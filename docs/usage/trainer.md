@@ -148,10 +148,10 @@ VeOmni includes several built-in callbacks:
 - **[ProfileTraceCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/trace_callback.py)**: Handles profiling.
 - **[ChannelLossCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/channel_loss_callback.py)**: Logs detached per-channel causal-LM loss metrics when `train.channel_loss.enable=true`.
 - **[CheckpointCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/checkpoint_callback.py)**: Saves resumable DCP checkpoints, exports HuggingFace / LoRA weights, and writes the config / tokenizer sidecars.
-- **[GlobalStateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Saves the job cursor per rank — the dataloader position as `loader/rank_{N}.pt`, the step counter, rng and meters as `extra_state/rank_{N}.pt` — separate from the model's `model/lr_scheduler.pt`. Runs last, and writes the step's `checkpoint_manifest.json`.
+- **[GlobalStateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/global_state_callback.py)**: Saves the job cursor per rank — the dataloader position as `loader/rank_{N}.pt`, the step counter, rng and meters as `extra_state/rank_{N}.pt` — separate from the model's own `model/<module>/extra_state/extra_state_rank_{N}.pt`, which holds the lr scheduler and runtime-contributed state. Runs last, and writes the step's `checkpoint_manifest.json`.
 - **[EvaluateCallback](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/callbacks/evaluate_callback.py)**: Runs evaluation on the validation set.
 
-On-disk layout for weights, optimizer, scheduler and job cursor, and how a checkpoint from an earlier layout is still resumed: [Checkpoint layout](checkpoint.md).
+On-disk layout for weights, optimizer, scheduler and job cursor, and which checkpoints resume: [Checkpoint layout](checkpoint.md).
 
 ### Custom Callbacks
 
@@ -213,3 +213,19 @@ class Arguments(VeOmniArguments):
 ```
 
 By following this pattern, you can leverage the robust infrastructure of `BaseTrainer` while tailoring the training process to your specific model and data requirements.
+
+### Token accounting diagnostics
+
+When the batch contains sufficient global length and padding metadata,
+`EnvironMeter` reports `token_accounting/*` diagnostics. The physical count is
+the SP-padded input window, the aligned count removes its known tail padding,
+and the source count uses valid global sequence lengths. Ambiguous batches omit
+these metrics. Existing `consume_tokens` and multi-source dataloader accounting
+retain their previous behavior and can therefore differ from the new source
+count.
+
+`loss_tokens` is a generic shifted-label count, not an objective-specific loss
+denominator. In particular, do not compare it across SP configurations for
+objectives whose collator does not shift labels, or treat it as the exact DPO,
+classification, or MTP target count. Token throughput uses the step timer,
+which starts after meter input collection and does not include its overhead.

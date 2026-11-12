@@ -62,6 +62,7 @@ config.add_import(
     names=["ForCausalLMLoss"],
 )
 config.add_import("veomni.models.utils.moe_utils", names=["merged_experts_act_fn_forward"])
+config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import("veomni.utils.moe_monitor", names=["record_router_indices"])
 config.add_import(
     "veomni.ops.kernels.dsa.mask",

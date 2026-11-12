@@ -70,6 +70,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
 )
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -83,7 +84,7 @@ config = PatchConfig(
     description="Qwen3_5Moe with LigerKernel GPU replacements, fused MoE, and VeOmni SP/fused loss patches",
 )
 
-config.drop_import_names("PreTrainedModel")
+config.drop_import_names("PreTrainedModel", "create_causal_mask")
 config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
 
 config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
@@ -114,14 +115,18 @@ config.add_import(
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
+# Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
+# packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
+# once in ``Qwen3_5MoeTextModel.forward``.
 config.add_import(
-    "veomni.models.utils.attention_utils",
-    names=["prepare_dense_attention_inputs"],
+    "veomni.models.utils.mask_utils",
+    names=["create_causal_mask"],
 )
 config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
 )
+config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "load_balancing_loss"],
@@ -917,6 +922,7 @@ class PatchedQwen3_5MoeExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         if not self.use_swiglu_mlp:
+            reject_quantizing_act_fn(self)
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,
@@ -1005,14 +1011,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
             cu_seq_lens_q=linear_attn_cu_seq_lens_q,
         )
     elif self.block_type == "full_attention":
-        # Self Attention. SDPA/eager reject GDN cu_seq_lens metadata.
-        attn_impl = getattr(getattr(self, "self_attn", None), "veomni_attn", None)
-        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-            kwargs,
-            impl=attn_impl.impl if attn_impl is not None else "eager",
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-        )
+        # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -1020,7 +1019,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
             past_key_values=past_key_values,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            **attn_kwargs,
+            **kwargs,
         )
 
     hidden_states = residual + hidden_states

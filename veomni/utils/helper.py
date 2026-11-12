@@ -38,6 +38,7 @@ from transformers import set_seed as set_seed_func
 
 from ..distributed.parallel_state import get_parallel_state
 from . import logging
+from .constants import IGNORE_INDEX
 from .count_flops import VeomniFlopsCounter
 from .device import (
     IS_CUDA_AVAILABLE,
@@ -47,6 +48,7 @@ from .device import (
     get_torch_device,
 )
 from .dist_utils import all_reduce
+from .flops_meter import get_flops_metadata_callback
 from .multisource_utils import parse_multisource_config
 from .seqlen_pos_transform_utils import valid_seqlens_from_cu_seqlens
 
@@ -130,41 +132,25 @@ def _compute_image_seqlens(
     return image_seqlens
 
 
-def _compute_wan_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
-    if "latents" not in micro_batch:
-        return []
-    dit_latents_seqlens = []
-    for latents in micro_batch["latents"]:
-        latent_shape = latents.shape
-        if len(latent_shape) == 3:
-            B, seq_len, _C = latent_shape
-            dit_latents_seqlens.append(B * seq_len)
-            continue
-        if len(latent_shape) == 5:
-            B = latent_shape[0]
-        else:
-            B = 1
-        C, T, H, W = latent_shape[-4:]
-        T_out = int((T - 1) / 1 + 1)
-        H_out = int((H - 2) / 2 + 1)
-        W_out = int((W - 2) / 2 + 1)
-        seqlens = B * T_out * H_out * W_out
-        dit_latents_seqlens.append(seqlens)
-    return dit_latents_seqlens
+def _as_index_list(ds_idx: Any) -> List[int]:
+    """Normalize a batch's per-sample source indices to a plain ``list[int]``.
+
+    Three shapes reach this: a tensor (``PackingCollator`` concatenates per-sample
+    indices), a list (a collator that keeps them per sample), or a bare int (a
+    single-sample micro batch).
+    """
+    if isinstance(ds_idx, torch.Tensor):
+        return ds_idx.tolist()
+    if isinstance(ds_idx, list):
+        return [int(idx) for idx in ds_idx]
+    return [int(ds_idx)]
 
 
 def _get_multisource_ds_idx(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
     ds_idx = micro_batch.pop("ds_idx")
     micro_batch.pop("source_name", None)
     micro_batch.pop("cur_token_num", None)
-    if isinstance(ds_idx, torch.Tensor):
-        # packed micro batch (e.g. PackingCollator)
-        return ds_idx.tolist()
-    if isinstance(ds_idx, list):
-        # SeedOmniCollator gathers per-sample ds_idx into a list
-        return [int(idx) for idx in ds_idx]
-    # single-sample micro batch
-    return [int(ds_idx)]
+    return _as_index_list(ds_idx)
 
 
 def compute_device_memory_metrics() -> Dict[str, Any]:
@@ -246,6 +232,10 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
+        self._flops_metadata_callback = get_flops_metadata_callback(config)
+        self._model_metadata = {}
+        self._batch_token_stats = []
+        self._batch_token_stats_complete = True
 
         if self.enable_multisource:
             if dataloader is None or data_path is None:
@@ -289,15 +279,81 @@ class EnvironMeter:
                 for sample in micro_batch:
                     self.batch_seqlens.extend(_compute_seqlens(sample))
                     self.images_seqlens.extend(_compute_image_seqlens(sample, self.config))
+                    self._record_token_stats(sample)
                     if self.enable_multisource:
                         self.batch_ds_idx.extend(_get_multisource_ds_idx(sample))
             else:
                 self.batch_seqlens.extend(_compute_seqlens(micro_batch))
                 self.images_seqlens.extend(_compute_image_seqlens(micro_batch, self.config))
+                self._record_token_stats(micro_batch)
                 if self.enable_multisource:
                     self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
-        else:  # dit diffusers model
-            self.batch_seqlens.extend(_compute_wan_seqlens(micro_batch))
+        else:
+            seq_lens, model_metadata = self._flops_metadata_callback(micro_batch)
+            self.batch_seqlens.extend(seq_lens)
+            for name, values in model_metadata.items():
+                self._model_metadata.setdefault(name, []).extend(values)
+
+    def _record_token_stats(self, batch):
+        """Meter standard packed batches without changing existing data-cursor accounting.
+
+        Physical counts the padded SP window, aligned removes the known tail,
+        and source counts valid global sequence lengths. ``loss_tokens`` is
+        the generic shifted-label count; it is not an objective-specific loss
+        denominator and is not comparable across SP for unshifted objectives.
+        Ambiguous metadata is omitted from the new metrics.
+        """
+        ids, labels = batch.get("input_ids"), batch.get("labels")
+        if (
+            not isinstance(ids, torch.Tensor)
+            or not isinstance(labels, torch.Tensor)
+            or ids.ndim == 0
+            or labels.ndim == 0
+            or ids.shape != labels.shape
+        ):
+            self._batch_token_stats_complete = False
+            return
+        sp_enabled = getattr(self.parallel_state, "sp_enabled", False)
+        if sp_enabled and "linear_attn_cu_seq_lens_q" not in batch:
+            # A rank-local boundary list cannot prove a global token count.
+            self._batch_token_stats_complete = False
+            return
+        sp_size = self.parallel_state.sp_size if sp_enabled else 1
+        capacity = ids.numel() * sp_size
+        has_boundaries = "linear_attn_cu_seq_lens_q" in batch or "cu_seq_lens_q" in batch
+        if has_boundaries:
+            cu = batch.get("linear_attn_cu_seq_lens_q", batch.get("cu_seq_lens_q"))
+            trusted_lengths = (
+                isinstance(cu, torch.Tensor)
+                and cu.ndim == 1
+                and cu.numel() >= 2
+                and int(cu[0]) == 0
+                and int(cu[-1]) == capacity
+                and ("packed_sequence_slices" in batch or batch.get("tail_padding_length") is not None)
+            )
+        else:
+            mask = batch.get("attention_mask")
+            trusted_lengths = not sp_enabled and isinstance(mask, torch.Tensor) and mask.shape == ids.shape
+        if not trusted_lengths:
+            self._batch_token_stats_complete = False
+            return
+        tail = int(batch.get("tail_padding_length", 0) or 0)
+        if tail < 0 or tail > capacity:
+            self._batch_token_stats_complete = False
+            return
+        if has_boundaries and tail and not bool((cu == capacity - tail).any().item()):
+            self._batch_token_stats_complete = False
+            return
+        source = (
+            int(valid_seqlens_from_cu_seqlens(cu, tail_padding_length=tail).sum().item())
+            if has_boundaries
+            else int(mask.sum().item())
+        )
+        # SP collators already shift labels before slicing. This is a generic
+        # shifted-label count, not an objective-specific loss denominator.
+        shifted = labels if sp_enabled else labels[..., 1:]
+        loss_tokens = int((shifted != IGNORE_INDEX).sum().item())
+        self._batch_token_stats.append((capacity, capacity - tail, loss_tokens, source))
 
     def step(
         self,
@@ -321,6 +377,10 @@ class EnvironMeter:
                 self._warned_unsupported_lora_flops = True
         if freeze_vit is not None and self.supports_lora_flops:
             flops_kwargs["freeze_vit"] = freeze_vit
+        # Omit empty metadata for existing counters; metadata-aware estimators
+        # must accept an omitted argument for steps without model-specific data.
+        if self._model_metadata:
+            flops_kwargs["model_metadata"] = self._model_metadata
         flops_achieved, flops_promised = self.estimate_flops(
             self.batch_seqlens,
             delta_time,
@@ -355,6 +415,49 @@ class EnvironMeter:
             "consumed_chunk_num": self.consume_chunks,
         }
         metrics.update(compute_device_memory_metrics())
+        stats = self._batch_token_stats
+        local_loss = sum(item[2] for item in stats)
+        complete = int(bool(stats) and self._batch_token_stats_complete)
+        sp_enabled = getattr(self.parallel_state, "sp_enabled", False)
+        sp_size = self.parallel_state.sp_size if sp_enabled else 1
+        if sp_enabled:
+            local_loss, complete = all_reduce(
+                torch.tensor([local_loss, complete], dtype=torch.int64, device=get_device_type()),
+                op="sum",
+                group=self.parallel_state.sp_group,
+            )
+        capacity, aligned, loss_tokens, complete_ranks, source_tokens = all_reduce(
+            torch.tensor(
+                [
+                    sum(item[0] for item in stats),
+                    sum(item[1] for item in stats),
+                    local_loss,
+                    complete,
+                    sum(item[3] for item in stats),
+                ],
+                dtype=torch.int64,
+                device=get_device_type(),
+            ),
+            op="sum",
+            group=self.parallel_state.dp_group,
+        )
+        if complete_ranks and complete_ranks == sp_size * dist.get_world_size(group=self.parallel_state.dp_group):
+            metrics.update(
+                {
+                    "token_accounting/physical_window_tokens": capacity,
+                    "token_accounting/aligned_compute_tokens": aligned,
+                    "token_accounting/source_input_tokens": source_tokens,
+                    "token_accounting/loss_tokens": loss_tokens,
+                    "token_accounting/source_fill": source_tokens / capacity if capacity else 0.0,
+                    "token_accounting/aligned_compute_fill": aligned / capacity if capacity else 0.0,
+                    "token_accounting/loss_density": loss_tokens / source_tokens if source_tokens else 0.0,
+                    "token_accounting/loss_fill": loss_tokens / capacity if capacity else 0.0,
+                    "token_accounting/capacity_tokens_per_second(M)": capacity / delta_time / 1e6,
+                    "token_accounting/aligned_compute_tokens_per_second(M)": aligned / delta_time / 1e6,
+                    "token_accounting/source_tokens_per_second(M)": source_tokens / delta_time / 1e6,
+                    "token_accounting/loss_tokens_per_second(M)": loss_tokens / delta_time / 1e6,
+                }
+            )
 
         if self.enable_multisource:
             metrics.update(self.multisource_tracker.step(self.batch_ds_idx, self.batch_seqlens))
@@ -368,6 +471,9 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
+        self._model_metadata = {}
+        self._batch_token_stats = []
+        self._batch_token_stats_complete = True
 
         return metrics
 

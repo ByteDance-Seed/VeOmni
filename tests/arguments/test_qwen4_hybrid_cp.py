@@ -37,6 +37,7 @@ def test_hybrid_opt_in_rejects_non_booleans_before_topology_resolution(monkeypat
 @pytest.mark.parametrize("constructor", ["state", "init"])
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_direct_hybrid_state_rejects_non_booleans_before_mesh_creation(monkeypatch, value, constructor):
+    """Reject invalid hybrid opt-ins before constructing any device mesh."""
     import veomni.distributed.parallel_state as parallel_state
 
     def unexpected_mesh(*args, **kwargs):
@@ -77,6 +78,7 @@ def test_native_cp_qualification_is_not_extended_to_other_models(monkeypatch):
 
 
 def _hybrid_mesh_worker(rank, rendezvous):
+    """Check hybrid rank groups, contiguous context, and vision rank mapping."""
     from datetime import timedelta
 
     import torch
