@@ -43,9 +43,17 @@ The BAGEL graphs cover understanding, generation, and edit.
 
 BAGEL registers an HF layout (`modules/bagel/hf_layout.py`), so
 `model.model_path` can point at the **upstream checkpoint itself** (holding
-`ema.safetensors` and `ae.safetensors`) with no offline convert needed.
-HF exports (`save_hf_weights`) are written back in the upstream layout as
-`ema.safetensors` and `ae.safetensors` (see
+`ema.safetensors` and `ae.safetensors`, with or without
+`model.safetensors.index.json`) — no offline convert needed. The layout routes
+`encoder.*` and `decoder.*` from `ae.safetensors` (FP32) plus the VAE image
+processor to `bagel_vae`; `vit_model.*`, `connector.*`, and `vit_pos_embed.*`
+plus the SigLIP image processor to `bagel_siglip_navit`;
+`language_model.model.embed_tokens.*` and `language_model.lm_head.*` plus the
+tokenizer to `bagel_text_encoder`; `vae2llm.*`, `llm2vae.*`,
+`time_embedder.*`, and `latent_pos_embed.*` to `bagel_flow_connector`; and the
+remaining `language_model.*` keys to `bagel_qwen2_mot`. HF exports
+(`save_hf_weights`) split fused runtime QKV weights back to upstream Q/K/V keys
+and write `ema.safetensors` and `ae.safetensors` in the upstream layout (see
 [Load an upstream checkpoint directly](../usage/training_and_inference.md#21-load-an-upstream-checkpoint-directly)).
 
 The offline split also works through the same layout:
@@ -356,7 +364,8 @@ YAML.
 ## 6. Contract checks
 
 The Bagel module and graph contracts cover carrier context-tag routing, generation
-state transitions, packing/cache behavior, and graph config structure. Packed
+state transitions, packing/cache behavior, graph config structure, and direct
+HF-layout load/convert/export round-trips (`test_bagel_hf_layout.py`). Packed
 MoT also compares Flex and Magi against eager SDPA on toy CE / MSE / gradients
 in `tests/seed_omni/modules/bagel/test_bagel_accel_align.py`. Magi cases skip unless an
 NVIDIA SM100+ GPU with the CUTE DSL/JIT backend is present.
