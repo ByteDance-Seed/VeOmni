@@ -520,13 +520,10 @@ PLE 2D layout: rows=8 (ple), columns=8 (ple_fsdp), local=[V/8, E/8]
 | `veomni/optim/optimizer.py` | Classify persistent PLE DTensors into the `ple` optimizer bucket. |
 | `veomni/distributed/fsdp2/clip_grad_norm.py` | Verify two-axis norm reduction for persistent PLE shards. |
 | `veomni/models/transformers/qwen4_exp/parallel_plan.py` | Declare the persistent PLE shard and the disjoint EP expert shard. |
-| `qwen4_exp_*_patch_gen_config.py` | Implement GPU/NPU two-dimensional request/result routing. |
+| `veomni/models/transformers/qwen4_exp/modeling_qwen4_exp.py` | Implement GPU/NPU two-dimensional request/result routing. |
 | `tests/models/test_qwen4_exp_packing.py` | Packed-boundary output and gradient parity. |
 | `tests/parallel/ulysses/test_qwen4_exp_ulysses.py` | Ulysses lookup, halo, QSA, GDN, and VLM parity. |
 | `tests/e2e/test_e2e_parallel.py` | Two-device Qwen4-Exp VLM training smoke coverage. |
-
-Generated files under `veomni/models/transformers/qwen4_exp/generated/` must
-only be changed by running patchgen.
 
 ## Validation plan
 

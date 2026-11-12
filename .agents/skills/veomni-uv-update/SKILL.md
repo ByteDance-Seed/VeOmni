@@ -36,10 +36,7 @@ which versions are current.
 
    Update every hit, and keep them on the same version — a per-image drift is
    a debugging trap, not a feature.
-2. `.github/workflows/check_patchgen.yml` -> `astral-sh/setup-uv` `version:`.
-   This job runs outside the container image, so an unpinned uv would float
-   above the range ceiling.
-3. `pyproject.toml` -> `required-version` — only widen/move the range when the
+2. `pyproject.toml` -> `required-version` — only widen/move the range when the
    new pin falls outside it.
 
 Then regenerate the lockfile:
@@ -139,12 +136,17 @@ uv lock
 uv sync --extra gpu --dev
 ```
 
-3. Check for API breakage and adjust `veomni/` accordingly. Forward-looking
-   guards may be expressed with
+3. Run the 3-way merge helper across all HF-derived `modeling_<m>.py` modules
+   using the old `transformers` checkout/site-packages root, resolve any
+   conflict markers, and audit signature drift:
+   ```bash
+   python scripts/sync_hf_modeling.py merge --old-hf-root <path-to-old-transformers>
+   make check-hf-modeling
+   ```
+   Forward-looking guards may be expressed with
    `is_transformers_version_greater_or_equal_to()` from
    `veomni/utils/import_utils.py`.
 4. Run tests: `pytest tests/models/ tests/e2e/`
-5. Regenerate model patches: `make patchgen` (with the target transformers installed)
 
 ## Scenario 5: Regenerate Lockfile Only
 

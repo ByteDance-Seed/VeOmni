@@ -46,7 +46,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _qwen2_classes():
-    from veomni.models.transformers.qwen2.generated.patched_modeling_qwen2_gpu import (
+    from veomni.models.transformers.qwen2.modeling_qwen2 import (
         Qwen2ForCausalLM,
         Qwen2ForQuestionAnswering,
         Qwen2ForSequenceClassification,
@@ -74,7 +74,7 @@ def _build_ours(config: Qwen2Config, ops: SimpleNamespace | None = None):
 
 
 def test_qwen2_rope_reads_selected_impl(monkeypatch, selected_rope_impl):
-    from veomni.models.transformers.qwen2.generated import patched_modeling_qwen2_gpu as modeling
+    from veomni.models.transformers.qwen2 import modeling_qwen2 as modeling
 
     selected: list[tuple[str, str, str]] = []
 

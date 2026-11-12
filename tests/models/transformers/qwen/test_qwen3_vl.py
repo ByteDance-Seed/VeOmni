@@ -45,16 +45,8 @@ VIDEO_TOKEN_ID = 121
 
 
 def _qwen3_vl_cls():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_npu import (
-            Qwen3VLForConditionalGeneration,
-        )
-    else:
-        from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
-            Qwen3VLForConditionalGeneration,
-        )
     return Qwen3VLForConditionalGeneration
 
 
@@ -98,35 +90,22 @@ def test_qwen3_vl_async_text_skips_ulysses_but_vision_stays_sync():
     """Text async gathers outside attention; vision must keep sync Ulysses."""
     import inspect
 
-    from veomni.models.transformers.qwen3_vl.generated import (
-        patched_modeling_qwen3_vl_gpu,
-        patched_modeling_qwen3_vl_npu,
-    )
-    from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
-        _qwen3_vl_async_ulysses_attention_forward,
-        qwen3_vl_vision_attention_forward_patched,
-    )
-    from veomni.models.transformers.qwen3_vl_moe.generated import (
-        patched_modeling_qwen3_vl_moe_gpu,
-        patched_modeling_qwen3_vl_moe_npu,
-    )
+    from veomni.models.transformers.qwen3_vl import modeling_qwen3_vl
+    from veomni.models.transformers.qwen3_vl_moe import modeling_qwen3_vl_moe
 
-    assert "skip_ulysses=True" in inspect.getsource(_qwen3_vl_async_ulysses_attention_forward)
-    assert "rms_norm=self.q_norm.veomni_rms_norm" in inspect.getsource(_qwen3_vl_async_ulysses_attention_forward)
-    assert "skip_ulysses=True" not in inspect.getsource(qwen3_vl_vision_attention_forward_patched)
-    for module in (
-        patched_modeling_qwen3_vl_gpu,
-        patched_modeling_qwen3_vl_npu,
-        patched_modeling_qwen3_vl_moe_gpu,
-        patched_modeling_qwen3_vl_moe_npu,
-    ):
+    assert "skip_ulysses=True" in inspect.getsource(modeling_qwen3_vl._qwen3_vl_async_ulysses_attention_forward)
+    assert "rms_norm=self.q_norm.veomni_rms_norm" in inspect.getsource(
+        modeling_qwen3_vl._qwen3_vl_async_ulysses_attention_forward
+    )
+    assert "skip_ulysses=True" not in inspect.getsource(modeling_qwen3_vl.Qwen3VLVisionAttention.forward)
+    for module in (modeling_qwen3_vl, modeling_qwen3_vl_moe):
         source = inspect.getsource(module._qwen3_vl_async_ulysses_attention_forward)
         assert "skip_ulysses=True" in source
         assert "rms_norm=self.q_norm.veomni_rms_norm" in source
 
 
 def test_qwen3_vl_async_helper_forwards_skip_ulysses(monkeypatch):
-    from veomni.models.transformers.qwen3_vl import qwen3_vl_gpu_patch_gen_config as cfg
+    from veomni.models.transformers.qwen3_vl import modeling_qwen3_vl as cfg
 
     captured = {}
 
@@ -179,7 +158,7 @@ def test_qwen3_vl_async_helper_forwards_skip_ulysses(monkeypatch):
 
 
 def test_qwen3_vl_npu_generated_attention_binds_ops_and_runs_eager_forward():
-    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_npu import (
+    from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import (
         Qwen3VLForConditionalGeneration,
     )
 

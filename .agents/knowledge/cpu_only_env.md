@@ -21,8 +21,7 @@ extensions and is NVIDIA SM100+ only.
 ## What works CPU-only (use these to validate changes without hardware)
 
 - Lint gate: `make quality` (and `make style` to auto-fix) — see `Makefile`.
-- Patchgen drift: `make check-patchgen` (i.e. `patchgen --check`; CI equivalent
-  of the check_patchgen job).
+- HF modeling header & upstream module check: `make check-hf-modeling` (`python3 scripts/sync_hf_modeling.py check`).
 - Device API check — the `-d` flag takes a single directory, so run it once per dir:
   `for d in veomni tasks tests; do python tests/special_sanity/check_device_api_usage.py -d "$d"; done`.
 - The CPU subset of `pytest` (registry/ops-gate/eager/data/lora-unit/converter/

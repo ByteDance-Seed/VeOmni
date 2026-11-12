@@ -52,7 +52,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _build_ours(config: Qwen2_5_VLConfig, ops: SimpleNamespace | None = None):
-    from veomni.models.transformers.qwen2_5vl.generated.patched_modeling_qwen2_5_vl_gpu import (
+    from veomni.models.transformers.qwen2_5vl.modeling_qwen2_5_vl import (
         Qwen2_5_VLForConditionalGeneration,
     )
 
@@ -73,7 +73,7 @@ def _mask_kwargs(input_ids: torch.Tensor) -> dict:
     [(3, 2, 8, 2), (1, 1, 8, 2), (3, 2, 8, 1), (3, 2, 8, 4)],
 )
 def test_qwen2_5_vl_dummy_forward_uses_vision_geometry(channels, temporal, patch, merge):
-    from veomni.models.transformers.qwen2_5vl.generated.patched_modeling_qwen2_5_vl_gpu import (
+    from veomni.models.transformers.qwen2_5vl.modeling_qwen2_5_vl import (
         Qwen2_5_VisionTransformerPretrainedModel,
     )
 
@@ -97,7 +97,7 @@ def test_qwen2_5_vl_dummy_forward_uses_vision_geometry(channels, temporal, patch
 
 @pytest.mark.parametrize("attention", ["eager", "veomni_sdpa"])
 def test_qwen2_5_vl_regular_vision_forward(attention):
-    from veomni.models.transformers.qwen2_5vl.generated import patched_modeling_qwen2_5_vl_gpu as module
+    from veomni.models.transformers.qwen2_5vl import modeling_qwen2_5_vl as module
 
     config = _tiny_config().vision_config
     ops = eager_ops_config()
@@ -124,7 +124,7 @@ def test_qwen2_5_vl_regular_vision_forward(attention):
 
 def _qwen2_5_vl_dummy_sp_worker(rank, merge, endpoint):
     from veomni.distributed.parallel_state import _init_parallel_state
-    from veomni.models.transformers.qwen2_5vl.generated.patched_modeling_qwen2_5_vl_gpu import (
+    from veomni.models.transformers.qwen2_5vl.modeling_qwen2_5_vl import (
         Qwen2_5_VisionTransformerPretrainedModel,
     )
 

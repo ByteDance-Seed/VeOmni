@@ -12,16 +12,13 @@ from scripts.ci.accelerator.launch_plan import from_parameter
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
-def _load_qwen4_exp_modeling(backend: str):
-    return importlib.import_module(
-        f"veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_{backend}"
-    )
+def _load_qwen4_exp_modeling():
+    return importlib.import_module("veomni.models.transformers.qwen4_exp.modeling_qwen4_exp")
 
 
 def test_compact_qsa_npu_finite_mask_matches_gpu_packed_selection(monkeypatch):
     """Verify NPU QSA indexer masks invisible blocks with -1.0 (not -inf) and matches GPU selection."""
-    gpu_modeling = _load_qwen4_exp_modeling("gpu")
-    npu_modeling = _load_qwen4_exp_modeling("npu")
+    modeling = _load_qwen4_exp_modeling()
 
     torch.manual_seed(38)
     hidden = torch.randn(1, 25, 3)
@@ -40,7 +37,8 @@ def test_compact_qsa_npu_finite_mask_matches_gpu_packed_selection(monkeypatch):
     positions = (torch.ones(1, 25, 2), torch.zeros(1, 25, 2))
     boundaries = torch.tensor([0, 9, 25], dtype=torch.int32)
 
-    expected = gpu_modeling.Qwen4ExpTextQSAIndexer.forward(
+    monkeypatch.setattr(modeling, "IS_NPU_AVAILABLE", False)
+    expected = modeling.Qwen4ExpTextQSAIndexer.forward(
         indexer,
         hidden,
         positions,
@@ -57,7 +55,8 @@ def test_compact_qsa_npu_finite_mask_matches_gpu_packed_selection(monkeypatch):
         return orig_topk(self, k, dim=dim, largest=largest, sorted=sorted)
 
     monkeypatch.setattr(torch.Tensor, "topk", recording_topk)
-    actual = npu_modeling.Qwen4ExpTextQSAIndexer.forward(
+    monkeypatch.setattr(modeling, "IS_NPU_AVAILABLE", True)
+    actual = modeling.Qwen4ExpTextQSAIndexer.forward(
         indexer,
         hidden,
         positions,
@@ -131,7 +130,7 @@ def _native_indexer_worker(rank, world_size, endpoint):
     )
     try:
         _init_parallel_state(ulysses_size=world_size, device_type="npu")
-        module = _load_qwen4_exp_modeling("npu")
+        module = _load_qwen4_exp_modeling()
         torch.manual_seed(38)
         indexer = SimpleNamespace(
             index_kv_heads=1,

@@ -1,6 +1,6 @@
 ---
 name: veomni-new-model
-description: "Integrate an existing external model into VeOmni, adapting modeling, data, training, and weight loading as needed. Use for new model support or migration from Transformers, Diffusers, or standalone implementations."
+description: "Integrate an existing external model into VeOmni, author or update standalone `veomni/models/transformers/<model>/modeling_<model>.py` modules, or upgrade the pinned `transformers` version across models. Use for new model support or migration from Transformers, Diffusers, or standalone implementations."
 ---
 
 # Model migration into VeOmni
@@ -9,8 +9,7 @@ Bring an existing model into VeOmni while preserving its architecture and
 numerical semantics. By default, complete a training integration: pretrained
 weight loading, real data, a short training run, and training-state resume.
 Honor an explicit inference-only or partial request by narrowing the phases and
-acceptance checks. Debugging an already supported model uses `/veomni-debug`;
-a patchgen-only refresh uses `/veomni-patchgen-model`.
+acceptance checks. Debugging an already supported model uses `/veomni-debug`.
 
 ## Responsibilities and scope
 
@@ -85,14 +84,20 @@ implementation route, affected areas, and explicit acceptance checks or blockers
 
 | Source implementation | VeOmni approach |
 |---|---|
-| Transformers modeling/configuration contracts | Use `/veomni-patchgen-model` under `veomni/models/transformers/`. |
+| Transformers modeling/configuration contracts | Bootstrap and author a single standalone `veomni/models/transformers/<m>/modeling_<m>.py` via `scripts/sync_hf_modeling.py init`. |
 | Diffusers components or pipelines | Follow a maintained integration; inspect the trainable components separately from the inference pipeline. |
 | Independent implementation or another framework | Wrap compatible PyTorch modules, port the required subset, or translate unsupported operations. |
 
-For Transformers, the patchgen skill owns generated modeling, registration,
-model-level patch tests, and relevant ExtraParallel/converter details. Never
-hand-edit generated modeling. Return here for weights, data, training, and
-resume after the applicable modeling checks pass.
+For Transformers models, every family ships a **single, explicit, self-contained**
+`veomni/models/transformers/<m>/modeling_<m>.py` file with `# Upstream-Module:` and
+`# Base-Transformers-Version:` headers at the top (verified by `make check-hf-modeling` /
+`scripts/sync_hf_modeling.py check`). Bootstrap with
+`python scripts/sync_hf_modeling.py init transformers.models.<m>.modeling_<m> -o veomni/models/transformers/<m>/modeling_<m>.py`,
+wire instance-local `VeomniOp` handles (`self.config.ops_config`), inspect deltas via
+`python scripts/sync_hf_modeling.py diff <m>`, and use
+`python scripts/sync_hf_modeling.py merge --old-hf-root <old-transformers>` during
+`transformers` upgrades. Never create separate `_gpu` / `_npu` modeling files; gate rare
+structural NPU branches explicitly with `IS_NPU_AVAILABLE` (never `not IS_CUDA_AVAILABLE`).
 
 Place DiT integrations, including independent diffusion backbones and their
 model-specific conditioning, under `veomni/models/diffusers/`. This layout does
@@ -130,7 +135,7 @@ Read `docs/design/module_config.md`. Custom configs inherit
 recursively at class creation. Custom constructors and lifecycle overrides
 must call `super()` so the native schema and VeOmni contracts both run.
 
-Generated specs replace the HF `PreTrainedModel` import with
+Standalone `modeling_<m>.py` modules replace the HF `PreTrainedModel` import with
 `VeOmniPreTrainedModel as PreTrainedModel` from `veomni.models.modeling_base`.
 Handwritten HF-compatible models use the same base. It adapts the model's
 `config_class` and direct config inputs recursively and validates final ops
@@ -285,8 +290,9 @@ Run checks in increasing cost order, omitting only those outside explicit scope.
 ### Import, forward, and numerical parity
 
 Check clean-process import, config/registry lookup, output shapes, and expected
-forward behavior. For generated modeling, run applicable patch tests and drift
-checks required by the patchgen skill.
+forward behavior. For HF-derived `modeling_<m>.py` modules, run `make check-hf-modeling`,
+`tests/models/transformers/test_generated_modeling_imports.py`, and
+`tests/models/transformers/test_generated_call_site_signatures.py`.
 
 For Transformers families, follow
 [Testing a New Model](../../../docs/transformers_v5/testing_new_model.md).

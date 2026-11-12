@@ -94,7 +94,7 @@ def test_model_reuses_metadata_without_changing_outputs_or_gradients(monkeypatch
 
     from tests.tools.training_utils import make_eager_ops_config
 
-    module = import_module("veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu")
+    module = import_module("veomni.models.transformers.qwen4_exp.modeling_qwen4_exp")
     config = AutoConfig.from_pretrained("tests/toy_config/qwen4_exp_toy/config.json").text_config
     config.ple_layer_ids = []
     config.layer_types = ["full_attention"] * config.num_hidden_layers

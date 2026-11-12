@@ -22,7 +22,6 @@ reviews:
   path_filters:
     - "!**/*.diff"
     - "!docs/assets/**"
-    - "!veomni/models/transformers/**/generated/**"
     - "!uv.lock"
   path_instructions:
     - path: "veomni/distributed/**"
@@ -43,12 +42,11 @@ reviews:
         - Multimodal placeholder IDs and masks must stay consistent with TYPE2INDEX.
     - path: "veomni/models/**"
       instructions: |
-        Focus on model loading and patchgen.
-        - Do not request edits under veomni/models/transformers/*/generated/. Change the patchgen config instead.
+        Focus on model loading, standalone HF-derived modeling_<model>.py modules, and multi-backend safety.
         - Model registration must happen at import time.
         - config model_type must match the registry key.
-        - New modeling must target transformers 5.16.1 and FSDP2.
-        - NPU-only imports must be guarded with is_torch_npu_available() or IS_NPU_AVAILABLE.
+        - New modeling must target transformers 5.16.1 and FSDP2, using instance-local VeomniOp handles.
+        - NPU-only imports and structural branches must be guarded explicitly with is_torch_npu_available() or IS_NPU_AVAILABLE (never `not IS_CUDA_AVAILABLE`).
     - path: "veomni/checkpoint/**"
       instructions: |
         Focus on DCP safety: all ranks must participate, checkpoint keys must match the model state dict, and integer or boolean buffers must not be treated as floating tensors during consolidation.

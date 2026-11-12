@@ -361,7 +361,7 @@ def test_qwen4_exp_attention_layer_tilelang_matches_fp32_reference():
     _require_tilelang_cuda()
     from transformers import AutoConfig
 
-    from veomni.models.transformers.qwen4_exp.generated import patched_modeling_qwen4_exp_gpu as modeling
+    from veomni.models.transformers.qwen4_exp import modeling_qwen4_exp as modeling
 
     config = AutoConfig.from_pretrained("tests/toy_config/qwen4_exp_toy").text_config
     config.num_attention_heads = 8

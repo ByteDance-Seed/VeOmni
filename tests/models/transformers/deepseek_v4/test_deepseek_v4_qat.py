@@ -43,9 +43,11 @@ import textwrap
 
 import pytest
 
-from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling_gpu
-from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as modeling_npu
+from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as modeling_gpu
 from veomni.ops import VeomniOp
+
+
+modeling_npu = modeling_gpu
 
 
 # The projections DeepSeek V4 serves as a true low-precision GEMM, and the ones
@@ -289,12 +291,7 @@ def _build_tiny_model(linear_impl: str):
     """A tiny DeepSeek-V4 on the reference rows, with ``linear_impl`` for the projections."""
     from tests.models.tiny_configs import tiny_deepseek_v4_config
     from veomni.arguments import OpsImplementationConfig
-    from veomni.utils.device import IS_NPU_AVAILABLE
-
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as gen
-    else:
-        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gen
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as gen
 
     config = tiny_deepseek_v4_config()
     config._set_ops_implementation(

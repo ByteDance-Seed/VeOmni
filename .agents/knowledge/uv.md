@@ -12,7 +12,6 @@ CI install a concrete pin and use `--locked` / `--frozen` for reproducibility.
 |----------|--------|
 | `pyproject.toml` -> `[tool.uv]` -> `required-version` | range |
 | `docker/**/Dockerfile.*` | concrete pin, per file: `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` |
-| `.github/workflows/check_patchgen.yml` | `setup-uv` `version: "X.Y.Z"` |
 
 Every Dockerfile is standalone and hand-maintained — the Jinja template
 generator and its matrix were dropped in #1133, so nothing fans a pin out for
@@ -49,10 +48,9 @@ pyproject.toml
 │   │                  torch 2.10.0 + torch-npu 2.10.0 + the same data/model deps
 │   └── dev          pre-commit, ruff, pytest (legacy pip-style; modern uv path is the dev group)
 ├── [dependency-groups]                 Dev-only (uv-native)
-│   ├── dev                  includes lint + test + patchgen
+│   ├── dev                  includes lint + test
 │   ├── lint                 pre-commit, ruff
 │   ├── test                 pytest, expecttest, rich
-│   ├── patchgen             patchgen (path source under patchgen-pkg/)
 │   └── transformers-stable  transformers==5.16.1 (default, in default-groups)
 ├── [tool.uv]
 │   ├── required-version     Allowed uv version range
@@ -185,4 +183,4 @@ uv sync --locked --all-packages --extra gpu --dev  # docker / CI (no magi)
 4. **uv bumps require Docker rebuilds**; concrete pins must stay in range.
 5. **`override-dependencies` `extra == '...'` markers are load-bearing.**
 6. **`transformers==5.16.1` is the only supported version.** New code targets
-   v5 + FSDP2 + patchgen-generated modeling.
+   v5 + FSDP2 + standalone `modeling_<m>.py` modules.

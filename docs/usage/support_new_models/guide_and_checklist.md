@@ -4,17 +4,15 @@
 - [qwen3_vl_example.md](./qwen3_vl_example.md) — VLM + MoE (image/video, deepstack, EP)
 - [qwen3_omni_moe_example.md](./qwen3_omni_moe_example.md) — Omni-modal MoE (image/video/audio, talker)
 
-> **Scope note:** VeOmni now pins `transformers==5.16.1` and ships
-> patchgen-generated modeling files under
-> `veomni/models/transformers/<model>/generated/`. The runtime monkey-patch
-> flow this document was originally written for has been retired. The high-level
+> **Scope note:** VeOmni pins `transformers==5.16.1` and ships standalone,
+> multi-backend modeling files at
+> `veomni/models/transformers/<model>/modeling_<model>.py` (bootstrapped and
+> synced via `scripts/sync_hf_modeling.py`). The runtime monkey-patch flow this
+> document was originally written for has been retired. The high-level
 > checklists (registration, parallel plan, multimodal data transform, trainer
-> wiring, tests) still apply, but the modeling-patch steps below should be
-> read as describing what the *generated* file does, with the actual edits
-> happening in `<model>_gpu_patch_gen_config.py`. For step-by-step
-> instructions on the patchgen flow, see
-> [the patchgen design guide](../../design/patchgen.md) and
-> the `veomni-patchgen-model` agent skill.
+> wiring, tests) still apply, with the modeling adaptations living directly in
+> `modeling_<model>.py` using instance-local `VeomniOp` handles. See the
+> `/veomni-new-model` agent skill for the step-by-step workflow.
 
 ---
 
@@ -22,9 +20,9 @@
 
 | Model Type | Files Required | Key Additions |
 |---|---|---|
-| Dense text-only LLM | `__init__.py` + GPU patchgen config | SP position embedding slicing |
-| VLM (image/video) | `__init__.py` + GPU/NPU patchgen configs | FSDP dummy forward, SP in ViT + LM, position ID func |
-| Omni-modal MoE | `__init__.py` + patchgen configs and helpers | All of the above + audio encoder, fused MoE, EP plan, processor patch |
+| Dense text-only LLM | `__init__.py` + `modeling_<model>.py` | `VeomniOp` handles, SP position embedding slicing |
+| VLM (image/video) | `__init__.py` + `modeling_<model>.py` | FSDP dummy forward, SP in ViT + LM, position ID + metadata hooks |
+| Omni-modal MoE | `__init__.py` + `modeling_<model>.py` + helpers | All of the above + audio encoder, fused MoE, EP plan, processor patch |
 
 ---
 
@@ -46,9 +44,10 @@ Before writing any VeOmni code, answer:
 ```bash
 mkdir veomni/models/transformers/your_model_name/
 touch veomni/models/transformers/your_model_name/__init__.py
+python scripts/sync_hf_modeling.py init \
+    transformers.models.your_model_name.modeling_your_model_name \
+    -o veomni/models/transformers/your_model_name/modeling_your_model_name.py
 # For complex models, also add:
-touch veomni/models/transformers/your_model_name/your_model_name_gpu_patch_gen_config.py
-touch veomni/models/transformers/your_model_name/your_model_name_npu_patch_gen_config.py  # if NPU supported
 touch veomni/models/transformers/your_model_name/configuration_your_model_name.py  # if config fix needed
 touch veomni/models/transformers/your_model_name/processing_your_model_name.py    # if multimodal
 touch veomni/models/transformers/your_model_name/parallel_plan.py                 # if MoE
@@ -59,21 +58,16 @@ touch veomni/models/transformers/your_model_name/parallel_plan.py               
 **Minimal (text-only):**
 ```python
 from veomni.models.registry import MODELING_REGISTRY
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 @MODELING_REGISTRY.register("your_model_type")
 def register_modeling(architecture: str):
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_your_model_npu import YourModelForCausalLM
-    else:
-        from .generated.patched_modeling_your_model_gpu import YourModelForCausalLM
+    from .modeling_your_model_name import YourModelForCausalLM
     return YourModelForCausalLM
 ```
 
 **Full (multimodal MoE):**
 ```python
 from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 @MODEL_CONFIG_REGISTRY.register("your_model_type")
 def register_config():
@@ -82,10 +76,7 @@ def register_config():
 
 @MODELING_REGISTRY.register("your_model_type")
 def register_modeling(architecture: str):
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_your_model_npu import YourModelForCausalLM
-    else:
-        from .generated.patched_modeling_your_model_gpu import YourModelForCausalLM
+    from .modeling_your_model_name import YourModelForCausalLM
     return YourModelForCausalLM
 
 @MODEL_PROCESSOR_REGISTRY.register("YourModelProcessor")  # exact class name from processor_config.json
@@ -109,15 +100,15 @@ from . import (
 )
 ```
 
-### Step 4: Declare the Patchgen Config
+### Step 4: Author `modeling_<model>.py`
 
-Define model changes in `<model>_gpu_patch_gen_config.py` using patchgen
-decorators such as `replace_class`, `override_method`, and
-`add_post_import_block`. Add a sibling NPU config when needed, then regenerate
-the checked-in `generated/*.py` and `generated/*.diff` files with `patchgen`.
-Never edit generated files directly, and do not add runtime monkey-patch
-helpers. See the [patchgen design guide](../../design/patchgen.md) and
-`veomni-patchgen-model` skill for the complete workflow.
+Adapt `veomni/models/transformers/<model>/modeling_<model>.py` directly:
+replace `PreTrainedModel` with `VeOmniPreTrainedModel`, wire instance-local
+`VeomniOp` handles (`self.config.ops_config`), and keep `# Upstream-Module:` /
+`# Base-Transformers-Version:` headers intact. Inspect your exact diff against
+upstream HF with `python scripts/sync_hf_modeling.py diff <model>`, and verify
+with `make check-hf-modeling`. See the `/veomni-new-model` skill for the
+complete workflow.
 
 ### Step 5: Define Expert Parallelism Plan (`parallel_plan.py`, MoE only)
 

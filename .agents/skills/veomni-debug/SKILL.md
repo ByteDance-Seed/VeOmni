@@ -94,33 +94,19 @@ Phase 5: Knowledge capture           -> pending
    (source .venv-b/bin/activate && <reproducer>)
    ```
 
-   **If the suspect package is transformers, you need two worktrees *and* two
-   venvs — one venv per worktree.** They isolate different things and neither
-   substitutes for the other: a venv isolates the installed packages, a
-   worktree isolates the checkout. `generated/` modeling lives in the
-   checkout, so two venvs in one worktree share a single `generated/` and
-   regenerating it for Env B silently changes what Env A runs. Two worktrees
-   without separate venvs share one transformers install, which defeats the
-   bisect outright.
+   **If the suspect package is transformers, create two worktrees with separate
+   venvs if you also need to merge/adapt `modeling_<m>.py` for the target version.**
    ```bash
    git worktree add ../bisect-a HEAD && (cd ../bisect-a && uv venv .venv && VIRTUAL_ENV=.venv uv sync --active --extra gpu --dev)
    git worktree add ../bisect-b HEAD && (cd ../bisect-b && uv venv .venv && VIRTUAL_ENV=.venv uv sync --active --extra gpu --dev && VIRTUAL_ENV=.venv uv pip install "transformers==<other-version>")
    ```
-   Regenerate `generated/` inside each worktree against its own pin
-   (`make patchgen`) before running the reproducer — it is produced against
-   the pinned version, and a stale `generated/` is itself a source of
-   failures.
-
-   Compare the package sets here too, using `uv pip freeze --python` with
-   `../bisect-a/.venv/bin/python` and `../bisect-b/.venv/bin/python`, and
-   reconcile non-transformers dependency version differences as above. The
-   editable VeOmni and patchgen paths must point to their respective worktrees;
-   normalize those corresponding paths only when comparing the freeze output,
-   without changing either environment's editable installs. Run codegen and
-   the reproducer from each worktree with its own environment activated:
+   Compare the package sets using `uv pip freeze --python` with
+   `../bisect-a/.venv/bin/python` and `../bisect-b/.venv/bin/python`, reconcile
+   non-transformers dependency differences as above, and run the reproducer from
+   each worktree with its own environment activated:
    ```bash
-   (cd ../bisect-a && source .venv/bin/activate && make patchgen && <reproducer>)
-   (cd ../bisect-b && source .venv/bin/activate && make patchgen && <reproducer>)
+   (cd ../bisect-a && source .venv/bin/activate && <reproducer>)
+   (cd ../bisect-b && source .venv/bin/activate && <reproducer>)
    ```
 
 ### Phase 3: Hypothesis and Testing
@@ -176,7 +162,7 @@ right problem, and report the analysis to the user before continuing.
 - **DCP checkpoint format**: model state dict keys must match exactly between save and load — renamed parameters break checkpoint loading silently.
 - **Multi-modality data collators**: text-only collators crash on multimodal data and vice versa — always check `data_collator` type matches the dataset.
 - **Sequence parallel**: attention outputs must be gathered before loss computation — partial outputs produce incorrect loss values.
-- **Patchgen**: model patches in `veomni/models/transformers/*/generated/` are auto-generated — editing generated files directly will be overwritten.
+- **HF-derived modeling**: `veomni/models/transformers/*/modeling_*.py` files are shared across all accelerators — never add top-level vendor imports (`torch_npu`) or use `not IS_CUDA_AVAILABLE` as a proxy for NPU.
 
 ## Domain-Specific Checklists
 

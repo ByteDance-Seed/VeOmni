@@ -5,7 +5,7 @@ description: "Add or optimize a tensor-level kernel in veomni/ops, register its 
 
 ## Before You Start
 
-1. Read `.agents/knowledge/constraints.md`, especially device guards and patchgen rules.
+1. Read `.agents/knowledge/constraints.md`, especially device guards and multi-backend `modeling_<m>.py` rules.
 2. Read `veomni/ops/README.md` and `docs/design/op_selection.md`.
 3. Inspect the closest family under `veomni/ops/kernels/` and its tests under `tests/ops/`.
 
@@ -147,7 +147,7 @@ Use these separate mechanisms only when their semantics require them:
 - Importing NPU/CUDA-only libraries without guards or requirements.
 - Registering a row without importing its family from `kernels/__init__.py`.
 - Letting an unavailable optimized implementation fall back silently.
-- Editing patchgen-generated files instead of their patch config.
+- Importing a specific kernel implementation module directly inside `modeling_<m>.py` instead of dispatching via `VeomniOp`.
 - Renaming `ops_implementation` while changing the internal kernel plumbing.
 
 ## Configuration ownership

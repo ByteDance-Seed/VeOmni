@@ -144,11 +144,11 @@ def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
 
     config = AutoConfig.from_pretrained(toy_path)
     if config.model_type == "qwen3":
-        from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import (
+        from veomni.models.transformers.qwen3.modeling_qwen3 import (
             Qwen3ForCausalLM as ModelClass,
         )
     elif config.model_type == "qwen3_vl":
-        from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+        from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import (
             Qwen3VLForConditionalGeneration as ModelClass,
         )
     else:

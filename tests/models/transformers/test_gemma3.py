@@ -41,7 +41,7 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 def _build_ours(config: Gemma3TextConfig, ops: SimpleNamespace | None = None):
-    from veomni.models.transformers.gemma3.generated.patched_modeling_gemma3_gpu import (
+    from veomni.models.transformers.gemma3.modeling_gemma3 import (
         Gemma3ForCausalLM,
     )
 

@@ -52,7 +52,7 @@ The grid tensor stays in the batch (Model.forward still needs it as the HF
 
 ## Two model hooks
 
-Patched onto each wired `…ForConditionalGeneration` via patchgen `override_method`:
+Defined on each wired `…ForConditionalGeneration` in `modeling_<model>.py`:
 
 ### `get_metadata_collate_func() -> Callable | None`
 
@@ -69,7 +69,7 @@ appended. The collator invokes it **once, after SP padding** — the same timing
 the text-side flash-attention kwargs (`add_flash_attention_kwargs_from_position_ids`).
 
 For the qwen3-VL family the helper is `collate_multimodal_metadata`, a module-level
-patchgen helper (`@config.add_helper`) emitted into each generated modeling file.
+helper defined in `modeling_<model>.py`.
 Its formula (temporal-unroll of `h*w` patch counts) needs no model config, so the
 hook is the bare helper reference.
 
@@ -252,9 +252,9 @@ guarantees:
 - `veomni/data/data_transform.py` — transforms emit the `*_grid_thw` tensors +
   `position_ids`.
 - `veomni/trainer/vlm_trainer.py` — `_build_collate_fn` resolves the two model hooks.
-- `veomni/models/transformers/<model>/<model>_{gpu,npu}_patch_gen_config.py` —
+- `veomni/models/transformers/<model>/modeling_<model>.py` —
   `collate_multimodal_metadata` helper + `get_metadata_collate_func` /
-  `get_extra_collate_infos` overrides; regenerated `generated/` files.
+  `get_extra_collate_infos` hooks.
 - `tests/data/test_mm_metadata.py` — collator-hook handoff + hook picklability.
 - `tests/models/transformers/test_model_forward_no_implicit_sync.py` — sync gate; feeds synthetic
   `multimodal_metadata` for the wired cases.

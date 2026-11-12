@@ -166,7 +166,7 @@ def test_lasp_depthwise_conv1d_slicing_matches_full(
     if causal_conv1d_fn is None or not get_torch_device().is_available():
         pytest.skip("FLA causal_conv1d or accelerator not available")
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+    from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5GatedDeltaNet,
     )
 
@@ -244,7 +244,7 @@ def _run_gated_deltanet_sp_fw_bw(rank: int, world_size: int, init_file: str) -> 
     )
 
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+    from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5GatedDeltaNet,
     )
 
@@ -372,7 +372,7 @@ def _run_gated_deltanet_sp_determinism(rank: int, world_size: int, init_file: st
     )
 
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+    from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5GatedDeltaNet,
     )
 
@@ -447,7 +447,7 @@ def test_qwen3_5_gated_deltanet_forward_deterministic_no_sp(bsz, seq_len):
     if causal_conv1d_fn is None or not get_torch_device().is_available():
         pytest.skip("FLA causal_conv1d or accelerator not available")
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+    from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5GatedDeltaNet,
     )
 

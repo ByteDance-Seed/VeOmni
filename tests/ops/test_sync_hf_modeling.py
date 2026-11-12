@@ -18,6 +18,11 @@ from pathlib import Path
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "sync_hf_modeling.py"
 _SPEC = importlib.util.spec_from_file_location("sync_hf_modeling", _SCRIPT_PATH)
@@ -73,13 +78,15 @@ def test_repo_hf_modeling_check_strict():
     assert bad_dir.is_dir()
 
 
-def test_three_way_merge_preserves_local_opslot_and_absorbs_upstream_edit():
+def test_three_way_merge_preserves_local_veomni_op_and_absorbs_upstream_edit():
     base_hf = (
         "import torch\n"
         "from ...activations import ACT2FN\n\n\n"
         "class DemoMLP:\n"
-        "    def __init__(self, hidden_size: int):\n"
-        "        self.hidden_size = hidden_size\n\n"
+        "    def __init__(self, config):\n"
+        "        self.config = config\n"
+        "        self.hidden_size = config.hidden_size\n"
+        "        self.act_fn = ACT2FN[config.hidden_act]\n\n"
         "    def forward(self, x):\n"
         "        y = x * 2\n"
         "        return y\n"
@@ -89,25 +96,29 @@ def test_three_way_merge_preserves_local_opslot_and_absorbs_upstream_edit():
         "# Base-Transformers-Version: 5.16.1\n\n"
         "import torch\n"
         "from transformers.activations import ACT2FN\n"
-        "from veomni.ops.dispatch import OpSlot\n\n"
-        "veomni_mlp = OpSlot('swiglu_mlp', 'standard')\n\n\n"
+        "from veomni.ops import VeomniOp\n\n\n"
         "class DemoMLP:\n"
-        "    def __init__(self, hidden_size: int):\n"
-        "        self.hidden_size = hidden_size\n\n"
+        "    def __init__(self, config):\n"
+        "        self.config = config\n"
+        "        self.hidden_size = config.hidden_size\n"
+        "        self.act_fn = ACT2FN[config.hidden_act]\n"
+        "        self.veomni_mlp = VeomniOp('swiglu_mlp', 'standard', config)\n\n"
         "    def forward(self, x):\n"
-        "        if veomni_mlp.use_non_eager_impl:\n"
-        "            return veomni_mlp(self, x)\n"
+        "        if self.veomni_mlp.use_non_eager_impl:\n"
+        "            return self.veomni_mlp(self, x)\n"
         "        y = x * 2\n"
         "        return y\n"
     )
-    # Upstream bumps init and bottom of forward without touching our OpSlot guard!
+    # Upstream edits the top of __init__ and bottom of forward without touching our VeomniOp lines.
     new_hf = (
         "import torch\n"
         "from ...activations import ACT2FN\n\n\n"
         "class DemoMLP:\n"
-        "    def __init__(self, hidden_size: int, bias: bool = False):\n"
-        "        self.hidden_size = hidden_size\n"
-        "        self.bias = bias\n\n"
+        "    def __init__(self, config, bias: bool = False):\n"
+        "        self.bias = bias\n"
+        "        self.config = config\n"
+        "        self.hidden_size = config.hidden_size\n"
+        "        self.act_fn = ACT2FN[config.hidden_act]\n\n"
         "    def forward(self, x):\n"
         "        y = x * 2\n"
         "        return y + 1\n"
@@ -122,7 +133,7 @@ def test_three_way_merge_preserves_local_opslot_and_absorbs_upstream_edit():
     )
     assert not had_conflicts
     assert "# Base-Transformers-Version: 5.20.0" in merged
-    assert "if veomni_mlp.use_non_eager_impl:" in merged
+    assert "if self.veomni_mlp.use_non_eager_impl:" in merged
     assert "self.bias = bias" in merged
     assert "return y + 1" in merged
 

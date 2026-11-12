@@ -67,7 +67,7 @@ def test_unweighted_rms_norm_rejects_explicit_npu_backend(monkeypatch, family, i
         model_cfg._set_ops_implementation(cfg)
         build = partial(PytorchAdaZeroFunction, config=model_cfg)
     else:
-        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+        from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
             DeepseekV4UnweightedRMSNorm,
         )
 
@@ -179,7 +179,7 @@ def _assert_isolated(
 
 
 def test_qwen2_text_forward_keeps_construction_impls():
-    from veomni.models.transformers.qwen2.generated.patched_modeling_qwen2_gpu import Qwen2ForCausalLM
+    from veomni.models.transformers.qwen2.modeling_qwen2 import Qwen2ForCausalLM
 
     config = tiny_qwen2_config()
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
@@ -196,7 +196,7 @@ def test_qwen2_text_forward_keeps_construction_impls():
 
 
 def test_qwen2_vl_vision_forward_keeps_construction_impls():
-    from veomni.models.transformers.qwen2_vl.generated.patched_modeling_qwen2_vl_gpu import (
+    from veomni.models.transformers.qwen2_vl.modeling_qwen2_vl import (
         Qwen2VLForConditionalGeneration,
     )
 
@@ -367,7 +367,7 @@ def test_qwen_image_forward_keeps_construction_impls():
 
 
 def test_qwen3_moe_text_forward_keeps_construction_impls():
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import Qwen3MoeForCausalLM
+    from veomni.models.transformers.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM
 
     config = tiny_qwen3_moe_config()
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
@@ -387,7 +387,7 @@ def test_qwen3_moe_text_forward_keeps_construction_impls():
 
 
 def test_glm_moe_dsa_forward_keeps_construction_impls():
-    from veomni.models.transformers.glm_moe_dsa.generated.patched_modeling_glm_moe_dsa_gpu import GlmMoeDsaForCausalLM
+    from veomni.models.transformers.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
 
     config = tiny_glm_moe_dsa_config()
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
@@ -407,7 +407,7 @@ def test_glm_moe_dsa_forward_keeps_construction_impls():
 
 
 def test_gemma3_text_forward_keeps_construction_impls():
-    from veomni.models.transformers.gemma3.generated.patched_modeling_gemma3_gpu import Gemma3ForCausalLM
+    from veomni.models.transformers.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
     config = tiny_gemma3_text_config()
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
@@ -424,7 +424,7 @@ def test_gemma3_text_forward_keeps_construction_impls():
 
 
 def test_gemma3_eager_instance_keeps_first_token_causal_after_another_sdpa_model():
-    from veomni.models.transformers.gemma3.generated.patched_modeling_gemma3_gpu import Gemma3ForCausalLM
+    from veomni.models.transformers.gemma3.modeling_gemma3 import Gemma3ForCausalLM
 
     config = tiny_gemma3_text_config()
     config._set_ops_implementation(_attn_cfg("eager"))
@@ -445,16 +445,7 @@ def test_gemma3_eager_instance_keeps_first_token_causal_after_another_sdpa_model
 
 
 def test_deepseek_v3_rope_keeps_construction_impl():
-    from veomni.utils.device import IS_NPU_AVAILABLE
-
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.deepseek_v3.generated.patched_modeling_deepseek_v3_npu import (
-            DeepseekV3ForCausalLM,
-        )
-    else:
-        from veomni.models.transformers.deepseek_v3.generated.patched_modeling_deepseek_v3_gpu import (
-            DeepseekV3ForCausalLM,
-        )
+    from veomni.models.transformers.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 
     config = tiny_deepseek_v3_config()
     if hasattr(config, "rope_interleave"):
@@ -477,16 +468,7 @@ def test_deepseek_v3_rope_keeps_construction_impl():
 
 
 def test_deepseek_v4_rope_keeps_construction_impl():
-    from veomni.utils.device import IS_NPU_AVAILABLE
-
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_npu import (
-            DeepseekV4ForCausalLM,
-        )
-    else:
-        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
-            DeepseekV4ForCausalLM,
-        )
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
 
     config = tiny_deepseek_v4_config()
     eager_cfg = eager_ops_config()

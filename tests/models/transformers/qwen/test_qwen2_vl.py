@@ -56,7 +56,7 @@ def _qwen2_vl_vision_fsdp_checkpoint_worker():
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
     from veomni.distributed.parallel_state import _init_parallel_state
-    from veomni.models.transformers.qwen2_vl.generated.patched_modeling_qwen2_vl_gpu import (
+    from veomni.models.transformers.qwen2_vl.modeling_qwen2_vl import (
         Qwen2VisionTransformerPretrainedModel,
     )
 
@@ -113,7 +113,7 @@ def test_qwen2_vl_default_vision_rope_with_fsdp_checkpoint():
 
 
 def _build_ours(config: Qwen2VLConfig, ops: SimpleNamespace | None = None):
-    from veomni.models.transformers.qwen2_vl.generated.patched_modeling_qwen2_vl_gpu import (
+    from veomni.models.transformers.qwen2_vl.modeling_qwen2_vl import (
         Qwen2VLForConditionalGeneration,
     )
 

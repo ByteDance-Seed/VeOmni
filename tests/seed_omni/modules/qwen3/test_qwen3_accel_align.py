@@ -138,10 +138,7 @@ def _monolithic_and_split_qwen3(
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module]:
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_npu import Qwen3ForCausalLM
-    else:
-        from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3ForCausalLM
+    from veomni.models.transformers.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
     Qwen3Config = get_veomni_config_class(HFQwen3Config)
     ops = make_eager_ops_config(attn_implementation=attn_implementation)
