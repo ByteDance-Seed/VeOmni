@@ -44,7 +44,9 @@ class TrainingMixin(TrainingModuleMixin):
     device: torch.device
     _chat_template: TextEncoderChatTemplate
     _encode_batch_shape: torch.LongTensor | None
-    _supports_sp_sharded_handoff: bool = True
+    #: ``wte`` is a per-token lookup, so slicing the packed ids is exact: the shard
+    #: this module writes back is the next module's input shard, item by item.
+    supports_sp_sharded_handoff = True
 
     @pre_forward("encode")
     def encode_pre(
@@ -86,7 +88,7 @@ class TrainingMixin(TrainingModuleMixin):
         batch_shape = self._encode_batch_shape
         self._encode_batch_shape = None
         if ps.sp_size > 1:
-            if ps.skip_sp_gather_between_modules and self._supports_sp_sharded_handoff:
+            if ps.skip_sp_gather_between_modules:
                 valid_len = int(self._sp_own_len)
                 self._sp_own_len = None
                 inputs_embeds = mask_sp_pad_tail(inputs_embeds, valid_len, ps.sp_rank, ps.sp_size)
@@ -117,7 +119,7 @@ class TrainingMixin(TrainingModuleMixin):
         del kwargs
         self._conversation_carrier = conversation_list
         ps = get_parallel_state()
-        if ps.sp_size > 1 and ps.skip_sp_gather_between_modules and self._supports_sp_sharded_handoff:
+        if ps.sp_size > 1 and ps.skip_sp_gather_between_modules:
             hidden_states, shift_labels = self._prepare_sharded_decode_inputs(self._conversation_carrier, ps)
         else:
             hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier)

@@ -40,6 +40,8 @@ class TrainingMixin(TrainingModuleMixin):
     config: Qwen3LlmConfig
     device: torch.device
     training: bool
+    #: See :attr:`TrainingModuleMixin.supports_sp_sharded_handoff`.
+    supports_sp_sharded_handoff = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

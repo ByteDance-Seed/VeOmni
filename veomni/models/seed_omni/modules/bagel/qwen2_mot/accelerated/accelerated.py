@@ -64,6 +64,10 @@ class TrainingMixin(TrainingModuleMixin):
     config: BagelQwen2MoTConfig
     device: torch.device
     dtype: torch.dtype
+    #: See :attr:`TrainingModuleMixin.supports_sp_sharded_handoff`: the packed MoT
+    #: scatters hidden states back through a two-stream mask, not by walking the
+    #: carrier, and gathers unconditionally.
+    supports_sp_sharded_handoff = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

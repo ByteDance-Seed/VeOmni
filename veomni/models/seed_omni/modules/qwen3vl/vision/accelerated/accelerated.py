@@ -45,6 +45,8 @@ class TrainingMixin(TrainingModuleMixin):
     config: Qwen3VLVisionEncoderConfig
     device: torch.device
     dtype: torch.dtype
+    #: See :attr:`TrainingModuleMixin.supports_sp_sharded_handoff`.
+    supports_sp_sharded_handoff = True
 
     def _merged_tokens_per_item(self, item: ConversationItem) -> int:
         """Merged visual tokens one item contributes: ``prod(grid) / merge²``.

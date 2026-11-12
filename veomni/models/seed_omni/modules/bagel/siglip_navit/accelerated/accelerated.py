@@ -33,6 +33,9 @@ class TrainingMixin(TrainingModuleMixin):
     config: BagelSiglipNavitConfig
     device: torch.device
     dtype: torch.dtype
+    #: See :attr:`TrainingModuleMixin.supports_sp_sharded_handoff`: this module
+    #: gathers unconditionally, so a skip-gather run is refused.
+    supports_sp_sharded_handoff = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

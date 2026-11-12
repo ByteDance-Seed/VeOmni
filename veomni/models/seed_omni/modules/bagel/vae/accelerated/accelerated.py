@@ -175,6 +175,10 @@ class TrainingMixin(TrainingModuleMixin):
     _conversation_carrier: list[list[ConversationItem]] | None
     _encode_items: list[ConversationItem]
     _sp_encode_count: int | None
+    #: See :attr:`TrainingModuleMixin.supports_sp_sharded_handoff`: this module
+    #: slices and gathers along the *image batch* dim, not the carrier's token
+    #: sequence, so a skip-gather run is refused.
+    supports_sp_sharded_handoff = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

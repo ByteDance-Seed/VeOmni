@@ -69,6 +69,10 @@ class TrainingMixin(TrainingModuleMixin):
     config: BagelFlowConnectorConfig
     device: torch.device
     dtype: torch.dtype
+    #: See :attr:`TrainingModuleMixin.supports_sp_sharded_handoff`: this module
+    #: slices over latent tokens, not the backbone sequence, and gathers
+    #: unconditionally, so a skip-gather run is refused.
+    supports_sp_sharded_handoff = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
