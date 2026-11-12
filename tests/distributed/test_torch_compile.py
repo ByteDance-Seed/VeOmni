@@ -279,7 +279,8 @@ def test_compile_decoder_blocks_accepts_scoped_no_split_modules(monkeypatch):
 
         def __init__(self):
             super().__init__()
-            self.selected = ToyDecoderLayer()
+            self.llama = nn.Module()
+            self.llama.blk = ToyDecoderLayer()
 
     def fake_compile(fn, **kwargs):
         calls.append(kwargs)
@@ -291,8 +292,39 @@ def test_compile_decoder_blocks_accepts_scoped_no_split_modules(monkeypatch):
     compiled = compile_decoder_blocks(model, CompileConfig())
 
     assert compiled == 1
-    assert getattr(model.selected, "_veomni_forward_compiled", False)
+    assert getattr(model.llama.blk, "_veomni_forward_compiled", False)
     assert calls == [{"fullgraph": True, "dynamic": False, "backend": "inductor"}]
+
+
+def test_a_scoped_entry_leaves_a_sibling_with_the_same_layer_class_alone(monkeypatch):
+    """Only the named child is compiled; a bare entry stays global.
+
+    Two children using the same decoder class is exactly the ambiguity
+    ``{child}.{ClassName}`` exists to settle, so collapsing the scope would
+    quietly compile both.
+    """
+    calls = []
+
+    class TwoChildModel(nn.Module):
+        _no_split_modules = ["llama.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llama = nn.Module()
+            self.llama.blk = ToyDecoderLayer()
+            self.other = nn.Module()
+            self.other.blk = ToyDecoderLayer()
+
+    def fake_compile(fn, **kwargs):
+        calls.append(kwargs)
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    model = TwoChildModel()
+    assert compile_decoder_blocks(model, CompileConfig()) == 1
+    assert getattr(model.llama.blk, "_veomni_forward_compiled", False)
+    assert not getattr(model.other.blk, "_veomni_forward_compiled", False)
 
 
 def test_compile_decoder_blocks_rejects_unvalidated_multimodal_model(monkeypatch):

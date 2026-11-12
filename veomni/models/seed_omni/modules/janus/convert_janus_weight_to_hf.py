@@ -178,8 +178,18 @@ def ensure_model_downloaded(
     """
     if local_dir is not None:
         if os.path.exists(local_dir):
-            print(f"Using provided local directory: {local_dir}")
-            return local_dir
+            # An existing directory is only usable if it actually holds a
+            # checkpoint; a stale-but-empty path would otherwise be returned and
+            # the conversion would fail later with a confusing missing-weight error.
+            has_weights = any(name.endswith((".safetensors", ".bin", ".pt", ".pth")) for name in os.listdir(local_dir))
+            if has_weights:
+                print(f"Using provided local directory: {local_dir}")
+                return local_dir
+            if repo_id is None:
+                raise ValueError(
+                    f"{local_dir} exists but contains no model weights, and no repo_id was given to fetch them."
+                )
+            print(f"Provided local directory is empty, downloading into it: {local_dir}")
         else:
             # Create the local directory if it doesn't exist
             os.makedirs(local_dir, exist_ok=True)
@@ -358,9 +368,25 @@ def convert_model(
                 extra_special_tokens=special_image_tokens,
             )
         else:
-            # Fallback to creating from text_model_id with special tokens
+            # Fallback to creating from text_model_id with special tokens. When
+            # there is no ``tokenizer.json`` and no explicit ``text_model_id``, use
+            # the checkpoint directory itself if it ships tokenizer files — passing
+            # ``None`` raises deep inside ``AutoTokenizer`` instead of naming the
+            # actual problem.
+            tokenizer_source = text_model_id
+            if tokenizer_source is None:
+                has_tokenizer_files = any(
+                    os.path.exists(os.path.join(input_path, name))
+                    for name in ("tokenizer_config.json", "vocab.json", "vocab.model", "spiece.model")
+                )
+                if not has_tokenizer_files:
+                    raise ValueError(
+                        f"{input_path} has no tokenizer.json and no tokenizer files AutoTokenizer can read. "
+                        "Pass text_model_id=<hf model id> or convert from a checkpoint that ships a tokenizer."
+                    )
+                tokenizer_source = input_path
             tokenizer = AutoTokenizer.from_pretrained(
-                text_model_id,
+                tokenizer_source,
                 bos_token=special_tokens_map["bos_token"],
                 eos_token=special_tokens_map["eos_token"],
                 pad_token=special_tokens_map["pad_token"],

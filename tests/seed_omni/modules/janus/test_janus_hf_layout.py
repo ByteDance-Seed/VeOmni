@@ -266,9 +266,10 @@ def test_the_backbone_never_ties_itself():
     [
         (False, False, True),  # Janus-1.3B: untied, the file stores its own head
         (True, False, False),  # a genuinely tied export omits lm_head.weight
-        # Tied config, but the export still stores the key: ``transformers`` refuses
-        # to tie when both are present, so the head must survive.
-        (True, True, True),
+        # Tied config and the duplicate stored with *equal* values: transformers
+        # keeps the tie there, so the head must stay tied rather than become an
+        # independent copy that SFT would drift away from the embedding.
+        (True, True, False),
     ],
     ids=["untied", "tied", "tied-with-duplicate"],
 )

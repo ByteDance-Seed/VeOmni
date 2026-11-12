@@ -47,10 +47,16 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
         image_processor: Any,
         dtype: Optional[torch.dtype] = None,
         dummy_pixel_values: Optional[torch.Tensor] = None,
+        patch_size: Optional[int] = None,
     ) -> None:
         self._image_processor = image_processor
         self._dtype = dtype
         self._dummy_pixel_values = dummy_pixel_values  # CPU (C, H, W), model dtype
+        # ``JanusImageProcessor`` carries no ``patch_size`` (it is not in its
+        # ``to_dict()``), so the tower's patch size has to come from the vision
+        # config — either recorded by ``bind_dummy_inputs`` or read from the
+        # module's own config in ``from_pretrained``.
+        self._patch_size = patch_size
 
     @property
     def _processor_size(self) -> tuple[int, int]:
@@ -75,16 +81,23 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
         patch and the aligner does not change the row count.
         """
         height, width = self._processor_size
-        # A processor always exposes ``patch_size``; a lightweight stand-in
-        # (a test double) may not, and one token per pixel is the honest default.
-        patch = int(getattr(self._image_processor, "patch_size", 1))
+        patch = self._patch_size
+        if patch is None:
+            raise RuntimeError(
+                f"{type(self).__name__}: patch size unknown — call bind_dummy_inputs() or build through "
+                "from_pretrained() so the vision config's patch_size is recorded."
+            )
         return (height // patch) * (width // patch)
 
     @classmethod
     def from_pretrained(cls, module_path: str, **kwargs: Any) -> "JanusSiglipPreprocessor":
         """Build straight from the checkpoint dir — no model instance needed."""
         del kwargs
-        return cls(JanusSiglipProcessor.from_pretrained(module_path))
+        config = JanusSiglipConfig.from_pretrained(module_path)
+        return cls(
+            JanusSiglipProcessor.from_pretrained(module_path),
+            patch_size=int(config.vision_config.patch_size),
+        )
 
     def bind_dummy_inputs(self, config: JanusSiglipConfig, dtype: Optional[torch.dtype] = None) -> None:
         """Training-only FSDP-anchor dummy — pure ``(config, dtype)``, no live model.
@@ -105,6 +118,7 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
                 "drop the vision_config override — a mixed real/dummy batch would fail to stack."
             )
         self._dtype = dtype
+        self._patch_size = int(cfg.patch_size)
         self._dummy_pixel_values = torch.zeros(cfg.num_channels, proc_h, proc_w, dtype=dtype)
 
     def preprocess_conversations(

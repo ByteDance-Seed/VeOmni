@@ -96,38 +96,41 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
         image_processor: JanusVqvaeProcessor,
         dtype: Optional[torch.dtype] = None,
         dummy_pixel_values: Optional[torch.Tensor] = None,
+        num_patches: Optional[int] = None,
     ) -> None:
         self._image_processor = image_processor
         self._dtype = dtype
         self._dummy_pixel_values = dummy_pixel_values  # CPU (C, H, W), model dtype
+        # The codec's grid side length, which ``JanusImageProcessor`` does not
+        # carry: recorded by ``bind_dummy_inputs`` or read in ``from_pretrained``.
+        self._num_patches = num_patches
 
     @property
     def _num_image_tokens(self) -> int:
         """VQ tokens one generation image expands to, i.e. its backbone row count.
 
-        Read off the processor alias when available, else derived from the grid
-        the codec decodes. HF allows ``size`` to be an ``int`` or a dict, so both
-        spellings are handled.
+        ``vq_config.num_patches`` is the codec's grid side length, so the token
+        count is its square. Deriving it here rather than reading
+        ``JanusVqvaeProcessor.num_image_tokens`` (a fixed 576) keeps a config with
+        a different grid from recording a wrong ``dyn_bsz`` row count.
         """
-        tokens = getattr(self._image_processor, "num_image_tokens", None)
-        if tokens is not None:
-            return int(tokens)
-        size = self._image_processor.size
-        if isinstance(size, int):
-            height = width = size
-        else:
-            height = size.get("height") or size.get("shortest_edge")
-            width = size.get("width") or size.get("shortest_edge")
-        # A processor always exposes ``patch_size``; a lightweight stand-in
-        # (a test double) may not, and one token per pixel is the honest default.
-        patch = int(getattr(self._image_processor, "patch_size", 1))
-        return (int(height) // patch) * (int(width) // patch)
+        patches = self._num_patches
+        if patches is None:
+            raise RuntimeError(
+                f"{type(self).__name__}: VQ grid unknown — call bind_dummy_inputs() or build through "
+                "from_pretrained() so the VQ config's num_patches is recorded."
+            )
+        return patches * patches
 
     @classmethod
     def from_pretrained(cls, module_path: str, **kwargs: Any) -> "JanusVqvaePreprocessor":
         """Build straight from the checkpoint dir — no model instance needed."""
         del kwargs
-        return cls(JanusVqvaeProcessor.from_pretrained(module_path))
+        config = JanusVqvaeConfig.from_pretrained(module_path)
+        return cls(
+            JanusVqvaeProcessor.from_pretrained(module_path),
+            num_patches=int(config.vq_config.num_patches),
+        )
 
     def bind_dummy_inputs(self, config: JanusVqvaeConfig, dtype: Optional[torch.dtype] = None) -> None:
         """Training-only FSDP-anchor dummy — pure ``(config, dtype)`` + the already
@@ -137,6 +140,7 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
         height = size.get("height")
         width = size.get("width")
         self._dtype = dtype
+        self._num_patches = int(cfg.num_patches)
         self._dummy_pixel_values = torch.zeros(cfg.in_channels, height, width, dtype=dtype)
 
     def preprocess_conversations(
