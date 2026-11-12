@@ -56,23 +56,6 @@ class TrainingModuleMixin:
     training-side runtime caches after ``super().__init__(...)``.
     """
 
-    #: Whether this module moves sequence activations through the carrier in a way
-    #: ``ParallelState.skip_sp_gather_between_modules`` can short-circuit.
-    #:
-    #: Three states, because "not applicable" and "cannot" are different answers:
-    #:
-    #: * ``True`` — ``post_forward`` can write this rank's ``1 / sp_size`` slice of
-    #:   the packed backbone sequence onto the carrier items, in order, so the next
-    #:   module can consume it without an all-gather.
-    #: * ``False`` — the module moves sequence activations through the carrier but
-    #:   gathers unconditionally, or scatters through a packed layout instead of
-    #:   walking the carrier. A run that turns the switch on is refused, because
-    #:   that boundary would pass a full-sequence tensor where a shard is expected.
-    #: * ``None`` (default) — the module does not move sequence activations through
-    #:   the carrier at all (an n-gram table lookup, a VAE latent, an FSDP anchor),
-    #:   so the switch neither helps nor hurts it and it is not checked.
-    supports_sp_sharded_handoff: bool | None = None
-
     def pre_forward(self, method: str, **kwargs: Any) -> dict[str, Any]:
         """Dispatch to the ``@pre_forward(method)``-decorated hook for this call-site."""
         name = hook_name(type(self), "_omni_pre_context", method)

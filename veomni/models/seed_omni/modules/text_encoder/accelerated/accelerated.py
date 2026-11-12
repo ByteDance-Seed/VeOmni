@@ -44,9 +44,6 @@ class TrainingMixin(TrainingModuleMixin):
     device: torch.device
     _chat_template: TextEncoderChatTemplate
     _encode_batch_shape: torch.LongTensor | None
-    #: ``wte`` is a per-token lookup, so slicing the packed ids is exact: the shard
-    #: this module writes back is the next module's input shard, item by item.
-    supports_sp_sharded_handoff = True
 
     @pre_forward("encode")
     def encode_pre(

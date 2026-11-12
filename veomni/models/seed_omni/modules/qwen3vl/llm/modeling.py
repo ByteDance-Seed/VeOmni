@@ -318,6 +318,9 @@ class Qwen3VLLlm(InferenceMixin, PretrainedOmniModule):
 
     config_class = Qwen3VLLlmConfig
     base_model_prefix = "qwen3vl_llm"
+    # Hidden states are a plain per-item concatenation of the carrier, so
+    # ``forward_post`` can write this rank's slice back item by item.
+    supports_sp_sharded_handoff = True
     main_input_name = "inputs_embeds"
     _no_split_modules = ["Qwen3VLTextDecoderLayer"]
     supports_gradient_checkpointing = True

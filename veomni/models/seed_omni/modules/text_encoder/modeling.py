@@ -182,6 +182,10 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
 
     config_class = TextEncoderConfig
     base_model_prefix = ""
+    # ``wte`` is a per-token lookup, so slicing the packed ids is exact: the shard
+    # ``encode_post`` writes back is the next module's input shard, item by item.
+    # ``decode`` likewise scores only this rank's label slice.
+    supports_sp_sharded_handoff = True
     # ``ShardedEmbedding`` must be its own FSDP2 unit: under ``emb`` its table is
     # vocab-split and a parent unit would mix different ranks' vocab slices.
     _no_split_modules: list = ["ShardedEmbedding"]

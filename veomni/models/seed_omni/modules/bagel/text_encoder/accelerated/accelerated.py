@@ -32,7 +32,6 @@ class TrainingMixin(BaseTrainingMixin):
     #: BAGEL's backbone is a packed MoT: ``bagel_qwen2_mot.forward_post`` scatters
     #: hidden states back through a two-stream mask rather than by walking the
     #: carrier, so this module cannot hand its shard on.
-    supports_sp_sharded_handoff = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

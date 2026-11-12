@@ -259,6 +259,9 @@ class Qwen3VLVisionEncoder(InferenceMixin, PretrainedOmniModule):
     """Qwen3-VL vision tower for image understanding."""
 
     config_class = Qwen3VLVisionEncoderConfig
+    # Merged tokens (and DeepStack features) are a run of carrier items, so both
+    # can be split at this rank's shard boundary and written back item by item.
+    supports_sp_sharded_handoff = True
     image_processor_class = Qwen3VLVisionImageProcessor
     video_processor_class = Qwen3VLVisionVideoProcessor
     preprocessor_class = Qwen3VLVisionPreprocessor

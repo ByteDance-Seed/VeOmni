@@ -147,6 +147,19 @@ for node in training_graph:
     `reduce_sequence_parallel_loss` combines the numerators and denominators
     over `fsdp_group` (`dp_sp`).
 
+Which modules can take part is declared per module, on
+`PretrainedOmniModule.supports_sp_sharded_handoff`
+(`veomni/models/seed_omni/modules/module_modeling_base.py`). It defaults to
+`False`; a model that implements the handoff sets it to `True` on its own
+modeling class — for example
+[`TextEncoder`](../../../veomni/models/seed_omni/modules/text_encoder/modeling.py#L188)
+and
+[`Qwen3VLVisionEncoder`](../../../veomni/models/seed_omni/modules/qwen3vl/vision/modeling.py#L264).
+`build_omni_model_runtime` refuses a run that enables
+`skip_sp_gather_between_modules` while any participating module still leaves it
+`False`, naming those modules, so one boundary cannot quietly keep gathering
+while the rest hand their shards on.
+
 The SP logic lives entirely in each module's `pre_forward` / `post_forward`;
 there is no separate SP hook. Inside the module's forward and backward pass,
 local intermediate activations scale as about `1/S` of a full sample, while
