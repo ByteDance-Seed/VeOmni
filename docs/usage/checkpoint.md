@@ -296,10 +296,12 @@ partial placements, or any active ExtraParallel dimension remain unproven.
 All ranks in a checkpoint operation must use the same logical model and
 checkpoint configuration, including the layout version and corresponding
 sharding specifications. Normal rank-local shard contents and mesh coordinates
-may differ. When any rank enables the canonical v2 layout, a preflight checks
-that every rank agrees on the logical layout and optimizer policy before any
-checkpoint is modified. Legacy-only configurations still rely on this agreement
-as an input contract. Rank-local layout validation errors are propagated to peers.
+may differ. When any rank enables the canonical v2 layout, a preflight compares
+the v2 flag, shard specifications, optimizer presence and trainable-only
+selection before any checkpoint is modified. This is not a complete proof of
+all runtime provenance or replica equality. Legacy-only configurations still
+rely on agreement as an input contract. Rank-local layout validation errors are
+propagated to peers.
 
 Raw `torch.distributed.checkpoint.load(..., planner=DefaultLoadPlanner(allow_partial_load=True))` is not a
 supported migration API: it can return success without reading any tensor when

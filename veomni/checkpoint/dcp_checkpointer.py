@@ -774,6 +774,13 @@ def _reject_unproven_extra_parallel_optimizer(state, parallel_state, *, group=No
                     if trainable_only
                     else ()
                 ),
+                runtime_ndims={
+                    name: tensor.ndim
+                    for name, tensor in (
+                        list(state["model"].named_parameters(remove_duplicate=False))
+                        + list(state["model"].named_buffers(remove_duplicate=False))
+                    )
+                },
             )
     except BaseException as exc:
         error = exc
@@ -806,7 +813,9 @@ def _reject_unproven_extra_parallel_optimizer(state, parallel_state, *, group=No
     raise_if_any_rank_failed(error, "checking canonical ExtraParallel runtime tensors", group=group)
 
 
-def _checkpoint_extra_parallel_signature(specs, *, optimizer_present, trainable_only, trainability=()):
+def _checkpoint_extra_parallel_signature(
+    specs, *, optimizer_present, trainable_only, trainability=(), runtime_ndims=None
+):
     """Describe logical layout, excluding rank-local coordinates and tensor contents."""
     entries = []
     for name, spec in sorted((specs or {}).items()):
@@ -822,8 +831,11 @@ def _checkpoint_extra_parallel_signature(specs, *, optimizer_present, trainable_
         if persistent_axis is not None:
             # Persistent shards do not use the ordinary FSDP axis or v2 marker.
             fsdp_axis, layout_v2 = None, None
-        if shape:
-            ndim = len(shape)
+        ndim = len(shape) if shape is not None else (runtime_ndims or {}).get(name)
+        if ndim:
+            for shard_axis in (axis, fsdp_axis, persistent_axis):
+                if shard_axis is not None and not -ndim <= shard_axis < ndim:
+                    raise RuntimeError(f"ExtraParallel checkpoint axis is outside the tensor rank: {name}")
             axis = axis % ndim if axis is not None else None
             fsdp_axis = fsdp_axis % ndim if fsdp_axis is not None else None
             persistent_axis = persistent_axis % ndim if persistent_axis is not None else None
