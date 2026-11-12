@@ -110,17 +110,20 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
         """VQ tokens one generation image expands to, i.e. its backbone row count.
 
         ``vq_config.num_patches`` is the codec's grid side length, so the token
-        count is its square. Deriving it here rather than reading
-        ``JanusVqvaeProcessor.num_image_tokens`` (a fixed 576) keeps a config with
-        a different grid from recording a wrong ``dyn_bsz`` row count.
+        count is its square — recorded by ``bind_dummy_inputs`` / ``from_pretrained``.
+        A processor alias that states the count itself (``JanusVqvaeProcessor``
+        carries ``num_image_tokens``) is honoured as a fallback; with neither, this
+        raises rather than guessing.
         """
-        patches = self._num_patches
-        if patches is None:
+        if self._num_patches is not None:
+            return self._num_patches**2
+        tokens = getattr(self._image_processor, "num_image_tokens", None)
+        if tokens is None:
             raise RuntimeError(
                 f"{type(self).__name__}: VQ grid unknown — call bind_dummy_inputs() or build through "
                 "from_pretrained() so the VQ config's num_patches is recorded."
             )
-        return patches * patches
+        return int(tokens)
 
     @classmethod
     def from_pretrained(cls, module_path: str, **kwargs: Any) -> "JanusVqvaePreprocessor":

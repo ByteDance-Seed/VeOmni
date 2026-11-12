@@ -118,7 +118,9 @@ def test_siglip_patch_count_does_not_depend_on_a_processor_patch_size():
 
 
 def test_siglip_refuses_to_count_tokens_before_the_patch_size_is_known():
-    processor = _processor()
+    """No config recorded and no ``patch_size`` on the processor: raise, do not guess."""
+    processor = JanusImageProcessor(size={"height": IMAGE_SIZE, "width": IMAGE_SIZE})
+    assert not hasattr(processor, "patch_size")
     pre = JanusSiglipPreprocessor(processor, dtype=torch.bfloat16)
     with pytest.raises(RuntimeError, match="patch size unknown"):
         _ = pre._num_patch_tokens

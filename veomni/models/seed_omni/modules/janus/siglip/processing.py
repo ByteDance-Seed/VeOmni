@@ -79,15 +79,22 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
 
         ``dyn_bsz`` counts these per image item; the tower emits one row per
         patch and the aligner does not change the row count.
+
+        The patch size comes from the vision config (``bind_dummy_inputs`` /
+        ``from_pretrained`` record it), because ``JanusImageProcessor`` does not
+        carry one. A processor that *does* expose it is honoured as a fallback;
+        with neither, this raises rather than guessing a count.
         """
         height, width = self._processor_size
-        patch = self._patch_size
+        patch = (
+            self._patch_size if self._patch_size is not None else getattr(self._image_processor, "patch_size", None)
+        )
         if patch is None:
             raise RuntimeError(
                 f"{type(self).__name__}: patch size unknown — call bind_dummy_inputs() or build through "
                 "from_pretrained() so the vision config's patch_size is recorded."
             )
-        return (height // patch) * (width // patch)
+        return (height // int(patch)) * (width // int(patch))
 
     @classmethod
     def from_pretrained(cls, module_path: str, **kwargs: Any) -> "JanusSiglipPreprocessor":
