@@ -206,6 +206,23 @@ Core files:
     - Offline DCP-to-HF conversion may cast `save_dtype` only onto floating tensors; integer and boolean buffers must retain their original dtype, and shard-size planning must use their original element sizes.
     - Do not remove this patch during torch upgrades until the new upstream consolidator is verified with sharded integer-tensor save/load coverage.
 
+## Dense MXFP8
+
+- MXFP8 is limited to explicitly selected bias-free dense Qwen3 decoder
+  projections under ordinary FSDP2, with FP32 masters and BF16/FP32 mixed
+  precision. Unsupported topology, QAT, LoRA, offload and compilation must fail
+  before conversion. Inspect config-owned `ops_implementation` for QAT as well
+  as model attributes.
+- Quantized AllGather needs uniform dim-0 shards aligned to 32 rows. Derive both
+  orientations directly from the master; do not transpose a lossy quantization
+  and re-quantize it. The two payloads plus scales are 2.0625 bytes/weight and
+  do not reduce BF16 communication volume.
+- Checkpoints must expose FP32 masters, never ephemeral gathered compute
+  payloads. An unset `mixed_precision.mxfp8` inherits HF recipe metadata;
+  only an explicit override can disable or replace it. Native execution needs
+  SM100+ and a successful current-rank GEMM probe; CPU oracles are not native
+  hardware acceptance.
+
 ## Code Quality
 
 19. **Ruff must pass before commit**

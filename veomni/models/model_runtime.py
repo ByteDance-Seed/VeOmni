@@ -414,6 +414,24 @@ class VeOmniModelRuntime:
                 "module inference (ModuleRuntime._init_eager_inference)."
             )
 
+        if (
+            args.accelerator.fsdp_config.mixed_precision.mxfp8 is not None
+            or getattr(getattr(self.model, "config", None), "veomni_mxfp8", None) is not None
+        ):
+            from ..distributed.mxfp8 import resolve_mxfp8_config
+
+            recipe = resolve_mxfp8_config(self.model, args.accelerator.fsdp_config.mixed_precision.mxfp8)
+            if (
+                recipe is not None
+                and recipe.enable
+                and (
+                    args.accelerator.offload_config.enable_activation
+                    or args.accelerator.offload_config.enable_async_activation
+                    or callable(getattr(self.model, "build_parallelize_model", None))
+                )
+            ):
+                raise ValueError("MXFP8 does not support activation offload or custom parallelization.")
+
         self._apply_async_activation_offload()
 
         # Customized parallelize model.
@@ -476,6 +494,8 @@ class VeOmniModelRuntime:
             early_stop=gc_cfg.early_stop,
             enable_forward_prefetch=args.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.accelerator.fsdp_config.offload,
+            enable_activation_offload=args.accelerator.offload_config.enable_activation
+            or args.accelerator.offload_config.enable_async_activation,
             fsdp_offload_pin_memory=args.accelerator.fsdp_config.offload_pin_memory,
             broadcast_model_weights_from_rank0=args.broadcast_model_weights_from_rank0,
             ep_sharded_stream_load=args.ep_sharded_stream_load,
