@@ -281,6 +281,9 @@ class ModuleRuntime(VeOmniModelRuntime):
         model_path = args.model_path
         model_type = self.module_config.model_type
         cls = OMNI_MODEL_REGISTRY[model_type]()
+        module_dtype = getattr(self.module_config, "dtype", None) or torch.bfloat16
+        if isinstance(module_dtype, str):
+            module_dtype = getattr(torch, module_dtype)
         if dist.is_initialized():
             device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
         else:
@@ -298,7 +301,7 @@ class ModuleRuntime(VeOmniModelRuntime):
                 self.hf_source,
                 self.module_name,
                 device_map=device_map,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=module_dtype,
             ).eval()
             self.model_config = self.model.config
             self._build_model_assets()
@@ -310,7 +313,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         self.model = cls.from_pretrained(
             model_path,
             config=self.module_config,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=module_dtype,
             device_map=device_map,
         ).eval()
         self.model_config = self.model.config

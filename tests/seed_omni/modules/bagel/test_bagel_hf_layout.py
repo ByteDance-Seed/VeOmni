@@ -191,6 +191,12 @@ def _write_bagel_hf_checkpoint(
     save_file(ae_tensors, root / "ae.safetensors", metadata={"format": "pt"})
     save_file(ema_tensors, root / "ema.safetensors", metadata={"format": "pt"})
 
+    # Mirror the upstream BAGEL checkpoint mismatch where ``config.json`` declares
+    # a smaller ``max_latent_size`` (2) than the 4x4 (16-row) ``latent_pos_embed.pos_embed``
+    # stored in ``ema.safetensors``.
+    cfg_dict["max_latent_size"] = 2
+    (root / "config.json").write_text(json.dumps(cfg_dict, indent=2), encoding="utf-8")
+
     if with_index:
         weight_map = {
             **dict.fromkeys(ae_tensors, "ae.safetensors"),
@@ -271,6 +277,8 @@ def test_an_hf_root_resolves_to_a_weight_free_split_view(hf_root):
     assert set(omni_cfg.module_names) == set(ALL_MODULES)
     assert omni_cfg.infer_type == "infer_und"
     assert set(omni_cfg.generation_graphs) == {"infer_edit", "infer_gen", "infer_und"}
+    # Recovered from the 16-row ``latent_pos_embed.pos_embed`` in ``ema.safetensors`` despite ``config.json`` saying 2.
+    assert omni_cfg._module_configs[FLOW].max_latent_size == 4
 
 
 @pytest.mark.parametrize("with_index", [True, False], ids=["with_index", "without_index"])
@@ -323,10 +331,20 @@ def test_accelerated_mot_fuses_qkv_on_load_and_splits_back_on_export(tmp_path: P
         ],
         dim=0,
     )
+    expected_qkv_gen = torch.cat(
+        [
+            ema_tensors["language_model.model.layers.0.self_attn.q_proj_moe_gen.weight"],
+            ema_tensors["language_model.model.layers.0.self_attn.k_proj_moe_gen.weight"],
+            ema_tensors["language_model.model.layers.0.self_attn.v_proj_moe_gen.weight"],
+        ],
+        dim=0,
+    )
     assert torch.equal(mot_accel.model.layers[0].self_attn.qkv_proj_und.weight, expected_qkv_und)
+    assert torch.equal(mot_accel.model.layers[0].self_attn.qkv_proj_gen.weight, expected_qkv_gen)
 
     with torch.no_grad():
         mot_accel.model.layers[0].self_attn.qkv_proj_und.weight.add_(1.0)
+        mot_accel.model.layers[0].self_attn.qkv_proj_gen.weight.add_(2.0)
 
     out = tmp_path / f"exported-{with_index}"
     save_hf_source_checkpoint(source, {MOT: (mot_accel, None)}, str(out))
@@ -346,15 +364,22 @@ def test_accelerated_mot_fuses_qkv_on_load_and_splits_back_on_export(tmp_path: P
         assert exported_ae[key].dtype == torch.float32
         assert torch.equal(exported_ae[key], value), key
 
-    modified_qkv_keys = {
+    modified_qkv_und_keys = {
         "language_model.model.layers.0.self_attn.q_proj.weight",
         "language_model.model.layers.0.self_attn.k_proj.weight",
         "language_model.model.layers.0.self_attn.v_proj.weight",
     }
+    modified_qkv_gen_keys = {
+        "language_model.model.layers.0.self_attn.q_proj_moe_gen.weight",
+        "language_model.model.layers.0.self_attn.k_proj_moe_gen.weight",
+        "language_model.model.layers.0.self_attn.v_proj_moe_gen.weight",
+    }
     for key, value in ema_tensors.items():
         assert exported_ema[key].dtype == torch.bfloat16
-        if key in modified_qkv_keys:
+        if key in modified_qkv_und_keys:
             assert torch.equal(exported_ema[key], value + 1.0), key
+        elif key in modified_qkv_gen_keys:
+            assert torch.equal(exported_ema[key], value + 2.0), key
         else:
             assert torch.equal(exported_ema[key], value), key
 
@@ -368,6 +393,7 @@ def test_offline_convert_matches_the_runtime_load(hf_root, tmp_path):
 
     split = OmniModel.from_pretrained(str(out), torch_dtype="auto", device_map="cpu", attn_implementation="eager")
     runtime = OmniModel.from_pretrained(str(root), torch_dtype="auto", device_map="cpu", attn_implementation="eager")
+    assert split.modules_dict[FLOW].config.max_latent_size == 4
     for name in ALL_MODULES:
         expected = runtime.modules_dict[name].state_dict()
         actual = split.modules_dict[name].state_dict()
@@ -375,6 +401,79 @@ def test_offline_convert_matches_the_runtime_load(hf_root, tmp_path):
         for key in expected:
             assert expected[key].dtype == actual[key].dtype, (name, key)
             assert torch.equal(expected[key], actual[key]), (name, key)
+
+
+def test_convert_bagel_checkpoint_honors_max_latent_size_override(hf_root, tmp_path):
+    root, _, _ = hf_root
+    out = tmp_path / "split_override"
+    convert_checkpoint(str(root), str(out), max_latent_size="8", attn_implementation="eager")
+
+    split = OmniModel.from_pretrained(str(out), torch_dtype="auto", device_map="cpu", attn_implementation="eager")
+    flow = split.modules_dict[FLOW]
+    assert flow.config.max_latent_size == 8
+    assert tuple(flow.latent_pos_embed.pos_embed.shape) == (64, 16)
+    assert flow.latent_pos_embed.pos_embed.dtype == torch.bfloat16
+
+    with pytest.raises(ValueError, match="max_latent_size must be positive"):
+        convert_checkpoint(str(root), str(tmp_path / "bad_override"), max_latent_size=0, attn_implementation="eager")
+
+
+def test_eager_inference_preserves_per_module_dtypes(hf_root, tmp_path, monkeypatch):
+    import accelerate.utils
+    import accelerate.utils.modeling
+
+    from veomni.arguments.omni_arguments_types import (
+        OmniArguments,
+        OmniDataArguments,
+        OmniInferArguments,
+        OmniModelRuntimeArguments,
+    )
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
+    from veomni.trainer.omni.omni_inferencer import OmniInferencer
+
+    monkeypatch.setattr(accelerate.utils, "get_max_memory", lambda max_memory=None: {"cpu": 10**10})
+    monkeypatch.setattr(accelerate.utils.modeling, "get_max_memory", lambda max_memory=None: {"cpu": 10**10})
+
+    root, _, _ = hf_root
+    split = tmp_path / "split"
+    convert_checkpoint(str(root), str(split), attn_implementation="eager")
+
+    modules_cfg = {
+        name: {
+            "model_path": name,
+            "ops_implementation": {"attn_implementation": "eager"},
+            "accelerator": {"fsdp_config": {"fsdp_mode": "eager"}},
+        }
+        for name in ALL_MODULES
+    }
+
+    for ckpt_path in (root, split):
+        args = OmniArguments(
+            model=OmniModelRuntimeArguments(
+                model_path=str(ckpt_path),
+                model_config={"modules": modules_cfg},
+            ),
+            data=OmniDataArguments(train_path=""),
+            infer=OmniInferArguments(),
+        )
+        inferencer = OmniInferencer(args)
+        assert {p.dtype for p in inferencer.modules[VAE].parameters()} == {torch.float32}
+        for name in (SIGLIP, TEXT_ENCODER, FLOW, MOT):
+            assert {p.dtype for p in inferencer.modules[name].parameters()} == {torch.bfloat16}
+
+        omni_cfg = inferencer.omni_model_runtime.to_hf_config()
+        omni_cfg.load_checkpoint_sidecars(inferencer.checkpoint_root)
+        for name in (VAE, TEXT_ENCODER):
+            rt = ModuleRuntime(
+                inferencer.omni_model_runtime.modules[name],
+                name,
+                module_config=omni_cfg._module_configs[name],
+                global_accelerator=inferencer.omni_model_runtime.accelerator,
+                for_inference=True,
+                hf_source=omni_cfg._hf_source,
+            )
+            expected_dtype = torch.float32 if name == VAE else torch.bfloat16
+            assert {p.dtype for p in rt.model.parameters()} == {expected_dtype}
 
 
 def test_hf_view_modules_must_all_come_from_the_layout(hf_root):
