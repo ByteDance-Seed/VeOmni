@@ -68,14 +68,24 @@ length, so `get_uniform_layout` caches the layout per `(rows, groups, device)`.
 Without it each dense projection paid a host read plus a layout-kernel launch per
 layer per step.
 
-The same layout makes the unpad step skippable. ``GroupedLinear`` normally
-gathers its padded output rows back into source order; when every group is already
-a multiple of the alignment -- always true for one group -- that gather is a
-prefix slice, and the row says so through ``layout.is_identity_unpad``.
+The same layout makes the unpad step skippable. `GroupedLinear` normally
+gathers its padded output rows back into source order; when there is a single
+group, or when every group was already padded to its own token count, the gather
+is the identity and the row returns the leading rows instead of a full-size
+`index_select`. `layout.is_identity_unpad` records which case applies, so the
+forward and the backward agree on it.
 
 The mainline DeepSeek V4 expert module is covered by a real forward/backward
-integration test, using its existing merged weights and FP32 router scores. This
-is operator integration, not full-model convergence validation.
+integration test, using its existing merged weights and FP32 router scores. The
+dense `linear` and `swiglu_mlp` rows are covered the same way: forward, dgrad and
+wgrad against an independently quantized reference and a BF16 GEMM, at row counts
+that are and are not a multiple of the 128-column alignment. This is operator
+integration, not full-model convergence validation.
+
+All of these tests need SM90/SM100 hardware and `deep_gemm`, so they skip on the
+CPU-only hosts that run part of CI — a green CI run does not by itself prove the
+rows execute. Check `tests/ops/moe_experts/test_deepgemm_fp8.py` on a Hopper or
+Blackwell host after changing `GroupedLinear`, the layout, or a quantizer.
 
 ## Requirements and tensor contract
 

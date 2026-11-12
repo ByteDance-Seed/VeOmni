@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the ``kv_round`` operation family (``standard`` and ``deepseek_v4``)."""
+"""Tests for the ``kv_round`` operation family (``standard``, ``deepseek_v4`` and ``fp4``)."""
 
 from __future__ import annotations
 
@@ -387,7 +387,96 @@ def test_fp4_rejects_a_partial_group():
         op(x, block_size=32)
 
 
-def test_fp4_none_row_leaves_the_tensor_untouched():
+@pytest.mark.parametrize("scale_fmt", ["e4m3", "ue8m0"])
+def test_fp4_none_row_leaves_the_tensor_untouched(scale_fmt: str):
+    """The off row must accept the same keywords the rounding rows do.
+
+    It is the default ``kv_round_implementation``, so a caller that selects the
+    fp4 variant and passes its documented ``scale_fmt`` reaches this row first. A
+    shared ``none`` from another variant would raise here instead of doing
+    nothing, which is why fp4 owns one.
+    """
     op = VeomniOp("kv_round", "fp4", "none")
     x = torch.randn(2, 4, 32, dtype=torch.bfloat16)
-    assert torch.equal(op(x, block_size=32), x)
+    assert torch.equal(op(x, block_size=32, scale_fmt=scale_fmt), x)
+
+
+@_TRITON_DEVICE
+@pytest.mark.parametrize("scale_fmt", ["e4m3", "ue8m0"])
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_triton_fp4_matches_eager(device: str, scale_fmt: str, block_size: int):
+    """The FP4 kernel must reproduce the eager round trip exactly, not approximately.
+
+    ``e4m3`` is where the two can drift: its amax floor is ``6 * 2^-9`` and it
+    divides by 6 *before* the narrowing cast, so an implementation that floors
+    the scale instead of the amax hands back a value up to 6x too large for every
+    small-magnitude block -- the common case once activations are normalized.
+    The tiny and all-zero blocks below are what pin that down.
+    """
+    eager = VeomniOp("kv_round", "fp4", "eager")
+    triton = _triton_op("fp4", device)
+
+    torch.manual_seed(7)
+    normal = torch.randn(3, 5, block_size * 2, dtype=torch.bfloat16, device=device)
+    torch.testing.assert_close(
+        triton(normal, block_size=block_size, scale_fmt=scale_fmt),
+        eager(normal, block_size=block_size, scale_fmt=scale_fmt),
+        rtol=0,
+        atol=0,
+        msg="normal",
+    )
+
+    tiny = torch.randn(2, 3, block_size, dtype=torch.bfloat16, device=device) * 1e-3
+    torch.testing.assert_close(
+        triton(tiny, block_size=block_size, scale_fmt=scale_fmt),
+        eager(tiny, block_size=block_size, scale_fmt=scale_fmt),
+        rtol=0,
+        atol=0,
+        msg="tiny",
+    )
+
+    zeros = torch.zeros(1, 2, block_size, dtype=torch.bfloat16, device=device)
+    torch.testing.assert_close(
+        triton(zeros, block_size=block_size, scale_fmt=scale_fmt),
+        eager(zeros, block_size=block_size, scale_fmt=scale_fmt),
+        rtol=0,
+        atol=0,
+        msg="zeros",
+    )
+
+    huge = torch.full((1, 2, block_size), 1e4, dtype=torch.bfloat16, device=device)
+    torch.testing.assert_close(
+        triton(huge, block_size=block_size, scale_fmt=scale_fmt),
+        eager(huge, block_size=block_size, scale_fmt=scale_fmt),
+        rtol=0,
+        atol=0,
+        msg="saturating",
+    )
+
+
+@pytest.mark.parametrize("amax", [0.0, 0.005, 0.02, 0.05, 0.2])
+def test_fp4_e4m3_scale_floors_the_amax_not_the_scale(amax: float):
+    """A block never stores a magnitude far above its own amax.
+
+    The floor is applied to the amax (``6 * 2^-9``) *before* dividing by 6, so a
+    sub-floor block gets a scale no larger than the floor's and the ratio it
+    implies stays near ``6``. Flooring the *scale* instead hands back a scale up to
+    6x bigger, and since the numerator is unchanged the stored magnitudes inflate
+    with it -- a silent eager/Triton divergence for exactly the small blocks that
+    normalized activations produce.
+
+    Some overshoot is expected and is not the bug: near the floor an E4M3 scale
+    sits in its subnormal range, where the step is coarse, so ``6 * scale`` can
+    exceed the amax by ~17% for the smallest blocks. ``6x`` is a different
+    failure entirely, and it is what flooring the scale instead of the amax
+    produces.
+    """
+    from veomni.ops.kernels.kv_round.fp4.eager import fp4_roundtrip
+
+    x = torch.full((1, 1, 32), amax, dtype=torch.bfloat16)
+    y = fp4_roundtrip(x, block_size=32, scale_fmt="e4m3").float()
+
+    assert torch.isfinite(y).all()
+    assert y.abs().max() <= amax * 1.25 + 1e-6, f"stored {y.abs().max()} above amax {amax}"
+    if amax == 0.0:
+        assert torch.equal(y, torch.zeros_like(y))

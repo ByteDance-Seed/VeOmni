@@ -25,11 +25,14 @@ implementation is the backend that performs it.
   indexer head. A caller selects which by passing ``rope_features``.
 
 The *implementation* is the backend: ``eager`` is a PyTorch round trip, ``triton``
-the same arithmetic on a fused kernel. Both variants also register ``none``, which
+the same arithmetic on a fused kernel. Every variant also registers ``none``, which
 returns the tensor unchanged. Every other family spells "off" as ``eager``; here
 ``eager`` is a real rounding row, so "off" needs its own name. That keeps the field
 shaped like the others -- the model always builds a handle and never branches on a
-missing one.
+missing one. Each variant owns its own ``none`` because the call arguments differ:
+``standard``'s takes ``quant_features``, ``fp4``'s takes ``scale_fmt``, and a
+caller passes its variant's arguments to whichever row the config selected --
+including the off row, which is this family's default.
 
 The *element format* is not part of either name. ``fp4`` below is a separate
 variant rather than an ``impl`` because it changes what the stored tensor means --
@@ -53,6 +56,7 @@ from .deepseek_v4 import eager as dsv4_eager
 from .deepseek_v4 import none as dsv4_none
 from .deepseek_v4 import triton as dsv4_triton
 from .fp4 import eager as fp4_eager
+from .fp4 import none as fp4_none
 from .fp4 import triton as fp4_triton
 from .standard import eager as standard_eager
 from .standard import none as standard_none
@@ -135,8 +139,8 @@ register_op(
     "kv_round",
     "fp4",
     "none",
-    standard_none.forward,
-    standard_none.backward,
+    fp4_none.forward,
+    fp4_none.backward,
     description="Leave stored tensors unchanged; the off state for this family",
 )
 

@@ -56,12 +56,13 @@ def _triton_fp4_roundtrip_kernel(
     x = tl.load(X + row * X_STRIDE_ROW + col_offs).to(tl.float32)
     amax = tl.max(tl.abs(x), axis=0)
     if USE_E4M3_SCALE:
-        # Smallest normal of E4M3 below, largest finite value above: the cast is
-        # narrowing, so an unclamped ratio above 448 becomes NaN and takes the
-        # block's scale with it.
-        ratio = (tl.maximum(amax, 6.0 * (2.0**-9)) * (1.0 / 6.0)).to(tl.float32)
-        scale = tl.minimum(ratio, 448.0).to(tl.float8e4nv).to(tl.float32)
-        scale = tl.maximum(scale, 6.0 * (2.0**-9))
+        # Floor the *amax* at E4M3's smallest normal, then divide by 6, then clamp
+        # the ratio into the castable range. The cast is narrowing, so an
+        # unclamped ratio above 448 becomes NaN and takes the block's scale with
+        # it. Both floors are on the same quantity as the eager row's, which is
+        # what keeps the two backends bit-identical.
+        scale = (tl.maximum(amax, 6.0 * (2.0**-9)) * (1.0 / 6.0)).to(tl.float32)
+        scale = tl.minimum(scale, 448.0).to(tl.float8e4nv).to(tl.float32)
     else:
         # Smallest E8M0 exponent step, then round the ratio up to a power of two.
         scaled = tl.maximum(amax, 6.0 * (2.0**-126)) * (1.0 / 6.0)
@@ -70,7 +71,7 @@ def _triton_fp4_roundtrip_kernel(
         scale = (exp_byte << 23).to(tl.float32, bitcast=True)
     v = tl.minimum(tl.maximum(x / scale, -6.0), 6.0)
     a = tl.abs(v)
-    # Nearest E2M1 magnitude; ties round down, as the reference quantizer does.
+    # Nearest E2M1 magnitude; a value exactly on a midpoint rounds down.
     nearest = tl.where(
         a <= 1.75,
         tl.where(

@@ -82,9 +82,9 @@ model:
       fsdp_mode: fsdp2
       mixed_precision:
         enable: true
-        # FP32 reduction keeps the straight-through gradients in the wider format;
-        # the quantizers themselves upcast internally, so param dtype does not matter
-        # to them.
+        # Required: every `deepgemm_fp8` row rejects a non-BF16 operand, and the
+        # shared expert's fused kernel does the same. FP32 reduction keeps the
+        # gradients in the wider format; the GEMMs themselves are FP8 either way.
         param_dtype: bfloat16
         reduce_dtype: float32
   chat_template: chatml

@@ -149,10 +149,10 @@ activation is fused into the grouped GEMM there, so the Python fallback genuinel
 cannot quantize), and expert LoRA is refused as above.
 
 There is no cross-family conflict to reject. `deepgemm_fp8` and `qat` are two
-values of the same `moe_implementation` field, so the routed experts cannot be
-quantized twice; the dense families are separate GEMMs, so pairing them with
-DeepGEMM experts is a valid recipe -- and the only way to quantize the shared
-expert, which DeepGEMM does not cover.
+values of the same `*_implementation` field, so one GEMM cannot be rounded twice;
+the families are separate GEMMs, so pairing them differently is a valid recipe --
+and necessary, because the routed-expert kernel does not cover the dense shared
+expert.
 
 torchao-backed formats register as further rows on the same families, on top of
 this mechanism. Their rows are added by the PRs that own those formats.
@@ -605,8 +605,9 @@ GEMM and changes nothing about how the product is accumulated. `deepgemm_fp8`
 rounds them and multiplies on the FP8 tensor cores, which is the deployment GEMM
 itself; it covers forward, input gradient and weight gradient. A model can select
 them independently per family, and `deepseek_v4_qat.yaml` documents why: the
-shared expert is a dense SwiGLU FFN that DeepGEMM's expert kernel does not cover,
-so its family can stay on `qat` while the routed experts run `deepgemm_fp8`.
+routed-expert kernel takes the experts' merged slab, so the dense shared expert
+is a separate GEMM with its own field and can stay on `qat` while the routed
+experts run `deepgemm_fp8`.
 
 Both quantizing rows refuse to run on a projection substituted after
 construction (LoRA keeps the base layer at `base_layer` and owns no `weight`):

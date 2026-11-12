@@ -658,3 +658,127 @@ def test_grouped_linear_activation_offload_preserves_output_and_gradients(fp8_we
         results.append((y.detach(), dx, dw))
     for actual, expected in zip(results[1], results[0]):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_linear_row_uses_the_dense_identity_unpad_path():
+    """A dense projection is one group, so its layout must take the prefix-slice path.
+
+    ``GroupedLinear`` normally gathers padded rows back into source order. With one
+    group there is nothing to reorder, and the dense rows depend on that: a gather
+    there would cost a full-size ``index_select`` per projection per step. This
+    pins both halves -- the layout reports the fast path, and the row's output still
+    matches a plain FP8 GEMM at a row count that is not a multiple of the alignment.
+    """
+    from deep_gemm.testing import calc_diff
+
+    from veomni.ops import VeomniOp
+    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import get_uniform_layout
+
+    torch.manual_seed(101)
+    for n_rows in (128, 130, 257):
+        layout = get_uniform_layout(n_rows, 1, torch.device("cuda"))
+        assert layout.is_identity_unpad, n_rows
+        assert len(layout.counts) == 1
+
+        linear = torch.nn.Linear(256, 384, bias=False, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(n_rows, 256, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            actual = VeomniOp("linear", "standard", "deepgemm_fp8")(linear, x)
+        assert actual.shape == (n_rows, 384)
+
+        reference = _quantized_rows(x) @ _quantized_weight(linear.weight).T
+        # Every row must survive: a dropped padding tail or a mis-sliced prefix
+        # would show up as a wrong row count above and as a bad diff here.
+        assert calc_diff(actual, reference.bfloat16()) < 0.001, n_rows
+
+
+def test_linear_row_backward_matches_a_bf16_reference():
+    """dgrad and wgrad go through the same one-group layout as the forward."""
+    from deep_gemm.testing import calc_diff
+
+    from veomni.ops import VeomniOp
+
+    torch.manual_seed(102)
+    for n_rows in (128, 130):
+        linear = torch.nn.Linear(256, 384, bias=False, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(n_rows, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        op = VeomniOp("linear", "standard", "deepgemm_fp8")
+        out = op(linear, x)
+        grad = torch.randn_like(out)
+        dx, dw = torch.autograd.grad(out, (x, linear.weight), grad)
+
+        assert dx.shape == x.shape and dw.shape == linear.weight.shape
+        bf16 = grad.float() @ linear.weight.detach().float()
+        assert calc_diff(dx, bf16.bfloat16()) < 0.001, f"dgrad {n_rows}"
+        bf16_dw = grad.float().T @ x.detach().float()
+        assert calc_diff(dw, bf16_dw.bfloat16()) < 0.001, f"wgrad {n_rows}"
+
+
+def test_grouped_linear_row_matches_a_per_group_bmm():
+    """The grouped row permutes to group-major, GEMMs, and permutes back."""
+    from deep_gemm.testing import calc_diff
+
+    from veomni.ops import VeomniOp
+
+    class _Grouped(torch.nn.Linear):
+        """The grouped layout ``DeepseekV4GroupedLinear`` owns."""
+
+        def __init__(self, in_per_group: int, n_groups: int, out_per_group: int):
+            super().__init__(in_per_group, n_groups * out_per_group, bias=False)
+            self.n_groups = n_groups
+
+    torch.manual_seed(103)
+    n_groups, in_per_group, out_per_group, n_rows = 4, 256, 192, 130
+    linear = _Grouped(in_per_group, n_groups, out_per_group).cuda().to(torch.bfloat16)
+    x = torch.randn(n_rows, n_groups, in_per_group, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    out = VeomniOp("linear", "grouped", "deepgemm_fp8")(linear, x)
+
+    assert out.shape == (n_rows, n_groups, out_per_group)
+    reference = torch.bmm(
+        _quantized_rows(x.reshape(-1, in_per_group)).reshape(n_rows, n_groups, in_per_group).transpose(0, 1),
+        _quantized_weight(linear.weight).view(n_groups, out_per_group, in_per_group).transpose(1, 2),
+    ).transpose(0, 1)
+    assert calc_diff(out, reference.bfloat16()) < 0.001
+
+    (dx,) = torch.autograd.grad(out.sum(), x)
+    assert dx.shape == x.shape
+    assert torch.isfinite(dx).all()
+
+
+def test_swiglu_mlp_row_matches_the_quantized_reference():
+    """gate/up share one GEMM, and the clamp plus silu*mul stay in the model dtype."""
+    from deep_gemm.testing import calc_diff
+
+    from veomni.ops import VeomniOp
+
+    torch.manual_seed(104)
+    hidden, intermediate, limit = 256, 384, 10.0
+    for n_rows in (128, 130):
+        gate = torch.nn.Linear(hidden, intermediate, bias=False, device="cuda", dtype=torch.bfloat16)
+        up = torch.nn.Linear(hidden, intermediate, bias=False, device="cuda", dtype=torch.bfloat16)
+        down = torch.nn.Linear(intermediate, hidden, bias=False, device="cuda", dtype=torch.bfloat16)
+        for proj in (gate, up, down):
+            proj.weight.data.mul_(0.05)
+        x = torch.randn(n_rows, hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        empty = x.new_empty(0)
+
+        out = VeomniOp("swiglu_mlp", "standard", "deepgemm_fp8")(
+            x,
+            gate.weight,
+            empty,
+            up.weight,
+            empty,
+            down.weight,
+            empty,
+            swiglu_limit=limit,
+        )
+        assert out.shape == (n_rows, hidden)
+
+        qx = _quantized_rows(x)
+        g = (qx @ _quantized_weight(gate.weight).T).clamp(max=limit)
+        u = (qx @ _quantized_weight(up.weight).T).clamp(min=-limit, max=limit)
+        reference = _quantized_rows(torch.nn.functional.silu(g) * u) @ _quantized_weight(down.weight).T
+        assert calc_diff(out, reference.bfloat16()) < 0.001, n_rows
+
+        (dx,) = torch.autograd.grad(out.sum(), x)
+        assert dx.shape == x.shape and torch.isfinite(dx).all(), n_rows

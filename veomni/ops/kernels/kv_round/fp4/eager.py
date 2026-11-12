@@ -41,9 +41,12 @@ def _round_to_fp4(values: Tensor) -> Tensor:
     """Round to the nearest E2M1 magnitude, keeping the sign.
 
     The midpoints between consecutive magnitudes are ``0.25, 0.75, 1.25, 1.75,
-    2.5, 3.5, 5.0``; a value exactly on one rounds down, matching the reference
-    quantizer. Written out rather than derived from a table because the table
-    would have to be indexed by an already-quantized code.
+    2.5, 3.5, 5.0``; a value exactly on one rounds *down*. That is what the
+    released DeepSeek checkpoints were produced with and what the deployment
+    kernel reads back, so it is the convention here -- note it is not
+    round-half-to-even (``0.75 -> 0.5``, ``2.5 -> 2.0``), which is what a
+    hardware E2M1 convert typically does. Written out rather than derived from a
+    table because the table would have to be indexed by an already-quantized code.
     """
     a = values.abs()
     nearest = torch.where(
