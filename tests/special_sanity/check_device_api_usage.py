@@ -25,6 +25,7 @@ python3 tests/special_sanity/check_device_api_usage.py --directory ./tasks
 python3 tests/special_sanity/check_device_api_usage.py --directory ./veomni
 """
 
+import ast
 import os
 from argparse import ArgumentParser
 from pathlib import Path
@@ -78,6 +79,11 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "tests/distributed/test_async_activation_offload.py",
     "tests/models/test_qwen_image_precision.py",
     "tests/precision/qwen_image.py",
+    # These Muon tests exercise CUDA-specific precision settings and mocks.
+    "tests/optim/test_qwen38_cuda_native.py",
+    "tests/optim/test_qwen38_cuda_preflight.py",
+    "tests/optim/test_qwen38_muon.py",
+    "tests/optim/test_qwen38_muon_device.py",
     # Compute-unit lookup is asserted per backend by name (cuda / npu / xpu /
     # mlu), with each namespace stubbed; the literals are fixtures, not device
     # management.
@@ -97,6 +103,56 @@ NCCL_KEYWORD_CHECK_WHITELIST = [
 SEARCH_WHITELIST = CUDA_KEYWORD_CHECK_WHITELIST + NCCL_KEYWORD_CHECK_WHITELIST
 
 SEARCH_KEYWORDS = [".cuda", '"cuda"', '"nccl"']
+
+# Only these existing Muon lines need backend-specific precision inspection or
+# device dispatch. The existing keyword scan still checks every other line.
+LINE_EXCEPTIONS = {
+    "veomni/optim/optimizer.py": {
+        "_qwen38_cuda_domain": {
+            'local = (mesh is not None and mesh.device_type == "cuda") or any(',
+            'return any(flags) or torch.distributed.get_backend() == "nccl"',
+        },
+        "build_optimizer": {
+            'local_cuda = any(param.device.type == "cuda" for group in param_groups for param in group["params"])',
+            'cuda_guard = any(flags) or torch.distributed.get_backend() == "nccl"',
+        },
+        "build_extra_parallel_fsdp2_optimizer": {
+            'cuda_guard = cuda_guard or torch.distributed.get_backend() == "nccl"',
+        },
+    },
+    "veomni/optim/qwen38_muon.py": {
+        "_check_cuda_fp32_policy": {"backend = torch.backends.cuda.matmul"},
+        "_optimizer_uses_cuda": {
+            'return any(param.device.type == "cuda" for group in optimizer.param_groups for param in group["params"])'
+        },
+        "_strict_matmul": {'elif device_type == "cuda":'},
+    },
+}
+
+
+def _remove_scoped_exceptions(path: str, content: str) -> str:
+    rules = next(
+        (rules for suffix, rules in LINE_EXCEPTIONS.items() if path.endswith(suffix.replace("/", os.sep))), None
+    )
+    if rules is None:
+        return content
+    try:
+        module = ast.parse(content)
+    except SyntaxError:
+        return content
+
+    lines = content.splitlines()
+    excluded = set()
+    for name, permitted_lines in rules.items():
+        functions = [node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == name]
+        if len(functions) != 1:
+            continue
+        function = functions[0]
+        for permitted in permitted_lines:
+            matches = [i for i in range(function.lineno - 1, function.end_lineno) if lines[i].strip() == permitted]
+            if len(matches) == 1:
+                excluded.add(matches[0])
+    return "\n".join(line for i, line in enumerate(lines) if i not in excluded)
 
 
 if __name__ == "__main__":
@@ -124,7 +180,7 @@ if __name__ == "__main__":
             continue
 
         with open(path_in_str, encoding="utf-8") as f:
-            file_content = f.read()
+            file_content = _remove_scoped_exceptions(path_in_str, f.read())
 
             find_invalid_device_management = False
 
