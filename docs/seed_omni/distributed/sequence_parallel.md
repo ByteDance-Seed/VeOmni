@@ -119,6 +119,28 @@ for node in training_graph:
   sequence, the backbone assembles its packed sequence from full-length
   embeddings, then slices again for its own forward. There is no extra reshard
   mechanism between modules.
+- **Skipping inter-module SP all-gathers (`skip_sp_gather_between_modules: true`).**
+  On ultra-long sequences (e.g. `128k`–`256k` tokens), materializing the
+  full-sequence embeddings after `text_encoder.encode` and the full-sequence
+  hidden states after `llm.forward` adds two full-sequence `AllGather` /
+  `ReduceScatter` pairs and keeps full-sequence autograd buffers alive across
+  module boundaries. Setting `model.accelerator.skip_sp_gather_between_modules: true`
+  (propagated to `ParallelState.skip_sp_gather_between_modules`) lets modules
+  sharing the same SP/CP configuration hand off `1/S` sequence shards directly
+  through `veomni/models/seed_omni/modules/base/llm_packing.py`:
+  - On text-only batches (`is_text_only_conversation`), `text_encoder.encode_post`
+    zero-masks any SP pad tail rows and stashes `(local_embeds, valid_len)` via
+    `stash_sp_sharded_embeds` instead of calling `gather_outputs`, and the
+    backbone's `forward_pre` consumes that shard via `pop_sp_sharded_embeds` and
+    builds `position_ids` / `cu_seqlens` from carrier metadata
+    (`pack_llm_metadata_from_conversations`).
+  - On both text-only and multimodal batches, the backbone's `forward_post`
+    stashes this rank's `[start, end)` output shard (`SpShardedHiddenStates`)
+    via `stash_sp_sharded_hidden_states` instead of calling `gather_outputs`,
+    and `text_encoder.decode_pre` (`_prepare_sharded_decode_inputs`) slices the
+    shifted labels to `[sharded.start : sharded.end]` so each rank projects and
+    scores only its own `1/S` slice before `reduce_sequence_parallel_loss`
+    combines the numerators and denominators over `fsdp_group` (`dp_sp`).
 
 The SP logic lives entirely in each module's `pre_forward` / `post_forward`;
 there is no separate SP hook. Inside the module's forward and backward pass,

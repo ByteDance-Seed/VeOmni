@@ -29,6 +29,7 @@ class TrainingMixin(BaseTrainingMixin):
     dtype: torch.dtype
     _chat_template: BagelChatTemplate | None
     _encode_batch_shape: torch.LongTensor | None
+    _supports_sp_sharded_handoff: bool = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

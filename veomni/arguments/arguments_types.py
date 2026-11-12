@@ -905,6 +905,14 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Context parallel size."},
     )
+    skip_sp_gather_between_modules: bool = field(
+        default=False,
+        metadata={
+            "help": "When True, SeedOmni modules sharing the same SP/CP configuration pass "
+            "sequence-sharded activations directly between modules without all-gathering "
+            "to restore full conversation_list tensors."
+        },
+    )
     init_device: Literal["cuda", "meta", "npu", "mlu"] = field(
         default="meta",
         metadata={

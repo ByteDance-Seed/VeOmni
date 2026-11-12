@@ -26,7 +26,13 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 from ....mixins.base_mixin import BaseMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from ....utils.conversation import ConversationItem
+from ....utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
+from ...base.llm_packing import (
+    SpShardedHiddenStates,
+    is_text_only_conversation,
+    pop_sp_sharded_hidden_states,
+    stash_sp_sharded_embeds,
+)
 from ..chat_template import TextEncoderChatTemplate
 from ..configuration import TextEncoderConfig
 from ..modeling import TextEncoder, scatter_text_encoder_embeds
@@ -39,6 +45,7 @@ class TrainingMixin(TrainingModuleMixin):
     device: torch.device
     _chat_template: TextEncoderChatTemplate
     _encode_batch_shape: torch.LongTensor | None
+    _supports_sp_sharded_handoff: bool = True
 
     @pre_forward("encode")
     def encode_pre(
@@ -74,16 +81,42 @@ class TrainingMixin(TrainingModuleMixin):
 
     @post_forward("encode")
     def encode_post(self, inputs_embeds: torch.Tensor) -> Dict[str, Any]:
-        if get_parallel_state().sp_size > 1:
-            # SP output-gather: all-gather token shards back to the full sequence
-            # (autograd-aware; backward sums grads across the SP group), then drop
-            # the SP pad tail so the packed length matches its carrier below.
-            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=0, group=get_parallel_state().sp_group)
-            inputs_embeds = inputs_embeds.narrow(0, 0, self._sp_own_len)
+        ps = get_parallel_state()
         conversation = self._conversation_carrier
         self._conversation_carrier = None
         batch_shape = self._encode_batch_shape
         self._encode_batch_shape = None
+        if ps.sp_size > 1:
+            if (
+                ps.skip_sp_gather_between_modules
+                and self._supports_sp_sharded_handoff
+                and is_text_only_conversation(conversation)
+            ):
+                valid_len = int(self._sp_own_len)
+                self._sp_own_len = None
+                full_len = valid_len + (-valid_len % ps.sp_size)
+                local_len = full_len // ps.sp_size
+                start = ps.sp_rank * local_len
+                if start + local_len > valid_len:
+                    valid_in_shard = max(0, valid_len - start)
+                    if valid_in_shard == 0:
+                        inputs_embeds = inputs_embeds * 0.0
+                    else:
+                        inputs_embeds = torch.cat(
+                            [
+                                inputs_embeds[:valid_in_shard],
+                                inputs_embeds[valid_in_shard:] * 0.0,
+                            ],
+                            dim=0,
+                        )
+                stash_sp_sharded_embeds(conversation, inputs_embeds, valid_len)
+                return {"conversation_list": conversation}
+            # SP output-gather: all-gather token shards back to the full sequence
+            # (autograd-aware; backward sums grads across the SP group), then drop
+            # the SP pad tail so the packed length matches its carrier below.
+            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=0, group=ps.sp_group)
+            inputs_embeds = inputs_embeds.narrow(0, 0, self._sp_own_len)
+            self._sp_own_len = None
         scatter_text_encoder_embeds(conversation, unflatten(inputs_embeds, batch_shape))
         return {"conversation_list": conversation}
 
@@ -98,7 +131,12 @@ class TrainingMixin(TrainingModuleMixin):
         # framework metadata and sibling-module keys from failing the call.
         del kwargs
         self._conversation_carrier = conversation_list
-        hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier)
+        sharded = pop_sp_sharded_hidden_states(self._conversation_carrier)
+        self._last_sp_sharded_hidden = sharded
+        if sharded is not None:
+            hidden_states, shift_labels = self._prepare_sharded_decode_inputs(self._conversation_carrier, sharded)
+        else:
+            hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier)
         # No SP sharding here: the lm-head loss is a token-weighted mean over the whole
         # ``dp_sp`` (``fsdp_group``) mesh (``modeling.decode`` →
         # ``reduce_sequence_parallel_loss``), so each rank scoring only its OWN span
@@ -181,6 +219,54 @@ class TrainingMixin(TrainingModuleMixin):
         # orders after the backbone kernels on the GPU stream without a CPU stall.
         shift_labels = shift_labels.to(device=hidden_states.device, non_blocking=True)
         return hidden_states, shift_labels
+
+    def _prepare_sharded_decode_inputs(
+        self,
+        conversation_list: Optional[list[list[ConversationItem]]],
+        sharded: SpShardedHiddenStates,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prepare decode ``(hidden_states, shift_labels)`` directly from this rank's SP/CP slice."""
+        label_chunks: list[torch.Tensor] = []
+        sample_starts: list[int] = []
+        decode_len = 0
+
+        for sample in conversation_list or []:
+            sample_start = decode_len
+            for part in sample:
+                if part.is_dummy:
+                    continue
+                if part.type == "text":
+                    labels = part.meta["labels"]
+                    label_chunks.append(labels)
+                    decode_len += int(labels.shape[0])
+                else:
+                    seg_len = (
+                        int(part.value.size(0))
+                        if isinstance(part.value, torch.Tensor)
+                        else int(part.meta.get(_OMNI_TOKEN_LEN, 1))
+                    )
+                    label_chunks.append(torch.full((seg_len,), IGNORE_INDEX, dtype=torch.long))
+                    decode_len += seg_len
+            if decode_len > sample_start:
+                sample_starts.append(sample_start)
+
+        if decode_len != sharded.valid_len:
+            raise RuntimeError(
+                f"Sharded decode labels walked {decode_len} tokens, but backbone packed {sharded.valid_len}."
+            )
+        labels = torch.cat(label_chunks, dim=0)
+        for start in sample_starts[1:]:
+            labels[start] = IGNORE_INDEX
+
+        labels = labels[..., 1:].contiguous()
+        pad_tail = 1 + (sharded.full_len - sharded.valid_len)
+        shift_labels = F.pad(labels, (0, pad_tail), "constant", IGNORE_INDEX)
+        local_shift_labels = shift_labels[sharded.start : sharded.end].contiguous()
+        hidden_states = sharded.hidden_states
+        if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+            hidden_states = hidden_states.squeeze(0)
+        local_shift_labels = local_shift_labels.to(device=hidden_states.device, non_blocking=True)
+        return hidden_states, local_shift_labels
 
     @staticmethod
     def _drop_unsupervised_decode_rows(
@@ -316,6 +402,7 @@ class TrainingMixin(TrainingModuleMixin):
         # Active sample's packed token count. Under SP the encode output-gather hook
         # (``encode_sp_post``) narrows the all-gathered (seq-padded) embeds to it.
         self._sp_own_len: Optional[int] = None
+        self._last_sp_sharded_hidden: Optional[SpShardedHiddenStates] = None
 
 
 class MeterMixin(MetricMeterMixin):

@@ -261,6 +261,15 @@ def _run_alignment_matrix(
         device_type=device_type,
         name="sp2",
     )
+    sp2_skip_ps = _init_parallel_state(
+        dp_size=1,
+        dp_shard_size=1,
+        ulysses_size=world,
+        dp_mode="fsdp2",
+        device_type=device_type,
+        skip_sp_gather_between_modules=True,
+        name="sp2_skip_gather",
+    )
     _init_parallel_state(dp_size=world, ulysses_size=1, dp_mode="ddp", device_type=device_type, name="ref_sp1")
 
     shard_extra = {"mp_policy": mp_policy} if mp_policy is not None else {}
@@ -270,7 +279,11 @@ def _run_alignment_matrix(
 
     reports: dict[str, dict] = {}
     for attn_impl in attn_impls:
-        for sp_size, ps_name, ps in ((1, "sp1", sp1_ps), (2, "sp2", sp2_ps)):
+        for sp_size, ps_name, ps in (
+            (1, "sp1", sp1_ps),
+            (2, "sp2", sp2_ps),
+            (2, "sp2_skip_gather", sp2_skip_ps),
+        ):
             for tied in (True, False):
                 monolithic_ref, te, llm = _monolithic_and_split_qwen3(
                     tied=tied,
@@ -327,6 +340,10 @@ def _run_alignment_matrix(
                         local_convs = all_convs
 
                     loss = _run_qwen3_omni_graph_step(te, llm, local_convs)
+                    if ps.skip_sp_gather_between_modules:
+                        # Under skip_sp_gather_between_modules, full-sequence embeds/hidden_states
+                        # are never scattered back onto conversation_list text items.
+                        assert all(item.value.dim() == 1 for conv in local_convs for item in conv)
                     loss.backward()
 
                     omni_grads = _collect_omni_as_source_dict(te, llm, grads=True)
@@ -348,9 +365,9 @@ def _run_alignment_matrix(
                     if not torch.allclose(omni_stepped[key].float(), ref_w.float(), atol=step_atol, rtol=step_rtol)
                 ]
                 mode_key = (
-                    f"sp{sp_size}_{'tied' if tied else 'untied'}"
+                    f"{ps_name}_{'tied' if tied else 'untied'}"
                     if len(attn_impls) == 1
-                    else f"{attn_impl}_sp{sp_size}_{'tied' if tied else 'untied'}"
+                    else f"{attn_impl}_{ps_name}_{'tied' if tied else 'untied'}"
                 )
                 reports[mode_key] = {
                     "loss_match": loss_match,
@@ -427,7 +444,14 @@ def test_qwen3_omni_graph_matches_monolithic_qwen3_under_fsdp2_and_sp(tmp_path: 
     )
     for rank in range(2):
         reports = json.loads((out_dir / f"rank{rank}.json").read_text(encoding="utf-8"))
-        assert set(reports) == {"sp1_tied", "sp1_untied", "sp2_tied", "sp2_untied"}
+        assert set(reports) == {
+            "sp1_tied",
+            "sp1_untied",
+            "sp2_tied",
+            "sp2_untied",
+            "sp2_skip_gather_tied",
+            "sp2_skip_gather_untied",
+        }
         for mode, report in reports.items():
             assert report["loss_match"], (rank, mode, report)
             assert not report["grad_mismatches"], (rank, mode, report)

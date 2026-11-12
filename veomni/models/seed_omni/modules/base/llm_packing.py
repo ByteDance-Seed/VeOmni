@@ -19,6 +19,7 @@ cache.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -27,7 +28,137 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 from veomni.utils.tensor_utils import naflatten
 
-from ...utils.conversation import ConversationItem
+from ...utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
+
+
+_SP_SHARDED_EMBEDS_KEY = "_veomni_sp_sharded_embeds"
+_SP_SHARDED_HIDDEN_KEY = "_veomni_sp_sharded_hidden"
+
+
+@dataclass
+class SpShardedHiddenStates:
+    """Sequence-sharded backbone hidden states passed directly to ``text_encoder.decode``."""
+
+    hidden_states: torch.Tensor
+    start: int
+    end: int
+    valid_len: int
+    full_len: int
+    extra_rows: dict[str, torch.Tensor] = field(default_factory=dict)
+
+
+def _carrier_anchor_meta(conversations: list[list[ConversationItem]] | None) -> dict[str, Any] | None:
+    if not conversations:
+        return None
+    for sample in conversations:
+        for item in sample:
+            return item.meta
+    return None
+
+
+def is_text_only_conversation(conversations: list[list[ConversationItem]] | None) -> bool:
+    if not conversations:
+        return False
+    saw_text = False
+    for sample in conversations:
+        for item in sample:
+            if item.is_dummy:
+                continue
+            if item.type != "text":
+                return False
+            saw_text = True
+    return saw_text
+
+
+def stash_sp_sharded_embeds(
+    conversations: list[list[ConversationItem]] | None,
+    inputs_embeds: torch.Tensor,
+    valid_len: int,
+) -> None:
+    meta = _carrier_anchor_meta(conversations)
+    if meta is not None:
+        meta[_SP_SHARDED_EMBEDS_KEY] = (inputs_embeds, int(valid_len))
+
+
+def pop_sp_sharded_embeds(
+    conversations: list[list[ConversationItem]] | None,
+) -> tuple[torch.Tensor, int] | None:
+    meta = _carrier_anchor_meta(conversations)
+    if meta is None:
+        return None
+    return meta.pop(_SP_SHARDED_EMBEDS_KEY, None)
+
+
+def stash_sp_sharded_hidden_states(
+    conversations: list[list[ConversationItem]] | None,
+    hidden_states: torch.Tensor,
+    *,
+    start: int,
+    end: int,
+    valid_len: int,
+    full_len: int,
+    extra_rows: dict[str, torch.Tensor] | None = None,
+) -> None:
+    meta = _carrier_anchor_meta(conversations)
+    if meta is not None:
+        meta[_SP_SHARDED_HIDDEN_KEY] = SpShardedHiddenStates(
+            hidden_states=hidden_states,
+            start=int(start),
+            end=int(end),
+            valid_len=int(valid_len),
+            full_len=int(full_len),
+            extra_rows=dict(extra_rows) if extra_rows else {},
+        )
+
+
+def pop_sp_sharded_hidden_states(
+    conversations: list[list[ConversationItem]] | None,
+) -> SpShardedHiddenStates | None:
+    meta = _carrier_anchor_meta(conversations)
+    if meta is None:
+        return None
+    return meta.pop(_SP_SHARDED_HIDDEN_KEY, None)
+
+
+def pack_llm_metadata_from_conversations(
+    conversations: list[list[ConversationItem]],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, list[int], list[tuple[int, int]]]:
+    """Build ``(position_ids, attention_mask, sample_seqlens, seq_slices)`` without touching ``item.value`` embeds."""
+    build_on_cpu = device.type != "cpu"
+    target_dev = torch.device("cpu") if build_on_cpu else device
+    attention_mask_chunks: list[torch.Tensor] = []
+    position_ids_chunks: list[torch.Tensor] = []
+    sample_seqlens: list[int] = []
+    seq_slices: list[tuple[int, int]] = []
+    offset = 0
+    for sample in conversations:
+        sample_length = 0
+        for item in sample:
+            if item.is_dummy:
+                continue
+            if isinstance(item.value, torch.Tensor):
+                seg_len = int(item.value.size(0))
+            else:
+                seg_len = int(item.meta.get(_OMNI_TOKEN_LEN, 0))
+            chunk_mask = item.meta.get("attention_mask")
+            if chunk_mask is None:
+                chunk_mask = torch.ones(seg_len, dtype=torch.long, device=target_dev)
+            else:
+                chunk_mask = chunk_mask.to(target_dev)
+            attention_mask_chunks.append(chunk_mask)
+            sample_length += seg_len
+        if sample_length > 0:
+            sample_seqlens.append(sample_length)
+            seq_slices.append((offset, offset + sample_length))
+            offset += sample_length
+            position_ids_chunks.append(torch.arange(sample_length, dtype=torch.long, device=target_dev))
+    position_ids = torch.cat(position_ids_chunks, dim=0).unsqueeze(0)
+    attention_mask = torch.cat(attention_mask_chunks, dim=0).unsqueeze(0)
+    if build_on_cpu:
+        position_ids = position_ids.to(device, non_blocking=True)
+        attention_mask = attention_mask.to(device, non_blocking=True)
+    return position_ids, attention_mask, sample_seqlens, seq_slices
 
 
 def pack_llm_conversations_for_forward(
