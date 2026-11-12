@@ -37,6 +37,7 @@ import torch.nn.functional as F
 from ...distributed.parallel_state import get_parallel_state
 from ...utils.constants import IGNORE_INDEX
 from ...utils.logging import get_logger
+from ...utils.loss_utils import is_padding_microbatch
 from .base import Callback, TrainerState
 
 
@@ -951,6 +952,8 @@ class ChannelLossCallback(Callback):
             self.computer.begin_step([], [], [])
             if self.config.strict:
                 for micro_batch in micro_batches or []:
+                    if is_padding_microbatch(micro_batch):
+                        continue
                     source_ids, _, _, _ = self._extract_metadata(micro_batch)
                     self._require_source_ids(source_ids)
             return
@@ -959,6 +962,11 @@ class ChannelLossCallback(Callback):
         per_mb_position_ids: list[torch.Tensor | None] = []
         per_mb_attention_masks: list[torch.Tensor | None] = []
         for micro_batch in micro_batches or []:
+            if is_padding_microbatch(micro_batch):
+                per_mb_source_ids.append([])
+                per_mb_position_ids.append(None)
+                per_mb_attention_masks.append(None)
+                continue
             source_ids, source_names, position_ids, attention_mask = self._extract_metadata(micro_batch)
             if self.config.strict:
                 self._require_source_ids(source_ids)
@@ -1415,6 +1423,10 @@ def _filter_surplus_tail_padding_segments(
     ignore_index: int,
 ) -> list[tuple[int, int, int]]:
     """Drop trailing padding-only segments until segment count matches ``source_count``."""
+    if len(segments) > source_count and len({batch_idx for batch_idx, _, _ in segments}) > 1:
+        # PackingCollator produces a single row. With several rows a surplus
+        # segment cannot safely be assigned to a source using tail order alone.
+        return segments
     while len(segments) > source_count:
         _, start, end = segments[-1]
         mask_slice = attention_mask_flat[start : end + 1] if attention_mask_flat is not None else None
@@ -1436,6 +1448,8 @@ def _filter_surplus_tail_padding_sp_segments(
     """Drop trailing padding-only SP logical segments until start count matches ``source_count``."""
     surplus = sum(1 for segment in segments if segment["is_start"]) - source_count
     if surplus <= 0:
+        return segments
+    if len({segment.get("batch_idx", 0) for segment in segments}) > 1:
         return segments
 
     logical_segments: list[list[int]] = []

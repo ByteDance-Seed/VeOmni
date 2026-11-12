@@ -34,6 +34,24 @@
     ]
   },
   {
+    "name": "dpo-pair-normalization-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_dpo_pair_mean.py"
+    ]
+  },
+  {
+    "name": "qwen38-sft-resume-modes-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_sft_resume_modes.py"
+    ]
+  },
+  {
     "name": "npu-unit-03",
     "suite": "unit",
     "args": [
@@ -51,6 +69,16 @@
       "-s",
       "-x",
       "tests/parallel/ulysses/test_wan_t2v_ulysses.py"
+    ]
+  },
+  {
+    "name": "npu-selective-expert-cpu-clip-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_fsdp2_clip_grad_norm.py"
     ]
   },
   {
@@ -132,7 +160,8 @@
       "-v",
       "-s",
       "-x",
-      "tests/trainer/test_aux_metrics.py"
+      "tests/trainer/test_aux_metrics.py",
+      "tests/trainer/test_padding_loss.py"
     ]
   },
   {
@@ -213,6 +242,16 @@
       "-s",
       "-x",
       "tests/checkpoints/"
+    ]
+  },
+  {
+    "name": "sparse-optimizer-state-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_multi_optimizer_sparse_lr.py"
     ]
   },
   {

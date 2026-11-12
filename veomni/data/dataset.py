@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import copy
+import hashlib
 import math
 import os
 import random
+import re
 import traceback
 from functools import partial
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
@@ -24,6 +26,7 @@ import numpy as np
 import torch
 from datasets import IterableDataset as HFIterableDataset
 from datasets import interleave_datasets, load_dataset
+from datasets.fingerprint import dumps as fingerprint_dumps
 from huggingface_hub import hf_hub_download
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
@@ -99,10 +102,149 @@ class MappingDataset(Dataset):
             return self._data[mapped_idx]
 
 
+class _ReplayableHFStream(IterableDataset):
+    """Restore deterministic HF streams by replaying their raw output on load.
+
+    Hugging Face's streaming state omits the shuffle buffer. Keeping a count
+    instead permits exact replay without serializing its potentially large
+    contents. Restoration rereads the preceding rows of this source.
+    """
+
+    def __init__(self, dataset, input_contract=None, deterministic=False):
+        self._dataset = dataset
+        hf = dataset
+        shard_config = None
+        if isinstance(dataset, ShardedIterableDataset):
+            hf = dataset._dataset
+            shard_config = (dataset._dp_rank, dataset._dp_size, dataset._repeat, dataset._seed)
+        if not isinstance(hf, HFIterableDataset):
+            raise TypeError("exact HF replay requires a Hugging Face iterable source")
+        if getattr(hf, "_starting_state_dict", None) is not None:
+            raise ValueError("exact HF replay requires an unconsumed source")
+        try:
+            copy.deepcopy(dataset)
+        except Exception as exc:
+            raise ValueError("exact HF replay requires a deepcopyable streaming source") from exc
+        identity = (hf._ex_iterable, hf._shuffling, hf._formatting, hf._distributed, shard_config)
+        self._source_identity = hashlib.sha256(fingerprint_dumps(identity)).hexdigest()
+        self._input_contract = input_contract
+        self._deterministic = deterministic
+        self._epoch = 0
+        self._yielded = 0
+        self._restored_iterator = None
+
+    @staticmethod
+    def _worker_geometry():
+        worker = get_worker_info()
+        return (worker.id, worker.num_workers) if worker is not None else (None, 0)
+
+    def set_epoch(self, epoch: int) -> None:
+        if epoch != self._epoch:
+            self._epoch = epoch
+            self._yielded = 0
+            self._restored_iterator = None
+
+    def reset_for_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+        self._yielded = 0
+        self._restored_iterator = None
+
+    def _new_iterator(self, epoch):
+        dataset = copy.deepcopy(self._dataset)
+        dataset.set_epoch(epoch)
+        return iter(dataset)
+
+    def __iter__(self):
+        if self._restored_iterator is None:
+            iterator = self._new_iterator(self._epoch)
+            self._yielded = 0
+        else:
+            iterator = self._restored_iterator
+            self._restored_iterator = None
+        for sample in iterator:
+            self._yielded += 1
+            yield sample
+
+    def state_dict(self):
+        return {
+            "version": 1,
+            "source_identity": self._source_identity,
+            "input_contract": self._input_contract,
+            "deterministic": self._deterministic,
+            "epoch": self._epoch,
+            "yielded": self._yielded,
+            "worker_geometry": self._worker_geometry(),
+        }
+
+    def validate_state_dict(self, state, worker_geometry=None):
+        if not isinstance(state, dict) or state.get("version") != 1:
+            raise ValueError("HF stream checkpoint lacks exact replay state")
+        if (
+            self._deterministic is not True
+            or state.get("deterministic") is not True
+            or not isinstance(self._input_contract, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", self._input_contract) is None
+            or state.get("input_contract") != self._input_contract
+        ):
+            raise ValueError("HF stream replay requires the same attested deterministic input contract")
+        if state.get("source_identity") != self._source_identity:
+            raise ValueError("HF stream checkpoint source identity differs")
+        geometry = self._worker_geometry() if worker_geometry is None else worker_geometry
+        saved_geometry = state.get("worker_geometry")
+        if not isinstance(saved_geometry, (tuple, list)) or tuple(saved_geometry) != geometry:
+            raise ValueError("HF stream checkpoint worker geometry differs")
+        epoch, yielded = state.get("epoch"), state.get("yielded")
+        if type(epoch) is not int or type(yielded) is not int or epoch < 0 or yielded < 0:
+            raise ValueError("HF stream checkpoint has invalid epoch or cursor")
+
+    def load_state_dict(self, state):
+        self.validate_state_dict(state)
+        epoch, yielded = state["epoch"], state["yielded"]
+        iterator = self._new_iterator(epoch)
+        try:
+            for _ in range(yielded):
+                next(iterator)
+        except StopIteration as exc:
+            raise ValueError("HF stream ended before its checkpoint cursor") from exc
+        self._epoch, self._yielded = epoch, yielded
+        self._restored_iterator = iterator
+
+
 class IterativeDataset(IterableDataset):
-    def __init__(self, data: "HFIterableDataset", transform: Optional[Callable] = None):
+    def __init__(
+        self,
+        data: "HFIterableDataset",
+        transform: Optional[Callable] = None,
+        *,
+        exact_stream_replay: bool = False,
+        resume_input_contract: Optional[str] = None,
+        resume_input_deterministic: bool = False,
+        _restartable_file_source: bool = False,
+    ):
+        if exact_stream_replay:
+            data = _ReplayableHFStream(data, resume_input_contract, resume_input_deterministic)
         self._data = data
         self._transform = transform
+        self._restartable_file_source = _restartable_file_source
+
+    @property
+    def supports_exact_epoch_restart(self) -> bool:
+        return isinstance(self._data, _ReplayableHFStream)
+
+    def enable_persistent_epoch(self) -> None:
+        """Isolate ordinary HF streams between worker epochs, without attesting resume."""
+        if isinstance(self._data, _ReplayableHFStream) or not self._restartable_file_source:
+            return
+        raw = self._data
+        if isinstance(raw, HFIterableDataset) or (
+            isinstance(raw, ShardedIterableDataset) and isinstance(raw._dataset, HFIterableDataset)
+        ):
+            self._data = _ReplayableHFStream(raw)
+
+    def reset_for_epoch(self, epoch: int) -> None:
+        if not self.supports_exact_epoch_restart:
+            raise ValueError("source does not support exact persistent-worker epoch restart")
+        self._data.reset_for_epoch(epoch)
 
     def __iter__(self):
         for sample in self._data:
@@ -113,8 +255,23 @@ class IterativeDataset(IterableDataset):
 
     def load_state_dict(self, state_dict):
         inner = state_dict.get("dataset")
+        if inner is None and isinstance(self._data, _ReplayableHFStream):
+            raise ValueError("HF stream checkpoint lacks exact replay state")
         if inner is not None and hasattr(self._data, "load_state_dict"):
             self._data.load_state_dict(inner)
+
+    def validate_state_dict(self, state_dict, worker_geometry=None, epoch=None):
+        if not isinstance(state_dict, dict):
+            raise ValueError("iterable source checkpoint must be a dict")
+        inner = state_dict.get("dataset")
+        if isinstance(self._data, _ReplayableHFStream):
+            self._data.validate_state_dict(inner, worker_geometry=worker_geometry)
+            if epoch is not None and inner["epoch"] != epoch:
+                raise ValueError("HF stream checkpoint epoch differs from the multi-source epoch")
+        elif inner is None or not callable(getattr(self._data, "load_state_dict", None)):
+            raise ValueError("iterable source checkpoint has no restorable source state")
+        elif isinstance(self._data, HFIterableDataset):
+            raise ValueError("HF iterable source requires exact replay support")
 
     def state_dict(self):
         if hasattr(self._data, "state_dict"):
@@ -543,6 +700,12 @@ class WeightedMultiSourceDataset(IterableDataset):
     - Optional distributed sharding behavior controlled by ``upstream_sharded``.
     - Stopping strategies for how to behave when an upstream source is exhausted.
     - Optional resume-index passthrough for checkpointing buffers by index.
+
+    New snapshots record whether this dataset instance has initialized its
+    sampling RNG and, when known, its epoch. Legacy snapshots cannot guarantee a
+    not-yet-started worker's first sample; provide their epoch before sampling
+    if the epoch will later be changed. The dataset state alone does not
+    identify one of multiple active or restarted iterators.
     """
 
     def __init__(
@@ -634,9 +797,58 @@ class WeightedMultiSourceDataset(IterableDataset):
         self.dp_rank = max(0, int(getattr(parallel_state, "dp_rank", 0)))
         self.dp_size = max(1, int(getattr(parallel_state, "dp_size", 1)))
 
+        from .dynamic_batching import _resume_callable_identity
+
+        identities = []
+        for dataset in self._datasets:
+            if type(dataset) is IterativeDataset and isinstance(dataset._data, _ReplayableHFStream):
+                identities.append((dataset._data._source_identity, _resume_callable_identity(dataset._transform)))
+            elif callable(getattr(dataset, "validate_exact_resume_state", None)) and isinstance(
+                getattr(dataset, "exact_resume_fingerprint", None), str
+            ):
+                identities.append(dataset.exact_resume_fingerprint)
+        fingerprint = (
+            self._source_ids,
+            self._source_names,
+            self._weights.tolist(),
+            self._seed,
+            self._level,
+            _resume_callable_identity(self._sample_token_len_fn),
+            self._stopping_strategy,
+            self._upstream_sharded,
+            self.dp_rank,
+            self.dp_size,
+            identities,
+        )
+        self._fingerprint = (
+            hashlib.sha256(fingerprint_dumps(fingerprint)).hexdigest() if len(identities) == self._ds_num else None
+        )
+
         self.output_index_for_resume = output_index_for_resume
 
         self._just_resumed = False
+        self._sampling_initialized = False
+        self._resume_epoch_unknown = False
+        self._pending_epoch = None
+        self._persistent_epoch = None
+
+    def enable_persistent_epoch(self) -> None:
+        for source_id, dataset in zip(self._source_ids, self._datasets):
+            if type(dataset) is IterativeDataset:
+                dataset.enable_persistent_epoch()
+            if not getattr(dataset, "supports_exact_epoch_restart", False) or not callable(
+                getattr(dataset, "reset_for_epoch", None)
+            ):
+                raise ValueError(f"persistent workers require exact epoch restart support for source {source_id!r}")
+        self._persistent_epoch = torch.tensor(self._epoch, dtype=torch.int64, device="cpu").share_memory_()
+
+    @property
+    def supports_persistent_epoch_cold_resume(self) -> bool:
+        """Only built-in replay streams have an idempotent epoch setter contract."""
+        return all(
+            type(dataset) is IterativeDataset and type(dataset._data) is _ReplayableHFStream
+            for dataset in self._datasets
+        )
 
     @property
     def output_index_for_resume(self) -> bool:
@@ -701,11 +913,30 @@ class WeightedMultiSourceDataset(IterableDataset):
         Args:
             epoch: Current epoch number.
         """
+        if self._resume_epoch_unknown:
+            if not self._just_resumed:
+                raise ValueError("a legacy multi-source checkpoint needs its epoch before sampling")
+            # The caller supplies the epoch missing from a legacy snapshot.
+            self._resume_epoch_unknown = False
+        elif epoch != self._epoch:
+            self._sampling_initialized = False
+            self._just_resumed = False
         self._epoch = epoch
+        if self._persistent_epoch is not None and get_worker_info() is None:
+            self._persistent_epoch.fill_(epoch)
         for dataset in self._datasets:
             set_epoch_fn = getattr(dataset, "set_epoch", None)
             if callable(set_epoch_fn):
                 set_epoch_fn(epoch)
+        # StatefulDataLoader may restore the dataset only when its iterator is
+        # constructed, after the trainer has supplied the current epoch.
+        self._pending_epoch = epoch
+
+    def prepare_resume_epoch(self, epoch: int) -> None:
+        """Supply a legacy checkpoint's missing epoch without resetting any source."""
+        self._pending_epoch = epoch
+        if self._persistent_epoch is not None and get_worker_info() is None:
+            self._persistent_epoch.fill_(epoch)
 
     def __iter__(self):
         """Iterate and yield samples from multiple sources.
@@ -715,8 +946,27 @@ class WeightedMultiSourceDataset(IterableDataset):
             If ``output_index_for_resume`` is True, yields
             ``(sample, (source_id, output_index))``.
         """
+        # StatefulDataLoader snapshots persistent workers immediately after
+        # creating the new iterator, before requesting their first sample.
+        # Prepare that worker's epoch before the startup snapshot is captured.
+        prepared = self._persistent_epoch is not None and get_worker_info() is not None
+        if prepared:
+            self._prepare_iteration()
+        return self._iterate(prepared)
+
+    def _prepare_iteration(self):
+        self._pending_epoch = None
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
+        if self._persistent_epoch is not None:
+            epoch = int(self._persistent_epoch.item())
+            if self._just_resumed and self._epoch != epoch:
+                raise ValueError("restored multi-source epoch differs from the loader epoch")
+            if self._epoch != epoch:
+                self.set_epoch(epoch)
+            if not self._just_resumed:
+                for dataset in self._datasets:
+                    dataset.reset_for_epoch(epoch)
         if not self._just_resumed:
             seed_seq = np.random.SeedSequence([self._seed, self._epoch, self.dp_rank, worker_id])
             current_seed = int(seed_seq.generate_state(1, dtype=np.uint32)[0])
@@ -725,10 +975,14 @@ class WeightedMultiSourceDataset(IterableDataset):
             self._avg_len_sum = [0.0 for _ in range(self._ds_num)]
             self._avg_len_count = [0 for _ in range(self._ds_num)]
             self._global_sample_idx = 0
+            self._sampling_initialized = True
         else:
             self._just_resumed = False
-
         self._iters = [iter(ds) for ds in self._datasets]
+
+    def _iterate(self, prepared):
+        if not prepared:
+            self._prepare_iteration()
         while True:
             ds_idx = self._random_state.choice(self._ds_num, p=self._runtime_weights())
             try:
@@ -877,15 +1131,23 @@ class WeightedMultiSourceDataset(IterableDataset):
         # save _exhausted state
         exhausted_by_id = {source_id: self._exhausted[idx] for idx, source_id in enumerate(self._source_ids)}
         return {
-            "version": 0,
+            "version": 1,
             "topology": {
                 "source_ids": list(self._source_ids),
                 "source_names": list(self._source_names) if self._source_names is not None else None,
+                "fingerprint": self._fingerprint,
                 "weights": self._weights.tolist(),
                 "level": self._level,
                 "stopping_strategy": self._stopping_strategy,
+                "seed": self._seed,
+                "dp_rank": self.dp_rank,
+                "dp_size": self.dp_size,
+                "upstream_sharded": self._upstream_sharded,
+                "worker_geometry": _ReplayableHFStream._worker_geometry(),
             },
             "runtime": {
+                **({} if self._resume_epoch_unknown else {"epoch": self._epoch}),
+                "sampling_initialized": self._sampling_initialized,
                 "random_state": self._random_state.get_state(),
                 "avg_len_sum": avg_len_sum_by_id,
                 "avg_len_count": avg_len_count_by_id,
@@ -895,20 +1157,115 @@ class WeightedMultiSourceDataset(IterableDataset):
             },
         }
 
+    def validate_exact_resume_state(self, state: dict, worker_geometry=None) -> None:
+        """Check sample-order provenance without changing any source state."""
+        if not isinstance(state, dict) or "topology" not in state or "runtime" not in state:
+            raise ValueError("state_dict missing required keys: topology/runtime")
+        topology, runtime = state["topology"], state["runtime"]
+        if not isinstance(topology, dict) or not isinstance(runtime, dict):
+            raise ValueError("multi-source topology and runtime must be dicts")
+        if not isinstance(runtime.get("dataset_states"), dict):
+            raise ValueError("runtime.dataset_states must be a dict keyed by source_id")
+        if type(runtime.get("sampling_initialized", True)) is not bool:
+            raise ValueError("runtime.sampling_initialized must be a bool")
+        try:
+            rng = np.random.RandomState()
+            rng.set_state(runtime["random_state"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("multi-source checkpoint has invalid sampling RNG state") from exc
+        sample_index = runtime.get("global_sample_idx")
+        if type(sample_index) is not int or sample_index < 0:
+            raise ValueError("multi-source checkpoint has invalid global sample index")
+        for key in ("avg_len_sum", "avg_len_count", "exhausted"):
+            values = runtime.get(key)
+            if not isinstance(values, dict) or set(values) != set(self._source_ids):
+                raise ValueError(f"multi-source checkpoint has invalid {key}")
+            for value in values.values():
+                if key == "avg_len_sum" and (
+                    isinstance(value, (bool, np.bool_))
+                    or not isinstance(value, (int, float, np.integer, np.floating))
+                    or not math.isfinite(value)
+                    or value < 0
+                    or float(value) != value
+                ):
+                    raise ValueError("multi-source checkpoint has invalid avg_len_sum")
+                if key == "avg_len_count" and (type(value) is not int or value < 0):
+                    raise ValueError("multi-source checkpoint has invalid avg_len_count")
+                if key == "exhausted" and type(value) is not bool:
+                    raise ValueError("multi-source checkpoint has invalid exhausted flags")
+        if state.get("version") != 1:
+            raise ValueError("multi-source checkpoint lacks exact topology provenance")
+        geometry = _ReplayableHFStream._worker_geometry() if worker_geometry is None else worker_geometry
+        expected = {
+            "source_ids": self._source_ids,
+            "source_names": self._source_names,
+            "fingerprint": self._fingerprint,
+            "weights": self._weights.tolist(),
+            "level": self._level,
+            "stopping_strategy": self._stopping_strategy,
+            "seed": self._seed,
+            "dp_rank": self.dp_rank,
+            "dp_size": self.dp_size,
+            "upstream_sharded": self._upstream_sharded,
+            "worker_geometry": geometry,
+        }
+        for key, value in expected.items():
+            saved = topology.get(key)
+            if key == "worker_geometry" and saved is not None:
+                saved = tuple(saved)
+            if saved != value:
+                raise ValueError(f"multi-source checkpoint topology differs: {key}")
+        if "sampling_initialized" not in runtime and not runtime.get("global_sample_idx", 0):
+            raise ValueError("legacy multi-source checkpoint cannot prove sampling was initialized")
+        saved_epoch = runtime.get("epoch")
+        if saved_epoch is not None and self._pending_epoch is not None and saved_epoch != self._pending_epoch:
+            raise ValueError("multi-source checkpoint epoch differs from the requested resume epoch")
+        states = runtime["dataset_states"]
+        for source_id, dataset in zip(self._source_ids, self._datasets):
+            source_state = states.get(source_id)
+            if source_state is None or not callable(getattr(dataset, "load_state_dict", None)):
+                raise ValueError(f"multi-source checkpoint cannot restore source {source_id!r}")
+            if isinstance(dataset, IterativeDataset):
+                dataset.validate_state_dict(
+                    source_state,
+                    worker_geometry=geometry,
+                    epoch=saved_epoch if saved_epoch is not None else self._pending_epoch,
+                )
+                inner = source_state.get("dataset")
+                if (
+                    runtime.get("sampling_initialized") is False
+                    and isinstance(dataset._data, _ReplayableHFStream)
+                    and inner["yielded"] > 0
+                ):
+                    raise ValueError("uninitialized multi-source checkpoint has a consumed HF source")
+            else:
+                validate = getattr(dataset, "validate_exact_resume_state", None)
+                if not callable(validate):
+                    raise ValueError(f"multi-source source {source_id!r} lacks exact resume validation")
+                validate(
+                    source_state,
+                    worker_geometry=geometry,
+                    epoch=saved_epoch if saved_epoch is not None else self._pending_epoch,
+                )
+        if not isinstance(self._fingerprint, str) or not self._fingerprint:
+            raise ValueError("exact multi-source resume requires a source fingerprint")
+
     def load_state_dict(
         self,
         state: dict,
-        reconcile_policy: Literal["strict", "allow_add", "allow_add_remove", "warn_only"] = "allow_add_remove",
+        reconcile_policy: Literal["strict", "allow_add", "allow_add_remove", "warn_only"] = "strict",
     ) -> None:
         """Restore state from a previous ``state_dict()``.
 
         Args:
             state: State dict previously produced by ``state_dict()``.
             reconcile_policy: Policy for handling source-id changes:
-                - ``strict``: error on any added/removed source.
+                - ``strict``: require provenance for exact same-layout recovery.
                 - ``allow_add``: allow new sources but error on removed ones.
                 - ``allow_add_remove``: allow both add and remove.
                 - ``warn_only``: allow changes and log a warning.
+                Non-strict policies are explicit migrations and do not claim
+                the same subsequent sample order.
 
         Raises:
             ValueError: If required state fields are missing or incompatible.
@@ -917,9 +1274,18 @@ class WeightedMultiSourceDataset(IterableDataset):
             raise ValueError("state_dict missing required keys: topology/runtime")
         runtime = state["runtime"]
         topology = state["topology"]
+        initialized = runtime.get("sampling_initialized", True)
+        if type(initialized) is not bool:
+            raise ValueError("runtime.sampling_initialized must be a bool")
         if "source_ids" not in topology:
             raise ValueError("state_dict missing topology.source_ids")
         saved_source_ids = topology["source_ids"]
+        if not isinstance(runtime.get("avg_len_sum"), dict) or not isinstance(runtime.get("avg_len_count"), dict):
+            raise ValueError("runtime.avg_len_sum and runtime.avg_len_count must be dicts keyed by source_id")
+        if not isinstance(runtime.get("dataset_states"), dict):
+            raise ValueError("runtime.dataset_states must be a dict keyed by source_id")
+        if reconcile_policy == "strict":
+            self.validate_exact_resume_state(state)
         added = []
         removed = []
         if saved_source_ids is not None:
@@ -968,7 +1334,13 @@ class WeightedMultiSourceDataset(IterableDataset):
         else:
             self._exhausted = [False for _ in range(self._ds_num)]
 
-        self._just_resumed = True
+        epoch_supplied = self._pending_epoch is not None
+        fallback_epoch = self._pending_epoch if epoch_supplied else self._epoch
+        self._epoch = runtime.get("epoch", fallback_epoch)
+        self._sampling_initialized = initialized
+        self._just_resumed = initialized
+        self._resume_epoch_unknown = "epoch" not in runtime and not epoch_supplied
+        self._pending_epoch = None
 
 
 class _MapStyleSamplerWrapper(IterableDataset):
@@ -1543,6 +1915,11 @@ class DynamicBatchingSizeDataset(IterableDataset):
 
         self._just_resumed = True
 
+    def prepare_resume_epoch(self, epoch: int) -> None:
+        prepare = getattr(self.dataset, "prepare_resume_epoch", None)
+        if callable(prepare):
+            prepare(epoch)
+
     def set_epoch(self, epoch: int):
         """Set the epoch for the upstream dataset.
 
@@ -1670,6 +2047,9 @@ def build_iterable_dataset(
     split_by_node: bool = True,
     shuffle: bool = True,
     dataset_repeat: bool = False,
+    exact_stream_replay: bool = False,
+    resume_input_contract: Optional[str] = None,
+    resume_input_deterministic: bool = False,
     **kwargs,
 ) -> "IterableDataset":
     """
@@ -1697,7 +2077,14 @@ def build_iterable_dataset(
 
     if transform:
         transform = partial(transform, source_name=source_name)
-    return IterativeDataset(dataset, transform=transform)
+    return IterativeDataset(
+        dataset,
+        transform=transform,
+        exact_stream_replay=exact_stream_replay,
+        resume_input_contract=resume_input_contract,
+        resume_input_deterministic=resume_input_deterministic,
+        _restartable_file_source=True,
+    )
 
 
 @DATASET_REGISTRY.register("interleave")
@@ -1913,6 +2300,13 @@ def build_weighted_multisource_dataset(
             split_by_node=split_by_node,
             shuffle=shuffle,
             dataset_repeat=bool(kwargs.get("dataset_repeat", False)),
+            exact_stream_replay=(
+                kwargs.get("resume_input_deterministic") is True
+                and isinstance(kwargs.get("resume_input_contract"), str)
+                and re.fullmatch(r"sha256:[0-9a-f]{64}", kwargs["resume_input_contract"]) is not None
+            ),
+            resume_input_contract=kwargs.get("resume_input_contract"),
+            resume_input_deterministic=kwargs.get("resume_input_deterministic", False),
         )
         for idx, source in enumerate(sources)
     ]

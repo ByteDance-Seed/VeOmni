@@ -37,6 +37,7 @@ def test_packed_lengths_keep_real_single_token_documents():
 def _meter(state):
     meter = object.__new__(helper.EnvironMeter)
     meter.config = SimpleNamespace(condition_model_type=None)
+    meter.dpo_provenance_enabled = False
     meter._flops_metadata_callback = None
     meter._model_metadata = {}
     meter.parallel_state = state
@@ -44,6 +45,7 @@ def _meter(state):
     meter.world_size = 4
     meter.consume_tokens = meter.consume_chunks = 0
     meter.batch_seqlens = []
+    meter.batch_source_seqlens = []
     meter.batch_ds_idx = []
     meter.images_seqlens = []
     meter._batch_token_stats = []
