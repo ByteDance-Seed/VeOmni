@@ -29,9 +29,16 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
 
 WORLD_SIZE = 4
 ROWS, COLS = 3, 5
+
+# The workers are gloo-only and touch no accelerator, so the launch is declared
+# as a CPU case: ``mp.spawn`` is refused when its nproc disagrees with the plan
+# the CI scheduler leased.
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(nproc=WORLD_SIZE, device="cpu"))
 
 
 def _worker(rank: int, init_file: str, ckpt_dir: str) -> None:

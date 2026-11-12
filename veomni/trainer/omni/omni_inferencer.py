@@ -57,10 +57,10 @@ logger = helper.create_logger(__name__)
 def _module_needs_distributed(module_args: OmniModuleRuntimeArguments) -> bool:
     """True when a module opts into a distributed build (FSDP2 / ExtraParallel / DDP).
 
-    See :attr:`OmniModuleRuntimeArguments.needs_distributed_build`, which
-    ``ModuleRuntime`` reads too -- the inferencer decides here whether to set up
-    a process group at all, and the runtime decides per module how to build,
-    and the two must not be able to disagree.
+    See :func:`accelerator_needs_distributed_build`, which ``ModuleRuntime``
+    reads too -- the inferencer decides here whether to set up a process group at
+    all, and the runtime decides per module how to build, and the two must not be
+    able to disagree.
     """
     return module_args.needs_distributed_build
 
