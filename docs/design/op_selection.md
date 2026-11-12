@@ -138,12 +138,26 @@ Only quantizing rows are affected — every reference row keeps its fallback.
 
 The gated-MLP rows take the activation as an argument, so a model's `hidden_act`
 decides what its MLP computes whether or not the row quantizes. `veomni/ops/activation.py`
-maps the config's spellings onto the three it implements (SiLU, exact GELU,
-GELU-tanh) and evaluates them; SiLU keeps its ATen spelling so the quantizing row
-reuses `eager`'s gradient bit for bit. A row that cannot compute the requested
-activation **raises when the handle is built** rather than falling back:
-`liger_kernel` wraps Liger's `swiglu_forward`, which is SiLU only, so it refuses
-anything else and points at `eager` / `qat`.
+evaluates the config's spellings by delegating to transformers' own implementation
+of each name -- `gelu_new` and `gelu_pytorch_tanh` are *different* functions whose
+bf16 intermediates round differently, so they are not normalized onto one formula.
+SiLU keeps its ATen spelling so the quantizing row reuses `eager`'s gradient bit
+for bit.
+
+Which row runs is decided before the call, by `swiglu_mlp.use_fused_row`, because
+a row's activation support is part of its contract:
+
+| Row | Activations | When it cannot serve the call |
+| --- | --- | --- |
+| `eager`, `qat` | every name `activation.py` evaluates | — |
+| `liger_kernel` | SiLU only (Liger's `swiglu_forward`) | the model falls back to its projection modules |
+| any row | — | a *quantizing* row raises instead of falling back |
+
+`liger_kernel` is the GPU default, so this matters in practice: a `gelu` model on
+GPU would otherwise reach a SiLU-only kernel and fail on its first forward. It is
+skipped, not entered. A quantizing row has no such option -- falling back would
+train at full precision under a config that says otherwise -- so it raises, and
+the error names `eager` as the way to keep the fallback.
 
 The routed experts are the exception, and the reason is structural: their
 activation is fused *into* the grouped GEMM (`aten.silu` in the forward,

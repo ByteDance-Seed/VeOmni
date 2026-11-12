@@ -71,7 +71,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.swiglu_mlp import use_fused_row
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
@@ -114,7 +114,7 @@ config.add_import(
 )
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["use_fused_row"])
 # Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
 # packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
 # once in ``Qwen3_5MoeTextModel.forward``.
@@ -221,7 +221,7 @@ config.override_method(
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def qwen3_5_moe_mlp_forward_patched(self, x):
-    if has_plain_linear_projections(self):
+    if use_fused_row(self, self.config.hidden_act):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,

@@ -99,7 +99,7 @@
 +from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 +from veomni.models.utils.mask_utils import create_causal_mask
 +from veomni.ops import VeomniOp
-+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
++from veomni.ops.kernels.swiglu_mlp import use_fused_row
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 +
 +
@@ -191,7 +191,7 @@
 -    q_embed = (q * cos) + (rotate_half(q) * sin)
 -    k_embed = (k * cos) + (rotate_half(k) * sin)
 -    return q_embed, k_embed
-+        if has_plain_linear_projections(self):
++        if use_fused_row(self, self.config.hidden_act):
 +            down_proj = self.veomni_swiglu_mlp(
 +                x,
 +                self.gate_proj.weight,

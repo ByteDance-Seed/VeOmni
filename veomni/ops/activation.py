@@ -23,24 +23,33 @@ that fell back trained at full precision while the config claimed otherwise.
 
 This module is deliberately pure PyTorch, with no kernel of its own:
 
-* :func:`normalize_activation` maps the names a config uses onto the names a row
-  supports, so a row can validate a selection without knowing the config's
-  vocabulary.
+* :func:`normalize_activation` / :func:`supports` let a row validate a selection
+  without knowing the config's vocabulary.
 * :func:`apply_activation` / :func:`apply_activation_backward` evaluate one.
+
+**Every name delegates to the transformer's own implementation**, looked up by the
+name the config used. That is not redundancy: the names are not interchangeable.
+``gelu_new`` resolves to ``NewGELUActivation``, which stages ``torch.pow(x, 3.0)``,
+while ``gelu_pytorch_tanh`` resolves to ``PytorchGELUTanh``, which calls
+``F.gelu(approximate="tanh")`` and writes ``x * x * x`` internally. In bf16 the
+intermediates round differently -- max ~1.6e-2 on unit-scale inputs -- so mapping
+them onto one formula would change a model's outputs and gradients against the
+function it trained with.
 
 A Triton elementwise kernel was considered and rejected. The activation sits
 between GEMMs whose operands are already quantized through TileLang, so it is a
 rounding error in the profile, and the ``eager`` row has to stay a readable
 reference: a reference implementation that dispatches to a kernel on the one
-device where it is hardest to check is not a reference. SiLU keeps its ATen
-spelling because the fused kernels and HF's autograd both use it, and matching
-their rounding bit-for-bit is what lets ``qat`` reuse ``eager``'s gradient.
+device where it is hardest to check is not a reference.
+
+SiLU keeps its ATen spelling so its values and gradients match the fused kernels
+bit for bit.
 """
 
 from __future__ import annotations
 
-import math
-from enum import Enum
+import inspect
+from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
@@ -48,114 +57,104 @@ from torch import Tensor
 
 
 __all__ = [
-    "ACTIVATION_ALIASES",
-    "ActivationType",
     "apply_activation",
     "apply_activation_backward",
     "normalize_activation",
     "supported_activations",
+    "supports",
 ]
 
 
-class ActivationType(str, Enum):
-    """Activations this module can evaluate, named after their HF spelling."""
+#: Names this module evaluates, exactly as a config spells them. Membership is
+#: checked against ``transformers.activations.ACT2FN`` at import time so a
+#: transformers upgrade that renames or drops one fails here, not mid-training.
+ACTIVATIONS: tuple[str, ...] = (
+    "silu",
+    "swish",
+    "gelu",
+    "gelu_new",
+    "gelu_pytorch_tanh",
+)
 
-    GELU = "gelu"
-    GELU_PYTORCH_TANH = "gelu_pytorch_tanh"
-    SILU = "silu"
 
+@lru_cache(maxsize=None)
+def _resolver(name: str):
+    """The transformers implementation for *name*, or ``None`` if it has none.
 
-#: Model-config spellings mapped onto :class:`ActivationType` values. The left
-#: side is what ``transformers.activations.ACT2FN`` accepts; a name missing here
-#: is refused rather than silently rounded to SiLU.
-ACTIVATION_ALIASES: dict[str, str] = {
-    # ``gelu`` is the exact erf form. ``gelu_new`` and ``gelu_tanh`` are HF's
-    # other names for the tanh approximation, and they are *not* numerically the
-    # same function -- mapping them together would change a model's math.
-    "gelu": ActivationType.GELU.value,
-    "gelu_new": ActivationType.GELU_PYTORCH_TANH.value,
-    "gelu_pytorch_tanh": ActivationType.GELU_PYTORCH_TANH.value,
-    "gelu_tanh": ActivationType.GELU_PYTORCH_TANH.value,
-    "silu": ActivationType.SILU.value,
-    # HF's own alias for SiLU (``ACT2FN["swish"] is ACT2FN["silu"]``). Omitting
-    # it would refuse a config that is bit-for-bit the row's default.
-    "swish": ActivationType.SILU.value,
-}
+    ``ACT2FN`` maps most names to a *class* (``NewGELUActivation``,
+    ``PytorchGELUTanh``) and a few to a bare function. Instantiating the classes
+    once here keeps callers free of that distinction, and the cache is what makes
+    repeated evaluation during training cheap.
+    """
+    from transformers.activations import ACT2FN
+
+    if name == "swish":
+        # HF aliases this to SiLU, and naming it explicitly keeps the lookup from
+        # depending on whether that alias survives a transformers upgrade.
+        name = "silu"
+    implementation = ACT2FN.get(name)
+    if implementation is None:
+        return None
+    if inspect.isclass(implementation):
+        return implementation()
+    return implementation
 
 
 def supported_activations() -> frozenset[str]:
     """Every config-level activation name this module can evaluate."""
-    return frozenset(ACTIVATION_ALIASES)
+    return frozenset(name for name in ACTIVATIONS if _resolver(name) is not None)
 
 
-def normalize_activation(activation: str | ActivationType) -> str:
-    """Map a model-config activation name onto a canonical name.
+def supports(activation: str) -> bool:
+    """Whether this module can evaluate *activation* on this host."""
+    return activation in supported_activations()
+
+
+def normalize_activation(activation: str) -> str:
+    """Return the canonical spelling of *activation*.
 
     Raises:
-        ValueError: if the name has no implementation here. Refusing is the
-            point: the caller has a config asking for a function the row cannot
-            compute, and substituting SiLU would train a different model than
-            the one described.
+        ValueError: if the name has no implementation. Refusing is the point: the
+            caller has a config asking for a function the row cannot compute, and
+            substituting SiLU would train a different model than the one
+            described.
     """
-    name = activation.value if isinstance(activation, ActivationType) else activation
-    try:
-        return ACTIVATION_ALIASES[name]
-    except KeyError as error:
+    name = activation.value if hasattr(activation, "value") else activation
+    if name == "swish":
+        name = "silu"
+    if _resolver(name) is None:
         raise ValueError(
             f"Unsupported MLP activation {name!r}. The gated-MLP rows implement "
-            f"{sorted(ACTIVATION_ALIASES)}. Select a row that supports this activation, or use the "
-            f"model's `eager` fallback."
-        ) from error
+            f"{sorted(supported_activations())}. Select a row that evaluates this activation, or "
+            f"leave the model on its `eager` projection fallback."
+        )
+    return name
 
 
-def apply_activation(hidden: Tensor, activation: str | ActivationType) -> Tensor:
-    """Evaluate ``activation(hidden)``.
-
-    SiLU goes through ATen so its values and gradients match the fused kernels
-    and HF's autograd bit for bit.
-    """
+def apply_activation(hidden: Tensor, activation: str) -> Tensor:
+    """Evaluate ``activation(hidden)`` through transformers' own implementation."""
     name = normalize_activation(activation)
-    if name == ActivationType.SILU.value:
+    if name == "silu":
+        # ATen, not ``ACT2FN["silu"]``: identical values, and the fused rows and
+        # HF's autograd both use this spelling, so gradients stay bit-comparable.
         return F.silu(hidden)
-    if name == ActivationType.GELU.value:
-        return F.gelu(hidden)
-    return F.gelu(hidden, approximate="tanh")
+    return _resolver(name)(hidden)
 
 
-def apply_activation_backward(
-    grad_output: Tensor,
-    hidden: Tensor,
-    activation: str | ActivationType,
-) -> Tensor:
+def apply_activation_backward(grad_output: Tensor, hidden: Tensor, activation: str) -> Tensor:
     """Return ``grad_output * activation'(hidden)``.
 
-    The derivative is written out rather than obtained from autograd: callers are
-    inside a custom ``autograd.Function``, where nesting another graph would cost
-    a full backward pass for one elementwise term.
+    Autograd computes the derivative rather than this module restating it. Callers
+    are inside a custom ``autograd.Function``, but they are not inside a graph
+    that would be re-entered: ``hidden`` is a saved tensor, and this runs once per
+    backward. Restating three derivative formulas was where a missing ``up``
+    factor survived a bit-exact forward.
     """
     name = normalize_activation(activation)
-    if name == ActivationType.SILU.value:
+    if name == "silu":
         return torch.ops.aten.silu_backward(grad_output, hidden)
-
-    x = hidden.float()
-    if name == ActivationType.GELU.value:
-        derivative = _gelu_grad(x)
-    else:
-        derivative = _gelu_pytorch_tanh_grad(x)
-    return (grad_output.float() * derivative).to(hidden.dtype)
-
-
-def _gelu_grad(x: Tensor) -> Tensor:
-    """Derivative of the exact (erf) GELU."""
-    cdf = 0.5 * (1.0 + torch.erf(x * math.sqrt(0.5)))
-    pdf = torch.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
-    return cdf + x * pdf
-
-
-def _gelu_pytorch_tanh_grad(x: Tensor) -> Tensor:
-    """Derivative of the tanh-approximated GELU, as ``F.gelu(approximate="tanh")`` computes it."""
-    inner = 0.79788456 * (x + 0.044715 * x * x * x)
-    tanh_inner = torch.tanh(inner)
-    return 0.5 * (1.0 + tanh_inner) + 0.5 * x * (1.0 - tanh_inner * tanh_inner) * 0.79788456 * (
-        1.0 + 3 * 0.044715 * x * x
-    )
+    with torch.enable_grad():
+        leaf = hidden.detach().requires_grad_(True)
+        value = _resolver(name)(leaf)
+        (grad,) = torch.autograd.grad(value, leaf, grad_output)
+    return grad

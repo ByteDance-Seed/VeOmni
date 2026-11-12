@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ....activation import ActivationType, apply_activation, apply_activation_backward
+from ....activation import apply_activation, apply_activation_backward
 from ....registry import SavedState
 
 
@@ -36,7 +36,7 @@ class _Meta:
     has_gate_bias: bool
     has_up_bias: bool
     has_down_bias: bool
-    activation: str = ActivationType.SILU.value
+    activation: str = "silu"
 
 
 def optional_bias(bias: Tensor) -> Tensor | None:
@@ -112,7 +112,7 @@ def mlp_hidden(
     up_b: Tensor,
     *,
     swiglu_limit: float | None,
-    activation: str = ActivationType.SILU.value,
+    activation: str = "silu",
 ) -> tuple[Tensor, Tensor, Tensor, torch.dtype]:
     """Project, optional clamp, then ``activation(gate) * up``.
 
@@ -148,7 +148,7 @@ def forward(
     down_b: Tensor,
     *,
     swiglu_limit: float | None = None,
-    activation: str = ActivationType.SILU.value,
+    activation: str = "silu",
 ) -> tuple[Tensor, SavedState]:
     """Full gated MLP: ``down(activation(gate(x)) * up(x))``.
 

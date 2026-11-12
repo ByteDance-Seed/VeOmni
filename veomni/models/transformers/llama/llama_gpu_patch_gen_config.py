@@ -37,7 +37,7 @@ from transformers.utils import TransformersKwargs
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
 from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.swiglu_mlp import use_fused_row
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
     CausalLMOutputWithLogProbs,
@@ -70,7 +70,7 @@ config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask"],
 )
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["use_fused_row"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "ForSequenceClassificationLoss"],
@@ -221,7 +221,7 @@ def llama_model_forward_patched(
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def llama_mlp_forward_patched(self, x):
-    if has_plain_linear_projections(self):
+    if use_fused_row(self, self.config.hidden_act):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,
