@@ -359,8 +359,13 @@ def test_build_omni_model_runtime_args_rejects_top_level_dp_size_mismatch(monkey
         build_omni_model_runtime_args(args_sp2)
 
 
-def test_skip_sp_gather_between_modules_propagates_to_modules_and_parallel_state(monkeypatch):
-    """Top-level ``skip_sp_gather_between_modules=True`` propagates to module accelerators and ``ParallelState``."""
+def test_skip_sp_gather_between_modules_is_global_and_propagates_to_modules(monkeypatch):
+    """``skip_sp_gather_between_modules`` is a run-wide switch propagated to every module.
+
+    It describes the whole graph -- every ``post_forward`` either gathers or hands
+    its SP shard on -- so a per-module YAML entry cannot desynchronise the two
+    sides of a handoff; the top-level value wins.
+    """
     from veomni.distributed import parallel_state
     from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state_from_config
 
@@ -372,7 +377,12 @@ def test_skip_sp_gather_between_modules_propagates_to_modules_and_parallel_state
             return self
 
     monkeypatch.setattr(parallel_state, "init_device_mesh", lambda *a, **kw: _DummyMesh())
-    args = _fake_args(accelerator=AcceleratorConfig(skip_sp_gather_between_modules=True))
+    args = _fake_args(
+        accelerator=AcceleratorConfig(skip_sp_gather_between_modules=True),
+        modules_override={
+            MODULE_A: {"accelerator": {"skip_sp_gather_between_modules": False}},
+        },
+    )
     resolved = build_omni_model_runtime_args(args)
     assert resolved.accelerator.skip_sp_gather_between_modules is True
     for mod_args in resolved.modules.values():
@@ -384,13 +394,3 @@ def test_skip_sp_gather_between_modules_propagates_to_modules_and_parallel_state
         assert ps.skip_sp_gather_between_modules is True
     finally:
         clear_parallel_state()
-
-    with pytest.raises(ValueError, match="skip_sp_gather_between_modules"):
-        build_omni_model_runtime_args(
-            _fake_args(
-                accelerator=AcceleratorConfig(skip_sp_gather_between_modules=True),
-                modules_override={
-                    MODULE_A: {"accelerator": {"skip_sp_gather_between_modules": False}},
-                },
-            )
-        )

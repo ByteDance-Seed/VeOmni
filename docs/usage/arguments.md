@@ -695,7 +695,7 @@ configured and never round-trip through a saved config.
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
 | enable_async | `bool` | `False` | Enable async Ulysses. |
 | cp_size | `int` | `1` | Ring-attention context parallel size. |
-| skip_sp_gather_between_modules | `bool` | `False` | SeedOmni: pass sequence-sharded activations directly between modules sharing the same SP/CP configuration without all-gathering full-sequence tensors onto `conversation_list` (`encode -> llm` on text-only batches and `llm -> decode` on all batches). |
+| skip_sp_gather_between_modules | `bool` | `False` | Run-wide SeedOmni switch: every module's `post_forward` hands its sequence-parallel shard directly to the next module instead of all-gathering full-sequence tensors onto `conversation_list` (`encode`/`vision` -> `llm` and `llm` -> `decode`). Global to the run — per-module YAML overrides are ignored, since one side of a handoff gathering while the other does not would leave the backbone with a shard-sized input and full-length positions. |
 | init_device | `Literal["cuda", "meta", "npu", "mlu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
 | fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
 | offload_config | `OffloadConfig` | — | Activation offload settings. |

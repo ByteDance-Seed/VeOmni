@@ -908,9 +908,9 @@ class AcceleratorConfig:
     skip_sp_gather_between_modules: bool = field(
         default=False,
         metadata={
-            "help": "When True, SeedOmni modules sharing the same SP/CP configuration pass "
-            "sequence-sharded activations directly between modules without all-gathering "
-            "to restore full conversation_list tensors."
+            "help": "SeedOmni: every module's post_forward hands its sequence-parallel shard "
+            "directly to the next module instead of all-gathering full-sequence tensors onto "
+            "`conversation_list`. Global to the run: per-module overrides are ignored."
         },
     )
     init_device: Literal["cuda", "meta", "npu", "mlu"] = field(
