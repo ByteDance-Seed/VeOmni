@@ -23,13 +23,14 @@ import torch.nn.functional as F
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OP_REGISTRY, VeomniOp
 from veomni.ops.kernels.linear._module import QUANTIZING_IMPLS
+from veomni.utils.import_utils import is_package_available
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_linear_registry_entries():
-    assert OP_REGISTRY.list_registered("linear", "standard") == ["eager", "qat"]
+    assert OP_REGISTRY.list_registered("linear", "standard") == ["eager", "qat", "torchao_nvfp4"]
     assert OP_REGISTRY.list_registered("linear", "grouped") == ["eager", "qat"]
     assert OP_REGISTRY.default_impl("linear", "standard", device="cpu") == "eager"
     assert OP_REGISTRY.default_impl("linear", "grouped", device="cpu") == "eager"
@@ -184,3 +185,87 @@ def test_the_standard_eager_row_calls_the_projection_module():
 
     assert linear.calls == 1
     torch.testing.assert_close(out, F.linear(x, linear.weight, linear.bias))
+
+
+_requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reason="torchao_nvfp4 row needs torchao")
+
+
+def _nvfp4_reference(x: torch.Tensor) -> torch.Tensor:
+    """torchao's own 16-wide two-level NVFP4 round trip, computed without the row."""
+    from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor, per_tensor_amax_to_scale
+
+    x_2d = x.detach().reshape(-1, x.shape[-1])
+    quantized = NVFP4Tensor.to_nvfp4(
+        x_2d,
+        block_size=16,
+        per_tensor_scale=per_tensor_amax_to_scale(torch.max(torch.abs(x_2d))),
+        is_swizzled_scales=False,
+        use_triton_kernel=False,
+    )
+    return quantized.dequantize(x.dtype).reshape_as(x)
+
+
+def test_linear_torchao_nvfp4_row_is_declared_with_torchao():
+    """The row needs no specific hardware, only the optional package."""
+    entries = {(entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", "standard")}
+    assert ("torchao_nvfp4", ("torchao",)) in entries
+    assert "torchao_nvfp4" in QUANTIZING_IMPLS
+    # ``standard`` only: a model that also binds ``grouped`` cannot select it.
+    assert "torchao_nvfp4" not in OP_REGISTRY.list_registered("linear", "grouped")
+
+
+@_requires_torchao
+def test_linear_torchao_nvfp4_forward_and_backward_round_trip():
+    """The row equals F.linear over torchao's NVFP4 round trip, with straight-through gradients."""
+    from veomni.ops.kernels.linear.standard import torchao_nvfp4 as impl
+    from veomni.ops.qat.torchao_nvfp4 import nvfp4_fake_quant
+
+    assert impl.NVFP4_BLOCK_SIZE == 16
+    op = VeomniOp("linear", "standard", "torchao_nvfp4")
+    torch.manual_seed(0)
+    # 48 is a whole number of 16-wide groups: NVFP4 needs nothing wider.
+    linear = torch.nn.Linear(48, 32).to(torch.bfloat16)
+    x = torch.randn(2, 5, 48, dtype=torch.bfloat16, requires_grad=True)
+
+    ref_x = _nvfp4_reference(x)
+    torch.testing.assert_close(nvfp4_fake_quant(x.detach()), ref_x, rtol=0, atol=0)
+
+    out = op(linear, x)
+    expected = F.linear(ref_x, _nvfp4_reference(linear.weight), linear.bias.detach())
+    torch.testing.assert_close(out, expected)
+    assert not torch.equal(out, linear(x))
+
+    out.sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert linear.weight.grad is not None and torch.isfinite(linear.weight.grad).all()
+    torch.testing.assert_close(linear.bias.grad, torch.full_like(linear.bias.grad, 10.0))
+
+
+@_requires_torchao
+def test_linear_torchao_nvfp4_validates_its_operands():
+    """16-wide groups only, BF16/FP32 only, and no partial group."""
+    from veomni.ops.qat.torchao_nvfp4 import nvfp4_fake_quant
+
+    op = VeomniOp("linear", "standard", "torchao_nvfp4")
+    with pytest.raises(ValueError, match="divisible by block_size 16"):
+        op(torch.nn.Linear(24, 16, bias=False).to(torch.bfloat16), torch.randn(2, 24, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="requires block_size=16"):
+        nvfp4_fake_quant(torch.randn(2, 32, dtype=torch.bfloat16), block_size=32)
+    with pytest.raises(TypeError, match="bfloat16 or float32"):
+        op(torch.nn.Linear(16, 16, bias=False).to(torch.float16), torch.randn(2, 16, dtype=torch.float16))
+    # An all-zero operand dequantizes to zeros instead of 0/0 NaNs.
+    zeros = torch.zeros(3, 32, dtype=torch.bfloat16)
+    torch.testing.assert_close(nvfp4_fake_quant(zeros), zeros, rtol=0, atol=0)
+
+
+@_requires_torchao
+def test_linear_torchao_nvfp4_handles_empty_input():
+    """A zero-token micro-batch keeps its shape and yields zero weight gradients."""
+    op = VeomniOp("linear", "standard", "torchao_nvfp4")
+    linear = torch.nn.Linear(16, 8).to(torch.bfloat16)
+    x = torch.randn(0, 16, dtype=torch.bfloat16, requires_grad=True)
+
+    out = op(linear, x)
+    assert out.shape == (0, 8)
+    out.sum().backward()
+    torch.testing.assert_close(linear.weight.grad, torch.zeros_like(linear.weight))

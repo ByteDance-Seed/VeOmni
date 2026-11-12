@@ -28,13 +28,16 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM as HFQwen3
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForTokenClassification as HFQwen3ForTokenClassification
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Model as HFQwen3Model
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import assert_sequence_classification_matches_hf, eager_ops_config
 from tests.models.tiny_configs import tiny_qwen3_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.data.data_collator import MainCollator
 from veomni.models import build_foundation_model
+from veomni.ops import VeomniOp
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+from veomni.utils.import_utils import is_package_available
 
 
 def _qwen3_classes():
@@ -613,3 +616,134 @@ def test_qwen3_packed_sage_attention_matches_independent_samples(monkeypatch, av
 
     torch.testing.assert_close(packed_logits[:, :3], first_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
     torch.testing.assert_close(packed_logits[:, 3:], second_logits, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+
+_requires_torchao = pytest.mark.skipif(
+    not is_package_available("torchao"),
+    reason="the torchao_nvfp4 linear/swiglu_mlp rows need the optional 'torchao' package",
+)
+
+
+_cpu = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def _qwen3_with_ops(config: Qwen3Config, **ops):
+    import copy
+
+    return _build_qwen3(copy.deepcopy(config), SimpleNamespace(**{**vars(eager_ops_config()), **ops}))
+
+
+@_cpu
+def test_qwen3_attention_binds_the_configured_linear_row():
+    """The attention projections read ``linear_implementation``; the MLP keeps its own field."""
+    model = _qwen3_with_ops(_tiny_config(), linear_implementation="eager", swiglu_mlp_implementation="eager")
+
+    attention = model.model.layers[0].self_attn
+    assert isinstance(attention.veomni_linear, VeomniOp)
+    assert (attention.veomni_linear.op, attention.veomni_linear.variant) == ("linear", "standard")
+    assert attention.veomni_linear.impl == "eager"
+    assert model.model.layers[0].mlp.veomni_swiglu_mlp.impl == "eager"
+
+
+@_cpu
+def test_qwen3_eager_linear_row_calls_the_projection_modules():
+    """``eager`` must run each projection's own forward, not read its weight.
+
+    A projection listed in ``basic_modules`` is ``fully_shard``-wrapped on its own
+    and unshards in a forward pre-hook; reading ``q_proj.weight`` directly would
+    hand the GEMM a sharded parameter. Forward hooks stand in for that pre-hook.
+    """
+    config = _tiny_config()
+    model = _qwen3_with_ops(config, linear_implementation="eager")
+    attention = model.model.layers[0].self_attn
+    calls = []
+    for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        getattr(attention, name).register_forward_pre_hook(lambda module, args, name=name: calls.append(name))
+
+    model(input_ids=torch.randint(3, config.vocab_size, (1, 4)), use_cache=False)
+
+    assert calls == ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        pytest.param("cpu", marks=pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))),
+        pytest.param("cuda", marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires CUDA")),
+    ],
+)
+@_requires_torchao
+def test_qwen3_nvfp4_qat_trains_and_rounds(device: str):
+    """Both op families quantize: logits move away from eager and every gradient stays finite."""
+    torch.manual_seed(0)
+    config = _tiny_config()
+    eager = _qwen3_with_ops(config).to(device)
+    quantized = _qwen3_with_ops(
+        config, linear_implementation="torchao_nvfp4", swiglu_mlp_implementation="torchao_nvfp4"
+    ).to(device)
+    quantized.load_state_dict(eager.state_dict())
+
+    input_ids = torch.randint(3, config.vocab_size, (2, 8), device=device)
+    eager_logits = eager(input_ids=input_ids, use_cache=False).logits
+    quantized_logits = quantized(input_ids=input_ids, use_cache=False).logits
+    assert not torch.equal(quantized_logits, eager_logits)
+    assert torch.isfinite(quantized_logits).all()
+
+    loss = quantized(input_ids=input_ids, labels=input_ids, use_cache=False).loss
+    assert torch.isfinite(loss)
+    loss.backward()
+
+    for name, param in _named_trainable(quantized).items():
+        assert param.grad is not None, name
+        assert torch.isfinite(param.grad).all(), name
+    assert torch.count_nonzero(quantized.model.layers[0].self_attn.q_proj.weight.grad) > 0
+    assert torch.count_nonzero(quantized.model.layers[0].mlp.gate_proj.weight.grad) > 0
+
+
+@pytest.mark.parametrize(
+    ("ops", "targets"),
+    [
+        pytest.param(
+            {"linear_implementation": "torchao_nvfp4"}, ["q_proj", "k_proj", "v_proj", "o_proj"], id="attention"
+        ),
+        pytest.param({"swiglu_mlp_implementation": "torchao_nvfp4"}, ["gate_proj", "up_proj", "down_proj"], id="mlp"),
+    ],
+)
+@_cpu
+@_requires_torchao
+def test_qwen3_nvfp4_qat_refuses_a_wrapped_projection(ops, targets):
+    """LoRA swaps in a weightless ``LoraLinear``; running it unquantized would be a silent no-op QAT."""
+    from veomni.lora.config import VeOmniLoraConfig
+    from veomni.lora.mapping import inject_dense_lora
+
+    config = _tiny_config()
+    model = _qwen3_with_ops(config, **ops)
+    inject_dense_lora(model.model, VeOmniLoraConfig(r=8, lora_alpha=16, target_modules=targets), "default")
+
+    with pytest.raises(ValueError, match="torchao_nvfp4.* cannot run on"):
+        model(input_ids=torch.randint(3, config.vocab_size, (1, 4)), use_cache=False)
+
+
+@_cpu
+def test_qwen3_lora_runs_with_the_eager_linear_row():
+    """The shipped LoRA recipe targets the attention projections; ``eager`` runs the adapter's own forward."""
+    from veomni.lora.config import VeOmniLoraConfig
+    from veomni.lora.mapping import inject_dense_lora
+
+    config = _tiny_config()
+    model = _qwen3_with_ops(config, linear_implementation="eager")
+    model.eval()
+    input_ids = torch.randint(3, config.vocab_size, (1, 4))
+    with torch.no_grad():
+        before = model(input_ids=input_ids, use_cache=False).logits
+
+    inject_dense_lora(
+        model.model,
+        VeOmniLoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]),
+        "default",
+    )
+    with torch.no_grad():
+        after = model(input_ids=input_ids, use_cache=False).logits
+
+    # Zero-initialized lora_B keeps an injected adapter a no-op at construction.
+    torch.testing.assert_close(after, before, atol=1e-5, rtol=1e-5)

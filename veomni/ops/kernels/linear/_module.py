@@ -41,7 +41,7 @@ __all__ = [
 
 #: ``linear`` rows that fake-quantize the weight they are handed, and therefore
 #: cannot fall back to calling a wrapped projection module.
-QUANTIZING_IMPLS = frozenset({"qat"})
+QUANTIZING_IMPLS = frozenset({"qat", "torchao_nvfp4"})
 
 
 def resolve_projection(op_impl: str, module: nn.Module, x: Tensor) -> tuple[Tensor | None, Tensor | None]:

@@ -42,6 +42,7 @@ from veomni.ops.kernels.swiglu_mlp.geglu.eager import gelu_tanh_mul_backward
 from veomni.ops.kernels.swiglu_mlp.standard import liger_kernel as standard_liger
 from veomni.ops.registry import OpEntry
 from veomni.utils.device import IS_CUDA_AVAILABLE
+from veomni.utils.import_utils import is_package_available
 
 
 def _empty_bias(weight: Tensor) -> Tensor:
@@ -669,3 +670,62 @@ def test_a_linear_subclass_projection_skips_the_fused_path():
     mlp.veomni_swiglu_mlp = _QatHandle()
     with pytest.raises(ValueError, match="nn.Linear subclass"):
         has_plain_linear_projections(mlp)
+
+
+_requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reason="torchao_nvfp4 row needs torchao")
+
+
+@_requires_torchao
+@pytest.mark.parametrize("swiglu_limit", [None, 1.0])
+def test_torchao_nvfp4_matches_manual_round_trip(swiglu_limit: float | None):
+    """The fused row equals the same math with operands quantized by hand, clamp in the model dtype."""
+    from veomni.ops.qat.torchao_nvfp4 import nvfp4_fake_quant
+
+    impl = resolve_op("swiglu_mlp", "standard", "torchao_nvfp4").wrapper
+    torch.manual_seed(0)
+    mlp = _tiny_qwen3_mlp(64, 128).to(dtype=torch.bfloat16)
+    x = torch.randn(2, 16, 64, dtype=torch.bfloat16)
+
+    out = impl(*_mlp_args(mlp, x), swiglu_limit=swiglu_limit)
+
+    x_q = nvfp4_fake_quant(x)
+    gate = F.linear(x_q, nvfp4_fake_quant(mlp.gate_proj.weight), None)
+    up = F.linear(x_q, nvfp4_fake_quant(mlp.up_proj.weight), None)
+    if swiglu_limit is not None:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    hidden_states = F.silu(gate) * up
+    expected = F.linear(nvfp4_fake_quant(hidden_states), nvfp4_fake_quant(mlp.down_proj.weight), None)
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    assert not torch.equal(out, mlp(x))
+
+
+@_requires_torchao
+def test_torchao_nvfp4_backward_produces_finite_gradients():
+    """Straight-through gradients reach the input and every projection weight."""
+    impl = resolve_op("swiglu_mlp", "standard", "torchao_nvfp4").wrapper
+    torch.manual_seed(0)
+    mlp = _tiny_qwen3_mlp().to(dtype=torch.bfloat16)
+    x = torch.randn(2, 16, mlp.hidden_size, dtype=torch.bfloat16, requires_grad=True)
+
+    impl(*_mlp_args(mlp, x)).float().pow(2).sum().backward()
+
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    for parameter in mlp.parameters():
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        assert torch.count_nonzero(parameter.grad) > 0
+
+
+@_requires_torchao
+def test_torchao_nvfp4_handles_empty_input():
+    """Zero-token inputs keep their shape and propagate zero gradients to the MLP weights."""
+    impl = resolve_op("swiglu_mlp", "standard", "torchao_nvfp4").wrapper
+    mlp = _tiny_qwen3_mlp().to(dtype=torch.bfloat16)
+    x = torch.randn(0, 8, mlp.hidden_size, dtype=torch.bfloat16, requires_grad=True)
+
+    out = impl(*_mlp_args(mlp, x))
+    assert out.shape == (0, 8, mlp.hidden_size)
+    out.sum().backward()
+    for parameter in mlp.parameters():
+        torch.testing.assert_close(parameter.grad, torch.zeros_like(parameter))
