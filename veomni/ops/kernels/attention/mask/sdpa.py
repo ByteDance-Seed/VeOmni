@@ -25,6 +25,8 @@ from transformers.masking_utils import (
     and_masks,
     bidirectional_mask_function,
     causal_mask_function,
+    or_masks,
+    sliding_window_bidirectional_overlay,
     sliding_window_overlay,
 )
 
@@ -91,6 +93,8 @@ def _dense_attention_mask_builder(
     custom predicates do.
     """
     sliding_window = kwargs.pop("sliding_window", None)
+    or_mask_function = kwargs.pop("or_mask_function", None)
+    and_mask_function = kwargs.pop("and_mask_function", None)
     cu_seqlens = kwargs.pop("cu_seqlens", None)
     cu_seqlens_k = kwargs.pop("cu_seqlens_k", None)
     if cu_seqlens_k is None:
@@ -105,7 +109,11 @@ def _dense_attention_mask_builder(
         if (
             attention_mask is None
             and cu_seqlens is None
-            and mask_function not in (causal_mask_function, bidirectional_mask_function)
+            and (
+                mask_function not in (causal_mask_function, bidirectional_mask_function)
+                or or_mask_function is not None
+                or and_mask_function is not None
+            )
         ):
             raise ValueError(
                 "SDPA with Ulysses requires full-sequence metadata for a custom mask function; "
@@ -128,7 +136,16 @@ def _dense_attention_mask_builder(
         q_offset = kv_offset = 0
 
     if sliding_window is not None:
-        mask_function = and_masks(mask_function, sliding_window_overlay(sliding_window))
+        window_overlay = (
+            sliding_window_bidirectional_overlay(sliding_window)
+            if mask_function is bidirectional_mask_function
+            else sliding_window_overlay(sliding_window)
+        )
+        mask_function = and_masks(mask_function, window_overlay)
+    if or_mask_function is not None:
+        mask_function = or_masks(mask_function, or_mask_function)
+    if and_mask_function is not None:
+        mask_function = and_masks(mask_function, and_mask_function)
     if cu_seqlens is not None:
         mask_function = packed_mask_function(
             mask_function=mask_function,

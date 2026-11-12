@@ -58,14 +58,72 @@ grad_fc2_output = moe_scatter(grad_output, scatter_index)
 num_scattered_tokens = grad_fc2_output.shape[0]
 ```
 
-Use `num_scattered_tokens` for the downstream `group_gemm_same_nk(...,
-max_M=...)` calls in non-EP backward. The matching `group_gemm_same_mn(...,
-max_K=...)` value is kept consistent with the scattered input row count, but the
-stale-row correctness issue is about `group_gemm_same_nk` under-covering its
-output rows.
+With the shape-derived fallback, split-FC1 backward uses `num_scattered_tokens` for the downstream
+`group_gemm_same_nk(..., max_M=...)` calls. The merged backward reuses its
+forward's shape-derived bound: total routed rows by default, or original
+tokens only when the caller explicitly guarantees distinct top-k routes.
+The matching `group_gemm_same_mn(..., max_K=...)` value stays the total
+scattered row count. Weight-gradient reduction dimensions are unchanged.
 
-Do not use the original token count as the backward grouped-GEMM bound. It is
-only safe when every expert group has at most `tokens` scattered rows.
+Only use the original token count when every expert group is guaranteed to
+have at most `tokens` scattered rows.
+
+## Device-side row-tile schedule
+
+Eligible eager calls build one device prefix of each expert's
+`ceil(expert_rows / 128)` output-row tiles. Standard split/merged FC1, their
+EP-local counterparts, and shared/independent MoE-LoRA (with and without EP)
+use the same schedule selection. EP builds its prefix from the local,
+already-permuted rows and local expert boundaries.
+
+The prefix is saved for backward. Split experts reuse it for three forward
+and three input-gradient same-NK GEMMs; merged experts reuse it for two plus
+two. Shared LoRA applies it to the base grouped GEMMs; its dense adapter
+projections are unchanged. Independent LoRA also passes it through the
+per-expert A/B projections and their input gradients, sharing one prefix
+across eight forward and eight backward same-NK calls. Each forward owns
+its prefix; equal shapes do not permit reuse across different routing inputs.
+
+The host can bound the row-tile grid using tensor shapes:
+
+```text
+sum(ceil(expert_rows / 128)) <= ceil(total_routed_rows / 128) + experts - 1
+```
+
+The kernel checks the actual total in the device prefix, then binary-searches
+the expert owning each valid tile. Row and column tile axes are flattened
+into `grid.x`, preserving the original launch's supported column range.
+The schedule may launch a few unused tail tiles but avoids repeating the
+whole per-expert upper bound for every expert.
+
+`same_nk_tile_schedule(cumsum, rows)` returns the optional prefix together
+with its Python integer row total. Every `group_gemm_same_nk` consumer passes
+both `tile_cumsum` and `tile_total_M`. With a prefix, the latter must match
+`a.shape[0]`; a missing, tensor-valued or mismatched total is rejected before
+output allocation or kernel launch. This checks the producer/consumer row
+contract without copying the prefix's last value to the host. Consumers must
+also preserve the original expert boundaries and row ordering.
+
+The prefix applies to NVIDIA CUDA tensors, nonempty routed input and the
+existing 128-row GEMM tiles. ROCm retains the shape-derived schedule. Expert
+counts are limited by `_COMPACT_SCHEDULE_MAX_EXPERTS` (currently 256).
+
+Building the prefix scans `next_power_of_2(experts)` positions in one program,
+and each valid GEMM tile binary-searches that prefix. These costs are traded
+against fewer empty GEMM programs; the net benefit depends on routed rows,
+matrix shapes and expert load distribution. The cap is a conservative support
+limit for this implementation, not a mathematical correctness bound or a
+measured universal performance crossover. Raising it does not change the scan
+size or lookup range for already-eligible calls: both use the actual expert
+count. Eligible eager calls above the cap warn once and keep the shape-derived
+bound before allocating or launching a prefix.
+
+Compilation, stream capture, unavailable capture-state queries and unsupported
+metadata retain each entry point's
+original shape-derived bound. The unused schedule and its row total are both
+`None`. Neither selection reads a device scalar. Existing EP preprocessing
+and communication are unchanged. Weight-gradient same-MN reduction bounds,
+GEMM tile parameters, routing weights and activation rounding are unchanged.
 
 ## Why ordinary top-k routing may hide the bug
 

@@ -124,6 +124,18 @@ def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable
         # accept ``grad_enabled`` still see the caller's autograd mode.
         if accepts_grad_enabled:
             attrs.setdefault("grad_enabled", torch.is_grad_enabled())
+        # Nothing needs a backward, so skip the autograd node. This is not only
+        # cheaper: Dynamo cannot bind ``_OpFn.forward`` in inference mode, where
+        # the variadic tensors are followed by a non-tensor argument. Inlining it
+        # reports ``args = []`` and fails with "failed to bind arguments when
+        # attempting to inline", which breaks every ``torch.compile``d forward
+        # that runs under ``no_grad``/``inference_mode``. Calling the raw pair
+        # directly keeps that path compilable and produces the same values.
+        needs_graph = torch.is_grad_enabled() and any(
+            isinstance(tensor, Tensor) and tensor.requires_grad for tensor in bound_tensors
+        )
+        if not needs_graph:
+            return raw_forward(*bound_tensors, **attrs)[0]
         return _OpFn.apply(*bound_tensors, attrs)
 
     return wrapper
