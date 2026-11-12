@@ -65,6 +65,36 @@ def _cpu_inputs(counts=(6, 7)):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("enabled", [False, True])
+def test_npu_wrapper_accepts_quantization_options_and_forwards_fp32_wgrad(monkeypatch, enabled):
+    from veomni.ops.kernels.moe_experts.standard import npu
+
+    captured = {}
+
+    def forward(*args, **kwargs):
+        captured.update(kwargs)
+        return args[3]
+
+    monkeypatch.setattr(npu, "npu_fused_moe_forward", forward)
+    tensor = torch.ones(1)
+    result = npu.wrapper(
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        num_experts=1,
+        block_size=64,
+        expert_dtype="fp4",
+        fp32_wgrad=enabled,
+    )
+    assert result is tensor
+    assert captured["fp32_wgrad"] is enabled
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_fp32_wgrad_keeps_bf16_forward_and_input_gradient(fake_npu):
     x, master, dy = _cpu_inputs()
     counts = [6, 7]
