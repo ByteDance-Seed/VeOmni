@@ -56,7 +56,7 @@ from torch.distributed.tensor.placement_types import _StridedShard
 
 from ..distributed.parallel_state import ParallelState, get_parallel_state, is_parallel_state_initialized
 from ..utils import logging
-from ..utils.device import empty_cache, synchronize
+from ..utils.device import empty_cache, get_device_type, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
 from ..utils.dtensor_utils import rewrap_dtensor_local
 from .checkpointer import CheckpointerBase
@@ -873,7 +873,7 @@ def _has_live_expert_checkpoint_tensors(model):
 def _reject_unproven_extra_parallel_optimizer(
     state, parallel_state, *, group=None, trainable_only=False, allow_proven_optimizer=False, saving=False
 ):
-    error, has_canonical_layout = None, False
+    error, has_v2, logical_signature = None, False, None
     try:
         model = state.get("model")
         ps = (
@@ -887,18 +887,56 @@ def _reject_unproven_extra_parallel_optimizer(
                 "the expert checkpoint source layout is not proven for TP > 1"
             )
         specs = getattr(model, "_fqn2spec_info", None)
-        if _needs_extra_parallel_layout_marker(specs):
+        has_v2 = _needs_extra_parallel_layout_marker(specs)
+        if has_v2:
             _extra_parallel_layout_key(specs)
-            has_canonical_layout = True
         if state.get("optimizer") is not None and getattr(ps, "dp_mode", None) == "fsdp2":
-            if _needs_extra_parallel_layout_marker(specs) and not allow_proven_optimizer:
+            if has_v2 and not allow_proven_optimizer:
                 raise RuntimeError("Canonical ExtraParallel optimizer state requires an owner-aware checkpoint codec")
+        if has_v2:
+            named_params = list(state["model"].named_parameters(remove_duplicate=False))
+            if ps is None:
+                ps = parallel_state if parallel_state is not None else get_parallel_state()
+            aliases = {}
+            for name, param in named_params:
+                aliases.setdefault(id(param), []).append(name)
+            expert_aliases = {
+                name
+                for names in aliases.values()
+                if any("experts" in alias.split(".") for alias in names)
+                for name in names
+            }
+            ordinary_experts = (
+                tuple(sorted(_ordinary_expert_fqns(state["model"], ps)))
+                if isinstance(ps, ParallelState) and any(size != 1 for size in ps.extra_parallel_sizes.values())
+                else ()
+            )
+            logical_signature = _checkpoint_extra_parallel_signature(
+                specs,
+                optimizer_present=state.get("optimizer") is not None,
+                trainable_only=trainable_only,
+                trainability=(
+                    tuple(sorted((name, param.requires_grad) for name, param in named_params))
+                    if trainable_only
+                    else ()
+                ),
+                runtime_ndims={
+                    name: tensor.ndim
+                    for name, tensor in (named_params + list(state["model"].named_buffers(remove_duplicate=False)))
+                },
+                expert_aliases=expert_aliases,
+                ordinary_experts=ordinary_experts,
+                shared_lora=tuple(sorted(_shared_lora_fqns(state["model"], ordinary_experts)))
+                if ordinary_experts
+                else (),
+            )
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "checking canonical ExtraParallel optimizer state", group=group)
+    _check_extra_parallel_signature_across_ranks(has_v2, logical_signature, group=group)
     error = None
     try:
-        if has_canonical_layout:
+        if has_v2:
             model = state["model"]
             options = StateDictOptions(ignore_frozen_params=True) if trainable_only else None
             canonical_state = get_model_state_dict(model, options=options)
@@ -923,6 +961,97 @@ def _reject_unproven_extra_parallel_optimizer(
     raise_if_any_rank_failed(error, "checking canonical ExtraParallel runtime tensors", group=group)
 
 
+def _checkpoint_extra_parallel_signature(
+    specs,
+    *,
+    optimizer_present,
+    trainable_only,
+    trainability=(),
+    runtime_ndims=None,
+    expert_aliases=(),
+    ordinary_experts=(),
+    shared_lora=(),
+):
+    """Describe logical layout, excluding rank-local coordinates and tensor contents."""
+    entries = []
+    for name, spec in sorted((specs or {}).items()):
+        mesh = getattr(spec, "para_fsdp_mesh", None)
+        shape = getattr(spec, "global_shape", None)
+        placement = getattr(spec, "placement", None)
+        if isinstance(placement, Replicate) and ("experts" in name.split(".") or name in expert_aliases):
+            mesh_names = getattr(mesh, "mesh_dim_names", None)
+            entries.append(
+                (
+                    name,
+                    spec.para_name,
+                    "Replicate",
+                    tuple(mesh_names) if mesh_names is not None else None,
+                    tuple(mesh.shape) if mesh is not None else None,
+                )
+            )
+            continue
+        if not isinstance(placement, Shard):
+            continue
+        axis = placement.dim
+        fsdp_axis = getattr(spec, "fsdp_shard_dim", None)
+        persistent_axis = getattr(spec, "persistent_fsdp_shard_dim", None)
+        layout_v2 = bool(getattr(spec, "checkpoint_layout_v2", False))
+        if persistent_axis is not None:
+            # Persistent shards do not use the ordinary FSDP axis or v2 marker.
+            fsdp_axis, layout_v2 = None, None
+        ndim = len(shape) if shape is not None else (runtime_ndims or {}).get(name)
+        if ndim:
+            for shard_axis in (axis, fsdp_axis, persistent_axis):
+                if shard_axis is not None and not -ndim <= shard_axis < ndim:
+                    raise RuntimeError(f"ExtraParallel checkpoint axis is outside the tensor rank: {name}")
+            axis = axis % ndim if axis is not None else None
+            fsdp_axis = fsdp_axis % ndim if fsdp_axis is not None else None
+            persistent_axis = persistent_axis % ndim if persistent_axis is not None else None
+        mesh_names = getattr(mesh, "mesh_dim_names", None)
+        entries.append(
+            (
+                name,
+                spec.para_name,
+                type(placement).__name__,
+                axis,
+                fsdp_axis,
+                persistent_axis,
+                tuple(shape) if shape is not None else None,
+                layout_v2,
+                tuple(mesh_names) if mesh_names is not None else None,
+                tuple(mesh.shape) if mesh is not None else None,
+            )
+        )
+    return (
+        bool(optimizer_present),
+        bool(trainable_only),
+        tuple(trainability),
+        tuple(ordinary_experts),
+        tuple(shared_lora),
+        tuple(entries),
+    )
+
+
+def _check_extra_parallel_signature_across_ranks(has_v2, signature, *, group=None):
+    """Reject rank-inconsistent checkpoint policy before collectives or file mutation."""
+    if not dist.is_initialized():
+        return
+    device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
+    presence = torch.tensor([int(has_v2), int(not has_v2)], dtype=torch.int32, device=device)
+    dist.all_reduce(presence, op=dist.ReduceOp.MAX, group=group)
+    if bool(presence[0]) and bool(presence[1]):
+        raise RuntimeError("checkpoint ExtraParallel layout version differs across ranks")
+    if not bool(presence[0]):
+        return
+    digest = hashlib.sha256(repr(signature).encode("utf-8")).digest()
+    low = torch.tensor(list(digest), dtype=torch.int32, device=device)
+    high = low.clone()
+    dist.all_reduce(low, op=dist.ReduceOp.MIN, group=group)
+    dist.all_reduce(high, op=dist.ReduceOp.MAX, group=group)
+    if not torch.equal(low, high):
+        raise RuntimeError("checkpoint ExtraParallel layout or optimizer policy differs across ranks")
+
+
 def _extra_parallel_layout_key(specs):
     """Version canonical tensors independently of their source geometry."""
     for spec in (specs or {}).values():
@@ -935,6 +1064,42 @@ def _extra_parallel_layout_key(specs):
         _normalized_extra_parallel_dims(spec)
     digest = hashlib.sha256(b"veomni-extra-parallel-canonical-v2").hexdigest()
     return f"{_EXTRA_PARALLEL_LAYOUT_MARKER}{digest}"
+
+
+def _runtime_extra_parallel_layout_signature(specs):
+    """Detect mutation while a single Stateful adapter is in use."""
+    if _needs_extra_parallel_layout_marker(specs):
+        _extra_parallel_layout_key(specs)
+    return tuple(
+        (
+            name,
+            spec.para_name,
+            repr(spec.placement),
+            spec.fsdp_shard_dim,
+            getattr(spec, "persistent_fsdp_shard_dim", None),
+            getattr(spec, "global_shape", None),
+            getattr(spec, "checkpoint_layout_v2", False),
+            tuple(spec.para_fsdp_mesh.shape) if spec.para_fsdp_mesh else None,
+        )
+        for name, spec in sorted((specs or {}).items())
+    )
+
+
+def _assert_extra_parallel_layout_unchanged(owner):
+    specs = owner.extra_parallel_fqn2spec_info
+    if specs is not getattr(owner.model, "_fqn2spec_info", None) or (
+        owner._layout_signature != _runtime_extra_parallel_layout_signature(specs)
+    ):
+        raise RuntimeError("ExtraParallel layout changed while checkpoint adapter was active")
+
+
+def _coordinate_extra_parallel_layout_check(owner, group):
+    error = None
+    try:
+        _assert_extra_parallel_layout_unchanged(owner)
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "checking checkpoint adapter layout", group=group)
 
 
 def _strip_extra_parallel_layout_marker(state_dict, required, marker_key):
@@ -1402,12 +1567,14 @@ class ModelState(Stateful):
             if _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info)
             else None
         )
+        self._layout_signature = _runtime_extra_parallel_layout_signature(self.extra_parallel_fqn2spec_info)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
         )
 
     @torch.no_grad()
     def state_dict(self):
+        _assert_extra_parallel_layout_unchanged(self)
         options = StateDictOptions(ignore_frozen_params=True) if self.trainable_only else None
         model_state_dict = get_model_state_dict(model=self.model, options=options)
         if self.should_extra_parallel_aware and _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info):
@@ -1435,6 +1602,7 @@ class ModelState(Stateful):
         need to drop ExtraParallel-dim when loading from DCP checkpoints
         so that ExtraParallel-FSDP would not be confused
         """
+        _assert_extra_parallel_layout_unchanged(self)
         model_state_dict = _strip_extra_parallel_layout_marker(
             state_dict,
             self.should_extra_parallel_aware
@@ -1548,6 +1716,7 @@ class OptimizerState(Stateful):
             if _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info)
             else None
         )
+        self._layout_signature = _runtime_extra_parallel_layout_signature(self.extra_parallel_fqn2spec_info)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
         )
@@ -1559,6 +1728,7 @@ class OptimizerState(Stateful):
             # can enter its own collectives, even if a local check fails.
             error = None
             try:
+                _assert_extra_parallel_layout_unchanged(self)
                 if _requires_rank_local_optimizer_checkpoint(self.optimizer):
                     raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
                 if self._layout_marker_key is not None:
@@ -1576,6 +1746,7 @@ class OptimizerState(Stateful):
             raise_if_any_rank_failed(error, "validating ExtraParallel optimizer checkpoint", group=self.process_group)
             raise RuntimeError("ExtraParallel optimizer checkpoint preflight unexpectedly succeeded")
 
+        _assert_extra_parallel_layout_unchanged(self)
         if _requires_rank_local_optimizer_checkpoint(self.optimizer):
             raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
         if getattr(self.optimizer, "_is_multi_optimizer", False):
@@ -1587,6 +1758,7 @@ class OptimizerState(Stateful):
 
     def load_state_dict(self, state_dict):
         """Restore optimizer state from the loaded DCP state dict."""
+        _assert_extra_parallel_layout_unchanged(self)
         if _requires_rank_local_optimizer_checkpoint(self.optimizer):
             raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
         if self.should_extra_parallel_aware and self._layout_marker_key is not None:
@@ -1642,6 +1814,7 @@ class _ProvenModelState(ModelState):
         self.group = group
 
     def state_dict(self):
+        _coordinate_extra_parallel_layout_check(self, self.group)
         result, error = None, None
         try:
             result = super().state_dict()
@@ -1659,6 +1832,7 @@ class _ProvenModelState(ModelState):
         return result
 
     def load_state_dict(self, state_dict):
+        _coordinate_extra_parallel_layout_check(self, self.group)
         error = None
         try:
             super().load_state_dict(state_dict)
@@ -1685,6 +1859,7 @@ class _ProvenMultiOptimizerState(OptimizerState):
         self._verified_rank_local_keys = frozenset()
 
     def state_dict(self):
+        _coordinate_extra_parallel_layout_check(self, self.group)
         result, error = None, None
         try:
             result = self.optimizer._sparse_state_dict(coordinate=True, group=self.group)
@@ -1723,6 +1898,7 @@ class _ProvenMultiOptimizerState(OptimizerState):
         return result
 
     def load_state_dict(self, state_dict):
+        _coordinate_extra_parallel_layout_check(self, self.group)
         error = None
         try:
             state_dict = dict(state_dict)
@@ -1995,9 +2171,7 @@ def _prepare_stage_dir(stage_dir: str, path: str, group: Optional[Any] = None) -
     return stage_path
 
 
-def _promote_staged_checkpoint(
-    stage_path: str, final_path: str, step_root: Optional[str] = None, group: Optional[Any] = None
-) -> None:
+def _promote_staged_checkpoint(stage_path: str, final_path: str, group: Optional[Any] = None) -> None:
     """Copy a staged checkpoint to its destination, then drop the staged copy.
 
     The staging directory is node-local, so one rank per node copies all of it
@@ -2024,10 +2198,8 @@ def _promote_staged_checkpoint(
     previous checkpoint before the new one exists anywhere -- and keeping that
     checkpoint readable until the last possible moment is what staging is for.
 
-    ``step_root`` is the step directory, given when the destination may hold a
-    pre-split checkpoint whose marker sits there rather than inside
-    ``final_path``. Nested files are copied in the data phase, before any
-    ``.metadata`` is. The per-rank ``extra_state/`` files are among those files.
+    Nested files are copied in the data phase, before any ``.metadata`` is. The
+    per-rank ``extra_state/`` files are among those files.
     """
     metadata_name = DCP_MARKER_FILENAME
     is_node_leader = _local_rank() == 0
@@ -2068,15 +2240,8 @@ def _promote_staged_checkpoint(
         One module's directory. A sibling module of the same job lives beside it,
         is not being written, and keeps everything it has.
         """
-        # The step may predate this layout, in which case DCP left its marker at
-        # the step root rather than in here. Delete this import (and
-        # veomni/checkpoint/legacy_v0_1_12.py) to drop that layout.
-        from .legacy_v0_1_12 import drop_marker
-
         shutil.rmtree(final_path, ignore_errors=True)
         os.makedirs(final_path, exist_ok=True)
-        if step_root is not None:
-            drop_marker(step_root)
 
     def copy_this_nodes_files() -> None:
         """Copy every staged file on this node, except the completion markers.
@@ -2379,8 +2544,9 @@ class DistributedCheckpointer(CheckpointerBase):
             stage_dir: write the checkpoint here and copy it to ``path`` afterwards,
                 instead of writing straight to ``path``. Intended for a destination far
                 slower than local disk. The whole ``model/`` subtree — both DCP
-                directories and the scheduler sidecar — lands under the staging
-                directory and is copied together, with every ``.metadata`` copied
+                directories and the per-rank ``extra_state/`` pickles — lands under
+                the staging directory and is copied together, with every
+                ``.metadata`` copied
                 last. Staging is keyed per module as well as per run, so two modules
                 of one job do not sweep each other's staged files. The caller
                 owns the choice: this does not probe
@@ -2600,7 +2766,7 @@ class DistributedCheckpointer(CheckpointerBase):
             raise
 
         if stage_path is not None:
-            _promote_staged_checkpoint(stage_path, model_root, step_root=checkpoint_dir, group=stage_group)
+            _promote_staged_checkpoint(stage_path, model_root, group=stage_group)
 
         logger.info_rank0(f"Saved checkpoint to {model_root}")
         return generation if multi else None
@@ -2613,10 +2779,9 @@ class DistributedCheckpointer(CheckpointerBase):
         staged save has ``_promote_staged_checkpoint`` do the same job at
         promotion time, because until then it has overwritten nothing.
 
-        Two places to look. This module's ``ckpt/`` and ``optimizer/``, and the
-        step root, where an older VeOmni's fused save left the same file. Both
-        are DCP's own marker, which is why both are dropped here rather than by
-        the callback: this class is the one that puts them back.
+        This module's ``ckpt/`` and ``optimizer/``: DCP's own marker, which is
+        why the checkpointer drops them rather than the callback -- this class
+        is the one that puts them back.
 
         Only this module's. A sibling module is not being rewritten and its
         markers still hold. The step's ``checkpoint_manifest.json`` is not ours
@@ -2625,16 +2790,10 @@ class DistributedCheckpointer(CheckpointerBase):
         One rank owns these files, so only that rank deletes them, and the
         reduction turns a failure there into one every rank sees.
         """
-        # The step being overwritten may predate this layout, in which case DCP
-        # left its marker at the step root. Delete this import (and
-        # veomni/checkpoint/legacy_v0_1_12.py) to drop that layout.
-        from .legacy_v0_1_12 import drop_marker
-
         is_coordinator = (not dist.is_initialized()) or dist.get_rank() == 0
         error: Optional[Exception] = None
         if is_coordinator:
             try:
-                drop_marker(checkpoint_dir)
                 for marker in dcp_markers(checkpoint_dir, [module]):
                     if os.path.exists(marker):
                         os.remove(marker)
@@ -2658,9 +2817,7 @@ class DistributedCheckpointer(CheckpointerBase):
 
         Mirrors :meth:`save`: weights from ``model/<module>/ckpt``, optimizer from
         ``model/<module>/optimizer``, model-bound extra state from the per-rank
-        ``extra_state/`` beside them. A checkpoint written before the split has
-        no ``model/`` at all and keeps both in one directory; that shape is
-        detected and read as-is.
+        ``extra_state/`` beside them.
 
         args:
             path: step directory to load from
@@ -2702,27 +2859,72 @@ class DistributedCheckpointer(CheckpointerBase):
 
         wants_optimizer = state.get("optimizer") is not None
 
-        fused_dir, error = None, None
+        error = None
         try:
             _validate_legacy_expert_source_layout(legacy_expert_source_layout)
             if legacy_expert_source_layout is not None and optimizer is not None:
                 raise ValueError("Legacy expert source declarations are only supported for model-only loads")
-            fused_dir = cls._legacy_fused_dir(path, module)
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "inspecting checkpoint layout", group=process_group)
-        specs, needs_marker, error = None, False, None
-        try:
-            specs = getattr(state["model"], "_fqn2spec_info", None)
-            needs_marker = _needs_extra_parallel_layout_marker(specs)
-        except BaseException as exc:
-            error = exc
-        raise_if_any_rank_failed(error, "checking ExtraParallel marker policy", group=process_group)
-        if needs_marker:
+
+        model_root = model_dir(path, module)
+        # Every directory this load will read has to be complete, or ``dcp.load``
+        # fails with a bare "metadata is None" that names neither the path nor
+        # the reason. Two ways to get here: a step written by a layout this
+        # version no longer produces (see ``docs/usage/checkpoint.md``), or a
+        # save that was interrupted — on disk the two are the same shape.
+        #
+        # Reduced before any rank enters ``dcp.load``: the markers are read from
+        # the filesystem, and a job writing to non-shared storage
+        # (``dcp_save_to_lowest_rank``) can see a marker on one rank and not
+        # another. A rank that raised here alone would leave its peers waiting in
+        # the load's collectives until the backend timed out.
+        #
+        # Requiring the global ``.metadata`` is safe here because that is the
+        # only one VeOmni writes: ``FileSystemWriter`` is constructed with its
+        # defaults, so each save emits a single step-level ``.metadata`` and
+        # never the ``__{rank}.metadata`` a DCP load can fall back to. A
+        # checkpoint carrying only rank-local metadata is therefore not
+        # something this framework produces.
+        error: Optional[Exception] = None
+        for directory, wanted in (
+            (weights_dir(path, module), True),
+            (optimizer_dir(path, module), wants_optimizer),
+        ):
+            if not wanted:
+                continue
+            marker = os.path.join(directory, DCP_MARKER_FILENAME)
+            try:
+                # Opened, not stat-ed. A marker that exists but cannot be read
+                # passes ``os.stat`` and then fails inside ``dcp.load`` as
+                # "metadata is None" -- the message this guard exists to replace.
+                with open(marker, "rb"):
+                    pass
+            except FileNotFoundError:
+                error = FileNotFoundError(
+                    f"no complete DCP checkpoint under {directory}: {DCP_MARKER_FILENAME} is "
+                    "missing. Checkpoints written before the step directory was split by state "
+                    "owner are not resumable, and a save that did not finish leaves the same "
+                    "shape. See docs/usage/checkpoint.md."
+                )
+            except OSError as read_error:
+                # Unreadable is not missing. Reporting a permissions or I/O
+                # failure as "not resumable" would send the user to the layout
+                # doc for a problem that has nothing to do with the layout.
+                error = read_error
+            if error is not None:
+                break
+        raise_if_any_rank_failed(error, "validating the checkpoint to load", group=process_group)
+        if error is not None:
+            raise error
+        specs = getattr(state["model"], "_fqn2spec_info", None)
+        if _needs_extra_parallel_layout_marker(specs):
             marker_error = None
             try:
-                source_path = fused_dir if fused_dir is not None else weights_dir(path, module)
-                _read_extra_parallel_marker(cls._create_storage_reader(source_path), _extra_parallel_layout_key(specs))
+                _read_extra_parallel_marker(
+                    cls._create_storage_reader(weights_dir(path, module)), _extra_parallel_layout_key(specs)
+                )
             except BaseException as exc:
                 marker_error = exc
             raise_if_any_rank_failed(marker_error, "validating ExtraParallel checkpoint marker", group=process_group)
@@ -2738,12 +2940,6 @@ class DistributedCheckpointer(CheckpointerBase):
             except BaseException as exc:
                 error = exc
             raise_if_any_rank_failed(error, "validating MultiOptimizer checkpoint policy", group=process_group)
-            error = (
-                RuntimeError("Fused MultiOptimizer checkpoints require an explicitly verified migration")
-                if fused_dir is not None
-                else None
-            )
-            raise_if_any_rank_failed(error, "checking MultiOptimizer checkpoint layout", group=process_group)
             scheduler_object = state.get("_veomni_scheduler_object")
             optimizer_path = optimizer_dir(path, module)
             model_path = weights_dir(path, module)
@@ -2848,17 +3044,15 @@ class DistributedCheckpointer(CheckpointerBase):
         try:
             model_state = _model_state()
             optimizer_state = _optimizer_state() if wants_optimizer else None
-            model_reader = cls._create_storage_reader(fused_dir or weights_dir(path, module))
+            model_reader = cls._create_storage_reader(weights_dir(path, module))
             if wants_optimizer:
-                reader = (
-                    model_reader if fused_dir is not None else cls._create_storage_reader(optimizer_dir(path, module))
-                )
+                reader = cls._create_storage_reader(optimizer_dir(path, module))
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "preparing distributed checkpoint load", group=process_group)
         if dist.is_initialized():
             decisions = [None] * dist.get_world_size(group=process_group)
-            local = (fused_dir, wants_optimizer, multi)
+            local = (wants_optimizer, multi)
             dist.all_gather_object(decisions, local, group=process_group)
             if any(decision != local for decision in decisions):
                 raise RuntimeError("Checkpoint load format differs across ranks")
@@ -2890,24 +3084,6 @@ class DistributedCheckpointer(CheckpointerBase):
             ):
                 error = RuntimeError("Frozen SwapAdamW history does not support optimizer load-state hooks")
             raise_if_any_rank_failed(error, "checking frozen optimizer recovery hooks", group=process_group)
-            split_fused = fused_dir is not None and has_frozen
-            if fused_dir is not None and not split_fused:
-                model_state = prepared(model_state, "preparing model checkpoint state")
-                load_state = {"model": model_state}
-                if wants_optimizer:
-                    load_state["optimizer"] = prepared(optimizer_state, "preparing optimizer checkpoint state")
-                dcp.load(
-                    state_dict=load_state,
-                    storage_reader=model_reader,
-                    process_group=process_group,
-                    planner=_ModelStrictLoadPlanner(
-                        strict_model=not trainable_only, legacy_expert_source_layout=legacy_expert_source_layout
-                    ),
-                )
-                load_extra_coordinated(fused_dir)
-                logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
-                return state
-
             model_root = model_dir(path, module)
             error = None
             try:
@@ -2932,25 +3108,9 @@ class DistributedCheckpointer(CheckpointerBase):
                     process_group=process_group,
                     planner=_ModelStrictLoadPlanner(strict_model=False),
                 )
-            load_extra_coordinated(fused_dir if split_fused else model_root)
+            load_extra_coordinated(model_root)
             logger.info_rank0(f"Loaded checkpoint from {model_root}")
             return state
-
-    @classmethod
-    def _legacy_fused_dir(cls, path: str, module: str) -> Optional[str]:
-        """Directory holding a pre-split checkpoint, or ``None`` for a current one.
-
-        Before weights and optimizer were separated there was one DCP directory
-        per model, marked by its own ``.metadata``: at the step root for a
-        single-model job, and at ``<step>/<module>/`` for SeedOmni V2. Neither has
-        a ``model/`` subtree, which is what tells the two apart.
-        """
-        if os.path.exists(os.path.join(weights_dir(path, module), DCP_MARKER_FILENAME)):
-            return None
-        legacy_dir = os.path.join(path, module) if module else path
-        if os.path.exists(os.path.join(legacy_dir, DCP_MARKER_FILENAME)):
-            return legacy_dir
-        return None
 
     @classmethod
     def wait_for_pending_save(cls) -> None:

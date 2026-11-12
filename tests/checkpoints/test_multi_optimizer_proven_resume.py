@@ -2,13 +2,14 @@
 # Licensed under the Apache License, Version 2.0.
 """CPU regressions for proven MultiOptimizer checkpoint recovery."""
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_capabilities
 from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.optim.lr_scheduler import build_lr_scheduler
 from veomni.optim.muon import DistributedMuon
@@ -96,6 +97,69 @@ def test_corrupt_optimizer_inventory_fails_on_all_ranks():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     spawn_with_rendezvous(_corrupt_inventory_worker, nprocs=2)
+
+
+def _adapter_layout_mutation_worker(rank, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from veomni.checkpoint.dcp_checkpointer import OptimizerState, _ProvenModelState, _ProvenMultiOptimizerState
+
+    class OptimizerProbe:
+        def __init__(self):
+            self.entered = False
+
+        def _sparse_state_dict(self, **kwargs):
+            self.entered = True
+            dist.all_reduce(torch.ones(1))
+            return {}
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        for kind in ("model", "optimizer"):
+            for operation in ("state_dict", "load_state_dict"):
+                model = torch.nn.Linear(1, 1)
+                optimizer = OptimizerProbe()
+                parallel = SimpleNamespace(dp_mode="ddp")
+                if kind == "model":
+                    adapter = _ProvenModelState(model, optimizer=optimizer, parallel_state=parallel, group=None)
+                else:
+                    adapter = _ProvenMultiOptimizerState(
+                        model, optimizer, parallel_state=parallel, generation="g", expected_layout="l", group=None
+                    )
+                if rank == 0:
+                    model._fqn2spec_info = {}
+                with pytest.raises(RuntimeError, match="layout changed|failed on another rank"):
+                    getattr(adapter, operation)({}) if operation == "load_state_dict" else getattr(
+                        adapter, operation
+                    )()
+                assert not optimizer.entered
+                tensor = torch.ones(1)
+                dist.all_reduce(tensor)
+                assert tensor.item() == 2
+
+        model = torch.nn.Linear(1, 1)
+        model._fqn2spec_info = {}
+        adapter = OptimizerState(
+            model, torch.optim.AdamW(model.parameters()), parallel_state=SimpleNamespace(dp_mode="fsdp2")
+        )
+        if rank == 0:
+            model._fqn2spec_info = {}
+        with pytest.raises(RuntimeError, match="layout changed|ExtraParallel|failed on another rank"):
+            adapter.state_dict()
+        tensor = torch.ones(1)
+        dist.all_reduce(tensor)
+        assert tensor.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_adapter_layout_mutation_is_coordinated_before_collectives():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_adapter_layout_mutation_worker, nprocs=2)
 
 
 def _asymmetric_optimizer_policy_worker(rank, checkpoint, operation, failure, endpoint):
@@ -856,13 +920,14 @@ def test_multi_optimizer_rejects_changed_group_identity(tmp_path):
 def test_unversioned_multi_optimizer_checkpoint_fails_closed(tmp_path):
     import torch.distributed.checkpoint as dcp
 
-    from veomni.checkpoint.layout import optimizer_dir
+    from veomni.checkpoint.layout import optimizer_dir, weights_dir
 
     model, optimizer = _model_and_optimizer()
     model.weight.grad = torch.ones_like(model.weight)
     model.bias.grad = torch.ones_like(model.bias)
     optimizer.step()
     # Historical MultiOptimizer format had flat entries but no group identity.
+    dcp.save({"model": model.state_dict()}, checkpoint_id=weights_dir(str(tmp_path)))
     dcp.save({"optimizer": optimizer._sparse_state_dict()}, checkpoint_id=optimizer_dir(str(tmp_path)))
     target, restored = _model_and_optimizer()
     with pytest.raises(RuntimeError, match="(?i)group layout is unproven"):
@@ -2010,6 +2075,131 @@ def test_matching_storage_views_resume_and_update(tmp_path):
     step(target, restored)
     torch.testing.assert_close(target.p, source.p, rtol=0, atol=0)
     torch.testing.assert_close(target.view, source.view, rtol=0, atol=0)
+
+
+def _storage_view_roundtrip(tmp_path, device, matching):
+    def build(shared):
+        model = torch.nn.Module()
+        model.p = torch.nn.Parameter(torch.arange(8, dtype=torch.float32, device=device))
+        backing = model.p.detach() if shared else model.p.detach().clone()
+        model.register_buffer("view", backing[1::2])
+        optimizer = MultiOptimizer(model, {"leaf": torch.optim.AdamW([model.p], lr=0.01)}, ["leaf"])
+        return model, optimizer
+
+    def step(model, optimizer):
+        model.p.grad = torch.ones_like(model.p)
+        optimizer.step()
+        optimizer.zero_grad()
+
+    source, optimizer = build(True)
+    step(source, optimizer)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
+    target, restored = build(matching)
+    assert target.view.shape == source.view.shape
+    assert target.view.stride() == source.view.stride()
+    assert target.view.storage_offset() == source.view.storage_offset()
+    assert target.view.untyped_storage().nbytes() == source.view.untyped_storage().nbytes()
+    assert (target.view.untyped_storage().data_ptr() == target.p.untyped_storage().data_ptr()) is matching
+    before = (target.p.detach().clone(), target.view.detach().clone())
+    state = {"model": target, "optimizer": restored, "_veomni_scheduler_object": None}
+    if not matching:
+        from unittest.mock import patch
+
+        import torch.distributed.checkpoint as dcp
+
+        from veomni.checkpoint.dcp_checkpointer import _ProvenModelState
+
+        original_load = dcp.load
+
+        def guard_model_load(*args, **kwargs):
+            requested = kwargs.get("state_dict", args[0] if args else {})
+            assert not isinstance(requested.get("model"), _ProvenModelState), "model tensor load must not start"
+            return original_load(*args, **kwargs)
+
+        with patch.object(dcp, "load", side_effect=guard_model_load):
+            with pytest.raises(RuntimeError, match="layout|identity"):
+                DistributedCheckpointer.load(str(tmp_path), state, parallel_state=parallel)
+        torch.testing.assert_close(target.p, before[0], rtol=0, atol=0)
+        torch.testing.assert_close(target.view, before[1], rtol=0, atol=0)
+        assert not restored.optimizers_dict["leaf"].state
+        return
+    DistributedCheckpointer.load(str(tmp_path), state, parallel_state=parallel)
+    assert target.view.untyped_storage().data_ptr() == target.p.untyped_storage().data_ptr()
+    torch.testing.assert_close(target.p, source.p, rtol=0, atol=0)
+    torch.testing.assert_close(target.view, source.view, rtol=0, atol=0)
+    torch.testing.assert_close(restored.state_dict(), optimizer.state_dict(), rtol=0, atol=0)
+    step(source, optimizer)
+    step(target, restored)
+    torch.testing.assert_close(target.p, source.p, rtol=0, atol=0)
+    torch.testing.assert_close(target.view, source.view, rtol=0, atol=0)
+    torch.testing.assert_close(restored.state_dict(), optimizer.state_dict(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("matching", [False, True])
+def test_storage_view_checkpoint_reference_cpu(tmp_path, matching):
+    _storage_view_roundtrip(tmp_path, torch.device("cpu"), matching)
+
+
+def _storage_view_accelerator_plan(context):
+    if context.capabilities.backend in ("cuda", "npu") and context.capabilities.devices:
+        return LaunchSpec(device="accelerator")
+    return LaunchSpec(device="cpu")
+
+
+@pytest.mark.parametrize(
+    ("backend", "devices", "expected"),
+    [("cpu", (), "cpu"), ("npu", (), "cpu"), ("npu", ("0",), "accelerator"), ("cuda", ("0",), "accelerator")],
+)
+def test_storage_view_accelerator_plan_respects_owned_devices(backend, devices, expected):
+    context = SimpleNamespace(capabilities=SimpleNamespace(backend=backend, devices=devices))
+    assert _storage_view_accelerator_plan(context).device == expected
+
+
+@pytest.mark.launch_plan(provider=_storage_view_accelerator_plan)
+@pytest.mark.parametrize("matching", [False, True])
+def test_storage_view_checkpoint_native_accelerator(tmp_path, matching):
+    from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
+
+    ci_backend = runner_capabilities().backend if os.environ.get("VEOMNI_CI_CAPABILITIES") else None
+    require_npu = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1" or ci_backend == "npu"
+    if require_npu and ci_backend not in (None, "npu"):
+        pytest.fail("A working npu device must be assigned to this test")
+    backend = "npu" if require_npu else (ci_backend or get_device_type())
+    available = (
+        IS_NPU_AVAILABLE and torch.npu.is_available()
+        if backend == "npu"
+        else backend == "cuda" and torch.cuda.is_available()
+    )
+    if not available:
+        if require_npu or ci_backend == "cuda":
+            pytest.fail(f"A working {backend} device is required for storage-view recovery")
+        pytest.skip("requires an available CUDA or NPU device")
+    _storage_view_roundtrip(tmp_path, torch.device(backend, 0), matching)
+
+
+def test_required_storage_view_checkpoint_rejects_missing_npu(tmp_path, monkeypatch):
+    import veomni.utils.device as device
+
+    monkeypatch.setenv("VEOMNI_REQUIRE_NPU_TESTS", "1")
+    monkeypatch.setattr(device, "IS_NPU_AVAILABLE", False)
+    with pytest.raises(pytest.fail.Exception, match="working npu device"):
+        test_storage_view_checkpoint_native_accelerator(tmp_path, True)
+
+
+def test_required_storage_view_checkpoint_rejects_cuda_assignment(tmp_path, monkeypatch):
+    import veomni.utils.device as device
+
+    monkeypatch.setenv("VEOMNI_REQUIRE_NPU_TESTS", "1")
+    monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", "unused")
+    monkeypatch.setattr(device, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setitem(globals(), "runner_capabilities", lambda: SimpleNamespace(backend="cuda"))
+    with pytest.raises(pytest.fail.Exception, match="npu device must be assigned"):
+        test_storage_view_checkpoint_native_accelerator(tmp_path, True)
 
 
 def test_storage_view_geometry_and_disjoint_views_are_distinguished():
