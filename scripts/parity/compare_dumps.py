@@ -208,6 +208,7 @@ def main() -> None:
         header = f"{'tensor':<58} {'shape':>16} {'max|Δ|':>11} {'rel norm':>10}  verdict"
 
     failures, compared, skipped, worst = 0, 0, [], 0.0
+    matched_right: set[str] = set()
     printed_header = False
     for left_name in activations + gradients:
         right_name = counterpart(left_name)
@@ -217,6 +218,7 @@ def main() -> None:
             skipped.append((left_name, reason))
             failures += reason == "UNMATCHED"
             continue
+        matched_right.add(right_name)
 
         a = to_common_frame(left_name, left_tensors[left_name])
         b = right_tensors[right_name]
@@ -242,6 +244,15 @@ def main() -> None:
             continue
         verdict = "ok" if ok else (f"SHAPE {tuple(b.shape)}" if a.shape != b.shape else f"DIFFERS at {index}")
         print(f"{left_name:<58} {str(tuple(a.shape)):>16} {max_abs:>11.3e} {rel_norm:>10.3e}  {verdict}")
+
+    # A tensor only the right stack dumped is as much a mismatch as one only the left
+    # stack dumped: `dump_forward.py` omits a gradient that was never produced, so a
+    # dropped backward in one stack would otherwise pass with exit status 0.
+    for right_name in sorted(set(right_tensors) - matched_right):
+        base = split_gradient(right_name)[0] if right_name.startswith("grad::") else right_name
+        reason = "folded into the expert down-projection" if base.endswith(NO_COUNTERPART) else "UNMATCHED"
+        skipped.append((right_name, reason))
+        failures += reason == "UNMATCHED"
 
     if args.elementwise:
         print("\n* over elements at or above 1% of the tensor's RMS; `*share` is how many those are.")

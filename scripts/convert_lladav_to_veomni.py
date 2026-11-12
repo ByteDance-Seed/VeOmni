@@ -147,9 +147,16 @@ def convert_config(src_cfg: dict, num_vision_layers: int, mask_token_id: int, bo
     return out
 
 
+def _reject_identical_src_dst(src: str, dst: str) -> None:
+    """Refuse a destination that resolves to the source, which the symlinking below would destroy."""
+    if os.path.realpath(src) == os.path.realpath(dst):
+        raise ValueError(f"--dst resolves to --src ({os.path.realpath(src)}); converting in place deletes the source.")
+
+
 def convert_checkpoint(src: str, dst: str, copy_tokenizer: bool = True) -> None:
     from transformers import SiglipImageProcessor
 
+    _reject_identical_src_dst(src, dst)
     os.makedirs(dst, exist_ok=True)
     with open(os.path.join(src, "config.json")) as f:
         src_cfg = json.load(f)

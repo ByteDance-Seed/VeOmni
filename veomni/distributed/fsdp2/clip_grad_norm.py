@@ -48,7 +48,9 @@ def clip_grad_norm(
         )
 
     if not clip:
-        return _unclipped_grad_norm(model, norm_type)
+        total_norm = _unclipped_grad_norm(model, norm_type)
+        _raise_if_nonfinite(total_norm, norm_type, error_if_nonfinite)
+        return total_norm
 
     grad_norm = torch.nn.utils.clip_grad_norm_(
         model.parameters(),

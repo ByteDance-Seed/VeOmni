@@ -37,10 +37,7 @@ from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.integrations import (
-    use_kernel_forward_from_hub,
-    use_kernelized_func,
-)
+from transformers.integrations import use_kernel_forward_from_hub
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
@@ -122,7 +119,6 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-@use_kernelized_func(apply_rotary_pos_emb)
 class LLaDAMoEAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 

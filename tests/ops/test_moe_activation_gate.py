@@ -35,6 +35,7 @@ import torch
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models.auto import check_model_build_prerequisites
 from veomni.ops.kernels.moe_experts.standard.activation_gate import (
@@ -222,6 +223,7 @@ def test_a_missing_config_warns():
     mock_logger.warning_rank0.assert_called_once()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_build_time_prerequisite_refuses_unsupported_activation():
     """The guard fires in ``check_model_build_prerequisites``, before ``load_model``."""
     DiffusionGemmaConfig = pytest.importorskip(
@@ -236,6 +238,7 @@ def test_build_time_prerequisite_refuses_unsupported_activation():
         check_model_build_prerequisites(config)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_eager_moe_keeps_serving_a_gelu_activation():
     """The eager expert loop reads ``config.hidden_activation`` and is correct."""
     DiffusionGemmaConfig = pytest.importorskip(
@@ -246,6 +249,7 @@ def test_eager_moe_keeps_serving_a_gelu_activation():
     check_model_build_prerequisites(config)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_diffusion_gemma_builds_on_fused_triton():
     """The 26B recipe, which is ``fused_triton`` + ``gelu_pytorch_tanh``.
 

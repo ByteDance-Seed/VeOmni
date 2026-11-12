@@ -229,8 +229,12 @@ def run_length(model, config, total: int, samples: int, replicated, sharded, ran
                 results[arm] = measure(step_for(model, tokens, positions))
                 caches[arm] = cache_megabytes(model, tokens, positions)
             except torch.cuda.OutOfMemoryError:
+                # A rank that continues after a local OOM enters the next arm's barrier and
+                # all-to-alls while its peers are still inside `measure`, so the ranks end up
+                # executing different collective sequences. Record it and abort the run.
                 torch.cuda.empty_cache()
-                results[arm], caches[arm] = (float("nan"), float("nan")), float("nan")
+                print(f"[{arm}] CUDA OOM at {total} tokens; aborting the whole run to keep ranks in step.")
+                raise SystemExit(2)
         model.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
 
@@ -370,8 +374,11 @@ def run_whole_model(args, replicated, sharded, rank: int, sp_size: int):
                 try:
                     results[arm] = measure(step)
                 except torch.cuda.OutOfMemoryError:
+                    # See `run_length`: continuing here would leave the ranks executing
+                    # different collective sequences.
                     torch.cuda.empty_cache()
-                    results[arm] = (float("nan"), float("nan"))
+                    print(f"[{arm}] CUDA OOM at {total} tokens; aborting the whole run to keep ranks in step.")
+                    raise SystemExit(2)
             model.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
 

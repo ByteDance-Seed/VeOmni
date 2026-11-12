@@ -22,8 +22,10 @@ from veomni.models.transformers.diffusion_gemma.generation import (
 from veomni.models.transformers.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
 
 
-#: Gemma chat templates close the model's turn with this rather than with `eos_token`.
-END_OF_TURN_TOKEN = "<end_of_turn>"
+#: Turns close with the checkpoint's ``eot_token``, which is ``<turn|>`` for the released
+#: DiffusionGemma checkpoints (``<end_of_turn>`` is the Gemma 2/3 spelling and is kept only
+#: as a fallback). ``eos_token`` is a separate ``<eos>`` and does not end a turn.
+END_OF_TURN_TOKENS = ("<turn|>", "<end_of_turn>")
 
 
 def build_model(checkpoint_path: str, device: str, load_device: str = "cpu"):
@@ -47,8 +49,16 @@ def build_model(checkpoint_path: str, device: str, load_device: str = "cpu"):
 
 
 def resolve_end_of_turn_ids(tokenizer) -> list[int]:
-    """Token ids that end the model's turn, so generation can stop at a canvas boundary."""
-    candidates = {tokenizer.convert_tokens_to_ids(END_OF_TURN_TOKEN), tokenizer.eos_token_id}
+    """Token ids that end the model's turn, so generation can stop at a canvas boundary.
+
+    ``tokenizer.eot_token_id`` is authoritative when the checkpoint declares it; the
+    literal spellings cover a tokenizer that only stores it in the chat template.
+    """
+    candidates = {getattr(tokenizer, "eot_token_id", None), tokenizer.eos_token_id}
+    for token in END_OF_TURN_TOKENS:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id != tokenizer.unk_token_id:
+            candidates.add(token_id)
     return sorted(i for i in candidates if i is not None and i != tokenizer.unk_token_id)
 
 

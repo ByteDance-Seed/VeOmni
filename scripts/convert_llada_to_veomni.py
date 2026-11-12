@@ -132,9 +132,16 @@ def _list_safetensors(src: str) -> list[str]:
     return sorted(f for f in os.listdir(src) if f.endswith(".safetensors"))
 
 
+def _reject_identical_src_dst(src: str, dst: str) -> None:
+    """Refuse a destination that resolves to the source, which the in-place rewrite would destroy."""
+    if os.path.realpath(src) == os.path.realpath(dst):
+        raise ValueError(f"--dst resolves to --src ({os.path.realpath(src)}); converting in place deletes the source.")
+
+
 def convert_checkpoint(src: str, dst: str, copy_tokenizer: bool = True) -> None:
     from safetensors.torch import load_file, save_file
 
+    _reject_identical_src_dst(src, dst)
     os.makedirs(dst, exist_ok=True)
 
     # --- config.json ---

@@ -40,12 +40,24 @@ from ....utils import logging
 logger = logging.get_logger(__name__)
 
 
+def _sharing_enabled(model: nn.Module) -> bool:
+    """Whether encoder/decoder sharing is allowed by ``config.tie_word_embeddings``."""
+    config = getattr(model, "config", None)
+    return bool(getattr(config, "tie_word_embeddings", True))
+
+
 def retie_encoder_to_decoder(model: nn.Module) -> int:
     """Re-point the encoder's shared parameters at the decoder's (possibly sharded) ones.
 
     Returns the number of parameters that had to be re-tied, so callers can assert the
     tie was actually restored.
+
+    ``tie_word_embeddings=False`` disables every encoder/decoder tie, so a model loaded
+    with independently trained encoder weights must keep them.
     """
+    if not _sharing_enabled(model):
+        return 0
+
     base = getattr(model, "model", model)
     encoder = base.encoder.language_model
     decoder = base.decoder
@@ -99,7 +111,11 @@ def share_expert_modules(model: nn.Module) -> int:
 
     Safe because ``DiffusionGemmaTextExperts`` holds no per-side state: the encoder's
     private tensors are the layer's ``layer_scalar`` buffers, which live on the layer.
+    Returns 0 when ``tie_word_embeddings=False`` disables the shared expert weights.
     """
+    if not _sharing_enabled(model):
+        return 0
+
     base = getattr(model, "model", model)
     shared = 0
     for encoder_layer, decoder_layer in zip(base.encoder.language_model.layers, base.decoder.layers):

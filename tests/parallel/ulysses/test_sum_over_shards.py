@@ -28,6 +28,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec
 from veomni.distributed.sequence_parallel.loss import SumOverShards, sum_over_ulysses_shards
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 
@@ -65,7 +66,15 @@ def _check_sum_over_shards(rank, init_method, backend):
         dist.destroy_process_group()
 
 
+def _sum_over_shards_launch(context):
+    """Two processes for both backends: Gloo runs on CPU, NCCL needs two accelerators."""
+    if context.params["backend"] == "gloo":
+        return CasePlan.sequential(LaunchSpec(nproc=2, device="cpu"))
+    return CasePlan.sequential(LaunchSpec(nproc=2, device="accelerator"))
+
+
 @pytest.mark.parametrize("backend", _BACKENDS)
+@pytest.mark.launch_plan(provider=_sum_over_shards_launch)
 def test_sum_over_shards_sums_forward_and_scales_backward(tmp_path, backend):
     mp.spawn(_check_sum_over_shards, args=((tmp_path / "rendezvous").as_uri(), backend), nprocs=2)
 

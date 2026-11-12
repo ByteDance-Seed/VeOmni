@@ -51,6 +51,21 @@ VARLEN_ATTENTION_TYPES = (
 )
 
 
+def _cache_is_empty(past_key_values) -> bool:
+    """Whether ``past_key_values`` carries no cached tokens yet.
+
+    ``LLaDAModel.forward`` builds a ``DynamicCache`` before this point whenever
+    ``use_cache`` is on, so an "is None" test would drop the packed boundaries on the
+    very first forward -- the one that still holds the whole row.
+    """
+    if past_key_values is None:
+        return True
+    try:
+        return len(past_key_values) == 0
+    except TypeError:  # a legacy tuple-of-tensors cache
+        return not past_key_values
+
+
 def bidirectional_attention_mask(
     config,
     inputs_embeds: torch.Tensor,
@@ -70,7 +85,7 @@ def bidirectional_attention_mask(
         return None
     if position_ids is not None and position_ids.dim() == 3:
         position_ids = position_ids[:, 0, :]
-    if position_ids is not None and position_ids.shape == inputs_embeds.shape[:2] and past_key_values is None:
+    if position_ids is not None and position_ids.shape == inputs_embeds.shape[:2] and _cache_is_empty(past_key_values):
         starts = position_ids == 0
         starts[:, 0] = True
         segment_ids = starts.cumsum(dim=-1)

@@ -79,7 +79,9 @@ def veomni_clip_grad_norm(
         if parallel_state.sp_size > 1:
             _allreduce_ddp_sp_grads(model, parallel_state)
         if clip:
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm, foreach=foreach)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm, error_if_nonfinite=error_if_nonfinite, foreach=foreach
+            )
         else:
             grads = [p.grad for p in model.parameters() if p.grad is not None]
             grad_norm = torch.nn.utils.get_total_norm(grads, norm_type, error_if_nonfinite, foreach)

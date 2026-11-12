@@ -148,7 +148,7 @@ def unpermute(
     hidden_states_shape: torch.Size,
     permutation_mapping: torch.Tensor,
     routing_map: torch.Tensor,
-    top_k: int,
+    top_k: int | None = None,
 ):
     """
     Unpermutes the tokens and apply the weight.
@@ -158,16 +158,36 @@ def unpermute(
         routing_weights (torch.Tensor): The routing weights, [num_tokens, num_experts].
         hidden_states_shape (torch.Size): The shape of the hidden states, [num_tokens, hidden_dim].
         routing_map (torch.Tensor): The sparse token to expert mapping, [num_experts, tokens].
-        top_k (int): How many experts each token was routed to.
+        top_k (int | None): How many experts each token was routed to. Passing it selects the
+            grouped, order-independent sum below; ``None`` keeps the fused kernel dispatch.
 
     Returns:
         torch.Tensor: The unpermuted token tensor, [num_tokens, hidden_dim].
     """
-    require_top_k_entries(tokens.shape[0], hidden_states_shape[0], top_k)
-
+    out_dtype = tokens.dtype
     tokens_weight = routing_weights.T.contiguous().masked_select(routing_map.bool())
-    tokens = tokens * tokens_weight.unsqueeze(-1)
-    return sum_entries_per_token(tokens, permutation_mapping, hidden_states_shape[0], top_k)
+
+    if top_k is not None:
+        # The routing weights may be FP32 under FSDP2 bf16 compute, which promotes the
+        # product; the caller expects the expert outputs back in the activation dtype.
+        require_top_k_entries(tokens.shape[0], hidden_states_shape[0], top_k)
+        weighted = tokens * tokens_weight.unsqueeze(-1)
+        return sum_entries_per_token(weighted, permutation_mapping, hidden_states_shape[0], top_k).to(out_dtype)
+
+    from ...ops import VeomniOp
+    from ...utils.device import IS_CUDA_AVAILABLE, get_device_type
+
+    impl = (
+        "triton"
+        if IS_CUDA_AVAILABLE
+        and torch.version.hip is None
+        and tokens.device.type == get_device_type()
+        and not torch.are_deterministic_algorithms_enabled()
+        else "eager"
+    )
+    return VeomniOp("moe_unpermute", "standard", impl)(
+        tokens, tokens_weight, permutation_mapping, num_tokens=hidden_states_shape[0]
+    ).to(out_dtype)
 
 
 def generate_weights_idx(routing_weights: torch.Tensor, selected_experts: torch.Tensor, num_experts) -> torch.Tensor:

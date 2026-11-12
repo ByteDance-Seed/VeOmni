@@ -60,6 +60,26 @@ class LLaDAVPreTrainedModel(LLaDAPreTrainedModel):
     config: LLaDAVConfig
     _no_split_modules = ["LLaDADecoderLayer", "SiglipEncoderLayer"]
 
+    def _init_weights(self, module):
+        """Re-apply the constructor's special initializations after meta materialization.
+
+        ``to_empty()`` on the meta random-init path discards the ``torch.zeros`` the
+        constructor wrote for ``image_newline``, and no checkpoint path restores it, so a
+        first image forward would read uninitialized values. Every other module keeps HF's
+        own scheme: the base class defines no hook, so each parameter arrives initialized
+        by the module that created it.
+        """
+        newline = getattr(module, "image_newline", None)
+        if newline is not None:
+            newline.data.zero_()
+
+
+def _needs_symmetric_collectives() -> bool:
+    """Whether every rank must enter the same vision collectives (distributed world size > 1)."""
+    from ....distributed.parallel_state import get_parallel_state
+
+    return get_parallel_state().world_size > 1
+
 
 class LLaDAVModel(LLaDAVPreTrainedModel, LLaDAModel):
     def __init__(self, config: LLaDAVConfig):
@@ -112,10 +132,12 @@ class LLaDAVModel(LLaDAVPreTrainedModel, LLaDAModel):
                 )
             slots, image_embeds = ulysses_local_image_slots(slots, image_embeds, inputs_embeds.shape[1])
             inputs_embeds = inputs_embeds.masked_scatter(slots.unsqueeze(-1), image_embeds)
-        elif self.training:
+        elif self.training or _needs_symmetric_collectives():
             # A rank whose micro-batch has no image still has to run the tower, or its FSDP
-            # all-gathers and reductions would not match those of ranks that did. An eval
-            # forward under FSDP with images on some ranks only would hang the same way.
+            # all-gathers would not match those of ranks that did. This holds for eval as much
+            # as for training: an eval forward under a distributed run with images on some
+            # ranks only would hang the same way. Single-process inference skips it, since
+            # there is no collective to keep in step.
             size = self.config.vision_config.image_size
             dummy = inputs_embeds.new_zeros(1, self.config.vision_config.num_channels, size, size)
             inputs_embeds = inputs_embeds + 0.0 * self.get_image_features(dummy).sum()

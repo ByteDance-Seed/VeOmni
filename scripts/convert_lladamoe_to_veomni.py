@@ -122,7 +122,14 @@ def convert_config(src_cfg: dict) -> dict:
     return out
 
 
+def _reject_identical_src_dst(src: str, dst: str) -> None:
+    """Refuse a destination that resolves to the source, which the symlinking below would destroy."""
+    if os.path.realpath(src) == os.path.realpath(dst):
+        raise ValueError(f"--dst resolves to --src ({os.path.realpath(src)}); converting in place deletes the source.")
+
+
 def convert_checkpoint(src: str, dst: str, copy_tokenizer: bool = True) -> None:
+    _reject_identical_src_dst(src, dst)
     os.makedirs(dst, exist_ok=True)
 
     with open(os.path.join(src, "config.json")) as f:

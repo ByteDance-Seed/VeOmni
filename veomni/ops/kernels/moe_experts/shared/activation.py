@@ -21,7 +21,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .....utils.device import get_torch_device
+from .....utils.device import get_torch_device, is_moe_kernel_supported
 
 
 class ActivationType(str, Enum):
@@ -131,7 +131,9 @@ def apply_activation(input: torch.Tensor, activation: str | ActivationType) -> t
     if activation == ActivationType.SILU.value:
         return torch.ops.aten.silu(input)
 
-    assert input.is_cuda, "Triton activation requires a CUDA tensor."
+    assert is_moe_kernel_supported(input.device), (
+        f"Triton activation requires a CUDA or MLU tensor, got {input.device}."
+    )
     assert input.ndim == 2 and input.stride(1) == 1, (
         f"Triton activation requires a row-major 2D tensor, got shape={input.shape}, stride={input.stride()}."
     )
@@ -169,7 +171,9 @@ def apply_activation_backward(
     assert grad_output.shape == input.shape, (grad_output.shape, input.shape)
     assert grad_output.device == input.device, (grad_output.device, input.device)
     assert grad_output.dtype == input.dtype, (grad_output.dtype, input.dtype)
-    assert grad_output.is_cuda, "Triton activation backward requires CUDA tensors."
+    assert is_moe_kernel_supported(grad_output.device), (
+        f"Triton activation backward requires CUDA or MLU tensors, got {grad_output.device}."
+    )
     assert grad_output.is_contiguous(), "Triton activation backward requires contiguous grad_output."
     assert input.ndim == 2 and input.stride(1) == 1, (
         f"Triton activation backward requires a row-major 2D input, got shape={input.shape}, stride={input.stride()}."
