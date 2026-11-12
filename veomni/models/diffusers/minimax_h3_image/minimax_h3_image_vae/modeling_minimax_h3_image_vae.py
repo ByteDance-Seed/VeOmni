@@ -542,6 +542,7 @@ class MiniMaxH3ImageVAE(nn.Module):
                     tile = self._blend(tiles[row_index - 1][column_index], tile, height_overlaps[row_index - 1], -2)
                 if column_index > 0:
                     tile = self._blend(row[column_index - 1], tile, width_overlaps[column_index - 1], -1)
+                row[column_index] = tile
                 if row_index < len(tiles) - 1:
                     tile = tile[..., : -height_overlaps[row_index], :]
                 if column_index < len(row) - 1:
@@ -560,6 +561,13 @@ class MiniMaxH3ImageVAE(nn.Module):
         x_indices, x_lengths, x_overlaps = self._split_tiles(
             width, self.tile_sample_min_width, self.tile_sample_min_overlap_width
         )
+        latent_y_overlaps = [overlap // self.spatial_compression_ratio for overlap in y_overlaps]
+        latent_x_overlaps = [overlap // self.spatial_compression_ratio for overlap in x_overlaps]
+        if any(overlap < 1 for overlap in latent_y_overlaps + latent_x_overlaps):
+            raise ValueError(
+                "Tiled VAE encoding requires each overlap to cover at least one latent unit "
+                f"({self.spatial_compression_ratio} pixels)."
+            )
         rows = []
         for y_pos, y_len in zip(y_indices, y_lengths):
             row = []
@@ -567,8 +575,6 @@ class MiniMaxH3ImageVAE(nn.Module):
                 tile = x[..., y_pos : y_pos + y_len, x_pos : x_pos + x_len]
                 row.append(self.quant_conv(self.encoder(tile[:, :, None]))[:, :, -1])
             rows.append(row)
-        latent_y_overlaps = [overlap // self.spatial_compression_ratio for overlap in y_overlaps]
-        latent_x_overlaps = [overlap // self.spatial_compression_ratio for overlap in x_overlaps]
         return self._stitch_tiles(rows, latent_y_overlaps, latent_x_overlaps)
 
     def _decode(self, z: torch.Tensor) -> torch.Tensor:

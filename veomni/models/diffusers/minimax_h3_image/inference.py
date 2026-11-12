@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+from itertools import chain
 from pathlib import Path
 
 import numpy as np
@@ -237,10 +238,8 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
             module = getattr(pipe, name)
             if module is None:
                 continue
-            parameter = next(module.parameters(), None)
-            if parameter is None or parameter.device.type == "cpu":
-                continue
-            module.to("cpu")
+            if any(tensor.device.type != "cpu" for tensor in chain(module.parameters(), module.buffers())):
+                module.to("cpu")
 
     def _offload(self, names) -> None:
         self._offload_names(self, names)
@@ -327,8 +326,8 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         num_steps = len(self.scheduler.sigmas) - 1
 
         self._offload(["text_encoder", "vae"])
-        self._stage(["dit"])
         try:
+            self._stage(["dit"])
             for step in range(num_steps):
                 timestep = float(1.0 - self.scheduler.sigmas[step])
                 if reference_latents:
