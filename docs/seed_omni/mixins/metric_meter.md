@@ -163,7 +163,7 @@ reported per module under `trace/<module>/` and there is no top-level
 [`OmniEnvironMeter.state_dict()`](../../../veomni/utils/omni_helper.py#L111),
 which `GlobalStateCallback`
 [saves](../../../veomni/trainer/callbacks/global_state_callback.py#L332) and
-[restores](../../../veomni/trainer/callbacks/global_state_callback.py#L908), so
+[restores](../../../veomni/trainer/callbacks/global_state_callback.py#L901), so
 the cumulative counters survive a resume.
 
 ## Rules for a correct implementation
@@ -220,7 +220,7 @@ warning. To make a backbone eligible, stash exactly one length per conversation.
 - [`tests/seed_omni/mixins/test_metric_meter_mixin.py`](../../../tests/seed_omni/mixins/test_metric_meter_mixin.py):
   the mixin's stash/accumulate/reset contract and the `OmniEnvironMeter` roll-up,
   including a two-rank gloo run.
-- [`test_metric_meter_collect_drains_only_the_metered_modules`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L400):
+- [`test_metric_meter_collect_drains_only_the_metered_modules`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L399):
   the runtime drain.
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
   the callback wiring.

@@ -626,12 +626,11 @@ def test_weights_only_resume_does_not_overwrite_source_step_zero(tmp_path, monke
     trainer.model = SimpleNamespace(optimizer=torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))]), checkpoint=None)
     callback = GlobalStateCallback(trainer)
     monkeypatch.setattr(callback, "_read_current", lambda _: None)
-    with patch("veomni.checkpoint.legacy_v0_1_12.apply_legacy_global_state", return_value=None):
-        if mode != "different":
-            with pytest.raises(RuntimeError, match="without trainer state"):
-                callback.load_global_state()
-        else:
-            assert callback.load_global_state() is None
+    if mode != "different":
+        with pytest.raises(RuntimeError, match="without trainer state"):
+            callback.load_global_state()
+    else:
+        assert callback.load_global_state() is None
 
 
 def test_failed_load_barrier_cannot_certify_legacy_receipt(tmp_path):
