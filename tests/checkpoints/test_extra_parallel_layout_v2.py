@@ -340,6 +340,29 @@ def test_same_v2_wrapper_can_save_and_load(tmp_path, monkeypatch):
     torch.testing.assert_close(model.weight, saved, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("mutation", ["version", "replace_map"])
+@pytest.mark.parametrize("operation", ["state_dict", "load_state_dict"])
+def test_v2_wrapper_rejects_layout_mutation_before_io(monkeypatch, mutation, operation):
+    model = torch.nn.Linear(2, 2, bias=False)
+    mesh = SimpleNamespace(shape=(2, 2))
+    spec = SpecInfo("ep", Shard(0), "weight", mesh, 0, None, (2, 2), True)
+    model._fqn2spec_info = {"weight": spec}
+    monkeypatch.setattr(
+        ModelState, "get_state_dict_with_extra_parallel_dim_preprocess", lambda self, state, action: state
+    )
+    adapter = ModelState(model, parallel_state=SimpleNamespace(dp_mode="fsdp2"))
+    saved = adapter.state_dict()
+    assert _extra_parallel_layout_key(model._fqn2spec_info) in saved
+    before = model.weight.detach().clone()
+    if mutation == "version":
+        spec.checkpoint_layout_v2 = False
+    else:
+        model._fqn2spec_info = dict(model._fqn2spec_info)
+    with pytest.raises(RuntimeError, match="layout changed while checkpoint adapter was active"):
+        getattr(adapter, operation)(saved) if operation == "load_state_dict" else getattr(adapter, operation)()
+    torch.testing.assert_close(model.weight, before, rtol=0, atol=0)
+
+
 def test_v2_tensors_cannot_be_silently_read_with_legacy_dcp_keys(tmp_path, monkeypatch):
     from torch.distributed.checkpoint.api import CheckpointException
 
@@ -688,6 +711,13 @@ def test_logical_signature_normalizes_negative_axes_but_preserves_singleton_axes
     persistent = SpecInfo("ep", Shard(0), "weight", mesh, 0, 1, (8, 8), False)
     persistent_unused_fields = SpecInfo("ep", Shard(0), "weight", mesh, 1, 1, (8, 8), True)
     assert signature(persistent) == signature(persistent_unused_fields)
+    replicated_expert = SpecInfo("ep", Replicate(), "experts.weight", mesh)
+    replicated_other = SpecInfo("ple", Replicate(), "experts.weight", mesh)
+    assert _checkpoint_extra_parallel_signature(
+        {"experts.weight": replicated_expert}, optimizer_present=False, trainable_only=False
+    ) != _checkpoint_extra_parallel_signature(
+        {"experts.weight": replicated_other}, optimizer_present=False, trainable_only=False
+    )
     persistent_unknown_shape = SpecInfo("ep", Shard(-1), "weight", mesh, 0, -1, None, False)
     persistent_positive = SpecInfo("ep", Shard(1), "weight", mesh, 0, 1, None, False)
     assert _checkpoint_extra_parallel_signature(
@@ -701,6 +731,24 @@ def test_logical_signature_normalizes_negative_axes_but_preserves_singleton_axes
     assert signature(first) != _checkpoint_extra_parallel_signature(
         {"weight": first}, optimizer_present=False, trainable_only=True
     )
+
+
+@pytest.mark.parametrize("adapter_name", ["model", "optimizer"])
+@pytest.mark.parametrize("operation", ["state_dict", "load_state_dict"])
+def test_stateful_adapter_rejects_layout_mutation_before_io(adapter_name, operation):
+    model = torch.nn.Linear(2, 2, bias=False)
+    mesh = SimpleNamespace(shape=(1, 1))
+    spec = SpecInfo("ep", Shard(0), "weight", mesh, 0, None, (2, 2), True)
+    model._fqn2spec_info = {"weight": spec}
+    parallel = SimpleNamespace(dp_mode="ddp")
+    adapter = (
+        ModelState(model, parallel_state=parallel)
+        if adapter_name == "model"
+        else OptimizerState(model, torch.optim.AdamW(model.parameters()), parallel_state=parallel)
+    )
+    spec.checkpoint_layout_v2 = False
+    with pytest.raises(RuntimeError, match="layout changed while checkpoint adapter was active"):
+        getattr(adapter, operation)({}) if operation == "load_state_dict" else getattr(adapter, operation)()
 
 
 def _singleton_axis_guard_worker(rank, root, singleton):

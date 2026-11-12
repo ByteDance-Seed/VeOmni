@@ -99,6 +99,69 @@ def test_corrupt_optimizer_inventory_fails_on_all_ranks():
     spawn_with_rendezvous(_corrupt_inventory_worker, nprocs=2)
 
 
+def _adapter_layout_mutation_worker(rank, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from veomni.checkpoint.dcp_checkpointer import OptimizerState, _ProvenModelState, _ProvenMultiOptimizerState
+
+    class OptimizerProbe:
+        def __init__(self):
+            self.entered = False
+
+        def _sparse_state_dict(self, **kwargs):
+            self.entered = True
+            dist.all_reduce(torch.ones(1))
+            return {}
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        for kind in ("model", "optimizer"):
+            for operation in ("state_dict", "load_state_dict"):
+                model = torch.nn.Linear(1, 1)
+                optimizer = OptimizerProbe()
+                parallel = SimpleNamespace(dp_mode="ddp")
+                if kind == "model":
+                    adapter = _ProvenModelState(model, optimizer=optimizer, parallel_state=parallel, group=None)
+                else:
+                    adapter = _ProvenMultiOptimizerState(
+                        model, optimizer, parallel_state=parallel, generation="g", expected_layout="l", group=None
+                    )
+                if rank == 0:
+                    model._fqn2spec_info = {}
+                with pytest.raises(RuntimeError, match="layout changed|failed on another rank"):
+                    getattr(adapter, operation)({}) if operation == "load_state_dict" else getattr(
+                        adapter, operation
+                    )()
+                assert not optimizer.entered
+                tensor = torch.ones(1)
+                dist.all_reduce(tensor)
+                assert tensor.item() == 2
+
+        model = torch.nn.Linear(1, 1)
+        model._fqn2spec_info = {}
+        adapter = OptimizerState(
+            model, torch.optim.AdamW(model.parameters()), parallel_state=SimpleNamespace(dp_mode="fsdp2")
+        )
+        if rank == 0:
+            model._fqn2spec_info = {}
+        with pytest.raises(RuntimeError, match="layout changed|ExtraParallel|failed on another rank"):
+            adapter.state_dict()
+        tensor = torch.ones(1)
+        dist.all_reduce(tensor)
+        assert tensor.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_adapter_layout_mutation_is_coordinated_before_collectives():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_adapter_layout_mutation_worker, nprocs=2)
+
+
 def _asymmetric_optimizer_policy_worker(rank, checkpoint, operation, failure, endpoint):
     from datetime import timedelta
     from unittest.mock import patch

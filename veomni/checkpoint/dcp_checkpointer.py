@@ -894,27 +894,41 @@ def _reject_unproven_extra_parallel_optimizer(
             if has_v2 and not allow_proven_optimizer:
                 raise RuntimeError("Canonical ExtraParallel optimizer state requires an owner-aware checkpoint codec")
         if has_v2:
+            named_params = list(state["model"].named_parameters(remove_duplicate=False))
+            if ps is None:
+                ps = parallel_state if parallel_state is not None else get_parallel_state()
+            aliases = {}
+            for name, param in named_params:
+                aliases.setdefault(id(param), []).append(name)
+            expert_aliases = {
+                name
+                for names in aliases.values()
+                if any("experts" in alias.split(".") for alias in names)
+                for name in names
+            }
+            ordinary_experts = (
+                tuple(sorted(_ordinary_expert_fqns(state["model"], ps)))
+                if isinstance(ps, ParallelState) and any(size != 1 for size in ps.extra_parallel_sizes.values())
+                else ()
+            )
             logical_signature = _checkpoint_extra_parallel_signature(
                 specs,
                 optimizer_present=state.get("optimizer") is not None,
                 trainable_only=trainable_only,
                 trainability=(
-                    tuple(
-                        sorted(
-                            (name, param.requires_grad)
-                            for name, param in state["model"].named_parameters(remove_duplicate=False)
-                        )
-                    )
+                    tuple(sorted((name, param.requires_grad) for name, param in named_params))
                     if trainable_only
                     else ()
                 ),
                 runtime_ndims={
                     name: tensor.ndim
-                    for name, tensor in (
-                        list(state["model"].named_parameters(remove_duplicate=False))
-                        + list(state["model"].named_buffers(remove_duplicate=False))
-                    )
+                    for name, tensor in (named_params + list(state["model"].named_buffers(remove_duplicate=False)))
                 },
+                expert_aliases=expert_aliases,
+                ordinary_experts=ordinary_experts,
+                shared_lora=tuple(sorted(_shared_lora_fqns(state["model"], ordinary_experts)))
+                if ordinary_experts
+                else (),
             )
     except BaseException as exc:
         error = exc
@@ -948,7 +962,15 @@ def _reject_unproven_extra_parallel_optimizer(
 
 
 def _checkpoint_extra_parallel_signature(
-    specs, *, optimizer_present, trainable_only, trainability=(), runtime_ndims=None
+    specs,
+    *,
+    optimizer_present,
+    trainable_only,
+    trainability=(),
+    runtime_ndims=None,
+    expert_aliases=(),
+    ordinary_experts=(),
+    shared_lora=(),
 ):
     """Describe logical layout, excluding rank-local coordinates and tensor contents."""
     entries = []
@@ -956,6 +978,18 @@ def _checkpoint_extra_parallel_signature(
         mesh = getattr(spec, "para_fsdp_mesh", None)
         shape = getattr(spec, "global_shape", None)
         placement = getattr(spec, "placement", None)
+        if isinstance(placement, Replicate) and ("experts" in name.split(".") or name in expert_aliases):
+            mesh_names = getattr(mesh, "mesh_dim_names", None)
+            entries.append(
+                (
+                    name,
+                    spec.para_name,
+                    "Replicate",
+                    tuple(mesh_names) if mesh_names is not None else None,
+                    tuple(mesh.shape) if mesh is not None else None,
+                )
+            )
+            continue
         if not isinstance(placement, Shard):
             continue
         axis = placement.dim
@@ -988,7 +1022,14 @@ def _checkpoint_extra_parallel_signature(
                 tuple(mesh.shape) if mesh is not None else None,
             )
         )
-    return bool(optimizer_present), bool(trainable_only), tuple(trainability), tuple(entries)
+    return (
+        bool(optimizer_present),
+        bool(trainable_only),
+        tuple(trainability),
+        tuple(ordinary_experts),
+        tuple(shared_lora),
+        tuple(entries),
+    )
 
 
 def _check_extra_parallel_signature_across_ranks(has_v2, signature, *, group=None):
@@ -1023,6 +1064,42 @@ def _extra_parallel_layout_key(specs):
         _normalized_extra_parallel_dims(spec)
     digest = hashlib.sha256(b"veomni-extra-parallel-canonical-v2").hexdigest()
     return f"{_EXTRA_PARALLEL_LAYOUT_MARKER}{digest}"
+
+
+def _runtime_extra_parallel_layout_signature(specs):
+    """Detect mutation while a single Stateful adapter is in use."""
+    if _needs_extra_parallel_layout_marker(specs):
+        _extra_parallel_layout_key(specs)
+    return tuple(
+        (
+            name,
+            spec.para_name,
+            repr(spec.placement),
+            spec.fsdp_shard_dim,
+            getattr(spec, "persistent_fsdp_shard_dim", None),
+            getattr(spec, "global_shape", None),
+            getattr(spec, "checkpoint_layout_v2", False),
+            tuple(spec.para_fsdp_mesh.shape) if spec.para_fsdp_mesh else None,
+        )
+        for name, spec in sorted((specs or {}).items())
+    )
+
+
+def _assert_extra_parallel_layout_unchanged(owner):
+    specs = owner.extra_parallel_fqn2spec_info
+    if specs is not getattr(owner.model, "_fqn2spec_info", None) or (
+        owner._layout_signature != _runtime_extra_parallel_layout_signature(specs)
+    ):
+        raise RuntimeError("ExtraParallel layout changed while checkpoint adapter was active")
+
+
+def _coordinate_extra_parallel_layout_check(owner, group):
+    error = None
+    try:
+        _assert_extra_parallel_layout_unchanged(owner)
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "checking checkpoint adapter layout", group=group)
 
 
 def _strip_extra_parallel_layout_marker(state_dict, required, marker_key):
@@ -1490,12 +1567,14 @@ class ModelState(Stateful):
             if _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info)
             else None
         )
+        self._layout_signature = _runtime_extra_parallel_layout_signature(self.extra_parallel_fqn2spec_info)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
         )
 
     @torch.no_grad()
     def state_dict(self):
+        _assert_extra_parallel_layout_unchanged(self)
         options = StateDictOptions(ignore_frozen_params=True) if self.trainable_only else None
         model_state_dict = get_model_state_dict(model=self.model, options=options)
         if self.should_extra_parallel_aware and _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info):
@@ -1523,6 +1602,7 @@ class ModelState(Stateful):
         need to drop ExtraParallel-dim when loading from DCP checkpoints
         so that ExtraParallel-FSDP would not be confused
         """
+        _assert_extra_parallel_layout_unchanged(self)
         model_state_dict = _strip_extra_parallel_layout_marker(
             state_dict,
             self.should_extra_parallel_aware
@@ -1636,6 +1716,7 @@ class OptimizerState(Stateful):
             if _needs_extra_parallel_layout_marker(self.extra_parallel_fqn2spec_info)
             else None
         )
+        self._layout_signature = _runtime_extra_parallel_layout_signature(self.extra_parallel_fqn2spec_info)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
         )
@@ -1647,6 +1728,7 @@ class OptimizerState(Stateful):
             # can enter its own collectives, even if a local check fails.
             error = None
             try:
+                _assert_extra_parallel_layout_unchanged(self)
                 if _requires_rank_local_optimizer_checkpoint(self.optimizer):
                     raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
                 if self._layout_marker_key is not None:
@@ -1664,6 +1746,7 @@ class OptimizerState(Stateful):
             raise_if_any_rank_failed(error, "validating ExtraParallel optimizer checkpoint", group=self.process_group)
             raise RuntimeError("ExtraParallel optimizer checkpoint preflight unexpectedly succeeded")
 
+        _assert_extra_parallel_layout_unchanged(self)
         if _requires_rank_local_optimizer_checkpoint(self.optimizer):
             raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
         if getattr(self.optimizer, "_is_multi_optimizer", False):
@@ -1675,6 +1758,7 @@ class OptimizerState(Stateful):
 
     def load_state_dict(self, state_dict):
         """Restore optimizer state from the loaded DCP state dict."""
+        _assert_extra_parallel_layout_unchanged(self)
         if _requires_rank_local_optimizer_checkpoint(self.optimizer):
             raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
         if self.should_extra_parallel_aware and self._layout_marker_key is not None:
@@ -1730,6 +1814,7 @@ class _ProvenModelState(ModelState):
         self.group = group
 
     def state_dict(self):
+        _coordinate_extra_parallel_layout_check(self, self.group)
         result, error = None, None
         try:
             result = super().state_dict()
@@ -1747,6 +1832,7 @@ class _ProvenModelState(ModelState):
         return result
 
     def load_state_dict(self, state_dict):
+        _coordinate_extra_parallel_layout_check(self, self.group)
         error = None
         try:
             super().load_state_dict(state_dict)
@@ -1773,6 +1859,7 @@ class _ProvenMultiOptimizerState(OptimizerState):
         self._verified_rank_local_keys = frozenset()
 
     def state_dict(self):
+        _coordinate_extra_parallel_layout_check(self, self.group)
         result, error = None, None
         try:
             result = self.optimizer._sparse_state_dict(coordinate=True, group=self.group)
@@ -1811,6 +1898,7 @@ class _ProvenMultiOptimizerState(OptimizerState):
         return result
 
     def load_state_dict(self, state_dict):
+        _coordinate_extra_parallel_layout_check(self, self.group)
         error = None
         try:
             state_dict = dict(state_dict)

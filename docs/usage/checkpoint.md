@@ -421,6 +421,9 @@ the namespaces differ. Replicated values must already agree across ranks.
 - A MultiOptimizer checkpoint can only resume with the recorded owner, mesh,
   world size and optimizer layout. It cannot be restored across an EP/FSDP
   shard-axis or world-size change, even when model weights can be resharded.
+  Preserve the original axis notation too: the current optimizer identity
+  treats `Shard(0)` and `Shard(-2)`, or axis `1` and `-1`, as different even
+  when they describe equivalent two-dimensional shards.
 - Older MultiOptimizer checkpoints whose parameter-group and scheduler identity
   cannot be proven are rejected. The repository does not yet provide a
   validated general migration for these checkpoints. Continue with the
