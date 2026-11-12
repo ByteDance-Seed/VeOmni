@@ -309,6 +309,30 @@ def test_a_stale_top_level_tie_flag_does_not_drop_a_stored_head(tmp_path):
     assert torch.equal(text_encoder.lm_head.weight, tensors["lm_head.weight"])
 
 
+def test_an_explicitly_untied_config_is_not_re_tied_by_equal_weights(tmp_path):
+    """The config outranks what the tensors happen to look like.
+
+    A checkpoint can declare ``tie_word_embeddings: false`` on both levels and
+    still store two equal tensors (a copy made by a tool, an interpolated export).
+    Tying them here would couple the head to the embedding for the whole SFT run,
+    changing how the source model trains — so the config's ``false`` wins.
+    """
+    from veomni.models.seed_omni.modules.janus.hf_layout import JANUS_HF_LAYOUT, _tie_word_embeddings
+
+    root = tmp_path / "Janus-tiny"
+    tensors = _write_hf_checkpoint(root, tied=False)
+    # Make the stored head identical to the embedding, leaving the flags untied.
+    tensors["lm_head.weight"] = tensors["model.language_model.embed_tokens.weight"].clone()
+    save_file(tensors, root / "model.safetensors", metadata={"format": "pt"})
+
+    config = JANUS_HF_LAYOUT.read_hf_config(str(root))
+    assert config.text_config.tie_word_embeddings is False
+    assert _tie_word_embeddings(config) is False
+
+    model = OmniModel.from_pretrained(str(root), dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager")
+    assert model.modules_dict[TEXT_ENCODER].lm_head is not None
+
+
 def test_an_hf_root_resolves_to_a_weight_free_split_view(hf_root):
     root, _ = hf_root
     view = resolve_omni_checkpoint_root(root)

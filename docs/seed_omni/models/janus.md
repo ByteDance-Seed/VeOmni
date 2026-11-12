@@ -262,9 +262,10 @@ Two cases do **not** produce that merged export:
 
 - A **LoRA** run saves adapters per module instead. With only LoRA-trained
   modules there is no `hf_ckpt/` at all; with mixed full/LoRA modules the merged
-  export carries the original bases, not the adapter updates. Load the adapters
-  on top of the base (`model.model_path=<HF root>` plus the per-module adapter
-  path) rather than pointing at `hf_ckpt/`.
+  export carries the original bases, not the adapter updates. Point
+  `model.model_path` at the base checkpoint (upstream root or split root) and set
+  `model.lora_config.lora_adapter` to the adapter directory
+  (`<output_dir>/checkpoints/global_step_N/lora_ckpt`) instead of using `hf_ckpt/`.
 - A module that ended up **fully frozen** (for example one whose LoRA targets
   matched nothing) has no per-module export, so the assembled root below would
   lack its weights. Copy those modules from the original checkpoint.
