@@ -232,7 +232,7 @@ class TrainingMixin(TrainingModuleMixin):
         self._pack_inputs_embeds_shape = None
 
         if ps.sp_size > 1:
-            if ps.skip_sp_gather_between_modules:
+            if ps.skip_sp_gather_between_modules or pack_shape is None:
                 valid_len = int(self._sp_own_len)
                 self._sp_own_len = None
                 full_len = valid_len + (-valid_len % ps.sp_size)

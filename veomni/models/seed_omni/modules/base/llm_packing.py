@@ -138,7 +138,8 @@ def pack_llm_metadata_from_conversations(
             if item.is_dummy:
                 continue
             if isinstance(item.value, torch.Tensor):
-                seg_len = int(item.value.size(0))
+                val = item.value.squeeze(0) if item.value.dim() == 3 else item.value
+                seg_len = int(val.size(0))
             else:
                 seg_len = int(item.meta.get(_OMNI_TOKEN_LEN, 0))
             chunk_mask = item.meta.get("attention_mask")

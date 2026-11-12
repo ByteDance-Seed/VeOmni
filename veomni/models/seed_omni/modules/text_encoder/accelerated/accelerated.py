@@ -148,6 +148,7 @@ class TrainingMixin(TrainingModuleMixin):
     def decode_post(self, loss: torch.Tensor, logits: torch.Tensor) -> Dict[str, Any]:
         conversation = self._conversation_carrier
         self._conversation_carrier = None
+        self._last_sp_sharded_hidden = None
         # Single-loss protocol: drop logits, rename ``loss`` → ``_loss``.
         if loss is not None:
             return {"_loss": loss, "conversation_list": conversation}
@@ -240,11 +241,11 @@ class TrainingMixin(TrainingModuleMixin):
                     label_chunks.append(labels)
                     decode_len += int(labels.shape[0])
                 else:
-                    seg_len = (
-                        int(part.value.size(0))
-                        if isinstance(part.value, torch.Tensor)
-                        else int(part.meta.get(_OMNI_TOKEN_LEN, 1))
-                    )
+                    if isinstance(part.value, torch.Tensor):
+                        val = part.value.squeeze(0) if part.value.dim() == 3 else part.value
+                        seg_len = int(val.size(0))
+                    else:
+                        seg_len = int(part.meta.get(_OMNI_TOKEN_LEN, 1))
                     label_chunks.append(torch.full((seg_len,), IGNORE_INDEX, dtype=torch.long))
                     decode_len += seg_len
             if decode_len > sample_start:
