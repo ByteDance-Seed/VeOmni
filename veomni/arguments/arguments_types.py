@@ -1630,13 +1630,14 @@ class OpsImplementationConfig:
             "(requires cann_ops_transformer); 'triton' is DeepSeek-V4 sparse MQA on AMD ROCm."
         },
     )
-    mhc_implementation: Literal["eager", "cann", "tilelang"] = field(
+    mhc_implementation: Literal["eager", "cann", "tilelang", "triton"] = field(
         default="eager",
         metadata={
             "help": "Manifold-constrained Hyper-Connection implementation. 'tilelang' enables the "
-            "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'cann' enables the "
-            "Ascend CANN fused pre/post path with a PyTorch final-head collapse (requires NPU BF16 "
-            "and cann_ops_transformer); 'eager' uses PyTorch."
+            "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'triton' enables Triton "
+            "forward/backward kernels on AMD ROCm; 'cann' enables the Ascend CANN fused pre/post path "
+            "with a PyTorch final-head collapse (requires NPU BF16 and cann_ops_transformer); 'eager' "
+            "uses PyTorch."
         },
     )
     qat_implementation: Literal["none", "fp8_blockwise"] = field(

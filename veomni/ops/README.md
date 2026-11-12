@@ -55,7 +55,7 @@ when the selected implementation runs.
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
 | `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu` as supported by the family |
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `triton`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
-| `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
+| `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `triton` (ROCm), `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
 
 The MLU `liger_kernel` rows reuse the CUDA adapters and use

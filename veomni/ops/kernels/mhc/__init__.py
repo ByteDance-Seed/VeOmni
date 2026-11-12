@@ -18,24 +18,30 @@ Three independent variants share this package. They are not a compound
 kernel. Eager is the modeling math (regular autograd). ``tilelang`` is
 TileKernels on SM90+. ``post`` / ``tilelang`` is a raw pair; ``pre`` and
 ``head`` keep an opaque wrapper because TileKernels owns that autograd.
-``cann`` is the Ascend CANN fused pre and post. CANN has no head kernel,
-so ``head`` / ``cann`` runs the eager math and lets one
-``mhc_implementation`` name cover all three variants.
+``triton`` is the AMD ROCm counterpart: Triton kernels adapted from AMD
+Primus around the FP32 mix GEMM, each owning its autograd. ``cann`` is the
+Ascend CANN fused pre and post. CANN has no head kernel, so ``head`` /
+``cann`` runs the eager math and lets one ``mhc_implementation`` name
+cover all three variants.
 """
 
-from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, NpuKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, ROCM_GPU, GpuKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
 from .head import eager as head_eager
 from .head import tilelang as head_tilelang
+from .head import triton as head_triton
 from .post import cann as post_cann
 from .post import eager as post_eager
 from .post import tilelang as post_tilelang
+from .post import triton as post_triton
 from .pre import cann as pre_cann
 from .pre import eager as pre_eager
 from .pre import tilelang as pre_tilelang
+from .pre import triton as pre_triton
 
 
 _TILELANG = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+_TRITON = GpuKernelRequirement(platforms=(ROCM_GPU,))
 _CANN = NpuKernelRequirement()
 
 register_op(
@@ -54,6 +60,16 @@ register_op(
     wrapper=pre_tilelang.wrapper,
     requirement=_TILELANG,
     requires=("tile_kernels",),
+)
+
+register_op(
+    "mhc",
+    "pre",
+    "triton",
+    description="Triton DeepSeek-V4 mHC pre transform with Sinkhorn normalization and collapse for AMD ROCm",
+    wrapper=pre_triton.wrapper,
+    requirement=_TRITON,
+    requires=("triton",),
 )
 
 register_op(
@@ -88,6 +104,16 @@ register_op(
 register_op(
     "mhc",
     "post",
+    "triton",
+    description="Triton DeepSeek-V4 mHC residual post-mix for AMD ROCm",
+    wrapper=post_triton.wrapper,
+    requirement=_TRITON,
+    requires=("triton",),
+)
+
+register_op(
+    "mhc",
+    "post",
     "cann",
     description="Ascend CANN DeepSeek-V4 mHC residual post-mix",
     wrapper=post_cann.wrapper,
@@ -111,6 +137,16 @@ register_op(
     wrapper=head_tilelang.wrapper,
     requirement=_TILELANG,
     requires=("tile_kernels",),
+)
+
+register_op(
+    "mhc",
+    "head",
+    "triton",
+    description="Triton DeepSeek-V4 final mHC collapse for AMD ROCm",
+    wrapper=head_triton.wrapper,
+    requirement=_TRITON,
+    requires=("triton",),
 )
 
 register_op(
