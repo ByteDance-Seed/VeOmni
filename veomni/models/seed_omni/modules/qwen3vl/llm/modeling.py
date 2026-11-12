@@ -71,8 +71,81 @@ def collect_qwen3vl_dummy_deepstack(
     for sample in conversations:
         for item in sample:
             if item.is_dummy and item.type == "image" and "deepstack" in item.meta:
-                return [d.to(device) for d in item.meta["deepstack"]]
+                ds = item.meta["deepstack"]
+                if ds and ds[0].numel() > 0:
+                    return [d.to(device) for d in ds]
     return None
+
+
+def pack_sp_sharded_qwen3vl_conversations_for_forward(
+    conversations: list[list[ConversationItem]],
+    device: torch.device,
+    spatial_merge_size: int,
+) -> Dict[str, Any]:
+    """Pack SP-sharded ``item.value`` segments directly for single-modality Qwen3-VL forward."""
+    from ...base.llm_packing import item_token_len
+
+    local_embeds_list: list[torch.Tensor] = []
+    position_ids_list: list[torch.Tensor] = []
+    visual_pos_masks_list: list[torch.Tensor] = []
+    sample_lengths: list[int] = []
+    prefix_rows: list[torch.Tensor] = []
+    deepstack_chunks: list[list[torch.Tensor]] = []
+
+    for sample in conversations:
+        sample_len = 0
+        current_pos = 0
+        for item in sample:
+            if item.is_dummy:
+                continue
+            val = item.value.squeeze(0) if item.value.dim() == 3 else item.value
+            local_embeds_list.append(val.to(device))
+            length = item_token_len(item)
+            prefix_rows.append(torch.tensor([length], dtype=torch.long, device="cpu"))
+            is_visual = item.type in ("image", "video")
+            if is_visual:
+                grid_thw = item.meta["grid_thw"]
+                seg_pos = qwen3vl_vision_position_ids(current_pos, grid_thw, spatial_merge_size).to(device)
+                current_pos += qwen3vl_vision_position_advance(grid_thw, spatial_merge_size)
+                visual_pos_masks_list.append(torch.ones(length, dtype=torch.bool, device=device))
+                deepstack_chunks.append([d.to(device) for d in item.meta["deepstack"]])
+            else:
+                seg_pos = torch.arange(length, dtype=torch.long, device=device).view(1, -1).expand(3, -1) + current_pos
+                current_pos += length
+                visual_pos_masks_list.append(torch.zeros(length, dtype=torch.bool, device=device))
+            position_ids_list.append(seg_pos)
+            sample_len += length
+        sample_lengths.append(sample_len)
+
+    inputs_embeds = torch.cat(local_embeds_list, dim=0).unsqueeze(0)
+    inputs_embeds_shape = torch.stack(prefix_rows)
+    position_ids = torch.cat(position_ids_list, dim=1).unsqueeze(1)
+    visual_pos_masks = torch.cat(visual_pos_masks_list, dim=0).unsqueeze(0)
+
+    if deepstack_chunks:
+        num_layers = len(deepstack_chunks[0])
+        deepstack_visual_embeds = [
+            torch.cat([chunk[layer] for chunk in deepstack_chunks], dim=0) for layer in range(num_layers)
+        ]
+    else:
+        deepstack_visual_embeds = collect_qwen3vl_dummy_deepstack(conversations, device)
+        visual_pos_masks = None
+    if not deepstack_visual_embeds:
+        deepstack_visual_embeds = None
+        visual_pos_masks = None
+
+    cu_seq_lens = torch.tensor([0, *_cumsum(sample_lengths)], dtype=torch.int32, device=device)
+    max_length = max(sample_lengths) if sample_lengths else 0
+
+    return {
+        "inputs_embeds": inputs_embeds,
+        "position_ids": position_ids,
+        "visual_pos_masks": visual_pos_masks,
+        "deepstack_visual_embeds": deepstack_visual_embeds,
+        "cu_seq_lens": cu_seq_lens,
+        "max_length": max_length,
+        "inputs_embeds_shape": inputs_embeds_shape,
+    }
 
 
 def pack_qwen3vl_conversations_for_forward(

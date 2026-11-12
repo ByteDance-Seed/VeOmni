@@ -121,26 +121,31 @@ for node in training_graph:
   mechanism between modules.
 - **Skipping inter-module SP all-gathers (`skip_sp_gather_between_modules: true`).**
   On ultra-long sequences (e.g. `128k`–`256k` tokens), materializing the
-  full-sequence embeddings after `text_encoder.encode` and the full-sequence
-  hidden states after `llm.forward` adds two full-sequence `AllGather` /
-  `ReduceScatter` pairs and keeps full-sequence autograd buffers alive across
-  module boundaries. Setting `model.accelerator.skip_sp_gather_between_modules: true`
-  (propagated to `ParallelState.skip_sp_gather_between_modules`) lets modules
-  sharing the same SP/CP configuration hand off `1/S` sequence shards directly
-  through `veomni/models/seed_omni/modules/base/llm_packing.py`:
-  - On text-only batches (`is_text_only_conversation`), `text_encoder.encode_post`
-    zero-masks any SP pad tail rows and stashes `(local_embeds, valid_len)` via
-    `stash_sp_sharded_embeds` instead of calling `gather_outputs`, and the
-    backbone's `forward_pre` consumes that shard via `pop_sp_sharded_embeds` and
-    builds `position_ids` / `cu_seqlens` from carrier metadata
-    (`pack_llm_metadata_from_conversations`).
-  - On both text-only and multimodal batches, the backbone's `forward_post`
-    stashes this rank's `[start, end)` output shard (`SpShardedHiddenStates`)
-    via `stash_sp_sharded_hidden_states` instead of calling `gather_outputs`,
-    and `text_encoder.decode_pre` (`_prepare_sharded_decode_inputs`) slices the
-    shifted labels to `[sharded.start : sharded.end]` so each rank projects and
-    scores only its own `1/S` slice before `reduce_sequence_parallel_loss`
-    combines the numerators and denominators over `fsdp_group` (`dp_sp`).
+  full-sequence embeddings after `text_encoder.encode` / `vision.forward` and
+  the full-sequence hidden states after `llm.forward` adds full-sequence
+  `AllGather` / `ReduceScatter` collectives and keeps full-sequence autograd
+  buffers alive across module boundaries. Setting
+  `model.accelerator.skip_sp_gather_between_modules: true` (propagated to
+  `ParallelState.skip_sp_gather_between_modules`) lets every module's
+  `post_forward` (`text_encoder.encode_post`, `vision.forward_post`,
+  `llm.forward_post`) skip `gather_outputs`, zero-mask any SP-padded tail rows
+  (`mask_sp_pad_tail`), and scatter its rank-local `1/S` shard directly onto
+  `item.value` via `split_sp_sharded_tensor` (`veomni/models/seed_omni/modules/base/llm_packing.py`):
+  - When a micro-batch carries only a single modality (`can_use_sp_sharded_embeds_directly`,
+    such as text-only or vision-only), the backbone's `forward_pre` concatenates
+    the sharded `item.value`s directly without any `AllGather` and builds
+    `position_ids` / `cu_seqlens` from each item's unsharded token length
+    (`item_token_len`). When multiple modalities (`text` + `image`/`video`) must
+    be interleaved in conversation order, `llm.forward_pre` all-gathers each
+    modality's `item.value` (`gather_sp_sharded_modalities_for_interleaving`),
+    interleaves them, and slices the combined sequence.
+  - After `llm.forward`, `llm.forward_post` scatters its `1/S` output shard
+    directly onto `item.value`, and `text_encoder.decode_pre`
+    (`_prepare_sharded_decode_inputs`) concatenates those sharded `item.value`s
+    and slices the shifted labels to `[shard_start : shard_end]` so each rank
+    projects and scores only its own `1/S` slice before
+    `reduce_sequence_parallel_loss` combines the numerators and denominators
+    over `fsdp_group` (`dp_sp`).
 
 The SP logic lives entirely in each module's `pre_forward` / `post_forward`;
 there is no separate SP hook. Inside the module's forward and backward pass,

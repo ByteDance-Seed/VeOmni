@@ -294,20 +294,24 @@ def _graph_loss(
     regression in the parallelism guards looks like. Every module that slices
     imports the helper by name, so the counter wraps each of those bindings.
     """
-    calls = {"slice": 0, "pad": 0}
+    calls = {"slice": 0, "pad": 0, "post_gather": 0, "interleave_gather": 0}
     restores = []
     if count_sp:
+        from veomni.models.seed_omni.modules.base import llm_packing
         from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated import accelerated as llm_acc
         from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated import packed as llm_packed
         from veomni.models.seed_omni.modules.qwen3vl.text_encoder.accelerated import packed as te_packed
+        from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated import accelerated as vision_acc
         from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated import packed as vision_packed
+        from veomni.models.seed_omni.modules.text_encoder.accelerated import accelerated as base_te_acc
 
-        targets = [llm_acc, llm_packed, te_packed, vision_packed]
+        targets = [llm_acc, llm_packed, te_packed, vision_acc, vision_packed, base_te_acc]
         for module in targets:
             for attr, key in (
                 ("slice_input_tensor", "slice"),
                 ("sp_pad", "pad"),
                 ("sp_pad_and_slice", "pad"),
+                ("gather_outputs", "post_gather"),
             ):
                 original = getattr(module, attr, None)
                 if original is None:
@@ -319,6 +323,15 @@ def _graph_loss(
 
                 restores.append((module, attr, original))
                 setattr(module, attr, wrapper)
+
+        orig_interleave_gather = llm_packing.gather_outputs
+
+        def _wrap_interleave_gather(*args, **kwargs):
+            calls["interleave_gather"] += 1
+            return orig_interleave_gather(*args, **kwargs)
+
+        restores.append((llm_packing, "gather_outputs", orig_interleave_gather))
+        llm_packing.gather_outputs = _wrap_interleave_gather
 
     try:
         model = _omni(modules, edges)
@@ -540,6 +553,19 @@ def test_sp_matches_single_rank_on_cpu(tmp_path: Path):
                 assert sq2 == pytest.approx(sq1, abs=1e-5), (rank, name, param_name, sq1, sq2)
 
         assert reports["conversation_sp1"] == pytest.approx(reports["packed_sp1"], abs=1e-5), (rank, reports)
+        assert reports["conversation_sp2_sp_calls"]["post_gather"] == 4, (rank, reports["conversation_sp2_sp_calls"])
+        assert reports["conversation_sp2_sp_calls"]["interleave_gather"] == 0, (
+            rank,
+            reports["conversation_sp2_sp_calls"],
+        )
+        assert reports["conversation_sp2_skip_gather_sp_calls"]["post_gather"] == 0, (
+            rank,
+            reports["conversation_sp2_skip_gather_sp_calls"],
+        )
+        assert reports["conversation_sp2_skip_gather_sp_calls"]["interleave_gather"] == 3, (
+            rank,
+            reports["conversation_sp2_skip_gather_sp_calls"],
+        )
         assert reports["conversation_sp2_skip_gather"] == pytest.approx(reports["conversation_sp1"], abs=1e-5), (
             rank,
             reports,

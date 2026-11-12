@@ -22,7 +22,7 @@ from transformers import PreTrainedTokenizerBase
 from veomni.distributed.emb_parallel import ShardedEmbedding
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from ...utils.conversation import ConversationItem, seal_outputs
+from ...utils.conversation import _OMNI_TOKEN_LEN, ConversationItem, seal_outputs
 from ..module_modeling_base import PretrainedOmniModule
 from .chat_template import TextEncoderChatTemplate
 from .configuration import TextEncoderConfig
@@ -41,6 +41,8 @@ def scatter_text_encoder_embeds(
         for part in sample:
             if part.type != "text":
                 continue
+            if _OMNI_TOKEN_LEN not in part.meta and isinstance(part.value, torch.Tensor) and part.value.dim() == 1:
+                part.meta[_OMNI_TOKEN_LEN] = int(part.value.numel())
             part.value = next(segment_embeds_iterator)
     if next(segment_embeds_iterator, None) is not None:
         raise RuntimeError("TextEncoder text segment count mismatch during embed scatter.")

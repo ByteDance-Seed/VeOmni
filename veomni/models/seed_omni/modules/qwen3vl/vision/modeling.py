@@ -28,7 +28,7 @@ from veomni.utils.device import IS_NPU_AVAILABLE
 
 from ......distributed.parallel_state import get_parallel_state
 from ......models.checkpoint.convert import ConvertedCheckpointTensor
-from ....utils.conversation import ConversationItem
+from ....utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
 from ...module_modeling_base import PretrainedOmniModule
 from .configuration import Qwen3VLVisionEncoderConfig
 from .processing import (
@@ -149,14 +149,25 @@ def scatter_qwen3vl_visual_embeds(
     output_slots: List[_VisualOutputSlot],
     embeds: torch.Tensor,
     deepstack_features: List[torch.Tensor],
+    *,
+    sp_sharded: bool = False,
+    sp_rank: int = 0,
+    sp_size: int = 1,
 ) -> None:
     """Scatter merged ViT tokens back onto conversation items."""
     sizes = [slot.num_merged for slot in output_slots]
-    embeds_split = torch.split(embeds, sizes, dim=0)
-    deepstack_split = [torch.split(layer, sizes, dim=0) for layer in deepstack_features]
+    if sp_sharded and sp_size > 1:
+        from ...base.llm_packing import split_sp_sharded_tensor
+
+        embeds_split = split_sp_sharded_tensor(embeds, sizes, sp_rank, sp_size)
+        deepstack_split = [split_sp_sharded_tensor(layer, sizes, sp_rank, sp_size) for layer in deepstack_features]
+    else:
+        embeds_split = torch.split(embeds, sizes, dim=0)
+        deepstack_split = [torch.split(layer, sizes, dim=0) for layer in deepstack_features]
     for idx, slot in enumerate(output_slots):
         slot.item.value = embeds_split[idx]
         slot.item.meta["grid_thw"] = slot.grid
+        slot.item.meta[_OMNI_TOKEN_LEN] = slot.num_merged
         slot.item.meta["deepstack"] = [layer[idx] for layer in deepstack_split]
 
 

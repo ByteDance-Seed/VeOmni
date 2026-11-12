@@ -341,9 +341,13 @@ def _run_alignment_matrix(
 
                     loss = _run_qwen3_omni_graph_step(te, llm, local_convs)
                     if ps.skip_sp_gather_between_modules:
-                        # Under skip_sp_gather_between_modules, full-sequence embeds/hidden_states
-                        # are never scattered back onto conversation_list text items.
-                        assert all(item.value.dim() == 1 for conv in local_convs for item in conv)
+                        # Under skip_sp_gather_between_modules, each item.value holds only
+                        # this rank's SP shard slice (total 8 // 2 = 4 rows, not full 7 rows).
+                        assert all(item.value.dim() == 2 for conv in local_convs for item in conv)
+                        assert sum(item.value.size(0) for conv in local_convs for item in conv) == 4
+                    else:
+                        expected_rows = sum(int(item.meta["labels"].numel()) for conv in local_convs for item in conv)
+                        assert sum(item.value.size(0) for conv in local_convs for item in conv) == expected_rows
                     loss.backward()
 
                     omni_grads = _collect_omni_as_source_dict(te, llm, grads=True)

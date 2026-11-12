@@ -18,17 +18,16 @@ from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem
 from ....base.llm_packing import (
-    pack_llm_metadata_from_conversations,
-    pop_sp_sharded_embeds,
+    can_use_sp_sharded_embeds_directly,
+    gather_sp_sharded_modalities_for_interleaving,
     scatter_llm_hidden_states,
-    stash_sp_sharded_hidden_states,
+    split_sp_sharded_tensor,
 )
 from ..configuration import Qwen3VLLlmConfig
 from ..modeling import (
     Qwen3VLLlm,
-    _cumsum,
-    collect_qwen3vl_dummy_deepstack,
     pack_qwen3vl_conversations_for_forward,
+    pack_sp_sharded_qwen3vl_conversations_for_forward,
 )
 from .packed import PackedTrainingMixin
 
@@ -60,49 +59,52 @@ class TrainingMixin(TrainingModuleMixin):
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        sharded_embeds = pop_sp_sharded_embeds(conversation_list)
-        if sharded_embeds is not None:
-            local_embeds, valid_len = sharded_embeds
-            if local_embeds.dim() == 2:
-                local_embeds = local_embeds.unsqueeze(0)
-            if self.training and get_parallel_state().fsdp_enabled:
-                local_embeds = _fold_fsdp_dummy_anchors(local_embeds, conversation_list)
-            position_ids_1d, _, sample_seqlens, _ = pack_llm_metadata_from_conversations(
-                conversation_list, self.device
-            )
-            self._conversation_carrier = conversation_list
-            self._pack_inputs_embeds_shape = None
-            self.metric_meter_set_seqlens("forward", sample_seqlens)
+        ps = get_parallel_state()
+        if ps.sp_size > 1 and ps.skip_sp_gather_between_modules:
+            if can_use_sp_sharded_embeds_directly(conversation_list):
+                packed = pack_sp_sharded_qwen3vl_conversations_for_forward(
+                    conversation_list, self.device, self._spatial_merge_size
+                )
+                local_embeds = packed["inputs_embeds"]
+                cu = packed["cu_seq_lens"].reshape(-1)
+                self.metric_meter_set_seqlens("forward", [int(s) for s in (cu[1:] - cu[:-1]).tolist()])
+                if self.training and ps.fsdp_enabled:
+                    local_embeds = _fold_fsdp_dummy_anchors(local_embeds, conversation_list)
+                self._conversation_carrier = conversation_list
+                self._pack_inputs_embeds_shape = packed["inputs_embeds_shape"]
+                self._sp_own_len = int(packed["inputs_embeds_shape"].prod(-1).sum().item())
 
-            deepstack_visual_embeds = collect_qwen3vl_dummy_deepstack(conversation_list, self.device)
-            local_embeds, _, empty_deepstack = self._normalize_visual_inputs(
-                local_embeds, None, deepstack_visual_embeds
-            )
+                local_embeds, visual_pos_masks, deepstack_visual_embeds = self._normalize_visual_inputs(
+                    local_embeds, packed["visual_pos_masks"], packed["deepstack_visual_embeds"]
+                )
+                if visual_pos_masks.size(1) != self._sp_own_len:
+                    visual_pos_masks = torch.zeros(1, self._sp_own_len, dtype=torch.bool, device=self.device)
 
-            ps = get_parallel_state()
-            group = ps.sp_group
-            self._sp_own_len = valid_len
-            cu = torch.tensor([0, *_cumsum(sample_seqlens)], dtype=torch.int32, device=self.device)
-            max_length = max(sample_seqlens) if sample_seqlens else 0
-            pids = sp_pad(position_ids_1d.unsqueeze(0).expand(3, -1, -1).contiguous(), dim=2, pad_value=0)
-            padded_len = pids.size(2)
-            pad_len = padded_len - self._sp_own_len
-            if pad_len > 0:
-                tail = torch.tensor([padded_len], dtype=cu.dtype, device=cu.device)
-                cu = torch.cat([cu, tail], dim=0)
-                max_length = max(max_length, pad_len)
-            pids = slice_input_tensor(pids, dim=2, padding=False, group=group)
-            mask = torch.zeros(1, local_embeds.size(1), dtype=torch.bool, device=self.device)
-            return dict(
-                inputs_embeds=local_embeds,
-                position_ids=pids,
-                visual_pos_masks=mask,
-                deepstack_visual_embeds=empty_deepstack,
-                cu_seq_lens_q=cu,
-                cu_seq_lens_k=cu,
-                max_length_q=max_length,
-                max_length_k=max_length,
-            )
+                group = ps.sp_group
+                max_length = packed["max_length"]
+                pids = sp_pad(packed["position_ids"], dim=2, pad_value=0)
+                mask = sp_pad(visual_pos_masks, dim=1, pad_value=0)
+                padded_len = pids.size(2)
+                pad_len = padded_len - self._sp_own_len
+                if pad_len > 0:
+                    tail = torch.tensor([padded_len], dtype=cu.dtype, device=cu.device)
+                    cu = torch.cat([cu, tail], dim=0)
+                    max_length = max(max_length, pad_len)
+                pids = slice_input_tensor(pids, dim=2, padding=False, group=group)
+                mask = slice_input_tensor(mask, dim=1, padding=False, group=group)
+                if deepstack_visual_embeds is not None and deepstack_visual_embeds.size(1) > int(mask.sum().item()):
+                    deepstack_visual_embeds = deepstack_visual_embeds[:, : int(mask.sum().item()), :]
+                return dict(
+                    inputs_embeds=local_embeds,
+                    position_ids=pids,
+                    visual_pos_masks=mask,
+                    deepstack_visual_embeds=deepstack_visual_embeds,
+                    cu_seq_lens_q=cu,
+                    cu_seq_lens_k=cu,
+                    max_length_q=max_length,
+                    max_length_k=max_length,
+                )
+            gather_sp_sharded_modalities_for_interleaving(conversation_list, ps.sp_group)
 
         packed = pack_qwen3vl_conversations_for_forward(conversation_list, self.device, self._spatial_merge_size)
         inputs_embeds = packed["inputs_embeds"]
@@ -232,22 +234,14 @@ class TrainingMixin(TrainingModuleMixin):
         self._pack_inputs_embeds_shape = None
 
         if ps.sp_size > 1:
-            if ps.skip_sp_gather_between_modules or pack_shape is None:
-                valid_len = int(self._sp_own_len)
+            if ps.skip_sp_gather_between_modules:
                 self._sp_own_len = None
-                full_len = valid_len + (-valid_len % ps.sp_size)
-                local_len = full_len // ps.sp_size
-                start = ps.sp_rank * local_len
-                end = start + local_len
                 if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
                     hidden_states = hidden_states.squeeze(0)
-                stash_sp_sharded_hidden_states(
+                lengths = pack_shape.prod(-1).tolist()
+                scatter_llm_hidden_states(
                     conversation,
-                    hidden_states,
-                    start=start,
-                    end=end,
-                    valid_len=valid_len,
-                    full_len=full_len,
+                    split_sp_sharded_tensor(hidden_states, lengths, ps.sp_rank, ps.sp_size),
                 )
                 return {"conversation_list": conversation}
             # SP output-gather: all-gather Ulysses shards back to the full sequence
@@ -308,7 +302,7 @@ def _fold_fsdp_dummy_anchors(
         for part in sample:
             if not part.is_dummy:
                 continue
-            if isinstance(part.value, torch.Tensor):
+            if isinstance(part.value, torch.Tensor) and part.value.numel() > 0:
                 inputs_embeds = (
                     inputs_embeds + part.value.mean().to(device=inputs_embeds.device, dtype=inputs_embeds.dtype) * 0.0
                 )

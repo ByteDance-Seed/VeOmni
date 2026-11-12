@@ -23,11 +23,12 @@ from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem
 from ....base.llm_packing import (
+    can_use_sp_sharded_embeds_directly,
+    gather_sp_sharded_modalities_for_interleaving,
     pack_llm_conversations_for_forward,
-    pack_llm_metadata_from_conversations,
-    pop_sp_sharded_embeds,
+    pack_sp_sharded_conversations_for_forward,
     scatter_llm_hidden_states,
-    stash_sp_sharded_hidden_states,
+    split_sp_sharded_tensor,
 )
 from ..configuration import Qwen3LlmConfig
 from ..modeling import Qwen3Llm
@@ -54,41 +55,39 @@ class TrainingMixin(TrainingModuleMixin):
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        sharded_embeds = pop_sp_sharded_embeds(conversation_list)
-        if sharded_embeds is not None:
-            local_embeds, valid_len = sharded_embeds
-            if local_embeds.dim() == 2:
-                local_embeds = local_embeds.unsqueeze(0)
-            if self.training and get_parallel_state().fsdp_enabled:
-                local_embeds = _fold_fsdp_dummy_anchors(local_embeds, conversation_list)
-            position_ids, attention_mask, sample_seqlens, _ = pack_llm_metadata_from_conversations(
-                conversation_list, self.device
-            )
-            self._conversation_carrier = conversation_list
-            self._pack_inputs_embeds_shape = None
-            self.metric_meter_set_seqlens("forward", sample_seqlens)
-            ps = get_parallel_state()
-            self._sp_own_len = valid_len
-            mask = sp_pad(attention_mask, dim=1, pad_value=1)
-            pids = sp_pad(position_ids, dim=1, pad_value=0)
-            tail_padding_length = pids.size(1) - self._sp_own_len
-            (cu_q, cu_k), (max_q, max_k) = prepare_fa_kwargs_from_position_ids(pids)
-            if tail_padding_length > 0:
-                cu_q = coalesce_tail_padding_cu_seqlens(cu_q, tail_padding_length)
-                cu_k = cu_q
-                seqlens = cu_q[1:] - cu_q[:-1]
-                max_q = int(seqlens.max().item()) if seqlens.numel() else 0
-                max_k = max_q
-            pids = slice_input_tensor(pids, dim=1, padding=False, group=ps.sp_group)
-            return dict(
-                inputs_embeds=local_embeds,
-                attention_mask=mask,
-                position_ids=pids,
-                cu_seq_lens_q=cu_q,
-                cu_seq_lens_k=cu_k,
-                max_length_q=max_q,
-                max_length_k=max_k,
-            )
+        ps = get_parallel_state()
+        if ps.sp_size > 1 and ps.skip_sp_gather_between_modules:
+            if can_use_sp_sharded_embeds_directly(conversation_list):
+                local_embeds, attention_mask, position_ids, inputs_embeds_shape, sample_seqlens = (
+                    pack_sp_sharded_conversations_for_forward(conversation_list, self.device)
+                )
+                if self.training and ps.fsdp_enabled:
+                    local_embeds = _fold_fsdp_dummy_anchors(local_embeds, conversation_list)
+                self._conversation_carrier = conversation_list
+                self._pack_inputs_embeds_shape = inputs_embeds_shape
+                self.metric_meter_set_seqlens("forward", sample_seqlens)
+                self._sp_own_len = int(inputs_embeds_shape.prod(-1).sum().item())
+                mask = sp_pad(attention_mask, dim=1, pad_value=1)
+                pids = sp_pad(position_ids, dim=1, pad_value=0)
+                tail_padding_length = pids.size(1) - self._sp_own_len
+                (cu_q, cu_k), (max_q, max_k) = prepare_fa_kwargs_from_position_ids(pids)
+                if tail_padding_length > 0:
+                    cu_q = coalesce_tail_padding_cu_seqlens(cu_q, tail_padding_length)
+                    cu_k = cu_q
+                    seqlens = cu_q[1:] - cu_q[:-1]
+                    max_q = int(seqlens.max().item()) if seqlens.numel() else 0
+                    max_k = max_q
+                pids = slice_input_tensor(pids, dim=1, padding=False, group=ps.sp_group)
+                return dict(
+                    inputs_embeds=local_embeds,
+                    attention_mask=mask,
+                    position_ids=pids,
+                    cu_seq_lens_q=cu_q,
+                    cu_seq_lens_k=cu_k,
+                    max_length_q=max_q,
+                    max_length_k=max_k,
+                )
+            gather_sp_sharded_modalities_for_interleaving(conversation_list, ps.sp_group)
 
         inputs_embeds, attention_mask, position_ids, inputs_embeds_shape = pack_llm_conversations_for_forward(
             conversation_list, self.device
@@ -168,22 +167,14 @@ class TrainingMixin(TrainingModuleMixin):
         self._pack_inputs_embeds_shape = None
 
         if ps.sp_size > 1:
-            if ps.skip_sp_gather_between_modules or pack_shape is None:
-                valid_len = int(self._sp_own_len)
+            if ps.skip_sp_gather_between_modules:
                 self._sp_own_len = None
-                full_len = valid_len + (-valid_len % ps.sp_size)
-                local_len = full_len // ps.sp_size
-                start = ps.sp_rank * local_len
-                end = start + local_len
                 if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
                     hidden_states = hidden_states.squeeze(0)
-                stash_sp_sharded_hidden_states(
+                lengths = pack_shape.prod(-1).tolist()
+                scatter_llm_hidden_states(
                     conversation,
-                    hidden_states,
-                    start=start,
-                    end=end,
-                    valid_len=valid_len,
-                    full_len=full_len,
+                    split_sp_sharded_tensor(hidden_states, lengths, ps.sp_rank, ps.sp_size),
                 )
                 return {"conversation_list": conversation}
             # SP output-gather: all-gather Ulysses shards back to the full sequence
@@ -242,7 +233,7 @@ def _fold_fsdp_dummy_anchors(
         for part in sample:
             if not part.is_dummy:
                 continue
-            if not isinstance(part.value, torch.Tensor):
+            if not isinstance(part.value, torch.Tensor) or part.value.numel() == 0:
                 continue
             fake = part.value.mean().to(device=inputs_embeds.device, dtype=inputs_embeds.dtype) * 0.0
             inputs_embeds = inputs_embeds + fake
