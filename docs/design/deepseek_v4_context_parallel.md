@@ -46,8 +46,10 @@ the indexer independently — all three derive the shard's origin from
 
 The safety net for any such change is `tests/parallel/context_parallel/`, which
 compares forward output, input gradient and every parameter gradient against a
-single-rank baseline at `cp_size` 2 and 4, packed and unpacked, with and without
-the compressor. It needs four GPUs. `cp_size=8` has never been run.
+single-rank baseline at `cp_size` 2, and on CUDA also at 4, packed and unpacked,
+with and without the compressor. CUDA CI runs both topologies; NPU CI runs the
+two-rank case, where the packed-model branches do not execute. `cp_size=8` has
+never been run.
 
 ## Constraints the code enforces
 
@@ -57,7 +59,7 @@ the compressor. It needs four GPUs. `cp_size=8` has never been run.
 | `cp_size > 1` requires `ulysses_size == 1` | `ParallelState.__post_init__` and `AcceleratorConfig._resolve_topology` | `NotImplementedError` at launch |
 | the model type must implement CP | `check_context_parallel_supported`, from `build_foundation_model` and `build_omni_model` | `NotImplementedError` at model build |
 | on Ascend/NPU, the model type must be `deepseek_v4` | `check_context_parallel_supported` | `NotImplementedError` at model build |
-| on Ascend/NPU, `dsa_indexer_implementation` and `dsa_attention_implementation` must be `eager` | `check_context_parallel_supported` | `NotImplementedError` at model build |
+| on Ascend/NPU, both `dsa_indexer_implementation` and `dsa_attention_implementation` must be `eager` | `check_context_parallel_supported` | `NotImplementedError` at model build |
 | explicit `position_ids` under either sequence-parallel mode | `DeepseekV4Model.forward` | `ValueError` on the first forward |
 | the attention mask spans the full sequence | `DeepseekV4Attention.forward`, ahead of the KV all-gather | `ValueError` on the first forward |
 | no KV cache under CP | `DeepseekV4Attention.forward` | `NotImplementedError` |
@@ -148,13 +150,15 @@ DSA selections remain the right choice for non-CP runs, and switching them
 costs those runs their kernels.
 
 The gate validates that selection pair and nothing else. It cannot verify that
-the eager operators are correct or fast on Ascend, and no NPU run has been
-validated beyond configuration: `tests/parallel/context_parallel/` needs four
-GPUs, so the parity suite still covers CUDA only, and
+the eager operators are correct or fast on Ascend, and
 `cp_size <= S / max(config.compress_rates)` applies unchanged. CANN CP support
 would be a kernel change — teaching both adapters the `query_offset` /
 `ori_kv` geometry and the explicit ranges — not a gate change; until then an
 NPU job that needs the CANN operators has to run with `cp_size=1`.
+
+`tests/parallel/context_parallel/` runs its two-rank eager case on the NPU
+suite, so the eager path's rank and local-query/global-KV geometry is checked on
+device; the four-rank and packed-model branches stay CUDA-only.
 
 ## Decisions that took more than one attempt
 
