@@ -16,7 +16,7 @@
 import types
 from collections.abc import Collection, Mapping
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -887,21 +887,37 @@ def parallelize_model_fsdp2(
         parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
     ) and kwargs.pop("enable_forward_prefetch", True)
     if need_manual_prefetch:
-        blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules
-        next_blocks = blocks[1:] + [None]
-        for current_block, next_block in zip(blocks, next_blocks):
-            if next_block is not None:
-                prefetch_modules = next_block._fsdp_modules
-                # prefetch in order of attn, gate, experts
-                current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
+        # Group target modules by their parent container prefix (e.g. "model.layers"
+        # vs "model.engram") so sidecar module groups registered after the main
+        # decoder stack do not chain into or out of the decoder layers' prefetch list.
+        groups_by_prefix: Dict[str, List[nn.Module]] = {}
+        for fqn, (layer_mod, _) in layer_pairs_list:
+            prefix = fqn.rsplit(".", 1)[0] if "." in fqn else ""
+            groups_by_prefix.setdefault(prefix, []).append(layer_mod)
 
-        # configure backward prefetch
-        rev_blocks = list(reversed(blocks))
-        prev_blocks = rev_blocks[1:] + [None]
-        for current_block, prev_block in zip(rev_blocks, prev_blocks):
-            if prev_block is not None:
-                prefetch_modules = prev_block._fsdp_modules
-                current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
+        for blocks in groups_by_prefix.values():
+            if len(blocks) <= 1:
+                continue
+            next_blocks = blocks[1:] + [None]
+            for current_block, next_block in zip(blocks, next_blocks):
+                if next_block is not None:
+                    prefetch_modules = next_block._fsdp_modules
+                    # prefetch in order of attn, gate, experts
+                    current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
+
+            # configure backward prefetch
+            rev_blocks = list(reversed(blocks))
+            prev_blocks = rev_blocks[1:] + [None]
+            for current_block, prev_block in zip(rev_blocks, prev_blocks):
+                if prev_block is not None:
+                    prefetch_modules = prev_block._fsdp_modules
+                    # Trigger backward prefetch from the inner FSDP submodule
+                    # (e.g. current_block.mlp.experts) rather than the outer
+                    # decoder layer so that under activation checkpointing the
+                    # next layer's weights are prefetched during current_block's
+                    # backward rather than before current_block's recompute.
+                    trigger_mod = current_block._fsdp_modules[0] if current_block._fsdp_modules else current_block
+                    trigger_mod.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
 
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"

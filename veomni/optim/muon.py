@@ -24,7 +24,7 @@ projection in row blocks (one block per head group) instead of as one matrix.
 """
 
 from functools import lru_cache
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -686,6 +686,30 @@ _KIND_FSDP_GATHER_2D = "fsdp_gather_2d"
 _KIND_MOE_LOCAL_3D = "moe_local_3d"
 _KIND_MOE_GATHER_3D = "moe_gather_3d"
 
+#: Local experts per Newton-Schulz call on a 3D expert stack. Dim 0 is a pure
+#: batch dim for ``batched_*_newton_schulz``, so slicing it changes only the
+#: workspace size -- which otherwise scales with the local expert count.
+_MOE_LOCAL_3D_NS_CHUNK = 3
+
+
+def _chunked_newton_schulz(local: Tensor, ns: "Callable[[Tensor], Tensor]") -> Tensor:
+    """Run ``ns`` over a 3D expert stack in chunks of ``_MOE_LOCAL_3D_NS_CHUNK`` experts.
+
+    The result is written into one preallocated stack chunk by chunk. Collecting the
+    chunk outputs in a list and ``torch.cat``-ing them would hold two full stacks at
+    peak (the list plus the concatenation), which is the opposite of the point: at
+    64 FP32 experts of ``2048 x 7168`` the second stack alone is 7 GiB.
+    """
+    if local.shape[0] <= _MOE_LOCAL_3D_NS_CHUNK:
+        return ns(local)
+    out = torch.empty_like(local)
+    for start in range(0, local.shape[0], _MOE_LOCAL_3D_NS_CHUNK):
+        end = start + _MOE_LOCAL_3D_NS_CHUNK
+        # In-place: the chunk's ortho lands directly in ``out``, so only one chunk
+        # of workspace is live on top of the result the caller needs anyway.
+        out[start:end] = ns(local[start:end])
+    return out
+
 
 def _shard_dims(p: DTensor) -> List[int]:
     """Return the list of tensor dims along which ``p`` is sharded."""
@@ -1001,6 +1025,7 @@ class DistributedMuon(Optimizer):
                         )
                 else:
                     ortho = self._compute_ortho(update, kind, **ns_kwargs)
+                    del update
                     self._apply_ortho(
                         p,
                         ortho,
@@ -1010,6 +1035,7 @@ class DistributedMuon(Optimizer):
                         adjust_lr_fn=adjust_lr_fn,
                         head_blocks=head_blocks,
                     )
+                    del ortho
 
             for (mesh, _local_dtype), entries in a2a_buckets.items():
                 self._flush_fsdp_all2all_chunk(
@@ -1226,7 +1252,7 @@ class DistributedMuon(Optimizer):
         if kind == _KIND_MOE_LOCAL_3D:
             assert isinstance(update, DTensor)
             local = update._local_tensor
-            local_ortho = _ns(local)
+            local_ortho = _chunked_newton_schulz(local, _ns)
             return DTensor.from_local(
                 local_ortho,
                 device_mesh=update.device_mesh,

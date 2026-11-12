@@ -1216,3 +1216,92 @@ class TestGramQuackFallback:
         monkeypatch.setattr(muon_mod, "get_gpu_compute_capability", lambda _device: 90)
         grad = type("FakeTensor", (), {"device": torch.device(device_type)})()
         assert muon_mod._gram_quack_unavailable_reason(grad) is None
+
+
+def test_moe_local_3d_newton_schulz_chunking_matches_a_whole_stack_call():
+    """The 3D-expert NS chunk must be identical to one call on the whole stack.
+
+    The local expert stack is processed in groups of ``_MOE_LOCAL_3D_NS_CHUNK`` so
+    the Newton-Schulz workspace stops scaling with the local expert count. Dim 0
+    is a pure batch dim for ``batched_*_newton_schulz``, so the chunking only
+    changes the workspace.
+    """
+    from veomni.optim.muon import _MOE_LOCAL_3D_NS_CHUNK, _chunked_newton_schulz
+
+    torch.manual_seed(0)
+    experts, rows, cols = 7, 4, 6
+    local = torch.randn(experts, rows, cols)
+
+    def _ns(x):
+        return run_newton_schulz(
+            x,
+            ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+            ns_steps=DEFAULT_NS_STEPS,
+            eps=1e-7,
+            ns_implementation="gram",
+            gram_ns_reset_iterations=(2,),
+        )
+
+    shapes = []
+
+    def _recording_ns(x):
+        shapes.append(tuple(x.shape))
+        return _ns(x)
+
+    chunked = _chunked_newton_schulz(local, _recording_ns)
+
+    torch.testing.assert_close(chunked, _ns(local))
+    # Pins the workspace bound: without this the test would also pass if the
+    # helper called ``ns`` once on all seven experts.
+    assert shapes == [(3, rows, cols), (3, rows, cols), (1, rows, cols)]
+    assert experts % _MOE_LOCAL_3D_NS_CHUNK == 1, "the final chunk is meant to hold a single expert"
+
+
+def test_moe_local_3d_newton_schulz_handles_a_tall_expert_stack():
+    """Rectangular experts exercise the Gram path, which the square case can skip."""
+    from veomni.optim.muon import _chunked_newton_schulz
+
+    torch.manual_seed(0)
+    local = torch.randn(4, 8, 3)
+
+    def _ns(x):
+        return run_newton_schulz(
+            x,
+            ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+            ns_steps=DEFAULT_NS_STEPS,
+            eps=1e-7,
+            ns_implementation="gram",
+            gram_ns_reset_iterations=(2,),
+        )
+
+    torch.testing.assert_close(_chunked_newton_schulz(local, _ns), _ns(local))
+
+
+def test_moe_local_3d_newton_schulz_output_keeps_the_input_dtype():
+    """The preallocated stack must not widen or narrow the update."""
+    from veomni.optim.muon import _chunked_newton_schulz
+
+    for dtype in (torch.bfloat16, torch.float32):
+        local = torch.randn(5, 4, 6, dtype=dtype)
+
+        def _ns(x, dtype=dtype):
+            return torch.zeros_like(x)
+
+        out = _chunked_newton_schulz(local, _ns)
+        assert out.dtype == dtype
+        assert out.shape == local.shape
+
+
+def test_moe_local_3d_newton_schulz_skips_chunking_below_the_threshold():
+    from veomni.optim.muon import _chunked_newton_schulz
+
+    local = torch.randn(3, 4, 4)
+    calls = []
+
+    def _ns(x):
+        calls.append(tuple(x.shape))
+        return x
+
+    _chunked_newton_schulz(local, _ns)
+
+    assert calls == [(3, 4, 4)]
