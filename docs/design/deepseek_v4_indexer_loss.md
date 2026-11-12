@@ -9,8 +9,9 @@ everything beneath them moved.
 `dsa_indexer_loss` trains it with DeepSeek-V3.2 eq. (4): the KL from the real CSA
 attention distribution, restricted to the candidates the indexer itself selected,
 to `softmax(index_score)`. The teacher is recomputed in the forward by
-`sparse_mqa_target_fwd` from the TileLang attention's own base-2 log-sum-exp,
-summed over CSA layers, normalised per query token, scaled by
+`sparse_mqa_target_fwd` (TileLang on NVIDIA, Triton on AMD ROCm) from the
+corresponding fused attention's full base-2 log-sum-exp, summed over CSA layers,
+normalised per query token, scaled by
 `dsa_indexer_loss_coef` and added to the total loss. The base is part of the
 operator contract because the target and backward kernels reconstruct
 probabilities with `exp2`.
@@ -94,8 +95,8 @@ distinguish the correct teacher from Megatron's.
 | constraint | enforced at | if violated |
 |----|----|----|
 | `dsa_indexer_loss_coef` finite and non-negative | `DeepseekV4Config.validate_build_prerequisites`, from `build_foundation_model` | `ValueError` at model build |
-| `dsa_indexer_implementation == "tilelang"` | `validate_build_prerequisites`, and `_indexer_loss_enabled` again | `ValueError` at model build |
-| `dsa_attention_implementation == "tilelang"` | `validate_build_prerequisites`, and `_indexer_loss_enabled` again | `ValueError` at model build |
+| `dsa_indexer_implementation` in `("tilelang", "triton")` | `validate_build_prerequisites`, and `_indexer_loss_enabled` again | `ValueError` at model build |
+| `dsa_attention_implementation` in `("tilelang", "triton")` | `validate_build_prerequisites`, and `_indexer_loss_enabled` again | `ValueError` at model build |
 | `ulysses_size == 1` and `cp_size == 1` | `_indexer_loss_enabled` | `ValueError` on the first forward |
 | at least one `compressed_sparse_attention` layer | `DeepseekV4Model.forward` | `RuntimeError` on the first forward |
 | the compressor handed over its scores | `DeepseekV4Attention.forward` | `RuntimeError` on the first forward |

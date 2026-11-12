@@ -109,6 +109,7 @@ _BUILTIN_ENTRIES = (
     ("dsa_attention", "glm", "flashmla_cudnn", "cuda", _GPU_NVIDIA_SM90, ("cudnn", "flash_mla")),
     ("dsa_indexer", "deepseek_v4", "eager", "any", _ANY, ()),
     ("dsa_indexer", "deepseek_v4", "tilelang", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("dsa_indexer", "deepseek_v4", "triton", "cuda", _GPU_ROCM, ("triton",)),
     ("dsa_indexer", "deepseek_v4", "cann", "npu", _NPU, ("cann_ops_transformer",)),
     ("dsa_indexer", "glm", "eager", "any", _ANY, ()),
     ("dsa_indexer", "glm", "cudnn", "cuda", _GPU_NVIDIA_SM90, ("cudnn", "flash_mla")),
