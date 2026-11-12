@@ -2,7 +2,7 @@
 
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -84,9 +84,8 @@ def _rank_local_legacy_rejection(rank, store, checkpoint):
         callback = GlobalStateCallback.__new__(GlobalStateCallback)
         callback.trainer = trainer
         callback._read_current = lambda _: {"global_step": 3, "_veomni_external_data": {}} if rank == 0 else None
-        with patch("veomni.checkpoint.legacy_v0_1_12.apply_legacy_global_state", return_value=None):
-            with pytest.raises((ValueError, RuntimeError)):
-                callback.load_global_state()
+        with pytest.raises((ValueError, RuntimeError)):
+            callback.load_global_state()
         assert trainer.state.global_step == 0
         alive = torch.ones(1)
         dist.all_reduce(alive)

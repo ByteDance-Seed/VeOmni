@@ -84,7 +84,7 @@ Qwen3-0.6B-dpo-ultrafeedback/
         ├── model/
         │   ├── ckpt/                ← DCP shards: weights
         │   ├── optimizer/           ← DCP shards: optimizer state
-        │   └── lr_scheduler.pt
+        │   └── extra_state/         ← scheduler, per rank
         ├── loader/rank_{R}.pt       ← dataloader cursor
         ├── extra_state/rank_{R}.pt  ← step, rng, meters
         └── hf_ckpt/                 ← HuggingFace safetensors (when save_hf_weights)

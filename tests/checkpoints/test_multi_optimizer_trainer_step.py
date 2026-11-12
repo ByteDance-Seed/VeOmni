@@ -88,7 +88,6 @@ def test_trainer_state_cannot_silently_diverge_from_restored_optimizer(tmp_path,
         state["_veomni_optimizer_generations"]["model"] = "older-generation"
     with (
         patch.object(callback, "_read_current", return_value=state),
-        patch("veomni.checkpoint.legacy_v0_1_12.apply_legacy_global_state", return_value=None),
         patch("veomni.trainer.callbacks.global_state_callback.set_device_rng_state"),
     ):
         if mode in (
@@ -273,7 +272,6 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
         )
         with (
             patch.object(callback, "_read_current", return_value=state),
-            patch("veomni.checkpoint.legacy_v0_1_12.apply_legacy_global_state", return_value=None),
             patch("veomni.trainer.callbacks.global_state_callback.set_device_rng_state"),
         ):
             if mode in ("matching", "asymmetric_loader"):
@@ -435,7 +433,7 @@ def _save_failure_worker(rank, tmp_path, mode, endpoint):
         elif mode == "generation_fatal":
             expected = (SystemExit, "injected generation failure")
         else:
-            expected = (RuntimeError, "matching MultiOptimizer checkpoint generation")
+            expected = (RuntimeError, "matching same-step MultiOptimizer checkpoint generation")
         inject = (
             patch(
                 "veomni.trainer.callbacks.global_state_callback._saved_multi_optimizer_generations",

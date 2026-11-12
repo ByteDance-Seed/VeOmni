@@ -38,6 +38,8 @@ def _meter(state):
     meter = object.__new__(helper.EnvironMeter)
     meter.config = SimpleNamespace(condition_model_type=None)
     meter.dpo_provenance_enabled = False
+    meter._flops_metadata_callback = None
+    meter._model_metadata = {}
     meter.parallel_state = state
     meter.global_batch_size = 2
     meter.world_size = 4

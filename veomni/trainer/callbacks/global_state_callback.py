@@ -570,20 +570,14 @@ class GlobalStateCallback(Callback):
         # silently drop a corrupt cursor. Reduce the read failure separately, and
         # before that reduction, so a rank that raised cannot strand its peers.
         read_error: Optional[Exception] = None
-        current_state = legacy_state = None
+        current_state = None
         dpo_sampler = None
         try:
             current_state = self._read_current(load_path)
-            if current_state is None:
-                # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to drop
-                # resume from the pre-split layouts.
-                from ...checkpoint.legacy_v0_1_12 import apply_legacy_global_state
-
-                legacy_state = apply_legacy_global_state(load_path, self.rank)
-            loaded_state = current_state if current_state is not None else legacy_state
-            if isinstance(loaded_state, Mapping):
-                cursor = loaded_state.get("train_dataloader")
-                if "_veomni_external_data" in loaded_state or _contains_retired_streaming_cursor(cursor):
+            loaded_state = current_state
+            if isinstance(current_state, Mapping):
+                cursor = current_state.get("train_dataloader")
+                if "_veomni_external_data" in current_state or _contains_retired_streaming_cursor(cursor):
                     raise ValueError(
                         "External data checkpoint cannot be resumed by the native loader; "
                         "start a weights-only run or use a separately verified migration"
@@ -724,7 +718,7 @@ class GlobalStateCallback(Callback):
         read_group = dist.group.WORLD if dist.is_initialized() else None
         raise_if_any_rank_failed(read_error, "reading the trainer state", group=read_group)
 
-        found = current_state is not None or legacy_state is not None
+        found = current_state is not None
         if dist.is_initialized():
             device = "cpu" if dist.get_backend(dist.group.WORLD) == "gloo" else get_device_type()
             flag = torch.tensor([int(found)], dtype=torch.int32, device=device)
@@ -762,7 +756,7 @@ class GlobalStateCallback(Callback):
             logger.warning_rank0("Trainer state is missing; resuming weights only.")
             return None
 
-        global_state = current_state if current_state is not None else legacy_state
+        global_state = current_state
         dpo_recovery = callable(getattr(type(self.trainer), "validate_dpo_provenance_checkpoint", None))
         # Reject an incompatible legacy cursor on every rank before any
         # loader or DPO position restoration can perform its own collectives.

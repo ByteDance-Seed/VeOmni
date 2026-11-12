@@ -353,6 +353,25 @@ def test_wrapper_rejects_deepgemm_fp8_before_moving_parameters(mode: str):
         assert buffer is original_buffers[name]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_moe_lora_rejects_a_quantizing_expert_row(mode: str):
+    """`qat` has no `moe_experts_lora` row, so substituting `eager` would round nothing.
+
+    The adapter forward multiplies the base weights it is handed; silently falling
+    back to a full-precision base while `moe_implementation='qat'` is set is the
+    same silent-precision-loss failure the `deepgemm_fp8` guard covers.
+    """
+    from types import SimpleNamespace
+
+    from veomni.lora.moe_layers import _moe_lora_op
+
+    base_layer = SimpleNamespace(veomni_moe=SimpleNamespace(impl="qat"))
+
+    with pytest.raises(ValueError, match="qat.*does not support MoE-LoRA"):
+        _moe_lora_op(base_layer, mode)
+
+
 @pytest.mark.parametrize("mode", _MODE_CASES)
 def test_wrapper_constructs_on_mocked_mlu_with_default_ops_config(monkeypatch, mode: str):
     """MLU keeps the default ``fused_triton`` MoE row, but has no ``fused_triton`` MoE-LoRA row."""

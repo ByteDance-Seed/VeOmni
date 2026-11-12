@@ -1107,7 +1107,6 @@ def test_missing_checkpoint_trainer_state_does_not_assume_safe_mode(monkeypatch,
     callback = GlobalStateCallback.__new__(GlobalStateCallback)
     callback.trainer = trainer
     callback._read_current = lambda _: None
-    monkeypatch.setattr("veomni.checkpoint.legacy_v0_1_12.apply_legacy_global_state", lambda *_: None)
     monkeypatch.setattr("veomni.trainer.callbacks.global_state_callback.dist.is_initialized", lambda: False)
     with pytest.raises((ValueError, RuntimeError), match="trainer state|provenance"):
         callback.load_global_state()
@@ -1119,7 +1118,6 @@ def test_explicit_legacy_resume_cannot_bypass_required_provenance(monkeypatch):
     callback = GlobalStateCallback.__new__(GlobalStateCallback)
     callback.trainer = trainer
     callback._read_current = lambda _: None
-    monkeypatch.setattr("veomni.checkpoint.legacy_v0_1_12.apply_legacy_global_state", lambda *_: None)
     monkeypatch.setattr("veomni.trainer.callbacks.global_state_callback.dist.is_initialized", lambda: False)
     with pytest.raises((ValueError, RuntimeError), match="provenance"):
         callback.load_global_state()
