@@ -244,3 +244,69 @@ def test_deepgemm_rows_refuse_a_block_size_they_cannot_honor(block_size: int):
     require_deepgemm_block_size(128)
     with pytest.raises(ValueError, match="only block_size=128"):
         require_deepgemm_block_size(block_size)
+
+
+@pytest.mark.parametrize("shard_projection", [False, True])
+def test_a_quantizing_row_only_refuses_a_projection_that_is_its_own_fsdp_unit(shard_projection):
+    """``_is_sharded`` must fire on the ``basic_modules`` placement and nowhere else.
+
+    FSDP2 unshards a parameter in the *forward* of whatever unit owns it. A
+    quantizing row reads ``module.weight`` without calling ``forward``, so the
+    question is which unit owns the projection:
+
+    * Owned by its parent block -- the normal case. The parent's forward has already
+      run when the row is called, so the weight is a whole ``Parameter`` and the row
+      must proceed. Getting this wrong would break every QAT run.
+    * Listed in ``basic_modules``, so it is ``fully_shard``-ed on its own. Nothing
+      unshards it before the row reads it, so the row would multiply one rank's
+      slice and the shape checks would still pass on the global shape.
+
+    Written against real ``fully_shard`` on gloo rather than a mock, because the
+    distinction *is* FSDP2's behaviour -- a hand-built ``DTensor`` would prove only
+    that the type test works.
+    """
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    from veomni.ops.kernels.linear._module import _is_sharded, resolve_projection
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(64, 64, bias=False)
+            self.seen: list[bool] = []
+
+        def forward(self, x):
+            self.seen.append(_is_sharded(self.proj.weight))
+            return self.proj(x)
+
+    # ``fully_shard`` needs a process group; skip rather than fail when a plain
+    # ``pytest`` run has none. CI collects this file wholesale, so the guard is on
+    # the operation, not the device.
+    if not dist.is_available() or not dist.is_gloo_available():
+        pytest.skip("gloo is required to exercise fully_shard")
+
+    block = Block()
+    created = False
+    if not dist.is_initialized():
+        dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29571", rank=0, world_size=1)
+        created = True
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        if shard_projection:
+            fully_shard(block.proj, mesh=mesh)
+        fully_shard(block, mesh=mesh)
+        block(torch.randn(2, 64))
+
+        if shard_projection:
+            assert block.seen == [True], "basic_modules placement must be refused"
+            with pytest.raises(RuntimeError, match="read a sharded weight"):
+                resolve_projection("deepgemm_fp8", block.proj, torch.randn(2, 64))
+        else:
+            assert block.seen == [False], "a parent-owned projection must not be refused"
+            weight, shortcut = resolve_projection("deepgemm_fp8", block.proj, torch.randn(2, 64))
+            assert shortcut is None and weight.shape == (64, 64)
+    finally:
+        if created:
+            dist.destroy_process_group()

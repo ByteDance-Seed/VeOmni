@@ -79,10 +79,18 @@ def _is_sharded(weight: Tensor) -> bool:
     ``Tensor`` subclass -- so the type is checked by name to avoid importing it
     (``torch.distributed.tensor`` is not always available).
 
-    Only the DTensor case is treated as sharded. A ``Parameter`` FSDP2 has already
-    resharded in place also has local storage behind a global ``.shape``, but
-    telling that apart from an ordinary tensor needs a heuristic that would fire
-    on legitimate inputs, so it is left to the caller's own checks.
+    Verified against real ``fully_shard`` on gloo, in the two placements a
+    projection can have:
+
+    * Sharded as part of its parent block (the normal case): by the time a
+      quantizing row is called, the parent's forward has run its unshard hook, so
+      ``module.weight`` is a whole ``Parameter`` and this returns ``False``.
+    * Listed in ``basic_modules``, i.e. its own FSDP unit: nothing unshards it
+      before the row reads it, so ``module.weight`` is the ``DTensor`` and this
+      returns ``True`` -- which is the case the row must refuse.
+
+    ``tests/ops/linear/test_linear.py::test_a_quantizing_row_only_refuses_a_projection_that_is_its_own_fsdp_unit``
+    pins both.
     """
     return type(weight).__name__ == "DTensor"
 
