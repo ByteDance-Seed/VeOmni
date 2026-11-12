@@ -2,7 +2,12 @@
   {
     "name": "distributed-default-gloo-group",
     "suite": "unit",
-    "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_dist_utils_group.py"
+    ]
   },
   {
     "name": "npu-unit-01",
@@ -51,6 +56,16 @@
       "-s",
       "-x",
       "tests/parallel/ulysses/test_wan_t2v_ulysses.py"
+    ]
+  },
+  {
+    "name": "npu-selective-expert-cpu-clip-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_fsdp2_clip_grad_norm.py"
     ]
   },
   {
@@ -213,6 +228,16 @@
       "-s",
       "-x",
       "tests/checkpoints/"
+    ]
+  },
+  {
+    "name": "sparse-optimizer-state-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_multi_optimizer_sparse_lr.py"
     ]
   },
   {
@@ -473,6 +498,17 @@
       "-s",
       "-x",
       "tests/optim/test_swap_adamw_device.py"
+    ]
+  },
+  {
+    "name": "qwen38-cpu-offload-adamw-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_cpu_offload_adamw.py",
+      "tests/optim/test_cpu_offload_adamw_device.py",
+      "tests/optim/test_master_fp32_adamw.py"
     ]
   }
 ]

@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,7 @@ import torch.multiprocessing as mp
 from torch.distributed.tensor import DTensor
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter, runner_device_count
+from tests.tools.launch_utils import spawn_with_rendezvous
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 from veomni.models.seed_omni import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_CONFIG_REGISTRY
@@ -463,6 +465,323 @@ def test_the_hook_rebuilds_the_table_group_and_survives_a_restore():
 
     assert torch.equal(table.detach()[~mask], before[~mask]), "frozen rows decayed after a restore"
     assert table_group["weight_decay"] == 0.0, "the step hook must re-zero the group decay"
+
+
+@pytest.mark.parametrize("kind", ["master", "full", "offload"])
+@pytest.mark.parametrize("multi", [False, True])
+def test_image_row_decay_rejects_fp32_master_before_optimizer_mutation(kind, multi):
+    """Do not silently decay a compute copy that an FP32 master will overwrite."""
+    from veomni.optim.cpu_offload_adamw import CPUOffloadAdamW
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW
+    from veomni.optim.optimizer import MultiOptimizer
+
+    text_encoder = _build_modules(device=torch.device("cpu"), dtype=torch.float32)["qwen3_text_encoder"]
+    table = text_encoder.embed_tokens.weight
+    other = torch.nn.Parameter(torch.ones(1))
+    classes = {"master": MasterFP32AdamW, "full": FullFP32AdamW, "offload": CPUOffloadAdamW}
+    group = {"params": [table, other], "weight_decay": 0.5}
+    if kind == "offload":
+        group["cpu_offload"] = True
+    leaf = classes[kind]([group], lr=1e-2)
+    optimizer = MultiOptimizer(text_encoder, {"leaf": leaf}, ["leaf"]) if multi else leaf
+    before = table.detach().clone()
+    with pytest.raises(RuntimeError, match="row-wise weight decay.*FP32 master"):
+        text_encoder.configure_optimizer(optimizer)
+    assert len(leaf.param_groups) == 1
+    assert leaf.param_groups[0]["params"] == [table, other]
+    assert leaf.param_groups[0]["weight_decay"] == 0.5
+    assert not leaf._optimizer_step_pre_hooks
+    assert not leaf.state
+    assert torch.equal(table, before)
+
+
+def test_image_zero_row_decay_remains_supported_by_fp32_master():
+    """The unsupported combination requires nonzero row-specific decay."""
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+
+    text_encoder = _build_modules(device=torch.device("cpu"), dtype=torch.float32)["qwen3_text_encoder"]
+    table = text_encoder.embed_tokens.weight
+    optimizer = FullFP32AdamW([table], weight_decay=0.0)
+    text_encoder.configure_optimizer(optimizer)
+    assert optimizer.param_groups[0]["weight_decay"] == 0.0
+    assert not optimizer._optimizer_step_pre_hooks
+
+
+def test_image_row_mask_rejects_initialized_fp32_master_optimizer():
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+
+    encoder = _build_modules(device=torch.device("cpu"), dtype=torch.float32)["qwen3_text_encoder"]
+    table = encoder.embed_tokens.weight
+    optimizer = FullFP32AdamW([table], lr=1e-2, weight_decay=0.0)
+    table.grad = torch.ones_like(table)
+    optimizer.step()
+    before = table.detach().clone()
+    with pytest.raises(RuntimeError, match="requires a fresh FP32 master optimizer"):
+        encoder.configure_optimizer(optimizer)
+    assert "qwen3_image_row_mask" not in optimizer.param_groups[0]
+    assert torch.equal(table, before)
+
+
+def test_image_row_mask_rejects_multiple_optimizer_owners():
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+    from veomni.optim.optimizer import MultiOptimizer
+
+    encoder = _build_modules(device=torch.device("cpu"), dtype=torch.float32)["qwen3_text_encoder"]
+    table = encoder.embed_tokens.weight
+    first = FullFP32AdamW([table], weight_decay=0.0)
+    second = FullFP32AdamW([table], weight_decay=0.5)
+    optimizer = MultiOptimizer(encoder, {"first": first, "second": second}, ["first", "second"])
+    with pytest.raises(RuntimeError, match="multiple optimizer owners"):
+        encoder.configure_optimizer(optimizer)
+    assert "qwen3_image_row_mask" not in first.param_groups[0]
+    assert first.param_groups[0]["weight_decay"] == 0.0
+    assert second.param_groups[0]["weight_decay"] == 0.5
+    assert not first.state and not second.state
+
+
+@pytest.mark.parametrize("mode", ["same_mask", "text_to_image", "image_to_text", "changed_mask"])
+def test_image_row_mask_fp32_master_dcp_resume_contract(tmp_path, mode):
+    """Frozen-row history must not be restored across different row recipes."""
+    from types import SimpleNamespace
+
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+    from veomni.optim.optimizer import MultiOptimizer
+
+    def build(text_only=False, change_mask=False):
+        encoder = _build_modules(device=torch.device("cpu"), dtype=torch.float32)["qwen3_text_encoder"]
+        if text_only:
+            encoder._trainable_row_mask = None
+        elif change_mask:
+            encoder._trainable_row_mask = encoder._trainable_row_mask.clone()
+            encoder._trainable_row_mask[0] = ~encoder._trainable_row_mask[0]
+        table = encoder.embed_tokens.weight
+        leaf = FullFP32AdamW([table], lr=1e-2, weight_decay=0.0)
+        optimizer = MultiOptimizer(encoder, {"leaf": leaf}, ["leaf"])
+        encoder.configure_optimizer(optimizer)
+        return encoder, table, leaf, optimizer
+
+    source, source_table, source_leaf, source_opt = build(text_only=mode == "text_to_image")
+    source_table.grad = torch.ones_like(source_table)
+    if source._trainable_row_mask is not None:
+        source_table.grad[~source._trainable_row_mask] = 0
+    source_opt.step()
+    source_opt.zero_grad()
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": source_opt, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
+    target, target_table, target_leaf, target_opt = build(
+        text_only=mode == "image_to_text", change_mask=mode == "changed_mask"
+    )
+    before = {name: value.detach().clone() for name, value in target.state_dict().items()}
+
+    def load():
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": target_opt, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
+
+    if mode != "same_mask":
+        with pytest.raises(RuntimeError, match="layout|identity|group|recipe"):
+            load()
+        assert not target_leaf.state
+        for name, value in target.state_dict().items():
+            assert torch.equal(value, before[name])
+        return
+    load()
+    torch.testing.assert_close(target_table, source_table, rtol=0, atol=0)
+    for key in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(
+            target_leaf.state[target_table][key], source_leaf.state[source_table][key], rtol=0, atol=0
+        )
+    grad = torch.ones_like(source_table)
+    grad[~source._trainable_row_mask] = 0
+    source_table.grad, target_table.grad = grad, grad.clone()
+    source_opt.step()
+    target_opt.step()
+    torch.testing.assert_close(target_table, source_table, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mode", ["text_to_image", "image_to_text", "changed_mask"])
+def test_image_row_mask_fp32_master_direct_load_rejects_unproven_history(mode):
+    import copy
+
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+
+    source = _build_modules(device=torch.device("cpu"), dtype=torch.float32)["qwen3_text_encoder"]
+    target = _build_modules(device=torch.device("cpu"), dtype=torch.float32)["qwen3_text_encoder"]
+    if mode == "text_to_image":
+        source._trainable_row_mask = None
+    if mode == "image_to_text":
+        target._trainable_row_mask = None
+    if mode == "changed_mask":
+        target._trainable_row_mask = target._trainable_row_mask.clone()
+        target._trainable_row_mask[0] = ~target._trainable_row_mask[0]
+    source_table, target_table = source.embed_tokens.weight, target.embed_tokens.weight
+    old = FullFP32AdamW([source_table], lr=1e-2, weight_decay=0.0)
+    new = FullFP32AdamW([target_table], lr=1e-2, weight_decay=0.0)
+    source.configure_optimizer(old)
+    target.configure_optimizer(new)
+    source_table.grad = torch.ones_like(source_table)
+    old.step()
+    before = target_table.detach().clone()
+    with pytest.raises(RuntimeError, match="row-mask identity"):
+        new.load_state_dict(copy.deepcopy(old.state_dict()))
+    assert not new.state
+    assert torch.equal(target_table, before)
+
+
+def test_image_row_mask_fp32_master_direct_load_rejects_nonzero_decay():
+    import copy
+
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+
+    source = _build_modules(device=torch.device("cpu"), dtype=torch.float32)["qwen3_text_encoder"]
+    target = _build_modules(device=torch.device("cpu"), dtype=torch.float32)["qwen3_text_encoder"]
+    old = FullFP32AdamW([source.embed_tokens.weight], lr=1e-2, weight_decay=0.0)
+    new = FullFP32AdamW([target.embed_tokens.weight], lr=1e-2, weight_decay=0.0)
+    source.configure_optimizer(old)
+    target.configure_optimizer(new)
+    source.embed_tokens.weight.grad = torch.ones_like(source.embed_tokens.weight)
+    old.step()
+    state = copy.deepcopy(old.state_dict())
+    state["param_groups"][0]["weight_decay"] = 0.5
+    before = target.embed_tokens.weight.detach().clone()
+    with pytest.raises(RuntimeError, match="row-mask requires zero weight decay"):
+        new.load_state_dict(state)
+    assert not new.state and new.param_groups[0]["weight_decay"] == 0.0
+    assert torch.equal(target.embed_tokens.weight, before)
+
+
+def test_image_row_mask_fp32_master_direct_load_rejects_reordered_shared_group():
+    import copy
+
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+
+    source = _build_modules(device=torch.device("cpu"), dtype=torch.float32)["qwen3_text_encoder"]
+    target = _build_modules(device=torch.device("cpu"), dtype=torch.float32)["qwen3_text_encoder"]
+    source_table, target_table = source.embed_tokens.weight, target.embed_tokens.weight
+    source_other = torch.nn.Parameter(torch.ones_like(source_table))
+    target_other = torch.nn.Parameter(torch.ones_like(target_table))
+    old = FullFP32AdamW([source_table, source_other], lr=1e-2, weight_decay=0.0)
+    new = FullFP32AdamW([target_other, target_table], lr=1e-2, weight_decay=0.0)
+    source.configure_optimizer(old)
+    target.configure_optimizer(new)
+    source_other.grad = torch.ones_like(source_other)
+    old.step()
+    before = target_table.detach().clone()
+    with pytest.raises(RuntimeError, match="row-mask identity"):
+        new.load_state_dict(copy.deepcopy(old.state_dict()))
+    assert not new.state and torch.equal(target_table, before)
+
+
+def _row_decay_guard_worker(rank, world_size, scenario, native, endpoint):
+    """A local build failure must be coordinated by the real runtime wrapper."""
+    from types import SimpleNamespace
+
+    from veomni.models.model_runtime import VeOmniModelRuntime
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+
+    device_type = get_device_type() if native else "cpu"
+    backend = get_dist_comm_backend() if native else "gloo"
+    if native:
+        get_torch_device().set_device(rank)
+    dist.init_process_group(
+        backend, store=endpoint.connect(), rank=rank, world_size=world_size, timeout=timedelta(seconds=30)
+    )
+    try:
+        _init_parallel_state(dp_size=world_size, dp_shard_size=world_size, device_type=device_type)
+        text_encoder = _build_modules(device=torch.device("cpu"), dtype=torch.float32)["qwen3_text_encoder"]
+        table = text_encoder.embed_tokens.weight
+        cls = FullFP32AdamW if rank == 0 else torch.optim.AdamW
+        optimizer = cls([table], lr=1e-2, weight_decay=0.5)
+        before = table.detach().clone()
+
+        def build():
+            if rank == 0 and scenario == "build_failure":
+                raise RuntimeError("injected optimizer construction failure")
+            text_encoder.configure_optimizer(optimizer)
+
+        def unexpected_validate():
+            raise AssertionError("a failed optimizer build must not reach validation")
+
+        runtime = SimpleNamespace(_build_optimizer=build, _validate_optimizer_checkpoint_mode=unexpected_validate)
+        message = (
+            (
+                "injected optimizer construction failure"
+                if scenario == "build_failure"
+                else "row-wise weight decay.*FP32 master"
+            )
+            if rank == 0
+            else "another rank"
+        )
+        with pytest.raises(RuntimeError, match=message):
+            VeOmniModelRuntime._build_optimizer_checked(runtime)
+        if rank == 0:
+            assert optimizer.param_groups[0]["weight_decay"] == 0.5
+            assert not optimizer._optimizer_step_pre_hooks
+        assert not optimizer.state
+        assert torch.equal(table, before)
+        result = torch.ones((), dtype=torch.int32, device=f"{device_type}:{rank}" if native else "cpu")
+        dist.all_reduce(result)
+        assert result.item() == world_size
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+@pytest.mark.parametrize("scenario", ["guard_mismatch", "build_failure"])
+def test_image_row_decay_guard_coordinates_across_ranks(scenario):
+    spawn_with_rendezvous(_row_decay_guard_worker, args=(2, scenario, False), nprocs=2)
+
+
+@pytest.mark.launch_plan(
+    provider=lambda context: LaunchSpec(nproc=2, device="accelerator")
+    if context.capabilities.backend == "npu" and len(context.capabilities.devices) >= 2
+    else LaunchSpec(device="cpu")
+)
+@pytest.mark.parametrize("scenario", ["guard_mismatch", "build_failure"])
+def test_native_image_row_decay_guard_coordinates_across_ranks(scenario):
+    if not IS_NPU_AVAILABLE or get_device_type() != "npu" or get_torch_device().device_count() < 2:
+        if os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1":
+            pytest.fail("Two usable NPU devices are required for this native test")
+        pytest.skip("Requires two NPU devices")
+    spawn_with_rendezvous(_row_decay_guard_worker, args=(2, scenario, True), nprocs=2)
+
+
+def test_required_native_row_decay_guard_rejects_missing_npu(monkeypatch):
+    monkeypatch.setenv("VEOMNI_REQUIRE_NPU_TESTS", "1")
+    monkeypatch.setitem(
+        test_native_image_row_decay_guard_coordinates_across_ranks.__globals__, "IS_NPU_AVAILABLE", False
+    )
+    with pytest.raises(pytest.fail.Exception, match="Two usable NPU devices are required"):
+        test_native_image_row_decay_guard_coordinates_across_ranks("guard_mismatch")
+
+
+def test_native_row_decay_guard_forwards_rendezvous_last(monkeypatch):
+    import inspect
+    from types import SimpleNamespace
+
+    scope = test_native_image_row_decay_guard_coordinates_across_ranks.__globals__
+    monkeypatch.setitem(scope, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setitem(scope, "get_device_type", lambda: "npu")
+    monkeypatch.setitem(scope, "get_torch_device", lambda: SimpleNamespace(device_count=lambda: 2))
+    calls = []
+
+    def record(worker, args, *, nprocs):
+        endpoint = object()
+        bound = inspect.signature(worker).bind(0, *args, endpoint)
+        assert nprocs == 2 and bound.arguments["native"] is True and bound.arguments["endpoint"] is endpoint
+        calls.append(True)
+
+    monkeypatch.setitem(scope, "spawn_with_rendezvous", record)
+    test_native_image_row_decay_guard_coordinates_across_ranks("guard_mismatch")
+    assert calls == [True]
 
 
 def test_the_toy_recipe_converges():

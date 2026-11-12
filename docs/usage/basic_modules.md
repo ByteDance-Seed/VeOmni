@@ -377,18 +377,36 @@ model = build_parallelize_model(
 
 ### Optimizer and LR Scheduler
 
-`build_optimizer` supports three optimizer types via `model.optimizer.type`:
+`build_optimizer` supports the following optimizer types via `model.optimizer.type`:
 
 | Type | Description |
 |------|-------------|
 | `adamw` (default) | Standard `torch.optim.AdamW`. |
 | `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
+| `master_fp32_adamw` | FP32 master weights with BF16 first and second moments. |
+| `full_fp32_adamw` | FP32 master weights and FP32 first and second moments. |
+| `cpu_offload_adamw` | FP32 master weights and configurable moment precision, with selected parameter states on CPU. |
 | `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases and norms. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
+
+For `cpu_offload_adamw`, set `model.optimizer.cpu_offload_param_patterns` to
+full-parameter-name regular expressions selecting the optimizer states to
+offload. `cpu_offload_cpu_moment_dtype` and `cpu_offload_resident_moment_dtype`
+default to `float32`; `bfloat16` is an explicit lower-precision option. The
+compute parameters and gradients stay on their original device. Checkpoint
+resume for these optimizers requires the same proven parameter groups and
+parallel layout; see [checkpoint recovery](checkpoint.md).
 
 `model.optimizer.state_offload: cpu` (with `type: adamw`) keeps the AdamW moment
 states in host buffers — pinned by default, pageable when `state_offload_pin_memory`
 is `false` or a pinned allocation fails — and streams them to the device in
 batches, lowering peak device memory.
+
+This optimizer's moments use the parameter dtype and it does not create FP32
+master weights. BF16 parameters therefore have BF16 moments and BF16 parameter
+writes; select an optimizer with the desired precision policy when FP32 masters
+are required.
+`state_offload: cpu` cannot be combined with selective ExtraParallel parameter
+CPU offload (`cpu_offload_extra_parallel_names`).
 
 Muon-specific hyperparameters live under `model.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` continue to drive the AdamW sibling group.
 

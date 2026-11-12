@@ -212,6 +212,17 @@ class CheckpointCallbackTest(CheckpointCallback):
         pass
 
 
+def _prepare_optimizer_for_restore(runtime, total_steps, checkpoint_path):
+    """Construct fresh optimizer state for the proven MultiOptimizer loader."""
+    if getattr(runtime.optimizer, "_is_multi_optimizer", False):
+        from veomni.distributed.parallel_state import use_parallel_state
+
+        with use_parallel_state(runtime.model_name):
+            runtime.model.zero_grad(set_to_none=True)
+            runtime._build_optimizer_checked(checkpoint_path)
+            runtime._build_lr_scheduler(total_steps=total_steps)
+
+
 class CheckCallback(Callback):
     trainer: TrainerTest
 
@@ -244,7 +255,12 @@ class CheckCallback(Callback):
         ]
         assert changed_params, "Expected step-2 optimizer update to mutate model weights after step-1 save"
 
+        # The proven MultiOptimizer DCP path requires a fresh optimizer and
+        # scheduler. Reuse the distributed model, but clear pending gradients
+        # and rebuild those stateful consumers before restoring step 1.
         self.trainer.args.train.checkpoint.load_path = self.trainer.step_ckpt_path
+        total_steps = self.trainer.args.train_steps * self.trainer.args.train.num_train_epochs
+        _prepare_optimizer_for_restore(self.trainer.model, total_steps, self.trainer.step_ckpt_path)
         self.trainer.load()
 
         tied_weights_keys = None

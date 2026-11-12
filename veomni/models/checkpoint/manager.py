@@ -33,9 +33,88 @@ Two blobs, two owners:
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch.distributed as dist
+from torch.optim.lr_scheduler import LambdaLR
 
 from ...checkpoint import CheckpointerBase, build_checkpointer, layout
 from ...utils import helper
+from ...utils.dist_utils import raise_if_any_rank_failed
+
+
+def _scheduler_recipe(scheduler, optimizer):
+    """Stable schedule identity; LambdaLR state_dict omits its callable."""
+    from ...checkpoint.optimizer_resume_layout import _scheduler_functions
+    from ...optim.lr_scheduler import MultiLRScheduler
+
+    if scheduler is None:
+        return None
+    if type(scheduler) is MultiLRScheduler:
+        if set(scheduler) != set(optimizer.optimizers_dict):
+            raise RuntimeError("MultiOptimizer scheduler leaves differ")
+        return {
+            name: _scheduler_recipe(scheduler[name], optimizer.optimizers_dict[name]) for name in sorted(scheduler)
+        }
+    if getattr(optimizer, "_is_multi_optimizer", False) is True:
+        raise RuntimeError("MultiOptimizer requires a scheduler for each optimizer leaf")
+    if type(scheduler) is not LambdaLR or scheduler.optimizer is not optimizer:
+        raise RuntimeError("MultiOptimizer scheduler implementation or binding is unsupported")
+    return {"type": "LambdaLR", "functions": _scheduler_functions(scheduler)}
+
+
+def _validate_scheduler_checkpoint(saved, current, global_step):
+    """Require every scheduler leaf and its step to match a fresh runtime."""
+
+    def validate(left, right):
+        if not isinstance(left, dict) or not isinstance(right, dict) or set(left) != set(right):
+            raise RuntimeError("MultiOptimizer checkpoint scheduler layout differs")
+        found = "last_epoch" in right
+        if found:
+            initial, restored = right["last_epoch"], left["last_epoch"]
+            if type(initial) is not int or type(restored) is not int or restored != initial + global_step:
+                raise RuntimeError("MultiOptimizer checkpoint scheduler step differs from trainer step")
+        if "_step_count" in right:
+            initial_count, saved_count = right["_step_count"], left["_step_count"]
+            if (
+                type(initial_count) is not int
+                or type(saved_count) is not int
+                or saved_count != initial_count + global_step
+            ):
+                raise RuntimeError("MultiOptimizer checkpoint scheduler call count differs from trainer step")
+        for name, value in right.items():
+            if isinstance(value, dict):
+                child_found = validate(left[name], value)
+                if "last_epoch" not in right and not child_found:
+                    raise RuntimeError("MultiOptimizer checkpoint scheduler leaf has no provable step")
+                found = child_found or found
+            elif isinstance(value, (list, tuple)):
+                if not isinstance(left[name], (list, tuple)) or len(left[name]) != len(value):
+                    raise RuntimeError("MultiOptimizer checkpoint scheduler state shape differs")
+                if name != "_last_lr" and left[name] != value:
+                    raise RuntimeError("MultiOptimizer checkpoint scheduler configuration differs")
+            elif name not in {"last_epoch", "_step_count", "_get_lr_called_within_step"} and left[name] != value:
+                raise RuntimeError("MultiOptimizer checkpoint scheduler configuration differs")
+        return found
+
+    if not validate(saved, current):
+        raise RuntimeError("MultiOptimizer checkpoint scheduler has no provable step")
+
+
+def _validate_scheduler_optimizer_lrs(saved, optimizer):
+    """A restored scheduler and optimizer must agree on the next-step LR."""
+    for name, leaf in optimizer.optimizers_dict.items():
+        state = saved.get(name)
+        if not isinstance(state, dict) or not isinstance(state.get("_last_lr"), (list, tuple)):
+            raise RuntimeError("MultiOptimizer checkpoint scheduler LR state is missing")
+        last_lrs = state["_last_lr"]
+        if len(last_lrs) != len(leaf.param_groups):
+            raise RuntimeError("MultiOptimizer checkpoint scheduler LR groups differ")
+        for value, group in zip(last_lrs, leaf.param_groups, strict=True):
+            actual = group["lr"]
+            if hasattr(value, "numel") and value.numel() == 1:
+                value = value.item()
+            if hasattr(actual, "numel") and actual.numel() == 1:
+                actual = actual.item()
+            if type(value) not in (int, float) or type(actual) not in (int, float) or value != actual:
+                raise RuntimeError("MultiOptimizer checkpoint scheduler and optimizer LRs differ")
 
 
 if TYPE_CHECKING:
@@ -86,6 +165,10 @@ class ModelCheckpointManager:
         self.runtime = runtime
         self.config: "CheckpointConfig" = runtime.train_args.checkpoint
         self._last_saved_step: int = -1
+        self._loaded_optimizer_global_step = None
+        self._loaded_optimizer_generation = None
+        self._last_saved_optimizer_generation = None
+        self._loaded_checkpoint_path = None
         self.checkpointer: CheckpointerBase = build_checkpointer(
             ckpt_manager=self.config.manager,
             dist_backend=runtime.args.accelerator.fsdp_config.fsdp_mode,
@@ -186,6 +269,15 @@ class ModelCheckpointManager:
             "lr_scheduler": None if lr_scheduler is None else lr_scheduler.state_dict(),
         }
         extra_state.update(self.runtime.extra_state())
+        if getattr(self.runtime.optimizer, "_is_multi_optimizer", False) is True:
+            extra_state["_veomni_optimizer_global_step"] = int(state.global_step)
+            try:
+                extra_state["_veomni_scheduler_recipe"] = {
+                    "status": "supported",
+                    "value": _scheduler_recipe(lr_scheduler, self.runtime.optimizer),
+                }
+            except RuntimeError as exc:
+                extra_state["_veomni_scheduler_recipe"] = {"status": "unsupported", "reason": str(exc)}
         return extra_state
 
     def _load_extra_state(self, extra_state: Dict[str, Any]) -> None:
@@ -198,6 +290,11 @@ class ModelCheckpointManager:
 
     def load(self) -> None:
         """Restore model, optimizer and model-bound extra state from ``load_path``."""
+        self._last_saved_step = -1
+        self._last_saved_optimizer_generation = None
+        self._loaded_checkpoint_path = None
+        self._loaded_optimizer_global_step = None
+        self._loaded_optimizer_generation = None
         load_dir = self.load_dir()
         if load_dir is None:
             return
@@ -207,14 +304,73 @@ class ModelCheckpointManager:
             "model": self.runtime.model,
             "optimizer": self.runtime.optimizer,
             "extra_state": {},
+            "_veomni_scheduler_object": self.runtime.lr_scheduler,
         }
-        self.checkpointer.load(
-            load_dir,
-            state,
-            **self._checkpointer_kwargs(),
-        )
-        self._load_extra_state(state["extra_state"])
-        dist.barrier()
+        multi = getattr(self.runtime.optimizer, "_is_multi_optimizer", False) is True
+        error = None
+        try:
+            self.checkpointer.load(load_dir, state, **self._checkpointer_kwargs())
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "loading checkpoint")
+        error, step = None, None
+        try:
+            if multi:
+                if state.get("_veomni_optimizer_identity_verified") is not True:
+                    raise RuntimeError("MultiOptimizer checkpoint identity has not been proven")
+                step = state["extra_state"].pop("_veomni_optimizer_global_step", None)
+                if type(step) is not int or step < 0:
+                    raise RuntimeError("MultiOptimizer checkpoint is missing its proven trainer global step")
+                if "_veomni_scheduler_recipe" not in state["extra_state"]:
+                    raise RuntimeError("MultiOptimizer checkpoint scheduler identity is missing")
+                recipe = state["extra_state"].pop("_veomni_scheduler_recipe")
+                if (
+                    not isinstance(recipe, dict)
+                    or recipe.get("status") != "supported"
+                    or set(recipe) != {"status", "value"}
+                ):
+                    raise RuntimeError("MultiOptimizer checkpoint scheduler identity is unsupported")
+                if recipe["value"] != _scheduler_recipe(self.runtime.lr_scheduler, self.runtime.optimizer):
+                    raise RuntimeError("MultiOptimizer checkpoint scheduler identity differs")
+                saved_scheduler = state["extra_state"].get("lr_scheduler")
+                scheduler = self.runtime.lr_scheduler
+                if (scheduler is None) != (saved_scheduler is None) or (
+                    scheduler is not None and not isinstance(saved_scheduler, dict)
+                ):
+                    raise RuntimeError("MultiOptimizer checkpoint scheduler state is missing or incompatible")
+                if scheduler is not None:
+                    _validate_scheduler_checkpoint(saved_scheduler, scheduler.state_dict(), step)
+                    _validate_scheduler_optimizer_lrs(saved_scheduler, self.runtime.optimizer)
+            self._load_extra_state(state["extra_state"])
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "restoring trainer step and scheduler")
+        if multi:
+            generation = state.get("_veomni_optimizer_checkpoint_generation")
+            error = (
+                RuntimeError("MultiOptimizer checkpoint generation is missing")
+                if not isinstance(generation, str) or not generation
+                else None
+            )
+            raise_if_any_rank_failed(error, "checking restored MultiOptimizer generation")
+        try:
+            dist.barrier()
+        except BaseException:
+            optimizer = state.get("optimizer")
+            leaves = getattr(optimizer, "optimizers_dict", {})
+            targets = [optimizer, *(leaves.values() if isinstance(leaves, dict) else ())]
+            for leaf in targets:
+                abort = getattr(leaf, "checkpoint_abort_file_backed_state", None)
+                if callable(abort):
+                    try:
+                        abort()
+                    except Exception:
+                        pass  # Keep the original barrier error.
+            raise
+        if multi:
+            self._loaded_optimizer_global_step = step
+            self._loaded_optimizer_generation = generation
+        self._loaded_checkpoint_path = load_dir
         logger.info_rank0(f"Load distributed checkpoint from {load_dir} successfully!")
 
     def save_dcp(self, state: "TrainerState") -> None:
@@ -223,14 +379,42 @@ class ModelCheckpointManager:
         Only model-bound state goes in here. Job-level state — where the
         dataloader is, the rng — has its own writer.
         """
-        extra_state = self._extra_state(state)
-        helper.empty_cache()
-        self.checkpointer.save(
+        self._last_saved_optimizer_generation = None
+        if self._last_saved_step == state.global_step:
+            # A failed rewrite may already have invalidated the old DCP marker.
+            # A later export must not reuse the previous same-step receipt.
+            self._last_saved_step = -1
+        optimizer = self.runtime.optimizer
+        multi = getattr(optimizer, "_is_multi_optimizer", False) is True
+        error, extra_state = None, None
+        try:
+            extra_state = self._extra_state(state)
+        except BaseException as exc:
+            error = exc
+        if multi:
+            raise_if_any_rank_failed(error, "preparing MultiOptimizer model extra state")
+        elif error is not None:
+            raise error
+
+        def clear_cache(stage):
+            error = None
+            try:
+                helper.empty_cache()
+            except BaseException as exc:
+                error = exc
+            if multi:
+                raise_if_any_rank_failed(error, stage)
+            elif error is not None:
+                raise error
+
+        clear_cache("clearing cache before MultiOptimizer checkpoint save")
+        generation = self.checkpointer.save(
             self.config.save_path,
             {
                 "model": self.runtime.model,
                 "optimizer": self.runtime.optimizer,
                 "extra_state": extra_state,
+                "_veomni_scheduler_object": self.runtime.lr_scheduler,
             },
             global_steps=state.global_step,
             save_async=self.config.save_async,
@@ -239,8 +423,17 @@ class ModelCheckpointManager:
             save_timeout_seconds=self.config.save_timeout_seconds,
             **self._checkpointer_kwargs(),
         )
-        helper.empty_cache()
+        if multi:
+            error = (
+                RuntimeError("MultiOptimizer save did not return its checkpoint generation")
+                if not isinstance(generation, str) or not generation
+                else None
+            )
+            raise_if_any_rank_failed(error, "checking saved MultiOptimizer generation")
+        clear_cache("clearing cache after MultiOptimizer checkpoint save")
         dist.barrier()
+        if multi:
+            self._last_saved_optimizer_generation = generation
         self._last_saved_step = state.global_step
         logger.info_rank0(f"Distributed checkpoint saved at {self.save_dir(state)} successfully!")
 
@@ -294,6 +487,7 @@ class ModelCheckpointManager:
             model=self.runtime.model,
             save_path=self.lora_export_dir(state),
             adapter_name=adapter_name,
+            parallel_state=self.parallel_state,
         )
         helper.empty_cache()
         dist.barrier()
