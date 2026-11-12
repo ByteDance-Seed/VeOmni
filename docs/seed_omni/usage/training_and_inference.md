@@ -5,10 +5,10 @@ checkpoint conversion, training, resume, inference, and the graph debugging
 tools; the concepts behind them are in
 [Architecture](../design/architecture.md).
 
-> **Note:** On `main`, the in-tree runnable stand-in config and modules live
-> under `configs/seed_omni/fake_model/` (`veomni/models/seed_omni/modules/fake_model/`).
-> The `Janus` / `Qwen` / `Bagel` family paths shown in the examples below use
-> the model implementations on the `omniv2` branch (and follow-up model PRs).
+> **Note:** The in-tree runnable stand-in config and modules live under
+> `configs/seed_omni/fake_model/` (`veomni/models/seed_omni/modules/fake_model/`).
+> The `Janus` / `Qwen` / `Bagel` family paths in the examples below are the real
+> family configs.
 
 ## 1. Config layout
 
@@ -122,7 +122,7 @@ handles single- or multi-node runs):
 # In-tree stand-in config:
 bash train.sh tasks/omni/train_omni.py configs/seed_omni/fake_model/train/base.yaml
 
-# Janus family config (on omniv2 / follow-up model PRs):
+# Janus family config:
 bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus/train/base.yaml
 ```
 
