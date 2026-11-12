@@ -945,36 +945,6 @@ class AcceleratorConfig:
             self.extra_parallel_sizes.append(self.ep_size)
             self.extra_parallel_names.append("ep")
             self.extra_parallel_placement_innermost.append(self.ep_outside)
-        else:
-            # Already folded, but not necessarily from *this* `ep_size`. A
-            # per-module YAML overlay is applied by rebuilding the config from a
-            # dict that already carries the folded "ep" entry, so a module that
-            # raises `ep_size` gets the new field and the old entry -- and the
-            # mesh is built from the entry. A backbone that asked for
-            # `ep_size: 8` then reported 8 when read back but built a mesh of 1:
-            # every rank silently held all of that layer's experts.
-            #
-            # Skipping was right for the case the guard was written for, an
-            # asdict round-trip, where the two already agree. It is only when
-            # they disagree that one of them is stale, and then the explicit
-            # one is the one that was just set.
-            index = self.extra_parallel_names.index("ep")
-            folded_size = self.extra_parallel_sizes[index]
-            if folded_size != self.ep_size:
-                if folded_size != 1 and self.ep_size != 1:
-                    raise ValueError(
-                        f"ep_size={self.ep_size} and extra_parallel_sizes[{index}]={folded_size} both ask "
-                        'for expert parallelism at different widths. Set one of them: "ep" in '
-                        "extra_parallel_names is the same dimension as ep_size."
-                    )
-                # Whichever is not the default is the one that was asked for.
-                # Refresh the placement from the same fields rather than only
-                # the size, or an overlay that also moved `ep_outside` would be
-                # half-applied.
-                resolved = self.ep_size if self.ep_size != 1 else folded_size
-                self.ep_size = resolved
-                self.extra_parallel_sizes[index] = resolved
-                self.extra_parallel_placement_innermost[index] = self.ep_outside
 
         ep_size = dict(zip(self.extra_parallel_names, self.extra_parallel_sizes)).get("ep", 1)
         if (self.npu_ep_hccl_buffer_mib is not None or self.npu_ep_hccl_expansion_mode is not None) and ep_size <= 1:
