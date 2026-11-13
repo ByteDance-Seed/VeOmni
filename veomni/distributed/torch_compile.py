@@ -167,6 +167,61 @@ def validate_compile_runtime(
     validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
 
 
+#: Op rows whose kernels emit dtypes Inductor cannot lower.
+#:
+#: ``torchao_mxfp4`` materializes ``float8_e8m0fnu`` scale tensors, and Inductor's
+#: codegen has no lowering for that dtype. A runtime check cannot catch it, so the
+#: selection is refused here, by config field. Formats whose scales use a dtype
+#: Inductor knows (``torchao_nvfp4`` uses ``float8_e4m3fn`` plus an FP32
+#: per-tensor scale) stay out of this table.
+_UNCOMPILABLE_IMPLS: dict[str, str] = {
+    "linear_implementation": "torchao_mxfp4",
+    "swiglu_mlp_implementation": "torchao_mxfp4",
+}
+
+
+def _uncompilable_selections(ops) -> list[str]:
+    """Return the offending ``field=impl`` strings on one ops config, if any."""
+    if ops is None:
+        return []
+    return [
+        f"{field}={getattr(ops, field)!r}"
+        for field, impl in _UNCOMPILABLE_IMPLS.items()
+        if getattr(ops, field, None) == impl
+    ]
+
+
+def _reject_incompatible_ops(model: nn.Module) -> None:
+    """Reject op selections ``torch.compile`` cannot lower, at any config depth.
+
+    The walk covers nested configs because that is how the selections bind: a
+    multimodal root carries its text tower's ops under ``sub_configs``, and a
+    module resolves the selection from the config it was built with. A child-only
+    selection is real and must be caught, and the message names the path so the
+    offending level is unambiguous.
+    """
+    config = getattr(model, "config", None)
+    offending = _uncompilable_at(config, prefix="")
+    if offending:
+        raise RuntimeError(
+            "model.accelerator.torch_compile cannot be combined with "
+            f"{', '.join(offending)}: those rows emit float8_e8m0fnu scale tensors, which "
+            "Inductor cannot lower. Disable compilation or select a different row."
+        )
+
+
+def _uncompilable_at(config, *, prefix: str) -> list[str]:
+    """Collect offending selections on ``config`` and every sub-config below it."""
+    if config is None:
+        return []
+    found = [f"{prefix}{item}" for item in _uncompilable_selections(getattr(config, "ops_config", None))]
+    for name in getattr(config, "sub_configs", {}) or {}:
+        child = getattr(config, name, None)
+        if child is not None:
+            found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
+    return found
+
+
 def compile_decoder_blocks(
     model: nn.Module,
     compile_config: CompileConfig,
@@ -186,6 +241,7 @@ def compile_decoder_blocks(
         )
 
     validate_compile_model(model, compile_config, sequence_parallel_enabled, async_enabled)
+    _reject_incompatible_ops(model)
 
     compile_kwargs = {
         "fullgraph": compile_config.fullgraph,
