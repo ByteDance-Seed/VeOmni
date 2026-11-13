@@ -30,7 +30,7 @@ communication than necessary to get it.
 | Contiguous sharding, `cp_size` in {2, 4} verified | Zigzag / load-balanced sharding |
 | All-gather for full-resolution KV, compressed rows and compressor halos | P2P halos; multi-hop halos |
 | DeepSeek-V4 only, via an allow-list | Any other model |
-| GPU-only (`check_context_parallel_supported` rejects NPU) | Ascend/NPU CP |
+| GPU, and Ascend/NPU with the eager DSA operators | CANN DSA operators under CP |
 | `cp_size > 1` with `ulysses_size == 1` | Hybrid CP x Ulysses |
 | Training | KV cache and decode paths |
 | Correctness | Measured performance; `cp_size=8` |
@@ -46,8 +46,10 @@ the indexer independently — all three derive the shard's origin from
 
 The safety net for any such change is `tests/parallel/context_parallel/`, which
 compares forward output, input gradient and every parameter gradient against a
-single-rank baseline at `cp_size` 2 and 4, packed and unpacked, with and without
-the compressor. It needs four GPUs. `cp_size=8` has never been run.
+single-rank baseline at `cp_size` 2, and on CUDA also at 4, packed and unpacked,
+with and without the compressor. CUDA CI runs both topologies; NPU CI runs the
+two-rank case, where the packed-model branches do not execute. `cp_size=8` has
+never been run.
 
 ## Constraints the code enforces
 
@@ -56,13 +58,14 @@ the compressor. It needs four GPUs. `cp_size=8` has never been run.
 | `cp_size <= S / max(config.compress_rates)` | `plan_compressor_shard`, called by all three window compressors before their halo exchange | `ValueError` on the first forward |
 | `cp_size > 1` requires `ulysses_size == 1` | `ParallelState.__post_init__` and `AcceleratorConfig._resolve_topology` | `NotImplementedError` at launch |
 | the model type must implement CP | `check_context_parallel_supported`, from `build_foundation_model` and `build_omni_model` | `NotImplementedError` at model build |
-| CP is GPU-only | `check_context_parallel_supported` | `NotImplementedError` at model build on Ascend/NPU |
+| on Ascend/NPU, the model type must be `deepseek_v4` | `check_context_parallel_supported` | `NotImplementedError` at model build |
+| on Ascend/NPU, `dsa_indexer_implementation` and `dsa_attention_implementation`, when set, must be `eager` | `check_context_parallel_supported` | `NotImplementedError` at model build, only for an explicitly set non-`eager` value; an unset field is skipped (the field's default is `eager`) |
 | explicit `position_ids` under either sequence-parallel mode | `DeepseekV4Model.forward` | `ValueError` on the first forward |
 | the attention mask spans the full sequence | `DeepseekV4Attention.forward`, ahead of the KV all-gather | `ValueError` on the first forward |
 | no KV cache under CP | `DeepseekV4Attention.forward` | `NotImplementedError` |
 | shards are contiguous and equally sized, carrying global `position_ids` | not checkable from one rank; see below | silently wrong results |
 
-Two of these are worth more than a table row.
+Three of these are worth more than a table row.
 
 ### Sequence length and compression rate
 
@@ -118,6 +121,44 @@ defect on this branch: `arange(local_seq_len)` tells every rank its shard starts
 at position 0, which keeps every shape self-consistent while every rank above 0
 compresses the wrong rows and the indexer's canonical-position check admits the
 TileLang kernel on rank 0 alone. Hence the refusal rather than a default.
+
+### Ascend/NPU operator selections
+
+`check_context_parallel_supported` admits DeepSeek-V4 on Ascend/NPU, but only
+with both DSA operators on the eager path. The CANN adapters on either side of
+the sparse attention reject the geometry CP hands them:
+
+- `dsa_attention_implementation: cann` requires one KV row per query row. Under
+  CP a rank owns `L` queries while the KV buffer is all-gathered to `S_global`,
+  so the adapter sees `ori_kv.shape[1] != q.shape[1]` (and `query_offset != 0`)
+  and raises before the first compressed layer produces an output.
+- `dsa_indexer_implementation: cann` derives causal visibility from the query
+  row and only accepts selection ranges that match its own segment-causal plan.
+  CP supplies explicit `cu_seqlen_ks` / `cu_seqlen_ke` rebased onto the global
+  sequence without the slices those ranges would have to imply, so the adapter
+  raises instead of masking from the wrong origin — the same class of failure
+  the indexer's canonical-position check guards against.
+
+The rest of the NPU selections are CP-safe and stay on their kernels:
+`mhc_implementation: cann` sees per-token tensors with no sequence geometry, and
+`moe_implementation: fused_npu` / `cross_entropy_loss_implementation:
+chunk_loss` are unaffected. There is no separate CP configuration: a CP run is
+[`configs/text/deepseek_v4_npu.yaml`](../../configs/text/deepseek_v4_npu.yaml)
+with `dsa_indexer_implementation` and `dsa_attention_implementation` edited to
+`eager` and `cp_size` set above 1. Do the edit only for the CP run: the CANN
+DSA selections remain the right choice for non-CP runs, and switching them
+costs those runs their kernels.
+
+The gate validates that selection pair and nothing else. It cannot verify that
+the eager operators are correct or fast on Ascend, and
+`cp_size <= S / max(config.compress_rates)` applies unchanged. CANN CP support
+would be a kernel change — teaching both adapters the `query_offset` /
+`ori_kv` geometry and the explicit ranges — not a gate change; until then an
+NPU job that needs the CANN operators has to run with `cp_size=1`.
+
+`tests/parallel/context_parallel/` runs its two-rank eager case on the NPU
+suite, so the eager path's rank and local-query/global-KV geometry is checked on
+device; the four-rank and packed-model branches stay CUDA-only.
 
 ## Decisions that took more than one attempt
 

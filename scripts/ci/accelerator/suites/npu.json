@@ -94,6 +94,16 @@
     ]
   },
   {
+    "name": "npu-unit-07b",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/context_parallel/test_deepseek_v4_cp.py"
+    ]
+  },
+  {
     "name": "npu-unit-08",
     "suite": "unit",
     "args": [
