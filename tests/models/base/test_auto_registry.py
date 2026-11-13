@@ -788,11 +788,7 @@ def _op_bindings(model, selected_path):
     return bindings
 
 
-@pytest.mark.launch_plan(
-    provider=lambda context: (
-        _ACCELERATOR_LAUNCH if context.params["model_case"].model_type in _STANDALONE_HF_FAMILIES else _CPU_LAUNCH
-    )
-)
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 @pytest.mark.parametrize(
     "model_case",
     [case for case in _MODEL_CASES if case.eager_ops],

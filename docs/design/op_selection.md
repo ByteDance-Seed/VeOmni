@@ -462,7 +462,7 @@ Selecting `liger_kernel` requires that the model's forward pass provide
 `hidden_states=` and `weights=self.lm_head.weight` through
 `self.loss_function(...)` — the Liger fused linear+CE implementation does the
 projection itself and has no full logits tensor to fall back on. VeOmni's
-patched modeling files (`patched_modeling_*.py`) already do this. If a model
+standalone modeling files (`modeling_*.py`) already do this. If a model
 whose forward was not patched calls `self.loss_function` without these
 kwargs while `cross_entropy_loss_implementation="liger_kernel"`, the Liger
 row raises `RuntimeError` with a pointer to the patch pattern — it does

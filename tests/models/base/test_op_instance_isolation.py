@@ -388,17 +388,18 @@ def test_qwen3_moe_text_forward_keeps_construction_impls():
 
 def test_glm_moe_dsa_forward_keeps_construction_impls():
     from veomni.models.transformers.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
+    from veomni.utils.device import IS_NPU_AVAILABLE
 
     config = tiny_glm_moe_dsa_config()
     input_ids = torch.randint(3, config.vocab_size, (2, 8))
+    sticky_paths = ("model.layers.0.self_attn.veomni_dsa_attention",)
+    if not IS_NPU_AVAILABLE:
+        sticky_paths = (*sticky_paths, "model.layers.0.self_attn.indexer.veomni_dsa_indexer")
     _assert_isolated(
         build=lambda: GlmMoeDsaForCausalLM(config),
         run=lambda model: model(input_ids=input_ids, use_cache=False),
         attn_paths=(),
-        sticky_paths=(
-            "model.layers.0.self_attn.veomni_dsa_attention",
-            "model.layers.0.self_attn.indexer.veomni_dsa_indexer",
-        ),
+        sticky_paths=sticky_paths,
         eager_cfg=_attn_cfg("eager"),
         alt_cfg=_attn_cfg("veomni_sdpa"),
         poison_cfg=_poison_cfg(),

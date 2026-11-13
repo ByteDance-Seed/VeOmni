@@ -62,18 +62,23 @@ _REMOVED_PACKAGES = re.compile(
     r"veomni[./]" + r"kernels(?:[./]|\b)|"
     r"tests/" + r"kernels(?:/|\b)|"
     r"veomni[./]" + r"models_kernel(?:[./]|\b)|"
-    r"tests/" + r"models_kernel(?:/|\b)"
+    r"tests/" + r"models_kernel(?:/|\b)|"
+    r"veomni[./]" + r"patchgen(?:[./]|\b)|"
+    r"patchgen" + r"-pkg(?:/|\b)"
 )
+
+_REMOVED_CODE_IMPORTS = re.compile(r"\.generated\." + r"patched_modeling_|" + r"_patch_gen" + r"_config\b")
 
 
 def test_active_tree_uses_ops_architecture_paths():
-    """Prevent removed leftover kernel and models-kernel package paths from returning."""
+    """Prevent removed leftover kernel, models-kernel, and patchgen paths from returning."""
     stale: list[str] = []
     for path in _active_text_files():
         relative = path.relative_to(REPO_ROOT)
         text = path.read_text(encoding="utf-8")
+        check_code_imports = path.suffix in {".py", ".toml", ".yaml", ".yml"}
         for line_number, line in enumerate(text.splitlines(), start=1):
-            if _REMOVED_PACKAGES.search(line):
+            if _REMOVED_PACKAGES.search(line) or (check_code_imports and _REMOVED_CODE_IMPORTS.search(line)):
                 stale.append(f"{relative}:{line_number}: {line.strip()}")
 
     assert not stale, "Stale architecture paths:\n" + "\n".join(stale)

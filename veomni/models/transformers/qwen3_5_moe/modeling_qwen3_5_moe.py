@@ -1998,7 +1998,7 @@ class Qwen3_5MoeCausalLMOutputWithPast(CausalLMOutputWithPast):
 
 # Surface ``Qwen3_5MoeCausalLMOutputWithLogProbs`` so the patched multimodal
 # ``forward`` can return per-token log-probs while preserving ``rope_deltas``.
-# See qwen3_5_gpu_patch_gen_config.py for why @auto_docstring is skipped.
+# See modeling_qwen3_5.py for why @auto_docstring is skipped.
 @dataclass
 class Qwen3_5MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5MoeCausalLMOutputWithPast):
     r"""

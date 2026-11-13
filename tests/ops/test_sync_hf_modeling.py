@@ -71,11 +71,26 @@ def test_rewrite_relative_imports():
     assert "    from transformers.modeling_utils import PreTrainedModel" in out
 
 
-def test_repo_hf_modeling_check_strict():
+def test_repo_hf_modeling_check_strict(tmp_path: Path):
     assert sync_hf_modeling.main(["check", "--strict-version"]) == 0
 
-    bad_dir = Path(sync_hf_modeling.TRANSFORMERS_MODELS_ROOT).parent.parent
-    assert bad_dir.is_dir()
+    out_file = tmp_path / "modeling_llama.py"
+    assert sync_hf_modeling.main(["init", "transformers.models.llama.modeling_llama", "-o", str(out_file)]) == 0
+    assert out_file.is_file()
+    import shutil
+    import subprocess
+
+    ruff_bin = shutil.which("ruff")
+    if ruff_bin is not None:
+        proc = subprocess.run(
+            [ruff_bin, "check", "--select", "I,E,F,W", str(out_file)], capture_output=True, text=True
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    fake_hf = tmp_path / "fake_hf"
+    (fake_hf / "transformers").mkdir(parents=True)
+    (fake_hf / "transformers" / "__init__.py").write_text('__version__ = "5.99.0"\n', encoding="utf-8")
+    assert sync_hf_modeling.transformers_version_from_root(fake_hf) == "5.99.0"
 
 
 def test_three_way_merge_preserves_local_veomni_op_and_absorbs_upstream_edit():

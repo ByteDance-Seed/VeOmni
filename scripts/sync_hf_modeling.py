@@ -68,6 +68,22 @@ def installed_transformers_version() -> str | None:
         return None
 
 
+def transformers_version_from_root(hf_root: Path) -> str | None:
+    """Extract ``__version__`` from an uninstalled ``transformers`` source tree."""
+    for candidate in (
+        hf_root / "transformers" / "__init__.py",
+        hf_root / "src" / "transformers" / "__init__.py",
+    ):
+        if not candidate.is_file():
+            continue
+        match = re.search(
+            r'^__version__\s*=\s*["\']([^"\']+)["\']', candidate.read_text(encoding="utf-8"), re.MULTILINE
+        )
+        if match:
+            return match.group(1)
+    return None
+
+
 def parse_modeling_metadata(path: Path, header_lines: int = 60) -> ModelingMetadata | None:
     """Parse ``Upstream-Module`` and ``Base-Transformers-Version`` from file header."""
     head = "\n".join(path.read_text(encoding="utf-8").splitlines()[:header_lines])
@@ -141,10 +157,20 @@ def rewrite_relative_imports(source: str, upstream_module: str) -> str:
 
 
 def ruff_format_text(source: str, repo_root: Path = REPO_ROOT) -> str:
-    """Format Python source with ruff using repo configuration when ruff is available."""
+    """Sort imports and format Python source with ruff using repo configuration when available."""
     ruff_bin = shutil.which("ruff")
     if ruff_bin is None:
         return source
+    isort_proc = subprocess.run(
+        [ruff_bin, "check", "--select", "I", "--fix", "--stdin-filename", "modeling.py", "-"],
+        input=source,
+        text=True,
+        capture_output=True,
+        cwd=repo_root,
+        check=False,
+    )
+    if isort_proc.returncode == 0 and isort_proc.stdout:
+        source = isort_proc.stdout
     proc = subprocess.run(
         [ruff_bin, "format", "--stdin-filename", "modeling.py", "-"],
         input=source,
@@ -382,6 +408,8 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
 def cmd_init(args: argparse.Namespace) -> int:
     installed_ver = installed_transformers_version()
+    if not installed_ver:
+        raise RuntimeError("Cannot determine installed `transformers` version for Base-Transformers-Version header.")
     upstream_file = find_module_file(args.upstream_module)
     normalized = normalize_upstream_source(upstream_file.read_text(encoding="utf-8"), args.upstream_module)
     header = f"# Upstream-Module: {args.upstream_module}\n# Base-Transformers-Version: {installed_ver}\n\n"
@@ -393,7 +421,18 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_merge(args: argparse.Namespace) -> int:
-    new_ver = args.new_version or installed_transformers_version()
+    if args.new_version:
+        new_ver = args.new_version
+    elif args.new_hf_root is not None:
+        new_ver = transformers_version_from_root(args.new_hf_root)
+        if not new_ver:
+            raise RuntimeError(
+                f"Could not detect __version__ under --new-hf-root={args.new_hf_root}; pass --new-version explicitly."
+            )
+    else:
+        new_ver = installed_transformers_version()
+        if not new_ver:
+            raise RuntimeError("Cannot determine installed `transformers` version; pass --new-version explicitly.")
     new_roots = [args.new_hf_root] if args.new_hf_root else None
     metas = resolve_targets(args.target, root=args.root)
     any_conflicts = False
