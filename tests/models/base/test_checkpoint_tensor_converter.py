@@ -511,11 +511,9 @@ class TestGlmMoeDsaConverter:
             init_device="cpu",
             ops_implementation=make_eager_ops_config(),
         )
-        from veomni.utils.device import IS_NPU_AVAILABLE
-
-        expected_suffix = "_npu" if IS_NPU_AVAILABLE else "_gpu"
-        assert type(model).__module__.endswith(expected_suffix)
-        assert type(loaded).__module__.endswith(expected_suffix)
+        expected_mod = "veomni.models.transformers.glm_moe_dsa.modeling_glm_moe_dsa"
+        assert type(model).__module__ == expected_mod
+        assert type(loaded).__module__ == expected_mod
         load_model_weights(loaded, str(tmp_path), init_device="cpu")
 
         loaded_state = loaded.state_dict()
@@ -854,7 +852,7 @@ class TestDeepseekV4ConverterConvert:
         from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
             _build_default_deepseek_v4_fqn_to_index_mapping,
         )
-        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+        from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
             DeepseekV4ForCausalLM,
         )
 

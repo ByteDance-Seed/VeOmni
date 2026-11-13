@@ -9,9 +9,7 @@ This section documents VeOmni's integration with HuggingFace
 - [Flash Attention custom-name handling](veomni_flash_attention_op_adapter.md): explains why `_lazy_imports` fails for VeOmni custom attention names and how the local hub-kernel loader adapter resolves it.
 - [MoE weight loading](transformers_v5_moe_weight_loading.md): explains how VeOmni expects MoE expert weights to be laid out and documents qwen3_moe handling.
 - [Testing a new model](testing_new_model.md): SOP for adding registry/parity cases under `tests/models/` and `tests/e2e/test_e2e_parallel.py` when onboarding a new model.
-- [Upgrading the pin 5.9.0 → 5.16.1](upgrade_5_9_to_5_16.md): what upstream changed across the bump, how each affected patch config was migrated, and how to detect the same class of drift next time.
-
-The modeling code generation workflow (patchgen) has graduated out of this section — it is no longer tied to the transformers v5 cutover and now lives at [`design/patchgen.md`](../design/patchgen.md).
+- [Upgrading the pin 5.9.0 → 5.16.1](upgrade_5_9_to_5_16.md): historical notes on what upstream changed across the 5.9 → 5.16 bump and how to detect similar signature/init drift during future `scripts/sync_hf_modeling.py merge` upgrades.
 
 ```{toctree}
 :maxdepth: 1

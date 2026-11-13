@@ -33,16 +33,8 @@ from tests.models.tiny_configs import tiny_seed_oss_config as _tiny_config
 
 
 def _seed_oss_cls():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.seed_oss.modeling_seed_oss import SeedOssForCausalLM
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.seed_oss.generated.patched_modeling_seed_oss_npu import (
-            SeedOssForCausalLM,
-        )
-    else:
-        from veomni.models.transformers.seed_oss.generated.patched_modeling_seed_oss_gpu import (
-            SeedOssForCausalLM,
-        )
     return SeedOssForCausalLM
 
 

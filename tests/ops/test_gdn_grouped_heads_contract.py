@@ -22,22 +22,22 @@ from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextCo
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.configuration_base import as_veomni_config
-from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5GatedDeltaNet,
 )
-from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
     get_parallel_state as qwen3_5_get_parallel_state,
 )
-from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu import (
+from veomni.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeGatedDeltaNet,
 )
-from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu import (
+from veomni.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import (
     get_parallel_state as qwen3_5_moe_get_parallel_state,
 )
-from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu import (
+from veomni.models.transformers.qwen4_exp.modeling_qwen4_exp import (
     Qwen4ExpTextGatedDeltaNet,
 )
-from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu import (
+from veomni.models.transformers.qwen4_exp.modeling_qwen4_exp import (
     get_parallel_state as qwen4_exp_get_parallel_state,
 )
 
@@ -70,6 +70,9 @@ class _RecordingGdnOp:
         *,
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
+        cu_seqlens_list: list[int] | None = None,
+        chunk_indices: dict | None = None,
+        chunk_indices_list: dict | None = None,
     ):
         self._calls.append(
             {
@@ -178,47 +181,47 @@ def test_gdn_grouped_heads_dispatch_contract(
             return tuple(scatter_heads(value, seq_dim=1, head_dim=2, group=group) for value in (q, k, v, beta, decay))
 
         monkeypatch.setattr(
-            f"veomni.models.transformers.{model_name}.generated.patched_modeling_{model_name}_gpu.coalesced_gather_aligned",
+            f"veomni.models.transformers.{model_name}.modeling_{model_name}.coalesced_gather_aligned",
             coalesced_heads,
         )
 
         if model_name == "qwen3_5":
             monkeypatch.setattr(
-                "veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu.get_parallel_state",
+                "veomni.models.transformers.qwen3_5.modeling_qwen3_5.get_parallel_state",
                 lambda: fake_ps,
             )
             monkeypatch.setattr(
-                "veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu.gather_seq_scatter_heads",
+                "veomni.models.transformers.qwen3_5.modeling_qwen3_5.gather_seq_scatter_heads",
                 scatter_heads,
             )
             monkeypatch.setattr(
-                "veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu.gather_heads_scatter_seq",
+                "veomni.models.transformers.qwen3_5.modeling_qwen3_5.gather_heads_scatter_seq",
                 scatter_seq,
             )
         elif model_name == "qwen3_5_moe":
             monkeypatch.setattr(
-                "veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu.get_parallel_state",
+                "veomni.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe.get_parallel_state",
                 lambda: fake_ps,
             )
             monkeypatch.setattr(
-                "veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu.gather_seq_scatter_heads",
+                "veomni.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe.gather_seq_scatter_heads",
                 scatter_heads,
             )
             monkeypatch.setattr(
-                "veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu.gather_heads_scatter_seq",
+                "veomni.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe.gather_heads_scatter_seq",
                 scatter_seq,
             )
         elif model_name == "qwen4_exp":
             monkeypatch.setattr(
-                "veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu.get_parallel_state",
+                "veomni.models.transformers.qwen4_exp.modeling_qwen4_exp.get_parallel_state",
                 lambda: fake_ps,
             )
             monkeypatch.setattr(
-                "veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu.gather_seq_scatter_heads",
+                "veomni.models.transformers.qwen4_exp.modeling_qwen4_exp.gather_seq_scatter_heads",
                 scatter_heads,
             )
             monkeypatch.setattr(
-                "veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu.gather_heads_scatter_seq",
+                "veomni.models.transformers.qwen4_exp.modeling_qwen4_exp.gather_heads_scatter_seq",
                 scatter_seq,
             )
     else:
@@ -261,11 +264,11 @@ def test_gdn_precomputed_states_always_expand_qk_heads(
         return value, initial_state
 
     monkeypatch.setattr(
-        "veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu.causal_conv1d_update",
+        "veomni.models.transformers.qwen4_exp.modeling_qwen4_exp.causal_conv1d_update",
         lambda x, conv_state, weight, bias=None, activation=None: x,
     )
     monkeypatch.setattr(
-        "veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu.torch_recurrent_gated_delta_rule",
+        "veomni.models.transformers.qwen4_exp.modeling_qwen4_exp.torch_recurrent_gated_delta_rule",
         fake_recurrent,
     )
 

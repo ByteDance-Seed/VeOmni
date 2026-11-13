@@ -32,7 +32,6 @@ from tests.models.tiny_configs import (
     tiny_qwen2_config,
     tiny_qwen3_moe_config,
 )
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 HIDDEN_ACTS = ("silu", "swish", "gelu")
@@ -62,10 +61,7 @@ def _init_parameters(module: nn.Module) -> None:
 
 
 def _generated_cls(family: str, class_name: str):
-    suffix = "npu" if IS_NPU_AVAILABLE and family != "qwen2" else "gpu"
-    module = importlib.import_module(
-        f"veomni.models.transformers.{family}.generated.patched_modeling_{family}_{suffix}"
-    )
+    module = importlib.import_module(f"veomni.models.transformers.{family}.modeling_{family}")
     return getattr(module, class_name)
 
 

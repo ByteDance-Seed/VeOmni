@@ -139,7 +139,7 @@ For each changed file, check:
 ### VeOmni-Specific Checks
 - PR title format: `[{modules}] {type}: {description}`?
 - All comments and docstrings in English?
-- No auto-generated files (`veomni/models/transformers/*/generated/`) edited directly?
+- HF-derived `veomni/models/transformers/*/modeling_*.py` modules preserve `# Upstream-Module:` / `# Base-Transformers-Version:` headers (`make check-hf-modeling` passes) and multi-backend safety?
 - Tests: does the diff extend an existing CI-enumerated test, or add a new file that the workflow owning that path actually lists? Check the owning workflow rather than assuming — `tests/{data,checkpoints,ops,models}/` run wholesale in both unit workflows, `tests/parallel/context_parallel/` runs wholesale only in the GPU workflow, the e2e paths belong to `{gpu,npu}_e2e_test.yml`, and everything else must be listed file by file or it never runs. See `.agents/knowledge/testing.md`.
 - Ruff-compliant (`make quality` passes)?
 

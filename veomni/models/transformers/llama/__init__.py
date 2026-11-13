@@ -19,7 +19,7 @@ from veomni.models.registry import MODELING_REGISTRY
 
 @MODELING_REGISTRY.register("llama")
 def register_llama_modeling(architecture: str):
-    from .generated.patched_modeling_llama_gpu import (
+    from .modeling_llama import (
         LlamaForCausalLM,
         LlamaForSequenceClassification,
         LlamaForTokenClassification,

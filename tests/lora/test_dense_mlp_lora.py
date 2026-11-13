@@ -34,7 +34,7 @@ from veomni.utils.device import get_device_type
 def _qwen3_mlp(ops: OpsImplementationConfig) -> nn.Module:
     from transformers import Qwen3Config
 
-    from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3MLP
+    from veomni.models.transformers.qwen3.modeling_qwen3 import Qwen3MLP
 
     Qwen3Config = get_veomni_config_class(Qwen3Config)
 
@@ -44,7 +44,7 @@ def _qwen3_mlp(ops: OpsImplementationConfig) -> nn.Module:
 def _llama_mlp(ops: OpsImplementationConfig) -> nn.Module:
     from transformers import LlamaConfig
 
-    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaMLP
+    from veomni.models.transformers.llama.modeling_llama import LlamaMLP
 
     LlamaConfig = get_veomni_config_class(LlamaConfig)
 
@@ -62,7 +62,7 @@ def _llama_mlp(ops: OpsImplementationConfig) -> nn.Module:
 def _gemma3_mlp(ops: OpsImplementationConfig) -> nn.Module:
     from transformers import Gemma3TextConfig
 
-    from veomni.models.transformers.gemma3.generated.patched_modeling_gemma3_gpu import Gemma3MLP
+    from veomni.models.transformers.gemma3.modeling_gemma3 import Gemma3MLP
 
     Gemma3TextConfig = get_veomni_config_class(Gemma3TextConfig)
 
@@ -79,7 +79,7 @@ def _gemma3_mlp(ops: OpsImplementationConfig) -> nn.Module:
 def _deepseek_v4_mlp(ops: OpsImplementationConfig) -> nn.Module:
     from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
-    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import DeepseekV4MLP
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MLP
 
     DeepseekV4Config = get_veomni_config_class(DeepseekV4Config)
 

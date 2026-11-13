@@ -152,7 +152,6 @@ npu_aarch64 = [
 dev = [
   {include-group = "lint"},
   {include-group = "test"},
-  {include-group = "patchgen"},
 ]
 lint = [
   "pre-commit",
@@ -162,13 +161,6 @@ test = [
   "rich",
   "pytest",
   "expecttest",
-]
-# Sibling project under ./patchgen-pkg/ (build-time tool — regenerates
-# veomni/models/transformers/*/generated/; not imported at runtime).
-# Outer dir is `patchgen-pkg` because a flat `patchgen/` would shadow the
-# editable install via namespace-package discovery.
-patchgen = [
-  "patchgen>=0.1.0",
 ]
 # In default-groups so `uv sync` always installs transformers==5.16.1.
 # Kept out of [project.dependencies] so pip users are not forced into a
@@ -180,8 +172,7 @@ transformers-stable = [
 [tool.uv]
 # Range so local devs are not forced onto one weekly uv build. Reproducibility
 # is preserved because docker/CI install a concrete pin and use --locked /
-# --frozen. Concrete pins (docker/, .github/workflows/check_patchgen.yml)
-# must stay inside this range.
+# --frozen. Concrete pins in docker/ must stay inside this range.
 required-version = ">=0.9.8,<0.13"
 
 default-groups = ["transformers-stable"]
@@ -223,7 +214,6 @@ conflicts = [
 ]
 
 [tool.uv.sources]
-patchgen = { path = "patchgen-pkg", editable = true }
 magi-attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 # MagiAttention upstream designates this contributor-maintained support branch
 # for its arbitrary-mask FA4 packages. Dao-AILab does
@@ -355,7 +345,6 @@ version = {attr = "veomni._version.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]
-# patchgen-pkg* — sibling project, not bundled into the veomni wheel.
 # The trailing `*` matters: `packages.find` treats a bare name as that package
 # only, and pyproject-based discovery enables namespace packages, so bare
 # `tasks` / `scripts` still shipped `tasks.infer`, `scripts.ci` and friends as
@@ -368,15 +357,10 @@ exclude = [
   "veomni_patch*",
   "tasks*",
   "scripts*",
-  "patchgen-pkg*",
 ]
 
 [tool.setuptools.package-data]
 veomni = ["**/*.txt"]
-
-[tool.patchgen]
-search_root = "veomni/models/transformers"
-package_prefix = "veomni.models.transformers"
 
 [tool.ruff]
 target-version = "py311"
@@ -392,11 +376,9 @@ select = ["B", "C", "E", "F", "I", "W"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401", "F403", "F811"]
-# Patch gen configs reference names from add_post_import_block (for example,
-# rotate_half) that ruff can't resolve because they only exist as
-# string literals until patchgen materializes them into the generated file.
-"veomni/models/**/generated/*.py" = ["E402", "B007"]
-"veomni/models/**/*_patch_gen_config.py" = ["F821"]
+# Upstream HuggingFace modeling loops occasionally bind an unused loop index;
+# keep upstream loop variables intact to minimize 3-way merge noise.
+"veomni/models/transformers/*/modeling_*.py" = ["B007"]
 "veomni/ops/kernels/gated_delta_rule/vendor/**" = ["I001", "W291", "W292", "W293", "F401", "F811", "F841", "B028"]
 "tests/models/test_qwen_image_precision.py" = ["F401", "F811"]
 

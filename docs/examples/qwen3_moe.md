@@ -106,7 +106,7 @@ class Qwen3MoeExperts(nn.Module):
         )
 ```
 
-See `veomni/models/transformers/qwen3_moe/qwen3_moe_gpu_patch_gen_config.py` for the live patch. Selection comes from `model.ops_implementation.moe_implementation`.
+See `veomni/models/transformers/qwen3_moe/modeling_qwen3_moe.py` for the live implementation. Selection comes from `model.ops_implementation.moe_implementation`.
 
 3. Train qwen3 moe model
 ```

@@ -46,24 +46,14 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _qwen3_moe_classes():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.qwen3_moe.modeling_qwen3_moe import (
+        Qwen3MoeForCausalLM,
+        Qwen3MoeForQuestionAnswering,
+        Qwen3MoeForSequenceClassification,
+        Qwen3MoeForTokenClassification,
+        Qwen3MoeModel,
+    )
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_npu import (
-            Qwen3MoeForCausalLM,
-            Qwen3MoeForQuestionAnswering,
-            Qwen3MoeForSequenceClassification,
-            Qwen3MoeForTokenClassification,
-            Qwen3MoeModel,
-        )
-    else:
-        from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (
-            Qwen3MoeForCausalLM,
-            Qwen3MoeForQuestionAnswering,
-            Qwen3MoeForSequenceClassification,
-            Qwen3MoeForTokenClassification,
-            Qwen3MoeModel,
-        )
     return (
         Qwen3MoeForCausalLM,
         Qwen3MoeForSequenceClassification,
@@ -84,7 +74,7 @@ def _build_ours(config: Qwen3MoeConfig, ops: SimpleNamespace | None = None):
 
 
 def test_qwen3_moe_rope_reads_selected_impl(monkeypatch, selected_rope_impl):
-    from veomni.models.transformers.qwen3_moe.generated import patched_modeling_qwen3_moe_gpu as modeling
+    from veomni.models.transformers.qwen3_moe import modeling_qwen3_moe as modeling
 
     selected: list[tuple[str, str, str]] = []
 

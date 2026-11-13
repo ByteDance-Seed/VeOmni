@@ -34,7 +34,8 @@ jobs:
       - name: Run device api usage normativity in VeOmni/tests
         run: |
           python tests/special_sanity/check_device_api_usage.py -d tests
-      - name: Run ops architecture and generated signature guards
+      - name: Run ops architecture, HF modeling header, and signature guards
         run: |
+          python scripts/sync_hf_modeling.py check
           python -m pip install "pytest>=6.0.0,<8.0"
           PYTHONPATH=. pytest --noconftest tests/special_sanity/test_ops_architecture.py tests/ops/base/test_op_documentation.py tests/models/transformers/test_generated_call_site_signatures.py

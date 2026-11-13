@@ -53,18 +53,11 @@ VIDEO_TOKEN_ID = 121
 
 
 def _qwen3_5_classes():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
+        Qwen3_5ForCausalLM,
+        Qwen3_5ForConditionalGeneration,
+    )
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_npu import (
-            Qwen3_5ForCausalLM,
-            Qwen3_5ForConditionalGeneration,
-        )
-    else:
-        from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
-            Qwen3_5ForCausalLM,
-            Qwen3_5ForConditionalGeneration,
-        )
     return Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
 
 
@@ -330,9 +323,10 @@ def test_qwen3_5_packed_padding_matches_separate_logits_and_grads(ops_factory):
 
 
 def test_qwen3_5_npu_generated_attention_binds_ops_and_runs_eager_forward(monkeypatch):
-    from veomni.models.transformers.qwen3_5.generated import patched_modeling_qwen3_5_npu as npu_modeling
+    from veomni.models.transformers.qwen3_5 import modeling_qwen3_5 as npu_modeling
     from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu
 
+    monkeypatch.setattr(npu_modeling, "IS_NPU_AVAILABLE", True)
     monkeypatch.setattr(fla_npu, "precompute_varlen_metadata", lambda **kwargs: ([0, 6], None, None))
     torch.manual_seed(0)
     config = _tiny_text_config(layer_types=["full_attention", "full_attention"])

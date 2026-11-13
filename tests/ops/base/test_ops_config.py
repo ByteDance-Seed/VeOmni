@@ -967,7 +967,7 @@ def test_direct_model_validates_final_ops_before_hf_initialization(monkeypatch, 
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.models.diffusers.ltx2_3.ltx_transformer.modeling_ltx2_3_transformer import LTXVideoTransformerModel
     from veomni.models.transformers.flux.modeling_flux import FluxModel
-    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
+    from veomni.models.transformers.llama.modeling_llama import LlamaForCausalLM
 
     monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
     monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)

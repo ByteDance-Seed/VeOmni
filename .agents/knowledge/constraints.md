@@ -17,22 +17,22 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
    - Mismatches fail explicitly under the VeOmni backend. Set `MODELING_BACKEND=hf`
      only when loading the upstream HuggingFace class without VeOmni model kernels.
 
-3. **Patchgen-generated files must not be edited manually**
-   - Files under `veomni/models/transformers/*/generated/` are created by the `patchgen` CLI (entry point installed by the `patchgen` package).
-   - Manual edits are silently overwritten on the next patchgen run.
-   - To change generated behavior, edit the patch spec (`patch_spec.py`) or the modeling patch file (`modeling_*_patch.py`).
+3. **Standalone HF-derived modeling files carry upstream tracking headers**
+   - Every HuggingFace-derived model under `veomni/models/transformers/<m>/` ships a single, self-contained `modeling_<m>.py` file with `# Upstream-Module: transformers.models.<m>.modeling_<m>` and `# Base-Transformers-Version: 5.16.1` headers (validated by `scripts/sync_hf_modeling.py check` / `make check-hf-modeling`).
+   - Do not split HF-derived models into separate `_gpu` and `_npu` files. Use instance-local `VeomniOp` handles (`veomni/ops/registry.py`) for accelerator dispatch, and gate rare structural NPU-only differences explicitly with `IS_NPU_AVAILABLE` (never `not IS_CUDA_AVAILABLE`, which breaks ROCm and MLU).
 
 4. **Transformers version: pinned to v5.16.1**
    - VeOmni installs `transformers==5.16.1` via the `transformers-stable`
      default dependency group in `pyproject.toml`.
-   - The legacy v4 path was removed; all modeling under
-     `veomni/models/transformers/<m>/` is patchgen-generated.
+   - The legacy v4 path and `patchgen` codegen DSL were removed; all HF-derived
+     modeling under `veomni/models/transformers/<m>/` lives directly in
+     `modeling_<m>.py`.
    - `is_transformers_version_greater_or_equal_to()` from
      `veomni/utils/import_utils.py` is retained only for forward-looking
      gates (for HF APIs newer than the current pin) — do **not** add new
      version gates for versions `<= 5.16.1` (the legacy `>= 5.0.0` …
      `>= 5.15.x` interval is dead code).
-   - Patchgen regeneration must be done with `transformers==5.16.1` installed.
+   - When upgrading `transformers`, run `python scripts/sync_hf_modeling.py merge --old-hf-root <old-hf>` to 3-way merge upstream changes across all HF-derived `modeling_<m>.py` files.
 
 ## Distributed Training
 
@@ -236,7 +236,7 @@ Core files:
    - Each family that rounds operands owns a `qat` row (`linear` `standard`/`grouped`, `swiglu_mlp`, `moe_experts`), stored KV/indexer activations round through the `kv_round` family, and third-party formats register further rows on the same families. Modeling builds one `VeomniOp` per site and never passes a recipe string through call signatures.
    - The **variant** is the tensor contract or the model's recipe; the **implementation** is the backend. Never encode geometry in an implementation name, and never make `eager` a variant -- it is an implementation under every variant. A model-specific geometry belongs in a model-named variant directory beside the generic one, exactly as `rms_norm/deepseek_v4` and `rope/deepseek_v4` already do. `kv_round` follows that: `standard` takes `block_size`/`quant_features`, `deepseek_v4` fixes its two geometries and takes `rope_features`, and both register `none` + `eager` + `triton`. `none` exists because this family's reference row rounds, so "off" needs a name; do not model "off" as a missing handle — that forces every call site to branch.
    - Recipe *parameters* travel with the call, not in the name: `block_size`, `scale_fmt`, `quant_features`, `rope_features`, `expert_dtype`. DeepSeek-V4 rounds window KV in 64-wide FP8 groups over the NoPE prefix, indexer logits over whole 128-wide heads, and dense GEMM operands in 128-wide tiles; encoding those in the name would multiply rows without changing what the kernel does.
-   - Do not re-implement a row's rounding in modeling, and do not import a specific implementation module from a patchgen config to do it. If a model path cannot call the row, that path simply does not quantize — it must not reach into `veomni.ops.kernels.<family>.<impl>`.
+   - Do not re-implement a row's rounding in modeling, and do not import a specific implementation module from `modeling_<m>.py` to do it. If a model path cannot call the row, that path simply does not quantize — it must not reach into `veomni.ops.kernels.<family>.<impl>`.
    - A non-SiLU activation means different things in the two families, and only one of them needs a new kernel. **Routed experts:** the activation is *inside* the grouped-GEMM kernel (`aten.silu` three times in the forward, `aten.silu_backward` twice in the backward; the TileLang `qat` rows are shaped the same), so another activation falls back to `merged_experts_act_fn_forward`, a Python loop that cannot reach the family row. `reject_quantizing_act_fn(self)` refuses a quantizing selection there, reading the module's `use_swiglu_mlp` because these experts are plain `nn.Module` objects with no config reference. **Shared expert:** the activation is *between* three independent GEMMs -- `silu_mul` is elementwise and the row only quantizes the GEMM operands -- so the activation has nothing to do with whether it can quantize; `swiglu_mlp/standard/qat.py` is merely hard-coded to `silu_mul`. Supporting another activation there is a small parameterization, not a new kernel family. Both are tracked in #1430. The silence is closed at the **config layer**, not in modeling: `configuration_base._reject_quantized_swiglu_on_an_unfused_activation` refuses a quantizing `swiglu_mlp` selection whose activation is outside `swiglu_mlp.FUSED_ACTIVATIONS`, so the error fires at load time instead of the row being quietly bypassed on step one. It runs inside `collect()`, which already walks `sub_configs`, so a VLM's `text_config` is covered; guard it with `hasattr(config, "num_hidden_layers")` or a Gemma-family `vision_config` (GELU-tanh, no `swiglu_mlp` at all) would be rejected by mistake. Do not re-add a per-model activation check — that is the same rule copied N times, and it was already wrong once when `A and B` short-circuited before the check could run.
    - A quantizing row must fake-quantize exactly what deployment rounds and nothing else. Adding a projection to a `qat` row, or dropping one, changes the trained numerics silently -- `tests/models/transformers/deepseek_v4/test_deepseek_v4_qat.py` pins both the quantized and the unquantized sets, and fails on any site it has not been told about.
    - A quantizing row refuses a wrapped projection (LoRA keeps the base layer at `LoraLinear.base_layer`). Scope that guard to the quantizing rows (`swiglu_mlp.QUANTIZING_IMPLS`), never to "impl != eager": `liger_kernel` is the GPU/MLU default and keeps the projection-module fallback.

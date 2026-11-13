@@ -31,7 +31,7 @@ veomni/
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
 │   ├── context_parallel/  DeepSeek-V4 sparse-attention CP: window sharding and collectives
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
-├── models/      Model loading, patchgen configs, and kernel-aware modeling
+├── models/      Model loading, standalone HF-derived modeling, and kernel-aware modules
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── registry.py     Import-time model/config/processor registries
 │   ├── model_runtime.py  VeOmniModelRuntime: the model-bound half of a job
@@ -82,9 +82,6 @@ veomni/
 │                        subpackage, e.g. kv_round/deepseek_v4)
 ├── lora/               LoRA / PEFT injection: linear + MoE-expert adapters,
 │                       DCP + HF-adapter save/load, target mapping
-├── patchgen/           Patch specs + codegen driver consumed by the `patchgen`
-│                       CLI, which is a separate package under patchgen-pkg/
-│                       (installed via the `patchgen` dependency group)
 ├── schedulers/         LR scheduler implementations (flow matching)
 ├── trainer/            Training loop implementations
 │   ├── base.py         BaseTrainer (ABC): VeOmniModelRuntime + the job-bound

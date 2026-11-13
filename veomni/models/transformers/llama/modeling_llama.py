@@ -1,0 +1,590 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Upstream-Module: transformers.models.llama.modeling_llama
+# Base-Transformers-Version: 5.16.1
+
+from collections.abc import Callable
+from functools import partial
+
+import torch
+from torch import nn
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.generation import GenerationMixin
+from transformers.integrations import use_kernel_forward_from_hub
+from transformers.modeling_layers import (
+    GenericForQuestionAnswering,
+    GenericForSequenceClassification,
+    GenericForTokenClassification,
+    GradientCheckpointingLayer,
+)
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+    SequenceClassifierOutputWithPast,
+)
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
+from transformers.utils.deprecation import deprecate_kwarg
+from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
+from transformers.utils.output_capturing import capture_outputs
+
+from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
+
+# Additional imports for patches
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
+from veomni.models.utils.mask_utils import create_causal_mask
+from veomni.ops import VeomniOp
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
+
+
+logger = logging.get_logger(__name__)
+
+
+# ======================================================================
+# [MODIFIED CLASS] LlamaRMSNorm
+# Methods patched: __init__, forward
+# ======================================================================
+
+
+@use_kernel_forward_from_hub("RMSNorm")
+class LlamaRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps: float = 1e-6, config=None) -> None:
+        nn.Module.__init__(self)
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+        impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+class LlamaRotaryEmbedding(nn.Module):
+    @deprecate_kwarg("device", version="5.18")
+    def __init__(self, config: LlamaConfig, device=None):
+        super().__init__()
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+
+        self.rope_type = self.config.rope_parameters["rope_type"]
+        rope_init_fn: Callable = self.compute_default_rope_parameters
+        if self.rope_type != "default":
+            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
+
+        self.inv_freq = nn.Buffer(inv_freq, persistent=False)
+        self.original_inv_freq = nn.Buffer(inv_freq.clone(), persistent=False)
+
+    @staticmethod
+    @deprecate_kwarg("device", version="5.18")
+    def compute_default_rope_parameters(config: LlamaConfig, device=None, **kwargs) -> tuple[torch.Tensor, float]:
+        """
+        Computes the inverse frequencies according to the original RoPE implementation
+        Args:
+            config ([`~transformers.PreTrainedConfig`]):
+                The model configuration.
+        Returns:
+            Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+            post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
+        """
+        base = config.rope_parameters["rope_theta"]
+        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+
+        attention_factor = 1.0  # Unused in this type of RoPE
+        # Compute the inverse frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        return inv_freq.to(device), attention_factor
+
+    @torch.no_grad()
+    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+    def forward(self, x, position_ids):
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1).to(dtype=torch.float, device=x.device)
+        )
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        # Disable any outside autocast context if any, to really force fp32
+        with maybe_autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+# ======================================================================
+# [MODIFIED CLASS] LlamaMLP
+# Methods patched: __init__, forward
+# ======================================================================
+
+
+class LlamaMLP(nn.Module):
+    def __init__(self, config):
+        nn.Module.__init__(self)
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+
+    def forward(self, x):
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+            return self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                self.up_proj.weight,
+                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+                self.down_proj.weight,
+                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+            )
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Unpack[TransformersKwargs],
+):
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+
+
+# ======================================================================
+# [MODIFIED CLASS] LlamaAttention
+# Methods patched: forward, __init__
+# ======================================================================
+
+
+class LlamaAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
+    def __init__(self, config: LlamaConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = True
+
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        )
+        # Bind instance-local rope and attention VeomniOps
+        self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
+
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+        attn_output, attn_weights = self.veomni_attn(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
+# ======================================================================
+# [MODIFIED CLASS] LlamaDecoderLayer
+# Methods patched: __init__
+# ======================================================================
+
+
+class LlamaDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+        self.mlp = LlamaMLP(config)
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        # Self Attention
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+@auto_docstring
+class LlamaPreTrainedModel(PreTrainedModel):
+    config: LlamaConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["LlamaDecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    _supports_flex_attn = True
+
+    _can_compile_fullgraph = True
+    _supports_attention_backend = True
+    _can_record_outputs = {
+        "hidden_states": LlamaDecoderLayer,
+        "attentions": LlamaAttention,
+    }
+
+
+# ======================================================================
+# [MODIFIED CLASS] LlamaModel
+# Methods patched: __init__, forward
+# ======================================================================
+
+
+@auto_docstring
+class LlamaModel(LlamaPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList(
+            [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        self.gradient_checkpointing = False
+
+        self.post_init()
+
+    # ================================================================
+    # Patch: LlamaModel.forward
+    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+    #    into ``veomni.models.utils.mask_utils.create_causal_mask`` so packed
+    #    sequences build an isolated mask once in the model forward
+    # ================================================================
+    @merge_with_config_defaults
+    @capture_outputs
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPast:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        if position_ids is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.unsqueeze(0)
+
+        # --- Patch.1 ---
+        causal_mask = create_causal_mask(
+            **{
+                **kwargs,
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+        )
+        # --- Patch.1 ---
+
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_embeddings=position_embeddings,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                **kwargs,
+            )
+
+        hidden_states = self.norm(hidden_states)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+        )
+
+
+# ======================================================================
+# [MODIFIED CLASS] LlamaForCausalLM
+# Methods patched: __init__, forward
+# ======================================================================
+
+
+@auto_docstring
+class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tp_plan = {"lm_head": "colwise_gather_output"}
+    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _fsdp_plan = {"lm_head": "keep_full_weight"}
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = LlamaModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        impl = config.ops_config.cross_entropy_loss_implementation
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+        self.post_init()
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> CausalLMOutputWithPast:
+        r"""
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of input tokens in the sequence. This is
+            retained explicitly for callers that pass it positionally.
+        """
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+
+        loss = None
+        logits = None
+        fused_linear_aux = None
+        if labels is not None:
+            loss, logits, fused_linear_aux = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
+        else:
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        return CausalLMOutputWithLogProbs(
+            loss=loss,
+            logits=logits,
+            fused_linear_aux=fused_linear_aux,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+# ======================================================================
+# [MODIFIED CLASS] LlamaForSequenceClassification
+# Methods patched: __init__, forward
+# ======================================================================
+
+
+class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        impl = config.ops_config.cross_entropy_loss_implementation
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForSequenceClassificationLoss, op=self.veomni_ce)
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        outputs = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = outputs.last_hidden_state
+        logits = self.score(hidden_states)
+
+        loss = None
+        if labels is not None:
+            loss, _, _ = self.loss_function(
+                logits=None,
+                labels=labels,
+                num_labels=self.num_labels,
+                hidden_states=hidden_states,
+                weights=self.score.weight,
+                **kwargs,
+            )
+
+        return SequenceClassifierOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+class LlamaForQuestionAnswering(GenericForQuestionAnswering, LlamaPreTrainedModel):
+    base_model_prefix = "transformer"  # For BC, where `transformer` was used instead of `model`
+
+
+class LlamaForTokenClassification(GenericForTokenClassification, LlamaPreTrainedModel): ...
+
+
+__all__ = [
+    "LlamaForCausalLM",
+    "LlamaModel",
+    "LlamaPreTrainedModel",
+    "LlamaForSequenceClassification",
+    "LlamaForQuestionAnswering",
+    "LlamaForTokenClassification",
+]

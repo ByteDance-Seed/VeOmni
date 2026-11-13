@@ -13,14 +13,10 @@ from transformers import Qwen4ExpConfig
 
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.models.configuration_base import as_veomni_config
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 def _load_text_model_class():
-    backend = "npu" if IS_NPU_AVAILABLE else "gpu"
-    module = importlib.import_module(
-        f"veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_{backend}"
-    )
+    module = importlib.import_module("veomni.models.transformers.qwen4_exp.modeling_qwen4_exp")
     return module.Qwen4ExpTextModel
 
 

@@ -32,7 +32,7 @@ from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torc
 _CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 
-_PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
+_PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.modeling_deepseek_v4"
 
 
 def _load_dsv4_toy_config(**ops_overrides):
@@ -83,7 +83,7 @@ def _run_deepseek_v4_attention_sp_fw_bw(
     )
 
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as dsv4
 
     sp_state = _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type, name="sp")
     dp_state = _init_parallel_state(dp_size=world_size, ulysses_size=1, device_type=device_type, name="dp")
@@ -227,7 +227,7 @@ def _run_deepseek_v4_indexer_sp_equivalence(rank: int, world_size: int, init_fil
     )
 
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
     sp_state = _init_parallel_state(dp_size=1, ulysses_size=world_size, device_type=device_type, name="sp")

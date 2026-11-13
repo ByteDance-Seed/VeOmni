@@ -462,7 +462,7 @@ Selecting `liger_kernel` requires that the model's forward pass provide
 `hidden_states=` and `weights=self.lm_head.weight` through
 `self.loss_function(...)` — the Liger fused linear+CE implementation does the
 projection itself and has no full logits tensor to fall back on. VeOmni's
-patched modeling files (`patched_modeling_*.py`) already do this. If a model
+standalone modeling files (`modeling_*.py`) already do this. If a model
 whose forward was not patched calls `self.loss_function` without these
 kwargs while `cross_entropy_loss_implementation="liger_kernel"`, the Liger
 row raises `RuntimeError` with a pointer to the patch pattern — it does
@@ -624,7 +624,7 @@ supported values are `triton` and `eager`.
 - Config base class: `veomni/models/configuration_base.py` — `VeOmniPretrainedConfig`, `config.ops_config`
 - Unified registry: `veomni/ops/registry.py` — `register_op()`, `resolve_op()`, `VeomniOp`
 - Backend registration: `veomni/ops/kernels/{rms_norm,rope,swiglu_mlp,linear}/__init__.py`
-- Model integration: `veomni/models/transformers/{model}/*_patch_gen_config.py`
+- Model integration: `veomni/models/transformers/{model}/modeling_{model}.py`
 
 ---
 
@@ -757,7 +757,7 @@ CANN and `torch_npu` stack to enable the fused activation.
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
 - Registration: `veomni/ops/kernels/moe_experts/__init__.py`
 - Config base class: `veomni/models/configuration_base.py` — `config.ops_config.moe_implementation`
-- Model integration: `veomni/models/transformers/*/*_patch_gen_config.py`
+- Model integration: `veomni/models/transformers/*/modeling_*.py`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 
 ---

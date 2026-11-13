@@ -33,7 +33,7 @@ Read on demand:
 - **Search Before You Act**: On unexpected behavior, search codebase + check constraints + review `git log` before attempting fixes.
 - **Planning Discipline**: Complex tasks (multi-file, >30 min) -> write a plan with the agent's todo/plan tool. The plan must state which skills will be used (e.g. `/veomni-develop` + `/veomni-review`). Simple tasks -> just do them.
 - **Cross-modality Awareness**: Changes in shared code (`BaseTrainer`, `data_collator`, `distributed/`) affect all modalities.
-- **No Patchgen Edits**: Never edit files under `veomni/models/transformers/*/generated/`.
+- **Standalone HF Modeling**: HF-derived models live in a single `veomni/models/transformers/<m>/modeling_<m>.py` file with `# Upstream-Module:` and `# Base-Transformers-Version:` headers. Use `scripts/sync_hf_modeling.py` (`init` / `diff` / `check` / `merge`) to inspect upstream diffs or upgrade `transformers`.
 
 ---
 
@@ -57,12 +57,12 @@ See `.agents/knowledge/uv.md` and `.agents/knowledge/constraints.md`.
 
 ```bash
 source .venv/bin/activate
-make style          # ruff fix + format
-make quality        # ruff check (CI gate)
-make commit         # style + quality
-make patchgen       # regenerate model patches
-pytest tests/       # all tests
-pytest tests/<mod>/ # specific module
+make style             # ruff fix + format
+make quality           # ruff check (CI gate)
+make commit            # style + quality
+make check-hf-modeling # verify HF modeling headers against transformers pin
+pytest tests/          # all tests
+pytest tests/<mod>/    # specific module
 ```
 
 ---
@@ -103,8 +103,8 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 | Feature / refactoring | `/veomni-develop` |
 | Bug fix / debugging | `/veomni-debug` |
 | Code review (before opening a PR) | `/veomni-review` |
-| Add new model | `/veomni-new-model` |
-| Write or refresh a model's patchgen modeling | `/veomni-patchgen-model` |
+| Add new model or update HF modeling | `/veomni-new-model` |
+| Migrate existing GPU model to Ascend NPU | `/veomni-gpu-to-npu` |
 | Add / modify SeedOmni module or graph | `/veomni-seed-omni` |
 | Add new op/kernel | `/veomni-new-op` |
 | Update dependencies (uv) | `/veomni-uv-update` |
@@ -114,8 +114,8 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 
 ### Quick Decision Guide
 
-- **"Add support for model X"** → `/veomni-new-model`
-- **"Write a patch_gen_config" / "regenerate the generated modeling" / "add NPU patchgen" / "port X to patchgen"** → `/veomni-patchgen-model` (also the modeling step inside `/veomni-new-model`)
+- **"Add support for model X" / "author or update `modeling_<m>.py`"** → `/veomni-new-model`
+- **"Migrate model X to Ascend NPU"** → `/veomni-gpu-to-npu`
 - **"Add OmniModule (mixin)" / "extend seed_omni" / "wire into omni graph (nodes/edges/end)" / "split <model> into omni subfolders + per-module callback" / "modify training_graph or generation_graph"** → `/veomni-seed-omni`
 - **"Add a new kernel / fused op"** → `/veomni-new-op`
 - **"Fix this error" / "training hangs" / "wrong results"** → `/veomni-debug`

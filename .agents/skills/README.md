@@ -13,13 +13,13 @@ Each skill is a folder containing a `SKILL.md` with YAML frontmatter:
 ├── veomni-debug/
 │   └── SKILL.md
 ├── veomni-new-model/
-│   └── SKILL.md          # full migration workflow; narrower scope on request
-├── veomni-patchgen-model/
-│   ├── SKILL.md          # the spine: applies to every model
-│   └── references/       # loaded on demand, per model category
-│       ├── model-examples.md
-│       ├── moe.md
-│       └── multimodal.md
+│   └── SKILL.md          # full migration workflow + HF modeling sync
+├── veomni-seed-omni/
+│   ├── SKILL.md          # the spine: SeedOmni graph & module workflow
+│   └── references/       # loaded on demand, per concern
+│       ├── data-flow.md
+│       ├── graph-runtime.md
+│       └── module-contract.md
 └── ...
 ```
 
@@ -33,9 +33,9 @@ skill grows past a few hundred lines, check whether the bulk of it is
 move each conditional block into `references/` and leave a routing table near
 the top of `SKILL.md` saying which file to load when.
 
-`veomni-patchgen-model` is the worked example: it was 1055 lines, of which
-roughly a third only applied to MoE models and another third only to VLM/Omni
-models. A text-only dense model now reads the ~710-line spine and skips both.
+`veomni-seed-omni` is the worked example: conditional topics (checkpoint
+splitting, data flow, per-module parallelism, validation) live under
+`references/` while the core workflow stays concise in `SKILL.md`.
 Keep the spine self-contained — a reference file adds to a phase, it never
 replaces one, so nobody has to reconstruct the procedure from fragments.
 

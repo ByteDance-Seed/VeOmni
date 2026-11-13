@@ -38,22 +38,13 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
 def _qwen3_classes():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.qwen3.modeling_qwen3 import (
+        Qwen3ForCausalLM,
+        Qwen3ForSequenceClassification,
+        Qwen3ForTokenClassification,
+        Qwen3Model,
+    )
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_npu import (
-            Qwen3ForCausalLM,
-            Qwen3ForSequenceClassification,
-            Qwen3ForTokenClassification,
-            Qwen3Model,
-        )
-    else:
-        from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import (
-            Qwen3ForCausalLM,
-            Qwen3ForSequenceClassification,
-            Qwen3ForTokenClassification,
-            Qwen3Model,
-        )
     return Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3ForTokenClassification, Qwen3Model
 
 

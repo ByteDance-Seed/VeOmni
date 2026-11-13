@@ -50,7 +50,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _build_ours(config: Qwen2_5OmniThinkerConfig, ops: SimpleNamespace | None = None):
-    from veomni.models.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
+    from veomni.models.transformers.qwen2_5_omni.modeling_qwen2_5_omni import (
         Qwen2_5OmniThinkerForConditionalGeneration,
     )
 
@@ -141,7 +141,7 @@ def test_qwen2_5_omni_vision_and_audio_attention_veomni_sdpa_matches_hf(availabl
         Qwen2_5OmniVisionAttention as HFQwen2_5OmniVisionAttention,
     )
 
-    from veomni.models.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
+    from veomni.models.transformers.qwen2_5_omni.modeling_qwen2_5_omni import (
         Qwen2_5OmniAudioAttention,
         Qwen2_5OmniVisionAttention,
     )

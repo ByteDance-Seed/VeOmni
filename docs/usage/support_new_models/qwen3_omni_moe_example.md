@@ -4,16 +4,14 @@
 
 This document provides in-depth implementation details for each patch applied in the **Qwen3-Omni-MoE** integration — VeOmni's most complex model type, covering image, video, and audio modalities with MoE and Expert Parallelism. Use this alongside [guide_and_checklist.md](./guide_and_checklist.md).
 
-> **Scope note:** VeOmni now ships patchgen-generated modeling files under
-> `veomni/models/transformers/<model>/generated/`. The actual patches live in
-> [veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/models/transformers/qwen3_omni_moe/qwen3_omni_moe_gpu_patch_gen_config.py)
+> **Scope note:** VeOmni ships standalone modeling files under
+> `veomni/models/transformers/<model>/modeling_<model>.py`. The actual implementation lives in
+> [veomni/models/transformers/qwen3_omni_moe/modeling_qwen3_omni_moe.py](../../../veomni/models/transformers/qwen3_omni_moe/modeling_qwen3_omni_moe.py)
 > rather than the runtime `apply_veomni_*_patch()` helpers shown below. The
 > patterns (config fix, FSDP dummy, SP, MoE `VeomniOp`, EP plan, processor patch)
-> are unchanged; what has changed is *where* the patches are declared
-> (declarative patchgen config emitted into `generated/`) rather than applied
-> at import time. See
-> [the patchgen design guide](../../design/patchgen.md) and
-> the `veomni-patchgen-model` agent skill for the current flow.
+> are unchanged; what has changed is *where* the adaptations live (directly in
+> `modeling_qwen3_omni_moe.py`) rather than applied at import time. See the
+> `/veomni-new-model` agent skill for the current workflow.
 
 ---
 

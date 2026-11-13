@@ -1,0 +1,898 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Upstream-Module: transformers.models.qwen3_moe.modeling_qwen3_moe
+# Base-Transformers-Version: 5.16.1
+
+from collections.abc import Callable
+from functools import partial
+
+import torch
+from torch import nn
+from transformers import initialization as init
+from transformers.activations import ACT2FN
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.generation import GenerationMixin
+from transformers.integrations import use_kernel_forward_from_hub
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_layers import (
+    GenericForQuestionAnswering,
+    GenericForSequenceClassification,
+    GenericForTokenClassification,
+    GradientCheckpointingLayer,
+)
+from transformers.modeling_outputs import MoeModelOutputWithPast, SequenceClassifierOutputWithPast
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
+from transformers.utils.deprecation import deprecate_kwarg
+from transformers.utils.generic import maybe_autocast, merge_with_config_defaults
+from transformers.utils.output_capturing import OutputRecorder, capture_outputs
+
+from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss, load_balancing_loss
+
+# Additional imports for patches
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
+from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
+from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
+from veomni.ops import VeomniOp
+from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
+from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Unpack[TransformersKwargs],
+):
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeAttention
+# Methods patched: forward, __init__
+# ======================================================================
+
+
+class Qwen3MoeAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    # [modified __init__] Bind instance-local rope and attention VeomniOps
+    def __init__(self, config: Qwen3MoeConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = True
+
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        )
+        self.q_norm = Qwen3MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
+        self.k_norm = Qwen3MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
+        self.sliding_window = getattr(config, "sliding_window", None)
+        # Bind instance-local rope and attention VeomniOps
+        self.q_norm = Qwen3MoeRMSNorm(self.head_dim, eps=self.config.rms_norm_eps, config=self.config)
+        self.k_norm = Qwen3MoeRMSNorm(self.head_dim, eps=self.config.rms_norm_eps, config=self.config)
+        self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
+
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+        attn_output, attn_weights = self.veomni_attn(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeMLP
+# Methods patched: __init__, forward
+# ======================================================================
+
+
+class Qwen3MoeMLP(nn.Module):
+    # ── SwiGLU MLP (always call local VeomniOp) ──────────────────────────────
+    def __init__(self, config, intermediate_size=None):
+        nn.Module.__init__(self)
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+
+    def forward(self, x):
+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+            return self.veomni_swiglu_mlp(
+                x,
+                self.gate_proj.weight,
+                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
+                self.up_proj.weight,
+                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
+                self.down_proj.weight,
+                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+            )
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+# ======================================================================
+# [PATCHED CLASS] Qwen3MoeExperts
+# Original class replaced with: PatchedQwen3MoeExperts
+# Reason: Always call moe_experts VeomniOp on v5 gate_up_proj weights
+# ======================================================================
+class Qwen3MoeExperts(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        self.gate_up_proj = torch.nn.Parameter(
+            torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim)
+        )
+        self.down_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.use_swiglu_mlp:
+            reject_quantizing_act_fn(self)
+            return merged_experts_act_fn_forward(
+                hidden_states,
+                top_k_index,
+                top_k_weights,
+                self.gate_up_proj,
+                self.down_proj,
+                self.act_fn,
+                self.num_experts,
+            )
+        unused = self.gate_up_proj.new_empty(0)
+        return self.veomni_moe(
+            hidden_states,
+            top_k_weights,
+            top_k_index,
+            unused,
+            unused,
+            self.down_proj,
+            self.gate_up_proj,
+            num_experts=self.num_experts,
+        )
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeTopKRouter
+# Methods patched: forward
+# ======================================================================
+
+
+class Qwen3MoeTopKRouter(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_experts
+        self.norm_topk_prob = config.norm_topk_prob
+        self.hidden_dim = config.hidden_size
+        self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
+
+    def forward(self, hidden_states: torch.Tensor):
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        # Return raw pre-softmax logits as `router_logits`; HF's
+        # `load_balancing_loss_func` applies softmax internally. The post-softmax
+        # tensor is kept locally as `routing_weights` for top-k selection only.
+        router_logits = torch.nn.functional.linear(hidden_states, self.weight)
+        routing_weights = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+        router_top_value, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            router_top_value /= router_top_value.sum(dim=-1, keepdim=True)
+        # Cast ``router_top_value`` back to the raw-logits dtype, matching HF's
+        # reference ``Qwen3MoeTopKRouter.forward``: transformers v5.8 keeps
+        # ``router_logits`` bound to the pre-softmax ``F.linear`` output (it no
+        # longer re-binds it to the fp32 post-softmax tensor), so this cast lands
+        # on the model dtype rather than being a no-op. The fused MoE call site
+        # casts to ``final_hidden_states.dtype`` regardless; matching HF here
+        # keeps the generated modeling bitwise-equal to vanilla HF.
+        router_top_value = router_top_value.to(router_logits.dtype)
+        return router_logits, router_top_value, router_indices
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeSparseMoeBlock
+# Methods patched: forward
+# ======================================================================
+
+
+class Qwen3MoeSparseMoeBlock(nn.Module):
+    def __init__(self, config: Qwen3MoeConfig):
+        super().__init__()
+        self.experts = Qwen3MoeExperts(config)
+        self.gate = Qwen3MoeTopKRouter(config)
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
+        router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        # MoE router replay: when an RL framework has installed a manager via
+        # ``set_active_replay``, the manager may substitute ``selected_experts``
+        # with previously recorded target indices. The manager's sole
+        # responsibility is choosing indices; all model-specific post-topk
+        # weight math (softmax recompute, gather, renorm, dtype cast) is
+        # replicated here so the cross-framework controller stays
+        # model-agnostic. After upstream #715, ``Qwen3MoeTopKRouter`` returns
+        # pre-softmax ``router_logits`` for HF's load_balancing_loss_func
+        # consistency and discards its internal post-softmax matrix after
+        # top-k, so we recompute ``softmax`` here to feed the RR contract.
+        # The guarded block runs only when a manager is installed — the
+        # default training path pays zero extra compute.
+        if get_active_replay() is not None:
+            target_dtype = routing_weights.dtype
+            routing_scores = torch.nn.functional.softmax(router_logits, dtype=torch.float, dim=-1)
+            selected_experts = maybe_replay_indices(self.gate, routing_scores, selected_experts)
+            routing_weights = routing_scores.gather(1, selected_experts)
+            if self.gate.norm_topk_prob:
+                routing_weights = routing_weights / routing_weights.sum(-1, keepdim=True)
+            routing_weights = routing_weights.to(target_dtype)
+        final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeRMSNorm
+# Methods patched: __init__, forward
+# ======================================================================
+
+
+@use_kernel_forward_from_hub("RMSNorm")
+class Qwen3MoeRMSNorm(nn.Module):
+    # ── RMSNorm (always call local VeomniOp) ─────────────────────────────────
+    def __init__(self, hidden_size, eps: float = 1e-6, config=None) -> None:
+        nn.Module.__init__(self)
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+        impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeDecoderLayer
+# Methods patched: __init__
+# ======================================================================
+
+
+class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.self_attn = Qwen3MoeAttention(config, layer_idx)
+        if (layer_idx not in config.mlp_only_layers) and (
+            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+        ):
+            self.mlp = Qwen3MoeSparseMoeBlock(config)
+        else:
+            self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
+        self.input_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.post_attention_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.hidden_size = config.hidden_size
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        # Self Attention
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+@auto_docstring
+class Qwen3MoePreTrainedModel(PreTrainedModel):
+    config: Qwen3MoeConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["Qwen3MoeDecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    _supports_flex_attn = True
+
+    _can_compile_fullgraph = True
+    _supports_attention_backend = True
+    _can_record_outputs = {
+        "router_logits": OutputRecorder(Qwen3MoeTopKRouter, index=0),
+        "hidden_states": Qwen3MoeDecoderLayer,
+        "attentions": Qwen3MoeAttention,
+    }
+
+    @torch.no_grad()
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        std = self.config.initializer_range
+        if isinstance(module, Qwen3MoeExperts):
+            init.normal_(module.gate_up_proj, mean=0.0, std=std)
+            init.normal_(module.down_proj, mean=0.0, std=std)
+        elif isinstance(module, Qwen3MoeTopKRouter):
+            init.normal_(module.weight, mean=0.0, std=std)
+
+
+class Qwen3MoeRotaryEmbedding(nn.Module):
+    @deprecate_kwarg("device", version="5.18")
+    def __init__(self, config: Qwen3MoeConfig, device=None):
+        super().__init__()
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+
+        self.rope_type = self.config.rope_parameters["rope_type"]
+        rope_init_fn: Callable = self.compute_default_rope_parameters
+        if self.rope_type != "default":
+            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
+
+        self.inv_freq = nn.Buffer(inv_freq, persistent=False)
+        self.original_inv_freq = nn.Buffer(inv_freq.clone(), persistent=False)
+
+    @staticmethod
+    @deprecate_kwarg("device", version="5.18")
+    def compute_default_rope_parameters(config: Qwen3MoeConfig, device=None, **kwargs) -> tuple[torch.Tensor, float]:
+        """
+        Computes the inverse frequencies according to the original RoPE implementation
+        Args:
+            config ([`~transformers.PreTrainedConfig`]):
+                The model configuration.
+        Returns:
+            Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+            post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
+        """
+        base = config.rope_parameters["rope_theta"]
+        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+
+        attention_factor = 1.0  # Unused in this type of RoPE
+        # Compute the inverse frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        return inv_freq.to(device), attention_factor
+
+    @torch.no_grad()
+    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+    def forward(self, x, position_ids):
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1).to(dtype=torch.float, device=x.device)
+        )
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        # Disable any outside autocast context if any, to really force fp32
+        with maybe_autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeModel
+# Methods patched: __init__, forward
+# ======================================================================
+
+
+@auto_docstring
+class Qwen3MoeModel(Qwen3MoePreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList(
+            [Qwen3MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+        self.rotary_emb = Qwen3MoeRotaryEmbedding(config=config)
+        self.gradient_checkpointing = False
+
+        self.post_init()
+
+    # ================================================================
+    # Patch: Qwen3MoeModel.forward
+    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+    #    into ``veomni.models.utils.mask_utils.{create_causal_mask,
+    #    create_sliding_window_causal_mask}`` so packed sequences build an
+    #    isolated mask once in the model forward
+    # ================================================================
+    @merge_with_config_defaults
+    @capture_outputs
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> MoeModelOutputWithPast:
+        r"""
+        cache_position (`torch.LongTensor`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence.
+        """
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
+        # --- Patch.1 ---
+        # transformers 5.9 dropped ``cache_position`` from these constructors
+        # ("Deprecated and unused" — see masking_utils.py:917). Forward ``**kwargs``
+        # so ``veomni.models.utils.mask_utils`` can build packed masks from ``cu_seq_lens_q``.
+        causal_mask = mask_function(
+            **{
+                **kwargs,
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+        )
+        # --- Patch.1 ---
+
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
+        hidden_states = self.norm(hidden_states)
+
+        return MoeModelOutputWithPast(  # only diff with Mistral is the output type, we need MoE
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+        )
+
+
+def load_balancing_loss_func(
+    gate_logits: torch.Tensor | tuple[torch.Tensor] | None,
+    num_experts: int | None = None,
+    top_k=2,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor | int:
+    r"""
+    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
+
+    See Switch Transformer (https://huggingface.co/papers/2101.03961) for more details. This function implements the loss
+    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
+    experts is too unbalanced.
+
+    Args:
+        gate_logits:
+            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
+            shape [batch_size X sequence_length, num_experts].
+        num_experts:
+            Number of experts
+        top_k:
+            The number of experts to route per-token, can be also interpreted as the `top-k` routing
+            parameter.
+        attention_mask (`torch.Tensor`, *optional*):
+            The attention_mask used in forward function
+            shape [batch_size X sequence_length] if not None.
+
+    Returns:
+        The auxiliary loss.
+    """
+    if gate_logits is None or not isinstance(gate_logits, tuple):
+        return 0
+
+    # Accumulate assignment counts and probability sums layer by layer, normalizing at the end,
+    # so peak memory stays O(seq_len * num_experts) regardless of the number of layers.
+    compute_device = gate_logits[0].device
+    tokens_per_expert_sum = torch.zeros(num_experts, dtype=torch.float32, device=compute_device)
+    router_prob_sum = torch.zeros(num_experts, dtype=torch.float32, device=compute_device)
+    total_rows = 0.0
+
+    if attention_mask is not None:
+        # The same flat mask applies to every layer's [batch_size * sequence_length] rows.
+        flat_mask = attention_mask.reshape(-1).to(device=compute_device, dtype=torch.float32)
+
+    for layer_gate in gate_logits:
+        routing_weights = torch.nn.functional.softmax(layer_gate.to(compute_device), dim=-1)
+        _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+        if attention_mask is None:
+            # Count of top-k assignments per expert
+            tokens_per_expert_sum = (
+                tokens_per_expert_sum + torch.bincount(selected_experts.reshape(-1), minlength=num_experts).float()
+            )
+            # Sum of routing probabilities per expert
+            router_prob_sum = router_prob_sum + routing_weights.float().sum(dim=0)
+            total_rows = total_rows + routing_weights.shape[0]
+        else:
+            # Same reductions, weighted by the attention mask to exclude padding tokens
+            tokens_per_expert_sum = tokens_per_expert_sum + torch.zeros(
+                num_experts, dtype=torch.float32, device=compute_device
+            ).scatter_add_(0, selected_experts.reshape(-1), flat_mask.repeat_interleave(top_k))
+            router_prob_sum = router_prob_sum + (routing_weights.float() * flat_mask.unsqueeze(-1)).sum(dim=0)
+            total_rows = total_rows + flat_mask.sum()
+
+    tokens_per_expert = tokens_per_expert_sum / total_rows
+    router_prob_per_expert = router_prob_sum / total_rows
+
+    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+    return overall_loss * num_experts
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeForCausalLM
+# Methods patched: __init__, forward, get_parallel_plan
+# ======================================================================
+
+
+@auto_docstring
+class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tp_plan = {"lm_head": "colwise_gather_output"}
+    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _fsdp_plan = {"lm_head": "keep_full_weight"}
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = Qwen3MoeModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.router_aux_loss_coef = config.router_aux_loss_coef
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        impl = config.ops_config.cross_entropy_loss_implementation
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
+        self.veomni_lb = VeomniOp(
+            "load_balancing_loss",
+            "standard",
+            config.ops_config.load_balancing_loss_implementation,
+        )
+        self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
+        self.post_init()
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_router_logits: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> MoeCausalLMOutputWithLogProbs:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+        cache_position (`torch.LongTensor`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence.
+        """
+        output_router_logits = (
+            output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        )
+
+        outputs: MoeModelOutputWithPast = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_router_logits=output_router_logits,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        hidden_states = hidden_states[:, slice_indices, :]
+
+        loss = None
+        logits = None
+        fused_linear_aux = None
+        if labels is not None:
+            loss, logits, fused_linear_aux = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                hidden_states=hidden_states,
+                weights=self.lm_head.weight,
+                **kwargs,
+            )
+        else:
+            logits = self.lm_head(hidden_states)
+
+        aux_loss = None
+        if output_router_logits:
+            aux_loss = self.load_balancing_loss(
+                outputs.router_logits,
+                self.num_experts,
+                self.num_experts_per_tok,
+                attention_mask,
+            )
+            if isinstance(loss, torch.Tensor) and isinstance(aux_loss, torch.Tensor):
+                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)
+
+        return MoeCausalLMOutputWithLogProbs(
+            loss=loss,
+            aux_loss=aux_loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            router_logits=outputs.router_logits,
+            fused_linear_aux=fused_linear_aux,
+        )
+
+    def get_parallel_plan(self):
+        from .parallel_plan import get_parallel_plan as _get_parallel_plan
+
+        return _get_parallel_plan()
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeForSequenceClassification
+# Methods patched: __init__, forward
+# ======================================================================
+
+
+class Qwen3MoeForSequenceClassification(GenericForSequenceClassification, Qwen3MoePreTrainedModel):
+    def __init__(self, config):
+        Qwen3MoePreTrainedModel.__init__(self, config)
+        self.num_labels = config.num_labels
+        self.model = Qwen3MoeModel(config)
+        self.score = nn.Linear(config.get_text_config().hidden_size, self.num_labels, bias=False)
+        impl = config.ops_config.cross_entropy_loss_implementation
+        self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
+        self.loss_function = partial(ForSequenceClassificationLoss, op=self.veomni_ce)
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        outputs = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = outputs.last_hidden_state
+        logits = self.score(hidden_states)
+
+        loss = None
+        if labels is not None:
+            loss, _, _ = self.loss_function(
+                logits=None,
+                labels=labels,
+                num_labels=self.num_labels,
+                hidden_states=hidden_states,
+                weights=self.score.weight,
+                **kwargs,
+            )
+
+        return SequenceClassifierOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeForTokenClassification
+# Methods patched: __init__
+# ======================================================================
+
+
+class Qwen3MoeForTokenClassification(GenericForTokenClassification, Qwen3MoePreTrainedModel):
+    def __init__(self, config):
+        Qwen3MoePreTrainedModel.__init__(self, config)
+        self.num_labels = config.num_labels
+        self.model = Qwen3MoeModel(config)
+        classifier_dropout = getattr(config, "classifier_dropout", None)
+        if classifier_dropout is None:
+            classifier_dropout = getattr(config, "hidden_dropout", None)
+        if classifier_dropout is None:
+            classifier_dropout = 0.1
+        self.dropout = nn.Dropout(classifier_dropout)
+        self.score = nn.Linear(
+            config.get_text_config().hidden_size,
+            config.num_labels,
+            bias=getattr(config, "token_classification_bias", True),
+        )
+        self.post_init()
+
+
+# ======================================================================
+# [MODIFIED CLASS] Qwen3MoeForQuestionAnswering
+# Methods patched: __init__
+# ======================================================================
+
+
+class Qwen3MoeForQuestionAnswering(GenericForQuestionAnswering, Qwen3MoePreTrainedModel):
+    base_model_prefix = "transformer"  # For BC, where `transformer` was used instead of `model`
+
+    def __init__(self, config):
+        Qwen3MoePreTrainedModel.__init__(self, config)
+        self.transformer = Qwen3MoeModel(config)
+        self.qa_outputs = nn.Linear(config.hidden_size, 2)
+        self.post_init()
+
+
+__all__ = [
+    "Qwen3MoeForCausalLM",
+    "Qwen3MoeForQuestionAnswering",
+    "Qwen3MoeModel",
+    "Qwen3MoePreTrainedModel",
+    "Qwen3MoeForSequenceClassification",
+    "Qwen3MoeForTokenClassification",
+]

@@ -38,9 +38,7 @@ CPU-only parsing, preprocessing, eager references and mocked backend tests need
 an explicit CPU launch plan. Mark entire modules only when all cases are CPU-only;
 use individual case markers in files that also exercise accelerator kernels.
 The lightweight device-API workflow runs architecture, op-documentation and
-generated-call-site-signature tests with `pytest --noconftest`, without Torch.
-The patchgen workflow owns `test_modify_init.py`, using the standalone
-`patchgen` package and `pytest --noconftest` to avoid runtime fixture imports.
+modeling call-site-signature tests with `pytest --noconftest`, without Torch.
 Device-API acceptance also includes the three `check_device_api_usage.py`
 scans over `tasks`, `veomni`, and `tests`; the pytest guards alone do not cover
 that workflow. CPU tests checking device-name forwarding should use a mock
@@ -129,7 +127,7 @@ describe selections in `scripts/ci/accelerator/suites/gpu.json` and `npu.json`.
 | `tests/data/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
 | `tests/checkpoints/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
 | `tests/ops/` | directory in both GPU/NPU unit manifests, excluding `base/test_op_documentation.py` (device-API workflow) |
-| `tests/models/` | unit selection in both manifests, excluding `base/test_modify_init.py` (patchgen workflow) and `transformers/test_generated_call_site_signatures.py` (device-API workflow); GPU additionally excludes `test_omni_fsdp.py` |
+| `tests/models/` | unit selection in both manifests, excluding `transformers/test_generated_call_site_signatures.py` (device-API workflow); GPU additionally excludes `test_omni_fsdp.py` |
 | `tests/parallel/context_parallel/` | whole directory, GPU manifest only (`suite: unit`) |
 | everything else | **one selection per file** in the appropriate GPU/NPU suite manifest |
 | `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | GPU/NPU manifests (`suite: e2e`) |
@@ -222,7 +220,7 @@ is not GPU-specific. Say in the PR what it costs in wall time.
   kernels on the SM89 runners, NPU-only paths with no NPU coverage for that
   area).
 - Changes whose only failure mode is a build/lint error that another gate
-  already catches (`check_patchgen`, `device_api_check`, `check_doc_task_paths`,
+  already catches (`device_api_check`, `check_doc_task_paths`,
   ruff via `check_pr_lint`).
 
 Say so explicitly in the PR's **Test** section, with the reason. "No test

@@ -48,7 +48,8 @@ still works by invoking `/skill-name` explicitly.
 | "Add a fused RoPE kernel" | `/veomni-new-op` |
 | "Refactor the data collator" | `/veomni-develop` |
 | "Update torch to 2.10" | `/veomni-uv-update` |
-| "Write the patchgen config for Qwen3" | `/veomni-patchgen-model` |
+| "Author or update `modeling_qwen3.py`" | `/veomni-new-model` |
+| "Migrate Gemma 3 to Ascend NPU" | `/veomni-gpu-to-npu` |
 | "Analyze this Chrome trace" | `/veomni-profile` |
 | "Submit the current branch as a PR" | `/create-pr` |
 
@@ -76,8 +77,8 @@ Each skill is a folder containing a `SKILL.md` file with YAML frontmatter (`name
 ├── veomni-develop/SKILL.md    # Feature development and refactoring
 ├── veomni-debug/SKILL.md      # Bug fix and debugging (quick path + full protocol)
 ├── veomni-review/SKILL.md     # Pre-PR code review (mandatory)
-├── veomni-new-model/SKILL.md  # Integrate an existing external model
-├── veomni-patchgen-model/SKILL.md  # Author a model's patchgen-generated modeling
+├── veomni-new-model/SKILL.md  # Integrate a new model or sync HF modeling_<m>.py
+├── veomni-gpu-to-npu/SKILL.md # Migrate an existing GPU model to Ascend NPU
 ├── veomni-new-op/SKILL.md     # Add a new kernel/operator
 ├── veomni-uv-update/SKILL.md  # Dependency management with uv
 ├── veomni-profile/SKILL.md    # Performance profiling and optimization

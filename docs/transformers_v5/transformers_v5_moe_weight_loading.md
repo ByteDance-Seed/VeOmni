@@ -90,15 +90,15 @@ Handling summary:
 
 ## Qwen3Moe Handling in VeOmni
 
-VeOmni's patchgen-generated modeling uses the native v5 fused expert layout:
+VeOmni's standalone modeling uses the native v5 fused expert layout:
 - `gate_up_proj` `[E, 2*I, H]`
 - `down_proj` `[E, H, I]`
 
-See `veomni/models/transformers/qwen3_moe/qwen3_moe_gpu_patch_gen_config.py` for the patchgen config.
+See `veomni/models/transformers/qwen3_moe/modeling_qwen3_moe.py` for the implementation.
 
 ### Loading (HF safetensors -> VeOmni modeling)
 
-A runtime `CheckpointTensorConverter` is registered on every patchgen-generated
+A runtime `CheckpointTensorConverter` is registered on every MoE
 model class. For per-expert HF checkpoints, Qwen3-MoE, Qwen3.5-MoE (its MTP
 experts), Qwen3-Omni-MoE, DeepSeek-V3 and GLM-MoE-DSA (GLM-5) all use thin
 subclasses of `PerExpertFusedCheckpointTensorConverter`

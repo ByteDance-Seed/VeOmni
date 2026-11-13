@@ -41,10 +41,7 @@ import ast
 import inspect
 import textwrap
 
-import pytest
-
-from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling_gpu
-from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as modeling_npu
+from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as modeling
 from veomni.ops import VeomniOp
 
 
@@ -166,8 +163,7 @@ def _projection_calls(module, qualname):
     return via_handle, plain
 
 
-@pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
-def test_every_quantizable_projection_goes_through_the_linear_row(modeling):
+def test_every_quantizable_projection_goes_through_the_linear_row():
     """The linear family's selected row decides these projections' precision."""
     for qualname in _EXPECTED_LINEAR:
         via_handle, plain = _projection_calls(modeling, qualname)
@@ -181,8 +177,7 @@ def test_every_quantizable_projection_goes_through_the_linear_row(modeling):
         )
 
 
-@pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
-def test_storage_rounding_covers_exactly_the_stored_tensors(modeling):
+def test_storage_rounding_covers_exactly_the_stored_tensors():
     """Check the full storage recipe, including the unrounded main-attention Q."""
     for qualname, expected in _EXPECTED_STORAGE_ROUND.items():
         assert _storage_round_calls(modeling, qualname) == sorted(expected), (
@@ -191,8 +186,7 @@ def test_storage_rounding_covers_exactly_the_stored_tensors(modeling):
         )
 
 
-@pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
-def test_storage_rounding_is_off_until_asked_for(modeling):
+def test_storage_rounding_is_off_until_asked_for():
     """The default selection leaves every stored tensor in the model dtype.
 
     "Off" is the ``none`` row rather than an absent handle, so the model builds its
@@ -213,8 +207,7 @@ def test_storage_rounding_is_off_until_asked_for(modeling):
     torch.testing.assert_close(handle(kv), kv, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
-def test_kv_round_op_follows_the_instance_selection(modeling):
+def test_kv_round_op_follows_the_instance_selection():
     """Selecting a row must reach the modules that round stored tensors."""
     from tests.models.tiny_configs import tiny_deepseek_v4_config
 
@@ -225,8 +218,7 @@ def test_kv_round_op_follows_the_instance_selection(modeling):
     assert (handle.op, handle.variant, handle.impl) == ("kv_round", "deepseek_v4", "eager")
 
 
-@pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
-def test_stored_kv_rounds_only_the_nope_prefix(modeling):
+def test_stored_kv_rounds_only_the_nope_prefix():
     """Window KV stores 64-wide FP8 groups up to the RoPE boundary, not past it."""
     import torch
 
@@ -241,8 +233,7 @@ def test_stored_kv_rounds_only_the_nope_prefix(modeling):
     assert torch.isfinite(rounded).all()
 
 
-@pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
-def test_indexer_act_rounds_whole_128_wide_heads(modeling):
+def test_indexer_act_rounds_whole_128_wide_heads():
     """The indexer rounds whole heads in 128-wide groups, unlike the window KV."""
     import torch
 
@@ -254,8 +245,7 @@ def test_indexer_act_rounds_whole_128_wide_heads(modeling):
     assert torch.isfinite(rounded).all()
 
 
-@pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
-def test_storage_rounding_is_a_no_op_when_off(modeling):
+def test_storage_rounding_is_a_no_op_when_off():
     """No handle means no rounding, so a plain run keeps every tensor untouched."""
     import torch
 
@@ -289,12 +279,7 @@ def _build_tiny_model(linear_impl: str):
     """A tiny DeepSeek-V4 on the reference rows, with ``linear_impl`` for the projections."""
     from tests.models.tiny_configs import tiny_deepseek_v4_config
     from veomni.arguments import OpsImplementationConfig
-    from veomni.utils.device import IS_NPU_AVAILABLE
-
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as gen
-    else:
-        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gen
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as gen
 
     config = tiny_deepseek_v4_config()
     config._set_ops_implementation(
@@ -336,8 +321,7 @@ def test_deepseek_v4_lora_runs_on_the_reference_linear_row():
     assert out.logits.shape == (1, 4, config.vocab_size)
 
 
-@pytest.mark.parametrize("modeling", [modeling_gpu, modeling_npu], ids=["gpu", "npu"])
-def test_a_non_silu_expert_activation_trains_in_the_model_dtype(modeling):
+def test_a_non_silu_expert_activation_trains_in_the_model_dtype():
     """The fused expert rows bake SiLU into their kernels, so another activation cannot use them.
 
     The fallback loops over experts in Python instead, which means it cannot reach
@@ -371,9 +355,6 @@ def test_a_non_silu_expert_activation_trains_in_the_model_dtype(modeling):
         )
     )
 
-    if modeling.__name__.endswith("_npu"):
-        pytest.skip("the DSV4 NPU build needs torch_npu")
-
     model = modeling.DeepseekV4Experts(config)
     assert model.use_swiglu_mlp is False
     # The parameters are allocated with `torch.empty`; a real build fills them from
@@ -392,8 +373,7 @@ def test_a_non_silu_expert_activation_trains_in_the_model_dtype(modeling):
     assert torch.isfinite(output).all()
 
 
-@pytest.mark.parametrize("modeling", [modeling_gpu], ids=["gpu"])
-def test_an_unquantized_shared_expert_keeps_the_non_silu_fallback(modeling):
+def test_an_unquantized_shared_expert_keeps_the_non_silu_fallback():
     """The refusal is scoped to quantizing rows; `eager` still trains the fallback."""
     import copy
 

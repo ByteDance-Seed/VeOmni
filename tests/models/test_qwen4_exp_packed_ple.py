@@ -228,13 +228,26 @@ def production_method(name, class_name=None, extra_namespace=None):
     import textwrap
     from types import SimpleNamespace
 
-    path = ROOT / "veomni/models/transformers/qwen4_exp/qwen4_exp_gpu_patch_gen_config.py"
+    legacy_map = {
+        (None, "qwen4_exp_text_model_forward_patched"): ("Qwen4ExpTextModel", "forward"),
+        (None, "qwen4_exp_text_decoder_layer_forward_patched"): ("Qwen4ExpTextDecoderLayer", "forward"),
+        (None, "qwen4_exp_text_ple_layer_forward_patched"): ("Qwen4ExpTextPLELayer", "forward"),
+        (None, "qwen4_exp_text_ple_layer_short_conv_patched"): ("Qwen4ExpTextPLELayer", "_short_conv"),
+        ("PatchedQwen4ExpTextNGramEmbedding", "forward"): ("Qwen4ExpTextNGramEmbedding", "forward"),
+        ("PatchedQwen4ExpTextNGramEmbedding", "_shift_right_ignore_eos"): (
+            "Qwen4ExpTextNGramEmbedding",
+            "_shift_right_ignore_eos",
+        ),
+    }
+    class_name, name = legacy_map.get((class_name, name), (class_name, name))
+
+    path = ROOT / "veomni/models/transformers/qwen4_exp/modeling_qwen4_exp.py"
     raw = path.read_text()
     nodes = ast.parse(raw).body
     if class_name:
         nodes = next(n for n in nodes if isinstance(n, ast.ClassDef) and n.name == class_name).body
     node = next(n for n in nodes if isinstance(n, ast.FunctionDef) and n.name == name)
-    # Compile the real patchgen method without importing device-specific model kernels.
+    # Compile the real modeling method without importing device-specific model kernels.
     source = textwrap.dedent("\n".join(raw.splitlines()[node.lineno - 1 : node.end_lineno]))
 
     def sequence_parallel_state(parallel_state):

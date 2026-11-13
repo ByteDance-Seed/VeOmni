@@ -25,12 +25,9 @@ real MoE model weights:
 * ``validate_model_for_replay`` accepts declared-supported ``model_type``
   values and fails fast with an actionable message otherwise.
 
-It also includes a patchgen-drift guard: the generated ``patched_modeling_*``
-files for every wired MoE family MUST import and call
-``maybe_replay_indices``. The NPU variant is fragile under solo regeneration
-(see the docstring in ``qwen3_5_moe_npu_patch_gen_config.py``), so a static
-check here prevents the call site silently disappearing on a stale
-``make patchgen``.
+It also includes a static wiring guard: the ``modeling_*.py`` files for every
+wired MoE family MUST import and call ``maybe_replay_indices`` so no edit or
+HF 3-way merge drops a call site silently.
 """
 
 from __future__ import annotations
@@ -223,13 +220,11 @@ def test_validate_accepts_ddp_style_module_wrapper():
     validate_model_for_replay(wrapper)  # must not raise
 
 
-# --------------------------------------------------- patchgen drift guard
+# --------------------------------------------------- router replay wiring guard
 #
-# The router-replay wiring lives inside generated patched_modeling_*.py files.
-# If `make patchgen` is ever run with a broken shared-state cache (see the
-# NPU gen_config docstring), the `maybe_replay_indices` call site can silently
-# drop out while the import stays — or vice versa. These checks surface such a
-# regression at test time instead of at the first RL step.
+# The router-replay wiring lives inside HF-derived modeling_*.py files.
+# These checks ensure no edit or HF 3-way merge drops a `maybe_replay_indices`
+# import or call site silently.
 
 
 _REPO_ROOT = Path(moe_router_replay.__file__).resolve().parents[2]
@@ -247,21 +242,18 @@ _REPO_ROOT = Path(moe_router_replay.__file__).resolve().parents[2]
 # three layers are hash-routed (``mlp_layer_types``) and leaving that class
 # unhooked shifts every learned router's target by three layers, which just
 # degrades the trained policy instead of raising.
-_GENERATED_FILES = {
-    _REPO_ROOT / "veomni/models/transformers/qwen3_moe/generated/patched_modeling_qwen3_moe_gpu.py": 1,
-    _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_gpu.py": 1,
-    _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/generated/patched_modeling_qwen3_5_moe_npu.py": 1,
-    _REPO_ROOT / "veomni/models/transformers/qwen4_exp/generated/patched_modeling_qwen4_exp_gpu.py": 1,
-    _REPO_ROOT / "veomni/models/transformers/qwen4_exp/generated/patched_modeling_qwen4_exp_npu.py": 1,
+_MODELING_FILES = {
+    _REPO_ROOT / "veomni/models/transformers/qwen3_moe/modeling_qwen3_moe.py": 1,
+    _REPO_ROOT / "veomni/models/transformers/qwen3_5_moe/modeling_qwen3_5_moe.py": 1,
+    _REPO_ROOT / "veomni/models/transformers/qwen4_exp/modeling_qwen4_exp.py": 1,
     # TopKRouter + HashRouter.
-    _REPO_ROOT / "veomni/models/transformers/deepseek_v4/generated/patched_modeling_deepseek_v4_gpu.py": 2,
-    _REPO_ROOT / "veomni/models/transformers/deepseek_v4/generated/patched_modeling_deepseek_v4_npu.py": 2,
+    _REPO_ROOT / "veomni/models/transformers/deepseek_v4/modeling_deepseek_v4.py": 2,
 }
 
 
-@pytest.mark.parametrize(("path", "expected_calls"), _GENERATED_FILES.items(), ids=lambda p: getattr(p, "name", p))
+@pytest.mark.parametrize(("path", "expected_calls"), _MODELING_FILES.items(), ids=lambda p: getattr(p, "name", p))
 def test_generated_file_wires_maybe_replay_indices(path: Path, expected_calls: int):
-    assert path.is_file(), f"generated file missing: {path} — run `make patchgen`"
+    assert path.is_file(), f"modeling file missing: {path}"
     src = path.read_text()
     # Import must be present. The patch site imports `maybe_replay_indices`
     # alongside `get_active_replay` (to skip the guarded block on the default
@@ -269,7 +261,7 @@ def test_generated_file_wires_maybe_replay_indices(path: Path, expected_calls: i
     assert re.search(
         r"from\s+veomni\.utils\.moe_router_replay\s+import\s+[^\n]*\bmaybe_replay_indices\b",
         src,
-    ), f"{path.name} dropped the maybe_replay_indices import — patchgen state likely stale"
+    ), f"{path.name} dropped the maybe_replay_indices import"
     # Call sites must be present (match arbitrary whitespace/newlines after the name).
     num_calls = len(re.findall(r"\bmaybe_replay_indices\s*\(", src))
     assert num_calls == expected_calls, (

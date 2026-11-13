@@ -100,7 +100,6 @@
       "-v",
       "-s",
       "-x",
-      "--ignore=tests/models/base/test_modify_init.py",
       "--ignore=tests/models/transformers/test_generated_call_site_signatures.py",
       "tests/models"
     ]
