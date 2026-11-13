@@ -1,0 +1,46 @@
+# Janus-1.3B inference — text-to-image only (no trailing text).
+#
+# Optional per-module load overrides (deep-merged into ``train.yaml`` modules)::
+#
+#   modules:
+#     janus_siglip:
+#       train:
+#         accelerator:
+#           fsdp_config:
+#             fsdp_mode: fsdp2
+#
+# Modules without ``accelerator.fsdp_config`` load eagerly (``device_map='auto'``).
+#
+# Flow: ``prompt_encode`` primes KV → ``image_vq_start`` emits ``<boi>`` (no
+# llama forward) → ``image_vq`` loops ``janus_llama`` on the tail embed then
+# ``vqvae.generate`` (576 steps) → ``image_vq_end`` emits ``<eoi>`` (no llama).
+
+initial: prompt_encode
+
+states:
+  prompt_encode:
+    body:
+      - { from: janus_siglip,       to: janus_llama }
+      - { from: janus_text_encoder, to: janus_llama }
+      - { from: janus_llama,        to: end }
+    transitions:
+      - { condition: { type: default }, next_state: image_vq_start }
+
+  image_vq_start:
+    body:
+      - { from: janus_text_encoder.emit_image_start, to: end }
+    transitions:
+      - { condition: { type: default }, next_state: image_vq }
+
+  image_vq:
+    body:
+      - { from: janus_llama, to: janus_vqvae }
+      - { from: janus_vqvae, to: janus_llama }
+    transitions:
+      - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
+
+  image_vq_end:
+    body:
+      - { from: janus_text_encoder.emit_image_end, to: end }
+    transitions:
+      - { condition: { type: default }, next_state: done }

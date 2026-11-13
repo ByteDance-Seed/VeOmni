@@ -5,10 +5,10 @@ checkpoint conversion, training, resume, inference, and the graph debugging
 tools; the concepts behind them are in
 [Architecture](../design/architecture.md).
 
-> **Note:** On `main`, the in-tree runnable stand-in config and modules live
-> under `configs/seed_omni/fake_model/` (`veomni/models/seed_omni/modules/fake_model/`).
-> The `Janus` / `Qwen` / `Bagel` family paths shown in the examples below use
-> the model implementations on the `omniv2` branch (and follow-up model PRs).
+> **Note:** The in-tree runnable stand-in config and modules live under
+> `configs/seed_omni/fake_model/` (`veomni/models/seed_omni/modules/fake_model/`).
+> The `Janus` / `Qwen` / `Bagel` family paths in the examples below are the real
+> family configs.
 
 ## 1. Config layout
 
@@ -32,11 +32,11 @@ the fragments only it uses. Anything two or more tasks share moves up to
 model:
   model_path: /path/to/split-checkpoint
   model_config:
-    modules: configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml
-    train_graph: configs/seed_omni/Janus/janus_1.3b/train/graph_train.yaml
+    modules: configs/seed_omni/Janus/janus/train/modules_train.yaml
+    train_graph: configs/seed_omni/Janus/janus/train/graph_train.yaml
     infer_graph:
-      infer_gen: configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_gen.yaml
-      infer_und: configs/seed_omni/Janus/janus_1.3b/infer/graph_infer_und.yaml
+      infer_gen: configs/seed_omni/Janus/janus/infer/graph_infer_gen.yaml
+      infer_und: configs/seed_omni/Janus/janus/infer/graph_infer_und.yaml
     infer_type: infer_und
   accelerator: { ... }   # global default for every module
   optimizer: { ... }
@@ -122,8 +122,8 @@ handles single- or multi-node runs):
 # In-tree stand-in config:
 bash train.sh tasks/omni/train_omni.py configs/seed_omni/fake_model/train/base.yaml
 
-# Janus family config (on omniv2 / follow-up model PRs):
-bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml
+# Janus family config:
+bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus/train/base.yaml
 ```
 
 Common overrides:
@@ -169,7 +169,7 @@ Resume by pointing `load_path` at that directory:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --train.checkpoint.load_path outputs/janus_1.3b_omni_sft/checkpoints/global_step_500
 ```
 
@@ -242,8 +242,8 @@ python tasks/omni/infer_omni_native.py \
 ```bash
 # all eager (single process)
 python tasks/omni/infer_omni.py \
-    configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
-    --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
+    configs/seed_omni/Janus/janus/train/base.yaml \
+    --model.model_config.modules configs/seed_omni/Janus/janus/infer/modules_infer_eager.yaml \
     --model.model_config.infer_type infer_und \
     --infer.prompt "Describe this image." \
     --infer.images /path/to/image.jpg \
@@ -251,8 +251,8 @@ python tasks/omni/infer_omni.py \
 
 # any FSDP2 / DDP / extra-parallel module
 bash train.sh tasks/omni/infer_omni.py \
-    configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
-    --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
+    configs/seed_omni/Janus/janus/train/base.yaml \
+    --model.model_config.modules configs/seed_omni/Janus/janus/infer/modules_infer_fsdp.yaml \
     --model.model_config.infer_type infer_gen \
     --infer.prompt "A cat on a windowsill"
 ```

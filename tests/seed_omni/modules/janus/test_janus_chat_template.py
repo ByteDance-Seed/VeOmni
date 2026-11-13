@@ -1,0 +1,181 @@
+"""Janus chat-template expansion (class-based mirror of Jinja)."""
+
+from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import (
+    IMAGE_PLACEHOLDER,
+    JanusChatTemplate,
+)
+from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
+
+
+# A distinctive substring of the fixed Janus default system prompt.
+_SYSTEM_PROMPT_MARKER = "helpful language and vision assistant"
+
+
+class FakeTokenizer:
+    """Minimal tokenizer exposing the marker tokens / ids Janus resolves at init."""
+
+    bos_token = "<s>"
+    eos_token = "</s>"
+    boi_token = "<boi>"
+    eoi_token = "<eoi>"
+    bos_token_id = 1
+    eos_token_id = 2
+    boi_token_id = 3
+    eoi_token_id = 4
+    pad_token_id = 0
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [ord(c) for c in text]}
+
+
+def _template() -> JanusChatTemplate:
+    return JanusChatTemplate(FakeTokenizer())
+
+
+def test_expand_user_text_image_text_uses_boi_eoi_spans():
+    sample = [
+        ConversationItem(type="text", value="describe", role="user"),
+        ConversationItem(type="image", value=None, role="user"),
+        ConversationItem(type="text", value="more", role="user"),
+        ConversationItem(type="text", value="hi", role="assistant"),
+    ]
+    tmpl = _template()
+    parts = tmpl.apply_chat_template(sample)
+    rendered = tmpl.render_template_string(parts)
+    assert rendered.startswith("<s>")
+    assert _SYSTEM_PROMPT_MARKER in rendered  # user image → system prompt prepended
+    assert "<|User|>: " in rendered
+    assert IMAGE_PLACEHOLDER in rendered
+    assert "<boi>" in rendered
+    assert "<eoi>" in rendered
+    assert "describe" in rendered
+    assert "\nmore" in rendered
+    assert "\n\n<|Assistant|>:" in rendered
+    assert "hi" in rendered
+    assert rendered.endswith("</s>")
+    assert all(p.type in ("text", "image") for p in parts)
+    assert not any(p.meta.get("image_slot") for p in parts)
+
+
+def test_apply_chat_template_passes_media_rows_through():
+    """Rebuilt image rows must be the original items (regression).
+
+    The text encoder's ``tokenize_conversation`` re-materialises every sample, so
+    if ``apply_chat_template`` rebuilt the image row without its ``role`` /
+    ``meta``, the VQVAE encoder's assistant-image filter would see an empty batch
+    and ``torch.stack`` would crash on the next forward.
+    """
+    image = ConversationItem(type="image", value=None, role="assistant", meta={_IMG_TAG_KEY: "gen"})
+    sample = [ConversationItem(type="text", value="draw a cat", role="user"), image]
+    parts = _template().apply_chat_template(sample)
+    image_rows = [p for p in parts if p.type == "image"]
+    assert image_rows == [image]
+    assert image_rows[0] is image
+
+
+def test_apply_chat_template_moves_dummy_rows_to_the_tail():
+    """A worker-appended dummy is passed through verbatim after the templated
+    sample, and does not cost the sample its closing eos."""
+    dummy = ConversationItem(type="image", value=None, role="assistant", is_dummy=True, meta={_IMG_TAG_KEY: "gen"})
+    sample = [
+        ConversationItem(type="text", value="hello", role="user"),
+        ConversationItem(type="text", value="hi", role="assistant"),
+        dummy,
+    ]
+    parts = _template().apply_chat_template(sample)
+    assert parts[-1] is dummy
+    assert parts[-2].value == "</s>"
+    assert [p for p in parts if p.is_dummy] == [dummy]
+
+
+def _supervised_text(tmpl: JanusChatTemplate, parts: list[ConversationItem]) -> str:
+    """The text the CE head is asked to predict (``FakeTokenizer`` ids are codepoints)."""
+    tmpl.tokenize(parts)
+    return "".join(
+        chr(label) for part in parts if part.type == "text" for label in part.meta["labels"].tolist() if label != -100
+    )
+
+
+def test_t2i_supervises_only_eoi():
+    """A generated-image turn scores ``<eoi>`` alone — matching the reference stack.
+
+    Janus never learned to emit ``<boi>`` or the eos that follows a generated
+    image, so supervising either costs tens of nats and swamps the text loss
+    (the image tokens themselves are scored by the VQ head, not here).
+    """
+    sample = [
+        ConversationItem(type="text", value="a cat on the moon", role="user"),
+        ConversationItem(type="image", value=None, role="assistant", meta={_IMG_TAG_KEY: "gen"}),
+    ]
+    tmpl = _template()
+    assert _supervised_text(tmpl, tmpl.apply_chat_template(sample)) == "<eoi>"
+
+
+def test_i2t_supervises_answer_and_eos():
+    """A text answer keeps its eos supervised so the model still learns to stop."""
+    sample = [
+        ConversationItem(type="image", value=None, role="user"),
+        ConversationItem(type="text", value="describe", role="user"),
+        ConversationItem(type="text", value="a cat", role="assistant"),
+    ]
+    tmpl = _template()
+    assert _supervised_text(tmpl, tmpl.apply_chat_template(sample)) == "a cat</s>"
+
+
+def test_text_only_supervises_answer_and_eos():
+    sample = [
+        ConversationItem(type="text", value="hello", role="user"),
+        ConversationItem(type="text", value="hi", role="assistant"),
+    ]
+    tmpl = _template()
+    assert _supervised_text(tmpl, tmpl.apply_chat_template(sample)) == "hi</s>"
+
+
+def test_expand_text_only_t2i_skips_system_prompt():
+    """T2I-style user text (no user image) matches official empty system_prompt."""
+    sample = [
+        ConversationItem(type="text", value="a cat on the moon", role="user"),
+        ConversationItem(type="text", value="", role="assistant"),
+    ]
+    tmpl = _template()
+    parts = tmpl.apply_chat_template(sample)
+    rendered = tmpl.render_template_string(parts)
+    assert rendered.startswith("<s><|User|>: ")
+    assert _SYSTEM_PROMPT_MARKER not in rendered
+
+
+def test_multi_turn_closes_every_assistant_turn_with_eos():
+    """Janus' wire format ends each assistant turn, not just the sample."""
+    sample = [
+        ConversationItem(type="text", value="q1", role="user"),
+        ConversationItem(type="text", value="a1", role="assistant"),
+        ConversationItem(type="text", value="q2", role="user"),
+        ConversationItem(type="text", value="a2", role="assistant"),
+    ]
+    tmpl = _template()
+    rendered = tmpl.render_template_string(tmpl.apply_chat_template(sample))
+    assert "a1</s>" in rendered, rendered
+    assert rendered.count("</s>") == 2, rendered
+    # The intermediate stop token is supervised; only a generated-image turn is masked.
+    assert _supervised_text(tmpl, tmpl.apply_chat_template(sample)) == "a1</s>a2</s>"
+
+
+def test_multi_turn_eos_after_a_generated_image_stays_unscored():
+    """A turn ending on a generated image leaves its EOS untrained, as at sample end."""
+    sample = [
+        ConversationItem(type="text", value="draw", role="user"),
+        ConversationItem(type="image", value=None, role="assistant"),
+        ConversationItem(type="text", value="now describe", role="user"),
+        ConversationItem(type="text", value="ok", role="assistant"),
+    ]
+    tmpl = _template()
+    parts = tmpl.apply_chat_template(sample)
+    # Both EOS rows are emitted; only the trailing one is scored. Checked before
+    # ``tokenize`` rewrites ``value`` into ids.
+    eos_rows = [p for p in parts if p.type == "text" and str(p.value) == "</s>"]
+    assert [p.meta.get("loss_mask") for p in eos_rows] == [0, 1]
+
+    # The image turn's EOS is not scored, the trailing text turn's is.
+    supervised = _supervised_text(tmpl, parts)
+    assert supervised.endswith("ok</s>")
+    assert supervised.count("</s>") == 1, supervised

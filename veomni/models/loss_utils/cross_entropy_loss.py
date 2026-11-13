@@ -76,7 +76,7 @@ def _select_causal_target(
     """Return the token targets the CE op should consume.
 
     A provided ``shift_labels`` always wins, including when SP is on.
-    SeedOmni V2 BAGEL builds segment-aware pre-shifted targets that a
+    SeedOmni BAGEL builds segment-aware pre-shifted targets that a
     single causal shift cannot reconstruct. When ``shift_labels`` is
     missing, non-SP applies the ordinary causal shift and SP uses
     collator-prepared ``labels``.

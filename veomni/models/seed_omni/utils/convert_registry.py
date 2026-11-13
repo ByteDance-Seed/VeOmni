@@ -92,7 +92,7 @@ def load_family_graphs(
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
     """Read a family's default training DAGs and generation FSMs from ``configs/``.
 
-    ``config_dir`` is repo-relative (e.g. ``configs/seed_omni/Janus/janus_1.3b``);
+    ``config_dir`` is repo-relative (e.g. ``configs/seed_omni/Janus/janus``);
     ``training`` / ``generation`` name files under it. ``training_graph`` /
     ``generation_graph`` are caller-supplied YAML paths that replace the
     defaults, so a converter still runs outside a checkout when both are given.
