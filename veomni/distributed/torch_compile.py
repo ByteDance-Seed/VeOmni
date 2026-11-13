@@ -205,8 +205,8 @@ def _reject_incompatible_ops(model: nn.Module) -> None:
     if offending:
         raise RuntimeError(
             "model.accelerator.torch_compile cannot be combined with "
-            f"{', '.join(offending)}: those rows emit float8_e8m0fnu scale tensors, which "
-            "Inductor cannot lower. Disable compilation or select a different row."
+            f"{', '.join(offending)}: those rows emit tensors of a dtype Inductor cannot lower "
+            "(float8_e8m0fnu for torchao_mxfp4). Disable compilation or select a different row."
         )
 
 

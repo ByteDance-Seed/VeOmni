@@ -50,11 +50,15 @@ def test_leaves_a_model_without_torchao_rows_alone(monkeypatch):
     reject_qat_without_native_bf16(_model(linear_implementation="qat"))
 
 
+_TORCHAO_ROWS = ("torchao_nvfp4", "torchao_mxfp4")
+
+
+@pytest.mark.parametrize("impl", _TORCHAO_ROWS)
 @pytest.mark.parametrize("field", ["linear_implementation", "swiglu_mlp_implementation"])
-def test_refuses_a_torchao_row_below_sm80(monkeypatch, field):
+def test_refuses_a_torchao_row_below_sm80(monkeypatch, field, impl):
     _device(monkeypatch, cuda=True, capability=79)
     with pytest.raises(RuntimeError, match="native BF16 support"):
-        reject_qat_without_native_bf16(_model(**{field: "torchao_mxfp4"}))
+        reject_qat_without_native_bf16(_model(**{field: impl}))
 
 
 @pytest.mark.parametrize("capability", [80, 89, 90])
@@ -69,7 +73,8 @@ def test_leaves_a_cpu_host_alone(monkeypatch):
     reject_qat_without_native_bf16(_model(linear_implementation="torchao_mxfp4"))
 
 
-def test_walks_nested_configs(monkeypatch):
+@pytest.mark.parametrize("impl", _TORCHAO_ROWS)
+def test_walks_nested_configs(monkeypatch, impl):
     _device(monkeypatch, cuda=True, capability=70)
-    with pytest.raises(RuntimeError, match="torchao_mxfp4"):
-        reject_qat_without_native_bf16(_nested_model(linear_implementation="torchao_mxfp4"))
+    with pytest.raises(RuntimeError, match=impl):
+        reject_qat_without_native_bf16(_nested_model(linear_implementation=impl))

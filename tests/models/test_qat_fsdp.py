@@ -163,7 +163,8 @@ def _step(model, optimizer, step, impl):
     # each through `linear`, and five rounded tensors through `swiglu_mlp` (the
     # input once for gate/up, the hidden state once, three weights). Gradient
     # checkpointing reruns every layer's forward in backward, so each micro-batch
-    # makes two passes. Both rows must be reached.
+    # makes two passes. Both rows must be reached. The counts were verified for
+    # torchao_nvfp4; a new row must re-check them against its own implementation.
     layers, microbatches, passes = model.config.num_hidden_layers, 2, 2
     assert calls == {
         "linear": 4 * 2 * layers * microbatches * passes,
@@ -263,10 +264,8 @@ def _fsdp_worker(root: str, impl: str):
 
 
 @pytest.mark.launch_plan(provider=_LAUNCH)
-@pytest.mark.parametrize("impl", _torchao_qat_impls() or ["none"])
+@pytest.mark.parametrize("impl", _torchao_qat_impls())
 def test_qwen3_torchao_qat_two_gpu_fsdp2_checkpoint_resume(tmp_path, monkeypatch, impl):
-    if impl == "none":
-        pytest.skip("No torchao FP4 row is registered on this branch.")
     if torch.version.hip is not None or not IS_CUDA_AVAILABLE or runner_device_count() < _LAUNCH.nproc:
         pytest.skip("Requires two NVIDIA CUDA GPUs; no CPU/Gloo substitute.")
     if not all(get_gpu_compute_capability(rank) >= 80 for rank in range(_LAUNCH.nproc)):

@@ -36,8 +36,8 @@ dependencies = [
 [project.optional-dependencies]
 # Hardware extras gpu / npu / npu_aarch64 are mutually exclusive
 # (`[tool.uv].conflicts`). MagiAttention is optional NVIDIA SM100+ and
-# requires gpu: `uv sync --extra gpu --extra magi`. torchao float8 training is
-# optional too: `uv sync --extra gpu --extra float8`.
+# requires gpu: `uv sync --extra gpu --extra magi`. torchao (float8 training and
+# the torchao FP4 QAT rows) is optional too: `uv sync --extra gpu --extra float8`.
 dev = [
   "pre-commit>=4.0.0,<5.0",
   "ruff>=0.7.0,<1.0",

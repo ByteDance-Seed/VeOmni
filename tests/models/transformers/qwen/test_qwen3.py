@@ -700,6 +700,54 @@ def test_qwen3_nvfp4_qat_trains_and_rounds(device: str):
     assert torch.count_nonzero(quantized.model.layers[0].mlp.gate_proj.weight.grad) > 0
 
 
+@_cpu
+@_requires_torchao
+def test_qwen3_nvfp4_qat_rounds_exactly_the_projection_weights(monkeypatch):
+    """Pin the recipe: every attention/MLP projection weight is rounded, nothing else is.
+
+    A forward-output test cannot tell a recipe that quantizes one tensor too few
+    from the right one, so this records which parameters reach the quantizer.
+    """
+    import veomni.ops.kernels.linear.standard.torchao_nvfp4 as linear_row
+    import veomni.ops.kernels.swiglu_mlp.standard.torchao_nvfp4 as mlp_row
+
+    config = _tiny_config()
+    model = _qwen3_with_ops(config, linear_implementation="torchao_nvfp4", swiglu_mlp_implementation="torchao_nvfp4")
+    names_by_ptr = {param.data_ptr(): name for name, param in model.named_parameters()}
+    rounded = set()
+
+    for row in (linear_row, mlp_row):
+        original = row.nvfp4_fake_quant
+
+        def record(tensor, *args, _original=original, **kwargs):
+            name = names_by_ptr.get(tensor.data_ptr())
+            if name is not None:
+                rounded.add(name)
+            return _original(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(row, "nvfp4_fake_quant", record)
+
+    model(input_ids=torch.randint(3, config.vocab_size, (1, 8)), use_cache=False)
+
+    expected = {
+        f"model.layers.{layer}.{module}.weight"
+        for layer in range(config.num_hidden_layers)
+        for module in (
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        )
+    }
+    assert rounded == expected
+    unrounded = set(names_by_ptr.values()) - rounded
+    assert "lm_head.weight" in unrounded and "model.embed_tokens.weight" in unrounded
+    assert all("norm" in name or name in {"lm_head.weight", "model.embed_tokens.weight"} for name in unrounded)
+
+
 @pytest.mark.parametrize(
     ("ops", "targets"),
     [

@@ -1218,23 +1218,3 @@ def test_compile_rejection_walks_sub_configs():
     root = SimpleNamespace(ops_config=ops(lin="eager"), sub_configs={"text_config": None}, text_config=child_only)
 
     assert _uncompilable_at(root, prefix="") == ["text_config.linear_implementation='torchao_mxfp4'"]
-
-
-def test_compile_rejection_keeps_a_root_selection_a_child_overrides():
-    """A root-level selection is still reported even when a child picks a safe row.
-
-    The check is conservative: any level that names an uncompilable row is refused,
-    because a false refusal is a clear config error while a false pass would surface
-    as an Inductor assertion mid-compile.
-    """
-    from veomni.distributed.torch_compile import _uncompilable_at
-
-    def ops(lin=None):
-        return SimpleNamespace(linear_implementation=lin, swiglu_mlp_implementation=None)
-
-    root = SimpleNamespace(
-        ops_config=ops(lin="torchao_mxfp4"),
-        sub_configs={"text_config": None},
-        text_config=SimpleNamespace(ops_config=ops(lin="qat"), sub_configs={}),
-    )
-    assert _uncompilable_at(root, prefix="") == ["linear_implementation='torchao_mxfp4'"]

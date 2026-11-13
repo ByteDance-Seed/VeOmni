@@ -43,7 +43,7 @@ pyproject.toml
 │   │                  magi-attention + create-block-mask-cuda + flash-attn-cute
 │   │                  + magi-to-hstu-cuda + debugpy; source-built CUDA extensions
 │   ├── float8       Optional torchao==0.18.0 for float8 training and the torchao FP4 QAT rows (combine with gpu);
-│   │                  kept out of gpu so jobs that never enable float8 skip the wheel
+│   │                  kept out of gpu so jobs that use neither skip the wheel (and keep PEFT interop)
 │   ├── npu          Ascend NPU x86_64 — full superset, minus CUDA-only kernels:
 │   │                  torch 2.10.0+cpu + torch-npu 2.10.0
 │   │                  + diffusers / av / audio / video / peft / megatron-energon
@@ -76,7 +76,7 @@ conflicts with the NPU extras.
 ```bash
 uv sync --extra gpu --dev                      # NVIDIA GPU
 uv sync --extra gpu --extra magi --dev         # NVIDIA GPU + MagiAttention (SM100+)
-uv sync --extra gpu --extra float8 --dev       # NVIDIA GPU + torchao float8 training (SM89+)
+uv sync --extra gpu --extra float8 --dev       # NVIDIA GPU + torchao (float8 training SM89+, FP4 QAT rows)
 uv sync --extra npu --dev                      # Ascend NPU x86
 uv sync --extra npu_aarch64 --dev              # Ascend NPU ARM
 ```

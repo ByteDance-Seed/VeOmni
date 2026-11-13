@@ -51,7 +51,7 @@ quantizing only some of its projections.
 | Quantized | Both GEMM operands (activation and weight) |
 | Backward | Straight-through, using the quantized operands |
 | Dependency | `torchao`, optional; the row is unavailable without it. Validated on `torchao==0.18.0` |
-| Device | Device-agnostic PyTorch math. CPU and NVIDIA CUDA are supported. **NPU and MLU are rejected at config-parse time** (`arguments_types._NPU_ALLOWED` / `_MLU_ALLOWED` exclude the row), not merely untested |
+| Device | Device-agnostic PyTorch math. CPU and NVIDIA CUDA are supported; distributed training on CUDA needs SM80+ (native BF16), refused before sharding by `ops/qat/_hardware.reject_qat_without_native_bf16`. **NPU and MLU are rejected at config-parse time** (`arguments_types._NPU_ALLOWED` / `_MLU_ALLOWED` exclude the row), not merely untested |
 
 The row uses torchao's prototype `NVFP4Tensor` API. The registry only checks
 that `torchao` is installed, so an older torchao without that API (for
