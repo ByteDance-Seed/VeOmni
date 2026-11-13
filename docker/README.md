@@ -94,28 +94,31 @@ Triton is installed before Triton-Ascend because the Ascend package overlays
 shared Triton files. The Dockerfiles retain wheel files under `/app` and
 record wheel checksums and installed package versions for each build.
 
-### Candidate builders
+### Build and publication workflows
 
-The candidate workflows build and publish images to GHCR:
+The existing Ascend workflows build CANN 9.2.1 images and publish to
+`quay.io/ascend/veomni`:
 
-| Workflow | Platform | Image tag under `ghcr.io/<owner>/veomni` |
+| Workflow | Platforms | Image tag on `main` |
 | --- | --- | --- |
-| [A2 builder](../.github/workflows/build-cann921-a2.yml) | `linux/amd64` | `cann921-a2-x86-<commit>` |
-| [A3 builder](../.github/workflows/build-cann921-a3.yml) | `linux/arm64` | `cann921-a3-arm64-<commit>-<run-id>-<attempt>` |
+| [A2 builder](../.github/workflows/docker-build-ascend-a2.yml) | `linux/amd64`, `linux/arm64` | `veomni-9.2.1-910b-ubuntu22.04-py3.12-latest` |
+| [A3 builder](../.github/workflows/docker-build-ascend-a3.yml) | `linux/arm64` | `veomni-9.2.1-a3-ubuntu22.04-py3.12-latest` |
 
-Both declare `workflow_dispatch` and path-filtered pushes on
-`main`. A2 watches its workflow and the two CANN 9.2.1
-A2 Dockerfiles (`910b.x86` and `910b.arm`); its build job produces only x86.
-A3 watches its workflow and its A3 Dockerfile. There is no A2 ARM candidate
-workflow in this addition. These builders are separate from the existing
-Quay publishing workflows.
+Both support manual dispatch, published releases and path-filtered pushes to
+`main`. A2 watches its workflow and both CANN 9.2.1 A2 Dockerfiles, builds
+on native x86 and ARM runners, and merges the digests into a multi-architecture
+image. A3 watches its workflow and the CANN 9.2.1 A3 Dockerfile.
+Release builds retain the existing release-tag and `.postN` naming scheme.
+Publishing runs only under the `ByteDance-Seed` owner and requires the existing
+Quay credentials. GHCR remains the A2 build-cache registry; there is no
+separate candidate publishing pipeline.
 
 ### Validation scope
 
-The candidate builders perform image construction and publication, including
+The builders perform image construction and publication, including
 the Dockerfiles' package-version and import checks. They do not run NPU
 numerical tests. The existing NPU unit/e2e workflows retain their upstream
-image and dependency setup; they do not validate these candidate images.
+image and dependency setup; they do not validate these CANN 9.2.1 images.
 
 Device validation remains a local procedure. Keep its scripts, logs and
 environment-specific patches outside the committed source tree. Record the
