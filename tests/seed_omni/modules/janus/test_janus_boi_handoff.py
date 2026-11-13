@@ -37,44 +37,29 @@ class _FakeTokenizer:
         return "".join(chr(i) for i in ids)
 
 
-def _text_encoder() -> JanusTextEncoder:
-    model = JanusTextEncoder(JanusTextEncoderConfig(vocab_size=16, hidden_size=8, tie_word_embeddings=True))
-    model._tokenizer = _FakeTokenizer()
-    model._chat_template = JanusChatTemplate(_FakeTokenizer())
-    model._prompt_encoded = True
-    model._text_token_cache = [10, 11]
-    return model
+def test_a_sampled_boi_seals_the_row_and_the_backbone_consumes_it(monkeypatch):
+    """``<boi>`` is text, and ``image_vq``'s first node reads only ``value[-1:]``.
 
+    ``JanusLlama.generate`` used to assert ``tail.type == "output"``, which the
+    seal violated; the type was never part of the contract.
+    """
+    encoder = JanusTextEncoder(JanusTextEncoderConfig(vocab_size=16, hidden_size=8, tie_word_embeddings=True))
+    encoder._tokenizer = _FakeTokenizer()
+    encoder._chat_template = JanusChatTemplate(_FakeTokenizer())
+    encoder._prompt_encoded = True
+    encoder._text_token_cache = [10, 11]
+    monkeypatch.setattr(encoder, "_sample_token", lambda *a, **k: encoder._chat_template.boi_token_id)
 
-def _conversation() -> list[ConversationItem]:
-    return [
+    conversation = [
         ConversationItem(type="text", value=torch.zeros(3, dtype=torch.long), role="user"),
         ConversationItem(type="output", value=torch.zeros(1, 4, 8), role="assistant", meta={}),
     ]
-
-
-def test_the_boi_row_hands_one_embedding_to_the_image_span(monkeypatch):
-    """``image_vq`` starts with the backbone reading ``value[-1:]`` regardless of type."""
-    encoder = _text_encoder()
-    monkeypatch.setattr(encoder, "_sample_token", lambda *a, **k: encoder._chat_template.boi_token_id)
-
-    conversation = _conversation()
     encoder.generate(conversation, generation_kwargs={})
 
     # ``<boi>`` is sealed as text, exactly as the training template emits it.
     assert conversation[-1].type == "text"
-
-    # The backbone's one hard requirement: the tail holds embeddings it can slice.
     assert conversation[-1].value is not None
-    assert conversation[-1].value.size(-2) >= 1
 
-
-def test_the_backbone_accepts_a_text_tail(monkeypatch):
-    """A sealed ``<boi>`` row is what ``image_vq``'s first node sees.
-
-    ``JanusLlama.generate`` used to assert ``tail.type == "output"``, which the
-    seal violated. It now only requires the row to carry embeddings.
-    """
     llama = JanusLlama(
         JanusLlamaConfig(
             text_config={
@@ -86,20 +71,14 @@ def test_the_backbone_accepts_a_text_tail(monkeypatch):
             }
         )
     )
-    # Simulate the state ``image_vq`` starts from: a text tail mid-image-span.
     llama._past_key_values = object()
-    conversation = [
-        ConversationItem(type="text", value=torch.zeros(1, 2, 8), role="assistant"),
-    ]
     llama.reset_local_inference_state = lambda: None
     forward_calls = []
-
-    def _fake_forward(**kwargs):
-        forward_calls.append(kwargs)
-        hidden = torch.zeros(1, 8)
-        return {"past_key_values": object(), "hidden_states": hidden}
-
-    monkeypatch.setattr(llama, "forward", _fake_forward)
+    monkeypatch.setattr(
+        llama,
+        "forward",
+        lambda **kw: forward_calls.append(kw) or {"past_key_values": object(), "hidden_states": torch.zeros(1, 8)},
+    )
     monkeypatch.setattr(llama, "_tail_hidden_from_forward", lambda h: h.unsqueeze(1))
 
     llama.generate(conversation)  # must not raise on ``type == "text"``

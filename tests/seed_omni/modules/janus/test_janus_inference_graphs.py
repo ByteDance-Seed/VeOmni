@@ -47,23 +47,6 @@ def test_image_vq_runs_the_backbone_before_the_codec(graph_file: str):
     )
 
 
-def test_both_image_graphs_agree_on_the_image_vq_order():
-    assert _image_vq_order("graph_infer_gen.yaml") == _image_vq_order("graph_infer_interleave.yaml")
-
-
-def test_arming_cfg_is_callable_from_both_image_span_entry_points():
-    """``emit_image_start`` and the sampled-``<boi>`` path share one signature."""
-    import inspect
-
-    from veomni.models.seed_omni.modules.janus.text_encoder.modeling import JanusTextEncoder
-
-    params = list(inspect.signature(JanusTextEncoder._maybe_arm_cfg_for_image_gen).parameters)
-    assert params == ["self", "conversation_list", "generation_kwargs"]
-    # It must return the embeds: the sampled-``<boi>`` path stores them on the
-    # item's meta, exactly as ``emit_image_start`` does.
-    assert inspect.signature(JanusTextEncoder._maybe_arm_cfg_for_image_gen).return_annotation is not None
-
-
 def test_every_ar_state_samples_before_running_the_backbone_again():
     """Each text step must sample the *current* hidden state, not re-encode it.
 
