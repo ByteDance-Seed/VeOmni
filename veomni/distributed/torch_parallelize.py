@@ -477,8 +477,11 @@ def parallelize_model_fsdp2(
         low_precision_reduce_scatter_comm, mixed_precision
     )
     if use_low_precision_transport:
-        if get_device_type() != "cuda":
-            raise RuntimeError("Low-precision ReduceScatter transport is only supported on CUDA/NCCL.")
+        device_type = get_device_type()
+        if device_type not in ("cuda", "npu"):
+            raise RuntimeError("Low-precision ReduceScatter transport requires CUDA/NCCL or Ascend/HCCL.")
+        if device_type == "npu" and (mixed_precision.param_dtype != "bfloat16" or parallel_state.dp_replicate_enabled):
+            raise ValueError("Ascend/HCCL low-precision ReduceScatter requires BF16 transport without HSDP replicas.")
     elif low_precision_reduce_scatter_comm:
         logger.info_rank0("Parameter dtype matches reduce dtype; using the native PyTorch collective.")
 
@@ -815,8 +818,9 @@ def parallelize_model_fsdp2(
                 # but for torch 2.7 we still use set_reduce_scatter_divide_factor(parallel_state.ep_size)
                 gradient_divide_factor = parallel_state.extra_parallel_gradient_divide_factor(para)
                 logger.info(f"setting grad divide factor for {para} module to {gradient_divide_factor}")
-                if IS_NPU_AVAILABLE:
-                    # NPU is using torch 2.7
+                if IS_NPU_AVAILABLE and (
+                    transport_reduction_scales is None or not extra_parallel_transport_enabled[para]
+                ):
                     _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
                 elif transport_reduction_scales is None:
                     _para_mod.set_gradient_divide_factor(gradient_divide_factor)

@@ -719,7 +719,7 @@ configured and never round-trip through a saved config.
 | offload_pin_memory | `bool` | `True` | Pin the CPU offload buffers, matching torch's `CPUOffloadPolicy` default. Set `False` to keep offloaded shards pageable, so a large-MoE job is not charged non-reclaimable Shmem. |
 | expert_fsdp_shard_dim | `Optional[int]` | `None` | Override EP expert FSDP2 placement: `0` shards whole experts, `1` splits matrix rows. `None` preserves the existing placement/Muon policy; explicit values override it. Dim 0 requires evenly divisible local expert stacks. Applies to BF16 and FP8; see [FP8 MoE](../design/deepgemm_fp8_moe.md#whole-expert-fsdp-sharding-and-ep-combine). |
 | expert_weight_fp8_all_gather | `bool` | `False` | Gather DeepGEMM routed expert weights as E4M3 payloads and 128x128 block scales. Ignored when no experts use `deepgemm_fp8`. Selected experts require native FSDP2, BF16 mixed precision, block-aligned shards and no CPU offload. See [FP8 MoE](../design/deepgemm_fp8_moe.md#optional-fp8-parameter-all-gather). |
-| low_precision_reduce_scatter_comm | `bool` | `False` | Use `mixed_precision.param_dtype` (BF16 or FP16) for node-local FSDP2 ReduceScatter communication while keeping FP32 accumulation. See the precision and topology tables below. |
+| low_precision_reduce_scatter_comm | `bool` | `False` | Use `mixed_precision.param_dtype` for node-local FSDP2 ReduceScatter communication while keeping FP32 accumulation. CUDA/NCCL supports BF16 or FP16. Ascend/HCCL supports BF16 only. See the precision and topology tables below. |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
 
@@ -740,15 +740,17 @@ model:
 
 #### Which training layouts use it?
 
-The following assumes a valid custom configuration on CUDA. A node means a physical machine, not a worker
-process. VeOmni checks the actual ReduceScatter (RS) group, not the FSDP/HSDP strategy name.
+CUDA/NCCL supports BF16 or FP16 transport. Ascend/HCCL supports BF16 transport with a one-dimensional
+FSDP mesh. A node means a physical machine. VeOmni checks the actual placement of the ReduceScatter
+(RS) group.
 
 | Training layout | RS behavior | Warning or error? |
 | --- | --- | --- |
-| Single-node FSDP with multiple GPUs | Communicate in `param_dtype`; sum in FP32 | No fallback warning |
+| Single-node FSDP with multiple devices | Communicate in `param_dtype`; sum in FP32 | No fallback warning |
 | Multi-node FSDP whose RS group spans machines | Keep native PyTorch RS | Warning; training continues |
-| HSDP with RS inside each node and AllReduce between nodes | Communicate RS in `param_dtype`; replica AllReduce stays FP32 | No fallback warning |
-| HSDP whose RS group spans machines | Keep native communication for all replica-linked shard groups | Warning; training continues |
+| CUDA HSDP with RS inside each node and AllReduce between nodes | Communicate RS in `param_dtype`; replica AllReduce stays FP32 | No fallback warning |
+| CUDA HSDP whose RS group spans machines | Keep native communication for all replica-linked shard groups | Warning; training continues |
+| Ascend HSDP with BF16 transport requested | Custom transport unavailable | Configuration error |
 | Node identity cannot be determined | Keep native communication for all replica-linked shard groups | Warning; training continues |
 | RS group contains only one rank | Keep native communication and scaling | No fallback warning |
 | Option disabled, or supported parameter/reduction dtypes are equal | Keep native communication without topology checks | No fallback warning |
@@ -778,10 +780,10 @@ only when every member reports the same valid Linux kernel boot ID (`/proc/sys/k
 Container hostnames, local rank numbers and configured shard sizes are not used as evidence of node locality.
 Isolated container boot IDs may conservatively cause a fallback even on one physical node.
 
-HSDP replica-linked shard groups must all qualify, preventing replicas from mixing the custom force-SUM
+CUDA HSDP replica-linked shard groups must all qualify, preventing replicas from mixing the custom force-SUM
 scaling contract with native reduction scaling. Unrelated module meshes may choose different paths.
 Decisions are cached by process group within one model initialization; no detection runs during backward.
-Only named 1D shard meshes and 2D replica/shard meshes are supported; other dimensionalities are rejected
+The policy supports named 1D shard meshes and, on CUDA, 2D replica/shard meshes. Other dimensionalities are rejected
 before process-group lookup rather than skipping replica consensus.
 
 This is a conservative performance guard, not a guarantee of acceleration on every node-local interconnect
@@ -815,10 +817,10 @@ The supported combinations are intentionally narrow:
 | `false` | Any otherwise valid configuration | Any otherwise valid configuration | Native path; no topology checks |
 | `true` | Same supported dtype as reduction | Same supported dtype as parameters | Native path; no topology checks |
 | `true` | `bfloat16` | `float32` | BF16 communication and FP32 accumulation on eligible groups |
-| `true` | `float16` | `float32` | FP16 communication and FP32 accumulation on eligible groups |
+| `true` | `float16` | `float32` | FP16 communication and FP32 accumulation on eligible CUDA groups |
 | `true` | Other combinations | Other combinations | Configuration error, not silent compression |
 
-The custom rows additionally require enabled mixed precision and CUDA FSDP2. Equal-dtype native bypass
+The custom rows additionally require enabled mixed precision and a supported FSDP2 backend. Equal-dtype native bypass
 does not enable this custom path, even if mixed precision is disabled. Two unset dtypes are not a supported
 equal-dtype configuration for an enabled flag.
 

@@ -256,6 +256,16 @@
     ]
   },
   {
+    "name": "npu-fsdp2-low-precision-reduce-scatter",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_reduce_scatter_fp32_accumulation.py::test_reduce_scatter_fp32_accumulation_hccl"
+    ]
+  },
+  {
     "name": "npu-unit-24",
     "suite": "unit",
     "args": [
