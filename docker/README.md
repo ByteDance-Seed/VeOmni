@@ -59,3 +59,107 @@ docker build -f docker/cuda/Dockerfile.cu130 \
   and [`docker-build-ascend-a3.yml`](../.github/workflows/docker-build-ascend-a3.yml)
   build and push a fixed set of `ascend/` Dockerfiles on merge to `main`; check
   those workflows before renaming or removing a file under `ascend/`.
+
+## CANN 9.2.1 A2/A3 images
+
+These standalone Dockerfiles use Python 3.12, torch 2.10.0,
+torch-npu 2.10.0.post7 and Transformers 5.16.1. Select the Dockerfile for
+both the NPU generation and the host architecture:
+
+| Target | Platform | Dockerfile | Triton | Triton-Ascend |
+| --- | --- | --- | --- | --- |
+| A2 ARM | `linux/arm64` | [910b.arm](ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.arm) | 3.5.0 | 3.2.2 |
+| A2 x86 | `linux/amd64` | [910b.x86](ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86) | 3.2.0 | 3.2.2 |
+| A3 ARM | `linux/arm64` | [a3](ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_a3) | 3.5.0 | 3.2.2 |
+
+A2 uses the `swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.2.1-910b-ubuntu22.04-py3.12` base;
+A3 uses `swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.2.1-a3-ubuntu22.04-py3.12`.
+The images install into system Python. ARM variants select `npu_aarch64`
+and build TorchCodec from source; x86 selects `npu`.
+FLA source is pinned to `a7c608f2e3f828779ceeec1fcf155a6e37ede83c`, with
+the package and SoC selected for A2 or A3.
+
+Build from the repository root on a matching host architecture. For example,
+to build A2 x86:
+
+```bash
+docker build --platform linux/amd64 \
+  -f docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86 \
+  --build-arg FLA_BUILD_JOBS=4 \
+  -t veomni:cann921-a2-x86 .
+```
+
+For ARM, use `--platform linux/arm64` and the corresponding Dockerfile above.
+Triton is installed before Triton-Ascend because the Ascend package overlays
+shared Triton files. The Dockerfiles retain wheel files under `/app` and
+record wheel checksums and installed package versions for each build.
+
+### Build and publication workflows
+
+The existing Ascend workflows build CANN 9.2.1 images and publish to
+`quay.io/ascend/veomni`:
+
+| Workflow | Platforms | Image tag on `main` |
+| --- | --- | --- |
+| [A2 builder](../.github/workflows/docker-build-ascend-a2.yml) | `linux/amd64`, `linux/arm64` | `veomni-9.2.1-910b-ubuntu22.04-py3.12-latest` |
+| [A3 builder](../.github/workflows/docker-build-ascend-a3.yml) | `linux/arm64` | `veomni-9.2.1-a3-ubuntu22.04-py3.12-latest` |
+
+Both support manual dispatch, published releases and path-filtered pushes to
+`main`. A2 watches its workflow and both CANN 9.2.1 A2 Dockerfiles, builds
+on native x86 and ARM runners, and merges the digests into a multi-architecture
+image. A3 watches its workflow and the CANN 9.2.1 A3 Dockerfile.
+Release builds retain the existing release-tag and `.postN` naming scheme.
+Upstream publication runs under the `ByteDance-Seed` owner using the existing
+Quay credentials. For local validation, the same workflows also accept pushes
+or manual dispatch on `zpl1n/ascend-cann921-a2-a3` in `zpl1n/VeOmni`, publishing
+to `ghcr.io/zpl1n/veomni` with `<base-image-name>-<commit>-<run-id>-<attempt>`
+tags. A2 retains both architectures. Fork builds use their own GHCR cache and
+do not require Quay credentials. There is no separate candidate workflow.
+
+### Validation scope
+
+The builders perform image construction and publication, including
+the Dockerfiles' package-version and import checks. They do not run NPU
+numerical tests. The existing NPU unit/e2e workflows retain their upstream
+image and dependency setup; they do not validate these CANN 9.2.1 images.
+
+Device validation remains a local procedure. Keep its scripts, logs and
+environment-specific patches outside the committed source tree. Record the
+exact image, architecture and package versions when interpreting results;
+results from a modified local image do not validate a different Dockerfile.
+
+An image's preinstalled system packages are separate from the project
+environment created by `uv sync`. Local validation must explicitly select
+which environment it tests. Any wheel overlays applied after synchronization
+are additional environment changes, not part of the lockfile alone.
+
+### uv cache included in the image
+
+The CANN 9.2.1 Dockerfiles set `UV_CACHE_DIR=/opt/veomni/uv-cache` and
+populate it with `uv sync --frozen` for their hardware extra and the `dev`
+group. A disposable virtual environment is removed after warming the cache;
+the existing system Python installation remains the runtime environment.
+The cache is stored in the image layer, outside `/app`, rather than in a
+BuildKit cache mount, so mounting a new source checkout does not hide it.
+
+The warm-up also installs ninja, pybind11 and the target's Triton packages
+through uv. A2 x86 additionally caches Triton-Ascend 3.2.1 from the Huawei
+index used by the existing upstream workflow. This cache-only installation
+does not change the image's runtime Triton-Ascend version.
+
+Reuse requires the same architecture, compatible Python version, dependency
+versions and package sources. Changing the lockfile or index, overriding
+`UV_CACHE_DIR`, or installing an uncached package can still require network
+access. The cache increases image size and build time; it does not guarantee
+that every future dependency installation is offline.
+
+The complete locked `dev` group is also exported with `uv export --frozen`
+and installed with `uv pip` into the image's default Python. This includes
+patchgen, pytest and the lint tools; builds check patchgen imports and its CLI.
+The editable patchgen installation uses `/app/patchgen-pkg`. If a different
+checkout replaces `/app`, run `uv sync` in that checkout to recreate its project
+environment. A fresh CI venv still needs its own `uv sync --group dev`;
+the image cache accelerates installation but does not replace synchronization.
+All three runtime images pin Triton-Ascend to 3.2.2 and assert its version at
+build time. The upstream CI's explicit Triton-Ascend 3.2.1 installation remains
+an independent override; using that workflow does not test the image's 3.2.2.
