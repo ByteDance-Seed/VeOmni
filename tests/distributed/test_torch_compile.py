@@ -1168,7 +1168,7 @@ def test_deepseek_v4_rms_norm_compiled_backward_matches_eager(compile_backend):
 
 def _model_with_ops(**ops_fields) -> nn.Module:
     """A model whose config carries the given ops selections, as the registry reads them."""
-    ops = SimpleNamespace(linear_implementation=None, swiglu_mlp_implementation=None, **ops_fields)
+    ops = SimpleNamespace(**{"linear_implementation": None, "swiglu_mlp_implementation": None, **ops_fields})
     model = nn.Linear(2, 2)
     model.config = SimpleNamespace(ops_config=ops, sub_configs={})
     return model
@@ -1220,7 +1220,13 @@ def test_compile_rejection_walks_sub_configs():
     assert _uncompilable_at(root, prefix="") == ["text_config.linear_implementation='torchao_mxfp4'"]
 
 
-def test_compile_rejection_ignores_a_child_that_overrides_to_a_safe_row():
+def test_compile_rejection_keeps_a_root_selection_a_child_overrides():
+    """A root-level selection is still reported even when a child picks a safe row.
+
+    The check is conservative: any level that names an uncompilable row is refused,
+    because a false refusal is a clear config error while a false pass would surface
+    as an Inductor assertion mid-compile.
+    """
     from veomni.distributed.torch_compile import _uncompilable_at
 
     def ops(lin=None):
@@ -1231,4 +1237,4 @@ def test_compile_rejection_ignores_a_child_that_overrides_to_a_safe_row():
         sub_configs={"text_config": None},
         text_config=SimpleNamespace(ops_config=ops(lin="qat"), sub_configs={}),
     )
-    assert _uncompilable_at(root, prefix="") == []
+    assert _uncompilable_at(root, prefix="") == ["linear_implementation='torchao_mxfp4'"]

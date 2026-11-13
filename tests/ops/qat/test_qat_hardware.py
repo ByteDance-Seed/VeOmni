@@ -27,12 +27,12 @@ from veomni.ops.qat._hardware import reject_qat_without_native_bf16
 
 
 def _model(**ops_fields) -> SimpleNamespace:
-    ops = SimpleNamespace(linear_implementation=None, swiglu_mlp_implementation=None, **ops_fields)
+    ops = SimpleNamespace(**{"linear_implementation": None, "swiglu_mlp_implementation": None, **ops_fields})
     return SimpleNamespace(config=SimpleNamespace(ops_config=ops, sub_configs={}))
 
 
 def _nested_model(**ops_fields) -> SimpleNamespace:
-    child_ops = SimpleNamespace(linear_implementation=None, swiglu_mlp_implementation=None, **ops_fields)
+    child_ops = SimpleNamespace(**{"linear_implementation": None, "swiglu_mlp_implementation": None, **ops_fields})
     child = SimpleNamespace(ops_config=child_ops, sub_configs={})
     root_ops = SimpleNamespace(linear_implementation=None, swiglu_mlp_implementation=None)
     return SimpleNamespace(
@@ -71,5 +71,5 @@ def test_leaves_a_cpu_host_alone(monkeypatch):
 
 def test_walks_nested_configs(monkeypatch):
     _device(monkeypatch, cuda=True, capability=70)
-    with pytest.raises(RuntimeError, match="linear_implementation"):
+    with pytest.raises(RuntimeError, match="torchao_mxfp4"):
         reject_qat_without_native_bf16(_nested_model(linear_implementation="torchao_mxfp4"))
