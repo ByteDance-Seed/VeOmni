@@ -201,6 +201,9 @@ def _save_hf_safetensor_distributed(
                 f"to match actual model weights"
             )
 
+    from veomni.checkpoint.row_crop import RowCropSavePlanner, checkpoint_row_counts
+
+    row_counts = checkpoint_row_counts(model)
     storage_writer = HuggingFaceStorageWriter(
         path=save_path,
         save_distributed=True,
@@ -216,6 +219,7 @@ def _save_hf_safetensor_distributed(
     dcp.save(
         state_dict=save_state,
         storage_writer=storage_writer,
+        planner=RowCropSavePlanner(row_counts) if row_counts else None,
     )
     del save_state  # Free copied tensors (e.g. fp32->bf16) to reduce peak memory
     if dist.is_initialized():
@@ -224,7 +228,6 @@ def _save_hf_safetensor_distributed(
     helper.empty_cache()
     elapsed_time = time.time() - start_time
     logger.info_rank0(f"Distributed HuggingFace safetensors save took {elapsed_time:.2f}s")
-
     # Save model assets (config, tokenizer, etc.) on rank 0
     if model_assets and (not dist.is_initialized() or dist.get_rank() == 0):
         save_model_assets(save_path, model_assets)
@@ -238,6 +241,7 @@ def _save_hf_safetensor_legacy(
     model_assets: Optional[Sequence],
     ckpt_manager: str,
     output_dir: Optional[str],
+    rows_by_name,
 ):
     """Legacy HuggingFace safetensors save via checkpoint conversion (rank-0 only)."""
     model_state_dict = ckpt_to_state_dict(
@@ -245,6 +249,9 @@ def _save_hf_safetensor_legacy(
         ckpt_manager=ckpt_manager,
         output_dir=output_dir,
     )
+    from veomni.checkpoint.row_crop import crop_dense_state_dict
+
+    model_state_dict = crop_dense_state_dict(model_state_dict, rows_by_name)
     save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets)
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 
@@ -271,7 +278,7 @@ def save_hf_safetensor(
     save_checkpoint_path: Optional[str] = None,
     output_dir: Optional[str] = None,
     is_rank_0: bool = False,
-    # Distributed only
+    # Live model for distributed export and legacy checkpoint row metadata
     model: Optional[torch.nn.Module] = None,
     fqn_to_index_mapping: Optional[Dict[str, int]] = None,
     parallel_state=None,
@@ -284,7 +291,7 @@ def save_hf_safetensor(
     do not need to add external synchronization around this function.
 
     Supports two modes:
-    - Distributed mode (PyTorch >= 2.9, ckpt_manager="dcp", non-LoRA): Uses HuggingFaceStorageWriter
+    - Distributed mode (PyTorch >= 2.9, ckpt_manager="dcp", non-NPU): Uses HuggingFaceStorageWriter
       for efficient distributed save directly from the live FSDP model. Must be called on all ranks.
     - Legacy mode: Loads from checkpoint and converts to safetensors on rank 0.
 
@@ -297,13 +304,16 @@ def save_hf_safetensor(
         save_checkpoint_path: [Legacy only] Path to the distributed checkpoint for conversion.
         output_dir: [Legacy only] Output directory passed to ``ckpt_to_state_dict``.
         is_rank_0: [Legacy only] Whether the current process is global rank 0.
-            Legacy save is rank-0 only; non-rank-0 processes return immediately.
+            Only rank 0 converts weights; all ranks join the final barrier.
             Required by non-dcp checkpoint managers (e.g., omnistore).
-        model: [Distributed only] Live FSDP model for distributed save.
+        model: Live model for distributed export and row-count metadata in legacy export.
+            Without a model, legacy conversion skips row cropping. Older padded
+            checkpoints require model metadata to export logical rows.
         fqn_to_index_mapping: [Distributed only] Maps FQNs to safetensors file indices
             for multi-file output.
     """
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+    from veomni.checkpoint.row_crop import checkpoint_row_counts
 
     use_distributed = should_use_distributed_hf_safetensor_save(ckpt_manager)
 
@@ -330,6 +340,7 @@ def save_hf_safetensor(
                 model_assets,
                 ckpt_manager,
                 output_dir,
+                rows_by_name=checkpoint_row_counts(model),
             )
 
     # Ensure all ranks finish saving before anyone proceeds

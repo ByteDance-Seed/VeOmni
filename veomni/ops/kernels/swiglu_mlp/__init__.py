@@ -135,10 +135,11 @@ def use_fused_row(mlp: nn.Module, activation: str) -> bool:
 def has_plain_linear_projections(mlp: nn.Module) -> bool:
     """Whether ``swiglu_mlp`` may read ``mlp``'s projection weights directly.
 
-    A wrapped projection such as ``LoraLinear`` has no ``weight`` and must run
-    its own forward, so the MLP has to call the projection modules instead. The
-    fused rows that only read the tensors still work that way, because their own
-    ``forward`` accepts the modules' inputs.
+    Only an exact ``nn.Linear`` qualifies. A wrapped projection such as
+    ``LoraLinear`` has no ``weight``, and a ``Linear`` subclass such as torchao's
+    ``Float8Linear`` exposes one but does extra computation in its ``forward``
+    (float8 GEMMs). Either must run its own forward, so the MLP has to call the
+    projection modules instead of the weight-only fused path.
 
     Raises:
         ValueError: when a fallback is needed while ``mlp``'s own ``swiglu_mlp``
@@ -150,15 +151,16 @@ def has_plain_linear_projections(mlp: nn.Module) -> bool:
             fallback.
 
     """
-    plain = all(isinstance(getattr(mlp, name), nn.Linear) for name in ("gate_proj", "up_proj", "down_proj"))
+    plain = all(type(getattr(mlp, name)) is nn.Linear for name in ("gate_proj", "up_proj", "down_proj"))
     if plain:
         return True
 
     reject_quantizing_row(
         mlp,
-        "a wrapped projection: a layer substituted after construction (LoRA) keeps the base weights at "
-        "`base_layer`, so the handle cannot read the weight the row asks for",
-        remedy="Set swiglu_mlp_implementation='eager' for adapter training on gate/up/down.",
+        "a wrapped projection or an nn.Linear subclass: LoRA keeps the base weights at `base_layer`, and a "
+        "subclass such as torchao's Float8Linear computes its own GEMM in forward, so the handle cannot "
+        "fake-quantize the weight the projection actually uses",
+        remedy="Set swiglu_mlp_implementation='eager' for adapter or float8 training on gate/up/down.",
     )
     return False
 

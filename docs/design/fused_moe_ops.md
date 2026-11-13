@@ -76,6 +76,15 @@ EP-local counterparts, and shared/independent MoE-LoRA (with and without EP)
 use the same schedule selection. EP builds its prefix from the local,
 already-permuted rows and local expert boundaries.
 
+The compact launch flattens row and column tiles into `grid.x`, with column
+tiles varying fastest: `tile_id = program_id // ceil(N / BLOCK_N)` and
+`n = program_id % ceil(N / BLOCK_N)`. Adjacent program IDs therefore share a
+row tile, providing an opportunity to reuse its input block across output
+columns. This is a logical traversal order, not a guarantee of physical
+execution order or cache hits. The number of programs, prefix lookup and GEMM
+arithmetic are unchanged. Keeping the grid one-dimensional avoids adding a
+`grid.y` dimension limit. Shape-derived fallback traversal is unchanged.
+
 The prefix is saved for backward. Split experts reuse it for three forward
 and three input-gradient same-NK GEMMs; merged experts reuse it for two plus
 two. Shared LoRA applies it to the base grouped GEMMs; its dense adapter

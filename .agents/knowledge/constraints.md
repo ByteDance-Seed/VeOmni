@@ -111,6 +111,7 @@ Core entry points:
    - Persistent ExtraParallel parameters currently require a 2D `(<para>_fsdp, <para>)` mesh covering the complete world. HSDP replicas and FSDP CPU offload remain unsupported.
    - There is currently no `sequence_parallel_persistent_names` plan field and no explicit SP allowlist or SP-specific rejection in `torch_parallelize.py`. Therefore this constraint must not be read as validation that persistent ExtraParallel parameters are safe for every SP model; adding another such model requires reviewing its optimizer, gradient, and checkpoint semantics under SP.
    - Qwen4-Exp's `ple` dimension is currently the only persistent ExtraParallel use. Its lookup, gradient scaling, optimizer, and checkpoint paths operate over the complete flattened PLE mesh while inputs remain sequence-sharded.
+   - See [Qwen4-Exp checkpoint row contract](../../docs/design/qwen4_exp_ple_2d_parallelism.md#dcp-model-and-optimizer-state) for per-table logical and padded shapes.
 
 8b. **Qwen4-Exp QSA indices are global full-resolution token indices**
    - `qsa_attention_implementation` selects blocks with local queries and globally gathered pooled keys, returning local `[B,L,K]` selections for each rank's query shard while `Qwen4ExpTextAttention` keeps `query_states` local (`[B,H_q,L,D]`) and all-gathers `key_states`/`value_states` (`[B,H_kv,S,D]`) over the active sequence- or context-parallel group.
@@ -187,16 +188,17 @@ Core files:
 17. **Checkpoint save/load requires all ranks to participate**
     - DCP operations are collective — all ranks must call save/load simultaneously.
     - Calling checkpoint operations from only rank 0 causes deadlocks.
-    - ``lr_scheduler.pt`` is replicated: rank 0 writes the file, but every rank
-      still joins the save reduction and the promotion collectives. The sidecar
-      is written before ``dcp.save`` / ``dcp.async_save``, so DCP's ``.metadata``
-      (the resume completeness marker) lands last. Each step writes a new
-      ``global_step_{N}/``; a failed save has no ``.metadata`` and is skipped.
-      A resume that expects a scheduler and finds no ``lr_scheduler.pt`` falls
-      back to ``extra_state/`` via ``veomni/checkpoint/legacy_v0_1_12.py``
-      (VeOmni 0.1.12). Delete that module and its two imports to drop the
-      fallback; the load then raises.
-    - ``trainer_state_rank_{R}.pt`` stays per-rank: the dataloader cursor and RNG
+    - The lr scheduler is per-rank, in
+      ``model/<module>/extra_state/extra_state_rank_{R}.pt`` beside whatever
+      state the runtime contributes. There is no replicated sidecar file. That
+      pickle is written before ``dcp.save`` / ``dcp.async_save``, so DCP's
+      ``.metadata`` (the resume completeness marker) lands last. Each step
+      writes a new ``global_step_{N}/``; a failed save has no ``.metadata`` and
+      is skipped. With ``stage_dir`` the pickle is staged with the shards and
+      every marker is copied last at promotion. There is no fallback to a
+      pre-split layout: a VeOmni 0.1.12 / 0.2.x checkpoint no longer resumes
+      (see ``docs/usage/checkpoint.md``).
+    - ``extra_state/rank_{R}.pt`` stays per-rank: the step counter and RNG
       are rank-local. Changing world size still requires a matching cursor file
       per rank. On-disk layout: ``docs/usage/checkpoint.md``.
 

@@ -76,6 +76,7 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # name to exercise accelerator-specific code paths; the literal "cuda" is
     # a test fixture, not a production device-API call.
     "tests/distributed/test_async_activation_offload.py",
+    "tests/models/test_float8_training.py",
     "tests/models/test_qwen_image_precision.py",
     "tests/precision/qwen_image.py",
     # Compute-unit lookup is asserted per backend by name (cuda / npu / xpu /

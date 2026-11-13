@@ -126,9 +126,11 @@ A second rejection covers the paths a row cannot serve. A fake-quantizing row re
 the weights it is handed, so a branch that bypasses it would train at full precision
 while the config still said QAT. Two of them refuse instead of falling through:
 
-- **A projection wrapped after construction** (LoRA keeps the base layer at
-  `base_layer`, so there is no `weight`) is refused by
-  `has_plain_linear_projections` when it calls `reject_quantizing_row`.
+- **A projection that is not an exact `nn.Linear`** is refused by
+  `has_plain_linear_projections` when it calls `reject_quantizing_row`: a
+  projection wrapped after construction (LoRA keeps the base layer at
+  `base_layer`, so there is no `weight`), or an `nn.Linear` subclass such as
+  torchao's `Float8Linear`, whose own forward computes the GEMM.
 - **Expert LoRA on a quantizing experts row** is refused by `_moe_lora_op`,
   because no adapter forward would quantize the base weights.
 
