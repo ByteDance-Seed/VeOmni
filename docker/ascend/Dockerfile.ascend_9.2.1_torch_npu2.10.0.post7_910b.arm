@@ -1,6 +1,6 @@
 # A2 / ARM64, CANN 9.2.1, Ubuntu 22.04 and shared Python 3.12.
 # torch-npu source: https://ascend.devcloud.huaweicloud.com/pypi/simple/torch-npu/
-FROM quay.io/ascend/cann:9.2.1-910b-ubuntu22.04-py3.12
+FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.2.1-910b-ubuntu22.04-py3.12
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 USER root

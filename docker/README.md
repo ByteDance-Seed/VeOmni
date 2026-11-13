@@ -72,8 +72,8 @@ both the NPU generation and the host architecture:
 | A2 x86 | `linux/amd64` | [910b.x86](ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86) | 3.2.0 | 3.2.2 |
 | A3 ARM | `linux/arm64` | [a3](ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_a3) | 3.5.0 | 3.2.2 |
 
-A2 uses the `quay.io/ascend/cann:9.2.1-910b-ubuntu22.04-py3.12` base;
-A3 uses `quay.io/ascend/cann:9.2.1-a3-ubuntu22.04-py3.12`.
+A2 uses the `swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.2.1-910b-ubuntu22.04-py3.12` base;
+A3 uses `swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.2.1-a3-ubuntu22.04-py3.12`.
 The images install into system Python. ARM variants select `npu_aarch64`
 and build TorchCodec from source; x86 selects `npu`.
 FLA source is pinned to `a7c608f2e3f828779ceeec1fcf155a6e37ede83c`, with
