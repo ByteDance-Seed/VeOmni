@@ -52,7 +52,7 @@ Three splits in the tree above are deliberate:
   Iterable datasets are `split_dataset_by_node`-sharded on `dp_rank` and the
   multisource sampler filters on `dp_rank`, so restoring rank 0's cursor
   everywhere would replay rank 0's shard and skip the rest. RNG and meters are
-  rank-local for the same reason. The scheduler is rank-local too: it lives in
+  rank-local for the same reason. Scheduler state is also saved and restored per rank: it lives in
   each rank's `model/<module>/extra_state/extra_state_rank_{R}.pt`, beside the
   runtime-contributed state, rather than in a replicated sidecar.
 - **Weights and optimizer are two DCP directories** because they have different
@@ -215,6 +215,24 @@ The compatibility loader that handled VeOmni 0.1.12 and 0.2.x
 such a run, restart it, or convert the weights out first with
 [Checkpoint conversion](checkpoint_conversion.md) and resume from the converted
 export as a fresh run.
+
+### Split-layout checkpoints missing model sidecars
+
+A split-layout checkpoint containing only `model/[<module>/]lr_scheduler.pt`
+can pass marker discovery even when the per-rank model sidecars are missing.
+The current loader skips missing sidecars; the default runtime then keeps its
+initialized scheduler rather than restoring the saved schedule. Do not continue
+training assuming that discovery proves scheduler restoration.
+
+For such a checkpoint, resume with the compatible revision/environment that
+wrote and reads that scheduler layout, and verify the restored step and learning
+rate before continuing. To migrate instead, work on a copy: convert the saved
+scheduler state into the `lr_scheduler` key of each rank's model
+`extra_state/extra_state_rank_{R}.pt`, preserving any model-specific rank-local
+state as well. This is a format conversion, not a file rename; the repository
+does not provide an automatic standalone-scheduler fallback here. Validate the
+restored scheduler state and next learning-rate update against a compatible
+resume before using the converted checkpoint for training.
 
 ## Related pages
 

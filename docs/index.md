@@ -88,11 +88,14 @@ examples/seed_oss.md
 key_features/model_loader.md
 key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
-key_features/async_activate_offload.md
 key_features/extra_parallel.md
 key_features/sharded_embedding.md
 key_features/ulysses.md
 key_features/lora.md
+key_features/activation_offload.md
+key_features/moe_router_monitor.md
+key_features/channel_loss.md
+key_features/dcp_async_save.md
 key_features/mtp.md
 
 ```
