@@ -221,3 +221,17 @@ export as a fresh run.
 - [Checkpoint conversion](checkpoint_conversion.md) — DCP shards → HuggingFace safetensors (`scripts/merge_dcp_to_hf.py`).
 - [Trainer callbacks](trainer.md#callbacks) — `CheckpointCallback` (when) vs `GlobalStateCallback` (job cursor).
 - [LoRA checkpoints](../key_features/lora.md#4-checkpoint-saving) — adapter export under `lora_ckpt/`.
+
+### Optional source cache advice during DCP load
+
+For memory-constrained hosts, `train.checkpoint.dcp_evict_source_cache=true`
+asks the OS to discard the checkpoint byte ranges this rank has finished
+reading. It is disabled by default and requires POSIX `posix_fadvise` support.
+Advice is per host and does not guarantee eviction; shared shards may be read
+by other ranks at the same time, causing additional I/O or longer loading.
+Symbolic-link shards remain readable, but their cache advice is skipped with
+a warning. Advice follows each completed DCP read plan rather than each tensor;
+partial pages may remain cached and the read's peak usage may not decrease.
+For Python calls, pass `evict_source_cache=True` to `DistributedCheckpointer.load`.
+Benchmark the actual filesystem and topology before enabling this option.
+This flag does not change checkpoint contents or optimizer precision.

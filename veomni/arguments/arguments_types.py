@@ -1073,6 +1073,10 @@ class CheckpointConfig:
         default=None,
         metadata={"help": "Path to checkpoint to resume from."},
     )
+    dcp_evict_source_cache: bool = field(
+        default=False,
+        metadata={"help": "Advise the OS to discard local DCP pages after this rank reads them (may increase I/O)."},
+    )
     save_steps: int = field(
         default=0,
         metadata={"help": "Number of steps between two checkpoint saves."},
