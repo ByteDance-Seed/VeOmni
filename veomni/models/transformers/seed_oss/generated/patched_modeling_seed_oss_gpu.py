@@ -19,6 +19,8 @@
 #      Pass config to SeedOssRMSNorm instances
 #    - method_override: SeedOssModel.__init__
 #      Pass config to final SeedOssRMSNorm
+#    - method_override: SeedOssModel.forward
+#      Forward packed sequence metadata to VeOmni mask builders
 #    - method_override: SeedOssMLP.forward
 #      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules, then residual dropout
 #    - method_override: SeedOssForCausalLM.__init__
@@ -41,7 +43,6 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
-from transformers.masking_utils import create_causal_mask
 from transformers.modeling_layers import (
     GenericForQuestionAnswering,
     GenericForSequenceClassification,
@@ -61,7 +62,7 @@ from veomni.models.loss_utils import ForCausalLMLoss
 
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
@@ -220,13 +221,6 @@ class SeedOssAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-            kwargs,
-            impl=self.veomni_attn.impl,
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-        )
-
         attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
@@ -235,7 +229,7 @@ class SeedOssAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            **attn_kwargs,
+            **kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -370,7 +364,7 @@ class SeedOssRotaryEmbedding(nn.Module):
 
 # ======================================================================
 # [MODIFIED CLASS] SeedOssModel
-# Methods patched: __init__
+# Methods patched: __init__, forward
 # ======================================================================
 
 
@@ -391,6 +385,12 @@ class SeedOssModel(SeedOssPreTrainedModel):
 
         self.post_init()
 
+    # ================================================================
+    # Patch: SeedOssModel.forward
+    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+    #    into ``veomni.models.utils.mask_utils.create_causal_mask`` so packed
+    #    sequences build an isolated mask once in the model forward
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -418,13 +418,18 @@ class SeedOssModel(SeedOssPreTrainedModel):
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             position_ids = position_ids.unsqueeze(0)
 
+        # --- Patch.1 ---
         causal_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
+            **{
+                **kwargs,
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
         )
+        # --- Patch.1 ---
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)

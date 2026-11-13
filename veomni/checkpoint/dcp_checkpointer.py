@@ -586,9 +586,7 @@ def _prepare_stage_dir(stage_dir: str, path: str, group: Optional[Any] = None) -
     return stage_path
 
 
-def _promote_staged_checkpoint(
-    stage_path: str, final_path: str, step_root: Optional[str] = None, group: Optional[Any] = None
-) -> None:
+def _promote_staged_checkpoint(stage_path: str, final_path: str, group: Optional[Any] = None) -> None:
     """Copy a staged checkpoint to its destination, then drop the staged copy.
 
     The staging directory is node-local, so one rank per node copies all of it
@@ -615,10 +613,8 @@ def _promote_staged_checkpoint(
     previous checkpoint before the new one exists anywhere -- and keeping that
     checkpoint readable until the last possible moment is what staging is for.
 
-    ``step_root`` is the step directory, given when the destination may hold a
-    pre-split checkpoint whose marker sits there rather than inside
-    ``final_path``. Nested files are copied in the data phase, before any
-    ``.metadata`` is. The per-rank ``extra_state/`` files are among those files.
+    Nested files are copied in the data phase, before any ``.metadata`` is. The
+    per-rank ``extra_state/`` files are among those files.
     """
     metadata_name = DCP_MARKER_FILENAME
     is_node_leader = _local_rank() == 0
@@ -659,15 +655,8 @@ def _promote_staged_checkpoint(
         One module's directory. A sibling module of the same job lives beside it,
         is not being written, and keeps everything it has.
         """
-        # The step may predate this layout, in which case DCP left its marker at
-        # the step root rather than in here. Delete this import (and
-        # veomni/checkpoint/legacy_v0_1_12.py) to drop that layout.
-        from .legacy_v0_1_12 import drop_marker
-
         shutil.rmtree(final_path, ignore_errors=True)
         os.makedirs(final_path, exist_ok=True)
-        if step_root is not None:
-            drop_marker(step_root)
 
     def copy_this_nodes_files() -> None:
         """Copy every staged file on this node, except the completion markers.
@@ -836,8 +825,9 @@ class DistributedCheckpointer(CheckpointerBase):
             stage_dir: write the checkpoint here and copy it to ``path`` afterwards,
                 instead of writing straight to ``path``. Intended for a destination far
                 slower than local disk. The whole ``model/`` subtree — both DCP
-                directories and the scheduler sidecar — lands under the staging
-                directory and is copied together, with every ``.metadata`` copied
+                directories and the per-rank ``extra_state/`` pickles — lands under
+                the staging directory and is copied together, with every
+                ``.metadata`` copied
                 last. Staging is keyed per module as well as per run, so two modules
                 of one job do not sweep each other's staged files. The caller
                 owns the choice: this does not probe
@@ -890,11 +880,11 @@ class DistributedCheckpointer(CheckpointerBase):
 
         cls._create_checkpoint_dir(write_root)
 
-        # Sidecar first, then the DCP directories. Ordering no longer carries the
-        # completeness guarantee it used to — ``checkpoint_manifest.json`` does,
-        # and it is written only after every module's save has returned — but
-        # writing the small replicated file first still means a save that dies
-        # part-way leaves less behind.
+        # The per-rank extra state first, then the DCP directories. Ordering no
+        # longer carries the completeness guarantee it used to —
+        # ``checkpoint_manifest.json`` does, and it is written only after every
+        # module's save has returned — but writing the small per-rank pickles
+        # first still means a save that dies part-way leaves less behind.
         cls._save_extra_state(checkpoint_dir=write_root, state=state)
 
         try:
@@ -931,7 +921,7 @@ class DistributedCheckpointer(CheckpointerBase):
             raise
 
         if stage_path is not None:
-            _promote_staged_checkpoint(stage_path, model_root, step_root=checkpoint_dir, group=stage_group)
+            _promote_staged_checkpoint(stage_path, model_root, group=stage_group)
 
         logger.info_rank0(f"Saved checkpoint to {model_root}")
 
@@ -943,10 +933,9 @@ class DistributedCheckpointer(CheckpointerBase):
         staged save has ``_promote_staged_checkpoint`` do the same job at
         promotion time, because until then it has overwritten nothing.
 
-        Two places to look. This module's ``ckpt/`` and ``optimizer/``, and the
-        step root, where an older VeOmni's fused save left the same file. Both
-        are DCP's own marker, which is why both are dropped here rather than by
-        the callback: this class is the one that puts them back.
+        This module's ``ckpt/`` and ``optimizer/``: DCP's own marker, which is
+        why the checkpointer drops them rather than the callback -- this class
+        is the one that puts them back.
 
         Only this module's. A sibling module is not being rewritten and its
         markers still hold. The step's ``checkpoint_manifest.json`` is not ours
@@ -955,16 +944,10 @@ class DistributedCheckpointer(CheckpointerBase):
         One rank owns these files, so only that rank deletes them, and the
         reduction turns a failure there into one every rank sees.
         """
-        # The step being overwritten may predate this layout, in which case DCP
-        # left its marker at the step root. Delete this import (and
-        # veomni/checkpoint/legacy_v0_1_12.py) to drop that layout.
-        from .legacy_v0_1_12 import drop_marker
-
         is_coordinator = (not dist.is_initialized()) or dist.get_rank() == 0
         error: Optional[Exception] = None
         if is_coordinator:
             try:
-                drop_marker(checkpoint_dir)
                 for marker in dcp_markers(checkpoint_dir, [module]):
                     if os.path.exists(marker):
                         os.remove(marker)
@@ -987,9 +970,7 @@ class DistributedCheckpointer(CheckpointerBase):
 
         Mirrors :meth:`save`: weights from ``model/<module>/ckpt``, optimizer from
         ``model/<module>/optimizer``, model-bound extra state from the per-rank
-        ``extra_state/`` beside them. A checkpoint written before the split has
-        no ``model/`` at all and keeps both in one directory; that shape is
-        detected and read as-is.
+        ``extra_state/`` beside them.
 
         args:
             path: step directory to load from
@@ -1028,26 +1009,59 @@ class DistributedCheckpointer(CheckpointerBase):
 
         wants_optimizer = state.get("optimizer") is not None
 
-        fused_dir = cls._legacy_fused_dir(path, module)
-        if fused_dir is not None:
-            load_state: Dict[str, Any] = {"model": _model_state()}
-            if wants_optimizer:
-                load_state["optimizer"] = _optimizer_state()
-            dcp.load(
-                state_dict=load_state,
-                storage_reader=cls._create_storage_reader(fused_dir),
-                process_group=process_group,
-                planner=_model_load_planner(strict_model=not trainable_only, rows_by_name=row_counts),
-            )
-            cls._load_extra_state(checkpoint_dir=fused_dir, state=state)
-            logger.info_rank0(f"Loaded pre-split checkpoint from {fused_dir}")
-            return state
-
         model_root = model_dir(path, module)
-        weights_path = weights_dir(path, module)
+        # Every directory this load will read has to be complete, or ``dcp.load``
+        # fails with a bare "metadata is None" that names neither the path nor
+        # the reason. Two ways to get here: a step written by a layout this
+        # version no longer produces (see ``docs/usage/checkpoint.md``), or a
+        # save that was interrupted — on disk the two are the same shape.
+        #
+        # Reduced before any rank enters ``dcp.load``: the markers are read from
+        # the filesystem, and a job writing to non-shared storage
+        # (``dcp_save_to_lowest_rank``) can see a marker on one rank and not
+        # another. A rank that raised here alone would leave its peers waiting in
+        # the load's collectives until the backend timed out.
+        #
+        # Requiring the global ``.metadata`` is safe here because that is the
+        # only one VeOmni writes: ``FileSystemWriter`` is constructed with its
+        # defaults, so each save emits a single step-level ``.metadata`` and
+        # never the ``__{rank}.metadata`` a DCP load can fall back to. A
+        # checkpoint carrying only rank-local metadata is therefore not
+        # something this framework produces.
+        error: Optional[Exception] = None
+        for directory, wanted in (
+            (weights_dir(path, module), True),
+            (optimizer_dir(path, module), wants_optimizer),
+        ):
+            if not wanted:
+                continue
+            marker = os.path.join(directory, DCP_MARKER_FILENAME)
+            try:
+                # Opened, not stat-ed. A marker that exists but cannot be read
+                # passes ``os.stat`` and then fails inside ``dcp.load`` as
+                # "metadata is None" -- the message this guard exists to replace.
+                with open(marker, "rb"):
+                    pass
+            except FileNotFoundError:
+                error = FileNotFoundError(
+                    f"no complete DCP checkpoint under {directory}: {DCP_MARKER_FILENAME} is "
+                    "missing. Checkpoints written before the step directory was split by state "
+                    "owner are not resumable, and a save that did not finish leaves the same "
+                    "shape. See docs/usage/checkpoint.md."
+                )
+            except OSError as read_error:
+                # Unreadable is not missing. Reporting a permissions or I/O
+                # failure as "not resumable" would send the user to the layout
+                # doc for a problem that has nothing to do with the layout.
+                error = read_error
+            if error is not None:
+                break
+        raise_if_any_rank_failed(error, "validating the checkpoint to load", group=process_group)
+        if error is not None:
+            raise error
         dcp.load(
             state_dict={"model": _model_state()},
-            storage_reader=cls._create_storage_reader(weights_path),
+            storage_reader=cls._create_storage_reader(weights_dir(path, module)),
             process_group=process_group,
             planner=_model_load_planner(strict_model=not trainable_only, rows_by_name=row_counts),
         )
@@ -1066,22 +1080,6 @@ class DistributedCheckpointer(CheckpointerBase):
         logger.info_rank0(f"Loaded checkpoint from {model_root}")
 
         return state
-
-    @classmethod
-    def _legacy_fused_dir(cls, path: str, module: str) -> Optional[str]:
-        """Directory holding a pre-split checkpoint, or ``None`` for a current one.
-
-        Before weights and optimizer were separated there was one DCP directory
-        per model, marked by its own ``.metadata``: at the step root for a
-        single-model job, and at ``<step>/<module>/`` for SeedOmni V2. Neither has
-        a ``model/`` subtree, which is what tells the two apart.
-        """
-        if os.path.exists(os.path.join(weights_dir(path, module), DCP_MARKER_FILENAME)):
-            return None
-        legacy_dir = os.path.join(path, module) if module else path
-        if os.path.exists(os.path.join(legacy_dir, DCP_MARKER_FILENAME)):
-            return legacy_dir
-        return None
 
     @classmethod
     def wait_for_pending_save(cls) -> None:

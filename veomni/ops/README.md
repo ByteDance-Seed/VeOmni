@@ -43,18 +43,20 @@ when the selected implementation runs.
 | Op | Variants | Implementations |
 |---|---|---|
 | `attention` | `standard` | `eager`, `sdpa`, and FlashAttention/AITER/FlexAttention/MagiAttention/SageAttention names |
-| `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit` | `eager` orchestration |
+| `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit`, `bagel` | `eager` orchestration |
 | `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `offset` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; all accept optional `group_size` (fused weighted rows delegate grouped calls to eager) |
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
-| `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel` |
-| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `deepgemm_fp8` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant |
+| `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel`; `qat` (FP8 QAT) is `standard` only |
+| `linear` | `standard`, `grouped` | `eager`, `qat` (FP8 QAT). Rows take the projection **module** (`op(self.q_a_proj, x)`), not a weight tensor, so adapters work |
+| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `qat` (FP8/FP4 QAT), `deepgemm_fp8` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `token_logprobs` | `standard` | `eager`, `flash_attn` (GPU Triton cross-entropy), `torch_npu` (Ascend NPU cross-entropy) |
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
 | `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu` as supported by the family |
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `triton`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
+| `kv_round` | `standard`, `deepseek_v4` | `none` (leave stored tensors alone), `eager`, `triton` (NVIDIA SM89+/ROCm, FP8 E4M3); `standard` takes block width and quantized prefix as call arguments, `deepseek_v4` fixes the model's two geometries and takes `rope_features` |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
 

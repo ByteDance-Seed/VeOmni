@@ -232,6 +232,8 @@ def get_checkpoint_tensor_converter(
     model: Union["nn.Module", "PreTrainedModel"],
 ) -> Optional["CheckpointTensorConverter"]:
     """Return the checkpoint tensor converter registered on *model*, or ``None``."""
+    while isinstance(getattr(model, "module", None), nn.Module):
+        model = model.module
     factory = getattr(model, "_create_checkpoint_tensor_converter", None)
     if factory is None:
         return None
