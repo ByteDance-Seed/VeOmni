@@ -986,6 +986,34 @@ def _run_fsdp2_optimizer_step() -> None:
 
     assert all_reduce_dtypes == [torch.float32]
     torch.testing.assert_close(custom.weight.grad.to_local(), baseline.weight.grad.to_local(), rtol=5e-6, atol=5e-6)
+
+    # Exercise native BF16 NCCL ExtraParallel FSDP2 reduction when gradient_divide_factor != ep_fsdp_size
+    # (both ep_fsdp=2 > 1, which previously hit ProcessGroupNCCL PreMulSum float32*->bfloat16 zeroing,
+    # and singleton ep_fsdp=1, which must not double-divide).
+    mp_bf16 = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16)
+    ep_nccl_meshes = (
+        init_device_mesh(get_device_type(), (2, 2), mesh_dim_names=("ep_fsdp", "ep"))["ep_fsdp"],
+        init_device_mesh(get_device_type(), (1, 4), mesh_dim_names=("ep_fsdp", "ep"))["ep_fsdp"],
+    )
+    for para_fsdp_mesh in ep_nccl_meshes:
+        torch.manual_seed(4321)
+        ep_mod = nn.Linear(16, 8, bias=False, device=device)
+        w_ref = ep_mod.weight.detach().bfloat16().float().clone()
+        fully_shard(ep_mod, mesh=para_fsdp_mesh, mp_policy=mp_bf16)
+        rs_size = torch_parallelize._fsdp_reduce_scatter_size(para_fsdp_mesh)
+        torch_parallelize._set_extra_parallel_gradient_divide_factor(
+            ep_mod, float(world_size), reduce_scatter_size=rs_size
+        )
+        ep_in = torch.ones(2, 16, device=device, dtype=torch.bfloat16) * float(rank + 1)
+        ep_mod(ep_in).sum().backward()
+        full_grad = ep_mod.weight.grad.full_tensor().float()
+        participating = [rank] if rs_size == 1 else [r for r in range(world_size) if (r % 2) == (rank % 2)]
+        expected_val = sum(2.0 * (r + 1) for r in participating) / float(world_size)
+        torch.testing.assert_close(full_grad, torch.full_like(w_ref, expected_val), rtol=2e-2, atol=2e-2)
+        del ep_mod, w_ref, ep_in, full_grad
+        gc.collect()
+        dist.barrier(device_ids=[device.index])
+
     _run_transport_policy_fsdp2_gradients(mesh, hsdp_mesh, device)
 
 

@@ -615,6 +615,37 @@ class TorchCompileConfig:
     )
 
 
+_FLOAT8_RECIPES = ("tensorwise", "rowwise", "rowwise_with_gw_hp")
+
+
+@dataclass
+class Float8TrainingConfig:
+    """Opt-in torchao float8 computation for explicitly selected dense Linear modules."""
+
+    enable: bool = False
+    recipe: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"] = field(
+        default="tensorwise",
+        metadata={"help": "Float8 scaling recipe: 'tensorwise', 'rowwise', or 'rowwise_with_gw_hp'."},
+    )
+    target_modules: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Full Linear module names with optional '*' wildcards to convert to float8 training."},
+    )
+
+    def __post_init__(self):
+        """Validate float8 enable flag, scaling recipe, and explicit target module patterns."""
+        if type(self.enable) is not bool:
+            raise ValueError("float8.enable must be a boolean.")
+        if self.recipe not in _FLOAT8_RECIPES:
+            raise ValueError(f"float8.recipe must be one of {_FLOAT8_RECIPES}, got {self.recipe!r}.")
+        if not isinstance(self.target_modules, list) or any(
+            not isinstance(pattern, str) or not pattern for pattern in self.target_modules
+        ):
+            raise ValueError("float8.target_modules must be a list of nonempty module-name patterns.")
+        if self.enable and not self.target_modules:
+            raise ValueError("Enabled float8 training requires explicit target_modules.")
+
+
 @dataclass
 class MixedPrecisionConfig:
     """model.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
@@ -639,6 +670,7 @@ class MixedPrecisionConfig:
         default=True,
         metadata={"help": "Enable mixed precision cast forward inputs (FSDP2)."},
     )
+    float8: Float8TrainingConfig = field(default_factory=Float8TrainingConfig)
 
     def __post_init__(self):
         def _check_dtype(dtype: str):

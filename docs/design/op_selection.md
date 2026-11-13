@@ -132,9 +132,11 @@ each where the information lives:
   model's gate excludes those activations before the handle is called, so without
   the check the config would claim QAT and quantize nothing. Failing at load also
   beats failing on step one. `swiglu_mlp.FUSED_ACTIVATIONS` holds the set.
-- **A projection wrapped after construction** (LoRA keeps the base layer at
-  `base_layer`, so there is no `weight`) is refused by
-  `has_plain_linear_projections` when it calls `reject_quantizing_row`.
+- **A projection that is not an exact `nn.Linear`** is refused by
+  `has_plain_linear_projections` when it calls `reject_quantizing_row`: a
+  projection wrapped after construction (LoRA keeps the base layer at
+  `base_layer`, so there is no `weight`), or an `nn.Linear` subclass such as
+  torchao's `Float8Linear`, whose own forward computes the GEMM.
 - **Expert LoRA on a quantizing experts row** is refused by `_moe_lora_op`,
   because no adapter forward would quantize the base weights.
 
