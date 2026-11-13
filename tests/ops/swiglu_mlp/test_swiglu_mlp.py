@@ -761,4 +761,3 @@ def test_a_linear_subclass_projection_skips_the_fused_path():
     mlp.veomni_swiglu_mlp = _QatHandle()
     with pytest.raises(ValueError, match="nn.Linear subclass"):
         has_plain_linear_projections(mlp)
-
