@@ -78,7 +78,9 @@ __all__ = [
 
 DEFAULT_NS_COEFFICIENTS: Tuple[float, float, float] = (DEFAULT_A, DEFAULT_B, DEFAULT_C)
 
-# Lookup-table-like 2D weights are kept on AdamW.
+# Lookup-table, routing, hyper-connection stream-mixing, and scalar-gating 2D
+# weights are kept on AdamW so Newton-Schulz does not orthogonalize non-feature
+# control directions or amplify narrow row blocks by ``0.2 * sqrt(hidden_dim)``.
 _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
     "embed_tokens",
     "embedding",
@@ -87,6 +89,14 @@ _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
     "confidence_head",
     "output_layer",
     "conv1d",
+    ".gate.",
+    ".router.",
+    "shared_expert_gate",
+    "_hc.fn",
+    "hc_head.",
+    ".q_weight",
+    ".k_weight",
+    "weights_proj",
 )
 
 # Attribute names carrying a head count and a per-head row stride. MLA modules
@@ -417,7 +427,13 @@ def split_muon_adamw_params(
     """Split model parameters into Muon-eligible weights and AdamW fallback weights."""
     no_decay_modules = no_decay_modules or []
     no_decay_params = no_decay_params or []
+    if isinstance(extra_adamw_name_patterns, (str, bytes)):
+        raise ValueError(
+            "extra_adamw_name_patterns must be a sequence of parameter name substrings, not a bare string."
+        )
     extra_patterns = list(extra_adamw_name_patterns or ())
+    if any(not isinstance(pat, str) for pat in extra_patterns):
+        raise ValueError("extra_adamw_name_patterns entries must all be strings.")
 
     forced_adamw_fqns: set = set()
     for module_name, module in model.named_modules():
@@ -927,6 +943,19 @@ class DistributedMuon(Optimizer):
                 f"with the configured {[1 if b is None else b for b in configured]}; "
                 "keeping the configured value."
             )
+        # Normalize Kahan compensation state across checkpoint format/dtype transitions:
+        # - Flattened checkpoints saved before ``compensation`` existed leave ``{}``
+        #   behind when ``_unflatten_optim_state_dict`` reconstructs missing leaf keys.
+        # - Loading a BF16 checkpoint into an FP32 model must drop the cast buffer so
+        #   FP32 parameters stay on the plain update path.
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state.get(p)
+                if not state or "compensation" not in state:
+                    continue
+                local_dtype = p.to_local().dtype if isinstance(p, DTensor) else p.dtype
+                if local_dtype not in (torch.bfloat16, torch.float16) or not isinstance(state["compensation"], Tensor):
+                    state.pop("compensation", None)
 
     @torch.no_grad()
     def step(self, closure=None):  # type: ignore[override]
@@ -974,6 +1003,9 @@ class DistributedMuon(Optimizer):
                 state = self.state[p]
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                local_dtype = p.to_local().dtype if isinstance(p, DTensor) else p.dtype
+                if local_dtype in (torch.bfloat16, torch.float16) and "compensation" not in state:
+                    state["compensation"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                 buf: Tensor = state["momentum_buffer"]
 
                 grad = p.grad
@@ -1050,8 +1082,8 @@ class DistributedMuon(Optimizer):
             )
         entries.clear()
 
-    @staticmethod
     def _apply_ortho(
+        self,
         p: Tensor,
         ortho: Tensor,
         *,
@@ -1066,6 +1098,38 @@ class DistributedMuon(Optimizer):
             # Scale by the block shape NS actually saw, not the full matrix.
             lr_shape = (lr_shape[0] // head_blocks, lr_shape[1])
         adjusted_lr = _adjust_lr(lr, adjust_lr_fn, lr_shape)
+
+        comp: Optional[Tensor] = self.state[p].get("compensation")
+        if comp is not None:
+            # Low-precision (BF16/FP16) parameters under small SFT learning rates
+            # (e.g. muon_expert_zero_comm 3D experts at lr=4e-5 where |dw| ~ 8e-6
+            # vs |w| ~ 1.5e-2) suffer >90% mantissa underflow on direct BF16 add_.
+            # Accumulating both decoupled weight decay and the orthogonalized step
+            # in FP32 against a BF16 Kahan compensation shard preserves FP32
+            # master-weight precision at half the memory cost (+2 B/elem vs +6 B/elem).
+            if isinstance(p, DTensor):
+                p_local = p.to_local()
+                comp_local = comp.to_local()
+                if is_local_shard:
+                    ortho_local = ortho
+                elif isinstance(ortho, DTensor):
+                    ortho_local = ortho.to_local()
+                else:
+                    ortho_local = _wrap_full_as_dtensor_like(ortho.float(), p).to_local()
+            else:
+                p_local = p
+                comp_local = comp
+                ortho_local = ortho
+
+            if p_local.numel() > 0:
+                full = p_local.float().add_(comp_local.float())
+                if weight_decay != 0.0:
+                    full.mul_(1.0 - lr * weight_decay)
+                full.add_(ortho_local.float(), alpha=-adjusted_lr)
+                p_new = full.to(dtype=p_local.dtype)
+                comp_local.copy_(full.sub_(p_new.float()))
+                p_local.copy_(p_new)
+            return
 
         if weight_decay != 0.0:
             p.mul_(1 - lr * weight_decay)

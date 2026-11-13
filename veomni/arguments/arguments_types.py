@@ -279,6 +279,15 @@ class OptimizerConfig:
             )
         },
     )
+    muon_extra_adamw_names: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Additional case-insensitive parameter name substrings routed to the AdamW "
+                "group (preserving weight_decay) instead of Muon orthogonalization."
+            )
+        },
+    )
 
     def __post_init__(self):
         # Annotations are not enforced for YAML values (see constraints), so the
@@ -301,6 +310,15 @@ class OptimizerConfig:
                 raise ValueError(
                     f"model.optimizer.state_offload='cpu' is only supported for type='adamw'; got type={self.type!r}."
                 )
+        if (
+            isinstance(self.muon_extra_adamw_names, (str, bytes))
+            or not isinstance(self.muon_extra_adamw_names, (list, tuple))
+            or any(not isinstance(item, str) for item in self.muon_extra_adamw_names)
+        ):
+            raise ValueError(
+                "model.optimizer.muon_extra_adamw_names must be a list of strings, "
+                f"got {self.muon_extra_adamw_names!r}."
+            )
 
 
 @dataclass
