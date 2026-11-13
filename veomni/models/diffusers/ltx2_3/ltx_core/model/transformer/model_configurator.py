@@ -16,6 +16,7 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
 
     @classmethod
     def from_config(cls, config: dict, ops: TransformerOpsConfig | None = None) -> LTXModel:
+        """Build an audio-video transformer from checkpoint metadata and operator settings."""
         if ops is None:
             ops = TransformerOpsConfig()
         # Build caption projections for 19B models (projection handled in transformer).
@@ -70,6 +71,9 @@ class LTXModelConfigurator(ModelConfigurator[LTXModel]):
             caption_projection=caption_projection,
             audio_caption_projection=audio_caption_projection,
             cross_attention_adaln=config.get("cross_attention_adaln", False),
+            ff_bias=config.get("ff_bias", True),
+            audio_ff_bias=config.get("audio_ff_bias", True),
+            use_keyframes_abs_pos_embedding=config.get("use_keyframes_abs_pos_embedding", False),
         )
 
 
@@ -81,6 +85,7 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
 
     @classmethod
     def from_config(cls, config: dict, ops: TransformerOpsConfig | None = None) -> LTXModel:
+        """Build a video-only transformer from checkpoint metadata and operator settings."""
         if ops is None:
             ops = TransformerOpsConfig()
         # Build caption projection for 19B model (projection handled in transformer).
@@ -123,6 +128,9 @@ class LTXVideoOnlyModelConfigurator(ModelConfigurator[LTXModel]):
             apply_gated_attention=config.get("apply_gated_attention", False),
             caption_projection=caption_projection,
             cross_attention_adaln=config.get("cross_attention_adaln", False),
+            ff_bias=config.get("ff_bias", True),
+            audio_ff_bias=config.get("audio_ff_bias", True),
+            use_keyframes_abs_pos_embedding=config.get("use_keyframes_abs_pos_embedding", False),
         )
 
 

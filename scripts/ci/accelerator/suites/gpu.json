@@ -668,5 +668,15 @@
       "-x",
       "tests/optim/test_swap_adamw_device.py"
     ]
+  },
+  {
+    "name": "native-lora-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/lora/test_veomni_lora_native.py"
+    ]
   }
 ]

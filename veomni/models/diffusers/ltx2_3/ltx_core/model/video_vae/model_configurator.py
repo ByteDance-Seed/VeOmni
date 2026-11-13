@@ -65,15 +65,21 @@ class VideoDecoderConfigurator(ModelConfigurator[VideoDecoder]):
 VAE_DECODER_COMFY_KEYS_FILTER = (
     SDOps("VAE_DECODER_COMFY_KEYS_FILTER")
     .with_matching(prefix="vae.decoder.")
+    .with_matching(prefix="decoder.")
     .with_matching(prefix="vae.per_channel_statistics.")
+    .with_matching(prefix="per_channel_statistics.")
     .with_replacement("vae.decoder.", "")
+    .with_replacement("decoder.", "")
     .with_replacement("vae.per_channel_statistics.", "per_channel_statistics.")
 )
 
 VAE_ENCODER_COMFY_KEYS_FILTER = (
     SDOps("VAE_ENCODER_COMFY_KEYS_FILTER")
     .with_matching(prefix="vae.encoder.")
+    .with_matching(prefix="encoder.")
     .with_matching(prefix="vae.per_channel_statistics.")
+    .with_matching(prefix="per_channel_statistics.")
     .with_replacement("vae.encoder.", "")
+    .with_replacement("encoder.", "")
     .with_replacement("vae.per_channel_statistics.", "per_channel_statistics.")
 )

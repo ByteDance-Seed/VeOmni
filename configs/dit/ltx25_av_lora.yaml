@@ -1,0 +1,73 @@
+# LTX-2.5 22B-dev, offline text-to-audio/video SFT with LoRA.
+# Prepare model/data directories as documented in docs/examples/ltx-2.5.md.
+model:
+  model_path: /path/to/models/LTX-2.5-veomni
+  condition_model_path: /path/to/models/LTX-2.5-veomni
+  config_path: /path/to/models/LTX-2.5-veomni/config.json
+  condition_model_cfg:
+    with_audio: true
+    first_frame_conditioning_p: 0.0
+    timestep_sampling_mode: shifted_logit_normal
+  lora_config:
+    rank: 32
+    alpha: 32
+    dropout: 0.0
+    lora_modules: [to_q, to_k, to_v, to_out.0]
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    moe_implementation: eager
+    load_balancing_loss_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_decay_style: linear
+    lr_min: 1.0e-5
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      enable: true
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      offload: true
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        cast_forward_inputs: false
+
+data:
+  train_path: /path/to/ltx25-parquet
+  data_type: diffusion
+  datasets_type: iterable
+  train_sample: 16000
+  dataset_repeat: true
+  text_keys: text
+  max_seq_len: 8192
+  dataloader:
+    type: native
+    num_workers: 2
+    drop_last: true
+
+train:
+  training_task: offline_training
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+  seed: 42
+  num_train_epochs: 1
+  max_steps: 2000
+  checkpoint:
+    output_dir: outputs/ltx25_av_lora
+    save_steps: 250
+    save_hf_weights: true
+    hf_save_steps: 250
+  wandb:
+    enable: false
+    project: ltx25_av_lora
