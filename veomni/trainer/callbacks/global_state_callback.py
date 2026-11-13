@@ -161,9 +161,6 @@ class GlobalStateCallback(Callback):
         """
         args: "VeOmniArguments" = self.trainer.args
         step_root = layout.step_dir(args.train.checkpoint.save_path, state.global_step)
-        payload = self.state_dict(state)
-        loader_payload = {key: payload[key] for key in _LOADER_KEYS if key in payload}
-        extra_payload = {key: value for key, value in payload.items() if key not in _LOADER_KEYS}
 
         # A restarted run reaching this step again overwrites the cursor files, so
         # the manifest an earlier attempt left has to go before the first of them
@@ -180,6 +177,18 @@ class GlobalStateCallback(Callback):
                 logger.error(f"[RANK {self.rank}] failed to remove the manifest under {step_root}", exc_info=True)
                 remove_error = e
         raise_if_any_rank_failed(remove_error, "removing the stale checkpoint manifest")
+
+        payload, state_error = None, None
+        try:
+            payload = self.state_dict(state)
+            if not isinstance(payload, dict):
+                raise TypeError("Trainer checkpoint state must be a dictionary")
+        except BaseException as exc:  # noqa: BLE001 - synchronize a rank-local cursor failure
+            state_error = exc
+        raise_if_any_rank_failed(state_error, "collecting trainer checkpoint state")
+        assert payload is not None
+        loader_payload = {key: payload[key] for key in _LOADER_KEYS if key in payload}
+        extra_payload = {key: value for key, value in payload.items() if key not in _LOADER_KEYS}
 
         # Each rank writes its own files, so a full disk or a bad pickle starts out
         # visible to that rank alone. Reduce before the manifest: the manifest
