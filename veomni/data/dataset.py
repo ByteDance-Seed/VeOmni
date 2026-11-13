@@ -1922,6 +1922,9 @@ def build_weighted_multisource_dataset(
         weights=weights,
         seed=seed,
         level=level,
+        # Optional model hook (e.g. K3 expanded-token length) for token-level
+        # weighting; forwarded by the trainer when the model provides one.
+        sample_token_len_fn=kwargs.pop("sample_token_len_fn", None),
         source_names=source_names,
         source_ids=source_ids,
         upstream_sharded=split_by_node,

@@ -432,12 +432,21 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_dataset(self):
         args: VeOmniArguments = self.args
+        # Optional model hook (same source as the dataloader path below):
+        # multimodal models that expand modality placeholders inside the model
+        # report the expanded length so token-weighted multisource sampling
+        # weighs the true sequence cost. Text models: no-op, and mock trainers
+        # in unit tests drive this builder without any model attached.
+        _model = getattr(self, "model", None)
+        _model = getattr(_model, "unwrapped_module", _model)
+        _token_len_fn = getattr(_model, "get_dyn_bsz_length_fn", None)
         # Build dataset
         self.train_dataset = build_dataset(
             dataset_name=args.data.dataset_name,
             transform=self.data_transform,
             seed=args.train.seed,
             shuffle=args.data.dataloader.shuffle,
+            sample_token_len_fn=_token_len_fn() if _token_len_fn is not None else None,
             **asdict(args.data),
         )
         dataset_length = None if not hasattr(self.train_dataset, "__len__") else len(self.train_dataset)
@@ -459,6 +468,15 @@ class BaseTrainer(Stateful, ABC):
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
         dataloader_kwargs.pop("use_background_prefetcher", None)
+        # Optional model hook: multimodal models that expand modality placeholders
+        # inside the model (single-token placeholders) report the expanded length so
+        # dynamic batching budgets the true sequence cost. Text models: no-op, and
+        # mock trainers in unit tests drive this builder without any model attached.
+        _model = getattr(self, "model", None)
+        _model = getattr(_model, "unwrapped_module", _model)
+        _get_length_fn = getattr(_model, "get_dyn_bsz_length_fn", None)
+        if _get_length_fn is not None:
+            dataloader_kwargs["dyn_bsz_length_fn"] = _get_length_fn()
         self.train_dataloader = build_dataloader(
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,

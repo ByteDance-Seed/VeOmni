@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
 from torch import Tensor
 
 from ....registry import SavedState
@@ -31,6 +32,7 @@ class _Meta:
 
     empty: bool
     eps: float
+    x_dtype: torch.dtype | None = None
 
 
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
@@ -44,8 +46,13 @@ def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedStat
 
     import torch_npu
 
+    # aclnnRmsNorm has no mixed-dtype overload (fp32 x with bf16 gamma or vice
+    # versa); align defensively and cast the gradient back in ``backward``.
+    x_dtype = x.dtype if x.dtype != weight.dtype else None
+    if x_dtype is not None:
+        x = x.to(weight.dtype)
     output, rstd = torch_npu.npu_rms_norm(x, weight, eps)
-    return output, SavedState((x, weight, rstd), _Meta(False, eps))
+    return output, SavedState((x, weight, rstd), _Meta(False, eps, x_dtype))
 
 
 def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
@@ -59,7 +66,10 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor, Tensor]:
     import torch_npu
 
     (rstd,) = optional_rstd
-    return torch_npu.npu_rms_norm_backward(grad_output.contiguous(), x, weight, rstd)
+    grad_x, grad_weight = torch_npu.npu_rms_norm_backward(grad_output.contiguous(), x, weight, rstd)
+    if meta.x_dtype is not None:
+        grad_x = grad_x.to(meta.x_dtype)
+    return grad_x, grad_weight
 
 
 forward, backward = apply_group_size_fallback_weighted(forward, backward, _eager.forward, _eager.backward)
