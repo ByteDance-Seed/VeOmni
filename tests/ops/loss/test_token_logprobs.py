@@ -224,6 +224,158 @@ def test_token_logprobs_flash_attn_import_error_fallback_vs_strict(monkeypatch):
         )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("use_shift_labels", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("temperature", [1.0, 0.8])
+def test_chunk_logprobs_topk_ids_forward_and_backward_contract(monkeypatch, use_shift_labels, dtype, temperature):
+    """Verify ``topk_ids`` in ``chunk_logprobs_function`` and ``ForCausalLMLoss`` matches dense log-softmax gather."""
+    from veomni.models.loss_utils.cross_entropy_loss import ForCausalLMLoss
+
+    monkeypatch.setattr(cl, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    torch.manual_seed(13)
+
+    B, L, H, V, K = 2, 7, 8, 29, 4
+    hidden = torch.randn(B, L, H, dtype=dtype, requires_grad=True)
+    weight = torch.randn(V, H, dtype=dtype, requires_grad=True)
+    labels = torch.randint(0, V, (B, L), dtype=torch.int64)
+    labels[0, 3] = IGNORE_INDEX
+    labels[1, -2] = IGNORE_INDEX
+    shift_labels = torch.roll(labels, shifts=-1, dims=-1) if use_shift_labels else None
+    if shift_labels is not None:
+        shift_labels[0, 2] = IGNORE_INDEX
+    topk_ids = torch.stack([torch.randperm(V)[:K] for _ in range(B * L)]).view(B, L, K)
+
+    _, logits_out, aux = ForCausalLMLoss(
+        labels=labels,
+        shift_labels=shift_labels,
+        hidden_states=hidden,
+        weights=weight,
+        return_log_probs=True,
+        temperature=temperature,
+        topk_ids=topk_ids,
+        chunk_size=3,
+        ignore_index=IGNORE_INDEX,
+    )
+    assert logits_out is None
+    assert aux is not None and aux.topk_log_probs is not None
+    assert aux.topk_log_probs.shape == (B, L, K)
+
+    hidden_ref = hidden.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    if use_shift_labels:
+        h_used, l_used, ids_used = hidden_ref, shift_labels, topk_ids
+    else:
+        h_used, l_used, ids_used = hidden_ref[:, :-1, :], labels[:, 1:], topk_ids[:, 1:, :]
+    logits_ref = ((h_used @ weight_ref.t()) / temperature).float()
+    logp_ref = logits_ref.log_softmax(dim=-1)
+    valid = l_used != IGNORE_INDEX
+    lp_ref = torch.where(valid, logp_ref.gather(-1, l_used.clamp(min=0).unsqueeze(-1)).squeeze(-1), 0.0)
+    ent_ref = torch.where(valid, -(logp_ref.exp() * logp_ref).sum(dim=-1), 0.0)
+    topk_lp_ref = torch.where(valid.unsqueeze(-1), logp_ref.gather(-1, ids_used), 0.0)
+    if not use_shift_labels:
+        lp_ref = F.pad(lp_ref, (0, 1), value=0.0)
+        ent_ref = F.pad(ent_ref, (0, 1), value=0.0)
+        topk_lp_ref = F.pad(topk_lp_ref, (0, 0, 0, 1), value=0.0)
+
+    atol = 2e-2 if dtype == torch.bfloat16 else 1e-5
+    rtol = 2e-2 if dtype == torch.bfloat16 else 1e-5
+    torch.testing.assert_close(aux.log_probs, lp_ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(aux.entropy, ent_ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(aux.topk_log_probs, topk_lp_ref, rtol=rtol, atol=atol)
+
+    w_lp = torch.randn_like(aux.log_probs)
+    w_ent = torch.randn_like(aux.entropy)
+    w_topk = torch.randn_like(aux.topk_log_probs)
+    ((aux.log_probs * w_lp).sum() + (aux.entropy * w_ent).sum() + (aux.topk_log_probs * w_topk).sum()).backward()
+    ((lp_ref * w_lp).sum() + (ent_ref * w_ent).sum() + (topk_lp_ref * w_topk).sum()).backward()
+
+    torch.testing.assert_close(hidden.grad.float(), hidden_ref.grad.float(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(weight.grad.float(), weight_ref.grad.float(), rtol=rtol, atol=atol)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_chunk_logprobs_topk_edge_contracts_and_pytree(monkeypatch):
+    """Cover pytree leaf exposure, topk-only backward, ignored negative sentinels, duplicates, 2D/SP, and validation."""
+    from veomni.models.loss_utils.cross_entropy_loss import ForCausalLMLoss
+    from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
+
+    monkeypatch.setattr(cl, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
+    torch.manual_seed(29)
+
+    # 1. Packed 2D inputs (needs_trailing_pad=True) + duplicate topk_ids + negative sentinels on IGNORE_INDEX rows,
+    #    and backward through topk_log_probs ONLY (dlog_probs=None, dentropy=None).
+    T, H, V, K = 9, 8, 23, 4
+    hidden = torch.randn(T, H, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(V, H, dtype=torch.float32, requires_grad=True)
+    labels = torch.randint(0, V, (T,), dtype=torch.int64)
+    labels[4] = IGNORE_INDEX
+    topk_ids = torch.randint(0, V, (T, K), dtype=torch.int64)
+    topk_ids[2, 1] = topk_ids[2, 0]  # duplicate index in row -> scatter_add_ accumulates
+    topk_ids[4] = torch.tensor([-1, IGNORE_INDEX, -5, -99])  # negative sentinels at ignored target position
+
+    _, _, aux_2d = ForCausalLMLoss(
+        labels=labels,
+        hidden_states=hidden,
+        weights=weight,
+        return_log_probs=True,
+        topk_ids=topk_ids,
+        chunk_size=3,
+        ignore_index=IGNORE_INDEX,
+    )
+    out_obj = CausalLMOutputWithLogProbs(fused_linear_aux=aux_2d)
+    leaves = torch.utils._pytree.tree_leaves(out_obj)
+    assert any(leaf is aux_2d.topk_log_probs for leaf in leaves)
+
+    w_topk = torch.randn_like(aux_2d.topk_log_probs)
+    (aux_2d.topk_log_probs * w_topk).sum().backward()
+
+    hidden_ref = hidden.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    logp_ref = (hidden_ref[:-1] @ weight_ref.t()).log_softmax(dim=-1)
+    valid = labels[1:] != IGNORE_INDEX
+    safe_ids = torch.where(valid.unsqueeze(-1), topk_ids[1:], 0)
+    topk_ref = F.pad(torch.where(valid.unsqueeze(-1), logp_ref.gather(-1, safe_ids), 0.0), (0, 0, 0, 1), value=0.0)
+    torch.testing.assert_close(aux_2d.topk_log_probs, topk_ref, rtol=1e-5, atol=1e-5)
+    (topk_ref * w_topk).sum().backward()
+    torch.testing.assert_close(hidden.grad, hidden_ref.grad, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, rtol=1e-5, atol=1e-5)
+
+    # 2. labels=None with shift_labels provided + sp_enabled=True (no internal shift or trailing pad).
+    monkeypatch.setattr(cl, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=True))
+    _, _, aux_sp = ForCausalLMLoss(
+        labels=None,
+        shift_labels=labels,
+        hidden_states=hidden.detach(),
+        weights=weight.detach(),
+        return_log_probs=True,
+        topk_ids=topk_ids,
+        chunk_size=4,
+    )
+    assert aux_sp.topk_log_probs.shape == (T, K)
+    assert torch.all(aux_sp.topk_log_probs[4] == 0.0)
+
+    # 3. Validation guards: mutual exclusion with teacher_topk_ids and mismatched shapes / K <= 0.
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ForCausalLMLoss(
+            labels=labels,
+            hidden_states=hidden.detach(),
+            weights=weight.detach(),
+            return_log_probs=True,
+            topk_ids=topk_ids,
+            teacher_topk_ids=topk_ids,
+            teacher_topk_log_probs=torch.zeros_like(topk_ids, dtype=torch.float32),
+        )
+    with pytest.raises(ValueError, match="leading shape"):
+        cl.chunk_logprobs_function(
+            hidden.detach(), weight.detach(), labels, shift_labels=labels, topk_ids=topk_ids[:-1]
+        )
+    with pytest.raises(ValueError, match="positive"):
+        cl.chunk_logprobs_function(
+            hidden.detach(), weight.detach(), labels, shift_labels=labels, topk_ids=topk_ids[:, :0]
+        )
+
+
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Ascend NPU required")
 def test_npu_token_logprobs_matches_eager():
     """On Ascend NPU, default ``token_logprobs`` resolves to ``torch_npu`` and matches ``eager``."""

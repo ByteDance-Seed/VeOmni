@@ -1936,6 +1936,7 @@ def qwen3_5_forconditional_generation_forward_patched(
             labels is not None
             and kwargs.get("return_log_probs")
             and kwargs.get("teacher_topk_ids") is None
+            and kwargs.get("topk_ids") is None
             and not (isinstance(logits_to_keep, int) and logits_to_keep > 0)
         ):
             shift_labels = kwargs.pop("shift_labels", orig_shift_labels)
