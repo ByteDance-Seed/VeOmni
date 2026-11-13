@@ -27,6 +27,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
 
 LLADA_TOY = "./tests/toy_config/llada_toy"
 LLADA_MOE_TOY = "./tests/toy_config/llada_moe_toy"
@@ -236,6 +238,7 @@ def _load_balancing_worker():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_llada_two_ranks_agree_with_one():
     from ..tools.launch_utils import torchrun
 
@@ -243,6 +246,7 @@ def test_llada_two_ranks_agree_with_one():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4))
 def test_llada_four_ranks_agree_with_one_when_the_kv_heads_are_repeated():
     from ..tools.launch_utils import torchrun
 
@@ -250,6 +254,7 @@ def test_llada_four_ranks_agree_with_one_when_the_kv_heads_are_repeated():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_llada_moe_two_ranks_agree_with_one_including_the_aux_loss():
     from ..tools.launch_utils import torchrun
 
@@ -257,6 +262,7 @@ def test_llada_moe_two_ranks_agree_with_one_including_the_aux_loss():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_llada_v_two_ranks_agree_with_one_when_an_image_is_split():
     from ..tools.launch_utils import torchrun
 
@@ -264,6 +270,7 @@ def test_llada_v_two_ranks_agree_with_one_when_an_image_is_split():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_llada2_uni_two_ranks_agree_with_one_when_an_image_is_split():
     from ..tools.launch_utils import torchrun
 
@@ -271,6 +278,7 @@ def test_llada2_uni_two_ranks_agree_with_one_when_an_image_is_split():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_load_balancing_loss_reduces_over_the_group():
     from ..tools.launch_utils import torchrun
 

@@ -34,6 +34,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
 
 TOY_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "toy_config", "diffusion_gemma_toy")
 
@@ -664,6 +666,7 @@ def _padded_mode_refusal_worker():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_two_ranks_agree_with_one_on_the_encoder_and_the_ar_term():
     from ..tools.launch_utils import torchrun
 
@@ -672,6 +675,7 @@ def test_two_ranks_agree_with_one_on_the_encoder_and_the_ar_term():
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("return_logits", [True, False], ids=["materialized_logits", "chunked_diffusion_loss"])
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_two_ranks_agree_with_one_on_the_whole_model(return_logits: bool):
     from functools import partial
 
@@ -681,6 +685,7 @@ def test_two_ranks_agree_with_one_on_the_whole_model(return_logits: bool):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices: two KV heads repeated twice")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4))
 def test_four_ranks_agree_with_one_when_the_kv_heads_are_repeated():
     from ..tools.launch_utils import torchrun
 
@@ -688,6 +693,7 @@ def test_four_ranks_agree_with_one_when_the_kv_heads_are_repeated():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_the_backward_carries_the_sp_size_factor():
     from ..tools.launch_utils import torchrun
 
@@ -695,6 +701,7 @@ def test_the_backward_carries_the_sp_size_factor():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_the_trainer_reduces_the_loss_to_the_same_number():
     from ..tools.launch_utils import torchrun
 
@@ -702,6 +709,7 @@ def test_the_trainer_reduces_the_loss_to_the_same_number():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_a_loss_that_is_only_a_shard_is_still_refused():
     from ..tools.launch_utils import torchrun
 
@@ -716,6 +724,7 @@ def test_the_collectives_survive_being_replayed_by_recompute():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_attn_dg_prefix_is_refused_at_build_on_a_real_group():
     """The build-time gate, on a topology where `sp_enabled` is genuinely true.
 
@@ -728,6 +737,7 @@ def test_attn_dg_prefix_is_refused_at_build_on_a_real_group():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_a_padded_mode_refuses_to_build_on_a_real_group():
     """Same refusal the single-process tests cover, on a topology that really exists.
 

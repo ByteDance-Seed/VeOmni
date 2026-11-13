@@ -38,6 +38,7 @@ class LladaUniTextEncoderConfig(TextEncoderConfig):
         pad_token_id: Optional[int] = 156892,
         mask_token_id: int = 156895,
         mask_eps: float = 1e-3,
+        mask_seed: int = 0,
         text_vocab_size: int = 156891,
         image_token_offset: int = 157184,
         image_start_token_id: int = 156901,
@@ -56,6 +57,7 @@ class LladaUniTextEncoderConfig(TextEncoderConfig):
         )
         self.mask_token_id = mask_token_id
         self.mask_eps = mask_eps
+        self.mask_seed = mask_seed
         self.text_vocab_size = text_vocab_size
         self.image_token_offset = image_token_offset
         self.image_start_token_id = image_start_token_id

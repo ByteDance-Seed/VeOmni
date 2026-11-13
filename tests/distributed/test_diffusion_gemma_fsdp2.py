@@ -31,6 +31,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import MixedPrecisionConfig
 
 
@@ -334,6 +335,7 @@ def _component_grad_norm_worker(ep_size: int = 2, return_logits: bool = True):
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("ep_size", [1, 2], ids=["no_ep", "ep2"])
 @pytest.mark.parametrize("return_logits", [True, False], ids=["materialized_logits", "chunked_diffusion_loss"])
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_component_grad_norms_survive_the_shared_parameter_aliasing(ep_size: int, return_logits: bool):
     """``print_ar_df_norm``'s split backward, where FSDP2 can break it.
 
@@ -359,6 +361,7 @@ def test_component_grad_norms_survive_the_shared_parameter_aliasing(ep_size: int
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("ep_size", [1, 2], ids=["no_ep", "ep2"])
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_recompute_matches_the_plain_backward(ep_size: int):
     """Recomputing the encoder must not change a single gradient.
 
@@ -376,6 +379,7 @@ def test_recompute_matches_the_plain_backward(ep_size: int):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("ep_size", [1, 2], ids=["no_ep", "ep2"])
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_shared_weights_survive_fsdp2(ep_size: int):
     """Encoder/decoder sharing must survive `fully_shard` *and* a backward pass.
 

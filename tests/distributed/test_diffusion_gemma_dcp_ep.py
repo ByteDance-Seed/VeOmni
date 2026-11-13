@@ -36,6 +36,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import MixedPrecisionConfig
 
 
@@ -191,6 +192,7 @@ def _dcp_round_trip_worker(ep_size: int = 2):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
 @pytest.mark.parametrize("ep_size", [1, 2], ids=["no_ep", "ep2"])
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_experts_survive_a_dcp_round_trip(ep_size: int):
     """The aliased encoder name must not smuggle a local expert shard into the checkpoint.
 

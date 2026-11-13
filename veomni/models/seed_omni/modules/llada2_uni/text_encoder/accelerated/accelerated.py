@@ -36,6 +36,7 @@ from ....text_encoder.accelerated import (
 )
 from ..chat_template import (
     _OMNI_TOKENIZED,
+    DiffusionGemmaCorruptionEpoch,
     LladaUniChatMarkers,
     prepare_llada2_uni_sample_training,
 )
@@ -69,6 +70,25 @@ class TrainingMixin(BaseTrainingMixin):
     def encode_post(self, **outputs: Any) -> Dict[str, Any]:
         return super().encode_post(**outputs)
 
+    def _mask_epoch(self) -> "int | DiffusionGemmaCorruptionEpoch":
+        """The current epoch, so a sample redraws its corruption every time it is seen.
+
+        A shared mutable holder rather than an int, for the reason
+        `DiffusionGemmaCorruptionEpoch` documents: the dataset builders re-wrap the
+        transform with `functools.partial`, which copies the keyword dict, so only a
+        write through a shared object reaches the workers. ``OmniTrainer`` updates
+        ``state.epoch`` before the epoch's iterator is created; a launcher that wants a
+        different epoch sets `set_mask_epoch` on this module.
+        """
+        holder = getattr(self, "_mask_epoch_holder", None)
+        if holder is None:
+            holder = self._mask_epoch_holder = DiffusionGemmaCorruptionEpoch()
+        return holder
+
+    def set_mask_epoch(self, epoch: int) -> None:
+        """Advance the shared epoch counter, which changes the next pass's corruption draw."""
+        self._mask_epoch().epoch = int(epoch)
+
     def _prepare_encode_inputs(
         self,
         conversation_list: Optional[list[list[ConversationItem]]],
@@ -83,6 +103,8 @@ class TrainingMixin(BaseTrainingMixin):
                     config=self.config,
                     markers=self._chat_markers,
                     device=self.device,
+                    mask_seed=int(getattr(self.config, "mask_seed", 0)),
+                    mask_epoch=self._mask_epoch(),
                 )
             input_ids.extend(part.value for part in sample if part.type == "text" and not part.is_dummy)
         flat_ids, self._encode_batch_shape = naflatten(input_ids)

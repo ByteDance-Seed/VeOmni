@@ -25,7 +25,10 @@ from typing import Any
 
 import torch
 
-from veomni.data.data_transform import apply_dllm_masking
+from veomni.data.data_transform import (
+    DiffusionGemmaCorruptionEpoch,
+    apply_dllm_masking,
+)
 from veomni.utils.constants import IGNORE_INDEX
 
 from ....utils.conversation import ConversationItem
@@ -138,6 +141,8 @@ def prepare_llada2_uni_sample_training(
     config: Any,
     markers: LladaUniChatMarkers,
     device: torch.device,
+    mask_seed: int = 0,
+    mask_epoch: "int | DiffusionGemmaCorruptionEpoch" = 0,
 ) -> None:
     """Apply GlmImage chat template, splice VQ image spans, merge into one sequence, and apply dLLM masking."""
     parts = apply_lladauni_chat_template(sample, markers)
@@ -179,7 +184,7 @@ def prepare_llada2_uni_sample_training(
 
     ids_cpu = ids.cpu()
     generator = diffusion_gemma_noise_generator(
-        diffusion_gemma_sample_key(0, 0, ids_cpu),
+        diffusion_gemma_sample_key(mask_seed, mask_epoch, ids_cpu),
         0,
     )
     corrupted_ids, masked_labels, loss_weight = apply_dllm_masking(
@@ -207,6 +212,7 @@ def prepare_llada2_uni_sample_training(
 
 __all__ = [
     "_OMNI_TOKENIZED",
+    "DiffusionGemmaCorruptionEpoch",
     "LladaUniChatMarkers",
     "apply_lladauni_chat_template",
     "build_image_segment_ids",

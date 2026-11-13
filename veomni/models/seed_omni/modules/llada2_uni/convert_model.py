@@ -34,7 +34,7 @@ from ...utils.hf_layout import convert_with_hf_layout
 
 def convert_llada2_uni_from_raw(model_path: str, **kwargs: Any) -> dict[str, Any]:
     """Convert raw upstream ``inclusionAI/LLaDA2.0-Uni`` (``model_type: llada2_moe``) into SeedOmni modules."""
-    from scripts.convert_llada2uni_to_veomni import convert_checkpoint as convert_raw_to_veomni
+    from veomni.models.transformers.llada2_uni.convert_from_raw import convert_checkpoint as convert_raw_to_veomni
 
     with tempfile.TemporaryDirectory(prefix="llada2_uni_veomni_") as veomni_dir:
         convert_raw_to_veomni(model_path, veomni_dir, copy_tokenizer=True)

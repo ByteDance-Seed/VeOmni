@@ -46,6 +46,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import MixedPrecisionConfig
 
 
@@ -206,6 +207,7 @@ def _fold_preserves_the_forward_worker(ep_size: int):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 devices")
 @pytest.mark.parametrize("ep_size", [1, 2], ids=["no_ep", "ep2"])
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4))
 def test_folding_the_expert_scale_leaves_the_forward_alone(ep_size: int):
     """`ep2` is the arm that matters: it is the one where the two operands are cut
     differently, EP taking a block of experts from `down_proj` and leaving
