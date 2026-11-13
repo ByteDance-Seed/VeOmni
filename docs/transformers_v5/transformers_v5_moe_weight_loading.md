@@ -136,6 +136,32 @@ through the converter before dispatch, as the whole-tensor loader does. A
 converter that emits an ExtraParallel parameter from such a key, rather than
 through `fused_expert_target`, raises `NotImplementedError`.
 
+#### Row-wise companions
+
+A converter whose conversion of a row-sharded key needs a second key, row by row,
+declares it with two more methods:
+
+```python
+class MyTableConverter:
+    def dim0_rowwise_companion(self, name: str) -> Optional[str]:
+        """The key row `i` of the converted `name` also needs, or None."""
+        return f"{name}_scale" if name.endswith(".weight") else None
+
+    def convert_rows(self, name, rows, companion_rows):
+        """Convert matching row slices; `rows` covers `[a, b)` of the checkpoint's rows."""
+        return dequant(rows, companion_rows)
+```
+
+Row `i` of the output may depend only on row `i` of the key and of its companion,
+so the transform commutes with the `Shard(0)` split the ExtraParallel plan makes.
+The streaming loader then reads the same `[start, end)` row range of both keys
+(and never reads the companion on its own), zero-fills rows past the checkpoint,
+and hands the pair to `convert_rows`. A key outside every ExtraParallel plan is
+read whole, together with its whole companion. `can_handle_tensor` is checked at
+the same point: a converter that claims a key by its content -- a quantized weight
+it would dequantize -- makes the streaming loader raise rather than hand the raw
+tensor to the parameter.
+
 ### Saving (VeOmni modeling -> checkpoint)
 
 When `model.safetensors.index.json` from a per-expert HF checkpoint is used for

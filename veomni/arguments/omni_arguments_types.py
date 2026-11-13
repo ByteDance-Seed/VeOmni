@@ -138,17 +138,8 @@ def _check_hf_source_exportable(model_path: str) -> None:
         raise ValueError(f"`train.checkpoint.save_hf_weights` cannot write this source back: {e}") from e
 
 
-def _validate_hf_view_modules(
-    model_path: str,
-    modules: dict[str, OmniModuleRuntimeArguments],
-    *,
-    ep_sharded_stream_load: bool = False,
-) -> None:
-    """Under an HF ``model_path`` every module is one the family layout cuts from that checkpoint.
-
-    ``ep_sharded_stream_load`` is the top-level flag, which the composed wrap
-    (``fsdp_scope: model``) reads instead of the per-module ones.
-    """
+def _validate_hf_view_modules(model_path: str, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
+    """Under an HF ``model_path`` every module is one the family layout cuts from that checkpoint."""
     from ..models.seed_omni.utils.hf_layout import read_hf_source
 
     source = read_hf_source(model_path)
@@ -168,12 +159,6 @@ def _validate_hf_view_modules(
                 f"HuggingFace `{source.model_type}` checkpoint every module loads from. Drop the per-module "
                 "model_path, or convert the checkpoint to compose modules from several sources."
             )
-    streaming = sorted(name for name, args in modules.items() if args.ep_sharded_stream_load)
-    if ep_sharded_stream_load or streaming:
-        raise ValueError(
-            f"ep_sharded_stream_load (model: {ep_sharded_stream_load}, modules: {streaming}) does not apply the "
-            f"`{source.model_type}` HF layout's key renames. Disable it, or convert the checkpoint to a split one."
-        )
     overrides = {
         name: sorted(keys) for name, args in modules.items() if (keys := hf_module_model_config(args.model_config))
     }
@@ -264,9 +249,7 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         for_inference=for_inference,
         checkpoint_modules=ckpt_modules,
     )
-    _validate_hf_view_modules(
-        seed_omni_model_path, modules, ep_sharded_stream_load=model_runtime.ep_sharded_stream_load
-    )
+    _validate_hf_view_modules(seed_omni_model_path, modules)
     for module_args in modules.values():
         _validate_omni_accelerator(module_args.accelerator)
     _validate_composed_wrap(model_runtime.accelerator, modules)
@@ -332,10 +315,18 @@ def build_omni_module_runtime_args(
     # it off alongside `fsdp_mode: eager` keeps the single-process eager-inference
     # default from inheriting a rank0-broadcast load policy that cannot run
     # without a wrap.
+    # Mixed precision is off for the same reason it is on when training: it
+    # exists to keep fp32 master weights for an optimizer, and inference has no
+    # optimizer. Left on, it builds every module at float32 and calls
+    # `model.float()`, which upcasts whatever the checkpoint stored -- including
+    # a quantized model's fp8 weights and scales, since those are floating point
+    # too. A large quantized backbone replicates tens of GiB of fp32 that way,
+    # and its fp8 GEMMs would have been handed fp32 operands. These are defaults,
+    # so a config that wants fp32 inference can still ask for it.
     inference_default = (
         {
             "broadcast_model_weights_from_rank0": False,
-            "accelerator": {"fsdp_config": {"fsdp_mode": "eager"}},
+            "accelerator": {"fsdp_config": {"fsdp_mode": "eager", "mixed_precision": {"enable": False}}},
         }
         if for_inference
         else {}
@@ -464,10 +455,37 @@ def _resolve_model_path(
 
 
 def _module_base(global_dict: dict[str, Any]) -> dict[str, Any]:
+    """The module base a per-module overlay is merged onto.
+
+    The folded ``ep`` entry is removed because ``AcceleratorConfig`` re-folds it
+    from ``ep_size``; leaving it would make a module that overrides ``ep_size``
+    see the inherited size instead. The inherited *effective* width is carried
+    into ``ep_size`` first: a restored config can hold ``ep_size=1`` beside
+    ``extra_parallel_sizes=[2]``, where the list is what the mesh was built from,
+    and dropping that would silently shrink expert parallelism to 1.
+    """
     acc = global_dict.get("accelerator")
     if isinstance(acc, dict):
         acc["dp_replicate_size"] = -1
         acc["dp_shard_size"] = -1
+        names = acc.get("extra_parallel_names") or []
+        if "ep" in names:
+            i = names.index("ep")
+            sizes = acc.get("extra_parallel_sizes") or ()
+            placement = acc.get("extra_parallel_placement_innermost") or ()
+            inherited_size = sizes[i] if i < len(sizes) else acc.get("ep_size", 1)
+            if inherited_size != acc.get("ep_size", 1):
+                if acc.get("ep_size", 1) != 1:
+                    raise ValueError(
+                        f"accelerator.ep_size={acc.get('ep_size')} and extra_parallel_sizes['ep']="
+                        f"{inherited_size} disagree; 'ep' in extra_parallel_names is the same dimension "
+                        "as ep_size. Set one of them."
+                    )
+                acc["ep_size"] = inherited_size
+                if i < len(placement):
+                    acc["ep_outside"] = placement[i]
+            for key in ("extra_parallel_names", "extra_parallel_sizes", "extra_parallel_placement_innermost"):
+                acc[key] = [v for j, v in enumerate(acc.get(key) or ()) if j != i]
     return global_dict
 
 
@@ -524,6 +542,19 @@ class OmniInferArguments:
     )
     output_dir: str = field(default="output", metadata={"help": "Root output directory."})
     seed: int = field(default=42, metadata={"help": "Random seed."})
+    enable_full_determinism: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Opt into bitwise-reproducible generation (NCCL_DETERMINISTIC, "
+                "torch.use_deterministic_algorithms, cuDNN off). Off by default, "
+                "same as training and as vLLM serving: the rank-0 token broadcast "
+                "already keeps a multi-rank FSM from deadlocking on a last-bit "
+                "MoE scatter_add race. Turn this on only when a seeded prompt "
+                "must give the same answer twice; it is a large latency tax."
+            )
+        },
+    )
 
 
 @dataclass
@@ -834,18 +865,32 @@ def _validate_training_task_data(train: OmniTrainingArguments, data: OmniDataArg
 
 
 def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
-    """Reject an eager module under a top-level ``fsdp_scope='model'`` before any weights load."""
+    """Reject per-module wrap settings that a top-level ``fsdp_scope='model'`` cannot honour.
+
+    Two of them: an ``eager`` module (nothing would build it sharded), and
+    ``extra_parallel_only`` (it removes the wrap the composed parent owns, so the
+    per-module plan would be left applying to a parent that is also sharded for
+    storage).
+    """
     fsdp_config = accelerator.fsdp_config
     if fsdp_config.fsdp_scope != "model" or fsdp_config.fsdp_mode == "eager":
         return
-    eager = sorted(
+    unwrapped = sorted(
         name for name, module_args in modules.items() if module_args.accelerator.fsdp_config.fsdp_mode == "eager"
     )
-    if eager:
+    if unwrapped:
         raise ValueError(
             "fsdp_scope='model' wraps the composed OmniModel once, so no module can be loaded "
-            f"unwrapped; these use fsdp_mode='eager': {eager}. Run with fsdp_scope='module', or "
+            f"unwrapped; these use fsdp_mode='eager': {unwrapped}. Run with fsdp_scope='module', or "
             "give them fsdp2 / ddp."
+        )
+    no_wrap = sorted(
+        name for name, module_args in modules.items() if module_args.accelerator.fsdp_config.extra_parallel_only
+    )
+    if no_wrap:
+        raise ValueError(
+            "fsdp_scope='model' wraps the composed OmniModel once, so no module can skip that wrap; "
+            f"these set fsdp_config.extra_parallel_only: {no_wrap}. Run with fsdp_scope='module'."
         )
 
 

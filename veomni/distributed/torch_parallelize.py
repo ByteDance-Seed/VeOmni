@@ -16,7 +16,7 @@
 import types
 from collections.abc import Collection, Mapping
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -36,6 +36,7 @@ from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_lo
 from ..utils import logging, recompute_utils
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .emb_parallel import ShardedEmbedding
 from .fsdp2.reduce_scatter import (
     ReduceScatterTransportPolicy,
     register_fp32_reduce_scatter_with_low_precision_transport,
@@ -93,7 +94,19 @@ def _to_empty_preserving_nonpersistent_buffers(
                 continue
             buffers.append((module, name, buffer.detach().clone()))
 
+    # ``to_empty`` rebuilds every Parameter object, so the ``spec_info`` the
+    # parallel plan attached to the meta parameters is gone afterwards. Keep it
+    # by name and re-attach: without it a plan shard looks like a plain local
+    # tensor, and the optimizer then treats rows that differ per rank as a
+    # replica (averaging them in the gradient clip / step).
+    spec_infos = {
+        name: spec_info for name, param in model.named_parameters() if (spec_info := getattr(param, "spec_info", None))
+    }
     model.to_empty(device=device)
+    if spec_infos:
+        for name, param in model.named_parameters():
+            if name in spec_infos:
+                param.spec_info = spec_infos[name]
 
     for module, name, buffer in buffers:
         materialized_buffer = module._buffers[name]
@@ -410,6 +423,135 @@ def _is_fsdp_wrap_target(fqn: str, class_name: str, targets: Collection[str]) ->
     return False
 
 
+def _finish_without_fsdp_wrap(
+    model: "nn.Module",
+    weights_path: Optional[str | Mapping[str, str]],
+    parallel_state,
+    fqn2spec_info,
+    should_skip_hf_weight_load: bool,
+    kwargs: Dict[str, Any],
+) -> "nn.Module":
+    """Materialize and load a model whose only parallelism is its ExtraParallel plan.
+
+    FSDP and the plan shard for different reasons. FSDP shards for *storage* and
+    all-gathers the parameter back before the operator runs, so it communicates
+    parameters and computes exactly what one device would. ep / emb shard for
+    *compute*: the parameter is never reassembled, tokens are routed to the rank
+    holding their expert or their table rows, and what crosses the wire is
+    activations. Only the second kind is load-bearing at inference, where there
+    are no gradients and no optimizer state for the first kind to shard.
+
+    Dropping the wrap is what makes a quantized checkpoint loadable at all: an
+    FSDP parameter group requires one original dtype, while one quantized decoder
+    layer holds several (packed int8 weights, fp8 values, fp8 or fp32 scales, and
+    fp32 numerics buffers). That is a property of quantized storage, not a
+    configuration to get right.
+
+    What it costs is the parameters the plan does not name: they stay whole on
+    every rank instead of being sharded for storage. That is logged rather than
+    assumed, since it is the number that decides whether the model fits.
+    """
+    # The plan builds its DTensors over a 2D ``(para_fsdp, para)`` mesh and
+    # leaves the first axis to FSDP. With no wrap nothing shards it, so a
+    # topology that expects one would silently hold every expert `para_fsdp`
+    # times over -- exactly the kind of quiet growth this path exists to avoid.
+    for para in parallel_state.extra_parallel_names:
+        if not parallel_state.extra_parallel_enabled(para):
+            continue
+        para_fsdp_size = parallel_state.extra_parallel_fsdp_size(para)
+        if para_fsdp_size != 1:
+            raise ValueError(
+                f"fsdp_config.extra_parallel_only needs {para} to span the whole shard axis, but "
+                f"{para}_fsdp_size={para_fsdp_size}: the plan leaves that axis to FSDP, and without "
+                f"the wrap it would not be sharded at all. Set {para}_size to the dp_shard size."
+            )
+
+    # Keyed on the plan, not on `isinstance(param, DTensor)`: ExtraParallel
+    # leaves a plain local tensor behind with its SpecInfo alongside, so a
+    # DTensor test calls every parameter replicated and reports the whole model.
+    sharded_bytes = replicated_bytes = 0
+    for fqn, param in model.named_parameters():
+        spec_info = (fqn2spec_info or {}).get(fqn)
+        size = param.numel() * param.element_size()
+        if spec_info is not None and isinstance(spec_info.placement, Shard):
+            sharded_bytes += size
+        else:
+            replicated_bytes += size
+    logger.info_rank0(
+        "ExtraParallel only: skipping the FSDP2 wrap. "
+        f"{sharded_bytes / 1024**3:.2f} GiB a rank is sharded by the plan; "
+        f"{replicated_bytes / 1024**3:.2f} GiB it does not name is replicated on every rank."
+    )
+
+    enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False) or bool(
+        getattr(getattr(model, "config", None), "cpu_offload", False)
+    )
+    if enable_fsdp_cpu_offload and replicated_bytes:
+        # FSDP CPU offload works by staging parameters back onto the accelerator
+        # in a pre-forward hook. There is no hook here, so the parameters the plan
+        # does not name would be materialized on the host and stay there, and the
+        # first operator to meet an accelerator activation raises a device
+        # mismatch. Refuse instead of producing that later.
+        raise ValueError(
+            "fsdp_config.offload cannot be combined with fsdp_config.extra_parallel_only: FSDP CPU "
+            "offload stages parameters back onto the accelerator through FSDP's own hooks, and this "
+            "path has none. Keep the wrap, or leave offload off."
+        )
+    model._fsdp_cpu_offload_enabled = enable_fsdp_cpu_offload
+    assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
+    materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
+
+    _materialize_and_load_weights(
+        model,
+        weights_path,
+        materialize_device,
+        should_skip_hf_weight_load=should_skip_hf_weight_load,
+        is_peft_model=kwargs.pop("is_peft_model", False),
+        adapter_path=kwargs.pop("adapter_path", None),
+        broadcast_from_rank0=bool(kwargs.get("broadcast_model_weights_from_rank0")),
+        cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
+        max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
+        fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
+        ep_sharded_stream_load=bool(kwargs.get("ep_sharded_stream_load")),
+        module_skip_hf_weight_load=kwargs.pop("module_skip_hf_weight_load", None),
+        module_is_peft_model=kwargs.pop("module_is_peft_model", None),
+        module_adapter_path=kwargs.pop("module_adapter_path", None),
+    )
+
+    if materialize_device == "cpu":
+        _move_buffers_to_device(model, get_device_type())
+
+    _divide_extra_parallel_grads_like_fsdp(model, parallel_state, fqn2spec_info)
+    # Read by the grad clipper, which averages the replicated parameters' grads.
+    model._extra_parallel_only = True
+    for module in model.modules():
+        if isinstance(module, ShardedEmbedding):
+            module.outside_fsdp = True
+    return model
+
+
+def _divide_extra_parallel_grads_like_fsdp(model: "nn.Module", parallel_state, fqn2spec_info) -> None:
+    """Scale plan-sharded grads the way the skipped FSDP2 wrap would have.
+
+    A row-sharded table's gradient is complete after ``AllToAllEmbedding``'s
+    backward, but as the *sum* of every rank's contribution. The wrapped path
+    divides ExtraParallel grads by ``extra_parallel_gradient_divide_factor``
+    (the world size), so without this an unwrapped module would take steps
+    ``world_size`` times larger than the same module under FSDP2. A tensor hook
+    runs before accumulation, so gradient accumulation stays correct.
+    """
+    for fqn, param in model.named_parameters():
+        spec_info = (fqn2spec_info or {}).get(fqn)
+        if not param.requires_grad or spec_info is None or not isinstance(spec_info.placement, Shard):
+            continue
+        para = spec_info.para_name
+        if not parallel_state.extra_parallel_enabled(para):
+            continue
+        factor = parallel_state.extra_parallel_gradient_divide_factor(para)
+        if factor > 1:
+            param.register_hook(lambda grad, factor=factor: grad / factor)
+
+
 def _configure_fsdp_gradient_reduction(
     module: FSDPModule,
     *,
@@ -427,6 +569,7 @@ def _configure_fsdp_gradient_reduction(
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str | Mapping[str, str]] = None,
+    extra_parallel_only: bool = False,
     enable_reshard_after_forward: bool = True,
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     basic_modules: Optional[List[str]] = None,
@@ -580,6 +723,16 @@ def parallelize_model_fsdp2(
         _extra_parallel_mesh = None
         _extra_parallel_map = None
 
+    if extra_parallel_only:
+        return _finish_without_fsdp_wrap(
+            model,
+            weights_path,
+            parallel_state,
+            fqn2spec_info,
+            should_skip_hf_weight_load=should_skip_hf_weight_load,
+            kwargs=kwargs,
+        )
+
     # Extract ExtraParallel modules from the target classes if any, then pair them.
     # Regard each target module as a layer.
     # Note that all target modules should include ExtraParallel modules.
@@ -648,11 +801,32 @@ def parallelize_model_fsdp2(
         "reshard_after_forward": enable_reshard_after_forward,
         "shard_placement_fn": _veomni_shard_placement_fn,
     }
-    if persistent_extra_parallel_params:
-        # These params already carry their complete 2D DTensor placement. Every
-        # ancestor FSDP group must ignore them or the parent layer/root would
-        # absorb them and reintroduce a parameter all-gather.
-        fsdp_kwargs["ignored_params"] = persistent_extra_parallel_params
+    ignored_params = set(persistent_extra_parallel_params or ())
+    # A parameter that is not floating point cannot be an FSDP2 parameter at
+    # all: sharding one ends in `nn.Parameter(...)` with the default
+    # `requires_grad=True`, which torch refuses for an integer tensor. This is
+    # not a policy that could be configured differently.
+    #
+    # What lands here is packed quantized storage -- 4-bit experts are two values
+    # to an int8 byte, because safetensors has no 4-bit float. Such a tensor is
+    # frozen and dequantized inside the kernel that reads it.
+    #
+    # Only the ones an ExtraParallel plan has already placed are ignored, not
+    # every non-float parameter. One that nothing has sharded would then be held
+    # whole on every rank, and silently: the unsharded fp4 experts were 4.22 GiB
+    # a layer. Left to FSDP it raises instead, which is the honest answer to
+    # "nothing can shard this".
+    for fqn, param in model.named_parameters():
+        if param.is_floating_point():
+            continue
+        spec_info = (fqn2spec_info or {}).get(fqn)
+        if spec_info is not None and isinstance(spec_info.placement, Shard):
+            ignored_params.add(param)
+    if ignored_params:
+        # These params already carry their complete placement. Every ancestor
+        # FSDP group must ignore them or the parent layer/root would absorb them
+        # and reintroduce a parameter all-gather.
+        fsdp_kwargs["ignored_params"] = ignored_params
     # prepare mp_policy kwargs
     if mixed_precision.enable:
         mp_policy = MixedPrecisionPolicy(
@@ -887,21 +1061,41 @@ def parallelize_model_fsdp2(
         parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
     ) and kwargs.pop("enable_forward_prefetch", True)
     if need_manual_prefetch:
-        blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules
-        next_blocks = blocks[1:] + [None]
-        for current_block, next_block in zip(blocks, next_blocks):
-            if next_block is not None:
-                prefetch_modules = next_block._fsdp_modules
-                # prefetch in order of attn, gate, experts
-                current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
+        # Group target modules by their parent container prefix (e.g. "model.layers"
+        # vs "model.engram") so sidecar module groups registered after the main
+        # decoder stack do not chain into or out of the decoder layers' prefetch list.
+        # Additionally, in backward, only attach explicit prefetch to the inner
+        # FSDP module (or single-module block) so that when gradient checkpointing
+        # is enabled, layer L's outer pre_backward does not prefetch layer L-1's
+        # experts before layer L's own AC recomputation and expert backward have run.
+        groups_by_prefix: Dict[str, List[nn.Module]] = {}
+        for fqn, (layer_mod, _) in layer_pairs_list:
+            prefix = fqn.rsplit(".", 1)[0] if "." in fqn else ""
+            groups_by_prefix.setdefault(prefix, []).append(layer_mod)
 
-        # configure backward prefetch
-        rev_blocks = list(reversed(blocks))
-        prev_blocks = rev_blocks[1:] + [None]
-        for current_block, prev_block in zip(rev_blocks, prev_blocks):
-            if prev_block is not None:
-                prefetch_modules = prev_block._fsdp_modules
-                current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
+        for blocks in groups_by_prefix.values():
+            if len(blocks) <= 1:
+                continue
+            next_blocks = blocks[1:] + [None]
+            for current_block, next_block in zip(blocks, next_blocks):
+                if next_block is not None:
+                    prefetch_modules = next_block._fsdp_modules
+                    # prefetch in order of attn, gate, experts
+                    current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
+
+            # configure backward prefetch
+            rev_blocks = list(reversed(blocks))
+            prev_blocks = rev_blocks[1:] + [None]
+            for current_block, prev_block in zip(rev_blocks, prev_blocks):
+                if prev_block is not None:
+                    prefetch_modules = prev_block._fsdp_modules
+                    # Trigger backward prefetch from the inner FSDP submodule
+                    # (e.g. current_block.mlp.experts) rather than the outer
+                    # decoder layer so that under activation checkpointing the
+                    # next layer's weights are prefetched during current_block's
+                    # backward rather than before current_block's recompute.
+                    trigger_mod = current_block._fsdp_modules[0] if current_block._fsdp_modules else current_block
+                    trigger_mod.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
 
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
@@ -1030,6 +1224,7 @@ def parallelize_model_ddp(
 def build_parallelize_model(
     model: "nn.Module",
     weights_path: Optional[str | Mapping[str, str]] = None,
+    extra_parallel_only: bool = False,
     enable_reshard_after_forward: bool = True,
     mixed_precision: MixedPrecisionConfig = MixedPrecisionConfig(enable=True),  # noqa
     enable_gradient_checkpointing: bool = True,
@@ -1135,6 +1330,7 @@ def build_parallelize_model(
             model = parallelize_model_fsdp2(
                 model=model,
                 weights_path=weights_path,
+                extra_parallel_only=extra_parallel_only,
                 enable_reshard_after_forward=enable_reshard_after_forward,
                 mixed_precision=mixed_precision,
                 basic_modules=basic_modules,

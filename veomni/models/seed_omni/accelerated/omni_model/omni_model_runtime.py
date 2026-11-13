@@ -306,6 +306,10 @@ class OmniModelRuntime:
             self.model = build_parallelize_model(
                 self.model,
                 init_device=acc.init_device,
+                # A composed wrap always applies FSDP2 to the parent; the
+                # per-module plan is inside it, so `extra_parallel_only` cannot be
+                # used here (`_validate_composed_wrap` refuses that pairing).
+                extra_parallel_only=False,
                 weights_path=weights_path,
                 should_skip_hf_weight_load=False,
                 enable_reshard_after_forward=acc.fsdp_config.reshard_after_forward,

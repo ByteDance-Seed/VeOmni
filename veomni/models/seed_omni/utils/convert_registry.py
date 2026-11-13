@@ -5,13 +5,17 @@ Each family registers a converter under its upstream HuggingFace
 :class:`~veomni.models.seed_omni.utils.hf_layout.OmniHFLayout`, which then
 does the split). The converter **returns** split modules and, when it has them,
 graphs; :func:`convert_checkpoint` writes the split directory (CLI:
-``scripts/seed_omni/convert_model.py``). Graphs are optional at convert time —
+``scripts/seed_omni/convert_model.py``). A converter whose signature takes
+``output_dir`` streams its module subfolders there itself and returns
+``module_names`` instead of ``modules``, for checkpoints too large to build a
+model from. Graphs are optional at convert time —
 train / generate load sidecars from the checkpoint (or accept an override) and
 error only if they still have nothing to run.
 """
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -123,7 +127,8 @@ def load_family_graphs(
 def _save_converted_omni(
     output_dir: str,
     *,
-    modules: Mapping[str, PretrainedOmniModule],
+    modules: Mapping[str, PretrainedOmniModule] | None = None,
+    module_names: list[str] | None = None,
     training_graphs: dict[str, list[dict[str, Any]]] | None = None,
     generation_graphs: dict[str, dict[str, Any]] | None = None,
     train_type: str | None = None,
@@ -133,19 +138,27 @@ def _save_converted_omni(
     """Write a split omni checkpoint: module subfolders, plus graph sidecars when given.
 
     A family can split modules before its DAGs/FSMs exist. Graph endpoints are
-    checked when the checkpoint is loaded, not here.
+    checked when the checkpoint is loaded, not here. ``module_names`` instead of
+    ``modules`` means a streaming converter already wrote those subfolders, so
+    only the root config and graph sidecars are written here.
     """
     from ..configuration_omni import OmniConfig
     from ..modeling_omni import OmniModel
 
+    if (modules is None) == (module_names is None):
+        raise ValueError("A converter returns exactly one of `modules` and `module_names`.")
     config = OmniConfig(
-        _module_entries={name: {"model_path": name} for name in modules},
+        _module_entries={name: {"model_path": name} for name in (modules if modules is not None else module_names)},
         training_graphs=dict(training_graphs or {}),
         generation_graphs=dict(generation_graphs or {}),
         train_type=train_type,
         infer_type=infer_type,
         generation_kwargs=generation_kwargs,
     )
+    if modules is None:
+        config.load_checkpoint_sidecars(output_dir)
+        config.save_pretrained(output_dir)
+        return
     OmniModel(config, modules).save_pretrained(output_dir)
 
 
@@ -168,7 +181,7 @@ def convert_checkpoint(
         kwargs.setdefault("training_graph", training_graph)
     if generation_graph is not None:
         kwargs.setdefault("generation_graph", generation_graph)
-    converted = _run_converter(model_path, **kwargs)
+    converted = _run_converter(model_path, output_dir, **kwargs)
     _apply_graph_files(converted, training_graph=training_graph, generation_graph=generation_graph)
     _save_converted_omni(output_dir, **converted)
 
@@ -197,7 +210,7 @@ def _apply_graph_files(
             converted["infer_type"] = next(iter(graphs)) if graphs else None
 
 
-def _run_converter(model_path: str, **kwargs) -> dict[str, Any]:
+def _run_converter(model_path: str, output_dir: str, **kwargs) -> dict[str, Any]:
     """Dispatch to the registered converter; returns kwargs for :func:`_save_converted_omni`.
 
     A family with no converter of its own but a registered
@@ -215,6 +228,8 @@ def _run_converter(model_path: str, **kwargs) -> dict[str, Any]:
     if model_type not in OMNI_CONVERT_REGISTRY.valid_keys() and has_hf_layout(model_type):
         return convert_with_hf_layout(model_path, **kwargs)
     converter: ConvertFn = OMNI_CONVERT_REGISTRY[model_type]()
+    if "output_dir" in inspect.signature(converter).parameters:
+        return converter(model_path, output_dir=output_dir, **kwargs)
     return converter(model_path, **kwargs)
 
 

@@ -10,6 +10,7 @@ Usage:
     python tests/utils/test_save_safetensor_utils.py -v
 """
 
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -38,6 +39,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 # via "veomni.utils.save_safetensor_utils.<name>".
 
 _MOD = "veomni.utils.save_safetensor_utils"
+_CONSOLIDATE = "torch.distributed.checkpoint._consolidate_hf_safetensors"
 
 
 class _TinyModel(nn.Module):
@@ -76,6 +78,8 @@ def _call_save_distributed(model, save_path, fqn_to_index_mapping, model_assets,
         # --- deferred imports: patch at source ---
         patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", mock_writer_cls),
         patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
+        patch(f"{_CONSOLIDATE}.consolidate_safetensors_files", MagicMock()),
+        patch(f"{_CONSOLIDATE}.consolidate_safetensors_files_on_every_rank", MagicMock()),
         # --- module-level imports: patch on consumer ---
         patch(f"{_MOD}.get_model_save_state", mock_get_state),
         patch(f"{_MOD}.dcp", MagicMock(save=mock_dcp_save)),
@@ -84,6 +88,10 @@ def _call_save_distributed(model, save_path, fqn_to_index_mapping, model_assets,
         patch(f"{_MOD}.helper", MagicMock()),
         patch(f"{_MOD}.gc", MagicMock()),
         patch(f"{_MOD}.synchronize", MagicMock()),
+        # The staging directory is never created here, and its cleanup is not
+        # mocked, so an unmocked rmtree would delete a real ``<save_path>/sharded``
+        # that belongs to something else.
+        patch("shutil.rmtree", MagicMock()),
     ):
         from veomni.utils.save_safetensor_utils import _save_hf_safetensor_distributed
 
@@ -432,16 +440,157 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         passed = writer_cls.call_args.kwargs["fqn_to_index_mapping"]
         self.assertEqual(set(passed), {"embed_tokens.weight", "linear.weight"})
 
-    def test_none_mapping_passed_through(self):
-        fake = {"w": torch.randn(4, 4, dtype=torch.bfloat16)}
-        _, writer_cls, _, _ = _call_save_distributed(
-            self.model,
-            "/tmp/test",
-            None,
-            None,
-            fake,
+    def test_none_mapping_becomes_size_balanced_files(self):
+        fake = {"w": torch.randn(4, 4, dtype=torch.bfloat16), "b": torch.randn(4, dtype=torch.bfloat16)}
+        with patch(f"{_MOD}._MAX_SHARD_BYTES", 32), tempfile.TemporaryDirectory() as save_root:
+            _, writer_cls, _, _ = _call_save_distributed(
+                self.model,
+                save_root,
+                None,
+                None,
+                fake,
+            )
+        self.assertEqual(writer_cls.call_args.kwargs["fqn_to_index_mapping"], {"w": 1, "b": 2})
+        self.assertFalse(writer_cls.call_args.kwargs["enable_consolidation"])
+
+    def test_none_mapping_gathers_rank_partitioned_save_state_across_ranks(self):
+        """When save_state is rank-partitioned and fqn_to_index_mapping is None, all ranks derive the same global mapping."""
+        from veomni.utils.save_safetensor_utils import _size_balanced_index_mapping
+
+        rank0_state = {
+            "w0.weight": torch.zeros(4, 4, dtype=torch.bfloat16),  # 32B
+            "w0.scale": torch.zeros(2, 2, dtype=torch.uint8),  # 4B
+            "w2.weight": torch.zeros(4, 4, dtype=torch.bfloat16),  # 32B
+        }
+        rank1_state = {
+            "w1.weight": torch.zeros(4, 4, dtype=torch.bfloat16),  # 32B
+            "w3.weight": torch.zeros(4, 4, dtype=torch.bfloat16),  # 32B
+            "w3.scale": torch.zeros(2, 2, dtype=torch.uint8),  # 4B
+        }
+        rank0_local = [(k, v.numel() * v.element_size()) for k, v in rank0_state.items()]
+        rank1_local = [(k, v.numel() * v.element_size()) for k, v in rank1_state.items()]
+
+        def fake_all_gather_object(output_list, obj):
+            output_list[0] = rank0_local
+            output_list[1] = rank1_local
+
+        mock_dist = MagicMock(
+            is_initialized=MagicMock(return_value=True),
+            get_world_size=MagicMock(return_value=2),
+            all_gather_object=MagicMock(side_effect=fake_all_gather_object),
         )
-        self.assertIsNone(writer_cls.call_args.kwargs["fqn_to_index_mapping"])
+        with patch(f"{_MOD}.dist", mock_dist), patch(f"{_MOD}._MAX_SHARD_BYTES", 40):
+            mapping_rank0 = _size_balanced_index_mapping(rank0_state)
+            mapping_rank1 = _size_balanced_index_mapping(rank1_state)
+
+        expected = {
+            "w0.weight": 1,
+            "w0.scale": 1,
+            "w1.weight": 2,
+            "w2.weight": 3,
+            "w3.weight": 4,
+            "w3.scale": 4,
+        }
+        self.assertEqual(mapping_rank0, expected)
+        self.assertEqual(mapping_rank1, expected)
+
+    def test_none_mapping_consolidates_into_several_loadable_files(self):
+        import tempfile
+        from pathlib import Path
+
+        from safetensors.torch import load_file
+
+        fake = {f"layer{i}.weight": torch.randn(8, 8, dtype=torch.bfloat16) for i in range(5)}
+        fake["ids"] = torch.arange(6, dtype=torch.int64)
+        with tempfile.TemporaryDirectory() as output_dir, patch(f"{_MOD}._MAX_SHARD_BYTES", 300):
+            with (
+                patch(f"{_MOD}.get_model_save_state", MagicMock(return_value=dict(fake))),
+                patch(f"{_MOD}.helper", MagicMock()),
+            ):
+                from veomni.utils.save_safetensor_utils import _save_hf_safetensor_distributed
+
+                _save_hf_safetensor_distributed(self.model, output_dir, None, None)
+
+            files = sorted(Path(output_dir).glob("model-*.safetensors"))
+            self.assertGreater(len(files), 1)
+            self.assertTrue((Path(output_dir) / "model.safetensors.index.json").exists())
+            self.assertFalse((Path(output_dir) / "sharded").exists())
+            loaded = {}
+            for file in files:
+                loaded.update(load_file(file))
+        self.assertEqual(set(loaded), set(fake))
+        for key, value in fake.items():
+            torch.testing.assert_close(loaded[key], value)
+
+    def test_consolidation_opens_each_shard_once(self):
+        import builtins
+        import tempfile
+        from pathlib import Path
+
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint import HuggingFaceStorageWriter
+        from torch.distributed.checkpoint._consolidate_hf_safetensors import consolidate_safetensors_files
+
+        from veomni.checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
+
+        apply_dcp_consolidation_patch()
+        fake = {f"t{i}": torch.randn(4, 4, dtype=torch.bfloat16) for i in range(6)}
+        with tempfile.TemporaryDirectory() as output_dir:
+            sharded = str(Path(output_dir) / "sharded")
+            mapping = dict.fromkeys(fake, 1)
+            dcp.save(
+                fake,
+                storage_writer=HuggingFaceStorageWriter(sharded, save_distributed=True, fqn_to_index_mapping=mapping),
+            )
+
+            opened = []
+            real_open = builtins.open
+
+            def counting_open(file, *args, **kwargs):
+                if str(file).startswith(sharded):
+                    opened.append(str(file))
+                return real_open(file, *args, **kwargs)
+
+            with patch("builtins.open", counting_open):
+                consolidate_safetensors_files(sharded, output_dir, mapping)
+
+        shards = set(opened)
+        self.assertEqual(len(shards), 1)
+        # One read of the header while parsing metadata, one handle for all six tensors.
+        self.assertEqual(len(opened), 2)
+
+    def test_consolidation_keeps_e8m0_block_scales(self):
+        """Block-scaled exports store their scales as e8m0, which older safetensors cannot name."""
+        import tempfile
+        from pathlib import Path
+
+        import torch.distributed.checkpoint as dcp
+        from safetensors.torch import load_file
+        from torch.distributed.checkpoint import HuggingFaceStorageWriter
+        from torch.distributed.checkpoint._consolidate_hf_safetensors import consolidate_safetensors_files
+
+        from veomni.checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
+
+        apply_dcp_consolidation_patch()
+        fake = {
+            "w.weight": torch.randn(4, 64).to(torch.float8_e4m3fn),
+            "w.scale": torch.randint(120, 135, (4, 2), dtype=torch.uint8).view(torch.float8_e8m0fnu),
+        }
+        with tempfile.TemporaryDirectory() as output_dir:
+            sharded = str(Path(output_dir) / "sharded")
+            mapping = dict.fromkeys(fake, 1)
+            dcp.save(
+                fake,
+                storage_writer=HuggingFaceStorageWriter(sharded, save_distributed=True, fqn_to_index_mapping=mapping),
+            )
+            consolidate_safetensors_files(sharded, output_dir, mapping)
+            loaded = {}
+            for file in Path(output_dir).glob("*.safetensors"):
+                loaded.update(load_file(file))
+
+        for key, value in fake.items():
+            self.assertEqual(loaded[key].dtype, value.dtype)
+            self.assertTrue(torch.equal(loaded[key].view(torch.uint8), value.view(torch.uint8)), key)
 
     def test_naflatten_and_unflatten_roundtrip_keeps_shape_on_cpu(self):
         from veomni.utils.tensor_utils import naflatten, unflatten
@@ -587,6 +736,11 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         mapping = {"k_shard1": 1, "k_shard2": 2, "mtp.0.weight": 3}
 
         def fake_all_gather_object(output_list, obj):
+            # Also used by the deferred-set gather, whose payload is a dict.
+            if isinstance(obj, dict):
+                for index in range(len(output_list)):
+                    output_list[index] = {}
+                return
             output_list[0] = ["k_shard2"]
             output_list[1] = ["k_shard1"]
 
@@ -601,6 +755,7 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         with (
             patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", mock_writer_cls),
             patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
+            patch(f"{_CONSOLIDATE}.consolidate_safetensors_files_on_every_rank", MagicMock()),
             patch(f"{_MOD}.get_model_save_state", MagicMock(return_value=rank0_state)),
             patch(f"{_MOD}.dcp", MagicMock(save=MagicMock())),
             patch(f"{_MOD}.dist", mock_dist),
@@ -608,6 +763,7 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
             patch(f"{_MOD}.helper", MagicMock()),
             patch(f"{_MOD}.gc", MagicMock()),
             patch(f"{_MOD}.synchronize", MagicMock()),
+            patch("shutil.rmtree", MagicMock()),
         ):
             from veomni.utils.save_safetensor_utils import _save_hf_safetensor_distributed
 
@@ -642,6 +798,7 @@ class TestExecutionOrdering(unittest.TestCase):
         with (
             patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", MagicMock(side_effect=fake_writer)),
             patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
+            patch(f"{_CONSOLIDATE}.consolidate_safetensors_files", MagicMock()),
             patch(f"{_MOD}.get_model_save_state", fake_get_state),
             patch(f"{_MOD}.dcp", MagicMock(save=MagicMock())),
             patch(f"{_MOD}.dist", MagicMock(is_initialized=MagicMock(return_value=False))),
@@ -662,6 +819,40 @@ class TestExecutionOrdering(unittest.TestCase):
         idx_get = call_order.index("get_state")
         idx_writer = call_order.index("writer_init")
         self.assertLess(idx_get, idx_writer, f"Wrong order: {call_order}")
+
+
+class TestConsolidationWait(unittest.TestCase):
+    def test_ranks_wait_for_consolidation_on_a_long_timeout_cpu_group(self):
+        import veomni.utils.save_safetensor_utils as mod
+
+        group = object()
+        fake_dist = MagicMock(
+            is_initialized=MagicMock(return_value=True),
+            get_world_size=MagicMock(return_value=2),
+            new_group=MagicMock(return_value=group),
+        )
+        on_every_rank = MagicMock()
+        with (
+            patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", MagicMock()),
+            patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
+            patch(f"{_CONSOLIDATE}.consolidate_safetensors_files_on_every_rank", on_every_rank),
+            patch(f"{_MOD}.get_model_save_state", lambda m, f, parallel_state=None: {"a": torch.zeros(2)}),
+            patch(f"{_MOD}.dcp", MagicMock(save=MagicMock())),
+            patch(f"{_MOD}.dist", fake_dist),
+            patch(f"{_MOD}._consolidation_group", None),
+            patch(f"{_MOD}.save_model_assets", MagicMock()),
+            patch(f"{_MOD}.helper", MagicMock()),
+            patch(f"{_MOD}.gc", MagicMock()),
+            patch("shutil.rmtree", MagicMock()),
+        ):
+            mod._save_hf_safetensor_distributed(
+                model=_TinyModel(), save_path="/tmp/test", fqn_to_index_mapping=None, model_assets=None
+            )
+
+        kwargs = fake_dist.new_group.call_args.kwargs
+        self.assertEqual(kwargs["backend"], "gloo")
+        self.assertGreaterEqual(kwargs["timeout"].total_seconds(), 3600)
+        self.assertIs(on_every_rank.call_args.kwargs["process_group"], group)
 
 
 class TestLegacySaveModelWeights(unittest.TestCase):
@@ -738,6 +929,37 @@ class TestLegacySaveModelWeights(unittest.TestCase):
 
         self.assertEqual(getattr(model, "_veomni_fqn_to_index_mapping", None), mapping)
         self.assertEqual(getattr(model, "_veomni_prepared_fqn_to_index_mapping", None), mapping)
+
+    def test_materialize_keeps_the_plan_spec_info_on_every_parameter(self):
+        """``to_empty`` rebuilds each Parameter, dropping the ``spec_info`` the plan set.
+
+        Without it a plan shard looks like a plain local tensor: the optimizer then
+        classifies rows that differ per rank as a replica and averages them, which
+        corrupts every plan-sharded update.
+        """
+        from types import SimpleNamespace
+
+        from veomni.distributed.torch_parallelize import _materialize_and_load_weights
+        from veomni.models.checkpoint import init_empty_weights
+
+        with init_empty_weights():
+            model = _TinyModel()
+        model.init_weights = lambda: None
+        spec = SimpleNamespace(para_name="emb", placement=object())
+        model.embed_tokens.weight.spec_info = spec
+
+        _materialize_and_load_weights(
+            model,
+            weights_path="/tmp/nonexistent",
+            materialize_device="cpu",
+            should_skip_hf_weight_load=True,
+            is_peft_model=False,
+            adapter_path=None,
+            broadcast_from_rank0=False,
+        )
+
+        self.assertIs(getattr(model.embed_tokens.weight, "spec_info", None), spec)
+        self.assertFalse(getattr(model.linear.weight, "spec_info", None))
 
 
 if __name__ == "__main__":

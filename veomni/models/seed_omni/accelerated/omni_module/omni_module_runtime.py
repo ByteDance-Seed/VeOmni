@@ -41,6 +41,7 @@ from ....model_runtime import VeOmniModelRuntime
 from ...mixins.offline_encoding_mixin import OfflineEncodingMixin
 from ...utils.checkpoint import OmniModuleCheckpointManager
 from ..utils.dispatch import unwrap_module_chain
+from .omni_module_config import accelerator_needs_distributed_build
 
 
 if TYPE_CHECKING:
@@ -185,9 +186,18 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         Inference only: it skips :meth:`setup`, so it has no mesh, no
         :class:`ParallelState` and no wrap. The generic parallelize step rejects
-        ``eager`` for training.
+        ``eager`` for training. A module that asks for ``ep`` or ``emb`` is not
+        eager even with ``fsdp_mode='eager'``; see
+        :func:`accelerator_needs_distributed_build`.
+
+        The accelerator is read directly rather than through
+        ``self.args.needs_distributed_build``: an ``AttributeError`` raised inside
+        a property is indistinguishable from "not defined", and
+        :meth:`VeOmniModelRuntime.__getattr__` then forwards the lookup to the
+        wrapped model -- so a config field that was missing would surface as a
+        model attribute instead.
         """
-        return self.args.accelerator.fsdp_config.fsdp_mode == "eager"
+        return not accelerator_needs_distributed_build(getattr(self.args, "accelerator", None))
 
     @property
     def wrap_omni_model(self) -> bool:
