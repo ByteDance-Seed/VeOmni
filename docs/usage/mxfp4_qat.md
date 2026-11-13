@@ -163,13 +163,18 @@ Inductor compilation can fail on pre-SM89 CUDA GPUs because Triton does not
 support the E4M3 casts there; disable `torch.compile` on those GPUs when using
 `torchao_nvfp4`.
 
-Compiled rounding is **not bit-identical** to the eager round trip. On an SM89
-GPU, `torch.compile(nvfp4_fake_quant)` on a `4096 x 1024` BF16 tensor puts about
-0.5% of elements on a neighbouring FP4 code (relative L2 difference about 1.2%),
-most likely because Inductor fuses the two-level scale division differently from torchao's
-eager kernels. Training still runs on the same quantization
-grid, but the eager path is the one the op tests pin; treat a compiled NVFP4
-run as unvalidated against that reference.
+Whether compiled rounding matches the eager round trip depends on the GPU.
+`torch.compile(nvfp4_fake_quant)` was measured on a `4096 x 1024` BF16 tensor:
+
+| GPU | Compiled vs eager |
+| --- | --- |
+| RTX PRO 6000 Blackwell (SM120) | bit-identical |
+| RTX 4060 Laptop (SM89) | about 0.5% of elements on a neighbouring FP4 code (relative L2 about 1.2%) |
+
+The SM89 difference most likely comes from Inductor fusing the two-level scale
+division differently from torchao's eager kernels. The eager path is the one
+the op tests pin, so treat a compiled NVFP4 run on any GPU other than SM120 as
+unvalidated against that reference.
 
 ## Checkpoints and export
 
