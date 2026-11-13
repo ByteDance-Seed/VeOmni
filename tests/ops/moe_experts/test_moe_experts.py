@@ -634,8 +634,9 @@ def test_triton_split_and_merged_match_eager(swiglu_limit: float | None):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", [(0, 257), (5, 257), (17, 768)])
 @pytest.mark.parametrize("swiglu_limit", [None, 1.0])
-def test_triton_merged_swiglu_preserves_staged_rounding(dtype, shape, swiglu_limit):
-    """Match materialized ATen SiLU for merged views and clamped inputs."""
+@pytest.mark.parametrize("grad_layout", ["contiguous", "transposed"])
+def test_triton_merged_swiglu_preserves_staged_rounding(dtype, shape, swiglu_limit, grad_layout):
+    """Match staged ATen values for merged views and strided upstream gradients."""
     require_nvidia_cuda("triton")
     from veomni.ops.kernels.moe_experts.shared.swiglu import (
         apply_swiglu_clamp,
@@ -650,7 +651,13 @@ def test_triton_merged_swiglu_preserves_staged_rounding(dtype, shape, swiglu_lim
     gate_before, up_before = gate.clone(), up.clone()
     expected = torch.ops.aten.silu(gate) * up
     actual = merged_swiglu_forward(gate, up)
-    grad = torch.randn_like(gate)
+    if grad_layout == "transposed":
+        grad = torch.randn(columns, rows, device="cuda", dtype=dtype).T
+        if rows:
+            assert not grad.is_contiguous()
+            assert grad.stride(1) > 1
+    else:
+        grad = torch.randn_like(gate)
     activation, packed_grad = merged_swiglu_backward(gate, up, grad, gate_mask, up_mask)
     expected_gate_grad = torch.ops.aten.silu_backward(grad * up, gate)
     expected_up_grad = torch.ops.aten.silu(gate) * grad
