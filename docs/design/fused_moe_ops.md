@@ -29,9 +29,24 @@ preserving the staged ATen expression rather than rounding a full-precision
 SiLU/product only once. The kernel writes only the final activation and does
 not modify the FC1 inputs.
 
-Routing weights remain applied after FC2, and the saved tensors and backward
-formulas are unchanged. ROCm and MLU retain their ATen activation inside
-`merged_swiglu_forward`.
+Routing weights remain applied after FC2. ROCm and MLU retain their ATen
+activation inside `merged_swiglu_forward`.
+
+## Merged backward activation
+
+The same two merged-FC1 autograd functions call
+`shared/swiglu.py::merged_swiglu_backward` after FC2 input-gradient GEMM.
+On NVIDIA CUDA, one pointwise kernel recomputes the activation used by FC2
+weight gradients and writes both FC1 gradients directly into a contiguous
+`[routed_tokens, 2 * intermediate]` tensor. This replaces SiLU recomputation,
+separate products, SiLU backward, optional clamp masking, and concatenation.
+
+The kernel preserves the activation-dtype rounding of the materialized SiLU
+and of `grad_activation * up` before SiLU backward. It uses the original clamp
+masks, including the inclusive clamp boundaries. Grouped GEMMs, routing weights,
+saved tensors, and launch bounds are unchanged. ROCm and MLU retain the staged
+ATen expressions through the shared helper. Split-FC1 and Quack keep their
+existing backward implementations.
 
 ## EP tensor lifetimes
 
