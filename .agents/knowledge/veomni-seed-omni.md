@@ -94,6 +94,7 @@ tasks/omni/infer_omni.py             -> OmniInferencer
 | `build_parallelized_model` | supports custom `customized_build_parallelize_model` hooks; deferred to `OmniModelRuntime` when `fsdp_scope='model'` |
 | `build_optimizer` / `build_lr_scheduler` | scoped to the module's mesh and skipped when the module is frozen; the built optimizer is handed to `module.configure_optimizer(optimizer)` when defined, before the lr scheduler and any checkpoint load. A hook that changes the param-group count also changes the optimizer-state key space, so it must be present on every run that resumes such a checkpoint |
 | `build_checkpoint` | creates a per-module `OmniModuleCheckpointManager` under `<save_path>/global_step_N/<module>/` when trainable |
+| `extra_state` / `load_extra_state` | persists a module's own sampling stream (`rng_state_dict` / `load_rng_state_dict` on the module) per rank in that module's `extra_state`; a fully frozen module has no checkpoint manager, so its stream is never written (`build_checkpoint` warns) |
 | `clip_grad_norm` | computes this module's norm (`veomni_omni_module_clip_grad_norm`) for `OmniModelRuntime` to combine |
 | `skip_hf_weight_load` | keeps HF weight loading enabled on resume when the module is frozen and has persistent state |
 | `on_lora_matched_nothing` | leaves a module with no matching LoRA targets frozen; `_reject_lora_that_matched_nothing` raises only if the entire composed model has no trainable parameters |

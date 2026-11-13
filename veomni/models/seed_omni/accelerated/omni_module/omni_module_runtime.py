@@ -644,6 +644,12 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         if not any(p.requires_grad for p in self.model.parameters()):
             logger.info_rank0(f"ModuleRuntime[{self.module_name}]: fully frozen — skipping DCP/HF checkpoint.")
+            if getattr(self.omni_module, "rng_state_dict", None) is not None:
+                logger.warning_rank0(
+                    f"ModuleRuntime[{self.module_name}]: the module keeps its own sampling stream "
+                    "(rng_state_dict), but a fully frozen module has no checkpoint manager, so the stream is "
+                    "never saved and a resumed run restarts it. Keep such a stream on a trainable module."
+                )
             self._has_trainable_parameters = False
             self.checkpoint = None
             return
@@ -653,6 +659,27 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Resume this module's DCP checkpoint, if one is configured."""
         if self.checkpoint is not None:
             self.checkpoint.load()
+
+    def extra_state(self) -> dict[str, Any]:
+        """This module's own sampling stream, for a module that draws from one.
+
+        The trainer checkpoints the global RNGs; a module that keeps a private
+        generator (the Cosmos3 flow connector's sigma / noise stream) exposes it
+        as ``rng_state_dict`` / ``load_rng_state_dict``, the same pair a DiT
+        condition model does. Saved per rank beside this module's weights, by
+        this module's checkpoint manager: a fully frozen module has none (see
+        :meth:`build_checkpoint`), so its stream is never written.
+        """
+        rng_state_dict = getattr(self.omni_module, "rng_state_dict", None)
+        return {} if rng_state_dict is None else {"module_rng_state": rng_state_dict()}
+
+    def load_extra_state(self, extra_state: dict[str, Any]) -> None:
+        rng_state = extra_state.get("module_rng_state")
+        if rng_state is None:
+            return
+        # Scoped: a generator seeded on first use reads this module's dp rank.
+        with self._scoped():
+            self.omni_module.load_rng_state_dict(rng_state)
 
     def save_dcp(self, state: "TrainerState") -> None:
         """Write this module's distributed checkpoint (train resume)."""

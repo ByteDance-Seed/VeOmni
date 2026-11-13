@@ -110,8 +110,8 @@ def read_model_type(model_path: str) -> str:
     return model_type
 
 
-# Side-effect only: attach @register factories under bagel/, base/, fake_model/, qwen3/, qwen3vl/, text_encoder/.
-from . import bagel, base, fake_model, qwen3, qwen3vl, text_encoder  # noqa: F401  E402
+# Side-effect only: attach @register factories under bagel/, base/, cosmos3/, fake_model/, qwen3/, qwen3vl/, text_encoder/.
+from . import bagel, base, cosmos3, fake_model, qwen3, qwen3vl, text_encoder  # noqa: F401  E402
 
 
 __all__ = [
