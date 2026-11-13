@@ -22,7 +22,7 @@ from transformers import PreTrainedTokenizerBase
 from veomni.distributed.emb_parallel import ShardedEmbedding
 from veomni.utils.tensor_utils import naflatten, unflatten
 
-from ...utils.conversation import ConversationItem, seal_outputs
+from ...utils.conversation import _OMNI_TOKEN_LEN, ConversationItem, seal_outputs
 from ..module_modeling_base import PretrainedOmniModule
 from .chat_template import TextEncoderChatTemplate
 from .configuration import TextEncoderConfig
@@ -41,6 +41,8 @@ def scatter_text_encoder_embeds(
         for part in sample:
             if part.type != "text":
                 continue
+            if _OMNI_TOKEN_LEN not in part.meta and isinstance(part.value, torch.Tensor) and part.value.dim() == 1:
+                part.meta[_OMNI_TOKEN_LEN] = int(part.value.numel())
             part.value = next(segment_embeds_iterator)
     if next(segment_embeds_iterator, None) is not None:
         raise RuntimeError("TextEncoder text segment count mismatch during embed scatter.")
@@ -180,6 +182,10 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
 
     config_class = TextEncoderConfig
     base_model_prefix = ""
+    # ``wte`` is a per-token lookup, so slicing the packed ids is exact: the shard
+    # ``encode_post`` writes back is the next module's input shard, item by item.
+    # ``decode`` likewise scores only this rank's label slice.
+    supports_sp_sharded_handoff = True
     # ``ShardedEmbedding`` must be its own FSDP2 unit: under ``emb`` its table is
     # vocab-split and a parent unit would mix different ranks' vocab slices.
     _no_split_modules: list = ["ShardedEmbedding"]

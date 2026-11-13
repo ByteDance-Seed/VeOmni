@@ -905,6 +905,14 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Context parallel size."},
     )
+    skip_sp_gather_between_modules: bool = field(
+        default=False,
+        metadata={
+            "help": "SeedOmni: every module's post_forward hands its sequence-parallel shard "
+            "directly to the next module instead of all-gathering full-sequence tensors onto "
+            "`conversation_list`. Global to the run: per-module overrides are ignored."
+        },
+    )
     init_device: Literal["cuda", "meta", "npu", "mlu"] = field(
         default="meta",
         metadata={

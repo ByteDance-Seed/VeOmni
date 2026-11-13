@@ -27,6 +27,11 @@ from ....mixins.base_mixin import BaseMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem
+from ...base.llm_packing import (
+    item_token_len,
+    mask_sp_pad_tail,
+    split_sp_sharded_tensor,
+)
 from ..chat_template import TextEncoderChatTemplate
 from ..configuration import TextEncoderConfig
 from ..modeling import TextEncoder, scatter_text_encoder_embeds
@@ -66,7 +71,7 @@ class TrainingMixin(TrainingModuleMixin):
             # sequence-sharded). Every SP rank already holds the same ``input_ids``
             # (the dataloader replicates each shard); pad it to a multiple of
             # ``sp_size`` and take this rank's contiguous chunk. ``encode_post``
-            # all-gathers the embeds back.
+            # all-gathers the embeds back unless ``skip_sp_gather_between_modules`` is enabled.
             self._sp_own_len = input_ids.size(0)
             input_ids = sp_pad(input_ids, dim=0, pad_value=0)
             input_ids = slice_input_tensor(input_ids, dim=0, padding=False, group=get_parallel_state().sp_group)
@@ -74,16 +79,28 @@ class TrainingMixin(TrainingModuleMixin):
 
     @post_forward("encode")
     def encode_post(self, inputs_embeds: torch.Tensor) -> Dict[str, Any]:
-        if get_parallel_state().sp_size > 1:
-            # SP output-gather: all-gather token shards back to the full sequence
-            # (autograd-aware; backward sums grads across the SP group), then drop
-            # the SP pad tail so the packed length matches its carrier below.
-            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=0, group=get_parallel_state().sp_group)
-            inputs_embeds = inputs_embeds.narrow(0, 0, self._sp_own_len)
+        ps = get_parallel_state()
         conversation = self._conversation_carrier
         self._conversation_carrier = None
         batch_shape = self._encode_batch_shape
         self._encode_batch_shape = None
+        if ps.sp_size > 1:
+            if ps.skip_sp_gather_between_modules:
+                valid_len = int(self._sp_own_len)
+                self._sp_own_len = None
+                inputs_embeds = mask_sp_pad_tail(inputs_embeds, valid_len, ps.sp_rank, ps.sp_size)
+                lengths = batch_shape.prod(-1).tolist()
+                scatter_text_encoder_embeds(
+                    conversation,
+                    split_sp_sharded_tensor(inputs_embeds, lengths, ps.sp_rank, ps.sp_size),
+                )
+                return {"conversation_list": conversation}
+            # SP output-gather: all-gather token shards back to the full sequence
+            # (autograd-aware; backward sums grads across the SP group), then drop
+            # the SP pad tail so the packed length matches its carrier below.
+            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=0, group=ps.sp_group)
+            inputs_embeds = inputs_embeds.narrow(0, 0, self._sp_own_len)
+            self._sp_own_len = None
         scatter_text_encoder_embeds(conversation, unflatten(inputs_embeds, batch_shape))
         return {"conversation_list": conversation}
 
@@ -98,7 +115,11 @@ class TrainingMixin(TrainingModuleMixin):
         # framework metadata and sibling-module keys from failing the call.
         del kwargs
         self._conversation_carrier = conversation_list
-        hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier)
+        ps = get_parallel_state()
+        if ps.sp_size > 1 and ps.skip_sp_gather_between_modules:
+            hidden_states, shift_labels = self._prepare_sharded_decode_inputs(self._conversation_carrier, ps)
+        else:
+            hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier)
         # No SP sharding here: the lm-head loss is a token-weighted mean over the whole
         # ``dp_sp`` (``fsdp_group``) mesh (``modeling.decode`` →
         # ``reduce_sequence_parallel_loss``), so each rank scoring only its OWN span
@@ -181,6 +202,54 @@ class TrainingMixin(TrainingModuleMixin):
         # orders after the backbone kernels on the GPU stream without a CPU stall.
         shift_labels = shift_labels.to(device=hidden_states.device, non_blocking=True)
         return hidden_states, shift_labels
+
+    def _prepare_sharded_decode_inputs(
+        self,
+        conversation_list: Optional[list[list[ConversationItem]]],
+        ps: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prepare decode ``(hidden_states, shift_labels)`` directly from this rank's SP/CP slice on ``part.value``."""
+        hidden_states_chunks: list[torch.Tensor] = []
+        label_chunks: list[torch.Tensor] = []
+        sample_starts: list[int] = []
+        decode_len = 0
+
+        for sample in conversation_list or []:
+            sample_start = decode_len
+            for part in sample:
+                if part.is_dummy:
+                    continue
+                hidden = part.value
+                if hidden.dim() == 3:
+                    hidden = hidden.squeeze(0)
+                hidden_states_chunks.append(hidden)
+                if part.type == "text":
+                    labels = part.meta["labels"]
+                    label_chunks.append(labels)
+                    decode_len += int(labels.shape[0])
+                else:
+                    seg_len = item_token_len(part)
+                    label_chunks.append(torch.full((seg_len,), IGNORE_INDEX, dtype=torch.long))
+                    decode_len += seg_len
+            if decode_len > sample_start:
+                sample_starts.append(sample_start)
+
+        hidden_states = torch.cat(hidden_states_chunks, dim=0)
+        labels = torch.cat(label_chunks, dim=0)
+        for start in sample_starts[1:]:
+            labels[start] = IGNORE_INDEX
+
+        full_len = decode_len + (-decode_len % ps.sp_size)
+        local_len = full_len // ps.sp_size
+        shard_start = ps.sp_rank * local_len
+        shard_end = shard_start + local_len
+
+        labels = labels[..., 1:].contiguous()
+        pad_tail = 1 + (full_len - decode_len)
+        shift_labels = F.pad(labels, (0, pad_tail), "constant", IGNORE_INDEX)
+        local_shift_labels = shift_labels[shard_start:shard_end].contiguous()
+        local_shift_labels = local_shift_labels.to(device=hidden_states.device, non_blocking=True)
+        return hidden_states, local_shift_labels
 
     @staticmethod
     def _drop_unsupervised_decode_rows(

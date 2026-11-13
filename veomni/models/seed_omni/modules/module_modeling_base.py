@@ -28,6 +28,32 @@ class PretrainedOmniModule(PreTrainedModel):
     Subclasses hold weights, ``forward``, and FSM ``generate`` endpoints only.
     """
 
+    #: Whether this module can hand its sequence-parallel shard straight to the
+    #: next module in the graph instead of all-gathering it back to the full
+    #: sequence (``ParallelState.skip_sp_gather_between_modules``).
+    #:
+    #: ``False`` by default. A module that implements the handoff sets
+    #: ``supports_sp_sharded_handoff = True`` on its own class, beside its other
+    #: class attributes; a family whose reason is not obvious says why in a
+    #: comment next to it.
+    #:
+    #: What ``True`` claims: once ``pre_forward`` has sliced this rank's
+    #: ``1 / sp_size`` chunk and ``forward`` has run, ``post_forward`` writes, item
+    #: by item and in carrier order, exactly this rank's slice of the packed
+    #: backbone sequence onto ``item.value`` -- no gather, no reordering, and no
+    #: padding left on the last item beyond the SP pad tail, which the consumer
+    #: recomputes from the same lengths. A module that gathers unconditionally, or
+    #: whose outputs are not a plain concatenation of the carrier items (a packed
+    #: MoT scattering through a dense two-stream mask, an image-batch-dim VAE),
+    #: leaves this ``False``. A module that never moves sequence activations
+    #: through the carrier (an n-gram table lookup) satisfies it trivially and may
+    #: say ``True``.
+    #:
+    #: :func:`~veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime.build_omni_model_runtime`
+    #: rejects a run that turns the switch on while any participating module
+    #: leaves this ``False``, so the two sides of a handoff can never disagree.
+    supports_sp_sharded_handoff: bool = False
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
         """Load weights, then bind module-owned processor / tokenizer sidecars."""

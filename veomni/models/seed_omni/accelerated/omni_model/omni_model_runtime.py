@@ -153,6 +153,34 @@ def _reject_lora_that_matched_nothing(
     )
 
 
+def _reject_sp_handoff_unsupported_modules(module_runtimes: Mapping[str, ModuleRuntime]) -> None:
+    """Fail a ``skip_sp_gather_between_modules`` run that includes a module which cannot take part.
+
+    The switch is run-wide: it says *every* module's ``post_forward`` hands its
+    sequence-parallel shard to the next module instead of all-gathering. A module
+    that keeps gathering (``PretrainedOmniModule.supports_sp_sharded_handoff`` is
+    ``False``) would then feed a full-sequence tensor to a consumer that expects a
+    shard, or itself receive a shard it cannot parse. Refuse at build time rather
+    than let one boundary silently disagree with the switch.
+    """
+    unsupported = sorted(
+        name
+        for name, runtime in module_runtimes.items()
+        if not getattr(runtime.omni_module, "supports_sp_sharded_handoff", False)
+    )
+    if not unsupported:
+        return
+    raise ValueError(
+        "`model.accelerator.skip_sp_gather_between_modules=True` hands every module's sequence-parallel "
+        f"shard straight to the next module, but these modules do not implement that handoff: {unsupported}. "
+        "They gather unconditionally (or scatter through a packed layout instead of the carrier), so a "
+        "boundary involving one of them would pass a full-sequence tensor where a shard is expected. "
+        "Disable `skip_sp_gather_between_modules`, or set "
+        "`supports_sp_sharded_handoff = True` on those modules once their "
+        "post_forward hands its shard on."
+    )
+
+
 class OmniModelRuntime:
     """VeOmni model handle for one composed :class:`OmniModel`.
 
@@ -703,6 +731,8 @@ def build_omni_model_runtime(
     )
     if not for_inference:
         _reject_lora_that_matched_nothing(module_runtimes, train_args)
+        if bool(omni_model_runtime_args.accelerator.skip_sp_gather_between_modules):
+            _reject_sp_handoff_unsupported_modules(module_runtimes)
     runtime = OmniModelRuntime(
         OmniModel(omni_config, {name: rt.omni_module for name, rt in module_runtimes.items()}),
         module_runtimes=module_runtimes,

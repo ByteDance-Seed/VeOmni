@@ -294,20 +294,24 @@ def _graph_loss(
     regression in the parallelism guards looks like. Every module that slices
     imports the helper by name, so the counter wraps each of those bindings.
     """
-    calls = {"slice": 0, "pad": 0}
+    calls = {"slice": 0, "pad": 0, "post_gather": 0, "interleave_gather": 0}
     restores = []
     if count_sp:
+        from veomni.models.seed_omni.modules.base import llm_packing
         from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated import accelerated as llm_acc
         from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated import packed as llm_packed
         from veomni.models.seed_omni.modules.qwen3vl.text_encoder.accelerated import packed as te_packed
+        from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated import accelerated as vision_acc
         from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated import packed as vision_packed
+        from veomni.models.seed_omni.modules.text_encoder.accelerated import accelerated as base_te_acc
 
-        targets = [llm_acc, llm_packed, te_packed, vision_packed]
+        targets = [llm_acc, llm_packed, te_packed, vision_acc, vision_packed, base_te_acc]
         for module in targets:
             for attr, key in (
                 ("slice_input_tensor", "slice"),
                 ("sp_pad", "pad"),
                 ("sp_pad_and_slice", "pad"),
+                ("gather_outputs", "post_gather"),
             ):
                 original = getattr(module, attr, None)
                 if original is None:
@@ -319,6 +323,15 @@ def _graph_loss(
 
                 restores.append((module, attr, original))
                 setattr(module, attr, wrapper)
+
+        orig_interleave_gather = llm_packing.gather_outputs
+
+        def _wrap_interleave_gather(*args, **kwargs):
+            calls["interleave_gather"] += 1
+            return orig_interleave_gather(*args, **kwargs)
+
+        restores.append((llm_packing, "gather_outputs", orig_interleave_gather))
+        llm_packing.gather_outputs = _wrap_interleave_gather
 
     try:
         model = _omni(modules, edges)
@@ -439,16 +452,21 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str, device_type: str) -> No
             ("conversation", _CONVERSATION_EDGES, _conversation_batch),
             ("packed", _PACKED_EDGES, _packed_batch),
         ):
-            for sp_size in (1, 2):
+            for sp_size, skip_gather, suffix in (
+                (1, False, "sp1"),
+                (2, False, "sp2"),
+                *([(2, True, "sp2_skip_gather")] if name == "conversation" else []),
+            ):
                 ps = _init_parallel_state(
                     dp_size=world if sp_size == 1 else 1,
                     dp_shard_size=world if sp_size == 1 else 1,
                     ulysses_size=sp_size,
                     dp_mode="fsdp2",
                     device_type=device_type,
-                    name=f"{name}_sp{sp_size}",
+                    skip_sp_gather_between_modules=skip_gather,
+                    name=f"{name}_{suffix}",
                 )
-                with use_parallel_state(f"{name}_sp{sp_size}"):
+                with use_parallel_state(f"{name}_{suffix}"):
                     modules = _build_modules(attn_implementation=attn, device=device, dtype=dtype)
                     # Shard on CPU too. FSDP2 is what reduces gradient across the
                     # group; without the wrap, SP=2 ranks each keep their own
@@ -465,8 +483,8 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str, device_type: str) -> No
                     # ranks are slices of one replicated batch.
                     batch = build_batch(samples)
                     loss, _, sp_calls = _graph_loss(modules, edges, batch, count_sp=True, backward=True)
-                    reports[f"{name}_sp{sp_size}"] = float(loss.detach().float())
-                    reports[f"{name}_sp{sp_size}_sp_calls"] = sp_calls
+                    reports[f"{name}_{suffix}"] = float(loss.detach().float())
+                    reports[f"{name}_{suffix}_sp_calls"] = sp_calls
                     # Compare *parameters after an optimizer step*, not pre-reduce
                     # gradients. Under FSDP2 the cross-rank reduction of `.grad`
                     # happens when the optimizer consumes it, so reading `param.grad`
@@ -477,7 +495,7 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str, device_type: str) -> No
                     # Every parameter, not a sample: two fingerprints per tensor
                     # catch both an offset and a scale difference, so a single
                     # divergent tensor cannot hide behind the ones not probed.
-                    reports[f"{name}_sp{sp_size}_param_probe"] = {
+                    reports[f"{name}_{suffix}_param_probe"] = {
                         f"{mod_name}.{param_name}": [
                             float(full.sum()),
                             float((full * full).sum()),
@@ -535,6 +553,30 @@ def test_sp_matches_single_rank_on_cpu(tmp_path: Path):
                 assert sq2 == pytest.approx(sq1, abs=1e-5), (rank, name, param_name, sq1, sq2)
 
         assert reports["conversation_sp1"] == pytest.approx(reports["packed_sp1"], abs=1e-5), (rank, reports)
+        assert reports["conversation_sp2_sp_calls"]["post_gather"] == 4, (rank, reports["conversation_sp2_sp_calls"])
+        assert reports["conversation_sp2_sp_calls"]["interleave_gather"] == 0, (
+            rank,
+            reports["conversation_sp2_sp_calls"],
+        )
+        assert reports["conversation_sp2_skip_gather_sp_calls"]["post_gather"] == 0, (
+            rank,
+            reports["conversation_sp2_skip_gather_sp_calls"],
+        )
+        assert reports["conversation_sp2_skip_gather_sp_calls"]["interleave_gather"] == 3, (
+            rank,
+            reports["conversation_sp2_skip_gather_sp_calls"],
+        )
+        assert reports["conversation_sp2_skip_gather"] == pytest.approx(reports["conversation_sp1"], abs=1e-5), (
+            rank,
+            reports,
+        )
+        probe_skip = reports["conversation_sp2_skip_gather_param_probe"]
+        probe_ref = reports["conversation_sp1_param_probe"]
+        assert probe_skip.keys() == probe_ref.keys()
+        for param_name, (sum1, sq1) in probe_ref.items():
+            sum2, sq2 = probe_skip[param_name]
+            assert sum2 == pytest.approx(sum1, abs=1e-5), (rank, param_name, sum1, sum2)
+            assert sq2 == pytest.approx(sq1, abs=1e-5), (rank, param_name, sq1, sq2)
 
 
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
@@ -557,6 +599,10 @@ def test_sp_matches_single_rank_on_accelerator(tmp_path: Path):
         assert reports
         for name in ("conversation", "packed"):
             assert reports[f"{name}_sp2"] == pytest.approx(reports[f"{name}_sp1"], rel=5e-3), (rank, name, reports)
+        assert reports["conversation_sp2_skip_gather"] == pytest.approx(reports["conversation_sp1"], rel=5e-3), (
+            rank,
+            reports,
+        )
         assert reports["conversation_sp1"] == pytest.approx(reports["packed_sp1"], rel=5e-3), (rank, reports)
 
 
