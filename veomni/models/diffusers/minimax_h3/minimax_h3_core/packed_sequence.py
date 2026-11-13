@@ -1,4 +1,4 @@
-"""FL2VA and visual Ref2VA packed sequence builders.
+"""FL2VA and multimodal Ref2VA packed sequence builders.
 
 Layout: [text | cond | audio | video]
 
@@ -67,59 +67,82 @@ def build_packed_ref2va(
     audio_channel: int = 2,
     text_token_tags: torch.Tensor | None = None,
 ) -> dict:
-    """Build visual-reference training metadata using the native inference grids.
+    """Build compact multimodal Ref2VA metadata using native inference coordinates.
 
-    References describe pre-encoded image/video geometry; anchor rows are supplied
-    separately, in block order. Audio references require a different replay/loss
-    contract and are not supported here. No encoder or inference pipeline is loaded.
+    Each block is audio then video (video_audio), video (image/video), or audio.
+    Anchors are concatenated separately by modality in reference order. Only
+    target rows are supervised; both reference counts are retained for slicing.
     """
     if not ref_blocks:
-        raise ValueError("Ref2VA requires at least one visual reference.")
+        raise ValueError("Ref2VA requires at least one reference.")
+    if audio_channel not in (1, 2):
+        raise ValueError("Ref2VA supports mono or stereo audio.")
     pk = build_packed_fl2va(text_len, latent_t, latent_h, latent_w, audio_t, [], audio_channel, text_token_tags)
-    grids = []
-    t_cursor = float(text_len)
+    grids, image_parts, audio_parts = [], [], []
+    cursor, t_cursor = text_len, float(text_len)
+    target_w_grid = _axis_from_sqrt_area(latent_w, 2, np.sqrt(latent_h * latent_w))
     for block in ref_blocks:
         kind = block["kind"]
-        if kind in ("audio", "video_audio") or block.get("ref_audio_t", 0):
-            raise NotImplementedError("Ref2VA audio references are not supported.")
-        if kind not in ("image", "video"):
-            raise ValueError(f"Unknown visual reference kind: {kind}")
-        t, h, w = (int(block[key]) for key in ("latent_t", "latent_h", "latent_w"))
-        if t < 1 or h < 2 or w < 2 or h % 2 or w % 2 or (kind == "image" and t != 1):
-            raise ValueError("Reference geometry requires positive T, even H/W, and T=1 for images.")
-        sqrt_area = np.sqrt(h * w)
-        hh, ww = torch.meshgrid(
-            _axis_from_sqrt_area(h, 2, sqrt_area), _axis_from_sqrt_area(w, 2, sqrt_area), indexing="ij"
-        )
-        grid = torch.empty(t, (h // 2) * (w // 2), 3, dtype=torch.float64)
-        grid[:, :, 0] = _video_t_grid(t, t_cursor)[:, None]
-        grid[:, :, 1:] = torch.stack([hh.flatten(), ww.flatten()], dim=-1)[None]
-        grids.append(grid.flatten(0, 1))
-        t_cursor += 1.0 if kind == "image" else _temporal_position_span(t)
+        if kind not in ("image", "video", "audio", "video_audio"):
+            raise ValueError(f"Unknown reference kind: {kind}")
+        ref_at = int(block.get("ref_audio_t", 0))
+        if (kind in ("audio", "video_audio") and ref_at <= 0) or (kind in ("image", "video") and ref_at != 0):
+            raise ValueError("Only audio/video_audio references must have positive ref_audio_t.")
+        w_grid = target_w_grid
+        if kind != "audio":
+            t, h, w = (int(block[key]) for key in ("latent_t", "latent_h", "latent_w"))
+            if t < 1 or h < 2 or w < 2 or h % 2 or w % 2 or (kind == "image" and t != 1):
+                raise ValueError("Reference geometry requires positive T, even H/W, and T=1 for images.")
+            sqrt_area = np.sqrt(h * w)
+            w_grid = _axis_from_sqrt_area(w, 2, sqrt_area)
+            hh, ww = torch.meshgrid(_axis_from_sqrt_area(h, 2, sqrt_area), w_grid, indexing="ij")
+            visual_grid = torch.empty(t, (h // 2) * (w // 2), 3, dtype=torch.float64)
+            visual_grid[:, :, 0] = _video_t_grid(t, t_cursor)[:, None]
+            visual_grid[:, :, 1:] = torch.stack([hh.flatten(), ww.flatten()], dim=-1)[None]
+        if ref_at:
+            rows = ref_at * audio_channel
+            audio_grid = torch.zeros(rows, 3, dtype=torch.float64)
+            audio_grid[:, 0] = (t_cursor + torch.arange(ref_at, dtype=torch.float64)).repeat(audio_channel)
+            audio_grid[:, 2] = torch.cat(
+                [
+                    torch.full((ref_at,), float(w_grid[0]), dtype=torch.float64),
+                    torch.full((rows - ref_at,), float(w_grid[-1]), dtype=torch.float64),
+                ]
+            )
+            grids.append(audio_grid)
+            audio_parts.append(torch.arange(cursor, cursor + rows))
+            cursor += rows
+        if kind != "audio":
+            visual_grid = visual_grid.flatten(0, 1)
+            grids.append(visual_grid)
+            image_parts.append(torch.arange(cursor, cursor + len(visual_grid)))
+            cursor += len(visual_grid)
+        span = 0.0 if kind == "audio" else (1.0 if kind == "image" else _temporal_position_span(t))
+        t_cursor += max(float(ref_at), span)
+
     ref_grid = torch.cat(grids)
-    cond_rows = ref_grid.shape[0]
-    old_used = int(pk["cu_seqlens"][1])
-    target_grid = pk["img_position_ids"][0, text_len:old_used].clone()
+    ref_rows = len(ref_grid)
+    cond_rows = sum(len(p) for p in image_parts)
+    audio_cond_rows = sum(len(p) for p in audio_parts)
+    target_grid = pk["img_position_ids"][0, text_len:].clone()
     target_grid[:, 0] += t_cursor - text_len
-    used = old_used + cond_rows
-    seq_len = used
-    positions = torch.zeros(1, seq_len, 3, dtype=torch.float64)
-    positions[0, :text_len] = pk["img_position_ids"][0, :text_len]
-    positions[0, text_len : text_len + cond_rows] = ref_grid
-    positions[0, text_len + cond_rows : used] = target_grid
+    positions = torch.cat([pk["img_position_ids"][0, :text_len], ref_grid, target_grid]).unsqueeze(0)
+    img_pos = torch.cat(image_parts + [pk["img_pos"] + ref_rows])
+    audio_pos = torch.cat(audio_parts + [pk["audio_pos"] + ref_rows])
+    seq_len = pk["seq_len"] + ref_rows
     tags = torch.full((seq_len,), -1, dtype=torch.long)
     tags[:text_len] = pk["token_tags"][:text_len]
-    tags[text_len : text_len + cond_rows] = 0
-    tags[text_len + cond_rows : used] = pk["token_tags"][text_len:old_used]
+    tags[img_pos], tags[audio_pos] = 0, 2
     pk.update(
         seq_len=seq_len,
         img_position_ids=positions,
         token_tags=tags,
-        img_pos=torch.cat([torch.arange(text_len, text_len + cond_rows), pk["img_pos"] + cond_rows]),
-        audio_pos=pk["audio_pos"] + cond_rows,
+        img_pos=img_pos,
+        audio_pos=audio_pos,
         cond_rows=cond_rows,
+        audio_cond_rows=audio_cond_rows,
         update_mask=torch.cat([torch.zeros(cond_rows, dtype=torch.bool), pk["update_mask"]]),
-        cu_seqlens=torch.tensor([0, used], dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, seq_len], dtype=torch.int32),
         task="ref2va",
     )
     return pk

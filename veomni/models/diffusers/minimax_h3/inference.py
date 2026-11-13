@@ -1,11 +1,11 @@
 """Joint video/audio generation with MiniMax H3.
 
 ``MiniMaxH3Pipeline`` accepts text prompts, optional first/last-frame keyframes,
-and optional image or silent-video references. It returns a list of PIL video
+and optional image, video, or audio references. It returns a list of PIL video
 frames and a CPU FP32 audio tensor shaped ``[C, T]`` at the audio VAE's sample
 rate. Text-to-video/audio (t2va) and keyframe-conditioned generation (fl2va)
-use the same denoising loop. Audio-bearing references (ref2va audio or
-video_audio inputs) are rejected by the DiT call with ``NotImplementedError``.
+use the same denoising loop. Ref2VA audio and video_audio inputs condition both
+modalities without adding prediction targets.
 
 ``MiniMaxH3ConditionModel`` supplies the text encoder, VAEs, and schedulers;
 ``MiniMaxH3DiTModel`` supplies latent-grid predictions. Pipeline stages move
@@ -17,6 +17,9 @@ performed. Spatial dimensions and frame counts are aligned before denoising.
 Pipeline, audio utilities, and unit-runner machinery are adapted from
 minimax_h3_audio_video (MiniMaxH3Pipeline, BasePipeline, PipelineUnit, and
 PipelineUnitRunner).
+
+The HF wrapper slices visual and audio reference rows before unpatchifying and
+negating target predictions. Training and inference share packed-layout builders.
 """
 
 from __future__ import annotations
@@ -41,7 +44,7 @@ from .minimax_h3_core.minimax_h3_text_encoder import (
     prepare_ref_prompt,
 )
 from .minimax_h3_core.minimax_h3_video_vae import MiniMaxH3VideoVAE
-from .minimax_h3_core.packed_sequence import build_packed_fl2va, host_cu_seqlens
+from .minimax_h3_core.packed_sequence import build_packed_fl2va, build_packed_ref2va, host_cu_seqlens
 from .minimax_h3_transformer.configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 from .minimax_h3_transformer.modeling_minimax_h3_transformer import MiniMaxH3DiTModel
 
@@ -472,10 +475,11 @@ class MiniMaxH3Pipeline(BasePipeline):
 
             {"type": "image",       "image": PIL.Image}
             {"type": "video",       "video": list[PIL.Image]}   # silent
+            {"type": "audio",       "audio": waveform, "sample_rate": int}
+            {"type": "video_audio", "video": list[PIL.Image], "audio": waveform, "sample_rate": int}
 
-        Reference preprocessing also parses `audio` and `video_audio` dicts
-        with waveform and sample-rate fields, but the DiT call does not support
-        reference-audio rows and raises `NotImplementedError` for these inputs.
+        Audio references condition both modalities. Reference rows are removed
+        before target unpatchification and add no prediction targets.
 
         Reference video frame lists must already be sampled at 24 fps; the
         pipeline does not resample frame rates. Return a list of PIL frames and
@@ -912,11 +916,6 @@ class MiniMaxH3Unit_ReferenceEncoder(PipelineUnit):
 
 
 class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
-    _INTERP = 32
-    _T_GROUP = 5
-    _FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
-    _FRAME_RESCALE = 5.0 / 3.0
-
     def __init__(self):
         super().__init__(
             seperate_cfg=True,
@@ -929,48 +928,6 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
     @staticmethod
     def _to_device(packed: dict, device) -> dict:
         return {k: v.to(device) if torch.is_tensor(v) else v for k, v in packed.items()}
-
-    def _axis_from_sqrt_area(self, dim: int, patch: int, sqrt_area: float) -> torch.Tensor:
-        ratio = dim / sqrt_area
-        left = (1.0 - ratio) * 0.5
-        right = left + ratio
-        grid = np.linspace(left, right, dim // patch, endpoint=False) * self._INTERP
-        return torch.from_numpy(grid).to(torch.float64)
-
-    def _video_t_grid(self, n: int, origin: float) -> torch.Tensor:
-        spans = torch.tensor(
-            [self._FRAME_RESCALE * self._FRAME_PER_TOKEN[k % self._T_GROUP] for k in range(n)], dtype=torch.float64
-        )
-        return origin + torch.cat([torch.zeros(1, dtype=torch.float64), spans[:-1].cumsum(0)])
-
-    def _temporal_position_span(self, temporal_length: int) -> float:
-        spans = np.ones(int(temporal_length), dtype=np.float64) * self._FRAME_RESCALE
-        for token_index in range(self._T_GROUP):
-            spans[token_index :: self._T_GROUP] *= self._FRAME_PER_TOKEN[token_index]
-        return float(spans.sum())
-
-    def _video_t_span(self, n: int) -> float:
-        return sum(self._FRAME_RESCALE * self._FRAME_PER_TOKEN[k % self._T_GROUP] for k in range(n))
-
-    def _frame_grid(self, latent_h: int, latent_w: int, sqrt_area):
-        h_grid = self._axis_from_sqrt_area(latent_h, 2, sqrt_area)
-        w_grid = self._axis_from_sqrt_area(latent_w, 2, sqrt_area)
-        hh, ww = torch.meshgrid(h_grid, w_grid, indexing="ij")
-        return torch.stack([hh.reshape(-1), ww.reshape(-1)], dim=-1), w_grid
-
-    def _video_grid(self, latent_t: int, frame: torch.Tensor, origin: float) -> torch.Tensor:
-        video_g = torch.empty(latent_t, frame.shape[0], 3, dtype=torch.float64)
-        video_g[:, :, 0] = self._video_t_grid(latent_t, origin)[:, None]
-        video_g[:, :, 1:] = frame[None]
-        return video_g.reshape(-1, 3)
-
-    def _audio_w_axis(self, w_grid: torch.Tensor, audio_t: int, audio_rows: int) -> torch.Tensor:
-        return torch.cat(
-            [
-                torch.full((audio_t,), float(w_grid[0]), dtype=torch.float64),
-                torch.full((audio_rows - audio_t,), float(w_grid[-1]), dtype=torch.float64),
-            ]
-        )
 
     def _build_packed_fl2va(self, text_len, latent_t, latent_h, latent_w, audio_t, keyframe_indices, audio_channel=2):
         """fl2va layout: [text | cond | audio | video | pad].
@@ -991,135 +948,8 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
         )
 
     def _build_packed_ref2va(self, text_len, latent_t, latent_h, latent_w, audio_t, ref_blocks, audio_channel=2):
-        """ref2va layout: [text | ref_0 | ref_1 | ... | target_audio | target_video | pad]"""
-        ph, pw = latent_h // 2, latent_w // 2
-        target_frame_rows = ph * pw
-        target_video_rows = latent_t * target_frame_rows
-        target_audio_rows = audio_t * audio_channel
-
-        block_dims, total_ref_visual_rows, total_ref_audio_rows = [], 0, 0
-        for b in ref_blocks:
-            kind = b["kind"]
-            info = {"kind": kind, "visual_rows": 0, "audio_rows": 0, "ref_audio_t": int(b.get("ref_audio_t", 0))}
-            if kind in ("image", "video", "video_audio"):
-                lt_r, lh_r, lw_r = int(b["latent_t"]), int(b["latent_h"]), int(b["latent_w"])
-                info.update(visual_rows=lt_r * (lh_r // 2) * (lw_r // 2), latent_t=lt_r, latent_h=lh_r, latent_w=lw_r)
-                total_ref_visual_rows += info["visual_rows"]
-                info["audio_rows"] = info["ref_audio_t"] * audio_channel
-                total_ref_audio_rows += info["audio_rows"]
-            elif kind == "audio":
-                info["audio_rows"] = info["ref_audio_t"] * audio_channel
-                total_ref_audio_rows += info["audio_rows"]
-            else:
-                raise ValueError(f"unknown ref kind: {kind}")
-            block_dims.append(info)
-
-        used = text_len + total_ref_visual_rows + total_ref_audio_rows + target_audio_rows + target_video_rows
-        seq_len = used
-
-        g = torch.zeros(seq_len, 3, dtype=torch.float64)
-        g[0:text_len, 0] = torch.arange(text_len, dtype=torch.float64)
-        token_tags = torch.full((seq_len,), -1, dtype=torch.long)
-        token_tags[0:text_len] = 1
-
-        # Iterate through ref blocks, placing them contiguously.
-        cursor, t_cursor = text_len, float(text_len)
-        ref_visual_pos_parts, ref_audio_pos_parts = [], []
-        # Target w_grid used for audio W-axis (channel separation)
-        target_sqrt_area = float(np.sqrt(latent_h * latent_w))
-        target_w_grid = self._axis_from_sqrt_area(latent_w, 2, target_sqrt_area)
-
-        for info in block_dims:
-            kind = info["kind"]
-            if kind == "image":
-                v_rows, lh_r, lw_r = info["visual_rows"], info["latent_h"], info["latent_w"]
-                # Own spatial grid
-                sqrt_area = float(np.sqrt(lh_r * lw_r))
-                frame, w_grid = self._frame_grid(lh_r, lw_r, sqrt_area)
-                sl = slice(cursor, cursor + v_rows)
-                g[sl, 0] = t_cursor
-                g[sl, 1:] = frame
-                token_tags[sl] = 0
-                ref_visual_pos_parts.append(torch.arange(sl.start, sl.stop))
-                cursor += v_rows
-                t_cursor += 1.0
-
-            elif kind in ("video", "video_audio"):
-                a_rows, v_rows, ref_at = info["audio_rows"], info["visual_rows"], info["ref_audio_t"]
-                lt_r, lh_r, lw_r = info["latent_t"], info["latent_h"], info["latent_w"]
-                sqrt_area = float(np.sqrt(lh_r * lw_r))
-                frame, rv_w_grid = self._frame_grid(lh_r, lw_r, sqrt_area)
-
-                audio_sl = slice(cursor, cursor + a_rows)
-                visual_sl = slice(audio_sl.stop, audio_sl.stop + v_rows)
-
-                a_t_grid = t_cursor + torch.arange(ref_at, dtype=torch.float64)
-                g[audio_sl, 0] = a_t_grid.repeat(audio_channel)
-                if ref_at:
-                    # W-axis uses THIS reference video's own grid, not the target's.
-                    g[audio_sl, 2] = self._audio_w_axis(rv_w_grid, ref_at, a_rows)
-                    token_tags[audio_sl] = 2
-                    ref_audio_pos_parts.append(torch.arange(audio_sl.start, audio_sl.stop))
-
-                g[visual_sl] = self._video_grid(lt_r, frame, t_cursor)
-                token_tags[visual_sl] = 0
-                ref_visual_pos_parts.append(torch.arange(visual_sl.start, visual_sl.stop))
-
-                cursor = visual_sl.stop
-                t_cursor += max(float(ref_at), self._video_t_span(lt_r))
-
-            elif kind == "audio":
-                a_rows, ref_at = info["audio_rows"], info["ref_audio_t"]
-                sl = slice(cursor, cursor + a_rows)
-                a_t_grid = t_cursor + torch.arange(ref_at, dtype=torch.float64)
-                g[sl, 0] = a_t_grid.repeat(audio_channel)
-                if ref_at:
-                    g[sl, 2] = self._audio_w_axis(target_w_grid, ref_at, a_rows)
-                    token_tags[sl] = 2
-                    ref_audio_pos_parts.append(torch.arange(sl.start, sl.stop))
-                cursor += a_rows
-                t_cursor += float(ref_at)
-
-        # Target audio + target video after ref blocks
-        target_audio_sl = slice(cursor, cursor + target_audio_rows)
-        target_video_sl = slice(target_audio_sl.stop, target_audio_sl.stop + target_video_rows)
-
-        # Target spatial grid (own)
-        frame_t, w_grid_t = self._frame_grid(latent_h, latent_w, target_sqrt_area)
-        g[target_video_sl] = self._video_grid(latent_t, frame_t, t_cursor)
-
-        target_audio_t_grid = t_cursor + torch.arange(audio_t, dtype=torch.float64)
-        g[target_audio_sl, 0] = target_audio_t_grid.repeat(audio_channel)
-        g[target_audio_sl, 2] = self._audio_w_axis(w_grid_t, audio_t, target_audio_rows)
-
-        # Build combined img_pos / audio_pos
-        target_video_pos = torch.arange(target_video_sl.start, target_video_sl.stop)
-        target_audio_pos = torch.arange(target_audio_sl.start, target_audio_sl.stop)
-
-        if ref_visual_pos_parts:
-            img_pos = torch.cat(ref_visual_pos_parts + [target_video_pos])
-        else:
-            img_pos = target_video_pos
-        if ref_audio_pos_parts:
-            audio_pos = torch.cat(ref_audio_pos_parts + [target_audio_pos])
-        else:
-            audio_pos = target_audio_pos
-
-        token_tags[img_pos] = 0
-        token_tags[target_audio_sl] = 2
-
-        text_pos = torch.arange(0, text_len)
-        cu = torch.tensor([0, used], dtype=torch.int32)
-
-        return {
-            "img_pos": img_pos,
-            "audio_pos": audio_pos,
-            "text_pos": text_pos,
-            "img_position_ids": g[None],
-            "token_tags": token_tags,
-            "cu_seqlens": cu,
-            "seq_len": seq_len,
-        }
+        """Use the same multimodal reference layout as prepared-cache training."""
+        return build_packed_ref2va(text_len, latent_t, latent_h, latent_w, audio_t, ref_blocks, audio_channel)
 
     def process(
         self,
@@ -1170,6 +1000,7 @@ def model_fn_minimax_h3(
     audio_cond_noise_aug=1.0,
     **kwargs,
 ):
+    """Predict target video and audio velocities from the shared packed reference layout."""
     dtype, device = video_latents.dtype, video_latents.device
     f, h, w = video_latents.shape[2:]
     audio_channel, audio_t = audio_latents.shape[0], audio_latents.shape[-1]
@@ -1205,13 +1036,7 @@ def model_fn_minimax_h3(
 
     refiner_cu = torch.tensor([0, text_len], dtype=torch.int32, device=device)
 
-    # The DiT wrapper returns latent-grid predictions after slicing visual
-    # condition rows. It does not slice reference-audio rows, so reject those
-    # inputs before calling it.
-    if ref_audio_anchor is not None:
-        raise NotImplementedError(
-            "ref2va audio references are not supported by the VeOmni wrapper (MiniMaxH3DiTModel)."
-        )
+    # The HF wrapper removes both reference modalities before target unpatchification.
     outputs = dit(
         x=x,
         audio_x=audio_x,
@@ -1232,6 +1057,7 @@ def model_fn_minimax_h3(
         },
         skip_mask_out_condition=True,
         cond_rows=cond_rows_count,
+        audio_cond_rows=ref_audio_rows_count,
         video_latent_shape=(f, h // 2, w // 2),
         audio_latent_shape=(audio_channel, audio_t),
     )
