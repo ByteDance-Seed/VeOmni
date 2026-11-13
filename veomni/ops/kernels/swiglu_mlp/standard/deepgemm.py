@@ -23,6 +23,10 @@ from .....utils.device import get_gpu_compute_capability, is_nvidia_cuda_device
 from ...linear._module import require_deepgemm_block_size
 
 
+#: The activations this row's recomputed kernel implements, in both directions.
+_FUSED_ACTIVATIONS = frozenset({"silu", "swish"})
+
+
 def wrapper(
     x: Tensor,
     gate_w: Tensor,
@@ -34,15 +38,31 @@ def wrapper(
     *,
     swiglu_limit: float | None = None,
     block_size: int = 128,
+    activation: str = "silu",
 ) -> Tensor:
-    """Run FP8 SwiGLU MLP GEMMs with BF16 inputs, outputs, and first-order gradients.
+    """Run FP8 gated-MLP GEMMs with BF16 inputs, outputs, and first-order gradients.
 
     Uses DeepGEMM blockwise FP8 grouped GEMMs (single group) for the gate/up and
-    down projections and recomputed Triton SwiGLU activation with optional
+    down projections and a recomputed Triton SwiGLU activation with optional
     clamping. Hidden and intermediate dimensions must be positive multiples of
     128. Empty bias tensors denote unused biases. ``block_size`` is fixed by
     DeepGEMM's blockwise recipe at 128; see the ``linear`` rows.
+
+    ``activation`` is part of the family's call contract (#1462): every
+    ``swiglu_mlp`` row takes it so a model can pass ``config.hidden_act`` without
+    branching on which row the config selected. This row's recomputed kernel
+    implements SiLU only -- it calls ``aten.silu`` in the forward and
+    ``aten.silu_backward`` in the backward, and both are fused into the same
+    Triton launch as the clamp -- so anything else is refused here rather than
+    silently computed as SiLU. ``row_supports_activation`` already keeps a
+    non-SiLU model off this row; this check is what makes a direct call honest.
     """
+    if activation not in _FUSED_ACTIVATIONS:
+        raise ValueError(
+            f"swiglu_mlp_implementation='deepgemm_fp8' implements {sorted(_FUSED_ACTIVATIONS)} only, "
+            f"got activation={activation!r}. Its Triton kernel fuses the activation into the "
+            "grouped GEMM's forward and backward, so another activation needs its own kernel."
+        )
     require_deepgemm_block_size(block_size)
     if not is_nvidia_cuda_device(x.device) or get_gpu_compute_capability(x.device) not in (90, 100):
         raise RuntimeError("deepgemm_fp8 requires NVIDIA Hopper SM90 or Blackwell SM100.")

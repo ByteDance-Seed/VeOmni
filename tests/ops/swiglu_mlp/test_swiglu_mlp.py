@@ -669,3 +669,42 @@ def test_a_linear_subclass_projection_skips_the_fused_path():
     mlp.veomni_swiglu_mlp = _QatHandle()
     with pytest.raises(ValueError, match="nn.Linear subclass"):
         has_plain_linear_projections(mlp)
+
+
+def test_deepgemm_row_takes_the_family_activation_argument():
+    """Every ``swiglu_mlp`` row accepts ``activation=`` (the #1462 call contract).
+
+    A model passes ``config.hidden_act`` unconditionally so it need not branch on
+    which row the config selected. This row's recomputed kernel implements SiLU in
+    both directions, so it accepts the name and refuses anything else instead of
+    silently computing SiLU for a ``gelu`` request.
+    """
+    import inspect
+
+    from veomni.ops.kernels.swiglu_mlp.standard.deepgemm import wrapper
+
+    assert "activation" in inspect.signature(wrapper).parameters
+    for name in ("silu", "swish"):
+        # Reaches the hardware/block-size checks, i.e. past the activation gate.
+        with pytest.raises((RuntimeError, ValueError), match="SM90|block_size|BF16|2D|multiples"):
+            wrapper(
+                torch.zeros(2, 256),
+                torch.zeros(384, 256),
+                torch.zeros(0),
+                torch.zeros(384, 256),
+                torch.zeros(0),
+                torch.zeros(256, 384),
+                torch.zeros(0),
+                activation=name,
+            )
+    with pytest.raises(ValueError, match="implements .* only"):
+        wrapper(
+            torch.zeros(2, 256),
+            torch.zeros(384, 256),
+            torch.zeros(0),
+            torch.zeros(384, 256),
+            torch.zeros(0),
+            torch.zeros(256, 384),
+            torch.zeros(0),
+            activation="gelu",
+        )

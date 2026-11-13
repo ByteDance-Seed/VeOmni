@@ -56,13 +56,13 @@ def _triton_fp4_roundtrip_kernel(
     x = tl.load(X + row * X_STRIDE_ROW + col_offs).to(tl.float32)
     amax = tl.max(tl.abs(x), axis=0)
     if USE_E4M3_SCALE:
-        # Mirror the eager row's arithmetic exactly, because the two are compared
-        # bitwise: floor the *amax* at E4M3's smallest normal, divide by 6 (not
-        # multiply by a reciprocal -- they differ in fp32 for a third of inputs),
-        # clamp the ratio into the castable range, then cast. The cast is
-        # narrowing, so an unclamped ratio above 448 would become NaN and take the
-        # block's scale with it.
-        scale = tl.maximum(amax, 6.0 * (2.0**-9)) / 6.0
+        # ``div_rn`` rather than ``/``: Triton's default fp32 division is not
+        # IEEE round-to-nearest, and ``e4m3`` scales are not powers of two (three
+        # mantissa bits), so a 1-ulp difference here lands on one of the E2M1
+        # midpoints below and flips the rounded magnitude. ``ue8m0`` scales are
+        # powers of two, where any division is exact -- which is why only the
+        # ``e4m3`` case diverged. The eager row divides with ``div.rn.f32``.
+        scale = tl.div_rn(tl.maximum(amax, 6.0 * (2.0**-9)), 6.0)
         scale = tl.minimum(scale, 448.0)
         scale = scale.to(tl.float8e4nv).to(tl.float32)
     else:
@@ -71,7 +71,10 @@ def _triton_fp4_roundtrip_kernel(
         bits = scaled.to(tl.int32, bitcast=True)
         exp_byte = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
         scale = (exp_byte << 23).to(tl.float32, bitcast=True)
-    v = tl.minimum(tl.maximum(x / scale, -6.0), 6.0)
+    # Same reason as the scale above: ``div_rn`` keeps ``x / scale`` identical to
+    # the eager row's ``div.rn.f32`` for a non-power-of-two scale.
+    v = tl.div_rn(x, scale)
+    v = tl.minimum(tl.maximum(v, -6.0), 6.0)
     a = tl.abs(v)
     # Nearest E2M1 magnitude; a value exactly on a midpoint rounds down.
     nearest = tl.where(

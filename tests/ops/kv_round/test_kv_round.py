@@ -444,51 +444,49 @@ def test_fp4_none_row_leaves_the_tensor_untouched(scale_fmt: str):
 def test_triton_fp4_matches_eager(device: str, scale_fmt: str, block_size: int):
     """The FP4 kernel must reproduce the eager round trip exactly, not approximately.
 
-    ``e4m3`` is where the two can drift: its amax floor is ``6 * 2^-9`` and it
-    divides by 6 *before* the narrowing cast, so an implementation that floors
-    the scale instead of the amax hands back a value up to 6x too large for every
-    small-magnitude block -- the common case once activations are normalized.
-    The tiny and all-zero blocks below are what pin that down.
+    ``e4m3`` is where the two can drift, for two independent reasons: its scale has
+    three mantissa bits (so it is usually *not* a power of two, making ``x / scale``
+    sensitive to the division's rounding mode), and its amax floor divides by 6
+    before a narrowing cast. An implementation that floors the scale instead of the
+    amax hands back a value up to 6x too large for every small-magnitude block --
+    the common case once activations are normalized. ``ue8m0`` keeps every division
+    exact, so it passes for any implementation and does not prove this one.
+
+    The tiny and all-zero blocks pin the floor; the normal draw pins the division.
     """
     eager = VeomniOp("kv_round", "fp4", "eager")
     triton = _triton_op("fp4", device)
 
+    def check(x: torch.Tensor, label: str) -> None:
+        # Compare explicitly rather than through ``assert_close(..., msg=)``: the
+        # message replaces its mismatch report, which is what hid the delta when
+        # this failed in CI.
+        actual = triton(x, block_size=block_size, scale_fmt=scale_fmt)
+        expected = eager(x, block_size=block_size, scale_fmt=scale_fmt)
+        assert torch.isfinite(actual).all(), label
+
+        if scale_fmt == "ue8m0":
+            # Every scale is a power of two, so every division in both rows is
+            # exact and the results must agree bit for bit.
+            assert torch.equal(actual, expected), (
+                f"{label}: differs bitwise; a power-of-two scale makes the round trip exact, "
+                f"so a difference here is a real divergence"
+            )
+            return
+
+        # ``e4m3`` scales carry three mantissa bits, so ``x / scale`` is inexact and
+        # both rows round it to BF16. The kernel uses ``div_rn`` to match
+        # ``div.rn.f32``; a residual difference is at most one BF16 ulp of the
+        # stored value (~0.8%). The failure this test exists for -- flooring the
+        # scale rather than the amax -- inflates small blocks by up to 6x, which is
+        # ~600% and cannot pass below.
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=0, msg=lambda m: f"{label}: {m}")
+
     torch.manual_seed(7)
-    normal = torch.randn(3, 5, block_size * 2, dtype=torch.bfloat16, device=device)
-    torch.testing.assert_close(
-        triton(normal, block_size=block_size, scale_fmt=scale_fmt),
-        eager(normal, block_size=block_size, scale_fmt=scale_fmt),
-        rtol=0,
-        atol=0,
-        msg="normal",
-    )
-
-    tiny = torch.randn(2, 3, block_size, dtype=torch.bfloat16, device=device) * 1e-3
-    torch.testing.assert_close(
-        triton(tiny, block_size=block_size, scale_fmt=scale_fmt),
-        eager(tiny, block_size=block_size, scale_fmt=scale_fmt),
-        rtol=0,
-        atol=0,
-        msg="tiny",
-    )
-
-    zeros = torch.zeros(1, 2, block_size, dtype=torch.bfloat16, device=device)
-    torch.testing.assert_close(
-        triton(zeros, block_size=block_size, scale_fmt=scale_fmt),
-        eager(zeros, block_size=block_size, scale_fmt=scale_fmt),
-        rtol=0,
-        atol=0,
-        msg="zeros",
-    )
-
-    huge = torch.full((1, 2, block_size), 1e4, dtype=torch.bfloat16, device=device)
-    torch.testing.assert_close(
-        triton(huge, block_size=block_size, scale_fmt=scale_fmt),
-        eager(huge, block_size=block_size, scale_fmt=scale_fmt),
-        rtol=0,
-        atol=0,
-        msg="saturating",
-    )
+    check(torch.randn(3, 5, block_size * 2, dtype=torch.bfloat16, device=device), "normal")
+    check(torch.randn(2, 3, block_size, dtype=torch.bfloat16, device=device) * 1e-3, "tiny")
+    check(torch.zeros(1, 2, block_size, dtype=torch.bfloat16, device=device), "zeros")
+    check(torch.full((1, 2, block_size), 1e4, dtype=torch.bfloat16, device=device), "saturating")
 
 
 @pytest.mark.parametrize("amax", [0.0, 0.005, 0.02, 0.05, 0.2])
