@@ -128,6 +128,7 @@ seed_omni/models/bagel.md
 :maxdepth: 1
 :caption: Design
 
+design/qwen4_frozen_cpu_ple.md
 design/ci_case_scheduling.md
 design/op_selection.md
 design/module_config.md
