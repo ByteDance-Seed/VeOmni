@@ -104,9 +104,9 @@ def forward(
     v_res = all_to_all_tensor(v, scatter_dim=head_dimension, gather_dim=seq_dimension, group=sp_group, async_op=True)
 
     # Wait after all three launches. Q and K already finished their pre-A2A norms.
-    output_q = unpadding_tensor_for_seqeunce_parallel(output_q_res(), seq_dimension, unpadded_dim_size)
-    output_k = unpadding_tensor_for_seqeunce_parallel(output_k_res(), seq_dimension, unpadded_dim_size)
-    v = unpadding_tensor_for_seqeunce_parallel(v_res(), seq_dimension, unpadded_dim_size)
+    output_q = unpadding_tensor_for_seqeunce_parallel(output_q_res(), seq_dimension, unpadded_dim_size, group=sp_group)
+    output_k = unpadding_tensor_for_seqeunce_parallel(output_k_res(), seq_dimension, unpadded_dim_size, group=sp_group)
+    v = unpadding_tensor_for_seqeunce_parallel(v_res(), seq_dimension, unpadded_dim_size, group=sp_group)
 
     saved: list[Tensor | None] = [
         hidden_states,
@@ -154,7 +154,7 @@ def backward(grad_output: tuple[Tensor, Tensor, Tensor], saved: SavedState) -> t
         saved_rms_k, rest = take_inner(rest, meta.rms_k)
 
     # Reverse all-to-all before the QK-norm backward. Norm ran pre-collect.
-    grad_v = padding_tensor_for_seqeunce_parallel(grad_output[2].contiguous(), dim=seq_dimension)
+    grad_v = padding_tensor_for_seqeunce_parallel(grad_output[2].contiguous(), dim=seq_dimension, group=sp_group)
     grad_v_res = all_to_all_tensor(
         grad_v,
         scatter_dim=seq_dimension,
@@ -164,7 +164,7 @@ def backward(grad_output: tuple[Tensor, Tensor, Tensor], saved: SavedState) -> t
     )
     grad_v = grad_v_res()
 
-    grad_k = padding_tensor_for_seqeunce_parallel(grad_output[1].contiguous(), dim=seq_dimension)
+    grad_k = padding_tensor_for_seqeunce_parallel(grad_output[1].contiguous(), dim=seq_dimension, group=sp_group)
     grad_k_res = all_to_all_tensor(
         grad_k,
         scatter_dim=seq_dimension,
@@ -189,7 +189,7 @@ def backward(grad_output: tuple[Tensor, Tensor, Tensor], saved: SavedState) -> t
     elif meta.norm_type is not None:
         raise NotImplementedError(f"{meta.norm_type} is not supported in async-ulysses now!")
 
-    grad_q = padding_tensor_for_seqeunce_parallel(grad_output[0].contiguous(), dim=seq_dimension)
+    grad_q = padding_tensor_for_seqeunce_parallel(grad_output[0].contiguous(), dim=seq_dimension, group=sp_group)
     grad_q_res = all_to_all_tensor(
         grad_q,
         scatter_dim=seq_dimension,
