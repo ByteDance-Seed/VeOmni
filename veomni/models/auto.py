@@ -191,7 +191,7 @@ def build_foundation_model(
             "native-sparse",
         ]
     ) = None,
-    init_device: Literal["cpu", "cuda", "npu", "mlu", "meta"] = "cuda",
+    init_device: Literal["cpu", "cuda", "npu", "mlu", "xpu", "meta"] = "cuda",
     config_kwargs: dict[str, Any] | None = None,
     encoder_data_balance: bool | None = False,
     encoder_data_balance_sorting_algo: str | None = "post_mbs_balancing_greedy_without_pad",
