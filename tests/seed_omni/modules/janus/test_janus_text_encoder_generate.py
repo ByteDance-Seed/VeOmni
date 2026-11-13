@@ -3,9 +3,8 @@
 A sampled ``<boi>`` ends the text phase and opens an image span. Three things
 have to hold at that moment, and each used to break:
 
-* The row carrying the ``<boi>`` embedding must stay an ``output`` item, because
-  ``image_vq`` starts with ``janus_llama.generate``, which asserts the tail is
-  output and reads ``value[-1:]`` as its next input.
+* ``<boi>`` is an ordinary text token, so the row is sealed as ``text`` like any
+  other span. The backbone reads only ``value[-1:]``, never the type.
 * The classifier-free-guidance embeds must be stored on an item that is *in* the
   conversation list. ``maybe_merge_outputs`` folds the current row into the
   previous one and drops it, so writing them on the pre-merge object lost them.
@@ -58,75 +57,37 @@ def _conversation() -> list[ConversationItem]:
     ]
 
 
-def test_a_sampled_boi_seals_the_tail_as_text(monkeypatch):
-    """``<boi>`` is an ordinary text token, exactly as the training template emits it.
-
-    The image span re-encodes the row's last embedding, so nothing about the
-    backbone step depends on the row still being an ``output``.
-    """
-    model = _encoder()
-    monkeypatch.setattr(model, "_sample_token", lambda *a, **k: model._chat_template.boi_token_id)
-
-    conversation = _conversation()
-    outputs = model.generate(conversation, generation_kwargs={"guidance_scale": 5.0})
-
-    assert conversation[-1].type == "text"
-    assert outputs.get("signal") == "start_image_gen" or "start_image_gen" in str(outputs)
-
-
-def test_a_sampled_boi_arms_cfg_on_the_live_tail(monkeypatch):
+def test_a_sampled_boi_seals_the_tail_arms_cfg_and_reports_the_text(monkeypatch):
     model = _encoder()
     monkeypatch.setattr(model, "_sample_token", lambda *a, **k: model._chat_template.boi_token_id)
     monkeypatch.setattr(model, "_build_cfg_uncond_embeds", lambda conversation_list: torch.zeros(1, 2, 8))
 
     conversation = _conversation()
-    model.generate(conversation, generation_kwargs={"guidance_scale": 5.0})
+    outputs = model.generate(conversation, generation_kwargs={"guidance_scale": 5.0})
 
-    # Stored on an item still in the list — not on the row the merge dropped.
-    assert "cfg_uncond_inputs_embeds" in conversation[-1].meta
-    assert conversation[-1].meta["cfg_uncond_inputs_embeds"] is not None
-
-
-def test_a_sampled_boi_reports_the_text_so_far(monkeypatch):
-    model = _encoder()
-    monkeypatch.setattr(model, "_sample_token", lambda *a, **k: model._chat_template.boi_token_id)
-
-    conversation = _conversation()
-    outputs = model.generate(conversation, generation_kwargs={})
-
-    assert outputs["generated"]["type"] == "text"
-    assert outputs["generated"]["meta"]["token_ids"] == [10, 11]
-    # The whole span, ``<boi>`` included, is sealed as text; ``<boi>`` is dropped
-    # from the reported token ids because it belongs to the image span.
+    # Sealed as text; ``<boi>`` itself belongs to the image span, not the reply.
     assert conversation[-1].type == "text"
+    assert outputs["generated"]["meta"]["token_ids"] == [10, 11]
+    # CFG armed on an item still in the list — not on the row the merge dropped.
+    assert conversation[-1].meta["cfg_uncond_inputs_embeds"] is not None
+    assert "start_image_gen" in str(outputs)
 
 
-def test_generate_accepts_no_generation_kwargs(monkeypatch):
-    """``emit_image_start`` defaults ``generation_kwargs`` to ``None``."""
-    model = _encoder()
-    monkeypatch.setattr(model, "_sample_token", lambda *a, **k: model._chat_template.eos_token_id)
+def test_generate_accepts_no_generation_kwargs_and_pads_the_cfg_prefix(monkeypatch):
+    """``emit_image_start`` defaults ``generation_kwargs`` to ``None``.
 
-    conversation = _conversation()
-    outputs = model.generate(conversation, generation_kwargs=None)
-
-    assert "text_done" in str(outputs)
-
-
-def test_cfg_uncond_prefix_covers_the_text_already_generated():
-    """Both CFG branches must enter the image span at the same position.
-
-    The conditional cache holds every token generated so far; the unconditional one
-    starts from the prompt. If the uncond prefix stopped at the prompt, the two
-    branches would run the image span at different positions.
+    Both CFG branches must also enter the image span at the same position: the
+    conditional cache already holds the text generated so far, so the
+    unconditional prefix is padded out to that length.
     """
     model = _encoder()
-    prompt_len = 4
-    generated = 3
-    conversation = [
+    monkeypatch.setattr(model, "_sample_token", lambda *a, **k: model._chat_template.eos_token_id)
+    outputs = model.generate(_conversation(), generation_kwargs=None)
+    assert "text_done" in str(outputs)
+
+    prompt_len, generated = 4, 3
+    prompt = [
         ConversationItem(type="text", value=torch.zeros(prompt_len, dtype=torch.long), role="user"),
         ConversationItem(type="output", value=torch.zeros(1, generated, 8), role="assistant", meta={}),
     ]
-
-    embeds = model._build_cfg_uncond_embeds(conversation)
-
-    assert embeds.shape[-2] == prompt_len + generated
+    assert model._build_cfg_uncond_embeds(prompt).shape[-2] == prompt_len + generated

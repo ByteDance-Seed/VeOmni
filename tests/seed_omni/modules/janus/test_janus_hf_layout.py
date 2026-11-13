@@ -218,6 +218,12 @@ def test_the_layout_claims_every_upstream_key():
 
 
 def test_build_config_maps_the_upstream_config_per_module():
+    """Each module's config comes from the upstream one, including the tie flag.
+
+    ``post_process_after_weight_loading`` ANDs the outer and nested flags, so the
+    layout does too: guessing from one loses a real ``lm_head.weight`` in one
+    direction and drops a genuinely tied embedding in the other.
+    """
     config = _janus_config()
     modules = JANUS_HF_LAYOUT.modules
     assert modules[SIGLIP].build_config(config).model_type == "janus_siglip"
@@ -227,21 +233,10 @@ def test_build_config_maps_the_upstream_config_per_module():
 
     # The backbone keeps the upstream understanding-image placeholder.
     assert modules[LLAMA].build_config(config).image_token_id == config.image_token_id
-    # An untied source stays untied: the text encoder loads its own lm_head.
-    assert modules[TEXT_ENCODER].build_config(config).tie_word_embeddings is False
 
-
-def test_build_config_ties_only_when_both_flags_agree():
-    """``post_process_after_weight_loading`` ANDs the two flags, so the layout must too.
-
-    Guessing from one flag loses a real ``lm_head.weight`` in one direction and
-    drops a genuinely tied embedding in the other.
-    """
-    text_encoder = JANUS_HF_LAYOUT.modules[TEXT_ENCODER]
-
+    text_encoder = modules[TEXT_ENCODER]
     assert text_encoder.build_config(_janus_config(tied=True)).tie_word_embeddings is True
     assert text_encoder.build_config(_janus_config(tied=False)).tie_word_embeddings is False
-
     # A stale top-level flag beside an untied text_config means the file stores a
     # head: build it rather than substituting the embedding.
     disagreeing = _janus_config(tied=False)
@@ -262,25 +257,46 @@ def test_the_backbone_never_ties_itself():
 
 
 @pytest.mark.parametrize(
-    ("tied", "store_tied_head", "expect_head"),
+    ("tied", "store_tied_head", "expect_head", "stale_top_flag", "equal_weights"),
     [
-        (False, False, True),  # Janus-1.3B: untied, the file stores its own head
-        (True, False, False),  # a genuinely tied export omits lm_head.weight
+        # Janus-1.3B: untied config, the file stores its own distinct head.
+        (False, False, True, False, False),
+        # A genuinely tied export omits lm_head.weight.
+        (True, False, False, False, False),
         # Tied config and the duplicate stored with *equal* values: transformers
         # keeps the tie there, so the head must stay tied rather than become an
         # independent copy that SFT would drift away from the embedding.
-        (True, True, False),
+        (True, True, False, False, True),
+        # A stale top-level flag beside an untied text_config means the file has a
+        # head: build it rather than substituting the embedding.
+        (False, False, True, True, False),
+        # The config outranks what the tensors look like: explicitly untied with
+        # two equal tensors still keeps its own head, so SFT cannot couple them.
+        (False, False, True, False, True),
     ],
-    ids=["untied", "tied", "tied-with-duplicate"],
+    ids=["untied", "tied", "tied-with-duplicate", "stale-top-flag", "untied-equal-weights"],
 )
-def test_a_tied_checkpoint_loads_and_keeps_the_right_head(tmp_path, tied, store_tied_head, expect_head):
-    """A tie flag on the backbone used to make the whole load raise.
+def test_the_layout_decides_tying_from_the_config_and_the_stored_weights(
+    tmp_path, tied, store_tied_head, expect_head, stale_top_flag, equal_weights
+):
+    """A tie needs the config's permission and weights that support it.
 
-    The layout decides tying from the config, so this also pins that the text
-    encoder ends up with a head exactly when the file has one to give it.
+    The backbone used to crash outright on a tied checkpoint (its input embedding
+    is ``nn.Identity``, so the shared post-load tie did ``_parameters["weight"]``
+    on it), and reading only one of the two signals lost a real head or coupled a
+    tied pair. This pins every combination end to end.
     """
     root = tmp_path / "Janus-tiny"
     tensors = _write_hf_checkpoint(root, tied=tied, store_tied_head=store_tied_head)
+
+    if equal_weights:
+        tensors["lm_head.weight"] = tensors["model.language_model.embed_tokens.weight"].clone()
+        save_file(tensors, root / "model.safetensors", metadata={"format": "pt"})
+    if stale_top_flag:
+        config_path = root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["tie_word_embeddings"] = True
+        config_path.write_text(json.dumps(config), encoding="utf-8")
 
     model = OmniModel.from_pretrained(str(root), dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager")
     text_encoder = model.modules_dict[TEXT_ENCODER]
@@ -292,45 +308,6 @@ def test_a_tied_checkpoint_loads_and_keeps_the_right_head(tmp_path, tied, store_
     else:
         # No head of its own, so ``decode`` projects through the embedding.
         assert torch.equal(text_encoder.embed_tokens.weight, embedding)
-
-
-def test_a_stale_top_level_tie_flag_does_not_drop_a_stored_head(tmp_path):
-    """Top-level ``True`` beside an untied ``text_config`` means the file has a head."""
-    root = tmp_path / "Janus-tiny"
-    tensors = _write_hf_checkpoint(root, tied=False)
-    config_path = root / "config.json"
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    config["tie_word_embeddings"] = True
-    config_path.write_text(json.dumps(config), encoding="utf-8")
-
-    model = OmniModel.from_pretrained(str(root), dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager")
-    text_encoder = model.modules_dict[TEXT_ENCODER]
-    assert text_encoder.lm_head is not None
-    assert torch.equal(text_encoder.lm_head.weight, tensors["lm_head.weight"])
-
-
-def test_an_explicitly_untied_config_is_not_re_tied_by_equal_weights(tmp_path):
-    """The config outranks what the tensors happen to look like.
-
-    A checkpoint can declare ``tie_word_embeddings: false`` on both levels and
-    still store two equal tensors (a copy made by a tool, an interpolated export).
-    Tying them here would couple the head to the embedding for the whole SFT run,
-    changing how the source model trains — so the config's ``false`` wins.
-    """
-    from veomni.models.seed_omni.modules.janus.hf_layout import JANUS_HF_LAYOUT, _tie_word_embeddings
-
-    root = tmp_path / "Janus-tiny"
-    tensors = _write_hf_checkpoint(root, tied=False)
-    # Make the stored head identical to the embedding, leaving the flags untied.
-    tensors["lm_head.weight"] = tensors["model.language_model.embed_tokens.weight"].clone()
-    save_file(tensors, root / "model.safetensors", metadata={"format": "pt"})
-
-    config = JANUS_HF_LAYOUT.read_hf_config(str(root))
-    assert config.text_config.tie_word_embeddings is False
-    assert _tie_word_embeddings(config) is False
-
-    model = OmniModel.from_pretrained(str(root), dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager")
-    assert model.modules_dict[TEXT_ENCODER].lm_head is not None
 
 
 def test_an_hf_root_resolves_to_a_weight_free_split_view(hf_root):
