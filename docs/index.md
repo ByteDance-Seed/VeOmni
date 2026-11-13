@@ -30,6 +30,7 @@ usage/basic_modules.md
 usage/multimodal_data_processing.md
 usage/data_packing_and_dyn_bsz.md
 usage/dit_microbatching.md
+usage/float8_training.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
 usage/support_new_models/qwen3_omni_moe_example.md
@@ -73,6 +74,7 @@ examples/qwen3_omni_moe.md
 examples/qwen3_omni_offline_av.md
 examples/minimax_h3.md
 examples/minimax_h3_smoke_test.md
+examples/hunyuanvideo15.md
 examples/wan2.1.md
 examples/wan2.1_I2V_1.3B.md
 examples/ltx-2.3.md
@@ -112,6 +114,7 @@ seed_omni/distributed/sequence_parallel.md
 seed_omni/mixins/module_preprocessor.md
 seed_omni/mixins/metric_meter.md
 seed_omni/mixins/offline_encoding.md
+seed_omni/mixins/configure_optimizer.md
 ```
 
 ```{toctree}
@@ -119,6 +122,8 @@ seed_omni/mixins/offline_encoding.md
 :caption: SeedOmni Models
 
 seed_omni/models/qwen3.md
+seed_omni/models/qwen3vl.md
+seed_omni/models/bagel.md
 ```
 
 ```{toctree}

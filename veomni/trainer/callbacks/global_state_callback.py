@@ -253,21 +253,15 @@ class GlobalStateCallback(Callback):
         # silently drop a corrupt cursor. Reduce the read failure separately, and
         # before that reduction, so a rank that raised cannot strand its peers.
         read_error: Optional[Exception] = None
-        current_state = legacy_state = None
+        current_state = None
         try:
             current_state = self._read_current(load_path)
-            if current_state is None:
-                # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to drop
-                # resume from the pre-split layouts.
-                from ...checkpoint.legacy_v0_1_12 import apply_legacy_global_state
-
-                legacy_state = apply_legacy_global_state(load_path, self.rank)
         except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
             logger.error(f"[RANK {self.rank}] failed to read trainer state under {load_path}", exc_info=True)
             read_error = e
         raise_if_any_rank_failed(read_error, "reading the trainer state")
 
-        found = current_state is not None or legacy_state is not None
+        found = current_state is not None
         if dist.is_initialized():
             flag = torch.tensor([int(found)], dtype=torch.int32, device=get_device_type())
             dist.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
@@ -279,7 +273,7 @@ class GlobalStateCallback(Callback):
             logger.warning(f"No trainer state at {state_path}; resuming weights only.")
             return None
 
-        global_state = current_state if current_state is not None else legacy_state
+        global_state = current_state
         self.trainer.state.global_step = global_state["global_step"]
         self._restore_position(global_state)
 

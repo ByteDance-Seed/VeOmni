@@ -33,6 +33,8 @@ def wrapper(
     num_experts: int,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
+    block_size: int = 128,
+    expert_dtype: str = "fp8",
 ) -> Tensor:
     """Routed expert MLP. Empty ``fc1_*`` means that layout is unused.
 
