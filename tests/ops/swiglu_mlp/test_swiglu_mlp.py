@@ -717,14 +717,21 @@ def test_liger_kernels_refuses_an_activation_it_cannot_compute():
 
 
 def test_the_disallowed_activations_are_refused_with_a_reason():
-    """`prelu` / `xielu` carry parameters, `laplace` is not elementwise, `gelu_10` takes bounds.
+    """Three names are excluded, each for a measured reason rather than an assumed one.
 
-    Each would silently mean something other than ``activation(gate) * up``, so the
-    set is asserted rather than left to drift with a transformers upgrade.
+    `prelu` / `xielu` carry learnable parameters, so an inline instance would train a
+    different function from the model's own. `mish` has a fused ATen backward whose
+    bf16 rounding differs from any decomposed derivative (1.56e-2 absolute on ~25%
+    of elements), so a row here would train gradients the model's own `act_fn` never
+    produces.
+
+    `laplace` and `gelu_10` are **served**: `LaplaceActivation` acts elementwise, and
+    `ACT2FN["gelu_10"]` supplies its bounds at construction so its `forward` takes one
+    tensor. The set is asserted rather than left to drift with a transformers upgrade.
     """
     from veomni.ops.activation import _DISALLOWED, normalize_activation, supports
 
-    assert set(_DISALLOWED) == {"prelu", "xielu", "laplace", "gelu_10"}
+    assert set(_DISALLOWED) == {"prelu", "xielu", "mish"}
     for name in _DISALLOWED:
         assert not supports(name)
         with pytest.raises(ValueError, match="cannot run through a gated-MLP row"):

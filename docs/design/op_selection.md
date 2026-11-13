@@ -146,14 +146,16 @@ transformers' own implementation of each -- `gelu_new` and `gelu_pytorch_tanh` a
 normalized onto one formula. SiLU keeps its ATen spelling so the quantizing row
 reuses `eager`'s gradient bit for bit.
 
-The four exclusions are incompatible with `activation(gate) * up`, and each says
-why rather than silently computing something else:
+Three names are excluded, each for a measured reason rather than an assumed one:
 
 | Name | Why not |
 | --- | --- |
 | `prelu`, `xielu` | carry learnable parameters, so an inline instance would train a different function from the model's own |
-| `laplace` | normalizes along the last dimension instead of acting elementwise |
-| `gelu_10` | its forward takes `min` / `max` bounds in addition to the input |
+| `mish` | `F.mish` has a fused ATen backward whose bf16 rounding differs from any decomposed derivative (1.56e-2 absolute on ~25% of elements), so a row here would train gradients the model's own `act_fn` never produces |
+
+`laplace` and `gelu_10` are **served**, not excluded: `LaplaceActivation` acts
+elementwise, and `ACT2FN["gelu_10"]` supplies its bounds at construction so its
+`forward` takes one tensor.
 
 Which row runs is decided before the call, by `swiglu_mlp.use_fused_row`, because
 a row's activation support is part of its contract:

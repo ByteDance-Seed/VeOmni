@@ -72,10 +72,9 @@ _DISALLOWED: dict[str, str] = {
     "prelu": "carries a learnable `num_parameters` slope, so an inline instance would train "
     "a different function from the model's own",
     "xielu": "carries learnable `alpha_p` / `alpha_n` parameters, same problem as `prelu`",
-    "laplace": "normalizes along the last dimension rather than acting elementwise, so "
-    "`activation(gate) * up` would not mean what the row assumes",
-    "gelu_10": "its forward takes `min` / `max` bounds in addition to the input, so it is not a "
-    "one-argument activation",
+    "mish": "`F.mish` has a fused ATen backward whose bf16 rounding differs from any decomposed "
+    "derivative -- 1.56e-2 absolute on ~25% of elements -- so a row here would train gradients "
+    "the model's own `act_fn` never produces",
 }
 
 
