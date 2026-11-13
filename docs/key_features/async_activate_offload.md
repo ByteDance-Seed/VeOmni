@@ -214,14 +214,32 @@ lifecycle across GPU and CPU:
 1. **Creation:** A pinned CPU buffer (`tensor_cpu`) is allocated matching the tensor's
    shape and dtype.
 2. **D2H (launch_d2h):** On the swap stream, copy GPU tensor to pinned CPU buffer
-   (non-blocking). Record a `d2h_event` for synchronization.
-3. **Wait D2H (wait_d2h_finished):** After the D2H transfer completes, free the GPU
-   storage by resizing to 0.
+   (non-blocking), with `record_stream` on that stream so the native caching
+   allocator holds the old storage until the copy finishes. Record a `d2h_event`
+   and store it on the host buffer as `_last_swap_event`.
+3. **Wait D2H (wait_d2h_finished):** Detach the GPU storage by pointing the tensor
+   at an empty storage. With CUDA's **native** caching allocator this does **not**
+   host-synchronize: the `record_stream` above already keeps the source storage
+   alive, so the D2H copy is ordered by the stream rather than by a blocking event
+   wait. Every other case keeps the event synchronize, because `record_stream`
+   cannot defer a free there: NPU and MLU allocators, CUDA's async allocator,
+   `PYTORCH_NO_CUDA_MEMORY_CACHING`, and any tensor whose storage the allocator
+   does not own (`torch.from_numpy`, `from_dlpack`, `frombuffer` — those storages
+   report `resizable() == False`). `veomni.utils.device.is_caching_allocator_active()`
+   answers the allocator half of that question, and it is deliberately conservative.
 4. **H2D (launch_h2d):** On the swap stream, resize GPU storage back and copy from
-   pinned CPU buffer (non-blocking). Record an `h2d_event`.
+   pinned CPU buffer (non-blocking). Record an `h2d_event`, also stored on the host
+   buffer as `_last_swap_event`.
 5. **Wait H2D:** The default stream waits on `h2d_event` before accessing the tensor.
 
 State transitions: `device` → (D2H) → `host` → (H2D) → `device`
+
+The `_last_swap_event` tag is what lets the host pool stay asynchronous: handing a
+buffer to a new owner waits on that buffer's own last transfer, and so does the
+moment a buffer is dropped or evicted — the only two points where the pool has to
+care. Both run outside the pool lock, so one manager's in-flight transfer does not
+serialize another manager's release, and the tag is popped when it is waited on so
+a completed event is not retained.
 
 ### OffloadManager Ownership
 

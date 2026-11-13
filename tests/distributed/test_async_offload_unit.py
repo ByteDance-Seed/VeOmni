@@ -291,6 +291,36 @@ def test_async_offload_rejects_cpu_tensors():
     assert not base_check_fn(torch.ones(4))
 
 
+def test_deferred_free_requires_an_allocator_owned_storage(monkeypatch):
+    """A tensor over foreign memory cannot rely on ``record_stream``.
+
+    ``from_numpy`` / ``from_dlpack`` / ``frombuffer`` hand the allocator a deleter
+    it does not recognise, so ``record_stream`` returns without pinning anything
+    and the storage can be freed the moment ``set_`` drops the last reference.
+    Those storages report ``resizable() == False``, which is the check.
+    """
+    from veomni.distributed import async_offload
+
+    monkeypatch.setattr(async_offload, "is_caching_allocator_active", lambda: True)
+
+    owned = torch.empty(4)
+    assert async_offload._deferred_free_supported(owned)
+
+    import numpy as np
+
+    foreign = torch.from_numpy(np.zeros(4, dtype=np.float32))
+    assert not foreign.untyped_storage().resizable()
+    assert not async_offload._deferred_free_supported(foreign)
+
+
+def test_deferred_free_is_false_without_the_native_allocator(monkeypatch):
+    from veomni.distributed import async_offload
+
+    monkeypatch.setattr(async_offload, "is_caching_allocator_active", lambda: False)
+
+    assert not async_offload._deferred_free_supported(torch.empty(4))
+
+
 def test_shared_host_buffer_pool_survives_repeated_application():
     """The per-module application path must not multiply the configured limit.
 

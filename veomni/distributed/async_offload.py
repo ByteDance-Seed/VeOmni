@@ -37,6 +37,7 @@ from ..utils.device import (
     create_stream,
     get_current_stream,
     get_device_type,
+    is_caching_allocator_active,
     switch_to_specified_stream,
 )
 
@@ -109,9 +110,18 @@ class PinnedBufferPool:
         return (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
 
     def acquire(self, tensor):
+        """Return a host buffer matching ``tensor``'s layout, waiting for its last transfer.
+
+        A buffer handed back by :meth:`release` may still be the destination of a
+        D2H copy, or the source of an H2D one, because ``release`` deliberately
+        does not block. The wait therefore belongs here -- the one path that hands
+        a buffer to a new owner -- and runs outside the lock so a slow transfer on
+        one manager's stream cannot serialize another manager's acquire.
+        """
         key = self._key(tensor)
         with self._lock:
             free_buffers = self._free_buffers.get(key)
+            buffer = None
             if free_buffers:
                 buffer = free_buffers.pop()
                 self._cached_bytes -= buffer.numel() * buffer.element_size()
@@ -120,7 +130,15 @@ class PinnedBufferPool:
                 else:
                     del self._free_buffers[key]
                 self.reuses += 1
-                return buffer, key
+        if buffer is not None:
+            # The buffer may still be the destination of a D2H copy, or the
+            # source of an H2D copy, when it was released. Release does not wait
+            # for it (that is what keeps the pool off the host's critical path),
+            # so the wait belongs here, on the one path that hands the buffer to
+            # a new owner -- and outside the lock, so a slow transfer on one
+            # manager's stream does not serialize every other manager's release.
+            self._wait_for_last_swap(buffer)
+            return buffer, key
 
         pin_memory = _is_active_accelerator_tensor(tensor)
         try:
@@ -149,27 +167,59 @@ class PinnedBufferPool:
         return buffer, key
 
     def release(self, buffer, key):
+        """Return a host buffer to the pool, without waiting for its last transfer.
+
+        The wait is deferred to :meth:`acquire` for the reuse path and performed
+        here only for a buffer that leaves the pool for good (a drop or an
+        eviction), because those two cannot be waited on later. Both happen outside
+        the lock, so one manager's in-flight transfer does not hold up another's
+        release; the counters stay inside it.
+        """
         if buffer is None:
             return
 
         buffer_nbytes = buffer.numel() * buffer.element_size()
+        evicted = []
         with self._lock:
             if self.max_cached_bytes == 0 or buffer_nbytes > self.max_cached_bytes:
                 self.drops += 1
-                return
+                dropped = True
+            else:
+                dropped = False
+                while self._cached_bytes + buffer_nbytes > self.max_cached_bytes:
+                    oldest_key, oldest_buffers = next(iter(self._free_buffers.items()))
+                    oldest = oldest_buffers.popleft()
+                    self._cached_bytes -= oldest.numel() * oldest.element_size()
+                    self.evictions += 1
+                    evicted.append(oldest)
+                    if not oldest_buffers:
+                        del self._free_buffers[oldest_key]
 
-            while self._cached_bytes + buffer_nbytes > self.max_cached_bytes:
-                oldest_key, oldest_buffers = next(iter(self._free_buffers.items()))
-                evicted = oldest_buffers.popleft()
-                self._cached_bytes -= evicted.numel() * evicted.element_size()
-                self.evictions += 1
-                if not oldest_buffers:
-                    del self._free_buffers[oldest_key]
+                free_buffers = self._free_buffers.setdefault(key, deque())
+                free_buffers.append(buffer)
+                self._free_buffers.move_to_end(key)
+                self._cached_bytes += buffer_nbytes
+        # Synchronize outside the lock: one manager's in-flight transfer must not
+        # hold up another manager's release. A dropped buffer leaves the pool for
+        # good and an evicted one is about to be freed, so both need their last
+        # transfer complete now. The counters stay inside the lock, since the pool
+        # is shared and ``release`` can run on any thread that drops a SwapTensor.
+        if dropped:
+            self._wait_for_last_swap(buffer)
+        for oldest in evicted:
+            self._wait_for_last_swap(oldest)
 
-            free_buffers = self._free_buffers.setdefault(key, deque())
-            free_buffers.append(buffer)
-            self._free_buffers.move_to_end(key)
-            self._cached_bytes += buffer_nbytes
+    @staticmethod
+    def _wait_for_last_swap(buffer) -> None:
+        """Wait for the transfer that last wrote or read ``buffer``, then forget it.
+
+        The tag is attached by :class:`SwapTensor` on every D2H and H2D copy. It
+        is popped rather than kept so a long-idle buffer does not pin a completed
+        event, and released outside the pool lock by every caller.
+        """
+        event = buffer.__dict__.pop("_last_swap_event", None)
+        if event is not None:
+            event.synchronize()
 
 
 class GetCnt:
@@ -215,6 +265,24 @@ class GetCnt:
         return self._block_tensor_nums[block_idx]
 
 
+def _deferred_free_supported(tensor=None) -> bool:
+    """Whether ``record_stream`` can keep ``tensor``'s storage alive, as this path assumes.
+
+    Delegates to :func:`~veomni.utils.device.is_caching_allocator_active` for the
+    allocator question, and additionally requires the storage to belong to that
+    allocator: a tensor built over foreign memory (``torch.from_numpy``,
+    ``from_dlpack``, ``frombuffer``) carries a deleter the allocator does not
+    recognise, so ``record_stream`` returns without doing anything and the memory
+    can be released the moment ``set_`` drops the last reference. Those storages
+    report ``resizable() == False``.
+    """
+    if not is_caching_allocator_active():
+        return False
+    if tensor is not None and not tensor.untyped_storage().resizable():
+        return False
+    return True
+
+
 class SwapTensor:
     def __init__(self, tensor, key, pool):
         if not _has_private_dense_storage(tensor):
@@ -234,14 +302,20 @@ class SwapTensor:
         self.h2d_event = create_event()
 
     def release_host_buffer(self):
+        """Hand the host buffer back to the pool, tagging an in-flight H2D source.
+
+        Never waits: a buffer that may still be the destination of a D2H copy is
+        tagged with that copy's event, and :class:`PinnedBufferPool` waits on the
+        tag when it hands the buffer to a new owner or drops/evicts it.
+        """
         if self._host_buffer_released or self.tensor_cpu is None:
             return
-        if self.stat == "d2h":
-            self.d2h_event.synchronize()
-        elif self.stat == "host":
-            self.d2h_event.synchronize()
-        elif self.stat == "h2d":
-            self.h2d_event.synchronize()
+        # A buffer that may still be the destination of a D2H copy is tagged with
+        # that copy's event and released without waiting; ``PinnedBufferPool``
+        # synchronizes the tag on the path that hands it to a new owner and when
+        # it drops or evicts it. An H2D source is tagged the same way.
+        if self.stat == "h2d":
+            self.tensor_cpu._last_swap_event = self.h2d_event
         self.pool.release(self.tensor_cpu, self._host_buffer_key)
         self.tensor_cpu = None
         self._host_buffer_released = True
@@ -253,6 +327,12 @@ class SwapTensor:
             pass
 
     def launch_d2h(self, stream):
+        """Queue the GPU-to-host copy of ``self.tensor`` on ``stream``.
+
+        ``record_stream`` is what lets :meth:`wait_d2h_finished` detach the source
+        storage without a host wait, so it is queued on the same stream as the copy
+        and before it.
+        """
         if self.stat != "device":
             return
 
@@ -261,25 +341,43 @@ class SwapTensor:
         with torch.no_grad():
             with switch_to_specified_stream(stream):
                 stream.wait_event(forward_event)
+                self.tensor.record_stream(stream)
                 self.tensor_cpu.copy_(self.tensor, non_blocking=True)
                 self.d2h_event.record()
+                self.tensor_cpu._last_swap_event = self.d2h_event
                 self.stat = "d2h"
 
     def wait_d2h_finished(self):
+        """Detach the offloaded GPU storage once the D2H copy is ordered or complete.
+
+        See :func:`_deferred_free_supported`: the host wait is skipped only where
+        ``record_stream`` actually defers the free of this storage.
+        """
         if self.stat != "d2h":
             return
-        get_current_stream().wait_event(self.d2h_event)
-        # Stream wait only orders later GPU work. Detaching storage is a host
-        # operation, so the D2H copy must be host-complete first.
-        self.d2h_event.synchronize()
+        if not _deferred_free_supported(self.tensor):
+            # No allocator hook to keep the source storage alive -- either the
+            # allocator is not the native caching one, or the storage is foreign
+            # (a DLPack / from_numpy view the allocator's deleter check skips) --
+            # so the copy must be host-complete before the storage is detached.
+            self.d2h_event.synchronize()
         # Point this tensor at a fresh empty storage instead of resize_(0).
         # resize_ would free a StorageImpl that a Tensor.set_() alias can still
-        # hold even when _base is None and storage_offset is 0.
+        # hold even when _base is None and storage_offset is 0. On CUDA,
+        # record_stream(d2h_stream) in launch_d2h keeps the old StorageImpl
+        # alive in the caching allocator until the D2H copy finishes, avoiding
+        # a per-layer host cudaEventSynchronize stall; the host buffer's own
+        # event orders its reuse instead.
         placeholder = torch.empty(0, dtype=self.tensor.dtype, device=self.tensor.device)
         self.tensor.set_(placeholder.untyped_storage())
         self.stat = "host"
 
     def launch_h2d(self, h2d_stream):
+        """Queue the host-to-GPU restore of ``self.tensor`` on ``h2d_stream``.
+
+        Tags the host buffer with the copy's event, so the pool knows the buffer is
+        still being read until that event fires.
+        """
         if self.stat == "h2d":
             return
         if self.stat != "host":
@@ -299,6 +397,7 @@ class SwapTensor:
                 restored.copy_(self.tensor_cpu, non_blocking=True)
                 self.tensor.set_(restored.untyped_storage(), 0, self.size, self.stride)
                 self.h2d_event.record()
+                self.tensor_cpu._last_swap_event = self.h2d_event
                 self.stat = "h2d"
 
 
