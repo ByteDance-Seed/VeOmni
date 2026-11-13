@@ -261,20 +261,20 @@ to `--model.model_path` (the layout loads it again) or to `transformers`:
 
 Two cases do **not** produce that merged export:
 
-- A **LoRA** run saves adapters per module, under
-  `hf_ckpt/lora_ckpt/<module>/` rather than as one merged checkpoint. Point
-  `model.model_path` at the base checkpoint (upstream root or split root) and give
-  each module its own adapter directory, e.g.
+- A **LoRA** run saves adapters per module under
+  `<output_dir>/checkpoints/global_step_N/lora_ckpt/<module>/` — a sibling of
+  `hf_ckpt/`, not inside it. Point `model.model_path` at the base checkpoint
+  (upstream root or split root) and give each trained module its own adapter
+  directory, e.g.
   `--model.model_config.modules.janus_llama.lora_config.lora_adapter=<...>/lora_ckpt/janus_llama`
   (repeat per trained module). A mixed full-parameter + LoRA run needs both: the
-  merged export carries the full-parameter modules' *updated* weights, so keep it
-  and layer the adapters on top — using only `hf_ckpt/` there would drop the LoRA
-  updates.
+  merged `hf_ckpt/` carries the full-parameter modules' *updated* weights, so keep
+  it and layer the adapters on top — that directory alone drops the LoRA updates.
 - A module that ended up **fully frozen** (for example one whose LoRA targets
   matched nothing) produces no export of its own.
 
 A split-checkpoint run (no HF layout to write back to) instead writes per-module
-folders under `hf_ckpt/<module>/` (and `hf_ckpt/lora_ckpt/<module>/` for adapters).
+folders under `hf_ckpt/<module>/`, with adapters at `lora_ckpt/<module>/`.
 Assemble those into a flat root by linking each module's folder to
 `<root>/<module>`. Treat a **missing** directory as an error rather than
 substituting the original weights: a module can be absent because the export

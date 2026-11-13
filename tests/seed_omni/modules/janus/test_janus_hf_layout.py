@@ -268,9 +268,9 @@ def test_the_backbone_never_ties_itself():
         # keeps the tie there, so the head must stay tied rather than become an
         # independent copy that SFT would drift away from the embedding.
         (True, None, True, False, True),
-        # The config outranks equal tensors: explicitly untied on both levels with
-        # two equal stored tensors still keeps its own head.
-        (False, None, False, True, True),
+        # Equal stored tensors outrank an untied config: the pair is shared in the
+        # source model, so splitting it would let SFT update the two apart.
+        (False, None, True, False, True),
         # Outer ``True`` beside an untied ``text_config`` with a stored, distinct
         # head: a stale top-level flag must not drop it.
         (True, False, True, True, False),
@@ -283,7 +283,7 @@ def test_the_backbone_never_ties_itself():
         "untied",
         "tied",
         "tied-with-duplicate",
-        "untied-equal-weights",
+        "equal-weights-outrank-config",
         "outer-tied-nested-untied-with-head",
         "outer-tied-nested-untied-no-head",
     ],
@@ -302,8 +302,12 @@ def test_the_layout_decides_tying_from_the_config_and_the_stored_weights(
     tensors = _write_hf_checkpoint(root, tied=tied, nested_tied=nested_tied, store_tied_head=store_tied_head)
 
     if equal_weights:
+        # Same values as the embedding: the tied pair HF keeps together.
         tensors["lm_head.weight"] = tensors["model.language_model.embed_tokens.weight"].clone()
-        save_file(tensors, root / "model.safetensors", metadata={"format": "pt"})
+    elif "lm_head.weight" in tensors:
+        # Stored separately with its own values: a genuinely independent head.
+        tensors["lm_head.weight"] = tensors["lm_head.weight"] + 1.0
+    save_file(tensors, root / "model.safetensors", metadata={"format": "pt"})
     model = OmniModel.from_pretrained(str(root), dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager")
     text_encoder = model.modules_dict[TEXT_ENCODER]
     assert (text_encoder.lm_head is not None) is expect_head

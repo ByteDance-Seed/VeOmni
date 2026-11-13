@@ -83,3 +83,29 @@ def test_a_sampled_boi_seals_the_row_and_the_backbone_consumes_it(monkeypatch):
 
     llama.generate(conversation)  # must not raise on ``type == "text"``
     assert forward_calls, "the backbone ran with a text tail"
+
+
+def test_emit_image_end_accepts_an_accumulated_span():
+    """``infer_interleave`` reaches ``emit_image_end`` with the whole VQ span in the tail.
+
+    ``infer_gen`` gets there with one token (the span lives in the KV cache), so the
+    step may not assume either size — only that the tail is an output row.
+    """
+    from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import JanusChatTemplate
+    from veomni.models.seed_omni.modules.janus.text_encoder.configuration import JanusTextEncoderConfig
+    from veomni.models.seed_omni.modules.janus.text_encoder.modeling import JanusTextEncoder
+
+    encoder = JanusTextEncoder(JanusTextEncoderConfig(vocab_size=16, hidden_size=8, tie_word_embeddings=True))
+    encoder._tokenizer = _FakeTokenizer()
+    encoder._chat_template = JanusChatTemplate(_FakeTokenizer())
+
+    for rows in (1, 576):
+        conversation = [
+            ConversationItem(type="text", value=torch.zeros(3), role="user"),
+            ConversationItem(type="output", value=torch.zeros(1, rows, 8), role="assistant", meta={}),
+        ]
+        encoder.emit_image_end(conversation)
+        # The span was replaced by a single ``<eoi>`` row carrying ``collapse_cfg``.
+        assert conversation[-1].type == "output"
+        assert conversation[-1].value.size(-2) == 1
+        assert conversation[-1].meta.get("collapse_cfg") is True

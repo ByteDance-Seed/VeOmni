@@ -51,6 +51,26 @@ the name is private to this module and never serialised.
 """
 
 
+def _bin_weight_map(source_path: str) -> dict[str, str] | None:
+    """``{weight key: shard filename}`` from a ``.bin`` index, or ``None``.
+
+    Only the key names are usable here: comparing head against embedding would
+    mean unpickling both tensors. Presence alone distinguishes "the checkpoint has
+    its own head" from "the head is the embedding", which is the decision that
+    matters — an untied module with no tensor to load is the failure this guards.
+    """
+    index_path = os.path.join(source_path, "pytorch_model.bin.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            return dict(json.load(f)["weight_map"])
+    single = os.path.join(source_path, "pytorch_model.bin")
+    if os.path.isfile(single):
+        # No index: only the file's presence is known, so report an empty map.
+        # Callers treat a missing head key as "cannot tell" rather than "absent".
+        return {}
+    return None
+
+
 def _tie_verdict_from_weights(
     source_path: str, weight_files: Mapping[str, str], head_key: str, embed_key: str
 ) -> str | None:
@@ -69,13 +89,21 @@ def _tie_verdict_from_weights(
 
     from safetensors import safe_open
 
+    if not weight_files:
+        # A ``.bin`` file with no index: the keys are unknown, so nothing decisive.
+        return None
     if head_key not in weight_files:
         return "absent"
     if embed_key not in weight_files:
         return None
     tensors = {}
     for key in (head_key, embed_key):
-        with safe_open(os.path.join(source_path, weight_files[key]), framework="pt", device="cpu") as f:
+        shard = weight_files[key]
+        if not os.path.isfile(os.path.join(source_path, shard)):
+            # A non-safetensors shard (``.bin``): the key exists but cannot be
+            # compared, and an existing key means the module must keep its head.
+            return "different"
+        with safe_open(os.path.join(source_path, shard), framework="pt", device="cpu") as f:
             tensors[key] = f.get_tensor(key)
     head, embed = tensors[head_key], tensors[embed_key]
     if head.shape != embed.shape or head.dtype != embed.dtype:
@@ -109,20 +137,18 @@ def _config_allows_tie(hf_config: Any) -> bool:
 def _tie_word_embeddings(hf_config: Any) -> bool:
     """Whether the text encoder can tie its head to the input embedding.
 
-    The config states intent, the weights state fact, and each stored-tensor case
-    wants a different answer:
+    The stored tensors decide whenever they say anything, because the failure this
+    guards is silent: an untied head with no tensor to load is randomly
+    initialised, and a pair that HF keeps tied would be split into two parameters
+    that SFT then updates separately.
 
-    * **No stored head** — the head *is* the embedding. Tying is the only option:
-      an independent head would be **randomly initialised**, which silently
-      corrupts every logit. This outranks the config, because an outer ``True``
-      beside an untied ``text_config`` is exactly how a tied export looks.
-    * **A stored head identical to the embedding** — a tied model that wrote the
-      duplicate out. Tie unless the config explicitly asks for separate weights, so
-      a deliberate ``tie_word_embeddings: false`` is not overridden but a tied pair
-      cannot drift apart under SFT.
-    * **A stored head with different values** — load it independently.
+    * **No stored head** — the head *is* the embedding.
+    * **A stored head identical to the embedding** — HF keeps them tied, so tie too;
+      an explicit ``tie_word_embeddings: false`` does not override the weights, or
+      SFT would drift a pair the source model shares.
+    * **A stored head with different values** — a genuinely separate head.
 
-    With nothing to inspect, fall back to the config's word — the same AND
+    Only with nothing to inspect does the config's word decide — the same AND
     :func:`~veomni.models.checkpoint.weights.post_process_after_weight_loading`
     applies to the loaded module.
     """
@@ -131,7 +157,8 @@ def _tie_word_embeddings(hf_config: Any) -> bool:
         return True
     if verdict == "different":
         return False
-    # ``"equal"`` (or nothing to inspect): the config decides.
+    if verdict == "equal":
+        return True
     return _config_allows_tie(hf_config)
 
 
@@ -222,21 +249,28 @@ class JanusHFLayout(OmniHFLayout):
         from transformers import AutoConfig
 
         hf_config = AutoConfig.from_pretrained(source_path)
+        verdict = self._tie_verdict(source_path)
+        setattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, verdict)
+        return hf_config
+
+    def _tie_verdict(self, source_path: str) -> str | None:
+        """The stored-tensor verdict, reading safetensors and falling back to ``.bin``.
+
+        ``source_weight_files`` covers safetensors only, but a ``.bin``-only source
+        is legitimate: reading the config's flags there would report ``"tied"`` for
+        a checkpoint that stores its own head, and the text encoder would then have
+        no tensor to load into it. The ``.bin`` index names the same keys, which is
+        all the verdict needs.
+        """
         try:
             weight_files = self.source_weight_files(source_path)
         except FileNotFoundError:
-            # No safetensors weights to inspect (e.g. a bin-only or fixture root):
-            # fall back to the config flags alone.
-            setattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, None)
-        else:
-            setattr(
-                hf_config,
-                _TIED_EMBEDDING_SOURCE_KEY,
-                _tie_verdict_from_weights(
-                    source_path, weight_files, "lm_head.weight", "model.language_model.embed_tokens.weight"
-                ),
-            )
-        return hf_config
+            weight_files = _bin_weight_map(source_path)
+            if weight_files is None:
+                return None
+        return _tie_verdict_from_weights(
+            source_path, weight_files, "lm_head.weight", "model.language_model.embed_tokens.weight"
+        )
 
 
 JANUS_GENERATION_KWARGS: dict[str, Any] = {
