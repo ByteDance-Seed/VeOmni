@@ -367,4 +367,16 @@ python tasks/omni/infer_omni.py \
 ```
 
 **Interleaved** — `infer/graph_infer_interleave.yaml` (default `model.model_config.infer_type`)
-mixes text and image generation in one graph.
+mixes text and image generation in one graph. Here the model decides on its own
+when to open an image span, by sampling `<begin_of_image>`.
+
+> **Test coverage limit.** Only the text half of this graph has been exercised
+> end to end. The public Janus-1.3B checkpoint is a base model: it does not reliably
+> sample `<begin_of_image>`, so a smoke run never enters `image_vq` and the image
+> span (the sampled-`<boi>` hand-off, CFG arming, and `emit_image_end` closing an
+> accumulated span) is covered by unit tests only —
+> `tests/seed_omni/modules/janus/test_janus_boi_handoff.py` and
+> `test_janus_text_encoder_generate.py`. Validating it for real needs an SFT
+> checkpoint that has learned to emit the token; neither it nor its expected
+> output is available here. `infer_gen`, which forces the image span from a
+> prompt, is exercised end to end.
