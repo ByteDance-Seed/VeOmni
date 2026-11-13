@@ -27,6 +27,7 @@ averaging, and the route to the ``training/<key>`` name that reaches wandb.
 import os
 import time
 from contextlib import nullcontext
+from datetime import timedelta
 from types import SimpleNamespace
 
 
@@ -34,6 +35,7 @@ os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
 import pytest
 import torch
+import torch.distributed as dist
 
 import veomni.trainer.base as base_trainer_module
 import veomni.trainer.callbacks.trace_callback as trace_callback_module
@@ -334,6 +336,58 @@ def _environ_meter_callback(env_metrics=None, lr=None):
         model=SimpleNamespace(lr_scheduler=None if lr is None else SimpleNamespace(get_last_lr=lambda: [lr])),
     )
     return callback
+
+
+def _metric_schema_worker(rank, endpoint):
+    """Compare reductions when ranks provide metric keys in different orders."""
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        callback = _environ_meter_callback()
+        aux = {"x": 1.0, "y": 10.0} if rank == 0 else {"y": 2.0, "x": 20.0}
+        callback.on_step_end(TrainerState(global_step=1), loss=0.0, loss_dict={}, grad_norm=0.0, aux_metrics=aux)
+        assert callback.trainer.step_train_metrics["training/x"] == pytest.approx(10.5)
+        assert callback.trainer.step_train_metrics["training/y"] == pytest.approx(6.0)
+        callback.on_step_end(
+            TrainerState(global_step=2), loss=float(rank), loss_dict={}, grad_norm=0.0, aux_metrics=None
+        )
+        assert callback.trainer.step_train_metrics["training/total_loss"] == pytest.approx(0.5)
+        done = torch.ones(1)
+        dist.all_reduce(done)
+        assert done.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_metric_reduction_aligns_different_key_orders():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_metric_schema_worker, args=(), nprocs=2)
+
+
+def _metric_subgroup_worker(rank, endpoint):
+    """Check that metric reductions stay within each independent FSDP group."""
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=4, timeout=timedelta(seconds=30))
+    try:
+        first = dist.new_group([0, 1], backend="gloo")
+        second = dist.new_group([2, 3], backend="gloo")
+        callback = _environ_meter_callback()
+        callback.parallel_state.fsdp_group = first if rank < 2 else second
+        aux = {"x": float(rank), "y": 4.0} if rank < 2 else {"z": float(rank)}
+        if rank == 1:
+            aux = {"y": 4.0, "x": 1.0}
+        callback.on_step_end(TrainerState(global_step=1), loss=0.0, loss_dict={}, grad_norm=0.0, aux_metrics=aux)
+        name, expected = ("x", 0.5) if rank < 2 else ("z", 2.5)
+        assert callback.trainer.step_train_metrics[f"training/{name}"] == pytest.approx(expected)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
+def test_metric_reduction_respects_independent_fsdp_groups():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_metric_subgroup_worker, args=(), nprocs=4)
 
 
 def test_reserved_names_match_what_the_callback_publishes_itself(monkeypatch):

@@ -243,6 +243,7 @@ class EnvironMeterCallback(Callback):
         aux_metrics: Dict[str, float] = None,
         **kwargs,
     ) -> None:
+        """Reduce training metrics in a consistent group order and publish step statistics."""
         delta_time = time.time() - self.start_time
         step_env_metrics = self.trainer.environ_meter.step(
             delta_time,
@@ -263,9 +264,12 @@ class EnvironMeterCallback(Callback):
         step_train_metrics.update(aux_metrics or {})
         step_train_metrics["grad_norm"] = grad_norm
 
-        # gather training_step_info from all ranks
+        # All ranks in the FSDP group must report the same metric keys. Those
+        # keys may be inserted in a different order; sort before reducing so
+        # collectives do not silently mix values from different metrics.
         step_train_metrics = {
-            f"training/{k}": all_reduce(v, group=self.parallel_state.fsdp_group) for k, v in step_train_metrics.items()
+            f"training/{key}": all_reduce(value, group=self.parallel_state.fsdp_group)
+            for key, value in sorted(step_train_metrics.items())
         }
 
         if self.trainer.model.lr_scheduler is not None:
