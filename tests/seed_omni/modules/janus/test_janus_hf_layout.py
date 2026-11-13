@@ -450,3 +450,23 @@ def test_declared_graphs_and_infer_type_match_the_family_converter():
     assert layout.infer_type == "infer_interleave"
     assert set(layout.generation_graphs) == {"infer_gen", "infer_und", "infer_interleave"}
     assert layout.training_graphs == "train/graph_train.yaml"
+
+
+def test_a_bin_only_root_is_refused_with_a_usable_message(tmp_path):
+    """The layout reads safetensors; a ``.bin`` root gets told so, up front.
+
+    ``source_weight_files`` is safetensors-only, so a ``.bin`` checkpoint cannot be
+    loaded through the layout at all. Answering the tie question from its config
+    flags would move the failure into ``safe_open``, which raises a
+    ``SafetensorError`` while the module is being built.
+    """
+    root = tmp_path / "Janus-bin"
+    root.mkdir()
+    (root / "config.json").write_text(json.dumps({"model_type": "janus"}), encoding="utf-8")
+    torch.save({"lm_head.weight": torch.zeros(4, 4)}, root / "pytorch_model.bin")
+    (root / "pytorch_model.bin.index.json").write_text(
+        json.dumps({"weight_map": {"lm_head.weight": "pytorch_model.bin"}}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="reads safetensors only"):
+        JANUS_HF_LAYOUT.read_hf_config(str(root))

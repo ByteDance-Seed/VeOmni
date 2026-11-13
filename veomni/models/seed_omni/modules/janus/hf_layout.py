@@ -51,24 +51,22 @@ the name is private to this module and never serialised.
 """
 
 
-def _bin_weight_map(source_path: str) -> dict[str, str] | None:
-    """``{weight key: shard filename}`` from a ``.bin`` index, or ``None``.
+def _reject_bin_only_source(source_path: str) -> None:
+    """Fail with a usable message when the checkpoint has no safetensors weights.
 
-    Only the key names are usable here: comparing head against embedding would
-    mean unpickling both tensors. Presence alone distinguishes "the checkpoint has
-    its own head" from "the head is the embedding", which is the decision that
-    matters — an untied module with no tensor to load is the failure this guards.
+    The layout's load path reads safetensors shards only — ``source_weight_files``
+    documents as much — so a ``.bin`` root cannot be loaded through it at all,
+    independent of the tie question. Say so instead of letting ``safe_open`` fail on
+    a pickle file, and name the two ways forward.
     """
-    index_path = os.path.join(source_path, "pytorch_model.bin.index.json")
-    if os.path.isfile(index_path):
-        with open(index_path, encoding="utf-8") as f:
-            return dict(json.load(f)["weight_map"])
-    single = os.path.join(source_path, "pytorch_model.bin")
-    if os.path.isfile(single):
-        # No index: only the file's presence is known, so report an empty map.
-        # Callers treat a missing head key as "cannot tell" rather than "absent".
-        return {}
-    return None
+    for name in ("pytorch_model.bin", "pytorch_model.bin.index.json"):
+        if os.path.isfile(os.path.join(source_path, name)):
+            raise ValueError(
+                f"{source_path} stores its weights as `{name}`; the SeedOmni HF layout reads safetensors only. "
+                'Convert it first: `python -c "import torch,safetensors.torch as st; ..."` is not needed — '
+                "re-save the checkpoint with `model.save_pretrained(out, safe_serialization=True)`, "
+                "or run `scripts/seed_omni/convert_model.py` if it is a DeepSeek-format Janus root."
+            )
 
 
 def _tie_verdict_from_weights(
@@ -80,30 +78,23 @@ def _tie_verdict_from_weights(
 
     * ``"absent"`` — no head is stored, so the head *is* the embedding. Tying is the
       only option; an independent head would be randomly initialised.
-    * ``"equal"`` — a tied model that wrote the duplicate out. Tying keeps SFT from
-      drifting the pair apart, but the config may still say they are separate.
+    * ``"equal"`` — a tied model that wrote the duplicate out. HF keeps such a pair
+      shared, so tying is what the source model actually does.
     * ``"different"`` — a genuinely independent head, which must load its own copy.
 
-    Returns ``None`` when there is nothing to read.
+    Returns ``None`` when there is nothing to read. Callers have already established
+    that the shards are safetensors (a ``.bin`` root is refused before this point).
     """
 
     from safetensors import safe_open
 
-    if not weight_files:
-        # A ``.bin`` file with no index: the keys are unknown, so nothing decisive.
-        return None
     if head_key not in weight_files:
         return "absent"
     if embed_key not in weight_files:
         return None
     tensors = {}
     for key in (head_key, embed_key):
-        shard = weight_files[key]
-        if not os.path.isfile(os.path.join(source_path, shard)):
-            # A non-safetensors shard (``.bin``): the key exists but cannot be
-            # compared, and an existing key means the module must keep its head.
-            return "different"
-        with safe_open(os.path.join(source_path, shard), framework="pt", device="cpu") as f:
+        with safe_open(os.path.join(source_path, weight_files[key]), framework="pt", device="cpu") as f:
             tensors[key] = f.get_tensor(key)
     head, embed = tensors[head_key], tensors[embed_key]
     if head.shape != embed.shape or head.dtype != embed.dtype:
@@ -254,20 +245,18 @@ class JanusHFLayout(OmniHFLayout):
         return hf_config
 
     def _tie_verdict(self, source_path: str) -> str | None:
-        """The stored-tensor verdict, reading safetensors and falling back to ``.bin``.
+        """The stored-tensor verdict, from the safetensors shards.
 
-        ``source_weight_files`` covers safetensors only, but a ``.bin``-only source
-        is legitimate: reading the config's flags there would report ``"tied"`` for
-        a checkpoint that stores its own head, and the text encoder would then have
-        no tensor to load into it. The ``.bin`` index names the same keys, which is
-        all the verdict needs.
+        A ``.bin`` root is refused here rather than silently falling back to the
+        config's flags: the layout could not load such a checkpoint either, so
+        answering the tie question would only move the failure later and into a
+        less obvious place.
         """
         try:
             weight_files = self.source_weight_files(source_path)
         except FileNotFoundError:
-            weight_files = _bin_weight_map(source_path)
-            if weight_files is None:
-                return None
+            _reject_bin_only_source(source_path)
+            return None
         return _tie_verdict_from_weights(
             source_path, weight_files, "lm_head.weight", "model.language_model.embed_tokens.weight"
         )
