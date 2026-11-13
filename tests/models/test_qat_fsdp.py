@@ -159,12 +159,15 @@ def _step(model, optimizer, step, impl):
             loss.backward()
             losses.append(loss.detach().cpu())
 
-    # Four attention projections and three MLP projections per layer, two
-    # operands each, over two microbatches. Both rows must be reached.
-    layers, microbatches, operands = model.config.num_hidden_layers, 2, 2
+    # Per layer and forward pass: four attention projections with two operands
+    # each through `linear`, and five rounded tensors through `swiglu_mlp` (the
+    # input once for gate/up, the hidden state once, three weights). Gradient
+    # checkpointing reruns every layer's forward in backward, so each micro-batch
+    # makes two passes. Both rows must be reached.
+    layers, microbatches, passes = model.config.num_hidden_layers, 2, 2
     assert calls == {
-        "linear": 4 * layers * microbatches * operands,
-        "swiglu_mlp": 3 * layers * microbatches * operands,
+        "linear": 4 * 2 * layers * microbatches * passes,
+        "swiglu_mlp": 5 * layers * microbatches * passes,
     }, calls
 
     for name, param in model.named_parameters():
@@ -229,7 +232,7 @@ def _fsdp_worker(root: str, impl: str):
         assert all(state for state in saved_optimizer.values())
         DistributedCheckpointer.save(str(dcp_path), {"model": model, "optimizer": optimizer})
 
-        expected_losses = _step(model, optimizer, 1)
+        expected_losses = _step(model, optimizer, 1, impl)
         expected_weights = _master_snapshot(model)
         expected_optimizer = _optimizer_snapshot(model, optimizer)
         del model, optimizer
