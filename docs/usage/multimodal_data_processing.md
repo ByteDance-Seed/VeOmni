@@ -225,3 +225,48 @@ data:
     use_audio_in_video: false
     sample_rate: 16000
 ```
+
+## OpenAI-style text and image conversations for Qwen-VL
+
+Select `openai_chatml_qwenvl` as the model chat template: it installs the same
+ChatML rendering on the saved processor and tokenizer. The Qwen-VL transform
+accepts a `messages` array with string content for text and typed content
+blocks for image conversations. Samples with `messages` use this path even if
+a dataset-level `source_name` is set. A non-null per-sample `source` must be
+`openai_chatml`; other non-null values, including registered preprocessors, are
+rejected. Assistant messages default to
+`loss_mask: 1` and other roles default to `0`; either can explicitly set a
+binary mask. Images are currently accepted only as unsupervised user input.
+
+```json
+{"messages": [
+  {"role": "user", "content": [
+    {"type": "text", "text": "Describe this image."},
+    {"type": "image", "image": null}
+  ]},
+  {"role": "assistant", "content": "A cat.", "loss_mask": 1}
+], "images": ["/path/to/image.png"]}
+```
+
+Image blocks can alternatively contain inline image bytes, a path, an HTTP(S)
+URL, or a PNG/JPEG base64 data URI in `image` or `url`. Use either inline images or the top-level
+`images` array for a sample; the number of top-level images must exactly match
+its null image blocks, in conversation order. Text blocks may include
+`"image": null`. Image inputs have ignored labels; assistant text targets can
+still backpropagate through an unfrozen vision encoder. The text-only renderer
+uses the same ChatML label and truncation convention as VeOmni's text path;
+overlength image conversations are rejected rather than partially truncating
+an image. Nonempty `tools` metadata requires `data.mm_configs.tools_in_system`
+to be `true`, and every tool name must already occur in the system message.
+The caller must ensure complete tool definitions are already in that message;
+only names are checked and `tools` is not rendered separately. At inference the
+exported Jinja rejects a nonempty `tools` argument. Standard nested `image_url`
+blocks are not supported; use the `type: image` forms described above.
+Fractional `loss_weight` requires the complete weighted-loss feature (renderer, collator, model loss, and
+trainer normalization) and is rejected if the weighted renderer is not
+installed. MTP, video/audio blocks and structured tool calls are outside this contract.
+Tool-call IDs and message names must be serialized in text content; nonempty
+structured tool message fields are rejected rather than discarded.
+When this template is selected, exported processor and tokenizer assets retain
+its ChatML Jinja rather than the checkpoint's original template. That exported
+Jinja rejects video and audio content blocks as well.
