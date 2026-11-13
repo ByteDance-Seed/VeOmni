@@ -53,8 +53,30 @@ RUN pip3 install --no-cache-dir -U pip setuptools requests
 # The A2 CI creates its own venv with uv after checking out VeOmni.
 COPY --from=ghcr.io/astral-sh/uv:0.11.16 /uv /uvx /bin/
 
+# Keep the cache outside /app so a source checkout mount does not hide it.
+ENV UV_CACHE_DIR=/opt/veomni/uv-cache
+ENV UV_HTTP_TIMEOUT=300
+
 WORKDIR /app
 COPY . .
+
+# Populate uv's cache using the same locked extra and dev group as validation.
+# Use a disposable venv; system Python retains the runtime packages below.
+# Do not use a BuildKit cache mount: these artifacts must ship in the image.
+RUN UV_PROJECT_ENVIRONMENT=/tmp/veomni-cache-env \
+        uv sync --frozen --python "$(command -v python3)" --extra npu_aarch64 --group dev && \
+    uv pip install --python /tmp/veomni-cache-env/bin/python ninja pybind11 && \
+    uv pip install --python /tmp/veomni-cache-env/bin/python "triton==3.5.0" && \
+    uv pip install --python /tmp/veomni-cache-env/bin/python --no-deps "triton-ascend==3.2.2" \
+        --index=https://mirrors.huaweicloud.com/ascend/repos/pypi && \
+    rm -rf /tmp/veomni-cache-env
+
+# Install the complete locked dev group into the default Python as well.
+# Cache warm-up alone does not make patchgen available outside its temporary venv.
+RUN uv export --frozen --only-group dev --no-emit-project --no-hashes \
+        --output-file /app/dev-requirements.txt && \
+    uv pip install --python "$(command -v python3)" --no-deps -r /app/dev-requirements.txt && \
+    python -c "import patchgen, pytest" && patchgen --help
 
 # Match the existing ARM installation path; pip does not install uv groups.
 RUN pip install -e ".[npu_aarch64]" "transformers==5.16.1" && \
@@ -63,24 +85,24 @@ RUN pip install -e ".[npu_aarch64]" "transformers==5.16.1" && \
 # Preserve the ARM parquet workaround from the historical Dockerfile.
 RUN pip install "pyarrow==21.0.0" "pandas==2.3.2"
 
-# Keep the selected wheels in /app for reproducibility; A2 CI installs
-# the selected wheels from this image after its environment setup is aligned.
+# Keep the selected wheels in /app for reproducibility;
+# local validation can use these wheels after creating a project environment.
 # Discard stale copies inherited from a base image or the build context.
 RUN rm -f /app/torch_npu-*.whl /app/triton-*.whl /app/triton_ascend-*.whl /app/flash_linear_attention_npu-*.whl /app/flash_linear_attention_npu_a2-*.whl /app/flash_linear_attention_npu_a3-*.whl /app/flash_linear_attention_npu_a5-*.whl && \
     python -m pip download --no-deps --only-binary=:all: --dest /app --index-url https://ascend.devcloud.huaweicloud.com/pypi/simple/ "torch-npu==2.10.0.post7" && \
     python -m pip install --no-deps --force-reinstall /app/torch_npu-*.whl && \
     python -m pip install pybind11 wheel ninja
 
-# The cp312/aarch64 3.6.0 wheel requires triton==3.6.0. Install the base first,
+# The cp312/aarch64 3.2.2 wheel requires triton==3.5.0. Install the base first,
 # then the Ascend overlay so its patched libtriton.so wins. --no-deps preserves
 # VeOmni's scipy/decorator versions instead of applying the wheel's older pins.
-# CI must also restore triton==3.6.0 and pybind11 after its exact uv sync;
+# CI must also restore triton==3.5.0 and pybind11 after its exact uv sync;
 # system site-packages are not inherited by the CI venv.
 RUN python -m pip uninstall -y triton triton-ascend && \
-    python -m pip download --no-deps --only-binary=:all: --dest /app "triton==3.6.0" && \
-    python -m pip install --no-deps /app/triton-3.6.0-*.whl && \
+    python -m pip download --no-deps --only-binary=:all: --dest /app "triton==3.5.0" && \
+    python -m pip install --no-deps /app/triton-3.5.0-*.whl && \
     python -m pip download --no-deps --dest /app \
-        "https://mirrors.huaweicloud.com/ascend/repos/pypi/triton-ascend/triton_ascend-3.6.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl" && \
+        "https://mirrors.huaweicloud.com/ascend/repos/pypi/triton-ascend/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl" && \
     python -m pip install --no-deps --force-reinstall /app/triton_ascend-*.whl && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     python -c "from triton._C.libtriton import ascend"
@@ -119,8 +141,10 @@ RUN bash install_torchcodec_Ascend.sh ${CANN_PATH}/ascend-toolkit/set_env.sh
 WORKDIR /app
 
 # Record the actual resolved Python packages alongside the retained artifacts.
-RUN python -c "from importlib.metadata import version; assert version('torch').split('+')[0] == '2.10.0'; assert version('torch-npu') == '2.10.0.post7'; assert version('triton') == '3.6.0'; assert version('triton-ascend') == '3.6.0'; assert version('transformers') == '5.16.1'" && \
+RUN python -c "from importlib.metadata import version; assert version('torch').split('+')[0] == '2.10.0'; assert version('torch-npu') == '2.10.0.post7'; assert version('triton') == '3.5.0'; assert version('triton-ascend') == '3.2.2'; assert version('transformers') == '5.16.1'" && \
     python -m pip freeze > /app/a2-image-requirements.txt && \
     sha256sum /app/torch_npu-*.whl /app/triton-*.whl /app/triton_ascend-*.whl /app/flash_linear_attention_npu_a2-*.whl > /app/a2-ci-wheels.sha256
+
+RUN python -c "import patchgen, pytest" && patchgen --help
 
 CMD ["/bin/bash"]

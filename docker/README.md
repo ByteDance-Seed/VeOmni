@@ -68,7 +68,7 @@ both the NPU generation and the host architecture:
 
 | Target | Platform | Dockerfile | Triton | Triton-Ascend |
 | --- | --- | --- | --- | --- |
-| A2 ARM | `linux/arm64` | [910b.arm](ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.arm) | 3.6.0 | 3.6.0 |
+| A2 ARM | `linux/arm64` | [910b.arm](ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.arm) | 3.5.0 | 3.2.2 |
 | A2 x86 | `linux/amd64` | [910b.x86](ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86) | 3.2.0 | 3.2.2 |
 | A3 ARM | `linux/arm64` | [a3](ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_a3) | 3.5.0 | 3.2.2 |
 
@@ -129,3 +129,34 @@ An image's preinstalled system packages are separate from the project
 environment created by `uv sync`. Local validation must explicitly select
 which environment it tests. Any wheel overlays applied after synchronization
 are additional environment changes, not part of the lockfile alone.
+
+### uv cache included in the image
+
+The CANN 9.2.1 Dockerfiles set `UV_CACHE_DIR=/opt/veomni/uv-cache` and
+populate it with `uv sync --frozen` for their hardware extra and the `dev`
+group. A disposable virtual environment is removed after warming the cache;
+the existing system Python installation remains the runtime environment.
+The cache is stored in the image layer, outside `/app`, rather than in a
+BuildKit cache mount, so mounting a new source checkout does not hide it.
+
+The warm-up also installs ninja, pybind11 and the target's Triton packages
+through uv. A2 x86 additionally caches Triton-Ascend 3.2.1 from the Huawei
+index used by the existing upstream workflow. This cache-only installation
+does not change the image's runtime Triton-Ascend version.
+
+Reuse requires the same architecture, compatible Python version, dependency
+versions and package sources. Changing the lockfile or index, overriding
+`UV_CACHE_DIR`, or installing an uncached package can still require network
+access. The cache increases image size and build time; it does not guarantee
+that every future dependency installation is offline.
+
+The complete locked `dev` group is also exported with `uv export --frozen`
+and installed with `uv pip` into the image's default Python. This includes
+patchgen, pytest and the lint tools; builds check patchgen imports and its CLI.
+The editable patchgen installation uses `/app/patchgen-pkg`. If a different
+checkout replaces `/app`, run `uv sync` in that checkout to recreate its project
+environment. A fresh CI venv still needs its own `uv sync --group dev`;
+the image cache accelerates installation but does not replace synchronization.
+All three runtime images pin Triton-Ascend to 3.2.2 and assert its version at
+build time. The upstream CI's explicit Triton-Ascend 3.2.1 installation remains
+an independent override; using that workflow does not test the image's 3.2.2.
