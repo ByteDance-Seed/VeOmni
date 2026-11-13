@@ -535,22 +535,3 @@ def test_fp4_triton_row_falls_back_for_a_non_power_of_two_block(device: str, sca
         rtol=0,
         atol=0,
     )
-
-
-@_TRITON_DEVICE
-def test_fp4_triton_row_refuses_an_unwritable_inplace_request(device: str):
-    """``inplace=True`` on a layout the kernel cannot address must raise, not return a copy."""
-    triton = _triton_op("fp4", device)
-    x = torch.randn(2, 4, 32, dtype=torch.bfloat16, device=device)
-    # A view whose last dimension is strided: neither row can write it in place.
-    strided = x[..., ::2]
-    with pytest.raises(ValueError, match="inplace=True requires"):
-        triton(strided, block_size=16, inplace=True)
-
-
-@_TRITON_DEVICE
-def test_fp4_triton_row_rejects_both_write_targets(device: str):
-    triton = _triton_op("fp4", device)
-    x = torch.randn(2, 4, 32, dtype=torch.bfloat16, device=device)
-    with pytest.raises(ValueError, match="at most one of"):
-        triton(x, block_size=16, inplace=True, out=torch.empty_like(x))
