@@ -31,6 +31,7 @@ from veomni.models.loader import get_loader
 from veomni.models.registry import get_model_config, get_model_processor
 from veomni.utils import logging
 from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.utils.env import get_env
 
 
 if TYPE_CHECKING:
@@ -92,8 +93,26 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if not get_parallel_state().cp_enabled:
         return
 
-    if IS_NPU_AVAILABLE:
-        raise NotImplementedError("Context parallelism is GPU-only in this release; set cp_size=1 on Ascend/NPU runs.")
+    state = get_parallel_state()
+    model_type = getattr(config, "model_type", None)
+    if model_type == "qwen4_exp" and get_env("MODELING_BACKEND") == "hf":
+        raise NotImplementedError("Qwen4-Exp Context Parallelism requires the VeOmni modeling backend.")
+    if model_type == "qwen4_exp":
+        vision_config = getattr(config, "vision_config", None)
+        vision_heads = (
+            vision_config.get("num_heads")
+            if isinstance(vision_config, dict)
+            else getattr(vision_config, "num_heads", None)
+        )
+        if isinstance(vision_heads, int) and vision_heads % state.sp_size != 0:
+            raise ValueError(
+                f"Qwen4-Exp vision heads ({vision_heads}) must be divisible by "
+                f"the combined sequence-parallel size ({state.sp_size})."
+            )
+    if getattr(state, "ulysses_size", 1) > 1 and model_type != "qwen4_exp":
+        raise NotImplementedError("Combined Ulysses/CP is currently implemented for Qwen4-Exp only.")
+    if IS_NPU_AVAILABLE and model_type != "qwen4_exp":
+        raise NotImplementedError("Context parallelism on Ascend/NPU is currently implemented for Qwen4-Exp only.")
 
     from .seed_omni.modules.module_configuration_base import OmniModuleConfig
 
@@ -105,7 +124,6 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
         if inner_model_type in CONTEXT_PARALLEL_MODEL_TYPES:
             return
 
-    model_type = getattr(config, "model_type", None)
     if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
         return
 
