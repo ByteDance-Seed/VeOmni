@@ -411,10 +411,50 @@ def _is_fsdp_wrap_target(fqn: str, class_name: str, targets: Collection[str]) ->
     return False
 
 
+def _fsdp_reduce_scatter_size(mesh) -> int:
+    """Size of the FSDP reduce-scatter axis (innermost dim on 2D HSDP, sole dim on 1D)."""
+    if mesh is None:
+        return 1
+    ndim = getattr(mesh, "ndim", 1)
+    return int(mesh.size(ndim - 1) if ndim > 1 else mesh.size())
+
+
+def _set_extra_parallel_gradient_divide_factor(
+    module: FSDPModule,
+    gradient_divide_factor: float,
+    *,
+    reduce_scatter_size: int,
+) -> None:
+    """Configure gradient scaling on an ExtraParallel FSDP2 unit safely across dtypes/backends.
+
+    When ``reduce_scatter_size > 1`` and ``gradient_divide_factor != reduce_scatter_size``
+    (the normal EP+FSDP2 case where ``factor == world_size`` while the reduce-scatter
+    group is ``ep_fsdp``), PyTorch's ``_get_gradient_divide_factors`` defaults to
+    ``torch.distributed._make_nccl_premul_sum(1 / factor)``. In PyTorch 2.x,
+    ``ProcessGroupNCCL::getNcclReduceOp`` passes a host ``float32*`` pointer to
+    ``ncclRedOpCreatePreMulSum(..., ncclBfloat16, ncclScalarHostImmediate, ...)``,
+    causing ``libnccl`` to ``memcpy`` the low 2 bytes of the IEEE-754 ``float32``
+    scalar as a ``bfloat16`` value — which turns every power-of-two ``1 / 2^k``
+    into ``0x0000 == bfloat16(0.0)`` and zeroes 100% of BF16-reduced gradients
+    (and also fails on Gloo). Forcing ``ReduceOp.SUM`` when ``reduce_scatter_size > 1``
+    makes FSDP2 run a plain SUM reduce-scatter followed by one exact ATen post-division.
+
+    When ``reduce_scatter_size == 1`` (e.g. ``ep_size == world_size`` so ``ep_fsdp == 1``),
+    ``foreach_reduce`` never calls ``reduce_scatter_comm`` and already divides by
+    ``gradient_divide_factor`` in its singleton copy branch; setting
+    ``force_sum_reduction_for_comms=True`` there would populate ``postdivide_factor``
+    as well and divide gradients a second time (by ``factor ** 2``).
+    """
+    module.set_gradient_divide_factor(gradient_divide_factor)
+    if reduce_scatter_size > 1 and hasattr(module, "set_force_sum_reduction_for_comms"):
+        module.set_force_sum_reduction_for_comms(True)
+
+
 def _configure_fsdp_gradient_reduction(
     module: FSDPModule,
     *,
     gradient_divide_factor: float,
+    reduce_scatter_size: int,
     use_low_precision_transport: bool,
     transport_reduction_scales: dict[nn.Module, float],
 ) -> None:
@@ -422,7 +462,11 @@ def _configure_fsdp_gradient_reduction(
         transport_reduction_scales[module] = 1.0 / gradient_divide_factor
     else:
         # Singleton, cross-node and unknown-placement groups keep native scaling.
-        module.set_gradient_divide_factor(gradient_divide_factor)
+        _set_extra_parallel_gradient_divide_factor(
+            module,
+            gradient_divide_factor,
+            reduce_scatter_size=reduce_scatter_size,
+        )
 
 
 def parallelize_model_fsdp2(
@@ -824,16 +868,22 @@ def parallelize_model_fsdp2(
                 # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
                 # but for torch 2.7 we still use set_reduce_scatter_divide_factor(parallel_state.ep_size)
                 gradient_divide_factor = parallel_state.extra_parallel_gradient_divide_factor(para)
+                para_rs_size = _fsdp_reduce_scatter_size(extra_parallel_fsdp_kwargs[para]["mesh"])
                 logger.info(f"setting grad divide factor for {para} module to {gradient_divide_factor}")
                 if IS_NPU_AVAILABLE:
                     # NPU is using torch 2.7
                     _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
                 elif transport_reduction_scales is None:
-                    _para_mod.set_gradient_divide_factor(gradient_divide_factor)
+                    _set_extra_parallel_gradient_divide_factor(
+                        _para_mod,
+                        gradient_divide_factor,
+                        reduce_scatter_size=para_rs_size,
+                    )
                 else:
                     _configure_fsdp_gradient_reduction(
                         _para_mod,
                         gradient_divide_factor=gradient_divide_factor,
+                        reduce_scatter_size=para_rs_size,
                         use_low_precision_transport=extra_parallel_transport_enabled[para],
                         transport_reduction_scales=transport_reduction_scales,
                     )

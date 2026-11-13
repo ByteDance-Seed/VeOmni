@@ -186,22 +186,26 @@ def test_registers_only_selected_fsdp_modules_and_moves_scaling_into_hook(monkey
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("reduce_scatter_size", [1, 4])
 @pytest.mark.parametrize("use_low_precision_transport", [False, True])
-def test_fsdp_gradient_scaling_uses_custom_path_only_when_needed(use_low_precision_transport):
+def test_fsdp_gradient_scaling_uses_custom_path_only_when_needed(reduce_scatter_size, use_low_precision_transport):
     module = _FakeFSDPModule()
     reduction_scales = {}
     _configure_fsdp_gradient_reduction(
         module,
         gradient_divide_factor=8.0,
+        reduce_scatter_size=reduce_scatter_size,
         use_low_precision_transport=use_low_precision_transport,
         transport_reduction_scales=reduction_scales,
     )
 
     if not use_low_precision_transport:
         assert module.gradient_divide_factors == [8.0]
+        assert module.force_sum_reductions == ([] if reduce_scatter_size == 1 else [True])
         assert reduction_scales == {}
     else:
         assert module.gradient_divide_factors == []
+        assert module.force_sum_reductions == []
         assert reduction_scales == {module: 0.125}
 
 
@@ -657,25 +661,28 @@ def test_parallelize_registers_transport_only_for_eligible_mesh(
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("expert_fsdp_size", [1, 4])
 @pytest.mark.parametrize("dense_eligible", [False, True])
 @pytest.mark.parametrize("expert_eligible", [False, True])
 def test_parallelize_checks_dense_and_expert_meshes_independently(
-    monkeypatch, mock_fsdp_builder, dense_eligible, expert_eligible
+    monkeypatch, mock_fsdp_builder, expert_fsdp_size, dense_eligible, expert_eligible
 ):
     class FakeMesh:
         mesh_dim_names = ("ep_fsdp", "ep")
 
-        def __init__(self, shard_mesh=None):
+        def __init__(self, shard_mesh=None, mesh_size=4):
             self.shard_mesh = shard_mesh
+            self.mesh_size = mesh_size
 
         def __getitem__(self, names):
             assert names == ("ep_fsdp",)
             return self.shard_mesh
 
         def size(self):
-            return 4
+            return self.mesh_size
 
-    dense_mesh, expert_mesh = FakeMesh(), FakeMesh()
+    dense_mesh = FakeMesh(mesh_size=4)
+    expert_mesh = FakeMesh(mesh_size=expert_fsdp_size)
 
     class ParallelState:
         any_extra_parallel_enabled = True
@@ -700,7 +707,9 @@ def test_parallelize_checks_dense_and_expert_meshes_independently(
     model._no_split_modules = ["ToyDecoder"]
     model.get_ignore_modules_in_mixed_precision = lambda: (nn.LayerNorm,)
     factors = []
+    force_sum_flags = []
     model.decoder.experts.set_gradient_divide_factor = factors.append
+    model.decoder.experts.set_force_sum_reduction_for_comms = force_sum_flags.append
 
     class FakePlan:
         extra_parallel_plan = {"ep": {}}
@@ -760,6 +769,7 @@ def test_parallelize_checks_dense_and_expert_meshes_independently(
         expected_scales[model.decoder.experts] = 0.125
     assert registration_calls == [expected_scales]
     assert factors == ([] if expert_eligible else [8.0])
+    assert force_sum_flags == ([] if (expert_eligible or expert_fsdp_size == 1) else [True])
     assert topology_calls == [dense_mesh, expert_mesh]
     assert wrapping_calls[model.decoder.experts]["mesh"] is expert_mesh
     assert "mp_policy" not in wrapping_calls[model.decoder.high_precision]
@@ -799,6 +809,46 @@ def _run_transport_policy_gloo(rank, rendezvous):
             decisions = [None] * 4
             original_gather(decisions, policy.can_use(mesh))
             assert decisions == [expected] * 4
+
+        # Verify real FSDP2 backward gradient scaling through _set_extra_parallel_gradient_divide_factor
+        # across singleton (ep_fsdp == 1, 1D and 2D HSDP) and multi-rank (ep_fsdp == 2) BF16 reductions.
+        dist.all_gather_object = original_gather
+        mp_bf16 = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16)
+        ep_meshes = (
+            DeviceMesh("cpu", [[0, 1, 2, 3]], mesh_dim_names=("ep_fsdp", "ep"))["ep_fsdp"],
+            DeviceMesh("cpu", [[[0, 1]], [[2, 3]]], mesh_dim_names=("ep_replicate", "ep_fsdp", "ep"))[
+                ("ep_replicate", "ep_fsdp")
+            ],
+            DeviceMesh("cpu", [[0, 1], [2, 3]], mesh_dim_names=("ep_fsdp", "ep"))["ep_fsdp"],
+        )
+        for para_fsdp_mesh in ep_meshes:
+            torch.manual_seed(99)
+            mod = nn.Linear(8, 8, bias=False)
+            w_ref = mod.weight.detach().bfloat16().float().clone()
+            fully_shard(mod, mesh=para_fsdp_mesh, mp_policy=mp_bf16)
+            rs_size = torch_parallelize._fsdp_reduce_scatter_size(para_fsdp_mesh)
+            torch_parallelize._set_extra_parallel_gradient_divide_factor(mod, 4.0, reduce_scatter_size=rs_size)
+            x = torch.ones(2, 8, dtype=torch.bfloat16) * float(rank + 1)
+            (mod(x).sum()).backward()
+            full_grad = mod.weight.grad.full_tensor().float()
+            # On each rank r, d(sum(x @ W.T))/dW[i, j] = sum_b x[b, j] = 2 * (r + 1).
+            # Summing over participating ranks in para_fsdp_mesh and dividing ONCE by 4.0:
+            coords = para_fsdp_mesh.mesh.flatten().tolist()
+            if para_fsdp_mesh.ndim == 1 and para_fsdp_mesh.size() == 1:
+                participating = [rank]
+            elif para_fsdp_mesh.ndim == 2 and rs_size == 1:
+                # 2D HSDP [[[0],[2]]] or [[[1],[3]]]: replicate axis sums peers with same ep rank
+                participating = [rank, (rank + 2) % 4]
+            else:
+                # ep_fsdp=2: [0, 2] or [1, 3]
+                participating = [r for r in coords if (r % 2) == (rank % 2)]
+            expected_val = sum(2.0 * (r + 1) for r in participating) / 4.0
+            torch.testing.assert_close(
+                full_grad,
+                torch.full_like(w_ref, expected_val),
+                rtol=2e-2,
+                atol=2e-2,
+            )
     finally:
         reduce_scatter_module._get_node_id = original_get_node_id
         dist.all_gather_object = original_gather
@@ -936,6 +986,34 @@ def _run_fsdp2_optimizer_step() -> None:
 
     assert all_reduce_dtypes == [torch.float32]
     torch.testing.assert_close(custom.weight.grad.to_local(), baseline.weight.grad.to_local(), rtol=5e-6, atol=5e-6)
+
+    # Exercise native BF16 NCCL ExtraParallel FSDP2 reduction when gradient_divide_factor != ep_fsdp_size
+    # (both ep_fsdp=2 > 1, which previously hit ProcessGroupNCCL PreMulSum float32*->bfloat16 zeroing,
+    # and singleton ep_fsdp=1, which must not double-divide).
+    mp_bf16 = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16)
+    ep_nccl_meshes = (
+        init_device_mesh(get_device_type(), (2, 2), mesh_dim_names=("ep_fsdp", "ep"))["ep_fsdp"],
+        init_device_mesh(get_device_type(), (1, 4), mesh_dim_names=("ep_fsdp", "ep"))["ep_fsdp"],
+    )
+    for para_fsdp_mesh in ep_nccl_meshes:
+        torch.manual_seed(4321)
+        ep_mod = nn.Linear(16, 8, bias=False, device=device)
+        w_ref = ep_mod.weight.detach().bfloat16().float().clone()
+        fully_shard(ep_mod, mesh=para_fsdp_mesh, mp_policy=mp_bf16)
+        rs_size = torch_parallelize._fsdp_reduce_scatter_size(para_fsdp_mesh)
+        torch_parallelize._set_extra_parallel_gradient_divide_factor(
+            ep_mod, float(world_size), reduce_scatter_size=rs_size
+        )
+        ep_in = torch.ones(2, 16, device=device, dtype=torch.bfloat16) * float(rank + 1)
+        ep_mod(ep_in).sum().backward()
+        full_grad = ep_mod.weight.grad.full_tensor().float()
+        participating = [rank] if rs_size == 1 else [r for r in range(world_size) if (r % 2) == (rank % 2)]
+        expected_val = sum(2.0 * (r + 1) for r in participating) / float(world_size)
+        torch.testing.assert_close(full_grad, torch.full_like(w_ref, expected_val), rtol=2e-2, atol=2e-2)
+        del ep_mod, w_ref, ep_in, full_grad
+        gc.collect()
+        dist.barrier(device_ids=[device.index])
+
     _run_transport_policy_fsdp2_gradients(mesh, hsdp_mesh, device)
 
 

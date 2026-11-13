@@ -383,7 +383,7 @@ model = build_parallelize_model(
 |------|-------------|
 | `adamw` (default) | Standard `torch.optim.AdamW`. |
 | `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
-| `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases and norms. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
+| `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, `lm_head`, MoE routers/gates, hyper-connection stream-mixing weights, scalar head/gating projections, biases and norms. Low-precision (`bfloat16`/`float16`) Muon parameters additionally maintain a `+2 B/elem` Kahan `compensation` buffer in optimizer state so small-LR updates do not suffer mantissa underflow. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
 
 `model.optimizer.state_offload: cpu` (with `type: adamw`) keeps the AdamW moment
 states in host buffers — pinned by default, pageable when `state_offload_pin_memory`
@@ -407,6 +407,7 @@ Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 | `muon_expert_zero_comm` | `false` | **MoE / FSDP+EP only.** When `true`, expert FSDP shards along dim-0 (whole experts per rank) instead of the default dim-1 (hidden split), letting Muon's batched Newton-Schulz run with **zero communication**. Requires the model's ExtraParallel plan to declare a 3D expert stack sliced on dim 0, and every parameter it covers (2D per-expert biases included) to satisfy `(num_experts / ep_size) % ep_fsdp_size == 0`; otherwise the trainer logs a warning and falls back to the dim-1 + all-to-all-gather path. Non-expert ExtraParallels such as `emb` keep their default layout. |
 | `muon_ns_implementation` | `gram_quack` | Newton–Schulz backend: `std`, `gram` (pure PyTorch Gram-NS), or `gram_quack` (default; Dao-AILab + quack CuTeDSL GEMM; falls back to `gram` with a warning if unavailable). |
 | `muon_gram_ns_reset_iterations` | `[2]` | Restart indices for Gram-NS (`gram` / `gram_quack` only). |
+| `muon_extra_adamw_names` | `[]` | Additional case-insensitive parameter name substrings routed to AdamW (preserving `weight_decay`) instead of Muon orthogonalization. |
 | `muon_head_group_size` | `0` | Attention heads per orthogonalization block ("Muon Split", see below). `0` keeps one polar factor per projection, `1` is fully per-head, `g>1` groups `g` heads per block. Any value `>= 1` also requires `muon_head_split_modules`. |
 | `muon_head_split_modules` | `[]` | Projections to head-split, each matched as a leaf module name or a dotted path suffix (`self_attn.q_b_proj`). **Required** when `muon_head_group_size >= 1`; there is no default list. See below for the nested-name rule. |
 

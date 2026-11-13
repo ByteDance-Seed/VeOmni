@@ -185,6 +185,83 @@ class TestSplit:
         muon, adamw, *_ = split_muon_adamw_params(model)
         assert muon == [] and adamw == []
 
+    def test_split_routes_router_mhc_engram_and_indexer_weights_to_adamw(self):
+        """Control/routing/mHC/gating 2D matrices route to AdamW while hidden/expert GEMMs stay on Muon."""
+        model = nn.Module()
+        layer = nn.Module()
+        layer.attn_hc = nn.ParameterDict({"fn": nn.Parameter(torch.randn(24, 64))})
+        layer.ffn_hc = nn.ParameterDict({"fn": nn.Parameter(torch.randn(24, 64))})
+        layer.mlp = nn.Module()
+        layer.mlp.gate = nn.Linear(16, 8, bias=False)
+        layer.mlp.router = nn.Linear(16, 8, bias=False)
+        layer.mlp.shared_expert_gate = nn.Linear(16, 1, bias=False)
+        layer.mlp.experts = nn.ParameterDict({"gate_up_proj": nn.Parameter(torch.randn(4, 16, 16))})
+        layer.mlp.shared_experts = nn.ModuleDict(
+            {
+                "gate_proj": nn.Linear(16, 8, bias=False),
+                "custom_adamw_only": nn.Linear(16, 8, bias=False),
+            }
+        )
+        layer.self_attn = nn.Module()
+        layer.self_attn.compressor = nn.ModuleDict({"wgate": nn.Linear(16, 8, bias=False)})
+        layer.self_attn.indexer = nn.ModuleDict(
+            {
+                "weights_proj": nn.Linear(16, 4, bias=False),
+                "wq_b": nn.Linear(16, 32, bias=False),
+            }
+        )
+        model.layers = nn.ModuleList([layer])
+        model.hc_head = nn.ParameterDict({"hc_fn": nn.Parameter(torch.randn(4, 64))})
+        model.engram = nn.ModuleDict(
+            {
+                "1": nn.ParameterDict(
+                    {
+                        "q_weight": nn.Parameter(torch.randn(4, 16)),
+                        "k_weight": nn.Parameter(torch.randn(4, 16)),
+                        "wkv": nn.Parameter(torch.randn(32, 16)),
+                    }
+                )
+            }
+        )
+
+        _, _, muon_names, adamw_names = split_muon_adamw_params(
+            model,
+            extra_adamw_name_patterns=["custom_adamw_only"],
+        )
+
+        assert set(adamw_names) == {
+            "layers.0.attn_hc.fn",
+            "layers.0.ffn_hc.fn",
+            "layers.0.mlp.gate.weight",
+            "layers.0.mlp.router.weight",
+            "layers.0.mlp.shared_expert_gate.weight",
+            "layers.0.mlp.shared_experts.custom_adamw_only.weight",
+            "layers.0.self_attn.indexer.weights_proj.weight",
+            "hc_head.hc_fn",
+            "engram.1.q_weight",
+            "engram.1.k_weight",
+        }
+        assert set(muon_names) == {
+            "layers.0.mlp.experts.gate_up_proj",
+            "layers.0.mlp.shared_experts.gate_proj.weight",
+            "layers.0.self_attn.compressor.wgate.weight",
+            "layers.0.self_attn.indexer.wq_b.weight",
+            "engram.1.wkv",
+        }
+
+        from veomni.arguments.arguments_types import OptimizerConfig
+        from veomni.optim import build_optimizer
+
+        with pytest.raises(ValueError, match="muon_extra_adamw_names"):
+            OptimizerConfig(type="muon", muon_extra_adamw_names="bare_string")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="extra_adamw_name_patterns"):
+            split_muon_adamw_params(model, extra_adamw_name_patterns="bare_string")
+
+        opt_cfg = OptimizerConfig(type="muon", muon_extra_adamw_names=["custom_adamw_only"])
+        built = build_optimizer(model, lr=1e-4, weight_decay=0.1, optimizer_type="muon", optimizer_config=opt_cfg)
+        adamw_param_ids = {id(p) for g in built.optimizers_dict["adamw"].param_groups for p in g["params"]}
+        assert id(layer.mlp.shared_experts["custom_adamw_only"].weight) in adamw_param_ids
+
 
 class TestParamShapeEligibility:
     """``DistributedMuon`` must accept 2D/3D and reject 1D/4D+."""
@@ -381,6 +458,86 @@ class TestNumerics:
             v_after = sd_after[k]
             if isinstance(v_before, torch.Tensor):
                 torch.testing.assert_close(v_before, v_after, atol=0.0, rtol=0.0, msg=f"state_dict mismatch at {k}")
+
+    def test_bf16_kahan_compensation_prevents_small_lr_underflow_and_roundtrips(self):
+        """BF16 3D expert stacks at SFT lr=4e-5 retain FP32-accurate updates via Kahan compensation."""
+        torch.manual_seed(17)
+        w_init = (torch.randn(3, 64, 64) * 0.02).bfloat16()
+        p_fp32 = nn.Parameter(w_init.float().clone())
+        p_bf16 = nn.Parameter(w_init.clone())
+
+        kwargs = {
+            "lr": 4e-5,
+            "weight_decay": 0.1,
+            "momentum": 0.95,
+            "nesterov": True,
+            "adjust_lr_fn": "match_rms_adamw",
+            "ns_implementation": "std",
+        }
+        opt_fp32 = DistributedMuon([p_fp32], **kwargs)
+        opt_bf16 = DistributedMuon([p_bf16], **kwargs)
+
+        drift = torch.randn_like(p_fp32) * 0.05
+        for _ in range(30):
+            g = (drift + torch.randn_like(p_fp32) * 0.02).bfloat16()
+            p_fp32.grad = g.float()
+            p_bf16.grad = g.clone()
+            opt_fp32.step()
+            opt_bf16.step()
+
+        assert "compensation" in opt_bf16.state[p_bf16]
+        assert "compensation" not in opt_fp32.state[p_fp32]
+
+        oracle_delta = (p_fp32.detach() - w_init.float()).norm().item()
+        actual_err = (p_bf16.detach().float() - p_fp32.detach()).norm().item() / oracle_delta
+        assert oracle_delta > 0.0
+        assert actual_err < 0.20, f"Kahan BF16 drifted too far from FP32 master: rel_err={actual_err:.4f}"
+        assert (p_bf16.detach() != w_init).float().mean().item() > 0.5
+
+        sd = opt_bf16.state_dict()
+        p_restored = nn.Parameter(p_bf16.detach().clone())
+        opt_restored = DistributedMuon([p_restored], **kwargs)
+        opt_restored.load_state_dict(sd)
+        torch.testing.assert_close(
+            opt_restored.state[p_restored]["compensation"],
+            opt_bf16.state[p_bf16]["compensation"],
+            atol=0.0,
+            rtol=0.0,
+        )
+
+        # Loading a BF16 checkpoint into an FP32 model must drop the cast compensation buffer.
+        p_to_fp32 = nn.Parameter(p_bf16.detach().float().clone())
+        opt_to_fp32 = DistributedMuon([p_to_fp32], **kwargs)
+        opt_to_fp32.load_state_dict(sd)
+        assert "compensation" not in opt_to_fp32.state[p_to_fp32]
+
+        # Loading a pre-change flattened MultiOptimizer checkpoint without `.compensation`
+        # keys must not leave `{}` behind or crash on the next step().
+        from veomni.optim import build_optimizer
+
+        bf16_model = nn.Sequential(nn.Linear(8, 8, bias=False, dtype=torch.bfloat16))
+        multi_opt = build_optimizer(
+            bf16_model,
+            lr=4e-5,
+            weight_decay=0.1,
+            optimizer_type="muon",
+            muon_kwargs={"lr": 4e-5, "ns_implementation": "std"},
+        )
+        bf16_model[0].weight.grad = torch.randn_like(bf16_model[0].weight)
+        multi_opt.step()
+        legacy_flat_sd = {k: v for k, v in multi_opt.state_dict().items() if not k.endswith(".compensation")}
+        fresh_model = nn.Sequential(nn.Linear(8, 8, bias=False, dtype=torch.bfloat16))
+        fresh_opt = build_optimizer(
+            fresh_model,
+            lr=4e-5,
+            weight_decay=0.1,
+            optimizer_type="muon",
+            muon_kwargs={"lr": 4e-5, "ns_implementation": "std"},
+        )
+        fresh_opt.load_state_dict(legacy_flat_sd)
+        fresh_model[0].weight.grad = torch.randn_like(fresh_model[0].weight)
+        fresh_opt.step()
+        assert isinstance(fresh_opt.optimizers_dict["muon"].state[fresh_model[0].weight]["compensation"], torch.Tensor)
 
 
 class TestBuildOptimizer:

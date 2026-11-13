@@ -421,6 +421,7 @@ def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
         # Resolved against the model in _build_muon_with_adamw, not ctor kwargs.
         "head_group_size": int(optimizer_cfg.muon_head_group_size),
         "head_split_modules": tuple(optimizer_cfg.muon_head_split_modules),
+        "extra_adamw_name_patterns": getattr(optimizer_cfg, "muon_extra_adamw_names", ()),
         # Surface for startup summary only; not a DistributedMuon ctor kwarg.
         "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
     }
@@ -644,6 +645,7 @@ def _build_muon_with_adamw(
     adamw_lr = float(lr)
     head_group_size = int(muon_kwargs.pop("head_group_size", 0) or 0)
     head_split_modules = tuple(muon_kwargs.pop("head_split_modules", None) or ())
+    extra_adamw_name_patterns = muon_kwargs.pop("extra_adamw_name_patterns", None)
     if head_group_size < 0:
         raise ValueError(f"muon_head_group_size must be >= 0 (0 disables head splitting), got {head_group_size}")
     if head_group_size >= 1 and not head_split_modules:
@@ -664,6 +666,7 @@ def _build_muon_with_adamw(
         model,
         no_decay_modules=no_decay_modules,
         no_decay_params=no_decay_params,
+        extra_adamw_name_patterns=extra_adamw_name_patterns,
     )
     if not muon_params:
         raise ValueError(

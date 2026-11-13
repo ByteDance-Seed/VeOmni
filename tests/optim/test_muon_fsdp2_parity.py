@@ -654,8 +654,8 @@ def _run_qwen3_moe_smoke(use_zero_comm: bool, *, init_dist: bool = True) -> None
             no_decay_modules=[],
             no_decay_params=[],
             muon_kwargs={
-                "lr": 2e-2,
-                "weight_decay": 0.0,
+                "lr": 4e-5,
+                "weight_decay": 0.1,
                 "momentum": 0.9,
                 "nesterov": True,
                 "ns_steps": 5,
@@ -684,11 +684,20 @@ def _run_qwen3_moe_smoke(use_zero_comm: bool, *, init_dist: bool = True) -> None
         optimizer.zero_grad()
 
         moved = 0
+        expert_moved = 0
         for name, param in model.named_parameters():
             new = (param.full_tensor() if isinstance(param, DTensor) else param).detach().cpu()
             if not torch.equal(new, snap[name]):
                 moved += 1
+                if ".experts." in name:
+                    expert_moved += 1
         assert moved > 0, "no parameter changed after a single optimizer step"
+        assert expert_moved > 0, (
+            f"no 3D expert parameter changed after optimizer.step() (use_zero_comm={use_zero_comm})"
+        )
+        assert "compensation" in optimizer.optimizers_dict["muon_ep"].state[p], (
+            "expected BF16 3D expert parameter to carry Kahan compensation state in muon_ep"
+        )
 
         if rank == 0:
             print(
