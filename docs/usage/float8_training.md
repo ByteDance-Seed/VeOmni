@@ -97,7 +97,7 @@ Model-specific eligible DiT projection patterns:
 Configuration is defined by [Float8TrainingConfig](../../veomni/arguments/arguments_types.py#L604),
 validated by [validate_float8_training](../../veomni/distributed/float8.py#L51),
 and applied by [convert_float8_linears](../../veomni/distributed/float8.py#L86)
-inside [parallelize_model_fsdp2](../../veomni/distributed/torch_parallelize.py#L428)
+inside [parallelize_model_fsdp2](../../veomni/distributed/torch_parallelize.py#L429)
 before FSDP2 wraps transformer blocks.
 
 ### Interactions
