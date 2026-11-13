@@ -105,7 +105,7 @@
 +from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 +from veomni.models.utils.mask_utils import create_causal_mask
 +from veomni.ops import VeomniOp
-+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
++from veomni.ops.kernels.swiglu_mlp import use_fused_row
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -190,7 +190,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -170,10 +174,20 @@
+@@ -170,10 +174,21 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -199,7 +199,7 @@
      def forward(self, x):
 -        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 -        return down_proj
-+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
++        if use_fused_row(self, self.config.hidden_act):
 +            return self.veomni_swiglu_mlp(
 +                x,
 +                self.gate_proj.weight,
@@ -208,12 +208,13 @@
 +                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
 +                self.down_proj.weight,
 +                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
++                activation=self.config.hidden_act,
 +            )
 +        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -213,10 +227,16 @@
+@@ -213,10 +228,16 @@
      return attn_output, attn_weights
 
 
@@ -231,7 +232,7 @@
      def __init__(self, config: LlamaConfig, layer_idx: int):
          super().__init__()
          self.config = config
-@@ -239,6 +259,9 @@
+@@ -239,6 +260,9 @@
          self.o_proj = nn.Linear(
              config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
          )
@@ -241,7 +242,7 @@
 
      def forward(
          self,
-@@ -256,16 +279,12 @@
+@@ -256,16 +280,12 @@
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -260,7 +261,7 @@
              self,
              query_states,
              key_states,
-@@ -281,16 +300,20 @@
+@@ -281,16 +301,20 @@
          return attn_output, attn_weights
 
 
@@ -286,7 +287,7 @@
 
      def forward(
          self,
-@@ -343,9 +366,15 @@
+@@ -343,9 +367,15 @@
      }
 
 
@@ -303,7 +304,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -354,13 +383,18 @@
+@@ -354,13 +384,18 @@
          self.layers = nn.ModuleList(
              [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
          )
@@ -324,7 +325,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -388,13 +422,18 @@
+@@ -388,13 +423,18 @@
              position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
              position_ids = position_ids.unsqueeze(0)
 
@@ -349,7 +350,7 @@
 
          hidden_states = inputs_embeds
          position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
-@@ -417,6 +456,12 @@
+@@ -417,6 +457,12 @@
          )
 
 
@@ -362,7 +363,7 @@
  @auto_docstring
  class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -429,8 +474,9 @@
+@@ -429,8 +475,9 @@
          self.model = LlamaModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -374,7 +375,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -444,55 +490,110 @@
+@@ -444,55 +491,110 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

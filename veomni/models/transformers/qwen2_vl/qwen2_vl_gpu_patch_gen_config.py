@@ -48,7 +48,7 @@ from veomni.distributed.sequence_parallel import (
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.swiglu_mlp import use_fused_row
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen2VLCausalLMOutputWithLogProbs
@@ -96,7 +96,7 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "Qwen2VLCausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
+config.add_import("veomni.ops.kernels.swiglu_mlp", names=["use_fused_row"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
@@ -283,7 +283,7 @@ def qwen2_vl_text_model_forward_patched(
     description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
 )
 def qwen2_vl_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+    if use_fused_row(self, self.config.hidden_act):
         return self.veomni_swiglu_mlp(
             x,
             self.gate_proj.weight,
@@ -292,6 +292,7 @@ def qwen2_vl_mlp_forward_patched(self, x):
             self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
             self.down_proj.weight,
             self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+            activation=self.config.hidden_act,
         )
     return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 

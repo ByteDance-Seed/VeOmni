@@ -118,7 +118,7 @@ from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.swiglu_mlp import use_fused_row
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import (
     Qwen2_5_VLCausalLMOutputWithLogProbs,
@@ -356,7 +356,7 @@ class Qwen2_5_VLMLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, hidden_state):
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+        if use_fused_row(self, self.config.hidden_act):
             return self.veomni_swiglu_mlp(
                 hidden_state,
                 self.gate_proj.weight,
@@ -365,6 +365,7 @@ class Qwen2_5_VLMLP(nn.Module):
                 self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
                 self.down_proj.weight,
                 self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+                activation=self.config.hidden_act,
             )
         return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
 
@@ -1010,7 +1011,7 @@ class Qwen2MLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+        if use_fused_row(self, self.config.hidden_act):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,
@@ -1019,6 +1020,7 @@ class Qwen2MLP(nn.Module):
                 self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
                 self.down_proj.weight,
                 self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+                activation=self.config.hidden_act,
             )
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 

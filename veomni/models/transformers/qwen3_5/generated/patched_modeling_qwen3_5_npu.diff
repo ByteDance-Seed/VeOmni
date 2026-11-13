@@ -174,7 +174,7 @@
 +from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 +from veomni.models.utils.mask_utils import create_causal_mask
 +from veomni.ops import VeomniOp
-+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
++from veomni.ops.kernels.swiglu_mlp import use_fused_row
 +from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
 +
@@ -828,7 +828,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = intermediate_size
-@@ -714,30 +1071,51 @@
+@@ -714,30 +1071,52 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -837,7 +837,7 @@
      def forward(self, x):
 -        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 -        return down_proj
-+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
++        if use_fused_row(self, self.config.hidden_act):
 +            return self.veomni_swiglu_mlp(
 +                x,
 +                self.gate_proj.weight,
@@ -846,6 +846,7 @@
 +                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
 +                self.down_proj.weight,
 +                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
++                activation=self.config.hidden_act,
 +            )
 +        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 +
@@ -889,7 +890,7 @@
 
 
  class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
-@@ -746,13 +1124,14 @@
+@@ -746,13 +1125,14 @@
          self.hidden_size = config.hidden_size
          self.block_type = config.layer_types[layer_idx]
          if self.block_type == "linear_attention":
@@ -910,7 +911,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -760,19 +1139,39 @@
+@@ -760,19 +1140,39 @@
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
          past_key_values: Cache | None = None,
@@ -952,7 +953,7 @@
              )
          elif self.block_type == "full_attention":
              # Self Attention
-@@ -781,6 +1180,7 @@
+@@ -781,6 +1181,7 @@
                  attention_mask=attention_mask,
                  position_ids=position_ids,
                  past_key_values=past_key_values,
@@ -960,7 +961,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -792,8 +1192,76 @@
+@@ -792,8 +1193,76 @@
          hidden_states = self.post_attention_layernorm(hidden_states)
          hidden_states = self.mlp(hidden_states)
          hidden_states = residual + hidden_states
@@ -1038,7 +1039,7 @@
 
 
  class Qwen3_5PreTrainedModel(PreTrainedModel):
-@@ -879,21 +1347,14 @@
+@@ -879,21 +1348,14 @@
          return x
 
 
@@ -1065,7 +1066,7 @@
      def __init__(self, config: Qwen3_5VisionConfig) -> None:
          super().__init__()
          self.dim = config.hidden_size
-@@ -906,13 +1367,16 @@
+@@ -906,13 +1368,16 @@
          self.config = config
          self.attention_dropout = 0.0
          self.is_causal = False
@@ -1083,7 +1084,7 @@
          **kwargs,
      ) -> torch.Tensor:
          seq_length = hidden_states.shape[0]
-@@ -920,56 +1384,34 @@
+@@ -920,56 +1385,34 @@
              self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
          )
          cos, sin = position_embeddings
@@ -1163,7 +1164,7 @@
 
          attn_output = attn_output.reshape(seq_length, -1).contiguous()
          attn_output = self.proj(attn_output)
-@@ -1006,6 +1448,12 @@
+@@ -1006,6 +1449,12 @@
          return hidden_states
 
 
@@ -1176,7 +1177,7 @@
  class Qwen3_5VisionModel(Qwen3_5PreTrainedModel):
      config: Qwen3_5VisionConfig
      input_modalities = ("image", "video")
-@@ -1044,30 +1492,127 @@
+@@ -1044,30 +1493,127 @@
 
          self.post_init()
 
@@ -1326,7 +1327,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1082,33 +1627,149 @@
+@@ -1082,33 +1628,149 @@
          Returns:
              `torch.Tensor`: hidden_states.
          """
@@ -1491,7 +1492,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -1119,6 +1780,36 @@
+@@ -1119,6 +1781,36 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -1528,7 +1529,7 @@
 
 
  @auto_docstring
-@@ -1133,6 +1824,27 @@
+@@ -1133,6 +1825,27 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -1556,7 +1557,7 @@
  class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
      config: Qwen3_5TextConfig
 
-@@ -1140,14 +1852,14 @@
+@@ -1140,14 +1853,14 @@
          super().__init__(config)
          self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
          self.layers = nn.ModuleList(
@@ -1576,7 +1577,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -1159,8 +1871,14 @@
+@@ -1159,8 +1872,14 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -1592,7 +1593,7 @@
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-@@ -1178,6 +1896,20 @@
+@@ -1178,6 +1897,20 @@
          elif position_ids.ndim == 2:
              position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
 
@@ -1613,7 +1614,7 @@
          if position_ids.ndim == 3 and position_ids.shape[0] == 4:
              text_position_ids = position_ids[0]
              position_ids = position_ids[1:]
-@@ -1185,7 +1917,6 @@
+@@ -1185,7 +1918,6 @@
              text_position_ids = None
 
          if not isinstance(causal_mask_mapping := attention_mask, dict):
@@ -1621,7 +1622,7 @@
              mask_kwargs = {
                  "config": self.config,
                  "inputs_embeds": inputs_embeds,
-@@ -1193,11 +1924,38 @@
+@@ -1193,11 +1925,38 @@
                  "past_key_values": past_key_values,
                  "position_ids": text_position_ids,
              }
@@ -1665,7 +1666,7 @@
 
          hidden_states = inputs_embeds
          position_embeddings = self.rotary_emb(hidden_states, position_ids)
-@@ -1213,12 +1971,36 @@
+@@ -1213,12 +1972,36 @@
                  **kwargs,
              )
 
@@ -1704,7 +1705,7 @@
 
 
  @auto_docstring
-@@ -1230,11 +2012,9 @@
+@@ -1230,11 +2013,9 @@
 
      def __init__(self, config):
          super().__init__(config)
@@ -1719,7 +1720,7 @@
          self.post_init()
 
      def get_vision_position_ids(
-@@ -1401,58 +2181,43 @@
+@@ -1401,58 +2182,43 @@
          self,
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
@@ -1807,7 +1808,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1518,37 +2283,188 @@
+@@ -1518,37 +2284,188 @@
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
          mm_token_type_ids: torch.IntTensor | None = None,
@@ -2006,7 +2007,7 @@
              position_ids = self.compute_3d_position_ids(
                  input_ids=input_ids,
                  image_grid_thw=image_grid_thw,
-@@ -1558,6 +2474,18 @@
+@@ -1558,6 +2475,18 @@
                  past_key_values=past_key_values,
                  mm_token_type_ids=mm_token_type_ids,
              )
@@ -2025,7 +2026,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1565,13 +2493,17 @@
+@@ -1565,13 +2494,17 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -2047,7 +2048,7 @@
 
 
  @auto_docstring
-@@ -1588,8 +2520,9 @@
+@@ -1588,8 +2521,9 @@
          self.model = Qwen3_5TextModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -2059,7 +2060,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -1603,10 +2536,13 @@
+@@ -1603,10 +2537,13 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
@@ -2073,7 +2074,7 @@
          labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
              Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
              config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-@@ -1635,21 +2571,34 @@
+@@ -1635,21 +2572,34 @@
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
@@ -2112,7 +2113,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1672,15 +2621,60 @@
+@@ -1672,15 +2622,60 @@
      rope_deltas: torch.LongTensor | None = None
 
 
@@ -2174,7 +2175,7 @@
 
          self.post_init()
 
-@@ -1724,48 +2718,64 @@
+@@ -1724,48 +2719,64 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -2279,7 +2280,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1776,28 +2786,105 @@
+@@ -1776,28 +2787,105 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -2395,7 +2396,7 @@
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
          # Overwritten -- requires 3D position ids
-@@ -1984,6 +3071,24 @@
+@@ -1984,6 +3072,24 @@
 
          return input_ids, model_kwargs
 

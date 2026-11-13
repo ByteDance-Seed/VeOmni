@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from torch import Tensor
 
+from ....activation import normalize_activation
 from ....registry import SavedState
 from . import eager as _eager
 
@@ -32,10 +33,25 @@ def forward(
     down_b: Tensor,
     *,
     swiglu_limit: float | None = None,
+    activation: str = "silu",
 ) -> tuple[Tensor, SavedState]:
-    """Same MLP as eager; ``silu(gate) * up`` uses Liger when the tensors are nonempty."""
+    """Same MLP as eager; ``silu(gate) * up`` uses Liger when the tensors are nonempty.
+
+    Liger's ``swiglu_forward``/``swiglu_backward`` implement SiLU only, so another
+    activation is refused here rather than silently computed as SiLU. The ``eager``
+    row serves every activation this module knows; this row is the fused fast path
+    for the one Liger has.
+    """
+    if normalize_activation(activation) != "silu":
+        raise ValueError(
+            f"swiglu_mlp_implementation='liger_kernel' computes SiLU only, and the model asks for "
+            f"{activation!r}. Select 'eager' for this activation, or 'qat' if the run is "
+            f"quantization-aware -- both evaluate the config's activation."
+        )
     if x.numel() == 0:
-        return _eager.forward(x, gate_w, gate_b, up_w, up_b, down_w, down_b, swiglu_limit=swiglu_limit)
+        return _eager.forward(
+            x, gate_w, gate_b, up_w, up_b, down_w, down_b, swiglu_limit=swiglu_limit, activation=activation
+        )
 
     gate = _eager.linear(x, gate_w, gate_b)
     up = _eager.linear(x, up_w, up_b)

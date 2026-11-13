@@ -26,7 +26,7 @@ If a field is not in this table, it is not an op-selection knob.
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel`, `qat` (FP8 QAT, SM90+) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Gated MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel`, `qat` (FP8 QAT, SM90+) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp`. The activation is a **call argument** (`activation=config.hidden_act`), so a `gelu` model quantizes like a `silu` one; `liger_kernel` computes SiLU only and refuses anything else |
 | Dense projection | `linear_implementation` | `eager`, `qat` (FP8 QAT, SM90+) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants). **DeepSeek-V4 is currently the only consumer** — the row exists for any model, but no other model binds it yet |
 | KV / indexer storage round | `kv_round_implementation` | `none`, `eager`, `triton` (NVIDIA SM89+, ROCm) | `"none"`; there is no host default | Model `__init__` via an instance-local `VeomniOp` on the `deepseek_v4` variant, which fixes the model's two geometries; the `standard` variant is model-agnostic and takes them as call arguments. **DeepSeek-V4 is the only consumer** |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
@@ -124,14 +124,8 @@ falling back to `eager`.
 
 A second rejection covers the paths a row cannot serve. A fake-quantizing row reads
 the weights it is handed, so a branch that bypasses it would train at full precision
-while the config still said QAT. Three of them refuse instead of falling through,
-each where the information lives:
+while the config still said QAT. Two of them refuse instead of falling through:
 
-- **An activation no quantizing row implements** is refused at *config load* by
-  `configuration_base._reject_quantized_swiglu_on_an_unfused_activation`. The
-  model's gate excludes those activations before the handle is called, so without
-  the check the config would claim QAT and quantize nothing. Failing at load also
-  beats failing on step one. `swiglu_mlp.FUSED_ACTIVATIONS` holds the set.
 - **A projection that is not an exact `nn.Linear`** is refused by
   `has_plain_linear_projections` when it calls `reject_quantizing_row`: a
   projection wrapped after construction (LoRA keeps the base layer at
@@ -140,11 +134,51 @@ each where the information lives:
 - **Expert LoRA on a quantizing experts row** is refused by `_moe_lora_op`,
   because no adapter forward would quantize the base weights.
 
-Only quantizing rows are affected — every reference row keeps its fallback. The
-routed-expert side has its own refusals, at two levels: `moe_implementation='qat'`
-with a non-SwiGLU activation is refused in the model's expert forward (the
-activation is fused into the grouped GEMM there, so the Python fallback genuinely
-cannot quantize), and expert LoRA is refused as above.
+Only quantizing rows are affected — every reference row keeps its fallback.
+
+### The activation travels with the call
+
+The gated-MLP rows take the activation as an argument, so a model's `hidden_act`
+decides what its MLP computes whether or not the row quantizes. `veomni/ops/activation.py`
+serves every name in `transformers.activations.ACT2FN` except four, delegating to
+transformers' own implementation of each -- `gelu_new` and `gelu_pytorch_tanh` are
+*different* functions whose bf16 intermediates round differently, so they are not
+normalized onto one formula. SiLU keeps its ATen spelling so the quantizing row
+reuses `eager`'s gradient bit for bit.
+
+Three names are excluded, each for a measured reason rather than an assumed one:
+
+| Name | Why not |
+| --- | --- |
+| `prelu`, `xielu` | carry learnable parameters, so an inline instance would train a different function from the model's own |
+| `mish` | `F.mish` has a fused ATen backward whose bf16 rounding differs from any decomposed derivative (1.56e-2 absolute on ~25% of elements), so a row here would train gradients the model's own `act_fn` never produces |
+
+`laplace` and `gelu_10` are **served**, not excluded: `LaplaceActivation` acts
+elementwise, and `ACT2FN["gelu_10"]` supplies its bounds at construction so its
+`forward` takes one tensor.
+
+Which row runs is decided before the call, by `swiglu_mlp.use_fused_row`, because
+a row's activation support is part of its contract:
+
+| Row | Activations | When it cannot serve the call |
+| --- | --- | --- |
+| `eager`, `qat` | every name `activation.py` evaluates | — |
+| `liger_kernel` | SiLU only (Liger's `swiglu_forward`) | the model falls back to its projection modules |
+| any row | — | a *quantizing* row raises instead of falling back |
+
+`liger_kernel` is the GPU default, so this matters in practice: a `gelu` model on
+GPU would otherwise reach a SiLU-only kernel and fail on its first forward. It is
+skipped, not entered. A quantizing row has no such option -- falling back would
+train at full precision under a config that says otherwise -- so it raises, and
+the error names `eager` as the way to keep the fallback.
+
+The routed experts are the exception, and the reason is structural: their
+activation is fused *into* the grouped GEMM (`aten.silu` in the forward,
+`silu_backward` in the backward), so the Python `act_fn` loop is the only path for
+another activation and it cannot reach the family row. A quantizing
+`moe_implementation` on a non-SiLU activation is therefore refused in each model's
+expert forward, via `reject_quantizing_act_fn`. Teaching those kernels an
+activation argument is tracked in #1430.
 
 There is no cross-family conflict to reject. `deepgemm_fp8` and `qat` are two
 values of the same `moe_implementation` field, so the routed experts cannot be

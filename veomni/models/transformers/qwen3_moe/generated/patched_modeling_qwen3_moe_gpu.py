@@ -84,7 +84,7 @@ from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_wi
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.swiglu_mlp import use_fused_row
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
@@ -225,7 +225,7 @@ class Qwen3MoeMLP(nn.Module):
         self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
+        if use_fused_row(self, self.config.hidden_act):
             return self.veomni_swiglu_mlp(
                 x,
                 self.gate_proj.weight,
@@ -234,6 +234,7 @@ class Qwen3MoeMLP(nn.Module):
                 self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
                 self.down_proj.weight,
                 self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
+                activation=self.config.hidden_act,
             )
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 

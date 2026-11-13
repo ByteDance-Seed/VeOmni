@@ -114,7 +114,7 @@
 +from veomni.ops import VeomniOp
 +from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, create_standard_causal_mask, translate_fused_dsa_mask
 +from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
-+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
++from veomni.ops.kernels.swiglu_mlp import use_fused_row
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 +from veomni.utils.moe_monitor import record_router_indices
 +
@@ -585,7 +585,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
-@@ -490,10 +565,26 @@
+@@ -490,10 +565,27 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -594,7 +594,7 @@
      def forward(self, x):
 -        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 -        return down_proj
-+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
++        if use_fused_row(self, self.config.hidden_act):
 +            return self.veomni_swiglu_mlp(
 +                x,
 +                self.gate_proj.weight,
@@ -603,6 +603,7 @@
 +                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
 +                self.down_proj.weight,
 +                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
++                activation=self.config.hidden_act,
 +            )
 +        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 +
@@ -614,7 +615,7 @@
 
 
  class GlmMoeDsaTopkRouter(nn.Module):
-@@ -511,7 +602,8 @@
+@@ -511,7 +603,8 @@
 
      def forward(self, hidden_states):
          hidden_states = hidden_states.view(-1, self.hidden_dim)
@@ -624,7 +625,7 @@
          scores = router_logits.sigmoid()
          scores_for_choice = scores + self.e_score_correction_bias
          group_scores = (
-@@ -531,13 +623,17 @@
+@@ -531,13 +624,17 @@
          topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
          topk_weights = scores.gather(1, topk_indices)
          if self.norm_topk_prob:
@@ -645,7 +646,7 @@
  class GlmMoeDsaExperts(nn.Module):
      """Collection of expert weights stored as 3D tensors."""
 
-@@ -549,6 +645,8 @@
+@@ -549,6 +646,8 @@
          self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
          self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
          self.act_fn = ACT2FN[config.hidden_act]
@@ -654,7 +655,7 @@
 
      def forward(
          self,
-@@ -556,25 +654,34 @@
+@@ -556,25 +655,34 @@
          top_k_index: torch.Tensor,
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
@@ -708,7 +709,7 @@
 
 
  class GlmMoeDsaMoE(nn.Module):
-@@ -591,26 +698,33 @@
+@@ -591,26 +699,33 @@
              config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
          )
 
@@ -749,7 +750,7 @@
 
      def forward(
          self,
-@@ -677,6 +791,12 @@
+@@ -677,6 +792,12 @@
              init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
 
 
@@ -762,7 +763,7 @@
  @auto_docstring
  class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
      def __init__(self, config: GlmMoeDsaConfig):
-@@ -686,13 +806,12 @@
+@@ -686,13 +807,12 @@
 
          self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
          self.layers = nn.ModuleList(
@@ -780,7 +781,7 @@
          self.post_init()
 
      @merge_with_config_defaults
-@@ -756,6 +875,12 @@
+@@ -756,6 +876,12 @@
          )
 
 
@@ -793,7 +794,7 @@
  @auto_docstring
  class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -768,8 +893,9 @@
+@@ -768,8 +894,9 @@
          self.model = GlmMoeDsaModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -805,7 +806,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -783,52 +909,61 @@
+@@ -783,52 +910,61 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
