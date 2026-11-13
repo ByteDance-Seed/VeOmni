@@ -1247,6 +1247,20 @@ class TrainingArguments:
             )
         },
     )
+    moe_router_bias_update_rate: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Step size for the auxiliary-loss-free router bias update "
+                "(https://arxiv.org/abs/2408.15664). 0 = disabled, which leaves the "
+                "e_score_correction_bias buffer frozen at whatever it was initialised "
+                "or loaded with. Applies to routers that carry that buffer "
+                "(DeepSeek-V3/V4, GLM-MoE). Once per optimizer step, each expert's "
+                "bias moves by this rate against its share of the step's tokens. "
+                "DeepSeek-V3 used 1e-3, dropped to 0 for the final phase."
+            )
+        },
+    )
 
     # sub-argument groups
     wandb: WandbConfig = field(default_factory=WandbConfig)
@@ -1258,6 +1272,15 @@ class TrainingArguments:
         if self.dyn_bsz_physical_overflow_ratio < 1.0:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
+            )
+
+        if self.moe_router_bias_update_rate < 0.0:
+            # Caught here rather than in the callback, which treats anything
+            # non-positive as "disabled": a typo would otherwise switch
+            # balancing off silently on every rank.
+            raise ValueError(
+                f"moe_router_bias_update_rate must be >= 0, got {self.moe_router_bias_update_rate}. "
+                "Use 0 to disable the auxiliary-loss-free bias update."
             )
 
         self._train_steps = -1

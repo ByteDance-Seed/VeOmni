@@ -1,0 +1,262 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Auxiliary-loss-free router balancing: the expert bias update.
+
+DeepSeek-V3/V4 and GLM-MoE route with a per-expert bias term added to the
+router scores before the top-k selection, and only for the selection: the
+weight each chosen expert receives still comes from the unbiased score. The
+strategy is from `Auxiliary-Loss-Free Load Balancing
+<https://arxiv.org/abs/2408.15664>`_, and it only balances anything if
+something moves that bias in response to observed load.
+
+The routers declare the buffer and read it, but nothing wrote it, so the bias
+stayed at whatever it was initialised or loaded with for the whole run. This
+module supplies the missing half.
+
+Design notes, in case they are not obvious:
+
+* **Keyed on the buffer, not on a class name.** Any module carrying
+  ``e_score_correction_bias`` is updated, so a future model gets this without
+  touching a registry. That also keeps the change outside
+  ``veomni/models/transformers/*/generated/``, which must not be hand-edited.
+* **Counts are accumulated in a forward hook and consumed once per optimizer
+  step**, not once per micro-batch, so gradient accumulation sees the load of
+  the whole step. This is the same placement torchtitan uses.
+* **The counts all-reduce over every rank holding a distinct token slice**,
+  which is ``fsdp_group``, the flattened ``dp_sp``
+  (``dp_replicate x dp_shard x cp x ulysses``). Sequence-parallel ranks belong
+  in it because ``slice_input_tensor`` gives each one a different slice of the
+  sequence, so their routers score different tokens. **Expert-parallel ranks
+  belong in it too**: the EP mesh is carved out of ``dp_shard_sp``, so EP peers
+  are already inside this group, and each of them holds its own micro-batch.
+  Tensor and pipeline parallelism are outside it, because TP peers score
+  identical tokens and PP stages hold disjoint routers.
+
+  Narrowing this group would be a silent correctness bug rather than a
+  performance tweak. FSDP2 synchronises no buffers at all, so the bias is kept
+  identical across ranks only by this reduce being global; a partial sum would
+  leave ranks with divergent biases, routing differently, forever, with
+  nothing raising.
+* **Update is sign-based**, as in the paper and in Megatron-LM and torchtitan:
+  the bias moves by a fixed rate, not in proportion to the imbalance, which
+  keeps it from reacting violently to one unusual step.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Optional
+
+import torch
+import torch.distributed as dist
+from torch import nn
+
+from .logging import get_logger
+
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
+
+logger = get_logger(__name__)
+
+BIAS_ATTR = "e_score_correction_bias"
+
+
+def _topk_indices_from_output(output: Any) -> Optional[torch.Tensor]:
+    """The selected experts, from a router's return value.
+
+    All three routers that carry the bias today return
+    ``(logits, weights, indices)``. Anything else returns ``None`` rather than
+    being guessed at; the caller raises on that, so a router whose contract
+    changed stops the run instead of accumulating nonsense.
+    """
+    if isinstance(output, tuple) and len(output) == 3:
+        indices = output[-1]
+        if isinstance(indices, torch.Tensor) and indices.dtype in (torch.int32, torch.int64):
+            return indices
+    return None
+
+
+class ExpertBiasUpdater:
+    """Accumulates expert load and nudges the routers' correction bias.
+
+    Args:
+        update_rate: How far the bias moves per optimizer step. The paper's
+            ``u``; Megatron-LM calls it ``--moe-router-bias-update-rate`` and
+            torchtitan ``load_balance_coeff``.
+    """
+
+    def __init__(self, update_rate: float) -> None:
+        if update_rate <= 0.0:
+            raise ValueError(f"update_rate must be positive, got {update_rate}")
+        self.update_rate = update_rate
+        self._routers: list[nn.Module] = []
+        self._seen: set[int] = set()
+        self._counts: Optional[torch.Tensor] = None
+        self._handles: list[Any] = []
+        self._enabled = True
+
+    def attach(self, model: nn.Module) -> int:
+        """Hook every router that carries the bias buffer. Returns how many.
+
+        ``model.modules()`` yields a deterministic order that is the same on
+        every rank, since every rank builds the same model from the same
+        config, so the row each router owns in the counts tensor needs no
+        cross-rank agreement. Calling this twice is a no-op for routers already
+        hooked, so a second call cannot silently double-count.
+        """
+        for module in model.modules():
+            bias = getattr(module, BIAS_ATTR, None)
+            if not isinstance(bias, torch.Tensor) or id(module) in self._seen:
+                continue
+            index = len(self._routers)
+            self._seen.add(id(module))
+            self._routers.append(module)
+            self._handles.append(module.register_forward_hook(self._make_hook(index)))
+
+        if self._routers:
+            bias = getattr(self._routers[0], BIAS_ATTR)
+            # One rectangular tensor only works if every router has the same
+            # expert count. Nothing in the tree breaks that today, so this is
+            # the premise the preallocation below rests on rather than a
+            # defence: state it here, where it is cheap and names the module,
+            # instead of letting a mismatch surface as an out-of-range
+            # scatter_add_ inside a forward hook.
+            for module in self._routers:
+                width = getattr(module, BIAS_ATTR).numel()
+                if width != bias.numel():
+                    raise ValueError(
+                        f"{type(module).__name__} carries a '{BIAS_ATTR}' of {width} experts while "
+                        f"{type(self._routers[0]).__name__} carries {bias.numel()}. The bias update "
+                        "accumulates every router's load in one rectangular tensor, which assumes a "
+                        "uniform expert count across routers."
+                    )
+            # One row per router, allocated up front rather than on first use:
+            # a lazily built set of rows would differ between ranks whose
+            # micro-batches reached different layers, and step() issues one
+            # collective over the whole tensor.
+            self._counts = torch.zeros((len(self._routers), bias.numel()), dtype=torch.long, device=bias.device)
+        return len(self._routers)
+
+    def _make_hook(self, index: int):
+        def _hook(module: nn.Module, inputs, output):  # noqa: ANN001
+            if not self._enabled or self._counts is None:
+                return
+            indices = _topk_indices_from_output(output)
+            if indices is None:
+                raise RuntimeError(
+                    f"{type(module).__name__} carries '{BIAS_ATTR}' but its forward did not return "
+                    "the (logits, weights, indices) tuple the bias update reads load from. "
+                    "Failing loudly rather than silently freezing the bias: a router that stops "
+                    "reporting its selection would leave load balancing switched off for the rest "
+                    "of the run with nothing to show for it. Update _topk_indices_from_output in "
+                    "veomni/utils/expert_bias.py for the new contract."
+                )
+            # Under activation recompute this hook may run more than once per
+            # micro-batch, so counts can come out a small multiple of the token
+            # count. Whether it does depends on where the checkpoint boundary
+            # falls: block checkpointing replays the router and double-counts,
+            # while non-reentrant checkpointing with early stopping can finish
+            # before the router's post-forward hook runs and count once.
+            #
+            # Either way it is harmless here, and harmless only because step()
+            # reduces the counts to a sign: scaling a router's whole row by the
+            # same factor leaves the ordering, and so the sign, unchanged. Each
+            # row has its own mean, so a factor that differs between layers is
+            # fine too. Anything that later makes the update proportional to
+            # load, or reports these counts as an absolute token count, has to
+            # divide the replay out first.
+            #
+            # scatter_add_ wants an int64 index and a src of the tensor's own
+            # dtype; a router returning int32 indices would otherwise raise.
+            flat = indices.detach().reshape(-1).to(device=self._counts.device, dtype=torch.long)
+            self._counts[index].scatter_add_(0, flat, torch.ones_like(flat))
+
+        return _hook
+
+    @torch.no_grad()
+    def step(self, group: Optional["ProcessGroup"] = None) -> None:
+        """Update every router's bias from the load seen since the last call.
+
+        Every rank must call this, and each one issues exactly one collective
+        over the whole counts tensor however its own traffic fell out. A
+        per-router reduce skipped on empty counts would make the number of
+        collectives depend on local data, which deadlocks rather than erroring
+        as soon as any rank disagrees. A router that genuinely saw no tokens
+        contributes an all-zero row, whose sign is zero, so it is a no-op.
+        """
+        if self._counts is None:
+            return
+
+        # Reduce in int64 and cast afterwards, not before. These are exact
+        # counts, and float32 stops representing consecutive integers past
+        # 2**24, which 4k tokens per rank at top-8 over a few hundred ranks
+        # reaches. Rounding there would land exactly on the near-average
+        # experts whose sign is already the marginal decision.
+        if group is not None and dist.is_initialized():
+            dist.all_reduce(self._counts, op=dist.ReduceOp.SUM, group=group)
+        load = self._counts.to(torch.float32)
+
+        # Underloaded experts (below their layer's mean) get a nudge up,
+        # overloaded ones a nudge down, by a fixed step. torch.sign gives 0 for
+        # an exactly-average expert, which correctly leaves it alone.
+        direction = torch.sign(load.mean(dim=1, keepdim=True) - load)
+        for index, module in enumerate(self._routers):
+            bias = getattr(module, BIAS_ATTR)
+            bias.add_(self.update_rate * direction[index].to(bias.dtype))
+        self._counts.zero_()
+
+    def disable(self) -> None:
+        """Stop accumulating and release the hooks."""
+        self._enabled = False
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        self._routers.clear()
+        self._seen.clear()
+        self._counts = None
+
+
+def ensure_lora_can_carry_the_bias(lora_config: Optional[dict], attached_routers: int) -> None:
+    """Reject a LoRA run that would train a bias no adapter file can carry.
+
+    ``e_score_correction_bias`` is a registered buffer on every router this
+    module attaches to, and ``get_lora_state_dict`` builds the adapter from
+    ``named_parameters()``, so the buffer never reaches it under any ``bias``
+    policy. A LoRA run with the update on would therefore train routing state
+    that the exported adapter drops. Reloading that adapter against its
+    original base therefore routes without the learned correction, and nothing
+    in the run says so. Not that it routes exactly as the base did: the adapter
+    weights still move the hidden states the router scores, so routing differs
+    from both the base and the trained model.
+
+    Note this is about adapter export specifically, not about resuming. A DCP
+    checkpoint does keep the buffers, because ``ignore_frozen_params`` drops
+    frozen parameters and not buffers, so a resume is unaffected. It is the
+    portable adapter, which is the point of training with LoRA, that cannot
+    represent the result.
+
+    Checked after ``attach`` rather than at config-parse time so it stays
+    architecture-aware: a dense model has no such routers, and a rate set on
+    one is already handled by disabling the update with a warning.
+    """
+    if attached_routers > 0 and lora_config:
+        raise ValueError(
+            "moe_router_bias_update_rate > 0 cannot be combined with LoRA. The update writes "
+            f"'{BIAS_ATTR}' on {attached_routers} router module(s), which the routers register as "
+            "a buffer, while the adapter export collects named_parameters() only. The trained "
+            "routing state would be dropped from the exported adapter, and reloading it against "
+            "its original base would route differently with nothing to show for it. Set the rate "
+            "to 0 for LoRA runs, or train the router bias with full fine-tuning."
+        )

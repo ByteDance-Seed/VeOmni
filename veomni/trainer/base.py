@@ -76,6 +76,7 @@ from .callbacks import (
     CheckpointCallback,
     EnvironMeterCallback,
     EvaluateCallback,
+    ExpertBiasCallback,
     GlobalStateCallback,
     MoERouterMonitorCallback,
     ProfileTraceCallback,
@@ -514,6 +515,7 @@ class BaseTrainer(Stateful, ABC):
         self.global_state_callback = GlobalStateCallback(trainer)
         self.evaluate_callback = EvaluateCallback(trainer)
         self.moe_monitor_callback = MoERouterMonitorCallback(trainer)
+        self.expert_bias_callback = ExpertBiasCallback(trainer)
         self.channel_loss_callback = ChannelLossCallback(trainer)
         # Ordered dispatch list. Callbacks own their ParallelState explicitly:
         # each captured it at construction (``Callback.parallel_state``), and
@@ -530,6 +532,10 @@ class BaseTrainer(Stateful, ABC):
             self.channel_loss_callback,
             self.wandb_callback,
             self.profile_callback,
+            # Before the checkpoint: the bias update writes a buffer that the
+            # checkpoint saves, so running it after would persist a bias one
+            # step stale while the load counts behind it are already gone.
+            self.expert_bias_callback,
             # Weights first, then the cursor: at resume the DCP load frees its
             # materialization buffers before the dataloader prefetches, and at
             # save a crash between the two leaves weights whose trainer state is

@@ -473,6 +473,7 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | seed | `int` | `42` | Random seed. |
 | max_steps | `Optional[int]` | `None` | Max training steps per epoch (debug only). |
 | moe_load_balance_monitor_interval | `int` | `0` | Log a globally reduced MoE expert-load heatmap every N steps. `0` disables monitoring. |
+| moe_router_bias_update_rate | `float` | `0.0` | Step size for the auxiliary-loss-free router bias update ([paper](https://arxiv.org/abs/2408.15664)). `0` disables it, leaving `e_score_correction_bias` frozen. Applies to routers carrying that buffer (DeepSeek-V3/V4, GLM-MoE); a model without them disables the update with a warning. Cannot be combined with `model.lora_config` on a model that has such routers: the update writes a buffer, while the adapter holds parameters only, so the trained routing would be dropped on adapter export. A DCP resume is unaffected, since it keeps buffers. |
 | wandb | `WandbConfig` | — | Weights & Biases logging. |
 | profile | `ProfileConfig` | — | Torch profiler settings. |
 | channel_loss | `ChannelLossConfig` | — | Detached per-channel causal-LM loss logging. |

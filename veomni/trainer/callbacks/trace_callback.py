@@ -32,6 +32,71 @@ if TYPE_CHECKING:
     from ..base import BaseTrainer, VeOmniArguments
 
 
+class ExpertBiasCallback(Callback):
+    """Updates the auxiliary-loss-free router bias once per optimizer step.
+
+    Gated by ``moe_router_bias_update_rate > 0``, and off by default: with the
+    rate at 0 the ``e_score_correction_bias`` buffer keeps the behaviour it has
+    had until now, frozen at whatever it was initialised or loaded with.
+
+    Separate from :class:`MoERouterMonitorCallback` on purpose. That one
+    samples load every N steps to draw a heatmap and may be paused; this one
+    affects what the model routes and has to run on every step, on every rank.
+    """
+
+    def __init__(self, trainer: "BaseTrainer") -> None:
+        super().__init__(trainer)
+        self.updater = None
+
+        args: "VeOmniArguments" = self.trainer.args
+        rate = args.train.moe_router_bias_update_rate
+        if rate <= 0.0:
+            return
+
+        from ...utils.expert_bias import ExpertBiasUpdater
+
+        self.updater = ExpertBiasUpdater(update_rate=rate)
+        logger.info_rank0(f"Expert bias update enabled: rate={rate}")
+
+    def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        if self.updater is None:
+            return
+
+        from ...utils.expert_bias import ensure_lora_can_carry_the_bias
+
+        attached = self.updater.attach(self.trainer.model)
+        if attached == 0:
+            logger.warning_rank0(
+                "moe_router_bias_update_rate > 0 but no router carrying "
+                "'e_score_correction_bias' was found in the model. The auxiliary-loss-free "
+                "bias update does not apply to this architecture; disabling it."
+            )
+            self.updater.disable()
+            self.updater = None
+        else:
+            # Only once routers are known: a LoRA adapter cannot carry these
+            # buffers, so the pair is rejected here rather than at config time,
+            # where a dense model would be rejected for a knob that does not
+            # apply to it.
+            ensure_lora_can_carry_the_bias(self.trainer.args.model.lora_config, attached)
+            logger.info_rank0(f"Expert bias update: attached to {attached} router module(s).")
+
+    def on_step_end(self, state: TrainerState, **kwargs) -> None:
+        if self.updater is None:
+            return
+        # fsdp_group is dp_sp: every rank holding a distinct token slice,
+        # sequence-parallel and expert-parallel ranks included. Both hold their
+        # own slice, so both belong in the sum. Narrowing it would leave ranks
+        # with divergent biases and divergent routing, since FSDP2 syncs no
+        # buffers; see the module docstring in veomni/utils/expert_bias.py.
+        self.updater.step(group=self.parallel_state.fsdp_group)
+
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        if self.updater is not None:
+            self.updater.disable()
+            self.updater = None
+
+
 class MoERouterMonitorCallback(Callback):
     """Monitors MoE expert load distribution and logs heatmaps to wandb.
 
