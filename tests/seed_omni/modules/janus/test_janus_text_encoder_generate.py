@@ -90,4 +90,7 @@ def test_generate_accepts_no_generation_kwargs_and_pads_the_cfg_prefix(monkeypat
         ConversationItem(type="text", value=torch.zeros(prompt_len, dtype=torch.long), role="user"),
         ConversationItem(type="output", value=torch.zeros(1, generated, 8), role="assistant", meta={}),
     ]
-    assert model._build_cfg_uncond_embeds(prompt).shape[-2] == prompt_len + generated
+    # The tail row's last position is the token the backbone feeds as the span's
+    # first input, so it must not also be in the prefix; counting it would put the
+    # unconditional branch one position ahead of the conditional one.
+    assert model._build_cfg_uncond_embeds(prompt).shape[-2] == prompt_len + generated - 1
