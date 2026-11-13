@@ -75,13 +75,18 @@ inference deployment.
 
 ## Configure training
 
-`torchao` is not part of any VeOmni extra. Install it alongside the GPU extra:
+`torchao` comes from the optional `float8` extra (shared with
+[float8 training](float8_training.md)), not from `gpu`:
 
 ```bash
-uv sync --locked --extra gpu --dev
+uv sync --locked --extra gpu --extra float8 --dev
 source .venv/bin/activate      # train.sh resolves torchrun from PATH
-uv pip install torchao==0.18.0
 ```
+
+With that extra installed, PEFT-format LoRA interop fails with `ImportError`:
+`peft==0.18.1` imports `LinearActivationQuantizedTensor`, which torchao 0.18.0
+removed. VeOmni's native LoRA is unaffected, and quantizing rows refuse LoRA on
+the projections they quantize anyway.
 
 Select the implementation under the model's existing ops config:
 
@@ -193,8 +198,9 @@ separate work.
 ## Tests
 
 ```bash
-uv pip install torchao==0.18.0   # not in any extra; the rows are optional
-pytest tests/ops/linear/ tests/ops/swiglu_mlp/ tests/models/transformers/qwen/test_qwen3.py -q
+uv sync --extra gpu --extra float8 --dev
+pytest tests/ops/linear/ tests/ops/swiglu_mlp/ tests/models/transformers/qwen/test_qwen3.py \
+  tests/models/test_qat_fsdp.py -q
 ```
 
 The op tests cover the registry rows, forward parity against torchao's own
@@ -204,8 +210,12 @@ and the group-width and dtype errors.
 Qwen3 model binds the selected row, that the `eager` row calls each projection
 module, that NVFP4 training produces finite gradients (CPU, and CUDA when
 available), and that a LoRA-wrapped projection is refused.
+`tests/models/test_qat_fsdp.py` is the two-GPU acceptance: physical two-rank
+FSDP2 on NCCL with both rows selected, covering accumulated updates over unequal
+micro-batches, FP32 masters and AdamW state across a DCP save and reload, and
+an HF export/reload round trip.
 
-**They skip when `torchao` is absent**, and `torchao` is in no VeOmni extra.
-CI therefore reports them as skipped, not passed: install `torchao` to run them,
-and treat a change that removes `torchao` from a test environment as reducing
-what is verified.
+**They skip when `torchao` is absent**, which is every job that installs only
+the `gpu` extra. CI therefore reports them as skipped, not passed: install the
+`float8` extra to run them, and treat a change that removes it from a test
+environment as reducing what is verified.
