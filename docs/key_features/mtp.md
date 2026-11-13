@@ -68,6 +68,12 @@ export behave exactly as they did before MTP support existed. There is deliberat
 no second boolean flag: `mtp_num_hidden_layers` describes the checkpoint architecture,
 and MTP is enabled only when both the layer count and loss weight are positive.
 
+Within one train step, `loss_weights` and `mtp_labels` cannot both be present,
+even on different micro-batches or ranks. The trainer rejects this combination
+at the start of `train_step`, before any micro-batch forward.
+This also applies when the template emits MTP labels but the MTP objective is
+disabled. Ordinary binary loss masks and unweighted MTP remain supported.
+
 The weight is applied inside the model, so **`training/mtp_loss` in the logs is the
 weighted contribution**. `BaseTrainer.postforward` sums the loss dict, so whatever is
 in it is the optimized objective. Set `mtp_loss_weight: 1.0` to read the raw MTP

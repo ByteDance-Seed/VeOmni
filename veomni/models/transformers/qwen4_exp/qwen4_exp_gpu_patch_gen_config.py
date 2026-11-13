@@ -59,7 +59,7 @@ from veomni.distributed.context_parallel.dsa_cp import all_gather_compressed_row
 from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state, use_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
-from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
+from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss, pop_loss_weights
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
@@ -191,7 +191,7 @@ config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import("veomni.models.utils.moe_utils", names=["merged_experts_act_fn_forward"])
-config.add_import("veomni.models.loss_utils", names=["ForCausalLMLoss", "load_balancing_loss"])
+config.add_import("veomni.models.loss_utils", names=["ForCausalLMLoss", "load_balancing_loss", "pop_loss_weights"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.add_import("veomni.utils.model_outputs", names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin"])
 config.add_import("veomni.utils.seqlen_pos_transform_utils", names=["pos2culen"])
@@ -2375,7 +2375,7 @@ def qwen4_exp_for_conditional_generation_forward_patched(
     **kwargs: Unpack[TransformersKwargs],
 ) -> tuple | Qwen4ExpCausalLMOutputWithLogProbs:
     # --- Patch.1: Forward the packed position-id layout to the VLM model. ---
-    position_ids_layout = kwargs.pop("qwen4_exp_position_ids_layout", None)
+    position_ids_layout, loss_weights = kwargs.pop("qwen4_exp_position_ids_layout", None), pop_loss_weights(kwargs)
     # --- Patch.1 ---
     outputs = self.model(
         input_ids=input_ids,
@@ -2407,7 +2407,7 @@ def qwen4_exp_for_conditional_generation_forward_patched(
             vocab_size=self.config.text_config.vocab_size,
             hidden_states=hidden_states,
             weights=self.lm_head.weight,
-            **kwargs,
+            **dict(kwargs, loss_weights=loss_weights),
         )
     else:
         logits = self.lm_head(hidden_states)

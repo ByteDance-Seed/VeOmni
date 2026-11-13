@@ -29,6 +29,7 @@ class ReduceLoss(torch.autograd.Function):
         num_valid_tokens: torch.Tensor,
         group=None,
     ) -> torch.Tensor:
+        """Reduce a local loss by its valid-token mass over the selected SP group."""
         # ``group`` defaults to the comm-global unified SP group (single-model
         # path). SeedOmni V2 passes each module's OWN SP group so heterogeneous
         # per-module SP reduces over the right ranks (the comm-global unified
@@ -49,7 +50,7 @@ class ReduceLoss(torch.autograd.Function):
         # This NaN propagates through element_mul_kernel in Liger backward,
         # corrupting the entire model via FSDP all-reduce.
         # Return zero loss instead to safely skip this micro-batch.
-        return loss / num_valid_tokens.clamp_min(1)
+        return loss / torch.where(num_valid_tokens > 0, num_valid_tokens, torch.ones_like(num_valid_tokens))
 
     @staticmethod
     def backward(
@@ -59,7 +60,12 @@ class ReduceLoss(torch.autograd.Function):
 
         # FIX: Mirror the forward guard — zero grad when global tokens = 0,
         # preventing NaN grad_output from corrupting downstream parameters.
-        grad_output = ctx.sp_world_size * local_num_tokens * grad_output / global_num_tokens.clamp(min=1)
+        grad_output = (
+            ctx.sp_world_size
+            * local_num_tokens
+            * grad_output
+            / torch.where(global_num_tokens > 0, global_num_tokens, torch.ones_like(global_num_tokens))
+        )
         return grad_output, None, None
 
 

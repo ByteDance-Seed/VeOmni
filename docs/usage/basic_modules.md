@@ -273,6 +273,33 @@ class CustomTemplate(ChatTemplate):
 
 `encode_messages` is the only method you have to write: training lays out tokens through it, including the assistant-only label mask that jinja cannot express. `get_jinja_template` is optional and read by nothing in the training or export path — an exported checkpoint keeps whatever chat template it shipped with, so selecting a template here never rewrites it.
 
+For text SFT examples containing message-level `loss_weight`, a custom template must
+expose `supports_loss_weights = True` and handle the weights in
+`encode_messages`. Otherwise [`process_conversation_example`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_transform.py)
+rejects the example before calling the template. The attribute can be inherited;
+an overriding encoder must preserve the weight handling or set it to `False`.
+When a fractional weight survives truncation on a supervised target, return
+`loss_weights` alongside `input_ids`, `attention_mask`, and `labels`: it must contain one finite float per
+token, aligned with `labels`, with values in `[0, 1]` (positive values must be
+normal FP32 values). Apply the same truncation to all four fields. Use zero for
+tokens excluded from supervision. For example, a three-token encoding could
+return labels `[-100, -100, 12]` and weights `[0.0, 0.0, 0.5]`.
+If all surviving target weights are binary, the template may instead encode
+weight 0 as label `-100`, leave weight 1 supervised, and omit `loss_weights`;
+the built-in ChatML template uses this optimization.
+
+The data collator packs and pads the weights with the corresponding labels. The
+training loss is `sum(weight * token_cross_entropy) / sum(weight)` over supervised
+targets: a single target weighted `0.5` is therefore not a halved mean loss. An
+entire step with zero supervised weight is rejected. An entirely unweighted step
+uses normal supervision. In a mixed batch, samples without `loss_weights` receive
+weight 1 for supervised labels and share the weighted denominator.
+
+Any non-`None` `loss_weights` field currently requires the VeOmni `qwen4_exp`
+VLM model and `chunk_loss`; it is not supported with DPO, MTP targets or router
+auxiliary loss. See [per-message loss weights](multimodal_data_processing.md#per-message-loss-weights-for-qwen-vl)
+for the supported configurations and other restrictions.
+
 
 ## DataLoader
 VeOmni offered a flexible and powerful dataloader implementation, which supports

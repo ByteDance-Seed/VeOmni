@@ -24,6 +24,8 @@ To add custom preprocessors, simply define a function and decorate it with @regi
 import random
 import re
 
+import numpy as np
+
 from ...utils.registry import Registry
 
 
@@ -31,7 +33,33 @@ PREPROCESSOR_REGISTRY = Registry("preprocessor")
 
 
 def conv_preprocess(source: str, conversations, **kwargs):
+    """Dispatch multimodal preprocessing without silently dropping loss weights."""
+
+    # These preprocessors construct new modality records and do not preserve
+    # per-message supervision metadata. Fail explicitly rather than silently
+    # training with unit weights when a dataset supplies loss_weight.
+    def has_weight(record):
+        """Find explicit weights in nested conversation records."""
+        if isinstance(record, dict):
+            if record.get("loss_weight") is not None:
+                return True
+            return any(has_weight(record[k]) for k in ("messages", "conversations") if k in record)
+        if isinstance(record, (list, tuple, np.ndarray)):
+            return any(has_weight(item) for item in record)
+        return False
+
+    preserve_supervision = kwargs.get("preserve_loss_supervision", False)
+    supported = source in {"sharegpt4v_sft", "sharegpt4v_captioner_sft"}
+    if has_weight(conversations) and not (supported and preserve_supervision):
+        raise ValueError("loss_weight is not supported by this multimodal conversation preprocessor")
     return PREPROCESSOR_REGISTRY[source](conversations, **kwargs)
+
+
+def conv_preprocess_qwen_vl(source: str, conversations, **kwargs):
+    """Preserve supported turn supervision in the Qwen-VL data path."""
+    from . import conv_preprocess as dispatch
+
+    return dispatch(source, conversations, **{**kwargs, "preserve_loss_supervision": True})
 
 
 # ============================================================================
@@ -65,6 +93,7 @@ def sharegpt4v_pretrain_preprocess(conversations, generation_ratio=0.0, **kwargs
 @PREPROCESSOR_REGISTRY.register("sharegpt4v_captioner_sft")
 @PREPROCESSOR_REGISTRY.register("sharegpt4v_sft")
 def sharegpt4v_sft_preprocess(conversations, **kwargs):
+    """Convert ShareGPT4V turns and optionally preserve supervision metadata."""
     role_mapping = {"human": "user", "gpt": "assistant"}
     constructed_conversation = []
     if conversations[0]["from"] != "human":  # Skip the first one if it is not from human
@@ -76,9 +105,14 @@ def sharegpt4v_sft_preprocess(conversations, **kwargs):
         role = role_mapping[message["from"]]
         if "<image>" in value:
             value = value.replace("<image>", "")
-            constructed_conversation.append([role, ("image", None), ("text", value)])
+            converted = [role, ("image", None), ("text", value)]
         else:
-            constructed_conversation.append([role, ("text", value)])
+            converted = [role, ("text", value)]
+        if kwargs.get("preserve_loss_supervision", False):
+            for key in ("loss_mask", "loss_weight"):
+                if message.get(key) is not None:
+                    converted.append((key, message[key]))
+        constructed_conversation.append(converted)
     return constructed_conversation
 
 

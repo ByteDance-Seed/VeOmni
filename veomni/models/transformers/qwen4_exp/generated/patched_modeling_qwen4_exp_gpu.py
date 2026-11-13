@@ -134,7 +134,7 @@ from veomni.distributed.parallel_state import _init_parallel_state, get_parallel
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
 from veomni.distributed.sequence_parallel.gdn_exchange import coalesced_gather_aligned
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
-from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
+from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss, pop_loss_weights
 
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
@@ -3882,7 +3882,7 @@ class Qwen4ExpForConditionalGeneration(Qwen4ExpPreTrainedModel, GenerationMixin)
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen4ExpCausalLMOutputWithLogProbs:
         # --- Patch.1: Forward the packed position-id layout to the VLM model. ---
-        position_ids_layout = kwargs.pop("qwen4_exp_position_ids_layout", None)
+        position_ids_layout, loss_weights = kwargs.pop("qwen4_exp_position_ids_layout", None), pop_loss_weights(kwargs)
         # --- Patch.1 ---
         outputs = self.model(
             input_ids=input_ids,
@@ -3914,7 +3914,7 @@ class Qwen4ExpForConditionalGeneration(Qwen4ExpPreTrainedModel, GenerationMixin)
                 vocab_size=self.config.text_config.vocab_size,
                 hidden_states=hidden_states,
                 weights=self.lm_head.weight,
-                **kwargs,
+                **dict(kwargs, loss_weights=loss_weights),
             )
         else:
             logits = self.lm_head(hidden_states)
