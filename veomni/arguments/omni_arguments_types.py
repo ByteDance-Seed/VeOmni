@@ -347,6 +347,10 @@ def build_omni_module_runtime_args(
         merged = deepcopy(base_dict)
         for layer in (checkpoint_defaults.get(name, {}), inference_default, override or {}):
             _deep_update(merged, layer)
+        fsdp_config = merged["accelerator"]["fsdp_config"]
+        if for_inference and fsdp_config["fsdp_mode"] == "eager":
+            # Eager inference has no FSDP wrapper, even when the training YAML selects Hyper.
+            fsdp_config["fsdp_backend"] = "torch"
         runtime_modules[name] = _instantiate_recursive(OmniModuleRuntimeArguments, merged)
     return runtime_modules
 

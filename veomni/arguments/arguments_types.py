@@ -100,6 +100,10 @@ class OptimizerConfig:
             )
         },
     )
+    use_hyper_optimizer: bool = field(
+        default=False,
+        metadata={"help": "Use Hyper Muon independently of the FSDP backend."},
+    )
     lr: float = field(
         default=5e-5,
         metadata={"help": "Maximum learning rate or default learning rate, or init learning rate for warmup."},
@@ -301,6 +305,8 @@ class OptimizerConfig:
                 raise ValueError(
                     f"model.optimizer.state_offload='cpu' is only supported for type='adamw'; got type={self.type!r}."
                 )
+        if self.use_hyper_optimizer and self.type != "muon":
+            raise ValueError("use_hyper_optimizer requires optimizer.type='muon'.")
 
 
 @dataclass
@@ -703,9 +709,39 @@ def validate_expert_fsdp_shard_dim(dim, *, fsdp_mode="fsdp2"):
 
 
 @dataclass
+class HyperParallelFSDPConfig:
+    """Optional Hyper-specific controls under the shared FSDP configuration."""
+
+    comm_fusion: bool = False
+    comm_fusion_zero_copy: Optional[bool] = None
+    wrap_policy: Literal["block"] = "block"
+    forward_prefetch_depth: int = 2
+    backward_prefetch_depth: int = 1
+    reduce_comm_interval: int = 1
+
+    def __post_init__(self):
+        if type(self.comm_fusion) is not bool:
+            raise ValueError("hyper_parallel.comm_fusion must be bool.")
+        if self.comm_fusion_zero_copy is not None and type(self.comm_fusion_zero_copy) is not bool:
+            raise ValueError("hyper_parallel.comm_fusion_zero_copy must be bool or null.")
+        if self.comm_fusion_zero_copy is True and not self.comm_fusion:
+            raise ValueError("comm_fusion_zero_copy=true requires comm_fusion=true.")
+        if self.wrap_policy != "block":
+            raise ValueError("Only hyper_parallel.wrap_policy='block' is currently supported.")
+        for name in ("forward_prefetch_depth", "backward_prefetch_depth", "reduce_comm_interval"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"hyper_parallel.{name} must be a positive integer.")
+
+
+@dataclass
 class FSDPConfig:
     """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
+    fsdp_backend: Literal["torch", "hyper_parallel"] = field(
+        default="torch",
+        metadata={"help": "FSDP implementation; independent of optimizer selection."},
+    )
     fsdp_mode: Literal["ddp", "fsdp2", "eager"] = field(
         default="fsdp2",
         metadata={
@@ -791,6 +827,7 @@ class FSDPConfig:
         },
     )
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
+    hyper_parallel: HyperParallelFSDPConfig = field(default_factory=HyperParallelFSDPConfig)
 
     def __post_init__(self):
         if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
@@ -799,6 +836,10 @@ class FSDPConfig:
                 "switch to fsdp_mode='fsdp2' (with model.accelerator.init_device='meta'), "
                 "'ddp', or 'eager'."
             )
+        if self.fsdp_backend not in ("torch", "hyper_parallel"):
+            raise ValueError("fsdp_backend must be 'torch' or 'hyper_parallel'.")
+        if self.fsdp_backend == "hyper_parallel" and self.fsdp_mode != "fsdp2":
+            raise ValueError("hyper_parallel requires fsdp_mode='fsdp2'.")
         if self.fsdp_scope not in ("module", "model"):
             raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
         if not isinstance(self.expert_weight_fp8_all_gather, bool):

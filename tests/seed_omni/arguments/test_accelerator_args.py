@@ -12,8 +12,10 @@ chain (``configs/seed_omni/fake_model/``), so they need no real model config.
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -240,6 +242,258 @@ def test_build_omni_model_runtime_args_for_inference_forces_eager_without_broadc
     assert modules[MODULE_B].broadcast_model_weights_from_rank0 is False
     assert modules[MODULE_A].accelerator.fsdp_config.fsdp_mode == "ddp"
     assert "broadcast_model_weights_from_rank0" not in veomni_caplog.text
+
+
+@pytest.mark.parametrize("backend", ["torch", "hyper_parallel"])
+@pytest.mark.parametrize("module_backend", [None, "hyper_parallel"])
+def test_hyper_training_config_accepts_standard_eager_inference_overlay(module_backend, backend):
+    accelerator = AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_backend=backend))
+    training_modules = {
+        name: {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}}} for name in (MODULE_A, MODULE_B)
+    }
+    if module_backend is not None:
+        for module in training_modules.values():
+            module["accelerator"]["fsdp_config"]["fsdp_backend"] = module_backend
+    args = _fake_args(modules_override=training_modules, accelerator=accelerator)
+    training = build_omni_model_runtime_args(args)
+    expected_backend = module_backend or backend
+    assert all(module.accelerator.fsdp_config.fsdp_backend == expected_backend for module in training.modules.values())
+    distributed_inference = build_omni_model_runtime_args(args, for_inference=True)
+    assert all(
+        module.accelerator.fsdp_config.fsdp_backend == expected_backend
+        for module in distributed_inference.modules.values()
+    )
+
+    with open(_cfg_dir() / "infer/modules_infer_eager.yaml") as handle:
+        eager_overlay = yaml.safe_load(handle)
+    for name, overlay in eager_overlay.items():
+        args.model.model_config["modules"][name]["accelerator"]["fsdp_config"].update(
+            overlay["accelerator"]["fsdp_config"]
+        )
+    inference = build_omni_model_runtime_args(args, for_inference=True)
+    for module in inference.modules.values():
+        assert module.accelerator.fsdp_config.fsdp_mode == "eager"
+        assert module.accelerator.fsdp_config.fsdp_backend == "torch"
+    assert args.model.accelerator.fsdp_config.fsdp_backend == backend
+
+
+@pytest.mark.parametrize("backend", ["torch", "hyper_parallel"])
+def test_omni_setup_does_not_resolve_or_activate_model_configuration(monkeypatch, backend):
+    from veomni.trainer.omni import omni_trainer
+
+    args = _fake_args(accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_backend=backend)))
+    resolve = Mock(side_effect=AssertionError("setup must not resolve model configuration"))
+    activate = Mock(side_effect=AssertionError("setup must not activate model adapters"))
+    monkeypatch.setattr(omni_trainer, "build_omni_model_runtime_args", resolve)
+    monkeypatch.setattr(omni_trainer, "_apply_hyper_parallel_patch", activate)
+    accelerator = Mock()
+    init_process_group = Mock()
+    init_parallel_state = Mock()
+    save_args = Mock()
+    checkpoint_debug = Mock()
+    monkeypatch.setattr(omni_trainer, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(omni_trainer, "get_torch_device", lambda: accelerator)
+    monkeypatch.setattr(omni_trainer, "get_dist_comm_backend", lambda: "gloo")
+    monkeypatch.setattr(omni_trainer.dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(omni_trainer.dist, "init_process_group", init_process_group)
+    monkeypatch.setattr(omni_trainer, "init_parallel_state_from_config", init_parallel_state)
+    monkeypatch.setattr(omni_trainer, "save_args", save_args)
+    monkeypatch.setattr(omni_trainer, "set_checkpoint_debug_enabled", checkpoint_debug)
+    for name in ("set_seed", "enable_high_precision_for_bf16", "enable_third_party_logging"):
+        monkeypatch.setattr(omni_trainer.helper, name, Mock())
+
+    device = omni_trainer.OmniTrainer._setup(args)
+
+    assert str(device) == f"cpu:{args.train.local_rank}"
+    accelerator.set_device.assert_called_once_with(str(device))
+    init_process_group.assert_called_once_with(backend="gloo")
+    init_parallel_state.assert_called_once_with(args.model.accelerator, name="base")
+    omni_trainer.helper.set_seed.assert_called_once_with(args.train.seed, args.train.enable_full_determinism)
+    omni_trainer.helper.enable_high_precision_for_bf16.assert_called_once_with()
+    if args.train.local_rank == 0:
+        omni_trainer.helper.enable_third_party_logging.assert_called_once_with()
+    if args.train.global_rank == 0:
+        save_args.assert_called_once_with(args, args.train.checkpoint.output_dir)
+    checkpoint_debug.assert_called_once_with(args.model.accelerator.gradient_checkpointing.debug)
+    resolve.assert_not_called()
+    activate.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["eager", "ddp", "fsdp2"])
+def test_omni_inference_does_not_import_hyper_for_unused_training_flags(monkeypatch, mode):
+    from veomni.trainer.omni import omni_inferencer, omni_trainer
+
+    args = _fake_args(
+        accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_backend="hyper_parallel")),
+        modules_override={
+            name: {
+                "accelerator": {
+                    "fsdp_config": {"fsdp_mode": mode if name == MODULE_A else "eager", "fsdp_backend": "torch"}
+                }
+            }
+            for name in (MODULE_A, MODULE_B)
+        },
+    )
+    args.model.optimizer.type = "muon"
+    args.model.optimizer.use_hyper_optimizer = True
+    monkeypatch.setitem(sys.modules, "hyper_parallel.integration.veomni", None)
+    setup = Mock()
+    resolve = Mock(wraps=build_omni_model_runtime_args)
+    monkeypatch.setattr(omni_trainer.OmniTrainer, "_setup", setup)
+    monkeypatch.setattr(omni_inferencer, "build_omni_model_runtime_args", resolve)
+    monkeypatch.setattr(omni_inferencer.helper, "set_seed", Mock())
+    monkeypatch.setattr(
+        omni_inferencer.OmniInferencer, "_build_model", Mock(side_effect=RuntimeError("stop before model build"))
+    )
+    with pytest.raises(RuntimeError, match="stop before model build"):
+        omni_inferencer.OmniInferencer(args)
+    resolve.assert_called_once_with(args, for_inference=True)
+    if mode == "eager":
+        setup.assert_not_called()
+    else:
+        setup.assert_called_once_with(args, save_launch_args=False)
+
+
+@pytest.mark.parametrize(
+    "scope,root_mode,module_mode",
+    [
+        ("module", "fsdp2", "fsdp2"),
+        ("model", "fsdp2", "fsdp2"),
+        ("model", "fsdp2", "ddp"),
+        ("model", "eager", "fsdp2"),
+    ],
+)
+def test_omni_inference_keeps_hyper_for_actual_fsdp_wrapping(monkeypatch, scope, root_mode, module_mode):
+    from veomni.trainer.omni import omni_inferencer, omni_trainer
+
+    composed = scope == "model" and root_mode != "eager"
+    args = _fake_args(
+        accelerator=AcceleratorConfig(
+            fsdp_config=FSDPConfig(
+                fsdp_backend="hyper_parallel" if composed else "torch", fsdp_scope=scope, fsdp_mode=root_mode
+            )
+        ),
+        modules_override={
+            name: {
+                "accelerator": {
+                    "fsdp_config": {
+                        "fsdp_mode": module_mode,
+                        "fsdp_backend": "torch" if composed else "hyper_parallel",
+                    }
+                }
+            }
+            for name in (MODULE_A, MODULE_B)
+        },
+    )
+    args.model.optimizer.type = "muon"
+    args.model.optimizer.use_hyper_optimizer = True
+    adapter = ModuleType("hyper_parallel.integration.veomni")
+    adapter.apply_hyper_parallel_patch = Mock()
+    monkeypatch.setitem(sys.modules, adapter.__name__, adapter)
+    setup = Mock()
+    monkeypatch.setattr(omni_trainer.OmniTrainer, "_setup", setup)
+    monkeypatch.setattr(omni_inferencer.helper, "set_seed", Mock())
+    monkeypatch.setattr(
+        omni_inferencer.OmniInferencer, "_build_model", Mock(side_effect=RuntimeError("stop before model build"))
+    )
+    with pytest.raises(RuntimeError, match="stop before model build"):
+        omni_inferencer.OmniInferencer(args)
+    setup.assert_called_once_with(args, save_launch_args=False)
+    assert adapter.apply_hyper_parallel_patch.call_count == 1
+    assert adapter.apply_hyper_parallel_patch.call_args.kwargs == {"for_inference": True}
+
+
+@pytest.mark.parametrize("fsdp,muon", [(True, False), (False, True), (True, True)])
+def test_omni_training_does_not_import_hyper_for_overridden_root_defaults(monkeypatch, fsdp, muon):
+    from veomni.trainer.base import _apply_hyper_parallel_patch
+
+    args = _fake_args(
+        accelerator=AcceleratorConfig(
+            fsdp_config=FSDPConfig(fsdp_backend="hyper_parallel" if fsdp else "torch", fsdp_scope="module")
+        ),
+        modules_override={
+            name: {
+                "accelerator": {"fsdp_config": {"fsdp_backend": "torch"}},
+                "optimizer": {"type": "adamw", "use_hyper_optimizer": False},
+            }
+            for name in (MODULE_A, MODULE_B)
+        },
+    )
+    args.model.optimizer.type = "muon" if muon else "adamw"
+    args.model.optimizer.use_hyper_optimizer = muon
+    resolved = build_omni_model_runtime_args(args)
+    monkeypatch.setitem(sys.modules, "hyper_parallel.integration.veomni", None)
+
+    _apply_hyper_parallel_patch(resolved)
+
+
+@pytest.mark.parametrize("fsdp,muon", [(True, False), (False, True), (True, True)])
+def test_omni_training_uses_composed_fsdp_and_module_optimizer_selections(monkeypatch, fsdp, muon):
+    from veomni.trainer.base import _apply_hyper_parallel_patch
+
+    args = _fake_args(
+        accelerator=AcceleratorConfig(
+            fsdp_config=FSDPConfig(fsdp_backend="hyper_parallel" if fsdp else "torch", fsdp_scope="model")
+        ),
+        modules_override={
+            name: {
+                "accelerator": {"fsdp_config": {"fsdp_backend": "torch"}},
+                "optimizer": {"type": "muon" if muon else "adamw", "use_hyper_optimizer": muon},
+            }
+            for name in (MODULE_A, MODULE_B)
+        },
+    )
+    resolved = build_omni_model_runtime_args(args)
+    adapter = ModuleType("hyper_parallel.integration.veomni")
+    adapter.apply_hyper_parallel_patch = Mock()
+    monkeypatch.setitem(sys.modules, adapter.__name__, adapter)
+
+    _apply_hyper_parallel_patch(resolved)
+
+    adapter.apply_hyper_parallel_patch.assert_called_once_with(resolved, for_inference=False)
+
+
+@pytest.mark.parametrize("fsdp,muon", [(False, False), (True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("modules_from_file", [False, True])
+def test_omni_model_build_reads_module_only_hyper_selection(monkeypatch, tmp_path, fsdp, muon, modules_from_file):
+    from veomni.trainer.omni import omni_trainer
+
+    overrides = {
+        name: {
+            "accelerator": {
+                "fsdp_config": {"fsdp_mode": "fsdp2", "fsdp_backend": "hyper_parallel" if fsdp else "torch"}
+            }
+        }
+        for name in (MODULE_A, MODULE_B)
+    }
+    overrides[MODULE_B]["optimizer"] = {"type": "muon" if muon else "adamw", "use_hyper_optimizer": muon}
+    args = _fake_args(modules_override=overrides)
+    if modules_from_file:
+        modules_path = tmp_path / "modules.yaml"
+        modules_path.write_text(yaml.safe_dump(args.model.model_config["modules"]))
+        args.model.model_config["modules"] = str(modules_path)
+    adapter = ModuleType("hyper_parallel.integration.veomni")
+    adapter.apply_hyper_parallel_patch = Mock()
+    monkeypatch.setitem(sys.modules, adapter.__name__, adapter)
+    resolve = Mock(wraps=build_omni_model_runtime_args)
+    monkeypatch.setattr(omni_trainer, "build_omni_model_runtime_args", resolve)
+    monkeypatch.setattr(
+        omni_trainer, "build_omni_model_runtime", Mock(side_effect=RuntimeError("stop before model build"))
+    )
+    trainer = omni_trainer.OmniTrainer.__new__(omni_trainer.OmniTrainer)
+    trainer.args = args
+    with pytest.raises(RuntimeError, match="stop before model build"):
+        trainer._build_model_runtime()
+    resolve.assert_called_once_with(args)
+    assert adapter.apply_hyper_parallel_patch.call_count == int(fsdp or muon)
+    if fsdp or muon:
+        selected = adapter.apply_hyper_parallel_patch.call_args.args[0]
+        assert selected.modules[MODULE_B].accelerator.fsdp_config.fsdp_backend == (
+            "hyper_parallel" if fsdp else "torch"
+        )
+        assert selected.modules[MODULE_B].optimizer.use_hyper_optimizer is muon
+    assert args.model.accelerator.fsdp_config.fsdp_backend == "torch"
+    assert args.model.optimizer.use_hyper_optimizer is False
 
 
 def test_build_omni_model_runtime_args_validates_each_module_accelerator():

@@ -114,6 +114,7 @@ def test_async_activation_offload_is_reset_only_on_modules_that_enable_it(monkey
 
 
 def test_the_trainer_refuses_a_model_with_nothing_to_train(monkeypatch):
+    monkeypatch.setattr("veomni.trainer.omni.omni_trainer._apply_hyper_parallel_patch", MagicMock())
     monkeypatch.setattr("veomni.trainer.omni.omni_trainer.build_omni_model_runtime_args", MagicMock())
     monkeypatch.setattr(
         "veomni.trainer.omni.omni_trainer.build_omni_model_runtime",
@@ -128,6 +129,7 @@ def test_the_trainer_refuses_a_model_with_nothing_to_train(monkeypatch):
 
 def test_an_offline_embedding_run_may_build_no_optimizer(monkeypatch):
     """Every module is frozen in ``offline_embedding``, so it trains nothing by design."""
+    monkeypatch.setattr("veomni.trainer.omni.omni_trainer._apply_hyper_parallel_patch", MagicMock())
     monkeypatch.setattr("veomni.trainer.omni.omni_trainer.build_omni_model_runtime_args", MagicMock())
     built = SimpleNamespace(optimizer=None)
     monkeypatch.setattr("veomni.trainer.omni.omni_trainer.build_omni_model_runtime", MagicMock(return_value=built))
