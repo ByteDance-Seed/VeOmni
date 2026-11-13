@@ -27,6 +27,7 @@ the ``requires_grad`` policy, and PEFT-format save/load.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any
 
 import torch.nn as nn
@@ -118,6 +119,7 @@ class VeOmniLoraModel(nn.Module):
     ) -> None:
         super().__init__()
         self.base_model = LoraModel(model, config, adapter_name=adapter_name, inject=inject)
+        self._adapters_unloaded = False
         self.active_adapter = adapter_name
 
     # ------------------------------------------------------------------
@@ -130,6 +132,32 @@ class VeOmniLoraModel(nn.Module):
 
     def get_base_model(self) -> nn.Module:
         return self.base_model.model
+
+    @contextmanager
+    def disable_adapter(self):
+        """Temporarily bypass dense adapters for reference-policy inference.
+
+        Restores every layer's previous state, including on nested use or an
+        exception. Merged weights and expert adapters require separate handling
+        and are rejected before any layer is changed.
+        """
+        from .layers import LoraLinear
+
+        if self._adapters_unloaded:
+            raise ValueError("disable_adapter() cannot bypass adapters after they have been merged and unloaded.")
+        if self.get_lora_config().has_moe:
+            raise NotImplementedError("disable_adapter() currently supports dense LoRA only.")
+        layers = [module for module in self.modules() if isinstance(module, LoraLinear)]
+        if any(layer.merged for layer in layers):
+            raise ValueError("disable_adapter() requires unmerged LoRA layers.")
+        previous = [layer.disable_adapters for layer in layers]
+        try:
+            for layer in layers:
+                layer.disable_adapters = True
+            yield
+        finally:
+            for layer, disabled in zip(layers, previous):
+                layer.disable_adapters = disabled
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self.base_model(*args, **kwargs)
@@ -233,4 +261,5 @@ class VeOmniLoraModel(nn.Module):
             module.merge()
             _replace_module(base, fqn, module.base_layer)
 
+        self._adapters_unloaded = True
         return base
