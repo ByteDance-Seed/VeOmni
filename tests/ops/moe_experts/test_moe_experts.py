@@ -637,17 +637,30 @@ def test_triton_split_and_merged_match_eager(swiglu_limit: float | None):
 def test_triton_merged_swiglu_preserves_staged_rounding(dtype, shape, swiglu_limit):
     """Match materialized ATen SiLU for merged views and clamped inputs."""
     require_nvidia_cuda("triton")
-    from veomni.ops.kernels.moe_experts.shared.swiglu import apply_swiglu_clamp, merged_swiglu_forward
+    from veomni.ops.kernels.moe_experts.shared.swiglu import (
+        apply_swiglu_clamp,
+        merged_swiglu_backward,
+        merged_swiglu_forward,
+    )
 
     torch.manual_seed(919)
     rows, columns = shape
     merged = torch.randn(rows, 2 * columns, device="cuda", dtype=dtype)
-    gate, up = apply_swiglu_clamp(*merged.chunk(2, dim=-1), swiglu_limit)[:2]
+    gate, up, gate_mask, up_mask = apply_swiglu_clamp(*merged.chunk(2, dim=-1), swiglu_limit)
     gate_before, up_before = gate.clone(), up.clone()
     expected = torch.ops.aten.silu(gate) * up
     actual = merged_swiglu_forward(gate, up)
+    grad = torch.randn_like(gate)
+    activation, packed_grad = merged_swiglu_backward(gate, up, grad, gate_mask, up_mask)
+    expected_gate_grad = torch.ops.aten.silu_backward(grad * up, gate)
+    expected_up_grad = torch.ops.aten.silu(gate) * grad
+    if gate_mask is not None:
+        expected_gate_grad.masked_fill_(~gate_mask, 0)
+        expected_up_grad.masked_fill_(~up_mask, 0)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(activation, expected, rtol=0, atol=0)
+    torch.testing.assert_close(packed_grad, torch.cat([expected_gate_grad, expected_up_grad], dim=-1), rtol=0, atol=0)
     torch.testing.assert_close(gate, gate_before, rtol=0, atol=0)
     torch.testing.assert_close(up, up_before, rtol=0, atol=0)
     assert actual.shape == shape and actual.dtype == dtype and actual.is_contiguous()
@@ -706,6 +719,17 @@ def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, 
     assert calls == [(tokens * top_k, intermediate), (tokens, intermediate)]
 
     monkeypatch.setattr(swiglu, "merged_swiglu_forward", lambda gate_input, up: torch.ops.aten.silu(gate_input) * up)
+
+    def staged_backward(gate_input, up, grad, gate_mask=None, up_mask=None):
+        silu = torch.ops.aten.silu(gate_input)
+        grad_gate = torch.ops.aten.silu_backward(grad * up, gate_input)
+        grad_up = silu * grad
+        if gate_mask is not None:
+            grad_gate.masked_fill_(~gate_mask, 0)
+            grad_up.masked_fill_(~up_mask, 0)
+        return silu * up, torch.cat([grad_gate, grad_up], dim=-1)
+
+    monkeypatch.setattr(swiglu, "merged_swiglu_backward", staged_backward)
     expected, expected_grads = run()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
@@ -719,6 +743,23 @@ def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, 
     for actual_grad, expected_grad in zip(ep_grads, ep_ref_grads):
         assert torch.isfinite(actual_grad).all()
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_merged_swiglu_backward_cpu_preserves_clamp_gradients():
+    """The non-NVIDIA fallback matches autograd through the original clamped inputs."""
+    from veomni.ops.kernels.moe_experts.shared.swiglu import apply_swiglu_clamp, merged_swiglu_backward
+
+    torch.manual_seed(3)
+    gate = torch.randn(5, 33, requires_grad=True)
+    up = torch.randn_like(gate, requires_grad=True)
+    grad = torch.randn_like(gate)
+    clamped_gate, clamped_up, gate_mask, up_mask = apply_swiglu_clamp(gate, up, 0.5)
+    expected = torch.ops.aten.silu(clamped_gate) * clamped_up
+    expected_grads = torch.autograd.grad(expected, (gate, up), grad)
+    activation, packed_grad = merged_swiglu_backward(clamped_gate, clamped_up, grad, gate_mask, up_mask)
+    torch.testing.assert_close(activation, expected, rtol=0, atol=0)
+    torch.testing.assert_close(packed_grad, torch.cat(expected_grads, dim=-1), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

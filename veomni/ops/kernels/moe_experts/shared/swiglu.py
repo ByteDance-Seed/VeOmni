@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SwiGLU clamping and merged-FC1 forward activation shared across MoE experts."""
+"""SwiGLU clamping and merged-FC1 forward/backward shared across MoE experts."""
 
 from __future__ import annotations
 
@@ -78,3 +78,56 @@ def merged_swiglu_forward(gate: Tensor, up: Tensor) -> Tensor:
             enable_fp_fusion=False,
         )
     return output
+
+
+def merged_swiglu_backward(
+    gate: Tensor, up: Tensor, grad: Tensor, gate_mask: Tensor | None = None, up_mask: Tensor | None = None
+) -> tuple[Tensor, Tensor]:
+    """Recompute the activation and packed FC1 gradients with staged rounding.
+
+    Clamp masks are the contiguous masks returned by ``apply_swiglu_clamp``.
+    Non-NVIDIA backends retain the materialized ATen expressions.
+    """
+    assert gate.ndim == 2 and up.shape == grad.shape == gate.shape
+    assert gate.device == up.device == grad.device
+    assert (gate_mask is None) == (up_mask is None)
+    if not is_nvidia_cuda_device(gate.device):
+        silu = torch.ops.aten.silu(gate)
+        grad_gate = torch.ops.aten.silu_backward(grad * up, gate)
+        grad_up = silu * grad
+        if gate_mask is not None:
+            grad_gate.masked_fill_(~gate_mask, 0)
+            grad_up.masked_fill_(~up_mask, 0)
+        return silu * up, torch.cat([grad_gate, grad_up], dim=-1)
+    assert gate.dtype == up.dtype == grad.dtype and gate.dtype in (torch.bfloat16, torch.float16)
+    if gate_mask is not None:
+        assert gate_mask.shape == up_mask.shape == gate.shape
+        assert gate_mask.is_contiguous() and up_mask.is_contiguous()
+    activation = gate.new_empty(gate.shape)
+    packed_grad = gate.new_empty((gate.shape[0], 2 * gate.shape[1]))
+    if activation.numel() == 0:
+        return activation, packed_grad
+    from ._triton_swiglu import _merged_swiglu_backward_kernel
+
+    with get_torch_device().device(gate.device):
+        _merged_swiglu_backward_kernel[((activation.numel() + 1023) // 1024,)](
+            gate,
+            up,
+            grad,
+            gate_mask,
+            up_mask,
+            activation,
+            packed_grad,
+            activation.numel(),
+            columns=gate.shape[1],
+            gate_stride_m=gate.stride(0),
+            gate_stride_n=gate.stride(1),
+            up_stride_m=up.stride(0),
+            up_stride_n=up.stride(1),
+            grad_stride_m=grad.stride(0),
+            grad_stride_n=grad.stride(1),
+            CLAMPED=gate_mask is not None,
+            BLOCK_SIZE=1024,
+            enable_fp_fusion=False,
+        )
+    return activation, packed_grad
