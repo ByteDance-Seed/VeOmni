@@ -741,7 +741,8 @@ with model.disable_adapter():
 
 The context restores the previous state on exit, including nested contexts and
 exceptions. It requires unmerged dense adapters; expert adapters are not yet
-supported. To use the result as a frozen base reference policy, train with
+supported. Calls on the retained wrapper after `merge_and_unload()` are also
+rejected because the base weights already include the adapter deltas. To use the result as a frozen base reference policy, train with
 `bias="none"` and no extra trainable base modules. Disabling adapters does not
 undo updates to trainable base biases or other base parameters. Keep the context
 active for any backward recomputation if using it outside inference.

@@ -119,6 +119,7 @@ class VeOmniLoraModel(nn.Module):
     ) -> None:
         super().__init__()
         self.base_model = LoraModel(model, config, adapter_name=adapter_name, inject=inject)
+        self._adapters_unloaded = False
         self.active_adapter = adapter_name
 
     # ------------------------------------------------------------------
@@ -142,6 +143,8 @@ class VeOmniLoraModel(nn.Module):
         """
         from .layers import LoraLinear
 
+        if self._adapters_unloaded:
+            raise ValueError("disable_adapter() cannot bypass adapters after they have been merged and unloaded.")
         if self.get_lora_config().has_moe:
             raise NotImplementedError("disable_adapter() currently supports dense LoRA only.")
         layers = [module for module in self.modules() if isinstance(module, LoraLinear)]
@@ -258,4 +261,5 @@ class VeOmniLoraModel(nn.Module):
             module.merge()
             _replace_module(base, fqn, module.base_layer)
 
+        self._adapters_unloaded = True
         return base

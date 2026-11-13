@@ -351,3 +351,48 @@ def test_disable_adapter_rejects_merged_layers_before_changing_flags():
         with model.disable_adapter():
             pytest.fail("Merged weights cannot provide the base-policy reference")
     assert all(not layer.disable_adapters for layer in layers)
+
+
+@pytest.mark.parametrize("moe_mode", ["independent", "shared"])
+def test_disable_adapter_rejects_moe_before_changing_flags(moe_mode):
+    """Unsupported expert adapters preserve mixed dense adapter states."""
+    base = Toy()
+    base.experts = nn.Module()
+    base.experts.num_experts = 2
+    base.experts.hidden_dim = 32
+    base.experts.intermediate_dim = 32
+    base.experts.gate_up_proj = nn.Parameter(torch.randn(2, 64, 32))
+    base.experts.down_proj = nn.Parameter(torch.randn(2, 32, 32))
+    base.experts.act_fn = nn.SiLU()
+    model = VeOmniLoraModel(
+        base,
+        _base_config(
+            target_parameters=["experts.gate_up_proj", "experts.down_proj"],
+            moe_mode=moe_mode,
+        ),
+    )
+    layers = [m for m in model.modules() if isinstance(m, LoraLinear)]
+    assert len(layers) == 2
+    layers[0].disable_adapters = True
+    previous = [layer.disable_adapters for layer in layers]
+    with pytest.raises(NotImplementedError, match="dense LoRA only"):
+        with model.disable_adapter():
+            pytest.fail("Expert adapters cannot provide the base-policy reference")
+    assert [layer.disable_adapters for layer in layers] == previous
+
+
+def test_disable_adapter_rejects_after_merge_and_unload():
+    """An unloaded wrapper cannot silently return merged reference outputs."""
+    base = Toy()
+    reference = copy.deepcopy(base)
+    model = VeOmniLoraModel(base, _base_config())
+    _randomize_lora_b(model)
+    x = torch.randn(3, 32)
+    adapted = model(x).detach()
+    assert not torch.equal(adapted, reference(x))
+    merged = model.merge_and_unload()
+    assert not any(isinstance(m, LoraLinear) for m in model.modules())
+    torch.testing.assert_close(merged(x), adapted, rtol=1e-5, atol=1e-6)
+    with pytest.raises(ValueError, match="unloaded"):
+        with model.disable_adapter():
+            pytest.fail("Unloaded weights cannot provide the base-policy reference")
