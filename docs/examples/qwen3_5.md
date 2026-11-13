@@ -263,14 +263,16 @@ so `triton-ascend` remains a real dependency even with the AscendC GDN backend.
 Packed calls reuse host boundary/chunk tables instead of uploading unused
 legacy metadata on every layer.
 
-The adapter fixes `disable_recompute=True` to obtain the cumulative gates and
-A matrix consumed by the stable backward API. It does not expose a second
-retain/recompute policy or the legacy `fla_npu_reuse` implementation from
-#1346. Any future policy option needs matching library support and independent
-correctness and memory/performance validation.
+The `fla_npu` adapter fixes `disable_recompute=True` to retain the cumulative
+gates and A matrix needed by the stable backward API. The separate opt-in
+`fla_npu_reuse` row also retains forward state for backward on 910C and needs
+the stable decomposed GDN operators. Both paths compact empty packed segments
+while preserving their state slots. Reuse trades memory for less recomputation;
+measure correctness and memory/throughput on the actual image and configuration.
 
-The `fla_npu` backend requires manual installation and validation; it is not
-covered by the repository's GDN tests or NPU CI.
+AscendC GDN requires manual installation. Repository tests include optional
+native comparison cases; they run only when the required NPU and dependencies
+are available, so their presence alone does not establish an NPU CI pass.
 
 If the `fla_npu` package is missing when `chunk_gated_delta_rule_implementation: fla_npu` is
 selected, the backend raises an actionable error when the model constructs its `VeomniOp` handle

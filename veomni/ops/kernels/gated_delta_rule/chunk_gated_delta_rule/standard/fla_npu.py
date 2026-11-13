@@ -50,6 +50,7 @@ class _Meta:
     cu_seqlens_list: list[int] | None
     chunk_indices: dict[str, Tensor | None] | None
     chunk_indices_list: dict[str, list[int] | None] | None
+    reuse_intermediates: bool = False
 
 
 def _l2norm_fwd(x: Tensor, dim: int = -1, eps: float = 1e-6) -> tuple[Tensor, Tensor]:
@@ -138,6 +139,17 @@ def _as_int_list(value: list[int] | Tensor | None) -> list[int] | None:
     return [int(x) for x in value]
 
 
+def _validate_packed_boundaries(cu_seqlens: list[int], sequence_length: int | None = None) -> None:
+    """Reject malformed host boundaries before expanding chunk metadata."""
+    if (
+        not cu_seqlens
+        or cu_seqlens[0] != 0
+        or cu_seqlens != sorted(cu_seqlens)
+        or (sequence_length is not None and cu_seqlens[-1] != sequence_length)
+    ):
+        raise ValueError("Packed boundaries must be nondecreasing and span the input.")
+
+
 def _as_chunk_dict(
     value: dict[str, Tensor | None] | Tensor | None,
     chunk_size: int,
@@ -190,6 +202,9 @@ def _ensure_varlen_metadata(
     """
     cu_seqlens_list = _as_int_list(cu_seqlens_list) or _as_int_list(cu_seqlens)
     assert cu_seqlens_list is not None
+    # Validate before expanding chunk metadata, so a malformed large offset
+    # cannot request an unbounded host-side index table.
+    _validate_packed_boundaries(cu_seqlens_list, g.shape[1])
     tensor_indices = _as_chunk_dict(chunk_indices, chunk_size)
     list_indices = _as_chunk_list_dict(chunk_indices_list, chunk_size)
     key = str(chunk_size)
@@ -213,6 +228,9 @@ def precompute_varlen_metadata(
         cu_seqlens = cu_seqlens.cpu()
     cu_seqlens_list = _as_int_list(cu_seqlens)
     assert cu_seqlens_list is not None
+    # At this call site the post-parallel sequence length is not yet known;
+    # reject malformed ordering here and validate the final offset at dispatch.
+    _validate_packed_boundaries(cu_seqlens_list)
     cumsum_block_size = _next_power_of_2((1 << 17) // max(1, int(num_heads) * int(chunk_size)))
     required_sizes = set(_DEFAULT_VARLEN_CHUNK_SIZES) | {int(chunk_size), cumsum_block_size}
     chunk_indices: dict[str, Tensor | None] = {}
@@ -244,6 +262,29 @@ def _chunk_list(
     if chunk_indices_list is None:
         return None
     return chunk_indices_list.get(str(chunk_size))
+
+
+def _expand_empty_final_states(
+    initial_state: Tensor | None,
+    compact_final_state: Tensor,
+    nonempty_indices: list[int],
+    num_sequences: int,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+) -> Tensor:
+    """Restore empty sequence slots without changing their initial state."""
+    dtype = compact_final_state.dtype
+    device = compact_final_state.device
+    if initial_state is None:
+        full_state = torch.zeros(
+            (num_sequences, query.shape[1], key.shape[-1], value.shape[-1]), dtype=dtype, device=device
+        )
+    else:
+        full_state = initial_state.to(device=device, dtype=dtype).clone()
+    indices = torch.tensor(nonempty_indices, dtype=torch.long, device=device)
+    full_state.index_copy_(0, indices, compact_final_state)
+    return full_state
 
 
 def _get_gdn_ops():
@@ -380,6 +421,7 @@ def forward(
     chunk_indices: object = None,
     chunk_indices_list: object = None,
     scale: float | None = None,
+    _reuse_intermediates: bool = False,
 ) -> tuple[tuple[Tensor, Tensor], SavedState]:
     """AscendC fused chunk gated delta rule. Layout is FLA ``[B, T, H, D]``.
 
@@ -389,6 +431,7 @@ def forward(
     ``initial_state`` and ``output_final_state=True`` with trainable inputs
     are rejected. Extra NPU varlen tables are accepted; missing
     host chunk tables are filled from ``cu_seqlens`` without device uploads.
+    Packed inputs may contain empty segments, but the token dimension must be nonzero.
     """
     from ...vendor.triton.utils import input_guard
 
@@ -421,6 +464,8 @@ def forward(
         raise ValueError(
             f"Expected q/k/v in [B, T, H, D] and g/beta in [B, T, H]; got q={tuple(query.shape)}, g={tuple(g.shape)}."
         )
+    if query_h.shape[2] == 0:
+        raise ValueError("fla_npu GDN requires at least one token.")
     if chunk_size <= 0 or chunk_size & (chunk_size - 1):
         raise ValueError(f"chunk_size must be a power of 2, got {chunk_size}.")
 
@@ -444,6 +489,9 @@ def forward(
         )
 
     cu_opt = optional_tensor(cu_seqlens)
+    original_initial_opt = initial_opt
+    nonempty_indices = None
+    original_num_sequences = 0
     if cu_opt is not None:
         cu_opt, cu_seqlens_list, chunk_indices, chunk_indices_list = _ensure_varlen_metadata(
             g,
@@ -464,6 +512,35 @@ def forward(
                 f"got initial_state.shape[0]={initial_opt.shape[0]} and sequences={len(cu_seqlens_list) - 1}."
             )
 
+        # Both the fused and decomposed AscendC APIs require strictly
+        # increasing boundaries. Removing empty segments preserves token
+        # order, provided the state and chunk-owner indices are remapped too.
+        has_empty_segment = len(cu_seqlens_list) == 1 or len(set(cu_seqlens_list)) != len(cu_seqlens_list)
+        if has_empty_segment:
+            original_num_sequences = len(cu_seqlens_list) - 1
+            if initial_opt is not None:
+                expected_state_shape = (
+                    original_num_sequences,
+                    query_h.shape[1],
+                    key_h.shape[-1],
+                    value_h.shape[-1],
+                )
+                if tuple(initial_opt.shape) != expected_state_shape or initial_opt.device != query_h.device:
+                    raise ValueError("Packed initial_state must match the sequence, head and device layout.")
+            nonempty_indices = [
+                index for index, (start, end) in enumerate(zip(cu_seqlens_list, cu_seqlens_list[1:])) if end > start
+            ]
+            cu_seqlens_list = [0] + [cu_seqlens_list[index + 1] for index in nonempty_indices]
+            # AscendC consumes host metadata; do not upload a replacement cu
+            # tensor on every layer when the input boundaries live on NPU.
+            cu_opt = torch.tensor(cu_seqlens_list, dtype=cu_opt.dtype, device="cpu")
+            chunk_indices = {}
+            chunk_indices_list = {str(chunk_size): _prepare_chunk_indices_list(cu_seqlens_list, chunk_size)}
+            if initial_opt is not None:
+                index = torch.tensor(nonempty_indices, dtype=torch.long, device=initial_opt.device)
+                initial_opt = initial_opt.index_select(0, index)
+                initial_state = initial_opt
+
     if use_qk_l2norm_in_kernel:
         query_h, query_inv_norm = _l2norm_fwd(query_h)
         key_h, key_inv_norm = _l2norm_fwd(key_h)
@@ -475,8 +552,14 @@ def forward(
 
     if scale is None:
         scale = key_h.shape[-1] ** -0.5
-    guarded_fwd = input_guard(_chunk_fwd)
-    g_cum, output, a, final_state = guarded_fwd(
+    if _reuse_intermediates:
+        from .fla_npu_reuse import _chunk_fwd_reuse
+
+        selected_fwd = _chunk_fwd_reuse
+    else:
+        selected_fwd = _chunk_fwd
+    guarded_fwd = input_guard(selected_fwd)
+    result = guarded_fwd(
         query_h,
         key_h,
         value_h,
@@ -491,6 +574,14 @@ def forward(
         chunk_indices_list,
         chunk_size,
     )
+    g_cum, output, a, final_state = result[:4]
+    retained = result[4:] if _reuse_intermediates else ()
+    if nonempty_indices is not None and output_final_state:
+        if final_state is None:
+            raise RuntimeError("AscendC GDN did not return the requested final state.")
+        final_state = _expand_empty_final_states(
+            original_initial_opt, final_state, nonempty_indices, original_num_sequences, query_h, key_h, value_h
+        )
     if final_state is None:
         final_state = output.new_empty(0)
     saved_cu_seqlens = cu_opt if cu_opt is not None else cu_seqlens
@@ -506,7 +597,8 @@ def forward(
             saved_cu_seqlens,
             query_inv_norm,
             key_inv_norm,
-        ),
+        )
+        + retained,
         _Meta(
             scale,
             chunk_size,
@@ -517,6 +609,7 @@ def forward(
             cu_seqlens_list,
             chunk_indices,
             chunk_indices_list,
+            _reuse_intermediates,
         ),
     )
 
@@ -542,12 +635,18 @@ def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Ten
         cu_seqlens,
         query_inv_norm,
         key_inv_norm,
-    ) = saved.tensors
+    ) = saved.tensors[:10]
     do, _dht = grad_output
     initial_opt = initial_state if meta.has_initial_state else None
     cu_opt = cu_seqlens if meta.has_cu_seqlens else None
 
-    guarded_bwd = input_guard(_chunk_bwd)
+    if meta.reuse_intermediates:
+        from .fla_npu_reuse import _chunk_bwd_reuse
+
+        selected_bwd = _chunk_bwd_reuse
+    else:
+        selected_bwd = _chunk_bwd
+    guarded_bwd = input_guard(selected_bwd)
     grad_q_h, grad_k_h, grad_v_h, grad_beta, grad_g = guarded_bwd(
         query_h,
         key_h,
@@ -563,6 +662,7 @@ def backward(grad_output: tuple[Tensor, Tensor], saved: SavedState) -> tuple[Ten
         meta.chunk_indices,
         meta.chunk_indices_list,
         meta.chunk_size,
+        *saved.tensors[10:],
     )
     if meta.use_qk_l2norm:
         grad_q_h = _l2norm_bwd(query_h, query_inv_norm, grad_q_h)

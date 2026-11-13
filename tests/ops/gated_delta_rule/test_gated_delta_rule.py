@@ -654,11 +654,19 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
         pytest.param("triton", 77, 256, 20, False, id="triton-repeated-partial-wide-head"),
         pytest.param("triton", 128, 64, 1, True, id="triton-packed-small-head"),
         pytest.param("triton", 128, 128, 1, True, id="triton-packed"),
+        pytest.param("fla_npu", 128, 128, 1, False, id="fla-npu-unpacked"),
+        pytest.param("fla_npu", 128, 128, 1, True, id="fla-npu-packed"),
+        pytest.param("fla_npu_reuse", 128, 128, 1, True, id="fla-npu-reuse-packed"),
+        pytest.param("fla_npu_reuse", 128, 128, 1, "empty", id="fla-npu-reuse-packed-empty"),
     ),
 )
 def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, seq, dim, repeats, packed):
-    """Cover Triton small heads, packed inputs, and repeated backwards."""
+    """Compare optimized kernels with independent eager segment references."""
     _require_npu_gdr_dependencies()
+    if impl in ("fla_npu", "fla_npu_reuse"):
+        pytest.importorskip("fla_npu")
+    if impl == "fla_npu_reuse" and not torch.npu.get_device_name(0).startswith(("Ascend910C", "Ascend910_93")):
+        pytest.skip("fla_npu_reuse currently supports Ascend 910C only")
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", impl).wrapper
     torch.manual_seed(19)
@@ -669,7 +677,8 @@ def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, seq
     g = -torch.rand(batch, seq, heads, device="npu", dtype=torch.float32) * 0.5
     beta = torch.rand(batch, seq, heads, device="npu", dtype=torch.bfloat16)
     lengths = (61, 67) if packed else (seq,)
-    cu = torch.tensor([0, 61, 128], device="npu", dtype=torch.int32) if packed else None
+    boundaries = [0, 61, 61, 128] if packed == "empty" else [0, 61, 128]
+    cu = torch.tensor(boundaries, device="npu", dtype=torch.int32) if packed else None
     grad_output = torch.randn_like(v)
 
     for _ in range(repeats):
@@ -694,6 +703,145 @@ def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, seq
                 atol=GDN_CHUNK_GRAD_ATOL,
                 rtol=GDN_CHUNK_GRAD_RTOL,
             )
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Requires native AscendC GDN")
+@pytest.mark.parametrize("checkpointed", (False, True))
+@pytest.mark.parametrize("boundaries", ([0, 17, 64], [0, 17, 148], [0, 17, 17, 64]))
+def test_fla_npu_reuse_packed_checkpoint_parity(checkpointed, boundaries):
+    """Compare cached-state and fused recomputation across packed segments."""
+    from tests.ops.gated_delta_rule._checkpoint_guard import checkpoint_nonreentrant
+
+    _require_npu_gdr_dependencies()
+    pytest.importorskip("fla_npu")
+    if not torch.npu.get_device_name(0).startswith(("Ascend910C", "Ascend910_93")):
+        pytest.skip("fla_npu_reuse currently supports Ascend 910C only")
+    reference = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu").wrapper
+    candidate = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu_reuse").wrapper
+    torch.manual_seed(43)
+    length = boundaries[-1]
+    q, k, v = [torch.randn(1, length, 2, 128, device="npu", dtype=torch.bfloat16) for _ in range(3)]
+    g = -torch.rand(1, length, 2, device="npu", dtype=torch.float32)
+    beta = torch.rand(1, length, 2, device="npu", dtype=torch.bfloat16)
+    cu = torch.tensor(boundaries, dtype=torch.int64)
+    gradient = torch.randn_like(q)
+    results = []
+    for operation in (reference, reference, candidate):
+        leaves = make_grad_leaves(q, k, v, g, beta)
+
+        def forward(*values, operation=operation):
+            """Bind a checkpoint recomputation to its original operation."""
+            return operation(*values, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)[0]
+
+        output = checkpoint_nonreentrant(forward, *leaves) if checkpointed else forward(*leaves)
+        output.backward(gradient)
+        results.append((output.detach(), [x.grad.detach().clone() for x in leaves]))
+    for output, grads in results[1:]:
+        torch.testing.assert_close(output, results[0][0], atol=0, rtol=0)
+        for actual, expected in zip(grads, results[0][1], strict=True):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Requires native AscendC GDN")
+@pytest.mark.parametrize("l2norm", (False, True))
+def test_fla_npu_reuse_unpacked_initial_state_backward(l2norm):
+    """Compare nonpacked multi-batch training with a detached initial state."""
+    _require_npu_gdr_dependencies()
+    pytest.importorskip("fla_npu")
+    if not torch.npu.get_device_name(0).startswith(("Ascend910C", "Ascend910_93")):
+        pytest.skip("fla_npu_reuse currently supports Ascend 910C only")
+    reference = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu").wrapper
+    candidate = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu_reuse").wrapper
+    torch.manual_seed(44)
+    q, k, v = [torch.randn(2, 77, 2, 128, device="npu", dtype=torch.bfloat16) for _ in range(3)]
+    g = -torch.rand(2, 77, 2, device="npu", dtype=torch.float32)
+    beta = torch.rand(2, 77, 2, device="npu", dtype=torch.bfloat16)
+    initial = torch.randn(2, 2, 128, 128, device="npu", dtype=torch.bfloat16)
+    gradient = torch.randn_like(v)
+    results = []
+    for operation in (reference, candidate):
+        leaves = make_grad_leaves(q, k, v, g, beta)
+        output, _ = operation(*leaves, initial_state=initial, use_qk_l2norm_in_kernel=l2norm)
+        output.backward(gradient)
+        results.append((output.detach(), [x.grad.detach().clone() for x in leaves]))
+    torch.testing.assert_close(results[1][0], results[0][0], atol=0, rtol=0)
+    for actual, expected in zip(results[1][1], results[0][1], strict=True):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Requires native AscendC GDN")
+@pytest.mark.parametrize("state_dtype", (torch.bfloat16, torch.float32))
+def test_fla_npu_reuse_inference_final_state(state_dtype):
+    """Compare output and final state for both supported inference state dtypes."""
+    _require_npu_gdr_dependencies()
+    pytest.importorskip("fla_npu")
+    if not torch.npu.get_device_name(0).startswith(("Ascend910C", "Ascend910_93")):
+        pytest.skip("fla_npu_reuse currently supports Ascend 910C only")
+    reference = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu").wrapper
+    candidate = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu_reuse").wrapper
+    torch.manual_seed(45)
+    q, k, v = [torch.randn(2, 77, 2, 128, device="npu", dtype=torch.bfloat16) for _ in range(3)]
+    g = -torch.rand(2, 77, 2, device="npu", dtype=torch.float32)
+    beta = torch.rand(2, 77, 2, device="npu", dtype=torch.bfloat16)
+    initial = torch.randn(2, 2, 128, 128, device="npu", dtype=state_dtype)
+    outputs = [op(q, k, v, g, beta, initial_state=initial, output_final_state=True) for op in (reference, candidate)]
+    for actual, expected in zip(outputs[1], outputs[0], strict=True):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Requires native AscendC GDN")
+@pytest.mark.parametrize("impl", ("fla_npu", "fla_npu_reuse"))
+@pytest.mark.parametrize("state_dtype", (torch.bfloat16, torch.float32))
+def test_fla_npu_empty_packed_preserves_inference_states(impl, state_dtype):
+    """Empty slots keep their state while nonempty owners match a compact call."""
+    _require_npu_gdr_dependencies()
+    pytest.importorskip("fla_npu")
+    if impl == "fla_npu_reuse" and not torch.npu.get_device_name(0).startswith(("Ascend910C", "Ascend910_93")):
+        pytest.skip("fla_npu_reuse currently supports Ascend 910C only")
+    operation = resolve_op("chunk_gated_delta_rule", "standard", impl).wrapper
+    torch.manual_seed(46)
+    q, k, v = [torch.randn(1, 64, 2, 128, device="npu", dtype=torch.bfloat16) for _ in range(3)]
+    g = -torch.rand(1, 64, 2, device="npu", dtype=torch.float32)
+    beta = torch.rand(1, 64, 2, device="npu", dtype=torch.bfloat16)
+    initial = torch.randn(5, 2, 128, 128, device="npu", dtype=state_dtype)
+    compact_cu = torch.tensor([0, 17, 64], dtype=torch.int64)
+    padded_cu = torch.tensor([0, 0, 17, 17, 64, 64], dtype=torch.int64)
+    compact_out, compact_final = operation(
+        q, k, v, g, beta, initial_state=initial[[1, 3]], cu_seqlens=compact_cu, output_final_state=True
+    )
+    output, final = operation(q, k, v, g, beta, initial_state=initial, cu_seqlens=padded_cu, output_final_state=True)
+    expected_final = initial.to(compact_final).clone()
+    expected_final[[1, 3]] = compact_final
+    torch.testing.assert_close(output, compact_out, atol=0, rtol=0)
+    torch.testing.assert_close(final, expected_final, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Requires native AscendC GDN")
+@pytest.mark.parametrize("impl", ("fla_npu", "fla_npu_reuse"))
+def test_fla_npu_empty_packed_preserves_token_gradients_with_initial_state(impl):
+    """Compact state owners preserve output and token gradients in training."""
+    _require_npu_gdr_dependencies()
+    pytest.importorskip("fla_npu")
+    if impl == "fla_npu_reuse" and not torch.npu.get_device_name(0).startswith(("Ascend910C", "Ascend910_93")):
+        pytest.skip("fla_npu_reuse currently supports Ascend 910C only")
+    operation = resolve_op("chunk_gated_delta_rule", "standard", impl).wrapper
+    torch.manual_seed(47)
+    q, k, v = [torch.randn(1, 64, 2, 128, device="npu", dtype=torch.bfloat16) for _ in range(3)]
+    g = -torch.rand(1, 64, 2, device="npu", dtype=torch.float32)
+    beta = torch.rand(1, 64, 2, device="npu", dtype=torch.bfloat16)
+    initial = torch.randn(5, 2, 128, 128, device="npu", dtype=torch.bfloat16)
+    gradient = torch.randn_like(v)
+    results = []
+    for boundaries, state in (([0, 17, 64], initial[[1, 3]]), ([0, 0, 17, 17, 64, 64], initial)):
+        leaves = make_grad_leaves(q, k, v, g, beta)
+        output, _ = operation(
+            *leaves, initial_state=state, cu_seqlens=torch.tensor(boundaries), use_qk_l2norm_in_kernel=True
+        )
+        output.backward(gradient)
+        results.append((output.detach(), [leaf.grad.detach().clone() for leaf in leaves]))
+    torch.testing.assert_close(results[1][0], results[0][0], atol=0, rtol=0)
+    for actual, expected in zip(results[1][1], results[0][1], strict=True):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")

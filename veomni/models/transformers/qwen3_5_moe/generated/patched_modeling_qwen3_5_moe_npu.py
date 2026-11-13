@@ -935,10 +935,10 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
                         "Shared-prefix training requires a varlen-capable chunk_gated_delta_rule backend. "
                         "On GPU, set the implementation to 'fla' or 'flash_qla'; on NPU, set it to 'fla' or 'triton'."
                     )
-                if self.veomni_chunk_gated_delta_rule.impl == "fla_npu":
+                if self.veomni_chunk_gated_delta_rule.impl in ("fla_npu", "fla_npu_reuse"):
                     raise NotImplementedError(
                         "Shared-prefix training requires gradient propagation through recurrent state, "
-                        "which the 'fla_npu' backend does not support (it discards dht and returns dh0=None). "
+                        "which the AscendC GDN backends do not support (they discard dht and return dh0=None). "
                         "Use the 'triton' backend on NPU, or unset text_config.shared_prefix_training."
                     )
                 # Modification: two varlen calls; suffixes start from the prefix state at its last chunk boundary.
