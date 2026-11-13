@@ -2,7 +2,7 @@ name: Build CANN 9.2.1 A2 candidate
 on:
   workflow_dispatch:
   push:
-    branches: [zpl1n/ascend-cann921-a2-a3]
+    branches: [main]
     paths:
       - .github/workflows/build-cann921-a2.yml
       - docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86

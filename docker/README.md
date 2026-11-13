@@ -104,7 +104,7 @@ The candidate workflows build and publish images to GHCR:
 | [A3 builder](../.github/workflows/build-cann921-a3.yml) | `linux/arm64` | `cann921-a3-arm64-<commit>-<run-id>-<attempt>` |
 
 Both declare `workflow_dispatch` and path-filtered pushes on
-`zpl1n/ascend-cann921-a2-a3`. A2 watches its workflow and the two CANN 9.2.1
+`main`. A2 watches its workflow and the two CANN 9.2.1
 A2 Dockerfiles (`910b.x86` and `910b.arm`); its build job produces only x86.
 A3 watches its workflow and its A3 Dockerfile. There is no A2 ARM candidate
 workflow in this addition. These builders are separate from the existing
