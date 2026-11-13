@@ -114,7 +114,14 @@ class JanusTextEncoder(TextEncoder):
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
-        assert conversation_list[-1].type == "output" and conversation_list[-1].value.shape[-2] == 1
+        # The tail holds the image span the codec just finished. Its row count
+        # varies: one token in `infer_gen` (the span lives in the KV cache), the
+        # whole accumulated span in `infer_interleave`, where the backbone re-reads
+        # it. Only the last row feeds the `emit_image_end` step, so the type is the
+        # only contract.
+        tail = conversation_list[-1]
+        if tail.type != "output":
+            raise ValueError(f"emit_image_end expects an output tail; got {tail.type!r}.")
         conversation_list.pop()
         output_token_id = self._chat_template.eoi_token_id
         input_ids = self._token_id_tensor(output_token_id)
