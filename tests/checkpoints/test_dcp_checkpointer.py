@@ -639,7 +639,7 @@ class TestAllowPartialLoad:
     """DCP load may be partial for optimizer state, but not full model state."""
 
     def test_load_uses_allow_partial_load_planner(self):
-        from veomni.checkpoint.dcp_checkpointer import DefaultLoadPlanner
+        from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 
         planner = DefaultLoadPlanner(allow_partial_load=True)
         assert planner.allow_partial_load is True
