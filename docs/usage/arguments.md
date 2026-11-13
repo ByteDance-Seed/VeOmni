@@ -61,6 +61,7 @@ Model architecture, paths, and multimodal encoder / decoder setup.
     * `AcceleratorConfig` — `model.accelerator.*`
         * `FSDPConfig` — `model.accelerator.fsdp_config.*`
             * `MixedPrecisionConfig` — `model.accelerator.fsdp_config.mixed_precision.*`
+                * `Float8TrainingConfig` — `model.accelerator.fsdp_config.mixed_precision.float8.*`
         * `OffloadConfig` — `model.accelerator.offload_config.*`
         * `GradientCheckpointingConfig` — `model.accelerator.gradient_checkpointing.*`
         * `TorchCompileConfig` — `model.accelerator.torch_compile.*`
@@ -880,6 +881,7 @@ implementations also differ. These timings measure collective latency, not model
 | reduce_dtype | `str` | `"float32"` | Dtype for gradient reduction (i.e. reduce-scatter or all-reduce). |
 | output_dtype | `str` | `None` | Dtype for casting floating-point forward outputs (FSDP2). |
 | cast_forward_inputs | `bool` | `True` | Enable mixed precision cast forward inputs (FSDP2). |
+| float8 | `Float8TrainingConfig` | disabled | Opt-in torchao float8 GEMMs for selected `nn.Linear` projections. Fields: `enable` (`bool`, default `False`), `recipe` (`"tensorwise"` (default) \| `"rowwise"` \| `"rowwise_with_gw_hp"`), `target_modules` (`List[str]`, full module names with `*` wildcards; required when enabled). Needs the optional `float8` extra; see [Float8 training](float8_training.md). |
 
 
 ### OffloadConfig
