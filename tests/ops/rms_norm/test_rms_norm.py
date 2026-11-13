@@ -492,3 +492,68 @@ def test_liger_grouped_delegates_to_eager(variant: str):
     out_o.backward(grad_output)
     assert torch.equal(x_e.grad, x_o.grad)
     assert torch.equal(w_e.grad, w_o.grad)
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Frozen-weight fused RMSNorm requires NPU")
+@pytest.mark.parametrize("variant", ["standard", "offset"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("strided_grad", [False, True], ids=["contiguous-grad", "strided-grad"])
+def test_npu_frozen_weight_backward(variant: str, dtype: torch.dtype, strided_grad: bool, monkeypatch):
+    """Frozen affine weights must not block input gradients through fused NPU RMSNorm."""
+    import torch_npu
+
+    generator = torch.Generator().manual_seed(73)
+    shape = (2, 8, 128)
+    x = torch.randn(shape, generator=generator).to(device="npu", dtype=dtype).requires_grad_(True)
+    weight = (0.1 * torch.randn(shape[-1], generator=generator)).to(device="npu", dtype=dtype)
+    if variant == "standard":
+        weight = weight + 1.0
+    weight_before = weight.clone()
+    x_ref = x.detach().clone().requires_grad_(True)
+    eps = 1e-6
+
+    # An independent autograd formula, not the adapter's handwritten backward.
+    normalized = x_ref.float() * torch.rsqrt(x_ref.float().square().mean(-1, keepdim=True) + eps)
+    if variant == "standard":
+        expected = weight * normalized.to(dtype)
+    else:
+        expected = ((1.0 + weight.float()) * normalized).to(dtype)
+
+    calls = []
+    real_forward = torch_npu.npu_rms_norm
+    real_backward = torch_npu.npu_rms_norm_backward
+
+    def traced_forward(*args, **kwargs):
+        calls.append("forward")
+        return real_forward(*args, **kwargs)
+
+    def traced_backward(*args, **kwargs):
+        calls.append("backward")
+        return real_backward(*args, **kwargs)
+
+    # Spies delegate to the actual vendor kernels; no mock numerical output.
+    monkeypatch.setattr(torch_npu, "npu_rms_norm", traced_forward)
+    monkeypatch.setattr(torch_npu, "npu_rms_norm_backward", traced_backward)
+    actual = resolve_op("rms_norm", variant, "torch_npu").wrapper(x, weight, eps=eps)
+    assert actual.device == x.device
+    assert actual.dtype == dtype
+    assert actual.shape == x.shape
+    assert torch.isfinite(actual).all()
+    atol, rtol = (RMS_NPU_FP32_ATOL, RMS_NPU_FP32_RTOL) if dtype == torch.float32 else (RMS_NPU_ATOL, RMS_NPU_RTOL)
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+    grad = torch.randn((*shape[:-1], shape[-1] * 2), generator=generator).to(device="npu", dtype=dtype)[..., ::2]
+    if not strided_grad:
+        grad = grad.contiguous()
+    assert grad.is_contiguous() != strided_grad
+    actual.backward(grad)
+    expected.backward(grad)
+    assert calls == ["forward", "backward"]
+    assert x.grad is not None and x_ref.grad is not None
+    assert torch.isfinite(x.grad).all()
+    assert torch.count_nonzero(x.grad) > 0
+    grad_atol, grad_rtol = (atol, rtol) if dtype == torch.float32 else (RMS_NPU_GRAD_ATOL, RMS_NPU_GRAD_RTOL)
+    torch.testing.assert_close(x.grad, x_ref.grad, atol=grad_atol, rtol=grad_rtol)
+    assert not weight.requires_grad
+    assert weight.grad is None
+    torch.testing.assert_close(weight, weight_before, atol=0, rtol=0)

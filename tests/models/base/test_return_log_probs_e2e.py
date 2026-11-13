@@ -32,13 +32,14 @@ to ``lm_head.weight``. Public registry/build coverage lives in
 
 import gc
 import os
+from contextlib import nullcontext
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from veomni.models.configuration_base import as_veomni_config
-from veomni.utils.device import IS_CUDA_AVAILABLE, empty_cache, get_device_type
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, empty_cache, get_device_type
 
 
 # Same env-var contract as the existing logits-equality test: keep GPU
@@ -62,7 +63,7 @@ IGNORE_INDEX = -100
 
 def _release():
     gc.collect()
-    if IS_CUDA_AVAILABLE:
+    if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
         empty_cache()
 
 
@@ -73,22 +74,24 @@ def _apply_determinism():
 @pytest.fixture(autouse=True)
 def _deterministic_backend_flags():
     """Scope mutable CUDA backend flags so test order cannot freeze or leak them."""
-    if not IS_CUDA_AVAILABLE:
-        yield
-        return
-
     prev_deterministic = torch.are_deterministic_algorithms_enabled()
-    with torch.backends.cudnn.flags(
-        enabled=torch.backends.cudnn.enabled,
-        benchmark=False,
-        benchmark_limit=torch.backends.cudnn.benchmark_limit,
-        deterministic=True,
-        allow_tf32=False,
-    ):
+    prev_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    backend_flags = (
+        torch.backends.cudnn.flags(
+            enabled=torch.backends.cudnn.enabled,
+            benchmark=False,
+            benchmark_limit=torch.backends.cudnn.benchmark_limit,
+            deterministic=True,
+            allow_tf32=False,
+        )
+        if IS_CUDA_AVAILABLE
+        else nullcontext()
+    )
+    with backend_flags:
         try:
             yield
         finally:
-            torch.use_deterministic_algorithms(prev_deterministic, warn_only=True)
+            torch.use_deterministic_algorithms(prev_deterministic, warn_only=prev_warn_only)
 
 
 def _have_python_dev_headers() -> bool:
@@ -144,13 +147,23 @@ def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
 
     config = AutoConfig.from_pretrained(toy_path)
     if config.model_type == "qwen3":
-        from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import (
-            Qwen3ForCausalLM as ModelClass,
-        )
+        if get_device_type() == "npu":
+            from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_npu import (
+                Qwen3ForCausalLM as ModelClass,
+            )
+        else:
+            from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import (
+                Qwen3ForCausalLM as ModelClass,
+            )
     elif config.model_type == "qwen3_vl":
-        from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
-            Qwen3VLForConditionalGeneration as ModelClass,
-        )
+        if get_device_type() == "npu":
+            from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_npu import (
+                Qwen3VLForConditionalGeneration as ModelClass,
+            )
+        else:
+            from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+                Qwen3VLForConditionalGeneration as ModelClass,
+            )
     else:
         raise ValueError(f"Unsupported toy model type: {config.model_type}")
 
@@ -162,11 +175,10 @@ def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
     return model.to(device=get_device_type(), dtype=torch.float32)
 
 
-def _skip_unless_cuda(toy_path: str):
-    if not IS_CUDA_AVAILABLE:
-        pytest.skip("CUDA required.")
-    if not os.path.isdir(toy_path):
-        pytest.skip(f"Path not found: {toy_path}")
+def _require_accelerator(toy_path: str):
+    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
+        pytest.skip("A CUDA or NPU device is required for these integration tests")
+    assert os.path.isdir(toy_path), f"Path not found: {toy_path}"
 
 
 _MODELS = [
@@ -176,7 +188,8 @@ _MODELS = [
 
 
 def _check_bitwise_matches_logits_reference(model: torch.nn.Module, family: str) -> None:
-    bi_active = _have_python_dev_headers()
+    # Batch-invariant Triton kernels are CUDA-only; NPU retains the exact assertions below.
+    bi_active = IS_CUDA_AVAILABLE and _have_python_dev_headers()
     bi_ctx = None
     if bi_active:
         from veomni.ops.batch_invariant import set_batch_invariant_mode
@@ -421,7 +434,7 @@ def _check_topk_distill_forward_and_backward(model: torch.nn.Module, family: str
 @pytest.mark.parametrize("toy_path,family", _MODELS)
 def test_return_log_probs_bitwise_matches_logits_reference(toy_path, family):
     """Build each generated model family once and run all four return_log_probs contracts."""
-    _skip_unless_cuda(toy_path)
+    _require_accelerator(toy_path)
     _apply_determinism()
 
     torch.manual_seed(0)
