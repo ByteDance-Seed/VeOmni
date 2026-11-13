@@ -456,7 +456,7 @@ def test_float8_qwen3_fsdp2_dcp_resume_and_hf_export(tmp_path, monkeypatch, reci
         clear_parallel_state()
 
 
-def _two_rank_gloo_fsdp2_worker(rank: int, checkpoint_str: str, dcp_str: str, recipe: str, endpoint):
+def _two_rank_fsdp2_worker(rank: int, checkpoint_str: str, dcp_str: str, recipe: str, endpoint):
     """Execute 2-rank FSDP2 sharded Llama float8 training and DCP resume."""
     import torch.distributed as dist
     import torch.distributed.checkpoint as dcp
@@ -470,7 +470,7 @@ def _two_rank_gloo_fsdp2_worker(rank: int, checkpoint_str: str, dcp_str: str, re
     from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
 
     device.get_torch_device().set_device(rank)
-    dist.init_process_group(backend="gloo", store=endpoint.connect(), rank=rank, world_size=2)
+    dist.init_process_group(backend="cuda:nccl,cpu:gloo", store=endpoint.connect(), rank=rank, world_size=2)
     try:
         _init_parallel_state(dp_size=2, dp_mode="fsdp2")
         config = LlamaConfig(
@@ -647,7 +647,7 @@ def test_float8_two_rank_sharded_fsdp2(tmp_path, recipe):
         )
     ).float().save_pretrained(ckpt)
     spawn_with_rendezvous(
-        _two_rank_gloo_fsdp2_worker,
+        _two_rank_fsdp2_worker,
         nprocs=2,
         args=(str(ckpt), str(tmp_path / f"dcp_{recipe}"), recipe),
     )
