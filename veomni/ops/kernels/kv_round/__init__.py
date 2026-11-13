@@ -24,15 +24,30 @@ implementation is the backend that performs it.
   groups over the NoPE channels of a KV entry, and 128-wide groups over a whole
   indexer head. A caller selects which by passing ``rope_features``.
 
-Both variants also register ``none``, which returns the tensor unchanged. Every
-other family spells "off" as ``eager``; here ``eager`` is a real rounding row, so
-"off" needs its own name. That keeps the field shaped like the others -- the model
-always builds a handle and never branches on a missing one.
+The *implementation* is the backend: ``eager`` is a PyTorch round trip, ``triton``
+the same arithmetic on a fused kernel. Every variant also registers ``none``, which
+returns the tensor unchanged. Every other family spells "off" as ``eager``; here
+``eager`` is a real rounding row, so "off" needs its own name. That keeps the field
+shaped like the others -- the model always builds a handle and never branches on a
+missing one. Each variant owns its own ``none`` because the call arguments differ:
+``standard``'s takes ``quant_features``, ``fp4``'s takes ``scale_fmt``, and a
+caller passes its variant's arguments to whichever row the config selected --
+including the off row, which is this family's default.
+
+The *element format* is not part of either name. ``fp4`` below is a separate
+variant rather than an ``impl`` because it changes what the stored tensor means --
+E2M1 values in ``[-6, 6]`` with a 16-wide group, not E4M3 with a 64- or 128-wide
+one -- and a model that stores FP4 has no FP8 geometry to fall back to. A caller
+therefore selects the variant its checkpoint uses, exactly as it selects
+``deepseek_v4`` for that model's FP8 geometries.
 
 These are *storage* round trips, not GEMM operand quantization: the point is to
 show training the values an inference cache would hold. Backward is a
-straight-through estimator, which is sound here because every scale derives from
-its own group's amax and rounds up, so no element saturates.
+straight-through estimator, which is sound for FP8 because every scale derives
+from its own group's amax and rounds up, so no element saturates. FP4 saturates by
+construction (E2M1 tops out at 6 and an E4M3 scale is not always a power of two),
+so its backward is the same approximation a deployment kernel makes when it reads
+back the rounded values.
 """
 
 from ...platform import NVIDIA_SM89_PLUS, ROCM_GPU, GpuKernelRequirement
@@ -40,6 +55,9 @@ from ...registry import register_op
 from .deepseek_v4 import eager as dsv4_eager
 from .deepseek_v4 import none as dsv4_none
 from .deepseek_v4 import triton as dsv4_triton
+from .fp4 import eager as fp4_eager
+from .fp4 import none as fp4_none
+from .fp4 import triton as fp4_triton
 from .standard import eager as standard_eager
 from .standard import none as standard_none
 from .standard import triton as standard_triton
@@ -111,6 +129,40 @@ register_op(
     description=(
         "Triton DeepSeek-V4 storage rounding: the same two geometries as the eager row on the "
         "Triton round trip, straight-through backward"
+    ),
+    requirement=_GPU_FP8,
+    requires=("triton",),
+    default=True,
+)
+
+register_op(
+    "kv_round",
+    "fp4",
+    "none",
+    fp4_none.forward,
+    fp4_none.backward,
+    description="Leave stored tensors unchanged; the off state for this family",
+)
+
+register_op(
+    "kv_round",
+    "fp4",
+    "eager",
+    fp4_eager.forward,
+    fp4_eager.backward,
+    description=(
+        "PyTorch blockwise FP4 (E2M1 + E4M3 or UE8M0 scale) storage round-trip with straight-through backward"
+    ),
+)
+
+register_op(
+    "kv_round",
+    "fp4",
+    "triton",
+    fp4_triton.forward,
+    fp4_triton.backward,
+    description=(
+        "Triton blockwise FP4 (E2M1 + E4M3 or UE8M0 scale) storage round-trip with straight-through backward"
     ),
     requirement=_GPU_FP8,
     requires=("triton",),

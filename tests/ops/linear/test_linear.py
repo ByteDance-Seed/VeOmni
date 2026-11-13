@@ -29,10 +29,28 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_linear_registry_entries():
-    assert OP_REGISTRY.list_registered("linear", "standard") == ["eager", "qat"]
-    assert OP_REGISTRY.list_registered("linear", "grouped") == ["eager", "qat"]
+    assert OP_REGISTRY.list_registered("linear", "standard") == ["eager", "qat", "deepgemm_fp8"]
+    assert OP_REGISTRY.list_registered("linear", "grouped") == ["eager", "qat", "deepgemm_fp8"]
     assert OP_REGISTRY.default_impl("linear", "standard", device="cpu") == "eager"
     assert OP_REGISTRY.default_impl("linear", "grouped", device="cpu") == "eager"
+
+
+def test_linear_deepgemm_rows_declare_deep_gemm_on_sm90_or_sm100():
+    """The DeepGEMM rows carry the hardware and package they need, like the QAT ones.
+
+    Read the registered metadata rather than resolving the handle: whether
+    resolution *fails* depends on the host this runs on, and this file also runs
+    on the GPU CI workers, where the row legitimately resolves.
+    """
+    for variant in ("standard", "grouped"):
+        entries = {entry.impl: entry for entry in OP_REGISTRY.list_entries("linear", variant)}
+        assert "deepgemm_fp8" in entries, variant
+        entry = entries["deepgemm_fp8"]
+        assert entry.requires == ("deep_gemm", "triton"), variant
+        # SM90 and SM100 named explicitly: SM89 has an E4M3 type but no DeepGEMM
+        # kernel, so it must not satisfy this requirement.
+        platforms = entry.requirement.platforms
+        assert {(p.min_cc, p.max_cc) for p in platforms} == {(90, 90), (100, 100)}, variant
 
 
 def test_linear_eager_matches_f_linear():
@@ -184,3 +202,111 @@ def test_the_standard_eager_row_calls_the_projection_module():
 
     assert linear.calls == 1
     torch.testing.assert_close(out, F.linear(x, linear.weight, linear.bias))
+
+
+def test_the_deepgemm_row_refuses_a_wrapped_projection():
+    """Same refusal as ``qat``: the row must not train at full precision silently.
+
+    Both quantizing impls read ``module.weight``. A wrapper keeps the real weight
+    at ``base_layer``, so a fallback would run an unquantized GEMM under a config
+    that selected a low-precision one.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.linear._module import resolve_projection
+
+    class Wrapped(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base_layer = nn.Linear(8, 4, bias=False)
+
+        def forward(self, x):
+            return self.base_layer(x)
+
+    with pytest.raises(ValueError, match="cannot run on .Wrapped."):
+        resolve_projection("deepgemm_fp8", Wrapped(), torch.randn(2, 8))
+
+
+def test_both_quantizing_impls_are_declared_together():
+    """``QUANTIZING_IMPLS`` is what the wrapper-refusal and LoRA checks consult."""
+    assert QUANTIZING_IMPLS == frozenset({"qat", "deepgemm_fp8"})
+
+
+@pytest.mark.parametrize("block_size", [32, 64])
+def test_deepgemm_rows_refuse_a_block_size_they_cannot_honor(block_size: int):
+    """``qat`` honors ``block_size``; ``deepgemm_fp8``'s recipe is fixed at 128.
+
+    Accepting and ignoring the keyword would make one field mean two different
+    recipes depending on which row the config selected.
+    """
+    from veomni.ops.kernels.linear._module import require_deepgemm_block_size
+
+    require_deepgemm_block_size(128)
+    with pytest.raises(ValueError, match="only block_size=128"):
+        require_deepgemm_block_size(block_size)
+
+
+@pytest.mark.parametrize("shard_projection", [False, True])
+def test_a_quantizing_row_only_refuses_a_projection_that_is_its_own_fsdp_unit(shard_projection):
+    """``_is_sharded`` must fire on the ``basic_modules`` placement and nowhere else.
+
+    FSDP2 unshards a parameter in the *forward* of whatever unit owns it. A
+    quantizing row reads ``module.weight`` without calling ``forward``, so the
+    question is which unit owns the projection:
+
+    * Owned by its parent block -- the normal case. The parent's forward has already
+      run when the row is called, so the weight is a whole ``Parameter`` and the row
+      must proceed. Getting this wrong would break every QAT run.
+    * Listed in ``basic_modules``, so it is ``fully_shard``-ed on its own. Nothing
+      unshards it before the row reads it, so the row would multiply one rank's
+      slice and the shape checks would still pass on the global shape.
+
+    Written against real ``fully_shard`` on gloo rather than a mock, because the
+    distinction *is* FSDP2's behaviour -- a hand-built ``DTensor`` would prove only
+    that the type test works.
+    """
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    from veomni.ops.kernels.linear._module import _is_sharded, resolve_projection
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(64, 64, bias=False)
+            self.seen: list[bool] = []
+
+        def forward(self, x):
+            self.seen.append(_is_sharded(self.proj.weight))
+            return self.proj(x)
+
+    # ``fully_shard`` needs a process group; skip rather than fail when a plain
+    # ``pytest`` run has none. CI collects this file wholesale, so the guard is on
+    # the operation, not the device.
+    if not dist.is_available() or not dist.is_gloo_available():
+        pytest.skip("gloo is required to exercise fully_shard")
+
+    block = Block()
+    created = False
+    if not dist.is_initialized():
+        dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29571", rank=0, world_size=1)
+        created = True
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        if shard_projection:
+            fully_shard(block.proj, mesh=mesh)
+        fully_shard(block, mesh=mesh)
+        block(torch.randn(2, 64))
+
+        if shard_projection:
+            assert block.seen == [True], "basic_modules placement must be refused"
+            with pytest.raises(RuntimeError, match="read a sharded weight"):
+                resolve_projection("deepgemm_fp8", block.proj, torch.randn(2, 64))
+        else:
+            assert block.seen == [False], "a parent-owned projection must not be refused"
+            weight, shortcut = resolve_projection("deepgemm_fp8", block.proj, torch.randn(2, 64))
+            assert shortcut is None and weight.shape == (64, 64)
+    finally:
+        if created:
+            dist.destroy_process_group()

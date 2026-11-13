@@ -32,9 +32,15 @@
 #
 # Swapping `moe_implementation` to `deepgemm_fp8` is a valid variant of this config: it
 # runs native FP8 expert GEMMs instead of fake-quantizing the experts, while `linear`,
-# `swiglu_mlp` and `kv_round` stay on their QAT rows. Those are separate GEMMs -- in
-# particular `swiglu_mlp` is the shared expert, which DeepGEMM does not cover -- so the
-# two selections compose rather than conflict.
+# `swiglu_mlp` and `kv_round` stay on their QAT rows. The routed-expert kernel takes the
+# experts' merged slab, so the dense shared expert is a separate GEMM with its own
+# field -- the two selections compose rather than conflict.
+#
+# The three GEMM families also accept `deepgemm_fp8` themselves, which replaces the
+# emulation with real FP8 tensor-core forward, dgrad and wgrad. Selecting it everywhere
+# is `deepseek_v4_deepgemm_fp8.yaml`; selecting only the routed experts is the variant
+# above. `qat` and `deepgemm_fp8` are never both selected on one field -- they are two
+# values of the same `*_implementation`, so one replaces the other.
 #
 # Precision: BF16 parameters with FP32 gradient reduction. The fake quantizers are
 # straight-through, so the FP32 master weights keep updating normally and checkpoints
@@ -81,9 +87,10 @@ model:
       fsdp_mode: fsdp2
       mixed_precision:
         enable: true
-        # FP32 reduction keeps the straight-through gradients in the wider format;
-        # the quantizers themselves upcast internally, so param dtype does not matter
-        # to them.
+        # FP32 reduction keeps the straight-through gradients in the wider format.
+        # The `qat` rows upcast internally, so param dtype does not matter to them --
+        # but a `deepgemm_fp8` row does require BF16 operands, so keep this at
+        # bfloat16 if you swap any family to it.
         param_dtype: bfloat16
         reduce_dtype: float32
   chat_template: chatml

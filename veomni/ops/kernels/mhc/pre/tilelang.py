@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from ..helper import POST_MULTIPLIER, require_tilelang_input
+from ..helper import FUSED_TOKEN_ALIGN, POST_MULTIPLIER, TOKEN_ALIGN, pad_token_axis, require_tilelang_input
 
 
 def wrapper(
@@ -47,8 +47,10 @@ def wrapper(
     base = base.float().contiguous()
 
     if not torch.is_grad_enabled():
+        # Inference: ``mhc_pre_big_fuse`` tiles the query axis too.
+        hs, seq_len = pad_token_axis(hidden_streams, FUSED_TOKEN_ALIGN)
         post, comb, collapsed = mhc_pre_big_fuse(
-            hidden_streams.contiguous(),
+            hs,
             fn,
             scale,
             base,
@@ -59,9 +61,12 @@ def wrapper(
             sinkhorn_repeat=sinkhorn_iters,
             n_splits=16,
         )
+        if hs is not hidden_streams:
+            post, comb, collapsed = post[:, :seq_len], comb[:, :seq_len], collapsed[:, :seq_len]
     else:
+        hs, seq_len = pad_token_axis(hidden_streams, TOKEN_ALIGN)
         mixes = mhc_pre_norm_fn(
-            hidden_streams.contiguous(),
+            hs,
             fn,
             None,
             norm_eps,
@@ -76,5 +81,7 @@ def wrapper(
             hc_eps,
         )
         comb = sinkhorn_normalize(comb, repeat=sinkhorn_iters, eps=hc_eps)
-        collapsed = mhc_pre_apply_mix(hidden_streams.contiguous(), pre)
+        collapsed = mhc_pre_apply_mix(hs, pre)
+        if hs is not hidden_streams:
+            post, comb, collapsed = post[:, :seq_len], comb[:, :seq_len], collapsed[:, :seq_len]
     return post.squeeze(-1), comb, collapsed

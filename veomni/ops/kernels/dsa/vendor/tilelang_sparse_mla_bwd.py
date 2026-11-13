@@ -314,6 +314,23 @@ def bwd(
     return sparse_mqa_bwd_kernel
 
 
+def _preprocess_delta(preprocess_kernel, o, do, S: int):
+    """Run the ``delta`` preprocess kernel on whole 32-query tiles.
+
+    ``preprocess`` tiles its query axis in blocks of 32 and indexes the last tile
+    without a length guard, so a packed sequence whose per-sample query length is
+    not a multiple of 32 reads and writes past ``o``. Zero padding is exact here:
+    the padded rows hold no scores, so the extra ``delta`` rows are never read --
+    only their own computation is discarded when the result is sliced back.
+    """
+    pad_s = -S % 32
+    if not pad_s:
+        return preprocess_kernel(o, do)
+    o_padded = torch.cat([o, o.new_zeros(o.shape[0], pad_s, *o.shape[2:])], dim=1).contiguous()
+    do_padded = torch.cat([do, do.new_zeros(do.shape[0], pad_s, *do.shape[2:])], dim=1).contiguous()
+    return preprocess_kernel(o_padded, do_padded)[:, :S].contiguous()
+
+
 def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=None):
     """Backward interface for V4 sparse MQA attention.
 
@@ -382,7 +399,7 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     bwd_kernel = bwd(B, S_kv, padded_H, D, topk, sm_scale)
     postprocess_kernel = postprocess(B, S_kv, D)
 
-    delta = preprocess_kernel(o, do)
+    delta = _preprocess_delta(preprocess_kernel, o, do, S)
     dkv = torch.zeros_like(kv, dtype=torch.float32)
     d_attn_sink = torch.zeros_like(attn_sink)
     dq = bwd_kernel(q, kv, do, attn_sink, topk_idxs, lse, delta, dkv, d_attn_sink)
