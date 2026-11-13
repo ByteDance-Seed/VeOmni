@@ -413,9 +413,15 @@ class TestCheckpointLayoutRoundTrip:
         assert (model_root / "ckpt" / ".metadata").is_file()
         assert (model_root / "optimizer" / ".metadata").is_file()
         assert (model_root / "extra_state" / "extra_state_rank_0.pt").is_file()
-        # The pre-split marker at the step root is gone; only the manifest, which
-        # GlobalStateCallback writes, marks a step complete now.
+        # Nothing writes a marker at the step root; only the manifest, which
+        # GlobalStateCallback writes, marks a step complete.
         assert not (tmp_path / "global_step_7" / ".metadata").exists()
+        # Only the global metadata. A DCP load falls back to ``__{rank}.metadata``
+        # when this one is unreadable, and ``load`` refuses a step without it, so
+        # a save that started emitting rank-local metadata would have to revisit
+        # that guard rather than silently lose the fallback.
+        rank_local = sorted(p.name for p in (model_root / "ckpt").glob("__*.metadata"))
+        assert rank_local == [], f"rank-local metadata appeared: {rank_local}"
 
         weight_keys = FileSystemReader(model_root / "ckpt").read_metadata().state_dict_metadata.keys()
         assert weight_keys, "weights directory is empty"
@@ -476,10 +482,13 @@ class TestCheckpointLayoutRoundTrip:
             assert (model_root / module / "optimizer" / ".metadata").is_file()
             assert (model_root / module / "extra_state" / "extra_state_rank_0.pt").is_file()
 
-    def test_resume_reads_a_pre_split_checkpoint(self, mock_gps, tmp_path):
-        """A checkpoint written before the split keeps both in one directory.
+    def test_a_pre_split_checkpoint_no_longer_resumes(self, mock_gps, tmp_path):
+        """A step written before weights and optimizer were split has no
+        ``model/`` at all, so a resume now finds nothing to read.
 
-        Delete this along with ``veomni/checkpoint/legacy_v0_1_12.py``.
+        Dropping ``veomni/checkpoint/legacy_v0_1_12.py`` means an old checkpoint
+        fails instead of being translated: the fused directory is no longer
+        detected and loaded.
         """
         from veomni.checkpoint.dcp_checkpointer import (
             DistributedCheckpointer,
@@ -502,32 +511,151 @@ class TestCheckpointLayoutRoundTrip:
         )
 
         resumed, resumed_optimizer, _ = self._build(seed=1)
-        DistributedCheckpointer.load(
-            path=str(step),
-            state={"model": resumed, "optimizer": resumed_optimizer, "extra_state": {}},
-        )
+        # The error names the directory and points at the layout doc, rather than
+        # DCP's bare "metadata is None".
+        with pytest.raises(FileNotFoundError, match="not resumable"):
+            DistributedCheckpointer.load(
+                path=str(step),
+                state={"model": resumed, "optimizer": resumed_optimizer, "extra_state": {}},
+            )
 
-        torch.testing.assert_close(resumed.weight, model.weight, atol=0.0, rtol=0.0)
-        expected_exp_avg = optimizer.state_dict()["state"][0]["exp_avg"]
-        torch.testing.assert_close(
-            resumed_optimizer.state_dict()["state"][0]["exp_avg"], expected_exp_avg, atol=0.0, rtol=0.0
-        )
+    def test_an_interrupted_optimizer_save_is_reported_the_same_way(self, mock_gps, tmp_path):
+        """The weights landed and the optimizer write did not — what an
+        interrupted ``save_async`` leaves behind. The optimizer directory has no
+        marker, so the load has to stop before ``dcp.load`` reaches it; without
+        that check DCP reports a bare ``metadata is None`` again."""
+        from veomni.checkpoint import layout
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        weights = Path(layout.weights_dir(str(tmp_path)))
+        weights.mkdir(parents=True)
+        (weights / layout.DCP_MARKER_FILENAME).write_text("weights finished")
+        os.makedirs(layout.optimizer_dir(str(tmp_path)))
+
+        model, optimizer, _ = self._build(seed=1)
+        with pytest.raises(FileNotFoundError, match="optimizer"):
+            DistributedCheckpointer.load(
+                path=str(tmp_path),
+                state={"model": model, "optimizer": optimizer, "extra_state": {}},
+            )
+
+    def test_a_step_with_no_optimizer_directory_is_not_loaded_with_one(self, mock_gps, tmp_path):
+        """The export at train end drops the optimizer, so a weights-only step is
+        a real checkpoint. Asking to resume an optimizer from it is a mismatch,
+        and the error has to say which directory is missing rather than let
+        ``dcp.load`` fail on a path that was never written."""
+        from veomni.checkpoint import layout
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        weights = Path(layout.weights_dir(str(tmp_path)))
+        weights.mkdir(parents=True)
+        (weights / layout.DCP_MARKER_FILENAME).write_text("weights finished")
+
+        model, optimizer, _ = self._build(seed=1)
+        with pytest.raises(FileNotFoundError, match="optimizer"):
+            DistributedCheckpointer.load(
+                path=str(tmp_path),
+                state={"model": model, "optimizer": optimizer, "extra_state": {}},
+            )
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permission bits")
+    def test_an_unreadable_marker_is_not_reported_as_an_old_layout(self, mock_gps, tmp_path):
+        """A permissions failure is not the same as an absent marker.
+
+        Both stop the load, but reporting an unreadable file as "not resumable
+        because the layout is old" sends the user to the layout doc for a
+        problem that has nothing to do with the layout. The marker really exists
+        and really cannot be read here, rather than a stubbed ``os.stat``.
+        """
+        from veomni.checkpoint import layout
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        weights = Path(layout.weights_dir(str(tmp_path)))
+        weights.mkdir(parents=True)
+        marker = weights / layout.DCP_MARKER_FILENAME
+        marker.write_text("{}")
+        marker.chmod(0o000)
+        # Complete optimizer half, so the unreadable weights marker is the only
+        # thing left to report.
+        optimizer_dir = Path(layout.optimizer_dir(str(tmp_path)))
+        optimizer_dir.mkdir(parents=True)
+        (optimizer_dir / layout.DCP_MARKER_FILENAME).write_text("{}")
+
+        model, optimizer, _ = self._build(seed=1)
+
+        try:
+            with (
+                patch("veomni.utils.dist_utils.any_rank_failed", side_effect=lambda failed, group=None: failed),
+                patch.object(DistributedCheckpointer, "_create_storage_reader"),
+                patch("veomni.checkpoint.dcp_checkpointer.dcp") as mock_dcp,
+            ):
+                with pytest.raises(PermissionError):
+                    DistributedCheckpointer.load(
+                        path=str(tmp_path),
+                        state={"model": model, "optimizer": optimizer, "extra_state": {}},
+                    )
+        finally:
+            # Left unreadable, the directory cannot be cleaned up.
+            marker.chmod(0o644)
+
+        mock_dcp.load.assert_not_called()
+
+    def test_a_marker_missing_on_this_rank_alone_stops_every_rank(self, mock_gps, tmp_path):
+        """The markers are read from the filesystem, so a checkpoint on
+        non-shared storage (``dcp_save_to_lowest_rank``) can show one on this
+        rank and not on a peer. Raising here alone would walk the peers into
+        ``dcp.load``'s collectives, where they wait out the backend timeout.
+
+        The reduction is what the peers rely on, so it is stubbed to agree here
+        — that it really is reached by a rank whose own markers are fine is what
+        ``TestMarkerValidationAcrossRanks`` runs for real.
+        """
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        model, optimizer, _ = self._build(seed=1)
+
+        with (
+            patch("veomni.utils.dist_utils.any_rank_failed", return_value=True) as agreed,
+            patch.object(DistributedCheckpointer, "_create_storage_reader"),
+            patch("veomni.checkpoint.dcp_checkpointer.dcp") as mock_dcp,
+        ):
+            # The rank that saw the problem reports it; the reduction is what
+            # tells the peers, and it ran before anything collective.
+            with pytest.raises(FileNotFoundError, match="not resumable"):
+                DistributedCheckpointer.load(
+                    path=str(tmp_path),
+                    state={"model": model, "optimizer": optimizer, "extra_state": {}},
+                )
+
+        agreed.assert_called_once()
+        mock_dcp.load.assert_not_called()
 
 
 class TestAllowPartialLoad:
     """DCP load may be partial for optimizer state, but not full model state."""
 
     def test_load_uses_allow_partial_load_planner(self):
-        from veomni.checkpoint.dcp_checkpointer import DefaultLoadPlanner
+        from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 
         planner = DefaultLoadPlanner(allow_partial_load=True)
         assert planner.allow_partial_load is True
 
     @patch("veomni.checkpoint.dcp_checkpointer.get_parallel_state")
     @patch("veomni.checkpoint.dcp_checkpointer.dcp")
-    def test_load_passes_partial_planner_to_dcp(self, mock_dcp, mock_gps):
+    def test_load_passes_partial_planner_to_dcp(self, mock_dcp, mock_gps, tmp_path):
         mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
+        from veomni.checkpoint import layout
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        # Both directories this load reads have to carry their marker, or
+        # ``load`` stops before reaching ``dcp.load``.
+        for directory in (layout.weights_dir(str(tmp_path)), layout.optimizer_dir(str(tmp_path))):
+            Path(directory).mkdir(parents=True)
+            (Path(directory) / layout.DCP_MARKER_FILENAME).write_text("complete")
 
         model = MagicMock()
         model._fqn2spec_info = None
@@ -540,7 +668,7 @@ class TestAllowPartialLoad:
         with patch.object(DistributedCheckpointer, "_load_extra_state"):
             with patch.object(DistributedCheckpointer, "_create_storage_reader") as mock_reader:
                 mock_reader.return_value = MagicMock()
-                DistributedCheckpointer.load(path="/fake", state=state)
+                DistributedCheckpointer.load(path=str(tmp_path), state=state)
 
         # Weights and optimizer live in separate DCP directories, so a resume is
         # two loads.
@@ -558,10 +686,12 @@ class TestAllowPartialLoad:
     def test_full_model_load_rejects_missing_checkpoint_key(self, mock_gps, tmp_path):
         from torch.distributed.checkpoint import CheckpointException
 
+        from veomni.checkpoint import layout
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
-        torch.distributed.checkpoint.save({"model": {"weight": torch.full((2, 2), 7.0)}}, checkpoint_id=tmp_path)
+        weights = layout.weights_dir(str(tmp_path))
+        torch.distributed.checkpoint.save({"model": {"weight": torch.full((2, 2), 7.0)}}, checkpoint_id=weights)
 
         model = nn.Linear(2, 2)
         with pytest.raises(CheckpointException, match=r"model\.bias"):
@@ -569,10 +699,12 @@ class TestAllowPartialLoad:
 
     @patch("veomni.checkpoint.dcp_checkpointer.get_parallel_state")
     def test_trainable_only_model_load_allows_missing_frozen_key(self, mock_gps, tmp_path):
+        from veomni.checkpoint import layout
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         mock_gps.return_value = SimpleNamespace(dp_mode="fsdp2")
-        torch.distributed.checkpoint.save({"model": {"weight": torch.full((2, 2), 7.0)}}, checkpoint_id=tmp_path)
+        weights = layout.weights_dir(str(tmp_path))
+        torch.distributed.checkpoint.save({"model": {"weight": torch.full((2, 2), 7.0)}}, checkpoint_id=weights)
 
         model = nn.Linear(2, 2)
         with torch.no_grad():
@@ -2196,69 +2328,6 @@ class TestStageDirValidation:
         assert torch.load(sidecar, weights_only=False) == previous
         assert (weights / ".metadata").read_text() == "previous"
 
-    def test_a_failed_staged_save_over_a_legacy_step_leaves_it_resumable(self, tmp_path):
-        """Same guarantee, one layout back. A staged save must not invalidate the
-        destination before it has a complete copy to put there, and for a
-        pre-split step the marker that makes it resumable sits at the step root.
-        Dropping it when the save starts would cost the user a checkpoint the
-        save never got far enough to replace.
-        """
-        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
-        from veomni.checkpoint.legacy_v0_1_12 import marker_path
-
-        final = tmp_path / "ckpt"
-        step_root = final / "global_step_10"
-        step_root.mkdir(parents=True)
-        legacy_marker = Path(marker_path(str(step_root)))
-        legacy_marker.write_text("written by an older VeOmni")
-
-        with (
-            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
-            patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=0),
-            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
-            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed, group=None: failed),
-            patch.object(DistributedCheckpointer, "execute_save", side_effect=OSError("dcp write failed")),
-            patch.object(DistributedCheckpointer, "_create_storage_writer"),
-            patch.object(DistributedCheckpointer, "_save_extra_state"),
-            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
-        ):
-            with pytest.raises(OSError, match="dcp write failed"):
-                DistributedCheckpointer.save(
-                    path=str(final),
-                    state={"model": MagicMock()},
-                    save_async=False,
-                    global_steps=10,
-                    stage_dir=str(tmp_path / "stage"),
-                )
-
-        assert legacy_marker.read_text() == "written by an older VeOmni"
-
-    def test_a_staged_save_drops_the_legacy_marker_when_it_promotes(self, tmp_path):
-        """And once the copy is real, the old marker has to go: the step is no
-        longer the pre-split checkpoint that marker describes."""
-        from veomni.checkpoint.dcp_checkpointer import _promote_staged_checkpoint
-        from veomni.checkpoint.legacy_v0_1_12 import marker_path
-
-        stage_path = tmp_path / "stage"
-        (stage_path / "ckpt").mkdir(parents=True)
-        (stage_path / "ckpt" / ".metadata").write_text("new")
-        (stage_path / "ckpt" / "__0_0.distcp").write_text("new-weights")
-
-        step_root = tmp_path / "ckpt" / "global_step_10"
-        step_root.mkdir(parents=True)
-        legacy_marker = Path(marker_path(str(step_root)))
-        legacy_marker.write_text("written by an older VeOmni")
-
-        with (
-            patch("veomni.checkpoint.dcp_checkpointer.dist.is_initialized", return_value=False),
-            patch("veomni.checkpoint.dcp_checkpointer._local_rank", return_value=0),
-            patch("veomni.checkpoint.dcp_checkpointer.any_rank_failed", side_effect=lambda failed, group=None: failed),
-        ):
-            _promote_staged_checkpoint(str(stage_path), str(step_root / "model"), step_root=str(step_root))
-
-        assert not legacy_marker.exists()
-        assert (step_root / "model" / "ckpt" / ".metadata").read_text() == "new"
-
     def test_promotion_replaces_the_destination_rather_than_merging_into_it(self, tmp_path):
         """A weights-only save over a step that has an optimizer. Copying only the
         staged files would leave the previous save's optimizer shards and marker
@@ -2380,35 +2449,6 @@ class TestStageDirValidation:
 
         assert os.path.exists(layout.manifest_path(step_root))
         assert not layout.checkpoint_is_complete(step_root)
-
-    def test_rewriting_a_legacy_step_drops_its_marker_too(self, tmp_path):
-        """A pre-split step is vouched for by a ``.metadata`` at its root. Writing
-        the current layout over it leaves that file untouched — nothing in this
-        layout puts a marker there — so resume discovery would keep accepting the
-        step through its legacy fallback while the rewrite is half done."""
-        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
-        from veomni.checkpoint.legacy_v0_1_12 import marker_path
-
-        final = tmp_path / "ckpt"
-        step_root = final / "global_step_10"
-        step_root.mkdir(parents=True)
-        legacy_marker = Path(marker_path(str(step_root)))
-        legacy_marker.write_text("written by an older VeOmni")
-
-        with (
-            patch.object(DistributedCheckpointer, "execute_save"),
-            patch.object(DistributedCheckpointer, "_create_storage_writer"),
-            patch.object(DistributedCheckpointer, "_save_extra_state"),
-            patch("veomni.checkpoint.dcp_checkpointer.ModelState"),
-        ):
-            DistributedCheckpointer.save(
-                path=str(final),
-                state={"model": MagicMock()},
-                save_async=False,
-                global_steps=10,
-            )
-
-        assert not legacy_marker.exists()
 
     def test_rewriting_a_step_drops_the_modules_own_markers(self, tmp_path):
         """DCP rewrites ``.metadata`` at the end of a successful save, so a save
@@ -2589,8 +2629,8 @@ class TestResumeDiscovery:
 
     A current-layout step is two independent halves, and both have to be down:
     ``checkpoint_manifest.json`` for the per-rank cursor, and DCP's ``.metadata``
-    for each directory the manifest says a module wrote. A pre-split step has
-    neither and is recognised by the ``.metadata`` that used to sit at its root.
+    for each directory the manifest says a module wrote. A step from an older
+    layout has neither and is skipped.
     """
 
     @staticmethod
@@ -2676,27 +2716,15 @@ class TestResumeDiscovery:
 
         assert self._validate(step) == (10 if accepted else None)
 
-    def test_a_legacy_step_is_accepted_by_its_own_marker(self, tmp_path):
-        from veomni.checkpoint.legacy_v0_1_12 import marker_path
+    def test_a_pre_split_step_is_not_discovered(self, tmp_path):
+        """A step written before the split has no manifest, and the marker that
+        used to vouch for it is no longer consulted. Resume skips it rather than
+        picking a step whose layout nothing writes any more."""
+        from veomni.checkpoint import layout
 
         step = tmp_path / "global_step_10"
         step.mkdir()
-        Path(marker_path(str(step))).write_text("legacy")
-
-        assert self._validate(step) == 10
-
-    def test_a_legacy_step_being_rewritten_is_skipped(self, tmp_path):
-        """The current layout never writes a ``.metadata`` at the step root, so
-        one sitting beside a ``model/`` means a rewrite landed on a pre-split
-        step and did not finish. The loader prefers the new tree and would fail
-        on whatever part of it never arrived, so the old marker must not keep the
-        step discoverable."""
-        from veomni.checkpoint import layout
-        from veomni.checkpoint.legacy_v0_1_12 import marker_path
-
-        step = tmp_path / "global_step_10"
-        (step / layout.MODEL_DIRNAME / layout.WEIGHTS_DIRNAME).mkdir(parents=True)
-        Path(marker_path(str(step))).write_text("legacy")
+        Path(step / layout.DCP_MARKER_FILENAME).write_text("from a pre-split save")
 
         assert self._validate(step) is None
 
@@ -2919,3 +2947,74 @@ class TestShardingPlanDropHfKeys:
 
         assert set(plan) == set(expected)
         assert size == expected_size
+
+
+def _marker_validation_worker(rank: int, world_size: int, base: str, endpoint) -> None:
+    """One rank of the marker-validation check; see ``TestMarkerValidationAcrossRanks``.
+
+    Rank 0 sees a complete step, rank 1's weights directory has no ``.metadata``
+    — what a checkpoint on non-shared storage looks like from the rank that did
+    not write it. Each rank reads its own copy of the tree, so the two genuinely
+    disagree. Neither may reach ``dcp.load``.
+    """
+    from veomni.checkpoint import dcp_checkpointer as module
+    from veomni.checkpoint import layout
+
+    os.environ["LOCAL_RANK"] = str(rank)
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=world_size)
+
+    step = os.path.join(base, f"rank_{rank}", "global_step_7")
+    weights = layout.weights_dir(step)
+    os.makedirs(weights, exist_ok=True)
+    if rank == 0:
+        with open(os.path.join(weights, layout.DCP_MARKER_FILENAME), "w") as f:
+            f.write("complete")
+    dist.barrier()
+
+    reached_load = []
+    outcome = "completed"
+    with (
+        patch.object(module, "get_parallel_state", return_value=SimpleNamespace(dp_mode="fsdp2")),
+        patch.object(module.dcp, "load", side_effect=lambda **kw: reached_load.append(kw)),
+        patch.object(module.DistributedCheckpointer, "_create_storage_reader"),
+    ):
+        try:
+            module.DistributedCheckpointer.load(
+                path=step,
+                state={"model": nn.Linear(2, 2), "extra_state": {}},
+            )
+        except BaseException as e:  # noqa: BLE001 - asserted by the test
+            outcome = f"{type(e).__name__}: {e}"
+
+    with open(os.path.join(base, f"outcome_{rank}"), "w") as f:
+        f.write(f"{outcome}\n{len(reached_load)}")
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+class TestMarkerValidationAcrossRanks:
+    """The marker check, run for real on two ranks with different local visibility.
+
+    Rank 0's own markers are fine and only its peer's are missing. A guard that
+    raised locally would leave rank 0 inside ``dcp.load``'s collective waiting
+    for a peer that already left, so what this pins is that rank 0 fails too and
+    never enters the load.
+    """
+
+    def test_a_peer_missing_a_marker_stops_the_rank_that_has_one(self, tmp_path):
+        base = str(tmp_path / "split")
+        os.makedirs(base, exist_ok=True)
+        spawn_with_rendezvous(_marker_validation_worker, args=(2, base), nprocs=2)
+
+        outcomes = []
+        for rank in range(2):
+            outcome, loads = open(os.path.join(base, f"outcome_{rank}")).read().splitlines()
+            outcomes.append(outcome)
+            assert loads == "0", f"rank {rank} entered dcp.load"
+
+        # The rank that saw the problem names it; the one that did not reports the
+        # reduction's verdict. Neither succeeds.
+        assert "FileNotFoundError" in outcomes[1], outcomes
+        assert all(o != "completed" for o in outcomes), outcomes

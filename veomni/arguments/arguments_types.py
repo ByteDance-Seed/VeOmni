@@ -1349,7 +1349,7 @@ class TrainingArguments:
                 logger.warning("load_checkpoint_path should be under output_dir.")
 
         # output_dir/
-        # ├── checkpoints/          # DCP: model + optimizer + lr_scheduler.pt + trainer_state
+        # ├── checkpoints/          # DCP: model + optimizer + per-rank extra_state
         # │   ├── global_step_100/
         # │   └── global_step_200/
         # │       └── hf_ckpt/      # HF safetensors saved under the last checkpoint folder
@@ -1391,6 +1391,8 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
     "swiglu_mlp_implementation": frozenset(),
+    "linear_implementation": frozenset(),
+    "kv_round_implementation": frozenset({"none"}),
     "load_balancing_loss_implementation": frozenset(),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
     "moe_implementation": frozenset({"fused_npu"}),
@@ -1416,6 +1418,8 @@ _MLU_ALLOWED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"liger_kernel"}),
     "rotary_pos_emb_vision_implementation": frozenset({"liger_kernel"}),
     "swiglu_mlp_implementation": frozenset({"liger_kernel"}),
+    "linear_implementation": frozenset(),
+    "kv_round_implementation": frozenset({"none"}),
     "cross_entropy_loss_implementation": frozenset({"liger_kernel", "chunk_loss"}),
     "moe_implementation": frozenset({"fused_mlu", "fused_triton"}),
 }
@@ -1471,7 +1475,7 @@ class OpsImplementationConfig:
 
     - **Config-parse time** (``__post_init__``) for the model-agnostic fields:
       ``rms_norm``, ``rotary_pos_emb``,
-      ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``load_balancing_loss``, plus
+      ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``linear``, ``load_balancing_loss``, plus
       ``cross_entropy_loss`` and ``moe``. Errors fire immediately with a
       model-agnostic allow-list.
     - **Model-build time** (instance-local ``VeomniOp`` resolution) for
@@ -1554,8 +1558,17 @@ class OpsImplementationConfig:
     swiglu_mlp_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'eager'. No NPU backend. "
-            "Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
+            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'qat' (FP8 QAT, SM90+) | 'eager'. "
+            "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
+        },
+    )
+    linear_implementation: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Dense projection. 'qat' (FP8 fake quantization of both GEMM operands, SM90+) | "
+            "'eager' (PyTorch F.linear). "
+            "Unset: 'eager'. Selected independently of swiglu_mlp_implementation: a model that owns its "
+            "own projections reads this field, a model that runs the fused SwiGLU row reads that one."
         },
     )
     rotary_pos_emb_implementation: Optional[str] = field(
@@ -1656,19 +1669,16 @@ class OpsImplementationConfig:
             "and cann_ops_transformer); 'eager' uses PyTorch."
         },
     )
-    qat_implementation: Literal["none", "fp8_blockwise"] = field(
+    kv_round_implementation: Literal["none", "eager", "triton"] = field(
         default="none",
         metadata={
-            "help": "Quantization-aware training recipe for DeepSeek V4. 'fp8_blockwise' makes training "
-            "see the rounding FP8 deployment will: the operands of every linear inference runs as a "
-            "true FP8 GEMM (128x128 weight tiles, 1x128 activation blocks, ue8m0 scales), the NoPE "
-            "channels of every attention KV entry inference caches in FP8 (1x64 blocks), both "
-            "sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path "
-            "(weights per the checkpoint's expert_dtype -- FP4 with 1x32 groups on V4-Flash, "
-            "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
-            "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
-            "recipe rather than an op-registry implementation, so it is not selected through "
-            "VeomniOp -- see veomni/ops/qat/. Must be 'none' when moe_implementation='deepgemm_fp8'."
+            "help": "KV-cache and indexer-activation storage rounding. 'none' leaves stored tensors "
+            "unchanged and is the default, because this family has no host default and its reference "
+            "row ('eager') does round -- unlike every other field, 'eager' here is not 'off'. "
+            "'triton' (GPU) and 'eager' both round stored KV and indexer operands to their inference "
+            "storage dtype on every forward, which is what quantization-aware training needs to see "
+            "deployment's rounding. A model selects the variant that owns its geometry; this field "
+            "only chooses the implementation."
         },
     )
 
@@ -1795,12 +1805,13 @@ class OpsImplementationConfig:
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
-        if self.moe_implementation == "deepgemm_fp8" and self.qat_implementation != "none":
-            raise ValueError(
-                "moe_implementation='deepgemm_fp8' cannot be combined with "
-                f"qat_implementation={self.qat_implementation!r}. Set qat_implementation='none'; "
-                "DeepGEMM already quantizes the expert GEMM operands."
-            )
+        # No cross-family conflict needs rejecting here. ``deepgemm_fp8`` and
+        # ``qat`` are two values of the same ``moe_implementation`` field, so they
+        # cannot both be selected; ``linear_implementation`` and
+        # ``swiglu_mlp_implementation`` are separate GEMMs with separate operands,
+        # so quantizing them alongside a DeepGEMM expert GEMM rounds nothing twice.
+        # The shared expert in particular is a dense SwiGLU FFN, not one of the
+        # routed experts.
 
         from ..utils.device import IS_NPU_AVAILABLE
         from ..utils.import_utils import (
@@ -1846,32 +1857,6 @@ class OpsImplementationConfig:
                         f"Set to one of {allowed}; 'eager' is the universal fallback "
                         f"for ops with no MLU kernel for the current model."
                     )
-
-        # ``qat_implementation`` selects a quantization recipe rather than an
-        # op implementation, so registry resolution does not validate it. Its fake
-        # quantizers are the SM90-only TileLang kernels: without this check a
-        # CPU, NPU, ROCm or pre-SM90 host trains for a while and then raises
-        # inside the first fake-quant call.
-        if self.qat_implementation != "none":
-            import torch
-
-            from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
-
-            unsupported = torch.version.hip is not None or not IS_CUDA_AVAILABLE
-            if not unsupported:
-                # Reading the capability initializes CUDA, and parsing happens
-                # before the trainer calls ``set_device`` -- query this rank's
-                # own GPU so the early context does not land on device 0 for
-                # every rank. The count is NVML-based and needs no context.
-                local_rank = int(os.getenv("LOCAL_RANK", "0"))
-                device = local_rank if local_rank < torch.cuda.device_count() else 0
-                unsupported = get_gpu_compute_capability(device) < 90
-            if unsupported:
-                raise ValueError(
-                    f"qat_implementation={self.qat_implementation!r} requires an SM90 or later NVIDIA CUDA "
-                    f"GPU, because its fake quantizers are the DeepSeek V4 TileLang kernels. "
-                    f"Set it to 'none' to train in the model dtype."
-                )
 
 
 @dataclass

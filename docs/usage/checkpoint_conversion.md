@@ -2,7 +2,7 @@
 
 This guide explains how to convert VeOmni's Distributed Checkpoint (DCP) format to HuggingFace format using the `scripts/merge_dcp_to_hf.py` script.
 
-`--load-dir` is a `global_step_{N}` directory. The script reads the weights from its `model/ckpt/` subdirectory; the optimizer state beside them, the scheduler sidecar and the job cursor are not part of a HuggingFace export and are never opened. You can also point `--load-dir` straight at a DCP directory, which is what a checkpoint written before weights and optimizer were split requires. For the full training-run tree, see [Checkpoint layout](checkpoint.md).
+`--load-dir` is a `global_step_{N}` directory. The script reads the weights from its `model/ckpt/` subdirectory; the optimizer state beside them, the scheduler pickle and the job cursor are not part of a HuggingFace export and are never opened. You can also point `--load-dir` straight at a DCP directory, which a checkpoint written before weights and optimizer were split needs — conversion still accepts those fused directories even though [resume does not](checkpoint.md#older-checkpoints-do-not-resume). For the full training-run tree, see [Checkpoint layout](checkpoint.md).
 
 ## Overview
 

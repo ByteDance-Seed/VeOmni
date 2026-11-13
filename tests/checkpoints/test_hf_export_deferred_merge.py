@@ -15,10 +15,10 @@
 """HF export of an oversized row-sharded ``emb`` table: kept split by rank, merged offline.
 
 Consolidating such a table during training is one rank streaming the whole
-tensor into one file -- about an hour for a 200 GB table on an HDFS mount --
-while the job waits. The export leaves its per-rank shards and a marker instead,
-loaders refuse the directory, and ``scripts/merge_hf_export.py`` writes the
-table out afterwards.
+tensor into one file -- about an hour for DeepSeek-V4.1's 197 GB n-gram tables
+on an HDFS mount -- while the job waits. The export leaves its per-rank shards
+and a marker instead, loaders refuse the directory, and
+``scripts/merge_hf_export.py`` writes the table out afterwards.
 """
 
 import importlib.util
@@ -39,7 +39,6 @@ from safetensors.torch import load_file
 from torch.distributed.tensor import Replicate, Shard
 
 import veomni.utils.save_safetensor_utils as save_utils
-from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint.layout import HF_PENDING_MERGE_FILENAME, HF_SHARDED_DIRNAME
 from veomni.models.checkpoint.weights import _resolve_safetensors_shards, _resolve_state_dict_iterators
 
@@ -116,7 +115,6 @@ def _load_export(save_path: str) -> dict:
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo required")
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=WORLD_SIZE, device="cpu"))
 def test_an_emb_sharded_table_is_kept_split_and_merged_offline():
     with tempfile.TemporaryDirectory() as tmp:
         save_path = os.path.join(tmp, "hf_ckpt", "ngram")
@@ -235,3 +233,25 @@ def test_the_merge_script_finds_every_pending_export_below_a_root():
         pending, orphaned = script.scan(root)
         assert pending == [os.path.join(root, "ngram"), os.path.join(root, "text_encoder")]
         assert orphaned == [os.path.join(root, "llm", HF_SHARDED_DIRNAME)]
+
+
+def test_deferred_emb_table_with_checkpoint_row_counts_crops_padded_tail_on_merge():
+    """When a model converter reports ``checkpoint_row_counts``, deferred merge writes only logical rows."""
+    padded_rows = WORLD_SIZE * ROWS  # 12
+    logical_rows = padded_rows - 2  # 10 (last rank's 3-row shard is clipped to 1 row)
+    table = torch.cat([_local_rows(rank) for rank in range(WORLD_SIZE)])
+    spec = SimpleNamespace(para_name="emb", placement=Shard(0))
+    model = _model(spec)
+    model._create_checkpoint_tensor_converter = lambda _m: SimpleNamespace(
+        checkpoint_row_counts=lambda: {"table": (logical_rows, padded_rows)}
+    )
+    with tempfile.TemporaryDirectory() as save_path:
+        _export(model, {"table": table, **_replicated()}, save_path)
+        pending = json.loads((Path(save_path) / HF_PENDING_MERGE_FILENAME).read_text())["tensors"]
+        assert pending["table"]["shape"] == [logical_rows, COLS]
+        assert pending["table"]["nbytes"] == logical_rows * COLS * table.element_size()
+
+        save_utils.merge_pending_hf_shards(save_path)
+        loaded = _load_export(save_path)
+        assert tuple(loaded["table"].shape) == (logical_rows, COLS)
+        torch.testing.assert_close(loaded["table"], table[:logical_rows], atol=0, rtol=0)

@@ -160,6 +160,7 @@ class OmniHFLayout:
     training_graphs: GraphFiles | None = None
     generation_graphs: GraphFiles | None = None
     infer_type: str | None = None
+    generation_kwargs: Mapping[str, Any] | None = None
     load_hf_config: Callable[[str], PretrainedConfig] | None = field(default=None, compare=False)
 
     @cached_property
@@ -261,6 +262,45 @@ class OmniHFLayout:
             logger.warning_rank0(f"OmniHFLayout: no default graphs ({e}); the launcher must supply them.")
             return {}, {}
 
+    def source_weight_files(self, source_path: str) -> dict[str, str]:
+        """``{weight key: shard filename}`` of a safetensors HF checkpoint."""
+        return source_weight_files(source_path)
+
+    def resolve_weights_path(self, source_path: str) -> str:
+        """Directory :func:`load_model_weights` reads safetensors from for ``source_path``."""
+        return source_path
+
+    def extract_module_save_state(
+        self,
+        module_name: str,
+        model: torch.nn.Module,
+        parallel_state: Any = None,
+    ) -> Mapping[str, torch.Tensor]:
+        """``{module_key: tensor}`` to export for live ``model`` of ``module_name``."""
+        from ....checkpoint.dcp_checkpointer import ModelState
+
+        del module_name
+        return ModelState(model, parallel_state=parallel_state).state_dict()
+
+    def build_fqn_to_index_mapping(self, weight_files: Mapping[str, str]) -> dict[str, int]:
+        """Map each source key in ``weight_files`` to its 1-based ``HuggingFaceStorageWriter`` shard index."""
+        single_file = set(weight_files.values()) == {_SAFE_WEIGHTS_NAME}
+        return {
+            key: 1 if single_file else shard_index_from_filename(filename) for key, filename in weight_files.items()
+        }
+
+    def finalize_exported_shards(
+        self,
+        source_path: str,
+        save_path: str,
+        weight_files: Mapping[str, str],
+    ) -> None:
+        """Finalize consolidated safetensors shard filenames in ``save_path`` on rank 0."""
+        del source_path
+        if set(weight_files.values()) != {_SAFE_WEIGHTS_NAME}:
+            return
+        _restore_single_file_name(save_path)
+
 
 @dataclass(frozen=True)
 class HFSource:
@@ -273,6 +313,10 @@ class HFSource:
     def layout(self) -> OmniHFLayout:
         return get_hf_layout(self.model_type, self.path)
 
+    @property
+    def weights_path(self) -> str:
+        return self.layout.resolve_weights_path(self.path)
+
 
 @functools.lru_cache(maxsize=None)
 def get_hf_layout(model_type: str, source_path: str | None = None) -> OmniHFLayout:
@@ -283,9 +327,14 @@ def get_hf_layout(model_type: str, source_path: str | None = None) -> OmniHFLayo
     per-layer rename needs the layer count -- can read its config. A layout
     built for one path is reused for it.
     """
+    import inspect
+
     import veomni.models.seed_omni.modules  # noqa: F401  (registers every family's layout)
 
-    return OMNI_HF_LAYOUT_REGISTRY[model_type](source_path)
+    factory = OMNI_HF_LAYOUT_REGISTRY[model_type]
+    if inspect.signature(factory).parameters:
+        return factory(source_path)
+    return factory()
 
 
 def has_hf_layout(model_type: str | None) -> bool:
@@ -362,6 +411,7 @@ def _write_hf_view(source: HFSource) -> str:
         training_graphs=training_graphs,
         generation_graphs=generation_graphs,
         infer_type=layout.infer_type,
+        generation_kwargs=dict(layout.generation_kwargs) if layout.generation_kwargs is not None else None,
     )
     config._module_configs = dict(module_configs)
     config.save_pretrained(view)
@@ -595,12 +645,12 @@ def load_module_from_hf_source(
             f"Loading '{module_name}' from a HuggingFace checkpoint cannot offload to disk: {device_map}."
         )
     if len(devices) == 1:
-        load_model_weights(model, source.path, init_device=devices.pop())
+        load_model_weights(model, source.weights_path, init_device=devices.pop())
         return model
 
     from accelerate import dispatch_model
 
-    load_model_weights(model, source.path, init_device="cpu")
+    load_model_weights(model, source.weights_path, init_device="cpu")
     dispatch_model(
         model,
         device_map=device_map,
@@ -631,14 +681,15 @@ def convert_with_hf_layout(
     source = HFSource(path=os.path.realpath(model_path), model_type=model_type)
     layout = source.layout
     hf_config = layout.read_hf_config(source.path)
-    dtype = getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", None)
-    if isinstance(dtype, str):
-        dtype = getattr(torch, dtype)
+    default_dtype = getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", None)
     module_configs = {name: module.build_config(hf_config) for name, module in layout.modules.items()}
     assets = layout.build_module_assets(source.path)
     modules = {}
     for name, module_config in module_configs.items():
         logger.info_rank0(f"convert: loading module '{name}' from {source.path}")
+        module_dtype = getattr(module_config, "dtype", None) or default_dtype
+        if isinstance(module_dtype, str):
+            module_dtype = getattr(torch, module_dtype)
         module_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
         module = load_module_from_hf_source(
             module_cls,
@@ -646,7 +697,7 @@ def convert_with_hf_layout(
             source,
             name,
             device_map="cpu",
-            torch_dtype=dtype,
+            torch_dtype=module_dtype,
             attn_implementation=attn_implementation,
         )
         modules[name] = attach_module_assets(module, **assets[name])
@@ -658,6 +709,7 @@ def convert_with_hf_layout(
         "training_graphs": training_graphs,
         "generation_graphs": generation_graphs,
         "infer_type": layout.infer_type if layout.infer_type in generation_graphs else None,
+        "generation_kwargs": dict(layout.generation_kwargs) if layout.generation_kwargs is not None else None,
     }
 
 
@@ -869,13 +921,12 @@ def save_hf_source_checkpoint(
     except ImportError:  # torch 2.10 (the NPU stack) has only the single-process helper
         consolidate_safetensors_files_on_every_rank = None
 
-    from ....checkpoint.dcp_checkpointer import ModelState
     from ....checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
     from ....utils.save_safetensor_utils import _consolidation_process_group
 
     apply_dcp_consolidation_patch()
     layout = source.layout
-    weight_files = source_weight_files(source.path)
+    weight_files = layout.source_weight_files(source.path)
     source_specs = source_tensor_specs(source.path, weight_files)
 
     save_state: dict[str, torch.Tensor] = {}
@@ -883,7 +934,7 @@ def save_hf_source_checkpoint(
     # rank only, so "produced" is decided across ranks, not from save_state.
     produced: set[str] = set()
     for name, (model, parallel_state) in modules.items():
-        module_state = ModelState(model, parallel_state=parallel_state).state_dict()
+        module_state = layout.extract_module_save_state(name, model, parallel_state)
         tied = _tied_parameter_names(model)
         # The hook answers in *source* terms, so it must see the source's own key
         # layout: a model that declares weight conversions has a state dict in
@@ -961,10 +1012,7 @@ def save_hf_source_checkpoint(
         # be most of the checkpoint, more than one process should hold.
         save_state.update(_read_carried_tensors(source.path, weight_files, source_specs, carried))
 
-    single_file = set(weight_files.values()) == {_SAFE_WEIGHTS_NAME}
-    fqn_to_index_mapping = {
-        key: 1 if single_file else shard_index_from_filename(filename) for key, filename in weight_files.items()
-    }
+    fqn_to_index_mapping = layout.build_fqn_to_index_mapping(weight_files)
     sharded_path = os.path.join(save_path, _DCP_STAGING_DIRNAME)
     storage_writer = HuggingFaceStorageWriter(
         path=sharded_path,
@@ -1001,8 +1049,7 @@ def save_hf_source_checkpoint(
 
     if not dist.is_initialized() or dist.get_rank() == 0:
         shutil.rmtree(sharded_path, ignore_errors=True)
-        if single_file:
-            _restore_single_file_name(save_path)
+        layout.finalize_exported_shards(source.path, save_path, weight_files)
         copy_source_non_weight_files(source.path, save_path)
     if dist.is_initialized():
         dist.barrier(group=group)
