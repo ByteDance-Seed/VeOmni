@@ -446,9 +446,9 @@ class TextDPOTrainer:
             return loss, loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        self.state.global_step += 1
-
         micro_batches: List[Dict[str, Any]] = next(data_iterator)
+
+        self.state.global_step += 1
 
         self.base._reset_async_activation_offload_if_enabled(self.policy_model)
         self.on_step_begin(micro_batches=micro_batches)
