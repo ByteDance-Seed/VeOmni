@@ -124,7 +124,7 @@ Neither marker can stand in for the other. The manifest is written while the
 async DCP saves may still be in flight, so it says nothing about the model; a
 `.metadata` covers one directory and knows nothing about the loader, the job
 cursor, or its sibling modules. Module markers are not interchangeable either —
-in `configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml`, `janus_siglip`
+in `configs/seed_omni/Janus/janus/train/modules_train.yaml`, `janus_siglip`
 runs DDP while `janus_llama` runs FSDP2, so each records a different topology.
 
 Resume discovery accepts a `global_step_{N}/` directory only when both halves
