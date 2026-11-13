@@ -96,7 +96,8 @@ class OptimizerConfig:
                 "Optimizer-managed state offload. 'none' disables it (training state may still be "
                 "offloaded by model.accelerator.fsdp_config.offload); 'cpu' keeps the moment states "
                 "in host buffers and streams them to the device in batches, lowering peak device "
-                "memory (type='adamw' only)."
+                "memory (type='adamw' only). This cannot be combined with selective ExtraParallel "
+                "CPU offload."
             )
         },
     )
@@ -621,8 +622,21 @@ class MixedPrecisionConfig:
         default=True,
         metadata={"help": "Enable mixed precision cast forward inputs (FSDP2)."},
     )
+    npu_expert_fp32_wgrad: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Compute NPU fused MoE expert weight gradients in FP32 while keeping BF16 forward and "
+                "input gradients. Currently supports Qwen4-Exp with FSDP2, BF16 parameters, FP32 "
+                "reduction, and native communication; increases expert gather and temporary memory."
+            )
+        },
+    )
 
     def __post_init__(self):
+        if not isinstance(self.npu_expert_fp32_wgrad, bool):
+            raise ValueError("npu_expert_fp32_wgrad must be a boolean (true or false).")
+
         def _check_dtype(dtype: str):
             if dtype is not None and dtype not in ["bfloat16", "float32", "float16"]:
                 raise ValueError(f"Invalid dtype {dtype} for mixed precision training.")
@@ -726,6 +740,14 @@ class FSDPConfig:
             )
         },
     )
+    cpu_offload_extra_parallel_names: List[str] = field(
+        default_factory=list,
+        metadata={"help": "CPU-offload selected ExtraParallel parameter/gradient groups (currently ep only)."},
+    )
+    cpu_offload_exclude_module_patterns: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Keep matching selected expert modules resident on the accelerator; complete FQN patterns."},
+    )
     expert_fsdp_shard_dim: Optional[int] = field(
         default=None,
         metadata={
@@ -761,6 +783,13 @@ class FSDPConfig:
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
 
     def __post_init__(self):
+        if self.cpu_offload_exclude_module_patterns and not self.cpu_offload_extra_parallel_names:
+            raise ValueError("Resident module exclusions require selective ExtraParallel CPU offload")
+        if self.cpu_offload_extra_parallel_names:
+            if self.fsdp_mode != "fsdp2" or self.offload:
+                raise ValueError("Selective ExtraParallel CPU offload requires FSDP2 and global offload=False")
+            if self.cpu_offload_extra_parallel_names != ["ep"]:
+                raise ValueError("Only the ep ExtraParallel axis supports selective CPU offload")
         if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
             raise ValueError(
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
@@ -1997,6 +2026,10 @@ class ModelArguments(BaseModelArguments):
             raise ValueError(
                 "model.optimizer.state_offload='cpu' cannot be combined with "
                 "model.accelerator.fsdp_config.offload; both move training state to host."
+            )
+        if self.optimizer.state_offload == "cpu" and self.accelerator.fsdp_config.cpu_offload_extra_parallel_names:
+            raise ValueError(
+                "model.optimizer.state_offload='cpu' cannot be combined with selective ExtraParallel CPU offload."
             )
         # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
