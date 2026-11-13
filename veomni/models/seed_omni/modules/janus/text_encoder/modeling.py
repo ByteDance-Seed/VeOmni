@@ -172,13 +172,18 @@ class JanusTextEncoder(TextEncoder):
                 break
             input_ids.extend([pad_id] * len(part.value))
 
-        # Positions the conditional side has generated (each output row is one
-        # token, already merged into a single row by ``maybe_merge_outputs``).
+        # Positions the conditional side has already attended to *before* the token
+        # this span starts with. The sampled ``<boi>`` is already merged into the
+        # tail row at arming time, but the backbone feeds it as the span's first
+        # input — counting it here would put the unconditional branch one position
+        # ahead of the conditional one. ``emit_image_start`` pops the priming row
+        # before arming, so there the subtraction is a no-op.
         generated = sum(
             int(part.value.size(-2)) if part.value is not None and hasattr(part.value, "size") else 0
             for part in conversation_list
             if part.type == "output"
         )
+        generated = max(generated - 1, 0)
         if generated:
             input_ids.extend([pad_id] * generated)
 

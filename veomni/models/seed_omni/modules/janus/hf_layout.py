@@ -53,19 +53,24 @@ the name is private to this module and never serialised.
 
 def _tie_verdict_from_weights(
     source_path: str, weight_files: Mapping[str, str], head_key: str, embed_key: str
-) -> bool | None:
-    """Whether the text encoder should tie, judged from the stored tensors.
+) -> str | None:
+    """How the stored tensors relate to each other: ``"absent"`` / ``"equal"`` / ``"different"``.
 
-    ``transformers`` ties when the config asks *and* the stored head is either
-    absent or byte-identical to the embedding; it refuses only when both keys are
-    present with different values. Returns ``None`` when there is nothing to read.
+    The three cases want different answers, so the verdict is not a bool:
+
+    * ``"absent"`` — no head is stored, so the head *is* the embedding. Tying is the
+      only option; an independent head would be randomly initialised.
+    * ``"equal"`` — a tied model that wrote the duplicate out. Tying keeps SFT from
+      drifting the pair apart, but the config may still say they are separate.
+    * ``"different"`` — a genuinely independent head, which must load its own copy.
+
+    Returns ``None`` when there is nothing to read.
     """
 
     from safetensors import safe_open
 
     if head_key not in weight_files:
-        # A tied export omits the key: the head is the embedding.
-        return True
+        return "absent"
     if embed_key not in weight_files:
         return None
     tensors = {}
@@ -74,10 +79,8 @@ def _tie_verdict_from_weights(
             tensors[key] = f.get_tensor(key)
     head, embed = tensors[head_key], tensors[embed_key]
     if head.shape != embed.shape or head.dtype != embed.dtype:
-        return False
-    # Equal values mean a tied model that wrote the duplicate out; keep the tie so
-    # SFT cannot drift head and embedding apart.
-    return bool(torch.equal(head, embed))
+        return "different"
+    return "equal" if torch.equal(head, embed) else "different"
 
 
 def _siglip_config(hf_config: Any) -> JanusSiglipConfig:
@@ -106,24 +109,30 @@ def _config_allows_tie(hf_config: Any) -> bool:
 def _tie_word_embeddings(hf_config: Any) -> bool:
     """Whether the text encoder can tie its head to the input embedding.
 
-    A tie needs both the config's permission and weights that support it:
+    The config states intent, the weights state fact, and each stored-tensor case
+    wants a different answer:
 
-    * **The config must ask.** An explicit ``tie_word_embeddings: false`` — on the
-      top level or the nested ``text_config`` — is the author's decision; a
-      checkpoint that happens to store two equal tensors anyway must not be
-      re-tied behind their back, because SFT would then couple them.
-    * **The weights must allow it.** ``transformers`` declines to tie when the head
-      and embedding are stored with *different* values, and warns; with the key
-      absent it is a genuinely tied export. Comparing the tensors also catches a
-      tied model that wrote the duplicate out (two *equal* tensors), where
-      splitting them into independent weights would let SFT drift them apart.
+    * **No stored head** — the head *is* the embedding. Tying is the only option:
+      an independent head would be **randomly initialised**, which silently
+      corrupts every logit. This outranks the config, because an outer ``True``
+      beside an untied ``text_config`` is exactly how a tied export looks.
+    * **A stored head identical to the embedding** — a tied model that wrote the
+      duplicate out. Tie unless the config explicitly asks for separate weights, so
+      a deliberate ``tie_word_embeddings: false`` is not overridden but a tied pair
+      cannot drift apart under SFT.
+    * **A stored head with different values** — load it independently.
 
-    When the weights cannot be inspected, only the config's word is available.
+    With nothing to inspect, fall back to the config's word — the same AND
+    :func:`~veomni.models.checkpoint.weights.post_process_after_weight_loading`
+    applies to the loaded module.
     """
-    if not _config_allows_tie(hf_config):
+    verdict = getattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, None)
+    if verdict == "absent":
+        return True
+    if verdict == "different":
         return False
-    matches = getattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, None)
-    return True if matches is None else matches
+    # ``"equal"`` (or nothing to inspect): the config decides.
+    return _config_allows_tie(hf_config)
 
 
 def _text_encoder_config(hf_config: Any) -> JanusTextEncoderConfig:
@@ -230,6 +239,21 @@ class JanusHFLayout(OmniHFLayout):
         return hf_config
 
 
+JANUS_GENERATION_KWARGS: dict[str, Any] = {
+    "max_new_tokens": 2048,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "do_sample": False,
+    "guidance_scale": 5.0,
+}
+"""Default decode settings for every Janus generation scenario.
+
+``guidance_scale`` is what arms classifier-free guidance on the image span; it
+belongs here rather than only in the converter, so an HF checkpoint loaded
+directly (no offline convert) generates images the same way.
+"""
+
+
 JANUS_HF_LAYOUT = JanusHFLayout(
     modules={
         "janus_siglip": OmniHFModuleLayout(
@@ -275,6 +299,7 @@ JANUS_HF_LAYOUT = JanusHFLayout(
         "infer_interleave": "infer/graph_infer_interleave.yaml",
     },
     infer_type="infer_interleave",
+    generation_kwargs=dict(JANUS_GENERATION_KWARGS),
 )
 
 

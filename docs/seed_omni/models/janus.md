@@ -73,10 +73,11 @@ python scripts/seed_omni/convert_model.py \
 ```
 
 The `output_dir` is then a split-checkpoint root (a folder of per-module
-subfolders, not a single HF checkpoint). The converter is also the only path for
-a DeepSeek ``multi_modality`` source, which it rewrites to the HF layout first,
-and the only one that records the family's generation defaults (`guidance_scale`
-among them) and the tokenizer-derived `gen_image_token_id`.
+subfolders, not a single HF checkpoint). The split goes through the same layout
+as the direct load, so the two produce identical modules — including the family's
+generation defaults (`guidance_scale` among them), which the layout declares. The
+only thing the converter adds is DeepSeek's own `multi_modality` format, which it
+rewrites to the HF layout before splitting.
 
 ---
 
@@ -260,33 +261,46 @@ to `--model.model_path` (the layout loads it again) or to `transformers`:
 
 Two cases do **not** produce that merged export:
 
-- A **LoRA** run saves adapters per module instead. With only LoRA-trained
-  modules there is no `hf_ckpt/` at all; with mixed full/LoRA modules the merged
-  export carries the original bases, not the adapter updates. Point
-  `model.model_path` at the base checkpoint (upstream root or split root) and set
-  `model.lora_config.lora_adapter` to the adapter directory
-  (`<output_dir>/checkpoints/global_step_N/lora_ckpt`) instead of using `hf_ckpt/`.
+- A **LoRA** run saves adapters per module, under
+  `hf_ckpt/lora_ckpt/<module>/` rather than as one merged checkpoint. Point
+  `model.model_path` at the base checkpoint (upstream root or split root) and give
+  each module its own adapter directory, e.g.
+  `--model.model_config.modules.janus_llama.lora_config.lora_adapter=<...>/lora_ckpt/janus_llama`
+  (repeat per trained module). A mixed full-parameter + LoRA run needs both: the
+  merged export carries the full-parameter modules' *updated* weights, so keep it
+  and layer the adapters on top — using only `hf_ckpt/` there would drop the LoRA
+  updates.
 - A module that ended up **fully frozen** (for example one whose LoRA targets
-  matched nothing) has no per-module export, so the assembled root below would
-  lack its weights. Copy those modules from the original checkpoint.
+  matched nothing) produces no export of its own.
 
 A split-checkpoint run (no HF layout to write back to) instead writes per-module
-folders under `hf_ckpt/<module>/`; assemble those into a flat root by linking
-each module's folder to `<root>/<module>`. A module with no `hf_ckpt/` folder was
-fully frozen, so it comes from `$ORIG` instead:
+folders under `hf_ckpt/<module>/` (and `hf_ckpt/lora_ckpt/<module>/` for adapters).
+Assemble those into a flat root by linking each module's folder to
+`<root>/<module>`. Treat a **missing** directory as an error rather than
+substituting the original weights: a module can be absent because the export
+failed or because it was frozen, and silently loading the untrained copy would
+hide a lost update. Confirm which modules the run was meant to export, then either
+link the trained ones or copy the deliberately-frozen ones from `$ORIG` by name:
 
 ```bash
 STEP=outputs/janus_1.3b_omni_sft/checkpoints/global_step_20
 ASM=outputs/janus_1.3b_omni_sft/infer_ckpt/global_step_20
 ORIG=/path/to/split/checkpoint          # the step-1 convert output
+FROZEN=""                               # space-separated modules you know were frozen
 mkdir -p "$ASM"
 for m in janus_siglip janus_vqvae janus_text_encoder janus_llama; do
   src="$STEP/hf_ckpt/$m"
-  [ -d "$src" ] || src="$ORIG/$m"
-  [ -d "$src" ] || { echo "missing module: $m" >&2; exit 1; }
+  case " $FROZEN " in
+    *" $m "*) [ -d "$ORIG/$m" ] || { echo "frozen module missing from ORIG: $m" >&2; exit 1; }
+              src="$ORIG/$m" ;;
+  esac
+  [ -d "$src" ] || { echo "no export for $m and it is not listed as frozen — check the run: $src" >&2; exit 1; }
   ln -sfn "$(realpath "$src")" "$ASM/$m"
 done
 ```
+
+Setting `FROZEN` explicitly is what distinguishes "this module was never meant to
+train" from "this export did not happen".
 
 Then pass `--model.model_path "$ASM"`.
 

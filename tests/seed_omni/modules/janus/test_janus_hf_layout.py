@@ -20,7 +20,7 @@ from transformers import JanusConfig, JanusVisionConfig, JanusVQVAEConfig, Llama
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni.modeling_omni import OmniModel
-from veomni.models.seed_omni.modules.janus.hf_layout import JANUS_HF_LAYOUT
+from veomni.models.seed_omni.modules.janus.hf_layout import JANUS_GENERATION_KWARGS, JANUS_HF_LAYOUT
 from veomni.models.seed_omni.utils.hf_layout import (
     read_hf_source,
     resolve_omni_checkpoint_root,
@@ -36,7 +36,7 @@ LLAMA = "janus_llama"
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def _janus_config(*, tied: bool = False) -> JanusConfig:
+def _janus_config(*, tied: bool = False, nested_tied: bool | None = None) -> JanusConfig:
     """A Janus config small enough to build on CPU.
 
     ``tied`` follows the top-level field, which is what
@@ -52,7 +52,7 @@ def _janus_config(*, tied: bool = False) -> JanusConfig:
         num_key_value_heads=1,
         head_dim=8,
         max_position_embeddings=64,
-        tie_word_embeddings=tied,
+        tie_word_embeddings=tied if nested_tied is None else nested_tied,
     )
     vision_config = JanusVisionConfig(
         hidden_size=8,
@@ -126,6 +126,7 @@ def _write_hf_checkpoint(
     sharded: bool = False,
     tied: bool = False,
     store_tied_head: bool = False,
+    nested_tied: bool | None = None,
 ) -> dict[str, torch.Tensor]:
     """Write a tiny upstream Janus root.
 
@@ -136,7 +137,7 @@ def _write_hf_checkpoint(
     """
     from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
-    config = _janus_config(tied=tied)
+    config = _janus_config(tied=tied, nested_tied=nested_tied)
     root.mkdir(parents=True)
     config.save_pretrained(root)
     JanusImageProcessor(image_size=8, patch_size=4).save_pretrained(root)
@@ -257,27 +258,38 @@ def test_the_backbone_never_ties_itself():
 
 
 @pytest.mark.parametrize(
-    ("tied", "store_tied_head", "expect_head", "stale_top_flag", "equal_weights"),
+    ("tied", "nested_tied", "store_tied_head", "expect_head", "equal_weights"),
     [
         # Janus-1.3B: untied config, the file stores its own distinct head.
-        (False, False, True, False, False),
+        (False, None, False, True, False),
         # A genuinely tied export omits lm_head.weight.
-        (True, False, False, False, False),
+        (True, None, False, False, False),
         # Tied config and the duplicate stored with *equal* values: transformers
         # keeps the tie there, so the head must stay tied rather than become an
         # independent copy that SFT would drift away from the embedding.
-        (True, True, False, False, True),
-        # A stale top-level flag beside an untied text_config means the file has a
-        # head: build it rather than substituting the embedding.
-        (False, False, True, True, False),
-        # The config outranks what the tensors look like: explicitly untied with
-        # two equal tensors still keeps its own head, so SFT cannot couple them.
-        (False, False, True, False, True),
+        (True, None, True, False, True),
+        # The config outranks equal tensors: explicitly untied on both levels with
+        # two equal stored tensors still keeps its own head.
+        (False, None, False, True, True),
+        # Outer ``True`` beside an untied ``text_config`` with a stored, distinct
+        # head: a stale top-level flag must not drop it.
+        (True, False, True, True, False),
+        # Same flags with NO stored head: there is no tensor to load into an
+        # independent head, so tying is the only option — building one anyway left
+        # it randomly initialised, corrupting every logit.
+        (True, False, False, False, False),
     ],
-    ids=["untied", "tied", "tied-with-duplicate", "stale-top-flag", "untied-equal-weights"],
+    ids=[
+        "untied",
+        "tied",
+        "tied-with-duplicate",
+        "untied-equal-weights",
+        "outer-tied-nested-untied-with-head",
+        "outer-tied-nested-untied-no-head",
+    ],
 )
 def test_the_layout_decides_tying_from_the_config_and_the_stored_weights(
-    tmp_path, tied, store_tied_head, expect_head, stale_top_flag, equal_weights
+    tmp_path, tied, nested_tied, store_tied_head, expect_head, equal_weights
 ):
     """A tie needs the config's permission and weights that support it.
 
@@ -287,17 +299,11 @@ def test_the_layout_decides_tying_from_the_config_and_the_stored_weights(
     tied pair. This pins every combination end to end.
     """
     root = tmp_path / "Janus-tiny"
-    tensors = _write_hf_checkpoint(root, tied=tied, store_tied_head=store_tied_head)
+    tensors = _write_hf_checkpoint(root, tied=tied, nested_tied=nested_tied, store_tied_head=store_tied_head)
 
     if equal_weights:
         tensors["lm_head.weight"] = tensors["model.language_model.embed_tokens.weight"].clone()
         save_file(tensors, root / "model.safetensors", metadata={"format": "pt"})
-    if stale_top_flag:
-        config_path = root / "config.json"
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        config["tie_word_embeddings"] = True
-        config_path.write_text(json.dumps(config), encoding="utf-8")
-
     model = OmniModel.from_pretrained(str(root), dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager")
     text_encoder = model.modules_dict[TEXT_ENCODER]
     assert (text_encoder.lm_head is not None) is expect_head
@@ -390,14 +396,12 @@ def test_export_writes_back_the_source_layout(tmp_path, sharded):
 
 @pytest.mark.parametrize("tied", [False, True], ids=["untied", "tied"])
 def test_offline_convert_matches_the_runtime_load(tmp_path, tied):
-    """Both entry points must produce the same module weights.
+    """The offline convert and the direct load must agree.
 
-    A layout gives the offline convert *and* the direct load; that only holds if
-    the two agree, which is the property this pins. Parametrised over the tie
-    flag because the two paths used to read it from different config levels, so
-    a mismatch only showed up on a tied (or stale-flag) checkpoint. The converter
-    additionally records ``generation_kwargs``, so compare weights, not root
-    configs.
+    ``convert_checkpoint`` now routes a standard HF root through the layout, so
+    this pins that the split it writes is what the runtime load reads back — and
+    that the defaults the layout declares (``generation_kwargs``, ``infer_type``)
+    survive into the split root's config.
     """
     from safetensors.torch import load_file
 
@@ -409,8 +413,12 @@ def test_offline_convert_matches_the_runtime_load(tmp_path, tied):
 
     split = tmp_path / "split"
     convert_checkpoint(str(root), str(split), attn_implementation="eager")
-    assert json.loads((split / "config.json").read_text(encoding="utf-8"))["model_type"] == "omni"
+    root_config = json.loads((split / "config.json").read_text(encoding="utf-8"))
+    assert root_config["model_type"] == "omni"
     assert read_hf_source(split) is None
+    # The layout's decode defaults reach the split root, not just the offline path.
+    assert root_config["generation_kwargs"] == JANUS_GENERATION_KWARGS
+    assert root_config["infer_type"] == "infer_interleave"
 
     from_layout = tmp_path / "from_layout"
     _save_converted_omni(str(from_layout), **convert_with_hf_layout(str(root), attn_implementation="eager"))
