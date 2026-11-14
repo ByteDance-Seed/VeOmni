@@ -621,8 +621,13 @@ def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch):
     assert pipe.dit.dit.final_layer.video_out.weight.dtype == torch.float32
     assert pipe.dit.dit.final_layer.pdd_out[0].weight.dtype == torch.float32
 
+    torch.manual_seed(0)
     image = pipe("a cat", height=32, width=32, min_generation_area=1024, seed=0)
     assert image.size == (32, 32)
+    torch.manual_seed(0)
+    array = pipe("a cat", height=32, width=32, min_generation_area=1024, seed=0, output_type="np")
+    assert array.dtype.name == "uint8"
+    assert array.tobytes() == image.tobytes()
 
     from veomni.models.diffusers.minimax_h3_image import inference as inference_module
 
@@ -640,6 +645,61 @@ def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch):
         seed=0,
     )
     assert edit.size == (64, 64)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("sigmas", [[1.0, 0.0], [1.0, 0.75, 0.5, 0.0]])
+def test_minimax_h3_image_pipeline_rejects_mismatched_pdd_schedule_before_loading(tmp_path, sigmas):
+    save_file(
+        {"video_out.weight": torch.zeros(2, 1, 1), "video_out.bias": torch.zeros(2, 1)},
+        tmp_path / "pdd_fused_heads.safetensors",
+    )
+    (tmp_path / "pdd_config.json").write_text(json.dumps({"sigmas": sigmas}))
+
+    with pytest.raises(ValueError, match=rf"{len(sigmas) - 1}.*2 PDD heads"):
+        MiniMaxH3ImagePipeline.from_pretrained(str(tmp_path), device="cpu")
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("failure_phase", ["text_stage", "text_encode", "vae_stage", "reference_encode"])
+def test_minimax_h3_image_pipeline_offloads_conditioning_on_failure(monkeypatch, failure_phase):
+    from veomni.models.diffusers.minimax_h3_image import inference as inference_module
+
+    failure = RuntimeError("conditioning failed")
+    calls = []
+
+    class FakeConditionModel:
+        def encode_text(self, prompt, reference_images=None, device=None, dtype=None):
+            if failure_phase == "text_encode":
+                raise failure
+            return torch.zeros(1, 1, 16), torch.tensor([1])
+
+        def encode_reference_images(self, images, generator=None, device=None):
+            raise failure
+
+    pipe = MiniMaxH3ImagePipeline(device="cpu")
+    pipe.condition_model = FakeConditionModel()
+    pipe.text_encoder = torch.nn.Linear(1, 1)
+    pipe.vae = torch.nn.Linear(1, 1)
+    pipe.dit = torch.nn.Linear(1, 1)
+
+    def stage(names):
+        calls.append(("stage", tuple(names)))
+        if (failure_phase == "text_stage" and names == ["text_encoder"]) or (
+            failure_phase == "vae_stage" and names == ["vae"]
+        ):
+            raise failure
+
+    monkeypatch.setattr(pipe, "_stage", stage)
+    monkeypatch.setattr(pipe, "_offload", lambda names: calls.append(("offload", tuple(names))))
+    monkeypatch.setattr(inference_module, "_resize_reference", lambda image, *_args: image)
+    references = [Image.new("RGB", (32, 32))] if failure_phase in ("vae_stage", "reference_encode") else None
+
+    with pytest.raises(RuntimeError, match="conditioning failed") as error:
+        pipe("a cat", height=32, width=32, min_generation_area=1024, references=references)
+
+    assert error.value is failure
+    assert ("offload", ("text_encoder", "vae")) in calls
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -703,7 +763,28 @@ def test_minimax_h3_image_pipeline_offloads_partially_staged_module(monkeypatch,
     assert destinations == ["cpu"]
 
 
-@pytest.mark.parametrize("failure_phase", ["stage", "forward"])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("misplaced_tensor", ["parameter", "buffer", "buffer_only"])
+def test_minimax_h3_image_pipeline_stages_all_misplaced_tensors(monkeypatch, misplaced_tensor):
+    module = torch.nn.Module()
+    if misplaced_tensor != "buffer_only":
+        module.register_parameter("first", torch.nn.Parameter(torch.empty(1, device="meta")))
+    if misplaced_tensor == "parameter":
+        module.register_parameter("misplaced", torch.nn.Parameter(torch.ones(1)))
+    else:
+        module.register_buffer("misplaced", torch.ones(1))
+    destinations = []
+    monkeypatch.setattr(module, "to", lambda device: destinations.append(device))
+    pipe = MiniMaxH3ImagePipeline(device="cpu")
+    pipe.device = torch.device("meta")
+    pipe.dit = module
+
+    pipe._stage(["dit"])
+
+    assert destinations == [torch.device("meta")]
+
+
+@pytest.mark.parametrize("failure_phase", ["stage", "forward", "text_stage"])
 def test_minimax_h3_image_pipeline_accelerator_offload_and_retry(failure_phase):
     from types import SimpleNamespace
 
@@ -717,8 +798,23 @@ def test_minimax_h3_image_pipeline_accelerator_offload_and_retry(failure_phase):
 
     class ConditionModel:
         def encode_text(self, prompt, reference_images=None, device=None, dtype=None):
-            assert pipe.text_encoder.weight.device == pipe.device
+            assert all(tensor.device == pipe.device for tensor in pipe.text_encoder.parameters())
             return torch.zeros(1, 1, 16, device=device, dtype=dtype), torch.tensor([1])
+
+    class TextEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = torch.nn.Parameter(torch.ones(1, dtype=torch.float32))
+            self.projection = torch.nn.Linear(1, 1, bias=False, dtype=torch.bfloat16)
+            self.fail = failure_phase == "text_stage"
+
+        def to(self, device):
+            if torch.device(device).type != "cpu" and self.fail:
+                self.projection.to(device)
+                assert self.first.device.type == "cpu"
+                assert self.projection.weight.device == pipe.device
+                raise failure
+            return super().to(device)
 
     class VAE(torch.nn.Module):
         def __init__(self):
@@ -756,26 +852,34 @@ def test_minimax_h3_image_pipeline_accelerator_offload_and_retry(failure_phase):
             return torch.zeros_like(x)
 
     pipe.condition_model = ConditionModel()
-    pipe.text_encoder = torch.nn.Linear(1, 1, bias=False)
+    pipe.text_encoder = TextEncoder()
     pipe.vae = VAE()
     pipe.dit = DiT()
+    initial_text_state = {name: tensor.clone() for name, tensor in pipe.text_encoder.state_dict().items()}
     initial_state = {name: tensor.clone() for name, tensor in pipe.dit.state_dict().items()}
 
     with pytest.raises(RuntimeError, match="injected DiT failure") as error:
         pipe("a cat", height=32, width=32, min_generation_area=1024)
 
     assert error.value is failure
+    assert all(tensor.device.type == "cpu" for tensor in pipe.text_encoder.parameters())
     assert all(tensor.device.type == "cpu" for tensor in [*pipe.dit.parameters(), *pipe.dit.buffers()])
-    assert pipe.dit.forward_calls == (0 if failure_phase == "stage" else 1)
+    assert pipe.dit.forward_calls == (1 if failure_phase == "forward" else 0)
+    for name, tensor in pipe.text_encoder.state_dict().items():
+        torch.testing.assert_close(tensor, initial_text_state[name], rtol=0, atol=0)
     for name, tensor in pipe.dit.state_dict().items():
         torch.testing.assert_close(tensor, initial_state[name], rtol=0, atol=0)
 
+    pipe.text_encoder.fail = False
     pipe.dit.fail = False
     image = pipe("a cat", height=32, width=32, min_generation_area=1024)
 
     assert image.size == (32, 32)
-    assert pipe.dit.forward_calls == len(pipe.scheduler.sigmas) - 1 + (0 if failure_phase == "stage" else 1)
+    assert pipe.dit.forward_calls == len(pipe.scheduler.sigmas) - 1 + (1 if failure_phase == "forward" else 0)
+    assert all(tensor.device.type == "cpu" for tensor in pipe.text_encoder.parameters())
     assert all(tensor.device.type == "cpu" for tensor in [*pipe.dit.parameters(), *pipe.dit.buffers()])
+    for name, tensor in pipe.text_encoder.state_dict().items():
+        torch.testing.assert_close(tensor, initial_text_state[name], rtol=0, atol=0)
     for name, tensor in pipe.dit.state_dict().items():
         torch.testing.assert_close(tensor, initial_state[name], rtol=0, atol=0)
     pipe._offload(["text_encoder", "vae", "dit"])

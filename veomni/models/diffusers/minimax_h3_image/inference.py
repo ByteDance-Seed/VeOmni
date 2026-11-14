@@ -146,6 +146,16 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
 
         pdd_state = load_file(pdd_path)
         num_pdd_heads = int(pdd_state["video_out.weight"].shape[0])
+        pdd_config_path = os.path.join(model_path, "pdd_config.json")
+        sigmas = DEFAULT_SIGMAS
+        if os.path.isfile(pdd_config_path):
+            with open(pdd_config_path) as handle:
+                sigmas = json.load(handle).get("sigmas", DEFAULT_SIGMAS)
+        if len(sigmas) - 1 != num_pdd_heads:
+            raise ValueError(
+                f"Sigma schedule has {len(sigmas) - 1} transitions but the checkpoint has {num_pdd_heads} PDD heads."
+            )
+        pipe.scheduler = MiniMaxH3ImageScheduler(sigmas)
 
         condition_cfg = dict(condition_model_cfg or {})
         condition_cfg.setdefault("base_model_path", model_path)
@@ -178,12 +188,6 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         load_model_weights(pipe.dit, os.path.join(model_path, "transformer"), init_device="cpu")
         pipe.dit.eval()
         pipe._load_pdd_heads(pdd_state)
-
-        pdd_config_path = os.path.join(model_path, "pdd_config.json")
-        if os.path.isfile(pdd_config_path):
-            with open(pdd_config_path) as handle:
-                pdd_config = json.load(handle)
-            pipe.scheduler = MiniMaxH3ImageScheduler(pdd_config.get("sigmas", DEFAULT_SIGMAS))
 
         pipe._offload(["text_encoder", "vae", "dit"])
         return pipe
@@ -227,10 +231,11 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
             module = getattr(self, name)
             if module is None:
                 continue
-            parameter = next(module.parameters(), None)
-            if parameter is None or self._parameter_on_device(parameter, self.device):
-                continue
-            module.to(self.device)
+            if any(
+                not self._parameter_on_device(tensor, self.device)
+                for tensor in chain(module.parameters(), module.buffers())
+            ):
+                module.to(self.device)
 
     @staticmethod
     def _offload_names(pipe, names) -> None:
@@ -276,21 +281,23 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         vision_references = [_resize_reference(image, 1024, 1024) for image in reference_images]
 
         generator = torch.Generator(device="cpu").manual_seed(seed)
-        self._stage(["text_encoder"])
-        prompt_embeds, text_token_tags = self.condition_model.encode_text(
-            prompt,
-            reference_images=vision_references or None,
-            device=self.device,
-            dtype=self.torch_dtype,
-        )
-        prompt_embeds = prompt_embeds.to(self.device)
-
         reference_latents = []
-        if vae_references:
-            self._stage(["vae"])
-            reference_latents = self.condition_model.encode_reference_images(
-                vae_references, generator=generator, device=self.device
+        try:
+            self._stage(["text_encoder"])
+            prompt_embeds, text_token_tags = self.condition_model.encode_text(
+                prompt,
+                reference_images=vision_references or None,
+                device=self.device,
+                dtype=self.torch_dtype,
             )
+            prompt_embeds = prompt_embeds.to(self.device)
+            if vae_references:
+                self._stage(["vae"])
+                reference_latents = self.condition_model.encode_reference_images(
+                    vae_references, generator=generator, device=self.device
+                )
+        finally:
+            self._offload(["text_encoder", "vae"])
 
         reference_grids = [(latents.shape[-2], latents.shape[-1]) for latents in reference_latents]
         position_ids, token_tags, image_indices, text_indices, num_reference_rows = build_image_packed_sequence(
@@ -325,7 +332,6 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         sequence_length = position_ids.shape[0]
         num_steps = len(self.scheduler.sigmas) - 1
 
-        self._offload(["text_encoder", "vae"])
         try:
             self._stage(["dit"])
             for step in range(num_steps):
@@ -371,8 +377,8 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         pixel_mean = torch.tensor(PIXEL_MEAN, device=self.device).view(1, -1, 1, 1)
         pixel_std = torch.tensor(PIXEL_STD, device=self.device).view(1, -1, 1, 1)
         image = (image.float() * pixel_std + pixel_mean).clamp(0, 1)
-        image = (image * 255).clamp(0, 255).to(torch.uint8).float() / 255
-        image = image[0].permute(1, 2, 0).mul(255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+        image = (image * 255).clamp(0, 255).to(torch.uint8)
+        image = image[0].permute(1, 2, 0).cpu().numpy()
         result = Image.fromarray(image)
         if (height, width) != (canvas_height, canvas_width):
             result = result.resize((width, height), Image.Resampling.BICUBIC)
