@@ -89,6 +89,17 @@ class OptimizerConfig:
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
+    state_offload: Literal["none", "cpu"] = field(
+        default="none",
+        metadata={
+            "help": (
+                "Optimizer-managed state offload. 'none' disables it (training state may still be "
+                "offloaded by model.accelerator.fsdp_config.offload); 'cpu' keeps the moment states "
+                "in host buffers and streams them to the device in batches, lowering peak device "
+                "memory (type='adamw' only)."
+            )
+        },
+    )
     lr: float = field(
         default=5e-5,
         metadata={"help": "Maximum learning rate or default learning rate, or init learning rate for warmup."},
@@ -144,6 +155,27 @@ class OptimizerConfig:
     betas: Tuple[float, float] = field(
         default=(0.9, 0.95),
         metadata={"help": "AdamW betas (beta1, beta2). Default (0.9, 0.95)."},
+    )
+    # ---- state_offload-specific (only consulted when state_offload == "cpu") ----
+    state_offload_device_memory_fraction: float = field(
+        default=0.8,
+        metadata={
+            "help": (
+                "With model.optimizer.state_offload='cpu', the fraction of currently free device memory "
+                "used to size one streamed batch of optimizer states. It is recomputed every step; "
+                "a parameter whose states exceed it cannot be swapped in and step() raises."
+            )
+        },
+    )
+    state_offload_pin_memory: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "With model.optimizer.state_offload='cpu', pin the host-side optimizer state buffers. "
+                "Disable if page-locked memory is scarce; a failed pinned allocation degrades to "
+                "pageable buffers (rank-0 warning)."
+            )
+        },
     )
     # ---- Muon-specific (only consulted when type == "muon") ---------------
     muon_lr: Optional[float] = field(
@@ -247,6 +279,28 @@ class OptimizerConfig:
             )
         },
     )
+
+    def __post_init__(self):
+        # Annotations are not enforced for YAML values (see constraints), so the
+        # literal is validated explicitly; otherwise a typo would silently fall
+        # back to the stock path in the builder.
+        if self.state_offload not in ("none", "cpu"):
+            raise ValueError(f"model.optimizer.state_offload must be 'none' or 'cpu', got {self.state_offload!r}")
+        if self.state_offload == "cpu":
+            if self.type == "adamw":
+                # YAML resolves an exponent literal without a decimal point
+                # (``8e-1``) to a string, so coerce before the range check (same
+                # reason as ``_collect_muon_kwargs`` does for ``muon_lr``).
+                self.state_offload_device_memory_fraction = float(self.state_offload_device_memory_fraction)
+                if not 0.0 < self.state_offload_device_memory_fraction <= 1.0:
+                    raise ValueError(
+                        "model.optimizer.state_offload_device_memory_fraction must be in (0, 1], "
+                        f"got {self.state_offload_device_memory_fraction}"
+                    )
+            else:
+                raise ValueError(
+                    f"model.optimizer.state_offload='cpu' is only supported for type='adamw'; got type={self.type!r}."
+                )
 
 
 @dataclass
@@ -543,6 +597,37 @@ class TorchCompileConfig:
     )
 
 
+_FLOAT8_RECIPES = ("tensorwise", "rowwise", "rowwise_with_gw_hp")
+
+
+@dataclass
+class Float8TrainingConfig:
+    """Opt-in torchao float8 computation for explicitly selected dense Linear modules."""
+
+    enable: bool = False
+    recipe: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"] = field(
+        default="tensorwise",
+        metadata={"help": "Float8 scaling recipe: 'tensorwise', 'rowwise', or 'rowwise_with_gw_hp'."},
+    )
+    target_modules: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Full Linear module names with optional '*' wildcards to convert to float8 training."},
+    )
+
+    def __post_init__(self):
+        """Validate float8 enable flag, scaling recipe, and explicit target module patterns."""
+        if type(self.enable) is not bool:
+            raise ValueError("float8.enable must be a boolean.")
+        if self.recipe not in _FLOAT8_RECIPES:
+            raise ValueError(f"float8.recipe must be one of {_FLOAT8_RECIPES}, got {self.recipe!r}.")
+        if not isinstance(self.target_modules, list) or any(
+            not isinstance(pattern, str) or not pattern for pattern in self.target_modules
+        ):
+            raise ValueError("float8.target_modules must be a list of nonempty module-name patterns.")
+        if self.enable and not self.target_modules:
+            raise ValueError("Enabled float8 training requires explicit target_modules.")
+
+
 @dataclass
 class MixedPrecisionConfig:
     """model.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
@@ -567,6 +652,7 @@ class MixedPrecisionConfig:
         default=True,
         metadata={"help": "Enable mixed precision cast forward inputs (FSDP2)."},
     )
+    float8: Float8TrainingConfig = field(default_factory=Float8TrainingConfig)
 
     def __post_init__(self):
         def _check_dtype(dtype: str):
@@ -1278,7 +1364,7 @@ class TrainingArguments:
                 logger.warning("load_checkpoint_path should be under output_dir.")
 
         # output_dir/
-        # ├── checkpoints/          # DCP: model + optimizer + lr_scheduler.pt + trainer_state
+        # ├── checkpoints/          # DCP: model + optimizer + per-rank extra_state
         # │   ├── global_step_100/
         # │   └── global_step_200/
         # │       └── hf_ckpt/      # HF safetensors saved under the last checkpoint folder
@@ -1320,6 +1406,8 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
     "swiglu_mlp_implementation": frozenset(),
+    "linear_implementation": frozenset(),
+    "kv_round_implementation": frozenset({"none"}),
     "load_balancing_loss_implementation": frozenset(),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
     "moe_implementation": frozenset({"fused_npu"}),
@@ -1345,6 +1433,8 @@ _MLU_ALLOWED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"liger_kernel"}),
     "rotary_pos_emb_vision_implementation": frozenset({"liger_kernel"}),
     "swiglu_mlp_implementation": frozenset({"liger_kernel"}),
+    "linear_implementation": frozenset(),
+    "kv_round_implementation": frozenset({"none"}),
     "cross_entropy_loss_implementation": frozenset({"liger_kernel", "chunk_loss"}),
     "moe_implementation": frozenset({"fused_mlu", "fused_triton"}),
 }
@@ -1400,7 +1490,7 @@ class OpsImplementationConfig:
 
     - **Config-parse time** (``__post_init__``) for the model-agnostic fields:
       ``rms_norm``, ``rotary_pos_emb``,
-      ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``load_balancing_loss``, plus
+      ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``linear``, ``load_balancing_loss``, plus
       ``cross_entropy_loss`` and ``moe``. Errors fire immediately with a
       model-agnostic allow-list.
     - **Model-build time** (instance-local ``VeomniOp`` resolution) for
@@ -1483,8 +1573,17 @@ class OpsImplementationConfig:
     swiglu_mlp_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'eager'. No NPU backend. "
-            "Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
+            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'qat' (FP8 QAT, SM90+) | 'eager'. "
+            "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
+        },
+    )
+    linear_implementation: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Dense projection. 'qat' (FP8 fake quantization of both GEMM operands, SM90+) | "
+            "'eager' (PyTorch F.linear). "
+            "Unset: 'eager'. Selected independently of swiglu_mlp_implementation: a model that owns its "
+            "own projections reads this field, a model that runs the fused SwiGLU row reads that one."
         },
     )
     rotary_pos_emb_implementation: Optional[str] = field(
@@ -1544,7 +1643,7 @@ class OpsImplementationConfig:
             "cu_seqlens; varlen training therefore raises at runtime. "
             "'triton' uses the vendored Triton-Ascend kernel (requires triton-ascend, NPU). "
             "'fla_npu' uses the AscendC fused ops (requires fla_npu + triton-ascend, NPU; "
-            "delegates heavy GDN compute to torch.ops.npu.*). "
+            "delegates heavy GDN compute to the stable fla_npu.ops.ascendc entry). "
             "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },
     )
@@ -1585,19 +1684,16 @@ class OpsImplementationConfig:
             "and cann_ops_transformer); 'eager' uses PyTorch."
         },
     )
-    qat_implementation: Literal["none", "fp8_blockwise"] = field(
+    kv_round_implementation: Literal["none", "eager", "triton"] = field(
         default="none",
         metadata={
-            "help": "Quantization-aware training recipe for DeepSeek V4. 'fp8_blockwise' makes training "
-            "see the rounding FP8 deployment will: the operands of every linear inference runs as a "
-            "true FP8 GEMM (128x128 weight tiles, 1x128 activation blocks, ue8m0 scales), the NoPE "
-            "channels of every attention KV entry inference caches in FP8 (1x64 blocks), both "
-            "sides of the indexer's logits (1x128), and the routed experts on the fused-MoE path "
-            "(weights per the checkpoint's expert_dtype -- FP4 with 1x32 groups on V4-Flash, "
-            "else FP8 tiles; activations 1x128). Needs the TileLang kernels on NVIDIA SM90+; "
-            "'none' trains in the model dtype. Unlike the other fields this selects a quantization "
-            "recipe rather than an op-registry implementation, so it is not selected through "
-            "VeomniOp -- see veomni/ops/qat/. Must be 'none' when moe_implementation='deepgemm_fp8'."
+            "help": "KV-cache and indexer-activation storage rounding. 'none' leaves stored tensors "
+            "unchanged and is the default, because this family has no host default and its reference "
+            "row ('eager') does round -- unlike every other field, 'eager' here is not 'off'. "
+            "'triton' (GPU) and 'eager' both round stored KV and indexer operands to their inference "
+            "storage dtype on every forward, which is what quantization-aware training needs to see "
+            "deployment's rounding. A model selects the variant that owns its geometry; this field "
+            "only chooses the implementation."
         },
     )
 
@@ -1724,12 +1820,13 @@ class OpsImplementationConfig:
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
-        if self.moe_implementation == "deepgemm_fp8" and self.qat_implementation != "none":
-            raise ValueError(
-                "moe_implementation='deepgemm_fp8' cannot be combined with "
-                f"qat_implementation={self.qat_implementation!r}. Set qat_implementation='none'; "
-                "DeepGEMM already quantizes the expert GEMM operands."
-            )
+        # No cross-family conflict needs rejecting here. ``deepgemm_fp8`` and
+        # ``qat`` are two values of the same ``moe_implementation`` field, so they
+        # cannot both be selected; ``linear_implementation`` and
+        # ``swiglu_mlp_implementation`` are separate GEMMs with separate operands,
+        # so quantizing them alongside a DeepGEMM expert GEMM rounds nothing twice.
+        # The shared expert in particular is a dense SwiGLU FFN, not one of the
+        # routed experts.
 
         from ..utils.device import IS_NPU_AVAILABLE
         from ..utils.import_utils import (
@@ -1775,32 +1872,6 @@ class OpsImplementationConfig:
                         f"Set to one of {allowed}; 'eager' is the universal fallback "
                         f"for ops with no MLU kernel for the current model."
                     )
-
-        # ``qat_implementation`` selects a quantization recipe rather than an
-        # op implementation, so registry resolution does not validate it. Its fake
-        # quantizers are the SM90-only TileLang kernels: without this check a
-        # CPU, NPU, ROCm or pre-SM90 host trains for a while and then raises
-        # inside the first fake-quant call.
-        if self.qat_implementation != "none":
-            import torch
-
-            from ..utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
-
-            unsupported = torch.version.hip is not None or not IS_CUDA_AVAILABLE
-            if not unsupported:
-                # Reading the capability initializes CUDA, and parsing happens
-                # before the trainer calls ``set_device`` -- query this rank's
-                # own GPU so the early context does not land on device 0 for
-                # every rank. The count is NVML-based and needs no context.
-                local_rank = int(os.getenv("LOCAL_RANK", "0"))
-                device = local_rank if local_rank < torch.cuda.device_count() else 0
-                unsupported = get_gpu_compute_capability(device) < 90
-            if unsupported:
-                raise ValueError(
-                    f"qat_implementation={self.qat_implementation!r} requires an SM90 or later NVIDIA CUDA "
-                    f"GPU, because its fake quantizers are the DeepSeek V4 TileLang kernels. "
-                    f"Set it to 'none' to train in the model dtype."
-                )
 
 
 @dataclass
@@ -1952,6 +2023,13 @@ class ModelArguments(BaseModelArguments):
 
     def __post_init__(self):
         super().__post_init__()
+        # Both move training state to host; running them together would double
+        # the host footprint and fight over the accelerator. Reject at parse time.
+        if self.optimizer.state_offload == "cpu" and self.accelerator.fsdp_config.offload:
+            raise ValueError(
+                "model.optimizer.state_offload='cpu' cannot be combined with "
+                "model.accelerator.fsdp_config.offload; both move training state to host."
+            )
         # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
         # instead of silently ignoring the flag.

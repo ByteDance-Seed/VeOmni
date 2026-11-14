@@ -1,5 +1,15 @@
 [
   {
+    "name": "dense-mlp-precision",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/distributed/test_dense_mlp_precision.py"]
+  },
+  {
+    "name": "distributed-default-gloo-group",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
+  },
+  {
     "name": "npu-unit-01",
     "suite": "unit",
     "args": [
@@ -436,6 +446,38 @@
       "-s",
       "-x",
       "tests/distributed/test_fsdp_equivalence.py"
+    ]
+  },
+  {
+    "name": "npu-unit-42",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_get_compute_units.py"
+    ]
+  },
+  {
+    "name": "swap-adamw-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw.py"
+    ]
+  },
+  {
+    "name": "swap-adamw-device-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw_device.py"
     ]
   }
 ]

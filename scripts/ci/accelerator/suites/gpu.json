@@ -1,5 +1,15 @@
 [
   {
+    "name": "dense-mlp-precision",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/distributed/test_dense_mlp_precision.py"]
+  },
+  {
+    "name": "distributed-default-gloo-group",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
+  },
+  {
     "name": "01-unit",
     "suite": "unit",
     "conditional": false,
@@ -642,6 +652,26 @@
       "-s",
       "-x",
       "tests/models/test_omni_fsdp.py"
+    ]
+  },
+  {
+    "name": "swap-adamw-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw.py"
+    ]
+  },
+  {
+    "name": "swap-adamw-device-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw_device.py"
     ]
   }
 ]

@@ -81,6 +81,26 @@ def test_nvidia_platform_compute_capability_range(monkeypatch, cc, expected):
     assert NvidiaGpuPlatform(min_cc=80, max_cc=90).matches() is expected
 
 
+def test_kv_round_triton_row_rejects_ampere(monkeypatch):
+    """FP8 E4M3 needs SM89; on an A100 the row must fail to resolve, not fail to compile.
+
+    ``_triton_kernels`` casts to ``tl.float8e4nv``, which Triton enables from SM89
+    only, so registering this row as "any CUDA GPU" would let an A100 select it.
+    """
+    from veomni.ops import OP_REGISTRY
+
+    monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.ops.platform.gpu.torch.version.hip", None, raising=False)
+    monkeypatch.setattr("veomni.ops.platform.gpu.get_gpu_compute_capability", lambda: 80)
+
+    entry = next(row for row in OP_REGISTRY.list_entries("kv_round", "deepseek_v4") if row.impl == "triton")
+    assert not entry.requirement.matches()
+    assert "compute capability >= 89" in entry.requirement.platforms[0].describe()
+
+    monkeypatch.setattr("veomni.ops.platform.gpu.get_gpu_compute_capability", lambda: 89)
+    assert entry.requirement.matches()
+
+
 def test_gpu_requirement_error_describes_supported_platforms(monkeypatch):
     """Requirement errors expose platform and architecture constraints."""
     monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)

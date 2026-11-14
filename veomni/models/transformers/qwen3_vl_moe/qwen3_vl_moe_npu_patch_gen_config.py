@@ -48,6 +48,7 @@ from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config i
     qwen3_vl_moe_model_forward_patched,
     qwen3_vl_moe_model_init_patched,
     qwen3_vl_moe_text_decoder_layer_init_patched,
+    qwen3_vl_moe_text_model_forward_patched,
 )
 from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config import (
     config as gpu_config,
@@ -118,6 +119,11 @@ config.override_method(
     replacement=qwen3_vl_text_model_init_patched,
     name_map=_NAME_MAP,
     description="Pass config to final Qwen3VLMoeTextRMSNorm",
+)
+config.override_method(
+    "Qwen3VLMoeTextModel.forward",
+    replacement=qwen3_vl_moe_text_model_forward_patched,
+    description="Forward packed sequence metadata to VeOmni mask builders",
 )
 config.override_method(
     "Qwen3VLMoeVisionAttention.forward",

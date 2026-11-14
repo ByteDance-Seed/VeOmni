@@ -44,7 +44,12 @@ class TrainingMixin(TrainingModuleMixin):
     def encode_pre(
         self,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
+        # The graph hands a node the whole batch; this hook owns only the carrier.
+        # Subclasses forward **kwargs, so accepting (and dropping) the rest keeps
+        # framework metadata and sibling-module keys from failing the call.
+        del kwargs
         self._conversation_carrier = conversation_list
         input_ids = self._prepare_encode_inputs(self._conversation_carrier)
 
@@ -86,7 +91,12 @@ class TrainingMixin(TrainingModuleMixin):
     def decode_pre(
         self,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
+        # The graph hands a node the whole batch; this hook owns only the carrier.
+        # Subclasses forward **kwargs, so accepting (and dropping) the rest keeps
+        # framework metadata and sibling-module keys from failing the call.
+        del kwargs
         self._conversation_carrier = conversation_list
         hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier)
         # No SP sharding here: the lm-head loss is a token-weighted mean over the whole

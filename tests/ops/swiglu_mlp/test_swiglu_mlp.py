@@ -595,3 +595,77 @@ def test_geglu_liger_matches_eager(hidden: int, intermediate: int):
     assert torch.allclose(x_e.grad, x_o.grad, atol=SWIGLU_FUSED_GRAD_ATOL, rtol=SWIGLU_FUSED_GRAD_RTOL)
     for param_e, param_o in zip(mlp_e.parameters(), mlp_o.parameters(), strict=True):
         assert torch.allclose(param_e.grad, param_o.grad, atol=SWIGLU_FUSED_GRAD_ATOL, rtol=SWIGLU_FUSED_GRAD_RTOL)
+
+
+def test_qat_row_keeps_the_clamp_in_the_model_dtype(monkeypatch):
+    """A deployment fused kernel clamps BF16 projection outputs, not FP32 ones.
+
+    Widening the clamp to FP32 (what ``eager`` does) changes the trained function
+    for values around ``swiglu_limit``, so the QAT row must not inherit that. The
+    quantizers are stubbed to identity here so the assertion isolates the clamp;
+    the real ones need an SM90 GPU.
+    """
+    import veomni.ops.kernels.swiglu_mlp.standard.qat as qat_impl
+
+    monkeypatch.setattr(qat_impl, "fp8_fake_quant_act", lambda t, block_size=128: t)
+    monkeypatch.setattr(qat_impl, "fp8_fake_quant_weight", lambda t, block_size=128: t)
+
+    limit = 10.0
+    torch.manual_seed(0)
+    # Identity gate/up weights make the projection a known, invertible passthrough
+    # of the input, so the expected value is computable without the op.
+    hidden_dim = 64
+    eye = torch.eye(hidden_dim, dtype=torch.bfloat16)
+    down = torch.eye(hidden_dim, dtype=torch.bfloat16)
+    x = torch.randn(1, hidden_dim, dtype=torch.bfloat16) * 40
+
+    actual = qat_impl.wrapper(
+        x,
+        eye,
+        eye.new_empty(0),
+        eye,
+        eye.new_empty(0),
+        down,
+        down.new_empty(0),
+        swiglu_limit=limit,
+    )
+
+    clamped = x.clamp(max=limit)
+    expected = F.silu(clamped) * x.clamp(min=-limit, max=limit)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    # The FP32 clamp disagrees, so the assertion above is not vacuous.
+    widened = (F.silu(x.float().clamp(max=limit)) * x.float().clamp(min=-limit, max=limit)).bfloat16()
+    assert not torch.equal(expected, widened)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_linear_subclass_projection_skips_the_fused_path():
+    """Only an exact ``nn.Linear`` may be read by weight; a subclass runs its own forward.
+
+    torchao's ``Float8Linear`` subclasses ``nn.Linear`` and does its float8 GEMM in
+    ``forward``. An ``isinstance`` check would let the fused row read its weight and
+    silently skip float8, so the check must be on the exact type. A quantizing row
+    on such a projection is refused instead of falling back.
+    """
+    from veomni.ops import VeomniOp
+    from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+
+    class _SubclassLinear(nn.Linear):
+        pass
+
+    mlp = _tiny_qwen3_mlp()
+    assert has_plain_linear_projections(mlp)
+
+    mlp.up_proj = _SubclassLinear(mlp.hidden_size, mlp.intermediate_size, bias=False)
+    mlp.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", "eager")
+    assert not has_plain_linear_projections(mlp)
+
+    # The quantizing check runs before the row is resolved, so a stub handle
+    # carrying the impl name is enough; the real ``qat`` row needs SM90 + TileLang.
+    class _QatHandle:
+        impl = "qat"
+
+    mlp.veomni_swiglu_mlp = _QatHandle()
+    with pytest.raises(ValueError, match="nn.Linear subclass"):
+        has_plain_linear_projections(mlp)

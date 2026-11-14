@@ -38,6 +38,7 @@ from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_lo
 from ..utils import logging, recompute_utils
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
+from .float8 import convert_float8_linears, validate_float8_training
 from .fsdp2.reduce_scatter import (
     ReduceScatterTransportPolicy,
     register_fp32_reduce_scatter_with_low_precision_transport,
@@ -474,6 +475,15 @@ def parallelize_model_fsdp2(
     dense_mlp_path = os.environ.get("VEOMNI_DENSE_MLP_LAYERS", "")
     prefetch_next = _validate_dense_mlp_prefetch_next() if dense_mlp_path else "0"
 
+    validate_float8_training(
+        mixed_precision,
+        parallel_state,
+        cpu_offload=kwargs.get("enable_fsdp_offload", False),
+        compile_enabled=bool(compile_config and compile_config.enable),
+        is_peft_model=kwargs.get("is_peft_model", False),
+    )
+    convert_float8_linears(model, mixed_precision.float8)
+
     if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
 
@@ -823,6 +833,9 @@ def parallelize_model_fsdp2(
         if not isinstance(decoder_blocks, nn.ModuleList) or not len(decoder_blocks):
             raise ValueError("VEOMNI_DENSE_MLP_LAYERS must identify a nonempty decoder ModuleList")
         target_ids = {id(mod) for _, (mod, _) in layer_pairs_list}
+        parameter_aliases: dict[int, list[str]] = {}
+        for name, param in model.named_parameters(remove_duplicate=False):
+            parameter_aliases.setdefault(id(param), []).append(name)
         for index, block in enumerate(decoder_blocks):
             mlp = getattr(block, "mlp", None)
             if id(block) not in target_ids or not isinstance(mlp, nn.Module):
@@ -836,10 +849,7 @@ def parallelize_model_fsdp2(
             # Shared parameters need a separate ownership plan; reject them here.
             mlp_ids = {id(param) for param in mlp.parameters()}
             prefix = f"{dense_mlp_path}.{index}.mlp."
-            if any(
-                id(param) in mlp_ids and not name.startswith(prefix)
-                for name, param in model.named_parameters(remove_duplicate=False)
-            ):
+            if any(not name.startswith(prefix) for param_id in mlp_ids for name in parameter_aliases[param_id]):
                 raise ValueError(f"Decoder {index} MLP shares parameters outside its FSDP group")
             dense_mlp_pairs[id(block)] = (block, mlp)
 
@@ -1162,6 +1172,13 @@ def build_parallelize_model(
                 "recomputation. Set selective_recompute_layers=0, or disable "
                 "VEOMNI_DENSE_MLP_PREFETCH."
             )
+    validate_float8_training(
+        mixed_precision,
+        parallel_state,
+        cpu_offload=kwargs.get("enable_fsdp_offload", False),
+        compile_enabled=bool(compile_config and compile_config.enable),
+        is_peft_model=kwargs.get("is_peft_model", False),
+    )
     validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim, fsdp_mode=parallel_state.dp_mode)
     if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather

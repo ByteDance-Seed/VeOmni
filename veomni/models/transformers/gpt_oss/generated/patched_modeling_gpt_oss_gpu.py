@@ -17,6 +17,8 @@
 #      Pass config to GptOssRMSNorm instances
 #    - method_override: GptOssModel.__init__
 #      Pass config to final GptOssRMSNorm
+#    - method_override: GptOssModel.forward
+#      Forward packed sequence metadata to VeOmni mask builders
 #    - class_replacement: GptOssPreTrainedModel
 #      Allow VeOmni FA4 implementation names during Transformers attention backend validation
 #    - class_replacement: GptOssExperts
@@ -45,7 +47,6 @@ from torch.nn import functional as F
 from transformers import initialization as init
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_layers import (
     GenericForSequenceClassification,
     GenericForTokenClassification,
@@ -64,7 +65,7 @@ from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 
@@ -321,13 +322,6 @@ class GptOssAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-            kwargs,
-            impl=self.veomni_attn.impl,
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-        )
-
         attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
@@ -338,7 +332,7 @@ class GptOssAttention(nn.Module):
             scaling=self.scaling,
             sliding_window=self.sliding_window,
             s_aux=self.sinks,
-            **attn_kwargs,
+            **kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -442,7 +436,7 @@ class GptOssPreTrainedModel(PreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] GptOssModel
-# Methods patched: __init__
+# Methods patched: __init__, forward
 # ======================================================================
 
 
@@ -463,6 +457,13 @@ class GptOssModel(GptOssPreTrainedModel):
 
         self.post_init()
 
+    # ================================================================
+    # Patch: GptOssModel.forward
+    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+    #    into ``veomni.models.utils.mask_utils.{create_causal_mask,
+    #    create_sliding_window_causal_mask}`` so packed sequences build an
+    #    isolated mask once in the model forward
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -492,16 +493,20 @@ class GptOssModel(GptOssPreTrainedModel):
 
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # --- Patch.1 ---
             mask_kwargs = {
+                **kwargs,
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
                 "past_key_values": past_key_values,
+                "position_ids": position_ids,
             }
             causal_mask_mapping = {
                 "full_attention": create_causal_mask(**mask_kwargs),
                 "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
             }
+            # --- Patch.1 ---
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

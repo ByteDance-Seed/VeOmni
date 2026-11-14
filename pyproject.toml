@@ -36,7 +36,8 @@ dependencies = [
 [project.optional-dependencies]
 # Hardware extras gpu / npu / npu_aarch64 are mutually exclusive
 # (`[tool.uv].conflicts`). MagiAttention is optional NVIDIA SM100+ and
-# requires gpu: `uv sync --extra gpu --extra magi`.
+# requires gpu: `uv sync --extra gpu --extra magi`. torchao float8 training is
+# optional too: `uv sync --extra gpu --extra float8`.
 dev = [
   "pre-commit>=4.0.0,<5.0",
   "ruff>=0.7.0,<1.0",
@@ -94,6 +95,14 @@ gpu = [
   "peft==0.18.1",
   "megatron-energon>=7.2.1",
   "hf_transfer",
+]
+
+# torchao float8 training (NVIDIA SM89+), opt-in via
+# `mixed_precision.float8.enable`. Kept out of `gpu` so GPU jobs that never
+# enable float8 do not install it; combine with gpu:
+# `uv sync --extra gpu --extra float8 --dev`.
+float8 = [
+  "torchao==0.18.0",
 ]
 
 # MagiAttention FFA (NVIDIA SM100+). Requires gpu via veomni[gpu]; conflicts with npu extras.
@@ -346,6 +355,9 @@ magi-to-hstu-cuda = ["setuptools", "wheel", "packaging", "ninja", { requirement 
 magi-attention = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "100", MAGI_ATTENTION_PREBUILD_FFA = "0", MAGI_ATTENTION_SKIP_MAGI_ATTN_COMM_BUILD = "1" }
 create-block-mask-cuda = { MAX_JOBS = "8", MAGI_ATTENTION_BUILD_COMPUTE_CAPABILITY = "100" }
 magi-to-hstu-cuda = { MAX_JOBS = "8" }
+
+[tool.setuptools]
+license-files = ["LICENSE", "docs/licenses/hunyuanvideo15/LICENSE.txt", "docs/licenses/hunyuanvideo15/NOTICE.txt"]
 
 [tool.setuptools.dynamic]
 version = {attr = "veomni._version.__version__"}

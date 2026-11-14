@@ -2,6 +2,14 @@
 
 This document describes VeOmni's architecture for AI coding agents. Read this to understand where code lives and how components interact.
 
+`veomni/utils/flops_meter.py` registers optional model-specific FLOPs metadata
+callbacks for the shared `EnvironMeter`. The meter accumulates their results,
+passes model-specific fields to the selected counter through `model_metadata`,
+and handles DP reduction and per-step reset. DiT
+models without a model-specific callback use the default latent-based callback;
+HF models retain their existing metadata path without a callback. See
+`docs/design/flops_metadata_callback.md` for the extension contract.
+
 ## Module Map
 
 ```
@@ -55,14 +63,23 @@ veomni/
 │   │                   via OptimizerConfig.muon_expert_zero_comm), Shard(d>0)
 │   │                   experts go through one all-to-all-gather over the
 │   │                   ep_fsdp mesh.
+│   ├── swap_adamw.py   SwapAdamW: AdamW whose moment states live on host
+│   │                   memory (pinned by default; pageable when disabled or a
+│   │                   pinned allocation fails) and stream to the device in
+│   │                   budget-sized batches; per param group under FSDP+EP
+│   │                   (MultiOptimizer leaves). DCP reads/writes the host
+│   │                   buffers directly.
 │   └── lr_scheduler.py LR scheduler construction
 ├── ops/                Tensor-native op registry and implementations
 │   ├── registry.py     OP_REGISTRY, OpEntry, register_op, resolve_op, VeomniOp
 │   ├── platform/       GPU/NPU/MLU availability requirements
 │   ├── install.py      Idempotent process-wide attention integration
 │   ├── batch_invariant/  Scoped deterministic ATen patch
-│   ├── qat/            Functional quantization-aware-training helpers
+│   ├── qat/            Fake-quantization primitives called by the qat rows
+│   │                   (DeepSeek-V4 FP8/FP4 TileLang)
 │   └── kernels/        Registered per-op/variant eager and optimized rows
+│                       (a model-specific variant sits in a model-named
+│                        subpackage, e.g. kv_round/deepseek_v4)
 ├── lora/               LoRA / PEFT injection: linear + MoE-expert adapters,
 │                       DCP + HF-adapter save/load, target mapping
 ├── patchgen/           Patch specs + codegen driver consumed by the `patchgen`
@@ -150,7 +167,7 @@ Checkpointing is split three ways; `OmniTrainer` uses the same `CheckpointCallba
 - **What** — `BaseTrainer.load()` / `save_dcp()` / `save_hf_or_lora()` / `save_model_assets()`, one line each, fanning out to `self.model.<same name>()`. A trainer holding a second model (a DPO reference, a distillation teacher) extends the fan-out here without the callbacks learning about it.
 - **How** — `VeOmniModelRuntime` forwards to its `ModelCheckpointManager`, which owns the *ordering* (drain async saves, `empty_cache` around the DCP write, barrier, then export) — the part previously duplicated between the V1 callbacks and V2's per-module manager. The base's paths stop at the step directory; a multi-module model's subclass (`OmniModuleCheckpointManager`) overrides the path methods and `_checkpointer_kwargs()` to nest every artifact one level deeper under its module name via `veomni/checkpoint/layout.py`.
 
-Only this model's lr_scheduler travels with the DCP write (the checkpointer pickles `state_dict` into a single `model/lr_scheduler.pt`; rank 0 writes, every rank reads). Weights and optimizer are two DCP directories (`model/ckpt/`, `model/optimizer/`). Job-level state — the dataloader cursor, the rng, the meters — belongs to `GlobalStateCallback` (`veomni/trainer/callbacks/global_state_callback.py`) as `loader/rank_{N}.pt` and `extra_state/rank_{N}.pt`, because with several models in one job there is one such record but N model checkpoints. That callback also writes the step's `checkpoint_manifest.json`. VeOmni 0.1.12 `extra_state/` resume is `veomni/checkpoint/legacy_v0_1_12.py` (delete that file to drop it). On-disk layout: `docs/usage/checkpoint.md`.
+Only this model's lr_scheduler travels with the DCP write (the checkpointer pickles the runtime's `extra_state` into a per-rank `model/<module>/extra_state/extra_state_rank_{R}.pt`). Weights and optimizer are two DCP directories (`model/ckpt/`, `model/optimizer/`). Job-level state — the dataloader cursor, the rng, the meters — belongs to `GlobalStateCallback` (`veomni/trainer/callbacks/global_state_callback.py`) as `loader/rank_{N}.pt` and `extra_state/rank_{N}.pt`, because with several models in one job there is one such record but N model checkpoints. That callback also writes the step's `checkpoint_manifest.json`. Only this layout is read: a checkpoint from an older VeOmni does not resume. On-disk layout: `docs/usage/checkpoint.md`.
 
 Those cursor files are written **per rank**, where V2 writes a single rank-0 `trainer_state.pt`. The cursor is rank-local by construction (all in `veomni/data/dataset.py`): `_shard_iterable` wraps iterable datasets in a `ShardedIterableDataset` on `dp_rank`, `WeightedMultiSourceDataset.__iter__` filters on `_global_sample_idx % dp_size == dp_rank`, and `build_energon_dataset` passes `dp_rank` to its `WorkerConfig`. Restoring one rank's cursor everywhere makes every rank resume on rank 0's shard — replaying that slice and skipping the rest. Only the map-style path is rank-agnostic, which is why the single-file version looks correct until an iterable dataset resumes.
 
@@ -161,7 +178,7 @@ Those cursor files are written **per rank**, where V2 writes a single rank-0 `tr
 
 Subclasses override specific methods (e.g., `compute_loss()`, custom data transforms) rather than the entire training loop. Note that `TextTrainer`, `VLMTrainer`, `DiTTrainer` and `TextDPOTrainer` *compose* a `BaseTrainer` in `self.base` rather than subclassing it, and drive the build steps one at a time (constraint 24).
 
-**Checkpointing**: `CheckpointCallback` owns cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars; `GlobalStateCallback` owns the job cursor; `BaseTrainer.load` / `save_dcp` / `save_hf_or_lora` / `save_model_assets` fan out to the model handle; `ModelCheckpointManager` (`veomni/models/checkpoint/manager.py`) owns DCP / HF / LoRA I/O, drain-async, `empty_cache`, barrier, and directory layout. The scheduler is a single `lr_scheduler.pt` next to the DCP shards; the job cursor is `loader/rank_{N}.pt` plus `extra_state/rank_{N}.pt`. VeOmni 0.1.12 `extra_state/` resume is `veomni/checkpoint/legacy_v0_1_12.py` (delete that file to drop it). On-disk layout: `docs/usage/checkpoint.md`.
+**Checkpointing**: `CheckpointCallback` owns cadence for DCP, HF/LoRA, and the one-shot tokenizer/config sidecars; `GlobalStateCallback` owns the job cursor; `BaseTrainer.load` / `save_dcp` / `save_hf_or_lora` / `save_model_assets` fan out to the model handle; `ModelCheckpointManager` (`veomni/models/checkpoint/manager.py`) owns DCP / HF / LoRA I/O, drain-async, `empty_cache`, barrier, and directory layout. The scheduler rides in each rank's `model/<module>/extra_state/extra_state_rank_{R}.pt`; the job cursor is `loader/rank_{N}.pt` plus `extra_state/rank_{N}.pt`. On-disk layout: `docs/usage/checkpoint.md`.
 
 **Parallel-state scoping**: `BaseTrainer._setup(args)` registers `"base"` via `init_parallel_state_from_config` before seed/determinism — it is a staticmethod because everything it does is job-level and runs before any model exists. A model then derives its own mesh in `VeOmniModelRuntime.setup()`; `VeOmniModelRuntime.__init__` scopes the mesh-dependent build to that mesh, so the trainer's remaining build steps need no scope of their own. Run time is **per-op**: `forward_backward_step` wraps `use_parallel_state(self.model.parallel_state)` around forward, postforward, and backward so none of them hard-code `"base"` (DPO wraps policy vs reference itself). `clip_grad_norm()` still wraps itself. The `parallel_state` property is a by-name registry lookup, never a stored state object, so the registry stays the single source of truth. See `.agents/knowledge/constraints.md` §7 and `docs/design/local_parallel_state.md`.
 
@@ -375,3 +392,5 @@ overrides EP expert FSDP placement for either BF16 or FP8. Whole-expert
 dimension is recorded in `SpecInfo` for DCP resharding. The shared EP combine
 uses the registered `moe_unpermute` op with fused weighting/scatter on NVIDIA
 GPUs and eager PyTorch on other devices, retaining FP32 accumulation.
+
+Checkpoint planners live in `veomni/checkpoint/planner.py`; generic logical-row clipping and padded restore live in `row_crop.py`. Model-owned converters opt in with `checkpoint_row_counts()`, without checkpoint-layer imports of model packages. See `docs/design/qwen4_exp_ple_2d_parallelism.md` (Checkpoint row contract section).
