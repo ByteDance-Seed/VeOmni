@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from diffusers import QwenImageTransformer2DModel as OfficialQwenImageTransformer2DModel
 from torch import nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config
 from tests.models.tiny_configs import tiny_qwen_image_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_qwen_image_config as _tiny_config
@@ -235,6 +236,7 @@ def _flash_ops_config() -> SimpleNamespace:
     return ops
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("checkpointing", [False, True])
 def test_qwen_image_flash_keeps_configured_row_for_middle_text_padding(
     monkeypatch, available_nvidia_ops, checkpointing
@@ -309,6 +311,7 @@ def test_qwen_image_flash_keeps_configured_row_for_middle_text_padding(
         torch.testing.assert_close(actual[3][name], grad, msg=name)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_qwen_image_flash_processor_packs_mask_without_precomputed_metadata(monkeypatch, available_nvidia_ops):
     from veomni.models.diffusers.qwen_image.qwen_image_transformer import modeling_qwen_image_transformer as modeling
     from veomni.ops.kernels.attention.standard import flash as flash_backend
