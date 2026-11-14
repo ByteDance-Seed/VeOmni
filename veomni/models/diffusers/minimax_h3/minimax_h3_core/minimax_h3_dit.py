@@ -139,6 +139,13 @@ class MiniMaxH3FP32Linear(nn.Linear):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, dtype=torch.float32)
 
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
+        self.weight.data = self.weight.data.to(torch.float32)
+        if self.bias is not None:
+            self.bias.data = self.bias.data.to(torch.float32)
+        return self
+
     def forward(self, x):
         with torch.autocast(device_type=x.device.type, enabled=False):
             return super().forward(x.to(self.weight.dtype))

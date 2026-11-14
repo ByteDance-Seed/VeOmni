@@ -491,3 +491,21 @@ def test_minimax_native_text_encoder_adapts_qwen_config(monkeypatch):
     assert encoder.config.vision_config.ops_config.attn_implementation == "veomni_sdpa"
     output = encoder.model(input_ids=torch.tensor([[1, 2, 3]]), use_cache=False)
     assert output.last_hidden_state.shape == (1, 3, 16)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_fp32_linear_stays_fp32_after_bfloat16_conversion():
+    """MiniMaxH3FP32Linear weights remain FP32 after a whole-model dtype conversion."""
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3FP32Linear
+
+    linear = MiniMaxH3FP32Linear(4, 4)
+    assert linear.weight.dtype == torch.float32
+
+    linear.to(dtype=torch.bfloat16)
+    assert linear.weight.dtype == torch.float32, "weight must stay FP32 after .to(bfloat16)"
+    if linear.bias is not None:
+        assert linear.bias.dtype == torch.float32, "bias must stay FP32 after .to(bfloat16)"
+
+    x = torch.randn(2, 4, dtype=torch.bfloat16)
+    out = linear(x)
+    assert out.dtype == torch.float32
