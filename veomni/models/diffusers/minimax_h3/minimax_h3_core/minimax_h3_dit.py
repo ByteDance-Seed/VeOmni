@@ -140,10 +140,12 @@ class MiniMaxH3FP32Linear(nn.Linear):
         super().__init__(*args, **kwargs, dtype=torch.float32)
 
     def _apply(self, fn, recurse=True):
+        originals = {name: param.data for name, param in self._parameters.items() if param is not None}
         super()._apply(fn, recurse=recurse)
-        self.weight.data = self.weight.data.to(torch.float32)
-        if self.bias is not None:
-            self.bias.data = self.bias.data.to(torch.float32)
+        for name, original in originals.items():
+            param = self._parameters[name]
+            if param.dtype != torch.float32:
+                param.data = original.to(device=param.device)
         return self
 
     def forward(self, x):

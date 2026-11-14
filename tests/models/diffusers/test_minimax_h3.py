@@ -499,13 +499,19 @@ def test_minimax_h3_fp32_linear_stays_fp32_after_bfloat16_conversion():
     from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3FP32Linear
 
     linear = MiniMaxH3FP32Linear(4, 4)
-    assert linear.weight.dtype == torch.float32
+    with torch.no_grad():
+        linear.weight.fill_(1.0 + 2**-12)
+        linear.bias.fill_(-1.0 - 2**-12)
+    weight, bias = linear.weight.detach().clone(), linear.bias.detach().clone()
+    assert not torch.equal(weight.to(torch.bfloat16).float(), weight)
 
     linear.to(dtype=torch.bfloat16)
-    assert linear.weight.dtype == torch.float32, "weight must stay FP32 after .to(bfloat16)"
-    if linear.bias is not None:
-        assert linear.bias.dtype == torch.float32, "bias must stay FP32 after .to(bfloat16)"
+    linear.bfloat16()
+    assert linear.weight.dtype == torch.float32 and linear.bias.dtype == torch.float32
+    torch.testing.assert_close(linear.weight, weight, rtol=0, atol=0)
+    torch.testing.assert_close(linear.bias, bias, rtol=0, atol=0)
 
     x = torch.randn(2, 4, dtype=torch.bfloat16)
     out = linear(x)
     assert out.dtype == torch.float32
+    torch.testing.assert_close(out, torch.nn.functional.linear(x.float(), weight, bias), rtol=0, atol=0)
