@@ -1,5 +1,10 @@
 [
   {
+    "name": "dense-mlp-precision",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/distributed/test_dense_mlp_precision.py"]
+  },
+  {
     "name": "distributed-default-gloo-group",
     "suite": "unit",
     "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
