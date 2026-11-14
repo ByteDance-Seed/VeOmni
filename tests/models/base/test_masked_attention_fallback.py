@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Masked attention binds SDPA when the requested impl has no mask path."""
+"""Masked attention binds SDPA when the requested impl has no mask path the model can use."""
 
 from __future__ import annotations
 
@@ -45,17 +45,27 @@ def _qwen_image_processor(ops):
 
 
 @pytest.mark.parametrize(
-    "build",
+    ("build", "impl"),
     (
-        pytest.param(_flux_joint_attention, id="flux"),
-        pytest.param(_qwen_image_processor, id="qwen_image"),
+        pytest.param(_flux_joint_attention, "flash_attention_2", id="flux"),
+        pytest.param(_qwen_image_processor, "flex_attention", id="qwen_image"),
     ),
 )
-def test_masked_attention_falls_back_to_veomni_sdpa(available_nvidia_ops, build):
+def test_masked_attention_falls_back_to_sdpa(available_nvidia_ops, build, impl):
     ops = eager_ops_config()
-    ops.attn_implementation = "flash_attention_2"
+    ops.attn_implementation = impl
     module = build(ops)
 
-    assert module.veomni_attn.impl == "veomni_flash_attention_2"
+    assert module.veomni_attn.impl == f"veomni_{impl}"
     assert module.veomni_attn_masked.impl == "veomni_sdpa"
     assert module.veomni_attn_masked is not module.veomni_attn
+
+
+def test_qwen_image_masked_attention_keeps_flash_row(available_nvidia_ops):
+    """Qwen-Image packs its joint keep-mask into varlen metadata for flash rows instead of using SDPA."""
+    ops = eager_ops_config()
+    ops.attn_implementation = "flash_attention_2"
+    module = _qwen_image_processor(ops)
+
+    assert module.veomni_attn.impl == "veomni_flash_attention_2"
+    assert module.veomni_attn_masked is module.veomni_attn
