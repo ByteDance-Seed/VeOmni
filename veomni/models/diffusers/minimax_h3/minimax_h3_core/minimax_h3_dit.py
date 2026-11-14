@@ -105,7 +105,7 @@ def _h3_attention_impl(config=None) -> str:
     module-local eager attention) and ``veomni_sdpa`` (whose masked-SDPA backend
     pin excludes PyTorch's flash SDPA kernel) both select the plain ``sdpa`` row.
     """
-    impl = config.ops_config.attn_implementation if config is not None else "veomni_sdpa"
+    impl = (config.ops_config.attn_implementation if config is not None else None) or "veomni_sdpa"
     if impl in _H3_REFERENCE_ATTN_IMPLS:
         return "sdpa"
     if impl.startswith("flash_attention_"):
