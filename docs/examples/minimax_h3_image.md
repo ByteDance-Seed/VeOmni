@@ -74,8 +74,9 @@ image.save("edit.png")
   canvas and resized back.
 - The text encoder and DiT are about 66 GB each. The pipeline stages the text
   encoder and VAE on demand and keeps them off the device while the DiT runs.
-- For custom VAE tiling, every overlap between encoded tiles must cover at
-  least one latent unit (16 image pixels). Encoding rejects smaller actual
-  overlaps; decoding and single-tile encoding retain their existing settings.
+- For custom VAE tiling, each multi-tile encoding overlap must be at least one
+  latent unit (16 image pixels). Tile sizes round down and overlaps round up to
+  the 16-pixel latent grid, keeping encode/decode dimensions aligned. Smaller
+  overlap settings remain available for decoding and single-tile encoding.
 - Training support is not part of this integration; the released PDD heads are
   an inference-time distillation of the H3 backbone.

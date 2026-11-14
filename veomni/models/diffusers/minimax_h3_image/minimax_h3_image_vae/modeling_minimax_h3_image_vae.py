@@ -497,13 +497,20 @@ class MiniMaxH3ImageVAE(nn.Module):
             )
         if tile_size >= length:
             return [0], [length], []
+        ratio = self.spatial_compression_ratio
+        tile_size = tile_size // ratio * ratio
+        min_overlap = math.ceil(min_overlap / ratio) * ratio
+        if tile_size <= min_overlap:
+            raise ValueError(
+                "Multi-tile VAE sampling requires a tile size greater than the overlap on the latent grid."
+            )
         num_tiles = math.ceil(length / tile_size)
         while tile_size * num_tiles - min_overlap * (num_tiles - 1) - length < 0:
             num_tiles += 1
         overlaps = [min_overlap] * (num_tiles - 1)
         remaining = tile_size * num_tiles - sum(overlaps) - length
-        for index in range(remaining // self.spatial_compression_ratio):
-            overlaps[index % (num_tiles - 1)] += self.spatial_compression_ratio
+        for index in range(remaining // ratio):
+            overlaps[index % (num_tiles - 1)] += ratio
         indices = [0]
         for index in range(num_tiles - 1):
             indices.append(indices[-1] + tile_size - overlaps[index])
@@ -555,6 +562,13 @@ class MiniMaxH3ImageVAE(nn.Module):
         if not self.use_tiling:
             return self.quant_conv(self.encoder(x[:, :, None]))[:, :, -1]
         height, width = x.shape[-2], x.shape[-1]
+        if (
+            height > self.tile_sample_min_height
+            and self.tile_sample_min_overlap_height < self.spatial_compression_ratio
+        ) or (
+            width > self.tile_sample_min_width and self.tile_sample_min_overlap_width < self.spatial_compression_ratio
+        ):
+            raise ValueError("Tiled VAE encoding requires each configured overlap to cover at least one latent unit.")
         y_indices, y_lengths, y_overlaps = self._split_tiles(
             height, self.tile_sample_min_height, self.tile_sample_min_overlap_height
         )

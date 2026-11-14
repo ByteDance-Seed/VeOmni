@@ -205,6 +205,56 @@ def test_minimax_h3_image_vae_tiles_and_stitches():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    ("tile_height", "min_overlap", "image_height"),
+    [(65, 16, 96), (64, 17, 112)],
+)
+def test_minimax_h3_image_vae_tiles_on_latent_grid(tile_height, min_overlap, image_height):
+    vae = _tiny_vae().eval()
+    vae.enable_tiling(
+        tile_sample_min_height=tile_height,
+        tile_sample_min_width=64,
+        tile_sample_min_overlap_height=min_overlap,
+        tile_sample_min_overlap_width=16,
+    )
+    indices, lengths, overlaps = vae._split_tiles(image_height, tile_height, min_overlap)
+    ratio = vae.spatial_compression_ratio
+    assert all(index % ratio == 0 for index in indices)
+    assert all(length % ratio == 0 for length in lengths)
+    assert all(overlap % ratio == 0 for overlap in overlaps)
+    assert sum(lengths) - sum(overlaps) == image_height
+
+    image = torch.randn(1, 3, image_height, 64)
+    with torch.no_grad():
+        latent = vae.encode(image).latent_dist.mode()
+        decoded = vae.decode(latent).sample
+
+    assert latent.shape == (1, 24, image_height // ratio, 4)
+    assert decoded.shape == image.shape
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_image_vae_tiled_encoding_matches_untiled_shape_for_partial_edge():
+    vae = _tiny_vae().eval()
+    image = torch.randn(1, 3, 97, 64)
+
+    with torch.no_grad():
+        vae.disable_tiling()
+        untiled_shape = vae.encode(image).latent_dist.mode().shape
+        vae.enable_tiling(
+            tile_sample_min_height=65,
+            tile_sample_min_width=64,
+            tile_sample_min_overlap_height=16,
+            tile_sample_min_overlap_width=16,
+        )
+        latent = vae.encode(image).latent_dist.mode()
+        decoded = vae.decode(latent).sample
+
+    assert latent.shape == untiled_shape == (1, 24, 6, 4)
+    assert decoded.shape == (1, 3, 96, 64)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_minimax_h3_image_vae_preserves_blended_neighbors_at_tile_junction():
     vae = _tiny_vae()
     tiles = [[torch.full((1, 1, 4, 4), value) for value in values] for values in ((0.0, 4.0), (8.0, 12.0))]
@@ -259,6 +309,21 @@ def test_minimax_h3_image_vae_allows_small_overlap_for_single_tile():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_image_vae_allows_small_overlap_for_tiled_decode():
+    vae = _tiny_vae().eval()
+    vae.enable_tiling(
+        tile_sample_min_height=64,
+        tile_sample_min_width=64,
+        tile_sample_min_overlap_height=1,
+        tile_sample_min_overlap_width=1,
+    )
+    with torch.no_grad():
+        decoded = vae.decode(torch.zeros(1, 24, 7, 4)).sample
+
+    assert decoded.shape == (1, 3, 112, 64)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_minimax_h3_image_vae_rejects_non_advancing_tiles():
     vae = _tiny_vae()
     with pytest.raises(ValueError, match="positive"):
@@ -276,6 +341,8 @@ def test_minimax_h3_image_vae_rejects_non_advancing_tiles():
         vae._split_tiles(128, 64, 64)
     with pytest.raises(ValueError, match="overlap must be positive"):
         vae._split_tiles(128, 64, 0)
+    with pytest.raises(ValueError, match="latent grid"):
+        vae._split_tiles(64, 17, 16)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
