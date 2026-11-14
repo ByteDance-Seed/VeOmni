@@ -1,0 +1,26 @@
+qwen3_text_encoder:
+  model_path: qwen3_text_encoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+qwen3_moe_llm:
+  model_path: qwen3_moe_llm
+  # Per-rank EP-slice streaming: each rank reads only its own experts' rows
+  # straight from the checkpoint instead of every rank reading all of them.
+  # Needs the every-rank-reads path, so the rank0 broadcast is off here.
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  accelerator:
+    # Size the `ep` dim by list, not `ep_size`. A per-module entry starts from
+    # `asdict(ModelArguments)`, which already carries
+    # `extra_parallel_names: ["ep"]`, and `AcceleratorConfig.__post_init__`
+    # only appends `ep_size` when `"ep"` is absent — so `ep_size: 4` here would
+    # leave the effective dim at 1 and silently run without Expert Parallel.
+    #
+    # All three lists are written out together: they are paired by position, and
+    # a launcher whose global accelerator adds another dim (e.g. a text encoder's
+    # `emb`) would leave an inherited placeholder behind, so replacing only
+    # `sizes` would desynchronise the lengths and mis-size `emb`.
+    extra_parallel_names: ["ep"]
+    extra_parallel_sizes: [4]
+    extra_parallel_placement_innermost: [false]
