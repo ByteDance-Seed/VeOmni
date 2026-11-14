@@ -48,6 +48,7 @@ from ...models.seed_omni.modeling_omni import OmniModel
 from ...models.seed_omni.processing_omni import OmniProcessor
 from ...models.seed_omni.utils.graph_profiler import GraphProfiler
 from ...utils import helper
+from ..base import _apply_hyper_parallel_patch
 from .omni_trainer import OmniTrainer, batch_to_device
 
 
@@ -103,6 +104,7 @@ class OmniInferencer:
         if self._distributed:
             self.device = OmniTrainer._setup(args, save_launch_args=False)
         helper.set_seed(args.infer.seed)
+        _apply_hyper_parallel_patch(self.omni_model_runtime, for_inference=True)
         self._build_model()
 
         # Nest artefacts under <output_dir>/<infer_type>/ (infer_type is resolved

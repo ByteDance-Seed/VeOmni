@@ -43,7 +43,7 @@ from torch.utils.checkpoint import set_checkpoint_debug_enabled
 from torch.utils.data import Dataset
 from transformers.modeling_outputs import ModelOutput
 
-from ..arguments import OffloadConfig, VeOmniArguments, save_args
+from ..arguments import ModelArguments, OffloadConfig, VeOmniArguments, save_args
 from ..data import (
     DistributedDataloader,
     build_dataloader,
@@ -86,6 +86,27 @@ from .callbacks import (
 
 
 logger = logging.get_logger(__name__)
+
+
+def _apply_hyper_parallel_patch(model_config: ModelArguments, *, for_inference: bool = False) -> None:
+    """Load the optional Hyper adapter only when FSDP or Muon selects it."""
+    module_configs = list(getattr(model_config, "modules", {}).values()) or [model_config]
+    fsdp_configs = [config.accelerator.fsdp_config for config in module_configs]
+    root_fsdp = model_config.accelerator.fsdp_config
+    if (
+        root_fsdp.fsdp_scope == "model"
+        and root_fsdp.fsdp_mode != "eager"
+        and (not for_inference or any(config.fsdp_mode != "eager" for config in fsdp_configs))
+    ):
+        fsdp_configs = [root_fsdp]
+    use_hyper_fsdp = any(
+        config.fsdp_mode == "fsdp2" and config.fsdp_backend == "hyper_parallel" for config in fsdp_configs
+    )
+    use_hyper_muon = not for_inference and any(config.optimizer.use_hyper_optimizer for config in module_configs)
+    if use_hyper_fsdp or use_hyper_muon:
+        from hyper_parallel.integration.veomni import apply_hyper_parallel_patch
+
+        apply_hyper_parallel_patch(model_config, for_inference=for_inference)
 
 
 class BackgroundPrefetcher:
@@ -340,6 +361,8 @@ class BaseTrainer(Stateful, ABC):
         Everything here is job-level and runs before any model exists, so it
         takes the config rather than a built trainer.
         """
+        _apply_hyper_parallel_patch(args.model)
+
         # log args
         logger.info_rank0(json.dumps(asdict(args), indent=2))
 

@@ -109,6 +109,23 @@ veomni/
 
 Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.
 
+## Optional HyperParallel Integration
+
+FSDP/HSDP and Muon are selected independently:
+
+```yaml
+model:
+  accelerator:
+    fsdp_config:
+      fsdp_backend: hyper_parallel
+  optimizer:
+    type: muon
+    use_hyper_optimizer: true
+```
+
+When either option is enabled, VeOmni loads the HyperParallel adapter before
+building the model. Training continues through VeOmni's existing task and runtime.
+
 ## Trainer Hierarchy
 
 A training job splits in two. `VeOmniModelRuntime` (`veomni/models/model_runtime.py`) owns everything bound to *one* model; `BaseTrainer` *holds* one as `trainer.model` and adds everything bound to the *job*, of which there is exactly one. A single-model job is one runtime inside one trainer; a composed omni model is many runtimes under one orchestrator, which is why the trainer composes the runtime rather than inheriting it — `OmniTrainer` holds several and could not inherit them all.

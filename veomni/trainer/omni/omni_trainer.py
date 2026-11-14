@@ -83,7 +83,7 @@ from ...utils.device import (
     synchronize,
 )
 from ...utils.omni_helper import OmniEnvironMeter
-from ..base import VeOmniIter
+from ..base import VeOmniIter, _apply_hyper_parallel_patch
 from ..callbacks import (
     CheckpointCallback,
     EvaluateCallback,
@@ -272,7 +272,9 @@ class OmniTrainer:
         ``train.training_task='offline_embedding'`` trains nothing by design, so
         only it may build no optimizer.
         """
-        model = build_omni_model_runtime(build_omni_model_runtime_args(self.args), train_args=self.args.train)
+        runtime_args = build_omni_model_runtime_args(self.args)
+        _apply_hyper_parallel_patch(runtime_args)
+        model = build_omni_model_runtime(runtime_args, train_args=self.args.train)
         if model.optimizer is None and self.args.train.training_task != "offline_embedding":
             raise ValueError("OmniTrainer has nothing to train: every module is frozen.")
         return model

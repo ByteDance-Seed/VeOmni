@@ -31,6 +31,7 @@ Our guiding principles when building VeOmni are:
 </div>
 
 ## 🔥 Latest News
+- [2026/11] VeOmni now supports [HyperParallel](https://github.com/mindspore-ai/hyper-parallel) as an optional acceleration backend for training on Ascend SuperPoD.
 - [2025/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo](https://arxiv.org/abs/2508.02317) was accepted by AAAI 2026
 - [2025/09] We released VeOmni's first official version, [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75).
 - [2025/08] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./docs/assets/wechat.png). Feel free to join us!
@@ -46,10 +47,12 @@ Our guiding principles when building VeOmni are:
 - Dynamic batching strategy, Omnidata processing
 - [**Torch Distributed Checkpoint**](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html) for checkpoint.
 - Support for NVIDIA GPU, AMD ROCm, Ascend NPU, and Cambricon MLU training.
+- Optional [**HyperParallel**](docs/key_features/hyper_parallel.md) acceleration backend for Ascend SuperPoD training, providing FSDP/HSDP and distributed Muon.
 - Experiment tracking with wandb
 
 ## 📝 Upcoming Features and Changes
 
+- Proposed HyperParallel optimizations for Ascend NPU training, including high-performance modules and MegaMoE ([RFC #1413](https://github.com/ByteDance-Seed/VeOmni/issues/1413)).
 - VeOmni v0.2 Roadmap https://github.com/ByteDance-Seed/VeOmni/issues/268, https://github.com/ByteDance-Seed/VeOmni/issues/271
 - Vit balance tool https://github.com/ByteDance-Seed/VeOmni/issues/280
 - Validation dataset during training https://github.com/ByteDance-Seed/VeOmni/issues/247
