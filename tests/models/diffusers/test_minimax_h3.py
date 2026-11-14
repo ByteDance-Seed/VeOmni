@@ -31,6 +31,7 @@ from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RT
 from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import (
     MiniMaxH3Attention,
     VeomniRMSNorm,
+    _h3_attention_impl,
     _PackedBounds,
 )
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
@@ -56,6 +57,17 @@ def _build_norm(size: int = 16):
     cfg = _tiny_config()
     cfg._set_ops_implementation(eager_ops_config())
     return VeomniRMSNorm(size, eps=1e-6, config=cfg)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_attention_defaults_to_sdpa_only_when_selection_is_omitted(available_nvidia_ops):
+    cfg = _tiny_config()
+    cfg.ops_implementation.pop("attn_implementation", None)
+    assert _h3_attention_impl(cfg) == "sdpa"
+    assert _h3_attention_impl(None) == "sdpa"
+
+    cfg.ops_implementation["attn_implementation"] = "flash_attention_2"
+    assert _h3_attention_impl(cfg) == "veomni_flash_attention_2"
 
 
 def _build_model():
