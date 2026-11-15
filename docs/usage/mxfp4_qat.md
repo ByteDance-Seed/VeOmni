@@ -136,6 +136,15 @@ the same rule, and only for the quantizing value: with
 `liger_kernel` is **not** affected — it is an arithmetic rewrite that keeps the
 projection-module fallback.
 
+### Not supported: float8 training on the same projection
+
+[Float8 training](float8_training.md) converts its `target_modules` into
+torchao's `Float8Linear`, an `nn.Linear` subclass whose forward runs FP8 GEMMs.
+A quantizing `linear` or `swiglu_mlp` row only runs on an exact `nn.Linear`, so
+selecting `torchao_nvfp4` for a projection that float8 also targets raises
+`cannot run on nn.Linear subclass 'Float8Linear'` instead of silently skipping
+the FP8 GEMMs. Pick one recipe per projection.
+
 ## Distributed behaviour
 
 The rows are **tensor-level**: they round the operands they are handed and pass
@@ -149,7 +158,7 @@ partitioning.
 | Mode | Status |
 | --- | --- |
 | FSDP2 / HSDP sharding (decoder-layer wrapping) | works: FSDP2 all-gathers each block's parameters before its forward, so the row sees whole tensors |
-| `basic_modules: [Linear]` (per-projection FSDP2 wrapping) | `eager` works, because it calls the projection module and its unshard hook runs; `torchao_nvfp4` reads the weight directly and refuses the still-sharded `DTensor` |
+| `basic_modules: [Linear]` (per-projection FSDP2 wrapping) | `eager` works, because it calls the projection module and its unshard hook runs. `torchao_nvfp4` is refused: FSDP2 turns the projection into an `FSDPLinear` subclass whose forward unshards the weight, so the row cannot read the whole weight directly |
 | Sequence / context parallel | works; the sharded axis is the sequence (see the `amax` note above) |
 | Tensor parallel | not implemented in VeOmni, independently of this row |
 

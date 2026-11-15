@@ -80,9 +80,10 @@ def resolve_projection(
         if isinstance(module, nn.Linear):
             raise ValueError(
                 f"linear_implementation={op_impl!r} cannot run on nn.Linear subclass {type(module).__name__!r}: "
-                "a subclass such as torchao's Float8Linear computes its own GEMM in forward, so reading "
-                "`module.weight` would silently bypass it. Set linear_implementation='eager' or exclude "
-                "overlapping targets."
+                "its forward does more than F.linear on its weight (torchao's Float8Linear runs FP8 GEMMs; a "
+                "projection listed in FSDP2 `basic_modules` becomes FSDPLinear and unshards its weight there), "
+                "so reading `module.weight` would bypass it. Set linear_implementation='eager', or drop the "
+                "overlapping float8 target / `basic_modules` entry."
             )
         raise ValueError(
             f"linear_implementation={op_impl!r} cannot run on {type(module).__name__!r}: the row "
