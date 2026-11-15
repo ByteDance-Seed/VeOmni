@@ -68,20 +68,6 @@ def _nvfp4_roundtrip(x: Tensor, block_size: int) -> Tensor:
     return quantized.dequantize(x.dtype).reshape(x.shape)
 
 
-class _NvFp4FakeQuant(torch.autograd.Function):
-    """Straight-through NVFP4 fake quantization."""
-
-    @staticmethod
-    def forward(ctx, x: Tensor, block_size: int) -> Tensor:
-        """Return the NVFP4 quantize-dequantize round trip of ``x``."""
-        return _nvfp4_roundtrip(x.detach(), block_size)
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor) -> tuple[Tensor, None]:
-        """Pass the output gradient straight through to the high-precision operand."""
-        return grad_output, None
-
-
 def nvfp4_fake_quant(x: Tensor, block_size: int = NVFP4_BLOCK_SIZE) -> Tensor:
     """Fake-quantize ``x`` in NVFP4, differentiably into ``x``.
 
@@ -118,4 +104,6 @@ def nvfp4_fake_quant(x: Tensor, block_size: int = NVFP4_BLOCK_SIZE) -> Tensor:
             f"NVFP4 fake quantization needs the last dimension ({x.shape[-1]}) divisible by block_size "
             f"{block_size}; the deployment kernels index one scale per group and cannot pad a partial one."
         )
-    return _NvFp4FakeQuant.apply(x, block_size)
+    with torch.no_grad():
+        quantized = _nvfp4_roundtrip(x, block_size)
+    return quantized.detach() + (x - x.detach())

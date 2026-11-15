@@ -124,6 +124,39 @@ def test_a_quantizing_row_refuses_a_wrapped_projection(quantizing_impl):
         resolve_projection(quantizing_impl, Wrapped(), torch.randn(2, 8))
 
 
+@pytest.mark.parametrize("quantizing_impl", sorted(QUANTIZING_IMPLS))
+def test_a_quantizing_row_refuses_a_linear_subclass_projection(quantizing_impl):
+    """A converted ``nn.Linear`` subclass such as ``Float8Linear`` owns a weight but runs its own GEMM."""
+    from torch import nn
+
+    from veomni.ops.kernels.linear._module import resolve_projection
+
+    class _SubclassLinear(nn.Linear):
+        def __init__(self):
+            super().__init__(8, 4, bias=False)
+
+        def forward(self, x):
+            return super().forward(x)
+
+    sub = _SubclassLinear()
+    x = torch.randn(2, 8)
+    with pytest.raises(ValueError, match="nn.Linear subclass"):
+        resolve_projection(quantizing_impl, sub, x)
+
+    # Non-quantizing rows still delegate to the subclass's own forward.
+    weight, shortcut = resolve_projection("eager", sub, x)
+    assert weight is None
+    assert shortcut is not None
+
+    if is_package_available("torchao"):
+        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+
+        fp8_parent = nn.Sequential(nn.Linear(16, 16, bias=False))
+        convert_to_float8_training(fp8_parent, config=Float8LinearConfig())
+        with pytest.raises(ValueError, match="nn.Linear subclass"):
+            resolve_projection(quantizing_impl, fp8_parent[0], torch.randn(2, 16))
+
+
 class _GroupedProjection(torch.nn.Linear):
     """The grouped layout ``DeepseekV4GroupedLinear`` owns: one flat weight, a bmm forward."""
 
