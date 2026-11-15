@@ -23,7 +23,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops.qat._hardware import reject_qat_without_native_bf16
+
+
+# The device is monkeypatched: these cases never touch an accelerator.
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _model(**ops_fields) -> SimpleNamespace:

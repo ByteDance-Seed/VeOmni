@@ -673,8 +673,10 @@ def test_a_linear_subclass_projection_skips_the_fused_path():
 
 
 _requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reason="torchao_nvfp4 row needs torchao")
+_cpu = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
+@_cpu
 @_requires_torchao
 @pytest.mark.parametrize("swiglu_limit", [None, 1.0])
 def test_torchao_nvfp4_matches_manual_round_trip(swiglu_limit: float | None):
@@ -701,6 +703,7 @@ def test_torchao_nvfp4_matches_manual_round_trip(swiglu_limit: float | None):
     assert not torch.equal(out, mlp(x))
 
 
+@_cpu
 @_requires_torchao
 def test_torchao_nvfp4_backward_produces_finite_gradients():
     """Straight-through gradients reach the input and every projection weight."""
@@ -717,6 +720,7 @@ def test_torchao_nvfp4_backward_produces_finite_gradients():
         assert torch.count_nonzero(parameter.grad) > 0
 
 
+@_cpu
 @_requires_torchao
 def test_torchao_nvfp4_handles_empty_input():
     """Zero-token inputs keep their shape and propagate zero gradients to the MLP weights."""

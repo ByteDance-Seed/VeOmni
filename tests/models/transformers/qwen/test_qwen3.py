@@ -669,7 +669,11 @@ def test_qwen3_eager_linear_row_calls_the_projection_modules():
     "device",
     [
         pytest.param("cpu", marks=pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))),
-        pytest.param("cuda", marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires CUDA")),
+        pytest.param(
+            get_device_type(),
+            marks=pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="requires CUDA"),
+            id="accelerator",
+        ),
     ],
 )
 @_requires_torchao
