@@ -25,7 +25,7 @@ Config dir: `configs/seed_omni/Cosmos3/cosmos3_nano/`.
 | File | Role |
 |------|------|
 | `train/online.yaml` | Online recipe: the VAE encodes inside the step. |
-| `train/offline_embedding.yaml` | Stage 1 of 2: encode every clip once into a latent cache. |
+| `train/offline_embedding.yaml` | Stage 1 of 2: encode every clip into a latent cache (one clip per rank per step; when the clip count is not a multiple of the dp size, the sampler's padding encodes up to `dp_size - 1` clips twice). |
 | `train/offline_training.yaml` | Stage 2 of 2: train on that cache. |
 | `train/modules_train.yaml` | Per-module settings shared by the two training recipes, including the freeze switch. |
 | `train/modules_offline_embedding.yaml` | The VAE alone, for stage 1. |

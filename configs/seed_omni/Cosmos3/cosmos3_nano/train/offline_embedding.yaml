@@ -59,7 +59,8 @@ data:
   dataloader:
     type: native
     num_workers: 1
-    drop_last: true
+    # Keep the last, shorter batch: every clip goes into the cache.
+    drop_last: false
   mm_configs:
     data_dir: dataset/cosmos3-demo
     # Hand every source frame to the VAE module, which picks them on the source
@@ -74,7 +75,7 @@ data:
 train:
   training_task: offline_embedding
   offline_cache_dir: outputs/cosmos3_nano_latent_cache
-  global_batch_size: 16
+  # Unset: one clip per rank per step, so no step is ever partly empty.
   micro_batch_size: 1
   dyn_bsz: false
   bsz_warmup_ratio: 0.0

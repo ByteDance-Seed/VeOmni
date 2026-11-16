@@ -951,7 +951,21 @@ class OmniArguments:
             train_size = int(self.data.train_size * (1 + self.train.bsz_warmup_ratio / 2))
             self._train_steps = math.ceil(train_size / (self.train.global_batch_size * self.data.max_seq_len))
         else:
-            if dataset_length is not None:
+            if (
+                dataset_length is not None
+                and self.train.training_task == "offline_embedding"
+                and self.data.datasets_type == "mapping"
+            ):
+                # Encode-only: every row must reach the cache. The sampler pads each dp rank to
+                # ceil(len / dp_size) rows, so round up and keep the last, shorter batch.
+                if self.train.gradient_accumulation_steps != 1 or self.data.dataloader.drop_last:
+                    raise ValueError(
+                        "train.training_task='offline_embedding' on a mapping dataset encodes every row, so it "
+                        "needs data.dataloader.drop_last=false and no gradient accumulation (leave "
+                        "train.global_batch_size unset or equal to micro_batch_size * dp_size)."
+                    )
+                self._train_steps = math.ceil(dataset_length / self.train.dataloader_batch_size)
+            elif dataset_length is not None:
                 self._train_steps = math.floor(dataset_length / self.train.dataloader_batch_size)
             else:
                 self._train_steps = math.ceil(self.data.train_sample / self.train.dataloader_batch_size)
