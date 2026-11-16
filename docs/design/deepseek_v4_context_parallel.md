@@ -158,12 +158,12 @@ would be a kernel change — teaching both adapters the `query_offset` /
 NPU job that needs the CANN operators has to run with `cp_size=1`.
 
 Validation beyond configuration is one non-CI training comparison, not tensor
-parity: on Ascend with `configs/text/deepseek_v4_npu.yaml` (GSM8K,
-`max_seq_len=512`, `global_batch_size=32`, lr `3e-4`, seed 42,
-`enable_full_determinism: true`, `dp_size=4`, `ep_size=4`), `cp_size=1` and
-`cp_size=2` trained over the same 71 steps and the loss relative error stayed
-within ±4%. That is evidence the eager path trains, not a per-tensor bound, and
-it says nothing about `cp_size=8`, which has never been run.
+parity: starting from `configs/text/deepseek_v4_npu.yaml` and overriding the run
+to GSM8K, `max_seq_len=512`, `global_batch_size=32`, lr `3e-4`, seed 42,
+`enable_full_determinism: true`, `dp_size=4`, `ep_size=4`, `cp_size=1` and
+`cp_size=2` trained on Ascend over the same 71 steps and the loss relative error
+stayed within ±4%. That is evidence the eager path trains, not a per-tensor
+bound, and it says nothing about `cp_size=8`, which has never been run.
 
 `tests/parallel/context_parallel/` runs its two-rank eager case on the NPU
 suite, so the eager path's rank and local-query/global-KV geometry is checked on
