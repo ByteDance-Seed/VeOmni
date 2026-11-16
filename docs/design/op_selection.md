@@ -204,53 +204,52 @@ former `npu` implementation names still parse with a deprecation warning; see th
 
 A family field names a row for the whole model. Some deployments need less than
 that: the first ten layers in the model dtype because the kernel does not cover
-them, the routed experts quantized while the shared expert is not, the compressed
-KV rounded while the sliding-window KV is not. Those are per-*site* decisions, and
-a family field may be written as a mapping to express them:
+them, the routed experts quantized while the shared expert is not. Those are
+per-*site* decisions, and a family field may be written as a mapping to express
+them:
 
 ```yaml
 moe_implementation:
-  name: fused_triton            # what runs when low_precision is off
-  low_precision:
-    enable: true
-    dtype: fp8
-    qat: false                  # the vendor's real GEMM, not fake quantization
-    backend: deepgemm
+  name: fused_triton            # the row every site runs
+  kwargs:                       # arguments passed to that row
+    block_size: 128
   overrides:
     - site: "layers\\.0\\.experts"
-      low_precision:
-        enable: false           # this layer falls back to `name`
+      name: eager               # this layer runs a different row
+      kwargs: {}                # `eager` takes no block_size, so drop the inherited one
+      replace_kwargs: true
 ```
 
 A bare string stays valid and means one row everywhere, which is what every
 existing config and checkpoint records.
 
-**The four parts of a selection.**
+**The row name carries the whole decision.** `qat`, `torchao_nvfp4` and
+`deepgemm_fp8` are rows, so "which precision", "fake quantization or the vendor's
+real GEMM" and "which package provides it" are already spelled by the name the
+registry resolves. There is no separate `enable` flag to keep in sync with it:
+turning quantization off for a site means naming a reference row such as `eager`
+or `liger_kernel` in that rule.
 
-| Key | Meaning |
+**`kwargs` is what a row still needs per call.** A row declares its own arguments
+(`dtype`, `block_size`, `expert_dtype`, `swiglu_limit`), and the selection passes
+them. Three rules:
+
+| Rule | Why |
 | --- | --- |
-| `name` | The row to run. Absent means the host default, exactly as an unset field does today |
-| `low_precision.enable` | `true` resolves `(dtype, qat, backend)` to a row; `false` or absent keeps `name` |
-| `low_precision.dtype` | `fp8`, `nvfp4`, `mxfp4`. Omitting it lets a backend with one dtype decide, and lets the row fall back to the checkpoint's own storage dtype where it has one |
-| `low_precision.qat` | `true` is fake quantization (training computes in the model dtype on rounded operands, reproducing a deployment kernel's numerics); `false` is the vendor's real low-precision GEMM |
-| `low_precision.backend` | `tilelang`, `torchao`, `deepgemm`. `triton` exists only on `kv_round`, which is not per-site (see below) |
-| `overrides` | A list of `{site, name?, low_precision?}` rules, matched with `re.fullmatch` |
-
-`dtype`, `qat` and `backend` are orthogonal, but only registered triples resolve:
-`('fp8', True, 'tilelang')` is `qat`, `('nvfp4', True, 'torchao')` is
-`torchao_nvfp4`, `('fp8', False, 'deepgemm')` is `deepgemm_fp8`. Anything else
-raises rather than falling back to the family's reference row — a config asking
-for real NVFP4 must not quietly train something else.
+| An argument the row does not accept raises when the handle is built | A typo in YAML would otherwise be dropped and the row would run its own default while the config said something else |
+| A call site can still override one for a single invocation | The checkpoint's `expert_dtype` is more specific than the config's `dtype`, so the modeling passes it at the call |
+| An override merges into the inherited set, unless `replace_kwargs: true` | Adjusting one argument should not repeat the rest; switching to a row with a different signature needs the inherited set dropped, which `replace_kwargs` with `kwargs: {}` does |
 
 **Override semantics.** Only the keys a rule writes change; everything else is
-inherited from the enclosing block, so a rule that changes just `backend` keeps the
-outer `enable`, `qat` and `dtype`. Later rules win over earlier ones, which is why
+inherited from the enclosing block. Later rules win over earlier ones, which is why
 the broad rule goes first and the narrow exception after it. `site` is matched with
-`fullmatch`, so `layers\.0\.mlp` does not match `layers.10.mlp`.
+`re.fullmatch`, so `layers\.0\.mlp` does not match `layers.10.mlp`.
 
 **Sites are chosen by the model.** A model publishes its own strings and passes one
 when it builds a handle; the string is consumed at construction and not retained.
-DeepSeek-V4 publishes:
+The resolved row *and* its arguments form the intern key, so two sites that resolve
+to the same row with the same arguments still share one handle, while two sites
+that need different arguments do not. DeepSeek-V4 publishes:
 
 ```
 layers.<i>.q_a_proj    layers.<i>.q_b_proj    layers.<i>.kv_proj
@@ -269,7 +268,7 @@ site argument is simply unused.
 
 **`kv_round` is not per-site.** It rounds *stored* tensors rather than GEMM
 operands, so `none` / `eager` / `triton` is already the whole space and there is no
-`(dtype, qat, backend)` triple to resolve. It keeps the plain row-name form.
+argument to choose per site. It keeps the plain row-name form.
 
 ---
 

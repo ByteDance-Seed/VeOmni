@@ -2,23 +2,28 @@
 #
 # `deepseek_v4_qat.yaml` selects one row for every site of each family. This file
 # shows the other shape: a family field may be a mapping whose `overrides` list
-# changes the selection for some sites and leaves the rest alone. Both halves are
-# needed in practice -- a deployment kernel often covers part of the network, and
-# training a rounding it will never perform is worse than not training it at all.
+# changes the row for some sites and leaves the rest alone. Both halves are needed
+# in practice -- a deployment kernel often covers part of the network, and training
+# a rounding it will never perform is worse than not training it at all.
 #
 # The shape of one family field:
 #
 #   <family>_implementation:
-#     name: <row>                 # what runs when low_precision is off
-#     low_precision:
-#       enable: true              # false (or absent) keeps `name`
-#       dtype: fp8                # fp8 | nvfp4 | mxfp4
-#       qat: true                 # fake quantization, not the vendor's real GEMM
-#       backend: tilelang         # tilelang | torchao | deepgemm | triton
+#     name: <row>                 # eager | qat | torchao_nvfp4 | deepgemm_fp8 | ...
+#     kwargs:                     # arguments the row takes; optional
+#       dtype: fp8
+#       block_size: 128
 #     overrides:
 #       - site: <regex>           # fullmatch against the model's site string
 #         name: <row>             # optional, replaces `name` at these sites
-#         low_precision: {...}    # optional, merged over the outer block
+#         kwargs: {...}           # optional, merged over the outer kwargs
+#
+# The row name already carries the three things that used to be separate fields:
+# `qat` is fake FP8 through TileLang, `torchao_nvfp4` is fake NVFP4,
+# `deepgemm_fp8` is the vendor's real FP8 GEMM. What a row still needs per call is
+# its *arguments* -- `dtype`, `block_size` -- and those live in `kwargs`. A key the
+# row does not accept raises when the handle is built, so a typo cannot silently
+# drop the setting it meant to write.
 #
 # A bare string still works and means "one row everywhere", which is what every
 # existing config and checkpoint records.
@@ -44,68 +49,59 @@ model:
     # Dense projections. Layers 0-9 run in the model dtype: the deployment
     # kernel covers 10-58 only, so rounding the first ten would train a
     # rounding nothing performs. The grouped output projection takes a
-    # different backend, which is why it gets its own rule after the broad one.
+    # different row, which is why it gets its own rule after the broad one.
     # ------------------------------------------------------------------
     linear_implementation:
       name: eager
       overrides:
         - site: "layers\\.(1[0-9]|[2-4][0-9]|5[0-8])\\.(q_a_proj|q_b_proj|kv_proj|o_a_proj|o_b_proj)"
-          low_precision:
-            enable: true
+          name: qat
+          kwargs:
             dtype: fp8
-            qat: true
-            backend: tilelang
+            block_size: 128
         - site: "layers\\.(1[0-9]|[2-4][0-9]|5[0-8])\\.o_a_proj"
-          low_precision:
-            enable: true
-            dtype: nvfp4
-            qat: true
-            backend: torchao
+          name: torchao_nvfp4
 
     # ------------------------------------------------------------------
     # Shared expert. Quantized everywhere except layer 0, which the
     # checkpoint stores in BF16.
     # ------------------------------------------------------------------
     swiglu_mlp_implementation:
-      name: liger_kernel
-      low_precision:
-        enable: true
+      name: qat
+      kwargs:
         dtype: fp8
-        qat: true
-        backend: tilelang
       overrides:
+        # Switching to a row with a different signature has to say so: `liger_kernel`
+        # takes no `dtype`, and inheriting one would be refused when the handle is
+        # built. `replace_kwargs` drops the inherited set instead of merging into it.
         - site: "layers\\.0\\.mlp"
-          low_precision:
-            enable: false
+          name: liger_kernel
+          kwargs: {}
+          replace_kwargs: true
 
     # ------------------------------------------------------------------
     # Routed experts: the vendor's real FP8 grouped GEMM, not fake
     # quantization. This is the "everything off, the experts on" shape.
+    #
+    # `dtype` is deliberately absent: the row falls back to the checkpoint's
+    # own `expert_dtype`, which is FP4 on V4-Flash. The modeling passes that
+    # as a call argument, and a call argument beats the handle's kwargs.
     # ------------------------------------------------------------------
     moe_implementation:
       name: fused_triton
       overrides:
         - site: "layers\\.\\d+\\.experts"
-          low_precision:
-            enable: true
-            dtype: fp8
-            qat: false
-            backend: deepgemm
+          name: deepgemm_fp8
 
     # ------------------------------------------------------------------
     # Stored KV and indexer activations. `kv_round` is not per-site: it rounds
-    # *stored* tensors rather than GEMM operands, so `none`/`eager`/`triton` is
-    # the whole space and there is no dtype/backend pair to choose. Rounding the
-    # main attention's window KV as well as the compressed layers:
+    # *stored* tensors rather than GEMM operands, so
+    # `none`/`eager`/`triton` is the whole space and there is no row argument
+    # to choose.
     # ------------------------------------------------------------------
     kv_round_implementation: triton
 
-# Hardware: `tilelang` rows need NVIDIA SM90+ and the `tilelang` package; the
-# `deepgemm` row needs SM90/SM100 and `deep_gemm`; the Triton `kv_round` row
-# needs SM89+ or ROCm. A selection this host cannot serve fails when the handle
-# is built, not mid-training.
-#
-# A triple with no registered row is refused rather than downgraded: asking for
-# `dtype: nvfp4, qat: false, backend: torchao` raises, because no row implements
-# it and training something else would be a silent difference between the config
-# and the step.
+# Hardware: `qat` needs NVIDIA SM90+ and the `tilelang` package; `deepgemm_fp8`
+# needs SM90/SM100 and `deep_gemm`; `torchao_nvfp4` needs the `torchao` package;
+# the Triton `kv_round` row needs SM89+ or ROCm. A selection this host cannot
+# serve fails when the handle is built, not mid-training.

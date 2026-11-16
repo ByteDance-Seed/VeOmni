@@ -24,6 +24,7 @@ Hardware ``requirement`` and software ``requires`` decide availability.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from inspect import Parameter, signature
 from typing import Any, Callable
@@ -397,20 +398,55 @@ def resolve_op(op: str, variant: str, impl: str | None = None) -> OpEntry:
     return OP_REGISTRY.resolve(op, variant, impl)
 
 
+def _kwargs_key(kwargs: Mapping[str, Any]) -> tuple:
+    """Hashable form of a row-argument mapping, for the intern key."""
+    return tuple(sorted(kwargs.items()))
+
+
+def _rebuild_op(op: str, variant: str, impl: str, kwargs: Mapping[str, Any]) -> VeomniOp:
+    """Reconstruct an interned handle from its pickle payload."""
+    return VeomniOp(op, variant, impl).with_kwargs(kwargs)
+
+
+def _check_kwargs(entry: OpEntry, kwargs: Mapping[str, Any]) -> None:
+    """Refuse a row argument the row does not accept.
+
+    A typo in YAML would otherwise be dropped silently: the row would run with its
+    own default and the config would say something else.
+
+    The raw ``forward`` carries the real signature. A generated ``wrapper`` is
+    ``(*tensors, **attrs)``, so reading it would accept any keyword and validate
+    nothing.
+    """
+    if not kwargs:
+        return
+    fn = entry.forward or entry.wrapper
+    if fn is None:
+        return
+    accepted = {
+        name for name, parameter in signature(fn).parameters.items() if parameter.kind is not Parameter.POSITIONAL_ONLY
+    }
+    unknown = sorted(set(kwargs) - accepted)
+    if unknown:
+        raise ValueError(
+            f"{entry.op}/{entry.variant}/{entry.impl} does not accept {unknown}; it takes {sorted(accepted)}."
+        )
+
+
 class VeomniOp:
-    """Local handle for one ``(op, variant, impl)`` row.
+    """Local handle for one ``(op, variant, impl)`` row plus its row arguments.
 
-    Interned by resolved triple. Always calls ``entry.wrapper``. Compound
-    Functions must use ``resolve_op(...).forward`` / ``.backward``, not this
-    handle.
+    Interned by the resolved triple *and* the row arguments: two sites that
+    resolve to the same row but pass different ``dtype`` must not share a handle,
+    or one site's rounding would leak into the other. Sites with identical
+    arguments still share one object, which is the common case -- a family with no
+    overrides produces one handle no matter how many layers bind it.
 
-    ``selection`` and ``site`` exist so one family field can pick different rows
-    per call site. The site is consumed while the handle is built -- it only
-    decides *which* impl this handle binds -- and is not retained, so two sites
-    that resolve to the same row still share one interned object.
+    Compound Functions must use ``resolve_op(...).forward`` / ``.backward``, not
+    this handle.
     """
 
-    _intern: dict[tuple[str, str, str], VeomniOp] = {}
+    _intern: dict[tuple[str, str, str, tuple], VeomniOp] = {}
 
     def __new__(
         cls,
@@ -420,26 +456,33 @@ class VeomniOp:
         *,
         site: str | None = None,
     ):
-        """Return the interned handle for ``(op, variant, resolved impl)``."""
+        """Return the interned handle for the resolved row and its arguments."""
+        kwargs: dict[str, Any] = {}
         if isinstance(impl, OpsSelection):
+            kwargs = impl.resolve_kwargs(site)
             impl = impl.resolve_impl(site)
-        # A bare string with a site is fine and common: the model always passes its
-        # site, and a config that names one row for the whole family leaves nothing
-        # to override. Only the mapping form consults the site.
+        # The un-resolved name is checked first, exactly as before this change. A
+        # handle whose row was resolved under a different device view is reused
+        # instead of re-resolved: a test that mocks the host as NPU and then as CPU
+        # must get its earlier handle back, not a failure from a device where the
+        # row does not exist.
         if impl is not None:
-            cached = cls._intern.get((op, variant, impl))
+            cached = cls._intern.get((op, variant, impl, _kwargs_key(kwargs)))
             if cached is not None:
                 return cached
         entry = resolve_op(op, variant, impl)
-        cached = cls._intern.get((op, variant, entry.impl))
+        key = (op, variant, entry.impl, _kwargs_key(kwargs))
+        cached = cls._intern.get(key)
         if cached is not None:
             return cached
+        _check_kwargs(entry, kwargs)
         instance = super().__new__(cls)
         instance.op = op
         instance.variant = variant
         instance.impl = entry.impl
+        instance.kwargs = kwargs
         instance._entry = entry
-        cls._intern[(op, variant, entry.impl)] = instance
+        cls._intern[key] = instance
         return instance
 
     def __init__(
@@ -463,14 +506,37 @@ class VeomniOp:
         return self
 
     def __reduce__(self):
-        """Rebuild through interned ``(op, variant, impl)`` rather than a bare ``__new__``."""
-        return (VeomniOp, (self.op, self.variant, self.impl))
+        """Rebuild through the interned row and its arguments rather than a bare ``__new__``."""
+        return (_rebuild_op, (self.op, self.variant, self.impl, self.kwargs))
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Call ``entry.wrapper``. Tensors are positional, non-tensors are keywords."""
+        """Call ``entry.wrapper``. Tensors are positional, non-tensors are keywords.
+
+        The handle's own row arguments go in first so a call site can still override
+        one for a single invocation -- the modeling code passes ``expert_dtype``
+        from the checkpoint, which is more specific than the config's ``dtype``.
+        """
         if self._entry.wrapper is None:
             raise RuntimeError(f"VeomniOp({self.op!r}, {self.variant!r}, {self.impl!r}) has no wrapper")
-        return self._entry.wrapper(*args, **kwargs)
+        if not self.kwargs:
+            return self._entry.wrapper(*args, **kwargs)
+        return self._entry.wrapper(*args, **{**self.kwargs, **kwargs})
+
+    def with_kwargs(self, kwargs: Mapping[str, Any]) -> VeomniOp:
+        """Return the interned handle for this row with ``kwargs`` as its arguments."""
+        key = (self.op, self.variant, self.impl, _kwargs_key(kwargs))
+        cached = self._intern.get(key)
+        if cached is not None:
+            return cached
+        _check_kwargs(self._entry, kwargs)
+        instance = super().__new__(VeomniOp)
+        instance.op = self.op
+        instance.variant = self.variant
+        instance.impl = self.impl
+        instance.kwargs = dict(kwargs)
+        instance._entry = self._entry
+        self._intern[key] = instance
+        return instance
 
     @property
     def entry(self) -> OpEntry:
@@ -479,4 +545,6 @@ class VeomniOp:
 
     def __repr__(self) -> str:
         """Return ``VeomniOp(op=..., variant=..., impl=...)``."""
+        if self.kwargs:
+            return f"VeomniOp(op={self.op!r}, variant={self.variant!r}, impl={self.impl!r}, kwargs={self.kwargs!r})"
         return f"VeomniOp(op={self.op!r}, variant={self.variant!r}, impl={self.impl!r})"

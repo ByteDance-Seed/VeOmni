@@ -15,10 +15,16 @@
 """Per-site op selection.
 
 One config field names a *family* ("the projections", "the routed experts"). A
-model may want different treatment for different sites of that family -- the
-first ten layers in the model dtype, the routed experts quantized but the shared
-expert not. :class:`OpsSelection` expresses that: a default row, an optional
-low-precision block, and regex overrides keyed by site.
+model may want different rows at different sites of that family -- the first ten
+layers in the model dtype, the routed experts quantized while the shared expert is
+not. :class:`OpsSelection` expresses that: a default row, its row arguments, and
+regex overrides keyed by site.
+
+Both halves are just the row name. ``qat``, ``torchao_nvfp4`` and ``deepgemm_fp8``
+are rows, so "which precision", "fake quantization or the vendor GEMM" and "which
+package provides it" are already encoded in the name the registry resolves; what a
+row still needs to know per call is its *arguments* -- ``dtype``, ``block_size`` --
+and those travel with the selection.
 
 The site string is chosen by the model, because only it knows what its sites are
 called: ``layers.3.q_a_proj``, ``layers.12.experts``, ``layers.0.window_kv``.
@@ -40,97 +46,30 @@ from typing import Any
 
 
 __all__ = [
-    "LowPrecisionConfig",
     "OpsSelection",
     "SiteOverride",
-    "low_precision_impl",
 ]
-
-
-#: ``(dtype, qat, backend)`` → the row that implements it. Only combinations a
-#: registered row actually serves appear here; anything else raises rather than
-#: falling back to the family's reference row, because a config that asks for
-#: real NVFP4 and silently trains FP8 is the failure this table exists to prevent.
-#:
-#: ``qat`` selects fake quantization (training computes in the model dtype on
-#: rounded operands, so a deployment kernel's numerics are reproduced) against
-#: ``False`` for the vendor's real low-precision GEMM.
-_IMPL_BY_TRIPLE: dict[tuple[str, bool, str], str] = {
-    # TileLang blockwise FP8, fake quantized. Both the dense and the MoE rows.
-    ("fp8", True, "tilelang"): "qat",
-    # torchao NVFP4, fake quantized.
-    ("nvfp4", True, "torchao"): "torchao_nvfp4",
-    # DeepGEMM blockwise FP8 routed experts, real GEMM.
-    ("fp8", False, "deepgemm"): "deepgemm_fp8",
-}
-
-#: Backends whose rows exist only as fake quantization today. Named here so the
-#: error for ``("nvfp4", False, "torchao")`` says *what* is missing rather than
-#: listing the whole table.
-_QAT_ONLY_BACKENDS = frozenset({"tilelang"})
-
-
-@dataclass
-class LowPrecisionConfig:
-    """The low-precision half of a selection: precision, mode and backend.
-
-    ``dtype``, ``qat`` and ``backend`` are orthogonal up to what has been
-    registered: ``torchao`` is expected to serve both ``nvfp4`` and ``mxfp4``,
-    ``tilelang`` only fake FP8, ``deepgemm`` only real FP8. :func:`low_precision_impl`
-    is the single place that knows which triples exist.
-    """
-
-    #: ``None`` means "inherit", which only an override may do. A top-level block
-    #: with ``None`` behaves as ``False``.
-    enable: bool | None = None
-    dtype: str | None = None
-    qat: bool | None = None
-    backend: str | None = None
-    #: Tile side length. ``None`` keeps the row's own default, which is what the
-    #: deployment recipe and the checkpoint usually agree on.
-    block_size: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.enable is not None and type(self.enable) is not bool:
-            raise ValueError(f"low_precision.enable must be a bool, got {self.enable!r}.")
-        if self.qat is not None and type(self.qat) is not bool:
-            raise ValueError(f"low_precision.qat must be a bool, got {self.qat!r}.")
-        if self.block_size is not None and (type(self.block_size) is not int or self.block_size <= 0):
-            raise ValueError(f"low_precision.block_size must be a positive int, got {self.block_size!r}.")
-        if not self.enable:
-            return
-        if self.dtype is None and self.backend is None:
-            raise ValueError(
-                "low_precision.enable is set but neither dtype nor backend is; nothing would be quantized."
-            )
-        if self.backend is None:
-            raise ValueError("low_precision.enable requires a backend.")
-
-    @classmethod
-    def from_dict(cls, raw: Any) -> LowPrecisionConfig:
-        """Build from a YAML mapping, rejecting unknown keys."""
-        if not isinstance(raw, dict):
-            raise TypeError(f"low_precision must be a mapping, got {type(raw).__name__}.")
-        known = {"enable", "dtype", "qat", "backend", "block_size"}
-        unknown = set(raw) - known
-        if unknown:
-            raise ValueError(f"Unknown low_precision keys: {sorted(unknown)}. Known: {sorted(known)}.")
-        return cls(**raw)
 
 
 @dataclass
 class SiteOverride:
-    """One ``site`` pattern and the selection it replaces.
+    """One ``site`` pattern and what it changes.
 
-    Only the fields written here change; everything else is inherited from the
-    enclosing :class:`OpsSelection`. A rule that sets ``low_precision.enable:
-    false`` therefore falls back to the enclosing ``name``, which is how "keep
-    these layers in the model dtype" is spelled.
+    Everything is optional and inherited: a rule that only sets ``kwargs`` keeps
+    the enclosing ``name``, and a rule that only sets ``name`` keeps the enclosing
+    ``kwargs``. A rule that sets ``name: eager`` is how "keep these layers in the
+    model dtype" is spelled -- there is no separate "disable" flag to keep in sync
+    with the row name.
     """
 
     site: str
     name: str | None = None
-    low_precision: LowPrecisionConfig | None = None
+    #: Merged over the enclosing ``kwargs``. ``None`` means "not specified" and
+    #: inherits; a mapping replaces only the keys it names. To drop inherited
+    #: arguments -- which is what switching to a row with a different signature
+    #: needs -- write ``kwargs: {}`` together with ``replace_kwargs: true``.
+    kwargs: dict[str, Any] | None = None
+    replace_kwargs: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.site, str) or not self.site:
@@ -139,6 +78,14 @@ class SiteOverride:
             self._pattern = re.compile(self.site)
         except re.error as error:
             raise ValueError(f"override site {self.site!r} is not a valid regex: {error}") from error
+        if self.name is not None and (not isinstance(self.name, str) or not self.name):
+            raise ValueError(f"override name must be a nonempty string, got {self.name!r}.")
+        if self.kwargs is not None and not isinstance(self.kwargs, dict):
+            raise TypeError(f"override kwargs must be a mapping, got {type(self.kwargs).__name__}.")
+        if type(self.replace_kwargs) is not bool:
+            raise ValueError(f"override replace_kwargs must be a bool, got {self.replace_kwargs!r}.")
+        if self.replace_kwargs and self.kwargs is None:
+            raise ValueError("replace_kwargs requires kwargs (use {} to drop every inherited argument).")
 
     def matches(self, site: str) -> bool:
         """Whether ``site`` is covered by this rule."""
@@ -149,38 +96,38 @@ class SiteOverride:
         """Build from a YAML mapping, rejecting unknown keys."""
         if not isinstance(raw, dict):
             raise TypeError(f"an override must be a mapping, got {type(raw).__name__}.")
-        known = {"site", "name", "low_precision"}
+        known = {"site", "name", "kwargs", "replace_kwargs"}
         unknown = set(raw) - known
         if unknown:
             raise ValueError(f"Unknown override keys: {sorted(unknown)}. Known: {sorted(known)}.")
         if "site" not in raw:
             raise ValueError("an override requires a site pattern.")
-        low_precision = raw.get("low_precision")
         return cls(
             site=raw["site"],
             name=raw.get("name"),
-            low_precision=None if low_precision is None else LowPrecisionConfig.from_dict(low_precision),
+            kwargs=raw.get("kwargs"),
+            replace_kwargs=raw.get("replace_kwargs", False),
         )
 
 
 @dataclass
 class OpsSelection:
-    """One config field: a reference row, an optional low-precision block, and site overrides."""
+    """One config field: a row name, its row arguments, and site overrides.
+
+    ``name is None`` means the host default, which is exactly what an unset field
+    does today. ``kwargs`` is passed to whichever row ends up running; a row that
+    does not accept a key raises, so a typo cannot silently drop a setting.
+    """
 
     name: str | None = None
-    low_precision: LowPrecisionConfig | None = None
+    kwargs: dict[str, Any] = field(default_factory=dict)
     overrides: list[SiteOverride] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.name is not None and (not isinstance(self.name, str) or not self.name):
             raise ValueError(f"name must be a nonempty string or None, got {self.name!r}.")
-        if self.low_precision is not None and not isinstance(self.low_precision, LowPrecisionConfig):
-            raise TypeError("low_precision must be a LowPrecisionConfig.")
-
-    @property
-    def is_plain(self) -> bool:
-        """Whether this selection is just a row name, i.e. the pre-override shape."""
-        return self.low_precision is None and not self.overrides
+        if not isinstance(self.kwargs, dict):
+            raise TypeError(f"kwargs must be a mapping, got {type(self.kwargs).__name__}.")
 
     def effective(self, site: str | None) -> OpsSelection:
         """This selection with every override matching ``site`` applied, in order.
@@ -193,35 +140,23 @@ class OpsSelection:
 
     def _apply(self, rules) -> OpsSelection:
         """Merge ``rules`` over this selection, in order."""
-        name, low_precision = self.name, self.low_precision
+        name, kwargs = self.name, dict(self.kwargs)
         for rule in rules:
             if rule.name is not None:
                 name = rule.name
-            if rule.low_precision is None:
-                continue
-            current = low_precision
-            override = rule.low_precision
-            low_precision = LowPrecisionConfig(
-                enable=override.enable if override.enable is not None else (current.enable if current else None),
-                dtype=override.dtype if override.dtype is not None else (current.dtype if current else None),
-                qat=override.qat if override.qat is not None else (current.qat if current else None),
-                backend=override.backend if override.backend is not None else (current.backend if current else None),
-                block_size=override.block_size
-                if override.block_size is not None
-                else (current.block_size if current else None),
-            )
-        return OpsSelection(name=name, low_precision=low_precision)
+            if rule.replace_kwargs:
+                kwargs = dict(rule.kwargs or {})
+            elif rule.kwargs:
+                kwargs.update(rule.kwargs)
+        return OpsSelection(name=name, kwargs=kwargs)
 
     def resolve_impl(self, site: str | None) -> str | None:
-        """The row this selection names at ``site``, or ``None`` for the host default.
+        """The row this selection names at ``site``, or ``None`` for the host default."""
+        return self.effective(site).name
 
-        ``None`` is not a failure: it means "let ``OP_REGISTRY.default_impl`` pick",
-        which is exactly what an unset field does today.
-        """
-        effective = self.effective(site)
-        if effective.low_precision is not None and effective.low_precision.enable:
-            return low_precision_impl(effective.low_precision)
-        return effective.name
+    def resolve_kwargs(self, site: str | None) -> dict[str, Any]:
+        """The row arguments in force at ``site``."""
+        return dict(self.effective(site).kwargs)
 
     def all_impls(self) -> list[str | None]:
         """Every row this selection can resolve to, default and overrides alike.
@@ -231,22 +166,33 @@ class OpsSelection:
         """
         seen: list[str | None] = []
 
-        def add(selection: OpsSelection) -> None:
-            impl = selection.resolve_impl(None)
-            if impl not in seen:
-                seen.append(impl)
+        def add(name: str | None) -> None:
+            if name not in seen:
+                seen.append(name)
 
-        add(self)
+        add(self.name)
         for rule in self.overrides:
-            add(self._apply([rule]))
+            add(self._apply([rule]).name)
         return seen
+
+    def all_kwargs_keys(self) -> set[str]:
+        """Every row argument this selection can pass, default and overrides alike."""
+        keys = set(self.kwargs)
+        for rule in self.overrides:
+            keys.update(rule.kwargs or {})
+        return keys
+
+    @property
+    def is_plain(self) -> bool:
+        """Whether this selection is just a row name, i.e. the pre-override shape."""
+        return not self.kwargs and not self.overrides
 
     @classmethod
     def from_config_value(cls, raw: Any) -> OpsSelection:
         """Accept either a plain row name or the mapping form.
 
-        The mapping form adds ``low_precision`` and ``overrides``; the bare string
-        stays valid so a config that only names a row keeps working.
+        The mapping form adds ``kwargs`` and ``overrides``; the bare string stays
+        valid so a config that only names a row keeps working.
         """
         if raw is None:
             return cls()
@@ -256,57 +202,12 @@ class OpsSelection:
             return raw
         if not isinstance(raw, dict):
             raise TypeError(f"ops selection must be a string or mapping, got {type(raw).__name__}.")
-        known = {"name", "low_precision", "overrides"}
+        known = {"name", "kwargs", "overrides"}
         unknown = set(raw) - known
         if unknown:
             raise ValueError(f"Unknown ops selection keys: {sorted(unknown)}. Known: {sorted(known)}.")
-        low_precision = raw.get("low_precision")
         return cls(
             name=raw.get("name"),
-            low_precision=None if low_precision is None else LowPrecisionConfig.from_dict(low_precision),
+            kwargs=raw.get("kwargs") or {},
             overrides=[SiteOverride.from_dict(item) for item in raw.get("overrides") or ()],
         )
-
-
-def low_precision_impl(config: LowPrecisionConfig) -> str:
-    """The registered row for ``config``'s ``(dtype, qat, backend)``.
-
-    Raises:
-        ValueError: when no row serves the triple. Falling back to the reference
-            row would train something other than what the config asked for, which
-            is the one outcome this function exists to make impossible.
-    """
-    backend = config.backend
-    dtype = config.dtype
-    # An inherited-away ``None`` means "not set": a block that enables the feature
-    # without saying ``qat`` gets the fake-quantization reading of its backend.
-    qat = bool(config.qat)
-    if backend is None:
-        raise ValueError("low_precision.backend is required when low_precision.enable is set.")
-    candidates = [d for d in (dtype, "fp8", "nvfp4", "mxfp4") if d is not None]
-    for candidate in dict.fromkeys(candidates):
-        key = (candidate, qat, backend)
-        if key in _IMPL_BY_TRIPLE:
-            return _IMPL_BY_TRIPLE[key]
-    if dtype is None:
-        # A backend-only selection is only unambiguous when it serves one row.
-        served = [
-            impl
-            for (_, row_qat, served_backend), impl in _IMPL_BY_TRIPLE.items()
-            if served_backend == backend and row_qat == qat
-        ]
-        if len(served) == 1:
-            return served[0]
-        raise ValueError(
-            f"low_precision.backend={backend!r} with qat={qat} serves more than one dtype; "
-            f"set low_precision.dtype to one of {sorted({d for (d, _q, b) in _IMPL_BY_TRIPLE if b == backend})}."
-        )
-    hint = ""
-    if backend in _QAT_ONLY_BACKENDS and not qat:
-        hint = f" {backend!r} registers only fake-quantization rows today, so qat must be true."
-    elif (dtype, not qat, backend) in _IMPL_BY_TRIPLE:
-        hint = f" Did you mean qat={not qat}?"
-    raise ValueError(
-        f"No registered row for dtype={dtype!r}, qat={qat}, backend={backend!r}. "
-        f"Registered combinations: {sorted(_IMPL_BY_TRIPLE)}.{hint}"
-    )

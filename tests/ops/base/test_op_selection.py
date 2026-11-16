@@ -16,17 +16,15 @@
 
 from __future__ import annotations
 
+import pickle
+
 import pytest
+import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import OpsImplementationConfig
 from veomni.ops import VeomniOp
-from veomni.ops.selection import (
-    LowPrecisionConfig,
-    OpsSelection,
-    SiteOverride,
-    low_precision_impl,
-)
+from veomni.ops.selection import OpsSelection, SiteOverride
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -50,41 +48,28 @@ def test_an_unset_field_asks_the_host_for_its_default():
     assert OpsSelection().resolve_impl("layers.0.q_a_proj") is None
 
 
-def test_a_low_precision_block_resolves_through_the_backend_table():
-    selection = OpsSelection.from_config_value(
-        {"low_precision": {"enable": True, "dtype": "fp8", "qat": True, "backend": "tilelang"}}
-    )
-    assert selection.resolve_impl("layers.0.q_a_proj") == "qat"
-
-
-def test_an_override_that_disables_quantization_falls_back_to_the_reference_row():
-    """This is how "keep these layers in the model dtype" is spelled."""
+def test_an_override_can_switch_rows_for_some_sites():
+    """The common shape: one row by default, a different one where the kernel differs."""
     selection = OpsSelection.from_config_value(
         {
-            "name": "liger_kernel",
-            "low_precision": {"enable": True, "dtype": "fp8", "qat": True, "backend": "tilelang"},
-            "overrides": [{"site": r"layers\.0\.mlp", "low_precision": {"enable": False}}],
+            "name": "eager",
+            "overrides": [{"site": r"layers\.(1[0-9]|2[0-9])\.q_a_proj", "name": "qat"}],
         }
     )
-    assert selection.resolve_impl("layers.5.mlp") == "qat"
+    assert selection.resolve_impl("layers.15.q_a_proj") == "qat"
+    assert selection.resolve_impl("layers.5.q_a_proj") == "eager"
+
+
+def test_an_override_can_turn_quantization_off_by_naming_a_reference_row():
+    """There is no separate "disable" flag: the row name is the whole decision."""
+    selection = OpsSelection.from_config_value(
+        {
+            "name": "qat",
+            "overrides": [{"site": r"layers\.0\.mlp", "name": "liger_kernel"}],
+        }
+    )
+    assert selection.resolve_impl("layers.7.mlp") == "qat"
     assert selection.resolve_impl("layers.0.mlp") == "liger_kernel"
-
-
-def test_the_reverse_also_works_a_reference_default_with_quantized_sites():
-    """The common shape: everything off, the routed experts on."""
-    selection = OpsSelection.from_config_value(
-        {
-            "name": "fused_triton",
-            "overrides": [
-                {
-                    "site": r"layers\.\d+\.experts",
-                    "low_precision": {"enable": True, "dtype": "fp8", "qat": False, "backend": "deepgemm"},
-                }
-            ],
-        }
-    )
-    assert selection.resolve_impl("layers.3.experts") == "deepgemm_fp8"
-    assert selection.resolve_impl("layers.3.mlp") == "fused_triton"
 
 
 def test_a_later_override_wins_over_an_earlier_one():
@@ -93,31 +78,13 @@ def test_a_later_override_wins_over_an_earlier_one():
         {
             "name": "eager",
             "overrides": [
-                {
-                    "site": r"layers\.\d+\.q_a_proj",
-                    "low_precision": {"enable": True, "dtype": "fp8", "qat": True, "backend": "tilelang"},
-                },
-                {"site": r"layers\.7\.q_a_proj", "name": "eager", "low_precision": {"enable": False}},
+                {"site": r"layers\.\d+\.q_a_proj", "name": "qat"},
+                {"site": r"layers\.7\.q_a_proj", "name": "eager"},
             ],
         }
     )
     assert selection.resolve_impl("layers.3.q_a_proj") == "qat"
     assert selection.resolve_impl("layers.7.q_a_proj") == "eager"
-
-
-def test_a_partial_override_inherits_the_enclosing_block():
-    """Only the fields a rule writes change; the rest comes from the outer block."""
-    selection = OpsSelection.from_config_value(
-        {
-            "low_precision": {"enable": True, "dtype": "fp8", "qat": True, "backend": "tilelang"},
-            "overrides": [
-                {"site": r"layers\.\d+\.o_a_proj", "low_precision": {"dtype": "nvfp4", "backend": "torchao"}}
-            ],
-        }
-    )
-    # qat was inherited as True, so the override keeps fake quantization.
-    assert selection.resolve_impl("layers.2.o_a_proj") == "torchao_nvfp4"
-    assert selection.resolve_impl("layers.2.q_a_proj") == "qat"
 
 
 def test_matching_is_anchored_so_a_suffix_does_not_leak():
@@ -129,16 +96,51 @@ def test_matching_is_anchored_so_a_suffix_does_not_leak():
     assert selection.resolve_impl("layers.10.mlp") == "eager"
 
 
-def test_all_impls_enumerates_every_row_the_field_can_produce():
-    """Config-time validation has no site, so it clears every row the field names."""
+# ---------------------------------------------------------------------------
+# Row arguments
+# ---------------------------------------------------------------------------
+
+
+def test_kwargs_travel_with_the_selection():
+    """A row's arguments are part of the selection, not of the row's name."""
+    selection = OpsSelection.from_config_value({"name": "qat", "kwargs": {"dtype": "fp8", "block_size": 64}})
+    assert selection.resolve_kwargs("layers.3.q_a_proj") == {"dtype": "fp8", "block_size": 64}
+
+
+def test_an_override_merges_kwargs_by_default():
+    """A rule that adjusts one argument keeps the rest."""
     selection = OpsSelection.from_config_value(
         {
-            "name": "liger_kernel",
-            "low_precision": {"enable": True, "dtype": "fp8", "qat": True, "backend": "tilelang"},
-            "overrides": [{"site": r"layers\.0\.mlp", "low_precision": {"enable": False}}],
+            "name": "qat",
+            "kwargs": {"dtype": "fp8", "block_size": 128},
+            "overrides": [{"site": r"layers\.\d+\.o_a_proj", "kwargs": {"block_size": 64}}],
         }
     )
-    assert selection.all_impls() == ["qat", "liger_kernel"]
+    assert selection.resolve_kwargs("layers.2.o_a_proj") == {"dtype": "fp8", "block_size": 64}
+    assert selection.resolve_kwargs("layers.2.q_a_proj") == {"dtype": "fp8", "block_size": 128}
+
+
+def test_an_override_can_replace_the_whole_kwargs_set():
+    """Switching to a row with a different signature needs the inherited set dropped.
+
+    ``liger_kernel`` takes no ``dtype``, so inheriting one from the enclosing
+    quantizing block would be refused when the handle is built.
+    """
+    selection = OpsSelection.from_config_value(
+        {
+            "name": "qat",
+            "kwargs": {"dtype": "fp8"},
+            "overrides": [{"site": r"layers\.0\.mlp", "name": "liger_kernel", "kwargs": {}, "replace_kwargs": True}],
+        }
+    )
+    assert selection.resolve_kwargs("layers.0.mlp") == {}
+    assert selection.resolve_kwargs("layers.7.mlp") == {"dtype": "fp8"}
+
+
+def test_replace_kwargs_without_kwargs_is_refused():
+    """The combination has no meaning, so it fails rather than being ignored."""
+    with pytest.raises(ValueError, match="replace_kwargs requires kwargs"):
+        SiteOverride(site="x", replace_kwargs=True)
 
 
 # ---------------------------------------------------------------------------
@@ -146,27 +148,10 @@ def test_all_impls_enumerates_every_row_the_field_can_produce():
 # ---------------------------------------------------------------------------
 
 
-def test_an_unregistered_triple_is_refused_rather_than_downgraded():
-    """A config asking for real NVFP4 must not quietly train something else."""
-    with pytest.raises(ValueError, match="No registered row for dtype='nvfp4', qat=False, backend='torchao'"):
-        low_precision_impl(LowPrecisionConfig(enable=True, dtype="nvfp4", qat=False, backend="torchao"))
-
-
-def test_a_qat_only_backend_says_so():
-    """``tilelang`` registers fake quantization only; the message names the fix."""
-    with pytest.raises(ValueError, match="qat must be true"):
-        low_precision_impl(LowPrecisionConfig(enable=True, dtype="fp8", qat=False, backend="tilelang"))
-
-
-def test_enabling_without_a_backend_is_refused_at_construction():
-    with pytest.raises(ValueError, match="requires a backend"):
-        LowPrecisionConfig(enable=True, dtype="fp8")
-
-
 def test_an_unknown_key_is_named_rather_than_ignored():
     """A typo in YAML would otherwise silently drop the setting it meant to write."""
-    with pytest.raises(ValueError, match=r"Unknown low_precision keys: \['qatt'\]"):
-        LowPrecisionConfig.from_dict({"enable": True, "dtype": "fp8", "qatt": True, "backend": "tilelang"})
+    with pytest.raises(ValueError, match=r"Unknown ops selection keys: \['kwarg'\]"):
+        OpsSelection.from_config_value({"name": "eager", "kwarg": {"dtype": "fp8"}})
 
 
 def test_an_invalid_site_regex_is_refused():
@@ -184,26 +169,68 @@ def test_an_override_without_a_site_is_refused():
 # ---------------------------------------------------------------------------
 
 
-def test_veomni_op_accepts_a_selection_and_a_site():
-    """The handle resolves at construction and keeps no site of its own."""
+def test_a_row_argument_the_row_does_not_take_is_refused():
+    """The row's own signature is the check, so a typo cannot reach a forward."""
+    selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"dtype": "fp8"}})
+    with pytest.raises(ValueError, match=r"does not accept \['dtype'\]"):
+        VeomniOp("swiglu_mlp", "standard", selection, site="layers.0.mlp")
+
+
+def test_a_row_argument_the_row_takes_is_kept_on_the_handle():
+    selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"swiglu_limit": 10.0}})
+    handle = VeomniOp("swiglu_mlp", "standard", selection, site="layers.0.mlp")
+    assert handle.kwargs == {"swiglu_limit": 10.0}
+
+
+def test_a_call_can_still_override_a_handle_argument():
+    """The checkpoint's storage dtype is more specific than the config's."""
+    selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"swiglu_limit": 10.0}})
+    handle = VeomniOp("swiglu_mlp", "standard", selection, site="layers.0.mlp")
+    seen = {}
+
+    def record(*args, **kwargs):
+        seen.update(kwargs)
+        return torch.zeros(1)
+
+    handle._entry = type(handle._entry)(
+        op="swiglu_mlp",
+        variant="standard",
+        impl="eager",
+        description="test",
+        wrapper=record,
+    )
+    handle(torch.zeros(1), swiglu_limit=5.0)
+    assert seen == {"swiglu_limit": 5.0}
+
+
+def test_sites_with_the_same_row_and_arguments_share_a_handle():
+    """Intern keys on the resolved row *and* its arguments, so nothing leaks across."""
+    selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"swiglu_limit": 10.0}})
+    first = VeomniOp("swiglu_mlp", "standard", selection, site="layers.3.mlp")
+    second = VeomniOp("swiglu_mlp", "standard", selection, site="layers.4.mlp")
+    assert first is second
+
+
+def test_sites_with_different_arguments_do_not_share_a_handle():
     selection = OpsSelection.from_config_value(
         {
             "name": "eager",
-            "low_precision": {"enable": True, "dtype": "fp8", "qat": True, "backend": "tilelang"},
-            "overrides": [{"site": r"layers\.0\..*", "low_precision": {"enable": False}}],
+            "kwargs": {"swiglu_limit": 10.0},
+            "overrides": [{"site": r"layers\.7\.mlp", "kwargs": {"swiglu_limit": 5.0}}],
         }
     )
-    # ``qat`` needs SM90, so the site that keeps it is checked by name only.
-    plain = VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
-    assert plain.impl == "eager"
+    normal = VeomniOp("swiglu_mlp", "standard", selection, site="layers.3.mlp")
+    special = VeomniOp("swiglu_mlp", "standard", selection, site="layers.7.mlp")
+    assert normal is not special
+    assert (normal.kwargs, special.kwargs) == ({"swiglu_limit": 10.0}, {"swiglu_limit": 5.0})
 
 
-def test_sites_that_resolve_to_one_row_share_a_handle():
-    """Intern is unchanged: the site decides the impl, and the impl is the key."""
-    selection = OpsSelection.from_config_value("eager")
-    first = VeomniOp("linear", "standard", selection, site="layers.3.q_a_proj")
-    second = VeomniOp("linear", "standard", selection, site="layers.4.q_a_proj")
-    assert first is second
+def test_an_interned_handle_survives_pickle_with_its_arguments():
+    selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"swiglu_limit": 10.0}})
+    handle = VeomniOp("swiglu_mlp", "standard", selection, site="layers.0.mlp")
+    restored = pickle.loads(pickle.dumps(handle))
+    assert restored is handle
+    assert restored.kwargs == {"swiglu_limit": 10.0}
 
 
 def test_the_config_accepts_both_shapes_and_round_trips_the_mapping_one():
@@ -212,14 +239,16 @@ def test_the_config_accepts_both_shapes_and_round_trips_the_mapping_one():
     assert plain.to_dict()["linear_implementation"] == "eager"
 
     mapping = {
-        "low_precision": {"enable": True, "dtype": "fp8", "qat": True, "backend": "tilelang"},
-        "overrides": [{"site": r"layers\.0\..*", "low_precision": {"enable": False}}],
+        "name": "qat",
+        "kwargs": {"dtype": "fp8"},
+        "overrides": [{"site": r"layers\.0\..*", "name": "eager"}],
     }
     configured = OpsImplementationConfig(linear_implementation=mapping)
     assert isinstance(configured.linear_implementation, OpsSelection)
 
     reloaded = OpsImplementationConfig(**configured.to_dict())
     assert reloaded.linear_implementation.all_impls() == configured.linear_implementation.all_impls()
+    assert reloaded.linear_implementation.kwargs == {"dtype": "fp8"}
 
 
 def test_a_deprecated_name_is_rewritten_in_every_form():
