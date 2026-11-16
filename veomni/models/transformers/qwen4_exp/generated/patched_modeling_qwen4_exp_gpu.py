@@ -1718,12 +1718,12 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         # --- Patch.7 ---
         # --- Patch.8: Gather each shard's sorted requests and restore the
         # request order with one inverse permutation. ``order`` already groups
-        # the requests by shard, so concatenating the per-shard gathers
-        # reproduces the original request order. The per-shard ``index_copy``
-        # scatters this replaces also launch once per shard, but torch_npu runs
-        # their backward as a per-index host loop (71,690 ``select`` /
-        # ``as_strided`` / ``item`` triples, 1.6 s of host time in one measured
-        # step), while the gather backward has no such host path. ---
+        # the requests by shard, so concatenating the per-shard gathers yields
+        # the shard-grouped order, which the inverse permutation maps back to
+        # the request order. The per-shard ``index_copy`` scatters this
+        # replaces also launch once per shard, but torch_npu runs their
+        # backward as a per-index host loop that leaves the lookup host bound,
+        # while the gather backward has no such host path. ---
         result_dtype = output_dtype or first_weight.dtype
         if order.numel() == 0:
             return first_weight.new_empty((0, first_weight.shape[1]), dtype=result_dtype)
