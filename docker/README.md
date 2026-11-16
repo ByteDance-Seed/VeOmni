@@ -115,11 +115,7 @@ on native x86 and ARM runners, and merges the digests into a multi-architecture
 image. A3 watches its workflow and the CANN 9.2.1 A3 Dockerfile.
 Release builds retain the existing release-tag and `.postN` naming scheme.
 Upstream publication runs under the `ByteDance-Seed` owner using the existing
-Quay credentials. For local validation, the same workflows also accept pushes
-or manual dispatch on `zpl1n/ascend-cann921-a2-a3` in `zpl1n/VeOmni`, publishing
-to `ghcr.io/zpl1n/veomni` with `<base-image-name>-<commit>-<run-id>-<attempt>`
-tags. A2 retains both architectures. Fork builds use their own GHCR cache and
-do not require Quay credentials. There is no separate candidate workflow.
+Quay credentials. Build jobs are restricted to the `ByteDance-Seed` owner.
 
 ### Validation scope
 
