@@ -335,11 +335,20 @@ class OpRegistry:
                 return entry.quantizes
         return None
 
-    def row_arguments(self, op: str, impl: str) -> set[str] | None:
-        """The keyword arguments ``impl`` accepts on ``op``, or ``None`` if unregistered.
+    def row_arguments(self, op: str, impl: str) -> dict[str, Any] | None:
+        """The keyword arguments a selection may set on ``impl`` of ``op``, name to default.
 
         Read from the raw ``forward``, which carries the real signature; the
         generated ``wrapper`` is ``(*tensors, **attrs)`` and would accept anything.
+
+        Only keyword-only parameters *with a default* are listed. A parameter with
+        no default is one the row cannot run without, so the modeling always passes
+        it and it describes the shape of the computation -- ``num_experts`` is the
+        expert count of the module, not a preference. Letting a config set it would
+        let a YAML typo launch the kernel over the wrong number of experts. It stays
+        call-only, which is also why the third precedence step does not reach it.
+
+        Returns ``None`` when ``impl`` is not registered for ``op`` on any device.
         """
         for (entry_op, _variant, entry_impl, _device), entry in self._entries.items():
             if entry_op != op or entry_impl != impl:
@@ -350,9 +359,9 @@ class OpRegistry:
             # ``KEYWORD_ONLY`` only: the tensor operands are positional, so a
             # selection never supplies them and listing them would suggest it could.
             return {
-                name
+                name: parameter.default
                 for name, parameter in signature(fn).parameters.items()
-                if parameter.kind is Parameter.KEYWORD_ONLY
+                if parameter.kind is Parameter.KEYWORD_ONLY and parameter.default is not Parameter.empty
             }
         return None
 
@@ -464,7 +473,9 @@ def _check_kwargs(entry: OpEntry, kwargs: Mapping[str, Any]) -> None:
 
     **A quantizing row still has to declare the key.** A typo would otherwise be
     dropped, and the row would run its own default while the config said something
-    else. The raw ``forward`` carries the real signature; a generated ``wrapper`` is
+    else. A key the row requires rather than defaults is refused too: it describes
+    the shape of the computation, so the modeling supplies it and a config must not.
+    The raw ``forward`` carries the real signature; a generated ``wrapper`` is
     ``(*tensors, **attrs)`` and would accept any keyword.
     """
     if not kwargs:
@@ -478,11 +489,21 @@ def _check_kwargs(entry: OpEntry, kwargs: Mapping[str, Any]) -> None:
     fn = entry.forward or entry.wrapper
     if fn is None:
         return
-    accepted = {
-        name for name, parameter in signature(fn).parameters.items() if parameter.kind is Parameter.KEYWORD_ONLY
-    }
-    unknown = sorted(set(kwargs) - accepted)
+    accepted = OP_REGISTRY.row_arguments(entry.op, entry.impl) or {}
+    unknown = sorted(set(kwargs) - set(accepted))
     if unknown:
+        required = sorted(
+            name
+            for name, parameter in signature(fn).parameters.items()
+            if parameter.kind is Parameter.KEYWORD_ONLY and parameter.default is Parameter.empty
+        )
+        shape = sorted(set(unknown) & set(required))
+        if shape:
+            raise ValueError(
+                f"{entry.op}/{entry.variant}/{entry.impl}: {shape} describes the shape of the computation -- "
+                f"the modeling passes it at the call site, so a config cannot set it. Configurable arguments "
+                f"are {sorted(accepted)}."
+            )
         raise ValueError(
             f"{entry.op}/{entry.variant}/{entry.impl} does not accept {unknown}; it takes {sorted(accepted)}."
         )
@@ -567,15 +588,24 @@ class VeomniOp:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Call ``entry.wrapper``. Tensors are positional, non-tensors are keywords.
 
-        The handle's own row arguments go in first so a call site can still override
-        one for a single invocation -- the modeling code passes ``expert_dtype``
-        from the checkpoint, which is more specific than the config's ``dtype``.
+        The handle's row arguments win over the call's. A row argument has three
+        sources, and each may correct the one before it: the row's own signature
+        default, the value the modeling passes from the checkpoint, and the value the
+        config sets. The checkpoint records what the weights were *stored* as
+        (``expert_dtype`` is ``"fp4"`` in a V4-Flash checkpoint), while the config
+        records what this run is *asked* to train at -- so the config has to be the
+        one that survives, or a YAML that says ``dtype: fp8`` over an FP4 checkpoint
+        would be silently ignored at every call site.
+
+        A call site therefore passes what the module knows and the handle corrects it.
+        Sites that the config says nothing about keep the modeling's value, because
+        then ``self.kwargs`` simply has no entry for that key.
         """
         if self._entry.wrapper is None:
             raise RuntimeError(f"VeomniOp({self.op!r}, {self.variant!r}, {self.impl!r}) has no wrapper")
         if not self.kwargs:
             return self._entry.wrapper(*args, **kwargs)
-        return self._entry.wrapper(*args, **{**self.kwargs, **kwargs})
+        return self._entry.wrapper(*args, **{**kwargs, **self.kwargs})
 
     def with_kwargs(self, kwargs: Mapping[str, Any]) -> VeomniOp:
         """Return the interned handle for this row with ``kwargs`` as its arguments."""

@@ -95,7 +95,9 @@ model:
     #
     # `expert_dtype` is deliberately absent: the row falls back to the
     # checkpoint's own, which is FP4 on V4-Flash. The modeling passes it as a
-    # call argument, and a call argument beats the handle's kwargs.
+    # call argument, and the config would win over it if it set one -- say
+    # `expert_dtype: fp8` here to train the experts at FP8 even though the
+    # checkpoint stored them in FP4.
     # ------------------------------------------------------------------
     moe_implementation:
       name: fused_triton

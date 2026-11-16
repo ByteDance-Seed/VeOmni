@@ -229,8 +229,14 @@ def test_a_row_argument_the_row_takes_is_kept_on_the_handle(quantizing_row):
     assert handle.kwargs == {"block_size": 64}
 
 
-def test_a_call_can_still_override_a_handle_argument(quantizing_row):
-    """The checkpoint's storage dtype is more specific than the config's."""
+def test_the_config_beats_the_value_the_modeling_passes(quantizing_row):
+    """Three sources, in order: row default, then modeling, then config.
+
+    A checkpoint records what its weights were stored as; the config records what
+    this run is asked to train at. The config has to be the one that survives, or a
+    YAML saying ``block_size: 64`` would be ignored wherever the modeling passes its
+    own value -- which is every DeepSeek-V4 expert call.
+    """
     selection = OpsSelection.from_config_value({"name": quantizing_row, "kwargs": {"block_size": 64}})
     handle = VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
     seen = {}
@@ -247,7 +253,47 @@ def test_a_call_can_still_override_a_handle_argument(quantizing_row):
         wrapper=record,
     )
     handle(torch.zeros(1), block_size=32)
+    assert seen == {"block_size": 64}
+
+
+def test_a_key_the_config_does_not_set_keeps_the_modeling_value(quantizing_row):
+    """Silence in the config is not an override: the call site's value passes through."""
+    selection = OpsSelection.from_config_value({"name": quantizing_row, "kwargs": {}})
+    handle = VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
+    seen = {}
+
+    def record(*args, **kwargs):
+        seen.update(kwargs)
+        return torch.zeros(1)
+
+    handle._entry = type(handle._entry)(
+        op="linear",
+        variant="standard",
+        impl=quantizing_row,
+        description="test",
+        wrapper=record,
+    )
+    handle(torch.zeros(1), block_size=32)
     assert seen == {"block_size": 32}
+
+
+def test_a_parameter_the_row_requires_is_not_configurable():
+    """``num_experts`` is the module's shape, not a preference.
+
+    It has no default because the row cannot run without it, so the modeling always
+    supplies it. Letting a config pin it would let a typo launch the kernel over the
+    wrong expert count -- refused at config parse, like any other key the row does
+    not offer.
+    """
+    with pytest.raises(ValueError, match=r"'qat' does not accept \['num_experts'\]"):
+        OpsImplementationConfig(moe_implementation={"name": "qat", "kwargs": {"num_experts": 256}})
+
+    # The keys that *are* configurable still are, including the checkpoint's
+    # storage dtype, which is the one the modeling also passes at the call site.
+    configured = OpsImplementationConfig(
+        moe_implementation={"name": "qat", "kwargs": {"expert_dtype": "fp4", "block_size": 64}}
+    )
+    assert configured.moe_implementation.kwargs == {"expert_dtype": "fp4", "block_size": 64}
 
 
 def test_sites_with_the_same_row_and_arguments_share_a_handle(quantizing_row):

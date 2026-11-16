@@ -1845,10 +1845,16 @@ class OpsImplementationConfig:
                 if accepted is None:
                     continue
                 # Only keyword-shaped parameters count: the tensor operands are passed
-                # positionally by the row's own caller, never by a selection.
-                unknown = sorted(set(kwargs) - accepted)
+                # positionally by the row's own caller, never by a selection. A
+                # parameter without a default describes the shape of the computation,
+                # so the modeling supplies it and a config must not.
+                unknown = sorted(set(kwargs) - set(accepted))
                 if unknown:
-                    raise ValueError(f"{field_name}: {name!r} does not accept {unknown}; it takes {sorted(accepted)}.")
+                    raise ValueError(
+                        f"{field_name}: {name!r} does not accept {unknown}; it takes {sorted(accepted)}. "
+                        "A parameter the row requires rather than defaults -- such as 'num_experts' -- is "
+                        "passed by the modeling at the call site, not by a config."
+                    )
 
     def _normalize_selections(self) -> None:
         """Turn the mapping form of a per-site field into an ``OpsSelection``.

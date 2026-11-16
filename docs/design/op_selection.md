@@ -246,7 +246,8 @@ row name says. Four rules:
 | --- | --- |
 | **Only a quantizing row takes arguments** | A row argument says *how* to round an operand. `fused_triton` and `eager` have nothing to round, so passing `block_size: 64` to them asks for something the row will not do, and the run would quietly do something else. Rows declare `quantizes=True` when they are registered, and both the config and the handle refuse arguments on the rest |
 | An argument the row does not accept raises when the handle is built | A typo in YAML would otherwise be dropped and the row would run its own default while the config said something else |
-| A call site can still override one for a single invocation | The checkpoint's `expert_dtype` is more specific than the config's `dtype`, so the modeling passes it at the call |
+| **The config beats what the modeling passes at the call site** | A row argument has three sources, and each corrects the one before it: the row's own signature default, the value the modeling passes from the checkpoint (`expert_dtype` is `"fp4"` in a V4-Flash checkpoint), and the value the config sets. The checkpoint says what the weights were *stored* as; the config says what this run is *asked* to train at, so the config is the one that has to survive. A key the config leaves out keeps the modeling's value |
+| An argument without a default is not configurable | `num_experts` has no default because the row cannot run without it, so the modeling always supplies it. It describes the shape of the computation rather than a preference, and a YAML typo must not be able to launch the kernel over the wrong expert count |
 | An override merges into the inherited set, unless `replace_kwargs: true` | Adjusting one argument should not repeat the rest; switching to a row with a different signature needs the inherited set dropped, which `replace_kwargs` with `kwargs: {}` does |
 
 That first rule is what makes an override's two shapes distinct: a rule that

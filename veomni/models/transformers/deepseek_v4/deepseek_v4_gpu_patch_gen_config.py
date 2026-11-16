@@ -1723,7 +1723,9 @@ class PatchedDeepseekV4Experts(nn.Module):
         # The quantizing rows round the activations and expert weights they are
         # handed; the reference rows pass them through. `expert_dtype` follows
         # the checkpoint (V4-Flash stores routed experts in FP4), so it is a call
-        # argument rather than part of the implementation name.
+        # argument rather than part of the implementation name -- and the config
+        # wins over it when the config sets one, because the config is what this
+        # run is asked to train at.
         down_proj = self.down_proj
         gate_up_proj = self.gate_up_proj
         if not self.use_swiglu_mlp:
