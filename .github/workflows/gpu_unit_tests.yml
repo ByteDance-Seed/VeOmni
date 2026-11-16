@@ -141,3 +141,28 @@ jobs:
             extra_args+=(--include-conditional)
           fi
           uv run --frozen python -m scripts.ci.accelerator --backend cuda --suite unit "${extra_args[@]}"
+
+      - name: Sync the torchao extra
+        # float8 training and the torchao FP4 QAT rows need torchao, which stays
+        # out of the `gpu` extra because it conflicts with peft's torchao
+        # integration. The suite above therefore skips those tests. Install it
+        # only after the peft-sensitive cases have run, then run the torchao
+        # selection below.
+        run: |
+          uv sync --frozen --extra gpu --extra float8 --group dev
+      - name: Run the torchao float8 tests
+        run: |
+          uv run --frozen pytest -q tests/models/test_float8_training.py
+      - name: Run the torchao QAT tests
+        shell: bash
+        run: |
+          files=(
+            tests/ops/linear/test_linear.py
+            tests/ops/swiglu_mlp/test_swiglu_mlp.py
+          )
+          # The two-rank QAT acceptance lands with the FP4 format PR; run it once
+          # the file exists rather than failing on a missing path.
+          if [ -f tests/models/test_qat_fsdp.py ]; then
+            files+=(tests/models/test_qat_fsdp.py)
+          fi
+          uv run --frozen pytest -q "${files[@]}"
