@@ -19,8 +19,10 @@ from safetensors.torch import save_file
 from transformers import JanusConfig, JanusVisionConfig, JanusVQVAEConfig, LlamaConfig
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.models.checkpoint.weights import tie_word_embeddings_if_requested
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.janus.hf_layout import JANUS_GENERATION_KWARGS, JANUS_HF_LAYOUT
+from veomni.models.seed_omni.modules.janus.llama.modeling import JanusLlama
 from veomni.models.seed_omni.utils.hf_layout import (
     read_hf_source,
     resolve_omni_checkpoint_root,
@@ -251,24 +253,54 @@ def test_build_config_maps_the_upstream_config_per_module():
     disagreeing = _janus_config(tied=False)
     disagreeing.tie_word_embeddings = True
     assert text_encoder.build_config(disagreeing).tie_word_embeddings is False
-    # The headless modules have no wte / lm_head, so they must say so rather than
-    # leave the attribute absent: the shared post-load tie reads it and would
-    # raise from ``get_output_embeddings()`` on a truthy value.
-    for name in (SIGLIP, VQVAE):
-        built = modules[name].build_config(config)
-        assert built.tie_word_embeddings is False, name
 
 
-def test_the_backbone_never_ties_itself():
-    """``janus_llama`` holds no wte / lm_head, so a tie there crashes the post-load step.
+def test_the_headless_modules_fabricate_no_tie_flag():
+    """A module with no output head says nothing about tying.
 
-    Its input embedding is ``nn.Identity``; the shared tie does
-    ``input_embeddings._parameters["weight"]`` and raises
-    ``RuntimeError('Failed to tie input/output embeddings')``.
+    ``tie_word_embeddings_if_requested`` skips a model whose
+    ``get_output_embeddings()`` is ``None``, so there is no flag to set — and
+    setting one would fake a field the module does not have. The backbone must
+    also leave the caller's nested ``text_config`` alone: the text encoder reads
+    that field for the one tie that is real.
     """
-    llm = JANUS_HF_LAYOUT.modules[LLAMA].build_config(_janus_config(tied=True))
-    assert llm.tie_word_embeddings is False
-    assert llm.text_config.tie_word_embeddings is False
+    config = _janus_config(tied=True)
+    modules = JANUS_HF_LAYOUT.modules
+    for name in (SIGLIP, VQVAE, LLAMA):
+        built = modules[name].build_config(config)
+        assert "tie_word_embeddings" not in built.__dict__, name
+
+    llm = modules[LLAMA].build_config(config)
+    # The nested config is the caller's object and keeps the flag it was given.
+    assert llm.text_config.tie_word_embeddings is True
+    assert llm.text_config is not config.text_config
+
+
+def test_the_backbone_is_skipped_by_the_real_tie_hook():
+    """``janus_llama`` holds no wte / lm_head, so the shared tie must skip it.
+
+    Its input embedding is ``nn.Identity`` and it exposes no output head. The
+    hook returns without assigning rather than reaching into
+    ``None._parameters`` and raising ``RuntimeError``.
+    """
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models.seed_omni.modules.janus.llama.configuration import JanusLlamaConfig
+
+    upstream = _janus_config(tied=True)
+    # Pin the backend: unset means ``veomni_flash_attention_2``, which a CPU host
+    # cannot construct — the tie check would never be reached.
+    cfg = JanusLlamaConfig(
+        text_config=upstream.text_config.to_dict(),
+        image_token_id=upstream.image_token_id,
+        ops_implementation=make_eager_ops_config(),
+    )
+    # The upstream flag survives on the nested config; nothing is forced.
+    assert "tie_word_embeddings" not in cfg.__dict__
+    assert cfg.text_config.tie_word_embeddings is True
+
+    model = JanusLlama(cfg)
+    assert model.get_output_embeddings() is None
+    assert tie_word_embeddings_if_requested(model) is False
 
 
 @pytest.mark.parametrize(
