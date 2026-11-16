@@ -48,8 +48,6 @@ from transformers.utils import (
 from transformers.utils.generic import check_model_inputs
 from transformers.utils.output_capturing import OutputRecorder
 
-from veomni.distributed.parallel_state import get_parallel_state
-
 # Linear-attention kernels: always use the eager implementations from the ops
 # tree (pure PyTorch, MindSpeed-derived; `fla` is GPU-only and absent from the
 # NPU image). patchgen hoists conditional imports to the module top level, so
@@ -58,7 +56,6 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.ops.kernels.kda.kimi_k3.eager import (
     FusedRMSNormGated,
     ShortConvolution,
-    chunk_kda,
     fused_recurrent_kda,
     prepare_cu_seqlens_from_mask,
     prepare_lens_from_mask,
@@ -537,11 +534,6 @@ class KimiDeltaAttention(nn.Module):
 
         self.o_norm = FusedRMSNormGated(self.head_dim, eps=config.rms_norm_eps, activation="sigmoid")
         self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
-        # Chunked-KDA kernel handle, stored on the instance (VeOmni constraint:
-        # kernel handles belong to model instances). The source default is the
-        # ops-side eager reference; generated modeling rebinds it to the
-        # ``chunk_kda`` VeomniOp resolved from the installed ops selection.
-        self.veomni_chunk_kda = chunk_kda
 
     def forward(
         self,
@@ -955,25 +947,6 @@ class KimiDecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             **kwargs,
         )
-
-    def _attn_selective_recompute(self) -> bool:
-        # NPU/EP (MindSpeed-style selective recompute): under EP
-        # the MoE block contains alltoall dispatch/combine collectives.
-        # Non-reentrant whole-layer gradient checkpointing replays them
-        # inside backward at rank-skewed moments, desynchronizing the
-        # collectives (all-NaN grads after a few training steps, observed during EP bring-up).
-        # When EP is on we therefore skip whole-layer checkpointing and
-        # checkpoint ONLY the attention stack (collective-free); the MoE
-        # block keeps its activations so it is never replayed.
-        return self.training and getattr(self, "gradient_checkpointing", False) and get_parallel_state().ep_enabled
-
-    def __call__(self, *args, **kwargs):
-        if self._attn_selective_recompute():
-            # Skip the whole-layer checkpoint (see _attn_selective_recompute)
-            # and run nn.Module.__call__ directly; forward() checkpoints the
-            # attention stack itself.
-            return super(GradientCheckpointingLayer, self).__call__(*args, **kwargs)
-        return super().__call__(*args, **kwargs)
 
     def forward(
         self,

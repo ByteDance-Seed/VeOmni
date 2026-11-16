@@ -1,6 +1,6 @@
 --- a/veomni/models/transformers/kimi_k3/source/modeling_kimi_k3.py
 +++ b/patched_modeling_kimi_k3_npu.py
-@@ -1,31 +1,78 @@
+@@ -1,31 +1,82 @@
 -# coding=utf-8
 -# Copyright 2025-2026 The Moonshot AI Team and HuggingFace Inc. team. All rights reserved.
 +# ==============================================================================
@@ -39,9 +39,13 @@
 +#    - method_override: KimiMoEGate.forward
 +#      Drop the inference-only `assert not self.training` so routing runs in training mode
 +#    - method_override: KimiDeltaAttention.__init__
-+#      Bind the instance-local chunk_kda VeomniOp (replaces the vendored eager reference)
++#      Define the instance-local chunk_kda VeomniOp declared by the source
 +#    - method_override: KimiDeltaAttention.forward
 +#      Sequence-parallel KDA: head-sharded ulysses all-to-all by default (K3_KDA_HEAD_SHARD=1) or the legacy full-sequence gather (K3_KDA_HEAD_SHARD=0)
++#    - method_override: KimiDecoderLayer._attn_selective_recompute
++#      EP selective-recompute policy (VeOmni-only; upstream has no EP): checkpoint only the collective-free attention stack under EP
++#    - method_override: KimiDecoderLayer.__call__
++#      Skip the whole-layer GradientCheckpointingLayer checkpoint under EP (forward() checkpoints the attention stack itself)
 +#    - method_override: KimiMLAAttention.forward
 +#      Sequence-parallel MLA: full-sequence gather/narrow around the attention, or head-sharded ulysses inside the veomni_* attention adapters
 +#    - class_replacement: KimiBlockSparseMLP
@@ -95,7 +99,7 @@
  import torch.utils.checkpoint
  from einops import rearrange
  from transformers.activations import ACT2FN, PytorchGELUTanh
-@@ -35,40 +82,225 @@
+@@ -35,24 +86,19 @@
  from transformers.masking_utils import create_causal_mask
  from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
  from transformers.modeling_layers import GradientCheckpointingLayer
@@ -114,13 +118,12 @@
  from transformers.utils.generic import check_model_inputs
  from transformers.utils.output_capturing import OutputRecorder
 
- from veomni.distributed.parallel_state import get_parallel_state
--
 -# Linear-attention kernels: always use the eager implementations from the ops
 -# tree (pure PyTorch, MindSpeed-derived; `fla` is GPU-only and absent from the
 -# NPU image). patchgen hoists conditional imports to the module top level, so
 -# a try/except fla import cannot survive codegen. NPU kernels replace these
 -# via VeomniOp dispatch in the patch configs instead.
++from veomni.distributed.parallel_state import get_parallel_state
 +from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
 +from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 +from veomni.models.loss_utils import ForCausalLMLoss
@@ -129,10 +132,7 @@
  from veomni.ops.kernels.kda.kimi_k3.eager import (
      FusedRMSNormGated,
      ShortConvolution,
--    chunk_kda,
-     fused_recurrent_kda,
-     prepare_cu_seqlens_from_mask,
-     prepare_lens_from_mask,
+@@ -62,10 +108,203 @@
      tensor_cache,
  )
 
@@ -337,7 +337,7 @@
 
  # Flash attention (vision tower only): patchgen hoists conditional imports to
  # the module top level, so `flash_attn_varlen_func` is unconditionally None
-@@ -78,6 +310,12 @@
+@@ -75,6 +314,12 @@
  flash_attn_varlen_func = None
 
 
@@ -350,7 +350,7 @@
  # Register Moonshot-specific activation functions
  class SituAndMul(nn.Module):
      """
-@@ -85,19 +323,16 @@
+@@ -82,19 +327,16 @@
      When linear_beta is set, up is also transformed by linear_beta * tanh(up / linear_beta).
      """
 
@@ -375,7 +375,7 @@
 
 
  def _get_situ_activation_params(config: KimiLinearConfig):
-@@ -236,51 +471,112 @@
+@@ -233,51 +475,112 @@
          return self.conv_states[self.last_linear_layer] is not None
 
 
@@ -522,7 +522,7 @@
 
 
  class KimiMLP(nn.Module):
-@@ -340,6 +636,12 @@
+@@ -337,6 +640,12 @@
      out = torch.einsum("bhqk,bhkd->bhqd", probs, value).transpose(1, 2).contiguous()
 
      return out, probs
@@ -535,7 +535,7 @@
 
 
  class KimiMLAAttention(nn.Module):
-@@ -414,14 +716,53 @@
+@@ -411,14 +720,53 @@
 
          self.rotary_emb = None
 
@@ -591,7 +591,7 @@
          batch_size, seq_length = hidden_states.shape[:-1]
          query_shape = (batch_size, seq_length, -1, self.q_head_dim)
          key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
-@@ -475,11 +816,30 @@
+@@ -472,11 +820,30 @@
              g = self.g_proj(hidden_states).sigmoid()
              attn_output = attn_output * g
          attn_output = self.o_proj(attn_output)
@@ -612,29 +612,25 @@
 -    def __init__(self, config: KimiLinearConfig, layer_idx: int):
 +    # KDA chunked linear attention (instance-local VeomniOp, fused AscendC kernel)
 +
-+    # Patch 12: the source binds the vendored eager ``chunk_kda`` reference onto
-+    # each ``KimiDeltaAttention`` instance (``self.veomni_chunk_kda``) and calls it
-+    # from both training paths. The override below rebinds that handle to a
-+    # ``chunk_kda`` ``VeomniOp`` (``kimi_k3`` variant) resolved from the ops
-+    # selection installed at model-build time, mirroring the rms_norm / situ_and_mul
-+    # instance-local pattern. Signatures are kwarg-compatible; extra K3 args
++    # Patch 12: the source declares the per-instance kernel handle
++    # (``self.veomni_chunk_kda``) and calls it from both training paths; the
++    # override below defines that handle as a ``chunk_kda`` ``VeomniOp``
++    # (``kimi_k3`` variant) resolved from the ops selection installed at
++    # model-build time, mirroring the rms_norm / situ_and_mul instance-local
++    # pattern. Signatures are kwarg-compatible; extra K3 args
 +    # (``A_log``/``dt_bias``/``transpose_state_layout``) pass through.
 +    def __init__(self, config: "KimiLinearConfig", layer_idx: int):
          super().__init__()
          self.config = config
          self.mode = "chunk"
-@@ -537,19 +897,18 @@
+@@ -534,14 +901,19 @@
 
          self.o_norm = FusedRMSNormGated(self.head_dim, eps=config.rms_norm_eps, activation="sigmoid")
          self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
--        # Chunked-KDA kernel handle, stored on the instance (VeOmni constraint:
--        # kernel handles belong to model instances). The source default is the
--        # ops-side eager reference; generated modeling rebinds it to the
--        # ``chunk_kda`` VeomniOp resolved from the installed ops selection.
--        self.veomni_chunk_kda = chunk_kda
-+        # Modification: rebind the source's eager ``chunk_kda`` reference to the
-+        # ops-configured ``VeomniOp`` (instance-local kernel handle; the fused
-+        # AscendC kernel when configured, the modeling reference otherwise).
++        # Modification: define the instance-local ``chunk_kda`` kernel handle
++        # (the source declares and calls it without binding a default): the
++        # fused AscendC kernel when configured, the modeling eager reference
++        # otherwise.
 +        self.veomni_chunk_kda = VeomniOp("chunk_kda", "kimi_k3", config.ops_config.chunk_kda_implementation)
 
      def forward(
@@ -650,7 +646,7 @@
          if attention_mask is not None:
              if attention_mask.dim() != 2:
                  attention_mask = kwargs.get("padding_mask")
-@@ -559,6 +918,23 @@
+@@ -551,6 +923,23 @@
                      "attention_mask must be a 0-1 matrix of shape [batch_size, seq_len] "
                      "(0 = padding). 3D masks are not supported here.",
                  )
@@ -674,7 +670,7 @@
          use_cache = cache_params is not None
          batch_size, q_len, _ = hidden_states.shape
          mode = "fused_recurrent" if use_cache and q_len == 1 else self.mode
-@@ -577,9 +953,15 @@
+@@ -569,9 +958,15 @@
              assert mode == "chunk", "Only chunk mode is supported in training."
 
          cu_seqlens = kwargs.get("cu_seqlens")
@@ -690,7 +686,7 @@
              hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
 
          conv_state_q, conv_state_k, conv_state_v = None, None, None
-@@ -636,6 +1018,7 @@
+@@ -628,6 +1023,7 @@
                  lower_bound=self.gate_lower_bound,
                  transpose_state_layout=True,
                  cu_seqlens=cu_seqlens,
@@ -698,7 +694,7 @@
                  disable_recompute=True,
              )
          else:
-@@ -671,8 +1054,16 @@
+@@ -663,8 +1059,16 @@
          o = self.o_proj(o)
          if attention_mask is not None:
              o = pad_input(o.squeeze(0), indices, batch_size, q_len)
@@ -715,7 +711,7 @@
 
 
  class KimiMoEGate(nn.Module):
-@@ -708,10 +1099,9 @@
+@@ -700,10 +1104,9 @@
          self.reset_parameters()
 
      def reset_parameters(self) -> None:
@@ -727,7 +723,7 @@
      def forward(self, hidden_states):
          bsz, seq_len, h = hidden_states.shape
          # compute gating score
-@@ -731,7 +1121,7 @@
+@@ -723,7 +1126,7 @@
              )
 
          # select top-k experts
@@ -736,7 +732,7 @@
          scores = scores.view(bsz * seq_len, -1)
          scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
          if self.num_expert_group > 1 and self.num_expert_group > self.topk_group:
-@@ -776,13 +1166,29 @@
+@@ -768,13 +1171,29 @@
          return topk_idx, topk_weight
 
 
@@ -771,7 +767,7 @@
          super().__init__()
          self.config = config
          self.hidden_dim = config.hidden_size
-@@ -794,20 +1200,16 @@
+@@ -786,20 +1205,16 @@
          self.moe_hidden_size = config.routed_expert_hidden_size if self.use_latent_moe else config.hidden_size
          self.latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
 
@@ -800,7 +796,7 @@
          if config.num_shared_experts is not None:
              intermediate_size = config.moe_intermediate_size * config.num_shared_experts
              self.shared_experts = KimiMLP(
-@@ -830,6 +1232,7 @@
+@@ -822,6 +1237,7 @@
                  self.routed_expert_norm = KimiRMSNorm(
                      self.moe_hidden_size,
                      eps=config.rms_norm_eps,
@@ -808,7 +804,7 @@
                  )
 
      def forward(self, hidden_states):
-@@ -841,10 +1244,9 @@
+@@ -833,10 +1249,9 @@
          if self.use_latent_moe:
              hidden_states = self.routed_expert_down_proj(hidden_states)
 
@@ -822,11 +818,10 @@
 
          if self.use_latent_moe:
              if self.latent_moe_use_norm:
-@@ -856,41 +1258,6 @@
-         if self.config.num_shared_experts is not None:
+@@ -849,40 +1264,11 @@
              y = y + self.shared_experts(identity)
          return y
--
+
 -    @torch.no_grad()
 -    def moe_infer(self, x, topk_ids, topk_weight):
 -        cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts)))
@@ -861,23 +856,51 @@
 -            .type(new_x.dtype)
 -        )
 -        return final_out
++
++# ======================================================================
++# [MODIFIED CLASS] KimiDecoderLayer
++# Methods patched: _attn_selective_recompute, __call__
++# ======================================================================
 
 
  class KimiDecoderLayer(GradientCheckpointingLayer):
-@@ -1122,6 +1489,12 @@
+@@ -1094,6 +1480,35 @@
+
          return prefix_sum, block_residual
 
-
++    # Decoder layer: EP selective recompute (moved out of the vendored source).
++    # Upstream has no expert parallelism, so this policy is pure VeOmni behaviour
++    # and lives in the patch layer alongside the SP routing -- the generated .diff
++    # shows it on every re-sync.
++    def _attn_selective_recompute(self) -> bool:
++        # NPU/EP (MindSpeed-style selective recompute): under EP the MoE block
++        # contains alltoall dispatch/combine collectives. Non-reentrant
++        # whole-layer gradient checkpointing replays them inside backward at
++        # rank-skewed moments, desynchronizing the collectives (all-NaN grads
++        # after a few training steps, observed during EP bring-up). When EP is
++        # on we therefore skip whole-layer checkpointing and checkpoint ONLY
++        # the attention stack (collective-free); the MoE block keeps its
++        # activations so it is never replayed.
++        return self.training and getattr(self, "gradient_checkpointing", False) and get_parallel_state().ep_enabled
++
++    def __call__(self, *args, **kwargs):
++        if self._attn_selective_recompute():
++            # Skip the whole-layer checkpoint (see _attn_selective_recompute)
++            # and run nn.Module.__call__ directly; forward() checkpoints the
++            # attention stack itself.
++            return super(GradientCheckpointingLayer, self).__call__(*args, **kwargs)
++        return super().__call__(*args, **kwargs)
++
++
 +# ======================================================================
 +# [MODIFIED CLASS] KimiPreTrainedModel
 +# Methods patched: _init_weights
 +# ======================================================================
 +
-+
+
  class KimiPreTrainedModel(PreTrainedModel):
      config_class = KimiLinearConfig
-     base_model_prefix = "model"
-@@ -1136,8 +1509,58 @@
+@@ -1109,8 +1524,58 @@
      }
      _is_stateful = True
 
@@ -936,7 +959,7 @@
          if isinstance(module, nn.Linear):
              module.weight.data.normal_(mean=0.0, std=std)
              if module.bias is not None:
-@@ -1145,15 +1568,10 @@
+@@ -1118,15 +1583,10 @@
          elif isinstance(module, nn.Embedding):
              module.weight.data.normal_(mean=0.0, std=std)
              if module.padding_idx is not None:
@@ -953,7 +976,7 @@
              module.reset_parameters()
 
 
-@@ -1173,8 +1591,15 @@
+@@ -1146,8 +1606,15 @@
      return hidden_states.to(v.dtype)
 
 
@@ -970,7 +993,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -1183,21 +1608,17 @@
+@@ -1156,21 +1623,17 @@
          self.layers = nn.ModuleList(
              [KimiDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
          )
@@ -998,7 +1021,7 @@
          self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
          self.gradient_checkpointing = False
          # Initialize weights and apply final processing
-@@ -1316,6 +1737,12 @@
+@@ -1289,6 +1752,12 @@
          ).view(batch_size, seq_len, hidden_size)
 
 
@@ -1011,7 +1034,7 @@
  class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
      @classmethod
      def _supports_default_dynamic_cache(cls) -> bool:
-@@ -1323,46 +1750,90 @@
+@@ -1296,46 +1765,90 @@
 
      _tied_weights_keys = ["lm_head.weight"]
 
@@ -1126,7 +1149,7 @@
 
          outputs = self.model(
              input_ids=input_ids,
-@@ -1375,24 +1846,46 @@
+@@ -1348,24 +1861,46 @@
              output_hidden_states=output_hidden_states,
              return_dict=return_dict,
              cache_position=cache_position,
@@ -1183,7 +1206,7 @@
 
 
  def multihead_attention(
-@@ -2015,6 +2508,12 @@
+@@ -1988,6 +2523,12 @@
      return outputs
 
 
@@ -1196,7 +1219,7 @@
  class MoonViT3dPretrainedModel(PreTrainedModel):
      config_class = None
      model_type = "moonvit3d"
-@@ -2079,6 +2578,50 @@
+@@ -2052,6 +2593,50 @@
 
          return hidden_states
 
@@ -1247,7 +1270,7 @@
 
  # ============================================================================
  # MM Projector Helper Classes (from mm_projector/modeling_mm_projectors.py)
-@@ -2166,6 +2709,12 @@
+@@ -2139,6 +2724,12 @@
              x = self.proj(x.view(B, -1, self.hidden_size))
              x = self.post_norm(x)
          return x
@@ -1260,7 +1283,7 @@
 
 
  class KimiK3PreTrainedModel(PreTrainedModel):
-@@ -2185,13 +2734,59 @@
+@@ -2158,13 +2749,59 @@
 
      def _init_weights(self, module):
          # important: this ported version of Llava isn't meant for training from scratch - only
@@ -1321,7 +1344,7 @@
 
          if hasattr(module, "class_embedding"):
              module.class_embedding.data.normal_(mean=0.0, std=std)
-@@ -2203,15 +2798,10 @@
+@@ -2176,15 +2813,10 @@
          elif isinstance(module, nn.Embedding):
              module.weight.data.normal_(mean=0.0, std=std)
              if module.padding_idx is not None:
@@ -1338,7 +1361,7 @@
              module.reset_parameters()
 
 
-@@ -2251,13 +2841,38 @@
+@@ -2224,13 +2856,38 @@
          self.projector_ln_eps = config.projector_ln_eps
 
 
@@ -1378,7 +1401,7 @@
          super().__init__(config)
 
          vt_config = VisionTowerConfig(config.vision_config)
-@@ -2276,7 +2891,23 @@
+@@ -2249,7 +2906,23 @@
              raise ValueError(f"Unsupported mm_projector_type: {proj_config.mm_projector_type}")
 
          self.language_model = KimiLinearForCausalLM(config.text_config)
@@ -1402,7 +1425,7 @@
 
          if hasattr(self.language_model, "dtype"):
              target_dtype = self.language_model.dtype
-@@ -2301,8 +2932,14 @@
+@@ -2274,8 +2947,14 @@
      def get_decoder(self):
          return self.language_model.get_decoder()
 
@@ -1419,7 +1442,7 @@
 
      def resize_token_embeddings(self, new_num_tokens: int | None = None, pad_to_multiple_of=None) -> nn.Embedding:
          model_embeds = self.language_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
-@@ -2311,6 +2948,7 @@
+@@ -2284,6 +2963,7 @@
          self.vocab_size = model_embeds.num_embeddings
          return model_embeds
 
@@ -1427,7 +1450,7 @@
      def _merge_input_ids_with_image_features(
          self,
          image_features: list[torch.Tensor],
-@@ -2318,28 +2956,74 @@
+@@ -2291,28 +2971,74 @@
          input_ids: torch.Tensor,
          attention_mask: torch.Tensor,
          labels: torch.Tensor | None = None,
@@ -1520,7 +1543,7 @@
          pad_token_id: int = self.config.pad_token_id
          ignore_index: int = self.config.ignore_index
 
-@@ -2457,27 +3141,20 @@
+@@ -2430,27 +3156,20 @@
 
      def forward(
          self,
@@ -1562,7 +1585,7 @@
          assert self.vision_tower is not None, "vision_tower is not loaded"
          output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
          output_hidden_states = (
-@@ -2485,31 +3162,63 @@
+@@ -2458,31 +3177,63 @@
          )
          return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1635,7 +1658,7 @@
                  )
 
              # In case input_ids.shape[1] == 1 & pixel_values==None & past_key_values != None, we are in the case of
-@@ -2545,46 +3254,135 @@
+@@ -2518,46 +3269,135 @@
                  attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
                  position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
@@ -1795,7 +1818,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2650,3 +3448,22 @@
+@@ -2623,3 +3463,22 @@
 
      def _reorder_cache(self, *args, **kwargs):
          return self.language_model._reorder_cache(*args, **kwargs)

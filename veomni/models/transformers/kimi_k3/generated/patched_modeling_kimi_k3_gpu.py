@@ -14,9 +14,13 @@
 #    - method_override: SituAndMul.forward
 #      Always call the local situ_and_mul VeomniOp
 #    - method_override: KimiDeltaAttention.__init__
-#      Bind the instance-local chunk_kda VeomniOp (replaces the vendored eager reference)
+#      Define the instance-local chunk_kda VeomniOp declared by the source
 #    - method_override: KimiDeltaAttention.forward
 #      Sequence-parallel KDA: head-sharded ulysses all-to-all by default (K3_KDA_HEAD_SHARD=1) or the legacy full-sequence gather (K3_KDA_HEAD_SHARD=0)
+#    - method_override: KimiDecoderLayer._attn_selective_recompute
+#      EP selective-recompute policy (VeOmni-only; upstream has no EP): checkpoint only the collective-free attention stack under EP
+#    - method_override: KimiDecoderLayer.__call__
+#      Skip the whole-layer GradientCheckpointingLayer checkpoint under EP (forward() checkpoints the attention stack itself)
 #    - function_replacement: multihead_attention
 #      Vision varlen attention via a lazily-imported flash-attn
 #    - method_override: KimiMLAAttention.forward
@@ -834,12 +838,12 @@ class KimiMLAAttention(nn.Module):
 class KimiDeltaAttention(nn.Module):
     # KDA chunked linear attention (instance-local VeomniOp, fused AscendC kernel)
 
-    # Patch 12: the source binds the vendored eager ``chunk_kda`` reference onto
-    # each ``KimiDeltaAttention`` instance (``self.veomni_chunk_kda``) and calls it
-    # from both training paths. The override below rebinds that handle to a
-    # ``chunk_kda`` ``VeomniOp`` (``kimi_k3`` variant) resolved from the ops
-    # selection installed at model-build time, mirroring the rms_norm / situ_and_mul
-    # instance-local pattern. Signatures are kwarg-compatible; extra K3 args
+    # Patch 12: the source declares the per-instance kernel handle
+    # (``self.veomni_chunk_kda``) and calls it from both training paths; the
+    # override below defines that handle as a ``chunk_kda`` ``VeomniOp``
+    # (``kimi_k3`` variant) resolved from the ops selection installed at
+    # model-build time, mirroring the rms_norm / situ_and_mul instance-local
+    # pattern. Signatures are kwarg-compatible; extra K3 args
     # (``A_log``/``dt_bias``/``transpose_state_layout``) pass through.
     def __init__(self, config: "KimiLinearConfig", layer_idx: int):
         super().__init__()
@@ -899,9 +903,10 @@ class KimiDeltaAttention(nn.Module):
 
         self.o_norm = FusedRMSNormGated(self.head_dim, eps=config.rms_norm_eps, activation="sigmoid")
         self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
-        # Modification: rebind the source's eager ``chunk_kda`` reference to the
-        # ops-configured ``VeomniOp`` (instance-local kernel handle; the fused
-        # AscendC kernel when configured, the modeling reference otherwise).
+        # Modification: define the instance-local ``chunk_kda`` kernel handle
+        # (the source declares and calls it without binding a default): the
+        # fused AscendC kernel when configured, the modeling eager reference
+        # otherwise.
         self.veomni_chunk_kda = VeomniOp("chunk_kda", "kimi_k3", config.ops_config.chunk_kda_implementation)
 
     def forward(
@@ -1262,6 +1267,12 @@ class KimiSparseMoeBlock(nn.Module):
         return y
 
 
+# ======================================================================
+# [MODIFIED CLASS] KimiDecoderLayer
+# Methods patched: _attn_selective_recompute, __call__
+# ======================================================================
+
+
 class KimiDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: KimiLinearConfig, layer_idx: int):
         super().__init__()
@@ -1324,25 +1335,6 @@ class KimiDecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             **kwargs,
         )
-
-    def _attn_selective_recompute(self) -> bool:
-        # NPU/EP (MindSpeed-style selective recompute): under EP
-        # the MoE block contains alltoall dispatch/combine collectives.
-        # Non-reentrant whole-layer gradient checkpointing replays them
-        # inside backward at rank-skewed moments, desynchronizing the
-        # collectives (all-NaN grads after a few training steps, observed during EP bring-up).
-        # When EP is on we therefore skip whole-layer checkpointing and
-        # checkpoint ONLY the attention stack (collective-free); the MoE
-        # block keeps its activations so it is never replayed.
-        return self.training and getattr(self, "gradient_checkpointing", False) and get_parallel_state().ep_enabled
-
-    def __call__(self, *args, **kwargs):
-        if self._attn_selective_recompute():
-            # Skip the whole-layer checkpoint (see _attn_selective_recompute)
-            # and run nn.Module.__call__ directly; forward() checkpoints the
-            # attention stack itself.
-            return super(GradientCheckpointingLayer, self).__call__(*args, **kwargs)
-        return super().__call__(*args, **kwargs)
 
     def forward(
         self,
@@ -1489,6 +1481,29 @@ class KimiDecoderLayer(GradientCheckpointingLayer):
             prefix_sum = prefix_sum + hidden_states
 
         return prefix_sum, block_residual
+
+    # Decoder layer: EP selective recompute (moved out of the vendored source).
+    # Upstream has no expert parallelism, so this policy is pure VeOmni behaviour
+    # and lives in the patch layer alongside the SP routing -- the generated .diff
+    # shows it on every re-sync.
+    def _attn_selective_recompute(self) -> bool:
+        # NPU/EP (MindSpeed-style selective recompute): under EP the MoE block
+        # contains alltoall dispatch/combine collectives. Non-reentrant
+        # whole-layer gradient checkpointing replays them inside backward at
+        # rank-skewed moments, desynchronizing the collectives (all-NaN grads
+        # after a few training steps, observed during EP bring-up). When EP is
+        # on we therefore skip whole-layer checkpointing and checkpoint ONLY
+        # the attention stack (collective-free); the MoE block keeps its
+        # activations so it is never replayed.
+        return self.training and getattr(self, "gradient_checkpointing", False) and get_parallel_state().ep_enabled
+
+    def __call__(self, *args, **kwargs):
+        if self._attn_selective_recompute():
+            # Skip the whole-layer checkpoint (see _attn_selective_recompute)
+            # and run nn.Module.__call__ directly; forward() checkpoints the
+            # attention stack itself.
+            return super(GradientCheckpointingLayer, self).__call__(*args, **kwargs)
+        return super().__call__(*args, **kwargs)
 
 
 # ======================================================================

@@ -115,8 +115,11 @@ schedule:
 The `kimi_k3` transform is registered by `model_type` and renders the
 pre-expanded media template
 `<|media_begin|>image {w}x{h}<|media_content|><|media_pad|>...<|media_end|> {caption}`,
-with one `<|media_pad|>` per merged vision token (`t·h·w / (mh·mw)` from the
-preprocessed `grid_thws`), supervising only the caption + EOS. The
+with one `<|media_pad|>` per merged vision token: `(h // mh) * (w // mw)`
+from the preprocessed `grid_thws`, **independent of `t`** — the tower's
+`tpool_patch_merger` pools (averages) the temporal axis instead of
+concatenating it, so a `[2, 4, 4]` grid yields 4 pads, not 8. The
+transform supervises only the caption + EOS. The
 in-model merge is therefore length-preserving (it masked-scatters the
 projected features onto the pad slots), which keeps the collator's packed
 position_ids / cu_seq_lens and the SP label pre-shift valid; a
@@ -216,7 +219,12 @@ test-pinned, so an installed fused library cannot silently contaminate
 it: the version-asserted `fla` row requires the K3 gating parameters as
 named parameters and refuses `flash-linear-attention 0.4.1` (which
 carries them only through `**kwargs`, i.e. not at all) with a
-`NotImplementedError` naming what is missing.
+`NotImplementedError` naming what is missing. The GPU recipe pins `eager`
+to match this protocol; selecting the `fla` row instead requires a
+flash-linear-attention build that exposes those K3 gating parameters as
+named `chunk_kda` arguments (anything newer than the locked 0.4.1 that
+added `lower_bound` / `safe_gate` / `transpose_state_layout` /
+`state_v_first` / `use_beta_sigmoid_in_kernel`).
 
 Per-step loss deviation over the 200 steps (absolute, at the trainer's
 2-decimal print precision):
@@ -306,8 +314,10 @@ K3-specific behavior to know when writing configs or custom data pipelines:
    `get_extra_collate_infos` exempts them from sp-slicing. This is the
    opposite of the qwen convention (patch-sharded ViT).
 2. **Pre-expanded media span** — the kimi_k3 data transform materializes
-   one `<|media_pad|>` per merged vision token (`t·h·w / (mh·mw)`)
-   *before* packing, so the in-model merge is length-preserving: it
+   one `<|media_pad|>` per merged vision token (`(h // mh) * (w // mw)`,
+   independent of `t`: the temporal axis is pooled by `tpool_patch_merger`,
+   not concatenated) *before* packing, so the in-model merge is
+   length-preserving: it
    masked-scatters the projected features onto the pad slots and leaves
    the collator's packed position_ids / cu_seq_lens untouched. Token
    counts are therefore exact at packing time — no expanded-length hook,

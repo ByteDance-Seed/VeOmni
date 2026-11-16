@@ -15,8 +15,10 @@
 """Kimi K3 data transform: pre-expanded media placeholders.
 
 ``process_sample_kimi_k3`` materializes one ``<|media_pad|>`` per merged
-vision token (grid area / merge_size) inline in the text, so the in-model
-merge is length-preserving; labels supervise only the caption tail, and a
+vision token -- ``(h // mh) * (w // mw)`` per image, because the tower's
+``tpool_patch_merger`` pools (averages) the temporal axis instead of
+concatenating it -- inline in the text, so the in-model merge is
+length-preserving; labels supervise only the caption tail, and a
 ``max_seq_len`` that would cut the media span must fail loudly (the merge
 scatters exactly that many features onto the pad slots).
 """
@@ -28,6 +30,7 @@ import torch
 from PIL import Image
 
 from veomni.data.data_transform import process_sample_kimi_k3
+from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import tpool_patch_merger
 
 
 MEDIA_END_ID = 9
@@ -54,11 +57,15 @@ class _FakeTokenizer:
 class _FakeImageProcessor:
     merge_size = (2, 2)
 
+    def __init__(self, grid_thws=((1, 2, 2),)):
+        # One [t, h, w] row per image; the single-frame (1, 2, 2) default
+        # merges to exactly 1 vision token under a 2x2 kernel.
+        self.grid_thws = torch.tensor([list(g) for g in grid_thws])
+
     def preprocess(self, images, return_tensors="pt"):
-        # grid 1x2x2 with a 2x2 merge -> exactly 1 merged vision token.
         return {
-            "grid_thws": torch.tensor([[1, 2, 2]]),
-            "pixel_values": torch.zeros(1, 3, 8, 8),
+            "grid_thws": self.grid_thws,
+            "pixel_values": torch.zeros(len(self.grid_thws), 3, 8, 8),
         }
 
 
@@ -68,8 +75,8 @@ def _make_sample(tmp_path, caption="a cat sits here"):
     return {"caption": caption, "image": str(image_path), "width": 8, "height": 8}
 
 
-def _processor():
-    return SimpleNamespace(image_processor=_FakeImageProcessor(), tokenizer=_FakeTokenizer())
+def _processor(grid_thws=((1, 2, 2),)):
+    return SimpleNamespace(image_processor=_FakeImageProcessor(grid_thws), tokenizer=_FakeTokenizer())
 
 
 def test_media_span_is_pre_expanded(tmp_path):
@@ -83,7 +90,8 @@ def test_media_span_is_pre_expanded(tmp_path):
     # 1-D per-sample tensors (MainCollator packs dim=-1 then unsqueezes).
     assert input_ids.dim() == 1 and labels.dim() == 1 and attention_mask.dim() == 1
     assert input_ids.numel() == labels.numel() == attention_mask.numel()
-    # Exactly one <|media_pad|> per merged vision token (grid area / merge).
+    # Exactly one <|media_pad|> per merged vision token: the [1,2,2] grid
+    # under a 2x2 merge gives (2//2)*(2//2) = 1.
     assert int((input_ids == MEDIA_PAD_ID).sum()) == 1
     # Labels supervise only the caption tail: everything up to and including
     # <|media_end|> is -100 (covers the expanded media span).
@@ -129,3 +137,21 @@ def test_missing_tokenizer_raises(tmp_path):
     processor = SimpleNamespace(image_processor=_FakeImageProcessor(), tokenizer=None)
     with pytest.raises(ValueError, match="needs a tokenizer"):
         process_sample_kimi_k3(sample, processor, SimpleNamespace(tokenizer=None), None)
+
+
+def test_multi_frame_grid_pads_match_tpool_patch_merger(tmp_path):
+    # tpool_patch_merger AVERAGES over the temporal axis (pooled, not
+    # concatenated), so a [2, 4, 4] grid yields (4//2)*(4//2) = 4 merged
+    # tokens -- a prod-based count would emit 8 and the in-model merge would
+    # raise. The real merger is the single source of truth for the pad count.
+    sample = _make_sample(tmp_path)
+    (model_inputs,) = process_sample_kimi_k3(
+        sample, _processor(grid_thws=((2, 4, 4),)), SimpleNamespace(tokenizer=_FakeTokenizer()), None
+    )
+
+    t, h, w = 2, 4, 4
+    merged = tpool_patch_merger(torch.zeros(t * h * w, 8), torch.tensor([[t, h, w]]), merge_kernel_size=(2, 2))
+    n_pads = int((model_inputs["input_ids"] == MEDIA_PAD_ID).sum())
+    assert n_pads == merged[0].shape[0] == 4
+    # The published grid passes through untouched.
+    assert torch.equal(model_inputs["grid_thws"], torch.tensor([[t, h, w]]))

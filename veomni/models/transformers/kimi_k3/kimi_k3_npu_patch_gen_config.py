@@ -19,13 +19,15 @@ patchgen veomni.models.transformers.kimi_k3.kimi_k3_npu_patch_gen_config -o veom
 
 Re-registers every patch from the GPU config against an NPU-target file so the
 NPU modeling is generated from the same source (the eager fallbacks in the
-source module — ops-tree kda eager reference, eager MLA attention — are
+source module -- ops-tree eager KDA primitives, eager MLA attention -- are
 NPU-safe, and the VeomniOp handles resolve per ops config).
 """
 
 from veomni.models.transformers.kimi_k3.kimi_k3_gpu_patch_gen_config import (
     PatchedKimiK3Experts,
     PatchedKimiK3SparseMoeBlock,
+    kimi_decoder_layer_attn_selective_recompute_patched,
+    kimi_decoder_layer_call_patched,
     kimi_delta_attention_forward_patched,
     kimi_delta_attention_init_patched,
     kimi_k3_for_conditional_generation_forward_patched,
@@ -120,7 +122,7 @@ config.override_method(
 config.override_method(
     "KimiDeltaAttention.__init__",
     replacement=kimi_delta_attention_init_patched,
-    description="Bind the instance-local chunk_kda VeomniOp (replaces the vendored eager reference)",
+    description="Define the instance-local chunk_kda VeomniOp declared by the source",
 )
 
 config.override_method(
@@ -129,6 +131,27 @@ config.override_method(
     description=(
         "Sequence-parallel KDA: head-sharded ulysses all-to-all by default "
         "(K3_KDA_HEAD_SHARD=1) or the legacy full-sequence gather (K3_KDA_HEAD_SHARD=0)"
+    ),
+)
+
+# ── Decoder layer: EP selective recompute (moved out of the vendored source) ──
+
+
+config.override_method(
+    "KimiDecoderLayer._attn_selective_recompute",
+    replacement=kimi_decoder_layer_attn_selective_recompute_patched,
+    description=(
+        "EP selective-recompute policy (VeOmni-only; upstream has no EP): "
+        "checkpoint only the collective-free attention stack under EP"
+    ),
+)
+
+config.override_method(
+    "KimiDecoderLayer.__call__",
+    replacement=kimi_decoder_layer_call_patched,
+    description=(
+        "Skip the whole-layer GradientCheckpointingLayer checkpoint under EP "
+        "(forward() checkpoints the attention stack itself)"
     ),
 )
 

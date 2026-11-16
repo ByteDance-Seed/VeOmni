@@ -680,7 +680,10 @@ def process_sample_kimi_k3(
     One ``<|media_pad|>`` per merged vision token (the pre-expanded form):
     the image is preprocessed first so ``grid_thws`` fixes the merged patch
     count, and that many ``<|media_pad|>`` tokens are materialized inline in
-    the text. The merge inside the modeling is then length-preserving
+    the text. ``tpool_patch_merger`` in the modeling pools (averages) the
+    temporal axis instead of concatenating it, so an image contributes
+    ``(h // mh) * (w // mw)`` merged tokens regardless of ``t``.
+    The merge inside the modeling is then length-preserving
     (masked_scatter of the projected features onto the pad slots), which
     keeps the collator's packed position_ids / cu_seq_lens and the SP label
     pre-shift valid. Labels supervise only the caption tail (everything up
@@ -702,7 +705,13 @@ def process_sample_kimi_k3(
 
     merge_size = getattr(image_processor, "merge_size", None) or (2, 2)
     mh, mw = int(merge_size[0]), int(merge_size[1])
-    num_pads = int(grid_thws.prod(dim=-1).sum().item()) // (mh * mw)
+    # The vision tower's tpool_patch_merger AVERAGES over the temporal axis
+    # (t is pooled, not concatenated), so an image contributes
+    # (h // mh) * (w // mw) merged tokens regardless of t -- the prod-based
+    # count would multiply in t and overshoot the pad slots for multi-frame
+    # grids. (h % mh != 0 already raises inside tpool_patch_merger, so no
+    # extra guard is needed here.)
+    num_pads = int(((grid_thws[:, 1] // mh) * (grid_thws[:, 2] // mw)).sum().item())
 
     width = int(sample["width"])
     height = int(sample["height"])
@@ -722,7 +731,8 @@ def process_sample_kimi_k3(
     if len(input_ids) > max_seq_len:
         # Truncate the caption tail only: a cut into the media span would
         # desynchronize input_ids from the published grid_thws (the merge
-        # scatters exactly prod(grid) / (mh*mw) features onto the pad slots).
+        # scatters exactly (h // mh) * (w // mw) features per image onto the
+        # pad slots).
         if media_end_pos + 1 >= max_seq_len:
             raise ValueError(
                 f"Kimi K3 max_seq_len ({max_seq_len}) truncated the media span "

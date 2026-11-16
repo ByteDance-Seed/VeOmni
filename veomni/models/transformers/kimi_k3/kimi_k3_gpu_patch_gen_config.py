@@ -59,8 +59,9 @@ Patches (skeleton):
 11. ``SituAndMul`` --instance-local ``VeomniOp`` for the fused Triton SituGLU
     kernel (``situ_and_mul`` op, ``kimi_k3`` variant).
 12. ``KimiDeltaAttention.__init__`` --instance-local ``chunk_kda`` ``VeomniOp``
-    (``kimi_k3`` variant) rebound onto the source's per-instance handle: the
-    fused AscendC kernel when configured, the modeling reference otherwise.
+    (``kimi_k3`` variant) defined for the source's per-instance kernel
+    handle: the fused AscendC kernel when configured, the modeling reference
+    otherwise.
 13. ``KimiK3ForConditionalGeneration.forward`` --ulysses sequence-parallel
     data flow: gather the per-rank sequence shards (input_ids / mask /
     labels / position_ids) to the full sequence before the multimodal merge
@@ -91,12 +92,17 @@ Patches (skeleton):
     ``KimiLinearForCausalLM.forward`` forwards the collator's kwargs the same
     way for text-only batches.
 18. ``MoonViT3dPretrainedModel._init_weights`` --vision-tower init under the
-    FSDP2 meta flow: composite-model smart_apply dispatches sub-models to
-    their own ``_init_weights`` and the transformers default chain has no
+    FSDP2 meta flow: composite-model smart_apply dispatches sub-models to their
+    own ``_init_weights`` and the transformers default chain has no
     branch for the learnable 2D pos-emb (or the KDA o_norm / to_empty-zeroed
     tower norms), so ``to_empty`` leaves raw device memory in the pos-emb --
     zeroed NPU pages silently drop visual position information; fsdp offload
     leaves uninitialized CPU memory that poisons image features with NaN.
+19. ``KimiDecoderLayer._attn_selective_recompute`` / ``KimiDecoderLayer.__call__``
+    --EP selective-recompute policy, moved out of the vendored source (upstream
+    has no expert parallelism, so the behaviour is not derivable from the
+    vendored file): under EP, skip the whole-layer checkpoint and checkpoint
+    only the collective-free attention stack.
 """
 
 import os
@@ -148,6 +154,13 @@ config.add_import(
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_heads_scatter_seq", "gather_seq_scatter_heads"],
+)
+# Parallel state for the SP / EP policy patches below. The vendored source no
+# longer imports this (upstream has no EP and no sequence parallel, so the
+# policy is patch-owned); the generated file gets it here.
+config.add_import(
+    "veomni.distributed.parallel_state",
+    names=["get_parallel_state"],
 )
 
 
@@ -369,18 +382,18 @@ def situ_and_mul_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
 
 # KDA chunked linear attention (instance-local VeomniOp, fused AscendC kernel)
 
-# Patch 12: the source binds the vendored eager ``chunk_kda`` reference onto
-# each ``KimiDeltaAttention`` instance (``self.veomni_chunk_kda``) and calls it
-# from both training paths. The override below rebinds that handle to a
-# ``chunk_kda`` ``VeomniOp`` (``kimi_k3`` variant) resolved from the ops
-# selection installed at model-build time, mirroring the rms_norm / situ_and_mul
-# instance-local pattern. Signatures are kwarg-compatible; extra K3 args
+# Patch 12: the source declares the per-instance kernel handle
+# (``self.veomni_chunk_kda``) and calls it from both training paths; the
+# override below defines that handle as a ``chunk_kda`` ``VeomniOp``
+# (``kimi_k3`` variant) resolved from the ops selection installed at
+# model-build time, mirroring the rms_norm / situ_and_mul instance-local
+# pattern. Signatures are kwarg-compatible; extra K3 args
 # (``A_log``/``dt_bias``/``transpose_state_layout``) pass through.
 
 
 @config.override_method(
     "KimiDeltaAttention.__init__",
-    description="Bind the instance-local chunk_kda VeomniOp (replaces the vendored eager reference)",
+    description="Define the instance-local chunk_kda VeomniOp declared by the source",
 )
 def kimi_delta_attention_init_patched(self, config: "KimiLinearConfig", layer_idx: int):
     super().__init__()
@@ -440,9 +453,10 @@ def kimi_delta_attention_init_patched(self, config: "KimiLinearConfig", layer_id
 
     self.o_norm = FusedRMSNormGated(self.head_dim, eps=config.rms_norm_eps, activation="sigmoid")
     self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
-    # Modification: rebind the source's eager ``chunk_kda`` reference to the
-    # ops-configured ``VeomniOp`` (instance-local kernel handle; the fused
-    # AscendC kernel when configured, the modeling reference otherwise).
+    # Modification: define the instance-local ``chunk_kda`` kernel handle
+    # (the source declares and calls it without binding a default): the
+    # fused AscendC kernel when configured, the modeling eager reference
+    # otherwise.
     self.veomni_chunk_kda = VeomniOp("chunk_kda", "kimi_k3", config.ops_config.chunk_kda_implementation)
 
 
@@ -605,6 +619,47 @@ def kimi_delta_attention_forward_patched(
         o = slice_input_tensor(o, dim=1, group=get_parallel_state().sp_group)
 
     return o
+
+
+# Decoder layer: EP selective recompute (moved out of the vendored source).
+# Upstream has no expert parallelism, so this policy is pure VeOmni behaviour
+# and lives in the patch layer alongside the SP routing -- the generated .diff
+# shows it on every re-sync.
+
+
+@config.override_method(
+    "KimiDecoderLayer._attn_selective_recompute",
+    description=(
+        "EP selective-recompute policy (VeOmni-only; upstream has no EP): "
+        "checkpoint only the collective-free attention stack under EP"
+    ),
+)
+def kimi_decoder_layer_attn_selective_recompute_patched(self) -> bool:
+    # NPU/EP (MindSpeed-style selective recompute): under EP the MoE block
+    # contains alltoall dispatch/combine collectives. Non-reentrant
+    # whole-layer gradient checkpointing replays them inside backward at
+    # rank-skewed moments, desynchronizing the collectives (all-NaN grads
+    # after a few training steps, observed during EP bring-up). When EP is
+    # on we therefore skip whole-layer checkpointing and checkpoint ONLY
+    # the attention stack (collective-free); the MoE block keeps its
+    # activations so it is never replayed.
+    return self.training and getattr(self, "gradient_checkpointing", False) and get_parallel_state().ep_enabled
+
+
+@config.override_method(
+    "KimiDecoderLayer.__call__",
+    description=(
+        "Skip the whole-layer GradientCheckpointingLayer checkpoint under EP "
+        "(forward() checkpoints the attention stack itself)"
+    ),
+)
+def kimi_decoder_layer_call_patched(self, *args, **kwargs):
+    if self._attn_selective_recompute():
+        # Skip the whole-layer checkpoint (see _attn_selective_recompute)
+        # and run nn.Module.__call__ directly; forward() checkpoints the
+        # attention stack itself.
+        return super(GradientCheckpointingLayer, self).__call__(*args, **kwargs)
+    return super().__call__(*args, **kwargs)
 
 
 # Vision varlen attention (flash-attn fallback on non-NPU devices)
