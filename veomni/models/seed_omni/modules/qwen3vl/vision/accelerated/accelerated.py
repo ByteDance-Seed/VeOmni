@@ -15,7 +15,6 @@ from .....mixins.base_mixin import BaseMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem, iter_desired_items
-from ....base.llm_packing import mask_sp_pad_tail
 from ..configuration import Qwen3VLVisionEncoderConfig
 from ..modeling import (
     Qwen3VLVisionEncoder,
@@ -159,17 +158,11 @@ class TrainingMixin(TrainingModuleMixin):
         self._visual_output_slots = None
         if ps.sp_size > 1:
             if ps.skip_sp_gather_between_modules:
-                valid_len = int(self._sp_own_len)
                 self._sp_own_len = None
-                image_embeds = mask_sp_pad_tail(image_embeds, valid_len, ps.sp_rank, ps.sp_size)
-                deepstack_features = [
-                    mask_sp_pad_tail(layer, valid_len, ps.sp_rank, ps.sp_size) for layer in deepstack_features
-                ]
                 scatter_qwen3vl_visual_embeds(
                     output_slots,
                     image_embeds,
                     deepstack_features,
-                    sp_sharded=True,
                     sp_rank=ps.sp_rank,
                     sp_size=ps.sp_size,
                 )

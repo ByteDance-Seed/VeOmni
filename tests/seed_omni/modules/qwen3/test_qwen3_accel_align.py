@@ -34,6 +34,7 @@ from veomni.models.seed_omni import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_CONFIG
 from veomni.models.seed_omni.accelerated.utils.executor import TrainNodeRunner
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modeling_omni import OmniModel
+from veomni.models.seed_omni.modules.base.sp_shard import sp_local_len, sp_valid_in_window
 from veomni.models.seed_omni.modules.qwen3.hf_layout import QWEN3_HF_LAYOUT
 from veomni.models.seed_omni.modules.qwen3.text_encoder.chat_template import Qwen3ChatTemplate
 from veomni.models.seed_omni.modules.qwen3.text_encoder.configuration import Qwen3TextEncoderConfig
@@ -341,10 +342,13 @@ def _run_alignment_matrix(
 
                     loss = _run_qwen3_omni_graph_step(te, llm, local_convs)
                     if ps.skip_sp_gather_between_modules:
-                        # Under skip_sp_gather_between_modules, each item.value holds only
-                        # this rank's SP shard slice (total 8 // 2 = 4 rows, not full 7 rows).
-                        assert all(item.value.dim() == 2 for conv in local_convs for item in conv)
-                        assert sum(item.value.size(0) for conv in local_convs for item in conv) == 4
+                        # Under skip_sp_gather_between_modules each item.value holds only
+                        # this rank's window slice: padded window width minus the SP pad
+                        # tail, i.e. 4 real rows on rank 0 and 3 on rank 1 for a 7-token row.
+                        rows = sum(item.value.size(0) for conv in local_convs for item in conv)
+                        expected = sp_valid_in_window(7, rank, ps.sp_size)
+                        assert rows == expected, (rank, rows, expected)
+                        assert sp_local_len(7, ps.sp_size) == 4
                     else:
                         expected_rows = sum(int(item.meta["labels"].numel()) for conv in local_convs for item in conv)
                         assert sum(item.value.size(0) for conv in local_convs for item in conv) == expected_rows

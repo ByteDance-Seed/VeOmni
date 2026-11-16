@@ -27,11 +27,8 @@ from ....mixins.base_mixin import BaseMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem
-from ...base.llm_packing import (
-    item_token_len,
-    mask_sp_pad_tail,
-    split_sp_sharded_tensor,
-)
+from ...base.llm_packing import item_token_len
+from ...base.sp_shard import sp_local_len, sp_valid_in_window, split_sp_sharded_tensor
 from ..chat_template import TextEncoderChatTemplate
 from ..configuration import TextEncoderConfig
 from ..modeling import TextEncoder, scatter_text_encoder_embeds
@@ -86,9 +83,7 @@ class TrainingMixin(TrainingModuleMixin):
         self._encode_batch_shape = None
         if ps.sp_size > 1:
             if ps.skip_sp_gather_between_modules:
-                valid_len = int(self._sp_own_len)
                 self._sp_own_len = None
-                inputs_embeds = mask_sp_pad_tail(inputs_embeds, valid_len, ps.sp_rank, ps.sp_size)
                 lengths = batch_shape.prod(-1).tolist()
                 scatter_text_encoder_embeds(
                     conversation,
@@ -117,6 +112,10 @@ class TrainingMixin(TrainingModuleMixin):
         self._conversation_carrier = conversation_list
         ps = get_parallel_state()
         if ps.sp_size > 1 and ps.skip_sp_gather_between_modules:
+            # The switch decides, and the build gate guarantees every module in the
+            # graph honours it (`_reject_sp_handoff_unsupported_modules`), so a batch
+            # that had to gather its modalities still hands a shard on here: the
+            # consumer, not the producer, decides whether it wants full spans.
             hidden_states, shift_labels = self._prepare_sharded_decode_inputs(self._conversation_carrier, ps)
         else:
             hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier)
@@ -239,15 +238,15 @@ class TrainingMixin(TrainingModuleMixin):
         for start in sample_starts[1:]:
             labels[start] = IGNORE_INDEX
 
-        full_len = decode_len + (-decode_len % ps.sp_size)
-        local_len = full_len // ps.sp_size
-        shard_start = ps.sp_rank * local_len
-        shard_end = shard_start + local_len
-
+        # Each rank scores exactly the rows its window holds. ``item.value`` keeps
+        # only real rows (padding never enters the carrier), so the label slice has
+        # to stop at the window's real row count, not at its padded width.
+        rows = sp_valid_in_window(decode_len, ps.sp_rank, ps.sp_size)
+        shard_start = ps.sp_rank * sp_local_len(decode_len, ps.sp_size)
         labels = labels[..., 1:].contiguous()
-        pad_tail = 1 + (full_len - decode_len)
+        pad_tail = 1 + (sp_local_len(decode_len, ps.sp_size) * ps.sp_size - decode_len)
         shift_labels = F.pad(labels, (0, pad_tail), "constant", IGNORE_INDEX)
-        local_shift_labels = shift_labels[shard_start:shard_end].contiguous()
+        local_shift_labels = shift_labels[shard_start : shard_start + rows].contiguous()
         local_shift_labels = local_shift_labels.to(device=hidden_states.device, non_blocking=True)
         return hidden_states, local_shift_labels
 

@@ -187,16 +187,12 @@ def _samples() -> list[list[ConversationItem]]:
     # runs must see the *same* batch for their losses and gradients to be comparable.
     torch.manual_seed(1234)
     video_metadata = VideoMetadata(fps=2.0, total_num_frames=4, frames_indices=list(range(4)), requested_fps=2.0)
+    # The video turn comes before the image turn on purpose. A multimodal batch has
+    # to all-gather each producer's shards before interleaving, and the vision
+    # tower runs images then videos regardless of carrier order, so a carrier that
+    # lists video first is exactly where "gather in carrier order" would reassemble
+    # the two producers' windows from the wrong offsets.
     samples: list[list[ConversationItem]] = [
-        [
-            ConversationItem(type="text", value="hi", role="user"),
-            ConversationItem(
-                type="image",
-                value=torch.randint(0, 255, (3, 32, 32), dtype=torch.uint8),
-                role="user",
-            ),
-            ConversationItem(type="text", value="ok", role="assistant"),
-        ],
         [
             ConversationItem(type="text", value="hello there", role="user"),
             ConversationItem(
@@ -206,6 +202,15 @@ def _samples() -> list[list[ConversationItem]]:
                 meta={VIDEO_METADATA_KEY: video_metadata},
             ),
             ConversationItem(type="text", value="sure", role="assistant"),
+        ],
+        [
+            ConversationItem(type="text", value="hi", role="user"),
+            ConversationItem(
+                type="image",
+                value=torch.randint(0, 255, (3, 32, 32), dtype=torch.uint8),
+                role="user",
+            ),
+            ConversationItem(type="text", value="ok", role="assistant"),
         ],
         [
             ConversationItem(type="text", value="just text", role="user"),
@@ -297,7 +302,7 @@ def _graph_loss(
     calls = {"slice": 0, "pad": 0, "post_gather": 0, "interleave_gather": 0}
     restores = []
     if count_sp:
-        from veomni.models.seed_omni.modules.base import llm_packing
+        from veomni.models.seed_omni.modules.base import sp_shard
         from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated import accelerated as llm_acc
         from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated import packed as llm_packed
         from veomni.models.seed_omni.modules.qwen3vl.text_encoder.accelerated import packed as te_packed
@@ -324,14 +329,14 @@ def _graph_loss(
                 restores.append((module, attr, original))
                 setattr(module, attr, wrapper)
 
-        orig_interleave_gather = llm_packing.gather_outputs
+        orig_interleave_gather = sp_shard.gather_outputs
 
         def _wrap_interleave_gather(*args, **kwargs):
             calls["interleave_gather"] += 1
             return orig_interleave_gather(*args, **kwargs)
 
-        restores.append((llm_packing, "gather_outputs", orig_interleave_gather))
-        llm_packing.gather_outputs = _wrap_interleave_gather
+        restores.append((sp_shard, "gather_outputs", orig_interleave_gather))
+        sp_shard.gather_outputs = _wrap_interleave_gather
 
     try:
         model = _omni(modules, edges)
@@ -662,3 +667,61 @@ def test_every_module_meters_its_own_tokens_on_both_graphs():
             at_raw = 6 * (block_n + patch_n) * raw / 1e12
             # Reported FLOPs must sit closer to the raw reading than the merged one.
             assert vision_flops > (at_merged + at_raw) / 2, (vision_flops, at_merged, at_raw)
+
+
+def _text_only_batch(n_samples: int) -> dict:
+    """``n_samples`` text-only conversations, so every sample gets a dummy image.
+
+    A text-only sample is a normal training shape in a VLM dataset, and it is the
+    one where the vision tower contributes nothing but its FSDP anchor.
+    """
+    template = Qwen3VLChatTemplate(_SmallTokenizer())
+    samples = [
+        [
+            ConversationItem(type="text", value="a", role="user"),
+            ConversationItem(type="text", value="b", role="assistant"),
+        ]
+        for _ in range(n_samples)
+    ]
+    return {"conversation_list": [template.tokenize_conversation(sample) for sample in samples]}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_vision_anchor_survives_a_zero_row_window():
+    """The FSDP dummy anchor has to reach the vision params from a rank holding none of it.
+
+    The dummy image placeholder is 4 merged tokens. At ``sp_size=2`` each rank's
+    window holds 2 of them, but at ``sp_size=3`` the third rank's window holds
+    **zero** (:func:`sp_valid_in_window`). A zero-row slice is ``NaN`` under
+    ``.mean()``, and ``0.0 * NaN`` is still ``NaN`` — so folding the anchor with
+    ``mean`` poisons the loss, while guarding it with ``numel() > 0`` drops the
+    vision tower from that rank's graph. FSDP2 has no unused-parameter pass, so a
+    rank that skipped the anchor never issues its reduce-scatter for the vision
+    parameters: the run hangs in ``backward`` instead of failing. ``.sum()`` is
+    ``0.0`` over no rows and keeps the ``grad_fn``, which is why both anchor sites
+    use it.
+    """
+    from veomni.models.seed_omni.modules.base.sp_shard import sp_valid_in_window
+    from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated.accelerated import _fold_fsdp_dummy_anchors
+
+    # 4 merged dummy rows over 3 ranks: the last rank's window is empty.
+    dummy_rows = 4
+    assert [sp_valid_in_window(dummy_rows, rank, 3) for rank in range(3)] == [2, 2, 0]
+
+    vision = torch.nn.Linear(8, 8)
+    embeds = torch.zeros(1, 4, 8)
+
+    # A zero-row slice of a vision output: empty, but still carrying the ViT's graph.
+    empty = vision(torch.zeros(4, 8))[:0]
+    assert empty.numel() == 0
+    assert torch.isnan(empty.mean() * 0.0), "a zero-row mean must be the NaN this guards against"
+
+    item = ConversationItem(type="image", value=empty, role="user", is_dummy=True)
+    anchored = _fold_fsdp_dummy_anchors(embeds, [[item]])
+
+    # The anchor itself must stay finite and keep the ViT in this rank's graph.
+    assert torch.isfinite(anchored).all()
+    anchored.sum().backward()
+    assert vision.weight.grad is not None, "the dummy anchor must keep the vision params in the graph"
+    assert torch.isfinite(vision.weight.grad).all()
+    assert torch.equal(vision.weight.grad, torch.zeros_like(vision.weight.grad))

@@ -128,24 +128,40 @@ for node in training_graph:
   `model.accelerator.skip_sp_gather_between_modules: true` (propagated to
   `ParallelState.skip_sp_gather_between_modules`) lets every module's
   `post_forward` (`text_encoder.encode_post`, `vision.forward_post`,
-  `llm.forward_post`) skip `gather_outputs`, zero-mask any SP-padded tail rows
-  (`mask_sp_pad_tail`), and scatter its rank-local `1/S` shard directly onto
-  `item.value` via `split_sp_sharded_tensor` (`veomni/models/seed_omni/modules/base/llm_packing.py`):
-  - When a micro-batch carries only a single modality (`can_use_sp_sharded_embeds_directly`,
-    such as text-only or vision-only), the backbone's `forward_pre` concatenates
-    the sharded `item.value`s directly without any `AllGather` and builds
-    `position_ids` / `cu_seqlens` from each item's unsharded token length
-    (`item_token_len`). When multiple modalities (`text` + `image`/`video`) must
-    be interleaved in conversation order, `llm.forward_pre` all-gathers each
-    modality's `item.value` (`gather_sp_sharded_modalities_for_interleaving`),
-    interleaves them, and slices the combined sequence.
+  `llm.forward_post`) skip `gather_outputs` and scatter its rank-local `1/S`
+  shard directly onto `item.value` via `split_sp_sharded_tensor`
+  (`veomni/models/seed_omni/modules/base/sp_shard.py`):
+  - **An item never holds padding.** `split_sp_sharded_tensor` emits each
+    segment's intersection with this rank's window and drops the SP pad tail, so
+    `item.value` is always real rows; the consumer restores the padded width with
+    `pad_sp_shard`. Padding belongs to the window, not the data — carrying it in
+    the carrier made `meta[_OMNI_TOKEN_LEN]` and `value.size(0)` disagree on
+    exactly one item.
+  - **Lengths come from `meta`.** Once a value is a window, its row count is the
+    window's, so every length is read through `item_token_len`, which prefers
+    `_OMNI_TOKEN_LEN` (stamped at full span length and never sliced).
+  - When a micro-batch carries only a single modality
+    (`single_modality_shard_batch`, such as text-only or vision-only), the
+    backbone's `forward_pre` pads the sharded `item.value`s to the window and
+    concatenates them with no `AllGather` at all
+    (`pack_sp_sharded_conversations_for_forward` returns `None` when it cannot,
+    which is how the fallback is selected). That decision is made from
+    `item.type` and `meta` alone, so every rank reaches it together — it selects
+    between a path with a collective and one without.
+  - Otherwise several producers must be interleaved, and `llm.forward_pre`
+    all-gathers each producer's items (`gather_sp_sharded_groups` over
+    `modality_groups`) before interleaving them. A group must be one producer's
+    **whole** output in the order that producer concatenated it, because that is
+    the sequence it sliced: text is taken in carrier order (how the text encoder
+    embeds), media as a single images-then-videos run (how the ViT is called),
+    skipping non-`user` media. Grouping media in carrier order instead would
+    break as soon as a video turn precedes an image turn.
   - After `llm.forward`, `llm.forward_post` scatters its `1/S` output shard
     directly onto `item.value`, and `text_encoder.decode_pre`
     (`_prepare_sharded_decode_inputs`) concatenates those sharded `item.value`s
-    and slices the shifted labels to `[shard_start : shard_end]` so each rank
-    projects and scores only its own `1/S` slice before
-    `reduce_sequence_parallel_loss` combines the numerators and denominators
-    over `fsdp_group` (`dp_sp`).
+    and slices the shifted labels to its own window so each rank projects and
+    scores only its `1/S` share before `reduce_sequence_parallel_loss` combines
+    the numerators and denominators over `fsdp_group` (`dp_sp`).
 
 Which modules can take part is declared per module, on
 `PretrainedOmniModule.supports_sp_sharded_handoff`
@@ -154,7 +170,7 @@ Which modules can take part is declared per module, on
 modeling class — for example
 [`TextEncoder`](../../../veomni/models/seed_omni/modules/text_encoder/modeling.py#L188)
 and
-[`Qwen3VLVisionEncoder`](../../../veomni/models/seed_omni/modules/qwen3vl/vision/modeling.py#L264).
+[`Qwen3VLVisionEncoder`](../../../veomni/models/seed_omni/modules/qwen3vl/vision/modeling.py#L268).
 `build_omni_model_runtime` refuses a run that enables
 `skip_sp_gather_between_modules` while any participating module still leaves it
 `False`, naming those modules, so one boundary cannot quietly keep gathering

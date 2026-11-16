@@ -150,14 +150,18 @@ def scatter_qwen3vl_visual_embeds(
     embeds: torch.Tensor,
     deepstack_features: List[torch.Tensor],
     *,
-    sp_sharded: bool = False,
     sp_rank: int = 0,
     sp_size: int = 1,
 ) -> None:
-    """Scatter merged ViT tokens back onto conversation items."""
+    """Scatter merged ViT tokens back onto conversation items.
+
+    With ``sp_size > 1`` the tensors hold this rank's window only, so each item
+    receives its intersection with that window (:func:`split_sp_sharded_tensor`)
+    rather than a whole span; ``sp_size == 1`` keeps the plain split.
+    """
     sizes = [slot.num_merged for slot in output_slots]
-    if sp_sharded and sp_size > 1:
-        from ...base.llm_packing import split_sp_sharded_tensor
+    if sp_size > 1:
+        from ...base.sp_shard import split_sp_sharded_tensor
 
         embeds_split = split_sp_sharded_tensor(embeds, sizes, sp_rank, sp_size)
         deepstack_split = [split_sp_sharded_tensor(layer, sizes, sp_rank, sp_size) for layer in deepstack_features]
