@@ -1,0 +1,150 @@
+# A2 / ARM64, CANN 9.2.1, Ubuntu 22.04 and shared Python 3.12.
+# torch-npu source: https://ascend.devcloud.huaweicloud.com/pypi/simple/torch-npu/
+FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.2.1-910b-ubuntu22.04-py3.12
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+USER root
+
+ARG PIP_INDEX=https://pypi.org/simple
+ARG APT_SOURCE=http://ports.ubuntu.com/ubuntu-ports/
+
+ENV MAX_JOBS=16
+ENV PIP_ROOT_USER_ACTION=ignore
+ENV OMP_NUM_THREADS=4
+ENV OPENBLAS_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+ENV NUMEXPR_NUM_THREADS=1
+
+RUN python -c "import platform, sys; assert platform.machine() == 'aarch64'; assert sys.version_info[:2] == (3, 12)" && \
+    test -f /usr/local/Ascend/ascend-toolkit/set_env.sh
+
+RUN echo "Setting timezone to CST (China Standard Time)..." && \
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
+    echo "Asia/Shanghai" > /etc/timezone
+
+# Preserve the ARM Ubuntu mirror override used by the A2 Dockerfile.
+RUN if [ "${APT_SOURCE}" != "http://ports.ubuntu.com/ubuntu-ports/" ]; then \
+    cp /etc/apt/sources.list /etc/apt/sources.list.bak && \
+    sed -E -i "s#https?://[^[:space:]]+/ubuntu-ports/?#${APT_SOURCE}#g" /etc/apt/sources.list; \
+    fi
+
+# gawk and pciutils are required by the supplied A2 FLA build procedure.
+# binutils provides readelf for check_packaged_wheel_api.py.
+RUN apt-get -o Acquire::Check-Date=false update -y && \
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Check-Date=false install -y --no-install-recommends \
+        gcc g++ cmake libnuma-dev sudo wget git curl jq vim build-essential ssh ca-certificates ffmpeg pkg-config gawk pciutils binutils patch && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
+    pip install --upgrade pip setuptools packaging && \
+    pip cache purge
+
+RUN chmod +x /usr/bin/make /usr/bin/gmake /usr/bin/cc /usr/bin/c++
+
+RUN pip install --upgrade pip setuptools packaging --no-cache-dir --progress-bar off && \
+    pip cache purge
+
+RUN pip config set global.index-url "${PIP_INDEX}" && \
+    pip config set global.no-cache-dir "true" && \
+    pip config --user set global.progress_bar off && \
+    python -m pip install --upgrade pip
+
+RUN pip3 install --no-cache-dir -U pip setuptools requests
+
+# The A2 CI creates its own venv with uv after checking out VeOmni.
+COPY --from=ghcr.io/astral-sh/uv:0.11.16 /uv /uvx /bin/
+
+# Keep the cache outside /app so a source checkout mount does not hide it.
+ENV UV_CACHE_DIR=/opt/veomni/uv-cache
+ENV UV_HTTP_TIMEOUT=300
+
+WORKDIR /app
+COPY . .
+
+# Populate uv's cache using the same locked extra and dev group as validation.
+# Use a disposable venv; system Python retains the runtime packages below.
+# Do not use a BuildKit cache mount: these artifacts must ship in the image.
+RUN UV_PROJECT_ENVIRONMENT=/tmp/veomni-cache-env \
+        uv sync --frozen --python "$(command -v python3)" --extra npu_aarch64 --group dev && \
+    uv pip install --python /tmp/veomni-cache-env/bin/python ninja pybind11 && \
+    uv pip install --python /tmp/veomni-cache-env/bin/python "triton==3.5.0" && \
+    uv pip install --python /tmp/veomni-cache-env/bin/python --no-deps "triton-ascend==3.2.2" \
+        --index=https://mirrors.huaweicloud.com/ascend/repos/pypi && \
+    rm -rf /tmp/veomni-cache-env
+
+# Install the complete locked dev group into the default Python as well.
+# Cache warm-up alone does not make patchgen available outside its temporary venv.
+RUN uv export --frozen --only-group dev --no-emit-project --no-hashes \
+        --output-file /app/dev-requirements.txt && \
+    uv pip install --python "$(command -v python3)" --no-deps -r /app/dev-requirements.txt && \
+    python -c "import patchgen, pytest" && patchgen --help
+
+# Match the existing ARM installation path; pip does not install uv groups.
+RUN pip install -e ".[npu_aarch64]" "transformers==5.16.1" && \
+    python -c "import transformers; assert transformers.__version__ == '5.16.1'"
+
+# Preserve the ARM parquet workaround from the historical Dockerfile.
+RUN pip install "pyarrow==21.0.0" "pandas==2.3.2"
+
+# Keep the selected wheels in /app for reproducibility;
+# local validation can use these wheels after creating a project environment.
+# Discard stale copies inherited from a base image or the build context.
+RUN rm -f /app/torch_npu-*.whl /app/triton-*.whl /app/triton_ascend-*.whl /app/flash_linear_attention_npu-*.whl /app/flash_linear_attention_npu_a2-*.whl /app/flash_linear_attention_npu_a3-*.whl /app/flash_linear_attention_npu_a5-*.whl && \
+    python -m pip download --no-deps --only-binary=:all: --dest /app --index-url https://ascend.devcloud.huaweicloud.com/pypi/simple/ "torch-npu==2.10.0.post7" && \
+    python -m pip install --no-deps --force-reinstall /app/torch_npu-*.whl && \
+    python -m pip install pybind11 wheel ninja
+
+# The cp312/aarch64 3.2.2 wheel requires triton==3.5.0. Install the base first,
+# then the Ascend overlay so its patched libtriton.so wins. --no-deps preserves
+# VeOmni's scipy/decorator versions instead of applying the wheel's older pins.
+# CI must also restore triton==3.5.0 and pybind11 after its exact uv sync;
+# system site-packages are not inherited by the CI venv.
+RUN python -m pip uninstall -y triton triton-ascend && \
+    python -m pip download --no-deps --only-binary=:all: --dest /app "triton==3.5.0" && \
+    python -m pip install --no-deps /app/triton-3.5.0-*.whl && \
+    python -m pip download --no-deps --dest /app \
+        "https://mirrors.huaweicloud.com/ascend/repos/pypi/triton-ascend/triton_ascend-3.2.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl" && \
+    python -m pip install --no-deps --force-reinstall /app/triton_ascend-*.whl && \
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    python -c "from triton._C.libtriton import ascend"
+
+# Build the A2 wheel with the upstream script and retain it for CI environments.
+ARG FLA_BUILD_JOBS=4
+RUN git clone https://github.com/flashserve/flash-linear-attention-npu /tmp/fla-npu && \
+    cd /tmp/fla-npu && git checkout --detach a7c608f2e3f828779ceeec1fcf155a6e37ede83c && \
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    export FLA_NPU_SOC=ascend910b TORCH_DEVICE_BACKEND_AUTOLOAD=0 && \
+    python -m pip install -r requirements.txt 'setuptools>=70.1' wheel && \
+    python scripts/check_npu_env.py --build-only && \
+    unset FLA_NPU_OPS && \
+    PIP_VERBOSE=1 FLA_NPU_BUILD_ARGS="-j${FLA_BUILD_JOBS}" \
+        python -u scripts/build_wheel.py --no-progress --wheel-dir /app && \
+    python -m zipfile -t /app/flash_linear_attention_npu_a2-*.whl && \
+    python -m pip uninstall -y fla-npu flash-linear-attention-npu flash-linear-attention-npu-a2 flash-linear-attention-npu-a3 flash-linear-attention-npu-a5 && \
+    python -m pip install --force-reinstall --no-deps /app/flash_linear_attention_npu_a2-*.whl && \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c "from fla_npu.ops import ascendc; assert all(callable(getattr(ascendc, n, None)) for n in ('chunk_gated_delta_rule_fwd', 'chunk_gated_delta_rule_bwd'))" && \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 python scripts/check_packaged_wheel_api.py && \
+    cp scripts/check_packaged_wheel_api.py /app/check_packaged_wheel_api.py && \
+    cd / && rm -rf /tmp/fla-npu
+
+# Preserve the ARM TorchCodec source and installer for rebuilding in CI's venv.
+RUN git clone https://github.com/meta-pytorch/torchcodec.git
+
+WORKDIR /app/torchcodec
+RUN git checkout v0.10.0
+
+ENV CANN_PATH=/usr/local/Ascend
+
+RUN cp ../docs/get_started/installation/install_torchcodec_Ascend.sh .
+RUN chmod +x install_torchcodec_Ascend.sh
+RUN bash install_torchcodec_Ascend.sh ${CANN_PATH}/ascend-toolkit/set_env.sh
+
+WORKDIR /app
+
+# Record the actual resolved Python packages alongside the retained artifacts.
+RUN python -c "from importlib.metadata import version; assert version('torch').split('+')[0] == '2.10.0'; assert version('torch-npu') == '2.10.0.post7'; assert version('triton') == '3.5.0'; assert version('triton-ascend') == '3.2.2'; assert version('transformers') == '5.16.1'" && \
+    python -m pip freeze > /app/a2-image-requirements.txt && \
+    sha256sum /app/torch_npu-*.whl /app/triton-*.whl /app/triton_ascend-*.whl /app/flash_linear_attention_npu_a2-*.whl > /app/a2-ci-wheels.sha256
+
+RUN python -c "import patchgen, pytest" && patchgen --help
+
+CMD ["/bin/bash"]
