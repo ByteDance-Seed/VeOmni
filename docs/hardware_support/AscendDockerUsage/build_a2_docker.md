@@ -56,9 +56,9 @@ these CANN 9.2.1 Dockerfiles on matching native runners. They support manual
 dispatch, published releases, and path-filtered pushes to `main`. Upstream
 builds publish to Quay using repository secrets. Build jobs are restricted
 to the `ByteDance-Seed` owner. See the
-[workflow and tag rules](../../../docker/README.md#build-and-publication-workflows).
+[workflow and tag rules](overview.md#build-and-publication-workflows).
 The NPU unit/e2e workflows continue to use their existing environment.
-See [validation scope and cache details](../../../docker/README.md#validation-scope).
+See [validation scope and cache details](overview.md#validation-scope).
 
 ## CANN 9.1.0 instructions
 
