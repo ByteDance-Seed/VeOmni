@@ -208,6 +208,17 @@ def test_fsdp_gradient_scaling_uses_custom_path_only_when_needed(reduce_scatter_
         assert module.force_sum_reductions == []
         assert reduction_scales == {module: 0.125}
 
+    if not use_low_precision_transport and reduce_scatter_size > 1:
+        legacy_module = SimpleNamespace(set_gradient_divide_factor=lambda _factor: None)
+        with pytest.raises(RuntimeError, match="set_force_sum_reduction_for_comms"):
+            _configure_fsdp_gradient_reduction(
+                legacy_module,
+                gradient_divide_factor=8.0,
+                reduce_scatter_size=reduce_scatter_size,
+                use_low_precision_transport=False,
+                transport_reduction_scales={},
+            )
+
 
 class _FakeReductionMesh:
     def __init__(self, shard_group, replica_group=None):

@@ -43,9 +43,34 @@ class MultiLRScheduler(dict):
         return {name: sched.state_dict() for name, sched in self.items()}
 
     def load_state_dict(self, state_dict: Dict[str, any]) -> None:
+        donor_sub = next(
+            (v for v in state_dict.values() if isinstance(v, dict) and "last_epoch" in v),
+            None,
+        )
         for name, sched in self.items():
+            num_groups = len(sched.optimizer.param_groups)
             if name in state_dict:
-                sched.load_state_dict(state_dict[name])
+                sub_sd = dict(state_dict[name])
+                saved_base_lrs = sub_sd.get("base_lrs")
+                if isinstance(saved_base_lrs, list) and len(saved_base_lrs) != num_groups:
+                    # Parameter ownership migration (e.g. `.gate.` moving from Muon to
+                    # AdamW or `head_blocks` group splits changing) can alter a
+                    # sub-optimizer's `param_groups` count. Keep the newly built
+                    # per-group `base_lrs`, restore the step cursor, and recompute LRs
+                    # so `LambdaLR.get_lr`'s `zip(..., strict=True)` stays aligned.
+                    configured_base_lrs = list(sched.base_lrs)
+                    sub_sd["base_lrs"] = configured_base_lrs
+                    sub_sd.pop("_last_lr", None)
+                    sched.load_state_dict(sub_sd)
+                    sched.base_lrs = configured_base_lrs
+                    sched._update_lr(sched.last_epoch)
+                else:
+                    sched.load_state_dict(sub_sd)
+            elif donor_sub is not None:
+                # A newly materialized sub-optimizer (absent before ownership migration)
+                # aligns its step cursor with the rest of the MultiLRScheduler.
+                sched._step_count = donor_sub.get("_step_count", sched._step_count)
+                sched._update_lr(donor_sub["last_epoch"])
 
     def get_last_lr(self):
         # Return the first scheduler's LR for logging consistency

@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -255,6 +256,210 @@ class AnyPrecisionAdamW(Optimizer):
                     p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
 
 
+_MUON_EXCLUSIVE_PG_KEYS: frozenset[str] = frozenset(
+    {
+        "ns_steps",
+        "ns_coefficients",
+        "adjust_lr_fn",
+        "ns_implementation",
+        "gram_ns_reset_iterations",
+        "momentum",
+        "nesterov",
+        "head_blocks",
+    }
+)
+_ADAMW_EXCLUSIVE_PG_KEYS: frozenset[str] = frozenset(
+    {
+        "betas",
+        "amsgrad",
+        "use_kahan_summation",
+    }
+)
+
+
+def _fresh_state_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return torch.zeros_like(value, memory_format=torch.preserve_format)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return 0
+    if isinstance(value, float):
+        return 0.0
+    return copy.deepcopy(value)
+
+
+def _prepare_sub_optimizer_state_dict(
+    model: nn.Module,
+    opt: Optimizer,
+    opt_name: str,
+    state_dict: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Reconcile flattened checkpoint entries when parameters changed sub-optimizer ownership.
+
+    When routing rules change between runs (e.g. ``.gate.`` / ``.router.`` moving from
+    ``DistributedMuon`` to ``AdamW``, or ``muon_extra_adamw_names`` overrides), a
+    flattened checkpoint carries the previous owner's ``param_groups.<fqn>.*`` and
+    ``state.<fqn>.*`` keys.  Without migration:
+
+    * Direct ``MultiOptimizer.load_state_dict`` leaves missing target state leaves as
+      ``{}`` via PyTorch's ``_reconstruct_nested_dict`` and raises ``KeyError`` when a
+      migrated parameter is the first entry of its target ``param_group``.
+    * DCP ``OptimizerState(load=True)`` (after stripping unloaded template group keys)
+      still carries shared group keys (``lr``, ``weight_decay``, ``eps``, ``initial_lr``)
+      written by the old optimizer, which silently overwrite the entire target group's
+      hyperparameters whenever a migrated parameter sits first in that group.
+
+    Unchanged parameters keep their saved state and saved group options (including
+    scheduler-updated ``lr`` / ``initial_lr``); migrated parameters receive fresh
+    zeroed target state and inherit group options from an unchanged peer in the same
+    group (or from the configured group, carrying over scheduler-updated ``lr`` from a
+    same-base-LR sibling group when available).
+    """
+    if not state_dict or ("state" in state_dict and "param_groups" in state_dict):
+        return state_dict
+
+    if isinstance(opt, DistributedMuon):
+        own_sig_key = "ns_steps"
+        other_pg_markers = _ADAMW_EXCLUSIVE_PG_KEYS
+        own_state_markers: Tuple[str, ...] = ("momentum_buffer",)
+        other_state_markers: Tuple[str, ...] = ("exp_avg", "exp_avg_sq")
+    elif "betas" in getattr(opt, "defaults", {}):
+        own_sig_key = "betas"
+        other_pg_markers = _MUON_EXCLUSIVE_PG_KEYS
+        own_state_markers = ("exp_avg", "exp_avg_sq")
+        other_state_markers = ("momentum_buffer",)
+    else:
+        return state_dict
+
+    configured_groups = [{k: v for k, v in g.items() if k != "params"} for g in opt.param_groups]
+    template = get_optimizer_state_dict(model, opt)
+    template_pgs = template.get("param_groups", [])
+    if not template_pgs:
+        return state_dict
+    template_states: Dict[str, Dict[str, Any]] = template.get("state", {})
+
+    pg_keys_by_fqn: Dict[str, set[str]] = {}
+    for key in state_dict:
+        if key.startswith("param_groups."):
+            fqn, sep, gkey = key[len("param_groups.") :].rpartition(".")
+            if sep:
+                pg_keys_by_fqn.setdefault(fqn, set()).add(gkey)
+
+    group_classifications: List[List[Tuple[str, str]]] = []
+    unchanged_donor_by_group: List[Optional[str]] = []
+    migrated_fqns: set[str] = set()
+    needs_rewrite = False
+
+    for configured, t_pg in zip(configured_groups, template_pgs):
+        fqns: List[str] = list(t_pg.get("params", ()))
+        entries: List[Tuple[str, str]] = []
+        donor: Optional[str] = None
+        for fqn in fqns:
+            pg_keys = pg_keys_by_fqn.get(fqn, set())
+            has_own_pg = own_sig_key in pg_keys
+            has_other_pg = bool(pg_keys & other_pg_markers)
+            has_own_state = any(f"state.{fqn}.{m}" in state_dict for m in own_state_markers)
+            has_other_state = any(f"state.{fqn}.{m}" in state_dict for m in other_state_markers)
+
+            if (
+                (has_own_pg and (has_other_pg or has_other_state))
+                or (has_other_pg and has_own_state)
+                or (has_own_state and has_other_state)
+            ):
+                raise ValueError(
+                    f"Ambiguous optimizer ownership in checkpoint for parameter {fqn!r}: "
+                    "found conflicting Muon and AdamW state or param_group entries."
+                )
+
+            if has_own_pg:
+                kind = "unchanged"
+                if donor is None:
+                    donor = fqn
+                if any(f"param_groups.{fqn}.{k}" not in state_dict for k in configured):
+                    needs_rewrite = True
+                for skey in template_states.get(fqn, {}):
+                    sfull = f"state.{fqn}.{skey}"
+                    if sfull not in state_dict and not any(k.startswith(f"{sfull}.") for k in state_dict):
+                        needs_rewrite = True
+            elif pg_keys or has_other_state:
+                kind = "migrated"
+                migrated_fqns.add(fqn)
+                needs_rewrite = True
+            else:
+                kind = "absent"
+                needs_rewrite = True
+            entries.append((fqn, kind))
+
+        group_classifications.append(entries)
+        unchanged_donor_by_group.append(donor)
+
+    if not needs_rewrite:
+        return state_dict
+
+    if migrated_fqns:
+        logger.info_rank0(
+            f"Migrating {len(migrated_fqns)} parameter(s) into sub-optimizer '{opt_name}' with fresh state: "
+            f"{sorted(migrated_fqns)[:5]}"
+        )
+        sub_sd: Dict[str, Any] = {}
+        for key, value in state_dict.items():
+            if key.startswith("param_groups."):
+                fqn, sep, _ = key[len("param_groups.") :].rpartition(".")
+                if sep and fqn in migrated_fqns:
+                    continue
+            elif key.startswith("state."):
+                rest = key[len("state.") :]
+                if any(rest.startswith(f"{m_fqn}.") for m_fqn in migrated_fqns):
+                    continue
+            sub_sd[key] = value
+    else:
+        sub_sd = dict(state_dict)
+
+    resolved_group_opts: List[Dict[str, Any]] = []
+    for idx, configured in enumerate(configured_groups):
+        donor = unchanged_donor_by_group[idx]
+        if donor is not None:
+            opts = {k: sub_sd.get(f"param_groups.{donor}.{k}", v) for k, v in configured.items()}
+        else:
+            opts = dict(configured)
+            target_base_lr = configured.get("initial_lr", configured.get("lr"))
+            for sib_idx, sib_donor in enumerate(unchanged_donor_by_group):
+                if sib_donor is None:
+                    continue
+                sib_base_lr = configured_groups[sib_idx].get("initial_lr", configured_groups[sib_idx].get("lr"))
+                if sib_base_lr == target_base_lr:
+                    if f"param_groups.{sib_donor}.lr" in sub_sd:
+                        opts["lr"] = sub_sd[f"param_groups.{sib_donor}.lr"]
+                    if "initial_lr" in configured and f"param_groups.{sib_donor}.initial_lr" in sub_sd:
+                        opts["initial_lr"] = sub_sd[f"param_groups.{sib_donor}.initial_lr"]
+                    break
+        resolved_group_opts.append(opts)
+
+    for entries, opts in zip(group_classifications, resolved_group_opts):
+        for fqn, kind in entries:
+            param_template = template_states.get(fqn, {})
+            if kind == "unchanged":
+                for k, v in opts.items():
+                    sub_sd.setdefault(f"param_groups.{fqn}.{k}", v)
+                for skey, sval in param_template.items():
+                    sfull = f"state.{fqn}.{skey}"
+                    if sfull not in sub_sd and not any(k.startswith(f"{sfull}.") for k in sub_sd):
+                        sub_sd[sfull] = _fresh_state_value(sval)
+            elif kind == "migrated":
+                for k, v in opts.items():
+                    sub_sd[f"param_groups.{fqn}.{k}"] = v
+                for skey, sval in param_template.items():
+                    sub_sd[f"state.{fqn}.{skey}"] = _fresh_state_value(sval)
+            else:  # "absent"
+                for k, v in opts.items():
+                    sub_sd[f"param_groups.{fqn}.{k}"] = v
+                for skey, sval in param_template.items():
+                    sfull = f"state.{fqn}.{skey}"
+                    if sfull not in sub_sd and not any(k.startswith(f"{sfull}.") for k in sub_sd):
+                        sub_sd[sfull] = _fresh_state_value(sval)
+
+    return sub_sd
+
+
 class MultiOptimizer(Optimizer, Stateful):
     """
     A container that handles multiple optimizers (for extra_parallel and non-extra_parallel parameters when extra_parallel+fsdp2 is enabled)
@@ -333,14 +538,16 @@ class MultiOptimizer(Optimizer, Stateful):
         return merged
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        # Feed the same merged flattened dict to each sub-optimizer; PyTorch will
-        # pick out only the entries for parameters that belong to that optimizer.
+        # Feed the merged flattened dict to each sub-optimizer after reconciling any
+        # cross-optimizer parameter ownership changes; PyTorch then extracts each
+        # sub-optimizer's own parameter entries.
         for name in self.key_names:
             opt = self.optimizers_dict.get(name)
+            sub_sd = _prepare_sub_optimizer_state_dict(self.model, opt, name, state_dict)
             set_optimizer_state_dict(
                 self.model,
                 opt,
-                optim_state_dict=state_dict,
+                optim_state_dict=sub_sd,
                 options=StateDictOptions(flatten_optimizer_state_dict=True),
             )
 

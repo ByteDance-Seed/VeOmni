@@ -313,10 +313,10 @@ class OptimizerConfig:
         if (
             isinstance(self.muon_extra_adamw_names, (str, bytes))
             or not isinstance(self.muon_extra_adamw_names, (list, tuple))
-            or any(not isinstance(item, str) for item in self.muon_extra_adamw_names)
+            or any(not isinstance(item, str) or not item.strip() for item in self.muon_extra_adamw_names)
         ):
             raise ValueError(
-                "model.optimizer.muon_extra_adamw_names must be a list of strings, "
+                "model.optimizer.muon_extra_adamw_names must be a list of non-empty strings, "
                 f"got {self.muon_extra_adamw_names!r}."
             )
 

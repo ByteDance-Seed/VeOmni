@@ -258,6 +258,43 @@ class ModelState(Stateful):
         )
 
 
+class _UnloadedParamGroupValue(bytes):
+    """Sentinel marking ``param_groups.*`` template slots before ``dcp.load``.
+
+    ``OptimizerState(load=True).state_dict()`` returns a dense template so DCP
+    knows every destination key and tensor layout.  When a parameter changed
+    optimizer ownership across checkpoints (for example ``.gate.`` or ``.router.``
+    moving from ``DistributedMuon`` to ``AdamW``), ``dcp.load`` with
+    ``allow_partial_load=True`` overwrites shared group keys (``lr``,
+    ``weight_decay``, ``eps``, ``initial_lr``) with the old optimizer's values
+    while leaving missing target-only keys such as ``betas`` untouched.
+
+    Subclasses ``bytes`` because PyTorch DCP's ``_init_state_dict`` /
+    ``_iterate_state_dict`` preserves primitive ``bytes`` values verbatim while
+    rewriting arbitrary custom object classes to ``None`` before ``load_bytes``
+    runs.  Entries actually present in the checkpoint are overwritten by
+    ``load_bytes`` with their unpickled scalars/tuples; remaining sentinel slots
+    are stripped in ``load_state_dict`` so ``MultiOptimizer.load_state_dict``
+    sees true checkpoint ownership.
+    """
+
+    def __new__(cls) -> "_UnloadedParamGroupValue":
+        return super().__new__(cls, b"__veomni_unloaded_param_group_value__")
+
+
+_UNLOADED_PARAM_GROUP_VALUE = _UnloadedParamGroupValue()
+
+
+def _mark_unloaded_param_group_values(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: _UNLOADED_PARAM_GROUP_VALUE if k.startswith("param_groups.") else v for k, v in state_dict.items()}
+
+
+def _strip_unloaded_param_group_values(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    if not any(isinstance(v, _UnloadedParamGroupValue) for v in state_dict.values()):
+        return state_dict
+    return {k: v for k, v in state_dict.items() if not isinstance(v, _UnloadedParamGroupValue)}
+
+
 class OptimizerState(Stateful):
     """A wrapper around an optimizer to make it stateful.
 
@@ -321,18 +358,20 @@ class OptimizerState(Stateful):
             optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
                 vanilla_optim_sd, "restore"
             )
+            if self._load:
+                return _mark_unloaded_param_group_values(optim_sd_with_extra_parallel_dim)
             return optim_sd_with_extra_parallel_dim
 
         if getattr(self.optimizer, "_is_multi_optimizer", False):
             if self._load:
-                return self.optimizer.state_dict()
+                return _mark_unloaded_param_group_values(self.optimizer.state_dict())
             return self.optimizer._sparse_state_dict()
 
         return get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
 
     def load_state_dict(self, state_dict):
         """Restore optimizer state from the loaded DCP state dict."""
-        optim_state_from_dcp_load = state_dict
+        optim_state_from_dcp_load = _strip_unloaded_param_group_values(state_dict)
         if self.should_extra_parallel_aware:
             # we need to drop ExtraParallel dim before loading them into optimizers
             optim_state_without_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(

@@ -100,9 +100,16 @@ _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
 )
 
 # Attribute names carrying a head count and a per-head row stride. MLA modules
-# keep the true stride as ``qk_head_dim``; ``head_dim`` is only the rope part.
-_HEAD_COUNT_ATTRS: Tuple[str, ...] = ("num_heads", "n_heads", "num_attention_heads", "num_key_value_heads")
-_HEAD_STRIDE_ATTRS: Tuple[str, ...] = ("head_dim", "qk_head_dim")
+# keep the true stride as ``qk_head_dim`` (``head_dim`` is only the rope part),
+# and SeedOmni's ``DeepseekV41Indexer`` names its DSA stride ``index_head_dim``.
+_HEAD_COUNT_ATTRS: Tuple[str, ...] = (
+    "num_heads",
+    "n_heads",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "index_n_heads",
+)
+_HEAD_STRIDE_ATTRS: Tuple[str, ...] = ("head_dim", "qk_head_dim", "index_head_dim")
 
 
 def _as_coeff_schedule(
@@ -432,8 +439,8 @@ def split_muon_adamw_params(
             "extra_adamw_name_patterns must be a sequence of parameter name substrings, not a bare string."
         )
     extra_patterns = list(extra_adamw_name_patterns or ())
-    if any(not isinstance(pat, str) for pat in extra_patterns):
-        raise ValueError("extra_adamw_name_patterns entries must all be strings.")
+    if any(not isinstance(pat, str) or not pat.strip() for pat in extra_patterns):
+        raise ValueError("extra_adamw_name_patterns entries must all be non-empty strings.")
 
     forced_adamw_fqns: set = set()
     for module_name, module in model.named_modules():

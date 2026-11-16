@@ -254,6 +254,11 @@ class TestSplit:
 
         with pytest.raises(ValueError, match="muon_extra_adamw_names"):
             OptimizerConfig(type="muon", muon_extra_adamw_names="bare_string")  # type: ignore[arg-type]
+        for bad_pattern in ("", "   "):
+            with pytest.raises(ValueError, match="muon_extra_adamw_names"):
+                OptimizerConfig(type="muon", muon_extra_adamw_names=[bad_pattern])
+            with pytest.raises(ValueError, match="extra_adamw_name_patterns"):
+                split_muon_adamw_params(model, extra_adamw_name_patterns=[bad_pattern])
         with pytest.raises(ValueError, match="extra_adamw_name_patterns"):
             split_muon_adamw_params(model, extra_adamw_name_patterns="bare_string")
 
@@ -538,6 +543,146 @@ class TestNumerics:
         fresh_model[0].weight.grad = torch.randn_like(fresh_model[0].weight)
         fresh_opt.step()
         assert isinstance(fresh_opt.optimizers_dict["muon"].state[fresh_model[0].weight]["compensation"], torch.Tensor)
+
+    @pytest.mark.parametrize("no_decay_params", [[], ["norm"]], ids=["shared_adamw_group", "split_decay_groups"])
+    def test_pre_change_muon_router_checkpoint_migrates_to_adamw_on_dcp_and_direct_load(
+        self, tmp_path, monkeypatch, no_decay_params
+    ):
+        """Resuming a pre-change checkpoint where `.gate.` was owned by Muon must not poison AdamW group options."""
+        import torch.distributed.checkpoint as dcp
+
+        from veomni.checkpoint.dcp_checkpointer import OptimizerState, _ModelStrictLoadPlanner
+        from veomni.optim import build_lr_scheduler, build_optimizer
+
+        class _PreChangeRoutingModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Freeze embeddings so the rerouted `mlp.gate.weight` becomes the very first
+                # parameter in `adamw.param_groups[0]`.
+                self.embed_tokens = nn.Embedding(8, 8)
+                self.embed_tokens.requires_grad_(False)
+                self.mlp = nn.Module()
+                self.mlp.gate = nn.Linear(8, 4, bias=False)
+                self.mlp.up_proj = nn.Linear(8, 8, bias=False, dtype=torch.bfloat16)
+                self.norm = nn.LayerNorm(8, bias=False)
+
+        legacy_patterns = (
+            "embed_tokens",
+            "embedding",
+            "lm_head",
+            "markov_head",
+            "confidence_head",
+            "output_layer",
+            "conv1d",
+        )
+        adamw_lr, adamw_wd, adamw_eps = 1e-4, 0.1, 1e-8
+        muon_lr, muon_wd, muon_eps = 2e-2, 0.0, 1e-7
+
+        def _make_opt(model):
+            return build_optimizer(
+                model,
+                lr=adamw_lr,
+                weight_decay=adamw_wd,
+                eps=adamw_eps,
+                optimizer_type="muon",
+                no_decay_params=list(no_decay_params),
+                muon_kwargs={
+                    "lr": muon_lr,
+                    "weight_decay": muon_wd,
+                    "eps": muon_eps,
+                    "ns_implementation": "std",
+                },
+            )
+
+        with monkeypatch.context() as m:
+            m.setattr(muon_impl, "_DEFAULT_ADAMW_NAME_PATTERNS", legacy_patterns)
+            src_model = _PreChangeRoutingModel()
+            src_opt = _make_opt(src_model)
+            src_sched = build_lr_scheduler(
+                src_opt, train_steps=10, lr=adamw_lr, lr_decay_style="cosine", lr_warmup_ratio=0.2, lr_min=1e-5
+            )
+            torch.manual_seed(19)
+            for _ in range(3):
+                for p in src_model.parameters():
+                    if p.requires_grad:
+                        p.grad = torch.randn_like(p)
+                src_opt.step()
+                src_sched.step()
+            saved_adamw_lr = src_opt.optimizers_dict["adamw"].param_groups[0]["lr"]
+            saved_muon_lr = src_opt.optimizers_dict["muon"].param_groups[0]["lr"]
+            saved_sched_sd = src_sched.state_dict()
+            raw_legacy_sd = src_opt.state_dict()
+            dcp.save({"optimizer": OptimizerState(src_model, src_opt, load=False)}, checkpoint_id=str(tmp_path))
+            expected_norm_exp_avg = src_opt.optimizers_dict["adamw"].state[src_model.norm.weight]["exp_avg"].clone()
+            expected_up_buf = (
+                src_opt.optimizers_dict["muon"].state[src_model.mlp.up_proj.weight]["momentum_buffer"].clone()
+            )
+
+        for mode in ("dcp_optimizer_state", "direct_flattened"):
+            dst_model = _PreChangeRoutingModel()
+            dst_opt = _make_opt(dst_model)
+            dst_sched = build_lr_scheduler(
+                dst_opt, train_steps=10, lr=adamw_lr, lr_decay_style="cosine", lr_warmup_ratio=0.2, lr_min=1e-5
+            )
+            adamw_opt = dst_opt.optimizers_dict["adamw"]
+            muon_opt = dst_opt.optimizers_dict["muon"]
+            assert adamw_opt.param_groups[0]["params"][0] is dst_model.mlp.gate.weight
+
+            if mode == "dcp_optimizer_state":
+                dcp.load(
+                    state_dict={"optimizer": OptimizerState(dst_model, dst_opt, load=True)},
+                    storage_reader=dcp.FileSystemReader(str(tmp_path)),
+                    planner=_ModelStrictLoadPlanner(strict_model=False),
+                )
+            else:
+                dst_opt.load_state_dict(raw_legacy_sd)
+            dst_sched.load_state_dict(saved_sched_sd)
+
+            # Migrated gate sits at params[0], yet AdamW group options must reflect AdamW
+            # (including scheduler-scaled lr), never Muon's lr / wd=0.0 / eps=1e-7.
+            assert adamw_opt.param_groups[0]["lr"] == pytest.approx(saved_adamw_lr)
+            assert adamw_opt.param_groups[0]["weight_decay"] == pytest.approx(adamw_wd)
+            assert adamw_opt.param_groups[0]["eps"] == pytest.approx(adamw_eps)
+            assert adamw_opt.param_groups[0]["betas"] == (0.9, 0.95)
+            if len(adamw_opt.param_groups) > 1:
+                assert adamw_opt.param_groups[1]["lr"] == pytest.approx(saved_adamw_lr)
+                assert adamw_opt.param_groups[1]["weight_decay"] == pytest.approx(0.0)
+
+            # Migrated gate has fresh zeroed AdamW moments; unchanged norm & up_proj keep saved state.
+            gate_state = adamw_opt.state[dst_model.mlp.gate.weight]
+            assert float(gate_state["step"]) == 0.0
+            assert torch.count_nonzero(gate_state["exp_avg"]) == 0
+            assert torch.count_nonzero(gate_state["exp_avg_sq"]) == 0
+            torch.testing.assert_close(
+                adamw_opt.state[dst_model.norm.weight]["exp_avg"], expected_norm_exp_avg, atol=0.0, rtol=0.0
+            )
+            assert float(adamw_opt.state[dst_model.norm.weight]["step"]) == 3.0
+            torch.testing.assert_close(
+                muon_opt.state[dst_model.mlp.up_proj.weight]["momentum_buffer"], expected_up_buf, atol=0.0, rtol=0.0
+            )
+            assert muon_opt.param_groups[0]["lr"] == pytest.approx(saved_muon_lr)
+            assert isinstance(muon_opt.state[dst_model.mlp.up_proj.weight]["compensation"], torch.Tensor)
+
+            # Subsequent optimizer + scheduler steps update every trainable parameter without error
+            # (even when AdamW gained a second param_group on resume).
+            snap = {n: p.detach().clone() for n, p in dst_model.named_parameters() if p.requires_grad}
+            for p in dst_model.parameters():
+                if p.requires_grad:
+                    p.grad = torch.randn_like(p)
+            dst_opt.step()
+            dst_sched.step()
+            for n, p in dst_model.named_parameters():
+                if p.requires_grad:
+                    assert not torch.equal(p.detach(), snap[n]), f"{mode}: {n} did not update after resume step"
+            assert float(adamw_opt.state[dst_model.mlp.gate.weight]["step"]) == 1.0
+
+        # Ambiguous checkpoint carrying both Muon and AdamW keys for one parameter must fail explicitly.
+        ambiguous_sd = dict(raw_legacy_sd)
+        ambiguous_sd["param_groups.mlp.gate.weight.betas"] = (0.9, 0.95)
+        ambiguous_dst = _PreChangeRoutingModel()
+        ambiguous_opt = _make_opt(ambiguous_dst)
+        with pytest.raises(ValueError, match="Ambiguous optimizer ownership"):
+            ambiguous_opt.load_state_dict(ambiguous_sd)
 
 
 class TestBuildOptimizer:
@@ -1051,6 +1196,29 @@ class TestHeadSplitInference:
         }
         assert infer_head_block_counts(model, head_group_size=1, module_names=("q_b_proj",)) == {
             "self_attn.q_b_proj.weight": 8
+        }
+
+    def test_index_head_dim_resolves_dsa_indexer_wq_b(self):
+        """SeedOmni's ``DeepseekV41Indexer`` declares ``n_heads`` + ``index_head_dim`` (no ``head_dim``)."""
+        attn = nn.Module()
+        attn.num_heads = 64
+        attn.qk_head_dim = 512
+        attn.wq_b = nn.Linear(1280, 64 * 512, bias=False)
+        indexer = nn.Module()
+        indexer.n_heads = 32
+        indexer.index_head_dim = 128
+        indexer.wq_b = nn.Linear(1280, 32 * 128, bias=False)
+        attn.indexer = indexer
+        model = nn.Module()
+        model.self_attn = attn
+
+        with pytest.raises(ValueError, match="is ambiguous"):
+            infer_head_block_counts(model, head_group_size=1, module_names=("wq_b",))
+
+        blocks = infer_head_block_counts(model, head_group_size=1, module_names=("self_attn.wq_b", "indexer.wq_b"))
+        assert blocks == {
+            "self_attn.wq_b.weight": 64,
+            "self_attn.indexer.wq_b.weight": 32,
         }
 
     def test_head_split_modules_thread_from_the_optimizer_config(self):

@@ -446,7 +446,12 @@ def _set_extra_parallel_gradient_divide_factor(
     as well and divide gradients a second time (by ``factor ** 2``).
     """
     module.set_gradient_divide_factor(gradient_divide_factor)
-    if reduce_scatter_size > 1 and hasattr(module, "set_force_sum_reduction_for_comms"):
+    if reduce_scatter_size > 1:
+        if not hasattr(module, "set_force_sum_reduction_for_comms"):
+            raise RuntimeError(
+                f"{type(module).__name__} does not expose set_force_sum_reduction_for_comms; "
+                "cannot force ReduceOp.SUM for multi-rank ExtraParallel FSDP2 gradient reduction."
+            )
         module.set_force_sum_reduction_for_comms(True)
 
 
