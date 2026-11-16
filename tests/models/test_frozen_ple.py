@@ -1,11 +1,15 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard, distribute_tensor
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.models.frozen_ple import freeze_ple_embeddings, is_ple_table
+from veomni.models.frozen_ple import freeze_ple_embeddings, is_ple_table, prepare_ple_storage
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -37,20 +41,14 @@ def test_freeze_rejects_other_model_types():
         freeze_ple_embeddings(model)
 
 
-def test_training_arguments_validate_frozen_ple_dtype():
-    """Accept supported freeze settings and reject invalid dtype combinations."""
-    from veomni.arguments.arguments_types import TrainingArguments
+@pytest.mark.parametrize("freeze", [False, True])
+def test_invalid_frozen_ple_dtype(freeze):
+    """Reject a dtype without freezing or an unsupported dtype."""
     from veomni.trainer.vlm_trainer import VLMTrainingArguments
 
-    enabled = TrainingArguments(freeze_ple_embeddings=True, frozen_ple_dtype="bfloat16")
-    assert enabled.freeze_ple_embeddings is True
-    assert enabled.frozen_ple_dtype == "bfloat16"
-    assert VLMTrainingArguments(freeze_ple_embeddings=True).freeze_ple_embeddings is True
-
-    with pytest.raises(ValueError, match="freeze_ple_embeddings"):
-        TrainingArguments(frozen_ple_dtype="bfloat16")
-    with pytest.raises(ValueError, match="bfloat16"):
-        TrainingArguments(freeze_ple_embeddings=True, frozen_ple_dtype="float16")
+    dtype = "float16" if freeze else "bfloat16"
+    with pytest.raises(ValueError, match="frozen_ple_dtype"):
+        VLMTrainingArguments(freeze_ple_embeddings=freeze, frozen_ple_dtype=dtype)
 
 
 def _build_runtime(dtype):
@@ -66,7 +64,6 @@ def _build_runtime(dtype):
     from veomni.arguments.arguments_types import OptimizerConfig
 
     runtime.args = SimpleNamespace(optimizer=OptimizerConfig(lr=1e-3, weight_decay=0.0), lora_config=None)
-    runtime._setup_lora = lambda: None
     runtime._freeze_model_module()
     table = runtime.model.ple.ple_embedding.ngram_embedding["shard_0"].weight
     assert not table.requires_grad
@@ -131,17 +128,17 @@ def test_runtime_trains_and_resumes_with_frozen_ple(monkeypatch, tmp_path, dtype
 
 
 def test_runtime_leaves_ple_trainable_when_freeze_is_disabled():
-    """Preserve table trainability when the freeze option is disabled."""
-    from veomni.models.model_runtime import VeOmniModelRuntime
+    """Preserve table trainability when the VLM freeze option is disabled."""
+    from veomni.trainer.vlm_trainer import VLMModelRuntime
 
     model = _qwen4_model()
-    runtime = VeOmniModelRuntime.__new__(VeOmniModelRuntime)
+    runtime = VLMModelRuntime.__new__(VLMModelRuntime)
     runtime.model = model
-    runtime.train_args = SimpleNamespace(freeze_ple_embeddings=False, frozen_ple_dtype=None)
-    runtime._setup_lora = lambda: None
+    runtime.model_config = model.config
+    runtime.args = SimpleNamespace(lora_config=None)
+    runtime.train_args = SimpleNamespace(freeze_ple_embeddings=False, freeze_vit=False, freeze_audio_tower=False)
     runtime._freeze_model_module()
-    table = model.ple.ple_embedding.ngram_embedding["shard_0"].weight
-    assert table.requires_grad
+    assert model.ple.ple_embedding.ngram_embedding["shard_0"].weight.requires_grad
 
 
 def test_freeze_ple_on_meta_preserves_dtype():
@@ -151,3 +148,65 @@ def test_freeze_ple_on_meta_preserves_dtype():
     assert freeze_ple_embeddings(model) == 1
     assert not table.requires_grad
     assert table.dtype == torch.float32
+
+
+@pytest.mark.parametrize("value", ['"false"', '"true"', "0", "null", "true", "false"])
+def test_yaml_freeze_requires_boolean(value, monkeypatch, tmp_path):
+    """Validate quoted and unquoted freeze settings through the YAML parser."""
+    from veomni.arguments import parse_args
+    from veomni.trainer.vlm_trainer import VLMTrainingArguments
+
+    config = tmp_path / "freeze.yaml"
+    config.write_text(
+        f"freeze_ple_embeddings: {value}\n" + ("frozen_ple_dtype: bfloat16\n" if value == "true" else "")
+    )
+    monkeypatch.setattr(sys, "argv", ["test", str(config)])
+    if value in ("true", "false"):
+        assert parse_args(VLMTrainingArguments).freeze_ple_embeddings is (value == "true")
+    else:
+        with pytest.raises(ValueError, match="must be a boolean"):
+            parse_args(VLMTrainingArguments)
+
+
+@pytest.mark.parametrize("setting", ["freeze_ple_embeddings: true", "frozen_ple_dtype: bfloat16"])
+def test_text_training_rejects_ple_options(setting, monkeypatch, tmp_path):
+    """Reject VLM-only PLE options through the plain training YAML parser."""
+    from veomni.arguments import parse_args
+    from veomni.arguments.arguments_types import TrainingArguments
+
+    config = tmp_path / "text.yaml"
+    config.write_text(setting + "\n")
+    monkeypatch.setattr(sys, "argv", ["test", str(config)])
+    with pytest.raises(ValueError, match="Invalid configuration keys"):
+        parse_args(TrainingArguments)
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
+def test_dtensor_cast_preserves_local_shard_and_metadata(dtype, tmp_path):
+    """Preserve DTensor layout, local values, identity, and ExtraParallel metadata."""
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1)
+    try:
+        with torch.device("cpu"):
+            model = _qwen4_model()
+            mesh = init_device_mesh("cpu", (1,))
+            embedding = model.ple.ple_embedding.ngram_embedding["shard_0"]
+            source_dtype = torch.float32 if dtype == "bfloat16" else torch.bfloat16
+            values = torch.arange(8, dtype=source_dtype).reshape(4, 2) / 8
+            param = nn.Parameter(distribute_tensor(values, mesh, [Shard(0)]), requires_grad=False)
+            param.spec_info = SimpleNamespace(para_name="ple")
+            metadata = param.spec_info
+            embedding.weight = param
+            placements = param.placements
+
+            prepare_ple_storage(model, dtype, expected_device="cpu")
+
+            assert embedding.weight is param
+            assert not param.requires_grad
+            assert param.dtype == getattr(torch, dtype)
+            assert param.to_local().dtype == getattr(torch, dtype)
+            assert param.placements == placements
+            assert param.device_mesh == mesh
+            assert param.spec_info is metadata
+            torch.testing.assert_close(param.to_local(), values.to(getattr(torch, dtype)), rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()

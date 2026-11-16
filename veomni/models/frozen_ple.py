@@ -33,6 +33,8 @@ def prepare_ple_storage(model: torch.nn.Module, dtype: str | None, expected_devi
             # DTensor .data assignment changes wrapper dtype but leaves its
             # local shard unchanged. Swap the complete tensor implementation.
             converted = torch.nn.Parameter(param.to(dtype=target), requires_grad=param.requires_grad)
+            if hasattr(param, "spec_info"):
+                converted.spec_info = param.spec_info
             torch.utils.swap_tensors(param, converted)
 
 

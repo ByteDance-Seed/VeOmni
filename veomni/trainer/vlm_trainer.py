@@ -75,6 +75,34 @@ class VLMTrainingArguments(TrainingArguments):
         metadata={"help": "Maximum learning rate for vit parameters."},
     )
 
+    freeze_ple_embeddings: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Freeze Qwen4-Exp PLE n-gram embedding tables. The forward lookup still "
+                "reads them, but they are excluded from the optimizer and Adam states."
+            )
+        },
+    )
+    frozen_ple_dtype: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Training-time dtype for frozen PLE tables: float32 or bfloat16. Requires freeze_ple_embeddings=true."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        """Validate VLM freeze settings and initialize inherited training options."""
+        if not isinstance(self.freeze_ple_embeddings, bool):
+            raise ValueError("freeze_ple_embeddings must be a boolean (true or false).")
+        if self.frozen_ple_dtype is not None and (
+            not self.freeze_ple_embeddings or self.frozen_ple_dtype not in ("float32", "bfloat16")
+        ):
+            raise ValueError("frozen_ple_dtype requires freeze_ple_embeddings and must be float32 or bfloat16")
+        super().__post_init__()
+
 
 @dataclass
 class VLMMDataArguments(DataArguments):

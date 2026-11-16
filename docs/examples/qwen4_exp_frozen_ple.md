@@ -1,9 +1,8 @@
 # Freeze Qwen4-Exp PLE embeddings
 
-To freeze the per-layer embedding (PLE) n-gram tables with the VLM SFT entry
-point (`tasks/train_vlm.py`), merge this YAML fragment into your Qwen4-Exp
-training configuration. This option is implemented by `VLMModelRuntime`;
-other model runtimes do not apply it.
+Use these VLM-only options with `tasks/train_vlm.py` to freeze Qwen4-Exp
+per-layer embedding (PLE) n-gram tables. The plain-text training entry point
+rejects these options as unknown fields.
 
 ```yaml
 train:
@@ -11,7 +10,8 @@ train:
   frozen_ple_dtype: bfloat16
 ```
 
-`train.freeze_ple_embeddings` defaults to `false`. It applies only to models
+`train.freeze_ple_embeddings` defaults to `false` and accepts YAML booleans
+(`true` or `false`), not quoted strings. It applies only to models
 with `model_type: qwen4_exp` that have
 `ple.ple_embedding.ngram_embedding.shard_<n>.weight` parameters. The forward
 pass still looks up values in these tables. Freezing disables gradients for
@@ -28,18 +28,15 @@ keep the dtype they have after model parallelization.
 - **CPU parameter offload.** Each rank's frozen PLE table shards must reside
   on the training device when VeOmni checks their placement. Offloading
   these shards to CPU fails that check.
-- **DDP.** The current implementation does not support `fsdp_mode: ddp`
-  with `freeze_ple_embeddings: true`; training and checkpoint restore with
-  this combination have not been validated.
-  `fsdp_mode` defaults to `fsdp2`, which is also the setting in the Qwen4-Exp
-  training example.
+- **DDP.** Qwen4-Exp configurations with ExtraParallel require
+  `fsdp_mode: fsdp2`, the default and the setting in the Qwen4-Exp example.
+  DDP does not apply the required sharding plan, independently of PLE freezing.
 
 ## Resume from a checkpoint
 
-- **Frozen tables.** VeOmni freezes the tables before model parallelization and checkpoint restore.
-  The requested table dtype is applied after parallelization and before optimizer
-  construction. Loading weights into the tables preserves their configured training dtype and
-  frozen status.
+- **Frozen tables.** Freezing happens before parallelization; the requested dtype
+  is applied afterwards, before optimizer construction. Checkpoint loading preserves
+  the tables' configured dtype and frozen status.
 - **Optimizer state.** If the PLE tables were trainable when the checkpoint
   was saved, the saved optimizer parameter groups may include them.
   Resuming with `freeze_ple_embeddings: true` excludes them from the current
