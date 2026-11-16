@@ -1717,6 +1717,10 @@ class DeepseekV4MLP(nn.Module):
 class DeepseekV4Experts(nn.Module):
     """Collection of expert weights stored as 3D tensors."""
 
+    # ``layer_idx`` defaults to 0 because the site only selects which row is bound,
+    # never the arithmetic: a caller that constructs this directly for a shape or a
+    # forward check gets a working module at ``layers.0.experts``. Every model-side
+    # construction passes the real index -- ``DeepseekV4SparseMoeBlock`` always has it.
     def __init__(self, config, layer_idx: int = 0):
         super().__init__()
         self.layer_idx = layer_idx

@@ -1605,7 +1605,7 @@
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
          self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-@@ -973,52 +1649,130 @@
+@@ -973,52 +1649,134 @@
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
          self.act_fn = ACT2FN[config.hidden_act]
          self.limit = config.swiglu_limit
@@ -1662,6 +1662,10 @@
      """Collection of expert weights stored as 3D tensors."""
 
 -    def __init__(self, config: DeepseekV4Config):
++    # ``layer_idx`` defaults to 0 because the site only selects which row is bound,
++    # never the arithmetic: a caller that constructs this directly for a shape or a
++    # forward check gets a working module at ``layers.0.experts``. Every model-side
++    # construction passes the real index -- ``DeepseekV4SparseMoeBlock`` always has it.
 +    def __init__(self, config, layer_idx: int = 0):
          super().__init__()
 +        self.layer_idx = layer_idx
@@ -1766,7 +1770,7 @@
 
 
  class DeepseekV4TopKRouter(nn.Module):
-@@ -1032,14 +1786,28 @@
+@@ -1032,14 +1790,28 @@
          self.routed_scaling_factor = config.routed_scaling_factor
          self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts))
 
@@ -1798,7 +1802,7 @@
 
 
  class DeepseekV4HashRouter(nn.Module):
-@@ -1062,24 +1830,55 @@
+@@ -1062,24 +1834,55 @@
          self.tid2eid = nn.Buffer(torch.zeros(config.vocab_size, self.top_k, dtype=torch.long), persistent=True)
 
      def forward(
@@ -1860,7 +1864,7 @@
 
      def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
          batch, seq_len, hidden_dim = hidden_states.shape
-@@ -1093,6 +1892,12 @@
+@@ -1093,6 +1896,12 @@
          return routed + self.shared_experts(residual)
 
 
@@ -1873,7 +1877,7 @@
  class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
      r"""DeepSeek-V4 decoder block (paper §2). Differs from a classic residual block in
      two places:
-@@ -1107,41 +1912,51 @@
+@@ -1107,41 +1916,51 @@
 
      """
 
@@ -1944,7 +1948,7 @@
 
 
  @auto_docstring
-@@ -1252,9 +2067,27 @@
+@@ -1252,9 +2071,27 @@
                  init.copy_(getattr(module, f"{layer_type}_original_inv_freq"), curr_inv_freq)
 
 
@@ -1973,7 +1977,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -1263,10 +2096,23 @@
+@@ -1263,10 +2100,23 @@
          self.layers = nn.ModuleList(
              [DeepseekV4DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
          )
@@ -1998,7 +2002,7 @@
 
          # Initialize weights and apply final processing
          self.post_init()
-@@ -1283,38 +2129,154 @@
+@@ -1283,38 +2133,154 @@
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -2163,7 +2167,7 @@
                  hidden_states,
                  position_embeddings=position_embeddings,
                  position_ids=position_ids,
-@@ -1323,9 +2285,90 @@
+@@ -1323,9 +2289,90 @@
                  past_key_values=past_key_values,
                  **kwargs,
              )
@@ -2255,7 +2259,7 @@
 
 
  def load_balancing_loss_func(
-@@ -1397,6 +2440,12 @@
+@@ -1397,6 +2444,12 @@
      return overall_loss * num_experts
 
 
@@ -2268,7 +2272,7 @@
  @auto_docstring
  class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -1404,6 +2453,9 @@
+@@ -1404,6 +2457,9 @@
      _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
      _fsdp_plan = {"lm_head": "keep_full_weight"}
 
@@ -2278,7 +2282,7 @@
      def __init__(self, config):
          super().__init__(config)
          self.model = DeepseekV4Model(config)
-@@ -1412,54 +2464,51 @@
+@@ -1412,54 +2468,51 @@
          self.router_aux_loss_coef = config.router_aux_loss_coef
          self.num_experts = config.num_local_experts
          self.num_experts_per_tok = config.num_experts_per_tok
@@ -2367,7 +2371,7 @@
              input_ids=input_ids,
              attention_mask=attention_mask,
              position_ids=position_ids,
-@@ -1471,26 +2520,168 @@
+@@ -1471,26 +2524,168 @@
          )
 
          hidden_states = outputs.last_hidden_state
@@ -2550,7 +2554,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1498,7 +2689,22 @@
+@@ -1498,7 +2693,22 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

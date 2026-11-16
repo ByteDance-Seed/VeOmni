@@ -1815,9 +1815,10 @@ class OpsImplementationConfig:
     def _apply_deprecated_aliases(self) -> None:
         """Resolve renamed implementation values and reject values that were never implementations.
 
-        The rename tables are keyed by old *names*, so a per-site selection is
-        skipped: it carries names inside its blocks, and a deprecated spelling there
-        is a config the author wrote against the current docs.
+        Both forms are rewritten: a bare string, and the ``name`` of a per-site
+        selection. Leaving the mapping form out would make the same deprecated
+        value work as a string and fail as ``name:``, which is the kind of
+        inconsistency that only shows up after someone copies a config.
         """
         for field_name, messages in _REJECTED_IMPLEMENTATION_VALUES.items():
             value = getattr(self, field_name)
@@ -1829,6 +1830,11 @@ class OpsImplementationConfig:
         for field_name, aliases in _DEPRECATED_IMPLEMENTATION_ALIASES.items():
             value = getattr(self, field_name)
             if isinstance(value, OpsSelection):
+                for holder in (value, *value.overrides):
+                    renamed = aliases.get(holder.name)
+                    if renamed is not None:
+                        self._warn_deprecated(field_name, holder.name, renamed)
+                        holder.name = renamed
                 continue
             if value in aliases:
                 self._warn_deprecated(field_name, value, aliases[value])

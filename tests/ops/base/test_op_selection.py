@@ -220,3 +220,43 @@ def test_the_config_accepts_both_shapes_and_round_trips_the_mapping_one():
 
     reloaded = OpsImplementationConfig(**configured.to_dict())
     assert reloaded.linear_implementation.all_impls() == configured.linear_implementation.all_impls()
+
+
+def test_a_deprecated_name_is_rewritten_in_every_form():
+    """The rename tables must not apply to bare strings only.
+
+    A value that works as ``moe_implementation: fused_mlu_triton`` and fails as
+    ``moe_implementation: {name: fused_mlu_triton}`` is the kind of asymmetry
+    nobody finds until they copy a config.
+    """
+    plain = OpsImplementationConfig(moe_implementation="fused_mlu_triton")
+    assert plain.moe_implementation == "fused_triton"
+
+    named = OpsImplementationConfig(moe_implementation={"name": "fused_mlu_triton"})
+    assert named.moe_implementation.name == "fused_triton"
+
+    overridden = OpsImplementationConfig(
+        moe_implementation={
+            "name": "eager",
+            "overrides": [{"site": r"layers\.\d+\.experts", "name": "fused_mlu_triton"}],
+        }
+    )
+    assert overridden.moe_implementation.overrides[0].name == "fused_triton"
+
+
+def test_hardware_validation_covers_every_row_an_override_can_produce():
+    """A rule that never runs on this host is still checked.
+
+    Config-time validation has no site, so it has to clear the default *and* every
+    override. Checking only the default would let an NPU-only row sit in a rule
+    until the layer that matches it builds.
+    """
+    from veomni.utils.device import IS_NPU_AVAILABLE
+
+    if IS_NPU_AVAILABLE:
+        pytest.skip("this case asserts the non-NPU refusal")
+
+    with pytest.raises(ValueError, match="requires Ascend NPU"):
+        OpsImplementationConfig(
+            moe_implementation={"name": "eager", "overrides": [{"site": r"layers\.0\.experts", "name": "fused_npu"}]}
+        )
