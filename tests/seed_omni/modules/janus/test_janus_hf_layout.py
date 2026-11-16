@@ -127,6 +127,7 @@ def _write_hf_checkpoint(
     tied: bool = False,
     store_tied_head: bool = False,
     nested_tied: bool | None = None,
+    serialization: str = "safetensors",
 ) -> dict[str, torch.Tensor]:
     """Write a tiny upstream Janus root.
 
@@ -134,6 +135,10 @@ def _write_hf_checkpoint(
     shape :meth:`JanusForConditionalGeneration.tie_weights` reads. HF still lists
     ``lm_head.weight`` in ``state_dict()`` (it aliases the embedding), but a real
     tied export omits the file, so ``store_tied_head=False`` drops it.
+
+    ``serialization="bin"`` writes a pickle checkpoint instead, so the layout is
+    held to what ``from_pretrained`` itself accepts rather than a safetensors-only
+    subset of it.
     """
     from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
@@ -145,6 +150,10 @@ def _write_hf_checkpoint(
     tensors = _source_tensors(config)
     if tied and not store_tied_head:
         tensors.pop("lm_head.weight", None)
+    if serialization == "bin":
+        assert not sharded, "the bin case only needs the single-file shape"
+        torch.save(tensors, root / "pytorch_model.bin")
+        return tensors
     if not sharded:
         save_file(tensors, root / "model.safetensors", metadata={"format": "pt"})
         return tensors
@@ -222,8 +231,7 @@ def test_build_config_maps_the_upstream_config_per_module():
     """Each module's config comes from the upstream one, including the tie flag.
 
     ``post_process_after_weight_loading`` ANDs the outer and nested flags, so the
-    layout does too: guessing from one loses a real ``lm_head.weight`` in one
-    direction and drops a genuinely tied embedding in the other.
+    layout does too — the same predicate the module then acts on.
     """
     config = _janus_config()
     modules = JANUS_HF_LAYOUT.modules
@@ -238,11 +246,17 @@ def test_build_config_maps_the_upstream_config_per_module():
     text_encoder = modules[TEXT_ENCODER]
     assert text_encoder.build_config(_janus_config(tied=True)).tie_word_embeddings is True
     assert text_encoder.build_config(_janus_config(tied=False)).tie_word_embeddings is False
-    # A stale top-level flag beside an untied text_config means the file stores a
-    # head: build it rather than substituting the embedding.
+    # Outer ``True`` beside an untied ``text_config`` resolves to untied — the
+    # AND the framework applies.
     disagreeing = _janus_config(tied=False)
     disagreeing.tie_word_embeddings = True
     assert text_encoder.build_config(disagreeing).tie_word_embeddings is False
+    # The headless modules have no wte / lm_head, so they must say so rather than
+    # leave the attribute absent: the shared post-load tie reads it and would
+    # raise from ``get_output_embeddings()`` on a truthy value.
+    for name in (SIGLIP, VQVAE):
+        built = modules[name].build_config(config)
+        assert built.tie_word_embeddings is False, name
 
 
 def test_the_backbone_never_ties_itself():
@@ -264,13 +278,11 @@ def test_the_backbone_never_ties_itself():
         (False, None, False, True, False),
         # A genuinely tied export omits lm_head.weight.
         (True, None, False, False, False),
-        # Tied config and the duplicate stored with *equal* values: transformers
-        # keeps the tie there, so the head must stay tied rather than become an
-        # independent copy that SFT would drift away from the embedding.
+        # Tied config and the duplicate stored with *equal* values: the flag is
+        # what ties, so HF keeps the shared parameter and so do we.
         (True, None, True, False, True),
-        # Equal stored tensors under an explicitly untied config: HF keeps two
-        # parameters there, so the layout does too — the pair starts equal but the
-        # source model trains them apart.
+        # Equal stored tensors under an explicitly untied config: two parameters,
+        # because equal values are not a tie. The source model trains them apart.
         (False, None, False, True, True),
         # Outer ``True`` beside an untied ``text_config`` resolves to untied: the
         # framework ANDs both flags, so the module must keep its own head.
@@ -284,15 +296,18 @@ def test_the_backbone_never_ties_itself():
         "outer-tied-nested-untied-with-head",
     ],
 )
-def test_the_layout_decides_tying_from_the_config_and_the_stored_weights(
+def test_tying_follows_the_config_not_the_stored_values(
     tmp_path, tied, nested_tied, store_tied_head, expect_head, equal_weights
 ):
-    """A tie needs the config's permission and weights that support it.
+    """The flag decides, exactly as it does in ``post_process_after_weight_loading``.
 
-    The backbone used to crash outright on a tied checkpoint (its input embedding
-    is ``nn.Identity``, so the shared post-load tie did ``_parameters["weight"]``
-    on it), and reading only one of the two signals lost a real head or coupled a
-    tied pair. This pins every combination end to end.
+    Value-equality is not consulted: a config that says untied keeps two
+    parameters even when the file stores identical tensors, and a config that
+    says tied keeps the shared parameter even when the duplicate was written
+    out. The backbone used to crash outright on a tied checkpoint (its input
+    embedding is ``nn.Identity``, so the shared post-load tie did
+    ``_parameters["weight"]`` on it), and the headless modules had no flag at
+    all, which would have raised on a truthy value from a checkpoint config.
     """
     root = tmp_path / "Janus-tiny"
     tensors = _write_hf_checkpoint(root, tied=tied, nested_tied=nested_tied, store_tied_head=store_tied_head)
@@ -360,6 +375,33 @@ def test_omni_model_loads_every_module_weight_from_the_hf_root(hf_root):
     # The backbone owns no wte / lm_head; the text encoder does.
     assert not any("embed_tokens" in key for key in model.modules_dict[LLAMA].state_dict())
     assert "infer_gen" in model.config.generation_graphs
+
+
+def test_a_bin_root_loads_the_way_from_pretrained_does(tmp_path):
+    """`.bin` is an HF-supported serialization, so the layout must load it too.
+
+    The loader resolves ``pytorch_model.bin`` / ``pytorch_model.bin.index.json``
+    in ``_resolve_state_dict_iterators``; a layout that inspected the weight
+    files itself and refused a bin root restricted the model to a subset of what
+    ``from_pretrained`` accepts. Every module weight must come through, including
+    the untied head.
+    """
+    root = tmp_path / "Janus-bin"
+    tensors = _write_hf_checkpoint(root, serialization="bin")
+    assert (root / "pytorch_model.bin").is_file()
+
+    model = OmniModel.from_pretrained(str(root), dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager")
+    layout = model.config._hf_source.layout
+
+    compared = set()
+    for name, module in model.modules_dict.items():
+        for key, value in module.state_dict().items():
+            source_key = layout.source_key(name, key)
+            if source_key in tensors:
+                assert torch.equal(value, tensors[source_key]), (name, key)
+                compared.add(source_key)
+    assert compared == set(tensors)
+    assert model.modules_dict[TEXT_ENCODER].lm_head is not None
 
 
 @pytest.mark.parametrize("sharded", [False, True], ids=["single_file", "sharded"])
