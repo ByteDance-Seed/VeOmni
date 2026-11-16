@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from veomni.distributed.parallel_state import get_parallel_state
+from veomni.lora.layers import is_lora_linear
 
 from ...module_modeling_base import PretrainedOmniModule
 from ..core import (
@@ -69,6 +70,12 @@ class Cosmos3FlowConnector(PretrainedOmniModule):
         it, as the reference does; a packed one embeds one timestep per row.
         """
         del kwargs
+        adapted = [name for name, module in self.named_modules() if is_lora_linear(module)]
+        if adapted:
+            raise ValueError(
+                f"cosmos3_flow_connector is trained in full and takes no LoRA adapters; the LoRA config matched {adapted}. "
+                "Narrow lora_config.target_modules to the other modules."
+            )
         noisy, targets, masks, timesteps = self.sample_flow(latents)
         rows = [patchify_latent(latent, self.patch_size) for latent in noisy]
         hidden = self.proj_in(torch.cat(rows, dim=0).to(self.proj_in.weight.dtype))
@@ -144,9 +151,11 @@ class Cosmos3FlowConnector(PretrainedOmniModule):
         sigmas = self.train_time_sampler(count, generator=generator, shift=shift).to(torch.float32)
         noisy, targets, masks, timesteps = [], [], [], []
         for index, clean in enumerate(latents):
+            # fp32 from here to the ``proj_in`` cast, as the reference: in the latents' bf16,
+            # ``x_t`` would round sigma (0.999 -> 1.0) away from the timestep the model is told.
+            clean = clean.float()
             sigma = sigmas[index : index + 1]
-            noise = torch.randn(clean.shape, generator=generator, dtype=torch.float32)
-            noise = noise.to(device=clean.device, dtype=clean.dtype)
+            noise = torch.randn(clean.shape, generator=generator, dtype=torch.float32).to(clean.device)
             # Drawn after the noise, so the noise stream does not depend on the mixture.
             mask = self._sample_condition_mask(clean, generator)
             effective_sigma = sigma.to(device=noise.device).reshape(1, 1, 1) * (

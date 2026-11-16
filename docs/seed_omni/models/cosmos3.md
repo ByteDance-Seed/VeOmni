@@ -102,7 +102,7 @@ Where each step of the data pipeline happens:
 |---|---|---|
 | CFG dropout: one prompt in ten becomes empty | dataset preprocessor, a per-sample draw | `mm_configs.cfg_dropout_rate`, `mm_configs.cfg_dropout_seed` |
 | Decode every source frame | SeedOmni video loader | `mm_configs.fps: null`, no `max_frames` |
-| Keep `duration * sample_fps` frames, aligned to `4k + 1` within `[min_frames, max_frames]`, as a fixed-stride prefix; pad short clips with the last frame | `cosmos3_vae` preprocessor | `cosmos3_vae.model_config` |
+| Keep `duration * sample_fps` frames, aligned to `4k + 1` within `[min_frames, max_frames]`, as a fixed-stride prefix; pad short clips with the last frame. The mRoPE gets the kept frames' rate, source fps / stride | `cosmos3_vae` preprocessor | `cosmos3_vae.model_config` |
 | Map to `[-1, 1]` and resize to a multiple of 32 (VAE stride 16 x patch 2) | `cosmos3_vae` preprocessor | — |
 | Chat template with the generation prompt, truncate to 2048, append `[eos, <\|vision_start\|>]` | `cosmos3_text_encoder` preprocessor | `max_sequence_length` |
 
@@ -149,7 +149,8 @@ resumed run. The same rows are dropped in every epoch; the recipes train one. Th
 which is why `modules_offline_embedding.yaml` repeats them.
 
 The recipes keep `mixed_precision.enable: false`: weights are bf16 end to end,
-like the reference's, and the sigma, timestep and target tensors the connector
+like the reference's. The connector noises in fp32 (the bf16 VAE latents are
+promoted first) and casts only at `proj_in`; the sigma, timestep and target tensors it
 passes between its nodes stay fp32 because nothing casts the graph inputs. With
 mixed precision on, FSDP would cast them to `param_dtype`.
 

@@ -364,6 +364,28 @@ def test_sampling_stream_resumes_from_its_state():
             torch.testing.assert_close(x, y, rtol=0, atol=0)
 
 
+def test_bf16_latents_are_noised_in_fp32():
+    """With the shipped bf16 VAE, noising in bf16 would round sigma (0.999 -> 1.0) away from the timestep."""
+    connector = _modules(accelerated=False)["cosmos3_flow_connector"]
+    latents = [sample["latent"] for sample in _samples()]
+    state = connector.rng_state_dict()
+    expected = connector.sample_flow([latent.bfloat16().float() for latent in latents])
+    connector.load_rng_state_dict(state)
+    noisy, targets, masks, timesteps = connector.sample_flow([latent.bfloat16() for latent in latents])
+    assert all(x.dtype == torch.float32 for x in noisy + targets)
+    for got, want in zip(noisy + targets, expected[0] + expected[1]):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+def test_connector_refuses_lora_adapters():
+    from veomni.lora.layers import LoraLinear
+
+    connector = _modules(accelerated=False)["cosmos3_flow_connector"]
+    connector.proj_in = LoraLinear(connector.proj_in, "default", r=2, lora_alpha=2)
+    with pytest.raises(ValueError, match="takes no LoRA adapters"):
+        connector.embed_latent([sample["latent"] for sample in _samples()])
+
+
 def test_gradient_checkpointing_keeps_the_gradients():
     generator = torch.Generator().manual_seed(3)
     und, gen = torch.randn(5, 64, generator=generator), torch.randn(12, 64, generator=generator)
@@ -507,8 +529,8 @@ def test_vae_preprocessor_cuts_resizes_and_prices_the_clip():
     assert torch.equal(long_clip.value, expected)
     # Priced on the frames before the resize: 2 latent frames of ceil(4/2) x ceil(5/2) patches, plus three markers.
     assert long_clip.meta[_OMNI_TOKEN_LEN] == 2 * 2 * 3 + 3
-    # The mRoPE spaces latent frames by the source clip's rate.
-    assert long_clip.meta[FPS_KEY] == 30.0
+    # The mRoPE spaces latent frames by the kept frames' rate: 30 fps at stride 2 is 15 fps.
+    assert long_clip.meta[FPS_KEY] == 15.0
     # 2 frames pad up to 5 by repeating the last one.
     assert short_clip.value.shape[1] == 5
     torch.testing.assert_close(short_clip.value[:, 4], short_clip.value[:, 1])

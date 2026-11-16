@@ -104,7 +104,10 @@ class Cosmos3VaePreprocessor(ModulePreprocessorBase):
             item.meta[_OMNI_TOKEN_LEN] = self.token_count(tuple(frames.shape))
 
     def select_frames(self, item: ConversationItem) -> tuple[torch.Tensor, Optional[float]]:
-        """The kept ``(T, C, H, W)`` frames and the source clip's rate, which the mRoPE spaces them by."""
+        """The kept ``(T, C, H, W)`` frames and their rate (source fps / stride), which the mRoPE spaces them by.
+
+        As cosmos-framework's SFT reader: ``fps = original_fps / temporal_interval``.
+        """
         frames = item.value.video
         metadata = item.meta.get(VIDEO_METADATA_KEY)
         if metadata is None:
@@ -128,7 +131,8 @@ class Cosmos3VaePreprocessor(ModulePreprocessorBase):
         kept = frames[[decoded[index] for index in indices]]
         if pad_count:
             kept = torch.cat([kept, kept[-1:].expand(pad_count, -1, -1, -1)], dim=0)
-        return kept, float(metadata.fps)
+        stride = indices[1] - indices[0] if len(indices) > 1 else 1
+        return kept, float(metadata.fps) / stride
 
     def to_vae_input(self, frames: torch.Tensor) -> torch.Tensor:
         """``(T, C, H, W)`` ``uint8`` -> ``(3, T, H', W')`` ``float32`` in ``[-1, 1]`` on the latent-patch grid."""
