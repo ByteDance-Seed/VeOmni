@@ -74,40 +74,23 @@ def check_model_build_prerequisites(config: PretrainedConfig) -> None:
     ``DeepseekV4Config.validate_build_prerequisites`` is the only implementation
     today. It refuses a Lightning Indexer KL objective configured without the TileLang
     indexer and attention it is defined in terms of -- a disagreement between a model
-    field and two op selections, which no single dataclass can see.
+    field and two op selections, which no single dataclass can see -- and it refuses
+    an Ascend context-parallel run whose DSA operators are not the eager ones, a
+    disagreement between two op selections and the parallel state.
     """
     validate = getattr(config, "validate_build_prerequisites", None)
     if callable(validate):
         validate()
 
 
-#: DSA implementations that understand CP's geometry. The CANN adapters do not:
-#: sparse attention requires one KV row per query row (CP keeps the query local
-#: and the KV global, and passes a nonzero ``query_offset``), and the indexer
-#: derives visibility from the query row (CP supplies explicit ``cu_seqlen``
-#: ranges over the global sequence). Both reject the first compressed layer.
-_NPU_CP_DSA_IMPLEMENTATIONS = frozenset({"eager"})
-
-
-def _check_deepseek_v4_npu_dsa_ops(config: PretrainedConfig) -> None:
-    """Refuse an Ascend CP run whose DSA operators cannot serve CP's geometry."""
-    ops_config = getattr(config, "ops_config", None)
-    for field in ("dsa_indexer_implementation", "dsa_attention_implementation"):
-        implementation = getattr(ops_config, field, None)
-        if implementation is not None and implementation not in _NPU_CP_DSA_IMPLEMENTATIONS:
-            raise NotImplementedError(
-                f"Context parallelism on Ascend/NPU requires {field}='eager'; got {implementation!r}. "
-                "The CANN DeepSeek-V4 sparse attention rejects CP's local-query/global-KV geometry and "
-                "the CANN indexer rejects CP's explicit cu_seqlen ranges, so training fails in the first "
-                "compressed layer. Set both DSA operators to 'eager' in configs/text/deepseek_v4_npu.yaml, "
-                "or set cp_size=1."
-            )
-
-
 def check_context_parallel_supported(config: PretrainedConfig) -> None:
     """Raise unless this model type implements context parallelism.
 
     A no-op when context parallelism is off, which is every other configuration.
+    Operator selection is deliberately not decided here: whether a model's ops can
+    serve the parallel state is that model config's business, and
+    ``check_model_build_prerequisites`` -- called right after this one -- reaches
+    ``validate_build_prerequisites`` for it.
     """
     if not is_parallel_state_initialized():
         return
@@ -115,15 +98,12 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if not get_parallel_state().cp_enabled:
         return
 
-    # deepseek_v4's context parallelism is validated on Ascend, and only with the
-    # CP-aware DSA operators; every other model stays GPU-only.
-    if IS_NPU_AVAILABLE:
-        if getattr(config, "model_type", None) != "deepseek_v4":
-            raise NotImplementedError(
-                "Context parallelism is GPU-only in this release except for deepseek_v4; "
-                "set cp_size=1 on Ascend/NPU runs."
-            )
-        _check_deepseek_v4_npu_dsa_ops(config)
+    # deepseek_v4's context parallelism is validated on Ascend; every other model
+    # stays GPU-only.
+    if IS_NPU_AVAILABLE and getattr(config, "model_type", None) != "deepseek_v4":
+        raise NotImplementedError(
+            "Context parallelism is GPU-only in this release except for deepseek_v4; set cp_size=1 on Ascend/NPU runs."
+        )
 
     from .seed_omni.modules.module_configuration_base import OmniModuleConfig
 

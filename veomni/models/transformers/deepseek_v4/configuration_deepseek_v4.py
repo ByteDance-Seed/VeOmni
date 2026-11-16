@@ -19,8 +19,10 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
     DeepseekV4Config as _DeepseekV4Config,
 )
 
+from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
 from veomni.models.configuration_base import VeOmniPretrainedConfig
 from veomni.utils import logging
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 logger = logging.get_logger(__name__)
@@ -174,9 +176,39 @@ class DeepseekV4Config(VeOmniPretrainedConfig, _DeepseekV4Config):
                         f"dspark_target_layer_ids contains {layer_idx!r}, outside [0, {self.num_hidden_layers})."
                     )
 
+    def _validate_npu_cp_dsa_ops(self) -> None:
+        """Refuse an Ascend context-parallel run whose DSA operators cannot serve CP's geometry.
+
+        The CANN adapters are written against one KV row per query row: sparse
+        attention keeps the query local and the KV global and passes a nonzero
+        ``query_offset``, and the indexer derives visibility from the query row
+        where CP supplies explicit ``cu_seqlen`` ranges over the global sequence.
+        Both reject the first compressed layer, so only the eager operators are
+        admitted here.
+        """
+        if not IS_NPU_AVAILABLE:
+            return
+        if not is_parallel_state_initialized() or not get_parallel_state().cp_enabled:
+            return
+
+        ops_config = self.ops_config
+        for field in ("dsa_indexer_implementation", "dsa_attention_implementation"):
+            # ``ops_config`` resolves the dataclass defaults, so an unset field
+            # reads back as its default rather than ``None``.
+            implementation = getattr(ops_config, field)
+            if implementation != "eager":
+                raise NotImplementedError(
+                    f"Context parallelism on Ascend/NPU requires {field}='eager'; got {implementation!r}. "
+                    "The CANN DeepSeek-V4 sparse attention rejects CP's local-query/global-KV geometry and "
+                    "the CANN indexer rejects CP's explicit cu_seqlen ranges, so training fails in the first "
+                    "compressed layer. Set both DSA operators to 'eager' in configs/text/deepseek_v4_npu.yaml, "
+                    "or set cp_size=1."
+                )
+
     def validate_build_prerequisites(self) -> None:
-        """Refuse an invalid DSpark MTP or Lightning Indexer KL configuration before weight loading."""
+        """Refuse an invalid DSpark MTP, Lightning Indexer KL or NPU CP configuration before weight loading."""
         self._validate_mtp_prerequisites()
+        self._validate_npu_cp_dsa_ops()
 
         enabled = self.dsa_indexer_loss
         if not isinstance(enabled, bool):

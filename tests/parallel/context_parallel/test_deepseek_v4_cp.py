@@ -29,7 +29,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from scripts.ci.accelerator.launch_plan import (
-    SCHEDULED_BACKENDS,
     LaunchSpec,
     from_parameter,
     runner_device_count,
@@ -44,9 +43,6 @@ from veomni.utils.device import (
 )
 
 
-_PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
-
-
 def _modeling():
     """The generated DeepSeek-V4 module for the backend this worker runs on.
 
@@ -58,6 +54,11 @@ def _modeling():
     return importlib.import_module(
         f"veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_{suffix}"
     )
+
+
+# The in-process tests patch the parallel-state accessor of the module they build
+# layers from, so this has to name the same backend the workers do.
+_PATCHED_MODULE = _modeling().__name__
 
 
 def _load_dsv4_toy_config(**ops_overrides):
@@ -78,12 +79,12 @@ def _accelerator_device_count() -> int:
 
     Context parallelism is admitted on CUDA and, with the eager DSA operators,
     on Ascend, and these workers build the backend's patched module directly, so
-    a plain device count is the right eligibility test. A CPU-only host reports
-    0 and skips, as does a backend the scheduler does not model -- asking for
-    its capabilities would raise, and this helper feeds a skip decorator, so it
-    runs during collection.
+    a plain device count is the right eligibility test. A host on any other
+    backend reports 0 and skips -- asking the scheduler for its capabilities
+    would raise, and this helper feeds a skip decorator, so it runs during
+    collection.
     """
-    if get_device_type() not in SCHEDULED_BACKENDS:
+    if get_device_type() not in ("cuda", "npu"):
         return 0
     return runner_device_count()
 

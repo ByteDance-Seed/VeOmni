@@ -30,48 +30,34 @@ is stubbed.
 
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import yaml
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed import parallel_state as parallel_state_module
 from veomni.models import auto as auto_module
 from veomni.models.auto import build_config, check_context_parallel_supported
-from veomni.utils import device as device_module
+from veomni.models.transformers.deepseek_v4 import configuration_deepseek_v4 as configuration_module
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
-TEXT_CONFIGS = Path(__file__).parents[3] / "configs" / "text"
-
 
 def _enable_npu_cp(monkeypatch):
-    monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
-    monkeypatch.setattr(
-        auto_module,
-        "get_parallel_state",
-        lambda: SimpleNamespace(cp_enabled=True),
-    )
-    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", True)
-    # The NPU config selects NPU-only kernels, so ops validation has to see an
-    # NPU host before it will build the config object on CPU.
-    monkeypatch.setattr(device_module, "IS_NPU_AVAILABLE", True)
-
-
-def _shipped_ops_implementation(name: str) -> dict:
-    return yaml.safe_load((TEXT_CONFIGS / name).read_text())["model"]["ops_implementation"]
+    # The model-type gate reads these from ``auto``; the DSA-vs-parallel-state
+    # check lives on the model config and reads its own copies of the same three
+    # names, so both modules are patched.
+    for module in (auto_module, configuration_module):
+        monkeypatch.setattr(module, "is_parallel_state_initialized", lambda: True)
+        monkeypatch.setattr(module, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True))
+        monkeypatch.setattr(module, "IS_NPU_AVAILABLE", True)
 
 
 def _npu_ops_for_cp() -> dict:
-    # There is no dedicated CP config: a CP run is the shipped NPU config with
-    # both DSA operators switched to the only pair the gate admits on Ascend.
-    ops = _shipped_ops_implementation("deepseek_v4_npu.yaml")
-    ops["dsa_indexer_implementation"] = "eager"
-    ops["dsa_attention_implementation"] = "eager"
-    return ops
+    # Only the pair the gate admits matters here; a real CP run is the shipped NPU
+    # config with these two fields switched to ``eager``.
+    return {"dsa_indexer_implementation": "eager", "dsa_attention_implementation": "eager"}
 
 
 def _dsv4_with_ops(ops_implementation: dict):
@@ -93,8 +79,7 @@ def test_gate_is_inert_when_no_parallel_state_was_installed(monkeypatch):
     check_context_parallel_supported(build_config("tests/toy_config/qwen3_toy"))
 
 
-@pytest.mark.parametrize("model_type", ["qwen4_exp"])
-def test_gate_rejects_context_parallel_on_npu(monkeypatch, model_type):
+def test_gate_rejects_context_parallel_on_npu(monkeypatch):
     monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(
         auto_module,
@@ -104,13 +89,15 @@ def test_gate_rejects_context_parallel_on_npu(monkeypatch, model_type):
     monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", True)
 
     with pytest.raises(NotImplementedError, match="GPU-only"):
-        check_context_parallel_supported(SimpleNamespace(model_type=model_type))
+        check_context_parallel_supported(SimpleNamespace(model_type="qwen4_exp"))
 
 
 def test_gate_allows_npu_dsv4_cp_with_eager_dsa_ops(monkeypatch):
     _enable_npu_cp(monkeypatch)
+    config = _dsv4_with_ops(_npu_ops_for_cp())
 
-    check_context_parallel_supported(_dsv4_with_ops(_npu_ops_for_cp()))
+    check_context_parallel_supported(config)
+    config.validate_build_prerequisites()
 
 
 @pytest.mark.parametrize("field", ["dsa_indexer_implementation", "dsa_attention_implementation"])
@@ -120,7 +107,7 @@ def test_gate_rejects_npu_dsv4_cp_with_a_non_cp_aware_dsa_operator(monkeypatch, 
     ops[field] = "cann"
 
     with pytest.raises(NotImplementedError, match=field):
-        check_context_parallel_supported(_dsv4_with_ops(ops))
+        _dsv4_with_ops(ops).validate_build_prerequisites()
 
 
 @pytest.mark.parametrize("model_type", ["deepseek_v4", "qwen4_exp"])

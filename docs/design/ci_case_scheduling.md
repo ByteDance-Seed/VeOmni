@@ -60,7 +60,7 @@ collected against the complete runner slice to catch such losses.
 
 `pytest.mark.skipif(device_count < N)` markers express eligibility,
 not exact resource reservations. For example,
-[the CP eligibility marker](../../tests/parallel/context_parallel/test_deepseek_v4_cp.py#L1194)
+[the CP eligibility marker](../../tests/parallel/context_parallel/test_deepseek_v4_cp.py#L1195)
 checks a two-device minimum but launches either two or four workers according
 to its parameter (two on NPU, where the four-rank topology is not run). The
 [launcher defaults](../../tests/tools/launch_utils.py#L149) and
