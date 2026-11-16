@@ -253,8 +253,9 @@ _POSITION_BIAS_SHARD_DIM_DESCRIPTION = (
 
 
 @config.override_method("DeepseekV4HCACompressor.__init__", description=_POSITION_BIAS_SHARD_DIM_DESCRIPTION)
-def deepseek_v4_hca_compressor_init_patched(self, config: "DeepseekV4Config") -> None:
+def deepseek_v4_hca_compressor_init_patched(self, config: "DeepseekV4Config", layer_idx: int = 0) -> None:
     nn.Module.__init__(self)
+    self.layer_idx = layer_idx
     self.compress_rate = config.compress_rates["heavily_compressed_attention"]
     self.head_dim = config.head_dim
     self.kv_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
@@ -264,12 +265,15 @@ def deepseek_v4_hca_compressor_init_patched(self, config: "DeepseekV4Config") ->
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
     self.position_bias._veomni_fsdp_shard_dim = 1
     self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
-    self.veomni_kv_round = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
+    self.veomni_kv_round = VeomniOp(
+        "kv_round", "deepseek_v4", config.ops_config.kv_round_implementation, site=f"layers.{layer_idx}.hca_kv"
+    )
 
 
 @config.override_method("DeepseekV4Indexer.__init__", description=_POSITION_BIAS_SHARD_DIM_DESCRIPTION)
-def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
+def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config", layer_idx: int = 0) -> None:
     nn.Module.__init__(self)
+    self.layer_idx = layer_idx
     self.compress_rate = config.compress_rates["compressed_sparse_attention"]
     self.num_heads = config.index_n_heads
     self.head_dim = config.index_head_dim
@@ -279,7 +283,9 @@ def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
     self.position_bias = nn.Parameter(torch.empty(self.compress_rate, 2 * self.head_dim))
     self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
     self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
-    self.veomni_q_b_proj = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
+    self.veomni_q_b_proj = VeomniOp(
+        "linear", "standard", config.ops_config.linear_implementation, site=f"layers.{layer_idx}.indexer_q_b_proj"
+    )
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
     self.scorer = DeepseekV4IndexerScorer(config)
     self.position_bias._veomni_fsdp_shard_dim = 1
@@ -289,12 +295,15 @@ def deepseek_v4_indexer_init_patched(self, config: "DeepseekV4Config") -> None:
         config.ops_config.dsa_indexer_implementation,
     )
     self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
-    self.veomni_kv_round = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
+    self.veomni_kv_round = VeomniOp(
+        "kv_round", "deepseek_v4", config.ops_config.kv_round_implementation, site=f"layers.{layer_idx}.indexer"
+    )
 
 
 @config.override_method("DeepseekV4CSACompressor.__init__", description=_POSITION_BIAS_SHARD_DIM_DESCRIPTION)
-def deepseek_v4_csa_compressor_init_patched(self, config: "DeepseekV4Config") -> None:
+def deepseek_v4_csa_compressor_init_patched(self, config: "DeepseekV4Config", layer_idx: int = 0) -> None:
     nn.Module.__init__(self)
+    self.layer_idx = layer_idx
     self.compress_rate = config.compress_rates["compressed_sparse_attention"]
     self.head_dim = config.head_dim
     self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
@@ -302,10 +311,12 @@ def deepseek_v4_csa_compressor_init_patched(self, config: "DeepseekV4Config") ->
     self.position_bias = nn.Parameter(torch.empty(self.compress_rate, 2 * self.head_dim))
     self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
     self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-    self.indexer = DeepseekV4Indexer(config)
+    self.indexer = DeepseekV4Indexer(config, layer_idx)
     self.position_bias._veomni_fsdp_shard_dim = 1
     self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
-    self.veomni_kv_round = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
+    self.veomni_kv_round = VeomniOp(
+        "kv_round", "deepseek_v4", config.ops_config.kv_round_implementation, site=f"layers.{layer_idx}.csa_kv"
+    )
 
 
 # ================================================================

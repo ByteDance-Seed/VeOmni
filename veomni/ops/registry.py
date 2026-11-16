@@ -34,6 +34,7 @@ from torch import Tensor
 from ..utils.device import get_device_type
 from ..utils.import_utils import is_package_available
 from .platform import ANY_DEVICE, KernelRequirement
+from .selection import OpsSelection
 
 
 Output = Tensor | tuple[Tensor, ...]
@@ -402,12 +403,29 @@ class VeomniOp:
     Interned by resolved triple. Always calls ``entry.wrapper``. Compound
     Functions must use ``resolve_op(...).forward`` / ``.backward``, not this
     handle.
+
+    ``selection`` and ``site`` exist so one family field can pick different rows
+    per call site. The site is consumed while the handle is built -- it only
+    decides *which* impl this handle binds -- and is not retained, so two sites
+    that resolve to the same row still share one interned object.
     """
 
     _intern: dict[tuple[str, str, str], VeomniOp] = {}
 
-    def __new__(cls, op: str, variant: str, impl: str | None = None):
-        """Return the interned handle for ``(op, variant, impl)``."""
+    def __new__(
+        cls,
+        op: str,
+        variant: str,
+        impl: str | OpsSelection | None = None,
+        *,
+        site: str | None = None,
+    ):
+        """Return the interned handle for ``(op, variant, resolved impl)``."""
+        if isinstance(impl, OpsSelection):
+            impl = impl.resolve_impl(site)
+        # A bare string with a site is fine and common: the model always passes its
+        # site, and a config that names one row for the whole family leaves nothing
+        # to override. Only the mapping form consults the site.
         if impl is not None:
             cached = cls._intern.get((op, variant, impl))
             if cached is not None:
@@ -424,7 +442,14 @@ class VeomniOp:
         cls._intern[(op, variant, entry.impl)] = instance
         return instance
 
-    def __init__(self, op: str, variant: str, impl: str | None = None):
+    def __init__(
+        self,
+        op: str,
+        variant: str,
+        impl: str | OpsSelection | None = None,
+        *,
+        site: str | None = None,
+    ):
         """Resolve the registry row and intern this handle."""
         return None
 

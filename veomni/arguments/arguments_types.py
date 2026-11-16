@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
+from ..ops.selection import OpsSelection
 from ..utils import logging
 from ..utils.env import get_env
 
@@ -1541,7 +1542,7 @@ class OpsImplementationConfig:
             "MODELING_BACKEND=veomni. Pass a veomni_* name to select that adapter directly."
         },
     )
-    moe_implementation: Optional[str] = field(
+    moe_implementation: Optional[str] | OpsSelection = field(
         default=None,
         metadata={
             "help": "MoE experts forward. 'fused_triton' (GPU SM70+ or MLU) | "
@@ -1570,7 +1571,7 @@ class OpsImplementationConfig:
             "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU."
         },
     )
-    swiglu_mlp_implementation: Optional[str] = field(
+    swiglu_mlp_implementation: Optional[str] | OpsSelection = field(
         default=None,
         metadata={
             "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'qat' (FP8 QAT, SM90+) | "
@@ -1578,7 +1579,7 @@ class OpsImplementationConfig:
             "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
         },
     )
-    linear_implementation: Optional[str] = field(
+    linear_implementation: Optional[str] | OpsSelection = field(
         default=None,
         metadata={
             "help": "Dense projection. 'qat' (FP8 fake quantization of both GEMM operands, SM90+) | "
@@ -1686,7 +1687,7 @@ class OpsImplementationConfig:
             "and cann_ops_transformer); 'eager' uses PyTorch."
         },
     )
-    kv_round_implementation: Literal["none", "eager", "triton"] = field(
+    kv_round_implementation: Optional[str] | OpsSelection = field(
         default="none",
         metadata={
             "help": "KV-cache and indexer-activation storage rounding. 'none' leaves stored tensors "
@@ -1771,25 +1772,64 @@ class OpsImplementationConfig:
         return implementation
 
     def __post_init__(self):
+        self._normalize_selections()
         self._apply_deprecated_aliases()
         self.validate_attention_backend(self.attn_implementation)
         self.validate_hub_attention_backend(self.attn_implementation)
         self.attn_implementation = self.normalize_attention_backend(self.attn_implementation)
         self._validate_implementations()
 
+    #: Fields that accept the per-site form. Every other field stays a bare string,
+    #: because a site override only means something where the model owns several
+    #: instances of one family.
+    #: ``kv_round`` is deliberately absent: it rounds *stored* tensors rather than
+    #: GEMM operands, so there is no ``(dtype, qat, backend)`` triple to resolve --
+    #: ``none``/``eager``/``triton`` are already the whole space. It keeps the plain
+    #: row-name form.
+    _PER_SITE_FIELDS = (
+        "moe_implementation",
+        "swiglu_mlp_implementation",
+        "linear_implementation",
+    )
+
+    def _normalize_selections(self) -> None:
+        """Turn the mapping form of a per-site field into an ``OpsSelection``.
+
+        A bare string stays a bare string: that is the shape every config and
+        checkpoint in the wild uses, and it means "one row for every site of this
+        family", which is exactly ``OpsSelection(name=...)``. Normalizing here,
+        before validation, keeps ``_validate_implementations`` comparing strings.
+        """
+        for field_name in self._PER_SITE_FIELDS:
+            value = getattr(self, field_name)
+            if value is None or isinstance(value, OpsSelection):
+                continue
+            if isinstance(value, str):
+                continue
+            setattr(self, field_name, OpsSelection.from_config_value(value))
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize non-None op implementation selections to a dict."""
         return {k: v for k, v in asdict(self).items() if v is not None}
 
     def _apply_deprecated_aliases(self) -> None:
-        """Resolve renamed implementation values and reject values that were never implementations."""
+        """Resolve renamed implementation values and reject values that were never implementations.
+
+        The rename tables are keyed by old *names*, so a per-site selection is
+        skipped: it carries names inside its blocks, and a deprecated spelling there
+        is a config the author wrote against the current docs.
+        """
         for field_name, messages in _REJECTED_IMPLEMENTATION_VALUES.items():
             value = getattr(self, field_name)
+            if isinstance(value, OpsSelection):
+                continue
             if value in messages:
                 raise ValueError(f"{field_name}={value!r}: {messages[value]}")
 
         for field_name, aliases in _DEPRECATED_IMPLEMENTATION_ALIASES.items():
             value = getattr(self, field_name)
+            if isinstance(value, OpsSelection):
+                continue
             if value in aliases:
                 self._warn_deprecated(field_name, value, aliases[value])
                 setattr(self, field_name, aliases[value])
@@ -1840,40 +1880,60 @@ class OpsImplementationConfig:
         on_npu = IS_NPU_AVAILABLE
         on_mlu = is_torch_mlu_available()
 
-        for field_name, npu_ok in _NPU_ALLOWED.items():
+        def impls_for(field_name: str):
+            """Every impl this field can resolve to, across its overrides.
+
+            A per-site selection carries one row per override, and each is a
+            separate kernel, so all of them have to clear the host check -- not
+            just the default. The site itself is unknown here, so a selection with
+            a low-precision block contributes its low-precision row and its
+            reference row.
+            """
             value = getattr(self, field_name)
-            if value is None or value == "eager":
-                continue
-            if on_npu and value not in npu_ok:
-                allowed = sorted(npu_ok | {"eager"})
-                raise ValueError(
-                    f"{field_name}={value!r} is not supported on Ascend NPU. "
-                    f"Set to one of {allowed}, or leave it unset for the NPU default; "
-                    f"'eager' is the universal fallback for ops with no NPU kernel for the current model."
-                )
-            if not on_npu and value in _NPU_REQUIRED.get(field_name, frozenset()):
-                raise ValueError(f"{field_name}={value!r} requires Ascend NPU but none is available.")
+            if isinstance(value, OpsSelection):
+                seen = []
+                for candidate in value.all_impls():
+                    if candidate not in seen:
+                        seen.append(candidate)
+                return seen
+            return [value]
+
+        for field_name, npu_ok in _NPU_ALLOWED.items():
+            for value in impls_for(field_name):
+                if value is None or value == "eager":
+                    continue
+                if on_npu and value not in npu_ok:
+                    allowed = sorted(npu_ok | {"eager"})
+                    raise ValueError(
+                        f"{field_name}={value!r} is not supported on Ascend NPU. "
+                        f"Set to one of {allowed}, or leave it unset for the NPU default; "
+                        f"'eager' is the universal fallback for ops with no NPU kernel for the current model."
+                    )
+                if not on_npu and value in _NPU_REQUIRED.get(field_name, frozenset()):
+                    raise ValueError(f"{field_name}={value!r} requires Ascend NPU but none is available.")
 
         for field_name, mlu_ok in _MLU_ALLOWED.items():
-            value = getattr(self, field_name)
-            if value is None or value == "eager":
-                continue
-            if on_mlu:
-                if value == "fused_mlu" and not is_apex_mlu_available():
-                    raise ValueError("moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU.")
-                if value == "liger_kernel" and not is_liger_kernel_mlu_available():
-                    raise ValueError(
-                        f"{field_name}='liger_kernel' requires the Cambricon MLU liger_kernel build on MLU "
-                        "(upstream GPU liger-kernel does not run on MLU). Install the MLU liger_kernel wheel, "
-                        "set 'eager', or leave the field unset."
-                    )
-                if value not in mlu_ok:
-                    allowed = sorted(mlu_ok | {"eager"})
-                    raise ValueError(
-                        f"{field_name}={value!r} is not supported on Cambricon MLU. "
-                        f"Set to one of {allowed}; 'eager' is the universal fallback "
-                        f"for ops with no MLU kernel for the current model."
-                    )
+            for value in impls_for(field_name):
+                if value is None or value == "eager":
+                    continue
+                if on_mlu:
+                    if value == "fused_mlu" and not is_apex_mlu_available():
+                        raise ValueError(
+                            "moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU."
+                        )
+                    if value == "liger_kernel" and not is_liger_kernel_mlu_available():
+                        raise ValueError(
+                            f"{field_name}='liger_kernel' requires the Cambricon MLU liger_kernel build on MLU "
+                            "(upstream GPU liger-kernel does not run on MLU). Install the MLU liger_kernel wheel, "
+                            "set 'eager', or leave the field unset."
+                        )
+                    if value not in mlu_ok:
+                        allowed = sorted(mlu_ok | {"eager"})
+                        raise ValueError(
+                            f"{field_name}={value!r} is not supported on Cambricon MLU. "
+                            f"Set to one of {allowed}; 'eager' is the universal fallback "
+                            f"for ops with no MLU kernel for the current model."
+                        )
 
 
 @dataclass

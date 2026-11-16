@@ -472,8 +472,9 @@ class DeepseekV4HCACompressor(nn.Module):
     # 1. Keep every HCA/CSA compression window within one packed sequence.
     # 2. Reset compressed RoPE positions and causal ranges at each boundary.
     # ================================================================
-    def __init__(self, config: "DeepseekV4Config"):
+    def __init__(self, config: "DeepseekV4Config", layer_idx: int = 0):
         nn.Module.__init__(self)
+        self.layer_idx = layer_idx
         self.compress_rate = config.compress_rates["heavily_compressed_attention"]
         self.head_dim = config.head_dim
         self.kv_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
@@ -482,7 +483,9 @@ class DeepseekV4HCACompressor(nn.Module):
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
-        self.veomni_kv_round = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
+        self.veomni_kv_round = VeomniOp(
+            "kv_round", "deepseek_v4", config.ops_config.kv_round_implementation, site=f"layers.{layer_idx}.hca_kv"
+        )
 
     def forward(
         self,
@@ -688,8 +691,9 @@ class DeepseekV4Indexer(nn.Module):
     #    Indexer when ``dsa_indexer_implementation=tilelang``. Cache/decode and unusual
     #    position layouts retain the upstream eager implementation.
     # ================================================================
-    def __init__(self, config: "DeepseekV4Config") -> None:
+    def __init__(self, config: "DeepseekV4Config", layer_idx: int = 0) -> None:
         nn.Module.__init__(self)
+        self.layer_idx = layer_idx
         self.compress_rate = config.compress_rates["compressed_sparse_attention"]
         self.num_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
@@ -699,7 +703,9 @@ class DeepseekV4Indexer(nn.Module):
         self.position_bias = nn.Parameter(torch.empty(self.compress_rate, 2 * self.head_dim))
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
         self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
-        self.veomni_q_b_proj = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
+        self.veomni_q_b_proj = VeomniOp(
+            "linear", "standard", config.ops_config.linear_implementation, site=f"layers.{layer_idx}.indexer_q_b_proj"
+        )
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.scorer = DeepseekV4IndexerScorer(config)
         self.veomni_dsa_indexer = VeomniOp(
@@ -708,7 +714,9 @@ class DeepseekV4Indexer(nn.Module):
             config.ops_config.dsa_indexer_implementation,
         )
         self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
-        self.veomni_kv_round = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
+        self.veomni_kv_round = VeomniOp(
+            "kv_round", "deepseek_v4", config.ops_config.kv_round_implementation, site=f"layers.{layer_idx}.indexer"
+        )
 
     def forward(
         self,
@@ -995,8 +1003,9 @@ class DeepseekV4CSACompressor(nn.Module):
 
     rope_layer_type = "compress"
 
-    def __init__(self, config: "DeepseekV4Config"):
+    def __init__(self, config: "DeepseekV4Config", layer_idx: int = 0):
         nn.Module.__init__(self)
+        self.layer_idx = layer_idx
         self.compress_rate = config.compress_rates["compressed_sparse_attention"]
         self.head_dim = config.head_dim
         self.kv_proj = nn.Linear(config.hidden_size, 2 * self.head_dim, bias=False)
@@ -1004,9 +1013,11 @@ class DeepseekV4CSACompressor(nn.Module):
         self.position_bias = nn.Parameter(torch.empty(self.compress_rate, 2 * self.head_dim))
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-        self.indexer = DeepseekV4Indexer(config)
+        self.indexer = DeepseekV4Indexer(config, layer_idx)
         self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
-        self.veomni_kv_round = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
+        self.veomni_kv_round = VeomniOp(
+            "kv_round", "deepseek_v4", config.ops_config.kv_round_implementation, site=f"layers.{layer_idx}.csa_kv"
+        )
 
     def forward(
         self,
@@ -1321,13 +1332,19 @@ class DeepseekV4Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
-        self.veomni_q_a_proj = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
+        self.veomni_q_a_proj = VeomniOp(
+            "linear", "standard", config.ops_config.linear_implementation, site=f"layers.{layer_idx}.q_a_proj"
+        )
         self.q_a_norm = DeepseekV4RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps, config=config)
         self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
-        self.veomni_q_b_proj = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
+        self.veomni_q_b_proj = VeomniOp(
+            "linear", "standard", config.ops_config.linear_implementation, site=f"layers.{layer_idx}.q_b_proj"
+        )
         self.q_b_norm = DeepseekV4UnweightedRMSNorm(eps=config.rms_norm_eps, config=config)
         self.kv_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
-        self.veomni_kv_proj = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
+        self.veomni_kv_proj = VeomniOp(
+            "linear", "standard", config.ops_config.linear_implementation, site=f"layers.{layer_idx}.kv_proj"
+        )
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
         self.o_a_proj = DeepseekV4GroupedLinear(
             self.num_heads * self.head_dim // config.o_groups, config.o_groups * config.o_lora_rank, config.o_groups
@@ -1335,7 +1352,7 @@ class DeepseekV4Attention(nn.Module):
         self.o_b_proj = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
         self.sinks = nn.Parameter(torch.empty(self.num_heads))
         self.compressor = (
-            COMPRESSOR_CLASSES[self.layer_type](config) if self.layer_type != "sliding_attention" else None
+            COMPRESSOR_CLASSES[self.layer_type](config, layer_idx) if self.layer_type != "sliding_attention" else None
         )
         self.veomni_dsa_attention = VeomniOp(
             "dsa_attention",
@@ -1344,9 +1361,15 @@ class DeepseekV4Attention(nn.Module):
         )
         self.veomni_attn = VeomniOp("attention", "standard", config.ops_config.attn_implementation)
         self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
-        self.veomni_kv_round = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
-        self.veomni_o_a_proj = VeomniOp("linear", "grouped", config.ops_config.linear_implementation)
-        self.veomni_o_b_proj = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
+        self.veomni_kv_round = VeomniOp(
+            "kv_round", "deepseek_v4", config.ops_config.kv_round_implementation, site=f"layers.{layer_idx}.window_kv"
+        )
+        self.veomni_o_a_proj = VeomniOp(
+            "linear", "grouped", config.ops_config.linear_implementation, site=f"layers.{layer_idx}.o_a_proj"
+        )
+        self.veomni_o_b_proj = VeomniOp(
+            "linear", "standard", config.ops_config.linear_implementation, site=f"layers.{layer_idx}.o_b_proj"
+        )
 
     def forward(
         self,
@@ -1637,9 +1660,10 @@ class DeepseekV4MLP(nn.Module):
     # Patch: DeepseekV4MLP — shared experts. Pass ``swiglu_limit`` so the
     # kernel applies the same gate/up clamp as routed experts.
     # ================================================================
-    def __init__(self, config):
+    def __init__(self, config, layer_idx: int = 0):
         nn.Module.__init__(self)
         self.config = config
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
@@ -1647,7 +1671,12 @@ class DeepseekV4MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
         self.limit = config.swiglu_limit
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+        self.veomni_swiglu_mlp = VeomniOp(
+            "swiglu_mlp",
+            "standard",
+            config.ops_config.swiglu_mlp_implementation,
+            site=f"layers.{layer_idx}.mlp",
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # One call covers every row: the quantizing rows fake-quantize the weights
@@ -1688,8 +1717,9 @@ class DeepseekV4MLP(nn.Module):
 class DeepseekV4Experts(nn.Module):
     """Collection of expert weights stored as 3D tensors."""
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx: int = 0):
         super().__init__()
+        self.layer_idx = layer_idx
         self.num_experts = config.num_local_experts
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = config.intermediate_size
@@ -1708,7 +1738,12 @@ class DeepseekV4Experts(nn.Module):
         # extra config key, and only V4-Flash sets it to "fp4".
         self.expert_dtype = getattr(config, "expert_dtype", "fp8")
         self.moe_implementation = config.ops_config.moe_implementation
-        self.veomni_moe = VeomniOp("moe_experts", "standard", self.moe_implementation)
+        self.veomni_moe = VeomniOp(
+            "moe_experts",
+            "standard",
+            self.moe_implementation,
+            site=f"layers.{layer_idx}.experts",
+        )
 
     def forward(
         self,
@@ -1859,13 +1894,13 @@ class DeepseekV4SparseMoeBlock(nn.Module):
         nn.Module.__init__(self)
         self.is_hash = config.mlp_layer_types[layer_idx] == "hash_moe"
         self.gate = DeepseekV4HashRouter(config) if self.is_hash else DeepseekV4TopKRouter(config)
-        self.experts = DeepseekV4Experts(config)
+        self.experts = DeepseekV4Experts(config, layer_idx)
         # Only the learned top-k router (``torch.topk``) guarantees distinct experts
         # per token, so opt those layers into the tight ``max_M = T`` grouped-GEMM
         # bound. Hash routing reads a frozen ``tid2eid`` table that may repeat an
         # expert within a token's slots, so it keeps the conservative default.
         self.experts.assume_distinct_experts = not self.is_hash
-        self.shared_experts = DeepseekV4MLP(config)
+        self.shared_experts = DeepseekV4MLP(config, layer_idx)
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
         batch, seq_len, hidden_dim = hidden_states.shape

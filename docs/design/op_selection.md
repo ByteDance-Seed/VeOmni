@@ -200,6 +200,79 @@ former `npu` implementation names still parse with a deprecation warning; see th
 
 ---
 
+### Choosing different rows per site
+
+A family field names a row for the whole model. Some deployments need less than
+that: the first ten layers in the model dtype because the kernel does not cover
+them, the routed experts quantized while the shared expert is not, the compressed
+KV rounded while the sliding-window KV is not. Those are per-*site* decisions, and
+a family field may be written as a mapping to express them:
+
+```yaml
+moe_implementation:
+  name: fused_triton            # what runs when low_precision is off
+  low_precision:
+    enable: true
+    dtype: fp8
+    qat: false                  # the vendor's real GEMM, not fake quantization
+    backend: deepgemm
+  overrides:
+    - site: "layers\\.0\\.experts"
+      low_precision:
+        enable: false           # this layer falls back to `name`
+```
+
+A bare string stays valid and means one row everywhere, which is what every
+existing config and checkpoint records.
+
+**The four parts of a selection.**
+
+| Key | Meaning |
+| --- | --- |
+| `name` | The row to run. Absent means the host default, exactly as an unset field does today |
+| `low_precision.enable` | `true` resolves `(dtype, qat, backend)` to a row; `false` or absent keeps `name` |
+| `low_precision.dtype` | `fp8`, `nvfp4`, `mxfp4`. Omitting it lets a backend with one dtype decide, and lets the row fall back to the checkpoint's own storage dtype where it has one |
+| `low_precision.qat` | `true` is fake quantization (training computes in the model dtype on rounded operands, reproducing a deployment kernel's numerics); `false` is the vendor's real low-precision GEMM |
+| `low_precision.backend` | `tilelang`, `torchao`, `deepgemm`. `triton` exists only on `kv_round`, which is not per-site (see below) |
+| `overrides` | A list of `{site, name?, low_precision?}` rules, matched with `re.fullmatch` |
+
+`dtype`, `qat` and `backend` are orthogonal, but only registered triples resolve:
+`('fp8', True, 'tilelang')` is `qat`, `('nvfp4', True, 'torchao')` is
+`torchao_nvfp4`, `('fp8', False, 'deepgemm')` is `deepgemm_fp8`. Anything else
+raises rather than falling back to the family's reference row — a config asking
+for real NVFP4 must not quietly train something else.
+
+**Override semantics.** Only the keys a rule writes change; everything else is
+inherited from the enclosing block, so a rule that changes just `backend` keeps the
+outer `enable`, `qat` and `dtype`. Later rules win over earlier ones, which is why
+the broad rule goes first and the narrow exception after it. `site` is matched with
+`fullmatch`, so `layers\.0\.mlp` does not match `layers.10.mlp`.
+
+**Sites are chosen by the model.** A model publishes its own strings and passes one
+when it builds a handle; the string is consumed at construction and not retained.
+DeepSeek-V4 publishes:
+
+```
+layers.<i>.q_a_proj    layers.<i>.q_b_proj    layers.<i>.kv_proj
+layers.<i>.o_a_proj    layers.<i>.o_b_proj
+layers.<i>.mlp         the shared expert
+layers.<i>.experts     the routed experts
+layers.<i>.window_kv   the main attention's stored KV
+layers.<i>.hca_kv      the heavily-compressed attention's stored KV
+layers.<i>.csa_kv      the compressed-sparse attention's stored KV
+layers.<i>.indexer     the indexer's stored activations
+layers.<i>.indexer_q_b_proj
+```
+
+A model that publishes no sites is unaffected: its field is a bare string and the
+site argument is simply unused.
+
+**`kv_round` is not per-site.** It rounds *stored* tensors rather than GEMM
+operands, so `none` / `eager` / `triton` is already the whole space and there is no
+`(dtype, qat, backend)` triple to resolve. It keeps the plain row-name form.
+
+---
+
 ### Loading a config written before the per-family rows
 
 Temporary. New saves never produce this shape, and the migration in
