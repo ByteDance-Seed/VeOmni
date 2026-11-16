@@ -312,11 +312,14 @@ def test_qwen3_moe_inference_configs_resolve_the_intended_ep_dim():
 def test_qwen3_moe_backbone_never_ties_embeddings():
     """An upstream ``tie_word_embeddings: true`` must not reach the post-load tie.
 
-    ``Qwen3MoeLlm`` owns no ``lm_head`` (the vocabulary module does), so the shared
-    tie would run against this class's ``nn.Identity()`` input embedding and raise
-    ``RuntimeError: Failed to tie input/output embeddings``. Only the *outer* flag
-    is forced off — enough to short-circuit the AND, and it leaves ``text_config``
-    as the caller wrote it, since the real tie lives in ``qwen3_text_encoder``.
+    ``Qwen3MoeLlm`` owns only the decoder: ``get_input_embeddings()`` is the
+    ``nn.Identity`` over the real ``embed_tokens`` and ``get_output_embeddings()``
+    is ``None``, so there is nothing here to tie. The hook skips a model with no
+    output head instead of assigning into ``None``.
+
+    The config is left alone: the flag is not forced, and the nested value the
+    caller set is preserved — ``qwen3_text_encoder`` reads it for the one tie that
+    is real.
     """
     MoeAcc = OMNI_ACCELERATED_MODEL_REGISTRY["qwen3_moe_llm"]()
     MoeConfig = OMNI_CONFIG_REGISTRY["qwen3_moe_llm"]()
@@ -328,13 +331,13 @@ def test_qwen3_moe_backbone_never_ties_embeddings():
         # tie check would never be reached.
         ops_implementation=make_eager_ops_config(),
     )
-    assert cfg.tie_word_embeddings is False
-    # The nested config is the caller's; the vocabulary module reads it for the one
-    # tie that is real, so it must keep whatever the upstream checkpoint declares.
+    # No fabricated outer flag: the module simply has no output head.
+    assert "tie_word_embeddings" not in cfg.__dict__
     assert cfg.text_config.tie_word_embeddings is True
 
     model = MoeAcc(cfg)
-    # The real post-load hook, not a reimplementation of its condition.
+    assert model.get_output_embeddings() is None
+    # The real post-load hook must skip it rather than raising.
     post_process_after_weight_loading(model, {})
 
 
@@ -387,8 +390,8 @@ def test_qwen3_moe_config_accepts_an_instantiated_text_config():
 def test_qwen3_moe_config_leaves_the_nested_tie_flag_alone():
     """``text_config`` is the caller's object and its tie flag is theirs to set.
 
-    The wrapper forces ``tie_word_embeddings`` off on its *own* top-level config,
-    because it has no output head to tie. The nested config belongs to the upstream
+    The wrapper has no output head, so it does not fabricate a
+    ``tie_word_embeddings`` value at all. The nested config belongs to the upstream
     architecture: ``qwen3_text_encoder`` reads it for the one real
     ``embed_tokens``↔``lm_head`` tie, so the wrapper must neither replace the object
     nor rewrite the field.
@@ -403,7 +406,7 @@ def test_qwen3_moe_config_leaves_the_nested_tie_flag_alone():
     assert inner.tie_word_embeddings is True, "the caller's object must be untouched"
     assert wrapper.text_config is inner
     assert wrapper.text_config.tie_word_embeddings is True
-    assert wrapper.tie_word_embeddings is False
+    assert "tie_word_embeddings" not in wrapper.__dict__, "no fabricated outer flag"
     # The nested config still drives the backbone it was written for.
     assert wrapper.text_config.vocab_size == 128
     assert wrapper.text_config.num_hidden_layers == 1
