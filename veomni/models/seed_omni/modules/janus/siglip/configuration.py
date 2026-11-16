@@ -31,4 +31,8 @@ class JanusSiglipConfig(OmniModuleConfig):
             self.vision_config = vision_config
         else:
             self.vision_config = JanusVisionConfig(**vision_config) if vision_config else JanusVisionConfig()
+        # No wte / lm_head, so there is nothing to tie. Declared rather than left
+        # absent: the shared post-load tie would call ``get_output_embeddings()``
+        # and raise when the flag is truthy.
+        kwargs["tie_word_embeddings"] = False
         super().__init__(**kwargs)

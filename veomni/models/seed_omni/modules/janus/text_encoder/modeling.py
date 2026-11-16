@@ -148,8 +148,7 @@ class JanusTextEncoder(TextEncoder):
         The conditional cache already holds every position generated so far; the
         unconditional one starts fresh. The two CFG branches must therefore enter
         the image span at the *same* sequence position, so the uncond side is
-        padded out to the conditional prompt length with the pad token — matching
-        what the upstream Janus implementation does for interleaved generation.
+        padded out to the conditional prompt length with the pad token.
         """
         bos_id = self._chat_template.bos_token_id
         pad_id = self._chat_template.pad_token_id
