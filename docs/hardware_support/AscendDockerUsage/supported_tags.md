@@ -14,19 +14,15 @@ Two tag schemes coexist on quay.io:
 > triton-ascend and fla_npu GDN stack. General-purpose Dockerfiles remain
 > available for the legacy tags.
 
-## CANN 9.2.1: pending Quay publication
+## CANN 9.2.1
 
-These target tags are not yet confirmed available on Quay. They are listed
-for the planned publication, not as currently pullable release images.
-Build locally using the [A2](build_a2_docker.md) or [A3](build_a3_docker.md)
-guide. The integrated builders currently generate legacy-style tags; these
-product-style target names are for manual publication and are not generated
-by the workflows. See [workflow tag rules](overview.md#build-and-publication-workflows).
+### Product-based tags
 
-| Target tag | Architectures | Triton / Triton-Ascend |
-| --- | --- | --- |
-| `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-910b-ubuntu22.04-py3.12-veomni` | A2: `linux/amd64`, `linux/arm64` | x86: 3.2.0 / 3.2.2; ARM: 3.5.0 / 3.2.2 |
-| `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-a3-ubuntu22.04-py3.12-veomni` | A3: `linux/arm64` | 3.5.0 / 3.2.2 |
+| Tag | Dockerfile | Content |
+|---|---|---|
+| `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-910b-ubuntu22.04-py3.12-veomni` | [a2.x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86) / [a2.arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.arm) | veomni / torch-npu / triton-ascend / fla_npu |
+| `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-a3-ubuntu22.04-py3.12-veomni` | [a3](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_a3) | veomni / torch-npu / triton-ascend / fla_npu |
+| `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-a5-ubuntu22.04-py3.12-veomni` | [Dockerfile] [a5](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_a5) | veomni / torch-npu / triton-ascend / fla_npu |
 
 ## CANN 9.1.0
 
