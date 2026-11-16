@@ -34,17 +34,4 @@ class Qwen3MoeLlmConfig(OmniModuleConfig):
         # When True, ``Qwen3MoeLlm.freeze_model`` freezes the whole backbone
         # (used to bootstrap a frozen LLM into a multimodal model).
         self.freeze = freeze
-        # This wrapper owns no vocabulary: ``get_input_embeddings()`` is the
-        # ``nn.Identity`` installed over the real ``embed_tokens``, and
-        # ``get_output_embeddings()`` is ``None`` — the tie lives in
-        # ``qwen3_text_encoder``, which keeps whatever the upstream config says.
-        #
-        # The shared post-load tie (``checkpoint.weights.post_process_after_weight_loading``)
-        # ANDs the outer and nested flags. Left True on both, it would try to
-        # assign ``None._parameters["weight"]`` here and raise
-        # ``RuntimeError: Failed to tie input/output embeddings``. Turning the
-        # outer flag off is enough to short-circuit it, and it is the only side
-        # touched: the nested config is the caller's, and ``text_config`` is what
-        # the upstream model's own tie is derived from.
-        kwargs["tie_word_embeddings"] = False
         super().__init__(**kwargs)
