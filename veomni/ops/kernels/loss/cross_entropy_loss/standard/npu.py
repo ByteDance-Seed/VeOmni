@@ -25,6 +25,9 @@ if IS_NPU_AVAILABLE:
     import torch_npu
 
 
+_MAX_NATIVE_CE_ROWS = 200_000
+
+
 def can_use_fused_ce(hidden: Tensor, weight: Tensor, labels: Tensor) -> bool:
     """Conservatively stay within the native kernel's documented contract."""
     return (
@@ -40,7 +43,7 @@ def can_use_fused_ce(hidden: Tensor, weight: Tensor, labels: Tensor) -> bool:
         and weight.shape[0] > 0
         and labels.ndim == 1
         and labels.numel() == hidden.shape[0]
-        and hidden.shape[0] <= 200000
+        and hidden.shape[0] <= _MAX_NATIVE_CE_ROWS
     )
 
 

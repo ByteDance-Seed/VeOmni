@@ -774,7 +774,8 @@ def test_native_guard_rejects_unsupported_inputs(monkeypatch):
     assert not npu.can_use_fused_ce(hidden, weight, labels.to(torch.int32))
     assert not npu.can_use_fused_ce(hidden, weight.cpu(), labels)
     assert not npu.can_use_fused_ce(hidden.to(torch.bfloat16), weight, labels)
-    assert not npu.can_use_fused_ce(hidden[:1].expand(200001, -1), weight, labels[:1].expand(200001))
+    assert npu.can_use_fused_ce(hidden[:1].expand(200_000, -1), weight, labels[:1].expand(200_000))
+    assert not npu.can_use_fused_ce(hidden[:1].expand(200_001, -1), weight, labels[:1].expand(200_001))
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     assert not npu.can_use_fused_ce(hidden, weight, labels)
 
