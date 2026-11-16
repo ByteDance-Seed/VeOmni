@@ -31,6 +31,7 @@ usage/multimodal_data_processing.md
 usage/data_packing_and_dyn_bsz.md
 usage/dit_microbatching.md
 usage/float8_training.md
+usage/mxfp4_qat.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
 usage/support_new_models/qwen3_omni_moe_example.md

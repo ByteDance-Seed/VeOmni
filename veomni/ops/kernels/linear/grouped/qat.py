@@ -48,8 +48,9 @@ def wrapper(
 def module_wrapper(linear: nn.Module, x: Tensor, *, block_size: int = 128) -> Tensor:
     """Row entry point: take the projection module and dispatch to :func:`wrapper`."""
     # A quantizing row always gets a weight: ``resolve_projection`` raises for a
-    # wrapped projection instead of handing back a shortcut.
-    weight, shortcut = resolve_projection("qat", linear, x)
+    # wrapped projection instead of handing back a shortcut. Grouped projections
+    # use ``DeepseekV4GroupedLinear`` (an ``nn.Linear`` subclass holding the flat weight).
+    weight, shortcut = resolve_projection("qat", linear, x, allow_linear_subclass=True)
     assert shortcut is None
     bias = getattr(linear, "bias", None)
     return wrapper(
