@@ -75,11 +75,9 @@ class BagelTextEncoder(TextEncoder):
 
     config_class = BagelTextEncoderConfig
     preprocessor_class = BagelTextEncoderPreprocessor
-    # ``TextEncoder`` opts into the shard handoff because ``wte`` is a per-token
-    # lookup. BAGEL's decode side is not: ``bagel_qwen2_mot.forward_post``
-    # scatters hidden states back through a two-stream packed mask rather than by
-    # walking the carrier, so the label/row walk this module would use does not
-    # apply. Leave it out of the handoff.
+    # ``TextEncoder`` opts in because ``wte`` is a per-token lookup. BAGEL's decode
+    # side is not: ``bagel_qwen2_mot.forward_post`` scatters hidden states through a
+    # two-stream packed mask rather than by walking the carrier.
     supports_sp_sharded_handoff = False
 
     def generate(

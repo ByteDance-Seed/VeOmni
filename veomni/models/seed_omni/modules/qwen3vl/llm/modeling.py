@@ -105,7 +105,7 @@ def pack_sp_sharded_qwen3vl_conversations_for_forward(
     **full** row for the same reason: the caller pads and narrows it identically.
     """
     from ...base.llm_packing import item_token_len, item_value_2d
-    from ...base.sp_shard import check_shard_rows, pad_sp_shard, single_modality_shard_batch, sp_local_len
+    from ...base.sp_shard import pad_sp_shard, single_modality_shard_batch, sp_local_len
 
     if not single_modality_shard_batch(conversations):
         return None
@@ -114,7 +114,6 @@ def pack_sp_sharded_qwen3vl_conversations_for_forward(
     valid_len = sum(item_token_len(item) for item in items)
     local_len = sp_local_len(valid_len, ps.sp_size)
     values = [item_value_2d(item) for item in items]
-    check_shard_rows(sum(int(value.size(0)) for value in values), valid_len, ps.sp_size, ps.sp_rank)
     embeds = pad_sp_shard(torch.cat(values, dim=0).to(device), valid_len, ps.sp_size)
     position_ids, sample_seqlens = qwen3vl_position_ids(conversations, spatial_merge_size, device)
 
@@ -197,39 +196,27 @@ def pack_qwen3vl_conversations_for_forward(
 ) -> Dict[str, Any]:
     """Pack Qwen3-VL conversation embeds for backbone forward (training + inference)."""
     inputs_embeds_list: list[torch.Tensor] = []
-    position_ids_list: list[torch.Tensor] = []
     visual_pos_masks_list: list[torch.Tensor] = []
-    sample_lengths: list[int] = []
     deepstack_chunks: list[list[torch.Tensor]] = []
 
     for sample in conversations:
-        sample_len = 0
-        current_pos = 0
         for item in sample:
             if item.is_dummy:
                 continue
             embeds = item.value.to(device)
             length = embeds.size(0)
             inputs_embeds_list.append(embeds)
-            is_visual = item.type in ("image", "video")
-            if is_visual:
-                grid_thw = item.meta["grid_thw"]
-                seg_pos = qwen3vl_vision_position_ids(current_pos, grid_thw, spatial_merge_size).to(device)
-                current_pos += qwen3vl_vision_position_advance(grid_thw, spatial_merge_size)
+            if item.type in ("image", "video"):
                 visual_pos_masks_list.append(torch.ones(length, dtype=torch.bool, device=device))
                 deepstack_chunks.append([d.to(device) for d in item.meta["deepstack"]])
             else:
-                seg_pos = torch.arange(length, dtype=torch.long, device=device).view(1, -1).expand(3, -1) + current_pos
-                current_pos += length
                 visual_pos_masks_list.append(torch.zeros(length, dtype=torch.bool, device=device))
-            position_ids_list.append(seg_pos)
-            sample_len += length
-        sample_lengths.append(sample_len)
 
     inputs_embeds, inputs_embeds_shape = naflatten(inputs_embeds_list)
     if inputs_embeds.dim() == 2:
         inputs_embeds = inputs_embeds.unsqueeze(0)
-    position_ids = torch.cat(position_ids_list, dim=1).unsqueeze(1)
+    position_ids, sample_lengths = qwen3vl_position_ids(conversations, spatial_merge_size, device)
+    position_ids = position_ids.unsqueeze(1)
     visual_pos_masks = torch.cat(visual_pos_masks_list, dim=0).unsqueeze(0)
 
     if deepstack_chunks:

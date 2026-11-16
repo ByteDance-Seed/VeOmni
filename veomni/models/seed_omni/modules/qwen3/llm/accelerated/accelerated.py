@@ -75,8 +75,8 @@ class TrainingMixin(TrainingModuleMixin):
                     attention_mask,
                     self._sp_own_len,
                     pos_dim=1,
-                    mask_dim=1,
                     group=ps.sp_group,
+                    sample_seqlens=sample_seqlens,
                 )
                 return dict(
                     inputs_embeds=local_embeds,

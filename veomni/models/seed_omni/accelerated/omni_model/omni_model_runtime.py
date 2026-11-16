@@ -164,9 +164,7 @@ def _reject_sp_handoff_unsupported_modules(module_runtimes: Mapping[str, ModuleR
     than let one boundary silently disagree with the switch.
     """
     unsupported = sorted(
-        name
-        for name, runtime in module_runtimes.items()
-        if not getattr(runtime.omni_module, "supports_sp_sharded_handoff", False)
+        name for name, runtime in module_runtimes.items() if not runtime.omni_module.supports_sp_sharded_handoff
     )
     if not unsupported:
         return

@@ -50,13 +50,10 @@ def item_token_len(item: ConversationItem) -> int:
 
     ``meta[_OMNI_TOKEN_LEN]`` is stamped by the CPU preprocessors at *full* span
     length and is never sliced, so it is the only trustworthy length once
-    ``item.value`` holds a sequence-parallel shard. ``value.size(0)`` is only a
-    fallback for a carrier that carries no length (a raw token tensor).
+    ``item.value`` holds a sequence-parallel shard.
     """
     if _OMNI_TOKEN_LEN in item.meta:
         return int(item.meta[_OMNI_TOKEN_LEN])
-    if item.type == "text" and "labels" in item.meta:
-        return int(item.meta["labels"].numel())
     value = item_value_2d(item)
     return int(value.size(0)) if isinstance(value, torch.Tensor) else 1
 
@@ -64,8 +61,8 @@ def item_token_len(item: ConversationItem) -> int:
 def conversation_metadata(
     conversations: list[list[ConversationItem]],
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, list[int], list[tuple[int, int]]]:
-    """Build ``(position_ids, attention_mask, sample_seqlens, seq_slices)`` from ``meta`` lengths.
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    """Build ``(position_ids, attention_mask, sample_seqlens)`` from ``meta`` lengths.
 
     Neither tensor is read off ``item.value``: a value may hold a shard, and these
     two are always built over the *full* packed row — the SP path pads and slices
@@ -77,8 +74,6 @@ def conversation_metadata(
     masks: list[torch.Tensor] = []
     positions: list[torch.Tensor] = []
     sample_seqlens: list[int] = []
-    seq_slices: list[tuple[int, int]] = []
-    offset = 0
     for sample in conversations:
         sample_length = 0
         for item in sample:
@@ -90,15 +85,13 @@ def conversation_metadata(
             sample_length += length
         if sample_length > 0:
             sample_seqlens.append(sample_length)
-            seq_slices.append((offset, offset + sample_length))
-            offset += sample_length
             positions.append(torch.arange(sample_length, dtype=torch.long, device=host))
     position_ids = torch.cat(positions, dim=0).unsqueeze(0)
     attention_mask = torch.cat(masks, dim=0).unsqueeze(0)
     if stage_on_cpu:
         position_ids = position_ids.to(device, non_blocking=True)
         attention_mask = attention_mask.to(device, non_blocking=True)
-    return position_ids, attention_mask, sample_seqlens, seq_slices
+    return position_ids, attention_mask, sample_seqlens
 
 
 def pack_llm_conversations_for_forward(
@@ -111,7 +104,7 @@ def pack_llm_conversations_for_forward(
     with batch dim 0 when the packed sample is a single varlen sequence.
     """
     values = [item_value_2d(item).to(device) for sample in conversations for item in sample if not item.is_dummy]
-    position_ids, attention_mask, _, _ = conversation_metadata(conversations, device)
+    position_ids, attention_mask, _ = conversation_metadata(conversations, device)
     inputs_embeds, inputs_embeds_shape = naflatten(values)
     if inputs_embeds.dim() == 2:
         inputs_embeds = inputs_embeds.unsqueeze(0)

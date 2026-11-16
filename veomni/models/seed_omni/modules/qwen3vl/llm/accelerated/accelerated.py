@@ -81,7 +81,6 @@ class TrainingMixin(TrainingModuleMixin):
                     None,
                     valid_len,
                     pos_dim=2,
-                    mask_dim=1,
                     group=ps.sp_group,
                     sample_seqlens=packed["sample_seqlens"],
                 )

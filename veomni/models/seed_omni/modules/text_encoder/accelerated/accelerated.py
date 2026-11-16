@@ -116,7 +116,7 @@ class TrainingMixin(TrainingModuleMixin):
             # graph honours it (`_reject_sp_handoff_unsupported_modules`), so a batch
             # that had to gather its modalities still hands a shard on here: the
             # consumer, not the producer, decides whether it wants full spans.
-            hidden_states, shift_labels = self._prepare_sharded_decode_inputs(self._conversation_carrier, ps)
+            hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier, ps)
         else:
             hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier)
         # No SP sharding here: the lm-head loss is a token-weighted mean over the whole
@@ -153,13 +153,23 @@ class TrainingMixin(TrainingModuleMixin):
     def _prepare_decode_inputs(
         self,
         conversation_list: Optional[list[list[ConversationItem]]],
+        ps: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prepare decode ``(hidden_states, shift_labels)`` from the carrier.
+
+        With ``ps`` (the ``skip_sp_gather_between_modules`` path) every ``part.value``
+        already holds this rank's window, so a media segment contributes all of its
+        real rows and only this rank's label slice is scored. Without it the carrier
+        is the full packed sequence, and a media segment contributes one row — the
+        sequence only has to stay aligned across the causal label shift.
+        """
+        sharded = ps is not None
         hidden_states_chunks: list[torch.Tensor] = []
         label_chunks: list[torch.Tensor] = []
         sample_starts: list[int] = []
         decode_len = 0
 
-        for sample in conversation_list:
+        for sample in conversation_list or []:
             sample_start = decode_len
             for part in sample:
                 if part.is_dummy:
@@ -169,10 +179,17 @@ class TrainingMixin(TrainingModuleMixin):
                     hidden_states = hidden_states.squeeze(0)
                 if part.type == "text":
                     labels = part.meta["labels"]
-                    assert labels.shape[0] == hidden_states.shape[0]
+                    if not sharded:
+                        assert labels.shape[0] == hidden_states.shape[0]
                     hidden_states_chunks.append(hidden_states)
                     label_chunks.append(labels)
-                    decode_len += labels.shape[0]
+                    decode_len += int(labels.shape[0])
+                elif sharded:
+                    # The window keeps every real media row; none of them is a target.
+                    seg_len = item_token_len(part)
+                    hidden_states_chunks.append(hidden_states)
+                    label_chunks.append(torch.full((seg_len,), IGNORE_INDEX, dtype=torch.long))
+                    decode_len += seg_len
                 else:
                     # Non-text segment (image, video, audio, ...) carries projected
                     # media embeds; keep one row (no label) so the sequence stays
@@ -196,59 +213,21 @@ class TrainingMixin(TrainingModuleMixin):
             labels[start] = IGNORE_INDEX
 
         labels = labels[..., 1:].contiguous()
-        shift_labels = F.pad(labels, (0, 1), "constant", -100)
+        if not sharded:
+            shift_labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
+        else:
+            # Each rank scores exactly the rows its window holds. ``item.value`` keeps
+            # only real rows (padding never enters the carrier), so the label slice has
+            # to stop at the window's real row count, not at its padded width.
+            rows = sp_valid_in_window(decode_len, ps.sp_rank, ps.sp_size)
+            local_len = sp_local_len(decode_len, ps.sp_size)
+            shift_labels = F.pad(labels, (0, 1 + (local_len * ps.sp_size - decode_len)), "constant", IGNORE_INDEX)
+            shard_start = ps.sp_rank * local_len
+            shift_labels = shift_labels[shard_start : shard_start + rows].contiguous()
         # Single H2D move (labels are tiny host-side bookkeeping); the loss forward
         # orders after the backbone kernels on the GPU stream without a CPU stall.
         shift_labels = shift_labels.to(device=hidden_states.device, non_blocking=True)
         return hidden_states, shift_labels
-
-    def _prepare_sharded_decode_inputs(
-        self,
-        conversation_list: Optional[list[list[ConversationItem]]],
-        ps: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Prepare decode ``(hidden_states, shift_labels)`` directly from this rank's SP/CP slice on ``part.value``."""
-        hidden_states_chunks: list[torch.Tensor] = []
-        label_chunks: list[torch.Tensor] = []
-        sample_starts: list[int] = []
-        decode_len = 0
-
-        for sample in conversation_list or []:
-            sample_start = decode_len
-            for part in sample:
-                if part.is_dummy:
-                    continue
-                hidden = part.value
-                if hidden.dim() == 3:
-                    hidden = hidden.squeeze(0)
-                hidden_states_chunks.append(hidden)
-                if part.type == "text":
-                    labels = part.meta["labels"]
-                    label_chunks.append(labels)
-                    decode_len += int(labels.shape[0])
-                else:
-                    seg_len = item_token_len(part)
-                    label_chunks.append(torch.full((seg_len,), IGNORE_INDEX, dtype=torch.long))
-                    decode_len += seg_len
-            if decode_len > sample_start:
-                sample_starts.append(sample_start)
-
-        hidden_states = torch.cat(hidden_states_chunks, dim=0)
-        labels = torch.cat(label_chunks, dim=0)
-        for start in sample_starts[1:]:
-            labels[start] = IGNORE_INDEX
-
-        # Each rank scores exactly the rows its window holds. ``item.value`` keeps
-        # only real rows (padding never enters the carrier), so the label slice has
-        # to stop at the window's real row count, not at its padded width.
-        rows = sp_valid_in_window(decode_len, ps.sp_rank, ps.sp_size)
-        shard_start = ps.sp_rank * sp_local_len(decode_len, ps.sp_size)
-        labels = labels[..., 1:].contiguous()
-        pad_tail = 1 + (sp_local_len(decode_len, ps.sp_size) * ps.sp_size - decode_len)
-        shift_labels = F.pad(labels, (0, pad_tail), "constant", IGNORE_INDEX)
-        local_shift_labels = shift_labels[shard_start : shard_start + rows].contiguous()
-        local_shift_labels = local_shift_labels.to(device=hidden_states.device, non_blocking=True)
-        return hidden_states, local_shift_labels
 
     @staticmethod
     def _drop_unsupervised_decode_rows(

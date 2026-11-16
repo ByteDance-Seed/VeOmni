@@ -770,7 +770,7 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
         extra_parallel_names=accelerator.extra_parallel_names,
         dp_mode=accelerator.fsdp_config.fsdp_mode,
         async_enabled=accelerator.enable_async,
-        skip_sp_gather_between_modules=getattr(accelerator, "skip_sp_gather_between_modules", False),
+        skip_sp_gather_between_modules=accelerator.skip_sp_gather_between_modules,
         npu_ep_hccl_buffer_mib=accelerator.npu_ep_hccl_buffer_mib,
         npu_ep_hccl_expansion_mode=accelerator.npu_ep_hccl_expansion_mode,
         name=name,

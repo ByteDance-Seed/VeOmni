@@ -106,22 +106,31 @@ def pad_sp_shard(
     sp_size: int,
     *,
     dim: int = 0,
-    pad_value: int = 0,
 ) -> torch.Tensor:
-    """Pad this rank's real rows back up to its window width.
+    """Pad this rank's real rows back up to its window width with zeros.
 
     :func:`split_sp_sharded_tensor` keeps padding out of the carrier, so the
     consumer restores it here: the kernels downstream are launched from a
     ``cu_seqlens`` computed over the *padded* row and their inputs have to match.
     The pad rows carry no gradient and no label ever targets them, so they cannot
     reach the loss.
+
+    More rows than the window means a value that was never sliced (a producer
+    that gathered, or a full span left on the carrier); that is raised here
+    rather than padded, because padding cannot shorten a tensor.
     """
-    pad = sp_local_len(valid_len, sp_size) - local.size(dim)
+    window = sp_local_len(valid_len, sp_size)
+    if local.size(dim) > window:
+        raise ValueError(
+            f"pad_sp_shard: {local.size(dim)} rows exceed the window width {window} "
+            f"(valid_len={valid_len}, sp_size={sp_size}); a value on the carrier was never sliced."
+        )
+    pad = window - local.size(dim)
     if pad <= 0:
         return local
     shape = list(local.shape)
     shape[dim] = pad
-    return torch.cat([local, torch.full(shape, pad_value, dtype=local.dtype, device=local.device)], dim=dim)
+    return torch.cat([local, local.new_zeros(shape)], dim=dim)
 
 
 def single_modality_shard_batch(conversations: list[list[ConversationItem]] | None) -> bool:
@@ -131,8 +140,8 @@ def single_modality_shard_batch(conversations: list[list[ConversationItem]] | No
     rank's row. Decided from ``item.type`` and ``meta`` alone, so every rank of
     the ``sp_group`` reaches the same answer — this predicate chooses between a
     path with a collective and one without, and a rank-local answer would leave
-    half the group inside a gather. Whether the values really are windows is
-    checked by the packer's row count (:func:`check_shard_rows`), not here.
+    half the group inside a gather. A value that was never sliced is caught by
+    :func:`pad_sp_shard`, not here.
     """
     ps = get_parallel_state()
     if ps.sp_size <= 1 or not ps.skip_sp_gather_between_modules or not conversations:
@@ -141,22 +150,6 @@ def single_modality_shard_batch(conversations: list[list[ConversationItem]] | No
     if not items or len({item.type for item in items}) != 1:
         return False
     return all(isinstance(value := item_value_2d(item), torch.Tensor) and value.dim() >= 2 for item in items)
-
-
-def check_shard_rows(rows: int, valid_len: int, sp_size: int, sp_rank: int) -> None:
-    """Assert that ``rows`` items' shards add up to this rank's window.
-
-    The packers concatenate ``item.value``s straight into the backbone's row, so
-    the row is only right if the items cover exactly this rank's real rows. A
-    shard handoff cannot produce anything else; a mismatch means a value was not
-    sliced and concatenating it would silently feed a wrong-length row.
-    """
-    expected = sp_valid_in_window(valid_len, sp_rank, sp_size)
-    if rows != expected:
-        raise ValueError(
-            f"check_shard_rows: items hold {rows} rows but rank {sp_rank} of {sp_size} owns {expected} "
-            f"(valid_len={valid_len}). A value on the carrier was never sliced."
-        )
 
 
 def gather_sp_sharded_tensor(local: torch.Tensor, valid_len: int, group: Any) -> torch.Tensor:
@@ -172,8 +165,6 @@ def gather_sp_sharded_tensor(local: torch.Tensor, valid_len: int, group: Any) ->
     ``valid_len`` must be the *producer's* full length, so ``sp_local_len``
     yields the width that producer sliced with.
     """
-    if group is None:
-        return local.narrow(0, 0, int(valid_len))
     ps = get_parallel_state()
     padded = pad_sp_shard(local, valid_len, ps.sp_size, dim=0)
     gathered = gather_outputs(padded, gather_dim=0, group=group)
@@ -237,7 +228,7 @@ def gather_sp_sharded_groups(
     :func:`modality_groups`.
     """
     for items in groups:
-        if items and all(isinstance(item_value_2d(item), torch.Tensor) for item in items):
+        if items:
             keys = tuple(key for key in meta_list_keys if key in items[0].meta)
             gather_sp_sharded_items(items, sp_group, meta_list_keys=keys)
 
@@ -253,9 +244,8 @@ def modality_groups(conversations: list[list[ConversationItem]] | None) -> list[
     * The vision tower hands images and videos to one ViT call and always runs
       images first, then videos (``process_qwen3vl_visual_items`` calls
       ``_add(image_items)`` before ``_add(video_items)``). This mirrors that
-      selection exactly — non-``user`` media excluded, per-sample dummy image
-      placeholders included only on the no-real-media step where the tower
-      actually runs them.
+      selection exactly, including the step where an all-dummy batch feeds its
+      image placeholders through the ViT as the FSDP anchor.
 
     Grouping media in carrier order instead would break as soon as a video turn
     precedes an image turn: each rank would reassemble the two producers'
@@ -269,12 +259,9 @@ def modality_groups(conversations: list[list[ConversationItem]] | None) -> list[
         groups.append(text)
     image_items = list(iter_desired_items(conversations, types=["image"], roles=["user"]))
     video_items = list(iter_desired_items(conversations, types=["video"], roles=["user"]))
-    if not any(not item.is_dummy for item in image_items) and not video_items:
-        # No real media: the tower feeds its dummy image placeholders through the
-        # ViT as the FSDP anchor, so those are the rows it sliced.
-        media = image_items
-    else:
-        media = [item for item in image_items if not item.is_dummy] + video_items
+    real_images = [item for item in image_items if not item.is_dummy]
+    # No real media at all: the tower runs its dummy image placeholders instead.
+    media = (real_images + video_items) if (real_images or video_items) else image_items
     if media:
         groups.append(media)
     return groups
@@ -286,9 +273,8 @@ def sp_varlen_row(
     valid_len: int,
     *,
     pos_dim: int,
-    mask_dim: int,
     group: Any,
-    sample_seqlens: Sequence[int] | None = None,
+    sample_seqlens: Sequence[int],
 ) -> tuple[torch.Tensor | None, torch.Tensor, tuple[Any, Any, int, int]]:
     """Pad a full-row position/mask pair to the window width and derive its varlen kwargs.
 
@@ -299,39 +285,25 @@ def sp_varlen_row(
     over the *padded* row because the attention all-to-all reconstructs the full
     sequence before the kernel runs.
 
-    ``sample_seqlens`` is required for a multi-row (M-RoPE) ``position_ids``:
-    ``prepare_fa_kwargs_from_position_ids`` reads boundaries off ``position_ids
-    == 0`` on a flattened single row, which for a ``[3, 1, L]`` tensor would find
-    three zeros per sample start and produce garbage offsets. Given the sample
-    lengths, the boundaries and the single pad segment are stated directly. For
-    1-D position ids the lengths are redundant and may be omitted.
+    The boundaries come from ``sample_seqlens`` rather than from
+    ``prepare_fa_kwargs_from_position_ids``: that helper finds them at
+    ``position_ids == 0`` on a flattened row, which for a multi-row (M-RoPE)
+    ``[3, 1, L]`` tensor finds three zeros per sample start and produces garbage
+    offsets. The lengths are known here anyway, so the boundaries and the single
+    pad segment are stated directly for every family.
     """
-    from veomni.utils.seqlen_pos_transform_utils import (
-        coalesce_tail_padding_cu_seqlens,
-        prepare_fa_kwargs_from_position_ids,
-    )
-
-    mask = None if attention_mask is None else sp_pad(attention_mask, dim=mask_dim, pad_value=1)
+    mask = None if attention_mask is None else sp_pad(attention_mask, dim=1, pad_value=1)
     pids = sp_pad(position_ids, dim=pos_dim, pad_value=0)
     padded_len = pids.size(pos_dim)
     tail_padding = padded_len - int(valid_len)
-    if sample_seqlens is not None:
-        bounds = [0]
-        for length in sample_seqlens:
-            bounds.append(bounds[-1] + int(length))
-        if tail_padding > 0:
-            bounds.append(padded_len)
-        cu_q = cu_k = torch.tensor(bounds, dtype=torch.int32, device=pids.device)
-        max_q = max(sample_seqlens) if sample_seqlens else 0
-        max_k = max(max_q, tail_padding)
-    else:
-        (cu_q, cu_k), (max_q, max_k) = prepare_fa_kwargs_from_position_ids(pids)
-        if tail_padding > 0:
-            cu_q = coalesce_tail_padding_cu_seqlens(cu_q, tail_padding)
-            cu_k = cu_q
-            seqlens = cu_q[1:] - cu_q[:-1]
-            max_q = int(seqlens.max().item()) if seqlens.numel() else 0
-            max_k = max_q
+    bounds = [0]
+    for length in sample_seqlens:
+        bounds.append(bounds[-1] + int(length))
+    if tail_padding > 0:
+        bounds.append(padded_len)
+    cu_q = cu_k = torch.tensor(bounds, dtype=torch.int32, device=pids.device)
+    max_q = max(sample_seqlens) if sample_seqlens else 0
+    max_k = max(max_q, tail_padding)
     return mask, slice_input_tensor(pids, dim=pos_dim, padding=False, group=group), (cu_q, cu_k, max_q, max_k)
 
 
@@ -363,15 +335,13 @@ def pack_sp_sharded_conversations_for_forward(
     full_lengths = [item_token_len(item) for item in items]
     valid_len = sum(full_lengths)
     values = [item_value_2d(item) for item in items]
-    check_shard_rows(sum(int(value.size(0)) for value in values), valid_len, ps.sp_size, ps.sp_rank)
-    position_ids, attention_mask, sample_seqlens, _ = conversation_metadata(conversations, device)
+    position_ids, attention_mask, sample_seqlens = conversation_metadata(conversations, device)
     embeds = pad_sp_shard(torch.cat(values, dim=0).unsqueeze(0), valid_len, ps.sp_size, dim=1)
     inputs_embeds_shape = torch.tensor([[length] for length in full_lengths], dtype=torch.long, device="cpu")
     return embeds, attention_mask, position_ids, inputs_embeds_shape, sample_seqlens
 
 
 __all__ = [
-    "check_shard_rows",
     "gather_sp_sharded_groups",
     "modality_groups",
     "pack_sp_sharded_conversations_for_forward",
