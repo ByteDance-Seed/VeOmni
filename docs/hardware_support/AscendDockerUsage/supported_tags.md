@@ -14,6 +14,19 @@ Two tag schemes coexist on quay.io:
 > triton-ascend and fla_npu GDN stack. General-purpose Dockerfiles remain
 > available for the legacy tags.
 
+## CANN 9.2.1: pending Quay publication
+
+These target tags are not yet confirmed available on Quay. They are listed
+for the planned publication, not as currently pullable release images.
+Build locally using the [A2](build_a2_docker.md) or [A3](build_a3_docker.md)
+guide. Workflow integration is separate in
+[PR #1470](https://github.com/ByteDance-Seed/VeOmni/pull/1470).
+
+| Target tag | Architectures | Triton / Triton-Ascend |
+| --- | --- | --- |
+| `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-910b-ubuntu22.04-py3.12-veomni` | A2: `linux/amd64`, `linux/arm64` | x86: 3.2.0 / 3.2.2; ARM: 3.5.0 / 3.2.2 |
+| `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-a3-ubuntu22.04-py3.12-veomni` | A3: `linux/arm64` | 3.5.0 / 3.2.2 |
+
 ## CANN 9.1.0
 
 ### Product-based tags

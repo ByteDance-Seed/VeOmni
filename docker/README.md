@@ -62,6 +62,11 @@ docker build -f docker/cuda/Dockerfile.cu130 \
 
 ## CANN 9.2.1 A2/A3 images
 
+See the user-facing [A2 guide](../docs/hardware_support/AscendDockerUsage/build_a2_docker.md),
+[A3 guide](../docs/hardware_support/AscendDockerUsage/build_a3_docker.md), and
+[image publication status](../docs/hardware_support/AscendDockerUsage/supported_tags.md)
+for architecture-specific build, pull and run commands.
+
 These standalone Dockerfiles use Python 3.12, torch 2.10.0,
 torch-npu 2.10.0.post7 and Transformers 5.16.1. Select the Dockerfile for
 both the NPU generation and the host architecture:

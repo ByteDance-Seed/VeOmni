@@ -56,6 +56,16 @@ Notes:
 
 ---
 
+## CANN 9.2.1
+
+CANN 9.2.1 Dockerfiles cover A2 x86/ARM64 and A3 ARM64. All three use
+system Python and include a uv cache and development dependencies. See the
+[A2 guide](build_a2_docker.md), [A3 guide](build_a3_docker.md), and
+[publication status](supported_tags.md#cann-921-pending-quay-publication).
+The Dockerfile change does not update the existing build or NPU test workflows;
+builder integration is handled separately in
+[PR #1470](https://github.com/ByteDance-Seed/VeOmni/pull/1470).
+
 ## Quick Start
 
 ### Prerequisites: Install Driver
@@ -103,7 +113,7 @@ For complete, advanced mount and training configuration (checkpoint / dataset mo
 
 Starting from a CANN base image, build locally with the in-repo Dockerfiles. For build commands, proxy configuration, and per-platform details, see:
 
-- [build_a2_docker.md](build_a2_docker.md) (x86 uses uv, arm uses pip — two environments)
+- [build_a2_docker.md](build_a2_docker.md) (CANN 9.2.1 uses system Python on both architectures; older images differ)
 - [build_a3_docker.md](build_a3_docker.md)
 
 ---
