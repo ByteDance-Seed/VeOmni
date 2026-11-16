@@ -17,22 +17,21 @@ import torch
 
 
 def require_top_k_entries(num_entries: int, num_tokens: int, top_k: int) -> None:
-    """Refuse an entry count that cannot be ``num_tokens`` groups of ``top_k``.
+    """Refuse an entry count no token could have produced under ``top_k`` slots.
 
     A shape comparison, so it costs nothing and needs no device sync -- and it catches
     what actually goes wrong in practice: a ``top_k`` that disagrees with the router, or
-    a buffer that lost entries in transit. It does not, and cannot cheaply, establish
-    that the entries are spread *evenly* over the tokens. That comes from the routing
-    itself: ``torch.topk`` returns distinct experts, so no token can appear more than
-    ``top_k`` times, and a total of ``num_tokens * top_k`` then leaves each token exactly
-    ``top_k``. A router that drops tokens or repeats an expert would break that argument
-    before it broke this check.
+    a buffer that lost entries in transit. The bound is an upper one rather than an
+    equality because hash routing (DeepSeek V4) can select the same expert twice, and
+    that repeated slot collapses to one entry while its weights are summed into the same
+    expert. So a token carries between one and ``top_k`` entries, and only a count outside
+    that range contradicts the routing. Entries are still grouped by token, which is what
+    makes the sum reproducible; the group sizes just need not be uniform.
     """
-    if num_entries != num_tokens * top_k:
+    if not num_tokens <= num_entries <= num_tokens * top_k:
         raise ValueError(
-            f"the token permutation should carry exactly top_k={top_k} entries per token, but it covers "
-            f"{num_entries} where {num_tokens} tokens need {num_tokens * top_k}. Grouping by token, which is "
-            "what makes this sum reproducible, would pair entries with the wrong token."
+            f"a token permutation of top_k={top_k} over {num_tokens} tokens covers {num_tokens}.."
+            f"{num_tokens * top_k} entries, but this one has {num_entries}."
         )
 
 
@@ -40,16 +39,16 @@ def sum_entries_per_token(
     values: torch.Tensor,
     permutation_mapping: torch.Tensor,
     num_tokens: int,
-    top_k: int,
+    top_k: int | None = None,
 ) -> torch.Tensor:
-    """Add up each token's ``top_k`` entries over an axis rather than over atomics.
+    """Add up each token's entries over an axis rather than over atomics.
 
     Both directions of the expert-parallel permutation need this sum: the unpermute
-    adds a token's ``top_k`` expert outputs, and the permute's backward adds the
-    gradient of its ``top_k`` copies. The obvious spelling of either -- ``scatter_add_``
-    on the token index, or letting autograd answer a duplicated ``index_select`` -- has
-    ``top_k`` duplicate destinations, which CUDA serves with atomics, so the same input
-    adds up in a different order on every call.
+    adds a token's expert outputs, and the permute's backward adds the gradient of its
+    copies. The obvious spelling of either -- ``scatter_add_`` on the token index, or
+    letting autograd answer a duplicated ``index_select`` -- has several duplicate
+    destinations per token, which CUDA serves with atomics, so the same input adds up
+    in a different order on every call.
 
     Measured on the 26B-A4B recipe that is not the last bit it sounds like. Two forwards
     of one batch first diverged at an expert output by a single bf16 step, and the
@@ -76,16 +75,29 @@ def sum_entries_per_token(
     sort has to be stable for that order to belong to the shape rather than to the sort's
     tie-breaking, which nothing promises to keep and no test can observe.
 
-    Only correct because top-k routing gives every token exactly ``top_k`` distinct
-    experts, so the entry count pins the grouping -- checked, because being one entry off
-    would pair entries with the wrong token and stay silent about it.
+    Top-k routing normally gives every token exactly ``top_k`` distinct experts, but a
+    hash router (DeepSeek V4) may repeat one, and a repeated slot is a single entry in
+    ``permutation_mapping`` while its weight is summed into the same expert. The grouping
+    therefore uses each token's real entry count; ``top_k`` only pins that count down when
+    no slot repeats, so it is checked when given rather than relied on.
     """
-    require_top_k_entries(permutation_mapping.numel(), num_tokens, top_k)
-    require_top_k_entries(values.shape[0], num_tokens, top_k)
+    entries_per_token = torch.bincount(permutation_mapping, minlength=num_tokens)
+    if top_k is not None:
+        require_top_k_entries(permutation_mapping.numel(), num_tokens, top_k)
+        require_top_k_entries(values.shape[0], num_tokens, top_k)
+    elif bool((entries_per_token == 0).any()):
+        raise ValueError(
+            f"every one of {num_tokens} tokens needs at least one entry in the permutation, got counts "
+            f"{entries_per_token.tolist()[:16]} for {permutation_mapping.numel()} entries."
+        )
 
-    ordered = torch.argsort(permutation_mapping, stable=True)
-    grouped = values[ordered].view(num_tokens, top_k, values.shape[-1])
-    return grouped.sum(dim=1, dtype=torch.float32).to(values.dtype)
+    ordered_indices = torch.argsort(permutation_mapping, stable=True)
+    # `segment_reduce` sums each token's contiguous run in a fixed order, so uneven run
+    # lengths (a repeated hash slot) need no reshape and no padding. It has no dtype
+    # argument, so the FP32 accumulation has to come from the cast before it.
+    return torch.segment_reduce(values[ordered_indices].float(), "sum", lengths=entries_per_token, axis=0).to(
+        values.dtype
+    )
 
 
 class _PermuteTokens(torch.autograd.Function):
@@ -98,7 +110,7 @@ class _PermuteTokens(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, tokens: torch.Tensor, permutation_mapping: torch.Tensor, top_k: int) -> torch.Tensor:
+    def forward(ctx, tokens: torch.Tensor, permutation_mapping: torch.Tensor, top_k: int | None) -> torch.Tensor:
         ctx.save_for_backward(permutation_mapping)
         ctx.num_tokens, ctx.top_k = tokens.shape[0], top_k
         return tokens.index_select(0, permutation_mapping)
@@ -110,14 +122,16 @@ class _PermuteTokens(torch.autograd.Function):
         return grad_tokens, None, None
 
 
-def permute(tokens: torch.Tensor, routing_map: torch.Tensor, top_k: int):
+def permute(tokens: torch.Tensor, routing_map: torch.Tensor, top_k: int | None = None):
     """
     Permutes the tokens according to the routing map.
 
     Args:
         tokens (torch.Tensor): The input token tensor, [num_tokens, hidden_dim].
         routing_map (torch.Tensor): The sparse token to expert mapping, [num_experts, tokens].
-        top_k (int): How many experts each token is routed to.
+        top_k (int | None): How many experts each token is routed to. Pass it to assert the
+            routing width; leave it ``None`` when the router may repeat an expert (hash
+            routing), where the real entry count is taken from ``routing_map`` instead.
 
     """
     num_tokens, _ = tokens.shape
@@ -134,7 +148,13 @@ def permute(tokens: torch.Tensor, routing_map: torch.Tensor, top_k: int):
     # already run the expert forward and its all-to-alls. Raising in the middle of that
     # leaves the other ranks in a collective, so the job hangs to a watchdog timeout
     # instead of reporting the mismatch.
-    require_top_k_entries(sorted_indices.numel(), num_tokens, top_k)
+    if top_k is not None:
+        require_top_k_entries(sorted_indices.numel(), num_tokens, top_k)
+    elif bool((torch.bincount(sorted_indices, minlength=num_tokens) == 0).any()):
+        raise ValueError(
+            f"every one of {num_tokens} routed tokens needs at least one expert entry, got "
+            f"{sorted_indices.numel()} entries for {num_tokens} tokens."
+        )
 
     # use the mapping to permute the tokens
     permuted_input = _PermuteTokens.apply(tokens, sorted_indices, top_k)

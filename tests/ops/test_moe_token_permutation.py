@@ -185,14 +185,21 @@ def test_the_permute_backward_agrees_bit_for_bit(dtype, num_tokens):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_a_permutation_it_cannot_group_is_refused(device):
-    """Fewer entries than ``num_tokens * top_k`` would silently shift the grouping."""
+    """An entry count no token could have produced is refused instead of silently mis-grouped.
+
+    A token carries one entry per *distinct* expert it was routed to, so the total lies
+    between ``num_tokens`` and ``num_tokens * top_k`` -- the floor because a routed token
+    always reaches at least one expert, the ceiling because it cannot have more distinct
+    experts than slots. Losing so many entries that some token has none falls below the
+    floor; claiming more slots than the router has rises above the ceiling.
+    """
     hidden, entries, weights_idx, mapping, routing_map = build_routing(64, device)
 
-    with pytest.raises(ValueError, match="exactly top_k"):
-        unpermute(entries[:-TOP_K], weights_idx, hidden.shape, mapping[:-TOP_K], routing_map, TOP_K)
+    with pytest.raises(ValueError, match="covers"):
+        unpermute(entries[:32], weights_idx, hidden.shape, mapping[:32], routing_map, TOP_K)
 
-    with pytest.raises(ValueError, match="exactly top_k"):
-        unpermute(entries, weights_idx, hidden.shape, mapping, routing_map, TOP_K + 1)
+    with pytest.raises(ValueError, match="covers"):
+        unpermute(entries, weights_idx, hidden.shape, mapping, routing_map, TOP_K - 1)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -206,5 +213,5 @@ def test_a_top_k_the_routing_contradicts_is_refused_before_the_experts_run(devic
     hidden, _, _, _, routing_map = build_routing(64, device)
     leaf = hidden.detach().clone().requires_grad_(True)
 
-    with pytest.raises(ValueError, match="exactly top_k"):
-        permute(leaf, routing_map, TOP_K + 1)
+    with pytest.raises(ValueError, match="covers"):
+        permute(leaf, routing_map, TOP_K - 1)
