@@ -34,6 +34,8 @@ If a field is not in this table, it is not an op-selection knob.
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `torch_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `triton` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `triton`, `fla_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
+| Kimi K3 chunked KDA | `chunk_kda_implementation` | `eager`, `ascendc` (Ascend NPU), `fla` (CUDA) | `"ascendc"` (NPU), `"eager"` (GPU) | Kimi K3 model `__init__` via an instance-local `VeomniOp`; `eager` is the `chunk_kda_naive` reference, `ascendc` runs guarded routing (SHA-pinned chunk indices, version assertions), `fla` refuses builds without the K3 gating contract |
+| Kimi K3 SituGLU | `situ_and_mul_implementation` | `eager`, `triton` (Triton-Ascend) | `"triton"` (NPU), `"eager"` (GPU) | Kimi K3 model `__init__` via an instance-local `VeomniOp`; the `eager` fp32 core is shared by the MoE expert loops |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU) | `"triton"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `qat` (FP8/FP4 QAT, SM90+), `deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
 
