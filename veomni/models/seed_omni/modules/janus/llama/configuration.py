@@ -42,13 +42,11 @@ class JanusLlamaConfig(OmniModuleConfig):
         **kwargs,
     ):
         self.text_config = LlamaConfig(**text_config) if text_config else LlamaConfig()
-        # This backbone owns no wte / lm_head, so there is nothing to tie — the
-        # real ``embed_tokens``<->head tie lives in ``janus_text_encoder``. The
-        # source Janus ``text_config`` can carry the flag True, which would drive
-        # the shared post-load tie (``checkpoint.weights.post_process_after_weight_loading``)
-        # into this module's ``nn.Identity()`` input embedding and crash with
-        # ``KeyError: 'weight'``. Force it off on both the outer + nested config so
-        # the tie is skipped (the check ANDs both sides).
-        kwargs["tie_word_embeddings"] = False
-        self.text_config.tie_word_embeddings = False
+        # This backbone owns no wte / lm_head — the real ``embed_tokens``<->head
+        # tie lives in ``janus_text_encoder``. Nothing needs to be said here:
+        # ``tie_word_embeddings_if_requested`` skips a model whose
+        # ``get_output_embeddings()`` is ``None``, and the backbone's input
+        # embedding is the ``nn.Identity`` over the sibling's ``embed_tokens``.
+        # Forcing the flag off (and rewriting the caller's nested ``text_config``)
+        # was the old workaround, and it faked a field this module does not have.
         super().__init__(**kwargs)

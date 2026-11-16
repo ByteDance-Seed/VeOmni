@@ -49,13 +49,13 @@ def _tie_word_embeddings(hf_config: Any) -> bool:
 
     Read straight from the config: ``tie_word_embeddings`` is a config field, not
     something to infer from the weight values. The framework acts on it —
-    :func:`~veomni.models.checkpoint.weights.post_process_after_weight_loading`
+    :func:`~veomni.models.checkpoint.weights.tie_word_embeddings_if_requested`
     points the head at the embedding when both the outer and nested flags allow
     it — so a value derived from the tensors here would make the module disagree
     with the very code that ties it.
 
-    The backbone holds no wte / lm_head and forces the flag off in
-    :class:`JanusLlamaConfig`, so this only has an effect on the text encoder.
+    Only the text encoder has a wte / lm_head pair; every other Janus module
+    reports ``get_output_embeddings() is None`` and the hook skips it.
     """
     outer = getattr(hf_config, "tie_word_embeddings", None)
     nested = getattr(getattr(hf_config, "text_config", None), "tie_word_embeddings", None)
