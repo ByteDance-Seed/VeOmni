@@ -113,29 +113,35 @@ class JanusTextEncoder(TextEncoder):
         conversation_list: Optional[List[ConversationItem]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        """Close the image span: fold the last image token into the tail as ``<eoi>``.
+
+        The codec's completing step leaves the 576th VQ token's embedding in the
+        tail. That token is the last thing the backbone must see of the image, so
+        dropping it here would leave it out of the KV cache and shift every token
+        that follows. The tail row is therefore *extended* with ``<eoi>`` rather
+        than replaced by it: the backbone reads ``value[-1:]``, gets ``<eoi>``, and
+        the image token before it is already part of the row it attends over.
+
+        ``infer_gen`` reaches here with a one-row tail that the backbone has already
+        consumed (its span lives in the cache), so appending changes nothing there.
+        """
         del kwargs
-        # The tail holds the image span the codec just finished. Its row count
-        # varies: one token in `infer_gen` (the span lives in the KV cache), the
-        # whole accumulated span in `infer_interleave`, where the backbone re-reads
-        # it. Only the last row feeds the `emit_image_end` step, so the type is the
-        # only contract.
         tail = conversation_list[-1]
         if tail.type != "output":
             raise ValueError(f"emit_image_end expects an output tail; got {tail.type!r}.")
-        conversation_list.pop()
         output_token_id = self._chat_template.eoi_token_id
         input_ids = self._token_id_tensor(output_token_id)
-        inputs_embeds = self.encode(input_ids)["inputs_embeds"]
-        conversation_list.append(
-            ConversationItem(
-                type="output",
-                value=inputs_embeds,
-                role="assistant",
-                meta={
-                    "collapse_cfg": True,
-                },
-            )
-        )
+        eoi_embeds = self.encode(input_ids)["inputs_embeds"]
+
+        # Keep the image rows, append <eoi>. ``maybe_merge_outputs`` below cannot be
+        # used: it needs a second output row to fold into, which is exactly what the
+        # old pop() destroyed.
+        if tail.value is not None and tail.value.dim() == 3:
+            eoi_rows = eoi_embeds.reshape(1, -1, eoi_embeds.size(-1))
+            tail.value = torch.cat([tail.value, eoi_rows.to(tail.value.device, tail.value.dtype)], dim=-2)
+        else:
+            tail.value = eoi_embeds
+        tail.meta["collapse_cfg"] = True
         return {"conversation_list": conversation_list}
 
     def _maybe_arm_cfg_for_image_gen(

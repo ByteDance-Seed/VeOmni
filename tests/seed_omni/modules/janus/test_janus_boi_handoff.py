@@ -104,8 +104,62 @@ def test_emit_image_end_accepts_an_accumulated_span():
             ConversationItem(type="text", value=torch.zeros(3), role="user"),
             ConversationItem(type="output", value=torch.zeros(1, rows, 8), role="assistant", meta={}),
         ]
+        before = conversation[-1].value.size(-2)
         encoder.emit_image_end(conversation)
-        # The span was replaced by a single ``<eoi>`` row carrying ``collapse_cfg``.
+        # ``<eoi>`` is appended, not substituted: the final image row must survive
+        # so the backbone still consumes it.
         assert conversation[-1].type == "output"
-        assert conversation[-1].value.size(-2) == 1
+        assert conversation[-1].value.size(-2) == before + 1
         assert conversation[-1].meta.get("collapse_cfg") is True
+
+
+def test_the_final_image_token_and_the_eoi_are_fed_together():
+    """The 576th VQ token must reach the cache; ``emit_image_end`` cannot drop it.
+
+    The codec's completing step leaves that token's embedding in the tail. The old
+    step popped the row and appended ``<eoi>``, so the backbone consumed ``<eoi>``
+    alone and the image token was never attended to. ``<eoi>`` is now appended, and
+    the backbone feeds both rows in one pass.
+    """
+    from veomni.models.seed_omni.modules.janus.llama.configuration import JanusLlamaConfig
+    from veomni.models.seed_omni.modules.janus.llama.modeling import JanusLlama
+    from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import JanusChatTemplate
+    from veomni.models.seed_omni.modules.janus.text_encoder.configuration import JanusTextEncoderConfig
+    from veomni.models.seed_omni.modules.janus.text_encoder.modeling import JanusTextEncoder
+
+    encoder = JanusTextEncoder(JanusTextEncoderConfig(vocab_size=16, hidden_size=8, tie_word_embeddings=True))
+    encoder._tokenizer = _FakeTokenizer()
+    encoder._chat_template = JanusChatTemplate(_FakeTokenizer())
+
+    final_token = torch.full((1, 1, 8), 5.0)
+    conversation = [ConversationItem(type="output", value=final_token, role="assistant", meta={})]
+    encoder.emit_image_end(conversation)
+    assert conversation[-1].value.size(-2) == 2, "the image token plus <eoi>"
+
+    llama = JanusLlama(
+        JanusLlamaConfig(
+            text_config={
+                "hidden_size": 8,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "num_hidden_layers": 0,
+                "vocab_size": 16,
+            }
+        )
+    )
+    llama._past_key_values = object()
+    llama.reset_local_inference_state = lambda: None
+    fed = []
+
+    def _record_forward(**kw):
+        fed.append(kw["inputs_embeds"])
+        return {"past_key_values": object(), "hidden_states": torch.zeros(1, 8)}
+
+    llama.forward = _record_forward
+    llama._tail_hidden_from_forward = lambda h: h.unsqueeze(1)
+
+    llama.generate(conversation)
+
+    # Both rows went through the backbone, the image token value among them.
+    assert fed and fed[0].size(1) == 2
+    assert torch.allclose(fed[0][0, 0], final_token[0, 0])

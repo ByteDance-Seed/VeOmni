@@ -268,9 +268,10 @@ def test_the_backbone_never_ties_itself():
         # keeps the tie there, so the head must stay tied rather than become an
         # independent copy that SFT would drift away from the embedding.
         (True, None, True, False, True),
-        # Equal stored tensors outrank an untied config: the pair is shared in the
-        # source model, so splitting it would let SFT update the two apart.
-        (False, None, True, False, True),
+        # Equal stored tensors under an explicitly untied config: HF keeps two
+        # parameters there, so the layout does too — the pair starts equal but the
+        # source model trains them apart.
+        (False, None, False, True, True),
         # Outer ``True`` beside an untied ``text_config`` with a stored, distinct
         # head: a stale top-level flag must not drop it.
         (True, False, True, True, False),
@@ -283,7 +284,7 @@ def test_the_backbone_never_ties_itself():
         "untied",
         "tied",
         "tied-with-duplicate",
-        "equal-weights-outrank-config",
+        "equal-weights-untied-config",
         "outer-tied-nested-untied-with-head",
         "outer-tied-nested-untied-no-head",
     ],

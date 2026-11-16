@@ -62,6 +62,13 @@ The layout cuts the checkpoint into one sub-checkpoint per OmniModule (SigLIP
 encoder, VQVAE codec + generation head, LLaMA backbone) at the upstream key
 prefixes, so every source tensor lands on exactly one module.
 
+> **Weights must be safetensors.** The layout reads `model.safetensors` /
+> `model.safetensors.index.json`. A legacy `.bin` root (`pytorch_model.bin[.index.json]`)
+> is refused with an explicit error rather than loaded: re-save it with
+> `model.save_pretrained(out, safe_serialization=True)` first. The Janus family
+> converter used to read `.bin` through `transformers`; that path was dropped when
+> the offline convert was routed through the layout.
+
 To materialise the modules on disk instead, run the family converter — the
 layout gives both paths, and on a checkpoint whose tie flags agree they hold
 identical module weights:
