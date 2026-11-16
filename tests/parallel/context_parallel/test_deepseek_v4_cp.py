@@ -36,6 +36,7 @@ from scripts.ci.accelerator.launch_plan import (
 from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.device import (
     IS_CUDA_AVAILABLE,
+    IS_NPU_AVAILABLE,
     get_device_type,
     get_dist_comm_backend,
     get_gpu_compute_capability,
@@ -84,7 +85,7 @@ def _accelerator_device_count() -> int:
     would raise, and this helper feeds a skip decorator, so it runs during
     collection.
     """
-    if get_device_type() not in ("cuda", "npu"):
+    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
         return 0
     return runner_device_count()
 
