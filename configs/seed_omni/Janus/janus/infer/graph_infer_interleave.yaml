@@ -35,7 +35,13 @@ states:
       - { condition: { type: module_signal, key: image_complete }, next_state: image_vq_end }
 
   image_vq_end:
+    # Two backbone steps, not one. The codec's completing step wrote the 576th VQ
+    # token's embedding into the tail, so the backbone consumes that first (it is
+    # the last image token, and without this step it never reaches the KV cache);
+    # ``emit_image_end`` then swaps the row for ``<eoi>`` and the backbone consumes
+    # that. ``infer_gen`` needs only the second step because it never resumes text.
     body:
+      - { from: janus_llama, to: janus_text_encoder.emit_image_end }
       - { from: janus_text_encoder.emit_image_end, to: janus_llama }
       - { from: janus_llama, to: end }
     transitions:
