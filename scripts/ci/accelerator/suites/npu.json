@@ -424,6 +424,15 @@
     ]
   },
   {
+    "name": "expert-bias-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/utils/test_expert_bias.py"
+    ]
+  },
+  {
     "name": "npu-e2e-40",
     "suite": "e2e",
     "args": [
