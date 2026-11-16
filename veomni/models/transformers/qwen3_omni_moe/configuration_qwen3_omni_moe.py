@@ -18,8 +18,10 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeConfig as _Qwen3OmniMoeConfig,
 )
 
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
-class Qwen3OmniMoeConfig(_Qwen3OmniMoeConfig):
+
+class Qwen3OmniMoeConfig(VeOmniPretrainedConfig, _Qwen3OmniMoeConfig):
     def __init__(
         self,
         **kwargs,

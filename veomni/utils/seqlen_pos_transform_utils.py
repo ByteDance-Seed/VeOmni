@@ -157,5 +157,5 @@ def valid_seqlens_from_cu_seqlens(cu_seqlens: torch.Tensor, tail_padding_length:
         valid_end = torch.clamp(cu_seqlens[-1:] - tail_padding_length, min=0)
         return diff[cu_seqlens[1:] <= valid_end]
 
-    pad = int((torch.flip(diff == 1, (0,)).cumprod(0)).sum().item())
+    pad = int((torch.flip(diff == 1, (0,)).int().cumprod(0)).sum().item())
     return diff[:-pad] if pad else diff

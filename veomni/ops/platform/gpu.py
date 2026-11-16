@@ -97,5 +97,8 @@ class RocmGpuPlatform(GpuPlatform):
 NVIDIA_GPU = NvidiaGpuPlatform()
 ROCM_GPU = RocmGpuPlatform()
 NVIDIA_SM70_PLUS = NvidiaGpuPlatform(min_cc=70)
+#: Ada and later. FP8 E4M3 exists in hardware from SM89; the earlier Ampere parts
+#: (SM80/SM86) have no E4M3 type at all, so a kernel that casts to it cannot run there.
+NVIDIA_SM89_PLUS = NvidiaGpuPlatform(min_cc=89)
 NVIDIA_SM90_PLUS = NvidiaGpuPlatform(min_cc=90)
 NVIDIA_SM100_PLUS = NvidiaGpuPlatform(min_cc=100)

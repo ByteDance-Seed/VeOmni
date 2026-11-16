@@ -28,6 +28,15 @@ A module's choices live in its block of the `modules` YAML, under
 | Sequence / Context parallel | `ulysses_size: U`, `cp_size: C` (one axis `> 1` per module, with `U * C = W / dp_size` and `pp_size = tp_size = 1` across all modules) | Ulysses SP on encoders/ViT, CP on long-context backbones |
 | Gradient checkpointing | `gradient_checkpointing.enable: false` | Off for cheap modules (text encoders, VAE, flow connector) |
 
+Children can inherit `expert_weight_fp8_all_gather: true` from the global accelerator.
+It enables FP8 transport only for experts whose actual `veomni_moe.impl` is
+`deepgemm_fp8`. A child without matching experts silently skips FP8 registration
+and its compatibility checks, including when the child uses DDP, FP16 or CPU
+offload. Selected experts still undergo all shape, device and FSDP checks.
+The same selection rule applies to standalone models and the composed
+`fsdp_scope: model` wrap; no separate scope flag is needed.
+See [DeepGEMM FP8 transport](../../design/deepgemm_fp8_moe.md#optional-fp8-parameter-all-gather).
+
 Two per-module properties are not accelerator settings but change how the
 module is wrapped and saved:
 

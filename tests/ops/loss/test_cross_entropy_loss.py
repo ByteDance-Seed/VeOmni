@@ -16,6 +16,12 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
+from threading import Barrier
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -23,6 +29,7 @@ from torch import Tensor
 from torch.utils._python_dispatch import TorchDispatchMode
 from transformers.loss.loss_utils import fixed_cross_entropy
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.tol import (
     CE_FUSED_ATOL,
     CE_FUSED_GRAD_ATOL,
@@ -35,7 +42,157 @@ from tests.ops.tol import (
 )
 from tests.ops.utils import make_grad_leaf
 from veomni.ops import resolve_op
+from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss as chunk_loss_impl
 from veomni.utils.device import IS_CUDA_AVAILABLE
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_chunk_loss_standalone_does_not_import_trainer():
+    program = """
+import sys
+import torch
+from veomni.ops import resolve_op
+
+callback = 'veomni.trainer.callbacks.channel_loss_callback'
+assert callback not in sys.modules
+hidden = torch.randn(2, 4, requires_grad=True)
+weight = torch.randn(7, 4, requires_grad=True)
+loss = resolve_op('cross_entropy_loss', 'standard', 'chunk_loss').wrapper(
+    hidden, torch.tensor([1, 2]), weight, chunk_size=1
+)
+loss.backward()
+assert callback not in sys.modules
+"""
+    result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+
+@contextmanager
+def _capture_chunk_tokens(target):
+    capture = {}
+    token = chunk_loss_impl._CAPTURE.set(capture)
+    try:
+        yield
+        assert "error" not in capture, capture.get("error")
+        assert isinstance(capture.get("per_token"), torch.Tensor)
+        target.append(capture["per_token"])
+    finally:
+        chunk_loss_impl._CAPTURE.reset(token)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_chunk_capture_is_nested_and_thread_local():
+    barrier = Barrier(2)
+
+    def worker(seed):
+        outer, inner = {}, {}
+        outer_token = chunk_loss_impl._CAPTURE.set(outer)
+        try:
+            inner_token = chunk_loss_impl._CAPTURE.set(inner)
+            try:
+                barrier.wait(timeout=10)
+                hidden = torch.arange(12, dtype=torch.float32).reshape(3, 4) + seed
+                weight = torch.arange(20, dtype=torch.float32).reshape(5, 4) / 11
+                labels = torch.tensor([0, 1, 2])
+                resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(
+                    hidden, labels, weight, chunk_size=2
+                )
+                expected = F.cross_entropy(F.linear(hidden, weight), labels, reduction="none")
+                torch.testing.assert_close(inner["per_token"], expected)
+                assert "per_token" not in outer
+            finally:
+                chunk_loss_impl._CAPTURE.reset(inner_token)
+            assert chunk_loss_impl._CAPTURE.get() is outer
+        finally:
+            chunk_loss_impl._CAPTURE.reset(outer_token)
+        assert chunk_loss_impl._CAPTURE.get() is None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(worker, [0, 1]))
+    assert chunk_loss_impl._CAPTURE.get() is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_chunk_observer_failure_does_not_change_main_loss_or_gradients(monkeypatch):
+    hidden = torch.randn(5, 4, requires_grad=True)
+    weight = torch.randn(7, 4, requires_grad=True)
+    labels = torch.tensor([0, 1, 2, 3, -100])
+    reference_hidden = hidden.detach().clone().requires_grad_()
+    reference_weight = weight.detach().clone().requires_grad_()
+    op = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper
+    reference = op(reference_hidden, labels, reference_weight, chunk_size=2)
+    reference.backward()
+    original = F.cross_entropy
+
+    def fail_observer(*args, **kwargs):
+        if kwargs.get("reduction") == "none":
+            raise RuntimeError("injected observer failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(F, "cross_entropy", fail_observer)
+    capture = {}
+    token = chunk_loss_impl._CAPTURE.set(capture)
+    try:
+        actual = op(hidden, labels, weight, chunk_size=2)
+    finally:
+        chunk_loss_impl._CAPTURE.reset(token)
+    actual.backward()
+    assert "injected observer failure" in capture["error"]
+    assert "per_token" not in capture
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    torch.testing.assert_close(hidden.grad, reference_hidden.grad, rtol=0, atol=0)
+    torch.testing.assert_close(weight.grad, reference_weight.grad, rtol=0, atol=0)
+    with pytest.raises(AssertionError, match="injected observer failure"), _capture_chunk_tokens([]):
+        op(hidden.detach(), labels, weight.detach(), chunk_size=2)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("bias_kind", ["full", "factored"])
+@pytest.mark.parametrize("trainable", ["all", "bias_only", "none"])
+@pytest.mark.parametrize("all_ignored", [False, True])
+def test_chunk_observer_preserves_logits_bias_and_gradients(bias_kind, trainable, all_ignored):
+    """Observation must preserve both bias forms, including bias-only gradients."""
+    from torch.autograd.graph import saved_tensors_hooks
+
+    torch.manual_seed(712)
+    hidden = torch.randn(2, 7, 8)
+    weight = torch.randn(19, 8)
+    bias = torch.randn(2, 7, 4 if bias_kind == "factored" else 19)
+    tensors = [hidden, weight, bias]
+    if bias_kind == "factored":
+        tensors.append(torch.randn(19, 4))
+    labels = torch.randint(0, 19, (2, 7))
+    labels[:, 1:3] = -100
+    if all_ignored:
+        labels.fill_(-100)
+
+    results, captured = [], []
+    for observe in (False, True):
+        args = [
+            tensor.detach().clone().requires_grad_(trainable == "all" or (trainable == "bias_only" and i >= 2))
+            for i, tensor in enumerate(tensors)
+        ]
+        context = _capture_chunk_tokens(captured) if observe else nullcontext()
+        with context, saved_tensors_hooks(lambda tensor: tensor.detach().clone(), lambda tensor: tensor):
+            loss = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(
+                args[0], labels, args[1], *args[2:], chunk_size=3
+            )
+            if loss.requires_grad:
+                loss.backward()
+        results.append((loss.detach(), *(arg.grad for arg in args)))
+
+    for actual, expected in zip(results[1], results[0], strict=True):
+        if expected is None:
+            assert actual is None
+        else:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    logits = F.linear(hidden, weight)
+    logits = logits + (F.linear(bias, tensors[3]) if bias_kind == "factored" else bias)
+    expected_tokens = F.cross_entropy(logits.reshape(-1, 19), labels.reshape(-1), reduction="none").reshape_as(labels)
+    assert len(captured) == 1
+    assert not captured[0].requires_grad
+    assert not torch._C._functorch.is_functorch_wrapped_tensor(captured[0])
+    torch.testing.assert_close(captured[0], expected_tokens)
 
 
 class _FullWeightAddCounter(TorchDispatchMode):

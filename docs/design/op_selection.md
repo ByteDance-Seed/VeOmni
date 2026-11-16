@@ -6,8 +6,10 @@ cross-entropy, load-balancing loss, GatedDeltaNet ops, DSA, mHC, and Qwen4-Exp Q
 handles. There is no process-global bind and no silent eager fallback after
 an optimized row is selected.
 
-`qat_implementation` is the one field that is not a registry row. It selects
-a fake-quantization recipe consumed by `veomni/ops/qat/`.
+Quantization-aware training is not a separate recipe. Each family that can round
+its operands owns a `qat` row, and stored KV/indexer activations round through the
+`kv_round` family. Selecting them is independent per family, so a run can quantize
+only the GEMMs, only the stored activations, or both.
 
 ## Quick Reference
 
@@ -17,37 +19,149 @@ If a field is not in this table, it is not an op-selection knob.
 
 | Op | Config field | Available values | Default | Selection time |
 |--------|-------------|------------------|---------|----------------|
-| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `aiter`, `magi_attention`, `sage_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` rewrite + model `__init__` via `VeomniOp("attention", "standard", config._attn_implementation)` stored on the attention module |
+| Attention | `attn_implementation` | `eager`, `sdpa`, `flash_attention_2`, `flash_attention_3`, `flash_attention_4`, `flex_attention`, `aiter`, `magi_attention`, `sage_attention`, `native-sparse` | `"flash_attention_2"` | Config `__post_init__` rewrite + model `__init__` via `VeomniOp("attention", "standard", config.ops_config.attn_implementation)` stored on the attention module |
 | DSA indexer | `dsa_indexer_implementation` | `eager`, `cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | DSA attention | `dsa_attention_implementation` | `eager`, `flashmla_cudnn` (GLM-DSA), `tilelang` (DeepSeek-V4), `triton` (DeepSeek-V4), `cann` (DeepSeek-V4) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | mHC | `mhc_implementation` | `eager`, `tilelang` (DeepSeek-V4, SM90+), `cann` (DeepSeek-V4, Ascend) | `"eager"` | Model `__init__` via three instance-local `VeomniOp`s (`pre`, `post`, `head`) |
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel`, `qat` (FP8 QAT, SM90+) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Dense projection | `linear_implementation` | `eager`, `qat` (FP8 QAT, SM90+) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants). **DeepSeek-V4 is currently the only consumer** — the row exists for any model, but no other model binds it yet |
+| KV / indexer storage round | `kv_round_implementation` | `none`, `eager`, `triton` (NVIDIA SM89+, ROCm) | `"none"`; there is no host default | Model `__init__` via an instance-local `VeomniOp` on the `deepseek_v4` variant, which fixes the model's two geometries; the `standard` variant is model-agnostic and takes them as call arguments. **DeepSeek-V4 is the only consumer** |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `torch_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `triton` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `triton`, `fla_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU) | `"triton"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
-| QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Model `__init__` stores `self.qat_implementation`; patched helpers consume that bound recipe |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `qat` (FP8/FP4 QAT, SM90+), `deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
 
-`qat_implementation` has no per-model registry variants. `fp8_blockwise` is
-rejected at config-parse time on anything but an SM90+ NVIDIA CUDA GPU.
-It also cannot be combined with `moe_implementation: deepgemm_fp8`; that
-backend requires `qat_implementation: none` because it already quantizes
-the expert GEMM operands. Conflicting selections raise at config-parse time.
-Constructed DeepSeek-V4 modules freeze the recipe on `self.qat_implementation`;
-changing the process-global ops config later does not retarget an existing
-instance.
+### Quantization is chosen per op, not as a recipe
 
-**The seven general-purpose op fields default per host.** They default to
+Every family that can round its operands owns a `qat` row, and each is selected on
+its own field. There is no recipe name to switch on and no requirement that the
+selections agree: one run can fake-quantize the dense projections while the routed
+experts stay in the model dtype, or round the stored KV while every GEMM runs
+full precision. Any subset is valid, and the resulting numerics are simply the
+subset's.
+
+That independence is the point. A deployment kernel rounds whatever that kernel
+rounds, and the model's families are usually on different paths — the attention
+projections, the shared expert's SwiGLU, the routed experts and the KV cache are
+four different kernels in inference, with four different granularities. Binding
+them to one switch forces a training run to simulate rounding it does not have.
+
+The geometry is independent too, at two levels.
+
+**Across rows:** every row carries its own keyword argument with its own default,
+so the three GEMM families and the storage round trip can each run a different
+width in the same job. Nothing links them: `linear` at 128 and `kv_round` at 64 is
+an ordinary combination.
+
+**Across call sites of one row:** the argument travels with the call, not with the
+implementation name, so one model can round the same row differently in different
+places. DeepSeek-V4 does exactly that: a stored KV entry passes
+`rope_features=qk_rope_head_dim`, which selects 64-wide groups over the NoPE prefix
+and leaves the RoPE tail in the model dtype, while an indexer activation passes
+`rope_features=None` and rounds its whole head in 128-wide groups — both through the
+same `kv_round`/`deepseek_v4` row. The variant owns the two geometries, so the
+numbers live in one place and neither call site repeats them; a row named after a
+width would have needed a second row for the second site without changing what the
+kernel does.
+
+| Argument | Row | What it selects |
+| --- | --- | --- |
+| `block_size` | `linear`, `swiglu_mlp`, `moe_experts` (`qat`) | Channels sharing one scale. One number drives **both** operands: the `1 x block_size` activation blocks and the square `block_size x block_size` weight tiles |
+| `block_size` | `kv_round` (`standard`) | Group width over the last dimension |
+| `quant_features` | `kv_round` (`standard`) | How many leading channels to round, so a call can stop partway through the last dimension |
+| `rope_features` | `kv_round` (`deepseek_v4`) | Which of the model's two geometries applies: pass the trailing RoPE channels for a KV entry, or `None` to round a whole indexer head |
+| `expert_dtype` | `moe_experts` (`qat`) | `fp8` tiles or `fp4` groups, following the checkpoint |
+
+One limitation worth stating plainly: on the GEMM rows a single `block_size` sets
+the activation block *and* the weight tile, because the deployment recipe ties them
+(the FP8 GEMM indexes a weight's scale by the same block counter as the
+activation's). A recipe that used different widths for the two operands would need
+the row to take them separately; none does today.
+
+These arguments are **not** `model.ops_implementation` fields. They are parameters
+of the registered row, resolved at the call site, so changing one is a modeling
+change rather than a config change. What the config decides is *which row runs*.
+
+The `linear` rows take the projection **module** rather than a weight tensor, so a
+model writes `self.veomni_q_a_proj(self.q_a_proj, x)`. Whether a projection can be
+driven by its weight, or has to run its own `forward`, is decided once inside the
+family (`veomni/ops/kernels/linear/_module.py`). Adapters are why: a `LoraLinear`
+keeps the real layer at `base_layer` and owns no `weight`, so a weight-taking call
+site would break the moment someone attached an adapter. A reference row calls the
+wrapped module; a quantizing row refuses rather than training at full precision
+under a config that claimed otherwise.
+
+Selecting every family is a legitimate configuration — it makes training see
+exactly what an FP8 deployment computes — and `configs/text/deepseek_v4_qat.yaml`
+is that example:
+
+```yaml
+ops_implementation:
+  linear_implementation: qat          # attention and indexer projections
+  swiglu_mlp_implementation: qat      # the shared expert's fused SwiGLU
+  moe_implementation: qat             # routed experts, per the checkpoint's expert_dtype
+  kv_round_implementation: triton     # stored KV and indexer logits
+```
+
+Leaving any of them at its reference row trains that family in the model dtype.
+`kv_round_implementation` is the one field with an explicit `none` value, because
+its reference row rounds: every other family spells "off" as `eager`, which there
+already does nothing. Registering `none` as a row rather than asking callers to skip
+a missing handle keeps the field shaped like the rest — the model always builds its
+handle and the row decides. The variant is `deepseek_v4` whenever a model selects
+this row: the model names its own variant, and the config only chooses the
+implementation.
+
+One thing is rejected rather than run: a row's hardware and package `requires` are
+checked when its handle is built, so an unavailable selection raises instead of
+falling back to `eager`.
+
+A second rejection covers the paths a row cannot serve. A fake-quantizing row reads
+the weights it is handed, so a branch that bypasses it would train at full precision
+while the config still said QAT. Three of them refuse instead of falling through,
+each where the information lives:
+
+- **An activation no quantizing row implements** is refused at *config load* by
+  `configuration_base._reject_quantized_swiglu_on_an_unfused_activation`. The
+  model's gate excludes those activations before the handle is called, so without
+  the check the config would claim QAT and quantize nothing. Failing at load also
+  beats failing on step one. `swiglu_mlp.FUSED_ACTIVATIONS` holds the set.
+- **A projection that is not an exact `nn.Linear`** is refused by
+  `has_plain_linear_projections` when it calls `reject_quantizing_row`: a
+  projection wrapped after construction (LoRA keeps the base layer at
+  `base_layer`, so there is no `weight`), or an `nn.Linear` subclass such as
+  torchao's `Float8Linear`, whose own forward computes the GEMM.
+- **Expert LoRA on a quantizing experts row** is refused by `_moe_lora_op`,
+  because no adapter forward would quantize the base weights.
+
+Only quantizing rows are affected — every reference row keeps its fallback. The
+routed-expert side has its own refusals, at two levels: `moe_implementation='qat'`
+with a non-SwiGLU activation is refused in the model's expert forward (the
+activation is fused into the grouped GEMM there, so the Python fallback genuinely
+cannot quantize), and expert LoRA is refused as above.
+
+There is no cross-family conflict to reject. `deepgemm_fp8` and `qat` are two
+values of the same `moe_implementation` field, so the routed experts cannot be
+quantized twice; the dense families are separate GEMMs, so pairing them with
+DeepGEMM experts is a valid recipe -- and the only way to quantize the shared
+expert, which DeepGEMM does not cover.
+
+torchao-backed formats register as further rows on the same families, on top of
+this mechanism. Their rows are added by the PRs that own those formats.
+
+**The nine general-purpose op fields default per host.** They default to
 `None`, and config `__post_init__` fills each unset field from the host table.
+`kv_round_implementation` is the exception: `None` there means *off*, not
+"use the host default", so an unset field never turns storage rounding on.
 On Ascend NPU, unset fields resolve to `torch_npu` for RMSNorm, rotary embedding and
 its vision-layout selection; to `chunk_loss` for cross-entropy; to `fused_npu`
-for MoE; and to `eager` for SwiGLU and load-balancing loss. Explicit
+for MoE; and to `eager` for SwiGLU, dense projection and load-balancing loss. Explicit
 values are never rewritten, so an explicit GPU value such as `liger_kernel` or
 `fused_triton` raises on NPU. Qwen3.5's three GatedDeltaNet fields are
 model-specific and are not in the host table. Their `fla` default also registers on Ascend NPU. Set
@@ -60,10 +174,11 @@ says what a row calls, so an Ascend row is `torch_npu`, `triton` for vendored
 Triton-Ascend, `cann` for `cann_ops_transformer`, or `fla_npu`. PyTorch math
 that merely runs on NPU is `eager`. MoE keeps `fused_npu`, in line with the
 other `fused_*` group-gemm backends. The
-`unweighted` RMSNorm variant (Flux, LTX-2.3, DeepSeek-V4) resolves
-`rms_norm_implementation: torch_npu` to `eager`, while the weighted variants keep
-their `torch_npu` rows. Any other variant without a row for the selected value
-fails at model build and lists the registered implementations.
+`unweighted` RMSNorm variant (Flux, LTX-2.3, DeepSeek-V4) supports only `eager`
+on NPU. Leave `rms_norm_implementation` unset or select `eager`; explicit
+`torch_npu` (including the deprecated `npu` alias) fails at module construction.
+Any variant without a row for the selected value fails and lists its registered
+implementations.
 
 **MLU `liger_kernel` rows require the Cambricon liger build.** `rms_norm`,
 `rope`, `swiglu_mlp`, and `cross_entropy_loss` register `liger_kernel`
@@ -85,6 +200,35 @@ former `npu` implementation names still parse with a deprecation warning; see th
 
 ---
 
+### Loading a config written before the per-family rows
+
+Temporary. New saves never produce this shape, and the migration in
+`veomni/models/legacy_qat_selections.py` will be removed.
+
+A model config records whatever ops fields existed when it was written, so a
+checkpoint exported before this refactor still carries `qat_implementation`.
+`_resolve_ops()` translates it before validation — one choke point every path
+reaches, so `from_pretrained`, a re-save and a caller override all behave alike.
+
+| Retired value | Becomes |
+|---|---|
+| `qat_implementation: none` | *(dropped)* — "train in the model dtype" is an unset field today, so nothing else changes. This covers essentially every published checkpoint, because `none` was the default |
+| `qat_implementation: fp8_blockwise` | `ValueError` naming the replacement fields. It cannot translate here: which rows apply depends on the model's families, and a Qwen3 checkpoint has neither routed experts nor a KV cache |
+
+Select a quantized run explicitly instead:
+
+```yaml
+ops_implementation:
+  linear_implementation: qat
+  swiglu_mlp_implementation: qat
+  moe_implementation: qat
+  kv_round_implementation: triton
+```
+
+To drop the compatibility, delete `veomni/models/legacy_qat_selections.py` and the
+one import in `configuration_base._resolve_ops` (search for
+`legacy_qat_selections`). An old config then fails to load instead of migrating.
+
 ## Lifecycle Overview
 
 ```
@@ -101,11 +245,11 @@ OpsImplementationConfig.__post_init__()       # (2) config parse time
 
 VeOmniModelRuntime._build_model()             # (3) model build time
   └─ models.build_foundation_model(..., ops_implementation=ops)
-       ├─ set_ops_config(ops)
+       ├─ config._apply_ops_overrides(ops_implementation=ops)
        └─ model init + weight loading
-            ├─ patched modules construct local VeomniOp handles
+            ├─ patched modules construct local VeomniOp handles from config.ops_config
             ├─ registry validates row hardware + optional packages
-            ├─ VeomniOp("attention", "standard", config._attn_implementation)
+            ├─ VeomniOp("attention", "standard", config.ops_config.attn_implementation)
             ├─ self.veomni_ce = VeomniOp("cross_entropy_loss", ...)
             ├─ self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
             └─ RMSNorm / RoPE / SwiGLU / MoE / DSA / mHC bind local handles
@@ -123,13 +267,19 @@ Transformers' `LOSS_MAPPING`. Each model resolves its configured CE row once,
 stores an instance-local `VeomniOp`, and binds that handle to the model
 helper with `functools.partial`; there is no per-forward implementation lookup.
 
-**Ownership.** `models.build_foundation_model` installs the supplied
-`ops_implementation` through `set_ops_config` before constructing the
-model. Callers that provide neither an explicit config nor a previously
-installed ops config receive `ValueError`; there is no silent all-eager
-fallback.
+**Ownership.** `models.build_foundation_model` attaches the supplied
+`ops_implementation` onto the model `PretrainedConfig` (exposed as
+`config.ops_config`) before constructing the model. Callers that provide neither
+an explicit `ops_implementation` nor a `PretrainedConfig` with `ops_implementation`
+populated receive `ValueError`; there is no silent all-eager fallback.
 
 ---
+
+Configuration lifecycle, recursive HF adapters, override precedence, and model
+entry-point contracts are documented in [Module-level configuration](module_config.md).
+Importing VeOmni does not modify HF's `PretrainedConfig` methods. The
+`ops_implementation` dictionary is the only attention selection state;
+`_attn_implementation` and HF's private attention accessor read that dictionary.
 
 ## 1. Attention
 
@@ -147,7 +297,7 @@ model:
 
 | Public value | Implementation | Sequence Parallel | Requirements |
 |-------|--------|:-:|---|
-| `eager` | PyTorch | No | — |
+| `eager` | Model-local PyTorch eager; otherwise `veomni_sdpa` | Yes for the SDPA path | — |
 | `sdpa` | `F.scaled_dot_product_attention` | Yes after rewrite to `veomni_sdpa` | — |
 | `flash_attention_2` | Flash Attention v2 | Yes after rewrite | `flash-attn` |
 | `flash_attention_3` | Flash Attention v3 | Yes after rewrite | `flash-attn-interface` |
@@ -175,7 +325,7 @@ public values to VeOmni adapters:
 `apply_veomni_attention_patch()` registers those names and matching mask
 builders on Transformers' `ALL_ATTENTION_FUNCTIONS` /
 `ALL_MASK_ATTENTION_FUNCTIONS`. Patched modeling constructs
-`VeomniOp("attention", "standard", config._attn_implementation)` in
+`VeomniOp("attention", "standard", config.ops_config.attn_implementation)` in
 `__init__` (or `modify_init`) and stores `self.veomni_attn`. `forward` calls
 that handle. The registered row looks up the same Transformers interface.
 
@@ -185,11 +335,12 @@ ROCm-only GPU requirement and does not resolve on NVIDIA, Ascend, or MLU. Both
 `veomni_flash_attention_aiter` name are rejected on Ascend before Transformers
 can select its NPU attention path.
 
-`eager` resolves the modeling file's own `eager_attention_forward`, as in
-Transformers. Flux, Qwen-Image, LTX-2.3, and MiniMax-H3 define none, so
-they read the field with `resolve_op_impl("attn_implementation",
-eager_as="veomni_sdpa")`. Their masked fallback for a mask-less backend is
-also `veomni_sdpa`.
+The registered `eager` row uses the modeling file's `eager_attention_forward`
+when present, preserving model-specific math such as softcap and attention
+sinks. For modules without one (Flux, Qwen-Image, LTX-2.3, MiniMax-H3), that row
+forwards to `veomni_sdpa`, including its mask, packed-sequence, and Ulysses
+handling. Modeling reads `config.ops_config.attn_implementation` directly.
+Masked calls with a mask-less backend still use a separate `veomni_sdpa` handle.
 
 FlexAttention requires a model-provided native `BlockMask`; VeOmni does not
 construct model-specific visibility. With Ulysses enabled, the mask must be
@@ -325,7 +476,64 @@ model cannot be patched.
 - Registration: `veomni/ops/kernels/loss/__init__.py`
 - Implementations: `veomni/ops/kernels/loss/cross_entropy_loss/standard/`
 - Model policy: `veomni/models/loss_utils/cross_entropy_loss.py`
-- Log-probs/distillation side paths: `veomni/models/loss_utils/`
+
+### Per-Token Log-Probabilities and Chunked RL / Distillation (`token_logprobs`)
+
+When `ForCausalLMLoss` runs with `return_log_probs=True` (PPO/GRPO log-prob and
+entropy recompute, or top-k forward-KL distillation), it delegates to
+`chunk_logprobs_function` and `chunk_topk_distill_function` in
+`veomni/models/loss_utils/`. The tensor-level chunked `torch.autograd.Function`
+kernels (`_ChunkedLinearLogProbs`, `_ChunkedLinearTopkDistill`) live in
+`veomni/ops/kernels/loss/token_logprobs/chunked.py`, while the per-token
+log-probability step dispatches through the `("token_logprobs", "standard")`
+operation family on `OP_REGISTRY`:
+
+| Value | Implementation | Default device | Requirements |
+|-------|---------------|----------------|---|
+| `flash_attn` | `flash_attn.ops.triton.cross_entropy.cross_entropy_loss` | GPU (`cuda`) | `flash_attn.ops.triton.cross_entropy` on GPU |
+| `torch_npu` | `torch_npu.npu_cross_entropy_loss` | Ascend NPU (`npu`) | Ascend NPU |
+| `eager` | PyTorch `clamp + log_softmax + gather + where` | CPU / fallback | — |
+
+Selection and fallback semantics:
+
+- **Device defaults (`impl=None`)**: On GPU, automatic selection chooses
+  `flash_attn` when `flash_attn.ops.triton.cross_entropy` is available and
+  importable, and otherwise falls back to `eager` (including when the package is
+  discoverable via `find_spec` but its compiled extension raises `ImportError`
+  at runtime). On Ascend NPU, automatic selection chooses `torch_npu` and falls
+  back to `eager` if `torch_npu.npu_cross_entropy_loss` is unavailable.
+- **CPU tensor behavior**: When `impl=None` and the input tensor is on `"cpu"`,
+  `resolve_token_logprobs_op` selects `eager` directly so CPU unit tests and
+  host tensors on GPU/NPU machines do not dispatch into accelerator-only
+  kernels.
+- **Explicit implementation (`impl="flash_attn" | "torch_npu" | "eager"`)**:
+  Explicit selection is strict and never falls back. Unmet hardware or package
+  requirements raise `RuntimeError` during `OP_REGISTRY` resolution, and broken
+  runtime imports raise `ImportError`.
+
+```python
+from veomni.models.loss_utils import chunk_logprobs_function, chunk_topk_distill_function
+from veomni.ops.kernels.loss.token_logprobs.chunked import resolve_token_logprobs_op
+
+# Direct per-token log-probabilities op handle:
+token_logprobs_op = resolve_token_logprobs_op(device_type=logits.device.type)
+log_probs = token_logprobs_op(logits, labels, ignore_index=-100)
+
+# Model-facing chunked fused-linear helpers (optional impl or op override):
+log_probs, entropy = chunk_logprobs_function(
+    hidden_states, weights, labels, chunk_size=1024, impl=None
+)
+log_probs, entropy, distill, student_mass, teacher_mass = chunk_topk_distill_function(
+    hidden_states, weights, labels, teacher_topk_ids, teacher_topk_log_probs, chunk_size=1024, impl=None
+)
+```
+
+Key files:
+
+- Registration: `veomni/ops/kernels/loss/__init__.py`
+- Row implementations: `veomni/ops/kernels/loss/token_logprobs/standard/{eager,flash_attn,torch_npu}.py`
+- Chunked autograd kernels: `veomni/ops/kernels/loss/token_logprobs/chunked.py`
+- Model-facing policy (SP guard, causal shift, trailing zero pad): `veomni/models/loss_utils/{chunk_logprobs,chunk_topk_distill}.py`
 
 ---
 
@@ -352,7 +560,7 @@ model:
 | Value | Implementation | Requirements |
 |-------|---------------|---|
 | `liger_kernel` | Registered Liger RMSNorm row | `liger-kernel` package |
-| `npu` | Registered `torch_npu.npu_rms_norm` row for `standard`, `offset`, and `deepseek_v4`; `unweighted` resolves `npu` to `eager` | `torch_npu` |
+| `npu` | Registered `torch_npu.npu_rms_norm` row for `standard`, `offset`, and `deepseek_v4`; rejected for `unweighted` | `torch_npu` |
 | `triton` | Registered model-specific Triton row (for example DeepSeek-V3 batch-invariant RMSNorm) | `triton` |
 | `eager` | Registered PyTorch reference row | — |
 
@@ -376,6 +584,17 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 | `liger_kernel` | Registered Liger SwiGLU row | `liger-kernel` package |
 | `eager` | Registered PyTorch reference row | — |
 
+#### `linear_implementation`
+
+| Value | Implementation | Requirements |
+|-------|---------------|---|
+| `eager` | Registered `F.linear` row | — |
+
+Both quantizing rows refuse to run on a projection substituted after
+construction (LoRA keeps the base layer at `base_layer` and owns no `weight`):
+they raise instead of forwarding the unquantized base, because a graceful
+fallback would leave the config claiming quantization-aware training.
+
 ### What gets patched
 
 Patchgen-generated modeling constructs a model-local `VeomniOp` handle and
@@ -388,6 +607,7 @@ weight stay on the model side.
 | `rms_norm_implementation` | `{Model}RMSNorm` | `VeomniOp("rms_norm", variant, impl)` |
 | `rotary_pos_emb_implementation` | `apply_rotary_pos_emb` | `VeomniOp("rope", variant, impl)` |
 | `swiglu_mlp_implementation` | `{Model}MLP.forward` | `VeomniOp("swiglu_mlp", "standard", impl)` |
+| `linear_implementation` | `{Model}Attention.q/k/v/o_proj` | `VeomniOp("linear", "standard", impl)` |
 
 The selected registry row determines the callable and validates its hardware
 and optional-package requirements when the handle is constructed.
@@ -403,9 +623,9 @@ supported values are `triton` and `eager`.
 
 ### Key files
 
-- Config singleton: `veomni/ops/config.py` — `get_ops_config()`, `set_ops_config()`
+- Config base class: `veomni/models/configuration_base.py` — `VeOmniPretrainedConfig`, `config.ops_config`
 - Unified registry: `veomni/ops/registry.py` — `register_op()`, `resolve_op()`, `VeomniOp`
-- Backend registration: `veomni/ops/kernels/{rms_norm,rope,swiglu_mlp}/__init__.py`
+- Backend registration: `veomni/ops/kernels/{rms_norm,rope,swiglu_mlp,linear}/__init__.py`
 - Model integration: `veomni/models/transformers/{model}/*_patch_gen_config.py`
 
 ---
@@ -433,10 +653,10 @@ model:
 The Ascend gated RMSNorm uses `torch_npu`. The Ascend causal Conv1D and gated
 delta-rule implementations are vendored MindSpeed-MM Triton kernels named
 `triton` and additionally require `triton-ascend`. The gated delta rule has a
-second Ascend backend, `fla_npu`, an AscendC fused `torch.ops.npu.*` path that
-requires a manual `fla_npu` install. Registrations live in
-`veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and allowed
-values are documented by `OpsImplementationConfig`.
+second Ascend backend, `fla_npu`, a fused AscendC path called through
+`fla_npu.ops.ascendc` that requires a manual `fla_npu` install. Registrations
+live in `veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and
+allowed values are documented by `OpsImplementationConfig`.
 
 ---
 
@@ -512,7 +732,7 @@ raise during config validation or op binding.
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
 | `fused_mlu` | Apex grouped-GEMM | Cambricon MLU | Yes |
 
-Patched experts modules construct `VeomniOp("moe_experts", variant, resolve_op_impl("moe_implementation"))`
+Patched experts modules construct `VeomniOp("moe_experts", variant, config.ops_config.moe_implementation)`
 in `__init__` and always call that handle. `eager` is a registered row, not a
 separate `ModuleList` fork. LoRA experts follow the wrapped module's
 `veomni_moe.impl` and fall back to `eager` when that `moe_experts_lora` row is
@@ -538,7 +758,7 @@ CANN and `torch_npu` stack to enable the fused activation.
 
 - Config: `veomni/arguments/arguments_types.py` — `OpsImplementationConfig`
 - Registration: `veomni/ops/kernels/moe_experts/__init__.py`
-- Config helper: `veomni/ops/config.py` — `resolve_op_impl("moe_implementation")`
+- Config base class: `veomni/models/configuration_base.py` — `config.ops_config.moe_implementation`
 - Model integration: `veomni/models/transformers/*/*_patch_gen_config.py`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 
@@ -605,7 +825,7 @@ All four are defined in `transformers.integrations`:
 
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
-| **Mechanism** | `apply_veomni_attention_patch()` registers SP-aware `veomni_*` names into `ALL_ATTENTION_FUNCTIONS`; patched models bind `VeomniOp("attention", "standard", config._attn_implementation)` in `__init__` and call `self.veomni_attn` | Same `ALL_ATTENTION_FUNCTIONS` registry. Additionally supports hub-based attention kernels via `attn_implementation="kernels-community/flash-mla"` syntax (loaded by `load_and_register_attn_kernel()`). |
+| **Mechanism** | `apply_veomni_attention_patch()` registers SP-aware `veomni_*` names into `ALL_ATTENTION_FUNCTIONS`; patched models bind `VeomniOp("attention", "standard", config.ops_config.attn_implementation)` in `__init__` and call `self.veomni_attn` | Same `ALL_ATTENTION_FUNCTIONS` registry. Additionally supports hub-based attention kernels via `attn_implementation="kernels-community/flash-mla"` syntax (loaded by `load_and_register_attn_kernel()`). |
 | **Config** | `OpsImplementationConfig.attn_implementation` | `config._attn_implementation` (set via `AutoModel.from_pretrained(attn_implementation=...)`) |
 | **SP rewrite** | `__post_init__` rewrites `flash_attention_2/3/4`, `flex_attention`, `magi_attention`, `sage_attention`, and `sdpa` to `veomni_*` | No SP support — upstream Transformers does not handle Ulysses SP |
 | **Compatibility** | VeOmni registers into the **same** `ALL_ATTENTION_FUNCTIONS` registry that Transformers uses, so the two are compatible by design |
@@ -731,7 +951,7 @@ currently exist in the `kernels-community` hub.
 | RMSNorm | Instance-local `VeomniOp` with variants | `@use_kernel_forward_from_hub` | Parallel — both can apply | VeOmni covers Qwen3.5's `+1` variant explicitly |
 | RoPE | Instance-local `VeomniOp` with variants | `@use_kernel_forward_from_hub` + `@use_kernelized_func` | Parallel | VeOmni adds an NPU partial-RoPE variant |
 | SwiGLU MLP | Instance-local `VeomniOp` | Not annotated in MoE models (MLP is per-expert, not standalone) | VeOmni only | — |
-| Attention | Instance-local `VeomniOp("attention", "standard", config._attn_implementation)` plus shared `ALL_ATTENTION_FUNCTIONS` | `ALL_ATTENTION_FUNCTIONS` (same registry) | Yes | VeOmni adds SP wrapping |
+| Attention | Instance-local `VeomniOp("attention", "standard", config.ops_config.attn_implementation)` plus shared `ALL_ATTENTION_FUNCTIONS` | `ALL_ATTENTION_FUNCTIONS` (same registry) | Yes | VeOmni adds SP wrapping |
 | MoE experts | Instance-local `VeomniOp("moe_experts", ...)` | `@use_experts_implementation` (batched_mm/grouped_mm) | No — different dispatch paths | VeOmni uses registered fused rows; HF uses PyTorch native `grouped_mm` |
 | Cross-entropy | Instance-local `VeomniOp` + model helper | `LOSS_MAPPING` (standard `F.cross_entropy`) | VeOmni only | HF has no fused loss selection |
 | MoE aux loss | Instance-local eager/Triton `VeomniOp` + model helper | Eager `load_balancing_loss_func` | VeOmni only | HF has no fused selection surface |
@@ -780,3 +1000,14 @@ Temporary packing storage trades memory traffic for fewer collective launches.
 `tests/models/test_qwen4_exp_gdn_exchange.py` covers exact CPU/Gloo permutations,
 projection view storage, and native NCCL/HCCL model parity with same/mixed dtypes.
 CPU tests do not establish native throughput or numerical acceptance.
+
+### EP-weighted token combine
+
+The shared EP dispatcher uses `moe_unpermute/standard/triton` on NVIDIA GPUs
+and `moe_unpermute/standard/eager` elsewhere or when deterministic algorithms
+are enabled. This internal device selection
+applies to BF16 and FP8 MoE backends and has no separate YAML switch. The fused
+implementation requires Triton and does not silently fall back if it is
+unavailable. It preserves promoted-dtype multiplication followed by FP32
+scatter accumulation; the EP dispatcher casts the combined result back to the
+original token dtype. See [FP8 MoE](deepgemm_fp8_moe.md#whole-expert-fsdp-sharding-and-ep-combine).

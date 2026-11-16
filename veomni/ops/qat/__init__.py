@@ -18,13 +18,16 @@ These are functional helpers: model code calls them directly because which
 tensor gets quantized at which granularity is a property of the model's
 quantization recipe rather than a selectable op implementation.
 
-The recipes implemented so far are DeepSeek-V4's: block-wise FP8 everywhere
-except the routed experts of a V4-Flash checkpoint, whose weights are FP4. Both
-reuse the V4 TileLang quantizers in :mod:`veomni.ops.qat.quant`, so training
-stays bit-aligned with inference by construction. Quantizing calls require an
-NVIDIA SM90 or later GPU and load the backend lazily, so importing this package
-on CPU or NPU stays free. ``qat_linear(..., enabled=False)`` bypasses
-quantization and its hardware and dependency checks.
+The recipes implemented here are DeepSeek-V4's: block-wise FP8 everywhere except
+the routed experts of a V4-Flash checkpoint, whose weights are FP4. Both reuse
+the V4 TileLang quantizers in :mod:`veomni.ops.qat.quant`, so training stays
+bit-aligned with inference by construction.
+
+These are *primitives*, not a selection mechanism. Which tensor is rounded, at
+what block width, is chosen by the op row that calls them -- ``linear`` /
+``swiglu_mlp`` / ``moe_experts`` / ``kv_round`` each have their own
+implementation name for it. Quantizing calls require an NVIDIA SM90 or later GPU
+and load the backend lazily, so importing this package on CPU or NPU stays free.
 """
 
 from ._hardware import require_tilelang_sm90
@@ -38,7 +41,6 @@ from .fp8_blockwise import (
     fp8_fake_quant_act_prefix,
     fp8_fake_quant_stacked_weight,
     fp8_fake_quant_weight,
-    qat_linear,
 )
 
 
@@ -77,5 +79,4 @@ __all__ = [
     "fp8_fake_quant_stacked_weight",
     "fp8_fake_quant_weight",
     "fp8_weight_quant",
-    "qat_linear",
 ]

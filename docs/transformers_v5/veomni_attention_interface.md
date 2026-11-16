@@ -4,15 +4,15 @@ VeOmni registers sequence-parallel FlashAttention, AITER, FlexAttention, SDPA,
 SageAttention, and MagiAttention FFA adapters in Transformers'
 `ALL_ATTENTION_FUNCTIONS`. There is no `fused_attention_forward` facade and
 no replaceable module-level `_flash_attention_forward` slots. Patched models
-bind `VeomniOp("attention", "standard", config._attn_implementation)` once in `__init__` / `modify_init` and call
+bind `VeomniOp("attention", "standard", config.ops_config.attn_implementation)` once in `__init__` / `modify_init` and call
 `self.veomni_attn` from `forward`.
 
 Public names such as `flash_attention_2` rewrite to `veomni_flash_attention_2`
 (not a `_with_sp` suffix). Ulysses wrapping lives inside those registered
 adapters.
 
-Models continue to select an attention implementation through
-`config._attn_implementation`; modeling code stores that choice in a local
+Models select an attention implementation through
+`config.ops_config.attn_implementation` (kept in sync with `config._attn_implementation` for HF mask builders); modeling code stores that choice in a local
 `VeomniOp("attention", "standard", implementation)` handle.
 
 ## Configuration
@@ -69,9 +69,11 @@ model-local VeomniOp("attention", "standard", implementation)
 `apply_veomni_attention_patch()` registers the concrete `veomni_*` forward
 functions and matching mask builders in the Transformers registries. Each ops
 row then uses the same Transformers interface lookup as the model-facing path.
-The `eager` row falls back to the modeling module's local
-`eager_attention_forward`, because Transformers does not register eager
-attention globally. The short `flex_attention` and `magi_attention` rows resolve
+The `eager` row uses the modeling module's local `eager_attention_forward` when
+present, preserving model-specific math. Modules without that function forward
+through `veomni_sdpa`, including its packed-sequence and Ulysses handling.
+Transformers' global eager interface is unchanged. The short `flex_attention`
+and `magi_attention` rows resolve
 their `veomni_*` interfaces so they share the adapters' device and backend
 behavior when selected directly through the ops registry.
 

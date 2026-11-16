@@ -300,9 +300,9 @@ def test_tilelang_sparse_attention_backward_shares_kernel_across_kv_lengths(monk
     requested_kv_lengths = []
     original_bwd = sparse_mla_bwd.bwd
 
-    def tracking_bwd(B, S, S_kv, *args, **kwargs):
+    def tracking_bwd(B, S_kv, *args, **kwargs):
         requested_kv_lengths.append(S_kv)
-        return original_bwd(B, S, S_kv, *args, **kwargs)
+        return original_bwd(B, S_kv, *args, **kwargs)
 
     monkeypatch.setattr(sparse_mla_bwd, "bwd", tracking_bwd)
 

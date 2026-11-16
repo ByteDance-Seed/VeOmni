@@ -21,6 +21,7 @@ patchgen veomni.models.transformers.qwen3_moe.qwen3_moe_npu_patch_gen_config -o 
 from veomni.models.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config import (
     PatchedQwen3MoeExperts,
     qwen3_moe_attention_forward_patched,
+    qwen3_moe_decoder_layer_init_patched,
     qwen3_moe_for_question_answering_init_patched,
     qwen3_moe_for_sequence_classification_forward_patched,
     qwen3_moe_for_sequence_classification_init_patched,
@@ -31,6 +32,7 @@ from veomni.models.transformers.qwen3_moe.qwen3_moe_gpu_patch_gen_config import 
     qwen3_moe_mlp_forward_patched,
     qwen3_moe_mlp_init_patched,
     qwen3_moe_model_forward_patched,
+    qwen3_moe_model_init_patched,
     qwen3_moe_rmsnorm_forward_patched,
     qwen3_moe_rmsnorm_init_patched,
     qwen3_moe_topk_router_forward_patched,
@@ -79,6 +81,16 @@ config.override_method(
     "Qwen3MoeMLP.forward",
     replacement=qwen3_moe_mlp_forward_patched,
     description="Always call the local swiglu_mlp VeomniOp",
+)
+config.override_method(
+    "Qwen3MoeDecoderLayer.__init__",
+    replacement=qwen3_moe_decoder_layer_init_patched,
+    description="Pass config to Qwen3MoeRMSNorm instances",
+)
+config.override_method(
+    "Qwen3MoeModel.__init__",
+    replacement=qwen3_moe_model_init_patched,
+    description="Pass config to final Qwen3MoeRMSNorm",
 )
 
 

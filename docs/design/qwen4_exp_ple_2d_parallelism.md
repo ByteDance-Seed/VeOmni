@@ -73,7 +73,7 @@ different data-parallel samples to those ranks.
   `ple_fsdp × ple` mesh.
 - HSDP replicas of the two-dimensional PLE table in the first implementation.
 - FSDP CPU offload for FSDP-ignored PLE parameters.
-- Hugging Face export of the complete 95 GiB PLE table.
+- Validation of full-size 95 GiB Hugging Face export on production hardware.
 
 Unsupported combinations must fail during argument or parallel-plan
 validation. They must not silently fall back to the current parameter
@@ -439,7 +439,45 @@ must measure bytes read and startup time as well as host materialization size.
 ## DCP model and optimizer state
 
 A persistent PLE parameter is already a DTensor on the complete mesh with
-placements `[Shard(1), Shard(0)]`. It should be passed to DCP in that form.
+placements `[Shard(1), Shard(0)]`. DCP and Hugging Face checkpoints save each
+PLE table at its own logical row count; runtime parameters and optimizer state
+retain their padded shapes. Row counts are tracked by the full weight name
+because different PLE layers can have different vocabulary sizes.
+
+DCP loading restores the runtime shape with a zero-filled tail for logical-row
+checkpoints and remains compatible with older padded checkpoints. Invalid row
+counts and mixed logical/padded formats are rejected. Models with
+`ple_layer_ids=[]` skip PLE row conversion.
+
+DCP and distributed HF export clip PLE chunks at their original global offsets.
+The save planner emits logical-row metadata and local prefix views, without
+resharding DTensors or exchanging PLE rows. DCP loads directly into padded
+runtime shards and zeroes only the unsaved tail. Legacy rank-zero HF export
+crops full CPU tensors after reading the checkpoint.
+
+### Checkpoint row contract
+
+The model-owned converter may implement `checkpoint_row_counts()` to return
+`{weight_fqn: (logical_rows, runtime_rows)}`. Names match
+`model.named_parameters()` on the underlying model, without DDP or DCP wrapper
+prefixes. The framework unwraps DDP before querying the converter. Each pair must satisfy
+`0 < logical_rows <= runtime_rows`; padding must be semantically inert.
+Every weight requiring cropping must have metadata, with missing metadata
+reported by the converter. A missing method or empty mapping opts out.
+The getter must not materialize parameter data or perform collectives.
+
+`DistributedCheckpointer.execute_save()` and `.load()` consume this mapping
+through `checkpoint/row_crop.py` and add the outer `model.` prefix. Distributed
+HF saving uses unprefixed names with `RowCropSavePlanner`; legacy rank-zero
+export receives explicit row counts derived from the supplied model and crops
+full CPU tensors. Without a model, legacy conversion skips cropping; older padded
+checkpoints need model metadata to export logical rows. Optimizer state
+retains its runtime shapes. The checkpoint layer imports no model packages.
+
+See the [converter protocol](../../veomni/models/checkpoint/convert.py#L89)
+and [row-count lookup](../../veomni/checkpoint/row_crop.py#L15).
+
+### ExtraParallel adapter
 
 The existing ExtraParallel DCP adapter drops the ExtraParallel dimension before
 handing an FSDP-local tensor to DCP and restores it afterward. Extend

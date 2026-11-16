@@ -26,9 +26,10 @@ from functools import partial
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
     CausalLMOutputWithPast,
     SequenceClassifierOutputWithPast,
 )
@@ -36,9 +37,8 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 
@@ -49,6 +49,10 @@ config = PatchConfig(
     description="Qwen3 with VeomniOp-based GPU kernel replacements",
 )
 
+config.drop_import_names("PreTrainedModel", "create_causal_mask", "create_sliding_window_causal_mask")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
+
 config.add_import("functools", names=["partial"])
 config.add_import("transformers.modeling_outputs", names=["SequenceClassifierOutputWithPast"])
 config.add_import(
@@ -58,16 +62,15 @@ config.add_import(
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
-config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "ForSequenceClassificationLoss"],
 )
+# Replace HF's ``create_causal_mask`` / ``create_sliding_window_causal_mask`` with
+# ``veomni.models.utils.mask_utils`` so packed ``cu_seq_lens_q`` / ``cu_seq_lens_k``
+# inputs route through ``veomni.ops.mask`` once in ``Qwen3Model.forward``.
 config.add_import(
-    "veomni.models.utils.attention_utils",
-    names=["prepare_dense_attention_inputs"],
+    "veomni.models.utils.mask_utils",
+    names=["create_causal_mask", "create_sliding_window_causal_mask"],
 )
 config.exclude_from_output("apply_rotary_pos_emb", "rotate_half")
 config.drop_import_names("use_kernelized_func")
@@ -77,11 +80,12 @@ config.drop_import_names("use_kernelized_func")
     "Qwen3RMSNorm.__init__",
     description="Construct a local rms_norm VeomniOp",
 )
-def qwen3_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+def qwen3_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+    impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
 
 @config.override_method(
@@ -105,7 +109,118 @@ def qwen3_mlp_init_patched(self, config):
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+
+
+@config.override_method(
+    "Qwen3DecoderLayer.__init__",
+    description="Pass config to Qwen3RMSNorm instances",
+)
+def qwen3_decoder_layer_init_patched(self, config, layer_idx: int):
+    super().__init__()
+    self.hidden_size = config.hidden_size
+    self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
+    self.mlp = Qwen3MLP(config)
+    self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+
+
+@config.override_method(
+    "Qwen3Model.__init__",
+    description="Pass config to final Qwen3RMSNorm",
+)
+def qwen3_model_init_patched(self, config):
+    super().__init__(config)
+    self.padding_idx = config.pad_token_id
+    self.vocab_size = config.vocab_size
+
+    self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+    self.layers = nn.ModuleList(
+        [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+    )
+    self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.rotary_emb = Qwen3RotaryEmbedding(config=config)
+    self.gradient_checkpointing = False
+    self.has_sliding_layers = "sliding_attention" in self.config.layer_types
+
+    self.post_init()
+
+
+# ================================================================
+# Patch: Qwen3Model.forward
+# 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+#    into ``veomni.models.utils.mask_utils.{create_causal_mask,
+#    create_sliding_window_causal_mask}`` so packed sequences build an
+#    isolated mask once in the model forward
+# ================================================================
+@config.override_method(
+    "Qwen3Model.forward",
+    description="Forward packed sequence metadata to VeOmni mask builders",
+)
+def qwen3_model_forward_patched(
+    self,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    use_cache: bool | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> BaseModelOutputWithPast:
+    if (input_ids is None) ^ (inputs_embeds is not None):
+        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_tokens(input_ids)
+
+    if use_cache and past_key_values is None:
+        past_key_values = DynamicCache(config=self.config)
+
+    if position_ids is None:
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+        position_ids = position_ids.unsqueeze(0)
+
+    # It may already have been prepared by e.g. `generate`
+    if not isinstance(causal_mask_mapping := attention_mask, dict):
+        # --- Patch.1 ---
+        # Prepare mask arguments
+        mask_kwargs = {
+            **kwargs,
+            "config": self.config,
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+        }
+        # Create the masks
+        causal_mask_mapping = {
+            "full_attention": create_causal_mask(**mask_kwargs),
+        }
+        # The sliding window alternating layers are not always activated depending on the config
+        if self.has_sliding_layers:
+            causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        # --- Patch.1 ---
+
+    hidden_states = inputs_embeds
+    position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+    for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+        hidden_states = decoder_layer(
+            hidden_states,
+            attention_mask=causal_mask_mapping[self.config.layer_types[i]],
+            position_embeddings=position_embeddings,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **kwargs,
+        )
+
+    hidden_states = self.norm(hidden_states)
+    return BaseModelOutputWithPast(
+        last_hidden_state=hidden_states,
+        past_key_values=past_key_values if use_cache else None,
+    )
 
 
 @config.override_method(
@@ -145,11 +260,11 @@ def qwen3_attention_init_patched(self, config, layer_idx: int):
     self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
     self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
     self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
-    self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-    self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+    self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
+    self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
     self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_rope = VeomniOp("rope", "full", config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
@@ -177,13 +292,6 @@ def qwen3_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-        kwargs,
-        impl=self.veomni_attn.impl,
-        attention_mask=attention_mask,
-        hidden_states=hidden_states,
-    )
-
     attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
@@ -193,7 +301,7 @@ def qwen3_attention_forward_patched(
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
         sliding_window=self.sliding_window,
-        **attn_kwargs,
+        **kwargs,
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -210,7 +318,7 @@ def qwen3_forcausallm_init_patched(self, config):
     self.model = Qwen3Model(config)
     self.vocab_size = config.vocab_size
     self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
@@ -283,7 +391,7 @@ def qwen3_forcausallm_forward_patched(
 )
 def qwen3_seq_cls_init_patched(self, config):
     super(Qwen3ForSequenceClassification, self).__init__(config)
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForSequenceClassificationLoss, op=self.veomni_ce)
 

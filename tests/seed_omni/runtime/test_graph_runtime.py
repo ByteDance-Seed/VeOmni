@@ -47,6 +47,7 @@ class _StubConfig(OmniModuleConfig):
     model_type = "graph_runtime_stub"
 
     def __init__(self, **kwargs):
+        kwargs.setdefault("ops_implementation", {"attn_implementation": "eager"})
         super().__init__(**kwargs)
 
 

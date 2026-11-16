@@ -30,7 +30,7 @@ grep -rnE "torch(-npu)?==" docker/  # same for torch; -npu is the ascend form
 ```
 pyproject.toml
 ├── [project.dependencies]              Core deps (always installed, transformers NOT included here)
-├── [project.optional-dependencies]     Hardware extras + optional Magi extra + legacy `dev`
+├── [project.optional-dependencies]     Hardware extras + optional Magi / float8 extras + legacy `dev`
 │   ├── gpu          NVIDIA x86_64 / aarch64 — full superset (kernel-specific libc requirements):
 │   │                  torch 2.11.0+cu130 + cu130 nvidia stack + cuda-python
 │   │                  + FA2 on x86_64 (cp311/cp312 wheels)
@@ -47,6 +47,8 @@ pyproject.toml
 │   │                  wheels; docker/rocm/Dockerfile.ROCm7.14 source-builds them):
 │   │                  torch 2.12.0+rocm7.14.0 + ROCm runtime wheels (rocm-sdk-*,
 │   │                  amd-torch(vision)-device-gfx942/950) + same data/model deps
+│   ├── float8       Optional torchao==0.18.0 for opt-in float8 training (combine with gpu);
+│   │                  kept out of gpu so jobs that never enable float8 skip the wheel
 │   ├── npu          Ascend NPU x86_64 — full superset, minus CUDA-only kernels:
 │   │                  torch 2.10.0+cpu + torch-npu 2.10.0
 │   │                  + diffusers / av / audio / video / peft / megatron-energon
@@ -80,6 +82,7 @@ conflicts with the ROCm and NPU extras.
 ```bash
 uv sync --extra gpu --dev                      # NVIDIA GPU
 uv sync --extra gpu --extra magi --dev         # NVIDIA GPU + MagiAttention (SM100+)
+uv sync --extra gpu --extra float8 --dev       # NVIDIA GPU + torchao float8 training (SM89+)
 uv sync --extra rocm --dev                     # AMD ROCm (gfx942 / gfx950)
 uv sync --extra npu --dev                      # Ascend NPU x86
 uv sync --extra npu_aarch64 --dev              # Ascend NPU ARM
@@ -164,6 +167,7 @@ See `docs/design/deepgemm_fp8_moe.md` for supported shapes and precision.
 | `flash-qla` | PyPI `0.1.2` | pure-Python wheel with usable metadata; requires TileLang 0.1.9; full forward/backward support on SM90 and SM100 |
 | `tile-kernels` | PyPI `1.0.0` | DeepSeek V4 mHC forward/backward; requires TileLang 0.1.9 and SM90+ |
 | `magi-attention` + `create-block-mask-cuda`, `flash-attn-cute`, `magi-to-hstu-cuda` | git revs | optional `--extra magi`; SM100 source builds, omitted by the default GPU CI install |
+| `torchao` | PyPI `0.18.0` | optional `--extra float8`; exact pin checked at runtime by `veomni/distributed/float8.py`, omitted by the default GPU CI install, so the float8 GPU tests skip there. Incompatible with the `gpu` extra's `peft==0.18.1` torchao integration (`LinearActivationQuantizedTensor` removed), so PEFT interop fails with the extra installed |
 
 FlashQLA 0.1.2 supports full forward/backward execution on NVIDIA SM90 and
 SM100. Its SM120 path is forward-only, so VeOmni's full op registration is

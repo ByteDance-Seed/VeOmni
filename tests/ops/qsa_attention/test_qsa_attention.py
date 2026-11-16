@@ -17,7 +17,6 @@
 import copy
 import importlib
 import sys
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +25,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.models.configuration_base import as_veomni_config
 from veomni.ops import resolve_op
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 
@@ -47,19 +47,6 @@ def _tilelang_qsa():
 
 def _eager_qsa():
     return resolve_op("qsa_attention", "standard", "eager").wrapper
-
-
-@contextmanager
-def _selected_qsa_implementation(implementation):
-    """Install one QSA selection for directly constructed test layers."""
-    from veomni.ops.config import get_ops_config, set_ops_config
-
-    previous = get_ops_config()
-    set_ops_config(SimpleNamespace(qsa_attention_implementation=implementation))
-    try:
-        yield
-    finally:
-        set_ops_config(previous)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -382,13 +369,19 @@ def test_qwen4_exp_attention_layer_tilelang_matches_fp32_reference():
     # The toy head_dim (16) is below the TileLang MMA tiling floor; use the
     # smallest tileable dim, keeping the indexer head dim at or above the
     # rotary width as Qwen4-Exp config validation requires.
+    from tests.models.compare import eager_ops_config
+
     config.head_dim = 64
     config.indexer_head_dim = 32
     torch.manual_seed(31)
-    with _selected_qsa_implementation("eager"):
-        reference = modeling.Qwen4ExpTextAttention(config, layer_idx=1).float().to(DEVICE)
-    with _selected_qsa_implementation("tilelang"):
-        attention = modeling.Qwen4ExpTextAttention(config, layer_idx=1).to(DEVICE, dtype=torch.bfloat16)
+    eager_ops = eager_ops_config()
+    eager_ops.qsa_attention_implementation = "eager"
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops)
+    reference = modeling.Qwen4ExpTextAttention(config, layer_idx=1).float().to(DEVICE)
+    tilelang_ops = eager_ops_config()
+    tilelang_ops.qsa_attention_implementation = "tilelang"
+    as_veomni_config(config, validate=False)._set_ops_implementation(tilelang_ops)
+    attention = modeling.Qwen4ExpTextAttention(config, layer_idx=1).to(DEVICE, dtype=torch.bfloat16)
     attention.load_state_dict(copy.deepcopy(reference.state_dict()))
     assert reference.veomni_qsa_attn.impl == "eager"
     assert attention.veomni_qsa_attn.impl == "tilelang"

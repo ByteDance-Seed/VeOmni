@@ -63,14 +63,20 @@ def unpermute(
     out_dtype = tokens.dtype
     tokens_weight = routing_weights.T.contiguous().masked_select(routing_map.bool())
 
-    tokens = tokens * tokens_weight.unsqueeze(-1)
-    hidden_dim = hidden_states_shape[-1]
+    from ...ops import VeomniOp
+    from ...utils.device import IS_CUDA_AVAILABLE, get_device_type
 
-    # Accumulate in FP32 to match the non-EP moe_gather kernel which also uses FP32
-    # accumulation internally, reducing top-k rounding error from BF16 scatter_add_.
-    unpermuted_tokens = torch.zeros(hidden_states_shape, device=tokens.device, dtype=torch.float32)
-    unpermuted_tokens.scatter_add_(0, permutation_mapping.unsqueeze(1).expand(-1, hidden_dim), tokens.float())
-    return unpermuted_tokens.to(out_dtype)
+    impl = (
+        "triton"
+        if IS_CUDA_AVAILABLE
+        and torch.version.hip is None
+        and tokens.device.type == get_device_type()
+        and not torch.are_deterministic_algorithms_enabled()
+        else "eager"
+    )
+    return VeomniOp("moe_unpermute", "standard", impl)(
+        tokens, tokens_weight, permutation_mapping, num_tokens=hidden_states_shape[0]
+    ).to(out_dtype)
 
 
 def generate_weights_idx(routing_weights: torch.Tensor, selected_experts: torch.Tensor, num_experts) -> torch.Tensor:

@@ -457,29 +457,22 @@ class TestGlmMoeDsaConverter:
         assert isinstance(converter, GlmMoeDsaCheckpointTensorConverter)
         assert converter.num_experts == 8
 
-    @pytest.fixture
-    def eager_ops(self):
-        from tests.tools.training_utils import make_eager_ops_config
-        from veomni.ops.config import get_ops_config, set_ops_config
-
-        previous = get_ops_config()
-        set_ops_config(make_eager_ops_config())
-        try:
-            yield
-        finally:
-            set_ops_config(previous)
-
     @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
-    def test_per_expert_checkpoint_loads_into_fused_experts(self, tmp_path, eager_ops):
+    def test_per_expert_checkpoint_loads_into_fused_experts(self, tmp_path):
         """The released GLM-5 layout: per-expert routed experts plus an unbuilt MTP layer."""
         from safetensors.torch import save_file
 
+        from tests.tools.training_utils import make_eager_ops_config
         from veomni.models.auto import build_foundation_model
         from veomni.models.checkpoint.weights import load_model_weights
 
         toy_config = Path(__file__).resolve().parents[2] / "toy_config" / "glm_moe_dsa_toy"
         model = build_foundation_model(
-            config_path=str(toy_config), weights_path=None, torch_dtype="float32", init_device="cpu"
+            config_path=str(toy_config),
+            weights_path=None,
+            torch_dtype="float32",
+            init_device="cpu",
+            ops_implementation=make_eager_ops_config(),
         )
         config = model.config
         generator = torch.Generator().manual_seed(0)
@@ -512,7 +505,11 @@ class TestGlmMoeDsaConverter:
         config.save_pretrained(tmp_path)
         save_file(on_disk, str(tmp_path / "model.safetensors"))
         loaded = build_foundation_model(
-            config_path=str(tmp_path), weights_path=None, torch_dtype="float32", init_device="cpu"
+            config_path=str(tmp_path),
+            weights_path=None,
+            torch_dtype="float32",
+            init_device="cpu",
+            ops_implementation=make_eager_ops_config(),
         )
         from veomni.utils.device import IS_NPU_AVAILABLE
 
@@ -852,7 +849,7 @@ class TestDeepseekV4ConverterConvert:
             )
 
     @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-    def test_export_weights_synthesizes_release_mapping_when_none(self):
+    def test_export_weights_synthesizes_release_mapping_when_none(self, monkeypatch):
         from tests.models.tiny_configs import tiny_deepseek_v4_config
         from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
             _build_default_deepseek_v4_fqn_to_index_mapping,
@@ -865,6 +862,11 @@ class TestDeepseekV4ConverterConvert:
         model = DeepseekV4ForCausalLM(cfg).float()
         converter = DeepseekV4CheckpointTensorConverter(num_experts=cfg.n_routed_experts)
 
+        def unexpected_device_query():
+            pytest.fail("Exporting ordinary CPU tensors must not query an accelerator device.")
+
+        monkeypatch.setattr("veomni.models.checkpoint.convert.get_device_type", lambda: "unavailable_accelerator")
+        monkeypatch.setattr("veomni.models.checkpoint.convert.get_device_id", unexpected_device_query)
         exported = dict(converter.export_weights(model))
 
         assert getattr(model, "_veomni_fqn_to_index_mapping", None) is not None
