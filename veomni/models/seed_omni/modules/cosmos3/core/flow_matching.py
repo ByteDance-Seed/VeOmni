@@ -103,6 +103,8 @@ def flow_matching_loss(
         masks = [None] * len(preds)
     else:
         masks = list(condition_mask.unbind(0)) if isinstance(condition_mask, Tensor) else list(condition_mask)
+    if not len(preds) == len(targets) == len(masks):
+        raise ValueError(f"got {len(preds)} predictions, {len(targets)} targets and {len(masks)} masks.")
     per_sample = []
     for pred_i, target_i, mask_i in zip(preds, targets, masks):
         sqerr = (pred_i - target_i) ** 2

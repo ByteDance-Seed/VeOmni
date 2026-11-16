@@ -6,9 +6,9 @@ resumed run continues the same stream instead of replaying it from the seed.
 Like [`OfflineEncodingMixin`](offline_encoding.md), this is a protocol, not a
 base class: a module opts in by defining two methods.
 
-- Save: [`ModuleRuntime.extra_state`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L651)
-- Load: [`ModuleRuntime.load_extra_state`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L664)
-- Where it is written: [`ModelCheckpointManager._extra_state`](../../../veomni/models/checkpoint/manager.py#L177)
+- Save: [`ModuleRuntime.extra_state`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L663)
+- Load: [`ModuleRuntime.load_extra_state`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L676)
+- Where it is written: [`ModelCheckpointManager._extra_state`](../../../veomni/models/checkpoint/manager.py#L178)
 - Example: [`Cosmos3FlowConnector.rng_state_dict`](../../../veomni/models/seed_omni/modules/cosmos3/flow_connector/modeling.py#L195)
 
 ## Why a module needs it

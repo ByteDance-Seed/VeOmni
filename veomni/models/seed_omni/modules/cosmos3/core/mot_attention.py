@@ -351,7 +351,7 @@ class MotAttention(nn.Module):
             v_gen,
             k_und_for_gen=k_und_for_gen,
             scaling=self.scaling,
-            dropout=self.attention_dropout,
+            dropout=self.attention_dropout if self.training else 0.0,
             layout=layout,
         )
         out_und = self.to_out(out_und.reshape(out_und.shape[0], -1))

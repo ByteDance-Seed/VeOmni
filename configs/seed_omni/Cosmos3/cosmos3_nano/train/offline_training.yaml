@@ -72,7 +72,7 @@ train:
   seed: 42
   checkpoint:
     output_dir: outputs/cosmos3_nano_sft_offline
-    save_steps: 999999
+    save_steps: 250
     save_epochs: 0
     save_hf_weights: false
   wandb:

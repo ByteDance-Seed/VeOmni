@@ -1,5 +1,6 @@
 """Config for :class:`Cosmos3FlowConnector`. Defaults are the ``vision_sft_nano`` recipe's."""
 
+import math
 from typing import Optional
 
 from ...module_configuration_base import OmniModuleConfig
@@ -49,7 +50,12 @@ class Cosmos3FlowConnectorConfig(OmniModuleConfig):
         """Normalized ``[(clean_prefix_latent_frames, probability), ...]`` in configured order."""
         weights = [(int(str(frames).strip()), float(weight)) for frames, weight in self.conditioning_config.items()]
         total = sum(weight for _, weight in weights)
-        if not weights or total <= 0 or any(frames < 0 or weight < 0 for frames, weight in weights):
+        if (
+            not weights
+            or not math.isfinite(total)
+            or total <= 0
+            or any(frames < 0 or weight < 0 or not math.isfinite(weight) for frames, weight in weights)
+        ):
             raise ValueError(f"invalid conditioning_config {self.conditioning_config!r}.")
         return [(frames, weight / total) for frames, weight in weights]
 
@@ -58,4 +64,6 @@ class Cosmos3FlowConnectorConfig(OmniModuleConfig):
         shifts = {str(key): float(value) for key, value in self.shift.items()}
         if bucket not in shifts:
             raise ValueError(f"resolution {bucket!r} has no entry in shift={self.shift!r}.")
+        if not math.isfinite(shifts[bucket]) or shifts[bucket] <= 0:
+            raise ValueError(f"shift for resolution {bucket!r} must be positive and finite, got {shifts[bucket]}.")
         return shifts[bucket]

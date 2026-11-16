@@ -299,7 +299,8 @@ def cosmos3_sft_jsonl_preprocess(
                 return caption.strip().rstrip(".") + "."
         raise ValueError(f"cosmos3_sft_jsonl needs a 'caption_json' or a 'caption'; window keys are {sorted(window)}.")
 
-    prompt = caption_of(conversations["t2w_windows"][0], conversations)
+    windows = conversations.get("t2w_windows") or [{}]
+    prompt = caption_of(windows[0], conversations)
     vision_path = conversations["vision_path"]
     rate = float(cfg_dropout_rate or 0.0)
     if rate >= 1.0 or (rate > 0.0 and _per_sample_draw(cfg_dropout_seed, vision_path, prompt) < rate):

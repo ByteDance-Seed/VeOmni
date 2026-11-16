@@ -87,7 +87,7 @@ row per clip:
 |---|---|
 | `vision_path` | Clip path. A relative path is joined to `mm_configs.data_dir`; an absolute path or a `://` URI is used as is. |
 | `t2w_windows[0].caption_json` | Preferred prompt, serialized verbatim. |
-| `t2w_windows[0].caption`, then the row's `caption` | Fallback prompts. A blank value falls through. |
+| `t2w_windows[0].caption`, then the row's `caption` | Fallback prompts. A blank value falls through; a row without `t2w_windows` uses its own `caption`. |
 
 ```json
 {"vision_path": "videos/clip_0001.mp4",
