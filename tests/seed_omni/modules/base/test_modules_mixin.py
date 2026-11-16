@@ -738,9 +738,7 @@ def test_janus_train_yaml_loads_with_v2_module_names():
     assert not any("emit_image" in e["from"] or "emit_image" in e["to"] for e in cfg.training_graph)
 
 
-@pytest.mark.parametrize(
-    "infer_graph", ["infer/graph_infer_interleave.yaml", "infer/graph_infer_gen.yaml", "infer/graph_infer_und.yaml"]
-)
+@pytest.mark.parametrize("infer_graph", ["infer/graph_infer_gen.yaml", "infer/graph_infer_und.yaml"])
 def test_janus_train_plus_infer_merges_generation_graph(infer_graph: str):
     cfg = _load_omni_config(
         modules_path=_janus_cfg_dir() / "train/modules_train.yaml",

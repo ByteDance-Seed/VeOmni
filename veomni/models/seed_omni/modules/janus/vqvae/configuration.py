@@ -44,4 +44,8 @@ class JanusVqvaeConfig(OmniModuleConfig):
         # as a *partial* freeze (only the inner ``vqmodel``); the generation
         # heads stay trainable.
         self.freeze = freeze
+        # No wte / lm_head on the LLM sense of the term, so nothing to tie.
+        # Declared rather than left absent: the shared post-load tie would call
+        # ``get_output_embeddings()`` and raise when the flag is truthy.
+        kwargs["tie_word_embeddings"] = False
         super().__init__(**kwargs)

@@ -27,79 +27,13 @@ and wins over the backbone's shorter ``model.language_model.``.
 from __future__ import annotations
 
 import json
-import os
-from collections.abc import Mapping
 from typing import Any
-
-import torch
 
 from ...utils.hf_layout import OMNI_HF_LAYOUT_REGISTRY, OmniHFLayout, OmniHFModuleLayout
 from .llama.configuration import JanusLlamaConfig
 from .siglip.configuration import JanusSiglipConfig
 from .text_encoder.configuration import JanusTextEncoderConfig
 from .vqvae.configuration import JanusVqvaeConfig
-
-
-_TIED_EMBEDDING_SOURCE_KEY = "__janus_tied_embedding_source__"
-"""Attribute set by :meth:`JanusHFLayout.read_hf_config`: should the text encoder tie its head?
-
-``True`` when the checkpoint stores no ``lm_head.weight`` (a tied export) or
-stores it byte-identical to the embedding (a tied model that wrote the duplicate
-out); ``False`` when the two differ; ``None`` when the weights could not be
-inspected. ``build_config`` only receives a config, so the verdict travels on it;
-the name is private to this module and never serialised.
-"""
-
-
-def _reject_bin_only_source(source_path: str) -> None:
-    """Fail with a usable message when the checkpoint has no safetensors weights.
-
-    The layout's load path reads safetensors shards only — ``source_weight_files``
-    documents as much — so a ``.bin`` root cannot be loaded through it at all,
-    independent of the tie question. Say so instead of letting ``safe_open`` fail on
-    a pickle file, and name the two ways forward.
-    """
-    for name in ("pytorch_model.bin", "pytorch_model.bin.index.json"):
-        if os.path.isfile(os.path.join(source_path, name)):
-            raise ValueError(
-                f"{source_path} stores its weights as `{name}`; the SeedOmni HF layout reads safetensors only. "
-                'Convert it first: `python -c "import torch,safetensors.torch as st; ..."` is not needed — '
-                "re-save the checkpoint with `model.save_pretrained(out, safe_serialization=True)`, "
-                "or run `scripts/seed_omni/convert_model.py` if it is a DeepSeek-format Janus root."
-            )
-
-
-def _tie_verdict_from_weights(
-    source_path: str, weight_files: Mapping[str, str], head_key: str, embed_key: str
-) -> str | None:
-    """How the stored tensors relate to each other: ``"absent"`` / ``"equal"`` / ``"different"``.
-
-    The three cases want different answers, so the verdict is not a bool:
-
-    * ``"absent"`` — no head is stored, so the head *is* the embedding. Tying is the
-      only option; an independent head would be randomly initialised.
-    * ``"equal"`` — a tied model that wrote the duplicate out. HF keeps such a pair
-      shared, so tying is what the source model actually does.
-    * ``"different"`` — a genuinely independent head, which must load its own copy.
-
-    Returns ``None`` when there is nothing to read. Callers have already established
-    that the shards are safetensors (a ``.bin`` root is refused before this point).
-    """
-
-    from safetensors import safe_open
-
-    if head_key not in weight_files:
-        return "absent"
-    if embed_key not in weight_files:
-        return None
-    tensors = {}
-    for key in (head_key, embed_key):
-        with safe_open(os.path.join(source_path, weight_files[key]), framework="pt", device="cpu") as f:
-            tensors[key] = f.get_tensor(key)
-    head, embed = tensors[head_key], tensors[embed_key]
-    if head.shape != embed.shape or head.dtype != embed.dtype:
-        return "different"
-    return "equal" if torch.equal(head, embed) else "different"
 
 
 def _siglip_config(hf_config: Any) -> JanusSiglipConfig:
@@ -110,46 +44,25 @@ def _vqvae_config(hf_config: Any) -> JanusVqvaeConfig:
     return JanusVqvaeConfig(vq_config=hf_config.vq_config.to_dict())
 
 
-def _config_allows_tie(hf_config: Any) -> bool:
-    """Whether the config itself asks for a tie.
+def _tie_word_embeddings(hf_config: Any) -> bool:
+    """Whether the text encoder ties its head to the input embedding.
 
-    Both flags are consulted — the AND that
+    Read straight from the config: ``tie_word_embeddings`` is a config field, not
+    something to infer from the weight values. The framework acts on it —
     :func:`~veomni.models.checkpoint.weights.post_process_after_weight_loading`
-    applies to the loaded module. An explicit ``False`` on either side is the
-    author's decision and outranks anything the tensors look like.
+    points the head at the embedding when both the outer and nested flags allow
+    it — so a value derived from the tensors here would make the module disagree
+    with the very code that ties it.
+
+    The backbone holds no wte / lm_head and forces the flag off in
+    :class:`JanusLlamaConfig`, so this only has an effect on the text encoder.
     """
     outer = getattr(hf_config, "tie_word_embeddings", None)
     nested = getattr(getattr(hf_config, "text_config", None), "tie_word_embeddings", None)
     if outer is None and nested is None:
-        return True
-    return bool(True if outer is None else outer) and bool(True if nested is None else nested)
-
-
-def _tie_word_embeddings(hf_config: Any) -> bool:
-    """Whether the text encoder can tie its head to the input embedding.
-
-    The stored tensors decide when they are decisive, but "equal values" alone does
-    not: HF ties an equal pair only when the config asks for it.
-
-    * **No stored head** — the head *is* the embedding. Tying is the only option;
-      an independent head has nothing to load and would be randomly initialised.
-    * **A stored head with different values** — a genuinely separate head.
-    * **A stored head identical to the embedding** — the config decides. Tied
-      requests keep HF's shared parameter; an explicit ``false`` keeps two
-      parameters that happen to start equal, which is what HF does and what the
-      source model then trains.
-
-    With nothing to inspect, fall back to the config's word — the same AND
-    :func:`~veomni.models.checkpoint.weights.post_process_after_weight_loading`
-    applies to the loaded module.
-    """
-    verdict = getattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, None)
-    if verdict == "absent":
-        return True
-    if verdict == "different":
         return False
-    # ``"equal"`` (or nothing to inspect): the config decides, as HF does.
-    return _config_allows_tie(hf_config)
+    # The same AND the framework applies to the loaded module.
+    return bool(True if outer is None else outer) and bool(True if nested is None else nested)
 
 
 def _text_encoder_config(hf_config: Any) -> JanusTextEncoderConfig:
@@ -227,40 +140,6 @@ def _vqvae_assets(model_path: str) -> dict[str, Any]:
     return {"image_processor": JanusVqvaeProcessor(**processor.to_dict())}
 
 
-class JanusHFLayout(OmniHFLayout):
-    """Janus' upstream layout, deciding the head/embedding tie from the weight files.
-
-    ``read_hf_config`` is the only place that sees the checkpoint's tensors before
-    the module configs are built, so the tie verdict is recorded on the config
-    there and :func:`_tie_word_embeddings` reads it back.
-    """
-
-    def read_hf_config(self, source_path: str):
-        from transformers import AutoConfig
-
-        hf_config = AutoConfig.from_pretrained(source_path)
-        verdict = self._tie_verdict(source_path)
-        setattr(hf_config, _TIED_EMBEDDING_SOURCE_KEY, verdict)
-        return hf_config
-
-    def _tie_verdict(self, source_path: str) -> str | None:
-        """The stored-tensor verdict, from the safetensors shards.
-
-        A ``.bin`` root is refused here rather than silently falling back to the
-        config's flags: the layout could not load such a checkpoint either, so
-        answering the tie question would only move the failure later and into a
-        less obvious place.
-        """
-        try:
-            weight_files = self.source_weight_files(source_path)
-        except FileNotFoundError:
-            _reject_bin_only_source(source_path)
-            return None
-        return _tie_verdict_from_weights(
-            source_path, weight_files, "lm_head.weight", "model.language_model.embed_tokens.weight"
-        )
-
-
 JANUS_GENERATION_KWARGS: dict[str, Any] = {
     "max_new_tokens": 2048,
     "temperature": 0.0,
@@ -276,7 +155,7 @@ directly (no offline convert) generates images the same way.
 """
 
 
-JANUS_HF_LAYOUT = JanusHFLayout(
+JANUS_HF_LAYOUT = OmniHFLayout(
     modules={
         "janus_siglip": OmniHFModuleLayout(
             key_prefixes=(
@@ -318,9 +197,10 @@ JANUS_HF_LAYOUT = JanusHFLayout(
     generation_graphs={
         "infer_gen": "infer/graph_infer_gen.yaml",
         "infer_und": "infer/graph_infer_und.yaml",
-        "infer_interleave": "infer/graph_infer_interleave.yaml",
     },
-    infer_type="infer_interleave",
+    # Text-to-image is the scenario this family exists for; understanding is
+    # selected with ``--model.model_config.infer_type infer_und``.
+    infer_type="infer_gen",
     generation_kwargs=dict(JANUS_GENERATION_KWARGS),
 )
 

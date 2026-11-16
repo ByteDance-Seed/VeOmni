@@ -100,13 +100,12 @@ class InferenceMixin:
                 )
             )
             return {"conversation_list": conversation_list}
-        # The tail row carries the embedding rows the backbone still has to consume.
-        # Normally that is the last token only (an ``output`` row holding what the
-        # model just sampled, or a ``text`` row holding the ``<boi>`` embed that
-        # opens an image span). ``emit_image_end`` is the exception: it appends
-        # ``<eoi>`` to the row that still holds the final image token, so both rows
-        # are fed here in one pass — the image token would otherwise never reach the
-        # cache. The type is not part of the contract.
+        # The tail row carries the embedding of the last token, whatever its type:
+        # an ``output`` row holds a token the model just sampled (or the hidden
+        # state priming the cache), and a ``text`` row holds the ``<boi>`` embed
+        # that opens an image span. Both are consumed the same way -- one token's
+        # embedding, re-fed through the backbone -- so the type is not a contract
+        # here. ``value[-1:]`` is the only thing read.
         tail_part = conversation_list[-1]
         if tail_part.value is None:
             raise ValueError(
@@ -130,17 +129,8 @@ class InferenceMixin:
             self._uncond_past_key_values = None
             self._cfg_active = False
 
-        # One row normally. ``emit_image_end`` is the exception: it appends ``<eoi>``
-        # to the row that still holds the final image token, so both must be fed or
-        # that token never reaches the cache. ``collapse_cfg`` marks that step.
-        rows = tail_part.value.to(self.device)
-        if rows.dim() == 2:
-            rows = rows.unsqueeze(0)
-        pending = 2 if tail_part.meta.get("collapse_cfg", False) and rows.size(1) >= 2 else 1
-        inputs_embeds = rows[:, -pending:]
-        # Consumed now; leave one row so a later step cannot feed them again.
-        if pending > 1:
-            tail_part.value = rows[:, -1:]
+        inputs_embeds: torch.Tensor = tail_part.value[-1:].to(self.device)
+        inputs_embeds = inputs_embeds.unsqueeze(0)
 
         if self._cfg_active:
             cond_out = self.forward(

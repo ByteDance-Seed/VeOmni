@@ -272,13 +272,9 @@ def test_the_backbone_never_ties_itself():
         # parameters there, so the layout does too — the pair starts equal but the
         # source model trains them apart.
         (False, None, False, True, True),
-        # Outer ``True`` beside an untied ``text_config`` with a stored, distinct
-        # head: a stale top-level flag must not drop it.
+        # Outer ``True`` beside an untied ``text_config`` resolves to untied: the
+        # framework ANDs both flags, so the module must keep its own head.
         (True, False, True, True, False),
-        # Same flags with NO stored head: there is no tensor to load into an
-        # independent head, so tying is the only option — building one anyway left
-        # it randomly initialised, corrupting every logit.
-        (True, False, False, False, False),
     ],
     ids=[
         "untied",
@@ -286,7 +282,6 @@ def test_the_backbone_never_ties_itself():
         "tied-with-duplicate",
         "equal-weights-untied-config",
         "outer-tied-nested-untied-with-head",
-        "outer-tied-nested-untied-no-head",
     ],
 )
 def test_the_layout_decides_tying_from_the_config_and_the_stored_weights(
@@ -364,7 +359,7 @@ def test_omni_model_loads_every_module_weight_from_the_hf_root(hf_root):
     assert model.modules_dict[TEXT_ENCODER]._tokenizer is not None
     # The backbone owns no wte / lm_head; the text encoder does.
     assert not any("embed_tokens" in key for key in model.modules_dict[LLAMA].state_dict())
-    assert "infer_interleave" in model.config.generation_graphs
+    assert "infer_gen" in model.config.generation_graphs
 
 
 @pytest.mark.parametrize("sharded", [False, True], ids=["single_file", "sharded"])
@@ -423,7 +418,7 @@ def test_offline_convert_matches_the_runtime_load(tmp_path, tied):
     assert read_hf_source(split) is None
     # The layout's decode defaults reach the split root, not just the offline path.
     assert root_config["generation_kwargs"] == JANUS_GENERATION_KWARGS
-    assert root_config["infer_type"] == "infer_interleave"
+    assert root_config["infer_type"] == "infer_gen"
 
     from_layout = tmp_path / "from_layout"
     _save_converted_omni(str(from_layout), **convert_with_hf_layout(str(root), attn_implementation="eager"))
@@ -447,27 +442,7 @@ def test_offline_convert_matches_the_runtime_load(tmp_path, tied):
 
 def test_declared_graphs_and_infer_type_match_the_family_converter():
     layout = JANUS_HF_LAYOUT
-    # The interleave FSM is the family default on both the layout and converter paths.
-    assert layout.infer_type == "infer_interleave"
-    assert set(layout.generation_graphs) == {"infer_gen", "infer_und", "infer_interleave"}
+    # Text-to-image is the family default; understanding is opted into per run.
+    assert layout.infer_type == "infer_gen"
+    assert set(layout.generation_graphs) == {"infer_gen", "infer_und"}
     assert layout.training_graphs == "train/graph_train.yaml"
-
-
-def test_a_bin_only_root_is_refused_with_a_usable_message(tmp_path):
-    """The layout reads safetensors; a ``.bin`` root gets told so, up front.
-
-    ``source_weight_files`` is safetensors-only, so a ``.bin`` checkpoint cannot be
-    loaded through the layout at all. Answering the tie question from its config
-    flags would move the failure into ``safe_open``, which raises a
-    ``SafetensorError`` while the module is being built.
-    """
-    root = tmp_path / "Janus-bin"
-    root.mkdir()
-    (root / "config.json").write_text(json.dumps({"model_type": "janus"}), encoding="utf-8")
-    torch.save({"lm_head.weight": torch.zeros(4, 4)}, root / "pytorch_model.bin")
-    (root / "pytorch_model.bin.index.json").write_text(
-        json.dumps({"weight_map": {"lm_head.weight": "pytorch_model.bin"}}), encoding="utf-8"
-    )
-
-    with pytest.raises(ValueError, match="reads safetensors only"):
-        JANUS_HF_LAYOUT.read_hf_config(str(root))

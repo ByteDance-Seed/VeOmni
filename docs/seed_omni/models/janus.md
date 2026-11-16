@@ -40,7 +40,7 @@ the trainer and its `infer.*` block drives the inferencer.
 | `../data.yaml` | Weighted multisource data list (ImageNet + ShareGPT4V). |
 | `infer/modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` (`fsdp2` + `emb`), `janus_llama` `fsdp2`, `janus_vqvae` `ddp`, `janus_siglip` eager. Select it with `--model.model_config.modules`. |
 | `infer/modules_infer_eager.yaml` | Per-module **inference** overrides — every module `eager`; the file pins `janus_siglip` explicitly and `for_inference` supplies the `eager` default to the rest, so the whole run is a single-process replica. |
-| `infer/graph_infer_und.yaml` / `infer/graph_infer_gen.yaml` / `infer/graph_infer_interleave.yaml` | Per-scenario generation graphs (mapped under `model.model_config.infer_graph`). |
+| `infer/graph_infer_und.yaml` / `infer/graph_infer_gen.yaml` | Per-scenario generation graphs — image understanding and text-to-image (mapped under `model.model_config.infer_graph`). |
 
 ---
 
@@ -238,7 +238,7 @@ The two inference launches are described in
 
 `tasks/omni/infer_omni.py` runs a generation graph selected by
 `--model.model_config.infer_type` (a key into the `model.model_config.infer_graph`
-map in `base.yaml`; defaults to `infer_interleave`). `--model.model_path` takes
+map in `base.yaml`; defaults to `infer_gen`). `--model.model_path` takes
 either the upstream HF checkpoint (loaded through the layout, as in step 1) or a
 split-checkpoint root holding one subfolder per module (`janus_siglip/`,
 `janus_vqvae/`, `janus_text_encoder/`, `janus_llama/`), each with its own
@@ -372,18 +372,3 @@ python tasks/omni/infer_omni.py \
   --infer.generation_kwargs.max_new_tokens 2048 \
   --infer.generation_kwargs.guidance_scale 5.0
 ```
-
-**Interleaved** — `infer/graph_infer_interleave.yaml` (default `model.model_config.infer_type`)
-mixes text and image generation in one graph. Here the model decides on its own
-when to open an image span, by sampling `<begin_of_image>`.
-
-> **Test coverage limit.** Only the text half of this graph has been exercised
-> end to end. The public Janus-1.3B checkpoint is a base model: it does not reliably
-> sample `<begin_of_image>`, so a smoke run never enters `image_vq` and the image
-> span (the sampled-`<boi>` hand-off, CFG arming, and `emit_image_end` closing an
-> accumulated span) is covered by unit tests only —
-> `tests/seed_omni/modules/janus/test_janus_boi_handoff.py` and
-> `test_janus_text_encoder_generate.py`. Validating it for real needs an SFT
-> checkpoint that has learned to emit the token; neither it nor its expected
-> output is available here. `infer_gen`, which forces the image span from a
-> prompt, is exercised end to end.

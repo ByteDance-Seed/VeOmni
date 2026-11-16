@@ -29,8 +29,7 @@ model:
     infer_graph:
       infer_gen: configs/seed_omni/Janus/janus/infer/graph_infer_gen.yaml
       infer_und: configs/seed_omni/Janus/janus/infer/graph_infer_und.yaml
-      infer_interleave: configs/seed_omni/Janus/janus/infer/graph_infer_interleave.yaml
-    infer_type: infer_interleave
+    infer_type: infer_gen
   ops_implementation:
     attn_implementation: flash_attention_2
 
