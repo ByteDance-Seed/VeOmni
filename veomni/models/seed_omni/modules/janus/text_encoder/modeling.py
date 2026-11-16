@@ -56,24 +56,8 @@ class JanusTextEncoder(TextEncoder):
             # ``maybe_merge_outputs`` folds this row into the previous one and
             # drops it, so every write below has to go through the live tail.
             maybe_merge_outputs(conversation_list)
-            current = conversation_list[-1]
 
-            if output_token_id == self._chat_template.boi_token_id:
-                # Same arming as ``emit_image_start``: the unconditional embeds go on
-                # the item's meta so the VQVAE span runs with guidance.
-                current.meta["cfg_uncond_inputs_embeds"] = self._maybe_arm_cfg_for_image_gen(
-                    conversation_list, generation_kwargs
-                )
-                outputs[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
-                # Seal as usual: ``<boi>`` is an ordinary text token (the training
-                # template emits it as one), and the image span simply re-encodes
-                # the row's last embedding. ``<boi>`` itself belongs to the image
-                # span, so it is not part of the reported text.
-                self._text_token_cache.pop()
-                generated = self._flush_text_generated(conversation_list)
-                if generated:
-                    outputs["generated"] = generated
-            elif output_token_id == self._chat_template.eos_token_id:
+            if output_token_id == self._chat_template.eos_token_id:
                 outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
                 generated = self._flush_text_generated(conversation_list)
                 if generated:
@@ -113,35 +97,29 @@ class JanusTextEncoder(TextEncoder):
         conversation_list: Optional[List[ConversationItem]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Close the image span: fold the last image token into the tail as ``<eoi>``.
+        """Replace the finished image span's tail with ``<eoi>``.
 
-        The codec's completing step leaves the 576th VQ token's embedding in the
-        tail. That token is the last thing the backbone must see of the image, so
-        dropping it here would leave it out of the KV cache and shift every token
-        that follows. The tail row is therefore *extended* with ``<eoi>`` rather
-        than replaced by it: the backbone reads ``value[-1:]``, gets ``<eoi>``, and
-        the image token before it is already part of the row it attends over.
-
-        ``infer_gen`` reaches here with a one-row tail that the backbone has already
-        consumed (its span lives in the cache), so appending changes nothing there.
+        ``infer_gen`` ends here: the image span lives in the KV cache, so this step
+        only produces the embedding the next state starts from.
         """
         del kwargs
         tail = conversation_list[-1]
         if tail.type != "output":
             raise ValueError(f"emit_image_end expects an output tail; got {tail.type!r}.")
+        conversation_list.pop()
         output_token_id = self._chat_template.eoi_token_id
         input_ids = self._token_id_tensor(output_token_id)
-        eoi_embeds = self.encode(input_ids)["inputs_embeds"]
-
-        # Keep the image rows, append <eoi>. ``maybe_merge_outputs`` below cannot be
-        # used: it needs a second output row to fold into, which is exactly what the
-        # old pop() destroyed.
-        if tail.value is not None and tail.value.dim() == 3:
-            eoi_rows = eoi_embeds.reshape(1, -1, eoi_embeds.size(-1))
-            tail.value = torch.cat([tail.value, eoi_rows.to(tail.value.device, tail.value.dtype)], dim=-2)
-        else:
-            tail.value = eoi_embeds
-        tail.meta["collapse_cfg"] = True
+        inputs_embeds = self.encode(input_ids)["inputs_embeds"]
+        conversation_list.append(
+            ConversationItem(
+                type="output",
+                value=inputs_embeds,
+                role="assistant",
+                meta={
+                    "collapse_cfg": True,
+                },
+            )
+        )
         return {"conversation_list": conversation_list}
 
     def _maybe_arm_cfg_for_image_gen(
