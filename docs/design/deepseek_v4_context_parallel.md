@@ -59,7 +59,7 @@ never been run.
 | `cp_size > 1` requires `ulysses_size == 1` | `ParallelState.__post_init__` and `AcceleratorConfig._resolve_topology` | `NotImplementedError` at launch |
 | the model type must implement CP | `check_context_parallel_supported`, from `build_foundation_model` (the omni path reaches it the same way, once per sub-module) | `NotImplementedError` at model build |
 | on Ascend/NPU, the model type must be `deepseek_v4` | `check_context_parallel_supported` | `NotImplementedError` at model build |
-| on Ascend/NPU, `dsa_indexer_implementation` and `dsa_attention_implementation` must be `eager` | `DeepseekV4Config.validate_build_prerequisites`, reached through `check_model_build_prerequisites` | `NotImplementedError` at model build for any value other than `eager` |
+| on Ascend/NPU, `dsa_indexer_implementation` and `dsa_attention_implementation` must be `eager` | `check_context_parallel_supported`, which reads the adapted config's `ops_config` | `NotImplementedError` at model build for any value other than `eager` |
 | explicit `position_ids` under either sequence-parallel mode | `DeepseekV4Model.forward` | `ValueError` on the first forward |
 | the attention mask spans the full sequence | `DeepseekV4Attention.forward`, ahead of the KV all-gather | `ValueError` on the first forward |
 | no KV cache under CP | `DeepseekV4Attention.forward` | `NotImplementedError` |
@@ -124,10 +124,13 @@ TileLang kernel on rank 0 alone. Hence the refusal rather than a default.
 
 ### Ascend/NPU operator selections
 
-`check_context_parallel_supported` admits DeepSeek-V4 on Ascend/NPU; the
-operator pair is then checked by `DeepseekV4Config.validate_build_prerequisites`,
-and only the eager DSA path is accepted. The CANN adapters on either side of the
-sparse attention reject the geometry CP hands them:
+`check_context_parallel_supported` admits DeepSeek-V4 on Ascend/NPU and then
+checks the operator pair on the config it was handed, which is why the check
+lives there rather than on the model config: a native checkpoint config is
+adapted into a generic class that keeps `ops_config` but not
+`DeepseekV4Config.validate_build_prerequisites`. Only the eager DSA path is
+accepted. The CANN adapters on either side of the sparse attention reject the
+geometry CP hands them:
 
 - `dsa_attention_implementation: cann` requires one KV row per query row. Under
   CP a rank owns `L` queries while the KV buffer is all-gathered to `S_global`,

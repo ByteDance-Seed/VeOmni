@@ -26,38 +26,50 @@ process which builds a model without installing a state into a hard failure;
 GPU CI caught this and the unit tests did not, because every one of them stubbed
 the accessor. Hence the one thing worth pinning here is the case where nothing
 is stubbed.
+
+The DSA-versus-parallel-state gate has a matching trap: a native checkpoint
+config is adapted into a generic class that keeps ``ops_config`` but not
+``DeepseekV4Config.validate_build_prerequisites``, so the pair has to be judged
+by the builder itself and exercised through ``build_foundation_model``.
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import torch
+from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config as NativeDSV4Config
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.distributed import parallel_state as parallel_state_module
 from veomni.models import auto as auto_module
 from veomni.models.auto import build_config, check_context_parallel_supported
-from veomni.models.transformers.deepseek_v4 import configuration_deepseek_v4 as configuration_module
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _enable_npu_cp(monkeypatch):
-    # The model-type gate reads these from ``auto``; the DSA-vs-parallel-state
-    # check lives on the model config and reads its own copies of the same three
-    # names, so both modules are patched.
-    for module in (auto_module, configuration_module):
-        monkeypatch.setattr(module, "is_parallel_state_initialized", lambda: True)
-        monkeypatch.setattr(module, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True))
-        monkeypatch.setattr(module, "IS_NPU_AVAILABLE", True)
+    # The DSA-vs-parallel-state check now runs in the builder gate, so only
+    # ``auto``'s copies of these three names matter.
+    monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(auto_module, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, global_rank=0))
+    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", True)
 
 
 def _npu_ops_for_cp() -> dict:
     # Only the pair the gate admits matters here; a real CP run is the shipped NPU
     # config with these two fields switched to ``eager``.
     return {"dsa_indexer_implementation": "eager", "dsa_attention_implementation": "eager"}
+
+
+def _installed_ops(ops_implementation: dict) -> OpsImplementationConfig:
+    # The builder takes a resolved config, while the direct gate tests below go
+    # through the model config's dict form.
+    return OpsImplementationConfig(attn_implementation="eager", **ops_implementation)
 
 
 def _dsv4_with_ops(ops_implementation: dict):
@@ -94,10 +106,8 @@ def test_gate_rejects_context_parallel_on_npu(monkeypatch):
 
 def test_gate_allows_npu_dsv4_cp_with_eager_dsa_ops(monkeypatch):
     _enable_npu_cp(monkeypatch)
-    config = _dsv4_with_ops(_npu_ops_for_cp())
 
-    check_context_parallel_supported(config)
-    config.validate_build_prerequisites()
+    check_context_parallel_supported(_dsv4_with_ops(_npu_ops_for_cp()))
 
 
 @pytest.mark.parametrize("field", ["dsa_indexer_implementation", "dsa_attention_implementation"])
@@ -107,7 +117,36 @@ def test_gate_rejects_npu_dsv4_cp_with_a_non_cp_aware_dsa_operator(monkeypatch, 
     ops[field] = "cann"
 
     with pytest.raises(NotImplementedError, match=field):
-        _dsv4_with_ops(ops).validate_build_prerequisites()
+        check_context_parallel_supported(_dsv4_with_ops(ops))
+
+
+def test_gate_rejects_a_native_config_adapted_by_the_builder(monkeypatch):
+    """The failure the direct tests miss: the adapted class has no model hook."""
+    _enable_npu_cp(monkeypatch)
+    load_model = Mock(return_value=torch.nn.Identity())
+    monkeypatch.setattr(auto_module, "get_loader", lambda config: SimpleNamespace(load_model=load_model))
+    ops = _npu_ops_for_cp()
+    ops["dsa_attention_implementation"] = "cann"
+
+    with pytest.raises(NotImplementedError, match="dsa_attention_implementation"):
+        auto_module.build_foundation_model(
+            NativeDSV4Config(), init_device="cpu", ops_implementation=_installed_ops(ops)
+        )
+
+    load_model.assert_not_called()
+
+
+def test_gate_admits_a_native_config_adapted_by_the_builder(monkeypatch):
+    _enable_npu_cp(monkeypatch)
+    load_model = Mock(return_value=torch.nn.Identity())
+    monkeypatch.setattr(auto_module, "get_loader", lambda config: SimpleNamespace(load_model=load_model))
+
+    model = auto_module.build_foundation_model(
+        NativeDSV4Config(), init_device="cpu", ops_implementation=_installed_ops(_npu_ops_for_cp())
+    )
+
+    assert model is load_model.return_value
+    load_model.assert_called_once()
 
 
 @pytest.mark.parametrize("model_type", ["deepseek_v4", "qwen4_exp"])

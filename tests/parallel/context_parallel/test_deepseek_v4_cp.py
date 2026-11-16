@@ -744,7 +744,7 @@ def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int, 
     so that a guard moved after the halo exchange is caught by the unusable group
     rather than by the compressor's own shard-width check.
     """
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    dsv4 = _modeling()
 
     config = _load_dsv4_toy_config()
     torch.manual_seed(0)
@@ -811,7 +811,7 @@ def test_deepseek_v4_cp_rejects_a_narrow_shard(kind):
     or none does, which is the property that keeps this a clean error instead of
     a ten-minute watchdog timeout.
     """
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    dsv4 = _modeling()
 
     class_name, role = _WINDOW_COMPRESSORS[kind]
     config = _load_dsv4_toy_config()
@@ -855,7 +855,7 @@ def test_deepseek_v4_attention_cp_rejects_a_local_length_mask(with_compressor):
 
 def _build_toy_model(seq_len: int):
     """A whole toy model on CPU plus one batch of ids, for the model-forward guards."""
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    dsv4 = _modeling()
 
     config = _load_dsv4_toy_config()
     torch.manual_seed(0)
