@@ -1,6 +1,6 @@
 """Registered Diffusers modeling that calls local ``VeomniOp`` handles."""
 
-from . import hunyuanvideo15, ltx2_3, minimax_h3, qwen_image, wan_t2v
+from . import hunyuanvideo15, ltx2_3, minimax_h3, minimax_h3_image, qwen_image, wan_t2v
 
 
-__all__ = ["hunyuanvideo15", "ltx2_3", "minimax_h3", "qwen_image", "wan_t2v"]
+__all__ = ["hunyuanvideo15", "ltx2_3", "minimax_h3", "minimax_h3_image", "qwen_image", "wan_t2v"]
