@@ -56,6 +56,7 @@ register_op(
     "standard",
     "qat",
     description="TileLang blockwise FP8 fake-quantized dense linear projection",
+    quantizes=True,
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
@@ -66,6 +67,7 @@ register_op(
     "standard",
     "torchao_nvfp4",
     description="TorchAO NVFP4 fake-quantized dense linear projection",
+    quantizes=True,
     wrapper=standard_torchao_nvfp4.wrapper,
     requires=("torchao",),
 )
@@ -83,6 +85,7 @@ register_op(
     "grouped",
     "qat",
     description="TileLang blockwise FP8 fake-quantized grouped linear projection",
+    quantizes=True,
     wrapper=grouped_qat.module_wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),

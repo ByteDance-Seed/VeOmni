@@ -214,9 +214,16 @@ moe_implementation:
   kwargs:                       # arguments passed to that row
     block_size: 128
   overrides:
+    # A different quantization: another row, with its own arguments.
+    - site: "layers\\.(1[0-9]|2[0-9])\\.experts"
+      name: qat
+      kwargs:
+        block_size: 64
+    # No quantization: a reference row, and no arguments -- it rounds nothing, so
+    # there is nothing to describe. `replace_kwargs` drops the inherited `block_size`.
     - site: "layers\\.0\\.experts"
-      name: eager               # this layer runs a different row
-      kwargs: {}                # `eager` takes no block_size, so drop the inherited one
+      name: eager
+      kwargs: {}
       replace_kwargs: true
 ```
 
@@ -231,14 +238,22 @@ turning quantization off for a site means naming a reference row such as `eager`
 or `liger_kernel` in that rule.
 
 **`kwargs` is what a row still needs per call.** A row declares its own arguments
-(`dtype`, `block_size`, `expert_dtype`, `swiglu_limit`), and the selection passes
-them. Three rules:
+(`block_size` for the GEMM rows, `expert_dtype` and `swiglu_limit` where they
+apply), and the selection passes them. Precision is not among them: it is what the
+row name says. Four rules:
 
 | Rule | Why |
 | --- | --- |
+| **Only a quantizing row takes arguments** | A row argument says *how* to round an operand. `fused_triton` and `eager` have nothing to round, so passing `block_size: 64` to them asks for something the row will not do, and the run would quietly do something else. Rows declare `quantizes=True` when they are registered, and both the config and the handle refuse arguments on the rest |
 | An argument the row does not accept raises when the handle is built | A typo in YAML would otherwise be dropped and the row would run its own default while the config said something else |
 | A call site can still override one for a single invocation | The checkpoint's `expert_dtype` is more specific than the config's `dtype`, so the modeling passes it at the call |
 | An override merges into the inherited set, unless `replace_kwargs: true` | Adjusting one argument should not repeat the rest; switching to a row with a different signature needs the inherited set dropped, which `replace_kwargs` with `kwargs: {}` does |
+
+That first rule is what makes an override's two shapes distinct: a rule that
+quantizes differently — another precision, another block width — names a
+quantizing row and carries `kwargs`; a rule that leaves the site unquantized names
+a reference row and carries **no** `kwargs`, because the reference row inherits
+whatever the enclosing block set and would then be refused.
 
 **Override semantics.** Only the keys a rule writes change; everything else is
 inherited from the enclosing block. Later rules win over earlier ones, which is why

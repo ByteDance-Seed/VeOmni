@@ -138,6 +138,7 @@ register_op(
     "standard",
     "qat",
     description="TileLang blockwise FP8 fake-quantized SwiGLU MLP with optional activation clamping",
+    quantizes=True,
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
@@ -148,6 +149,7 @@ register_op(
     "standard",
     "torchao_nvfp4",
     description="TorchAO NVFP4 fake-quantized SwiGLU MLP with optional activation clamping",
+    quantizes=True,
     wrapper=standard_torchao_nvfp4.wrapper,
     requires=("torchao",),
 )

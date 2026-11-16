@@ -1774,6 +1774,7 @@ class OpsImplementationConfig:
     def __post_init__(self):
         self._normalize_selections()
         self._apply_deprecated_aliases()
+        self._validate_row_arguments()
         self.validate_attention_backend(self.attn_implementation)
         self.validate_hub_attention_backend(self.attn_implementation)
         self.attn_implementation = self.normalize_attention_backend(self.attn_implementation)
@@ -1791,6 +1792,63 @@ class OpsImplementationConfig:
         "swiglu_mlp_implementation",
         "linear_implementation",
     )
+
+    #: Which registry family each per-site field drives. ``kv_round`` is absent for
+    #: the same reason it is not per-site: its rows round stored tensors, so there is
+    #: no row argument for a selection to pass.
+    _FIELD_TO_OP = {
+        "moe_implementation": "moe_experts",
+        "swiglu_mlp_implementation": "swiglu_mlp",
+        "linear_implementation": "linear",
+    }
+
+    def _validate_row_arguments(self) -> None:
+        """Refuse row arguments on a row that does not round.
+
+        Row arguments say *how* to round -- ``dtype``, ``block_size``, the
+        checkpoint's ``expert_dtype``. A reference row such as ``fused_triton`` or
+        ``eager`` has nothing to round, so a config that passes arguments to it asks
+        for something the row will not do, and the run would quietly do something
+        else.
+
+        Checked here as well as when the handle is built: a config naming an
+        SM90-only row cannot be resolved on every host, and the mistake should not
+        wait for a GPU to surface.
+        """
+        from ..ops import OP_REGISTRY
+
+        for field_name in self._PER_SITE_FIELDS:
+            value = getattr(self, field_name)
+            if not isinstance(value, OpsSelection):
+                continue
+            op = self._FIELD_TO_OP[field_name]
+            offered = [(value.name, value.kwargs)]
+            offered.extend((rule.name, rule.kwargs) for rule in value.overrides)
+            # An override inherits the enclosing name, so a rule with only kwargs is
+            # judged against that name, not against "no row".
+            effective = [(value.resolve_impl(rule.site), value.resolve_kwargs(rule.site)) for rule in value.overrides]
+            for name, kwargs in [*offered, *effective]:
+                if not kwargs or name is None:
+                    continue
+                quantizes = OP_REGISTRY.quantizes(op, name)
+                if quantizes is None:
+                    # An unregistered name is reported by the registry when the model
+                    # builds its handle; nothing useful to add here.
+                    continue
+                if not quantizes:
+                    raise ValueError(
+                        f"{field_name}: {name!r} is not a quantizing row of {op!r}, so it takes no row arguments; "
+                        f"got {sorted(kwargs)}. A row argument describes how to round an operand -- put it on a row "
+                        "that rounds, such as 'qat' or 'torchao_nvfp4'."
+                    )
+                accepted = OP_REGISTRY.row_arguments(op, name)
+                if accepted is None:
+                    continue
+                # Only keyword-shaped parameters count: the tensor operands are passed
+                # positionally by the row's own caller, never by a selection.
+                unknown = sorted(set(kwargs) - accepted)
+                if unknown:
+                    raise ValueError(f"{field_name}: {name!r} does not accept {unknown}; it takes {sorted(accepted)}.")
 
     def _normalize_selections(self) -> None:
         """Turn the mapping form of a per-site field into an ``OpsSelection``.

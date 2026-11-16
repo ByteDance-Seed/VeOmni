@@ -166,6 +166,7 @@ register_op(
     "standard",
     "qat",
     description="TileLang blockwise FP8/FP4 fake-quantized Triton grouped-GEMM routed SwiGLU MoE experts",
+    quantizes=True,
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang", "triton"),
@@ -176,6 +177,7 @@ register_op(
     "standard",
     "deepgemm_fp8",
     description="DeepGEMM blockwise FP8 expert forward, input gradients and weight gradients",
+    quantizes=True,
     wrapper=standard_deepgemm.wrapper,
     requirement=GpuKernelRequirement(
         platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=90), NvidiaGpuPlatform(min_cc=100, max_cc=100)),

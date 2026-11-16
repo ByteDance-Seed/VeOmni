@@ -30,6 +30,42 @@ from veomni.ops.selection import OpsSelection, SiteOverride
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
+#: A quantizing row the CPU can resolve, so the argument plumbing is testable
+#: without an SM90 host. It rounds nothing; what it proves is that ``kwargs`` reach
+#: a row that declares itself quantizing, and that a non-quantizing row refuses them.
+def _round_forward(x: torch.Tensor, *, block_size: int = 128) -> tuple[torch.Tensor, object]:
+    from veomni.ops.registry import SavedState
+
+    del block_size
+    return x, SavedState(())
+
+
+def _round_backward(grad_output: torch.Tensor, saved: object) -> tuple[torch.Tensor]:
+    del saved
+    return (grad_output,)
+
+
+@pytest.fixture
+def quantizing_row():
+    """Register ``test_round`` on the ``linear/standard`` family for one test."""
+    from veomni.ops import OP_REGISTRY, register_op
+
+    register_op(
+        "linear",
+        "standard",
+        "test_round",
+        _round_forward,
+        _round_backward,
+        description="test-only quantizing row",
+        quantizes=True,
+    )
+    try:
+        yield "test_round"
+    finally:
+        for key in [key for key in OP_REGISTRY._entries if key[2] == "test_round"]:
+            del OP_REGISTRY._entries[key]
+
+
 # ---------------------------------------------------------------------------
 # Resolution
 # ---------------------------------------------------------------------------
@@ -103,8 +139,8 @@ def test_matching_is_anchored_so_a_suffix_does_not_leak():
 
 def test_kwargs_travel_with_the_selection():
     """A row's arguments are part of the selection, not of the row's name."""
-    selection = OpsSelection.from_config_value({"name": "qat", "kwargs": {"dtype": "fp8", "block_size": 64}})
-    assert selection.resolve_kwargs("layers.3.q_a_proj") == {"dtype": "fp8", "block_size": 64}
+    selection = OpsSelection.from_config_value({"name": "qat", "kwargs": {"block_size": 64}})
+    assert selection.resolve_kwargs("layers.3.q_a_proj") == {"block_size": 64}
 
 
 def test_an_override_merges_kwargs_by_default():
@@ -112,29 +148,29 @@ def test_an_override_merges_kwargs_by_default():
     selection = OpsSelection.from_config_value(
         {
             "name": "qat",
-            "kwargs": {"dtype": "fp8", "block_size": 128},
+            "kwargs": {"block_size": 128},
             "overrides": [{"site": r"layers\.\d+\.o_a_proj", "kwargs": {"block_size": 64}}],
         }
     )
-    assert selection.resolve_kwargs("layers.2.o_a_proj") == {"dtype": "fp8", "block_size": 64}
-    assert selection.resolve_kwargs("layers.2.q_a_proj") == {"dtype": "fp8", "block_size": 128}
+    assert selection.resolve_kwargs("layers.2.o_a_proj") == {"block_size": 64}
+    assert selection.resolve_kwargs("layers.2.q_a_proj") == {"block_size": 128}
 
 
 def test_an_override_can_replace_the_whole_kwargs_set():
-    """Switching to a row with a different signature needs the inherited set dropped.
+    """Switching to a reference row needs the inherited set dropped.
 
-    ``liger_kernel`` takes no ``dtype``, so inheriting one from the enclosing
-    quantizing block would be refused when the handle is built.
+    ``liger_kernel`` is not a quantizing row, so it takes no row arguments;
+    inheriting the enclosing block's ``block_size`` would be refused.
     """
     selection = OpsSelection.from_config_value(
         {
             "name": "qat",
-            "kwargs": {"dtype": "fp8"},
+            "kwargs": {"block_size": 64},
             "overrides": [{"site": r"layers\.0\.mlp", "name": "liger_kernel", "kwargs": {}, "replace_kwargs": True}],
         }
     )
     assert selection.resolve_kwargs("layers.0.mlp") == {}
-    assert selection.resolve_kwargs("layers.7.mlp") == {"dtype": "fp8"}
+    assert selection.resolve_kwargs("layers.7.mlp") == {"block_size": 64}
 
 
 def test_replace_kwargs_without_kwargs_is_refused():
@@ -169,23 +205,34 @@ def test_an_override_without_a_site_is_refused():
 # ---------------------------------------------------------------------------
 
 
-def test_a_row_argument_the_row_does_not_take_is_refused():
-    """The row's own signature is the check, so a typo cannot reach a forward."""
-    selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"dtype": "fp8"}})
-    with pytest.raises(ValueError, match=r"does not accept \['dtype'\]"):
-        VeomniOp("swiglu_mlp", "standard", selection, site="layers.0.mlp")
+def test_a_non_quantizing_row_refuses_row_arguments(quantizing_row):
+    """Row arguments describe how to round, so a reference row must not take any.
+
+    Accepting them would leave the config saying ``dtype: fp8`` while the row ran
+    no rounding at all.
+    """
+    selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"block_size": 64}})
+    with pytest.raises(ValueError, match="is not a quantizing row"):
+        VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
 
 
-def test_a_row_argument_the_row_takes_is_kept_on_the_handle():
-    selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"swiglu_limit": 10.0}})
-    handle = VeomniOp("swiglu_mlp", "standard", selection, site="layers.0.mlp")
-    assert handle.kwargs == {"swiglu_limit": 10.0}
+def test_a_quantizing_row_still_has_to_declare_the_key(quantizing_row):
+    """A typo must not be dropped: the row would run its own default instead."""
+    selection = OpsSelection.from_config_value({"name": quantizing_row, "kwargs": {"block_siz": 64}})
+    with pytest.raises(ValueError, match=r"does not accept \['block_siz'\]"):
+        VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
 
 
-def test_a_call_can_still_override_a_handle_argument():
+def test_a_row_argument_the_row_takes_is_kept_on_the_handle(quantizing_row):
+    selection = OpsSelection.from_config_value({"name": quantizing_row, "kwargs": {"block_size": 64}})
+    handle = VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
+    assert handle.kwargs == {"block_size": 64}
+
+
+def test_a_call_can_still_override_a_handle_argument(quantizing_row):
     """The checkpoint's storage dtype is more specific than the config's."""
-    selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"swiglu_limit": 10.0}})
-    handle = VeomniOp("swiglu_mlp", "standard", selection, site="layers.0.mlp")
+    selection = OpsSelection.from_config_value({"name": quantizing_row, "kwargs": {"block_size": 64}})
+    handle = VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
     seen = {}
 
     def record(*args, **kwargs):
@@ -193,44 +240,44 @@ def test_a_call_can_still_override_a_handle_argument():
         return torch.zeros(1)
 
     handle._entry = type(handle._entry)(
-        op="swiglu_mlp",
+        op="linear",
         variant="standard",
-        impl="eager",
+        impl=quantizing_row,
         description="test",
         wrapper=record,
     )
-    handle(torch.zeros(1), swiglu_limit=5.0)
-    assert seen == {"swiglu_limit": 5.0}
+    handle(torch.zeros(1), block_size=32)
+    assert seen == {"block_size": 32}
 
 
-def test_sites_with_the_same_row_and_arguments_share_a_handle():
+def test_sites_with_the_same_row_and_arguments_share_a_handle(quantizing_row):
     """Intern keys on the resolved row *and* its arguments, so nothing leaks across."""
-    selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"swiglu_limit": 10.0}})
-    first = VeomniOp("swiglu_mlp", "standard", selection, site="layers.3.mlp")
-    second = VeomniOp("swiglu_mlp", "standard", selection, site="layers.4.mlp")
+    selection = OpsSelection.from_config_value({"name": quantizing_row, "kwargs": {"block_size": 64}})
+    first = VeomniOp("linear", "standard", selection, site="layers.3.q_a_proj")
+    second = VeomniOp("linear", "standard", selection, site="layers.4.q_a_proj")
     assert first is second
 
 
-def test_sites_with_different_arguments_do_not_share_a_handle():
+def test_sites_with_different_arguments_do_not_share_a_handle(quantizing_row):
     selection = OpsSelection.from_config_value(
         {
-            "name": "eager",
-            "kwargs": {"swiglu_limit": 10.0},
-            "overrides": [{"site": r"layers\.7\.mlp", "kwargs": {"swiglu_limit": 5.0}}],
+            "name": quantizing_row,
+            "kwargs": {"block_size": 128},
+            "overrides": [{"site": r"layers\.7\.q_a_proj", "kwargs": {"block_size": 64}}],
         }
     )
-    normal = VeomniOp("swiglu_mlp", "standard", selection, site="layers.3.mlp")
-    special = VeomniOp("swiglu_mlp", "standard", selection, site="layers.7.mlp")
+    normal = VeomniOp("linear", "standard", selection, site="layers.3.q_a_proj")
+    special = VeomniOp("linear", "standard", selection, site="layers.7.q_a_proj")
     assert normal is not special
-    assert (normal.kwargs, special.kwargs) == ({"swiglu_limit": 10.0}, {"swiglu_limit": 5.0})
+    assert (normal.kwargs, special.kwargs) == ({"block_size": 128}, {"block_size": 64})
 
 
-def test_an_interned_handle_survives_pickle_with_its_arguments():
-    selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"swiglu_limit": 10.0}})
-    handle = VeomniOp("swiglu_mlp", "standard", selection, site="layers.0.mlp")
+def test_an_interned_handle_survives_pickle_with_its_arguments(quantizing_row):
+    selection = OpsSelection.from_config_value({"name": quantizing_row, "kwargs": {"block_size": 64}})
+    handle = VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
     restored = pickle.loads(pickle.dumps(handle))
     assert restored is handle
-    assert restored.kwargs == {"swiglu_limit": 10.0}
+    assert restored.kwargs == {"block_size": 64}
 
 
 def test_the_config_accepts_both_shapes_and_round_trips_the_mapping_one():
@@ -240,7 +287,7 @@ def test_the_config_accepts_both_shapes_and_round_trips_the_mapping_one():
 
     mapping = {
         "name": "qat",
-        "kwargs": {"dtype": "fp8"},
+        "kwargs": {"block_size": 64},
         "overrides": [{"site": r"layers\.0\..*", "name": "eager"}],
     }
     configured = OpsImplementationConfig(linear_implementation=mapping)
@@ -248,7 +295,7 @@ def test_the_config_accepts_both_shapes_and_round_trips_the_mapping_one():
 
     reloaded = OpsImplementationConfig(**configured.to_dict())
     assert reloaded.linear_implementation.all_impls() == configured.linear_implementation.all_impls()
-    assert reloaded.linear_implementation.kwargs == {"dtype": "fp8"}
+    assert reloaded.linear_implementation.kwargs == {"block_size": 64}
 
 
 def test_a_deprecated_name_is_rewritten_in_every_form():
@@ -289,3 +336,27 @@ def test_hardware_validation_covers_every_row_an_override_can_produce():
         OpsImplementationConfig(
             moe_implementation={"name": "eager", "overrides": [{"site": r"layers\.0\.experts", "name": "fused_npu"}]}
         )
+
+
+def test_config_time_refuses_row_arguments_on_a_reference_row():
+    """The mistake should not wait for a GPU: `qat` does not resolve on every host.
+
+    A rule that inherits a reference row from the enclosing block and adds only
+    `dtype` is the same error as writing it on `name:`, and is judged the same way.
+    """
+    with pytest.raises(ValueError, match="'fused_triton' is not a quantizing row"):
+        OpsImplementationConfig(moe_implementation={"name": "fused_triton", "kwargs": {"block_size": 64}})
+
+    with pytest.raises(ValueError, match="'eager' is not a quantizing row"):
+        OpsImplementationConfig(
+            moe_implementation={
+                "name": "qat",
+                "kwargs": {"block_size": 128},
+                "overrides": [{"site": r"layers\.0\.experts", "name": "eager", "kwargs": {"block_size": 64}}],
+            }
+        )
+
+
+def test_a_quantizing_row_may_carry_arguments():
+    configured = OpsImplementationConfig(moe_implementation={"name": "qat", "kwargs": {"block_size": 64}})
+    assert configured.moe_implementation.kwargs == {"block_size": 64}

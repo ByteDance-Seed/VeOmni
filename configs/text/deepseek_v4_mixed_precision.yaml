@@ -11,7 +11,6 @@
 #   <family>_implementation:
 #     name: <row>                 # eager | qat | torchao_nvfp4 | deepgemm_fp8 | ...
 #     kwargs:                     # arguments the row takes; optional
-#       dtype: fp8
 #       block_size: 128
 #     overrides:
 #       - site: <regex>           # fullmatch against the model's site string
@@ -21,9 +20,16 @@
 # The row name already carries the three things that used to be separate fields:
 # `qat` is fake FP8 through TileLang, `torchao_nvfp4` is fake NVFP4,
 # `deepgemm_fp8` is the vendor's real FP8 GEMM. What a row still needs per call is
-# its *arguments* -- `dtype`, `block_size` -- and those live in `kwargs`. A key the
-# row does not accept raises when the handle is built, so a typo cannot silently
-# drop the setting it meant to write.
+# its *arguments* -- `block_size` for the GEMM rows, `expert_dtype` for the routed
+# experts -- and those live in `kwargs`. Precision is not an argument: it is what
+# the name says.
+#
+# Only a quantizing row takes arguments, because an argument says *how* to round.
+# A reference row (`eager`, `fused_triton`, `liger_kernel`) rounds nothing, so
+# naming one in an override means dropping the inherited arguments:
+# `kwargs: {}` with `replace_kwargs: true`. Both mistakes -- an argument the row
+# does not accept, and any argument on a non-quantizing row -- raise at config
+# parse time, so a typo cannot silently drop the setting it meant to write.
 #
 # A bare string still works and means "one row everywhere", which is what every
 # existing config and checkpoint records.
@@ -57,10 +63,14 @@ model:
         - site: "layers\\.(1[0-9]|[2-4][0-9]|5[0-8])\\.(q_a_proj|q_b_proj|kv_proj|o_a_proj|o_b_proj)"
           name: qat
           kwargs:
-            dtype: fp8
             block_size: 128
+        # A different quantizer: `torchao_nvfp4` is NVFP4 by name, and takes only
+        # `block_size`, so the inherited width is replaced rather than merged.
         - site: "layers\\.(1[0-9]|[2-4][0-9]|5[0-8])\\.o_a_proj"
           name: torchao_nvfp4
+          kwargs:
+            block_size: 16
+          replace_kwargs: true
 
     # ------------------------------------------------------------------
     # Shared expert. Quantized everywhere except layer 0, which the
@@ -69,11 +79,11 @@ model:
     swiglu_mlp_implementation:
       name: qat
       kwargs:
-        dtype: fp8
+        block_size: 128
       overrides:
-        # Switching to a row with a different signature has to say so: `liger_kernel`
-        # takes no `dtype`, and inheriting one would be refused when the handle is
-        # built. `replace_kwargs` drops the inherited set instead of merging into it.
+        # A reference row rounds nothing, so it takes no arguments: the inherited
+        # `block_size` is dropped with `replace_kwargs` rather than passed to a row
+        # that would refuse it.
         - site: "layers\\.0\\.mlp"
           name: liger_kernel
           kwargs: {}
@@ -83,9 +93,9 @@ model:
     # Routed experts: the vendor's real FP8 grouped GEMM, not fake
     # quantization. This is the "everything off, the experts on" shape.
     #
-    # `dtype` is deliberately absent: the row falls back to the checkpoint's
-    # own `expert_dtype`, which is FP4 on V4-Flash. The modeling passes that
-    # as a call argument, and a call argument beats the handle's kwargs.
+    # `expert_dtype` is deliberately absent: the row falls back to the
+    # checkpoint's own, which is FP4 on V4-Flash. The modeling passes it as a
+    # call argument, and a call argument beats the handle's kwargs.
     # ------------------------------------------------------------------
     moe_implementation:
       name: fused_triton

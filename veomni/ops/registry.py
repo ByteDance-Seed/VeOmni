@@ -165,6 +165,11 @@ class OpEntry:
     requirement: KernelRequirement | None = None
     requires: tuple[str, ...] = ()
     default: bool = False
+    #: Whether this row rounds the operands it is handed. A selection may pass
+    #: ``kwargs`` only to such a row: a fused reference row has no ``dtype`` or
+    #: ``block_size``, so accepting them would mean silently ignoring what the
+    #: config asked for.
+    quantizes: bool = False
 
     def __post_init__(self) -> None:
         """Validate the raw/wrapper pairing and generate the wrapper if needed."""
@@ -317,6 +322,40 @@ class OpRegistry:
                 seen.append(impl)
         return seen
 
+    def quantizes(self, op: str, impl: str) -> bool | None:
+        """Whether ``impl`` is a quantizing row of ``op``, or ``None`` if unregistered.
+
+        ``quantizes`` describes what the row computes, not which hardware can run
+        it, so any registered device's entry answers for all of them. Config-time
+        validation uses this to refuse row arguments on a reference row without
+        needing a device where the row resolves.
+        """
+        for (entry_op, _variant, entry_impl, _device), entry in self._entries.items():
+            if entry_op == op and entry_impl == impl:
+                return entry.quantizes
+        return None
+
+    def row_arguments(self, op: str, impl: str) -> set[str] | None:
+        """The keyword arguments ``impl`` accepts on ``op``, or ``None`` if unregistered.
+
+        Read from the raw ``forward``, which carries the real signature; the
+        generated ``wrapper`` is ``(*tensors, **attrs)`` and would accept anything.
+        """
+        for (entry_op, _variant, entry_impl, _device), entry in self._entries.items():
+            if entry_op != op or entry_impl != impl:
+                continue
+            fn = entry.forward or entry.wrapper
+            if fn is None:
+                return None
+            # ``KEYWORD_ONLY`` only: the tensor operands are positional, so a
+            # selection never supplies them and listing them would suggest it could.
+            return {
+                name
+                for name, parameter in signature(fn).parameters.items()
+                if parameter.kind is Parameter.KEYWORD_ONLY
+            }
+        return None
+
     def list_entries(self, op: str, variant: str) -> list[OpEntry]:
         """Return every registered row for ``(op, variant)``.
 
@@ -365,6 +404,7 @@ def register_op(
     requirement: KernelRequirement | None = None,
     requires: tuple[str, ...] = (),
     default: bool = False,
+    quantizes: bool = False,
 ) -> None:
     """Register one row on ``OP_REGISTRY``.
 
@@ -376,6 +416,8 @@ def register_op(
     ``default=True`` marks a device-specific row as a host default candidate
     in registration order. ``resolve_op`` resolves ``impl=None`` through
     ``default_impl(op, variant)``.
+    ``quantizes=True`` marks a row that rounds its operands, which is the only
+    kind of row a selection may pass row arguments to.
     """
     OP_REGISTRY.register(
         OpEntry(
@@ -389,6 +431,7 @@ def register_op(
             requirement=requirement,
             requires=requires,
             default=default,
+            quantizes=quantizes,
         )
     )
 
@@ -409,22 +452,34 @@ def _rebuild_op(op: str, variant: str, impl: str, kwargs: Mapping[str, Any]) -> 
 
 
 def _check_kwargs(entry: OpEntry, kwargs: Mapping[str, Any]) -> None:
-    """Refuse a row argument the row does not accept.
+    """Refuse row arguments the row cannot honour.
 
-    A typo in YAML would otherwise be dropped silently: the row would run with its
-    own default and the config would say something else.
+    Two things are checked, and the first is the important one.
 
-    The raw ``forward`` carries the real signature. A generated ``wrapper`` is
-    ``(*tensors, **attrs)``, so reading it would accept any keyword and validate
-    nothing.
+    **Only a quantizing row takes arguments.** ``kwargs`` describe how to round --
+    ``dtype``, ``block_size``, the checkpoint's ``expert_dtype``. A fused reference
+    row such as ``fused_triton`` has no rounding to describe, so a config that
+    passes arguments to it asks for something the row will not do; accepting them
+    would leave the config saying one thing and the step doing another.
+
+    **A quantizing row still has to declare the key.** A typo would otherwise be
+    dropped, and the row would run its own default while the config said something
+    else. The raw ``forward`` carries the real signature; a generated ``wrapper`` is
+    ``(*tensors, **attrs)`` and would accept any keyword.
     """
     if not kwargs:
         return
+    if not entry.quantizes:
+        raise ValueError(
+            f"{entry.op}/{entry.variant}/{entry.impl} is not a quantizing row, so it takes no row arguments; "
+            f"got {sorted(kwargs)}. A row argument describes how to round an operand, so it belongs on a row "
+            "that rounds -- name one (for example 'qat' or 'torchao_nvfp4'), or drop the kwargs."
+        )
     fn = entry.forward or entry.wrapper
     if fn is None:
         return
     accepted = {
-        name for name, parameter in signature(fn).parameters.items() if parameter.kind is not Parameter.POSITIONAL_ONLY
+        name for name, parameter in signature(fn).parameters.items() if parameter.kind is Parameter.KEYWORD_ONLY
     }
     unknown = sorted(set(kwargs) - accepted)
     if unknown:
