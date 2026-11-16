@@ -62,9 +62,9 @@ CANN 9.2.1 Dockerfiles cover A2 x86/ARM64 and A3 ARM64. All three use
 system Python and include a uv cache and development dependencies. See the
 [A2 guide](build_a2_docker.md), [A3 guide](build_a3_docker.md), and
 [publication status](supported_tags.md#cann-921-pending-quay-publication).
-The Dockerfile change does not update the existing build or NPU test workflows;
-builder integration is handled separately in
-[PR #1470](https://github.com/ByteDance-Seed/VeOmni/pull/1470).
+The existing A2/A3 builders select the CANN 9.2.1 Dockerfiles. See the
+[build and publication rules](../../../docker/README.md#build-and-publication-workflows).
+NPU test workflows retain their existing environment.
 
 ## Quick Start
 

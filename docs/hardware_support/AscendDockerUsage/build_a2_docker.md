@@ -50,10 +50,13 @@ docker run --rm -it --network host --shm-size=32g \
 For x86, use `linux/amd64` in the pull command and the local
 `veomni:cann921-a2-amd64` tag in the run command.
 
-The existing build workflows are unchanged by the Dockerfile PR.
-[PR #1470](https://github.com/ByteDance-Seed/VeOmni/pull/1470) separately
-integrates these Dockerfiles into the existing A2/A3 builders and must follow
-[PR #1427](https://github.com/ByteDance-Seed/VeOmni/pull/1427).
+The existing [A2 builder](../../../.github/workflows/docker-build-ascend-a2.yml)
+and [A3 builder](../../../.github/workflows/docker-build-ascend-a3.yml) build
+these CANN 9.2.1 Dockerfiles on matching native runners. They support manual
+dispatch, published releases, and path-filtered pushes to `main`. Upstream
+builds publish to Quay using repository secrets; the authorized personal
+candidate branch publishes to GHCR. See the
+[workflow and tag rules](../../../docker/README.md#build-and-publication-workflows).
 The NPU unit/e2e workflows continue to use their existing environment.
 See [validation scope and cache details](../../../docker/README.md#validation-scope).
 

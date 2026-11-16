@@ -19,8 +19,9 @@ Two tag schemes coexist on quay.io:
 These target tags are not yet confirmed available on Quay. They are listed
 for the planned publication, not as currently pullable release images.
 Build locally using the [A2](build_a2_docker.md) or [A3](build_a3_docker.md)
-guide. Workflow integration is separate in
-[PR #1470](https://github.com/ByteDance-Seed/VeOmni/pull/1470).
+guide. The integrated builders currently generate legacy-style tags; these
+product-style target names are for manual publication and are not generated
+by the workflows. See [workflow tag rules](../../../docker/README.md#build-and-publication-workflows).
 
 | Target tag | Architectures | Triton / Triton-Ascend |
 | --- | --- | --- |
