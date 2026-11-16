@@ -81,7 +81,7 @@ The `output_dir` becomes `model.model_path` in `base.yaml`.
 ### 2.1 Load an upstream checkpoint directly
 
 A family that registers an HF layout (`OMNI_HF_LAYOUT_REGISTRY` — for example
-`qwen3` and `qwen3_vl`) skips the convert: `model.model_path` (or
+`qwen3`, `qwen3_vl`, and `bagel`) skips the convert: `model.model_path` (or
 `OmniModel.from_pretrained` / `OmniProcessor.from_pretrained`) can name the
 upstream HF checkpoint. Detection is by the root `config.json`'s `model_type`:
 `omni` is a split checkpoint, a type with a registered layout loads through it,

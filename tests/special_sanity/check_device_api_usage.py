@@ -88,6 +88,7 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "tests/optim/test_adafactor_fsdp2.py",
     "tests/models/test_diffusion_gemma",
     "tests/models/test_llada.py",
+    "tests/models/test_float8_training.py",
     "tests/models/test_qwen_image_precision.py",
     "tests/precision/qwen_image.py",
     "tests/utils/test_full_determinism_attention.py",

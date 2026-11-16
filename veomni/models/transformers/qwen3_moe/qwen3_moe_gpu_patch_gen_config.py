@@ -35,6 +35,7 @@ from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
@@ -76,6 +77,7 @@ config.add_import(
 # Replace HF's ``create_causal_mask`` / ``create_sliding_window_causal_mask`` with
 # ``veomni.models.utils.mask_utils`` so packed ``cu_seq_lens_q`` / ``cu_seq_lens_k``
 # inputs route through ``veomni.ops.mask`` once in ``Qwen3MoeModel.forward``.
+config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask", "create_sliding_window_causal_mask"],
@@ -208,6 +210,7 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         if not self.use_swiglu_mlp:
+            reject_quantizing_act_fn(self)
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,

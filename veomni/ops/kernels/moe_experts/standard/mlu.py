@@ -207,6 +207,8 @@ def mlu_group_gemm_fused_moe_forward(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
     activation: str = "silu",
+    block_size: int = 128,
+    expert_dtype: str = "fp8",
 ) -> Tensor:
     """MLU grouped-gemm fused MoE. Empty weights are ``None``.
 
@@ -292,6 +294,8 @@ def wrapper(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
     activation: str = "silu",
+    block_size: int = 128,
+    expert_dtype: str = "fp8",
 ) -> Tensor:
     """Call the MLU fused MoE path. Empty weights are ``None``."""
     return mlu_group_gemm_fused_moe_forward(
@@ -307,3 +311,4 @@ def wrapper(
         assume_distinct_experts=assume_distinct_experts,
         activation=activation,
     )
+    del block_size, expert_dtype
