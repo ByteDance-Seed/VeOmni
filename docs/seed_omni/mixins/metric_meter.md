@@ -163,7 +163,7 @@ reported per module under `trace/<module>/` and there is no top-level
 [`OmniEnvironMeter.state_dict()`](../../../veomni/utils/omni_helper.py#L111),
 which `GlobalStateCallback`
 [saves](../../../veomni/trainer/callbacks/global_state_callback.py#L142) and
-[restores](../../../veomni/trainer/callbacks/global_state_callback.py#L300), so
+[restores](../../../veomni/trainer/callbacks/global_state_callback.py#L295), so
 the cumulative counters survive a resume.
 
 ## Rules for a correct implementation

@@ -223,6 +223,44 @@ conversation path (`tests/seed_omni/modules/<family>/test_*_accel_align.py`
 compares loss, per-parameter gradients and the AdamW step). None of that is on the
 critical path for "support model X".
 
+### 4.2 Composing modules across families
+
+The other direction from §4.1: a graph whose modules come from **different**
+families, i.e. different checkpoints, composed by YAML alone. This is the strongest
+test of the module contract — if it needs Python, the contract has a gap.
+
+The in-tree example is
+[Qwen3-0.6B visual instruction tuning](../models/qwen3.md#7-visual-instruction-tuning-composing-the-qwen3-vl-vit):
+`qwen3vl_vision` (from the Qwen3-VL family) beside `qwen3_text_encoder` and
+`qwen3_llm` (from the Qwen3 family). No new class; the recipe is three
+`model_config:` overrides in `modules_train.yaml`.
+
+What a cross-family composition may need — and what each knob is for:
+
+| Need | Mechanism | Example |
+|------|-----------|---------|
+| Match the source module's output width to the destination's hidden size | a config field the source module already reads at build time | `qwen3vl_vision` `out_hidden_size: 1024` retargets its own patch merger |
+| Drop features the destination cannot consume | likewise a build-time config field | `qwen3vl_vision` `disable_deepstack: true`, because the plain Qwen3 backbone has no DeepStack injection |
+| Freeze most of a borrowed module, keep part trainable | the module's own `freeze_model()` reading a config flag | `qwen3vl_vision` `freeze: true` keeps only the merger |
+| Make a module accept another family's item types | the module's own config flag | `qwen3_text_encoder` `enable_image: true` switches it to the Qwen3-VL chat template and keeps only the vision special-token rows trainable |
+| Point the modules at different checkpoints | per-module `model_path` | `qwen3vl_vision: model_path: /abs/path/to/Qwen3-VL-2B/qwen3vl_vision` |
+
+Three rules make this work:
+
+- **One `dp_size`.** Every distributed module and `model.accelerator` must resolve
+  to the same `dp_size`; see
+  [Per-Module Parallelism](../distributed/per_module_parallelism.md). A borrowed
+  module does not get its own data stream.
+- **One carrier.** A cross-family graph uses the conversation graph, never a packed
+  one (§4.1). Each module reads the items it owns by `type` / `role` / `meta` and
+  writes its output back onto the same item, which is what lets a tower from one
+  family feed a backbone from another.
+- **A split checkpoint per source.** `model.model_path` is a HuggingFace checkpoint
+  only when every module comes from that one layout
+  ([Upstream Checkpoint Layout](hf_layout.md) rejects a module outside it), so a
+  multi-source composition starts from split checkpoints and exports one
+  `hf_ckpt/` per module rather than a single flat checkpoint.
+
 ## 5. Honour the contracts
 
 - Return at most one scalar `_loss` per node, token-mean reduced over the

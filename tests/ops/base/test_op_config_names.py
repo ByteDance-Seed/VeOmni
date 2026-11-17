@@ -38,6 +38,8 @@ _FIELD_TO_OP = {
     "dsa_attention_implementation": "dsa_attention",
     "dsa_indexer_implementation": "dsa_indexer",
     "load_balancing_loss_implementation": "load_balancing_loss",
+    "linear_implementation": "linear",
+    "kv_round_implementation": "kv_round",
     "mhc_implementation": "mhc",
     "moe_implementation": "moe_experts",
     "qsa_attention_implementation": "qsa_attention",
@@ -47,8 +49,6 @@ _FIELD_TO_OP = {
     "rotary_pos_emb_vision_implementation": "rope",
     "swiglu_mlp_implementation": "swiglu_mlp",
 }
-
-_FUNCTIONAL_IMPLEMENTATION_FIELDS = {"qat_implementation"}
 
 
 def _registered_implementations(op: str) -> set[str]:
@@ -72,10 +72,10 @@ def test_yaml_op_implementation_names_are_registered():
                 continue
 
             for field, implementation in implementations.items():
+                # Every op-selection field names a registered family, so an
+                # unmapped key is a stale config rather than a field to skip.
                 op = _FIELD_TO_OP.get(field)
                 if op is None:
-                    if field in _FUNCTIONAL_IMPLEMENTATION_FIELDS:
-                        continue
                     invalid.append(f"{path.relative_to(REPO_ROOT)}: unmapped implementation field {field!r}")
                     continue
                 if implementation in _registered_implementations(op):

@@ -106,7 +106,6 @@ from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import (
@@ -144,9 +143,10 @@ from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen3OmniMoeThinkerCausalLMOutputWithLogProbs
@@ -1626,6 +1626,7 @@ class Qwen3OmniMoeThinkerTextExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         if not self.use_swiglu_mlp:
+            reject_quantizing_act_fn(self)
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,
@@ -1766,13 +1767,6 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-            kwargs,
-            impl=self.veomni_attn.impl,
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-        )
-
         attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
@@ -1782,7 +1776,7 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=self.sliding_window,
-            **attn_kwargs,
+            **kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -1973,6 +1967,9 @@ class Qwen3OmniMoeThinkerTextModel(Qwen3OmniMoePreTrainedModel):
     #    index 0 is the text_position_ids used for the causal mask).
     # 2. Return MoeModelOutputWithPast so @capture_outputs can inject
     #    router_logits via the registered OutputRecorder.
+    # 3. Forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``) into
+    #    ``veomni.models.utils.mask_utils.create_causal_mask`` so packed sequences
+    #    build an isolated mask once in the model forward.
     # NOTE: the @merge_with_config_defaults / @capture_outputs / @auto_docstring
     # decorators on the upstream method are preserved by patchgen.
     # ================================================================
@@ -2027,15 +2024,20 @@ class Qwen3OmniMoeThinkerTextModel(Qwen3OmniMoePreTrainedModel):
         else:
             text_position_ids = position_ids[0]
 
+        # --- Patch.3 ---
         # transformers 5.9 dropped ``cache_position`` from ``create_causal_mask``
         # ("Deprecated and unused" — see masking_utils.py:917).
         attention_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=text_position_ids,
+            **{
+                **kwargs,
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": text_position_ids,
+            }
         )
+        # --- Patch.3 ---
 
         hidden_states = inputs_embeds
 
