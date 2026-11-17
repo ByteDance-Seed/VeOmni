@@ -94,6 +94,8 @@ def _require_two_native_npus():
         if required:
             pytest.fail("VEOMNI_REQUIRE_NPU_TESTS=1 requires an NPU CI assignment")
         pytest.skip("requires an NPU CI assignment")
+    if capabilities is not None and len(capabilities.devices) < 2:
+        pytest.fail("NPU CI assignment must own at least two devices")
     npu = getattr(torch, "npu", None)
     if not IS_NPU_AVAILABLE or npu is None or not npu.is_available() or npu.device_count() < 2:
         if required or (capabilities is not None and capabilities.backend == "npu"):
