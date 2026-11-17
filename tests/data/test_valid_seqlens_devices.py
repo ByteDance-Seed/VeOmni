@@ -28,6 +28,9 @@ from veomni.utils.seqlen_pos_transform_utils import valid_seqlens_from_cu_seqlen
 
 _CASES = [
     ([0, 4, 7, 8, 9, 10], None, [4, 3]),
+    # An overlapping segment is excluded in full; callers should segment padding separately.
+    ([0, 4, 7], 1, [4]),
+    ([0, 4, 6, 7], 1, [4, 2]),
     ([0, 4, 5, 6, 7, 8], 3, [4, 1]),
     ([0, 4, 5], 0, [4, 1]),
     ([0, 1, 3], None, [1, 2]),
