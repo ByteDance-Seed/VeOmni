@@ -1398,6 +1398,45 @@ def test_multi_optimizer_rejects_changed_scheduler_before_loading_weights(tmp_pa
     assert different is not None
 
 
+def test_old_callable_hash_scheduler_identity_is_rejected_without_mutation(tmp_path, monkeypatch):
+    from veomni.checkpoint import optimizer_resume_layout
+
+    model, optimizer = _model_and_optimizer()
+    scheduler = build_lr_scheduler(optimizer, train_steps=100, lr_decay_style="linear", lr_warmup_ratio=0.1)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    current_layout = optimizer_resume_layout._scheduler_layout
+
+    def legacy_layout(leaf):
+        layout = current_layout(leaf)
+        if layout is not None:
+            layout = {"type": layout["type"], "functions": ["legacy-callable-hash"]}
+        return layout
+
+    with monkeypatch.context() as context:
+        context.setattr(optimizer_resume_layout, "_scheduler_layout", legacy_layout)
+        DistributedCheckpointer.save(
+            str(tmp_path),
+            {
+                "model": model,
+                "optimizer": optimizer,
+                "extra_state": {"lr_scheduler": scheduler.state_dict()},
+                "_veomni_scheduler_object": scheduler,
+            },
+            parallel_state=parallel,
+        )
+    target, restored = _model_and_optimizer()
+    target_scheduler = build_lr_scheduler(restored, train_steps=100, lr_decay_style="linear", lr_warmup_ratio=0.1)
+    before = {name: param.detach().clone() for name, param in target.named_parameters()}
+    with pytest.raises(RuntimeError, match="(?i)optimizer.*scheduler.*layout"):
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "extra_state": {}, "_veomni_scheduler_object": target_scheduler},
+            parallel_state=parallel,
+        )
+    assert all(torch.equal(param, before[name]) for name, param in target.named_parameters())
+    assert all(not leaf.state for leaf in restored.optimizers_dict.values())
+
+
 def test_multi_lr_scheduler_rejects_missing_leaf():
     _, optimizer = _model_and_optimizer()
     scheduler = build_lr_scheduler(optimizer, train_steps=100)
@@ -2461,8 +2500,9 @@ def test_multi_checkpoint_requires_explicit_scheduler_declaration(tmp_path):
     assert not (tmp_path / "model").exists()
 
 
-def test_scheduler_recipe_rejects_schedules_outside_the_checkpoint_contract():
+def test_scheduler_recipe_requires_explicit_registration():
     from veomni.models.checkpoint.manager import _scheduler_recipe
+    from veomni.optim.lr_scheduler import register_checkpoint_scheduler
 
     _, optimizer = _model_and_optimizer()
     leaf = optimizer.optimizers_dict["weight"]
@@ -2470,170 +2510,12 @@ def test_scheduler_recipe_rejects_schedules_outside_the_checkpoint_contract():
     with pytest.raises(RuntimeError, match="scheduler implementation or binding is unsupported"):
         _scheduler_recipe(step, leaf)
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(leaf, lambda value, *, factor=0.5: value * factor)
-    with pytest.raises(RuntimeError, match="scheduler captures unsupported mutable state"):
+    scheduler = torch.optim.lr_scheduler.LambdaLR(leaf, lambda value: 0.5 if value in {1, 3} else 1.0)
+    with pytest.raises(RuntimeError, match="no registered checkpoint recipe"):
         _scheduler_recipe(scheduler, leaf)
-
-
-@pytest.mark.parametrize("kind", ["function", "comprehension"])
-def test_scheduler_recipe_rejects_global_in_nested_function(monkeypatch, kind):
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    monkeypatch.setitem(globals(), "_TEST_NESTED_LR_FACTOR", 0.5)
-
-    def schedule(step):
-        def nested():
-            return _TEST_NESTED_LR_FACTOR  # noqa: F821
-
-        return step * nested()
-
-    def comprehension(step):
-        return sum(value * _TEST_NESTED_LR_FACTOR for value in range(step))  # noqa: F821
-
-    # Changing this global changes the next learning-rate update even though
-    # the outer code object never names it. Its identity is therefore unsafe.
-    with pytest.raises(RuntimeError, match="unsupported global state"):
-        _scheduler_functions(SimpleNamespace(lr_lambdas=[schedule if kind == "function" else comprehension]))
-
-
-def test_scheduler_recipe_accepts_nested_pure_function():
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    def schedule(step):
-        def nested(value):
-            return value * 0.5
-
-        return nested(step)
-
-    recipe = _scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))
-    assert len(recipe) == 1
-    assert schedule(2) == 1.0
-
-
-def test_scheduler_recipe_accepts_local_temporary_cell():
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    def schedule(step):
-        value = step * 0.5
-        return (lambda: value)()
-
-    assert len(_scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))) == 1
-    assert schedule(2) == 1.0
-
-
-def test_scheduler_recipe_accepts_math_attribute_with_unrelated_global(monkeypatch):
-    import math as math_module
-
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    monkeypatch.setitem(globals(), "math", math_module)
-    monkeypatch.setitem(globals(), "cos", "unrelated")
-
-    def schedule(step):
-        def nested(value):
-            return math.cos(value)  # noqa: F821
-
-        return nested(step)
-
-    assert len(_scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))) == 1
-
-
-@pytest.mark.parametrize("kind", ["set", "frozenset_constant"])
-def test_scheduler_recipe_rejects_process_dependent_computation(kind):
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    def unordered(step):
-        return sum(float(value) for value in {"0.125", "1e16", "-1e16"})
-
-    def unordered_constant(step):
-        return step in {1, 2, 3}
-
-    schedule = {"set": unordered, "frozenset_constant": unordered_constant}[kind]
-    with pytest.raises(RuntimeError, match="unsupported.*state"):
-        _scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))
-
-
-def test_scheduler_recipe_accepts_deterministic_format_and_records_its_identity():
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    def build_schedule(two_decimals):
-        if two_decimals:
-
-            def schedule(step):
-                return float(f"{step / 300:.2f}")
-        else:
-
-            def schedule(step):
-                return float(f"{step / 300:.3f}")
-
-        return schedule
-
-    two_decimals = build_schedule(True)
-    three_decimals = build_schedule(False)
-    assert two_decimals.__qualname__ == three_decimals.__qualname__
-    two = _scheduler_functions(SimpleNamespace(lr_lambdas=[two_decimals]))
-    three = _scheduler_functions(SimpleNamespace(lr_lambdas=[three_decimals]))
-    assert two_decimals(13) != three_decimals(13)
-    assert two != three
-
-
-def test_scheduler_recipe_rejects_nonlocal_mutation():
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    state = 1.0
-
-    def schedule(step):
-        nonlocal state
-        state += 1.0
-        return step * state
-
-    with pytest.raises(RuntimeError, match="unsupported dynamic state"):
-        _scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))
-
-
-def test_nested_global_scheduler_is_rejected_before_checkpoint_load(tmp_path, monkeypatch):
-    model, optimizer = _model_and_optimizer()
-    scheduler = build_lr_scheduler(optimizer, train_steps=10)
-    parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(
-        str(tmp_path),
-        {
-            "model": model,
-            "optimizer": optimizer,
-            "extra_state": {"lr_scheduler": scheduler.state_dict()},
-            "_veomni_scheduler_object": scheduler,
-        },
-        parallel_state=parallel,
-    )
-
-    target, restored = _model_and_optimizer()
-    target_scheduler = build_lr_scheduler(restored, train_steps=10)
-    monkeypatch.setitem(globals(), "_TEST_NESTED_LR_FACTOR", 0.5)
-
-    def schedule(step):
-        def nested():
-            return _TEST_NESTED_LR_FACTOR  # noqa: F821
-
-        return step * nested()
-
-    target_scheduler["weight"].lr_lambdas[0] = schedule
-    before = {name: value.detach().clone() for name, value in target.named_parameters()}
-    scheduler_before = target_scheduler.state_dict()
-    with pytest.raises(RuntimeError, match="unsupported global state"):
-        DistributedCheckpointer.load(
-            str(tmp_path),
-            {
-                "model": target,
-                "optimizer": restored,
-                "extra_state": {},
-                "_veomni_scheduler_object": target_scheduler,
-            },
-            parallel_state=parallel,
-        )
-    for name, value in target.named_parameters():
-        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
-    assert target_scheduler.state_dict() == scheduler_before
-    assert all(not leaf.state for leaf in restored.optimizers_dict.values())
+    register_checkpoint_scheduler(scheduler, name="test.piecewise", version=1, parameters={"half_steps": [1, 3]})
+    assert _scheduler_recipe(scheduler, leaf)["recipe"]["parameters"] == {"half_steps": [1, 3]}
+    assert scheduler.lr_lambdas[0](1) == 0.5
 
 
 def test_multi_checkpoint_accepts_explicit_no_scheduler(tmp_path):
@@ -2662,9 +2544,7 @@ def test_multi_checkpoint_accepts_explicit_no_scheduler(tmp_path):
 
 
 def test_deterministic_formatted_scheduler_recovers_next_update(tmp_path):
-    import weakref
-
-    from veomni.optim.lr_scheduler import _CHECKPOINT_SCHEDULER_BINDINGS, MultiLRScheduler
+    from veomni.optim.lr_scheduler import MultiLRScheduler, register_checkpoint_scheduler
 
     def build_formatted_scheduler(optimizer, *, precision=4):
         schedules = {}
@@ -2679,7 +2559,9 @@ def test_deterministic_formatted_scheduler_recovers_next_update(tmp_path):
                     return float(f"{1 / (step + 1):.3f}")
 
             schedule = torch.optim.lr_scheduler.LambdaLR(leaf, lr_lambda)
-            _CHECKPOINT_SCHEDULER_BINDINGS[leaf] = weakref.ref(schedule)
+            register_checkpoint_scheduler(
+                schedule, name="test.formatted", version=1, parameters={"precision": precision}
+            )
             schedules[name] = schedule
         return MultiLRScheduler(schedules)
 
