@@ -184,7 +184,7 @@ model:
     chunk_gated_delta_rule_implementation: fla_npu
 ```
 
-`fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It covers the targets Atlas A2 training products
+`fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It covers the Atlas A2 training products
 (`ascend910b`), A3 (`ascend910_93`) and A5 / arch35 (`ascend950`) targets; the library picks the
 arch22 or arch35 kernel path from the SoC, and this adapter uses the BF16 K=V=128,
 chunk_size=64 contract both paths share. The vendored `causal_conv1d` no longer rejects
@@ -202,7 +202,7 @@ The following prebuilt NPU images on [quay.io](https://quay.io/repository/ascend
 bundle the legacy `fla_npu` build from `c2e3d83f`, which does not provide the GDN API required
 by this adapter:
 
-- targets Atlas A2 training products: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A2-ubuntu22.04-py3.11-veomni-latest`
+- Atlas A2 training products: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A2-ubuntu22.04-py3.11-veomni-latest`
 - Atlas A3 training products: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A3-ubuntu22.04-py3.11-veomni-latest`
 
 Before selecting the `fla_npu` backend in either image, replace its legacy package using the
@@ -212,11 +212,11 @@ system, selecting the matching SoC target. A compatible Ascend 950PR&950DT produ
 Build and install the `a7c608f` wheel from the
 [`flash-linear-attention-npu`](https://github.com/flashserve/flash-linear-attention-npu) sources.
 The library does not install `torch`, `torch_npu` or `triton-ascend` for you; those must match
-your CANN and Python versions, and `FLA_NPU_SOC` must match the chip — targets Atlas A2 training products → `ascend910b`,
+your CANN and Python versions, and `FLA_NPU_SOC` must match the chip — Atlas A2 training products → `ascend910b`,
 Atlas A3 training products → `ascend910_93`, Ascend 950PR&950DT products → `ascend950`.
 
 ```bash
-# CANN first: targets Atlas A2 training products/Atlas A3 training products need >= 8.5.2, Ascend 950PR&950DT products needs >= 9.0.0. Re-source it in every new shell.
+# CANN first: Atlas A2 training products/Atlas A3 training products need >= 8.5.2, Ascend 950PR&950DT products needs >= 9.0.0. Re-source it in every new shell.
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 git clone https://github.com/flashserve/flash-linear-attention-npu
@@ -243,7 +243,7 @@ python scripts/check_packaged_wheel_api.py
 
 **Compatibility change:** migrating to the stable complete forward/backward API
 removes the legacy adapter's wider-value training domain, including V=256 on
-targets Atlas A2 training products/Atlas A3 training products. Some individual operators and forward-only paths in the library accept
+Atlas A2 training products/Atlas A3 training products. Some individual operators and forward-only paths in the library accept
 wider values or chunk sizes, but its composite backward explicitly requires
 K=V=128 and chunk_size=64. VeOmni intentionally exposes the complete pair's
 common domain, rather than allowing a forward that fails during backward.
@@ -252,7 +252,7 @@ the fused backend cannot represent the requested configuration.
 
 | Target | Q/K/V dtype | K / V | Chunk size | Initial state |
 | --- | --- | --- | --- | --- |
-| targets Atlas A2 training products / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
+| Atlas A2 training products / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
 | Atlas A3 training products / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
 | Ascend 950PR&950DT products / arch35 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
 

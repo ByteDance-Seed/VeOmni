@@ -41,7 +41,7 @@ docker run --rm -it --network host --shm-size=32g \
   veomni:cann921-a3-arm64 bash
 ```
 
-The existing [targets Atlas A2 training products builder](../../../.github/workflows/docker-build-ascend-a2.yml)
+The existing [Atlas A2 training products builder](../../../.github/workflows/docker-build-ascend-a2.yml)
 and [Atlas A3 training products builder](../../../.github/workflows/docker-build-ascend-a3.yml) build
 these CANN 9.2.1 Dockerfiles on matching native runners. They support manual
 dispatch, published releases, and path-filtered pushes to `main`. Upstream

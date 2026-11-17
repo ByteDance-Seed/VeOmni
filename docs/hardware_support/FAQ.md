@@ -30,7 +30,7 @@ NODE_RANK=${NODE_RANK:=0}
 MASTER_ADDR=${MASTER_ADDR:=192.168.1.100}
 # Master node port (default works for most cases)
 MASTER_PORT=${MASTER_PORT:=12345}
-# Number of NPUs per node (targets Atlas A2 training products: max 8, Atlas A3 training products: max 16)
+# Number of NPUs per node (Atlas A2 training products: max 8, Atlas A3 training products: max 16)
 NPROC_PER_NODE=${NPROC_PER_NODE:=8}
 ```
 
@@ -41,7 +41,7 @@ NPROC_PER_NODE=${NPROC_PER_NODE:=8}
 - `NODE_RANK`: Unique identifier for each node (0 to NNODES-1)
 - `MASTER_ADDR`: IP address of the master node (same for all machines)
 - `MASTER_PORT`: Communication port (default: 12345)
-- `NPROC_PER_NODE`: NPUs per node (targets Atlas A2 training products: max 8, Atlas A3 training products: max 16)
+- `NPROC_PER_NODE`: NPUs per node (Atlas A2 training products: max 8, Atlas A3 training products: max 16)
 
 **Important Notes**:
 - All nodes must communicate via `MASTER_ADDR:MASTER_PORT`

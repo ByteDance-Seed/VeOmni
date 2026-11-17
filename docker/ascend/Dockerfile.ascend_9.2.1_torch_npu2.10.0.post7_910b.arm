@@ -1,4 +1,4 @@
-# targets Atlas A2 training products / ARM64, CANN 9.2.1, Ubuntu 22.04 and shared Python 3.12.
+# Atlas A2 training products / ARM64, CANN 9.2.1, Ubuntu 22.04 and shared Python 3.12.
 # torch-npu source: https://ascend.devcloud.huaweicloud.com/pypi/simple/torch-npu/
 FROM swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.2.1-910b-ubuntu22.04-py3.12
 
@@ -22,13 +22,13 @@ RUN echo "Setting timezone to CST (China Standard Time)..." && \
     ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
     echo "Asia/Shanghai" > /etc/timezone
 
-# Preserve the ARM Ubuntu mirror override used by the targets Atlas A2 training products Dockerfile.
+# Preserve the ARM Ubuntu mirror override used by the Atlas A2 training products Dockerfile.
 RUN if [ "${APT_SOURCE}" != "http://ports.ubuntu.com/ubuntu-ports/" ]; then \
     cp /etc/apt/sources.list /etc/apt/sources.list.bak && \
     sed -E -i "s#https?://[^[:space:]]+/ubuntu-ports/?#${APT_SOURCE}#g" /etc/apt/sources.list; \
     fi
 
-# gawk and pciutils are required by the supplied targets Atlas A2 training products FLA build procedure.
+# gawk and pciutils are required by the supplied Atlas A2 training products FLA build procedure.
 # binutils provides readelf for check_packaged_wheel_api.py.
 RUN apt-get -o Acquire::Check-Date=false update -y && \
     DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Check-Date=false install -y --no-install-recommends \
@@ -50,7 +50,7 @@ RUN pip config set global.index-url "${PIP_INDEX}" && \
 
 RUN pip3 install --no-cache-dir -U pip setuptools requests
 
-# The targets Atlas A2 training products CI creates its own venv with uv after checking out VeOmni.
+# The Atlas A2 training products CI creates its own venv with uv after checking out VeOmni.
 COPY --from=ghcr.io/astral-sh/uv:0.11.16 /uv /uvx /bin/
 
 # Keep the cache outside /app so a source checkout mount does not hide it.
@@ -107,7 +107,7 @@ RUN python -m pip uninstall -y triton triton-ascend && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     python -c "from triton._C.libtriton import ascend"
 
-# Build the targets Atlas A2 training products wheel with the upstream script and retain it for CI environments.
+# Build the Atlas A2 training products wheel with the upstream script and retain it for CI environments.
 ARG FLA_BUILD_JOBS=4
 RUN git clone https://github.com/flashserve/flash-linear-attention-npu /tmp/fla-npu && \
     cd /tmp/fla-npu && git checkout --detach a7c608f2e3f828779ceeec1fcf155a6e37ede83c && \
