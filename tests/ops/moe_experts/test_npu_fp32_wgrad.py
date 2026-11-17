@@ -211,10 +211,17 @@ def test_bad_compute_or_master_dtype_is_rejected(fake_npu):
 
 @pytest.mark.parametrize("rematerialize", [False, True])
 def test_native_npu_fp32_wgrad_matches_cpu_reference(rematerialize):
-    assigned = bool(os.environ.get("VEOMNI_CI_CAPABILITIES")) and runner_capabilities().backend == "npu"
-    available = IS_NPU_AVAILABLE and torch.npu.is_available()
-    if not available:
-        if assigned or os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1":
+    capabilities = runner_capabilities() if os.environ.get("VEOMNI_CI_CAPABILITIES") else None
+    required = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1"
+    if capabilities is not None and capabilities.backend != "npu":
+        if required:
+            pytest.fail("VEOMNI_REQUIRE_NPU_TESTS=1 requires an NPU CI assignment")
+        pytest.skip("requires an NPU CI assignment")
+    npu = getattr(torch, "npu", None)
+    if (capabilities is not None and not capabilities.devices) or not (
+        IS_NPU_AVAILABLE and npu is not None and npu.is_available() and npu.device_count() >= 1
+    ):
+        if required or capabilities is not None:
             pytest.fail("Assigned or required NPU runtime must provide a usable device")
         pytest.skip("native NPU is unavailable")
     import torch_npu  # noqa: F401
