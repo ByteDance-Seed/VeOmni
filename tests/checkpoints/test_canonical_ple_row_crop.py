@@ -27,6 +27,9 @@ from veomni.checkpoint.dcp_checkpointer import (
 from veomni.distributed.parallel_plan import SpecInfo
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
 def _canonical_ep_ple_worker(rank, path, endpoint):
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=4, timeout=timedelta(seconds=60))
     try:
