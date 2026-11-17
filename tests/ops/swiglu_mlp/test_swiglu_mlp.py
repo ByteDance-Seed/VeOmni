@@ -663,7 +663,7 @@ def test_a_linear_subclass_projection_skips_the_fused_path():
     assert not has_plain_linear_projections(mlp)
 
     # The quantizing check runs before the row is resolved, so a stub handle
-    # carrying the impl name is enough; the real ``qat`` row needs SM90 + TileLang.
+    # carrying the impl name is enough; the real ``qat`` row needs a supported GPU.
     class _QatHandle:
         impl = "qat"
 

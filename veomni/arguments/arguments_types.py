@@ -1572,7 +1572,8 @@ class OpsImplementationConfig:
     swiglu_mlp_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'qat' (FP8 QAT, SM90+) | "
+            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | "
+            "'qat' (FP8 QAT, SM90+ or ROCm gfx942/gfx950) | "
             "'torchao_nvfp4' (NVFP4 QAT, needs the 'torchao' package) | 'eager'. "
             "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
         },
@@ -1580,7 +1581,8 @@ class OpsImplementationConfig:
     linear_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "Dense projection. 'qat' (FP8 fake quantization of both GEMM operands, SM90+) | "
+            "help": "Dense projection. 'qat' (FP8 fake quantization of both GEMM operands, "
+            "SM90+ or ROCm gfx942/gfx950) | "
             "'torchao_nvfp4' (NVFP4 fake quantization of both GEMM operands, 'standard' variant only, needs "
             "the 'torchao' package) | 'eager' (calls the projection module). "
             "Unset: 'eager'. Selected independently of swiglu_mlp_implementation: a model that owns its "

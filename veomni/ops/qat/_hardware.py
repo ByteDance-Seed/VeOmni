@@ -67,6 +67,8 @@ def reject_qat_without_native_bf16(model: nn.Module) -> None:
     selected = _native_bf16_qat_selections(model)
     if not selected:
         return
+    from ...utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+
     if not IS_CUDA_AVAILABLE:
         return
     if get_gpu_compute_capability() < 80:

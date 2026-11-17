@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config as UpstreamConfig
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -65,6 +66,54 @@ def test_the_defaults_leave_the_objective_off():
     config = DeepseekV4Config(num_hidden_layers=2, layer_types=["compressed_sparse_attention"] * 2)
     assert config.dsa_indexer_loss is False
     assert config.dsa_indexer_loss_coef == 1.0
+
+
+def _qat_config(*, expert_dtype=None, quantization_config=None, moe_qat=True):
+    ops = eager_ops_config()
+    ops.linear_implementation = "qat"
+    ops.swiglu_mlp_implementation = "qat"
+    ops.moe_implementation = "qat" if moe_qat else "eager"
+    kwargs = {"ops_implementation": ops}
+    if expert_dtype is not None:
+        kwargs["expert_dtype"] = expert_dtype
+    if quantization_config is not None:
+        kwargs["quantization_config"] = quantization_config
+    config = DeepseekV4Config(**kwargs)
+    config._ops_config_cache = (dict(config.ops_implementation), ops)
+    return config
+
+
+def test_qat_recipe_normalizes_metadata_expert_dtype():
+    config = _qat_config(quantization_config={"expert_dtype": "fp8", "weight_block_size": [128, 128]})
+
+    config.validate_build_prerequisites()
+
+    assert config.expert_dtype == "fp8"
+
+
+def test_qat_recipe_rejects_conflicting_expert_dtype():
+    config = _qat_config(
+        expert_dtype="fp8",
+        quantization_config={"expert_dtype": "fp4", "weight_block_size": [128, 128]},
+    )
+
+    with pytest.raises(ValueError, match="expert_dtype to agree"):
+        config.validate_build_prerequisites()
+
+
+def test_qat_recipe_rejects_export_block_geometry_drift():
+    config = _qat_config(quantization_config={"expert_dtype": "fp8", "weight_block_size": [32, 32]})
+
+    with pytest.raises(ValueError, match="128x128"):
+        config.validate_build_prerequisites()
+
+
+def test_qat_recipe_rejects_fp4_experts_on_rocm(monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", "7.14", raising=False)
+    config = _qat_config(expert_dtype="fp4")
+
+    with pytest.raises(ValueError, match="FP4 expert QAT requires NVIDIA"):
+        config.validate_build_prerequisites()
 
 
 @pytest.mark.parametrize("coef", [-1.0, -1e-8, float("nan"), float("inf"), float("-inf")])

@@ -24,14 +24,14 @@ has to know whether it is looking at an ``nn.Linear`` or a wrapped one, and neve
 branches on the row itself.
 
 The ``qat`` row sits next to the eager reference: it fake-quantizes both GEMM
-operands with the DeepSeek-V4 TileLang quantizers and keeps the multiply in the
-model dtype, which is what an emulated low-precision deployment GEMM computes.
+operands and keeps the multiply in the model dtype, which is what an emulated
+low-precision deployment GEMM computes.
 ``torchao_nvfp4`` does the same with torchao's NVFP4 round trip; it is
 ``standard`` only, so a model that also binds ``grouped`` (DeepSeek-V4) cannot
 select it.
 """
 
-from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, ROCM_GPU, GpuKernelRequirement
 from ...registry import register_op
 from .grouped import eager as grouped_eager
 from .grouped import qat as grouped_qat
@@ -40,7 +40,7 @@ from .standard import qat as standard_qat
 from .standard import torchao_nvfp4 as standard_torchao_nvfp4
 
 
-_NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+_QAT_GPU = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS, ROCM_GPU))
 
 
 register_op(
@@ -55,10 +55,10 @@ register_op(
     "linear",
     "standard",
     "qat",
-    description="TileLang blockwise FP8 fake-quantized dense linear projection",
+    description="Blockwise FP8 fake-quantized dense linear projection",
     wrapper=standard_qat.wrapper,
-    requirement=_NVIDIA_SM90_PLUS,
-    requires=("tilelang",),
+    requirement=_QAT_GPU,
+    requires=("triton",),
 )
 
 register_op(
@@ -82,8 +82,8 @@ register_op(
     "linear",
     "grouped",
     "qat",
-    description="TileLang blockwise FP8 fake-quantized grouped linear projection",
+    description="Blockwise FP8 fake-quantized grouped linear projection",
     wrapper=grouped_qat.module_wrapper,
-    requirement=_NVIDIA_SM90_PLUS,
-    requires=("tilelang",),
+    requirement=_QAT_GPU,
+    requires=("triton",),
 )
