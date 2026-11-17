@@ -25,6 +25,7 @@ from veomni.models.seed_omni.utils.conversation import (
     ConversationItem,
     iter_desired_items,
 )
+from veomni.utils.constants import IGNORE_INDEX
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -195,3 +196,17 @@ def test_seedomni_transform_runs_processor_and_supports_dyn_bsz_lengths():
     # Total includes the 4-token dummy; effective excludes dummy and user prompt.
     assert get_length_fn(cached_sample) == 4 + 2 + 4
     assert get_length_by_labels_fn(cached_sample) == 2
+
+
+def test_length_fns_size_a_packed_sample_by_its_packed_tensors():
+    """A packed sample has no carrier, no `input_ids` and no `attention_mask`, so
+    the generic branches cannot size it and dynamic batching would count it as one
+    token. Read the packed tensors instead."""
+    labels = torch.full((1, 40), IGNORE_INDEX, dtype=torch.long)
+    labels[0, 10:22] = 7  # 12 supervised tokens
+    packed = {
+        "packed_input_ids": torch.zeros(1, 40, dtype=torch.long),
+        "packed_labels": labels,
+    }
+    assert get_length_fn(packed) == 40
+    assert get_length_by_labels_fn(packed) == 12

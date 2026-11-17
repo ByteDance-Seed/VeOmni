@@ -67,6 +67,15 @@ def _add_backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None
     return grad_output * scale, grad_output * scale
 
 
+def _identity_forward(x: Tensor, *, scale: float) -> tuple[Tensor, SavedState]:
+    """One tensor plus one attribute: the arity Dynamo cannot bind under ``no_grad``."""
+    return x * scale, SavedState((), metadata=scale)
+
+
+def _identity_backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...]:
+    return (grad_output * saved.metadata,)
+
+
 def _pair_forward(x: Tensor, y: Tensor) -> tuple[tuple[Tensor, Tensor], SavedState]:
     return (x + y, x * y), SavedState((x, y))
 
@@ -634,3 +643,38 @@ class TestVeomniOp:
         cloned = copy.deepcopy({"op": handle})
         assert cloned["op"] is handle
         assert pickle.loads(pickle.dumps(handle)) is handle
+
+    def test_inference_mode_compiles_for_a_single_tensor_row(self):
+        """A ``no_grad`` call on a one-tensor row must be inlinable by Dynamo.
+
+        ``_OpFn.forward`` is variadic in the tensors and takes the attribute dict as
+        a trailing argument. Dynamo cannot bind that shape in inference mode when the
+        row takes a single tensor -- it reports ``args = []`` and raises "failed to
+        bind arguments when attempting to inline" -- so the wrapper has to skip
+        ``apply`` when nothing needs a backward. Rows that take two or more tensors
+        happen to bind, which is why this has to be tested on arity 1 specifically.
+        """
+        register_op(
+            "identity", "standard", "eager", _identity_forward, _identity_backward, description=_TEST_DESCRIPTION
+        )
+        handle = VeomniOp("identity", "standard", "eager")
+        x = torch.randn(4)
+
+        def forward(a):
+            return handle(a, scale=2.0)
+
+        compiled = torch.compile(forward, fullgraph=True, backend="eager")
+
+        torch.testing.assert_close(compiled(x), forward(x))
+
+    def test_inference_mode_skips_the_autograd_node(self):
+        """No tensor needs a gradient, so no autograd node is built at all."""
+        register_op("add", "standard", "eager", _add_forward, _add_backward, description=_TEST_DESCRIPTION)
+        handle = VeomniOp("add", "standard", "eager")
+        x = torch.randn(4)
+
+        out = handle(x, x, scale=2.0)
+
+        assert out.requires_grad is False
+        assert out.grad_fn is None
+        torch.testing.assert_close(out, (x + x) * 2.0)

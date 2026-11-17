@@ -43,6 +43,7 @@ still works by invoking `/skill-name` explicitly.
 | What you say | Agent uses |
 |---|---|
 | "Add support for Llama 4" | `/veomni-new-model` |
+| "Migrate an external model and checkpoint into VeOmni" | `/veomni-new-model` |
 | "Fix the OOM error in VLM training" | `/veomni-debug` |
 | "Add a fused RoPE kernel" | `/veomni-new-op` |
 | "Refactor the data collator" | `/veomni-develop` |
@@ -50,6 +51,19 @@ still works by invoking `/skill-name` explicitly.
 | "Write the patchgen config for Qwen3" | `/veomni-patchgen-model` |
 | "Analyze this Chrome trace" | `/veomni-profile` |
 | "Submit the current branch as a PR" | `/create-pr` |
+
+`veomni-new-model` carries the migration workflow in its `SKILL.md`: source
+analysis, modeling/registration, weight loading or conversion, real-data training,
+validation/resume, and reproducible delivery. By default it covers pretrained
+initialization, a short real-data training run, and fresh-process resume; an
+explicit inference-only or partial request narrows those checks.
+
+The agent derives configs, mappings, and model-specific scripts from actual
+source and current VeOmni interfaces. Compatible checkpoints load directly;
+necessary converters belong in the project's model-conversion directory.
+Auxiliary skill tools may be added for demonstrated repeated needs, without
+requiring generic analyzers or report templates. Backend claims require actual
+execution, and missing weights or hardware remain explicit validation blockers.
 
 ## Directory Structure
 
@@ -62,7 +76,7 @@ Each skill is a folder containing a `SKILL.md` file with YAML frontmatter (`name
 ├── veomni-develop/SKILL.md    # Feature development and refactoring
 ├── veomni-debug/SKILL.md      # Bug fix and debugging (quick path + full protocol)
 ├── veomni-review/SKILL.md     # Pre-PR code review (mandatory)
-├── veomni-new-model/SKILL.md  # Add a new model to VeOmni
+├── veomni-new-model/SKILL.md  # Integrate an existing external model
 ├── veomni-patchgen-model/SKILL.md  # Author a model's patchgen-generated modeling
 ├── veomni-new-op/SKILL.md     # Add a new kernel/operator
 ├── veomni-uv-update/SKILL.md  # Dependency management with uv

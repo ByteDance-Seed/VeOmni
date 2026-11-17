@@ -509,6 +509,39 @@ def test_a_launcher_infer_graph_does_not_inherit_the_checkpoint_infer_type(tmp_p
     assert build_omni_model_runtime_args(args, for_inference=True).infer_type == "understanding"
 
 
+def test_build_model_runtime_args_merges_checkpoint_generation_kwargs(tmp_path):
+    """Checkpoint ``generation_kwargs`` supply the defaults and ``infer.generation_kwargs`` overrides per key,
+    even when the launcher YAML also declares ``model.model_config.infer_graph``."""
+    infer_dir = _cfg_dir() / "infer"
+    runtime_cfg = _model_runtime(
+        model_path=str(tmp_path),
+        infer_graph={"infer_und": str(infer_dir / "graph_infer_und.yaml")},
+        infer_type="infer_und",
+    )
+    runtime_cfg.generation_kwargs = {"num_timesteps": 50, "timestep_shift": 3.0}
+    export_root = tmp_path / "exported"
+    _with_module_configs(runtime_cfg.to_hf_config()).save_pretrained(export_root)
+
+    args = OmniArguments(
+        model=OmniModelRuntimeArguments(model_path=str(export_root)),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(generation_kwargs={"num_timesteps": 10}),
+    )
+    resolved = build_omni_model_runtime_args(args, for_inference=True)
+    assert resolved.generation_kwargs == {"num_timesteps": 10, "timestep_shift": 3.0}
+
+    args_with_launcher_graph = OmniArguments(
+        model=OmniModelRuntimeArguments(
+            model_path=str(export_root),
+            model_config={"infer_graph": {"understanding": str(infer_dir / "graph_infer_und.yaml")}},
+        ),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(generation_kwargs={"num_timesteps": 10}),
+    )
+    resolved_with_launcher_graph = build_omni_model_runtime_args(args_with_launcher_graph, for_inference=True)
+    assert resolved_with_launcher_graph.generation_kwargs == {"num_timesteps": 10, "timestep_shift": 3.0}
+
+
 def test_build_model_runtime_args_keeps_every_training_scenario_from_omni_checkpoint(tmp_path):
     """The checkpoint stores the whole ``training_graphs`` map and its ``train_type``;
     reading back only the active graph would rename it ``default`` and drop the rest."""
