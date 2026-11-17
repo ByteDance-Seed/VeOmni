@@ -43,14 +43,14 @@ All image tags follow this pattern:
 
 | Chip Series | Architecture | Tag Example | Dockerfile |
 |---|---|---|---|
-| 910B (Atlas A2 training products) | amd64 + arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni` | [x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86) / [arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm) |
+| Atlas A2 training products | amd64 + arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni` | [x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86) / [arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm) |
 | Atlas A3 training products | arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.12-veomni` | [a3](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_a3) |
 
 For the complete list of published image tags, see [Ascend Docker Supported Tags](supported_tags.md).
 
 Notes:
 
-- **Atlas A2 training products (910B)** ships two Dockerfiles (x86 and arm64); CI merges them into a single multi-arch image sharing one tag.
+- **Atlas A2 training products** ships two Dockerfiles (x86 and arm64); CI merges them into a single multi-arch image sharing one tag.
 - **Atlas A3 training products** is arm64 only.
 - The historical `8.3.rc2` Dockerfiles (`Dockerfile.ascend_8.3.rc2_a2.x86/.arm/a3`) remain in the repo but are no longer published.
 
@@ -77,7 +77,7 @@ An Ascend NPU driver compatible with the container's CANN version must be instal
 Pull the image from quay.io and run it:
 
 ```bash
-# 910B (Atlas A2 training products), multi-arch
+# Atlas A2 training products, multi-arch
 docker pull quay.io/ascend/veomni:v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni
 
 # Atlas A3 training products
@@ -104,7 +104,7 @@ docker run --runtime=runc -it \
 
 For complete, advanced mount and training configuration (checkpoint / dataset mounts, training command examples) per platform, see:
 
-- [build_a2_docker.md](build_a2_docker.md) — Atlas A2 training products (910B) build and usage
+- [build_a2_docker.md](build_a2_docker.md) — Atlas A2 training products build and usage
 - [build_a3_docker.md](build_a3_docker.md) — Atlas A3 training products build and usage
 
 ---
