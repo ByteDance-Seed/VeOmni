@@ -176,8 +176,7 @@ config.override_method(
     "KimiDecoderLayer._forward_attn_residual",
     replacement=kimi_decoder_layer_forward_attn_residual_patched,
     description=(
-        "Attention-residual forward carrying the same EP selective-recompute "
-        "call site (see KimiDecoderLayer.forward)"
+        "Attention-residual forward carrying the same EP selective-recompute call site (see KimiDecoderLayer.forward)"
     ),
 )
 

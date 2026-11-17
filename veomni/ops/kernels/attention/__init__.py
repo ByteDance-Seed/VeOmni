@@ -334,9 +334,7 @@ def _vision_attention(impl: str) -> Callable:
         defining = sys.modules.get(type(module).__module__)
         fn = getattr(defining, fn_name, None) if defining is not None else None
         if not callable(fn):
-            raise KeyError(
-                f"vision attention impl {impl!r} is not available in {type(module).__module__}"
-            )
+            raise KeyError(f"vision attention impl {impl!r} is not available in {type(module).__module__}")
         if impl == "veomni_flash_attention_2":
             # The NPU fusion path consumes the hoisted host cu_seqlens copies
             # (q_cu_seqlens_host / k_cu_seqlens_host) through **kwargs.
@@ -395,9 +393,7 @@ for _requirement, _requires in _VISION_FA2_ROWS:
         "vision_attention",
         "kimi_k3",
         "flash_attention_2",
-        description=(
-            "MoonViT3d packed-varlen vision attention via the flash-attn varlen kernel (module-resolved)"
-        ),
+        description=("MoonViT3d packed-varlen vision attention via the flash-attn varlen kernel (module-resolved)"),
         wrapper=_vision_attention("flash_attention_2"),
         requirement=_requirement,
         requires=_requires,

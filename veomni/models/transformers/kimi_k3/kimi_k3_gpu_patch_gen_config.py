@@ -803,8 +803,7 @@ def kimi_decoder_layer_forward_patched(
 @config.override_method(
     "KimiDecoderLayer._forward_attn_residual",
     description=(
-        "Attention-residual forward carrying the same EP selective-recompute "
-        "call site (see KimiDecoderLayer.forward)"
+        "Attention-residual forward carrying the same EP selective-recompute call site (see KimiDecoderLayer.forward)"
     ),
 )
 def kimi_decoder_layer_forward_attn_residual_patched(
@@ -886,6 +885,7 @@ def kimi_decoder_layer_forward_attn_residual_patched(
         prefix_sum = prefix_sum + hidden_states
 
     return prefix_sum, block_residual
+
 
 # Vision varlen attention (flash-attn fallback on non-NPU devices)
 
@@ -1022,6 +1022,8 @@ def kimi_mla_attention_init_patched(self, config: "KimiLinearConfig", layer_idx:
     # implementation fails here, at construction, instead of raising
     # from inside forward.
     self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
+
+
 # MLA under sequence parallel (gather/narrow around the attention)
 
 
@@ -1685,9 +1687,7 @@ def moonvit_encoder_layer_forward_patched(
 
     # Modification: pass the hoisted host copy through (None keeps the
     # per-call .tolist() behavior for direct callers of the layer).
-    hidden_states = self.attention_qkvpacked(
-        hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis, cu_seqlens_host
-    )
+    hidden_states = self.attention_qkvpacked(hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis, cu_seqlens_host)
     hidden_states = residual + hidden_states
 
     residual = hidden_states
