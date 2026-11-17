@@ -77,7 +77,7 @@ Known limitations:
   preserves grouped Q/K heads (`num_k_heads < num_v_heads`) directly into the
   FlashQLA chunk kernel instead of expanding Q/K with `repeat_interleave`.
   Qwen4-Exp does the same for `fla_npu`, whose AscendC chunk kernel supports
-  grouped value attention; Qwen3.5/Qwen3.5-MoE still expand for that backend.
+  grouped value attention.
 - PLE n-gram history and its dilated convolution reset at explicit
   `cu_seq_lens_q` packed-sample boundaries. The halo-only fallback remains for
   direct component calls that do not provide packing metadata.
