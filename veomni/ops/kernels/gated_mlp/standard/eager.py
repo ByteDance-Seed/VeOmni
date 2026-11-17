@@ -22,8 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ....activation import apply_activation, apply_activation_backward, supports
-from ....registry import SavedState
+from ....activation import apply_activation, supports
 
 
 @dataclass(frozen=True)
@@ -67,22 +66,6 @@ def clamp_gate_up_in_fp32(gate: Tensor, up: Tensor, swiglu_limit: float | None) 
     if swiglu_limit is None:
         return gate, up
     return clamp_gate_up(gate.float(), up.float(), swiglu_limit)
-
-
-def silu_mul(gate: Tensor, up: Tensor) -> Tensor:
-    """``silu(gate) * up``."""
-    return F.silu(gate) * up
-
-
-def silu_mul_backward(grad_hidden: Tensor, gate: Tensor, up: Tensor) -> tuple[Tensor, Tensor]:
-    """Return ``(grad_gate, grad_up)`` for ``silu(gate) * up``.
-
-    Uses autograd's op sequence (mul backward, then ``aten.silu_backward``) so
-    BF16 grads match Hugging Face's autograd MLP bitwise.
-    """
-    grad_up = grad_hidden * F.silu(gate)
-    grad_gate = torch.ops.aten.silu_backward(grad_hidden * up, gate)
-    return grad_gate, grad_up
 
 
 def unclamp_gate(grad_clamped: Tensor, gate: Tensor, swiglu_limit: float | None) -> Tensor:
@@ -146,114 +129,6 @@ def mlp_hidden(
 def empty_output(x: Tensor, down_w: Tensor) -> Tensor:
     """Output with the down-projection width and the leading shape of *x*."""
     return x.new_zeros(*x.shape[:-1], down_w.shape[0])
-
-
-def forward(
-    x: Tensor,
-    gate_w: Tensor,
-    gate_b: Tensor,
-    up_w: Tensor,
-    up_b: Tensor,
-    down_w: Tensor,
-    down_b: Tensor,
-    *,
-    swiglu_limit: float | None = None,
-    activation: str = "silu",
-) -> tuple[Tensor, SavedState]:
-    """Full gated MLP: ``down(activation(gate(x)) * up(x))``.
-
-    Empty biases are unused. ``swiglu_limit`` is the DeepSeek-V4 clamp; ``None``
-    skips it.
-    """
-    if x.numel() == 0:
-        meta = _Meta(
-            True,
-            swiglu_limit,
-            x.dtype,
-            gate_b.numel() > 0,
-            up_b.numel() > 0,
-            down_b.numel() > 0,
-            activation,
-        )
-        return empty_output(x, down_w), SavedState((x, gate_w, gate_b, up_w, up_b, down_w, down_b), meta)
-
-    hidden, gate, up, projection_dtype = mlp_hidden(
-        x, gate_w, gate_b, up_w, up_b, swiglu_limit=swiglu_limit, activation=activation
-    )
-    meta = _Meta(
-        False,
-        swiglu_limit,
-        projection_dtype,
-        gate_b.numel() > 0,
-        up_b.numel() > 0,
-        down_b.numel() > 0,
-        activation,
-    )
-    output = linear(hidden, down_w, down_b)
-    return output, SavedState((x, gate_w, gate_b, up_w, up_b, down_w, down_b, gate, up, hidden), meta)
-
-
-def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...]:
-    """Return grads for ``x`` and the six weight / bias tensors."""
-    meta = saved.metadata
-    assert isinstance(meta, _Meta)
-    if meta.empty:
-        x, gate_w, gate_b, up_w, up_b, down_w, down_b = saved.tensors
-        return (
-            torch.zeros_like(x),
-            torch.zeros_like(gate_w),
-            None if not meta.has_gate_bias else torch.zeros_like(gate_b),
-            torch.zeros_like(up_w),
-            None if not meta.has_up_bias else torch.zeros_like(up_b),
-            torch.zeros_like(down_w),
-            None if not meta.has_down_bias else torch.zeros_like(down_b),
-        )
-
-    x, gate_w, gate_b, up_w, up_b, down_w, down_b, gate, up, hidden_out = saved.tensors
-    grad_hidden, grad_down_w, grad_down_b = linear_backward(
-        grad_output,
-        hidden_out,
-        down_w,
-        has_bias=meta.has_down_bias,
-        compute_dtype=grad_output.dtype,
-    )
-    if meta.swiglu_limit is not None:
-        gate_c, up_c = clamp_gate_up_in_fp32(gate, up, meta.swiglu_limit)
-        grad_hidden = grad_hidden.to(dtype=gate_c.dtype)
-        # ``d/dgate`` needs the ``up`` factor: activation_backward multiplies by
-        # the derivative only, matching ``aten.silu_backward``'s contract.
-        grad_gate_c = apply_activation_backward(grad_hidden * up_c, gate_c, meta.activation)
-        grad_up_c = grad_hidden * apply_activation(gate_c, meta.activation)
-        grad_gate = unclamp_gate(grad_gate_c, gate, meta.swiglu_limit).to(dtype=meta.projection_dtype)
-        grad_up = unclamp_up(grad_up_c, up, meta.swiglu_limit).to(dtype=meta.projection_dtype)
-    else:
-        grad_hidden = grad_hidden.to(dtype=meta.projection_dtype)
-        grad_gate = apply_activation_backward(grad_hidden * up, gate, meta.activation)
-        grad_up = grad_hidden * apply_activation(gate, meta.activation)
-
-    grad_x_gate, grad_gate_w, grad_gate_b = linear_backward(
-        grad_gate,
-        x,
-        gate_w,
-        has_bias=meta.has_gate_bias,
-        compute_dtype=meta.projection_dtype,
-    )
-    grad_x_up, grad_up_w, grad_up_b = linear_backward(
-        grad_up,
-        x,
-        up_w,
-        has_bias=meta.has_up_bias,
-        compute_dtype=meta.projection_dtype,
-    )
-    return (
-        grad_x_gate + grad_x_up,
-        grad_gate_w,
-        grad_gate_b,
-        grad_up_w,
-        grad_up_b,
-        grad_down_w,
-        grad_down_b,
-    )
 
 
 def wrapper(

@@ -18,8 +18,7 @@ from __future__ import annotations
 
 from torch import Tensor, nn
 
-from ....activation import normalize_activation
-from ....registry import SavedState
+from ....registry import SavedState, _make_autograd_fn
 from . import eager as _eager
 
 
@@ -35,24 +34,16 @@ def forward(
     swiglu_limit: float | None = None,
     activation: str = "silu",
 ) -> tuple[Tensor, SavedState]:
-    """Same MLP as eager; ``silu(gate) * up`` uses Liger when the tensors are nonempty.
+    """Same MLP as eager; ``silu(gate) * up`` uses Liger.
 
-    Liger's ``swiglu_forward``/``swiglu_backward`` implement SiLU only, so another
-    activation is refused here rather than silently computed as SiLU. The ``eager``
-    row serves every activation this module knows; this row is the fused fast path
-    for the one Liger has.
+    No activation check here: :func:`.._module.render` has already established that
+    this row serves the activation before reaching this, and it is the single place
+    that decides. A guard here would be unreachable -- and being unreachable is why
+    the ``standard`` variant's non-SiLU behaviour is tested through ``render``.
     """
-    if normalize_activation(activation) != "silu":
-        raise ValueError(
-            f"gated_mlp_implementation='liger_kernel' computes SiLU only, and the model asks for "
-            f"{activation!r}. Select 'eager' for this activation, or 'qat' if the run is "
-            f"quantization-aware -- both evaluate the config's activation."
-        )
-    if x.numel() == 0:
-        return _eager.forward(
-            x, gate_w, gate_b, up_w, up_b, down_w, down_b, swiglu_limit=swiglu_limit, activation=activation
-        )
-
+    # No empty-input branch here: :func:`wrapper` routes ``x.numel() == 0`` to the
+    # ``eager`` row before this is reached, and ``_eager.forward``'s own empty path
+    # returns a detached zero, which would cut the block out of the backward pass.
     gate = _eager.linear(x, gate_w, gate_b)
     up = _eager.linear(x, up_w, up_b)
     projection_dtype = gate.dtype
@@ -85,9 +76,6 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
     """Down linear, Liger silu-mul, then the two input linears."""
     meta = saved.metadata
     assert isinstance(meta, _eager._Meta)
-    if meta.empty:
-        return _eager.backward(grad_output, saved)
-
     x, gate_w, gate_b, up_w, up_b, down_w, down_b, gate, up, hidden, saved_gate, saved_up = saved.tensors
     grad_hidden, grad_down_w, grad_down_b = _eager.linear_backward(
         grad_output,
@@ -138,6 +126,15 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
     )
 
 
+#: The differentiable entry point for this row's raw math.
+#:
+#: ``forward`` is not one: it runs ``swiglu_forward``, a bare Triton kernel, and
+#: hand-written ``F.linear`` calls, none of which build a graph. ``_make_autograd_fn``
+#: is what turns the raw pair into an ``autograd.Function``, and it is also what
+#: ``register_op`` would have built had this row been registered as a pair.
+_autograd = _make_autograd_fn(forward, backward)
+
+
 def wrapper(
     mlp: nn.Module,
     x: Tensor,
@@ -162,8 +159,11 @@ def wrapper(
         # pass. Plain PyTorch is exact on zero elements and keeps the graph.
         return _eager.wrapper(mlp, x, swiglu_limit=swiglu_limit, activation=activation)
 
+    # ``_autograd``, not ``forward``: the kernels in ``forward`` build no graph, so
+    # calling it directly would return a tensor whose gradient never reaches
+    # ``gate_proj`` / ``up_proj`` -- which is exactly what it used to do.
     gate_w, gate_b, up_w, up_b, down_w, down_b = rendered.weights
-    output, _ = forward(
+    return _autograd(
         x,
         gate_w,
         gate_b,
@@ -174,4 +174,3 @@ def wrapper(
         swiglu_limit=swiglu_limit,
         activation=activation,
     )
-    return output

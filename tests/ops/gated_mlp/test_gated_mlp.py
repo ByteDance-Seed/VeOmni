@@ -653,6 +653,9 @@ def test_the_eager_row_evaluates_every_activation_it_claims(activation, dtype):
 
     Parametrized over ``supported_activations()`` rather than a list here, so the
     test and the implementation cannot disagree about what is supported.
+
+    Goes through the row's ``wrapper`` -- the only entry point a model can reach --
+    rather than the raw ``forward`` it uses internally.
     """
     import torch.nn.functional as F
     from transformers.activations import ACT2FN
@@ -661,14 +664,21 @@ def test_the_eager_row_evaluates_every_activation_it_claims(activation, dtype):
 
     torch.manual_seed(0)
     x = torch.randn(3, 16, dtype=dtype)
-    gate_w = torch.randn(32, 16, dtype=dtype) * 0.2
-    up_w = torch.randn(32, 16, dtype=dtype) * 0.2
-    down_w = torch.randn(16, 32, dtype=dtype) * 0.2
-    empty = torch.empty(0)
+    mlp = _mlp_from_tensors(
+        torch.randn(32, 16, dtype=dtype) * 0.2,
+        torch.empty(0),
+        torch.randn(32, 16, dtype=dtype) * 0.2,
+        torch.empty(0),
+        torch.randn(16, 32, dtype=dtype) * 0.2,
+        torch.empty(0),
+    )
 
-    out, _ = eager.forward(x, gate_w, empty, up_w, empty, down_w, empty, activation=activation)
+    out = eager.wrapper(mlp, x, activation=activation)
 
-    expected = F.linear(ACT2FN[activation](F.linear(x, gate_w)) * F.linear(x, up_w), down_w)
+    expected = F.linear(
+        ACT2FN[activation](F.linear(x, mlp.gate_proj.weight)) * F.linear(x, mlp.up_proj.weight),
+        mlp.down_proj.weight,
+    )
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
@@ -681,6 +691,8 @@ def test_the_eager_row_backward_matches_autograd_for_every_activation(activation
     the shape of bug a forward-only test cannot see. It happened once here: an
     early draft dropped the ``up`` factor from ``d/dgate``, and the forward matched
     perfectly.
+
+    Differentiates the row's ``wrapper`` output, which is the graph a model trains.
     """
     import torch.nn.functional as F
     from transformers.activations import ACT2FN
@@ -689,33 +701,98 @@ def test_the_eager_row_backward_matches_autograd_for_every_activation(activation
 
     torch.manual_seed(0)
     x = torch.randn(3, 16, dtype=torch.float32, requires_grad=True)
-    gate_w = (torch.randn(32, 16, dtype=torch.float32) * 0.2).requires_grad_()
-    up_w = (torch.randn(32, 16, dtype=torch.float32) * 0.2).requires_grad_()
-    down_w = (torch.randn(16, 32, dtype=torch.float32) * 0.2).requires_grad_()
-    empty = torch.empty(0)
+    mlp = _mlp_from_tensors(
+        torch.randn(32, 16, dtype=torch.float32) * 0.2,
+        torch.empty(0),
+        torch.randn(32, 16, dtype=torch.float32) * 0.2,
+        torch.empty(0),
+        torch.randn(16, 32, dtype=torch.float32) * 0.2,
+        torch.empty(0),
+    )
+    weights = (mlp.gate_proj.weight, mlp.up_proj.weight, mlp.down_proj.weight)
 
-    out, saved = eager.forward(x, gate_w, empty, up_w, empty, down_w, empty, activation=activation)
+    out = eager.wrapper(mlp, x, activation=activation)
     grad_out = torch.randn_like(out)
-    grads = [g for g in eager.backward(grad_out, saved) if g is not None]
+    grad_x, *grad_weights = torch.autograd.grad(out, (x, *weights), grad_out)
 
-    reference = F.linear(ACT2FN[activation](F.linear(x, gate_w)) * F.linear(x, up_w), down_w)
-    expected = torch.autograd.grad(reference, (x, gate_w, up_w, down_w), grad_out)
+    reference = F.linear(ACT2FN[activation](F.linear(x, weights[0])) * F.linear(x, weights[1]), weights[2])
+    expected = torch.autograd.grad(reference, (x, *weights), grad_out)
 
-    assert len(grads) == len(expected)
-    for got, want in zip(grads, expected):
+    torch.testing.assert_close(grad_x, expected[0], rtol=1e-5, atol=1e-6)
+    for got, want in zip(grad_weights, expected[1:], strict=True):
         torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
 
 
 @_cpu
-def test_liger_kernels_refuses_an_activation_it_cannot_compute():
-    """Liger's swiglu kernels are SiLU only, and say so instead of computing SiLU anyway."""
-    from veomni.ops.kernels.gated_mlp.standard import liger_kernel
+@pytest.mark.parametrize(("variant", "impl"), [("standard", "liger_kernel"), ("geglu", "liger_kernel")])
+def test_every_row_reaches_the_projection_gradients(variant, impl):
+    """A row's output must be differentiable w.r.t. the projections it read by weight.
 
-    empty = torch.empty(0)
-    x = torch.randn(2, 16)
+    This is the check a ``forward``-only test cannot make, and its absence hid a real
+    bug: these rows call a bare Triton kernel (``swiglu_forward`` / ``geglu_forward``)
+    inside a raw ``forward`` that returns ``(output, SavedState)``. ``SavedState`` is
+    what ``_make_autograd_fn`` turns into an ``autograd.Function``'s saved tensors, so
+    a wrapper that called ``forward`` directly and dropped it returned a tensor with
+    **no** gradient path back to ``gate_proj`` / ``up_proj`` -- and to ``x``. The GPU
+    default row silently trained only the down projection.
 
-    with pytest.raises(ValueError, match="computes SiLU only"):
-        liger_kernel.forward(x, x.T, empty, x.T, empty, x.T, empty, activation="gelu")
+    Liger's kernels are replaced by differentiable stand-ins with the same contract,
+    so this runs on CPU and tests the wiring rather than the kernel.
+    """
+    import sys
+    import types
+
+    import torch.nn.functional as F
+
+    # The stand-in forward runs under ``no_grad``, which is what makes a Triton
+    # kernel's output carry no ``grad_fn``. A differentiable stand-in would let a
+    # gradient leak through the math itself and hide exactly the bug under test.
+    def swiglu_forward(a, b):
+        with torch.no_grad():
+            return a, b, F.silu(a) * b
+
+    def geglu_forward(a, b):
+        with torch.no_grad():
+            return a, b, F.gelu(a, approximate="tanh") * b
+
+    module = types.ModuleType("liger_kernel.ops.swiglu")
+    module.swiglu_forward = swiglu_forward
+    module.swiglu_backward = lambda a, b, g: (torch.ops.aten.silu_backward(g * b, a), g * F.silu(a))
+    geglu = types.ModuleType("liger_kernel.ops.geglu")
+    geglu.geglu_forward = geglu_forward
+    geglu.geglu_backward = lambda a, b, g: (
+        torch.ops.aten.gelu_backward(g * b, a, approximate="tanh"),
+        g * F.gelu(a, approximate="tanh"),
+    )
+    monkeypatched = {
+        "liger_kernel.ops.swiglu": module,
+        "liger_kernel.ops.geglu": geglu,
+    }
+    saved = {name: sys.modules.get(name) for name in monkeypatched}
+    sys.modules.update(monkeypatched)
+    try:
+        from veomni.ops.kernels.gated_mlp.geglu import liger_kernel as geglu_liger
+        from veomni.ops.kernels.gated_mlp.standard import liger_kernel as standard_liger
+
+        row = standard_liger if variant == "standard" else geglu_liger
+        if row is standard_liger:
+            # The row imports the kernel lazily, by name, on each call.
+            row.forward.__globals__.pop("swiglu_forward", None)
+
+        mlp = _tiny_qwen3_mlp(16, 32) if variant == "standard" else _tiny_gemma3_mlp(16, 32)
+        x = torch.randn(2, 4, 16, requires_grad=True)
+        row.wrapper(mlp, x).sum().backward()
+    finally:
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+    assert x.grad is not None and torch.any(x.grad != 0), "input gradient is missing"
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        weight = getattr(mlp, name).weight
+        assert weight.grad is not None and torch.any(weight.grad != 0), f"{name} got no gradient"
 
 
 @_cpu
@@ -801,7 +878,9 @@ def test_render_routes_each_row_by_shape_and_activation():
         for activation in ("silu", "swish"):
             assert render(mlp, impl=impl, activation=activation).projections is None, (impl, activation)
 
-    # Liger's swiglu kernels are SiLU only; every other row evaluates the set.
+    # Liger's swiglu kernels are SiLU only, and ``render`` is the only place that
+    # knows it: a ``gelu`` model never enters the row, so there is no second guard
+    # inside ``liger_kernel.forward`` to keep in sync (or to test separately).
     assert render(mlp, impl="liger_kernel", activation="gelu").projections is not None
     for impl in ("eager", "qat", "torchao_nvfp4"):
         assert render(mlp, impl=impl, activation="gelu").projections is None
@@ -872,34 +951,36 @@ def test_render_refuses_a_quantizing_row_it_cannot_serve():
             render(mlp, impl=impl, activation=activation)
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize("activation", ["gelu", "gelu_pytorch_tanh", "gelu_new"])
-def test_the_activation_backward_compiles_fullgraph(activation):
-    """A compiled forward must not regress relative to the projection fallback.
+@_cpu
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh", "gelu_new"])
+def test_the_eager_row_compiles_fullgraph(activation):
+    """A compiled forward must not regress against the plain projection path.
 
-    The first version of this backward rebuilt the derivative with
-    ``hidden.detach().requires_grad_(True)`` and ``torch.autograd.grad``, which
-    Dynamo rejects under ``fullgraph=True``:
+    A model whose ``hidden_act`` is not SiLU compiled and trained before these rows
+    existed, so failing to compile afterwards would regress exactly the models this
+    change serves. ``fullgraph=True`` is the strict form: it rejects any graph break,
+    including the ones a hand-written backward used to cause -- rebuilding a
+    derivative with ``requires_grad_(True)`` fails with
+    ``Unsupported: Unsupported Tensor.requires_grad_() call``, and ``torch.func.vjp``
+    refuses to run inside ``saved_tensors_hooks``, which is how activation offload
+    works. The row is an opaque wrapper now, so autograd builds the backward and
+    Dynamo traces it; this pins that.
 
-        Unsupported: Unsupported Tensor.requires_grad_() call
-
-    A ``gelu`` model compiled and trained through its projection fallback before
-    this work, so failing to compile afterwards would be a regression for exactly
-    the models the change exists to serve. ``torch.func.vjp`` reaches the same
-    derivative without touching the grad flag.
+    ``backend="eager"`` keeps it to the graph capture itself.
     """
     import torch
 
-    from veomni.ops.activation import apply_activation_backward
+    from veomni.ops.kernels.gated_mlp.standard import eager
 
-    grad = torch.randn(4, 8)
-    hidden = torch.randn(4, 8)
+    torch.manual_seed(0)
+    mlp = _tiny_qwen3_mlp(16, 32)
+    x = torch.randn(2, 4, 16, requires_grad=True)
 
-    def step(g, x):
-        return apply_activation_backward(g, x, activation)
+    def step(module, inp):
+        return eager.wrapper(module, inp, activation=activation)
 
-    expected = step(grad, hidden)
-    actual = torch.compile(step, fullgraph=True, backend="eager")(grad, hidden)
+    expected = step(mlp, x)
+    actual = torch.compile(step, fullgraph=True, backend="eager")(mlp, x)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 

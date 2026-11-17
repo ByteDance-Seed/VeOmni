@@ -25,7 +25,7 @@ This module is deliberately pure PyTorch, with no kernel of its own:
 
 * :func:`normalize_activation` / :func:`supports` let a row validate a selection
   without knowing the config's vocabulary.
-* :func:`apply_activation` / :func:`apply_activation_backward` evaluate one.
+* :func:`apply_activation` evaluates one.
 
 **Every name delegates to the transformer's own implementation**, looked up by the
 name the config used. That is not redundancy: the names are not interchangeable.
@@ -35,6 +35,12 @@ while ``gelu_pytorch_tanh`` resolves to ``PytorchGELUTanh``, which calls
 intermediates round differently -- max ~1.6e-2 on unit-scale inputs -- so mapping
 them onto one formula would change a model's outputs and gradients against the
 function it trained with.
+
+The derivative is deliberately absent. Every row is an opaque ``wrapper`` now, so
+autograd differentiates whatever the row computes and there is no hand-written
+backward to keep in sync -- which is also what keeps activation offload and
+``torch.compile(fullgraph=True)`` working (``torch.func.vjp`` refuses to run inside
+``saved_tensors_hooks``).
 
 A Triton elementwise kernel was considered and rejected. The activation sits
 between GEMMs whose operands are already quantized through TileLang, so it is a
@@ -51,7 +57,6 @@ from __future__ import annotations
 import inspect
 from functools import lru_cache
 
-import torch
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -59,7 +64,6 @@ from torch import Tensor
 __all__ = [
     "SUPPORTED_ACTIVATIONS",
     "apply_activation",
-    "apply_activation_backward",
     "normalize_activation",
     "supported_activations",
     "supports",
@@ -184,29 +188,3 @@ def apply_activation(hidden: Tensor, activation: str) -> Tensor:
         # HF's autograd both use this spelling, so gradients stay bit-comparable.
         return F.silu(hidden)
     return _resolver(name)(hidden)
-
-
-def apply_activation_backward(grad_output: Tensor, hidden: Tensor, activation: str) -> Tensor:
-    """Return ``grad_output * activation'(hidden)``.
-
-    The derivative comes from transformers' own implementation rather than a formula
-    restated here, because the forms are not interchangeable: ``gelu_new`` stages
-    ``torch.pow(x, 3.0)`` and no closed form reproduces its autograd chain in bf16
-    (measured 1.56e-2).
-
-    **Reached only from a raw ``forward``/``backward`` pair**, and today only from
-    ``liger_kernel``'s, which is SiLU-only and therefore takes the ATen branch below.
-    The ``eager`` row is an opaque wrapper that lets autograd build the whole MLP's
-    backward, which is what keeps activation offload and ``fullgraph=True`` working
-    -- ``torch.func.vjp`` refuses to run inside ``saved_tensors_hooks``, so a row that
-    called this with a non-SiLU activation would raise under offload. If a future
-    fused row needs a non-SiLU derivative here, it has to solve that first.
-
-    SiLU keeps its ATen spelling -- the fused rows and HF's autograd both use it.
-    """
-    name = normalize_activation(activation)
-    if name == "silu":
-        return torch.ops.aten.silu_backward(grad_output, hidden)
-    _, vjp = torch.func.vjp(_resolver(name), hidden)
-    (grad,) = vjp(grad_output)
-    return grad
