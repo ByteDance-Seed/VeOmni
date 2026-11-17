@@ -1032,7 +1032,7 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
-        row_counts = {f"model.{name}": counts for name, counts in checkpoint_row_counts(state["model"]).items()}
+        row_counts = {}
 
         def _model_state() -> "ModelState":
             """Build the model load target using its padded runtime shapes."""
@@ -1069,10 +1069,16 @@ class DistributedCheckpointer(CheckpointerBase):
         # checkpoint carrying only rank-local metadata is therefore not
         # something this framework produces.
         error: Optional[Exception] = None
+        try:
+            row_counts = {f"model.{name}": counts for name, counts in checkpoint_row_counts(state["model"]).items()}
+        except Exception as exc:
+            error = exc
         for directory, wanted in (
             (weights_dir(path, module), True),
             (optimizer_dir(path, module), wants_optimizer),
         ):
+            if error is not None:
+                break
             if not wanted:
                 continue
             marker = os.path.join(directory, DCP_MARKER_FILENAME)
