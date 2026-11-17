@@ -115,7 +115,13 @@ def _image_value(value):
 def _reject_media_fields(container, fields):
     for field in fields:
         value = container.get(field)
-        if value is not None and (not hasattr(value, "__len__") or len(value)):
+        if value is None:
+            continue
+        try:
+            nonempty = len(value) != 0
+        except TypeError:
+            nonempty = True
+        if nonempty:
             raise ValueError(f"unsupported media field: {field}")
 
 
@@ -149,6 +155,8 @@ def normalize_openai_messages(sample, *, tools_in_system=False):
         "image_mask",
         "video_mask",
     )
+    message_media = (*unsupported_media, "images")
+    block_media = (*(field for field in unsupported_media if field != "image"), "images")
     _reject_media_fields(sample, unsupported_media)
     messages = sample.get("messages")
     if isinstance(messages, str):
@@ -163,7 +171,7 @@ def normalize_openai_messages(sample, *, tools_in_system=False):
     for message in messages:
         if not isinstance(message, Mapping):
             raise ValueError("each message must be a mapping")
-        _reject_media_fields(message, (*unsupported_media, "images"))
+        _reject_media_fields(message, message_media)
         if any(message.get(key) for key in ("tool_calls", "function_call", "tool_call_id", "name")):
             raise ValueError("structured tool message metadata must be serialized in content")
         role = message.get("role")
@@ -189,7 +197,7 @@ def normalize_openai_messages(sample, *, tools_in_system=False):
         for block in blocks:
             if not isinstance(block, Mapping):
                 raise ValueError("content block must be a mapping")
-            _reject_media_fields(block, (*(field for field in unsupported_media if field != "image"), "images"))
+            _reject_media_fields(block, block_media)
             kind = block.get("type")
             if kind == "text":
                 if not isinstance(block.get("text"), str) or any(

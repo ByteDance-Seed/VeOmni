@@ -112,6 +112,17 @@ def test_rejects_ambiguous_or_unsupported_inputs(sample):
         normalize_openai_messages(sample)
 
 
+@pytest.mark.parametrize("location", ["sample", "message", "block"])
+@pytest.mark.parametrize("value", [np.array(0), np.array(1)])
+def test_rejects_scalar_array_in_unsupported_media_field(location, value):
+    block = {"type": "text", "text": "hello"}
+    message = {"role": "user", "content": [block]}
+    sample = {"messages": [message]}
+    {"sample": sample, "message": message, "block": block}[location]["video"] = value
+    with pytest.raises(ValueError, match="unsupported media field: video"):
+        normalize_openai_messages(sample)
+
+
 class _ToyTokenizer:
     def encode(self, text, add_special_tokens=False):
         result = []
