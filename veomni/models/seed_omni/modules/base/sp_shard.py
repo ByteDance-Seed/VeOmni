@@ -302,8 +302,12 @@ def sp_varlen_row(
     if tail_padding > 0:
         bounds.append(padded_len)
     cu_q = cu_k = torch.tensor(bounds, dtype=torch.int32, device=pids.device)
-    max_q = max(sample_seqlens) if sample_seqlens else 0
-    max_k = max(max_q, tail_padding)
+    # ``cu_q`` and ``cu_k`` are the same tensor, so one maximum has to describe the
+    # longest segment of both. The pad tail is a segment like any other: when it is
+    # longer than every real sample, it — not ``max(sample_seqlens)`` — is what the
+    # kernel has to size for. (``flash_attn_varlen_func`` launches from
+    # ``max_seqlen_q``, so under-reporting it is not merely inconsistent metadata.)
+    max_q = max_k = max(max(sample_seqlens, default=0), tail_padding)
     return mask, slice_input_tensor(pids, dim=pos_dim, padding=False, group=group), (cu_q, cu_k, max_q, max_k)
 
 

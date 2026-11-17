@@ -158,7 +158,7 @@ for node in training_graph:
     break as soon as a video turn precedes an image turn.
   - After `llm.forward`, `llm.forward_post` scatters its `1/S` output shard
     directly onto `item.value`, and `text_encoder.decode_pre`
-    (`_prepare_sharded_decode_inputs`) concatenates those sharded `item.value`s
+    (`_prepare_decode_inputs(..., ps)`) concatenates those sharded `item.value`s
     and slices the shifted labels to its own window so each rank projects and
     scores only its `1/S` share before `reduce_sequence_parallel_loss` combines
     the numerators and denominators over `fsdp_group` (`dp_sp`).
