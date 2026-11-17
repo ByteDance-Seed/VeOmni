@@ -28,6 +28,14 @@ import torch.distributed.checkpoint as dcp
 from veomni.checkpoint import ckpt_to_state_dict
 from veomni.models import save_model_assets, save_model_weights
 from veomni.models.checkpoint.weights import _save_state_dict
+from veomni.models.qwen4_gdn_precision import (
+    expected_qwen4_gdn_layer_ids,
+    has_qwen4_exp_assets,
+    is_qwen4_exp_model,
+    is_qwen4_gdn_parameter,
+    qwen4_exp_model_config,
+    validate_qwen4_gdn_pairs,
+)
 from veomni.utils import helper
 from veomni.utils.device import IS_NPU_AVAILABLE, synchronize
 from veomni.utils.import_utils import is_torch_version_greater_than
@@ -93,12 +101,19 @@ def get_model_save_state(
     """
     from contextlib import nullcontext
 
-    from veomni.checkpoint.dcp_checkpointer import ModelState, _export_extra_parallel_layout_key
+    from veomni.checkpoint.dcp_checkpointer import (
+        _QWEN4_GDN_FP32_LEGACY_MARKER,
+        _QWEN4_GDN_FP32_MARKER,
+        ModelState,
+        _export_extra_parallel_layout_key,
+    )
     from veomni.distributed.parallel_state import use_parallel_state
     from veomni.models.checkpoint import get_checkpoint_tensor_converter
 
     converter = get_checkpoint_tensor_converter(model) if model is not None else None
     if converter is not None and callable(getattr(converter, "export_weights", None)):
+        if is_qwen4_exp_model(model) and expected_qwen4_gdn_layer_ids(qwen4_exp_model_config(model)) != set():
+            raise NotImplementedError("Qwen4 converter-based online export has not been validated for FP32 GDN")
         import inspect
 
         effective_mapping = (
@@ -166,17 +181,33 @@ def get_model_save_state(
 
     # Use flat state dict so DCP FQNs match the original HF weight_map keys
     # (e.g. "model.embed_tokens.weight" instead of "model.model.embed_tokens.weight")
-    save_state = ModelState(model, parallel_state=parallel_state).state_dict()
+    raw_state = ModelState(model, parallel_state=parallel_state).state_dict()
+    save_state = {}
+    for name, value in raw_state.items():
+        if name in (_QWEN4_GDN_FP32_MARKER, _QWEN4_GDN_FP32_LEGACY_MARKER):
+            continue
+        name = _export_extra_parallel_layout_key(name)
+        if name in (_QWEN4_GDN_FP32_MARKER, _QWEN4_GDN_FP32_LEGACY_MARKER):
+            continue
+        if name is not None:
+            if name in save_state:
+                raise RuntimeError(f"Multiple checkpoint tensors map to export key {name}")
+            save_state[name] = value
+    is_qwen4 = is_qwen4_exp_model(model)
+    gdn_names = set()
+    if is_qwen4:
+        raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        validate_qwen4_gdn_pairs(save_state, getattr(raw_model, "config", None))
+        gdn_names = {name for name in save_state if is_qwen4_gdn_parameter(name)}
 
     # Convert float32 tensors to bfloat16 on a copy of the state dict,
     # so the original model parameters remain unchanged.
     converted_state = {}
     for k, v in save_state.items():
-        # Translate versioned DCP-only names back to their HuggingFace FQNs.
-        k = _export_extra_parallel_layout_key(k)
-        if k is None:
-            continue
-        if v.dtype == torch.float32:
+        preserve_gdn = is_qwen4 and is_qwen4_gdn_parameter(k)
+        if preserve_gdn and v.dtype != torch.float32:
+            raise RuntimeError(f"Cannot export non-FP32 Qwen4 GDN parameter without explicit migration: {k}")
+        if v.dtype == torch.float32 and not preserve_gdn:
             logger.info_rank0(f"Converting {k} from {v.dtype} to torch.bfloat16")
             converted_state[k] = v.to(torch.bfloat16)
         else:
@@ -198,6 +229,12 @@ def get_model_save_state(
             "fqn_to_index_mapping is None, HuggingFaceStorageWriter will save "
             "all model weights into a single safetensors file."
         )
+
+    if is_qwen4:
+        # Filtering tied weights must never silently drop a GDN scalar or layer.
+        validate_qwen4_gdn_pairs(save_state, getattr(raw_model, "config", None))
+        if {name for name in save_state if is_qwen4_gdn_parameter(name)} != gdn_names:
+            raise RuntimeError("HF weight_map dropped Qwen4 GDN parameters during export")
 
     return save_state
 
@@ -313,7 +350,8 @@ def _save_hf_safetensor_legacy(
     model_assets: Optional[Sequence],
     ckpt_manager: str,
     output_dir: Optional[str],
-    rows_by_name,
+    model: Optional[torch.nn.Module] = None,
+    rows_by_name=None,
 ):
     """Legacy HuggingFace safetensors save via checkpoint conversion (rank-0 only)."""
     model_state_dict = ckpt_to_state_dict(
@@ -323,8 +361,43 @@ def _save_hf_safetensor_legacy(
     )
     from veomni.checkpoint.row_crop import crop_dense_state_dict
 
-    model_state_dict = crop_dense_state_dict(model_state_dict, rows_by_name)
-    save_model_weights(save_hf_safetensor_path, model_state_dict, model_assets=model_assets, legacy_fuse_fallback=True)
+    model_state_dict = crop_dense_state_dict(model_state_dict, rows_by_name or {})
+    qwen4_model = is_qwen4_exp_model(model)
+    if qwen4_model:
+        validate_qwen4_gdn_pairs(model_state_dict, qwen4_exp_model_config(model))
+    qwen4_gdn_fp32 = qwen4_model and expected_qwen4_gdn_layer_ids(qwen4_exp_model_config(model)) != set()
+    if ckpt_manager == "dcp" and save_checkpoint_path and os.path.isdir(save_checkpoint_path):
+        from torch.distributed.checkpoint import FileSystemReader
+
+        from veomni.checkpoint.dcp_checkpointer import (
+            _QWEN4_GDN_FP32_LEGACY_MARKER,
+            _QWEN4_GDN_FP32_MARKER,
+            read_qwen4_gdn_manifest,
+        )
+
+        metadata = FileSystemReader(save_checkpoint_path).read_metadata().state_dict_metadata
+        if (
+            f"model.{_QWEN4_GDN_FP32_LEGACY_MARKER}" in metadata
+            and f"model.{_QWEN4_GDN_FP32_MARKER}" not in metadata
+            and not (qwen4_gdn_fp32 or has_qwen4_exp_assets(model_assets))
+        ):
+            raise RuntimeError("Legacy Qwen4 GDN marker needs the Qwen4 model or model assets for export")
+
+        manifest = read_qwen4_gdn_manifest(save_checkpoint_path)
+        if manifest is not None:
+            actual = {name for name in model_state_dict if is_qwen4_gdn_parameter(name)}
+            if actual != manifest:
+                raise RuntimeError("Qwen4 GDN checkpoint inventory does not match model tensors")
+            qwen4_gdn_fp32 = True
+    if qwen4_gdn_fp32:
+        validate_qwen4_gdn_pairs(model_state_dict, qwen4_exp_model_config(model))
+    save_model_weights(
+        save_hf_safetensor_path,
+        model_state_dict,
+        model_assets=model_assets,
+        qwen4_gdn_fp32=qwen4_gdn_fp32,
+        legacy_fuse_fallback=True,
+    )
     logger.info_rank0(f"HuggingFace checkpoint saved at {save_hf_safetensor_path} successfully!")
 
 
@@ -407,6 +480,8 @@ def save_hf_safetensor(
             model, save_hf_safetensor_path, fqn_to_index_mapping, model_assets, parallel_state=parallel_state
         )
     else:
+        # A rank-0 export error must reach every participant before any rank
+        # proceeds. A plain barrier would strand peers when validation fails.
         from veomni.utils.dist_utils import raise_if_any_rank_failed
 
         error = None
@@ -418,6 +493,7 @@ def save_hf_safetensor(
                     model_assets,
                     ckpt_manager,
                     output_dir,
+                    model=model,
                     rows_by_name=checkpoint_row_counts(model),
                 )
         except BaseException as exc:
@@ -492,7 +568,13 @@ def save_lora_adapter_with_dcp(
     dcp_save_path = os.path.join(save_path, dcp_subdir)
     error = None
     try:
-        lora_state = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v for k, v in lora_state.items()}
+        qwen4_model = is_qwen4_exp_model(model)
+        for name, value in lora_state.items():
+            if qwen4_model and is_qwen4_gdn_parameter(name):
+                if value.dtype != torch.float32:
+                    raise RuntimeError(f"Qwen4 LoRA GDN parameter {name} must be FP32, got {value.dtype}")
+            elif value.dtype == torch.float32:
+                lora_state[name] = value.to(torch.bfloat16)
         for name, value in lora_state.items():
             spec = (fqn2spec_info or {}).get(name)
             if spec is None and name.endswith(".weight"):

@@ -12,8 +12,22 @@ from torch.distributed.checkpoint import FileSystemReader
 from transformers import AutoConfig, AutoProcessor
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
 
-from veomni.checkpoint.dcp_checkpointer import _get_sharding_plan, _normalize_key, _process_shard
+from veomni.checkpoint.dcp_checkpointer import (
+    _QWEN4_GDN_FP32_LEGACY_MARKER,
+    _QWEN4_GDN_FP32_MARKER,
+    _get_sharding_plan,
+    _normalize_key,
+    _process_shard,
+    read_qwen4_gdn_manifest,
+)
 from veomni.checkpoint.layout import weights_dir
+from veomni.models.qwen4_gdn_precision import (
+    has_qwen4_exp_assets,
+    is_qwen4_exp_config,
+    is_qwen4_gdn_parameter,
+    preserve_qwen4_gdn_fp32,
+    validate_qwen4_gdn_pairs,
+)
 from veomni.utils import helper
 
 
@@ -111,6 +125,7 @@ def save_model_weights(
     shard_size: int = 2_000_000_000,
     safe_serialization: bool = True,
     model_assets: Optional[Sequence["ModelAssets"]] = None,
+    qwen4_gdn_fp32: bool = False,
     *,
     legacy_expert_source_layout: Optional[str] = None,
 ) -> None:
@@ -123,8 +138,46 @@ def save_model_weights(
 
     # Plan shards from metadata
     logger.info("Analyzing DCP metadata and planning shards...")
+    metadata = FileSystemReader(checkpoint_path).read_metadata().state_dict_metadata
+    if (
+        f"model.{_QWEN4_GDN_FP32_LEGACY_MARKER}" in metadata
+        and f"model.{_QWEN4_GDN_FP32_MARKER}" not in metadata
+        and not (qwen4_gdn_fp32 or has_qwen4_exp_assets(model_assets))
+    ):
+        raise RuntimeError("Legacy Qwen4 GDN marker needs model assets or --qwen4-gdn-fp32 for export")
+    manifest = read_qwen4_gdn_manifest(checkpoint_path)
+    qwen4_gdn_fp32 = qwen4_gdn_fp32 or manifest is not None
+    if not qwen4_gdn_fp32 and not any(getattr(asset, "model_type", None) for asset in model_assets or ()):
+        target_dtype = getattr(torch, save_dtype) if isinstance(save_dtype, str) else save_dtype
+        if target_dtype and any(
+            key.startswith("model.")
+            and is_qwen4_gdn_parameter(key)
+            and getattr(getattr(item, "properties", None), "dtype", target_dtype) != target_dtype
+            for key, item in metadata.items()
+        ):
+            logger.warning("GDN model identity is unknown; supply --model-assets-dir or --qwen4-gdn-fp32 for Qwen4.")
+    preserve_fp32_keys = set()
+    if qwen4_gdn_fp32 or preserve_qwen4_gdn_fp32(model_assets):
+        all_keys, _, _ = _get_sharding_plan(
+            checkpoint_path, shard_size=None, save_dtype=None, legacy_expert_source_layout=legacy_expert_source_layout
+        )
+        preserve_fp32_keys = {key for key in all_keys if is_qwen4_gdn_parameter(key)}
+        if manifest is not None and preserve_fp32_keys != manifest:
+            raise RuntimeError("Qwen4 GDN checkpoint inventory does not match model tensors")
+        qwen4_config = next((asset for asset in model_assets or () if is_qwen4_exp_config(asset)), None)
+        validate_qwen4_gdn_pairs(preserve_fp32_keys, qwen4_config)
+        if qwen4_gdn_fp32 or has_qwen4_exp_assets(model_assets):
+            invalid = [key for key in preserve_fp32_keys if metadata[all_keys[key]].properties.dtype != torch.float32]
+            if invalid:
+                raise RuntimeError(
+                    f"Cannot export non-FP32 Qwen4 GDN parameters without explicit migration: {invalid}"
+                )
     shards, total_size, all_dcp_keys = _get_sharding_plan(
-        checkpoint_path, shard_size, save_dtype, legacy_expert_source_layout=legacy_expert_source_layout
+        checkpoint_path,
+        shard_size,
+        save_dtype,
+        preserve_fp32_keys=preserve_fp32_keys,
+        legacy_expert_source_layout=legacy_expert_source_layout,
     )
 
     logger.info(f"Found {len(all_dcp_keys)} model tensors, total size: ~{total_size / 1e9:.2f}GB")
@@ -150,7 +203,11 @@ def save_model_weights(
         logger.info(f"Processing shard {shard_idx + 1}/{num_shards}: {filename} ({len(shard_keys)} tensors)")
 
         processed_dict = _process_shard(
-            shard_keys, checkpoint_path, save_dtype, legacy_expert_source_layout=legacy_expert_source_layout
+            shard_keys,
+            checkpoint_path,
+            save_dtype,
+            preserve_fp32_keys,
+            legacy_expert_source_layout=legacy_expert_source_layout,
         )
 
         # Save shard
@@ -196,6 +253,7 @@ def merge_to_hf_pt(
     save_path: str,
     model_assets_dir: Optional[str] = None,
     shard_size: int = 2_000_000_000,
+    qwen4_gdn_fp32: bool = False,
     *,
     save_dtype: Optional[Union[str, torch.dtype]] = "bfloat16",
     legacy_expert_source_layout: Optional[str] = None,
@@ -226,6 +284,7 @@ def merge_to_hf_pt(
         save_dtype=save_dtype,
         shard_size=shard_size,
         model_assets=model_assets,
+        qwen4_gdn_fp32=qwen4_gdn_fp32,
         legacy_expert_source_layout=legacy_expert_source_layout,
     )
 
@@ -256,6 +315,11 @@ def main():
         type=str,
         default=None,
         help="Directory containing model config and processor (optional)",
+    )
+    parser.add_argument(
+        "--qwen4-gdn-fp32",
+        action="store_true",
+        help="Require and preserve FP32 Qwen4 GDN scalars for legacy DCPs without a precision marker.",
     )
     parser.add_argument(
         "--shard-size",
@@ -341,6 +405,7 @@ def main():
             save_dir,
             model_assets_dir,
             shard_size=shard_size,
+            qwen4_gdn_fp32=args.qwen4_gdn_fp32,
             save_dtype=save_dtype,
             legacy_expert_source_layout=args.legacy_expert_source_layout,
         )

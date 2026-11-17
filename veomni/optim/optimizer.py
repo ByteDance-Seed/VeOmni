@@ -15,11 +15,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
+import json
+import math
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
-from functools import wraps
+from functools import partial, wraps
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -402,6 +405,19 @@ class AnyPrecisionAdamW(Optimizer):
                     p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
 
 
+def _validate_optimizer_serializer(opt):
+    """Reject instance wrappers that can rewrite packed parameter IDs."""
+    state_dict_fn = _state_dict_fn(opt, "state_dict")
+    if "state_dict" in vars(opt) and not (
+        isinstance(state_dict_fn, partial)
+        and state_dict_fn.func is type(opt).state_dict
+        and not state_dict_fn.args
+        and set(state_dict_fn.keywords or ()) == {"self"}
+        and state_dict_fn.keywords["self"] is opt
+    ):
+        raise RuntimeError("Cannot prove optimizer parameter IDs for an instance-patched state_dict")
+
+
 def _empty_optimizer_state_dict(model, opt):
     packed_groups = []
     id_to_name = {}
@@ -537,6 +553,9 @@ class MultiOptimizer(Optimizer, Stateful):
         self.key_names = key_names
         self._qwen38_cuda_guard = qwen38_cuda_guard
         self._qwen38_cuda_group = qwen38_cuda_group
+        self._qwen38_ple_world_profile = any(
+            isinstance(opt, Qwen38MuonAdamW) and opt._ple_world_profile for opt in optimizers.values()
+        )
 
     @property
     def param_groups(self):
@@ -544,10 +563,35 @@ class MultiOptimizer(Optimizer, Stateful):
         return [group for name in self.key_names for group in self.optimizers_dict[name].param_groups]
 
     def step(self, closure=None):
-        if getattr(self, "_veomni_dcp_restore_failed", False):
+        restore_failed = getattr(self, "_veomni_dcp_restore_failed", False)
+        if restore_failed and not self._qwen38_ple_world_profile:
             raise RuntimeError("MultiOptimizer cannot train after a failed checkpoint restore; rebuild the optimizer")
         children = tuple(self.optimizers_dict.values())
         qwen_children = tuple(opt for opt in children if isinstance(opt, Qwen38MuonAdamW))
+        if self._qwen38_ple_world_profile:
+            from torch.optim.optimizer import _global_optimizer_post_hooks, _global_optimizer_pre_hooks
+
+            preflight_error = None
+            if (
+                closure is not None
+                or _global_optimizer_pre_hooks
+                or _global_optimizer_post_hooks
+                or len(qwen_children) != len(children)
+                or any(
+                    not opt._ple_world_profile or opt._optimizer_step_pre_hooks or opt._optimizer_step_post_hooks
+                    for opt in qwen_children
+                )
+            ):
+                preflight_error = ValueError(
+                    "File-backed optimizer requires coordinated children and no closures or step hooks"
+                )
+            if not qwen_children and preflight_error is not None:
+                raise preflight_error
+            for index, opt in enumerate(qwen_children):
+                opt._prepare_file_step(
+                    restore_failed=restore_failed if index == 0 else False,
+                    preflight_error=preflight_error if index == 0 else None,
+                )
         uses_cuda = bool(qwen_children) and any(_optimizer_uses_cuda(opt) for opt in children)
         if uses_cuda and not self._qwen38_cuda_guard and torch.distributed.is_initialized():
             raise RuntimeError("Distributed MultiOptimizer requires qwen38_cuda_guard on every participant")
@@ -555,6 +599,9 @@ class MultiOptimizer(Optimizer, Stateful):
             _cuda_step_preflight(children, self._qwen38_cuda_group, closure=closure is not None)
             for opt in qwen_children:
                 opt._cuda_parent_preflight = True
+        if self._qwen38_ple_world_profile:
+            for opt in qwen_children:
+                opt._ple_parent_preflight = True
         loss = None
         try:
             if closure is not None:
@@ -562,9 +609,15 @@ class MultiOptimizer(Optimizer, Stateful):
                     loss = closure()
             for opt in children:
                 opt.step()
+        except BaseException:
+            if self._qwen38_ple_world_profile:
+                for opt in qwen_children:
+                    opt._ple_state_poisoned = True
+            raise
         finally:
             for opt in qwen_children:
                 opt._cuda_parent_preflight = False
+                opt._ple_parent_preflight = False
         return loss
 
     def zero_grad(self, set_to_none: bool = True) -> None:
@@ -610,6 +663,7 @@ class MultiOptimizer(Optimizer, Stateful):
             error, sd = None, None
             try:
                 opt = self.optimizers_dict.get(name)
+                _validate_optimizer_serializer(opt)
                 from .checkpoint_adapter import rank_local_adamw_context
 
                 with rank_local_adamw_context(opt), _dcp_swap_load_template(opt):
@@ -708,6 +762,83 @@ def _qwen38_cuda_domain(optimizer_type, parallel_state, optimizers):
     return local
 
 
+def _file_profile_value(value):
+    """Encode supported group options without truncating numerical values."""
+    if value is None or type(value) in (bool, int, str):
+        return [type(value).__name__, value]
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("File-backed optimizer group options must be finite")
+        return ["float", value.hex()]
+    if isinstance(value, torch.dtype):
+        return ["dtype", str(value)]
+    if isinstance(value, torch.device):
+        return ["device", value.type]
+    if isinstance(value, torch.Tensor):
+        if isinstance(value, DTensor) or value.layout != torch.strided or value.numel() != 1 or value.requires_grad:
+            raise ValueError("File-backed optimizer supports only detached scalar tensor options")
+        raw = value.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+        return ["tensor", str(value.dtype), tuple(value.shape), bytes(raw.tolist()).hex()]
+    if isinstance(value, (tuple, list)):
+        return [type(value).__name__, [_file_profile_value(element) for element in value]]
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return ["dict", [[key, _file_profile_value(item)] for key, item in sorted(value.items())]]
+    raise ValueError(f"Unsupported file-backed optimizer option type: {type(value).__name__}")
+
+
+def _file_profile_group_signature(model, param_groups):
+    """Describe the common logical work, excluding owner-specific mesh members."""
+    if not param_groups:
+        raise ValueError("File-backed optimizer has no parameter groups")
+    names = {id(parameter): name for name, parameter in model.named_parameters()}
+    rows = []
+    for group in param_groups:
+        parameters = []
+        for parameter in group["params"]:
+            name = names.get(id(parameter))
+            if name is None:
+                raise ValueError("File-backed optimizer contains an unnamed parameter")
+            if isinstance(parameter, DTensor):
+                layout = (tuple(parameter.device_mesh.mesh_dim_names or ()), tuple(map(str, parameter.placements)))
+            else:
+                layout = None
+            parameters.append(
+                (name, tuple(parameter.shape), str(parameter.dtype), bool(parameter.requires_grad), layout)
+            )
+        options = []
+        for key, value in sorted(group.items()):
+            if key == "params":
+                continue
+            if key == "qwen38_ple_step_layout":
+                layout = json.loads(value)
+                if not isinstance(layout, list) or len(layout) != 2 or layout[0] != "owner-grid-v1":
+                    raise ValueError("Invalid PLE owner step layout")
+                if layout[1] is None:
+                    value = (layout[0], None)
+                else:
+                    grid = torch.as_tensor(layout[1])
+                    if (
+                        grid.dtype != torch.int64
+                        or grid.ndim == 0
+                        or grid.numel() == 0
+                        or torch.unique(grid).numel() != grid.numel()
+                        or (
+                            torch.distributed.is_initialized()
+                            and (
+                                torch.any(grid < 0)
+                                or torch.any(grid >= torch.distributed.get_world_size())
+                                or not torch.any(grid == torch.distributed.get_rank())
+                            )
+                        )
+                    ):
+                        raise ValueError("Invalid PLE owner mesh")
+                    value = (layout[0], tuple(grid.shape))
+            options.append((key, _file_profile_value(value)))
+        rows.append((tuple(parameters), tuple(options)))
+    encoded = json.dumps(rows, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
+    return len(rows), hashlib.sha256(encoded).hexdigest()
+
+
 _QWEN_BUILD_DEFER_CUDA = ContextVar("qwen_build_defer_cuda", default=False)
 
 
@@ -717,6 +848,75 @@ def _coordinate_qwen_builder(builder):
         optimizer_type = kwargs.get("optimizer_type", args[6] if len(args) > 6 else "adamw")
         if optimizer_type != "qwen38_muon" or not torch.distributed.is_initialized() or _QWEN_BUILD_DEFER_CUDA.get():
             return builder(*args, **kwargs)
+        # A file-backed run must agree on the complete logical work before any
+        # rank enters profile-specific collectives or constructs an optimizer.
+        import inspect
+
+        from ..utils.dist_utils import raise_if_any_rank_failed
+        from .ple_world_profile import require_same_rank_value
+
+        bound, profile, error = None, False, None
+        try:
+            bound = inspect.signature(builder).bind(*args, **kwargs)
+            bound.apply_defaults()
+            config = bound.arguments.get("optimizer_config")
+            # The lower-level ExtraParallel builder has no optimizer_config.
+            # It may be called directly for ordinary Muon, but file-backed PLE
+            # must enter through build_optimizer's all-rank profile preflight.
+            direct_options = bound.arguments.get("cpu_offload_kwargs") or {}
+            if (
+                direct_options.get("ple_moments_world_profile")
+                or direct_options.get("ple_moments_scratch_dir") is not None
+            ):
+                raise RuntimeError("File-backed PLE requires the certified build_optimizer factory")
+            profile = bool(getattr(config, "qwen38_ple_moments_world_profile", False))
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "inspecting file-backed optimizer configuration")
+        require_same_rank_value(profile, "file-backed optimizer profile")
+        if profile:
+            signature, error = None, None
+            try:
+                model = bound.arguments["model"]
+                groups = bound.arguments["param_groups"]
+                if groups is None:
+                    groups = [{"params": [p for p in model.parameters() if p.requires_grad]}]
+                elif not isinstance(groups, (tuple, list)) or any(
+                    not isinstance(group.get("params"), (tuple, list)) for group in groups
+                ):
+                    raise ValueError("File-backed optimizer requires reusable parameter group sequences")
+                signature = (
+                    _file_profile_group_signature(model, groups),
+                    tuple(
+                        _file_profile_value(bound.arguments[name])
+                        for name in (
+                            "lr",
+                            "betas",
+                            "eps",
+                            "weight_decay",
+                            "fused",
+                            "no_decay_modules",
+                            "no_decay_params",
+                            "cpu_offload_param_patterns",
+                            "cpu_offload_resident_moment_dtype",
+                            "cpu_offload_cpu_moment_dtype",
+                        )
+                    ),
+                    tuple(
+                        _file_profile_value(getattr(config, name, None))
+                        for name in (
+                            "qwen38_ple_moments_scratch_dir",
+                            "cpu_offload_param_patterns",
+                            "cpu_offload_resident_moment_dtype",
+                            "cpu_offload_cpu_moment_dtype",
+                        )
+                    ),
+                    _should_build_extra_parallel_aware(model),
+                )
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "inspecting file-backed optimizer groups")
+            require_same_rank_value(signature, "file-backed optimizer groups and hyperparameters")
         token = _QWEN_BUILD_DEFER_CUDA.set(True)
         result, error = None, None
         try:
@@ -725,8 +925,6 @@ def _coordinate_qwen_builder(builder):
             error = exc
         finally:
             _QWEN_BUILD_DEFER_CUDA.reset(token)
-        from ..utils.dist_utils import raise_if_any_rank_failed
-
         raise_if_any_rank_failed(error, "building Qwen3.8 Muon optimizer")
         parallel_state, error = None, None
         try:
@@ -882,6 +1080,7 @@ def build_optimizer(
     cpu_offload_param_patterns: Optional[List[str]] = None,
     cpu_offload_resident_moment_dtype: Optional[str] = None,
     cpu_offload_cpu_moment_dtype: Optional[str] = None,
+    ple_profile_receipt=None,
 ) -> "torch.optim.Optimizer":
     """Build the optimizer.
 
@@ -933,6 +1132,19 @@ def build_optimizer(
             raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
 
     cpu_offload_kwargs = {}
+    if optimizer_type == "qwen38_muon":
+        from .ple_world_profile import _FactoryPermit, validate_build_config
+
+        validate_build_config(optimizer_type, optimizer_config, ple_profile_receipt)
+        scratch = getattr(optimizer_config, "qwen38_ple_moments_scratch_dir", None)
+        world_profile = getattr(optimizer_config, "qwen38_ple_moments_world_profile", False)
+        if scratch is not None or world_profile:
+            cpu_offload_kwargs.update(
+                ple_moments_scratch_dir=scratch,
+                ple_moments_world_profile=world_profile,
+                ple_world_receipt=ple_profile_receipt,
+                ple_factory_permit=_FactoryPermit(ple_profile_receipt) if ple_profile_receipt is not None else None,
+            )
     if optimizer_type in ("cpu_offload_adamw", "qwen38_muon"):
         for key, override in (
             ("resident_moment_dtype", cpu_offload_resident_moment_dtype),

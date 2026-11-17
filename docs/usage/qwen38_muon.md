@@ -7,7 +7,8 @@ Ulysses/CP, expert routing, and global gradient clipping unchanged. The generic
 
 ## Recipe
 
-- FP32 master weights and FP32 optimizer states; BF16 model compute copies.
+- FP32 master weights and FP32 optimizer states; ordinary model compute
+  copies may be BF16. Qwen4 GDN `A_log` and `dt_bias` remain FP32.
 - Muon: Nesterov momentum 0.95, eight explicitly pinned Polar Express iterations,
   Frobenius normalization epsilon `1e-14`, update scale `0.2*sqrt(max(rows, cols))`.
   Autocast and Ascend HF32 are disabled during NS. CUDA TF32 must already be
@@ -65,9 +66,10 @@ gradients are counted only once by the ExtraParallel grad clipper. Independent
 expert adapters follow the expert sharding plan. The synchronization and model
 compute still use their configured gradient and compute dtypes; FP32 optimizer
 state does not turn BF16 forward/backward into FP32 computation.
-Training DCP preserves the FP32 optimizer state. The distributed HF adapter
-export retains the existing behavior of casting FP32 adapter weights to BF16;
-it is an inference artifact, not a full-precision optimizer checkpoint.
+Training DCP preserves the FP32 optimizer state. Distributed HF adapter export
+casts ordinary FP32 adapter tensors to BF16, while a trainable Qwen4 GDN
+`dt_bias` (for example with `bias: all`) remains FP32. The adapter is an
+inference artifact, not a full-precision optimizer checkpoint.
 
 The schedule is generated from the Polar Express authors' implementation with
 `l=1e-3, num_iters=8, degree=5, safety_factor_eps=1e-2, cushion=0.02` and pinned in

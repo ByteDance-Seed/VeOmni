@@ -57,6 +57,7 @@ def _corrupt_inventory_worker(rank, endpoint):
     class OptimizerProbe:
         def __init__(self):
             self.entered = False
+            self.optimizers_dict = {}
 
         def _dcp_load_state_dict(self, state_dict, *, group=None):
             self.entered = True
