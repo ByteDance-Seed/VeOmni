@@ -3,12 +3,8 @@
 
 """Identity of a MultiOptimizer's rank-local parameter and scheduler layout."""
 
-import dis
 import hashlib
 import json
-import marshal
-import math
-import types
 
 import torch
 import torch.distributed as dist
@@ -18,15 +14,6 @@ from ..utils.dist_utils import raise_if_any_rank_failed
 
 
 MULTI_LAYOUT_MARKER = "__veomni_multi_optimizer_layout_v1__"
-
-_SCHEDULER_SAFE_BUILTINS = frozenset(
-    ("abs", "bool", "float", "int", "len", "max", "min", "pow", "range", "round", "sum")
-)
-_SCHEDULER_MATH_MEMBERS = frozenset(
-    name
-    for name, value in vars(math).items()
-    if not name.startswith("_") and type(value) in (float, int, types.BuiltinFunctionType)
-)
 
 
 def _immutable_value(value):
@@ -137,84 +124,8 @@ def _lr_layout(group, key, aliases):
     return {"type": type(value).__name__}
 
 
-def _scheduler_functions(scheduler):
-    """Describe LambdaLR callables using the existing checkpoint identity format."""
-
-    def has_unordered_constant(value):
-        if isinstance(value, frozenset):
-            return True
-        return isinstance(value, tuple) and any(has_unordered_constant(item) for item in value)
-
-    def normalize(code, globals_dict):
-        # Nested code objects share this function's global namespace. A
-        # referenced global can change the next LR without changing code.
-        # LOAD_ATTR names are not globals; inspect actual global lookups instead.
-        instructions = list(dis.get_instructions(code))
-        for index, instruction in enumerate(instructions):
-            opcode = instruction.opname
-            if opcode in ("STORE_DEREF", "DELETE_DEREF") and instruction.argval in code.co_freevars:
-                raise RuntimeError("MultiOptimizer scheduler uses unsupported dynamic state")
-            if opcode in (
-                "LOAD_NAME",
-                "STORE_NAME",
-                "DELETE_NAME",
-                "STORE_GLOBAL",
-                "DELETE_GLOBAL",
-                "STORE_ATTR",
-                "DELETE_ATTR",
-                "STORE_SUBSCR",
-                "DELETE_SUBSCR",
-                "IMPORT_NAME",
-                "IMPORT_FROM",
-                "IMPORT_STAR",
-                "LOAD_BUILD_CLASS",
-                # Hash-randomized set iteration can change floating-point LR
-                # results across processes without changing the recipe hash.
-                "BUILD_SET",
-                "SET_ADD",
-                "SET_UPDATE",
-            ):
-                raise RuntimeError("MultiOptimizer scheduler uses unsupported dynamic state")
-            if opcode in ("LOAD_ATTR", "LOAD_METHOD"):
-                previous = instructions[index - 1] if index else None
-                if previous is None or previous.opname != "LOAD_GLOBAL" or previous.argval != "math":
-                    raise RuntimeError("MultiOptimizer scheduler uses unsupported attribute access")
-                if instruction.argval not in _SCHEDULER_MATH_MEMBERS:
-                    raise RuntimeError("MultiOptimizer scheduler uses unsupported math state")
-                continue
-            if opcode != "LOAD_GLOBAL":
-                continue
-            name = instruction.argval
-            if name in globals_dict:
-                if name != "math" or globals_dict[name] is not math:
-                    raise RuntimeError("MultiOptimizer scheduler refers to unsupported global state")
-            elif name not in _SCHEDULER_SAFE_BUILTINS:
-                raise RuntimeError("MultiOptimizer scheduler uses an unsupported builtin")
-        if any(has_unordered_constant(item) for item in code.co_consts):
-            raise RuntimeError("MultiOptimizer scheduler uses unsupported unordered state")
-        constants = tuple(
-            normalize(item, globals_dict) if isinstance(item, types.CodeType) else item for item in code.co_consts
-        )
-        return code.replace(co_filename="", co_firstlineno=0, co_consts=constants)
-
-    functions = []
-    for function in scheduler.lr_lambdas:
-        if not isinstance(function, types.FunctionType):
-            raise RuntimeError("MultiOptimizer scheduler uses an unsupported callable")
-
-        functions.append(
-            {
-                "code": hashlib.sha256(marshal.dumps(normalize(function.__code__, function.__globals__))).hexdigest(),
-                "defaults": _immutable_value(function.__defaults__),
-                "kwdefaults": _immutable_value(function.__kwdefaults__),
-                "closure": [_immutable_value(cell.cell_contents) for cell in function.__closure__ or ()],
-            }
-        )
-    return functions
-
-
 def _scheduler_layout(leaf):
-    from ..optim.lr_scheduler import checkpoint_scheduler_binding
+    from ..optim.lr_scheduler import checkpoint_scheduler_binding, checkpoint_scheduler_recipe
 
     scheduler = checkpoint_scheduler_binding(leaf)
     if scheduler is None:
@@ -225,7 +136,7 @@ def _scheduler_layout(leaf):
         raise RuntimeError("MultiOptimizer scheduler binding changed")
     return {
         "type": f"{type(scheduler).__module__}.{type(scheduler).__qualname__}",
-        "functions": _scheduler_functions(scheduler),
+        "recipe": checkpoint_scheduler_recipe(scheduler),
     }
 
 
