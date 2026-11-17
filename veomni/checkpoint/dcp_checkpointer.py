@@ -3047,12 +3047,7 @@ class DistributedCheckpointer(CheckpointerBase):
             state, parallel_state, group=process_group, trainable_only=trainable_only, allow_proven_optimizer=multi
         )
 
-        row_counts, error = {}, None
-        try:
-            row_counts = _checkpoint_rows_by_name(state["model"])
-        except Exception as exc:
-            error = exc
-        raise_if_any_rank_failed(error, "preparing checkpoint row metadata for load", group=process_group)
+        row_counts = {}
 
         def _model_state() -> "ModelState":
             """Build the model load target using its padded runtime shapes."""
@@ -3071,6 +3066,7 @@ class DistributedCheckpointer(CheckpointerBase):
 
         error = None
         try:
+            row_counts = _checkpoint_rows_by_name(state["model"])
             _validate_legacy_expert_source_layout(legacy_expert_source_layout)
             if legacy_expert_source_layout is not None and optimizer is not None:
                 raise ValueError("Legacy expert source declarations are only supported for model-only loads")
