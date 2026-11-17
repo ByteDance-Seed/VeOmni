@@ -22,7 +22,7 @@ import pytest
 import torch
 import torch.utils.checkpoint
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_capabilities
 from veomni.ops.kernels.moe_experts.standard.npu import GmmFunction
 from veomni.utils.device import IS_NPU_AVAILABLE
 
@@ -211,9 +211,11 @@ def test_bad_compute_or_master_dtype_is_rejected(fake_npu):
 
 @pytest.mark.parametrize("rematerialize", [False, True])
 def test_native_npu_fp32_wgrad_matches_cpu_reference(rematerialize):
-    if not IS_NPU_AVAILABLE:
-        if os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1":
-            pytest.fail("VEOMNI_REQUIRE_NPU_TESTS=1 requires a native NPU")
+    assigned = bool(os.environ.get("VEOMNI_CI_CAPABILITIES")) and runner_capabilities().backend == "npu"
+    available = IS_NPU_AVAILABLE and torch.npu.is_available()
+    if not available:
+        if assigned or os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1":
+            pytest.fail("Assigned or required NPU runtime must provide a usable device")
         pytest.skip("native NPU is unavailable")
     import torch_npu  # noqa: F401
 
