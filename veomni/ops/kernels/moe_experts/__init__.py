@@ -47,31 +47,18 @@ _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
 
-#: ``moe_experts`` rows that *simulate* their target format instead of running it
-#: in that format. Derived from the registry rather than listed here, so a new
-#: emulated row is complete the moment it is registered -- ``deepgemm_fp8`` is
-#: native and therefore absent, even though it also rounds.
-def quantizing_impls() -> frozenset[str]:
-    """``moe_experts`` rows that fake-quantize, i.e. the ones a deployment kernel is not running.
-
-    Adapters need the real weights and no ``moe_experts_lora`` row simulates a
-    rounding, so an expert-LoRA request on one of these must be refused rather than
-    silently falling back to a full-precision ``eager`` base. This is the narrower
-    set: :func:`rounding_impls` is for guards that care about rounding at all.
-    """
-    from ...registry import OP_REGISTRY
-
-    return OP_REGISTRY.emulated_impls("moe_experts")
-
-
 def rounding_impls() -> frozenset[str]:
     """``moe_experts`` rows that round the operands they are handed, native ones included.
 
-    The activation guard needs this set rather than the emulated one: every fused
-    row bakes SiLU into both directions, ``deepgemm_fp8`` included, so an activation
-    the family cannot run has to be refused for a native row just as much as for an
-    emulated one. Only ``EXACT`` rows are satisfied by the Python act_fn loop,
+    The activation guard needs this set rather than :meth:`OpRegistry.emulated_impls`:
+    every fused row bakes SiLU into both directions, ``deepgemm_fp8`` included, so an
+    activation the family cannot run has to be refused for a native row just as much as
+    for an emulated one. Only ``EXACT`` rows are satisfied by the Python act_fn loop,
     because they are the ones that never round.
+
+    Adapter rejection reads the row's precision directly (``veomni/lora/moe_layers.py``)
+    rather than a set from here: it needs the same "does this round?" answer, and a
+    second name for it would be one more place to drift.
     """
     from ...registry import OP_REGISTRY
 
