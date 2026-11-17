@@ -1682,7 +1682,7 @@ class DeepseekV4Experts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_gated_mlp = config.hidden_act in {"silu", "swish"}
+        self.use_swiglu = config.hidden_act in {"silu", "swish"}
         self.limit = config.swiglu_limit
         # Per-expert grouped-GEMM ``max_M`` launch bound selector. Defaults to
         # the conservative ``T * top_k`` (``assume_distinct_experts`` False):
@@ -1708,7 +1708,7 @@ class DeepseekV4Experts(nn.Module):
         # argument rather than part of the implementation name.
         down_proj = self.down_proj
         gate_up_proj = self.gate_up_proj
-        if not self.use_gated_mlp:
+        if not self.use_swiglu:
             # The act_fn loop does not use grouped-GEMM ``max_M``, so it cannot go
             # through the family row: the fused kernel bakes SiLU into both its
             # forward and its backward, so a different activation has no fused row

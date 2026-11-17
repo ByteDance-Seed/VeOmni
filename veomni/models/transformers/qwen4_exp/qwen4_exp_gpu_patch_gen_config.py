@@ -1044,7 +1044,7 @@ class PatchedQwen4ExpTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_gated_mlp = config.hidden_act in {"silu", "swish"}
+        self.use_swiglu = config.hidden_act in {"silu", "swish"}
         self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
@@ -1054,7 +1054,7 @@ class PatchedQwen4ExpTextExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         # --- Patch.1 ---
-        if not self.use_gated_mlp:
+        if not self.use_swiglu:
             reject_quantizing_act_fn(self)
             return merged_experts_act_fn_forward(
                 hidden_states,
