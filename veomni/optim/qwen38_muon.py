@@ -308,6 +308,12 @@ def _validate_file_muon_gradient_traffic(groups, state=None):
             target = _matrix_placements(param)
             local_cpu_matrix = param.device.type == "cpu" and hasattr(param, "_veomni_optimizer_compute_device")
             grad = param.grad
+            step = None
+            if state is not None and grad is not None:
+                parameter_state = state.get(param)
+                if parameter_state is None or "step" not in parameter_state:
+                    raise RuntimeError("Muon state is missing during communication preflight")
+                step = float(_local(parameter_state["step"]).item())
             signature = (
                 index,
                 grad is not None,
@@ -319,7 +325,7 @@ def _validate_file_muon_gradient_traffic(groups, state=None):
                 tuple(map(str, grad.placements))
                 if isinstance(grad, DTensor)
                 else ("none" if grad is None else "plain"),
-                float(_local(state[param]["step"]).item()) if state is not None and grad is not None else None,
+                step,
             )
             for axis, (placement, wanted) in enumerate(zip(param.placements, target, strict=True)):
                 if placement == wanted:
