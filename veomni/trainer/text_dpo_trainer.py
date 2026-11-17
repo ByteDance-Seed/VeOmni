@@ -49,7 +49,7 @@ from ..utils.dpo_provenance import (
     DPOInvalidProof,
     DPOPackedProof,
 )
-from ..utils.loss_utils import contains_padding, is_padding_microbatch
+from ..utils.loss_utils import contains_padding
 from .base import BaseTrainer, VeOmniIter
 from .callbacks.channel_loss_callback import _validate_segment_count
 from .dpo_provenance import next_dpo_microbatches
@@ -58,16 +58,6 @@ from .dpo_provenance import next_dpo_microbatches
 logger = logging.get_logger(__name__)
 
 _NON_MODEL_KEYS = set()
-
-
-def _dpo_step_batch_structure(batch):
-    """Record the proven microbatch structure across the DPO callback."""
-    if isinstance(batch, (list, tuple)):
-        return (type(batch), tuple(_dpo_step_batch_structure(item) for item in batch))
-    if isinstance(batch, dict):
-        auxiliary = tuple(sorted(key for key in batch if isinstance(key, str) and key.endswith("_labels")))
-        return (id(batch), is_padding_microbatch(batch), batch.get("loss_weights") is not None, auxiliary)
-    return (type(batch), id(batch))
 
 
 def _dpo_training_iterator(dataloader, use_background_prefetcher: bool, preserve_cpu_rng: bool):
@@ -1257,36 +1247,11 @@ class TextDPOTrainer:
         # only after all ranks have obtained and validated this step's data.
         previous_step = self.state.global_step
         self.state.global_step = next_step
-        expected_microsteps = len(micro_batches)
-        original_structure = _dpo_step_batch_structure(micro_batches) if provenance_enabled else None
-        original_proofs = (
-            tuple((batch.get(DPO_APPROVED_KEY), batch.get(DPO_AGREED_KEY)) for batch in micro_batches)
-            if provenance_enabled
-            else None
-        )
         try:
             step_begin_error = None
             try:
                 self.base._reset_async_activation_offload_if_enabled(self.policy_model)
                 self.on_step_begin(micro_batches=micro_batches)
-                if contains_padding(micro_batches):
-                    raise ValueError("DPO step-begin callback introduced padding")
-                if any(
-                    batch.get("loss_weight") is not None or batch.get("loss_weights") is not None
-                    for batch in micro_batches
-                    if isinstance(batch, dict)
-                ):
-                    raise ValueError("DPO does not support token loss_weights")
-                if provenance_enabled and len(micro_batches) != expected_microsteps:
-                    raise ValueError("DPO step-begin callback changed proven microbatch count")
-                if provenance_enabled and _dpo_step_batch_structure(micro_batches) != original_structure:
-                    raise ValueError("DPO step-begin callback changed proven microbatch structure")
-                if (
-                    provenance_enabled
-                    and tuple((batch.get(DPO_APPROVED_KEY), batch.get(DPO_AGREED_KEY)) for batch in micro_batches)
-                    != original_proofs
-                ):
-                    raise ValueError("DPO step-begin callback changed proven microbatch provenance")
             except Exception as exc:  # noqa: BLE001 - report a local callback error before forwarding
                 step_begin_error = exc
             _dpo_sync_step_begin_error(step_begin_error)

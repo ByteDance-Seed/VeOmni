@@ -624,7 +624,7 @@ class BaseTrainer(Stateful, ABC):
             callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
             if started is not None:
                 channel_elapsed = time.perf_counter() - started
-            elif reordered and callback is meter:
+            elif reordered and callback is meter and getattr(meter, "_step_timing_used_preflight", False) is not True:
                 # Keep the meter's previous timing contract: include channel
                 # capture, but exclude the meter's own metadata accounting.
                 meter.start_time -= channel_elapsed

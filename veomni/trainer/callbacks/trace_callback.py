@@ -237,6 +237,7 @@ class EnvironMeterCallback(Callback):
                 self.trainer.environ_meter.add(micro_batch)
         clock_owner = getattr(self.trainer, "base", self.trainer)
         preflight_start = getattr(clock_owner, "_step_preflight_start_time", None)
+        self._step_timing_used_preflight = preflight_start is not None
         self.start_time = preflight_start if preflight_start is not None else time.time()
         clock_owner._step_preflight_start_time = None
 

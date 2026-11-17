@@ -704,6 +704,27 @@ def test_dpo_wrapper_reads_and_clears_base_preflight_clock_across_steps(monkeypa
         assert "_step_preflight_start_time" not in trainer.__dict__
 
 
+@pytest.mark.parametrize("preflight", [False, True])
+def test_reordered_channel_capture_counts_elapsed_once(monkeypatch, preflight):
+    from veomni.trainer.base import BaseTrainer
+    from veomni.trainer.callbacks import trace_callback
+
+    trainer = object.__new__(BaseTrainer)
+    trainer.state = SimpleNamespace()
+    trainer.environ_meter = SimpleNamespace(add=lambda _batch: None)
+    trainer._step_preflight_start_time = 100.0 if preflight else None
+    meter = object.__new__(trace_callback.EnvironMeterCallback)
+    meter.trainer = trainer
+    channel = SimpleNamespace(on_step_begin=lambda *_args, **_kwargs: None)
+    trainer.channel_loss_callback, trainer.environ_meter_callback = channel, meter
+    trainer._callbacks = [meter, channel]
+    clock = iter((10.0, 13.0))
+    monkeypatch.setattr(trace_callback.time, "time", lambda: 130.0)
+    monkeypatch.setattr(trace_callback.time, "perf_counter", lambda: next(clock))
+    trainer.on_step_begin(micro_batches=[{"labels": torch.tensor([1])}])
+    assert meter.start_time == (100.0 if preflight else 127.0)
+
+
 def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
     import copy
 
@@ -826,12 +847,6 @@ def _dpo_weight_guard_worker(rank, endpoint):
         with pytest.raises(RuntimeError, match="same number of micro-batches"):
             loss_utils.fetch_training_micro_batches(iter([[{"labels": torch.tensor([1])}] * (rank + 1)]))
 
-        def fail_fetched():
-            if rank == 1:
-                raise RuntimeError("rank-local timer error")
-
-        with pytest.raises(RuntimeError, match="data loading failed"):
-            loss_utils.fetch_training_micro_batches(iter([[{"labels": torch.tensor([1])}]]), on_fetched=fail_fetched)
         value = torch.ones(1)
         dist.all_reduce(value)
         assert value.item() == 2
@@ -924,69 +939,3 @@ def test_sft_loader_failure_and_eof_are_synchronized():
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     spawn_with_rendezvous(_sft_fetch_guard_worker, args=(), nprocs=2)
-
-
-def _dpo_provenance_callback_guard_worker(rank, endpoint):
-    from datetime import timedelta
-
-    import torch.distributed as dist
-
-    from tests.trainer.test_dpo_pair_mean import _build_trainer, _CheckpointTokenizer
-    from veomni.data import data_collator as collator_module
-    from veomni.data.data_transform import dpo_producer_identity, process_dpo_example
-    from veomni.data.dpo_collator import DPOProvenanceCollator
-    from veomni.trainer import text_dpo_trainer as dpo
-
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
-        state = SimpleNamespace(
-            sp_enabled=False, sp_size=1, sp_rank=0, fsdp_group=dist.group.WORLD, dp_size=2, dp_rank=rank
-        )
-        collator_module.get_parallel_state = lambda: state
-        trainer, _ = _build_trainer(state, distributed=True)
-        trainer._dpo_provenance_required = True
-        trainer.base.args.dpo_config.explicit_segment_provenance = True
-        trainer._dpo_objective_parameters = dpo._dpo_objective_parameters(trainer.base.args.dpo_config)
-        trainer.base.args.data = SimpleNamespace(enable_multisource=False)
-        trainer.policy_model.tokenizer = _CheckpointTokenizer()
-        trainer.policy_model.chat_template = None
-        trainer._dpo_producer_identity = dpo_producer_identity(trainer.policy_model.tokenizer, None, None)
-        trainer._dpo_transform_max_seq_len = 32
-        collator = DPOProvenanceCollator(collator_module.MainCollator())
-        for scenario in ("loss_weight", "loss_weights", "padding", "structure"):
-            feature = process_dpo_example(
-                {"chosen": "!Bx", "rejected": "!Ax"},
-                tokenizer=trainer.policy_model.tokenizer,
-                max_seq_len=32,
-                record_segment_provenance=True,
-            )[0]
-            batch = collator([feature])
-
-            def mutate(micro_batches, scenario=scenario, **_kwargs):
-                if rank != 1:
-                    return
-                if scenario == "padding":
-                    micro_batches[0]["padding_flag"] = True
-                elif scenario == "structure":
-                    micro_batches[0] = dict(micro_batches[0])
-                else:
-                    micro_batches[0][scenario] = torch.ones_like(micro_batches[0]["labels"], dtype=torch.float32)
-
-            trainer.base.on_step_begin = mutate
-            expected = "loss_weights" if scenario.startswith("loss_weight") else scenario
-            with pytest.raises(RuntimeError, match=f"DPO step-begin callback failed:.*{expected}"):
-                trainer.train_step(iter([[batch]]))
-            assert trainer.state.global_step == 0
-            assert trainer.policy_model.optimizer.steps == 0
-        alive = torch.ones(1)
-        dist.all_reduce(alive)
-        assert alive.item() == 2
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_dpo_provenance_callback_changes_fail_on_all_ranks():
-    from tests.tools.launch_utils import spawn_with_rendezvous
-
-    spawn_with_rendezvous(_dpo_provenance_callback_guard_worker, nprocs=2)

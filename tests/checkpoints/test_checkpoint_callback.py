@@ -672,7 +672,8 @@ class TestGlobalStateCallbackJobState:
         trainer.channel_loss_callback.load_state_dict.assert_called_once_with(callback_state)
         assert trainer.state.global_step == 7
 
-    def test_the_offline_cache_writer_resumes_with_the_cursor(self, mock_dist, tmp_path):
+    @pytest.mark.parametrize("composed", [False, True])
+    def test_the_offline_cache_writer_resumes_with_the_cursor(self, mock_dist, tmp_path, composed):
         """The cursor is saved only after the writer flushed, and the position comes back with it.
 
         The run saves no model state, so the cursor alone makes the step complete for ``load_path: auto``.
@@ -696,7 +697,10 @@ class TestGlobalStateCallbackJobState:
         assert not os.path.exists(os.path.join(step_root, layout.MODEL_DIRNAME))
         assert layout.checkpoint_is_complete(step_root)
 
-        resumed = _make_mock_trainer()
+        resumed = _make_mock_trainer(save_path=str(tmp_path / "ckpt"))
+        resumed.args.train.training_task = "offline_embedding"
+        encoder = SimpleNamespace(optimizer=None, checkpoint=None)
+        resumed.model = SimpleNamespace(checkpoint=None, module_runtimes={"encoder": encoder}) if composed else encoder
         resumed.args.train.checkpoint.load_path = str(tmp_path / "ckpt" / "global_step_10")
         resumed.train_dataloader = None
         resumed.offline_cache_writer = MagicMock()
