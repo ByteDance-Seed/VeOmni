@@ -116,6 +116,7 @@ def read_model_type(model_path: str) -> str:
 # ``convert_checkpoint`` reads ``read_hf_model_type`` back from this module.
 from . import bagel, base, cosmos3, fake_model, qwen3, qwen3_moe, qwen3vl, text_encoder  # noqa: F401  E402
 
+
 __all__ = [
     "MODULE_ASSET_ATTRS",
     "OMNI_ACCELERATED_MODEL_REGISTRY",
