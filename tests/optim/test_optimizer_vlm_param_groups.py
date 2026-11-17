@@ -60,6 +60,37 @@ def test_optimizer_config_offload_options_remain_keyword_compatible():
     assert config.cpu_offload_cpu_moment_dtype == "float32"
 
 
+@pytest.mark.parametrize("optimizer_type", ["cpu_offload_adamw", "full_fp32_adamw", "master_fp32_adamw"])
+def test_precision_optimizer_exposes_live_groups_to_omni(optimizer_type):
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import MultiOptimizer as OmniMultiOptimizer
+    from veomni.optim.lr_scheduler import build_lr_scheduler
+
+    model = _TinyModel()
+    optimizer = build_optimizer(
+        model,
+        lr=0.02,
+        weight_decay=0,
+        optimizer_type=optimizer_type,
+        cpu_offload_param_patterns=["backbone.weight"] if optimizer_type == "cpu_offload_adamw" else None,
+    )
+    other = torch.nn.Linear(4, 4, bias=False)
+    other_optimizer = torch.optim.AdamW(other.parameters(), lr=0.03)
+    combined = OmniMultiOptimizer({"precision": optimizer, "other": other_optimizer})
+    leaf_group = optimizer.optimizers_dict[optimizer.key_names[0]].param_groups[0]
+    assert combined.param_groups[0] is leaf_group
+    combined.param_groups[0]["lr"] = 0.01
+    assert leaf_group["lr"] == 0.01
+
+    schedule = build_lr_scheduler(optimizer, train_steps=4, lr=0.01, lr_decay_style="linear")
+    before = model.backbone.weight.detach().clone()
+    for param in (*model.parameters(), *other.parameters()):
+        param.grad = torch.ones_like(param)
+    combined.step()
+    schedule.step()
+    assert not torch.equal(model.backbone.weight, before)
+    assert combined.param_groups[0]["lr"] == schedule.get_last_lr()[0]
+
+
 @pytest.mark.parametrize("optimizer_type", ["cpu_offload_adamw", "adamw", "anyprecision_adamw"])
 def test_optimizer_config_rejects_old_draft_offload_positional_options(optimizer_type):
     with pytest.raises(TypeError, match="CPU-offload options by keyword"):

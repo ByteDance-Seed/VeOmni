@@ -531,6 +531,11 @@ class MultiOptimizer(Optimizer, Stateful):
         self._is_multi_optimizer: bool = True
         self.key_names = key_names
 
+    @property
+    def param_groups(self):
+        """Expose the live leaf groups to trainer and metric consumers."""
+        return [group for name in self.key_names for group in self.optimizers_dict[name].param_groups]
+
     def step(self, closure=None):
         if getattr(self, "_veomni_dcp_restore_failed", False):
             raise RuntimeError("MultiOptimizer cannot train after a failed checkpoint restore; rebuild the optimizer")

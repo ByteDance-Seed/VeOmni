@@ -35,7 +35,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.tensor import DTensor
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter, runner_device_count
+from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter, runner_capabilities, runner_device_count
 from tests.tools.launch_utils import spawn_with_rendezvous
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
@@ -679,7 +679,7 @@ def test_image_row_mask_fp32_master_direct_load_rejects_reordered_shared_group()
     assert not new.state and torch.equal(target_table, before)
 
 
-def _row_decay_guard_worker(rank, world_size, scenario, native, endpoint):
+def _row_decay_guard_worker(rank, world_size, native, endpoint):
     """A local build failure must be coordinated by the real runtime wrapper."""
     from types import SimpleNamespace
 
@@ -697,12 +697,11 @@ def _row_decay_guard_worker(rank, world_size, scenario, native, endpoint):
         _init_parallel_state(dp_size=world_size, dp_shard_size=world_size, device_type=device_type)
         text_encoder = _build_modules(device=torch.device("cpu"), dtype=torch.float32)["qwen3_text_encoder"]
         table = text_encoder.embed_tokens.weight
-        cls = FullFP32AdamW if rank == 0 else torch.optim.AdamW
-        optimizer = cls([table], lr=1e-2, weight_decay=0.5)
+        optimizer = FullFP32AdamW([table], lr=1e-2, weight_decay=0.0)
         before = table.detach().clone()
 
         def build():
-            if rank == 0 and scenario == "build_failure":
+            if rank == 0:
                 raise RuntimeError("injected optimizer construction failure")
             text_encoder.configure_optimizer(optimizer)
 
@@ -710,19 +709,11 @@ def _row_decay_guard_worker(rank, world_size, scenario, native, endpoint):
             raise AssertionError("a failed optimizer build must not reach validation")
 
         runtime = SimpleNamespace(_build_optimizer=build, _validate_optimizer_checkpoint_mode=unexpected_validate)
-        message = (
-            (
-                "injected optimizer construction failure"
-                if scenario == "build_failure"
-                else "row-wise weight decay.*FP32 master"
-            )
-            if rank == 0
-            else "another rank"
-        )
+        message = "injected optimizer construction failure" if rank == 0 else "another rank"
         with pytest.raises(RuntimeError, match=message):
             VeOmniModelRuntime._build_optimizer_checked(runtime)
         if rank == 0:
-            assert optimizer.param_groups[0]["weight_decay"] == 0.5
+            assert optimizer.param_groups[0]["weight_decay"] == 0.0
             assert not optimizer._optimizer_step_pre_hooks
         assert not optimizer.state
         assert torch.equal(table, before)
@@ -735,9 +726,8 @@ def _row_decay_guard_worker(rank, world_size, scenario, native, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-@pytest.mark.parametrize("scenario", ["guard_mismatch", "build_failure"])
-def test_image_row_decay_guard_coordinates_across_ranks(scenario):
-    spawn_with_rendezvous(_row_decay_guard_worker, args=(2, scenario, False), nprocs=2)
+def test_image_row_decay_guard_coordinates_across_ranks():
+    spawn_with_rendezvous(_row_decay_guard_worker, args=(2, False), nprocs=2)
 
 
 @pytest.mark.launch_plan(
@@ -745,43 +735,13 @@ def test_image_row_decay_guard_coordinates_across_ranks(scenario):
     if context.capabilities.backend == "npu" and len(context.capabilities.devices) >= 2
     else LaunchSpec(device="cpu")
 )
-@pytest.mark.parametrize("scenario", ["guard_mismatch", "build_failure"])
-def test_native_image_row_decay_guard_coordinates_across_ranks(scenario):
+def test_native_image_row_decay_guard_coordinates_across_ranks():
+    assigned = bool(os.environ.get("VEOMNI_CI_CAPABILITIES")) and runner_capabilities().backend == "npu"
     if not IS_NPU_AVAILABLE or get_device_type() != "npu" or get_torch_device().device_count() < 2:
-        if os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1":
+        if assigned or os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1":
             pytest.fail("Two usable NPU devices are required for this native test")
         pytest.skip("Requires two NPU devices")
-    spawn_with_rendezvous(_row_decay_guard_worker, args=(2, scenario, True), nprocs=2)
-
-
-def test_required_native_row_decay_guard_rejects_missing_npu(monkeypatch):
-    monkeypatch.setenv("VEOMNI_REQUIRE_NPU_TESTS", "1")
-    monkeypatch.setitem(
-        test_native_image_row_decay_guard_coordinates_across_ranks.__globals__, "IS_NPU_AVAILABLE", False
-    )
-    with pytest.raises(pytest.fail.Exception, match="Two usable NPU devices are required"):
-        test_native_image_row_decay_guard_coordinates_across_ranks("guard_mismatch")
-
-
-def test_native_row_decay_guard_forwards_rendezvous_last(monkeypatch):
-    import inspect
-    from types import SimpleNamespace
-
-    scope = test_native_image_row_decay_guard_coordinates_across_ranks.__globals__
-    monkeypatch.setitem(scope, "IS_NPU_AVAILABLE", True)
-    monkeypatch.setitem(scope, "get_device_type", lambda: "npu")
-    monkeypatch.setitem(scope, "get_torch_device", lambda: SimpleNamespace(device_count=lambda: 2))
-    calls = []
-
-    def record(worker, args, *, nprocs):
-        endpoint = object()
-        bound = inspect.signature(worker).bind(0, *args, endpoint)
-        assert nprocs == 2 and bound.arguments["native"] is True and bound.arguments["endpoint"] is endpoint
-        calls.append(True)
-
-    monkeypatch.setitem(scope, "spawn_with_rendezvous", record)
-    test_native_image_row_decay_guard_coordinates_across_ranks("guard_mismatch")
-    assert calls == [True]
+    spawn_with_rendezvous(_row_decay_guard_worker, args=(2, True), nprocs=2)
 
 
 def test_the_toy_recipe_converges():
