@@ -23,10 +23,10 @@ guide. The integrated builders currently generate legacy-style tags; these
 product-style target names are for manual publication and are not generated
 by the workflows. See [workflow tag rules](overview.md#build-and-publication-workflows).
 
-| Target tag | Architectures | Triton / Triton-Ascend |
-| --- | --- | --- |
-| `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-910b-ubuntu22.04-py3.12-veomni` | A2: `linux/amd64`, `linux/arm64` | x86: 3.2.0 / 3.2.2; ARM: 3.5.0 / 3.2.2 |
-| `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-a3-ubuntu22.04-py3.12-veomni` | A3: `linux/arm64` | 3.5.0 / 3.2.2 |
+| Tag | Dockerfile | Content |
+|---|---|---|
+| `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-910b-ubuntu22.04-py3.12-veomni` | [Dockerfile] [a2.x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86) / [a2.arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.arm) | veomni / torch-npu / triton-ascend / fla_npu |
+| `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-a3-ubuntu22.04-py3.12-veomni` | [Dockerfile] [a3](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_a3) | veomni / torch-npu / triton-ascend / fla_npu |
 
 ## CANN 9.1.0
 
