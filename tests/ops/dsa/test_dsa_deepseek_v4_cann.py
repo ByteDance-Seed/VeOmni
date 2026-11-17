@@ -22,6 +22,7 @@ Sparse FlashMLA numerical parity is not; see the FIXME on
 from __future__ import annotations
 
 import importlib.util
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -70,9 +71,11 @@ def fake_ops(monkeypatch: pytest.MonkeyPatch) -> _FakeOps:
     monkeypatch.setattr(cann_indexer, "_ops", lambda: ops)
     cann_indexer._causal_plan.cache_clear()
     cann_indexer._packed_plan.cache_clear()
+    cann_indexer._CHECKED_CONTEXT_PARALLEL_RANGES.clear()
     yield ops
     cann_indexer._causal_plan.cache_clear()
     cann_indexer._packed_plan.cache_clear()
+    cann_indexer._CHECKED_CONTEXT_PARALLEL_RANGES.clear()
 
 
 def _bshd_inputs(batch: int, seq_len: int, compressed_len: int) -> tuple[Tensor, Tensor, Tensor]:
@@ -236,6 +239,205 @@ def test_empty_compressed_kv_returns_an_empty_selection(fake_ops: _FakeOps):
     assert fake_ops.indexer_calls == [] and fake_ops.metadata_calls == []
 
 
+def _causal_ranges(offset: int, seq_len: int) -> tuple[Tensor, Tensor]:
+    """The ranges the model builds for a context-parallel shard at ``offset``."""
+    starts = torch.zeros(seq_len, dtype=torch.int32)
+    ends = ((offset + torch.arange(seq_len) + 1) // _RATE).to(torch.int32)
+    return starts, ends
+
+
+def _install_context_parallel(monkeypatch: pytest.MonkeyPatch, cp_rank: int, cp_size: int) -> None:
+    state = SimpleNamespace(cp_enabled=True, ulysses_enabled=False, cp_rank=cp_rank, cp_size=cp_size)
+    monkeypatch.setattr(cann_indexer, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(cann_indexer, "get_parallel_state", lambda: state)
+
+
+@pytest.mark.parametrize(
+    ("cp_rank", "cp_size", "seq_len", "offset", "prefix_len", "residual", "global_slots"),
+    [
+        # 16 rows over cp_size=4: rank 1 owns rows [4, 8) and its last query sees
+        # two of the all-gathered table's four compressed rows.
+        (1, 4, 4, 4, 2, 0, 4),
+        # 10 rows over cp_size=2: rank 0 owns rows [0, 5), narrows hardest, and the
+        # non-zero remainder keeps the kernel's column alignment.
+        (0, 2, 5, 0, 1, 1, 2),
+    ],
+    ids=["middle_rank", "first_rank"],
+)
+def test_context_parallel_narrows_the_table_and_numbers_rows_globally(
+    fake_ops: _FakeOps,
+    monkeypatch: pytest.MonkeyPatch,
+    cp_rank: int,
+    cp_size: int,
+    seq_len: int,
+    offset: int,
+    prefix_len: int,
+    residual: int,
+    global_slots: int,
+):
+    _install_context_parallel(monkeypatch, cp_rank, cp_size)
+    q, k, weights = _bshd_inputs(batch=1, seq_len=seq_len, compressed_len=global_slots)
+    starts, ends = _causal_ranges(offset, seq_len)
+
+    scores, indices = cann_indexer.wrapper(
+        q.transpose(0, 1),
+        k.transpose(0, 1),
+        weights.transpose(0, 1),
+        _RATE,
+        4,
+        cu_seqlen_ks=starts,
+        cu_seqlen_ke=ends,
+    )
+
+    (cann_q, cann_k, _), kwargs = fake_ops.indexer_calls[0]
+    assert cann_q.shape == (1, seq_len, _HEADS, _DIM)
+    # The table is cut to the prefix the shard's last query can see; the kernel
+    # reconstructs ``kv_len = offset + seq_len`` from it and the remainder.
+    assert cann_k.shape == (1, prefix_len, 1, _DIM)
+    torch.testing.assert_close(cann_k[0, :, 0], k[0, :prefix_len])
+    assert kwargs["cmp_residual_k"].tolist() == [residual]
+    assert (kwargs["layout_q"], kwargs["layout_k"], kwargs["top_k"]) == ("BSND", "BSND", prefix_len)
+    (metadata,) = fake_ops.metadata_calls
+    assert (metadata["max_seqlen_q"], metadata["max_seqlen_k"]) == (seq_len, prefix_len)
+    # The kernel's selection addresses the narrowed prefix, which starts at the
+    # global slot 0, so nothing is rebased here. The contract width is still
+    # min(topk, global compressed length), padded with -1 past the prefix.
+    assert indices.shape == scores.shape == (1, seq_len, min(4, global_slots))
+
+
+def test_context_parallel_rejects_ranges_from_another_shard(fake_ops: _FakeOps, monkeypatch: pytest.MonkeyPatch):
+    _install_context_parallel(monkeypatch, cp_rank=2, cp_size=4)
+    q, k, weights = _bshd_inputs(batch=1, seq_len=4, compressed_len=4)
+    # Ranges an offset-0 shard would produce: the kernel would mask from the wrong
+    # origin, so the adapter refuses instead of running.
+    starts, ends = _causal_ranges(0, 4)
+
+    with pytest.raises(ValueError, match="global row"):
+        cann_indexer.wrapper(
+            q.transpose(0, 1),
+            k.transpose(0, 1),
+            weights.transpose(0, 1),
+            _RATE,
+            4,
+            cu_seqlen_ks=starts,
+            cu_seqlen_ke=ends,
+        )
+    assert fake_ops.indexer_calls == []
+
+
+def test_ulysses_explicit_ranges_stay_unsupported(fake_ops: _FakeOps, monkeypatch: pytest.MonkeyPatch):
+    # Ulysses also passes global ranges without slices, but it partitions the
+    # full-sequence queries instead of handing over contiguous ``cp_rank * L``
+    # shards, so the CP narrowing would number its rows from the wrong origin.
+    state = SimpleNamespace(cp_enabled=False, ulysses_enabled=True, cp_rank=0, cp_size=1)
+    monkeypatch.setattr(cann_indexer, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(cann_indexer, "get_parallel_state", lambda: state)
+    q, k, weights = _bshd_inputs(batch=1, seq_len=8, compressed_len=2)
+    ranges, _ = _causal_ranges(0, 8)
+
+    with pytest.raises(ValueError, match="without slices"):
+        cann_indexer.wrapper(
+            q.transpose(0, 1),
+            k.transpose(0, 1),
+            weights.transpose(0, 1),
+            _RATE,
+            2,
+            cu_seqlen_ks=ranges,
+            cu_seqlen_ke=ranges,
+        )
+
+
+@pytest.mark.parametrize(
+    ("cp_rank", "avail", "residual", "compressed_start", "top_k", "rebased"),
+    [
+        # Rank 0 runs the whole first sample (2 compressed rows, remainder 1);
+        # its 3-row head of the middle sample owns no complete window yet.
+        (0, 2, 1, 0, 2, [0, -1, -1, -1]),
+        # Rank 1's first 9 rows are the truncated tail of the middle sample: all
+        # 3 of its compressed rows with no remainder number the shard's first
+        # query at its global row 12 within the sample, and the indices rebase
+        # by the sample's compressed start (packed table row 2).
+        (1, 3, 0, 2, 3, [2, 3, -1, -1]),
+    ],
+    ids=["first_rank", "last_rank"],
+)
+def test_packed_context_parallel_calls_each_intersected_sample(
+    fake_ops: _FakeOps,
+    monkeypatch: pytest.MonkeyPatch,
+    cp_rank: int,
+    avail: int,
+    residual: int,
+    compressed_start: int,
+    top_k: int,
+    rebased: list[int],
+):
+    # A global packed sequence of 24 rows over cp_size=2. The middle sample
+    # spans the shard boundary and the 3-row third sample (21, 24) has no
+    # compressed row of its own, so each rank runs one narrowed BSND call for
+    # the intersecting sample that owns compressed rows and leaves the sample
+    # without one -1 / -inf, exactly as the eager row would.
+    _install_context_parallel(monkeypatch, cp_rank, cp_size=2)
+    slices = ((0, 9), (9, 21), (21, 24))
+    position_ids = torch.cat([torch.arange(9), torch.arange(12), torch.arange(3)]).unsqueeze(0)
+    range_starts, range_ends = _packed_ranges(slices, position_ids)
+    q, k, weights = _bshd_inputs(batch=1, seq_len=12, compressed_len=5)
+
+    scores, indices = cann_indexer.wrapper(
+        q.transpose(0, 1),
+        k.transpose(0, 1),
+        weights.transpose(0, 1),
+        _RATE,
+        4,
+        cu_seqlen_ks=range_starts[cp_rank * 12 : cp_rank * 12 + 12],
+        cu_seqlen_ke=range_ends[cp_rank * 12 : cp_rank * 12 + 12],
+        packed_sequence_slices=slices,
+    )
+
+    assert len(fake_ops.indexer_calls) == 1
+    (cann_q, cann_k, cann_weights), kwargs = fake_ops.indexer_calls[0]
+    assert cann_q.shape == (1, 9, _HEADS, _DIM)
+    assert cann_weights.shape == (1, 9, _HEADS)
+    # The sample's compressed buffer starts at the sample's first compressed row
+    # and is narrowed to the prefix the shard's last query in it can see, with
+    # the remainder of that prefix keeping the kernel's column alignment.
+    assert cann_k.shape == (1, avail, 1, _DIM)
+    torch.testing.assert_close(cann_k[0, :, 0], k[0, compressed_start : compressed_start + avail])
+    assert kwargs["cmp_residual_k"].tolist() == [residual]
+    assert (kwargs["layout_q"], kwargs["layout_k"], kwargs["top_k"]) == ("BSND", "BSND", top_k)
+    assert kwargs["mask_mode"] == cann_indexer._SEGMENT_CAUSAL_MASK_MODE
+    # The first 9 rows select the sample's compressed rows rebased into the
+    # packed table; the remaining 3 rows own no complete window and stay -1.
+    assert indices.shape == scores.shape == (1, 12, 4)
+    assert indices[0, :9].equal(torch.tensor([rebased] * 9, dtype=torch.int32))
+    assert indices[0, 9:].equal(torch.full((3, 4), -1, dtype=torch.int32))
+    assert torch.isinf(scores[0, 9:]).all()
+
+
+def test_packed_context_parallel_rejects_ranges_from_another_shard(
+    fake_ops: _FakeOps, monkeypatch: pytest.MonkeyPatch
+):
+    _install_context_parallel(monkeypatch, cp_rank=1, cp_size=2)
+    slices = ((0, 9), (9, 24))
+    position_ids = torch.cat([torch.arange(9), torch.arange(15)]).unsqueeze(0)
+    range_starts, range_ends = _packed_ranges(slices, position_ids)
+    q, k, weights = _bshd_inputs(batch=1, seq_len=12, compressed_len=5)
+
+    # Ranges an offset-0 shard would produce: the kernel would mask from the
+    # wrong origin, so the adapter refuses instead of running.
+    with pytest.raises(ValueError, match="global ranges"):
+        cann_indexer.wrapper(
+            q.transpose(0, 1),
+            k.transpose(0, 1),
+            weights.transpose(0, 1),
+            _RATE,
+            4,
+            cu_seqlen_ks=range_starts[:12],
+            cu_seqlen_ke=range_ends[:12],
+            packed_sequence_slices=slices,
+        )
+    assert fake_ops.indexer_calls == []
+
+
 def _assert_same_selection(actual: tuple[Tensor, Tensor], expected: tuple[Tensor, Tensor]) -> None:
     """Compare per-row selections independent of the order each backend lists them in."""
     actual_scores, actual_indices = (tensor.cpu() for tensor in actual)
@@ -272,6 +474,44 @@ def test_cann_matches_eager(segment_lengths: tuple[int, ...]):
         metadata = build_packed_compression_metadata(q, position_ids, slices, (_RATE,))
         range_starts, range_ends = packed_compressed_causal_ranges(metadata[_RATE])
         kwargs = {"cu_seqlen_ks": range_starts, "cu_seqlen_ke": range_ends, "packed_sequence_slices": slices}
+    operands = (q.transpose(0, 1), k.transpose(0, 1), weights.transpose(0, 1), _RATE, topk)
+
+    expected = resolve_op("dsa_indexer", "deepseek_v4", "eager").wrapper(*operands, **kwargs)
+    actual = resolve_op("dsa_indexer", "deepseek_v4", "cann").wrapper(*operands, **kwargs)
+
+    _assert_same_selection(actual, expected)
+
+
+@pytest.mark.skipif(
+    not IS_NPU_AVAILABLE or importlib.util.find_spec("cann_ops_transformer") is None,
+    reason="CANN Lightning Indexer requires Ascend NPU and cann_ops_transformer",
+)
+@pytest.mark.parametrize("cp_rank", [0, 1], ids=["first_rank", "last_rank"])
+def test_cann_matches_eager_packed_context_parallel(cp_rank: int, monkeypatch: pytest.MonkeyPatch):
+    # A packed CP shard: one sample spans the shard boundary, so the per-sample
+    # calls must reproduce the truncated tail (rank 1) or the truncated head
+    # (rank 0) against the same replicated packed table and global ranges eager
+    # sees.
+    torch.manual_seed(3)
+    _install_context_parallel(monkeypatch, cp_rank, cp_size=2)
+    device = get_device_type()
+    heads, dim, topk = 32, 128, 8
+    segment_lengths = (37, 64, 27)
+    seq_len = sum(segment_lengths) // 2
+    compressed_len = sum(length // _RATE for length in segment_lengths)
+    bounds = torch.tensor((0, *segment_lengths)).cumsum(0).tolist()
+    slices = tuple(zip(bounds[:-1], bounds[1:]))
+    position_ids = torch.cat([torch.arange(length) for length in segment_lengths]).unsqueeze(0).to(device)
+    metadata = build_packed_compression_metadata(torch.empty((), device=device), position_ids, slices, (_RATE,))
+    range_starts, range_ends = packed_compressed_causal_ranges(metadata[_RATE])
+    q = torch.randn(1, seq_len, heads, dim, device=device).to(torch.bfloat16)
+    k = torch.randn(1, compressed_len, dim, device=device).to(torch.bfloat16)
+    weights = torch.randn(1, seq_len, heads, device=device) * dim**-0.5
+    kwargs = {
+        "cu_seqlen_ks": range_starts[cp_rank * seq_len : cp_rank * seq_len + seq_len],
+        "cu_seqlen_ke": range_ends[cp_rank * seq_len : cp_rank * seq_len + seq_len],
+        "packed_sequence_slices": slices,
+    }
     operands = (q.transpose(0, 1), k.transpose(0, 1), weights.transpose(0, 1), _RATE, topk)
 
     expected = resolve_op("dsa_indexer", "deepseek_v4", "eager").wrapper(*operands, **kwargs)
@@ -411,7 +651,7 @@ def test_attention_without_compressed_rows_runs_eager(flash_mla: _FlashMlaRecord
         ({"dropout": 0.1}, "dropout=0"),
         ({"return_attn_weights": True}, "output_attentions"),
         ({"return_lse": True}, "LSE"),
-        ({"query_offset": 4}, "one KV row per query row"),
+        ({"query_offset": 4}, "end inside the KV buffer"),
     ],
 )
 def test_attention_rejects_what_the_kernel_cannot_express(flash_mla: _FlashMlaRecorder, overrides, match: str):
@@ -449,6 +689,113 @@ def test_attention_ignores_the_mask_and_leaves_kernel_limits_to_the_kernel(flash
     ((cann_q, _, _, _), kwargs) = flash_mla.calls[0]
     assert cann_q.dtype == torch.float32
     assert (kwargs["ori_win_left"], kwargs["cmp_ratio"]) == (63, 8)
+
+
+@pytest.mark.parametrize(
+    ("query_offset", "cmp_rows", "residual"), [(0, 1, 2), (6, 3, 0)], ids=["first_rank", "last_rank"]
+)
+def test_attention_context_parallel_narrows_to_the_query_tail(
+    flash_mla: _FlashMlaRecorder, query_offset: int, cmp_rows: int, residual: int
+):
+    # cp_size=2 over 12 rows: rank 0 owns rows [0, 6), rank 1 owns [6, 12), and both
+    # receive the all-gathered 12-row KV. The kernel assumes the queries end at the
+    # last KV row, so the adapter narrows the buffer to the local prefix.
+    q = torch.randn(1, 6, _ATTN_HEADS, _ATTN_DIM).to(torch.bfloat16)
+    ori_kv = torch.randn(1, 12, _ATTN_DIM).to(torch.bfloat16)
+    cmp_kv = torch.randn(1, 3, _ATTN_DIM).to(torch.bfloat16)
+    sink = torch.randn(_ATTN_HEADS).to(torch.bfloat16)
+    topk = torch.zeros(1, 6, 1, dtype=torch.int32)
+
+    cann_attention.wrapper(
+        q,
+        ori_kv,
+        cmp_kv,
+        sink,
+        torch.arange(query_offset, query_offset + 6).unsqueeze(0),
+        sliding_window=_WINDOW,
+        compress_ratio=_RATE,
+        candidates=CompressedCandidates(topk_indices=topk),
+        query_offset=query_offset,
+    )
+
+    ((cann_q, cann_ori_kv, cann_cmp_kv, _), kwargs) = flash_mla.calls[0]
+    assert cann_q.data_ptr() == q.data_ptr()
+    # The narrowing is a view, so the prefix still points at the gathered buffer.
+    assert cann_ori_kv.data_ptr() == ori_kv.data_ptr()
+    assert cann_ori_kv.shape == (1, query_offset + 6, 1, _ATTN_DIM)
+    assert cann_cmp_kv.shape == (1, cmp_rows, 1, _ATTN_DIM)
+    # The compressed table is aligned to the KV prefix, not to the local query count.
+    assert kwargs["cmp_residual_kv"].tolist() == [residual]
+
+
+def test_attention_packed_context_parallel_calls_each_intersected_sample(flash_mla: _FlashMlaRecorder):
+    # Global packed sequence of 24 rows over cp_size=2, so this rank owns rows [0, 12).
+    # The second sample starts inside the shard, and every local query still needs the
+    # rows its own sample contributes before it.
+    slices = ((0, 6), (6, 18), (18, 24))
+    q = torch.randn(1, 12, _ATTN_HEADS, _ATTN_DIM).to(torch.bfloat16)
+    ori_kv = torch.randn(1, 24, _ATTN_DIM).to(torch.bfloat16)
+    cmp_kv = torch.randn(1, 5, _ATTN_DIM).to(torch.bfloat16)
+    sink = torch.randn(_ATTN_HEADS).to(torch.bfloat16)
+    topk = torch.full((1, 12, 1), -1, dtype=torch.int32)
+    topk[0, :6, 0] = 0  # first sample owns compressed row 0
+    topk[0, 6:, 0] = 1  # second sample owns rows [1, 4)
+
+    cann_attention.wrapper(
+        q,
+        ori_kv,
+        cmp_kv,
+        sink,
+        _segment_positions((6, 6)),
+        sliding_window=_WINDOW,
+        compress_ratio=_RATE,
+        candidates=CompressedCandidates(topk_indices=topk),
+        packed_sequence_slices=slices,
+        query_offset=0,
+    )
+
+    assert len(flash_mla.calls) == 2
+    ((first_q, first_ori, first_cmp, first_idx), first_kwargs) = flash_mla.calls[0]
+    assert first_q.data_ptr() == q.data_ptr() and first_q.shape[1] == 6
+    assert first_ori.shape == (1, 6, 1, _ATTN_DIM) and first_cmp.shape == (1, 1, 1, _ATTN_DIM)
+    assert first_idx[0, :, 0].tolist() == [0] * 6
+    # Each sample is its own single-segment call, so no TND slices reach the kernel.
+    assert "packed_sequence_slices" not in first_kwargs
+
+    # The second sample's buffer starts at global row 6, not at the shard start.
+    ((second_q, second_ori, second_cmp, second_idx), _) = flash_mla.calls[1]
+    assert second_q.shape[1] == 6 and second_ori.shape == (1, 6, 1, _ATTN_DIM)
+    assert second_cmp.shape == (1, 1, 1, _ATTN_DIM)
+    # Its rows start at compressed row 1, so the selection is rebased by that start.
+    assert second_idx[0, :, 0].tolist() == [0] * 6
+
+
+def test_attention_packed_context_parallel_leaves_short_samples_to_eager(flash_mla: _FlashMlaRecorder):
+    # A padding tail is encoded as 1-token slices; no compressed row is visible there,
+    # so those rows run the eager path while the rest of the shard keeps the kernel.
+    slices = ((0, 6), (6, 7), (7, 8))
+    q = torch.randn(1, 4, _ATTN_HEADS, _ATTN_DIM)
+    ori_kv = torch.randn(1, 8, _ATTN_DIM)
+    cmp_kv = torch.randn(1, 1, _ATTN_DIM)
+    sink = torch.randn(_ATTN_HEADS)
+
+    out = cann_attention.wrapper(
+        q,
+        ori_kv,
+        cmp_kv,
+        sink,
+        torch.arange(4, 8).unsqueeze(0),
+        sliding_window=_WINDOW,
+        compress_ratio=_RATE,
+        packed_sequence_slices=slices,
+        query_offset=4,
+    )
+
+    assert out.shape == q.shape
+    assert len(flash_mla.calls) == 1
+    ((cann_q, cann_ori, cann_cmp, _), _) = flash_mla.calls[0]
+    assert cann_q.shape[1] == 2 and cann_ori.shape == (1, 6, 1, _ATTN_DIM)
+    assert cann_cmp.shape == (1, 1, 1, _ATTN_DIM)
 
 
 # FIXME: compare ``sparse_flash_mla`` / ``sparse_flash_mla_grad`` with eager on Ascend.

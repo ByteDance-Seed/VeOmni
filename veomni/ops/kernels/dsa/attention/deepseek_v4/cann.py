@@ -26,6 +26,14 @@ restart at 0 in every packed segment and equal the row index otherwise. The
 ``cann`` indexer checks this on CSA layers. Packed (TND) selections address
 each segment's own compressed rows while the contract addresses the packed
 buffer, so this adapter undoes the indexer's rebase.
+
+Context parallelism hands over the replicated KV buffer plus the row where the
+local query shard starts. Because the kernel has no offset input and counts
+causality from the KV end, this adapter narrows the buffer to the prefix
+``[0, query_offset + q_len)`` before calling it, so the local queries end at the
+last row on every rank. That is the same layout MindSpeed-LLM calls prefix KV.
+Packed slices stay global, so every sample that intersects the shard becomes its
+own single-segment call starting at that sample's first row.
 """
 
 from __future__ import annotations
@@ -45,6 +53,32 @@ _ORI_SLIDING_CAUSAL_MASK_MODE = 4
 _CMP_SEGMENT_CAUSAL_MASK_MODE = 3
 
 
+# TEMPORARY: one-shot layout dump for the packed CP call; remove after diagnosis.
+_DEBUG_LAYOUT_LOGGED: list[bool] = []
+
+
+def _standard_layout(x: Tensor) -> Tensor:
+    """Return ``x`` with row-major strides and a zero storage offset.
+
+    ``contiguous()`` is a no-op on a packed sample slice or a narrowed prefix: the
+    batch is one and the KV head axis is one, and torch ignores the strides of
+    size-1 dimensions, so the view keeps the parent buffer's leading stride and
+    its storage offset. The aclnn argument check compares strides numerically and
+    rejects that view, so it has to be materialized.
+    """
+    stride = 1
+    for size, actual in zip(reversed(x.shape), reversed(x.stride())):
+        if actual != stride:
+            break
+        stride *= size
+    else:
+        if x.storage_offset() == 0:
+            return x
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    out.copy_(x)
+    return out
+
+
 @lru_cache(maxsize=8)
 def _segment_compressed_starts(
     slices: tuple[tuple[int, int], ...], compress_ratio: int, device: torch.device
@@ -58,6 +92,98 @@ def _segment_compressed_starts(
         output_size=slices[-1][1],
     )
     return rows.to(device).view(1, -1, 1)
+
+
+def _packed_context_parallel_call(
+    q: Tensor,
+    ori_kv: Tensor,
+    cmp_kv: Tensor,
+    attn_sink: Tensor,
+    topk_indices: Tensor | None,
+    slices: tuple[tuple[int, int], ...],
+    query_offset: int,
+    *,
+    sliding_window: int,
+    compress_ratio: int,
+    sm_scale: float | None,
+) -> Tensor:
+    """Run one single-segment call per packed sample that intersects this shard.
+
+    The packed TND path segments queries and KV alike, so it cannot express the
+    prefix rows a local query still needs. Each sample instead becomes its own
+    call whose buffer starts at that sample's first row, which is the origin the
+    kernel's mask modes count from, so causality and the sliding window stay
+    unchanged. Slices are global and this shard covers ``[query_offset, +q_len)``,
+    so a sample boundary may fall inside it; the boundary sample is truncated at
+    the shard, exactly as the prefix narrowing does for an unpacked sequence.
+    """
+    compressed_starts: list[int] = []
+    compressed_rows = 0
+    for start, end in slices:
+        compressed_starts.append(compressed_rows)
+        compressed_rows += (end - start) // compress_ratio
+
+    outputs = []
+    for (start, end), compressed_start in zip(slices, compressed_starts):
+        first = max(start, query_offset)
+        last = min(end, query_offset + q.shape[1])
+        if first >= last:
+            continue
+        rows = slice(first - query_offset, last - query_offset)
+        available = (last - start) // compress_ratio
+        segment_topk = None if topk_indices is None else topk_indices[:, rows]
+        if segment_topk is not None:
+            segment_topk = torch.where(segment_topk >= 0, segment_topk - compressed_start, -1)
+        if available == 0:
+            # No compressed row is causally visible in this sample (a padding tail,
+            # or a sample narrower than the rate): the sliding window is the whole
+            # result, which the eager row already implements.
+            positions = torch.arange(first - start, last - start, device=q.device)
+            outputs.append(
+                eager.wrapper(
+                    q[:, rows],
+                    ori_kv[:, start:last],
+                    None,
+                    attn_sink,
+                    positions.unsqueeze(0).expand(q.shape[0], -1),
+                    sliding_window=sliding_window,
+                    compress_ratio=compress_ratio,
+                    sm_scale=sm_scale,
+                )
+            )
+            continue
+        seg_q = _standard_layout(q[:, rows])
+        seg_kv = _standard_layout(ori_kv[:, start:last].unsqueeze(2))
+        seg_cmp = _standard_layout(cmp_kv[:, compressed_start : compressed_start + available].unsqueeze(2))
+        if not _DEBUG_LAYOUT_LOGGED:
+            _DEBUG_LAYOUT_LOGGED.append(True)
+            print(
+                f"[cp-debug] dev={q.device} q={tuple(seg_q.shape)} {seg_q.stride()}"
+                f" off={seg_q.storage_offset()}"
+                f" | ori_kv={tuple(seg_kv.shape)} {seg_kv.stride()} off={seg_kv.storage_offset()}"
+                f" | cmp_kv={tuple(seg_cmp.shape)} {seg_cmp.stride()} off={seg_cmp.storage_offset()}"
+                f" | slice=({start},{last}) q_off={query_offset} samples={len(slices)}",
+                flush=True,
+            )
+        outputs.append(
+            npu_sparse_flash_mla(
+                seg_q,
+                seg_kv,
+                seg_cmp,
+                segment_topk,
+                softmax_scale=sm_scale,
+                cmp_ratio=compress_ratio,
+                cmp_residual_kv=torch.full(
+                    (q.shape[0],), (last - start) % compress_ratio, dtype=torch.int32, device=q.device
+                ),
+                ori_mask_mode=_ORI_SLIDING_CAUSAL_MASK_MODE,
+                cmp_mask_mode=_CMP_SEGMENT_CAUSAL_MASK_MODE,
+                ori_win_left=sliding_window - 1,
+                ori_win_right=0,
+                sinks=attn_sink.to(dtype=torch.float32),
+            )
+        )
+    return torch.cat(outputs, dim=1)
 
 
 def wrapper(
@@ -82,10 +208,13 @@ def wrapper(
 
     Layers without compressed rows run the eager row. ``attention_mask`` is
     not read, because the mask modes already carry causality and packed
-    isolation, so padded batches are unsupported. The kernel needs one row per
-    query (no KV cache or context-parallel offset) and validates its own
-    dtype, window, ratio and head-size limits. Packed calls take the TND path,
-    which needs batch size 1 and reads the slice boundaries on the host.
+    isolation, so padded batches are unsupported. The kernel needs the query
+    rows to end at the last KV row: a non-zero ``query_offset`` (context
+    parallelism) is served by narrowing ``ori_kv`` to that prefix, and packed
+    slices then need one call per sample because the TND path segments queries
+    and KV alike. It validates its own dtype, window, ratio and head-size
+    limits. Packed calls without CP take the TND path, which needs batch size 1
+    and reads the slice boundaries on the host.
     """
     if cmp_kv is None or cmp_kv.shape[1] == 0:
         return eager.wrapper(
@@ -117,27 +246,57 @@ def wrapper(
             "cann DeepSeek-V4 sparse attention does not return the softmax LSE the indexer loss needs; "
             "use the eager or tilelang implementation."
         )
-    if query_offset != 0 or ori_kv.shape[1] != q.shape[1]:
-        raise ValueError(
-            "cann DeepSeek-V4 sparse attention requires one KV row per query row; "
-            f"got {q.shape[1]} queries over {ori_kv.shape[1]} rows at query_offset={query_offset}."
-        )
-
     slices = None
     if packed_sequence_slices is not None:
         slices = tuple((int(start), int(end)) for start, end in packed_sequence_slices)
     topk_indices = None if candidates is None else candidates.topk_indices
+
+    # The kernel derives each query's row from ``kv_len - q_len`` and encodes causality
+    # as a mask mode, so it cannot express "this shard starts at row ``query_offset``":
+    # it assumes the queries end at the last KV row. CP keeps the reproduced buffer
+    # global and passes the shard's start, so narrowing to the prefix
+    # ``[0, query_offset + q_len)`` restores the assumption on every rank. Causal
+    # attention never reads past the last local query, so the result is unchanged; the
+    # slice is a view, and only that prefix is copied by the ``contiguous`` below.
+    kv_len = query_offset + q.shape[1]
+    if query_offset < 0 or ori_kv.shape[1] < kv_len:
+        raise ValueError(
+            "cann DeepSeek-V4 sparse attention needs the local queries to end inside the KV buffer: "
+            f"got {q.shape[1]} queries at query_offset={query_offset} over {ori_kv.shape[1]} rows."
+        )
+    # Packed slices describe the global buffer while a CP rank owns a window of it, so
+    # they end past the local queries even on the rank whose window starts at row 0.
+    if slices is not None and len(slices) > 1 and (query_offset != 0 or slices[-1][1] != q.shape[1]):
+        return _packed_context_parallel_call(
+            q,
+            ori_kv,
+            cmp_kv,
+            attn_sink,
+            topk_indices,
+            slices,
+            query_offset,
+            sliding_window=sliding_window,
+            compress_ratio=compress_ratio,
+            sm_scale=sm_scale,
+        )
+    if ori_kv.shape[1] != kv_len:
+        ori_kv = ori_kv[:, :kv_len]
+        cmp_kv = cmp_kv[:, : kv_len // compress_ratio]
+
     if topk_indices is not None and slices is not None and len(slices) > 1:
         segment_starts = _segment_compressed_starts(slices, compress_ratio, q.device)
         topk_indices = torch.where(topk_indices >= 0, topk_indices - segment_starts, -1)
 
     return npu_sparse_flash_mla(
-        q.contiguous(),
-        ori_kv.unsqueeze(2).contiguous(),
-        cmp_kv.unsqueeze(2).contiguous(),
+        _standard_layout(q),
+        _standard_layout(ori_kv.unsqueeze(2)),
+        _standard_layout(cmp_kv.unsqueeze(2)),
         topk_indices,
         softmax_scale=sm_scale,
         cmp_ratio=compress_ratio,
+        # The vendor wrapper would derive the residual from ``q_len``, but the
+        # compressed table is aligned to the narrowed KV prefix.
+        cmp_residual_kv=torch.full((q.shape[0],), kv_len % compress_ratio, dtype=torch.int32, device=q.device),
         ori_mask_mode=_ORI_SLIDING_CAUSAL_MASK_MODE,
         cmp_mask_mode=_CMP_SEGMENT_CAUSAL_MASK_MODE,
         ori_win_left=sliding_window - 1,
