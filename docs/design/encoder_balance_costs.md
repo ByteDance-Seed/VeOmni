@@ -26,9 +26,10 @@ the same column count, dtype, and device. This does not by itself make a legacy
 exchange caller empty-rank-safe; that caller must support empty payloads too.
 
 The existing distributed reverse test defaults to the four ranks declared by
-its CI launch plan. Set `VEOMNI_BALANCE_WORLD_SIZE` when invoking pytest to use
-a different number of ranks; the worker derives its DP topology from the
-torchrun world size.
+its CI launch plan. Set `VEOMNI_BALANCE_WORLD_SIZE` (at least two) when invoking
+pytest to use a different number of ranks; the launch plan and the torchrun
+command both use it, and the worker derives its DP topology from the torchrun
+world size.
 
 This is the independent shared-cost step of
 [#1074](https://github.com/ByteDance-Seed/VeOmni/issues/1074), following the

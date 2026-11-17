@@ -133,8 +133,8 @@ the primitives are in `veomni/distributed/sequence_parallel/data.py`.
 Token-wise SP slicing balances work within one SP group. Qwen3-VL additionally
 balances whole items across the module-local DP group before SP slicing and
 restores outputs after SP gather. `DataBalanceMixin` declares the item fields,
-costs and inverse output splits; full original token lengths remain the
-metering input. The legacy `Qwen3VLEncoderDataBalance` entry points use the same
+costs and inverse output splits. The vision meter records merged tokens for
+real items on their original owners. The legacy `Qwen3VLEncoderDataBalance` entry points use the same
 `ModuleDataBalancer` transport while retaining separate image/video slots and
 merged/deepstack output restoration. See
 [declarative encoder data balance](../module_data_balance.md) for the validated

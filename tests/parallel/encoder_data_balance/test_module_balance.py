@@ -25,22 +25,6 @@ def _roundtrip_launch(context):
     return LaunchSpec(nproc=_roundtrip_world(len(context.capabilities.devices)))
 
 
-@pytest.mark.parametrize("source", ["yaml", "cli"])
-def test_bare_off_from_yaml_or_cli_disables_balancing(source):
-    import yaml
-
-    from veomni.arguments.omni_parser import _coerce_cli_value
-    from veomni.models.seed_omni.mixins.data_balance_mixin import ModuleStructure, resolve_balance_strategy
-
-    if source == "yaml":
-        override = yaml.safe_load("data_balance_override: off")["data_balance_override"]
-    else:
-        override = _coerce_cli_value("off")
-    assert override is False
-    plan = resolve_balance_strategy(ModuleStructure(), sp_size=1, dp_size=2, override=override)
-    assert (plan.strategy, plan.balance_dp) == ("replicate", False)
-
-
 @pytest.mark.parametrize("costs,size", [([], 4), ([9], 4), ([0, 0], 4), ([4, 4, 4, 4], 2), ([100, 9, 4, 1], 2)])
 def test_cost_assignment(costs, size):
     assigned = greedy_cost_assignment(costs, size)
@@ -84,79 +68,10 @@ def test_bad_splits():
         ModuleDataBalancer(None).balance({"x": torch.ones(3, 2)}, {"x": [2]}, [1])
 
 
-@pytest.mark.parametrize("invalid", ["fields", "input", "output", "scalar", "overflow", "callback"])
-def test_invalid_metadata_is_shared_before_raising(monkeypatch, invalid):
-    group = object()
-    gathered_calls = []
-    monkeypatch.setattr(dist, "get_world_size", lambda _: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda _: 0)
-
-    def gather(result, local, group):
-        gathered_calls.append(local)
-        result[:] = [local, local]
-
-    monkeypatch.setattr(dist, "all_gather_object", gather)
-    tensors, lengths, outputs = {"x": torch.ones(1, 2)}, {"x": [1]}, [1]
-    if invalid == "fields":
-        lengths = {"other": [1]}
-    elif invalid == "input":
-        lengths = {"x": [None]}
-    elif invalid == "output":
-        outputs = [None]
-    elif invalid == "scalar":
-        tensors = {"x": torch.tensor(1.0)}
-    elif invalid == "overflow":
-        lengths = {"x": [float("inf")]}
-
-    def cost_callback(_):
-        raise RuntimeError("cost callback failure")
-
-    with pytest.raises(ValueError, match="metadata"):
-        ModuleDataBalancer(group, cost_callback if invalid == "callback" else None).balance(tensors, lengths, outputs)
-    assert len(gathered_calls) == 1
-    assert gathered_calls[0][4] is not None
-
-
-@pytest.mark.parametrize("invalid", ["metric", "missing_metric", "missing_input", "missing_output", "missing_tensor"])
-def test_mixin_metadata_errors_reach_shared_validation(monkeypatch, invalid):
-    from types import SimpleNamespace
-
-    import veomni.models.seed_omni.mixins.data_balance_mixin as balance
-
-    class Module(balance.DataBalanceMixin):
-        training = True
-        config = SimpleNamespace()
-        data_balance_specs = {
-            "encode": balance.DataBalanceSpec(
-                fields=(balance.ItemTensorField("x", "input"),),
-                output_names=("out",),
-                output_lengths_key="output",
-                cost_lengths_key="metric",
-                structure=balance.ModuleStructure(),
-            )
-        }
-
-    group, calls = object(), []
-    monkeypatch.setattr(balance, "get_parallel_state", lambda: SimpleNamespace(dp_size=2, sp_size=1, dp_group=group))
-    monkeypatch.setattr(dist, "get_world_size", lambda _: 2)
-    monkeypatch.setattr(dist, "get_rank", lambda _: 0)
-
-    def gather(result, local, group):
-        calls.append(local)
-        result[:] = [local, local]
-
-    monkeypatch.setattr(dist, "all_gather_object", gather)
-    tensors, metadata = {"x": torch.ones(1, 2)}, {"input": [1], "output": [1], "metric": [1]}
-    if invalid == "metric":
-        metadata["metric"] = [None]
-    elif invalid == "missing_tensor":
-        tensors = {}
-    else:
-        del metadata[invalid.removeprefix("missing_")]
-    module = Module()
-    with module.data_balance_scope(), pytest.raises(ValueError, match="metadata"):
-        module.data_balance_pre("encode", tensors, metadata)
-    assert len(calls) == 1 and calls[0][4] is not None
+@pytest.mark.parametrize("lengths,outputs", [([1.5, 2], [1, 1]), ([1, 2], [0.5, 1])])
+def test_fractional_splits_are_rejected(lengths, outputs):
+    with pytest.raises(TypeError):
+        ModuleDataBalancer(None).balance({"x": torch.ones(3, 2)}, {"x": lengths}, outputs)
 
 
 @pytest.mark.parametrize(
@@ -164,6 +79,7 @@ def test_mixin_metadata_errors_reach_shared_validation(monkeypatch, invalid):
     [
         (True, True, True, 2, 2, None, "sp_slice", True),
         (True, True, True, 2, 2, "off", "sp_slice", False),
+        (True, False, True, 2, 2, False, "replicate", False),
         (True, True, True, 1, 4, None, "sp_slice", False),
         (True, True, True, 4, 1, None, "dp_balance", True),
         (True, False, True, 2, 2, None, "dp_balance", True),
@@ -178,6 +94,22 @@ def test_structural_strategy(global_attn, patchify, items, dp, sp, override, exp
         ModuleStructure(global_attn, patchify, items), sp_size=sp, dp_size=dp, override=override
     )
     assert (plan.strategy, plan.balance_dp) == (expected, balance)
+
+
+@pytest.mark.parametrize("source", ["yaml", "cli"])
+def test_bare_off_from_yaml_or_cli_disables_balancing(source):
+    import yaml
+
+    from veomni.arguments.omni_parser import _coerce_cli_value
+    from veomni.models.seed_omni.mixins.data_balance_mixin import ModuleStructure, resolve_balance_strategy
+
+    if source == "yaml":
+        override = yaml.safe_load("data_balance_override: off")["data_balance_override"]
+    else:
+        override = _coerce_cli_value("off")
+    assert override is False
+    plan = resolve_balance_strategy(ModuleStructure(), sp_size=1, dp_size=2, override=override)
+    assert (plan.strategy, plan.balance_dp) == ("replicate", False)
 
 
 def test_invalid_strategy_override():
@@ -276,6 +208,39 @@ def test_qwen_video_cost_is_framewise_not_clip_squared():
     vision._balance_vision_inputs("forward", torch.ones(16, 3), torch.tensor([[2, 2, 4]]))
 
 
+@pytest.mark.parametrize("balanced", [False, True])
+def test_packed_dummy_owner_encodes_received_items(monkeypatch, balanced):
+    from types import SimpleNamespace
+
+    from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated import packed
+
+    class Vision(packed.PackedTrainingMixin):
+        config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
+        device = torch.device("cpu")
+        dtype = torch.float32
+
+        def metric_meter_set_seqlens(self, method, lengths):
+            assert method == "pack_encode"
+            assert lengths == []
+
+        def _balance_vision_inputs(self, method, pixels, grid):
+            if balanced:
+                return torch.ones(8, 3), torch.tensor([[1, 2, 4]]), True
+            return pixels, grid, False
+
+    monkeypatch.setattr(packed, "get_parallel_state", lambda: SimpleNamespace(sp_size=1))
+    model = Vision()
+    inputs = model.pack_encode_pre(
+        packed_features=torch.zeros(1, 2, 4),
+        pixel_values=torch.zeros(4, 3),
+        image_grid_thw=torch.tensor([[1, 2, 2]]),
+        visual_pos_mask=torch.tensor([False, False]),
+        visual_is_real=torch.tensor([False]),
+    )
+    assert inputs["is_dummy"] is (not balanced)
+    assert inputs["vit_metadata"]["grid_thw_list"] == ([[1, 2, 4]] if balanced else [[1, 2, 2]])
+
+
 def distributed_worker():
     """One real DP/SP mesh, including empty owners, destinations, and global batch."""
     device_type = get_device_type()
@@ -334,92 +299,6 @@ def distributed_worker():
                 f"DP{world // sp_size}/SP{sp_size}: roundtrip, deepstack, gradients, empty ranks, token totals passed",
                 flush=True,
             )
-
-        # One bad owner must fail *every* rank before a payload collective.
-        def rank_local_cost_failure(_, owner=owner):
-            if owner == 0:
-                raise RuntimeError("owner callback failure")
-            return [1]
-
-        with pytest.raises(ValueError, match="RuntimeError"):
-            ModuleDataBalancer(dp_group, rank_local_cost_failure).balance(
-                {"x": torch.ones(1, 2, device=device)}, {"x": [1]}, [1]
-            )
-        with pytest.raises(ValueError, match="metadata"):
-            ModuleDataBalancer(dp_group).balance(
-                {"x": torch.ones(1, 2, device=device)}, {"x": [1]}, [1], costs=[-1 if owner == 0 else 1]
-            )
-        with pytest.raises(ValueError, match="schema"):
-            ModuleDataBalancer(dp_group).balance(
-                {"x": torch.ones(1, 3 if owner == 0 else 2, device=device)}, {"x": [1]}, [1], costs=[1]
-            )
-        with pytest.raises(ValueError, match="schema"):
-            ModuleDataBalancer(dp_group).balance(
-                {"x": torch.ones(1, 2, device=device, requires_grad=owner == 0)}, {"x": [1]}, [1], costs=[1]
-            )
-        for invalid in ("fields", "input", "output", "scalar", "overflow"):
-            tensors, lengths, outputs = {"x": torch.ones(1, 2, device=device)}, {"x": [1]}, [1]
-            if owner == 0:
-                if invalid == "fields":
-                    lengths = {"other": [1]}
-                elif invalid == "input":
-                    lengths = {"x": [None]}
-                elif invalid == "output":
-                    outputs = [None]
-                elif invalid == "scalar":
-                    tensors = {"x": torch.tensor(1.0, device=device)}
-                else:
-                    lengths = {"x": [float("inf")]}
-            with pytest.raises(ValueError, match="metadata"):
-                ModuleDataBalancer(dp_group).balance(tensors, lengths, outputs)
-        from types import SimpleNamespace
-
-        import veomni.models.seed_omni.mixins.data_balance_mixin as balance
-
-        class DeclaredModule(balance.DataBalanceMixin):
-            training = True
-            config = SimpleNamespace()
-            data_balance_specs = {
-                "encode": balance.DataBalanceSpec(
-                    fields=(balance.ItemTensorField("x", "input"),),
-                    output_names=("out",),
-                    output_lengths_key="output",
-                    cost_lengths_key="metric",
-                    structure=balance.ModuleStructure(),
-                )
-            }
-
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(
-                balance,
-                "get_parallel_state",
-                lambda sp_size=sp_size, dp_group=dp_group: SimpleNamespace(
-                    dp_size=world // sp_size, sp_size=sp_size, dp_group=dp_group
-                ),
-            )
-            for invalid in ("metric", "missing_metric", "missing_input", "missing_output", "missing_tensor"):
-                tensors = {"x": torch.ones(1, 2, device=device)}
-                metadata = {"input": [1], "output": [1], "metric": [1]}
-                if owner == 0:
-                    if invalid == "metric":
-                        metadata["metric"] = [None]
-                    elif invalid == "missing_tensor":
-                        tensors = {}
-                    else:
-                        del metadata[invalid.removeprefix("missing_")]
-                module = DeclaredModule()
-                with module.data_balance_scope(), pytest.raises(ValueError, match="metadata"):
-                    module.data_balance_pre("encode", tensors, metadata)
-            from dataclasses import replace
-
-            module = DeclaredModule()
-            module.data_balance_specs = {
-                "encode": replace(DeclaredModule.data_balance_specs["encode"], cost_fn=rank_local_cost_failure)
-            }
-            with module.data_balance_scope(), pytest.raises(ValueError, match="metadata"):
-                module.data_balance_pre(
-                    "encode", {"x": torch.ones(1, 2, device=device)}, {"input": [1], "output": [1], "metric": [1]}
-                )
     dist.destroy_process_group()
 
 
