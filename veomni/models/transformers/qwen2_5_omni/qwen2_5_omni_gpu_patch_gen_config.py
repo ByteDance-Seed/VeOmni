@@ -92,7 +92,6 @@ from veomni.distributed.sequence_parallel import (
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import (
     AUDIO_INPUT_INDEX,
@@ -141,7 +140,6 @@ config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask", "create_sliding_window_causal_mask"],
 )
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
@@ -247,7 +245,7 @@ def qwen2_5_omni_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> t
 
 @config.override_method(
     "Qwen2_5OmniMLP.__init__",
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 def qwen2_5_omni_vision_mlp_init_patched(self, config, bias: bool = False):
     nn.Module.__init__(self)
@@ -258,30 +256,20 @@ def qwen2_5_omni_vision_mlp_init_patched(self, config, bias: bool = False):
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=bias)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+    self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
 
 @config.override_method(
     "Qwen2_5OmniMLP.forward",
-    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the gated_mlp row, which picks fused weights or the projection modules",
 )
 def qwen2_5_omni_vision_mlp_forward_patched(self, hidden_state):
-    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-        return self.veomni_swiglu_mlp(
-            hidden_state,
-            self.gate_proj.weight,
-            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-            self.up_proj.weight,
-            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-            self.down_proj.weight,
-            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-        )
-    return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+    return self.veomni_gated_mlp(self, hidden_state, activation=self.config.hidden_act)
 
 
 @config.override_method(
     "Qwen2MLP.__init__",
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 def qwen2_5_omni_text_mlp_init_patched(self, config, bias: bool = False):
     nn.Module.__init__(self)
@@ -292,25 +280,15 @@ def qwen2_5_omni_text_mlp_init_patched(self, config, bias: bool = False):
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=bias)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=bias)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+    self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
 
 @config.override_method(
     "Qwen2MLP.forward",
-    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the gated_mlp row, which picks fused weights or the projection modules",
 )
 def qwen2_5_omni_text_mlp_forward_patched(self, hidden_state):
-    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-        return self.veomni_swiglu_mlp(
-            hidden_state,
-            self.gate_proj.weight,
-            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-            self.up_proj.weight,
-            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-            self.down_proj.weight,
-            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-        )
-    return self.down_proj(self.act_fn(self.gate_proj(hidden_state)) * self.up_proj(hidden_state))
+    return self.veomni_gated_mlp(self, hidden_state, activation=self.config.hidden_act)
 
 
 @config.override_method(
