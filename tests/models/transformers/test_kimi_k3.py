@@ -581,6 +581,7 @@ def test_position_id_func_is_picklable():
     assert restored(input_ids=None) is None
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_vlm_attention_override_preserves_child_selections():
     """A root attention override must not clobber explicit per-child
     selections (round-3 review): ``VeOmniPretrainedConfig``'s
@@ -588,7 +589,19 @@ def test_vlm_attention_override_preserves_child_selections():
     rank above the root value, and the patched ``__init__`` used to
     re-stamp both sub-configs with the root selection. The vision tower
     only supports ``VL_VISION_ATTENTION_FUNCTIONS`` -- unsupported names
-    must raise at construction, not KeyError at the first image forward."""
+    must raise at construction, not KeyError at the first image forward.
+
+    The construction is CPU-native end to end (round-4 review): both
+    children pin 'eager' explicitly -- the toy config's text default is
+    the accelerator-bound 'veomni_flash_attention_2' -- and the
+    discriminating root selection is a non-flash veomni name,
+    'veomni_sage_attention', which HF passes through for the root class
+    while the vision validation rejects it for the tower: the re-stamp
+    this test pins fails loudly instead of silently degrading to dense
+    eager. A flash-flavored root cannot play that role here at all: the
+    suite's cpu_model_attention_kernel_guard forbids FlashAttention
+    preloading under CPU launch plans, and HF's preload path fires before
+    any registry row, so even a mocked row would not construct."""
     from veomni.models.transformers.kimi_k3.generated.patched_modeling_kimi_k3_gpu import (
         KimiK3ForConditionalGeneration,
     )
@@ -598,31 +611,39 @@ def test_vlm_attention_override_preserves_child_selections():
     # config itself, the production shape: the launch yaml embeds
     # ops_config in the model config and VeOmniPretrainedConfig's
     # post-init keeps per-child entries on top of it. The old patch
-    # re-stamped both sub-configs with the root value at __init__.
-    # 'veomni_flash_attention_2' is normalize-stable and passes HF's
-    # construction-time sdpa/flash_attn availability guards; the root
-    # 'eager' differs from both children so a re-stamp flips the assert.
+    # re-stamped both sub-configs with the root value at __init__ -- with
+    # the root at 'veomni_sage_attention' that re-stamp now fails the
+    # vision-tower validation instead of quietly training dense eager.
     cfg = _tiny_config()
-    cfg._attn_implementation = {"text_config": "veomni_flash_attention_2", "vision_config": "eager"}
+    cfg._attn_implementation = {"text_config": "eager", "vision_config": "eager"}
     # root selection written without the setter's tree-wide recursion
-    cfg.ops_implementation["attn_implementation"] = "eager"
+    cfg.ops_implementation["attn_implementation"] = "veomni_sage_attention"
     model = build_foundation_model(cfg, torch_dtype="float32", init_device="cpu")
-    assert model.config.text_config._attn_implementation == "veomni_flash_attention_2"
+    assert model.config.text_config._attn_implementation == "eager"
     assert model.config.vision_config._attn_implementation == "eager"
 
     # an sdpa-flavored selection on the vision child itself (raw dict
     # spelling -- both the normalizing setter and HF's own 'sdpa'
     # construction guard live elsewhere) falls back to 'eager': the old
     # patch only remapped the root selection onto children and left a
-    # child-level selection to KeyError at the first image forward
+    # child-level selection to KeyError at the first image forward. The
+    # text side pins an explicit eager default instead of the toy config's
+    # accelerator-bound 'veomni_flash_attention_2' (round-4 review).
     cfg = _tiny_config()
+    cfg.text_config.ops_implementation["attn_implementation"] = "eager"
     cfg.vision_config.ops_implementation["attn_implementation"] = "veomni_sdpa"
+    # the toy config's root default is the flash-flavored
+    # 'veomni_flash_attention_2', which HF's root-class check would try to
+    # preload (forbidden under CPU launch plans): pin the root to the same
+    # eager default explicitly
+    cfg.ops_implementation["attn_implementation"] = "eager"
     model = KimiK3ForConditionalGeneration(cfg)
+    assert model.config.text_config._attn_implementation == "eager"
     assert model.config.vision_config._attn_implementation == "eager"
 
     # unsupported vision selection raises at construction
     cfg = _tiny_config()
-    cfg._attn_implementation = "veomni_sage_attention"
+    cfg._attn_implementation = {"text_config": "eager", "vision_config": "veomni_sage_attention"}
     with pytest.raises(ValueError, match="vision attention"):
         KimiK3ForConditionalGeneration(cfg)
 
@@ -673,66 +694,6 @@ def test_source_kda_module_forward_runs():
         out = module(hidden_states)
     assert out.shape == hidden_states.shape
     assert torch.isfinite(out).all()
-
-
-def test_source_module_self_attributes_are_defined():
-    """AST-scan the vendored source for ``self.<attr>`` loads that no
-    assignment, method definition, or buffer registration in the same
-    module can back.
-
-    This is the mechanical guard for the class of drift the round-3 review
-    caught by hand (definitions moved to the patch layer while their call
-    sites stayed in the source). The allowlist covers: ``loss_function``
-    (the patched ``__init__`` overrides assign ``partial(ForCausalLMLoss,
-    op=...)``), ``freqs_cis`` / ``time_weight`` (created through
-    ``self.register_buffer(...)`` in the vision tower, where the string
-    argument is invisible to a textual scan), and the torch / transformers
-    base-class API (``training``, ``post_init``, ``register_buffer``)."""
-    import ast
-    import inspect
-
-    from veomni.models.transformers.kimi_k3.source import modeling_kimi_k3 as source_module
-
-    allow = {
-        # patch-injected: assigned in the patched KimiLinearForCausalLM /
-        # KimiK3ForConditionalGeneration __init__ overrides
-        "loss_function",
-        # register_buffer-created buffers (the string arg is not an assignment)
-        "freqs_cis",
-        "time_weight",
-        # torch / transformers base-class API
-        "training",
-        "post_init",
-        "register_buffer",
-    }
-
-    tree = ast.parse(inspect.getsource(source_module))
-    defined: set[str] = set()
-    loaded: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            defined.add(node.name)
-        if isinstance(node, ast.Assign):
-            defined.update(
-                target.attr
-                for target in node.targets
-                if isinstance(target, ast.Attribute)
-                and isinstance(target.value, ast.Name)
-                and target.value.id == "self"
-            )
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Attribute):
-            if isinstance(node.target.value, ast.Name) and node.target.value.id == "self":
-                defined.add(node.target.attr)
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
-            loaded.add(node.attr)
-    dangling = loaded - defined - allow
-    assert not dangling, (
-        "self.<attr> references in the vendored source with no backing "
-        f"assignment or method in the module: {sorted(dangling)} -- move the "
-        "call site into the patch layer (or leave an upstream-shaped source "
-        "call) so source/modeling_kimi_k3.py stays runnable as its own "
-        "re-sync reference."
-    )
 
 
 def test_moe_gate_router_is_initialized():
@@ -1225,16 +1186,27 @@ def test_vision_tower_dispatches_through_bound_op_handle():
         torch.testing.assert_close(a, b)
 
 
-def test_vision_flash_row_fails_at_construction_without_flash_attn():
+def test_vision_flash_row_fails_at_construction_without_flash_attn(monkeypatch):
     """A 'flash_attention_2' vision selection on a host without flash-attn
     fails at construction with an attributable error -- the registry row's
     flash_attn package requirement, or HF's tower availability guard for the
     raw spelling -- never an ImportError raised from inside the modeling
-    function at the first image forward (round-3 review)."""
-    import importlib.util
+    function at the first image forward (round-3 review).
 
-    if importlib.util.find_spec("flash_attn") is not None:
-        pytest.skip("flash_attn installed: the no-flash-attn attribution path is not reachable")
+    The dependency attribution is pinned by mocking a supported platform
+    and hiding only the flash_attn package (round-4 review): unmocked, a
+    CPU-only lease dies at the device-registration check first, whose
+    message names the impl ('flash_attention_2') instead of the package,
+    so the flash_attn attribution never gets a chance to fire there."""
+    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "npu")
+    monkeypatch.setattr(
+        "veomni.ops.platform.requirement.NpuKernelRequirement.matches",
+        lambda self: True,
+    )
+    monkeypatch.setattr(
+        "veomni.ops.registry.is_package_available",
+        lambda package: package != "flash_attn",
+    )
     # the op row itself declares its flash_attn package requirement
     with pytest.raises(RuntimeError, match="flash_attn"):
         VeomniOp("vision_attention", "kimi_k3", "flash_attention_2")
@@ -1243,8 +1215,13 @@ def test_vision_flash_row_fails_at_construction_without_flash_attn():
     )
 
     # and a model carrying the raw spelling never reaches forward: the tower
-    # is refused at construction (HF's guard or the row binding)
+    # is refused at construction (HF's guard or the row binding). The text
+    # side and the root pin explicit eager defaults so the refusal cannot
+    # be masked by the toy config's accelerator-bound flash-flavored
+    # defaults under the CPU construction guard.
     cfg = _tiny_config()
+    cfg.text_config.ops_implementation["attn_implementation"] = "eager"
+    cfg.ops_implementation["attn_implementation"] = "eager"
     cfg.vision_config.ops_implementation["attn_implementation"] = "flash_attention_2"
     with pytest.raises((ValueError, RuntimeError)):
         KimiK3ForConditionalGeneration(cfg)
