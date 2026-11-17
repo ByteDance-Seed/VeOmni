@@ -62,6 +62,7 @@ from .layout import (
     step_dir,
     weights_dir,
 )
+from .row_crop import _RowCropLoadMixin, _RowCropSaveMixin, checkpoint_row_counts
 
 
 logger = logging.get_logger(__name__)
@@ -567,7 +568,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                         f"ExtraParallel checkpoint dtype differs for {key}; explicit conversion required"
                     )
         self._validate_expert_layouts()
-        plan = super().create_local_plan()
+        plan = self._create_read_plan()
         if not self.strict_model:
             return plan
 
@@ -586,6 +587,9 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             )
 
         return plan
+
+    def _create_read_plan(self):
+        return super().create_local_plan()
 
     def _validate_expert_layouts(self):
         planner_data = self.metadata.planner_data or {}
@@ -657,6 +661,27 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                 "Migrate model and optimizer state using the original training layout before loading; "
                 "changing the target expert_fsdp_shard_dim does not resolve the ambiguity."
             )
+
+
+class _CanonicalRowCropSavePlanner(_RowCropSaveMixin, _ExtraParallelSavePlanner):
+    """Retain both logical-row cropping and source expert-layout provenance."""
+
+
+class _CanonicalRowCropLoadPlanner(_RowCropLoadMixin, _ModelStrictLoadPlanner):
+    """Apply row padding after verifying the canonical source expert layout."""
+
+
+def _checkpoint_rows_by_name(model):
+    counts = checkpoint_row_counts(model)
+    specs = getattr(model, "_fqn2spec_info", None)
+    marker = _extra_parallel_layout_key(specs) + "__" if _needs_extra_parallel_layout_marker(specs) else ""
+    return {f"model.{marker}{name}": value for name, value in counts.items()}
+
+
+def _model_load_planner(*, strict_model: bool, rows_by_name):
+    if rows_by_name:
+        return _CanonicalRowCropLoadPlanner(strict_model=strict_model, rows_by_name=rows_by_name)
+    return _ModelStrictLoadPlanner(strict_model=strict_model)
 
 
 def _validate_extra_parallel_meshes(parallel_state) -> None:
@@ -1403,7 +1428,12 @@ class ModelState(Stateful):
             (already populated from ``model_path``) base params are left untouched.
     """
 
-    def __init__(self, model, trainable_only: bool = False, parallel_state=None):
+    def __init__(
+        self,
+        model,
+        trainable_only: bool = False,
+        parallel_state=None,
+    ):
         self.model = model
         self.trainable_only = trainable_only
 
@@ -1423,6 +1453,7 @@ class ModelState(Stateful):
 
     @torch.no_grad()
     def state_dict(self):
+        """Extract model weights while preserving runtime shapes and checkpoint sharding."""
         if self.extra_parallel_fqn2spec_info is not getattr(self.model, "_fqn2spec_info", None) or (
             self._layout_signature != _runtime_extra_parallel_layout_signature(self.extra_parallel_fqn2spec_info)
         ):
@@ -2263,7 +2294,15 @@ class DistributedCheckpointer(CheckpointerBase):
             state, parallel_state, group=process_group, trainable_only=trainable_only
         )
 
+        row_counts, error = {}, None
+        try:
+            row_counts = _checkpoint_rows_by_name(state["model"])
+        except Exception as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "preparing checkpoint row metadata for load", group=process_group)
+
         def _model_state() -> "ModelState":
+            """Build the model load target using its padded runtime shapes."""
             return ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
 
         def _optimizer_state() -> "OptimizerState":
@@ -2341,7 +2380,7 @@ class DistributedCheckpointer(CheckpointerBase):
             state_dict={"model": _model_state()},
             storage_reader=cls._create_storage_reader(weights_dir(path, module)),
             process_group=process_group,
-            planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
+            planner=_model_load_planner(strict_model=not trainable_only, rows_by_name=row_counts),
         )
         if wants_optimizer:
             dcp.load(
@@ -2475,7 +2514,12 @@ class DistributedCheckpointer(CheckpointerBase):
         """
         planner, error = None, None
         try:
-            planner = _ExtraParallelSavePlanner(
+            model_state = save_state.get("model")
+            rows = _checkpoint_rows_by_name(model_state.model) if isinstance(model_state, ModelState) else {}
+            planner_type = _CanonicalRowCropSavePlanner if rows else _ExtraParallelSavePlanner
+            planner_args = {"rows_by_name": rows} if rows else {}
+            planner = planner_type(
+                **planner_args,
                 dedup_save_to_lowest_rank=save_to_lowest_rank,
                 parallel_state=parallel_state if parallel_state is not None else get_parallel_state(),
                 source_model=source_model,

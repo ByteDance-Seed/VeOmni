@@ -41,31 +41,50 @@ __all__ = [
 
 #: ``linear`` rows that fake-quantize the weight they are handed, and therefore
 #: cannot fall back to calling a wrapped projection module.
-QUANTIZING_IMPLS = frozenset({"qat"})
+QUANTIZING_IMPLS = frozenset({"qat", "torchao_nvfp4"})
 
 
-def resolve_projection(op_impl: str, module: nn.Module, x: Tensor) -> tuple[Tensor | None, Tensor | None]:
+def resolve_projection(
+    op_impl: str,
+    module: nn.Module,
+    x: Tensor,
+    *,
+    allow_linear_subclass: bool = False,
+) -> tuple[Tensor | None, Tensor | None]:
     """Return ``(weight, output)`` for a projection, exactly one of which is set.
 
     Args:
         op_impl: The resolved implementation name of the calling row.
         module: The projection the row was asked to run.
         x: Input activation, used only on the fallback path.
+        allow_linear_subclass: Allow ``nn.Linear`` subclasses whose custom
+            ``forward`` matches the row contract (used by the grouped QAT row for
+            ``DeepseekV4GroupedLinear``), except converted ``Float8Linear``.
 
     Returns:
         ``(module.weight, None)`` when the module owns a weight the row may read,
         otherwise ``(None, module(x))`` -- the module's own forward.
 
     Raises:
-        ValueError: when the module is wrapped while the row fake-quantizes. The
-            wrapped module keeps its base layer at ``base_layer``, so the row
-            cannot reach the weight it is supposed to round, and running the
-            wrapper would train at full precision under a QAT config.
+        ValueError: when the module is wrapped or is an ``nn.Linear`` subclass
+            whose own ``forward`` computes extra/quantized math while the row
+            fake-quantizes. Reading ``module.weight`` would bypass the module's
+            ``forward`` (e.g. ``Float8Linear`` GEMMs) and calling the fallback
+            would train at full precision under a QAT config.
     """
-    weight = getattr(module, "weight", None)
-    if isinstance(weight, Tensor):
-        return weight, None
+    if type(module) is nn.Linear:
+        return module.weight, None
+    if allow_linear_subclass and isinstance(module, nn.Linear) and type(module).__name__ != "Float8Linear":
+        return module.weight, None
     if op_impl in QUANTIZING_IMPLS:
+        if isinstance(module, nn.Linear):
+            raise ValueError(
+                f"linear_implementation={op_impl!r} cannot run on nn.Linear subclass {type(module).__name__!r}: "
+                "its forward does more than F.linear on its weight (torchao's Float8Linear runs FP8 GEMMs; a "
+                "projection listed in FSDP2 `basic_modules` becomes FSDPLinear and unshards its weight there), "
+                "so reading `module.weight` would bypass it. Set linear_implementation='eager', or drop the "
+                "overlapping float8 target / `basic_modules` entry."
+            )
         raise ValueError(
             f"linear_implementation={op_impl!r} cannot run on {type(module).__name__!r}: the row "
             "fake-quantizes the projection weight, and a wrapped projection (LoRA keeps the base "

@@ -243,7 +243,7 @@ def qwen3_mlp_forward_patched(self, x):
 
 @config.override_method(
     "Qwen3Attention.__init__",
-    description="Construct local rope and attention VeomniOps",
+    description="Construct local rope, attention and linear VeomniOps",
 )
 def qwen3_attention_init_patched(self, config, layer_idx: int):
     nn.Module.__init__(self)
@@ -265,11 +265,12 @@ def qwen3_attention_init_patched(self, config, layer_idx: int):
     self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
     self.veomni_rope = VeomniOp("rope", "full", config.ops_config.rotary_pos_emb_implementation)
     self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
+    self.veomni_linear = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
 
 
 @config.override_method(
     "Qwen3Attention.forward",
-    description="Always call the local rope and attention VeomniOps",
+    description="Always call the local rope, attention and linear VeomniOps",
 )
 def qwen3_attention_forward_patched(
     self,
@@ -282,9 +283,12 @@ def qwen3_attention_forward_patched(
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
 
-    query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-    key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    # The ``linear`` row takes the projection module: ``eager`` calls it (so a
+    # ``basic_modules``-wrapped projection still unshards and a LoRA adapter still
+    # runs), while a quantizing row reads its weight and refuses a wrapped one.
+    query_states = self.q_norm(self.veomni_linear(self.q_proj, hidden_states).view(hidden_shape)).transpose(1, 2)
+    key_states = self.k_norm(self.veomni_linear(self.k_proj, hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = self.veomni_linear(self.v_proj, hidden_states).view(hidden_shape).transpose(1, 2)
 
     cos, sin = position_embeddings
     query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
@@ -305,7 +309,7 @@ def qwen3_attention_forward_patched(
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-    attn_output = self.o_proj(attn_output)
+    attn_output = self.veomni_linear(self.o_proj, attn_output)
     return attn_output, attn_weights
 
 
