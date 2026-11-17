@@ -41,7 +41,7 @@ NPROC_PER_NODE=${NPROC_PER_NODE:=8}
 - `NODE_RANK`: Unique identifier for each node (0 to NNODES-1)
 - `MASTER_ADDR`: IP address of the master node (same for all machines)
 - `MASTER_PORT`: Communication port (default: 12345)
-- `NPROC_PER_NODE`: NPUs per node (A2: max 8, A3: max 16)
+- `NPROC_PER_NODE`: NPUs per node (Atlas A2训练系列产品: max 8, Atlas A3训练系列产品: max 16)
 
 **Important Notes**:
 - All nodes must communicate via `MASTER_ADDR:MASTER_PORT`

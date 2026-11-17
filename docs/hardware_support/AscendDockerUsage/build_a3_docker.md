@@ -1,4 +1,4 @@
-# Ascend A3 Docker Image Build and Usage Guide
+# Atlas A3训练系列产品 Docker Image Build and Usage Guide
 
 ## CANN 9.2.1 images
 
@@ -41,8 +41,8 @@ docker run --rm -it --network host --shm-size=32g \
   veomni:cann921-a3-arm64 bash
 ```
 
-The existing [A2 builder](../../../.github/workflows/docker-build-ascend-a2.yml)
-and [A3 builder](../../../.github/workflows/docker-build-ascend-a3.yml) build
+The existing [Atlas A2训练系列产品 builder](../../../.github/workflows/docker-build-ascend-a2.yml)
+and [Atlas A3训练系列产品 builder](../../../.github/workflows/docker-build-ascend-a3.yml) build
 these CANN 9.2.1 Dockerfiles on matching native runners. They support manual
 dispatch, published releases, and path-filtered pushes to `main`. Upstream
 builds publish to Quay using repository secrets. Build jobs are restricted
@@ -56,11 +56,11 @@ See [validation scope and cache details](overview.md#validation-scope).
 The instructions below describe the existing CANN 9.1.0 images.
 
 ## Overview
-This guide provides step-by-step instructions for building and using the Ascend A3 Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Ascend A3 accelerators.
+This guide provides step-by-step instructions for building and using the Atlas A3训练系列产品 Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Atlas A3训练系列产品 accelerators.
 
 ## Prerequisites
 - Docker installed on your system
-- Access to Ascend A3 hardware accelerators
+- Access to Atlas A3训练系列产品 hardware accelerators
 - Network access to pull the base image and install dependencies
 - Proxy configuration (if required in your environment)
 
@@ -74,7 +74,7 @@ docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1
 ```
 
 ## Step 2: Build the Custom Image
-Build the GDN-ready VeOmni Ascend A3 image using the provided Dockerfile. It includes `torch-npu==2.10.0.post2`, `triton-ascend`, and `fla_npu`. The existing `Dockerfile.ascend_9.0.0_a3` remains available for the general-purpose image.
+Build the GDN-ready VeOmni Atlas A3训练系列产品 image using the provided Dockerfile. It includes `torch-npu==2.10.0.post2`, `triton-ascend`, and `fla_npu`. The existing `Dockerfile.ascend_9.0.0_a3` remains available for the general-purpose image.
 
 **Note:** Proxy settings are optional and only needed if your server requires proxy access to the internet. Remove the proxy arguments if not needed.
 
