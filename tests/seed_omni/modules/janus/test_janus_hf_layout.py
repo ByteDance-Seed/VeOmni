@@ -120,8 +120,9 @@ def _write_hf_checkpoint(
     tied: bool = False,
     nested_tied: bool | None = None,
     head: str = "auto",
+    serialization: str = "safetensors",
 ) -> dict[str, torch.Tensor]:
-    """Write a tiny upstream Janus root (single-file safetensors).
+    """Write a tiny upstream Janus root.
 
     ``head`` says what the checkpoint stores for ``lm_head.weight``:
 
@@ -130,6 +131,9 @@ def _write_hf_checkpoint(
     * ``"omit"`` — never store it, even when the flags say untied;
     * ``"equal"`` — store it byte-identical to the embedding;
     * ``"different"`` — store it with its own values.
+
+    ``serialization="bin"`` writes ``pytorch_model.bin`` instead, so a rule that
+    consults the stored tensors is held to both formats `from_pretrained` takes.
     """
     from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
@@ -154,7 +158,12 @@ def _write_hf_checkpoint(
     else:  # pragma: no cover - guards the call sites
         raise ValueError(f"unknown head mode {head!r}")
 
-    save_file(tensors, root / "model.safetensors", metadata={"format": "pt"})
+    if serialization == "bin":
+        torch.save(tensors, root / "pytorch_model.bin")
+    elif serialization == "safetensors":
+        save_file(tensors, root / "model.safetensors", metadata={"format": "pt"})
+    else:  # pragma: no cover - guards the call sites
+        raise ValueError(f"unknown serialization {serialization!r}")
     return tensors
 
 
@@ -317,6 +326,35 @@ def test_the_stored_head_decides_tying_the_way_from_pretrained_does(tmp_path, ti
     if expect_head:
         assert torch.equal(text_encoder.lm_head.weight, tensors["lm_head.weight"])
     else:
+        assert torch.equal(
+            text_encoder.embed_tokens.weight,
+            tensors["model.language_model.embed_tokens.weight"],
+        )
+
+
+@pytest.mark.parametrize("head", ["different", "equal", "omit"], ids=["head-differs", "head-equal", "head-omitted"])
+def test_a_bin_root_resolves_tying_from_its_stored_head(tmp_path, head):
+    """``.bin`` must reach the same verdict as safetensors, not fall back to the flag.
+
+    The config says tied, and only the stored head disagrees. A rule that read
+    safetensors and treated ``.bin`` as unreadable would silently skip a trained
+    head here — the same data loss as F022, on the other serialization.
+    """
+    root = tmp_path / "Janus-bin"
+    tensors = _write_hf_checkpoint(root, tied=True, nested_tied=True, head=head, serialization="bin")
+    assert (root / "pytorch_model.bin").is_file()
+    assert not (root / "model.safetensors").exists()
+
+    model = OmniModel.from_pretrained(str(root), dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager")
+    text_encoder = model.modules_dict[TEXT_ENCODER]
+
+    if head == "different":
+        # The stored head wins over the config: it must load, not be replaced.
+        assert text_encoder.lm_head is not None
+        assert torch.equal(text_encoder.lm_head.weight, tensors["lm_head.weight"])
+    else:
+        # Equal or omitted: the tie is what upstream keeps.
+        assert text_encoder.lm_head is None
         assert torch.equal(
             text_encoder.embed_tokens.weight,
             tensors["model.language_model.embed_tokens.weight"],

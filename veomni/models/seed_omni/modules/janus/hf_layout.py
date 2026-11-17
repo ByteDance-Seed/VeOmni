@@ -27,7 +27,6 @@ and wins over the backbone's shorter ``model.language_model.``.
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
 import torch
@@ -36,6 +35,7 @@ from ...utils.hf_layout import (
     OMNI_HF_LAYOUT_REGISTRY,
     OmniHFLayout,
     OmniHFModuleLayout,
+    read_source_tensors,
     read_source_weight_files,
 )
 from .llama.configuration import JanusLlamaConfig
@@ -72,11 +72,13 @@ def _stored_head_relation(source_path: str) -> str:
       disagrees with the checkpoint and deliberately does *not* tie, so the head
       must load its own copy.
 
-    Returns ``"unknown"`` when the weights cannot be read (a non-safetensors
-    root); the caller then falls back to the config.
-    """
-    from safetensors import safe_open
+    Both serializations are read: ``.bin`` checkpoints store the pair as two
+    keys referencing one storage just as often as safetensors writes an equal
+    copy, and a config-only answer would drop a trained head there.
 
+    Returns ``"unknown"`` when the tensors cannot be read; the caller then falls
+    back to the config.
+    """
     try:
         weight_files = read_source_weight_files(source_path)
     except (FileNotFoundError, OSError, ValueError):
@@ -86,10 +88,10 @@ def _stored_head_relation(source_path: str) -> str:
         return "absent"
     if _TIED_HEAD_TARGET_KEY not in weight_files:
         return "unknown"
-    tensors = {}
-    for key in (_TIED_HEAD_SOURCE_KEY, _TIED_HEAD_TARGET_KEY):
-        with safe_open(os.path.join(source_path, weight_files[key]), framework="pt", device="cpu") as f:
-            tensors[key] = f.get_tensor(key)
+    try:
+        tensors = read_source_tensors(source_path, weight_files, (_TIED_HEAD_SOURCE_KEY, _TIED_HEAD_TARGET_KEY))
+    except (OSError, ValueError, RuntimeError):
+        return "unknown"
     head, embed = tensors[_TIED_HEAD_SOURCE_KEY], tensors[_TIED_HEAD_TARGET_KEY]
     if head.shape != embed.shape or head.dtype != embed.dtype:
         return "different"

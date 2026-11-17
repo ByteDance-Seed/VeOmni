@@ -139,6 +139,46 @@ def test_the_vq_head_scores_on_every_cross_entropy_backend(impl):
     assert head_bias.grad.abs().sum() > 0
 
 
+@pytest.mark.parametrize("impl", sorted(_FUSED_CE_IMPLS))
+def test_the_fused_vq_backend_accepts_the_batched_training_shape(impl):
+    """``decode`` hands the loss a ``[1, T, H]`` span, not a flat one.
+
+    That is the shape the graph produces, and it is where the fused rows broke:
+    the activations were flattened to ``[T, H]`` for the fused linear while the
+    token-axis bias kept its ``[1, T, 1]`` shape, so chunk_loss rejected the row
+    mismatch (``logits_bias rows (1, T) do not match hidden_states rows (T,)``).
+    Everything on that axis has to be flattened together.
+    """
+    if impl == "chunk_loss":
+        pytest.importorskip("flash_attn", reason="chunk_loss needs the flash-attn kernels")
+    else:
+        pytest.importorskip("liger_kernel", reason="liger_kernel is a GPU-only fused backend")
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip(f"{impl} needs a CUDA device")
+
+    device = torch.device(get_device_type())
+    Acc = OMNI_ACCELERATED_MODEL_REGISTRY["janus_vqvae"]()
+    cfg = OMNI_CONFIG_REGISTRY["janus_vqvae"]()(
+        vq_config=_VQ_CONFIG,
+        ops_implementation=make_eager_ops_config(cross_entropy_loss_implementation=impl),
+    )
+    module = Acc(cfg).to(device=device, dtype=torch.float32)
+    with torch.no_grad():
+        module.generation_head.vision_head.bias.copy_(
+            torch.linspace(-1.0, 1.0, _VQ_CONFIG["num_embeddings"], device=device)
+        )
+    head_bias = module.generation_head.vision_head.bias
+
+    # The batch axis is present, which is what the graph produces.
+    hidden = torch.randn(1, 7, _VQ_CONFIG["image_token_embed_dim"], device=device)
+    labels = torch.tensor([[1, -100, 3, 4, 5, -100, 7]], device=device)
+
+    loss = module._vq_loss(hidden, labels)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert head_bias.grad is not None and head_bias.grad.abs().sum() > 0
+
+
 @pytest.mark.parametrize("impl", ["eager", "chunk_loss"])
 def test_the_fused_vq_backend_matches_eager_with_the_real_head_bias(impl):
     """Switching the CE backend must not change the number.
@@ -165,8 +205,10 @@ def test_the_fused_vq_backend_matches_eager_with_the_real_head_bias(impl):
         return module
 
     reference_module = _module("eager", torch.device("cpu"))
-    hidden = torch.randn(4, _VQ_CONFIG["image_token_embed_dim"])
-    labels = torch.tensor([1, -100, 3, 4])
+    # The batched shape the graph produces — this test and the one above cover
+    # the two failure modes separately: bias dropped, and bias mis-shapen.
+    hidden = torch.randn(1, 7, _VQ_CONFIG["image_token_embed_dim"])
+    labels = torch.tensor([[1, -100, 3, 4, 5, -100, 7]])
     reference = reference_module._vq_loss(hidden, labels)
 
     if impl == "eager":
