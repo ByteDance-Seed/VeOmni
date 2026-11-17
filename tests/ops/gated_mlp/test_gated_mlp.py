@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SwiGLU MLP eager vs HF, and fused impls vs eager."""
+"""Gated MLP eager vs HF, and fused impls vs eager.
+
+Every row takes the MLP module and returns the block's output, so the calls below
+pass ``(mlp, x)`` -- the same shape a model's patched forward uses.
+"""
 
 from __future__ import annotations
 
@@ -38,10 +42,9 @@ from tests.ops.tol import (
 )
 from veomni.ops import resolve_op
 from veomni.ops.activation import supported_activations
-from veomni.ops.kernels.swiglu_mlp.geglu import liger_kernel as geglu_liger
-from veomni.ops.kernels.swiglu_mlp.geglu.eager import gelu_tanh_mul_backward
-from veomni.ops.kernels.swiglu_mlp.standard import liger_kernel as standard_liger
-from veomni.ops.registry import OpEntry
+from veomni.ops.kernels.gated_mlp.geglu import liger_kernel as geglu_liger
+from veomni.ops.kernels.gated_mlp.geglu.eager import gelu_tanh_mul_backward
+from veomni.ops.kernels.gated_mlp.standard import liger_kernel as standard_liger
 from veomni.utils.device import IS_CUDA_AVAILABLE
 from veomni.utils.import_utils import is_package_available
 
@@ -54,16 +57,51 @@ def _bias(linear: nn.Linear) -> Tensor:
     return linear.bias if linear.bias is not None else _empty_bias(linear.weight)
 
 
-def _mlp_args(mlp: nn.Module, x: Tensor) -> tuple[Tensor, ...]:
-    return (
-        x,
-        mlp.gate_proj.weight,
-        _bias(mlp.gate_proj),
-        mlp.up_proj.weight,
-        _bias(mlp.up_proj),
-        mlp.down_proj.weight,
-        _bias(mlp.down_proj),
-    )
+def _mlp_args(mlp: nn.Module, x: Tensor) -> tuple[nn.Module, Tensor]:
+    return mlp, x
+
+
+def _mlp_of(gate: nn.Linear, up: nn.Linear, down: nn.Linear) -> nn.Module:
+    """A stand-in MLP block around three projections."""
+    mlp = nn.Module()
+    mlp.gate_proj, mlp.up_proj, mlp.down_proj = gate, up, down
+    return mlp
+
+
+def _mlp_from_tensors(
+    gate_w: Tensor,
+    gate_b: Tensor,
+    up_w: Tensor,
+    up_b: Tensor,
+    down_w: Tensor,
+    down_b: Tensor,
+) -> nn.Module:
+    """A stand-in MLP block whose projections are the given tensors.
+
+    An empty bias means the projection has none, which is exactly how the rows read
+    it: ``nn.Linear(bias=False)``, so ``.grad`` stays ``None`` for a bias the model
+    does not have.
+    """
+    layers = []
+    for weight, bias in ((gate_w, gate_b), (up_w, up_b), (down_w, down_b)):
+        layer = nn.Linear(weight.shape[1], weight.shape[0], bias=bias.numel() > 0)
+        layer.weight = nn.Parameter(weight.detach().clone())
+        layer.bias = nn.Parameter(bias.detach().clone()) if bias.numel() > 0 else None
+        layers.append(layer)
+    return _mlp_of(*layers)
+
+
+def _reference(mlp: nn.Module, x: Tensor, *, tanh_gelu: bool = False, swiglu_limit: float | None = None):
+    """The plain-PyTorch MLP the rows are compared against."""
+    gate, up = mlp.gate_proj(x), mlp.up_proj(x)
+    if swiglu_limit is not None:
+        gate = gate.float().clamp(max=swiglu_limit)
+        up = up.float().clamp(min=-swiglu_limit, max=swiglu_limit)
+    activation = F.gelu(gate, approximate="tanh") if tanh_gelu else F.silu(gate)
+    hidden_state = activation * up
+    if hidden_state.dtype != x.dtype:
+        hidden_state = hidden_state.to(dtype=x.dtype)
+    return mlp.down_proj(hidden_state)
 
 
 def _tiny_qwen3_mlp(hidden_size: int = 64, intermediate_size: int = 128) -> Qwen3MLP:
@@ -95,7 +133,7 @@ def test_eager_matches_hf():
     out_h = mlp_h(x_h)
 
     x_e = x.detach().requires_grad_(True)
-    wrapper = resolve_op("swiglu_mlp", "standard", "eager").wrapper
+    wrapper = resolve_op("gated_mlp", "standard", "eager").wrapper
     out_e = wrapper(*_mlp_args(mlp_e, x_e))
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -122,8 +160,8 @@ def test_eager_matches_biased_linears():
     out_h = down_h(F.silu(gate_h(x_h)) * up_h(x_h))
 
     x_e = x.detach().requires_grad_(True)
-    wrapper = resolve_op("swiglu_mlp", "standard", "eager").wrapper
-    out_e = wrapper(x_e, gate_e.weight, gate_e.bias, up_e.weight, up_e.bias, down_e.weight, down_e.bias)
+    wrapper = resolve_op("gated_mlp", "standard", "eager").wrapper
+    out_e = wrapper(_mlp_of(gate_e, up_e, down_e), x_e)
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = torch.randn_like(out_e)
@@ -157,8 +195,7 @@ def test_autocast_forward_backward_matches_pytorch(impl: str, device: str, swigl
 
     torch.manual_seed(12)
     hidden, intermediate = 64, 128
-    tensors = (
-        torch.randn(2, 8, hidden, device=device) * 0.1,
+    weights = (
         torch.randn(intermediate, hidden, device=device) * 0.1,
         torch.randn(intermediate, device=device) * 0.1,
         torch.randn(intermediate, hidden, device=device) * 0.1,
@@ -166,22 +203,17 @@ def test_autocast_forward_backward_matches_pytorch(impl: str, device: str, swigl
         torch.randn(hidden, intermediate, device=device) * 0.1,
         torch.randn(hidden, device=device) * 0.1,
     )
-    reference_args = tuple(tensor.detach().clone().requires_grad_(True) for tensor in tensors)
-    actual_args = tuple(tensor.detach().clone().requires_grad_(True) for tensor in tensors)
+    reference_mlp = _mlp_from_tensors(*weights)
+    actual_mlp = _mlp_from_tensors(*weights)
+    x = torch.randn(2, 8, hidden, device=device) * 0.1
+    x_ref = x.detach().requires_grad_(True)
+    x_act = x.detach().requires_grad_(True)
 
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        x, gate_w, gate_b, up_w, up_b, down_w, down_b = reference_args
-        gate = F.linear(x, gate_w, gate_b)
-        up = F.linear(x, up_w, up_b)
-        if swiglu_limit is not None:
-            gate = gate.float().clamp(max=swiglu_limit)
-            up = up.float().clamp(min=-swiglu_limit, max=swiglu_limit)
-        hidden_state = F.silu(gate) * up
-        if hidden_state.dtype != x.dtype:
-            hidden_state = hidden_state.to(dtype=x.dtype)
-        expected = F.linear(hidden_state, down_w, down_b)
-        actual = resolve_op("swiglu_mlp", "standard", impl).wrapper(
-            *actual_args,
+        expected = _reference(reference_mlp, x_ref, swiglu_limit=swiglu_limit)
+        actual = resolve_op("gated_mlp", "standard", impl).wrapper(
+            actual_mlp,
+            x_act,
             swiglu_limit=swiglu_limit,
         )
 
@@ -190,7 +222,9 @@ def test_autocast_forward_backward_matches_pytorch(impl: str, device: str, swigl
     actual.backward(grad_output)
 
     torch.testing.assert_close(actual, expected, atol=SWIGLU_FUSED_ATOL, rtol=SWIGLU_FUSED_RTOL)
-    for actual_arg, reference_arg in zip(actual_args, reference_args, strict=True):
+    for actual_arg, reference_arg in zip(
+        (x_act, *actual_mlp.parameters()), (x_ref, *reference_mlp.parameters()), strict=True
+    ):
         torch.testing.assert_close(
             actual_arg.grad,
             reference_arg.grad,
@@ -205,7 +239,7 @@ def test_eager_matches_swiglu_limit():
     Installed class: ``transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Experts``.
 
     One expert, every token routed to it with weight 1, so the expert MLP
-    is the same as ``swiglu_mlp`` with the DSV4 clamp.
+    is the same as ``gated_mlp`` with the DSV4 clamp.
     """
     torch.manual_seed(2)
     hidden, intermediate, limit = 64, 128, 7.0
@@ -237,21 +271,16 @@ def test_eager_matches_swiglu_limit():
     out_h = experts(x_h.reshape(tokens, hidden), selected, routing).reshape_as(x)
 
     x_e = x.detach().requires_grad_(True)
-    down_w = experts.down_proj[0].detach()
-    gate_e = nn.Parameter(gate_w.clone())
-    up_e = nn.Parameter(up_w.clone())
-    down_e = nn.Parameter(down_w.clone())
-    wrapper = resolve_op("swiglu_mlp", "standard", "eager").wrapper
-    out_e = wrapper(
-        x_e,
-        gate_e,
-        _empty_bias(gate_e),
-        up_e,
-        _empty_bias(up_e),
-        down_e,
-        _empty_bias(down_e),
-        swiglu_limit=limit,
+    mlp_e = _mlp_from_tensors(
+        gate_w,
+        gate_w.new_empty(0),
+        up_w,
+        up_w.new_empty(0),
+        experts.down_proj[0].detach(),
+        gate_w.new_empty(0),
     )
+    wrapper = resolve_op("gated_mlp", "standard", "eager").wrapper
+    out_e = wrapper(mlp_e, x_e, swiglu_limit=limit)
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = torch.randn_like(out_e)
@@ -259,9 +288,11 @@ def test_eager_matches_swiglu_limit():
     out_e.backward(go)
     assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     gate_h_grad, up_h_grad = experts.gate_up_proj.grad[0].chunk(2, dim=0)
-    assert torch.allclose(gate_e.grad, gate_h_grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-    assert torch.allclose(up_e.grad, up_h_grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
-    assert torch.allclose(down_e.grad, experts.down_proj.grad[0], atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(mlp_e.gate_proj.weight.grad, gate_h_grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(mlp_e.up_proj.weight.grad, up_h_grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(
+        mlp_e.down_proj.weight.grad, experts.down_proj.grad[0], atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL
+    )
 
 
 @pytest.mark.parametrize("with_bias", (False, True), ids=("no-bias", "bias"))
@@ -280,26 +311,18 @@ def test_liger_empty_input_falls_back_to_eager_backward(with_bias: bool):
         up_b = torch.empty(0, requires_grad=True)
         down_b = torch.empty(0, requires_grad=True)
 
-    entry = OpEntry(
-        "swiglu_mlp",
-        "standard",
-        "liger-empty-test",
-        description="Test-only Liger SwiGLU entry",
-        forward=standard_liger.forward,
-        backward=standard_liger.backward,
-    )
-    assert entry.wrapper is not None
-    output = entry.wrapper(x, gate_w, gate_b, up_w, up_b, down_w, down_b, swiglu_limit=1.0)
+    mlp = _mlp_from_tensors(gate_w, gate_b, up_w, up_b, down_w, down_b)
+    output = standard_liger.wrapper(mlp, x, swiglu_limit=1.0)
 
     assert output.shape == x.shape
     output.sum().backward()
-    for tensor in (x, gate_w, up_w, down_w):
-        torch.testing.assert_close(tensor.grad, torch.zeros_like(tensor))
-    for bias in (gate_b, up_b, down_b):
+    torch.testing.assert_close(x.grad, torch.zeros_like(x))
+    for projection in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        torch.testing.assert_close(projection.weight.grad, torch.zeros_like(projection.weight))
         if with_bias:
-            torch.testing.assert_close(bias.grad, torch.zeros_like(bias))
+            torch.testing.assert_close(projection.bias.grad, torch.zeros_like(projection.bias))
         else:
-            assert bias.grad is None
+            assert projection.bias is None
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger SwiGLU needs a GPU")
@@ -307,8 +330,8 @@ def test_liger_empty_input_falls_back_to_eager_backward(with_bias: bool):
 @pytest.mark.parametrize("swiglu_limit", [None, 1.0])
 def test_liger_matches_eager(hidden: int, intermediate: int, swiglu_limit: float | None):
     pytest.importorskip("liger_kernel")
-    eager = resolve_op("swiglu_mlp", "standard", "eager").wrapper
-    other = resolve_op("swiglu_mlp", "standard", "liger_kernel").wrapper
+    eager = resolve_op("gated_mlp", "standard", "eager").wrapper
+    other = resolve_op("gated_mlp", "standard", "liger_kernel").wrapper
     torch.manual_seed(0)
     mlp = _tiny_qwen3_mlp(hidden, intermediate).to(device="cuda", dtype=torch.bfloat16)
     x = torch.randn(2, 16, mlp.hidden_size, device="cuda", dtype=torch.bfloat16)
@@ -344,39 +367,23 @@ def test_liger_swiglu_limit_matches_fp32_activation_contract():
     up_w[:, 0] = 0.9921875
     down_w = torch.zeros(hidden, intermediate, device="cuda", dtype=torch.bfloat16)
     down_w[:, :hidden] = torch.eye(hidden, device="cuda", dtype=torch.bfloat16)
-    tensors = (x, gate_w, up_w, down_w)
-
-    eager_args = [tensor.detach().clone().requires_grad_(True) for tensor in tensors]
-    liger_args = [tensor.detach().clone().requires_grad_(True) for tensor in tensors]
     empty = x.new_empty(0)
-    eager = resolve_op("swiglu_mlp", "standard", "eager").wrapper
-    liger = resolve_op("swiglu_mlp", "standard", "liger_kernel").wrapper
-    output_eager = eager(
-        eager_args[0],
-        eager_args[1],
-        empty,
-        eager_args[2],
-        empty,
-        eager_args[3],
-        empty,
-        swiglu_limit=1.0,
-    )
-    output_liger = liger(
-        liger_args[0],
-        liger_args[1],
-        empty,
-        liger_args[2],
-        empty,
-        liger_args[3],
-        empty,
-        swiglu_limit=1.0,
-    )
+    eager = resolve_op("gated_mlp", "standard", "eager").wrapper
+    liger = resolve_op("gated_mlp", "standard", "liger_kernel").wrapper
+    # Fresh copies per row: the two backward passes must not share parameters.
+    mlp_eager = _mlp_from_tensors(gate_w, empty, up_w, empty, down_w, empty)
+    mlp_liger = _mlp_from_tensors(gate_w, empty, up_w, empty, down_w, empty)
+    x_eager = x.detach().clone().requires_grad_(True)
+    x_liger = x.detach().clone().requires_grad_(True)
+
+    output_eager = eager(mlp_eager, x_eager, swiglu_limit=1.0)
+    output_liger = liger(mlp_liger, x_liger, swiglu_limit=1.0)
 
     torch.testing.assert_close(output_liger, output_eager, rtol=0, atol=5e-4)
     grad_output = torch.randn_like(output_eager)
     output_eager.backward(grad_output)
     output_liger.backward(grad_output)
-    for actual, expected in zip(liger_args, eager_args, strict=True):
+    for actual, expected in zip((x_liger, *mlp_liger.parameters()), (x_eager, *mlp_eager.parameters()), strict=True):
         torch.testing.assert_close(
             actual.grad,
             expected.grad,
@@ -439,7 +446,7 @@ def test_geglu_eager_matches_hf():
     out_h = mlp_h(x_h)
 
     x_e = x.detach().requires_grad_(True)
-    wrapper = resolve_op("swiglu_mlp", "geglu", "eager").wrapper
+    wrapper = resolve_op("gated_mlp", "geglu", "eager").wrapper
     out_e = wrapper(*_mlp_args(mlp_e, x_e))
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
@@ -466,8 +473,8 @@ def test_geglu_eager_matches_biased_linears():
     out_h = down_h(F.gelu(gate_h(x_h), approximate="tanh") * up_h(x_h))
 
     x_e = x.detach().requires_grad_(True)
-    wrapper = resolve_op("swiglu_mlp", "geglu", "eager").wrapper
-    out_e = wrapper(x_e, gate_e.weight, gate_e.bias, up_e.weight, up_e.bias, down_e.weight, down_e.bias)
+    wrapper = resolve_op("gated_mlp", "geglu", "eager").wrapper
+    out_e = wrapper(_mlp_of(gate_e, up_e, down_e), x_e)
     assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
 
     go = torch.randn_like(out_e)
@@ -500,8 +507,7 @@ def test_geglu_autocast_forward_backward_matches_pytorch(impl: str, device: str)
 
     torch.manual_seed(12)
     hidden, intermediate = 64, 128
-    tensors = (
-        torch.randn(2, 8, hidden, device=device) * 0.1,
+    weights = (
         torch.randn(intermediate, hidden, device=device) * 0.1,
         torch.randn(intermediate, device=device) * 0.1,
         torch.randn(intermediate, hidden, device=device) * 0.1,
@@ -509,22 +515,24 @@ def test_geglu_autocast_forward_backward_matches_pytorch(impl: str, device: str)
         torch.randn(hidden, intermediate, device=device) * 0.1,
         torch.randn(hidden, device=device) * 0.1,
     )
-    reference_args = tuple(tensor.detach().clone().requires_grad_(True) for tensor in tensors)
-    actual_args = tuple(tensor.detach().clone().requires_grad_(True) for tensor in tensors)
+    reference_mlp = _mlp_from_tensors(*weights)
+    actual_mlp = _mlp_from_tensors(*weights)
+    x = torch.randn(2, 8, hidden, device=device) * 0.1
+    x_ref = x.detach().requires_grad_(True)
+    x_act = x.detach().requires_grad_(True)
 
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        x, gate_w, gate_b, up_w, up_b, down_w, down_b = reference_args
-        expected = F.linear(
-            F.gelu(F.linear(x, gate_w, gate_b), approximate="tanh") * F.linear(x, up_w, up_b), down_w, down_b
-        )
-        actual = resolve_op("swiglu_mlp", "geglu", impl).wrapper(*actual_args)
+        expected = _reference(reference_mlp, x_ref, tanh_gelu=True)
+        actual = resolve_op("gated_mlp", "geglu", impl).wrapper(actual_mlp, x_act)
 
     grad_output = torch.randn_like(expected)
     expected.backward(grad_output)
     actual.backward(grad_output)
 
     torch.testing.assert_close(actual, expected, atol=SWIGLU_FUSED_ATOL, rtol=SWIGLU_FUSED_RTOL)
-    for actual_arg, reference_arg in zip(actual_args, reference_args, strict=True):
+    for actual_arg, reference_arg in zip(
+        (x_act, *actual_mlp.parameters()), (x_ref, *reference_mlp.parameters()), strict=True
+    ):
         torch.testing.assert_close(
             actual_arg.grad,
             reference_arg.grad,
@@ -549,34 +557,26 @@ def test_geglu_liger_empty_input_falls_back_to_eager_backward(with_bias: bool):
         up_b = torch.empty(0, requires_grad=True)
         down_b = torch.empty(0, requires_grad=True)
 
-    entry = OpEntry(
-        "swiglu_mlp",
-        "geglu",
-        "liger-empty-test",
-        description="Test-only Liger GeGLU entry",
-        forward=geglu_liger.forward,
-        backward=geglu_liger.backward,
-    )
-    assert entry.wrapper is not None
-    output = entry.wrapper(x, gate_w, gate_b, up_w, up_b, down_w, down_b)
+    mlp = _mlp_from_tensors(gate_w, gate_b, up_w, up_b, down_w, down_b)
+    output = geglu_liger.wrapper(mlp, x)
 
     assert output.shape == x.shape
     output.sum().backward()
-    for tensor in (x, gate_w, up_w, down_w):
-        torch.testing.assert_close(tensor.grad, torch.zeros_like(tensor))
-    for bias in (gate_b, up_b, down_b):
+    torch.testing.assert_close(x.grad, torch.zeros_like(x))
+    for projection in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        torch.testing.assert_close(projection.weight.grad, torch.zeros_like(projection.weight))
         if with_bias:
-            torch.testing.assert_close(bias.grad, torch.zeros_like(bias))
+            torch.testing.assert_close(projection.bias.grad, torch.zeros_like(projection.bias))
         else:
-            assert bias.grad is None
+            assert projection.bias is None
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="liger GeGLU needs a GPU")
 @pytest.mark.parametrize("hidden, intermediate", [(64, 128), (128, 256)])
 def test_geglu_liger_matches_eager(hidden: int, intermediate: int):
     pytest.importorskip("liger_kernel")
-    eager = resolve_op("swiglu_mlp", "geglu", "eager").wrapper
-    other = resolve_op("swiglu_mlp", "geglu", "liger_kernel").wrapper
+    eager = resolve_op("gated_mlp", "geglu", "eager").wrapper
+    other = resolve_op("gated_mlp", "geglu", "liger_kernel").wrapper
     torch.manual_seed(0)
     mlp = _tiny_gemma3_mlp(hidden, intermediate).to(device="cuda", dtype=torch.bfloat16)
     x = torch.randn(2, 16, mlp.hidden_size, device="cuda", dtype=torch.bfloat16)
@@ -607,7 +607,7 @@ def test_qat_row_keeps_the_clamp_in_the_model_dtype(monkeypatch):
     quantizers are stubbed to identity here so the assertion isolates the clamp;
     the real ones need an SM90 GPU.
     """
-    import veomni.ops.kernels.swiglu_mlp.standard.qat as qat_impl
+    import veomni.ops.kernels.gated_mlp.standard.qat as qat_impl
 
     monkeypatch.setattr(qat_impl, "fp8_fake_quant_act", lambda t, block_size=128: t)
     monkeypatch.setattr(qat_impl, "fp8_fake_quant_weight", lambda t, block_size=128: t)
@@ -621,16 +621,8 @@ def test_qat_row_keeps_the_clamp_in_the_model_dtype(monkeypatch):
     down = torch.eye(hidden_dim, dtype=torch.bfloat16)
     x = torch.randn(1, hidden_dim, dtype=torch.bfloat16) * 40
 
-    actual = qat_impl.wrapper(
-        x,
-        eye,
-        eye.new_empty(0),
-        eye,
-        eye.new_empty(0),
-        down,
-        down.new_empty(0),
-        swiglu_limit=limit,
-    )
+    mlp = _mlp_from_tensors(eye, eye.new_empty(0), eye, eye.new_empty(0), down, down.new_empty(0))
+    actual = qat_impl.wrapper(mlp, x, swiglu_limit=limit)
 
     clamped = x.clamp(max=limit)
     expected = F.silu(clamped) * x.clamp(min=-limit, max=limit)
@@ -659,7 +651,7 @@ def test_the_eager_row_evaluates_every_activation_it_claims(activation, dtype):
     import torch.nn.functional as F
     from transformers.activations import ACT2FN
 
-    from veomni.ops.kernels.swiglu_mlp.standard import eager
+    from veomni.ops.kernels.gated_mlp.standard import eager
 
     torch.manual_seed(0)
     x = torch.randn(3, 16, dtype=dtype)
@@ -687,7 +679,7 @@ def test_the_eager_row_backward_matches_autograd_for_every_activation(activation
     import torch.nn.functional as F
     from transformers.activations import ACT2FN
 
-    from veomni.ops.kernels.swiglu_mlp.standard import eager
+    from veomni.ops.kernels.gated_mlp.standard import eager
 
     torch.manual_seed(0)
     x = torch.randn(3, 16, dtype=torch.float32, requires_grad=True)
@@ -710,7 +702,7 @@ def test_the_eager_row_backward_matches_autograd_for_every_activation(activation
 
 def test_liger_kernels_refuses_an_activation_it_cannot_compute():
     """Liger's swiglu kernels are SiLU only, and say so instead of computing SiLU anyway."""
-    from veomni.ops.kernels.swiglu_mlp.standard import liger_kernel
+    from veomni.ops.kernels.gated_mlp.standard import liger_kernel
 
     empty = torch.empty(0)
     x = torch.randn(2, 16)
@@ -746,7 +738,7 @@ def test_the_supported_set_is_the_bounded_whitelist():
             normalize_activation(name)
 
 
-def test_a_linear_subclass_projection_skips_the_fused_path():
+def test_a_linear_subclass_projection_runs_its_own_forward():
     """Only an exact ``nn.Linear`` may be read by weight; a subclass runs its own forward.
 
     torchao's ``Float8Linear`` subclasses ``nn.Linear`` and does its float8 GEMM in
@@ -754,27 +746,85 @@ def test_a_linear_subclass_projection_skips_the_fused_path():
     silently skip float8, so the check must be on the exact type. A quantizing row
     on such a projection is refused instead of falling back.
     """
-    from veomni.ops import VeomniOp
-    from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+    from veomni.ops.kernels.gated_mlp._module import render
+
+    class _SubclassLinear(nn.Linear):
+        calls = 0
+
+        def forward(self, x):
+            type(self).calls += 1
+            return super().forward(x)
+
+    mlp = _tiny_qwen3_mlp()
+    assert render(mlp, impl="eager", activation="silu").projections is None
+
+    mlp.up_proj = _SubclassLinear(mlp.hidden_size, mlp.intermediate_size, bias=False)
+    assert render(mlp, impl="eager", activation="silu").projections is not None
+
+    # The row routes through the projection modules, so the subclass sees the call.
+    _SubclassLinear.calls = 0
+    resolve_op("gated_mlp", "standard", "eager").wrapper(mlp, torch.randn(2, 4, mlp.hidden_size))
+    assert _SubclassLinear.calls == 1
+
+    # A quantizing row would have to fake-quantize a weight this projection does not
+    # compute with, so it refuses rather than silently training at full precision.
+    with pytest.raises(ValueError, match="nn.Linear subclass"):
+        render(mlp, impl="qat", activation="silu")
+    with pytest.raises(ValueError, match="nn.Linear subclass"):
+        render(mlp, impl="torchao_nvfp4", activation="silu")
+
+
+def test_render_routes_each_row_by_shape_and_activation():
+    """Every row decides weights-or-projections the same way, and only that once.
+
+    The decision lives in ``gated_mlp._module.render`` rather than in modeling, so a
+    model's MLP forward is one handle call with no branch. What it decides has to
+    hold for each row: ``swish`` is HF's alias of the SiLU a row implements (so it
+    takes the weights path, not the fallback), and any activation a row does not
+    implement -- or any projection it cannot read -- takes the projection modules.
+    """
+    from veomni.ops.kernels.gated_mlp._module import render
+
+    mlp = _tiny_qwen3_mlp()
+
+    for impl in ("eager", "qat", "torchao_nvfp4", "liger_kernel"):
+        for activation in ("silu", "swish"):
+            assert render(mlp, impl=impl, activation=activation).projections is None, (impl, activation)
+
+    # Liger's swiglu kernels are SiLU only; every other row evaluates the set.
+    assert render(mlp, impl="liger_kernel", activation="gelu").projections is not None
+    for impl in ("eager", "qat", "torchao_nvfp4"):
+        assert render(mlp, impl=impl, activation="gelu").projections is None
+
+    # An activation outside the set is never served by a row.
+    for impl in ("eager", "liger_kernel"):
+        assert render(mlp, impl=impl, activation="mish").projections is not None
+
+
+def test_render_refuses_a_quantizing_row_it_cannot_serve():
+    """A quantizing row raises rather than fall back, and says which knob to turn.
+
+    Falling back would train at full precision under a config that claimed
+    quantization -- a silent correctness bug, not a graceful degradation.
+    """
+    from veomni.ops.kernels.gated_mlp._module import render
+
+    mlp = _tiny_qwen3_mlp()
+
+    with pytest.raises(ValueError, match="no quantizing row evaluates that activation"):
+        render(mlp, impl="qat", activation="mish")
 
     class _SubclassLinear(nn.Linear):
         pass
 
-    mlp = _tiny_qwen3_mlp()
-    assert has_plain_linear_projections(mlp)
-
     mlp.up_proj = _SubclassLinear(mlp.hidden_size, mlp.intermediate_size, bias=False)
-    mlp.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", "eager")
-    assert not has_plain_linear_projections(mlp)
-
-    # The quantizing check runs before the row is resolved, so a stub handle
-    # carrying the impl name is enough; the real ``qat`` row needs SM90 + TileLang.
-    class _QatHandle:
-        impl = "qat"
-
-    mlp.veomni_swiglu_mlp = _QatHandle()
     with pytest.raises(ValueError, match="nn.Linear subclass"):
-        has_plain_linear_projections(mlp)
+        render(mlp, impl="qat", activation="silu")
+
+    # Both messages name `eager` as the way to keep the projection path.
+    for impl, activation in (("qat", "mish"), ("torchao_nvfp4", "mish")):
+        with pytest.raises(ValueError, match="gated_mlp_implementation='eager'"):
+            render(mlp, impl=impl, activation=activation)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -831,7 +881,7 @@ def test_the_eager_row_backward_survives_activation_offload(activation):
 
     from veomni.ops import VeomniOp
 
-    op = VeomniOp("swiglu_mlp", "standard", "eager")
+    op = VeomniOp("gated_mlp", "standard", "eager")
 
     # Fixed inputs: the comparison is between two backward passes over the same
     # graph, so both must see the same tensors.
@@ -842,8 +892,9 @@ def test_the_eager_row_backward_survives_activation_offload(activation):
     empty = weight.new_empty(0)
 
     def step():
+        mlp = _mlp_from_tensors(weight, empty, weight, empty, down, empty)
         leaf = x.detach().requires_grad_(True)
-        out = op(leaf, weight, empty, weight, empty, down, empty, activation=activation)
+        out = op(mlp, leaf, activation=activation)
         return torch.autograd.grad(out.sum(), leaf)[0]
 
     plain = step()
@@ -865,7 +916,7 @@ def test_torchao_nvfp4_matches_manual_round_trip(swiglu_limit: float | None):
     """The fused row equals the same math with operands quantized by hand, clamp in the model dtype."""
     from veomni.ops.qat.torchao_nvfp4 import nvfp4_fake_quant
 
-    impl = resolve_op("swiglu_mlp", "standard", "torchao_nvfp4").wrapper
+    impl = resolve_op("gated_mlp", "standard", "torchao_nvfp4").wrapper
     torch.manual_seed(0)
     mlp = _tiny_qwen3_mlp(64, 128).to(dtype=torch.bfloat16)
     x = torch.randn(2, 16, 64, dtype=torch.bfloat16)
@@ -889,7 +940,7 @@ def test_torchao_nvfp4_matches_manual_round_trip(swiglu_limit: float | None):
 @_requires_torchao
 def test_torchao_nvfp4_backward_produces_finite_gradients():
     """Straight-through gradients reach the input and every projection weight."""
-    impl = resolve_op("swiglu_mlp", "standard", "torchao_nvfp4").wrapper
+    impl = resolve_op("gated_mlp", "standard", "torchao_nvfp4").wrapper
     torch.manual_seed(0)
     mlp = _tiny_qwen3_mlp().to(dtype=torch.bfloat16)
     x = torch.randn(2, 16, mlp.hidden_size, dtype=torch.bfloat16, requires_grad=True)
@@ -906,7 +957,7 @@ def test_torchao_nvfp4_backward_produces_finite_gradients():
 @_requires_torchao
 def test_torchao_nvfp4_handles_empty_input():
     """Zero-token inputs keep their shape and propagate zero gradients to the MLP weights."""
-    impl = resolve_op("swiglu_mlp", "standard", "torchao_nvfp4").wrapper
+    impl = resolve_op("gated_mlp", "standard", "torchao_nvfp4").wrapper
     mlp = _tiny_qwen3_mlp().to(dtype=torch.bfloat16)
     x = torch.randn(0, 8, mlp.hidden_size, dtype=torch.bfloat16, requires_grad=True)
 

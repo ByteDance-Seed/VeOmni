@@ -67,18 +67,18 @@ def reject_quantizing_act_fn(owner: nn.Module) -> None:
     the routed experts at full precision while the config claims otherwise. Support
     for other activations is tracked in #1430.
 
-    The activation is read from ``owner.use_swiglu_mlp`` rather than a config:
+    The activation is read from ``owner.use_gated_mlp`` rather than a config:
     ``DeepseekV3Experts`` and its siblings are plain ``nn.Module`` objects that
     record the answer at construction and hold no config reference.
 
     Args:
         owner: The experts module that owns the ``veomni_moe`` handle and carries
-            ``use_swiglu_mlp``.
+            ``use_gated_mlp``.
 
     Raises:
         ValueError: when the selection quantizes and the activation is not SwiGLU.
     """
-    if getattr(owner, "use_swiglu_mlp", True):
+    if getattr(owner, "use_gated_mlp", True):
         return
     handle = getattr(owner, "veomni_moe", None)
     impl = getattr(handle, "impl", None)

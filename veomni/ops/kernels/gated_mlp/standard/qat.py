@@ -30,7 +30,7 @@ this row instead of falling back to its projection modules unquantized.
 from __future__ import annotations
 
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
 from ....activation import apply_activation
 from ....qat import fp8_fake_quant_act, fp8_fake_quant_weight
@@ -38,13 +38,8 @@ from . import eager as _eager
 
 
 def wrapper(
+    mlp: nn.Module,
     x: Tensor,
-    gate_w: Tensor,
-    gate_b: Tensor,
-    up_w: Tensor,
-    up_b: Tensor,
-    down_w: Tensor,
-    down_b: Tensor,
     *,
     swiglu_limit: float | None = None,
     block_size: int = 128,
@@ -52,11 +47,15 @@ def wrapper(
 ) -> Tensor:
     """Run a gated MLP with blockwise FP8 fake-quantized projections.
 
-    Empty bias tensors denote unused biases. ``activation`` is the config's
-    ``hidden_act``; it defaults to SiLU because that is what every published
-    checkpoint of this shape uses, and the string is validated by
-    :func:`~veomni.ops.activation.apply_activation`.
+    ``mlp`` is the model's MLP block. This row always reads its weights, so
+    :func:`.._module.render` refuses a wrapped projection or an ``nn.Linear``
+    subclass instead of quantizing something other than what the projection
+    computes, and refuses an activation no quantizing row evaluates rather than
+    falling back to full precision.
     """
+    from .._module import render
+
+    gate_w, gate_b, up_w, up_b, down_w, down_b = render(mlp, impl="qat", activation=activation).weights
     x_gate_q = fp8_fake_quant_act(x, block_size=block_size) if x.numel() > 0 else x
     gate = F.linear(x_gate_q, fp8_fake_quant_weight(gate_w, block_size=block_size), _eager.optional_bias(gate_b))
     up = F.linear(x_gate_q, fp8_fake_quant_weight(up_w, block_size=block_size), _eager.optional_bias(up_b))

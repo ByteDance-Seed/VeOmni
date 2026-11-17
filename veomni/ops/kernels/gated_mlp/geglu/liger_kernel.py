@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from torch import Tensor
+from torch import Tensor, nn
 
 from ....registry import SavedState
 from . import eager as _eager
@@ -100,3 +100,32 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
         grad_down_w,
         grad_down_b,
     )
+
+
+def wrapper(mlp: nn.Module, x: Tensor, *, activation: str = "gelu_pytorch_tanh") -> Tensor:
+    """Row entry point: take the GeGLU MLP module and run it through Liger.
+
+    A projection the row cannot read by weight, an activation this variant does not
+    compute, or an empty batch goes to the ``eager`` row, which runs the projection
+    modules' own ``forward``.
+    """
+    from .._module import plain_projections
+
+    if activation not in _eager.TANH_GELU or not plain_projections(mlp) or x.numel() == 0:
+        # An empty grid is not what Liger is for, and the raw pair's empty path
+        # returns a detached zero, which would cut the block out of the backward
+        # pass. Plain PyTorch is exact on zero elements and keeps the graph.
+        return _eager.wrapper(mlp, x, activation=activation)
+
+    gate, up, down = mlp.gate_proj, mlp.up_proj, mlp.down_proj
+    empty = gate.weight.new_empty(0)
+    output, _ = forward(
+        x,
+        gate.weight,
+        gate.bias if gate.bias is not None else empty,
+        up.weight,
+        up.bias if up.bias is not None else empty,
+        down.weight,
+        down.bias if down.bias is not None else empty,
+    )
+    return output

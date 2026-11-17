@@ -55,13 +55,13 @@ def test_unweighted_rms_norm_rejects_unregistered_backend(monkeypatch, impl):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("parse_config", [False, True], ids=["dataclass", "parser"])
-@pytest.mark.parametrize("field", ["linear_implementation", "swiglu_mlp_implementation"])
+@pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
 def test_deepgemm_experts_coexist_with_quantizing_gemm_families(monkeypatch, parse_config, field):
     """A DeepGEMM expert GEMM and a quantizing dense family round different operands.
 
     ``deepgemm_fp8`` and ``qat`` are two values of the same ``moe_implementation``
     field, so the routed experts can never be quantized twice. The shared expert
-    (``swiglu_mlp``) and the attention projections (``linear``) are separate dense
+    (``gated_mlp``) and the attention projections (``linear``) are separate dense
     GEMMs, so quantizing them alongside is a valid recipe -- and a useful one, since
     DeepGEMM covers only the experts.
     """
@@ -95,7 +95,7 @@ def test_deepgemm_experts_coexist_with_quantizing_gemm_families(monkeypatch, par
         {"moe_implementation": "eager", "linear_implementation": "qat"},
         {"moe_implementation": "fused_triton", "linear_implementation": "qat"},
         {"moe_implementation": "fused_quack", "linear_implementation": "qat"},
-        {"moe_implementation": "eager", "swiglu_mlp_implementation": "qat"},
+        {"moe_implementation": "eager", "gated_mlp_implementation": "qat"},
     ],
 )
 def test_deepgemm_qat_guard_preserves_valid_selections(monkeypatch, values):
@@ -167,12 +167,12 @@ def test_upstream_llama_config_ops_config_save_and_reload(tmp_path):
 
     overridden = LlamaConfig.from_pretrained(
         tmp_path,
-        ops_implementation={"swiglu_mlp_implementation": "eager"},
+        ops_implementation={"gated_mlp_implementation": "eager"},
     )
     assert overridden.ops_implementation == {
         "rms_norm_implementation": "eager",
         "attn_implementation": "veomni_sdpa",
-        "swiglu_mlp_implementation": "eager",
+        "gated_mlp_implementation": "eager",
     }
 
 

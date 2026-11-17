@@ -14,7 +14,7 @@
 
 """Activation selection shared by the gated-MLP rows.
 
-Both ``swiglu_mlp`` and ``moe_experts`` compute ``act_fn(gate) * up``. Which
+Both ``gated_mlp`` and ``moe_experts`` compute ``act_fn(gate) * up``. Which
 ``act_fn`` is a property of the *model*, not of the row: a config says
 ``hidden_act: gelu`` and expects its MLP to use GELU whether or not the row
 quantizes. Hard-coding SiLU inside a row made that impossible, so a model with
@@ -81,7 +81,7 @@ __all__ = [
 #: and ``gelu_pytorch_tanh``. The latter only appears on Gemma3 and on vision
 #: towers, and neither reaches an ``activation=`` call -- Gemma3 binds the ``geglu``
 #: variant, whose rows take no such argument and are fixed to GELU-tanh, and the
-#: vision towers bind no ``swiglu_mlp`` at all. So on the ``standard`` variant the
+#: vision towers bind no ``gated_mlp`` at all. So on the ``standard`` variant the
 #: only activation any model passes today is ``silu``.
 #:
 #: What is kept beyond that, and why:
@@ -100,7 +100,7 @@ __all__ = [
 #: ``sigmoid``, ``sqrtsoftplus``, ``tanh`` -- would be an unexercised capability.
 #: A model configured with one takes its projection fallback, which calls the
 #: model's own ``act_fn`` and is exact for any activation; a *quantizing* row
-#: refuses rather than fall back (see ``use_fused_row``).
+#: refuses rather than fall back (see ``veomni.ops.kernels.gated_mlp._module``).
 SUPPORTED_ACTIVATIONS: tuple[str, ...] = (
     "silu",
     "swish",

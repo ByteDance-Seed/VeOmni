@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from torch import Tensor
+from torch import Tensor, nn
 
 from ....activation import normalize_activation
 from ....registry import SavedState
@@ -44,7 +44,7 @@ def forward(
     """
     if normalize_activation(activation) != "silu":
         raise ValueError(
-            f"swiglu_mlp_implementation='liger_kernel' computes SiLU only, and the model asks for "
+            f"gated_mlp_implementation='liger_kernel' computes SiLU only, and the model asks for "
             f"{activation!r}. Select 'eager' for this activation, or 'qat' if the run is "
             f"quantization-aware -- both evaluate the config's activation."
         )
@@ -136,3 +136,42 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
         grad_down_w,
         grad_down_b,
     )
+
+
+def wrapper(
+    mlp: nn.Module,
+    x: Tensor,
+    *,
+    swiglu_limit: float | None = None,
+    activation: str = "silu",
+) -> Tensor:
+    """Row entry point: take the MLP module and run it through Liger.
+
+    Liger's ``swiglu_forward`` / ``swiglu_backward`` implement SiLU only, so a model
+    that asks for another activation -- or whose projections cannot be read by
+    weight -- is served by its own projection modules instead of by this row. That
+    decision is :func:`.._module.render`'s, so a model's MLP forward stays a single
+    handle call.
+    """
+    from .._module import render
+
+    rendered = render(mlp, impl="liger_kernel", activation=activation)
+    if rendered.projections is not None or x.numel() == 0:
+        # An empty grid is not what Liger is for, and the raw pair's empty path
+        # returns a detached zero -- which would cut the block out of the backward
+        # pass. Plain PyTorch is exact on zero elements and keeps the graph.
+        return _eager.wrapper(mlp, x, swiglu_limit=swiglu_limit, activation=activation)
+
+    gate_w, gate_b, up_w, up_b, down_w, down_b = rendered.weights
+    output, _ = forward(
+        x,
+        gate_w,
+        gate_b,
+        up_w,
+        up_b,
+        down_w,
+        down_b,
+        swiglu_limit=swiglu_limit,
+        activation=activation,
+    )
+    return output

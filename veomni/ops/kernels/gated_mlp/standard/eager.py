@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
 from ....activation import apply_activation, apply_activation_backward
 from ....registry import SavedState
@@ -247,22 +247,17 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
 
 
 def wrapper(
+    mlp: nn.Module,
     x: Tensor,
-    gate_w: Tensor,
-    gate_b: Tensor,
-    up_w: Tensor,
-    up_b: Tensor,
-    down_w: Tensor,
-    down_b: Tensor,
     *,
     swiglu_limit: float | None = None,
     activation: str = "silu",
 ) -> Tensor:
     """Run the gated MLP as plain PyTorch, letting autograd build the backward.
 
-    This is the row entry point, and it deliberately does **not** go through
-    ``forward`` / ``backward`` above. Those exist for ``liger_kernel`` to reuse the
-    same clamp and projection helpers, and ``register_op`` turns a raw pair into one
+    This is the row entry point. It deliberately does **not** go through
+    ``forward`` / ``backward`` above: those exist for ``liger_kernel`` to reuse the
+    clamp and projection helpers, and ``register_op`` turns a raw pair into one
     ``autograd.Function`` wrapping the whole MLP -- which two other mechanisms
     cannot coexist with:
 
@@ -279,8 +274,25 @@ def wrapper(
     the individual ops and Dynamo traces them. Verified bit-identical to the raw
     pair for ``silu`` and ``gelu``, with and without the clamp, in bf16 and fp32 --
     so switching the registration does not change any trained numerics.
+
+    ``mlp`` may also be a projection the row cannot read (a LoRA wrapper, an
+    ``nn.Linear`` subclass) or an activation nothing here evaluates; then the
+    projections run as modules, which is the model's own path. See
+    :func:`.._module.render`.
     """
-    if x.numel() == 0:
-        return empty_output(x, down_w)
+    from .._module import render
+
+    rendered = render(mlp, impl="eager", activation=activation)
+    if rendered.projections is not None:
+        gate_proj, up_proj, down_proj = rendered.projections
+        gate, up = gate_proj(x), up_proj(x)
+        gate, up = clamp_gate_up(gate, up, swiglu_limit)
+        return down_proj((apply_activation(gate, activation) * up).to(x.dtype))
+
+    # No empty-input shortcut here: ``F.linear`` on a zero-token batch returns zeros
+    # with a live graph, and a detached zero would cut the block out of the backward
+    # pass for exactly the ranks that hold no tokens. The fused rows keep their own
+    # shortcut, because kernels that misbehave on an empty grid need one.
+    gate_w, gate_b, up_w, up_b, down_w, down_b = rendered.weights
     hidden, _, _, _ = mlp_hidden(x, gate_w, gate_b, up_w, up_b, swiglu_limit=swiglu_limit, activation=activation)
     return linear(hidden, down_w, down_b)

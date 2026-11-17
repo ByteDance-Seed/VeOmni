@@ -1471,7 +1471,7 @@ def test_reject_quantizing_act_fn_refuses_only_quantizing_rows():
     Python ``act_fn`` loop is the only path for another activation -- and that loop
     cannot reach the family row. Support is tracked in #1430.
 
-    The activation is read from ``use_swiglu_mlp`` because these experts modules are
+    The activation is read from ``use_gated_mlp`` because these experts modules are
     plain ``nn.Module`` objects with no config reference.
     """
     from types import SimpleNamespace
@@ -1479,7 +1479,7 @@ def test_reject_quantizing_act_fn_refuses_only_quantizing_rows():
     from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 
     def experts(impl, swiglu):
-        return SimpleNamespace(veomni_moe=SimpleNamespace(impl=impl), use_swiglu_mlp=swiglu)
+        return SimpleNamespace(veomni_moe=SimpleNamespace(impl=impl), use_gated_mlp=swiglu)
 
     # SwiGLU is what every fused row implements.
     reject_quantizing_act_fn(experts("qat", swiglu=True))

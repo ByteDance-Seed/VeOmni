@@ -24,7 +24,7 @@ drop that compatibility. Call site:
 Only one retired name is handled here:
 
 * ``qat_implementation`` — a single global recipe. It was removed in favour of
-  one row per family (``linear_implementation``, ``swiglu_mlp_implementation``,
+  one row per family (``linear_implementation``, ``gated_mlp_implementation``,
   ``moe_implementation``, ``kv_round_implementation``).
 
 Two old values, and they do not migrate the same way:
@@ -96,7 +96,7 @@ def migrate_retired_selections(selections: Mapping[str, Any]) -> dict[str, Any]:
                 f"{field}={value!r} came from a config written before quantization-aware training "
                 f"became per-family, and cannot be translated without knowing which families the "
                 f"model has. Select them explicitly: 'linear_implementation' / "
-                f"'swiglu_mlp_implementation' / 'moe_implementation' = 'qat', plus "
+                f"'gated_mlp_implementation' / 'moe_implementation' = 'qat', plus "
                 f"'kv_round_implementation' = 'triton' for stored KV. Only {field}='none' "
                 f"(train in the model dtype) migrates automatically. See "
                 f"veomni/models/legacy_qat_selections.py."

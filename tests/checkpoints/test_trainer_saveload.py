@@ -385,7 +385,7 @@ def test_frozen_omni_module_resume_loads_hf_weights(tmp_path):
         "eager",
         "--model.ops_implementation.rms_norm_implementation",
         "eager",
-        "--model.ops_implementation.swiglu_mlp_implementation",
+        "--model.ops_implementation.gated_mlp_implementation",
         "eager",
         "--model.ops_implementation.rotary_pos_emb_implementation",
         "eager",

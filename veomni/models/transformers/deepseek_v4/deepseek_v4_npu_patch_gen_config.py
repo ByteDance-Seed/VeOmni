@@ -123,12 +123,12 @@ config.override_method(
 config.override_method(
     "DeepseekV4MLP.__init__",
     replacement=deepseek_v4_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 config.override_method(
     "DeepseekV4MLP.forward",
     replacement=deepseek_v4_mlp_forward_patched,
-    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the gated_mlp row, which picks fused weights or the projection modules",
 )
 config.override_method(
     "DeepseekV4TopKRouter.forward",

@@ -14,9 +14,9 @@
 #    - method_override: Qwen3RMSNorm.forward
 #      Always call the local rms_norm VeomniOp
 #    - method_override: Qwen3MLP.__init__
-#      Construct a local swiglu_mlp VeomniOp
+#      Construct a local gated_mlp VeomniOp
 #    - method_override: Qwen3MLP.forward
-#      Always call the local swiglu_mlp VeomniOp
+#      Always call the local gated_mlp VeomniOp
 #    - method_override: Qwen3DecoderLayer.__init__
 #      Pass config to Qwen3RMSNorm instances
 #    - method_override: Qwen3Model.__init__
@@ -73,7 +73,6 @@ from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationL
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import use_fused_row
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -115,21 +114,10 @@ class Qwen3MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+        self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
     def forward(self, x):
-        if use_fused_row(self, self.config.hidden_act):
-            return self.veomni_swiglu_mlp(
-                x,
-                self.gate_proj.weight,
-                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                self.up_proj.weight,
-                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-                self.down_proj.weight,
-                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-                activation=self.config.hidden_act,
-            )
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
 
 
 class Qwen3RotaryEmbedding(nn.Module):

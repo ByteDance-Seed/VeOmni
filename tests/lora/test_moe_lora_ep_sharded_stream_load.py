@@ -147,7 +147,7 @@ def _build_and_save_stream_load_assets(root_dir: str) -> None:
         moe_implementation="eager",
         cross_entropy_loss_implementation="eager",
         rms_norm_implementation="eager",
-        swiglu_mlp_implementation="eager",
+        gated_mlp_implementation="eager",
         rotary_pos_emb_implementation="eager",
     )
     model = build_lora_test_model(

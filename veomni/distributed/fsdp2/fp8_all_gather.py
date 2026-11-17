@@ -90,7 +90,7 @@ def register_deepgemm_fp8_all_gather(model: torch.nn.Module) -> int:
     """
     selected = {}
     for name, module in _deepgemm_experts(model):
-        if not getattr(module, "use_swiglu_mlp", True):
+        if not getattr(module, "use_gated_mlp", True):
             raise ValueError(f"FP8 all-gather requires the SwiGLU DeepGEMM execution path: {name}.")
         params = list(module.named_parameters(recurse=False))
         if len(params) != 2 or any(p.ndim != 3 for _, p in params):

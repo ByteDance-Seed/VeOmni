@@ -1,6 +1,6 @@
 # Op Selection in VeOmni
 
-VeOmni selects implementations for attention, RMSNorm, RoPE, SwiGLU, MoE,
+VeOmni selects implementations for attention, RMSNorm, RoPE, gated MLP, MoE,
 cross-entropy, load-balancing loss, GatedDeltaNet ops, DSA, mHC, and Qwen4-Exp QSA through
 `OpsImplementationConfig`. Modeling constructs instance-local `VeomniOp`
 handles. There is no process-global bind and no silent eager fallback after
@@ -26,7 +26,7 @@ If a field is not in this table, it is not an op-selection knob.
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| Gated MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel`, `qat` (FP8 QAT, SM90+), `torchao_nvfp4` (NVFP4 QAT) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp`. The activation is a **call argument** (`activation=config.hidden_act`), so a `gelu` model quantizes like a `silu` one; `liger_kernel` computes SiLU only and is skipped for anything else |
+| Gated MLP | `gated_mlp_implementation` | `eager`, `liger_kernel`, `qat` (FP8 QAT, SM90+), `torchao_nvfp4` (NVFP4 QAT) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp`. The activation is a **call argument** (`activation=config.hidden_act`), so a `gelu` model quantizes like a `silu` one; `liger_kernel` computes SiLU only and is skipped for anything else |
 | Dense projection | `linear_implementation` | `eager`, `qat` (FP8 QAT, SM90+), `torchao_nvfp4` (NVFP4 QAT, `standard` only) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants). Consumers: DeepSeek-V4 (`standard` + `grouped`, so `torchao_nvfp4` is not selectable there) and Qwen3 attention `q/k/v/o` (`standard`) |
 | KV / indexer storage round | `kv_round_implementation` | `none`, `eager`, `triton` (NVIDIA SM89+, ROCm) | `"none"`; there is no host default | Model `__init__` via an instance-local `VeomniOp` on the `deepseek_v4` variant, which fixes the model's two geometries; the `standard` variant is model-agnostic and takes them as call arguments. **DeepSeek-V4 is the only consumer** |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
@@ -48,7 +48,7 @@ subset's.
 
 That independence is the point. A deployment kernel rounds whatever that kernel
 rounds, and the model's families are usually on different paths — the attention
-projections, the shared expert's SwiGLU, the routed experts and the KV cache are
+projections, the shared expert's gated MLP, the routed experts and the KV cache are
 four different kernels in inference, with four different granularities. Binding
 them to one switch forces a training run to simulate rounding it does not have.
 
@@ -72,7 +72,7 @@ kernel does.
 
 | Argument | Row | What it selects |
 | --- | --- | --- |
-| `block_size` | `linear`, `swiglu_mlp`, `moe_experts` (`qat`) | Channels sharing one scale. One number drives **both** operands: the `1 x block_size` activation blocks and the square `block_size x block_size` weight tiles |
+| `block_size` | `linear`, `gated_mlp`, `moe_experts` (`qat`) | Channels sharing one scale. One number drives **both** operands: the `1 x block_size` activation blocks and the square `block_size x block_size` weight tiles |
 | `block_size` | `kv_round` (`standard`) | Group width over the last dimension |
 | `quant_features` | `kv_round` (`standard`) | How many leading channels to round, so a call can stop partway through the last dimension |
 | `rope_features` | `kv_round` (`deepseek_v4`) | Which of the model's two geometries applies: pass the trailing RoPE channels for a KV entry, or `None` to round a whole indexer head |
@@ -104,7 +104,7 @@ is that example:
 ```yaml
 ops_implementation:
   linear_implementation: qat          # attention and indexer projections
-  swiglu_mlp_implementation: qat      # the shared expert's fused SwiGLU
+  gated_mlp_implementation: qat      # the shared expert's fused gated MLP
   moe_implementation: qat             # routed experts, per the checkpoint's expert_dtype
   kv_round_implementation: triton     # stored KV and indexer logits
 ```
@@ -127,10 +127,9 @@ the weights it is handed, so a branch that bypasses it would train at full preci
 while the config still said QAT. Two of them refuse instead of falling through:
 
 - **A projection that is not an exact `nn.Linear`** is refused by
-  `has_plain_linear_projections` when it calls `reject_quantizing_row`: a
-  projection wrapped after construction (LoRA keeps the base layer at
-  `base_layer`, so there is no `weight`), or an `nn.Linear` subclass such as
-  torchao's `Float8Linear`, whose own forward computes the GEMM.
+  `gated_mlp._module.render`: a projection wrapped after construction (LoRA keeps
+  the base weights at `base_layer`, so there is no `weight`), or an `nn.Linear`
+  subclass such as torchao's `Float8Linear`, whose own forward computes the GEMM.
 - **Expert LoRA on a quantizing experts row** is refused by `_moe_lora_op`,
   because no adapter forward would quantize the base weights.
 
@@ -162,13 +161,18 @@ model's own `act_fn` and is exact for any activation. A *quantizing* row refuses
 instead, because falling back there would train at full precision under a config
 that claimed otherwise.
 
-Which row runs is decided before the call, by `swiglu_mlp.use_fused_row`, because
-a row's activation support is part of its contract:
+A row takes the **MLP module**, not six weight tensors, so a model's forward is a
+single handle call with no branch. The row decides for itself how to run the block:
+`gated_mlp._module.render` returns either the six weight tensors (when all three
+projections are exact `nn.Linear` and the row serves the activation) or the three
+projection modules. A row that has to fall back to the modules runs them through
+their own `forward`, which is the path the model took before this family existed.
+Row support is part of the row's contract:
 
 | Row | Activations | When it cannot serve the call |
 | --- | --- | --- |
-| `eager`, `qat` | every name `activation.py` evaluates | — |
-| `liger_kernel` | SiLU only (Liger's `swiglu_forward`) | the model falls back to its projection modules |
+| `eager`, `qat`, `torchao_nvfp4` | every name `activation.py` evaluates | — |
+| `liger_kernel` | SiLU only (Liger's `swiglu_forward`) | runs the projection modules instead |
 | any row | — | a *quantizing* row raises instead of falling back |
 
 `liger_kernel` is the GPU default, so this matters in practice: a `gelu` model on
@@ -200,7 +204,7 @@ this mechanism. Their rows are added by the PRs that own those formats.
 "use the host default", so an unset field never turns storage rounding on.
 On Ascend NPU, unset fields resolve to `torch_npu` for RMSNorm, rotary embedding and
 its vision-layout selection; to `chunk_loss` for cross-entropy; to `fused_npu`
-for MoE; and to `eager` for SwiGLU, dense projection and load-balancing loss. Explicit
+for MoE; and to `eager` for gated MLP, dense projection and load-balancing loss. Explicit
 values are never rewritten, so an explicit GPU value such as `liger_kernel` or
 `fused_triton` raises on NPU. Qwen3.5's three GatedDeltaNet fields are
 model-specific and are not in the host table. Their `fla` default also registers on Ascend NPU. Set
@@ -220,7 +224,7 @@ Any variant without a row for the selected value fails and lists its registered
 implementations.
 
 **MLU `liger_kernel` rows require the Cambricon liger build.** `rms_norm`,
-`rope`, `swiglu_mlp`, and `cross_entropy_loss` register `liger_kernel`
+`rope`, `gated_mlp`, and `cross_entropy_loss` register `liger_kernel`
 rows for the `mlu` device that reuse the CUDA adapters — the
 Cambricon fork keeps the upstream `liger_kernel.ops.*` API over MLU backends.
 These rows use `MluKernelRequirement` for device matching and declare
@@ -259,7 +263,7 @@ Select a quantized run explicitly instead:
 ```yaml
 ops_implementation:
   linear_implementation: qat
-  swiglu_mlp_implementation: qat
+  gated_mlp_implementation: qat
   moe_implementation: qat
   kv_round_implementation: triton
 ```
@@ -291,12 +295,12 @@ VeOmniModelRuntime._build_model()             # (3) model build time
             ├─ VeomniOp("attention", "standard", config.ops_config.attn_implementation)
             ├─ self.veomni_ce = VeomniOp("cross_entropy_loss", ...)
             ├─ self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
-            └─ RMSNorm / RoPE / SwiGLU / MoE / DSA / mHC bind local handles
+            └─ RMSNorm / RoPE / gated MLP / MoE / DSA / mHC bind local handles
 
 model.forward()                               # (4) runtime
   ├─ attention: self.veomni_attn -> registered attention row
   ├─ loss: self.loss_function(...) -> model helper -> instance-local VeomniOp
-  ├─ RMSNorm / RoPE / SwiGLU: instance-local VeomniOp
+  ├─ RMSNorm / RoPE / gated MLP: instance-local VeomniOp
   ├─ mHC: instance-local VeomniOp handles (pre / post / head)
   └─ MoE: instance-local VeomniOp("moe_experts", variant, impl)
 ```
@@ -576,7 +580,7 @@ Key files:
 
 ---
 
-## 3. Per-Model Ops (RMSNorm, RoPE, SwiGLU MLP)
+## 3. Per-Model Ops (RMSNorm, RoPE, Gated MLP)
 
 Each operation can be independently controlled. These fields are not
 Liger-only: they also accept `torch_npu` and model-specific `triton` registry rows
@@ -588,7 +592,7 @@ Liger-only: they also accept `torch_npu` and model-specific `triton` registry ro
 model:
   ops_implementation:
     rms_norm_implementation: liger_kernel       # default; pin to "torch_npu" / "eager" on NPU
-    swiglu_mlp_implementation: liger_kernel     # default; pin to "eager" on NPU (no NPU backend)
+    gated_mlp_implementation: liger_kernel     # default; pin to "eager" on NPU (no NPU backend)
     rotary_pos_emb_implementation: liger_kernel # default; pin to "torch_npu" / "eager" on NPU
 ```
 
@@ -616,11 +620,11 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 | `triton` | Registered model-specific Triton row (DeepSeek-V3 deterministic RoPE, DeepSeek-V4 fused partial-interleaved RoPE, Wan DiT) | `triton` |
 | `eager` | Registered PyTorch reference row | — |
 
-#### `swiglu_mlp_implementation`
+#### `gated_mlp_implementation`
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `liger_kernel` | Registered Liger SwiGLU row | `liger-kernel` package |
+| `liger_kernel` | Registered Liger SwiGLU row (SiLU only) | `liger-kernel` package |
 | `qat` | Registered TileLang blockwise FP8 fake-quant row | `tilelang`, NVIDIA SM90+ |
 | `torchao_nvfp4` | Registered NVFP4 fake-quant row ([FP4 QAT](../usage/mxfp4_qat.md)) | `torchao` package |
 | `eager` | Registered PyTorch reference row | — |
@@ -649,7 +653,7 @@ weight stay on the model side.
 |---|---|---|
 | `rms_norm_implementation` | `{Model}RMSNorm` | `VeomniOp("rms_norm", variant, impl)` |
 | `rotary_pos_emb_implementation` | `apply_rotary_pos_emb` | `VeomniOp("rope", variant, impl)` |
-| `swiglu_mlp_implementation` | `{Model}MLP.forward` | `VeomniOp("swiglu_mlp", "standard", impl)` |
+| `gated_mlp_implementation` | `{Model}MLP.forward` | `VeomniOp("gated_mlp", "standard", impl)` |
 | `linear_implementation` | `{Model}Attention.q/k/v/o_proj` | `VeomniOp("linear", "standard", impl)` |
 
 The selected registry row determines the callable and validates its hardware
@@ -668,7 +672,7 @@ supported values are `triton` and `eager`.
 
 - Config base class: `veomni/models/configuration_base.py` — `VeOmniPretrainedConfig`, `config.ops_config`
 - Unified registry: `veomni/ops/registry.py` — `register_op()`, `resolve_op()`, `VeomniOp`
-- Backend registration: `veomni/ops/kernels/{rms_norm,rope,swiglu_mlp,linear}/__init__.py`
+- Backend registration: `veomni/ops/kernels/{rms_norm,rope,gated_mlp,linear}/__init__.py`
 - Model integration: `veomni/models/transformers/{model}/*_patch_gen_config.py`
 
 ---
@@ -993,7 +997,7 @@ currently exist in the `kernels-community` hub.
 |-----------|-----------------|--------------------------|:-----------:|-----|
 | RMSNorm | Instance-local `VeomniOp` with variants | `@use_kernel_forward_from_hub` | Parallel — both can apply | VeOmni covers Qwen3.5's `+1` variant explicitly |
 | RoPE | Instance-local `VeomniOp` with variants | `@use_kernel_forward_from_hub` + `@use_kernelized_func` | Parallel | VeOmni adds an NPU partial-RoPE variant |
-| SwiGLU MLP | Instance-local `VeomniOp` | Not annotated in MoE models (MLP is per-expert, not standalone) | VeOmni only | — |
+| Gated MLP | Instance-local `VeomniOp` | Not annotated in MoE models (MLP is per-expert, not standalone) | VeOmni only | — |
 | Attention | Instance-local `VeomniOp("attention", "standard", config.ops_config.attn_implementation)` plus shared `ALL_ATTENTION_FUNCTIONS` | `ALL_ATTENTION_FUNCTIONS` (same registry) | Yes | VeOmni adds SP wrapping |
 | MoE experts | Instance-local `VeomniOp("moe_experts", ...)` | `@use_experts_implementation` (batched_mm/grouped_mm) | No — different dispatch paths | VeOmni uses registered fused rows; HF uses PyTorch native `grouped_mm` |
 | Cross-entropy | Instance-local `VeomniOp` + model helper | `LOSS_MAPPING` (standard `F.cross_entropy`) | VeOmni only | HF has no fused loss selection |
@@ -1011,7 +1015,7 @@ model:
     moe_implementation: fused_triton
     cross_entropy_loss_implementation: liger_kernel
     rms_norm_implementation: liger_kernel
-    swiglu_mlp_implementation: eager           # disable Liger for MLP only
+    gated_mlp_implementation: eager           # disable Liger for MLP only
     rotary_pos_emb_implementation: liger_kernel
     load_balancing_loss_implementation: triton
 ```
