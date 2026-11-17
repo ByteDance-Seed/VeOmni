@@ -640,6 +640,7 @@ def test_qat_row_keeps_the_clamp_in_the_model_dtype(monkeypatch):
     assert not torch.equal(expected, widened)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("activation", sorted(supported_activations()))
 def test_the_eager_row_evaluates_every_activation_it_claims(activation, dtype):
@@ -672,6 +673,7 @@ def test_the_eager_row_evaluates_every_activation_it_claims(activation, dtype):
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("activation", sorted(supported_activations()))
 def test_the_eager_row_backward_matches_autograd_for_every_activation(activation):
     """The derivative comes from autograd inside the custom Function, and must match.
@@ -774,6 +776,7 @@ def test_a_linear_subclass_projection_skips_the_fused_path():
         has_plain_linear_projections(mlp)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("activation", ["gelu", "gelu_pytorch_tanh", "gelu_new"])
 def test_the_activation_backward_compiles_fullgraph(activation):
     """A compiled forward must not regress relative to the projection fallback.
@@ -803,3 +806,48 @@ def test_the_activation_backward_compiles_fullgraph(activation):
     actual = torch.compile(step, fullgraph=True, backend="eager")(grad, hidden)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_new"])
+def test_the_eager_row_backward_survives_activation_offload(activation):
+    """The row must run inside ``saved_tensors_hooks``, which is how offload works.
+
+    ``BaseTrainer``/``OmniTrainer`` build a ``custom_save_on_cpu`` context from
+    ``veomni/distributed/offloading.py`` and run backward inside it. The eager row
+    used to be a raw ``forward``/``backward`` pair, and its backward called
+    ``torch.func.vjp`` for a non-SiLU activation -- which refuses to run there:
+
+        RuntimeError: torch.func.{grad, vjp, jacrev, hessian} don't yet support
+        saved tensor hooks
+
+    So a ``gelu`` model raised under offload, where it trained fine before this
+    work. The row is an opaque wrapper now; autograd builds the backward, so the
+    hooks see individual ops.
+    """
+    import torch
+    from torch.autograd.graph import saved_tensors_hooks
+
+    from veomni.ops import VeomniOp
+
+    op = VeomniOp("swiglu_mlp", "standard", "eager")
+
+    # Fixed inputs: the comparison is between two backward passes over the same
+    # graph, so both must see the same tensors.
+    torch.manual_seed(0)
+    x = torch.randn(4, 16, dtype=torch.bfloat16)
+    weight = torch.randn(32, 16, dtype=torch.bfloat16) * 0.1
+    down = torch.randn(16, 32, dtype=torch.bfloat16) * 0.1
+    empty = weight.new_empty(0)
+
+    def step():
+        leaf = x.detach().requires_grad_(True)
+        out = op(leaf, weight, empty, weight, empty, down, empty, activation=activation)
+        return torch.autograd.grad(out.sum(), leaf)[0]
+
+    plain = step()
+    # Identity pack/unpack: the point is that the context is entered at all.
+    with saved_tensors_hooks(lambda t: t, lambda t: t):
+        offloaded = step()
+
+    torch.testing.assert_close(offloaded, plain, rtol=0, atol=0)

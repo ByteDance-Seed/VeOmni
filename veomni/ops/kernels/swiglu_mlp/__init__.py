@@ -188,9 +188,8 @@ register_op(
     "swiglu_mlp",
     "standard",
     "eager",
-    standard_eager.forward,
-    standard_eager.backward,
-    description="PyTorch SwiGLU MLP with optional activation clamping",
+    wrapper=standard_eager.wrapper,
+    description="PyTorch gated MLP with optional activation clamping, autograd backward",
 )
 
 register_op(

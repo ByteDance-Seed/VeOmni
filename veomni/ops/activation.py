@@ -188,12 +188,17 @@ def apply_activation_backward(grad_output: Tensor, hidden: Tensor, activation: s
     The derivative comes from transformers' own implementation rather than a formula
     restated here, because the forms are not interchangeable: ``gelu_new`` stages
     ``torch.pow(x, 3.0)`` and no closed form reproduces its autograd chain in bf16
-    (measured 1.56e-2). ``torch.func.vjp`` reaches that decomposition without the two
-    things that make a plain ``autograd.grad`` uncompilable under ``fullgraph=True``:
-    re-enabling grad and flipping a tensor's ``requires_grad``.
+    (measured 1.56e-2).
 
-    SiLU keeps its ATen spelling -- the fused rows and HF's autograd both use it, and
-    it is already compilable.
+    **Reached only from a raw ``forward``/``backward`` pair**, and today only from
+    ``liger_kernel``'s, which is SiLU-only and therefore takes the ATen branch below.
+    The ``eager`` row is an opaque wrapper that lets autograd build the whole MLP's
+    backward, which is what keeps activation offload and ``fullgraph=True`` working
+    -- ``torch.func.vjp`` refuses to run inside ``saved_tensors_hooks``, so a row that
+    called this with a non-SiLU activation would raise under offload. If a future
+    fused row needs a non-SiLU derivative here, it has to solve that first.
+
+    SiLU keeps its ATen spelling -- the fused rows and HF's autograd both use it.
     """
     name = normalize_activation(activation)
     if name == "silu":

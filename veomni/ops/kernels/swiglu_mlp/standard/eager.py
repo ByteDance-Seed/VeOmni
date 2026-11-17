@@ -244,3 +244,45 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
         grad_down_w,
         grad_down_b,
     )
+
+
+def wrapper(
+    x: Tensor,
+    gate_w: Tensor,
+    gate_b: Tensor,
+    up_w: Tensor,
+    up_b: Tensor,
+    down_w: Tensor,
+    down_b: Tensor,
+    *,
+    swiglu_limit: float | None = None,
+    activation: str = "silu",
+) -> Tensor:
+    """Run the gated MLP as plain PyTorch, letting autograd build the backward.
+
+    This is the row entry point, and it deliberately does **not** go through
+    ``forward`` / ``backward`` above. Those exist for ``liger_kernel`` to reuse the
+    same clamp and projection helpers, and ``register_op`` turns a raw pair into one
+    ``autograd.Function`` wrapping the whole MLP -- which two other mechanisms
+    cannot coexist with:
+
+    * **Activation offload** runs the backward inside ``saved_tensors_hooks``
+      (``veomni/distributed/offloading.py``). ``torch.func.vjp`` refuses to run
+      there ("don't yet support saved tensor hooks"), and a hand-written derivative
+      cannot reproduce the bf16 rounding of the model's own autograd chain, so a
+      non-SiLU activation under offload would either raise or train different
+      gradients.
+    * **``torch.compile(fullgraph=True)``** rejects a ``requires_grad_`` flag flip,
+      which is the other way to get a derivative inside a custom Function.
+
+    Plain PyTorch sidesteps both: there is no Function to enter, so the hooks see
+    the individual ops and Dynamo traces them. Verified bit-identical to the raw
+    pair for ``silu`` and ``gelu``, with and without the clamp, in bf16 and fp32 --
+    so switching the registration does not change any trained numerics.
+    """
+    if x.numel() == 0:
+        return empty_output(x, down_w)
+    hidden, _, _, _ = mlp_hidden(
+        x, gate_w, gate_b, up_w, up_b, swiglu_limit=swiglu_limit, activation=activation
+    )
+    return linear(hidden, down_w, down_b)
