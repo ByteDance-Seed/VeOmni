@@ -19,6 +19,8 @@
 #      Pass config to Qwen2VLRMSNorm instances
 #    - method_override: Qwen2VLTextModel.__init__
 #      Pass config to final Qwen2VLRMSNorm
+#    - method_override: Qwen2VLTextModel.forward
+#      Forward packed sequence metadata to VeOmni mask builders
 #    - method_override: Qwen2MLP.forward
 #      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
 #    - init_modification: VisionAttention
@@ -67,7 +69,6 @@ from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
@@ -91,7 +92,7 @@ from veomni.models.loss_utils import ForCausalLMLoss
 
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -618,13 +619,6 @@ class Qwen2VLAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-            kwargs,
-            impl=self.veomni_attn.impl,
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-        )
-
         attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
@@ -635,7 +629,7 @@ class Qwen2VLAttention(nn.Module):
             scaling=self.scaling,
             sliding_window=self.sliding_window,
             position_ids=position_ids,
-            **attn_kwargs,
+            **kwargs,
         )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
@@ -938,7 +932,7 @@ class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2VLTextModel
-# Methods patched: __init__
+# Methods patched: __init__, forward
 # ======================================================================
 
 
@@ -968,6 +962,13 @@ class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
         self.gradient_checkpointing = False
         self.post_init()
 
+    # ================================================================
+    # Patch: Qwen2VLTextModel.forward
+    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+    #    into ``veomni.models.utils.mask_utils.{create_causal_mask,
+    #    create_sliding_window_causal_mask}`` so packed sequences build an
+    #    isolated mask once in the model forward
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -999,16 +1000,6 @@ class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
-        # NOTE: we need to pass text position ids for packing. Qwen2-VL uses 3D positions
-        # where each dim indicates visual spatial positions for temporal/height/width grids.
-        # There are two scenarios when FA2-like packed masking might be activated.
-        # 1. User specifically passed packed `position_ids` and no attention mask.
-        #    In this case we expect the user to create correct position ids for all 3 grids
-        #    and prepend text-only position ids to it. The final tensor will be [4, bs, seq-len]
-        # 2. User runs forward with no attention mask and no position ids. In this case, position ids
-        #    are prepared by the model (`get_rope_index`) as `[4, bs, seq-len]` tensor. Text-only positions are
-        #    prepended by us when creating positions so that the mask is constructed correctly. NOTE: failing to pass
-        #    text-only positions will cause incorrect mask construction, do not change `prepare_input_for_generation`
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
             text_position_ids = position_ids[0]
             position_ids = position_ids[1:]
@@ -1018,8 +1009,10 @@ class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
 
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # --- Patch.1 ---
             # Prepare mask arguments
             mask_kwargs = {
+                **kwargs,
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
@@ -1033,6 +1026,7 @@ class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+            # --- Patch.1 ---
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)

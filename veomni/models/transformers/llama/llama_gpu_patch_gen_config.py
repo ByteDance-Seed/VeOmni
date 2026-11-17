@@ -25,8 +25,9 @@ from functools import partial
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
     CausalLMOutputWithPast,
     SequenceClassifierOutputWithPast,
 )
@@ -34,7 +35,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationLoss
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
@@ -51,7 +52,7 @@ config = PatchConfig(
     description="Llama with VeomniOp-based GPU kernel replacements",
 )
 
-config.drop_import_names("PreTrainedModel")
+config.drop_import_names("PreTrainedModel", "create_causal_mask")
 config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
 
 
@@ -62,9 +63,12 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
+# Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
+# packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
+# once in ``LlamaModel.forward``.
 config.add_import(
-    "veomni.models.utils.attention_utils",
-    names=["prepare_dense_attention_inputs"],
+    "veomni.models.utils.mask_utils",
+    names=["create_causal_mask"],
 )
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
@@ -142,6 +146,74 @@ def llama_model_init_patched(self, config):
     self.gradient_checkpointing = False
 
     self.post_init()
+
+
+# ================================================================
+# Patch: LlamaModel.forward
+# 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+#    into ``veomni.models.utils.mask_utils.create_causal_mask`` so packed
+#    sequences build an isolated mask once in the model forward
+# ================================================================
+@config.override_method(
+    "LlamaModel.forward",
+    description="Forward packed sequence metadata to VeOmni mask builders",
+)
+def llama_model_forward_patched(
+    self,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    use_cache: bool | None = None,
+    **kwargs: Unpack[TransformersKwargs],
+) -> BaseModelOutputWithPast:
+    if (input_ids is None) ^ (inputs_embeds is not None):
+        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+    if inputs_embeds is None:
+        inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
+
+    if use_cache and past_key_values is None:
+        past_key_values = DynamicCache(config=self.config)
+
+    if position_ids is None:
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+        position_ids = position_ids.unsqueeze(0)
+
+    # --- Patch.1 ---
+    causal_mask = create_causal_mask(
+        **{
+            **kwargs,
+            "config": self.config,
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+        }
+    )
+    # --- Patch.1 ---
+
+    hidden_states = inputs_embeds
+    position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+
+    for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        hidden_states = decoder_layer(
+            hidden_states,
+            attention_mask=causal_mask,
+            position_embeddings=position_embeddings,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **kwargs,
+        )
+
+    hidden_states = self.norm(hidden_states)
+    return BaseModelOutputWithPast(
+        last_hidden_state=hidden_states,
+        past_key_values=past_key_values,
+    )
 
 
 @config.override_method(
@@ -330,13 +402,6 @@ def llama_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-        kwargs,
-        impl=self.veomni_attn.impl,
-        attention_mask=attention_mask,
-        hidden_states=hidden_states,
-    )
-
     attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
@@ -345,7 +410,7 @@ def llama_attention_forward_patched(
         attention_mask,
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
-        **attn_kwargs,
+        **kwargs,
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()

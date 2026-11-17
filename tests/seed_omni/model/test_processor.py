@@ -155,6 +155,7 @@ def test_omni_processor_from_pretrained_collects_module_preprocessors(
     mock_from_pretrained.assert_called_once_with(tmp_path, infer_type="infer_gen")
     fake_mod_cls.preprocessor_class.from_pretrained.assert_called_once()
     assert len(processor._preprocessors) == 1
+    assert processor.infer_type == "infer_gen"
 
 
 @patch("veomni.models.seed_omni.processing_omni.OMNI_MODEL_REGISTRY")

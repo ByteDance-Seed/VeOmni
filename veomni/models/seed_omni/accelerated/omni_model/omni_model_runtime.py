@@ -260,6 +260,18 @@ class OmniModelRuntime:
         if not composed_model_owns_wrap(acc):
             return
 
+        checkpoint = getattr(self.train_args, "checkpoint", None)
+        if not for_inference and getattr(checkpoint, "extra_parallel_canonical_layout", False):
+            from .....distributed.parallel_state import get_parallel_state
+
+            with use_parallel_state("base"):
+                state = get_parallel_state()
+                if getattr(state, "any_extra_parallel_enabled", False):
+                    raise RuntimeError(
+                        "Canonical ExtraParallel checkpoints are not supported for SeedOmni fsdp_scope='model'; "
+                        "use fsdp_scope='module'."
+                    )
+
         modules = self.module_runtimes
         # Cache readers stay on meta and must not go through the composed
         # materialisation path: ``skip_hf_weight_load`` still calls ``to_empty``.
@@ -317,10 +329,14 @@ class OmniModelRuntime:
                 enable_forward_prefetch=acc.fsdp_config.forward_prefetch,
                 enable_fsdp_offload=acc.fsdp_config.offload,
                 fsdp_offload_pin_memory=acc.fsdp_config.offload_pin_memory,
+                cpu_offload_extra_parallel_names=acc.fsdp_config.cpu_offload_extra_parallel_names,
+                cpu_offload_exclude_module_patterns=acc.fsdp_config.cpu_offload_exclude_module_patterns,
                 broadcast_model_weights_from_rank0=args.broadcast_model_weights_from_rank0,
                 ep_sharded_stream_load=args.ep_sharded_stream_load,
                 max_load_broadcast_size=acc.fsdp_config.max_load_broadcast_size,
                 muon_expert_zero_comm=muon_expert_zero_comm,
+                expert_weight_fp8_all_gather=acc.fsdp_config.expert_weight_fp8_all_gather,
+                expert_fsdp_shard_dim=acc.fsdp_config.expert_fsdp_shard_dim,
                 compile_config=compile_config,
                 **kwargs,
             )
@@ -467,11 +483,13 @@ class OmniModelRuntime:
         model.generation_graph.validate_modules({name: model.get_module(name) for name in model._module_names})
         generation_kwargs = model.resolve_generation_kwargs(generation_kwargs)
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
+        max_steps = max_new_tokens
         total_steps = 0
 
-        while not model.generation_graph.is_done() and total_steps < max_new_tokens:
+        while not model.generation_graph.is_done() and total_steps < max_steps:
             model._emit_progress(total_steps)
             state_name = model.generation_graph.current_state_name
+            emitted_before = len(model._generated)
             for node in model.generation_graph.iter_nodes(ctx):
                 execute_generation_node(
                     modules,
@@ -489,6 +507,10 @@ class OmniModelRuntime:
             fired = model.generation_graph.maybe_transition(ctx)
             if fired is not None and profiler is not None:
                 profiler.record(f"transition: {fired.from_state} -> {fired.to_state} [{fired.condition}]")
+            if total_steps == 1 and len(model._generated) == emitted_before:
+                # Pass 1 emitted nothing: it was prompt prefill, so it must not
+                # consume the token budget.
+                max_steps += 1
 
         model._emit_progress(total_steps)
 

@@ -15,6 +15,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import defaultdict
+from contextlib import contextmanager
+from copy import deepcopy
+from itertools import chain
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -24,6 +28,7 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     _flatten_optim_state_dict,
     _get_fqns,
+    _state_dict_fn,
     get_optimizer_state_dict,
     set_optimizer_state_dict,
 )
@@ -152,6 +157,58 @@ def filter_empty_param_groups(
     return non_empty
 
 
+def _same_owned_optimizer_tensor(current, incoming):
+    """Recognize a DCP-filled target tensor without taking a second copy."""
+    if current is incoming:
+        return True
+    if not torch.is_tensor(current) or not torch.is_tensor(incoming):
+        return False
+    if isinstance(current, DTensor) != isinstance(incoming, DTensor):
+        return False
+    if current.layout != torch.strided or incoming.layout != torch.strided:
+        return False
+    if (
+        current.device != incoming.device
+        or current.dtype != incoming.dtype
+        or current.shape != incoming.shape
+        or current.stride() != incoming.stride()
+    ):
+        return False
+    if isinstance(current, DTensor):
+        if current.device_mesh != incoming.device_mesh or current.placements != incoming.placements:
+            return False
+        current, incoming = current.to_local(), incoming.to_local()
+    if current.layout != torch.strided or incoming.layout != torch.strided or current.numel() == 0:
+        return False
+    return (
+        current.device == incoming.device
+        and current.dtype == incoming.dtype
+        and current.shape == incoming.shape
+        and current.stride() == incoming.stride()
+        and current.storage_offset() == incoming.storage_offset()
+        and current.data_ptr() == incoming.data_ptr()
+    )
+
+
+@contextmanager
+def _dcp_reuse_owned_anyprecision_state(optimizer):
+    """Permit reuse only for fresh state buffers created by the proven DCP loader."""
+    if type(optimizer) is not AnyPrecisionAdamW or any(
+        getattr(optimizer, name, None)
+        for name in ("_optimizer_load_state_dict_pre_hooks", "_optimizer_load_state_dict_post_hooks")
+    ):
+        yield
+        return
+    marker = "_veomni_dcp_reuse_owned_state"
+    if marker in vars(optimizer):
+        raise RuntimeError("AnyPrecisionAdamW DCP state reuse is already active")
+    setattr(optimizer, marker, True)
+    try:
+        yield
+    finally:
+        delattr(optimizer, marker)
+
+
 # https://github.com/meta-llama/llama-recipes/blob/v0.0.4/src/llama_recipes/policies/anyprecision_optimizer.py
 class AnyPrecisionAdamW(Optimizer):
     def __init__(
@@ -177,6 +234,90 @@ class AnyPrecisionAdamW(Optimizer):
             "compensation_buffer_dtype": compensation_buffer_dtype,
         }
         super().__init__(params, defaults)
+
+    def load_state_dict(self, state_dict):
+        """Restore each moment at its configured dtype without a parameter-dtype cast."""
+        state_dict = state_dict.copy()
+        for hook in self._optimizer_load_state_dict_pre_hooks.values():
+            result = hook(self, state_dict)
+            if result is not None:
+                state_dict = result
+        groups = self.param_groups
+        saved_groups = deepcopy(state_dict["param_groups"])
+        if len(groups) != len(saved_groups):
+            raise ValueError("loaded state dict has a different number of parameter groups")
+        if any(
+            len(group["params"]) != len(saved["params"]) for group, saved in zip(groups, saved_groups, strict=True)
+        ):
+            raise ValueError("loaded state dict contains a parameter group that doesn't match the optimizer's group")
+
+        id_map = dict(
+            zip(
+                chain.from_iterable(group["params"] for group in saved_groups),
+                chain.from_iterable(group["params"] for group in groups),
+                strict=True,
+            )
+        )
+        group_by_id = {key: group for group in saved_groups for key in group["params"]}
+        restored = defaultdict(dict)
+        for key, saved in state_dict["state"].items():
+            if key not in id_map:
+                restored[key] = deepcopy(saved)
+                continue
+            param = id_map[key]
+            group = group_by_id[key]
+            previous = self.state.get(param, {})
+            reuse_owned = getattr(self, "_veomni_dcp_reuse_owned_state", False) is True
+            fields = {"step", "exp_avg", "exp_avg_sq"}
+            if group.get("use_kahan_summation"):
+                fields.add("compensation")
+            if saved and set(saved) != fields:
+                raise RuntimeError("AnyPrecisionAdamW checkpoint contains incomplete or unsupported state")
+            result = dict(saved)
+            if result and (
+                not torch.is_tensor(result["step"])
+                or isinstance(result["step"], DTensor)
+                or result["step"].shape != ()
+            ):
+                raise RuntimeError("AnyPrecisionAdamW checkpoint step must be a scalar tensor")
+            if result:
+                value = result["step"]
+                if reuse_owned and _same_owned_optimizer_tensor(previous.get("step"), value):
+                    result["step"] = previous["step"]
+                else:
+                    result["step"] = value.detach().clone()
+            for field, dtype_key in (
+                ("exp_avg", "momentum_dtype"),
+                ("exp_avg_sq", "variance_dtype"),
+                ("compensation", "compensation_buffer_dtype"),
+            ):
+                if field not in result:
+                    continue
+                value = result[field]
+                if not torch.is_tensor(value) or value.dtype != group[dtype_key] or value.shape != param.shape:
+                    raise RuntimeError(f"AnyPrecisionAdamW checkpoint has an incompatible {field} tensor")
+                if isinstance(param, DTensor) != isinstance(value, DTensor) or (
+                    isinstance(param, DTensor)
+                    and (
+                        value.device_mesh != param.device_mesh
+                        or value.placements != param.placements
+                        or value.to_local().shape != param.to_local().shape
+                    )
+                ):
+                    raise RuntimeError(f"AnyPrecisionAdamW checkpoint has an incompatible {field} layout")
+                if reuse_owned and _same_owned_optimizer_tensor(previous.get(field), value):
+                    result[field] = previous[field]
+                else:
+                    result[field] = value.to(device=param.device).detach().clone()
+            restored[param] = result
+
+        for group, saved in zip(groups, saved_groups, strict=True):
+            saved["params"] = group["params"]
+            if "param_names" in group and "param_names" not in saved:
+                saved["param_names"] = group["param_names"]
+        self.__setstate__({"state": restored, "param_groups": saved_groups})
+        for hook in self._optimizer_load_state_dict_post_hooks.values():
+            hook(self)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -258,17 +399,10 @@ class AnyPrecisionAdamW(Optimizer):
 
 
 def _empty_optimizer_state_dict(model, opt):
-    if getattr(opt.state_dict, "__func__", None) is not Optimizer.state_dict:
-        raise RuntimeError("Cannot safely serialize an empty optimizer with a custom state_dict")
     packed_groups = []
     id_to_name = {}
-    captured = False
 
     def capture_params(leaf):
-        nonlocal captured
-        if captured:
-            raise RuntimeError("Cannot reenter optimizer state_dict while saving an empty optimizer")
-        captured = True
         packed_groups.extend([list(group["params"]) for group in leaf.param_groups])
 
     def capture_ids(_leaf, packed):
@@ -291,7 +425,10 @@ def _empty_optimizer_state_dict(model, opt):
     try:
         post_hook = opt.register_state_dict_post_hook(capture_ids, prepend=True)
         try:
-            raw = opt.state_dict()
+            # PyTorch's DCP instance wrapper can perform a synthetic step
+            # when state is empty. Its resolver unwraps that known wrapper
+            # while preserving optimizer class methods and registered hooks.
+            raw = _state_dict_fn(opt, "state_dict")()
         finally:
             post_hook.remove()
     finally:
@@ -302,6 +439,73 @@ def _empty_optimizer_state_dict(model, opt):
         for saved_group in raw["param_groups"]
     ]
     return _flatten_optim_state_dict({"state": state, "param_groups": groups})
+
+
+@contextmanager
+def _dcp_restore_frozen_ownership(optimizer):
+    frozen = [param for group in optimizer.param_groups for param in group["params"] if not param.requires_grad]
+    changed = []
+    try:
+        for param in frozen:
+            param.requires_grad_(True)
+            changed.append(param)
+        yield
+    finally:
+        for param in changed:
+            param.requires_grad_(False)
+
+
+@contextmanager
+def _dcp_avoid_synthetic_optimizer_step(optimizer):
+    param = next((param for group in optimizer.param_groups for param in group["params"]), None)
+    if param is None:
+        raise RuntimeError("Cannot restore a MultiOptimizer leaf without parameters")
+    sentinel = {} if not optimizer.state else None
+    if sentinel is not None:
+        optimizer.state[param] = sentinel
+    called = False
+
+    def before_load(current, state_dict):
+        nonlocal called
+        called = True
+        if sentinel is not None:
+            if current.state.get(param) is not sentinel or sentinel:
+                raise RuntimeError("Optimizer state changed while preparing checkpoint restore")
+            current.state.pop(param)
+        return {**state_dict, "state": {k: v for k, v in state_dict["state"].items() if not isinstance(v, dict) or v}}
+
+    before_load._veomni_internal_dcp_filter = True
+    handle = optimizer.register_load_state_dict_pre_hook(before_load, prepend=True)
+    try:
+        yield
+        if not called:
+            raise RuntimeError("Optimizer bypassed checkpoint load-state hooks")
+    finally:
+        handle.remove()
+        if sentinel is not None and optimizer.state.get(param) is sentinel:
+            optimizer.state.pop(param)
+
+
+@contextmanager
+def _dcp_swap_load_template(optimizer):
+    from .swap_adamw import SwapAdamW
+
+    staged = getattr(optimizer, "_veomni_dcp_staged_state", None)
+    if type(optimizer) is not SwapAdamW or staged is None:
+        yield
+        return
+    if "_veomni_dcp_live_state" in vars(optimizer):
+        raise RuntimeError("SwapAdamW checkpoint load is already active")
+    live = optimizer.state
+    optimizer._veomni_dcp_live_state = live
+    # PyTorch probes absent parameters through ``state[param]``. Keep those
+    # empty probe entries out of the proven source-owner inventory.
+    optimizer.state = defaultdict(dict, staged)
+    try:
+        yield
+    finally:
+        optimizer.state = live
+        del optimizer._veomni_dcp_live_state
 
 
 class MultiOptimizer(Optimizer, Stateful):
@@ -325,36 +529,47 @@ class MultiOptimizer(Optimizer, Stateful):
         self._is_multi_optimizer: bool = True
         self.key_names = key_names
 
-    def step(self) -> None:
+    def step(self, closure=None):
+        if getattr(self, "_veomni_dcp_restore_failed", False):
+            raise RuntimeError("MultiOptimizer cannot train after a failed checkpoint restore; rebuild the optimizer")
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
         for opt in self.optimizers_dict.values():
             opt.step()
+        return loss
 
-    def zero_grad(self) -> None:
+    def zero_grad(self, set_to_none: bool = True) -> None:
         for opt in self.optimizers_dict.values():
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=set_to_none)
 
     def state_dict(
         self,
     ) -> Dict[str, Any]:
-        # get the flatten state dict for multi-optimizer
-        merged: Dict[str, Any] = {}
-        for name in self.key_names:
-            opt = self.optimizers_dict.get(name)
-            sd = get_optimizer_state_dict(self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
-            # check for key clashes before merging
-            overlap = set(merged.keys()) & set(sd.keys())
-            if overlap:
-                raise KeyError(
-                    f"Key clash detected while merging state dict for optimizer '{name}': {', '.join(sorted(overlap))}"
-                )
-            else:
-                logger.info_rank0("No clashes when merging MultiOptimizer state dicts")
-            merged.update(sd)
+        # A snapshot must not let a raw DCP load overwrite live optimizer
+        # tensors before ``load_state_dict`` can reject unproven provenance.
+        import copy
 
-        return merged
+        from .checkpoint_adapter import rank_local_adamw_adapter
+        from .muon import DistributedMuon
+        from .swap_adamw import SwapAdamW
+
+        for optimizer in self.optimizers_dict.values():
+            if type(optimizer) not in (torch.optim.AdamW, AnyPrecisionAdamW, DistributedMuon, SwapAdamW) and (
+                rank_local_adamw_adapter(optimizer) is None
+            ):
+                raise RuntimeError("Cannot construct a MultiOptimizer snapshot for an unsupported optimizer leaf")
+        return {
+            key: value.detach().clone() if torch.is_tensor(value) else copy.deepcopy(value)
+            for key, value in self._sparse_state_dict().items()
+        }
 
     def _sparse_state_dict(
         self,
+        *,
+        coordinate=False,
+        group=None,
     ) -> Dict[str, Any]:
         """Return a flattened optimizer state dict without materializing state.
 
@@ -365,35 +580,66 @@ class MultiOptimizer(Optimizer, Stateful):
         """
         merged: Dict[str, Any] = {}
         for name in self.key_names:
-            opt = self.optimizers_dict.get(name)
-            if not opt.state:
-                sd = _empty_optimizer_state_dict(self.model, opt)
-            else:
-                sd = get_optimizer_state_dict(
-                    self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True)
-                )
-            overlap = set(merged.keys()) & set(sd.keys())
-            if overlap:
-                raise KeyError(
-                    f"Key clash detected while merging state dict for optimizer '{name}': {', '.join(sorted(overlap))}"
-                )
-            else:
-                logger.info_rank0("No clashes when merging MultiOptimizer state dicts")
+            error, sd = None, None
+            try:
+                opt = self.optimizers_dict.get(name)
+                from .checkpoint_adapter import rank_local_adamw_context
+
+                with rank_local_adamw_context(opt), _dcp_swap_load_template(opt):
+                    if not opt.state and not getattr(opt, "_veomni_dcp_staged_state", None):
+                        sd = _empty_optimizer_state_dict(self.model, opt)
+                    else:
+                        sd = get_optimizer_state_dict(
+                            self.model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True)
+                        )
+                overlap = set(merged) & set(sd)
+                if overlap:
+                    raise KeyError(
+                        f"Key clash detected while merging state dict for optimizer '{name}': {', '.join(sorted(overlap))}"
+                    )
+            except BaseException as exc:
+                error = exc
+            if coordinate:
+                from ..utils.dist_utils import raise_if_any_rank_failed
+
+                raise_if_any_rank_failed(error, f"serializing optimizer leaf {name}", group=group)
+            elif error is not None:
+                raise error
             merged.update(sd)
 
         return merged
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        # Feed the same merged flattened dict to each sub-optimizer; PyTorch will
-        # pick out only the entries for parameters that belong to that optimizer.
+        raise RuntimeError(
+            "Unverified MultiOptimizer state cannot establish group and scheduler identity; "
+            "restore through DistributedCheckpointer or an explicitly verified migration."
+        )
+
+    def _dcp_load_state_dict(self, state_dict: Dict[str, Any], *, group=None) -> None:
         for name in self.key_names:
-            opt = self.optimizers_dict.get(name)
-            set_optimizer_state_dict(
-                self.model,
-                opt,
-                optim_state_dict=state_dict,
-                options=StateDictOptions(flatten_optimizer_state_dict=True),
-            )
+            error = None
+            try:
+                optimizer = self.optimizers_dict[name]
+                from .checkpoint_adapter import rank_local_adamw_context
+
+                with (
+                    rank_local_adamw_context(optimizer),
+                    _dcp_restore_frozen_ownership(optimizer),
+                    _dcp_swap_load_template(optimizer),
+                    _dcp_reuse_owned_anyprecision_state(optimizer),
+                    _dcp_avoid_synthetic_optimizer_step(optimizer),
+                ):
+                    set_optimizer_state_dict(
+                        self.model,
+                        optimizer,
+                        optim_state_dict=state_dict,
+                        options=StateDictOptions(flatten_optimizer_state_dict=True),
+                    )
+            except BaseException as exc:
+                error = exc
+            from ..utils.dist_utils import raise_if_any_rank_failed
+
+            raise_if_any_rank_failed(error, f"loading optimizer leaf {name}", group=group)
 
     def register_step_pre_hook(self, hook):
         return [opt.register_step_pre_hook(hook) for opt in self.optimizers_dict.values()]
@@ -477,6 +723,43 @@ def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
     }
 
 
+def _build_state_offload_optimizer(
+    optimizer_type: str,
+    param_groups: Sequence[Dict[str, Any]],
+    *,
+    lr: float,
+    betas: Tuple[float, float],
+    eps: float,
+    weight_decay: float,
+    optimizer_config: Optional["OptimizerConfig"],
+) -> "Optimizer":
+    """Build the optimizer whose moment states live in host buffers.
+
+    ``model.optimizer.state_offload='cpu'`` is a placement choice, not an algorithm: the
+    algorithm dispatch lives here, so a new offloadable algorithm is one branch
+    rather than one helper per algorithm. Muon will add its own ``elif`` (its
+    AdamW leaf is what carries host state today).
+    """
+    if optimizer_type == "adamw":
+        from .swap_adamw import SwapAdamW
+
+        return SwapAdamW(
+            param_groups,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            device_memory_fraction=(
+                0.8 if optimizer_config is None else optimizer_config.state_offload_device_memory_fraction
+            ),
+            pin_memory=True if optimizer_config is None else optimizer_config.state_offload_pin_memory,
+        )
+    else:
+        raise ValueError(
+            f"model.optimizer.state_offload='cpu' is only supported for type='adamw'; got type={optimizer_type!r}."
+        )
+
+
 def build_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
@@ -494,14 +777,26 @@ def build_optimizer(
     """Build the optimizer.
 
     ``optimizer_config`` lets callers hand over the whole ``OptimizerConfig`` so
-    that optimizer-specific knobs (currently Muon's ``muon_*`` fields) are read
-    here rather than unpacked by every trainer. It does *not* supply ``lr``,
-    ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit arguments,
-    because callers such as the VLM trainer drive the AdamW side from their own
-    param groups. ``muon_kwargs`` overrides the config key by key, for callers
-    that build Muon without an ``OptimizerConfig`` at all.
+    that optimizer-specific knobs (currently Muon's ``muon_*`` fields and
+    ``state_offload='cpu'``'s ``state_offload_device_memory_fraction``/``state_offload_pin_memory``)
+    are read here rather than unpacked by every trainer. It does *not* supply
+    ``lr``, ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit
+    arguments, because callers such as the VLM trainer drive the AdamW side from
+    their own param groups. ``muon_kwargs`` overrides the config key by key, for
+    callers that build Muon without an ``OptimizerConfig`` at all.
+
+    ``fused`` drives the stock ``AdamW`` path only: the state-offload optimizer
+    selects the fused kernel from the backend (``FUSED_ADAMW_DEVICE_TYPES``) and
+    takes the elementwise path elsewhere.
     """
+    if isinstance(betas, list):
+        betas = tuple(betas)
     if optimizer_type == "muon":
+        if any(
+            parameter.requires_grad and getattr(parameter, "_veomni_optimizer_compute_device", None) is not None
+            for parameter in model.parameters()
+        ):
+            raise ValueError("DistributedMuon does not support selectively CPU-offloaded parameters")
         if optimizer_config is not None:
             muon_kwargs = {**_collect_muon_kwargs(optimizer_config), **(muon_kwargs or {})}
         if param_groups is not None:
@@ -530,7 +825,17 @@ def build_optimizer(
 
     if _should_build_extra_parallel_aware(model):
         return build_extra_parallel_fsdp2_optimizer(
-            model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
+            model,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            fused,
+            optimizer_type,
+            param_groups,
+            no_decay_modules,
+            no_decay_params,
+            optimizer_config=optimizer_config,
         )
     if param_groups is None:
         decay_param_names = get_parameter_names(model, no_decay_modules, no_decay_params)
@@ -556,6 +861,19 @@ def build_optimizer(
     param_groups = filter_empty_param_groups(param_groups)
     if not param_groups:
         raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
+
+    if optimizer_config is not None and optimizer_config.state_offload == "cpu":
+        # State offload is a placement choice, not a new algorithm: dispatch on it
+        # first; the algorithm branch lives in the helper.
+        return _build_state_offload_optimizer(
+            optimizer_type,
+            param_groups,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            optimizer_config=optimizer_config,
+        )
 
     if optimizer_type == "adamw":
         foreach = not fused
@@ -803,6 +1121,7 @@ def build_extra_parallel_fsdp2_optimizer(
     param_groups: Optional[List[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
+    optimizer_config: Optional["OptimizerConfig"] = None,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with ExtraParallel+FSDP2
@@ -814,6 +1133,8 @@ def build_extra_parallel_fsdp2_optimizer(
     - Each group's params are automatically split into ExtraParallel1, ExtraParallel2, ... and non-ExtraParallel based on DTensor mesh
     - Custom learning rates and other optimizer settings are preserved per group
     """
+    if isinstance(betas, list):
+        betas = tuple(betas)
     parallel_state = get_parallel_state()
 
     # Collect all ExtraParallel and non-ExtraParallel parameters across all groups
@@ -929,7 +1250,23 @@ def build_extra_parallel_fsdp2_optimizer(
             model, non_extra_parallel_params, weight_decay, no_decay_modules, no_decay_params
         )
 
+    # Each SwapAdamW leaf owns its own swap stream: the MultiOptimizer steps its
+    # leaves serially and every leaf drains its stream at the end of its own
+    # ``step``, so there is no cross-leaf copy to serialize.
+
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
+        if optimizer_config is not None and optimizer_config.state_offload == "cpu":
+            # Same outer dispatch as the dense path: offload decides placement,
+            # the helper decides the algorithm.
+            return _build_state_offload_optimizer(
+                optimizer_type,
+                groups,
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=weight_decay,
+                optimizer_config=optimizer_config,
+            )
         if optimizer_type == "adamw":
             nonlocal fused
             foreach = not fused

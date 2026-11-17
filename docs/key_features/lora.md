@@ -233,7 +233,7 @@ infix (PEFT convention — e.g. `lora_A.weight`), whereas the live model stores 
 `trainer.model.save_dcp` and lands in `ModelCheckpointManager`
 (`veomni/models/checkpoint/manager.py`). That writes the
 weights to `model/ckpt/` and the optimizer to `model/optimizer/` — two separate DCP
-directories — plus a replicated `model/lr_scheduler.pt`. For LoRA training the DCP
+directories — plus the scheduler in each rank's `model/extra_state/`. For LoRA training the DCP
 stores only the trainable adapter parameters and optimizer state; the frozen base is
 reloaded from `model.model_path`. Job-level state is written separately by
 `GlobalStateCallback`, as `loader/rank_{R}.pt` for the dataloader cursor and
@@ -265,7 +265,7 @@ Output structure for each checkpoint:
 │       ├── model/
 │       │   ├── ckpt/                    ← adapter weights, DCP
 │       │   ├── optimizer/               ← adapter optimizer state, DCP
-│       │   └── lr_scheduler.pt
+│       │   └── extra_state/             ← scheduler, per rank
 │       ├── loader/rank_{R}.pt
 │       ├── extra_state/rank_{R}.pt
 │       └── lora_ckpt/                   ← the inference artifact
@@ -686,6 +686,14 @@ bash train.sh tasks/train_dit.py configs/dit/qwen_image_lora.yaml \
 ```
 
 `CheckpointCallback` writes the trained adapter to `${output_dir}/checkpoints/global_step_${step}/lora_ckpt/{adapter_config.json, adapter_model.safetensors}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`). Loading a PEFT-trained adapter still accepts `adapter_model.bin`.
+
+Export uses one writer and stages both files before publishing. An existing
+adapter directory can be overwritten only when its JSON configuration is
+identical; use a new directory for a different configuration. Atomic replacement
+between the staging directory and its parent must be supported by the filesystem.
+If a replacement reports an error after it was committed, the directory may contain
+either the old or the new weights; the exporter does not promise which. This
+contract does not validate compatibility with a different base model.
 
 ---
 

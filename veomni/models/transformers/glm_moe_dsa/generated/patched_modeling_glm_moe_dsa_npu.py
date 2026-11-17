@@ -73,6 +73,7 @@ from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, create_standard_causal_mask, translate_fused_dsa_mask
+from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 from veomni.utils.moe_monitor import record_router_indices
@@ -654,6 +655,7 @@ class GlmMoeDsaExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         if not self.use_swiglu_mlp:
+            reject_quantizing_act_fn(self)
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,

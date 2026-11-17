@@ -1,0 +1,2 @@
+# BAGEL-7B-MoT VAE posterior cache production DAG.
+- { from: bagel_vae.offline_encode, to: end }

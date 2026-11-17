@@ -14,6 +14,7 @@
 
 
 import math
+import weakref
 from typing import TYPE_CHECKING, Dict, Literal
 
 from torch.optim.lr_scheduler import LambdaLR
@@ -26,6 +27,13 @@ if TYPE_CHECKING:
 
 
 logger = logging.get_logger(__name__)
+_CHECKPOINT_SCHEDULER_BINDINGS = weakref.WeakKeyDictionary()
+
+
+def checkpoint_scheduler_binding(optimizer):
+    """Find a framework-built scheduler without mutating the optimizer payload."""
+    reference = _CHECKPOINT_SCHEDULER_BINDINGS.get(optimizer)
+    return None if reference is None else reference()
 
 
 class MultiLRScheduler(dict):
@@ -43,9 +51,10 @@ class MultiLRScheduler(dict):
         return {name: sched.state_dict() for name, sched in self.items()}
 
     def load_state_dict(self, state_dict: Dict[str, any]) -> None:
+        if set(state_dict) != set(self):
+            raise RuntimeError("MultiLRScheduler checkpoint leaves differ from the current optimizer layout")
         for name, sched in self.items():
-            if name in state_dict:
-                sched.load_state_dict(state_dict[name])
+            sched.load_state_dict(state_dict[name])
 
     def get_last_lr(self):
         # Return the first scheduler's LR for logging consistency
@@ -83,15 +92,15 @@ def build_lr_scheduler(
 
     lr_warmup_steps = int(train_steps * lr_warmup_ratio)
     if lr_decay_style == "constant":
-        return get_constant_schedule_with_warmup(
+        scheduler = get_constant_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=lr_warmup_steps,
             lr_start=lr_start,
             init_lr=lr,
         )
 
-    if lr_decay_style == "linear":
-        return get_linear_schedule_with_warmup(
+    elif lr_decay_style == "linear":
+        scheduler = get_linear_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=lr_warmup_steps,
             num_training_steps=train_steps,
@@ -99,8 +108,8 @@ def build_lr_scheduler(
             lr_start=lr_start,
         )
 
-    if lr_decay_style == "cosine":
-        return get_cosine_schedule_with_warmup(
+    elif lr_decay_style == "cosine":
+        scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=lr_warmup_steps,
             num_training_steps=train_steps,
@@ -110,7 +119,10 @@ def build_lr_scheduler(
             lr_start=lr_start,
         )
 
-    raise ValueError(f"Unknown learning rate decay style: {lr_decay_style}.")
+    else:
+        raise ValueError(f"Unknown learning rate decay style: {lr_decay_style}.")
+    _CHECKPOINT_SCHEDULER_BINDINGS[optimizer] = weakref.ref(scheduler)
+    return scheduler
 
 
 def get_constant_schedule_with_warmup(

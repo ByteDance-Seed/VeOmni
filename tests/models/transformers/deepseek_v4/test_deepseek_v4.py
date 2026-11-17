@@ -201,6 +201,10 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
         "num_experts": experts.num_experts,
         "swiglu_limit": config.swiglu_limit,
         "assume_distinct_experts": True,
+        # The checkpoint's expert dtype is a call argument, not part of the
+        # implementation name: V4-Flash stores routed experts in FP4 and its
+        # dense projections in FP8, so one recipe name cannot describe both.
+        "expert_dtype": getattr(config, "expert_dtype", "fp8"),
     }
     torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
 
@@ -219,7 +223,7 @@ def test_deepseek_v4_experts_deepgemm_fp8_forward_backward():
     from tests.ops.moe_experts.reference import standard_ep_reference
     from veomni.arguments import OpsImplementationConfig
 
-    ops = OpsImplementationConfig(moe_implementation="deepgemm_fp8", qat_implementation="none")
+    ops = OpsImplementationConfig(moe_implementation="deepgemm_fp8")
     config = SimpleNamespace(
         num_local_experts=4,
         hidden_size=256,

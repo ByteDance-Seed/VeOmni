@@ -269,6 +269,28 @@ class TestCheckpointCallbackTrainEndWait:
         with pytest.raises(RuntimeError, match="HDFS write failed"):
             cb.on_train_end(TrainerState(global_step=60))
 
+    def test_failed_async_epoch_wait_cannot_be_retried_as_success(self, mock_helper, monkeypatch):
+        from concurrent.futures import Future
+
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        failed = Future()
+        failed.set_exception(RuntimeError("HDFS write failed"))
+        monkeypatch.setattr(DistributedCheckpointer, "_save_futures", {"weights": failed})
+        monkeypatch.setattr(DistributedCheckpointer, "_async_process_groups", {})
+        trainer = _make_mock_trainer(save_async=True)
+        trainer.wait_for_pending_save.side_effect = DistributedCheckpointer.wait_for_pending_save
+        callback = CheckpointCallback(trainer)
+        callback._last_dcp_step = 5
+        state = TrainerState(global_step=5, epoch=0)
+
+        with pytest.raises(RuntimeError, match="HDFS write failed"):
+            callback.on_epoch_end(state)
+        assert not DistributedCheckpointer._save_futures
+        with pytest.raises(RuntimeError, match="restart from a complete checkpoint"):
+            callback.on_epoch_end(state)
+        trainer.save_dcp.assert_not_called()
+
     def test_train_end_waits_even_without_async(self, mock_helper):
         """The call is unconditional; wait_for_pending_save is a no-op when nothing is pending."""
         trainer = _make_mock_trainer(save_async=False)
@@ -625,7 +647,9 @@ class TestGlobalStateCallbackJobState:
             "channel_loss_callback": callback_state,
             "torch_rng_state": torch.get_rng_state(),
         }
-        torch.save(payload, tmp_path / "trainer_state_rank_0.pt")
+        extra_path = Path(layout.extra_state_path(str(tmp_path), 0))
+        extra_path.parent.mkdir(parents=True)
+        torch.save(payload, extra_path)
 
         cb = GlobalStateCallback(trainer)
         cb.load_global_state()
@@ -680,6 +704,8 @@ class TestGlobalStateCallbackJobState:
         trainer.args.train.checkpoint.load_path = str(tmp_path)
         trainer.args.train.global_rank = 0
         trainer.train_dataloader = None
+        extra_path = Path(layout.extra_state_path(str(tmp_path), 0))
+        extra_path.parent.mkdir(parents=True)
         torch.save(
             {
                 "global_step": 7,
@@ -688,82 +714,38 @@ class TestGlobalStateCallbackJobState:
                 "channel_loss_callback": {},
                 "torch_rng_state": torch.get_rng_state(),
             },
-            tmp_path / "trainer_state_rank_0.pt",
+            extra_path,
         )
 
         cb = GlobalStateCallback(trainer)
         assert cb.load_global_state() is None
         trainer.channel_loss_callback.load_state_dict.assert_not_called()
         assert trainer.state.global_step == 0
-        mock_dist.all_reduce.assert_called_once()
-        assert mock_dist.all_reduce.call_args.kwargs["op"] is torch.distributed.ReduceOp.MIN
+        assert mock_dist.all_reduce.call_count == 2
+        assert mock_dist.all_reduce.call_args_list[0].kwargs["op"] is torch.distributed.ReduceOp.MIN
+        assert mock_dist.all_reduce.call_args_list[1].kwargs["op"] is torch.distributed.ReduceOp.MAX
 
-    def test_load_restores_0_1_12_extra_state_job_cursor(self, mock_dist, tmp_path):
-        mock_dist.is_initialized.return_value = False
-        trainer = _make_mock_trainer()
-        trainer.args.train.checkpoint.load_path = str(tmp_path)
-        trainer.args.train.global_rank = 0
-        trainer.args.train_steps = 100
-        rng = torch.get_rng_state()
-        extra = tmp_path / "extra_state"
-        extra.mkdir()
-        torch.save(
-            {
-                "global_step": 7,
-                "lr_scheduler": {"last_epoch": 7},
-                "train_dataloader": {"cursor": 3},
-                "environ_meter": {"tokens": 1},
-                "channel_loss_callback": {"source_registry": [(1, "train/a")]},
-                "torch_rng_state": rng,
-            },
-            extra / "extra_state_rank_0.pt",
-        )
+    def test_a_pre_split_job_cursor_is_not_read(self, mock_dist, tmp_path):
+        """Only ``extra_state/rank_{R}.pt`` carries the cursor now.
 
-        cb = GlobalStateCallback(trainer)
-        cb.load_global_state()
-
-        assert trainer.state.global_step == 7
-        assert trainer.start_epoch == 0
-        assert trainer.start_step == 7
-        trainer.train_dataloader.load_state_dict.assert_called_once_with({"cursor": 3})
-        trainer.environ_meter.load_state_dict.assert_called_once_with({"tokens": 1})
-        trainer.channel_loss_callback.load_state_dict.assert_called_once_with({"source_registry": [(1, "train/a")]})
-
-    def test_trainer_state_wins_over_extra_state_job_cursor(self, mock_dist, tmp_path):
+        The pre-split layouts kept it in ``extra_state_rank_{R}.pt`` and
+        ``trainer_state_rank_{R}.pt``. Both are gone with
+        ``veomni/checkpoint/legacy_v0_1_12.py``: the step has no current-layout
+        cursor, so a resume falls back to weights only rather than restoring a
+        step counter from a shape nothing writes any more.
+        """
         mock_dist.is_initialized.return_value = False
         trainer = _make_mock_trainer()
         trainer.args.train.checkpoint.load_path = str(tmp_path)
         trainer.args.train.global_rank = 0
         trainer.train_dataloader = None
-        torch.save(
-            {
-                "global_step": 7,
-                "train_dataloader": None,
-                "environ_meter": {},
-                "channel_loss_callback": {},
-                "torch_rng_state": torch.get_rng_state(),
-            },
-            tmp_path / "trainer_state_rank_0.pt",
-        )
         extra = tmp_path / "extra_state"
         extra.mkdir()
         torch.save(
-            {"global_step": 99, "lr_scheduler": {}, "torch_rng_state": torch.get_rng_state()},
+            {"global_step": 7, "lr_scheduler": {}, "torch_rng_state": torch.get_rng_state()},
             extra / "extra_state_rank_0.pt",
         )
-
-        cb = GlobalStateCallback(trainer)
-        cb.load_global_state()
-        assert trainer.state.global_step == 7
-
-    def test_scheduler_only_extra_state_does_not_restore_job_cursor(self, mock_dist, tmp_path):
-        mock_dist.is_initialized.return_value = False
-        trainer = _make_mock_trainer()
-        trainer.args.train.checkpoint.load_path = str(tmp_path)
-        trainer.args.train.global_rank = 0
-        extra = tmp_path / "extra_state"
-        extra.mkdir()
-        torch.save({"lr_scheduler": {"last_epoch": 3}}, extra / "extra_state_rank_0.pt")
+        torch.save({"global_step": 9, "torch_rng_state": torch.get_rng_state()}, tmp_path / "trainer_state_rank_0.pt")
 
         cb = GlobalStateCallback(trainer)
         assert cb.load_global_state() is None

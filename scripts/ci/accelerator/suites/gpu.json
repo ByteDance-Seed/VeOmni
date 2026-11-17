@@ -1,5 +1,10 @@
 [
   {
+    "name": "distributed-default-gloo-group",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
+  },
+  {
     "name": "01-unit",
     "suite": "unit",
     "conditional": false,
@@ -36,6 +41,16 @@
       "-s",
       "-x",
       "tests/parallel/ulysses/test_slice_input_tensor.py"
+    ]
+  },
+  {
+    "name": "gpu-selective-expert-cpu-clip-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_fsdp2_clip_grad_norm.py"
     ]
   },
   {
@@ -652,6 +667,26 @@
       "-s",
       "-x",
       "tests/models/test_omni_fsdp.py"
+    ]
+  },
+  {
+    "name": "swap-adamw-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw.py"
+    ]
+  },
+  {
+    "name": "swap-adamw-device-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw_device.py"
     ]
   }
 ]

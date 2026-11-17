@@ -183,6 +183,15 @@ There are two ways to distribute encoder work across the `S` ranks of an
 
 ## 6. Limitations and future work
 
+- **Inference runs at `sp_size = cp_size = ulysses_size = 1`.** SP and CP are
+  training-only: the generation FSM decodes one token at a time on every rank
+  and has no all-to-all in its step, so nothing in the inference path slices.
+  `OmniInferencer` accepts a launcher YAML, and that YAML may well be the
+  training `base.yaml`, but any `ulysses_size` / `cp_size` it carries is not
+  honoured — and a module that is asked to generate under `sp_size > 1` refuses
+  rather than returning wrong tokens (for example
+  `Qwen3VLLlm.generate`). Keep the parallel sizes at 1 for
+  `tasks/omni/infer_omni.py` and for `tasks/omni/infer_omni_native.py`.
 - **Local operators in audio and video encoders.** Whisper-style conv1d
   downsampling and video 3D-conv patchify or temporal windows act on the sharded
   sequence **before** any all-to-all, so shard boundaries would need halo
