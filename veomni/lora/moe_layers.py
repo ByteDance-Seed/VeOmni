@@ -166,16 +166,15 @@ logger = logging.get_logger(__name__)
 def _moe_lora_op(base_layer: nn.Module, variant: str):
     """Reject a rounding expert backend; otherwise bind its row."""
     from veomni.ops import OP_REGISTRY, VeomniOp
+    from veomni.ops.kernels.moe_experts import QUANTIZING_IMPLS
 
     base_op = getattr(base_layer, "veomni_moe", None)
     impl = "eager" if base_op is None else base_op.impl
-    # The handle knows its own arguments, so it can say which mode it runs in -- an
-    # expert row that offers both emulation and a native GEMM answers per config.
-    # No ``moe_experts_lora`` row rounds, so any rounding backend cannot be adapted:
-    # substituting the adapter would train the base weights in the model dtype while
-    # the config still claimed otherwise.
-    mode = None if base_op is None else base_op.mode
-    if mode is not None and mode.rounds_operands:
+    # No ``moe_experts_lora`` row fake-quantizes the base weights, so a selection
+    # that does -- ``qat`` or ``deepgemm`` -- must be refused: substituting
+    # ``eager`` would train them at full precision while the config still claimed
+    # quantization.
+    if impl in QUANTIZING_IMPLS:
         raise ValueError(
             f"moe_implementation={impl!r} does not support MoE-LoRA on expert weights. "
             "Select a supported MoE-LoRA backend (for example 'fused_triton' on GPU), "

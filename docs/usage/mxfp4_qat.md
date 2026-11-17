@@ -46,7 +46,7 @@ See [op selection](../design/op_selection.md).
 | Field | Op | What it covers |
 | --- | --- | --- |
 | `linear_implementation` | `linear` / `standard` | A model that owns its projections individually (Qwen3 attention `q/k/v/o`) |
-| `swiglu_mlp_implementation` | `swiglu_mlp` / `standard` | A model that runs the fused SwiGLU row (Qwen3 MLP `gate/up/down`) |
+| `gated_mlp_implementation` | `gated_mlp` / `standard` | A model that runs the fused SwiGLU row (Qwen3 MLP `gate/up/down`) |
 
 Together they cover the **attention projections and the MLP projections**.
 `lm_head` is excluded: the causal-LM path either calls it directly or hands its
@@ -120,20 +120,24 @@ model:
     linear_implementation:
       name: torchao
       kwargs: {dtype: nvfp4}
-    swiglu_mlp_implementation:
+    gated_mlp_implementation:
       name: torchao
       kwargs: {dtype: nvfp4}
 ```
 
 An unselected field falls back to that family's host default — `eager` for
-`linear`, `liger_kernel` on GPU/MLU and `eager` on NPU for `swiglu_mlp`. Either
+`linear`, `liger_kernel` on GPU/MLU and `eager` on NPU for `gated_mlp`. Either
 way that family is **not** quantized, so a config that sets only
 `linear_implementation` trains NVFP4 attention with a full-precision MLP.
 Selecting `torchao` without `torchao` installed raises
 `Op 'linear' variant='standard' impl='torchao' requires unavailable
 package(s): 'torchao'` at model construction; it never falls back silently.
-A quantizing `swiglu_mlp` row on a model whose activation is not SiLU is
-refused at config load, as for every quantizing `swiglu_mlp` row.
+A quantizing `gated_mlp` row evaluates any of the five activations
+`veomni/ops/activation.py` serves (`silu`, `swish`, `gelu`, `gelu_new`,
+`gelu_pytorch_tanh`), so a GELU model quantizes its MLP like a SiLU one. An
+activation outside that set is refused when the row runs, not at config load:
+falling back would train at full precision under a config that claimed
+otherwise, so the error names `eager` as the way to keep the projection path.
 
 Start from [the Qwen3 example](../../configs/text/qwen3_nvfp4_qat.yaml), set
 `model.model_path` and `data.train_path`, then run:
@@ -158,9 +162,9 @@ unquantized base layer while the config still claims NVFP4.
 Set `linear_implementation: eager` for adapter training: the eager row calls the
 projection module, so the adapter's own forward runs. The fused MLP row follows
 the same rule, and only for the quantizing value: with
-`swiglu_mlp_implementation: torchao` and an adapter on
+`gated_mlp_implementation: torchao` and an adapter on
 `gate_proj`/`up_proj`/`down_proj`, the forward raises
-`swiglu_mlp_implementation='torchao' cannot run on a wrapped projection`.
+`gated_mlp_implementation='torchao' cannot run on a wrapped projection`.
 `liger_kernel` is **not** affected — it is an arithmetic rewrite that keeps the
 projection-module fallback.
 
@@ -168,7 +172,7 @@ projection-module fallback.
 
 [Float8 training](float8_training.md) converts its `target_modules` into
 torchao's `Float8Linear`, an `nn.Linear` subclass whose forward runs FP8 GEMMs.
-A quantizing `linear` or `swiglu_mlp` row only runs on an exact `nn.Linear`, so
+A quantizing `linear` or `gated_mlp` row only runs on an exact `nn.Linear`, so
 selecting `torchao` for a projection that float8 also targets raises
 `cannot run on nn.Linear subclass 'Float8Linear'` instead of silently skipping
 the FP8 GEMMs. Pick one recipe per projection.
@@ -223,7 +227,7 @@ unvalidated against that reference.
 **A restart must re-select the rows.** The trainer passes its own
 `OpsImplementationConfig` when it builds the model, and that object replaces
 whatever the exported checkpoint recorded. Launching a resumed run without
-`linear_implementation` / `swiglu_mlp_implementation` therefore trains at full
+`linear_implementation` / `gated_mlp_implementation` therefore trains at full
 precision even though the checkpoint's `config.json` still lists the rows.
 
 Weight names are unchanged, so DCP resume, HF safetensors export and reload all
@@ -236,7 +240,7 @@ separate work.
 
 ```bash
 uv sync --extra gpu --extra float8 --dev
-pytest tests/ops/linear/ tests/ops/swiglu_mlp/ tests/models/transformers/qwen/test_qwen3.py \
+pytest tests/ops/linear/ tests/ops/gated_mlp/ tests/models/transformers/qwen/test_qwen3.py \
   tests/models/test_qat_fsdp.py -q
 ```
 

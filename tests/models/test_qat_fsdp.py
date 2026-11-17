@@ -16,7 +16,7 @@
 
 No CPU collective substitute: this case requires two CUDA devices and NCCL. It
 covers accumulated updates, DCP continuation and ordinary HF export/reload with
-``linear_implementation`` and ``swiglu_mlp_implementation`` set to every torchao
+``linear_implementation`` and ``gated_mlp_implementation`` set to every torchao
 FP4 row registered on this branch. The rows themselves are validated on CPU in
 tests/ops/; what only this case can reach is the FSDP2 and checkpoint boundary.
 """
@@ -45,7 +45,7 @@ def _torchao_qat_impls() -> list[str]:
 
 
 def _rows(impl: str) -> dict[str, str]:
-    return {"linear_implementation": impl, "swiglu_mlp_implementation": impl}
+    return {"linear_implementation": impl, "gated_mlp_implementation": impl}
 
 
 def _qat_ops(impl: str):
@@ -63,7 +63,7 @@ def _build_fsdp(weights_path: Path, impl: str, *, skip_hf_load: bool = False):
     config = build_config(str(weights_path))
     # The trainer passes its own ops instance, which replaces the recorded rows.
     assert config.ops_config.linear_implementation == impl
-    assert config.ops_config.swiglu_mlp_implementation == impl
+    assert config.ops_config.gated_mlp_implementation == impl
     model = build_foundation_model(
         config, init_device="meta", torch_dtype="float32", ops_implementation=_qat_ops(impl)
     )
@@ -113,10 +113,10 @@ def _record_quantizer_calls(impl: str):
 
     quant = _QUANT_FUNCTION[impl]
     linear_row = import_module(f"veomni.ops.kernels.linear.standard.{impl}")
-    mlp_row = import_module(f"veomni.ops.kernels.swiglu_mlp.standard.{impl}")
+    mlp_row = import_module(f"veomni.ops.kernels.gated_mlp.standard.{impl}")
 
-    calls = {"linear": 0, "swiglu_mlp": 0}
-    originals = {"linear": getattr(linear_row, quant), "swiglu_mlp": getattr(mlp_row, quant)}
+    calls = {"linear": 0, "gated_mlp": 0}
+    originals = {"linear": getattr(linear_row, quant), "gated_mlp": getattr(mlp_row, quant)}
 
     def _recorder(family):
         def _wrapped(tensor, block_size=None):
@@ -128,12 +128,12 @@ def _record_quantizer_calls(impl: str):
         return _wrapped
 
     setattr(linear_row, quant, _recorder("linear"))
-    setattr(mlp_row, quant, _recorder("swiglu_mlp"))
+    setattr(mlp_row, quant, _recorder("gated_mlp"))
     try:
         yield calls
     finally:
         setattr(linear_row, quant, originals["linear"])
-        setattr(mlp_row, quant, originals["swiglu_mlp"])
+        setattr(mlp_row, quant, originals["gated_mlp"])
 
 
 def _step(model, optimizer, step, impl):
@@ -156,7 +156,7 @@ def _step(model, optimizer, step, impl):
             losses.append(loss.detach().cpu())
 
     # Per layer and forward pass: four attention projections with two operands
-    # each through `linear`, and five rounded tensors through `swiglu_mlp` (the
+    # each through `linear`, and five rounded tensors through `gated_mlp` (the
     # input once for gate/up, the hidden state once, three weights). Gradient
     # checkpointing reruns every layer's forward in backward, so each micro-batch
     # makes two passes. Both rows must be reached. The counts were verified for
@@ -164,7 +164,7 @@ def _step(model, optimizer, step, impl):
     layers, microbatches, passes = model.config.num_hidden_layers, 2, 2
     assert calls == {
         "linear": 4 * 2 * layers * microbatches * passes,
-        "swiglu_mlp": 5 * layers * microbatches * passes,
+        "gated_mlp": 5 * layers * microbatches * passes,
     }, calls
 
     for name, param in model.named_parameters():
@@ -252,7 +252,7 @@ def _fsdp_worker(root: str, impl: str):
         torch.testing.assert_close(_master_snapshot(resumed), expected_weights, atol=0, rtol=0)
         reloaded, _ = _build_fsdp(hf_path, impl)
         assert reloaded.config.ops_config.linear_implementation == impl
-        assert reloaded.config.ops_config.swiglu_mlp_implementation == impl
+        assert reloaded.config.ops_config.gated_mlp_implementation == impl
         rounded_weights = {name: weight.bfloat16().float() for name, weight in expected_weights.items()}
         torch.testing.assert_close(_master_snapshot(reloaded), rounded_weights, atol=0, rtol=0)
     finally:

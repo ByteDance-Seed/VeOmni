@@ -316,10 +316,10 @@ def test_wrapper_uses_eager_when_lora_row_is_unavailable(monkeypatch, mode: str,
     from types import SimpleNamespace
 
     from veomni.lora.moe_layers import _moe_lora_op
-    from veomni.ops import OP_REGISTRY, NumericMode
+    from veomni.ops import OP_REGISTRY
 
     monkeypatch.setattr(OP_REGISTRY, "list_available", lambda op, variant: ["eager"])
-    base_layer = SimpleNamespace(veomni_moe=SimpleNamespace(impl=base_impl, mode=NumericMode.EXACT))
+    base_layer = SimpleNamespace(veomni_moe=SimpleNamespace(impl=base_impl))
 
     assert _moe_lora_op(base_layer, mode).impl == "eager"
 
@@ -337,9 +337,7 @@ def test_wrapper_rejects_deepgemm_before_moving_parameters(mode: str):
     base_layer.gate_up_proj = torch.nn.Parameter(torch.empty(2, 16, 8))
     base_layer.down_proj = torch.nn.Parameter(torch.empty(2, 8, 8))
     base_layer.register_buffer("residual_mask", torch.ones(2))
-    from veomni.ops import NumericMode
-
-    base_layer.veomni_moe = SimpleNamespace(impl="deepgemm", mode=NumericMode.NATIVE)
+    base_layer.veomni_moe = SimpleNamespace(impl="deepgemm")
     original_parameters = dict(base_layer.named_parameters())
     original_buffers = dict(base_layer.named_buffers())
 
@@ -367,9 +365,7 @@ def test_moe_lora_rejects_a_quantizing_expert_row(mode: str):
     from types import SimpleNamespace
 
     from veomni.lora.moe_layers import _moe_lora_op
-    from veomni.ops import NumericMode
-
-    base_layer = SimpleNamespace(veomni_moe=SimpleNamespace(impl="qat", mode=NumericMode.EMULATED))
+    base_layer = SimpleNamespace(veomni_moe=SimpleNamespace(impl="qat"))
 
     with pytest.raises(ValueError, match="qat.*does not support MoE-LoRA"):
         _moe_lora_op(base_layer, mode)

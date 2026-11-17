@@ -26,7 +26,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from enum import Enum
 from inspect import Parameter, signature
 from typing import Any, Callable
 
@@ -40,60 +39,6 @@ from .selection import OpsSelection
 
 
 Output = Tensor | tuple[Tensor, ...]
-
-
-class NumericMode(Enum):
-    """How one *call* to a row treats its operands.
-
-    A property of the call, not of the row: ``torchao`` can fake-quantize to FP4 and
-    multiply in the model dtype, or hand the operands to a real FP4/FP8 GEMM. Which
-    one it does is the ``emulated`` row argument, exactly as torchao's own
-    ``Float8LinearConfig.emulate`` works. So a row declares the modes it *can* run
-    in, and the guards ask about the mode a particular config selected.
-
-    Getting this wrong is not cosmetic. An emulated row reads the parameters and
-    computes on rounded values in the model dtype, so a wrapped projection has no
-    ``weight`` for it and an adapter cannot sit in front of it. A native row that
-    replaces the module (torchao's ``Float8Linear``) keeps the weight, so an adapter
-    works normally. The same row name therefore has to answer the guard question
-    differently depending on its arguments.
-    """
-
-    #: The operands are computed on unchanged.
-    EXACT = "exact"
-    #: Operands are rounded to the target format, then the product accumulates in
-    #: the model dtype. Training-only: gradients pass straight through, and the
-    #: parameters keep their high-precision layout.
-    EMULATED = "emulated"
-    #: Operands are cast to the target format and the GEMM itself runs in it -- the
-    #: deployed math, so the row owns the cast instead of receiving rounded operands.
-    NATIVE = "native"
-
-    @property
-    def rounds_operands(self) -> bool:
-        """Whether the operands reach the arithmetic already rounded.
-
-        The guard question: a wrapped projection has no ``weight`` to give a row
-        that reads it, an adapter cannot sit in front of one, and a fused kernel
-        bakes a single activation in. True for both emulated and native rounding.
-        """
-        return self is not NumericMode.EXACT
-
-    @property
-    def replaces_the_parameters(self) -> bool:
-        """Whether the row keeps the module's own parameters in place.
-
-        A native row that swaps the module (torchao's ``Float8Linear``) leaves the
-        weight where the model put it, so an adapter still finds it. An emulated row
-        reads the weight to round it and needs it unwrapped, which is why the two
-        answer the adapter question differently.
-        """
-        return self is NumericMode.NATIVE
-
-
-#: A row that says nothing computes on its operands unchanged, which is what every
-#: reference row wants.
-_DEFAULT_MODE = NumericMode.EXACT
 
 
 @dataclass(frozen=True)
@@ -220,32 +165,12 @@ class OpEntry:
     requirement: KernelRequirement | None = None
     requires: tuple[str, ...] = ()
     default: bool = False
-    #: Modes this row can run in. ``(EXACT,)`` for a reference row; a rounding row
-    #: lists the ones its wrapper implements, and the ``emulated`` row argument picks
-    #: between them at call time. Declaring both is what lets one row name serve a
-    #: fake-quantized training recipe and the real low-precision GEMM, which is what
-    #: torchao does with ``emulate``.
-    modes: tuple[NumericMode, ...] = (_DEFAULT_MODE,)
     #: Numeric formats this row can round to, as the values its ``dtype`` argument
     #: accepts. Empty for a row that rounds nothing. The format is a row *argument*
     #: rather than part of the name: ``qat`` serves FP8 and FP4 checkpoints, and
     #: ``torchao`` serves whatever torchao can quantize, so naming the row after one
     #: format would either multiply rows or lie.
     dtypes: tuple[str, ...] = ()
-
-    def mode(self, kwargs: Mapping[str, Any] | None = None) -> NumericMode:
-        """The mode this row runs in with ``kwargs``, i.e. for one particular site.
-
-        A row that supports both reads the ``emulated`` argument, defaulting to
-        emulation: that is the training-safe choice, and the native path is opt-in
-        because it needs hardware and a kernel the host may not have. A row that
-        supports only one ignores the argument, which the caller has already filtered
-        out of ``kwargs`` if the row does not take it.
-        """
-        if len(self.modes) == 1:
-            return self.modes[0]
-        emulated = (kwargs or {}).get("emulated", True)
-        return NumericMode.EMULATED if emulated else NumericMode.NATIVE
 
     def __post_init__(self) -> None:
         """Validate the raw/wrapper pairing and generate the wrapper if needed."""
@@ -263,19 +188,6 @@ class OpEntry:
             isinstance(name, str) and name.strip() for name in self.dtypes
         ):
             raise TypeError("dtypes must be a tuple of non-empty format names")
-        if (
-            not isinstance(self.modes, tuple)
-            or not self.modes
-            or not all(isinstance(mode, NumericMode) for mode in self.modes)
-        ):
-            raise TypeError("modes must be a non-empty tuple of NumericMode members")
-        if len(set(self.modes)) != len(self.modes):
-            raise ValueError("modes must not contain duplicates")
-        if self.dtypes and not any(mode.rounds_operands for mode in self.modes):
-            raise ValueError(
-                f"{self.op}/{self.variant}/{self.impl} rounds nothing in any of its modes, "
-                "so it cannot declare the formats it rounds to"
-            )
         if self.default and self.requirement is None:
             raise ValueError(
                 "default=True requires a device-specific requirement; eager is already the fallback default"
@@ -428,56 +340,18 @@ class OpRegistry:
                 seen.append(impl)
         return seen
 
-    def mode(self, op: str, impl: str, kwargs: Mapping[str, Any] | None = None) -> NumericMode | None:
-        """The mode ``impl`` of ``op`` runs in with ``kwargs``, or ``None`` if unregistered.
-
-        Pass the row arguments a site actually resolved to: a row that supports both
-        emulation and a native GEMM answers differently depending on ``emulated``. The
-        mode describes what the call computes, not which hardware can run it, so any
-        registered device's entry answers for all of them.
-        """
-        entry = self.first_entry(op, impl)
-        return None if entry is None else entry.mode(kwargs)
-
     def first_entry(self, op: str, impl: str) -> OpEntry | None:
         """Some registered entry for ``(op, impl)``, ignoring variant and device.
 
-        For the checks that must run before hardware resolution: a row's modes and
-        the keys it accepts do not depend on which device registered it, so any entry
-        answers. Returns ``None`` when no device registers the name, which the caller
-        leaves to ``resolve`` to report.
+        For the checks that must run before hardware resolution: the formats a row
+        accepts and the keys it takes do not depend on which device registered it, so
+        any entry answers. Returns ``None`` when no device registers the name, which
+        the caller leaves to ``resolve`` to report.
         """
         for (entry_op, _variant, entry_impl, _device), entry in self._entries.items():
             if entry_op == op and entry_impl == impl:
                 return entry
         return None
-
-    def quantizes(self, op: str, impl: str, kwargs: Mapping[str, Any] | None = None) -> bool | None:
-        """Whether ``impl`` of ``op`` rounds its operands, or ``None`` if unregistered.
-
-        A convenience over :meth:`mode` for the callers that only ask "does this row
-        round?" -- see :meth:`rounding_impls` for the set form.
-        """
-        found = self.mode(op, impl, kwargs)
-        return None if found is None else found.rounds_operands
-
-    def rounding_impls(self, op: str) -> frozenset[str]:
-        """Every ``op`` row that rounds the operands it is handed, in any of its modes.
-
-        This is the set a guard wants when the question is "could this row read the
-        real weights and compute on rounded values?" -- a wrapped projection has no
-        ``weight`` for it, every fused kernel bakes one activation into it. ``deepgemm``
-        belongs here alongside ``qat``, and so does ``torchao`` even though it can also
-        run natively, because the emulated mode is what a config gets by default.
-
-        A guard that needs the answer for *one* config's arguments asks
-        :meth:`mode` instead; this set is the conservative "could it ever round?".
-        """
-        return frozenset(
-            entry.impl
-            for (entry_op, _variant, _impl, _device), entry in self._entries.items()
-            if entry_op == op and any(mode.rounds_operands for mode in entry.modes)
-        )
 
     def row_dtypes(self, op: str, impl: str) -> tuple[str, ...] | None:
         """The formats ``impl`` of ``op`` can round to, or ``None`` if unregistered.
@@ -501,10 +375,6 @@ class OpRegistry:
         let a YAML typo launch the kernel over the wrong number of experts. It stays
         call-only, which is also why the third precedence step does not reach it.
 
-        A row that offers both numeric modes also accepts ``emulated``, because that
-        argument is what picks between them; a row that offers one mode does not
-        declare it and a config that sets it is filtered out like any unused key.
-
         Returns ``None`` when ``impl`` is not registered for ``op`` on any device.
         """
         for (entry_op, _variant, entry_impl, _device), entry in self._entries.items():
@@ -515,14 +385,11 @@ class OpRegistry:
                 return None
             # ``KEYWORD_ONLY`` only: the tensor operands are positional, so a
             # selection never supplies them and listing them would suggest it could.
-            accepted = {
+            return {
                 name: parameter.default
                 for name, parameter in signature(fn).parameters.items()
                 if parameter.kind is Parameter.KEYWORD_ONLY and parameter.default is not Parameter.empty
             }
-            if len(entry.modes) > 1:
-                accepted.setdefault("emulated", True)
-            return accepted
         return None
 
     def list_entries(self, op: str, variant: str) -> list[OpEntry]:
@@ -573,7 +440,6 @@ def register_op(
     requirement: KernelRequirement | None = None,
     requires: tuple[str, ...] = (),
     default: bool = False,
-    modes: tuple[NumericMode, ...] = (_DEFAULT_MODE,),
     dtypes: tuple[str, ...] = (),
 ) -> None:
     """Register one row on ``OP_REGISTRY``.
@@ -586,12 +452,6 @@ def register_op(
     ``default=True`` marks a device-specific row as a host default candidate
     in registration order. ``resolve_op`` resolves ``impl=None`` through
     ``default_impl(op, variant)``.
-    ``modes`` lists the numeric modes the row's wrapper implements. ``EXACT``
-    computes on the operands unchanged; ``EMULATED`` rounds them and runs the GEMM
-    in the model dtype; ``NATIVE`` casts them and runs the GEMM in that format. A
-    row that implements both reads the ``emulated`` row argument to pick, which is
-    how ``torchao`` can be a fake-quantized training stand-in and the real
-    low-precision GEMM under one name.
     ``dtypes`` lists the formats the row's ``dtype`` argument accepts. The format is
     an argument, not part of the name: ``qat`` serves an FP8 and an FP4 checkpoint,
     and ``torchao`` serves whatever torchao can quantize.
@@ -608,7 +468,6 @@ def register_op(
             requirement=requirement,
             requires=requires,
             default=default,
-            modes=modes,
             dtypes=dtypes,
         )
     )
@@ -811,14 +670,15 @@ class VeomniOp:
         return self._entry
 
     @property
-    def mode(self) -> NumericMode:
-        """The numeric mode *this* handle runs in, i.e. for its own arguments.
+    def rounds(self) -> bool:
+        """Whether this row rounds the operands it is handed.
 
-        A guard should read this rather than the row's declared modes: ``torchao``
-        can be an emulated stand-in or the real low-precision GEMM, and an adapter is
-        allowed in front of the second but not the first.
+        A row declares ``dtypes`` exactly when it rounds to one of them, so that
+        tuple is the registry-visible answer. The per-family ``QUANTIZING_IMPLS``
+        sets say the same thing for the families that own one; a guard that has a
+        handle should read this, because it is derived rather than hand-listed.
         """
-        return self._entry.mode(self.kwargs)
+        return bool(self._entry.dtypes)
 
     def __repr__(self) -> str:
         """Return ``VeomniOp(op=..., variant=..., impl=...)``."""

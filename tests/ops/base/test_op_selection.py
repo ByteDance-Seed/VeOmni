@@ -23,7 +23,7 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import OpsImplementationConfig
-from veomni.ops import OP_REGISTRY, NumericMode, VeomniOp
+from veomni.ops import OP_REGISTRY, VeomniOp
 from veomni.ops.selection import OpsSelection, SiteOverride
 
 
@@ -56,8 +56,8 @@ def quantizing_row():
         "test_round",
         _round_forward,
         _round_backward,
-        description="test-only emulated row",
-        modes=(NumericMode.EMULATED,),
+        description="test-only rounding row",
+        dtypes=("fp8",),
     )
     try:
         yield "test_round"
@@ -426,53 +426,61 @@ def test_a_quantizing_row_may_carry_arguments():
 # ---------------------------------------------------------------------------
 
 
-def test_the_mode_is_a_property_of_the_call_not_only_the_row():
-    """One row name can serve both modes, and the arguments pick which.
+def test_dtypes_declares_which_formats_a_row_rounds_to():
+    """A row that rounds names its formats; a reference row names none.
 
-    This is what torchao does with ``Float8LinearConfig.emulate``, and why the answer
-    cannot be a constant on the row: ``torchao`` emulates by default (the
-    training-safe choice, no special hardware) and runs its real low-precision GEMM
-    only when a config asks. A row that offers one mode ignores the argument, and the
-    handle has already filtered it out.
+    ``dtypes`` is what a config's ``dtype`` is validated against, and its emptiness
+    is also how the registry distinguishes a rounding row from a reference one
+    without a hand-written list per family.
     """
-    expected = {
-        ("moe_experts", "fused_triton"): NumericMode.EXACT,
-        ("moe_experts", "qat"): NumericMode.EMULATED,
-        ("moe_experts", "deepgemm"): NumericMode.NATIVE,
-        # A single-mode row answers the same however it is asked.
-        ("linear", "eager"): NumericMode.EXACT,
-        ("linear", "qat"): NumericMode.EMULATED,
-    }
-    for (op, impl), want in expected.items():
-        assert OP_REGISTRY.mode(op, impl) is want
-
-    # The row that offers both: emulated unless the config says otherwise.
-    assert OP_REGISTRY.mode("linear", "torchao") is NumericMode.EMULATED
-    assert OP_REGISTRY.mode("linear", "torchao", {"emulated": False}) is NumericMode.NATIVE
-    # And it takes the argument, while a single-mode row does not.
-    assert "emulated" in OP_REGISTRY.row_arguments("linear", "torchao")
-    assert "emulated" not in OP_REGISTRY.row_arguments("linear", "qat")
-
-    # ``exact`` is the only mode that leaves the operands alone.
-    assert [m.rounds_operands for m in NumericMode] == [False, True, True]
+    assert OP_REGISTRY.row_dtypes("moe_experts", "qat") == ("fp8", "fp4")
+    assert OP_REGISTRY.row_dtypes("moe_experts", "deepgemm") == ("fp8",)
+    assert OP_REGISTRY.row_dtypes("linear", "torchao") == ("nvfp4", "mxfp4")
+    assert OP_REGISTRY.row_dtypes("gated_mlp", "torchao") == ("nvfp4", "mxfp4")
+    # A reference row rounds nothing, so it declares no format.
+    assert OP_REGISTRY.row_dtypes("moe_experts", "fused_triton") == ()
+    assert OP_REGISTRY.row_dtypes("linear", "eager") == ()
+    assert OP_REGISTRY.row_dtypes("moe_experts", "no_such_row") is None
 
 
-def test_an_unregistered_row_has_no_mode():
-    """``None`` means "not a row", which callers must not confuse with ``EXACT``."""
-    assert OP_REGISTRY.mode("moe_experts", "no_such_row") is None
-    assert OP_REGISTRY.quantizes("moe_experts", "no_such_row") is None
+def test_the_handle_reports_whether_it_rounds():
+    """``VeomniOp.rounds`` is derived from ``dtypes``, not a hand-kept name list.
 
-
-def test_rounding_impls_is_derived_from_the_registry_not_a_hand_written_list():
-    """The guard set is computed, so a new rounding row is complete on registration.
-
-    ``deepgemm`` is the case that motivated it: listed by hand, it was missing from
-    ``moe_experts.QUANTIZING_IMPLS`` and so slipped past the non-SwiGLU guard.
+    Built from rows that resolve on CPU: ``qat`` needs SM90 and ``deepgemm`` needs
+    SM90/SM100, so their declaration is asserted through ``row_dtypes`` above.
     """
-    assert OP_REGISTRY.rounding_impls("moe_experts") == frozenset({"qat", "deepgemm"})
-    # A row offering both modes is in the set: emulation is what a config gets by
-    # default, so "could this ever round?" is yes.
-    assert OP_REGISTRY.rounding_impls("linear") == frozenset({"qat", "torchao"})
+    from veomni.ops.registry import OpEntry
+
+    def handle(impl, dtypes):
+        op = object.__new__(VeomniOp)
+        op.op, op.variant, op.impl, op.kwargs = "linear", "standard", impl, {}
+        op._entry = OpEntry(
+            op="linear",
+            variant="standard",
+            impl=impl,
+            description="probe",
+            wrapper=lambda *a, **k: None,
+            dtypes=dtypes,
+        )
+        return op
+
+    assert handle("qat", ("fp8",)).rounds
+    assert handle("deepgemm", ("fp8",)).rounds
+    assert not handle("fused_triton", ()).rounds
+
+
+def test_the_per_family_quantizing_sets_name_the_rows_that_round():
+    """The families that own one list the rows a guard must refuse a fallback for.
+
+    ``deepgemm`` is the case that motivated listing it: absent, a non-SwiGLU
+    activation reached the plain-``F.linear`` fallback and trained the routed
+    experts at full precision while the config said ``deepgemm``.
+    """
+    from veomni.ops.kernels.gated_mlp._module import QUANTIZING_IMPLS as gated
+    from veomni.ops.kernels.moe_experts import QUANTIZING_IMPLS as moe
+
+    assert moe == frozenset({"qat", "deepgemm"})
+    assert gated == frozenset({"qat", "torchao"})
 
 
 def test_a_native_row_ignores_the_arguments_it_does_not_take():
@@ -535,14 +543,14 @@ def test_a_native_row_is_refused_where_a_deployment_kernel_is_not_reached():
     from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 
     class _Experts(nn.Module):
-        def __init__(self, impl, mode):
+        def __init__(self, impl):
             super().__init__()
-            self.use_swiglu_mlp = False
-            self.veomni_moe = type("_Handle", (), {"impl": impl, "mode": mode})()
+            self.use_swiglu = False
+            self.veomni_moe = type("_Handle", (), {"impl": impl})()
 
     for impl in ("qat", "deepgemm"):
         with pytest.raises(ValueError, match="cannot run with a non-SwiGLU activation"):
-            reject_quantizing_act_fn(_Experts(impl, NumericMode.EMULATED if impl == "qat" else NumericMode.NATIVE))
+            reject_quantizing_act_fn(_Experts(impl))
 
     # A row that rounds nothing keeps the fallback: it has no fused kernel to miss.
-    reject_quantizing_act_fn(_Experts("fused_triton", NumericMode.EXACT))
+    reject_quantizing_act_fn(_Experts("fused_triton"))

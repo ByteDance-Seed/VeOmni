@@ -620,7 +620,7 @@ def test_qwen3_packed_sage_attention_matches_independent_samples(monkeypatch, av
 
 _requires_torchao = pytest.mark.skipif(
     not is_package_available("torchao"),
-    reason="the torchao linear/swiglu_mlp rows need the optional 'torchao' package",
+    reason="the torchao linear/gated_mlp rows need the optional 'torchao' package",
 )
 
 
@@ -636,13 +636,13 @@ def _qwen3_with_ops(config: Qwen3Config, **ops):
 @_cpu
 def test_qwen3_attention_binds_the_configured_linear_row():
     """The attention projections read ``linear_implementation``; the MLP keeps its own field."""
-    model = _qwen3_with_ops(_tiny_config(), linear_implementation="eager", swiglu_mlp_implementation="eager")
+    model = _qwen3_with_ops(_tiny_config(), linear_implementation="eager", gated_mlp_implementation="eager")
 
     attention = model.model.layers[0].self_attn
     assert isinstance(attention.veomni_linear, VeomniOp)
     assert (attention.veomni_linear.op, attention.veomni_linear.variant) == ("linear", "standard")
     assert attention.veomni_linear.impl == "eager"
-    assert model.model.layers[0].mlp.veomni_swiglu_mlp.impl == "eager"
+    assert model.model.layers[0].mlp.veomni_gated_mlp.impl == "eager"
 
 
 @_cpu
@@ -682,9 +682,7 @@ def test_qwen3_nvfp4_qat_trains_and_rounds(device: str):
     torch.manual_seed(0)
     config = _tiny_config()
     eager = _qwen3_with_ops(config).to(device)
-    quantized = _qwen3_with_ops(config, linear_implementation="torchao", swiglu_mlp_implementation="torchao").to(
-        device
-    )
+    quantized = _qwen3_with_ops(config, linear_implementation="torchao", gated_mlp_implementation="torchao").to(device)
     quantized.load_state_dict(eager.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8), device=device)
@@ -712,11 +710,11 @@ def test_qwen3_nvfp4_qat_rounds_exactly_the_projection_weights(monkeypatch):
     A forward-output test cannot tell a recipe that quantizes one tensor too few
     from the right one, so this records which parameters reach the quantizer.
     """
+    import veomni.ops.kernels.gated_mlp.standard.torchao as mlp_row
     import veomni.ops.kernels.linear.standard.torchao as linear_row
-    import veomni.ops.kernels.swiglu_mlp.standard.torchao as mlp_row
 
     config = _tiny_config()
-    model = _qwen3_with_ops(config, linear_implementation="torchao", swiglu_mlp_implementation="torchao")
+    model = _qwen3_with_ops(config, linear_implementation="torchao", gated_mlp_implementation="torchao")
     names_by_ptr = {param.data_ptr(): name for name, param in model.named_parameters()}
     rounded = set()
 
@@ -756,7 +754,7 @@ def test_qwen3_nvfp4_qat_rounds_exactly_the_projection_weights(monkeypatch):
     ("ops", "targets"),
     [
         pytest.param({"linear_implementation": "torchao"}, ["q_proj", "k_proj", "v_proj", "o_proj"], id="attention"),
-        pytest.param({"swiglu_mlp_implementation": "torchao"}, ["gate_proj", "up_proj", "down_proj"], id="mlp"),
+        pytest.param({"gated_mlp_implementation": "torchao"}, ["gate_proj", "up_proj", "down_proj"], id="mlp"),
     ],
 )
 @_cpu

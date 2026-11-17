@@ -178,7 +178,7 @@ def validate_compile_runtime(
 #: which Inductor knows) and must not with ``dtype: mxfp4``.
 _UNCOMPILABLE_FORMATS: dict[str, tuple[str, str]] = {
     "linear_implementation": ("torchao", "mxfp4"),
-    "swiglu_mlp_implementation": ("torchao", "mxfp4"),
+    "gated_mlp_implementation": ("torchao", "mxfp4"),
 }
 
 

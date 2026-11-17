@@ -30,7 +30,7 @@ from ...platform import (
     NpuKernelRequirement,
     NvidiaGpuPlatform,
 )
-from ...registry import NumericMode, register_op
+from ...registry import register_op
 from .gpt_oss import eager as gpt_oss_eager
 from .gpt_oss import quack as gpt_oss_quack
 from .shared import unpermute
@@ -46,18 +46,19 @@ from .standard import triton as standard_triton
 _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
-
-def rounding_impls() -> frozenset[str]:
-    """``moe_experts`` rows that could round the operands they are handed, in any mode.
-
-    Kept for the callers that have no handle to ask -- a row's name is all they know.
-    A caller that *has* a handle should read ``handle.mode`` instead, which answers
-    for the arguments that config selected: a row offering both an emulated and a
-    native mode round in both, but a row offering only one is exact in neither.
-    """
-    from ...registry import OP_REGISTRY
-
-    return OP_REGISTRY.rounding_impls("moe_experts")
+#: ``moe_experts`` rows that fake-quantize the operands they are handed. Adapters
+#: need the real weights, and ``moe_experts_lora`` has no matching row, so an
+#: expert-LoRA request on one of these must be refused rather than silently
+#: falling back to a full-precision ``eager`` base.
+#:
+#: ``deepgemm`` belongs here for the same reason as ``qat``: its
+#: ``GroupedLinear`` runs the FP8 GEMM in forward, dgrad *and* wgrad. Leaving it
+#: out let a non-SwiGLU activation reach ``merged_experts_act_fn_forward`` -- plain
+#: ``F.linear`` in the model dtype -- and train the routed experts unquantized
+#: while the config said ``deepgemm``. The remaining rows (``fused_triton``,
+#: ``fused_quack``, ``fused_npu``, ``fused_mlu``, ``eager``) do bf16 math and
+#: ignore ``dtype``, so falling back changes nothing for them.
+QUANTIZING_IMPLS = frozenset({"qat", "deepgemm"})
 
 
 def reject_quantizing_act_fn(owner: nn.Module) -> None:
@@ -74,27 +75,25 @@ def reject_quantizing_act_fn(owner: nn.Module) -> None:
     the routed experts at full precision while the config claims otherwise. Support
     for other activations is tracked in #1430.
 
-    The activation is read from ``owner.use_swiglu_mlp`` rather than a config:
+    The activation is read from ``owner.use_swiglu`` rather than a config:
     ``DeepseekV3Experts`` and its siblings are plain ``nn.Module`` objects that
     record the answer at construction and hold no config reference.
 
     Args:
         owner: The experts module that owns the ``veomni_moe`` handle and carries
-            ``use_swiglu_mlp``.
+            ``use_swiglu``.
 
     Raises:
         ValueError: when the selection rounds its operands and the activation is not SwiGLU.
     """
-    if getattr(owner, "use_swiglu_mlp", True):
+    if getattr(owner, "use_swiglu", True):
         return
     handle = getattr(owner, "veomni_moe", None)
-    # Ask the handle, not the row: a row that offers both an emulated and a native
-    # mode has to answer for the one this config selected, and both round here.
-    mode = getattr(handle, "mode", None)
-    if mode is None or not mode.rounds_operands:
+    impl = getattr(handle, "impl", None)
+    if impl not in QUANTIZING_IMPLS:
         return
     raise ValueError(
-        f"moe_implementation={getattr(handle, 'impl', None)!r} cannot run with a non-SwiGLU activation: "
+        f"moe_implementation={impl!r} cannot run with a non-SwiGLU activation: "
         "every `moe_experts` row "
         "with a fused kernel implements SwiGLU only, in both forward and backward, so these routed "
         "experts would train through the Python act_fn loop and round nothing. Use hidden_act='silu' "
@@ -176,7 +175,6 @@ register_op(
     "standard",
     "qat",
     description="TileLang blockwise FP8/FP4 fake-quantized Triton grouped-GEMM routed SwiGLU MoE experts",
-    modes=(NumericMode.EMULATED,),
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang", "triton"),
@@ -188,11 +186,6 @@ register_op(
     "standard",
     "deepgemm",
     description="DeepGEMM blockwise FP8 expert forward, input gradients and weight gradients",
-    # ``NATIVE``, not ``EMULATED``: the row casts the operands to FP8 and runs
-    # DeepGEMM's grouped GEMM in that format, so it owns the cast instead of
-    # receiving already-rounded operands. That is what separates it from ``qat``
-    # even though both round.
-    modes=(NumericMode.NATIVE,),
     wrapper=standard_deepgemm.wrapper,
     requirement=GpuKernelRequirement(
         platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=90), NvidiaGpuPlatform(min_cc=100, max_cc=100)),

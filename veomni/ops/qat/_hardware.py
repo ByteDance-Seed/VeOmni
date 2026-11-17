@@ -37,7 +37,7 @@ def _native_bf16_qat_selections(model: nn.Module) -> set[str]:
         found: set[str] = set()
         ops = getattr(config, "ops_config", None)
         if ops is not None:
-            for field in ("linear_implementation", "swiglu_mlp_implementation"):
+            for field in ("linear_implementation", "gated_mlp_implementation"):
                 value = getattr(ops, field, None)
                 name = getattr(value, "name", value)
                 if name == _TORCHAO_FP4_ROW:

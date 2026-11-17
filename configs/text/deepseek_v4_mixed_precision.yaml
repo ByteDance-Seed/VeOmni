@@ -78,7 +78,7 @@ model:
     # Shared expert. Quantized everywhere except layer 0, which the
     # checkpoint stores in BF16.
     # ------------------------------------------------------------------
-    swiglu_mlp_implementation:
+    gated_mlp_implementation:
       name: qat
       kwargs:
         block_size: 128

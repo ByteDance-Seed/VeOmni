@@ -70,7 +70,7 @@ def wrapper(
         return _native(linear, x, dtype, block_size)
     # An emulated row always gets a weight: ``resolve_projection`` raises for a
     # wrapped projection instead of handing back a shortcut.
-    weight, shortcut = resolve_projection("torchao", linear, x, emulated=True)
+    weight, shortcut = resolve_projection("torchao", linear, x)
     assert shortcut is None
     bias = getattr(linear, "bias", None)
     quantize = torchao_fake_quant(dtype)
