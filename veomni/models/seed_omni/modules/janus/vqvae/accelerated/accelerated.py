@@ -281,20 +281,61 @@ class JanusVqvaeAccelerated(VeOmniMixin, JanusVqvae):
 
         ``chunk_loss`` and ``liger_kernel`` are fused-linear: they need the final
         linear's input activations and its weight, not a materialised logits
-        tensor. The eager row takes logits. Both shapes are computed here so an
-        explicit ``cross_entropy_loss_implementation`` override works rather than
-        raising ``chunk_loss requires a nonempty ``weight`` (fused-linear path)``.
+        tensor. The eager row takes logits.
+
+        The head has a bias (``nn.Linear`` default), and it must reach the loss:
+        omitting it changes the number and leaves ``vision_head.bias`` without a
+        gradient. ``chunk_loss`` takes it directly (``logits_bias`` along the
+        token axis plus ``logits_bias_weight`` of shape ``(V, 1)`` so the bias
+        gradient is projected, not materialised per token). ``liger_kernel``'s
+        VeOmni row hardcodes ``bias=None``, so the two are scored separately
+        there — a logit-additive bias commutes with the linear term, which keeps
+        the fused weight/hidden gradients exact.
         """
-        if getattr(self.veomni_ce, "impl", None) in _FUSED_CE_IMPLS:
+        head = self.generation_head.vision_head
+        bias = head.bias
+        impl = getattr(self.veomni_ce, "impl", None)
+
+        if impl == "chunk_loss":
+            if bias is None:
+                loss, _, _ = self.loss_function(
+                    hidden_states=pre_head.reshape(-1, pre_head.size(-1)),
+                    weights=head.weight,
+                    shift_labels=flat_labels,
+                    vocab_size=logits.size(-1),
+                    loss_reduction_group=loss_reduction_group,
+                )
+                return loss
+            # ``logits_bias`` is added to each chunk's logits: rows must line up
+            # with the activations, and a scalar ones column turns the (V, 1)
+            # bias weight into the plain bias vector.
+            ones = pre_head.new_ones(pre_head.shape[:-1] + (1,))
             loss, _, _ = self.loss_function(
                 hidden_states=pre_head.reshape(-1, pre_head.size(-1)),
-                weights=self.generation_head.vision_head.weight,
+                weights=head.weight,
+                shift_labels=flat_labels,
+                vocab_size=logits.size(-1),
+                logits_bias=ones,
+                logits_bias_weight=bias.unsqueeze(-1),
+                loss_reduction_group=loss_reduction_group,
+            )
+            return loss
+
+        if impl == "liger_kernel":
+            # The VeOmni liger row hardcodes ``bias=None`` and rejects an empty
+            # weight, so it has no bias path at all. Score through the eager row
+            # over `logits` (which already carries the bias) rather than dropping
+            # it: the number and the ``vision_head.bias`` gradient are then
+            # correct, and only the fused kernel is given up.
+            loss, _, _ = ForCausalLMLoss(
+                logits=logits,
                 shift_labels=flat_labels,
                 vocab_size=logits.size(-1),
                 loss_reduction_group=loss_reduction_group,
             )
             return loss
-        loss, _, _ = self.loss_function(
+
+        loss, _, _ = ForCausalLMLoss(
             logits=logits,
             shift_labels=flat_labels,
             vocab_size=logits.size(-1),

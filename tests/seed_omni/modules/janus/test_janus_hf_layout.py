@@ -30,10 +30,12 @@ LLAMA = "janus_llama"
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def _janus_config(*, tied: bool = False) -> JanusConfig:
+def _janus_config(*, tied: bool = False, nested_tied: bool | None = None) -> JanusConfig:
     """A Janus config small enough to build on CPU.
 
-    Janus-1.3B ships untied, so that is the default here.
+    Janus-1.3B ships untied, so that is the default here. ``nested_tied`` sets
+    the ``text_config`` flag independently: upstream expands the tied mapping
+    from the *outer* flag alone, so the two can disagree.
     """
     text_config = LlamaConfig(
         vocab_size=32,
@@ -44,7 +46,7 @@ def _janus_config(*, tied: bool = False) -> JanusConfig:
         num_key_value_heads=1,
         head_dim=8,
         max_position_embeddings=64,
-        tie_word_embeddings=tied,
+        tie_word_embeddings=tied if nested_tied is None else nested_tied,
     )
     vision_config = JanusVisionConfig(
         hidden_size=8,
@@ -112,20 +114,46 @@ def _save_tokenizer(path: Path) -> None:
     ).save_pretrained(path)
 
 
-def _write_hf_checkpoint(root: Path, *, tied: bool = False) -> dict[str, torch.Tensor]:
-    """Write a tiny upstream Janus root (single-file safetensors)."""
+def _write_hf_checkpoint(
+    root: Path,
+    *,
+    tied: bool = False,
+    nested_tied: bool | None = None,
+    head: str = "auto",
+) -> dict[str, torch.Tensor]:
+    """Write a tiny upstream Janus root (single-file safetensors).
+
+    ``head`` says what the checkpoint stores for ``lm_head.weight``:
+
+    * ``"auto"`` — omit it when tied (what a tied export does), else store a
+      distinct head (what an untied export does);
+    * ``"omit"`` — never store it, even when the flags say untied;
+    * ``"equal"`` — store it byte-identical to the embedding;
+    * ``"different"`` — store it with its own values.
+    """
     from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
-    config = _janus_config(tied=tied)
+    config = _janus_config(tied=tied, nested_tied=nested_tied)
     root.mkdir(parents=True)
     config.save_pretrained(root)
     JanusImageProcessor(image_size=8, patch_size=4).save_pretrained(root)
     _save_tokenizer(root)
     tensors = _source_tensors(config)
-    if tied:
-        # A real tied export omits ``lm_head.weight``; HF's ``state_dict()`` still
-        # lists it (aliasing the embedding).
+
+    if head == "auto":
+        if tied:
+            # A real tied export omits ``lm_head.weight``; HF's ``state_dict()``
+            # still lists it (aliasing the embedding).
+            tensors.pop("lm_head.weight", None)
+    elif head == "omit":
         tensors.pop("lm_head.weight", None)
+    elif head == "equal":
+        tensors["lm_head.weight"] = tensors["model.language_model.embed_tokens.weight"].clone()
+    elif head == "different":
+        tensors["lm_head.weight"] = tensors["lm_head.weight"] + 1.0
+    else:  # pragma: no cover - guards the call sites
+        raise ValueError(f"unknown head mode {head!r}")
+
     save_file(tensors, root / "model.safetensors", metadata={"format": "pt"})
     return tensors
 
@@ -175,8 +203,10 @@ def test_the_layout_claims_every_upstream_key():
 def test_build_config_maps_the_upstream_config_per_module():
     """Each module's config comes from the upstream one, including the tie flag.
 
-    ``tie_word_embeddings_if_requested`` ANDs the outer and nested flags, so the
-    layout does too — the same predicate the module then acts on.
+    The tie decision follows upstream ``from_pretrained``: the flag decides, so
+    it is read off the top-level ``tie_word_embeddings`` (upstream expands the
+    tied mapping from that flag alone — the nested ``text_config`` value does not
+    take part).
     """
     config = _janus_config()
     modules = JANUS_HF_LAYOUT.modules
@@ -191,11 +221,11 @@ def test_build_config_maps_the_upstream_config_per_module():
     text_encoder = modules[TEXT_ENCODER]
     assert text_encoder.build_config(_janus_config(tied=True)).tie_word_embeddings is True
     assert text_encoder.build_config(_janus_config(tied=False)).tie_word_embeddings is False
-    # Outer ``True`` beside an untied ``text_config`` resolves to untied — the
-    # AND the framework applies.
+    # Upstream ties from the outer flag, so an untied ``text_config`` beside it
+    # does not veto the tie (verified against transformers 5.16.1).
     disagreeing = _janus_config(tied=False)
     disagreeing.tie_word_embeddings = True
-    assert text_encoder.build_config(disagreeing).tie_word_embeddings is False
+    assert text_encoder.build_config(disagreeing).tie_word_embeddings is True
 
 
 def test_an_hf_root_resolves_to_a_weight_free_split_view(hf_root):
@@ -249,3 +279,45 @@ def test_omni_model_loads_every_module_weight_from_the_hf_root(tmp_path, tied):
     assert (text_encoder.lm_head is not None) is not tied
     # The backbone owns no wte / lm_head; the text encoder does.
     assert not any("embed_tokens" in key for key in model.modules_dict[LLAMA].state_dict())
+
+
+@pytest.mark.parametrize(
+    ("tied", "nested_tied", "head", "expect_head"),
+    [
+        # F015: upstream's own default (outer True, nested False) with the
+        # duplicate omitted. The old AND-based rule built an independent head
+        # with nothing to load into it — i.e. random weights on a real model.
+        (True, False, "omit", False),
+        # F022: both flags say tied, but the checkpoint stores a head that
+        # differs from the embedding. Upstream warns and keeps them separate, so
+        # the stored head must load rather than be replaced by the embedding.
+        (True, True, "different", True),
+        # A tied export that wrote the duplicate out keeps the tie.
+        (True, True, "equal", False),
+        # Janus-1.3B: untied flags and a real head of its own.
+        (False, False, "different", True),
+    ],
+    ids=["omitted-head-nested-untied", "stored-head-differs", "stored-head-equal", "plain-untied"],
+)
+def test_the_stored_head_decides_tying_the_way_from_pretrained_does(tmp_path, tied, nested_tied, head, expect_head):
+    """The tie rule has to match upstream, in both directions.
+
+    Upstream's ``from_pretrained`` consults the stored tensors: an omitted head
+    is tied regardless of the flags, and a stored head with different values is
+    kept independent regardless of them. Only an equal pair (and an unreadable
+    checkpoint) falls back to the config.
+    """
+    root = tmp_path / "Janus-tiny"
+    tensors = _write_hf_checkpoint(root, tied=tied, nested_tied=nested_tied, head=head)
+
+    model = OmniModel.from_pretrained(str(root), dtype=torch.bfloat16, device_map="cpu", attn_implementation="eager")
+    text_encoder = model.modules_dict[TEXT_ENCODER]
+    assert (text_encoder.lm_head is not None) is expect_head
+
+    if expect_head:
+        assert torch.equal(text_encoder.lm_head.weight, tensors["lm_head.weight"])
+    else:
+        assert torch.equal(
+            text_encoder.embed_tokens.weight,
+            tensors["model.language_model.embed_tokens.weight"],
+        )
