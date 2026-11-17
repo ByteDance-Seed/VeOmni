@@ -73,10 +73,11 @@ register_op(
     "gated_mlp",
     "standard",
     "qat",
-    description="TileLang blockwise FP8 fake-quantized SwiGLU MLP with optional activation clamping",
+    description="TileLang blockwise FP8 fake-quantized gated MLP with optional activation clamping",
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
+    dtypes=("fp8",),
 )
 
 register_op(

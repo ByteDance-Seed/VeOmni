@@ -365,6 +365,7 @@ def test_moe_lora_rejects_a_quantizing_expert_row(mode: str):
     from types import SimpleNamespace
 
     from veomni.lora.moe_layers import _moe_lora_op
+
     base_layer = SimpleNamespace(veomni_moe=SimpleNamespace(impl="qat"))
 
     with pytest.raises(ValueError, match="qat.*does not support MoE-LoRA"):

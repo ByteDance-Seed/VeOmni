@@ -483,6 +483,24 @@ def test_the_per_family_quantizing_sets_name_the_rows_that_round():
     assert gated == frozenset({"qat", "torchao"})
 
 
+def test_the_per_family_sets_agree_with_the_registry():
+    """The hand-written sets must say what each row already declares.
+
+    A row states the formats it rounds to (``dtypes``) at registration, and the
+    guard sets list the rows a fallback would train unquantized. Those are the same
+    fact recorded twice, so this pins them together: adding a rounding row without
+    listing it -- the mistake that let ``deepgemm`` slip past the activation guard --
+    fails here instead of at a user's first non-SwiGLU run.
+    """
+    from veomni.ops.kernels.gated_mlp._module import QUANTIZING_IMPLS as gated
+    from veomni.ops.kernels.linear._module import QUANTIZING_IMPLS as linear
+    from veomni.ops.kernels.moe_experts import QUANTIZING_IMPLS as moe
+
+    for op, declared in (("linear", linear), ("gated_mlp", gated), ("moe_experts", moe)):
+        rounds = {impl for impl in OP_REGISTRY.all_impls(op) if OP_REGISTRY.row_dtypes(op, impl)}
+        assert declared == rounds, f"{op}: QUANTIZING_IMPLS disagrees with the registry's dtypes"
+
+
 def test_a_native_row_ignores_the_arguments_it_does_not_take():
     """Its format is fixed by the row, so ``dtype`` is not passed to it.
 
