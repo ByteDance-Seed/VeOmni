@@ -263,13 +263,14 @@ def fp8_weight_quant(
         weight (torch.float8_e4m3fn): Quantized weight, same shape as ``x``.
         scale (``scale_dtype``): One scale per ``block_size x block_size`` tile.
     """
-    assert x.dim() == 2, f"fp8_weight_quant expects a 2D weight, got shape {tuple(x.shape)}"
-    assert x.dtype == torch.bfloat16, f"fp8_weight_quant expects a bfloat16 weight, got {x.dtype}"
+    if x.dim() != 2:
+        raise ValueError(f"fp8_weight_quant expects a 2D weight, got shape {tuple(x.shape)}")
+    if x.dtype != torch.bfloat16:
+        raise TypeError(f"fp8_weight_quant expects a bfloat16 weight, got {x.dtype}")
     validate_fp8_scale_pairing(scale_fmt, scale_dtype)
     M, N = x.shape
-    assert M % block_size == 0 and N % block_size == 0, (
-        f"weight shape {(M, N)} is not divisible by block_size {block_size}"
-    )
+    if M % block_size or N % block_size:
+        raise ValueError(f"weight shape {(M, N)} is not divisible by block_size {block_size}")
     z = x.contiguous()
     y = torch.empty_like(z) if dequant else torch.empty_like(z, dtype=torch.float8_e4m3fn)
     s = z.new_empty((M // block_size, N // block_size), dtype=scale_dtype)

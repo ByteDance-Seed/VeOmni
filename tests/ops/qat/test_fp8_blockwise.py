@@ -103,18 +103,8 @@ def test_qat_entry_points_reach_vendor_backend_after_sm90_check(monkeypatch):
 def test_qat_fp8_entry_points_run_triton_on_amd_and_fp4_stays_nvidia_only(monkeypatch):
     tilelang_calls, triton_calls = [], []
     _install_fake_quant_backend(monkeypatch, tilelang_calls)
+    _install_fake_quant_backend(monkeypatch, triton_calls, "veomni.ops.qat.triton_quant")
     monkeypatch.setattr(fp8_blockwise, "fp8_quantizer_backend", lambda device=None: "triton")
-
-    def act_impl(x, block_size, scale_fmt, scale_dtype=torch.float32, dequant=False, backend=None):
-        triton_calls.append(("act", backend))
-        return x.clone()
-
-    def weight_impl(x, block_size, scale_fmt, scale_dtype=torch.float32, dequant=False, backend=None):
-        triton_calls.append(("weight", backend))
-        return x.clone()
-
-    monkeypatch.setattr(fp8_blockwise, "_act_quant_impl", act_impl)
-    monkeypatch.setattr(fp8_blockwise, "_weight_quant_impl", weight_impl)
     error = RuntimeError("QAT TileLang quantizers require an SM90 or later NVIDIA CUDA GPU")
     monkeypatch.setattr(qat, "require_tilelang_sm90", lambda device=None: (_ for _ in ()).throw(error))
     monkeypatch.setattr(fp4_blockwise, "require_tilelang_sm90", lambda device=None: (_ for _ in ()).throw(error))
@@ -128,7 +118,6 @@ def test_qat_fp8_entry_points_run_triton_on_amd_and_fp4_stays_nvidia_only(monkey
         else:
             call()
             assert triton_calls, f"{name} did not reach the Triton backend"
-            assert all(backend == "triton" for _, backend in triton_calls)
     assert tilelang_calls == []
 
 
@@ -170,6 +159,14 @@ def _weight_qdq(weight, block_size=128, round_scale=True):
     rows, cols = weight.shape
     tiles = quantized.float().view(rows // block_size, block_size, cols // block_size, block_size)
     return (tiles * scales[:, None, :, None]).view(rows, cols).to(weight.dtype)
+
+
+def test_fp8_weight_quant_preserves_x_keyword(reference_quantizers):
+    weight = torch.randn(128, 128, dtype=torch.bfloat16)
+
+    actual = qat.fp8_weight_quant(x=weight, dequant=True)
+
+    torch.testing.assert_close(actual, reference_fp8_weight_quant(weight, dequant=True))
 
 
 def _fake_quant(kind, tensor):

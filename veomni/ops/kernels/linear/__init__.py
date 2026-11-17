@@ -31,7 +31,7 @@ low-precision deployment GEMM computes.
 select it.
 """
 
-from ...platform import NVIDIA_SM90_PLUS, ROCM_GPU, GpuKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, ROCM_GFX942_GFX950, GpuKernelRequirement
 from ...registry import register_op
 from .grouped import eager as grouped_eager
 from .grouped import qat as grouped_qat
@@ -40,7 +40,7 @@ from .standard import qat as standard_qat
 from .standard import torchao_nvfp4 as standard_torchao_nvfp4
 
 
-_QAT_GPU = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS, ROCM_GPU))
+_QAT_GPU = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS, ROCM_GFX942_GFX950))
 
 
 register_op(

@@ -24,10 +24,11 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from ...utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability, get_rocm_gcn_arch
+from ...utils.device import get_gpu_compute_capability, get_rocm_gcn_arch, normalize_cuda_device
+from ..platform import ROCM_GFX942_GFX950
 
 
-TRITON_FP8_ARCHS = ("gfx942", "gfx950")
+TRITON_FP8_ARCHS = ROCM_GFX942_GFX950.architectures
 FP8_QUANTIZER_GPUS = "an SM90 or later NVIDIA CUDA GPU or an AMD ROCm gfx942/gfx950 GPU"
 
 
@@ -80,15 +81,8 @@ def reject_qat_without_native_bf16(model: nn.Module) -> None:
 
 def quantizer_backend(device: torch.types.Device | int | None = None) -> str | None:
     """Return the FP8 backend for ``device``, or ``None`` when that device is unsupported."""
-    if not IS_CUDA_AVAILABLE:
-        return None
+    device = normalize_cuda_device(device)
     if device is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    elif isinstance(device, int):
-        device = torch.device("cuda", device)
-    else:
-        device = torch.device(device)
-    if device.type != "cuda":
         return None
     if torch.version.hip is not None:
         return "triton" if get_rocm_gcn_arch(device) in TRITON_FP8_ARCHS else None
