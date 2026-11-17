@@ -83,6 +83,20 @@ def get_device_id() -> int:
     return get_torch_device().current_device()
 
 
+def normalize_cuda_device(device: torch.types.Device | int | None = None) -> torch.device | None:
+    """Resolve a PyTorch CUDA/ROCm device, or return ``None`` off that device namespace."""
+    if not IS_CUDA_AVAILABLE:
+        return None
+    device_type = get_device_type()
+    if device is None:
+        resolved = torch.device(device_type, get_device_id())
+    elif isinstance(device, int):
+        resolved = torch.device(device_type, device)
+    else:
+        resolved = torch.device(device)
+    return resolved if resolved.type == device_type else None
+
+
 def is_moe_kernel_supported(device: torch.device | str) -> bool:
     """Return True if ``device`` is one of the supported accelerator types (CUDA/MLU)."""
     device_type = getattr(device, "type", device)
@@ -194,6 +208,13 @@ def get_gpu_compute_capability(device: torch.types.Device | int | None = None) -
 def is_sm90_or_above() -> bool:
     """Check if the current CUDA device has SM90+ capability."""
     return get_gpu_compute_capability() >= 90
+
+
+def get_rocm_gcn_arch(device: torch.types.Device | int | None = None) -> str | None:
+    """Return the AMD GPU architecture (e.g. ``"gfx950"``), or ``None`` off ROCm."""
+    if torch.version.hip is None or not IS_CUDA_AVAILABLE:
+        return None
+    return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
 
 
 def create_stream(device=None, priority: int = 0) -> Any:

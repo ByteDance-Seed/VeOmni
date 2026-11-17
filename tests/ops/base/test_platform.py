@@ -52,6 +52,18 @@ def test_rocm_platform_uses_pytorch_cuda_namespace(monkeypatch):
     assert RocmGpuPlatform().matches()
 
 
+@pytest.mark.parametrize(("architecture", "expected"), (("gfx90a", False), ("gfx942", True), ("gfx950", True)))
+def test_rocm_platform_architecture_allow_list(monkeypatch, architecture, expected):
+    monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.ops.platform.gpu.torch.version.hip", "6.0", raising=False)
+    monkeypatch.setattr("veomni.ops.platform.gpu.get_rocm_gcn_arch", lambda: architecture)
+
+    platform = RocmGpuPlatform(architectures=("gfx942", "gfx950"))
+
+    assert platform.matches() is expected
+    assert "gfx942" in platform.describe()
+
+
 def test_default_gpu_requirement_supports_nvidia_and_rocm():
     """Default GPU requirements cover both platforms without architecture bounds."""
     requirement = GpuKernelRequirement()
@@ -123,6 +135,12 @@ def test_nvidia_platform_rejects_invalid_cc_range(kwargs):
     """Invalid NVIDIA CC intervals fail at registration construction time."""
     with pytest.raises(ValueError):
         NvidiaGpuPlatform(**kwargs)
+
+
+@pytest.mark.parametrize("architectures", ((), ["gfx942"], ("gfx942", "gfx942"), ("",)))
+def test_rocm_platform_rejects_invalid_architectures(architectures):
+    with pytest.raises(ValueError, match="architectures"):
+        RocmGpuPlatform(architectures=architectures)
 
 
 def test_gpu_requirement_requires_platforms():

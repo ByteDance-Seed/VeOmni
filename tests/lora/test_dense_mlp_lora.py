@@ -187,7 +187,7 @@ def test_mlp_lora_keeps_every_non_quantizing_row(family: str, impl: str):
 
 @pytest.mark.skipif(
     "qat" not in OP_REGISTRY.list_available("swiglu_mlp", "standard"),
-    reason="the qat row needs TileLang on SM90+",
+    reason="the qat row needs a supported GPU quantizer",
 )
 def test_mlp_lora_refuses_the_quantizing_row():
     """Silently running the base layer at full precision would leave the config claiming QAT."""

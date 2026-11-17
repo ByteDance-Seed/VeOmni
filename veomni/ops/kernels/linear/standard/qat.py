@@ -14,10 +14,9 @@
 
 """Standard dense linear blockwise-FP8 QAT implementation.
 
-Both GEMM operands are fake-quantized with the DeepSeek-V4 TileLang quantizers
-and the multiply itself runs in the model dtype, which is what an emulated FP8
-deployment GEMM computes: the rounded values are read back and accumulated in
-high precision.
+Both GEMM operands are fake-quantized with the DeepSeek-V4 quantizers and the
+multiply itself runs in the model dtype, which is what an emulated FP8 deployment
+GEMM computes: the rounded values are read back and accumulated in high precision.
 """
 
 from __future__ import annotations

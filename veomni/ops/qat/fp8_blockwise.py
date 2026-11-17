@@ -20,6 +20,7 @@ halves come from reusing the DeepSeek-V4 TileLang quantizers for the
 quantize-dequantize round trip and wrapping them in a straight-through
 estimator, which keeps training bit-aligned with inference by construction
 instead of by a second, drifting reimplementation of the same numerics.
+AMD GPUs use a Triton port held to the same reference.
 
 The backward pass is the usual straight-through approximation: a
 quantize-dequantize round trip is a step function whose true derivative is zero
@@ -29,13 +30,14 @@ Every scale is derived from its own block's amax, and ``ue8m0`` rounds that
 scale up, so ``x / scale`` stays inside the representable FP8 range and no
 element sits in a saturated region whose gradient would have to be masked.
 
-Quantizing paths require BF16 operands on an NVIDIA SM90 or later GPU.
+Quantizing paths require BF16 operands on an NVIDIA SM90 or later GPU or an AMD
+gfx942/gfx950 GPU.
 """
 
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 
-from ._hardware import require_tilelang_sm90
+from ._hardware import fp8_quantizer_backend
 
 
 # DeepSeek-V4 rounds every scale up to a power of two so that it survives
@@ -53,66 +55,102 @@ __all__ = [
 ]
 
 
-def act_quant(*args, **kwargs):
-    """Lazily call the TileLang activation quantizer."""
-    require_tilelang_sm90()
-    from .quant import act_quant as quantize
-
-    return quantize(*args, **kwargs)
-
-
-def fp8_weight_quant(*args, **kwargs):
-    """Lazily call the TileLang FP8 weight quantizer."""
-    require_tilelang_sm90()
-    from .quant import fp8_weight_quant as quantize
-
-    return quantize(*args, **kwargs)
+def _act_quant_impl(x, block_size, scale_fmt, scale_dtype=torch.float32, *, dequant, backend=None):
+    if (backend or fp8_quantizer_backend(x.device)) == "triton":
+        from .triton_quant import act_quant as quantize
+    else:
+        from .quant import act_quant as quantize
+    return quantize(x, block_size, scale_fmt, scale_dtype, dequant)
 
 
-def _check_operand(tensor: torch.Tensor, scale_fmt: str | None, what: str) -> None:
-    """Validate dtype, scale format, and local-tensor ownership."""
-    # The TileLang quantizers hard-code a BF16 operand dtype, so a FP32 tensor
-    # would be reinterpreted rather than converted. Refuse instead of casting:
-    # a silent downcast here would change training numerics invisibly.
+def _weight_quant_impl(weight, block_size, scale_fmt, scale_dtype=torch.float32, *, dequant, backend=None):
+    if (backend or fp8_quantizer_backend(weight.device)) == "triton":
+        from .triton_quant import fp8_weight_quant as quantize
+    else:
+        from .quant import fp8_weight_quant as quantize
+    return quantize(weight, block_size, scale_fmt, scale_dtype, dequant)
+
+
+def act_quant(
+    x: torch.Tensor,
+    block_size: int = 128,
+    scale_fmt: str | None = None,
+    scale_dtype: torch.dtype = torch.float32,
+    dequant: bool = False,
+):
+    x = _local_operand(x)
+    backend = _check_operand(x, scale_fmt, "activation")
+    return _act_quant_impl(x, block_size, scale_fmt, scale_dtype, dequant=dequant, backend=backend)
+
+
+def fp8_weight_quant(
+    x: torch.Tensor,
+    block_size: int = 128,
+    scale_fmt: str | None = None,
+    scale_dtype: torch.dtype = torch.float32,
+    dequant: bool = False,
+):
+    x = _local_weight_operand(x)
+    backend = _check_operand(x, scale_fmt, "weight")
+    return _weight_quant_impl(x, block_size, scale_fmt, scale_dtype, dequant=dequant, backend=backend)
+
+
+def _local_operand(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+def _local_weight_operand(weight: torch.Tensor) -> torch.Tensor:
+    if isinstance(weight, DTensor):
+        if any(not isinstance(placement, Replicate) for placement in weight.placements):
+            raise ValueError(
+                "FP8 weight quantization cannot consume a sharded DTensor; local quantization would bypass "
+                "the owning module's FSDP unshard hook. Pass an unsharded weight or remove that projection "
+                "from basic_modules."
+            )
+        return weight.to_local()
+    return weight
+
+
+def _check_operand(tensor: torch.Tensor, scale_fmt: str | None, what: str) -> str:
+    """Validate a rank-local tensor and return its quantizer backend."""
     if tensor.dtype != torch.bfloat16:
         raise TypeError(f"FP8 fake quantization expects a bfloat16 {what}, got {tensor.dtype}")
-    # The kernels only test `scale_fmt is not None`, so any typo would silently
-    # select power-of-two scales instead of failing.
     if scale_fmt not in (None, "ue8m0"):
         raise ValueError(f"scale_fmt must be None or 'ue8m0', got {scale_fmt!r}")
-    # A DTensor carries the global shape, so the divisibility checks and the
-    # tile reshape below would be computed against dimensions the local shard
-    # does not have. Expert-parallel linears reach forward as DTensors.
-    if isinstance(tensor, DTensor):
-        raise TypeError(f"FP8 fake quantization does not support a DTensor {what}; pass the local shard")
+    return fp8_quantizer_backend(tensor.device)
+
+
+def _validate_block_size(block_size: int) -> None:
+    if block_size <= 0 or block_size & (block_size - 1):
+        raise ValueError(f"block_size must be a positive power of two, got {block_size}")
 
 
 class _Fp8FakeQuantAct(torch.autograd.Function):
     """Straight-through FP8 activation fake quantization."""
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, block_size: int, scale_fmt: str | None) -> torch.Tensor:
+    def forward(ctx, x: torch.Tensor, block_size: int, scale_fmt: str | None, backend: str) -> torch.Tensor:
         """Return the activation quantize-dequantize round trip."""
-        return act_quant(x.detach(), block_size, scale_fmt, dequant=True)
+        return _act_quant_impl(x.detach(), block_size, scale_fmt, dequant=True, backend=backend)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
         """Pass the output gradient straight through to the activation."""
-        return grad_output, None, None
+        return grad_output, None, None, None
 
 
 class _Fp8FakeQuantWeight(torch.autograd.Function):
     """Straight-through FP8 weight fake quantization."""
 
     @staticmethod
-    def forward(ctx, weight: torch.Tensor, block_size: int, scale_fmt: str | None) -> torch.Tensor:
+    def forward(ctx, weight: torch.Tensor, block_size: int, scale_fmt: str | None, backend: str) -> torch.Tensor:
         """Return the weight quantize-dequantize round trip."""
-        return fp8_weight_quant(weight.detach(), block_size, scale_fmt, dequant=True)
+        return _weight_quant_impl(weight.detach(), block_size, scale_fmt, dequant=True, backend=backend)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None, None]:
         """Pass the output gradient straight through to the master weight."""
-        return grad_output, None, None
+        return grad_output, None, None, None
 
 
 def fp8_fake_quant_act(
@@ -136,10 +174,14 @@ def fp8_fake_quant_act(
         A BF16 tensor holding the dequantized values, differentiable into ``x``
         through a straight-through estimator.
     """
-    _check_operand(x, scale_fmt, "activation")
+    x = _local_operand(x)
+    _validate_block_size(block_size)
+    if x.dim() == 0 or x.shape[-1] == 0:
+        raise ValueError(f"activation must have a nonzero last dimension, got shape {tuple(x.shape)}")
     if x.shape[-1] % block_size:
         raise ValueError(f"activation of {x.shape[-1]} channels is not divisible by block_size {block_size}")
-    return _Fp8FakeQuantAct.apply(x, block_size, scale_fmt)
+    backend = _check_operand(x, scale_fmt, "activation")
+    return _Fp8FakeQuantAct.apply(x, block_size, scale_fmt, backend)
 
 
 def fp8_fake_quant_act_prefix(
@@ -166,15 +208,19 @@ def fp8_fake_quant_act_prefix(
         A BF16 tensor of the same shape as ``x``, quantized below
         ``quant_features`` and untouched above it.
     """
-    _check_operand(x, scale_fmt, "activation")
+    x = _local_operand(x)
+    _validate_block_size(block_size)
+    if x.dim() == 0:
+        raise ValueError("activation must have at least one dimension")
     features = x.shape[-1]
     if not 0 < quant_features <= features:
         raise ValueError(f"quant_features must fall in (0, {features}], got {quant_features}")
     if quant_features % block_size:
         raise ValueError(f"quant_features {quant_features} is not divisible by block_size {block_size}")
+    backend = _check_operand(x, scale_fmt, "activation")
     if quant_features == features:
-        return fp8_fake_quant_act(x, block_size, scale_fmt)
-    quantized = fp8_fake_quant_act(x[..., :quant_features], block_size, scale_fmt)
+        return _Fp8FakeQuantAct.apply(x, block_size, scale_fmt, backend)
+    quantized = _Fp8FakeQuantAct.apply(x[..., :quant_features], block_size, scale_fmt, backend)
     return torch.cat([quantized, x[..., quant_features:]], dim=-1)
 
 
@@ -194,13 +240,15 @@ def fp8_fake_quant_weight(
         A BF16 tensor holding the dequantized weight, differentiable into
         ``weight`` through a straight-through estimator.
     """
-    _check_operand(weight, scale_fmt, "weight")
+    weight = _local_weight_operand(weight)
     if weight.dim() != 2:
         raise ValueError(f"FP8 weight fake quantization expects a 2D weight, got shape {tuple(weight.shape)}")
+    _validate_block_size(block_size)
     rows, cols = weight.shape
     if rows % block_size or cols % block_size:
         raise ValueError(f"weight shape {(rows, cols)} is not divisible by block_size {block_size}")
-    return _Fp8FakeQuantWeight.apply(weight, block_size, scale_fmt)
+    backend = _check_operand(weight, scale_fmt, "weight")
+    return _Fp8FakeQuantWeight.apply(weight, block_size, scale_fmt, backend)
 
 
 def fp8_fake_quant_stacked_weight(
@@ -227,11 +275,13 @@ def fp8_fake_quant_stacked_weight(
         A BF16 tensor of the input shape holding the dequantized weight,
         differentiable into ``weight`` through a straight-through estimator.
     """
-    _check_operand(weight, scale_fmt, "weight")
+    weight = _local_operand(weight)
     if weight.dim() != 3:
         raise ValueError(f"FP8 stacked weight fake quantization expects a 3D weight, got {tuple(weight.shape)}")
+    _validate_block_size(block_size)
     experts, rows, cols = weight.shape
     if rows % block_size or cols % block_size:
         raise ValueError(f"per-expert weight shape {(rows, cols)} is not divisible by block_size {block_size}")
-    flat = _Fp8FakeQuantWeight.apply(weight.reshape(experts * rows, cols), block_size, scale_fmt)
+    backend = _check_operand(weight, scale_fmt, "weight")
+    flat = _Fp8FakeQuantWeight.apply(weight.reshape(experts * rows, cols), block_size, scale_fmt, backend)
     return flat.view(experts, rows, cols)

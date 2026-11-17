@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ...utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability
+from ...utils.device import IS_CUDA_AVAILABLE, get_gpu_compute_capability, get_rocm_gcn_arch
 
 
 class GpuPlatform(ABC):
@@ -83,19 +83,39 @@ class NvidiaGpuPlatform(GpuPlatform):
 
 @dataclass(frozen=True)
 class RocmGpuPlatform(GpuPlatform):
-    """AMD ROCm/HIP as exposed through PyTorch's ``cuda`` namespace."""
+    """AMD ROCm/HIP with optional architecture allow-list."""
+
+    architectures: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the optional architecture allow-list."""
+        if self.architectures is None:
+            return
+        if (
+            not isinstance(self.architectures, tuple)
+            or not self.architectures
+            or not all(isinstance(arch, str) and arch for arch in self.architectures)
+        ):
+            raise ValueError("architectures must be a non-empty tuple of architecture names")
+        if len(set(self.architectures)) != len(self.architectures):
+            raise ValueError("architectures must not contain duplicates")
 
     def matches(self) -> bool:
-        """Return whether an AMD ROCm GPU is available."""
-        return IS_CUDA_AVAILABLE and torch.version.hip is not None
+        """Return whether an AMD ROCm GPU satisfies the architecture constraint."""
+        if not IS_CUDA_AVAILABLE or torch.version.hip is None:
+            return False
+        return self.architectures is None or get_rocm_gcn_arch() in self.architectures
 
     def describe(self) -> str:
         """Return the AMD ROCm platform description."""
+        if self.architectures is not None:
+            return f"AMD ROCm with architecture in {self.architectures}"
         return "AMD ROCm"
 
 
 NVIDIA_GPU = NvidiaGpuPlatform()
 ROCM_GPU = RocmGpuPlatform()
+ROCM_GFX942_GFX950 = RocmGpuPlatform(architectures=("gfx942", "gfx950"))
 NVIDIA_SM70_PLUS = NvidiaGpuPlatform(min_cc=70)
 #: Ada and later. FP8 E4M3 exists in hardware from SM89; the earlier Ampere parts
 #: (SM80/SM86) have no E4M3 type at all, so a kernel that casts to it cannot run there.
