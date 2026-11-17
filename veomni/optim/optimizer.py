@@ -17,7 +17,9 @@
 
 from collections import defaultdict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
+from functools import wraps
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -38,7 +40,10 @@ from torch.optim.optimizer import Optimizer
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
+from .cpu_offload_adamw import CPUOffloadAdamW, resolve_moment_dtype, select_cpu_offload_groups
+from .master_fp32_adamw import FullFP32AdamW, MasterFP32AdamW
 from .muon import DistributedMuon, infer_head_block_counts, split_muon_adamw_params
+from .qwen38_muon import Qwen38MuonAdamW, _cuda_step_preflight, _optimizer_uses_cuda, add_qwen38_plans
 
 
 if TYPE_CHECKING:
@@ -61,12 +66,9 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
     replicated by construction; ``LoraSharedExperts._ensure_ep_grad_sync_hooks``
     keeps their gradients in lock-step across the EP group).
 
-    Excluding these param ids from the ``"ep"`` optimizer/clip-grad-norm
-    bucket and putting them in the ``"non_extra_parallel"`` bucket gives
-    the right semantics: gradients still get cross-EP-summed (by the
-    LoraSharedExperts hook), the optimizer steps consistently on every
-    rank, and ``clip_grad_norm`` only reduces them across the FSDP mesh
-    (not the EP mesh) so the norm is computed once.
+    These parameters remain in their owning optimizer bucket because their
+    FSDP mesh differs from ordinary parameters. The clipper uses this sidecar
+    to count their synchronized gradients only once across the EP group.
 
     Detection by class name (``LoraSharedExperts``) so this stays free of
     a circular import (``veomni.lora.moe_layers`` already imports from
@@ -89,6 +91,8 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
     """
     from torch.distributed._tensor import DTensor
 
+    from ..lora.moe_layers import _is_lora_param_name
+
     out: set[int] = set()
     for mod in model.modules():
         # Walk the MRO so we still match after FSDP2's ``fully_shard`` rebases the
@@ -97,7 +101,7 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
         # would silently skip every wrapper post-FSDP.
         if any(b.__name__ == "LoraSharedExperts" for b in type(mod).__mro__):
             for n, p in mod.named_parameters(recurse=True):
-                if not p.requires_grad:
+                if not p.requires_grad or not _is_lora_param_name(n):
                     continue
                 # Catches wrong call-order misuse: if any matched LoRA param
                 # is still a plain ``nn.Parameter`` (not a DTensor) at this
@@ -523,21 +527,44 @@ class MultiOptimizer(Optimizer, Stateful):
         root_model: nn.Module,
         optimizers: dict,  # {"para_1": opt_1, "para_2": opt_2, ..., "parak": opt_k, "non_extra_parallel": opt_{k+1}}
         key_names: list[str],
+        *,
+        qwen38_cuda_guard=False,
+        qwen38_cuda_group=None,
     ):
         self.model = root_model
         self.optimizers_dict = optimizers
         self._is_multi_optimizer: bool = True
         self.key_names = key_names
+        self._qwen38_cuda_guard = qwen38_cuda_guard
+        self._qwen38_cuda_group = qwen38_cuda_group
+
+    @property
+    def param_groups(self):
+        """Expose the live leaf groups to trainer and metric consumers."""
+        return [group for name in self.key_names for group in self.optimizers_dict[name].param_groups]
 
     def step(self, closure=None):
         if getattr(self, "_veomni_dcp_restore_failed", False):
             raise RuntimeError("MultiOptimizer cannot train after a failed checkpoint restore; rebuild the optimizer")
+        children = tuple(self.optimizers_dict.values())
+        qwen_children = tuple(opt for opt in children if isinstance(opt, Qwen38MuonAdamW))
+        uses_cuda = bool(qwen_children) and any(_optimizer_uses_cuda(opt) for opt in children)
+        if uses_cuda and not self._qwen38_cuda_guard and torch.distributed.is_initialized():
+            raise RuntimeError("Distributed MultiOptimizer requires qwen38_cuda_guard on every participant")
+        if self._qwen38_cuda_guard or uses_cuda:
+            _cuda_step_preflight(children, self._qwen38_cuda_group, closure=closure is not None)
+            for opt in qwen_children:
+                opt._cuda_parent_preflight = True
         loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        for opt in self.optimizers_dict.values():
-            opt.step()
+        try:
+            if closure is not None:
+                with torch.enable_grad():
+                    loss = closure()
+            for opt in children:
+                opt.step()
+        finally:
+            for opt in qwen_children:
+                opt._cuda_parent_preflight = False
         return loss
 
     def zero_grad(self, set_to_none: bool = True) -> None:
@@ -646,6 +673,84 @@ class MultiOptimizer(Optimizer, Stateful):
 
     def __len__(self) -> int:
         return len(self.optimizers_dict)
+
+
+def _qwen38_cuda_training_group(parallel_state):
+    if parallel_state.tp_size != 1 or parallel_state.pp_size != 1:
+        raise ValueError("Distributed Qwen3.8 Muon CUDA preflight requires TP=PP=1")
+    group = parallel_state.fsdp_group
+    if torch.distributed.get_world_size() > 1:
+        if group is None or torch.distributed.get_world_size(group) != torch.distributed.get_world_size():
+            raise ValueError("Qwen3.8 Muon CUDA preflight requires the complete training process group")
+    return group
+
+
+def _qwen38_cuda_domain(optimizer_type, parallel_state, optimizers):
+    if optimizer_type != "qwen38_muon":
+        return False
+    local, error = False, None
+    try:
+        mesh = getattr(parallel_state, "device_mesh", None)
+        local = (mesh is not None and mesh.device_type == "cuda") or any(
+            _optimizer_uses_cuda(opt) for opt in optimizers
+        )
+    except BaseException as exc:
+        error = exc
+    if torch.distributed.is_initialized():
+        from ..utils.dist_utils import raise_if_any_rank_failed
+
+        raise_if_any_rank_failed(error, "inspecting Qwen3.8 CUDA optimizer domain")
+        flags = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(flags, local)
+        return any(flags) or torch.distributed.get_backend() == "nccl"
+    if error is not None:
+        raise error
+    return local
+
+
+_QWEN_BUILD_DEFER_CUDA = ContextVar("qwen_build_defer_cuda", default=False)
+
+
+def _coordinate_qwen_builder(builder):
+    @wraps(builder)
+    def coordinated(*args, **kwargs):
+        optimizer_type = kwargs.get("optimizer_type", args[6] if len(args) > 6 else "adamw")
+        if optimizer_type != "qwen38_muon" or not torch.distributed.is_initialized() or _QWEN_BUILD_DEFER_CUDA.get():
+            return builder(*args, **kwargs)
+        token = _QWEN_BUILD_DEFER_CUDA.set(True)
+        result, error = None, None
+        try:
+            result = builder(*args, **kwargs)
+        except BaseException as exc:
+            error = exc
+        finally:
+            _QWEN_BUILD_DEFER_CUDA.reset(token)
+        from ..utils.dist_utils import raise_if_any_rank_failed
+
+        raise_if_any_rank_failed(error, "building Qwen3.8 Muon optimizer")
+        parallel_state, error = None, None
+        try:
+            parallel_state = get_parallel_state()
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "getting Qwen3.8 optimizer parallel state")
+        children = tuple(result.optimizers_dict.values())
+        cuda_guard = _qwen38_cuda_domain(optimizer_type, parallel_state, children)
+        cuda_group, error = None, None
+        try:
+            if cuda_guard:
+                cuda_group = _qwen38_cuda_training_group(parallel_state)
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "configuring Qwen3.8 CUDA training group")
+        result._qwen38_cuda_guard = cuda_guard
+        result._qwen38_cuda_group = cuda_group
+        for child in children:
+            if isinstance(child, Qwen38MuonAdamW):
+                child._cuda_precision_group = cuda_group
+        return result
+
+    return coordinated
 
 
 def _should_build_extra_parallel_aware(model: "nn.Module") -> bool:
@@ -760,6 +865,7 @@ def _build_state_offload_optimizer(
         )
 
 
+@_coordinate_qwen_builder
 def build_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
@@ -773,6 +879,9 @@ def build_optimizer(
     no_decay_params: Optional[List[str]] = None,
     muon_kwargs: Optional[Dict[str, Any]] = None,
     optimizer_config: Optional["OptimizerConfig"] = None,
+    cpu_offload_param_patterns: Optional[List[str]] = None,
+    cpu_offload_resident_moment_dtype: Optional[str] = None,
+    cpu_offload_cpu_moment_dtype: Optional[str] = None,
 ) -> "torch.optim.Optimizer":
     """Build the optimizer.
 
@@ -823,6 +932,42 @@ def build_optimizer(
         if not param_groups:
             raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
 
+    cpu_offload_kwargs = {}
+    if optimizer_type in ("cpu_offload_adamw", "qwen38_muon"):
+        for key, override in (
+            ("resident_moment_dtype", cpu_offload_resident_moment_dtype),
+            ("cpu_moment_dtype", cpu_offload_cpu_moment_dtype),
+        ):
+            value = override if override is not None else getattr(optimizer_config, f"cpu_offload_{key}", "float32")
+            cpu_offload_kwargs[key] = resolve_moment_dtype(value)
+        patterns = cpu_offload_param_patterns
+        if patterns is None and optimizer_config is not None:
+            patterns = optimizer_config.cpu_offload_param_patterns
+        if param_groups is None:
+            param_groups = _make_param_groups_for_subset(
+                model, model.parameters(), weight_decay, no_decay_modules, no_decay_params
+            )
+        if optimizer_type == "qwen38_muon":
+            resolved_groups = []
+            for group in param_groups:
+                if "weight_decay" in group:
+                    resolved_groups.append(group)
+                else:
+                    for decay_group in _make_param_groups_for_subset(
+                        model, group["params"], weight_decay, no_decay_modules, no_decay_params
+                    ):
+                        resolved_groups.append({**group, **decay_group})
+            param_groups = resolved_groups
+        resident_only = patterns is None or (isinstance(patterns, list) and not patterns)
+        if optimizer_type == "cpu_offload_adamw" or not resident_only:
+            param_groups = select_cpu_offload_groups(model, param_groups, patterns)
+        else:
+            if any(group.get("cpu_offload", False) for group in param_groups):
+                raise ValueError("CPU offload requires explicit cpu_offload_param_patterns")
+            param_groups = [{**group, "cpu_offload": False} for group in param_groups]
+        if optimizer_type == "qwen38_muon":
+            param_groups = add_qwen38_plans(model, param_groups)
+
     if _should_build_extra_parallel_aware(model):
         return build_extra_parallel_fsdp2_optimizer(
             model,
@@ -835,6 +980,7 @@ def build_optimizer(
             param_groups,
             no_decay_modules,
             no_decay_params,
+            cpu_offload_kwargs=cpu_offload_kwargs,
             optimizer_config=optimizer_config,
         )
     if param_groups is None:
@@ -879,14 +1025,40 @@ def build_optimizer(
         foreach = not fused
         fused = fused
         optim = AdamW(param_groups, lr, betas, eps, weight_decay, fused=fused, foreach=foreach)
+    elif optimizer_type == "qwen38_muon":
+        cuda_group = None
+        local_cuda = any(param.device.type == "cuda" for group in param_groups for param in group["params"])
+        cuda_guard = local_cuda
+        if torch.distributed.is_initialized() and not _QWEN_BUILD_DEFER_CUDA.get():
+            flags = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(flags, local_cuda)
+            cuda_guard = any(flags) or torch.distributed.get_backend() == "nccl"
+        if cuda_guard and torch.distributed.is_initialized():
+            cuda_group = _qwen38_cuda_training_group(get_parallel_state())
+        optim = Qwen38MuonAdamW(
+            param_groups, lr, betas, eps, weight_decay, cuda_precision_group=cuda_group, **cpu_offload_kwargs
+        )
+    elif optimizer_type == "cpu_offload_adamw":
+        optim = CPUOffloadAdamW(param_groups, lr, betas, eps, weight_decay, **cpu_offload_kwargs)
+    elif optimizer_type == "full_fp32_adamw":
+        optim = FullFP32AdamW(param_groups, lr, betas, eps, weight_decay)
+    elif optimizer_type == "master_fp32_adamw":
+        optim = MasterFP32AdamW(param_groups, lr, betas, eps, weight_decay)
     elif optimizer_type == "anyprecision_adamw":
         optim = AnyPrecisionAdamW(param_groups, lr, betas, eps, weight_decay)
     else:
-        raise ValueError(
-            "Only adamw, anyprecision_adamw and muon are supported as optimizers; "
-            f"got optimizer_type={optimizer_type!r}."
-        )
+        raise ValueError(f"Unsupported optimizer selection: {optimizer_type!r}.")
 
+    if optimizer_type in ("cpu_offload_adamw", "full_fp32_adamw", "master_fp32_adamw", "qwen38_muon"):
+        if optimizer_type == "qwen38_muon":
+            return MultiOptimizer(
+                model,
+                {"qwen38_muon": optim},
+                ["qwen38_muon"],
+                qwen38_cuda_guard=cuda_guard,
+                qwen38_cuda_group=cuda_group,
+            )
+        return MultiOptimizer(model, {"adamw": optim}, ["adamw"])
     return optim
 
 
@@ -1110,6 +1282,7 @@ def _build_muon_with_adamw(
     return MultiOptimizer(model, optimizer_dict, key_names=list(optimizer_dict.keys()))
 
 
+@_coordinate_qwen_builder
 def build_extra_parallel_fsdp2_optimizer(
     model: "nn.Module",
     lr: float = 1e-3,
@@ -1121,6 +1294,7 @@ def build_extra_parallel_fsdp2_optimizer(
     param_groups: Optional[List[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
+    cpu_offload_kwargs: Optional[Dict[str, Any]] = None,
     optimizer_config: Optional["OptimizerConfig"] = None,
 ):
     """
@@ -1156,7 +1330,6 @@ def build_extra_parallel_fsdp2_optimizer(
             )
 
             # Extract group-specific settings
-            group_lr = group_config.get("lr", lr)
             group_params = group_config["params"]
 
             # Split this group's params into ExtraParallel and non-ExtraParallel
@@ -1184,30 +1357,33 @@ def build_extra_parallel_fsdp2_optimizer(
                 if not is_extra_parallel_params:
                     group_non_extra_parallel_params.append(p)
 
-            # Create subgroups with weight decay handling
+            def split_weight_decay(params, group_config=group_config):
+                # Existing optimizers historically use the top-level decay
+                # when splitting an explicit group. New FP32/offload optimizers
+                # honour a group override for decayed parameters, while the
+                # no-decay rules still take precedence for the other subgroup.
+                group_weight_decay = (
+                    group_config.get("weight_decay", weight_decay)
+                    if optimizer_type in ("cpu_offload_adamw", "full_fp32_adamw", "master_fp32_adamw", "qwen38_muon")
+                    else weight_decay
+                )
+                groups = _make_param_groups_for_subset(
+                    model, params, group_weight_decay, no_decay_modules, no_decay_params
+                )
+                for subgroup in groups:
+                    subgroup.update(
+                        {key: value for key, value in group_config.items() if key not in ("params", "weight_decay")}
+                    )
+                return groups
+
+            # Keep legacy EP decay subgroup boundaries and explicit group options.
             for para in parallel_state.extra_parallel_names:
                 if group_extra_parallel_params[para]:
-                    group_para_subgroups = _make_param_groups_for_subset(
-                        model, group_extra_parallel_params[para], weight_decay, no_decay_modules, no_decay_params
-                    )
-                    for subgroup in group_para_subgroups:
-                        subgroup["lr"] = group_lr
-                        # Preserve other custom settings from original group
-                        for key, value in group_config.items():
-                            if key not in ["params", "lr", "weight_decay"]:
-                                subgroup[key] = value
+                    group_para_subgroups = split_weight_decay(group_extra_parallel_params[para])
                     extra_parallel_groups[para].extend(group_para_subgroups)
 
             if group_non_extra_parallel_params:
-                group_non_extra_parallel_subgroups = _make_param_groups_for_subset(
-                    model, group_non_extra_parallel_params, weight_decay, no_decay_modules, no_decay_params
-                )
-                for subgroup in group_non_extra_parallel_subgroups:
-                    subgroup["lr"] = group_lr
-                    # Preserve other custom settings from original group
-                    for key, value in group_config.items():
-                        if key not in ["params", "lr", "weight_decay"]:
-                            subgroup[key] = value
+                group_non_extra_parallel_subgroups = split_weight_decay(group_non_extra_parallel_params)
                 non_extra_parallel_groups.extend(group_non_extra_parallel_subgroups)
     else:
         # Default case (param_groups is None): all model parameters with uniform settings(lr)
@@ -1272,10 +1448,18 @@ def build_extra_parallel_fsdp2_optimizer(
             foreach = not fused
             _fused = fused
             return AdamW(groups, lr, betas, eps, weight_decay, fused=_fused, foreach=foreach)
+        elif optimizer_type == "qwen38_muon":
+            return Qwen38MuonAdamW(groups, lr, betas, eps, weight_decay, **(cpu_offload_kwargs or {}))
+        elif optimizer_type == "cpu_offload_adamw":
+            return CPUOffloadAdamW(groups, lr, betas, eps, weight_decay, **(cpu_offload_kwargs or {}))
+        elif optimizer_type == "full_fp32_adamw":
+            return FullFP32AdamW(groups, lr, betas, eps, weight_decay)
+        elif optimizer_type == "master_fp32_adamw":
+            return MasterFP32AdamW(groups, lr, betas, eps, weight_decay)
         elif optimizer_type == "anyprecision_adamw":
             return AnyPrecisionAdamW(groups, lr, betas, eps, weight_decay)
         else:
-            raise ValueError("Only adamw and anyprecision_adamw are supported as optimizers.")
+            raise ValueError(f"Unsupported ExtraParallel optimizer selection: {optimizer_type!r}.")
 
     optimizer_dict: Dict[str, Optimizer] = {}
     for para in parallel_state.extra_parallel_names:
@@ -1311,6 +1495,18 @@ def build_extra_parallel_fsdp2_optimizer(
     key_names = list(optimizer_dict.keys())
 
     # Build MultiOptimizer and attach a pre-step hook to sanitize DTensor states
-    multi_opt = MultiOptimizer(model, optimizer_dict, key_names=key_names)
+    cuda_group = None
+    cuda_guard = (
+        False
+        if _QWEN_BUILD_DEFER_CUDA.get()
+        else _qwen38_cuda_domain(optimizer_type, parallel_state, optimizer_dict.values())
+    )
+    if optimizer_type == "qwen38_muon" and torch.distributed.is_initialized() and not _QWEN_BUILD_DEFER_CUDA.get():
+        cuda_guard = cuda_guard or torch.distributed.get_backend() == "nccl"
+        if cuda_guard:
+            cuda_group = _qwen38_cuda_training_group(parallel_state)
+    multi_opt = MultiOptimizer(
+        model, optimizer_dict, key_names=key_names, qwen38_cuda_guard=cuda_guard, qwen38_cuda_group=cuda_group
+    )
 
     return multi_opt

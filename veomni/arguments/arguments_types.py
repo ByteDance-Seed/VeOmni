@@ -85,12 +85,21 @@ class OptimizerConfig:
     norms use AdamW.
     """
 
-    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    type: Literal[
+        "adamw",
+        "anyprecision_adamw",
+        "muon",
+        "master_fp32_adamw",
+        "full_fp32_adamw",
+        "cpu_offload_adamw",
+        "qwen38_muon",
+    ] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
     state_offload: Literal["none", "cpu"] = field(
         default="none",
+        kw_only=True,
         metadata={
             "help": (
                 "Optimizer-managed state offload. 'none' disables it (training state may still be "
@@ -281,7 +290,22 @@ class OptimizerConfig:
         },
     )
 
+    cpu_offload_param_patterns: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Full parameter-name regexes selecting CPU master and moments for optimizer offload."},
+    )
+    cpu_offload_resident_moment_dtype: Literal["float32", "bfloat16"] = field(
+        default="float32", metadata={"help": "Resident Adam moment precision; master remains FP32."}
+    )
+    cpu_offload_cpu_moment_dtype: Literal["float32", "bfloat16"] = field(
+        default="float32", metadata={"help": "CPU-offloaded Adam moment precision; master remains FP32."}
+    )
+
     def __post_init__(self):
+        if isinstance(self.lr, (list, tuple)):
+            raise TypeError("Pass CPU-offload options by keyword; the second positional argument is learning rate")
+        if isinstance(self.lr, str) and self.lr in ("none", "cpu"):
+            raise TypeError("Pass state_offload by keyword; the second positional argument is learning rate")
         # YAML sequences arrive as lists; the declared tuple also prevents
         # optimizer defaults and groups from sharing mutable beta options.
         if isinstance(self.betas, list):
@@ -602,6 +626,37 @@ class TorchCompileConfig:
     )
 
 
+_FLOAT8_RECIPES = ("tensorwise", "rowwise", "rowwise_with_gw_hp")
+
+
+@dataclass
+class Float8TrainingConfig:
+    """Opt-in torchao float8 computation for explicitly selected dense Linear modules."""
+
+    enable: bool = False
+    recipe: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"] = field(
+        default="tensorwise",
+        metadata={"help": "Float8 scaling recipe: 'tensorwise', 'rowwise', or 'rowwise_with_gw_hp'."},
+    )
+    target_modules: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Full Linear module names with optional '*' wildcards to convert to float8 training."},
+    )
+
+    def __post_init__(self):
+        """Validate float8 enable flag, scaling recipe, and explicit target module patterns."""
+        if type(self.enable) is not bool:
+            raise ValueError("float8.enable must be a boolean.")
+        if self.recipe not in _FLOAT8_RECIPES:
+            raise ValueError(f"float8.recipe must be one of {_FLOAT8_RECIPES}, got {self.recipe!r}.")
+        if not isinstance(self.target_modules, list) or any(
+            not isinstance(pattern, str) or not pattern for pattern in self.target_modules
+        ):
+            raise ValueError("float8.target_modules must be a list of nonempty module-name patterns.")
+        if self.enable and not self.target_modules:
+            raise ValueError("Enabled float8 training requires explicit target_modules.")
+
+
 @dataclass
 class MixedPrecisionConfig:
     """model.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
@@ -636,6 +691,7 @@ class MixedPrecisionConfig:
             )
         },
     )
+    float8: Float8TrainingConfig = field(default_factory=Float8TrainingConfig)
 
     def __post_init__(self):
         if not isinstance(self.npu_expert_fp32_wgrad, bool):
@@ -1601,7 +1657,8 @@ class OpsImplementationConfig:
     swiglu_mlp_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'qat' (FP8 QAT, SM90+) | 'eager'. "
+            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'qat' (FP8 QAT, SM90+) | "
+            "'torchao_nvfp4' (NVFP4 QAT, needs the 'torchao' package) | 'eager'. "
             "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
         },
     )
@@ -1609,7 +1666,8 @@ class OpsImplementationConfig:
         default=None,
         metadata={
             "help": "Dense projection. 'qat' (FP8 fake quantization of both GEMM operands, SM90+) | "
-            "'eager' (PyTorch F.linear). "
+            "'torchao_nvfp4' (NVFP4 fake quantization of both GEMM operands, 'standard' variant only, needs "
+            "the 'torchao' package) | 'eager' (calls the projection module). "
             "Unset: 'eager'. Selected independently of swiglu_mlp_implementation: a model that owns its "
             "own projections reads this field, a model that runs the fused SwiGLU row reads that one."
         },

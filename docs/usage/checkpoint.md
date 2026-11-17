@@ -43,11 +43,13 @@ created before this storage-view proof existed is rejected for optimizer resume,
 even when its target has no shared views; the old metadata cannot prove that the
 source was also unshared. Use a separately verified migration or a new
 weights-only run rather than silently assuming identical update behavior.
-This proof currently requires Linux procfs for nonempty CPU model tensors and
-rejects shared CPU mappings, quantized, non-strided, and meta model tensors.
-Accelerator tensors must use framework-owned storage; externally imported or
-shared accelerator allocations are not proved by this check. File-backed
-optimizer moments are separate from model tensors and are not restricted here.
+For supported nonempty model storage, this includes distinct tensor views that
+share an allocation. It does not prove aliasing through independently imported
+shared mappings, empty allocations or external accelerator storage. Recognized
+file-backed model storage and lazy conjugate/negative model views are rejected;
+some externally mapped storage cannot be detected and must not be used for
+model aliases. Quantized, non-strided and meta model tensors are unsupported.
+File-backed optimizer moments are separate and are not restricted here.
 
 ## What each path holds
 
@@ -62,6 +64,19 @@ optimizer moments are separate from model tensors and are not restricted here.
 | `lora_ckpt/` | `adapter_config.json`, `adapter_model.safetensors`. Written instead of `hf_ckpt/` when `model.lora_config` is set. | Rank 0, after a collective gather |
 | `checkpoint_manifest.json` | Format version, `global_step`, world size, and `model_state`: whether the step has a `model/` at all. Trainer-level completion only. | Rank 0, last |
 | `model_assets/[<module>/]` | Each model's config / tokenizer / processor, once per run at train start. Nested like `hf_ckpt/`; a SeedOmni run loaded from an upstream HF checkpoint writes both flat, in that checkpoint's layout ([Upstream Checkpoint Layout](../seed_omni/usage/hf_layout.md)). | Rank 0 |
+
+The rank-0 legacy HF writer and DCP-based LoRA exporter first save each shard
+in a unique temporary directory beside its destination. If safetensors reports an `ENOSYS` I/O
+error, VeOmni retries by serializing one shard in the local temporary directory
+and copying it sequentially to that destination-side directory before rename.
+Set `TMPDIR` to a local filesystem with enough space for the largest shard; a
+single tensor can exceed the configured shard size. A DCP-based LoRA export
+writes one complete adapter file, so local staging must fit the whole adapter.
+The destination must support
+sequential writes and rename, and this fallback adds local I/O and can increase
+export time. Using a memory-backed temporary directory also consumes host memory.
+The temporary-file rename protects the staged shard, not the publication of
+the entire multi-shard checkpoint or the adapter weights and config together.
 
 **Model assets** is whatever that model's runtime `model_assets` list carries, in type terms
 `Union[PretrainedConfig, GenerationConfig, PreTrainedTokenizer, ProcessorMixin]`
@@ -187,19 +202,22 @@ step and generation alone do not prove exact dataloader or RNG recovery.
 If a restored run has not established a same-step save receipt, an immediate
 export to the already completed step fails rather than overwriting that DCP.
 
-MultiOptimizer checkpoint identity supports VeOmni's built-in constant, linear
-and cosine schedules. Custom `LambdaLR` functions must use immutable captures
-and the supported pure builtins or standard `math` members; global state,
-dynamic lookup, mutable closures and unrecognized attribute access are rejected
-at save and resume. Set construction and frozenset constants are also rejected
-because their iteration order can differ between processes. Custom scheduler
-authors must ensure that formatting and the overall schedule are deterministic across
-processes and recovery: the identity check does not prove arbitrary Python
-functions deterministic. Older custom scheduler checkpoints that cannot meet
-this contract require a verified migration or weights-only restart. Identity checks
-assume a trusted Python runtime whose standard `math` members and scheduler
-builtin bindings remain unchanged throughout training, saving and recovery.
-They do not detect monkeypatches to these objects and are not a code sandbox.
+MultiOptimizer checkpoint identity records the versioned recipe and concrete
+parameters of VeOmni's constant, linear and cosine schedules. Custom `LambdaLR`
+schedules must register a stable name, version and all behavior-affecting JSON
+parameters with `register_checkpoint_scheduler`; the caller must use the same
+trusted deterministic implementation on resume. The recipe is an attestation,
+not a sandbox or a proof about arbitrary Python code. Unregistered schedulers
+and checkpoints carrying only the older callable-hash identity require a
+verified migration or a new weights-only run. Scheduler step, optimizer group
+identity and checkpoint generation remain checked independently.
+
+```python
+from veomni.optim.lr_scheduler import register_checkpoint_scheduler
+
+register_checkpoint_scheduler(scheduler, name="my.schedule", version=1,
+                              parameters={"warmup_steps": 100})
+```
 
 With `stage_dir` the model half waits: a staged save has overwritten nothing
 until the copy to the destination, so it invalidates the destination there
@@ -213,6 +231,13 @@ The cursor files follow the same cadences as the model state, including HF and
 LoRA exports: with `save_steps=100` and an export at train end, step 150 gets
 its `loader/`, `extra_state/` and manifest too, instead of being left invisible
 to resume.
+
+When epoch DCP saving is enabled, a step-scheduled HF/LoRA export first
+schedules its DCP through the trainer checkpoint callback. The built-in
+exporter already needs this DCP, so a later epoch save at the same step can
+reuse it. A custom HF-only exporter will also receive a DCP save at that HF
+step. Callers that save DCP outside the trainer callback must coordinate that
+save with the trainer's cadence to avoid writing the same step twice.
 
 SeedOmni (`OmniTrainer`) writes both halves the same way: the model half through
 `ModelCheckpointManager`, one `model/<name>/` per module, and the trainer half
@@ -413,6 +438,9 @@ supported migration API: it can return success without reading any tensor when
 the namespaces differ. Replicated values must already agree across ranks.
 ## MultiOptimizer recovery identity
 
+Optimizer authors can find the registration callbacks and precision/placement
+contract in the [rank-local AdamW adapter guide](../design/rank_local_adamw_checkpoint_adapter.md).
+
 **Breaking change relative to earlier VeOmni checkpoint behavior:**
 
 - MultiOptimizer DCP save now requires `save_async: false`. Existing async
@@ -520,9 +548,9 @@ identity and rejects restoration; use the proven DCP path instead.
 The codec rejects tensor learning rates shared between groups. The saved alias
 identity covers parameters and buffers, including nonpersistent buffer aliases.
 Optimizer adapters and model serialization hooks are trusted to preserve their
-state and semantics. Identity tracks repeated tensor objects, but does not detect
-distinct views sharing storage; models that rely on mutable shared views are
-outside this checkpoint contract. The upstream and VeOmni-generated Qwen3
+state and semantics. Identity tracks repeated tensor objects and supported
+nonempty shared-storage views as described above; separately imported shared
+mappings remain outside the contract. The upstream and VeOmni-generated Qwen3
 dynamic RoPE reset alias is permitted when its current and original tables match
 a valid reconstruction; other reset aliases remain outside this contract.
 Dynamic RoPE frequencies and cached maximum lengths are not checkpointed. If

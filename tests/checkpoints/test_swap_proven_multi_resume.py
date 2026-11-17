@@ -293,6 +293,54 @@ def test_swap_and_fp32_master_leaf_preserve_both_updates(tmp_path):
     )
 
 
+@pytest.mark.parametrize("offload", [False, True])
+def test_real_fp32_master_and_swap_bf16_resume(tmp_path, offload):
+    from veomni.optim.cpu_offload_adamw import CPUOffloadAdamW
+    from veomni.optim.master_fp32_adamw import FullFP32AdamW
+
+    def build():
+        model = torch.nn.Linear(3, 2).to(torch.bfloat16)
+        swap = SwapAdamW([model.weight], lr=0.01, pin_memory=False)
+        master = (
+            CPUOffloadAdamW([{"params": [model.bias], "cpu_offload": True}], lr=0.01)
+            if offload
+            else FullFP32AdamW([model.bias], lr=0.01)
+        )
+        return model, swap, master, MultiOptimizer(model, {"swap": swap, "master": master}, ["swap", "master"])
+
+    model, swap, master, optimizer = build()
+    _step(model, optimizer)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
+    target, restored_swap, restored_master, resumed = build()
+    DistributedCheckpointer.load(
+        str(tmp_path),
+        {"model": target, "optimizer": resumed, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
+    for field in ("master_weight", "exp_avg", "exp_avg_sq"):
+        assert restored_master.state[target.bias][field].dtype == torch.float32
+        torch.testing.assert_close(
+            master.state[model.bias][field], restored_master.state[target.bias][field], rtol=0, atol=0
+        )
+    for field in swap._state_keys:
+        assert restored_swap._host_states[target.weight][field].dtype == torch.bfloat16
+        torch.testing.assert_close(
+            swap._host_states[model.weight][field], restored_swap._host_states[target.weight][field], rtol=0, atol=0
+        )
+    _step(model, optimizer)
+    _step(target, resumed)
+    for left, right in zip(model.parameters(), target.parameters(), strict=True):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    torch.testing.assert_close(
+        master.state[model.bias]["master_weight"], restored_master.state[target.bias]["master_weight"], rtol=0, atol=0
+    )
+
+
 def test_swap_rejects_nonfresh_host_state_before_loading(tmp_path):
     model, _, optimizer = _build()
     _step(model, optimizer)

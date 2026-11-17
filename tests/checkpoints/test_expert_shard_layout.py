@@ -35,6 +35,7 @@ from veomni.checkpoint.dcp_checkpointer import (
     drop_extra_parallel_dim,
     restore_extra_parallel_dim,
 )
+from veomni.checkpoint.layout import weights_dir
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -128,8 +129,9 @@ def _layout_worker(rank, world, directory, rendezvous):
         # The public model-only load/export paths accept the same independently
         # verified declaration; unknown source and optimizer restore stay closed.
         path = directory + "known_legacy_model_only"
+        weights_path = weights_dir(path)
         bf16_bias = torch.tensor([0.25, -0.5], dtype=torch.bfloat16)
-        dcp.save({"model": {"layer.experts.weight": wrap(1), "layer.bias": bf16_bias}}, checkpoint_id=path)
+        dcp.save({"model": {"layer.experts.weight": wrap(1), "layer.bias": bf16_bias}}, checkpoint_id=weights_path)
         model = torch.nn.Module()
         model.layer = torch.nn.Module()
         model.layer.experts = torch.nn.Module()
@@ -162,10 +164,10 @@ def _layout_worker(rank, world, directory, rendezvous):
             from veomni.checkpoint import ckpt_to_state_dict
 
             with pytest.raises(RuntimeError, match="Cannot determine source expert order"):
-                dcp_to_torch_state_dict(path)
-            exported = dcp_to_torch_state_dict(path, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1")
+                dcp_to_torch_state_dict(weights_path)
+            exported = dcp_to_torch_state_dict(weights_path, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1")
             torch.testing.assert_close(exported["layer.experts.weight"], global_weight, rtol=0, atol=0)
-            exported = ckpt_to_state_dict(path, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1")
+            exported = ckpt_to_state_dict(weights_path, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1")
             torch.testing.assert_close(exported["layer.experts.weight"], global_weight, rtol=0, atol=0)
             torch.testing.assert_close(exported["layer.bias"], bf16_bias, rtol=0, atol=0)
             assert exported["layer.experts.weight"].dtype == torch.float32
@@ -546,6 +548,62 @@ def _lora_export_worker(rank, world, shard_dim, directory, ep_dim, canonical, en
             torch.testing.assert_close(value, expected[name].to(value.dtype), rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
+
+
+def _lora_noep_export_worker(rank, directory, fail_consolidation, endpoint):
+    from unittest.mock import patch
+
+    from torch.distributed.fsdp import fully_shard
+
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.lora.state_dict import load_adapter_state_dict, strip_adapter_name
+    from veomni.utils import save_safetensor_utils
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        parallel_state = _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")
+        model = _lora_model()
+        expected = {}
+        for name, param in model.named_parameters():
+            if ".lora_" in name:
+                value = torch.arange(param.numel(), dtype=torch.float32).reshape(param.shape) / 256 + len(expected)
+                param.data.copy_(value)
+                expected[strip_adapter_name(name, "default")] = value.to(torch.bfloat16)
+        fully_shard(model, mesh=parallel_state.fsdp_mesh)
+        if fail_consolidation:
+            with patch.object(
+                save_safetensor_utils, "ckpt_to_state_dict", side_effect=OSError("injected export failure")
+            ):
+                expected_error = OSError if rank == 0 else RuntimeError
+                with pytest.raises(expected_error, match="injected export failure|failed on another rank"):
+                    save_safetensor_utils.save_lora_adapter_with_dcp(model, directory, parallel_state=parallel_state)
+            dist.barrier()
+        else:
+            original_load = save_safetensor_utils.ckpt_to_state_dict
+
+            def inspect_layout(*args, **kwargs):
+                reader = dcp.FileSystemReader(kwargs["save_checkpoint_path"])
+                layouts = reader.read_metadata().planner_data[_EXPERT_LAYOUTS_KEY]["tensors"]
+                experts = {name: layout for name, layout in layouts.items() if ".experts." in name}
+                assert experts
+                assert all(layout["source_kind"] == "veomni_tp1_no_ep" for layout in experts.values())
+                return original_load(*args, **kwargs)
+
+            with patch.object(save_safetensor_utils, "ckpt_to_state_dict", side_effect=inspect_layout):
+                save_safetensor_utils.save_lora_adapter_with_dcp(model, directory, parallel_state=parallel_state)
+            exported = load_adapter_state_dict(directory)
+            assert exported.keys() == expected.keys()
+            for name in expected:
+                torch.testing.assert_close(exported[name], expected[name], rtol=0, atol=0)
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+@pytest.mark.parametrize("fail_consolidation", [False, True])
+def test_noep_fsdp_lora_export_preserves_expert_layout(tmp_path, fail_consolidation):
+    spawn_with_rendezvous(_lora_noep_export_worker, args=(str(tmp_path), fail_consolidation), nprocs=2)
 
 
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
@@ -956,6 +1014,31 @@ def test_single_process_lora_export_without_parallel_state(tmp_path, monkeypatch
         torch.testing.assert_close(actual[key], value, rtol=0, atol=0)
 
 
+def _lora_incomplete_export_worker(rank, directory, endpoint):
+    from veomni.lora.state_dict import get_lora_state_dict
+    from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        model = _lora_model()
+        if rank == 0:
+            selected = {id(p) for p in get_lora_state_dict(model).values()}
+            next(p for p in model.parameters() if id(p) not in selected).requires_grad_(True)
+        with pytest.raises((ValueError, RuntimeError), match="omit trainable parameters|failed on another rank"):
+            save_lora_adapter_with_dcp(model, directory)
+        assert not Path(directory).exists()
+        alive = torch.ones(1)
+        dist.all_reduce(alive)
+        assert alive.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_lora_export_untracked_trainable_weight_is_coordinated(tmp_path):
+    spawn_with_rendezvous(_lora_incomplete_export_worker, args=(str(tmp_path / "adapter"),), nprocs=2)
+
+
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
 @pytest.mark.parametrize("world", [2])
 def test_ple_with_ep1_proves_ordinary_expert_from_plan(world, tmp_path):
@@ -990,9 +1073,15 @@ def _ple_ep1_lora_worker(rank, root, unproven, endpoint):
         base = model.base_model.model
         base.experts.bias = torch.nn.Parameter(torch.arange(8, dtype=torch.float32))
         base.ple = torch.nn.Embedding(8, 4)
+        # This adapter-only export exercises PLE layout, but does not export PLE weights.
+        base.ple.weight.requires_grad_(False)
         base.get_parallel_plan = lambda: ParallelPlan({"ple": {"ple.weight": Shard(0)}})
         plan = get_runtime_parallel_plan(model)
         model._fqn2spec_info = plan.apply(model, parallel.extra_parallel_fsdp_device_mesh)
+        assert not base.ple.weight.requires_grad
+        assert base.ple.weight.shape == (4, 4)
+        assert base.ple.weight.spec_info.para_name == "ple"
+        assert base.ple.weight.spec_info.placement == Shard(0)
         selected = get_lora_state_dict(model, config=model.get_lora_config())
         assert any("experts.bias" in name for name in selected)
         for name, param in list(model.named_parameters()):

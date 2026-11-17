@@ -152,11 +152,12 @@ class VeOmniLoraModel(nn.Module):
         instead (DCP parallel write + rank-0 consolidation). This method is the
         simple path for merged / single-process export and tests.
         """
-        from .state_dict import get_lora_state_dict, save_adapter_file
+        from .state_dict import get_lora_state_dict, save_adapter_file, validate_lora_export_covers_trainable
 
         cfg = self.get_lora_config()
-        cfg.save_pretrained(save_directory)
         state = get_lora_state_dict(self, adapter_name=self.active_adapter, config=cfg)
+        validate_lora_export_covers_trainable(self, state)
+        cfg.save_pretrained(save_directory)
         save_adapter_file(state, save_directory, safe_serialization=safe_serialization)
 
     @classmethod

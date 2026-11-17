@@ -687,6 +687,14 @@ bash train.sh tasks/train_dit.py configs/dit/qwen_image_lora.yaml \
 
 `CheckpointCallback` writes the trained adapter to `${output_dir}/checkpoints/global_step_${step}/lora_ckpt/{adapter_config.json, adapter_model.safetensors}`, which is the standard PEFT format consumable by `PeftModel.from_pretrained` and `diffusers`' `pipeline.transformer.load_lora_adapter` (the adapter keys carry the `base_model.model.` prefix expected by `peft`). Loading a PEFT-trained adapter still accepts `adapter_model.bin`.
 
+Export uses one writer and stages both files before publishing. An existing
+adapter directory can be overwritten only when its JSON configuration is
+identical; use a new directory for a different configuration. Atomic replacement
+between the staging directory and its parent must be supported by the filesystem.
+If a replacement reports an error after it was committed, the directory may contain
+either the old or the new weights; the exporter does not promise which. This
+contract does not validate compatibility with a different base model.
+
 ---
 
 ## 7. Testing

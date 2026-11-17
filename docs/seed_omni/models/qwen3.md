@@ -327,6 +327,17 @@ it sets that param group's `weight_decay` to 0 and applies the module's configur
 value (the model-level `optimizer.weight_decay` unless the module overrides it) to the
 vision rows alone, from an optimizer step pre-hook, before the update as AdamW would.
 
+This row-wise decay is not supported with an optimizer that owns a separate FP32
+master weight: modifying only the compute parameter would be overwritten by the
+master update. The module rejects that combination before changing optimizer
+groups or hooks. Use AdamW, or set the embedding group's `weight_decay` to zero.
+With zero decay, FP32-master checkpoints bind the trainable-row mask in the
+optimizer group: an older text-only checkpoint, a different mask or a checkpoint
+without that identity must be migrated explicitly. Configuration requires a fresh
+optimizer before checkpoint loading, and assumes gradients were masked before
+every saved update; it does not validate arbitrary externally modified moment
+tensors. This restriction applies to this image-mode row-freezing recipe only.
+
 `configure_optimizer(optimizer)` is called by `ModuleRuntime` immediately after the
 module's optimizer is built, before the lr scheduler and before any checkpoint load —
 see the [Optimizer Hook contract](../mixins/configure_optimizer.md) for the general

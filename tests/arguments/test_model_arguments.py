@@ -65,6 +65,13 @@ def test_state_offload_rejects_non_adamw_types_and_unknown_values():
         OptimizerConfig(type="anyprecision_adamw", state_offload="cpu")
 
 
+@pytest.mark.parametrize("offload", ["none", "cpu"])
+def test_state_offload_must_not_be_passed_in_the_learning_rate_position(offload):
+    with pytest.raises(TypeError, match="state_offload by keyword"):
+        OptimizerConfig("adamw", offload)
+    assert OptimizerConfig("adamw", 0.02, state_offload=offload).lr == 0.02
+
+
 def test_state_offload_rejects_fsdp_cpu_offload():
     with pytest.raises(ValueError, match="cannot be combined"):
         ModelArguments(
