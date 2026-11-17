@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 import torch
 from transformers.models.janus.modeling_janus import JanusVisionAlignerMLP, JanusVisionModel
 
+from veomni.distributed.parallel_state import get_parallel_state
+
 from ....utils.conversation import ConversationItem
 from ...module_modeling_base import PretrainedOmniModule
 from .configuration import JanusSiglipConfig
@@ -28,30 +30,16 @@ class InferenceMixin:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
-        pending = [part for part in conversation_list if part.type == "image_output"]
-        if pending:
-            pixel_values = self._pixels_from_raw_images([part.value for part in pending])
-        else:
-            pending = [part for part in conversation_list if part.type == "image" and part.role == "user"]
-            if not pending:
-                return {"conversation_list": conversation_list}
-            pixel_values = torch.stack([part.value for part in pending], dim=0).to(self.device, self.dtype)
+        pending = [part for part in conversation_list if part.type == "image" and part.role == "user"]
+        if not pending:
+            return {"conversation_list": conversation_list}
+        pixel_values = torch.stack([part.value for part in pending], dim=0).to(self.device, self.dtype)
 
         embeds = self._encode_pixel_values(pixel_values)
         for part, emb in zip(pending, embeds, strict=True):
             part.value = emb if emb.dim() == 2 else emb.squeeze(0)
-            if part.type == "image_output":
-                part.type = "image"
-                assert part.role == "assistant"
 
         return {"conversation_list": conversation_list}
-
-    def _pixels_from_raw_images(self, raw_images: list[Any]) -> Optional[torch.Tensor]:
-        if not raw_images:
-            return None
-        return self._image_processor(images=raw_images, return_tensors="pt")["pixel_values"].to(
-            device=self.device, dtype=self.dtype
-        )
 
 
 class JanusSiglip(InferenceMixin, PretrainedOmniModule):
@@ -64,6 +52,11 @@ class JanusSiglip(InferenceMixin, PretrainedOmniModule):
     main_input_name = "pixel_values"
     _no_split_modules = ["JanusVisionEncoderLayer"]
     supports_gradient_checkpointing = True
+    # The tower runs through VeOmni's patched attention, which takes the selected
+    # backend explicitly; HF gates each spelling on these flags.
+    _supports_sdpa = True
+    _supports_flash_attn = True
+    _supports_flex_attn = True
 
     def __init__(self, config: JanusSiglipConfig):
         super().__init__(config)
@@ -75,7 +68,15 @@ class JanusSiglip(InferenceMixin, PretrainedOmniModule):
         self.post_init()
 
     def _encode_pixel_values(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        vision_out = self.vision_model(pixel_values, return_dict=True)
+        # ``skip_ulysses`` on the SP path: the accelerated ``forward_pre`` slices
+        # the image **batch** across the SP group, so each rank's rows are whole
+        # images, not a sequence shard. Letting attention gather along the token
+        # axis would splice patches from different images into one sequence and
+        # silently corrupt both embeddings and gradients. Under SP the caller
+        # all-gathers the batch back in ``forward_post``, so no Ulysses exchange
+        # belongs inside the tower. Without SP the flag is a no-op.
+        skip_ulysses = get_parallel_state().sp_size > 1
+        vision_out = self.vision_model(pixel_values, return_dict=True, skip_ulysses=skip_ulysses)
         return self.aligner(vision_out.last_hidden_state)
 
     def forward(

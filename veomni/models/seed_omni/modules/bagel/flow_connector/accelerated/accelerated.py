@@ -14,7 +14,12 @@ from typing import Any
 import torch
 
 from .......distributed.parallel_state import get_parallel_state
-from .......distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
+from .......distributed.sequence_parallel import (
+    gather_outputs,
+    reduce_sequence_parallel_loss,
+    slice_input_tensor,
+    sp_pad,
+)
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
@@ -26,6 +31,7 @@ from ..processing import preprocess_context_latent_embed, preprocess_decode_velo
 
 
 def slice_sp_token_inputs(method: str, **inputs: torch.Tensor) -> tuple[int, dict[str, torch.Tensor]]:
+    """Pad and slice token-level ``inputs`` across the active Ulysses SP group."""
     ps = get_parallel_state()
     if ps.cp_size != 1:
         raise ValueError(f"BAGEL flow connector {method} supports Ulysses groups only; got cp_size={ps.cp_size}.")
@@ -50,6 +56,7 @@ def slice_sp_token_inputs(method: str, **inputs: torch.Tensor) -> tuple[int, dic
 
 
 def gather_sp_token_output(method: str, output: torch.Tensor, full_length: int | None) -> torch.Tensor:
+    """All-gather token-level ``output`` across the SP group and trim SP padding."""
     if full_length is None:
         raise RuntimeError(f"BAGEL flow connector {method} SP token length was not initialized.")
     output = gather_outputs(output, gather_dim=0, group=get_parallel_state().sp_group)
@@ -80,6 +87,7 @@ class TrainingMixin(TrainingModuleMixin):
         conversation_list: list[list[ConversationItem]] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Prepare patchified latent tokens, position IDs, and timesteps for ``embed_latent``."""
         del kwargs
         self._conversation_carrier = conversation_list
         self._embed_lengths = []
@@ -148,6 +156,7 @@ class TrainingMixin(TrainingModuleMixin):
 
     @post_forward("embed_latent")
     def embed_latent_post(self, latent_embeds: torch.Tensor) -> dict[str, Any]:
+        """Gather SP shards if needed and scatter ``latent_embeds`` back onto conversation items."""
         if get_parallel_state().sp_size > 1:
             latent_embeds = gather_sp_token_output("embed_latent", latent_embeds, self._sp_embed_length)
 
@@ -174,6 +183,7 @@ class TrainingMixin(TrainingModuleMixin):
         conversation_list: list[list[ConversationItem]] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Collect latent-token hidden states and velocity targets for ``decode_velocity``."""
         del kwargs
         self._conversation_carrier = conversation_list
         self._decode_lengths = []
@@ -216,6 +226,7 @@ class TrainingMixin(TrainingModuleMixin):
 
     @post_forward("decode_velocity")
     def decode_velocity_post(self, velocity: torch.Tensor) -> dict[str, Any]:
+        """Gather predicted velocity tokens, scatter onto items, and compute MSE flow loss."""
         if get_parallel_state().sp_size > 1:
             velocity = gather_sp_token_output("decode_velocity", velocity, self._sp_decode_length)
 
@@ -230,12 +241,21 @@ class TrainingMixin(TrainingModuleMixin):
         self._sp_decode_length = None
 
         real_velocity_parts = self._scatter_velocity(decode_target_groups, decode_lengths, velocity)
-        loss = velocity.sum() * 0.0
+        loss = velocity.float().sum() * 0.0
         if target is not None and real_velocity_parts:
             real_velocity = torch.cat(real_velocity_parts, dim=0)
-            mse = (real_velocity - target.to(device=velocity.device, dtype=velocity.dtype)).square()
-            token_count = torch.tensor(float(mse.shape[0]), device=mse.device, dtype=mse.dtype)
-            loss = loss + mse.mean(dim=-1).sum() / token_count
+            mse = (real_velocity - target.to(device=velocity.device, dtype=velocity.dtype)).float().square()
+            num_valid_tokens = torch.tensor(mse.shape[0], device=velocity.device, dtype=torch.long)
+            loss = loss + mse.mean(dim=-1).sum() / num_valid_tokens.to(dtype=loss.dtype)
+        else:
+            num_valid_tokens = torch.zeros((), device=velocity.device, dtype=torch.long)
+
+        ps = get_parallel_state()
+        loss_reduction_group = (
+            ps.fsdp_group if ps.fsdp_group is not None else (ps.sp_group if ps.sp_size > 1 else None)
+        )
+        if loss_reduction_group is not None:
+            loss = reduce_sequence_parallel_loss(loss, num_valid_tokens, group=loss_reduction_group)
         return {"conversation_list": conversation, "_loss": loss}
 
     def _anchor_dummy_decode_velocity_inputs(
@@ -280,6 +300,7 @@ class TrainingMixin(TrainingModuleMixin):
         self,
         conversation_list: list[list[ConversationItem]] | None,
     ) -> list[list[ConversationItem]]:
+        """Group non-dummy image items carrying ``flow_velocity_target`` per sample."""
         if conversation_list is None:
             raise ValueError("BAGEL flow connector requires conversation_list to select velocity targets.")
 
@@ -301,6 +322,7 @@ class TrainingMixin(TrainingModuleMixin):
         decode_lengths: list[int],
         velocity: torch.Tensor,
     ) -> list[torch.Tensor]:
+        """Write predicted velocity spans onto target items and return non-dummy spans."""
         real_velocity_parts: list[torch.Tensor] = []
         offset = 0
         length_iter = iter(decode_lengths)

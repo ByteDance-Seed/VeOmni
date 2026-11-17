@@ -32,7 +32,7 @@ def preprocess_latent_embed(
         token_count = int(clean.shape[0])
 
         noise = torch.randn_like(clean)
-        timestep = torch.sigmoid(torch.randn(token_count, device=device, dtype=torch.float32))
+        timestep = torch.sigmoid(torch.randn(1, device=device, dtype=torch.float32)).expand(token_count)
         timestep = float(timestep_shift) * timestep / (1.0 + (float(timestep_shift) - 1.0) * timestep)
         timestep_values = timestep.reshape(-1, 1).to(device=clean.device, dtype=torch.float32)
         noised = (1.0 - timestep_values) * clean + timestep_values * noise
@@ -195,6 +195,7 @@ def flattened_position_ids(
     max_latent_size: int,
     device: torch.device | None = None,
 ) -> torch.Tensor:
+    """Compute flattened 2D grid position IDs bounded by ``max_latent_size``."""
     grid_h, grid_w = int(grid_shape[0]), int(grid_shape[1])
     if grid_h > max_latent_size or grid_w > max_latent_size:
         raise ValueError(

@@ -57,7 +57,7 @@ class BalanceStrategy:
 
 
 def resolve_balance_strategy(
-    structure: ModuleStructure, *, sp_size: int, dp_size: int, override: Optional[str] = None
+    structure: ModuleStructure, *, sp_size: int, dp_size: int, override: Optional[str | bool] = None
 ) -> BalanceStrategy:
     """Derive SP-slice / DP-balance / replicate from structure and local topology.
 
@@ -67,6 +67,9 @@ def resolve_balance_strategy(
     """
     if sp_size < 1 or dp_size < 1:
         raise ValueError("Parallel dimensions must be positive.")
+    if override is False:
+        # YAML 1.1 (and schema-less CLI values, parsed the same way) turn a bare ``off`` into False.
+        override = "off"
     if override not in (None, "auto", "off"):
         raise ValueError("data_balance_override must be 'auto' or 'off'.")
     token_sp = structure.global_attention and structure.non_overlapping_patchify

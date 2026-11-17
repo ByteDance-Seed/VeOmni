@@ -2,10 +2,11 @@
 
 ``JanusLlama(InferenceMixin, PretrainedOmniModule)`` — patched
 ``LlamaModel`` with ``embed_tokens = Identity``; ``inputs_embeds`` come from
-the text-encoder node.  Packing / FSDP dummy anchors live in ``accelerated.py``.
+the text-encoder node.  The conversation carrier and FSDP dummy anchors are
+handled in ``accelerated.py``.
 
-Multi-modal embedding packing
------------------------------
+Multi-modal embedding concatenation
+-----------------------------------
 :meth:`pre_forward` concatenates each sample's embedded conversation items
 into one packed sequence (``bs=1``), builds per-sample ``position_ids``
 (``range(0, len)`` per sample), and precomputes Flash-Attention varlen
@@ -18,7 +19,7 @@ Sequence parallelism
 ``forward`` is SP-unaware — it computes on whatever (already-sliced) sequence
 it is handed. SP is driven OUTSIDE the model (classic single-pass Ulysses): when
 ``sp_size > 1`` the accelerated ``TrainingMixin``'s ``forward_pre`` hook slices
-the (replicated) packed sample to this rank's ``1/sp_size`` shard (rebuilding
+the (replicated) concatenated sample to this rank's ``1/sp_size`` shard (rebuilding
 the varlen ``cu_seqlens``), ``forward`` runs once (its attention all-to-alls
 over the SP group internally), and the ``forward_post`` hook all-gathers the
 shards back to the full sequence on every rank (both in ``accelerated.py``,
@@ -36,6 +37,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 
+from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaModel
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
@@ -70,6 +72,12 @@ class InferenceMixin:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
+        if get_parallel_state().sp_size > 1:
+            raise ValueError(
+                "JanusLlama.generate feeds the full prompt to the backbone, which conflicts with "
+                "Ulysses sequence parallelism (attention expects this rank's shard); run inference "
+                "with sp_size=1."
+            )
         if self._past_key_values is None:
             inputs_embeds, attention_mask, position_ids, _ = pack_llm_conversations_for_forward(
                 [conversation_list], self.device
@@ -99,8 +107,17 @@ class InferenceMixin:
                 )
             )
             return {"conversation_list": conversation_list}
+        # The tail row carries the embedding of the last token, whatever its type:
+        # an ``output`` row holds a token the model just sampled (or the hidden
+        # state priming the cache), and a ``text`` row holds the ``<boi>`` embed
+        # that opens an image span. Both are consumed the same way -- one token's
+        # embedding, re-fed through the backbone -- so the type is not a contract
+        # here. ``value[-1:]`` is the only thing read.
         tail_part = conversation_list[-1]
-        assert tail_part.type == "output"
+        if tail_part.value is None:
+            raise ValueError(
+                f"JanusLlama.generate expects the conversation tail to hold embeddings; got type={tail_part.type!r}."
+            )
 
         cfg_uncond_inputs_embeds = tail_part.meta.pop("cfg_uncond_inputs_embeds", None)
         if cfg_uncond_inputs_embeds is not None and not self._cfg_active:
@@ -184,6 +201,11 @@ class JanusLlama(InferenceMixin, PretrainedOmniModule):
     _no_split_modules = ["LlamaDecoderLayer"]
     # Inner ``language_model`` is VeOmni's patched ``LlamaModel`` (fused ops + SP).
     supports_gradient_checkpointing = True
+    # The backbone runs through VeOmni's patched attention, which takes the
+    # selected backend explicitly; HF gates each spelling on these flags.
+    _supports_sdpa = True
+    _supports_flash_attn = True
+    _supports_flex_attn = True
 
     def __init__(self, config: JanusLlamaConfig):
         super().__init__(config)

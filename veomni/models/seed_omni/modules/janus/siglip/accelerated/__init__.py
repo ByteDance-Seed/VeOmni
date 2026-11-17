@@ -1,4 +1,4 @@
-"""Accelerated runtime for the janus/siglip OmniModule (conversation + packed graphs)."""
+"""Accelerated runtime for the janus/siglip OmniModule (conversation graph)."""
 
 from .accelerated import (
     JanusSiglipAccelerated,

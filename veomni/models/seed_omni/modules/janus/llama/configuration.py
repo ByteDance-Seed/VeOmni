@@ -42,4 +42,11 @@ class JanusLlamaConfig(OmniModuleConfig):
         **kwargs,
     ):
         self.text_config = LlamaConfig(**text_config) if text_config else LlamaConfig()
+        # This backbone owns no wte / lm_head — the real ``embed_tokens``<->head
+        # tie lives in ``janus_text_encoder``. Nothing needs to be said here:
+        # ``tie_word_embeddings_if_requested`` skips a model whose
+        # ``get_output_embeddings()`` is ``None``, and the backbone's input
+        # embedding is the ``nn.Identity`` over the sibling's ``embed_tokens``.
+        # Forcing the flag off (and rewriting the caller's nested ``text_config``)
+        # was the old workaround, and it faked a field this module does not have.
         super().__init__(**kwargs)

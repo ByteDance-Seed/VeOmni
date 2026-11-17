@@ -15,11 +15,10 @@ from diffusers.models.transformers.transformer_wan import (
     _get_added_kv_projections,
     _get_qkv_projections,
 )
-from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -101,7 +100,7 @@ def _get_wan_full_sequence_varlen_kwargs(
     }
 
 
-_WAN_FLASH2_IMPLS = frozenset({"flash_attention_2", "veomni_flash_attention_2"})
+_WAN_FLASH_IMPLS = frozenset({"flash_attention_2", "veomni_flash_attention_2", "veomni_flash_attention_aiter"})
 
 
 def _get_weight_dtype(module):
@@ -139,10 +138,10 @@ def _assert_wan_flash_attention_bf16(
 class WanSPAttnProcessor(WanAttnProcessor):
     """Video self-attn / text cross-attn through the interned ``attention`` kernel."""
 
-    def __init__(self):
-        impl = resolve_op_impl("attn_implementation", eager_as="veomni_sdpa")
+    def __init__(self, config=None):
+        impl = config.ops_config.attn_implementation if config is not None else "veomni_sdpa"
         self.veomni_attn = VeomniOp("attention", "standard", impl)
-        self._use_flash2 = impl in _WAN_FLASH2_IMPLS
+        self._use_flash = impl in _WAN_FLASH_IMPLS
         self.config = SimpleNamespace(_attn_implementation=impl)
         super().__init__()
 
@@ -159,7 +158,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
         key_length: int | None = None,
     ) -> torch.Tensor:
         kwargs = {}
-        if self._use_flash2:
+        if self._use_flash:
             kwargs = _get_wan_full_sequence_varlen_kwargs(
                 query, key, value, query_length=query_length, key_length=key_length
             )
@@ -257,7 +256,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
             query = _apply_rope(query, *rotary_emb)
             key = _apply_rope(key, *rotary_emb)
 
-        if self._use_flash2:
+        if self._use_flash:
             _assert_wan_flash_attention_bf16(query, key, value, attn)
 
         kernel_module = WanAttentionKernelModule(self.config, attn)
@@ -268,7 +267,7 @@ class WanSPAttnProcessor(WanAttnProcessor):
             key_img = attn.norm_added_k(key_img)
             key_img = key_img.unflatten(2, (attn.heads, -1))
             value_img = value_img.unflatten(2, (attn.heads, -1))
-            if self._use_flash2:
+            if self._use_flash:
                 assert key_img.dtype == torch.bfloat16 and value_img.dtype == torch.bfloat16, (
                     "Wan image flash-attention expects bf16 added K/V tensors, "
                     f"got key={key_img.dtype}, value={value_img.dtype}."
@@ -489,20 +488,23 @@ class _WanTransformerInitShim(_WanTransformer3DModel):
 class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
     config_class = WanTransformer3DModelConfig
     supports_gradient_checkpointing = True
+    _supports_sdpa = True
     _supports_flash_attn = True
     _no_split_modules = ["WanTransformerBlock"]
 
     def __init__(self, config: WanTransformer3DModelConfig, **kwargs):
+        attn_implementation = kwargs.pop("attn_implementation", None)
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
         PreTrainedModel.__init__(self, config, **kwargs)
         del self._internal_dict
         # Remove VeOmni-specific kwargs before passing to the diffusers init.
-        kwargs.pop("attn_implementation", None)
         kwargs.pop("torch_dtype", None)
         _WanTransformer3DModel.__init__(self, **config.to_diffuser_dict())
         self.config: WanTransformer3DModelConfig = config
         self.config.tie_word_embeddings = False
 
-        sp_processor = WanSPAttnProcessor()
+        sp_processor = WanSPAttnProcessor(config)
         for block in self.blocks:
             block.attn1.set_processor(sp_processor)
             block.attn2.set_processor(sp_processor)
@@ -583,9 +585,11 @@ class WanTransformer3DModel(PreTrainedModel, _WanTransformerInitShim):
 
     def save_pretrained(self, path, **kwargs):
         hf_config = copy.deepcopy(self.config)
-        self.config = self.config.to_diffuser_dict()
-        _WanTransformer3DModel.save_pretrained(self, path, **kwargs)
-        self.config = hf_config
+        self.config = {**self.config.to_diffuser_dict(), "ops_implementation": dict(self.config.ops_implementation)}
+        try:
+            _WanTransformer3DModel.save_pretrained(self, path, **kwargs)
+        finally:
+            self.config = hf_config
 
     @classmethod
     def from_pretrained(cls, path, **kwargs):

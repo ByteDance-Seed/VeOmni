@@ -8,7 +8,6 @@ from einops import rearrange
 from torchvision.transforms import Normalize
 
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.utils.device import get_device_type
 
 from .core import bind_minimax_attention, minimax_attention
@@ -110,7 +109,17 @@ def _group_norm(ch, t_isolated=False):
 class Attention(nn.Module):
     """Multi-head attention through the interned ``attention/standard`` handle."""
 
-    def __init__(self, heads, dim_head, embed_dim=None, qk_norm_type=None, qk_norm_affine=False, bias=True, eps=1e-5):
+    def __init__(
+        self,
+        heads,
+        dim_head,
+        embed_dim=None,
+        qk_norm_type=None,
+        qk_norm_affine=False,
+        bias=True,
+        eps=1e-5,
+        config=None,
+    ):
         super().__init__()
         self.num_heads = heads
         self.dim_head = dim_head
@@ -121,9 +130,10 @@ class Attention(nn.Module):
         self.norm_k = norm_cls(dim_head, eps=eps, elementwise_affine=qk_norm_affine) if norm_cls else None
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=bias)
         self.to_out = nn.Linear(inner_dim, dim, bias=bias)
-        bind_minimax_attention(self, is_causal=False)
+        bind_minimax_attention(self, is_causal=False, config=config)
         # q/k are [B, S, H, D]. Production rotary width is dim_head * 0.75.
-        self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
+        rope_impl = config.ops_config.rotary_pos_emb_implementation if config is not None else "eager"
+        self.veomni_rope = VeomniOp("rope", "partial", rope_impl)
 
     def forward(self, x, rotary_pos_emb=None):
         B, S, _ = x.shape
@@ -179,6 +189,7 @@ class TransformerBlock(nn.Module):
         qk_norm_affine=False,
         bias=True,
         eps=1e-5,
+        config=None,
     ):
         super().__init__()
         dim = embed_dim or dim_head * heads
@@ -191,6 +202,7 @@ class TransformerBlock(nn.Module):
             qk_norm_affine=qk_norm_affine,
             bias=bias,
             eps=eps,
+            config=config,
         )
         self.scale1 = WarpedTensor(torch.zeros(dim))
         self.norm2 = nn.RMSNorm(dim, elementwise_affine=norm_affine, eps=eps)
@@ -370,6 +382,7 @@ class ViT3DDecoder(nn.Module):
         bias=True,
         eps=1e-5,
         num_register_tokens=4,
+        config=None,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -391,6 +404,7 @@ class ViT3DDecoder(nn.Module):
                     qk_norm_affine=qk_norm_affine,
                     bias=bias,
                     eps=eps,
+                    config=config,
                 )
                 for _ in range(num_layers)
             ]
@@ -541,6 +555,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         token_drop=3,
         tile_size=256,
         tile_overlap_min=64,
+        config=None,
         **kwargs,
     ):
         super().__init__()
@@ -593,6 +608,7 @@ class MiniMaxH3VideoVAE(nn.Module):
             qk_norm_type="rms_norm",
             rope_dim_ratio=0.75,
             rope_theta=100.0,
+            config=config,
         )
 
     def encode(self, x):

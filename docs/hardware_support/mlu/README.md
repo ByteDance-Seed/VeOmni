@@ -10,7 +10,7 @@ VeOmni supports a wide range of models on Cambricon MLU, across modalities (text
 
 The MoE expert layer is accelerated by the fused MoE kernel. On MLU there are two interchangeable `moe_implementation` backends. The faster one is **`fused_mlu`**, which requires `torch_mlu` plus `apex` (specifically `apex.contrib.grouped_gemm`) and runs the Apex grouped-GEMM kernel for better performance. When `apex` is not available, use **`fused_triton`**: it requires only `torch_mlu` plus `triton` and runs the same Triton grouped-GEMM kernel as on GPU. Both backends cover the same MoE path; pick `fused_mlu` for speed when the apex stack is present, otherwise `fused_triton` runs everywhere Triton does.
 
-Other ops on MLU (RMSNorm, RoPE, SwiGLU, load balancing loss, cross entropy loss) currently fall back to the `eager` (huggingface reference) implementation; more fused kernels will be supported soon for better performance.
+RMSNorm, RoPE, SwiGLU MLP and cross entropy loss are accelerated by the Cambricon MLU build of `liger_kernel` (the `liger_kernel` wheel versioned `+mlu*`, which keeps the upstream `liger_kernel.ops.*` API over MLU backends). With that build installed, the unset `rms_norm_implementation` / `rotary_pos_emb_implementation` / `swiglu_mlp_implementation` / `cross_entropy_loss_implementation` fields default to `liger_kernel` on MLU; without it (or with upstream GPU liger-kernel) they fall back to `eager`, as does the load balancing loss.
 
 ## Get Started
 

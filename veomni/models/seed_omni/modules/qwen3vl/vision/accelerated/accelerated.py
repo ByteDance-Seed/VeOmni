@@ -46,6 +46,21 @@ class TrainingMixin(TrainingModuleMixin):
     device: torch.device
     dtype: torch.dtype
 
+    def _merged_tokens_per_item(self, item: ConversationItem) -> int:
+        """Merged visual tokens one item contributes: ``prod(grid) / merge²``.
+
+        The tower's token domain is its *output* rows, not patch rows — the
+        merger collapses ``merge²`` patches into one. Reads the grid the
+        preprocessor stamped on the item, so it works for image and video alike.
+        """
+        grid = (item.meta or {}).get("_omni_grid") or (item.meta or {}).get("grid_thw")
+        if grid is None:
+            return 0
+        values = grid.tolist() if isinstance(grid, torch.Tensor) else list(grid)
+        t, h, w = (int(x) for x in values)
+        merge_area = int(self.config.vision_config.spatial_merge_size) ** 2
+        return int(t * h * w) // merge_area
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._conversation_carrier: Any = None
@@ -59,11 +74,22 @@ class TrainingMixin(TrainingModuleMixin):
     def forward_pre(
         self,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
+        # The graph hands a node the whole batch; this hook owns only the carrier.
+        # Swallowing the rest keeps framework metadata (`ds_idx`, …) and any
+        # sibling module's keys from failing the call.
+        del kwargs
         self._conversation_carrier = conversation_list
         image_items = list(iter_desired_items(conversation_list, types=["image"], roles=["user"]))
         video_items = list(iter_desired_items(conversation_list, types=["video"], roles=["user"]))
         real_image_items = [it for it in image_items if not it.is_dummy]
+        # Metering: this rank's own merged visual tokens, stashed BEFORE any SP
+        # slice so the count does not depend on `sp_size`.
+        self.metric_meter_set_seqlens(
+            "forward",
+            [self._merged_tokens_per_item(it) for it in (*real_image_items, *video_items) if not it.is_dummy],
+        )
         dummy = not (real_image_items or video_items)
         if not dummy:
             image_items = real_image_items
@@ -182,15 +208,10 @@ class BalanceMixin(DataBalanceMixin):
     data_balance_specs = {"forward": _vision_balance_spec, "pack_encode": _vision_balance_spec}
 
     def _balance_vision_inputs(self, method: str, pixels: torch.Tensor, grid: torch.Tensor) -> tuple:
-        # Worker-built geometry is the authoritative cost signal. Stash original
-        # full lengths for token accounting before routing or SP padding/slicing.
         grid_list = grid.tolist()
         patch_lengths = [t * h * w for t, h, w in grid_list]
         merged_lengths = [n // self.config.vision_config.spatial_merge_size**2 for n in patch_lengths]
         merge_area = self.config.vision_config.spatial_merge_size**2
-        # The ViT attends within each frame, not across the whole video clip.
-        # Keep frame lengths for FLOPs and clip output lengths for inverse splits.
-        self.metric_meter_set_seqlens(method, [h * w // merge_area for t, h, w in grid_list for _ in range(t)])
         inputs, balanced = self.data_balance_pre(
             method,
             {"pixel_values": pixels, "image_grid_thw": grid},
@@ -204,30 +225,61 @@ class BalanceMixin(DataBalanceMixin):
         return inputs["pixel_values"], inputs["image_grid_thw"], balanced
 
 
-class MeterMixin(MetricMeterMixin):
-    """Merged-token accounting and this vision tower's theoretical FLOPs only."""
+class VisionMeterMixin(MetricMeterMixin):
+    """Per-module training meter for the Qwen3-VL vision tower.
 
-    def estimate_flops(self, seqlens: list[int]) -> float:
+    `seqlens` carries **merged visual tokens** (the tower's output rows, what the
+    backbone sees), but the tower's own compute runs on **raw patch rows**: the
+    merger collapses `merge²` patches into one *after* the blocks. So the block
+    and patch-embed terms are scaled back up by `merge²`, and the merger terms are
+    the two projections that do the collapsing.
+    """
+
+    config: Qwen3VLVisionEncoderConfig
+
+    def estimate_flops(self, seqlens: List[int]) -> float:
         cfg = self.config.vision_config
-        merge_area = cfg.spatial_merge_size**2
-        dim = cfg.hidden_size
-        patch_params = dim * cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size**2
-        block_params = 4 * dim**2 + 2 * dim * cfg.intermediate_size
-        merger_dim = dim * merge_area
-        merger_params = merger_dim * (merger_dim + cfg.out_hidden_size)
+        hidden = cfg.hidden_size
+        depth = cfg.depth
+        merge_area = int(cfg.spatial_merge_size) ** 2
+        num_heads = cfg.num_heads
+        head_dim = hidden // num_heads
+
+        # The blocks see raw patches, `merge²` per merged token.
+        raw_seqlens = [max(0, int(s)) * merge_area for s in seqlens]
+        raw_tokens = sum(raw_seqlens)
+        raw_sq = sum(s * s for s in raw_seqlens)
+        merged_tokens = sum(max(0, int(s)) for s in seqlens)
+
+        # The vision block's MLP is a plain two-layer GELU MLP — `linear_fc1`
+        # (hidden -> intermediate) then `linear_fc2` (intermediate -> hidden) —
+        # not the SwiGLU of the language stack, so it carries no third
+        # projection.
+        mlp_n = hidden * cfg.intermediate_size * 2
+        attn_linear_n = hidden * (3 * hidden + hidden)  # qkv + o
+        dense_n = (mlp_n + attn_linear_n) * depth
+        dense_flops = 6 * dense_n * raw_tokens
+        # Quadratic term: per layer, per token pair, `head_dim * num_heads` MACs.
+        attn_flops = 12 * raw_sq * head_dim * num_heads * depth
+
+        # patch_embed (Conv3d over each patch) — one pass per raw patch.
+        patch_n = hidden * cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size**2
+        patch_flops = 6 * patch_n * raw_tokens
+
+        # Mergers: the patch merger widens to `hidden * merge²` and keeps that
+        # width, so `linear_fc1` maps `hidden*merge² -> hidden*merge²` and
+        # `linear_fc2` maps `hidden*merge² -> out_hidden_size`. Both run once
+        # per merged token, by the spatial merger plus one per DeepStack layer.
         merger_count = 1 + len(cfg.deepstack_visual_indexes)
-        tokens = sum(seqlens)
-        # Patch/block work runs on raw tokens; mergers run on merged tokens.
-        # freeze_model freezes the tower but leaves the final merger trainable.
-        frozen = self.config.freeze
-        tower_factor = 2 if frozen else 6
-        merger_flops = merger_params * tokens * (6 + tower_factor * (merger_count - 1))
-        dense = tower_factor * (patch_params + cfg.depth * block_params) * tokens * merge_area
-        attention = (4 if frozen else 12) * dim * cfg.depth * sum((n * merge_area) ** 2 for n in seqlens)
-        return (dense + attention + merger_flops) / 1e12
+        merged_width = hidden * merge_area
+        fc1_n = merged_width * merged_width
+        fc2_n = merged_width * cfg.out_hidden_size
+        merger_flops = 6 * (fc1_n + fc2_n) * merged_tokens * merger_count
+
+        return (dense_flops + attn_flops + patch_flops + merger_flops) / 1e12
 
 
-class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, BalanceMixin, MeterMixin):
+class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, BalanceMixin, VisionMeterMixin):
     """``generate()`` already lives on the native :class:`~.modeling.Qwen3VLVisionEncoder`
     (via its own :class:`~.modeling.InferenceMixin`), so no ``InferenceMixin`` is needed here.
     """

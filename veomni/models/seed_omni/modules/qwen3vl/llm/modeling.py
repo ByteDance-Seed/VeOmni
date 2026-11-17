@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 
+from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.tensor_utils import naflatten
 
@@ -28,13 +29,38 @@ def _cumsum(values: list[int]) -> list[int]:
     return out
 
 
-def qwen3vl_vision_position_ids(start: int, grid_thw: torch.Tensor, merge: int) -> torch.Tensor:
-    """3-row (t/h/w) M-RoPE positions for one image — mirrors Qwen3VLModel.get_vision_position_ids."""
+def qwen3vl_vision_position_advance(grid_thw: torch.Tensor, merge: int) -> int:
+    """How far M-RoPE positions move past one visual item.
+
+    A video is a run of ``t`` single-frame grids (see
+    :func:`qwen3vl_vision_position_ids`), and each frame advances positions by
+    ``max(h, w) // merge``, so the item advances ``t`` times that.
+    """
     t, h, w = int(grid_thw[0]), int(grid_thw[1]), int(grid_thw[2])
-    gt, gh, gw = t, h // merge, w // merge
-    temporal = torch.arange(gt).repeat_interleave(gh * gw) + start
-    height = torch.arange(gh).repeat_interleave(gw).repeat(gt) + start
-    width = torch.arange(gw).repeat(gh * gt) + start
+    return t * (max(h, w) // merge)
+
+
+def qwen3vl_vision_position_ids(start: int, grid_thw: torch.Tensor, merge: int) -> torch.Tensor:
+    """3-row (t/h/w) M-RoPE positions for one visual item, mirroring HF ``get_rope_index``.
+
+    Qwen3-VL separates video frames with timestamps, so HF splits a video's
+    ``(T, H, W)`` grid into ``T`` single-frame grids *before* assigning
+    positions: each frame restarts height/width and advances the running
+    position by ``max(h, w) // merge``. Emitting the whole grid at once would
+    share one temporal axis and one h/w range across all frames, which does not
+    match the checkpoint's training distribution. An image is ``T == 1``, where
+    both schemes coincide.
+    """
+    t, h, w = int(grid_thw[0]), int(grid_thw[1]), int(grid_thw[2])
+    gh, gw = h // merge, w // merge
+    per_frame = gh * gw
+    step = max(h, w) // merge
+    # One single-frame grid per timestamp: its temporal coordinate is the frame's
+    # own start position, and h/w restart there.
+    frame_starts = [start + frame * step for frame in range(t)]
+    temporal = torch.cat([torch.full((per_frame,), s) for s in frame_starts])
+    height = torch.cat([torch.arange(gh).repeat_interleave(gw) + s for s in frame_starts])
+    width = torch.cat([torch.arange(gw).repeat(gh) + s for s in frame_starts])
     return torch.stack([temporal, height, width], dim=0).long()
 
 
@@ -74,7 +100,7 @@ def pack_qwen3vl_conversations_for_forward(
             if is_visual:
                 grid_thw = item.meta["grid_thw"]
                 seg_pos = qwen3vl_vision_position_ids(current_pos, grid_thw, spatial_merge_size).to(device)
-                current_pos += int(max(int(grid_thw[1]), int(grid_thw[2])) // spatial_merge_size)
+                current_pos += qwen3vl_vision_position_advance(grid_thw, spatial_merge_size)
                 visual_pos_masks_list.append(torch.ones(length, dtype=torch.bool, device=device))
                 deepstack_chunks.append([d.to(device) for d in item.meta["deepstack"]])
             else:
@@ -98,6 +124,12 @@ def pack_qwen3vl_conversations_for_forward(
         ]
     else:
         deepstack_visual_embeds = collect_qwen3vl_dummy_deepstack(conversations, device)
+        visual_pos_masks = None
+    if not deepstack_visual_embeds:
+        # ``deepstack_visual_indexes: []`` (``disable_deepstack``) leaves every
+        # item's ``deepstack`` list empty, so there is nothing to inject and the
+        # backbone must not receive a mask that promises layer features.
+        deepstack_visual_embeds = None
         visual_pos_masks = None
 
     cu_seq_lens = torch.tensor([0, *_cumsum(sample_lengths)], dtype=torch.int32, device=device)
@@ -139,6 +171,12 @@ class InferenceMixin:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
+        if get_parallel_state().sp_size > 1:
+            raise ValueError(
+                "Qwen3VLLlm.generate feeds the full prompt to the backbone, which conflicts with "
+                "Ulysses sequence parallelism (attention expects this rank's shard); run inference "
+                "with sp_size=1."
+            )
         if self._past_key_values is None:
             packed = pack_qwen3vl_conversations_for_forward([conversation_list], self.device, self._spatial_merge_size)
             position_ids = packed["position_ids"]
@@ -210,6 +248,10 @@ class Qwen3VLLlm(InferenceMixin, PretrainedOmniModule):
     main_input_name = "inputs_embeds"
     _no_split_modules = ["Qwen3VLTextDecoderLayer"]
     supports_gradient_checkpointing = True
+    # This wrapper owns no attention — `self.language_model` does, and it supports
+    # both SDPA and eager. Without this the base `_supports_sdpa = False` rejects
+    # `sdpa` / `veomni_sdpa` at construction.
+    _supports_sdpa = True
 
     def __init__(self, config: Qwen3VLLlmConfig):
         super().__init__(config)

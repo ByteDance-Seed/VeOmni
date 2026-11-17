@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import copy
 import json
-from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -27,33 +26,28 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
 from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def _config_asking_for_the_loss(coef: float = 1.0, **overrides) -> DeepseekV4Config:
+def _config_asking_for_the_loss(
+    coef: float = 1.0,
+    *,
+    ops_overrides: dict | None = None,
+    **overrides,
+) -> DeepseekV4Config:
+    ops = eager_ops_config()
+    for key, value in (ops_overrides or {}).items():
+        setattr(ops, key, value)
     return DeepseekV4Config(
         num_hidden_layers=2,
         layer_types=["compressed_sparse_attention"] * 2,
         dsa_indexer_loss=True,
         dsa_indexer_loss_coef=coef,
+        ops_implementation=ops,
         **overrides,
     )
-
-
-@contextmanager
-def _kernels_config_installed(**overrides):
-    previous = get_ops_config()
-    installed = eager_ops_config()
-    for key, value in overrides.items():
-        setattr(installed, key, value)
-    set_ops_config(installed)
-    try:
-        yield installed
-    finally:
-        set_ops_config(previous)
 
 
 def test_the_two_fields_are_declared_on_the_model_config():
@@ -98,8 +92,10 @@ def test_the_two_fields_are_refused_when_they_arrive_with_the_wrong_type(field, 
 
 @pytest.mark.parametrize("coef", [0.5, 1.0, 100.0])
 def test_indexer_loss_coef_accepts_finite_positive_weights(coef):
-    with _kernels_config_installed(dsa_indexer_implementation="tilelang", dsa_attention_implementation="tilelang"):
-        _config_asking_for_the_loss(coef=coef).validate_build_prerequisites()
+    _config_asking_for_the_loss(
+        coef=coef,
+        ops_overrides={"dsa_indexer_implementation": "tilelang", "dsa_attention_implementation": "tilelang"},
+    ).validate_build_prerequisites()
 
 
 @pytest.mark.parametrize(
@@ -114,14 +110,12 @@ def test_indexer_loss_coef_accepts_finite_positive_weights(coef):
     ],
 )
 def test_the_two_kernel_prerequisites_are_refused_at_model_build(overrides, expected):
-    with _kernels_config_installed(**overrides):
-        with pytest.raises(ValueError, match=expected):
-            _config_asking_for_the_loss().validate_build_prerequisites()
+    with pytest.raises(ValueError, match=expected):
+        _config_asking_for_the_loss(ops_overrides=overrides).validate_build_prerequisites()
 
 
 def test_a_zero_coefficient_is_not_held_to_the_prerequisites():
-    with _kernels_config_installed():
-        _config_asking_for_the_loss(coef=0.0).validate_build_prerequisites()
+    _config_asking_for_the_loss(coef=0.0).validate_build_prerequisites()
 
 
 def test_undeclared_is_not_the_same_as_absent(tmp_path: Path):

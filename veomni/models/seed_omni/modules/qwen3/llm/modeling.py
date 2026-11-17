@@ -32,8 +32,12 @@ class Qwen3Llm(SimpleArGenerationMixin, PretrainedOmniModule):
     config_class = Qwen3LlmConfig
     base_model_prefix = "qwen3_llm"
     main_input_name = "inputs_embeds"
-    _no_split_modules = ["Qwen3DecoderLayer"]
-    supports_gradient_checkpointing = True
+    _no_split_modules = Qwen3Model._no_split_modules
+    supports_gradient_checkpointing = Qwen3Model.supports_gradient_checkpointing
+    _supports_flash_attn = Qwen3Model._supports_flash_attn
+    _supports_sdpa = Qwen3Model._supports_sdpa
+    _supports_flex_attn = Qwen3Model._supports_flex_attn
+    _supports_attention_backend = Qwen3Model._supports_attention_backend
 
     def __init__(self, config: Qwen3LlmConfig):
         super().__init__(config)

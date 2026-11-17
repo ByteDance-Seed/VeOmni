@@ -109,3 +109,20 @@ clear_parallel_state()
 
 Clearing prevents a later distributed session from reusing cached device
 meshes or process groups that have already been destroyed.
+
+### Optional Ascend expert communication tuning
+
+`model.accelerator.npu_ep_hccl_buffer_mib` and
+`model.accelerator.npu_ep_hccl_expansion_mode` (`host` or `device`, meaning AI CPU)
+configure **only** the existing `ep` mesh dimension using PyTorch's
+`init_device_mesh(backend_override=...)`. Both default to `None`; other dimensions,
+rank order, sharding and arithmetic are unchanged. The selected options participate
+in the topology cache key, so models requesting different communication policies
+do not share the same state. Set these fields only on NPU with EP enabled.
+
+For example, `1280` MiB plus `host` is a profile-specific tuning point, not a
+universal default. More communication buffer can increase NPU memory consumption;
+benchmark the real peak and step time. No extra lazy process group is created.
+TorchNPU's [HCCL options documentation](https://www.hiascend.com/document/detail/en/Pytorch/2600/ptmoddevg/Frameworkfeatures/docs/en/framework_feature_guide_pytorch/setting_HCCL_communicator_parameter.md)
+describes buffer and expansion-mode semantics. These options require a PyTorch /
+TorchNPU runtime implementing the public DeviceMesh `backend_override` argument.

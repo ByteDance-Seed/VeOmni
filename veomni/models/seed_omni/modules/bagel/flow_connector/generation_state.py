@@ -42,6 +42,7 @@ class FlowGenerationState:
         patch_latent_dim: int,
         device: torch.device,
     ) -> None:
+        """Initialize initial Gaussian latent tokens and shifted Euler timestep schedule."""
         if bool(generation_kwargs.get("enable_taylorseer", False)):
             raise NotImplementedError("BAGEL infer_gen TaylorSeer is not implemented in the SeedOmni graph path.")
 
@@ -92,29 +93,34 @@ class FlowGenerationState:
 
     @property
     def latents(self) -> torch.Tensor:
+        """Return the current noisy latent tokens ``x_t``."""
         if self._latents is None:
             raise RuntimeError("BAGEL flow denoise latent state is not initialized.")
         return self._latents
 
     @property
     def timestep_values(self) -> torch.Tensor:
+        """Return the shifted timestep schedule tensor."""
         if self._timestep_values is None:
             raise RuntimeError("BAGEL flow denoise timesteps are not initialized.")
         return self._timestep_values
 
     @property
     def dt_values(self) -> torch.Tensor:
+        """Return the step size deltas ``dt`` between consecutive timesteps."""
         if self._dt_values is None:
             raise RuntimeError("BAGEL flow denoise dt values are not initialized.")
         return self._dt_values
 
     @property
     def grid_shape(self) -> tuple[int, int]:
+        """Return the ``(height, width)`` patch grid dimensions."""
         if self._grid_shape is None:
             raise RuntimeError("BAGEL flow denoise latent grid shape is not initialized.")
         return self._grid_shape
 
     def current_timestep(self) -> torch.Tensor:
+        """Return the scalar timestep tensor for the current Euler step."""
         timesteps = self.timestep_values
         if self._step_index >= int(timesteps.numel()):
             raise RuntimeError("BAGEL flow denoise timestep index is past the final step.")
@@ -129,6 +135,7 @@ class FlowGenerationState:
         return self._step_index >= int(timesteps.numel())
 
     def advance(self, velocity: torch.Tensor) -> bool:
+        """Apply one Euler step ``x_t <- x_t - v_t * dt`` and return whether denoising finished."""
         x_t = self.latents
         dts = self.dt_values
         # Official generate_image does `x_t - v_t.to(x_t.device) * dts[i]` without

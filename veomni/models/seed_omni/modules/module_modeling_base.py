@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from transformers import PreTrainedModel
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 
 class PretrainedOmniModule(PreTrainedModel):
@@ -27,10 +27,6 @@ class PretrainedOmniModule(PreTrainedModel):
 
     Subclasses hold weights, ``forward``, and FSM ``generate`` endpoints only.
     """
-
-    _supports_sdpa = True
-    _supports_flash_attn = True
-    _supports_flex_attn = True
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):

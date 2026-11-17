@@ -23,7 +23,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config, ops_config_scope
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config
 from tests.models.tiny_configs import tiny_minimax_h3_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_minimax_h3_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
@@ -35,7 +36,6 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import (
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
     MiniMaxH3DiTModel,
 )
-from veomni.ops.config import get_ops_config, set_ops_config
 
 
 _VEOMNI_RMS_NORM_FORWARD = VeomniRMSNorm.forward
@@ -53,15 +53,17 @@ def _sdpa_ops_config() -> SimpleNamespace:
 
 
 def _build_norm(size: int = 16):
-    with ops_config_scope(eager_ops_config()):
-        return VeomniRMSNorm(size, eps=1e-6)
+    cfg = _tiny_config()
+    cfg._set_ops_implementation(eager_ops_config())
+    return VeomniRMSNorm(size, eps=1e-6, config=cfg)
 
 
 def _build_model():
-    with ops_config_scope(_sdpa_ops_config()):
-        # Keep the production latent channels/patch size: the public wrapper
-        # unpacks 24-channel video and 32-dimensional audio tokens.
-        return MiniMaxH3DiTModel(_tiny_config(latents_dim=24, audio_latents_dim=32, patch_size=(1, 2, 2)))
+    # Keep the production latent channels/patch size: the public wrapper
+    # unpacks 24-channel video and 32-dimensional audio tokens.
+    cfg = _tiny_config(latents_dim=24, audio_latents_dim=32, patch_size=(1, 2, 2))
+    cfg._set_ops_implementation(_sdpa_ops_config())
+    return MiniMaxH3DiTModel(cfg)
 
 
 def _minimax_h3_inputs(cond_rows: int) -> dict:
@@ -111,7 +113,7 @@ def test_minimax_h3_public_forward_matches_token_reference(monkeypatch, cond_row
     torch.manual_seed(1)
     reference = _build_model()
     ours = _build_model()
-    assert ours.dit.blocks[0].attn.veomni_attn.impl == "sdpa"
+    assert ours.dit.blocks[0].attn.veomni_attn.impl == "veomni_sdpa"
     ours.load_state_dict(reference.state_dict())
     inputs = _minimax_h3_inputs(cond_rows)
     ours_inputs = {
@@ -137,53 +139,49 @@ def test_minimax_h3_public_forward_matches_token_reference(monkeypatch, cond_row
         )
     expected_predictions = []
 
-    previous = get_ops_config()
-    set_ops_config(_sdpa_ops_config())
     monkeypatch.setattr(VeomniRMSNorm, "forward", VeomniRMSNorm.forward)
-    try:
 
-        def call(model):
-            VeomniRMSNorm.forward = _torch_rms_norm_forward if model is reference else _VEOMNI_RMS_NORM_FORWARD
-            if model is reference:
-                video_tokens, audio_tokens = model.dit(
-                    **dict(inputs, update_mask=None if skip_mask else inputs["update_mask"]),
-                    skip_mask_out_condition=skip_mask,
-                )
-                # Each frame has two flattened Cx2x2 patches. Fold reconstructs
-                # the spatial grid independently of production unpatchify_video.
-                patches = video_tokens[cond_rows:].reshape(2, 2, 96).transpose(1, 2)
-                video = -F.fold(patches, output_size=(2, 4), kernel_size=2, stride=2).transpose(0, 1).unsqueeze(0)
-                audio = -torch.stack([audio_tokens[:2].T, audio_tokens[2:].T])
-                expected_predictions.extend([video, audio])
-                if not training:
-                    return video, audio
-                return (
-                    F.mse_loss(video, video_target) * (1.75 if weighted else 1),
-                    F.mse_loss(audio, audio_target) * (2.4 if weighted else 1),
-                )
-            output = model(**ours_inputs, **public_kwargs)
-            assert len(output.predictions) == 2
-            for actual, expected in zip(output.predictions, expected_predictions, strict=True):
-                torch.testing.assert_close(actual, expected, atol=EAGER_ATOL, rtol=EAGER_RTOL)
-            if not training:
-                assert output.loss is None
-                return tuple(output.predictions)
-            assert set(output.loss) == {"mse_video", "mse_audio"}
-            return output.loss["mse_video"], output.loss["mse_audio"]
-
-        assert_outputs_and_grads_match(reference, ours, call)
-        for key in ("x", "audio_x", "prompt_embeds"):
-            assert inputs[key].grad is not None
-            torch.testing.assert_close(
-                ours_inputs[key].grad, inputs[key].grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL
+    def call(model):
+        VeomniRMSNorm.forward = _torch_rms_norm_forward if model is reference else _VEOMNI_RMS_NORM_FORWARD
+        if model is reference:
+            video_tokens, audio_tokens = model.dit(
+                **dict(inputs, update_mask=None if skip_mask else inputs["update_mask"]),
+                skip_mask_out_condition=skip_mask,
             )
-    finally:
-        set_ops_config(previous)
+            # Each frame has two flattened Cx2x2 patches. Fold reconstructs
+            # the spatial grid independently of production unpatchify_video.
+            patches = video_tokens[cond_rows:].reshape(2, 2, 96).transpose(1, 2)
+            video = -F.fold(patches, output_size=(2, 4), kernel_size=2, stride=2).transpose(0, 1).unsqueeze(0)
+            audio = -torch.stack([audio_tokens[:2].T, audio_tokens[2:].T])
+            expected_predictions.extend([video, audio])
+            if not training:
+                return video, audio
+            return (
+                F.mse_loss(video, video_target) * (1.75 if weighted else 1),
+                F.mse_loss(audio, audio_target) * (2.4 if weighted else 1),
+            )
+        output = model(**ours_inputs, **public_kwargs)
+        assert len(output.predictions) == 2
+        for actual, expected in zip(output.predictions, expected_predictions, strict=True):
+            torch.testing.assert_close(actual, expected, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+        if not training:
+            assert output.loss is None
+            return tuple(output.predictions)
+        assert set(output.loss) == {"mse_video", "mse_audio"}
+        return output.loss["mse_video"], output.loss["mse_audio"]
+
+    assert_outputs_and_grads_match(reference, ours, call)
+    for key in ("x", "audio_x", "prompt_embeds"):
+        assert inputs[key].grad is not None
+        torch.testing.assert_close(ours_inputs[key].grad, inputs[key].grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
 def _tiny_attention():
-    with ops_config_scope(_sdpa_ops_config()):
-        return MiniMaxH3Attention(hidden_size=16, num_attention_heads=2, attention_head_dim=8, qk_norm_eps=1e-5)
+    cfg = _tiny_config()
+    cfg._set_ops_implementation(_sdpa_ops_config())
+    return MiniMaxH3Attention(
+        hidden_size=16, num_attention_heads=2, attention_head_dim=8, qk_norm_eps=1e-5, config=cfg
+    )
 
 
 def test_minimax_h3_packed_sdpa_matches_independent_segments():
@@ -245,8 +243,11 @@ def test_minimax_h3_sdpa_packed_uses_host_slices_not_varlen_kwargs(monkeypatch):
 def test_minimax_h3_flash2_bind_defers_until_packed_bounds():
     ops = eager_ops_config()
     ops.attn_implementation = "flash_attention_2"
-    with ops_config_scope(ops):
-        attn = MiniMaxH3Attention(hidden_size=16, num_attention_heads=2, attention_head_dim=8, qk_norm_eps=1e-5)
+    cfg = _tiny_config()
+    cfg._set_ops_implementation(ops)
+    attn = MiniMaxH3Attention(
+        hidden_size=16, num_attention_heads=2, attention_head_dim=8, qk_norm_eps=1e-5, config=cfg
+    )
     assert attn.veomni_attn.impl == "veomni_sdpa"
     assert attn.veomni_rope.op == "rope"
     assert attn.veomni_rope.variant == "partial"
@@ -326,8 +327,9 @@ def test_minimax_h3_packed_flash_zeroes_uncovered_rows():
 def test_minimax_h3_video_vae_attention_uses_partial_rope():
     from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_video_vae import Attention
 
-    with ops_config_scope(_sdpa_ops_config()):
-        attn = Attention(heads=2, dim_head=8, qk_norm_type=None)
+    cfg = _tiny_config()
+    cfg._set_ops_implementation(_sdpa_ops_config())
+    attn = Attention(heads=2, dim_head=8, qk_norm_type=None, config=cfg)
     assert attn.veomni_rope.op == "rope"
     assert attn.veomni_rope.variant == "partial"
 
@@ -361,6 +363,80 @@ def test_minimax_h3_pipeline_constructs_without_weights():
     assert callable(pipe.model_fn)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("replace_all", [False, True], ids=["sparse", "full"])
+def test_minimax_h3_pipeline_applies_cross_device_ops_before_config_validation(tmp_path, monkeypatch, replace_all):
+    """Validate the final selections while preserving file < local kwargs < pipeline priority."""
+    from veomni.arguments import OpsImplementationConfig
+    from veomni.models.diffusers.minimax_h3 import inference
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    source_ops = {"rms_norm_implementation": "liger_kernel"}
+    condition_path = tmp_path / "condition"
+    transformer_path = tmp_path / "transformer"
+    _tiny_condition_config(ops_implementation=source_ops).save_pretrained(condition_path)
+    _tiny_config(ops_implementation=source_ops).save_pretrained(transformer_path)
+
+    loaded_configs = []
+
+    def load_condition(config):
+        loaded_configs.append(config)
+        return SimpleNamespace(
+            _text_encoder=None,
+            _video_vae=None,
+            _audio_vae=None,
+            _tokenizer=None,
+            _processor=None,
+            _scheduler_video=None,
+            _scheduler_audio=None,
+            eval=lambda: None,
+        )
+
+    class ConfigsLoaded(Exception):
+        pass
+
+    def load_transformer(config, **kwargs):
+        loaded_configs.append(config)
+        raise ConfigsLoaded
+
+    monkeypatch.setattr(inference.MiniMaxH3ConditionModel, "_from_config", load_condition)
+    monkeypatch.setattr(inference.MiniMaxH3DiTModel, "_from_config", load_transformer)
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
+    if hasattr(torch, "npu"):
+        monkeypatch.setattr(torch.npu, "empty_cache", lambda: None)
+
+    load_kwargs = dict(
+        device="cpu",
+        condition_model_path=str(condition_path),
+        transformer_config_path=str(transformer_path),
+        condition_model_cfg={
+            "attn_implementation": "eager",
+            "ops_implementation": {"rotary_pos_emb_implementation": "eager"},
+        },
+        transformer_config_kwargs={
+            "attn_implementation": "eager",
+            "ops_implementation": {"rotary_pos_emb_implementation": "eager"},
+        },
+    )
+    with pytest.raises(ValueError, match="rms_norm_implementation='liger_kernel'"):
+        inference.MiniMaxH3Pipeline.from_pretrained(**load_kwargs)
+    assert loaded_configs == []
+
+    runtime_ops = {"rms_norm_implementation": "torch_npu", "attn_implementation": "sdpa"}
+    if replace_all:
+        runtime_ops = OpsImplementationConfig(**runtime_ops)
+    with pytest.raises(ConfigsLoaded):
+        inference.MiniMaxH3Pipeline.from_pretrained(**load_kwargs, ops_implementation=runtime_ops)
+    assert len(loaded_configs) == 2
+    assert all(config.ops_config.rms_norm_implementation == "torch_npu" for config in loaded_configs)
+    assert all(config.ops_config.attn_implementation == "veomni_sdpa" for config in loaded_configs)
+    if replace_all:
+        assert all("rotary_pos_emb_implementation" not in config.ops_implementation for config in loaded_configs)
+    else:
+        assert all(config.ops_config.rotary_pos_emb_implementation == "eager" for config in loaded_configs)
+
+
 def test_minimax_h3_rms_norm_matches_official():
     torch.manual_seed(0)
     official = nn.RMSNorm(16, eps=1e-6)
@@ -372,3 +448,46 @@ def test_minimax_h3_rms_norm_matches_official():
         return model(hidden)
 
     assert_outputs_and_grads_match(official, ours, call)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_native_text_encoder_adapts_qwen_config(monkeypatch):
+    from transformers import Qwen3VLConfig
+
+    from veomni.models import VeOmniPretrainedConfig
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_text_encoder as modeling
+
+    def tiny_config(**kwargs):
+        return Qwen3VLConfig(
+            text_config={
+                "vocab_size": 32,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "mrope_section": [1, 1, 2]},
+            },
+            vision_config={
+                "depth": 1,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_heads": 2,
+                "out_hidden_size": 16,
+                "patch_size": 2,
+                "temporal_patch_size": 1,
+                "spatial_merge_size": 1,
+                "num_position_embeddings": 4,
+                "deepstack_visual_indexes": [],
+            },
+        )
+
+    monkeypatch.setattr(modeling, "Qwen3VLConfig", tiny_config)
+    parent = _tiny_condition_config(ops_implementation={"attn_implementation": "sdpa"})
+    encoder = modeling.MiniMaxH3TextEncoder(num_retained_layers=1, config=parent)
+    assert isinstance(encoder.config, VeOmniPretrainedConfig)
+    assert encoder.config.text_config.ops_config.attn_implementation == "veomni_sdpa"
+    assert encoder.config.vision_config.ops_config.attn_implementation == "veomni_sdpa"
+    output = encoder.model(input_ids=torch.tensor([[1, 2, 3]]), use_cache=False)
+    assert output.last_hidden_state.shape == (1, 3, 16)

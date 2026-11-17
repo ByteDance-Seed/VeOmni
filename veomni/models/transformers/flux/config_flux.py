@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from transformers import PretrainedConfig
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
-class FluxConfig(PretrainedConfig):
+class FluxConfig(VeOmniPretrainedConfig):
     model_type = "flux"
 
     def __init__(

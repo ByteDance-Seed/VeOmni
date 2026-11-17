@@ -85,6 +85,7 @@ class CheckpointFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *args):
+        """Recompute the checkpointed forward and propagate gradients to tensor inputs."""
         if not torch.autograd._is_checkpoint_valid():
             raise RuntimeError(
                 "When use_reentrant=True, torch.utils.checkpoint is incompatible"
@@ -146,12 +147,6 @@ class CheckpointFunction(torch.autograd.Function):
             raise RuntimeError("none of output has requires_grad=True, this checkpoint() is not necessary")
         torch.autograd.backward(outputs_with_grad, args_with_grad)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached_inputs)
-
-        # The detached recomputation leaves can outlive this call through saved-variable references.
-        # Their gradients have been captured above, so release the stale references before returning.
-        for inp in detached_inputs:
-            if isinstance(inp, torch.Tensor):
-                inp.grad = None
 
         # patch code, remove the extra allgather with use_reentrant + ckpt
         if handle:

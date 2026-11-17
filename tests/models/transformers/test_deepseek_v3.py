@@ -29,7 +29,6 @@ from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCa
 from tests.models.compare import (
     assert_eager_matches_hf,
     eager_ops_config,
-    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_deepseek_v3_config as _tiny_config
 
@@ -49,11 +48,12 @@ def _dsv3_cls():
 
 
 def _build_ours(config: DeepseekV3Config, ops: SimpleNamespace | None = None):
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
-        return _dsv3_cls()(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return _dsv3_cls()(config)
 
 
 def test_deepseek_v3_eager_matches_hf():
+    """Patched DeepSeek-V3 eager forward matches upstream Hugging Face bitwise."""
     torch.manual_seed(0)
     config = _tiny_config()
     hf = HFDeepseekV3ForCausalLM(config)
@@ -64,12 +64,9 @@ def test_deepseek_v3_eager_matches_hf():
     assert_eager_matches_hf(hf, ours, input_ids=input_ids, logits_equal=True)
 
 
-@pytest.mark.parametrize(
-    ("impl", "routing_dtype"),
-    [("eager", torch.float32), ("fused_triton", torch.bfloat16)],
-)
-def test_deepseek_v3_experts_routing_weight_dtype_follows_impl(impl: str, routing_dtype: torch.dtype):
-    """Eager keeps fp32 router scores like HF. Fused kernels get the activation dtype."""
+@pytest.mark.parametrize("impl", ["eager", "fused_triton"])
+def test_deepseek_v3_experts_routing_weight_dtype_follows_impl(impl: str):
+    """Experts forward passes router scores through unchanged; ops own dtype conversion."""
     config = _tiny_config()
     model = _build_ours(config)
     experts = next(layer.mlp.experts for layer in model.model.layers if hasattr(layer.mlp, "experts"))
@@ -85,6 +82,7 @@ def test_deepseek_v3_experts_routing_weight_dtype_follows_impl(impl: str, routin
 
     class _RecordingOp:
         def __call__(self, *args, **kwargs):
+            """Record positional and keyword arguments passed to ``veomni_moe``."""
             captured["args"] = args
             captured["kwargs"] = kwargs
             return torch.zeros_like(hidden_states)
@@ -96,8 +94,9 @@ def test_deepseek_v3_experts_routing_weight_dtype_follows_impl(impl: str, routin
     args = captured["args"]
 
     assert args[0] is hidden_states
-    assert args[1].dtype == routing_dtype
-    torch.testing.assert_close(args[1], top_k_weights.to(routing_dtype), rtol=0, atol=0)
+    assert args[1] is top_k_weights
+    assert args[1].dtype == torch.float32
+    torch.testing.assert_close(args[1], top_k_weights, rtol=0, atol=0)
     assert args[2] is selected_experts
     assert captured["kwargs"] == {"num_experts": experts.num_experts}
     torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)

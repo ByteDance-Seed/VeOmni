@@ -26,7 +26,7 @@ import torch
 from PIL import Image
 from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
-from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, _OMNI_TOKEN_LEN, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from .configuration import JanusVqvaeConfig
 
@@ -96,16 +96,44 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
         image_processor: JanusVqvaeProcessor,
         dtype: Optional[torch.dtype] = None,
         dummy_pixel_values: Optional[torch.Tensor] = None,
+        num_patches: Optional[int] = None,
     ) -> None:
         self._image_processor = image_processor
         self._dtype = dtype
         self._dummy_pixel_values = dummy_pixel_values  # CPU (C, H, W), model dtype
+        # The codec's grid side length, which ``JanusImageProcessor`` does not
+        # carry: recorded by ``bind_dummy_inputs`` or read in ``from_pretrained``.
+        self._num_patches = num_patches
+
+    @property
+    def _num_image_tokens(self) -> int:
+        """VQ tokens one generation image expands to, i.e. its backbone row count.
+
+        ``vq_config.num_patches`` is the codec's grid side length, so the token
+        count is its square — recorded by ``bind_dummy_inputs`` / ``from_pretrained``.
+        A processor alias that states the count itself (``JanusVqvaeProcessor``
+        carries ``num_image_tokens``) is honoured as a fallback; with neither, this
+        raises rather than guessing.
+        """
+        if self._num_patches is not None:
+            return self._num_patches**2
+        tokens = getattr(self._image_processor, "num_image_tokens", None)
+        if tokens is None:
+            raise RuntimeError(
+                f"{type(self).__name__}: VQ grid unknown — call bind_dummy_inputs() or build through "
+                "from_pretrained() so the VQ config's num_patches is recorded."
+            )
+        return int(tokens)
 
     @classmethod
     def from_pretrained(cls, module_path: str, **kwargs: Any) -> "JanusVqvaePreprocessor":
         """Build straight from the checkpoint dir — no model instance needed."""
         del kwargs
-        return cls(JanusVqvaeProcessor.from_pretrained(module_path))
+        config = JanusVqvaeConfig.from_pretrained(module_path)
+        return cls(
+            JanusVqvaeProcessor.from_pretrained(module_path),
+            num_patches=int(config.vq_config.num_patches),
+        )
 
     def bind_dummy_inputs(self, config: JanusVqvaeConfig, dtype: Optional[torch.dtype] = None) -> None:
         """Training-only FSDP-anchor dummy — pure ``(config, dtype)`` + the already
@@ -115,13 +143,13 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
         height = size.get("height")
         width = size.get("width")
         self._dtype = dtype
+        self._num_patches = int(cfg.num_patches)
         self._dummy_pixel_values = torch.zeros(cfg.in_channels, height, width, dtype=dtype)
 
     def preprocess_conversations(
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        saw_real_image = False
         for sample in conversation_list:
             sample_image_items = [
                 it for it in iter_desired_items([sample], types=["image"], roles=["assistant"]) if not it.is_dummy
@@ -135,25 +163,31 @@ class JanusVqvaePreprocessor(ModulePreprocessorBase):
                 )["pixel_values"]
                 for it, px in zip(sample_image_items, pixel_values, strict=True):
                     it.value = px.to(dtype=self._dtype)
-                saw_real_image = True
-
-        if inference or saw_real_image:
-            return
-        if self._dummy_pixel_values is None:
-            raise RuntimeError(
-                f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
-                "before training use (pure inference never reaches this branch)."
+                    # A generation image occupies one VQ token per codebook row, which
+                    # is what the backbone sees once the codec has emitted them.
+                    it.meta[_OMNI_TOKEN_LEN] = self._num_image_tokens
+                continue
+            if inference:
+                continue
+            if self._dummy_pixel_values is None:
+                raise RuntimeError(
+                    f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
+                    "before training use (pure inference never reaches this branch)."
+                )
+            # Per sample: the codec still runs on a step with no real target so its
+            # FSDP collectives stay in step with the other ranks.
+            sample.append(
+                ConversationItem(
+                    type="image",
+                    value=self._dummy_pixel_values,
+                    role="assistant",
+                    is_dummy=True,
+                    meta={
+                        _IMG_TAG_KEY: "gen",
+                        _OMNI_TOKEN_LEN: self._num_image_tokens,
+                    },
+                )
             )
-        self.append_batch_anchor(
-            conversation_list,
-            ConversationItem(
-                type="image",
-                value=self._dummy_pixel_values,
-                role="assistant",
-                is_dummy=True,
-                meta={_IMG_TAG_KEY: "gen"},
-            ),
-        )
 
 
 __all__ = ["JanusVqvaeProcessor", "JanusVqvaePreprocessor"]

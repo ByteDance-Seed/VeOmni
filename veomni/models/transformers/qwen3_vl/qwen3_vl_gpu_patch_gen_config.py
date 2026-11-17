@@ -29,8 +29,9 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.modeling_utils import (
     is_flash_attention_requested,
 )
@@ -50,9 +51,8 @@ from veomni.distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -65,6 +65,10 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_vl_gpu.py",
     description="Qwen3-VL with VeOmni v5 patches and VeomniOp replacements",
 )
+
+config.drop_import_names("PreTrainedModel", "create_causal_mask")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
 # Surface ``Qwen3VLCausalLMOutputWithLogProbs`` so the patched multimodal
 # ``forward`` can return per-token log-probs / entropy as constructor fields
 # while preserving ``rope_deltas``. Mutating ``output.log_probs`` /
@@ -117,23 +121,23 @@ from veomni.utils.model_outputs import (  # noqa: F401  surfaced for forward log
     Qwen3VLCausalLMOutputWithLogProbs,
 )
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.models.loss_utils import ForCausalLMLoss
 """)
 
 config.add_import("veomni.ops", names=["VeomniOp"])
 config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
-config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
 )
+# Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
+# packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
+# (FlexAttention BlockMask / MagiAttentionMask / dense 4D mask) once in
+# ``Qwen3VLTextModel.forward`` instead of building an unisolated HF mask or
+# rebuilding a 4D mask inside every decoder layer.
 config.add_import(
-    "veomni.models.utils.attention_utils",
-    names=["prepare_dense_attention_inputs"],
+    "veomni.models.utils.mask_utils",
+    names=["create_causal_mask"],
 )
 
 
@@ -144,11 +148,12 @@ config.add_import(
     "Qwen3VLTextRMSNorm.__init__",
     description="Construct a local rms_norm VeomniOp",
 )
-def qwen3_vl_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+def qwen3_vl_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+    impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
 
 @config.override_method(
@@ -172,7 +177,141 @@ def qwen3_vl_text_mlp_init_patched(self, config, intermediate_size=None):
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+
+
+@config.override_method(
+    "Qwen3VLTextDecoderLayer.__init__",
+    description="Pass config to Qwen3VLTextRMSNorm instances",
+)
+def qwen3_vl_text_decoder_layer_init_patched(self, config, layer_idx: int):
+    super().__init__()
+    self.hidden_size = config.hidden_size
+    self.self_attn = Qwen3VLTextAttention(config=config, layer_idx=layer_idx)
+    self.mlp = Qwen3VLTextMLP(config)
+    self.input_layernorm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.post_attention_layernorm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+
+
+@config.override_method(
+    "Qwen3VLTextModel.__init__",
+    description="Pass config to final Qwen3VLTextRMSNorm",
+)
+def qwen3_vl_text_model_init_patched(self, config):
+    super().__init__(config)
+    self.padding_idx = config.pad_token_id
+    self.vocab_size = config.vocab_size
+
+    self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+    self.layers = nn.ModuleList(
+        [Qwen3VLTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+    )
+    self.norm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=config)
+    self.gradient_checkpointing = False
+
+    self.post_init()
+
+
+# ================================================================
+# Patch: Qwen3VLTextModel.forward
+# 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+#    into ``veomni.models.utils.mask_utils.create_causal_mask`` so packed
+#    sequences build an isolated mask once in the model forward
+# ================================================================
+@config.override_method(
+    "Qwen3VLTextModel.forward",
+    description="Forward packed sequence metadata to VeOmni mask builders",
+)
+def qwen3_vl_text_model_forward_patched(
+    self,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    use_cache: bool | None = None,
+    # args for deepstack
+    visual_pos_masks: torch.Tensor | None = None,
+    deepstack_visual_embeds: list[torch.Tensor] | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple | BaseModelOutputWithPast:
+    r"""
+    visual_pos_masks (`torch.Tensor` of shape `(batch_size, seqlen)`, *optional*):
+        The mask of the visual positions.
+    deepstack_visual_embeds (`list[torch.Tensor]`, *optional*):
+        The deepstack visual embeddings. The shape is (num_layers, visual_seqlen, embed_dim).
+        The feature is extracted from the different visual encoder layers, and fed to the decoder
+        hidden states. It's from the paper DeepStack(https://arxiv.org/abs/2406.04334).
+    """
+    if (input_ids is None) ^ (inputs_embeds is not None):
+        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+    # torch.jit.trace() doesn't support cache objects in the output
+    if use_cache and past_key_values is None and not torch.jit.is_tracing():
+        past_key_values = DynamicCache(config=self.config)
+
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_tokens(input_ids)
+
+    # the hard coded `4` is for text, temporal, height and width.
+    if position_ids is None:
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+        position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+    elif position_ids.ndim == 2:
+        position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
+
+    if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+        text_position_ids = position_ids[0]
+        position_ids = position_ids[1:]
+    else:
+        text_position_ids = None
+
+    # --- Patch.1 ---
+    attention_mask = create_causal_mask(
+        **{
+            **kwargs,
+            "config": self.config,
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": text_position_ids,
+        }
+    )
+    # --- Patch.1 ---
+
+    hidden_states = inputs_embeds
+
+    # create position embeddings to be shared across the decoder layers
+    position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+    # decoder layers
+    for layer_idx, decoder_layer in enumerate(self.layers):
+        layer_outputs = decoder_layer(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=text_position_ids,
+            past_key_values=past_key_values,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = layer_outputs
+
+        # add visual features to the hidden states of first several layers
+        if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
+            hidden_states = self._deepstack_process(
+                hidden_states,
+                visual_pos_masks,
+                deepstack_visual_embeds[layer_idx],
+            )
+
+    hidden_states = self.norm(hidden_states)
+
+    return BaseModelOutputWithPast(
+        last_hidden_state=hidden_states,
+        past_key_values=past_key_values,
+    )
 
 
 @config.override_method(
@@ -247,7 +386,7 @@ def _qwen3_vl_async_ulysses_attention_forward(
     if not is_flash_attention_requested(self.config):
         raise ValueError(
             "Async Ulysses attention only supports flash attention implementations. "
-            f"Current implementation: '{self.config._attn_implementation}'. "
+            f"Current implementation: '{self.config.ops_config.attn_implementation}'. "
             "Please set attn_implementation to a flash attention variant or disable async Ulysses."
         )
 
@@ -407,8 +546,8 @@ def collate_multimodal_metadata(batch, sp_pad):
 @config.modify_init("Qwen3VLVisionAttention", description="Bind instance-local rope and attention VeomniOps")
 def qwen3_vl_vision_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_vision_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
@@ -869,11 +1008,33 @@ def qwen3_vl_vision_dummy_forward_patched(self):
 #    `get_parallel_state().async_enabled` is True; otherwise fall
 #    through to the upstream logic unchanged
 # ================================================================
-@config.modify_init("Qwen3VLTextAttention", description="Bind instance-local rope and attention VeomniOps")
-def qwen3_vl_text_attention_bind_ops(original_init, self, *args, **kwargs):
-    original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+@config.override_method(
+    "Qwen3VLTextAttention.__init__",
+    description="Pass config to Qwen3VLTextRMSNorm and bind instance-local rope and attention VeomniOps",
+)
+def qwen3_vl_text_attention_bind_ops(self, config, layer_idx: int):
+    nn.Module.__init__(self)
+    self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
+    self.config = config
+    self.layer_idx = layer_idx
+    self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+    self.scaling = self.head_dim**-0.5
+    self.attention_dropout = config.attention_dropout
+    self.is_causal = True
+
+    self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias)
+    self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+    self.q_norm = Qwen3VLTextRMSNorm(
+        self.head_dim, eps=config.rms_norm_eps, config=config
+    )  # unlike olmo, only on the head dim!
+    self.k_norm = Qwen3VLTextRMSNorm(
+        self.head_dim, eps=config.rms_norm_eps, config=config
+    )  # thus post q_norm does not need reshape
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
@@ -914,15 +1075,7 @@ def qwen3_vl_text_attention_forward_patched(
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-    attention_interface = self.veomni_attn
-    attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-        kwargs,
-        impl=attention_interface.impl,
-        attention_mask=attention_mask,
-        hidden_states=hidden_states,
-    )
-
-    attn_output, attn_weights = attention_interface(
+    attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
         key_states,
@@ -930,7 +1083,7 @@ def qwen3_vl_text_attention_forward_patched(
         attention_mask,
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
-        **attn_kwargs,
+        **kwargs,
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -1423,7 +1576,7 @@ def qwen3_vl_for_conditional_generation_init_patched(self, config):
     super().__init__(config)
     self.model = Qwen3VLModel(config)
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
