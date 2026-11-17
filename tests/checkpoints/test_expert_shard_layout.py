@@ -36,6 +36,7 @@ from veomni.checkpoint.dcp_checkpointer import (
     drop_extra_parallel_dim,
     restore_extra_parallel_dim,
 )
+from veomni.checkpoint.layout import weights_dir
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -198,6 +199,7 @@ def _layout_worker(rank, world, directory, rendezvous):
         # The public model-only load/export paths accept the same independently
         # verified declaration; unknown source and optimizer restore stay closed.
         path = directory + "known_legacy_model_only"
+        weights_path = weights_dir(path)
         bf16_bias = torch.tensor([0.25, -0.5], dtype=torch.bfloat16)
         gdn_a = torch.tensor([0.12345679], dtype=torch.float32)
         gdn_dt = torch.tensor([-0.07456543], dtype=torch.float32)
@@ -210,7 +212,7 @@ def _layout_worker(rank, world, directory, rendezvous):
                     "layers.0.linear_attn.dt_bias": gdn_dt,
                 }
             },
-            checkpoint_id=path,
+            checkpoint_id=weights_path,
         )
 
         def make_qwen_target():
@@ -256,10 +258,10 @@ def _layout_worker(rank, world, directory, rendezvous):
             from veomni.checkpoint import ckpt_to_state_dict
 
             with pytest.raises(RuntimeError, match="Cannot determine source expert order"):
-                dcp_to_torch_state_dict(path)
-            exported = dcp_to_torch_state_dict(path, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1")
+                dcp_to_torch_state_dict(weights_path)
+            exported = dcp_to_torch_state_dict(weights_path, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1")
             torch.testing.assert_close(exported["layer.experts.weight"], global_weight, rtol=0, atol=0)
-            exported = ckpt_to_state_dict(path, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1")
+            exported = ckpt_to_state_dict(weights_path, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1")
             torch.testing.assert_close(exported["layer.experts.weight"], global_weight, rtol=0, atol=0)
             torch.testing.assert_close(exported["layer.bias"], bf16_bias, rtol=0, atol=0)
             assert exported["layer.experts.weight"].dtype == torch.float32
@@ -329,6 +331,7 @@ def _layout_worker(rank, world, directory, rendezvous):
 
         # A trusted legacy expert declaration must not waive GDN precision.
         path = directory + "known_legacy_bf16_gdn"
+        weights_path = weights_dir(path)
         dcp.save(
             {
                 "model": {
@@ -337,7 +340,7 @@ def _layout_worker(rank, world, directory, rendezvous):
                     "layers.0.linear_attn.dt_bias": gdn_dt,
                 }
             },
-            checkpoint_id=path,
+            checkpoint_id=weights_path,
         )
         target = {
             "model": {
@@ -349,7 +352,7 @@ def _layout_worker(rank, world, directory, rendezvous):
         with pytest.raises(dcp.CheckpointException, match="Qwen4 GDN parameter"):
             dcp.load(
                 target,
-                checkpoint_id=path,
+                checkpoint_id=weights_path,
                 planner=_ModelStrictLoadPlanner(
                     strict_model=True,
                     strict_gdn_fp32=True,

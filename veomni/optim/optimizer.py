@@ -22,7 +22,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
-from functools import wraps
+from functools import partial, wraps
 from itertools import chain
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -405,6 +405,19 @@ class AnyPrecisionAdamW(Optimizer):
                     p.data.addcdiv_(exp_avg, centered_variance, value=-step_size)
 
 
+def _validate_optimizer_serializer(opt):
+    """Reject instance wrappers that can rewrite packed parameter IDs."""
+    state_dict_fn = _state_dict_fn(opt, "state_dict")
+    if "state_dict" in vars(opt) and not (
+        isinstance(state_dict_fn, partial)
+        and state_dict_fn.func is type(opt).state_dict
+        and not state_dict_fn.args
+        and set(state_dict_fn.keywords or ()) == {"self"}
+        and state_dict_fn.keywords["self"] is opt
+    ):
+        raise RuntimeError("Cannot prove optimizer parameter IDs for an instance-patched state_dict")
+
+
 def _empty_optimizer_state_dict(model, opt):
     packed_groups = []
     id_to_name = {}
@@ -650,6 +663,7 @@ class MultiOptimizer(Optimizer, Stateful):
             error, sd = None, None
             try:
                 opt = self.optimizers_dict.get(name)
+                _validate_optimizer_serializer(opt)
                 from .checkpoint_adapter import rank_local_adamw_context
 
                 with rank_local_adamw_context(opt), _dcp_swap_load_template(opt):
