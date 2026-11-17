@@ -246,8 +246,8 @@ where needed to distinguish executions. Include parameter IDs where applicable;
 non-parameterized node IDs are valid, including for single-configuration cases.
 Require an executable CI gate to match a separate JUnit/result record to every
 required pair. A passing result for one configuration must not satisfy another
-configuration running the same node ID. Reject
-missing, deselected, skipped, failed or errored cases even when other cases pass.
+configuration running the same node ID. Reject missing, deselected, skipped,
+failed or errored cases even when other cases pass.
 Allowed skips apply only to explicitly optional cases. If the gate is missing
 or unverified, report coverage as incomplete rather than validated-and-wired.
 Evaluate conditional required pairs only when their predicate is active; record
@@ -268,7 +268,9 @@ generated or modified Python file, including final newlines and top-level
 spacing. Rerun these checks after any later generated output. Run related
 original coverage against the final tree and repository quality checks; report
 pre-existing failures separately and do not claim a clean gate while they remain.
-Compare file/node IDs, not only totals. Map renamed/parameterized tests explicitly.
+Compare `(execution configuration, full pytest node ID)` pairs, not only totals.
+Preserve the job, matrix, manifest selection and environment distinctions used
+by the required-case gate. Map renamed/parameterized tests explicitly.
 If the user limits validation, record what was omitted without claiming success.
 
 Check every final claim against source selection, logs and JUnit. Keep one

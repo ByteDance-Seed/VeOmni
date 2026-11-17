@@ -198,9 +198,9 @@ non-parameterized node IDs are valid, including for single-configuration cases.
 Do not derive the required set from only the results that happened to pass.
 Make the CI gate match a separate JUnit/result record to every required pair.
 A passing result for one configuration must not satisfy another configuration
-running the same node ID. Fail
-if any required case is missing, deselected, skipped, failed or errored, even if
-other cases in the directory pass. Allowed skips must name optional cases only
+running the same node ID. Fail if any required case is missing, deselected,
+skipped, failed or errored, even if other cases in the directory pass.
+Allowed skips must name optional cases only
 and cannot waive required coverage. Preserve this check as an executable gate,
 not just a report instruction; if it is not implemented or verified, mark the
 coverage gate incomplete. For conditional selections, evaluate required pairs
@@ -239,8 +239,10 @@ CPU contracts, mocked behavior, real NPU numerics and distributed ST separately.
 
 ## Phase 4: Regression and Delivery
 
-1. Run baseline-related coverage against the final tree and compare by file/node ID.
-   Account explicitly for renamed or newly parameterized tests.
+1. Run baseline-related coverage against the final tree and compare by
+   `(execution configuration, full pytest node ID)`, not only totals. Preserve the
+   job, matrix, manifest selection and environment distinctions used by the
+   required-case gate. Account explicitly for renamed or newly parameterized tests.
 2. After the final generation/edit, run the repository formatter and lint on
    every generated or modified Python file, then the repository quality checks
    and relevant helper checks. Preserve a final newline and top-level spacing;
