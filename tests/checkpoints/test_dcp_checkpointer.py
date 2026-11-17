@@ -1245,6 +1245,7 @@ class TestWaitForPendingSave:
 
         DistributedCheckpointer._save_futures = {}
         DistributedCheckpointer._async_process_groups = {}
+        DistributedCheckpointer._async_save_failed = False
 
     def test_noop_when_no_pending_save(self):
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
@@ -1444,7 +1445,7 @@ class TestWaitForPendingSave:
         for slot in ("ckpt", "optimizer"):
             DistributedCheckpointer.execute_save(
                 save_state={},
-                storage_writer=MagicMock(),
+                storage_writer=MagicMock(spec=dcp.FileSystemWriter),
                 save_async=True,
                 slot=slot,
             )
@@ -1472,7 +1473,11 @@ class TestWaitForPendingSave:
         DistributedCheckpointer._async_process_groups = {}
         try:
             DistributedCheckpointer.execute_save(
-                save_state={}, storage_writer=MagicMock(), save_async=True, slot="ckpt", timeout_seconds=1800
+                save_state={},
+                storage_writer=MagicMock(spec=dcp.FileSystemWriter),
+                save_async=True,
+                slot="ckpt",
+                timeout_seconds=1800,
             )
             assert mock_dist.new_group.call_args.kwargs == {"backend": "gloo", "timeout": timedelta(seconds=1800)}
         finally:
@@ -2614,7 +2619,8 @@ class TestStageDirValidation:
             patch("veomni.checkpoint.dcp_checkpointer.dist.get_rank", return_value=1),
             patch("veomni.checkpoint.dcp_checkpointer._checkpoint_optimizer_policy", return_value=(None, False)),
             patch("veomni.checkpoint.dcp_checkpointer._reject_unproven_extra_parallel_optimizer"),
-            patch("veomni.utils.dist_utils.any_rank_failed", return_value=True),
+            patch("veomni.utils.dist_utils.any_rank_failed", side_effect=[False, True, True]),
+            patch.object(DistributedCheckpointer, "_async_save_failed", False),
             patch.object(DistributedCheckpointer, "execute_save") as execute_save,
         ):
             with pytest.raises(RuntimeError, match="removing the old DCP markers"):
@@ -3036,6 +3042,32 @@ class TestShardingPlanDropHfKeys:
 
         assert set(plan) == set(expected)
         assert size == expected_size
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_split_dcp_prepares_lazy_adam_only_after_loading_model(tmp_path):
+    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+    class Pair(nn.Module):
+        def __init__(self, unused):
+            super().__init__()
+            self.used = nn.Parameter(torch.tensor([2.0]))
+            self.unused = nn.Parameter(torch.tensor([unused]))
+
+    original = Pair(4.0)
+    optimizer = torch.optim.Adam(original.parameters(), lr=0.1, weight_decay=0.5, foreach=False)
+    original.used.grad = torch.ones_like(original.used)
+    optimizer.step()
+    assert original.unused not in optimizer.state
+    DistributedCheckpointer.save(str(tmp_path), {"model": original, "optimizer": optimizer})
+
+    restored = Pair(100.0)
+    resumed_optimizer = torch.optim.Adam(restored.parameters(), lr=0.1, weight_decay=0.5, foreach=False)
+    DistributedCheckpointer.load(str(tmp_path), {"model": restored, "optimizer": resumed_optimizer})
+    torch.testing.assert_close(restored.unused, original.unused, rtol=0, atol=0)
+    # PyTorch's legacy synthetic state initialization for missing entries is
+    # still approximate; this checks it sees the restored value, not 100.0.
+    torch.testing.assert_close(resumed_optimizer.state[restored.unused]["exp_avg"], torch.tensor([0.2]))
 
 
 def _marker_validation_worker(rank: int, world_size: int, base: str, endpoint) -> None:

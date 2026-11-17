@@ -175,6 +175,17 @@ class _VisionTokenizer:
         return [ord(c) % 97 for c in text]
 
 
+def test_chatml_declares_unpadded_output():
+    template = build_chat_template("chatml", _VisionTokenizer())
+    assert type(template).__dict__["dpo_unpadded_output_contract"] is True
+    assert type(template).__dict__["dpo_unpadded_output_contract_id"] == "veomni.chatml.v1"
+    messages = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "answer"}]
+    for limit in (4, 128):
+        encoded = template.encode_messages(messages, max_seq_len=limit)
+        assert len(encoded["input_ids"]) == len(encoded["labels"]) == len(encoded["attention_mask"])
+        assert all(value == 1 for value in encoded["attention_mask"])
+
+
 def test_qwen2_5vl_is_an_alias_of_qwen2vl():
     # The two names must share one class; a copy would let the two drift apart.
     assert CHAT_TEMPLATE_REGISTRY["qwen2_5vl"] is CHAT_TEMPLATE_REGISTRY["qwen2vl"]

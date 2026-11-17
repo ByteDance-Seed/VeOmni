@@ -52,6 +52,8 @@ def same_checkpoint_path(left, right) -> bool:
             return urlunsplit(
                 (parsed.scheme.lower(), parsed.netloc, posixpath.normpath(parsed.path), parsed.query, parsed.fragment)
             )
+        # Resolve symlinks before collapsing `..`: abspath alone can map two
+        # different existing checkpoints to the same textual path.
         return os.path.realpath(raw)
 
     left_normalized, right_normalized = normalize(left), normalize(right)

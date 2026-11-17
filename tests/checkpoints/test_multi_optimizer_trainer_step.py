@@ -4,6 +4,7 @@
 """Trainer state must match the optimizer step restored from DCP."""
 
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -14,10 +15,19 @@ import torch.distributed as dist
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.checkpoints.test_checkpoint_callback import _make_mock_trainer
 from tests.tools.launch_utils import spawn_with_rendezvous
+from veomni.checkpoint import layout
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def _complete_stub_checkpoint(path, world_size):
+    weights = Path(layout.weights_dir(str(path)))
+    weights.mkdir(parents=True, exist_ok=True)
+    (weights / layout.DCP_MARKER_FILENAME).touch()
+    layout.write_manifest(str(path), global_step=3, world_size=world_size)
+    assert layout.checkpoint_is_complete(str(path))
 
 
 def _trainer(tmp_path, *, optimizer_step=3, strict=True):
@@ -54,6 +64,7 @@ def _trainer(tmp_path, *, optimizer_step=3, strict=True):
     ],
 )
 def test_trainer_state_cannot_silently_diverge_from_restored_optimizer(tmp_path, mode):
+    _complete_stub_checkpoint(tmp_path, world_size=1)
     trainer = _trainer(tmp_path, strict=mode != "legacy_missing")
     if mode == "optimizer_step_missing":
         trainer.model.checkpoint._loaded_optimizer_global_step = None
@@ -66,6 +77,7 @@ def test_trainer_state_cannot_silently_diverge_from_restored_optimizer(tmp_path,
         else {
             "global_step": 4 if mode == "wrong_step" else 3,
             "_veomni_optimizer_generations": {"model": "generation"},
+            "torch_rng_state": torch.get_rng_state(),
         }
     )
     if mode == "invalid_step":
@@ -87,10 +99,17 @@ def test_trainer_state_cannot_silently_diverge_from_restored_optimizer(tmp_path,
             "cursor_generation_missing",
             "cursor_generation_wrong",
         ):
-            with pytest.raises(
-                RuntimeError,
-                match="Trainer state is missing|checkpoint steps differ|step is missing|step or generation|generations differ",
-            ):
+            expected = {
+                "missing": (RuntimeError, "Trainer state is missing"),
+                "wrong_step": (ValueError, "checkpoint steps differ"),
+                "invalid_step": (ValueError, "global_step must be a non-negative integer"),
+                "optimizer_step_missing": (RuntimeError, "optimizer checkpoint steps"),
+                "generation_missing": (RuntimeError, "proven optimizer checkpoint generation"),
+                "cursor_generation_missing": (ValueError, "generations differ"),
+                "cursor_generation_wrong": (ValueError, "generations differ"),
+            }
+            error_type, message = expected[mode]
+            with pytest.raises(error_type, match=message):
                 callback.load_global_state()
             assert trainer.state.global_step == 0
         else:
@@ -143,21 +162,21 @@ def test_real_dcp_with_scheduler_requires_matching_trainer_generation(tmp_path, 
             source.lr_scheduler.step()
         manager.save_dcp(TrainerState(global_step=3))
         source.checkpoint = manager
-        if mode == "matching":
-            source_trainer = _make_mock_trainer(save_path=str(tmp_path))
-            source_trainer.model = source
-            source_trainer.train_dataloader = None
-            source_trainer.data_iterator = SimpleNamespace(state_dict=lambda: {})
-            source_trainer.environ_meter.state_dict.return_value = {}
-            source_trainer.channel_loss_callback = None
-            source_trainer.offline_cache_writer = None
-            GlobalStateCallback(source_trainer).save_global_state(TrainerState(global_step=3))
-        elif mode == "stale_generation":
-            sidecar = layout.extra_state_path(str(tmp_path / "global_step_3"), 0)
-            import os
-
-            os.makedirs(os.path.dirname(sidecar), exist_ok=True)
-            torch.save({"global_step": 3, "_veomni_optimizer_generations": {"model": "stale"}}, sidecar)
+        source_trainer = _make_mock_trainer(save_path=str(tmp_path))
+        source_trainer.model = source
+        source_trainer.train_dataloader = None
+        source_trainer.data_iterator = SimpleNamespace(state_dict=lambda: {})
+        source_trainer.environ_meter.state_dict.return_value = {}
+        source_trainer.channel_loss_callback = None
+        source_trainer.offline_cache_writer = None
+        GlobalStateCallback(source_trainer).save_global_state(TrainerState(global_step=3))
+        sidecar = Path(layout.extra_state_path(str(tmp_path / "global_step_3"), 0))
+        if mode == "stale_generation":
+            cursor = torch.load(sidecar, map_location="cpu", weights_only=False)
+            cursor["_veomni_optimizer_generations"] = {"model": "stale"}
+            torch.save(cursor, sidecar)
+        elif mode == "missing":
+            sidecar.unlink()
         target = build(instrumented in ("target", "both"))
         target.train_args.checkpoint.load_path = str(tmp_path / "global_step_3")
         target.checkpoint = ModelCheckpointManager(target)
@@ -181,7 +200,7 @@ def test_real_dcp_with_scheduler_requires_matching_trainer_generation(tmp_path, 
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert target.lr_scheduler["model"].get_last_lr() == source.lr_scheduler["model"].get_last_lr()
     else:
-        with pytest.raises(RuntimeError, match="Trainer state is missing|generations differ"):
+        with pytest.raises((RuntimeError, ValueError), match="Trainer state is missing|generations differ"):
             GlobalStateCallback(trainer).load_global_state()
         assert trainer.state.global_step == 0
     assert target.lr_scheduler["model"].last_epoch == (4 if mode == "matching" else 3)
@@ -306,10 +325,15 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
         _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")
+        if rank == 0:
+            _complete_stub_checkpoint(tmp_path, world_size=2)
+        dist.barrier()
         step = 4 if mode == "optimizer_step" and rank == 1 else 3
-        trainer = _trainer(tmp_path, optimizer_step=step)
+        trainer = _trainer(tmp_path, optimizer_step=step, strict=True)
         trainer.args.train.global_rank = rank
         trainer.args.train.world_size = 2
+        if mode == "asymmetric_generations" and rank == 1:
+            trainer.model.checkpoint._loaded_optimizer_generation = "different-generation"
         if mode in ("asymmetric_loader", "asymmetric_loader_error"):
             trainer.args.train_steps = 3
 
@@ -328,6 +352,7 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
 
             trainer.train_dataloader = Loader() if rank == 0 else None
         callback = GlobalStateCallback(trainer)
+        rng_before_resume = torch.get_rng_state().clone()
         state = (
             None
             if mode == "missing" and rank == 1
@@ -336,6 +361,7 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
                 "_veomni_optimizer_generations": {
                     "model": "older" if mode == "trainer_generation" and rank == 1 else "generation"
                 },
+                "torch_rng_state": torch.get_rng_state(),
                 "train_dataloader": {"cursor": 2},
             }
         )
@@ -350,19 +376,32 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
                 with pytest.raises((ValueError, RuntimeError), match="iterator failure|restored data iterator"):
                     callback.load_global_state()
             else:
-                with pytest.raises(
-                    RuntimeError,
-                    match="Trainer state is missing|checkpoint steps differ|steps differ across ranks|"
-                    "generations differ|checking the trainer checkpoint step failed on another rank",
-                ):
+                expected = {
+                    "missing": (RuntimeError, "Trainer state is missing"),
+                    "asymmetric_generations": (RuntimeError, "checkpoint generations differ across ranks"),
+                    "optimizer_step": (RuntimeError, "Restored training position differs across ranks"),
+                    "trainer_step": (
+                        (ValueError, "checkpoint steps differ")
+                        if rank == 1
+                        else (RuntimeError, "validating the training data cursor failed on another rank")
+                    ),
+                    "trainer_generation": (
+                        (ValueError, "generations differ")
+                        if rank == 1
+                        else (RuntimeError, "validating the training data cursor failed on another rank")
+                    ),
+                }
+                error_type, message = expected[mode]
+                with pytest.raises(error_type, match=message):
                     callback.load_global_state()
                 assert trainer.state.global_step == 0
-        if mode in ("asymmetric_loader", "asymmetric_loader_error"):
-            if rank == 0:
-                assert trainer.train_dataloader.iterations == 1
-            value = torch.ones(1)
-            dist.all_reduce(value)
-            assert value.item() == 2
+                if mode == "asymmetric_generations":
+                    assert torch.equal(torch.get_rng_state(), rng_before_resume)
+        if mode in ("asymmetric_loader", "asymmetric_loader_error") and rank == 0:
+            assert trainer.train_dataloader.iterations == 1
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
     finally:
         clear_parallel_state()
         dist.destroy_process_group()
@@ -379,10 +418,88 @@ def _resume_worker(rank, tmp_path, mode, endpoint):
         "matching",
         "asymmetric_loader",
         "asymmetric_loader_error",
+        "asymmetric_generations",
     ],
 )
 def test_multi_optimizer_trainer_resume_is_rank_coordinated(tmp_path, mode):
     spawn_with_rendezvous(_resume_worker, args=(str(tmp_path), mode), nprocs=2)
+
+
+def _asymmetric_loader_epoch_worker(rank, tmp_path, multi, same_output, endpoint):
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+
+    class Loader:
+        def __init__(self):
+            self.position = None
+            self.iterations = 0
+
+        def load_state_dict(self, state):
+            self.position = state["position"]
+
+        def __iter__(self):
+            self.iterations += 1
+            return iter(())
+
+    class Owner:
+        def __init__(self, runtime, path):
+            self.runtime = runtime
+            self._loaded_optimizer_global_step = 3 if multi else None
+            self._loaded_optimizer_generation = "generation" if multi else None
+            self._loaded_checkpoint_path = path
+            self.confirmed = False
+
+        def confirm_loaded_checkpoint_for_reuse(self, step, generation):
+            assert (step, generation) == (3, "generation")
+            self.confirmed = True
+
+        def confirm_legacy_loaded_checkpoint_for_reuse(self, step, path):
+            assert (step, path) == (3, self._loaded_checkpoint_path)
+            self.confirmed = True
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")
+        root = Path(tmp_path)
+        load_path = layout.step_dir(str(root), 3) if same_output else str(root / "other-output")
+        if rank == 0:
+            _complete_stub_checkpoint(load_path, world_size=2)
+        dist.barrier()
+        trainer = _trainer(root, strict=multi)
+        trainer.args.train.checkpoint.load_path = load_path
+        trainer.args.train.global_rank = rank
+        trainer.args.train.world_size = 2
+        trainer.args.train_steps = 3
+        trainer.train_dataloader = Loader() if rank == 0 else None
+        trainer.data_iterator = None
+        owner = trainer.model.checkpoint = Owner(trainer.model, load_path)
+        state = {
+            "global_step": 3,
+            "_veomni_optimizer_generations": {"model": "generation"},
+            "torch_rng_state": torch.get_rng_state(),
+            "train_dataloader": {"position": 7} if rank == 0 else None,
+        }
+        callback = GlobalStateCallback(trainer)
+        with patch.object(callback, "_read_current", return_value=state):
+            callback.load_global_state()
+        assert trainer.state.global_step == 3
+        assert trainer.start_step == 0
+        if rank == 0:
+            assert trainer.train_dataloader.position == 7
+            assert trainer.train_dataloader.iterations == 1
+        assert owner.confirmed is same_output
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == 2
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("same_output", [False, True])
+def test_epoch_resume_coordinates_ranks_without_a_local_loader(tmp_path, multi, same_output):
+    spawn_with_rendezvous(_asymmetric_loader_epoch_worker, args=(str(tmp_path), multi, same_output), nprocs=2)
 
 
 def _save_failure_worker(rank, tmp_path, mode, endpoint):
@@ -404,6 +521,14 @@ def _save_failure_worker(rank, tmp_path, mode, endpoint):
         callback = GlobalStateCallback(trainer)
         if mode == "cursor" and rank == 1:
             callback.state_dict = lambda _: (_ for _ in ()).throw(ValueError("injected cursor failure"))
+        if rank == 0:
+            expected = (RuntimeError, "(collecting|preparing) trainer checkpoint state failed on another rank")
+        elif mode == "cursor":
+            expected = (ValueError, "injected cursor failure")
+        elif mode == "generation_fatal":
+            expected = (SystemExit, "injected generation failure")
+        else:
+            expected = (RuntimeError, "matching same-step MultiOptimizer checkpoint generation")
         inject = (
             patch(
                 "veomni.trainer.callbacks.global_state_callback._saved_multi_optimizer_generations",
@@ -412,13 +537,7 @@ def _save_failure_worker(rank, tmp_path, mode, endpoint):
             if mode == "generation_fatal" and rank == 1
             else nullcontext()
         )
-        with (
-            inject,
-            pytest.raises(
-                (RuntimeError, ValueError, SystemExit),
-                match="trainer checkpoint state|injected cursor failure|generation",
-            ),
-        ):
+        with inject, pytest.raises(expected[0], match=expected[1]):
             callback.save_global_state(TrainerState(global_step=3))
         dist.barrier()
         assert not (tmp_path / "global_step_3").exists()

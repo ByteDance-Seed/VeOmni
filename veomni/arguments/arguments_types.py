@@ -2234,6 +2234,36 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
+    resume_input_contract: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Caller-attested SHA256 identity of the immutable input snapshot, tokenizer, collator and "
+                "deterministic data transforms. "
+                "Required to resume a main-process dynamic batching cursor exactly."
+            )
+        },
+    )
+    resume_input_deterministic: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Attest that input decoding, preprocessing, tokenization and collation are deterministic and "
+                "semantically stateless: they neither depend on untracked mutable state nor consume untracked "
+                "worker RNG state. The input contract must identify the immutable data snapshot."
+            )
+        },
+    )
+    resume_replay_timeout_seconds: int = field(
+        default=7200,
+        metadata={
+            "help": (
+                "Timeout in seconds for each worker response during exact streaming replay. Rank coordination "
+                "uses (num_workers + 1) times this value plus 30 seconds. Replay can reread all source rows "
+                "consumed in the saved epoch."
+            )
+        },
+    )
     data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},
@@ -2278,6 +2308,8 @@ class DataArguments:
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
 
     def __post_init__(self):
+        if type(self.resume_replay_timeout_seconds) is not int or self.resume_replay_timeout_seconds <= 0:
+            raise ValueError("resume_replay_timeout_seconds must be a positive integer")
         self.enable_multisource = self.train_path.endswith(".yaml")
 
         if self.enable_multisource:

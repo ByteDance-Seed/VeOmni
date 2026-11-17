@@ -5,6 +5,11 @@ under `output_dir/checkpoints/global_step_{N}/` (`train.checkpoint.save_path`);
 the model assets are written once to `output_dir/model_assets/`
 (`output_dir/model_assets/<module>/` in a [multi-module job](#multi-module-jobs-seedomni)).
 
+All ranks must use the same checkpoint paths, save schedule and model/parallel
+configuration. The trainer does not compare a copy of that shared configuration
+on every rank. Some rank-local checkpoint and cursor operations coordinate
+failures; this is not a guarantee for every I/O path.
+
 ```
 checkpoints/global_step_{N}/
 ├── checkpoint_manifest.json      # completion marker, rank 0 writes it last
@@ -59,7 +64,7 @@ File-backed optimizer moments are separate and are not restricted here.
 | `model/**/optimizer/` | Optimizer state. | All ranks, via DCP |
 | `model/**/extra_state/extra_state_rank_{R}.pt` | Model-bound extra state: `lr_scheduler.state_dict()` and whatever the runtime contributes (e.g. the DiT condition model's RNG). | Rank R |
 | `loader/rank_{R}.pt` | Dataloader / sampler cursor. | Rank R |
-| `extra_state/rank_{R}.pt` | `global_step`, `environ_meter`, `channel_loss_callback`, `offline_cache_writer` (SeedOmni `offline_embedding` only), `torch_rng_state`. | Rank R |
+| `extra_state/rank_{R}.pt` | `global_step`, `environ_meter`, `channel_loss_callback`, `offline_cache_writer` (SeedOmni `offline_embedding` only), `torch_rng_state`; DPO runs also include `dpo_provenance_protocol` and `dpo_position`. | Rank R |
 | `hf_ckpt/` | `model*.safetensors`, its index, and the model assets. Written when `train.checkpoint.save_hf_weights` is set and the run is not LoRA. | Rank 0, after a collective gather |
 | `lora_ckpt/` | `adapter_config.json`, `adapter_model.safetensors`. Written instead of `hf_ckpt/` when `model.lora_config` is set. | Rank 0, after a collective gather |
 | `checkpoint_manifest.json` | Format version, `global_step`, world size, and `model_state`: whether the step has a `model/` at all. Trainer-level completion only. | Rank 0, last |
@@ -85,6 +90,163 @@ the entire multi-shard checkpoint or the adapter weights and config together.
 `config.json`, `generation_config.json`, then tokenizer files, processor files,
 or both. Do not read a fixed file list into these directories. Two modules
 cannot share one directory: both would write `config.json`.
+
+DPO's `dpo_provenance_protocol` records the producer contract, objective and
+recovery geometry; `dpo_position` contains `epoch`, `step_in_epoch` and
+`epoch_complete`. Resume requires both fields and matching positions across
+ranks; missing or incompatible state is rejected before training continues.
+Trainer-state recovery currently supports the native mapping dataset, native
+dataloader and standard stateful distributed sampler without persistent
+workers, a custom loader generator, out-of-order workers or background prefetch.
+Native DPO loaders take a worker snapshot at every source step, including
+fixed-batch runs, because one optimizer step can consume uneven microbatches.
+Other configurations can still be used for
+fresh training where supported, but their trainer-state exact resume is
+rejected. Set `data.resume_input_contract` and `data.resume_input_deterministic`
+as described below; the trusted input manifest must also cover the immutable
+DPO reference-model weights. This is a caller attestation; the trainer does not
+hash those weights. The reference is rebuilt from `model.model_path`, and the
+current trainer has no separate reference-model path. Starting a weights-only
+run from an exported policy sets the reference to those policy weights and can
+change the DPO objective; it is not an exact continuation. The saved dataset
+fingerprint is checked as an additional guard, not as a substitute for the
+manifest. Python, NumPy, and custom-component random states are not captured by
+this callback; data and worker transforms must also be deterministic, since
+worker torch RNG is not restored by this protocol. Recovery may temporarily copy
+the buffered samples on the host. The native multi-worker recovery checks were
+exercised with PyTorch 2.10 and torchdata
+0.11; other versions require their own validation.
+
+For native fixed-batch DPO on mapping datasets, `drop_last=False` includes a
+short final batch. Its optimizer step can contain fewer nonempty microbatches
+and is normalized by the actual pair count. The native distributed sampler may
+repeat samples to equalize DP ranks when the data size is not divisible by DP;
+the DPO microbatch collator does not add padding or replay.
+
+For main-process dynamic batching in the text and VLM trainers, exact resume
+requires either a native mapping dataset with an unchanged dataset fingerprint
+and native stateful and batch samplers, or an attested replayable weighted
+multi-source dataset as described below. Both require snapshots at every source
+step, no custom data-loader generator, in-order workers and disabled background prefetch.
+The checkpoint records the data/worker geometry, epoch length, source settings
+and input-parallel settings. A changed or missing cursor, geometry, source
+fingerprint or RNG state is rejected. Worker-mode batching and custom or other
+iterable sources use separate paths and are not qualified by this contract.
+Fixed-batch, worker-mode, custom and other iterable sources do not establish an
+exact continuation guarantee; weighted loaders still enforce their provenance
+and compatibility checks when restoring a cursor. MultiOptimizer recovery
+continues to validate the optimizer generation and warns when the loader has no
+verified exact data-resume contract. A cursor saved under the strict dynamic
+contract cannot be restored through a different data path.
+Custom weighted sources and loaders must implement the
+[exact data-resume extension contract](exact_data_resume.md); merely exposing a
+`state_dict()` does not establish that the data stream is reproducible.
+Exact continuation starts after a completed optimizer step; step-zero cursors
+are rejected because iterator initialization may advance CPU RNG.
+
+When the model checkpoint manager provides strict MultiOptimizer generation
+receipts, the trainer sidecar records that generation and recovery requires it
+to match the optimizer checkpoint and step. Dynamic-batching cursor checks
+alone do not establish optimizer-to-cursor identity for checkpoint managers
+without this protocol. The built-in ``ModelCheckpointManager`` and
+``DistributedCheckpointer`` record generation receipts for synchronous
+``MultiOptimizer`` checkpoints, including Muon and EP configurations. A
+same-output continuation is supported when the recorded step, generation and
+other optimizer, scheduler and data identities all match. An unversioned or
+otherwise ambiguous optimizer checkpoint requires a separately verified
+migration; changing the output directory does not establish its identity.
+
+Set `data.resume_input_contract` to `sha256:<64 lowercase hex characters>`
+before training, and set `data.resume_input_deterministic=true` only when the
+input snapshot, tokenizer, chat template, processor, collator and transforms are
+immutable and deterministic. The digest is a **caller attestation**, not a
+hash that VeOmni independently computes from those inputs. It must identify a
+trusted manifest covering those components and their code/configuration. The
+same digest and settings are required on resume. A missing contract emits a
+startup warning; training and export can proceed, but dynamic SFT trainer-state
+resume is rejected because its cursor cannot be proven exact. This also applies
+to weighted multi-source SFT: set the attestations before training if its
+trainer-state checkpoint must be exactly resumable. To start a new
+data stream, load the model weights as a new run instead of resuming its trainer
+state. Other trainer paths retain their own optimizer, checkpoint-provider and
+data-codec checks.
+
+For the attested weighted multi-source streaming path, each worker reconstructs
+the original Hugging Face stream and rereads the rows that its source consumed
+in the saved epoch. This reconstructs the shuffle buffer, which the Hugging Face
+streaming cursor does not persist. It can substantially increase restart time
+and source I/O; it does not add a source replay to each training step. The source
+files and all transforms must be immutable and semantically stateless, including
+no untracked RNG or mutable worker state. The fingerprint cannot independently
+prove file contents: a caller-supplied manifest must identify the actual snapshot.
+The native loader consumes file-backed sources supported by `get_data_files`;
+platform-specific dataset identifiers must first be resolved to immutable files.
+Switching loaders or materializing sources can change sampling and row order.
+A cursor from another loader is not an exact native continuation: initialize a
+new data stream from model weights or use a separately verified migration.
+Saved source order, weights, seed, worker and DP geometry must match. Version-0
+multi-source cursors lack that provenance and are rejected for exact resume; use
+weights-only initialization or a separately verified producer-specific migration.
+
+Distributed replay requires at least one worker per rank, in-order delivery and
+a working Gloo control group. `data.resume_replay_timeout_seconds` limits each
+worker response; rank coordination uses `(num_workers + 1)` times that value
+plus 30 seconds, so the total wait can be much longer than the per-worker timeout.
+The cold-resume and networking behavior must be validated for the exact data,
+torchdata, hardware and multi-node configuration used for training. This SFT
+contract does not establish DPO exact recovery for weighted streaming sources.
+For fresh training, persistent workers support the built-in file-backed HF
+sources. A custom source must explicitly provide the epoch-restart contract;
+otherwise construction fails rather than risk reusing the previous epoch.
+
+At a completed SFT epoch, in-order workers preserve the buffered samples and
+start the next epoch with a fresh sampler. Persistent workers are supported at
+this boundary only for the attested weighted replayable stream; persistent
+mapping workers, stochastic transforms and independent worker RNG state are not
+qualified. Legacy cursors without the saved geometry, source contract and phase
+are rejected. No legacy migration tool is provided here: old releases differed
+in step accounting and batching behavior, so migration requires a separately
+verified producer-specific implementation. Starting a new data stream requires
+a new training run rather than claiming exact continuation from that cursor.
+Exhausted one-shot sources cannot be drained independently by each rank as a
+distributed continuation; use a restartable source or coordinated exhaustion.
+For safety, cursors written by the prior exhausted-source experiment with its
+exhaustion flag set are rejected instead of reopening the source. This does
+not coordinate ordinary input exhaustion across ranks.
+With background prefetch enabled, exact resume of `drop_last=False` flush
+batches assumes consumers do not mutate yielded microbatches; prefetch can
+snapshot the cursor before such a mutation. Prefetching can also advance a
+restarted source's CPU RNG ahead of the consumed cursor, so model RNG may
+diverge after resume even when the text samples are deterministic. Validate
+the loader and prefetch configuration used by a training profile.
+
+When main-process dynamic batching emits padded micro-batches in single-process
+SFT, padding is excluded from loss token counts, channel loss and auxiliary
+metrics, and its model forward/backward is skipped. Distributed SFT main-process dynamic batching must use `drop_last=True` until tail
+step counts can be coordinated across ranks. The native DPO loader is an exception:
+it permits `drop_last=False`, forbids synthetic padding and implicit replay, and
+rejects an incomplete or uncoordinated final step. All distributed loaders, including finite native
+worker-based loaders, must coordinate fetch failures and EOF before entering
+the trainer and avoid injecting padded micro-batches. DPO and Omni reject padded
+micro-batches; custom data loaders must not inject padding into those objectives.
+DiT also rejects marked padding.
+The distributed padding guard adds one small collective before step-begin
+callbacks. SFT propagates callback errors in its existing loss-token reduction;
+DPO, Omni and DiT use a separate small error synchronization after callbacks.
+SFT still counts valid loss tokens after step-begin callbacks, so callbacks can
+adjust labels before the loss denominator is computed. Distributed training
+rejects unequal microbatch counts across ranks. Step-begin callbacks must not
+replace or reorder microbatches, or change the microbatch count, target-key
+structure or padding flags. Callback-internal collectives must coordinate their
+own failures; a failure before such a collective can still strand another rank.
+If any rank has auxiliary target keys, their union is synchronized once per
+step; missing targets contribute zero and keys are reduced in sorted order.
+This includes MTP inputs; object-gather overhead on accelerators is unmeasured.
+Environment-meter token and FLOP estimates likewise count useful batches only.
+The main dynamic loader's configured `train_steps` limit is unchanged: a
+normal SFT trainer does not consume extra flush batches beyond that limit, and a
+restartable SFT source can be replayed to fill the requested number of steps.
+DPO never implicitly replays a source to fill that limit.
 
 Three splits in the tree above are deliberate:
 
@@ -174,7 +336,7 @@ half-loaded.
 The one step with a single half is a run that saves no model state. SeedOmni's
 `offline_embedding` freezes every module, so no module has a checkpoint
 manager and the step has no `model/`. Its manifest records
-[`model_state: false`](../../veomni/checkpoint/layout.py#L185), and the manifest
+[`model_state: false`](../../veomni/checkpoint/layout.py#L187), and the manifest
 alone then marks the step complete. Without that field, the same tree would look
 like a step whose shards never started. A manifest written before the field
 existed counts as carrying model state.
@@ -218,6 +380,12 @@ from veomni.optim.lr_scheduler import register_checkpoint_scheduler
 register_checkpoint_scheduler(scheduler, name="my.schedule", version=1,
                               parameters={"warmup_steps": 100})
 ```
+
+Unrecognized instance-level `state_dict` replacements on optimizer leaves are
+rejected: a wrapper could otherwise renumber parameter IDs after capture and
+silently assign the wrong learning rate. Known PyTorch DCP wrappers are allowed.
+Optimizer class implementations and registered state-dict hooks are trusted to
+preserve their declared parameter mapping and update semantics.
 
 With `stage_dir` the model half waits: a staged save has overwritten nothing
 until the copy to the destination, so it invalidates the destination there
@@ -275,6 +443,13 @@ the next save of the same kind and at train end; a drain that finds a failed
 save raises on every rank, not just the one that saw it, agreeing on that
 save's own Gloo group so the ranks whose write finished first wait there
 rather than on the training backend.
+
+When resuming a split-layout checkpoint with an ordinary Adam optimizer into
+its original output directory, the trainer reuses an unchanged same-step
+checkpoint only after validating the completed manifest, model and optimizer
+load, RNG state and available data cursor. If those cannot be established, use
+a different output directory. This guard does not prove optimizer group identity
+or claim exact recovery for unproven optimizer formats.
 
 ## Older checkpoints do not resume
 

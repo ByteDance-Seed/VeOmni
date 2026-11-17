@@ -407,9 +407,13 @@ def _fresh_process_export_worker(rank, root, phase, endpoint):
             torch.manual_seed(777 + rank)
             assert not torch.equal(torch.get_rng_state(), saved_sidecar["torch_rng_state"])
             if phase in ("resume_bad_rng", "resume_missing_cursor"):
-                with pytest.raises(
-                    RuntimeError, match="conflicting CPU RNG|proven data cursor|failed on another rank"
-                ):
+                if rank == 0:
+                    expected = (RuntimeError, "validating the training data cursor failed on another rank")
+                elif phase == "resume_bad_rng":
+                    expected = (ValueError, "CPU and device RNG states conflict")
+                else:
+                    expected = (ValueError, "Trainer dataloader cursor is missing")
+                with pytest.raises(expected[0], match=expected[1]):
                     global_callback.load_global_state()
                 assert trainer.checkpoint_callback._last_dcp_step == -1
                 assert manager._last_saved_step == -1

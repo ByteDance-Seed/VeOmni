@@ -93,6 +93,32 @@ def _check_multi_destination(trainer, step):
     raise_if_any_rank_failed(error, "checking MultiOptimizer checkpoint destination")
 
 
+def _reject_retired_external_data_provider(trainer):
+    """Do not silently run a request for the removed external data protocol."""
+    from ...data.dynamic_batching import DynamicBatchSizeDataLoader
+
+    error = None
+    try:
+        requested = getattr(trainer, "_veomni_require_exact_data_resume", False) is True
+        loader = getattr(trainer, "train_dataloader", None)
+        seen = set()
+        while loader is not None:
+            if id(loader) in seen:
+                raise ValueError("Data loader wrapper cycle prevents resume validation")
+            seen.add(id(loader))
+            requested = requested or getattr(loader, "_veomni_exact_resume_requested", False) is True
+            if type(loader) is not DynamicBatchSizeDataLoader:
+                break
+            loader = loader._dataloader
+        if requested:
+            raise ValueError(
+                "External exact-data providers are unsupported; use a native loader or a verified migration"
+            )
+    except BaseException as exc:
+        error = exc
+    raise_if_any_rank_failed(error, "checking the data resume protocol")
+
+
 class CheckpointCallback(Callback):
     """Schedule DCP / HF / LoRA I/O and the one-shot tokenizer/config export."""
 
@@ -123,6 +149,7 @@ class CheckpointCallback(Callback):
             raise
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
+        _reject_retired_external_data_provider(self.trainer)
         self.trainer.save_model_assets()
         self.trainer.load()
         helper.empty_cache()
