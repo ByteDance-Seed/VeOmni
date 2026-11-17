@@ -62,12 +62,14 @@ IGNORE_INDEX = -100
 
 
 def _release():
+    """Collect unreachable objects and release cached CUDA/NPU allocations."""
     gc.collect()
     if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
         empty_cache()
 
 
 def _apply_determinism():
+    """Request deterministic algorithms while warning on unsupported operations."""
     torch.use_deterministic_algorithms(True, warn_only=True)
 
 
@@ -176,6 +178,7 @@ def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
 
 
 def _require_accelerator(toy_path: str):
+    """Skip unsupported hosts, then require model assets on CUDA/NPU hosts."""
     if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
         pytest.skip("A CUDA or NPU device is required for these integration tests")
     assert os.path.isdir(toy_path), f"Path not found: {toy_path}"
@@ -188,6 +191,7 @@ _MODELS = [
 
 
 def _check_bitwise_matches_logits_reference(model: torch.nn.Module, family: str) -> None:
+    """Check exact log-probability and entropy agreement, including ignored targets."""
     # Batch-invariant Triton kernels are CUDA-only; NPU retains the exact assertions below.
     bi_active = IS_CUDA_AVAILABLE and _have_python_dev_headers()
     bi_ctx = None
@@ -275,6 +279,7 @@ def _check_bitwise_matches_logits_reference(model: torch.nn.Module, family: str)
 
 
 def _check_plain_verl_consumer_contract(model: torch.nn.Module, family: str) -> None:
+    """Check auxiliary output shapes and finite values without returning full logits."""
     model.eval()
     torch.manual_seed(0)
     B, L = 2, 16
@@ -307,6 +312,7 @@ def _check_plain_verl_consumer_contract(model: torch.nn.Module, family: str) -> 
 
 
 def _check_log_probs_backward(model: torch.nn.Module, family: str) -> None:
+    """Verify returned log-probabilities propagate finite, nonzero LM-head gradients."""
     model.train()
     model.zero_grad(set_to_none=True)
     torch.manual_seed(1)
@@ -330,6 +336,7 @@ def _check_log_probs_backward(model: torch.nn.Module, family: str) -> None:
 
 
 def _check_topk_distill_forward_and_backward(model: torch.nn.Module, family: str) -> None:
+    """Validate top-k distillation outputs and gradients against the loss helper."""
     from veomni.models.loss_utils import chunk_topk_distill_function
 
     model.train()
