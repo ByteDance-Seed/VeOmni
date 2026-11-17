@@ -328,6 +328,18 @@ class PackingCollator(DataCollator):
         return batch
 
 
+def _compact_cpu_image_shard(shard):
+    """Release oversized image backing storage without copying pinned or differentiable views."""
+    if (
+        shard.layout == torch.strided
+        and not shard.requires_grad
+        and not shard.is_pinned()
+        and shard.untyped_storage().nbytes() > shard.numel() * shard.element_size()
+    ):
+        return shard.clone(memory_format=torch.contiguous_format)
+    return shard
+
+
 @dataclass
 class SequenceParallelCollator(DataCollator):
     collate_infos: Dict[str, DataCollateInfo] = field(default_factory=lambda: DEFAULT_DATA_COLLATE_INFO.copy())
@@ -354,16 +366,8 @@ class SequenceParallelCollator(DataCollator):
             sp_chunk_size = seq_length // self.sp_size
             shard = feature.narrow(dim, self.sp_rank * sp_chunk_size, sp_chunk_size)
             if key in ("pixel_values", "pixel_values_videos") and shard.device.type == "cpu":
-                # Processor-produced CPU tensors can retain the entire packed
-                # image storage through a narrow view. Preserve pinned and
-                # gradient-carrying views.
-                if (
-                    shard.layout == torch.strided
-                    and not shard.requires_grad
-                    and not shard.is_pinned()
-                    and shard.untyped_storage().nbytes() > shard.numel() * shard.element_size()
-                ):
-                    shard = shard.clone(memory_format=torch.contiguous_format)
+                # Processor-produced views can retain all packed image storage.
+                shard = _compact_cpu_image_shard(shard)
             return shard
 
     def sp_padding(

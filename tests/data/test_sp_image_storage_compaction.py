@@ -120,18 +120,10 @@ def test_real_pinned_image_slices_preserve_original_view(monkeypatch, key):
     assert shard.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
 
 
-def test_mixed_packing_metadata_and_weights_match_view_baseline(monkeypatch):
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_mixed_packing_metadata_and_weights_match_view_baseline(monkeypatch, rank):
     """Compare packed values, boundaries, weights and metadata to view slicing."""
-    monkeypatch.setattr(collators, "get_parallel_state", lambda: _parallel_state(4, 2))
-
-    class OriginalSequenceParallelCollator(collators.SequenceParallelCollator):
-        def sp_slice(self, key, feature, dim=-1):
-            """Reproduce the previous un-compacted slice for comparison."""
-            if isinstance(feature, list):
-                chunk = len(feature) // self.sp_size
-                return feature[self.sp_rank * chunk : (self.sp_rank + 1) * chunk]
-            chunk = feature.size(dim) // self.sp_size
-            return feature.narrow(dim, self.sp_rank * chunk, chunk)
+    monkeypatch.setattr(collators, "get_parallel_state", lambda: _parallel_state(4, rank))
 
     def metadata(batch, padding):
         """Record the image padding reported to a multimodal metadata hook."""
@@ -156,11 +148,10 @@ def test_mixed_packing_metadata_and_weights_match_view_baseline(monkeypatch):
     info = {"loss_weights": collators.DataCollateInfo(-1, True, 0, 1)}
     current = collators.MainCollator(data_collate_info=info, metadata_collate_func=metadata)
     reference = collators.MainCollator(data_collate_info=info, metadata_collate_func=metadata)
-    reference.preforward_pipeline[-1] = OriginalSequenceParallelCollator(
-        collate_infos=reference.collate_infos, metadata_collate_func=metadata
-    )
     actual = current(copy.deepcopy(features))
-    expected = reference(copy.deepcopy(features))
+    with monkeypatch.context() as context:
+        context.setattr(collators, "_compact_cpu_image_shard", lambda shard: shard)
+        expected = reference(copy.deepcopy(features))
 
     assert actual.keys() == expected.keys()
     for name, value in actual.items():
@@ -168,4 +159,6 @@ def test_mixed_packing_metadata_and_weights_match_view_baseline(monkeypatch):
             assert torch.equal(value, expected[name]), name
         else:
             assert value == expected[name], name
+    assert actual["multimodal_metadata"]["image_padding"] == 11
+    assert bool(torch.count_nonzero(actual["pixel_values"])) is (rank < 2)
     assert actual["pixel_values"].untyped_storage().nbytes() < expected["pixel_values"].untyped_storage().nbytes()
