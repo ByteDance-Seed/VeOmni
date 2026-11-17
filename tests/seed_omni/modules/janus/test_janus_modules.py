@@ -115,6 +115,14 @@ def test_the_vq_head_scores_on_every_cross_entropy_backend(impl):
     else:
         device = torch.device("cpu")
     module = VQVAE(cfg).to(device=device, dtype=torch.float32)
+    # The real head is ``nn.Linear``, so it has a bias. Give it values that are
+    # not all zero: a loss that drops the bias still comes out finite, so a
+    # zero-initialised bias would hide exactly the bug under test.
+    with torch.no_grad():
+        module.generation_head.vision_head.bias.copy_(
+            torch.linspace(-1.0, 1.0, _VQ_CONFIG["num_embeddings"], device=device)
+        )
+    head_bias = module.generation_head.vision_head.bias
 
     hidden = torch.randn(4, _VQ_CONFIG["image_token_embed_dim"], device=device)
     labels = torch.tensor([1, -100, 3, -100], device=device)
@@ -125,42 +133,54 @@ def test_the_vq_head_scores_on_every_cross_entropy_backend(impl):
     # reached it would leave them without a gradient.
     assert module.generation_head.vision_head.weight.grad is not None
     assert module.generation_head.vision_head.weight.grad.abs().sum() > 0
+    # And the bias has to reach both the loss and its own gradient: omitting it
+    # changes the number and silently drops the parameter from training.
+    assert head_bias.grad is not None, "the head's bias received no gradient"
+    assert head_bias.grad.abs().sum() > 0
 
 
 @pytest.mark.parametrize("impl", ["eager", "chunk_loss"])
-def test_the_eager_and_fused_vq_backends_agree(impl):
-    """An explicit backend override must not change the number, only the kernel."""
-    from veomni.models.loss_utils import ForCausalLMLoss
-    from veomni.ops import VeomniOp
+def test_the_fused_vq_backend_matches_eager_with_the_real_head_bias(impl):
+    """Switching the CE backend must not change the number.
 
+    Scored through the module's own ``_vq_loss``, so the real head (with its
+    bias) is the thing under test — a hand-built ``bias=False`` linear would not
+    exercise the path that shipped.
+    """
     if impl != "eager":
-        if impl == "liger_kernel":
-            pytest.importorskip("liger_kernel", reason="liger_kernel is a GPU-only fused backend")
-            if not IS_CUDA_AVAILABLE:
-                pytest.skip("liger_kernel needs a CUDA device")
-        else:
-            pytest.importorskip("flash_attn", reason="chunk_loss needs the flash-attn kernels")
+        pytest.importorskip("flash_attn", reason="chunk_loss needs the flash-attn kernels")
 
-    torch.manual_seed(0)
-    head = torch.nn.Linear(_VQ_CONFIG["projection_dim"], _VQ_CONFIG["num_embeddings"], bias=False)
-    hidden = torch.randn(4, _VQ_CONFIG["projection_dim"], requires_grad=True)
+    def _module(backend: str, device: torch.device):
+        torch.manual_seed(0)
+        Acc = OMNI_ACCELERATED_MODEL_REGISTRY["janus_vqvae"]()
+        cfg = OMNI_CONFIG_REGISTRY["janus_vqvae"]()(
+            vq_config=_VQ_CONFIG,
+            ops_implementation=make_eager_ops_config(cross_entropy_loss_implementation=backend),
+        )
+        module = Acc(cfg).to(device=device, dtype=torch.float32)
+        with torch.no_grad():
+            module.generation_head.vision_head.bias.copy_(
+                torch.linspace(-1.0, 1.0, _VQ_CONFIG["num_embeddings"], device=device)
+            )
+        return module
+
+    reference_module = _module("eager", torch.device("cpu"))
+    hidden = torch.randn(4, _VQ_CONFIG["image_token_embed_dim"])
     labels = torch.tensor([1, -100, 3, 4])
-    logits = head(hidden)
+    reference = reference_module._vq_loss(hidden, labels)
 
-    fused = impl in _FUSED_CE_IMPLS
-    loss, _, _ = ForCausalLMLoss(
-        **({"hidden_states": hidden, "weights": head.weight} if fused else {"logits": logits}),
-        shift_labels=labels,
-        vocab_size=_VQ_CONFIG["num_embeddings"],
-        op=VeomniOp("cross_entropy_loss", "standard", impl),
-    )
-    reference, _, _ = ForCausalLMLoss(
-        logits=logits,
-        shift_labels=labels,
-        vocab_size=_VQ_CONFIG["num_embeddings"],
-        op=VeomniOp("cross_entropy_loss", "standard", "eager"),
-    )
-    assert float(loss.detach()) == pytest.approx(float(reference.detach()), abs=1e-5)
+    if impl == "eager":
+        assert float(reference.detach()) > 0
+        return
+
+    # chunk_loss dispatches to a Triton/flash-attn kernel, which cannot read a
+    # CPU tensor.
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("chunk_loss needs a CUDA device")
+    device = torch.device(get_device_type())
+    fused_module = _module(impl, device)
+    fused = fused_module._vq_loss(hidden.to(device), labels.to(device))
+    assert float(fused.detach()) == pytest.approx(float(reference.detach()), abs=1e-3)
 
 
 def _vqvae_processor():

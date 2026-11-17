@@ -27,9 +27,17 @@ and wins over the backbone's shorter ``model.language_model.``.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
-from ...utils.hf_layout import OMNI_HF_LAYOUT_REGISTRY, OmniHFLayout, OmniHFModuleLayout
+import torch
+
+from ...utils.hf_layout import (
+    OMNI_HF_LAYOUT_REGISTRY,
+    OmniHFLayout,
+    OmniHFModuleLayout,
+    read_source_weight_files,
+)
 from .llama.configuration import JanusLlamaConfig
 from .siglip.configuration import JanusSiglipConfig
 from .text_encoder.configuration import JanusTextEncoderConfig
@@ -44,33 +52,92 @@ def _vqvae_config(hf_config: Any) -> JanusVqvaeConfig:
     return JanusVqvaeConfig(vq_config=hf_config.vq_config.to_dict())
 
 
-def _tie_word_embeddings(hf_config: Any) -> bool:
+_TIED_HEAD_SOURCE_KEY = "lm_head.weight"
+_TIED_HEAD_TARGET_KEY = "model.language_model.embed_tokens.weight"
+
+
+def _stored_head_relation(source_path: str) -> str:
+    """How the checkpoint's head relates to its embedding: ``absent`` / ``equal`` / ``different``.
+
+    Mirrors what ``PreTrainedModel.tie_weights`` does during ``from_pretrained``:
+    it consults the *stored* tensors, not only the config. Three cases, and all
+    three want a different answer:
+
+    * **absent** — upstream ties the pair and omitted the duplicate, so the head
+      *is* the embedding. Building an independent head leaves it randomly
+      initialised, because there is no weight to load into it.
+    * **equal** — a tied export that wrote the duplicate out. Upstream keeps them
+      tied (``torch.equal`` passes), so the module must too.
+    * **different** — a genuinely separate head. Upstream logs that the config
+      disagrees with the checkpoint and deliberately does *not* tie, so the head
+      must load its own copy.
+
+    Returns ``"unknown"`` when the weights cannot be read (a non-safetensors
+    root); the caller then falls back to the config.
+    """
+    from safetensors import safe_open
+
+    try:
+        weight_files = read_source_weight_files(source_path)
+    except (FileNotFoundError, OSError, ValueError):
+        return "unknown"
+
+    if _TIED_HEAD_SOURCE_KEY not in weight_files:
+        return "absent"
+    if _TIED_HEAD_TARGET_KEY not in weight_files:
+        return "unknown"
+    tensors = {}
+    for key in (_TIED_HEAD_SOURCE_KEY, _TIED_HEAD_TARGET_KEY):
+        with safe_open(os.path.join(source_path, weight_files[key]), framework="pt", device="cpu") as f:
+            tensors[key] = f.get_tensor(key)
+    head, embed = tensors[_TIED_HEAD_SOURCE_KEY], tensors[_TIED_HEAD_TARGET_KEY]
+    if head.shape != embed.shape or head.dtype != embed.dtype:
+        return "different"
+    return "equal" if torch.equal(head, embed) else "different"
+
+
+def _config_allows_tie(hf_config: Any) -> bool:
+    """Whether the config asks for the tie, the way upstream resolves it.
+
+    Upstream expands ``lm_head.weight -> embed_tokens.weight`` from the **outer**
+    ``tie_word_embeddings`` alone; the nested ``text_config`` flag does not take
+    part. Verified against transformers 5.16.1: an outer ``True`` beside a nested
+    ``False`` still yields the tied mapping. Unset counts as ``True``, which is
+    the ``PretrainedConfig`` default.
+    """
+    return bool(getattr(hf_config, "tie_word_embeddings", True))
+
+
+def _tie_word_embeddings(hf_config: Any, source_path: str | None = None) -> bool:
     """Whether the text encoder ties its head to the input embedding.
 
-    Read straight from the config: ``tie_word_embeddings`` is a config field, not
-    something to infer from the weight values. The framework acts on it —
-    :func:`~veomni.models.checkpoint.weights.tie_word_embeddings_if_requested`
-    points the head at the embedding when both the outer and nested flags allow
-    it — so a value derived from the tensors here would make the module disagree
-    with the very code that ties it.
+    The checkpoint decides when it can, the config otherwise — the same order
+    upstream applies in ``from_pretrained``:
+
+    1. no stored head -> tie (there is nothing to load into an independent one);
+    2. a stored head that differs from the embedding -> do not tie (upstream
+       warns and keeps them separate, so the stored values win over the flag);
+    3. a stored head equal to the embedding, or weights we cannot read -> the
+       config's flag decides, and ``True`` keeps upstream's shared parameter.
 
     Only the text encoder has a wte / lm_head pair; every other Janus module
-    reports ``get_output_embeddings() is None`` and the hook skips it.
+    reports ``get_output_embeddings() is None`` and the tie hook skips it.
     """
-    outer = getattr(hf_config, "tie_word_embeddings", None)
-    nested = getattr(getattr(hf_config, "text_config", None), "tie_word_embeddings", None)
-    if outer is None and nested is None:
-        return False
-    # The same AND the framework applies to the loaded module.
-    return bool(True if outer is None else outer) and bool(True if nested is None else nested)
+    if source_path is not None:
+        relation = _stored_head_relation(source_path)
+        if relation == "absent":
+            return True
+        if relation == "different":
+            return False
+    return _config_allows_tie(hf_config)
 
 
-def _text_encoder_config(hf_config: Any) -> JanusTextEncoderConfig:
+def _text_encoder_config(hf_config: Any, source_path: str | None = None) -> JanusTextEncoderConfig:
     text_config = hf_config.text_config
     return JanusTextEncoderConfig(
         vocab_size=text_config.vocab_size,
         hidden_size=text_config.hidden_size,
-        tie_word_embeddings=_tie_word_embeddings(hf_config),
+        tie_word_embeddings=_tie_word_embeddings(hf_config, source_path),
         lm_head_bias=False,
     )
 
