@@ -9,7 +9,7 @@ base class: a module opts in by defining two methods.
 - Save: [`ModuleRuntime.extra_state`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L663)
 - Load: [`ModuleRuntime.load_extra_state`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L676)
 - Where it is written: [`ModelCheckpointManager._extra_state`](../../../veomni/models/checkpoint/manager.py#L178)
-- Example: [`Cosmos3FlowConnector.rng_state_dict`](../../../veomni/models/seed_omni/modules/cosmos3/flow_connector/modeling.py#L195)
+- Example: [`Cosmos3FlowConnector.rng_state_dict`](../../../veomni/models/seed_omni/modules/cosmos3/flow_connector/modeling.py#L204)
 
 ## Why a module needs it
 

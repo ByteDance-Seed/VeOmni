@@ -158,6 +158,21 @@ def _conversation(samples: list[dict]) -> list[list[ConversationItem]]:
     ]
 
 
+def _devices() -> list[str]:
+    """CPU plus every accelerator this build exposes.
+
+    The sampling and placement tests are device-sensitive: a CPU-only case cannot
+    see a missing host-to-device move or a reduction that only differs on an
+    accelerator, so they run once per available device.
+    """
+    devices = ["cpu"]
+    if torch.cuda.is_available():
+        devices.append("cuda")
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        devices.append("npu")
+    return devices
+
+
 def _graph_loss(modules, samples) -> torch.Tensor:
     """Loss through the SeedOmni graph, the VAE step replaced by ready latents."""
     edges = [
@@ -364,17 +379,34 @@ def test_sampling_stream_resumes_from_its_state():
             torch.testing.assert_close(x, y, rtol=0, atol=0)
 
 
-def test_bf16_latents_are_noised_in_fp32():
+@pytest.mark.parametrize("device", _devices())
+def test_bf16_latents_are_noised_in_fp32(device):
     """With the shipped bf16 VAE, noising in bf16 would round sigma (0.999 -> 1.0) away from the timestep."""
-    connector = _modules(accelerated=False)["cosmos3_flow_connector"]
-    latents = [sample["latent"] for sample in _samples()]
+    connector = _modules(accelerated=False)["cosmos3_flow_connector"].to(device)
+    latents = [sample["latent"].to(device) for sample in _samples()]
     state = connector.rng_state_dict()
     expected = connector.sample_flow([latent.bfloat16().float() for latent in latents])
     connector.load_rng_state_dict(state)
     noisy, targets, masks, timesteps = connector.sample_flow([latent.bfloat16() for latent in latents])
     assert all(x.dtype == torch.float32 for x in noisy + targets)
+    assert all(x.device == connector.device for x in noisy + targets)
     for got, want in zip(noisy + targets, expected[0] + expected[1]):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+# `meta` is not an accelerator, but it is a device that differs from where the cached
+# rows live even on a CPU-only CI, so this test can prove the move happened without one.
+@pytest.mark.parametrize("device", ["cpu", "meta", *[name for name in _devices() if name != "cpu"]])
+def test_embed_latent_places_cached_latents_on_the_module_device(device):
+    """`seedomni_cached` rows are CPU tensors and nothing upstream moves them (see `batch_to_device`)."""
+    connector = _modules(accelerated=True)["cosmos3_flow_connector"].to(device)
+    conversation = _conversation(_samples())
+    cached = [item.value for item in conversation[0] if item.type == "video"]
+    assert all(latent.device.type == "cpu" for latent in cached)
+    latents = connector.embed_latent_pre(conversation_list=conversation)["latents"]
+    assert all(latent.device == connector.device for latent in latents)
+    # dtype untouched: `sample_flow` owns the fp32 promotion.
+    assert all(latent.dtype == original.dtype for latent, original in zip(latents, cached))
 
 
 def test_connector_refuses_lora_adapters():

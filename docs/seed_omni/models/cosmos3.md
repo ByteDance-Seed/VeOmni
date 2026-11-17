@@ -112,9 +112,10 @@ clip's latent patches (counted on the frames before the resize) and three marker
 tokens. That is the reference packer's count, `prompt + 1 + patches + 2`, so
 `data.max_seq_len: 45056` packs the same way.
 
-The frame choice and the mRoPE rate (the source clip's) are the DiT port's. The
-VAE preprocessor refuses a clip the loader has thinned, since it picks frames on
-the source timeline.
+The frame choice is the DiT port's; the mRoPE rate is the kept frames' rate,
+source fps / stride (the reference's `original_fps / temporal_interval`), which
+this port moved off the source rate. The VAE preprocessor refuses a clip the
+loader has thinned, since it picks frames on the source timeline.
 
 **Decode cost.** Because the VAE preprocessor picks frames on the source
 timeline, the loader has to hand it every source frame: `mm_configs.max_frames`
@@ -132,6 +133,10 @@ preprocessor.
 ```bash
 bash train.sh tasks/omni/train_omni.py configs/seed_omni/Cosmos3/cosmos3_nano/train/online.yaml
 ```
+
+Point `data.train_path` at your JSONL and `mm_configs.data_dir` at the clip root
+in `online.yaml` / `offline_embedding.yaml`; the recipes ship
+`dataset/cosmos3-demo/...`.
 
 Two-stage training runs the VAE once instead of every step:
 

@@ -30,7 +30,10 @@ class TrainingMixin(TrainingModuleMixin):
         unencoded = [item for item in self._clip_items if not item.meta.get(LATENT_KEY)]
         if unencoded:
             raise ValueError(f"cosmos3_flow_connector.embed_latent got {len(unencoded)} clip(s) with no latent yet.")
-        return {"latents": [item.value for item in self._clip_items]}
+        # Cached rows come back on CPU: `batch_to_device` does not traverse conversation
+        # items, so placing them is this module's job (the VAE's `encode_pre` does the
+        # same). Dtype untouched — `sample_flow` promotes bf16 latents to fp32 itself.
+        return {"latents": [item.value.to(self.device) for item in self._clip_items]}
 
     @post_forward("embed_latent")
     def embed_latent_post(
