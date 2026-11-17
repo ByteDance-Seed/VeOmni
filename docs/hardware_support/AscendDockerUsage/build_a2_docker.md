@@ -3,9 +3,9 @@
 ## Overview
 This guide provides step-by-step instructions for building and using the Ascend A2 Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Ascend A2 accelerators.
 
-**Note**: Ascend A2 supports both x86 and ARM64 architectures, with different environment management approaches for each:
-- **x86 Architecture**: Uses `uv` for dependency management, requires virtual environment activation
-- **ARM64 Architecture**: Uses `pip` for dependency management, no virtual environment required
+**Note**: Ascend A2 supports both x86 and ARM64 architectures, with system Python as the runtime on both architectures:
+- **x86 Architecture**: System Python; Triton 3.2.0 / Triton-Ascend 3.2.2
+- **ARM64 Architecture**: System Python; Triton 3.5.0 / Triton-Ascend 3.2.2
 
 ## Prerequisites
 - Docker installed on your system
@@ -20,18 +20,18 @@ You can find the latest official Ascend CANN images at: [Ascend Hub](https://www
 
 ```bash
 # for arm
-docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-910b-ubuntu22.04-py3.12
+docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.2.1-910b-ubuntu22.04-py3.12
 
 # for x86
-docker pull --platform=amd64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-910b-ubuntu22.04-py3.12
+docker pull --platform=amd64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.2.1-910b-ubuntu22.04-py3.12
 ```
 
 ## Step 2: Build the Custom Image
 
 Build the GDN-ready VeOmni Ascend A2 image using
-`Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86` for x86 or
-`Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm` for ARM64. These Dockerfiles include
-`torch-npu==2.10.0.post2`, `triton-ascend`, and `fla_npu`.
+`Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86` for x86 or
+`Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.arm` for ARM64. These Dockerfiles include
+`torch-npu==2.10.0.post7`, `triton-ascend==3.2.2`, and `fla_npu`.
 
 The existing `Dockerfile.ascend_9.0.0_a2.x86` and `Dockerfile.ascend_9.0.0_a2.arm` remain available for
 general-purpose images.
@@ -48,8 +48,8 @@ docker build \
   --build-arg http_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
-  -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86 \
+  -t ascend-a2-env:cann9.2.1 \
+  -f docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86 \
   .
 ```
 
@@ -61,8 +61,8 @@ docker build \
   --build-arg http_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg https_proxy=http://<user>:<pass>@<host>:<port> \
   --build-arg no_proxy=localhost,127.0.0.1 \
-  -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm \
+  -t ascend-a2-env:cann9.2.1 \
+  -f docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.arm \
   .
 ```
 
@@ -71,25 +71,31 @@ docker build \
 For x86:
 ```bash
 docker build \
-  -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86 \
+  -t ascend-a2-env:cann9.2.1 \
+  -f docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86 \
   .
 ```
 
 For ARM64:
 ```bash
 docker build \
-  -t ascend-a2-env:v1 \
-  -f docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm \
+  -t ascend-a2-env:cann9.2.1 \
+  -f docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.arm \
   .
 ```
+
+The existing [A2 builder](../../../.github/workflows/docker-build-ascend-a2.yml)
+selects these CANN 9.2.1 Dockerfiles. Its `main` builds publish
+`quay.io/ascend/veomni:veomni-9.2.1-910b-ubuntu22.04-py3.12-latest`.
+A2 combines native x86 and ARM builds into one multi-architecture tag.
+The local image tags in the commands below are independent of published tags.
 
 ### Image Components
 The built image includes:
 - Ubuntu 22.04 with Python 3.12
-- Ascend CANN 9.1.0 runtime
+- Ascend CANN 9.2.1 runtime
 - VeOmni framework with NPU support
-- torch-npu 2.10.0.post2, triton-ascend, and fla_npu for GDN
+- torch-npu 2.10.0.post7, triton-ascend 3.2.2, and fla_npu for GDN
 - TorchCodec for efficient video processing
 - All necessary development tools and dependencies
 
@@ -110,7 +116,7 @@ docker run --runtime=runc -it \
   -v /usr/local/Ascend/driver/tools:/usr/local/Ascend/driver/tools:ro \
   -v /usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons:ro \
   --name ascend-a2-container \
-  ascend-a2-env:v1 \
+  ascend-a2-env:cann9.2.1 \
   /bin/bash
 ```
 
@@ -168,24 +174,22 @@ docker run --runtime=runc -it \
   -v /path/to/your/checkpoints:/app/ckpt/:ro \
   -v /path/to/your/dataset:/app/dataset/:ro \
   --name ascend-a2-container \
-  ascend-a2-env:v1 \
+  ascend-a2-env:cann9.2.1 \
   /bin/bash
 ```
 
 ## Step 4: Run Training Inside the Container
 
-### Environment Activation (x86 Architecture Only)
+### Runtime Environment
 
-For x86 architecture, you need to activate the virtual environment created by `uv` before running training commands:
-
-```bash
-# Activate the virtual environment (x86 only)
-source /app/.venv/bin/activate
-```
+Both architectures install runtime and development dependencies into system
+Python. No virtual environment activation is needed. The images also include
+a uv cache; a project `uv sync` creates a separate environment whose installed
+packages must be checked independently.
 
 ### General Qwen3-VL Smoke Test
 
-After starting the container with appropriate mounts (and activating the environment for x86), you can run training commands. Here's an example for Qwen3-VL training using generic paths:
+After starting the container with appropriate mounts, you can run training commands. Here's an example for Qwen3-VL training using generic paths:
 
 ```bash
 bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
@@ -230,10 +234,12 @@ docker stop ascend-a2-container && docker rm ascend-a2-container
 
 | Feature | x86 Architecture | ARM64 Architecture |
 |---------|-----------------|--------------------|
-| Dependency Manager | uv | pip |
-| Virtual Environment | Required | Not Required |
-| Activation Command | `source /app/.venv/bin/activate` | N/A |
-| Installation Command | `uv sync --system-certs --python 3.12 --locked --extra npu` | `pip install -e .[npu_aarch64]` |
+| Runtime Python | System Python | System Python |
+| Virtual Environment | Not Required | Not Required |
+| Project Extra | `npu` | `npu_aarch64` |
+| Base Triton | 3.2.0 | 3.5.0 |
+| Triton-Ascend | 3.2.2 | 3.2.2 |
+| Development Dependencies and uv Cache | Included | Included |
 
 ### Device Access
 The container requires access to all Ascend devices for proper functionality. The `--device` flags in the run command grant access to these devices.
@@ -249,14 +255,14 @@ Update the proxy settings in both the build and run commands to match your envir
 
 ### Dockerfile Details
 
-#### x86 Dockerfile (Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86)
+#### x86 Dockerfile (Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86)
 1. Sets up the Ubuntu 22.04 base with Ascend CANN
 2. Configures system dependencies and development tools
 3. Installs and configures `uv` for dependency management
-4. Uses `uv` to install VeOmni framework with NPU support
-5. Sets up the virtual environment
+4. Installs VeOmni and pinned NPU packages into system Python
+5. Installs development dependencies and warms the uv cache
 
-#### ARM64 Dockerfile (Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm)
+#### ARM64 Dockerfile (Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.arm)
 1. Sets up the Ubuntu 22.04 base with Ascend CANN
 2. Configures system dependencies and development tools
 3. Uses `pip` to install VeOmni framework with NPU support
@@ -280,9 +286,9 @@ Update the proxy settings in both the build and run commands to match your envir
 - Ensure sufficient disk space is available
 - Review the full build log for specific error messages
 
-### Environment Activation Issues (x86 Only)
-- If you encounter "command not found" errors, ensure you've activated the virtual environment with `source /app/.venv/bin/activate`
-- Verify the virtual environment directory exists at `/app/.venv/`
+### Python Environment Issues
+- Check `which python` and installed package versions before running tests.
+- A project venv created by `uv sync` does not inherit the system packages.
 
 ## Support
 For additional help, please refer to:
