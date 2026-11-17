@@ -389,6 +389,9 @@ def forward(
     ``initial_state`` and ``output_final_state=True`` with trainable inputs
     are rejected. Extra NPU varlen tables are accepted; missing
     host chunk tables are filled from ``cu_seqlens`` without device uploads.
+    Grouped value attention is supported natively: ``q``/``k`` may have fewer
+    heads than ``v`` as long as the value head count is a multiple of theirs,
+    and ``g``/``beta`` stay in value-head space.
     """
     from ...vendor.triton.utils import input_guard
 
@@ -413,13 +416,20 @@ def forward(
         raise ValueError("g and beta must be rank-3 tensors with shape [B, T, H].")
     if query_h.ndim != 4 or key_h.ndim != 4 or value_h.ndim != 4:
         raise ValueError("q, k and v must be rank-4 tensors with shape [B, H, T, D] after layout convert.")
-    if query_h.shape[:3] != key_h.shape[:3] or query_h.shape[:3] != value_h.shape[:3]:
-        raise ValueError(f"q/k/v shape prefixes must match, got {query_h.shape}, {key_h.shape}, {value_h.shape}.")
+    if query_h.shape[:3] != key_h.shape[:3]:
+        raise ValueError(f"q/k shape prefixes must match, got {query_h.shape}, {key_h.shape}.")
+    if value_h.shape[0] != query_h.shape[0] or value_h.shape[2] != query_h.shape[2]:
+        raise ValueError(f"q/k/v batch and sequence dims must match, got {query_h.shape}, {value_h.shape}.")
+    if value_h.shape[1] % query_h.shape[1] != 0:
+        raise ValueError(
+            f"value head count must be a multiple of q/k head count (GVA), got q/k={query_h.shape[1]}, v={value_h.shape[1]}."
+        )
     if g.shape != beta.shape:
         raise ValueError(f"g and beta shapes must match, got {g.shape} and {beta.shape}.")
-    if g.shape[0] != query_h.shape[0] or g.shape[1] != query_h.shape[2] or g.shape[2] != query_h.shape[1]:
+    if g.shape[0] != value_h.shape[0] or g.shape[1] != value_h.shape[2] or g.shape[2] != value_h.shape[1]:
         raise ValueError(
-            f"Expected q/k/v in [B, T, H, D] and g/beta in [B, T, H]; got q={tuple(query.shape)}, g={tuple(g.shape)}."
+            f"Expected q/k in [B, T, Hk, D], v in [B, T, Hv, D] and g/beta in [B, T, Hv]; "
+            f"got q={tuple(query.shape)}, v={tuple(value.shape)}, g={tuple(g.shape)}."
         )
     if chunk_size <= 0 or chunk_size & (chunk_size - 1):
         raise ValueError(f"chunk_size must be a power of 2, got {chunk_size}.")
