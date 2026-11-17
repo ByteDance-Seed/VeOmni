@@ -90,6 +90,7 @@ from .optimizer_resume_layout import (
     finish_multi_layout,
     frozen_parameter_digest,
 )
+from .row_crop import _RowCropLoadMixin, _RowCropSaveMixin, checkpoint_row_counts
 
 
 logger = logging.get_logger(__name__)
@@ -669,7 +670,7 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             if actual != self.expected_save_id:
                 raise RuntimeError("Checkpoint changed between identity preflight and tensor load")
         self._validate_expert_layouts()
-        plan = super().create_local_plan()
+        plan = self._create_read_plan()
         if not self.strict_model:
             return plan
 
@@ -688,6 +689,9 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
             )
 
         return plan
+
+    def _create_read_plan(self):
+        return super().create_local_plan()
 
     def _validate_expert_layouts(self):
         planner_data = self.metadata.planner_data or {}
@@ -760,6 +764,27 @@ class _ModelStrictLoadPlanner(DefaultLoadPlanner):
                 "Migrate model and optimizer state using the original training layout before loading; "
                 "changing the target expert_fsdp_shard_dim does not resolve the ambiguity."
             )
+
+
+class _CanonicalRowCropSavePlanner(_RowCropSaveMixin, _ExtraParallelSavePlanner):
+    """Retain both logical-row cropping and source expert-layout provenance."""
+
+
+class _CanonicalRowCropLoadPlanner(_RowCropLoadMixin, _ModelStrictLoadPlanner):
+    """Apply row padding after verifying the canonical source expert layout."""
+
+
+def _checkpoint_rows_by_name(model):
+    counts = checkpoint_row_counts(model)
+    specs = getattr(model, "_fqn2spec_info", None)
+    marker = _extra_parallel_layout_key(specs) + "__" if _needs_extra_parallel_layout_marker(specs) else ""
+    return {f"model.{marker}{name}": value for name, value in counts.items()}
+
+
+def _model_load_planner(*, strict_model: bool, rows_by_name, **kwargs):
+    if rows_by_name:
+        return _CanonicalRowCropLoadPlanner(strict_model=strict_model, rows_by_name=rows_by_name, **kwargs)
+    return _ModelStrictLoadPlanner(strict_model=strict_model, **kwargs)
 
 
 def _validate_extra_parallel_meshes(parallel_state) -> None:
@@ -1554,7 +1579,12 @@ class ModelState(Stateful):
             (already populated from ``model_path``) base params are left untouched.
     """
 
-    def __init__(self, model, trainable_only: bool = False, parallel_state=None):
+    def __init__(
+        self,
+        model,
+        trainable_only: bool = False,
+        parallel_state=None,
+    ):
         self.model = model
         self.trainable_only = trainable_only
 
@@ -1574,6 +1604,7 @@ class ModelState(Stateful):
 
     @torch.no_grad()
     def state_dict(self):
+        """Extract model weights while preserving runtime shapes and checkpoint sharding."""
         _assert_extra_parallel_layout_unchanged(self)
         options = StateDictOptions(ignore_frozen_params=True) if self.trainable_only else None
         model_state_dict = get_model_state_dict(model=self.model, options=options)
@@ -1685,8 +1716,10 @@ class OptimizerState(Stateful):
     normal resume path), ``set_optimizer_state_dict`` internally calls
     ``_init_optim_state`` which pre-fills zero/default state for every
     param; DCP then overwrites the entries that exist in the checkpoint.
-    Params absent from the checkpoint keep their default-initialised state,
-    equivalent to what AdamW would create on the next ``step()`` call.
+    Params absent from the checkpoint can keep a synthetic ``step=1`` state.
+    For a lazily initialized stock AdamW parameter this differs from its first
+    uninterrupted update; this plain-optimizer path does not prove exact sparse
+    continuation. The proven MultiOptimizer adapter handles sparse state separately.
 
     Note: ``allow_partial_load`` is set globally on the DCP planner (it
     cannot be scoped to optimizer-only). ``_ModelStrictLoadPlanner`` therefore
@@ -2858,7 +2891,15 @@ class DistributedCheckpointer(CheckpointerBase):
             state, parallel_state, group=process_group, trainable_only=trainable_only, allow_proven_optimizer=multi
         )
 
+        row_counts, error = {}, None
+        try:
+            row_counts = _checkpoint_rows_by_name(state["model"])
+        except Exception as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "preparing checkpoint row metadata for load", group=process_group)
+
         def _model_state() -> "ModelState":
+            """Build the model load target using its padded runtime shapes."""
             return ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
 
         def _optimizer_state() -> "OptimizerState":
@@ -2970,6 +3011,7 @@ class DistributedCheckpointer(CheckpointerBase):
                     parallel_state=parallel_state,
                     trainable_only=trainable_only,
                     group=process_group,
+                    rows_by_name=row_counts,
                 )
             )
             _prepare_multi_optimizer_saved_states(
@@ -2992,7 +3034,9 @@ class DistributedCheckpointer(CheckpointerBase):
                     group=process_group,
                 )
                 reader = cls._create_storage_reader(model_path)
-                planner = _ModelStrictLoadPlanner(strict_model=not trainable_only, expected_save_id=model_id)
+                planner = _model_load_planner(
+                    strict_model=not trainable_only, rows_by_name=row_counts, expected_save_id=model_id
+                )
             except BaseException as exc:
                 error = exc
             raise_if_any_rank_failed(error, "preparing proven model checkpoint state", group=process_group)
@@ -3106,8 +3150,10 @@ class DistributedCheckpointer(CheckpointerBase):
                         state_dict={"model": model_state},
                         storage_reader=model_reader,
                         process_group=process_group,
-                        planner=_ModelStrictLoadPlanner(
-                            strict_model=not trainable_only, legacy_expert_source_layout=legacy_expert_source_layout
+                        planner=_model_load_planner(
+                            strict_model=not trainable_only,
+                            rows_by_name=row_counts,
+                            legacy_expert_source_layout=legacy_expert_source_layout,
                         ),
                     )
             except BaseException as exc:
@@ -3256,7 +3302,12 @@ class DistributedCheckpointer(CheckpointerBase):
         planner, error = None, None
         try:
             optimizer_adapter = save_state.get("optimizer")
-            planner = _ExtraParallelSavePlanner(
+            model_state = save_state.get("model")
+            rows = _checkpoint_rows_by_name(model_state.model) if isinstance(model_state, ModelState) else {}
+            planner_type = _CanonicalRowCropSavePlanner if rows else _ExtraParallelSavePlanner
+            planner_args = {"rows_by_name": rows} if rows else {}
+            planner = planner_type(
+                **planner_args,
                 dedup_save_to_lowest_rank=save_to_lowest_rank,
                 parallel_state=parallel_state,
                 source_model=source_model,

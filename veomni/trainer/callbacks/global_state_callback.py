@@ -135,8 +135,16 @@ def _saved_multi_optimizer_generations(trainer, step):
     return generations
 
 
+def _offline_condition_runtime(trainer):
+    runtime = getattr(trainer, "offline_embedding_runtime", None)
+    return runtime if getattr(runtime, "_veomni_offline_condition_runtime", False) is True else None
+
+
 def _legacy_optimizer_checkpoints(trainer):
     """Find the model runtimes responsible for legacy checkpoint recovery."""
+    # Offline embedding checkpoints carry a data cursor only; their module
+    # runtimes deliberately have no optimizer or optimizer checkpoint.
+    cursor_only = getattr(getattr(trainer.args, "train", None), "training_task", None) == "offline_embedding"
     root = getattr(trainer, "model", None)
     runtimes = [("model", root)]
     modules = getattr(root, "module_runtimes", None)
@@ -155,7 +163,7 @@ def _legacy_optimizer_checkpoints(trainer):
         if checkpoint is not None and id(checkpoint) in seen:
             continue
         if optimizer is None:
-            if getattr(runtime, "has_trainable_parameters", None) is not False:
+            if not cursor_only and getattr(runtime, "has_trainable_parameters", None) is not False:
                 unknown.append(name)
             continue
         multi = getattr(optimizer, "_is_multi_optimizer", False)
@@ -335,6 +343,9 @@ class GlobalStateCallback(Callback):
             "torch_rng_state": torch.get_rng_state(),
             "device_rng_state": get_device_rng_state(),
         }
+        offline_runtime = _offline_condition_runtime(self.trainer)
+        if offline_runtime is not None:
+            result["_veomni_offline_condition"] = offline_runtime.offline_condition_state()
         if _has_exact_sft_dynamic_resume(self.trainer):
             result["_veomni_dynamic_context"] = _dynamic_resume_context(
                 self.trainer.args, getattr(state, "epoch", None)
@@ -501,7 +512,11 @@ class GlobalStateCallback(Callback):
             dist.all_gather_object(restored_generations, local_generations)
             if any(value != local_generations for value in restored_generations):
                 raise RuntimeError("Restored optimizer checkpoint generations differ across ranks")
-        coordinated_resume = strict_resume or bool(legacy_checkpoints or unknown_checkpoints)
+        coordinated_resume = (
+            strict_resume
+            or bool(legacy_checkpoints or unknown_checkpoints)
+            or getattr(args.train, "training_task", None) == "offline_embedding"
+        )
 
         if strict_optimizer:
             completeness_error = None
@@ -597,6 +612,19 @@ class GlobalStateCallback(Callback):
             global_step = global_state["global_step"]
             if type(global_step) is not int or global_step < 0:
                 raise ValueError("Trainer checkpoint global_step must be a non-negative integer")
+            offline_runtime = _offline_condition_runtime(self.trainer)
+            if offline_runtime is not None:
+                offline_runtime.validate_offline_condition_state(global_state.get("_veomni_offline_condition"))
+            elif "_veomni_offline_condition" in global_state:
+                raise ValueError("Offline condition-model checkpoint requires its originating runtime")
+            writer = getattr(self.trainer, "offline_cache_writer", None)
+            writer_state = global_state.get("offline_cache_writer")
+            if writer is not None and getattr(self.trainer.args.train, "training_task", None) == "offline_embedding":
+                if writer_state is None:
+                    raise ValueError("Offline embedding checkpoint is missing its output writer state")
+                validate_writer = getattr(writer, "validate_state_dict", None)
+                if callable(validate_writer):
+                    validate_writer(writer_state)
             loader = self.trainer.train_dataloader
             saved_sft_context = "_veomni_dynamic_context" in global_state
             saved_geometry = isinstance(cursor, dict) and "_veomni_resume_geometry" in cursor
@@ -820,7 +848,7 @@ class GlobalStateCallback(Callback):
             global_step,
             saved_epoch,
             default_group,
-            replay_contract={"weighted": weighted_replay, "timeout": replay_timeout, "workers": replay_workers},
+            replay_contract={"weighted": weighted_replay},
         )
 
         def restore_local(action, description, group=default_group):
@@ -856,6 +884,14 @@ class GlobalStateCallback(Callback):
             if offline_cache_writer_state is not None and offline_cache_writer is not None
             else None,
             "restoring offline-cache state",
+        )
+
+        offline_runtime = _offline_condition_runtime(self.trainer)
+        restore_local(
+            lambda: offline_runtime.load_offline_condition_state(global_state["_veomni_offline_condition"])
+            if offline_runtime is not None
+            else None,
+            "restoring offline condition state",
         )
 
         def restore_loader():

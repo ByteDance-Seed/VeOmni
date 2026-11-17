@@ -54,6 +54,22 @@ encoder and host-memory budget. Embedding disables sampler shuffling and pads
 only an index view of the source dataset; the saver discards trailing repeats
 so each original sample is written once.
 
+At a checkpoint, the saver flushes its buffered rows and records its output
+directory, shard position and remaining sample count alongside the data cursor.
+Resume requires the same writer geometry and output directory. It checks that
+the saved shards still exist with the expected total number of rows, and
+rejects missing or extra shards before restoring the cursor. A checkpoint
+without writer state cannot safely resume this output; use a new output run or
+a separately verified migration. Checkpoints can create additional partial
+parquet shards, adding checkpoint I/O; the input snapshot and transforms must
+also remain unchanged for the resumed data sequence to match. The output
+directory must be exclusive to this run: the check verifies names and row
+counts, not file contents. Resume also requires the same immutable condition
+model checkpoint and configuration; the saved class name does not verify their
+contents. The condition model's exposed private RNG is saved and restored with
+the cursor; an uncheckpointable private generator is rejected. Custom models
+must expose all private RNG state to participate in exact recovery.
+
 ## Model ownership
 
 Packing, valid-token selection, multimodal layouts, attention boundaries,

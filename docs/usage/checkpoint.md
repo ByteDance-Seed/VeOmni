@@ -48,11 +48,13 @@ created before this storage-view proof existed is rejected for optimizer resume,
 even when its target has no shared views; the old metadata cannot prove that the
 source was also unshared. Use a separately verified migration or a new
 weights-only run rather than silently assuming identical update behavior.
-This proof currently requires Linux procfs for nonempty CPU model tensors and
-rejects shared CPU mappings, quantized, non-strided, and meta model tensors.
-Accelerator tensors must use framework-owned storage; externally imported or
-shared accelerator allocations are not proved by this check. File-backed
-optimizer moments are separate from model tensors and are not restricted here.
+For supported nonempty model storage, this includes distinct tensor views that
+share an allocation. It does not prove aliasing through independently imported
+shared mappings, empty allocations or external accelerator storage. Recognized
+file-backed model storage and lazy conjugate/negative model views are rejected;
+some externally mapped storage cannot be detected and must not be used for
+model aliases. Quantized, non-strided and meta model tensors are unsupported.
+File-backed optimizer moments are separate and are not restricted here.
 
 ## What each path holds
 
@@ -67,6 +69,19 @@ optimizer moments are separate from model tensors and are not restricted here.
 | `lora_ckpt/` | `adapter_config.json`, `adapter_model.safetensors`. Written instead of `hf_ckpt/` when `model.lora_config` is set. | Rank 0, after a collective gather |
 | `checkpoint_manifest.json` | Format version, `global_step`, world size, and `model_state`: whether the step has a `model/` at all. Trainer-level completion only. | Rank 0, last |
 | `model_assets/[<module>/]` | Each model's config / tokenizer / processor, once per run at train start. Nested like `hf_ckpt/`; a SeedOmni run loaded from an upstream HF checkpoint writes both flat, in that checkpoint's layout ([Upstream Checkpoint Layout](../seed_omni/usage/hf_layout.md)). | Rank 0 |
+
+The rank-0 legacy HF writer and DCP-based LoRA exporter first save each shard
+in a unique temporary directory beside its destination. If safetensors reports an `ENOSYS` I/O
+error, VeOmni retries by serializing one shard in the local temporary directory
+and copying it sequentially to that destination-side directory before rename.
+Set `TMPDIR` to a local filesystem with enough space for the largest shard; a
+single tensor can exceed the configured shard size. A DCP-based LoRA export
+writes one complete adapter file, so local staging must fit the whole adapter.
+The destination must support
+sequential writes and rename, and this fallback adds local I/O and can increase
+export time. Using a memory-backed temporary directory also consumes host memory.
+The temporary-file rename protects the staged shard, not the publication of
+the entire multi-shard checkpoint or the adapter weights and config together.
 
 **Model assets** is whatever that model's runtime `model_assets` list carries, in type terms
 `Union[PretrainedConfig, GenerationConfig, PreTrainedTokenizer, ProcessorMixin]`
@@ -91,6 +106,9 @@ and compatibility checks when restoring a cursor. MultiOptimizer recovery
 continues to validate the optimizer generation and warns when the loader has no
 verified exact data-resume contract. A cursor saved under the strict dynamic
 contract cannot be restored through a different data path.
+Custom weighted sources and loaders must implement the
+[exact data-resume extension contract](exact_data_resume.md); merely exposing a
+`state_dict()` does not establish that the data stream is reproducible.
 Exact continuation starts after a completed optimizer step; step-zero cursors
 are rejected because iterator initialization may advance CPU RNG.
 
@@ -646,9 +664,9 @@ identity and rejects restoration; use the proven DCP path instead.
 The codec rejects tensor learning rates shared between groups. The saved alias
 identity covers parameters and buffers, including nonpersistent buffer aliases.
 Optimizer adapters and model serialization hooks are trusted to preserve their
-state and semantics. Identity tracks repeated tensor objects, but does not detect
-distinct views sharing storage; models that rely on mutable shared views are
-outside this checkpoint contract. The upstream and VeOmni-generated Qwen3
+state and semantics. Identity tracks repeated tensor objects and supported
+nonempty shared-storage views as described above; separately imported shared
+mappings remain outside the contract. The upstream and VeOmni-generated Qwen3
 dynamic RoPE reset alias is permitted when its current and original tables match
 a valid reconstruction; other reset aliases remain outside this contract.
 Dynamic RoPE frequencies and cached maximum lengths are not checkpointed. If

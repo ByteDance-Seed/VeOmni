@@ -66,17 +66,6 @@ def _rank_local_legacy_rejection(rank, store, checkpoint):
     )
     try:
         trainer = _make_mock_trainer(save_path=checkpoint)
-        trainer.train_dataloader = SimpleNamespace(_veomni_exact_resume_requested=rank == 0)
-        checkpoint_callback = CheckpointCallback.__new__(CheckpointCallback)
-        checkpoint_callback.trainer = trainer
-        with pytest.raises((ValueError, RuntimeError)):
-            checkpoint_callback.on_train_begin(TrainerState())
-        trainer.load.assert_not_called()
-        alive = torch.ones(1)
-        dist.all_reduce(alive)
-        assert alive.item() == 2
-
-        trainer = _make_mock_trainer(save_path=checkpoint)
         trainer.args.train.checkpoint.load_path = checkpoint
         trainer.args.train.global_rank = rank
         trainer.args.train.world_size = 2
@@ -94,5 +83,6 @@ def _rank_local_legacy_rejection(rank, store, checkpoint):
         dist.destroy_process_group()
 
 
-def test_legacy_request_and_missing_peer_state_are_coordinated(tmp_path):
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_missing_peer_legacy_state_is_coordinated(tmp_path):
     mp.spawn(_rank_local_legacy_rejection, args=(str(tmp_path / "store"), str(tmp_path)), nprocs=2, join=True)

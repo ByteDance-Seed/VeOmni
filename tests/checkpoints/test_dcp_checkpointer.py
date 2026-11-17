@@ -21,7 +21,7 @@ from torch.distributed.fsdp import fully_shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import spawn_with_rendezvous
-from veomni.arguments import MixedPrecisionConfig
+from veomni.arguments.arguments_types import MixedPrecisionConfig
 from veomni.distributed import torch_parallelize
 from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import (
@@ -726,7 +726,7 @@ class TestAllowPartialLoad:
     """DCP load may be partial for optimizer state, but not full model state."""
 
     def test_load_uses_allow_partial_load_planner(self):
-        from veomni.checkpoint.dcp_checkpointer import DefaultLoadPlanner
+        from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 
         planner = DefaultLoadPlanner(allow_partial_load=True)
         assert planner.allow_partial_load is True
