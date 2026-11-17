@@ -32,7 +32,13 @@ class TrainingMixin(TrainingModuleMixin):
     def forward_pre(
         self,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
+        # The graph hands a node the whole batch; this hook owns only the carrier.
+        # Swallowing the rest keeps framework metadata (``ds_idx`` / ``source_name``,
+        # which ``WeightedMultiSourceDataset`` appends) and any sibling module's
+        # keys from failing the call.
+        del kwargs
         self._conversation_carrier = conversation_list
         items = list(iter_desired_items(conversation_list, types=["image"], roles=["user"]))
         pixel_values = torch.stack([it.value for it in items], dim=0).to(

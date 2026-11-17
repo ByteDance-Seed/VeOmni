@@ -23,6 +23,14 @@ from ..modeling import JanusVqvae
 from ..processing import JanusVqvaeProcessor
 
 
+_FUSED_CE_IMPLS = frozenset({"chunk_loss", "liger_kernel"})
+"""CE rows that consume ``(hidden_states, weight)`` instead of materialised logits.
+
+They are fused-linear: passing logits leaves ``weight`` empty and the kernel
+raises ``chunk_loss requires a nonempty ``weight`` (fused-linear path)``.
+"""
+
+
 class TrainingMixin(TrainingModuleMixin):
     """Training-graph hooks — depends on :class:`JanusVqvae` modeling APIs."""
 
@@ -44,7 +52,12 @@ class TrainingMixin(TrainingModuleMixin):
     def encode_pre(
         self,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
+        # The graph hands a node the whole batch; these hooks own only the carrier.
+        # Swallowing the rest keeps framework metadata (``ds_idx`` / ``source_name``,
+        # which ``WeightedMultiSourceDataset`` appends) from failing the call.
+        del kwargs
         self._conversation_carrier = conversation_list
         # Real gen images and worker-built dummies are both assistant images
         # (normalized on CPU by the JanusVqvaePreprocessor); stack + move.
@@ -107,7 +120,9 @@ class TrainingMixin(TrainingModuleMixin):
     def decode_pre(
         self,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
+        del kwargs
         self._conversation_carrier = conversation_list
         hidden_states, labels, is_dummy_flag = self._prepare_decode_inputs(conversation_list)
         # No SP sharding here: the generation-head loss is a token-weighted mean over
@@ -226,24 +241,64 @@ class JanusVqvaeAccelerated(VeOmniMixin, JanusVqvae):
 
     def _vq_loss(self, hidden_states: torch.Tensor, gt_token_ids: torch.Tensor) -> torch.Tensor:
         labels = gt_token_ids.to(hidden_states.device)
-        logits = self.generation_head(hidden_states)
+        # The head is ``proj_out -> act -> vision_head``. A fused CE consumes the
+        # *last* linear's input (the projection_dim activations) plus its weight,
+        # so both the intermediate and the logits are derived from one pass.
+        pre_head = self.generation_head.activation_fn(self.generation_head.proj_out(hidden_states))
+        logits = self.generation_head.vision_head(pre_head)
         flat_labels = labels.reshape(-1)
         ps = get_parallel_state()
         n_valid_local = (flat_labels != -100).sum()
         if n_valid_local > 0:
-            loss, _, _ = self.loss_function(
+            return self._vq_ce(
+                pre_head=pre_head,
                 logits=logits,
-                shift_labels=flat_labels,
-                vocab_size=logits.size(-1),
+                flat_labels=flat_labels,
                 loss_reduction_group=ps.fsdp_group,
             )
-            return loss
+        # All-dummy span: no supervised token on this micro-batch, so there is
+        # nothing for a fused kernel to reduce. Unweighted eager CE on `-100`
+        # labels returns 0, which keeps the head in the graph without dividing
+        # by a zero count.
         loss, _, _ = ForCausalLMLoss(
             logits=logits,
             shift_labels=flat_labels,
             vocab_size=logits.size(-1),
             num_items_in_batch=n_valid_local.clamp(min=1),
             loss_reduction_group=ps.fsdp_group,
+        )
+        return loss
+
+    def _vq_ce(
+        self,
+        *,
+        pre_head: torch.Tensor,
+        logits: torch.Tensor,
+        flat_labels: torch.Tensor,
+        loss_reduction_group,
+    ) -> torch.Tensor:
+        """Cross-entropy over the generation head, on whichever backend was configured.
+
+        ``chunk_loss`` and ``liger_kernel`` are fused-linear: they need the final
+        linear's input activations and its weight, not a materialised logits
+        tensor. The eager row takes logits. Both shapes are computed here so an
+        explicit ``cross_entropy_loss_implementation`` override works rather than
+        raising ``chunk_loss requires a nonempty ``weight`` (fused-linear path)``.
+        """
+        if getattr(self.veomni_ce, "impl", None) in _FUSED_CE_IMPLS:
+            loss, _, _ = self.loss_function(
+                hidden_states=pre_head.reshape(-1, pre_head.size(-1)),
+                weights=self.generation_head.vision_head.weight,
+                shift_labels=flat_labels,
+                vocab_size=logits.size(-1),
+                loss_reduction_group=loss_reduction_group,
+            )
+            return loss
+        loss, _, _ = self.loss_function(
+            logits=logits,
+            shift_labels=flat_labels,
+            vocab_size=logits.size(-1),
+            loss_reduction_group=loss_reduction_group,
         )
         return loss
 

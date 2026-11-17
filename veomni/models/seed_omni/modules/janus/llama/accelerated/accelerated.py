@@ -98,6 +98,15 @@ class TrainingMixin(TrainingModuleMixin):
             tail_padding_length = pids.size(1) - self._sp_own_len
             cu_q = coalesce_tail_padding_cu_seqlens(cu_q, tail_padding_length=tail_padding_length)
             cu_k = coalesce_tail_padding_cu_seqlens(cu_k, tail_padding_length=tail_padding_length)
+            if tail_padding_length > 0:
+                # ``max_length_*`` came from the pre-coalesce segments and can
+                # exceed the padded length the kernel is handed once the tail is
+                # folded; recompute it from the coalesced lengths. Without this a
+                # packed sample whose longest segment sits in the padding raises
+                # ``cu_seqlens must run from 0 to <sliced len>``.
+                seqlens = cu_q[1:] - cu_q[:-1]
+                max_q = int(seqlens.max().item()) if seqlens.numel() else 0
+                max_k = max_q
             embeds = slice_input_tensor(embeds, dim=1, padding=False, group=group)
             pids = slice_input_tensor(pids, dim=1, padding=False, group=group)
             return dict(
