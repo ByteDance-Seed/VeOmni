@@ -33,7 +33,25 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 MODULES = ("janus_siglip", "janus_vqvae", "janus_text_encoder", "janus_llama")
 
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+# Deliberately no module-level ``pytestmark``: the CI plan decides whether a
+# case runs on a CPU lease or an accelerator one, and a file-wide ``device="cpu"``
+# would put the fused-loss cases on a CPU lease too — where every torch kernel
+# they need is hidden and they skip, leaving the fix they cover unverified. The
+# pure-Python cases carry an explicit CPU marker instead; the fused ones take the
+# runner default, which is "accelerator" on a GPU/NPU runner.
+_CPU = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def _per_backend_plan(context):
+    """Accelerator lease for a fused CE row, CPU for the eager one.
+
+    The parametrization is over ``impl``, so the lease has to follow the
+    parameter: an accelerator lease keeps the Triton / flash-attn kernels
+    visible, while the eager row stays on CPU where it is cheapest.
+    """
+    impl = context.params["impl"]
+    return LaunchSpec(device="cpu" if impl == "eager" else "accelerator")
+
 
 _VISION_CONFIG = {
     "hidden_size": 8,
@@ -65,6 +83,7 @@ _VQ_CONFIG = {
 }
 
 
+@_CPU
 def test_every_module_registers_config_model_accelerated_and_processor():
     for name in MODULES:
         assert name in OMNI_CONFIG_REGISTRY, name
@@ -78,6 +97,7 @@ def test_every_module_registers_config_model_accelerated_and_processor():
     assert "janus_vqvae" in OMNI_PROCESSOR_REGISTRY
 
 
+@_CPU
 def test_the_backbone_keeps_the_upstream_attention_capability_flags():
     """``janus_llama`` runs HF's patched ``LlamaModel``, so it inherits its set."""
     llm = OMNI_MODEL_REGISTRY["janus_llama"]()
@@ -86,6 +106,7 @@ def test_the_backbone_keeps_the_upstream_attention_capability_flags():
     assert OMNI_CONFIG_REGISTRY["janus_llama"]().sub_configs.keys() == {"text_config"}
 
 
+@pytest.mark.launch_plan(provider=_per_backend_plan)
 @pytest.mark.parametrize("impl", ["eager", *sorted(_FUSED_CE_IMPLS)])
 def test_the_vq_head_scores_on_every_cross_entropy_backend(impl):
     """The generation head's CE has to accept the configured backend.
@@ -179,6 +200,7 @@ def test_the_fused_vq_backend_accepts_the_batched_training_shape(impl):
     assert head_bias.grad is not None and head_bias.grad.abs().sum() > 0
 
 
+@pytest.mark.launch_plan(provider=_per_backend_plan)
 @pytest.mark.parametrize("impl", ["eager", "chunk_loss"])
 def test_the_fused_vq_backend_matches_eager_with_the_real_head_bias(impl):
     """Switching the CE backend must not change the number.
@@ -238,6 +260,7 @@ def _vqvae_processor():
     return JanusVqvaeProcessor(image_processor=JanusImageProcessor(image_size=8, patch_size=4), num_patches=1)
 
 
+@_CPU
 def test_the_training_hooks_accept_collated_multisource_metadata():
     """``ds_idx`` / ``source_name`` ride along with every sample and must not crash.
 
@@ -292,6 +315,7 @@ def test_the_training_hooks_accept_collated_multisource_metadata():
     vqvae.decode_pre(**metadata)
 
 
+@_CPU
 def test_generate_refuses_sequence_parallelism(monkeypatch):
     """``generate`` feeds the full prompt, so SP would exchange duplicated shards.
 
