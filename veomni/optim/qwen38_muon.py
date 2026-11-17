@@ -13,6 +13,7 @@ this first implementation prioritizes safe resume over CPU memory savings.
 import json
 import math
 import os
+from collections import ChainMap
 from contextlib import contextmanager
 from functools import wraps
 
@@ -730,7 +731,7 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "preparing file-backed Muon state")
-        _validate_file_muon_gradient_traffic(self.param_groups, {**self.state, **pending_states})
+        _validate_file_muon_gradient_traffic(self.param_groups, ChainMap(pending_states, self.state))
         self.state.update(pending_states)
 
     @torch.no_grad()
