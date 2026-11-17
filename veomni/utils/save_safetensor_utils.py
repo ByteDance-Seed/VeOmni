@@ -262,7 +262,7 @@ def should_use_distributed_hf_safetensor_save(ckpt_manager: Optional[str]) -> bo
     Disable the distributed ``HuggingFaceStorageWriter`` path on NPU. Under
     HSDP replicate ranks independently cast fp32->bf16 on-device and write
     per-rank safetensors files. When the casts are not bit-exact (~1 ULP on
-    Atlas A2 training products) the consolidation step bakes in whichever rank's data it
+    Ascend 910B) the consolidation step bakes in whichever rank's data it
     reads last, causing an intermittent mismatch against the fp32 DCP
     checkpoint. Route through the legacy rank-0 path until the underlying
     fp32->bf16 determinism issue is resolved in the NPU stack.

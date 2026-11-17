@@ -89,7 +89,7 @@ RUN (pip uninstall -y triton triton-ascend || true) && \
     python -c "from triton._C.libtriton import ascend"
 
 # ONE RUN so the CANN env from set_env.sh persists. The ascend910_93 SOC target was
-# validated by building and running GDN on physical Atlas A3 training products hardware (x86/Atlas A2 training products uses ascend910b).
+# validated by building and running GDN on physical A3 hardware (x86/a2 uses ascend910b).
 # torch binding wheel is force-reinstalled with --no-deps (else pip pulls a CUDA torch).
 RUN git clone https://github.com/flashserve/flash-linear-attention-npu /tmp/fla-npu && \
     cd /tmp/fla-npu && git checkout c2e3d83f && \

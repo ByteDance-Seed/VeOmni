@@ -54,7 +54,7 @@ jobs:
     needs: lint
     if: github.repository_owner == 'ByteDance-Seed'
     name: VeOmni Ascend test (self-host)
-    # Pick any free 8-card Atlas A2 training products slice (910b-0..5). See
+    # Pick any free 8-card 910B slice (910b-0..5). See
     # github_runner/README.md for the full label scheme. Use
     # `[self-hosted, 910b-N]` if you need to pin to a specific runner, or
     # `[self-hosted, 910b-host-N]` to pin to a specific physical machine.

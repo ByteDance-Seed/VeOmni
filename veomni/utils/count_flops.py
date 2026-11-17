@@ -31,7 +31,7 @@ def get_device_flops(unit="T"):
     publishes that boost clock up to Hopper, so the datasheet numbers already match;
     for Blackwell it is the clock the deployed part actually runs at (`nvidia-smi
     --query-gpu=clocks.max.sm`), which is higher than the clock behind the datasheet.
-    H20 and Atlas A2 training products are throughput-capped SKUs the formula does not describe.
+    H20 and 910B are throughput-capped SKUs the formula does not describe.
     """
 
     def unit_convert(number, level):
