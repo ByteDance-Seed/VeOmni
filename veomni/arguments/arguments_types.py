@@ -1279,7 +1279,6 @@ class TrainingArguments:
             )
         },
     )
-
     # sub-argument groups
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
