@@ -18,7 +18,7 @@ docker/
 ```
 
 Ascend file names encode the variant: CANN version, torch-npu version where it
-is pinned, then the SoC (`910b` / Atlas A2训练系列产品 vs `a3`) and the host arch (`.x86` /
+is pinned, then the SoC (`910b` / Atlas A2 training products vs `a3`) and the host arch (`.x86` /
 `.arm`; the `a3` files are arm-only).
 
 ## Building

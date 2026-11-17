@@ -5,7 +5,7 @@ When adding a new workflow for continuous integration (CI), you have two runner 
 - **Fixed Runner**: To use a self-hosted fixed runner, specify it via the `runs-on` keyword. Common label sets:
   - GPU, any free L20-8 host: `runs-on: [self-hosted, l20-8]`
   - GPU, a specific host (e.g. for repro): `runs-on: [self-hosted, l20-3]`
-  - NPU, any free 8-card Atlas A2训练系列产品 slice: `runs-on: [self-hosted, 910b-8]`
+  - NPU, any free 8-card Atlas A2 training products slice: `runs-on: [self-hosted, 910b-8]`
   - NPU, a specific 8-card slice: `runs-on: [self-hosted, 910b-2]`
   - NPU, a specific physical machine (either of its two splits): `runs-on: [self-hosted, 910b-host-1]`
 

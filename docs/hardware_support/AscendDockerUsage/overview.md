@@ -43,26 +43,26 @@ All image tags follow this pattern:
 
 | Chip Series | Architecture | Tag Example | Dockerfile |
 |---|---|---|---|
-| Atlas A2训练系列产品 | amd64 + arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni` | [x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86) / [arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm) |
-| Atlas A3训练系列产品 | arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.12-veomni` | [a3](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_a3) |
+| Atlas A2 training products | amd64 + arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni` | [x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86) / [arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm) |
+| Atlas A3 training products | arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.12-veomni` | [a3](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_a3) |
 
 For the complete list of published image tags, see [Ascend Docker Supported Tags](supported_tags.md).
 
 Notes:
 
-- **Atlas A2训练系列产品** ships two Dockerfiles (x86 and arm64); CI merges them into a single multi-arch image sharing one tag.
-- **Atlas A3训练系列产品** is arm64 only.
+- **Atlas A2 training products** ships two Dockerfiles (x86 and arm64); CI merges them into a single multi-arch image sharing one tag.
+- **Atlas A3 training products** is arm64 only.
 - The historical `8.3.rc2` Dockerfiles (`Dockerfile.ascend_8.3.rc2_a2.x86/.arm/a3`) remain in the repo but are no longer published.
 
 ---
 
 ## CANN 9.2.1
 
-CANN 9.2.1 Dockerfiles cover Atlas A2训练系列产品 x86/ARM64 and Atlas A3训练系列产品 ARM64. All three use
+CANN 9.2.1 Dockerfiles cover Atlas A2 training products x86/ARM64 and Atlas A3 training products ARM64. All three use
 system Python and include a uv cache and development dependencies. See the
-[Atlas A2训练系列产品 guide](build_a2_docker.md), [Atlas A3训练系列产品 guide](build_a3_docker.md), and
+[Atlas A2 training products guide](build_a2_docker.md), [Atlas A3 training products guide](build_a3_docker.md), and
 [publication status](supported_tags.md#cann-921-pending-quay-publication).
-The existing Atlas A2训练系列产品/Atlas A3训练系列产品 builders select the CANN 9.2.1 Dockerfiles. See the
+The existing Atlas A2 training products/Atlas A3 training products builders select the CANN 9.2.1 Dockerfiles. See the
 [build and publication rules](overview.md#build-and-publication-workflows).
 NPU test workflows retain their existing environment.
 
@@ -104,8 +104,8 @@ docker run --runtime=runc -it \
 
 For complete, advanced mount and training configuration (checkpoint / dataset mounts, training command examples) per platform, see:
 
-- [build_a2_docker.md](build_a2_docker.md) — Atlas A2训练系列产品 build and usage
-- [build_a3_docker.md](build_a3_docker.md) — Atlas A3训练系列产品 build and usage
+- [build_a2_docker.md](build_a2_docker.md) — Atlas A2 training products build and usage
+- [build_a3_docker.md](build_a3_docker.md) — Atlas A3 training products build and usage
 
 ---
 
@@ -158,13 +158,13 @@ The existing Ascend workflows build CANN 9.2.1 images and publish to
 
 | Workflow | Platforms | Image tag on `main` |
 | --- | --- | --- |
-| [Atlas A2训练系列产品 builder](../../../.github/workflows/docker-build-ascend-a2.yml) | `linux/amd64`, `linux/arm64` | `veomni-9.2.1-910b-ubuntu22.04-py3.12-latest` |
-| [Atlas A3训练系列产品 builder](../../../.github/workflows/docker-build-ascend-a3.yml) | `linux/arm64` | `veomni-9.2.1-a3-ubuntu22.04-py3.12-latest` |
+| [Atlas A2 training products builder](../../../.github/workflows/docker-build-ascend-a2.yml) | `linux/amd64`, `linux/arm64` | `veomni-9.2.1-910b-ubuntu22.04-py3.12-latest` |
+| [Atlas A3 training products builder](../../../.github/workflows/docker-build-ascend-a3.yml) | `linux/arm64` | `veomni-9.2.1-a3-ubuntu22.04-py3.12-latest` |
 
 Both support manual dispatch, published releases and path-filtered pushes to
-`main`. Atlas A2训练系列产品 watches its workflow and both CANN 9.2.1 Atlas A2训练系列产品 Dockerfiles, builds
+`main`. Atlas A2 training products watches its workflow and both CANN 9.2.1 Atlas A2 training products Dockerfiles, builds
 on native x86 and ARM runners, and merges the digests into a multi-architecture
-image. Atlas A3训练系列产品 watches its workflow and the CANN 9.2.1 Atlas A3训练系列产品 Dockerfile.
+image. Atlas A3 training products watches its workflow and the CANN 9.2.1 Atlas A3 training products Dockerfile.
 Release builds retain the existing release-tag and `.postN` naming scheme.
 Upstream publication runs under the `ByteDance-Seed` owner using the existing
 Quay credentials. Build jobs are restricted to the `ByteDance-Seed` owner.
@@ -195,7 +195,7 @@ The cache is stored in the image layer, outside `/app`, rather than in a
 BuildKit cache mount, so mounting a new source checkout does not hide it.
 
 The warm-up also installs ninja, pybind11 and the target's Triton packages
-through uv. Atlas A2训练系列产品 x86 additionally caches Triton-Ascend 3.2.1 from the Huawei
+through uv. Atlas A2 training products x86 additionally caches Triton-Ascend 3.2.1 from the Huawei
 index used by the existing upstream workflow. This cache-only installation
 does not change the image's runtime Triton-Ascend version.
 

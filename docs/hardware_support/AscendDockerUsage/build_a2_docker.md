@@ -1,4 +1,4 @@
-# Atlas A2训练系列产品 Docker Image Build and Usage Guide
+# Atlas A2 training products Docker Image Build and Usage Guide
 
 ## CANN 9.2.1 images
 
@@ -50,8 +50,8 @@ docker run --rm -it --network host --shm-size=32g \
 For x86, use `linux/amd64` in the pull command and the local
 `veomni:cann921-a2-amd64` tag in the run command.
 
-The existing [Atlas A2训练系列产品 builder](../../../.github/workflows/docker-build-ascend-a2.yml)
-and [Atlas A3训练系列产品 builder](../../../.github/workflows/docker-build-ascend-a3.yml) build
+The existing [Atlas A2 training products builder](../../../.github/workflows/docker-build-ascend-a2.yml)
+and [Atlas A3 training products builder](../../../.github/workflows/docker-build-ascend-a3.yml) build
 these CANN 9.2.1 Dockerfiles on matching native runners. They support manual
 dispatch, published releases, and path-filtered pushes to `main`. Upstream
 builds publish to Quay using repository secrets. Build jobs are restricted
@@ -65,15 +65,15 @@ See [validation scope and cache details](overview.md#validation-scope).
 The instructions below describe the existing CANN 9.1.0 images.
 
 ## Overview
-This guide provides step-by-step instructions for building and using the Atlas A2训练系列产品 Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Atlas A2训练系列产品 accelerators.
+This guide provides step-by-step instructions for building and using the Atlas A2 training products Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Atlas A2 training products accelerators.
 
-**Note**: Atlas A2训练系列产品 supports both x86 and ARM64 architectures, with different environment management approaches for each:
+**Note**: Atlas A2 training products supports both x86 and ARM64 architectures, with different environment management approaches for each:
 - **x86 Architecture**: Uses `uv` for dependency management, requires virtual environment activation
 - **ARM64 Architecture**: Uses `pip` for dependency management, no virtual environment required
 
 ## Prerequisites
 - Docker installed on your system
-- Access to Atlas A2训练系列产品 hardware accelerators
+- Access to Atlas A2 training products hardware accelerators
 - Network access to pull the base image and install dependencies
 - Proxy configuration (if required in your environment)
 
@@ -92,7 +92,7 @@ docker pull --platform=amd64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1
 
 ## Step 2: Build the Custom Image
 
-Build the GDN-ready VeOmni Atlas A2训练系列产品 image using
+Build the GDN-ready VeOmni Atlas A2 training products image using
 `Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86` for x86 or
 `Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm` for ARM64. These Dockerfiles include
 `torch-npu==2.10.0.post2`, `triton-ascend`, and `fla_npu`.
