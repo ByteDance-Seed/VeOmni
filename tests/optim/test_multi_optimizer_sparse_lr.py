@@ -193,6 +193,18 @@ def test_sparse_leaf_learning_rate_survives_dcp_roundtrip(tmp_path):
         parallel_state=parallel,
     )
     assert restored_bias.param_groups[0]["lr"] == 0.0025
+    original_bias = model.bias.detach().clone()
+    gradient = torch.tensor([0.25, -0.5])
+    model.bias.grad = gradient.clone()
+    restored_model.bias.grad = gradient.clone()
+    bias.step()
+    restored_bias.step()
+    assert not torch.equal(model.bias, original_bias)
+    torch.testing.assert_close(restored_model.bias, model.bias, rtol=0, atol=0)
+    for key in ("step", "exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(
+            restored_bias.state[restored_model.bias][key], bias.state[model.bias][key], rtol=0, atol=0
+        )
 
 
 def _fsdp2_empty_leaf_worker(rank, checkpoint, endpoint):
@@ -267,6 +279,19 @@ def _fsdp2_empty_leaf_worker(rank, checkpoint, endpoint):
         assert restored_second.param_groups[0]["lr"] == 0.0025
         for expected, param in zip(source_shards, restored_model.parameters(), strict=True):
             torch.testing.assert_close(expected, param.to_local(), rtol=0, atol=0)
+        for source, target in zip(model[1].parameters(), restored_model[1].parameters(), strict=True):
+            source.grad = torch.ones_like(source)
+            target.grad = torch.ones_like(target)
+        second.step()
+        restored_second.step()
+        for source, target in zip(model[1].parameters(), restored_model[1].parameters(), strict=True):
+            torch.testing.assert_close(source.to_local(), target.to_local(), rtol=0, atol=0)
+            for field in ("step", "exp_avg", "exp_avg_sq"):
+                original = second.state[source][field]
+                recovered = restored_second.state[target][field]
+                if hasattr(original, "to_local"):
+                    original, recovered = original.to_local(), recovered.to_local()
+                torch.testing.assert_close(original, recovered, rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
 
