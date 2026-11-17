@@ -239,13 +239,18 @@ unresolved cause instead of continuing speculative edits. Continue independent r
    A workflow edit alone proves none of those execution outcomes.
 
 Required accelerator selections must fail when hardware preflight fails.
-Freeze a non-empty set of expected node IDs for all required cases (including parameter IDs where applicable) from the original scope and
-collection evidence, with explicit mappings for renamed cases. Require an
-executable CI gate to match each required ID against JUnit/results and reject
+Freeze a non-empty set of required `(execution configuration, full pytest node ID)`
+pairs from the original scope and collection evidence, with explicit mappings for
+renamed cases. Preserve job, matrix, manifest selection and environment identity
+where needed to distinguish executions. Include parameter IDs where applicable;
+non-parameterized node IDs are valid, including for single-configuration cases.
+Require an executable CI gate to match a separate JUnit/result record to every
+required pair. A passing result for one configuration must not satisfy another
+configuration running the same node ID. Reject
 missing, deselected, skipped, failed or errored cases even when other cases pass.
 Allowed skips apply only to explicitly optional cases. If the gate is missing
 or unverified, report coverage as incomplete rather than validated-and-wired.
-Evaluate conditional required IDs only when their predicate is active; record
+Evaluate conditional required pairs only when their predicate is active; record
 inactive conditions separately and fail an unexpectedly empty active selection.
 Preserve the pytest exit code through pipelines
 (`pipefail` with `tee`) and upload existing logs/JUnit with `if: always()` even

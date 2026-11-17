@@ -189,15 +189,21 @@ coverage, matching the largest launch in that step, bounded execution and JUnit
 artifacts. Do not copy private Python/CANN paths or device IDs into public CI.
 
 For a required real-device selection, fail preflight when its backend or device
-count is unavailable. Establish a non-empty set of expected node IDs for all required cases (including parameter IDs where applicable)
-from the approved matrix and collection evidence before execution; do not derive
-the required set from only the results that happened to pass. Make the CI gate
-compare that set against JUnit/results using an explicit node-ID mapping. Fail
+count is unavailable. Establish a non-empty set of required
+`(execution configuration, full pytest node ID)` pairs from the approved matrix
+and collection evidence before execution, with explicit mappings for renamed
+cases. Preserve job, matrix, manifest selection and environment identity where
+needed to distinguish executions. Include parameter IDs where applicable;
+non-parameterized node IDs are valid, including for single-configuration cases.
+Do not derive the required set from only the results that happened to pass.
+Make the CI gate match a separate JUnit/result record to every required pair.
+A passing result for one configuration must not satisfy another configuration
+running the same node ID. Fail
 if any required case is missing, deselected, skipped, failed or errored, even if
 other cases in the directory pass. Allowed skips must name optional cases only
 and cannot waive required coverage. Preserve this check as an executable gate,
 not just a report instruction; if it is not implemented or verified, mark the
-coverage gate incomplete. For conditional selections, evaluate required IDs
+coverage gate incomplete. For conditional selections, evaluate required pairs
 only under their active predicate and record inactive conditions explicitly;
 an unexpectedly empty active selection is a failure.
 Upload logs with `if: always()` so a failed test still leaves evidence, and retain
