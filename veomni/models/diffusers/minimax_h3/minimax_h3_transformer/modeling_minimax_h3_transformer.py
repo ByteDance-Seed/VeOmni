@@ -92,6 +92,8 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             norm_eps=config.norm_eps,
             qk_norm_eps=config.qk_norm_eps,
             final_norm_eps=config.final_norm_eps,
+            audio_enabled=config.audio_enabled,
+            num_pdd_heads=config.num_pdd_heads,
             config=config,
         )
 
@@ -145,6 +147,36 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         return MiniMaxH3DiTOutput(
             predictions=[[out.predictions[0] for out in outputs], [out.predictions[1] for out in outputs]],
             loss=losses,
+        )
+
+    def forward_image(
+        self,
+        x,
+        prompt_embeds,
+        unique_timesteps,
+        timestep_indices,
+        token_tags,
+        position_ids,
+        image_indices,
+        text_indices,
+        pdd_step_index=None,
+        packed_seq_params=None,
+        refiner_packed_seq_params=None,
+    ):
+        """Run the audio-free MiniMax-H3-Image packed sequence."""
+        self._load_packed_attention_kernel()
+        return self.dit.forward_image(
+            x=x,
+            prompt_embeds=prompt_embeds,
+            unique_timesteps=unique_timesteps,
+            timestep_indices=timestep_indices,
+            token_tags=token_tags,
+            position_ids=position_ids,
+            image_indices=image_indices,
+            text_indices=text_indices,
+            pdd_step_index=pdd_step_index,
+            packed_seq_params=packed_seq_params,
+            refiner_packed_seq_params=refiner_packed_seq_params,
         )
 
     def forward(
