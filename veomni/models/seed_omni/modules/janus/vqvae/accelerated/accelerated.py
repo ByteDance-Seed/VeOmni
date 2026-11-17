@@ -297,9 +297,14 @@ class JanusVqvaeAccelerated(VeOmniMixin, JanusVqvae):
         impl = getattr(self.veomni_ce, "impl", None)
 
         if impl == "chunk_loss":
+            # ``hidden_states`` is flattened to ``[tokens, H]`` for the fused
+            # linear, so every token-axis argument has to be flattened with it.
+            # The training shape is ``[1, T, H]``, where a 3-D ``logits_bias``
+            # would fail chunk_loss' row check against the 2-D activations.
+            flat_pre_head = pre_head.reshape(-1, pre_head.size(-1))
             if bias is None:
                 loss, _, _ = self.loss_function(
-                    hidden_states=pre_head.reshape(-1, pre_head.size(-1)),
+                    hidden_states=flat_pre_head,
                     weights=head.weight,
                     shift_labels=flat_labels,
                     vocab_size=logits.size(-1),
@@ -307,11 +312,11 @@ class JanusVqvaeAccelerated(VeOmniMixin, JanusVqvae):
                 )
                 return loss
             # ``logits_bias`` is added to each chunk's logits: rows must line up
-            # with the activations, and a scalar ones column turns the (V, 1)
-            # bias weight into the plain bias vector.
-            ones = pre_head.new_ones(pre_head.shape[:-1] + (1,))
+            # with the activations, and a ones column turns the (V, 1) bias
+            # weight into the plain bias vector.
+            ones = flat_pre_head.new_ones(flat_pre_head.shape[:-1] + (1,))
             loss, _, _ = self.loss_function(
-                hidden_states=pre_head.reshape(-1, pre_head.size(-1)),
+                hidden_states=flat_pre_head,
                 weights=head.weight,
                 shift_labels=flat_labels,
                 vocab_size=logits.size(-1),

@@ -39,6 +39,7 @@ checkpoint then works without an offline convert:
 from __future__ import annotations
 
 import atexit
+import gc
 import json
 import os
 import shutil
@@ -86,6 +87,8 @@ _SAFE_WEIGHTS_NAME = "model.safetensors"
 # Per-rank files ``HuggingFaceStorageWriter`` stages before consolidating into the save root.
 _DCP_STAGING_DIRNAME = "sharded"
 _SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
+_PICKLE_WEIGHTS_NAME = "pytorch_model.bin"
+_PICKLE_WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
 _WEIGHT_FILE_SUFFIXES = (
     ".safetensors",
     ".bin",
@@ -117,11 +120,15 @@ def _accepts_source_path(build_config: Callable[..., Any]) -> bool:
 
 
 def read_source_weight_files(source_path: str) -> dict[str, str]:
-    """``{weight key: shard filename}`` of a safetensors HF checkpoint.
+    """``{weight key: shard filename}`` of an HF checkpoint, either serialization.
 
-    Also the entry point a family layout uses to inspect the stored tensors
-    while building its module configs (Janus' tie flags depend on them).
-    Raises ``FileNotFoundError`` when the directory holds no safetensors weights.
+    Covers ``model.safetensors[.index.json]`` and the legacy
+    ``pytorch_model.bin[.index.json]``, because both are things
+    ``from_pretrained`` accepts — a family layout resolving a decision against
+    the stored tensors (Janus' tie flags) must not silently fall back to the
+    config just because the checkpoint uses the other format.
+
+    Raises ``FileNotFoundError`` when the directory holds no recognised weights.
     """
     index_path = os.path.join(source_path, _SAFE_WEIGHTS_INDEX_NAME)
     if os.path.isfile(index_path):
@@ -133,7 +140,74 @@ def read_source_weight_files(source_path: str) -> dict[str, str]:
 
         with safe_open(single, framework="pt", device="cpu") as f:
             return dict.fromkeys(f.keys(), _SAFE_WEIGHTS_NAME)
-    raise FileNotFoundError(f"{source_path} has neither {_SAFE_WEIGHTS_INDEX_NAME} nor {_SAFE_WEIGHTS_NAME}.")
+
+    pickle_index = os.path.join(source_path, _PICKLE_WEIGHTS_INDEX_NAME)
+    if os.path.isfile(pickle_index):
+        with open(pickle_index, encoding="utf-8") as f:
+            return dict(json.load(f)["weight_map"])
+    pickle_single = os.path.join(source_path, _PICKLE_WEIGHTS_NAME)
+    if os.path.isfile(pickle_single):
+        return dict.fromkeys(_pickle_state_dict_keys(pickle_single), _PICKLE_WEIGHTS_NAME)
+
+    raise FileNotFoundError(
+        f"{source_path} has none of {_SAFE_WEIGHTS_INDEX_NAME} / {_SAFE_WEIGHTS_NAME} / "
+        f"{_PICKLE_WEIGHTS_INDEX_NAME} / {_PICKLE_WEIGHTS_NAME}."
+    )
+
+
+def _pickle_state_dict_keys(path: str) -> list[str]:
+    """Top-level keys of a ``pytorch_model.bin`` state dict, without materialising it.
+
+    ``torch.load`` is the only reader that matches what the loader itself will
+    do, and the weights are read once here rather than twice: a 1.3B checkpoint
+    is a couple of GiB, so mapping it and dropping it is cheaper than keeping a
+    second copy alive next to the load.
+    """
+    state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    try:
+        return list(state.keys())
+    finally:
+        del state
+        gc.collect()
+
+
+def read_source_tensors(
+    source_path: str, weight_files: Mapping[str, str], keys: tuple[str, ...] | list[str]
+) -> dict[str, torch.Tensor]:
+    """Read ``keys`` out of an HF checkpoint, safetensors or pickle.
+
+    ``weight_files`` is :func:`read_source_weight_files`' mapping, so the shard
+    each key lives in is already known and each file is opened once per format.
+    The pickle path loads whole shards (there is no random access), then keeps
+    only the requested keys.
+    """
+    wanted = set(keys)
+    tensors: dict[str, torch.Tensor] = {}
+
+    safe_files = {name for key, name in weight_files.items() if key in wanted and name.endswith(".safetensors")}
+    if safe_files:
+        from safetensors import safe_open
+
+        for filename in sorted(safe_files):
+            with safe_open(os.path.join(source_path, filename), framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if key in wanted:
+                        tensors[key] = f.get_tensor(key)
+
+    pickle_files = {name for key, name in weight_files.items() if key in wanted and name.endswith(".bin")}
+    for filename in sorted(pickle_files):
+        state = torch.load(os.path.join(source_path, filename), map_location="cpu", weights_only=True, mmap=True)
+        try:
+            for key in state.keys() & wanted:
+                tensors[key] = state[key]
+        finally:
+            del state
+            gc.collect()
+
+    missing = wanted - tensors.keys()
+    if missing:
+        raise ValueError(f"{source_path} does not store {sorted(missing)}.")
+    return tensors
 
 
 @dataclass(frozen=True)

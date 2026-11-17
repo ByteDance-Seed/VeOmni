@@ -65,7 +65,8 @@ prefixes, so every source tensor lands on exactly one module.
 Both HF weight serializations load: `model.safetensors[.index.json]` and the
 legacy `pytorch_model.bin[.index.json]`, since `load_model_weights` resolves
 either. Whichever the checkpoint ships, the layout is a drop-in for
-`from_pretrained`.
+`from_pretrained` — including for the tie decision, which is resolved against
+the stored tensors and therefore has to read both formats.
 
 Exporting is narrower: `save_hf_weights` writes back in the source layout, so
 it needs safetensors weights to key the output on. A `.bin`-only root loads and
