@@ -70,6 +70,9 @@ class _RecordingGdnOp:
         *,
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
+        cu_seqlens_list: list[int] | None = None,
+        chunk_indices: object = None,
+        chunk_indices_list: object = None,
     ):
         self._calls.append(
             {
@@ -81,6 +84,8 @@ class _RecordingGdnOp:
                 "cu_seqlens": cu_seqlens,
                 "output_final_state": output_final_state,
                 "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
+                "cu_seqlens_list": cu_seqlens_list,
+                "chunk_indices_list": chunk_indices_list,
             }
         )
         state = None
