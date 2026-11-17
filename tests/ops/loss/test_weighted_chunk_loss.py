@@ -288,6 +288,13 @@ def _check_sp_weighted_reduce(rank, path):
         output = reduce_sequence_parallel_loss(zero_loss, torch.tensor(0.0), group=dist.group.WORLD)
         output.backward()
         assert output.item() == zero_loss.grad.item() == 0.0
+
+        partial_loss = torch.tensor(7.0 if rank == 0 else 4.0, requires_grad=True)
+        partial_mass = torch.tensor(0.0 if rank == 0 else 0.25)
+        output = reduce_sequence_parallel_loss(partial_loss, partial_mass, group=dist.group.WORLD)
+        output.backward()
+        torch.testing.assert_close(output, torch.tensor(4.0), rtol=0, atol=0)
+        torch.testing.assert_close(partial_loss.grad, torch.tensor(0.0 if rank == 0 else 2.0), rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
 
