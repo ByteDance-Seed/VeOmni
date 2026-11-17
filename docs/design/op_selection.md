@@ -84,12 +84,14 @@ the activation block *and* the weight tile, because the deployment recipe ties t
 activation's). A recipe that used different widths for the two operands would need
 the row to take them separately; none does today.
 
-Note that `RowPrecision` covers the op registry only.
+Note that `NumericMode` covers the op registry only.
 [float8 training](../usage/float8_training.md) is a module conversion
 (`Float8Linear`) driven from `fsdp_config`, outside the registry entirely: it is
-native in spirit. A quantizing row and a float8 target cannot share a projection,
-which the row-level guards already enforce because a converted projection is an
-`nn.Linear` subclass the rows refuse.
+native in spirit, and it is why `torchao`'s native mode is not reachable through
+this row yet — that path replaces the module before FSDP wraps, while a row wraps one
+call. A quantizing row and a float8 target cannot share a projection, which the
+row-level guards already enforce because a converted projection is an `nn.Linear`
+subclass the rows refuse.
 
 These arguments are **not** `model.ops_implementation` fields. They are parameters
 of the registered row, resolved at the call site, so changing one is a modeling
@@ -247,26 +249,35 @@ quantization off for a site means naming a reference row such as `eager` or
 
 **But the name does not say whether the rounding is emulated or native**, and the
 two behave differently everywhere a guard has to make a decision. So each row
-declares its `RowPrecision`:
+declares the `NumericMode`s its wrapper implements, and — where it offers both — the
+`emulated` row argument picks which one a call runs in:
 
-| Value | What the row does | Rows |
+| Value | What the call does | Rows |
 | --- | --- | --- |
 | `EXACT` | Computes on the operands unchanged | `eager`, `fused_triton`, `liger_kernel`, …. The default |
-| `EMULATED` | Rounds operands to the target format, then runs the GEMM in the model dtype. Training only: straight-through gradients, high-precision parameters | `qat`, `torchao` |
-| `NATIVE` | Casts operands to the target format and runs the GEMM in it | `deepgemm` |
+| `EMULATED` | Rounds operands to the target format, then runs the GEMM in the model dtype. Training only: straight-through gradients, high-precision parameters | `qat`, and `torchao` when `emulated` is true (its default) |
+| `NATIVE` | Casts operands to the target format and runs the GEMM in it | `deepgemm`, and `torchao` with `emulated: false` |
 
-`torchao` reads like a native FP4 GEMM and is not one: it uses torchao's
-`NVFP4Tensor` round trip to match that kernel's numerics, then multiplies in BF16.
-The registry cannot infer this from the name, which is why the row states it.
+This is a property of the **call**, not only the row, because one kernel can do both.
+torchao's own `Float8LinearConfig.emulate` works the same way, and it is why the mode
+cannot be a constant on the row: a registry that fixes it per row name forces a second
+name for the same kernel.
 
-Two derived sets answer the two different questions:
+```yaml
+linear_implementation:
+  name: torchao
+  kwargs: {dtype: nvfp4, emulated: true}    # round, then multiply in the model dtype
+```
 
-- `OP_REGISTRY.rounding_impls(op)` — every row that rounds anything. This is the
-  guard set: a wrapped projection has no `weight` to give such a row, every fused
-  kernel bakes one activation in, and an adapter cannot sit in front of it. It
-  contains both `qat` and `deepgemm`.
-- `OP_REGISTRY.emulated_impls(op)` — only the rows that *simulate* a deployment
-  kernel. This is the adapter set: no `moe_experts_lora` row reproduces a rounding.
+The guards follow the call, which is the part that matters. An emulated row reads the
+weight to round it, so a wrapped projection has none to give and an adapter cannot sit
+in front of it; a native row that owns its own arithmetic does not need to.
+`VeomniOp.mode` answers for the arguments a config resolved to, and that is what
+`_moe_lora_op`, `reject_quantizing_act_fn`, `reject_quantizing_row` and
+`resolve_projection` ask.
+
+`OP_REGISTRY.rounding_impls(op)` is the one derived set that remains: every row that
+rounds in *any* of its modes, for the callers that only have a name.
 
 **`kwargs` is what a row still needs per call.** A row declares its own arguments
 (`block_size` for the GEMM rows, `expert_dtype` and `swiglu_limit` where they

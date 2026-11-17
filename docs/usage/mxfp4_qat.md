@@ -27,10 +27,18 @@ must be BF16 or FP32; FP16 is rejected at runtime even though
 `mixed_precision.param_dtype` accepts `float16`). No native FP4 training kernels
 and no Blackwell requirement during QAT.
 
-The registry records that difference as `RowPrecision` — `EMULATED` here, `NATIVE`
-for a row that casts and runs the GEMM in the target format (the only such row
-today is `deepgemm` on `moe_experts`) — which is what decides that a native row
-takes no `dtype` from a config, and that an adapter cannot sit in front of either.
+The registry records that difference as `NumericMode`, and this row offers both:
+`emulated` (the default) rounds and multiplies in the model dtype, while
+`emulated: false` asks for the real low-precision GEMM. That mode is a property of the
+*call*, not of the row name, which is why the guard that refuses an adapter in front of
+a rounding row asks the handle rather than a list of names.
+
+**`emulated: false` is not implemented yet.** The native FP4 GEMM needs Blackwell
+SM100+ dispatch, so selecting it raises `NotImplementedError` rather than quietly
+training on emulation while the config says otherwise. FP8 is not a `dtype` here at
+all: torchao's FP8 training is `Float8Linear`, a module swap done before FSDP wrapping
+(see [float8 training](float8_training.md)), which is a different shape from an op row.
+
 See [op selection](../design/op_selection.md).
 
 ## The two op rows
