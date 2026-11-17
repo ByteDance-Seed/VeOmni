@@ -1,6 +1,6 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: Apache-2.0
-"""Native NCCL/HCCL regression for the training-metric schema preflight."""
+"""Native NCCL/HCCL regression for consistently ordered metric reductions."""
 
 import os
 import time
@@ -50,19 +50,6 @@ def _metric_schema_accelerator_worker(rank, expected_device, endpoint):
         callback.on_step_end(TrainerState(global_step=1), loss=0.0, loss_dict={}, grad_norm=0.0, aux_metrics=metrics)
         assert callback.trainer.step_train_metrics["training/x"] == pytest.approx(10.5)
         assert callback.trainer.step_train_metrics["training/y"] == pytest.approx(6.0)
-        for metrics in ({"x": 1.0} if rank == 0 else {}, {"x": 1.0} if rank == 0 else {"y": 1.0}):
-            with pytest.raises(RuntimeError, match="metric keys differ"):
-                callback.on_step_end(
-                    TrainerState(global_step=2), loss=0.0, loss_dict={}, grad_norm=0.0, aux_metrics=metrics
-                )
-        with pytest.raises(ValueError, match="keys must all be strings"):
-            callback.on_step_end(
-                TrainerState(global_step=3),
-                loss=0.0,
-                loss_dict={},
-                grad_norm=0.0,
-                aux_metrics={1: 1.0} if rank == 0 else {"x": 1.0},
-            )
         alive = torch.ones(1, device=get_device_type())
         dist.all_reduce(alive)
         assert alive.item() == 2
@@ -71,7 +58,7 @@ def _metric_schema_accelerator_worker(rank, expected_device, endpoint):
 
 
 @pytest.mark.launch_plan(provider=_accelerator_plan)
-def test_metric_schema_preflight_accelerator():
+def test_metric_reduction_accelerator():
     assigned_backend = runner_capabilities().backend if os.environ.get("VEOMNI_CI_CAPABILITIES") else None
     require_npu = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1"
     if require_npu and assigned_backend is not None and assigned_backend != "npu":

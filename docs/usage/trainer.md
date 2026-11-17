@@ -113,6 +113,14 @@ The contract:
   via `mean_aux_metrics` instead. Emit a key on every micro batch of a step, or on
   none — a key present in only some micro batches is averaged over all of them.
   Values are also averaged across the FSDP group before they are logged.
+- **The reduction schema must agree across the FSDP group.** Each rank must
+  emit the same `loss_dict` and `aux_metrics` keys at every step, with the same
+  meaning. A data-dependent metric must use a consistently defined default on
+  ranks without a local observation. The callback sorts keys before the
+  per-key reductions; it does not perform a separate cross-rank schema check.
+  Model mode, trainable modules, label presence and forward options such as
+  DeepSeek-V4's `return_mtp_outputs` must therefore be consistent across the group. A custom
+  producer that changes its keys per rank can mix values or block a collective.
 - **Names already reported under `training/` are reserved.** Separate dicts do not
   separate the published namespace, where every consumer keys on the name alone
   and both collision directions are silent, so a colliding key raises

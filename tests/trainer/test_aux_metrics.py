@@ -367,24 +367,6 @@ def _metric_schema_worker(rank, endpoint):
             aux_metrics={(MetricKey("x") if rank == 0 else "x"): float(rank)},
         )
         assert callback.trainer.step_train_metrics["training/x"] == pytest.approx(0.5)
-        for aux in (
-            {"x": 1.0} if rank == 0 else {},
-            {"x": 1.0} if rank == 0 else {"y": 1.0},
-            {"bad\udcff": 1.0} if rank == 0 else {"y": 1.0},
-            {"\U0001f600": 1.0} if rank == 0 else {"\ud83d\ude00": 1.0},
-        ):
-            with pytest.raises(RuntimeError, match="metric keys differ"):
-                callback.on_step_end(
-                    TrainerState(global_step=3), loss=0.0, loss_dict={}, grad_norm=0.0, aux_metrics=aux
-                )
-        with pytest.raises(ValueError, match="keys must all be strings"):
-            callback.on_step_end(
-                TrainerState(global_step=4),
-                loss=0.0,
-                loss_dict={},
-                grad_norm=0.0,
-                aux_metrics={1: 1.0} if rank == 0 else {"x": 1.0},
-            )
         done = torch.ones(1)
         dist.all_reduce(done)
         assert done.item() == 2

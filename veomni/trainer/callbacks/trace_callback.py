@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
-import json
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Union
 
@@ -211,39 +209,6 @@ RESERVED_TRAINING_METRIC_NAMES = frozenset(
 )
 
 
-def _validate_metric_keys(keys, group):
-    """Reject different schemas on all ranks before entering per-key collectives."""
-    import torch
-    import torch.distributed as dist
-
-    keys = list(keys)
-    valid = all(isinstance(key, str) for key in keys)
-    # Normalize string subclasses without calling an overridden __str__ or
-    # comparison method before the cross-rank schema check.
-    ordered = sorted(str.__str__(key) for key in keys) if valid else []
-    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size(group) == 1:
-        if not valid:
-            raise ValueError("Training metric keys must all be strings")
-        return
-    from ...utils.device import get_device_type
-
-    serialized = json.dumps(ordered, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "surrogatepass")
-    digest = hashlib.sha256(serialized).digest()
-    device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
-    local = torch.tensor([int(valid), *digest], dtype=torch.int32, device=device)
-    gathered = [torch.empty_like(local) for _ in range(dist.get_world_size(group))]
-    dist.all_gather(gathered, local, group=group)
-    signatures = torch.stack(gathered).cpu().tolist()
-    if any(signature[0] == 0 for signature in signatures):
-        raise ValueError("Training metric keys must all be strings on every FSDP rank")
-    if any(signature[1:] != signatures[0][1:] for signature in signatures[1:]):
-        # Collect the readable keys only on the error path; the common path
-        # sends one fixed-size digest per rank rather than pickling every step.
-        schemas = [None] * dist.get_world_size(group)
-        dist.all_gather_object(schemas, tuple(ordered), group=group)
-        raise RuntimeError(f"Training metric keys differ across the FSDP group: {schemas}")
-
-
 class EnvironMeterCallback(Callback):
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
@@ -299,10 +264,9 @@ class EnvironMeterCallback(Callback):
         step_train_metrics.update(aux_metrics or {})
         step_train_metrics["grad_norm"] = grad_norm
 
-        # Sort before reducing so differently ordered keys cannot mix values.
-        # Check the complete schema first: a missing or extra optional metric
-        # otherwise makes ranks enter different collectives and can hang.
-        _validate_metric_keys(step_train_metrics, self.parallel_state.fsdp_group)
+        # Producers must emit the same metric names on every FSDP rank. Sorting
+        # aligns reductions when insertion order differs without an extra per-step
+        # collective or device-to-host synchronization.
         step_train_metrics = {
             f"training/{str.__str__(key)}": all_reduce(value, group=self.parallel_state.fsdp_group)
             for key, value in sorted(step_train_metrics.items(), key=lambda item: str.__str__(item[0]))
