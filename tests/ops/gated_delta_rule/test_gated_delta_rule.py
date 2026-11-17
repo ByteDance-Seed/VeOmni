@@ -837,3 +837,63 @@ def test_chunk_scaled_dot_kkt_fwd_requires_g_and_beta(module_path: str) -> None:
     assert by_name["g"] is None
     assert by_name["beta"] is None
     assert "requires g and beta" in source
+
+
+def test_fla_npu_accepts_grouped_value_heads(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_npu_input_guard: None,
+) -> None:
+    """Hk < Hv must reach the AscendC kernel and grads keep the input heads."""
+    module = import_module("veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.fla_npu")
+    seen: list[tuple[str, tuple[int, ...], tuple[int, ...], tuple[int, ...]]] = []
+
+    def fake_chunk_fwd(query, key, value, g, beta, scale, *args):
+        del beta, args
+        seen.append(("forward", tuple(query.shape), tuple(key.shape), tuple(value.shape)))
+        return g, value.transpose(1, 2).contiguous(), query.new_empty(0), None
+
+    def fake_chunk_bwd(query, key, value, g, beta, a, scale, initial_state, grad_output, *args):
+        del a, initial_state, grad_output, args
+        seen.append(("backward", tuple(query.shape), tuple(key.shape), tuple(value.shape)))
+        return (
+            torch.zeros_like(query),
+            torch.zeros_like(key),
+            torch.zeros_like(value),
+            torch.zeros_like(beta),
+            torch.zeros_like(g),
+        )
+
+    monkeypatch.setattr(module, "_chunk_fwd", fake_chunk_fwd)
+    monkeypatch.setattr(module, "_chunk_bwd", fake_chunk_bwd)
+
+    torch.manual_seed(0)
+    batch, seq, key_heads, value_heads, head_dim = 1, 4, 2, 6, 8
+    query = torch.randn(batch, seq, key_heads, head_dim, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.randn(batch, seq, key_heads, head_dim, dtype=torch.bfloat16, requires_grad=True)
+    value = torch.randn(batch, seq, value_heads, head_dim, dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn(batch, seq, value_heads, dtype=torch.float32, requires_grad=True)
+    beta = torch.randn(batch, seq, value_heads, dtype=torch.bfloat16, requires_grad=True)
+
+    entry = OpEntry(
+        "test_fla_npu_grouped_value_heads",
+        "standard",
+        "fla_npu",
+        module.forward,
+        module.backward,
+        description="Test grouped value heads",
+    )
+    output, _final_state = entry.wrapper(query, key, value, g, beta, use_qk_l2norm_in_kernel=True)
+    assert tuple(output.shape) == (batch, seq, value_heads, head_dim)
+    output.float().square().sum().backward()
+
+    assert tuple(query.grad.shape) == (batch, seq, key_heads, head_dim)
+    assert tuple(key.grad.shape) == (batch, seq, key_heads, head_dim)
+    assert tuple(value.grad.shape) == (batch, seq, value_heads, head_dim)
+    assert tuple(g.grad.shape) == (batch, seq, value_heads)
+    assert tuple(beta.grad.shape) == (batch, seq, value_heads)
+    expected = (
+        (batch, key_heads, seq, head_dim),
+        (batch, key_heads, seq, head_dim),
+        (batch, value_heads, seq, head_dim),
+    )
+    assert seen == [("forward", *expected), ("backward", *expected)]

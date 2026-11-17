@@ -2355,7 +2355,9 @@ class Qwen4ExpTextModel(Qwen4ExpPreTrainedModel):
         # --- Patch.7: Build the fla_npu varlen tables once for every GDN layer. ---
         # Without this each GDN layer re-derives cu_seqlens on the host (one
         # device->host sync per layer) and rebuilds its chunk tables. The AscendC
-        # entry consumes only the host tables, so no device tensors are built.
+        # entry consumes only the host tables, so no device tensors are uploaded.
+        # This patch config is shared with the GPU target, where the impl guard
+        # below keeps the block inert.
         _ops_config = getattr(self.config, "ops_config", None)
         _gdn_impl = getattr(_ops_config, "chunk_gated_delta_rule_implementation", None)
         if (
@@ -2368,23 +2370,24 @@ class Qwen4ExpTextModel(Qwen4ExpPreTrainedModel):
                 precompute_varlen_metadata,
             )
 
-            if packed_seq_lens is not None:
-                # Reuse the host-side packed lengths so no extra sync is needed.
-                _cu_list = [0]
-                for _length in packed_seq_lens:
-                    _cu_list.append(_cu_list[-1] + int(_length))
-                _cu_cpu = torch.tensor(_cu_list, dtype=torch.int32)
-            else:
-                _cu_cpu = cu_seq_lens_q
+            # Patch.5 guarantees packed_seq_lens whenever cu_seq_lens_q is set, so
+            # rebuilding the boundaries from that host list costs no extra sync.
+            _cu_list = [0]
+            for _length in packed_seq_lens:
+                _cu_list.append(_cu_list[-1] + int(_length))
+            _cu_cpu = torch.tensor(_cu_list, dtype=torch.int32)
             _num_v_heads = self.config.linear_num_value_heads // (sp_size if sp_enabled else 1)
+            _chunk_size = 64
             _cu_seqlens_list, _, _chunk_indices_list = precompute_varlen_metadata(
                 cu_seqlens=_cu_cpu,
                 num_heads=_num_v_heads,
-                chunk_size=64,
+                chunk_size=_chunk_size,
                 device=None,
             )
             kwargs["cu_seqlens_list_q"] = _cu_seqlens_list
-            kwargs["chunk_indices_list_q"] = _chunk_indices_list
+            # The adapter only reads the key matching the chunk size it is called
+            # with; shipping just that entry keeps per-layer dict handling cheap.
+            kwargs["chunk_indices_list_q"] = {str(_chunk_size): _chunk_indices_list[str(_chunk_size)]}
         # --- Patch.7 ---
         # CODEPATH: @ArthurZucker fix flagging for no reason here
         if self.config.ple_layer_ids and ple_input_ids is None:
