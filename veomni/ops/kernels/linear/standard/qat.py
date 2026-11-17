@@ -52,7 +52,7 @@ def wrapper(linear: nn.Module, x: Tensor, *, dtype: str = "fp8", block_size: int
     """
     # A quantizing row always gets a weight: ``resolve_projection`` raises for a
     # wrapped projection instead of handing back a shortcut.
-    weight, shortcut = resolve_projection("qat", linear, x)
+    weight, shortcut = resolve_projection("qat", linear, x, emulated=True)
     assert shortcut is None
     bias = getattr(linear, "bias", None)
     if x.numel() == 0:

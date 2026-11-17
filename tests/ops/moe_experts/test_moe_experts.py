@@ -1428,16 +1428,21 @@ def test_reject_quantizing_act_fn_refuses_only_quantizing_rows():
     """
     from types import SimpleNamespace
 
+    from veomni.ops import NumericMode
     from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 
-    def experts(impl, swiglu):
-        return SimpleNamespace(veomni_moe=SimpleNamespace(impl=impl), use_swiglu_mlp=swiglu)
+    def experts(impl, swiglu, mode):
+        return SimpleNamespace(veomni_moe=SimpleNamespace(impl=impl, mode=mode), use_swiglu_mlp=swiglu)
 
     # SwiGLU is what every fused row implements.
-    reject_quantizing_act_fn(experts("qat", swiglu=True))
+    reject_quantizing_act_fn(experts("qat", swiglu=True, mode=NumericMode.EMULATED))
 
     with pytest.raises(ValueError, match="moe_implementation='qat' cannot run with a non-SwiGLU activation"):
-        reject_quantizing_act_fn(experts("qat", swiglu=False))
+        reject_quantizing_act_fn(experts("qat", swiglu=False, mode=NumericMode.EMULATED))
+
+    # A native row bakes the same activation in, so it is refused identically.
+    with pytest.raises(ValueError, match="moe_implementation='deepgemm' cannot run with a non-SwiGLU activation"):
+        reject_quantizing_act_fn(experts("deepgemm", swiglu=False, mode=NumericMode.NATIVE))
 
     # A reference row may use the fallback; that is a deliberate precision choice.
-    reject_quantizing_act_fn(experts("eager", swiglu=False))
+    reject_quantizing_act_fn(experts("eager", swiglu=False, mode=NumericMode.EXACT))

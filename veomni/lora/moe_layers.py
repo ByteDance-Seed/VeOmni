@@ -165,18 +165,17 @@ logger = logging.get_logger(__name__)
 
 def _moe_lora_op(base_layer: nn.Module, variant: str):
     """Reject a rounding expert backend; otherwise bind its row."""
-    from veomni.ops import OP_REGISTRY, RowPrecision, VeomniOp
+    from veomni.ops import OP_REGISTRY, VeomniOp
 
     base_op = getattr(base_layer, "veomni_moe", None)
     impl = "eager" if base_op is None else base_op.impl
-    # No ``moe_experts_lora`` row rounds its operands, so a rounding expert backend
-    # cannot be adapted: substituting the adapter would train the base weights in
-    # the model dtype while the config still claimed otherwise. Both halves of that
-    # -- ``EMULATED`` rounding that no adapter reproduces, and ``NATIVE`` GEMMs the
-    # adapter has no row for -- are the same question, which is why this reads the
-    # row's precision rather than listing names.
-    precision = OP_REGISTRY.precision("moe_experts", impl)
-    if precision is not None and precision is not RowPrecision.EXACT:
+    # The handle knows its own arguments, so it can say which mode it runs in -- an
+    # expert row that offers both emulation and a native GEMM answers per config.
+    # No ``moe_experts_lora`` row rounds, so any rounding backend cannot be adapted:
+    # substituting the adapter would train the base weights in the model dtype while
+    # the config still claimed otherwise.
+    mode = None if base_op is None else base_op.mode
+    if mode is not None and mode.rounds_operands:
         raise ValueError(
             f"moe_implementation={impl!r} does not support MoE-LoRA on expert weights. "
             "Select a supported MoE-LoRA backend (for example 'fused_triton' on GPU), "

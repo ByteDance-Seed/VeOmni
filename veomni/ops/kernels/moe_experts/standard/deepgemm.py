@@ -78,11 +78,12 @@ def wrapper(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
     # Accepted to honour the family-wide call signature: ``DeepseekV4Experts``
-    # passes every one of these at every call whatever row it resolved. Neither
-    # ``block_size`` nor ``dtype`` is something this row can vary -- DeepGEMM fixes
-    # its tile, and the row's registered ``dtypes`` says FP8 is the only format it
-    # implements -- so they are dropped below rather than forwarded.
-    block_size: int = 128,
+    # passes ``dtype`` at every call whatever row it resolved. It is dropped rather
+    # than forwarded -- DeepGEMM fixes its format and tile, and the row's registered
+    # ``dtypes`` says FP8 is the only one it implements, so a config asking for
+    # another is refused before this is reached. ``block_size`` is not declared: the
+    # family's call site does not pass it, and a config that sets one is filtered out
+    # as a key this row does not take.
     dtype: str = "fp8",
 ) -> Tensor:
     """Run FP8 expert GEMMs with BF16 inputs, outputs and first-order gradients.
@@ -95,8 +96,8 @@ def wrapper(
     eager expert contract rather than moving them through FP8 quantization.
     """
     # The format is fixed by the row, not by the caller: see the note on the
-    # signature. Dropping them here keeps the intent visible at the point of use.
-    del block_size, dtype
+    # signature. Dropping it here keeps the intent visible at the point of use.
+    del dtype
     if (
         hidden_states.device.type != "cuda"
         or torch.version.hip is not None

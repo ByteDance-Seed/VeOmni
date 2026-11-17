@@ -73,9 +73,18 @@ def _reject_quantized_swiglu_on_an_unfused_activation(config: PretrainedConfig, 
     reaches, including a VLM's ``text_config``, because ``collect`` already walks
     ``sub_configs``. It also fails at load time instead of on the first step.
     """
-    from ..ops.kernels.swiglu_mlp import FUSED_ACTIVATIONS, quantizing_impls
+    from ..ops.kernels.swiglu_mlp import FUSED_ACTIVATIONS
+    from ..ops.registry import OP_REGISTRY
+    from ..ops.selection import OpsSelection
 
-    if proposed.get("swiglu_mlp_implementation") not in quantizing_impls():
+    # The proposed value is whatever the config file said: a bare row name, or the
+    # mapping form with its arguments. The mode depends on the arguments, so resolve
+    # both before asking -- a ``torchao`` row is emulated by default and native only
+    # when ``emulated: false`` says so, and only the emulated one needs this guard.
+    selection = OpsSelection.from_config_value(proposed.get("swiglu_mlp_implementation"))
+    name = selection.resolve_impl(None)
+    mode = OP_REGISTRY.mode("swiglu_mlp", name, selection.resolve_kwargs(None)) if name is not None else None
+    if mode is None or not mode.rounds_operands:
         return
     if not _binds_swiglu_mlp(config):
         return

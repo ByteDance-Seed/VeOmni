@@ -22,7 +22,6 @@ import torch.nn.functional as F
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OP_REGISTRY, VeomniOp
-from veomni.ops.kernels.linear._module import quantizing_impls
 from veomni.utils.import_utils import is_package_available
 
 
@@ -105,7 +104,7 @@ def test_a_wrapped_projection_falls_back_to_its_own_forward():
     torch.testing.assert_close(out, module.base_layer(x))
 
 
-@pytest.mark.parametrize("quantizing_impl", sorted(quantizing_impls()))
+@pytest.mark.parametrize("quantizing_impl", sorted(OP_REGISTRY.rounding_impls("linear")))
 def test_a_quantizing_row_refuses_a_wrapped_projection(quantizing_impl):
     """Running the unquantized base layer would leave the config claiming QAT."""
     from torch import nn
@@ -121,10 +120,10 @@ def test_a_quantizing_row_refuses_a_wrapped_projection(quantizing_impl):
             return self.base_layer(x)
 
     with pytest.raises(ValueError, match="cannot run on .Wrapped."):
-        resolve_projection(quantizing_impl, Wrapped(), torch.randn(2, 8))
+        resolve_projection(quantizing_impl, Wrapped(), torch.randn(2, 8), emulated=True)
 
 
-@pytest.mark.parametrize("quantizing_impl", sorted(quantizing_impls()))
+@pytest.mark.parametrize("quantizing_impl", sorted(OP_REGISTRY.rounding_impls("linear")))
 def test_a_quantizing_row_refuses_a_linear_subclass_projection(quantizing_impl):
     """A converted ``nn.Linear`` subclass such as ``Float8Linear`` owns a weight but runs its own GEMM."""
     from torch import nn
@@ -141,7 +140,7 @@ def test_a_quantizing_row_refuses_a_linear_subclass_projection(quantizing_impl):
     sub = _SubclassLinear()
     x = torch.randn(2, 8)
     with pytest.raises(ValueError, match="nn.Linear subclass"):
-        resolve_projection(quantizing_impl, sub, x)
+        resolve_projection(quantizing_impl, sub, x, emulated=True)
 
     # Non-quantizing rows still delegate to the subclass's own forward.
     weight, shortcut = resolve_projection("eager", sub, x)
@@ -242,7 +241,7 @@ def test_linear_torchao_row_is_declared_with_torchao():
     """The row needs no specific hardware, only the optional package."""
     entries = {(entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", "standard")}
     assert ("torchao", ("torchao",)) in entries
-    assert "torchao" in quantizing_impls()
+    assert "torchao" in OP_REGISTRY.rounding_impls("linear")
     # ``standard`` only: a model that also binds ``grouped`` cannot select it.
     assert "torchao" not in OP_REGISTRY.list_registered("linear", "grouped")
 

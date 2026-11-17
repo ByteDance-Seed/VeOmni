@@ -23,7 +23,7 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import OpsImplementationConfig
-from veomni.ops import OP_REGISTRY, RowPrecision, VeomniOp
+from veomni.ops import OP_REGISTRY, NumericMode, VeomniOp
 from veomni.ops.selection import OpsSelection, SiteOverride
 
 
@@ -57,7 +57,7 @@ def quantizing_row():
         _round_forward,
         _round_backward,
         description="test-only emulated row",
-        precision=RowPrecision.EMULATED,
+        modes=(NumericMode.EMULATED,),
     )
     try:
         yield "test_round"
@@ -159,9 +159,9 @@ def test_an_override_merges_kwargs_by_default():
 def test_an_override_inherits_kwargs_it_does_not_use(quantizing_row):
     """Switching to a row with a different signature needs nothing cleared.
 
-    The ``eager`` row takes no ``block_size``, so the inherited one is simply not
-    passed to it. The selection still carries it -- resolving is a name question, and
-    what a row accepts is answered when the handle is built.
+    ``eager`` takes no ``dtype``, so the inherited one is simply not passed to it. The
+    selection still carries it -- resolving is a name question, and what a row accepts
+    is answered when the handle is built.
     """
     selection = OpsSelection.from_config_value(
         {
@@ -172,7 +172,10 @@ def test_an_override_inherits_kwargs_it_does_not_use(quantizing_row):
     )
     dropped = VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
     assert dropped.impl == "eager"
-    assert dropped.kwargs == {}
+    # ``eager`` declares ``block_size`` for the family-wide signature even though it
+    # ignores it, so nothing is dropped here; the dropping is exercised by
+    # ``test_a_reference_row_simply_ignores_the_arguments_it_does_not_take``.
+    assert dropped.kwargs == {"block_size": 64}
     # The selection itself still carries the inherited argument at both sites: the
     # filtering is a property of the row, not of the override.
     assert selection.resolve_kwargs("layers.0.q_a_proj") == {"block_size": 64}
@@ -210,11 +213,11 @@ def test_an_override_without_a_site_is_refused():
 def test_a_reference_row_simply_ignores_the_arguments_it_does_not_take(quantizing_row):
     """The enclosing block describes the family; the row decides what it can honour.
 
-    A site may name a reference row under a block that sets ``block_size`` for the
+    A site may name a reference row under a block that sets ``dtype`` for the
     quantized sites. That row rounds nothing, so the key is not passed to it -- not
     an error, because the config is not claiming that row rounds.
     """
-    selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"block_size": 64}})
+    selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"dtype": "fp8"}})
     handle = VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
     assert handle.impl == "eager"
     assert handle.kwargs == {}
@@ -423,45 +426,53 @@ def test_a_quantizing_row_may_carry_arguments():
 # ---------------------------------------------------------------------------
 
 
-def test_every_row_reports_a_precision_and_the_three_values_are_distinct():
-    """The axis has to separate the three cases a bool could not.
+def test_the_mode_is_a_property_of_the_call_not_only_the_row():
+    """One row name can serve both modes, and the arguments pick which.
 
-    ``deepgemm_fp8`` rounds *and* runs the GEMM in FP8, so ``quantizes=True`` made it
-    indistinguishable from ``qat`` -- which rounds but multiplies in the model
-    dtype. Both answers were wrong: treating it as emulated claimed the parameters
-    stay high precision, and treating it as exact claimed nothing is rounded.
+    This is what torchao does with ``Float8LinearConfig.emulate``, and why the answer
+    cannot be a constant on the row: ``torchao`` emulates by default (the
+    training-safe choice, no special hardware) and runs its real low-precision GEMM
+    only when a config asks. A row that offers one mode ignores the argument, and the
+    handle has already filtered it out.
     """
     expected = {
-        ("moe_experts", "fused_triton"): RowPrecision.EXACT,
-        ("moe_experts", "qat"): RowPrecision.EMULATED,
-        ("moe_experts", "deepgemm"): RowPrecision.NATIVE,
+        ("moe_experts", "fused_triton"): NumericMode.EXACT,
+        ("moe_experts", "qat"): NumericMode.EMULATED,
+        ("moe_experts", "deepgemm"): NumericMode.NATIVE,
+        # A single-mode row answers the same however it is asked.
+        ("linear", "eager"): NumericMode.EXACT,
+        ("linear", "qat"): NumericMode.EMULATED,
     }
     for (op, impl), want in expected.items():
-        assert OP_REGISTRY.precision(op, impl) is want
+        assert OP_REGISTRY.mode(op, impl) is want
 
-    # ``exact`` is the only value that does not round.
-    assert [m.rounds_operands for m in RowPrecision] == [False, True, True]
-    # ... and only emulation is parameterised, which is why a native row takes no
-    # config arguments even though it rounds.
-    assert [m.configurable for m in RowPrecision] == [False, True, False]
+    # The row that offers both: emulated unless the config says otherwise.
+    assert OP_REGISTRY.mode("linear", "torchao") is NumericMode.EMULATED
+    assert OP_REGISTRY.mode("linear", "torchao", {"emulated": False}) is NumericMode.NATIVE
+    # And it takes the argument, while a single-mode row does not.
+    assert "emulated" in OP_REGISTRY.row_arguments("linear", "torchao")
+    assert "emulated" not in OP_REGISTRY.row_arguments("linear", "qat")
+
+    # ``exact`` is the only mode that leaves the operands alone.
+    assert [m.rounds_operands for m in NumericMode] == [False, True, True]
 
 
-def test_an_unregistered_row_has_no_precision():
+def test_an_unregistered_row_has_no_mode():
     """``None`` means "not a row", which callers must not confuse with ``EXACT``."""
-    assert OP_REGISTRY.precision("moe_experts", "no_such_row") is None
+    assert OP_REGISTRY.mode("moe_experts", "no_such_row") is None
     assert OP_REGISTRY.quantizes("moe_experts", "no_such_row") is None
 
 
-def test_emulated_impls_is_derived_from_the_registry_not_a_hand_written_list():
-    """The guard sets are computed, so a new emulated row is complete on registration.
+def test_rounding_impls_is_derived_from_the_registry_not_a_hand_written_list():
+    """The guard set is computed, so a new rounding row is complete on registration.
 
-    ``deepgemm_fp8`` is the case that motivated it: listed by hand, it was missing
-    from ``moe_experts.QUANTIZING_IMPLS`` and so slipped past the non-SwiGLU guard.
+    ``deepgemm`` is the case that motivated it: listed by hand, it was missing from
+    ``moe_experts.QUANTIZING_IMPLS`` and so slipped past the non-SwiGLU guard.
     """
-    assert OP_REGISTRY.emulated_impls("moe_experts") == frozenset({"qat"})
-    # A native row rounds but is not emulated -- the distinction the sets now carry.
-    assert "deepgemm" in OP_REGISTRY.rounding_impls("moe_experts")
-    assert "deepgemm" not in OP_REGISTRY.emulated_impls("moe_experts")
+    assert OP_REGISTRY.rounding_impls("moe_experts") == frozenset({"qat", "deepgemm"})
+    # A row offering both modes is in the set: emulation is what a config gets by
+    # default, so "could this ever round?" is yes.
+    assert OP_REGISTRY.rounding_impls("linear") == frozenset({"qat", "torchao"})
 
 
 def test_a_native_row_ignores_the_arguments_it_does_not_take():
@@ -524,14 +535,14 @@ def test_a_native_row_is_refused_where_a_deployment_kernel_is_not_reached():
     from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 
     class _Experts(nn.Module):
-        def __init__(self, impl):
+        def __init__(self, impl, mode):
             super().__init__()
             self.use_swiglu_mlp = False
-            self.veomni_moe = type("_Handle", (), {"impl": impl})()
+            self.veomni_moe = type("_Handle", (), {"impl": impl, "mode": mode})()
 
     for impl in ("qat", "deepgemm"):
         with pytest.raises(ValueError, match="cannot run with a non-SwiGLU activation"):
-            reject_quantizing_act_fn(_Experts(impl))
+            reject_quantizing_act_fn(_Experts(impl, NumericMode.EMULATED if impl == "qat" else NumericMode.NATIVE))
 
     # A row that rounds nothing keeps the fallback: it has no fused kernel to miss.
-    reject_quantizing_act_fn(_Experts("fused_triton"))
+    reject_quantizing_act_fn(_Experts("fused_triton", NumericMode.EXACT))

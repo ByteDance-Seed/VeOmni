@@ -662,10 +662,14 @@ def test_a_linear_subclass_projection_skips_the_fused_path():
     mlp.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", "eager")
     assert not has_plain_linear_projections(mlp)
 
-    # The quantizing check runs before the row is resolved, so a stub handle
-    # carrying the impl name is enough; the real ``qat`` row needs SM90 + TileLang.
+    # The quantizing check runs before the row is resolved, so a stub handle is
+    # enough; the real ``qat`` row needs SM90 + TileLang. The guard reads ``mode``,
+    # because one row name can offer both an emulated and a native mode.
+    from veomni.ops import NumericMode
+
     class _QatHandle:
         impl = "qat"
+        mode = NumericMode.EMULATED
 
     mlp.veomni_swiglu_mlp = _QatHandle()
     with pytest.raises(ValueError, match="nn.Linear subclass"):

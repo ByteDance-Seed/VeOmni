@@ -35,7 +35,7 @@ FP8 and FP4 checkpoints, and ``torchao`` serves both the NVFP4 and MXFP4 layouts
 
 from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement
 from ...qat.torchao_fp4 import SUPPORTED_DTYPES
-from ...registry import RowPrecision, register_op
+from ...registry import NumericMode, register_op
 from .grouped import eager as grouped_eager
 from .grouped import qat as grouped_qat
 from .standard import eager as standard_eager
@@ -59,7 +59,7 @@ register_op(
     "standard",
     "qat",
     description="TileLang blockwise FP8 fake-quantized dense linear projection",
-    precision=RowPrecision.EMULATED,
+    modes=(NumericMode.EMULATED,),
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
@@ -69,8 +69,11 @@ register_op(
     "linear",
     "standard",
     "torchao",
-    description="TorchAO FP4 fake-quantized dense linear projection",
-    precision=RowPrecision.EMULATED,
+    description="TorchAO low-precision dense linear projection, emulated or native",
+    # Both modes: ``emulated`` true (the default) rounds the operands and multiplies
+    # in the model dtype; false hands them to torchao's real low-precision GEMM.
+    # One row, because the choice is the training recipe's, not the kernel's.
+    modes=(NumericMode.EMULATED, NumericMode.NATIVE),
     wrapper=standard_torchao.wrapper,
     requires=("torchao",),
     dtypes=SUPPORTED_DTYPES,
@@ -89,7 +92,7 @@ register_op(
     "grouped",
     "qat",
     description="TileLang blockwise FP8 fake-quantized grouped linear projection",
-    precision=RowPrecision.EMULATED,
+    modes=(NumericMode.EMULATED,),
     wrapper=grouped_qat.module_wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),

@@ -34,23 +34,8 @@ from torch import Tensor, nn
 
 
 __all__ = [
-    "quantizing_impls",
     "resolve_projection",
 ]
-
-
-def quantizing_impls() -> frozenset[str]:
-    """``linear`` rows that round the weight they are handed.
-
-    Those are the rows that cannot fall back to calling a wrapped projection
-    module: a ``LoraLinear`` keeps the base weights at ``base_layer``, so there is
-    nothing to round, and an ``nn.Linear`` subclass such as ``Float8Linear`` runs
-    its own GEMM over a weight the row would bypass. Derived from the registry, so
-    the set cannot drift from what is registered.
-    """
-    from ...registry import OP_REGISTRY
-
-    return OP_REGISTRY.rounding_impls("linear")
 
 
 def resolve_projection(
@@ -58,6 +43,7 @@ def resolve_projection(
     module: nn.Module,
     x: Tensor,
     *,
+    emulated: bool = False,
     allow_linear_subclass: bool = False,
 ) -> tuple[Tensor | None, Tensor | None]:
     """Return ``(weight, output)`` for a projection, exactly one of which is set.
@@ -66,6 +52,12 @@ def resolve_projection(
         op_impl: The resolved implementation name of the calling row.
         module: The projection the row was asked to run.
         x: Input activation, used only on the fallback path.
+        emulated: ``True`` when this call rounds the weight it reads. A native row
+            that hands the operands to its own low-precision kernel may keep working
+            on a wrapped projection -- torchao's ``Float8Linear`` replaces the module
+            and leaves the weight where an adapter finds it -- while an emulated row
+            has to read an unwrapped ``weight``. Defaults to ``False`` so a caller
+            that does not round keeps the fallback and is never refused.
         allow_linear_subclass: Allow ``nn.Linear`` subclasses whose custom
             ``forward`` matches the row contract (used by the grouped QAT row for
             ``DeepseekV4GroupedLinear``), except converted ``Float8Linear``.
@@ -76,16 +68,19 @@ def resolve_projection(
 
     Raises:
         ValueError: when the module is wrapped or is an ``nn.Linear`` subclass
-            whose own ``forward`` computes extra/quantized math while the row
-            rounds. Reading ``module.weight`` would bypass the module's
-            ``forward`` (e.g. ``Float8Linear`` GEMMs) and calling the fallback
-            would train at full precision under a QAT config.
+            whose own ``forward`` computes extra/quantized math while the row rounds.
+            Reading ``module.weight`` would bypass the module's ``forward`` (e.g.
+            ``Float8Linear`` GEMMs) and calling the fallback would train at full
+            precision under a QAT config.
     """
     if type(module) is nn.Linear:
         return module.weight, None
     if allow_linear_subclass and isinstance(module, nn.Linear) and type(module).__name__ != "Float8Linear":
         return module.weight, None
-    if op_impl in quantizing_impls():
+    if emulated:
+        # Only a rounding row reaches here. ``op_impl`` says which row is asking so
+        # the message names it; ``emulated=False`` (the default) means the caller is
+        # a row that does not round, and those keep the projection-module fallback.
         if isinstance(module, nn.Linear):
             raise ValueError(
                 f"linear_implementation={op_impl!r} cannot run on nn.Linear subclass {type(module).__name__!r}: "

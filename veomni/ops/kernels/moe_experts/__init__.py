@@ -30,7 +30,7 @@ from ...platform import (
     NpuKernelRequirement,
     NvidiaGpuPlatform,
 )
-from ...registry import RowPrecision, register_op
+from ...registry import NumericMode, register_op
 from .gpt_oss import eager as gpt_oss_eager
 from .gpt_oss import quack as gpt_oss_quack
 from .shared import unpermute
@@ -48,17 +48,12 @@ _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
 
 def rounding_impls() -> frozenset[str]:
-    """``moe_experts`` rows that round the operands they are handed, native ones included.
+    """``moe_experts`` rows that could round the operands they are handed, in any mode.
 
-    The activation guard needs this set rather than :meth:`OpRegistry.emulated_impls`:
-    every fused row bakes SiLU into both directions, ``deepgemm`` included, so an
-    activation the family cannot run has to be refused for a native row just as much as
-    for an emulated one. Only ``EXACT`` rows are satisfied by the Python act_fn loop,
-    because they are the ones that never round.
-
-    Adapter rejection reads the row's precision directly (``veomni/lora/moe_layers.py``)
-    rather than a set from here: it needs the same "does this round?" answer, and a
-    second name for it would be one more place to drift.
+    Kept for the callers that have no handle to ask -- a row's name is all they know.
+    A caller that *has* a handle should read ``handle.mode`` instead, which answers
+    for the arguments that config selected: a row offering both an emulated and a
+    native mode round in both, but a row offering only one is exact in neither.
     """
     from ...registry import OP_REGISTRY
 
@@ -93,11 +88,14 @@ def reject_quantizing_act_fn(owner: nn.Module) -> None:
     if getattr(owner, "use_swiglu_mlp", True):
         return
     handle = getattr(owner, "veomni_moe", None)
-    impl = getattr(handle, "impl", None)
-    if impl not in rounding_impls():
+    # Ask the handle, not the row: a row that offers both an emulated and a native
+    # mode has to answer for the one this config selected, and both round here.
+    mode = getattr(handle, "mode", None)
+    if mode is None or not mode.rounds_operands:
         return
     raise ValueError(
-        f"moe_implementation={impl!r} cannot run with a non-SwiGLU activation: every `moe_experts` row "
+        f"moe_implementation={getattr(handle, 'impl', None)!r} cannot run with a non-SwiGLU activation: "
+        "every `moe_experts` row "
         "with a fused kernel implements SwiGLU only, in both forward and backward, so these routed "
         "experts would train through the Python act_fn loop and round nothing. Use hidden_act='silu' "
         "to quantize them, or moe_implementation='eager' to train them in the model dtype."
@@ -178,7 +176,7 @@ register_op(
     "standard",
     "qat",
     description="TileLang blockwise FP8/FP4 fake-quantized Triton grouped-GEMM routed SwiGLU MoE experts",
-    precision=RowPrecision.EMULATED,
+    modes=(NumericMode.EMULATED,),
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang", "triton"),
@@ -194,7 +192,7 @@ register_op(
     # DeepGEMM's grouped GEMM in that format, so it owns the cast instead of
     # receiving already-rounded operands. That is what separates it from ``qat``
     # even though both round.
-    precision=RowPrecision.NATIVE,
+    modes=(NumericMode.NATIVE,),
     wrapper=standard_deepgemm.wrapper,
     requirement=GpuKernelRequirement(
         platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=90), NvidiaGpuPlatform(min_cc=100, max_cc=100)),

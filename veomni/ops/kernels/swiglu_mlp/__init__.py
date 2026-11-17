@@ -23,7 +23,7 @@ from torch import nn
 
 from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, MluKernelRequirement
 from ...qat.torchao_fp4 import SUPPORTED_DTYPES
-from ...registry import RowPrecision, register_op
+from ...registry import NumericMode, register_op
 from .geglu import eager as geglu_eager
 from .geglu import liger_kernel as geglu_liger
 from .standard import eager as standard_eager
@@ -42,18 +42,6 @@ _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 #: set has no quantizing row at all, and selecting one would round nothing -- which
 #: is why ``configuration_base`` refuses the combination at load time (#1430).
 FUSED_ACTIVATIONS = frozenset({"silu", "swish"})
-
-
-def quantizing_impls() -> frozenset[str]:
-    """``swiglu_mlp`` rows that round the weight tensors they are handed.
-
-    Only these need a projection's own ``weight``; every other row is a plain
-    arithmetic rewrite that keeps working on a wrapped projection's fallback path.
-    Derived from the registry, so the set cannot drift from what is registered.
-    """
-    from ...registry import OP_REGISTRY
-
-    return OP_REGISTRY.rounding_impls("swiglu_mlp")
 
 
 def has_plain_linear_projections(mlp: nn.Module) -> bool:
@@ -102,10 +90,12 @@ def reject_quantizing_row(owner: nn.Module, reason: str, *, remedy: str) -> None
     before a handle is even built. Do not route that case through here.
     """
     handle = getattr(owner, "veomni_swiglu_mlp", None)
-    impl = getattr(handle, "impl", None)
-    if impl not in quantizing_impls():
+    # The handle knows its own arguments, so it answers for the mode the config
+    # selected rather than for whichever mode the row could run in.
+    mode = getattr(handle, "mode", None)
+    if mode is None or not mode.rounds_operands:
         return
-    raise ValueError(f"swiglu_mlp_implementation={impl!r} cannot run on {reason}. {remedy}")
+    raise ValueError(f"swiglu_mlp_implementation={getattr(handle, 'impl', None)!r} cannot run on {reason}. {remedy}")
 
 
 register_op(
@@ -146,7 +136,7 @@ register_op(
     "standard",
     "qat",
     description="TileLang blockwise FP8 fake-quantized SwiGLU MLP with optional activation clamping",
-    precision=RowPrecision.EMULATED,
+    modes=(NumericMode.EMULATED,),
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
@@ -157,7 +147,7 @@ register_op(
     "standard",
     "torchao",
     description="TorchAO FP4 fake-quantized SwiGLU MLP with optional activation clamping",
-    precision=RowPrecision.EMULATED,
+    modes=(NumericMode.EMULATED,),
     wrapper=standard_torchao.wrapper,
     requires=("torchao",),
     dtypes=SUPPORTED_DTYPES,
