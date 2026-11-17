@@ -18,10 +18,10 @@ Two tag schemes coexist on quay.io:
 
 These target tags are not yet confirmed available on Quay. They are listed
 for the planned publication, not as currently pullable release images.
-The integrated builders currently generate legacy-style tags; these
+Build locally using the [A2](build_a2_docker.md) or [A3](build_a3_docker.md)
+guide. The integrated builders currently generate legacy-style tags; these
 product-style target names are for manual publication and are not generated
-by the workflows. See the tag computation in the [A2 builder](../../../.github/workflows/docker-build-ascend-a2.yml)
-and [A3 builder](../../../.github/workflows/docker-build-ascend-a3.yml).
+by the workflows. See [workflow tag rules](overview.md#build-and-publication-workflows).
 
 | Target tag | Architectures | Triton / Triton-Ascend |
 | --- | --- | --- |
