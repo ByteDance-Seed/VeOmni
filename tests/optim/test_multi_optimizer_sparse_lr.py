@@ -32,6 +32,31 @@ def test_sparse_leaf_preserves_learning_rate_without_creating_state():
     assert not bias.state
 
 
+@pytest.mark.parametrize("initialized", [False, True])
+def test_sparse_leaf_rejects_instance_serializer_that_renumbers_ids(initialized):
+    model = torch.nn.Linear(2, 2)
+    leaf = torch.optim.AdamW([{"params": [model.weight], "lr": 0.01}, {"params": [model.bias], "lr": 0.02}])
+    optimizer = MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
+    if initialized:
+        for param in model.parameters():
+            param.grad = torch.ones_like(param)
+        leaf.step()
+        leaf.zero_grad()
+    previous_state_count = len(leaf.state)
+    original = leaf.state_dict
+
+    def swapped():
+        state = original()
+        first, second = state["param_groups"]
+        first["params"], second["params"] = second["params"], first["params"]
+        return state
+
+    leaf.state_dict = swapped
+    with pytest.raises(RuntimeError, match="instance-patched state_dict"):
+        optimizer._sparse_state_dict()
+    assert len(leaf.state) == previous_state_count
+
+
 def test_sparse_leaf_uses_optimizer_state_dict_post_hook():
     _, _, bias, optimizer = _build()
 
