@@ -559,6 +559,182 @@ def test_kda_module_matches_source_layout():
         assert tensor.shape == patched_state[key].shape, key
 
 
+def test_position_id_func_is_picklable():
+    """Dataloader workers (spawn start method) pickle the VLM trainer's
+    dataset transform, which captures the position-id func returned by
+    ``KimiK3ForConditionalGeneration.get_position_id_func``. A closure
+    defined inside the patched method fails with "Can't pickle local
+    object" (round-3 review); the module-level helper must survive a
+    pickle round-trip and keep the arange-stub behaviour."""
+    import pickle
+
+    from veomni.models.transformers.kimi_k3.generated.patched_modeling_kimi_k3_gpu import (
+        _kimi_k3_position_ids,
+    )
+
+    input_ids = torch.randint(0, 100, (2, 7))
+    position_ids = _kimi_k3_position_ids(input_ids=input_ids)
+    assert position_ids.shape == input_ids.shape
+    assert torch.equal(position_ids, torch.arange(7).expand(2, 7))
+    restored = pickle.loads(pickle.dumps(_kimi_k3_position_ids))
+    assert torch.equal(restored(input_ids=input_ids), position_ids)
+    assert restored(input_ids=None) is None
+
+
+def test_vlm_attention_override_preserves_child_selections():
+    """A root attention override must not clobber explicit per-child
+    selections (round-3 review): ``VeOmniPretrainedConfig``'s
+    ``_attn_implementation`` mapping form records per-child choices that
+    rank above the root value, and the patched ``__init__`` used to
+    re-stamp both sub-configs with the root selection. The vision tower
+    only supports ``VL_VISION_ATTENTION_FUNCTIONS`` -- unsupported names
+    must raise at construction, not KeyError at the first image forward."""
+    from veomni.models.transformers.kimi_k3.generated.patched_modeling_kimi_k3_gpu import (
+        KimiK3ForConditionalGeneration,
+    )
+
+    # explicit per-child selections (HF mapping form -- the setter writes
+    # only the named children) survive a root selection embedded in the
+    # config itself, the production shape: the launch yaml embeds
+    # ops_config in the model config and VeOmniPretrainedConfig's
+    # post-init keeps per-child entries on top of it. The old patch
+    # re-stamped both sub-configs with the root value at __init__.
+    # 'veomni_flash_attention_2' is normalize-stable and passes HF's
+    # construction-time sdpa/flash_attn availability guards; the root
+    # 'eager' differs from both children so a re-stamp flips the assert.
+    cfg = _tiny_config()
+    cfg._attn_implementation = {"text_config": "veomni_flash_attention_2", "vision_config": "eager"}
+    # root selection written without the setter's tree-wide recursion
+    cfg.ops_implementation["attn_implementation"] = "eager"
+    model = build_foundation_model(cfg, torch_dtype="float32", init_device="cpu")
+    assert model.config.text_config._attn_implementation == "veomni_flash_attention_2"
+    assert model.config.vision_config._attn_implementation == "eager"
+
+    # an sdpa-flavored selection on the vision child itself (raw dict
+    # spelling -- both the normalizing setter and HF's own 'sdpa'
+    # construction guard live elsewhere) falls back to 'eager': the old
+    # patch only remapped the root selection onto children and left a
+    # child-level selection to KeyError at the first image forward
+    cfg = _tiny_config()
+    cfg.vision_config.ops_implementation["attn_implementation"] = "veomni_sdpa"
+    model = KimiK3ForConditionalGeneration(cfg)
+    assert model.config.vision_config._attn_implementation == "eager"
+
+    # unsupported vision selection raises at construction
+    cfg = _tiny_config()
+    cfg._attn_implementation = "veomni_sage_attention"
+    with pytest.raises(ValueError, match="vision attention"):
+        KimiK3ForConditionalGeneration(cfg)
+
+
+def test_short_convolution_reuses_hoisted_host_boundaries():
+    """ShortConvolution.forward accepts the hoisted host copy of the
+    varlen boundaries (round-3 review): reusing it must be output-identical
+    to re-deriving cu_seqlens.tolist() inside, for both the plain and
+    packed varlen forms (CPU tensor or plain sequence)."""
+    from veomni.ops.kernels.kda.kimi_k3.eager import ShortConvolution
+
+    torch.manual_seed(0)
+    conv = ShortConvolution(hidden_size=8, kernel_size=4)
+    x = torch.randn(1, 10, 8)
+
+    y_plain, _ = conv(x)
+    assert y_plain.shape == x.shape
+
+    cu = torch.tensor([0, 4, 10])
+    y_ref, _ = conv(x=x, cu_seqlens=cu)
+    # the packed form resets causality at the segment boundary, so the
+    # varlen output must differ from the plain causal run
+    assert not torch.allclose(y_ref, y_plain)
+    y_host_list, _ = conv(x=x, cu_seqlens=cu, cu_seqlens_cpu=cu.tolist())
+    y_host_tensor, _ = conv(x=x, cu_seqlens=cu, cu_seqlens_cpu=cu.cpu())
+    torch.testing.assert_close(y_host_list, y_ref)
+    torch.testing.assert_close(y_host_tensor, y_ref)
+
+
+def test_source_kda_module_forward_runs():
+    """The vendored source must stay runnable on its own: its package
+    docstring is the re-sync reference, and the round-3 review caught call
+    sites left behind after their definitions moved to the patch layer
+    (``SourceKDA(...)(x)`` raised ``AttributeError`` at forward). This
+    exercises the module-level eager ``chunk_kda`` reference call site (and
+    the eager ShortConvolution / FusedRMSNormGated imports) end to end."""
+    from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import (
+        KimiDeltaAttention as SourceKDA,
+    )
+
+    config = _tiny_config().text_config
+    torch.manual_seed(0)
+    module = SourceKDA(config, layer_idx=1).eval()
+    for p in module.parameters():
+        torch.nn.init.normal_(p, std=0.02)
+    hidden_states = torch.randn(1, 32, config.hidden_size)
+    with torch.no_grad():
+        out = module(hidden_states)
+    assert out.shape == hidden_states.shape
+    assert torch.isfinite(out).all()
+
+
+def test_source_module_self_attributes_are_defined():
+    """AST-scan the vendored source for ``self.<attr>`` loads that no
+    assignment, method definition, or buffer registration in the same
+    module can back.
+
+    This is the mechanical guard for the class of drift the round-3 review
+    caught by hand (definitions moved to the patch layer while their call
+    sites stayed in the source). The allowlist covers: ``loss_function``
+    (the patched ``__init__`` overrides assign ``partial(ForCausalLMLoss,
+    op=...)``), ``freqs_cis`` / ``time_weight`` (created through
+    ``self.register_buffer(...)`` in the vision tower, where the string
+    argument is invisible to a textual scan), and the torch / transformers
+    base-class API (``training``, ``post_init``, ``register_buffer``)."""
+    import ast
+    import inspect
+
+    from veomni.models.transformers.kimi_k3.source import modeling_kimi_k3 as source_module
+
+    allow = {
+        # patch-injected: assigned in the patched KimiLinearForCausalLM /
+        # KimiK3ForConditionalGeneration __init__ overrides
+        "loss_function",
+        # register_buffer-created buffers (the string arg is not an assignment)
+        "freqs_cis",
+        "time_weight",
+        # torch / transformers base-class API
+        "training",
+        "post_init",
+        "register_buffer",
+    }
+
+    tree = ast.parse(inspect.getsource(source_module))
+    defined: set[str] = set()
+    loaded: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            defined.add(node.name)
+        if isinstance(node, ast.Assign):
+            defined.update(
+                target.attr
+                for target in node.targets
+                if isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            )
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Attribute):
+            if isinstance(node.target.value, ast.Name) and node.target.value.id == "self":
+                defined.add(node.target.attr)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
+            loaded.add(node.attr)
+    dangling = loaded - defined - allow
+    assert not dangling, (
+        "self.<attr> references in the vendored source with no backing "
+        f"assignment or method in the module: {sorted(dangling)} -- move the "
+        "call site into the patch layer (or leave an upstream-shaped source "
+        "call) so source/modeling_kimi_k3.py stays runnable as its own "
+        "re-sync reference."
+    )
+
+
 def test_moe_gate_router_is_initialized():
     """The router weight and e_score_correction_bias survive to_empty re-init."""
     model = _build_model()

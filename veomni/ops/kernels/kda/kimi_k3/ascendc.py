@@ -935,8 +935,11 @@ def _chunk_kda_dispatch_segments(
     2. Calls whose total chunk count exceeds ``_KDA_MAX_FUSED_CHUNKS`` corrupt
        the first heads' outputs (see the constant's comment): consecutive long
        segments are grouped so every fused call stays within the budget. A
-       single segment larger than the budget keeps its own call and relies on
-       the finite-output check below.
+       single segment larger than the budget cannot be split without changing
+       the recurrence semantics, so it runs the eager reference on its own
+       rows -- the fused kernel corrupts the first heads' outputs in exactly
+       that envelope, and the finite-output check is a debug tool, not a
+       production guard.
 
     Segment groups are independent in stateless varlen mode, so per-group calls
     are output-identical to a single call (verified bit-identical below the
@@ -1024,6 +1027,14 @@ def _chunk_kda_dispatch_segments(
     o = torch.zeros(q.shape[0], q.shape[1], v.shape[2], v.shape[3], dtype=q.dtype, device=q.device)
     for group in _group_ranges_by_chunk_budget(long_ranges, chunk_size, _KDA_MAX_FUSED_CHUNKS):
         idx = _rows(group)
+        if sum((b - a + chunk_size - 1) // chunk_size for a, b in group) > _KDA_MAX_FUSED_CHUNKS:
+            # A single segment whose own chunk count exceeds the budget: the
+            # grouping cannot split it without changing the recurrence
+            # semantics, and a fused call there sits inside the characterized
+            # corruption envelope (the first heads' outputs) -- run the eager
+            # reference on those rows (round-3 review).
+            o = o.index_copy(1, idx, _eager_sub(group))
+            continue
         o_group = ChunkKDAFunction.apply(
             q[:, idx],
             k[:, idx],

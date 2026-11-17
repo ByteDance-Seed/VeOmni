@@ -56,6 +56,7 @@ from transformers.utils.output_capturing import OutputRecorder
 from veomni.ops.kernels.kda.kimi_k3.eager import (
     FusedRMSNormGated,
     ShortConvolution,
+    chunk_kda,
     fused_recurrent_kda,
     prepare_cu_seqlens_from_mask,
     prepare_lens_from_mask,
@@ -611,7 +612,7 @@ class KimiDeltaAttention(nn.Module):
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
 
         if mode == "chunk":
-            o, recurrent_state = self.veomni_chunk_kda(
+            o, recurrent_state = chunk_kda(
                 q=q,
                 k=k,
                 v=v,
@@ -976,31 +977,15 @@ class KimiDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        # NPU/EP (selective recompute): checkpoint the attention
-        # stack only; the MoE block below keeps its activations so the EP
-        # alltoall collectives are never replayed inside backward.
-        if self._attn_selective_recompute():
-            hidden_states = torch.utils.checkpoint.checkpoint(
-                self._run_attn,
-                hidden_states,
-                attention_mask,
-                position_ids,
-                past_key_values,
-                output_attentions,
-                use_cache,
-                use_reentrant=False,
-                **kwargs,
-            )
-        else:
-            hidden_states = self._run_attn(
-                hidden_states,
-                attention_mask,
-                position_ids,
-                past_key_values,
-                output_attentions,
-                use_cache,
-                **kwargs,
-            )
+        hidden_states = self._run_attn(
+            hidden_states,
+            attention_mask,
+            position_ids,
+            past_key_values,
+            output_attentions,
+            use_cache,
+            **kwargs,
+        )
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -1043,31 +1028,15 @@ class KimiDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        # NPU/EP (selective recompute): checkpoint the attention
-        # stack only; the MoE block below keeps its activations so the EP
-        # alltoall collectives are never replayed inside backward.
-        if self._attn_selective_recompute():
-            hidden_states = torch.utils.checkpoint.checkpoint(
-                self._run_attn,
-                hidden_states,
-                attention_mask,
-                position_ids,
-                past_key_values,
-                output_attentions,
-                use_cache,
-                use_reentrant=False,
-                **kwargs,
-            )
-        else:
-            hidden_states = self._run_attn(
-                hidden_states,
-                attention_mask,
-                position_ids,
-                past_key_values,
-                output_attentions,
-                use_cache,
-                **kwargs,
-            )
+        hidden_states = self._run_attn(
+            hidden_states,
+            attention_mask,
+            position_ids,
+            past_key_values,
+            output_attentions,
+            use_cache,
+            **kwargs,
+        )
 
         if prefix_sum is not None:
             prefix_sum = prefix_sum + hidden_states

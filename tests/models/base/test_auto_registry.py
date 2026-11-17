@@ -341,6 +341,7 @@ _MODEL_CASES = (
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
             ("language_model.model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("language_model.model.layers.3.self_attn.veomni_attn", "attention"),
             ("language_model.model.layers.1.self_attn.veomni_chunk_kda", "chunk_kda"),
             ("language_model.model.layers.1.block_sparse_moe.experts.veomni_moe", "moe_experts"),
             (
@@ -359,6 +360,7 @@ _MODEL_CASES = (
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.layers.3.self_attn.veomni_attn", "attention"),
             ("model.layers.1.self_attn.veomni_chunk_kda", "chunk_kda"),
             ("model.layers.1.block_sparse_moe.experts.veomni_moe", "moe_experts"),
             ("model.layers.1.block_sparse_moe.experts.act_fn.veomni_situ_and_mul", "situ_and_mul"),

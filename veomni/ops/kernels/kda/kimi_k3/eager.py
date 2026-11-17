@@ -45,7 +45,8 @@ def prepare_cu_seqlens_from_mask(mask: torch.Tensor, dtype=torch.int32) -> torch
 class ShortConvolution(nn.Conv1d):
     """Eager depthwise causal short convolution with the fla call interface.
 
-    ``forward(x, cache=None, output_final_state=False, cu_seqlens=None)`` where
+    ``forward(x, cache=None, output_final_state=False, cu_seqlens=None,
+    cu_seqlens_cpu=None)`` where
     ``x`` is ``[B, T, H]`` (or packed ``[1, total_T, H]`` together with
     ``cu_seqlens``). Output is ``silu(conv(x))``; the cache stores the last
     ``kernel_size - 1`` *inputs*. The varlen+cache combination (packed decode)
@@ -65,12 +66,21 @@ class ShortConvolution(nn.Conv1d):
             return x
         raise NotImplementedError(f"Unsupported activation for ShortConvolution: {self.activation!r}")
 
-    def forward(self, x, cache=None, output_final_state=False, cu_seqlens=None, channel_slice=None, **kwargs):
+    def forward(
+        self, x, cache=None, output_final_state=False, cu_seqlens=None, cu_seqlens_cpu=None, channel_slice=None, **kwargs
+    ):
         """Run the depthwise causal conv (``channel_slice`` serves KDA head-sharding)."""
         if x.dim() == 2:
             x = x.unsqueeze(0)
         if cu_seqlens is not None:
-            cu = cu_seqlens.tolist()
+            # Reuse the hoisted host copy when the caller provides one:
+            # cu_seqlens.tolist() is a device sync, and the three KDA convs
+            # would each re-pay it per layer otherwise (round-3 review).
+            # The copy may arrive as a CPU tensor or a plain sequence.
+            if cu_seqlens_cpu is not None:
+                cu = cu_seqlens_cpu.tolist() if isinstance(cu_seqlens_cpu, torch.Tensor) else list(cu_seqlens_cpu)
+            else:
+                cu = cu_seqlens.tolist()
             segments, states = [], []
             for s, e in zip(cu[:-1], cu[1:]):
                 seg, st = self._conv_seq(x[:, s:e, :], cache, output_final_state, channel_slice)

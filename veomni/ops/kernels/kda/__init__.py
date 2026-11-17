@@ -22,6 +22,12 @@ flash-linear-attention exposes the KDA gating contract (beta-sigmoid,
 in-kernel gate, safe-gate bounds). ``ascendc`` is the fused AscendC
 forward+backward path from flash-linear-attention-npu (MindSpeed-MM
 kimi_k3 wrapper) and is the production path on NPU.
+
+The KDA-adjacent eager primitives (``ShortConvolution`` /
+``FusedRMSNormGated``, vendored in ``.kimi_k3.eager``) are deliberately
+not registered as ops: the modeling constructs them directly and no
+fused-row selection applies to them (unlike the GDN family's registered
+``causal_conv1d`` / ``rms_norm_gated`` rows).
 """
 
 import inspect

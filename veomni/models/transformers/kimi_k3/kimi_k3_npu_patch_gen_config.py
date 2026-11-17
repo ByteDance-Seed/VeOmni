@@ -28,6 +28,8 @@ from veomni.models.transformers.kimi_k3.kimi_k3_gpu_patch_gen_config import (
     PatchedKimiK3SparseMoeBlock,
     kimi_decoder_layer_attn_selective_recompute_patched,
     kimi_decoder_layer_call_patched,
+    kimi_decoder_layer_forward_attn_residual_patched,
+    kimi_decoder_layer_forward_patched,
     kimi_delta_attention_forward_patched,
     kimi_delta_attention_init_patched,
     kimi_k3_for_conditional_generation_forward_patched,
@@ -43,6 +45,7 @@ from veomni.models.transformers.kimi_k3.kimi_k3_gpu_patch_gen_config import (
     kimi_linear_get_parallel_plan_patched,
     kimi_linear_model_init_patched,
     kimi_mla_attention_forward_patched,
+    kimi_mla_attention_init_patched,
     kimi_moe_gate_forward_patched,
     kimi_pretrained_init_weights_patched,
     kimi_rmsnorm_forward_patched,
@@ -155,8 +158,37 @@ config.override_method(
     ),
 )
 
-# ── MLA under sequence parallel ──────────────────────────────────────────────
+config.override_method(
+    "KimiDecoderLayer.forward",
+    replacement=kimi_decoder_layer_forward_patched,
+    description=(
+        "EP selective recompute at the call site too (moved out of the vendored "
+        "source together with the policy method; upstream has no expert "
+        "parallelism): checkpoint only the collective-free attention stack under EP"
+    ),
+)
 
+config.override_method(
+    "KimiDecoderLayer._forward_attn_residual",
+    replacement=kimi_decoder_layer_forward_attn_residual_patched,
+    description=(
+        "Attention-residual forward carrying the same EP selective-recompute "
+        "call site (see KimiDecoderLayer.forward)"
+    ),
+)
+
+# ── MLA: instance-local attention VeomniOp + sequence parallel ───────────────────────────────────────────────
+
+
+config.override_method(
+    "KimiMLAAttention.__init__",
+    replacement=kimi_mla_attention_init_patched,
+    description=(
+        "Bind the instance-local attention VeomniOp (veomni_attn) at construction so an "
+        "unsupported attention implementation fails here instead of raising from inside "
+        "forward (full-body override: patchgen has no init-append mechanism)"
+    ),
+)
 
 config.override_method(
     "KimiMLAAttention.forward",

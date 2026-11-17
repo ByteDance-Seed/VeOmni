@@ -21,10 +21,16 @@
 #      EP selective-recompute policy (VeOmni-only; upstream has no EP): checkpoint only the collective-free attention stack under EP
 #    - method_override: KimiDecoderLayer.__call__
 #      Skip the whole-layer GradientCheckpointingLayer checkpoint under EP (forward() checkpoints the attention stack itself)
+#    - method_override: KimiDecoderLayer.forward
+#      EP selective recompute at the call site too (moved out of the vendored source together with the policy method; upstream has no expert parallelism): checkpoint only the collective-free attention stack under EP
+#    - method_override: KimiDecoderLayer._forward_attn_residual
+#      Attention-residual forward carrying the same EP selective-recompute call site (see KimiDecoderLayer.forward)
 #    - function_replacement: multihead_attention
 #      Vision varlen attention via a lazily-imported flash-attn
+#    - method_override: KimiMLAAttention.__init__
+#      Bind the instance-local attention VeomniOp (veomni_attn) at construction so an unsupported attention implementation fails here instead of raising from inside forward (full-body override: patchgen has no init-append mechanism)
 #    - method_override: KimiMLAAttention.forward
-#      Sequence-parallel MLA: full-sequence gather/narrow around the attention, or head-sharded ulysses inside the veomni_* attention adapters
+#      Sequence-parallel MLA: full-sequence gather/narrow around the attention, or head-sharded ulysses inside the veomni_* attention adapters; dispatches through the instance-local veomni_attn VeomniOp bound at construction
 #    - method_override: KimiRMSNorm.__init__
 #      Construct a local rms_norm VeomniOp
 #    - method_override: KimiRMSNorm.forward
@@ -38,7 +44,7 @@
 #    - method_override: KimiLinearModel.__init__
 #      Respect the requested `_attn_implementation` (eager / veomni_* kernels) instead of forcing flash_attention_2
 #    - method_override: KimiK3ForConditionalGeneration.__init__
-#      Propagate the top-level `_attn_implementation` to text_config and vision_config before construction (the MoonViT3d tower registers 'eager'/'flash_attention_2'/'veomni_flash_attention_2' in VL_VISION_ATTENTION_FUNCTIONS -- HF K3 has no vision 'sdpa', so an 'sdpa' request falls back to 'eager' for vision); also override _no_split_modules to keep vision/projector in the root FSDP2 unit (asymmetric multimodal batches deadlock otherwise)
+#      Validate / remap the vision tower's `_attn_implementation` before construction (the MoonViT3d tower registers 'eager'/'flash_attention_2'/'veomni_flash_attention_2' in VL_VISION_ATTENTION_FUNCTIONS -- HF K3 has no vision 'sdpa', so an 'sdpa' request falls back to 'eager' and any other unsupported name raises at construction instead of key-erroring at the first image forward; the text_config selection is left to VeOmniPretrainedConfig's root->child propagation, which honors explicit per-child selections); also override _no_split_modules to keep vision/projector in the root FSDP2 unit (asymmetric multimodal batches deadlock otherwise)
 #    - method_override: KimiK3ForConditionalGeneration.tie_weights
 #      Accept the transformers v5 tie_weights kwargs (missing_keys / recompute_mapping) in the override
 #    - method_override: KimiLinearForCausalLM.__init__
@@ -56,7 +62,7 @@
 #    - method_override: MoonViT3dPretrainedModel._init_weights
 #      Vision-tower weight init under the FSDP2 meta flow: composite-model smart_apply dispatches sub-models to their own _init_weights and the transformers default chain has no branch for the learnable 2D pos-emb (or the KDA o_norm / to_empty-zeroed tower norms), so to_empty leaves raw device memory in the pos-emb -- zeroed NPU pages silently drop visual position information and fsdp offload leaves uninitialized CPU memory that poisons image features with NaN from the first step
 #    - method_override: KimiK3ForConditionalGeneration.get_position_id_func
-#      VLM trainer data hook: K3 derives positions inside the modeling (vision divided-fixed pos-emb from grid_thws, NoPE MLA, recurrent KDA); return an arange stub for generic consumers
+#      VLM trainer data hook: K3 derives positions inside the modeling (vision divided-fixed pos-emb from grid_thws, NoPE MLA, recurrent KDA); return the module-level arange stub (picklable for dataloader workers)
 #    - method_override: KimiK3ForConditionalGeneration.get_extra_collate_infos
 #      K3 SP contract: text tokens are seq-sharded (ulysses) but the vision tower runs redundantly on every SP rank -- pixel_values/grid_thws stay full (no sp-slice). grid_thws (num_images, 3) cats along dim 0 like image_grid_thw. Tuple form; MainCollator expands it to DataCollateInfo.
 #    - method_override: KimiLinearForCausalLM.get_parallel_plan
@@ -68,7 +74,7 @@
 
 import math
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from copy import deepcopy
 from functools import partial
 from math import sqrt
@@ -86,10 +92,9 @@ from transformers.cache_utils import Cache
 from transformers.configuration_utils import PretrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.masking_utils import create_causal_mask
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from transformers.modeling_utils import PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple, logging
 from transformers.utils.generic import check_model_inputs
@@ -246,17 +251,40 @@ def _kda_forward_sp_head_shard(module, hidden_states, attention_mask, **kwargs):
         g = index_first_axis(rearrange(g, "b s ... -> (b s) ..."), indices).unsqueeze(0)
         beta = index_first_axis(rearrange(beta, "b s ... -> (b s) ..."), indices).unsqueeze(0)
 
+    # Modification (round-3): one host materialization of the varlen
+    # boundaries feeds the three short convolutions below (see the non-SP
+    # forward): without it each ShortConvolution re-runs cu_seqlens.tolist()
+    # (a device sync) per KDA layer.
+    conv_cu_host = None
+    if cu_seqlens is not None:
+        conv_cu_host = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens.tolist()
+
     # -- short convs on the full varlen sequence (segments intact) -------
     cs_qk = (sp_rank * hs * Dk, (sp_rank + 1) * hs * Dk)
     cs_v = (sp_rank * hs * Dh, (sp_rank + 1) * hs * Dh)
     q, _ = module.q_conv1d(
-        x=q_proj_states, cache=None, output_final_state=False, cu_seqlens=cu_seqlens, channel_slice=cs_qk
+        x=q_proj_states,
+        cache=None,
+        output_final_state=False,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=conv_cu_host,
+        channel_slice=cs_qk,
     )
     k, _ = module.k_conv1d(
-        x=k_proj_states, cache=None, output_final_state=False, cu_seqlens=cu_seqlens, channel_slice=cs_qk
+        x=k_proj_states,
+        cache=None,
+        output_final_state=False,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=conv_cu_host,
+        channel_slice=cs_qk,
     )
     v, _ = module.v_conv1d(
-        x=v_proj_states, cache=None, output_final_state=False, cu_seqlens=cu_seqlens, channel_slice=cs_v
+        x=v_proj_states,
+        cache=None,
+        output_final_state=False,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=conv_cu_host,
+        channel_slice=cs_v,
     )
 
     # -- per-head parameters -> local head slice -------------------------
@@ -303,6 +331,23 @@ def _kda_forward_sp_head_shard(module, hidden_states, attention_mask, **kwargs):
     o = rearrange(o, "b t h d -> b t (h d)")
     o = module.o_proj(o)
     return o
+
+
+# The position-id stub must live at module level: VLMTrainer captures it
+# in the dataset transform and dataloader workers pickle that transform
+# (spawn start method on NPU) -- a closure would fail with
+# "Can't pickle local object".
+def _kimi_k3_position_ids(input_ids=None, **kwargs):
+    """Arange position-id stub for the VLM trainer data hook.
+
+    K3 derives positions inside the modeling (vision divided-fixed
+    pos-emb from grid_thws, NoPE MLA, recurrent KDA), so generic
+    consumers get an arange over the sequence; module level keeps the
+    reference picklable for dataloader workers.
+    """
+    if input_ids is None:
+        return None
+    return torch.arange(input_ids.shape[-1], device=input_ids.device).expand_as(input_ids)
 
 
 logger = logging.get_logger(__name__)
@@ -646,7 +691,7 @@ def eager_attention_forward(
 
 # ======================================================================
 # [MODIFIED CLASS] KimiMLAAttention
-# Methods patched: forward
+# Methods patched: __init__, forward
 # ======================================================================
 
 
@@ -655,7 +700,11 @@ class KimiMLAAttention(nn.Module):
     Multi-Latent Attention adapted from deepseek-v3
     """
 
-    def __init__(self, config: KimiLinearConfig, layer_idx: int):
+    # MLA attention: instance-local VeomniOp bound at construction (round-3: the
+    # forward dispatches through the handle, so an unsupported attention
+    # implementation fails at construction instead of raising from inside
+    # forward).
+    def __init__(self, config: "KimiLinearConfig", layer_idx: int):
         nn.Module.__init__(self)
         self.config = config
         self.layer_idx = layer_idx
@@ -721,6 +770,11 @@ class KimiMLAAttention(nn.Module):
             self.g_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
 
         self.rotary_emb = None
+        # Modification (round-3): instance-local attention VeomniOp -- forward
+        # dispatches through this handle, so an unregistered attention
+        # implementation fails here, at construction, instead of raising
+        # from inside forward.
+        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
     # MLA under sequence parallel (gather/narrow around the attention)
     def forward(
@@ -799,11 +853,22 @@ class KimiMLAAttention(nn.Module):
         if self.config._attn_implementation == "flash_attention_2" and self.q_head_dim != self.v_head_dim:
             value_states = F.pad(value_states, [0, self.q_head_dim - self.v_head_dim])
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, _ = attention_interface(
+        # Modification (round-3): dispatch through the instance-local veomni_attn
+        # VeomniOp bound in __init__ -- a wrong or unregistered attention
+        # implementation now fails at construction instead of raising from
+        # inside forward, and the ALL_ATTENTION_FUNCTIONS forward-time lookup
+        # (with its eager_attention_forward fallback branch) drops out of the
+        # generated file.
+        # Legacy SP path: the full sequence was gathered above, so Q/K/V are
+        # already global. The raw eager/sdpa rows cannot run the ulysses
+        # exchanges themselves, so tell the attention wrapper to skip its SP
+        # check (it would otherwise reject non-veomni_* implementations
+        # under SP); the veomni_* rows run the exchanges inside the wrapper
+        # and keep the default.
+        _call_kwargs = kwargs
+        if get_parallel_state().sp_enabled and not sp_ulysses_attn:
+            _call_kwargs = {**kwargs, "skip_ulysses": True}
+        attn_output, _ = self.veomni_attn(
             self,
             query_states,
             key_states,
@@ -811,7 +876,7 @@ class KimiMLAAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            **kwargs,
+            **_call_kwargs,
         )
 
         if self.config._attn_implementation == "flash_attention_2" and self.q_head_dim != self.v_head_dim:
@@ -971,6 +1036,15 @@ class KimiDeltaAttention(nn.Module):
             cu_seqlens_cpu = None
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
 
+        # Modification (round-3): one host materialization of the varlen
+        # boundaries feeds the three short convolutions below -- without it
+        # each ShortConvolution re-runs cu_seqlens.tolist() (a device sync)
+        # per KDA layer, exactly the per-layer host copy the AscendC entries
+        # avoid through cu_seqlens_cpu.
+        conv_cu_host = None
+        if cu_seqlens is not None:
+            conv_cu_host = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens.tolist()
+
         conv_state_q, conv_state_k, conv_state_v = None, None, None
         recurrent_state = None
         if cache_params is not None:
@@ -986,18 +1060,21 @@ class KimiDeltaAttention(nn.Module):
             cache=conv_state_q,
             output_final_state=use_cache,
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=conv_cu_host,
         )
         k, conv_state_k = self.k_conv1d(
             x=k_proj_states,
             cache=conv_state_k,
             output_final_state=use_cache,
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=conv_cu_host,
         )
         v, conv_state_v = self.v_conv1d(
             x=v_proj_states,
             cache=conv_state_v,
             output_final_state=use_cache,
             cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=conv_cu_host,
         )
         g = self.f_b_proj(self.f_a_proj(hidden_states))
         g = rearrange(g, "... (h d) -> ... h d", d=self.head_dim)
@@ -1269,7 +1346,7 @@ class KimiSparseMoeBlock(nn.Module):
 
 # ======================================================================
 # [MODIFIED CLASS] KimiDecoderLayer
-# Methods patched: _attn_selective_recompute, __call__
+# Methods patched: _attn_selective_recompute, __call__, forward, _forward_attn_residual
 # ======================================================================
 
 
@@ -1345,7 +1422,7 @@ class KimiDecoderLayer(GradientCheckpointingLayer):
         output_attentions: bool | None = False,
         use_cache: bool | None = False,
         block_residual: torch.Tensor | None = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs,
     ):
         if self.use_attn_residuals:
             return self._forward_attn_residual(
@@ -1411,7 +1488,7 @@ class KimiDecoderLayer(GradientCheckpointingLayer):
         output_attentions: bool | None = False,
         use_cache: bool | None = False,
         block_residual: torch.Tensor | None = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs,
     ):
         batch_size, seq_len, hidden_size = hidden_states.shape
         prefix_sum = hidden_states
@@ -1482,10 +1559,11 @@ class KimiDecoderLayer(GradientCheckpointingLayer):
 
         return prefix_sum, block_residual
 
-    # Decoder layer: EP selective recompute (moved out of the vendored source).
-    # Upstream has no expert parallelism, so this policy is pure VeOmni behaviour
-    # and lives in the patch layer alongside the SP routing -- the generated .diff
-    # shows it on every re-sync.
+    # Decoder layer: EP selective recompute (moved out of the vendored source,
+    # call sites included -- the source keeps plain self._run_attn(...) calls so
+    # it stays runnable). Upstream has no expert parallelism, so this policy is
+    # pure VeOmni behaviour and lives in the patch layer alongside the SP
+    # routing -- the generated .diff shows it on every re-sync.
     def _attn_selective_recompute(self) -> bool:
         # NPU/EP (MindSpeed-style selective recompute): under EP the MoE block
         # contains alltoall dispatch/combine collectives. Non-reentrant
@@ -1634,8 +1712,9 @@ class KimiLinearModel(KimiPreTrainedModel):
 
         # Modification: respect the caller-requested attention implementation
         # (eager / veomni_* NPU kernels) instead of forcing flash_attention_2.
-        # KimiMLAAttention already dispatches through ALL_ATTENTION_FUNCTIONS with
-        # an eager fallback, so any registered implementation works.
+        # KimiMLAAttention binds its instance-local veomni_attn VeomniOp in
+        # __init__, so any registered implementation works and an unsupported
+        # one fails at construction.
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -1820,6 +1899,14 @@ class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
             _linear_cu = kwargs.get("cu_seq_lens_q")
         if _linear_cu is not None:
             fa_kwargs["cu_seqlens"] = _linear_cu
+        # Modification (round-3): hoist the varlen boundaries to host once per
+        # forward (mirroring KimiK3ForConditionalGeneration.forward) -- the NPU
+        # KDA stack (AscendC entry + short convolutions) consumes host
+        # metadata, and without this hoist every KDA layer re-pays the D2H
+        # copy this forward already avoids.
+        _cu_linear = fa_kwargs.get("cu_seqlens")
+        if isinstance(_cu_linear, torch.Tensor):
+            fa_kwargs["cu_seqlens_cpu"] = _cu_linear.cpu()
 
         # Packed varlen metadata is only honored by the varlen attention
         # implementations: the dense eager/sdpa/veomni_sdpa path would run one
@@ -2877,25 +2964,35 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
     def _supports_default_dynamic_cache(cls) -> bool:
         return False
 
-    # KimiK3ForConditionalGeneration.__init__ (propagate _attn_implementation) --
+    # KimiK3ForConditionalGeneration.__init__ (vision attention validation) --
     # NOTE: patchgen's codegen has no INIT_MODIFICATION applicator (modify_init is
     # a silent no-op beyond the header listing), so this must be a full
     # override_method replacement of __init__.
     def __init__(self, config):
-        # Modification: propagate the attention implementation to the sub-configs
-        # before submodule construction. The MoonViT3d vision tower has no 'sdpa'
-        # implementation (VL_VISION_ATTENTION_FUNCTIONS registers only
-        # 'eager'/'flash_attention_2'), so an 'sdpa' request falls back to 'eager'
-        # for the vision tower.
-        selected_attn = config.ops_implementation.get("attn_implementation")
-        if isinstance(selected_attn, str):
-            config.text_config._attn_implementation = selected_attn
-            vision_config = getattr(config, "vision_config", None)
-            if vision_config is not None:
-                vision_impl = selected_attn
-                if vision_impl in ("sdpa", "veomni_sdpa"):
-                    vision_impl = "eager"
-                vision_config._attn_implementation = vision_impl
+        # Modification: validate / remap the vision tower's attention selection
+        # before submodule construction. text_config is intentionally NOT stamped
+        # here: VeOmniPretrainedConfig's root->child propagation already resolves
+        # the selection with an explicit per-child choice (the mapping form)
+        # ranking above the root value, and writing text_config._attn_implementation
+        # here would clobber that explicit choice (round-3 review). The MoonViT3d
+        # vision tower has no 'sdpa' implementation (VL_VISION_ATTENTION_FUNCTIONS
+        # registers only 'eager'/'flash_attention_2'/'veomni_flash_attention_2'), so
+        # 'sdpa'/'veomni_sdpa' fall back to 'eager'; any other unsupported name
+        # raises at construction instead of key-erroring at the first image
+        # forward.
+        vision_config = getattr(config, "vision_config", None)
+        if vision_config is not None:
+            vision_impl = vision_config._attn_implementation
+            if vision_impl in ("sdpa", "veomni_sdpa"):
+                vision_impl = "eager"
+            if vision_impl not in VL_VISION_ATTENTION_FUNCTIONS:
+                raise ValueError(
+                    f"Unsupported vision attention implementation {vision_impl!r} for the "
+                    "MoonViT3d vision tower; supported implementations are "
+                    f"{sorted(VL_VISION_ATTENTION_FUNCTIONS)} (plus 'sdpa'/'veomni_sdpa', "
+                    "which fall back to 'eager')"
+                )
+            vision_config._attn_implementation = vision_impl
 
         super().__init__(config)
 
@@ -3474,11 +3571,6 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         return self.language_model._reorder_cache(*args, **kwargs)
 
     def get_position_id_func(self):
-        def _kimi_k3_position_ids(input_ids=None, **kwargs):
-            if input_ids is None:
-                return None
-            return torch.arange(input_ids.shape[-1], device=input_ids.device).expand_as(input_ids)
-
         return _kimi_k3_position_ids
 
     def get_extra_collate_infos(self):

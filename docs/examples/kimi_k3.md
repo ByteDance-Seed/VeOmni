@@ -76,11 +76,15 @@ installed `fla_npu` version (supported: `1.0.x`) and the integrity of the
 canonical chunk-indices table the aclnn kernel consumes, and the varlen
 router keeps known-bad shapes off the fused kernel (segments shorter than
 4 tokens and calls above the 32-chunk budget run through the eager
-reference instead — the fused kernel corrupts those). Two escape hatches
-are documented in the module docstring: `VEOMNI_KDA_ASCENDC_GUARDED=0`
-disables the routing guards (raw fused calls) and
-`VEOMNI_KDA_DEBUG_FINITE_CHECK=1` re-checks finiteness of every fused
-call for bring-up debugging.
+reference instead — the fused kernel corrupts those). The full set of
+escape-hatch knobs:
+
+| Knob | Default | Effect |
+|---|---|---|
+| `VEOMNI_KDA_ASCENDC_GUARDED` | `1` | `0` disables the AscendC routing guards (raw fused calls; upstream-kernel debugging only) |
+| `VEOMNI_KDA_DEBUG_FINITE_CHECK` | `0` | `1` re-checks finiteness of every fused call and falls back to the eager reference on corruption (bring-up debugging; one device-to-host sync per call) |
+| `K3_ALLOW_DENSE_PACKED` | `0` | `1` re-enables the dense eager/sdpa MLA path for packed varlen batches (debug only: one causal mask across the packed row leaks across samples; the CPU packing tests use it) |
+| `K3_KDA_HEAD_SHARD` | `1` | `0` selects the legacy full-sequence-gather KDA path under sequence parallel instead of the head-sharded ulysses all-to-all (also the cache / inference path) |
 
 ## Prepare dataset
 
@@ -176,12 +180,15 @@ source .venv/bin/activate
 The GPU recipe `configs/multimodal/kimi_k3/kimi_k3_vl.yaml` pins the
 official-default baseline the NPU fused stack compares against: flash-attn
 FA2 attention (through the sequence-parallel adapter), eager RMSNorm /
-cross-entropy, the official `fla` chunk_kda (version-asserted: the row
-feature-detects the KDA gating parameters on the installed build and
-raises `NotImplementedError` naming what is missing instead of silently
-dropping them), and the SituGLU eager expert
-loop (expert-parallel aware; fused GPU MoE rows may follow). Launch it
-exactly like the NPU recipe:
+cross-entropy, the vendored eager `chunk_kda_naive` reference (portable
+and autograd-friendly — the same math the NPU eager row and the AscendC
+parity tests run), and the SituGLU eager expert
+loop (expert-parallel aware; fused GPU MoE rows may follow). The `fla`
+row stays available as an optional selection for compatible
+flash-linear-attention builds (version-asserted: the row feature-detects
+the KDA gating parameters on the installed build and raises
+`NotImplementedError` naming what is missing instead of silently dropping
+them). Launch it exactly like the NPU recipe:
 
 ```bash
 bash train.sh tasks/train_vlm.py configs/multimodal/kimi_k3/kimi_k3_vl.yaml \

@@ -356,3 +356,51 @@ def test_over_budget_small_heads_split_matches_reference():
         chunk_size=64,
     )
     torch.testing.assert_close(o_npu.float(), o_ref.float(), rtol=3e-2, atol=3e-2)
+
+
+def test_over_budget_single_segment_routes_to_eager(monkeypatch):
+    """A single segment whose own chunk count exceeds the budget runs eager.
+
+    The greedy grouping cannot split a single over-budget range (ranges
+    cannot be split without changing the recurrence semantics), and a fused
+    call there sits inside the characterized corruption envelope: 48 heads
+    x a 2304-token segment is 36 chunks > the 32-chunk budget, exactly the
+    repro from the round-3 review. Those rows must route through the eager
+    reference -- not rely on the finite-output debug check (default off).
+    """
+    H, K, V, seg_len = 48, 128, 128, 2304
+    T = seg_len
+    q, k, v, g, beta = _make_inputs(1, T, H, K, V, seed=46)
+    cu = torch.tensor([0, seg_len], dtype=torch.long, device=DEVICE)
+    A_log = torch.randn(H, device=DEVICE, dtype=torch.float32)
+    dt_bias = 0.1 * torch.randn(H * K, device=DEVICE, dtype=torch.float32)
+    shared = dict(
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        use_beta_sigmoid_in_kernel=True,
+        safe_gate=True,
+        lower_bound=-5.0,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        transpose_state_layout=True,
+        cu_seqlens=cu,
+        chunk_size=64,
+    )
+
+    class _NoFusedCalls:
+        # Any fused call for this batch would exceed the budget: making the
+        # fused entry fail loud proves the over-budget group actually routes
+        # through the eager reference (the eager path does not touch
+        # ChunkKDAFunction).
+        @staticmethod
+        def apply(*args, **kwargs):
+            raise AssertionError("fused chunk_kda called for an over-budget single segment")
+
+    monkeypatch.setattr(kda_wrapper, "ChunkKDAFunction", _NoFusedCalls)
+
+    kda_wrapper._KDA_CHUNK_BUDGET_WARNED = False
+    with pytest.warns(UserWarning, match="chunk budget"):
+        o_npu, _ = chunk_kda_ascendc(q, k, v, g, beta, **shared)
+
+    o_ref, _ = kda_reference(q, k, v, g, beta, **shared)
+    torch.testing.assert_close(o_npu.float(), o_ref.float(), rtol=5e-2, atol=5e-2)
