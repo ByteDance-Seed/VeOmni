@@ -163,6 +163,16 @@ per preference pair. The trainer repeats each entry for the chosen and rejected
 segments via `source_repeat=2`; do not supply already duplicated entries for those
 two sequences, or strict alignment validation can fail.
 
+For plaintext DPO pairs with no prompt (or an empty prompt), `process_dpo_example`
+leaves each segment's first label unmasked. Channel Loss shifts labels across the
+packed row, so it can count the rejected segment's first token at the chosen
+segment's final position, adding one supervised token and its CE to that source's
+metrics per pair. Standard `PackingCollator` masks the first label of each
+subsequent sample; because each DPO pair is one sample, this protects boundaries
+between pairs, but not the chosen/rejected boundary inside a pair. DPO's own
+per-segment loss masks these boundary positions, so this discrepancy affects
+reported Channel Loss metrics, not DPO training loss.
+
 For example, this is an **illustrative packed batch**, not a standalone model
 forward (token IDs, dtype/device and other model-specific inputs are omitted):
 
