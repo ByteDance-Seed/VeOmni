@@ -312,6 +312,8 @@ class OmniTrainer:
         dataloader_type = dataloader_kwargs.pop("type")
         dataloader_kwargs.pop("use_background_prefetcher", None)
         self.train_dataloader = build_dataloader(
+            _veomni_trainer_controls=True,
+            data_modality="multimodal",
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,
             micro_batch_size=args.train.micro_batch_size,

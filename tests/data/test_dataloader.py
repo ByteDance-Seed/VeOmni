@@ -93,6 +93,7 @@ def test_base_trainer_forwards_buffer_policy_scope(monkeypatch):
     assert captured_kwargs["dyn_bsz_buffer_policy"] == "context_aware"
     assert captured_kwargs["dyn_bsz_runtime"] == "worker"
     assert captured_kwargs["data_modality"] == "multimodal"
+    assert captured_kwargs["_veomni_trainer_controls"] is True
 
 
 @pytest.mark.parametrize(
@@ -312,24 +313,156 @@ def test_fixed_policy_keeps_builder_when_signature_is_unavailable(monkeypatch, e
     assert build_dataloader(name, dyn_bsz_buffer_size=37) == {"dyn_bsz_buffer_size": 37}
 
 
-def test_fixed_opaque_builder_with_new_controls_is_rejected(context_builder):
+@pytest.mark.parametrize("accepts_kwargs", [False, True])
+def test_fixed_opaque_builder_preserves_legacy_keywords(context_builder, accepts_kwargs):
     class OpaqueLegacyBuilder:
         __signature__ = "invalid"
 
-        def __call__(self, *, dyn_bsz_buffer_size):
-            return dyn_bsz_buffer_size
+        def __call__(self, **kwargs):
+            if not accepts_kwargs and set(kwargs) != {"dyn_bsz_buffer_size"}:
+                raise TypeError("legacy builder received new keywords")
+            return kwargs
 
-    with pytest.raises(ValueError, match="must expose an inspectable signature"):
+    assert build_dataloader(
+        context_builder(OpaqueLegacyBuilder()),
+        _veomni_trainer_controls=True,
+        dyn_bsz_buffer_size=37,
+        dyn_bsz_buffer_policy="fixed",
+        data_modality="text",
+    ) == {"dyn_bsz_buffer_size": 37}
+
+
+def test_fixed_opaque_builder_keeps_public_explicit_modality(context_builder):
+    class OpaqueBuilder:
+        __signature__ = "invalid"
+
+        def __call__(self, *, data_modality="text", **kwargs):
+            return data_modality
+
+    assert build_dataloader(context_builder(OpaqueBuilder()), data_modality="multimodal") == "multimodal"
+
+
+def test_fixed_trainer_keeps_legacy_optional_modality_default(context_builder):
+    def builder(*, data_modality="text", **kwargs):
+        return data_modality
+
+    assert (
         build_dataloader(
-            context_builder(OpaqueLegacyBuilder()),
-            dyn_bsz_buffer_size=37,
+            context_builder(builder),
+            _veomni_trainer_controls=True,
             dyn_bsz_buffer_policy="fixed",
-            data_modality="text",
+            data_modality="multimodal",
+        )
+        == "text"
+    )
+
+
+def test_fixed_trainer_keeps_legacy_plugin_policy_default(context_builder):
+    def builder(*, dyn_bsz_buffer_policy="adaptive", **kwargs):
+        return dyn_bsz_buffer_policy
+
+    assert (
+        build_dataloader(
+            context_builder(builder),
+            _veomni_trainer_controls=True,
+            dyn_bsz_buffer_policy="fixed",
+            data_modality="multimodal",
+        )
+        == "adaptive"
+    )
+
+
+def test_fixed_trainer_kwargs_wrapper_keeps_legacy_keyword_contract(context_builder):
+    def legacy_loader(*, dyn_bsz_buffer_size):
+        return dyn_bsz_buffer_size
+
+    def wrapper(**kwargs):
+        return legacy_loader(**kwargs)
+
+    assert (
+        build_dataloader(
+            context_builder(wrapper),
+            _veomni_trainer_controls=True,
+            dyn_bsz_buffer_policy="fixed",
+            data_modality="multimodal",
+            dyn_bsz_buffer_size=37,
+        )
+        == 37
+    )
+
+
+def test_fixed_trainer_kwargs_named_like_modality_remains_legacy_compatible(context_builder):
+    def legacy_loader(*, dyn_bsz_buffer_size):
+        return dyn_bsz_buffer_size
+
+    def wrapper(**data_modality):
+        return legacy_loader(**data_modality)
+
+    assert (
+        build_dataloader(
+            context_builder(wrapper),
+            _veomni_trainer_controls=True,
+            dyn_bsz_buffer_policy="fixed",
+            data_modality="multimodal",
+            dyn_bsz_buffer_size=37,
+        )
+        == 37
+    )
+
+
+def test_multimodal_trainer_rejects_context_aware_builder_default(context_builder):
+    def builder(
+        dyn_bsz_buffer_policy="context_aware",
+        data_modality="text",
+        dyn_bsz=True,
+        dyn_bsz_runtime="main",
+        dyn_bsz_count_mode="total",
+        **kwargs,
+    ):
+        raise AssertionError("multimodal context-aware builder must not run")
+
+    with pytest.raises(ValueError, match="only supported for text data"):
+        build_dataloader(
+            context_builder(builder),
+            _veomni_trainer_controls=True,
+            data_modality="multimodal",
+            max_seq_len=1048576,
+            micro_batch_size=1,
         )
 
 
+def test_native_dataloader_preserves_legacy_positional_worker_arguments(monkeypatch):
+    import veomni.data.data_loader as module
+
+    monkeypatch.setattr(module, "get_parallel_state", lambda: _fake_ps(1))
+    loader = module.build_native_dataloader(
+        [{"input_ids": [1], "attention_mask": [1]}],
+        1,
+        1,
+        1,
+        16,
+        1,
+        0.0,
+        200,
+        False,
+        "main",
+        "total",
+        1.5,
+        False,
+        200,
+        0,
+        None,
+        False,
+        False,
+        None,
+    )
+    assert loader.num_workers == 0
+    assert loader.drop_last is False
+    assert loader.pin_memory is False
+
+
 @pytest.mark.parametrize("accepts_kwargs", [False, True])
-def test_fixed_builder_positional_only_options_cannot_be_silently_changed(context_builder, accepts_kwargs):
+def test_fixed_trainer_preserves_positional_only_builder_defaults(context_builder, accepts_kwargs):
     if accepts_kwargs:
 
         def builder(data_modality="text", /, **kwargs):
@@ -340,12 +473,9 @@ def test_fixed_builder_positional_only_options_cannot_be_silently_changed(contex
             return data_modality, {}
 
     name = context_builder(builder)
-    assert build_dataloader(name, dyn_bsz_buffer_policy="fixed", data_modality="text") == (
-        "text",
-        {"dyn_bsz_buffer_policy": "fixed"} if accepts_kwargs else {},
-    )
-    with pytest.raises(ValueError, match="positional-only"):
-        build_dataloader(name, dyn_bsz_buffer_policy="fixed", data_modality="image")
+    assert build_dataloader(
+        name, _veomni_trainer_controls=True, dyn_bsz_buffer_policy="fixed", data_modality="image"
+    ) == ("text", {})
 
 
 @pytest.mark.parametrize("runtime", ["main", "worker"])

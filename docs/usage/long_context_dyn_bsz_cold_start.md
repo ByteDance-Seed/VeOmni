@@ -142,10 +142,15 @@ provide the corresponding values explicitly. `max_seq_len` and
 configuration the builder actually receives. Context-aware builders must have
 an inspectable signature; a builder that opts in by default must expose that
 policy in its signature. Existing fixed-policy builders with explicit legacy
-signatures keep their old keyword contract. Opaque builders may still be called
-without policy or modality controls, but the standard trainer supplies these
-controls and therefore requires an inspectable signature. Expose a Python
-wrapper or a valid `__signature__` to use such a builder from the trainer.
+signatures keep their old keyword contract. With the fixed policy, the trainer
+omits its new controls when calling opaque builders; explicitly supplied public
+arguments are still forwarded. To opt into context-aware dispatch, expose a
+Python wrapper or a valid `__signature__` so the new options can be validated.
+
+When resuming an existing dynamic-batching checkpoint, the saved batching
+strategy and buffer are restored, including their saved buffer size. Changing
+the new run's policy or size does not rewrite the saved strategy; use a fresh
+run if the new configuration must take effect.
 
 The experiments cover first-micro-batch preparation only. Whole-step
 pre-materialization and periodic forward-only stalls are separate problems.

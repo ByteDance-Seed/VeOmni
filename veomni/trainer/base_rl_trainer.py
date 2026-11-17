@@ -57,6 +57,7 @@ class BaseRLTrainer(BaseTrainer):
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
         self.train_dataloader = build_dataloader(
+            _veomni_trainer_controls=True,
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,
             micro_batch_size=args.train.micro_batch_size,

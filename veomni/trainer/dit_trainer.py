@@ -447,6 +447,7 @@ class DiTTrainer:
         args = self.base.args
         if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
             self.base.train_dataloader = build_dataloader(
+                _veomni_trainer_controls=True,
                 dataloader_type=args.data.dataloader.type,
                 dataset=self.base.train_dataset,
                 micro_batch_size=args.train.micro_batch_size,

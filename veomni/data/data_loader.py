@@ -93,7 +93,7 @@ def resolve_dyn_bsz_buffer_size(
         ) from exc
 
 
-def build_dataloader(dataloader_type: str, **kwargs):
+def build_dataloader(dataloader_type: str, *, _veomni_trainer_controls: bool = False, **kwargs):
     builder = DATALOADER_REGISTRY[dataloader_type]
     try:
         parameters = inspect.signature(builder).parameters
@@ -108,28 +108,27 @@ def build_dataloader(dataloader_type: str, **kwargs):
         else "fixed"
     )
     policy = kwargs.get("dyn_bsz_buffer_policy", policy_default)
-    if (
-        policy == "fixed"
-        and not inspectable
-        and any(name in kwargs for name in ("dyn_bsz_buffer_policy", "data_modality"))
-    ):
-        raise ValueError(
-            "A dataloader builder receiving policy or modality settings must expose an inspectable signature."
-        )
-    # Fixed policy keeps the legacy builder contract. New options are passed
-    # through when explicitly supported, including builders that take **kwargs.
-    if policy == "fixed":
-        accepts_kwargs = inspectable and any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
-        )
+    # Fixed-policy trainer calls preserve legacy optional builder defaults.
+    # Explicit public arguments still pass through unchanged.
+    if policy == "fixed" and _veomni_trainer_controls:
         for name in ("dyn_bsz_buffer_policy", "data_modality"):
             parameter = parameters.get(name)
-            if parameter is None and not accepts_kwargs:
+            needs_value = (
+                parameter is not None
+                and parameter.kind
+                not in (
+                    inspect.Parameter.VAR_KEYWORD,
+                    inspect.Parameter.VAR_POSITIONAL,
+                )
+                and (
+                    parameter.default is inspect.Parameter.empty
+                    or (name == "dyn_bsz_buffer_policy" and parameter.default == "context_aware")
+                )
+            )
+            if not needs_value:
                 kwargs.pop(name, None)
-            elif parameter is not None and parameter.kind is inspect.Parameter.POSITIONAL_ONLY and name in kwargs:
-                if parameter.default is inspect.Parameter.empty or kwargs[name] != parameter.default:
-                    raise ValueError(f"Cannot pass {name} to a positional-only dataloader builder parameter.")
-                kwargs.pop(name)
+            elif parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+                raise ValueError(f"Cannot pass {name} to a positional-only dataloader builder parameter.")
     if (
         policy_parameter is not None
         and policy_parameter.kind is inspect.Parameter.POSITIONAL_ONLY
@@ -228,8 +227,6 @@ def build_native_dataloader(
     dyn_bsz_physical_overflow_ratio: float = 1.5,
     dyn_bsz_dataset_save_by_idx: bool = False,  # Whether to save dynamic-batching buffers by index for worker-side checkpoint/resume.
     dyn_bsz_buffer_size: int = 200,
-    dyn_bsz_buffer_policy: Literal["fixed", "context_aware"] = "fixed",
-    data_modality: Literal["text", "multimodal", "diffusion"] = "text",
     num_workers: int = 8,
     worker_num_threads: Optional[int] = None,
     drop_last: bool = True,
@@ -244,6 +241,8 @@ def build_native_dataloader(
     collate_fn_kwargs: Optional[Dict[str, Any]] = None,
     multiprocessing_context=None,
     save_steps: int = 0,
+    dyn_bsz_buffer_policy: Literal["fixed", "context_aware"] = "fixed",
+    data_modality: Literal["text", "multimodal", "diffusion"] = "text",
 ) -> "DistributedDataloader":
     """Build the native training dataloader.
 
