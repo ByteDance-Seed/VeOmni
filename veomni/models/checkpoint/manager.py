@@ -43,8 +43,7 @@ from ...utils.dist_utils import raise_if_any_rank_failed
 
 def _scheduler_recipe(scheduler, optimizer):
     """Stable schedule identity; LambdaLR state_dict omits its callable."""
-    from ...checkpoint.optimizer_resume_layout import _scheduler_functions
-    from ...optim.lr_scheduler import MultiLRScheduler
+    from ...optim.lr_scheduler import MultiLRScheduler, checkpoint_scheduler_recipe
 
     if scheduler is None:
         return None
@@ -58,7 +57,7 @@ def _scheduler_recipe(scheduler, optimizer):
         raise RuntimeError("MultiOptimizer requires a scheduler for each optimizer leaf")
     if type(scheduler) is not LambdaLR or scheduler.optimizer is not optimizer:
         raise RuntimeError("MultiOptimizer scheduler implementation or binding is unsupported")
-    return {"type": "LambdaLR", "functions": _scheduler_functions(scheduler)}
+    return {"type": "LambdaLR", "recipe": checkpoint_scheduler_recipe(scheduler)}
 
 
 def _validate_scheduler_checkpoint(saved, current, global_step):

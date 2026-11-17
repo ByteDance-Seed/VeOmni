@@ -324,19 +324,21 @@ step and generation alone do not prove exact dataloader or RNG recovery.
 If a restored run has not established a same-step save receipt, an immediate
 export to the already completed step fails rather than overwriting that DCP.
 
-MultiOptimizer checkpoint identity supports VeOmni's built-in constant, linear
-and cosine schedules. Custom `LambdaLR` functions must use immutable captures
-and the supported pure builtins or standard `math` members; global state,
-dynamic lookup, mutable closures and unrecognized attribute access are rejected
-at save and resume. Set construction and frozenset constants are also rejected
-because their iteration order can differ between processes. Custom scheduler
-authors must ensure that formatting and the overall schedule are deterministic across
-processes and recovery: the identity check does not prove arbitrary Python
-functions deterministic. Older custom scheduler checkpoints that cannot meet
-this contract require a verified migration or weights-only restart. Identity checks
-assume a trusted Python runtime whose standard `math` members and scheduler
-builtin bindings remain unchanged throughout training, saving and recovery.
-They do not detect monkeypatches to these objects and are not a code sandbox.
+MultiOptimizer checkpoint identity records the versioned recipe and concrete
+parameters of VeOmni's constant, linear and cosine schedules. Custom `LambdaLR`
+schedules must register a stable name, version and all behavior-affecting JSON
+parameters with `register_checkpoint_scheduler`; the caller must use the same
+trusted deterministic implementation on resume. The recipe is an attestation,
+not a sandbox or a proof about arbitrary Python code. Unregistered schedulers
+and checkpoints carrying only the older callable-hash identity require a
+verified migration or a new weights-only run. Scheduler step, optimizer group
+identity and checkpoint generation remain checked independently.
+
+Unrecognized instance-level `state_dict` replacements on optimizer leaves are
+rejected: a wrapper could otherwise renumber parameter IDs after capture and
+silently assign the wrong learning rate. Known PyTorch DCP wrappers are allowed.
+Optimizer class implementations and registered state-dict hooks are trusted to
+preserve their declared parameter mapping and update semantics.
 
 With `stage_dir` the model half waits: a staged save has overwritten nothing
 until the copy to the destination, so it invalidates the destination there
