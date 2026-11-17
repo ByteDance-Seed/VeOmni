@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 
+from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaModel
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
@@ -71,6 +72,12 @@ class InferenceMixin:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
+        if get_parallel_state().sp_size > 1:
+            raise ValueError(
+                "JanusLlama.generate feeds the full prompt to the backbone, which conflicts with "
+                "Ulysses sequence parallelism (attention expects this rank's shard); run inference "
+                "with sp_size=1."
+            )
         if self._past_key_values is None:
             inputs_embeds, attention_mask, position_ids, _ = pack_llm_conversations_for_forward(
                 [conversation_list], self.device

@@ -67,6 +67,14 @@ legacy `pytorch_model.bin[.index.json]`, since `load_model_weights` resolves
 either. Whichever the checkpoint ships, the layout is a drop-in for
 `from_pretrained`.
 
+Exporting is narrower: `save_hf_weights` writes back in the source layout, so
+it needs safetensors weights to key the output on. A `.bin`-only root loads and
+converts fine but fails the startup check (`_check_hf_source_exportable`) when
+the recipe enables `save_hf_weights` — which the shipped configs do. Either
+re-save the checkpoint with `save_pretrained(out, safe_serialization=True)`, or
+point the run at the split root the converter writes and leave `save_hf_weights`
+off if a merged export is not needed.
+
 To materialise the modules on disk instead, run the family converter — the
 layout gives both paths, and on a checkpoint whose tie flags agree they hold
 identical module weights:
