@@ -48,9 +48,9 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeCau
 class FusedLinearAuxOutput:
     """Per-token tensors produced by the fused-linear loss path.
 
-    All five tensors share the input ``labels`` shape (``[B, L]`` or
-    packed ``[L]``) and are zero at IGNORE_INDEX positions and the
-    trailing pad slot.
+    Scalar per-token outputs share the input ``labels`` shape (``[B, L]`` or
+    packed ``[L]``), while ``topk_log_probs`` has shape ``[*labels.shape, K]``.
+    Every output is zero at ``IGNORE_INDEX`` positions and the trailing pad slot.
 
     - ``log_probs``: non-positive — actual log-probabilities
       ``log p(y_t)``, matches HF / verl conventions.
@@ -67,6 +67,11 @@ class FusedLinearAuxOutput:
       tensors, ``Σ_k exp(log q_s,k)`` / ``Σ_k exp(log p_t,k)``.
       Detached — verl uses them for clamp monitoring and reporting,
       not for backprop.
+    - ``topk_log_probs``: non-positive — full-vocabulary-normalized
+      log-probabilities ``log p(v_{t,k})`` gathered at caller-supplied
+      ``topk_ids`` of shape ``[*labels.shape, K]``. Zero at
+      ``IGNORE_INDEX`` positions and the trailing pad slot; carries
+      gradient back to the lm_head + hidden_states.
     """
 
     log_probs: Optional[torch.Tensor] = None
@@ -74,6 +79,7 @@ class FusedLinearAuxOutput:
     distillation_losses: Optional[torch.Tensor] = None
     student_mass: Optional[torch.Tensor] = None
     teacher_mass: Optional[torch.Tensor] = None
+    topk_log_probs: Optional[torch.Tensor] = None
 
     @classmethod
     def from_loss_slots(
@@ -83,8 +89,9 @@ class FusedLinearAuxOutput:
         distillation_losses: Optional[torch.Tensor] = None,
         student_mass: Optional[torch.Tensor] = None,
         teacher_mass: Optional[torch.Tensor] = None,
+        topk_log_probs: Optional[torch.Tensor] = None,
     ) -> Optional["FusedLinearAuxOutput"]:
-        """Construct from the loss-wrapper's trailing 5 slots, or return
+        """Construct from the loss-wrapper's trailing slots, or return
         ``None`` if all slots are ``None`` (the plain loss path).
 
         Keeps the patchgen ``forward`` template a one-liner regardless
@@ -96,6 +103,7 @@ class FusedLinearAuxOutput:
             and distillation_losses is None
             and student_mass is None
             and teacher_mass is None
+            and topk_log_probs is None
         ):
             return None
         return cls(
@@ -104,7 +112,14 @@ class FusedLinearAuxOutput:
             distillation_losses=distillation_losses,
             student_mass=student_mass,
             teacher_mass=teacher_mass,
+            topk_log_probs=topk_log_probs,
         )
+
+
+# Register ``FusedLinearAuxOutput`` as a PyTorch pytree node so ``tree_flatten``
+# on ``*CausalLMOutputWithLogProbs`` exposes all nested per-token tensors to
+# FSDP2's root pre-backward unshard hook registration.
+torch.utils._pytree.register_dataclass(FusedLinearAuxOutput)
 
 
 @dataclass
@@ -138,8 +153,9 @@ _FUSED_LINEAR_AUX_ARGS_DOC = """
         fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
             Per-token tensors produced by the fused-linear loss path
             (``log_probs``, ``entropy``, ``distillation_losses``,
-            ``student_mass``, ``teacher_mass``). ``None`` on the plain
-            loss path; populated when ``return_log_probs=True``.
+            ``student_mass``, ``teacher_mass``, ``topk_log_probs``).
+            ``None`` on the plain loss path; populated when
+            ``return_log_probs=True``.
     """
 
 

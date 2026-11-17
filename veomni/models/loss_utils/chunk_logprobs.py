@@ -54,7 +54,7 @@ _per_token_entropy_from_logits = token_entropy_from_logits
 
 def _prepare_causal_chunk_inputs(
     hidden_states: torch.Tensor,
-    labels: torch.Tensor,
+    labels: torch.Tensor | None,
     shift_labels: torch.Tensor | None,
     *,
     sp_enabled: bool,
@@ -74,6 +74,8 @@ def _prepare_causal_chunk_inputs(
     """
     if shift_labels is not None:
         return hidden_states, shift_labels, label_aligned_tensors, False
+    if labels is None:
+        raise ValueError("labels or shift_labels must be provided.")
     if sp_enabled:
         return hidden_states, labels, label_aligned_tensors, False
     return (
@@ -88,26 +90,34 @@ def _pad_causal_chunk_outputs(
     outputs: tuple[torch.Tensor, ...],
     *,
     needs_trailing_pad: bool,
+    seq_ndim: int | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Pad each output tensor with one trailing ``0.0`` along the sequence dim when needed."""
     if not needs_trailing_pad:
         return outputs
-    return tuple(torch.nn.functional.pad(output, (0, 1), value=0.0) for output in outputs)
+    padded = []
+    for output in outputs:
+        if seq_ndim is not None and output.ndim == seq_ndim + 1:
+            padded.append(torch.nn.functional.pad(output, (0, 0, 0, 1), value=0.0))
+        else:
+            padded.append(torch.nn.functional.pad(output, (0, 1), value=0.0))
+    return tuple(padded)
 
 
 def chunk_logprobs_function(
     hidden_states: torch.Tensor,
     weights: torch.Tensor,
-    labels: torch.Tensor,
+    labels: torch.Tensor | None,
     chunk_size: int = 1024,
     ignore_index: int = -100,
     shift_labels: torch.Tensor | None = None,
     temperature: float = 1.0,
     *,
+    topk_ids: torch.Tensor | None = None,
     op: Callable[..., torch.Tensor] | None = None,
     impl: str | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute per-token log-probabilities and entropy via a chunked fused linear.
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute per-token log-probabilities, entropy, and optional top-k log-probs via a chunked fused linear.
 
     Args:
         hidden_states: ``[B, L, H]`` (or ``[L, H]`` for already-packed
@@ -115,7 +125,7 @@ def chunk_logprobs_function(
         weights: lm_head weight, ``[V, H]``. Bias is not supported.
         labels: integer label tensor with shape matching the leading
             dims of ``hidden_states``. Positions equal to
-            ``ignore_index`` produce ``0.0`` in both outputs (no
+            ``ignore_index`` produce ``0.0`` in all outputs (no
             gradient flows through them either).
         chunk_size: token-dim chunk for the streamed projection.
         ignore_index: label value to mask (default ``-100`` /
@@ -132,6 +142,12 @@ def chunk_logprobs_function(
             matches the input ``labels``.
         temperature: divides logits before log_softmax (PPO actor
             path). Defaults to 1.0 (no-op).
+        topk_ids: optional ``[*labels.shape, K]`` integer vocabulary indices
+            at which to also gather ``log_softmax(logits)`` during the same
+            chunked pass. When ``shift_labels`` is ``None`` and SP is disabled,
+            ``topk_ids`` is shifted as ``topk_ids[..., 1:, :]`` alongside
+            ``labels``; when ``shift_labels`` is provided, ``topk_ids`` must
+            already align with ``shift_labels``.
         op: optional ``VeomniOp("token_logprobs", "standard", ...)`` handle
             owned by the consuming model.
         impl: optional ``token_logprobs`` implementation name override
@@ -140,29 +156,33 @@ def chunk_logprobs_function(
             default via ``VeomniOp``.
 
     Returns:
-        ``(log_probs, entropy)`` — both with the same shape as the
-        input ``labels``.
+        ``(log_probs, entropy)`` when ``topk_ids is None``, or
+        ``(log_probs, entropy, topk_log_probs)`` when ``topk_ids`` is supplied.
 
-        - ``log_probs``: per-token ``log p(y_t)`` (non-positive). Zero
-          at IGNORE_INDEX positions and at the trailing pad slot.
-        - ``entropy``: per-token softmax entropy
-          ``H[p] = -Σ_v p_v log p_v`` (non-negative). Zero at
-          IGNORE_INDEX positions and at the trailing pad slot.
+        - ``log_probs``: per-token ``log p(y_t)`` (non-positive), shape ``labels.shape``.
+        - ``entropy``: per-token softmax entropy ``H[p] = -Σ_v p_v log p_v``
+          (non-negative), shape ``labels.shape``.
+        - ``topk_log_probs``: per-token gathered log-probabilities at ``topk_ids``
+          (non-positive), shape ``[*labels.shape, K]``.
 
-        Sign conventions match HF / verl — no negation needed at the
+        All outputs are zero at ``IGNORE_INDEX`` positions and at the trailing
+        pad slot. Sign conventions match HF / verl — no negation needed at the
         call site.
     """
-    hidden_states, labels_shifted, _, needs_trailing_pad = _prepare_causal_chunk_inputs(
+    label_aligned = (topk_ids,) if topk_ids is not None else ()
+    hidden_states, labels_shifted, aligned_aux, needs_trailing_pad = _prepare_causal_chunk_inputs(
         hidden_states,
         labels,
         shift_labels,
         sp_enabled=get_parallel_state().sp_enabled,
+        label_aligned_tensors=label_aligned,
     )
+    topk_ids_shifted = aligned_aux[0] if aligned_aux else None
 
     token_logprobs_fn = (
         op if op is not None else resolve_token_logprobs_op(impl, device_type=hidden_states.device.type)
     )
-    log_probs, entropy = chunk_linear_logprobs(
+    outputs = chunk_linear_logprobs(
         hidden_states,
         weights,
         labels_shifted,
@@ -170,13 +190,14 @@ def chunk_logprobs_function(
         chunk_size=chunk_size,
         ignore_index=ignore_index,
         token_logprobs_fn=token_logprobs_fn,
+        topk_ids=topk_ids_shifted,
     )
 
-    log_probs, entropy = _pad_causal_chunk_outputs(
-        (log_probs, entropy),
+    return _pad_causal_chunk_outputs(
+        outputs,
         needs_trailing_pad=needs_trailing_pad,
+        seq_ndim=labels_shifted.ndim,
     )
-    return log_probs, entropy
 
 
 __all__ = [

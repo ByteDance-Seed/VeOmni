@@ -135,6 +135,7 @@ def ForCausalLMLoss(
     temperature = kwargs.pop("temperature", 1.0)
     teacher_topk_ids = kwargs.pop("teacher_topk_ids", None)
     teacher_topk_log_probs = kwargs.pop("teacher_topk_log_probs", None)
+    topk_ids = kwargs.pop("topk_ids", None)
     log_prob_min_clamp = kwargs.pop("log_prob_min_clamp", None)
     chunk_size = kwargs.pop("chunk_size", 1024)
     logits_bias = kwargs.pop("logits_bias", None)
@@ -152,11 +153,15 @@ def ForCausalLMLoss(
             raise ValueError("return_log_probs=True requires hidden_states (fused-linear path).")
         if weights is None:
             raise ValueError("return_log_probs=True requires weights (lm_head weight).")
+        if labels is None and shift_labels is None:
+            raise ValueError("labels or shift_labels must be provided.")
         if (teacher_topk_ids is None) != (teacher_topk_log_probs is None):
             raise ValueError(
                 "teacher_topk_ids and teacher_topk_log_probs must be provided together for "
                 "the top-k distillation path."
             )
+        if teacher_topk_ids is not None and topk_ids is not None:
+            raise ValueError("topk_ids cannot be combined with teacher_topk_ids / teacher_topk_log_probs.")
         if teacher_topk_ids is not None:
             log_probs, entropy, distill, student_mass, teacher_mass = chunk_topk_distill_function(
                 hidden_states,
@@ -179,6 +184,26 @@ def ForCausalLMLoss(
                     distillation_losses=distill,
                     student_mass=student_mass,
                     teacher_mass=teacher_mass,
+                ),
+            )
+        if topk_ids is not None:
+            log_probs, entropy, topk_log_probs = chunk_logprobs_function(
+                hidden_states,
+                weights,
+                labels,
+                chunk_size=chunk_size,
+                ignore_index=ignore_index,
+                shift_labels=shift_labels,
+                temperature=temperature,
+                topk_ids=topk_ids,
+            )
+            return (
+                None,
+                None,
+                FusedLinearAuxOutput(
+                    log_probs=log_probs,
+                    entropy=entropy,
+                    topk_log_probs=topk_log_probs,
                 ),
             )
         log_probs, entropy = chunk_logprobs_function(
@@ -274,6 +299,7 @@ def ForSequenceClassificationLoss(
     kwargs.pop("temperature", None)
     kwargs.pop("teacher_topk_ids", None)
     kwargs.pop("teacher_topk_log_probs", None)
+    kwargs.pop("topk_ids", None)
     kwargs.pop("log_prob_min_clamp", None)
     kwargs.pop("chunk_size", None)
 
