@@ -167,7 +167,7 @@ integration-specific additions.
 
 | Patch | Text LLM | VLM | Omni MoE |
 |---|:---:|:---:|:---:|
-| `tie_word_embeddings` config fix | sometimes | sometimes | ✓ |
+| `tie_word_embeddings` config fix | — (not needed) | — (not needed) | — (not needed) |
 | FSDP dummy forward | — | ✓ | ✓ (ViT + Audio) |
 | SP: LM position embedding slicing | ✓ | ✓ | ✓ |
 | SP: ViT pad+slice | — | ✓ | ✓ |
@@ -237,7 +237,7 @@ For implementation details of each patch, refer to the example docs.
 | NCCL hang during backward | Missing `dummy_forward` on ViT/AudioEncoder | Add and call on `fsdp_enabled` ranks when input is `None` |
 | Shape mismatch in ViT attention | `cu_seqlens` missing padding entry for SP | Append `cu_seqlens[-1] + pad_seq_len` when SP is active |
 | `masked_scatter` size error | Fill-back attempted in SP-sliced layout | Call `gather_seq_scatter_heads` before fill-back |
-| Crash: `tie_word_embeddings` | Config default `True` but no `get_output_embeddings` | Patch config to `tie_word_embeddings=False` |
+| Crash: `tie_word_embeddings` | Config default `True` but no `get_output_embeddings` | Nothing to do — a module with no output head is skipped by `tie_word_embeddings_if_requested`. Do **not** patch the config to `False`; that was the old workaround and it faked a field the module does not have |
 | Wrong position IDs in multi-sample batch | `(bs, 3, L)` not transposed to `(3, bs, L)` | Add transpose check in model forward |
 | Audio inputs silently skipped | `if audio is not None:` passes for empty list `[]` | Change to `if audio:` in processor |
 | EP has no effect | Expert weight paths in `parallel_plan` don't match | Run `named_parameters()` on model to verify exact paths |

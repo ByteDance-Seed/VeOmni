@@ -229,11 +229,12 @@ def group_gemm_same_nk_kernel(
 ):
     """Grouped GEMM over tokens (M) with shared N/K per expert."""
     if COMPACT_SCHEDULE:
-        # Flatten both logical axes into grid.x, preserving the column range
-        # accepted by the original launch instead of adding a grid.y limit.
-        row_tiles = tl.cdiv(tl.cast(total_M, tl.int64), BLOCK_M) + G - 1
-        tile_id = tl.program_id(0) % row_tiles
-        n = tl.program_id(0) // row_tiles
+        # Keep both logical axes in grid.x, with adjacent programs varying N
+        # first so column tiles of the same row tile can reuse their A block.
+        column_tiles = tl.cdiv(N, BLOCK_N)
+        pid = tl.cast(tl.program_id(0), tl.int64)
+        tile_id = pid // column_tiles
+        n = pid % column_tiles
         if tile_id >= tl.load(tile_cumsum + G - 1):
             return
         lo = tl.full((), 0, tl.int32)

@@ -3,7 +3,6 @@
 
 """Identity of a MultiOptimizer's rank-local parameter and scheduler layout."""
 
-import bisect
 import dis
 import hashlib
 import json
@@ -65,17 +64,22 @@ def _group_option_value(value):
 def _model_storage_alias_graph(names, tensors, safe_rope_pairs=()):
     """Describe local view geometry and shared storage without recording addresses.
 
-    CPU shared mappings are rejected: different virtual addresses can reference
-    the same underlying pages. Accelerator storage must be framework-owned.
+    Framework-owned, nonempty storage views are bound by their local geometry
+    and relationships. Aliasing through separately imported mappings is outside
+    the supported checkpoint contract.
     """
     from torch.distributed.tensor import DTensor
 
-    intervals, empty_storages, geometry = {}, {}, []
+    intervals, geometry = {}, []
     for object_id, value in tensors.items():
         local = value.to_local() if isinstance(value, DTensor) else value
         if local.layout != torch.strided or local.device.type == "meta" or local.is_quantized:
             raise RuntimeError("Cannot prove model tensor storage aliases for non-strided, meta or quantized tensors")
+        if local.is_conj() or local.is_neg():
+            raise RuntimeError("Cannot safely restore lazy conjugate or negative model views")
         storage = local.untyped_storage()
+        if local.device.type == "cpu" and getattr(storage, "filename", None) is not None:
+            raise RuntimeError("Cannot prove aliases for file-backed model tensor storage")
         base, size = storage.data_ptr(), storage.nbytes()
         if size and not base:
             raise RuntimeError("Cannot prove model tensor storage aliases without a storage address")
@@ -89,44 +93,15 @@ def _model_storage_alias_graph(names, tensors, safe_rope_pairs=()):
                     tuple(local.stride()),
                     local.storage_offset(),
                     size,
-                    local.is_conj(),
-                    local.is_neg(),
+                    # Preserve the v1 layout format for supported ordinary
+                    # tensors; exotic conjugate/negative views are outside the
+                    # trusted checkpoint contract.
+                    False,
+                    False,
                 )
             )
             if size:
                 intervals.setdefault(str(local.device), []).append((base, base + size, name))
-            else:
-                storage_identity = getattr(storage, "_cdata", None)
-                if not storage_identity:
-                    raise RuntimeError("Cannot prove empty model tensor storage identity")
-                empty_storages.setdefault((str(local.device), storage_identity), []).append((0, 0, name))
-
-    cpu_intervals = intervals.get("cpu", ())
-    if cpu_intervals:
-        try:
-            with open("/proc/self/maps", "rb") as maps:
-                mappings = []
-                for line in maps:
-                    address, permissions, *_ = line.split(maxsplit=2)
-                    start, end = (int(value, 16) for value in address.split(b"-"))
-                    mappings.append((start, end, permissions))
-        except (OSError, ValueError) as exc:
-            raise RuntimeError("Cannot prove CPU model tensor storage mapping") from exc
-        starts = [item[0] for item in mappings]
-        for start, end, _ in cpu_intervals:
-            position = start
-            index = bisect.bisect_right(starts, start) - 1
-            while position < end:
-                if index < 0 or index >= len(mappings):
-                    raise RuntimeError("Cannot prove CPU model tensor storage mapping")
-                mapped_start, mapped_end, permissions = mappings[index]
-                if not mapped_start <= position < mapped_end:
-                    raise RuntimeError("Cannot prove CPU model tensor storage mapping")
-                if len(permissions) < 4 or permissions[3:4] != b"p":
-                    raise RuntimeError("Cannot prove aliases for shared CPU model tensor mappings")
-                position = min(end, mapped_end)
-                index += 1
-
     groups = []
 
     def append_group(group):
@@ -143,8 +118,6 @@ def _model_storage_alias_graph(names, tensors, safe_rope_pairs=()):
                 group, group_end = [], None
             group.append(item)
             group_end = item[1] if group_end is None else max(group_end, item[1])
-        append_group(group)
-    for group in empty_storages.values():
         append_group(group)
     return {"geometry": sorted(geometry), "storage_groups": sorted(groups)}
 
