@@ -589,11 +589,17 @@ model:
 ```
 
 The `cann` indexer and sparse attention cover unpacked batches and packed
-batches whose `position_ids` restart at 0 in every segment, without context or
-Ulysses parallelism, decode, or a padding mask. Sparse attention runs layers
-that have no compressed rows in eager. `mhc_implementation: cann` fuses the
-pre and post kernels and keeps the final head collapse in eager PyTorch, since
-CANN has no head kernel.
+batches whose `position_ids` restart at 0 in every segment, without Ulysses
+parallelism, decode, or a padding mask. Both also serve context parallelism:
+each narrows the replicated compressed/KV buffers to the prefix its local
+queries can see and lets the kernel's `kv_len - q_len` row inference number the
+shard's queries from their global rows. A packed batch under context
+parallelism issues one call per packed sample that intersects the shard, because
+the global slices cannot express a local query shard in a single TND call; the
+indexer narrows each such sample to its own compressed rows and sparse attention
+makes the same split. Sparse attention runs layers that have no compressed rows
+in eager. `mhc_implementation: cann` fuses the pre and post kernels and keeps
+the final head collapse in eager PyTorch, since CANN has no head kernel.
 
 ---
 
