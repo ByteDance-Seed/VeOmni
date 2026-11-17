@@ -20,11 +20,16 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_
 def _require_native_device():
     """Only optional CPU runs may skip a native test."""
     capabilities = runner_capabilities() if os.environ.get("VEOMNI_CI_CAPABILITIES") else None
+    require_npu = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1"
+    if require_npu and capabilities is not None and capabilities.backend != "npu":
+        pytest.fail("NPU test requested with a non-NPU CI assignment")
     if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
-        if capabilities is not None and capabilities.backend != "cpu":
+        if require_npu or (capabilities is not None and capabilities.backend != "cpu"):
             pytest.fail("Assigned accelerator runtime is unavailable")
         pytest.skip("Requires a native CUDA or Ascend device")
     device_type = get_device_type()
+    if require_npu and device_type != "npu":
+        pytest.fail("NPU test requested but the active runtime is not NPU")
     if capabilities is not None and capabilities.backend != "cpu" and device_type != capabilities.backend:
         pytest.fail("Assigned accelerator backend does not match the runtime")
     runtime = get_torch_device()

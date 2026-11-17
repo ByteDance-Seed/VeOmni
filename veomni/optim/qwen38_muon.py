@@ -667,12 +667,19 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
         return state_dict
 
     @torch.no_grad()
-    def _prepare_file_step(self, closure=None):
+    def _prepare_file_step(self, closure=None, restore_failed=False, preflight_error=None):
         """Validate and allocate before any parent optimizer mutates state."""
         from torch.optim.optimizer import _global_optimizer_post_hooks, _global_optimizer_pre_hooks
 
         error = None
+        pending_states = {}
         try:
+            if preflight_error is not None:
+                raise preflight_error
+            if restore_failed:
+                raise RuntimeError(
+                    "MultiOptimizer cannot train after a failed checkpoint restore; rebuild the optimizer"
+                )
             if self._ple_state_poisoned:
                 raise RuntimeError("File-backed optimizer state failed; resume from a complete checkpoint")
             if (
@@ -696,15 +703,16 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
                 if tuple(_local(p.grad).shape) != tuple(_local(p).shape):
                     raise RuntimeError("Muon gradient shard shape differs from its parameter")
                 target = torch.device("cpu") if id(p) in self._offloaded else p.device
-                state = self.state[p]
+                state = self.state.get(p)
                 if not state:
                     master = p.detach().to(device=target, copy=True).float()
-                    state.update(
-                        step=torch.tensor(0.0, dtype=torch.float32, device="cpu"),
-                        master_weight=master,
-                        exp_avg=torch.zeros_like(master),
-                        exp_avg_sq=torch.zeros_like(master),
-                    )
+                    state = {
+                        "step": torch.tensor(0.0, dtype=torch.float32, device="cpu"),
+                        "master_weight": master,
+                        "exp_avg": torch.zeros_like(master),
+                        "exp_avg_sq": torch.zeros_like(master),
+                    }
+                    pending_states[p] = state
                 for field in ("step", "master_weight", "exp_avg", "exp_avg_sq"):
                     tensor = _local(state.get(field))
                     if not torch.is_tensor(tensor) or tensor.dtype != torch.float32:
@@ -722,7 +730,8 @@ class Qwen38MuonAdamW(CPUOffloadAdamW):
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "preparing file-backed Muon state")
-        _validate_file_muon_gradient_traffic(self.param_groups, self.state)
+        _validate_file_muon_gradient_traffic(self.param_groups, {**self.state, **pending_states})
+        self.state.update(pending_states)
 
     @torch.no_grad()
     def step(self, closure=None):

@@ -1189,9 +1189,8 @@ def _lora_incomplete_export_worker(rank, directory, endpoint):
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
         model = _lora_model()
-        if rank == 0:
-            selected = {id(p) for p in get_lora_state_dict(model).values()}
-            next(p for p in model.parameters() if id(p) not in selected).requires_grad_(True)
+        selected = {id(p) for p in get_lora_state_dict(model).values()}
+        next(p for p in model.parameters() if id(p) not in selected).requires_grad_(True)
         with pytest.raises((ValueError, RuntimeError), match="omit trainable parameters|failed on another rank"):
             save_lora_adapter_with_dcp(model, directory)
         assert not Path(directory).exists()
@@ -1205,6 +1204,35 @@ def _lora_incomplete_export_worker(rank, directory, endpoint):
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 def test_lora_export_untracked_trainable_weight_is_coordinated(tmp_path):
     spawn_with_rendezvous(_lora_incomplete_export_worker, args=(str(tmp_path / "adapter"),), nprocs=2)
+
+
+def _lora_local_validation_failure_worker(rank, directory, endpoint):
+    from contextlib import nullcontext
+    from unittest.mock import patch
+
+    from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        model = _lora_model()
+        fault = (
+            patch("veomni.lora.state_dict.validate_lora_export_covers_trainable", side_effect=OSError("local failure"))
+            if rank == 0
+            else nullcontext()
+        )
+        with fault, pytest.raises((OSError, RuntimeError), match="local failure|failed on another rank"):
+            save_lora_adapter_with_dcp(model, directory)
+        assert not Path(directory).exists()
+        alive = torch.ones(1)
+        dist.all_reduce(alive)
+        assert alive.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_lora_export_local_validation_failure_is_coordinated(tmp_path):
+    spawn_with_rendezvous(_lora_local_validation_failure_worker, args=(str(tmp_path / "adapter"),), nprocs=2)
 
 
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))

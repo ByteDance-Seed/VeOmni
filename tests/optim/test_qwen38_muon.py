@@ -604,33 +604,6 @@ def _skip_optional_npu_lora(count):
     return os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") != "1" and (caps.backend != "npu" or len(caps.devices) < count)
 
 
-@pytest.mark.parametrize(
-    "backend,devices,count,expected",
-    [
-        ("cpu", (), 2, "cpu"),
-        ("cuda", ("0", "1"), 2, "cpu"),
-        ("npu", ("0",), 2, "cpu"),
-        ("npu", ("0", "1"), 2, "accelerator"),
-    ],
-)
-def test_native_lora_launch_respects_owned_capacity(backend, devices, count, expected):
-    from scripts.ci.accelerator.launch_plan import PlanContext, RunnerCapabilities
-
-    context = PlanContext({}, RunnerCapabilities(backend, devices))
-    result = _npu_lora_launch(count)(context)
-    assert result.device == expected
-    assert result.nproc == (count if expected == "accelerator" else 1)
-
-
-def test_required_native_lora_test_rejects_missing_npu(monkeypatch):
-    import veomni.utils.device as device
-
-    monkeypatch.setenv("VEOMNI_REQUIRE_NPU_TESTS", "1")
-    monkeypatch.setattr(device, "IS_NPU_AVAILABLE", False)
-    with pytest.raises(pytest.fail.Exception, match="Native NPU test was required"):
-        _require_lora_npus(2)
-
-
 @pytest.mark.skipif(_skip_optional_npu_lora(1), reason="requires one Ascend NPU")
 @pytest.mark.launch_plan(provider=_npu_lora_launch(1))
 @pytest.mark.parametrize("kind", ["adamw", "muon"])

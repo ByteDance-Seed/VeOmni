@@ -2147,60 +2147,27 @@ def test_storage_view_checkpoint_reference_cpu(tmp_path, matching):
 
 
 def _storage_view_accelerator_plan(context):
-    if context.capabilities.backend in ("cuda", "npu") and context.capabilities.devices:
+    if context.capabilities.backend != "cpu" and context.capabilities.devices:
         return LaunchSpec(device="accelerator")
     return LaunchSpec(device="cpu")
-
-
-@pytest.mark.parametrize(
-    ("backend", "devices", "expected"),
-    [("cpu", (), "cpu"), ("npu", (), "cpu"), ("npu", ("0",), "accelerator"), ("cuda", ("0",), "accelerator")],
-)
-def test_storage_view_accelerator_plan_respects_owned_devices(backend, devices, expected):
-    context = SimpleNamespace(capabilities=SimpleNamespace(backend=backend, devices=devices))
-    assert _storage_view_accelerator_plan(context).device == expected
 
 
 @pytest.mark.launch_plan(provider=_storage_view_accelerator_plan)
 @pytest.mark.parametrize("matching", [False, True])
 def test_storage_view_checkpoint_native_accelerator(tmp_path, matching):
-    from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
+    from veomni.utils.device import get_device_type, get_torch_device
 
     ci_backend = runner_capabilities().backend if os.environ.get("VEOMNI_CI_CAPABILITIES") else None
     require_npu = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1" or ci_backend == "npu"
     if require_npu and ci_backend not in (None, "npu"):
         pytest.fail("A working npu device must be assigned to this test")
     backend = "npu" if require_npu else (ci_backend or get_device_type())
-    available = (
-        IS_NPU_AVAILABLE and torch.npu.is_available()
-        if backend == "npu"
-        else backend == "cuda" and torch.cuda.is_available()
-    )
+    available = backend != "cpu" and backend == get_device_type() and get_torch_device().is_available()
     if not available:
-        if require_npu or ci_backend == "cuda":
+        if require_npu or (ci_backend is not None and ci_backend != "cpu"):
             pytest.fail(f"A working {backend} device is required for storage-view recovery")
         pytest.skip("requires an available CUDA or NPU device")
     _storage_view_roundtrip(tmp_path, torch.device(backend, 0), matching)
-
-
-def test_required_storage_view_checkpoint_rejects_missing_npu(tmp_path, monkeypatch):
-    import veomni.utils.device as device
-
-    monkeypatch.setenv("VEOMNI_REQUIRE_NPU_TESTS", "1")
-    monkeypatch.setattr(device, "IS_NPU_AVAILABLE", False)
-    with pytest.raises(pytest.fail.Exception, match="working npu device"):
-        test_storage_view_checkpoint_native_accelerator(tmp_path, True)
-
-
-def test_required_storage_view_checkpoint_rejects_cuda_assignment(tmp_path, monkeypatch):
-    import veomni.utils.device as device
-
-    monkeypatch.setenv("VEOMNI_REQUIRE_NPU_TESTS", "1")
-    monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", "unused")
-    monkeypatch.setattr(device, "IS_NPU_AVAILABLE", True)
-    monkeypatch.setitem(globals(), "runner_capabilities", lambda: SimpleNamespace(backend="cuda"))
-    with pytest.raises(pytest.fail.Exception, match="npu device must be assigned"):
-        test_storage_view_checkpoint_native_accelerator(tmp_path, True)
 
 
 def test_storage_view_geometry_and_disjoint_views_are_distinguished():
@@ -2237,55 +2204,87 @@ def test_storage_view_proof_binds_internal_overlap_and_quantization():
         graph(torch.quantize_per_tensor(torch.ones(3), 0.1, 0, torch.quint8))
 
 
-def test_storage_view_proof_binds_empty_shared_storage():
-    from veomni.checkpoint.optimizer_resume_layout import _model_storage_alias_graph
+@pytest.mark.parametrize("kind", ["negative", "conjugate"])
+@pytest.mark.parametrize("failure_phase", ["save", "load"])
+def test_lazy_storage_view_is_rejected_without_mutating_model(tmp_path, kind, failure_phase):
+    def build(lazy):
+        model = torch.nn.Module()
+        dtype = torch.complex64 if kind == "conjugate" else torch.float32
+        model.p = torch.nn.Parameter(torch.tensor([2, 3], dtype=dtype))
+        view = model.p.detach()
+        if lazy:
+            view = view.conj() if kind == "conjugate" else torch._neg_view(view)
+        model.register_buffer("view", view)
+        leaf = torch.optim.AdamW([model.p], lr=0.01)
+        return model, MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
 
-    first = torch.empty(0)
-    shared = first.detach()
-    independent = torch.empty(0)
-
-    def graph(second):
-        return _model_storage_alias_graph(
-            {id(first): {"buffer:first"}, id(second): {"buffer:second"}},
-            {id(first): first, id(second): second},
+    parallel = SimpleNamespace(dp_mode="ddp")
+    source, optimizer = build(failure_phase == "save")
+    source_before = source.p.detach().clone()
+    if failure_phase == "save":
+        with pytest.raises(RuntimeError, match="lazy conjugate or negative model views"):
+            DistributedCheckpointer.save(
+                str(tmp_path),
+                {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
+            )
+        torch.testing.assert_close(source.p, source_before, rtol=0, atol=0)
+        return
+    DistributedCheckpointer.save(
+        str(tmp_path),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
+    target, restored = build(True)
+    before = target.p.detach().clone()
+    with pytest.raises(RuntimeError, match="lazy conjugate or negative model views"):
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
         )
-
-    assert graph(shared)["storage_groups"]
-    assert not graph(independent)["storage_groups"]
-    assert graph(shared) != graph(independent)
+    torch.testing.assert_close(target.p, before, rtol=0, atol=0)
+    assert not restored.optimizers_dict["leaf"].state
 
 
-def test_storage_view_proof_ignores_unrelated_non_ascii_mapping(tmp_path):
-    import mmap
+@pytest.mark.parametrize("failure_phase", ["save", "load"])
+def test_file_backed_model_storage_is_rejected_before_mutation(tmp_path, failure_phase):
+    path = tmp_path / "model-storage.bin"
+    path.write_bytes(torch.tensor([2.0, 3.0]).numpy().tobytes())
 
-    from veomni.checkpoint.optimizer_resume_layout import _model_storage_alias_graph
+    def build(mapped):
+        model = torch.nn.Module()
+        value = torch.from_file(str(path), shared=True, size=2) if mapped else torch.tensor([2.0, 3.0])
+        model.p = torch.nn.Parameter(value)
+        model.register_buffer("view", model.p.detach())
+        leaf = torch.optim.AdamW([model.p], lr=0.01)
+        return model, MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
 
-    path = tmp_path / "模型.bin"
-    path.write_bytes(bytes(64))
-    with path.open("r+b") as file, mmap.mmap(file.fileno(), 64, access=mmap.ACCESS_COPY):
-        value = torch.ones(3)
-        _model_storage_alias_graph({id(value): {"buffer:view"}}, {id(value): value})
-
-
-@pytest.mark.parametrize("method", ["from_file", "frombuffer"])
-def test_storage_view_proof_rejects_shared_cpu_mappings(tmp_path, method):
-    import mmap
-
-    from veomni.checkpoint.optimizer_resume_layout import _model_storage_alias_graph
-
-    path = tmp_path / "mapping.bin"
-    path.write_bytes(bytes(64))
-    with path.open("r+b") as file:
-        if method == "from_file":
-            value = torch.from_file(str(path), shared=True, size=16, dtype=torch.float32)
-        else:
-            mapping = mmap.mmap(file.fileno(), 64, access=mmap.ACCESS_WRITE)
-            value = torch.frombuffer(mapping, dtype=torch.float32)
-        with pytest.raises(RuntimeError, match="shared CPU model tensor mappings"):
-            _model_storage_alias_graph({id(value): {"buffer:view"}}, {id(value): value})
-        if method == "frombuffer":
-            del value
-            mapping.close()
+    parallel = SimpleNamespace(dp_mode="ddp")
+    source, optimizer = build(failure_phase == "save")
+    if failure_phase == "save":
+        with pytest.raises(RuntimeError, match="file-backed model tensor storage"):
+            DistributedCheckpointer.save(
+                str(tmp_path / "ckpt"),
+                {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+                parallel_state=parallel,
+            )
+        return
+    DistributedCheckpointer.save(
+        str(tmp_path / "ckpt"),
+        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
+        parallel_state=parallel,
+    )
+    target, restored = build(True)
+    before = target.p.detach().clone()
+    with pytest.raises(RuntimeError, match="file-backed model tensor storage"):
+        DistributedCheckpointer.load(
+            str(tmp_path / "ckpt"),
+            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
+            parallel_state=parallel,
+        )
+    torch.testing.assert_close(target.p, before, rtol=0, atol=0)
+    assert not restored.optimizers_dict["leaf"].state
 
 
 def test_old_layout_without_storage_view_proof_is_rejected(tmp_path, monkeypatch):
@@ -2434,8 +2433,9 @@ def test_multi_checkpoint_requires_explicit_scheduler_declaration(tmp_path):
     assert not (tmp_path / "model").exists()
 
 
-def test_scheduler_recipe_rejects_schedules_outside_the_checkpoint_contract():
+def test_scheduler_recipe_requires_explicit_registration():
     from veomni.models.checkpoint.manager import _scheduler_recipe
+    from veomni.optim.lr_scheduler import register_checkpoint_scheduler
 
     _, optimizer = _model_and_optimizer()
     leaf = optimizer.optimizers_dict["weight"]
@@ -2443,212 +2443,12 @@ def test_scheduler_recipe_rejects_schedules_outside_the_checkpoint_contract():
     with pytest.raises(RuntimeError, match="scheduler implementation or binding is unsupported"):
         _scheduler_recipe(step, leaf)
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(leaf, lambda value, *, factor=0.5: value * factor)
-    with pytest.raises(RuntimeError, match="scheduler captures unsupported mutable state"):
+    scheduler = torch.optim.lr_scheduler.LambdaLR(leaf, lambda value: 0.5 if value in {1, 3} else 1.0)
+    with pytest.raises(RuntimeError, match="no registered checkpoint recipe"):
         _scheduler_recipe(scheduler, leaf)
-
-
-@pytest.mark.parametrize("kind", ["function", "comprehension"])
-def test_scheduler_recipe_rejects_global_in_nested_function(monkeypatch, kind):
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    monkeypatch.setitem(globals(), "_TEST_NESTED_LR_FACTOR", 0.5)
-
-    def schedule(step):
-        def nested():
-            return _TEST_NESTED_LR_FACTOR  # noqa: F821
-
-        return step * nested()
-
-    def comprehension(step):
-        return sum(value * _TEST_NESTED_LR_FACTOR for value in range(step))  # noqa: F821
-
-    # Changing this global changes the next learning-rate update even though
-    # the outer code object never names it. Its identity is therefore unsafe.
-    with pytest.raises(RuntimeError, match="unsupported global state"):
-        _scheduler_functions(SimpleNamespace(lr_lambdas=[schedule if kind == "function" else comprehension]))
-
-
-def test_scheduler_recipe_accepts_nested_pure_function():
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    def schedule(step):
-        def nested(value):
-            return value * 0.5
-
-        return nested(step)
-
-    recipe = _scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))
-    assert len(recipe) == 1
-    assert schedule(2) == 1.0
-
-
-def test_scheduler_recipe_accepts_local_temporary_cell():
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    def schedule(step):
-        value = step * 0.5
-        return (lambda: value)()
-
-    assert len(_scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))) == 1
-    assert schedule(2) == 1.0
-
-
-def test_scheduler_recipe_accepts_math_attribute_with_unrelated_global(monkeypatch):
-    import math as math_module
-
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    monkeypatch.setitem(globals(), "math", math_module)
-    monkeypatch.setitem(globals(), "cos", "unrelated")
-
-    def schedule(step):
-        def nested(value):
-            return math.cos(value)  # noqa: F821
-
-        return nested(step)
-
-    assert len(_scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))) == 1
-
-
-@pytest.mark.parametrize("kind", ["set", "frozenset_constant"])
-def test_scheduler_recipe_rejects_process_dependent_computation(kind):
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    def unordered(step):
-        return sum(float(value) for value in {"0.125", "1e16", "-1e16"})
-
-    def unordered_constant(step):
-        return step in {1, 2, 3}
-
-    schedule = {"set": unordered, "frozenset_constant": unordered_constant}[kind]
-    with pytest.raises(RuntimeError, match="unsupported.*state"):
-        _scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))
-
-
-def test_scheduler_recipe_accepts_deterministic_format_and_records_its_identity():
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    def build_schedule(two_decimals):
-        if two_decimals:
-
-            def schedule(step):
-                return float(f"{step / 300:.2f}")
-        else:
-
-            def schedule(step):
-                return float(f"{step / 300:.3f}")
-
-        return schedule
-
-    two_decimals = build_schedule(True)
-    three_decimals = build_schedule(False)
-    assert two_decimals.__qualname__ == three_decimals.__qualname__
-    two = _scheduler_functions(SimpleNamespace(lr_lambdas=[two_decimals]))
-    three = _scheduler_functions(SimpleNamespace(lr_lambdas=[three_decimals]))
-    assert two_decimals(13) != three_decimals(13)
-    assert two != three
-
-
-def test_scheduler_recipe_rejects_tuple_subclass_closure():
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    class StatefulTuple(tuple):
-        def __getitem__(self, index):
-            return 0.5
-
-    factor = StatefulTuple((1.0,))
-
-    def schedule(step):
-        return step * factor[0]
-
-    with pytest.raises(RuntimeError, match="unsupported mutable state"):
-        _scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))
-
-
-def test_scheduler_recipe_rejects_nonlocal_mutation():
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    state = 1.0
-
-    def schedule(step):
-        nonlocal state
-        state += 1.0
-        return step * state
-
-    with pytest.raises(RuntimeError, match="unsupported dynamic state"):
-        _scheduler_functions(SimpleNamespace(lr_lambdas=[schedule]))
-
-
-@pytest.mark.parametrize("builtin_name", ["eval", "globals", "getattr", "__import__"])
-def test_scheduler_recipe_rejects_dynamic_builtin_in_nested_function(builtin_name):
-    from veomni.checkpoint.optimizer_resume_layout import _scheduler_functions
-
-    def schedule_eval(step):
-        return lambda: eval("step")  # noqa: S307
-
-    def schedule_globals(step):
-        return lambda: globals()
-
-    def schedule_getattr(step):
-        return lambda: getattr(step, str(step))
-
-    def schedule_import(step):
-        return lambda: __import__("math")
-
-    schedules = {
-        "eval": schedule_eval,
-        "globals": schedule_globals,
-        "getattr": schedule_getattr,
-        "__import__": schedule_import,
-    }
-    with pytest.raises(RuntimeError, match="unsupported.*state|unsupported.*builtin"):
-        _scheduler_functions(SimpleNamespace(lr_lambdas=[schedules[builtin_name]]))
-
-
-def test_nested_global_scheduler_is_rejected_before_checkpoint_load(tmp_path, monkeypatch):
-    model, optimizer = _model_and_optimizer()
-    scheduler = build_lr_scheduler(optimizer, train_steps=10)
-    parallel = SimpleNamespace(dp_mode="ddp")
-    DistributedCheckpointer.save(
-        str(tmp_path),
-        {
-            "model": model,
-            "optimizer": optimizer,
-            "extra_state": {"lr_scheduler": scheduler.state_dict()},
-            "_veomni_scheduler_object": scheduler,
-        },
-        parallel_state=parallel,
-    )
-
-    target, restored = _model_and_optimizer()
-    target_scheduler = build_lr_scheduler(restored, train_steps=10)
-    monkeypatch.setitem(globals(), "_TEST_NESTED_LR_FACTOR", 0.5)
-
-    def schedule(step):
-        def nested():
-            return _TEST_NESTED_LR_FACTOR  # noqa: F821
-
-        return step * nested()
-
-    target_scheduler["weight"].lr_lambdas[0] = schedule
-    before = {name: value.detach().clone() for name, value in target.named_parameters()}
-    scheduler_before = target_scheduler.state_dict()
-    with pytest.raises(RuntimeError, match="unsupported global state"):
-        DistributedCheckpointer.load(
-            str(tmp_path),
-            {
-                "model": target,
-                "optimizer": restored,
-                "extra_state": {},
-                "_veomni_scheduler_object": target_scheduler,
-            },
-            parallel_state=parallel,
-        )
-    for name, value in target.named_parameters():
-        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
-    assert target_scheduler.state_dict() == scheduler_before
-    assert all(not leaf.state for leaf in restored.optimizers_dict.values())
+    register_checkpoint_scheduler(scheduler, name="test.piecewise", version=1, parameters={"half_steps": [1, 3]})
+    assert _scheduler_recipe(scheduler, leaf)["recipe"]["parameters"] == {"half_steps": [1, 3]}
+    assert scheduler.lr_lambdas[0](1) == 0.5
 
 
 def test_multi_checkpoint_accepts_explicit_no_scheduler(tmp_path):
@@ -2677,9 +2477,7 @@ def test_multi_checkpoint_accepts_explicit_no_scheduler(tmp_path):
 
 
 def test_deterministic_formatted_scheduler_recovers_next_update(tmp_path):
-    import weakref
-
-    from veomni.optim.lr_scheduler import _CHECKPOINT_SCHEDULER_BINDINGS, MultiLRScheduler
+    from veomni.optim.lr_scheduler import MultiLRScheduler, register_checkpoint_scheduler
 
     def build_formatted_scheduler(optimizer, *, precision=4):
         schedules = {}
@@ -2694,7 +2492,9 @@ def test_deterministic_formatted_scheduler_recovers_next_update(tmp_path):
                     return float(f"{1 / (step + 1):.3f}")
 
             schedule = torch.optim.lr_scheduler.LambdaLR(leaf, lr_lambda)
-            _CHECKPOINT_SCHEDULER_BINDINGS[leaf] = weakref.ref(schedule)
+            register_checkpoint_scheduler(
+                schedule, name="test.formatted", version=1, parameters={"precision": precision}
+            )
             schedules[name] = schedule
         return MultiLRScheduler(schedules)
 

@@ -544,6 +544,11 @@ class MultiOptimizer(Optimizer, Stateful):
             isinstance(opt, Qwen38MuonAdamW) and opt._ple_world_profile for opt in optimizers.values()
         )
 
+    @property
+    def param_groups(self):
+        """Expose the live leaf groups to trainer and metric consumers."""
+        return [group for name in self.key_names for group in self.optimizers_dict[name].param_groups]
+
     def step(self, closure=None):
         restore_failed = getattr(self, "_veomni_dcp_restore_failed", False)
         if restore_failed and not self._qwen38_ple_world_profile:
@@ -553,33 +558,27 @@ class MultiOptimizer(Optimizer, Stateful):
         if self._qwen38_ple_world_profile:
             from torch.optim.optimizer import _global_optimizer_post_hooks, _global_optimizer_pre_hooks
 
-            from ..utils.dist_utils import raise_if_any_rank_failed
-
-            error = None
-            try:
-                if restore_failed:
-                    raise RuntimeError(
-                        "MultiOptimizer cannot train after a failed checkpoint restore; rebuild the optimizer"
-                    )
-                if (
-                    closure is not None
-                    or _global_optimizer_pre_hooks
-                    or _global_optimizer_post_hooks
-                    or len(qwen_children) != len(children)
-                    or any(
-                        not opt._ple_world_profile or opt._optimizer_step_pre_hooks or opt._optimizer_step_post_hooks
-                        for opt in qwen_children
-                    )
-                ):
-                    raise ValueError(
-                        "File-backed optimizer requires coordinated children and no closures or step hooks"
-                    )
-            except BaseException as exc:
-                error = exc
-            # No participant enters a child collective until all ranks agree.
-            raise_if_any_rank_failed(error, "validating file-backed optimizer step")
-            for opt in qwen_children:
-                opt._prepare_file_step()
+            preflight_error = None
+            if (
+                closure is not None
+                or _global_optimizer_pre_hooks
+                or _global_optimizer_post_hooks
+                or len(qwen_children) != len(children)
+                or any(
+                    not opt._ple_world_profile or opt._optimizer_step_pre_hooks or opt._optimizer_step_post_hooks
+                    for opt in qwen_children
+                )
+            ):
+                preflight_error = ValueError(
+                    "File-backed optimizer requires coordinated children and no closures or step hooks"
+                )
+            if not qwen_children and preflight_error is not None:
+                raise preflight_error
+            for index, opt in enumerate(qwen_children):
+                opt._prepare_file_step(
+                    restore_failed=restore_failed if index == 0 else False,
+                    preflight_error=preflight_error if index == 0 else None,
+                )
         uses_cuda = bool(qwen_children) and any(_optimizer_uses_cuda(opt) for opt in children)
         if uses_cuda and not self._qwen38_cuda_guard and torch.distributed.is_initialized():
             raise RuntimeError("Distributed MultiOptimizer requires qwen38_cuda_guard on every participant")

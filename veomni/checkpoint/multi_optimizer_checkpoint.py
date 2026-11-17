@@ -249,6 +249,7 @@ def _preflight_multi_optimizer_layout(
     parallel_state=None,
     trainable_only=False,
     group=None,
+    rows_by_name=None,
 ):
     """Reject an unproven or changed MultiOptimizer group/scheduler layout."""
     multi = getattr(optimizer, "_is_multi_optimizer", False) is True
@@ -391,6 +392,7 @@ def _preflight_multi_optimizer_layout(
         source_keys = {key for key in model_metadata.state_dict_metadata if key.startswith("model.")}
         if source_keys != expected_keys:
             raise RuntimeError("MultiOptimizer checkpoint model state inventory differs")
+        row_formats = set()
         for name, tensor in flat_model.items():
             source_entry = model_metadata.state_dict_metadata[name]
             if not torch.is_tensor(tensor):
@@ -399,8 +401,26 @@ def _preflight_multi_optimizer_layout(
                 continue
             if not isinstance(source_entry, TensorStorageMetadata):
                 raise RuntimeError(f"MultiOptimizer model checkpoint value type differs for {name}")
-            if source_entry.properties.dtype != tensor.dtype or tuple(source_entry.size) != tuple(tensor.shape):
+            expected_shape = tuple(tensor.shape)
+            source_shape = tuple(source_entry.size)
+            row_counts = (rows_by_name or {}).get(name)
+            shape_ok = source_shape == expected_shape
+            if row_counts is not None:
+                logical, padded = row_counts
+                shape_ok = (
+                    bool(expected_shape)
+                    and 0 < logical <= padded
+                    and expected_shape[0] == padded
+                    and bool(source_shape)
+                    and source_shape[0] in (logical, padded)
+                    and source_shape[1:] == expected_shape[1:]
+                )
+                if shape_ok and logical != padded:
+                    row_formats.add(source_shape[0] == logical)
+            if source_entry.properties.dtype != tensor.dtype or not shape_ok:
                 raise RuntimeError(f"MultiOptimizer model checkpoint tensor dtype or shape differs for {name}")
+        if len(row_formats) > 1:
+            raise RuntimeError("MultiOptimizer checkpoint mixes logical and padded row formats")
         if trainable_only:
             logical_source_keys = {
                 logical_key

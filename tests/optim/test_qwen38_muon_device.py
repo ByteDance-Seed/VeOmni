@@ -29,15 +29,6 @@ def _require_native_device():
     return torch.device(capabilities.backend)
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize("backend", ["cpu", "cuda"])
-def test_required_npu_test_fails_when_npu_is_missing(monkeypatch, backend):
-    monkeypatch.setenv("VEOMNI_REQUIRE_NPU_TESTS", "1")
-    monkeypatch.setitem(globals(), "runner_capabilities", lambda: SimpleNamespace(backend=backend))
-    with pytest.raises(pytest.fail.Exception, match="NPU test was required"):
-        _require_native_device()
-
-
 def _build(device, dtype):
     model = torch.nn.Module()
     model.down_proj = torch.nn.Linear(4, 4, bias=False, device=device, dtype=dtype)

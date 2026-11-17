@@ -334,13 +334,14 @@ def _file_step_worker(rank, rendezvous, root, mode):
         assert int(result) == (0 if mode == "success" else 2), (rank, mode, error)
         if mode in ("grad_mismatch", "asymmetric_step_hook", "asymmetric_restore_failure"):
             torch.testing.assert_close(original, model.ngram_embedding.weight, rtol=0, atol=0)
+            assert not leaf.state
         if mode in ("asymmetric_step_hook", "asymmetric_restore_failure"):
             expected = (
                 "no closures or step hooks"
                 if rank == 0 and mode == "asymmetric_step_hook"
                 else "failed checkpoint restore"
                 if rank == 0
-                else "validating file-backed optimizer step failed on another rank"
+                else "preparing file-backed Muon state failed on another rank"
             )
             assert expected in str(error)
             assert not hook_calls
