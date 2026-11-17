@@ -21,7 +21,14 @@ from .....utils.conversation import ConversationItem, iter_desired_items
 from ..configuration import JanusVqvaeConfig
 from ..modeling import JanusVqvae
 from ..processing import JanusVqvaeProcessor
-from .packed import PackedTrainingMixin
+
+
+_FUSED_CE_IMPLS = frozenset({"chunk_loss", "liger_kernel"})
+"""CE rows that consume ``(hidden_states, weight)`` instead of materialised logits.
+
+They are fused-linear: passing logits leaves ``weight`` empty and the kernel
+raises ``chunk_loss requires a nonempty ``weight`` (fused-linear path)``.
+"""
 
 
 class TrainingMixin(TrainingModuleMixin):
@@ -45,7 +52,12 @@ class TrainingMixin(TrainingModuleMixin):
     def encode_pre(
         self,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
+        # The graph hands a node the whole batch; these hooks own only the carrier.
+        # Swallowing the rest keeps framework metadata (``ds_idx`` / ``source_name``,
+        # which ``WeightedMultiSourceDataset`` appends) from failing the call.
+        del kwargs
         self._conversation_carrier = conversation_list
         # Real gen images and worker-built dummies are both assistant images
         # (normalized on CPU by the JanusVqvaePreprocessor); stack + move.
@@ -69,14 +81,12 @@ class TrainingMixin(TrainingModuleMixin):
             # batch (the VQVAE codec shards the batch dim — its attention is not
             # Ulysses). Every SP rank already holds the same image batch (the
             # dataloader replicates each shard); pad it to a multiple of ``sp_size``
-            # and take this rank's contiguous chunk. ``is_dummy`` is dropped: the SP
-            # path is a training path that always runs the codec (the FSDP grad
-            # anchor). ``encode_post`` all-gathers the shards back.
+            # and take this rank's contiguous chunk. ``encode_post`` all-gathers the
+            # shards back.
             self._sp_own_len = pixel_values.size(0)
             pixel_values = slice_input_tensor(pixel_values, dim=0, padding=True, group=get_parallel_state().sp_group)
-            return {"pixel_values": pixel_values}
-        # ``is_dummy`` stays for the plain (non-SP) encode: a non-SP inference/eval
-        # short-circuit that skips the codec for an all-dummy batch with no anchor.
+        # ``is_dummy`` travels with the slice: ``encode`` needs it to skip the codec
+        # for an all-dummy batch unless an FSDP2 wrap maintains a gradient anchor.
         return {"pixel_values": pixel_values, "is_dummy": is_dummy_flag}
 
     def _metric_meter_stash_tokens(self, num_images: int) -> None:
@@ -110,7 +120,9 @@ class TrainingMixin(TrainingModuleMixin):
     def decode_pre(
         self,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
+        del kwargs
         self._conversation_carrier = conversation_list
         hidden_states, labels, is_dummy_flag = self._prepare_decode_inputs(conversation_list)
         # No SP sharding here: the generation-head loss is a token-weighted mean over
@@ -199,7 +211,7 @@ class MeterMixin(MetricMeterMixin):
         return 0.0
 
 
-class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, MeterMixin):
+class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
     """``generate()`` / ``finalize()`` and the VQ-buffer inference state already
     live on the native :class:`~.modeling.JanusVqvae` (via its own
     :class:`~.modeling.InferenceMixin`), so no ``InferenceMixin`` is needed here.
@@ -229,24 +241,110 @@ class JanusVqvaeAccelerated(VeOmniMixin, JanusVqvae):
 
     def _vq_loss(self, hidden_states: torch.Tensor, gt_token_ids: torch.Tensor) -> torch.Tensor:
         labels = gt_token_ids.to(hidden_states.device)
-        logits = self.generation_head(hidden_states)
+        # The head is ``proj_out -> act -> vision_head``. A fused CE consumes the
+        # *last* linear's input (the projection_dim activations) plus its weight,
+        # so both the intermediate and the logits are derived from one pass.
+        pre_head = self.generation_head.activation_fn(self.generation_head.proj_out(hidden_states))
+        logits = self.generation_head.vision_head(pre_head)
         flat_labels = labels.reshape(-1)
         ps = get_parallel_state()
         n_valid_local = (flat_labels != -100).sum()
         if n_valid_local > 0:
-            loss, _, _ = self.loss_function(
+            return self._vq_ce(
+                pre_head=pre_head,
                 logits=logits,
-                shift_labels=flat_labels,
-                vocab_size=logits.size(-1),
+                flat_labels=flat_labels,
                 loss_reduction_group=ps.fsdp_group,
             )
-            return loss
+        # All-dummy span: no supervised token on this micro-batch, so there is
+        # nothing for a fused kernel to reduce. Unweighted eager CE on `-100`
+        # labels returns 0, which keeps the head in the graph without dividing
+        # by a zero count.
         loss, _, _ = ForCausalLMLoss(
             logits=logits,
             shift_labels=flat_labels,
             vocab_size=logits.size(-1),
             num_items_in_batch=n_valid_local.clamp(min=1),
             loss_reduction_group=ps.fsdp_group,
+        )
+        return loss
+
+    def _vq_ce(
+        self,
+        *,
+        pre_head: torch.Tensor,
+        logits: torch.Tensor,
+        flat_labels: torch.Tensor,
+        loss_reduction_group,
+    ) -> torch.Tensor:
+        """Cross-entropy over the generation head, on whichever backend was configured.
+
+        ``chunk_loss`` and ``liger_kernel`` are fused-linear: they need the final
+        linear's input activations and its weight, not a materialised logits
+        tensor. The eager row takes logits.
+
+        The head has a bias (``nn.Linear`` default), and it must reach the loss:
+        omitting it changes the number and leaves ``vision_head.bias`` without a
+        gradient. ``chunk_loss`` takes it directly (``logits_bias`` along the
+        token axis plus ``logits_bias_weight`` of shape ``(V, 1)`` so the bias
+        gradient is projected, not materialised per token). ``liger_kernel``'s
+        VeOmni row hardcodes ``bias=None``, so the two are scored separately
+        there — a logit-additive bias commutes with the linear term, which keeps
+        the fused weight/hidden gradients exact.
+        """
+        head = self.generation_head.vision_head
+        bias = head.bias
+        impl = getattr(self.veomni_ce, "impl", None)
+
+        if impl == "chunk_loss":
+            # ``hidden_states`` is flattened to ``[tokens, H]`` for the fused
+            # linear, so every token-axis argument has to be flattened with it.
+            # The training shape is ``[1, T, H]``, where a 3-D ``logits_bias``
+            # would fail chunk_loss' row check against the 2-D activations.
+            flat_pre_head = pre_head.reshape(-1, pre_head.size(-1))
+            if bias is None:
+                loss, _, _ = self.loss_function(
+                    hidden_states=flat_pre_head,
+                    weights=head.weight,
+                    shift_labels=flat_labels,
+                    vocab_size=logits.size(-1),
+                    loss_reduction_group=loss_reduction_group,
+                )
+                return loss
+            # ``logits_bias`` is added to each chunk's logits: rows must line up
+            # with the activations, and a ones column turns the (V, 1) bias
+            # weight into the plain bias vector.
+            ones = flat_pre_head.new_ones(flat_pre_head.shape[:-1] + (1,))
+            loss, _, _ = self.loss_function(
+                hidden_states=flat_pre_head,
+                weights=head.weight,
+                shift_labels=flat_labels,
+                vocab_size=logits.size(-1),
+                logits_bias=ones,
+                logits_bias_weight=bias.unsqueeze(-1),
+                loss_reduction_group=loss_reduction_group,
+            )
+            return loss
+
+        if impl == "liger_kernel":
+            # The VeOmni liger row hardcodes ``bias=None`` and rejects an empty
+            # weight, so it has no bias path at all. Score through the eager row
+            # over `logits` (which already carries the bias) rather than dropping
+            # it: the number and the ``vision_head.bias`` gradient are then
+            # correct, and only the fused kernel is given up.
+            loss, _, _ = ForCausalLMLoss(
+                logits=logits,
+                shift_labels=flat_labels,
+                vocab_size=logits.size(-1),
+                loss_reduction_group=loss_reduction_group,
+            )
+            return loss
+
+        loss, _, _ = ForCausalLMLoss(
+            logits=logits,
+            shift_labels=flat_labels,
+            vocab_size=logits.size(-1),
+            loss_reduction_group=loss_reduction_group,
         )
         return loss
 

@@ -4,7 +4,6 @@ import fcntl
 import json
 import os
 import socket
-import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -29,24 +28,6 @@ class RendezvousEndpoint:
         return PrefixStore(self.prefix, client)
 
 
-def _record_endpoint(action, endpoint):
-    output = os.environ.get("CI_RENDEZVOUS_EVENTS")
-    if not output:
-        return
-    event = dict(
-        action=action,
-        nodeid=os.environ.get("VEOMNI_CI_ACTIVE_NODEID"),
-        pid=os.getpid(),
-        host=endpoint.host,
-        port=endpoint.port,
-        launch_id=endpoint.prefix,
-        timestamp=time.time(),
-    )
-    with open(output, "a") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        handle.write(json.dumps(event) + "\n")
-
-
 @contextmanager
 def rendezvous_endpoint(*, timeout=timedelta(minutes=30)):
     """Keep a bound TCPStore alive until the caller has joined its workers.
@@ -61,11 +42,9 @@ def rendezvous_endpoint(*, timeout=timedelta(minutes=30)):
     server = TCPStore("127.0.0.1", 0, is_master=True, timeout=timeout, wait_for_workers=False)
     endpoint = RendezvousEndpoint("127.0.0.1", server.port, uuid.uuid4().hex, timeout)
     try:
-        _record_endpoint("ready", endpoint)
         yield endpoint
     finally:
         del server
-        _record_endpoint("closed", endpoint)
 
 
 def _free_port():

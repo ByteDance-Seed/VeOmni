@@ -6,4 +6,4 @@ vocabulary modules (``embed_tokens`` + ``lm_head``) are MoE-agnostic and reuse
 the dense ``qwen3/text_encoder`` module.
 """
 
-from . import convert_model, llm  # noqa: F401
+from . import hf_layout, llm  # noqa: F401

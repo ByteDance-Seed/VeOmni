@@ -1,7 +1,7 @@
 """VeOmni-accelerated BAGEL Qwen2-MoT — instance-local VeomniOp ops plus training-graph hooks.
 
 Native weights and packed ``forward`` live on :class:`BagelQwen2MoTCore`.
-This module adds packed CFG denoise, fused RMSNorm / SwiGLU / RoPE,
+This module adds packed CFG denoise, async Ulysses, fused RMSNorm / SwiGLU / RoPE,
 attention ``VeomniOp`` dispatch, and the training pre/forward/post hooks.
 """
 
@@ -12,7 +12,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask
-from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 from .......distributed.parallel_state import get_parallel_state
 from .......distributed.sequence_parallel import (
@@ -20,8 +20,13 @@ from .......distributed.sequence_parallel import (
     slice_input_tensor,
     sp_pad,
 )
+from .......models.transformers.qwen2.generated.patched_modeling_qwen2_gpu import (
+    Qwen2MLP as PatchedQwen2MLP,
+)
+from .......models.transformers.qwen2.generated.patched_modeling_qwen2_gpu import (
+    Qwen2RMSNorm as PatchedQwen2RMSNorm,
+)
 from .......ops import VeomniOp
-from .......ops.kernels.swiglu_mlp import has_plain_linear_projections
 from .......ops.mask import MagiAttentionMask
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
@@ -39,7 +44,6 @@ from ..checkpoint_conversion import (
     BagelQwen2MoTCheckpointTensorConverter,
     combine_qkv_state_dict_pre_hook,
     register_accelerated_qkv_conversion_mapping,
-    split_qkv_state_dict_post_hook,
 )
 from ..configuration import BagelQwen2MoTConfig
 from ..masking import build_mot_block_mask, build_mot_magi_mask, pad_mot_attention_metadata
@@ -47,9 +51,6 @@ from ..modeling import (
     BagelQwen2MoTAttention,
     BagelQwen2MoTCore,
     InferenceMixin,
-)
-from ..modeling import (
-    _apply_rotary_pos_emb as _apply_rotary_pos_emb_eager,
 )
 from ..processing import PackedConversation, preprocess_mot_inputs
 
@@ -77,6 +78,7 @@ class TrainingMixin(TrainingModuleMixin):
         conversation_list: list[list[ConversationItem]] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Pack multimodal conversation items into MoT training tensors and slice for Ulysses SP."""
         del kwargs
         self._conversation_carrier = conversation_list
         self._packed_training = preprocess_mot_inputs(
@@ -173,6 +175,7 @@ class TrainingMixin(TrainingModuleMixin):
 
     @post_forward("forward")
     def forward_post(self, hidden_states: torch.Tensor, **kwargs: Any) -> dict[str, Any]:
+        """Gather SP sequence shards if active and scatter MoT hidden states onto carrier items."""
         del kwargs
         ps = get_parallel_state()
         if ps.sp_size > 1:
@@ -200,6 +203,7 @@ class TrainingMixin(TrainingModuleMixin):
         packed_sequence: torch.Tensor,
         conversation_list: list[list[ConversationItem]] | None,
     ) -> torch.Tensor:
+        """Fold zero-valued FSDP dummy anchors from upstream SigLIP and flow encoders."""
         # Dummy encoder outputs must still touch MoT on ranks where another rank
         # has the real branch, otherwise FSDP sees different gradient buckets.
         anchor = packed_sequence.new_zeros(())
@@ -240,6 +244,7 @@ class TrainingMixin(TrainingModuleMixin):
         self,
         conversation_list: list[list[ConversationItem]] | None,
     ) -> tuple[bool, bool]:
+        """Return whether any rank in the distributed group has real SigLIP or flow embeddings."""
         has_siglip = int(
             self._has_valid_upstream_embedding(
                 conversation_list,
@@ -273,6 +278,7 @@ class TrainingMixin(TrainingModuleMixin):
         meta: dict[str, list[Any]] | None = None,
         meta_keys: list[str] | None = None,
     ) -> bool:
+        """Check whether ``conversation_list`` contains a non-dummy rank-2 embedding matching the filter."""
         for item in iter_desired_items(
             conversation_list or [],
             types=types,
@@ -306,6 +312,7 @@ class MeterMixin(MetricMeterMixin):
     config: BagelQwen2MoTConfig
 
     def estimate_flops(self, seqlens: list[int]) -> float:
+        """Estimate TFLOPs for the Qwen2-MoT transformer layers over ``seqlens``."""
         cfg = self.config
         hidden = cfg.hidden_size
         num_layers = cfg.num_hidden_layers
@@ -335,62 +342,6 @@ class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
     """
 
 
-class Qwen2RMSNormAccelerated(Qwen2RMSNorm):
-    """Qwen2 RMSNorm with instance-local VeomniOp fused dispatch."""
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6, *, config: BagelQwen2MoTConfig | None = None) -> None:
-        super().__init__(hidden_size, eps=eps)
-        self.config = config
-        rms_impl = config.ops_implementation.get("rms_norm_implementation", "eager") if config is not None else "eager"
-        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", rms_impl)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Empty modality branches retain zero-gradient FSDP anchors. Liger's
-        # Triton kernel cannot launch the resulting zero-row grid.
-        if hidden_states.numel() == 0:
-            return super().forward(hidden_states)
-
-        if self.veomni_rms_norm.impl != "eager":
-            return self.veomni_rms_norm(hidden_states, self.weight, eps=self.variance_epsilon)
-
-        return super().forward(hidden_states)
-
-
-class Qwen2MLPAccelerated(Qwen2MLP):
-    """Qwen2 SwiGLU MLP with instance-local VeomniOp fused dispatch."""
-
-    def __init__(self, config: BagelQwen2MoTConfig) -> None:
-        super().__init__(config)
-        impl = config.ops_implementation.get("swiglu_mlp_implementation", "eager")
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", impl)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Empty modality branches retain zero-gradient FSDP anchors. Liger's
-        # Triton kernel cannot launch the resulting zero-row grid.
-        if x.numel() == 0:
-            return super().forward(x)
-
-        if self.veomni_swiglu_mlp.impl != "eager":
-            if self.config.hidden_act not in {"silu", "swish"}:
-                raise ValueError(
-                    f"Liger SwiGLU requires hidden_act='silu' or 'swish', got {self.config.hidden_act!r}. "
-                    "Set model.ops_implementation.swiglu_mlp_implementation='eager' "
-                    "to use the Transformers reference implementation."
-                )
-            if has_plain_linear_projections(self):
-                return self.veomni_swiglu_mlp(
-                    x,
-                    self.gate_proj.weight,
-                    self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                    self.up_proj.weight,
-                    self.up_proj.bias if self.up_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                    self.down_proj.weight,
-                    self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-                )
-
-        return super().forward(x)
-
-
 def _apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -400,38 +351,36 @@ def _apply_rotary_pos_emb(
     *,
     rope_op: VeomniOp | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Packed RoPE with optional instance-local VeomniOp dispatch."""
+    """Packed RoPE dispatched through the instance-local ``VeomniOp``."""
     if rope_op is None:
         rope_op = VeomniOp("rope", "full", "eager")
-    if q.numel() != 0 and k.numel() != 0 and rope_op.impl != "eager":
-        if unsqueeze_dim != 1:
-            raise NotImplementedError("BAGEL packed fused RoPE requires unsqueeze_dim=1.")
-        if q.ndim != 3 or k.ndim != 3 or cos.ndim != 2 or sin.ndim != 2:
-            raise NotImplementedError(
-                "BAGEL fused RoPE requires packed q/k tensors shaped [tokens, heads, head_dim] "
-                "and cos/sin tensors shaped [tokens, head_dim]."
-            )
-        if not (q.shape[0] == k.shape[0] == cos.shape[0] == sin.shape[0]):
-            raise ValueError("BAGEL packed q/k/cos/sin tensors must share the token dimension.")
-        if not (q.shape[-1] == k.shape[-1] == cos.shape[-1] == sin.shape[-1]):
-            raise NotImplementedError("Liger full RoPE does not support partial rotary dimensions.")
-
-        # The shared full-RoPE kernels consume [batch, heads, sequence, head_dim].
-        # BAGEL stores packed Q/K as [tokens, heads, head_dim], so adapt through
-        # a synthetic batch dimension and restore the packed layout afterwards.
-        q_embed, k_embed = rope_op(
-            q.transpose(0, 1).unsqueeze(0),
-            k.transpose(0, 1).unsqueeze(0),
-            cos.unsqueeze(0),
-            sin.unsqueeze(0),
-            unsqueeze_dim=1,
+    if unsqueeze_dim != 1:
+        raise NotImplementedError("BAGEL packed fused RoPE requires unsqueeze_dim=1.")
+    if q.ndim != 3 or k.ndim != 3 or cos.ndim != 2 or sin.ndim != 2:
+        raise NotImplementedError(
+            "BAGEL fused RoPE requires packed q/k tensors shaped [tokens, heads, head_dim] "
+            "and cos/sin tensors shaped [tokens, head_dim]."
         )
-        return (
-            q_embed.squeeze(0).transpose(0, 1).contiguous(),
-            k_embed.squeeze(0).transpose(0, 1).contiguous(),
-        )
+    if not (q.shape[0] == k.shape[0] == cos.shape[0] == sin.shape[0]):
+        raise ValueError("BAGEL packed q/k/cos/sin tensors must share the token dimension.")
+    if not (q.shape[-1] == k.shape[-1] == cos.shape[-1] == sin.shape[-1]):
+        raise NotImplementedError("Liger full RoPE does not support partial rotary dimensions.")
 
-    return _apply_rotary_pos_emb_eager(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    # The shared full-RoPE kernels consume [batch, heads, sequence, head_dim]
+    # for LLM-dtype arithmetic (whereas 3-D [S, H, D] triggers vision FP32 promotion).
+    # BAGEL stores packed Q/K as [tokens, heads, head_dim], so adapt through
+    # a synthetic batch dimension and restore the packed layout afterwards.
+    q_embed, k_embed = rope_op(
+        q.transpose(0, 1).unsqueeze(0),
+        k.transpose(0, 1).unsqueeze(0),
+        cos.unsqueeze(0),
+        sin.unsqueeze(0),
+        unsqueeze_dim=1,
+    )
+    return (
+        q_embed.squeeze(0).transpose(0, 1).contiguous(),
+        k_embed.squeeze(0).transpose(0, 1).contiguous(),
+    )
 
 
 _PACKED_FUSED_ATTN_IMPLEMENTATIONS = (
@@ -443,6 +392,7 @@ _MAGI_ATTN_IMPLEMENTATIONS = frozenset({"magi_attention", "veomni_magi_attention
 
 
 def _normalize_packed_attn_impl(attn_implementation: str | None) -> str | None:
+    """Normalize Flex/Magi attention aliases to their canonical ``veomni_*`` names."""
     if attn_implementation in _FLEX_ATTN_IMPLEMENTATIONS:
         return "veomni_flex_attention"
     if attn_implementation in _MAGI_ATTN_IMPLEMENTATIONS:
@@ -461,22 +411,28 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         rms_norm_cls: type[Qwen2RMSNorm] = Qwen2RMSNorm,
     ):
         super().__init__(config, layer_idx, rms_norm_cls=rms_norm_cls)
-        rope_impl = config.ops_implementation.get("rotary_pos_emb_implementation", "eager")
-        self.veomni_rope = VeomniOp("rope", "full", rope_impl)
-        raw_attn = config.ops_implementation.get("attn_implementation", getattr(config, "_attn_implementation", None))
-        attn_impl = _normalize_packed_attn_impl(raw_attn)
-        if attn_impl in _FLEX_ATTN_IMPLEMENTATIONS:
-            self.veomni_attn: VeomniOp | None = VeomniOp("attention", "standard", attn_impl)
-        elif attn_impl in _MAGI_ATTN_IMPLEMENTATIONS:
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", config.ops_config.rms_norm_implementation)
+        self.veomni_rope = VeomniOp("rope", "full", config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_async_ulysses_qkv = VeomniOp("async_ulysses_qkv", "bagel")
+        self.veomni_async_ulysses_o = VeomniOp("async_ulysses_o", "bagel")
+        attn_impl = _normalize_packed_attn_impl(
+            config.ops_config.attn_implementation
+            if "attn_implementation" in config.ops_implementation
+            else "veomni_flex_attention"
+        )
+        self.veomni_attn_impl = attn_impl
+        if attn_impl in _PACKED_FUSED_ATTN_IMPLEMENTATIONS:
             try:
-                self.veomni_attn = VeomniOp("attention", "standard", attn_impl)
+                self.veomni_attn: VeomniOp | None = VeomniOp("attention", "standard", attn_impl)
             except RuntimeError:
                 self.veomni_attn = None
         else:
             self.veomni_attn = None
-        self.veomni_denoise_attn = VeomniOp("attention", "standard", _FLASH_ATTENTION_2)
+        try:
+            self.veomni_denoise_attn: VeomniOp | None = VeomniOp("attention", "standard", _FLASH_ATTENTION_2)
+        except RuntimeError:
+            self.veomni_denoise_attn = None
         self.register_load_state_dict_pre_hook(combine_qkv_state_dict_pre_hook)
-        self.register_state_dict_post_hook(split_qkv_state_dict_post_hook)
 
     def _build_qkv_proj(self) -> None:
         qkv_size = sum(self.qkv_split_sizes)
@@ -490,6 +446,7 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         is_gen: bool,
         split: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project ``hidden`` through the fused und or gen QKV linear layer."""
         projected = (self.qkv_proj_gen if is_gen else self.qkv_proj_und)(hidden)
         if split:
             return projected.split(self.qkv_split_sizes, dim=-1)
@@ -501,6 +458,7 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         *,
         attn_implementation: str | None = None,
     ) -> BlockMask | MagiAttentionMask:
+        """Materialize a Flex ``BlockMask`` or ``MagiAttentionMask`` from ``packed_attention_metadata``."""
         if attn_implementation in _MAGI_ATTN_IMPLEMENTATIONS:
             return build_mot_magi_mask(packed_attention_metadata)
         if attn_implementation in _FLEX_ATTN_IMPLEMENTATIONS or attn_implementation is None:
@@ -521,16 +479,16 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         return _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim, rope_op=self.veomni_rope)
 
     def _resolve_packed_attn_op(self, *, context: str) -> VeomniOp:
-        attn_impl = _normalize_packed_attn_impl(self.config._attn_implementation)
-        if attn_impl not in _PACKED_FUSED_ATTN_IMPLEMENTATIONS:
+        """Resolve the packed fused attention ``VeomniOp`` bound at initialization for ``context``."""
+        if self.veomni_attn is not None:
+            return self.veomni_attn
+        if self.veomni_attn_impl not in _PACKED_FUSED_ATTN_IMPLEMENTATIONS:
             raise ValueError(
                 f"BAGEL Qwen2-MoT {context} requires packed fused attention "
                 f"({', '.join(_PACKED_FUSED_ATTN_IMPLEMENTATIONS)}), got "
-                f"{self.config._attn_implementation!r}."
+                f"{self.veomni_attn_impl!r}."
             )
-        if self.veomni_attn is not None and self.veomni_attn.impl == attn_impl:
-            return self.veomni_attn
-        return VeomniOp("attention", "standard", attn_impl)
+        return VeomniOp("attention", "standard", self.veomni_attn_impl)
 
     def attend(
         self,
@@ -565,6 +523,7 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         max_length_q: int,
         max_length_k: int,
     ) -> torch.Tensor:
+        """Run packed inference attention using Flex/Magi for prefill and FlashAttention-2 for decode/denoise."""
         if attention_mask is not None:
             attn_op = self._resolve_packed_attn_op(context="packed prefill")
             packed_attn_output, _ = attn_op(
@@ -581,7 +540,8 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
             )
             return packed_attn_output.squeeze(0)
 
-        packed_attn_output, _ = self.veomni_denoise_attn(
+        denoise_op = self.veomni_denoise_attn or VeomniOp("attention", "standard", _FLASH_ATTENTION_2)
+        packed_attn_output, _ = denoise_op(
             self,
             packed_query_states.transpose(0, 1).unsqueeze(0),
             merged_key_states.transpose(0, 1).unsqueeze(0),
@@ -599,6 +559,111 @@ class BagelQwen2MoTAttentionAccelerated(BagelQwen2MoTAttention):
         )
         return packed_attn_output.squeeze(0)
 
+    def _has_plain_linear_projections(self) -> bool:
+        """Whether async Ulysses may read this layer's projection weights directly.
+
+        A wrapped projection such as ``LoraLinear`` has no ``weight`` and must run
+        its own forward, so attention falls back to the synchronous projection path.
+        """
+        return all(
+            isinstance(getattr(self, name), torch.nn.Linear)
+            for name in ("qkv_proj_und", "qkv_proj_gen", "o_proj", "o_proj_moe_gen")
+        )
+
+    def forward_packed_train(
+        self,
+        packed_sequence: torch.Tensor,
+        attention_mask: BlockMask | MagiAttentionMask,
+        packed_position_cos: torch.Tensor,
+        packed_position_sin: torch.Tensor,
+        packed_und_token_indexes: torch.Tensor,
+        packed_gen_token_indexes: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run packed training attention, using async Ulysses when enabled on the active parallel state."""
+        parallel_state = get_parallel_state()
+        use_async_ulysses = (
+            parallel_state.ulysses_enabled
+            and bool(parallel_state.async_enabled)
+            and self._has_plain_linear_projections()
+        )
+        if not use_async_ulysses:
+            return super().forward_packed_train(
+                packed_sequence,
+                attention_mask,
+                packed_position_cos,
+                packed_position_sin,
+                packed_und_token_indexes,
+                packed_gen_token_indexes,
+            )
+        attn_op = self._resolve_packed_attn_op(context="training")
+
+        q_weight_und, k_weight_und, v_weight_und = self.qkv_proj_und.weight.split(self.qkv_split_sizes, dim=0)
+        q_bias_und, k_bias_und, v_bias_und = (
+            (None, None, None)
+            if self.qkv_proj_und.bias is None
+            else self.qkv_proj_und.bias.split(self.qkv_split_sizes, dim=0)
+        )
+        q_weight_gen, k_weight_gen, v_weight_gen = self.qkv_proj_gen.weight.split(self.qkv_split_sizes, dim=0)
+        q_bias_gen, k_bias_gen, v_bias_gen = (
+            (None, None, None)
+            if self.qkv_proj_gen.bias is None
+            else self.qkv_proj_gen.bias.split(self.qkv_split_sizes, dim=0)
+        )
+        rms_norm_op = getattr(self.q_norm, "veomni_rms_norm", self.veomni_rms_norm)
+        packed_query_states, packed_key_states, packed_value_states = self.veomni_async_ulysses_qkv(
+            hidden_states=packed_sequence,
+            route_0_indices=packed_und_token_indexes,
+            route_1_indices=packed_gen_token_indexes,
+            position_cos=packed_position_cos,
+            position_sin=packed_position_sin,
+            q_weight_0=q_weight_und,
+            q_bias_0=q_bias_und,
+            k_weight_0=k_weight_und,
+            k_bias_0=k_bias_und,
+            v_weight_0=v_weight_und,
+            v_bias_0=v_bias_und,
+            q_norm_weight_0=self.q_norm.weight,
+            k_norm_weight_0=self.k_norm.weight,
+            q_weight_1=q_weight_gen,
+            q_bias_1=q_bias_gen,
+            k_weight_1=k_weight_gen,
+            k_bias_1=k_bias_gen,
+            v_weight_1=v_weight_gen,
+            v_bias_1=v_bias_gen,
+            q_norm_weight_1=self.q_norm_moe_gen.weight,
+            k_norm_weight_1=self.k_norm_moe_gen.weight,
+            head_dim=self.head_dim,
+            rms_norm_eps=self.config.rms_norm_eps,
+            # The SP pre-hook already pads the packed sequence and builds a
+            # BlockMask for that full padded length. Keep those padding rows
+            # through attention; the module post-hook removes them after the
+            # local output shards have been gathered.
+            unpadded_dim_size=packed_sequence.shape[0] * parallel_state.ulysses_size,
+            group=parallel_state.ulysses_group,
+            rms_norm=rms_norm_op,
+            rope=self.veomni_rope,
+        )
+        packed_attn_output, _ = attn_op(
+            self,
+            packed_query_states.transpose(0, 1).unsqueeze(0),
+            packed_key_states.transpose(0, 1).unsqueeze(0),
+            packed_value_states.transpose(0, 1).unsqueeze(0),
+            attention_mask,
+            dropout=0.0,
+            scaling=self.head_dim**-0.5,
+            skip_ulysses=True,
+        )
+        return self.veomni_async_ulysses_o(
+            hidden_states=packed_attn_output.squeeze(0),
+            route_0_indices=packed_und_token_indexes,
+            route_1_indices=packed_gen_token_indexes,
+            proj_weight_0=self.o_proj.weight,
+            proj_bias_0=self.o_proj.bias,
+            proj_weight_1=self.o_proj_moe_gen.weight,
+            proj_bias_1=self.o_proj_moe_gen.bias,
+            group=parallel_state.ulysses_group,
+        )
+
 
 class InferenceMixinAccelerated(InferenceMixin):
     """Packed CFG denoise for the FSDP/runtime MoT class.
@@ -614,6 +679,7 @@ class InferenceMixinAccelerated(InferenceMixin):
         generation_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Run one stacked CFG denoise forward across all active branches."""
         del kwargs
         tail, query = self._prepare_denoise_query(conversation_list, generation_kwargs)
         inputs = self._generation_state.preprocess_parallel_denoise_inputs(
@@ -638,10 +704,9 @@ class InferenceMixinAccelerated(InferenceMixin):
 class BagelQwen2MoTAccelerated(VeOmniMixin, InferenceMixinAccelerated, BagelQwen2MoTCore):
     _supports_flex_attn = True
     _supports_magi_attn = True
-    _export_hf_checkpoint_with_weight_conversions = True
     attention_cls = BagelQwen2MoTAttentionAccelerated
-    mlp_cls = Qwen2MLPAccelerated
-    rms_norm_cls = Qwen2RMSNormAccelerated
+    mlp_cls = PatchedQwen2MLP
+    rms_norm_cls = PatchedQwen2RMSNorm
 
     @staticmethod
     def _create_checkpoint_tensor_converter(

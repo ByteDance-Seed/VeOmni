@@ -21,7 +21,7 @@ fp32 affine scale), ``offset`` (offset 1, gemma-style fp32 scale), and
 registers an eager row plus optional CUDA / NPU adapters.
 """
 
-from ...platform import GpuKernelRequirement, NpuKernelRequirement
+from ...platform import GpuKernelRequirement, MluKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
 from .deepseek_v4 import eager as deepseek_v4_eager
 from .deepseek_v4 import liger_kernel as deepseek_v4_liger
@@ -38,6 +38,7 @@ from .unweighted import liger_kernel as unweighted_liger
 
 
 _GPU = GpuKernelRequirement()
+_MLU = MluKernelRequirement()
 
 
 register_op(
@@ -57,6 +58,18 @@ register_op(
     standard_liger.backward,
     description="Liger Kernel standard RMSNorm with Llama-style casting",
     requirement=_GPU,
+    requires=("liger_kernel",),
+    default=True,
+)
+
+register_op(
+    "rms_norm",
+    "standard",
+    "liger_kernel",
+    standard_liger.forward,
+    standard_liger.backward,
+    description="Liger Kernel standard RMSNorm with Llama-style casting",
+    requirement=_MLU,
     requires=("liger_kernel",),
     default=True,
 )
@@ -107,6 +120,18 @@ register_op(
 register_op(
     "rms_norm",
     "deepseek_v4",
+    "liger_kernel",
+    deepseek_v4_liger.forward,
+    deepseek_v4_liger.backward,
+    description="Liger Kernel DeepSeek-V4 RMSNorm with offset 0 and Gemma-style scaling",
+    requirement=_MLU,
+    requires=("liger_kernel",),
+    default=True,
+)
+
+register_op(
+    "rms_norm",
+    "deepseek_v4",
     "torch_npu",
     deepseek_v4_npu.forward,
     deepseek_v4_npu.backward,
@@ -139,6 +164,18 @@ register_op(
 register_op(
     "rms_norm",
     "offset",
+    "liger_kernel",
+    offset_liger.forward,
+    offset_liger.backward,
+    description="Liger Kernel RMSNorm with offset-1 weights and Gemma-style scaling",
+    requirement=_MLU,
+    requires=("liger_kernel",),
+    default=True,
+)
+
+register_op(
+    "rms_norm",
+    "offset",
     "torch_npu",
     offset_npu.forward,
     offset_npu.backward,
@@ -164,6 +201,18 @@ register_op(
     unweighted_liger.backward,
     description="Liger Kernel RMSNorm without an affine weight",
     requirement=_GPU,
+    requires=("liger_kernel",),
+    default=True,
+)
+
+register_op(
+    "rms_norm",
+    "unweighted",
+    "liger_kernel",
+    unweighted_liger.forward,
+    unweighted_liger.backward,
+    description="Liger Kernel RMSNorm without an affine weight",
+    requirement=_MLU,
     requires=("liger_kernel",),
     default=True,
 )

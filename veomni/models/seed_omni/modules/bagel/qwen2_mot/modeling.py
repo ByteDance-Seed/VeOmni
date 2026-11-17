@@ -7,10 +7,12 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.flex_attention import BlockMask
 from torch.nn.functional import scaled_dot_product_attention
-from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
+from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm, Qwen2RotaryEmbedding
 from transformers.utils import ModelOutput
 
+from veomni.ops import VeomniOp
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 from ....utils.conversation import ConversationItem
@@ -26,8 +28,11 @@ from ..sources import (
 )
 from .configuration import BagelQwen2MoTConfig
 from .generation_state import MotGenerationState
-from .masking import build_mot_sdpa_mask
+from .masking import build_mot_block_mask, build_mot_sdpa_mask
 from .processing import PackedConversation, preprocess_mot_inputs
+
+
+_FLEX_ATTN_IMPLEMENTATIONS = frozenset({"flex_attention", "veomni_flex_attention"})
 
 
 class InferenceMixin:
@@ -55,6 +60,7 @@ class InferenceMixin:
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
+        """Run one packed inference step through the MoT backbone and return hidden states and KV cache."""
         call_kwargs: Dict[str, Any] = {
             "packed_query_sequence": packed_query_sequence,
             "query_lens": query_lens,
@@ -90,35 +96,40 @@ class InferenceMixin:
         generation_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Prefill prompt caches or decode the next understanding token in the generation FSM."""
         del kwargs
         if conversation_list is None:
             raise ValueError("BAGEL Qwen2-MoT generate requires conversation_list.")
 
         generation_kwargs = generation_kwargs or {}
-        infer_mode = self._generation_state.update_infer_mode(generation_kwargs)
-        # Generation/edit rebuilds all CFG prompt caches. Understanding reuses
-        # the main cache and starts AR from the raw assistant BOS embedding.
-        if infer_mode == "gen":
+        tail = conversation_list[-1]
+        is_start_token = bagel_phase(tail) == BAGEL_START_TOKEN
+        # Prefill the full conversation_list (including the assistant start token
+        # on understanding requests). The first text_ar pass returns the prefilled
+        # start-token hidden state; subsequent AR steps decode the tail output item.
+        if self._generation_state.main.cache is None or tail.type != "output":
             hidden_states = self._prefill_prompt(conversation_list, generation_kwargs)
-        elif self._generation_state.main.cache is None:
-            tail = conversation_list[-1]
-            if tail.type != "output" or bagel_phase(tail) != BAGEL_START_TOKEN:
-                raise ValueError("BAGEL understanding prefill requires a tail assistant BOS embedding.")
-            self._prefill_prompt(conversation_list[:-1], generation_kwargs)
-            hidden_states = self._decode_next_token(conversation_list)
-        else:
-            hidden_states = self._decode_next_token(conversation_list)
+            if is_start_token:
+                if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+                    hidden_states = hidden_states.squeeze(0)
+                if hidden_states.dim() != 2:
+                    raise ValueError(
+                        f"BAGEL Qwen2-MoT expected packed hidden states, got {tuple(hidden_states.shape)}."
+                    )
+                tail.type = "output"
+                tail.value = hidden_states[-1:].contiguous()
+            return {"conversation_list": conversation_list}
 
-        if infer_mode != "gen":
-            if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
-                hidden_states = hidden_states.squeeze(0)
-            if hidden_states.dim() != 2:
-                raise ValueError(f"BAGEL Qwen2-MoT expected packed hidden states, got {tuple(hidden_states.shape)}.")
-            tail = conversation_list[-1]
-            if tail.type != "output":
-                raise ValueError(f"BAGEL understanding decode expects tail output item, got {tail.type!r}.")
-            tail.value = hidden_states[-1:].contiguous()
+        if is_start_token:
             tail.meta.pop(BAGEL_PHASE_KEY, None)
+            return {"conversation_list": conversation_list}
+
+        hidden_states = self._decode_next_token(conversation_list)
+        if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+            hidden_states = hidden_states.squeeze(0)
+        if hidden_states.dim() != 2:
+            raise ValueError(f"BAGEL Qwen2-MoT expected packed hidden states, got {tuple(hidden_states.shape)}.")
+        tail.value = hidden_states[-1:].contiguous()
         return {"conversation_list": conversation_list}
 
     def _prepare_denoise_query(
@@ -126,6 +137,7 @@ class InferenceMixin:
         conversation_list: list[ConversationItem] | None,
         generation_kwargs: dict[str, Any] | None,
     ) -> tuple[ConversationItem, torch.Tensor]:
+        """Validate CFG parameters and extract the tail ``flow_query`` tensor."""
         if conversation_list is None:
             raise ValueError("BAGEL Qwen2-MoT denoise_branch requires conversation_list.")
 
@@ -155,6 +167,7 @@ class InferenceMixin:
         generation_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Run serial CFG denoise forwards over active branches and write ``flow_hidden``."""
         del kwargs
         tail, query = self._prepare_denoise_query(conversation_list, generation_kwargs)
 
@@ -186,6 +199,7 @@ class InferenceMixin:
         generation_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        """Strip marker rows from ``flow_velocity`` and apply CFG combination."""
         del kwargs
         if conversation_list is None:
             raise ValueError("BAGEL Qwen2-MoT collect_velocity requires conversation_list.")
@@ -220,6 +234,7 @@ class InferenceMixin:
         conversation_list: list[ConversationItem],
         generation_kwargs: dict[str, Any],
     ) -> torch.Tensor:
+        """Pack and prefill the main prompt and optional CFG branch caches."""
         main_packed = preprocess_mot_inputs(
             [conversation_list],
             device=self.device,
@@ -336,6 +351,7 @@ class InferenceMixin:
         return self.forward_inference(**call_kwargs)
 
     def _decode_next_token(self, conversation_list: list[ConversationItem]) -> torch.Tensor:
+        """Run one AR decode step against the cached ``main`` prompt context."""
         # AR has one query token and an existing contiguous cache, so the
         # dedicated FlashAttention path is preferable to rebuilding a packed mask.
         main_context = self._generation_state.main
@@ -380,6 +396,7 @@ class InferenceMixin:
         return outputs["hidden_states"]
 
     def _cfg_text_prefix_slice(self, packed: PackedConversation) -> tuple[slice, torch.Tensor]:
+        """Compute the ``main`` cache prefix slice and next position ID for text CFG."""
         # Moving across an image keeps the image in text-CFG conditioning;
         # encountering text moves the boundary to just before that text span.
         prefix_end = 0
@@ -395,6 +412,7 @@ class InferenceMixin:
         return slice(0, prefix_end), next_position_id
 
     def _slice_prefill_cache(self, packed_cache: Any, rows: slice, *, clone: bool) -> Any:
+        """Extract a row slice from ``packed_cache`` into a standalone ``NaiveCache``."""
         # main/cfg_img outlive the temporary packed cache and own their storage.
         # cfg_text is an immutable prefix of main, so it may use cheap views.
         cache = self._new_empty_cache()
@@ -408,6 +426,7 @@ class InferenceMixin:
         return cache
 
     def _next_position_id(self, position_ids: torch.Tensor) -> torch.Tensor:
+        """Return ``max(position_ids) + 1`` or ``0`` when ``position_ids`` is empty."""
         if int(position_ids.numel()) == 0:
             return torch.zeros(1, device=self.device, dtype=torch.long)
         return position_ids.max().reshape(1).to(device=self.device, dtype=torch.long) + 1
@@ -429,8 +448,7 @@ class BagelQwen2MoTCore(PretrainedOmniModule):
     _no_split_modules = ["BagelQwen2MoTDecoderLayer"]
     supports_gradient_checkpointing = True
     _supports_sdpa = True
-    _supports_flex_attn = False
-    _export_hf_checkpoint_with_weight_conversions = False
+    _supports_flex_attn = True
 
     def __init__(self, config: BagelQwen2MoTConfig):
         super().__init__(config)
@@ -625,6 +643,7 @@ def _sdpa_packed_attention(
 
 
 def _fold_zero_anchors(target: torch.Tensor, *anchors: torch.Tensor) -> torch.Tensor:
+    """Add ``0 * sum(anchor)`` to ``target`` so empty-route parameters remain in the autograd graph."""
     # When a packed batch has no generation tokens, the MoT "gen" expert weights still
     # run on an empty slice and produce zero-sized outputs. Folding ``sum() * 0.0`` of
     # those outputs into ``target`` keeps the gen-expert parameters in the autograd graph
@@ -664,6 +683,7 @@ def _scatter_moe(
 def _check_packed_inference_mode(
     mode: str,
 ) -> bool:
+    """Validate ``mode`` (``'und'`` or ``'gen'``) and return ``True`` for ``'gen'``."""
     if mode == "und":
         return False
     if mode == "gen":
@@ -671,65 +691,21 @@ def _check_packed_inference_mode(
     raise ValueError(f"Unsupported BAGEL Qwen2 MoT inference mode: {mode!r}")
 
 
-class BagelQwen2RotaryEmbedding(nn.Module):
-    """Official-compatible Qwen2 RoPE for BAGEL parity."""
-
-    def __init__(self, config: BagelQwen2MoTConfig, device: Optional[torch.device] = None):
-        super().__init__()
-        self.config = config
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
-        self.rope_type = "default"
-        self.attention_scaling = 1.0
-        inv_freq, _ = self.compute_default_rope_parameters(config, device)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+class BagelQwen2RotaryEmbedding(Qwen2RotaryEmbedding):
+    """Qwen2 RoPE preserving fp32 inverse frequencies across dtype casts and meta materialization."""
 
     def _apply(self, fn: Any, recurse: bool = True) -> nn.Module:
-        # Snapshot the true fp32 table before ``fn`` can quantize it (``.to(bfloat16)``).
-        # Casting first and then ``.float()`` keeps bf16 rounding, which is not official
-        # mixed-precision train (buffers stay fp32) and is not bitwise with a fresh table.
-        inv_freq = self.inv_freq.detach().to(dtype=torch.float32).clone()
-        original_inv_freq = self.original_inv_freq.detach().to(dtype=torch.float32).clone()
+        # Rebuild the true fp32 table after ``fn`` so ``.to(bfloat16)`` does not
+        # quantize rotary buffers and ``to_empty(device=...)`` from ``meta``
+        # materializes valid fp32 inverse frequencies on the target device.
         module = super()._apply(fn, recurse=recurse)
         device = self.inv_freq.device
-        self.inv_freq = inv_freq.to(device=device)
-        self.original_inv_freq = original_inv_freq.to(device=device)
+        if device.type == "meta":
+            return module
+        inv_freq, _ = self.compute_default_rope_parameters(self.config, device)
+        self.inv_freq = inv_freq
+        self.original_inv_freq = inv_freq.clone()
         return module
-
-    @staticmethod
-    def compute_default_rope_parameters(
-        config: BagelQwen2MoTConfig,
-        device: Optional[torch.device] = None,
-        seq_len: Optional[int] = None,
-    ) -> tuple[torch.Tensor, float]:
-        del seq_len
-        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
-        dim = int(head_dim * partial_rotary_factor)
-        base = getattr(config, "rope_theta", None)
-        if base is None:
-            base = config.rope_parameters["rope_theta"]
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
-        )
-        return inv_freq, 1.0
-
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        inv_freq = self.inv_freq.to(device=x.device, dtype=torch.float32)
-        inv_freq_expanded = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
-        device_type = x.device.type
-        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()
-            sin = emb.sin()
-        cos = cos * self.attention_scaling
-        sin = sin * self.attention_scaling
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 def _build_rms_norm(
@@ -737,6 +713,7 @@ def _build_rms_norm(
     hidden_size: int,
     config: BagelQwen2MoTConfig,
 ) -> Qwen2RMSNorm:
+    """Instantiate ``rms_norm_cls``, forwarding ``config`` when the subclass accepts it."""
     try:
         return rms_norm_cls(hidden_size, eps=config.rms_norm_eps, config=config)
     except TypeError:
@@ -770,6 +747,17 @@ class BagelQwen2MoTAttention(nn.Module):
         self.o_proj_moe_gen = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm_moe_gen = _build_rms_norm(rms_norm_cls, self.head_dim, config)
         self.k_norm_moe_gen = _build_rms_norm(rms_norm_cls, self.head_dim, config)
+        attn_impl = (
+            config.ops_config.attn_implementation if "attn_implementation" in config.ops_implementation else "sdpa"
+        )
+        self.veomni_attn: VeomniOp | None = None
+        if attn_impl in _FLEX_ATTN_IMPLEMENTATIONS:
+            try:
+                self.veomni_attn = VeomniOp("attention", "standard", "veomni_flex_attention")
+            except RuntimeError:
+                self.veomni_attn = None
+                attn_impl = "sdpa"
+        self.veomni_attn_impl = attn_impl
 
     def _build_qkv_proj(self) -> None:
         self.q_proj = nn.Linear(self.hidden_size, self.query_size, bias=True)
@@ -786,6 +774,7 @@ class BagelQwen2MoTAttention(nn.Module):
         is_gen: bool,
         split: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project ``hidden`` through the und or gen Q/K/V linear layers."""
         query_proj, key_proj, value_proj = (
             (self.q_proj_moe_gen, self.k_proj_moe_gen, self.v_proj_moe_gen)
             if is_gen
@@ -803,8 +792,9 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_attention_metadata: torch.Tensor,
         *,
         attn_implementation: str | None = None,
-    ) -> torch.Tensor:
-        del attn_implementation
+    ) -> torch.Tensor | BlockMask:
+        if attn_implementation in _FLEX_ATTN_IMPLEMENTATIONS:
+            return build_mot_block_mask(packed_attention_metadata)
         return build_mot_sdpa_mask(packed_attention_metadata)
 
     def apply_rotary_pos_emb(
@@ -867,8 +857,22 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_query_states: torch.Tensor,
         packed_key_states: torch.Tensor,
         packed_value_states: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor | BlockMask,
     ) -> torch.Tensor:
+        if isinstance(attention_mask, BlockMask):
+            attn_op = self.veomni_attn or VeomniOp("attention", "standard", "veomni_flex_attention")
+            packed_attn_output, _ = attn_op(
+                self,
+                packed_query_states.transpose(0, 1).unsqueeze(0),
+                packed_key_states.transpose(0, 1).unsqueeze(0),
+                packed_value_states.transpose(0, 1).unsqueeze(0),
+                attention_mask,
+                dropout=0.0,
+                scaling=self.head_dim**-0.5,
+                skip_ulysses=True,
+            )
+            return packed_attn_output.squeeze(0).reshape(-1, self.num_heads * self.head_dim)
+
         packed_attn_output = _sdpa_packed_attention(
             packed_query_states,
             packed_key_states,
@@ -941,7 +945,6 @@ class BagelQwen2MoTAttention(nn.Module):
             packed_key_states = self.k_norm(packed_key_states)
             return packed_query_states, packed_key_states, packed_value_states
 
-        packed_query_sequence = packed_query_sequence.to(torch.bfloat16)
         packed_qkv_states = packed_query_sequence.new_zeros(
             (packed_query_sequence.shape[0], sum(self.qkv_split_sizes))
         )
@@ -954,16 +957,18 @@ class BagelQwen2MoTAttention(nn.Module):
         packed_query_states, packed_key_states, packed_value_states = packed_qkv_states.split(
             self.qkv_split_sizes, dim=-1
         )
-        packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim).to(torch.float32)
-        packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim).to(torch.float32)
+        packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
+        packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
         packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
-        packed_query_states[packed_text_indexes] = self.q_norm(packed_query_states[packed_text_indexes])
-        packed_query_states[packed_vae_token_indexes] = self.q_norm_moe_gen(
+        normed_query_states = packed_query_states.new_zeros(packed_query_states.shape)
+        normed_query_states[packed_text_indexes] = self.q_norm(packed_query_states[packed_text_indexes])
+        normed_query_states[packed_vae_token_indexes] = self.q_norm_moe_gen(
             packed_query_states[packed_vae_token_indexes]
         )
-        packed_key_states[packed_text_indexes] = self.k_norm(packed_key_states[packed_text_indexes])
-        packed_key_states[packed_vae_token_indexes] = self.k_norm_moe_gen(packed_key_states[packed_vae_token_indexes])
-        return packed_query_states, packed_key_states, packed_value_states
+        normed_key_states = packed_key_states.new_zeros(packed_key_states.shape)
+        normed_key_states[packed_text_indexes] = self.k_norm(packed_key_states[packed_text_indexes])
+        normed_key_states[packed_vae_token_indexes] = self.k_norm_moe_gen(packed_key_states[packed_vae_token_indexes])
+        return normed_query_states, normed_key_states, packed_value_states
 
     def merge_kv_cache(
         self,
@@ -1002,7 +1007,7 @@ class BagelQwen2MoTAttention(nn.Module):
         merged_key_states: torch.Tensor,
         merged_value_states: torch.Tensor,
         *,
-        attention_mask: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor | BlockMask],
         is_causal: bool,
         cu_seq_lens_q: torch.Tensor,
         cu_seq_lens_k: torch.Tensor,
@@ -1010,6 +1015,21 @@ class BagelQwen2MoTAttention(nn.Module):
         max_length_k: int,
     ) -> torch.Tensor:
         del max_length_q, max_length_k
+
+        if isinstance(attention_mask, BlockMask):
+            attn_op = self.veomni_attn or VeomniOp("attention", "standard", "veomni_flex_attention")
+            packed_attn_output, _ = attn_op(
+                self,
+                packed_query_states.transpose(0, 1).unsqueeze(0),
+                merged_key_states.transpose(0, 1).unsqueeze(0),
+                merged_value_states.transpose(0, 1).unsqueeze(0),
+                attention_mask,
+                dropout=0.0,
+                scaling=self.head_dim**-0.5,
+                skip_ulysses=True,
+            )
+            return packed_attn_output.squeeze(0)
+
         return _sdpa_packed_attention(
             packed_query_states,
             merged_key_states,
@@ -1035,11 +1055,10 @@ class BagelQwen2MoTAttention(nn.Module):
         if not is_gen:
             return self.o_proj(packed_attn_output)
 
-        packed_attn_output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
-        packed_attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(
-            packed_attn_output[packed_vae_token_indexes]
-        )
-        return packed_attn_output
+        output = packed_attn_output.new_zeros(packed_attn_output.shape)
+        output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
+        output[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
+        return output
 
     def forward_packed_inference(
         self,
@@ -1064,6 +1083,7 @@ class BagelQwen2MoTAttention(nn.Module):
         total_key_value_tokens: int,
     ) -> tuple[torch.Tensor, Optional[NaiveCache]]:
         is_gen = _check_packed_inference_mode(mode)
+        compute_dtype = packed_query_sequence.dtype
         packed_query_states, packed_key_states, packed_value_states = self.project_qkv_inference(
             packed_query_sequence,
             is_gen=is_gen,
@@ -1080,9 +1100,9 @@ class BagelQwen2MoTAttention(nn.Module):
             unsqueeze_dim=1,
         )
 
-        packed_query_states = packed_query_states.to(torch.bfloat16)
-        packed_key_states = packed_key_states.to(torch.bfloat16)
-        packed_value_states = packed_value_states.to(torch.bfloat16)
+        packed_query_states = packed_query_states.to(compute_dtype)
+        packed_key_states = packed_key_states.to(compute_dtype)
+        packed_value_states = packed_value_states.to(compute_dtype)
 
         merged_key_states, merged_value_states = self.merge_kv_cache(
             packed_key_states,
@@ -1105,7 +1125,7 @@ class BagelQwen2MoTAttention(nn.Module):
             max_length_k=max_length_k,
         )
         packed_attn_output = self.project_o_inference(
-            packed_attn_output,
+            packed_attn_output.to(compute_dtype),
             is_gen=is_gen,
             packed_text_indexes=packed_text_indexes,
             packed_vae_token_indexes=packed_vae_token_indexes,
@@ -1232,13 +1252,11 @@ class BagelQwen2MoTDecoderLayer(nn.Module):
         if not is_gen:
             return self.mlp(self.post_attention_layernorm(packed_query_sequence))
 
-        packed_text_query_sequence = self.post_attention_layernorm(packed_query_sequence[packed_text_indexes]).to(
-            torch.bfloat16
-        )
+        packed_text_query_sequence = self.post_attention_layernorm(packed_query_sequence[packed_text_indexes])
         packed_vae_query_sequence = self.post_attention_layernorm_moe_gen(
             packed_query_sequence[packed_vae_token_indexes]
-        ).to(torch.bfloat16)
-        mlp_output = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
+        )
+        mlp_output = torch.zeros_like(packed_query_sequence)
         mlp_output[packed_text_indexes] = self.mlp(packed_text_query_sequence)
         mlp_output[packed_vae_token_indexes] = self.mlp_moe_gen(packed_vae_query_sequence)
         return mlp_output
@@ -1342,6 +1360,14 @@ class BagelQwen2MoTBackbone(nn.Module):
         self.use_moe = "Mo" in config.layer_module
         self.attention_cls = attention_cls
 
+    def _bound_attn_implementation(self) -> str | None:
+        """Return the attention implementation bound onto the decoder layers at initialization."""
+        if len(self.layers) > 0:
+            bound = getattr(self.layers[0].self_attn, "veomni_attn_impl", None)
+            if bound is not None:
+                return bound
+        return self.config._attn_implementation
+
     def _build_inference_attention_mask(
         self,
         packed_query_sequence: torch.Tensor,
@@ -1363,7 +1389,7 @@ class BagelQwen2MoTBackbone(nn.Module):
             )
         return self.attention_cls.build_attention_mask(
             packed_attention_metadata.to(device=packed_query_sequence.device),
-            attn_implementation=self.config._attn_implementation,
+            attn_implementation=self._bound_attn_implementation(),
         )
 
     def _apply_inference_final_norm(
@@ -1391,9 +1417,10 @@ class BagelQwen2MoTBackbone(nn.Module):
         packed_und_token_indexes: Optional[torch.Tensor] = None,
         packed_gen_token_indexes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Run packed training forward across all MoT decoder layers and final expert norms."""
         attention_mask = self.attention_cls.build_attention_mask(
             packed_attention_metadata,
-            attn_implementation=self.config._attn_implementation,
+            attn_implementation=self._bound_attn_implementation(),
         )
         cos, sin = self.rotary_emb(packed_sequence, packed_position_ids.unsqueeze(0))
         packed_position_cos = cos.squeeze(0)
@@ -1455,6 +1482,7 @@ class BagelQwen2MoTBackbone(nn.Module):
         packed_vae_token_indexes: Optional[torch.Tensor] = None,
         packed_text_indexes: Optional[torch.Tensor] = None,
     ) -> BaseNavitOutputWithPast:
+        """Execute all MoT decoder layers for packed inference prefill, decode, or denoise."""
         is_gen = _check_packed_inference_mode(mode)
         query_device = packed_query_sequence.device
         packed_query_indexes = packed_query_indexes.to(device=query_device)

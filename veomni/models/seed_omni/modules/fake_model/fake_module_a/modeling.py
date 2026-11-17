@@ -27,11 +27,10 @@ class FakeModuleA(PretrainedOmniModule):
     base_model_prefix = "fake_module_a"
     supports_gradient_checkpointing = False
     _no_split_modules = ["FakeModuleA"]
-    # No attention here at all, so every implementation is equally vacuous. The
-    # flag is what opens HF's `_sdpa_can_dispatch` gate, without which the omni
-    # load path cannot be exercised end to end with anything but `eager` --
-    # `attn_implementation` would raise before reaching this module's __init__.
-    _supports_sdpa = True
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # This fixture module only projects hidden states and executes no attention.
+        return attn_implementation
 
     def __init__(self, config: FakeModuleAConfig, **kwargs):
         super().__init__(config, **kwargs)

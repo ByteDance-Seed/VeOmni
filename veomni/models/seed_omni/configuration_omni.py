@@ -30,7 +30,8 @@ from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Collection, Dict, List, Optional, Tuple, Union
 
 import yaml
-from transformers import PretrainedConfig
+
+from ..configuration_base import VeOmniPretrainedConfig
 
 
 if TYPE_CHECKING:
@@ -67,11 +68,10 @@ def select_graph(
     empty_hint: str = "",
     unknown_hint: str = "scenario",
 ) -> Any:
-    """Pick the active graph out of a scenario map; unset ``scenario`` takes the first."""
+    """Pick the active graph out of a scenario map."""
     if not graphs:
         raise ValueError(f"No graph scenarios are declared. {empty_hint}".strip())
-    if scenario is None:
-        return next(iter(graphs.values()))
+    assert scenario is not None, f"`{unknown_hint}` must be normalized before calling `select_graph`."
     if scenario not in graphs:
         known = ", ".join(graphs)
         raise KeyError(f"Unknown {unknown_hint} {scenario!r}; expected one of: {known}.")
@@ -130,6 +130,8 @@ def _split_omni_kwargs(
     caller meant for HF (``torch_dtype``, ``device_map``, …). A block states
     choices rather than replacing the layer it lands on.
     """
+    from ...arguments import OpsImplementationConfig
+
     ops_fields = _ops_field_names()
     root_ops: Dict[str, Any] = {}
     per_module: Dict[str, Dict[str, Any]] = {}
@@ -137,6 +139,10 @@ def _split_omni_kwargs(
 
     def ops_selection(key: str, field: str, value: Any) -> Dict[str, Any]:
         if field == "ops_implementation":
+            if value is None:
+                return {}
+            if isinstance(value, OpsImplementationConfig):
+                value = value.to_dict()
             if not isinstance(value, dict):
                 raise ValueError(
                     f"Load kwarg {key!r} must be a dict of kernel selections, got {type(value).__name__}."
@@ -181,7 +187,7 @@ def _split_omni_kwargs(
     return root_ops, per_module, remaining
 
 
-class OmniConfig(PretrainedConfig):
+class OmniConfig(VeOmniPretrainedConfig):
     """Checkpoint config for :class:`~veomni.models.seed_omni.modeling_omni.OmniModel`.
 
     ``_module_entries`` is the dict of checkpoint entries. A loaded module config is
@@ -213,11 +219,12 @@ class OmniConfig(PretrainedConfig):
         check_infer_type_names(generation_graphs or {})
         self.train_type = train_type
         self.infer_type = infer_type
+        self._resolve_graph_types()
         self.generation_kwargs = generation_kwargs
         # Model-level kernels: this composed model's defaults for every module
         # it holds. Sparse — only what was explicitly selected. A loaded module
         # config ranks its own file under this, then under the module entry.
-        self.ops_implementation: Dict[str, Any] = dict(ops_implementation or {})
+
         # Each module's own typed config, built by :meth:`from_pretrained`.
         # In-memory only: the modules are described by their own files, and a
         # copy here would be a second place to keep in sync. Dropped by
@@ -229,7 +236,7 @@ class OmniConfig(PretrainedConfig):
         # :attr:`_module_configs`: a saved config describes its own files.
         self._hf_source: Optional[HFSource] = None
 
-        super().__init__(**kwargs)
+        super().__init__(ops_implementation=ops_implementation, **kwargs)
 
     @property
     def train_types(self) -> List[str]:
@@ -410,7 +417,7 @@ class OmniConfig(PretrainedConfig):
         # Out before transformers sees them: it would turn each one into a
         # config attribute. Judged against this config's entries once it exists.
         omni_kwargs = pop_omni_kwargs(kwargs)
-        config = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        config = super().from_pretrained(pretrained_model_name_or_path, *model_args, _validate_ops=False, **kwargs)
         root = config.checkpoint_root or str(pretrained_model_name_or_path)
         config.apply_omni_kwargs(omni_kwargs)
         config.load_checkpoint_sidecars(root)
@@ -447,6 +454,17 @@ class OmniConfig(PretrainedConfig):
                 base_ops_implementation=self.ops_implementation,
             )
 
+    def _resolve_graph_types(self) -> None:
+        """Bind the active scenario in each graph map once the map is final."""
+        for graphs, attr in ((self.training_graphs, "train_type"), (self.generation_graphs, "infer_type")):
+            if not graphs:
+                continue
+            selected = getattr(self, attr)
+            if selected is None:
+                setattr(self, attr, next(iter(graphs)))
+            elif selected not in graphs:
+                raise KeyError(f"Unknown {attr} {selected!r}; expected one of: {', '.join(graphs)}.")
+
     def _load_graphs_from_pretrained(self, checkpoint_root: Union[str, os.PathLike]) -> None:
         """Load ``training_graphs`` and ``generation_graphs`` from YAML sidecars when present.
 
@@ -462,6 +480,7 @@ class OmniConfig(PretrainedConfig):
         if not self.generation_graphs:
             self.generation_graphs = self._read_graph_sidecar(root, DEFAULT_GENERATION_GRAPH_FILE, dict)
             check_infer_type_names(self.generation_graphs)
+        self._resolve_graph_types()
 
     @classmethod
     def _read_graph_sidecar(cls, root: str, filename: str, payload_type: type) -> Dict:

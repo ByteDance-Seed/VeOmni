@@ -53,16 +53,15 @@ class JanusTextEncoder(TextEncoder):
             inputs_embeds = self.encode(input_ids)["inputs_embeds"]
 
             tail.value = inputs_embeds
+            # ``maybe_merge_outputs`` folds this row into the previous one and
+            # drops it, so every write below has to go through the live tail.
             maybe_merge_outputs(conversation_list)
 
-            if output_token_id == self._chat_template.boi_token_id:
-                self._maybe_arm_cfg_for_image_gen(conversation_list, generation_kwargs, outputs)
-                outputs[FSM_SIGNAL_KEY] = SIGNAL_START_IMAGE_GEN
-            elif output_token_id == self._chat_template.eos_token_id:
+            if output_token_id == self._chat_template.eos_token_id:
                 outputs[FSM_SIGNAL_KEY] = SIGNAL_TEXT_DONE
-
-            if FSM_SIGNAL_KEY in outputs and outputs[FSM_SIGNAL_KEY] in (SIGNAL_TEXT_DONE, SIGNAL_START_IMAGE_GEN):
-                outputs["generated"] = self._flush_text_generated(conversation_list)
+                generated = self._flush_text_generated(conversation_list)
+                if generated:
+                    outputs["generated"] = generated
             return outputs
 
         raise ValueError(f"Invalid type: {tail.type}")
@@ -98,8 +97,15 @@ class JanusTextEncoder(TextEncoder):
         conversation_list: Optional[List[ConversationItem]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        """Replace the finished image span's tail with ``<eoi>``.
+
+        ``infer_gen`` ends here: the image span lives in the KV cache, so this step
+        only produces the embedding the next state starts from.
+        """
         del kwargs
-        assert conversation_list[-1].type == "output" and conversation_list[-1].value.shape[-2] == 1
+        tail = conversation_list[-1]
+        if tail.type != "output":
+            raise ValueError(f"emit_image_end expects an output tail; got {tail.type!r}.")
         conversation_list.pop()
         output_token_id = self._chat_template.eoi_token_id
         input_ids = self._token_id_tensor(output_token_id)
@@ -120,17 +126,30 @@ class JanusTextEncoder(TextEncoder):
         self,
         conversation_list: Optional[List[ConversationItem]],
         generation_kwargs: Optional[Dict[str, Any]],
-    ) -> None:
-        cfg_w = generation_kwargs.get("guidance_scale")
+    ) -> Optional[torch.Tensor]:
+        """Unconditional embeds to carry into the image span, or ``None``.
+
+        Classifier-free guidance only applies to image generation, so this is
+        called at the two points that open a span (``emit_image_start`` and the
+        sampled-``<boi>`` path in ``generate``). The caller stores the result on
+        the output item's ``meta``.
+        """
+        cfg_w = (generation_kwargs or {}).get("guidance_scale")
         if cfg_w is None or float(cfg_w) <= 1.0:
-            return
-        uncond = self._build_cfg_uncond_embeds(conversation_list)
-        return uncond
+            return None
+        return self._build_cfg_uncond_embeds(conversation_list)
 
     def _build_cfg_uncond_embeds(
         self,
         conversation_list: List[ConversationItem],
     ) -> Optional[torch.Tensor]:
+        """Unconditional prompt embeds, padded to the conditional prefix length.
+
+        The conditional cache already holds every position generated so far; the
+        unconditional one starts fresh. The two CFG branches must therefore enter
+        the image span at the *same* sequence position, so the uncond side is
+        padded out to the conditional prompt length with the pad token.
+        """
         bos_id = self._chat_template.bos_token_id
         pad_id = self._chat_template.pad_token_id
 
@@ -142,6 +161,21 @@ class JanusTextEncoder(TextEncoder):
             if part.type == "output":
                 break
             input_ids.extend([pad_id] * len(part.value))
+
+        # Positions the conditional side has already attended to *before* the token
+        # this span starts with. The sampled ``<boi>`` is already merged into the
+        # tail row at arming time, but the backbone feeds it as the span's first
+        # input — counting it here would put the unconditional branch one position
+        # ahead of the conditional one. ``emit_image_start`` pops the priming row
+        # before arming, so there the subtraction is a no-op.
+        generated = sum(
+            int(part.value.size(-2)) if part.value is not None and hasattr(part.value, "size") else 0
+            for part in conversation_list
+            if part.type == "output"
+        )
+        generated = max(generated - 1, 0)
+        if generated:
+            input_ids.extend([pad_id] * generated)
 
         uncond_inputs_embeds = self.embed_tokens(torch.tensor(input_ids, dtype=torch.long, device=self.device))
         return uncond_inputs_embeds

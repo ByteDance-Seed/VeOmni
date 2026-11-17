@@ -8,8 +8,9 @@ import os
 from dataclasses import dataclass, replace
 
 import torch
-from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
+
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 
 # isort: off
@@ -227,15 +228,19 @@ class _LTXModelInitShim(LTXModel):
 class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
     config_class = LTXVideoTransformerModelConfig
     supports_gradient_checkpointing = True
+    _supports_sdpa = True
+    _supports_flash_attn = True
     _no_split_modules = ["BasicAVTransformerBlock"]
     _checkpoint_conversion_mapping = {
         "^model\\.diffusion_model\\.": "",
     }
 
     def __init__(self, config: LTXVideoTransformerModelConfig, **kwargs):
+        attn_implementation = kwargs.pop("attn_implementation", None)
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
         PreTrainedModel.__init__(self, config, **kwargs)
         del self._internal_dict
-        kwargs.pop("attn_implementation", None)
         kwargs.pop("torch_dtype", None)
 
         inner_dim = config.num_attention_heads * config.attention_head_dim
@@ -283,6 +288,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
             caption_projection=caption_projection,
             audio_caption_projection=audio_caption_projection,
             cross_attention_adaln=config.cross_attention_adaln,
+            config=config,
         )
         self.config: LTXVideoTransformerModelConfig = config
         self.config.tie_word_embeddings = False
@@ -473,7 +479,7 @@ class LTXVideoTransformerModel(PreTrainedModel, _LTXModelInitShim):
     def save_pretrained(self, path, **kwargs):
         hf_config = copy.deepcopy(self.config)
 
-        config_dict = self.config.to_diffuser_dict()
+        config_dict = {**self.config.to_diffuser_dict(), "ops_implementation": dict(self.config.ops_implementation)}
         config_dict["_class_name"] = "LTXVideoTransformerModel"
         config_dict["_diffusers_version"] = diffusers_version
 

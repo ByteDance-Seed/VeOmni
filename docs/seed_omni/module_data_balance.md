@@ -20,8 +20,8 @@ exchange does not implement a second bin-packer or square those costs again.
 Qwen3-VL declares frame-wise quadratic attention costs
 `t * (h * w / merge_area) ** 2`, accumulated with exponent one. Treating a
 video clip as a single quadratic sequence would overestimate its cost by `t`.
-Its meter likewise stashes full frame lengths, while output restoration uses
-the clip's total merged-token length.
+Output restoration uses the clip's total merged-token length. The vision
+meter records merged tokens per real item before routing.
 
 ## Strategy and scope
 
@@ -56,7 +56,7 @@ Schemas and metadata errors are checked collectively before payload exchange.
 Both `forward` and `pack_encode` use the same declaration:
 
 1. Read worker-built grids; retain real and dummy items alike. Stash full
-   merged-token lengths in the meter before routing or slicing.
+   merged-token lengths for real items in the meter before routing or slicing.
 2. Balance packed patches and grid rows across the module-local DP group.
 3. Rebuild ViT metadata and recompute the post-balance own length; pad/slice SP.
 4. Execute one ViT forward; gather and de-pad SP outputs.

@@ -101,13 +101,7 @@ def read_model_type(model_path: str) -> str:
     # ``KeyError``) on miss, so the default ``in`` test on a MutableMapping
     # subclass would mis-route the exception.  Use ``valid_keys()`` to
     # decide registration explicitly.
-    config_keys = set(OMNI_CONFIG_REGISTRY.valid_keys())
     model_keys = set(OMNI_MODEL_REGISTRY.valid_keys())
-    if model_type in config_keys:
-        # Validate the config can be re-read by the registered subclass so
-        # downstream `from_pretrained` doesn't hit a surprise schema gap.
-        cfg_cls = OMNI_CONFIG_REGISTRY[model_type]()
-        cfg_cls.from_pretrained(model_path)
     if model_type not in model_keys:
         raise KeyError(
             f"Module model_type {model_type!r} (from {model_path}) is not registered in "
@@ -116,11 +110,10 @@ def read_model_type(model_path: str) -> str:
     return model_type
 
 
-# Side-effect only: attach @register factories under bagel/, base/, janus/, qwen3/,
-# qwen3_moe/, qwen3vl/, text_encoder/, fake_model/. Imported after ``read_hf_model_type``
-# so the convert_registry ↔ modules cycle resolves: each family's ``convert_model``
-# imports ``convert_registry``, whose ``convert_checkpoint`` reads
-# ``read_hf_model_type`` back from this module.
+# Side-effect only: attach @register factories under bagel/, base/, fake_model/, janus/, qwen3/,
+# qwen3_moe/, qwen3vl/, text_encoder/. Imported after ``read_hf_model_type`` so the convert_registry
+# ↔ modules cycle resolves: each family's ``convert_model`` imports ``convert_registry``, whose
+# ``convert_checkpoint`` reads ``read_hf_model_type`` back from this module.
 from . import bagel, base, fake_model, janus, qwen3, qwen3_moe, qwen3vl, text_encoder  # noqa: F401  E402
 
 

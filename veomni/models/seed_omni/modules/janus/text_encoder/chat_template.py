@@ -96,6 +96,9 @@ class JanusChatTemplate(TextEncoderChatTemplate):
         prev_was_user_image = (
             False  # True after a user image; prepend \n to the next user text (HF Jinja same-turn layout).
         )
+        # Whether the assistant turn just closed ended on a generated image, which
+        # decides if the EOS terminating it is supervised (see the two EOS sites).
+        prev_turn_ended_on_image = False
         for item in sample:
             if item.is_dummy:
                 dummy_parts.append(item)
@@ -103,6 +106,20 @@ class JanusChatTemplate(TextEncoderChatTemplate):
             role = item.role
             if role != prev_role:
                 if role == "user":
+                    if prev_role == "assistant":
+                        # Close the preceding assistant turn before the next user
+                        # one: Janus' wire format is ``...<|Assistant|>:answer</s>
+                        # <|User|>: next``. Without this the two answers run
+                        # together and only the sample-final EOS is supervised, so
+                        # the model never learns the intermediate stop token. A turn
+                        # that ended on a generated image leaves its EOS unscored,
+                        # exactly as the sample-final one does below.
+                        eos_loss_mask = 0 if prev_turn_ended_on_image else None
+                        out.append(
+                            self._build_conversation_item(
+                                "text", self.chat_markers.eos_token, "assistant", loss_mask=eos_loss_mask
+                            )
+                        )
                     out.append(self._build_conversation_item("text", self.chat_markers.user_prefix, "user"))
                 elif role == "assistant":
                     out.append(
@@ -115,6 +132,8 @@ class JanusChatTemplate(TextEncoderChatTemplate):
                     )
                 prev_role = role
                 prev_was_user_image = False
+                if role == "assistant":
+                    prev_turn_ended_on_image = False
 
             if item.type == "text":
                 text = str(item.value)
@@ -122,6 +141,8 @@ class JanusChatTemplate(TextEncoderChatTemplate):
                     text = "\n" + text
                 out.append(self._build_conversation_item("text", text, role))
                 prev_was_user_image = False
+                if role == "assistant":
+                    prev_turn_ended_on_image = False
             elif item.type == "image":
                 # ``<boi>`` stays out of the text CE: Janus was never trained to emit
                 # it (upstream VeOmni masks ``image_start_id`` for the same reason), so
@@ -132,6 +153,8 @@ class JanusChatTemplate(TextEncoderChatTemplate):
                 out.append(item)  # media row passed through verbatim (keeps value/role/meta)
                 out.append(self._build_conversation_item("text", self.chat_markers.eoi_token, role))
                 prev_was_user_image = role == "user"
+                if role == "assistant":
+                    prev_turn_ended_on_image = True
             else:
                 raise ValueError(f"Unsupported part type: {item.type}")
         if prev_role == "assistant":

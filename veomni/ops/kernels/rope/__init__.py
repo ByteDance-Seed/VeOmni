@@ -22,7 +22,7 @@ multiply by freqs). Each variant registers an eager row plus optional CUDA /
 NPU adapters. ``full`` and ``partial`` also expose ``liger_kernel``.
 """
 
-from ...platform import GpuKernelRequirement, NpuKernelRequirement
+from ...platform import GpuKernelRequirement, MluKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
 from .deepseek_v4 import eager as dsv4_eager
 from .deepseek_v4 import triton as dsv4_triton
@@ -40,6 +40,7 @@ from .wan import triton as wan_triton
 
 
 _GPU = GpuKernelRequirement()
+_MLU = MluKernelRequirement()
 
 
 register_op(
@@ -59,6 +60,18 @@ register_op(
     full_liger.backward,
     description="Liger Kernel rotary embedding over every channel, including rank-3 vision layout",
     requirement=_GPU,
+    requires=("liger_kernel",),
+    default=True,
+)
+
+register_op(
+    "rope",
+    "full",
+    "liger_kernel",
+    full_liger.forward,
+    full_liger.backward,
+    description="Liger Kernel rotary embedding over every channel, including rank-3 vision layout",
+    requirement=_MLU,
     requires=("liger_kernel",),
     default=True,
 )
@@ -91,6 +104,18 @@ register_op(
     partial_liger.backward,
     description="Liger Kernel rotary embedding over a channel prefix with eager fallback",
     requirement=_GPU,
+    requires=("liger_kernel",),
+    default=True,
+)
+
+register_op(
+    "rope",
+    "partial",
+    "liger_kernel",
+    partial_liger.forward,
+    partial_liger.backward,
+    description="Liger Kernel rotary embedding over a channel prefix with eager fallback",
+    requirement=_MLU,
     requires=("liger_kernel",),
     default=True,
 )

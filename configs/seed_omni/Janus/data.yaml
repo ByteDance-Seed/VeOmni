@@ -1,7 +1,10 @@
+# `sources` are placeholders: replace each entry with an absolute path (or an
+# `hdfs://` URL) this job can read. `names` are preprocessor keys in
+# veomni/data/seed_omni/preprocess.py — not paths, leave them as they are.
 sources:
-  - /mnt/hdfs/user_dir/dataset/imagenet1k_train
-  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture/data
-  - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k
+  - imagenet1k_train
+  - tulu-3-sft-mixture
+  - sharegpt4v_cap_100k
 names:
   - imagenet1k
   - tulu-3-sft-mixture

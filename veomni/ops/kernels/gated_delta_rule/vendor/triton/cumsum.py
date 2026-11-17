@@ -51,7 +51,7 @@ def chunk_local_cumsum_scalar_kernel(
     ptr_o = tl.make_block_ptr(
         o + bos * H, (T, H), (H, 1), (i_block * BLOCK_T, 0), (BLOCK_T, H), (1, 0)
     )
-    b_s = tl.load(ptr_s, boundary_check=(0,)).to(tl.float32)
+    b_s = tl.load(ptr_s, boundary_check=(0,), padding_option="zero").to(tl.float32)
     b_s = tl.reshape(b_s, (N_CHUNKS, CHUNK_SIZE, H))
     b_s = tl.trans(b_s, (1, 0, 2))
     b_o = tl.cumsum(b_s, axis=0)

@@ -268,14 +268,10 @@ def test_declared_output_inverse_and_cost_metric_are_independent(monkeypatch):
 def test_qwen_video_cost_is_framewise_not_clip_squared():
     from types import SimpleNamespace
 
-    from veomni.models.seed_omni.mixins import MetricMeterMixin
     from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated.accelerated import BalanceMixin
 
-    class Vision(BalanceMixin, MetricMeterMixin):
+    class Vision(BalanceMixin):
         config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
-
-        def estimate_flops(self, seqlens):
-            return float(sum(seqlens))
 
         def data_balance_pre(self, method, tensors, metadata):
             assert metadata["merged_lengths"] == [4]
@@ -285,8 +281,6 @@ def test_qwen_video_cost_is_framewise_not_clip_squared():
 
     vision = Vision()
     vision._balance_vision_inputs("forward", torch.ones(16, 3), torch.tensor([[2, 2, 4]]))
-    vision.metric_meter_add("forward")
-    assert vision.metric_meter_collect() == (4.0, [2, 2])
 
 
 def distributed_worker():
@@ -535,7 +529,7 @@ def qwen_vision_worker():
                             "image_grid_thw": torch.tensor(grids),
                             "packed_features": torch.zeros(1, length, 32, device=device, dtype=torch.bfloat16),
                             "visual_pos_mask": mask,
-                            "visual_num_real": real_count,
+                            "visual_is_real": torch.arange(len(grids)) < real_count,
                         }
                     execute_train_node(
                         model,
@@ -586,7 +580,7 @@ def qwen_vision_worker():
                     consume_tokens = torch.tensor(sum(lengths), device=device)
                     if ps.dp_size > 1:
                         dist.all_reduce(consume_tokens, group=ps.dp_group)
-                    assert consume_tokens.item() == {4: 24, 2: 16, 1: 14}[ps.dp_size], (
+                    assert consume_tokens.item() == {4: 16, 2: 16, 1: 14}[ps.dp_size], (
                         "Full pre-slice tokens miscounted"
                     )
                     results.append((loss.detach().clone(), consume_tokens, snapshots))

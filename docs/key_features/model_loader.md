@@ -39,15 +39,23 @@ See the [new-model guide](../usage/support_new_models/guide_and_checklist.md) fo
 
 ### 3. Model Configuration
 
-Your model should have a corresponding configuration class that inherits from `PretrainedConfig`. The configuration should include:
+Your model should have a corresponding configuration class that inherits from `VeOmniPretrainedConfig`. The configuration should include:
 
 ```python
-class YourCustomConfig(PretrainedConfig):
+from veomni.models import VeOmniPretrainedConfig
+
+class YourCustomConfig(VeOmniPretrainedConfig):
     model_type = "your_custom_model"
     architectures = ["YourCustomModel"]  # This should match your model class name
 ```
 
-You can also use the model configuration from HuggingFace if you are only modifying the modeling component of an existing HuggingFace model.
+To extend an HF schema, inherit `(VeOmniPretrainedConfig, HFConfig)`; declared
+`sub_configs` are adapted recursively. To construct an adapted HF config without
+defining an extension, use `get_veomni_config_class(HFConfig)`. VeOmni's
+loaders and generated model base adapt native HF inputs automatically; native HF
+classes themselves remain unchanged. Custom config constructors forward
+`ops_implementation` to `super().__init__`. See the
+[module configuration contract](../design/module_config.md).
 
 
 Register the generated model class from the package's `__init__.py`:

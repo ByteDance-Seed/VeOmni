@@ -19,7 +19,7 @@ def sp_pad(
     """Pad ``tensor`` along ``dim`` so its length is divisible by ``sp_size``.
 
     Pad-only counterpart of :func:`sp_pad_and_slice` (which also slices). Used by
-    SeedOmni V2 modules that need the FULL padded sequence (e.g. to compute
+    SeedOmni modules that need the FULL padded sequence (e.g. to compute
     FlashAttention ``cu_seqlens`` over the whole sequence) BEFORE slicing the
     per-rank chunk. Returns the tensor unchanged when already divisible or SP is
     disabled.

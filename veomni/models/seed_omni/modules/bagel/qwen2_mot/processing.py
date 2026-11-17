@@ -207,6 +207,7 @@ def _mot_value_for_item(
     dtype: torch.dtype,
     hidden_size: int,
 ) -> torch.Tensor:
+    """Validate and cast an item's rank-2 embedding tensor to ``(device, dtype)``."""
     value = item.value
     if not torch.is_tensor(value):
         raise ValueError(f"BAGEL Qwen2-MoT expects embedded item tensors, got {type(value).__name__}.")
@@ -292,6 +293,7 @@ def _mot_gen_token_indexes_for_span(span: PackedSpan, indexes: torch.Tensor) -> 
 
 
 def _is_vision_marker_triplet_at(items: list[ConversationItem], index: int) -> bool:
+    """Return whether ``items[index : index + 3]`` forms a ``(start, image, end)`` triplet."""
     # Context-tag equality prevents unrelated one-token text items around an
     # image from being mistaken for BAGEL's encoder-specific marker pair.
     if index + 2 >= len(items):
@@ -304,10 +306,12 @@ def _is_vision_marker_triplet_at(items: list[ConversationItem], index: int) -> b
 
 
 def _is_bagel_vision_marker(item: ConversationItem, *, context: str) -> bool:
+    """Return whether ``item`` is a single-token vision marker for ``context``."""
     return item.type == "text" and bagel_context(item) == context and _text_item_length(item) == 1
 
 
 def _text_item_length(item: ConversationItem) -> int | None:
+    """Return the token length of a text ``ConversationItem``, or ``None`` if unavailable."""
     value = item.value
     if torch.is_tensor(value):
         if value.dim() == 0:

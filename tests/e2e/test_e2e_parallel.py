@@ -237,6 +237,16 @@ text_test_cases = [
         1,  # max_sp_size: the DSA attention / indexer has no sequence-parallel path
         None,  # max_ep_size
     ),
+    pytest.param(
+        "gpt_oss",
+        "./tests/toy_config/gpt_oss_toy",
+        True,  # is_moe
+        1e-2,  # rtol: BF16 parallel reductions
+        1e-3,  # atol: toy grad norms are approximately 0.2
+        None,  # max_sp_size
+        None,  # max_ep_size
+        marks=_gpt_oss_fa4_quack_skip,
+    ),
 ]
 
 deepseek_v4_text_smoke_test_cases = [
@@ -249,17 +259,6 @@ deepseek_v4_text_smoke_test_cases = [
         2,  # min_sp_size: SP=1 is already covered by test_deepseek_v4_expert_parallel_alignment
         2,  # max_sp_size
         1,  # max_ep_size
-    ),
-    pytest.param(
-        "gpt_oss",
-        "./tests/toy_config/gpt_oss_toy",
-        True,  # is_moe
-        _DEFAULT_RTOL,
-        _DEFAULT_ATOL,
-        2,  # min_sp_size: retain both non-EP Quack and EP grouped-GEMM training
-        None,  # max_sp_size
-        None,  # max_ep_size
-        marks=_gpt_oss_fa4_quack_skip,
     ),
 ]
 

@@ -4,9 +4,9 @@ End-to-end recipe for training and inferring **Janus-1.3B** as a SeedOmni
 graph model: a unified understanding (image→text) + generation (text→image)
 model whose SigLIP / VQVAE / LLaMA backbone are wired as separate OmniModules.
 
-All paths below assume the upstream HuggingFace checkpoint lives at
-`/mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B`. Adjust to your
-own storage.
+Paths below are written as the placeholder `Janus-1.3B` for the upstream
+HuggingFace checkpoint — replace it with an absolute path (or `hdfs://` URL) this
+job can read. The same applies to `data.yaml`'s `sources`.
 
 ## Modules
 
@@ -26,7 +26,7 @@ walked through in [Architecture](../design/architecture.md#3-training-flow).
 
 ## Config files
 
-Config dir: `configs/seed_omni/Janus/janus_1.3b/` (layout explained in
+Config dir: `configs/seed_omni/Janus/janus/` (layout explained in
 [Training and Inference](../usage/training_and_inference.md#1-config-layout)).
 Training and inference take the **same** `base.yaml`; its `model.*` block drives
 the trainer and its `infer.*` block drives the inferencer.
@@ -35,33 +35,63 @@ the trainer and its `infer.*` block drives the inferencer.
 |------|------|
 | `train/base.yaml` | Launcher: model paths, `model.accelerator`, data, train, and the `infer` block. References the module/graph files below. |
 | `train/modules_train.yaml` | Per-module **training** overrides (`model` / `train` / `accelerator` per module). `janus_text_encoder` carries an embedding-parallel `emb` extra-parallel block (see below). Add `--model.accelerator.ulysses_size N` for Ulysses SP (see [Sequence parallelism](#sequence-parallelism-ulysses)). |
-| `packed/modules_train.yaml` | Same as `train/modules_train.yaml` plus `janus_text_encoder.processor_config.packed_preprocess: true`. |
 | `train/graph_train.yaml` | Training DAG — the file *is* the flat edge list. |
-| `packed/graph_train.yaml` | Packed training DAG (`pack_encode` / `pack_forward` / `pack_decode`). |
-| `packed/base.yaml` | Packed-training launcher (`packed/modules_train.yaml` + packed graph). |
 | `train/base_model_fsdp.yaml` | Conversation DAG with `fsdp_scope: model` (one FSDP tree over OmniModel). |
 | `../data.yaml` | Weighted multisource data list (ImageNet + ShareGPT4V). |
-| `infer/modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` + `janus_llama` `ddp`, vision modules eager. Select it with `--model.model_config.modules`. |
-| `infer/modules_infer_eager.yaml` | Per-module **inference** overrides — every module `eager` (single-process replica). |
-| `infer/graph_infer_und.yaml` / `infer/graph_infer_gen.yaml` / `infer/graph_infer_interleave.yaml` | Per-scenario generation graphs (mapped under `model.model_config.infer_graph`). |
+| `infer/modules_infer_fsdp.yaml` | Per-module **inference** overrides — distributed: `janus_text_encoder` vocab-parallel `emb` (`fsdp2` + `emb`), `janus_llama` `fsdp2`, `janus_vqvae` `ddp`, `janus_siglip` eager. Select it with `--model.model_config.modules`. |
+| `infer/modules_infer_eager.yaml` | Per-module **inference** overrides — every module `eager`; the file pins `janus_siglip` explicitly and `for_inference` supplies the `eager` default to the rest, so the whole run is a single-process replica. |
+| `infer/graph_infer_und.yaml` / `infer/graph_infer_gen.yaml` | Per-scenario generation graphs — image understanding and text-to-image (mapped under `model.model_config.infer_graph`). |
 
 ---
 
-## 1. Convert the checkpoint
+## 1. Point at the checkpoint
 
-The monolithic HF checkpoint is split into one sub-checkpoint per OmniModule
-(SigLIP encoder, VQVAE codec + generation head, LLaMA backbone). The converter
-reads `model_type` from the HF `config.json` and dispatches to the Janus family
-converter.
+Janus registers an [`OmniHFLayout`](../usage/hf_layout.md) under `model_type:
+janus`, so `model.model_path` can name the upstream HF checkpoint directly — no
+offline convert, and `save_hf_weights` writes back one checkpoint in that
+upstream layout, which loads with `transformers` or with `model.model_path`
+again.
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Janus/janus/train/base.yaml \
+  --model.model_path Janus-1.3B
+```
+
+The layout cuts the checkpoint into one sub-checkpoint per OmniModule (SigLIP
+encoder, VQVAE codec + generation head, LLaMA backbone) at the upstream key
+prefixes, so every source tensor lands on exactly one module.
+
+Both HF weight serializations load: `model.safetensors[.index.json]` and the
+legacy `pytorch_model.bin[.index.json]`, since `load_model_weights` resolves
+either. Whichever the checkpoint ships, the layout is a drop-in for
+`from_pretrained` — including for the tie decision, which is resolved against
+the stored tensors and therefore has to read both formats.
+
+Exporting is narrower: `save_hf_weights` writes back in the source layout, so
+it needs safetensors weights to key the output on. A `.bin`-only root loads and
+converts fine but fails the startup check (`_check_hf_source_exportable`) when
+the recipe enables `save_hf_weights` — which the shipped configs do. Either
+re-save the checkpoint with `save_pretrained(out, safe_serialization=True)`, or
+point the run at the split root the converter writes and leave `save_hf_weights`
+off if a merged export is not needed.
+
+To materialise the modules on disk instead, run the family converter — the
+layout gives both paths, and on a checkpoint whose tie flags agree they hold
+identical module weights:
 
 ```bash
 python scripts/seed_omni/convert_model.py \
-  --model_path /mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B \
-  --output_dir /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B
+  --model_path Janus-1.3B \
+  --output_dir Janus-1.3B-split
 ```
 
-The `output_dir` becomes `model.model_path` in `base.yaml` (a split-checkpoint
-root folder, not a single HF checkpoint).
+The `output_dir` is then a split-checkpoint root (a folder of per-module
+subfolders, not a single HF checkpoint). The split goes through the same layout
+as the direct load, so the two produce identical modules — including the family's
+generation defaults (`guidance_scale` among them), which the layout declares. The
+only thing the converter adds is DeepSeek's own `multi_modality` format, which it
+rewrites to the HF layout before splitting.
 
 ---
 
@@ -74,13 +104,15 @@ preprocessor key in `veomni/data/seed_omni/preprocess.py`
 ```yaml
 # configs/seed_omni/Janus/data.yaml
 sources:
-  - /mnt/hdfs/user_dir/dataset/imagenet1k_train      # text -> image (T2I)
-  - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k    # image -> text (I2T)
+  - imagenet1k_train      # text -> image (T2I)
+  - tulu-3-sft-mixture    # text-only SFT
+  - sharegpt4v_cap_100k   # image -> text (I2T)
 names:
   - imagenet1k
+  - tulu-3-sft-mixture
   - sharegpt4v_cap_100k
 schedule:
-  - { schedule_type: const, weights: [0.5, 0.5] }
+  - { schedule_type: const, weights: [0.5, 0.2, 0.3] }
 level: token
 stopping_strategy: all_exhausted
 upstream_sharded: true
@@ -100,24 +132,25 @@ or multi-node). Pass the task and config after it.
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml
+  configs/seed_omni/Janus/janus/train/base.yaml
 ```
 
-Packed training (CPU-built packed tokens/masks; modules only `masked_scatter`) uses
-`packed/base.yaml`. A single FSDP2 tree over the composed OmniModel uses
-`train/base_model_fsdp.yaml`, or add
-`--model.accelerator.fsdp_config.fsdp_scope model` to either launcher. Combined:
+The conversation DAG runs every module on the `conversation_list` carrier. A single
+FSDP2 tree over the composed OmniModel uses `train/base_model_fsdp.yaml`, or add
+`--model.accelerator.fsdp_config.fsdp_scope model` to any launcher:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/packed/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --model.accelerator.fsdp_config.fsdp_scope model
 ```
 
 Key knobs (override on the CLI, e.g. `--train.global_batch_size 32`):
 
 - `--train.global_batch_size` / `--train.micro_batch_size` — global vs. per-step micro batch.
-- `--data.max_seq_len` — packed sequence length (large images are resized to fit).
+- `--data.max_seq_len` — sequence length budget. It does **not** resize images: the
+  Janus image processor emits its configured size, and the transform's own
+  `image_max_pixels` bounds the initial downscale.
 - `--train.checkpoint.output_dir` — run root; DCP checkpoints land in `<output_dir>/checkpoints/`.
 - `--train.checkpoint.save_steps` / `--train.checkpoint.hf_save_steps` — DCP / HF save cadence.
 - `--train.wandb.enable false` — disable wandb for quick smoke runs.
@@ -141,11 +174,15 @@ accelerator:
   extra_parallel_placement_innermost: [false]
 ```
 
-Quick 1-node smoke run (no wandb, tiny step budget):
+Quick 1-node smoke run (no wandb, tiny step budget). The launcher's
+`modules_train.yaml` shards `embed_tokens.weight` across 4 ranks (`emb=4`), so
+this needs 4 GPUs — on a smaller node `emb` cannot divide the mesh; run
+`--model.model_config.modules configs/seed_omni/Janus/janus/train/modules_train.yaml`
+with the `emb` block removed, or use `train/base_model_fsdp.yaml`:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --train.max_steps 20 \
   --train.checkpoint.save_steps 10 \
   --train.wandb.enable false
@@ -168,7 +205,7 @@ its own `1/sp` token shard):
 
 ```bash
 NPROC_PER_NODE=4 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --model.accelerator.ulysses_size 4 \
   --train.global_batch_size 4 --train.micro_batch_size 1
 ```
@@ -187,7 +224,7 @@ Resume by pointing `load_path` at that directory:
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --train.checkpoint.load_path outputs/janus_1.3b_omni_sft/checkpoints/global_step_500
 ```
 
@@ -208,11 +245,12 @@ The two inference launches are described in
 
 `tasks/omni/infer_omni.py` runs a generation graph selected by
 `--model.model_config.infer_type` (a key into the `model.model_config.infer_graph`
-map in `base.yaml`; defaults to `infer_interleave`). `--model.model_path` is a
-**split-checkpoint root** that holds one subfolder per module (`janus_siglip/`,
+map in `base.yaml`; defaults to `infer_gen`). `--model.model_path` takes
+either the upstream HF checkpoint (loaded through the layout, as in step 1) or a
+split-checkpoint root holding one subfolder per module (`janus_siglip/`,
 `janus_vqvae/`, `janus_text_encoder/`, `janus_llama/`), each with its own
-`config.json` + weights; `base.yaml` already points it at the step-1 converter
-output, so you can infer directly with the converted base model.
+`config.json` + weights. `base.yaml` points it at the split root the step-1
+converter writes, so you can infer directly with the converted base model.
 
 Each module opts into FSDP / extra-parallel via its inference module YAML's
 `accelerator` block; `OmniInferencer` auto-detects whether any module needs a
@@ -220,25 +258,65 @@ distributed run. Two ready-made inference module files ship with the config:
 
 | `--model.model_config.modules` file | Layout | Launch |
 |-------------------------------------|--------|--------|
-| `infer/modules_infer_fsdp.yaml` | `janus_text_encoder` → distributed **vocab-parallel `emb`** (`fsdp2` + `emb`), `janus_llama` → `ddp`, vision modules eager | **torchrun** (`bash train.sh …`) |
-| `infer/modules_infer_eager.yaml` | every module `eager` — plain per-rank replica | single-process (`python …`) |
+| `infer/modules_infer_fsdp.yaml` | `janus_text_encoder` → distributed **vocab-parallel `emb`** (`fsdp2` + `emb`), `janus_llama` → `fsdp2`, `janus_vqvae` → `ddp`, `janus_siglip` → eager | **torchrun** (`bash train.sh …`) |
+| `infer/modules_infer_eager.yaml` | every module `eager` — plain per-rank replica (the file only pins `janus_siglip`; `for_inference` supplies `fsdp_mode: eager` to the rest) | single-process (`python …`) |
 
 ### 5.1 Inferring from a trained checkpoint
 
-Training writes each module's HF weights one level deeper, under
-`<output_dir>/checkpoints/global_step_N/hf_ckpt/<module>/`. Assemble a flat root
-the loader understands by linking each module's `hf_ckpt/` to `<root>/<module>`:
+Under an HF `model_path`, `save_hf_weights` writes one merged export in the
+source's own layout at
+`<output_dir>/checkpoints/global_step_N/hf_ckpt/` — the same keys, dtypes and
+shard files as the upstream root, plus its non-weight sidecars. Pass it straight
+to `--model.model_path` (the layout loads it again) or to `transformers`:
+
+```bash
+--model.model_path outputs/janus_1.3b_omni_sft/checkpoints/global_step_20/hf_ckpt
+```
+
+Two cases do **not** produce that merged export:
+
+- A **LoRA** run saves adapters per module under
+  `<output_dir>/checkpoints/global_step_N/lora_ckpt/<module>/` — a sibling of
+  `hf_ckpt/`, not inside it. Point `model.model_path` at the base checkpoint
+  (upstream root or split root) and give each trained module its own adapter
+  directory, e.g.
+  `--model.model_config.modules.janus_llama.lora_config.lora_adapter=<...>/lora_ckpt/janus_llama`
+  (repeat per trained module). A mixed full-parameter + LoRA run needs both: the
+  merged `hf_ckpt/` carries the full-parameter modules' *updated* weights, so keep
+  it and layer the adapters on top — that directory alone drops the LoRA updates.
+- A module that ended up **fully frozen** (for example one whose LoRA targets
+  matched nothing) produces no export of its own.
+
+A split-checkpoint run (no HF layout to write back to) instead writes per-module
+folders under `hf_ckpt/<module>/`, with adapters at `lora_ckpt/<module>/`.
+Assemble those into a flat root by linking each module's folder to
+`<root>/<module>`. Treat a **missing** directory as an error rather than
+substituting the original weights: a module can be absent because the export
+failed or because it was frozen, and silently loading the untrained copy would
+hide a lost update. Confirm which modules the run was meant to export, then either
+link the trained ones or copy the deliberately-frozen ones from `$ORIG` by name:
 
 ```bash
 STEP=outputs/janus_1.3b_omni_sft/checkpoints/global_step_20
 ASM=outputs/janus_1.3b_omni_sft/infer_ckpt/global_step_20
+ORIG=/path/to/split/checkpoint          # the step-1 convert output
+FROZEN=""                               # space-separated modules you know were frozen
 mkdir -p "$ASM"
 for m in janus_siglip janus_vqvae janus_text_encoder janus_llama; do
-  ln -sfn "$(realpath "$STEP/hf_ckpt/$m")" "$ASM/$m"
+  src="$STEP/hf_ckpt/$m"
+  case " $FROZEN " in
+    *" $m "*) [ -d "$ORIG/$m" ] || { echo "frozen module missing from ORIG: $m" >&2; exit 1; }
+              src="$ORIG/$m" ;;
+  esac
+  [ -d "$src" ] || { echo "no export for $m and it is not listed as frozen — check the run: $src" >&2; exit 1; }
+  ln -sfn "$(realpath "$src")" "$ASM/$m"
 done
 ```
 
-Then pass `--model.model_path "$ASM"` to any of the commands below.
+Setting `FROZEN` explicitly is what distinguishes "this module was never meant to
+train" from "this export did not happen".
+
+Then pass `--model.model_path "$ASM"`.
 
 **Image understanding (I2T / VQA)** — `infer/graph_infer_und.yaml`.
 
@@ -246,10 +324,10 @@ Distributed — `infer/modules_infer_fsdp.yaml`, torchrun:
 
 ```bash
 bash train.sh tasks/omni/infer_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --model.model_config.infer_type infer_und \
-  --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
-  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
+  --model.model_config.modules configs/seed_omni/Janus/janus/infer/modules_infer_fsdp.yaml \
+  --model.model_path Janus-1.3B-split \
   --infer.prompt "What do you see in this image?" \
   --infer.images /path/to/image.png \
   --infer.output_dir janus_out \
@@ -261,10 +339,10 @@ replica (no torchrun):
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --model.model_config.infer_type infer_und \
-  --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
-  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
+  --model.model_config.modules configs/seed_omni/Janus/janus/infer/modules_infer_eager.yaml \
+  --model.model_path Janus-1.3B-split \
   --infer.prompt "What do you see in this image?" \
   --infer.images /path/to/image.png \
   --infer.output_dir janus_out \
@@ -277,10 +355,10 @@ Distributed — `infer/modules_infer_fsdp.yaml`, torchrun:
 
 ```bash
 bash train.sh tasks/omni/infer_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --model.model_config.infer_type infer_gen \
-  --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml \
-  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
+  --model.model_config.modules configs/seed_omni/Janus/janus/infer/modules_infer_fsdp.yaml \
+  --model.model_path Janus-1.3B-split \
   --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
   --infer.output_dir janus_out \
   --infer.generation_kwargs.max_new_tokens 2048 \
@@ -292,15 +370,12 @@ replica (no torchrun):
 
 ```bash
 python tasks/omni/infer_omni.py \
-  configs/seed_omni/Janus/janus_1.3b/train/base.yaml \
+  configs/seed_omni/Janus/janus/train/base.yaml \
   --model.model_config.infer_type infer_gen \
-  --model.model_config.modules configs/seed_omni/Janus/janus_1.3b/infer/modules_infer_eager.yaml \
-  --model.model_path /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/Janus-1.3B \
+  --model.model_config.modules configs/seed_omni/Janus/janus/infer/modules_infer_eager.yaml \
+  --model.model_path Janus-1.3B-split \
   --infer.prompt "A photo of the Sydney Opera House under a starry night sky." \
   --infer.output_dir janus_out \
   --infer.generation_kwargs.max_new_tokens 2048 \
   --infer.generation_kwargs.guidance_scale 5.0
 ```
-
-**Interleaved** — `infer/graph_infer_interleave.yaml` (default `model.model_config.infer_type`)
-mixes text and image generation in one graph.

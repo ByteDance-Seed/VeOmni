@@ -12,7 +12,11 @@ import torch
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
-from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids, valid_seqlens_from_cu_seqlens
+from veomni.utils.seqlen_pos_transform_utils import (
+    coalesce_tail_padding_cu_seqlens,
+    prepare_fa_kwargs_from_position_ids,
+    valid_seqlens_from_cu_seqlens,
+)
 from veomni.utils.tensor_utils import unflatten
 
 from .....mixins.base_mixin import BaseMixin
@@ -22,7 +26,6 @@ from .....utils.conversation import ConversationItem
 from ....base.llm_packing import pack_llm_conversations_for_forward, scatter_llm_hidden_states
 from ..configuration import JanusLlamaConfig
 from ..modeling import JanusLlama
-from .packed import PackedTrainingMixin
 
 
 class TrainingMixin(TrainingModuleMixin):
@@ -66,7 +69,11 @@ class TrainingMixin(TrainingModuleMixin):
             position_ids
         )
         self.metric_meter_set_seqlens(
-            "forward", [int(s) for s in valid_seqlens_from_cu_seqlens(cu_seq_lens_q).tolist()]
+            # Metering runs before SP padding, so this sample has no pad tail to
+            # exclude; passing 0 keeps a legitimate one-token final sample from
+            # being dropped as presumed padding.
+            "forward",
+            [int(s) for s in valid_seqlens_from_cu_seqlens(cu_seq_lens_q, tail_padding_length=0).tolist()],
         )
 
         if get_parallel_state().sp_size > 1:
@@ -84,6 +91,22 @@ class TrainingMixin(TrainingModuleMixin):
             mask = sp_pad(attention_mask, dim=1, pad_value=1)
             pids = sp_pad(position_ids, dim=1, pad_value=0)
             (cu_q, cu_k), (max_q, max_k) = prepare_fa_kwargs_from_position_ids(pids)
+            # Zero-padded ``position_ids`` make each padding token its own
+            # single-token segment; coalesce them into one tail block, which is
+            # what the collator and the Qwen3 SP path do. Ascend's
+            # ``npu_fusion_attention`` can fault on the uncoalesced form.
+            tail_padding_length = pids.size(1) - self._sp_own_len
+            cu_q = coalesce_tail_padding_cu_seqlens(cu_q, tail_padding_length=tail_padding_length)
+            cu_k = coalesce_tail_padding_cu_seqlens(cu_k, tail_padding_length=tail_padding_length)
+            if tail_padding_length > 0:
+                # ``max_length_*`` came from the pre-coalesce segments and can
+                # exceed the padded length the kernel is handed once the tail is
+                # folded; recompute it from the coalesced lengths. Without this a
+                # packed sample whose longest segment sits in the padding raises
+                # ``cu_seqlens must run from 0 to <sliced len>``.
+                seqlens = cu_q[1:] - cu_q[:-1]
+                max_q = int(seqlens.max().item()) if seqlens.numel() else 0
+                max_k = max_q
             embeds = slice_input_tensor(embeds, dim=1, padding=False, group=group)
             pids = slice_input_tensor(pids, dim=1, padding=False, group=group)
             return dict(
@@ -156,7 +179,7 @@ class MeterMixin(MetricMeterMixin):
         return (dense_flops + attn_flops) / 1e12
 
 
-class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, MeterMixin):
+class VeOmniMixin(BaseMixin, TrainingMixin, MeterMixin):
     """``generate()`` (incl. CFG decode) and inference-state reset already live on
     the native :class:`~.modeling.JanusLlama` (via its own
     :class:`~.modeling.InferenceMixin`), so no ``InferenceMixin`` is needed here.

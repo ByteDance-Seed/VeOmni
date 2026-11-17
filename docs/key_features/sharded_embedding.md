@@ -62,11 +62,18 @@ The weight gradient covers every token of the `emb` group, but only this data-pa
 Build the embedding as a `ShardedEmbedding`, call it in the module's forward like any `nn.Embedding`, and list it in `_no_split_modules` so the parallelizer makes it its own FSDP2 unit:
 
 ```python
+from torch import nn
+
 from veomni.distributed.emb_parallel import ShardedEmbedding
+from veomni.models.modeling_base import VeOmniPreTrainedModel
 
 
-class TextEncoder(PreTrainedModel):
+class TextEncoder(VeOmniPreTrainedModel):
     _no_split_modules = ["ShardedEmbedding"]
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # This container embeds and projects tokens; it does not execute attention.
+        return attn_implementation
 
     def __init__(self, config):
         super().__init__(config)

@@ -117,8 +117,9 @@ EP-aware rank-0 broadcast / per-rank load paths slice the disk-side
 Both wrappers always call ``VeomniOp("moe_experts_lora", variant, impl)``.
 ``variant`` is the wrapper class (``shared`` / ``independent``). ``impl``
 follows the wrapped experts' ``veomni_moe`` handle when that LoRA row is
-available on this device, and falls back to ``eager`` otherwise. The FP8
-``deepgemm_fp8`` backend rejects expert LoRA rather than changing precision.
+available on this device, and falls back to ``eager`` otherwise. Two backends
+reject expert LoRA rather than changing precision: ``deepgemm_fp8``, and the
+``qat`` row, which has no adapter forward that would fake-quantize the weights.
 
 PEFT-format save/load compatibility (PEFT-aligned FQN layout)
 -------------------------------------------------------------
@@ -163,14 +164,21 @@ logger = logging.get_logger(__name__)
 
 
 def _moe_lora_op(base_layer: nn.Module, variant: str):
-    """Reject unsupported FP8 expert LoRA; otherwise bind the matching row or fall back to ``eager``."""
+    """Reject a quantizing or otherwise unmatched expert backend; otherwise bind its row."""
     from veomni.ops import OP_REGISTRY, VeomniOp
+    from veomni.ops.kernels.moe_experts import QUANTIZING_IMPLS
 
     base_op = getattr(base_layer, "veomni_moe", None)
     impl = "eager" if base_op is None else base_op.impl
-    if impl == "deepgemm_fp8":
+    # Two backends cannot be adapted, for different reasons and with the same
+    # consequence: running them through the adapter would quietly change precision
+    # or drop the quantization the config asked for. ``deepgemm_fp8`` has no adapter
+    # forward, and no ``moe_experts_lora`` row fake-quantizes the base weights the
+    # way ``qat`` does -- substituting ``eager`` there would train them at full
+    # precision while the config still claimed QAT.
+    if impl == "deepgemm_fp8" or impl in QUANTIZING_IMPLS:
         raise ValueError(
-            "moe_implementation='deepgemm_fp8' does not support MoE-LoRA on expert weights. "
+            f"moe_implementation={impl!r} does not support MoE-LoRA on expert weights. "
             "Select a supported MoE-LoRA backend (for example 'fused_triton' on GPU), "
             "or exclude expert weights from the LoRA targets."
         )
@@ -700,6 +708,7 @@ class LoraSharedExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
+        """Run routed experts with shared LoRA adapters through ``veomni_moe_lora``."""
         # Lazy-install cross-EP gradient sync on shared LoRA params (idempotent).
         # Must run after FSDP wrapping has converted params to DTensors, hence
         # the lazy install at first forward rather than in ``__init__``.
@@ -714,7 +723,7 @@ class LoraSharedExperts(nn.Module):
 
         return self.veomni_moe_lora(
             hidden_states,
-            top_k_weights.to(hidden_states.dtype),
+            top_k_weights,
             top_k_index,
             self.gate_up_proj.base_layer.weight,
             self.down_proj.base_layer.weight,
@@ -1003,6 +1012,7 @@ class LoraIndependentExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
+        """Run routed experts with per-expert LoRA adapters through ``veomni_moe_lora``."""
         if get_parallel_state().ep_enabled and self.veomni_moe_lora.impl == "eager":
             raise RuntimeError(
                 "LoraIndependentExperts: eager forward does not support expert parallelism (EP). "
@@ -1012,7 +1022,7 @@ class LoraIndependentExperts(nn.Module):
 
         return self.veomni_moe_lora(
             hidden_states,
-            top_k_weights.to(hidden_states.dtype),
+            top_k_weights,
             top_k_index,
             self.gate_up_proj.base_layer.weight,
             self.down_proj.base_layer.weight,

@@ -60,9 +60,20 @@ class _VisualOutputSlot(NamedTuple):
 
 
 def pixels_and_grid_from_items(items: list) -> Tuple[torch.Tensor, list[list[int]]]:
-    """Concat CPU-preprocessed patch tensors and pop stashed grid metadata."""
+    """Concat CPU-preprocessed patch tensors and read their stashed grid metadata.
+
+    The grid is read with ``get``, not popped: packing is not the item's last
+    reader (an eval pass or a reference re-forward walks the same carrier), and
+    ``ConversationItem.meta`` is durable per-module baggage.
+    """
     pixel_values = torch.cat([it.value for it in items], dim=0)
-    grids = [it.meta.pop(_OMNI_GRID) for it in items]
+    grids = [it.meta.get(_OMNI_GRID) for it in items]
+    missing = [i for i, grid in enumerate(grids) if grid is None]
+    if missing:
+        raise ValueError(
+            f"pixels_and_grid_from_items: item(s) {missing} carry no {_OMNI_GRID!r}; the vision CPU "
+            "preprocessor did not run (or ran for a different module) before this forward."
+        )
     return pixel_values, grids
 
 
@@ -157,6 +168,10 @@ else:
 
 logger = logging.get_logger(__name__)
 
+# The checkpoint keys a retargeted merger re-initialises. Named once because both
+# the VeOmni loader (which drops them) and HF's (which refuses to) need the same pair.
+_RETARGETED_MERGER_KEYS = frozenset({"visual.merger.linear_fc2.weight", "visual.merger.linear_fc2.bias"})
+
 
 class _MergerProjectionConverter:
     """Drop the patch-merger output projection (``merger.linear_fc2``) from the
@@ -240,6 +255,11 @@ class Qwen3VLVisionEncoder(InferenceMixin, PretrainedOmniModule):
     main_input_name = "pixel_values"
     _no_split_modules = ["Qwen3VLVisionBlock"]
     supports_gradient_checkpointing = True
+    # This wrapper owns no attention — the tower inside `self.visual` does, and
+    # `Qwen3VLVisionModel` supports both SDPA and eager. Without this the base
+    # `_supports_sdpa = False` rejects `sdpa` / `veomni_sdpa` at construction,
+    # before the nested model gets a say.
+    _supports_sdpa = True
 
     def __init__(self, config: Qwen3VLVisionEncoderConfig):
         super().__init__(config)
@@ -261,6 +281,71 @@ class Qwen3VLVisionEncoder(InferenceMixin, PretrainedOmniModule):
     @staticmethod
     def _create_checkpoint_tensor_converter(model: "PretrainedOmniModule") -> _MergerProjectionConverter:
         return _MergerProjectionConverter(model)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
+        """Load the tower, re-initialising a merger this config retargeted.
+
+        ``out_hidden_size`` rebuilds ``merger.linear_fc2`` at the LLM's width, so a
+        stock Qwen3-VL checkpoint no longer matches it. VeOmni's own loaders drop
+        that tensor through :class:`_MergerProjectionConverter`; single-process
+        eager inference loads through this HF entry point instead, which refuses to
+        start on the mismatch. Retry once accepting mismatches and keep that result
+        only when every mismatched key is one of the retargeted pair — any other
+        mismatch is re-raised with the offending keys. With ``out_hidden_size``
+        unset nothing is retried, so a standard Qwen3-VL load is untouched.
+
+        A caller's own ``ignore_mismatched_sizes=True`` still bypasses the check,
+        as it would on any HF model; this only supplies the retry the recipe needs.
+        """
+        if getattr(kwargs.get("config"), "out_hidden_size", None) is None:
+            return super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+
+        # Both are popped so the attempts below can pass their own values: leaving
+        # either in `kwargs` would collide with the explicit keyword on the retry
+        # (`TypeError: got multiple values`). A caller's explicit `True` still wins —
+        # it is a deliberate override of the check this method adds.
+        want_info = kwargs.pop("output_loading_info", False)
+        user_ignore = kwargs.pop("ignore_mismatched_sizes", False)
+        try:
+            model, info = super().from_pretrained(
+                pretrained_model_name_or_path,
+                *args,
+                ignore_mismatched_sizes=user_ignore,
+                output_loading_info=True,
+                **kwargs,
+            )
+        except RuntimeError as error:
+            if user_ignore:
+                raise
+            # HF reports the mismatch two ways depending on version (a "size mismatch"
+            # state-dict error, or the generic "ignore_mismatched_sizes is False"), so
+            # retry rather than matching on the message, and let the check below decide.
+            model, info = super().from_pretrained(
+                pretrained_model_name_or_path,
+                *args,
+                ignore_mismatched_sizes=True,
+                output_loading_info=True,
+                **kwargs,
+            )
+            unexpected = {name for name, _, _ in info["mismatched_keys"]} - _RETARGETED_MERGER_KEYS
+            if unexpected:
+                raise RuntimeError(
+                    f"{cls.__name__}: the load failed, and its size mismatches are not the retargeted merger "
+                    f"({sorted(unexpected)})."
+                ) from error
+
+        # The base class received `(model, info)` above and so skipped its asset
+        # binding (`bind_module_assets` sees no `preprocessor_class` on a tuple and
+        # returns). Bind the bare model here instead of loading twice.
+        from ...module_processing_base import bind_module_assets
+
+        bind_module_assets(
+            model,
+            checkpoint_path=str(pretrained_model_name_or_path),
+            config_overrides={k: v for k, v in kwargs.items() if k != "config"},
+        )
+        return (model, info) if want_info else model
 
     def freeze_model(self) -> None:
         """When ``config.freeze``, freeze the ViT but keep the patch merger

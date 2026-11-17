@@ -129,6 +129,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         for_inference: bool = False,
         hf_source: Optional["HFSource"] = None,
     ):
+        """Bind the arguments, config and accelerator settings for one module."""
         self.args = args
         self.model_name = module_name
         self.module_config = module_config
@@ -237,7 +238,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         ``model_path`` it is the weight-free view's, where the config and assets
         are read from.
         """
-        return self.hf_source.path if self.hf_source is not None else self.args.model_path
+        return self.hf_source.weights_path if self.hf_source is not None else self.args.model_path
 
     @property
     def module_name(self) -> str:
@@ -280,6 +281,9 @@ class ModuleRuntime(VeOmniModelRuntime):
         model_path = args.model_path
         model_type = self.module_config.model_type
         cls = OMNI_MODEL_REGISTRY[model_type]()
+        module_dtype = getattr(self.module_config, "dtype", None) or torch.bfloat16
+        if isinstance(module_dtype, str):
+            module_dtype = getattr(torch, module_dtype)
         if dist.is_initialized():
             device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
         else:
@@ -297,7 +301,7 @@ class ModuleRuntime(VeOmniModelRuntime):
                 self.hf_source,
                 self.module_name,
                 device_map=device_map,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=module_dtype,
             ).eval()
             self.model_config = self.model.config
             self._build_model_assets()
@@ -309,7 +313,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         self.model = cls.from_pretrained(
             model_path,
             config=self.module_config,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=module_dtype,
             device_map=device_map,
         ).eval()
         self.model_config = self.model.config
@@ -348,7 +352,7 @@ class ModuleRuntime(VeOmniModelRuntime):
             # Mirrors the loaders' ``empty_init``: off rank 0 a CPU init stays on meta.
             off_rank0 = dist.is_initialized() and dist.get_rank() != 0
             if init_device != "meta" and not (init_device == "cpu" and off_rank0):
-                load_model_weights(self.model, self.hf_source.path, init_device)
+                load_model_weights(self.model, self.hf_source.weights_path, init_device)
         self.model_config = self.model.config
 
     def _build_model_assets(self) -> None:
@@ -517,6 +521,7 @@ class ModuleRuntime(VeOmniModelRuntime):
 
     @property
     def has_trainable_parameters(self) -> bool:
+        """Whether any parameter of this module requires grad (cached after first use)."""
         if self._has_trainable_parameters is None:
             self._has_trainable_parameters = any(param.requires_grad for param in self.model.parameters())
         return self._has_trainable_parameters

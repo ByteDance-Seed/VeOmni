@@ -19,8 +19,19 @@ class Qwen3MoeLlmConfig(OmniModuleConfig):
 
     def __init__(
         self,
-        text_config: Optional[Dict[str, Any]] = None,
+        text_config: Optional[Dict[str, Any] | Qwen3MoeConfig] = None,
+        freeze: bool = False,
         **kwargs,
     ):
-        self.text_config = Qwen3MoeConfig(**text_config) if text_config else Qwen3MoeConfig()
+        # Accept an already-instantiated inner config, as the dense Qwen3 sibling
+        # does: ``from_dict`` / a caller holding a ``Qwen3MoeConfig`` would
+        # otherwise hit ``TypeError: argument after ** must be a mapping``. The
+        # object is reused as given — nothing below changes it.
+        if isinstance(text_config, Qwen3MoeConfig):
+            self.text_config = text_config
+        else:
+            self.text_config = Qwen3MoeConfig(**(text_config or {}))
+        # When True, ``Qwen3MoeLlm.freeze_model`` freezes the whole backbone
+        # (used to bootstrap a frozen LLM into a multimodal model).
+        self.freeze = freeze
         super().__init__(**kwargs)
