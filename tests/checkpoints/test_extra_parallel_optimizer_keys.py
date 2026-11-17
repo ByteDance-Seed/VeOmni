@@ -173,6 +173,7 @@ def _asymmetric_optimizer_preflight(rank, root):
 
     class FakeMesh:
         mesh_dim_names = ("ep_fsdp", "ep")
+        shape = (1, 2)
 
         def __getitem__(self, _):
             return SimpleNamespace(size=lambda: 2)
@@ -192,7 +193,9 @@ def _asymmetric_optimizer_preflight(rank, root):
     )
     try:
         dcp_checkpointer._validate_extra_parallel_meshes = lambda _: None
-        spec = SimpleNamespace(placement=Shard(0), para_fsdp_mesh=FakeMesh())
+        from veomni.distributed.parallel_plan import SpecInfo
+
+        spec = SpecInfo("ep", Shard(0), "experts.weight", FakeMesh())
         model = SimpleNamespace(_fqn2spec_info={"experts.weight": spec})
         parallel = SimpleNamespace(dp_mode="fsdp2")
         leaf = FakeOptimizer()
