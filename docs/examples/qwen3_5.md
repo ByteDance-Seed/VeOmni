@@ -184,7 +184,7 @@ model:
 ```
 
 `fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It covers the Atlas A2 training products
-(`ascend910b`), A3 (`ascend910_93`) and A5 / arch35 (`ascend950`) targets; the library picks the
+(`ascend910b`), Atlas A3 training products (`ascend910_93`) and Ascend 950PR&950DT products / arch35 (`ascend950`) targets; the library picks the
 arch22 or arch35 kernel path from the SoC, and this adapter uses the BF16 K=V=128,
 chunk_size=64 contract both paths share. The vendored `causal_conv1d` no longer rejects
 arch35 (Ascend 950PR&950DT products); the operator validation scope is recorded above.
