@@ -76,7 +76,7 @@ RUN (pip uninstall -y triton triton-ascend || true) && \
     echo "Verifying triton-ascend patched libtriton.so ..." && \
     python -c "from triton._C.libtriton import ascend"
 
-# ONE RUN so the CANN env from set_env.sh persists. --soc=ascend910b (a2 base is 910b).
+# ONE RUN so the CANN env from set_env.sh persists. --soc=ascend910b (the base targets Atlas A2 training products).
 # torch binding wheel is force-reinstalled with --no-deps (else pip pulls a CUDA torch).
 RUN git clone https://github.com/flashserve/flash-linear-attention-npu /tmp/fla-npu && \
     cd /tmp/fla-npu && git checkout c2e3d83f && \
