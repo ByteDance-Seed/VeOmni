@@ -135,6 +135,11 @@ def process_conversation_example(
     else:
         raise ValueError(f"text_keys must be a string or a list of strings, but got {type(text_keys)}")
 
+    if (
+        any(isinstance(message, dict) and message.get("loss_weight") is not None for message in text_example)
+        and getattr(chat_template, "supports_loss_weights", False) is not True
+    ):
+        raise ValueError("This chat template does not support loss_weight")
     tokenized_example = chat_template.encode_messages(text_example, max_seq_len=max_seq_len)
     tokenized_example = {k: torch.tensor(v) for k, v in tokenized_example.items()}
     return [tokenized_example]
@@ -661,8 +666,9 @@ def _process_sample_qwen_vl_base(
     position_id_func: "Callable",
     **kwargs,
 ):
-    from .multimodal import conv_preprocess
+    """Prepare Qwen-VL media and conversations while preserving supervision."""
     from .multimodal.image_utils import fetch_images
+    from .multimodal.preprocess import conv_preprocess_qwen_vl as conv_preprocess
     from .multimodal.video_utils import fetch_videos_metadata
 
     source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")

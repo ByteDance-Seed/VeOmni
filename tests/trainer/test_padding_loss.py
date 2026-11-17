@@ -168,6 +168,7 @@ def _strict_channel_error_worker(rank, accelerator, endpoint):
         get_torch_device().set_device(rank)
     backend = get_dist_comm_backend() if accelerator else "gloo"
     dist.init_process_group(backend, store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    loss_utils.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
     callback_module.get_parallel_state = lambda: SimpleNamespace(sp_enabled=False)
     original_reduce = dist.all_reduce
     reduce_sizes = []
@@ -207,9 +208,9 @@ def _strict_channel_error_worker(rank, accelerator, endpoint):
         results = [None, None]
         dist.all_gather_object(results, (error, trainer.state.global_step, reduce_sizes, callback_succeeded, cause))
         assert all(message and "callback or loss-token" in message and step == 3 for message, step, *_ in results)
-        assert all(sizes == [7, 2] for _, _, sizes, *_ in results)
+        assert all(sizes == [7, 13] for _, _, sizes, *_ in results)
         assert not results[0][3] and results[0][4][0] == "ValueError" and "source ID" in results[0][4][1]
-        assert results[1][3] and results[1][4] is None
+        assert results[1][3] and results[1][4] is None, results
 
         error = ValueError("strict source missing") if rank == 0 else None
         with pytest.raises(RuntimeError, match="DPO step-begin callback failed"):
@@ -454,11 +455,6 @@ def test_all_padding_step_does_not_advance_training_state(monkeypatch, trainer_n
         "text": (text_module, text_module.TextTrainer),
         "vlm": (vlm_module, vlm_module.VLMTrainer),
     }[trainer_name]
-    monkeypatch.setattr(
-        base_module,
-        "reduce_global_loss_token",
-        lambda counts, **kwargs: {key: value.item() for key, value in counts.items()},
-    )
     trainer = object.__new__(cls)
     state = SimpleNamespace(global_step=3)
     updates = []
@@ -725,7 +721,8 @@ def test_reordered_channel_capture_counts_elapsed_once(monkeypatch, preflight):
     assert meter.start_time == (100.0 if preflight else 127.0)
 
 
-def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
+@pytest.mark.parametrize("weighted", [False, True])
+def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch, weighted):
     import copy
 
     import veomni.data.data_collator as collator_module
@@ -745,11 +742,19 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.tensor(0.25))
             self.parallel_state = parallel_state
+            self.model_config = SimpleNamespace(model_type="qwen4_exp")
+            self.unwrapped_module = SimpleNamespace(veomni_ce=SimpleNamespace(impl="chunk_loss"))
 
-        def forward(self, input_ids, labels, use_cache=False, **_kwargs):
+        def forward(self, input_ids, labels, use_cache=False, loss_weights=None, **_kwargs):
             targets = labels[..., 1:]
             logits = self.weight * input_ids[..., :-1].float().unsqueeze(-1) * torch.arange(8, dtype=torch.float32)
-            loss = torch.nn.functional.cross_entropy(logits.reshape(-1, 8), targets.reshape(-1), ignore_index=-100)
+            per_token = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, 8), targets.reshape(-1), ignore_index=-100, reduction="none"
+            ).reshape_as(targets)
+            mass = (targets != -100).float()
+            if loss_weights is not None:
+                mass = mass * loss_weights[..., 1:]
+            loss = (per_token * mass).sum() / mass.sum()
             return SimpleNamespace(loss=loss)
 
     collator = collator_module.PackingCollator()
@@ -772,6 +777,10 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
         [{"input_ids": torch.tensor([6, 7]), "labels": torch.tensor([-100, 7]), "position_ids": torch.tensor([0, 1])}]
     )
 
+    if weighted:
+        packed["loss_weights"] = torch.tensor([[0.0, 0.25, 1.0, 0.5, 0.75]])
+        packed_other["loss_weights"] = torch.tensor([[0.0, 0.4]])
+
     def run(pad, mask_mode=None):
         model = TinyModel()
         model.optimizer = torch.optim.AdamW(model.parameters(), lr=0.02, weight_decay=0.1)
@@ -792,6 +801,9 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
         trainer.sync_before_train_step = lambda: None
 
         def step_begin(micro_batches):
+            recorded["callback_real_batches"] = sum(
+                not loss_utils.is_padding_microbatch(batch) for batch in micro_batches
+            )
             if mask_mode == "callback":
                 micro_batches[0]["labels"][0, 1] = -100
 
@@ -808,6 +820,7 @@ def test_packed_train_step_and_adamw_update_match_without_padding(monkeypatch):
     assert torch.equal(actual["gradient"], reference["gradient"])
     assert torch.equal(actual_weight, reference_weight)
     assert actual["loss"] == reference["loss"]
+    assert actual["callback_real_batches"] == reference["callback_real_batches"] == 2
 
     masked_reference, masked_reference_weight = run(False, "before")
     masked_callback, masked_callback_weight = run(False, "callback")

@@ -76,7 +76,7 @@ from ..utils.loss_utils import (
     count_loss_token,
     is_padding_microbatch,
     mean_global_loss,
-    reduce_global_loss_token,
+    prepare_loss_token_counts,
     reject_distributed_padding,
 )
 from .callbacks import (
@@ -946,14 +946,14 @@ class BaseTrainer(Stateful, ABC):
             try:
                 self._reset_async_activation_offload_if_enabled(self.model)
                 callback_owner.on_step_begin(micro_batches=micro_batches)
-                # Callbacks may adjust labels; normalize the inputs actually consumed.
-                self.micro_batches_token_len = count_loss_token(micro_batches)
             except Exception as exc:  # noqa: BLE001 - propagate on the existing token reduction
                 error = exc
-                self.micro_batches_token_len = {"foundation_tokens": torch.tensor(0)}
-            self.global_micro_batches_token_len = reduce_global_loss_token(
-                self.micro_batches_token_len, error=error, sync_auxiliary=has_auxiliary_targets
-            )
+            # Callbacks may adjust labels; normalize the inputs actually consumed.
+            (
+                self._weighted_loss_normalization,
+                self.micro_batches_token_len,
+                self.global_micro_batches_token_len,
+            ) = prepare_loss_token_counts(micro_batches, self.model, error=error, sync_auxiliary=has_auxiliary_targets)
         except BaseException:
             self.state.global_step = previous_step
             raise
@@ -986,7 +986,9 @@ class BaseTrainer(Stateful, ABC):
             loss_dict: Dict[str, torch.Tensor]
             aux_metrics: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
-            self.micro_batch_token_len = count_loss_token(micro_batch)
+            self.micro_batch_token_len = count_loss_token(
+                micro_batch, weighted_normalization=self._weighted_loss_normalization
+            )
             loss, loss_dict, aux_metrics = self.forward_backward_step(micro_batch)
 
             total_loss += loss.item()

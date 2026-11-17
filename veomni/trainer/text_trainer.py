@@ -114,7 +114,9 @@ class TextTrainer:
             loss_dict: Dict[str, torch.Tensor]
             aux_metrics: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
-            self.base.micro_batch_token_len = count_loss_token(micro_batch)
+            self.base.micro_batch_token_len = count_loss_token(
+                micro_batch, weighted_normalization=self.base._weighted_loss_normalization
+            )
             loss, loss_dict, aux_metrics = self.base.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
