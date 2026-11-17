@@ -106,6 +106,9 @@ class JanusChatTemplate(TextEncoderChatTemplate):
         # Whether the assistant turn just closed ended on a generated image, which
         # decides if the EOS terminating it is supervised (see the two EOS sites).
         prev_turn_ended_on_image = False
+        # Whether the current assistant turn already emitted a text span, so the
+        # ``<|Assistant|>: `` separator is added to the first one only.
+        prev_turn_has_text = False
         for item in sample:
             if item.is_dummy:
                 dummy_parts.append(item)
@@ -129,18 +132,25 @@ class JanusChatTemplate(TextEncoderChatTemplate):
                         )
                     out.append(self._build_conversation_item("text", self.chat_markers.user_prefix, "user"))
                 elif role == "assistant":
+                    # The bare marker. Upstream emits ``<|Assistant|>: `` — with a
+                    # trailing space — only when a response follows, and that space
+                    # belongs to the *first supervised token*: a byte-level
+                    # tokenizer has one id for ``Hello`` and another for `` Hello``,
+                    # so putting the separator in this unscored part tokenized it as
+                    # a standalone space and left the answer's first token different
+                    # from the native template. It is prepended to the first text
+                    # span below instead, where it merges with the response.
                     out.append(
                         self._build_conversation_item(
                             type="text",
-                            # Upstream separates the marker from the response with a
-                            # space; the bare marker is only for a generation prompt.
-                            value=self.chat_markers.assistant_prefix + self.chat_markers.assistant_text_separator,
+                            value=self.chat_markers.assistant_prefix,
                             role="assistant",
                             loss_mask=0,
                         )
                     )
                 prev_role = role
                 prev_was_user_image = False
+                prev_turn_has_text = False
                 if role == "assistant":
                     prev_turn_ended_on_image = False
 
@@ -148,6 +158,14 @@ class JanusChatTemplate(TextEncoderChatTemplate):
                 text = str(item.value)
                 if prev_was_user_image and role == "user" and not text.startswith("\n"):
                     text = "\n" + text
+                if role == "assistant" and not prev_turn_has_text:
+                    # First text span of an assistant turn: upstream renders
+                    # ``<|Assistant|>: Hello``, so the separator merges into this
+                    # span's first token rather than sitting in the unscored
+                    # marker part (where a byte-level tokenizer would emit it as a
+                    # standalone space and leave ``Hello`` on a different id).
+                    text = self.chat_markers.assistant_text_separator + text
+                    prev_turn_has_text = True
                 out.append(self._build_conversation_item("text", text, role))
                 prev_was_user_image = False
                 if role == "assistant":
@@ -158,7 +176,14 @@ class JanusChatTemplate(TextEncoderChatTemplate):
                 # supervising it costs tens of nats and swamps the real text loss.
                 # ``<eoi>`` is supervised — after a fixed-length image span the model
                 # predicts it near-perfectly, and the reference stack scores it too.
-                out.append(self._build_conversation_item("text", self.chat_markers.boi_token, role, loss_mask=0))
+                boi = self.chat_markers.boi_token
+                if role == "assistant" and not prev_turn_has_text:
+                    # An image opening a response takes the separator too: upstream
+                    # renders ``<|Assistant|>: <image_placeholder>``, and the boundary
+                    # before ``<boi>`` is the same position a text answer starts at.
+                    boi = self.chat_markers.assistant_text_separator + boi
+                    prev_turn_has_text = True
+                out.append(self._build_conversation_item("text", boi, role, loss_mask=0))
                 out.append(item)  # media row passed through verbatim (keeps value/role/meta)
                 out.append(self._build_conversation_item("text", self.chat_markers.eoi_token, role))
                 prev_was_user_image = role == "user"
