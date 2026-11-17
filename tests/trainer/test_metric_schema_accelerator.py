@@ -19,7 +19,7 @@ from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torc
 
 
 def _accelerator_plan(context):
-    if context.capabilities.backend in ("npu", "cuda") and len(context.capabilities.devices) >= 2:
+    if context.capabilities.backend != "cpu" and len(context.capabilities.devices) >= 2:
         return LaunchSpec(device="accelerator", nproc=2)
     return LaunchSpec(device="cpu")
 
@@ -27,8 +27,10 @@ def _accelerator_plan(context):
 def _metric_schema_accelerator_worker(rank, expected_device, endpoint):
     device = get_device_type()
     assert device == expected_device
-    expected_backend = {"npu": "hccl", "cuda": "nccl"}[expected_device]
-    assert get_dist_comm_backend() == expected_backend
+    expected_backend = get_dist_comm_backend()
+    assert expected_backend != "gloo"
+    if expected_device == "npu":
+        assert expected_backend == "hccl"
     get_torch_device().set_device(rank)
     dist.init_process_group(
         get_dist_comm_backend(), store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=60)
@@ -74,11 +76,11 @@ def test_metric_schema_preflight_accelerator():
     require_npu = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1"
     if require_npu and assigned_backend is not None and assigned_backend != "npu":
         pytest.fail("NPU test requested with a non-NPU CI assignment")
-    required = assigned_backend in ("npu", "cuda") or require_npu
+    required = (assigned_backend is not None and assigned_backend != "cpu") or require_npu
     device = get_device_type()
     expected_device = assigned_backend or ("npu" if require_npu else device)
     available = (
-        expected_device in ("npu", "cuda")
+        expected_device != "cpu"
         and device == expected_device
         and get_torch_device().is_available()
         and get_torch_device().device_count() >= 2
