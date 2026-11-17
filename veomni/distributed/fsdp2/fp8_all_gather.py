@@ -57,7 +57,7 @@ def _deepgemm_experts(model):
     return (
         (name, module)
         for name, module in model.named_modules()
-        if getattr(getattr(module, "veomni_moe", None), "impl", None) == "deepgemm_fp8"
+        if getattr(getattr(module, "veomni_moe", None), "impl", None) == "deepgemm"
     )
 
 

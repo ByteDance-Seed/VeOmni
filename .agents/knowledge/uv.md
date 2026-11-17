@@ -119,7 +119,7 @@ These native Ubuntu 24.04 wheels require glibc >=2.38 and libstdc++ symbols
 through GLIBCXX_3.4.31 (x86_64) or GLIBCXX_3.4.29 (aarch64). They package the
 host extension and DeepJIT/CUTLASS headers; runtime kernel JIT still needs
 NVCC and a C++20 compiler (validated with GCC 13). The backend is lazy-imported
-and selected explicitly with `moe_implementation: deepgemm_fp8`; installing
+and selected explicitly with `moe_implementation: deepgemm`; installing
 the GPU extra does not enable FP8 or import DeepGEMM on unsupported GPUs.
 See `docs/design/deepgemm_fp8_moe.md` for supported shapes and precision.
 
@@ -135,7 +135,7 @@ See `docs/design/deepgemm_fp8_moe.md` for supported shapes and precision.
 | `flash-qla` | PyPI `0.1.2` | pure-Python wheel with usable metadata; requires TileLang 0.1.9; full forward/backward support on SM90 and SM100 |
 | `tile-kernels` | PyPI `1.0.0` | DeepSeek V4 mHC forward/backward; requires TileLang 0.1.9 and SM90+ |
 | `magi-attention` + `create-block-mask-cuda`, `flash-attn-cute`, `magi-to-hstu-cuda` | git revs | optional `--extra magi`; SM100 source builds, omitted by the default GPU CI install |
-| `torchao` | PyPI `0.18.0` | optional `--extra float8`, also the backend of the `torchao_nvfp4` QAT rows; exact pin checked at runtime by `veomni/distributed/float8.py`, omitted by the default GPU CI install, so the float8 GPU tests and the torchao QAT tests skip there. Incompatible with the `gpu` extra's `peft==0.18.1` torchao integration (`LinearActivationQuantizedTensor` removed), so PEFT interop fails with the extra installed |
+| `torchao` | PyPI `0.18.0` | optional `--extra float8`, also the backend of the `torchao` QAT rows; exact pin checked at runtime by `veomni/distributed/float8.py`, omitted by the default GPU CI install, so the float8 GPU tests and the torchao QAT tests skip there. Incompatible with the `gpu` extra's `peft==0.18.1` torchao integration (`LinearActivationQuantizedTensor` removed), so PEFT interop fails with the extra installed |
 
 FlashQLA 0.1.2 supports full forward/backward execution on NVIDIA SM90 and
 SM100. Its SM120 path is forward-only, so VeOmni's full op registration is

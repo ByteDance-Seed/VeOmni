@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Standard dense linear blockwise-FP8 QAT implementation.
+"""Standard dense linear blockwise QAT implementation.
 
 Both GEMM operands are fake-quantized with the DeepSeek-V4 TileLang quantizers
-and the multiply itself runs in the model dtype, which is what an emulated FP8
-deployment GEMM computes: the rounded values are read back and accumulated in
-high precision.
+and the multiply itself runs in the model dtype, which is what an emulated
+low-precision deployment GEMM computes: the rounded values are read back and
+accumulated in high precision.
+
+``dtype`` picks the format. ``fp8`` uses square ``block_size`` tiles with an
+optional power-of-two scale; ``fp4`` groups only along the input dimension at a
+fixed 32 channels, because that is the layout a V4-Flash checkpoint stores its
+routed experts in.
 """
 
 from __future__ import annotations
@@ -29,13 +34,21 @@ from ....qat import fp8_fake_quant_act, fp8_fake_quant_weight
 from .._module import resolve_projection
 
 
-def wrapper(linear: nn.Module, x: Tensor, *, block_size: int = 128) -> Tensor:
-    """Run ``linear`` with blockwise FP8 fake-quantized activation and weight.
+#: Formats this row can round to, as its ``dtype`` argument.
+SUPPORTED_DTYPES = ("fp8", "fp4")
 
-    ``block_size`` sets both operands' granularity: ``1 x block_size`` activation
-    blocks and square ``block_size x block_size`` weight tiles. The deployment GEMM
-    ties them together -- it indexes a weight's scale by the same block counter as
-    the activation's -- so one number describes its recipe, not two.
+
+def wrapper(linear: nn.Module, x: Tensor, *, dtype: str = "fp8", block_size: int | None = None) -> Tensor:
+    """Run ``linear`` with blockwise fake-quantized activation and weight.
+
+    ``dtype`` picks the format. For ``fp8``, ``block_size`` (default 128) sets both
+    operands' granularity: ``1 x block_size`` activation blocks and square
+    ``block_size x block_size`` weight tiles. The deployment GEMM ties them together
+    -- it indexes a weight's scale by the same block counter as the activation's --
+    so one number describes its recipe, not two.
+
+    ``fp4`` groups only along the input dimension, at the fixed width the checkpoint's
+    scale layout defines, so ``block_size`` does not apply to it.
     """
     # A quantizing row always gets a weight: ``resolve_projection`` raises for a
     # wrapped projection instead of handing back a shortcut.
@@ -44,6 +57,17 @@ def wrapper(linear: nn.Module, x: Tensor, *, block_size: int = 128) -> Tensor:
     bias = getattr(linear, "bias", None)
     if x.numel() == 0:
         return F.linear(x, weight, bias)
-    x_q = fp8_fake_quant_act(x, block_size=block_size)
-    w_q = fp8_fake_quant_weight(weight, block_size=block_size)
+    if dtype == "fp4":
+        # FP4 rounds the weight only: the checkpoint's scales are per weight group,
+        # and the activation layout of the FP4 expert kernels is not one a dense
+        # projection consumes. A dense FP4 GEMM is not what this row is for.
+        raise ValueError(
+            "linear qat with dtype='fp4' is not implemented: the FP4 recipe in this tree is the routed-expert"
+            " one (32-wide input groups, weight-only scales). Use dtype='fp8' for dense projections."
+        )
+    if dtype != "fp8":
+        raise ValueError(f"linear qat does not support dtype={dtype!r}; it supports {SUPPORTED_DTYPES}")
+    width = 128 if block_size is None else block_size
+    x_q = fp8_fake_quant_act(x, block_size=width)
+    w_q = fp8_fake_quant_weight(weight, block_size=width)
     return F.linear(x_q, w_q, bias)

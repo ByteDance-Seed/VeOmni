@@ -620,7 +620,7 @@ def test_qwen3_packed_sage_attention_matches_independent_samples(monkeypatch, av
 
 _requires_torchao = pytest.mark.skipif(
     not is_package_available("torchao"),
-    reason="the torchao_nvfp4 linear/swiglu_mlp rows need the optional 'torchao' package",
+    reason="the torchao linear/swiglu_mlp rows need the optional 'torchao' package",
 )
 
 
@@ -682,9 +682,9 @@ def test_qwen3_nvfp4_qat_trains_and_rounds(device: str):
     torch.manual_seed(0)
     config = _tiny_config()
     eager = _qwen3_with_ops(config).to(device)
-    quantized = _qwen3_with_ops(
-        config, linear_implementation="torchao_nvfp4", swiglu_mlp_implementation="torchao_nvfp4"
-    ).to(device)
+    quantized = _qwen3_with_ops(config, linear_implementation="torchao", swiglu_mlp_implementation="torchao").to(
+        device
+    )
     quantized.load_state_dict(eager.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8), device=device)
@@ -712,11 +712,11 @@ def test_qwen3_nvfp4_qat_rounds_exactly_the_projection_weights(monkeypatch):
     A forward-output test cannot tell a recipe that quantizes one tensor too few
     from the right one, so this records which parameters reach the quantizer.
     """
-    import veomni.ops.kernels.linear.standard.torchao_nvfp4 as linear_row
-    import veomni.ops.kernels.swiglu_mlp.standard.torchao_nvfp4 as mlp_row
+    import veomni.ops.kernels.linear.standard.torchao as linear_row
+    import veomni.ops.kernels.swiglu_mlp.standard.torchao as mlp_row
 
     config = _tiny_config()
-    model = _qwen3_with_ops(config, linear_implementation="torchao_nvfp4", swiglu_mlp_implementation="torchao_nvfp4")
+    model = _qwen3_with_ops(config, linear_implementation="torchao", swiglu_mlp_implementation="torchao")
     names_by_ptr = {param.data_ptr(): name for name, param in model.named_parameters()}
     rounded = set()
 
@@ -755,10 +755,8 @@ def test_qwen3_nvfp4_qat_rounds_exactly_the_projection_weights(monkeypatch):
 @pytest.mark.parametrize(
     ("ops", "targets"),
     [
-        pytest.param(
-            {"linear_implementation": "torchao_nvfp4"}, ["q_proj", "k_proj", "v_proj", "o_proj"], id="attention"
-        ),
-        pytest.param({"swiglu_mlp_implementation": "torchao_nvfp4"}, ["gate_proj", "up_proj", "down_proj"], id="mlp"),
+        pytest.param({"linear_implementation": "torchao"}, ["q_proj", "k_proj", "v_proj", "o_proj"], id="attention"),
+        pytest.param({"swiglu_mlp_implementation": "torchao"}, ["gate_proj", "up_proj", "down_proj"], id="mlp"),
     ],
 )
 @_cpu
@@ -772,7 +770,7 @@ def test_qwen3_nvfp4_qat_refuses_a_wrapped_projection(ops, targets):
     model = _qwen3_with_ops(config, **ops)
     inject_dense_lora(model.model, VeOmniLoraConfig(r=8, lora_alpha=16, target_modules=targets), "default")
 
-    with pytest.raises(ValueError, match="torchao_nvfp4.* cannot run on"):
+    with pytest.raises(ValueError, match="torchao.* cannot run on"):
         model(input_ids=torch.randint(3, config.vocab_size, (1, 4)), use_cache=False)
 
 

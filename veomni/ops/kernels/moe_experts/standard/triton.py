@@ -698,10 +698,10 @@ def wrapper(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
     block_size: int = 128,
-    expert_dtype: str = "fp8",
+    dtype: str = "fp8",
 ) -> Tensor:
     """Call the Triton fused MoE Function. Empty weights are ``None``."""
-    del block_size, expert_dtype
+    del block_size, dtype
     # Empty tensor = unused layout. Registry args stay tensors.
     return group_gemm_fused_moe_forward(
         num_experts,

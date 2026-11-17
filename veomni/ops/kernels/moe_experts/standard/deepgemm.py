@@ -78,13 +78,12 @@ def wrapper(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
     # Accepted to honour the family-wide call signature: ``DeepseekV4Experts``
-    # passes both at every call whatever row it resolved. Neither is something this
-    # row can vary -- the format is FP8 because the name says so, and DeepGEMM fixes
-    # its tile -- so they are dropped below rather than forwarded. ``register_op``
-    # declares the row ``NATIVE``, which is what stops a config from setting them at
-    # all (see ``_check_kwargs``) instead of accepting a key that would be ignored.
+    # passes every one of these at every call whatever row it resolved. Neither
+    # ``block_size`` nor ``dtype`` is something this row can vary -- DeepGEMM fixes
+    # its tile, and the row's registered ``dtypes`` says FP8 is the only format it
+    # implements -- so they are dropped below rather than forwarded.
     block_size: int = 128,
-    expert_dtype: str = "fp8",
+    dtype: str = "fp8",
 ) -> Tensor:
     """Run FP8 expert GEMMs with BF16 inputs, outputs and first-order gradients.
 
@@ -97,15 +96,15 @@ def wrapper(
     """
     # The format is fixed by the row, not by the caller: see the note on the
     # signature. Dropping them here keeps the intent visible at the point of use.
-    del block_size, expert_dtype
+    del block_size, dtype
     if (
         hidden_states.device.type != "cuda"
         or torch.version.hip is not None
         or torch.cuda.get_device_capability(hidden_states.device) not in ((9, 0), (10, 0))
     ):
-        raise RuntimeError("deepgemm_fp8 requires NVIDIA Hopper SM90 or Blackwell SM100.")
+        raise RuntimeError("deepgemm requires NVIDIA Hopper SM90 or Blackwell SM100.")
     if hidden_states.ndim != 2 or hidden_states.dtype != torch.bfloat16:
-        raise ValueError("deepgemm_fp8 requires BF16 hidden_states with shape [tokens, hidden].")
+        raise ValueError("deepgemm requires BF16 hidden_states with shape [tokens, hidden].")
     if (
         selected_experts.ndim != 2
         or selected_experts.shape[1] == 0

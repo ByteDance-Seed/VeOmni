@@ -1189,8 +1189,8 @@ def test_compile_rejects_torchao_mxfp4(field):
         {},
         {"linear_implementation": "eager"},
         {"linear_implementation": "qat"},
-        {"linear_implementation": "torchao_nvfp4"},
-        {"swiglu_mlp_implementation": "torchao_nvfp4"},
+        {"linear_implementation": "torchao"},
+        {"swiglu_mlp_implementation": "torchao"},
     ],
 )
 def test_compile_allows_other_rows(ops_fields):

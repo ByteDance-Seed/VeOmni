@@ -1793,7 +1793,7 @@ class DeepseekV4Experts(nn.Module):
             num_experts=self.num_experts,
             swiglu_limit=self.limit,
             assume_distinct_experts=self.assume_distinct_experts,
-            expert_dtype=self.expert_dtype,
+            dtype=self.expert_dtype,
         )
 
 

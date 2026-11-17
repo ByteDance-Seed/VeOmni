@@ -167,28 +167,36 @@ def validate_compile_runtime(
     validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
 
 
-#: Op rows whose kernels emit dtypes Inductor cannot lower.
+#: Op rows whose kernels emit dtypes Inductor cannot lower, keyed by
+#: ``(config field, row name)`` and giving the format that triggers it.
 #:
-#: ``torchao_mxfp4`` materializes ``float8_e8m0fnu`` scale tensors, and Inductor's
-#: codegen has no lowering for that dtype. A runtime check cannot catch it, so the
-#: selection is refused here, by config field. Formats whose scales use a dtype
-#: Inductor knows (``torchao_nvfp4`` uses ``float8_e4m3fn`` plus an FP32
-#: per-tensor scale) stay out of this table.
-_UNCOMPILABLE_IMPLS: dict[str, str] = {
-    "linear_implementation": "torchao_mxfp4",
-    "swiglu_mlp_implementation": "torchao_mxfp4",
+#: ``mxfp4`` materializes ``float8_e8m0fnu`` scale tensors, and Inductor's codegen
+#: has no lowering for that dtype. A runtime check cannot catch it, so the selection
+#: is refused here, from the config. It is keyed on the *format* rather than the row
+#: because the row is ``torchao`` for both FP4 layouts: a config may compile with
+#: ``dtype: nvfp4`` (float8_e4m3fn scales plus an FP32 per-tensor scale, both of
+#: which Inductor knows) and must not with ``dtype: mxfp4``.
+_UNCOMPILABLE_FORMATS: dict[str, tuple[str, str]] = {
+    "linear_implementation": ("torchao", "mxfp4"),
+    "swiglu_mlp_implementation": ("torchao", "mxfp4"),
 }
 
 
 def _uncompilable_selections(ops) -> list[str]:
-    """Return the offending ``field=impl`` strings on one ops config, if any."""
+    """Return the offending ``field=row(dtype=...)`` strings on one ops config, if any."""
     if ops is None:
         return []
-    return [
-        f"{field}={getattr(ops, field)!r}"
-        for field, impl in _UNCOMPILABLE_IMPLS.items()
-        if getattr(ops, field, None) == impl
-    ]
+    offending: list[str] = []
+    for field, (impl, dtype) in _UNCOMPILABLE_FORMATS.items():
+        value = getattr(ops, field, None)
+        name = getattr(value, "name", value)
+        if name != impl:
+            continue
+        # A bare row name means the row's default format, which is not this one.
+        kwargs = getattr(value, "kwargs", {}) or {}
+        if kwargs.get("dtype") == dtype:
+            offending.append(f"{field}={impl}(dtype={dtype!r})")
+    return offending
 
 
 def _reject_incompatible_ops(model: nn.Module) -> None:
@@ -205,8 +213,8 @@ def _reject_incompatible_ops(model: nn.Module) -> None:
     if offending:
         raise RuntimeError(
             "model.accelerator.torch_compile cannot be combined with "
-            f"{', '.join(offending)}: those rows emit tensors of a dtype Inductor cannot lower "
-            "(float8_e8m0fnu for torchao_mxfp4). Disable compilation or select a different row."
+            f"{', '.join(offending)}: those selections emit tensors of a dtype Inductor cannot lower "
+            "(float8_e8m0fnu for the mxfp4 layout). Disable compilation or select a different dtype."
         )
 
 

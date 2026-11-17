@@ -1,28 +1,37 @@
 # Dense Qwen3 torchao FP4 QAT
 
 This page documents the torchao-backed FP4 quantization-aware training row,
-`torchao_nvfp4`.
+`torchao`.
 
-`torchao_nvfp4` fake-quantizes the operands of selected projections to NVFP4 so
-training sees the rounding an NVFP4 deployment kernel applies with dynamic
-two-level runtime scaling (not a calibrated static activation scale). It is an
-op implementation, selected exactly like `liger_kernel` or `eager` — not a
-separate quantization recipe, and not a module rewrite. Parameters stay ordinary
-floating point tensors with unchanged names, and checkpoint/export paths are
-untouched.
+`torchao` fake-quantizes the operands of selected projections so training sees the
+rounding a deployment kernel applies. It is an op implementation, selected exactly
+like `liger_kernel` or `eager` — not a separate quantization recipe, and not a
+module rewrite. Parameters stay ordinary floating point tensors with unchanged
+names, and checkpoint/export paths are untouched.
 
-It is **emulated**, not native, despite the name: torchao has a real NVFP4 GEMM,
-and this row is not it. The row borrows torchao's `NVFP4Tensor` round trip to match
-that kernel's numerics and then multiplies in the model dtype (nonempty operands
+The **format is a row argument**, `dtype`:
+
+| `dtype` | Element | Scale | Group width |
+| --- | --- | --- | --- |
+| `nvfp4` | E2M1 | E4M3 block scale + an FP32 per-tensor scale (two-level, dynamic `amax`) | 16 |
+| `mxfp4` | E2M1 | one E8M0 power-of-two block scale, no per-tensor scale | 32 |
+
+Nothing about the two layouts changes how the row is selected: the row is `torchao`
+either way, and the format is what a config asks for. `block_size` defaults to the
+format's group width, which is the only width it defines.
+
+Both are **emulated**, not native, despite what the names suggest: torchao has real
+FP4 GEMMs and this row is not one. It borrows torchao's tensor round trips to match
+those kernels' numerics and then multiplies in the model dtype (nonempty operands
 must be BF16 or FP32; FP16 is rejected at runtime even though
 `mixed_precision.param_dtype` accepts `float16`). No native FP4 training kernels
 and no Blackwell requirement during QAT.
 
 The registry records that difference as `RowPrecision` — `EMULATED` here, `NATIVE`
 for a row that casts and runs the GEMM in the target format (the only such row
-today is `deepgemm_fp8` on `moe_experts`) — which is what decides that this row
-takes `block_size` from a config while a native row may not, and that an adapter
-cannot sit in front of it. See [op selection](../design/op_selection.md).
+today is `deepgemm` on `moe_experts`) — which is what decides that a native row
+takes no `dtype` from a config, and that an adapter cannot sit in front of either.
+See [op selection](../design/op_selection.md).
 
 ## The two op rows
 
@@ -42,18 +51,18 @@ quantization-aware training recipe — the others being `moe_implementation` and
 no global recipe switch: each family owns its own row. See
 [op selection](../design/op_selection.md).
 
-`torchao_nvfp4` is registered for `linear` / `standard` only. DeepSeek-V4 also
+`torchao` is registered for `linear` / `standard` only. DeepSeek-V4 also
 binds `linear` / `grouped` (its `o_a_proj`), so it cannot select
-`linear_implementation: torchao_nvfp4`; model construction raises instead of
-quantizing only some of its projections.
+`linear_implementation: torchao`; model construction raises instead of quantizing
+only some of its projections.
 
 ## Recipe
 
-| Property | `torchao_nvfp4` |
+| Property | `torchao` |
 | --- | --- |
-| Format | NVFP4: E2M1 element, E4M3 block scale + FP32 per-tensor scale |
-| Group width | 16, the NVIDIA NVFP4 width (`block_size` other than 16 raises) |
-| Scale calculation | Two-level dynamic `amax` (`NVFP4Tensor`) |
+| Format | `dtype=nvfp4` (default) or `dtype=mxfp4` |
+| Group width | 16 for `nvfp4`, 32 for `mxfp4` (`block_size` other than the format's width raises) |
+| Scale calculation | `NVFP4Tensor` (two-level `amax`) or `MXTensor` (E8M0), per `dtype` |
 | Operand dtypes | BF16 or FP32 (FP16 rejected at runtime) |
 | Quantized | Both GEMM operands (activation and weight) |
 | Backward | Straight-through, using the quantized operands |
@@ -100,16 +109,20 @@ Select the implementation under the model's existing ops config:
 ```yaml
 model:
   ops_implementation:
-    linear_implementation: torchao_nvfp4
-    swiglu_mlp_implementation: torchao_nvfp4
+    linear_implementation:
+      name: torchao
+      kwargs: {dtype: nvfp4}
+    swiglu_mlp_implementation:
+      name: torchao
+      kwargs: {dtype: nvfp4}
 ```
 
 An unselected field falls back to that family's host default — `eager` for
 `linear`, `liger_kernel` on GPU/MLU and `eager` on NPU for `swiglu_mlp`. Either
 way that family is **not** quantized, so a config that sets only
 `linear_implementation` trains NVFP4 attention with a full-precision MLP.
-Selecting `torchao_nvfp4` without `torchao` installed raises
-`Op 'linear' variant='standard' impl='torchao_nvfp4' requires unavailable
+Selecting `torchao` without `torchao` installed raises
+`Op 'linear' variant='standard' impl='torchao' requires unavailable
 package(s): 'torchao'` at model construction; it never falls back silently.
 A quantizing `swiglu_mlp` row on a model whose activation is not SiLU is
 refused at config load, as for every quantizing `swiglu_mlp` row.
@@ -129,17 +142,17 @@ convergence recipe.
 A quantizing row fake-quantizes the projection's own `weight`. LoRA replaces the
 matched `nn.Linear` with a `LoraLinear` that keeps the base layer at
 `base_layer`, so the weight is no longer reachable as `q_proj.weight`. A model
-built with `linear_implementation: torchao_nvfp4` therefore raises
-`linear_implementation='torchao_nvfp4' cannot run on 'LoraLinear'` as soon as an
+built with `linear_implementation: torchao` therefore raises
+`linear_implementation='torchao' cannot run on 'LoraLinear'` as soon as an
 adapter on those projections forwards, instead of quietly training the
 unquantized base layer while the config still claims NVFP4.
 
 Set `linear_implementation: eager` for adapter training: the eager row calls the
 projection module, so the adapter's own forward runs. The fused MLP row follows
 the same rule, and only for the quantizing value: with
-`swiglu_mlp_implementation: torchao_nvfp4` and an adapter on
+`swiglu_mlp_implementation: torchao` and an adapter on
 `gate_proj`/`up_proj`/`down_proj`, the forward raises
-`swiglu_mlp_implementation='torchao_nvfp4' cannot run on a wrapped projection`.
+`swiglu_mlp_implementation='torchao' cannot run on a wrapped projection`.
 `liger_kernel` is **not** affected — it is an arithmetic rewrite that keeps the
 projection-module fallback.
 
@@ -148,7 +161,7 @@ projection-module fallback.
 [Float8 training](float8_training.md) converts its `target_modules` into
 torchao's `Float8Linear`, an `nn.Linear` subclass whose forward runs FP8 GEMMs.
 A quantizing `linear` or `swiglu_mlp` row only runs on an exact `nn.Linear`, so
-selecting `torchao_nvfp4` for a projection that float8 also targets raises
+selecting `torchao` for a projection that float8 also targets raises
 `cannot run on nn.Linear subclass 'Float8Linear'` instead of silently skipping
 the FP8 GEMMs. Pick one recipe per projection.
 
@@ -165,7 +178,7 @@ partitioning.
 | Mode | Status |
 | --- | --- |
 | FSDP2 / HSDP sharding (decoder-layer wrapping) | works: FSDP2 all-gathers each block's parameters before its forward, so the row sees whole tensors |
-| `basic_modules: [Linear]` (per-projection FSDP2 wrapping) | `eager` works, because it calls the projection module and its unshard hook runs. `torchao_nvfp4` is refused: FSDP2 turns the projection into an `FSDPLinear` subclass whose forward unshards the weight, so the row cannot read the whole weight directly |
+| `basic_modules: [Linear]` (per-projection FSDP2 wrapping) | `eager` works, because it calls the projection module and its unshard hook runs. `torchao` is refused: FSDP2 turns the projection into an `FSDPLinear` subclass whose forward unshards the weight, so the row cannot read the whole weight directly |
 | Sequence / context parallel | works; the sharded axis is the sequence (see the `amax` note above) |
 | Tensor parallel | not implemented in VeOmni, independently of this row |
 
@@ -179,10 +192,10 @@ an ordinary tensor.
 
 ### `torch.compile`
 
-`torchao_nvfp4` uses `float8_e4m3fn` block scales and an FP32 per-tensor scale.
+`torchao` uses `float8_e4m3fn` block scales and an FP32 per-tensor scale.
 Inductor compilation can fail on pre-SM89 CUDA GPUs because Triton does not
 support the E4M3 casts there; disable `torch.compile` on those GPUs when using
-`torchao_nvfp4`.
+`torchao`.
 
 Whether compiled rounding matches the eager round trip depends on the GPU.
 `torch.compile(nvfp4_fake_quant)` was measured on a `4096 x 1024` BF16 tensor:

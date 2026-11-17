@@ -789,7 +789,7 @@ def wrapper(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
     block_size: int = 128,
-    expert_dtype: str = "fp8",
+    dtype: str = "fp8",
 ) -> Tensor:
     """Call the Quack fused MoE Function. Empty weights are ``None``."""
     # Empty tensor = unused layout. Registry args stay tensors.

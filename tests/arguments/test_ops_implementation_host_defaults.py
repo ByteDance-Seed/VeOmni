@@ -153,21 +153,24 @@ def test_explicit_npu_value_is_kept_on_npu(field_name: str, value: str, monkeypa
 
 
 @pytest.mark.parametrize(
-    ("field_name", "value"),
+    ("field_name", "value", "expected"),
     [
-        ("moe_implementation", "fused_triton"),
-        ("cross_entropy_loss_implementation", "liger_kernel"),
-        ("rms_norm_implementation", "liger_kernel"),
-        ("swiglu_mlp_implementation", "liger_kernel"),
-        ("linear_implementation", "torchao_mxfp4"),
-        ("kv_round_implementation", "triton"),
-        ("rotary_pos_emb_implementation", "liger_kernel"),
-        ("load_balancing_loss_implementation", "triton"),
+        ("moe_implementation", "fused_triton", None),
+        ("cross_entropy_loss_implementation", "liger_kernel", None),
+        ("rms_norm_implementation", "liger_kernel", None),
+        ("swiglu_mlp_implementation", "liger_kernel", None),
+        # The old name carried its format; it migrates to the row plus a ``dtype``,
+        # so the refusal names the row rather than the format.
+        ("linear_implementation", "torchao_mxfp4", "torchao"),
+        ("kv_round_implementation", "triton", None),
+        ("rotary_pos_emb_implementation", "liger_kernel", None),
+        ("load_balancing_loss_implementation", "triton", None),
     ],
 )
-def test_explicit_gpu_default_raises_on_npu(field_name: str, value: str, monkeypatch: pytest.MonkeyPatch):
+def test_explicit_gpu_default_raises_on_npu(field_name: str, value: str, expected: str | None, monkeypatch):
     _set_host(monkeypatch, "npu")
-    with pytest.raises(ValueError, match=f"{field_name}='{value}' is not supported on Ascend NPU"):
+    named = value if expected is None else expected
+    with pytest.raises(ValueError, match=f"{field_name}='{named}' is not supported on Ascend NPU"):
         OpsImplementationConfig(**{field_name: value})
 
 

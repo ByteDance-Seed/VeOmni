@@ -22,13 +22,14 @@ Empty biases are unused.
 from torch import nn
 
 from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, MluKernelRequirement
+from ...qat.torchao_fp4 import SUPPORTED_DTYPES
 from ...registry import RowPrecision, register_op
 from .geglu import eager as geglu_eager
 from .geglu import liger_kernel as geglu_liger
 from .standard import eager as standard_eager
 from .standard import liger_kernel as standard_liger
 from .standard import qat as standard_qat
-from .standard import torchao_nvfp4 as standard_torchao_nvfp4
+from .standard import torchao as standard_torchao
 
 
 _GPU = GpuKernelRequirement()
@@ -154,11 +155,12 @@ register_op(
 register_op(
     "swiglu_mlp",
     "standard",
-    "torchao_nvfp4",
-    description="TorchAO NVFP4 fake-quantized SwiGLU MLP with optional activation clamping",
+    "torchao",
+    description="TorchAO FP4 fake-quantized SwiGLU MLP with optional activation clamping",
     precision=RowPrecision.EMULATED,
-    wrapper=standard_torchao_nvfp4.wrapper,
+    wrapper=standard_torchao.wrapper,
     requires=("torchao",),
+    dtypes=SUPPORTED_DTYPES,
 )
 
 

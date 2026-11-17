@@ -118,7 +118,7 @@ Both wrappers always call ``VeomniOp("moe_experts_lora", variant, impl)``.
 ``variant`` is the wrapper class (``shared`` / ``independent``). ``impl``
 follows the wrapped experts' ``veomni_moe`` handle when that LoRA row is
 available on this device, and falls back to ``eager`` otherwise. Two backends
-reject expert LoRA rather than changing precision: ``deepgemm_fp8``, and the
+reject expert LoRA rather than changing precision: ``deepgemm``, and the
 ``qat`` row, which has no adapter forward that would fake-quantize the weights.
 
 PEFT-format save/load compatibility (PEFT-aligned FQN layout)

@@ -47,9 +47,9 @@ when the selected implementation runs.
 | `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `offset` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; all accept optional `group_size` (fused weighted rows delegate grouped calls to eager) |
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
-| `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel`; `qat` (FP8 QAT) and `torchao_nvfp4` (NVFP4 QAT) are `standard` only |
-| `linear` | `standard`, `grouped` | `eager`, `qat` (FP8 QAT), `torchao_nvfp4` (NVFP4 QAT, `standard` only). Rows take the projection **module** (`op(self.q_a_proj, x)`), not a weight tensor, so adapters work |
-| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `qat` (FP8/FP4 QAT), `deepgemm_fp8` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant |
+| `swiglu_mlp` | `standard`, `geglu` | `eager`, `liger_kernel`; `qat` (FP8 QAT) and `torchao` (NVFP4 QAT) are `standard` only |
+| `linear` | `standard`, `grouped` | `eager`, `qat` (FP8 QAT), `torchao` (NVFP4 QAT, `standard` only). Rows take the projection **module** (`op(self.q_a_proj, x)`), not a weight tensor, so adapters work |
+| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `qat` (FP8/FP4 QAT), `deepgemm` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `token_logprobs` | `standard` | `eager`, `flash_attn` (GPU Triton cross-entropy), `torch_npu` (Ascend NPU cross-entropy) |
@@ -117,7 +117,7 @@ and is optional; install it with:
 uv sync --extra gpu --extra magi --dev
 ```
 
-The opt-in `deepgemm_fp8` MoE backend uses native FP8 grouped GEMMs
+The opt-in `deepgemm` MoE backend uses native FP8 grouped GEMMs
 for forward, input gradients and weight gradients on Hopper and Blackwell SM100.
 Its hidden states and weight interface remain BF16; optional FSDP2
 `expert_weight_fp8_all_gather` supplies block-quantized expert payloads directly. Routing

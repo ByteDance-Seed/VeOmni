@@ -20,7 +20,7 @@ layers in the model dtype, the routed experts quantized while the shared expert 
 not. :class:`OpsSelection` expresses that: a default row, its row arguments, and
 regex overrides keyed by site.
 
-Both halves are just the row name. ``qat``, ``torchao_nvfp4`` and ``deepgemm_fp8``
+Both halves are just the row name. ``qat``, ``torchao`` and ``deepgemm``
 are rows, so "which precision", "fake quantization or the vendor GEMM" and "which
 package provides it" are already encoded in the name the registry resolves; what a
 row still needs to know per call is its *arguments* -- ``dtype``, ``block_size`` --
@@ -60,16 +60,19 @@ class SiteOverride:
     ``kwargs``. A rule that sets ``name: eager`` is how "keep these layers in the
     model dtype" is spelled -- there is no separate "disable" flag to keep in sync
     with the row name.
+
+    ``kwargs`` are merged over the enclosing ones, key by key. A key the row that
+    ends up running does not accept is simply not passed to it: the enclosing block
+    describes the family, and a site that switched to a row with a different
+    signature is not asking for the enclosing block's arguments there. There is
+    nothing to clear, so there is no ``replace_kwargs``.
     """
 
     site: str
     name: str | None = None
     #: Merged over the enclosing ``kwargs``. ``None`` means "not specified" and
-    #: inherits; a mapping replaces only the keys it names. To drop inherited
-    #: arguments -- which is what switching to a row with a different signature
-    #: needs -- write ``kwargs: {}`` together with ``replace_kwargs: true``.
+    #: inherits; a mapping overrides only the keys it names.
     kwargs: dict[str, Any] | None = None
-    replace_kwargs: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.site, str) or not self.site:
@@ -82,10 +85,6 @@ class SiteOverride:
             raise ValueError(f"override name must be a nonempty string, got {self.name!r}.")
         if self.kwargs is not None and not isinstance(self.kwargs, dict):
             raise TypeError(f"override kwargs must be a mapping, got {type(self.kwargs).__name__}.")
-        if type(self.replace_kwargs) is not bool:
-            raise ValueError(f"override replace_kwargs must be a bool, got {self.replace_kwargs!r}.")
-        if self.replace_kwargs and self.kwargs is None:
-            raise ValueError("replace_kwargs requires kwargs (use {} to drop every inherited argument).")
 
     def matches(self, site: str) -> bool:
         """Whether ``site`` is covered by this rule."""
@@ -96,7 +95,7 @@ class SiteOverride:
         """Build from a YAML mapping, rejecting unknown keys."""
         if not isinstance(raw, dict):
             raise TypeError(f"an override must be a mapping, got {type(raw).__name__}.")
-        known = {"site", "name", "kwargs", "replace_kwargs"}
+        known = {"site", "name", "kwargs"}
         unknown = set(raw) - known
         if unknown:
             raise ValueError(f"Unknown override keys: {sorted(unknown)}. Known: {sorted(known)}.")
@@ -106,7 +105,6 @@ class SiteOverride:
             site=raw["site"],
             name=raw.get("name"),
             kwargs=raw.get("kwargs"),
-            replace_kwargs=raw.get("replace_kwargs", False),
         )
 
 
@@ -144,9 +142,7 @@ class OpsSelection:
         for rule in rules:
             if rule.name is not None:
                 name = rule.name
-            if rule.replace_kwargs:
-                kwargs = dict(rule.kwargs or {})
-            elif rule.kwargs:
+            if rule.kwargs:
                 kwargs.update(rule.kwargs)
         return OpsSelection(name=name, kwargs=kwargs)
 

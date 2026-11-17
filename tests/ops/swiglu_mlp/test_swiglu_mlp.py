@@ -672,7 +672,7 @@ def test_a_linear_subclass_projection_skips_the_fused_path():
         has_plain_linear_projections(mlp)
 
 
-_requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reason="torchao_nvfp4 row needs torchao")
+_requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reason="torchao row needs torchao")
 _cpu = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
@@ -681,9 +681,9 @@ _cpu = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("swiglu_limit", [None, 1.0])
 def test_torchao_nvfp4_matches_manual_round_trip(swiglu_limit: float | None):
     """The fused row equals the same math with operands quantized by hand, clamp in the model dtype."""
-    from veomni.ops.qat.torchao_nvfp4 import nvfp4_fake_quant
+    from veomni.ops.qat.torchao_fp4 import nvfp4_fake_quant
 
-    impl = resolve_op("swiglu_mlp", "standard", "torchao_nvfp4").wrapper
+    impl = resolve_op("swiglu_mlp", "standard", "torchao").wrapper
     torch.manual_seed(0)
     mlp = _tiny_qwen3_mlp(64, 128).to(dtype=torch.bfloat16)
     x = torch.randn(2, 16, 64, dtype=torch.bfloat16)
@@ -707,7 +707,7 @@ def test_torchao_nvfp4_matches_manual_round_trip(swiglu_limit: float | None):
 @_requires_torchao
 def test_torchao_nvfp4_backward_produces_finite_gradients():
     """Straight-through gradients reach the input and every projection weight."""
-    impl = resolve_op("swiglu_mlp", "standard", "torchao_nvfp4").wrapper
+    impl = resolve_op("swiglu_mlp", "standard", "torchao").wrapper
     torch.manual_seed(0)
     mlp = _tiny_qwen3_mlp().to(dtype=torch.bfloat16)
     x = torch.randn(2, 16, mlp.hidden_size, dtype=torch.bfloat16, requires_grad=True)
@@ -724,7 +724,7 @@ def test_torchao_nvfp4_backward_produces_finite_gradients():
 @_requires_torchao
 def test_torchao_nvfp4_handles_empty_input():
     """Zero-token inputs keep their shape and propagate zero gradients to the MLP weights."""
-    impl = resolve_op("swiglu_mlp", "standard", "torchao_nvfp4").wrapper
+    impl = resolve_op("swiglu_mlp", "standard", "torchao").wrapper
     mlp = _tiny_qwen3_mlp().to(dtype=torch.bfloat16)
     x = torch.randn(0, 8, mlp.hidden_size, dtype=torch.bfloat16, requires_grad=True)
 

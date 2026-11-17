@@ -25,7 +25,9 @@ from ..platform import NVIDIA_SM90_PLUS
 
 #: Rows whose fake quantization needs a device with native BF16 support: the
 #: operand they round is a BF16 tensor and the trained GEMM runs in that dtype.
-_NATIVE_BF16_QAT_IMPLS = frozenset({"torchao_mxfp4", "torchao_nvfp4"})
+#: Named by row, not by format, because it is the torchao round trip that needs
+#: BF16 -- the format is an argument and does not change the requirement.
+_TORCHAO_FP4_ROW = "torchao"
 
 
 def _native_bf16_qat_selections(model: nn.Module) -> set[str]:
@@ -36,9 +38,10 @@ def _native_bf16_qat_selections(model: nn.Module) -> set[str]:
         ops = getattr(config, "ops_config", None)
         if ops is not None:
             for field in ("linear_implementation", "swiglu_mlp_implementation"):
-                impl = getattr(ops, field, None)
-                if impl in _NATIVE_BF16_QAT_IMPLS:
-                    found.add(impl)
+                value = getattr(ops, field, None)
+                name = getattr(value, "name", value)
+                if name == _TORCHAO_FP4_ROW:
+                    found.add(name)
         for name in getattr(config, "sub_configs", {}) or {}:
             child = getattr(config, name, None)
             if child is not None:
@@ -65,7 +68,7 @@ def reject_qat_without_native_bf16(model: nn.Module) -> None:
         return
     if get_gpu_compute_capability() < 80:
         raise RuntimeError(
-            f"torchao QAT rows ({', '.join(sorted(selected))}) require a CUDA device with native "
+            f"torchao FP4 QAT rows ({', '.join(sorted(selected))}) require a CUDA device with native "
             "BF16 support (SM80 or newer); this host reports an older compute capability."
         )
 

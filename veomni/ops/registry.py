@@ -74,7 +74,7 @@ class RowPrecision(Enum):
         This is the guard question rather than the config question. A rounding row
         reads the real weights -- a wrapped projection has none to give -- cannot sit
         behind an adapter, and bakes one activation into its fused kernel.
-        ``deepgemm_fp8`` answers yes exactly like ``qat``.
+        ``deepgemm`` answers yes exactly like ``qat``.
         """
         return self is not RowPrecision.EXACT
 
@@ -85,7 +85,7 @@ class RowPrecision(Enum):
         Only ``EMULATED`` rows are parameterised. An emulation has to be told which
         format to stand in for and at what block width, because one row serves both
         an FP8 and an FP4 checkpoint. A ``NATIVE`` row's format *is* its name --
-        ``deepgemm_fp8`` has no width to choose -- so a config that sets an argument
+        ``deepgemm`` has no width to choose -- so a config that sets an argument
         on it is asking for something the kernel cannot vary, and the answer is to
         refuse rather than accept a key that will be ignored.
         """
@@ -226,6 +226,12 @@ class OpEntry:
     #: selection may pass ``kwargs``, whether the row can run behind an adapter,
     #: and whether it is a stand-in for a deployment kernel or the kernel itself.
     precision: RowPrecision = _DEFAULT_PRECISION
+    #: Numeric formats this row can round to, as the values its ``dtype`` argument
+    #: accepts. Empty for an ``EXACT`` row, which rounds nothing. The format is a
+    #: row *argument* rather than part of the name: ``qat`` serves FP8 and FP4
+    #: checkpoints, and ``torchao`` serves whatever torchao can fake-quantize, so
+    #: naming the row after one format would either multiply rows or lie.
+    dtypes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate the raw/wrapper pairing and generate the wrapper if needed."""
@@ -239,6 +245,15 @@ class OpEntry:
             raise ValueError("requires must not contain duplicate package names")
         if not isinstance(self.default, bool):
             raise TypeError("default must be a bool")
+        if not isinstance(self.dtypes, tuple) or not all(
+            isinstance(name, str) and name.strip() for name in self.dtypes
+        ):
+            raise TypeError("dtypes must be a tuple of non-empty format names")
+        if self.dtypes and not self.precision.rounds_operands:
+            raise ValueError(
+                f"{self.op}/{self.variant}/{self.impl} is {self.precision.name} and rounds nothing, "
+                "so it cannot declare the formats it rounds to"
+            )
         if not isinstance(self.precision, RowPrecision):
             raise TypeError(f"precision must be a RowPrecision member, got {type(self.precision).__name__}")
         if self.default and self.requirement is None:
@@ -363,6 +378,19 @@ class OpRegistry:
                 seen.append(impl)
         return seen
 
+    def all_impls(self, op: str) -> list[str]:
+        """Return every registered impl name for ``op``, across variants and devices.
+
+        For the config-time checks that ask what a *family* can express rather than
+        what one variant on this host can run: a key written on a family field is
+        meaningful if any row of that family takes it.
+        """
+        seen: list[str] = []
+        for entry_op, _variant, impl, _device in self._entries:
+            if entry_op == op and impl not in seen:
+                seen.append(impl)
+        return seen
+
     def list_available(self, op: str, variant: str) -> list[str]:
         """Return impl names whose hardware and optional packages are available."""
         device = get_device_type()
@@ -435,7 +463,7 @@ class OpRegistry:
         This is the set a guard wants when the question is "does this row read the
         real weights and compute on rounded values?" -- a wrapped projection has no
         ``weight`` for it, every fused kernel bakes one activation into it, and an
-        adapter cannot sit in front of it. ``deepgemm_fp8`` belongs here alongside
+        adapter cannot sit in front of it. ``deepgemm`` belongs here alongside
         ``qat``; only the two differ in *how* they round, which is what
         :meth:`emulated_impls` answers.
         """
@@ -444,6 +472,15 @@ class OpRegistry:
             for (entry_op, _variant, _impl, _device), entry in self._entries.items()
             if entry_op == op and entry.precision.rounds_operands
         )
+
+    def row_dtypes(self, op: str, impl: str) -> tuple[str, ...] | None:
+        """The formats ``impl`` of ``op`` can round to, or ``None`` if unregistered.
+
+        An empty tuple is a valid answer: an ``EXACT`` row rounds nothing, so there is
+        no format to choose. ``None`` means the row does not exist at all.
+        """
+        entry = self.first_entry(op, impl)
+        return None if entry is None else entry.dtypes
 
     def row_arguments(self, op: str, impl: str) -> dict[str, Any] | None:
         """The keyword arguments a selection may set on ``impl`` of ``op``, name to default.
@@ -459,9 +496,9 @@ class OpRegistry:
         call-only, which is also why the third precedence step does not reach it.
 
         An empty mapping for a ``NATIVE`` row means "registered, accepts nothing from
-        a config": its format is its name, so the parameters it must still take to
-        honour the family-wide call signature are not choices. That distinction
-        matters -- ``None`` means "unregistered", which the callers skip.
+        a config": a native row's format is fixed by the row, so the parameters it
+        must still take to honour the family-wide call signature are not choices.
+        That distinction matters -- ``None`` means "unregistered", which callers skip.
 
         Returns ``None`` when ``impl`` is not registered for ``op`` on any device.
         """
@@ -531,6 +568,7 @@ def register_op(
     requires: tuple[str, ...] = (),
     default: bool = False,
     precision: RowPrecision = _DEFAULT_PRECISION,
+    dtypes: tuple[str, ...] = (),
 ) -> None:
     """Register one row on ``OP_REGISTRY``.
 
@@ -545,8 +583,11 @@ def register_op(
     ``precision`` says what the row does to its operands: ``EXACT`` computes on
     them unchanged, ``EMULATED`` rounds them and runs the GEMM in the model dtype,
     and ``NATIVE`` casts them and runs the GEMM in that format. Only the last two
-    take row arguments, and ``NATIVE`` is what distinguishes ``deepgemm_fp8`` from
+    take row arguments, and ``NATIVE`` is what distinguishes ``deepgemm`` from
     ``qat`` even though both round.
+    ``dtypes`` lists the formats the row's ``dtype`` argument accepts. The format is
+    an argument, not part of the name: ``qat`` serves an FP8 and an FP4 checkpoint,
+    and ``torchao`` serves whatever torchao can fake-quantize.
     """
     OP_REGISTRY.register(
         OpEntry(
@@ -561,6 +602,7 @@ def register_op(
             requires=requires,
             default=default,
             precision=precision,
+            dtypes=dtypes,
         )
     )
 
@@ -580,64 +622,50 @@ def _rebuild_op(op: str, variant: str, impl: str, kwargs: Mapping[str, Any]) -> 
     return VeomniOp(op, variant, impl).with_kwargs(kwargs)
 
 
-def _check_kwargs(entry: OpEntry, kwargs: Mapping[str, Any]) -> None:
-    """Refuse row arguments the row cannot honour.
+def _filter_kwargs(entry: OpEntry, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """The subset of ``kwargs`` this row can honour, dropping the rest.
 
-    Two things are checked, and the first is the important one.
+    A row argument says how to round: ``dtype``, ``block_size``, the checkpoint's
+    ``expert_dtype``. A family field names one row for every site of a family, so
+    the enclosing block's ``kwargs`` describe *that* row; a site that overrides the
+    name to a row with a different signature is not asking for them. Passing a key
+    the row does not take would either raise on a legitimate config or -- worse,
+    for a row whose signature has a ``**attrs`` tail -- be dropped at the call.
 
-    **Only a rounding row takes arguments.** ``kwargs`` describe how to round --
-    ``dtype``, ``block_size``, the checkpoint's ``expert_dtype``. A fused reference
-    row such as ``fused_triton`` is ``EXACT``: it has no rounding to describe, so a
-    config that passes arguments to it asks for something the row will not do;
-    accepting them would leave the config saying one thing and the step doing
-    another.
+    Dropping is only safe because the config layer has already refused a key that
+    is meaningless for *every* row of the family (see
+    ``OpsImplementationConfig._validate_row_arguments``): a typo like ``block_siz``
+    is caught there, against the whole family, before any site is resolved. What
+    reaches here and is dropped is inherited, not requested at this site.
 
-    **A native row's format is its name, so it takes none either.** ``deepgemm_fp8``
-    rounds, but to FP8 at the width DeepGEMM fixes -- there is nothing for a config
-    to choose, and accepting ``expert_dtype: fp4`` there would be the same silent
-    disagreement in the other direction.
+    A parameter the row *requires* is never passed from a config either; it
+    describes the shape of the computation, so the modeling supplies it at the call.
 
-    **A rounding row still has to declare the key.** A typo would otherwise be
-    dropped, and the row would run its own default while the config said something
-    else. A key the row requires rather than defaults is refused too: it describes
-    the shape of the computation, so the modeling supplies it and a config must not.
-    The raw ``forward`` carries the real signature; a generated ``wrapper`` is
-    ``(*tensors, **attrs)`` and would accept any keyword.
+    A ``dtype`` the row cannot round to is **not** dropped, even when the key itself
+    is accepted: that is a config asking for a format this row does not implement,
+    and the run would quietly use another one.
     """
     if not kwargs:
+        return {}
+    accepted = OP_REGISTRY.row_arguments(entry.op, entry.impl)
+    if accepted is None:
+        # Unregistered for every device; ``resolve`` reports that, not this.
+        return dict(kwargs)
+    kept = {key: value for key, value in kwargs.items() if key in accepted}
+    if "dtype" in kept:
+        _check_dtype(entry, kept["dtype"])
+    return kept
+
+
+def _check_dtype(entry: OpEntry, dtype: Any) -> None:
+    """Refuse a format the row does not round to."""
+    if not entry.dtypes:
         return
-    if not entry.precision.rounds_operands:
+    if dtype not in entry.dtypes:
         raise ValueError(
-            f"{entry.op}/{entry.variant}/{entry.impl} is not a rounding row, so it takes no row arguments; "
-            f"got {sorted(kwargs)}. A row argument describes how to round an operand, so it belongs on a row "
-            "that rounds -- name one (for example 'qat' or 'torchao_nvfp4'), or drop the kwargs."
-        )
-    if not entry.precision.configurable:
-        raise ValueError(
-            f"{entry.op}/{entry.variant}/{entry.impl} is a native row, so it takes no row arguments; "
-            f"got {sorted(kwargs)}. Its format is what the name says -- the row casts the operands to it "
-            "and runs the GEMM in it -- so there is no width or dtype for a config to choose."
-        )
-    fn = entry.forward or entry.wrapper
-    if fn is None:
-        return
-    accepted = OP_REGISTRY.row_arguments(entry.op, entry.impl) or {}
-    unknown = sorted(set(kwargs) - set(accepted))
-    if unknown:
-        required = sorted(
-            name
-            for name, parameter in signature(fn).parameters.items()
-            if parameter.kind is Parameter.KEYWORD_ONLY and parameter.default is Parameter.empty
-        )
-        shape = sorted(set(unknown) & set(required))
-        if shape:
-            raise ValueError(
-                f"{entry.op}/{entry.variant}/{entry.impl}: {shape} describes the shape of the computation -- "
-                f"the modeling passes it at the call site, so a config cannot set it. Configurable arguments "
-                f"are {sorted(accepted)}."
-            )
-        raise ValueError(
-            f"{entry.op}/{entry.variant}/{entry.impl} does not accept {unknown}; it takes {sorted(accepted)}."
+            f"{entry.op}/{entry.variant}/{entry.impl} cannot round to {dtype!r}; it supports "
+            f"{sorted(entry.dtypes)}. The format is a row argument, not part of the name, so a row that "
+            "handles several formats states which ones here."
         )
 
 
@@ -669,6 +697,16 @@ class VeomniOp:
         if isinstance(impl, OpsSelection):
             kwargs = impl.resolve_kwargs(site)
             impl = impl.resolve_impl(site)
+        # Drop arguments the row cannot honour *before* resolving it, so a key the
+        # site does not use never reaches a row that would reject it, and so the
+        # intern key is built from the arguments the row actually runs with.
+        # Filtering by name rather than by resolved entry keeps it working on a host
+        # where the row does not resolve: what a row accepts is a property of the
+        # row, not of which device registered it.
+        if kwargs and impl is not None:
+            offered = OP_REGISTRY.first_entry(op, impl)
+            if offered is not None:
+                kwargs = _filter_kwargs(offered, kwargs)
         # The un-resolved name is checked first, exactly as before this change. A
         # handle whose row was resolved under a different device view is reused
         # instead of re-resolved: a test that mocks the host as NPU and then as CPU
@@ -678,21 +716,11 @@ class VeomniOp:
             cached = cls._intern.get((op, variant, impl, _kwargs_key(kwargs)))
             if cached is not None:
                 return cached
-            # Check the arguments before resolving the row. Resolution enforces the
-            # row's hardware and package requirements, so on a host that cannot run
-            # the row at all that error would mask a config mistake -- and the config
-            # mistake is the one the author can fix. The row's precision and its
-            # accepted keys are properties of the row, not of the device, so any
-            # registered entry for the name answers for every device.
-            offered = OP_REGISTRY.first_entry(op, impl)
-            if offered is not None:
-                _check_kwargs(offered, kwargs)
         entry = resolve_op(op, variant, impl)
         key = (op, variant, entry.impl, _kwargs_key(kwargs))
         cached = cls._intern.get(key)
         if cached is not None:
             return cached
-        _check_kwargs(entry, kwargs)
         instance = super().__new__(cls)
         instance.op = op
         instance.variant = variant
@@ -750,11 +778,11 @@ class VeomniOp:
 
     def with_kwargs(self, kwargs: Mapping[str, Any]) -> VeomniOp:
         """Return the interned handle for this row with ``kwargs`` as its arguments."""
+        kwargs = _filter_kwargs(self._entry, kwargs)
         key = (self.op, self.variant, self.impl, _kwargs_key(kwargs))
         cached = self._intern.get(key)
         if cached is not None:
             return cached
-        _check_kwargs(self._entry, kwargs)
         instance = super().__new__(VeomniOp)
         instance.op = self.op
         instance.variant = self.variant

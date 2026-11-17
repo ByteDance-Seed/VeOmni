@@ -51,7 +51,7 @@ def rounding_impls() -> frozenset[str]:
     """``moe_experts`` rows that round the operands they are handed, native ones included.
 
     The activation guard needs this set rather than :meth:`OpRegistry.emulated_impls`:
-    every fused row bakes SiLU into both directions, ``deepgemm_fp8`` included, so an
+    every fused row bakes SiLU into both directions, ``deepgemm`` included, so an
     activation the family cannot run has to be refused for a native row just as much as
     for an emulated one. Only ``EXACT`` rows are satisfied by the Python act_fn loop,
     because they are the ones that never round.
@@ -182,12 +182,13 @@ register_op(
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang", "triton"),
+    dtypes=("fp8", "fp4"),
 )
 
 register_op(
     "moe_experts",
     "standard",
-    "deepgemm_fp8",
+    "deepgemm",
     description="DeepGEMM blockwise FP8 expert forward, input gradients and weight gradients",
     # ``NATIVE``, not ``EMULATED``: the row casts the operands to FP8 and runs
     # DeepGEMM's grouped GEMM in that format, so it owns the cast instead of
@@ -199,6 +200,10 @@ register_op(
         platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=90), NvidiaGpuPlatform(min_cc=100, max_cc=100)),
     ),
     requires=("deep_gemm", "triton"),
+    # One format today. It is still an argument rather than a name because that is
+    # the shape every rounding row uses, and DeepGEMM gaining another layout is a
+    # new value, not a new row.
+    dtypes=("fp8",),
 )
 
 register_op(

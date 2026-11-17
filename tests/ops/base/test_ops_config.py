@@ -75,12 +75,12 @@ def test_deepgemm_experts_coexist_with_quantizing_gemm_families(monkeypatch, par
     monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
     monkeypatch.setattr("torch.version.hip", None)
 
-    values = {"moe_implementation": "deepgemm_fp8", field: "qat"}
+    values = {"moe_implementation": "deepgemm", field: "qat"}
     config = (
         _instantiate_recursive(OpsImplementationConfig, values) if parse_config else OpsImplementationConfig(**values)
     )
 
-    assert config.moe_implementation == "deepgemm_fp8"
+    assert config.moe_implementation == "deepgemm"
     assert getattr(config, field) == "qat"
 
 
@@ -88,9 +88,9 @@ def test_deepgemm_experts_coexist_with_quantizing_gemm_families(monkeypatch, par
 @pytest.mark.parametrize(
     "values",
     [
-        {"moe_implementation": "deepgemm_fp8"},
-        {"moe_implementation": "deepgemm_fp8", "linear_implementation": "eager"},
-        {"moe_implementation": "deepgemm_fp8", "linear_implementation": "torchao_mxfp4"},
+        {"moe_implementation": "deepgemm"},
+        {"moe_implementation": "deepgemm", "linear_implementation": "eager"},
+        {"moe_implementation": "deepgemm", "linear_implementation": "torchao_mxfp4"},
         {"moe_implementation": None, "linear_implementation": "qat"},
         {"moe_implementation": "eager", "linear_implementation": "qat"},
         {"moe_implementation": "fused_triton", "linear_implementation": "qat"},
@@ -100,6 +100,7 @@ def test_deepgemm_experts_coexist_with_quantizing_gemm_families(monkeypatch, par
 )
 def test_deepgemm_qat_guard_preserves_valid_selections(monkeypatch, values):
     from veomni.arguments import OpsImplementationConfig
+    from veomni.arguments.arguments_types import _DTYPE_IN_NAME_ALIASES
 
     # Model a supported QAT host without initializing an accelerator context.
     monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
@@ -110,9 +111,56 @@ def test_deepgemm_qat_guard_preserves_valid_selections(monkeypatch, values):
     monkeypatch.setattr("torch.version.hip", None)
 
     config = OpsImplementationConfig(**values)
-    assert config.moe_implementation == values["moe_implementation"]
-    expected = values.get("linear_implementation")
-    assert config.linear_implementation == expected
+
+    def resolved(value):
+        """The row a value ends up naming, after the name-to-format rewrite.
+
+        A bare string and an ``OpsSelection`` of the same row compare equal, and an
+        old name carrying its format (``torchao_mxfp4``) compares equal to the row it
+        now migrates to.
+        """
+        raw = getattr(value, "name", value)
+        rewritten = _DTYPE_IN_NAME_ALIASES.get("linear_implementation", {}).get(raw)
+        return raw if rewritten is None else rewritten[0]
+
+    assert resolved(config.moe_implementation) == resolved(values["moe_implementation"])
+    assert resolved(config.linear_implementation) == resolved(values.get("linear_implementation"))
+
+
+def test_a_row_name_with_a_format_in_it_migrates_to_the_dtype_argument(monkeypatch):
+    """``torchao_nvfp4`` named a row *and* a format; the format is an argument now.
+
+    A checkpoint written against the old name still loads, and it loads as the same
+    selection: the row ``torchao`` with ``dtype: nvfp4``.
+    """
+    from veomni.arguments import OpsImplementationConfig
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+    monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.utils.device.get_gpu_compute_capability", lambda _device: 90)
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    monkeypatch.setattr("torch.version.hip", None)
+
+    plain = OpsImplementationConfig(linear_implementation="torchao_nvfp4")
+    assert plain.linear_implementation.name == "torchao"
+    assert plain.linear_implementation.kwargs == {"dtype": "nvfp4"}
+
+    # The same rewrite inside the mapping form, on the default and on an override.
+    mapping = OpsImplementationConfig(
+        linear_implementation={
+            "name": "torchao_nvfp4",
+            "overrides": [{"site": r"layers\.0\..*", "name": "torchao_mxfp4"}],
+        }
+    )
+    assert mapping.linear_implementation.name == "torchao"
+    assert mapping.linear_implementation.kwargs == {"dtype": "nvfp4"}
+    assert mapping.linear_implementation.overrides[0].name == "torchao"
+    assert mapping.linear_implementation.overrides[0].kwargs == {"dtype": "mxfp4"}
+
+    # A config that already states the format keeps its own value.
+    explicit = OpsImplementationConfig(linear_implementation={"name": "torchao", "kwargs": {"dtype": "mxfp4"}})
+    assert explicit.linear_implementation.kwargs == {"dtype": "mxfp4"}
 
 
 def test_upstream_llama_config_ops_config_save_and_reload(tmp_path):

@@ -55,7 +55,7 @@ def test_leaves_a_model_without_torchao_rows_alone(monkeypatch):
     reject_qat_without_native_bf16(_model(linear_implementation="qat"))
 
 
-_TORCHAO_ROWS = ("torchao_nvfp4", "torchao_mxfp4")
+_TORCHAO_ROWS = ("torchao",)
 
 
 @pytest.mark.parametrize("impl", _TORCHAO_ROWS)
@@ -69,13 +69,13 @@ def test_refuses_a_torchao_row_below_sm80(monkeypatch, field, impl):
 @pytest.mark.parametrize("capability", [80, 89, 90])
 def test_allows_a_torchao_row_from_sm80(monkeypatch, capability):
     _device(monkeypatch, cuda=True, capability=capability)
-    reject_qat_without_native_bf16(_model(linear_implementation="torchao_nvfp4"))
+    reject_qat_without_native_bf16(_model(linear_implementation="torchao"))
 
 
 def test_leaves_a_cpu_host_alone(monkeypatch):
     """The fake quantizer is tensor math and runs on CPU; only training needs BF16 hardware."""
     _device(monkeypatch, cuda=False, capability=0)
-    reject_qat_without_native_bf16(_model(linear_implementation="torchao_mxfp4"))
+    reject_qat_without_native_bf16(_model(linear_implementation="torchao"))
 
 
 @pytest.mark.parametrize("impl", _TORCHAO_ROWS)

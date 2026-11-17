@@ -164,7 +164,7 @@ def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes():
     assert not torch.equal(captured["query"], wrong_fp32_multiply)
 
 
-@pytest.mark.parametrize("impl", ["eager", "fused_triton", "deepgemm_fp8"])
+@pytest.mark.parametrize("impl", ["eager", "fused_triton", "deepgemm"])
 def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
     """DeepSeek-V4 experts forward passes merged weights, raw routing weights, and ``swiglu_limit``."""
     config = _tiny_config()
@@ -201,10 +201,10 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
         "num_experts": experts.num_experts,
         "swiglu_limit": config.swiglu_limit,
         "assume_distinct_experts": True,
-        # The checkpoint's expert dtype is a call argument, not part of the
+        # The checkpoint's expert format is a call argument, not part of the
         # implementation name: V4-Flash stores routed experts in FP4 and its
-        # dense projections in FP8, so one recipe name cannot describe both.
-        "expert_dtype": getattr(config, "expert_dtype", "fp8"),
+        # dense projections in FP8, so one row name cannot describe both.
+        "dtype": getattr(config, "expert_dtype", "fp8"),
     }
     torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
 
@@ -223,7 +223,7 @@ def test_deepseek_v4_experts_deepgemm_fp8_forward_backward():
     from tests.ops.moe_experts.reference import standard_ep_reference
     from veomni.arguments import OpsImplementationConfig
 
-    ops = OpsImplementationConfig(moe_implementation="deepgemm_fp8")
+    ops = OpsImplementationConfig(moe_implementation="deepgemm")
     config = SimpleNamespace(
         num_local_experts=4,
         hidden_size=256,
@@ -234,7 +234,7 @@ def test_deepseek_v4_experts_deepgemm_fp8_forward_backward():
     )
     device = get_device_type()
     experts = _dsv4_module().DeepseekV4Experts(config).to(device=device, dtype=torch.bfloat16)
-    assert experts.veomni_moe.impl == "deepgemm_fp8"
+    assert experts.veomni_moe.impl == "deepgemm"
     torch.manual_seed(91)
     with torch.no_grad():
         experts.gate_up_proj.normal_(std=0.03)

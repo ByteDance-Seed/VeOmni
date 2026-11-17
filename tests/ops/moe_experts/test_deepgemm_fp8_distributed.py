@@ -24,7 +24,7 @@ class _Experts(nn.Module):
         super().__init__()
         self.fc1 = nn.Parameter(w1.clone())
         self.fc2 = nn.Parameter(w2.clone())
-        self.veomni_moe = VeomniOp("moe_experts", "standard", "deepgemm_fp8")
+        self.veomni_moe = VeomniOp("moe_experts", "standard", "deepgemm")
         self.experts = experts
         self.use_checkpoint = use_checkpoint
 

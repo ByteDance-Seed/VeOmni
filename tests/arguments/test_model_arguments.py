@@ -102,7 +102,7 @@ def test_fp8_all_gather_validates_policies_only_for_matching_experts(
     assert config.expert_weight_fp8_all_gather is True
     model = nn.Sequential(nn.Linear(2, 2))
     if has_experts:
-        model[0].veomni_moe = SimpleNamespace(impl="deepgemm_fp8")
+        model[0].veomni_moe = SimpleNamespace(impl="deepgemm")
     calls = []
     monkeypatch.setattr(
         torch_parallelize,
@@ -155,7 +155,7 @@ def test_fp8_all_gather_rejects_non_swiglu_before_collectives():
     from veomni.distributed.fsdp2.fp8_all_gather import register_deepgemm_fp8_all_gather
 
     module = nn.Module()
-    module.veomni_moe = SimpleNamespace(impl="deepgemm_fp8")
+    module.veomni_moe = SimpleNamespace(impl="deepgemm")
     module.use_swiglu_mlp = False
     with pytest.raises(ValueError, match="SwiGLU"):
         register_deepgemm_fp8_all_gather(module)
@@ -183,7 +183,7 @@ def test_fp8_all_gather_still_validates_selected_experts():
     from veomni.distributed.fsdp2.fp8_all_gather import register_deepgemm_fp8_all_gather
 
     module = nn.Linear(2, 2)
-    module.veomni_moe = SimpleNamespace(impl="deepgemm_fp8")
+    module.veomni_moe = SimpleNamespace(impl="deepgemm")
     with pytest.raises(ValueError, match="two merged expert weights"):
         register_deepgemm_fp8_all_gather(module)
 

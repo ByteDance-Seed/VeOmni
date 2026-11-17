@@ -156,27 +156,29 @@ def test_an_override_merges_kwargs_by_default():
     assert selection.resolve_kwargs("layers.2.q_a_proj") == {"block_size": 128}
 
 
-def test_an_override_can_replace_the_whole_kwargs_set():
-    """Switching to a reference row needs the inherited set dropped.
+def test_an_override_inherits_kwargs_it_does_not_use(quantizing_row):
+    """Switching to a row with a different signature needs nothing cleared.
 
-    ``liger_kernel`` is not a rounding row, so it takes no row arguments;
-    inheriting the enclosing block's ``block_size`` would be refused.
+    The ``eager`` row takes no ``block_size``, so the inherited one is simply not
+    passed to it. The selection still carries it -- resolving is a name question, and
+    what a row accepts is answered when the handle is built.
     """
     selection = OpsSelection.from_config_value(
         {
-            "name": "qat",
+            "name": quantizing_row,
             "kwargs": {"block_size": 64},
-            "overrides": [{"site": r"layers\.0\.mlp", "name": "liger_kernel", "kwargs": {}, "replace_kwargs": True}],
+            "overrides": [{"site": r"layers\.0\.q_a_proj", "name": "eager"}],
         }
     )
-    assert selection.resolve_kwargs("layers.0.mlp") == {}
-    assert selection.resolve_kwargs("layers.7.mlp") == {"block_size": 64}
-
-
-def test_replace_kwargs_without_kwargs_is_refused():
-    """The combination has no meaning, so it fails rather than being ignored."""
-    with pytest.raises(ValueError, match="replace_kwargs requires kwargs"):
-        SiteOverride(site="x", replace_kwargs=True)
+    dropped = VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
+    assert dropped.impl == "eager"
+    assert dropped.kwargs == {}
+    # The selection itself still carries the inherited argument at both sites: the
+    # filtering is a property of the row, not of the override.
+    assert selection.resolve_kwargs("layers.0.q_a_proj") == {"block_size": 64}
+    # The site that keeps the quantizing row still gets it.
+    kept = VeomniOp("linear", "standard", selection, site="layers.7.q_a_proj")
+    assert kept.kwargs == {"block_size": 64}
 
 
 # ---------------------------------------------------------------------------
@@ -205,22 +207,27 @@ def test_an_override_without_a_site_is_refused():
 # ---------------------------------------------------------------------------
 
 
-def test_a_non_quantizing_row_refuses_row_arguments(quantizing_row):
-    """Row arguments describe how to round, so a reference row must not take any.
+def test_a_reference_row_simply_ignores_the_arguments_it_does_not_take(quantizing_row):
+    """The enclosing block describes the family; the row decides what it can honour.
 
-    Accepting them would leave the config saying ``dtype: fp8`` while the row ran
-    no rounding at all.
+    A site may name a reference row under a block that sets ``block_size`` for the
+    quantized sites. That row rounds nothing, so the key is not passed to it -- not
+    an error, because the config is not claiming that row rounds.
     """
     selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"block_size": 64}})
-    with pytest.raises(ValueError, match="is not a rounding row"):
-        VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
+    handle = VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
+    assert handle.impl == "eager"
+    assert handle.kwargs == {}
 
 
-def test_a_quantizing_row_still_has_to_declare_the_key(quantizing_row):
-    """A typo must not be dropped: the row would run its own default instead."""
-    selection = OpsSelection.from_config_value({"name": quantizing_row, "kwargs": {"block_siz": 64}})
-    with pytest.raises(ValueError, match=r"does not accept \['block_siz'\]"):
-        VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
+def test_a_key_no_row_of_the_family_takes_is_refused_at_config_time(quantizing_row):
+    """Dropping inherited keys is safe only because a real typo is caught earlier.
+
+    ``block_siz`` is not an argument of any ``linear`` row, so it fails when the
+    config is read rather than being filtered away at each site.
+    """
+    with pytest.raises(ValueError, match=r"\['block_siz'\] is not a row argument of any 'linear' row"):
+        OpsImplementationConfig(linear_implementation={"name": "qat", "kwargs": {"block_siz": 64}})
 
 
 def test_a_row_argument_the_row_takes_is_kept_on_the_handle(quantizing_row):
@@ -285,15 +292,15 @@ def test_a_parameter_the_row_requires_is_not_configurable():
     wrong expert count -- refused at config parse, like any other key the row does
     not offer.
     """
-    with pytest.raises(ValueError, match=r"'qat' does not accept \['num_experts'\]"):
+    with pytest.raises(ValueError, match=r"\['num_experts'\] is not a row argument of any 'moe_experts' row"):
         OpsImplementationConfig(moe_implementation={"name": "qat", "kwargs": {"num_experts": 256}})
 
     # The keys that *are* configurable still are, including the checkpoint's
     # storage dtype, which is the one the modeling also passes at the call site.
     configured = OpsImplementationConfig(
-        moe_implementation={"name": "qat", "kwargs": {"expert_dtype": "fp4", "block_size": 64}}
+        moe_implementation={"name": "qat", "kwargs": {"dtype": "fp4", "block_size": 64}}
     )
-    assert configured.moe_implementation.kwargs == {"expert_dtype": "fp4", "block_size": 64}
+    assert configured.moe_implementation.kwargs == {"dtype": "fp4", "block_size": 64}
 
 
 def test_sites_with_the_same_row_and_arguments_share_a_handle(quantizing_row):
@@ -384,23 +391,26 @@ def test_hardware_validation_covers_every_row_an_override_can_produce():
         )
 
 
-def test_config_time_refuses_row_arguments_on_a_reference_row():
+def test_config_time_refuses_a_key_no_row_of_the_family_takes():
     """The mistake should not wait for a GPU: `qat` does not resolve on every host.
 
-    A rule that inherits a reference row from the enclosing block and adds only
-    `dtype` is the same error as writing it on `name:`, and is judged the same way.
+    ``expert_dtypo`` is not an argument of any ``moe_experts`` row, so it fails when
+    the config is read. A key that *some* row takes is allowed even on a site that
+    resolves elsewhere -- that is the inherited-argument case.
     """
-    with pytest.raises(ValueError, match="'fused_triton' is not a rounding row"):
-        OpsImplementationConfig(moe_implementation={"name": "fused_triton", "kwargs": {"block_size": 64}})
+    with pytest.raises(ValueError, match=r"\['expert_dtypo'\] is not a row argument of any 'moe_experts' row"):
+        OpsImplementationConfig(moe_implementation={"name": "qat", "kwargs": {"expert_dtypo": "fp4"}})
 
-    with pytest.raises(ValueError, match="'eager' is not a rounding row"):
-        OpsImplementationConfig(
-            moe_implementation={
-                "name": "qat",
-                "kwargs": {"block_size": 128},
-                "overrides": [{"site": r"layers\.0\.experts", "name": "eager", "kwargs": {"block_size": 64}}],
-            }
-        )
+    # An override naming a reference row while the enclosing block sets arguments is
+    # a family description, not a mistake: the handle drops what that row cannot take.
+    configured = OpsImplementationConfig(
+        moe_implementation={
+            "name": "qat",
+            "kwargs": {"block_size": 128},
+            "overrides": [{"site": r"layers\.0\.experts", "name": "eager"}],
+        }
+    )
+    assert configured.moe_implementation.kwargs == {"block_size": 128}
 
 
 def test_a_quantizing_row_may_carry_arguments():
@@ -424,7 +434,7 @@ def test_every_row_reports_a_precision_and_the_three_values_are_distinct():
     expected = {
         ("moe_experts", "fused_triton"): RowPrecision.EXACT,
         ("moe_experts", "qat"): RowPrecision.EMULATED,
-        ("moe_experts", "deepgemm_fp8"): RowPrecision.NATIVE,
+        ("moe_experts", "deepgemm"): RowPrecision.NATIVE,
     }
     for (op, impl), want in expected.items():
         assert OP_REGISTRY.precision(op, impl) is want
@@ -450,30 +460,40 @@ def test_emulated_impls_is_derived_from_the_registry_not_a_hand_written_list():
     """
     assert OP_REGISTRY.emulated_impls("moe_experts") == frozenset({"qat"})
     # A native row rounds but is not emulated -- the distinction the sets now carry.
-    assert "deepgemm_fp8" in OP_REGISTRY.rounding_impls("moe_experts")
-    assert "deepgemm_fp8" not in OP_REGISTRY.emulated_impls("moe_experts")
+    assert "deepgemm" in OP_REGISTRY.rounding_impls("moe_experts")
+    assert "deepgemm" not in OP_REGISTRY.emulated_impls("moe_experts")
 
 
-def test_a_native_row_refuses_row_arguments():
-    """Its format is its name, so a config cannot choose a width or dtype for it.
+def test_a_native_row_ignores_the_arguments_it_does_not_take():
+    """Its format is fixed by the row, so ``dtype`` is not passed to it.
 
-    Accepting ``expert_dtype: fp4`` here would be the same silent disagreement as
-    accepting ``block_size`` on ``eager``: the config would say FP4 while the row
-    cast to FP8.
+    ``deepgemm_fp8`` casts to FP8 at the width DeepGEMM fixes. An enclosing
+    ``kwargs`` that sets ``dtype: fp4`` is filtered away rather than raising --
+    the block describes the family, and ``qat`` at another site does take it.
     """
-    with pytest.raises(ValueError, match="'deepgemm_fp8' is a native row of 'moe_experts'"):
-        OpsImplementationConfig(moe_implementation={"name": "deepgemm_fp8", "kwargs": {"expert_dtype": "fp4"}})
+    configured = OpsImplementationConfig(moe_implementation={"name": "deepgemm", "kwargs": {"dtype": "fp4"}})
+    assert configured.moe_implementation.kwargs == {"dtype": "fp4"}
+    # The handle is where the filtering happens, and it needs a device the row
+    # resolves on. What matters is that the key never reaches the call.
+    from veomni.ops.registry import OpEntry
 
-    # No row arguments at all, so the empty mapping is not a loophole either.
-    assert OpsImplementationConfig(moe_implementation={"name": "deepgemm_fp8"}).moe_implementation.name == (
-        "deepgemm_fp8"
-    )
+    seen = {}
+
+    def record(*args, **kwargs):
+        seen.update(kwargs)
+        return torch.zeros(1)
+
+    handle = object.__new__(VeomniOp)
+    handle.op, handle.variant, handle.impl, handle.kwargs = "moe_experts", "standard", "deepgemm", {}
+    handle._entry = OpEntry(op="moe_experts", variant="standard", impl="deepgemm", description="probe", wrapper=record)
+    handle(torch.zeros(1), num_experts=8)
+    assert seen == {"num_experts": 8}
 
 
 def test_the_native_row_still_takes_the_family_signature_at_the_call_site():
     """``_check_kwargs`` constrains a config, not a call.
 
-    ``DeepseekV4Experts`` passes ``expert_dtype`` at every call whatever row it
+    ``DeepseekV4Experts`` passes ``dtype`` at every call whatever row it
     resolved, so a native row must still accept it positionally-equivalent: the
     check would otherwise break every DeepSeek-V4 expert forward.
     """
@@ -486,12 +506,10 @@ def test_the_native_row_still_takes_the_family_signature_at_the_call_site():
         return torch.zeros(1)
 
     handle = object.__new__(VeomniOp)
-    handle.op, handle.variant, handle.impl, handle.kwargs = "moe_experts", "standard", "deepgemm_fp8", {}
-    handle._entry = OpEntry(
-        op="moe_experts", variant="standard", impl="deepgemm_fp8", description="probe", wrapper=record
-    )
-    handle(torch.zeros(1), num_experts=8, expert_dtype="fp4")
-    assert seen == {"num_experts": 8, "expert_dtype": "fp4"}
+    handle.op, handle.variant, handle.impl, handle.kwargs = "moe_experts", "standard", "deepgemm", {}
+    handle._entry = OpEntry(op="moe_experts", variant="standard", impl="deepgemm", description="probe", wrapper=record)
+    handle(torch.zeros(1), num_experts=8, dtype="fp4")
+    assert seen == {"num_experts": 8, "dtype": "fp4"}
 
 
 def test_a_native_row_is_refused_where_a_deployment_kernel_is_not_reached():
@@ -511,7 +529,7 @@ def test_a_native_row_is_refused_where_a_deployment_kernel_is_not_reached():
             self.use_swiglu_mlp = False
             self.veomni_moe = type("_Handle", (), {"impl": impl})()
 
-    for impl in ("qat", "deepgemm_fp8"):
+    for impl in ("qat", "deepgemm"):
         with pytest.raises(ValueError, match="cannot run with a non-SwiGLU activation"):
             reject_quantizing_act_fn(_Experts(impl))
 

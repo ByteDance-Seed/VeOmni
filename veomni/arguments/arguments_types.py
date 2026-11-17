@@ -1457,8 +1457,9 @@ _DEPRECATED_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, str]] = {
         )
     },
     "moe_implementation": {"fused_mlu_triton": "fused_triton"},
-    # ``npu`` named the hardware rather than the kernel behind it. Each row now
-    # says which third-party kernel it calls; the old CE ``npu`` was ``chunk_loss``.
+    # The format moved from the name into the row's ``dtype`` argument, so these
+    # carry an implied argument rather than only a new name. See
+    # ``_RENAMED_ROWS_CARRYING_A_DTYPE``.
     "cross_entropy_loss_implementation": {"npu": "chunk_loss"},
     "rms_norm_implementation": {"npu": "torch_npu"},
     "rotary_pos_emb_implementation": {"npu": "torch_npu"},
@@ -1466,6 +1467,24 @@ _DEPRECATED_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, str]] = {
     "rms_norm_gated_implementation": {"npu": "torch_npu"},
     "causal_conv1d_implementation": {"npu": "triton"},
     "chunk_gated_delta_rule_implementation": {"npu": "triton", "npu_ascendc": "fla_npu"},
+}
+
+#: Old row names that also carried a format. ``torchao_nvfp4`` said both which row
+#: to call and that it rounds to NVFP4; the row is now ``torchao`` and the format is
+#: its ``dtype`` argument, so a checkpoint written against the old name has to gain
+#: that argument when the name is rewritten.
+_DTYPE_IN_NAME_ALIASES: Dict[str, Dict[str, tuple[str, str]]] = {
+    "linear_implementation": {
+        "torchao_nvfp4": ("torchao", "nvfp4"),
+        "torchao_mxfp4": ("torchao", "mxfp4"),
+    },
+    "swiglu_mlp_implementation": {
+        "torchao_nvfp4": ("torchao", "nvfp4"),
+        "torchao_mxfp4": ("torchao", "mxfp4"),
+    },
+    "moe_implementation": {
+        "deepgemm_fp8": ("deepgemm", "fp8"),
+    },
 }
 
 # Values that were never implementation names and have no implementation equivalent.
@@ -1546,8 +1565,8 @@ class OpsImplementationConfig:
         default=None,
         metadata={
             "help": "MoE experts forward. 'fused_triton' (GPU SM70+ or MLU) | "
-            "'fused_quack' (GPU SM90+) | 'deepgemm_fp8' (SM90/SM100 FP8 training) | 'fused_npu' (NPU) | "
-            "'fused_mlu' (MLU Apex grouped-GEMM) | 'eager'. "
+            "'fused_quack' (GPU SM90+) | 'deepgemm' (SM90/SM100, dtype='fp8') | 'fused_npu' (NPU) | "
+            "'fused_mlu' (MLU Apex grouped-GEMM) | 'qat' (dtype='fp8' or 'fp4') | 'eager'. "
             "Unset: 'fused_triton' on GPU, 'fused_npu' on NPU, 'fused_mlu' on MLU with Apex "
             "and 'fused_triton' otherwise."
         },
@@ -1574,17 +1593,17 @@ class OpsImplementationConfig:
     swiglu_mlp_implementation: Optional[str] | OpsSelection = field(
         default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'qat' (FP8 QAT, SM90+) | "
-            "'torchao_nvfp4' (NVFP4 QAT, needs the 'torchao' package) | 'eager'. "
+            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'qat' (SM90+, dtype='fp8') | "
+            "'torchao' (dtype='nvfp4' or 'mxfp4', needs the 'torchao' package) | 'eager'. "
             "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
         },
     )
     linear_implementation: Optional[str] | OpsSelection = field(
         default=None,
         metadata={
-            "help": "Dense projection. 'qat' (FP8 fake quantization of both GEMM operands, SM90+) | "
-            "'torchao_nvfp4' (NVFP4 fake quantization of both GEMM operands, 'standard' variant only, needs "
-            "the 'torchao' package) | 'eager' (calls the projection module). "
+            "help": "Dense projection. 'qat' (fake quantization of both GEMM operands, SM90+, dtype='fp8') | "
+            "'torchao' (FP4 fake quantization of both GEMM operands, 'standard' variant only, needs the "
+            "'torchao' package, dtype='nvfp4' or 'mxfp4') | 'eager' (calls the projection module). "
             "Unset: 'eager'. Selected independently of swiglu_mlp_implementation: a model that owns its "
             "own projections reads this field, a model that runs the fused SwiGLU row reads that one."
         },
@@ -1803,17 +1822,22 @@ class OpsImplementationConfig:
     }
 
     def _validate_row_arguments(self) -> None:
-        """Refuse row arguments on a row that does not round.
+        """Validate row arguments against the family, not against one site's row.
 
-        Row arguments say *how* to round -- ``dtype``, ``block_size``, the
-        checkpoint's ``expert_dtype``. A reference row such as ``fused_triton`` or
-        ``eager`` has nothing to round, so a config that passes arguments to it asks
-        for something the row will not do, and the run would quietly do something
-        else.
+        A key has to be *possible* somewhere in the family it is written on: a typo
+        like ``block_siz`` must not be dropped silently. So the check below is
+        against the union of every row's accepted arguments for the field's op.
 
-        Checked here as well as when the handle is built: a config naming an
-        SM90-only row cannot be resolved on every host, and the mistake should not
-        wait for a GPU to surface.
+        It deliberately does **not** compare a key against the row that one site
+        resolves to. A site may override ``name`` to a row with a different
+        signature -- ``moe_implementation: {name: qat, overrides: [{name: fused_triton}]}``
+        is the normal way to say "quantize these experts but not those" -- and the
+        inherited ``block_size`` is meaningless for ``fused_triton``. That is a
+        config describing a family, not a mistake: the handle drops the key when the
+        row it resolves cannot take it (``veomni/ops/registry.py:_filter_kwargs``).
+
+        Also refused here: a key the row *requires* rather than defaults, since that
+        describes the shape of the computation and the modeling supplies it.
         """
         from ..ops import OP_REGISTRY
 
@@ -1822,46 +1846,23 @@ class OpsImplementationConfig:
             if not isinstance(value, OpsSelection):
                 continue
             op = self._FIELD_TO_OP[field_name]
-            offered = [(value.name, value.kwargs)]
-            offered.extend((rule.name, rule.kwargs) for rule in value.overrides)
-            # An override inherits the enclosing name, so a rule with only kwargs is
-            # judged against that name, not against "no row".
-            effective = [(value.resolve_impl(rule.site), value.resolve_kwargs(rule.site)) for rule in value.overrides]
-            for name, kwargs in [*offered, *effective]:
-                if not kwargs or name is None:
-                    continue
-                precision = OP_REGISTRY.precision(op, name)
-                if precision is None:
-                    # An unregistered name is reported by the registry when the model
-                    # builds its handle; nothing useful to add here.
-                    continue
-                if not precision.rounds_operands:
-                    raise ValueError(
-                        f"{field_name}: {name!r} is not a rounding row of {op!r}, so it takes no row arguments; "
-                        f"got {sorted(kwargs)}. A row argument describes how to round an operand -- put it on a row "
-                        "that rounds, such as 'qat' or 'torchao_nvfp4'."
-                    )
-                if not precision.configurable:
-                    raise ValueError(
-                        f"{field_name}: {name!r} is a native row of {op!r}, so it takes no row arguments; "
-                        f"got {sorted(kwargs)}. Its format is what the name says -- the row casts the operands "
-                        "to it and runs the GEMM in it -- so there is no width or dtype for a config to choose. "
-                        "Name an emulated row (such as 'qat') if you need to pick one."
-                    )
-                accepted = OP_REGISTRY.row_arguments(op, name)
-                if accepted is None:
-                    continue
-                # Only keyword-shaped parameters count: the tensor operands are passed
-                # positionally by the row's own caller, never by a selection. A
-                # parameter without a default describes the shape of the computation,
-                # so the modeling supplies it and a config must not.
-                unknown = sorted(set(kwargs) - set(accepted))
-                if unknown:
-                    raise ValueError(
-                        f"{field_name}: {name!r} does not accept {unknown}; it takes {sorted(accepted)}. "
-                        "A parameter the row requires rather than defaults -- such as 'num_experts' -- is "
-                        "passed by the modeling at the call site, not by a config."
-                    )
+            offered_keys = set(value.kwargs)
+            for rule in value.overrides:
+                offered_keys.update(rule.kwargs or {})
+            if not offered_keys:
+                continue
+
+            # The family's space, taken from every registered row of this op. Rows on
+            # other devices count too: the row a site names may be one this host
+            # cannot resolve, and the key is still meaningful for the family.
+            family = {key for impl in OP_REGISTRY.all_impls(op) for key in (OP_REGISTRY.row_arguments(op, impl) or {})}
+            unknown = sorted(offered_keys - family)
+            if unknown:
+                raise ValueError(
+                    f"{field_name}: {unknown} is not a row argument of any {op!r} row; the family takes "
+                    f"{sorted(family)}. A parameter a row requires rather than defaults -- such as "
+                    "'num_experts' -- is passed by the modeling at the call site, not by a config."
+                )
 
     def _normalize_selections(self) -> None:
         """Turn the mapping form of a per-site field into an ``OpsSelection``.
@@ -1911,6 +1912,26 @@ class OpsImplementationConfig:
                 self._warn_deprecated(field_name, value, aliases[value])
                 setattr(self, field_name, aliases[value])
 
+        # A name that used to carry its format gains that format as an argument. The
+        # row is the same kernel, so this is a rename plus a default, not a different
+        # selection -- and a config that already sets ``dtype`` keeps its own value.
+        for field_name, renames in _DTYPE_IN_NAME_ALIASES.items():
+            value = getattr(self, field_name)
+            if isinstance(value, OpsSelection):
+                for holder in (value, *value.overrides):
+                    renamed = renames.get(holder.name)
+                    if renamed is None:
+                        continue
+                    new_name, dtype = renamed
+                    self._warn_deprecated(field_name, holder.name, f"{new_name} (dtype={dtype!r})")
+                    holder.name = new_name
+                    holder.kwargs = {**(holder.kwargs or {}), "dtype": dtype}
+                continue
+            if value in renames:
+                new_name, dtype = renames[value]
+                self._warn_deprecated(field_name, value, f"{new_name} (dtype={dtype!r})")
+                setattr(self, field_name, OpsSelection(name=new_name, kwargs={"dtype": dtype}))
+
         if self.moe_implementation == "fused":
             from ..utils.device import IS_NPU_AVAILABLE
             from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available
@@ -1939,7 +1960,7 @@ class OpsImplementationConfig:
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
-        # No cross-family conflict needs rejecting here. ``deepgemm_fp8`` and
+        # No cross-family conflict needs rejecting here. ``deepgemm`` and
         # ``qat`` are two values of the same ``moe_implementation`` field, so they
         # cannot both be selected; ``linear_implementation`` and
         # ``swiglu_mlp_implementation`` are separate GEMMs with separate operands,

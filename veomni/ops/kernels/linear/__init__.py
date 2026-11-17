@@ -26,18 +26,21 @@ branches on the row itself.
 The ``qat`` row sits next to the eager reference: it fake-quantizes both GEMM
 operands with the DeepSeek-V4 TileLang quantizers and keeps the multiply in the
 model dtype, which is what an emulated low-precision deployment GEMM computes.
-``torchao_nvfp4`` does the same with torchao's NVFP4 round trip; it is
-``standard`` only, so a model that also binds ``grouped`` (DeepSeek-V4) cannot
-select it.
+``torchao`` does the same with torchao's FP4 round trip; it is ``standard`` only,
+so a model that also binds ``grouped`` (DeepSeek-V4) cannot select it.
+
+The precision is a row *argument* (``dtype``), not part of the name: ``qat`` serves
+FP8 and FP4 checkpoints, and ``torchao`` serves both the NVFP4 and MXFP4 layouts.
 """
 
 from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement
+from ...qat.torchao_fp4 import SUPPORTED_DTYPES
 from ...registry import RowPrecision, register_op
 from .grouped import eager as grouped_eager
 from .grouped import qat as grouped_qat
 from .standard import eager as standard_eager
 from .standard import qat as standard_qat
-from .standard import torchao_nvfp4 as standard_torchao_nvfp4
+from .standard import torchao as standard_torchao
 
 
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
@@ -65,11 +68,12 @@ register_op(
 register_op(
     "linear",
     "standard",
-    "torchao_nvfp4",
-    description="TorchAO NVFP4 fake-quantized dense linear projection",
+    "torchao",
+    description="TorchAO FP4 fake-quantized dense linear projection",
     precision=RowPrecision.EMULATED,
-    wrapper=standard_torchao_nvfp4.wrapper,
+    wrapper=standard_torchao.wrapper,
     requires=("torchao",),
+    dtypes=SUPPORTED_DTYPES,
 )
 
 register_op(

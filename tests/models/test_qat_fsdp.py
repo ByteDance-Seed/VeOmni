@@ -34,18 +34,14 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_comp
 
 
 _LAUNCH = LaunchSpec(nproc=2)
-_QUANT_FUNCTION = {"torchao_mxfp4": "mxfp4_fake_quant", "torchao_nvfp4": "nvfp4_fake_quant"}
+_QUANT_FUNCTION = {"torchao_mxfp4": "mxfp4_fake_quant", "torchao": "nvfp4_fake_quant"}
 
 
 def _torchao_qat_impls() -> list[str]:
     """Every torchao FP4 row this branch registers, so both formats share one gate."""
     from veomni.ops import OP_REGISTRY
 
-    return [
-        impl
-        for impl in ("torchao_nvfp4", "torchao_mxfp4")
-        if impl in OP_REGISTRY.list_registered("linear", "standard")
-    ]
+    return [impl for impl in ("torchao", "torchao_mxfp4") if impl in OP_REGISTRY.list_registered("linear", "standard")]
 
 
 def _rows(impl: str) -> dict[str, str]:
@@ -164,7 +160,7 @@ def _step(model, optimizer, step, impl):
     # input once for gate/up, the hidden state once, three weights). Gradient
     # checkpointing reruns every layer's forward in backward, so each micro-batch
     # makes two passes. Both rows must be reached. The counts were verified for
-    # torchao_nvfp4; a new row must re-check them against its own implementation.
+    # torchao; a new row must re-check them against its own implementation.
     layers, microbatches, passes = model.config.num_hidden_layers, 2, 2
     assert calls == {
         "linear": 4 * 2 * layers * microbatches * passes,

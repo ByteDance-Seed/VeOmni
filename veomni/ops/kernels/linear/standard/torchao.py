@@ -24,19 +24,27 @@ from __future__ import annotations
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ....qat.torchao_nvfp4 import NVFP4_BLOCK_SIZE, nvfp4_fake_quant
+from ....qat.torchao_fp4 import torchao_fake_quant
 from .._module import resolve_projection
 
 
-def wrapper(linear: nn.Module, x: Tensor, *, block_size: int = NVFP4_BLOCK_SIZE) -> Tensor:
-    """Run ``linear`` with NVFP4 fake-quantized activation and weight.
+def wrapper(
+    linear: nn.Module,
+    x: Tensor,
+    *,
+    dtype: str = "nvfp4",
+    block_size: int | None = None,
+) -> Tensor:
+    """Run ``linear`` with both GEMM operands fake-quantized through torchao.
 
-    ``block_size`` defaults to the NVFP4 group width of 16, the only width the
-    format defines; any other value raises.
+    ``dtype`` picks the format: ``nvfp4`` (16-wide groups, an FP32 per-tensor scale)
+    or ``mxfp4`` (32-wide groups, an E8M0 power-of-two scale). ``block_size``
+    defaults to that format's group width, which is the only width it defines.
     """
     # A quantizing row always gets a weight: ``resolve_projection`` raises for a
     # wrapped projection instead of handing back a shortcut.
-    weight, shortcut = resolve_projection("torchao_nvfp4", linear, x)
+    weight, shortcut = resolve_projection("torchao", linear, x)
     assert shortcut is None
     bias = getattr(linear, "bias", None)
-    return F.linear(nvfp4_fake_quant(x, block_size), nvfp4_fake_quant(weight, block_size), bias)
+    quantize = torchao_fake_quant(dtype)
+    return F.linear(quantize(x, block_size), quantize(weight, block_size), bias)

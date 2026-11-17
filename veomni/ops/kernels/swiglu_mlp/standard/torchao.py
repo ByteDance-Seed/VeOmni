@@ -26,7 +26,7 @@ from __future__ import annotations
 import torch.nn.functional as F
 from torch import Tensor
 
-from ....qat.torchao_nvfp4 import NVFP4_BLOCK_SIZE, nvfp4_fake_quant
+from ....qat.torchao_fp4 import torchao_fake_quant
 from . import eager as _eager
 
 
@@ -40,20 +40,23 @@ def wrapper(
     down_b: Tensor,
     *,
     swiglu_limit: float | None = None,
-    block_size: int = NVFP4_BLOCK_SIZE,
+    dtype: str = "nvfp4",
+    block_size: int | None = None,
 ) -> Tensor:
-    """Run SwiGLU with NVFP4 fake-quantized projections and the optional clamp.
+    """Run SwiGLU with torchao fake-quantized projections and the optional clamp.
 
-    Empty bias tensors denote unused biases.
+    ``dtype`` picks the format (``nvfp4`` or ``mxfp4``); ``block_size`` defaults to
+    that format's group width. Empty bias tensors denote unused biases.
     """
-    x_q = nvfp4_fake_quant(x, block_size)
-    gate = F.linear(x_q, nvfp4_fake_quant(gate_w, block_size), _eager.optional_bias(gate_b))
-    up = F.linear(x_q, nvfp4_fake_quant(up_w, block_size), _eager.optional_bias(up_b))
+    quantize = torchao_fake_quant(dtype)
+    x_q = quantize(x, block_size)
+    gate = F.linear(x_q, quantize(gate_w, block_size), _eager.optional_bias(gate_b))
+    up = F.linear(x_q, quantize(up_w, block_size), _eager.optional_bias(up_b))
 
     gate_c, up_c = _eager.clamp_gate_up(gate, up, swiglu_limit)
     hidden = _eager.silu_mul(gate_c, up_c)
     if hidden.dtype != x.dtype:
         hidden = hidden.to(dtype=x.dtype)
 
-    hidden_q = nvfp4_fake_quant(hidden, block_size)
-    return F.linear(hidden_q, nvfp4_fake_quant(down_w, block_size), _eager.optional_bias(down_b))
+    hidden_q = quantize(hidden, block_size)
+    return F.linear(hidden_q, quantize(down_w, block_size), _eager.optional_bias(down_b))
