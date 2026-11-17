@@ -43,11 +43,13 @@ created before this storage-view proof existed is rejected for optimizer resume,
 even when its target has no shared views; the old metadata cannot prove that the
 source was also unshared. Use a separately verified migration or a new
 weights-only run rather than silently assuming identical update behavior.
-This proof currently requires Linux procfs for nonempty CPU model tensors and
-rejects shared CPU mappings, quantized, non-strided, and meta model tensors.
-Accelerator tensors must use framework-owned storage; externally imported or
-shared accelerator allocations are not proved by this check. File-backed
-optimizer moments are separate from model tensors and are not restricted here.
+For supported nonempty model storage, this includes distinct tensor views that
+share an allocation. It does not prove aliasing through independently imported
+shared mappings, empty allocations or external accelerator storage. Recognized
+file-backed model storage and lazy conjugate/negative model views are rejected;
+some externally mapped storage cannot be detected and must not be used for
+model aliases. Quantized, non-strided and meta model tensors are unsupported.
+File-backed optimizer moments are separate and are not restricted here.
 
 ## What each path holds
 
@@ -200,19 +202,22 @@ step and generation alone do not prove exact dataloader or RNG recovery.
 If a restored run has not established a same-step save receipt, an immediate
 export to the already completed step fails rather than overwriting that DCP.
 
-MultiOptimizer checkpoint identity supports VeOmni's built-in constant, linear
-and cosine schedules. Custom `LambdaLR` functions must use immutable captures
-and the supported pure builtins or standard `math` members; global state,
-dynamic lookup, mutable closures and unrecognized attribute access are rejected
-at save and resume. Set construction and frozenset constants are also rejected
-because their iteration order can differ between processes. Custom scheduler
-authors must ensure that formatting and the overall schedule are deterministic across
-processes and recovery: the identity check does not prove arbitrary Python
-functions deterministic. Older custom scheduler checkpoints that cannot meet
-this contract require a verified migration or weights-only restart. Identity checks
-assume a trusted Python runtime whose standard `math` members and scheduler
-builtin bindings remain unchanged throughout training, saving and recovery.
-They do not detect monkeypatches to these objects and are not a code sandbox.
+MultiOptimizer checkpoint identity records the versioned recipe and concrete
+parameters of VeOmni's constant, linear and cosine schedules. Custom `LambdaLR`
+schedules must register a stable name, version and all behavior-affecting JSON
+parameters with `register_checkpoint_scheduler`; the caller must use the same
+trusted deterministic implementation on resume. The recipe is an attestation,
+not a sandbox or a proof about arbitrary Python code. Unregistered schedulers
+and checkpoints carrying only the older callable-hash identity require a
+verified migration or a new weights-only run. Scheduler step, optimizer group
+identity and checkpoint generation remain checked independently.
+
+```python
+from veomni.optim.lr_scheduler import register_checkpoint_scheduler
+
+register_checkpoint_scheduler(scheduler, name="my.schedule", version=1,
+                              parameters={"warmup_steps": 100})
+```
 
 With `stage_dir` the model half waits: a staged save has overwritten nothing
 until the copy to the destination, so it invalidates the destination there
@@ -543,9 +548,9 @@ identity and rejects restoration; use the proven DCP path instead.
 The codec rejects tensor learning rates shared between groups. The saved alias
 identity covers parameters and buffers, including nonpersistent buffer aliases.
 Optimizer adapters and model serialization hooks are trusted to preserve their
-state and semantics. Identity tracks repeated tensor objects, but does not detect
-distinct views sharing storage; models that rely on mutable shared views are
-outside this checkpoint contract. The upstream and VeOmni-generated Qwen3
+state and semantics. Identity tracks repeated tensor objects and supported
+nonempty shared-storage views as described above; separately imported shared
+mappings remain outside the contract. The upstream and VeOmni-generated Qwen3
 dynamic RoPE reset alias is permitted when its current and original tables match
 a valid reconstruction; other reset aliases remain outside this contract.
 Dynamic RoPE frequencies and cached maximum lengths are not checkpointed. If

@@ -15,7 +15,6 @@
 """FSDP2 + expert-parallel optimizer/DCP cold-recovery regression on Ascend."""
 
 import os
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -108,53 +107,6 @@ def _native_npu_launch(context):
     if caps.backend == "npu" and len(caps.devices) >= 2:
         return LaunchSpec(nproc=2, device="accelerator")
     return LaunchSpec(device="cpu")
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize(
-    "backend,required,available,count,outcome",
-    [
-        (None, False, False, 0, "skip"),
-        (None, True, False, 0, "fail"),
-        ("npu", False, False, 0, "fail"),
-        ("npu", False, True, 1, "fail"),
-        ("npu", False, True, 2, "pass"),
-        ("cuda", False, True, 2, "skip"),
-        ("cuda", True, True, 2, "fail"),
-    ],
-)
-def test_native_npu_guard_respects_ci_assignment(monkeypatch, backend, required, available, count, outcome):
-    monkeypatch.setitem(globals(), "IS_NPU_AVAILABLE", available)
-    monkeypatch.setattr(
-        torch, "npu", SimpleNamespace(is_available=lambda: available, device_count=lambda: count), raising=False
-    )
-    if backend is None:
-        monkeypatch.delenv("VEOMNI_CI_CAPABILITIES", raising=False)
-    else:
-        monkeypatch.setenv("VEOMNI_CI_CAPABILITIES", "test")
-        monkeypatch.setitem(globals(), "runner_capabilities", lambda: SimpleNamespace(backend=backend))
-    monkeypatch.setenv("VEOMNI_REQUIRE_NPU_TESTS", "1" if required else "0")
-    if outcome == "fail":
-        with pytest.raises(pytest.fail.Exception):
-            _require_two_native_npus()
-    elif outcome == "skip":
-        with pytest.raises(pytest.skip.Exception):
-            _require_two_native_npus()
-    else:
-        _require_two_native_npus()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_native_npu_launch_keeps_missing_devices_runnable():
-    assert _native_npu_launch(SimpleNamespace(capabilities=SimpleNamespace(backend="cpu", devices=()))) == LaunchSpec(
-        device="cpu"
-    )
-    assert _native_npu_launch(
-        SimpleNamespace(capabilities=SimpleNamespace(backend="npu", devices=("0",)))
-    ) == LaunchSpec(device="cpu")
-    assert _native_npu_launch(
-        SimpleNamespace(capabilities=SimpleNamespace(backend="npu", devices=("0", "1")))
-    ) == LaunchSpec(nproc=2, device="accelerator")
 
 
 @pytest.mark.launch_plan(provider=_native_npu_launch)

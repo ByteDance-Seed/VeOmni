@@ -53,6 +53,72 @@ def test_legacy_hf_export_failure_reaches_all_ranks():
     spawn_with_rendezvous(_legacy_hf_failure_worker, nprocs=2)
 
 
+def _hf_export_preflight_failure_worker(rank, directory, phase, endpoint):
+    from veomni.checkpoint import row_crop
+    from veomni.utils import save_safetensor_utils
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        error = ValueError("injected export preflight failure") if rank == 1 else None
+        with (
+            patch.object(save_safetensor_utils, "get_model_save_state", return_value={"weight": torch.ones(2)}),
+            patch.object(
+                row_crop, "checkpoint_row_counts", side_effect=error if phase == "metadata" else None, return_value={}
+            ),
+            patch(
+                "torch.distributed.checkpoint.HuggingFaceStorageWriter",
+                side_effect=error if phase == "writer" else None,
+            ),
+            patch.object(save_safetensor_utils.dcp, "save") as save,
+        ):
+            expected = ValueError if rank == 1 else RuntimeError
+            with pytest.raises(expected, match="injected export preflight failure|failed on another rank"):
+                save_safetensor_utils._save_hf_safetensor_distributed(None, directory, None, None)
+            save.assert_not_called()
+        value = torch.ones(1)
+        dist.all_reduce(value)
+        assert value.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+@pytest.mark.parametrize("phase", ["metadata", "writer"])
+def test_hf_export_preflight_failure_reaches_all_ranks(tmp_path, phase):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_hf_export_preflight_failure_worker, args=(str(tmp_path), phase), nprocs=2)
+
+
+def _hf_export_assets_failure_worker(rank, directory, endpoint):
+    from veomni.checkpoint import row_crop
+    from veomni.utils import save_safetensor_utils
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        with (
+            patch.object(save_safetensor_utils, "get_model_save_state", return_value={"weight": torch.ones(2)}),
+            patch.object(row_crop, "checkpoint_row_counts", return_value={}),
+            patch.object(save_safetensor_utils.dcp, "save"),
+            patch.object(save_safetensor_utils, "save_model_assets", side_effect=OSError("injected asset failure")),
+        ):
+            expected = OSError if rank == 0 else RuntimeError
+            with pytest.raises(expected, match="injected asset failure|failed on another rank"):
+                save_safetensor_utils._save_hf_safetensor_distributed(None, directory, None, [object()])
+        value = torch.ones(1)
+        dist.all_reduce(value)
+        assert value.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_hf_export_asset_failure_reaches_all_ranks(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_hf_export_assets_failure_worker, args=(str(tmp_path),), nprocs=2)
+
+
 def test_legacy_hf_export_selects_fuse_fallback():
     from veomni.utils import save_safetensor_utils
 
@@ -61,7 +127,7 @@ def test_legacy_hf_export_selects_fuse_fallback():
         patch.object(save_safetensor_utils, "ckpt_to_state_dict", return_value=model_state),
         patch.object(save_safetensor_utils, "save_model_weights") as save_model_weights,
     ):
-        save_safetensor_utils._save_hf_safetensor_legacy("checkpoint", "output", None, "dcp", None)
+        save_safetensor_utils._save_hf_safetensor_legacy("checkpoint", "output", None, "dcp", None, None)
     save_model_weights.assert_called_once_with("output", model_state, model_assets=None, legacy_fuse_fallback=True)
 
 
@@ -101,6 +167,117 @@ def test_lora_adapter_export_uses_fuse_fallback(tmp_path, monkeypatch):
     assert actual.keys() == expected.keys()
     for name in expected:
         torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+
+
+def test_lora_config_write_failure_preserves_previous_adapter(tmp_path, monkeypatch):
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    output = tmp_path / "adapter"
+    output.mkdir()
+    weights = output / "adapter_model.safetensors"
+    config = output / "adapter_config.json"
+    weights.write_bytes(b"old weights")
+    config.write_bytes(b"old config")
+    base = nn.Module()
+    base.linear = nn.Linear(4, 4, bias=False)
+    model = VeOmniLoraModel(base, VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["linear"]))
+
+    def fail_config(*_args, **_kwargs):
+        raise OSError("injected config write failure")
+
+    monkeypatch.setattr(VeOmniLoraConfig, "save_pretrained", fail_config)
+    with pytest.raises(OSError, match="injected config write failure"):
+        save_lora_adapter_with_dcp(model, str(output))
+    assert weights.read_bytes() == b"old weights"
+    assert config.read_bytes() == b"old config"
+
+
+@pytest.mark.parametrize("failure_after_replace", [False, True])
+def test_lora_config_publish_failure_can_be_retried(tmp_path, monkeypatch, failure_after_replace):
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.utils import save_safetensor_utils
+
+    output = tmp_path / "adapter"
+    output.mkdir()
+    weights = output / "adapter_model.safetensors"
+    config = output / "adapter_config.json"
+    base = nn.Module()
+    base.linear = nn.Linear(4, 4, bias=False)
+    model = VeOmniLoraModel(base, VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["linear"]))
+    real_replace = save_safetensor_utils.os.replace
+
+    def fail_config_publish(source, destination):
+        if destination == str(config):
+            if failure_after_replace:
+                real_replace(source, destination)
+            raise OSError("injected config publish failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(save_safetensor_utils.os, "replace", fail_config_publish)
+    with pytest.raises(OSError, match="injected config publish failure"):
+        save_safetensor_utils.save_lora_adapter_with_dcp(model, str(output))
+    assert not weights.exists()
+    assert config.exists() == failure_after_replace
+    assert not list(output.glob(".veomni-adapter-*"))
+    monkeypatch.setattr(save_safetensor_utils.os, "replace", real_replace)
+    save_safetensor_utils.save_lora_adapter_with_dcp(model, str(output))
+    assert weights.exists() and config.exists()
+
+
+def test_lora_overwrite_rejects_different_config_without_changing_old_adapter(tmp_path):
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.utils.save_safetensor_utils import save_lora_adapter_with_dcp
+
+    base = nn.Module()
+    base.linear = nn.Linear(4, 4, bias=False)
+    model = VeOmniLoraModel(base, VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["linear"]))
+    output = tmp_path / "adapter"
+    save_lora_adapter_with_dcp(model, str(output))
+    weights, config = output / "adapter_model.safetensors", output / "adapter_config.json"
+    original_weights, original_config = weights.read_bytes(), config.read_bytes()
+    other = nn.Module()
+    other.linear = nn.Linear(4, 4, bias=False)
+    other = VeOmniLoraModel(other, VeOmniLoraConfig(r=2, lora_alpha=8, target_modules=["linear"]))
+    with pytest.raises(ValueError, match="different config"):
+        save_lora_adapter_with_dcp(other, str(output))
+    assert weights.read_bytes() == original_weights and config.read_bytes() == original_config
+
+
+@pytest.mark.parametrize("failure_after_replace", [False, True])
+def test_lora_weight_replace_error_keeps_matching_config(tmp_path, monkeypatch, failure_after_replace):
+    from safetensors.torch import load_file
+
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.utils import save_safetensor_utils
+
+    base = nn.Module()
+    base.linear = nn.Linear(4, 4, bias=False)
+    model = VeOmniLoraModel(base, VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["linear"]))
+    output = tmp_path / "adapter"
+    save_safetensor_utils.save_lora_adapter_with_dcp(model, str(output))
+    weights, config = output / "adapter_model.safetensors", output / "adapter_config.json"
+    old_weights, old_config = weights.read_bytes(), config.read_bytes()
+    with torch.no_grad():
+        for name, value in model.named_parameters():
+            if ".lora_" in name:
+                value.fill_(0.625)
+    real_replace = save_safetensor_utils.os.replace
+
+    def fail_weight_publish(source, destination):
+        if destination == str(weights):
+            if failure_after_replace:
+                real_replace(source, destination)
+            raise OSError("injected weight publish failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(save_safetensor_utils.os, "replace", fail_weight_publish)
+    with pytest.raises(OSError, match="injected weight publish failure"):
+        save_safetensor_utils.save_lora_adapter_with_dcp(model, str(output))
+    assert config.read_bytes() == old_config
+    assert (weights.read_bytes() != old_weights) == failure_after_replace
+    assert load_file(str(weights))
+    assert not list(output.glob(".veomni-adapter-*"))
 
 
 def _lora_export_failure_worker(rank, directory, endpoint):
@@ -181,6 +358,7 @@ def _lora_fallback_copy_failure_worker(rank, directory, local_temp, endpoint):
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 def test_lora_fallback_copy_failure_preserves_previous_adapter(tmp_path):
     from tests.tools.launch_utils import spawn_with_rendezvous
+    from veomni.lora import VeOmniLoraConfig
 
     output = tmp_path / "adapter"
     output.mkdir()
@@ -188,8 +366,12 @@ def test_lora_fallback_copy_failure_preserves_previous_adapter(tmp_path):
     local_temp.mkdir()
     adapter_path = output / "adapter_model.safetensors"
     adapter_path.write_bytes(b"previous adapter generation")
+    VeOmniLoraConfig(r=2, lora_alpha=4, target_modules=["linear"]).save_pretrained(str(output))
+    config_path = output / "adapter_config.json"
+    original_config = config_path.read_bytes()
     spawn_with_rendezvous(_lora_fallback_copy_failure_worker, args=(str(output), str(local_temp)), nprocs=2)
     assert adapter_path.read_bytes() == b"previous adapter generation"
+    assert config_path.read_bytes() == original_config
     assert not list(output.glob(".veomni-safetensors-*"))
     assert not list(local_temp.iterdir())
 
