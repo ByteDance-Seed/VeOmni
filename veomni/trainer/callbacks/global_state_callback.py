@@ -499,7 +499,8 @@ class GlobalStateCallback(Callback):
         optimizer_step = steps[0] if steps else None
         _agree_restored_position(optimizer_step, None, dist.group.WORLD if dist.is_initialized() else None)
         strict_optimizer = type(optimizer_step) is int
-        strict_resume = strict_sft or strict_optimizer
+        offline_resume = getattr(args.train, "training_task", None) == "offline_embedding"
+        strict_resume = strict_sft or strict_optimizer or offline_resume
         legacy_checkpoints, unknown_checkpoints, error = [], [], None
         try:
             legacy_checkpoints, unknown_checkpoints = _legacy_optimizer_checkpoints(self.trainer)
@@ -515,7 +516,7 @@ class GlobalStateCallback(Callback):
         coordinated_resume = (
             strict_resume
             or bool(legacy_checkpoints or unknown_checkpoints)
-            or getattr(args.train, "training_task", None) == "offline_embedding"
+            or offline_resume
         )
 
         if strict_optimizer:
@@ -612,6 +613,9 @@ class GlobalStateCallback(Callback):
             global_step = global_state["global_step"]
             if type(global_step) is not int or global_step < 0:
                 raise ValueError("Trainer checkpoint global_step must be a non-negative integer")
+            loader = self.trainer.train_dataloader
+            if offline_resume and loader is not None and (cursor is None or (global_step > 0 and not cursor)):
+                raise ValueError("Offline embedding checkpoint is missing its dataloader cursor")
             offline_runtime = _offline_condition_runtime(self.trainer)
             if offline_runtime is not None:
                 offline_runtime.validate_offline_condition_state(global_state.get("_veomni_offline_condition"))
@@ -625,7 +629,6 @@ class GlobalStateCallback(Callback):
                 validate_writer = getattr(writer, "validate_state_dict", None)
                 if callable(validate_writer):
                     validate_writer(writer_state)
-            loader = self.trainer.train_dataloader
             saved_sft_context = "_veomni_dynamic_context" in global_state
             saved_geometry = isinstance(cursor, dict) and "_veomni_resume_geometry" in cursor
             is_dpo = getattr(self.trainer, "_dpo_resume_proven", False) is True

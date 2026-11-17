@@ -710,6 +710,29 @@ class TestGlobalStateCallbackJobState:
             {"shard_index": 1, "rows_written": 1, "world_size": 1}
         )
 
+    @pytest.mark.parametrize("cursor_file", ["missing", "empty"])
+    def test_offline_resume_rejects_missing_loader_cursor_before_writer_restore(self, mock_dist, tmp_path, cursor_file):
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer()
+        trainer.args.train.training_task = "offline_embedding"
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.model = SimpleNamespace(optimizer=None, checkpoint=None)
+        trainer.train_dataloader = MagicMock()
+        trainer.offline_cache_writer = MagicMock()
+        extra_path = Path(layout.extra_state_path(str(tmp_path), 0))
+        extra_path.parent.mkdir(parents=True)
+        torch.save({"global_step": 7, "offline_cache_writer": {"shard_index": 1}}, extra_path)
+        if cursor_file == "empty":
+            loader_path = Path(layout.loader_path(str(tmp_path), 0))
+            loader_path.parent.mkdir(parents=True)
+            torch.save({"train_dataloader": {}}, loader_path)
+
+        with pytest.raises((RuntimeError, ValueError), match="[Oo]ffline embedding checkpoint.*dataloader cursor"):
+            GlobalStateCallback(trainer).load_global_state()
+        trainer.offline_cache_writer.load_state_dict.assert_not_called()
+        trainer.train_dataloader.load_state_dict.assert_not_called()
+        assert trainer.state.global_step == 0
+
     @patch("veomni.trainer.callbacks.global_state_callback.get_device_type", return_value="cpu")
     def test_load_skips_when_any_rank_is_missing_state(self, mock_device, mock_dist, tmp_path):
         """A missing cursor on one rank must not leave the others at a different step."""
