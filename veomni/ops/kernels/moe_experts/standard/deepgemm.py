@@ -77,6 +77,12 @@ def wrapper(
     num_experts: int,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
+    # Accepted to honour the family-wide call signature: ``DeepseekV4Experts``
+    # passes both at every call whatever row it resolved. Neither is something this
+    # row can vary -- the format is FP8 because the name says so, and DeepGEMM fixes
+    # its tile -- so they are dropped below rather than forwarded. ``register_op``
+    # declares the row ``NATIVE``, which is what stops a config from setting them at
+    # all (see ``_check_kwargs``) instead of accepting a key that would be ignored.
     block_size: int = 128,
     expert_dtype: str = "fp8",
 ) -> Tensor:
@@ -89,6 +95,9 @@ def wrapper(
     capture. Routing weights are applied after the down projection, matching the
     eager expert contract rather than moving them through FP8 quantization.
     """
+    # The format is fixed by the row, not by the caller: see the note on the
+    # signature. Dropping them here keeps the intent visible at the point of use.
+    del block_size, expert_dtype
     if (
         hidden_states.device.type != "cuda"
         or torch.version.hip is not None

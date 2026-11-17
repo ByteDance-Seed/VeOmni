@@ -11,11 +11,18 @@ separate quantization recipe, and not a module rewrite. Parameters stay ordinary
 floating point tensors with unchanged names, and checkpoint/export paths are
 untouched.
 
-The row uses torchao's **emulated** NVFP4 round trip (`NVFP4Tensor`), and the
-GEMM runs in the model dtype (nonempty operands must be BF16 or FP32; FP16
-operands are rejected at runtime even though `mixed_precision.param_dtype`
-accepts `float16`). No native FP4 training kernels and no Blackwell requirement
-during QAT.
+It is **emulated**, not native, despite the name: torchao has a real NVFP4 GEMM,
+and this row is not it. The row borrows torchao's `NVFP4Tensor` round trip to match
+that kernel's numerics and then multiplies in the model dtype (nonempty operands
+must be BF16 or FP32; FP16 is rejected at runtime even though
+`mixed_precision.param_dtype` accepts `float16`). No native FP4 training kernels
+and no Blackwell requirement during QAT.
+
+The registry records that difference as `RowPrecision` — `EMULATED` here, `NATIVE`
+for a row that casts and runs the GEMM in the target format (the only such row
+today is `deepgemm_fp8` on `moe_experts`) — which is what decides that this row
+takes `block_size` from a config while a native row may not, and that an adapter
+cannot sit in front of it. See [op selection](../design/op_selection.md).
 
 ## The two op rows
 

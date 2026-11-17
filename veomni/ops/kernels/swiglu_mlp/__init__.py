@@ -22,7 +22,7 @@ Empty biases are unused.
 from torch import nn
 
 from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, MluKernelRequirement
-from ...registry import register_op
+from ...registry import RowPrecision, register_op
 from .geglu import eager as geglu_eager
 from .geglu import liger_kernel as geglu_liger
 from .standard import eager as standard_eager
@@ -35,17 +35,24 @@ _GPU = GpuKernelRequirement()
 _MLU = MluKernelRequirement()
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
-#: ``swiglu_mlp`` rows that fake-quantize the weight tensors they are handed.
-#: Only these need a projection's own ``weight``; every other row is a plain
-#: arithmetic rewrite that keeps working on a wrapped projection's fallback path.
-QUANTIZING_IMPLS = frozenset({"qat", "torchao_nvfp4"})
-
 #: Activations the quantizing rows implement. ``standard`` is SiLU in both
 #: directions (forward and backward); ``geglu`` is GELU-tanh but registers no
 #: quantizing row, so its activation is deliberately absent. A model outside this
 #: set has no quantizing row at all, and selecting one would round nothing -- which
 #: is why ``configuration_base`` refuses the combination at load time (#1430).
 FUSED_ACTIVATIONS = frozenset({"silu", "swish"})
+
+
+def quantizing_impls() -> frozenset[str]:
+    """``swiglu_mlp`` rows that round the weight tensors they are handed.
+
+    Only these need a projection's own ``weight``; every other row is a plain
+    arithmetic rewrite that keeps working on a wrapped projection's fallback path.
+    Derived from the registry, so the set cannot drift from what is registered.
+    """
+    from ...registry import OP_REGISTRY
+
+    return OP_REGISTRY.rounding_impls("swiglu_mlp")
 
 
 def has_plain_linear_projections(mlp: nn.Module) -> bool:
@@ -82,7 +89,7 @@ def has_plain_linear_projections(mlp: nn.Module) -> bool:
 
 
 def reject_quantizing_row(owner: nn.Module, reason: str, *, remedy: str) -> None:
-    """Raise when ``owner``'s ``swiglu_mlp`` row quantizes and its call site cannot run it.
+    """Raise when ``owner``'s ``swiglu_mlp`` row rounds and its call site cannot run it.
 
     A wrapped projection (LoRA keeps the base layer at ``base_layer``) has no
     ``weight`` for the row to read, so falling through would train at full
@@ -95,7 +102,7 @@ def reject_quantizing_row(owner: nn.Module, reason: str, *, remedy: str) -> None
     """
     handle = getattr(owner, "veomni_swiglu_mlp", None)
     impl = getattr(handle, "impl", None)
-    if impl not in QUANTIZING_IMPLS:
+    if impl not in quantizing_impls():
         return
     raise ValueError(f"swiglu_mlp_implementation={impl!r} cannot run on {reason}. {remedy}")
 
@@ -138,7 +145,7 @@ register_op(
     "standard",
     "qat",
     description="TileLang blockwise FP8 fake-quantized SwiGLU MLP with optional activation clamping",
-    quantizes=True,
+    precision=RowPrecision.EMULATED,
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
@@ -149,7 +156,7 @@ register_op(
     "standard",
     "torchao_nvfp4",
     description="TorchAO NVFP4 fake-quantized SwiGLU MLP with optional activation clamping",
-    quantizes=True,
+    precision=RowPrecision.EMULATED,
     wrapper=standard_torchao_nvfp4.wrapper,
     requires=("torchao",),
 )

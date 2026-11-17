@@ -32,7 +32,7 @@ select it.
 """
 
 from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement
-from ...registry import register_op
+from ...registry import RowPrecision, register_op
 from .grouped import eager as grouped_eager
 from .grouped import qat as grouped_qat
 from .standard import eager as standard_eager
@@ -56,7 +56,7 @@ register_op(
     "standard",
     "qat",
     description="TileLang blockwise FP8 fake-quantized dense linear projection",
-    quantizes=True,
+    precision=RowPrecision.EMULATED,
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
@@ -67,7 +67,7 @@ register_op(
     "standard",
     "torchao_nvfp4",
     description="TorchAO NVFP4 fake-quantized dense linear projection",
-    quantizes=True,
+    precision=RowPrecision.EMULATED,
     wrapper=standard_torchao_nvfp4.wrapper,
     requires=("torchao",),
 )
@@ -85,7 +85,7 @@ register_op(
     "grouped",
     "qat",
     description="TileLang blockwise FP8 fake-quantized grouped linear projection",
-    quantizes=True,
+    precision=RowPrecision.EMULATED,
     wrapper=grouped_qat.module_wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),

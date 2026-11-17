@@ -23,7 +23,7 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import OpsImplementationConfig
-from veomni.ops import VeomniOp
+from veomni.ops import OP_REGISTRY, RowPrecision, VeomniOp
 from veomni.ops.selection import OpsSelection, SiteOverride
 
 
@@ -56,8 +56,8 @@ def quantizing_row():
         "test_round",
         _round_forward,
         _round_backward,
-        description="test-only quantizing row",
-        quantizes=True,
+        description="test-only emulated row",
+        precision=RowPrecision.EMULATED,
     )
     try:
         yield "test_round"
@@ -159,7 +159,7 @@ def test_an_override_merges_kwargs_by_default():
 def test_an_override_can_replace_the_whole_kwargs_set():
     """Switching to a reference row needs the inherited set dropped.
 
-    ``liger_kernel`` is not a quantizing row, so it takes no row arguments;
+    ``liger_kernel`` is not a rounding row, so it takes no row arguments;
     inheriting the enclosing block's ``block_size`` would be refused.
     """
     selection = OpsSelection.from_config_value(
@@ -212,7 +212,7 @@ def test_a_non_quantizing_row_refuses_row_arguments(quantizing_row):
     no rounding at all.
     """
     selection = OpsSelection.from_config_value({"name": "eager", "kwargs": {"block_size": 64}})
-    with pytest.raises(ValueError, match="is not a quantizing row"):
+    with pytest.raises(ValueError, match="is not a rounding row"):
         VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
 
 
@@ -390,10 +390,10 @@ def test_config_time_refuses_row_arguments_on_a_reference_row():
     A rule that inherits a reference row from the enclosing block and adds only
     `dtype` is the same error as writing it on `name:`, and is judged the same way.
     """
-    with pytest.raises(ValueError, match="'fused_triton' is not a quantizing row"):
+    with pytest.raises(ValueError, match="'fused_triton' is not a rounding row"):
         OpsImplementationConfig(moe_implementation={"name": "fused_triton", "kwargs": {"block_size": 64}})
 
-    with pytest.raises(ValueError, match="'eager' is not a quantizing row"):
+    with pytest.raises(ValueError, match="'eager' is not a rounding row"):
         OpsImplementationConfig(
             moe_implementation={
                 "name": "qat",
@@ -406,3 +406,114 @@ def test_config_time_refuses_row_arguments_on_a_reference_row():
 def test_a_quantizing_row_may_carry_arguments():
     configured = OpsImplementationConfig(moe_implementation={"name": "qat", "kwargs": {"block_size": 64}})
     assert configured.moe_implementation.kwargs == {"block_size": 64}
+
+
+# ---------------------------------------------------------------------------
+# The precision axis: emulated vs native
+# ---------------------------------------------------------------------------
+
+
+def test_every_row_reports_a_precision_and_the_three_values_are_distinct():
+    """The axis has to separate the three cases a bool could not.
+
+    ``deepgemm_fp8`` rounds *and* runs the GEMM in FP8, so ``quantizes=True`` made it
+    indistinguishable from ``qat`` -- which rounds but multiplies in the model
+    dtype. Both answers were wrong: treating it as emulated claimed the parameters
+    stay high precision, and treating it as exact claimed nothing is rounded.
+    """
+    expected = {
+        ("moe_experts", "fused_triton"): RowPrecision.EXACT,
+        ("moe_experts", "qat"): RowPrecision.EMULATED,
+        ("moe_experts", "deepgemm_fp8"): RowPrecision.NATIVE,
+    }
+    for (op, impl), want in expected.items():
+        assert OP_REGISTRY.precision(op, impl) is want
+
+    # ``exact`` is the only value that does not round.
+    assert [m.rounds_operands for m in RowPrecision] == [False, True, True]
+    # ... and only emulation is parameterised, which is why a native row takes no
+    # config arguments even though it rounds.
+    assert [m.configurable for m in RowPrecision] == [False, True, False]
+
+
+def test_an_unregistered_row_has_no_precision():
+    """``None`` means "not a row", which callers must not confuse with ``EXACT``."""
+    assert OP_REGISTRY.precision("moe_experts", "no_such_row") is None
+    assert OP_REGISTRY.quantizes("moe_experts", "no_such_row") is None
+
+
+def test_emulated_impls_is_derived_from_the_registry_not_a_hand_written_list():
+    """The guard sets are computed, so a new emulated row is complete on registration.
+
+    ``deepgemm_fp8`` is the case that motivated it: listed by hand, it was missing
+    from ``moe_experts.QUANTIZING_IMPLS`` and so slipped past the non-SwiGLU guard.
+    """
+    assert OP_REGISTRY.emulated_impls("moe_experts") == frozenset({"qat"})
+    # A native row rounds but is not emulated -- the distinction the sets now carry.
+    assert "deepgemm_fp8" in OP_REGISTRY.rounding_impls("moe_experts")
+    assert "deepgemm_fp8" not in OP_REGISTRY.emulated_impls("moe_experts")
+
+
+def test_a_native_row_refuses_row_arguments():
+    """Its format is its name, so a config cannot choose a width or dtype for it.
+
+    Accepting ``expert_dtype: fp4`` here would be the same silent disagreement as
+    accepting ``block_size`` on ``eager``: the config would say FP4 while the row
+    cast to FP8.
+    """
+    with pytest.raises(ValueError, match="'deepgemm_fp8' is a native row of 'moe_experts'"):
+        OpsImplementationConfig(moe_implementation={"name": "deepgemm_fp8", "kwargs": {"expert_dtype": "fp4"}})
+
+    # No row arguments at all, so the empty mapping is not a loophole either.
+    assert OpsImplementationConfig(moe_implementation={"name": "deepgemm_fp8"}).moe_implementation.name == (
+        "deepgemm_fp8"
+    )
+
+
+def test_the_native_row_still_takes_the_family_signature_at_the_call_site():
+    """``_check_kwargs`` constrains a config, not a call.
+
+    ``DeepseekV4Experts`` passes ``expert_dtype`` at every call whatever row it
+    resolved, so a native row must still accept it positionally-equivalent: the
+    check would otherwise break every DeepSeek-V4 expert forward.
+    """
+    from veomni.ops.registry import OpEntry
+
+    seen = {}
+
+    def record(*args, **kwargs):
+        seen.update(kwargs)
+        return torch.zeros(1)
+
+    handle = object.__new__(VeomniOp)
+    handle.op, handle.variant, handle.impl, handle.kwargs = "moe_experts", "standard", "deepgemm_fp8", {}
+    handle._entry = OpEntry(
+        op="moe_experts", variant="standard", impl="deepgemm_fp8", description="probe", wrapper=record
+    )
+    handle(torch.zeros(1), num_experts=8, expert_dtype="fp4")
+    assert seen == {"num_experts": 8, "expert_dtype": "fp4"}
+
+
+def test_a_native_row_is_refused_where_a_deployment_kernel_is_not_reached():
+    """The non-SwiGLU guard asks "does this row round?", so it must catch both kinds.
+
+    ``deepgemm_fp8`` bakes SwiGLU into its grouped GEMM exactly as ``qat`` does, so
+    falling back to the Python act_fn loop would run it at full precision. It was
+    the hand-written ``frozenset({"qat"})`` that let it through.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
+
+    class _Experts(nn.Module):
+        def __init__(self, impl):
+            super().__init__()
+            self.use_swiglu_mlp = False
+            self.veomni_moe = type("_Handle", (), {"impl": impl})()
+
+    for impl in ("qat", "deepgemm_fp8"):
+        with pytest.raises(ValueError, match="cannot run with a non-SwiGLU activation"):
+            reject_quantizing_act_fn(_Experts(impl))
+
+    # A row that rounds nothing keeps the fallback: it has no fused kernel to miss.
+    reject_quantizing_act_fn(_Experts("fused_triton"))

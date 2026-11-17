@@ -73,9 +73,9 @@ def _reject_quantized_swiglu_on_an_unfused_activation(config: PretrainedConfig, 
     reaches, including a VLM's ``text_config``, because ``collect`` already walks
     ``sub_configs``. It also fails at load time instead of on the first step.
     """
-    from ..ops.kernels.swiglu_mlp import FUSED_ACTIVATIONS, QUANTIZING_IMPLS
+    from ..ops.kernels.swiglu_mlp import FUSED_ACTIVATIONS, quantizing_impls
 
-    if proposed.get("swiglu_mlp_implementation") not in QUANTIZING_IMPLS:
+    if proposed.get("swiglu_mlp_implementation") not in quantizing_impls():
         return
     if not _binds_swiglu_mlp(config):
         return

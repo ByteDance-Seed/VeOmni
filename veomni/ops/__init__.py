@@ -25,7 +25,7 @@ ATen overrides live in ``batch_invariant``.
 
 from . import kernels as _op_families  # noqa: F401
 from .install import apply_ops_patch
-from .registry import OP_REGISTRY, VeomniOp, register_op, resolve_op
+from .registry import OP_REGISTRY, RowPrecision, VeomniOp, register_op, resolve_op
 
 
 apply_ops_patch()
@@ -33,6 +33,7 @@ apply_ops_patch()
 
 __all__ = [
     "OP_REGISTRY",
+    "RowPrecision",
     "VeomniOp",
     "apply_ops_patch",
     "register_op",

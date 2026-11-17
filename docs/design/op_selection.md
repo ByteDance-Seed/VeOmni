@@ -35,7 +35,7 @@ If a field is not in this table, it is not an op-selection knob.
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `triton` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `triton`, `fla_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU) | `"triton"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `qat` (FP8/FP4 QAT, SM90+), `deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `qat` (FP8/FP4 QAT, SM90+), `deepgemm_fp8` (native FP8 GEMM, SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
 
 ### Quantization is chosen per op, not as a recipe
 
@@ -83,6 +83,13 @@ the activation block *and* the weight tile, because the deployment recipe ties t
 (the FP8 GEMM indexes a weight's scale by the same block counter as the
 activation's). A recipe that used different widths for the two operands would need
 the row to take them separately; none does today.
+
+Note that `RowPrecision` covers the op registry only.
+[float8 training](../usage/float8_training.md) is a module conversion
+(`Float8Linear`) driven from `fsdp_config`, outside the registry entirely: it is
+native in spirit. A quantizing row and a float8 target cannot share a projection,
+which the row-level guards already enforce because a converted projection is an
+`nn.Linear` subclass the rows refuse.
 
 These arguments are **not** `model.ops_implementation` fields. They are parameters
 of the registered row, resolved at the call site, so changing one is a modeling
@@ -230,22 +237,45 @@ moe_implementation:
 A bare string stays valid and means one row everywhere, which is what every
 existing config and checkpoint records.
 
-**The row name carries the whole decision.** `qat`, `torchao_nvfp4` and
+**The row name carries most of the decision.** `qat`, `torchao_nvfp4` and
 `deepgemm_fp8` are rows, so "which precision", "fake quantization or the vendor's
-real GEMM" and "which package provides it" are already spelled by the name the
-registry resolves. There is no separate `enable` flag to keep in sync with it:
-turning quantization off for a site means naming a reference row such as `eager`
-or `liger_kernel` in that rule.
+real GEMM" and "which package provides it" are spelled by the name the registry
+resolves. There is no separate `enable` flag to keep in sync with it: turning
+quantization off for a site means naming a reference row such as `eager` or
+`liger_kernel` in that rule.
+
+**But the name does not say whether the rounding is emulated or native**, and the
+two behave differently everywhere a guard has to make a decision. So each row
+declares its `RowPrecision`:
+
+| Value | What the row does | Rows |
+| --- | --- | --- |
+| `EXACT` | Computes on the operands unchanged | `eager`, `fused_triton`, `liger_kernel`, …. The default |
+| `EMULATED` | Rounds operands to the target format, then runs the GEMM in the model dtype. Training only: straight-through gradients, high-precision parameters | `qat`, `torchao_nvfp4` |
+| `NATIVE` | Casts operands to the target format and runs the GEMM in it | `deepgemm_fp8` |
+
+`torchao_nvfp4` reads like a native NVFP4 GEMM and is not one: it uses torchao's
+`NVFP4Tensor` round trip to match that kernel's numerics, then multiplies in BF16.
+The registry cannot infer this from the name, which is why the row states it.
+
+Two derived sets answer the two different questions:
+
+- `OP_REGISTRY.rounding_impls(op)` — every row that rounds anything. This is the
+  guard set: a wrapped projection has no `weight` to give such a row, every fused
+  kernel bakes one activation in, and an adapter cannot sit in front of it. It
+  contains both `qat` and `deepgemm_fp8`.
+- `OP_REGISTRY.emulated_impls(op)` — only the rows that *simulate* a deployment
+  kernel. This is the adapter set: no `moe_experts_lora` row reproduces a rounding.
 
 **`kwargs` is what a row still needs per call.** A row declares its own arguments
 (`block_size` for the GEMM rows, `expert_dtype` and `swiglu_limit` where they
 apply), and the selection passes them. Precision is not among them: it is what the
-row name says. Four rules:
+row name says. Five rules:
 
 | Rule | Why |
 | --- | --- |
-| **Only a quantizing row takes arguments** | A row argument says *how* to round an operand. `fused_triton` and `eager` have nothing to round, so passing `block_size: 64` to them asks for something the row will not do, and the run would quietly do something else. Rows declare `quantizes=True` when they are registered, and both the config and the handle refuse arguments on the rest |
-| An argument the row does not accept raises when the handle is built | A typo in YAML would otherwise be dropped and the row would run its own default while the config said something else |
+| **Only an `EMULATED` row takes arguments** | An argument says *how* to round an operand, which only an emulation has to be told — one row serves both an FP8 and an FP4 checkpoint. `fused_triton` and `eager` are `EXACT` and have nothing to round; a `NATIVE` row *is* the kernel, so its format is its name and it has no width to choose. Both the config and the handle refuse arguments on the rest |
+| An argument the row does not accept raises when the handle is built | A typo in YAML would otherwise be dropped and the row would run its own default while the config said something else. The check runs *before* hardware resolution, so a config mistake on a host that cannot run the row reports the mistake rather than the missing GPU |
 | **The config beats what the modeling passes at the call site** | A row argument has three sources, and each corrects the one before it: the row's own signature default, the value the modeling passes from the checkpoint (`expert_dtype` is `"fp4"` in a V4-Flash checkpoint), and the value the config sets. The checkpoint says what the weights were *stored* as; the config says what this run is *asked* to train at, so the config is the one that has to survive. A key the config leaves out keeps the modeling's value |
 | An argument without a default is not configurable | `num_experts` has no default because the row cannot run without it, so the modeling always supplies it. It describes the shape of the computation rather than a preference, and a YAML typo must not be able to launch the kernel over the wrong expert count |
 | An override merges into the inherited set, unless `replace_kwargs: true` | Adjusting one argument should not repeat the rest; switching to a row with a different signature needs the inherited set dropped, which `replace_kwargs` with `kwargs: {}` does |

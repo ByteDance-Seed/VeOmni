@@ -164,19 +164,19 @@ logger = logging.get_logger(__name__)
 
 
 def _moe_lora_op(base_layer: nn.Module, variant: str):
-    """Reject a quantizing or otherwise unmatched expert backend; otherwise bind its row."""
-    from veomni.ops import OP_REGISTRY, VeomniOp
-    from veomni.ops.kernels.moe_experts import QUANTIZING_IMPLS
+    """Reject a rounding expert backend; otherwise bind its row."""
+    from veomni.ops import OP_REGISTRY, RowPrecision, VeomniOp
 
     base_op = getattr(base_layer, "veomni_moe", None)
     impl = "eager" if base_op is None else base_op.impl
-    # Two backends cannot be adapted, for different reasons and with the same
-    # consequence: running them through the adapter would quietly change precision
-    # or drop the quantization the config asked for. ``deepgemm_fp8`` has no adapter
-    # forward, and no ``moe_experts_lora`` row fake-quantizes the base weights the
-    # way ``qat`` does -- substituting ``eager`` there would train them at full
-    # precision while the config still claimed QAT.
-    if impl == "deepgemm_fp8" or impl in QUANTIZING_IMPLS:
+    # No ``moe_experts_lora`` row rounds its operands, so a rounding expert backend
+    # cannot be adapted: substituting the adapter would train the base weights in
+    # the model dtype while the config still claimed otherwise. Both halves of that
+    # -- ``EMULATED`` rounding that no adapter reproduces, and ``NATIVE`` GEMMs the
+    # adapter has no row for -- are the same question, which is why this reads the
+    # row's precision rather than listing names.
+    precision = OP_REGISTRY.precision("moe_experts", impl)
+    if precision is not None and precision is not RowPrecision.EXACT:
         raise ValueError(
             f"moe_implementation={impl!r} does not support MoE-LoRA on expert weights. "
             "Select a supported MoE-LoRA backend (for example 'fused_triton' on GPU), "

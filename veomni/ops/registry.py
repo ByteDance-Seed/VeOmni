@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from inspect import Parameter, signature
 from typing import Any, Callable
 
@@ -39,6 +40,62 @@ from .selection import OpsSelection
 
 
 Output = Tensor | tuple[Tensor, ...]
+
+
+class RowPrecision(Enum):
+    """What a row does to the numerics of the operands it is handed.
+
+    A single ``quantizes`` flag could not describe a vendor GEMM: it rounds its
+    operands *and* computes in the low-precision format, so answering "does this
+    row take row arguments?" and "can this row run behind an adapter?" with one
+    bit forced the two answers to agree when they do not.
+
+    The three values are exhaustive because the alternative -- compute in the low
+    precision but keep full-precision operands -- is not a thing a kernel does. A
+    row that writes ``F.linear(x, w)`` in the model dtype is ``EXACT`` no matter
+    how much reinterpretation preceded it.
+    """
+
+    #: Neither operand is rounded; the row computes what the caller passed.
+    EXACT = "exact"
+    #: Operands are rounded to the target format, then the GEMM runs in the model
+    #: dtype. Training-only: the rounding is simulated, gradients pass straight
+    #: through, and parameters keep their high-precision layout.
+    EMULATED = "emulated"
+    #: Operands are cast to the target format and the GEMM itself runs in it. This
+    #: is the deployment recipe, so the row owns the cast rather than receiving
+    #: already-rounded operands.
+    NATIVE = "native"
+
+    @property
+    def rounds_operands(self) -> bool:
+        """Whether the row rounds what it is handed.
+
+        This is the guard question rather than the config question. A rounding row
+        reads the real weights -- a wrapped projection has none to give -- cannot sit
+        behind an adapter, and bakes one activation into its fused kernel.
+        ``deepgemm_fp8`` answers yes exactly like ``qat``.
+        """
+        return self is not RowPrecision.EXACT
+
+    @property
+    def configurable(self) -> bool:
+        """Whether a config may describe *how* this row rounds.
+
+        Only ``EMULATED`` rows are parameterised. An emulation has to be told which
+        format to stand in for and at what block width, because one row serves both
+        an FP8 and an FP4 checkpoint. A ``NATIVE`` row's format *is* its name --
+        ``deepgemm_fp8`` has no width to choose -- so a config that sets an argument
+        on it is asking for something the kernel cannot vary, and the answer is to
+        refuse rather than accept a key that will be ignored.
+        """
+        return self is RowPrecision.EMULATED
+
+
+#: The axis is opt-in: a row that says nothing computes on its operands unchanged,
+#: which is the default every reference row wants. Emulated and native rows declare
+#: themselves, because getting either wrong changes what a config may say about them.
+_DEFAULT_PRECISION = RowPrecision.EXACT
 
 
 @dataclass(frozen=True)
@@ -165,11 +222,10 @@ class OpEntry:
     requirement: KernelRequirement | None = None
     requires: tuple[str, ...] = ()
     default: bool = False
-    #: Whether this row rounds the operands it is handed. A selection may pass
-    #: ``kwargs`` only to such a row: a fused reference row has no ``dtype`` or
-    #: ``block_size``, so accepting them would mean silently ignoring what the
-    #: config asked for.
-    quantizes: bool = False
+    #: What this row does to the numerics of its operands. Drives whether a
+    #: selection may pass ``kwargs``, whether the row can run behind an adapter,
+    #: and whether it is a stand-in for a deployment kernel or the kernel itself.
+    precision: RowPrecision = _DEFAULT_PRECISION
 
     def __post_init__(self) -> None:
         """Validate the raw/wrapper pairing and generate the wrapper if needed."""
@@ -183,6 +239,8 @@ class OpEntry:
             raise ValueError("requires must not contain duplicate package names")
         if not isinstance(self.default, bool):
             raise TypeError("default must be a bool")
+        if not isinstance(self.precision, RowPrecision):
+            raise TypeError(f"precision must be a RowPrecision member, got {type(self.precision).__name__}")
         if self.default and self.requirement is None:
             raise ValueError(
                 "default=True requires a device-specific requirement; eager is already the fallback default"
@@ -322,18 +380,70 @@ class OpRegistry:
                 seen.append(impl)
         return seen
 
-    def quantizes(self, op: str, impl: str) -> bool | None:
-        """Whether ``impl`` is a quantizing row of ``op``, or ``None`` if unregistered.
+    def precision(self, op: str, impl: str) -> RowPrecision | None:
+        """What ``impl`` of ``op`` does to its operands, or ``None`` if unregistered.
 
-        ``quantizes`` describes what the row computes, not which hardware can run
+        The row's precision describes what it computes, not which hardware can run
         it, so any registered device's entry answers for all of them. Config-time
         validation uses this to refuse row arguments on a reference row without
         needing a device where the row resolves.
         """
         for (entry_op, _variant, entry_impl, _device), entry in self._entries.items():
             if entry_op == op and entry_impl == impl:
-                return entry.quantizes
+                return entry.precision
         return None
+
+    def first_entry(self, op: str, impl: str) -> OpEntry | None:
+        """Some registered entry for ``(op, impl)``, ignoring variant and device.
+
+        For the checks that must run before hardware resolution: a row's precision and
+        the keys it accepts do not depend on which device registered it, so any entry
+        answers. Returns ``None`` when no device registers the name, which the caller
+        leaves to ``resolve`` to report.
+        """
+        for (entry_op, _variant, entry_impl, _device), entry in self._entries.items():
+            if entry_op == op and entry_impl == impl:
+                return entry
+        return None
+
+    def quantizes(self, op: str, impl: str) -> bool | None:
+        """Whether ``impl`` of ``op`` rounds its operands, or ``None`` if unregistered.
+
+        A convenience over :meth:`precision` for the callers that only ask "does this
+        row round?" -- see :meth:`rounding_impls` for the set form.
+        """
+        found = self.precision(op, impl)
+        return None if found is None else found.rounds_operands
+
+    def emulated_impls(self, op: str) -> frozenset[str]:
+        """Every ``op`` row that simulates its target format instead of running it.
+
+        These are the rows that train against a deployment kernel's numerics while
+        the parameters stay high precision. Derived from the registry rather than a
+        per-family ``frozenset``, so a new emulated row is complete the moment it is
+        registered.
+        """
+        return frozenset(
+            entry.impl
+            for (entry_op, _variant, _impl, _device), entry in self._entries.items()
+            if entry_op == op and entry.precision.configurable
+        )
+
+    def rounding_impls(self, op: str) -> frozenset[str]:
+        """Every ``op`` row that rounds the operands it is handed, native rows included.
+
+        This is the set a guard wants when the question is "does this row read the
+        real weights and compute on rounded values?" -- a wrapped projection has no
+        ``weight`` for it, every fused kernel bakes one activation into it, and an
+        adapter cannot sit in front of it. ``deepgemm_fp8`` belongs here alongside
+        ``qat``; only the two differ in *how* they round, which is what
+        :meth:`emulated_impls` answers.
+        """
+        return frozenset(
+            entry.impl
+            for (entry_op, _variant, _impl, _device), entry in self._entries.items()
+            if entry_op == op and entry.precision.rounds_operands
+        )
 
     def row_arguments(self, op: str, impl: str) -> dict[str, Any] | None:
         """The keyword arguments a selection may set on ``impl`` of ``op``, name to default.
@@ -348,11 +458,18 @@ class OpRegistry:
         let a YAML typo launch the kernel over the wrong number of experts. It stays
         call-only, which is also why the third precedence step does not reach it.
 
+        An empty mapping for a ``NATIVE`` row means "registered, accepts nothing from
+        a config": its format is its name, so the parameters it must still take to
+        honour the family-wide call signature are not choices. That distinction
+        matters -- ``None`` means "unregistered", which the callers skip.
+
         Returns ``None`` when ``impl`` is not registered for ``op`` on any device.
         """
         for (entry_op, _variant, entry_impl, _device), entry in self._entries.items():
             if entry_op != op or entry_impl != impl:
                 continue
+            if not entry.precision.configurable:
+                return {}
             fn = entry.forward or entry.wrapper
             if fn is None:
                 return None
@@ -413,7 +530,7 @@ def register_op(
     requirement: KernelRequirement | None = None,
     requires: tuple[str, ...] = (),
     default: bool = False,
-    quantizes: bool = False,
+    precision: RowPrecision = _DEFAULT_PRECISION,
 ) -> None:
     """Register one row on ``OP_REGISTRY``.
 
@@ -425,8 +542,11 @@ def register_op(
     ``default=True`` marks a device-specific row as a host default candidate
     in registration order. ``resolve_op`` resolves ``impl=None`` through
     ``default_impl(op, variant)``.
-    ``quantizes=True`` marks a row that rounds its operands, which is the only
-    kind of row a selection may pass row arguments to.
+    ``precision`` says what the row does to its operands: ``EXACT`` computes on
+    them unchanged, ``EMULATED`` rounds them and runs the GEMM in the model dtype,
+    and ``NATIVE`` casts them and runs the GEMM in that format. Only the last two
+    take row arguments, and ``NATIVE`` is what distinguishes ``deepgemm_fp8`` from
+    ``qat`` even though both round.
     """
     OP_REGISTRY.register(
         OpEntry(
@@ -440,7 +560,7 @@ def register_op(
             requirement=requirement,
             requires=requires,
             default=default,
-            quantizes=quantizes,
+            precision=precision,
         )
     )
 
@@ -465,13 +585,19 @@ def _check_kwargs(entry: OpEntry, kwargs: Mapping[str, Any]) -> None:
 
     Two things are checked, and the first is the important one.
 
-    **Only a quantizing row takes arguments.** ``kwargs`` describe how to round --
+    **Only a rounding row takes arguments.** ``kwargs`` describe how to round --
     ``dtype``, ``block_size``, the checkpoint's ``expert_dtype``. A fused reference
-    row such as ``fused_triton`` has no rounding to describe, so a config that
-    passes arguments to it asks for something the row will not do; accepting them
-    would leave the config saying one thing and the step doing another.
+    row such as ``fused_triton`` is ``EXACT``: it has no rounding to describe, so a
+    config that passes arguments to it asks for something the row will not do;
+    accepting them would leave the config saying one thing and the step doing
+    another.
 
-    **A quantizing row still has to declare the key.** A typo would otherwise be
+    **A native row's format is its name, so it takes none either.** ``deepgemm_fp8``
+    rounds, but to FP8 at the width DeepGEMM fixes -- there is nothing for a config
+    to choose, and accepting ``expert_dtype: fp4`` there would be the same silent
+    disagreement in the other direction.
+
+    **A rounding row still has to declare the key.** A typo would otherwise be
     dropped, and the row would run its own default while the config said something
     else. A key the row requires rather than defaults is refused too: it describes
     the shape of the computation, so the modeling supplies it and a config must not.
@@ -480,11 +606,17 @@ def _check_kwargs(entry: OpEntry, kwargs: Mapping[str, Any]) -> None:
     """
     if not kwargs:
         return
-    if not entry.quantizes:
+    if not entry.precision.rounds_operands:
         raise ValueError(
-            f"{entry.op}/{entry.variant}/{entry.impl} is not a quantizing row, so it takes no row arguments; "
+            f"{entry.op}/{entry.variant}/{entry.impl} is not a rounding row, so it takes no row arguments; "
             f"got {sorted(kwargs)}. A row argument describes how to round an operand, so it belongs on a row "
             "that rounds -- name one (for example 'qat' or 'torchao_nvfp4'), or drop the kwargs."
+        )
+    if not entry.precision.configurable:
+        raise ValueError(
+            f"{entry.op}/{entry.variant}/{entry.impl} is a native row, so it takes no row arguments; "
+            f"got {sorted(kwargs)}. Its format is what the name says -- the row casts the operands to it "
+            "and runs the GEMM in it -- so there is no width or dtype for a config to choose."
         )
     fn = entry.forward or entry.wrapper
     if fn is None:
@@ -546,6 +678,15 @@ class VeomniOp:
             cached = cls._intern.get((op, variant, impl, _kwargs_key(kwargs)))
             if cached is not None:
                 return cached
+            # Check the arguments before resolving the row. Resolution enforces the
+            # row's hardware and package requirements, so on a host that cannot run
+            # the row at all that error would mask a config mistake -- and the config
+            # mistake is the one the author can fix. The row's precision and its
+            # accepted keys are properties of the row, not of the device, so any
+            # registered entry for the name answers for every device.
+            offered = OP_REGISTRY.first_entry(op, impl)
+            if offered is not None:
+                _check_kwargs(offered, kwargs)
         entry = resolve_op(op, variant, impl)
         key = (op, variant, entry.impl, _kwargs_key(kwargs))
         cached = cls._intern.get(key)

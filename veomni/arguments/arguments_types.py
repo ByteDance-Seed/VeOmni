@@ -1830,16 +1830,23 @@ class OpsImplementationConfig:
             for name, kwargs in [*offered, *effective]:
                 if not kwargs or name is None:
                     continue
-                quantizes = OP_REGISTRY.quantizes(op, name)
-                if quantizes is None:
+                precision = OP_REGISTRY.precision(op, name)
+                if precision is None:
                     # An unregistered name is reported by the registry when the model
                     # builds its handle; nothing useful to add here.
                     continue
-                if not quantizes:
+                if not precision.rounds_operands:
                     raise ValueError(
-                        f"{field_name}: {name!r} is not a quantizing row of {op!r}, so it takes no row arguments; "
+                        f"{field_name}: {name!r} is not a rounding row of {op!r}, so it takes no row arguments; "
                         f"got {sorted(kwargs)}. A row argument describes how to round an operand -- put it on a row "
                         "that rounds, such as 'qat' or 'torchao_nvfp4'."
+                    )
+                if not precision.configurable:
+                    raise ValueError(
+                        f"{field_name}: {name!r} is a native row of {op!r}, so it takes no row arguments; "
+                        f"got {sorted(kwargs)}. Its format is what the name says -- the row casts the operands "
+                        "to it and runs the GEMM in it -- so there is no width or dtype for a config to choose. "
+                        "Name an emulated row (such as 'qat') if you need to pick one."
                     )
                 accepted = OP_REGISTRY.row_arguments(op, name)
                 if accepted is None:

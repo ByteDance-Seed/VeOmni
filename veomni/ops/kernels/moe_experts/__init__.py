@@ -30,7 +30,7 @@ from ...platform import (
     NpuKernelRequirement,
     NvidiaGpuPlatform,
 )
-from ...registry import register_op
+from ...registry import RowPrecision, register_op
 from .gpt_oss import eager as gpt_oss_eager
 from .gpt_oss import quack as gpt_oss_quack
 from .shared import unpermute
@@ -46,11 +46,36 @@ from .standard import triton as standard_triton
 _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
-#: ``moe_experts`` rows that fake-quantize the weights they are handed. Adapters
-#: need the real weights, and ``moe_experts_lora`` has no matching row, so an
-#: expert-LoRA request on one of these must be refused rather than silently
-#: falling back to a full-precision ``eager`` base.
-QUANTIZING_IMPLS = frozenset({"qat"})
+
+#: ``moe_experts`` rows that *simulate* their target format instead of running it
+#: in that format. Derived from the registry rather than listed here, so a new
+#: emulated row is complete the moment it is registered -- ``deepgemm_fp8`` is
+#: native and therefore absent, even though it also rounds.
+def quantizing_impls() -> frozenset[str]:
+    """``moe_experts`` rows that fake-quantize, i.e. the ones a deployment kernel is not running.
+
+    Adapters need the real weights and no ``moe_experts_lora`` row simulates a
+    rounding, so an expert-LoRA request on one of these must be refused rather than
+    silently falling back to a full-precision ``eager`` base. This is the narrower
+    set: :func:`rounding_impls` is for guards that care about rounding at all.
+    """
+    from ...registry import OP_REGISTRY
+
+    return OP_REGISTRY.emulated_impls("moe_experts")
+
+
+def rounding_impls() -> frozenset[str]:
+    """``moe_experts`` rows that round the operands they are handed, native ones included.
+
+    The activation guard needs this set rather than the emulated one: every fused
+    row bakes SiLU into both directions, ``deepgemm_fp8`` included, so an activation
+    the family cannot run has to be refused for a native row just as much as for an
+    emulated one. Only ``EXACT`` rows are satisfied by the Python act_fn loop,
+    because they are the ones that never round.
+    """
+    from ...registry import OP_REGISTRY
+
+    return OP_REGISTRY.rounding_impls("moe_experts")
 
 
 def reject_quantizing_act_fn(owner: nn.Module) -> None:
@@ -76,13 +101,13 @@ def reject_quantizing_act_fn(owner: nn.Module) -> None:
             ``use_swiglu_mlp``.
 
     Raises:
-        ValueError: when the selection quantizes and the activation is not SwiGLU.
+        ValueError: when the selection rounds its operands and the activation is not SwiGLU.
     """
     if getattr(owner, "use_swiglu_mlp", True):
         return
     handle = getattr(owner, "veomni_moe", None)
     impl = getattr(handle, "impl", None)
-    if impl not in QUANTIZING_IMPLS:
+    if impl not in rounding_impls():
         return
     raise ValueError(
         f"moe_implementation={impl!r} cannot run with a non-SwiGLU activation: every `moe_experts` row "
@@ -166,7 +191,7 @@ register_op(
     "standard",
     "qat",
     description="TileLang blockwise FP8/FP4 fake-quantized Triton grouped-GEMM routed SwiGLU MoE experts",
-    quantizes=True,
+    precision=RowPrecision.EMULATED,
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang", "triton"),
@@ -177,7 +202,11 @@ register_op(
     "standard",
     "deepgemm_fp8",
     description="DeepGEMM blockwise FP8 expert forward, input gradients and weight gradients",
-    quantizes=True,
+    # ``NATIVE``, not ``EMULATED``: the row casts the operands to FP8 and runs
+    # DeepGEMM's grouped GEMM in that format, so it owns the cast instead of
+    # receiving already-rounded operands. That is what separates it from ``qat``
+    # even though both round.
+    precision=RowPrecision.NATIVE,
     wrapper=standard_deepgemm.wrapper,
     requirement=GpuKernelRequirement(
         platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=90), NvidiaGpuPlatform(min_cc=100, max_cc=100)),

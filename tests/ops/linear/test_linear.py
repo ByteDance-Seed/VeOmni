@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OP_REGISTRY, VeomniOp
-from veomni.ops.kernels.linear._module import QUANTIZING_IMPLS
+from veomni.ops.kernels.linear._module import quantizing_impls
 from veomni.utils.import_utils import is_package_available
 
 
@@ -105,7 +105,7 @@ def test_a_wrapped_projection_falls_back_to_its_own_forward():
     torch.testing.assert_close(out, module.base_layer(x))
 
 
-@pytest.mark.parametrize("quantizing_impl", sorted(QUANTIZING_IMPLS))
+@pytest.mark.parametrize("quantizing_impl", sorted(quantizing_impls()))
 def test_a_quantizing_row_refuses_a_wrapped_projection(quantizing_impl):
     """Running the unquantized base layer would leave the config claiming QAT."""
     from torch import nn
@@ -124,7 +124,7 @@ def test_a_quantizing_row_refuses_a_wrapped_projection(quantizing_impl):
         resolve_projection(quantizing_impl, Wrapped(), torch.randn(2, 8))
 
 
-@pytest.mark.parametrize("quantizing_impl", sorted(QUANTIZING_IMPLS))
+@pytest.mark.parametrize("quantizing_impl", sorted(quantizing_impls()))
 def test_a_quantizing_row_refuses_a_linear_subclass_projection(quantizing_impl):
     """A converted ``nn.Linear`` subclass such as ``Float8Linear`` owns a weight but runs its own GEMM."""
     from torch import nn
@@ -242,7 +242,7 @@ def test_linear_torchao_nvfp4_row_is_declared_with_torchao():
     """The row needs no specific hardware, only the optional package."""
     entries = {(entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", "standard")}
     assert ("torchao_nvfp4", ("torchao",)) in entries
-    assert "torchao_nvfp4" in QUANTIZING_IMPLS
+    assert "torchao_nvfp4" in quantizing_impls()
     # ``standard`` only: a model that also binds ``grouped`` cannot select it.
     assert "torchao_nvfp4" not in OP_REGISTRY.list_registered("linear", "grouped")
 
