@@ -159,8 +159,7 @@ See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend
 for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,
 and `triton-ascend` on a mutually compatible release set.
 
-> **arch35:** the old `causal_conv1d` guard that raised `NotImplementedError` on
-> Ascend 950PR&950DT products has been removed. On 2026-10-31, forward/backward
+> **arch35:** On 2026-10-31, forward/backward
 > parity passed on Ascend 950PR&950DT products with CANN 9.2.0.B080, torch 2.10.0+cpu,
 > torch_npu 2.10.0.post4 and triton-ascend 3.2.2. Cases cover 256/640 channels
 > and both ordinary sequences and packed boundaries at 61/128 tokens. This is
