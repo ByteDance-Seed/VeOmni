@@ -160,7 +160,7 @@ def test_the_eager_and_fused_vq_backends_agree(impl):
         vocab_size=_VQ_CONFIG["num_embeddings"],
         op=VeomniOp("cross_entropy_loss", "standard", "eager"),
     )
-    assert float(loss) == pytest.approx(float(reference), abs=1e-5)
+    assert float(loss.detach()) == pytest.approx(float(reference.detach()), abs=1e-5)
 
 
 def _vqvae_processor():
