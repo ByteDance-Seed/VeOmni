@@ -21,6 +21,7 @@ from torch.distributed.fsdp import fully_shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import spawn_with_rendezvous
+from veomni.arguments.arguments_types import MixedPrecisionConfig
 from veomni.distributed import torch_parallelize
 from veomni.distributed.parallel_state import _init_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import (
@@ -639,7 +640,7 @@ class TestAllowPartialLoad:
     """DCP load may be partial for optimizer state, but not full model state."""
 
     def test_load_uses_allow_partial_load_planner(self):
-        from veomni.checkpoint.dcp_checkpointer import DefaultLoadPlanner
+        from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 
         planner = DefaultLoadPlanner(allow_partial_load=True)
         assert planner.allow_partial_load is True
@@ -744,7 +745,7 @@ class TestSkipHfWeightLoadOnResume:
 
         result = build_parallelize_model(
             model,
-            mixed_precision=SimpleNamespace(enable=False),
+            mixed_precision=MixedPrecisionConfig(enable=False),
             enable_gradient_checkpointing=False,
             should_skip_hf_weight_load=True,
         )
@@ -786,7 +787,7 @@ class TestSkipHfWeightLoadOnResume:
         resumed = parallelize_model_fsdp2(
             resumed,
             weights_path="unused-hf-path",
-            mixed_precision=SimpleNamespace(enable=False),
+            mixed_precision=MixedPrecisionConfig(enable=False),
             should_skip_hf_weight_load=True,
             init_device="meta",
         )
@@ -855,7 +856,7 @@ class TestMaterializeAndLoadDispatch:
         parallelize_model_fsdp2(
             nn.Linear(2, 2),
             weights_path="hf-path",
-            mixed_precision=SimpleNamespace(enable=False),
+            mixed_precision=MixedPrecisionConfig(enable=False),
             init_device="meta",
             broadcast_model_weights_from_rank0=True,
         )
@@ -1095,7 +1096,7 @@ class TestDdpMetaInit:
 
         build_parallelize_model(
             MagicMock(),
-            mixed_precision=SimpleNamespace(enable=False),
+            mixed_precision=MixedPrecisionConfig(enable=False),
             enable_gradient_checkpointing=False,
             should_skip_hf_weight_load=True,
             init_device="meta",

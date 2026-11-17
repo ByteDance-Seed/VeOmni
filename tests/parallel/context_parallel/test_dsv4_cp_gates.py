@@ -26,21 +26,60 @@ process which builds a model without installing a state into a hard failure;
 GPU CI caught this and the unit tests did not, because every one of them stubbed
 the accessor. Hence the one thing worth pinning here is the case where nothing
 is stubbed.
+
+The DSA-versus-parallel-state gate has a matching trap: a native checkpoint
+config is adapted into a generic class that keeps ``ops_config`` but not
+``DeepseekV4Config.validate_build_prerequisites``, so the pair has to be judged
+by the builder itself and exercised through ``build_foundation_model``.
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import torch
+from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config as NativeDSV4Config
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.distributed import parallel_state as parallel_state_module
 from veomni.models import auto as auto_module
 from veomni.models.auto import build_config, check_context_parallel_supported
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def _enable_npu_cp(monkeypatch):
+    # The DSA-vs-parallel-state check now runs in the builder gate, so only
+    # ``auto``'s copies of these three names matter.
+    monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(auto_module, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, global_rank=0))
+    monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", True)
+
+
+def _npu_ops_for_cp() -> dict:
+    # Only the pair the gate admits matters here; a real CP run is the shipped NPU
+    # config with these two fields switched to ``eager``.
+    return {"dsa_indexer_implementation": "eager", "dsa_attention_implementation": "eager"}
+
+
+def _installed_ops(ops_implementation: dict) -> OpsImplementationConfig:
+    # The builder takes a resolved config, while the direct gate tests below go
+    # through the model config's dict form.
+    return OpsImplementationConfig(attn_implementation="eager", **ops_implementation)
+
+
+def _dsv4_with_ops(ops_implementation: dict):
+    from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+
+    return DeepseekV4Config(
+        num_hidden_layers=2,
+        layer_types=["compressed_sparse_attention"] * 2,
+        ops_implementation=ops_implementation,
+    )
 
 
 def test_gate_is_inert_when_no_parallel_state_was_installed(monkeypatch):
@@ -52,8 +91,9 @@ def test_gate_is_inert_when_no_parallel_state_was_installed(monkeypatch):
     check_context_parallel_supported(build_config("tests/toy_config/qwen3_toy"))
 
 
+@pytest.mark.parametrize("model_type", ["qwen4_exp", "deepseek_v4"])
 @pytest.mark.parametrize("ulysses_size", [1, 8])
-def test_qwen4_cp_rejects_native_hf_modeling(monkeypatch, ulysses_size):
+def test_cp_rejects_native_hf_modeling(monkeypatch, ulysses_size, model_type):
     monkeypatch.setenv("MODELING_BACKEND", "hf")
     monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(
@@ -62,14 +102,15 @@ def test_qwen4_cp_rejects_native_hf_modeling(monkeypatch, ulysses_size):
         lambda: SimpleNamespace(cp_enabled=True, ulysses_size=ulysses_size),
     )
     with pytest.raises(NotImplementedError, match="requires the VeOmni modeling backend"):
-        check_context_parallel_supported(SimpleNamespace(model_type="qwen4_exp"))
+        check_context_parallel_supported(SimpleNamespace(model_type=model_type))
 
 
-def test_qwen4_hf_modeling_remains_available_without_cp(monkeypatch):
+@pytest.mark.parametrize("model_type", ["qwen4_exp", "deepseek_v4"])
+def test_hf_modeling_remains_available_without_cp(monkeypatch, model_type):
     monkeypatch.setenv("MODELING_BACKEND", "hf")
     monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(auto_module, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=False))
-    check_context_parallel_supported(SimpleNamespace(model_type="qwen4_exp"))
+    check_context_parallel_supported(SimpleNamespace(model_type=model_type))
 
 
 @pytest.mark.parametrize("vision_config", [SimpleNamespace(num_heads=4), {"num_heads": 4}])
@@ -101,7 +142,7 @@ def test_qwen4_cp_accepts_divisible_vision_heads(monkeypatch):
     check_context_parallel_supported(config)
 
 
-@pytest.mark.parametrize("model_type", ["deepseek_v4", "glm_moe_dsa"])
+@pytest.mark.parametrize("model_type", ["glm_moe_dsa"])
 def test_gate_rejects_context_parallel_on_npu(monkeypatch, model_type):
     monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(
@@ -111,8 +152,66 @@ def test_gate_rejects_context_parallel_on_npu(monkeypatch, model_type):
     )
     monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", True)
 
-    with pytest.raises(NotImplementedError, match="Ascend/NPU.*Qwen4-Exp only"):
+    with pytest.raises(NotImplementedError, match="Ascend/NPU.*Qwen4-Exp and deepseek_v4 only"):
         check_context_parallel_supported(SimpleNamespace(model_type=model_type))
+
+
+def test_gate_allows_npu_dsv4_cp_with_eager_dsa_ops(monkeypatch):
+    _enable_npu_cp(monkeypatch)
+
+    check_context_parallel_supported(_dsv4_with_ops(_npu_ops_for_cp()))
+
+
+def test_gate_rejects_npu_dsv4_cp_without_resolved_ops(monkeypatch):
+    _enable_npu_cp(monkeypatch)
+    with pytest.raises(NotImplementedError, match="dsa_indexer_implementation='eager'"):
+        check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))
+
+
+def test_gate_rejects_dsv4_hybrid_ulysses_cp(monkeypatch):
+    _enable_npu_cp(monkeypatch)
+    monkeypatch.setattr(auto_module, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, ulysses_size=2))
+    with pytest.raises(NotImplementedError, match="Combined Ulysses/CP.*Qwen4-Exp only"):
+        check_context_parallel_supported(_dsv4_with_ops(_npu_ops_for_cp()))
+
+
+@pytest.mark.parametrize("field", ["dsa_indexer_implementation", "dsa_attention_implementation"])
+def test_gate_rejects_npu_dsv4_cp_with_a_non_cp_aware_dsa_operator(monkeypatch, field):
+    _enable_npu_cp(monkeypatch)
+    ops = _npu_ops_for_cp()
+    ops[field] = "cann"
+
+    with pytest.raises(NotImplementedError, match=field):
+        check_context_parallel_supported(_dsv4_with_ops(ops))
+
+
+def test_gate_rejects_a_native_config_adapted_by_the_builder(monkeypatch):
+    """The failure the direct tests miss: the adapted class has no model hook."""
+    _enable_npu_cp(monkeypatch)
+    load_model = Mock(return_value=torch.nn.Identity())
+    monkeypatch.setattr(auto_module, "get_loader", lambda config: SimpleNamespace(load_model=load_model))
+    ops = _npu_ops_for_cp()
+    ops["dsa_attention_implementation"] = "cann"
+
+    with pytest.raises(NotImplementedError, match="dsa_attention_implementation"):
+        auto_module.build_foundation_model(
+            NativeDSV4Config(), init_device="cpu", ops_implementation=_installed_ops(ops)
+        )
+
+    load_model.assert_not_called()
+
+
+def test_gate_admits_a_native_config_adapted_by_the_builder(monkeypatch):
+    _enable_npu_cp(monkeypatch)
+    load_model = Mock(return_value=torch.nn.Identity())
+    monkeypatch.setattr(auto_module, "get_loader", lambda config: SimpleNamespace(load_model=load_model))
+
+    model = auto_module.build_foundation_model(
+        NativeDSV4Config(), init_device="cpu", ops_implementation=_installed_ops(_npu_ops_for_cp())
+    )
+
+    assert model is load_model.return_value
+    load_model.assert_called_once()
 
 
 def test_gate_allows_qwen4_exp_context_parallel_on_npu(monkeypatch):
@@ -183,6 +282,6 @@ def test_seed_omni_cp_opt_in_does_not_bypass_device_or_hybrid_gate(monkeypatch, 
         lambda: SimpleNamespace(cp_enabled=True, ulysses_size=ulysses_size),
     )
     monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", is_npu)
-    message = "Ascend/NPU.*Qwen4-Exp only" if is_npu else "Combined Ulysses/CP.*Qwen4-Exp only"
+    message = "Ascend/NPU.*Qwen4-Exp and deepseek_v4 only" if is_npu else "Combined Ulysses/CP.*Qwen4-Exp only"
     with pytest.raises(NotImplementedError, match=message):
         check_context_parallel_supported(TextEncoderConfig(vocab_size=64, hidden_size=16))

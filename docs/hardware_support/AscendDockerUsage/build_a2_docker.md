@@ -1,5 +1,69 @@
 # Ascend A2 Docker Image Build and Usage Guide
 
+## CANN 9.2.1 images
+
+These Dockerfiles install into system Python on every supported architecture.
+They include torch 2.10.0, torch-npu 2.10.0.post7, Transformers 5.16.1,
+Triton-Ascend 3.2.2, development dependencies (including patchgen), and a
+persistent uv package cache. A project `uv sync` creates its own environment;
+it does not automatically use the system packages.
+
+Build from the repository root on a matching host architecture:
+
+```bash
+docker build --platform linux/amd64 \
+  -f docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86 \
+  -t veomni:cann921-a2-amd64 .
+```
+
+```bash
+docker build --platform linux/arm64 \
+  -f docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.arm \
+  -t veomni:cann921-a2-arm64 .
+```
+
+Quay publication of the following product tag is pending. Use the local
+build above until publication is confirmed; see [image availability](supported_tags.md).
+After publication, pull the matching architecture (shown here for ARM64):
+
+```bash
+docker pull --platform linux/arm64 quay.io/ascend/veomni:v0.1.12-cann9.2.1-torch_npu2.10.0.post7-910b-ubuntu22.04-py3.12-veomni
+```
+
+Run the locally built ARM64 image with host driver access; mount only the
+source directory you intend to test, leaving the image contents in `/app` intact:
+
+```bash
+devices=()
+for device in /dev/davinci[0-9]* /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc; do
+  [ ! -e "$device" ] || devices+=(--device "$device")
+done
+docker run --rm -it --network host --shm-size=32g \
+  "${devices[@]}" \
+  -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
+  -v /usr/local/dcmi:/usr/local/dcmi:ro \
+  -v /etc/ascend_install.info:/etc/ascend_install.info:ro \
+  -v "$PWD":/workspace/VeOmni -w /workspace/VeOmni \
+  veomni:cann921-a2-arm64 bash
+```
+
+For x86, use `linux/amd64` in the pull command and the local
+`veomni:cann921-a2-amd64` tag in the run command.
+
+The existing [A2 builder](../../../.github/workflows/docker-build-ascend-a2.yml)
+and [A3 builder](../../../.github/workflows/docker-build-ascend-a3.yml) build
+these CANN 9.2.1 Dockerfiles on matching native runners. They support manual
+dispatch, published releases, and path-filtered pushes to `main`. Upstream
+builds publish to Quay using repository secrets. Build jobs are restricted
+to the `ByteDance-Seed` owner. See the
+[workflow and tag rules](overview.md#build-and-publication-workflows).
+The NPU unit/e2e workflows continue to use their existing environment.
+See [validation scope and cache details](overview.md#validation-scope).
+
+## CANN 9.1.0 instructions
+
+The instructions below describe the existing CANN 9.1.0 images.
+
 ## Overview
 This guide provides step-by-step instructions for building and using the Ascend A2 Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Ascend A2 accelerators.
 
