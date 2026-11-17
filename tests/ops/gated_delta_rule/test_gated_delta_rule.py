@@ -1191,5 +1191,13 @@ def test_causal_conv1d_npu_boundary_cache_inference_to_training():
             torch.testing.assert_close(
                 got.grad.float().cpu(), ref.grad.float(), atol=GDN_FUSED_GRAD_ATOL, rtol=GDN_FUSED_GRAD_RTOL
             )
+
+        misses = _cached_boundary_tensor.cache_info().misses
+        boundaries[1] = 23  # Mutate the same CPU tensor object, not just its identity.
+        changed = _stage_boundaries(boundaries, x.device)
+        assert _cached_boundary_tensor.cache_info().misses == misses + 1
+        assert changed is not staged
+        torch.testing.assert_close(changed.cpu(), torch.tensor([0, 23, 64], dtype=boundaries.dtype), rtol=0, atol=0)
+        torch.testing.assert_close(staged.cpu(), torch.tensor([0, 17, 64], dtype=boundaries.dtype), rtol=0, atol=0)
     finally:
         _cached_boundary_tensor.cache_clear()
