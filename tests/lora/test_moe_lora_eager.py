@@ -319,9 +319,7 @@ def test_wrapper_uses_eager_when_lora_row_is_unavailable(monkeypatch, mode: str,
     from veomni.ops import OP_REGISTRY, NumericMode
 
     monkeypatch.setattr(OP_REGISTRY, "list_available", lambda op, variant: ["eager"])
-    base_layer = SimpleNamespace(
-        veomni_moe=SimpleNamespace(impl=base_impl, mode=NumericMode.EXACT)
-    )
+    base_layer = SimpleNamespace(veomni_moe=SimpleNamespace(impl=base_impl, mode=NumericMode.EXACT))
 
     assert _moe_lora_op(base_layer, mode).impl == "eager"
 
