@@ -141,8 +141,11 @@ provide the corresponding values explicitly. `max_seq_len` and
 `micro_batch_size` must always be explicit. This lets dispatch validate the
 configuration the builder actually receives. Context-aware builders must have
 an inspectable signature; a builder that opts in by default must expose that
-policy in its signature. Calls to opaque builders that do not explicitly opt in
-continue to use the builder's existing behavior without policy validation.
+policy in its signature. Existing fixed-policy builders with explicit legacy
+signatures keep their old keyword contract. Opaque builders may still be called
+without policy or modality controls, but the standard trainer supplies these
+controls and therefore requires an inspectable signature. Expose a Python
+wrapper or a valid `__signature__` to use such a builder from the trainer.
 
 The experiments cover first-micro-batch preparation only. Whole-step
 pre-materialization and periodic forward-only stalls are separate problems.

@@ -109,6 +109,28 @@ def build_dataloader(dataloader_type: str, **kwargs):
     )
     policy = kwargs.get("dyn_bsz_buffer_policy", policy_default)
     if (
+        policy == "fixed"
+        and not inspectable
+        and any(name in kwargs for name in ("dyn_bsz_buffer_policy", "data_modality"))
+    ):
+        raise ValueError(
+            "A dataloader builder receiving policy or modality settings must expose an inspectable signature."
+        )
+    # Fixed policy keeps the legacy builder contract. New options are passed
+    # through when explicitly supported, including builders that take **kwargs.
+    if policy == "fixed":
+        accepts_kwargs = inspectable and any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        )
+        for name in ("dyn_bsz_buffer_policy", "data_modality"):
+            parameter = parameters.get(name)
+            if parameter is None and not accepts_kwargs:
+                kwargs.pop(name, None)
+            elif parameter is not None and parameter.kind is inspect.Parameter.POSITIONAL_ONLY and name in kwargs:
+                if parameter.default is inspect.Parameter.empty or kwargs[name] != parameter.default:
+                    raise ValueError(f"Cannot pass {name} to a positional-only dataloader builder parameter.")
+                kwargs.pop(name)
+    if (
         policy_parameter is not None
         and policy_parameter.kind is inspect.Parameter.POSITIONAL_ONLY
         and "dyn_bsz_buffer_policy" in kwargs

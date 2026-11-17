@@ -1,4 +1,5 @@
 import types
+from dataclasses import dataclass
 from functools import partial
 from typing import Literal
 
@@ -311,6 +312,42 @@ def test_fixed_policy_keeps_builder_when_signature_is_unavailable(monkeypatch, e
     assert build_dataloader(name, dyn_bsz_buffer_size=37) == {"dyn_bsz_buffer_size": 37}
 
 
+def test_fixed_opaque_builder_with_new_controls_is_rejected(context_builder):
+    class OpaqueLegacyBuilder:
+        __signature__ = "invalid"
+
+        def __call__(self, *, dyn_bsz_buffer_size):
+            return dyn_bsz_buffer_size
+
+    with pytest.raises(ValueError, match="must expose an inspectable signature"):
+        build_dataloader(
+            context_builder(OpaqueLegacyBuilder()),
+            dyn_bsz_buffer_size=37,
+            dyn_bsz_buffer_policy="fixed",
+            data_modality="text",
+        )
+
+
+@pytest.mark.parametrize("accepts_kwargs", [False, True])
+def test_fixed_builder_positional_only_options_cannot_be_silently_changed(context_builder, accepts_kwargs):
+    if accepts_kwargs:
+
+        def builder(data_modality="text", /, **kwargs):
+            return data_modality, kwargs
+    else:
+
+        def builder(data_modality="text", /):
+            return data_modality, {}
+
+    name = context_builder(builder)
+    assert build_dataloader(name, dyn_bsz_buffer_policy="fixed", data_modality="text") == (
+        "text",
+        {"dyn_bsz_buffer_policy": "fixed"} if accepts_kwargs else {},
+    )
+    with pytest.raises(ValueError, match="positional-only"):
+        build_dataloader(name, dyn_bsz_buffer_policy="fixed", data_modality="image")
+
+
 @pytest.mark.parametrize("runtime", ["main", "worker"])
 def test_context_aware_default_policy_is_validated(runtime, context_builder):
     def builder(
@@ -610,6 +647,70 @@ def test_build_dataloader_preserves_legacy_fixed_plugin_arguments():
         del DATALOADER_REGISTRY[test_loader_name]
 
     assert captured_kwargs == {"dyn_bsz": True, "dyn_bsz_buffer_size": 37}
+
+
+def test_trainer_fixed_policy_supports_legacy_explicit_builder(monkeypatch):
+    from veomni.trainer.base import BaseTrainer
+
+    @dataclass
+    class LoaderConfig:
+        type: str = "legacy_explicit"
+
+    received = {}
+
+    def legacy_builder(
+        dataset,
+        micro_batch_size,
+        global_batch_size,
+        dataloader_batch_size,
+        max_seq_len,
+        train_steps,
+        bsz_warmup_ratio,
+        bsz_warmup_init_mbtoken,
+        dyn_bsz,
+        dyn_bsz_runtime,
+        dyn_bsz_count_mode,
+        dyn_bsz_physical_overflow_ratio,
+        dyn_bsz_buffer_size,
+        seed,
+        collate_fn,
+        save_steps,
+    ):
+        received.update(locals())
+        return "legacy-loader"
+
+    monkeypatch.setitem(DATALOADER_REGISTRY._local_mapping, "legacy_explicit", legacy_builder)
+    trainer = types.SimpleNamespace(
+        args=types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                dataloader=LoaderConfig(),
+                max_seq_len=128,
+                dyn_bsz_buffer_size=37,
+                dyn_bsz_buffer_policy="fixed",
+                data_modality="text",
+            ),
+            train=types.SimpleNamespace(
+                micro_batch_size=1,
+                global_batch_size=2,
+                dataloader_batch_size=1,
+                bsz_warmup_ratio=0.0,
+                bsz_warmup_init_mbtoken=1,
+                dyn_bsz=True,
+                dyn_bsz_runtime="main",
+                dyn_bsz_count_mode="total",
+                dyn_bsz_physical_overflow_ratio=1.5,
+                seed=7,
+                checkpoint=types.SimpleNamespace(save_steps=10),
+            ),
+            train_steps=3,
+        ),
+        train_dataset=[{"input_ids": [1]}],
+        collate_fn=None,
+    )
+    BaseTrainer._build_dataloader(trainer)
+    assert trainer.train_dataloader == "legacy-loader"
+    assert received["dyn_bsz_buffer_size"] == 37
+    assert received["train_steps"] == 3
 
 
 @pytest.fixture(scope="session")
