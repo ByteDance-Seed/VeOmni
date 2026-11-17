@@ -22,8 +22,9 @@ were built under.
 Two blobs, two owners:
 
 * **lr_scheduler** — this model's scheduler. Passed to DCP like the optimizer;
-  the checkpointer pickles ``state_dict`` as a single ``lr_scheduler.pt`` beside
-  the two DCP directories.
+  the checkpointer pickles it into the per-rank
+  ``model/<module>/extra_state/extra_state_rank_{R}.pt`` beside the two DCP
+  directories, together with whatever the runtime contributes.
 * **global_state** — the job cursor (dataloader in ``loader/``; step, rng and
   meters in ``extra_state/``), written per rank by
   :class:`~veomni.trainer.callbacks.global_state_callback.GlobalStateCallback`.
@@ -66,7 +67,7 @@ class ModelCheckpointManager:
         ├── model/
         │   ├── ckpt/          # DCP shards: weights
         │   ├── optimizer/     # DCP shards: optimizer state
-        │   └── lr_scheduler.pt
+        │   └── extra_state/   # scheduler + runtime state, per rank
         ├── loader/            # dataloader cursor, per rank
         ├── extra_state/       # step, rng, meters, per rank
         ├── hf_ckpt/           # full-model HF safetensors export
