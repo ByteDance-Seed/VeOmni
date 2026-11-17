@@ -35,7 +35,7 @@ gfx942/gfx950 GPU.
 """
 
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 
 from ._hardware import fp8_quantizer_backend
 
@@ -90,13 +90,25 @@ def fp8_weight_quant(
     scale_dtype: torch.dtype = torch.float32,
     dequant: bool = False,
 ):
-    x = _local_operand(x)
+    x = _local_weight_operand(x)
     backend = _check_operand(x, scale_fmt, "weight")
     return _weight_quant_impl(x, block_size, scale_fmt, scale_dtype, dequant=dequant, backend=backend)
 
 
 def _local_operand(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
+def _local_weight_operand(weight: torch.Tensor) -> torch.Tensor:
+    if isinstance(weight, DTensor):
+        if any(not isinstance(placement, Replicate) for placement in weight.placements):
+            raise ValueError(
+                "FP8 weight quantization cannot consume a sharded DTensor; local quantization would bypass "
+                "the owning module's FSDP unshard hook. Pass an unsharded weight or remove that projection "
+                "from basic_modules."
+            )
+        return weight.to_local()
+    return weight
 
 
 def _check_operand(tensor: torch.Tensor, scale_fmt: str | None, what: str) -> str:
@@ -228,7 +240,7 @@ def fp8_fake_quant_weight(
         A BF16 tensor holding the dequantized weight, differentiable into
         ``weight`` through a straight-through estimator.
     """
-    weight = _local_operand(weight)
+    weight = _local_weight_operand(weight)
     if weight.dim() != 2:
         raise ValueError(f"FP8 weight fake quantization expects a 2D weight, got shape {tuple(weight.shape)}")
     _validate_block_size(block_size)
