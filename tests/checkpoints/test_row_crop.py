@@ -4,7 +4,6 @@
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -12,52 +11,6 @@ from veomni.checkpoint.row_crop import RowCropLoadPlanner, RowCropSavePlanner
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-
-
-def _row_metadata_failure_worker(rank, directory, operation, endpoint):
-    from datetime import timedelta
-    from types import SimpleNamespace
-    from unittest.mock import patch
-
-    from veomni.checkpoint import dcp_checkpointer
-    from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer, ModelState
-
-    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
-    try:
-        model = torch.nn.Linear(2, 2)
-        failure = ValueError("injected row metadata error") if rank == 1 else None
-        with (
-            patch.object(dcp_checkpointer, "checkpoint_row_counts", side_effect=failure, return_value={}),
-            patch.object(dcp, "save") as save,
-            patch.object(dcp, "async_save") as async_save,
-            patch.object(dcp, "load") as load,
-        ):
-            expected = ValueError if rank == 1 else RuntimeError
-            with pytest.raises(expected, match="injected row metadata error|failed on another rank"):
-                if operation == "load":
-                    DistributedCheckpointer.load(directory, {"model": model}, process_group=dist.group.WORLD)
-                else:
-                    DistributedCheckpointer.execute_save(
-                        {"model": ModelState(model, parallel_state=SimpleNamespace(dp_mode="ddp"))},
-                        dcp.FileSystemWriter(directory),
-                        save_async=operation == "async",
-                    )
-            save.assert_not_called()
-            async_save.assert_not_called()
-            load.assert_not_called()
-        value = torch.ones(1)
-        dist.all_reduce(value)
-        assert value.item() == 2
-    finally:
-        dist.destroy_process_group()
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-@pytest.mark.parametrize("operation", ["load", "save", "async"])
-def test_row_metadata_failure_is_coordinated_before_dcp(tmp_path, operation):
-    from tests.tools.launch_utils import spawn_with_rendezvous
-
-    spawn_with_rendezvous(_row_metadata_failure_worker, args=(str(tmp_path), operation), nprocs=2)
 
 
 def test_logical_rows_roundtrip(tmp_path):

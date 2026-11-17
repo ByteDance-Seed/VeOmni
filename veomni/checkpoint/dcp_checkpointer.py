@@ -1032,13 +1032,7 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
-        row_counts = {}
-        error = None
-        try:
-            row_counts = {f"model.{name}": counts for name, counts in checkpoint_row_counts(state["model"]).items()}
-        except Exception as exc:
-            error = exc
-        raise_if_any_rank_failed(error, "preparing checkpoint row metadata for load", group=process_group)
+        row_counts = {f"model.{name}": counts for name, counts in checkpoint_row_counts(state["model"]).items()}
 
         def _model_state() -> "ModelState":
             """Build the model load target using its padded runtime shapes."""
@@ -1242,12 +1236,7 @@ class DistributedCheckpointer(CheckpointerBase):
         model_state = save_state.get("model")
         counts = {}
         if isinstance(model_state, ModelState):
-            error = None
-            try:
-                counts = checkpoint_row_counts(model_state.model)
-            except Exception as exc:
-                error = exc
-            raise_if_any_rank_failed(error, "preparing checkpoint row metadata for save")
+            counts = checkpoint_row_counts(model_state.model)
         planner = (
             RowCropSavePlanner(
                 {f"model.{name}": rows for name, rows in counts.items()},
