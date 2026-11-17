@@ -70,11 +70,12 @@ def test_hybrid_model_guard_keeps_other_families_closed(monkeypatch, npu):
 
 
 def test_native_cp_qualification_is_not_extended_to_other_models(monkeypatch):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
     monkeypatch.setattr(auto, "is_parallel_state_initialized", lambda: True)
     monkeypatch.setattr(auto, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, ulysses_size=1))
     monkeypatch.setattr(auto, "IS_NPU_AVAILABLE", True)
     with pytest.raises(NotImplementedError, match="Ascend/NPU"):
-        auto.check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))
+        auto.check_context_parallel_supported(SimpleNamespace(model_type="glm_moe_dsa"))
 
 
 def _hybrid_mesh_worker(rank, rendezvous):
