@@ -1370,6 +1370,45 @@ def test_multi_optimizer_rejects_changed_scheduler_before_loading_weights(tmp_pa
     assert different is not None
 
 
+def test_old_callable_hash_scheduler_identity_is_rejected_without_mutation(tmp_path, monkeypatch):
+    from veomni.checkpoint import optimizer_resume_layout
+
+    model, optimizer = _model_and_optimizer()
+    scheduler = build_lr_scheduler(optimizer, train_steps=100, lr_decay_style="linear", lr_warmup_ratio=0.1)
+    parallel = SimpleNamespace(dp_mode="ddp")
+    current_layout = optimizer_resume_layout._scheduler_layout
+
+    def legacy_layout(leaf):
+        layout = current_layout(leaf)
+        if layout is not None:
+            layout = {"type": layout["type"], "functions": ["legacy-callable-hash"]}
+        return layout
+
+    with monkeypatch.context() as context:
+        context.setattr(optimizer_resume_layout, "_scheduler_layout", legacy_layout)
+        DistributedCheckpointer.save(
+            str(tmp_path),
+            {
+                "model": model,
+                "optimizer": optimizer,
+                "extra_state": {"lr_scheduler": scheduler.state_dict()},
+                "_veomni_scheduler_object": scheduler,
+            },
+            parallel_state=parallel,
+        )
+    target, restored = _model_and_optimizer()
+    target_scheduler = build_lr_scheduler(restored, train_steps=100, lr_decay_style="linear", lr_warmup_ratio=0.1)
+    before = {name: param.detach().clone() for name, param in target.named_parameters()}
+    with pytest.raises(RuntimeError, match="(?i)optimizer.*scheduler.*layout"):
+        DistributedCheckpointer.load(
+            str(tmp_path),
+            {"model": target, "optimizer": restored, "extra_state": {}, "_veomni_scheduler_object": target_scheduler},
+            parallel_state=parallel,
+        )
+    assert all(torch.equal(param, before[name]) for name, param in target.named_parameters())
+    assert all(not leaf.state for leaf in restored.optimizers_dict.values())
+
+
 def test_multi_lr_scheduler_rejects_missing_leaf():
     _, optimizer = _model_and_optimizer()
     scheduler = build_lr_scheduler(optimizer, train_steps=100)
