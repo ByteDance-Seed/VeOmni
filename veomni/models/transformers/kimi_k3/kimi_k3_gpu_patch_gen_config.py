@@ -118,6 +118,18 @@ Patches (skeleton):
     instead of raising from inside forward (mirrors the peer models' attention
     binding and drops the ``ALL_ATTENTION_FUNCTIONS`` forward-time lookup from
     the generated file).
+21. ``MoonViTEncoderLayer.__init__`` / ``.attention_qkvpacked`` /
+    ``MoonViTEncoderLayer.forward`` / ``MoonViT3dEncoder.forward`` --the vision
+    tower joins the op registry: an instance-local ``vision_attention``
+    (``kimi_k3`` variant) ``VeomniOp`` bound at construction (rows ``eager`` /
+    ``flash_attention_2`` / ``veomni_flash_attention_2``, all module-resolved
+    from the modeling file like the standard family's ``eager`` row, so the
+    lazy-import ``multihead_attention`` patch serves the flash row), the packed
+    varlen call dispatches through the handle instead of the
+    ``VL_VISION_ATTENTION_FUNCTIONS`` dict, and the encoder hoists the cu_seqlens
+    host copy once per forward (threaded as ``cu_seqlens_host``; the NPU fusion
+    kernel reads it via ``q_cu_seqlens_host`` / ``k_cu_seqlens_host``) so
+    per-layer calls skip the D2H sync.
 """
 
 import os
@@ -1542,6 +1554,194 @@ def kimi_k3_for_conditional_generation_init_patched(self, config):
         self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
 
+# MoonViT3d vision tower: instance-local vision_attention VeomniOp + hoisted
+# host cu_seqlens (round-3 review: the tower was the one attention site with
+# no kernel abstraction -- a hand-written dict dispatch validating nothing and
+# a per-layer .tolist() D2H sync inside the NPU fusion kernel).
+
+
+@config.override_method(
+    "MoonViTEncoderLayer.__init__",
+    description="Bind the instance-local vision_attention (kimi_k3 variant) VeomniOp at "
+    "construction so an unsupported or unavailable vision implementation fails here "
+    "instead of raising from inside forward (mirrors item 20's MLA binding)",
+)
+def moonvit_encoder_layer_init_patched(
+    self,
+    num_heads: int,
+    hidden_dim: int,
+    mlp_dim: int,
+    qkv_hidden_size: int | None = None,
+    norm_type: str = "layernorm",
+    mlp_type: str = "mlp2",
+    *,
+    attn_implementation: str = "flash_attention_2",
+    activation=F.gelu,
+    attn_bias: bool = False,
+    linear_bias: bool = True,
+    use_deterministic_attn: bool = False,
+):
+    super().__init__()
+    self.num_heads = num_heads
+    self.hidden_dim = hidden_dim
+    self.qkv_hidden_size = hidden_dim if qkv_hidden_size is None else qkv_hidden_size
+    self.hidden_size_per_attention_head = self.qkv_hidden_size // self.num_heads
+    self.attn_implementation = attn_implementation
+    # Modification: bind the op handle right after the selection lands, so
+    # the row's hardware / package requirements are validated at construction
+    # (a 'flash_attention_2' vision selection on a host without flash-attn
+    # fails here with a registry-attributable error, not an ImportError
+    # raised from inside a modeling function at the first image forward).
+    self.veomni_vision_attn = VeomniOp("vision_attention", "kimi_k3", attn_implementation)
+    self.use_deterministic_attn = use_deterministic_attn
+
+    if norm_type == "layernorm":
+        self.norm0 = nn.LayerNorm(hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+    elif norm_type == "rmsnorm":
+        self.norm0 = nn.RMSNorm(hidden_dim)
+        self.norm1 = nn.RMSNorm(hidden_dim)
+    else:
+        raise NotImplementedError(f"Not support norm_type: {norm_type}")
+
+    if mlp_type == "mlp2":
+        self.mlp = MLP2([hidden_dim, mlp_dim, hidden_dim], activation, bias=linear_bias)
+    else:
+        raise NotImplementedError(f"Not support mlp_type: {mlp_type}")
+
+    self.wqkv = nn.Linear(hidden_dim, self.qkv_hidden_size * 3, bias=attn_bias)
+    self.wo = nn.Linear(self.qkv_hidden_size, hidden_dim, bias=attn_bias)
+
+
+@config.override_method(
+    "MoonViTEncoderLayer.attention_qkvpacked",
+    description="Dispatch the packed varlen vision attention through the instance-local "
+    "veomni_vision_attn handle instead of the VL_VISION_ATTENTION_FUNCTIONS dict "
+    "(selection validated at construction; threads the hoisted host cu_seqlens "
+    "copy so the NPU fusion kernel skips the per-layer D2H sync)",
+)
+def moonvit_encoder_layer_attention_qkvpacked_patched(
+    self,
+    x: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: torch.Tensor,
+    rope_freqs_cis: torch.Tensor | None = None,
+    cu_seqlens_host: list | None = None,
+):
+    """
+    Args:
+        x (torch.Tensor): (batch_size, seqlen, hidden_dim)
+        cu_seqlens (torch.Tensor):
+    """
+    xqkv = self.wqkv(x)
+
+    qkv_shape = xqkv.size()[:-1] + (
+        3,
+        self.num_heads,
+        self.hidden_size_per_attention_head,
+    )
+    # xqkv: (batch_size, seqlen, 3, nheads, headdim)
+    xqkv = xqkv.view(*qkv_shape)
+    xq, xk, xv = torch.unbind(xqkv, dim=-3)
+
+    xq, xk = apply_rope(xq, xk, rope_freqs_cis)
+
+    # Modification: dispatch through the bound op handle (the vendored dict
+    # lookup served the same three functions but validated nothing); the
+    # hoisted host copy rides along as q_cu_seqlens_host / k_cu_seqlens_host
+    # and is consumed only by the NPU fusion implementation.
+    attn_out = self.veomni_vision_attn(
+        self,
+        xq,
+        xk,
+        xv,
+        q_cu_seqlens=cu_seqlens,
+        k_cu_seqlens=cu_seqlens,
+        max_seqlen_k=max_seqlen,
+        max_seqlen_q=max_seqlen,
+        deterministic=self.use_deterministic_attn,
+        q_cu_seqlens_host=cu_seqlens_host,
+        k_cu_seqlens_host=cu_seqlens_host,
+    )
+
+    attn_out = self.wo(attn_out)
+    return attn_out
+
+
+@config.override_method(
+    "MoonViTEncoderLayer.forward",
+    description="Thread the hoisted host cu_seqlens copy down to the packed varlen attention call",
+)
+def moonvit_encoder_layer_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    rope_freqs_cis: torch.Tensor | None = None,
+    cu_seqlens_host: list | None = None,
+):
+    residual = hidden_states
+    hidden_states = self.norm0(hidden_states)
+
+    # Modification: pass the hoisted host copy through (None keeps the
+    # per-call .tolist() behavior for direct callers of the layer).
+    hidden_states = self.attention_qkvpacked(
+        hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis, cu_seqlens_host
+    )
+    hidden_states = residual + hidden_states
+
+    residual = hidden_states
+    hidden_states = self.norm1(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    hidden_states = residual + hidden_states
+
+    return hidden_states
+
+
+@config.override_method(
+    "MoonViT3dEncoder.forward",
+    description="Hoist the cu_seqlens host copy once per tower forward (free when "
+    "grid_thws is host-side; one D2H sync otherwise) and thread it to every "
+    "layer's varlen attention call, mirroring the KDA cu_seqlens_cpu contract",
+)
+def moonvit_3d_encoder_forward_patched(
+    self,
+    hidden_states: torch.Tensor,
+    grid_thws: torch.Tensor,
+) -> torch.Tensor:
+    rope_freqs_cis = self.rope_2d.get_freqs_cis(grid_thws=grid_thws, device=hidden_states.device)
+
+    lengths = torch.cat(
+        (
+            torch.zeros(1, dtype=grid_thws.dtype, device=grid_thws.device),
+            grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2],
+        )
+    )
+
+    max_seqlen = lengths.max()
+    cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
+    # Modification: materialize the host copy of the cumulative lengths once
+    # per tower forward instead of once per attention layer: grid_thws arrives
+    # host-side in the collator flow, so the CPU cumsum needs no device sync;
+    # on hosts that stage grid_thws on device this is a single .tolist() (the
+    # NPU fusion kernel previously paid two D2H syncs per vision layer).
+    if lengths.device.type == "cpu":
+        cu_seqlens_host = lengths.cumsum(dim=0, dtype=torch.int32).tolist()
+    else:
+        cu_seqlens_host = cu_seqlens.tolist()
+    for block in self.blocks:
+        hidden_states = block(
+            hidden_states,
+            cu_seqlens,
+            max_seqlen,
+            rope_freqs_cis=rope_freqs_cis,
+            cu_seqlens_host=cu_seqlens_host,
+        )
+
+    hidden_states = self.final_layernorm(hidden_states)
+    return hidden_states
+
+
 @config.override_method(
     "KimiK3ForConditionalGeneration.tie_weights",
     description="Accept the transformers v5 tie_weights kwargs (missing_keys / recompute_mapping) in the override",
@@ -2430,3 +2630,5 @@ KimiBlockSparseMLP = None  # noqa: E305
 KimiDeltaAttention = None  # noqa: E305
 KimiLinearModel = None  # noqa: E305
 Learnable2DInterpPosEmbDivided_fixed = None  # noqa: E305
+MLP2 = None  # noqa: E305
+apply_rope = None  # noqa: E305

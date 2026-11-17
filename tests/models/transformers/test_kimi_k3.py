@@ -1168,3 +1168,129 @@ def test_get_seq_length_with_no_full_attention_layers():
     cache.transformer_layers = []
     cache.key_cache = []
     assert cache.get_seq_length() == 0
+
+
+def test_vision_attention_registry_rows_match_dispatch_dict():
+    """The vision_attention op family must cover exactly the tower's vendored
+    dispatch dict (round-3 review: the vision tower was the one attention site
+    with no kernel abstraction)."""
+    from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import (
+        VL_VISION_ATTENTION_FUNCTIONS,
+    )
+    from veomni.ops.registry import OP_REGISTRY
+
+    registered = set(OP_REGISTRY.list_registered("vision_attention", "kimi_k3"))
+    assert registered == set(VL_VISION_ATTENTION_FUNCTIONS)
+
+
+def test_vision_tower_dispatches_through_bound_op_handle():
+    """The patched tower dispatches through the bound vision_attention
+    VeomniOp and is output-identical to the vendored dict dispatch across
+    multimodal shapes (multi-image rows, mixed grids, video-style T>1)."""
+    model = _build_model()
+    model.eval()
+    for blk in model.vision_tower.encoder.blocks:
+        assert isinstance(blk.veomni_vision_attn, VeomniOp)
+        assert blk.veomni_vision_attn.impl == "eager"
+
+    from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import (
+        VL_VISION_ATTENTION_FUNCTIONS,
+    )
+
+    grids = [[1, 4, 4], [1, 2, 2], [2, 2, 2]]
+    grid_thws = torch.tensor(grids)
+    pixel_values = torch.randn(sum(t * h * w for t, h, w in grids), 3, 14, 14)
+    with torch.no_grad():
+        out_handle = model.vision_tower(pixel_values, grid_thws)
+
+    def dict_dispatch(module, q, k, v, **kwargs):
+        eager_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in ("q_cu_seqlens", "k_cu_seqlens", "max_seqlen_q", "max_seqlen_k", "deterministic")
+        }
+        return VL_VISION_ATTENTION_FUNCTIONS[module.attn_implementation](q, k, v, **eager_kwargs)
+
+    saved = [blk.veomni_vision_attn for blk in model.vision_tower.encoder.blocks]
+    try:
+        for blk in model.vision_tower.encoder.blocks:
+            blk.veomni_vision_attn = dict_dispatch
+        with torch.no_grad():
+            out_dict = model.vision_tower(pixel_values, grid_thws)
+    finally:
+        for blk, handle in zip(model.vision_tower.encoder.blocks, saved):
+            blk.veomni_vision_attn = handle
+    assert len(out_handle) == len(out_dict) == len(grids)
+    for a, b in zip(out_handle, out_dict):
+        torch.testing.assert_close(a, b)
+
+
+def test_vision_flash_row_fails_at_construction_without_flash_attn():
+    """A 'flash_attention_2' vision selection on a host without flash-attn
+    fails at construction with an attributable error -- the registry row's
+    flash_attn package requirement, or HF's tower availability guard for the
+    raw spelling -- never an ImportError raised from inside the modeling
+    function at the first image forward (round-3 review)."""
+    import importlib.util
+
+    if importlib.util.find_spec("flash_attn") is not None:
+        pytest.skip("flash_attn installed: the no-flash-attn attribution path is not reachable")
+    # the op row itself declares its flash_attn package requirement
+    with pytest.raises(RuntimeError, match="flash_attn"):
+        VeomniOp("vision_attention", "kimi_k3", "flash_attention_2")
+    from veomni.models.transformers.kimi_k3.generated.patched_modeling_kimi_k3_gpu import (
+        KimiK3ForConditionalGeneration,
+    )
+
+    # and a model carrying the raw spelling never reaches forward: the tower
+    # is refused at construction (HF's guard or the row binding)
+    cfg = _tiny_config()
+    cfg.vision_config.ops_implementation["attn_implementation"] = "flash_attention_2"
+    with pytest.raises((ValueError, RuntimeError)):
+        KimiK3ForConditionalGeneration(cfg)
+
+
+def _npu_available():
+    try:
+        return torch.npu.is_available()
+    except AttributeError:
+        return False
+
+
+@pytest.mark.skipif(not _npu_available(), reason="needs the torch_npu fused vision kernel")
+def test_npu_fused_vision_attention_matches_eager_across_multimodal_shapes():
+    """The fused vision path (VeomniOp dispatch + hoisted host cu copy) stays
+    numerically equivalent to the eager reference across multimodal shapes:
+    single image, multi-image packed rows, mixed grids, video-style T>1 -- with
+    grid_thws staged on host and on device (both hoist branches)."""
+    cfg = _tiny_config()
+    cfg._attn_implementation = {"vision_config": "veomni_flash_attention_2"}
+    fused = build_foundation_model(cfg, torch_dtype="float32", init_device="cpu")
+    eager = _build_model()
+    # same weights on both towers, or the comparison is meaningless
+    eager.vision_tower.load_state_dict(fused.vision_tower.state_dict())
+    fused.vision_tower.to("npu").eval()
+    eager.vision_tower.to("npu").eval()
+    # the comparison must actually exercise the two different kernels
+    fused_impls = {blk.veomni_vision_attn.impl for blk in fused.vision_tower.encoder.blocks}
+    eager_impls = {blk.veomni_vision_attn.impl for blk in eager.vision_tower.encoder.blocks}
+    assert fused_impls == {"veomni_flash_attention_2"}
+    assert eager_impls == {"eager"}
+
+    scenarios = [
+        [[1, 4, 4]],
+        [[1, 4, 4], [1, 2, 2]],
+        [[2, 2, 2]],
+        [[1, 4, 4], [2, 2, 2], [1, 2, 2], [1, 4, 4]],
+    ]
+    for grids in scenarios:
+        n_pix = sum(t * h * w for t, h, w in grids)
+        pixel_values = torch.randn(n_pix, 3, 14, 14, device="npu")
+        for grid_device in ("cpu", "npu"):
+            grid_thws = torch.tensor(grids, device=grid_device)
+            with torch.no_grad():
+                out_fused = fused.vision_tower(pixel_values, grid_thws)
+                out_eager = eager.vision_tower(pixel_values, grid_thws)
+            assert len(out_fused) == len(out_eager) == len(grids)
+            for a, b in zip(out_fused, out_eager):
+                torch.testing.assert_close(a, b, atol=1e-4, rtol=1e-4)

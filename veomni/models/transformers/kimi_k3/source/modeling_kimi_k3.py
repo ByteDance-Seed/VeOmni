@@ -1429,7 +1429,11 @@ def npu_fusion_vision_attention(
     segments; returns (tot_seqlens, num_heads * head_dim). CANN's varlen
     score takes cumulative-END positions (no leading zero), hence
     ``cu_seqlens[1:]`` (validated: fp32 max diff 4.77e-07 vs eager).
-    Non-NPU devices fall back to the flash-attn varlen path.
+    Non-NPU devices fall back to the flash-attn varlen path. Callers thread a
+    hoisted host copy of the cumulative lengths via ``q_cu_seqlens_host`` /
+    ``k_cu_seqlens_host`` (one materialization per tower forward, mirroring
+    the KDA ``cu_seqlens_cpu`` contract) so per-layer calls skip the D2H
+    ``.tolist()`` sync.
     """
     if q_cu_seqlens is None or k_cu_seqlens is None:
         raise ValueError("npu_fusion_vision_attention requires the packed varlen layout (cu_seqlens)")
@@ -1447,12 +1451,22 @@ def npu_fusion_vision_attention(
             deterministic=deterministic,
         )
     # CANN's op signature wants Optional[List[int]] (host-side cumulative END
-    # positions), not a device tensor -- hence the .tolist() translation.
-    if torch.is_tensor(q_cu_seqlens):
+    # positions), not a device tensor -- hence the .tolist() translation. The
+    # tower hoists the translation once per forward and threads the host copy
+    # through q_cu_seqlens_host / k_cu_seqlens_host (the same contract as the
+    # KDA cu_seqlens_cpu), so the per-layer call takes the first branch and
+    # skips the device-to-host sync.
+    q_cu_seqlens_host = kwargs.pop("q_cu_seqlens_host", None)
+    k_cu_seqlens_host = kwargs.pop("k_cu_seqlens_host", None)
+    if q_cu_seqlens_host is not None:
+        q_lens = list(q_cu_seqlens_host)[1:]
+    elif torch.is_tensor(q_cu_seqlens):
         q_lens = q_cu_seqlens[1:].tolist()
     else:
         q_lens = list(q_cu_seqlens)[1:]
-    if torch.is_tensor(k_cu_seqlens):
+    if k_cu_seqlens_host is not None:
+        k_lens = list(k_cu_seqlens_host)[1:]
+    elif torch.is_tensor(k_cu_seqlens):
         k_lens = k_cu_seqlens[1:].tolist()
     else:
         k_lens = list(k_cu_seqlens)[1:]

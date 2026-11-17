@@ -51,6 +51,10 @@ from veomni.models.transformers.kimi_k3.kimi_k3_gpu_patch_gen_config import (
     kimi_rmsnorm_forward_patched,
     kimi_rmsnorm_init_patched,
     moonvit3d_pretrained_init_weights_patched,
+    moonvit_3d_encoder_forward_patched,
+    moonvit_encoder_layer_attention_qkvpacked_patched,
+    moonvit_encoder_layer_forward_patched,
+    moonvit_encoder_layer_init_patched,
     situ_and_mul_forward_patched,
     situ_and_mul_init_patched,
 )
@@ -196,6 +200,43 @@ config.override_method(
     description=(
         "Sequence-parallel MLA: full-sequence gather/narrow around the attention, or "
         "head-sharded ulysses inside the veomni_* attention adapters"
+    ),
+)
+
+# --- Vision tower: instance-local vision_attention VeomniOp + hoisted host cu ---
+
+
+config.override_method(
+    "MoonViTEncoderLayer.__init__",
+    replacement=moonvit_encoder_layer_init_patched,
+    description=(
+        "Bind the instance-local vision_attention (kimi_k3 variant) VeomniOp at "
+        "construction so an unsupported or unavailable vision implementation fails "
+        "here instead of raising from inside forward"
+    ),
+)
+
+config.override_method(
+    "MoonViTEncoderLayer.attention_qkvpacked",
+    replacement=moonvit_encoder_layer_attention_qkvpacked_patched,
+    description=(
+        "Dispatch the packed varlen vision attention through the instance-local "
+        "veomni_vision_attn handle (threading the hoisted host cu_seqlens copy)"
+    ),
+)
+
+config.override_method(
+    "MoonViTEncoderLayer.forward",
+    replacement=moonvit_encoder_layer_forward_patched,
+    description="Thread the hoisted host cu_seqlens copy down to the varlen attention call",
+)
+
+config.override_method(
+    "MoonViT3dEncoder.forward",
+    replacement=moonvit_3d_encoder_forward_patched,
+    description=(
+        "Hoist the cu_seqlens host copy once per tower forward and thread it to "
+        "every layer's varlen attention call (KDA cu_seqlens_cpu contract)"
     ),
 )
 

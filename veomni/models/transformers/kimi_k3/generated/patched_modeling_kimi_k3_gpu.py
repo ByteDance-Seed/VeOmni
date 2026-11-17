@@ -45,6 +45,14 @@
 #      Respect the requested `_attn_implementation` (eager / veomni_* kernels) instead of forcing flash_attention_2
 #    - method_override: KimiK3ForConditionalGeneration.__init__
 #      Validate / remap the vision tower's `_attn_implementation` before construction (the MoonViT3d tower registers 'eager'/'flash_attention_2'/'veomni_flash_attention_2' in VL_VISION_ATTENTION_FUNCTIONS -- HF K3 has no vision 'sdpa', so an 'sdpa' request falls back to 'eager' and any other unsupported name raises at construction instead of key-erroring at the first image forward; the text_config selection is left to VeOmniPretrainedConfig's root->child propagation, which honors explicit per-child selections); also override _no_split_modules to keep vision/projector in the root FSDP2 unit (asymmetric multimodal batches deadlock otherwise)
+#    - method_override: MoonViTEncoderLayer.__init__
+#      Bind the instance-local vision_attention (kimi_k3 variant) VeomniOp at construction so an unsupported or unavailable vision implementation fails here instead of raising from inside forward (mirrors item 20's MLA binding)
+#    - method_override: MoonViTEncoderLayer.attention_qkvpacked
+#      Dispatch the packed varlen vision attention through the instance-local veomni_vision_attn handle instead of the VL_VISION_ATTENTION_FUNCTIONS dict (selection validated at construction; threads the hoisted host cu_seqlens copy so the NPU fusion kernel skips the per-layer D2H sync)
+#    - method_override: MoonViTEncoderLayer.forward
+#      Thread the hoisted host cu_seqlens copy down to the packed varlen attention call
+#    - method_override: MoonViT3dEncoder.forward
+#      Hoist the cu_seqlens host copy once per tower forward (free when grid_thws is host-side; one D2H sync otherwise) and thread it to every layer's varlen attention call, mirroring the KDA cu_seqlens_cpu contract
 #    - method_override: KimiK3ForConditionalGeneration.tie_weights
 #      Accept the transformers v5 tie_weights kwargs (missing_keys / recompute_mapping) in the override
 #    - method_override: KimiLinearForCausalLM.__init__
@@ -2091,7 +2099,11 @@ def npu_fusion_vision_attention(
     segments; returns (tot_seqlens, num_heads * head_dim). CANN's varlen
     score takes cumulative-END positions (no leading zero), hence
     ``cu_seqlens[1:]`` (validated: fp32 max diff 4.77e-07 vs eager).
-    Non-NPU devices fall back to the flash-attn varlen path.
+    Non-NPU devices fall back to the flash-attn varlen path. Callers thread a
+    hoisted host copy of the cumulative lengths via ``q_cu_seqlens_host`` /
+    ``k_cu_seqlens_host`` (one materialization per tower forward, mirroring
+    the KDA ``cu_seqlens_cpu`` contract) so per-layer calls skip the D2H
+    ``.tolist()`` sync.
     """
     if q_cu_seqlens is None or k_cu_seqlens is None:
         raise ValueError("npu_fusion_vision_attention requires the packed varlen layout (cu_seqlens)")
@@ -2109,12 +2121,22 @@ def npu_fusion_vision_attention(
             deterministic=deterministic,
         )
     # CANN's op signature wants Optional[List[int]] (host-side cumulative END
-    # positions), not a device tensor -- hence the .tolist() translation.
-    if torch.is_tensor(q_cu_seqlens):
+    # positions), not a device tensor -- hence the .tolist() translation. The
+    # tower hoists the translation once per forward and threads the host copy
+    # through q_cu_seqlens_host / k_cu_seqlens_host (the same contract as the
+    # KDA cu_seqlens_cpu), so the per-layer call takes the first branch and
+    # skips the device-to-host sync.
+    q_cu_seqlens_host = kwargs.pop("q_cu_seqlens_host", None)
+    k_cu_seqlens_host = kwargs.pop("k_cu_seqlens_host", None)
+    if q_cu_seqlens_host is not None:
+        q_lens = list(q_cu_seqlens_host)[1:]
+    elif torch.is_tensor(q_cu_seqlens):
         q_lens = q_cu_seqlens[1:].tolist()
     else:
         q_lens = list(q_cu_seqlens)[1:]
-    if torch.is_tensor(k_cu_seqlens):
+    if k_cu_seqlens_host is not None:
+        k_lens = list(k_cu_seqlens_host)[1:]
+    elif torch.is_tensor(k_cu_seqlens):
         k_lens = k_cu_seqlens[1:].tolist()
     else:
         k_lens = list(k_cu_seqlens)[1:]
@@ -2445,7 +2467,17 @@ class MLP2(nn.Module):
         return self.fc1(x)
 
 
+# ======================================================================
+# [MODIFIED CLASS] MoonViTEncoderLayer
+# Methods patched: __init__, attention_qkvpacked, forward
+# ======================================================================
+
+
 class MoonViTEncoderLayer(nn.Module):
+    # MoonViT3d vision tower: instance-local vision_attention VeomniOp + hoisted
+    # host cu_seqlens (round-3 review: the tower was the one attention site with
+    # no kernel abstraction -- a hand-written dict dispatch validating nothing and
+    # a per-layer .tolist() D2H sync inside the NPU fusion kernel).
     def __init__(
         self,
         num_heads: int,
@@ -2467,6 +2499,12 @@ class MoonViTEncoderLayer(nn.Module):
         self.qkv_hidden_size = hidden_dim if qkv_hidden_size is None else qkv_hidden_size
         self.hidden_size_per_attention_head = self.qkv_hidden_size // self.num_heads
         self.attn_implementation = attn_implementation
+        # Modification: bind the op handle right after the selection lands, so
+        # the row's hardware / package requirements are validated at construction
+        # (a 'flash_attention_2' vision selection on a host without flash-attn
+        # fails here with a registry-attributable error, not an ImportError
+        # raised from inside a modeling function at the first image forward).
+        self.veomni_vision_attn = VeomniOp("vision_attention", "kimi_k3", attn_implementation)
         self.use_deterministic_attn = use_deterministic_attn
 
         if norm_type == "layernorm":
@@ -2492,6 +2530,7 @@ class MoonViTEncoderLayer(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor,
         rope_freqs_cis: torch.Tensor | None = None,
+        cu_seqlens_host: list | None = None,
     ):
         """
         Args:
@@ -2511,8 +2550,12 @@ class MoonViTEncoderLayer(nn.Module):
 
         xq, xk = apply_rope(xq, xk, rope_freqs_cis)
 
-        attn_func = VL_VISION_ATTENTION_FUNCTIONS[self.attn_implementation]
-        attn_out = attn_func(
+        # Modification: dispatch through the bound op handle (the vendored dict
+        # lookup served the same three functions but validated nothing); the
+        # hoisted host copy rides along as q_cu_seqlens_host / k_cu_seqlens_host
+        # and is consumed only by the NPU fusion implementation.
+        attn_out = self.veomni_vision_attn(
+            self,
             xq,
             xk,
             xv,
@@ -2521,6 +2564,8 @@ class MoonViTEncoderLayer(nn.Module):
             max_seqlen_k=max_seqlen,
             max_seqlen_q=max_seqlen,
             deterministic=self.use_deterministic_attn,
+            q_cu_seqlens_host=cu_seqlens_host,
+            k_cu_seqlens_host=cu_seqlens_host,
         )
 
         attn_out = self.wo(attn_out)
@@ -2532,11 +2577,16 @@ class MoonViTEncoderLayer(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         rope_freqs_cis: torch.Tensor | None = None,
+        cu_seqlens_host: list | None = None,
     ):
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
 
-        hidden_states = self.attention_qkvpacked(hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis)
+        # Modification: pass the hoisted host copy through (None keeps the
+        # per-call .tolist() behavior for direct callers of the layer).
+        hidden_states = self.attention_qkvpacked(
+            hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis, cu_seqlens_host
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -2545,6 +2595,12 @@ class MoonViTEncoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states
+
+
+# ======================================================================
+# [MODIFIED CLASS] MoonViT3dEncoder
+# Methods patched: forward
+# ======================================================================
 
 
 class MoonViT3dEncoder(nn.Module):
@@ -2588,8 +2644,23 @@ class MoonViT3dEncoder(nn.Module):
 
         max_seqlen = lengths.max()
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
+        # Modification: materialize the host copy of the cumulative lengths once
+        # per tower forward instead of once per attention layer: grid_thws arrives
+        # host-side in the collator flow, so the CPU cumsum needs no device sync;
+        # on hosts that stage grid_thws on device this is a single .tolist() (the
+        # NPU fusion kernel previously paid two D2H syncs per vision layer).
+        if lengths.device.type == "cpu":
+            cu_seqlens_host = lengths.cumsum(dim=0, dtype=torch.int32).tolist()
+        else:
+            cu_seqlens_host = cu_seqlens.tolist()
         for block in self.blocks:
-            hidden_states = block(hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis=rope_freqs_cis)
+            hidden_states = block(
+                hidden_states,
+                cu_seqlens,
+                max_seqlen,
+                rope_freqs_cis=rope_freqs_cis,
+                cu_seqlens_host=cu_seqlens_host,
+            )
 
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states
