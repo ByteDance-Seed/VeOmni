@@ -10,6 +10,21 @@ from pathlib import Path
 from torch.distributed.checkpoint import FileSystemReader
 
 
+def _coalesce_ranges(ranges):
+    """Combine only overlapping or adjacent byte ranges already read."""
+    start = end = None
+    for offset, length in sorted(ranges):
+        if start is None:
+            start, end = offset, offset + length
+        elif offset <= end:
+            end = max(end, offset + length)
+        else:
+            yield start, end - start
+            start, end = offset, offset + length
+    if start is not None:
+        yield start, end - start
+
+
 class CacheAwareFileSystemReader(FileSystemReader):
     """Advise away the checkpoint byte ranges this rank has finished reading.
 
@@ -42,7 +57,7 @@ class CacheAwareFileSystemReader(FileSystemReader):
                     warnings.warn("Skipping checkpoint cache advice for a symlink shard", stacklevel=2)
                     continue
                 try:
-                    for offset, length in sorted(ranges):
+                    for offset, length in _coalesce_ranges(ranges):
                         os.posix_fadvise(fd, offset, length, os.POSIX_FADV_DONTNEED)
                 finally:
                     os.close(fd)

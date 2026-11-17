@@ -1,6 +1,7 @@
 """DCP cache advice must preserve restored values and follow completed reads."""
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -90,6 +91,39 @@ def test_dcp_read_advises_only_after_copy_and_preserves_values(tmp_path, monkeyp
     dcp.load(target, storage_reader=CacheAwareFileSystemReader(tmp_path))
     assert calls and all(length > 0 and advice == os.POSIX_FADV_DONTNEED for _, length, advice in calls)
     assert all(torch.equal(source[key], target[key]) for key in source)
+
+
+@pytest.mark.skipif(_NO_CACHE_ADVICE, reason="requires POSIX fadvise and O_NOFOLLOW")
+def test_cache_advice_coalesces_only_completed_ranges_within_each_shard(tmp_path, monkeypatch):
+    from torch.distributed.checkpoint import FileSystemReader
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.write_bytes(bytes(32))
+    second.write_bytes(bytes(32))
+    reader = CacheAwareFileSystemReader(tmp_path)
+    requests = [("first", 0, 4), ("first", 2, 5), ("first", 7, 2), ("first", 12, 2), ("second", 0, 4)]
+    reader.storage_data = {
+        index: SimpleNamespace(relative_path=name, offset=offset, length=length)
+        for index, (name, offset, length) in enumerate(requests)
+    }
+    plan = SimpleNamespace(items=[SimpleNamespace(storage_index=index) for index in range(len(requests))])
+    completed = torch.futures.Future()
+    completed.set_result(None)
+    monkeypatch.setattr(FileSystemReader, "read_data", lambda *args: completed)
+    calls = []
+    monkeypatch.setattr(
+        os,
+        "posix_fadvise",
+        lambda fd, offset, length, advice: calls.append((os.fstat(fd).st_ino, offset, length, advice)),
+    )
+
+    reader.read_data(plan, None).wait()
+    expected = {
+        (first.stat().st_ino, 0, 9, os.POSIX_FADV_DONTNEED),
+        (first.stat().st_ino, 12, 2, os.POSIX_FADV_DONTNEED),
+        (second.stat().st_ino, 0, 4, os.POSIX_FADV_DONTNEED),
+    }
+    assert len(calls) == len(expected) and set(calls) == expected
 
 
 @pytest.mark.skipif(_NO_CACHE_ADVICE, reason="requires POSIX fadvise and O_NOFOLLOW")
