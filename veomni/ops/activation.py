@@ -97,10 +97,14 @@ __all__ = [
 #: Everything else -- ``gelu_10``, ``gelu_accurate``, ``gelu_fast``,
 #: ``gelu_python``, ``gelu_python_tanh``, ``hardswish``, ``laplace``,
 #: ``leaky_relu``, ``linear``, ``quick_gelu``, ``relu``, ``relu2``, ``relu6``,
-#: ``sigmoid``, ``sqrtsoftplus``, ``tanh`` -- would be an unexercised capability.
-#: A model configured with one takes its projection fallback, which calls the
-#: model's own ``act_fn`` and is exact for any activation; a *quantizing* row
-#: refuses rather than fall back (see ``veomni.ops.kernels.gated_mlp._module``).
+#: ``sigmoid``, ``sqrtsoftplus``, ``tanh`` -- is an unexercised capability, so no
+#: row claims it. The reference ``eager`` row still runs such a model exactly: it
+#: calls the block's own ``act_fn`` through the projection modules, which is the
+#: expression the model used before this family existed. A *quantizing* row
+#: refuses instead of falling back (see ``veomni.ops.kernels.gated_mlp._module``).
+#: The ``geglu`` variant is a third case: it is fixed to
+#: ``gelu_pytorch_tanh`` / ``gelu_python_tanh`` and falls back to ``act_fn`` for
+#: anything else, whether or not the name is in this set.
 SUPPORTED_ACTIVATIONS: tuple[str, ...] = (
     "silu",
     "swish",

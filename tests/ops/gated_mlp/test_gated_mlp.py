@@ -801,6 +801,39 @@ def test_render_routes_each_row_by_shape_and_activation():
         assert render(mlp, impl=impl, activation="mish").projections is not None
 
 
+@pytest.mark.parametrize("activation", ["relu", "mish", "quick_gelu", "gelu_10"])
+def test_the_eager_row_runs_an_activation_outside_the_whitelist_exactly(activation):
+    """The reference row keeps every config that worked before this family existed.
+
+    ``veomni/ops/activation.py`` serves five names, and a config outside them cannot
+    be evaluated by a row. The *reference* row must still run it: the block owns an
+    ``act_fn``, which is exactly what the model called before these rows existed and
+    is correct for any activation. Before this test the row called
+    ``apply_activation`` there and raised, so a ``relu`` model that trained on
+    ``main`` stopped loading -- the fallback the docs promised did not exist.
+
+    A quantizing row still raises for those names, because falling back would train
+    at full precision under a config that said otherwise.
+    """
+    from torch import nn
+    from transformers.activations import ACT2FN
+
+    class _MLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = nn.Linear(16, 32, bias=False)
+            self.up_proj = nn.Linear(16, 32, bias=False)
+            self.down_proj = nn.Linear(32, 16, bias=False)
+            self.act_fn = ACT2FN[activation]
+
+    mlp = _MLP()
+    x = torch.randn(2, 4, 16)
+
+    out = resolve_op("gated_mlp", "standard", "eager").wrapper(mlp, x, activation=activation)
+    expected = mlp.down_proj(mlp.act_fn(mlp.gate_proj(x)) * mlp.up_proj(x))
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
 def test_render_refuses_a_quantizing_row_it_cannot_serve():
     """A quantizing row raises rather than fall back, and says which knob to turn.
 

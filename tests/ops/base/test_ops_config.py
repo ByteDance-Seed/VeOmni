@@ -1067,8 +1067,38 @@ def test_a_legacy_quantizing_recipe_names_the_replacement_fields(tmp_path):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_renamed_field_migrates_to_its_current_spelling(tmp_path):
+    """A checkpoint saved before the `swiglu_mlp` -> `gated_mlp` rename still loads.
+
+    The rename was forced by the family gaining an activation argument. Configs
+    written before it record `swiglu_mlp_implementation`, and a checkpoint stores
+    whatever was set, so without the migration the load dies with a bare
+    `unexpected keyword argument` and no way forward.
+    """
+    from transformers import Qwen3Config
+
+    from veomni.models import build_config
+
+    Qwen3Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=64,
+        ops_implementation={"swiglu_mlp_implementation": "eager"},
+    ).save_pretrained(tmp_path)
+
+    config = build_config(str(tmp_path))
+
+    assert "swiglu_mlp_implementation" not in config.ops_implementation
+    assert config.ops_implementation["gated_mlp_implementation"] == "eager"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_current_selections_are_untouched_by_the_migration():
     from veomni.models.legacy_qat_selections import migrate_retired_selections
 
     selections = {"linear_implementation": "qat", "kv_round_implementation": "triton"}
     assert migrate_retired_selections(selections) == selections
+    assert migrate_retired_selections({"gated_mlp_implementation": "qat"}) == {"gated_mlp_implementation": "qat"}

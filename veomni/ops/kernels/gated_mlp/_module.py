@@ -31,6 +31,16 @@ of the row rather than of the call site:
 Each of those has one answer: run the projection modules instead, which is what the
 model itself used before this family existed. :func:`render` makes that decision,
 so a model's MLP forward is a single handle call with no branch.
+
+What "run the projection modules" means differs by variant, and each row owns it:
+
+* ``standard`` evaluates the activation itself through ``veomni.ops.activation``,
+  and for a name outside that set calls the block's own ``act_fn`` -- the
+  expression the model used before this family, exact for any activation.
+* ``geglu`` computes ``gelu_pytorch_tanh`` and calls ``act_fn`` for anything else.
+
+A **quantizing** row has no such answer: falling back to the modules would train at
+full precision while the config claimed otherwise, so :func:`render` raises there.
 """
 
 from __future__ import annotations

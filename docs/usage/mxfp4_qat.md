@@ -104,8 +104,12 @@ way that family is **not** quantized, so a config that sets only
 Selecting `torchao_nvfp4` without `torchao` installed raises
 `Op 'linear' variant='standard' impl='torchao_nvfp4' requires unavailable
 package(s): 'torchao'` at model construction; it never falls back silently.
-A quantizing `gated_mlp` row on a model whose activation is not SiLU is
-refused at config load, as for every quantizing `gated_mlp` row.
+A quantizing `gated_mlp` row evaluates any of the five activations
+`veomni/ops/activation.py` serves (`silu`, `swish`, `gelu`, `gelu_new`,
+`gelu_pytorch_tanh`), so a GELU model quantizes its MLP like a SiLU one. An
+activation outside that set is refused when the row runs, not at config load:
+falling back would train at full precision under a config that claimed
+otherwise, so the error names `eager` as the way to keep the projection path.
 
 Start from [the Qwen3 example](../../configs/text/qwen3_nvfp4_qat.yaml), set
 `model.model_path` and `data.train_path`, then run:

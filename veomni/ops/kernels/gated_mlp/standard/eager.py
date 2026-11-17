@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ....activation import apply_activation, apply_activation_backward
+from ....activation import apply_activation, apply_activation_backward, supports
 from ....registry import SavedState
 
 
@@ -50,10 +50,23 @@ def linear(x: Tensor, weight: Tensor, bias: Tensor) -> Tensor:
 
 
 def clamp_gate_up(gate: Tensor, up: Tensor, swiglu_limit: float | None) -> tuple[Tensor, Tensor]:
-    """DeepSeek-V4 clamp: gate has an upper cap, up is two-sided."""
+    """DeepSeek-V4 clamp, in whatever dtype the caller passes: gate capped, up two-sided."""
     if swiglu_limit is None:
         return gate, up
     return gate.clamp(max=swiglu_limit), up.clamp(min=-swiglu_limit, max=swiglu_limit)
+
+
+def clamp_gate_up_in_fp32(gate: Tensor, up: Tensor, swiglu_limit: float | None) -> tuple[Tensor, Tensor]:
+    """The same clamp, widened to fp32 first -- official DeepSeek-V4 shared-expert math.
+
+    One helper for both of ``eager``'s paths (by weight, and through the projection
+    modules) so a bf16 model clamps identically whichever path runs. It is kept
+    separate from :func:`clamp_gate_up` because the quantizing rows deliberately
+    clamp in the model dtype, matching the deployment kernel they emulate.
+    """
+    if swiglu_limit is None:
+        return gate, up
+    return clamp_gate_up(gate.float(), up.float(), swiglu_limit)
 
 
 def silu_mul(gate: Tensor, up: Tensor) -> Tensor:
@@ -123,10 +136,7 @@ def mlp_hidden(
     gate = linear(x, gate_w, gate_b)
     up = linear(x, up_w, up_b)
     projection_dtype = gate.dtype
-    if swiglu_limit is not None:
-        gate = gate.float()
-        up = up.float()
-    gate_c, up_c = clamp_gate_up(gate, up, swiglu_limit)
+    gate_c, up_c = clamp_gate_up_in_fp32(gate, up, swiglu_limit)
     hidden = apply_activation(gate_c, activation) * up_c
     if hidden.dtype != x.dtype:
         hidden = hidden.to(dtype=x.dtype)
@@ -208,7 +218,7 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
         compute_dtype=grad_output.dtype,
     )
     if meta.swiglu_limit is not None:
-        gate_c, up_c = clamp_gate_up(gate, up, meta.swiglu_limit)
+        gate_c, up_c = clamp_gate_up_in_fp32(gate, up, meta.swiglu_limit)
         grad_hidden = grad_hidden.to(dtype=gate_c.dtype)
         # ``d/dgate`` needs the ``up`` factor: activation_backward multiplies by
         # the derivative only, matching ``aten.silu_backward``'s contract.
@@ -285,9 +295,16 @@ def wrapper(
     rendered = render(mlp, impl="eager", activation=activation)
     if rendered.projections is not None:
         gate_proj, up_proj, down_proj = rendered.projections
-        gate, up = gate_proj(x), up_proj(x)
-        gate, up = clamp_gate_up(gate, up, swiglu_limit)
-        return down_proj((apply_activation(gate, activation) * up).to(x.dtype))
+        gate, up = clamp_gate_up_in_fp32(gate_proj(x), up_proj(x), swiglu_limit)
+        if supports(activation):
+            hidden = apply_activation(gate, activation) * up
+        else:
+            # An activation ``veomni.ops.activation`` does not evaluate. The block
+            # still has its own ``act_fn``, which is what the model ran before this
+            # family existed and is exact for any activation -- so the reference row
+            # keeps working for every config that worked before.
+            hidden = mlp.act_fn(gate) * up
+        return down_proj(hidden.to(x.dtype))
 
     # No empty-input shortcut here: ``F.linear`` on a zero-token batch returns zeros
     # with a live graph, and a detached zero would cut the block out of the backward
