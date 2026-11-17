@@ -219,6 +219,12 @@ register_checkpoint_scheduler(scheduler, name="my.schedule", version=1,
                               parameters={"warmup_steps": 100})
 ```
 
+Unrecognized instance-level `state_dict` replacements on optimizer leaves are
+rejected: a wrapper could otherwise renumber parameter IDs after capture and
+silently assign the wrong learning rate. Known PyTorch DCP wrappers are allowed.
+Optimizer class implementations and registered state-dict hooks are trusted to
+preserve their declared parameter mapping and update semantics.
+
 With `stage_dir` the model half waits: a staged save has overwritten nothing
 until the copy to the destination, so it invalidates the destination there
 instead of at the start. A staged save that fails leaves the previous checkpoint
