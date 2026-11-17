@@ -16,13 +16,6 @@ Two tag schemes coexist on quay.io:
 
 ## CANN 9.2.1: pending Quay publication
 
-These target tags are not yet confirmed available on Quay. They are listed
-for the planned publication, not as currently pullable release images.
-Build locally using the [A2](build_a2_docker.md) or [A3](build_a3_docker.md)
-guide. The integrated builders currently generate legacy-style tags; these
-product-style target names are for manual publication and are not generated
-by the workflows. See [workflow tag rules](overview.md#build-and-publication-workflows).
-
 | Tag | Dockerfile | Content |
 |---|---|---|
 | `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-910b-ubuntu22.04-py3.12-veomni` | [Dockerfile] [a2.x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86) / [a2.arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.arm) | veomni / torch-npu / triton-ascend / fla_npu |
