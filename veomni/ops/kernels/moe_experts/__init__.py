@@ -45,6 +45,7 @@ from .standard import triton as standard_triton
 
 _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+_QAT_GPU = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS, ROCM_GPU))
 
 #: ``moe_experts`` rows that fake-quantize the operands they are handed. Adapters
 #: need the real weights, and ``moe_experts_lora`` has no matching row, so an
@@ -134,10 +135,10 @@ register_op(
     "moe_experts",
     "standard",
     "qat",
-    description="TileLang blockwise FP8/FP4 fake-quantized Triton grouped-GEMM routed SwiGLU MoE experts",
+    description="Blockwise FP8/FP4 fake-quantized Triton grouped-GEMM routed SwiGLU MoE experts",
     wrapper=standard_qat.wrapper,
-    requirement=_NVIDIA_SM90_PLUS,
-    requires=("tilelang", "triton"),
+    requirement=_QAT_GPU,
+    requires=("triton",),
 )
 
 register_op(

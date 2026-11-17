@@ -26,8 +26,8 @@ If a field is not in this table, it is not an op-selection knob.
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| Gated MLP | `gated_mlp_implementation` | `eager`, `liger_kernel`, `qat` (SM90+, `dtype=fp8`), `torchao` (`dtype=fp8, nvfp4, mxfp4`) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp`. The activation is a **call argument** (`activation=config.hidden_act`), so a `gelu` model quantizes like a `silu` one; `liger_kernel` computes SiLU only on the `standard` variant and is skipped for anything else (the `geglu` variant is not selectable here; Gemma3 binds it in code, and there `liger_kernel` computes GELU-tanh) |
-| Dense projection | `linear_implementation` | `eager`, `qat` (SM90+, `dtype=fp8`), `torchao` (`dtype=fp8, nvfp4, mxfp4`, `standard` only) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants). Consumers: DeepSeek-V4 (`standard` + `grouped`), Qwen3 (`standard`), and Llama (`standard`) |
+| Gated MLP | `gated_mlp_implementation` | `eager`, `liger_kernel`, `qat` (`dtype=fp8`, SM90+ or ROCm gfx942/gfx950), `torchao` (`dtype=fp8, nvfp4, mxfp4`) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp`. The activation is a **call argument** (`activation=config.hidden_act`), so a `gelu` model quantizes like a `silu` one; `liger_kernel` computes SiLU only on the `standard` variant and is skipped for anything else (the `geglu` variant is not selectable here; Gemma3 binds it in code, and there `liger_kernel` computes GELU-tanh) |
+| Dense projection | `linear_implementation` | `eager`, `qat` (`dtype=fp8`, SM90+ or ROCm gfx942/gfx950), `torchao` (`dtype=fp8, nvfp4, mxfp4`, `standard` only) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants). Consumers: DeepSeek-V4 (`standard` + `grouped`), Qwen3 (`standard`), and Llama (`standard`) |
 | KV / indexer storage round | `kv_round_implementation` | `none`, `eager`, `triton` (NVIDIA SM89+, ROCm) | `"none"`; there is no host default | Model `__init__` via an instance-local `VeomniOp` on the `deepseek_v4` variant, which fixes the model's two geometries; the `standard` variant is model-agnostic and takes them as call arguments. **DeepSeek-V4 is the only consumer** |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
@@ -37,7 +37,7 @@ If a field is not in this table, it is not an op-selection knob.
 | Kimi K3 chunked KDA | `chunk_kda_implementation` | `eager`, `ascendc` (Ascend NPU), `fla` (CUDA) | `"ascendc"` (NPU), `"eager"` (GPU) | Kimi K3 model `__init__` via an instance-local `VeomniOp`; `eager` is the `chunk_kda_naive` reference, `ascendc` runs guarded routing (SHA-pinned chunk indices, version assertions), `fla` refuses builds without the K3 gating contract |
 | Kimi K3 SituGLU | `situ_and_mul_implementation` | `eager`, `triton` (Triton-Ascend) | `"triton"` (NPU), `"eager"` (GPU) | Kimi K3 model `__init__` via an instance-local `VeomniOp`; the `eager` fp32 core is shared by the MoE expert loops |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU) | `"triton"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `qat` (`dtype=fp8, fp4`, SM90+), `deepgemm` (native FP8 GEMM, `dtype=fp8`, SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `qat` (`dtype=fp8` on SM90+/ROCm; `dtype=fp4` on SM90+), `deepgemm` (native FP8 GEMM, `dtype=fp8`, SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
 
 ### Quantization is chosen per op, not as a recipe
 
@@ -744,7 +744,7 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 | Value | Implementation | Requirements |
 |-------|---------------|---|
 | `liger_kernel` | Registered Liger SwiGLU row (SiLU only) | `liger-kernel` package |
-| `qat` | Registered TileLang blockwise FP8 fake-quant row | `tilelang`, NVIDIA SM90+ |
+| `qat` | Registered blockwise FP8 fake-quant row | TileLang on NVIDIA SM90+; Triton on AMD gfx942/gfx950 |
 | `torchao` | Registered dynamic FP8 GEMM and FP4 fake-quant row, `dtype=fp8`, `nvfp4`, or `mxfp4` ([Low-Precision Training](../usage/low_precision_training.md)) | `torchao` package |
 | `eager` | Registered PyTorch reference row | — |
 
@@ -753,7 +753,7 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 | Value | Implementation | Requirements |
 |-------|---------------|---|
 | `eager` | Registered row that calls the projection module | — |
-| `qat` | Registered TileLang blockwise FP8 fake-quant row | `tilelang`, NVIDIA SM90+ |
+| `qat` | Registered blockwise FP8 fake-quant row | TileLang on NVIDIA SM90+; Triton on AMD gfx942/gfx950 |
 | `torchao` | Registered dynamic FP8 GEMM and FP4 fake-quant row (`standard` only, `dtype=fp8`, `nvfp4`, or `mxfp4`; [Low-Precision Training](../usage/low_precision_training.md)) | `torchao` package |
 
 The quantizing rows refuse to run on a projection substituted after

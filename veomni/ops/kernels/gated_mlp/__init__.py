@@ -24,7 +24,7 @@ can read the projection weights or has to run the projection modules. See
 ``._module`` for that decision and why it belongs to the row.
 """
 
-from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, MluKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, ROCM_GPU, GpuKernelRequirement, MluKernelRequirement
 from ...registry import register_op
 from .geglu import eager as geglu_eager
 from .geglu import liger_kernel as geglu_liger
@@ -36,7 +36,7 @@ from .standard import torchao as standard_torchao
 
 _GPU = GpuKernelRequirement()
 _MLU = MluKernelRequirement()
-_NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+_QAT_GPU = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS, ROCM_GPU))
 
 register_op(
     "gated_mlp",
@@ -72,10 +72,10 @@ register_op(
     "gated_mlp",
     "standard",
     "qat",
-    description="TileLang blockwise FP8 fake-quantized gated MLP with optional activation clamping",
+    description="Blockwise FP8 fake-quantized gated MLP with optional activation clamping",
     wrapper=standard_qat.wrapper,
-    requirement=_NVIDIA_SM90_PLUS,
-    requires=("tilelang",),
+    requirement=_QAT_GPU,
+    requires=("triton",),
 )
 
 register_op(

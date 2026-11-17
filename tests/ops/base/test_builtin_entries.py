@@ -41,6 +41,7 @@ _GPU_NVIDIA_SM70 = ("gpu", (("nvidia", 70, None),))
 _GPU_NVIDIA_SM80 = ("gpu", (("nvidia", 80, None),))
 _GPU_NVIDIA_SM89_ROCM = ("gpu", (("nvidia", 89, None), ("rocm", None, None)))
 _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
+_GPU_NVIDIA_SM90_ROCM = ("gpu", (("nvidia", 90, None), ("rocm", None, None)))
 _GPU_NVIDIA_SM90_OR_SM100 = ("gpu", (("nvidia", 90, 90), ("nvidia", 100, 100)))
 _GPU_NVIDIA_SM100 = ("gpu", (("nvidia", 100, None),))
 _GPU_NVIDIA_SM90_TO_SM100 = ("gpu", (("nvidia", 90, 100),))
@@ -166,7 +167,7 @@ _BUILTIN_ENTRIES = (
     ("moe_experts", "standard", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts", "standard", "fused_triton", "mlu", _MLU, ("triton",)),
     ("moe_experts", "standard", "fused_quack", "cuda", _GPU_NVIDIA_SM90, ("quack",)),
-    ("moe_experts", "standard", "qat", "cuda", _GPU_NVIDIA_SM90, ("tilelang", "triton")),
+    ("moe_experts", "standard", "qat", "cuda", _GPU_NVIDIA_SM90_ROCM, ("triton",)),
     ("moe_experts", "standard", "deepgemm", "cuda", _GPU_NVIDIA_SM90_OR_SM100, ("deep_gemm", "triton")),
     ("moe_experts", "standard", "fused_npu", "npu", _NPU, ()),
     ("moe_experts", "standard", "fused_mlu", "mlu", _MLU, ("apex",)),
@@ -189,10 +190,10 @@ _BUILTIN_ENTRIES = (
     ("layer_norm", "standard", "eager", "any", _ANY, ()),
     ("layer_norm", "standard", "apex", "cuda", _GPU, ("fused_layer_norm_cuda",)),
     ("linear", "standard", "eager", "any", _ANY, ()),
-    ("linear", "standard", "qat", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("linear", "standard", "qat", "cuda", _GPU_NVIDIA_SM90_ROCM, ("triton",)),
     ("linear", "standard", "torchao", "any", _ANY, ("torchao",)),
     ("linear", "grouped", "eager", "any", _ANY, ()),
-    ("linear", "grouped", "qat", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("linear", "grouped", "qat", "cuda", _GPU_NVIDIA_SM90_ROCM, ("triton",)),
     ("rms_norm", "standard", "eager", "any", _ANY, ()),
     ("rms_norm", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("rms_norm", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
@@ -229,7 +230,7 @@ _BUILTIN_ENTRIES = (
     ("gated_mlp", "standard", "eager", "any", _ANY, ()),
     ("gated_mlp", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("gated_mlp", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
-    ("gated_mlp", "standard", "qat", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("gated_mlp", "standard", "qat", "cuda", _GPU_NVIDIA_SM90_ROCM, ("triton",)),
     ("gated_mlp", "standard", "torchao", "any", _ANY, ("torchao",)),
     ("gated_mlp", "geglu", "eager", "any", _ANY, ()),
     ("gated_mlp", "geglu", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),

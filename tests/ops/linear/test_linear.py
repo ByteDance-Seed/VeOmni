@@ -69,11 +69,11 @@ def test_linear_eager_handles_empty_input():
     assert op(torch.nn.Linear(16, 8), x).shape == (0, 8)
 
 
-def test_linear_qat_rows_require_tilelang_on_sm90():
-    """The TileLang rows are declared with the hardware and package they need."""
+def test_linear_qat_rows_require_triton_on_supported_gpus():
+    """The QAT rows declare the runtime shared by their GPU backends."""
     entries = {(entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", "standard")}
-    assert ("qat", ("tilelang",)) in entries
-    assert ("qat", ("tilelang",)) in {
+    assert ("qat", ("triton",)) in entries
+    assert ("qat", ("triton",)) in {
         (entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", "grouped")
     }
 

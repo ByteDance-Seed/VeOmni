@@ -1567,7 +1567,8 @@ class OpsImplementationConfig:
         default=None,
         metadata={
             "help": "Gated MLP (act(gate(x)) * up(x)). 'liger_kernel' (SiLU only; GPU, MLU) | "
-            "'qat' (SM90+, dtype='fp8') | 'torchao' (dtype='fp8', 'nvfp4', or 'mxfp4', needs the "
+            "'qat' (dtype='fp8', SM90+ or ROCm gfx942/gfx950) | "
+            "'torchao' (dtype='fp8', 'nvfp4', or 'mxfp4', needs the "
             "'torchao' package) | 'eager'. "
             "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
         },
@@ -1575,7 +1576,8 @@ class OpsImplementationConfig:
     linear_implementation: Optional[str] | OpsSelection = field(
         default=None,
         metadata={
-            "help": "Dense projection. 'qat' (fake quantization of both GEMM operands, SM90+, dtype='fp8') | "
+            "help": "Dense projection. 'qat' (fake quantization of both GEMM operands, dtype='fp8', "
+            "SM90+ or ROCm gfx942/gfx950) | "
             "'torchao' (dynamic FP8 GEMMs or FP4 fake quantization, 'standard' variant only, needs the "
             "'torchao' package, dtype='fp8', 'nvfp4', or 'mxfp4') | 'eager' (calls the projection module). "
             "Unset: 'eager'. Selected independently of gated_mlp_implementation: a model that owns its "
