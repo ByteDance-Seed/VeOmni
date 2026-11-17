@@ -67,7 +67,14 @@ class ShortConvolution(nn.Conv1d):
         raise NotImplementedError(f"Unsupported activation for ShortConvolution: {self.activation!r}")
 
     def forward(
-        self, x, cache=None, output_final_state=False, cu_seqlens=None, cu_seqlens_cpu=None, channel_slice=None, **kwargs
+        self,
+        x,
+        cache=None,
+        output_final_state=False,
+        cu_seqlens=None,
+        cu_seqlens_cpu=None,
+        channel_slice=None,
+        **kwargs,
     ):
         """Run the depthwise causal conv (``channel_slice`` serves KDA head-sharding)."""
         if x.dim() == 2:
