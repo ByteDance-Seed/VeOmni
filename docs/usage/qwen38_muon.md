@@ -83,9 +83,9 @@ recipe does not import the pretraining LR from the paper.
 
 In a distributed job, a direct `build_optimizer(..., optimizer_type="qwen38_muon")`
 call is collective across the training world on CPU, CUDA and Ascend. Every
-rank must enter it in the same order with the same optimizer type. The standard
-model runtime checks type agreement; custom callers must enforce this contract
-before calling the factory or a mismatched set of participants can hang.
+rank must enter it in the same order with the same optimizer type. Both standard
+runtime and custom callers must provide a consistent configuration before
+calling the factory; mismatched participants can hang.
 
 On CUDA, matmul must already use IEEE FP32 (`highest`, TF32 disabled); unsafe
 or mixed precision policies are rejected before any optimizer child updates.
