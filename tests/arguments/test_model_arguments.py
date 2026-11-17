@@ -17,7 +17,7 @@
 import pytest
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.arguments import ModelArguments
+from veomni.arguments import AcceleratorConfig, FSDPConfig, ModelArguments, OptimizerConfig
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -39,6 +39,39 @@ class TestWhereTheLoaderReadsTheConfigFrom:
 
     def test_the_tokenizer_follows_the_config_the_base_settled(self):
         assert ModelArguments(model_path="weights", config_path="cfg").tokenizer_path == "cfg"
+
+
+def test_state_offload_device_memory_fraction_is_coerced_and_ranged():
+    # YAML resolves an exponent literal without a decimal point to a string; it
+    # must be coerced before the range check instead of raising TypeError.
+    assert (
+        OptimizerConfig(
+            state_offload="cpu", state_offload_device_memory_fraction="8e-1"
+        ).state_offload_device_memory_fraction
+        == 0.8
+    )
+    with pytest.raises(ValueError, match="state_offload_device_memory_fraction"):
+        OptimizerConfig(state_offload="cpu", state_offload_device_memory_fraction=1.5)
+
+
+def test_state_offload_rejects_non_adamw_types_and_unknown_values():
+    # The literal is not enforced for YAML values, so the constructor validates
+    # it; otherwise a typo would silently fall back to the stock AdamW path.
+    with pytest.raises(ValueError, match="must be 'none' or 'cpu'"):
+        OptimizerConfig(state_offload="gpu")
+    with pytest.raises(ValueError, match="only supported for type='adamw'"):
+        OptimizerConfig(type="muon", state_offload="cpu")
+    with pytest.raises(ValueError, match="only supported for type='adamw'"):
+        OptimizerConfig(type="anyprecision_adamw", state_offload="cpu")
+
+
+def test_state_offload_rejects_fsdp_cpu_offload():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ModelArguments(
+            model_path="weights",
+            optimizer=OptimizerConfig(state_offload="cpu"),
+            accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(offload=True)),
+        )
 
 
 @pytest.mark.parametrize(

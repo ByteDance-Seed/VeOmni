@@ -234,6 +234,11 @@ class JanusVqvae(InferenceMixin, PretrainedOmniModule):
     # Mirrors HF ``JanusVQVAE._no_split_modules`` with our quantiser subclass in
     # place of theirs, so the FSDP wrap plan is unchanged by the swap below.
     _no_split_modules = ["JanusVQVAEAttnBlock", "JanusVQVAEResnetBlock", "JanusVqvaeVectorQuantizer"]
+    # The codec runs through VeOmni's patched attention, which takes the selected
+    # backend explicitly; HF gates each spelling on these flags.
+    _supports_sdpa = True
+    _supports_flash_attn = True
+    _supports_flex_attn = True
 
     def __init__(self, config: JanusVqvaeConfig):
         super().__init__(config)
@@ -260,7 +265,19 @@ class JanusVqvae(InferenceMixin, PretrainedOmniModule):
             self.vqmodel.requires_grad_(False)
 
     def _encode_pixels(self, pixel_values: torch.Tensor) -> Dict[str, torch.Tensor]:
-        with torch.no_grad() if self.config.freeze else torch.enable_grad():
+        # ``vqmodel.encode`` returns a straight-through quantiser output whose
+        # ``embedding_loss`` is the only differentiable codec objective. The graph
+        # looks the discrete ``image_tokens`` up through a fresh embedding, so that
+        # loss never reaches the total and codec parameters receive no gradient —
+        # which is why ``freeze`` must stay on. Reject the other setting here rather
+        # than let it look trainable while nothing updates it.
+        if not self.config.freeze:
+            raise NotImplementedError(
+                "JanusVqvae: freeze=False is unsupported — the training graphs consume only the "
+                "discrete VQ tokens, so the codec receives no gradient. Add the codec's "
+                "embedding_loss to the loss before enabling this."
+            )
+        with torch.no_grad():
             vq_out = self.vqmodel.encode(pixel_values)
         vq_token_ids = vq_out.image_tokens
         image_embeds = self.generation_aligner(self.generation_embeddings(vq_token_ids))

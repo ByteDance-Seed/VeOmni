@@ -30,7 +30,13 @@ from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
     BagelSiglipNavitPreprocessor,
     BagelSiglipNavitProcessor,
 )
-from veomni.models.seed_omni.modules.bagel.sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from veomni.models.seed_omni.modules.bagel.sources import (
+    BAGEL_CONTEXT_KEY,
+    BAGEL_PHASE_KEY,
+    BAGEL_SIGLIP_CONTEXT,
+    BAGEL_START_TOKEN,
+    BAGEL_VAE_CONTEXT,
+)
 from veomni.models.seed_omni.modules.bagel.text_encoder.chat_template import BagelChatTemplate
 from veomni.models.seed_omni.modules.bagel.text_encoder.modeling import (
     _OMNI_TOKENIZED as BAGEL_TOK,
@@ -117,11 +123,20 @@ class FakeTokenizer:
 
 
 class FakeImageProcessor:
-    """Returns a fixed-shape normalized pixel batch (fp32) for the given images."""
+    """Returns a fixed-shape normalized pixel batch (fp32) for the given images.
 
-    def __init__(self, channels=3, size=4):
+    ``patch_size`` stands in for the vision config value the real
+    ``JanusImageProcessor`` does not carry; the preprocessors need it to record a
+    per-image ``_omni_token_len``.
+    """
+
+    def __init__(self, channels=3, size=4, patch_size=4):
         self.channels = channels
         self.size = size
+        self.patch_size = patch_size
+        # Mirrors ``JanusVqvaeProcessor``: the codec's token count is stated by the
+        # processor alias, which the VQVAE preprocessor falls back to.
+        self.num_image_tokens = (size // patch_size) ** 2
 
     def __call__(self, images, return_tensors="pt"):
         # Deterministic content keyed on the (uint8) input so equivalence is checkable.
@@ -534,9 +549,14 @@ def test_bagel_preprocessors_route_inference_und_user_image_to_siglip_only():
     vae_pre(_b(batch), inference=True, generation_kwargs={"infer_type": "infer_und"})
     text_pre(_b(batch), inference=True, generation_kwargs={"infer_type": "infer_und"})
 
-    assert [item.type for item in batch[0]] == ["text", "image", "text"]
-    assert batch[0][1].meta.get(BAGEL_CONTEXT_KEY) == BAGEL_SIGLIP_CONTEXT
-    assert torch.equal(batch[0][1].value, image)
+    # infer_und routes the user image to SigLIP only and appends the assistant start
+    # token. Assert by role/tag rather than by fixed positions: the vision module
+    # wraps the media row in its own marker rows, so the count is not load-bearing.
+    image_items = [item for item in batch[0] if item.type == "image"]
+    assert len(image_items) == 1
+    assert image_items[0].meta.get(BAGEL_CONTEXT_KEY) == BAGEL_SIGLIP_CONTEXT
+    assert torch.equal(image_items[0].value, image)
+    assert batch[0][-1].meta.get(BAGEL_PHASE_KEY) == BAGEL_START_TOKEN
 
 
 def test_bagel_vae_preprocessor_appends_per_sample_dummy_for_missing_context():
@@ -860,19 +880,19 @@ def _text_only_batch():
     ]
 
 
-def test_siglip_appends_one_batch_anchor_when_no_user_image():
+def test_siglip_appends_a_dummy_per_sample_with_no_user_image():
     pre = JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = _text_only_batch()
     pre(_b(batch))
     dummies = _worker_dummies(batch, "user")
-    assert len(dummies) == 1
-    assert dummies[0] is batch[0][-1]
-    d = dummies[0]
-    assert d.type == "image" and d.role == "user" and d.is_dummy
-    assert d.value.shape == (3, 4, 4) and d.value.dtype == torch.bfloat16
-    assert d.meta[_IMG_TAG_KEY] == "und"
+    assert len(dummies) == len(batch)
+    for sample, d in zip(batch, dummies, strict=True):
+        assert d is sample[-1]
+        assert d.type == "image" and d.role == "user" and d.is_dummy
+        assert d.value.shape == (3, 4, 4) and d.value.dtype == torch.bfloat16
+        assert d.meta[_IMG_TAG_KEY] == "und"
 
 
 def test_siglip_no_dummy_when_user_image_present():
@@ -885,7 +905,7 @@ def test_siglip_no_dummy_when_user_image_present():
     assert batch[0][0].value.dtype == torch.bfloat16  # real image normalized instead
 
 
-def test_siglip_no_dummy_when_any_sample_in_batch_has_a_user_image():
+def test_siglip_dummy_only_on_the_sample_without_a_user_image():
     pre = JanusSiglipPreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
@@ -895,24 +915,27 @@ def test_siglip_no_dummy_when_any_sample_in_batch_has_a_user_image():
     ]
     pre(_b(batch))
 
-    # The real image already anchors the tower for the whole micro-batch.
-    assert _worker_dummies(batch, "user") == []
-    assert len(batch[0]) == 1 and len(batch[1]) == 1
+    # Per sample: the sample with a real image keeps exactly one row and gains no
+    # placeholder; the text-only sample gets one so the tower still runs for it.
+    dummies = _worker_dummies(batch, "user")
+    assert len(dummies) == 1 and dummies[0] is batch[1][-1]
+    assert len(batch[0]) == 1 and len(batch[1]) == 2
 
 
-def test_vqvae_appends_one_batch_anchor_when_no_assistant_image():
+def test_vqvae_appends_a_dummy_per_sample_with_no_assistant_image():
     pre = JanusVqvaePreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
     batch = _text_only_batch()
     pre(_b(batch))
     dummies = _worker_dummies(batch, "assistant")
-    assert len(dummies) == 1
-    assert dummies[0] is batch[0][-1]
-    assert dummies[0].meta[_IMG_TAG_KEY] == "gen" and dummies[0].value.shape == (3, 4, 4)
+    assert len(dummies) == len(batch)
+    for sample, d in zip(batch, dummies, strict=True):
+        assert d is sample[-1]
+        assert d.meta[_IMG_TAG_KEY] == "gen" and d.value.shape == (3, 4, 4)
 
 
-def test_vqvae_no_dummy_when_any_sample_in_batch_has_a_gen_image():
+def test_vqvae_dummy_only_on_the_sample_without_a_gen_image():
     pre = JanusVqvaePreprocessor(
         FakeImageProcessor(), dtype=torch.bfloat16, dummy_pixel_values=torch.zeros(3, 4, 4, dtype=torch.bfloat16)
     )
@@ -922,11 +945,18 @@ def test_vqvae_no_dummy_when_any_sample_in_batch_has_a_gen_image():
     ]
     pre(_b(batch))
 
-    assert _worker_dummies(batch, "assistant") == []
-    assert len(batch[0]) == 1 and len(batch[1]) == 1
+    # Per sample: only the sample lacking a generation target gets a placeholder.
+    dummies = _worker_dummies(batch, "assistant")
+    assert len(dummies) == 1 and dummies[0] is batch[1][-1]
+    assert len(batch[0]) == 1 and len(batch[1]) == 2
 
 
-def test_qwen3vl_vision_appends_one_batch_anchor_with_grid_when_no_visual():
+def test_qwen3vl_vision_appends_a_dummy_per_sample_with_grid_when_no_visual():
+    """With no visual anywhere in the batch, every sample gets its own placeholder.
+
+    The placeholder carries the zero patches + grid so the merger still runs on it
+    in the GPU forward (the FSDP gradient anchor).
+    """
     proc = FakeQwen3VLImageProcessor()
     pre = Qwen3VLVisionPreprocessor(
         proc,
@@ -938,14 +968,14 @@ def test_qwen3vl_vision_appends_one_batch_anchor_with_grid_when_no_visual():
     batch = _text_only_batch()
     pre(_b(batch))
     dummies = _worker_dummies(batch, "user")
-    assert len(dummies) == 1
-    assert dummies[0] is batch[0][-1]
-    d = dummies[0]
-    assert d.value.shape == (4, 8) and d.value.dtype == torch.bfloat16
-    assert d.meta[_OMNI_GRID] == [1, 2, 2] and d.meta[_IMG_TAG_KEY] == "und"
+    assert len(dummies) == len(batch)
+    for sample, dummy in zip(batch, dummies, strict=True):
+        assert dummy is sample[-1]
+        assert dummy.value.shape == (4, 8) and dummy.value.dtype == torch.bfloat16
+        assert dummy.meta[_OMNI_GRID] == [1, 2, 2] and dummy.meta[_IMG_TAG_KEY] == "und"
 
 
-def test_qwen3vl_vision_no_dummy_when_any_sample_in_batch_has_a_visual():
+def test_qwen3vl_vision_dummy_only_on_the_sample_without_a_visual():
     pre = Qwen3VLVisionPreprocessor(
         FakeQwen3VLImageProcessor(),
         None,
@@ -959,8 +989,11 @@ def test_qwen3vl_vision_no_dummy_when_any_sample_in_batch_has_a_visual():
     ]
     pre(_b(batch))
 
-    assert _worker_dummies(batch, "user") == []
-    assert len(batch[0]) == 1 and len(batch[1]) == 1
+    # Per-sample: only the sample that lacks a visual gets a placeholder. The one
+    # with a real image keeps its single row and gains none.
+    dummies = _worker_dummies(batch, "user")
+    assert len(dummies) == 1 and dummies[0] is batch[1][-1]
+    assert len(batch[0]) == 1 and len(batch[1]) == 2
 
 
 def test_worker_dummy_routes_to_dummy_parts_in_text_template():

@@ -25,9 +25,9 @@ inference block maps each scenario to a separate generation graph.
 
 | File | Role |
 |------|------|
-| `train/base.yaml` | Launcher: model paths, `model.accelerator`, data, train, and `infer` block. |
+| `train/base.yaml` | Launcher: model paths, `model.accelerator`, data, and train blocks. |
 | `train/modules_train.yaml` | Per-module training paths. `bagel_qwen2_mot` is the accelerated class with `flex_attention`. |
-| `infer/modules_infer_eager.yaml` | Single-process inference: every module loads eager; MoT uses SDPA. |
+| `infer/modules_infer_eager.yaml` | Single-process inference: every module loads eager; MoT uses FlexAttention. |
 | `infer/modules_infer_fsdp.yaml` | Distributed inference: every module uses FSDP2; MoT uses FlexAttention. |
 | `train/graph_train.yaml` | Training DAG. |
 | `infer/graph_infer_und.yaml` | Image/text understanding to text. |
@@ -39,11 +39,24 @@ The BAGEL graphs cover understanding, generation, and edit.
 
 ---
 
-## 1. Convert the checkpoint
+## 1. Checkpoint
 
-The converter reads upstream `llm_config.json`, `vit_config.json`,
-`ema.safetensors`, and `ae.safetensors`, then writes one sub-checkpoint per
-module:
+BAGEL registers an HF layout (`modules/bagel/hf_layout.py`), so
+`model.model_path` can point at the **upstream checkpoint itself** (holding
+`ema.safetensors` and `ae.safetensors`, with or without
+`model.safetensors.index.json`) — no offline convert needed. The layout routes
+`encoder.*` and `decoder.*` from `ae.safetensors` (FP32) plus the VAE image
+processor to `bagel_vae`; `vit_model.*`, `connector.*`, and `vit_pos_embed.*`
+plus the SigLIP image processor to `bagel_siglip_navit`;
+`language_model.model.embed_tokens.*` and `language_model.lm_head.*` plus the
+tokenizer to `bagel_text_encoder`; `vae2llm.*`, `llm2vae.*`,
+`time_embedder.*`, and `latent_pos_embed.*` to `bagel_flow_connector`; and the
+remaining `language_model.*` keys to `bagel_qwen2_mot`. HF exports
+(`save_hf_weights`) split fused runtime QKV weights back to upstream Q/K/V keys
+and write `ema.safetensors` and `ae.safetensors` in the upstream layout (see
+[Load an upstream checkpoint directly](../usage/training_and_inference.md#21-load-an-upstream-checkpoint-directly)).
+
+The offline split also works through the same layout:
 
 ```bash
 python scripts/seed_omni/convert_model.py \
@@ -51,8 +64,9 @@ python scripts/seed_omni/convert_model.py \
   --output_dir /mnt/hdfs/user_dir/veomni_omni/models/seed_omni/BAGEL-7B-MoT
 ```
 
-The family is picked from the source `config.json` (`model_type: bagel`). The
-output root becomes `model.model_path` in `base.yaml`. It contains:
+The family is picked from the source `config.json` (`model_type: bagel`). Either
+the upstream root or the split output root can be used as `model.model_path` in
+`base.yaml`. A split root contains:
 
 ```text
 BAGEL-7B-MoT/
@@ -125,6 +139,32 @@ code skip it via `item.is_dummy`.
 Training uses the accelerated Qwen2-MoT class from `train/modules_train.yaml`. The
 default packed attention backend is FlexAttention.
 
+On H20 (SM90), eligible BF16/FP16 calls automatically use Flex's FlashAttention-4
+backend from the standard `gpu` extra. The MoT training module enables async
+Ulysses when sequence parallelism is active. A single-node H20 baseline is:
+
+```bash
+bash train.sh tasks/omni/train_omni.py \
+  configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml \
+  --model.accelerator.ulysses_size 4 \
+  --train.micro_batch_size 1
+```
+
+The online and cached-VAE training module configs both set
+`bagel_qwen2_mot.accelerator.enable_async: true`. For a matched synchronous
+control, override
+`--model.model_config.modules.bagel_qwen2_mot.accelerator.enable_async false`.
+With SP disabled, the fused synchronous QKV path is used regardless of this
+flag. Both paths retain the same split-QKV external checkpoint schema.
+
+The async path dispatches through the `("async_ulysses_qkv", "bagel")` and
+`("async_ulysses_o", "bagel")` compound ops, overlapping Q/K exchanges with
+later routed projections and inverse exchanges with backward projection work.
+It forwards the module's configured `rms_norm` and `rope` handles into the
+compound ops and passes `skip_ulysses=True` to attention because Q/K/V have
+already been redistributed. Inference continues to use its existing packed
+prefill and FlashAttention-2 denoise/decode paths.
+
 ```bash
 bash train.sh tasks/omni/train_omni.py \
   configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml
@@ -167,12 +207,12 @@ training does not use FlashAttention-2.
 
 | Backend | Class | Config | Use |
 |---------|-------|--------|-----|
-| FlexAttention | accelerated | `train/modules_train.yaml`, `infer/modules_infer_fsdp.yaml` | Default packed training / FSDP inference |
-| MagiAttention | accelerated | CLI override onto `bagel_qwen2_mot` | SM90+ fused training; see nfunc below |
-| SDPA | eager | `infer/modules_infer_eager.yaml` | Single-process inference and the dense-mask oracle |
+| FlexAttention | accelerated / eager | `train/modules_train.yaml`, `infer/modules_infer_eager.yaml`, `infer/modules_infer_fsdp.yaml` | Default packed training and inference (only supported packed backend on SM90) |
+| MagiAttention | accelerated | CLI override onto `bagel_qwen2_mot` | SM100+ CUTE DSL/JIT fused training |
+| SDPA | eager | CLI override onto `bagel_qwen2_mot` | Dense-mask oracle |
 
-Leave the YAML on `flex_attention` unless you are opting into Magi. Enable Magi
-from the CLI (the launcher rewrites it to `veomni_magi_attention`):
+Leave the YAML on `flex_attention` unless you are opting into Magi on SM100+.
+Enable Magi from the CLI (the launcher rewrites it to `veomni_magi_attention`):
 
 ```bash
 bash train.sh tasks/omni/train_omni.py \
@@ -181,31 +221,13 @@ bash train.sh tasks/omni/train_omni.py \
   --train.micro_batch_size 1
 ```
 
-Magi requires physical batch size 1, `cp_size == 1`, and NVIDIA SM90 or newer.
-Ulysses still works. On 8 ranks, `--model.accelerator.ulysses_size 4` gives
-`dp_shard=2` and SP4. Packed Magi/Flex is the training (and FSDP prefill) path;
-the denoise loop still uses FlashAttention-2. The Magi adapter contract is in
+Magi requires physical batch size 1, `cp_size == 1`, and NVIDIA SM100 or newer
+(with CUTE DSL/JIT installed via `uv sync --extra gpu --extra magi --dev`).
+SM90 and older GPUs only support FlexAttention. Ulysses still works. On 8 ranks,
+`--model.accelerator.ulysses_size 4` gives `dp_shard=2` and SP4. Packed
+Magi/Flex is the training (and FSDP prefill) path; the denoise loop still uses
+FlashAttention-2. The Magi adapter contract is in
 [`docs/transformers_v5/veomni_attention_interface.md`](../../transformers_v5/veomni_attention_interface.md).
-
-#### SM90 nfunc vs dataset
-
-On SM90, Magi uses a precompiled CUTLASS overlay. `nfunc` is baked at install
-time: it is the HSTU interval count for the worst query in a sample, not the
-Magi range-list length. The installer default is `1,3,5`. A later exact
-`uv sync` removes the overlay, so rerun the installer before SM90 Magi runs.
-
-Text-only and single-image gen samples are typically `nfunc=1`. Multi-turn
-`seed_edit_p23_multi_turn` punches noise-key holes, so nfunc grows with the
-number of assistant images (about `2G-1`). That mixture needs **nfunc ≥ 11**:
-
-```bash
-bash scripts/kernel/install_magi_sm90.sh --nfunc 1,3,5,7,9,11
-```
-
-If a sample's runtime nfunc is missing from the compiled matrix, the kernel
-fails with `Compile-time kNFunc (...) must match runtime arbitrary_func_num (...)`.
-SM100+ uses CUTE DSL/JIT and compiles unseen nfunc at runtime, so it does not
-need this overlay matrix.
 
 ### 3.2 Offline VAE posterior cache (two stages)
 
@@ -342,10 +364,11 @@ YAML.
 ## 6. Contract checks
 
 The Bagel module and graph contracts cover carrier context-tag routing, generation
-state transitions, packing/cache behavior, and graph config structure. Packed
+state transitions, packing/cache behavior, graph config structure, and direct
+HF-layout load/convert/export round-trips (`test_bagel_hf_layout.py`). Packed
 MoT also compares Flex and Magi against eager SDPA on toy CE / MSE / gradients
-in `tests/seed_omni/modules/bagel/test_bagel_accel_align.py`. Magi cases skip unless the
-SM90 CUTLASS overlay or SM100+ CUTE JIT backend is present.
+in `tests/seed_omni/modules/bagel/test_bagel_accel_align.py`. Magi cases skip unless an
+NVIDIA SM100+ GPU with the CUTE DSL/JIT backend is present.
 
 ```bash
 .venv/bin/python -m pytest -q tests/seed_omni/modules/bagel

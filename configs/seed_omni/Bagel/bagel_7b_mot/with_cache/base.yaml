@@ -79,21 +79,3 @@ train:
     enable: true
     project: VeOmni_omni
     name: bagel_7b_mot_omni_sft_from_cache
-
-infer:
-  generation_kwargs:
-    max_new_tokens: 2048
-    temperature: 0.0
-    top_p: 1.0
-    do_sample: false
-    image_height: 1024
-    image_width: 1024
-    latent_downsample: 16
-    num_timesteps: 50
-    timestep_shift: 3.0
-    cfg_text_scale: 1.0
-    cfg_img_scale: 1.0
-    cfg_interval: [0.0, 1.0]
-    cfg_renorm_min: 0.0
-    cfg_renorm_type: global
-    enable_taylorseer: false

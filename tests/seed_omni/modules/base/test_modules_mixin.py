@@ -710,11 +710,11 @@ def test_fsdp_no_split_modules_preserved():
     assert set(JanusVQVAE._no_split_modules) <= set(jv._no_split_modules or [])
 
 
-# ── janus_1.3b/{train,infer_*}.yaml smoke load ────────────────────────────────
+# ── janus/{train,infer_*}.yaml smoke load ────────────────────────────────
 
 
 def _janus_cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Janus" / "janus_1.3b"
+    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Janus" / "janus"
 
 
 def test_janus_train_yaml_loads_with_v2_module_names():
@@ -738,9 +738,7 @@ def test_janus_train_yaml_loads_with_v2_module_names():
     assert not any("emit_image" in e["from"] or "emit_image" in e["to"] for e in cfg.training_graph)
 
 
-@pytest.mark.parametrize(
-    "infer_graph", ["infer/graph_infer_interleave.yaml", "infer/graph_infer_gen.yaml", "infer/graph_infer_und.yaml"]
-)
+@pytest.mark.parametrize("infer_graph", ["infer/graph_infer_gen.yaml", "infer/graph_infer_und.yaml"])
 def test_janus_train_plus_infer_merges_generation_graph(infer_graph: str):
     cfg = _load_omni_config(
         modules_path=_janus_cfg_dir() / "train/modules_train.yaml",
@@ -797,7 +795,7 @@ def test_init_applies_eager_defaults_for_inference():
 
 
 def test_init_resolves_relative_module_paths():
-    root = "seed_omni/janus_1.3b"
+    root = "seed_omni/janus"
     cfg = _load_omni_config(
         model_path=root,
         modules_path=_janus_cfg_dir() / "train/modules_train.yaml",
@@ -821,14 +819,14 @@ def test_init_resolves_relative_module_paths():
 
 
 def _qwen3_cfg_dir() -> Path:
-    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Qwen" / "qwen3_0.6b"
+    return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Qwen" / "qwen3"
 
 
 def test_qwen3_train_yaml_loads_with_v2_module_names():
     cfg = _load_omni_config(
         modules_path=_qwen3_cfg_dir() / "train/modules_train.yaml",
         train_graph_path=_qwen3_cfg_dir() / "train/graph_train.yaml",
-        infer_graph_path=_qwen3_cfg_dir() / "train/graph_infer.yaml",
+        infer_graph_path=_qwen3_cfg_dir() / "infer/graph_infer.yaml",
     )
 
     assert set(cfg._module_entries) == {"qwen3_text_encoder", "qwen3_llm"}
@@ -842,7 +840,7 @@ def test_qwen3_train_plus_infer_merges_generation_graph():
     cfg = _load_omni_config(
         modules_path=_qwen3_cfg_dir() / "train/modules_train.yaml",
         train_graph_path=_qwen3_cfg_dir() / "train/graph_train.yaml",
-        infer_graph_path=_qwen3_cfg_dir() / "train/graph_infer.yaml",
+        infer_graph_path=_qwen3_cfg_dir() / "infer/graph_infer.yaml",
     )
     assert set(cfg._module_entries) == {"qwen3_text_encoder", "qwen3_llm"}
     assert cfg.generation_graph is not None

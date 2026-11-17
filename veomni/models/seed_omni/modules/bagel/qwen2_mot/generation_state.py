@@ -158,6 +158,7 @@ class MotCacheContext:
     # ── Cache accessors ──────────────────────────────────
 
     def require_ready(self) -> None:
+        """Raise if this branch's KV-cache state has not been initialized."""
         if (
             self._cache is None
             or self._key_values_lens is None
@@ -167,6 +168,7 @@ class MotCacheContext:
             raise RuntimeError(f"BAGEL {self.name} branch context is not initialized.")
 
     def cache_len(self) -> int:
+        """Return the total cached sequence length for this branch."""
         if self._key_values_lens is None:
             raise RuntimeError(f"BAGEL {self.name} branch cache lengths are not initialized.")
         return int(self._key_values_lens.sum().item())
@@ -206,7 +208,6 @@ class MotGenerationState:
     also remembers the branch layout between denoise and velocity collection.
     """
 
-    _infer_mode: str = "und"
     _velocity_buffer: dict[str, torch.Tensor] = field(default_factory=dict)
     _pending_denoise_branches: tuple[str, ...] | None = None
     _pending_denoise_query_len: int | None = None
@@ -215,26 +216,12 @@ class MotGenerationState:
     _cfg_img: MotCacheContext = field(default_factory=lambda: MotCacheContext("image CFG"))
 
     def reset(self) -> None:
-        self._infer_mode = "und"
         self._velocity_buffer.clear()
         self._pending_denoise_branches = None
         self._pending_denoise_query_len = None
         self._main.reset()
         self._cfg_text.reset()
         self._cfg_img.reset()
-
-    def update_infer_mode(self, generation_kwargs: dict[str, Any]) -> str:
-        # Later graph steps omit infer_type, so the mode is sticky until the
-        # graph resets this module's local inference state.
-        if "infer_type" in generation_kwargs:
-            infer_type = str(generation_kwargs["infer_type"])
-            if infer_type not in {"infer_und", "infer_gen", "infer_edit"}:
-                raise ValueError(f"Unsupported BAGEL infer_type: {infer_type!r}.")
-            infer_mode = "und" if infer_type == "infer_und" else "gen"
-        else:
-            infer_mode = self._infer_mode or "und"
-        self._infer_mode = infer_mode
-        return self._infer_mode
 
     # ── CFG cache contexts ──────────────────────────────────
 
@@ -251,6 +238,7 @@ class MotGenerationState:
         return self._cfg_img
 
     def _cache_for_branch(self, branch: str) -> MotCacheContext:
+        """Return the ``MotCacheContext`` for ``branch`` (``'main'``, ``'cfg_text'``, or ``'cfg_img'``)."""
         if branch == "main":
             return self._main
         if branch == "cfg_text":
@@ -262,6 +250,7 @@ class MotGenerationState:
     # ── CFG request policy ──────────────────────────────────
 
     def validate_cfg_request(self, generation_kwargs: dict[str, object]) -> None:
+        """Validate that image CFG is only enabled when text CFG is also active."""
         cfg_text_scale = float(generation_kwargs.get("cfg_text_scale", 1.0))
         cfg_img_scale = float(generation_kwargs.get("cfg_img_scale", 1.0))
         if cfg_img_scale > 1.0 and cfg_text_scale <= 1.0:
@@ -393,6 +382,7 @@ class MotGenerationState:
     def _denoise_branches_for_timestep(
         self, generation_kwargs: dict[str, object], timestep: object
     ) -> tuple[str, ...]:
+        """Return the ordered tuple of active CFG branch names for ``timestep``."""
         self.validate_cfg_request(generation_kwargs)
         cfg_text_active = self._cfg_text_active(generation_kwargs, timestep)
         branches = ["main"]
@@ -403,6 +393,7 @@ class MotGenerationState:
         return tuple(branches)
 
     def _cfg_text_active(self, generation_kwargs: dict[str, object], timestep: object) -> bool:
+        """Return whether text CFG guidance is active at ``timestep``."""
         cfg_text_scale = float(generation_kwargs.get("cfg_text_scale", 1.0))
         if cfg_text_scale <= 1.0:
             return False
@@ -428,17 +419,20 @@ class MotGenerationState:
         return t > lower and t <= upper
 
     def _strip_denoise_query_markers(self, velocity: torch.Tensor) -> torch.Tensor:
+        """Strip the leading and trailing vision marker rows from a branch velocity tensor."""
         if int(velocity.shape[0]) < 3:
             raise ValueError("BAGEL MoT denoise velocity must include start/end marker rows.")
         return velocity[1:-1]
 
     def _merged_velocity_without_cfg(self, *, device: torch.device) -> torch.Tensor:
+        """Return the unguided ``main`` branch velocity."""
         main_velocity = self._velocity_buffer.get("main")
         if main_velocity is None:
             raise RuntimeError("BAGEL CFG merge requires a collected main branch velocity.")
         return main_velocity.to(device=device)
 
     def _merged_velocity_with_cfg(self, generation_kwargs: dict[str, object], *, device: torch.device) -> torch.Tensor:
+        """Combine ``main``, ``cfg_text``, and optional ``cfg_img`` velocities with CFG renormalization."""
         main_velocity = self._merged_velocity_without_cfg(device=device)
 
         cfg_text_scale = float(generation_kwargs.get("cfg_text_scale", 1.0))
@@ -497,6 +491,7 @@ class MotGenerationState:
         key_values_lens: torch.Tensor,
         empty_cache_factory: Callable[[], Any],
     ) -> Any:
+        """Concatenate per-branch KV caches into one packed ``NaiveCache``."""
         # Concatenation order must match preprocess_parallel_denoise_inputs:
         # main, then cfg_text, then cfg_img when those branches are active.
         merged_cache = empty_cache_factory()

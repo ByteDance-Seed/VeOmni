@@ -11,21 +11,21 @@ SIGNAL_TEXT_DONE = "text_done"
 
 
 class Qwen3TextEncoder(TextEncoder):
-    """Qwen3 ChatML text encoder, optionally image-aware.
+    """Qwen3 ChatML text encoder, optionally image/video aware.
 
-    With ``config.enable_image`` the module uses the Qwen3-VL image ChatML
-    template (image items wrapped in ``<|vision_start|> … <|vision_end|>``; the
-    sibling vision module supplies the projected patch embeds) — the CPU
-    preprocessor (see :class:`Qwen3TextEncoderPreprocessor`) picks the right
-    template at bind time. Only the ChatML autoregression (keyed on eos /
-    ``<|im_end|>``) is implemented here; SP-aware training hooks and the
-    image-mode vision-token freeze live in ``accelerated.py``.
+    With ``config.enable_image`` the module is handed the Qwen3-VL chat template
+    (media items wrapped in ``<|vision_start|> … <|vision_end|>``), so a sibling
+    vision module's projected embeds ride along the conversation carrier exactly
+    as they do for ``qwen3vl_text_encoder``. Only the ChatML autoregression
+    (keyed on eos / ``<|im_end|>``) is implemented here; SP-aware training hooks
+    and the image-mode vision-token freeze live in ``accelerated.py``.
     """
 
     config_class = Qwen3TextEncoderConfig
     preprocessor_class = Qwen3TextEncoderPreprocessor
 
     def __init__(self, config: Qwen3TextEncoderConfig):
+        """Build the shared :class:`TextEncoder` with this module's config."""
         super().__init__(config)
 
     def generate(
@@ -34,6 +34,7 @@ class Qwen3TextEncoder(TextEncoder):
         generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        """Run one ChatML FSM step: embed the prompt, or sample the next token."""
         del kwargs
         tail = conversation_list[-1]
         if not self._prompt_encoded:

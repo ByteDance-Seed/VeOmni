@@ -14,6 +14,7 @@ from veomni.distributed.sequence_parallel import gather_outputs, slice_input_ten
 from veomni.utils.tensor_utils import unflatten
 
 from .....mixins.base_mixin import BaseMixin
+from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem
 from ....base.llm_packing import scatter_llm_hidden_states
@@ -51,6 +52,13 @@ class TrainingMixin(TrainingModuleMixin):
     ) -> Dict[str, Any]:
         packed = pack_qwen3vl_conversations_for_forward(conversation_list, self.device, self._spatial_merge_size)
         inputs_embeds = packed["inputs_embeds"]
+
+        # Metering: one length per sample, from the packer's `cu_seq_lens`, so
+        # `estimate_flops` squares each sample instead of the batch total and
+        # `OmniEnvironMeter` can align the list with `ds_idx`. Stashed BEFORE the
+        # SP slice below so the count does not depend on `sp_size`.
+        cu = packed["cu_seq_lens"].reshape(-1)
+        self.metric_meter_set_seqlens("forward", [int(s) for s in (cu[1:] - cu[:-1]).tolist()])
 
         if self.training and get_parallel_state().fsdp_enabled:
             inputs_embeds = _fold_fsdp_dummy_anchors(inputs_embeds, conversation_list)
@@ -182,7 +190,35 @@ class TrainingMixin(TrainingModuleMixin):
         return {"conversation_list": conversation}
 
 
-class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin):
+class LlmMeterMixin(MetricMeterMixin):
+    """Per-module training meter for the Qwen3-VL backbone (decoder layers only).
+
+    Mirrors the Qwen3 meter: this module owns no wte / lm_head (the text encoder
+    does), so no vocabulary projection is counted.
+    """
+
+    config: Qwen3VLLlmConfig
+
+    def estimate_flops(self, seqlens: List[int]) -> float:
+        cfg = self.config.text_config
+        hidden = cfg.hidden_size
+        num_layers = cfg.num_hidden_layers
+        num_heads = cfg.num_attention_heads
+        num_kv_heads = cfg.num_key_value_heads
+        head_dim = getattr(cfg, "head_dim", hidden // num_heads)
+
+        mlp_n = hidden * cfg.intermediate_size * 3
+        attn_linear_n = hidden * (num_heads * head_dim * 2 + num_kv_heads * head_dim * 2)
+        dense_n = (mlp_n + attn_linear_n) * num_layers
+
+        tokens = sum(seqlens)
+        seqlen_sq = sum(s * s for s in seqlens)
+        dense_flops = 6 * dense_n * tokens
+        attn_flops = 12 * seqlen_sq * head_dim * num_heads * num_layers
+        return (dense_flops + attn_flops) / 1e12
+
+
+class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, LlmMeterMixin):
     """``_spatial_merge_size`` is inherited from the native :class:`Qwen3VLLlm`.
 
     ``generate()`` and inference-state reset already live on that native class

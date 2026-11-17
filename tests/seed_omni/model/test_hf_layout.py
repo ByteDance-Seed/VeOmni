@@ -601,3 +601,116 @@ def test_an_offline_embedding_run_skips_the_export_check(tmp_path, monkeypatch):
     args.train.training_task = "online_training"
     build_omni_model_runtime_args(args)
     assert len(checked) == 1
+
+
+def test_custom_layout_subclass_overrides_hooks_and_per_module_dtypes(tmp_path):
+    from veomni.arguments.omni_arguments_types import _check_hf_source_exportable
+
+    custom_type = "custom_named_shards_omni"
+
+    class CustomNamedShardsLayout(OmniHFLayout):
+        _SHARDS = ("a.safetensors", "b.safetensors")
+
+        def source_weight_files(self, source_path: str) -> dict[str, str]:
+            weight_map: dict[str, str] = {}
+            for filename in self._SHARDS:
+                shard_path = os.path.join(source_path, filename)
+                if not os.path.isfile(shard_path):
+                    raise FileNotFoundError(f"Missing {shard_path}")
+                with safe_open(shard_path, framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        weight_map[key] = filename
+            return weight_map
+
+        def resolve_weights_path(self, source_path: str) -> str:
+            staged = tmp_path / "staged_weights"
+            if not staged.exists():
+                staged.mkdir(parents=True)
+                weight_map = self.source_weight_files(source_path)
+                for filename in self._SHARDS:
+                    os.symlink(os.path.join(source_path, filename), staged / filename)
+                (staged / "model.safetensors.index.json").write_text(
+                    json.dumps({"metadata": {}, "weight_map": weight_map}),
+                    encoding="utf-8",
+                )
+            return str(staged)
+
+        def extract_module_save_state(self, module_name: str, model: torch.nn.Module, parallel_state=None):
+            state = dict(super().extract_module_save_state(module_name, model, parallel_state))
+            if module_name == FAKE_A:
+                state["proj.weight"] = state["proj.weight"] * 2.0
+            return state
+
+        def build_fqn_to_index_mapping(self, weight_files):
+            index_by_name = {name: idx for idx, name in enumerate(self._SHARDS, start=1)}
+            return {key: index_by_name[filename] for key, filename in weight_files.items()}
+
+        def finalize_exported_shards(self, source_path: str, save_path: str, weight_files) -> None:
+            del source_path, weight_files
+            total = len(self._SHARDS)
+            for idx, filename in enumerate(self._SHARDS, start=1):
+                os.replace(
+                    os.path.join(save_path, f"model-{idx:05d}-of-{total:05d}.safetensors"),
+                    os.path.join(save_path, filename),
+                )
+            index_path = os.path.join(save_path, "model.safetensors.index.json")
+            if os.path.isfile(index_path):
+                os.remove(index_path)
+
+    custom_layout = CustomNamedShardsLayout(
+        modules={
+            FAKE_A: OmniHFModuleLayout(
+                key_prefixes=(("encoder.", ""),),
+                build_config=lambda c: FakeModuleAConfig(hidden_size=c.hidden_size, dtype="bfloat16"),
+                build_assets=_load_tokenizer,
+            ),
+            FAKE_B: OmniHFModuleLayout(
+                key_prefixes=(("decoder.", ""),),
+                build_config=lambda c: FakeModuleBConfig(hidden_size=c.hidden_size, dtype="float32"),
+            ),
+        },
+        graph_dir="configs/seed_omni/fake_model",
+        training_graphs="graph_train.yaml",
+        generation_graphs="graph_infer.yaml",
+        infer_type="infer_gen",
+        generation_kwargs={"max_new_tokens": 128},
+        load_hf_config=PretrainedConfig.from_pretrained,
+    )
+    OMNI_HF_LAYOUT_REGISTRY[custom_type] = lambda source_path=None: custom_layout
+    try:
+        root = tmp_path / "custom-hf"
+        root.mkdir(parents=True)
+        (root / "config.json").write_text(
+            json.dumps({"model_type": custom_type, "hidden_size": HIDDEN, "dtype": "bfloat16"}),
+            encoding="utf-8",
+        )
+        _save_tokenizer(root)
+        enc_weight = torch.randn(HIDDEN, HIDDEN, dtype=torch.bfloat16)
+        dec_weight = torch.randn(HIDDEN, HIDDEN, dtype=torch.float32)
+        save_file({"encoder.proj.weight": enc_weight}, root / "a.safetensors", metadata={"format": "pt"})
+        save_file({"decoder.proj.weight": dec_weight}, root / "b.safetensors", metadata={"format": "pt"})
+
+        view = resolve_omni_checkpoint_root(root)
+        _check_hf_source_exportable(view)
+
+        model = OmniModel.from_pretrained(str(root), torch_dtype="auto", device_map="cpu")
+        assert model.config.generation_kwargs == {"max_new_tokens": 128}
+        assert model.modules_dict[FAKE_A].proj.weight.dtype == torch.bfloat16
+        assert model.modules_dict[FAKE_B].proj.weight.dtype == torch.float32
+
+        split = tmp_path / "split"
+        convert_checkpoint(str(root), str(split))
+        split_model = OmniModel.from_pretrained(str(split), torch_dtype="auto", device_map="cpu")
+        assert split_model.config.generation_kwargs == {"max_new_tokens": 128}
+        assert split_model.modules_dict[FAKE_A].proj.weight.dtype == torch.bfloat16
+        assert split_model.modules_dict[FAKE_B].proj.weight.dtype == torch.float32
+
+        out = tmp_path / "export"
+        save_hf_source_checkpoint(model.config._hf_source, {FAKE_A: (model.modules_dict[FAKE_A], None)}, str(out))
+        assert not (out / "model.safetensors.index.json").exists()
+        with safe_open(out / "a.safetensors", framework="pt") as f:
+            assert torch.equal(f.get_tensor("encoder.proj.weight"), enc_weight * 2.0)
+        with safe_open(out / "b.safetensors", framework="pt") as f:
+            assert torch.equal(f.get_tensor("decoder.proj.weight"), dec_weight)
+    finally:
+        del OMNI_HF_LAYOUT_REGISTRY[custom_type]

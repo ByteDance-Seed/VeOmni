@@ -1,370 +1,54 @@
+"""BAGEL preprocessing, MoT packing, and offline VAE cache round-trip tests."""
+
 from __future__ import annotations
 
-from inspect import Parameter, signature
+import copy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.seed_omni.modules.bagel.helpers import (
+    bagel_template,
     config_cls,
     model_cls,
-    native_model_cls,
     tiny_bagel_qwen2_cfg,
 )
+from veomni.data.dataset import get_length_by_labels_fn, get_length_fn
+from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import accelerated as mot_acc
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated.accelerated import TrainingMixin
 from veomni.models.seed_omni.modules.bagel.qwen2_mot.processing import preprocess_mot_inputs
-from veomni.models.seed_omni.modules.bagel.sources import BAGEL_CONTEXT_KEY, BAGEL_SIGLIP_CONTEXT, BAGEL_VAE_CONTEXT
+from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
+    _OMNI_TOKEN_LEN as BAGEL_SIGLIP_TOKEN_LEN,
+)
+from veomni.models.seed_omni.modules.bagel.siglip_navit.processing import (
+    BagelSiglipNavitPreprocessor,
+    BagelSiglipNavitProcessor,
+)
+from veomni.models.seed_omni.modules.bagel.sources import (
+    BAGEL_CONTEXT_KEY,
+    BAGEL_PHASE_KEY,
+    BAGEL_SIGLIP_CONTEXT,
+    BAGEL_START_TOKEN,
+    BAGEL_VAE_CONTEXT,
+)
+from veomni.models.seed_omni.modules.bagel.text_encoder.processing import BagelTextEncoderPreprocessor
 from veomni.models.seed_omni.modules.bagel.vae.processing import (
     BAGEL_VAE_PIXEL_SHAPE,
     BAGEL_VAE_POSTERIOR,
+    BagelVAEPreprocessor,
     BagelVAEProcessor,
 )
-from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, ConversationItem
+from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY, _OMNI_TOKEN_LEN, ConversationItem
 
 
-@pytest.mark.parametrize("conversation_list", [None, []])
-def test_bagel_mot_packing_rejects_missing_conversation_list(conversation_list):
-    with pytest.raises(ValueError, match="requires a non-empty conversation_list"):
-        preprocess_mot_inputs(
-            conversation_list,
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-            hidden_size=4,
-        )
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def test_bagel_mot_packing_rejects_incompatible_vae_img_tag():
-    item = ConversationItem(
-        type="image",
-        value=torch.ones(2, 4),
-        role="assistant",
-        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "und"},
-    )
-
-    with pytest.raises(ValueError, match="_img_tag"):
-        preprocess_mot_inputs([[item]], device=torch.device("cpu"), dtype=torch.float32, hidden_size=4)
-
-
-def test_bagel_mot_packing_routes_tagged_edit_vae_through_generation_expert():
-    edit_context = ConversationItem(
-        type="image",
-        value=torch.ones(2, 4),
-        role="assistant",
-        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "edit"},
-    )
-    gen_target = ConversationItem(
-        type="image",
-        value=torch.full((2, 4), 2),
-        role="assistant",
-        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "gen"},
-    )
-    siglip_context = ConversationItem(
-        type="image",
-        value=torch.full((1, 4), 3),
-        role="user",
-        meta={BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT, _IMG_TAG_KEY: "edit"},
-    )
-
-    packed = preprocess_mot_inputs(
-        [[edit_context, gen_target, siglip_context]],
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        hidden_size=4,
-    )
-
-    assert packed is not None
-    assert torch.equal(packed.packed_token_type_ids, torch.tensor([1, 1, 1, 1, 0]))
-    assert packed.sample_splits == [[2, 2, 1]]
-
-
-def test_bagel_mot_forward_pre_returns_sample_local_tensor_contract():
-    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
-    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
-    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).train()
-    hidden_size = int(model.config.hidden_size)
-    text = ConversationItem(type="text", value=torch.ones(2, hidden_size), role="user")
-    gen_target = ConversationItem(
-        type="image",
-        value=torch.ones(3, hidden_size),
-        role="assistant",
-        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "gen"},
-    )
-
-    inputs = model.forward_pre(conversation_list=[[text, gen_target]])
-
-    # The accelerated class inherits the graph's generic ``forward(**kwargs)``
-    # trampoline, so the explicit packed-tensor contract lives on the native one.
-    forward_parameters = signature(native_model_cls("bagel_qwen2_mot").forward).parameters
-    assert "packed_token_type_ids" in forward_parameters
-    assert "packed_und_token_indexes" not in forward_parameters
-    assert "packed_gen_token_indexes" not in forward_parameters
-    assert all(parameter.kind is not Parameter.VAR_KEYWORD for parameter in forward_parameters.values())
-    assert set(inputs) == {
-        "packed_sequence",
-        "packed_position_ids",
-        "packed_token_type_ids",
-        "packed_attention_metadata",
-    }
-    assert torch.equal(inputs["packed_token_type_ids"], torch.tensor([0, 0, 1, 1, 1]))
-    assert inputs["packed_attention_metadata"].shape == (3, 5)
-    assert inputs["packed_attention_metadata"].dtype == torch.int32
-    assert inputs["packed_attention_metadata"].is_contiguous()
-
-
-def test_bagel_mot_forward_pre_keeps_metadata_full_and_marks_sequence_padding(monkeypatch):
-    from veomni.models.seed_omni.modules.bagel.qwen2_mot.accelerated import accelerated
-
-    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
-    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
-    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).train()
-    monkeypatch.setattr(
-        accelerated,
-        "get_parallel_state",
-        lambda: SimpleNamespace(sp_size=4, cp_size=1, ulysses_size=4, sp_group=object()),
-    )
-
-    def fake_sp_pad(tensor, dim, pad_value):
-        pad_shape = list(tensor.shape)
-        pad_shape[dim] = 3
-        padding = torch.full(pad_shape, pad_value, device=tensor.device, dtype=tensor.dtype)
-        return torch.cat((tensor, padding), dim=dim)
-
-    monkeypatch.setattr(accelerated, "sp_pad", fake_sp_pad)
-    monkeypatch.setattr(accelerated, "slice_input_tensor", lambda tensor, **kwargs: tensor)
-    hidden_size = int(model.config.hidden_size)
-    text = ConversationItem(type="text", value=torch.ones(2, hidden_size), role="user")
-    image = ConversationItem(
-        type="image",
-        value=torch.ones(3, hidden_size),
-        role="assistant",
-        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "gen"},
-    )
-
-    inputs = model.forward_pre(conversation_list=[[text, image]])
-
-    assert inputs["packed_attention_metadata"].shape == (3, 8)
-    assert inputs["packed_sequence"].shape[0] == 8
-    assert set(inputs) == {
-        "packed_sequence",
-        "packed_position_ids",
-        "packed_token_type_ids",
-        "packed_attention_metadata",
-    }
-    assert torch.equal(inputs["packed_token_type_ids"], torch.tensor([0, 0, 1, 1, 1, -1, -1, -1]))
-    assert torch.equal(inputs["packed_attention_metadata"][0, 5:], torch.tensor([5, 5, 5], dtype=torch.int32))
-    assert torch.equal(inputs["packed_attention_metadata"][1, 5:], torch.tensor([5, 5, 5], dtype=torch.int32))
-    assert torch.equal(inputs["packed_attention_metadata"][2, 5:], torch.tensor([-1, -1, -1], dtype=torch.int32))
-
-
-def test_bagel_flow_training_embed_treats_edit_context_as_clean_and_gen_as_target():
-    BagelFlowConnector = model_cls("bagel_flow_connector")
-    BagelFlowConnectorConfig = config_cls("bagel_flow_connector")
-    model = BagelFlowConnector(
-        BagelFlowConnectorConfig(
-            hidden_size=4,
-            z_channels=1,
-            latent_patch_size=1,
-            patch_latent_dim=1,
-            max_latent_size=4,
-            timestep_frequency_embedding_size=4,
-            timestep_shift=1.0,
-        )
-    )
-    edit_context = ConversationItem(
-        type="image",
-        value=torch.ones(1, 1, 2),
-        role="assistant",
-        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "edit"},
-    )
-    gen_target = ConversationItem(
-        type="image",
-        value=torch.full((1, 1, 2), 2.0),
-        role="assistant",
-        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "gen"},
-    )
-
-    inputs = model.embed_latent_pre(conversation_list=[[edit_context, gen_target]])
-
-    assert model._embed_items == [edit_context, gen_target]
-    assert model._embed_lengths == [2, 2]
-    assert torch.equal(inputs["latents"][:2], torch.ones(2, 1))
-    assert torch.equal(inputs["timesteps"][:2], torch.zeros(2))
-    assert "flow_velocity_target" not in edit_context.meta
-    assert "timestep" not in edit_context.meta
-    assert gen_target.meta["flow_velocity_target"].shape == (2, 1)
-    assert gen_target.meta["timestep"].shape == (2,)
-
-
-def test_mot_forward_post_scatters_virtual_marker_triplet_hidden_states() -> None:
-    hidden_size = 4
-    markers = torch.tensor([[101.0, 102.0, 103.0, 104.0], [201.0, 202.0, 203.0, 204.0]])
-
-    def marker(row: int, context: str) -> ConversationItem:
-        return ConversationItem(
-            type="text",
-            value=markers[row : row + 1],
-            role="user",
-            meta={"labels": torch.full((1,), -100), BAGEL_CONTEXT_KEY: context},
-        )
-
-    latent_item = ConversationItem(
-        type="image",
-        value=torch.arange(8, dtype=torch.float32).reshape(2, hidden_size) + 20,
-        role="assistant",
-        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT},
-    )
-    siglip_item = ConversationItem(
-        type="image",
-        value=torch.arange(12, dtype=torch.float32).reshape(3, hidden_size),
-        role="user",
-        meta={BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT},
-    )
-    text_item = ConversationItem(
-        type="text",
-        value=torch.arange(8, dtype=torch.float32).reshape(2, hidden_size) + 40,
-        role="user",
-    )
-    sample = [
-        marker(0, BAGEL_VAE_CONTEXT),
-        latent_item,
-        marker(1, BAGEL_VAE_CONTEXT),
-        marker(0, BAGEL_SIGLIP_CONTEXT),
-        siglip_item,
-        marker(1, BAGEL_SIGLIP_CONTEXT),
-        text_item,
-    ]
-    packed = preprocess_mot_inputs(
-        [sample],
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        hidden_size=hidden_size,
-    )
-    assert packed is not None
-
-    model = SimpleNamespace(
-        device=torch.device("cpu"),
-        _conversation_carrier=[sample],
-        _packed_training=packed,
-    )
-    hidden_states = torch.arange(11 * hidden_size, dtype=torch.float32).reshape(11, hidden_size)
-
-    out = TrainingMixin.forward_post(model, hidden_states)
-
-    assert out["conversation_list"] == [sample]
-    assert torch.equal(sample[0].value, hidden_states[0:1])
-    assert torch.equal(latent_item.value, hidden_states[1:3])
-    assert torch.equal(sample[2].value, hidden_states[3:4])
-    assert torch.equal(sample[3].value, hidden_states[4:5])
-    assert torch.equal(siglip_item.value, hidden_states[5:8])
-    assert torch.equal(sample[5].value, hidden_states[8:9])
-    assert torch.equal(text_item.value, hidden_states[9:11])
-
-
-def test_bagel_vae_online_process_runs_on_a_meta_built_model() -> None:
-    """``offline_training`` builds the VAE on meta with no weights, because it mixes in ``OfflineEncodingMixin``."""
-    encode_model = _tiny_vae()
-    process_model = _tiny_vae(meta=True)
-    encoded_cache = encode_model.offline_encode(pixel_values=torch.zeros(1, 3, 8, 8))["encoded_cache"]
-    item_cache = encoded_cache[0].reshape(2, process_model.config.z_channels, *encoded_cache.shape[-2:])
-
-    assert process_model.encoder.conv_in.weight.is_meta
-    latents = process_model.online_process(encoded_cache=item_cache)["latents"]
-    assert isinstance(latents, list)
-    assert latents[0].shape == item_cache.shape[1:]
-    assert not latents[0].is_meta
-
-
-def test_bagel_vae_online_process_consumes_variable_size_cache_items_without_padding() -> None:
-    model = _tiny_vae(meta=True)
-    first = ConversationItem(
-        type="image",
-        value=torch.zeros(2, 2, 2, 1),
-        role="assistant",
-        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT},
-    )
-    second = ConversationItem(
-        type="image",
-        value=torch.zeros(2, 2, 2, 2),
-        role="assistant",
-        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT},
-    )
-    conversation = [[first], [second]]
-
-    pre = model.online_process_pre(conversation_list=conversation)
-    out = model.online_process(encoded_cache=pre["encoded_cache"])
-    post = model.post_forward("online_process", latents=out["latents"])
-
-    assert isinstance(pre["encoded_cache"], list)
-    assert [tuple(cache.shape) for cache in pre["encoded_cache"]] == [(2, 2, 2, 1), (2, 2, 2, 2)]
-    assert post["conversation_list"] is conversation
-    assert first.value.shape == (2, 2, 1)
-    assert second.value.shape == (2, 2, 2)
-
-
-def test_bagel_vae_offline_cache_replay_keeps_img_tag_for_flow_connector(tmp_path) -> None:
-    from datasets import load_dataset
-
-    from veomni.data.seed_omni.seedomni_transform import process_seedomni_cached_example
-    from veomni.models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
-
-    encode_model = _tiny_vae()
-    process_model = _tiny_vae(meta=True)
-
-    def vae_image(tag: str) -> ConversationItem:
-        return ConversationItem(
-            type="image",
-            value=torch.zeros(3, 4, 4),
-            role="assistant",
-            meta={
-                BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT,
-                _IMG_TAG_KEY: tag,
-                BAGEL_VAE_PIXEL_SHAPE: torch.tensor([4, 4]),
-            },
-        )
-
-    pre = encode_model.pre_forward("offline_encode", conversation_list=[[vae_image("edit"), vae_image("gen")]])
-    out = encode_model.offline_encode(**pre)
-    encoded = encode_model.post_forward("offline_encode", **out)["conversation_list"]
-
-    writer = SeedOmniOfflineCacheWriter(str(tmp_path))
-    writer.open()
-    writer.save_conversation_list(encoded)
-    writer.flush()
-    dataset = load_dataset("parquet", data_files=[str(tmp_path / "shard_000000.parquet")], split="train")
-    replayed = [process_seedomni_cached_example(dataset[0])[0]["conversation_list"]]
-    assert all(item.meta[BAGEL_VAE_POSTERIOR] for item in replayed[0])
-
-    pre = process_model.pre_forward("online_process", conversation_list=replayed)
-    out = process_model.online_process(**pre)
-    processed = process_model.post_forward("online_process", **out)["conversation_list"]
-
-    assert [item.meta[_IMG_TAG_KEY] for item in processed[0]] == ["edit", "gen"]
-    assert all(item.meta[BAGEL_CONTEXT_KEY] == BAGEL_VAE_CONTEXT for item in processed[0])
-
-    BagelFlowConnector = model_cls("bagel_flow_connector")
-    BagelFlowConnectorConfig = config_cls("bagel_flow_connector")
-    flow_connector = BagelFlowConnector(
-        BagelFlowConnectorConfig(
-            hidden_size=4,
-            z_channels=2,
-            latent_patch_size=1,
-            patch_latent_dim=2,
-            max_latent_size=4,
-            timestep_frequency_embedding_size=4,
-            timestep_shift=1.0,
-        )
-    )
-    edit_item, gen_item = processed[0]
-    inputs = flow_connector.embed_latent_pre(conversation_list=processed)
-
-    assert flow_connector._embed_lengths == [16, 16]
-    assert torch.equal(inputs["timesteps"][:16], torch.zeros(16))
-    assert "flow_velocity_target" not in edit_item.meta
-    assert gen_item.meta["flow_velocity_target"].shape == (16, 2)
-
-
-def _tiny_vae(meta=False, **config_overrides):
+def _tiny_vae(meta: bool = False, **config_overrides):
+    """Construct a tiny ``BagelVAE`` on CPU or meta device with a bound processor."""
     BagelVAE = model_cls("bagel_vae")
     BagelVAEConfig = config_cls("bagel_vae")
     config_kwargs = dict(
@@ -384,3 +68,231 @@ def _tiny_vae(meta=False, **config_overrides):
         model = BagelVAE(BagelVAEConfig(**config_kwargs))
     model._image_processor = BagelVAEProcessor.from_config(model.config)
     return model
+
+
+def _build_preprocessors():
+    return (
+        BagelVAEPreprocessor(
+            BagelVAEProcessor(image_stride=2, min_image_size=4, max_image_size=4, max_pixels=16),
+            dtype=torch.bfloat16,
+            dummy_pixel_values=torch.zeros(3, 2, 2, dtype=torch.bfloat16),
+            dummy_pixel_shape=torch.tensor([2, 2], dtype=torch.long),
+        ),
+        BagelSiglipNavitPreprocessor(
+            BagelSiglipNavitProcessor(
+                patch_size=2,
+                image_size=4,
+                min_image_size=2,
+                max_pixels=16,
+                vit_max_num_patch_per_side=2,
+            ),
+            dtype=torch.bfloat16,
+            dummy_pixel_values=torch.zeros(1, 12, dtype=torch.bfloat16),
+        ),
+        BagelTextEncoderPreprocessor(bagel_template()),
+    )
+
+
+def test_bagel_preprocessors_route_training_and_inference_contexts() -> None:
+    """Verify training (``edit``/``gen`` + text-only dummy injection + ``dyn_bsz`` token lens) and inference routing."""
+    vae_pre, siglip_pre, text_pre = _build_preprocessors()
+    user_image = torch.full((3, 4, 4), 7, dtype=torch.uint8)
+    assistant_image = torch.full((3, 4, 4), 9, dtype=torch.uint8)
+
+    # 1. Training batch: sample 0 has edit + gen images; sample 1 is text-only (receives both VAE and SigLIP dummies)
+    train_batch = [
+        [
+            ConversationItem(type="text", value="edit", role="user"),
+            ConversationItem(type="image", value=user_image.clone(), role="user", meta={_IMG_TAG_KEY: "edit"}),
+            ConversationItem(
+                type="image", value=assistant_image.clone(), role="assistant", meta={_IMG_TAG_KEY: "gen"}
+            ),
+        ],
+        [
+            ConversationItem(type="text", value="hi", role="user"),
+            ConversationItem(type="text", value="ok", role="assistant"),
+        ],
+    ]
+    for pre in (vae_pre, siglip_pre, text_pre):
+        pre({"conversation_list": train_batch})
+
+    edit_sample, text_sample = train_batch
+    assert [item.meta.get(BAGEL_CONTEXT_KEY) for item in edit_sample if item.type == "image"] == [
+        BAGEL_VAE_CONTEXT,
+        BAGEL_SIGLIP_CONTEXT,
+        BAGEL_VAE_CONTEXT,
+    ]
+    assert [item.meta.get(_IMG_TAG_KEY) for item in edit_sample if item.type == "image"] == ["edit", "edit", "gen"]
+    dummies = [item for item in text_sample if item.is_dummy and item.type == "image"]
+    assert {item.meta.get(BAGEL_CONTEXT_KEY) for item in dummies} == {BAGEL_VAE_CONTEXT, BAGEL_SIGLIP_CONTEXT}
+    for sample in train_batch:
+        assert all(
+            isinstance(item.meta.get(_OMNI_TOKEN_LEN), int) and item.meta[_OMNI_TOKEN_LEN] > 0 for item in sample
+        )
+    assert (
+        get_length_fn({"conversation_list": edit_sample})
+        > get_length_by_labels_fn({"conversation_list": edit_sample})
+        > 0
+    )
+
+    # 2. Inference routing: infer_und routes to SigLIP + appends BAGEL_START_TOKEN; infer_edit expands to VAE + SigLIP
+    und_batch = [[ConversationItem(type="image", value=user_image.clone(), role="user")]]
+    for pre in (vae_pre, siglip_pre, text_pre):
+        pre({"conversation_list": und_batch}, inference=True, generation_kwargs={"infer_type": "infer_und"})
+    assert [item.meta.get(BAGEL_CONTEXT_KEY) for item in und_batch[0] if item.type == "image"] == [
+        BAGEL_SIGLIP_CONTEXT
+    ]
+    assert und_batch[0][1].meta[BAGEL_SIGLIP_TOKEN_LEN] == 4
+    assert und_batch[0][-1].meta.get(BAGEL_PHASE_KEY) == BAGEL_START_TOKEN
+
+
+def test_bagel_mot_packing_sp_padding_and_scatter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify ``preprocess_mot_inputs`` expert routing, ``forward_pre`` SP padding, and ``forward_post`` triplet scatter."""
+    BagelQwen2MoT = model_cls("bagel_qwen2_mot")
+    BagelQwen2MoTConfig = config_cls("bagel_qwen2_mot")
+    model = BagelQwen2MoT(BagelQwen2MoTConfig(**tiny_bagel_qwen2_cfg())).train()
+    hidden_size = int(model.config.hidden_size)
+
+    monkeypatch.setattr(
+        mot_acc,
+        "get_parallel_state",
+        lambda: SimpleNamespace(sp_size=4, cp_size=1, ulysses_size=4, sp_group=object()),
+    )
+
+    def _fake_sp_pad(tensor, dim, pad_value):
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = 3
+        padding = torch.full(pad_shape, pad_value, device=tensor.device, dtype=tensor.dtype)
+        return torch.cat((tensor, padding), dim=dim)
+
+    monkeypatch.setattr(mot_acc, "sp_pad", _fake_sp_pad)
+    monkeypatch.setattr(mot_acc, "slice_input_tensor", lambda tensor, **kwargs: tensor)
+
+    text = ConversationItem(type="text", value=torch.ones(2, hidden_size), role="user")
+    image = ConversationItem(
+        type="image",
+        value=torch.ones(3, hidden_size),
+        role="assistant",
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "gen"},
+    )
+    inputs = model.forward_pre(conversation_list=[[text, image]])
+    assert torch.equal(inputs["packed_token_type_ids"], torch.tensor([0, 0, 1, 1, 1, -1, -1, -1]))
+    assert torch.equal(inputs["packed_attention_metadata"][2, 5:], torch.tensor([-1, -1, -1], dtype=torch.int32))
+
+    # Triplet scatter in forward_post
+    def _marker(context: str) -> ConversationItem:
+        return ConversationItem(
+            type="text",
+            value=torch.zeros(1, 4),
+            role="user",
+            meta={"labels": torch.full((1,), -100), BAGEL_CONTEXT_KEY: context},
+        )
+
+    latent_item = ConversationItem(
+        type="image",
+        value=torch.zeros(2, 4),
+        role="assistant",
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "edit"},
+    )
+    siglip_item = ConversationItem(
+        type="image",
+        value=torch.zeros(3, 4),
+        role="user",
+        meta={BAGEL_CONTEXT_KEY: BAGEL_SIGLIP_CONTEXT, _IMG_TAG_KEY: "edit"},
+    )
+    sample = [
+        _marker(BAGEL_VAE_CONTEXT),
+        latent_item,
+        _marker(BAGEL_VAE_CONTEXT),
+        _marker(BAGEL_SIGLIP_CONTEXT),
+        siglip_item,
+        _marker(BAGEL_SIGLIP_CONTEXT),
+    ]
+    packed = preprocess_mot_inputs([sample], device=torch.device("cpu"), dtype=torch.float32, hidden_size=4)
+    assert packed is not None
+    assert torch.equal(packed.packed_token_type_ids, torch.tensor([0, 1, 1, 0, 0, 0, 0, 0, 0]))
+    hidden_states = torch.arange(9 * 4, dtype=torch.float32).reshape(9, 4)
+    monkeypatch.setattr(
+        mot_acc,
+        "get_parallel_state",
+        lambda: SimpleNamespace(sp_size=1, cp_size=1, ulysses_size=1, sp_group=None),
+    )
+    stub = SimpleNamespace(device=torch.device("cpu"), _conversation_carrier=[sample], _packed_training=packed)
+    TrainingMixin.forward_post(stub, hidden_states)
+    assert torch.equal(latent_item.value, hidden_states[1:3])
+    assert torch.equal(siglip_item.value, hidden_states[5:8])
+
+
+def test_bagel_vae_encode_and_offline_cache_roundtrip(tmp_path: Path) -> None:
+    """Verify ragged-shape VAE ``encode``/``offline_encode`` and parquet cache replay into ``BagelFlowConnector``."""
+    from datasets import load_dataset
+
+    from veomni.data.seed_omni.seedomni_transform import process_seedomni_cached_example
+    from veomni.models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
+
+    vae = _tiny_vae(ch_mult=[1, 1], downsample=2)
+    meta_vae = _tiny_vae(meta=True, ch_mult=[1, 1], downsample=2)
+
+    edit_img = ConversationItem(
+        type="image",
+        value=torch.zeros(3, 4, 8),
+        role="assistant",
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "edit", BAGEL_VAE_PIXEL_SHAPE: torch.tensor([4, 8])},
+    )
+    gen_img = ConversationItem(
+        type="image",
+        value=torch.ones(3, 8, 4),
+        role="assistant",
+        meta={BAGEL_CONTEXT_KEY: BAGEL_VAE_CONTEXT, _IMG_TAG_KEY: "gen", BAGEL_VAE_PIXEL_SHAPE: torch.tensor([8, 4])},
+    )
+
+    # 1. Ragged micro-batch offline_encode matches single-item posteriors without spatial padding
+    single_edit = copy.deepcopy([[edit_img]])
+    vae.post_forward(
+        "offline_encode", **vae.offline_encode(**vae.pre_forward("offline_encode", conversation_list=single_edit))
+    )
+    single_gen = copy.deepcopy([[gen_img]])
+    vae.post_forward(
+        "offline_encode", **vae.offline_encode(**vae.pre_forward("offline_encode", conversation_list=single_gen))
+    )
+
+    batch = [[copy.deepcopy(edit_img), copy.deepcopy(gen_img)]]
+    pre = vae.pre_forward("offline_encode", conversation_list=batch)
+    encoded = vae.post_forward("offline_encode", **vae.offline_encode(**pre))["conversation_list"]
+    torch.testing.assert_close(encoded[0][0].value, single_edit[0][0].value)
+    torch.testing.assert_close(encoded[0][1].value, single_gen[0][0].value)
+
+    # 2. Parquet round-trip -> meta-built online_process -> BagelFlowConnector.embed_latent_pre
+    writer = SeedOmniOfflineCacheWriter(str(tmp_path))
+    writer.open()
+    writer.save_conversation_list(encoded)
+    writer.flush()
+    dataset = load_dataset("parquet", data_files=[str(tmp_path / "shard_000000.parquet")], split="train")
+    replayed = [process_seedomni_cached_example(dataset[0])[0]["conversation_list"]]
+    assert all(item.meta[BAGEL_VAE_POSTERIOR] for item in replayed[0])
+
+    assert meta_vae.encoder.conv_in.weight.is_meta
+    processed = meta_vae.post_forward(
+        "online_process",
+        **meta_vae.online_process(**meta_vae.pre_forward("online_process", conversation_list=replayed)),
+    )["conversation_list"]
+    assert [item.meta[_IMG_TAG_KEY] for item in processed[0]] == ["edit", "gen"]
+
+    flow = model_cls("bagel_flow_connector")(
+        config_cls("bagel_flow_connector")(
+            hidden_size=4,
+            z_channels=2,
+            latent_patch_size=1,
+            patch_latent_dim=2,
+            max_latent_size=4,
+            timestep_frequency_embedding_size=4,
+            timestep_shift=3.0,
+        )
+    )
+    edit_item, gen_item = processed[0]
+    inputs = flow.embed_latent_pre(conversation_list=processed)
+    assert flow._embed_lengths == [8, 8]
+    assert torch.equal(inputs["timesteps"][:8], torch.zeros(8))
+    assert "flow_velocity_target" not in edit_item.meta
+    assert gen_item.meta["flow_velocity_target"].shape == (8, 2)
+    assert torch.all(gen_item.meta["timestep"] == gen_item.meta["timestep"][0])

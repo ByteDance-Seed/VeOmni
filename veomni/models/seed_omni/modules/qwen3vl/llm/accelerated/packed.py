@@ -43,6 +43,9 @@ class PackedTrainingMixin:
             position_ids = position_ids.unsqueeze(1)
         cu = packed_cu_seqlens.to(device=self.device, non_blocking=True)
         max_length = int(packed_max_length) if packed_max_length is not None else int((cu[1:] - cu[:-1]).max().item())
+        # Metering: per-sample packed lengths straight from the collator's
+        # `cu_seqlens`, stashed BEFORE any SP slice.
+        self.metric_meter_set_seqlens("pack_forward", [int(s) for s in (cu[1:] - cu[:-1]).tolist()])
         if visual_pos_mask is None:
             visual_pos_masks = torch.zeros(1, inputs_embeds.size(1), dtype=torch.bool, device=self.device)
             deepstack = inputs_embeds.new_zeros(0, 0, inputs_embeds.size(-1))

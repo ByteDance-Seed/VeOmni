@@ -22,7 +22,7 @@ from typing import Any, Optional
 import torch
 from transformers.models.janus.image_processing_janus import JanusImageProcessor
 
-from ....utils.conversation import _IMG_TAG_KEY, ConversationItem, iter_desired_items
+from ....utils.conversation import _IMG_TAG_KEY, _OMNI_TOKEN_LEN, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from .configuration import JanusSiglipConfig
 
@@ -47,28 +47,91 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
         image_processor: Any,
         dtype: Optional[torch.dtype] = None,
         dummy_pixel_values: Optional[torch.Tensor] = None,
+        patch_size: Optional[int] = None,
     ) -> None:
         self._image_processor = image_processor
         self._dtype = dtype
         self._dummy_pixel_values = dummy_pixel_values  # CPU (C, H, W), model dtype
+        # ``JanusImageProcessor`` carries no ``patch_size`` (it is not in its
+        # ``to_dict()``), so the tower's patch size has to come from the vision
+        # config — either recorded by ``bind_dummy_inputs`` or read from the
+        # module's own config in ``from_pretrained``.
+        self._patch_size = patch_size
+
+    @property
+    def _processor_size(self) -> tuple[int, int]:
+        """``(height, width)`` the image processor emits at.
+
+        HF allows ``size`` to be an ``int`` (square) or a dict with
+        ``height``/``width`` or ``shortest_edge``; a caller passing a bare int is
+        legal, so both spellings are handled here.
+        """
+        size = self._image_processor.size
+        if isinstance(size, int):
+            return size, size
+        height = size.get("height") or size.get("shortest_edge")
+        width = size.get("width") or size.get("shortest_edge")
+        return int(height), int(width)
+
+    @property
+    def _num_patch_tokens(self) -> int:
+        """Patch embeddings one SigLIP image contributes, i.e. its backbone rows.
+
+        ``dyn_bsz`` counts these per image item; the tower emits one row per
+        patch and the aligner does not change the row count.
+
+        The patch size comes from the vision config (``bind_dummy_inputs`` /
+        ``from_pretrained`` record it), because ``JanusImageProcessor`` does not
+        carry one. A processor that *does* expose it is honoured as a fallback;
+        with neither, this raises rather than guessing a count.
+        """
+        height, width = self._processor_size
+        patch = (
+            self._patch_size if self._patch_size is not None else getattr(self._image_processor, "patch_size", None)
+        )
+        if patch is None:
+            raise RuntimeError(
+                f"{type(self).__name__}: patch size unknown — call bind_dummy_inputs() or build through "
+                "from_pretrained() so the vision config's patch_size is recorded."
+            )
+        return (height // int(patch)) * (width // int(patch))
 
     @classmethod
     def from_pretrained(cls, module_path: str, **kwargs: Any) -> "JanusSiglipPreprocessor":
         """Build straight from the checkpoint dir — no model instance needed."""
         del kwargs
-        return cls(JanusSiglipProcessor.from_pretrained(module_path))
+        config = JanusSiglipConfig.from_pretrained(module_path)
+        return cls(
+            JanusSiglipProcessor.from_pretrained(module_path),
+            patch_size=int(config.vision_config.patch_size),
+        )
 
     def bind_dummy_inputs(self, config: JanusSiglipConfig, dtype: Optional[torch.dtype] = None) -> None:
-        """Training-only FSDP-anchor dummy — pure ``(config, dtype)``, no live model."""
+        """Training-only FSDP-anchor dummy — pure ``(config, dtype)``, no live model.
+
+        The shape must match what ``self._image_processor`` produces, because a
+        mixed real/dummy batch is ``torch.stack``ed together. A ``vision_config``
+        override that moves ``image_size`` away from the checkpoint's
+        ``preprocessor_config.json`` would otherwise pair real 384px images with a
+        differently sized dummy and fail the stack, so that mismatch is rejected
+        here rather than at the first step.
+        """
         cfg = config.vision_config
+        proc_h, proc_w = self._processor_size
+        if (proc_h, proc_w) != (int(cfg.image_size), int(cfg.image_size)):
+            raise ValueError(
+                f"{type(self).__name__}: vision_config.image_size={cfg.image_size} does not match the image "
+                f"processor's {(proc_h, proc_w)} from preprocessor_config.json. Override both together, or "
+                "drop the vision_config override — a mixed real/dummy batch would fail to stack."
+            )
         self._dtype = dtype
-        self._dummy_pixel_values = torch.zeros(cfg.num_channels, cfg.image_size, cfg.image_size, dtype=dtype)
+        self._patch_size = int(cfg.patch_size)
+        self._dummy_pixel_values = torch.zeros(cfg.num_channels, proc_h, proc_w, dtype=dtype)
 
     def preprocess_conversations(
         self, conversation_list: list[list[ConversationItem]], inference: bool = False, **kwargs: Any
     ) -> None:
         del kwargs  # generation_kwargs unused: prep is kwarg-independent
-        saw_real_image = False
         for sample in conversation_list:
             sample_image_items = [
                 it for it in iter_desired_items([sample], types=["image"], roles=["user"]) if not it.is_dummy
@@ -82,25 +145,29 @@ class JanusSiglipPreprocessor(ModulePreprocessorBase):
                 )["pixel_values"]
                 for it, px in zip(sample_image_items, pixel_values, strict=True):
                     it.value = px.to(dtype=self._dtype)
-                saw_real_image = True
-
-        if inference or saw_real_image:
-            return
-        if self._dummy_pixel_values is None:
-            raise RuntimeError(
-                f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
-                "before training use (pure inference never reaches this branch)."
+                    # ``dyn_bsz`` counts backbone rows before collation, so each
+                    # image item must state how many tokens it contributes:
+                    # SigLIP turns one image into ``patches`` patch embeddings.
+                    it.meta[_OMNI_TOKEN_LEN] = self._num_patch_tokens
+                continue
+            if inference:
+                continue
+            if self._dummy_pixel_values is None:
+                raise RuntimeError(
+                    f"{type(self).__name__}: dummy inputs not bound — call bind_dummy_inputs() "
+                    "before training use (pure inference never reaches this branch)."
+                )
+            # Per sample: this module's forward still runs on a step with no real
+            # media so its FSDP collectives stay in step with the other ranks.
+            sample.append(
+                ConversationItem(
+                    type="image",
+                    value=self._dummy_pixel_values,
+                    role="user",
+                    is_dummy=True,
+                    meta={_IMG_TAG_KEY: "und", _OMNI_TOKEN_LEN: self._num_patch_tokens},
+                )
             )
-        self.append_batch_anchor(
-            conversation_list,
-            ConversationItem(
-                type="image",
-                value=self._dummy_pixel_values,
-                role="user",
-                is_dummy=True,
-                meta={_IMG_TAG_KEY: "und"},
-            ),
-        )
 
 
 __all__ = ["JanusSiglipProcessor", "JanusSiglipPreprocessor"]

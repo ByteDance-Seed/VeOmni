@@ -1,4 +1,4 @@
-"""Accelerated runtime for the janus/llama OmniModule (conversation + packed graphs)."""
+"""Accelerated runtime for the janus/llama OmniModule (conversation graph)."""
 
 from .accelerated import (
     JanusLlamaAccelerated,

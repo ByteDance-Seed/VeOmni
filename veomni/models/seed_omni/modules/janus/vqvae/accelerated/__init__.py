@@ -1,4 +1,4 @@
-"""Accelerated runtime for the janus/vqvae OmniModule (conversation + packed graphs)."""
+"""Accelerated runtime for the janus/vqvae OmniModule (conversation graph)."""
 
 from .accelerated import (
     JanusVqvaeAccelerated,
