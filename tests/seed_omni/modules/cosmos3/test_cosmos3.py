@@ -40,6 +40,7 @@ from veomni.models.seed_omni.modules.cosmos3.vae.processing import (
     prefix_frame_indices,
 )
 from veomni.models.seed_omni.utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
+from veomni.utils.device import get_device_id, get_device_type, get_torch_device
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -158,19 +159,17 @@ def _conversation(samples: list[dict]) -> list[list[ConversationItem]]:
     ]
 
 
-def _devices() -> list[str]:
-    """CPU plus every accelerator this build exposes.
+def _accelerator_device() -> torch.device:
+    """The runner's own accelerator, for the device-sensitive cases.
 
-    The sampling and placement tests are device-sensitive: a CPU-only case cannot
-    see a missing host-to-device move or a reduction that only differs on an
-    accelerator, so they run once per available device.
+    Those cases carry ``LaunchSpec(device="accelerator")``, so the CI runs them on
+    an accelerator while the rest of this file stays CPU-launched.
     """
-    devices = ["cpu"]
-    if torch.cuda.is_available():
-        devices.append("cuda")
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        devices.append("npu")
-    return devices
+    device_type = get_device_type()
+    if device_type == "cpu":
+        pytest.skip("requires an accelerator runtime")
+    assert get_torch_device().is_available(), "selected accelerator runtime is unavailable"
+    return torch.device(device_type, get_device_id())
 
 
 def _graph_loss(modules, samples) -> torch.Tensor:
@@ -379,8 +378,7 @@ def test_sampling_stream_resumes_from_its_state():
             torch.testing.assert_close(x, y, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("device", _devices())
-def test_bf16_latents_are_noised_in_fp32(device):
+def _check_bf16_latents_are_noised_in_fp32(device: torch.device) -> None:
     """With the shipped bf16 VAE, noising in bf16 would round sigma (0.999 -> 1.0) away from the timestep."""
     connector = _modules(accelerated=False)["cosmos3_flow_connector"].to(device)
     latents = [sample["latent"].to(device) for sample in _samples()]
@@ -394,10 +392,17 @@ def test_bf16_latents_are_noised_in_fp32(device):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
-# `meta` is not an accelerator, but it is a device that differs from where the cached
-# rows live even on a CPU-only CI, so this test can prove the move happened without one.
-@pytest.mark.parametrize("device", ["cpu", "meta", *[name for name in _devices() if name != "cpu"]])
-def test_embed_latent_places_cached_latents_on_the_module_device(device):
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_bf16_latents_are_noised_in_fp32():
+    _check_bf16_latents_are_noised_in_fp32(torch.device("cpu"))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+def test_bf16_latents_are_noised_in_fp32_on_the_accelerator():
+    _check_bf16_latents_are_noised_in_fp32(_accelerator_device())
+
+
+def _check_latent_placement(device: torch.device) -> None:
     """`seedomni_cached` rows are CPU tensors and nothing upstream moves them (see `batch_to_device`)."""
     connector = _modules(accelerated=True)["cosmos3_flow_connector"].to(device)
     conversation = _conversation(_samples())
@@ -407,6 +412,18 @@ def test_embed_latent_places_cached_latents_on_the_module_device(device):
     assert all(latent.device == connector.device for latent in latents)
     # dtype untouched: `sample_flow` owns the fp32 promotion.
     assert all(latent.dtype == original.dtype for latent, original in zip(latents, cached))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_embed_latent_places_cached_latents_on_the_module_device():
+    # `cpu` cannot tell a missing move from a no-op, so this case uses `meta`: still a
+    # device the cached rows are not on, and available to a CPU-only runner.
+    _check_latent_placement(torch.device("meta"))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+def test_embed_latent_places_cached_latents_on_the_accelerator():
+    _check_latent_placement(_accelerator_device())
 
 
 def test_connector_refuses_lora_adapters():

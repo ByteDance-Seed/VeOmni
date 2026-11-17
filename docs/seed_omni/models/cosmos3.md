@@ -151,7 +151,10 @@ The cache holds each sample's prompt after CFG dropout. Whether a row is dropped
 depends only on `cfg_dropout_seed`, its clip path and its prompt, so stage 1
 drops the same prompts an online run with the same seed would, and so does a
 resumed run. The same rows are dropped in every epoch; the recipes train one. The VAE frame settings decide what is in the cache,
-which is why `modules_offline_embedding.yaml` repeats them.
+which is why `modules_offline_embedding.yaml` repeats them. A cache written
+before the kept-frame rate change stores the old rate, and stage 2 does not
+re-read it; re-embed it into a new directory (the writer refuses to overwrite
+existing shards) and point `offline_training.yaml` at that directory.
 
 The recipes keep `mixed_precision.enable: false`: weights are bf16 end to end,
 like the reference's. The connector noises in fp32 (the bf16 VAE latents are
