@@ -57,6 +57,7 @@ from torch import Tensor
 
 
 __all__ = [
+    "SUPPORTED_ACTIVATIONS",
     "apply_activation",
     "apply_activation_backward",
     "normalize_activation",
@@ -65,17 +66,48 @@ __all__ = [
 ]
 
 
-#: ``ACT2FN`` entries this module will not evaluate, with the reason. Everything
-#: else in ``ACT2FN`` is served as-is, so a transformers release that adds an
-#: activation needs no change here -- only a genuinely incompatible one does.
-_DISALLOWED: dict[str, str] = {
-    "prelu": "carries a learnable `num_parameters` slope, so an inline instance would train "
-    "a different function from the model's own",
-    "xielu": "carries learnable `alpha_p` / `alpha_n` parameters, same problem as `prelu`",
-    "mish": "`F.mish` has a fused ATen backward whose bf16 rounding differs from any decomposed "
-    "derivative -- 1.56e-2 absolute on ~25% of elements -- so a row here would train gradients "
-    "the model's own `act_fn` never produces",
-}
+#: Activations the gated-MLP rows evaluate, as a config spells them.
+#:
+#: An explicit list, not a derivation from ``ACT2FN``. An earlier revision did
+#: derive the set, and the review that asked for it made a fair point: a
+#: hand-maintained list drifts from the library it mirrors. That concern does not
+#: apply to a list whose purpose is to *restrict*. Deriving means every name
+#: transformers ships becomes a capability this repository claims, and every
+#: ``ACT2FN`` entry is a function some model might be configured with -- including
+#: ones whose backward cannot be reproduced here (``mish``; see below).
+#:
+#: The set is bounded by what the repository actually runs. Scanning all 36 toy
+#: models, ``hidden_act`` / ``hidden_activation`` take exactly two values: ``silu``
+#: and ``gelu_pytorch_tanh``. The latter only appears on Gemma3 and on vision
+#: towers, and neither reaches an ``activation=`` call -- Gemma3 binds the ``geglu``
+#: variant, whose rows take no such argument and are fixed to GELU-tanh, and the
+#: vision towers bind no ``swiglu_mlp`` at all. So on the ``standard`` variant the
+#: only activation any model passes today is ``silu``.
+#:
+#: What is kept beyond that, and why:
+#:
+#: * ``swish`` -- HF's own alias (``ACT2FN["swish"] is ACT2FN["silu"]``), used in
+#:   the repository's own configs; refusing it would reject a value that is
+#:   bit-for-bit the row's default.
+#: * ``gelu`` -- the exact-erf form, the most likely hand-edited value.
+#: * ``gelu_pytorch_tanh`` / ``gelu_new`` -- two *different* implementations
+#:   (``torch.pow(x, 3.0)`` versus ``x * x * x``), which is the distinction that
+#:   produced a real bug earlier in this review. Keeping both keeps that pinned.
+#:
+#: Everything else -- ``gelu_10``, ``gelu_accurate``, ``gelu_fast``,
+#: ``gelu_python``, ``gelu_python_tanh``, ``hardswish``, ``laplace``,
+#: ``leaky_relu``, ``linear``, ``quick_gelu``, ``relu``, ``relu2``, ``relu6``,
+#: ``sigmoid``, ``sqrtsoftplus``, ``tanh`` -- would be an unexercised capability.
+#: A model configured with one takes its projection fallback, which calls the
+#: model's own ``act_fn`` and is exact for any activation; a *quantizing* row
+#: refuses rather than fall back (see ``use_fused_row``).
+SUPPORTED_ACTIVATIONS: tuple[str, ...] = (
+    "silu",
+    "swish",
+    "gelu",
+    "gelu_new",
+    "gelu_pytorch_tanh",
+)
 
 
 @lru_cache(maxsize=None)
@@ -105,15 +137,11 @@ def _resolver(name: str):
 
 
 def supported_activations() -> frozenset[str]:
-    """Every config-level activation name this module can evaluate.
+    """Every config-level activation name the gated-MLP rows evaluate.
 
-    Derived from ``ACT2FN`` so the set tracks the installed transformers rather
-    than a list that drifts from it. ``swish`` is added explicitly because HF
-    aliases it to ``silu`` and the alias has not always been present.
+    See :data:`SUPPORTED_ACTIVATIONS` for why this is an explicit list.
     """
-    from transformers.activations import ACT2FN
-
-    return (frozenset(ACT2FN) - frozenset(_DISALLOWED)) | {"swish"}
+    return frozenset(SUPPORTED_ACTIVATIONS)
 
 
 def supports(activation: str) -> bool:
@@ -125,26 +153,21 @@ def normalize_activation(activation: str) -> str:
     """Return the canonical spelling of *activation*.
 
     Raises:
-        ValueError: if the name is not in ``ACT2FN``, or is one of the entries
-            ``_DISALLOWED`` rejects. Refusing is the point: the caller has a config
-            asking for a function the row cannot compute, and substituting SiLU
-            would train a different model than the one described.
+        ValueError: if the name is outside :data:`SUPPORTED_ACTIVATIONS`. Refusing
+            is the point: the caller has a config asking for a function the row does
+            not claim to compute, and substituting SiLU would train a different
+            model than the one described. The caller's projection fallback handles
+            it exactly, for any activation.
     """
     name = activation.value if hasattr(activation, "value") else activation
     if name == "swish":
         name = "silu"
-    if name in _DISALLOWED:
+    if name not in supported_activations():
         raise ValueError(
-            f"Activation {name!r} cannot run through a gated-MLP row: it {_DISALLOWED[name]}. "
-            f"Leave the model on its `eager` projection fallback, which calls the model's own "
-            f"`act_fn` module."
-        )
-    if _resolver(name) is None:
-        raise ValueError(
-            f"Unsupported MLP activation {name!r}: it is not in `transformers.activations.ACT2FN`. "
-            f"The rows evaluate {len(supported_activations())} names from that table, excluding "
-            f"{sorted(_DISALLOWED)}. Select a row that evaluates this activation, or leave the "
-            f"model on its `eager` projection fallback."
+            f"Unsupported MLP activation {name!r}. The gated-MLP rows evaluate "
+            f"{sorted(supported_activations())}. Any other activation takes the model's own "
+            f"`eager` projection fallback, which calls its `act_fn` and is exact; a quantizing "
+            f"row will refuse instead."
         )
     return name
 
@@ -162,17 +185,19 @@ def apply_activation(hidden: Tensor, activation: str) -> Tensor:
 def apply_activation_backward(grad_output: Tensor, hidden: Tensor, activation: str) -> Tensor:
     """Return ``grad_output * activation'(hidden)``.
 
-    Autograd computes the derivative rather than this module restating it. Callers
-    are inside a custom ``autograd.Function``, but they are not inside a graph
-    that would be re-entered: ``hidden`` is a saved tensor, and this runs once per
-    backward. Restating three derivative formulas was where a missing ``up``
-    factor survived a bit-exact forward.
+    The derivative comes from transformers' own implementation rather than a formula
+    restated here, because the forms are not interchangeable: ``gelu_new`` stages
+    ``torch.pow(x, 3.0)`` and no closed form reproduces its autograd chain in bf16
+    (measured 1.56e-2). ``torch.func.vjp`` reaches that decomposition without the two
+    things that make a plain ``autograd.grad`` uncompilable under ``fullgraph=True``:
+    re-enabling grad and flipping a tensor's ``requires_grad``.
+
+    SiLU keeps its ATen spelling -- the fused rows and HF's autograd both use it, and
+    it is already compilable.
     """
     name = normalize_activation(activation)
     if name == "silu":
         return torch.ops.aten.silu_backward(grad_output, hidden)
-    with torch.enable_grad():
-        leaf = hidden.detach().requires_grad_(True)
-        value = _resolver(name)(leaf)
-        (grad,) = torch.autograd.grad(value, leaf, grad_output)
+    _, vjp = torch.func.vjp(_resolver(name), hidden)
+    (grad,) = vjp(grad_output)
     return grad

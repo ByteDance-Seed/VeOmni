@@ -716,29 +716,33 @@ def test_liger_kernels_refuses_an_activation_it_cannot_compute():
         liger_kernel.forward(x, x.T, empty, x.T, empty, x.T, empty, activation="gelu")
 
 
-def test_the_disallowed_activations_are_refused_with_a_reason():
-    """Three names are excluded, each for a measured reason rather than an assumed one.
+def test_the_supported_set_is_the_bounded_whitelist():
+    """Five names, chosen for what the repository runs plus the ones worth pinning.
 
-    `prelu` / `xielu` carry learnable parameters, so an inline instance would train a
-    different function from the model's own. `mish` has a fused ATen backward whose
-    bf16 rounding differs from any decomposed derivative (1.56e-2 absolute on ~25%
-    of elements), so a row here would train gradients the model's own `act_fn` never
-    produces.
+    The set is explicit rather than derived from ``ACT2FN`` on purpose: deriving
+    means every activation transformers ships becomes a capability claimed here,
+    including ones whose backward cannot be reproduced (``mish``). See
+    ``veomni/ops/activation.py`` for the reasoning.
 
-    `laplace` and `gelu_10` are **served**: `LaplaceActivation` acts elementwise, and
-    `ACT2FN["gelu_10"]` supplies its bounds at construction so its `forward` takes one
-    tensor. The set is asserted rather than left to drift with a transformers upgrade.
+    Everything outside it takes the model's projection fallback, which calls its own
+    ``act_fn`` and is exact -- so this test also pins that the *fallback* is what a
+    narrower set buys, not a loss of correctness.
     """
-    from veomni.ops.activation import _DISALLOWED, normalize_activation, supports
+    from veomni.ops.activation import SUPPORTED_ACTIVATIONS, normalize_activation, supports
 
-    assert set(_DISALLOWED) == {"prelu", "xielu", "mish"}
-    for name in _DISALLOWED:
+    assert set(SUPPORTED_ACTIVATIONS) == {"silu", "swish", "gelu", "gelu_new", "gelu_pytorch_tanh"}
+
+    for name in SUPPORTED_ACTIVATIONS:
+        assert supports(name)
+        assert normalize_activation(name)
+
+    # Names transformers has but this repository does not claim to run through a row.
+    for name in ("relu", "mish", "laplace", "gelu_10", "quick_gelu", "sigmoid"):
         assert not supports(name)
-        with pytest.raises(ValueError, match="cannot run through a gated-MLP row"):
+        with pytest.raises(ValueError, match="Unsupported MLP activation"):
             normalize_activation(name)
 
 
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_a_linear_subclass_projection_skips_the_fused_path():
     """Only an exact ``nn.Linear`` may be read by weight; a subclass runs its own forward.
 
@@ -768,3 +772,34 @@ def test_a_linear_subclass_projection_skips_the_fused_path():
     mlp.veomni_swiglu_mlp = _QatHandle()
     with pytest.raises(ValueError, match="nn.Linear subclass"):
         has_plain_linear_projections(mlp)
+
+
+@pytest.mark.parametrize("activation", ["gelu", "gelu_pytorch_tanh", "gelu_new"])
+def test_the_activation_backward_compiles_fullgraph(activation):
+    """A compiled forward must not regress relative to the projection fallback.
+
+    The first version of this backward rebuilt the derivative with
+    ``hidden.detach().requires_grad_(True)`` and ``torch.autograd.grad``, which
+    Dynamo rejects under ``fullgraph=True``:
+
+        Unsupported: Unsupported Tensor.requires_grad_() call
+
+    A ``gelu`` model compiled and trained through its projection fallback before
+    this work, so failing to compile afterwards would be a regression for exactly
+    the models the change exists to serve. ``torch.func.vjp`` reaches the same
+    derivative without touching the grad flag.
+    """
+    import torch
+
+    from veomni.ops.activation import apply_activation_backward
+
+    grad = torch.randn(4, 8)
+    hidden = torch.randn(4, 8)
+
+    def step(g, x):
+        return apply_activation_backward(g, x, activation)
+
+    expected = step(grad, hidden)
+    actual = torch.compile(step, fullgraph=True, backend="eager")(grad, hidden)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

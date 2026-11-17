@@ -140,22 +140,27 @@ Only quantizing rows are affected — every reference row keeps its fallback.
 
 The gated-MLP rows take the activation as an argument, so a model's `hidden_act`
 decides what its MLP computes whether or not the row quantizes. `veomni/ops/activation.py`
-serves every name in `transformers.activations.ACT2FN` except four, delegating to
-transformers' own implementation of each -- `gelu_new` and `gelu_pytorch_tanh` are
-*different* functions whose bf16 intermediates round differently, so they are not
-normalized onto one formula. SiLU keeps its ATen spelling so the quantizing row
-reuses `eager`'s gradient bit for bit.
+serves a fixed set of five, delegating to transformers' own implementation of each.
+`gelu_new` and `gelu_pytorch_tanh` are *different* functions whose bf16 intermediates
+round differently, so they are not normalized onto one formula. SiLU keeps its ATen
+spelling so the quantizing row reuses `eager`'s gradient bit for bit.
 
-Three names are excluded, each for a measured reason rather than an assumed one:
-
-| Name | Why not |
+| Name | Why it is in the set |
 | --- | --- |
-| `prelu`, `xielu` | carry learnable parameters, so an inline instance would train a different function from the model's own |
-| `mish` | `F.mish` has a fused ATen backward whose bf16 rounding differs from any decomposed derivative (1.56e-2 absolute on ~25% of elements), so a row here would train gradients the model's own `act_fn` never produces |
+| `silu`, `swish` | what every model in the repository actually passes today; `swish` is HF's own alias for `silu` |
+| `gelu` | the exact-erf form, the most likely hand-edited value |
+| `gelu_new`, `gelu_pytorch_tanh` | two different implementations, kept together because conflating them was a real bug earlier in this work |
 
-`laplace` and `gelu_10` are **served**, not excluded: `LaplaceActivation` acts
-elementwise, and `ACT2FN["gelu_10"]` supplies its bounds at construction so its
-`forward` takes one tensor.
+The set is explicit rather than derived from `ACT2FN`. Deriving means every
+activation transformers ships becomes a capability claimed here, and most of
+`ACT2FN` has no configuration in this repository to exercise it — including `mish`,
+whose fused ATen backward cannot be reproduced by any decomposed derivative
+(1.56e-2 absolute on ~25% of elements in bf16).
+
+Everything outside the set takes the model's projection fallback, which calls the
+model's own `act_fn` and is exact for any activation. A *quantizing* row refuses
+instead, because falling back there would train at full precision under a config
+that claimed otherwise.
 
 Which row runs is decided before the call, by `swiglu_mlp.use_fused_row`, because
 a row's activation support is part of its contract:
