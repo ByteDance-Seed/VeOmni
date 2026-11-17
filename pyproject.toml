@@ -36,8 +36,8 @@ dependencies = [
 [project.optional-dependencies]
 # Hardware extras gpu / npu / npu_aarch64 are mutually exclusive
 # (`[tool.uv].conflicts`). MagiAttention is optional NVIDIA SM100+ and
-# requires gpu: `uv sync --extra gpu --extra magi`. torchao float8 training is
-# optional too: `uv sync --extra gpu --extra float8`.
+# requires gpu: `uv sync --extra gpu --extra magi`. torchao (float8 training and
+# the torchao FP4 QAT rows) is optional too: `uv sync --extra gpu --extra float8`.
 dev = [
   "pre-commit>=4.0.0,<5.0",
   "ruff>=0.7.0,<1.0",
@@ -97,9 +97,10 @@ gpu = [
   "hf_transfer",
 ]
 
-# torchao float8 training (NVIDIA SM89+), opt-in via
-# `mixed_precision.float8.enable`. Kept out of `gpu` so GPU jobs that never
-# enable float8 do not install it; combine with gpu:
+# torchao: float8 training (NVIDIA SM89+, opt-in via
+# `mixed_precision.float8.enable`) and the torchao FP4 QAT op rows
+# (`torchao_nvfp4`). Kept out of `gpu` so GPU jobs that use neither do not
+# install it, and because it breaks peft 0.18.1's torchao integration; combine with gpu:
 # `uv sync --extra gpu --extra float8 --dev`.
 float8 = [
   "torchao==0.18.0",

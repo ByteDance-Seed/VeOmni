@@ -282,7 +282,5 @@ def wrapper(
     """
     if x.numel() == 0:
         return empty_output(x, down_w)
-    hidden, _, _, _ = mlp_hidden(
-        x, gate_w, gate_b, up_w, up_b, swiglu_limit=swiglu_limit, activation=activation
-    )
+    hidden, _, _, _ = mlp_hidden(x, gate_w, gate_b, up_w, up_b, swiglu_limit=swiglu_limit, activation=activation)
     return linear(hidden, down_w, down_b)

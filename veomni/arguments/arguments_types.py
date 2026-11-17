@@ -937,6 +937,14 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Context parallel size."},
     )
+    skip_sp_gather_between_modules: bool = field(
+        default=False,
+        metadata={
+            "help": "SeedOmni: every module's post_forward hands its sequence-parallel shard "
+            "directly to the next module instead of all-gathering full-sequence tensors onto "
+            "`conversation_list`. Global to the run: per-module overrides are ignored."
+        },
+    )
     init_device: Literal["cuda", "meta", "npu", "mlu"] = field(
         default="meta",
         metadata={
@@ -1279,7 +1287,6 @@ class TrainingArguments:
             )
         },
     )
-
     # sub-argument groups
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
@@ -1573,7 +1580,8 @@ class OpsImplementationConfig:
     swiglu_mlp_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'qat' (FP8 QAT, SM90+) | 'eager'. "
+            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'qat' (FP8 QAT, SM90+) | "
+            "'torchao_nvfp4' (NVFP4 QAT, needs the 'torchao' package) | 'eager'. "
             "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
         },
     )
@@ -1581,7 +1589,8 @@ class OpsImplementationConfig:
         default=None,
         metadata={
             "help": "Dense projection. 'qat' (FP8 fake quantization of both GEMM operands, SM90+) | "
-            "'eager' (PyTorch F.linear). "
+            "'torchao_nvfp4' (NVFP4 fake quantization of both GEMM operands, 'standard' variant only, needs "
+            "the 'torchao' package) | 'eager' (calls the projection module). "
             "Unset: 'eager'. Selected independently of swiglu_mlp_implementation: a model that owns its "
             "own projections reads this field, a model that runs the fused SwiGLU row reads that one."
         },
