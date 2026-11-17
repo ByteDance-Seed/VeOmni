@@ -112,6 +112,14 @@ clip's latent patches (counted on the frames before the resize) and three marker
 tokens. That is the reference packer's count, `prompt + 1 + patches + 2`, so
 `data.max_seq_len: 45056` packs the same way.
 
+Because it counts before the resize, the price can differ from the resized
+tensor's patch count by up to one patch row per axis. That is what the reference
+charges, so a batch packs like `cosmos-framework`; under
+`train.dyn_bsz_count_mode: effective` the same estimate also feeds the
+physical-token cap, so a micro-batch may exceed it by that margin
+(`train.dyn_bsz_physical_overflow_ratio` is the allowance, and 1.5 by default).
+The recipes keep the default `total` mode, which has no such cap.
+
 The frame choice is the DiT port's; the mRoPE rate is the kept frames' rate,
 source fps / stride (the reference's `original_fps / temporal_interval`), which
 this port moved off the source rate. The VAE preprocessor refuses a clip the
@@ -152,8 +160,9 @@ depends only on `cfg_dropout_seed`, its clip path and its prompt, so stage 1
 drops the same prompts an online run with the same seed would, and so does a
 resumed run. The same rows are dropped in every epoch; the recipes train one. The VAE frame settings decide what is in the cache,
 which is why `modules_offline_embedding.yaml` repeats them. A cache written
-before the kept-frame rate change stores the old rate, and stage 2 does not
-re-read it; re-embed it into a new directory (the writer refuses to overwrite
+before the kept-frame rate change stores the old rate, and stage 2 feeds that
+cached rate to the mRoPE as it is: it never recomputes the rate from the clip.
+Re-embed such a cache into a new directory (the writer refuses to overwrite
 existing shards) and point `offline_training.yaml` at that directory.
 
 The recipes keep `mixed_precision.enable: false`: weights are bf16 end to end,
