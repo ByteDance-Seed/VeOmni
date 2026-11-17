@@ -15,10 +15,17 @@ outputs back onto ``conversation_list`` segments.
 loop; only ``forward`` differs between the two). Janus LLaMA keeps its own
 CFG-aware ``generate()`` natively since it needs a second (unconditional)
 cache.
+
+Sequence-parallel shard handoff — an item carrying a rank-local window instead
+of a full span — lives in :mod:`.sp_shard`, which imports the length helpers
+here. This module stays free of SP: it packs whatever the carrier holds, and
+every length it needs comes from :func:`item_token_len` rather than from
+``value.size(0)``, so it keeps working once a value holds a shard.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -27,7 +34,64 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 from veomni.utils.tensor_utils import naflatten
 
-from ...utils.conversation import ConversationItem
+from ...utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
+
+
+def item_value_2d(item: ConversationItem) -> Any:
+    """``item.value`` with a leading batch dim of 1 squeezed off, when it has one."""
+    value = item.value
+    if isinstance(value, torch.Tensor) and value.dim() == 3 and value.size(0) == 1:
+        return value.squeeze(0)
+    return value
+
+
+def item_token_len(item: ConversationItem) -> int:
+    """Return the unsharded sequence-token length of ``item``.
+
+    ``meta[_OMNI_TOKEN_LEN]`` is stamped by the CPU preprocessors at *full* span
+    length and is never sliced, so it is the only trustworthy length once
+    ``item.value`` holds a sequence-parallel shard.
+    """
+    if _OMNI_TOKEN_LEN in item.meta:
+        return int(item.meta[_OMNI_TOKEN_LEN])
+    value = item_value_2d(item)
+    return int(value.size(0)) if isinstance(value, torch.Tensor) else 1
+
+
+def conversation_metadata(
+    conversations: list[list[ConversationItem]],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    """Build ``(position_ids, attention_mask, sample_seqlens)`` from ``meta`` lengths.
+
+    Neither tensor is read off ``item.value``: a value may hold a shard, and these
+    two are always built over the *full* packed row — the SP path pads and slices
+    them itself. Built on the host and moved once, so packing costs no
+    device-to-host sync.
+    """
+    stage_on_cpu = device.type != "cpu"
+    host = torch.device("cpu") if stage_on_cpu else device
+    masks: list[torch.Tensor] = []
+    positions: list[torch.Tensor] = []
+    sample_seqlens: list[int] = []
+    for sample in conversations:
+        sample_length = 0
+        for item in sample:
+            if item.is_dummy:
+                continue
+            length = item_token_len(item)
+            mask = item.meta.get("attention_mask")
+            masks.append(mask.to(host) if mask is not None else torch.ones(length, dtype=torch.long, device=host))
+            sample_length += length
+        if sample_length > 0:
+            sample_seqlens.append(sample_length)
+            positions.append(torch.arange(sample_length, dtype=torch.long, device=host))
+    position_ids = torch.cat(positions, dim=0).unsqueeze(0)
+    attention_mask = torch.cat(masks, dim=0).unsqueeze(0)
+    if stage_on_cpu:
+        position_ids = position_ids.to(device, non_blocking=True)
+        attention_mask = attention_mask.to(device, non_blocking=True)
+    return position_ids, attention_mask, sample_seqlens
 
 
 def pack_llm_conversations_for_forward(
@@ -39,46 +103,17 @@ def pack_llm_conversations_for_forward(
     Returns ``(inputs_embeds, attention_mask, position_ids, inputs_embeds_shape)``
     with batch dim 0 when the packed sample is a single varlen sequence.
     """
-    inputs_embeds_list = []
-    attention_mask = []
-    position_ids = []
-    for sample in conversations:
-        sample_lengths = 0
-        for item in sample:
-            if item.is_dummy:
-                continue
-            embeds = item.value
-            embeds_length = embeds.size(0)
-            # Read, don't consume: packing is not the item's last reader.
-            # scatter_llm_hidden_states writes hidden states back onto these same
-            # items, and any second forward over one conversation (a re-forward,
-            # a reference pass) would otherwise pack it with a fabricated
-            # all-ones mask the second time, silently.
-            chunk_attention_mask = item.meta.get("attention_mask")
-            if chunk_attention_mask is None:
-                chunk_attention_mask = torch.ones(embeds_length, dtype=torch.long, device=device)
-            inputs_embeds_list.append(embeds.to(device))
-            attention_mask.append(chunk_attention_mask.to(device))
-            sample_lengths += embeds_length
-        sample_position_ids = torch.arange(sample_lengths, dtype=torch.long, device=device)
-        position_ids.append(sample_position_ids)
-    inputs_embeds, inputs_embeds_shape = naflatten(inputs_embeds_list)
-    position_ids = torch.cat(position_ids, dim=0)
-    attention_mask = torch.cat(attention_mask, dim=0)
-
+    values = [item_value_2d(item).to(device) for sample in conversations for item in sample if not item.is_dummy]
+    position_ids, attention_mask, _ = conversation_metadata(conversations, device)
+    inputs_embeds, inputs_embeds_shape = naflatten(values)
     if inputs_embeds.dim() == 2:
         inputs_embeds = inputs_embeds.unsqueeze(0)
-    if attention_mask.dim() == 1:
-        attention_mask = attention_mask.unsqueeze(0)
-    if position_ids.dim() == 1:
-        position_ids = position_ids.unsqueeze(0)
-
     return inputs_embeds, attention_mask, position_ids, inputs_embeds_shape
 
 
 def scatter_llm_hidden_states(
     conversation_list: list[list[ConversationItem]],
-    hidden_states_list: list[torch.Tensor],
+    hidden_states_list: Sequence[torch.Tensor],
 ) -> None:
     """Write unflattened backbone hidden states back onto non-dummy conversation segments."""
     hidden_states_list_iter = iter(hidden_states_list)
@@ -194,3 +229,13 @@ class SimpleArGenerationMixin:
             hidden_states = hidden_states.squeeze(0)
             return hidden_states[-1:].contiguous()
         return hidden_states[:, -1:, :].contiguous()
+
+
+__all__ = [
+    "SimpleArGenerationMixin",
+    "conversation_metadata",
+    "item_token_len",
+    "item_value_2d",
+    "pack_llm_conversations_for_forward",
+    "scatter_llm_hidden_states",
+]
