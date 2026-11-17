@@ -49,6 +49,12 @@ from veomni.utils.device import IS_CUDA_AVAILABLE
 from veomni.utils.import_utils import is_package_available
 
 
+#: Nothing in this file launches a worker, so a case that never asks for a GPU
+#: should not be charged one. ``default_plan`` assumes ``accelerator``, so an
+#: unmarked case books a card it would leave idle.
+_cpu = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
 def _empty_bias(weight: Tensor) -> Tensor:
     return weight.new_empty(0)
 
@@ -700,6 +706,7 @@ def test_the_eager_row_backward_matches_autograd_for_every_activation(activation
         torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
 
 
+@_cpu
 def test_liger_kernels_refuses_an_activation_it_cannot_compute():
     """Liger's swiglu kernels are SiLU only, and say so instead of computing SiLU anyway."""
     from veomni.ops.kernels.gated_mlp.standard import liger_kernel
@@ -711,6 +718,7 @@ def test_liger_kernels_refuses_an_activation_it_cannot_compute():
         liger_kernel.forward(x, x.T, empty, x.T, empty, x.T, empty, activation="gelu")
 
 
+@_cpu
 def test_the_supported_set_is_the_bounded_whitelist():
     """Five names, chosen for what the repository runs plus the ones worth pinning.
 
@@ -738,6 +746,7 @@ def test_the_supported_set_is_the_bounded_whitelist():
             normalize_activation(name)
 
 
+@_cpu
 def test_a_linear_subclass_projection_runs_its_own_forward():
     """Only an exact ``nn.Linear`` may be read by weight; a subclass runs its own forward.
 
@@ -774,6 +783,7 @@ def test_a_linear_subclass_projection_runs_its_own_forward():
         render(mlp, impl="torchao_nvfp4", activation="silu")
 
 
+@_cpu
 def test_render_routes_each_row_by_shape_and_activation():
     """Every row decides weights-or-projections the same way, and only that once.
 
@@ -801,6 +811,7 @@ def test_render_routes_each_row_by_shape_and_activation():
         assert render(mlp, impl=impl, activation="mish").projections is not None
 
 
+@_cpu
 @pytest.mark.parametrize("activation", ["relu", "mish", "quick_gelu", "gelu_10"])
 def test_the_eager_row_runs_an_activation_outside_the_whitelist_exactly(activation):
     """The reference row keeps every config that worked before this family existed.
@@ -834,6 +845,7 @@ def test_the_eager_row_runs_an_activation_outside_the_whitelist_exactly(activati
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
+@_cpu
 def test_render_refuses_a_quantizing_row_it_cannot_serve():
     """A quantizing row raises rather than fall back, and says which knob to turn.
 
@@ -939,7 +951,6 @@ def test_the_eager_row_backward_survives_activation_offload(activation):
 
 
 _requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reason="torchao_nvfp4 row needs torchao")
-_cpu = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 @_cpu

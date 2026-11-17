@@ -156,10 +156,11 @@ activation transformers ships becomes a capability claimed here, and most of
 whose fused ATen backward cannot be reproduced by any decomposed derivative
 (1.56e-2 absolute on ~25% of elements in bf16).
 
-Everything outside the set takes the model's projection fallback, which calls the
-model's own `act_fn` and is exact for any activation. A *quantizing* row refuses
-instead, because falling back there would train at full precision under a config
-that claimed otherwise.
+A name outside the set is not an error for the reference row: `eager` runs the
+model's projection modules and calls the block's own `act_fn`, which is the
+expression the model used before this family existed and is exact for any
+activation. A *quantizing* row refuses instead, because falling back there would
+train at full precision under a config that claimed otherwise.
 
 A row takes the **MLP module**, not six weight tensors, so a model's forward is a
 single handle call with no branch. The row decides for itself how to run the block:
@@ -167,13 +168,21 @@ single handle call with no branch. The row decides for itself how to run the blo
 projections are exact `nn.Linear` and the row serves the activation) or the three
 projection modules. A row that has to fall back to the modules runs them through
 their own `forward`, which is the path the model took before this family existed.
-Row support is part of the row's contract:
+Row support is part of the row's contract, and the checks below are about the
+**`standard`** variant. `geglu` is a fixed-function variant: it computes
+`gelu_pytorch_tanh` and takes `activation=` only to recognise when it is the wrong
+row, falling back to the block's `act_fn` for anything else. It registers no
+quantizing row, so the "refuses instead of falling back" rules do not apply to it.
 
-| Row | Activations | When it cannot serve the call |
+| Row (`standard`) | Activations | When it cannot serve the call |
 | --- | --- | --- |
-| `eager`, `qat`, `torchao_nvfp4` | every name `activation.py` evaluates | — |
+| `eager` | the five names, plus anything else through the block's `act_fn` | never — it is the reference |
+| `qat`, `torchao_nvfp4` | the five names | raises, because a fallback would train at full precision |
 | `liger_kernel` | SiLU only (Liger's `swiglu_forward`) | runs the projection modules instead |
-| any row | — | a *quantizing* row raises instead of falling back |
+
+The refusal is a **forward-time** decision, inside `render` — not a config-layer or
+handle-construction check. A handle is built at `__init__`, where the selection is
+still legal; only running the row knows whether it can serve the activation.
 
 `liger_kernel` is the GPU default, so this matters in practice: a `gelu` model on
 GPU would otherwise reach a SiLU-only kernel and fail on its first forward. It is
