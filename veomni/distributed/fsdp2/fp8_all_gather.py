@@ -90,6 +90,14 @@ def register_deepgemm_fp8_all_gather(model: torch.nn.Module) -> int:
     """
     selected = {}
     for name, module in _deepgemm_experts(model):
+        # ``use_gated_mlp`` records whether the activation is SwiGLU
+        # (``config.hidden_act in {"silu", "swish"}``), not whether a family called
+        # ``gated_mlp`` is in use -- the name is historical. The distinction matters
+        # here: every ``moe_experts`` fused row bakes ``aten.silu`` into both its
+        # forward and backward, so another activation makes the experts fall back to
+        # ``merged_experts_act_fn_forward``, a Python loop with no merged 3-D expert
+        # layout for this hook to gather. It is also why the check reads the experts
+        # module rather than a config: only the module records the answer.
         if not getattr(module, "use_gated_mlp", True):
             raise ValueError(f"FP8 all-gather requires the SwiGLU DeepGEMM execution path: {name}.")
         params = list(module.named_parameters(recurse=False))
