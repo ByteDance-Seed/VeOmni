@@ -35,6 +35,7 @@ from veomni.checkpoint.dcp_checkpointer import (
     drop_extra_parallel_dim,
     restore_extra_parallel_dim,
 )
+from veomni.checkpoint.layout import weights_dir
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -128,8 +129,9 @@ def _layout_worker(rank, world, directory, rendezvous):
         # The public model-only load/export paths accept the same independently
         # verified declaration; unknown source and optimizer restore stay closed.
         path = directory + "known_legacy_model_only"
+        weights_path = weights_dir(path)
         bf16_bias = torch.tensor([0.25, -0.5], dtype=torch.bfloat16)
-        dcp.save({"model": {"layer.experts.weight": wrap(1), "layer.bias": bf16_bias}}, checkpoint_id=path)
+        dcp.save({"model": {"layer.experts.weight": wrap(1), "layer.bias": bf16_bias}}, checkpoint_id=weights_path)
         model = torch.nn.Module()
         model.layer = torch.nn.Module()
         model.layer.experts = torch.nn.Module()
@@ -162,10 +164,10 @@ def _layout_worker(rank, world, directory, rendezvous):
             from veomni.checkpoint import ckpt_to_state_dict
 
             with pytest.raises(RuntimeError, match="Cannot determine source expert order"):
-                dcp_to_torch_state_dict(path)
-            exported = dcp_to_torch_state_dict(path, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1")
+                dcp_to_torch_state_dict(weights_path)
+            exported = dcp_to_torch_state_dict(weights_path, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1")
             torch.testing.assert_close(exported["layer.experts.weight"], global_weight, rtol=0, atol=0)
-            exported = ckpt_to_state_dict(path, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1")
+            exported = ckpt_to_state_dict(weights_path, legacy_expert_source_layout="veomni_tp1_ep0_fsdp1")
             torch.testing.assert_close(exported["layer.experts.weight"], global_weight, rtol=0, atol=0)
             torch.testing.assert_close(exported["layer.bias"], bf16_bias, rtol=0, atol=0)
             assert exported["layer.experts.weight"].dtype == torch.float32

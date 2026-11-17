@@ -25,11 +25,24 @@ from torch import Tensor
 from .....distributed.parallel_state import get_parallel_state
 
 
+def _can_rematerialize_expert_weight():
+    """Avoid retaining a cast copy only when no saved-tensor hook is active.
+
+    In particular, activation offload hooks must not copy an FSDP-managed
+    unsharded FP32 parameter as though it were an activation. The hook query is
+    private to PyTorch; unknown versions conservatively keep the original path.
+    """
+    try:
+        return torch._C._autograd._top_saved_tensors_default_hooks(False) is None
+    except Exception:  # noqa: BLE001 - unknown hook APIs must keep the existing path
+        return False
+
+
 class GmmFunction(torch.autograd.Function):
     """NPU grouped matmul with dgrad and wgrad."""
 
     @staticmethod
-    def forward(ctx, x, weight, group_list, fp32_wgrad=False):
+    def forward(ctx, x, weight, group_list, fp32_wgrad=False, rematerialize_weight=False):
         """Grouped matmul ``x @ weight`` per expert."""
         import torch_npu
 
@@ -40,7 +53,8 @@ class GmmFunction(torch.autograd.Function):
         if fp32_wgrad and (weight.dtype != torch.float32 or x.dtype != torch.bfloat16):
             raise ValueError("FP32 expert wgrad requires FP32 expert weight and BF16 activations")
         compute_weight = weight.to(x.dtype) if ctx.fp32_wgrad else weight
-        ctx.save_for_backward(x, compute_weight)
+        ctx.rematerialize_weight = fp32_wgrad and rematerialize_weight and _can_rematerialize_expert_weight()
+        ctx.save_for_backward(x, weight if ctx.rematerialize_weight else compute_weight)
         ctx.group_list = group_list
 
         fwd_output = torch_npu.npu_grouped_matmul(
@@ -56,6 +70,8 @@ class GmmFunction(torch.autograd.Function):
         input_tensor, weight = ctx.saved_tensors
         group_list = ctx.group_list
 
+        if ctx.rematerialize_weight:
+            weight = weight.to(input_tensor.dtype)
         weight = torch.transpose(weight, 1, 2)
         grad_input = torch_npu.npu_grouped_matmul(
             [grad_output], [weight], bias=None, group_list=group_list, split_item=2, group_type=0, group_list_type=1
@@ -74,12 +90,12 @@ class GmmFunction(torch.autograd.Function):
         if ctx.fp32_wgrad and grad_weight.dtype != torch.float32:
             raise RuntimeError("FP32 expert weight-gradient GEMM did not return FP32")
 
-        return (grad_input, grad_weight, None, None)[: len(ctx.needs_input_grad)]
+        return (grad_input, grad_weight, None, None, None)[: len(ctx.needs_input_grad)]
 
 
-def npu_group_gemm(x, weight, group_list, fp32_wgrad=False):
+def npu_group_gemm(x, weight, group_list, fp32_wgrad=False, rematerialize_weight=False):
     """Apply ``GmmFunction`` to ``(x, weight, group_list)``."""
-    output = GmmFunction.apply(x, weight, group_list, fp32_wgrad)
+    output = GmmFunction.apply(x, weight, group_list, fp32_wgrad, rematerialize_weight)
     return output
 
 
@@ -162,7 +178,9 @@ def _npu_fused_moe_forward(
     tokens_per_expert = torch.histc(selected_experts, bins=num_experts, min=0, max=num_experts)
 
     fc1_weight = _fc1_weight(fc1_1_weight, fc1_2_weight, fc1_1_2_weight).transpose(1, 2)
-    intermediate_hidden_states = npu_group_gemm(permuted_hidden_states, fc1_weight, tokens_per_expert, fp32_wgrad)
+    intermediate_hidden_states = npu_group_gemm(
+        permuted_hidden_states, fc1_weight, tokens_per_expert, fp32_wgrad, fc1_1_2_weight is not None
+    )
     intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
     output = npu_group_gemm(intermediate_activations, fc2_weight.transpose(1, 2), tokens_per_expert, fp32_wgrad)
     # NPU unpermute applies routing after fc2. Equivalent for a biasless down
@@ -205,7 +223,7 @@ def npu_ep_fused_moe_forward(
 
     fc1_weight = _fc1_weight(fc1_1_weight, fc1_2_weight, fc1_1_2_weight).transpose(1, 2)
     intermediate_hidden_states = npu_group_gemm(
-        hidden_states, fc1_weight, num_global_sum_tokens_per_local_expert, fp32_wgrad
+        hidden_states, fc1_weight, num_global_sum_tokens_per_local_expert, fp32_wgrad, fc1_1_2_weight is not None
     )
     intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
     hidden_states = npu_group_gemm(
