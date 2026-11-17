@@ -77,10 +77,10 @@ An Ascend NPU driver compatible with the container's CANN version must be instal
 Pull the image from quay.io and run it:
 
 ```bash
-# 910B (A2), multi-arch
+# Atlas A2 training products, multi-arch
 docker pull quay.io/ascend/veomni:v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni
 
-# A3
+# Atlas A3 training products
 docker pull quay.io/ascend/veomni:v0.1.11-cann9.1.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.12-veomni
 ```
 

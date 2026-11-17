@@ -163,7 +163,7 @@ kernel dependencies land differently, and each decides what a test can reach:
 | `fla_npu` | image venv only; the workspace venv does not inherit it | `chunk_gated_delta_rule_implementation=fla_npu`, so that backend is untestable |
 | `flash-linear-attention` | `gpu` extra only, so absent from both | the `fla` backends. Its `HardwareRequirement` lists `npu`, but the GatedDeltaNet docs say it raises on Ascend even when installed — treat `fla` as GPU-only |
 
-The runners are 910B (A2, non-arch35), so kernels gated behind `is_arch35()`
+The runners are Atlas A2 training products (non-arch35), so kernels gated behind `is_arch35()`
 stay unreachable whatever is installed.
 
 Check whether a file is wired — by name, and by the directory it sits in:

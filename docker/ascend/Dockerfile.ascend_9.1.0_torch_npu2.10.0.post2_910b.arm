@@ -52,7 +52,7 @@ RUN pip install "pyarrow==21.0.0" "pandas==2.3.2"
 # ============================================================================
 # GDN / fla_npu (AscendC fused ops) — ported from Dockerfile.ascend_9.0.0_a2.x86.
 # The aarch64 image build is CI-validated, and GDN runtime behavior was validated
-# on physical A2 / 910B hardware. Differences vs x86: pip not uv, runs as root
+# on physical Atlas A2 training products hardware. Differences vs x86: pip not uv, runs as root
 # (so the .run writes the CANN opp dir directly, no sudo), no venv.
 # ============================================================================
 

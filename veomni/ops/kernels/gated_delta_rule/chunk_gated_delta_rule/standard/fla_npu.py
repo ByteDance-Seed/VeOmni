@@ -14,7 +14,7 @@
 
 """standard chunk_gated_delta_rule AscendC pair.
 
-Uses the stable ``fla_npu.ops.ascendc`` GDN forward/backward pair on A3/A5.
+Uses the stable ``fla_npu.ops.ascendc`` GDN forward/backward pair on Atlas A3 training products/Ascend 950PR&950DT products.
 The library selects arch22/arch35; this adapter uses their common BF16,
 K=V=128, chunk_size=64 contract. Forward can use the Phase6 fused kernel;
 backward is a composite ACLNN executor, not a single fused kernel.
@@ -263,7 +263,7 @@ def _get_gdn_ops():
 
 
 def _validate_gdn_contract(q: Tensor, k: Tensor, v: Tensor, chunk_size: int, initial_state: Tensor | None):
-    """Reject inputs outside the common A3/A5 complete forward/backward domain."""
+    """Reject inputs outside the common Atlas A3 training products/Ascend 950PR&950DT products complete forward/backward domain."""
     if any(x.dtype != torch.bfloat16 for x in (q, k, v)):
         raise ValueError("fla_npu GDN on A3/A5 requires bfloat16 q/k/v.")
     if any(x.shape[-1] != 128 for x in (q, k, v)) or chunk_size != 64:

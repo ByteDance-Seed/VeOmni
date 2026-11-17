@@ -160,7 +160,7 @@ for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,
 and `triton-ascend` on a mutually compatible release set.
 
 > **arch35:** the old `causal_conv1d` guard that raised `NotImplementedError` on
-> `Ascend910_95` / `Ascend950` has been removed. On 2026-10-31, forward/backward
+> Ascend 950PR&950DT products has been removed. On 2026-10-31, forward/backward
 > parity passed on Ascend 950PR&950DT products with CANN 9.2.0.B080, torch 2.10.0+cpu,
 > torch_npu 2.10.0.post4 and triton-ascend 3.2.2. Cases cover 256/640 channels
 > and both ordinary sequences and packed boundaries at 61/128 tokens. This is
@@ -188,7 +188,7 @@ model:
 (`ascend910b`), Atlas A3 training products (`ascend910_93`) and Ascend 950PR&950DT products / arch35 (`ascend950`) targets; the library picks the
 arch22 or arch35 kernel path from the SoC, and this adapter uses the BF16 K=V=128,
 chunk_size=64 contract both paths share. The vendored `causal_conv1d` no longer rejects
-arch35 (`Ascend910_95` / `Ascend950`); the operator validation scope is recorded above.
+arch35 (Ascend 950PR&950DT products); the operator validation scope is recorded above.
 
 These instance-local GDN selectors also apply to Qwen4-Exp. Keep the model's
 configured output-gate activation: selecting AscendC does not change sigmoid
@@ -216,7 +216,7 @@ your CANN and Python versions, and `FLA_NPU_SOC` must match the chip — Atlas A
 Atlas A3 training products → `ascend910_93`, Ascend 950PR&950DT products → `ascend950`.
 
 ```bash
-# CANN first: A2/A3 need >= 8.5.2, A5 needs >= 9.0.0. Re-source it in every new shell.
+# CANN first: Atlas A2 training products/Atlas A3 training products need >= 8.5.2, Ascend 950PR&950DT products needs >= 9.0.0. Re-source it in every new shell.
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 git clone https://github.com/flashserve/flash-linear-attention-npu

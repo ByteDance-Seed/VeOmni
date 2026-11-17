@@ -30,7 +30,7 @@ NODE_RANK=${NODE_RANK:=0}
 MASTER_ADDR=${MASTER_ADDR:=192.168.1.100}
 # Master node port (default works for most cases)
 MASTER_PORT=${MASTER_PORT:=12345}
-# Number of NPUs per node (A2: max 8, A3: max 16)
+# Number of NPUs per node (Atlas A2 training products: max 8, Atlas A3 training products: max 16)
 NPROC_PER_NODE=${NPROC_PER_NODE:=8}
 ```
 

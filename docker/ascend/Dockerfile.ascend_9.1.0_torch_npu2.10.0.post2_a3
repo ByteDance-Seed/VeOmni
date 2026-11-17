@@ -63,9 +63,9 @@ RUN pip install "pyarrow==21.0.0" "pandas==2.3.2"
 
 # ============================================================================
 # GDN / fla_npu (AscendC fused ops) — ported from Dockerfile.ascend_9.0.0_a2.x86.
-# The aarch64 A3 image build is CI-validated, and GDN runtime behavior was validated
-# on physical A3 hardware. Differences vs x86: pip not uv, runs as root (.run writes
-# the CANN opp dir directly, no sudo), no venv, and the A3 SOC target below.
+# The aarch64 Atlas A3 training products image build is CI-validated, and GDN runtime behavior was validated
+# on physical Atlas A3 training products hardware. Differences vs x86: pip not uv, runs as root (.run writes
+# the CANN opp dir directly, no sudo), no venv, and the Atlas A3 training products SOC target below.
 # ============================================================================
 
 # fla_npu's check_npu_env maps torch 2.10.0 -> torch_npu 2.10.0.post2 (npu_aarch64
@@ -89,7 +89,7 @@ RUN (pip uninstall -y triton triton-ascend || true) && \
     python -c "from triton._C.libtriton import ascend"
 
 # ONE RUN so the CANN env from set_env.sh persists. The ascend910_93 SOC target was
-# validated by building and running GDN on physical A3 hardware (x86/Atlas A2 training products uses ascend910b).
+# validated by building and running GDN on physical Atlas A3 training products hardware (x86/Atlas A2 training products uses ascend910b).
 # torch binding wheel is force-reinstalled with --no-deps (else pip pulls a CUDA torch).
 RUN git clone https://github.com/flashserve/flash-linear-attention-npu /tmp/fla-npu && \
     cd /tmp/fla-npu && git checkout c2e3d83f && \
