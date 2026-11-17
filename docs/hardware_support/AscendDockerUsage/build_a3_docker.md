@@ -44,12 +44,6 @@ docker build \
   .
 ```
 
-The existing [A3 builder](../../../.github/workflows/docker-build-ascend-a3.yml)
-selects these CANN 9.2.1 Dockerfiles. Its `main` builds publish
-`quay.io/ascend/veomni:veomni-9.2.1-a3-ubuntu22.04-py3.12-latest`.
-A3 builds ARM64 only.
-The local image tags in the commands below are independent of published tags.
-
 ### Image Components
 The built image includes:
 - Ubuntu 22.04 with Python 3.12

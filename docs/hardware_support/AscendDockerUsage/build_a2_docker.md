@@ -3,9 +3,9 @@
 ## Overview
 This guide provides step-by-step instructions for building and using the Ascend A2 Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Ascend A2 accelerators.
 
-**Note**: Ascend A2 supports both x86 and ARM64 architectures, with system Python as the runtime on both architectures:
-- **x86 Architecture**: System Python; Triton 3.2.0 / Triton-Ascend 3.2.2
-- **ARM64 Architecture**: System Python; Triton 3.5.0 / Triton-Ascend 3.2.2
+**Note**: Ascend A2 supports both x86 and ARM64 architectures, with different environment management approaches for each:
+- **x86 Architecture**: Uses `uv` for dependency management, requires virtual environment activation
+- **ARM64 Architecture**: Uses `pip` for dependency management, no virtual environment required
 
 ## Prerequisites
 - Docker installed on your system
@@ -83,12 +83,6 @@ docker build \
   -f docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.arm \
   .
 ```
-
-The existing [A2 builder](../../../.github/workflows/docker-build-ascend-a2.yml)
-selects these CANN 9.2.1 Dockerfiles. Its `main` builds publish
-`quay.io/ascend/veomni:veomni-9.2.1-910b-ubuntu22.04-py3.12-latest`.
-A2 combines native x86 and ARM builds into one multi-architecture tag.
-The local image tags in the commands below are independent of published tags.
 
 ### Image Components
 The built image includes:
