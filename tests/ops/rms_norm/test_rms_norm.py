@@ -494,7 +494,9 @@ def test_liger_grouped_delegates_to_eager(variant: str):
     assert torch.equal(w_e.grad, w_o.grad)
 
 
-@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Frozen-weight fused RMSNorm requires NPU")
+@pytest.mark.skipif(
+    not (IS_NPU_AVAILABLE and torch.npu.is_available()), reason="Frozen-weight fused RMSNorm requires a visible NPU"
+)
 @pytest.mark.parametrize("variant", ["standard", "offset"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("strided_grad", [False, True], ids=["contiguous-grad", "strided-grad"])

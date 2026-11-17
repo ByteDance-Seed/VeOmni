@@ -39,7 +39,7 @@ import torch
 import torch.nn.functional as F
 
 from veomni.models.configuration_base import as_veomni_config
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, empty_cache, get_device_type
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, empty_cache, get_device_type, get_torch_device
 
 
 # Same env-var contract as the existing logits-equality test: keep GPU
@@ -64,7 +64,7 @@ IGNORE_INDEX = -100
 def _release():
     """Collect unreachable objects and release cached CUDA/NPU allocations."""
     gc.collect()
-    if IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE:
+    if (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and get_torch_device().is_available():
         empty_cache()
 
 
@@ -179,7 +179,7 @@ def _build_model(toy_path: str, ce_impl: str = "chunk_loss"):
 
 def _require_accelerator(toy_path: str):
     """Skip unsupported hosts, then require model assets on CUDA/NPU hosts."""
-    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
+    if not ((IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and get_torch_device().is_available()):
         pytest.skip("A CUDA or NPU device is required for these integration tests")
     assert os.path.isdir(toy_path), f"Path not found: {toy_path}"
 

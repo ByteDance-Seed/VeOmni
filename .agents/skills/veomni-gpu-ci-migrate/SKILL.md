@@ -239,7 +239,7 @@ unresolved cause instead of continuing speculative edits. Continue independent r
    A workflow edit alone proves none of those execution outcomes.
 
 Required accelerator selections must fail when hardware preflight fails.
-Freeze a non-empty set of expected required parameterized node IDs from the original scope and
+Freeze a non-empty set of expected node IDs for all required cases (including parameter IDs where applicable) from the original scope and
 collection evidence, with explicit mappings for renamed cases. Require an
 executable CI gate to match each required ID against JUnit/results and reject
 missing, deselected, skipped, failed or errored cases even when other cases pass.
@@ -316,3 +316,12 @@ remaining scope is visible. Maintainer approval, PR publication and merge are
 separate outcomes requiring their own evidence.
 
 Device portability validation: run `python tests/special_sanity/check_device_api_usage.py -d tests` after generating or adapting tests. Use the existing device availability flags and helpers instead of hard-coded accelerator strings where equivalent; do not broaden the checker whitelist merely to hide a portable-test violation.
+
+The device API checker skips `tests/ops/` and does not search for NPU literals.
+Separately review every changed test, including skipped paths, for hard-coded
+accelerator strings and APIs; distinguish justified backend-specific guards from
+non-portable tensor placement. A passing checker alone does not establish portability.
+For NPU test guards, package registration (`IS_NPU_AVAILABLE`) is not device
+visibility: also check `get_torch_device().is_available()` for the selected backend
+(or `torch.npu.is_available()` for an NPU-only case) before allocations, while
+retaining unsupported-host skips and required-CI hardware preflight.

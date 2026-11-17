@@ -189,7 +189,7 @@ coverage, matching the largest launch in that step, bounded execution and JUnit
 artifacts. Do not copy private Python/CANN paths or device IDs into public CI.
 
 For a required real-device selection, fail preflight when its backend or device
-count is unavailable. Establish a non-empty set of expected required parameterized node IDs
+count is unavailable. Establish a non-empty set of expected node IDs for all required cases (including parameter IDs where applicable)
 from the approved matrix and collection evidence before execution; do not derive
 the required set from only the results that happened to pass. Make the CI gate
 compare that set against JUnit/results using an explicit node-ID mapping. Fail
@@ -266,3 +266,12 @@ maintainer approval, PR publication or merge.
 execution and CI-selection evidence, and remaining limitations are explicit.
 
 Device portability validation: run `python tests/special_sanity/check_device_api_usage.py -d tests` after generating or adapting tests. Use the existing device availability flags and helpers instead of hard-coded accelerator strings where equivalent; do not broaden the checker whitelist merely to hide a portable-test violation.
+
+The device API checker skips `tests/ops/` and does not search for NPU literals.
+Separately review every changed test, including skipped paths, for hard-coded
+accelerator strings and APIs; distinguish justified backend-specific guards from
+non-portable tensor placement. A passing checker alone does not establish portability.
+For NPU test guards, package registration (`IS_NPU_AVAILABLE`) is not device
+visibility: also check `get_torch_device().is_available()` for the selected backend
+(or `torch.npu.is_available()` for an NPU-only case) before allocations, while
+retaining unsupported-host skips and required-CI hardware preflight.
