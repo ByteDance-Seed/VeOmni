@@ -11,7 +11,6 @@
 
 """Module-agnostic whole-item DP scheduling and differentiable reverse routing."""
 
-import math
 import operator
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -135,52 +134,28 @@ class ModuleDataBalancer:
     ) -> tuple[dict[str, torch.Tensor], BalancePlan]:
         size = 1 if self.group is None else dist.get_world_size(self.group)
         rank = 0 if self.group is None else dist.get_rank(self.group)
-        names, schema, outputs = (), (), ()
-        lengths = {}
-        error = None
-        try:
-            names = tuple(sorted(tensors))
-            if not names or set(names) != set(input_lengths):
-                raise ValueError("Tensor fields and input-length fields must match and be nonempty.")
-            if any(not isinstance(tensors[name], torch.Tensor) or tensors[name].ndim == 0 for name in names):
-                raise ValueError("Packed tensor fields need a leading item dimension.")
-            # operator.index rejects fractional splits that int() would silently truncate.
-            lengths = {name: tuple(operator.index(n) for n in input_lengths[name]) for name in names}
-            outputs = tuple(operator.index(n) for n in output_lengths)
-            # Backward collectives must participate on every rank, including
-            # empty owners. Reject rank-asymmetric autograd before routing.
-            schema = tuple(
-                (name, tuple(tensors[name].shape[1:]), str(tensors[name].dtype), tensors[name].requires_grad)
-                for name in names
-            )
-            for name in names:
-                if len(lengths[name]) != len(outputs) or any(n < 0 for n in lengths[name]):
-                    raise ValueError("Every tensor field needs one nonnegative split per item.")
-                if sum(lengths[name]) != tensors[name].shape[0]:
-                    raise ValueError("Packed tensor size does not match item splits.")
-            if any(n < 0 for n in outputs):
-                raise ValueError("Output splits must be nonnegative.")
-            if costs is None:
-                costs = self.cost_fn(lengths) if self.cost_fn else [n * n for n in outputs]
-            costs = tuple(float(c) for c in costs)
-            if len(costs) != len(outputs) or any(not math.isfinite(c) or c < 0 for c in costs):
-                raise ValueError("Expected one finite nonnegative cost per item.")
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            costs = ()
-        local = (schema, lengths, outputs, costs, error)
-        # Only small host metadata uses object collectives; tensor payloads never
-        # use pickle. Validation errors are shared before any payload exchange.
+        names = tuple(sorted(tensors))
+        # operator.index rejects fractional splits that int() would silently truncate.
+        lengths = {name: tuple(operator.index(n) for n in input_lengths[name]) for name in names}
+        outputs = tuple(operator.index(n) for n in output_lengths)
+        for name in names:
+            if len(lengths[name]) != len(outputs) or sum(lengths[name]) != tensors[name].shape[0]:
+                raise ValueError("Packed tensor size does not match item splits.")
+        if costs is None:
+            costs = self.cost_fn(lengths) if self.cost_fn else [n * n for n in outputs]
+        costs = tuple(float(c) for c in costs)
+        if len(costs) != len(outputs):
+            raise ValueError("Expected one cost per item.")
+        local = (lengths, outputs, costs)
+        # Only small host metadata uses object collectives; tensor payloads never use pickle.
         gathered = [local]
         if size > 1:
             gathered = [None] * size
             dist.all_gather_object(gathered, local, group=self.group)
-        if any(meta[4] is not None for meta in gathered) or any(meta[0] != schema for meta in gathered):
-            raise ValueError(f"DP balancer metadata/schema mismatch: {[m[4] for m in gathered]}")
         items = tuple(
-            BalanceItem(owner, index, tuple(meta[1][name][index] for name in names), output, meta[3][index])
+            BalanceItem(owner, index, tuple(meta[0][name][index] for name in names), output, meta[2][index])
             for owner, meta in enumerate(gathered)
-            for index, output in enumerate(meta[2])
+            for index, output in enumerate(meta[1])
         )
         assignment = greedy_cost_assignment([item.cost for item in items], size)
         buckets = tuple(
