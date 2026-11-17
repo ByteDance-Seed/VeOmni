@@ -2294,12 +2294,7 @@ class DistributedCheckpointer(CheckpointerBase):
             state, parallel_state, group=process_group, trainable_only=trainable_only
         )
 
-        row_counts, error = {}, None
-        try:
-            row_counts = _checkpoint_rows_by_name(state["model"])
-        except Exception as exc:
-            error = exc
-        raise_if_any_rank_failed(error, "preparing checkpoint row metadata for load", group=process_group)
+        row_counts = {}
 
         def _model_state() -> "ModelState":
             """Build the model load target using its padded runtime shapes."""
@@ -2336,10 +2331,16 @@ class DistributedCheckpointer(CheckpointerBase):
         # checkpoint carrying only rank-local metadata is therefore not
         # something this framework produces.
         error: Optional[Exception] = None
+        try:
+            row_counts = _checkpoint_rows_by_name(state["model"])
+        except Exception as exc:
+            error = exc
         for directory, wanted in (
             (weights_dir(path, module), True),
             (optimizer_dir(path, module), wants_optimizer),
         ):
+            if error is not None:
+                break
             if not wanted:
                 continue
             marker = os.path.join(directory, DCP_MARKER_FILENAME)
