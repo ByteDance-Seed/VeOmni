@@ -125,3 +125,57 @@ def _restore_worker(rank, root, failure, dpo):
 @pytest.mark.parametrize("failure", ["exhausted", "not_mapping", "missing_step"])
 def test_rank_local_loader_restore_failure_is_coordinated(tmp_path, failure, dpo):
     mp.spawn(_restore_worker, args=(str(tmp_path), failure, dpo), nprocs=2, join=True)
+
+
+def _offline_missing_cursor_worker(rank, root):
+    dist.init_process_group(
+        "gloo", init_method=f"file://{root}/offline-init", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    try:
+        class Loader:
+            def load_state_dict(self, state):
+                raise AssertionError("no loader may restore an incomplete checkpoint")
+
+        class Writer:
+            def validate_state_dict(self, state):
+                pass
+
+            def load_state_dict(self, state):
+                raise AssertionError("no writer may restore an incomplete checkpoint")
+
+        checkpoint = SimpleNamespace(
+            save_steps=0, save_epochs=0, save_hf_weights=False, hf_save_steps=0, hf_save_epochs=0, load_path=str(root)
+        )
+        trainer = SimpleNamespace(
+            args=SimpleNamespace(
+                train=SimpleNamespace(global_rank=rank, checkpoint=checkpoint, training_task="offline_embedding"),
+                train_steps=10,
+            ),
+            model=SimpleNamespace(optimizer=None, checkpoint=None),
+            state=SimpleNamespace(global_step=0),
+            train_dataloader=Loader(),
+            channel_loss_callback=None,
+            offline_cache_writer=Writer(),
+            environ_meter=None,
+        )
+        with patch("veomni.trainer.callbacks.base.get_parallel_state", return_value=SimpleNamespace()):
+            callback = GlobalStateCallback(trainer)
+        callback._read_current = lambda _: {
+            "global_step": 3,
+            "offline_cache_writer": {"shard_index": 1},
+            **({"train_dataloader": {"cursor": 3}} if rank else {}),
+        }
+        before_rng = torch.get_rng_state().clone()
+        with pytest.raises((RuntimeError, ValueError), match="validating the training data cursor|dataloader cursor"):
+            callback.load_global_state()
+        assert trainer.state.global_step == 0
+        assert torch.equal(before_rng, torch.get_rng_state())
+        alive = torch.ones(1)
+        dist.all_reduce(alive)
+        assert alive.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+def test_offline_missing_cursor_is_rejected_on_all_ranks(tmp_path):
+    mp.spawn(_offline_missing_cursor_worker, args=(str(tmp_path),), nprocs=2, join=True)
