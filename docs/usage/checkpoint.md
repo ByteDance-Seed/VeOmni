@@ -210,7 +210,9 @@ trusted deterministic implementation on resume. The recipe is an attestation,
 not a sandbox or a proof about arbitrary Python code. Unregistered schedulers
 and checkpoints carrying only the older callable-hash identity require a
 verified migration or a new weights-only run. Scheduler step, optimizer group
-identity and checkpoint generation remain checked independently.
+identity and checkpoint generation remain checked independently. See the
+[scheduler extension contract](checkpoint_scheduler_recipes.md) for registration,
+versioning, and a complete example.
 
 Unrecognized instance-level `state_dict` replacements on optimizer leaves are
 rejected: a wrapper could otherwise renumber parameter IDs after capture and
