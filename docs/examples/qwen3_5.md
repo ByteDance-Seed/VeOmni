@@ -159,18 +159,20 @@ See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend
 for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,
 and `triton-ascend` on a mutually compatible release set.
 
-> **arch35 limitation:** the vendored `causal_conv1d` refuses to run on arch35 NPUs
-> (`Ascend910_95` / `Ascend950`) — its `is_arch35()` guard raises `NotImplementedError`
-> rather than mis-computing. Validated on `Ascend910B2C`. arch35 support would need to come
-> from upstream MindSpeed-MM.
+> **arch35:** the old `causal_conv1d` guard that raised `NotImplementedError` on
+> `Ascend910_95` / `Ascend950` has been removed. On 2026-10-31, forward/backward
+> parity passed on Ascend950DT_9582 with CANN 9.2.0.B080, torch 2.10.0+cpu,
+> torch_npu 2.10.0.post4 and triton-ascend 3.2.2. Cases cover 256/640 channels
+> and both ordinary sequences and packed boundaries at 61/128 tokens. This is
+> operator validation; it does not claim full-model training coverage.
 
 ### `fla_npu` — AscendC fused backend (`chunk_gated_delta_rule` only)
 
 `fla_npu` is a second NPU backend for `chunk_gated_delta_rule` that delegates the heavy GDN
 compute to the external [`fla_npu`](https://github.com/flashserve/flash-linear-attention-npu)
-package (registered as `torch.ops.npu.*` fused ops); only the Triton glue stays vendored under
-`veomni/ops/kernels/gated_delta_rule/vendor/triton_core`. It coexists with `triton` (pure vendored
-Triton-Ascend), which remains the fallback.
+operator library, driven through its stable Python entry `fla_npu.ops.ascendc`; only the Triton
+glue stays vendored under `veomni/ops/kernels/gated_delta_rule/vendor/triton_core`. It coexists
+with `triton` (pure vendored Triton-Ascend), which remains the fallback.
 Set only `chunk_gated_delta_rule` to `fla_npu`; keep `rms_norm_gated` on `torch_npu` and
 `causal_conv1d` on `triton`:
 
@@ -182,47 +184,97 @@ model:
     chunk_gated_delta_rule_implementation: fla_npu
 ```
 
-`fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It supports Ascend
-910B (A2) / 910_93 (A3), both non-arch35 chips where the `solve_tril` step runs the vendored
-Triton kernel (the arch35 native path is gated behind `is_arch35()`). arch35 (`Ascend910_95` /
-`Ascend950`) is not supported end-to-end: the vendored `causal_conv1d` raises there (see above).
+`fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It covers the A2
+(`ascend910b`), A3 (`ascend910_93`) and A5 / arch35 (`ascend950`) targets; the library picks the
+arch22 or arch35 kernel path from the SoC, and this adapter uses the BF16 K=V=128,
+chunk_size=64 contract both paths share. The vendored `causal_conv1d` no longer rejects
+arch35 (`Ascend910_95` / `Ascend950`); the operator validation scope is recorded above.
 
 These instance-local GDN selectors also apply to Qwen4-Exp. Keep the model's
 configured output-gate activation: selecting AscendC does not change sigmoid
-to SiLU. On Ascend910B, the v26.6.0 `RecomputeWUFwd` kernel accepts value-head
-widths 128 or 256; a 64-wide toy input fails native tiling before it exercises
-the GDN math. The NPU parity test uses a supported 128-wide AscendC input and
-checks both ordinary sequences and packed samples whose boundaries are not
-multiples of the recurrent chunk size. The vendored convolution also selects
-a smaller channel tile for head shards such as Qwen4-Exp U8CP2's 640 channels,
-preserving the existing 32-channel alignment and UB budget.
+to SiLU. The NPU parity test covers ordinary sequences and packed samples with
+boundaries that are not multiples of the recurrent chunk size. The vendored
+convolution also selects a smaller channel tile for head shards such as
+Qwen4-Exp U8CP2's 640 channels, preserving the existing 32-channel alignment
+and UB budget.
 
-The prebuilt NPU images on [quay.io](https://quay.io/repository/ascend/veomni?tab=tags) already
-bundle `fla_npu`:
+The following prebuilt NPU images on [quay.io](https://quay.io/repository/ascend/veomni?tab=tags)
+bundle the legacy `fla_npu` build from `c2e3d83f`, which does not provide the GDN API required
+by this adapter:
 
 - A2: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A2-ubuntu22.04-py3.11-veomni-latest`
 - A3: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A3-ubuntu22.04-py3.11-veomni-latest`
 
-To build on a bare host instead, install from the
-[`flash-linear-attention-npu`](https://github.com/flashserve/flash-linear-attention-npu) sources:
+Before selecting the `fla_npu` backend in either image, replace its legacy package using the
+`a7c608f` wheel installation steps below. Follow the same steps on a bare host or an A5
+system, selecting the matching SoC target. A compatible A5 image is not listed here.
+
+Build and install the `a7c608f` wheel from the
+[`flash-linear-attention-npu`](https://github.com/flashserve/flash-linear-attention-npu) sources.
+The library does not install `torch`, `torch_npu` or `triton-ascend` for you; those must match
+your CANN and Python versions, and `FLA_NPU_SOC` must match the chip — A2 → `ascend910b`,
+A3 → `ascend910_93`, A5 → `ascend950`.
 
 ```bash
+# CANN first: A2/A3 need >= 8.5.2, A5 needs >= 9.0.0. Re-source it in every new shell.
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
 git clone https://github.com/flashserve/flash-linear-attention-npu
 cd flash-linear-attention-npu
-git checkout c2e3d83f
+git checkout a7c608f2e3f828779ceeec1fcf155a6e37ede83c
 
-source /usr/local/Ascend/cann/set_env.sh          # source your actual CANN path
+# Build dependencies of the operator library only.
+python -m pip install -r requirements.txt
+python scripts/check_npu_env.py           # add --build-only on a host without an NPU
 
-# --soc must match the chip: {ascend910b, ascend910_93, ascend950}
-bash build.sh --soc=ascend910b --pkg --vendor_name=fla_npu
-bash build_out/fla-npu_*.run
-cd torch_custom/fla_npu/ && bash build.sh
+FLA_NPU_SOC=ascend910b python scripts/build_wheel.py
+python -m pip install --force-reinstall --no-cache-dir --no-deps dist/*.whl
 
-pip list | grep fla_npu   # verify it is installed
+# Verify the wheel registered its AscendC ops.
+python -c "import fla_npu; print('ok')"
+python -c "from fla_npu.ops import ascendc; assert all(callable(getattr(ascendc, n, None)) for n in ('chunk_gated_delta_rule_fwd', 'chunk_gated_delta_rule_bwd')), 'Missing required fla_npu GDN API'"
+python scripts/check_packaged_wheel_api.py
 ```
 
-If the `fla_npu` package is missing when `chunk_gated_delta_rule_implementation: fla_npu` is selected, the backend raises an actionable error when
-the model constructs its `VeomniOp` handle (pointing back to the install step or to `triton` / `eager`).
+`--no-deps` is required: without it pip re-resolves `torch` and can replace the Ascend
+`torch_npu` stack with a CUDA build. The wheel embeds the AscendC operators, so no run package
+(`build.sh --pkg`), no install into `$ASCEND_OPP_PATH/vendors` and no separate
+`torch_custom/fla_npu` build are needed any more.
+
+**Compatibility change:** migrating to the stable complete forward/backward API
+removes the legacy adapter's wider-value training domain, including V=256 on
+A2/A3. Some individual operators and forward-only paths in the library accept
+wider values or chunk sizes, but its composite backward explicitly requires
+K=V=128 and chunk_size=64. VeOmni intentionally exposes the complete pair's
+common domain, rather than allowing a forward that fails during backward.
+Use the `triton` backend for wider supported head dimensions, or `eager` when
+the fused backend cannot represent the requested configuration.
+
+| Target | Q/K/V dtype | K / V | Chunk size | Initial state |
+| --- | --- | --- | --- | --- |
+| A2 / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
+| A3 / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
+| A5 / arch35 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
+
+A returned FP32 final state can be passed to the next inference call without a
+lossy conversion. State gradients remain unsupported. Q/K normalization uses
+the vendored Triton L2Norm forward/backward pair with FP32 reciprocal norms,
+so `triton-ascend` remains a real dependency even with the AscendC GDN backend.
+Packed calls reuse host boundary/chunk tables instead of uploading unused
+legacy metadata on every layer.
+
+The adapter fixes `disable_recompute=True` to obtain the cumulative gates and
+A matrix consumed by the stable backward API. It does not expose a second
+retain/recompute policy or the legacy `fla_npu_reuse` implementation from
+#1346. Any future policy option needs matching library support and independent
+correctness and memory/performance validation.
+
+The `fla_npu` backend requires manual installation and validation; it is not
+covered by the repository's GDN tests or NPU CI.
+
+If the `fla_npu` package is missing when `chunk_gated_delta_rule_implementation: fla_npu` is
+selected, the backend raises an actionable error when the model constructs its `VeomniOp` handle
+(pointing back to the install step or to `triton` / `eager`).
 
 The native convolution qualification uses independent FP64 segment references
 computed from the exact BF16-rounded inputs and upstream gradient. Using separate

@@ -120,13 +120,13 @@ def _resolve_hf_checkpoint_view(model_runtime: OmniModelRuntimeArguments) -> str
 
 def _check_hf_source_exportable(model_path: str) -> None:
     """Fail at startup, not at the first HF save, when the source cannot be written back."""
-    from ..models.seed_omni.utils.hf_layout import read_hf_source, source_tensor_specs, source_weight_files
+    from ..models.seed_omni.utils.hf_layout import read_hf_source, source_tensor_specs
 
     source = read_hf_source(model_path)
     if source is None:
         return
     try:
-        weight_files = source_weight_files(source.path)
+        weight_files = source.layout.source_weight_files(source.path)
     except FileNotFoundError as e:
         raise ValueError(
             f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights: {e} "
@@ -290,7 +290,10 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         generation_graphs=generation_graphs,
         train_type=train_type,
         infer_type=infer_type,
-        generation_kwargs=dict(args.infer.generation_kwargs),
+        generation_kwargs={
+            **(omni_cfg.generation_kwargs or {} if omni_cfg is not None else {}),
+            **args.infer.generation_kwargs,
+        },
     )
 
 
