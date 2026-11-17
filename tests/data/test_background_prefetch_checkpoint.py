@@ -146,6 +146,95 @@ def test_unstateful_dataloader_still_iterates():
     try:
         assert prefetcher.state_dict() == {}
         assert list(prefetcher) == [1, 2, 3]
+        with pytest.raises(StopIteration):
+            next(prefetcher)
+    finally:
+        prefetcher.stop()
+
+
+def test_tuple_batch_and_worker_error_keep_the_last_consumed_state():
+    class Loader:
+        def __init__(self):
+            self.cursor = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.cursor:
+                raise ValueError("worker failure")
+            self.cursor += 1
+            return ("batch", 3)
+
+        def state_dict(self):
+            return {"cursor": self.cursor}
+
+    prefetcher = BackgroundPrefetcher(Loader())
+    try:
+        assert next(prefetcher) == ("batch", 3)
+        with pytest.raises(ValueError, match="worker failure"):
+            next(prefetcher)
+        assert prefetcher.state_dict() == {"cursor": 1}
+    finally:
+        prefetcher.stop()
+
+
+def test_exhaustion_preserves_last_state():
+    class Loader:
+        def __init__(self):
+            self.cursor = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.cursor:
+                raise StopIteration
+            self.cursor += 1
+            return ("batch", 3)
+
+        def state_dict(self):
+            return {"cursor": self.cursor}
+
+    prefetcher = BackgroundPrefetcher(Loader())
+    try:
+        assert next(prefetcher) == ("batch", 3)
+        for _ in range(2):
+            with pytest.raises(StopIteration):
+                next(prefetcher)
+            assert prefetcher.state_dict() == {"cursor": 1}
+    finally:
+        prefetcher.stop()
+
+
+def test_exception_data_item_does_not_drop_later_batches():
+    class Loader:
+        def __init__(self):
+            self.cursor = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            values = [1, ValueError("data item"), 2]
+            if self.cursor == len(values):
+                raise StopIteration
+            item = values[self.cursor]
+            self.cursor += 1
+            return item
+
+        def state_dict(self):
+            return {"cursor": self.cursor}
+
+    prefetcher = BackgroundPrefetcher(Loader())
+    try:
+        assert next(prefetcher) == 1
+        with pytest.raises(ValueError, match="data item"):
+            next(prefetcher)
+        assert next(prefetcher) == 2
+        with pytest.raises(StopIteration):
+            next(prefetcher)
+        assert prefetcher.state_dict() == {"cursor": 3}
     finally:
         prefetcher.stop()
 

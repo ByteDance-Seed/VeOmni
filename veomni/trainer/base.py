@@ -121,6 +121,7 @@ class BackgroundPrefetcher:
         self.original_state_dict = getattr(dataloader, "state_dict", None)
         self.current_state = None
         self._state_error = None
+        self._exhausted = False
         self.thread = threading.Thread(target=self._worker)
         self.thread.daemon = True
         self.thread.start()
@@ -132,7 +133,7 @@ class BackgroundPrefetcher:
                 try:
                     item = next(self.iterator)
                 except StopIteration:
-                    self.queue.put((StopIteration, None))
+                    self.queue.put((StopIteration, None, None))
                     break
 
                 # Subsequent advances must not mutate a consumed batch's cursor.
@@ -151,29 +152,24 @@ class BackgroundPrefetcher:
                         state_error = exc
                 self.queue.put((item, state, state_error))
         except Exception as e:
-            self.queue.put((e, None))
+            self.queue.put((e, None, None))
 
     def __iter__(self):
         return self
 
     def __next__(self):
         """Return a prefetched batch and publish only that batch's cursor."""
-        res = self.queue.get()
-        if isinstance(res, tuple) and len(res) in (2, 3):
-            item, state = res[:2]
-            if item is StopIteration:
-                raise StopIteration
-            if isinstance(item, Exception):
-                raise item
-            self.current_state = state
-            self._state_error = res[2] if len(res) == 3 else None
-            return item
-        else:
-            if res is StopIteration:
-                raise StopIteration
-            if isinstance(res, Exception):
-                raise res
-            return res
+        if self._exhausted:
+            raise StopIteration
+        item, state, state_error = self.queue.get()
+        if item is StopIteration:
+            self._exhausted = True
+            raise StopIteration
+        if isinstance(item, Exception):
+            raise item
+        self.current_state = state
+        self._state_error = state_error
+        return item
 
     def state_dict(self):
         """Return the last consumed cursor or reject an unsafe checkpoint."""
