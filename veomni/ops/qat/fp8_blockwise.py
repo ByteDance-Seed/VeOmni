@@ -84,15 +84,15 @@ def act_quant(
 
 
 def fp8_weight_quant(
-    weight: torch.Tensor,
+    x: torch.Tensor,
     block_size: int = 128,
     scale_fmt: str | None = None,
     scale_dtype: torch.dtype = torch.float32,
     dequant: bool = False,
 ):
-    weight = _local_operand(weight)
-    backend = _check_operand(weight, scale_fmt, "weight")
-    return _weight_quant_impl(weight, block_size, scale_fmt, scale_dtype, dequant=dequant, backend=backend)
+    x = _local_operand(x)
+    backend = _check_operand(x, scale_fmt, "weight")
+    return _weight_quant_impl(x, block_size, scale_fmt, scale_dtype, dequant=dequant, backend=backend)
 
 
 def _local_operand(tensor: torch.Tensor) -> torch.Tensor:

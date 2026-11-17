@@ -78,6 +78,18 @@ def test_linear_qat_rows_require_triton_on_supported_gpus():
     }
 
 
+def test_linear_qat_rows_reject_unsupported_rocm_architecture(monkeypatch):
+    monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.ops.platform.gpu.torch.version.hip", "6.0", raising=False)
+    monkeypatch.setattr("veomni.ops.platform.gpu.get_rocm_gcn_arch", lambda: "gfx90a")
+    entry = next(row for row in OP_REGISTRY.list_entries("linear", "standard") if row.impl == "qat")
+
+    assert not entry.requirement.matches()
+
+    monkeypatch.setattr("veomni.ops.platform.gpu.get_rocm_gcn_arch", lambda: "gfx942")
+    assert entry.requirement.matches()
+
+
 def test_a_wrapped_projection_falls_back_to_its_own_forward():
     """A wrapped projection keeps its base layer at ``base_layer`` and owns no ``weight``."""
     from torch import nn
