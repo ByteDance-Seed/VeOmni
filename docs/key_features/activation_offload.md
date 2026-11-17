@@ -101,7 +101,7 @@ All fields below are under `model.accelerator.offload_config`.
 | --- | --- | --- |
 | `enable_activation` | `false` | Enable synchronous offload. |
 | `activation_gpu_limit` | `0.0` | Synchronous retained-activation threshold, in units of 1,024³ bytes. Use a non-negative value; this field is not validated. A negative value bypasses retention for eligible tensors (the small-tensor and weight-view exclusions still apply). Does not tune async mode. |
-| `enable_async_activation` | `false` | Enable asynchronous offload; cannot be combined with `enable_activation`. |
+| `enable_async_activation` | `false` | Enable asynchronous offload for CUDA/NPU tensors only; MLU tensors are not offloaded. Cannot be combined with `enable_activation`. |
 | `activation_offload_modules` | `[]` | Async module paths. Empty means discover module classes from `model._no_split_modules`. Missing metadata or no matches raises an error. |
 | `activation_offload_host_cache_limit_gb` | `4.0` | Async idle host-buffer cache cap per pool, in units of 1,024³ bytes. Must be finite and non-negative and fit the implementation's byte conversion bound. Zero disables reuse. |
 
@@ -315,6 +315,10 @@ activations to be available on GPU.
 
 ### Limitations
 
+- **CUDA/NPU only:** Async offload selects tensors on the active CUDA or NPU device.
+  On MLU, module wrapping can succeed and log `Applying activation offload to module`,
+  but the pack hook leaves tensors on the device. That log does not establish that
+  activations moved to host or that device memory use decreased.
 - **Gradient checkpointing is recommended:** Set
   `model.accelerator.gradient_checkpointing.enable=True` to recompute intermediate activations.
   Without it, async offload still works but intermediates remain on the accelerator,

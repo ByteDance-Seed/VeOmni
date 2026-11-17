@@ -54,7 +54,8 @@ a sampled step successfully records:
 In general, let `S_c` be source c's loss sum, `N_c` its valid token count, and
 `N = sum_c N_c` the total successfully recorded count. These metrics are
 `S_c / N_c`, `S_c / N` and `N_c`, respectively. A source with zero valid tokens
-omits these three CE-related metrics. If sample metadata was recorded, it can
+omits these three CE-related metrics. If the loss hook recorded that source's
+totals and sample statistics, it can
 still emit `samples/<source>`, `input_tokens/<source>` and
 `label_tokens_per_sample/<source>` (supervised tokens divided by samples). These
 help diagnose sources that provide input samples but no supervision.
@@ -70,6 +71,14 @@ different normalization. Skipped metadata can also make observation incomplete.
 **all observed micro-batches in that step**, not the preceding ten steps. An
 optimizer step may accumulate gradients over multiple micro-batches, so their
 source totals must be combined before computing the means.
+
+Observation requires the model to call its wrapped `loss_function` during forward;
+returning logits alone does not trigger it. If no loss-hook results are recorded
+across the step, the callback returns before building either CE or sample/token
+metadata metrics. Metadata alone therefore does not provide a fallback report.
+This differs from a recorded source with zero valid supervised tokens, described
+above. Installation warns if no loss hook can be installed; a successfully wrapped
+`loss_function` that is never called does not trigger that installation warning.
 
 Observation uses detached tensors: these extra calculations do not contribute
 gradients and do not rewrite the original objective. If the model provides logits
@@ -119,7 +128,15 @@ possible numerical/CE failure into an exception. Inspect warnings as well.
 
 ## Usage and metadata example
 
-Merge this **configuration fragment** into a working causal-LM text or VLM recipe:
+Merge this **configuration fragment** into a working multisource causal-LM text
+or VLM recipe that supplies `ds_idx`. Do not use it with RL recipes based on
+`BaseRLTrainer`: they reject Channel Loss during callback construction, before
+training starts.
+
+Single-source datasets do not automatically attach `ds_idx`. For those recipes,
+set `source_id_keys` to an ID key already carried by the samples and preserved
+through collation, or add that metadata first. With `strict: true`, missing source
+IDs raise an error on both sampled and unsampled steps.
 
 ```yaml
 train:
@@ -140,6 +157,11 @@ samples. Custom pipelines must preserve equivalent metadata through transforms
 and collation. An ID identifies a source; an optional name labels it. The ordered
 ID/name lists must align with the original sequences packed into the batch,
 not with every token and not just with the number of packed tensor rows.
+
+`TextDPOTrainer` is an exception: supply one source ID (and optional source name)
+per preference pair. The trainer repeats each entry for the chosen and rejected
+segments via `source_repeat=2`; do not supply already duplicated entries for those
+two sequences, or strict alignment validation can fail.
 
 For example, this is an **illustrative packed batch**, not a standalone model
 forward (token IDs, dtype/device and other model-specific inputs are omitted):
