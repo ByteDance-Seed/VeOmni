@@ -110,6 +110,64 @@ def test_fp32_wgrad_keeps_bf16_forward_and_input_gradient(fake_npu):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("saved_hooks", [False, True])
+def test_fp32_weight_rematerialization_preserves_gradients_and_hook_fallback(fake_npu, saved_hooks):
+    from contextlib import nullcontext
+
+    x, master, dy = _cpu_inputs()
+    reference = []
+    for rematerialize in (False, True):
+        inp, param = x.clone().requires_grad_(True), master.clone().requires_grad_(True)
+        hooks = (
+            torch.autograd.graph.saved_tensors_hooks(lambda t: t.clone(), lambda t: t)
+            if saved_hooks
+            else nullcontext()
+        )
+        with hooks:
+            output = GmmFunction.apply(inp, param, [6, 7], True, rematerialize)
+        saved_dtype = output.grad_fn.saved_tensors[1].dtype
+        assert saved_dtype == (torch.float32 if rematerialize and not saved_hooks else torch.bfloat16)
+        output.backward(dy)
+        reference.append((output.detach(), inp.grad, param.grad))
+    for expected, actual in zip(*reference, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_fp32_weight_rematerialization_falls_back_if_hook_query_fails(fake_npu, monkeypatch):
+    def fail(_):
+        raise RuntimeError("unsupported hook query")
+
+    monkeypatch.setattr(torch._C._autograd, "_top_saved_tensors_default_hooks", fail)
+    x, master, dy = _cpu_inputs()
+    param = master.requires_grad_(True)
+    output = GmmFunction.apply(x, param, [6, 7], True, True)
+    assert output.grad_fn.saved_tensors[1].dtype == torch.bfloat16
+    output.backward(dy)
+    assert torch.equal(param.grad, _reference(x, dy, [6, 7]))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("reentrant", [False, True])
+def test_fp32_weight_rematerialization_with_transposed_weight_and_checkpoint(fake_npu, reentrant):
+    x, master, dy = _cpu_inputs()
+    results = []
+    for rematerialize in (False, True):
+        inp = x.clone().requires_grad_(True)
+        param = master.transpose(1, 2).contiguous().requires_grad_(True)
+        output = torch.utils.checkpoint.checkpoint(
+            lambda a, b, remat=rematerialize: GmmFunction.apply(a, b.transpose(1, 2), [6, 7], True, remat),
+            inp,
+            param,
+            use_reentrant=reentrant,
+        )
+        output.backward(dy)
+        results.append((output.detach(), inp.grad, param.grad))
+    for expected, actual in zip(*results, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_bf16_default_and_cast_before_autograd_preserve_legacy_rounding(fake_npu):
     x, master, dy = _cpu_inputs()
     counts = [6, 7]
@@ -151,7 +209,8 @@ def test_bad_compute_or_master_dtype_is_rejected(fake_npu):
         GmmFunction.apply(x, master.bfloat16(), [6, 7], True)
 
 
-def test_native_npu_fp32_wgrad_matches_cpu_reference():
+@pytest.mark.parametrize("rematerialize", [False, True])
+def test_native_npu_fp32_wgrad_matches_cpu_reference(rematerialize):
     if not IS_NPU_AVAILABLE:
         if os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1":
             pytest.fail("VEOMNI_REQUIRE_NPU_TESTS=1 requires a native NPU")
@@ -162,12 +221,20 @@ def test_native_npu_fp32_wgrad_matches_cpu_reference():
     torch.manual_seed(20261029)
     counts = [13, 0, 17]
     x = torch.randn(30, 256, dtype=torch.bfloat16, device="npu", requires_grad=True)
-    weight = torch.randn(3, 256, 32, dtype=torch.float32, device="npu", requires_grad=True)
+    weight = torch.randn(3, 32, 256, dtype=torch.float32, device="npu", requires_grad=True).transpose(1, 2)
+    weight.retain_grad()
     dy = torch.randn(30, 32, dtype=torch.bfloat16, device="npu")
     groups = torch.tensor(counts, dtype=torch.int64, device="npu")
-    output = GmmFunction.apply(x, weight, groups, True)
+    baseline_x = x.detach().clone().requires_grad_(True)
+    baseline_weight = weight.detach().clone().requires_grad_(True)
+    baseline_output = GmmFunction.apply(baseline_x, baseline_weight, groups, True, False)
+    baseline_output.backward(dy)
+    output = GmmFunction.apply(x, weight, groups, True, rematerialize)
     output.backward(dy)
     torch.npu.synchronize()
+    torch.testing.assert_close(output, baseline_output, rtol=0, atol=0)
+    torch.testing.assert_close(x.grad, baseline_x.grad, rtol=0, atol=0)
+    torch.testing.assert_close(weight.grad, baseline_weight.grad, rtol=0, atol=0)
     expected = _reference(x.detach().cpu(), dy.cpu(), counts)
     assert weight.grad.dtype == torch.float32
     torch.testing.assert_close(weight.grad.cpu(), expected, atol=1e-5, rtol=1e-5)
