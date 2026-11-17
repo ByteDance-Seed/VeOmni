@@ -19,6 +19,7 @@ from types import ModuleType
 
 import pytest
 import torch
+from torch.distributed.tensor import Shard
 
 import veomni.ops.qat as qat
 from tests.ops.qat.reference import reference_act_quant, reference_fp4_act_quant, reference_fp8_weight_quant
@@ -167,6 +168,21 @@ def test_fp8_weight_quant_preserves_x_keyword(reference_quantizers):
     actual = qat.fp8_weight_quant(x=weight, dequant=True)
 
     torch.testing.assert_close(actual, reference_fp8_weight_quant(weight, dequant=True))
+
+
+def test_fp8_weight_quant_rejects_sharded_dtensor_before_reading_local_weight(monkeypatch):
+    class ShardedWeight:
+        placements = (Shard(0),)
+
+        def to_local(self):
+            raise AssertionError("the sharded local weight must not be read")
+
+    monkeypatch.setattr(fp8_blockwise, "DTensor", ShardedWeight)
+    weight = ShardedWeight()
+
+    for quantize in (qat.fp8_weight_quant, fp8_fake_quant_weight):
+        with pytest.raises(ValueError, match="FSDP unshard hook"):
+            quantize(weight)
 
 
 def _fake_quant(kind, tensor):
