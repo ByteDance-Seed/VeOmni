@@ -14,7 +14,7 @@ Two tag schemes coexist on quay.io:
 > triton-ascend and fla_npu GDN stack. General-purpose Dockerfiles remain
 > available for the legacy tags.
 
-## CANN 9.2.1: pending Quay publication
+## CANN 9.2.1
 
 | Tag | Dockerfile | Content |
 |---|---|---|
