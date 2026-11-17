@@ -38,6 +38,12 @@ _JANUS_SYSTEM_PROMPT = (
 )
 _JANUS_USER_PREFIX = "<|User|>: "
 _JANUS_ASSISTANT_PREFIX = "\n\n<|Assistant|>:"
+# Upstream's Jinja emits a space after ``<|Assistant|>:`` only when a response
+# follows: ``...{%if not (loop.last and not add_generation_prompt and
+# message['content'][0]['text']=='')%} {%endif%}``. A bare generation prompt
+# ends at the colon. The tokenizer is byte-level and adds no spacing of its own,
+# so the two spellings are different tokens and the distinction has to be kept.
+_JANUS_ASSISTANT_TEXT_SEPARATOR = " "
 
 
 @dataclass(frozen=True)
@@ -51,6 +57,7 @@ class JanusChatMarkers:
     system_prompt: str = _JANUS_SYSTEM_PROMPT
     user_prefix: str = _JANUS_USER_PREFIX
     assistant_prefix: str = _JANUS_ASSISTANT_PREFIX
+    assistant_text_separator: str = _JANUS_ASSISTANT_TEXT_SEPARATOR
 
 
 class JanusChatTemplate(TextEncoderChatTemplate):
@@ -125,7 +132,9 @@ class JanusChatTemplate(TextEncoderChatTemplate):
                     out.append(
                         self._build_conversation_item(
                             type="text",
-                            value=self.chat_markers.assistant_prefix,
+                            # Upstream separates the marker from the response with a
+                            # space; the bare marker is only for a generation prompt.
+                            value=self.chat_markers.assistant_prefix + self.chat_markers.assistant_text_separator,
                             role="assistant",
                             loss_mask=0,
                         )

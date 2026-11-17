@@ -337,3 +337,76 @@ def test_generate_refuses_sequence_parallelism(monkeypatch):
     monkeypatch.setattr("veomni.models.seed_omni.modules.janus.llama.modeling.get_parallel_state", lambda: _SpState())
     with pytest.raises(ValueError, match="Ulysses sequence parallelism"):
         llm.generate([ConversationItem(type="text", value="hi", role="user")])
+
+
+def test_the_template_matches_the_upstream_jinja_byte_for_byte():
+    """The rendered wire format has to match the saved Jinja template.
+
+    Janus' tokenizer is byte-level, so it adds no spacing of its own: a missing
+    space after ``<|Assistant|>:`` is a different first supervised token, not a
+    cosmetic difference. Upstream emits that space only when a response follows —
+    ``{%if not (loop.last and not add_generation_prompt and ... == '')%} {%endif%}``
+    — and ends a bare generation prompt at the colon.
+    """
+    import jinja2
+
+    from veomni.models.seed_omni.modules.janus.convert_janus_weight_to_hf import CHAT_TEMPLATE
+    from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import JanusChatTemplate
+    from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY
+
+    class _Tokenizer:
+        bos_token = "<s>"
+        eos_token = "</s>"
+        boi_token = "<boi>"
+        eoi_token = "<eoi>"
+        bos_token_id = 1
+        eos_token_id = 2
+        boi_token_id = 3
+        eoi_token_id = 4
+        pad_token_id = 0
+
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [ord(c) for c in text]}
+
+    template = JanusChatTemplate(_Tokenizer())
+
+    def ours(items):
+        return template.render_template_string(template.apply_chat_template(items))
+
+    def upstream(messages, *, generation=False):
+        return jinja2.Template(CHAT_TEMPLATE).render(messages=messages, add_generation_prompt=generation)
+
+    # The assistant marker is followed by a space when a response follows.
+    text_only = [
+        ConversationItem(type="text", value="hi", role="user"),
+        ConversationItem(type="text", value="Hello", role="assistant"),
+    ]
+    assert "<|Assistant|>: Hello" in ours(text_only)
+    assert "<|Assistant|>: Hello" in upstream(
+        [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
+        ]
+    )
+
+    # ... but a generation prompt ends at the colon.
+    prompt = template.apply_generation_prompt(
+        template.apply_chat_template([ConversationItem(type="text", value="hi", role="user")])
+    )
+    assert template.render_template_string(prompt).endswith("<|Assistant|>:")
+    assert upstream([{"role": "user", "content": [{"type": "text", "text": "hi"}]}], generation=True).endswith(
+        "<|Assistant|>:"
+    )
+
+    # A generated-image turn keeps the same separator before ``<boi>``.
+    t2i = [
+        ConversationItem(type="text", value="a cat", role="user"),
+        ConversationItem(type="image", value=None, role="assistant", meta={_IMG_TAG_KEY: "gen"}),
+    ]
+    assert "<|Assistant|>: <boi>" in ours(t2i)
+    assert "<|Assistant|>: " in upstream(
+        [
+            {"role": "user", "content": [{"type": "text", "text": "a cat"}]},
+            {"role": "assistant", "content": [{"type": "image"}]},
+        ]
+    )
