@@ -48,7 +48,15 @@ def all_reduce(
         raise RuntimeError("Distributed environment is not initialized.")
 
     if not isinstance(data, torch.Tensor):
-        data = torch.tensor(data, dtype=torch.float, device=get_device_type())
+        # An integer reduction (a count, a length) goes as int64: HCCL's MAX/MIN support
+        # for float32 is not universal, and `int(all_reduce(n, op="max"))` above asks for
+        # exactly that.
+        dtype = (
+            torch.int64
+            if isinstance(data, int) or (isinstance(data, list) and all(isinstance(v, int) for v in data))
+            else torch.float
+        )
+        data = torch.tensor(data, dtype=dtype, device=get_device_type())
 
     reduce_ops = {
         "mean": dist.ReduceOp.SUM,
