@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import json
 import math
 import weakref
 from typing import TYPE_CHECKING, Dict, Literal
@@ -28,12 +29,48 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 _CHECKPOINT_SCHEDULER_BINDINGS = weakref.WeakKeyDictionary()
+_CHECKPOINT_SCHEDULER_RECIPES = weakref.WeakKeyDictionary()
 
 
 def checkpoint_scheduler_binding(optimizer):
     """Find a framework-built scheduler without mutating the optimizer payload."""
     reference = _CHECKPOINT_SCHEDULER_BINDINGS.get(optimizer)
     return None if reference is None else reference()
+
+
+def register_checkpoint_scheduler(scheduler, *, name: str, version: int, parameters: dict):
+    """Bind a trusted, reproducible LambdaLR recipe to its optimizer.
+
+    The caller must keep the recipe consistent with the scheduler callable.
+    Parameters must be JSON-serializable and describe every value affecting the
+    schedule; registration does not inspect or sandbox trusted Python code.
+    """
+    if (
+        type(scheduler) is not LambdaLR
+        or not isinstance(name, str)
+        or not name
+        or type(version) is not int
+        or version < 1
+    ):
+        raise ValueError("A LambdaLR recipe needs a name and positive integer version")
+    if not isinstance(parameters, dict):
+        raise TypeError("Scheduler recipe parameters must be a dictionary")
+    recipe = {"name": name, "version": version, "parameters": parameters}
+    try:
+        encoded = json.dumps(recipe, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Scheduler recipe must contain finite JSON values") from exc
+    _CHECKPOINT_SCHEDULER_RECIPES[scheduler] = encoded
+    _CHECKPOINT_SCHEDULER_BINDINGS[scheduler.optimizer] = weakref.ref(scheduler)
+    return scheduler
+
+
+def checkpoint_scheduler_recipe(scheduler):
+    """Return a detached recipe or fail when the caller supplied none."""
+    encoded = _CHECKPOINT_SCHEDULER_RECIPES.get(scheduler)
+    if encoded is None:
+        raise RuntimeError("MultiOptimizer scheduler has no registered checkpoint recipe")
+    return json.loads(encoded)
 
 
 class MultiLRScheduler(dict):
@@ -143,7 +180,12 @@ def get_constant_schedule_with_warmup(
 
         return 1.0
 
-    return LambdaLR(optimizer, _lr_lambda, last_epoch=last_epoch)
+    return register_checkpoint_scheduler(
+        LambdaLR(optimizer, _lr_lambda, last_epoch=last_epoch),
+        name="veomni.constant_warmup",
+        version=1,
+        parameters={"num_warmup_steps": num_warmup_steps, "init_lr": init_lr, "lr_start": lr_start},
+    )
 
 
 def get_linear_schedule_with_warmup(
@@ -170,7 +212,18 @@ def get_linear_schedule_with_warmup(
             float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps)),
         )
 
-    return LambdaLR(optimizer, _lr_lambda, last_epoch)
+    return register_checkpoint_scheduler(
+        LambdaLR(optimizer, _lr_lambda, last_epoch),
+        name="veomni.linear_warmup",
+        version=1,
+        parameters={
+            "num_warmup_steps": num_warmup_steps,
+            "num_training_steps": num_training_steps,
+            "init_lr": init_lr,
+            "min_lr": min_lr,
+            "lr_start": lr_start,
+        },
+    )
 
 
 def get_cosine_schedule_with_warmup(
@@ -205,4 +258,17 @@ def get_cosine_schedule_with_warmup(
         factor = factor * (1 - min_lr_ratio) + min_lr_ratio
         return max(0, factor)
 
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
+    return register_checkpoint_scheduler(
+        LambdaLR(optimizer, lr_lambda, last_epoch),
+        name="veomni.cosine_warmup",
+        version=1,
+        parameters={
+            "num_warmup_steps": num_warmup_steps,
+            "num_training_steps": num_training_steps,
+            "init_lr": init_lr,
+            "num_cycles": num_cycles,
+            "lr_decay_ratio": lr_decay_ratio,
+            "min_lr": min_lr,
+            "lr_start": lr_start,
+        },
+    )
