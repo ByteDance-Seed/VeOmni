@@ -1,5 +1,10 @@
 [
   {
+    "name": "distributed-default-gloo-group",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
+  },
+  {
     "name": "npu-unit-01",
     "suite": "unit",
     "args": [
@@ -86,6 +91,16 @@
       "-s",
       "-x",
       "tests/parallel/test_parallel_state_registry.py"
+    ]
+  },
+  {
+    "name": "npu-unit-07b",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/context_parallel/test_deepseek_v4_cp.py"
     ]
   },
   {
@@ -436,6 +451,38 @@
       "-s",
       "-x",
       "tests/distributed/test_fsdp_equivalence.py"
+    ]
+  },
+  {
+    "name": "npu-unit-42",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_get_compute_units.py"
+    ]
+  },
+  {
+    "name": "swap-adamw-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw.py"
+    ]
+  },
+  {
+    "name": "swap-adamw-device-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/optim/test_swap_adamw_device.py"
     ]
   }
 ]

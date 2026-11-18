@@ -33,17 +33,19 @@
 +#    - method_override: Qwen3RMSNorm.forward
 +#      Always call the local rms_norm VeomniOp
 +#    - method_override: Qwen3MLP.__init__
-+#      Construct a local swiglu_mlp VeomniOp
++#      Construct a local gated_mlp VeomniOp
 +#    - method_override: Qwen3MLP.forward
-+#      Always call the local swiglu_mlp VeomniOp
++#      Always call the local gated_mlp VeomniOp
 +#    - method_override: Qwen3DecoderLayer.__init__
 +#      Pass config to Qwen3RMSNorm instances
 +#    - method_override: Qwen3Model.__init__
 +#      Pass config to final Qwen3RMSNorm
++#    - method_override: Qwen3Model.forward
++#      Forward packed sequence metadata to VeOmni mask builders
 +#    - method_override: Qwen3Attention.__init__
-+#      Construct local rope and attention VeomniOps
++#      Construct local rope, attention and linear VeomniOps
 +#    - method_override: Qwen3Attention.forward
-+#      Always call the local rope and attention VeomniOps
++#      Always call the local rope, attention and linear VeomniOps
 +#    - method_override: Qwen3ForCausalLM.__init__
 +#      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 +#    - method_override: Qwen3ForCausalLM.forward
@@ -72,7 +74,6 @@
 +from transformers.cache_utils import Cache, DynamicCache
 +from transformers.generation import GenerationMixin
 +from transformers.integrations import use_kernel_forward_from_hub
-+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 +from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 +from transformers.modeling_layers import (
      GenericForQuestionAnswering,
@@ -106,9 +107,8 @@
 +
 +# Additional imports for patches
 +from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
-+from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
++from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 +from veomni.ops import VeomniOp
-+from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 +from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 +
 +
@@ -157,30 +157,20 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size
-@@ -77,10 +114,20 @@
+@@ -77,10 +114,10 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
-+        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
++        self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
      def forward(self, x):
 -        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 -        return down_proj
-+        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-+            return self.veomni_swiglu_mlp(
-+                x,
-+                self.gate_proj.weight,
-+                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-+                self.up_proj.weight,
-+                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-+                self.down_proj.weight,
-+                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-+            )
-+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
++        return self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
 
 
  class Qwen3RotaryEmbedding(nn.Module):
-@@ -137,39 +184,6 @@
+@@ -137,39 +174,6 @@
          return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -220,7 +210,7 @@
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
      """
      This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-@@ -207,12 +221,17 @@
+@@ -207,12 +211,17 @@
      return attn_output, attn_weights
 
 
@@ -241,7 +231,7 @@
          self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
          self.config = config
          self.layer_idx = layer_idx
-@@ -234,9 +253,11 @@
+@@ -234,9 +243,12 @@
          self.o_proj = nn.Linear(
              config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
          )
@@ -252,11 +242,23 @@
          self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
 +        self.veomni_rope = VeomniOp("rope", "full", config.ops_config.rotary_pos_emb_implementation)
 +        self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
++        self.veomni_linear = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
 
      def forward(
          self,
-@@ -254,16 +275,19 @@
-         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+@@ -249,21 +261,20 @@
+         input_shape = hidden_states.shape[:-1]
+         hidden_shape = (*input_shape, -1, self.head_dim)
+
+-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
++        # The ``linear`` row takes the projection module: ``eager`` calls it (so a
++        # ``basic_modules``-wrapped projection still unshards and a LoRA adapter still
++        # runs), while a quantizing row reads its weight and refuses a wrapped one.
++        query_states = self.q_norm(self.veomni_linear(self.q_proj, hidden_states).view(hidden_shape)).transpose(1, 2)
++        key_states = self.k_norm(self.veomni_linear(self.k_proj, hidden_states).view(hidden_shape)).transpose(1, 2)
++        value_states = self.veomni_linear(self.v_proj, hidden_states).view(hidden_shape).transpose(1, 2)
 
          cos, sin = position_embeddings
 -        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -270,29 +272,22 @@
 -        )
 -
 -        attn_output, attn_weights = attention_interface(
-+        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-+            kwargs,
-+            impl=self.veomni_attn.impl,
-+            attention_mask=attention_mask,
-+            hidden_states=hidden_states,
-+        )
-+
 +        attn_output, attn_weights = self.veomni_attn(
              self,
              query_states,
              key_states,
-@@ -271,8 +295,8 @@
+@@ -271,25 +282,29 @@
              attention_mask,
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
 -            sliding_window=self.sliding_window,  # diff with Llama
--            **kwargs,
 +            sliding_window=self.sliding_window,
-+            **attn_kwargs,
+             **kwargs,
          )
 
          attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-@@ -280,16 +304,20 @@
+-        attn_output = self.o_proj(attn_output)
++        attn_output = self.veomni_linear(self.o_proj, attn_output)
          return attn_output, attn_weights
 
 
@@ -318,13 +313,13 @@
 
      def forward(
          self,
-@@ -342,9 +370,15 @@
+@@ -342,9 +357,15 @@
      }
 
 
 +# ======================================================================
 +# [MODIFIED CLASS] Qwen3Model
-+# Methods patched: __init__
++# Methods patched: __init__, forward
 +# ======================================================================
 +
 +
@@ -335,7 +330,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -353,12 +387,11 @@
+@@ -353,14 +374,20 @@
          self.layers = nn.ModuleList(
              [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
          )
@@ -348,8 +343,36 @@
 -        # Initialize weights and apply final processing
          self.post_init()
 
++    # ================================================================
++    # Patch: Qwen3Model.forward
++    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
++    #    into ``veomni.models.utils.mask_utils.{create_causal_mask,
++    #    create_sliding_window_causal_mask}`` so packed sequences build an
++    #    isolated mask once in the model forward
++    # ================================================================
      @merge_with_config_defaults
-@@ -427,6 +460,12 @@
+     @capture_outputs
+     @auto_docstring
+@@ -390,8 +417,10 @@
+
+         # It may already have been prepared by e.g. `generate`
+         if not isinstance(causal_mask_mapping := attention_mask, dict):
++            # --- Patch.1 ---
+             # Prepare mask arguments
+             mask_kwargs = {
++                **kwargs,
+                 "config": self.config,
+                 "inputs_embeds": inputs_embeds,
+                 "attention_mask": attention_mask,
+@@ -405,6 +434,7 @@
+             # The sliding window alternating layers are not always activated depending on the config
+             if self.has_sliding_layers:
+                 causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
++            # --- Patch.1 ---
+
+         hidden_states = inputs_embeds
+         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+@@ -427,6 +457,12 @@
          )
 
 
@@ -362,7 +385,7 @@
  @auto_docstring
  class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -435,12 +474,13 @@
+@@ -435,12 +471,13 @@
      _fsdp_plan = {"lm_head": "keep_full_weight"}
 
      def __init__(self, config):
@@ -379,7 +402,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -454,61 +494,110 @@
+@@ -454,61 +491,110 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,

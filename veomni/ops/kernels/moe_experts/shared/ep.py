@@ -40,8 +40,9 @@ class EPGroupGemm(torch.autograd.Function):
         swiglu_limit=None,
     ):
         """Split fc1 GEMMs, SwiGLU, and fc2. No routing scale."""
-        from .group_gemm import group_gemm_same_nk
+        from .group_gemm import group_gemm_same_nk, same_nk_tile_schedule
 
+        tile_cumsum, tile_total_M = same_nk_tile_schedule(cumsum, permute_tokens.shape[0])
         fc1_1_output = group_gemm_same_nk(
             a=permute_tokens,
             b=fc1_1_weight,
@@ -49,6 +50,8 @@ class EPGroupGemm(torch.autograd.Function):
             max_M=permute_tokens.shape[0],
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         fc1_2_output = group_gemm_same_nk(
             a=permute_tokens,
@@ -57,6 +60,8 @@ class EPGroupGemm(torch.autograd.Function):
             max_M=permute_tokens.shape[0],
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = apply_swiglu_clamp(
             fc1_1_output, fc1_2_output, swiglu_limit
@@ -70,9 +75,12 @@ class EPGroupGemm(torch.autograd.Function):
             max_M=permute_tokens.shape[0],
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         ctx.swiglu_limit = swiglu_limit
+        ctx.tile_prefix_total = tile_total_M
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
@@ -83,6 +91,7 @@ class EPGroupGemm(torch.autograd.Function):
             fc1_2_output,
             mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=permute_tokens.device),
             mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=permute_tokens.device),
+            tile_cumsum,
         )
         return fc2_output
 
@@ -101,7 +110,9 @@ class EPGroupGemm(torch.autograd.Function):
             fc1_2_output,
             mask_fc1_1,
             mask_fc1_2,
+            tile_cumsum,
         ) = ctx.saved_tensors
+        tile_total_M = ctx.tile_prefix_total
         swiglu_limit = ctx.swiglu_limit
 
         grad_fc1_output = group_gemm_same_nk(
@@ -110,6 +121,8 @@ class EPGroupGemm(torch.autograd.Function):
             cumsum_M=cumsum,
             max_M=grad_output.shape[0],
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
         fc1_output = fc1_1_activation * fc1_2_output
@@ -138,6 +151,8 @@ class EPGroupGemm(torch.autograd.Function):
             cumsum_M=cumsum,
             max_M=grad_output.shape[0],
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         grad_fc1_2_weight = None
         if fc1_2_weight.requires_grad:
@@ -162,6 +177,8 @@ class EPGroupGemm(torch.autograd.Function):
             cumsum_M=cumsum,
             max_M=grad_output.shape[0],
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         grad_fc1_1_weight = None
         if fc1_1_weight.requires_grad:
@@ -199,11 +216,12 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         swiglu_limit=None,
     ):
         """Merged fc1 GEMM, SwiGLU, and fc2. No routing scale."""
-        from .group_gemm import group_gemm_same_nk
+        from .group_gemm import group_gemm_same_nk, same_nk_tile_schedule
 
         assert fc1_1_2_weight.shape[1] % 2 == 0, (
             f"Merged fc1_1_2_weight dim 1 must be even, got {fc1_1_2_weight.shape[1]}"
         )
+        tile_cumsum, tile_total_M = same_nk_tile_schedule(cumsum, permute_tokens.shape[0])
         fc1_output = group_gemm_same_nk(
             a=permute_tokens,
             b=fc1_1_2_weight,
@@ -211,6 +229,8 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             max_M=permute_tokens.shape[0],
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         fc1_1_output, fc1_2_output = fc1_output.chunk(2, dim=-1)
         fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = apply_swiglu_clamp(
@@ -224,9 +244,12 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             max_M=permute_tokens.shape[0],
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         ctx.swiglu_limit = swiglu_limit
+        ctx.tile_prefix_total = tile_total_M
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
@@ -236,6 +259,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             fc1_2_output,
             mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=permute_tokens.device),
             mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=permute_tokens.device),
+            tile_cumsum,
         )
         return fc2_output
 
@@ -253,18 +277,29 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             fc1_2_output,
             mask_fc1_1,
             mask_fc1_2,
+            tile_cumsum,
         ) = ctx.saved_tensors
+        tile_total_M = ctx.tile_prefix_total
         swiglu_limit = ctx.swiglu_limit
 
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        fc1_result = fc1_1_activation * fc1_2_output
         grad_fc1_result = group_gemm_same_nk(
             a=grad_output,
             b=fc2_weight,
             cumsum_M=cumsum,
             max_M=grad_output.shape[0],
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
+
+        fc1_result, grad_fc1_output = swiglu.merged_swiglu_backward(
+            fc1_1_output,
+            fc1_2_output,
+            grad_fc1_result,
+            mask_fc1_1 if swiglu_limit is not None else None,
+            mask_fc1_2 if swiglu_limit is not None else None,
+        )
+        del grad_fc1_result
 
         grad_fc2_weight = None
         if fc2_weight.requires_grad:
@@ -278,21 +313,16 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
                 transpose_a=True,
                 transpose_b=False,
             )
+        del fc1_result
 
-        grad_fc1_2_output = fc1_1_activation * grad_fc1_result
-        grad_fc1_1_activation = grad_fc1_result * fc1_2_output
-        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
-        if swiglu_limit is not None:
-            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
-            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
-
-        grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
         grad_permute_tokens = group_gemm_same_nk(
             a=grad_fc1_output,
             b=fc1_1_2_weight,
             cumsum_M=cumsum,
             max_M=grad_output.shape[0],
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         grad_fc1_1_2_weight = None

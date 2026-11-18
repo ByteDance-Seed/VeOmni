@@ -14,9 +14,9 @@
 #    - method_override: Qwen3_5MoeRMSNorm.forward
 #      Always call the local rms_norm offset VeomniOp
 #    - method_override: Qwen3_5MoeMLP.__init__
-#      Construct a local swiglu_mlp VeomniOp
+#      Construct a local gated_mlp VeomniOp
 #    - method_override: Qwen3_5MoeMLP.forward
-#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
+#      Call the gated_mlp row, which picks fused weights or the projection modules
 #    - method_override: Qwen3_5MoeDecoderLayer.__init__
 #      Pass config to Qwen3_5MoeRMSNorm instances
 #    - method_override: Qwen3_5MoeTextModel.__init__
@@ -99,7 +99,7 @@ from transformers.integrations import (
     use_kernel_func_from_hub_with_fallback,
 )
 from transformers.integrations.accelerate import force_accelerate_hooks
-from transformers.masking_utils import create_causal_mask, create_recurrent_attention_mask
+from transformers.masking_utils import create_recurrent_attention_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import (
@@ -132,10 +132,10 @@ from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.utils import logging
 from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
@@ -1144,20 +1144,10 @@ class Qwen3_5MoeMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+        self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-            return self.veomni_swiglu_mlp(
-                x,
-                self.gate_proj.weight,
-                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                self.up_proj.weight,
-                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-                self.down_proj.weight,
-                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-            )
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
 
 
 # ======================================================================
@@ -1179,7 +1169,7 @@ class Qwen3_5MoeExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
+        self.use_swiglu = config.hidden_act in {"silu", "swish"}
         self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
@@ -1188,7 +1178,8 @@ class Qwen3_5MoeExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        if not self.use_swiglu_mlp:
+        if not self.use_swiglu:
+            reject_quantizing_act_fn(self)
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,
@@ -1366,14 +1357,7 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
                 chunk_indices_list=linear_attn_chunk_indices_list,
             )
         elif self.block_type == "full_attention":
-            # Self Attention. SDPA/eager reject GDN cu_seq_lens metadata.
-            attn_impl = getattr(getattr(self, "self_attn", None), "veomni_attn", None)
-            attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-                kwargs,
-                impl=attn_impl.impl if attn_impl is not None else "eager",
-                attention_mask=attention_mask,
-                hidden_states=hidden_states,
-            )
+            # Self Attention
             hidden_states, _ = self.self_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -1381,7 +1365,7 @@ class Qwen3_5MoeDecoderLayer(GradientCheckpointingLayer):
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
-                **attn_kwargs,
+                **kwargs,
             )
 
         hidden_states = residual + hidden_states
@@ -2156,10 +2140,15 @@ class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
                 "past_key_values": past_key_values,
                 "position_ids": text_position_ids,
             }
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
-            }
+            # --- Patch.1 ---
+            # Only build the mask for layer types present in ``self.config.layer_types``
+            # and forward ``**kwargs`` into ``create_causal_mask`` for packed sequences.
+            causal_mask_mapping = {}
+            if "full_attention" in self.config.layer_types:
+                causal_mask_mapping["full_attention"] = create_causal_mask(**{**kwargs, **mask_kwargs})
+            if "linear_attention" in self.config.layer_types:
+                causal_mask_mapping["linear_attention"] = create_recurrent_attention_mask(**mask_kwargs)
+            # --- Patch.1 ---
 
         # Modification: precompute varlen metadata once for all GDN layers to avoid per-layer tolist overhead.
         cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)

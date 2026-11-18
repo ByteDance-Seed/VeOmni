@@ -115,11 +115,14 @@ def validate_mxfp8_training(
         raise ValueError("MXFP8 does not support compile, offload or LoRA.")
     if low_precision_reduce_scatter_comm or expert_weight_fp8_all_gather:
         raise ValueError("MXFP8 cannot be combined with other low-precision communication options.")
+    if mixed_precision.float8.enable:
+        raise ValueError("MXFP8 cannot be combined with float8 training.")
     for module in model.modules():
         module_config = getattr(module, "config", None)
         ops = getattr(module_config, "ops_implementation", None) or {}
-        qat = ops.get("qat_implementation", "none") if isinstance(ops, Mapping) else ops.qat_implementation
-        if qat not in (None, "none") or getattr(module, "qat_implementation", "none") not in (None, "none"):
+        fields = ("linear_implementation", "gated_mlp_implementation", "moe_implementation")
+        rows = (ops.get(key) if isinstance(ops, Mapping) else getattr(ops, key, None) for key in fields)
+        if any(row in ("qat", "torchao_nvfp4") for row in rows):
             raise ValueError("MXFP8 cannot be combined with QAT.")
     selected = _select_linears(model, config)
     for name, module in selected.items():
@@ -145,7 +148,7 @@ def _validate_native_runtime():
     try:
         installed = version("torchao")
     except PackageNotFoundError as exc:
-        raise ImportError("Native MXFP8 requires torchao==0.18.0 from the GPU extra.") from exc
+        raise ImportError("Native MXFP8 requires torchao==0.18.0 from the float8 extra.") from exc
     if installed.split("+")[0] != "0.18.0":
         raise RuntimeError(f"MXFP8 targets torchao==0.18.0, got {installed}.")
     _probe_native_gemm(index)

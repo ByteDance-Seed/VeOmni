@@ -16,13 +16,15 @@
 #    - method_override: Qwen3VLTextRMSNorm.forward
 #      Always call the local rms_norm VeomniOp
 #    - method_override: Qwen3VLTextMLP.__init__
-#      Construct a local swiglu_mlp VeomniOp
+#      Construct a local gated_mlp VeomniOp
 #    - method_override: Qwen3VLTextDecoderLayer.__init__
 #      Pass config to Qwen3VLTextRMSNorm instances
 #    - method_override: Qwen3VLTextModel.__init__
 #      Pass config to final Qwen3VLTextRMSNorm
+#    - method_override: Qwen3VLTextModel.forward
+#      Forward packed sequence metadata to VeOmni mask builders
 #    - method_override: Qwen3VLTextMLP.forward
-#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
+#      Call the gated_mlp row, which picks fused weights or the projection modules
 #    - init_modification: Qwen3VLVisionAttention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Qwen3VLVisionAttention.forward
@@ -78,7 +80,6 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
-from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling, CausalLMOutputWithPast
@@ -106,9 +107,8 @@ from veomni.models.loss_utils import ForCausalLMLoss
 
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.model_outputs import (  # noqa: F401  surfaced for forward log_probs path
@@ -769,15 +769,7 @@ class Qwen3VLTextAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface = self.veomni_attn
-        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-            kwargs,
-            impl=attention_interface.impl,
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-        )
-
-        attn_output, attn_weights = attention_interface(
+        attn_output, attn_weights = self.veomni_attn(
             self,
             query_states,
             key_states,
@@ -785,7 +777,7 @@ class Qwen3VLTextAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            **attn_kwargs,
+            **kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -809,20 +801,10 @@ class Qwen3VLTextMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+        self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-            return self.veomni_swiglu_mlp(
-                x,
-                self.gate_proj.weight,
-                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                self.up_proj.weight,
-                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-                self.down_proj.weight,
-                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-            )
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
 
 
 # ======================================================================
@@ -1300,7 +1282,7 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen3VLTextModel
-# Methods patched: __init__, _deepstack_process
+# Methods patched: __init__, forward, _deepstack_process
 # ======================================================================
 
 
@@ -1329,6 +1311,12 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
         self.post_init()
 
+    # ================================================================
+    # Patch: Qwen3VLTextModel.forward
+    # 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+    #    into ``veomni.models.utils.mask_utils.create_causal_mask`` so packed
+    #    sequences build an isolated mask once in the model forward
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -1377,13 +1365,18 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         else:
             text_position_ids = None
 
+        # --- Patch.1 ---
         attention_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=text_position_ids,
+            **{
+                **kwargs,
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": text_position_ids,
+            }
         )
+        # --- Patch.1 ---
 
         hidden_states = inputs_embeds
 

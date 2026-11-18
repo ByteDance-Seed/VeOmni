@@ -294,13 +294,13 @@ def _transport_oracle_worker(root):
     original_pre = MXFP8Weight.fsdp_pre_all_gather
     calls = {"candidate": 0, "reference": 0}
 
-    def candidate_pre(weight, *args, **kwargs):
-        payload, metadata = original_pre(weight, *args, **kwargs)
+    def candidate_pre(weight, mesh, outer_size, outer_stride, module, mp_policy):
+        payload, metadata = original_pre(weight, mesh, outer_size, outer_stride, module, mp_policy)
         assert len(payload) == 4 and all(part.dtype == torch.uint8 for part in payload)
         calls["candidate"] += 1
         return payload, metadata
 
-    def reference_pre(weight, *args, **kwargs):
+    def reference_pre(weight, mesh, outer_size, outer_stride, module, mp_policy):
         # Gather the original master without any rank-local quantization.
         assert weight._master.dtype == torch.float32
         calls["reference"] += 1

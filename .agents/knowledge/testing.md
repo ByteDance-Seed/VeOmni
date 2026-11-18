@@ -130,7 +130,7 @@ describe selections in `scripts/ci/accelerator/suites/gpu.json` and `npu.json`.
 | `tests/checkpoints/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
 | `tests/ops/` | directory in both GPU/NPU unit manifests, excluding `base/test_op_documentation.py` (device-API workflow) |
 | `tests/models/` | unit selection in both manifests, excluding `base/test_modify_init.py` (patchgen workflow) and `transformers/test_generated_call_site_signatures.py` (device-API workflow); GPU additionally excludes `test_omni_fsdp.py` |
-| `tests/parallel/context_parallel/` | whole directory, GPU manifest only (`suite: unit`) |
+| `tests/parallel/context_parallel/` | whole directory in the GPU manifest (`suite: unit`); on NPU only `test_deepseek_v4_cp.py` is listed |
 | everything else | **one selection per file** in the appropriate GPU/NPU suite manifest |
 | `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | GPU/NPU manifests (`suite: e2e`) |
 | `tests/models/test_omni_fsdp.py` | GPU manifest `61-e2e` (`suite: e2e`); NPU coverage remains in the models unit selection |
@@ -163,7 +163,7 @@ kernel dependencies land differently, and each decides what a test can reach:
 | `fla_npu` | image venv only; the workspace venv does not inherit it | `chunk_gated_delta_rule_implementation=fla_npu`, so that backend is untestable |
 | `flash-linear-attention` | `gpu` extra only, so absent from both | the `fla` backends. Its `HardwareRequirement` lists `npu`, but the GatedDeltaNet docs say it raises on Ascend even when installed — treat `fla` as GPU-only |
 
-The runners are 910B (A2, non-arch35), so kernels gated behind `is_arch35()`
+The runners are Atlas A2 training products (non-arch35), so kernels gated behind `is_arch35()`
 stay unreachable whatever is installed.
 
 Check whether a file is wired — by name, and by the directory it sits in:
@@ -193,12 +193,12 @@ by a `pytest.param` table, so a new case is a few lines:
 | `torch.compile` support | `tests/distributed/test_torch_compile.py` |
 | Gradient checkpointing / selective recompute (SAC) | `tests/distributed/test_gradient_checkpointing.py` |
 | Ulysses SP behaviour | `tests/parallel/ulysses/test_ulysses.py` and siblings |
-| Checkpoint callback / DCP round-trip | `tests/checkpoints/test_checkpoint_callback.py`, `test_trainer_saveload.py` |
+| Checkpoint callback / DCP round-trip | `tests/checkpoints/test_checkpoint_callback.py`, `test_trainer_saveload.py`, `test_dcp_checkpointer.py` |
 | DiT resume / noise-stream equivalence | `tests/checkpoints/test_dit_resume_align.py` |
 | Weight loading / broadcast / EP shard | `tests/utils/test_rank0_load_and_broadcast_weights.py`, `test_moe_ep_sharded_load_matrix.py` |
 | Grad clipping with ExtraParallel | `tests/utils/test_extra_parallel_clip_grad_norm.py` |
 | FLOPs / MFU accounting | `tests/utils/test_count_flops.py` |
-| Optimizer / Muon | `tests/optim/test_muon_*.py`, `test_optimizer_vlm_param_groups.py` |
+| Optimizer / Muon / swap | `tests/optim/test_muon_*.py`, `test_optimizer_vlm_param_groups.py`, `test_swap_adamw*.py` (CPU parity; the `_device` file runs on one real card; both swap files are enumerated per file in the suite manifests) |
 | LoRA / MoE-LoRA | the enumerated `tests/lora/test_*.py` set |
 | End-to-end parallel parity | `tests/e2e/test_e2e_parallel.py` (`text_test_cases` and friends) |
 

@@ -14,7 +14,7 @@ falls back to CPU emulation.
 
 ## Configure training
 
-Install the normal GPU environment with `uv sync --locked --extra gpu --dev`.
+Install the GPU environment with `uv sync --locked --extra gpu --extra float8 --dev`.
 Start from [the Qwen3 example](../../configs/text/qwen3_mxfp8.yaml) and set the
 model and prepared conversation dataset paths:
 
@@ -76,9 +76,9 @@ should not be expected to match bitwise.
 
 ## Loading, checkpoints and export
 
-The [parallel builder](../../veomni/distributed/torch_parallelize.py#L1030)
+The [parallel builder](../../veomni/distributed/torch_parallelize.py#L1042)
 [validates the recipe](../../veomni/distributed/mxfp8/__init__.py#L77),
-[converts projections](../../veomni/distributed/mxfp8/__init__.py#L219) after
+[converts projections](../../veomni/distributed/mxfp8/__init__.py#L222) after
 FP32 upcast, then wraps and materializes them through the existing FSDP2/HF loader.
 SwiGLU calls converted projection forwards instead of reading their weights
 through a fused BF16 path. Parameter names stay unchanged.
@@ -117,8 +117,9 @@ SM100+ devices:
 CUDA_VISIBLE_DEVICES=0,1 pytest tests/models/test_mxfp8_training.py -q
 ```
 
-These tests are selected by the existing `tests/models/` and `tests/ops/` CI
-directory entries. Native cases skip on unsupported hardware, including L20.
-A test definition or CPU pass does not establish a native hardware result.
-Native multi-GPU acceptance, representative convergence, throughput and memory
-benefits require separate measurements on the supported hardware.
+The GPU unit workflow reruns the torchao-dependent tests after installing
+the optional `float8` extra. Native cases skip on unsupported hardware, including L20.
+All three native tests passed on two NVIDIA B200 GPUs with PyTorch
+2.11.0+cu130 and torchao 0.18.0. They cover checkpoint continuation with
+both transport modes and an independent full-weight quantization reference.
+Representative convergence, throughput and peak memory require separate measurements.

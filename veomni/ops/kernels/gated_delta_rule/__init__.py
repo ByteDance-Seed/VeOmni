@@ -216,5 +216,6 @@ register_op(
     chunk_fla_npu.backward,
     description="AscendC chunked gated delta rule with variable-length support",
     requirement=NpuKernelRequirement(),
+    # AscendC runs GDN; input guarding and Q/K L2Norm still use Triton-Ascend.
     requires=("fla_npu", "triton"),
 )

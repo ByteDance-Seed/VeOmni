@@ -27,7 +27,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def _model():
     root = nn.Module()
     root.config = Qwen3Config(hidden_size=64, intermediate_size=128)
-    root.config.ops_implementation = {"qat_implementation": "none"}
+    root.config.ops_implementation = {}
     root.model = nn.Module()
     block = nn.Module()
     block.mlp = nn.ModuleDict(
@@ -196,12 +196,25 @@ def test_unaligned_shards_fail_before_conversion():
         mxfp8.validate_mxfp8_training(_model(), precision, _state(dp_shard_size=4))
 
 
-def test_config_owned_qat_is_rejected_without_module_attribute():
+@pytest.mark.parametrize(
+    ("field", "row"), [("linear_implementation", "qat"), ("gated_mlp_implementation", "torchao_nvfp4")]
+)
+def test_config_owned_qat_is_rejected_without_module_attribute(field, row):
     model = _model()
-    model.config.ops_implementation["qat_implementation"] = "fp8_blockwise"
-    assert not hasattr(model, "qat_implementation")
+    model.config.ops_implementation[field] = row
     with pytest.raises(ValueError, match="combined with QAT"):
         mxfp8.validate_mxfp8_training(model, MixedPrecisionConfig(mxfp8=MXFP8Config(enable=True)), _state())
+
+
+def test_mxfp8_rejects_concurrent_float8_conversion():
+    from veomni.arguments import Float8TrainingConfig
+
+    precision = MixedPrecisionConfig(
+        float8=Float8TrainingConfig(enable=True, target_modules=["model.layers.*.mlp.up_proj"]),
+        mxfp8=MXFP8Config(enable=True),
+    )
+    with pytest.raises(ValueError, match="combined with float8"):
+        mxfp8.validate_mxfp8_training(_model(), precision, _state())
 
 
 def test_selected_shared_weight_is_rejected():
@@ -258,7 +271,6 @@ def test_native_probe_failure_is_propagated_without_conversion(monkeypatch):
 def test_generated_qwen_mlp_calls_linear_subclass_forward(projection):
     from veomni.models.configuration_base import as_veomni_config
     from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3MLP
-    from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 
     class ScaledLinear(nn.Linear):
         calls = 0
@@ -270,12 +282,10 @@ def test_generated_qwen_mlp_calls_linear_subclass_forward(projection):
     config = as_veomni_config(Qwen3Config(hidden_size=32, intermediate_size=64))
     config._apply_ops_overrides(ops_implementation=make_eager_ops_config())
     mlp = Qwen3MLP(config)
-    assert has_plain_linear_projections(mlp)
     original = getattr(mlp, projection)
     replacement = ScaledLinear(original.in_features, original.out_features, bias=False)
     replacement.load_state_dict(original.state_dict())
     setattr(mlp, projection, replacement)
-    assert not has_plain_linear_projections(mlp)
     inputs = torch.randn(2, 17, 32, requires_grad=True)
     expected = mlp.down_proj(torch.nn.functional.silu(mlp.gate_proj(inputs)) * mlp.up_proj(inputs))
     replacement.calls = 0

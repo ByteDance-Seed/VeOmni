@@ -120,13 +120,13 @@ def _resolve_hf_checkpoint_view(model_runtime: OmniModelRuntimeArguments) -> str
 
 def _check_hf_source_exportable(model_path: str) -> None:
     """Fail at startup, not at the first HF save, when the source cannot be written back."""
-    from ..models.seed_omni.utils.hf_layout import read_hf_source, source_tensor_specs, source_weight_files
+    from ..models.seed_omni.utils.hf_layout import read_hf_source, source_tensor_specs
 
     source = read_hf_source(model_path)
     if source is None:
         return
     try:
-        weight_files = source_weight_files(source.path)
+        weight_files = source.layout.source_weight_files(source.path)
     except FileNotFoundError as e:
         raise ValueError(
             f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights: {e} "
@@ -290,7 +290,10 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         generation_graphs=generation_graphs,
         train_type=train_type,
         infer_type=infer_type,
-        generation_kwargs=dict(args.infer.generation_kwargs),
+        generation_kwargs={
+            **(omni_cfg.generation_kwargs or {} if omni_cfg is not None else {}),
+            **args.infer.generation_kwargs,
+        },
     )
 
 
@@ -339,11 +342,19 @@ def build_omni_module_runtime_args(
     )
 
     base_dict = _module_base(asdict(global_args))
+    # ``skip_sp_gather_between_modules`` is a property of the whole graph, not of
+    # one module: it says every module's ``post_forward`` hands its SP shard on
+    # instead of all-gathering. Enforcing the top-level value here means a
+    # per-module YAML entry cannot desynchronise the two sides of a handoff.
+    global_skip_sp_gather = bool(base_dict.get("accelerator", {}).get("skip_sp_gather_between_modules", False))
     runtime_modules: dict[str, OmniModuleRuntimeArguments] = {}
     for name, override in modules_overrides.items():
         merged = deepcopy(base_dict)
         for layer in (checkpoint_defaults.get(name, {}), inference_default, override or {}):
             _deep_update(merged, layer)
+        merged_acc = merged.setdefault("accelerator", {})
+        if isinstance(merged_acc, dict):
+            merged_acc["skip_sp_gather_between_modules"] = global_skip_sp_gather
         runtime_modules[name] = _instantiate_recursive(OmniModuleRuntimeArguments, merged)
     return runtime_modules
 
