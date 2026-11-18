@@ -171,7 +171,7 @@ def tiny_bagel_qwen2_cfg() -> dict:
         ops_implementation={
             "attn_implementation": "sdpa",
             "rms_norm_implementation": "eager",
-            "swiglu_mlp_implementation": "eager",
+            "gated_mlp_implementation": "eager",
             "rotary_pos_emb_implementation": "eager",
         },
     )

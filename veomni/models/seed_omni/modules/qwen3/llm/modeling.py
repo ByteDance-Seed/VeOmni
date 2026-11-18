@@ -30,6 +30,9 @@ class Qwen3Llm(SimpleArGenerationMixin, PretrainedOmniModule):
     """
 
     config_class = Qwen3LlmConfig
+    # Hidden states are a plain per-item concatenation of the carrier, so
+    # ``forward_post`` can write this rank's slice back item by item.
+    supports_sp_sharded_handoff = True
     base_model_prefix = "qwen3_llm"
     main_input_name = "inputs_embeds"
     _no_split_modules = Qwen3Model._no_split_modules

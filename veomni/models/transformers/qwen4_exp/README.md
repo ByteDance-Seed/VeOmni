@@ -3,8 +3,8 @@
 Supported in this correctness stage:
 
 - GPU and NPU VLM supervised fine-tuning with Ulysses sequence parallelism and
-  context parallelism (`cp_size > 1`). NPU context parallelism is enabled only
-  for Qwen4-Exp and requires NPU-compatible attention and GatedDeltaNet backends.
+  context parallelism (`cp_size > 1`). Qwen4-Exp NPU context parallelism requires
+  NPU-compatible attention and GatedDeltaNet backends.
   Combined Ulysses/CP uses the explicit opt-in described below.
 - GatedDeltaNet sequence-to-head all-to-all using the existing Qwen3.5
   causal-conv and gated-delta kernels over the active SP/CP group.
