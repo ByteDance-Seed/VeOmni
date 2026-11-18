@@ -342,43 +342,29 @@ def test_generate_refuses_sequence_parallelism(monkeypatch):
         llm.generate([ConversationItem(type="text", value="hi", role="user")])
 
 
-def _official_template():
-    """Official Janus chat template, as shipped in the checkpoint's tokenizer config."""
-    from veomni.models.seed_omni.modules.janus.convert_janus_weight_to_hf import CHAT_TEMPLATE
-
-    return CHAT_TEMPLATE
-
-
-def _real_janus_tokenizer():
-    """The byte-level BPE the checkpoints ship, loaded straight from ``tokenizer.json``.
-
-    ``AutoTokenizer`` resolves this repo's ``tokenizer_config.json`` to a Llama
-    tokenizer with a Metaspace pre-tokenizer, which normalises the assistant
-    separator away and would make the comparison vacuous. The checkpoint's own
-    ``tokenizer.json`` is the byte-level pipeline the model was trained with.
-    """
-    from transformers import PreTrainedTokenizerFast
-
-    return PreTrainedTokenizerFast(
-        tokenizer_file="/mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B/tokenizer.json"
-    )
-
-
+@_CPU
 @pytest.mark.parametrize(
-    ("messages", "add_generation_prompt", "infer_type", "expected_answer"),
+    ("sample", "messages", "add_generation_prompt", "infer_type"),
     [
-        # Text answer: ``<|Assistant|>: Hello``, the space folded into ``Hello``.
         (
+            [
+                ConversationItem(type="text", value="hi", role="user"),
+                ConversationItem(type="text", value="Hello", role="assistant"),
+            ],
             [
                 {"role": "user", "content": [{"type": "text", "text": "hi"}]},
                 {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
             ],
             False,
             None,
-            "Hello",
         ),
-        # Multi-turn: the intermediate EOS and separator handling.
         (
+            [
+                ConversationItem(type="text", value="q1", role="user"),
+                ConversationItem(type="text", value="a1", role="assistant"),
+                ConversationItem(type="text", value="q2", role="user"),
+                ConversationItem(type="text", value="a2", role="assistant"),
+            ],
             [
                 {"role": "user", "content": [{"type": "text", "text": "q1"}]},
                 {"role": "assistant", "content": [{"type": "text", "text": "a1"}]},
@@ -387,94 +373,81 @@ def _real_janus_tokenizer():
             ],
             False,
             None,
-            "a2",
         ),
-        # Generation prompt, text response: stops at the marker, no separator.
-        ([{"role": "user", "content": [{"type": "text", "text": "hi"}]}], True, "infer_und", None),
-        # Generation prompt, image response: carries the separator, which
-        # ``emit_image_start`` then follows with ``<boi>``.
-        ([{"role": "user", "content": [{"type": "text", "text": "a cat"}]}], True, "infer_gen", None),
+        (
+            [ConversationItem(type="text", value="hi", role="user")],
+            [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            True,
+            "infer_und",
+        ),
+        (
+            [ConversationItem(type="text", value="a cat", role="user")],
+            [{"role": "user", "content": [{"type": "text", "text": "a cat"}]}],
+            True,
+            "infer_gen",
+        ),
     ],
     ids=["text-answer", "multi-turn", "gen-prompt-text", "gen-prompt-image"],
 )
-def test_the_prompt_matches_the_official_template(messages, add_generation_prompt, infer_type, expected_answer):
-    """Our prompt must match official Janus' Jinja, including after the marker.
+def test_the_prompt_matches_the_official_template(sample, messages, add_generation_prompt, infer_type):
+    """Our rendered prompt must match official Janus' Jinja, including after the marker.
 
-    The checkpoint was trained against that template and its tokenizer is
-    byte-level, so the assistant tail is token-sensitive: ``<|Assistant|>: Hello``
-    and ``<|Assistant|>:<boi>`` are different token sequences, not spacing
-    preferences. A generation prompt therefore stops at the colon for a text
-    response (the space folds into the sampled word) and carries the separator
-    for an image one (``<boi>`` is special, so nothing folds).
+    The checkpoint was trained against that template, and its tokenizer is
+    byte-level, so the assistant tail is token-sensitive: a stray or missing
+    space is a different token, not a formatting preference.
 
-    Our template additionally wraps a generated image in ``<begin_of_image>`` /
-    ``<end_of_image>`` and appends an EOS; the official snippet leaves those to
-    the caller. Those extensions are trimmed off before comparing, so what is
-    checked is exactly the part the checkpoint cares about.
+    Two divergences are deliberate and asserted rather than hidden:
 
-    ``AutoTokenizer`` yields a Metaspace tokenizer for this checkpoint, under
-    which ``Hello`` and `` Hello`` collapse to one id; the checkpoint's own
-    ``tokenizer.json`` is loaded directly so the comparison is meaningful.
+    * A generation prompt for an **image** response carries the assistant
+      separator, because ``<boi>`` is a special token and the space cannot fold
+      into it the way it folds into a sampled word. Official always stops at the
+      colon since it samples the next token.
+    * Our render appends an EOS to close the sample; official leaves that to the
+      caller.
+
+    A user-image turn also makes our template prepend the system prompt and the
+    official snippet emit an ``<image_placeholder>`` instead of our
+    ``<begin_of_image>``/``<end_of_image>`` span, so those cases are not
+    parametrized here — this test covers the text-only shapes, where the two
+    templates describe the same wire format.
     """
     import jinja2
 
+    from veomni.models.seed_omni.modules.janus.convert_janus_weight_to_hf import CHAT_TEMPLATE
     from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import JanusChatTemplate
 
-    base = _real_janus_tokenizer()
-
     class _Tokenizer:
+        """Only the marker strings; this case never tokenizes."""
+
         bos_token = "<s>"
-        # The checkpoint's EOS is ``<\uff5cend\u2581of\u2581sentence\uff5c>``; ``</s>`` is
-        # not in its vocab. Using the wrong string here would compare our render
-        # against an official template that emits the real one and flag a
-        # difference that only exists in the fixture.
         eos_token = "<\uff5cend\u2581of\u2581sentence\uff5c>"
         boi_token = "<begin_of_image>"
         eoi_token = "<end_of_image>"
         bos_token_id = 0
-        eos_token_id = base.convert_tokens_to_ids("<\uff5cend\u2581of\u2581sentence\uff5c>")
-        boi_token_id = base.convert_tokens_to_ids("<begin_of_image>")
-        eoi_token_id = base.convert_tokens_to_ids("<end_of_image>")
+        eos_token_id = 1
+        boi_token_id = 2
+        eoi_token_id = 3
         pad_token_id = 0
-
-        def __call__(self, text, add_special_tokens=False):
-            return base(text, add_special_tokens=add_special_tokens)
 
     template = JanusChatTemplate(_Tokenizer())
     markers = template.chat_markers
 
-    sample = [
-        ConversationItem(type="text", value=message["content"][0]["text"], role=message["role"])
-        for message in messages
-    ]
     parts = template.apply_chat_template(sample)
     if add_generation_prompt:
         parts = template.apply_generation_prompt(parts, generation_kwargs={"infer_type": infer_type})
     ours = template.render_template_string(parts)
 
-    official = jinja2.Template(_official_template()).render(
-        messages=messages, add_generation_prompt=add_generation_prompt
-    )
+    official = jinja2.Template(CHAT_TEMPLATE).render(messages=messages, add_generation_prompt=add_generation_prompt)
+
+    # Compare from the first user marker: ours may prepend BOS and the system
+    # prompt, neither of which the official snippet emits for these inputs.
     ours_trimmed = ours[ours.index(markers.user_prefix) :]
-    # We append an EOS to close the sample; the official snippet leaves that to
-    # the caller, so trim it before comparing.
+    # We append an EOS to close the sample; official leaves that to the caller.
     if not add_generation_prompt and ours_trimmed.endswith(markers.eos_token):
         ours_trimmed = ours_trimmed[: -len(markers.eos_token)]
 
-    # The one deliberate divergence: an image generation prompt carries the
-    # assistant separator, because ``<boi>`` is a special token and the space
-    # cannot fold into it the way it folds into a sampled word. Official stops at
-    # the colon for both modalities (it always samples the next token).
     if add_generation_prompt and infer_type != "infer_und":
-        assert ours_trimmed == official + markers.assistant_text_separator, f"ours={ours!r} official={official!r}"
-        official_compare = official + markers.assistant_text_separator
-    else:
-        assert ours_trimmed == official, f"ours={ours!r} official={official!r}"
-        official_compare = official
+        # The one deliberate divergence: see the docstring.
+        official += markers.assistant_text_separator
 
-    # The same string, so the same ids — asserted separately because that is the
-    # consequence the checkpoint was trained on.
-    assert (
-        base(ours_trimmed, add_special_tokens=False)["input_ids"]
-        == base(official_compare, add_special_tokens=False)["input_ids"]
-    )
+    assert ours_trimmed == official, f"ours={ours_trimmed!r} official={official!r}"
