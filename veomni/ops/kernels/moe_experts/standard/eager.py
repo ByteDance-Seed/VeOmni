@@ -25,6 +25,18 @@ from ....activation import apply_activation, resolve, supports
 from ..shared.act_fn_experts import merged_experts_act_fn_forward
 
 
+def _experts_are_sharded() -> bool:
+    """Whether the expert weights this row is handed are sharded across ranks.
+
+    Reads ``extra_parallel_sizes`` directly rather than ``ep_enabled``: that property
+    indexes the dict unconditionally, and a parallel state built with a different
+    ``extra_parallel_names`` (some tests use one) has no ``"ep"`` key. The question
+    here is only "is expert parallelism on?", and an absent axis means no.
+    """
+    sizes = getattr(get_parallel_state(), "extra_parallel_sizes", None)
+    return bool(sizes) and sizes.get("ep", 1) > 1
+
+
 def _expert_activation(gate: Tensor, activation: str) -> Tensor:
     """Evaluate the configured activation, whichever name it is.
 
@@ -75,7 +87,7 @@ def wrapper(
     # sharded per rank, so the inline loop's ``num_experts`` mask indexes past the
     # shard. ``gelu`` is in the served set, so keying on the activation alone would
     # send it down the sharded-weight path.
-    if not supports(activation) or get_parallel_state().ep_enabled:
+    if not supports(activation) or _experts_are_sharded():
         # One implementation of the reference path, shared with the fused rows that
         # delegate here. It carries the EP dispatch, which is why this cannot be
         # inlined: indexing a sharded weight by global expert id reads past the shard.

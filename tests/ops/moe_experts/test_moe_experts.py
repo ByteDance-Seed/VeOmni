@@ -2044,3 +2044,37 @@ def test_every_backward_attribute_exists_on_the_ctx_its_forward_built():
 
     assert checked == 4, f"expected four Functions across both modules, checked {checked}"
     assert not missing, f"backward reads a ctx attribute its forward never sets: {missing}"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_expert_sharding_is_read_without_assuming_the_axis_is_named_ep():
+    """A parallel state built with another extra axis must not raise here.
+
+    ``ParallelState.ep_enabled`` indexes ``extra_parallel_sizes["ep"]`` unconditionally,
+    and ``_init_parallel_state`` builds that dict from ``extra_parallel_names``. A state
+    initialized with, say, ``("ple",)`` therefore has no ``"ep"`` key, and asking
+    whether expert weights are sharded raised ``KeyError: 'ep'`` -- which took out an
+    Ulysses test that never touches experts, because the guard runs on every call.
+
+    The question this row needs answered is only "are experts sharded?", and a missing
+    axis means no.
+    """
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from veomni.ops.kernels.moe_experts.standard import eager
+
+    def with_sizes(sizes):
+        return mock.patch(
+            "veomni.ops.kernels.moe_experts.standard.eager.get_parallel_state",
+            lambda: SimpleNamespace(extra_parallel_sizes=sizes),
+        )
+
+    with with_sizes({"ep": 4}):
+        assert eager._experts_are_sharded()
+    with with_sizes({"ep": 1}):
+        assert not eager._experts_are_sharded()
+    with with_sizes({"ple": 2}):
+        assert not eager._experts_are_sharded()
+    with with_sizes({}):
+        assert not eager._experts_are_sharded()

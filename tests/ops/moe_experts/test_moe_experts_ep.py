@@ -624,7 +624,7 @@ def test_fused_moe_routing_weights_match_ep_projection_order(swiglu_limit: float
     )
 
 
-def _distributed_standard_ep_worker(rank, merged, activation, endpoint):
+def _distributed_standard_ep_worker(rank, merged, activation, impl, endpoint):
     """Compare real token exchange and every gradient with a non-EP replica."""
     import torch.distributed as dist
 
@@ -662,7 +662,10 @@ def _distributed_standard_ep_worker(rank, merged, activation, endpoint):
         reference_routing = routing.detach().clone().requires_grad_()
         actual_routing = routing.detach().clone().requires_grad_()
         empty = torch.empty(0, device=device, dtype=torch.bfloat16)
-        fused = resolve_op("moe_experts", "standard", "fused_triton").wrapper
+        # ``impl`` is the row under test. ``eager`` matters most here: it is what a
+        # fused row hands a non-Swish activation to, and it is where the decision to
+        # take the dispatching path lives.
+        fused = resolve_op("moe_experts", "standard", impl).wrapper
 
         def forward(x, weights, scores):
             # ``activation`` is what makes this test exercise the EP dispatch at all:
@@ -728,9 +731,10 @@ def _distributed_standard_ep_worker(rank, merged, activation, endpoint):
 
 
 @pytest.mark.launch_plan(provider=_EP_DISPATCH_PLAN)
+@pytest.mark.parametrize("impl", ["eager", "fused_triton"], ids=["eager", "fused_triton"])
 @pytest.mark.parametrize("activation", ["silu", "gelu"], ids=["silu", "gelu"])
 @pytest.mark.parametrize("merged", [False, True], ids=["split-fc1", "merged-fc1"])
-def test_distributed_standard_ep_dispatch_matches_nonep(merged, activation):
+def test_distributed_standard_ep_dispatch_matches_nonep(merged, activation, impl):
     """Exercise the compact expert schedule behind real all-to-all dispatch.
 
     Parametrized over the activation because that is where the dispatch was lost:

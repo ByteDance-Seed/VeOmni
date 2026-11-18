@@ -176,8 +176,8 @@ quantizing row, so the "refuses instead of falling back" rules do not apply to i
 
 | Row (`standard`) | Activations | When it cannot serve the call |
 | --- | --- | --- |
-| `eager` | the five names, plus anything else through the block's `act_fn` | never — it is the reference |
-| `qat`, `torchao_nvfp4` | the five names | raises, because a fallback would train at full precision |
+| `eager` | the four names, plus anything else resolved through `ACT2FN` | never — it is the reference |
+| `qat`, `torchao_nvfp4` | the four names | raises, because a fallback would train at full precision |
 | `liger_kernel` | SiLU only (Liger's `swiglu_forward`) | runs the projection modules instead |
 
 The refusal is a **forward-time** decision, inside `render` — not a config-layer or
