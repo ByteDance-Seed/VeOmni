@@ -45,6 +45,7 @@ All image tags follow this pattern:
 |---|---|---|---|
 | 910B (A2) | amd64 + arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni` | [x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86) / [arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm) |
 | A3 | arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.12-veomni` | [a3](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_a3) |
+| A5 | arm64 | `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-a5-ubuntu22.04-py3.12-veomni` | [a5](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_a5) |
 
 For the complete list of published image tags, see [Ascend Docker Supported Tags](supported_tags.md).
 
@@ -52,6 +53,7 @@ Notes:
 
 - **A2 (910B)** ships two Dockerfiles (x86 and arm64); CI merges them into a single multi-arch image sharing one tag.
 - **A3** is arm64 only.
+- **A5** is arm64 only, using CANN 9.2.1.
 - The historical `8.3.rc2` Dockerfiles (`Dockerfile.ascend_8.3.rc2_a2.x86/.arm/a3`) remain in the repo but are no longer published.
 
 ---
@@ -96,6 +98,7 @@ For complete, advanced mount and training configuration (checkpoint / dataset mo
 
 - [build_a2_docker.md](build_a2_docker.md) — A2 (910B) build and usage
 - [build_a3_docker.md](build_a3_docker.md) — A3 build and usage
+- [build_a5_docker.md](build_a5_docker.md) — A5 build and usage
 
 ---
 
@@ -105,6 +108,7 @@ Starting from a CANN base image, build locally with the in-repo Dockerfiles. For
 
 - [build_a2_docker.md](build_a2_docker.md) (x86 uses uv, arm uses pip — two environments)
 - [build_a3_docker.md](build_a3_docker.md)
+- [build_a5_docker.md](build_a5_docker.md)
 
 ---
 
