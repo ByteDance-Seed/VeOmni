@@ -95,16 +95,19 @@ def wrapper(
     eager expert contract rather than moving them through FP8 quantization.
     """
     if activation_is_not_silu(activation):
-        # This kernel computes SiLU inside the grouped GEMM *and* runs the GEMMs in
-        # FP8, so there is no seam for another activation. Delegating is not an
-        # option here -- unlike the bf16 fused rows, which lose nothing by it -- the
-        # FP8 math would be skipped and the experts would train in bf16 while the
-        # config still said ``deepgemm_fp8``.
+        # Refused here, before any of the FP8 math, because this is where the
+        # quantization is decided. ``RecomputedSwiGLU`` computes SiLU inside the
+        # grouped GEMM and recomputes it in the backward instead of saving it, so
+        # there is no seam to substitute another activation into. Handing the call
+        # to a reference row -- what the bf16 fused rows do, losing nothing -- would
+        # skip the FP8 GEMMs and train the experts in bf16 under a config that says
+        # ``deepgemm_fp8``.
         raise ValueError(
             f"moe_implementation='deepgemm_fp8' computes SiLU only, and the model asks "
-            f"for {activation!r}. Its grouped GEMM is FP8, so another activation cannot "
-            f"be substituted without dropping the quantization. Use hidden_act='silu', or "
-            f"moe_implementation='eager' to train the experts in the model dtype."
+            f"for {activation!r}. Its grouped GEMM runs in FP8 and fuses the activation, "
+            f"so another activation cannot be substituted without dropping the "
+            f"quantization. Use hidden_act='silu', or moe_implementation='eager' to train "
+            f"the experts in the model dtype."
         )
     if (
         hidden_states.device.type != "cuda"
