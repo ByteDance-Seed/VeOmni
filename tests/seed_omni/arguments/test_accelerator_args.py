@@ -265,6 +265,16 @@ def test_build_omni_model_runtime_args_rejects_an_eager_module_under_the_compose
         build_omni_model_runtime_args(args)
 
 
+def test_composed_wrap_rejects_module_mxfp8():
+    mixed_precision = {"mxfp8": {"enable": True}}
+    args = _fake_args(
+        modules_override={MODULE_B: {"accelerator": {"fsdp_config": {"mixed_precision": mixed_precision}}}}
+    )
+    args.model.accelerator.fsdp_config.fsdp_scope = "model"
+    with pytest.raises(ValueError, match=rf"fsdp_scope='model'.*MXFP8.*{MODULE_B}"):
+        build_omni_model_runtime_args(args)
+
+
 def test_deep_update_merges_sp_and_cp_from_base_and_override(monkeypatch):
     """``build_omni_module_runtime_args`` merges module overrides onto ``global_args``
     directly via ``_deep_update``, allowing a module to inherit ``ulysses_size`` from

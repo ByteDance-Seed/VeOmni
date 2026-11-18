@@ -49,6 +49,7 @@ by 32. Selected weights must not be shared. The LM head is excluded because a
 fused loss may read its weight without calling its forward.
 
 The initial scope is standalone dense Qwen3 with ordinary FSDP2 and AdamW.
+SeedOmni rejects enabled module MXFP8 recipes when the composed model owns the FSDP wrap.
 HSDP, SP/CP, TP/PP, ExtraParallel, asynchronous attention, LoRA, parameter or
 activation offload, custom parallelization, QAT and compilation are unsupported.
 Other low-precision communication options cannot be combined with this recipe.
@@ -99,7 +100,9 @@ inference runtime does not enable MXFP8 by itself.
 
 ## Validation
 
-[CPU tests](../../tests/ops/test_mxfp8_tensors.py) check independent complete-weight
+[Operator tests](../../tests/ops/test_mxfp8_tensors.py) compare native forward, input gradients
+and weight gradients with dequantized reference GEMMs on one SM100+ GPU.
+The CPU tests check independent complete-weight
 quantization against gathered shards, both weight orientations, ragged-token
 forward/backward, master I/O, fused/foreach AdamW and CPU FSDP2/DCP continuation.
 [Configuration tests](../../tests/models/test_mxfp8_config.py) cover YAML/CLI,

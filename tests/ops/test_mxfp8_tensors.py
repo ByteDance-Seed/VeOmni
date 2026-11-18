@@ -1,12 +1,7 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU numerical oracles for the MXFP8 transport representation.
-
-These deliberately emulate GEMMs; native accelerator coverage is separate. The
-transport payloads, both independent weight quantizers, autograd and master I/O
-are the production code paths. No hardware-performance claim follows from them.
-"""
+"""CPU transport and native accelerator arithmetic tests for MXFP8."""
 
 import copy
 import io
@@ -29,6 +24,7 @@ from torchao.quantization.quantize_.common import KernelPreference
 from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter
 from veomni.distributed.mxfp8 import _convert_linears, unwrap_mxfp8_tensor
 from veomni.distributed.mxfp8.tensors import MXFP8Linear, MXFP8Weight
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -75,6 +71,48 @@ def test_sharded_quantization_matches_both_full_master_orientations(world_size):
     assert not torch.equal(col.qdata.view(torch.uint8), double_quantized.qdata.view(torch.uint8))
 
 
+def _reference_linear(master, x, dy):
+    x2d = x.detach().flatten(0, 1)
+    dy2d = dy.flatten(0, 1)
+    pad = (-x2d.shape[0]) % 32
+    xp, gp = F.pad(x2d, (0, 0, 0, pad)), F.pad(dy2d, (0, 0, 0, pad))
+    # Explicitly dequantize independently derived operands: the oracle does not
+    # call either the bridge's matmul or autograd implementation.
+    row_weight = _reference_quantize(master).dequantize(torch.bfloat16)
+    col_weight_t = _reference_quantize(master.t()).dequantize(torch.bfloat16)
+    expected = _reference_quantize(xp).dequantize() @ row_weight.t()
+    expected = expected[: x2d.shape[0]].reshape(*x.shape[:-1], master.shape[0])
+    dx = _reference_quantize(gp).dequantize() @ col_weight_t.t()
+    dw = _reference_quantize(gp.t()).dequantize() @ _reference_quantize(xp.t()).dequantize().t()
+    return expected, dx[: x2d.shape[0]].reshape_as(x), dw
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+def test_native_linear_matches_independent_quantized_oracle():
+    if not IS_CUDA_AVAILABLE or torch.version.hip is not None or get_gpu_compute_capability() < 100:
+        pytest.skip("Requires native MXFP8 on an NVIDIA SM100+ GPU.")
+    generator = torch.Generator().manual_seed(31)
+    master = torch.randn(128, 64, generator=generator)
+    x = torch.randn(1, 33, 64, dtype=torch.bfloat16, generator=generator)
+    dy = torch.randn(1, 33, 128, dtype=torch.bfloat16, generator=generator)
+    expected, dx, dw = _reference_linear(master, x, dy)
+
+    device = get_device_type()
+    projection = nn.Linear(64, 128, bias=False)
+    projection.weight = nn.Parameter(master.to(device))
+    layer = MXFP8Linear.from_float(projection, all_gather=False)
+    native_x = x.to(device).requires_grad_()
+    output = layer(native_x)
+    (output.float() * dy.to(device)).sum().backward()
+
+    # The independent CPU GEMMs and the native MX GEMMs both round to BF16.
+    # Allow one BF16 relative spacing and a small absolute floor near zero.
+    for actual, reference in ((output, expected), (native_x.grad, dx), (layer.weight.grad, dw)):
+        torch.testing.assert_close(
+            actual.detach().cpu(), reference.to(actual.dtype), rtol=torch.finfo(torch.bfloat16).eps, atol=1e-5
+        )
+
+
 @pytest.mark.parametrize("tokens", [1, 17, 32, 65])
 def test_gathered_linear_forward_and_gradients_match_independent_quantized_oracle(tokens):
     torch.manual_seed(31)
@@ -89,20 +127,10 @@ def test_gathered_linear_forward_and_gradients_match_independent_quantized_oracl
     output = layer(x)
     output.backward(dy)
 
-    x2d = x.detach().flatten(0, 1)
-    dy2d = dy.flatten(0, 1)
-    pad = (-x2d.shape[0]) % 32
-    xp, gp = F.pad(x2d, (0, 0, 0, pad)), F.pad(dy2d, (0, 0, 0, pad))
-    # Explicitly dequantize independently derived operands: the oracle does not
-    # call either the bridge's matmul or autograd implementation.
-    row_weight = _reference_quantize(master).dequantize(torch.bfloat16)
-    col_weight_t = _reference_quantize(master.t()).dequantize(torch.bfloat16)
-    expected = _reference_quantize(xp).dequantize() @ row_weight.t()
-    expected = expected[: x2d.shape[0]].reshape_as(output) + layer.bias.detach()
-    dx = _reference_quantize(gp).dequantize() @ col_weight_t.t()
-    dw = _reference_quantize(gp.t()).dequantize() @ _reference_quantize(xp.t()).dequantize().t()
+    expected, dx, dw = _reference_linear(master, x, dy)
+    expected = expected + layer.bias.detach()
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
-    torch.testing.assert_close(x.grad, dx[: x2d.shape[0]].reshape_as(x), rtol=0, atol=0)
+    torch.testing.assert_close(x.grad, dx, rtol=0, atol=0)
     torch.testing.assert_close(layer.weight.grad, dw, rtol=0, atol=0)
     torch.testing.assert_close(layer.bias.grad, dy.sum((0, 1)), rtol=0, atol=0)
 

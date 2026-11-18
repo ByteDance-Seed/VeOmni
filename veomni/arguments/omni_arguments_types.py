@@ -842,7 +842,7 @@ def _validate_training_task_data(train: OmniTrainingArguments, data: OmniDataArg
 
 
 def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
-    """Reject an eager module under a top-level ``fsdp_scope='model'`` before any weights load."""
+    """Reject module settings the composed FSDP wrap cannot honor before loading weights."""
     fsdp_config = accelerator.fsdp_config
     if fsdp_config.fsdp_scope != "model" or fsdp_config.fsdp_mode == "eager":
         return
@@ -855,6 +855,12 @@ def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, O
             f"unwrapped; these use fsdp_mode='eager': {eager}. Run with fsdp_scope='module', or "
             "give them fsdp2 / ddp."
         )
+    for name, module_args in modules.items():
+        recipe = module_args.accelerator.fsdp_config.mixed_precision.mxfp8
+        if recipe is not None and recipe.enable:
+            raise ValueError(
+                f"fsdp_scope='model' does not support MXFP8 on module {name!r}; use standalone dense Qwen3."
+            )
 
 
 def _validate_omni_dp_size(

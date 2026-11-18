@@ -152,7 +152,10 @@ jobs:
           uv sync --frozen --extra gpu --extra float8 --group dev
       - name: Run the torchao float8 tests
         run: |
-          uv run --no-sync pytest -q tests/models/test_float8_training.py tests/models/test_mxfp8_training.py
+          uv run --no-sync pytest -q \
+            tests/models/test_float8_training.py \
+            tests/models/test_mxfp8_training.py \
+            tests/ops/test_mxfp8_tensors.py::test_native_linear_matches_independent_quantized_oracle
           CUDA_VISIBLE_DEVICES="" uv run --no-sync pytest -q tests/ops/test_mxfp8_tensors.py tests/models/test_mxfp8_loading.py
       - name: Run the torchao QAT tests
         shell: bash
