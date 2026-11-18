@@ -95,26 +95,16 @@ def wrapper(
     eager expert contract rather than moving them through FP8 quantization.
     """
     if activation_is_not_silu(activation):
-        # This kernel computes SiLU inside the grouped GEMM; any other activation
-        # -- including one ``veomni.ops.activation`` does not evaluate, which the
-        # ``eager`` row covers through the model's own ``act_fn`` -- runs there.
-        from . import eager as _eager
-
-        return _eager.wrapper(
-            hidden_states,
-            routing_weights,
-            selected_experts,
-            fc1_1_weight,
-            fc1_2_weight,
-            fc2_weight,
-            fc1_1_2_weight,
-            num_experts=num_experts,
-            swiglu_limit=swiglu_limit,
-            assume_distinct_experts=assume_distinct_experts,
-            block_size=block_size,
-            expert_dtype=expert_dtype,
-            activation=activation,
-            act_fn=act_fn,
+        # This kernel computes SiLU inside the grouped GEMM *and* runs the GEMMs in
+        # FP8, so there is no seam for another activation. Delegating is not an
+        # option here -- unlike the bf16 fused rows, which lose nothing by it -- the
+        # FP8 math would be skipped and the experts would train in bf16 while the
+        # config still said ``deepgemm_fp8``.
+        raise ValueError(
+            f"moe_implementation='deepgemm_fp8' computes SiLU only, and the model asks "
+            f"for {activation!r}. Its grouped GEMM is FP8, so another activation cannot "
+            f"be substituted without dropping the quantization. Use hidden_act='silu', or "
+            f"moe_implementation='eager' to train the experts in the model dtype."
         )
     if (
         hidden_states.device.type != "cuda"

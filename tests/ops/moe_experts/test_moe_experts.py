@@ -1541,27 +1541,31 @@ def test_the_eager_row_runs_the_configured_activation(activation):
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize(
     "impl",
-    ["eager", "fused_quack", "deepgemm_fp8", "fused_npu", "fused_mlu"],
+    ["eager", "fused_quack", "fused_npu", "fused_mlu"],
 )
 def test_a_fused_row_delegates_a_non_silu_activation_to_eager(impl):
     """Rows whose kernel fuses SiLU agree with ``eager`` for every other activation.
 
-    ``fused_quack``, ``deepgemm_fp8``, ``fused_npu`` and ``fused_mlu`` compute
-    ``act(gate) * up`` inside their grouped GEMM, so another activation has no seam
-    to reach. They hand that call to the ``eager`` row, which is the reference
-    implementation and the same math models used before the activation became a call
-    argument -- hence ``rtol=0, atol=0`` here rather than a loose tolerance.
+    ``fused_quack``, ``fused_npu`` and ``fused_mlu`` compute ``act(gate) * up``
+    inside their grouped GEMM, so another activation has no seam to reach. They hand
+    that call to the ``eager`` row, which is the reference implementation and the same
+    math models used before the activation became a call argument -- hence
+    ``rtol=0, atol=0`` here rather than a loose tolerance. They lose nothing by it:
+    those rows do bf16 math and ignore ``expert_dtype``.
+
+    ``deepgemm_fp8`` is deliberately absent. Its GEMM is FP8, so handing the call
+    away would skip the quantization and train the experts in bf16 under a config
+    that said otherwise -- it refuses instead, covered below.
 
     This also pins the delegation's *placement*: it has to precede each row's
     hardware guard, or a non-SiLU model on the wrong device fails with a hardware
     error instead of running on the reference row.
     """
-    from veomni.ops.kernels.moe_experts.standard import deepgemm, eager, mlu, npu, quack
+    from veomni.ops.kernels.moe_experts.standard import eager, mlu, npu, quack
 
     rows = {
         "eager": eager,
         "fused_quack": quack,
-        "deepgemm_fp8": deepgemm,
         "fused_npu": npu,
         "fused_mlu": mlu,
     }
@@ -1766,3 +1770,44 @@ def test_absent_clamp_masks_are_never_inverted():
         if "mask_fc1_" in comparisons and "is not None" in comparisons and "~mask_fc1_" in body:
             offenders.append(comparisons)
     assert not offenders, f"a clamp mask is tested with `is not None`, but forward saves an empty tensor: {offenders}"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_quantizing_row_refuses_an_activation_it_cannot_evaluate():
+    """Neither quantizing row may quietly fall back to the model dtype.
+
+    ``qat`` and ``deepgemm_fp8`` round the expert GEMMs, so an activation they cannot
+    evaluate has no correct answer: handing it to a reference row, or to the model's
+    own ``act_fn``, would train the experts at full precision while the config claimed
+    quantization. Both refuse, and both say which selection to use instead.
+
+    ``moe_experts``' bf16 fused rows are the contrast: they delegate, because they
+    round nothing and the reference path is exactly as precise.
+    """
+    from transformers.activations import ACT2FN
+
+    from veomni.ops.kernels.moe_experts.standard import deepgemm, qat
+
+    torch.manual_seed(0)
+    experts, hidden, intermediate, tokens, top_k = 3, 128, 256, 4, 2
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
+    gate_up = torch.randn(experts, 2 * intermediate, hidden, dtype=torch.bfloat16)
+    down = torch.randn(experts, hidden, intermediate, dtype=torch.bfloat16)
+    routes = torch.randint(0, experts, (tokens, top_k))
+    routing = torch.softmax(torch.randn(tokens, top_k), dim=-1).to(torch.bfloat16)
+    empty = gate_up.new_empty(0)
+
+    for row, name in ((qat, "qat"), (deepgemm, "deepgemm_fp8")):
+        with pytest.raises(ValueError, match=f"moe_implementation='{name}'"):
+            row.wrapper(
+                x,
+                routing,
+                routes,
+                empty,
+                empty,
+                down,
+                gate_up,
+                num_experts=experts,
+                activation="relu",
+                act_fn=ACT2FN["relu"],
+            )
