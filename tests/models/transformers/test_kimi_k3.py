@@ -559,6 +559,47 @@ def test_kda_module_matches_source_layout():
         assert tensor.shape == patched_state[key].shape, key
 
 
+def test_source_module_has_no_patch_provided_member_references():
+    """``self.<x>`` references in the patch-relocated namespaces must be
+    defined in source/.
+
+    The patch layer removes members from the vendored module and re-adds
+    them via ``override_method``; a call site left behind in ``source/``
+    constructs fine and only raises ``AttributeError`` at forward -- the
+    round-3 drift class (``_attn_selective_recompute`` and the ``chunk_kda``
+    call sites moved to the patch layer while the source forwards kept
+    calling them). ``test_kda_module_matches_source_layout`` cannot see it:
+    it compares ``state_dict()`` without ever running forward.
+
+    The scan stays scoped to the namespaces the patch layer actually
+    relocates (``_attn*`` / ``veomni*``) and resolves definitions per class,
+    so there is no cross-class union and no allowlist: both round-3
+    regressions are covered with zero maintenance surface. The behavioral
+    companion is ``test_source_kda_module_forward_runs``.
+    """
+    import ast
+    import inspect
+
+    from veomni.models.transformers.kimi_k3.source import modeling_kimi_k3 as source_module
+
+    tree = ast.parse(inspect.getsource(source_module))
+    dangling = set()
+    for cls in (n for n in tree.body if isinstance(n, ast.ClassDef)):
+        defined = {m.name for m in cls.body if isinstance(m, ast.FunctionDef)}
+        assigned = {
+            target.attr
+            for node in ast.walk(cls)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self"
+        }
+        for node in ast.walk(cls):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
+                if node.attr.startswith(("_attn", "veomni")) and node.attr not in defined | assigned:
+                    dangling.add(f"{cls.name}.{node.attr}")
+    assert not dangling, f"source/ references patch-provided members: {sorted(dangling)}"
+
+
 def test_position_id_func_is_picklable():
     """Dataloader workers (spawn start method) pickle the VLM trainer's
     dataset transform, which captures the position-id func returned by
