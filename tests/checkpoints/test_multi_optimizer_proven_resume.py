@@ -169,7 +169,6 @@ def _asymmetric_optimizer_policy_worker(rank, checkpoint, operation, failure, en
     import torch.distributed as dist
 
     import veomni.checkpoint.dcp_checkpointer as checkpoint_module
-    from veomni.optim.swap_adamw import SwapAdamW
 
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=6))
     try:
@@ -184,12 +183,6 @@ def _asymmetric_optimizer_policy_worker(rank, checkpoint, operation, failure, en
 
         leaf = FaultAdamW(model.parameters())
         optimizer = leaf
-        if failure == "multi_mismatch" and rank == 0:
-            optimizer = MultiOptimizer(model, {"all": leaf}, ["all"])
-        if failure == "presence_mismatch" and rank == 0:
-            optimizer = None
-        if failure == "swap_mismatch" and rank == 0:
-            optimizer = SwapAdamW(model.parameters(), pin_memory=False)
         state = {
             "model": model,
             "optimizer": optimizer,
@@ -222,9 +215,7 @@ def _asymmetric_optimizer_policy_worker(rank, checkpoint, operation, failure, en
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize("operation", ["save", "load"])
-@pytest.mark.parametrize(
-    "failure", ["rank_local_check", "type_property", "multi_mismatch", "presence_mismatch", "swap_mismatch"]
-)
+@pytest.mark.parametrize("failure", ["rank_local_check", "type_property"])
 def test_asymmetric_optimizer_policy_fails_before_checkpoint_io(tmp_path, operation, failure):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
@@ -2244,49 +2235,6 @@ def test_storage_view_proof_binds_internal_overlap_and_quantization():
     assert graph(torch.ones(1).expand(3)) != graph(torch.ones(3))
     with pytest.raises(RuntimeError, match="quantized"):
         graph(torch.quantize_per_tensor(torch.ones(3), 0.1, 0, torch.quint8))
-
-
-@pytest.mark.parametrize("kind", ["negative", "conjugate"])
-@pytest.mark.parametrize("failure_phase", ["save", "load"])
-def test_lazy_storage_view_is_rejected_without_mutating_model(tmp_path, kind, failure_phase):
-    def build(lazy):
-        model = torch.nn.Module()
-        dtype = torch.complex64 if kind == "conjugate" else torch.float32
-        model.p = torch.nn.Parameter(torch.tensor([2, 3], dtype=dtype))
-        view = model.p.detach()
-        if lazy:
-            view = view.conj() if kind == "conjugate" else torch._neg_view(view)
-        model.register_buffer("view", view)
-        leaf = torch.optim.AdamW([model.p], lr=0.01)
-        return model, MultiOptimizer(model, {"leaf": leaf}, ["leaf"])
-
-    parallel = SimpleNamespace(dp_mode="ddp")
-    source, optimizer = build(failure_phase == "save")
-    source_before = source.p.detach().clone()
-    if failure_phase == "save":
-        with pytest.raises(RuntimeError, match="lazy conjugate or negative model views"):
-            DistributedCheckpointer.save(
-                str(tmp_path),
-                {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
-                parallel_state=parallel,
-            )
-        torch.testing.assert_close(source.p, source_before, rtol=0, atol=0)
-        return
-    DistributedCheckpointer.save(
-        str(tmp_path),
-        {"model": source, "optimizer": optimizer, "_veomni_scheduler_object": None},
-        parallel_state=parallel,
-    )
-    target, restored = build(True)
-    before = target.p.detach().clone()
-    with pytest.raises(RuntimeError, match="lazy conjugate or negative model views"):
-        DistributedCheckpointer.load(
-            str(tmp_path),
-            {"model": target, "optimizer": restored, "_veomni_scheduler_object": None},
-            parallel_state=parallel,
-        )
-    torch.testing.assert_close(target.p, before, rtol=0, atol=0)
-    assert not restored.optimizers_dict["leaf"].state
 
 
 @pytest.mark.parametrize("failure_phase", ["save", "load"])

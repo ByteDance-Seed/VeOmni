@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
 from ....registry import SavedState
 from ..standard.eager import empty_output, linear, linear_backward
@@ -139,3 +139,53 @@ def backward(grad_output: Tensor, saved: SavedState) -> tuple[Tensor | None, ...
         grad_down_w,
         grad_down_b,
     )
+
+
+#: The two config spellings this variant computes. Both resolve to the same
+#: tanh-approximate GELU, which is what ``gelu_tanh_mul`` evaluates.
+TANH_GELU = frozenset({"gelu_pytorch_tanh", "gelu_python_tanh"})
+
+
+def wrapper(mlp: nn.Module, x: Tensor, *, activation: str = "gelu_pytorch_tanh") -> Tensor:
+    """Row entry point: take the GeGLU MLP module and run it in the model dtype.
+
+    The variant is fixed to tanh-approximate GELU, so *activation* is not a way to
+    run something else -- it is the model's ``hidden_act``, passed so the row can
+    tell when it is the wrong row. Gemma3 configures ``gelu_pytorch_tanh`` today;
+    a config that asks for another activation still has to compute that activation,
+    so the row runs the projection modules through the model's own ``act_fn``, which
+    is exact for any of them. That check used to sit in the model's forward, as an
+    ``if`` around the handle call.
+
+    A projection the row cannot read by weight -- a LoRA wrapper, an ``nn.Linear``
+    subclass -- takes the same module path, as does an empty batch.
+    """
+    from .._module import plain_projections
+
+    gate_proj, up_proj, down_proj = mlp.gate_proj, mlp.up_proj, mlp.down_proj
+    if activation not in TANH_GELU:
+        # The config asks for another activation than this variant computes, so the
+        # row cannot be the one that runs it. The block's own ``act_fn`` is exact for
+        # any of them, and it is the expression the model used before this family.
+        return down_proj(mlp.act_fn(gate_proj(x)) * up_proj(x))
+
+    if not plain_projections(mlp) or x.numel() == 0:
+        # A projection the row cannot read by weight runs its own ``forward``, and a
+        # zero-token batch does too: ``forward``'s empty shortcut returns a detached
+        # zero, which would cut the block out of the backward pass for exactly the
+        # ranks that hold no tokens. The modules are exact on zero elements and keep
+        # the graph.
+        return down_proj(gelu_tanh_mul(gate_proj(x), up_proj(x)))
+
+    gate, up, down = mlp.gate_proj, mlp.up_proj, mlp.down_proj
+    empty = gate.weight.new_empty(0)
+    output, _ = forward(
+        x,
+        gate.weight,
+        gate.bias if gate.bias is not None else empty,
+        up.weight,
+        up.bias if up.bias is not None else empty,
+        down.weight,
+        down.bias if down.bias is not None else empty,
+    )
+    return output

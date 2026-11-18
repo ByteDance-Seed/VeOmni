@@ -17,7 +17,7 @@
 ``compound`` holds nested-handle helpers. Importing this package registers
 ops whose concrete implementations live under ``kernels``: ``rms_norm``,
 ``layer_norm``, ``rope``, ``async_ulysses_*``, ``dsa_attention`` /
-``dsa_indexer``, ``swiglu_mlp``, ``moe_experts``, ``loss`` (LB + CE),
+``dsa_indexer``, ``gated_mlp``, ``moe_experts``, ``loss`` (LB + CE),
 ``gated_delta_rule``, and ``attention``. Process-wide integrations live in
 ``install`` and the opt-in
 ATen overrides live in ``batch_invariant``.

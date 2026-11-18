@@ -62,14 +62,14 @@ the saved checkpoint. Change these only with an explicitly verified migration.
 
 ### Save and load call sites
 
-[`_local_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L228)
+[`_local_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L141)
 records `algorithm_identity`, each parameter's `state_dtype`, and
 `state_is_offloaded` in the checkpoint identity; a mismatch rejects resume
 before applying state. During save,
 [`_validate_source_optimizer_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L121)
 uses `state_dtype` to check initialized fields against their declared precision.
 During load,
-[`_prepare_multi_optimizer_saved_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L466)
+[`_prepare_multi_optimizer_saved_states`](../../veomni/checkpoint/multi_optimizer_checkpoint.py#L486)
 checks stored field dtypes and uses `state_is_offloaded` to allocate missing
 destination state on CPU when the adapter specifies offload.
 [`rank_local_adamw_context`](../../veomni/optim/checkpoint_adapter.py#L55)
