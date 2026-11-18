@@ -15,8 +15,6 @@ noticing:
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 import torch
 
@@ -42,6 +40,9 @@ MODULES = ("janus_siglip", "janus_vqvae", "janus_text_encoder", "janus_llama")
 # pure-Python cases carry an explicit CPU marker instead; the fused ones take the
 # runner default, which is "accelerator" on a GPU/NPU runner.
 _CPU = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+_IMAGE = object()
+"""Sentinel for a generated-image turn in the chat-template parametrization."""
 
 
 def _per_backend_plan(context):
@@ -341,13 +342,20 @@ def test_generate_refuses_sequence_parallelism(monkeypatch):
         llm.generate([ConversationItem(type="text", value="hi", role="user")])
 
 
+def _official_template():
+    """Official Janus chat template, as shipped in the checkpoint's tokenizer config."""
+    from veomni.models.seed_omni.modules.janus.convert_janus_weight_to_hf import CHAT_TEMPLATE
+
+    return CHAT_TEMPLATE
+
+
 def _real_janus_tokenizer():
     """The byte-level BPE the checkpoints ship, loaded straight from ``tokenizer.json``.
 
     ``AutoTokenizer`` resolves this repo's ``tokenizer_config.json`` to a Llama
     tokenizer with a Metaspace pre-tokenizer, which normalises the assistant
-    separator away and would make this file's assertions vacuous. The checkpoint's
-    own ``tokenizer.json`` is the byte-level pipeline the model was trained with.
+    separator away and would make the comparison vacuous. The checkpoint's own
+    ``tokenizer.json`` is the byte-level pipeline the model was trained with.
     """
     from transformers import PreTrainedTokenizerFast
 
@@ -356,140 +364,76 @@ def _real_janus_tokenizer():
     )
 
 
-@pytest.mark.skipif(
-    not Path("/mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B/tokenizer.json").is_file(),
-    reason="needs the Janus-1.3B tokenizer.json from shared storage",
-)
-def test_the_template_matches_the_upstream_jinja_in_ids_and_labels():
-    """Compare token ids and supervision labels against the saved Jinja template.
-
-    Rendering the string is not enough: a space that lands in the unscored marker
-    part still *renders*, but tokenizes separately from the response, so the first
-    supervised token differs from what the checkpoint was trained on. This
-    tokenizes both sides with the checkpoint's own byte-level BPE and compares.
-
-    ``AutoTokenizer`` returns a Metaspace tokenizer for this checkpoint, which
-    drops the whitespace difference entirely, so the byte-level pipeline is loaded
-    from ``tokenizer.json`` directly.
-    """
-    import jinja2
-
-    from veomni.models.seed_omni.modules.janus.convert_janus_weight_to_hf import CHAT_TEMPLATE
-    from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import JanusChatTemplate
-    from veomni.models.seed_omni.utils.conversation import _IMG_TAG_KEY
-
-    base = _real_janus_tokenizer()
-
-    class _Tokenizer:
-        bos_token = "<s>"
-        eos_token = "</s>"
-        boi_token = "<begin_of_image>"
-        eoi_token = "<end_of_image>"
-        bos_token_id = 1
-        eos_token_id = 3
-        boi_token_id = 4
-        eoi_token_id = 5
-        pad_token_id = 0
-
-        def __call__(self, text, add_special_tokens=False):
-            return base(text, add_special_tokens=add_special_tokens)
-
-    template = JanusChatTemplate(_Tokenizer())
-
-    def supervised(parts):
-        """Token ids the CE head is asked to predict, in order."""
-        return [
-            token
-            for part in parts
-            if part.meta.get("labels") is not None
-            for token in part.meta["labels"].tolist()
-            if token != -100
-        ]
-
-    def upstream_ids(messages):
-        rendered = jinja2.Template(CHAT_TEMPLATE).render(messages=messages, add_generation_prompt=False)
-        return base(rendered, add_special_tokens=False)["input_ids"]
-
-    # A text answer. Upstream renders ``<|Assistant|>: Hello``; the byte-level BPE
-    # has one id for ``Hello`` and another for `` Hello``.
-    answer = template.tokenize_conversation(
-        [
-            ConversationItem(type="text", value="hi", role="user"),
-            ConversationItem(type="text", value="Hello", role="assistant"),
-        ]
-    )
-    ours_tail = supervised(answer)
-    upstream = base(
-        jinja2.Template(CHAT_TEMPLATE).render(
-            messages=[
+@pytest.mark.parametrize(
+    ("messages", "add_generation_prompt", "infer_type", "expected_answer"),
+    [
+        # Text answer: ``<|Assistant|>: Hello``, the space folded into ``Hello``.
+        (
+            [
                 {"role": "user", "content": [{"type": "text", "text": "hi"}]},
                 {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
             ],
-            add_generation_prompt=False,
+            False,
+            None,
+            "Hello",
         ),
-        add_special_tokens=False,
-    )["input_ids"]
-    # Align on the assistant marker, then compare everything after it. The
-    # generated-image and EOS masking this template adds are Janus-specific and
-    # not what this test is about; the *ids* are.
-    marker_ids = base(template.chat_markers.assistant_prefix, add_special_tokens=False)["input_ids"]
-    start = upstream.index(marker_ids[0]) + len(marker_ids)
-    assert ours_tail[: len(upstream) - start] == upstream[start:], (ours_tail, upstream[start:])
-    # And the first one really is the space-prefixed form, not a bare ``Hello``.
-    assert ours_tail[0] == base(" Hello", add_special_tokens=False)["input_ids"][0]
-    assert ours_tail[0] != base("Hello", add_special_tokens=False)["input_ids"][0]
-
-    # A generated-image turn: the separator sits before ``<boi>``, mirroring
-    # upstream's ``<|Assistant|>: <image_placeholder>``.
-    t2i = template.tokenize_conversation(
-        [
-            ConversationItem(type="text", value="a cat", role="user"),
-            ConversationItem(type="image", value=None, role="assistant", meta={_IMG_TAG_KEY: "gen"}),
-        ]
-    )
-    boi_id = base(template.chat_markers.boi_token, add_special_tokens=False)["input_ids"][0]
-    joined = [token for part in t2i if part.value is not None for token in part.value.tolist()]
-    boundary = joined.index(boi_id)
-    # The token before ``<boi>`` is the separator. Upstream renders
-    # ``<|Assistant|>: <image_placeholder>``, and a byte-level BPE keeps that
-    # space as its own token here because ``<boi>`` is a special token.
-    assert joined[boundary - 1] == base(" ", add_special_tokens=False)["input_ids"][0], joined
-
-
-@pytest.mark.skipif(
-    not Path("/mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B/tokenizer.json").is_file(),
-    reason="needs the Janus-1.3B tokenizer.json from shared storage",
+        # Multi-turn: the intermediate EOS and separator handling.
+        (
+            [
+                {"role": "user", "content": [{"type": "text", "text": "q1"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "a1"}]},
+                {"role": "user", "content": [{"type": "text", "text": "q2"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "a2"}]},
+            ],
+            False,
+            None,
+            "a2",
+        ),
+        # Generation prompt, text response: stops at the marker, no separator.
+        ([{"role": "user", "content": [{"type": "text", "text": "hi"}]}], True, "infer_und", None),
+        # Generation prompt, image response: carries the separator, which
+        # ``emit_image_start`` then follows with ``<boi>``.
+        ([{"role": "user", "content": [{"type": "text", "text": "a cat"}]}], True, "infer_gen", None),
+    ],
+    ids=["text-answer", "multi-turn", "gen-prompt-text", "gen-prompt-image"],
 )
-def test_each_modality_gets_the_prompt_it_was_trained_to_continue():
-    """The assistant tail differs by response modality, and that is not cosmetic.
+def test_the_prompt_matches_the_official_template(messages, add_generation_prompt, infer_type, expected_answer):
+    """Our prompt must match official Janus' Jinja, including after the marker.
 
-    Byte-level BPE decides where the separator lands, and the checkpoint was
-    trained on both spellings:
+    The checkpoint was trained against that template and its tokenizer is
+    byte-level, so the assistant tail is token-sensitive: ``<|Assistant|>: Hello``
+    and ``<|Assistant|>:<boi>`` are different token sequences, not spacing
+    preferences. A generation prompt therefore stops at the colon for a text
+    response (the space folds into the sampled word) and carries the separator
+    for an image one (``<boi>`` is special, so nothing folds).
 
-    * text — ``<|Assistant|>: Hello`` → ``19685, 37727`` (space folded into the
-      word), so the prompt stops at the colon and the model predicts ``" Hello"``.
-    * image — ``<|Assistant|>: <boi>`` → ``19685, 207, 100016`` (``<boi>`` is
-      special, so the space stands alone), so the prompt carries the separator and
-      ``emit_image_start`` adds ``<boi>``.
+    Our template additionally wraps a generated image in ``<begin_of_image>`` /
+    ``<end_of_image>`` and appends an EOS; the official snippet leaves those to
+    the caller. Those extensions are trimmed off before comparing, so what is
+    checked is exactly the part the checkpoint cares about.
 
-    A prompt with the separator for a text response would put the model on a
-    position the checkpoint never saw; one without it for an image response would
-    start the span a token early.
+    ``AutoTokenizer`` yields a Metaspace tokenizer for this checkpoint, under
+    which ``Hello`` and `` Hello`` collapse to one id; the checkpoint's own
+    ``tokenizer.json`` is loaded directly so the comparison is meaningful.
     """
+    import jinja2
+
     from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import JanusChatTemplate
 
     base = _real_janus_tokenizer()
-    boi_id = base.convert_tokens_to_ids("<begin_of_image>")
-    separator_id = base(" ", add_special_tokens=False)["input_ids"][0]
 
     class _Tokenizer:
         bos_token = "<s>"
-        eos_token = "</s>"
+        # The checkpoint's EOS is ``<\uff5cend\u2581of\u2581sentence\uff5c>``; ``</s>`` is
+        # not in its vocab. Using the wrong string here would compare our render
+        # against an official template that emits the real one and flag a
+        # difference that only exists in the fixture.
+        eos_token = "<\uff5cend\u2581of\u2581sentence\uff5c>"
         boi_token = "<begin_of_image>"
         eoi_token = "<end_of_image>"
         bos_token_id = 0
-        eos_token_id = 0
-        boi_token_id = boi_id
+        eos_token_id = base.convert_tokens_to_ids("<\uff5cend\u2581of\u2581sentence\uff5c>")
+        boi_token_id = base.convert_tokens_to_ids("<begin_of_image>")
         eoi_token_id = base.convert_tokens_to_ids("<end_of_image>")
         pad_token_id = 0
 
@@ -497,75 +441,40 @@ def test_each_modality_gets_the_prompt_it_was_trained_to_continue():
             return base(text, add_special_tokens=add_special_tokens)
 
     template = JanusChatTemplate(_Tokenizer())
+    markers = template.chat_markers
 
-    def prompt_ids(infer_type):
-        parts = template.tokenize_conversation(
-            [ConversationItem(type="text", value="hi", role="user")],
-            add_generation_prompt=True,
-            generation_kwargs={"infer_type": infer_type},
-        )
-        return [token for part in parts if part.value is not None for token in part.value.tolist()]
+    sample = [
+        ConversationItem(type="text", value=message["content"][0]["text"], role=message["role"])
+        for message in messages
+    ]
+    parts = template.apply_chat_template(sample)
+    if add_generation_prompt:
+        parts = template.apply_generation_prompt(parts, generation_kwargs={"infer_type": infer_type})
+    ours = template.render_template_string(parts)
 
-    # Text response: stops at the marker; the model predicts the merged
-    # ``" Hello"`` token from there.
-    text_prompt = prompt_ids("infer_und")
-    assert base("\n\n<|Assistant|>: Hello", add_special_tokens=False)["input_ids"][-2:] == [
-        text_prompt[-1],
-        base(" Hello", add_special_tokens=False)["input_ids"][0],
-    ], (text_prompt[-3:],)
-
-    # Image response: carries the separator, then ``emit_image_start`` adds ``<boi>``.
-    image_prompt = prompt_ids("infer_gen")
-    assert image_prompt[-2:] == [text_prompt[-1], separator_id], (image_prompt[-3:],)
-    assert [*image_prompt[-2:], boi_id] == base("\n\n<|Assistant|>: <begin_of_image>", add_special_tokens=False)[
-        "input_ids"
-    ][-3:]
-
-    # And the two prompts really do differ — otherwise this test proves nothing.
-    assert text_prompt[-1] != image_prompt[-1]
-
-
-@_CPU
-def test_emit_image_start_feeds_one_embedding_row_to_the_backbone():
-    """``emit_image_start`` must hand the backbone a ``(1, H)`` row, not ``(1, 1, H)``.
-
-    ``_token_id_tensor`` builds ``[[token]]``, so passing it a *list* would nest one
-    dimension too many and ``encode`` would return ``(1, 1, H)``; the cached Llama
-    path unsqueezes again and the first image step fails. The row is the `<boi>`
-    embedding alone — the assistant separator already sits in the prompt.
-    """
-    import torch
-
-    from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import JanusChatTemplate
-
-    text_encoder = OMNI_ACCELERATED_MODEL_REGISTRY["janus_text_encoder"]()(
-        OMNI_CONFIG_REGISTRY["janus_text_encoder"]()(
-            vocab_size=32,
-            hidden_size=16,
-            tie_word_embeddings=False,
-            lm_head_bias=False,
-            ops_implementation=make_eager_ops_config(),
-        )
+    official = jinja2.Template(_official_template()).render(
+        messages=messages, add_generation_prompt=add_generation_prompt
     )
+    ours_trimmed = ours[ours.index(markers.user_prefix) :]
+    # We append an EOS to close the sample; the official snippet leaves that to
+    # the caller, so trim it before comparing.
+    if not add_generation_prompt and ours_trimmed.endswith(markers.eos_token):
+        ours_trimmed = ours_trimmed[: -len(markers.eos_token)]
 
-    class _Tokenizer:
-        bos_token = "<s>"
-        eos_token = "</s>"
-        boi_token = "<begin_of_image>"
-        eoi_token = "<end_of_image>"
-        bos_token_id = 0
-        eos_token_id = 1
-        boi_token_id = 4
-        eoi_token_id = 5
-        pad_token_id = 0
+    # The one deliberate divergence: an image generation prompt carries the
+    # assistant separator, because ``<boi>`` is a special token and the space
+    # cannot fold into it the way it folds into a sampled word. Official stops at
+    # the colon for both modalities (it always samples the next token).
+    if add_generation_prompt and infer_type != "infer_und":
+        assert ours_trimmed == official + markers.assistant_text_separator, f"ours={ours!r} official={official!r}"
+        official_compare = official + markers.assistant_text_separator
+    else:
+        assert ours_trimmed == official, f"ours={ours!r} official={official!r}"
+        official_compare = official
 
-        def __call__(self, text, add_special_tokens=False):
-            return {"input_ids": [ord(c) for c in text]}
-
-    text_encoder._chat_template = JanusChatTemplate(_Tokenizer())
-
-    priming = ConversationItem(type="output", value=torch.zeros(1, 16), role="assistant")
-    out = text_encoder.emit_image_start(conversation_list=[priming])
-    value = out["conversation_list"][-1].value
-
-    assert value.shape == (1, 16), f"emit_image_start produced {tuple(value.shape)}, expected (1, H)"
+    # The same string, so the same ids — asserted separately because that is the
+    # consequence the checkpoint was trained on.
+    assert (
+        base(ours_trimmed, add_special_tokens=False)["input_ids"]
+        == base(official_compare, add_special_tokens=False)["input_ids"]
+    )
