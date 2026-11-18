@@ -78,7 +78,7 @@ should not be expected to match bitwise.
 
 The [parallel builder](../../veomni/distributed/torch_parallelize.py#L1042)
 [validates the recipe](../../veomni/distributed/mxfp8/__init__.py#L77),
-[converts projections](../../veomni/distributed/mxfp8/__init__.py#L222) after
+[converts projections](../../veomni/distributed/mxfp8/__init__.py#L224) after
 FP32 upcast, then wraps and materializes them through the existing FSDP2/HF loader.
 SwiGLU calls converted projection forwards instead of reading their weights
 through a fused BF16 path. Parameter names stay unchanged.

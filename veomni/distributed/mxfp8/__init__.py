@@ -92,6 +92,8 @@ def validate_mxfp8_training(
         return config
     if getattr(getattr(model, "config", None), "model_type", None) != "qwen3":
         raise ValueError("MXFP8 currently supports standalone dense Qwen3 only.")
+    if not parallel_state.fsdp_enabled:
+        raise ValueError("MXFP8 requires FSDP2 with at least two ranks.")
     if parallel_state.dp_mode != "fsdp2" or any(
         getattr(parallel_state, name, False)
         for name in (

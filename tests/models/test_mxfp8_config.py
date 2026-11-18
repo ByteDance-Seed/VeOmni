@@ -43,7 +43,7 @@ def _model():
 
 
 def _state(**overrides):
-    return SimpleNamespace(**{"dp_mode": "fsdp2", "dp_shard_size": 2, **overrides})
+    return SimpleNamespace(**{"dp_mode": "fsdp2", "dp_shard_size": 2, "fsdp_enabled": True, **overrides})
 
 
 @pytest.mark.parametrize("gather", [False, True])
@@ -149,6 +149,7 @@ def test_builder_inherits_recipe_and_converts_fp32_before_sharding(monkeypatch, 
     "state",
     [
         _state(dp_mode="ddp"),
+        _state(fsdp_enabled=False, dp_shard_size=1),
         _state(dp_replicate_enabled=True),
         _state(sp_enabled=True),
         _state(cp_enabled=True),
