@@ -275,6 +275,7 @@ def test_scalar_only_metrics_skip_image_builders_and_preserve_interval_state(mon
     assert monitor._ep_rank_loads_before == {}
     assert monitor._ep_rank_loads_after == {}
     assert monitor._ep_stats == {}
+    assert monitor._ep_plan_stats == {}
     assert all(torch.count_nonzero(value) == 0 for value in monitor._counts.values())
 
 
@@ -608,12 +609,16 @@ def test_ep_balance_metrics_accumulate_exact_formulas_keys_and_reset(monkeypatch
         "moe/ep_moved_token_fraction/avg",
     }
     assert required <= metrics.keys()
-    assert metrics["moe/ep_rank_imbalance_before/layer_0"] == pytest.approx(2 / 3)
+    assert metrics["moe/ep_rank_imbalance_before/layer_0"] == pytest.approx(0.5)
     assert metrics["moe/ep_rank_imbalance_before/layer_1"] == 0.0
-    assert metrics["moe/ep_rank_imbalance_before/max"] == pytest.approx(2 / 3)
-    assert metrics["moe/ep_rank_imbalance_before/avg"] == pytest.approx(1 / 3)
-    assert metrics["moe/ep_rank_imbalance_after/layer_0"] == pytest.approx(1 / 6)
+    assert metrics["moe/ep_rank_imbalance_before/max"] == pytest.approx(0.5)
+    assert metrics["moe/ep_rank_imbalance_before/avg"] == pytest.approx(0.25)
+    assert metrics["moe/ep_rank_imbalance_after/layer_0"] == pytest.approx(0.25)
     assert metrics["moe/ep_rank_imbalance_after/layer_1"] == 0.0
+    assert metrics["moe/ep_rank_cumulative_imbalance_before/layer_0"] == pytest.approx(2 / 3)
+    assert metrics["moe/ep_rank_cumulative_imbalance_after/layer_0"] == pytest.approx(1 / 6)
+    assert metrics["moe/ep_rank_plan_imbalance_before_peak/layer_0"] == 1.0
+    assert metrics["moe/ep_rank_plan_imbalance_after_peak/layer_0"] == 0.5
     assert metrics["moe/ep_active_replicas/layer_0"] == 3
     assert metrics["moe/ep_active_replicas/sum"] == 3
     assert metrics["moe/ep_moved_tokens/layer_0"] == 5
@@ -651,7 +656,9 @@ def _two_rank_ep_monitor_worker(rank: int, world_size: int, rendezvous: str) -> 
 
         metrics = monitor.compute_metrics(current_step=3, format_only_on=rank == 0)
         if rank == 0:
-            assert metrics["moe/ep_rank_imbalance_before/layer_0"] == pytest.approx(0.2)
+            assert metrics["moe/ep_rank_imbalance_before/layer_0"] == pytest.approx(1.0)
+            assert metrics["moe/ep_rank_cumulative_imbalance_before/layer_0"] == pytest.approx(0.2)
+            assert metrics["moe/ep_rank_plan_imbalance_before_peak/layer_0"] == 1.0
             assert metrics["moe/ep_rank_imbalance_after/layer_0"] == 0.0
             assert metrics["moe/ep_active_replicas/sum"] == 3
             assert metrics["moe/ep_moved_tokens/sum"] == 5
@@ -1000,3 +1007,18 @@ def test_module_dunder_safety():
     # moe_monitor.__name__ sanity — guards against stray import-time errors
     # when the module is loaded by callbacks early in trainer init.
     assert moe_monitor.MoERouterMonitor.__name__ == "MoERouterMonitor"
+
+
+def test_alternating_hotspots_do_not_cancel_per_plan_imbalance():
+    monitor = MoERouterMonitor(num_experts=4)
+    _register_router_counts(monitor)
+    monitor.record_ep_balance(0, (100, 0), (50, 50), 1, 50)
+    monitor.record_ep_balance(0, (0, 100), (50, 50), 1, 50)
+    # Empty invocations must not dilute the active-plan mean.
+    monitor.record_ep_balance(0, (0, 0), (0, 0), 0, 0)
+    metrics = monitor.compute_metrics(current_step=1)
+    assert metrics["moe/ep_rank_imbalance_before/layer_0"] == 1.0
+    assert metrics["moe/ep_rank_imbalance_after/layer_0"] == 0.0
+    assert metrics["moe/ep_rank_cumulative_imbalance_before/layer_0"] == 0.0
+    assert metrics["moe/ep_rank_plan_imbalance_before_peak/layer_0"] == 1.0
+    assert monitor._ep_plan_stats == {}

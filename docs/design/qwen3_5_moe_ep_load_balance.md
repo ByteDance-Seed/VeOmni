@@ -38,6 +38,11 @@ must not exceed the original expert rows per EP rank. See the
 - Physical before/after load, active replicas and moved tokens are recorded
   once per EP group and reduced over the owning FSDP group. Monitoring is
   disabled by default; set moe_load_balance_monitor_interval to collect it.
+  Standard `ep_rank_imbalance_{before,after}` metrics average the normalized
+  imbalance of each nonempty plan before aggregating EP groups or time. Thus
+  opposite hotspots cannot cancel. `ep_rank_plan_imbalance_{before,after}_peak`
+  preserves the worst plan per layer; `ep_rank_cumulative_imbalance_{before,after}`
+  separately describes the cumulative rank-load distribution used by heatmaps.
 
 ## Validation results and limits
 

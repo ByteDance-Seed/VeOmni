@@ -262,6 +262,8 @@ class MoERouterMonitor:
         self._ep_rank_loads_after: Dict[int, torch.Tensor] = {}
         # Per-layer [active_replicas, moved_tokens, total_routed_tokens].
         self._ep_stats: Dict[int, torch.Tensor] = {}
+        # Per-active-plan imbalance sums/count and maxima, before aggregation.
+        self._ep_plan_stats: Dict[int, List[float]] = {}
         self._ep_rank_size: Optional[int] = None
 
         # Step range tracking for heatmap captions.
@@ -311,6 +313,7 @@ class MoERouterMonitor:
         self._ep_rank_loads_before.clear()
         self._ep_rank_loads_after.clear()
         self._ep_stats.clear()
+        self._ep_plan_stats.clear()
 
     # ---------------------- Recording ----------------------
 
@@ -419,6 +422,16 @@ class MoERouterMonitor:
             self._ep_rank_loads_before[layer_index] = before_tensor
             self._ep_rank_loads_after[layer_index] = after_tensor
             self._ep_stats[layer_index] = stats_tensor
+        total = sum(before)
+        rank_count = len(before)
+        before_vio = sum(abs(rank_count * value / total - 1) for value in before) / rank_count if total else 0.0
+        after_vio = sum(abs(rank_count * value / total - 1) for value in after) / rank_count if total else 0.0
+        summary = self._ep_plan_stats.setdefault(layer_index, [0.0] * 5)
+        summary[0] += before_vio
+        summary[1] += after_vio
+        summary[2] += int(total > 0)
+        summary[3] = max(summary[3], before_vio)
+        summary[4] = max(summary[4], after_vio)
         if self._ep_rank_size is None:
             self._ep_rank_size = len(before)
 
@@ -454,7 +467,7 @@ class MoERouterMonitor:
         num_layers: int,
         device: torch.device,
         rank_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         zero_loads = torch.zeros(rank_size, dtype=torch.long, device=device)
         zero_stats = torch.zeros(3, dtype=torch.long, device=device)
         before = torch.stack([self._ep_rank_loads_before.get(i, zero_loads) for i in range(num_layers)])
@@ -469,7 +482,14 @@ class MoERouterMonitor:
         before = packed[:before_size].reshape_as(before)
         after = packed[before_size : before_size + after_size].reshape_as(after)
         stats = packed[before_size + after_size :].reshape_as(stats)
-        return before, after, stats
+        summaries = torch.tensor(
+            [self._ep_plan_stats.get(i, [0.0] * 5) for i in range(num_layers)], dtype=torch.float32, device=device
+        )
+        sums, peaks = summaries[:, :3].contiguous(), summaries[:, 3:].contiguous()
+        if self.dp_group is not None and dist.is_initialized():
+            dist.all_reduce(sums, op=dist.ReduceOp.SUM, group=self.dp_group)
+            dist.all_reduce(peaks, op=dist.ReduceOp.MAX, group=self.dp_group)
+        return before, after, stats, sums, peaks
 
     def _resolve_interval_ep_rank_size(self, device: torch.device) -> Optional[int]:
         local_has_ep = bool(self._ep_rank_loads_before)
@@ -494,7 +514,7 @@ class MoERouterMonitor:
         self,
     ) -> tuple[
         torch.Tensor,
-        Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
         torch.device,
     ]:
         matrix = self._stack_and_reduce()
@@ -518,10 +538,10 @@ class MoERouterMonitor:
     @staticmethod
     def _prepare_snapshot_for_format(
         matrix: torch.Tensor,
-        ep_balance: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        ep_balance: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
     ) -> tuple[
         torch.Tensor,
-        Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
     ]:
         matrix = matrix.float().cpu()
         row_sums = matrix.sum(dim=1, keepdim=True).clamp(min=1.0)
@@ -586,7 +606,7 @@ class MoERouterMonitor:
     def _format_metrics(
         self,
         load_matrix: torch.Tensor,
-        ep_balance: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        ep_balance: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
         prefix: str,
         render_heatmaps: bool = True,
     ) -> Dict[str, Any]:
@@ -609,9 +629,11 @@ class MoERouterMonitor:
         metrics[f"{prefix}/avg_vio/avg"] = avg_vio.mean().item()
 
         if ep_balance is not None:
-            before, after, stats = ep_balance
-            before_imbalance = self.compute_rank_imbalance(before)
-            after_imbalance = self.compute_rank_imbalance(after)
+            before, after, stats, plan_sums, plan_peaks = ep_balance
+            before_imbalance = plan_sums[:, 0] / plan_sums[:, 2].clamp(min=1)
+            after_imbalance = plan_sums[:, 1] / plan_sums[:, 2].clamp(min=1)
+            cumulative_before = self.compute_rank_imbalance(before)
+            cumulative_after = self.compute_rank_imbalance(after)
             active_replicas = stats[:, 0]
             moved_tokens = stats[:, 1]
             total_routed_tokens = stats[:, 2]
@@ -624,6 +646,10 @@ class MoERouterMonitor:
             for i in range(num_layers):
                 metrics[f"{prefix}/ep_rank_imbalance_before/layer_{i}"] = before_imbalance[i].item()
                 metrics[f"{prefix}/ep_rank_imbalance_after/layer_{i}"] = after_imbalance[i].item()
+                metrics[f"{prefix}/ep_rank_cumulative_imbalance_before/layer_{i}"] = cumulative_before[i].item()
+                metrics[f"{prefix}/ep_rank_cumulative_imbalance_after/layer_{i}"] = cumulative_after[i].item()
+                metrics[f"{prefix}/ep_rank_plan_imbalance_before_peak/layer_{i}"] = plan_peaks[i, 0].item()
+                metrics[f"{prefix}/ep_rank_plan_imbalance_after_peak/layer_{i}"] = plan_peaks[i, 1].item()
                 metrics[f"{prefix}/ep_active_replicas/layer_{i}"] = active_replicas[i].item()
                 metrics[f"{prefix}/ep_moved_tokens/layer_{i}"] = moved_tokens[i].item()
                 metrics[f"{prefix}/ep_total_routed_tokens/layer_{i}"] = total_routed_tokens[i].item()
