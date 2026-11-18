@@ -56,7 +56,7 @@ from torch.distributed.tensor.placement_types import _StridedShard
 
 from ..distributed.parallel_state import ParallelState, get_parallel_state, is_parallel_state_initialized
 from ..utils import logging
-from ..utils.device import empty_cache, get_device_type, synchronize
+from ..utils.device import empty_cache, synchronize
 from ..utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
 from ..utils.dtensor_utils import rewrap_dtensor_local
 from .checkpointer import CheckpointerBase
@@ -898,7 +898,7 @@ def _has_live_expert_checkpoint_tensors(model):
 def _reject_unproven_extra_parallel_optimizer(
     state, parallel_state, *, group=None, trainable_only=False, allow_proven_optimizer=False, saving=False
 ):
-    error, has_v2, logical_signature = None, False, None
+    error, has_v2 = None, False
     try:
         model = state.get("model")
         ps = (
@@ -918,47 +918,9 @@ def _reject_unproven_extra_parallel_optimizer(
         if state.get("optimizer") is not None and getattr(ps, "dp_mode", None) == "fsdp2":
             if has_v2 and not allow_proven_optimizer:
                 raise RuntimeError("Canonical ExtraParallel optimizer state requires an owner-aware checkpoint codec")
-        if has_v2:
-            named_params = list(state["model"].named_parameters(remove_duplicate=False))
-            if ps is None:
-                ps = parallel_state if parallel_state is not None else get_parallel_state()
-            aliases = {}
-            for name, param in named_params:
-                aliases.setdefault(id(param), []).append(name)
-            expert_aliases = {
-                name
-                for names in aliases.values()
-                if any("experts" in alias.split(".") for alias in names)
-                for name in names
-            }
-            ordinary_experts = (
-                tuple(sorted(_ordinary_expert_fqns(state["model"], ps)))
-                if isinstance(ps, ParallelState) and any(size != 1 for size in ps.extra_parallel_sizes.values())
-                else ()
-            )
-            logical_signature = _checkpoint_extra_parallel_signature(
-                specs,
-                optimizer_present=state.get("optimizer") is not None,
-                trainable_only=trainable_only,
-                trainability=(
-                    tuple(sorted((name, param.requires_grad) for name, param in named_params))
-                    if trainable_only
-                    else ()
-                ),
-                runtime_ndims={
-                    name: tensor.ndim
-                    for name, tensor in (named_params + list(state["model"].named_buffers(remove_duplicate=False)))
-                },
-                expert_aliases=expert_aliases,
-                ordinary_experts=ordinary_experts,
-                shared_lora=tuple(sorted(_shared_lora_fqns(state["model"], ordinary_experts)))
-                if ordinary_experts
-                else (),
-            )
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "checking canonical ExtraParallel optimizer state", group=group)
-    _check_extra_parallel_signature_across_ranks(has_v2, logical_signature, group=group)
     error = None
     try:
         if has_v2:
@@ -984,97 +946,6 @@ def _reject_unproven_extra_parallel_optimizer(
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "checking canonical ExtraParallel runtime tensors", group=group)
-
-
-def _checkpoint_extra_parallel_signature(
-    specs,
-    *,
-    optimizer_present,
-    trainable_only,
-    trainability=(),
-    runtime_ndims=None,
-    expert_aliases=(),
-    ordinary_experts=(),
-    shared_lora=(),
-):
-    """Describe logical layout, excluding rank-local coordinates and tensor contents."""
-    entries = []
-    for name, spec in sorted((specs or {}).items()):
-        mesh = getattr(spec, "para_fsdp_mesh", None)
-        shape = getattr(spec, "global_shape", None)
-        placement = getattr(spec, "placement", None)
-        if isinstance(placement, Replicate) and ("experts" in name.split(".") or name in expert_aliases):
-            mesh_names = getattr(mesh, "mesh_dim_names", None)
-            entries.append(
-                (
-                    name,
-                    spec.para_name,
-                    "Replicate",
-                    tuple(mesh_names) if mesh_names is not None else None,
-                    tuple(mesh.shape) if mesh is not None else None,
-                )
-            )
-            continue
-        if not isinstance(placement, Shard):
-            continue
-        axis = placement.dim
-        fsdp_axis = getattr(spec, "fsdp_shard_dim", None)
-        persistent_axis = getattr(spec, "persistent_fsdp_shard_dim", None)
-        layout_v2 = bool(getattr(spec, "checkpoint_layout_v2", False))
-        if persistent_axis is not None:
-            # Persistent shards do not use the ordinary FSDP axis or v2 marker.
-            fsdp_axis, layout_v2 = None, None
-        ndim = len(shape) if shape is not None else (runtime_ndims or {}).get(name)
-        if ndim:
-            for shard_axis in (axis, fsdp_axis, persistent_axis):
-                if shard_axis is not None and not -ndim <= shard_axis < ndim:
-                    raise RuntimeError(f"ExtraParallel checkpoint axis is outside the tensor rank: {name}")
-            axis = axis % ndim if axis is not None else None
-            fsdp_axis = fsdp_axis % ndim if fsdp_axis is not None else None
-            persistent_axis = persistent_axis % ndim if persistent_axis is not None else None
-        mesh_names = getattr(mesh, "mesh_dim_names", None)
-        entries.append(
-            (
-                name,
-                spec.para_name,
-                type(placement).__name__,
-                axis,
-                fsdp_axis,
-                persistent_axis,
-                tuple(shape) if shape is not None else None,
-                layout_v2,
-                tuple(mesh_names) if mesh_names is not None else None,
-                tuple(mesh.shape) if mesh is not None else None,
-            )
-        )
-    return (
-        bool(optimizer_present),
-        bool(trainable_only),
-        tuple(trainability),
-        tuple(ordinary_experts),
-        tuple(shared_lora),
-        tuple(entries),
-    )
-
-
-def _check_extra_parallel_signature_across_ranks(has_v2, signature, *, group=None):
-    """Reject rank-inconsistent checkpoint policy before collectives or file mutation."""
-    if not dist.is_initialized():
-        return
-    device = "cpu" if dist.get_backend(group) == "gloo" else get_device_type()
-    presence = torch.tensor([int(has_v2), int(not has_v2)], dtype=torch.int32, device=device)
-    dist.all_reduce(presence, op=dist.ReduceOp.MAX, group=group)
-    if bool(presence[0]) and bool(presence[1]):
-        raise RuntimeError("checkpoint ExtraParallel layout version differs across ranks")
-    if not bool(presence[0]):
-        return
-    digest = hashlib.sha256(repr(signature).encode("utf-8")).digest()
-    low = torch.tensor(list(digest), dtype=torch.int32, device=device)
-    high = low.clone()
-    dist.all_reduce(low, op=dist.ReduceOp.MIN, group=group)
-    dist.all_reduce(high, op=dist.ReduceOp.MAX, group=group)
-    if not torch.equal(low, high):
-        raise RuntimeError("checkpoint ExtraParallel layout or optimizer policy differs across ranks")
 
 
 def _extra_parallel_layout_key(specs):
@@ -1668,30 +1539,21 @@ def _requires_rank_local_optimizer_checkpoint(optimizer):
 
 
 def _checkpoint_optimizer_policy(state, *, loading, group=None):
-    """Agree on the optimizer path before entering any checkpoint collective."""
-    optimizer, multi, swap, error = None, False, False, None
+    """Validate the optimizer path before entering any checkpoint collective."""
+    optimizer, multi, error = None, False, None
     try:
-        from ..optim.swap_adamw import SwapAdamW
-
         if not isinstance(state, dict) or "model" not in state:
             if loading and state is None:
                 raise ValueError("State dict must be provided to load a distributed checkpoint.")
             raise ValueError(f"Model must be provided to {'load' if loading else 'save'} a distributed checkpoint.")
         optimizer = state.get("optimizer")
         multi = getattr(optimizer, "_is_multi_optimizer", False) is True
-        swap = type(optimizer) is SwapAdamW
         if not multi and _requires_rank_local_optimizer_checkpoint(optimizer):
             raise RuntimeError("Exact-precision optimizers require MultiOptimizer for sparse DCP recovery")
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "checking checkpoint optimizer policy", group=group)
 
-    if any_rank_failed(multi, group=group) and any_rank_failed(not multi, group=group):
-        raise RuntimeError("Checkpoint optimizer types differ across ranks")
-    if any_rank_failed(optimizer is None, group=group) and any_rank_failed(optimizer is not None, group=group):
-        raise RuntimeError("Checkpoint optimizer presence differs across ranks")
-    if any_rank_failed(swap, group=group) and any_rank_failed(not swap, group=group):
-        raise RuntimeError("Checkpoint optimizer offload types differ across ranks")
     return optimizer, multi
 
 
@@ -2942,6 +2804,8 @@ class DistributedCheckpointer(CheckpointerBase):
             (weights_dir(path, module), True),
             (optimizer_dir(path, module), wants_optimizer),
         ):
+            if error is not None:
+                break
             if not wanted:
                 continue
             marker = os.path.join(directory, DCP_MARKER_FILENAME)
@@ -3103,12 +2967,6 @@ class DistributedCheckpointer(CheckpointerBase):
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "preparing distributed checkpoint load", group=process_group)
-        if dist.is_initialized():
-            decisions = [None] * dist.get_world_size(group=process_group)
-            local = (wants_optimizer, multi)
-            dist.all_gather_object(decisions, local, group=process_group)
-            if any(decision != local for decision in decisions):
-                raise RuntimeError("Checkpoint load format differs across ranks")
 
         def prepared(owner, description):
             snapshot, error = None, None
@@ -3393,8 +3251,7 @@ class DistributedCheckpointer(CheckpointerBase):
             return
         rank = dist.get_rank() if dist.is_initialized() else 0
         extra_state_path = os.path.join(checkpoint_dir, _EXTRA_STATE_DIRNAME, _EXTRA_STATE_FORMAT.format(rank))
-        if os.path.exists(extra_state_path):
-            state[_EXTRA_STATE_KEY] = torch.load(extra_state_path, weights_only=False)
+        state[_EXTRA_STATE_KEY] = torch.load(extra_state_path, weights_only=False)
 
 
 def get_dtype_size(dtype: torch.dtype) -> int:

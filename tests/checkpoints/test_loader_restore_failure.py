@@ -71,6 +71,7 @@ def _offline_missing_cursor_worker(rank, root):
         "gloo", init_method=f"file://{root}/offline-init", rank=rank, world_size=2, timeout=timedelta(seconds=30)
     )
     try:
+
         class Loader:
             def load_state_dict(self, state):
                 raise AssertionError("no loader may restore an incomplete checkpoint")

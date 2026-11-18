@@ -27,9 +27,9 @@ Product Hardware Support List
 
 |Product| Supported |
 |--|:---------:|
-|<term>Ascend 950 Series Products</term>|     ✅     |
-|<term>Atlas A3 Training Series Products</term>|     ✅     |
-|<term>Atlas A2 Training Series Products</term>|     ✅     |
+|<term>Ascend 950PR&950DT products</term>|     ✅     |
+|<term>Atlas A3 training products</term>|     ✅     |
+|<term>Atlas A2 training products</term>|     ✅     |
 
 - For the operating systems supported by each hardware product in bare-metal deployment scenarios, please refer to the Compatibility Query Assistant(https://www.hiascend.com/hardware/compatibility).
 - For the operating systems supported by each hardware product in virtual machine and container deployment scenarios, please refer to the "Operating System Compatibility Description"(https://www.hiascend.com/document/detail/zh/canncommercial/900/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum) chapter of the CANN Software Installation Guide(Commercial Edition) or the "Operating System Compatibility Description"(https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum) chapter (Community Edition).
@@ -54,8 +54,8 @@ Please refer to the specific installation guides based on your architecture:
 
 VeOmni also provides Docker support for Ascend NPUs. For detailed instructions on building and using Ascend Docker images, please refer to:
 
-- [Ascend A3 Docker Image Build and Usage Guide](./AscendDockerUsage/build_a3_docker.md)
-- [Ascend A2 Docker Image Build and Usage Guide](./AscendDockerUsage/build_a2_docker.md)
+- [Atlas A3 training products Docker Image Build and Usage Guide](./AscendDockerUsage/build_a3_docker.md)
+- [Atlas A2 training products Docker Image Build and Usage Guide](./AscendDockerUsage/build_a2_docker.md)
 
 ## Version Compatibility
 

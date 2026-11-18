@@ -291,9 +291,15 @@ class ModelCheckpointManager:
         return extra_state
 
     def _load_extra_state(self, extra_state: Dict[str, Any]) -> None:
+        if not isinstance(extra_state, dict):
+            raise RuntimeError("Checkpoint model extra state must be a mapping")
         lr_state = extra_state.get("lr_scheduler")
         lr_scheduler = self.runtime.lr_scheduler
-        if lr_state is not None and lr_scheduler is not None:
+        if lr_scheduler is not None:
+            if not isinstance(lr_state, dict):
+                raise RuntimeError("Checkpoint scheduler state is missing or incompatible")
+            if type(lr_scheduler) is LambdaLR and not lr_scheduler.state_dict().keys() <= lr_state.keys():
+                raise RuntimeError("Checkpoint scheduler state is missing required LambdaLR fields")
             lr_scheduler.load_state_dict(lr_state)
 
         self.runtime.load_extra_state(extra_state)

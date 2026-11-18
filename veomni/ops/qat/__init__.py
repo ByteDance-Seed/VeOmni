@@ -25,7 +25,7 @@ bit-aligned with inference by construction.
 
 These are *primitives*, not a selection mechanism. Which tensor is rounded, at
 what block width, is chosen by the op row that calls them -- ``linear`` /
-``swiglu_mlp`` / ``moe_experts`` / ``kv_round`` each have their own
+``gated_mlp`` / ``moe_experts`` / ``kv_round`` each have their own
 implementation name for it. Quantizing calls require an NVIDIA SM90 or later GPU
 and load the backend lazily, so importing this package on CPU or NPU stays free.
 
