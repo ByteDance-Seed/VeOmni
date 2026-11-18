@@ -980,12 +980,23 @@ class OmniArguments:
 
     @property
     def train_steps(self) -> int:
+        if self._train_steps == -1:
+            raise ValueError("Please run `compute_train_steps` first!")
+
+        if (
+            self.train.training_task == "offline_embedding"
+            and self.train.max_steps is not None
+            and self._train_steps > self.train.max_steps
+        ):
+            raise ValueError(
+                "`train.max_steps` would truncate the offline_embedding dataset: "
+                f"the full run requires {self._train_steps} steps, but max_steps={self.train.max_steps}. "
+                "Remove `train.max_steps` or set it to at least the full step count."
+            )
+
         if self.train.max_steps is not None and self._train_steps >= self.train.max_steps:
             logger.warning_once(f"Set train_steps to {self.train.max_steps}. It should be for debug purpose only.")
             return self.train.max_steps
-
-        if self._train_steps == -1:
-            raise ValueError("Please run `compute_train_steps` first!")
 
         return self._train_steps
 
