@@ -153,7 +153,7 @@ Training from an upstream root:
 - `ModuleRuntime._build_model` builds the module on meta and
   [attaches the key converter](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L372);
   [`weights_path`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L255) resolves through `HFSource.weights_path`.
-- The FSDP2 / DDP wrap (per module, or [composed](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L318)) loads weights:
+- The FSDP2 / DDP wrap (per module, or [composed](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L267)) loads weights:
   - [`load_model_weights`](../../../veomni/models/checkpoint/weights.py#L414) and the [rank-0 broadcast loader](../../../veomni/models/checkpoint/weights.py#L1212) skip keys the converter declares, without reading them;
   - [`HFSourceKeyConverter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L398) renames the module's own keys and hands them to the module's converter.
 

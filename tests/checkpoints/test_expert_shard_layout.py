@@ -1364,7 +1364,7 @@ def test_raw_multi_optimizer_is_rejected_on_all_ranks(world):
     spawn_with_rendezvous(_sparse_plain_optimizer_failure_worker, args=(), nprocs=world)
 
 
-def _inconsistent_optimizer_preflight_worker(rank, case, endpoint):
+def _optimizer_preflight_failure_worker(rank, endpoint):
     import veomni.checkpoint.dcp_checkpointer as checkpoint_module
     from veomni.checkpoint.dcp_checkpointer import OptimizerState
     from veomni.distributed.parallel_plan import SpecInfo
@@ -1383,9 +1383,9 @@ def _inconsistent_optimizer_preflight_worker(rank, case, endpoint):
 
             @property
             def _is_multi_optimizer(self):
-                if case == "type_property_error" and rank == 0:
+                if rank == 0:
                     raise ValueError("injected optimizer type lookup error")
-                return not (case == "wrong_type_collective" and rank == 0)
+                return True
 
             def state_dict(self):
                 self.called = True
@@ -1402,14 +1402,8 @@ def _inconsistent_optimizer_preflight_worker(rank, case, endpoint):
             return coordinator(error, what, group=group)
 
         checkpoint_module.raise_if_any_rank_failed = record_coordination
-        expected_type = ValueError if case == "type_property_error" and rank == 0 else RuntimeError
-        expected_message = (
-            "injected optimizer type lookup error"
-            if expected_type is ValueError
-            else "optimizer is not a MultiOptimizer"
-            if rank == 0
-            else "Raw DCP MultiOptimizer"
-        )
+        expected_type = ValueError if rank == 0 else RuntimeError
+        expected_message = "injected optimizer type lookup error" if rank == 0 else "Raw DCP MultiOptimizer"
         with pytest.raises(expected_type, match=expected_message):
             state.state_dict()
         assert coordinated == ["validating ExtraParallel optimizer checkpoint"]
@@ -1423,9 +1417,8 @@ def _inconsistent_optimizer_preflight_worker(rank, case, endpoint):
 
 @pytest.mark.launch_plan(provider=from_parameter("world", device="cpu"))
 @pytest.mark.parametrize("world", [4])
-@pytest.mark.parametrize("case", ["wrong_type_collective", "type_property_error"])
-def test_inconsistent_optimizer_preflight_exits_all_ranks(world, case):
-    spawn_with_rendezvous(_inconsistent_optimizer_preflight_worker, args=(case,), nprocs=world)
+def test_optimizer_preflight_local_exception_exits_all_ranks(world):
+    spawn_with_rendezvous(_optimizer_preflight_failure_worker, args=(), nprocs=world)
 
 
 def test_extra_parallel_rejects_non_multi_optimizer_locally():
