@@ -17,7 +17,7 @@ runs ``apply_chat_template`` → ``tokenize`` → ``merge_text_embeds`` → ``pa
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ....utils.conversation import ConversationItem
 from ...text_encoder.chat_template import TextEncoderChatTemplate
@@ -205,26 +205,34 @@ class JanusChatTemplate(TextEncoderChatTemplate):
         out.extend(dummy_parts)
         return out
 
-    def apply_generation_prompt(self, sample: list[ConversationItem]) -> list[ConversationItem]:
+    def apply_generation_prompt(
+        self,
+        sample: list[ConversationItem],
+        *,
+        generation_kwargs: dict[str, Any] | None = None,
+    ) -> list[ConversationItem]:
         """Append the assistant generation prefix to a templated prompt (inference).
 
-        The separator is part of the prefix, not of the first sampled span: a
-        training sample renders ``<|Assistant|>: <answer>``, and the prompt has to
-        put the model at the same position before it chooses the first token.
-        Upstream's ``{%if add_generation_prompt%}<|Assistant|>:{%endif%}`` omits it
-        because upstream then *samples* the next token; here the first token
-        (``<boi>`` or a text token) is fed explicitly, so the separator has to be
-        supplied by the prompt.
+        The two response modalities need different tails, and that is what the
+        checkpoint was trained on (byte-level BPE, so the difference is real):
+
+        * **text** (``infer_und``) — training renders ``<|Assistant|>: Hello`` and
+          the space folds into ``Hello``, so the model predicts the merged
+          ``" Hello"`` token straight off the marker. The prompt therefore stops at
+          the bare marker, matching upstream's
+          ``{%if add_generation_prompt%}<|Assistant|>:{%endif%}``.
+        * **image** (anything else) — training renders ``<|Assistant|>: <boi>``,
+          where ``<boi>`` is a special token so nothing folds and the space stays
+          its own token. The prompt carries the separator, and
+          ``emit_image_start`` then feeds ``<boi>`` — the same two positions a
+          training sample has.
         """
+        infer_type = None if generation_kwargs is None else generation_kwargs.get("infer_type")
+        value = self.chat_markers.assistant_prefix
+        if infer_type != "infer_und":
+            value += self.chat_markers.assistant_text_separator
         out = list(sample)
-        out.append(
-            self._build_conversation_item(
-                "text",
-                self.chat_markers.assistant_prefix + self.chat_markers.assistant_text_separator,
-                "assistant",
-                loss_mask=0,
-            )
-        )
+        out.append(self._build_conversation_item("text", value, "assistant", loss_mask=0))
         return out
 
     def render_template_string(self, parts: list[ConversationItem]) -> str:

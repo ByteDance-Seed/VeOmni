@@ -460,21 +460,27 @@ def test_the_template_matches_the_upstream_jinja_in_ids_and_labels():
     not Path("/mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B/tokenizer.json").is_file(),
     reason="needs the Janus-1.3B tokenizer.json from shared storage",
 )
-def test_a_generation_prompt_ends_with_the_training_separator():
-    """The inference prompt stops where a training sample's answer begins.
+def test_each_modality_gets_the_prompt_it_was_trained_to_continue():
+    """The assistant tail differs by response modality, and that is not cosmetic.
 
-    Upstream's ``{%if add_generation_prompt%}<|Assistant|>:{%endif%}`` ends at the
-    colon because upstream then *samples* the next token. This graph feeds the
-    first token explicitly (``<boi>`` via ``emit_image_start``, or a text token),
-    so the prompt has to carry the same ``<|Assistant|>: `` separator a training
-    sample renders — otherwise the first fed token lands one position early.
+    Byte-level BPE decides where the separator lands, and the checkpoint was
+    trained on both spellings:
+
+    * text — ``<|Assistant|>: Hello`` → ``19685, 37727`` (space folded into the
+      word), so the prompt stops at the colon and the model predicts ``" Hello"``.
+    * image — ``<|Assistant|>: <boi>`` → ``19685, 207, 100016`` (``<boi>`` is
+      special, so the space stands alone), so the prompt carries the separator and
+      ``emit_image_start`` adds ``<boi>``.
+
+    A prompt with the separator for a text response would put the model on a
+    position the checkpoint never saw; one without it for an image response would
+    start the span a token early.
     """
-    import jinja2
-
-    from veomni.models.seed_omni.modules.janus.convert_janus_weight_to_hf import CHAT_TEMPLATE
     from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import JanusChatTemplate
 
     base = _real_janus_tokenizer()
+    boi_id = base.convert_tokens_to_ids("<begin_of_image>")
+    separator_id = base(" ", add_special_tokens=False)["input_ids"][0]
 
     class _Tokenizer:
         bos_token = "<s>"
@@ -483,7 +489,7 @@ def test_a_generation_prompt_ends_with_the_training_separator():
         eoi_token = "<end_of_image>"
         bos_token_id = 0
         eos_token_id = 0
-        boi_token_id = base.convert_tokens_to_ids("<begin_of_image>")
+        boi_token_id = boi_id
         eoi_token_id = base.convert_tokens_to_ids("<end_of_image>")
         pad_token_id = 0
 
@@ -491,25 +497,32 @@ def test_a_generation_prompt_ends_with_the_training_separator():
             return base(text, add_special_tokens=add_special_tokens)
 
     template = JanusChatTemplate(_Tokenizer())
-    prompt = template.apply_generation_prompt(
-        template.apply_chat_template([ConversationItem(type="text", value="hi", role="user")])
-    )
-    rendered = template.render_template_string(prompt)
-    assert rendered.endswith("<|Assistant|>: "), rendered
 
-    # Upstream stops at the colon; this prompt tokenizes to that plus the
-    # separator, which is the position a training sample starts its answer at.
-    # (Our render also prepends BOS and the system prompt, so only the tail is
-    # comparable — the full id comparison is the image-prefix test's job.)
-    upstream = jinja2.Template(CHAT_TEMPLATE).render(
-        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
-        add_generation_prompt=True,
-    )
-    assert upstream.endswith("<|Assistant|>:")
-    assert (
-        base(rendered, add_special_tokens=False)["input_ids"][-1]
-        == base(" ", add_special_tokens=False)["input_ids"][0]
-    )
+    def prompt_ids(infer_type):
+        parts = template.tokenize_conversation(
+            [ConversationItem(type="text", value="hi", role="user")],
+            add_generation_prompt=True,
+            generation_kwargs={"infer_type": infer_type},
+        )
+        return [token for part in parts if part.value is not None for token in part.value.tolist()]
+
+    # Text response: stops at the marker; the model predicts the merged
+    # ``" Hello"`` token from there.
+    text_prompt = prompt_ids("infer_und")
+    assert base("\n\n<|Assistant|>: Hello", add_special_tokens=False)["input_ids"][-2:] == [
+        text_prompt[-1],
+        base(" Hello", add_special_tokens=False)["input_ids"][0],
+    ], (text_prompt[-3:],)
+
+    # Image response: carries the separator, then ``emit_image_start`` adds ``<boi>``.
+    image_prompt = prompt_ids("infer_gen")
+    assert image_prompt[-2:] == [text_prompt[-1], separator_id], (image_prompt[-3:],)
+    assert [*image_prompt[-2:], boi_id] == base("\n\n<|Assistant|>: <begin_of_image>", add_special_tokens=False)[
+        "input_ids"
+    ][-3:]
+
+    # And the two prompts really do differ — otherwise this test proves nothing.
+    assert text_prompt[-1] != image_prompt[-1]
 
 
 @_CPU
