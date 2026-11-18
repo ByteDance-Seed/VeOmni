@@ -130,7 +130,7 @@ def pad_input(
     return out.view(batch_size, seq_len, *hidden_states.shape[1:])
 
 
-class KimiDynamicCache:
+class KimiDynamicCache(Cache):
     """
     Dynamic cache for Kimi model.
     Inspired by Qwen3-Next
@@ -139,7 +139,12 @@ class KimiDynamicCache:
     is_compileable = False
 
     def __init__(self, config: KimiLinearConfig):
-        super().__init__()
+        # Modification (round-6 review): inherit the 5.16.1 Cache contract so
+        # the mask builder's unconditional get_query_offset / get_mask_sizes
+        # hold on use_cache=True forwards. The base __init__ is deliberately
+        # not called: it requires the layer-registry form (layers /
+        # layer_class_to_replicate) while this cache keeps its own flat
+        # per-layer lists below.
         self.config = config
 
         if config.linear_attn_config is not None:
@@ -214,14 +219,20 @@ class KimiDynamicCache:
             return 0
         return self.key_cache[layer_idx].shape[-2]
 
-    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> tuple[int, int]:
+    def get_max_length(self) -> int:
+        """The 5.16.1 Cache contract: this cache grows dynamically, so no maximum."""
+        return -1
+
+    def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> tuple[int, int]:
         """
         Return a tuple (kv_length, kv_offset) corresponding to the length and offset that will be returned for
         the given layer at `layer_idx`.
         The masks are then prepared according to the given lengths (kv_length, kv_offset) and patterns for each layer.
         """
+        # Modification (round-6 review): the 5.16.1 mask builder passes the
+        # query length as a Python int; the vendored Tensor spelling predates
+        # it and raised AttributeError on the int.
         kv_offset = 0
-        query_length = cache_position.shape[0]
         past_seen_tokens = self.get_seq_length(layer_idx)
         kv_length = query_length + past_seen_tokens
         return kv_length, kv_offset
@@ -695,9 +706,14 @@ class KimiMoEGate(nn.Module):
             torch.empty((self.num_experts, self.gating_dim)),
         )
 
-        self.e_score_correction_bias = nn.Parameter(
-            torch.empty(self.num_experts),
-        )
+        # Modification (round-6 review): the correction bias feeds only the
+        # top-k selection, never the value path, so autograd cannot reach it
+        # -- as an nn.Parameter every gate bias sat without a gradient and
+        # broke DDP's reducer on the second step (VeOmni runs ddp without
+        # find_unused_parameters). Register it as a buffer like the DeepSeek
+        # families; a future rule-based update would be an explicit optimizer
+        # step, not an autograd parameter.
+        self.e_score_correction_bias = nn.Buffer(torch.zeros(self.num_experts))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:

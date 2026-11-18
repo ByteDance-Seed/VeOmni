@@ -559,45 +559,80 @@ def test_kda_module_matches_source_layout():
         assert tensor.shape == patched_state[key].shape, key
 
 
-def test_source_module_has_no_patch_provided_member_references():
-    """``self.<x>`` references in the patch-relocated namespaces must be
-    defined in source/.
+def test_use_cache_forward_matches_no_cache_logits():
+    """A one-step ``use_cache=True`` forward goes through the 5.16.1 cache
+    contract (the mask builder calls ``get_query_offset`` /
+    ``get_mask_sizes`` with a Python int; the vendored KimiDynamicCache
+    predates the contract and raised AttributeError) and must stay
+    logit-identical to the no-cache path (round-6 review; training runs
+    use_cache=False, which is why the broken path survived CI)."""
+    model = _build_model()
+    model.eval()
+    input_ids = torch.randint(0, 100, (1, 16))
+    with torch.no_grad():
+        plain = model(input_ids=input_ids, use_cache=False).logits
+        cached = model(input_ids=input_ids, use_cache=True).logits
+    torch.testing.assert_close(plain, cached)
 
-    The patch layer removes members from the vendored module and re-adds
-    them via ``override_method``; a call site left behind in ``source/``
-    constructs fine and only raises ``AttributeError`` at forward -- the
-    round-3 drift class (``_attn_selective_recompute`` and the ``chunk_kda``
-    call sites moved to the patch layer while the source forwards kept
-    calling them). ``test_kda_module_matches_source_layout`` cannot see it:
-    it compares ``state_dict()`` without ever running forward.
 
-    The scan stays scoped to the namespaces the patch layer actually
-    relocates (``_attn*`` / ``veomni*``) and resolves definitions per class,
-    so there is no cross-class union and no allowlist: both round-3
-    regressions are covered with zero maintenance surface. The behavioral
-    companion is ``test_source_kda_module_forward_runs``.
-    """
-    import ast
-    import inspect
+def test_packed_guard_reads_the_text_config():
+    """The packed-batch guard must consult the decoder's own selection, not
+    the root's (round-6 review): VeOmniPretrainedConfig permits per-child
+    attention selections that rank above the root value, so the two can
+    diverge. Both divergences break the guard -- a root varlen / text eager
+    pair must still be rejected (the decoder's dense eager mask would
+    attend across samples), and a root eager / text varlen pack is valid
+    and must not be refused. The selections are stamped post-construction
+    (the layer handles stay bound to the constructed eager rows: this pins
+    the guard's verdict -- a diverged build is not constructible on CPU
+    leases). CPU leases cannot run the varlen side either (no varlen
+    kernel exists to bind), so the accepted direction runs behind a spy
+    that stands in for the varlen backend the text config selected: it
+    records the decoder call the guard let through and delegates an
+    unpacked view to the real decoder."""
+    model = _build_model()
+    model.eval()
+    cu = torch.tensor([0, 5, 10], dtype=torch.int32)
+    input_ids = torch.randint(0, 100, (1, 10))
+    packed = dict(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        position_ids=torch.arange(10).unsqueeze(0),
+        use_cache=False,
+        **_collator_fa_kwargs(cu),
+    )
 
-    from veomni.models.transformers.kimi_k3.source import modeling_kimi_k3 as source_module
+    model.config._attn_implementation = "veomni_flash_attention_2"
+    model.config.text_config._attn_implementation = "eager"
+    with pytest.raises(ValueError, match="cannot run packed batches"):
+        model(**packed)
 
-    tree = ast.parse(inspect.getsource(source_module))
-    dangling = set()
-    for cls in (n for n in tree.body if isinstance(n, ast.ClassDef)):
-        defined = {m.name for m in cls.body if isinstance(m, ast.FunctionDef)}
-        assigned = {
-            target.attr
-            for node in ast.walk(cls)
-            if isinstance(node, ast.Assign)
-            for target in node.targets
-            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self"
+    model.config._attn_implementation = "eager"
+    model.config.text_config._attn_implementation = "veomni_flash_attention_2"
+    # The guard must let this batch reach the decoder (the decoder's own
+    # selection is varlen, so packing is legal here). The old root-reading
+    # guard refused it before the decoder call, so the recorded kwargs
+    # below fail on the unfixed code.
+    recorded = {}
+    inner_forward = model.language_model.model.forward
+
+    def _varlen_backend_spy(*args, **kwargs):
+        recorded.update(kwargs)
+        unpacked = {
+            key: value
+            for key, value in kwargs.items()
+            if not (key.startswith("cu_") or key.startswith("max_length") or key == "tail_padding_length")
         }
-        for node in ast.walk(cls):
-            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self":
-                if node.attr.startswith(("_attn", "veomni")) and node.attr not in defined | assigned:
-                    dangling.add(f"{cls.name}.{node.attr}")
-    assert not dangling, f"source/ references patch-provided members: {sorted(dangling)}"
+        return inner_forward(*args, **unpacked)
+
+    model.language_model.model.forward = _varlen_backend_spy
+    try:
+        with torch.no_grad():
+            out = model(**packed)
+    finally:
+        model.language_model.model.forward = inner_forward
+    assert torch.equal(recorded["cu_seq_lens_q"], cu)
+    assert torch.isfinite(out.logits).all()
 
 
 def test_position_id_func_is_picklable():
@@ -735,6 +770,72 @@ def test_source_kda_module_forward_runs():
         out = module(hidden_states)
     assert out.shape == hidden_states.shape
     assert torch.isfinite(out).all()
+
+
+def test_source_decoder_layer_forward_runs():
+    """The vendored KimiDecoderLayer runs end-to-end standalone, covering
+    the decoder half of the round-3 drift class (a definition moved to the
+    patch layer while its call site stayed in source/, raising
+    ``AttributeError`` only at forward -- construction-only tests cannot
+    see it). The attention-residual block packing is threaded with the
+    production shape the model uses -- a (num_tokens, 0, hidden) zero
+    tensor that each block-boundary layer appends to -- spanning both
+    attention families and both feed paths: KDA+dense-MLP, KDA+MoE, and
+    MLA+MoE layers."""
+    from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import (
+        KimiDecoderLayer as SourceDecoderLayer,
+    )
+
+    config = _tiny_config().text_config
+    config._attn_implementation = "eager"
+    torch.manual_seed(0)
+    hidden_states = torch.randn(1, 32, config.hidden_size)
+    # the model threads block_residual as a (num_tokens, n_blocks, hidden)
+    # chain starting from an empty block list (KimiLinearModel.forward)
+    block_residual = hidden_states.new_zeros(hidden_states.shape[0] * hidden_states.shape[1], 0, config.hidden_size)
+    for layer_idx in (0, 1, 3):
+        module = SourceDecoderLayer(config, layer_idx=layer_idx).eval()
+        for p in module.parameters():
+            torch.nn.init.normal_(p, std=0.02)
+        with torch.no_grad():
+            out, block_residual = module(hidden_states, block_residual=block_residual)
+        assert out.shape == hidden_states.shape
+        assert torch.isfinite(out).all()
+    # layer 0 sits on the attn_res_block_size boundary and appends one block
+    assert block_residual.shape == (32, 1, config.hidden_size)
+
+
+def test_moe_gate_correction_bias_is_a_buffer():
+    """The router's e_score_correction_bias feeds only the top-k selection,
+    so autograd cannot reach it: as an nn.Parameter every gate bias sat
+    without a gradient and broke DDP's reducer on the second step (VeOmni
+    runs ddp without find_unused_parameters). It is registered as a buffer
+    like the DeepSeek families (round-6 review), and a training step must
+    leave every trainable language-model parameter with a gradient. The
+    vision tower is outside this batch's graph (no pixel_values) and thus
+    excluded from the no-unused assertion, alongside layer 0's
+    attention-side res pair (architecturally unused; see below)."""
+    model = _build_model()
+    gate = model.language_model.model.layers[1].block_sparse_moe.gate
+    assert "e_score_correction_bias" in dict(gate.named_buffers())
+    assert "e_score_correction_bias" not in dict(gate.named_parameters())
+    assert torch.equal(gate.e_score_correction_bias, torch.zeros_like(gate.e_score_correction_bias))
+
+    model.train()
+    input_ids = torch.randint(0, 100, (1, 12))
+    out = model(input_ids=input_ids, labels=input_ids.clone())
+    out.loss.backward()
+    unused = [n for n, p in model.language_model.named_parameters() if p.requires_grad and p.grad is None]
+    # The block_residual chain starts empty (new_zeros(n_tokens, 0, H)):
+    # layer 0's attention-side res projection only ever processes the
+    # accumulated blocks, and its own boundary append stores the raw
+    # prefix sum rather than a res-param output, so
+    # layers.0.self_attention_res_{norm,proj} are architecturally unused
+    # in any forward; every other parameter must participate in the
+    # backward.
+    allowed = {name for name, _ in model.language_model.named_parameters() if ".layers.0.self_attention_res_" in name}
+    leftover = [name for name in unused if name not in allowed]
+    assert not leftover, f"trainable parameters without a gradient after backward: {leftover}"
 
 
 def test_moe_gate_router_is_initialized():

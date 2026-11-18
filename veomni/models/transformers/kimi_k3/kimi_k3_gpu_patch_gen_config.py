@@ -1840,7 +1840,7 @@ def kimi_linear_for_causal_lm_forward_patched(
     # documented debug-only dense path (used by the CPU packing tests).
     _cu_seq_lens_q = fa_kwargs.get("cu_seq_lens_q")
     if _cu_seq_lens_q is not None and os.environ.get("K3_ALLOW_DENSE_PACKED", "0") != "1":
-        _attn_impl = getattr(self.config, "_attn_implementation", None)
+        _attn_impl = _kimi_k3_decoder_attn_implementation(self)
         if _attn_impl in ("eager", "sdpa", "veomni_sdpa"):
             _cu_t = _cu_seq_lens_q
             if not isinstance(_cu_t, torch.Tensor):
@@ -2245,9 +2245,7 @@ def kimi_k3_for_conditional_generation_forward_patched(
     # where no varlen kernel runs).
     _cu_seq_lens_q = fa_kwargs.get("cu_seq_lens_q")
     if _cu_seq_lens_q is not None and os.environ.get("K3_ALLOW_DENSE_PACKED", "0") != "1":
-        _attn_impl = getattr(self.config, "_attn_implementation", None)
-        if _attn_impl is None:
-            _attn_impl = getattr(getattr(self.config, "text_config", None), "_attn_implementation", None)
+        _attn_impl = _kimi_k3_decoder_attn_implementation(self)
         if _attn_impl in ("eager", "sdpa", "veomni_sdpa"):
             _cu_t = _cu_seq_lens_q
             if not isinstance(_cu_t, torch.Tensor):
@@ -2564,6 +2562,28 @@ def _kimi_k3_position_ids(input_ids=None, **kwargs):
     if input_ids is None:
         return None
     return torch.arange(input_ids.shape[-1], device=input_ids.device).expand_as(input_ids)
+
+
+@config.add_helper
+def _kimi_k3_decoder_attn_implementation(model):
+    """The attention implementation the decoder layers actually run.
+
+    The packed-batch guards in both entry points must consult the decoder's
+    own selection (round-6 review): the VLM root config permits per-child
+    attention selections that rank above the root value (the round-3
+    mapping form), so the text child is the authority; on the text-only
+    entry the config IS the text config and the same resolution applies.
+    Reading the root first let a root varlen / text eager pair slip a
+    packed row past the guard (the dense eager mask would attend across
+    samples) and, symmetrically, rejected a valid varlen-configured pack.
+    """
+    decoder_config = getattr(model.config, "text_config", None)
+    if decoder_config is None:
+        decoder_config = model.config
+    attn_impl = getattr(decoder_config, "_attn_implementation", None)
+    if attn_impl is None:
+        attn_impl = getattr(model.config, "_attn_implementation", None)
+    return attn_impl
 
 
 @config.override_method(
