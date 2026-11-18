@@ -46,7 +46,7 @@ Registration records the caller's assertion and does not inspect or sandbox
 the callable.
 
 The owner-aware optimizer checkpoint records the registered leaf identities:
-[`_scheduler_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L127)
+[`_scheduler_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L125)
 reads each leaf's registered recipe during layout construction. During save,
 [`ModelCheckpointManager._extra_state`](../../veomni/models/checkpoint/manager.py#L260)
 records the scheduler recipe alongside its state. During load, the

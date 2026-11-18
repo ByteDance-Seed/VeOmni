@@ -291,7 +291,7 @@ The generated file includes:
 See `veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py` for a complete example that includes:
 
 - **LigerRMSNorm**: Fused kernel replacement for `Qwen3RMSNorm`
-- **LigerSwiGLUMLP**: Fused SwiGLU MLP replacement for `Qwen3MLP`
+- **LigerGatedMLP**: fused gated MLP replacement for `Qwen3MLP`
 - **apply_rotary_pos_emb**: LigerKernel rotary position embedding
 
 Run it:
