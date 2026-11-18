@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.fsdp import FSDPModule
 from transformers.models.janus.modeling_janus import (
     JanusVQVAE,
     JanusVQVAEAlignerMLP,
@@ -42,6 +43,11 @@ from .processing import JanusVqvaePreprocessor, JanusVqvaeProcessor
 
 
 logger = helper.create_logger(__name__)
+
+
+def _is_fsdp_sharded(module: Any) -> bool:
+    """Whether FSDP2 wrapped ``module`` (so its parameters are sharded)."""
+    return isinstance(module, FSDPModule)
 
 
 class InferenceMixin:
@@ -104,6 +110,7 @@ class InferenceMixin:
         return outputs
 
     def _emit_buffered_image(self) -> Optional[Dict[str, Any]]:
+        self._require_unsharded_codec()
         token_ids = torch.tensor([self._vq_buffer], dtype=torch.long, device=self.device)
         self._vq_buffer.clear()
         with torch.inference_mode():
@@ -115,6 +122,34 @@ class InferenceMixin:
             )
         image_pil = self._image_processor.postprocess(decoded)[0]
         return {"type": "image", "value": image_pil}
+
+    def _require_unsharded_codec(self) -> None:
+        """Refuse to decode a sharded codec, with a usable message.
+
+        ``JanusVQVAE.decode`` reaches the codebook through
+        ``self.quantize.get_codebook_entry`` → ``self.embedding(...)`` — an
+        attribute lookup, not a call on the quantizer module — and then runs the
+        decoder convolutions. FSDP2 only unshards modules its forward hooks enter,
+        so neither step gathers ``embedding.weight`` nor the conv weights: the
+        lookup would reshape-fail against this rank's shard (the local rows no
+        longer fill ``*(quant_state_dims, emb_dim)``) and the convolutions would
+        mix a gathered tensor with sharded ones. Gathering by hand does not work
+        either — ``FSDPModule.unshard()`` needs autograd state that
+        ``inference_mode`` forbids here.
+
+        The shipped inference config already runs this module under DDP, so this
+        only fires for a hand-written FSDP2 inference config; say what to change
+        instead of failing inside ``aten::embedding``.
+        """
+        if _is_fsdp_sharded(self) or _is_fsdp_sharded(self.vqmodel):
+            raise RuntimeError(
+                "JanusVqvae.generate cannot decode from an FSDP2-sharded codec: "
+                "vqmodel.decode() reads the codebook and the decoder convolutions through "
+                "attribute access, which FSDP2 only gathers inside a module's own forward. "
+                "Run image generation with janus_vqvae under ddp or eager "
+                "(see configs/seed_omni/Janus/janus/infer/modules_infer_fsdp.yaml), "
+                "or add a forward hook for this path."
+            )
 
     def reset_local_inference_state(self) -> None:
         self._vq_buffer.clear()

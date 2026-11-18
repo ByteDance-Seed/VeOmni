@@ -499,3 +499,33 @@ def test_a_generation_prompt_ends_at_the_marker():
         base(rendered, add_special_tokens=False)["input_ids"][-4:]
         == base(upstream, add_special_tokens=False)["input_ids"][-4:]
     )
+
+
+@_CPU
+def test_generate_refuses_an_fsdp2_sharded_codec(monkeypatch):
+    """``vqmodel.decode`` bypasses FSDP2's unshard hooks, so decoding must be refused.
+
+    ``JanusVQVAE.decode`` reads the codebook through
+    ``self.quantize.get_codebook_entry`` → ``self.embedding(...)`` and then runs
+    the decoder convolutions — attribute lookups, not calls on the sharded
+    modules. FSDP2 therefore never gathers ``embedding.weight`` (nor the conv
+    weights): the lookup reshapes this rank's shard against the full grid and
+    fails, or mixes a gathered tensor with sharded ones. The shipped inference
+    config runs this module under DDP, so the guard only fires for a hand-written
+    FSDP2 inference config — where the alternative is an ``aten::embedding``
+    error from inside the decode.
+    """
+    from veomni.models.seed_omni.modules.janus.vqvae import modeling as vq_modeling
+
+    module = OMNI_ACCELERATED_MODEL_REGISTRY["janus_vqvae"]()(
+        OMNI_CONFIG_REGISTRY["janus_vqvae"]()(ops_implementation=make_eager_ops_config())
+    )
+    # The shipped config: unsharded, so the guard stays quiet.
+    assert not vq_modeling._is_fsdp_sharded(module)
+    module._require_unsharded_codec()
+
+    # `_is_fsdp_sharded` is the whole test; a real FSDP2 shard needs a process
+    # group this CPU case does not have, so report a shard for the codec itself.
+    monkeypatch.setattr(vq_modeling, "_is_fsdp_sharded", lambda candidate: candidate is module.vqmodel)
+    with pytest.raises(RuntimeError, match="FSDP2-sharded codec"):
+        module._require_unsharded_codec()
