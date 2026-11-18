@@ -97,6 +97,9 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             config=config,
         )
 
+        if config.image_training:
+            self.dit.final_layer.pdd_out.requires_grad_(False)
+            self.dit.final_layer.video_out.requires_grad_(False)
         self._configure_packed_attention(config.ops_config.attn_implementation)
 
     def _configure_packed_attention(self, attn_implementation):
@@ -199,6 +202,10 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         training_target_audio=None,
         video_latent_shape=None,
         audio_latent_shape=None,
+        *,
+        image_inputs=None,
+        image_training_target=None,
+        image_loss_weight=None,
         **kwargs,
     ) -> MiniMaxH3DiTOutput:
         """Forward pass with unpatchify + negation + internal loss computation.
@@ -209,6 +216,20 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         video_latent_shape: (T_v, latent_h//2, latent_w//2) for unpatchify_video
         audio_latent_shape: (audio_channel, T_a) for unpack_audio
         """
+        if self.config.image_training:
+            if (
+                image_inputs is None
+                or image_inputs.get("pdd_step_index") is None
+                or image_training_target is None
+                or image_loss_weight is None
+            ):
+                raise ValueError("H3-Image SFT requires image inputs, a PDD step index, a target, and a loss weight.")
+            predictions = -self.forward_image(**image_inputs)
+            if predictions.shape != image_training_target.shape:
+                raise ValueError("H3-Image predictions and target rows must have the same shape.")
+            loss = torch.nn.functional.mse_loss(predictions.float(), image_training_target.float())
+            return MiniMaxH3DiTOutput(loss={"mse_image": loss * image_loss_weight}, predictions=[predictions])
+
         if isinstance(x, list):
             if not x:
                 raise ValueError("H3 requires a nonempty microbatch.")

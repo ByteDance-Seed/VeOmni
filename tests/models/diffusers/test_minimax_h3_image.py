@@ -26,6 +26,7 @@ from safetensors.torch import save_file
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
+from tests.models.tiny_configs import tiny_minimax_h3_config
 from tests.models.tiny_configs import tiny_minimax_h3_image_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_minimax_h3_image_config as _tiny_config
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
@@ -113,6 +114,40 @@ def test_minimax_h3_image_forward_backpropagates_to_image_and_text_rows():
 
     assert inputs["x"].grad is not None
     assert inputs["prompt_embeds"].grad is not None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_image_training_updates_backbone_through_frozen_head():
+    torch.manual_seed(0)
+    config = tiny_minimax_h3_config(audio_enabled=False, num_pdd_heads=6, image_training=True)
+    config._set_ops_implementation(eager_ops_config())
+    model = MiniMaxH3DiTModel(config)
+    assert config.condition_model_type == "MiniMaxH3ImageConditionModel"
+    inputs = {**_image_inputs(), "pdd_step_index": 2}
+    target = torch.randn_like(inputs["x"])
+    weight = torch.tensor(0.7)
+    backbone_before = model.dit.video_patch_proj.weight.detach().clone()
+    frozen_before = {
+        name: param.detach().clone() for name, param in model.named_parameters() if not param.requires_grad
+    }
+
+    with torch.no_grad():
+        raw_prediction = model.forward_image(**inputs)
+        expected = (raw_prediction + target).square().mean() * weight
+    optimizer = torch.optim.AdamW((param for param in model.parameters() if param.requires_grad), lr=1e-3)
+    output = model(image_inputs=inputs, image_training_target=target, image_loss_weight=weight)
+    torch.testing.assert_close(output.predictions[0], -raw_prediction)
+    torch.testing.assert_close(output.loss["mse_image"], expected)
+    output.loss["mse_image"].backward()
+    assert torch.count_nonzero(model.dit.video_patch_proj.weight.grad) > 0
+    optimizer.step()
+
+    assert not torch.equal(model.dit.video_patch_proj.weight, backbone_before)
+    assert len(frozen_before) == 14
+    for name, param in model.named_parameters():
+        if name in frozen_before:
+            assert param.grad is None
+            torch.testing.assert_close(param, frozen_before[name], rtol=0, atol=0)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
