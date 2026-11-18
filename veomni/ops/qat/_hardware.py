@@ -35,7 +35,7 @@ def _native_bf16_qat_selections(model: nn.Module) -> set[str]:
         found: set[str] = set()
         ops = getattr(config, "ops_config", None)
         if ops is not None:
-            for field in ("linear_implementation", "swiglu_mlp_implementation"):
+            for field in ("linear_implementation", "gated_mlp_implementation"):
                 impl = getattr(ops, field, None)
                 if impl in _NATIVE_BF16_QAT_IMPLS:
                     found.add(impl)

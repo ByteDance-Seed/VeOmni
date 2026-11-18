@@ -342,11 +342,19 @@ def build_omni_module_runtime_args(
     )
 
     base_dict = _module_base(asdict(global_args))
+    # ``skip_sp_gather_between_modules`` is a property of the whole graph, not of
+    # one module: it says every module's ``post_forward`` hands its SP shard on
+    # instead of all-gathering. Enforcing the top-level value here means a
+    # per-module YAML entry cannot desynchronise the two sides of a handoff.
+    global_skip_sp_gather = bool(base_dict.get("accelerator", {}).get("skip_sp_gather_between_modules", False))
     runtime_modules: dict[str, OmniModuleRuntimeArguments] = {}
     for name, override in modules_overrides.items():
         merged = deepcopy(base_dict)
         for layer in (checkpoint_defaults.get(name, {}), inference_default, override or {}):
             _deep_update(merged, layer)
+        merged_acc = merged.setdefault("accelerator", {})
+        if isinstance(merged_acc, dict):
+            merged_acc["skip_sp_gather_between_modules"] = global_skip_sp_gather
         runtime_modules[name] = _instantiate_recursive(OmniModuleRuntimeArguments, merged)
     return runtime_modules
 
