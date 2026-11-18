@@ -59,7 +59,7 @@ never been run.
 | `cp_size > 1` requires `ulysses_size == 1` | `ParallelState.__post_init__` and `AcceleratorConfig._resolve_topology` | `NotImplementedError` at launch |
 | the model type must implement CP | `check_context_parallel_supported`, from `build_foundation_model` (the omni path reaches it the same way, once per sub-module) | `NotImplementedError` at model build |
 | on Ascend/NPU, the model type must be `deepseek_v4` | `check_context_parallel_supported` | `NotImplementedError` at model build |
-| on Ascend/NPU, `dsa_indexer_implementation` and `dsa_attention_implementation` must be `eager` | `check_context_parallel_supported`, which reads the adapted config's `ops_config` | `NotImplementedError` at model build for any value other than `eager` |
+| on Ascend/NPU, `dsa_indexer_implementation` and `dsa_attention_implementation` must be `eager` or `cann` | `check_context_parallel_supported`, which reads the adapted config's `ops_config` | `NotImplementedError` at model build for any other value |
 | explicit `position_ids` under either sequence-parallel mode | `DeepseekV4Model.forward` | `ValueError` on the first forward |
 | the attention mask spans the full sequence | `DeepseekV4Attention.forward`, ahead of the KV all-gather | `ValueError` on the first forward |
 | no KV cache under CP | `DeepseekV4Attention.forward` | `NotImplementedError` |

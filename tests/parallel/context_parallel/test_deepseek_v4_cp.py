@@ -37,7 +37,6 @@ from scripts.ci.accelerator.launch_plan import (
 from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.device import (
     IS_CUDA_AVAILABLE,
-    IS_NPU_AVAILABLE,
     get_device_type,
     get_dist_comm_backend,
     get_gpu_compute_capability,
