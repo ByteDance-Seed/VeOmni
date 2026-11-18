@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 import tempfile
 from contextlib import ExitStack
@@ -27,10 +28,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter, runner_device_count
+from scripts.ci.accelerator.launch_plan import (
+    LaunchSpec,
+    from_parameter,
+    runner_device_count,
+)
 from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.device import (
     IS_CUDA_AVAILABLE,
+    IS_NPU_AVAILABLE,
     get_device_type,
     get_dist_comm_backend,
     get_gpu_compute_capability,
@@ -38,7 +44,22 @@ from veomni.utils.device import (
 )
 
 
-_PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu"
+def _modeling():
+    """The generated DeepSeek-V4 module for the backend this worker runs on.
+
+    The GPU and NPU modules are the same modeling with backend-specific patches;
+    the CP code under test is shared, so a worker must build the one that matches
+    its device instead of always the GPU module.
+    """
+    suffix = "npu" if get_device_type() == "npu" else "gpu"
+    return importlib.import_module(
+        f"veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_{suffix}"
+    )
+
+
+# The in-process tests patch the parallel-state accessor of the module they build
+# layers from, so this has to name the same backend the workers do.
+_PATCHED_MODULE = _modeling().__name__
 
 
 def _load_dsv4_toy_config(**ops_overrides):
@@ -54,15 +75,19 @@ def _load_dsv4_toy_config(**ops_overrides):
     return config
 
 
-def _cuda_device_count() -> int:
-    """Devices this suite can run on, which are CUDA devices and nothing else.
+def _accelerator_device_count() -> int:
+    """Devices this suite can run on: the runner's own accelerator cards.
 
-    Context parallelism is GPU-only -- ``check_context_parallel_supported``
-    refuses it on Ascend -- but these workers build the GPU patched module
-    directly instead of going through that gate, so a plain device count would
-    let a multi-NPU host start a suite that cannot run there.
+    Context parallelism is admitted on CUDA and, with the eager DSA operators,
+    on Ascend, and these workers build the backend's patched module directly, so
+    a plain device count is the right eligibility test. A host on any other
+    backend reports 0 and skips -- asking the scheduler for its capabilities
+    would raise, and this helper feeds a skip decorator, so it runs during
+    collection.
     """
-    return runner_device_count() if IS_CUDA_AVAILABLE else 0
+    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
+        return 0
+    return runner_device_count()
 
 
 def _all_devices_sm90_or_above() -> bool:
@@ -203,8 +228,8 @@ def _init_cp_attention(
         )
 
     from veomni.distributed.parallel_state import _init_parallel_state
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
 
+    dsv4 = _modeling()
     cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
     dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
 
@@ -471,9 +496,9 @@ def _run_compressor_cp(
             world_size=world_size,
         )
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
+    dsv4 = _modeling()
     cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
     dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
 
@@ -600,10 +625,10 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int, *,
             world_size=world_size,
         )
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
     from veomni.ops import resolve_op
 
+    dsv4 = _modeling()
     cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
     dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
 
@@ -719,7 +744,7 @@ def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int, 
     so that a guard moved after the halo exchange is caught by the unusable group
     rather than by the compressor's own shard-width check.
     """
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    dsv4 = _modeling()
 
     config = _load_dsv4_toy_config()
     torch.manual_seed(0)
@@ -786,7 +811,7 @@ def test_deepseek_v4_cp_rejects_a_narrow_shard(kind):
     or none does, which is the property that keeps this a clean error instead of
     a ten-minute watchdog timeout.
     """
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    dsv4 = _modeling()
 
     class_name, role = _WINDOW_COMPRESSORS[kind]
     config = _load_dsv4_toy_config()
@@ -830,7 +855,7 @@ def test_deepseek_v4_attention_cp_rejects_a_local_length_mask(with_compressor):
 
 def _build_toy_model(seq_len: int):
     """A whole toy model on CPU plus one batch of ids, for the model-forward guards."""
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    dsv4 = _modeling()
 
     config = _load_dsv4_toy_config()
     torch.manual_seed(0)
@@ -888,6 +913,9 @@ _ZERO_WINDOW_PACKED_SEQ_LEN = 16
 _ZERO_WINDOW_PACKED_SAMPLES = ((0, 6), (6, 16))
 _PACKED_MODEL_SEQ_LEN = 128
 _PACKED_MODEL_SAMPLES = ((0, 70), (70, 128))
+# Two ranks are enough to exercise CP's rank and local-query/global-KV geometry;
+# CUDA CI also runs the four-rank topology that covers the packed-model branches.
+_CP_SIZES = (2, 4) if IS_CUDA_AVAILABLE else (2,)
 
 
 def _run_model_cp_packed(
@@ -906,8 +934,7 @@ def _run_model_cp_packed(
             world_size=world_size,
         )
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
-
+    dsv4 = _modeling()
     cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
     dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
     if tilelang:
@@ -1166,11 +1193,11 @@ def _run_all_cp_scenarios(rank: int, world_size: int, init_file: str) -> None:
 
 
 @pytest.mark.launch_plan(provider=from_parameter("cp_size", device="accelerator"))
-@pytest.mark.skipif(_cuda_device_count() < 2, reason="needs 2 devices")
-@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.skipif(_accelerator_device_count() < 2, reason="needs 2 devices")
+@pytest.mark.parametrize("cp_size", _CP_SIZES)
 def test_deepseek_v4_cp_equivalence(cp_size):
     """Fused CP worker covering all DeepSeek-V4 CP attention, compressor, indexer, and model parity scenarios."""
-    if _cuda_device_count() < cp_size:
+    if _accelerator_device_count() < cp_size:
         pytest.skip(f"needs {cp_size} devices")
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")

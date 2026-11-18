@@ -12,7 +12,7 @@
 #   linear_implementation        attention and indexer projections (q_a/q_b/kv/o_a/o_b):
 #                                both GEMM operands, 1x128 activation blocks, 128x128
 #                                weight tiles, ue8m0 power-of-two scales.
-#   swiglu_mlp_implementation    the shared expert's fused SwiGLU projections, same
+#   gated_mlp_implementation    the shared expert's fused SwiGLU projections, same
 #                                recipe; the clamp and silu*mul stay in the model dtype.
 #   moe_implementation           routed experts on the fused-MoE path: activation in
 #                                1x128 blocks, weights per the checkpoint's
@@ -32,8 +32,8 @@
 #
 # Swapping `moe_implementation` to `deepgemm_fp8` is a valid variant of this config: it
 # runs native FP8 expert GEMMs instead of fake-quantizing the experts, while `linear`,
-# `swiglu_mlp` and `kv_round` stay on their QAT rows. Those are separate GEMMs -- in
-# particular `swiglu_mlp` is the shared expert, which DeepGEMM does not cover -- so the
+# `gated_mlp` and `kv_round` stay on their QAT rows. Those are separate GEMMs -- in
+# particular `gated_mlp` is the shared expert, which DeepGEMM does not cover -- so the
 # two selections compose rather than conflict.
 #
 # Precision: BF16 parameters with FP32 gradient reduction. The fake quantizers are
@@ -53,7 +53,7 @@ model:
     rotary_pos_emb_implementation: triton
     # Every quantizable family, all on the QAT rows.
     linear_implementation: qat
-    swiglu_mlp_implementation: qat
+    gated_mlp_implementation: qat
     moe_implementation: qat
     kv_round_implementation: triton
   optimizer:

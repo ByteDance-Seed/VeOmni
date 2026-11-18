@@ -74,6 +74,33 @@ def test_qwen4_expert_forwards_fp32_wgrad_option_only_when_enabled(backend):
     assert calls.pop() == {"num_experts": 2, "fp32_wgrad": True}
 
 
+@pytest.mark.parametrize("backend", ["gpu", "npu"])
+@pytest.mark.parametrize("activation", ["silu", "gelu"])
+def test_precision_validator_uses_actual_qwen4_activation_flag(backend, activation):
+    import importlib
+
+    module = importlib.import_module(
+        f"veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_{backend}"
+    )
+    config = SimpleNamespace(
+        num_experts=2,
+        hidden_size=4,
+        moe_intermediate_size=3,
+        hidden_act=activation,
+        ops_config=SimpleNamespace(moe_implementation="eager"),
+    )
+    experts = module.Qwen4ExpTextExperts(config)
+    experts.veomni_moe = SimpleNamespace(impl="fused_npu")
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(model_type="qwen4_exp")
+    model.experts = experts
+    if activation == "silu":
+        assert validate_qwen4_experts(model) == {id(experts)}
+    else:
+        with pytest.raises(ValueError, match="SiLU fused_npu experts"):
+            validate_qwen4_experts(model)
+
+
 @pytest.mark.parametrize(
     "mixed_changes,parallel_changes",
     [
@@ -113,7 +140,7 @@ class Qwen4ExpTextExperts(torch.nn.Module):
     def __init__(self, impl="fused_npu", swiglu=True, dtype=torch.float32):
         super().__init__()
         self.veomni_moe = SimpleNamespace(impl=impl)
-        self.use_swiglu_mlp = swiglu
+        self.use_swiglu = swiglu
         self.weight = torch.nn.Parameter(torch.ones(2, 2, dtype=dtype))
 
 

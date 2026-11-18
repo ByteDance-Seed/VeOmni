@@ -46,9 +46,9 @@ weights-only run rather than silently assuming identical update behavior.
 For supported nonempty model storage, this includes distinct tensor views that
 share an allocation. It does not prove aliasing through independently imported
 shared mappings, empty allocations or external accelerator storage. Recognized
-file-backed model storage and lazy conjugate/negative model views are rejected;
-some externally mapped storage cannot be detected and must not be used for
-model aliases. Quantized, non-strided and meta model tensors are unsupported.
+file-backed model storage is rejected. Lazy conjugate/negative views and some
+externally mapped storage cannot be reliably identified and must not be used
+for model aliases. Quantized, non-strided and meta model tensors are unsupported.
 File-backed optimizer moments are separate and are not restricted here.
 
 ## What each path holds
@@ -92,7 +92,7 @@ Three splits in the tree above are deliberate:
   Iterable datasets are `split_dataset_by_node`-sharded on `dp_rank` and the
   multisource sampler filters on `dp_rank`, so restoring rank 0's cursor
   everywhere would replay rank 0's shard and skip the rest. RNG and meters are
-  rank-local for the same reason. The scheduler is rank-local too: it lives in
+  rank-local for the same reason. Scheduler state is also saved and restored per rank: it lives in
   each rank's `model/<module>/extra_state/extra_state_rank_{R}.pt`, beside the
   runtime-contributed state, rather than in a replicated sidecar.
 - **Weights and optimizer are two DCP directories** because they have different
@@ -221,11 +221,10 @@ register_checkpoint_scheduler(scheduler, name="my.schedule", version=1,
                               parameters={"warmup_steps": 100})
 ```
 
-Unrecognized instance-level `state_dict` replacements on optimizer leaves are
-rejected: a wrapper could otherwise renumber parameter IDs after capture and
-silently assign the wrong learning rate. Known PyTorch DCP wrappers are allowed.
-Optimizer class implementations and registered state-dict hooks are trusted to
-preserve their declared parameter mapping and update semantics.
+Optimizer class implementations, instance-level `state_dict` wrappers and
+registered hooks are trusted to preserve parameter IDs, group mappings and
+update semantics. A wrapper that changes the serialized mapping needs a
+matching, validated restore implementation for exact continuation.
 
 With `stage_dir` the model half waits: a staged save has overwritten nothing
 until the copy to the destination, so it invalidates the destination there
@@ -302,6 +301,24 @@ The compatibility loader that handled VeOmni 0.1.12 and 0.2.x
 such a run, restart it, or convert the weights out first with
 [Checkpoint conversion](checkpoint_conversion.md) and resume from the converted
 export as a fresh run.
+
+### Split-layout checkpoints missing model sidecars
+
+A split-layout checkpoint containing only `model/[<module>/]lr_scheduler.pt`
+can pass marker discovery even when the per-rank model sidecars are missing.
+The current loader skips missing sidecars; the default runtime then keeps its
+initialized scheduler rather than restoring the saved schedule. Do not continue
+training assuming that discovery proves scheduler restoration.
+
+For such a checkpoint, resume with the compatible revision/environment that
+wrote and reads that scheduler layout, and verify the restored step and learning
+rate before continuing. To migrate instead, work on a copy: convert the saved
+scheduler state into the `lr_scheduler` key of each rank's model
+`extra_state/extra_state_rank_{R}.pt`, preserving any model-specific rank-local
+state as well. This is a format conversion, not a file rename; the repository
+does not provide an automatic standalone-scheduler fallback here. Validate the
+restored scheduler state and next learning-rate update against a compatible
+resume before using the converted checkpoint for training.
 
 ## Versioned ExtraParallel layout
 
@@ -434,11 +451,9 @@ partial placements, or any active ExtraParallel dimension remain unproven.
 All ranks in a checkpoint operation must use the same logical model and
 checkpoint configuration, including the layout version and corresponding
 sharding specifications. Normal rank-local shard contents and mesh coordinates
-may differ. When any rank enables the canonical v2 layout, a preflight compares
-the v2 flag, shard specifications, optimizer presence and trainable-only
-selection before any checkpoint is modified. This is not a complete proof of
-all runtime provenance or replica equality. Legacy-only configurations still
-rely on agreement as an input contract. Rank-local layout validation errors are
+may differ. All ranks must use the same v2 flag, shard specifications, optimizer presence
+and trainable-only selection. This is an input contract, not a proof of runtime
+provenance or replica equality. Rank-local layout validation and I/O errors are
 propagated to peers.
 
 Raw `torch.distributed.checkpoint.load(..., planner=DefaultLoadPlanner(allow_partial_load=True))` is not a
