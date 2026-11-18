@@ -204,19 +204,10 @@ def apply_activation_backward(grad_output: Tensor, hidden: Tensor, activation: s
     runs under ``no_grad``, so autograd never differentiates it. The ``gated_mlp``
     rows do not use this -- they are opaque wrappers, and autograd handles them.
 
-    **Every branch is an ATen backward op**, never a restated formula and never
-    ``torch.func.vjp``. That is the only route that survives all three constraints
-    at once:
-
-    * ``vjp`` refuses to run inside ``saved_tensors_hooks``, which is how activation
-      offload works;
-    * ``autograd.grad`` over a fresh ``requires_grad_(True)`` leaf is rejected by
-      Dynamo under ``torch.compile(fullgraph=True)``;
-    * a closed-form derivative computed in fp32 does not reproduce the rounding of
-      the bf16 chain autograd would have taken (measured ~1% mean relative error).
-
-    ``aten.silu_backward`` and ``aten.gelu_backward`` reproduce it bit for bit in
-    bf16 and fp32 for every name :data:`SUPPORTED_ACTIVATIONS` serves.
+    Four names, one branch each, and no fallback: each is an ATen backward op rather
+    than a restated formula, so the gradient is bit-exact against ``ACT2FN``'s
+    autograd in bf16 and fp32. A name outside :data:`SUPPORTED_ACTIVATIONS` raises
+    here rather than differentiating as whichever branch happened to come last.
 
     Args:
         grad_output: Upstream gradient.
@@ -226,8 +217,19 @@ def apply_activation_backward(grad_output: Tensor, hidden: Tensor, activation: s
     Returns:
         The gradient with respect to ``hidden``, in ``hidden``'s dtype.
     """
-    name = normalize_activation(activation)
+    name = activation.value if hasattr(activation, "value") else activation
     if name == "silu":
         return torch.ops.aten.silu_backward(grad_output, hidden)
-    approximate = "none" if name == "gelu" else "tanh"
-    return torch.ops.aten.gelu_backward(grad_output, hidden, approximate=approximate)
+    if name == "swish":
+        # HF aliases ``swish`` to SiLU, and naming it here keeps the second supported
+        # spelling visible rather than hidden inside a normalization step.
+        return torch.ops.aten.silu_backward(grad_output, hidden)
+    if name == "gelu":
+        return torch.ops.aten.gelu_backward(grad_output, hidden, approximate="none")
+    if name == "gelu_pytorch_tanh":
+        return torch.ops.aten.gelu_backward(grad_output, hidden, approximate="tanh")
+    raise ValueError(
+        f"No activation backward for {activation!r}. This supports exactly "
+        f"{sorted(SUPPORTED_ACTIVATIONS)}; adding another means adding its ATen "
+        f"backward here in the same change."
+    )

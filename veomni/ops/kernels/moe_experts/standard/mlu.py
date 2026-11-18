@@ -297,9 +297,8 @@ def wrapper(
 ) -> Tensor:
     """Call the MLU fused MoE path. Empty weights are ``None``."""
     if normalize_activation(activation) != "silu":
-        # The MLU fused kernel computes SiLU inside the grouped GEMM, so there is no
-        # seam to substitute another activation into. The ``eager`` row runs the same
-        # expert math with any activation and is the reference implementation.
+        # This kernel computes SiLU inside the grouped GEMM; any other activation
+        # runs on the ``eager`` row, which is the reference implementation.
         from . import eager as _eager
 
         return _eager.wrapper(

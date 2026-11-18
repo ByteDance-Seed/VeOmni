@@ -889,6 +889,31 @@ def test_render_routes_each_row_by_shape_and_activation():
 
 
 @_cpu
+def test_every_supported_activation_has_a_backward_and_nothing_else_does():
+    """The derivative covers exactly the served names, and refuses the rest.
+
+    ``apply_activation_backward`` is called from ``moe_experts``' hand-written
+    ``autograd.Function``s, where the derivative must be supplied explicitly. It is
+    a chain of explicit branches with no fallback, so a name it does not know raises
+    rather than differentiating as whichever branch came last -- and a name added to
+    :data:`SUPPORTED_ACTIVATIONS` without a branch here fails this test rather than
+    reaching a training run.
+    """
+    import torch
+
+    from veomni.ops.activation import SUPPORTED_ACTIVATIONS, apply_activation_backward
+
+    grad = torch.randn(8)
+    hidden = torch.randn(8)
+    for name in SUPPORTED_ACTIVATIONS:
+        assert apply_activation_backward(grad, hidden, name).shape == hidden.shape
+
+    for name in ("relu", "mish", "quick_gelu", "gelu_10"):
+        with pytest.raises(ValueError, match="No activation backward"):
+            apply_activation_backward(grad, hidden, name)
+
+
+@_cpu
 @pytest.mark.parametrize("activation", ["relu", "mish", "quick_gelu", "gelu_10"])
 def test_the_eager_row_runs_an_activation_outside_the_whitelist_exactly(activation):
     """The reference row keeps every config that worked before this family existed.

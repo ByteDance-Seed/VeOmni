@@ -795,10 +795,8 @@ def wrapper(
 ) -> Tensor:
     """Call the Quack fused MoE Function. Empty weights are ``None``."""
     if normalize_activation(activation) != "silu":
-        # This row's fused kernel computes SiLU inside the grouped GEMM, so there is
-        # no seam to substitute another activation into. The ``eager`` row runs the
-        # same expert math with any activation and is the reference implementation,
-        # so a non-SiLU model takes it rather than losing the activation.
+        # This kernel computes SiLU inside the grouped GEMM; any other activation
+        # runs on the ``eager`` row, which is the reference implementation.
         from . import eager as _eager
 
         return _eager.wrapper(

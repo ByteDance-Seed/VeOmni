@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
+from ....activation import normalize_activation
 
 
 def _experts(x, counts, fc1, fc2, swiglu_limit, recompute_weights=(True, True)):
@@ -82,11 +83,17 @@ def wrapper(
     activation: str = "silu",
 ) -> Tensor:
     """Run FP8 expert GEMMs with BF16 inputs, outputs and first-order gradients.
+
+    Supports merged or split gate/up weights, zero-token experts, and EP with
+    distinct or repeated expert ids. Hidden and intermediate sizes must be
+    multiples of 128. Unsupported hardware,
+    dtypes or layouts fail explicitly. CPU count metadata prevents CUDA graph
+    capture. Routing weights are applied after the down projection, matching the
+    eager expert contract rather than moving them through FP8 quantization.
+    """
     if normalize_activation(activation) != "silu":
-        # This row's fused kernel computes SiLU inside the grouped GEMM, so there is
-        # no seam to substitute another activation into. The ``eager`` row runs the
-        # same expert math with any activation and is the reference implementation,
-        # so a non-SiLU model takes it rather than losing the activation.
+        # This kernel computes SiLU inside the grouped GEMM; any other activation
+        # runs on the ``eager`` row, which is the reference implementation.
         from . import eager as _eager
 
         return _eager.wrapper(
@@ -104,14 +111,6 @@ def wrapper(
             expert_dtype=expert_dtype,
             activation=activation,
         )
-
-    Supports merged or split gate/up weights, zero-token experts, and EP with
-    distinct or repeated expert ids. Hidden and intermediate sizes must be
-    multiples of 128. Unsupported hardware,
-    dtypes or layouts fail explicitly. CPU count metadata prevents CUDA graph
-    capture. Routing weights are applied after the down projection, matching the
-    eager expert contract rather than moving them through FP8 quantization.
-    """
     if (
         hidden_states.device.type != "cuda"
         or torch.version.hip is not None

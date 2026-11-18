@@ -56,6 +56,7 @@ from tests.ops.utils import assert_close_with_error, assert_reference_signal, ma
 from veomni.ops import resolve_op
 from veomni.ops.kernels.moe_experts.shared import scheduling as same_nk_scheduling
 from veomni.ops.kernels.moe_experts.shared.indices import build_moe_indices
+from veomni.ops.kernels.moe_experts.standard import triton as triton_module
 from veomni.ops.kernels.moe_experts.standard.npu import _fc1_weight
 from veomni.utils.device import (
     IS_CUDA_AVAILABLE,
@@ -1535,3 +1536,113 @@ def test_the_eager_row_runs_the_configured_activation(activation):
             activation="silu",
         )
         assert not torch.equal(out.detach(), other)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "impl",
+    ["eager", "fused_quack", "deepgemm_fp8", "fused_npu", "fused_mlu"],
+)
+def test_a_fused_row_delegates_a_non_silu_activation_to_eager(impl):
+    """Rows whose kernel fuses SiLU agree with ``eager`` for every other activation.
+
+    ``fused_quack``, ``deepgemm_fp8``, ``fused_npu`` and ``fused_mlu`` compute
+    ``act(gate) * up`` inside their grouped GEMM, so another activation has no seam
+    to reach. They hand that call to the ``eager`` row, which is the reference
+    implementation and the same math models used before the activation became a call
+    argument -- hence ``rtol=0, atol=0`` here rather than a loose tolerance.
+
+    This also pins the delegation's *placement*: it has to precede each row's
+    hardware guard, or a non-SiLU model on the wrong device fails with a hardware
+    error instead of running on the reference row.
+    """
+    from veomni.ops.kernels.moe_experts.standard import deepgemm, eager, mlu, npu, quack
+
+    rows = {
+        "eager": eager,
+        "fused_quack": quack,
+        "deepgemm_fp8": deepgemm,
+        "fused_npu": npu,
+        "fused_mlu": mlu,
+    }
+    row = rows[impl]
+
+    torch.manual_seed(0)
+    experts, hidden, intermediate, tokens, top_k = 3, 8, 16, 5, 2
+    x = torch.randn(tokens, hidden)
+    gate_up = torch.randn(experts, 2 * intermediate, hidden)
+    down = torch.randn(experts, hidden, intermediate)
+    routes = torch.randint(0, experts, (tokens, top_k))
+    routing = torch.softmax(torch.randn(tokens, top_k), dim=-1)
+    empty = gate_up.new_empty(0)
+
+    for activation in ("gelu", "gelu_pytorch_tanh"):
+        got = row.wrapper(
+            x,
+            routing,
+            routes,
+            empty,
+            empty,
+            down,
+            gate_up,
+            num_experts=experts,
+            activation=activation,
+        )
+        want = eager.wrapper(
+            x,
+            routing,
+            routes,
+            empty,
+            empty,
+            down,
+            gate_up,
+            num_experts=experts,
+            activation=activation,
+        )
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_every_ctx_attribute_a_backward_reads_is_assigned_in_forward():
+    """A custom ``autograd.Function``'s ``ctx`` only carries what ``forward`` set.
+
+    ``activation`` reaches the backward this way, and the two Triton Functions have
+    separate ``ctx`` assignments -- so adding the argument to one and forgetting the
+    other raises ``AttributeError`` only on the path that uses it. That happened
+    here: the merged-fc1 backward read ``ctx.activation`` while only the split-fc1
+    forward assigned it, and no CPU test reached the merged path.
+
+    Static rather than runtime, so it covers both Functions without a GPU.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(triton_module.__file__).read_text()
+    missing = []
+    checked = 0
+    for cls in (n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)):
+        forward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward"), None)
+        backward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "backward"), None)
+        if forward is None or backward is None:
+            continue
+        checked += 1
+        assigned = {
+            node.attr
+            for node in ast.walk(forward)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "ctx"
+            and isinstance(node.ctx, ast.Store)
+        }
+        read = {
+            node.attr
+            for node in ast.walk(backward)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "ctx"
+            and isinstance(node.ctx, ast.Load)
+        }
+        missing.extend((cls.name, name) for name in read - assigned - {"saved_tensors", "needs_input_grad"})
+
+    assert checked == 2, f"expected both Triton Functions, checked {checked}"
+    assert not missing, f"backward reads an attribute its forward never sets: {missing}"

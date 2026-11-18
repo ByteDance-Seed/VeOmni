@@ -294,10 +294,6 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             )
 
         # MOE Step 5
-        # An ATen backward op, not a restated derivative: it is the only form that
-        # reproduces this forward's rounding in bf16 and stays clear of both
-        # ``vjp`` (refused under ``saved_tensors_hooks``) and
-        # ``requires_grad_(True)`` (refused under ``fullgraph=True``).
         grad_fc1_1_output = apply_activation_backward(grad_fc1_1_activation, fc1_1_output, ctx.activation)
         if swiglu_limit is not None:
             grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
@@ -437,6 +433,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         ctx.num_experts = num_experts
         ctx.swiglu_limit = swiglu_limit
+        ctx.activation = activation
         ctx.max_expert_tokens = max_expert_tokens
         # These intermediates are cheap to recompute in backward and do not
         # need to remain live for the entire forward-to-backward interval.
