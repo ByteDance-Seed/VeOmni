@@ -26,8 +26,9 @@ import torch
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
-from ....activation import apply_activation, apply_activation_backward, normalize_activation
+from ....activation import apply_activation
 from ..shared import swiglu
+from ..shared.activation import activation_backward, is_silu
 from ..shared.scatter import compute_expert_scatter_index, compute_max_expert_tokens
 from ..shared.swiglu import apply_swiglu_clamp
 
@@ -319,7 +320,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             )
 
         # MOE Step 5
-        grad_fc1_1_output = apply_activation_backward(grad_fc1_1_activation, fc1_1_output, ctx.activation)
+        grad_fc1_1_output = activation_backward(grad_fc1_1_activation, fc1_1_output, ctx.activation, ctx.act_fn)
         if swiglu_limit is not None:
             grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
 
@@ -441,7 +442,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         # SiLU keeps the fused Triton kernel; any other activation is evaluated the
         # same way the split-fc1 forward does it, so ``forward`` and ``backward``
         # cannot disagree about which function was applied.
-        if normalize_activation(activation) == "silu":
+        if is_silu(activation):
             fc1_activation = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output)
         else:
             fc1_activation = _expert_activation(fc1_1_output, activation, act_fn) * fc1_2_output
@@ -544,7 +545,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             tile_total_M=tile_total_M,
         )
 
-        if normalize_activation(ctx.activation) == "silu":
+        if is_silu(ctx.activation):
             fc1_activation, grad_fc1_output = swiglu.merged_swiglu_backward(
                 fc1_1_output,
                 fc1_2_output,
@@ -553,7 +554,9 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 mask_fc1_2 if swiglu_limit is not None else None,
             )
         else:
-            gate_grad = apply_activation_backward(grad_fc1_activation * fc1_2_output, fc1_1_output, ctx.activation)
+            gate_grad = activation_backward(
+                grad_fc1_activation * fc1_2_output, fc1_1_output, ctx.activation, ctx.act_fn
+            )
             up_grad = grad_fc1_activation * _expert_activation(fc1_1_output, ctx.activation, ctx.act_fn)
             # Gate on ``swiglu_limit``, not on the mask tensors: forward saves an
             # empty float tensor when clamping is off, so "is not None" is always

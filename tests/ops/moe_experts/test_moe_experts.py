@@ -1935,3 +1935,65 @@ def test_every_backward_keeps_its_weight_gradient_inside_the_requires_grad_guard
                     problems.append(f"{cls.name}: `if {test}` computes no weight gradient")
 
     assert not problems, f"a weight gradient moved out of its guard: {problems}"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("activation", ["relu", "mish", "quick_gelu", "gelu", "silu"])
+def test_the_shared_activation_backward_matches_autograd(activation):
+    """A name outside the four served ones differentiates through the model's `act_fn`.
+
+    `fused_triton` is the GPU default, so a `relu` config reaches it first. Forward
+    worked through the `act_fn` fallback, but backward called
+    `apply_activation_backward`, which raises for anything outside its four branches --
+    so the run failed at the first training step instead of the first forward. This
+    covers both routes through one helper.
+    """
+    from transformers.activations import ACT2FN
+
+    from veomni.ops.kernels.moe_experts.shared.activation import activation_backward
+
+    torch.manual_seed(0)
+    act_fn = ACT2FN[activation]
+    hidden = torch.randn(256, dtype=torch.bfloat16)
+    grad = torch.randn(256, dtype=torch.bfloat16)
+
+    got = activation_backward(grad, hidden, activation, act_fn)
+
+    leaf = hidden.detach().clone().requires_grad_(True)
+    (expected,) = torch.autograd.grad(act_fn(leaf), leaf, grad)
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_silu_fused_row_delegates_to_triton_under_expert_parallelism():
+    """`eager` cannot serve a sharded expert weight, so EP delegation goes to `triton`.
+
+    `eager` indexes the expert weights it is handed by global expert id -- correct when
+    one rank owns every expert, wrong under EP where each rank holds a shard: it reads
+    past the shard or picks the wrong expert, with no error. `triton` owns the EP
+    dispatch, so it is the only reference row a non-Swish activation can fall back to
+    there.
+    """
+    import pathlib
+    from types import SimpleNamespace
+
+    from veomni.ops.kernels.moe_experts.shared import activation as activation_module
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(
+            "veomni.distributed.parallel_state.get_parallel_state",
+            lambda: SimpleNamespace(ep_enabled=False),
+        )
+        assert activation_module.delegate_target("gelu") == "eager"
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(
+            "veomni.distributed.parallel_state.get_parallel_state",
+            lambda: SimpleNamespace(ep_enabled=True),
+        )
+        assert activation_module.delegate_target("gelu") == "triton"
+
+    # And the three SiLU-fused rows must consult it rather than calling eager directly.
+    for module in ("quack", "npu", "mlu"):
+        source = (pathlib.Path(triton_module.__file__).parent / f"{module}.py").read_text()
+        assert "delegate_target(activation)" in source, f"{module} delegates without checking EP"

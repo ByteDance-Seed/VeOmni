@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import torch
 
-from ....activation import apply_activation, apply_activation_backward, normalize_activation
+from ....activation import apply_activation
 from . import swiglu
+from .activation import activation_backward, is_silu
 from .swiglu import apply_swiglu_clamp
 
 
@@ -187,7 +188,7 @@ class EPGroupGemm(torch.autograd.Function):
                 transpose_b=False,
             )
 
-        grad_fc1_1_output = apply_activation_backward(grad_fc1_1_activation, fc1_1_output, ctx.activation)
+        grad_fc1_1_output = activation_backward(grad_fc1_1_activation, fc1_1_output, ctx.activation, ctx.act_fn)
         if swiglu_limit is not None:
             grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
 
@@ -260,7 +261,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = apply_swiglu_clamp(
             fc1_1_output, fc1_2_output, swiglu_limit
         )
-        if normalize_activation(activation) == "silu":
+        if is_silu(activation):
             fc1_result = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output)
         else:
             fc1_result = _expert_activation(fc1_1_output, activation, act_fn) * fc1_2_output
@@ -321,7 +322,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             tile_total_M=tile_total_M,
         )
 
-        if normalize_activation(ctx.activation) == "silu":
+        if is_silu(ctx.activation):
             fc1_result, grad_fc1_output = swiglu.merged_swiglu_backward(
                 fc1_1_output,
                 fc1_2_output,
@@ -330,7 +331,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
                 mask_fc1_2 if swiglu_limit is not None else None,
             )
         else:
-            gate_grad = apply_activation_backward(grad_fc1_result * fc1_2_output, fc1_1_output, ctx.activation)
+            gate_grad = activation_backward(grad_fc1_result * fc1_2_output, fc1_1_output, ctx.activation, ctx.act_fn)
             up_grad = grad_fc1_result * _expert_activation(fc1_1_output, ctx.activation, ctx.act_fn)
             # Gate on ``swiglu_limit``: forward saves an empty float tensor where a
             # clamp mask would go, so "is not None" is always true and ``~`` would be
