@@ -116,6 +116,8 @@ seed_omni/mixins/module_preprocessor.md
 seed_omni/mixins/metric_meter.md
 seed_omni/mixins/offline_encoding.md
 seed_omni/mixins/configure_optimizer.md
+seed_omni/module_data_balance.md
+seed_omni/bagel_data_balance.md
 ```
 
 ```{toctree}
@@ -139,6 +141,7 @@ design/module_config.md
 design/fused_moe_ops.md
 design/deepgemm_fp8_moe.md
 design/local_parallel_state.md
+design/encoder_balance_costs.md
 design/patchgen.md
 design/qwen4_exp_ple_2d_parallelism.md
 design/verl_topk_distill_integration.md
