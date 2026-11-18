@@ -20,7 +20,7 @@
 #    - method_override: Gemma3RMSNorm.forward
 #      Always call the local rms_norm offset VeomniOp
 #    - init_modification: Gemma3MLP
-#      Bind instance-local geglu swiglu_mlp VeomniOp
+#      Bind instance-local geglu gated_mlp VeomniOp
 #    - method_override: Gemma3DecoderLayer.__init__
 #      Pass config to Gemma3RMSNorm instances
 #    - method_override: Gemma3TextModel.__init__
@@ -28,7 +28,7 @@
 #    - method_override: Gemma3MultiModalProjector.__init__
 #      Pass config to Gemma3RMSNorm
 #    - method_override: Gemma3MLP.forward
-#      Call geglu swiglu_mlp for gelu_pytorch_tanh on plain nn.Linear projections, otherwise the projection modules
+#      Call the geglu gated_mlp row, which picks fused weights or the projection modules
 #    - init_modification: Gemma3Attention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Gemma3Attention.forward
@@ -82,7 +82,6 @@ from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -153,7 +152,7 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
 
 
 class Gemma3MLP(nn.Module):
-    # [modified __init__] Bind instance-local geglu swiglu_mlp VeomniOp
+    # [modified __init__] Bind instance-local geglu gated_mlp VeomniOp
     def __init__(self, config: Gemma3TextConfig):
         super().__init__()
         self.config = config
@@ -163,23 +162,14 @@ class Gemma3MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_activation]
-        # Bind instance-local geglu swiglu_mlp VeomniOp
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "geglu", self.config.ops_config.swiglu_mlp_implementation)
+        # Bind instance-local geglu gated_mlp VeomniOp
+        self.veomni_gated_mlp = VeomniOp("gated_mlp", "geglu", self.config.ops_config.gated_mlp_implementation)
 
     def forward(self, x):
-        if self.config.hidden_activation in {"gelu_pytorch_tanh", "gelu_python_tanh"} and has_plain_linear_projections(
-            self
-        ):
-            return self.veomni_swiglu_mlp(
-                x,
-                self.gate_proj.weight,
-                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                self.up_proj.weight,
-                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-                self.down_proj.weight,
-                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-            )
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        # `hidden_activation` travels with the call: the variant computes GELU-tanh, and
+        # the row falls back to this block's own `act_fn` if the config asks for
+        # something else. That check used to be an `if` around the handle call.
+        return self.veomni_gated_mlp(self, x, activation=self.config.hidden_activation)
 
 
 # ======================================================================

@@ -59,7 +59,7 @@ model:
     dsa_indexer_implementation: tilelang
     mhc_implementation: tilelang
     rms_norm_implementation: liger_kernel
-    swiglu_mlp_implementation: liger_kernel
+    gated_mlp_implementation: liger_kernel
     rotary_pos_emb_implementation: triton
   optimizer:
     # Muon + AdamW, as the sibling config ships. The indexer's parameters carry gradients for

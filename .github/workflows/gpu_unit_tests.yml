@@ -158,7 +158,7 @@ jobs:
         run: |
           files=(
             tests/ops/linear/test_linear.py
-            tests/ops/swiglu_mlp/test_swiglu_mlp.py
+            tests/ops/gated_mlp/test_gated_mlp.py
           )
           # The two-rank QAT acceptance lands with the FP4 format PR; run it once
           # the file exists rather than failing on a missing path.
