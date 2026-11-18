@@ -13,6 +13,7 @@ import torch.multiprocessing as mp
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime, _make_mock_trainer
+from veomni.checkpoint import layout
 from veomni.models.checkpoint.manager import ModelCheckpointManager
 from veomni.trainer.callbacks.base import TrainerState
 
@@ -66,15 +67,30 @@ def _worker(rank, rendezvous, root, mode):
             if mode in ("dcp_reader", "model_state", "optimizer_state"):
                 from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer, ModelState, OptimizerState
 
+                if rank == 0:
+                    from pathlib import Path
+
+                    for directory in (layout.weights_dir(root), layout.optimizer_dir(root)):
+                        Path(directory).mkdir(parents=True, exist_ok=True)
+                        (Path(directory) / ".metadata").touch()
+                    extra = Path(layout.model_dir(root)) / "extra_state"
+                    extra.mkdir(parents=True, exist_ok=True)
+                    for saved_rank in range(2):
+                        torch.save({"lr_scheduler": None}, extra / f"extra_state_rank_{saved_rank}.pt")
+                dist.barrier()
                 manager.config.load_path = root
                 runtime.model = torch.nn.Linear(2, 2)
+                runtime.lr_scheduler = None
                 runtime.optimizer = (
                     torch.optim.AdamW(runtime.model.parameters()) if mode == "optimizer_state" else None
                 )
                 manager.checkpointer = DistributedCheckpointer
 
+                injected = []
+
                 def reader(_path):
                     if rank == 1 and mode == "dcp_reader":
+                        injected.append(mode)
                         raise RuntimeError("injected reader creation failure")
                     return MagicMock()
 
@@ -82,11 +98,13 @@ def _worker(rank, rendezvous, root, mode):
 
                 def model_snapshot(owner):
                     if rank == 1 and mode == "model_state":
+                        injected.append(mode)
                         raise RuntimeError("injected model state failure")
                     return original_model_snapshot(owner)
 
                 def optimizer_snapshot(owner):
                     if rank == 1 and mode == "optimizer_state":
+                        injected.append(mode)
                         raise RuntimeError("injected optimizer state failure")
                     return original_optimizer_snapshot(owner)
 
@@ -105,6 +123,9 @@ def _worker(rank, rendezvous, root, mode):
                 result = torch.tensor(int(error is not None))
                 dist.all_reduce(result)
                 assert result.item() == 2, (rank, error)
+                if rank == 1:
+                    assert injected == [mode]
+                    assert "injected" in error
                 return
             if mode in ("load_kwargs", "save_kwargs"):
                 manager.config.load_path = root

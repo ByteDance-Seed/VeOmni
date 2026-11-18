@@ -529,7 +529,14 @@ def test_legacy_same_output_resume_never_rewrites_completed_dcp(tmp_path, stage,
         resumed.checkpoint_callback = CheckpointCallback(resumed)
         cursor = GlobalStateCallback(resumed)
         if incomplete != "none":
-            with pytest.raises(RuntimeError, match="Cannot safely reuse"):
+            error, message = (
+                (ValueError, "Trainer CPU RNG state is missing")
+                if incomplete == "rng"
+                else (ValueError, "Trainer CPU and device RNG states conflict")
+                if incomplete == "rng_conflict"
+                else (RuntimeError, "Cannot safely reuse")
+            )
+            with pytest.raises(error, match=message):
                 cursor.load_global_state()
             assert restored._last_saved_step == -1
             assert resumed.checkpoint_callback._last_dcp_step == -1
@@ -626,11 +633,19 @@ def test_weights_only_resume_does_not_overwrite_source_step_zero(tmp_path, monke
     trainer.model = SimpleNamespace(optimizer=torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))]), checkpoint=None)
     callback = GlobalStateCallback(trainer)
     monkeypatch.setattr(callback, "_read_current", lambda _: None)
-    if mode != "different":
-        with pytest.raises(RuntimeError, match="without trainer state"):
-            callback.load_global_state()
-    else:
-        assert callback.load_global_state() is None
+    with pytest.raises(RuntimeError, match="Trainer state is missing.*optimizer continuation is unsafe"):
+        callback.load_global_state()
+
+
+def test_missing_trainer_state_accepts_weights_only_without_an_optimizer(tmp_path, monkeypatch):
+    trainer = _make_mock_trainer(save_path=str(tmp_path / "new"))
+    trainer.args.train.checkpoint.load_path = str(tmp_path / "old" / "global_step_0")
+    trainer.model = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
+    trainer.optimizer = None
+    trainer.lr_scheduler = None
+    callback = GlobalStateCallback(trainer)
+    monkeypatch.setattr(callback, "_read_current", lambda _: None)
+    assert callback.load_global_state() is None
 
 
 def test_failed_load_barrier_cannot_certify_legacy_receipt(tmp_path):
@@ -640,11 +655,16 @@ def test_failed_load_barrier_cannot_certify_legacy_receipt(tmp_path):
 
     runtime = _make_mock_runtime(save_path=str(tmp_path))
     runtime.optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+    runtime.lr_scheduler = None
     load_path = layout.step_dir(str(tmp_path), 2)
     runtime.train_args.checkpoint.load_path = load_path
     with (
         patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer),
-        patch.object(DistributedCheckpointer, "load"),
+        patch.object(
+            DistributedCheckpointer,
+            "load",
+            side_effect=lambda _path, state, **_: state["extra_state"].update(lr_scheduler=None),
+        ),
         patch("torch.distributed.barrier", side_effect=RuntimeError("barrier failed")),
     ):
         manager = ModelCheckpointManager(runtime)

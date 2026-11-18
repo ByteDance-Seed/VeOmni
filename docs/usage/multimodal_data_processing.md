@@ -266,10 +266,12 @@ the actual padding counts for `pixel_values` and `pixel_values_videos`.
 `sp_pad` maps those keys to the number of appended patch rows. The hook receives
 `(batch, sp_pad)` and updates the batch in place.
 
-This change only supplies declarations: it has no runtime consumer that checks
-these markers or enforces checkpoint compatibility. A resume implementation
-must explicitly consume and validate them; the markers alone do not establish
-exact data-loader or training recovery.
+The `cyclic_packed` loader's `_StatelessMainCollator` requires the RNG-free
+declaring `SerializablePureCollatorHook` wrapper and incorporates the hook
+identity into its checkpoint contract.
+Other loaders may not consume these declarations. The markers are author
+attestations, not a proof that the hook, its dependencies, or the data source
+are pure; they do not by themselves establish exact training recovery.
 See the [checkpoint guide](checkpoint.md) for the available save and restore
 workflows.
 

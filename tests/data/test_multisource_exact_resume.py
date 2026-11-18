@@ -66,6 +66,62 @@ def rows(iterator, n):
     return [next(iterator)[0][0]["id"] for _ in range(n)]
 
 
+@pytest.mark.parametrize("workers,persistent", [(0, False), (2, False), (2, True)])
+@pytest.mark.parametrize("boundary", [False, True])
+def test_fixed_multisource_trainer_resume_preserves_samples_and_cpu_rng(workers, persistent, boundary):
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    def trace(iterator):
+        return [(int(next(iterator)["id"]), torch.rand(4)) for _ in range(2)]
+
+    torch.manual_seed(12345)
+    _, source = make_loader(buffer_size=7, sharded=True, workers=workers, persistent=persistent)
+    try:
+        source.set_epoch(0)
+        iterator = iter(source)
+        for _ in range(4 if boundary else 2):
+            next(iterator)
+        cursor = copy.deepcopy(source.state_dict())
+        saved_rng = torch.get_rng_state().clone()
+        if boundary:
+            source.set_epoch(1)
+            iterator = iter(source)
+        expected = trace(iterator)
+    finally:
+        close(source)
+
+    _, restored = make_loader(buffer_size=7, sharded=True, workers=workers, persistent=persistent)
+    try:
+        trainer = SimpleNamespace(
+            args=SimpleNamespace(
+                train=SimpleNamespace(global_rank=0, checkpoint=SimpleNamespace(load_path="/unused")),
+                train_steps=4,
+            ),
+            state=SimpleNamespace(global_step=0, epoch=0),
+            train_dataloader=restored,
+            environ_meter=None,
+            channel_loss_callback=None,
+            offline_cache_writer=None,
+        )
+        callback = GlobalStateCallback.__new__(GlobalStateCallback)
+        callback.trainer = trainer
+        callback._read_current = lambda _: {
+            "global_step": 4 if boundary else 2,
+            "train_dataloader": cursor,
+            "torch_rng_state": saved_rng,
+            "device_rng_state": saved_rng,
+        }
+        callback.load_global_state()
+        assert torch.equal(torch.get_rng_state(), saved_rng)
+        restored.set_epoch(trainer.start_epoch)
+        actual = trace(iter(restored))
+        for (expected_id, expected_random), (actual_id, actual_random) in zip(expected, actual, strict=True):
+            assert actual_id == expected_id
+            torch.testing.assert_close(actual_random, expected_random, rtol=0, atol=0)
+    finally:
+        close(restored)
+
+
 def close(raw):
     iterator = raw._iterator
     if iterator is not None and hasattr(iterator, "_shutdown_workers"):

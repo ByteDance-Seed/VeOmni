@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import sys
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Sequence, Union
@@ -279,8 +280,26 @@ def dpo_tokenizer_contract_identity(tokenizer: Any, audited_sha256: str | None) 
     )
 
 
-def dpo_producer_identity(tokenizer: Any, chat_template: Any, audited_sha256: str | None) -> dict[str, str | None]:
-    """Validate and identify the actual producers before loading buffered data."""
+_dpo_producer_cache = None
+
+
+def dpo_producer_identity(
+    tokenizer: Any, chat_template: Any, audited_sha256: str | None, *, force_refresh: bool = False
+) -> dict[str, str | None]:
+    """Identify immutable producers once per process; force a live recheck at recovery."""
+    global _dpo_producer_cache
+    pid = os.getpid()
+    cached = _dpo_producer_cache
+    if force_refresh:
+        _dpo_producer_cache = None
+    elif (
+        cached is not None
+        and cached[0] == pid
+        and cached[1] is tokenizer
+        and cached[2] is chat_template
+        and cached[3] == audited_sha256
+    ):
+        return dict(cached[4])
     tokenizer_identity = dpo_tokenizer_contract_identity(tokenizer, audited_sha256)
     template_identity = None
     template_tokenizer_identity = None
@@ -293,11 +312,15 @@ def dpo_producer_identity(tokenizer: Any, chat_template: Any, audited_sha256: st
                 if template_tokenizer is tokenizer
                 else dpo_tokenizer_contract_identity(template_tokenizer, audited_sha256)
             )
-    return {
+    identity = {
         "tokenizer": tokenizer_identity,
         "template": template_identity,
         "template_tokenizer": template_tokenizer_identity,
     }
+    # Retain object references, not ids: CPython can reuse an id after GC.
+    # A child created by fork has a different PID and must attest again.
+    _dpo_producer_cache = (pid, tokenizer, chat_template, audited_sha256, tuple(identity.items()))
+    return identity
 
 
 def _dpo_completion_only_messages(chosen: list, rejected: list) -> tuple[list, list, list]:

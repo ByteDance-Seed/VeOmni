@@ -195,10 +195,12 @@ settings, and native chat template. Transient backend padding/truncation state
 that Transformers resets on each call is normalized before hashing; DPO uses
 single-sequence calls without padding. It is an operator attestation, not an
 automatic audit: do not set it until the actual tokenizer and template are
-verified to emit unpadded single sequences. It is checked during transformation
-and recorded in the checkpoint protocol, so a changed tokenizer is rejected.
-The serialization and hashing add CPU preflight cost; measure it for the target
-workload. Other tokenizer or template classes, including subclasses, must explicitly declare
+verified to emit unpadded single sequences. It is checked at trainer
+initialization, on each worker's first use, and again when recovering a
+checkpoint. The standard transform caches the result in each process:
+tokenizer, template, their configuration and methods must remain unchanged
+during that process's lifetime. In-place changes after attestation are not
+rechecked per example. Other tokenizer or template classes, including subclasses, must explicitly declare
 `dpo_unpadded_output_contract = True` on the concrete class and provide a stable
 `dpo_unpadded_output_contract_id` string (or zero-argument method). The identifier
 must change when the producer's behavior or configuration changes, and the
