@@ -56,6 +56,10 @@ Core entry points:
    - Flattens subviews for common usage: `dp` (all data-parallel), `sp` (ulysses+cp), `dp_shard_sp` (FSDP shard × SP), `dp_sp` (for loss/grad sync across SP+DP).
    - For each ExtraParallel name (e.g. `ep`), builds a `[para_size × para_fsdp_size]` submesh via `init_para_mesh_matrix()`.
 
+6a. **Async activation offload must wrap the checkpoint boundary**
+   - Selected modules must own checkpointing inside their `__call__`, as `GradientCheckpointingLayer` does. Calling checkpoint outside a selected module nests the offload saved-tensor hooks inside checkpoint hooks and can suppress recomputation. Regression tests must assert that backward reruns the block, not only that forward/backward succeeds.
+   - FSDP parent wrapping targets are not necessarily offload targets. A model can restrict auto-discovery with `_activation_offload_target_classes`; avoid selecting both a parent and its checkpointed children.
+
 ### Sequence Parallel (Ulysses)
 
 7. **SP uses all-to-all head/sequence exchange, not all-gather**

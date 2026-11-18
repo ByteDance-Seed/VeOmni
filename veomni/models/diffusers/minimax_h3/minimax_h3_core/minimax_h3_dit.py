@@ -8,6 +8,7 @@ from typing import NamedTuple
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from transformers.modeling_layers import GradientCheckpointingLayer
 
 from veomni.distributed.sequence_parallel.comm import get_ulysses_sequence_parallel_group
 from veomni.distributed.sequence_parallel.ulysses import (
@@ -127,21 +128,46 @@ class MiniMaxH3Rope(nn.Module):
         return torch.cat((half, half), dim=-1)
 
 
+def _cast_linear_input(module, args):
+    """Adapt activations after FSDP has materialized this projection's parameters."""
+    return (args[0].to(module.weight.dtype), *args[1:])
+
+
+class MiniMaxH3FP32Linear(nn.Linear):
+    """Keep checkpoint FP32 projections independent of the block/autocast dtype."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs, dtype=torch.float32)
+
+    def _apply(self, fn, recurse=True):
+        def keep_fp32(tensor):
+            converted = fn(tensor)
+            if tensor.dtype == torch.float32 and converted.dtype != torch.float32:
+                return tensor.to(device=converted.device)
+            return converted
+
+        return super()._apply(keep_fp32, recurse=recurse)
+
+    def forward(self, x):
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            return super().forward(x.to(self.weight.dtype))
+
+
 class MiniMaxH3TimeEmbedder(nn.Module):
     def __init__(self, timestep_input_dim, time_embed_hidden_size, time_embed_dim):
         super().__init__()
         self.frequency_embedding_size = timestep_input_dim
-        self.proj_in = nn.Linear(timestep_input_dim, time_embed_hidden_size, bias=True)
-        self.proj_out = nn.Linear(time_embed_hidden_size, time_embed_dim, bias=True)
+        self.proj_in = MiniMaxH3FP32Linear(timestep_input_dim, time_embed_hidden_size, bias=True)
+        self.proj_out = MiniMaxH3FP32Linear(time_embed_hidden_size, time_embed_dim, bias=True)
 
-    def forward(self, t: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
         half = self.frequency_embedding_size // 2
         freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32, device=t.device) / half)
         args = t.to(torch.float32)[:, None] * freqs[None]
         t_freq = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        hidden = self.proj_in(t_freq.to(self.proj_in.weight.dtype))
+        hidden = self.proj_in(t_freq)
         hidden = nn.functional.silu(hidden)
-        return self.proj_out(hidden.to(self.proj_out.weight.dtype))
+        return self.proj_out(hidden)
 
 
 class MiniMaxH3Attention(nn.Module):
@@ -331,6 +357,7 @@ class MiniMaxH3AdalnProj(nn.Module):
         self.modality_num = modality_num
         self.hidden_size = hidden_size
         self.linear = nn.Linear(time_embed_dim, out_features, bias=True)
+        self.linear.register_forward_pre_hook(_cast_linear_input)
 
     def forward(self, t_emb):
         x = nn.functional.silu(t_emb).to(self.linear.weight.dtype)
@@ -420,7 +447,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
         return self.final_norm(x)
 
 
-class MiniMaxH3DiTBlock(nn.Module):
+class MiniMaxH3DiTBlock(GradientCheckpointingLayer):
     def __init__(
         self,
         hidden_size,
@@ -499,13 +526,13 @@ class MiniMaxH3FinalLayer(nn.Module):
         self.adaln_proj = MiniMaxH3AdalnProj(
             hidden_size, time_embed_dim, final_adaln_out_features, expand_ratio=2, modality_num=1
         )
-        self.video_out = nn.Linear(hidden_size, video_patch_dim, bias=True)
-        self.audio_out = nn.Linear(hidden_size, audio_latents_dim, bias=True) if audio_enabled else None
+        self.video_out = MiniMaxH3FP32Linear(hidden_size, video_patch_dim, bias=True)
+        self.audio_out = MiniMaxH3FP32Linear(hidden_size, audio_latents_dim, bias=True) if audio_enabled else None
         # MiniMax-H3-Image distils one output head per sampling step. The
         # released base head above stays for the shared H3 checkpoint layout;
         # image inference selects one of these heads instead.
         self.pdd_out = (
-            nn.ModuleList([nn.Linear(hidden_size, video_patch_dim, bias=True) for _ in range(num_pdd_heads)])
+            nn.ModuleList([MiniMaxH3FP32Linear(hidden_size, video_patch_dim, bias=True) for _ in range(num_pdd_heads)])
             if num_pdd_heads > 0
             else None
         )
@@ -513,16 +540,15 @@ class MiniMaxH3FinalLayer(nn.Module):
     def forward(self, x, *, t_emb, inverse_indices, pdd_step_index=None):
         shift, scale = self.adaln_proj(t_emb)
         h = self.norm(x)
-        h = _modulate_scale_shift(h, shift, scale, inverse_indices)
+        h = _modulate_scale_shift(h, shift, scale, inverse_indices).to(torch.float32)
         if pdd_step_index is not None:
             if self.pdd_out is None:
                 raise ValueError("pdd_step_index was provided but this model has no PDD output heads.")
             if not 0 <= pdd_step_index < len(self.pdd_out):
                 raise IndexError(f"pdd_step_index {pdd_step_index} is outside [0, {len(self.pdd_out)}).")
-            head = self.pdd_out[pdd_step_index]
-            video = head(h.to(head.weight.dtype))
+            video = self.pdd_out[pdd_step_index](h)
         else:
-            video = self.video_out(h.to(self.video_out.weight.dtype))
+            video = self.video_out(h)
         audio = self.audio_out(h) if self.audio_out is not None else None
         return video, audio
 
@@ -558,10 +584,6 @@ class MiniMaxH3DiT(nn.Module):
     ):
         super().__init__()
         self._block_offload_enabled = False
-        # HF's marker: ``gradient_checkpointing_enable()`` walks ``modules()`` and writes both
-        # this flag and ``_gradient_checkpointing_func`` here, so the block loop below reads the
-        # run's setting and the policy's per-block decisions without owning a strategy itself.
-        self.gradient_checkpointing = False
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_channels_latents = latents_dim
@@ -569,9 +591,12 @@ class MiniMaxH3DiT(nn.Module):
         self.num_pdd_heads = num_pdd_heads
         video_patch_dim = latents_dim * patch_size[0] * patch_size[1] * patch_size[2]
 
-        self.video_patch_proj = nn.Linear(video_patch_dim, hidden_size, bias=True)
-        self.audio_patch_proj = nn.Linear(audio_latents_dim, hidden_size, bias=True) if audio_enabled else None
+        self.video_patch_proj = MiniMaxH3FP32Linear(video_patch_dim, hidden_size, bias=True)
+        self.audio_patch_proj = (
+            MiniMaxH3FP32Linear(audio_latents_dim, hidden_size, bias=True) if audio_enabled else None
+        )
         self.condition_proj = nn.Linear(text_dim, hidden_size, bias=True)
+        self.condition_proj.register_forward_pre_hook(_cast_linear_input)
         self.time_embedder = MiniMaxH3TimeEmbedder(timestep_input_dim, time_embed_hidden_size, time_embed_dim)
         self.rope = MiniMaxH3Rope(rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(
@@ -657,11 +682,11 @@ class MiniMaxH3DiT(nn.Module):
         device,
     ):
         x_rows = x.view(-1, x.shape[-1]).index_select(0, img_pos)
-        video_embed = self.video_patch_proj(x_rows.to(self.video_patch_proj.weight.dtype))
+        video_embed = self.video_patch_proj(x_rows)
         audio_rows = audio_x.view(-1, audio_x.shape[-1]).index_select(0, audio_pos)
-        audio_embed = self.audio_patch_proj(audio_rows.to(self.audio_patch_proj.weight.dtype))
+        audio_embed = self.audio_patch_proj(audio_rows)
         text_rows = text_embeddings_selected.to(device=device)
-        text_embed = self.condition_proj(text_rows.to(self.condition_proj.weight.dtype))
+        text_embed = self.condition_proj(text_rows)
         text_embed = text_embed.to(self.token_refiner.final_norm.weight.dtype)
         text_embed = self.token_refiner(
             text_embed,
@@ -677,7 +702,7 @@ class MiniMaxH3DiT(nn.Module):
         embeddings[img_pos] = video_embed.to(dtype)[: img_pos.shape[0]]
         embeddings[audio_pos] = audio_embed.to(dtype)[: audio_pos.shape[0]]
 
-        t_emb = self.time_embedder(unique_timesteps, dtype=dtype)
+        t_emb = self.time_embedder(unique_timesteps)
         return embeddings, t_emb
 
     def _embed_image(
@@ -693,8 +718,8 @@ class MiniMaxH3DiT(nn.Module):
         seq_len,
         device,
     ):
-        image_embed = self.video_patch_proj(x.to(self.video_patch_proj.weight.dtype))
-        text_embed = self.condition_proj(text_embeddings.to(device=device).to(self.condition_proj.weight.dtype))
+        image_embed = self.video_patch_proj(x)
+        text_embed = self.condition_proj(text_embeddings.to(device=device))
         text_embed = text_embed.to(self.token_refiner.final_norm.weight.dtype)
         text_embed = self.token_refiner(
             text_embed,
@@ -708,7 +733,7 @@ class MiniMaxH3DiT(nn.Module):
         embeddings[text_pos] = text_embed.to(dtype)[: text_pos.shape[0]]
         embeddings[image_pos] = image_embed.to(dtype)[: image_pos.shape[0]]
 
-        t_emb = self.time_embedder(unique_timesteps.view(-1).to(device), dtype=dtype)
+        t_emb = self.time_embedder(unique_timesteps.view(-1).to(device))
         return embeddings, t_emb
 
     def forward_image(
@@ -812,10 +837,7 @@ class MiniMaxH3DiT(nn.Module):
         }
         hidden = decoder_input
         for block in self.blocks:
-            if self.gradient_checkpointing:
-                hidden = self._gradient_checkpointing_func(block, hidden, **block_kwargs)
-            else:
-                hidden = block(hidden, **block_kwargs)
+            hidden = block(hidden, **block_kwargs)
 
         video, _ = self.final_layer(
             hidden,
@@ -847,6 +869,8 @@ class MiniMaxH3DiT(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.audio_enabled:
             raise ValueError("This transformer has audio_enabled=False; use forward_image() instead.")
+        if any(t.is_floating_point() and t.element_size() < 4 for t in (unique_timesteps, img_position_ids)):
+            raise ValueError("H3 timesteps/positions were cast below FP32; set cast_forward_inputs=false.")
         inverse_indices = inverse_indices.view(-1).to(torch.long)
         token_tags = token_tags.view(-1).to(torch.long)
         text_selected = prompt_embeds
@@ -935,8 +959,7 @@ class MiniMaxH3DiT(nn.Module):
         # dropped by the index_select below.
         cu_seqlens = _PackedBounds(cu_seqlens.to(device), cu_host) if packed_batch else cu_host
         block_swap = self._block_swap if self._block_offload_enabled else 0
-        # Every block takes the same arguments; only the recompute decision differs, and
-        # the bound policy folds that into ``self._gradient_checkpointing_func``.
+        # Each block owns its checkpoint boundary so async offload wraps it from outside.
         block_kwargs = {
             "t_emb": t_emb,
             "combined_indices": combined_indices,
@@ -957,10 +980,7 @@ class MiniMaxH3DiT(nn.Module):
                         b.to("cpu")
                     for b in self.blocks[block_swap:]:
                         b.to(device)
-            if self.gradient_checkpointing:
-                hidden = self._gradient_checkpointing_func(block, hidden, **block_kwargs)
-            else:
-                hidden = block(hidden, **block_kwargs)
+            hidden = block(hidden, **block_kwargs)
 
         if self._block_offload_enabled:
             for b in self.blocks[block_swap:]:

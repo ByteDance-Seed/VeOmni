@@ -105,14 +105,20 @@ def test_minimax_h3_image_forward_uses_pdd_heads_and_has_no_audio_modules():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_minimax_h3_image_forward_backpropagates_to_image_and_text_rows():
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_minimax_h3_image_forward_backpropagates_to_image_and_text_rows(checkpointing):
     model = _build_model()
+    if checkpointing:
+        model.gradient_checkpointing_enable({"use_reentrant": False})
+    forward_calls = []
+    model.dit.blocks[0].register_forward_pre_hook(lambda *_: forward_calls.append(1))
     inputs = _image_inputs()
     output = model.forward_image(**inputs, pdd_step_index=0)
     output.sum().backward()
 
     assert inputs["x"].grad is not None
     assert inputs["prompt_embeds"].grad is not None
+    assert len(forward_calls) == (2 if checkpointing else 1)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -127,17 +133,24 @@ def test_minimax_h3_image_forward_rejects_sequence_parallel(monkeypatch):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_minimax_h3_image_forward_keeps_fp32_projection_modules():
-    model = _build_model().to(torch.bfloat16)
-    model.dit.video_patch_proj.to(torch.float32)
-    model.dit.time_embedder.to(torch.float32)
-    model.dit.final_layer.video_out.to(torch.float32)
-    for head in model.dit.final_layer.pdd_out:
-        head.to(torch.float32)
+    model = _build_model()
+    projections = (
+        model.dit.video_patch_proj,
+        model.dit.time_embedder,
+        model.dit.final_layer.video_out,
+        model.dit.final_layer.pdd_out,
+    )
+    original_params = [[param.detach().clone() for param in module.parameters()] for module in projections]
+    model.to(torch.bfloat16)
+    assert model.dit.condition_proj.weight.dtype == torch.bfloat16
+    for module, originals in zip(projections, original_params, strict=True):
+        for param, original in zip(module.parameters(), originals, strict=True):
+            torch.testing.assert_close(param, original, rtol=0, atol=0)
 
     inputs = _image_inputs()
     inputs["x"] = inputs["x"].to(torch.bfloat16)
     inputs["prompt_embeds"] = inputs["prompt_embeds"].to(torch.bfloat16)
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
         output = model.forward_image(**inputs, pdd_step_index=0)
 
     assert output.shape == (4, 2)
