@@ -1464,39 +1464,74 @@ def test_triton_merged_stream_capture_uses_shape_bound(monkeypatch: pytest.Monke
         assert torch.isfinite(tensor.grad).all()
 
 
-def test_reject_quantizing_act_fn_refuses_only_quantizing_rows():
-    """A non-SwiGLU activation cannot use a fused expert row, so QAT must be refused.
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("activation", ["silu", "swish", "gelu", "gelu_pytorch_tanh"])
+def test_the_eager_row_runs_the_configured_activation(activation):
+    """The routed experts compute ``act(gate) * up`` for the model's activation.
 
-    The fused kernels call ``aten.silu`` / ``aten.silu_backward`` directly, so the
-    Python ``act_fn`` loop is the only path for another activation -- and that loop
-    cannot reach the family row. Support is tracked in #1430.
+    Before this, the fused rows hard-coded ``aten.silu`` and every model whose
+    ``hidden_act`` was anything else fell back to a Python loop outside the family --
+    which is why a quantizing selection had to be refused there. The activation is a
+    call argument now, so the same row serves any of them.
 
-    The activation is read from ``use_swiglu`` because these experts modules are
-    plain ``nn.Module`` objects with no config reference.
+    The oracle is ``ACT2FN[activation]``, not a restated formula: the exact-erf GELU
+    and the tanh approximation are different functions.
     """
-    from types import SimpleNamespace
+    from transformers.activations import ACT2FN
 
-    from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
+    from veomni.ops.kernels.moe_experts.standard import eager
 
-    def experts(impl, swiglu):
-        return SimpleNamespace(veomni_moe=SimpleNamespace(impl=impl), use_swiglu=swiglu)
+    torch.manual_seed(0)
+    experts, hidden, intermediate, tokens, top_k = 3, 8, 16, 5, 2
+    x = torch.randn(tokens, hidden, dtype=torch.float32, requires_grad=True)
+    gate_w = torch.randn(experts, intermediate, hidden, dtype=torch.float32, requires_grad=True)
+    up_w = torch.randn(experts, intermediate, hidden, dtype=torch.float32, requires_grad=True)
+    down_w = torch.randn(experts, hidden, intermediate, dtype=torch.float32, requires_grad=True)
+    routes = torch.randint(0, experts, (tokens, top_k))
+    routing = torch.softmax(torch.randn(tokens, top_k), dim=-1)
 
-    # SwiGLU is what every fused row implements.
-    reject_quantizing_act_fn(experts("qat", swiglu=True))
+    out = eager.wrapper(
+        x,
+        routing,
+        routes,
+        gate_w,
+        up_w,
+        down_w,
+        gate_w.new_empty(0),
+        num_experts=experts,
+        activation=activation,
+    )
 
-    with pytest.raises(ValueError, match="moe_implementation='qat' cannot run with a non-SwiGLU activation"):
-        reject_quantizing_act_fn(experts("qat", swiglu=False))
+    # Reference: the same loop with the transformers implementation.
+    act = ACT2FN[activation]
+    expected = torch.zeros(tokens, hidden)
+    for token in range(tokens):
+        for slot in range(top_k):
+            expert = int(routes[token, slot])
+            gate = x[token] @ gate_w[expert].T
+            up = x[token] @ up_w[expert].T
+            expected[token] += ((act(gate) * up) @ down_w[expert].T) * routing[token, slot]
 
-    # ``deepgemm_fp8`` quantizes too -- its ``GroupedLinear`` runs the FP8 GEMM in
-    # forward, dgrad and wgrad -- so it must refuse for the same reason. It used to
-    # be absent from ``QUANTIZING_IMPLS``, which let a non-SwiGLU activation reach the
-    # plain-``F.linear`` fallback and train the routed experts at full precision
-    # while the config said ``deepgemm_fp8``.
-    reject_quantizing_act_fn(experts("deepgemm_fp8", swiglu=True))
-    with pytest.raises(ValueError, match="moe_implementation='deepgemm_fp8' cannot run"):
-        reject_quantizing_act_fn(experts("deepgemm_fp8", swiglu=False))
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
 
-    # The remaining rows do bf16 math and ignore ``expert_dtype``, so the fallback
-    # changes nothing for them: a reference row may take it deliberately.
-    for impl in ("eager", "fused_triton", "fused_quack", "fused_npu", "fused_mlu"):
-        reject_quantizing_act_fn(experts(impl, swiglu=False))
+    out.sum().backward()
+    for tensor in (x, gate_w, up_w, down_w):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+        assert torch.any(tensor.grad != 0)
+
+    # The activation must actually change the result, or this proves nothing.
+    # ``swish`` is HF's alias for SiLU, so it is expected to match rather than differ.
+    if activation not in {"silu", "swish"}:
+        other = eager.wrapper(
+            x.detach(),
+            routing,
+            routes,
+            gate_w.detach(),
+            up_w.detach(),
+            down_w.detach(),
+            gate_w.new_empty(0),
+            num_experts=experts,
+            activation="silu",
+        )
+        assert not torch.equal(out.detach(), other)

@@ -102,6 +102,7 @@ def wrapper(
     assume_distinct_experts: bool = False,
     block_size: int = 128,
     expert_dtype: str = "fp8",
+    activation: str = "silu",
 ) -> Tensor:
     """Run fused MoE experts with fake-quantized activations and expert weights.
 
@@ -130,4 +131,5 @@ def wrapper(
         num_experts=num_experts,
         swiglu_limit=swiglu_limit,
         assume_distinct_experts=assume_distinct_experts,
+        activation=activation,
     )

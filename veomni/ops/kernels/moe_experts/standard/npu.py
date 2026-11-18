@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
+from ....activation import normalize_activation
 
 
 class GmmFunction(torch.autograd.Function):
@@ -382,8 +383,31 @@ def wrapper(
     assume_distinct_experts: bool = False,
     block_size: int = 128,
     expert_dtype: str = "fp8",
+    activation: str = "silu",
 ) -> Tensor:
     """Call the NPU fused MoE path. Empty weights are ``None``."""
+    if normalize_activation(activation) != "silu":
+        # This row's fused kernel computes SiLU inside the grouped GEMM, so there is
+        # no seam to substitute another activation into. The ``eager`` row runs the
+        # same expert math with any activation and is the reference implementation,
+        # so a non-SiLU model takes it rather than losing the activation.
+        from . import eager as _eager
+
+        return _eager.wrapper(
+            hidden_states,
+            routing_weights,
+            selected_experts,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
+            fc1_1_2_weight,
+            num_experts=num_experts,
+            swiglu_limit=swiglu_limit,
+            assume_distinct_experts=assume_distinct_experts,
+            block_size=block_size,
+            expert_dtype=expert_dtype,
+            activation=activation,
+        )
     # Empty tensor = unused layout. Registry args stay tensors.
     return npu_fused_moe_forward(
         num_experts,

@@ -139,16 +139,16 @@ Only quantizing rows are affected — every reference row keeps its fallback.
 
 The gated-MLP rows take the activation as an argument, so a model's `hidden_act`
 decides what its MLP computes whether or not the row quantizes. `veomni/ops/activation.py`
-serves a fixed set of five, delegating to transformers' own implementation of each.
-`gelu_new` and `gelu_pytorch_tanh` are *different* functions whose bf16 intermediates
-round differently, so they are not normalized onto one formula. SiLU keeps its ATen
+serves a fixed set of four, delegating to transformers' own implementation of each.
+`gelu` and `gelu_pytorch_tanh` are *different* functions, so they are not normalized
+onto one formula. SiLU keeps its ATen
 spelling so the quantizing row reuses `eager`'s gradient bit for bit.
 
 | Name | Why it is in the set |
 | --- | --- |
 | `silu`, `swish` | what every model in the repository actually passes today; `swish` is HF's own alias for `silu` |
 | `gelu` | the exact-erf form, the most likely hand-edited value |
-| `gelu_new`, `gelu_pytorch_tanh` | two different implementations, kept together because conflating them was a real bug earlier in this work |
+| `gelu_pytorch_tanh` | the tanh approximation Gemma uses; distinct from `gelu`, and the only GELU form `aten.gelu_backward` reproduces bit for bit |
 
 The set is explicit rather than derived from `ACT2FN`. Deriving means every
 activation transformers ships becomes a capability claimed here, and most of
@@ -190,13 +190,15 @@ skipped, not entered. A quantizing row has no such option -- falling back would
 train at full precision under a config that says otherwise -- so it raises, and
 the error names `eager` as the way to keep the fallback.
 
-The routed experts are the exception, and the reason is structural: their
-activation is fused *into* the grouped GEMM (`aten.silu` in the forward,
-`silu_backward` in the backward), so the Python `act_fn` loop is the only path for
-another activation and it cannot reach the family row. A quantizing
-`moe_implementation` on a non-SiLU activation is therefore refused in each model's
-expert forward, via `reject_quantizing_act_fn`. Teaching those kernels an
-activation argument is tracked in #1430.
+The routed experts take the same argument, so a non-SiLU model keeps its activation
+there too -- and no quantizing selection needs refusing on that account any more.
+Where the activation is evaluated depends on the row. `fused_triton` and `qat`
+compute it **between** the GEMMs through `apply_activation` /
+`apply_activation_backward`; those rows own a hand-written `autograd.Function`
+whose `forward` runs under `no_grad`, which is why the derivative is explicit. The
+rows whose kernel fuses SiLU internally (`fused_quack`, `deepgemm_fp8`,
+`fused_npu`, `fused_mlu`) delegate to `eager` for any other activation, which keeps
+the fused path for the default and the reference path for everything else.
 
 There is no cross-family conflict to reject. `deepgemm_fp8` and `qat` are two
 values of the same `moe_implementation` field, so the routed experts cannot be

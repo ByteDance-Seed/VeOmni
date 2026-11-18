@@ -24,6 +24,7 @@ import torch
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
+from ....activation import apply_activation, apply_activation_backward, normalize_activation
 from ..shared import swiglu
 from ..shared.scatter import compute_expert_scatter_index, compute_max_expert_tokens
 from ..shared.swiglu import apply_swiglu_clamp
@@ -44,6 +45,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         fc2_weight,
         swiglu_limit=None,
         assume_distinct_experts=False,
+        activation="silu",
     ):
         # MOE Step 3: dispatch input tokens to the experts
         # result shape is (batch_size * sequence_len * topk, hidden_size)
@@ -122,10 +124,12 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc1_1_output, fc1_2_output, swiglu_limit
         )
 
-        # MOE Step 5: compute the actication of linear layer 1-1
-        # TODO(wenyawei): act function
-        # fc1_1_activation shape is (batch_size * sequence_len * topk, ffn_dim)
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        # MOE Step 5: apply the model's activation to linear layer 1-1.
+        # fc1_1_activation shape is (batch_size * sequence_len * topk, ffn_dim).
+        # The activation travels with the call because it is a property of the
+        # model, and it is evaluated through ``veomni.ops.activation`` so its
+        # backward matches HF's own autograd bit for bit.
+        fc1_1_activation = apply_activation(fc1_1_output, activation)
 
         # MOE Step 7: compute final result of linear layer 1
         fc1_activation = fc1_1_activation * fc1_2_output
@@ -157,6 +161,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
 
         ctx.num_experts = num_experts
         ctx.swiglu_limit = swiglu_limit
+        ctx.activation = activation
         ctx.tile_prefix_total = tile_total_M
         ctx.save_for_backward(
             gate_weights,
@@ -247,8 +252,8 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
                 transpose_b=False,
             )
 
-        # recompute during backward
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
+        # Recompute during backward through the same path forward used.
+        fc1_1_activation = apply_activation(fc1_1_output, ctx.activation)
 
         # MOE Step 7
         grad_fc1_1_activation = grad_fc1_activation * fc1_2_output
@@ -289,7 +294,11 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             )
 
         # MOE Step 5
-        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
+        # An ATen backward op, not a restated derivative: it is the only form that
+        # reproduces this forward's rounding in bf16 and stays clear of both
+        # ``vjp`` (refused under ``saved_tensors_hooks``) and
+        # ``requires_grad_(True)`` (refused under ``fullgraph=True``).
+        grad_fc1_1_output = apply_activation_backward(grad_fc1_1_activation, fc1_1_output, ctx.activation)
         if swiglu_limit is not None:
             grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
 
@@ -365,8 +374,9 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         fc2_weight,
         swiglu_limit=None,
         assume_distinct_experts=False,
+        activation="silu",
     ):
-        """Scatter, merged fc1 GEMM, SwiGLU, fc2, gather."""
+        """Scatter, merged fc1 GEMM, gated activation, fc2, gather."""
         from ..shared.dispatch import expert_histogram, moe_gather, moe_scatter
         from ..shared.group_gemm import group_gemm_same_nk, same_nk_tile_schedule
 
@@ -502,13 +512,22 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             tile_total_M=tile_total_M,
         )
 
-        fc1_activation, grad_fc1_output = swiglu.merged_swiglu_backward(
-            fc1_1_output,
-            fc1_2_output,
-            grad_fc1_activation,
-            mask_fc1_1 if swiglu_limit is not None else None,
-            mask_fc1_2 if swiglu_limit is not None else None,
-        )
+        if normalize_activation(ctx.activation) == "silu":
+            fc1_activation, grad_fc1_output = swiglu.merged_swiglu_backward(
+                fc1_1_output,
+                fc1_2_output,
+                grad_fc1_activation,
+                mask_fc1_1 if swiglu_limit is not None else None,
+                mask_fc1_2 if swiglu_limit is not None else None,
+            )
+        else:
+            gate_grad = apply_activation_backward(grad_fc1_activation * fc1_2_output, fc1_1_output, ctx.activation)
+            up_grad = grad_fc1_activation * apply_activation(fc1_1_output, ctx.activation)
+            if mask_fc1_1 is not None:
+                gate_grad.masked_fill_(~mask_fc1_1, 0)
+                up_grad.masked_fill_(~mask_fc1_2, 0)
+            fc1_activation = apply_activation(fc1_1_output, ctx.activation) * fc1_2_output
+            grad_fc1_output = torch.cat([gate_grad, up_grad], dim=-1)
         del grad_fc1_activation
 
         # MOE Step 9 - wgrad
@@ -582,6 +601,7 @@ def group_gemm_fused_moe_forward(
     fc1_1_2_weight: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
+    activation: str = "silu",
 ):
     """Triton grouped-gemm fused MoE forward pass.
 
@@ -656,6 +676,7 @@ def group_gemm_fused_moe_forward(
                 fc2_weight,
                 swiglu_limit,
                 assume_distinct_experts,
+                activation,
             )
         else:
             if fc1_1_weight is None or fc1_2_weight is None:
@@ -670,6 +691,7 @@ def group_gemm_fused_moe_forward(
                 fc2_weight,
                 swiglu_limit,
                 assume_distinct_experts,
+                activation,
             )
     return final_hidden_states
 
@@ -688,6 +710,7 @@ def wrapper(
     assume_distinct_experts: bool = False,
     block_size: int = 128,
     expert_dtype: str = "fp8",
+    activation: str = "silu",
 ) -> Tensor:
     """Call the Triton fused MoE Function. Empty weights are ``None``."""
     del block_size, expert_dtype
@@ -703,4 +726,5 @@ def wrapper(
         fc1_1_2_weight if fc1_1_2_weight.numel() else None,
         swiglu_limit=swiglu_limit,
         assume_distinct_experts=assume_distinct_experts,
+        activation=activation,
     )

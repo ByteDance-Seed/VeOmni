@@ -33,9 +33,7 @@ from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
 from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
-from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
@@ -68,14 +66,9 @@ config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", 
 config.add_import("functools", names=["partial"])
 config.add_import("transformers.modeling_outputs", names=["SequenceClassifierOutputWithPast"])
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import(
-    "veomni.models.utils.moe_utils",
-    names=["merged_experts_act_fn_forward"],
-)
 # Replace HF's ``create_causal_mask`` / ``create_sliding_window_causal_mask`` with
 # ``veomni.models.utils.mask_utils`` so packed ``cu_seq_lens_q`` / ``cu_seq_lens_k``
 # inputs route through ``veomni.ops.mask`` once in ``Qwen3MoeModel.forward``.
-config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask", "create_sliding_window_causal_mask"],
@@ -188,7 +181,7 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
         )
         self.down_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_swiglu = config.hidden_act in {"silu", "swish"}
+        self.activation = config.hidden_act
         self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
@@ -197,17 +190,6 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        if not self.use_swiglu:
-            reject_quantizing_act_fn(self)
-            return merged_experts_act_fn_forward(
-                hidden_states,
-                top_k_index,
-                top_k_weights,
-                self.gate_up_proj,
-                self.down_proj,
-                self.act_fn,
-                self.num_experts,
-            )
         unused = self.gate_up_proj.new_empty(0)
         return self.veomni_moe(
             hidden_states,
@@ -218,6 +200,7 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
             self.down_proj,
             self.gate_up_proj,
             num_experts=self.num_experts,
+            activation=self.activation,
         )
 
 

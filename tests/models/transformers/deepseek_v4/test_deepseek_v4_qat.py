@@ -377,7 +377,6 @@ def test_a_non_silu_expert_activation_trains_in_the_model_dtype(modeling):
         pytest.skip("the DSV4 NPU build needs torch_npu")
 
     model = modeling.DeepseekV4Experts(config)
-    assert model.use_swiglu is False
     # The parameters are allocated with `torch.empty`; a real build fills them from
     # a checkpoint, so give them finite values before the forward.
     with torch.no_grad():

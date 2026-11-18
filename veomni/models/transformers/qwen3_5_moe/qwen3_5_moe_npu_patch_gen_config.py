@@ -122,11 +122,6 @@ config.add_import(
     names=["create_causal_mask"],
 )
 config.add_import(
-    "veomni.models.utils.moe_utils",
-    names=["merged_experts_act_fn_forward"],
-)
-config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
-config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "load_balancing_loss"],
 )

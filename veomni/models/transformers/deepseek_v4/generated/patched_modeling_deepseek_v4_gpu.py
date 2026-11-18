@@ -131,10 +131,8 @@ from veomni.models.transformers.deepseek_v4.packed_utils import (
     resolve_packed_sequence_slices,
     shard_packed_compression_metadata,
 )
-from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
-from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs, MoeModelOutputWithIndexerKL
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
@@ -1682,7 +1680,7 @@ class DeepseekV4Experts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_swiglu = config.hidden_act in {"silu", "swish"}
+        self.activation = config.hidden_act
         self.limit = config.swiglu_limit
         # Per-expert grouped-GEMM ``max_M`` launch bound selector. Defaults to
         # the conservative ``T * top_k`` (``assume_distinct_experts`` False):
@@ -1708,24 +1706,6 @@ class DeepseekV4Experts(nn.Module):
         # argument rather than part of the implementation name.
         down_proj = self.down_proj
         gate_up_proj = self.gate_up_proj
-        if not self.use_swiglu:
-            # The act_fn loop does not use grouped-GEMM ``max_M``, so it cannot go
-            # through the family row: the fused kernel bakes SiLU into both its
-            # forward and its backward, so a different activation has no fused row
-            # to run. It therefore trains in the model dtype -- for every model, so
-            # DeepSeek-V4 is not the one exception whose non-SiLU experts round.
-            # A quantizing selection cannot honor that, so refuse it here.
-            reject_quantizing_act_fn(self)
-            return merged_experts_act_fn_forward(
-                hidden_states,
-                top_k_index,
-                top_k_weights,
-                gate_up_proj,
-                down_proj,
-                self.act_fn,
-                self.num_experts,
-                swiglu_limit=self.limit,
-            )
         unused = gate_up_proj.new_empty(0)
         return self.veomni_moe(
             hidden_states,
@@ -1736,6 +1716,7 @@ class DeepseekV4Experts(nn.Module):
             down_proj,
             gate_up_proj,
             num_experts=self.num_experts,
+            activation=self.activation,
             swiglu_limit=self.limit,
             assume_distinct_experts=self.assume_distinct_experts,
             expert_dtype=self.expert_dtype,

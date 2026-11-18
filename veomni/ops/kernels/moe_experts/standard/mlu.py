@@ -24,6 +24,7 @@ import torch
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
+from ....activation import normalize_activation
 from ..shared.swiglu import apply_swiglu_clamp
 
 
@@ -292,8 +293,30 @@ def wrapper(
     assume_distinct_experts: bool = False,
     block_size: int = 128,
     expert_dtype: str = "fp8",
+    activation: str = "silu",
 ) -> Tensor:
     """Call the MLU fused MoE path. Empty weights are ``None``."""
+    if normalize_activation(activation) != "silu":
+        # The MLU fused kernel computes SiLU inside the grouped GEMM, so there is no
+        # seam to substitute another activation into. The ``eager`` row runs the same
+        # expert math with any activation and is the reference implementation.
+        from . import eager as _eager
+
+        return _eager.wrapper(
+            hidden_states,
+            routing_weights,
+            selected_experts,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
+            fc1_1_2_weight,
+            num_experts=num_experts,
+            swiglu_limit=swiglu_limit,
+            assume_distinct_experts=assume_distinct_experts,
+            block_size=block_size,
+            expert_dtype=expert_dtype,
+            activation=activation,
+        )
     return mlu_group_gemm_fused_moe_forward(
         num_experts,
         routing_weights,

@@ -71,9 +71,7 @@ from veomni.models.transformers.qwen4_exp.packed_ple import (
     local_packed_positions,
 )
 from veomni.models.transformers.qwen4_exp.qsa_metadata import PreparedQSAMetadata, prepare_qsa_metadata
-from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils import logging
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -177,8 +175,6 @@ config.add_import(
 )
 config.add_import("veomni.distributed.sequence_parallel.gdn_exchange", names=["coalesced_gather_aligned"])
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
-config.add_import("veomni.models.utils.moe_utils", names=["merged_experts_act_fn_forward"])
 config.add_import("veomni.models.loss_utils", names=["ForCausalLMLoss", "load_balancing_loss"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.add_import("veomni.utils.model_outputs", names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin"])
@@ -1044,7 +1040,7 @@ class PatchedQwen4ExpTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_swiglu = config.hidden_act in {"silu", "swish"}
+        self.activation = config.hidden_act
         self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
@@ -1054,17 +1050,6 @@ class PatchedQwen4ExpTextExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         # --- Patch.1 ---
-        if not self.use_swiglu:
-            reject_quantizing_act_fn(self)
-            return merged_experts_act_fn_forward(
-                hidden_states,
-                top_k_index,
-                top_k_weights,
-                self.gate_up_proj,
-                self.down_proj,
-                self.act_fn,
-                self.num_experts,
-            )
         unused = self.gate_up_proj.new_empty(0)
         return self.veomni_moe(
             hidden_states,
@@ -1075,6 +1060,7 @@ class PatchedQwen4ExpTextExperts(nn.Module):
             self.down_proj,
             self.gate_up_proj,
             num_experts=self.num_experts,
+            activation=self.activation,
         )
         # --- Patch.1 ---
 

@@ -20,6 +20,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from ....activation import apply_activation
+
 
 def wrapper(
     hidden_states: Tensor,
@@ -35,6 +37,7 @@ def wrapper(
     assume_distinct_experts: bool = False,
     block_size: int = 128,
     expert_dtype: str = "fp8",
+    activation: str = "silu",
 ) -> Tensor:
     """Routed expert MLP. Empty ``fc1_*`` means that layout is unused.
 
@@ -69,7 +72,7 @@ def wrapper(
         if swiglu_limit is not None:
             gate = gate.clamp(max=swiglu_limit)
             up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-        y = F.linear(F.silu(gate) * up, fc2_weight[idx])
+        y = F.linear(apply_activation(gate, activation) * up, fc2_weight[idx])
         y = y * routing_weights[token_idx, top_k_pos, None]
         output = output.index_add(0, token_idx, y.to(output.dtype))
     return output

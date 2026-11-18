@@ -646,10 +646,8 @@ def test_the_eager_row_evaluates_every_activation_it_claims(activation, dtype):
     """The row takes the activation as an argument, so a non-SiLU model can quantize.
 
     The oracle is ``ACT2FN[activation]``, not a formula restated here. That is the
-    point: ``gelu_new`` (``NewGELUActivation``) stages ``torch.pow(x, 3.0)`` while
-    ``gelu_pytorch_tanh`` (``PytorchGELUTanh``) writes ``x * x * x``, and the two
-    round differently in bf16. A hand-written tanh formula would have accepted the
-    wrong function for one of them.
+    point: ``gelu`` is the exact-erf form and ``gelu_pytorch_tanh`` the tanh
+    approximation, so a single restated formula would silently accept the wrong one.
 
     Parametrized over ``supported_activations()`` rather than a list here, so the
     test and the implementation cannot disagree about what is supported.
@@ -810,7 +808,7 @@ def test_the_supported_set_is_the_bounded_whitelist():
     """
     from veomni.ops.activation import SUPPORTED_ACTIVATIONS, normalize_activation, supports
 
-    assert set(SUPPORTED_ACTIVATIONS) == {"silu", "swish", "gelu", "gelu_new", "gelu_pytorch_tanh"}
+    assert set(SUPPORTED_ACTIVATIONS) == {"silu", "swish", "gelu", "gelu_pytorch_tanh"}
 
     for name in SUPPORTED_ACTIVATIONS:
         assert supports(name)
@@ -952,7 +950,7 @@ def test_render_refuses_a_quantizing_row_it_cannot_serve():
 
 
 @_cpu
-@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh", "gelu_new"])
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh"])
 def test_the_eager_row_compiles_fullgraph(activation):
     """A compiled forward must not regress against the plain projection path.
 
@@ -986,7 +984,7 @@ def test_the_eager_row_compiles_fullgraph(activation):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_new"])
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh"])
 def test_the_eager_row_backward_survives_activation_offload(activation):
     """The row must run inside ``saved_tensors_hooks``, which is how offload works.
 
