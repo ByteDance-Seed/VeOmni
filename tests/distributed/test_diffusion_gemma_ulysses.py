@@ -111,12 +111,15 @@ def _build_model(device, attn_dg_prefix: bool = True, kv_heads: int | None = Non
     return DiffusionGemmaForBlockDiffusion(config).to(device=device, dtype=torch.bfloat16).train()
 
 
-def _encoder_and_ar_term(model, batch):
+def _encoder_and_ar_term(model, batch, output_hidden_states: bool = False):
     """The encoder stack and the AR term, which is what SP covers today.
 
     `forward` is not available: it always runs the decoder, which refuses under SP.
     `encoder_ar_term` is the model's own method, so the arithmetic compared here is
     the arithmetic a training step performs.
+
+    `output_hidden_states` returns every layer's output alongside the last one. The
+    repeat-branch worker needs the early layers specifically: see `_first_divergence`.
     """
     encoder_outputs = model.model.encoder(
         input_ids=batch["input_ids"],
@@ -124,6 +127,7 @@ def _encoder_and_ar_term(model, batch):
         position_ids=batch["position_ids"],
         pack_samples=True,
         return_dict=True,
+        output_hidden_states=output_hidden_states,
     )
     loss = model.encoder_ar_term(
         encoder_outputs.last_hidden_state,
@@ -135,7 +139,40 @@ def _encoder_and_ar_term(model, batch):
         encoder_ar_row_weight=None,
         pack_samples=True,
     )
+    if output_hidden_states:
+        return encoder_outputs.last_hidden_state, loss, encoder_outputs.hidden_states
     return encoder_outputs.last_hidden_state, loss
+
+
+def _first_divergence(sharded_layers, full_layers, start: int, stop: int, upto: int) -> tuple[float, int]:
+    """The largest relative error over the layers before the first MoE reroute.
+
+    The whole stack cannot be asserted on. Repeating a KV head doubles the count the
+    attention kernel sees, which reroutes the MoE layers (constraint 33), and every
+    later layer then amplifies whatever the reroute changed: measured on the toy
+    config, one float32 ulp of input noise reaches 3.3e-1 to 7.1e-1 by layer 6, and
+    the correctly-ordered arm reaches 2.2e-3 to 6.1e-3 -- the same order as a wrong
+    order leaves, so a bound on the last layer separates nothing where the arithmetic
+    differs in its last bits.
+
+    The layers before the first reroute answer the question this worker asks. A rank
+    handed another group's KV attends to the wrong keys at every layer, so its *first*
+    attention layer is already off by O(1) -- measured at 1.09-1.14 -- while the
+    correctly-ordered arm is bit-exact there (0.0), because nothing has amplified
+    anything yet. That gap is five orders of magnitude and survives a kernel whose
+    reduction order differs.
+
+    `hidden_states[0]` is the embedding output, so `hidden_states[1]` is the first
+    layer's. `upto` is that layer index + 1.
+    """
+    worst, worst_layer = 0.0, 0
+    for index in range(1, upto + 1):
+        error = _relative_error(
+            sharded_layers[index].float()[:, : stop - start], full_layers[index].float()[:, start:stop]
+        )
+        if error > worst:
+            worst, worst_layer = error, index
+    return worst, worst_layer
 
 
 def _relative_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -364,15 +401,18 @@ def _repeated_kv_worker():
 
     Checked on the forward, and deliberately. Repeating doubles the KV head count the
     attention kernel sees, which changes its tiling and fp32 reduction order even
-    though the pairwise dot products and softmax sums are unchanged -- so the
-    output moves in its last bits from layer 0 rather than staying bit-exact as it
-    does at `repeats == 1`. That reroutes tokens in the MoE layers (constraint 33), and backpropagation carries a rerouted token
-    into every parameter *upstream* of it: measured at 3.4e-1 on
-    `router.per_expert_scale` and 3.1e-1 on a `q_norm` three layers earlier. So
-    gradients cannot discriminate here at any bound, and the bound below is set
-    from the forward instead -- where a misaligned group is not a last-bit effect
-    but a different head's output entirely. The gradient path is covered at
-    `repeats == 1` by the two workers above, and the ordering itself by
+    though the pairwise dot products and softmax sums are unchanged -- so the output
+    moves in its last bits from layer 0 rather than staying bit-exact as it does at
+    `repeats == 1`, and the rest of the stack amplifies that difference. (This toy
+    config has no MoE layers -- all six are dense -- so the amplification is ordinary
+    depth and the full-attention layer at index 5, whose head_dim differs from the
+    sliding layers'; on a MoE model the reroute would add to it, constraint 33.) The
+    gradients cannot discriminate here at any bound for the same reason: measured at
+    3.4e-1 on `router.per_expert_scale` and 3.1e-1 on a `q_norm` three layers
+    earlier. So the bound below is set from the forward instead, and from its *first*
+    layer -- where a misaligned group is not a last-bit effect but a different head's
+    output entirely. The gradient path is covered at `repeats == 1` by the two
+    workers above, and the ordering itself by
     `test_a_group_stays_with_its_kv_head_when_the_kv_is_repeated`, which asserts
     it exactly on indices.
     """
@@ -396,7 +436,7 @@ def _repeated_kv_worker():
 
     reference_batch = _build_row(model.config, device, sp_size=1)
     with torch.no_grad():
-        full_hidden, _ = _encoder_and_ar_term(model, reference_batch)
+        full_hidden, _, full_layers = _encoder_and_ar_term(model, reference_batch, output_hidden_states=True)
         full_hidden = full_hidden.float()
         full_loss = float(model(**reference_batch, use_cache=False).loss)
     del model
@@ -405,24 +445,38 @@ def _repeated_kv_worker():
         model = _build_model(device, kv_heads=kv_heads)
         batch = _build_row(model.config, device, sp_size=world_size)
         with torch.no_grad():
-            hidden, _ = _encoder_and_ar_term(model, batch)
+            hidden, _, layers = _encoder_and_ar_term(model, batch, output_hidden_states=True)
             value = float(model(**batch, use_cache=False).loss)
 
-    # The encoder states, on the real tokens of this rank's slice. A rank handed the
-    # wrong KV copy attends to another group's keys, which is an O(1) change to
-    # every state it produces -- so the bound has room for the ratio effect above
-    # and none for a misalignment.
+    # The first layer is the discriminator, not the last one. A rank handed the wrong
+    # KV copy attends to another group's keys from the very first attention, which is
+    # an O(1) change to the state it produces -- measured at 1.09-1.14 on this config
+    # against 0.0 for the correctly-ordered arm. The last layer cannot carry the
+    # assertion: repeating a KV head changes the head count the kernel sees, so its
+    # fp32 reduction order moves even though the pairwise dot products are identical,
+    # and the remaining layers amplify that difference until it is as large as a
+    # misalignment. Measured here: one float32 ulp of input noise reaches 3.3e-1 to
+    # 7.1e-1 by the last layer, and the correct arm sits at 2.2e-3 to 6.1e-3. See
+    # `_first_divergence`.
+    #
+    # `upto=1` is the first layer alone. Later layers are compared by the
+    # `repeats == 1` workers, where the kernel's head count does not change and the
+    # comparison stays a few ulps.
     real = int(batch["attention_mask"].sum())
     local = hidden.shape[1]
     start, stop = rank * local, min((rank + 1) * local, real)
-    error = _relative_error(hidden.float()[:, : stop - start], full_hidden[:, start:stop])
+    error, worst_layer = _first_divergence(layers, full_layers, start, stop, upto=1)
     assert error < 1e-1, (
         f"[Rank {rank}] with {kv_heads} KV heads repeated {repeats} times over {world_size} ranks, the "
-        f"sharded encoder states differ from the whole row by {error:.2e}"
+        f"sharded encoder state after layer {worst_layer} differs from the whole row by {error:.2e}"
     )
 
     # And the whole model, which is where `ulysses_decoder_split` repeats the cache's
-    # KV as well.
+    # KV as well. The loss is a much weaker discriminator than the first layer --
+    # measured at 6.5e-3 for a wrong order against 1.8e-4 for the right one -- because
+    # it averages over every position and the AR head masks most of them, but it is
+    # the only check that reaches the decoder, and the bound leaves room for the
+    # last-bit drift the repeated head count causes.
     loss_error = abs(value - full_loss) / max(abs(full_loss), 1e-9)
     assert loss_error < 1e-1, (
         f"[Rank {rank}] the loss with the KV heads repeated is {value} against {full_loss} unsharded, "

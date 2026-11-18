@@ -36,6 +36,21 @@ def all_gather(tensor: "torch.Tensor", world_size: int) -> "torch.Tensor":
     return output_tensor.view(-1, *tensor.size()[1:])
 
 
+def _reduction_device(group: Optional["ProcessGroup"] = None) -> str:
+    """The device a collective has to allocate on for the backend that will run it.
+
+    ``get_device_type()`` names the accelerator this process *has*, not the one the
+    group reduces on, and the two disagree whenever a gloo group is used on an
+    accelerator box -- which is every single-process test that needs a real reduction.
+    A gloo group has no NCCL/HCCL counterpart for an accelerator tensor and raises
+    ``No backend type associated with device type npu`` (or its CUDA equivalent), so
+    the allocation follows the backend: CPU for gloo, the accelerator otherwise.
+    """
+    if dist.is_initialized() and dist.get_backend(group) == "gloo":
+        return "cpu"
+    return get_device_type()
+
+
 def all_reduce(
     data: Union[int, float, List[Union[int, float]], "torch.Tensor"],
     op: Literal["mean", "sum", "max", "min"] = "mean",
@@ -50,13 +65,12 @@ def all_reduce(
     if not isinstance(data, torch.Tensor):
         # An integer reduction (a count, a length) goes as int64: HCCL's MAX/MIN support
         # for float32 is not universal, and `int(all_reduce(n, op="max"))` above asks for
-        # exactly that.
-        dtype = (
-            torch.int64
-            if isinstance(data, int) or (isinstance(data, list) and all(isinstance(v, int) for v in data))
-            else torch.float
-        )
-        data = torch.tensor(data, dtype=dtype, device=get_device_type())
+        # exactly that. `mean` cannot stay integer -- the division below is in place and
+        # its result is a fraction -- so it is the one op that needs a float input even
+        # for an integer count.
+        integer_input = isinstance(data, int) or (isinstance(data, list) and all(isinstance(v, int) for v in data))
+        dtype = torch.int64 if integer_input and op != "mean" else torch.float
+        data = torch.tensor(data, dtype=dtype, device=_reduction_device(group))
 
     reduce_ops = {
         "mean": dist.ReduceOp.SUM,
