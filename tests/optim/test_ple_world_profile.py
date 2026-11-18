@@ -317,17 +317,42 @@ def _file_step_worker(rank, rendezvous, root, mode):
                 raise OSError("injected file-backed allocation failure")
 
             leaf._ple_moment_storage.zeros = fail_allocate
+        if mode in ("cuda_preflight_failure", "direct_cuda_preflight_failure"):
+
+            def inspect_cuda(*_args, **_kwargs):
+                if rank == 1:
+                    raise RuntimeError("injected CUDA precision inspection failure")
+
+            if mode == "direct_cuda_preflight_failure":
+                qwen38_muon._optimizer_uses_cuda = lambda _: True
+                qwen38_muon._cuda_step_preflight = inspect_cuda
+            else:
+                optimizer._qwen38_cuda_guard = True
+                factory._cuda_step_preflight = inspect_cuda
         error = None
         try:
-            optimizer.step()
+            (leaf if mode == "direct_cuda_preflight_failure" else optimizer).step()
         except (RuntimeError, ValueError, OSError) as exc:
             error = exc
         result = torch.tensor(int(error is not None))
         dist.all_reduce(result)
         assert int(result) == (0 if mode == "success" else 2), (rank, mode, error)
-        if mode in ("grad_mismatch", "asymmetric_step_hook", "asymmetric_restore_failure"):
+        if mode in (
+            "grad_mismatch",
+            "asymmetric_step_hook",
+            "asymmetric_restore_failure",
+            "cuda_preflight_failure",
+            "direct_cuda_preflight_failure",
+        ):
             torch.testing.assert_close(original, model.ngram_embedding.weight, rtol=0, atol=0)
             assert not leaf.state
+        if mode in ("cuda_preflight_failure", "direct_cuda_preflight_failure"):
+            expected = (
+                "injected CUDA precision inspection failure"
+                if rank == 1
+                else "preparing file-backed Muon state failed on another rank"
+            )
+            assert expected in str(error)
         if mode in ("asymmetric_step_hook", "asymmetric_restore_failure"):
             expected = (
                 "no closures or step hooks"
@@ -348,7 +373,16 @@ def _file_step_worker(rank, rendezvous, root, mode):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
 @pytest.mark.parametrize(
-    "mode", ["success", "grad_mismatch", "disk_failure", "asymmetric_step_hook", "asymmetric_restore_failure"]
+    "mode",
+    [
+        "success",
+        "grad_mismatch",
+        "disk_failure",
+        "asymmetric_step_hook",
+        "asymmetric_restore_failure",
+        "cuda_preflight_failure",
+        "direct_cuda_preflight_failure",
+    ],
 )
 def test_file_optimizer_step_coordinates_before_muon_collectives(tmp_path, mode):
     mp.start_processes(

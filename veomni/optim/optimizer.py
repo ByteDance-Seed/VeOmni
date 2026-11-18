@@ -555,10 +555,19 @@ class MultiOptimizer(Optimizer, Stateful):
             raise RuntimeError("MultiOptimizer cannot train after a failed checkpoint restore; rebuild the optimizer")
         children = tuple(self.optimizers_dict.values())
         qwen_children = tuple(opt for opt in children if isinstance(opt, Qwen38MuonAdamW))
+        uses_cuda, cuda_error = False, None
+        try:
+            uses_cuda = bool(qwen_children) and any(_optimizer_uses_cuda(opt) for opt in children)
+            if uses_cuda and not self._qwen38_cuda_guard and torch.distributed.is_initialized():
+                raise RuntimeError("Distributed MultiOptimizer requires qwen38_cuda_guard on every participant")
+            if self._qwen38_cuda_guard or uses_cuda:
+                _cuda_step_preflight(children, self._qwen38_cuda_group, closure=closure is not None)
+        except BaseException as exc:
+            cuda_error = exc
         if self._qwen38_ple_world_profile:
             from torch.optim.optimizer import _global_optimizer_post_hooks, _global_optimizer_pre_hooks
 
-            preflight_error = None
+            preflight_error = cuda_error
             if (
                 closure is not None
                 or _global_optimizer_pre_hooks
@@ -569,9 +578,10 @@ class MultiOptimizer(Optimizer, Stateful):
                     for opt in qwen_children
                 )
             ):
-                preflight_error = ValueError(
-                    "File-backed optimizer requires coordinated children and no closures or step hooks"
-                )
+                if preflight_error is None:
+                    preflight_error = ValueError(
+                        "File-backed optimizer requires coordinated children and no closures or step hooks"
+                    )
             if not qwen_children and preflight_error is not None:
                 raise preflight_error
             for index, opt in enumerate(qwen_children):
@@ -579,11 +589,9 @@ class MultiOptimizer(Optimizer, Stateful):
                     restore_failed=restore_failed if index == 0 else False,
                     preflight_error=preflight_error if index == 0 else None,
                 )
-        uses_cuda = bool(qwen_children) and any(_optimizer_uses_cuda(opt) for opt in children)
-        if uses_cuda and not self._qwen38_cuda_guard and torch.distributed.is_initialized():
-            raise RuntimeError("Distributed MultiOptimizer requires qwen38_cuda_guard on every participant")
+        elif cuda_error is not None:
+            raise cuda_error
         if self._qwen38_cuda_guard or uses_cuda:
-            _cuda_step_preflight(children, self._qwen38_cuda_group, closure=closure is not None)
             for opt in qwen_children:
                 opt._cuda_parent_preflight = True
         if self._qwen38_ple_world_profile:
@@ -728,24 +736,12 @@ def _qwen38_cuda_training_group(parallel_state):
 def _qwen38_cuda_domain(optimizer_type, parallel_state, optimizers):
     if optimizer_type != "qwen38_muon":
         return False
-    local, error = False, None
-    try:
-        mesh = getattr(parallel_state, "device_mesh", None)
-        local = (mesh is not None and mesh.device_type == "cuda") or any(
-            _optimizer_uses_cuda(opt) for opt in optimizers
-        )
-    except BaseException as exc:
-        error = exc
-    if torch.distributed.is_initialized():
-        from ..utils.dist_utils import raise_if_any_rank_failed
-
-        raise_if_any_rank_failed(error, "inspecting Qwen3.8 CUDA optimizer domain")
-        flags = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(flags, local)
-        return any(flags) or torch.distributed.get_backend() == "nccl"
-    if error is not None:
-        raise error
-    return local
+    mesh = getattr(parallel_state, "device_mesh", None)
+    return (
+        (mesh is not None and mesh.device_type == "cuda")
+        or any(_optimizer_uses_cuda(opt) for opt in optimizers)
+        or (torch.distributed.is_initialized() and torch.distributed.get_backend() == "nccl")
+    )
 
 
 def _file_profile_value(value):
@@ -919,9 +915,9 @@ def _coordinate_qwen_builder(builder):
             error = exc
         raise_if_any_rank_failed(error, "getting Qwen3.8 optimizer parallel state")
         children = tuple(result.optimizers_dict.values())
-        cuda_guard = _qwen38_cuda_domain(optimizer_type, parallel_state, children)
-        cuda_group, error = None, None
+        cuda_guard, cuda_group, error = False, None, None
         try:
+            cuda_guard = _qwen38_cuda_domain(optimizer_type, parallel_state, children)
             if cuda_guard:
                 cuda_group = _qwen38_cuda_training_group(parallel_state)
         except BaseException as exc:

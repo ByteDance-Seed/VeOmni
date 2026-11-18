@@ -12,7 +12,7 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.optim import optimizer as factory
 
 
-def _worker(rank, endpoint):
+def _worker(rank, mode, endpoint):
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
         model = torch.nn.Module()
@@ -21,10 +21,18 @@ def _worker(rank, endpoint):
         factory.get_parallel_state = lambda: SimpleNamespace(
             dp_mode="ddp", any_extra_parallel_enabled=False, device_mesh=None
         )
-        pattern = "missing" if rank else "ngram_embedding"
-        with pytest.raises((RuntimeError, ValueError), match="building Qwen3.8|match no trainable"):
+        if rank == 1:
+
+            def fail_locally(*_args, **_kwargs):
+                raise OSError("injected local optimizer failure")
+
+            if mode == "builder":
+                factory.select_cpu_offload_groups = fail_locally
+            else:
+                factory._qwen38_cuda_domain = fail_locally
+        with pytest.raises((RuntimeError, OSError), match="Qwen3.8|optimizer failure"):
             factory.build_optimizer(
-                model, optimizer_type="qwen38_muon", weight_decay=0.0, cpu_offload_param_patterns=[pattern]
+                model, optimizer_type="qwen38_muon", weight_decay=0.0, cpu_offload_param_patterns=["ngram_embedding"]
             )
         done = torch.tensor(1)
         dist.all_reduce(done)
@@ -34,10 +42,11 @@ def _worker(rank, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_one_rank_qwen_builder_failure_stops_all_ranks():
+@pytest.mark.parametrize("mode", ["builder", "domain"])
+def test_one_rank_qwen_builder_failure_stops_all_ranks(mode):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
-    spawn_with_rendezvous(_worker, args=(), nprocs=2)
+    spawn_with_rendezvous(_worker, args=(mode,), nprocs=2)
 
 
 def _direct_extra_parallel_worker(rank, endpoint):

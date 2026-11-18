@@ -26,6 +26,7 @@ def _cuda_policy_worker(rank, rendezvous, output_dir):
         torch.set_float32_matmul_precision("highest")
         model = torch.nn.Module()
         model.down_proj = torch.nn.Linear(4, 4, bias=False, device=f"cuda:{rank}", dtype=torch.float32)
+        model.bias = torch.nn.Parameter(torch.ones(4, device=f"cuda:{rank}", dtype=torch.float32))
         initial = torch.arange(1, 17, dtype=torch.float32).reshape(4, 4) / 20
         gradient = torch.tensor(
             [
@@ -41,8 +42,13 @@ def _cuda_policy_worker(rank, rendezvous, output_dir):
         param = model.down_proj.weight
         plan = add_qwen38_plans(model, [{"params": [param]}])
         leaf = Qwen38MuonAdamW(plan, lr=1e-3, cuda_precision_group=dist.group.WORLD)
+        adam = torch.optim.AdamW([model.bias], lr=1e-3)
         optimizer = MultiOptimizer(
-            model, {"muon": leaf}, ["muon"], qwen38_cuda_guard=True, qwen38_cuda_group=dist.group.WORLD
+            model,
+            {"adam": adam, "muon": leaf},
+            ["adam", "muon"],
+            qwen38_cuda_guard=True,
+            qwen38_cuda_group=dist.group.WORLD,
         )
         reference = torch.nn.Module()
         reference.down_proj = torch.nn.Linear(4, 4, bias=False, dtype=torch.float32)
@@ -51,6 +57,7 @@ def _cuda_policy_worker(rank, rendezvous, output_dir):
         ref_param = reference.down_proj.weight
         ref = Qwen38MuonAdamW(add_qwen38_plans(reference, [{"params": [ref_param]}]), lr=1e-3)
         param.grad = gradient.to(device=torch.device("cuda", rank))
+        model.bias.grad = torch.full_like(model.bias, 0.25)
         ref_param.grad = gradient
         optimizer.step()
         ref.step()
@@ -62,14 +69,25 @@ def _cuda_policy_worker(rank, rendezvous, output_dir):
         )
         before_param = param.detach().clone()
         before_state = {key: value.detach().clone() for key, value in leaf.state[param].items()}
-        if rank == 1:
-            torch.set_float32_matmul_precision("medium")
+        before_bias = model.bias.detach().clone()
+        before_adam = {key: value.detach().clone() for key, value in adam.state[model.bias].items()}
+        torch.set_float32_matmul_precision("medium")
         with pytest.raises(RuntimeError):
             optimizer.step()
         assert torch.equal(param, before_param)
         assert before_state.keys() == leaf.state[param].keys()
         for key, before in before_state.items():
             assert torch.equal(leaf.state[param][key], before)
+        assert torch.equal(model.bias, before_bias)
+        for key, before in before_adam.items():
+            assert torch.equal(adam.state[model.bias][key], before)
+        torch.set_float32_matmul_precision("highest")
+        optimizer.step()
+        ref.step()
+        torch.testing.assert_close(
+            leaf.state[param]["master_weight"].cpu(), ref.state[ref_param]["master_weight"], rtol=1e-5, atol=1e-7
+        )
+        assert not torch.equal(model.bias, before_bias)
         torch.save({"passed": True}, Path(output_dir) / f"cuda-rank{rank}.pt")
         dist.barrier()
     finally:
@@ -77,7 +95,7 @@ def _cuda_policy_worker(rank, rendezvous, output_dir):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
-def test_native_cuda_ieee_update_and_cross_rank_unsafe_policy_fails_before_update(tmp_path):
+def test_native_cuda_ieee_update_and_unsafe_policy_fails_before_update(tmp_path):
     capabilities = runner_capabilities()
     if capabilities.backend == "cpu":
         pytest.skip("Requires 2 native CUDA devices")

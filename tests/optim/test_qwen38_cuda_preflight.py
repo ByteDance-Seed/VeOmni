@@ -1,4 +1,4 @@
-"""Coordinated CUDA precision preflight without requiring a CUDA device."""
+"""CUDA policy and checkpoint preflight without requiring a CUDA device."""
 
 from datetime import timedelta
 from pathlib import Path
@@ -65,7 +65,7 @@ def _group_worker(rank, rendezvous, output_dir):
         before_state = {name: value.clone() for name, value in adam.state[model.weight].items()}
 
         def second_policy():
-            if rank == 1:
+            if rank < 2:
                 raise RuntimeError("rank-local unsafe precision")
 
         implementation._check_cuda_fp32_policy = second_policy
@@ -84,7 +84,7 @@ def _group_worker(rank, rendezvous, output_dir):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=4, device="cpu"))
-def test_cuda_policy_preflight_is_group_local_and_preserves_updates_on_failure(tmp_path):
+def test_cuda_policy_preflight_is_local_and_preserves_updates_on_failure(tmp_path):
     mp.spawn(_group_worker, args=(str(tmp_path / "rdzv"), str(tmp_path)), nprocs=4, join=True)
     results = [torch.load(tmp_path / f"rank{rank}.pt", weights_only=True) for rank in range(4)]
     assert results[:2] == [{"failed": True, "unchanged": True}] * 2
@@ -103,14 +103,15 @@ def _empty_rank_worker(rank, rendezvous, output_dir):
         model.weight = torch.nn.Parameter(torch.tensor([1.0]))
         model.weight.grad = torch.ones_like(model.weight)
         adam = torch.optim.AdamW([model.weight], lr=0.01)
+        # An owner rank may have no local optimizer leaf despite identical
+        # job configuration; its CUDA-domain guard must still run.
         children = {"adam": adam} if rank == 0 else {}
         combined = factory.MultiOptimizer(
             model, children, list(children), qwen38_cuda_guard=True, qwen38_cuda_group=dist.group.WORLD
         )
 
         def policy():
-            if rank == 1:
-                raise RuntimeError("empty rank has unsafe precision")
+            raise RuntimeError("training domain has unsafe precision")
 
         implementation._check_cuda_fp32_policy = policy
         failed = False
@@ -160,7 +161,7 @@ def _closure_worker(rank, rendezvous, output_dir):
         failed = False
         message = ""
         try:
-            opt.step(closure=(lambda: called.append(True)) if rank == 1 else None)
+            opt.step(closure=lambda: called.append(True))
         except RuntimeError as exc:
             failed = True
             message = str(exc)
@@ -180,12 +181,11 @@ def _closure_worker(rank, rendezvous, output_dir):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_cuda_closure_on_one_rank_rejects_all_ranks_before_update(tmp_path):
+def test_cuda_closure_rejected_locally_before_update(tmp_path):
     mp.spawn(_closure_worker, args=(str(tmp_path / "rdzv-closure"), str(tmp_path)), nprocs=2, join=True)
     results = [torch.load(tmp_path / f"closure-rank{rank}.pt", weights_only=True) for rank in range(2)]
     assert all(result["failed"] and result["unchanged"] and not result["closure_called"] for result in results)
-    assert "another rank" in results[0]["message"]
-    assert "closures" in results[1]["message"]
+    assert all("closures" in result["message"] for result in results)
 
 
 def _checkpoint_worker(rank, rendezvous, output_dir):

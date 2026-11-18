@@ -89,16 +89,23 @@ rank must enter it in the same order with the same optimizer type. Both standard
 runtime and custom callers must provide a consistent configuration before
 calling the factory; mismatched participants can hang.
 
-On CUDA, matmul must already use IEEE FP32 (`highest`, TF32 disabled); unsafe
-or mixed precision policies are rejected before any optimizer child updates.
-The optimizer does not change process-wide CUDA precision flags. A distributed
-CUDA optimizer requires the explicit training process group; the framework's
-optimizer factory supplies it for `TP=PP=1` and requires the group to cover the
-whole training world. Directly constructed distributed optimizers must pass
-`cuda_precision_group`, and custom `MultiOptimizer` users must pass the same
-complete communication domain and enable `qwen38_cuda_guard` on every
-participant. A custom subgroup is valid only for an independent training
-domain with no dependent collectives outside it. When calling optimizer
+On CUDA, matmul must already use IEEE FP32 (`highest`, TF32 disabled); each
+rank rejects an unsafe local policy before any optimizer child updates. The
+runtime must configure the same precision policy and step hooks on all ranks;
+the step does not run a collective to detect inconsistent configurations.
+The file-backed PLE profile includes a local check failure in its existing WORLD
+preflight, before any rank updates optimizer state, without another collective.
+Other profiles do not provide that cross-rank guarantee: if one rank's local
+check fails, peers may already have updated parameters. Stop the failed job on
+all ranks and resume from a completed checkpoint in fresh processes; do not
+save or reuse its live state.
+The optimizer does not change process-wide CUDA precision flags. The framework
+factory checks that its distributed CUDA training group covers the full world
+and uses `TP=PP=1`. Custom `MultiOptimizer` callers must enable
+`qwen38_cuda_guard` on every participant, including ranks with no local
+optimizer leaf. The `cuda_precision_group` and `qwen38_cuda_group` arguments
+are retained for compatibility; they do not coordinate the per-step check.
+When calling optimizer
 factories directly, every rank in the domain must supply the same optimizer
 type and call the factory in the same order. CUDA Muon steps do not support
 closures or optimizer step hooks, which could change precision after the
