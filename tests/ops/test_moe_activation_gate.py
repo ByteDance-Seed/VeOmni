@@ -58,7 +58,7 @@ def _all_eager_ops_config(**overrides) -> OpsImplementationConfig:
         "moe_implementation": "eager",
         "cross_entropy_loss_implementation": "eager",
         "rms_norm_implementation": "eager",
-        "swiglu_mlp_implementation": "eager",
+        "gated_mlp_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
         "load_balancing_loss_implementation": "eager",
         "rms_norm_gated_implementation": "eager",

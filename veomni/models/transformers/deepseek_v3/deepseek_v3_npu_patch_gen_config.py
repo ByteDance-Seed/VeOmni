@@ -91,12 +91,12 @@ config.override_method(
 config.override_method(
     "DeepseekV3MLP.__init__",
     replacement=deepseek_v3_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 config.override_method(
     "DeepseekV3MLP.forward",
     replacement=deepseek_v3_mlp_forward_patched,
-    description="Always call the local swiglu_mlp VeomniOp",
+    description="Always call the local gated_mlp VeomniOp",
 )
 config.override_method(
     "DeepseekV3DecoderLayer.__init__",

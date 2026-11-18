@@ -47,7 +47,6 @@ from transformers.utils.output_capturing import capture_outputs
 
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 
 from .configuration_llada import LLaDAConfig
 from .dllm_utils import bidirectional_attention_mask, dllm_lm_head_loss
@@ -171,22 +170,13 @@ class LLaDAMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
-        impl = getattr(getattr(config, "ops_config", None), "swiglu_mlp_implementation", None) or "eager"
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", impl)
+        impl = getattr(getattr(config, "ops_config", None), "gated_mlp_implementation", None) or "eager"
+        self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", impl)
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-            return self.veomni_swiglu_mlp(
-                x,
-                self.gate_proj.weight,
-                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                self.up_proj.weight,
-                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-                self.down_proj.weight,
-                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-            )
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        # The row receives this module, so a wrapped or quantized projection is run
+        # through its own forward rather than read as a weight tensor.
+        return self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

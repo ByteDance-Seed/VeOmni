@@ -60,7 +60,7 @@ model:
     # Use these only when replacing explicit GPU-only overrides.
     rms_norm_implementation: "torch_npu"
     rotary_pos_emb_implementation: "torch_npu"
-    swiglu_mlp_implementation: "eager"
+    gated_mlp_implementation: "eager"
     moe_implementation: "fused_npu"
 ```
 
