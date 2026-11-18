@@ -83,6 +83,26 @@ def finite_scalar(value):
     return value if math.isfinite(value) else None
 
 
+def optimizer_learning_rates(optimizer):
+    children = getattr(optimizer, "optimizers_dict", None)
+    result = {}
+    if children is not None:
+        groups = [optimizer_learning_rates(child) for child in children.values()]
+        for group in groups:
+            for parameter, rate in group.items():
+                if parameter in result and result[parameter] != rate:
+                    raise RuntimeError("Conflicting optimizer learning rates for one parameter")
+                result[parameter] = rate
+        return result
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            key, rate = id(parameter), float(group["lr"])
+            if key in result and result[key] != rate:
+                raise RuntimeError("Conflicting optimizer learning rates for one parameter")
+            result[key] = rate
+    return result
+
+
 class EnvelopeLogSink(Callback):
     def __init__(self, trainer, run_label):
         super().__init__(trainer)
@@ -94,15 +114,20 @@ class EnvelopeLogSink(Callback):
         self.initial_experts = self.snapshot()
         self.previous_experts = self.initial_experts
         self.step_lr = None
+        self.learning_rates = []
         original_clip = trainer.model.clip_grad_norm
 
         def capture_clipped_gradients(*args, **kwargs):
             norm = original_clip(*args, **kwargs)
             self.expert_grads.append(self.snapshot(gradients=True))
-            rates = {float(group["lr"]) for group in trainer.model.optimizer.param_groups}
-            if len(rates) != 1:
-                raise RuntimeError("The toy update comparison requires one matched learning rate")
-            self.step_lr = rates.pop()
+            rates = optimizer_learning_rates(trainer.model.optimizer)
+            self.step_lr = {
+                name: rates[id(parameter)] for name, parameter in trainer.model.named_parameters()
+                if ".experts." in name and parameter.requires_grad
+            }
+            if self.step_lr.keys() != self.initial_experts.keys():
+                raise RuntimeError("Every expert parameter must have its actual optimizer learning rate")
+            self.learning_rates.append(self.step_lr.copy())
             return norm
 
         trainer.model.clip_grad_norm = capture_clipped_gradients
@@ -127,9 +152,8 @@ class EnvelopeLogSink(Callback):
         self.expert_updates.append(current)
         if self.step_lr is None:
             raise RuntimeError("Expert update capture must follow clipped gradients")
-        scale = self.step_lr if self.step_lr else 1.0
         self.expert_deltas.append({
-            name: (value.float() - self.previous_experts[name].float()) / scale
+            name: (value.float() - self.previous_experts[name].float()) / (self.step_lr[name] or 1.0)
             for name, value in current.items()
         })
         self.previous_experts = current
@@ -149,7 +173,7 @@ class EnvelopeLogSink(Callback):
         os.makedirs(output_dir, exist_ok=True)
         torch.save(
             {"initial": self.initial_experts, "gradients": self.expert_grads,
-             "parameters": self.expert_updates, "lr_scaled_updates": self.expert_deltas},
+             "parameters": self.expert_updates, "lr_scaled_updates": self.expert_deltas, "learning_rates": self.learning_rates},
             os.path.join(output_dir, f"expert_precision_rank{args.train.global_rank}.pt"),
         )
         if args.train.global_rank != 0:
@@ -411,6 +435,8 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(
     for rank in range(_REQUIRED_DEVICES):
         reference = torch.load(baseline_output / f"expert_precision_rank{rank}.pt", weights_only=True)
         actual = torch.load(candidate_output / f"expert_precision_rank{rank}.pt", weights_only=True)
+        assert actual["learning_rates"] == reference["learning_rates"]
+        assert len(actual["learning_rates"]) == 3
         assert actual["initial"].keys() == reference["initial"].keys()
         for name in reference["initial"]:
             torch.testing.assert_close(actual["initial"][name], reference["initial"][name], rtol=0, atol=0)
