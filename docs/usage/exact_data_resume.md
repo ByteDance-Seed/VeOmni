@@ -63,8 +63,22 @@ fingerprint. Use the same worker and DP geometry on restore.
 
 ## Loader with a prepared resume iterator
 
+For a mid-epoch resume of a native map-style `DistributedDataloader` using
+the standard batch sampler, no custom loader generator, and either
+`StatefulDistributedSampler` or PyTorch's `DistributedSampler`, the trainer
+sets the restored sampler epoch before
+workers prefetch, then retains the restored iterator before restoring its CPU
+RNG. It also retains a saved iterator at step zero; an empty step-zero cursor
+instead starts normally. The same RNG ordering applies to the replayable
+multi-source loader under its validated source contract. At an epoch boundary,
+the standard `StatefulDistributedSampler` starts from the beginning of the
+new epoch rather than reusing the previous epoch's cursor. The normal
+new-epoch iterator is still created after RNG restoration.
+
 `GlobalStateCallback.load_global_state` normally primes `iter(loader)` for a
-non-strict loader resumed at an epoch boundary. A custom stateful loader that
+non-strict loader resumed at an epoch boundary. It primes the supported native
+loaders described above before restoring the CPU RNG, and other loaders after
+restoring it. A custom stateful loader that
 already creates a restored iterator in `load_state_dict` can set
 `_veomni_resume_iterator_prepared = True` **after** installing its restored
 queue. The callback then skips that extra priming call. The subsequent training
@@ -86,4 +100,5 @@ def __iter__(self):
 
 This flag only avoids duplicate initialization. It does not certify custom
 loader ordering, epoch boundaries, worker prefetch, or cold recovery; validate
-those separately before relying on exact resume.
+those separately before relying on exact resume. Source identity, stateful
+transforms and custom generator state require their own verified contract.

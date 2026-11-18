@@ -182,6 +182,11 @@ class DistributedDataloader(StatefulDataLoader):
             return iterator
         return super().__iter__()
 
+    def prime_restored_iterator(self):
+        """Rebuild a saved iterator before restoring the trainer's RNG."""
+        if self._preloaded_resume_iterator is None:
+            self._preloaded_resume_iterator = super().__iter__()
+
     def prime_persistent_epoch_for_resume(self):
         """Start new-epoch workers before restoring the trainer's CPU RNG."""
         if (
