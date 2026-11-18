@@ -71,12 +71,12 @@ config.override_method(
 config.override_method(
     "Qwen3MLP.__init__",
     replacement=qwen3_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 config.override_method(
     "Qwen3MLP.forward",
     replacement=qwen3_mlp_forward_patched,
-    description="Always call the local swiglu_mlp VeomniOp",
+    description="Always call the local gated_mlp VeomniOp",
 )
 config.override_method(
     "Qwen3DecoderLayer.__init__",

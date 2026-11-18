@@ -1471,7 +1471,7 @@ def test_reject_quantizing_act_fn_refuses_only_quantizing_rows():
     Python ``act_fn`` loop is the only path for another activation -- and that loop
     cannot reach the family row. Support is tracked in #1430.
 
-    The activation is read from ``use_swiglu_mlp`` because these experts modules are
+    The activation is read from ``use_swiglu`` because these experts modules are
     plain ``nn.Module`` objects with no config reference.
     """
     from types import SimpleNamespace
@@ -1479,7 +1479,7 @@ def test_reject_quantizing_act_fn_refuses_only_quantizing_rows():
     from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 
     def experts(impl, swiglu):
-        return SimpleNamespace(veomni_moe=SimpleNamespace(impl=impl), use_swiglu_mlp=swiglu)
+        return SimpleNamespace(veomni_moe=SimpleNamespace(impl=impl), use_swiglu=swiglu)
 
     # SwiGLU is what every fused row implements.
     reject_quantizing_act_fn(experts("qat", swiglu=True))
@@ -1487,5 +1487,16 @@ def test_reject_quantizing_act_fn_refuses_only_quantizing_rows():
     with pytest.raises(ValueError, match="moe_implementation='qat' cannot run with a non-SwiGLU activation"):
         reject_quantizing_act_fn(experts("qat", swiglu=False))
 
-    # A reference row may use the fallback; that is a deliberate precision choice.
-    reject_quantizing_act_fn(experts("eager", swiglu=False))
+    # ``deepgemm_fp8`` quantizes too -- its ``GroupedLinear`` runs the FP8 GEMM in
+    # forward, dgrad and wgrad -- so it must refuse for the same reason. It used to
+    # be absent from ``QUANTIZING_IMPLS``, which let a non-SwiGLU activation reach the
+    # plain-``F.linear`` fallback and train the routed experts at full precision
+    # while the config said ``deepgemm_fp8``.
+    reject_quantizing_act_fn(experts("deepgemm_fp8", swiglu=True))
+    with pytest.raises(ValueError, match="moe_implementation='deepgemm_fp8' cannot run"):
+        reject_quantizing_act_fn(experts("deepgemm_fp8", swiglu=False))
+
+    # The remaining rows do bf16 math and ignore ``expert_dtype``, so the fallback
+    # changes nothing for them: a reference row may take it deliberately.
+    for impl in ("eager", "fused_triton", "fused_quack", "fused_npu", "fused_mlu"):
+        reject_quantizing_act_fn(experts(impl, swiglu=False))

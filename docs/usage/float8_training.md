@@ -102,13 +102,16 @@ before FSDP2 wraps transformer blocks.
 
 ### Interactions
 
-- **Fused SwiGLU MLP**: converting a model's MLP `gate_proj` / `up_proj` /
+- **Fused gated MLP**: converting a model's MLP `gate_proj` / `up_proj` /
   `down_proj` replaces them with torchao's `Float8Linear`, an `nn.Linear`
-  subclass whose `forward` runs the float8 GEMMs. The fused `swiglu_mlp` row
+  subclass whose `forward` runs the float8 GEMMs. A fused `gated_mlp` row
   (including the GPU default `liger_kernel`) reads projection weights directly,
-  so for those MLPs it is bypassed and the model runs the unfused
+  which would skip that float8 math, so `gated_mlp._module.render` hands the row
+  the projection modules instead and the block runs
   `down_proj(act_fn(gate_proj(x)) * up_proj(x))`. A quantizing
-  `swiglu_mlp_implementation` (`qat`) on converted projections is refused.
+  `gated_mlp_implementation` (`qat`, `torchao_nvfp4`) on converted projections is
+  refused, because it would train at full precision under a config that said
+  otherwise.
 - **PEFT interop**: `peft==0.18.1` (from the `gpu` extra) imports
   `LinearActivationQuantizedTensor` from torchao when torchao is installed, and
   torchao 0.18.0 no longer provides it. With the `float8` extra installed,

@@ -21,13 +21,21 @@ drop that compatibility. Call site:
   ends there (initial parse, ``from_pretrained``, ``save_pretrained``
   round-trip, caller overrides), so the migration cannot be bypassed.
 
-Only one retired name is handled here:
+Two kinds of old name are handled here:
 
 * ``qat_implementation`` — a single global recipe. It was removed in favour of
-  one row per family (``linear_implementation``, ``swiglu_mlp_implementation``,
+  one row per family (``linear_implementation``, ``gated_mlp_implementation``,
   ``moe_implementation``, ``kv_round_implementation``).
 
-Two old values, and they do not migrate the same way:
+and one rename, which needs no value mapping:
+
+* ``swiglu_mlp_implementation`` -> ``gated_mlp_implementation``. The family gained
+  an activation argument, so it is no longer SiLU-only and the old name was wrong.
+  Every selection stored before the rename uses the old spelling, and a checkpoint
+  records whatever was set, so without this the load fails with a bare
+  ``unexpected keyword argument``.
+
+The two old ``qat_implementation`` values do not migrate the same way:
 
 * ``"none"`` — was the default and meant "train in the model dtype". Today that
   is simply an unset field, so the migration drops the key and nothing else
@@ -51,9 +59,18 @@ from typing import Any, Mapping
 
 
 __all__ = [
+    "RENAMED_SELECTIONS",
     "RETIRED_SELECTIONS",
     "migrate_retired_selections",
 ]
+
+#: Fields renamed without changing their values. Applied before
+#: :data:`RETIRED_SELECTIONS`, so a config carrying both an old field name and an
+#: old value still migrates in one pass.
+RENAMED_SELECTIONS: dict[str, str] = {
+    # The family takes an activation argument now, so it is not SiLU-only.
+    "swiglu_mlp_implementation": "gated_mlp_implementation",
+}
 
 #: Retired ops-selection names, mapped from each old value to the selections that
 #: replace it. An old value absent from the inner map cannot be translated here.
@@ -73,18 +90,22 @@ def migrate_retired_selections(selections: Mapping[str, Any]) -> dict[str, Any]:
             retired key.
 
     Returns:
-        The selections with retired keys replaced by their current equivalent. A
-        mapping that carries none of them is returned unchanged, so the common
-        path costs one dict copy at most.
+        The selections with renamed and retired keys replaced by their current
+        equivalent. A mapping that carries none of them is returned unchanged, so
+        the common path costs one dict copy at most.
 
     Raises:
         ValueError: if a retired value has no translation, because choosing one
             needs to know the model. The message names the fields to set instead.
     """
-    if not any(field in selections for field in RETIRED_SELECTIONS):
+    if not any(field in selections for field in (*RENAMED_SELECTIONS, *RETIRED_SELECTIONS)):
         return dict(selections)
 
     migrated = dict(selections)
+    for field, current in RENAMED_SELECTIONS.items():
+        if field in migrated:
+            # A config that somehow carries both keeps the current spelling.
+            migrated.setdefault(current, migrated.pop(field))
     for field, mapping in RETIRED_SELECTIONS.items():
         if field not in migrated:
             continue
@@ -96,7 +117,7 @@ def migrate_retired_selections(selections: Mapping[str, Any]) -> dict[str, Any]:
                 f"{field}={value!r} came from a config written before quantization-aware training "
                 f"became per-family, and cannot be translated without knowing which families the "
                 f"model has. Select them explicitly: 'linear_implementation' / "
-                f"'swiglu_mlp_implementation' / 'moe_implementation' = 'qat', plus "
+                f"'gated_mlp_implementation' / 'moe_implementation' = 'qat', plus "
                 f"'kv_round_implementation' = 'triton' for stored KV. Only {field}='none' "
                 f"(train in the model dtype) migrates automatically. See "
                 f"veomni/models/legacy_qat_selections.py."

@@ -16,7 +16,7 @@ Run (4 GPUs):
         --model.ops_implementation.attn_implementation flash_attention_2 \\
         --model.ops_implementation.cross_entropy_loss_implementation eager \\
         --model.ops_implementation.rms_norm_implementation eager \\
-        --model.ops_implementation.swiglu_mlp_implementation eager \\
+        --model.ops_implementation.gated_mlp_implementation eager \\
         --model.ops_implementation.rotary_pos_emb_implementation eager \\
         --data.train_path dummy \\
         --data.max_seq_len 128 \\
