@@ -774,7 +774,10 @@ class TextDPOTrainer:
             identity_error = None
             try:
                 self._dpo_producer_identity = dpo_producer_identity(
-                    self.policy_model.tokenizer, self.policy_model.chat_template, tokenizer_fingerprint
+                    self.policy_model.tokenizer,
+                    self.policy_model.chat_template,
+                    tokenizer_fingerprint,
+                    force_refresh=True,
                 )
             except Exception as exc:  # noqa: BLE001 - report producer failures consistently across ranks
                 identity_error = exc
@@ -895,6 +898,7 @@ class TextDPOTrainer:
             self.policy_model.tokenizer,
             self.policy_model.chat_template,
             getattr(self.base.args.dpo_config, "audited_unpadded_tokenizer_sha256", None),
+            force_refresh=True,
         )
         if actual_identity != current["producer_identity"]:
             raise ValueError("DPO producer identity changed before checkpoint recovery")

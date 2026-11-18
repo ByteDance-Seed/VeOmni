@@ -49,13 +49,16 @@ unpadding transform before this interface.
 
 [`dpo_declared_producer_identity`](../../veomni/utils/dpo_provenance.py#L160)
 checks the concrete declaration and binds its ID, class and live methods.
-[`dpo_producer_identity`](../../veomni/data/data_transform.py#L277) checks the
+[`dpo_producer_identity`](../../veomni/data/data_transform.py#L281) checks the
 tokenizer and template together, including a template-owned tokenizer. The
-[DPO transform](../../veomni/data/data_transform.py#L475) checks the producer
-again before recording segment lengths. The
-[trainer initialization](../../veomni/trainer/text_dpo_trainer.py#L776) captures
-the identity; its [checkpoint state](../../veomni/trainer/text_dpo_trainer.py#L805)
-and [restore validation](../../veomni/trainer/text_dpo_trainer.py#L871) bind it
+standard DPO transform reuses the attestation within each process, and checks
+again on a worker's first sample after fork or spawn. Producers, their methods,
+configuration, and the template-owned tokenizer must remain immutable for the
+process lifetime. Call `dpo_producer_identity(..., force_refresh=True)` to
+explicitly check the current live objects. The
+[trainer initialization](../../veomni/trainer/text_dpo_trainer.py#L768) captures
+the identity; its [checkpoint state](../../veomni/trainer/text_dpo_trainer.py#L808)
+and [restore validation](../../veomni/trainer/text_dpo_trainer.py#L874) bind it
 alongside objective, data and parallel geometry. Changed or missing provenance
 is rejected for exact trainer-state recovery; use weights-only initialization
 or an independently verified migration when the old identity cannot be proven.

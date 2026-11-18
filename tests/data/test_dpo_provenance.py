@@ -45,6 +45,47 @@ class Tokenizer:
         return list(range(1, len(text) + 1))
 
 
+def _dpo_cache_worker(tokenizer, expected, queue):
+    import veomni.data.data_transform as transforms
+
+    calls = []
+    original = transforms.dpo_tokenizer_contract_identity
+
+    def attest(*args):
+        calls.append(True)
+        return original(*args)
+
+    transforms.dpo_tokenizer_contract_identity = attest
+    for _ in range(3):
+        feature = transforms.process_dpo_example(
+            {"chosen": "abc", "rejected": "de"},
+            tokenizer=tokenizer,
+            record_segment_provenance=True,
+            expected_dpo_producer_identity=expected,
+        )[0]
+        assert feature[DPO_FEATURE_KEY].producer_contract_version == 1
+    queue.put(len(calls))
+
+
+@pytest.mark.parametrize("start_method", ["fork", "spawn"])
+def test_dpo_worker_attests_once_after_process_start(start_method):
+    import multiprocessing
+
+    from veomni.data.data_transform import dpo_producer_identity
+
+    tokenizer = Tokenizer()
+    # Warm the parent cache first, so fork must not reuse its attestation.
+    expected = dpo_producer_identity(tokenizer, None, None, force_refresh=True)
+    context = multiprocessing.get_context(start_method)
+    queue = context.Queue()
+    worker = context.Process(target=_dpo_cache_worker, args=(tokenizer, expected, queue))
+    worker.start()
+    worker.join(60)
+    assert worker.exitcode == 0
+    assert queue.get(timeout=5) == 1
+    queue.close()
+
+
 def test_dpo_training_requires_provenance_by_default(monkeypatch):
     import veomni.trainer.text_dpo_trainer as dpo
 
@@ -675,6 +716,7 @@ def test_trainer_adds_transform_option_only_when_enabled(monkeypatch, enabled):
 
 def test_dpo_registry_and_real_trainer_transform_produce_verified_features():
     import veomni.trainer.text_dpo_trainer as dpo
+    from veomni.data.data_transform import dpo_producer_identity
 
     tokenizer = Tokenizer()
     trainer = dpo.TextDPOTrainer.__new__(dpo.TextDPOTrainer)
@@ -689,7 +731,61 @@ def test_dpo_registry_and_real_trainer_transform_produce_verified_features():
 
     tokenizer.encode = lambda text, add_special_tokens=True: [0, 0, 1]
     with pytest.raises(ValueError, match="instance-overridden"):
-        trainer.base.data_transform({"chosen": "abc", "rejected": "de"})
+        dpo_producer_identity(tokenizer, None, None, force_refresh=True)
+
+
+def test_dpo_producer_identity_is_cached_per_process_and_returns_a_copy(monkeypatch):
+    import veomni.data.data_transform as transforms
+
+    tokenizer = Tokenizer()
+    calls = []
+    original = transforms.dpo_tokenizer_contract_identity
+
+    def attest(*args):
+        calls.append(True)
+        return original(*args)
+
+    monkeypatch.setattr(transforms, "dpo_tokenizer_contract_identity", attest)
+    monkeypatch.setattr(transforms, "_dpo_producer_cache", None)
+    first = transforms.dpo_producer_identity(tokenizer, None, None)
+    expected = dict(first)
+    first["tokenizer"] = "corrupted result"
+    assert transforms.dpo_producer_identity(tokenizer, None, None) == expected
+    assert len(calls) == 1
+    assert transforms.dpo_producer_identity(tokenizer, None, None, force_refresh=True) == expected
+    assert len(calls) == 2
+
+    # A forked worker must not inherit its parent's successful attestation.
+    cache = transforms._dpo_producer_cache
+    monkeypatch.setattr(transforms, "_dpo_producer_cache", (cache[0] - 1, *cache[1:]))
+    assert transforms.dpo_producer_identity(tokenizer, None, None) == expected
+    assert len(calls) == 3
+
+    tokenizer.encode = lambda text, add_special_tokens=True: [0, 0, 1]
+    with pytest.raises(ValueError, match="instance-overridden"):
+        transforms.dpo_producer_identity(tokenizer, None, None, force_refresh=True)
+    with pytest.raises(ValueError, match="instance-overridden"):
+        transforms.dpo_producer_identity(tokenizer, None, None)
+
+
+def test_dpo_producer_cache_does_not_mix_concurrent_producers():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from veomni.data.data_transform import dpo_producer_identity
+
+    class OtherTokenizer(Tokenizer):
+        dpo_unpadded_output_contract = True
+        dpo_unpadded_output_contract_id = "other-tokenizer-v1"
+
+    first, second = Tokenizer(), OtherTokenizer()
+    expected = [dpo_producer_identity(obj, None, None, force_refresh=True) for obj in (first, second)]
+
+    def read(index):
+        return index, dpo_producer_identity((first, second)[index], None, None)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for index, identity in pool.map(read, [0, 1] * 30):
+            assert identity == expected[index]
 
 
 def _state(sp_enabled=False, rank=0):

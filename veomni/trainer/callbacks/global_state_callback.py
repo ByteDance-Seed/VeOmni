@@ -935,7 +935,7 @@ class GlobalStateCallback(Callback):
                             not source.persistent_workers
                             or (weighted_epoch_source and dataset.supports_persistent_epoch_cold_resume)
                         )
-                        and (source.num_workers == 0 or source.in_order is True)
+                        and (source.num_workers == 0 or getattr(source, "in_order", None) is True)
                         and isinstance(cursor.get("dataloader_state"), dict)
                         and bool(cursor["dataloader_state"])
                     )
@@ -965,6 +965,36 @@ class GlobalStateCallback(Callback):
             from ...data.data_loader import DistributedDataloader
 
             raw_loader = loader._dataloader if type(loader) is DynamicBatchSizeDataLoader else loader
+            if (
+                not dpo_recovery
+                and type(raw_loader) is DistributedDataloader
+                and global_step > 0
+                and cursor is not None
+            ):
+                from torch.utils.data.distributed import DistributedSampler
+                from torchdata.stateful_dataloader.sampler import BatchSampler, StatefulDistributedSampler
+
+                if (
+                    type(raw_loader.batch_sampler) is BatchSampler
+                    and raw_loader.batch_sampler.sampler is raw_loader.sampler
+                    and raw_loader.generator is None
+                    and not isinstance(raw_loader.dataset, torch.utils.data.IterableDataset)
+                    and hasattr(raw_loader.batch_sampler, "next_yielded")
+                    and (
+                        type(raw_loader.sampler) is DistributedSampler
+                        or (
+                            type(loader) is DistributedDataloader
+                            and type(raw_loader.sampler) is StatefulDistributedSampler
+                            and raw_loader.num_workers > 0
+                            and args.train_steps > 0
+                            and global_step % args.train_steps == 0
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        "Exact resume with this torchdata BatchSampler cannot prove the saved epoch; "
+                        "use the locked torchdata 0.11 runtime"
+                    )
             if (
                 isinstance(raw_loader, DistributedDataloader)
                 and type(raw_loader) is not DistributedDataloader
@@ -1098,6 +1128,23 @@ class GlobalStateCallback(Callback):
             "restoring offline condition state",
         )
 
+        def supports_native_iterator_rebuild(loader):
+            from torch.utils.data.distributed import DistributedSampler
+            from torchdata.stateful_dataloader.sampler import BatchSampler, StatefulDistributedSampler
+
+            if type(loader) is not DistributedDataloader:
+                return False
+            if loader.generator is not None:
+                return False
+            if loader._weighted_resume_dataset is not None:
+                return True
+            return (
+                not isinstance(loader.dataset, torch.utils.data.IterableDataset)
+                and type(loader.sampler) in (DistributedSampler, StatefulDistributedSampler)
+                and type(loader.batch_sampler) is BatchSampler
+                and loader.batch_sampler.sampler is loader.sampler
+            )
+
         def restore_loader():
             loader = self.trainer.train_dataloader
             if dpo_new_epoch and isinstance(loader, DynamicBatchSizeDataLoader):
@@ -1108,6 +1155,7 @@ class GlobalStateCallback(Callback):
             if strict_sft and type(loader) is DynamicBatchSizeDataLoader:
                 loader._strict_resume_contract = True
             if not dpo_recovery and self.trainer.start_step:
+                from torch.utils.data.distributed import DistributedSampler
                 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 
                 from ...data.data_loader import DistributedDataloader
@@ -1116,6 +1164,9 @@ class GlobalStateCallback(Callback):
                     type(loader) is DynamicBatchSizeDataLoader
                     and type(loader._dataloader) is DistributedDataloader
                     and type(loader._dataloader.sampler) is StatefulDistributedSampler
+                ) or (
+                    supports_native_iterator_rebuild(loader)
+                    and type(loader.sampler) in (DistributedSampler, StatefulDistributedSampler)
                 ):
                     loader.set_epoch(self.trainer.start_epoch)
             if sft_next_epoch:
@@ -1141,6 +1192,12 @@ class GlobalStateCallback(Callback):
                     iter(loader)
                     prepare_resume_epoch()
                     loader.load_state_dict(cursor)
+                elif supports_native_iterator_rebuild(loader) and (
+                    self.trainer.start_step != 0 or (global_step == 0 and bool(cursor))
+                ):
+                    # The training loop must reuse the iterator rebuilt before
+                    # restoring the checkpoint's CPU RNG.
+                    loader.prime_restored_iterator()
 
         replay_group = None
         try:
@@ -1164,6 +1221,44 @@ class GlobalStateCallback(Callback):
             "restoring training meter",
         )
 
+        def prime_epoch_loader(*, native):
+            loader = self.trainer.train_dataloader
+            supported_native = supports_native_iterator_rebuild(loader)
+            if (
+                strict_sft
+                or dpo_recovery
+                or self.trainer.start_step != 0
+                or sft_next_epoch
+                or loader is None
+                or native != supported_native
+                or (native and global_step == 0 and not cursor)
+                or (native and global_step == 0 and loader._preloaded_resume_iterator is not None)
+                or (cursor is not None and getattr(loader, "_veomni_resume_iterator_prepared", False) is True)
+            ):
+                return
+            iter(loader)
+            if (
+                native
+                and global_step > 0
+                and cursor is not None
+                and type(loader) is DistributedDataloader
+                and not isinstance(loader.dataset, torch.utils.data.IterableDataset)
+            ):
+                from torchdata.stateful_dataloader.sampler import BatchSampler, StatefulDistributedSampler
+
+                if type(loader.batch_sampler) is BatchSampler and loader.batch_sampler.sampler is loader.sampler:
+                    # Loading the old iterator installs a lazy sampler cursor.
+                    # The training loop starts a new epoch, not that cursor.
+                    if type(loader.sampler) is StatefulDistributedSampler:
+                        loader.sampler.load_state_dict({"yielded": 0})
+                    # torchdata 0.9/0.10 additionally cache the old epoch's
+                    # batch-sampler cursor; 0.11 moved it to the iterator.
+                    if hasattr(loader.batch_sampler, "next_yielded"):
+                        loader.batch_sampler.next_yielded = 0
+
+        if not dpo_recovery:
+            restore_local(lambda: prime_epoch_loader(native=True), "initializing the native data iterator")
+
         def restore_rng():
             rng_state = global_state.get("torch_rng_state")
             if rng_state is not None:
@@ -1171,27 +1266,12 @@ class GlobalStateCallback(Callback):
             set_device_rng_state(global_state.get("device_rng_state"))
 
         restore_local(restore_rng, "restoring training RNG")
+        restore_local(lambda: prime_epoch_loader(native=False), "initializing the custom data iterator")
         if sft_next_epoch:
+            # The live loader now points at the next epoch. If train_end exports
+            # immediately without a step, serialize the original boundary
+            # cursor rather than overwriting it with an unconsumed new epoch.
             self._unadvanced_boundary_state = global_state
-        restore_local(
-            lambda: iter(self.trainer.train_dataloader)
-            if (
-                not strict_sft
-                and not dpo_recovery
-                and self.trainer.start_step == 0
-                and not sft_next_epoch
-                and self.trainer.train_dataloader is not None
-                # A stateful loader may already have started its restored
-                # iterator in load_state_dict. The training loop will call
-                # iter(loader); priming it here as well can discard its queue.
-                and (
-                    cursor is None
-                    or getattr(self.trainer.train_dataloader, "_veomni_resume_iterator_prepared", False) is not True
-                )
-            )
-            else None,
-            "initializing the restored data iterator",
-        )
 
         legacy_cursor_proven = True
         if legacy_checkpoints:

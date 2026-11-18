@@ -1034,6 +1034,276 @@ def _native_resume_trainer(loader, rank=0):
     )
 
 
+@pytest.mark.parametrize("workers,persistent", [(0, False), (2, False), (2, True)])
+@pytest.mark.parametrize("sampler_kind", ["stateful", "torch"])
+@pytest.mark.parametrize(
+    "phase", ["initial", "initial_with_cursor", "mid_epoch", "mid_epoch_later", "epoch_boundary", "exhausted_boundary"]
+)
+def test_native_plain_loader_resume_preserves_sample_order_and_cpu_rng(workers, persistent, sampler_kind, phase):
+    from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
+    from veomni.data.data_loader import DistributedDataloader
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    size = 4 if phase == "exhausted_boundary" else 8
+
+    def make_loader():
+        dataset = torch.utils.data.TensorDataset(torch.arange(size))
+        sampler_type = (
+            StatefulDistributedSampler
+            if sampler_kind == "stateful"
+            else torch.utils.data.distributed.DistributedSampler
+        )
+        sampler = sampler_type(dataset, num_replicas=1, rank=0, shuffle=True, seed=7)
+        options = {"multiprocessing_context": "fork", "prefetch_factor": 1} if workers else {}
+        return DistributedDataloader(
+            dataset,
+            sampler=sampler,
+            batch_size=1,
+            num_workers=workers,
+            persistent_workers=persistent,
+            snapshot_every_n_steps=1,
+            **options,
+        )
+
+    def close(loader):
+        iterator = loader._preloaded_resume_iterator or loader._iterator
+        if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+            iterator._shutdown_workers()
+
+    def trace(iterator):
+        return [(int(next(iterator)[0].item()), torch.rand(4)) for _ in range(2)]
+
+    torch.manual_seed(12345)
+    source = make_loader()
+    try:
+        source.set_epoch(2 if phase == "mid_epoch_later" else 0)
+        if phase in {"initial", "initial_with_cursor"}:
+            cursor = {} if phase == "initial" else source.state_dict()
+            saved_rng = torch.get_rng_state().clone()
+            iterator = iter(source)
+        else:
+            iterator = iter(source)
+            for _ in range(2 if phase.startswith("mid_epoch") else 4):
+                next(iterator)
+            if phase == "exhausted_boundary":
+                with pytest.raises(StopIteration):
+                    next(iterator)
+            cursor = source.state_dict()
+            saved_rng = torch.get_rng_state().clone()
+            if not phase.startswith("mid_epoch"):
+                source.set_epoch(1)
+                iterator = iter(source)
+        expected = trace(iterator)
+    finally:
+        close(source)
+
+    restored = make_loader()
+    try:
+        trainer = _native_resume_trainer(restored)
+        trainer.args.train_steps = 4
+        callback = GlobalStateCallback.__new__(GlobalStateCallback)
+        callback.trainer = trainer
+        callback._read_current = lambda _: {
+            "global_step": 0
+            if phase in {"initial", "initial_with_cursor"}
+            else 10
+            if phase == "mid_epoch_later"
+            else 2
+            if phase == "mid_epoch"
+            else 4,
+            "train_dataloader": cursor,
+            "torch_rng_state": saved_rng,
+            "device_rng_state": saved_rng,
+        }
+        if (hasattr(restored.batch_sampler, "next_yielded") and phase not in {"initial", "initial_with_cursor"}) and (
+            sampler_kind == "torch" or (workers and phase in {"epoch_boundary", "exhausted_boundary"})
+        ):
+            with pytest.raises(ValueError, match="cannot prove the saved epoch"):
+                callback.load_global_state()
+            return
+        callback.load_global_state()
+        assert torch.equal(torch.get_rng_state(), saved_rng)
+        restored.set_epoch(trainer.start_epoch)
+        actual = trace(iter(restored))
+        for (expected_id, expected_random), (actual_id, actual_random) in zip(expected, actual, strict=True):
+            assert actual_id == expected_id
+            torch.testing.assert_close(actual_random, expected_random, rtol=0, atol=0)
+    finally:
+        close(restored)
+
+
+def test_custom_loader_epoch_resume_initializes_after_rng_restoration():
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    class CustomLoader:
+        def __init__(self):
+            self.epoch = 0
+            self.iterator = None
+
+        def set_epoch(self, epoch):
+            if self.epoch != epoch:
+                self.epoch = epoch
+                self.iterator = None
+
+        def load_state_dict(self, state):
+            self.epoch = state["next_epoch"]
+            self.iterator = None
+
+        def __iter__(self):
+            if self.iterator is None:
+                self.iterator = iter([torch.rand(4)])
+            return self.iterator
+
+    torch.manual_seed(12345)
+    source = CustomLoader()
+    saved_rng = torch.get_rng_state().clone()
+    source.set_epoch(1)
+    expected = next(iter(source))
+    expected_rng = torch.get_rng_state().clone()
+
+    restored = CustomLoader()
+    trainer = _native_resume_trainer(restored)
+    trainer.args.train_steps = 4
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._read_current = lambda _: {
+        "global_step": 4,
+        "train_dataloader": {"next_epoch": 1},
+        "torch_rng_state": saved_rng,
+        "device_rng_state": saved_rng,
+    }
+    callback.load_global_state()
+    restored.set_epoch(trainer.start_epoch)
+    torch.testing.assert_close(next(iter(restored)), expected, rtol=0, atol=0)
+    assert torch.equal(torch.get_rng_state(), expected_rng)
+
+
+def test_custom_native_sampler_keeps_existing_mid_epoch_initialization_order():
+    from veomni.data.data_loader import DistributedDataloader
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    class CustomSampler(torch.utils.data.distributed.DistributedSampler):
+        def __init__(self, dataset):
+            super().__init__(dataset, num_replicas=1, rank=0, seed=7)
+            self.epoch_calls = 0
+
+        def set_epoch(self, epoch):
+            self.epoch_calls += 1
+            super().set_epoch(epoch)
+
+    def make_loader():
+        dataset = torch.utils.data.TensorDataset(torch.arange(40))
+        return DistributedDataloader(dataset, sampler=CustomSampler(dataset), batch_size=1, num_workers=0)
+
+    torch.manual_seed(12345)
+    source = make_loader()
+    source.set_epoch(2)
+    iterator = iter(source)
+    next(iterator)
+    next(iterator)
+    cursor = source.state_dict()
+    saved_rng = torch.get_rng_state().clone()
+    expected = next(iterator)[0]
+
+    restored = make_loader()
+    trainer = _native_resume_trainer(restored)
+    trainer.args.train_steps = 4
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._read_current = lambda _: {
+        "global_step": 10,
+        "train_dataloader": cursor,
+        "torch_rng_state": saved_rng,
+        "device_rng_state": saved_rng,
+    }
+    callback.load_global_state()
+    assert restored.sampler.epoch_calls == 0
+    restored.set_epoch(trainer.start_epoch)
+    assert restored.sampler.epoch_calls == 1
+    assert torch.equal(next(iter(restored))[0], expected)
+
+
+def test_native_loader_with_custom_generator_keeps_existing_initialization_order():
+    from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
+    from veomni.data.data_loader import DistributedDataloader
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    def make_loader():
+        dataset = torch.utils.data.TensorDataset(torch.arange(40))
+        sampler = StatefulDistributedSampler(dataset, num_replicas=1, rank=0, seed=7)
+        return DistributedDataloader(
+            dataset, sampler=sampler, batch_size=1, generator=torch.Generator().manual_seed(9)
+        )
+
+    torch.manual_seed(12345)
+    source = make_loader()
+    source.set_epoch(2)
+    iterator = iter(source)
+    next(iterator)
+    next(iterator)
+    cursor = source.state_dict()
+    saved_rng = torch.get_rng_state().clone()
+    expected = next(iterator)[0]
+
+    restored = make_loader()
+    generator_before = restored.generator.get_state().clone()
+    trainer = _native_resume_trainer(restored)
+    trainer.args.train_steps = 4
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._read_current = lambda _: {
+        "global_step": 10,
+        "train_dataloader": cursor,
+        "torch_rng_state": saved_rng,
+        "device_rng_state": saved_rng,
+    }
+    callback.load_global_state()
+    assert torch.equal(restored.generator.get_state(), generator_before)
+    restored.set_epoch(trainer.start_epoch)
+    assert torch.equal(next(iter(restored))[0], expected)
+    assert not torch.equal(restored.generator.get_state(), generator_before)
+
+
+def test_custom_generator_boundary_does_not_reset_sampler():
+    from unittest.mock import patch
+
+    from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
+    from veomni.data.data_loader import DistributedDataloader
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    def make_loader():
+        dataset = torch.utils.data.TensorDataset(torch.arange(40))
+        sampler = StatefulDistributedSampler(dataset, num_replicas=1, rank=0, seed=7)
+        return DistributedDataloader(
+            dataset, sampler=sampler, batch_size=1, generator=torch.Generator().manual_seed(9)
+        )
+
+    source = make_loader()
+    iterator = iter(source)
+    next(iterator)
+    next(iterator)
+    cursor = source.state_dict()
+    rng = torch.get_rng_state().clone()
+    restored = make_loader()
+    trainer = _native_resume_trainer(restored)
+    trainer.args.train_steps = 4
+    callback = GlobalStateCallback.__new__(GlobalStateCallback)
+    callback.trainer = trainer
+    callback._read_current = lambda _: {
+        "global_step": 4,
+        "train_dataloader": cursor,
+        "torch_rng_state": rng,
+        "device_rng_state": rng,
+    }
+    with patch.object(restored.sampler, "load_state_dict", wraps=restored.sampler.load_state_dict) as load:
+        callback.load_global_state()
+    assert load.call_count > 0
+    assert all(call.args[0]["yielded"] != 0 for call in load.call_args_list)
+
+
 def test_dynamic_resume_rejects_same_path_changed_dataset():
     from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback, _dynamic_resume_context
 
@@ -1219,6 +1489,106 @@ def test_dynamic_trainer_state_records_epoch_and_input_contract():
     assert state["train_dataloader"]["_veomni_resume_geometry"]["dataset_fingerprint"]
 
 
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("advance", [0, 1])
+def test_resave_before_first_resumed_step_keeps_sampler_cursor(dynamic, advance):
+    from types import SimpleNamespace
+
+    from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
+    from veomni.data.data_loader import DistributedDataloader
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback, _dynamic_resume_context
+
+    class Meter:
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, _):
+            pass
+
+    def make_loader():
+        if dynamic:
+            return _native_mapping_loader()
+        dataset = torch.utils.data.TensorDataset(torch.arange(24))
+        sampler = StatefulDistributedSampler(dataset, num_replicas=1, rank=0, shuffle=True, seed=7)
+        return DistributedDataloader(dataset, sampler=sampler, batch_size=1, num_workers=0)
+
+    def make_trainer(loader):
+        trainer = (
+            _native_resume_trainer(loader)
+            if dynamic
+            else SimpleNamespace(
+                args=SimpleNamespace(
+                    train=SimpleNamespace(global_rank=0, checkpoint=SimpleNamespace(load_path="/unused")),
+                    train_steps=4,
+                ),
+                state=SimpleNamespace(global_step=0, epoch=0),
+                train_dataloader=loader,
+                channel_loss_callback=None,
+                offline_cache_writer=None,
+            )
+        )
+        trainer.environ_meter = Meter()
+        return trainer
+
+    def restore(state):
+        loader = make_loader()
+        trainer = make_trainer(loader)
+        callback = GlobalStateCallback.__new__(GlobalStateCallback)
+        callback.trainer = trainer
+        callback._read_current = lambda _: copy.deepcopy(state)
+        callback.load_global_state()
+        return callback, trainer, loader
+
+    def sample_id(batch):
+        return int(batch[0][0]["id"]) if dynamic else int(batch[0].item())
+
+    torch.manual_seed(12345)
+    source = make_loader()
+    source.set_epoch(0)
+    iterator = iter(source)
+    next(iterator)
+    next(iterator)
+    rng = torch.get_rng_state().clone()
+    state = {
+        "global_step": 2,
+        "train_dataloader": copy.deepcopy(source.state_dict()),
+        "torch_rng_state": rng,
+        "device_rng_state": rng,
+    }
+    if dynamic:
+        state["_veomni_dynamic_context"] = _dynamic_resume_context(make_trainer(source).args, 0)
+    expected = [(sample_id(next(iterator)), torch.rand(2)) for _ in range(advance + 3)]
+    callback, first_trainer, first_restored = restore(state)
+    if advance:
+        first_restored.set_epoch(first_trainer.start_epoch)
+        assert sample_id(next(iter(first_restored))) == expected[0][0]
+        torch.testing.assert_close(torch.rand(2), expected[0][1], rtol=0, atol=0)
+        callback.on_step_begin(SimpleNamespace(global_step=3, epoch=0))
+    resaved = callback.state_dict(SimpleNamespace(global_step=2 + advance, epoch=0))
+    _, trainer, restored = restore(resaved)
+    restored.set_epoch(trainer.start_epoch)
+    iterator = iter(restored)
+    for expected_id, expected_rng in expected[advance:]:
+        assert sample_id(next(iterator)) == expected_id
+        torch.testing.assert_close(torch.rand(2), expected_rng, rtol=0, atol=0)
+
+
+def test_unrecognized_pending_sampler_snapshot_fails_closed(monkeypatch):
+    from torchdata.stateful_dataloader import StatefulDataLoader
+    from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
+    from veomni.data.data_loader import DistributedDataloader
+
+    dataset = torch.utils.data.TensorDataset(torch.arange(5))
+    sampler = StatefulDistributedSampler(dataset, num_replicas=1, rank=0)
+    loader = DistributedDataloader(dataset, sampler=sampler, batch_size=1, num_workers=0)
+    sampler.next_yielded = 2
+    monkeypatch.setattr(StatefulDataLoader, "state_dict", lambda _: {"_sampler_iter_state": {"sampler_state": {}}})
+    with pytest.raises(RuntimeError, match="unrecognized torchdata sampler snapshot"):
+        loader.state_dict()
+
+
 def test_non_sft_loader_retains_legacy_resume_path(monkeypatch):
     from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 
@@ -1388,6 +1758,16 @@ def test_dynamic_epoch_boundary_fresh_process_matches_uninterrupted(tmp_path, wo
         iterator = getattr(loader, "_data_iter", None)
         if iterator is not None and hasattr(iterator, "_shutdown_workers"):
             iterator._shutdown_workers()
+    if workers and not hasattr(loader._dataloader, "in_order"):
+        from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+        target = _native_mapping_loader(workers=workers)
+        callback = GlobalStateCallback.__new__(GlobalStateCallback)
+        callback.trainer = _native_resume_trainer(target)
+        callback._read_current = lambda _: saved
+        with pytest.raises(RuntimeError, match="Cannot safely restore dynamic batching at this epoch boundary"):
+            callback.load_global_state()
+        return
     mp.spawn(_fresh_native_epoch_resume, args=(str(checkpoint_path), str(result_path), workers), nprocs=1, join=True)
     assert torch.load(result_path, weights_only=False) == expected
 
