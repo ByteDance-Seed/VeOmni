@@ -1168,13 +1168,13 @@ def test_deepseek_v4_rms_norm_compiled_backward_matches_eager(compile_backend):
 
 def _model_with_ops(**ops_fields) -> nn.Module:
     """A model whose config carries the given ops selections, as the registry reads them."""
-    ops = SimpleNamespace(**{"linear_implementation": None, "swiglu_mlp_implementation": None, **ops_fields})
+    ops = SimpleNamespace(**{"linear_implementation": None, "gated_mlp_implementation": None, **ops_fields})
     model = nn.Linear(2, 2)
     model.config = SimpleNamespace(ops_config=ops, sub_configs={})
     return model
 
 
-@pytest.mark.parametrize("field", ["linear_implementation", "swiglu_mlp_implementation"])
+@pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
 def test_compile_rejects_torchao_mxfp4(field):
     """MXTensor emits float8_e8m0fnu scales, which Inductor has no lowering for."""
     from veomni.distributed.torch_compile import _reject_incompatible_ops
@@ -1190,7 +1190,7 @@ def test_compile_rejects_torchao_mxfp4(field):
         {"linear_implementation": "eager"},
         {"linear_implementation": "qat"},
         {"linear_implementation": "torchao_nvfp4"},
-        {"swiglu_mlp_implementation": "torchao_nvfp4"},
+        {"gated_mlp_implementation": "torchao_nvfp4"},
     ],
 )
 def test_compile_allows_other_rows(ops_fields):
@@ -1212,7 +1212,7 @@ def test_compile_rejection_walks_sub_configs():
     from veomni.distributed.torch_compile import _uncompilable_at
 
     def ops(lin=None):
-        return SimpleNamespace(linear_implementation=lin, swiglu_mlp_implementation=None)
+        return SimpleNamespace(linear_implementation=lin, gated_mlp_implementation=None)
 
     child_only = SimpleNamespace(ops_config=ops(lin="torchao_mxfp4"), sub_configs={})
     root = SimpleNamespace(ops_config=ops(lin="eager"), sub_configs={"text_config": None}, text_config=child_only)

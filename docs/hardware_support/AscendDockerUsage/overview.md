@@ -43,28 +43,20 @@ All image tags follow this pattern:
 
 | Chip Series | Architecture | Tag Example | Dockerfile |
 |---|---|---|---|
-| 910B (A2) | amd64 + arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni` | [x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86) / [arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm) |
-| A3 | arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.12-veomni` | [a3](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_a3) |
+| Atlas A2 training products | amd64 + arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni` | [x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86) / [arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm) |
+| Atlas A3 training products | arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.12-veomni` | [Atlas A3 training products](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_a3) |
+| Ascend 950PR&950DT products | arm64 | `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-a5-ubuntu22.04-py3.12-veomni` | [Ascend 950PR&950DT products](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_a5) |
 
 For the complete list of published image tags, see [Ascend Docker Supported Tags](supported_tags.md).
 
 Notes:
 
-- **A2 (910B)** ships two Dockerfiles (x86 and arm64); CI merges them into a single multi-arch image sharing one tag.
-- **A3** is arm64 only.
+- **Atlas A2 training products** ships two Dockerfiles (x86 and arm64); CI merges them into a single multi-arch image sharing one tag.
+- **Atlas A3 training products** is arm64 only.
+- **Ascend 950PR&950DT products** is arm64 only, using CANN 9.2.1.
 - The historical `8.3.rc2` Dockerfiles (`Dockerfile.ascend_8.3.rc2_a2.x86/.arm/a3`) remain in the repo but are no longer published.
 
 ---
-
-## CANN 9.2.1
-
-CANN 9.2.1 Dockerfiles cover A2 x86/ARM64 and A3 ARM64. All three use
-system Python and include a uv cache and development dependencies. See the
-[A2 guide](build_a2_docker.md), [A3 guide](build_a3_docker.md), and
-[publication status](supported_tags.md#cann-921-pending-quay-publication).
-The existing A2/A3 builders select the CANN 9.2.1 Dockerfiles. See the
-[build and publication rules](overview.md#build-and-publication-workflows).
-NPU test workflows retain their existing environment.
 
 ## Quick Start
 
@@ -77,10 +69,10 @@ An Ascend NPU driver compatible with the container's CANN version must be instal
 Pull the image from quay.io and run it:
 
 ```bash
-# 910B (A2), multi-arch
+# Atlas A2 training products, multi-arch
 docker pull quay.io/ascend/veomni:v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni
 
-# A3
+# Atlas A3 training products
 docker pull quay.io/ascend/veomni:v0.1.11-cann9.1.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.12-veomni
 ```
 
@@ -104,8 +96,9 @@ docker run --runtime=runc -it \
 
 For complete, advanced mount and training configuration (checkpoint / dataset mounts, training command examples) per platform, see:
 
-- [build_a2_docker.md](build_a2_docker.md) — A2 (910B) build and usage
-- [build_a3_docker.md](build_a3_docker.md) — A3 build and usage
+- [build_a2_docker.md](build_a2_docker.md) — Atlas A2 training products build and usage
+- [build_a3_docker.md](build_a3_docker.md) — Atlas A3 training products build and usage
+- [build_a5_docker.md](build_a5_docker.md) — Ascend 950PR&950DT products build and usage
 
 ---
 
@@ -113,8 +106,9 @@ For complete, advanced mount and training configuration (checkpoint / dataset mo
 
 Starting from a CANN base image, build locally with the in-repo Dockerfiles. For build commands, proxy configuration, and per-platform details, see:
 
-- [build_a2_docker.md](build_a2_docker.md) (CANN 9.2.1 uses system Python on both architectures; older images differ)
+- [build_a2_docker.md](build_a2_docker.md) (x86 uses uv, arm uses pip — two environments)
 - [build_a3_docker.md](build_a3_docker.md)
+- [build_a5_docker.md](build_a5_docker.md)
 
 ---
 
@@ -150,68 +144,3 @@ When running containers with these images, be aware of the following security ri
 The CANN and MindSeries software included in these images is subject to their own licenses; see the [Ascend CANN community license information](https://www.hiascend.com/software/cann/community). The VeOmni framework's license is in its [GitHub repository](https://github.com/ByteDance-Seed/VeOmni).
 
 As with all container images, the pre-installed packages (Python, system libraries, etc.) may be subject to their own licenses.
-
-## Build and publication workflows
-
-The existing Ascend workflows build CANN 9.2.1 images and publish to
-`quay.io/ascend/veomni`:
-
-| Workflow | Platforms | Image tag on `main` |
-| --- | --- | --- |
-| [A2 builder](../../../.github/workflows/docker-build-ascend-a2.yml) | `linux/amd64`, `linux/arm64` | `veomni-9.2.1-910b-ubuntu22.04-py3.12-latest` |
-| [A3 builder](../../../.github/workflows/docker-build-ascend-a3.yml) | `linux/arm64` | `veomni-9.2.1-a3-ubuntu22.04-py3.12-latest` |
-
-Both support manual dispatch, published releases and path-filtered pushes to
-`main`. A2 watches its workflow and both CANN 9.2.1 A2 Dockerfiles, builds
-on native x86 and ARM runners, and merges the digests into a multi-architecture
-image. A3 watches its workflow and the CANN 9.2.1 A3 Dockerfile.
-Release builds retain the existing release-tag and `.postN` naming scheme.
-Upstream publication runs under the `ByteDance-Seed` owner using the existing
-Quay credentials. Build jobs are restricted to the `ByteDance-Seed` owner.
-
-## Validation scope
-
-The builders construct and publish images, including the Dockerfiles'
-package-version and import checks. They do not run NPU numerical tests. The existing NPU unit/e2e workflows retain their upstream
-image and dependency setup; they do not validate these CANN 9.2.1 images.
-
-Device validation remains a local procedure. Keep its scripts, logs and
-environment-specific patches outside the committed source tree. Record the
-exact image, architecture and package versions when interpreting results;
-results from a modified local image do not validate a different Dockerfile.
-
-An image's preinstalled system packages are separate from the project
-environment created by `uv sync`. Local validation must explicitly select
-which environment it tests. Any wheel overlays applied after synchronization
-are additional environment changes, not part of the lockfile alone.
-
-## uv cache included in the image
-
-The CANN 9.2.1 Dockerfiles set `UV_CACHE_DIR=/opt/veomni/uv-cache` and
-populate it with `uv sync --frozen` for their hardware extra and the `dev`
-group. A disposable virtual environment is removed after warming the cache;
-the existing system Python installation remains the runtime environment.
-The cache is stored in the image layer, outside `/app`, rather than in a
-BuildKit cache mount, so mounting a new source checkout does not hide it.
-
-The warm-up also installs ninja, pybind11 and the target's Triton packages
-through uv. A2 x86 additionally caches Triton-Ascend 3.2.1 from the Huawei
-index used by the existing upstream workflow. This cache-only installation
-does not change the image's runtime Triton-Ascend version.
-
-Reuse requires the same architecture, compatible Python version, dependency
-versions and package sources. Changing the lockfile or index, overriding
-`UV_CACHE_DIR`, or installing an uncached package can still require network
-access. The cache increases image size and build time; it does not guarantee
-that every future dependency installation is offline.
-
-The complete locked `dev` group is also exported with `uv export --frozen`
-and installed with `uv pip` into the image's default Python. This includes
-patchgen, pytest and the lint tools; builds check patchgen imports and its CLI.
-The editable patchgen installation uses `/app/patchgen-pkg`. If a different
-checkout replaces `/app`, run `uv sync` in that checkout to recreate its project
-environment. A fresh CI venv still needs its own `uv sync --group dev`;
-the image cache accelerates installation but does not replace synchronization.
-All three runtime images pin Triton-Ascend to 3.2.2 and assert its version at
-build time. The upstream CI's explicit Triton-Ascend 3.2.1 installation remains
-an independent override; using that workflow does not test the image's 3.2.2.

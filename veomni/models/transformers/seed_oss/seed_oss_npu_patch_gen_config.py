@@ -63,12 +63,12 @@ config.override_method(
 config.override_method(
     "SeedOssMLP.__init__",
     replacement=seed_oss_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 config.override_method(
     "SeedOssMLP.forward",
     replacement=seed_oss_mlp_forward_patched,
-    description="Always call the local swiglu_mlp VeomniOp, then residual dropout",
+    description="Always call the local gated_mlp VeomniOp, then residual dropout",
 )
 config.override_method(
     "SeedOssDecoderLayer.__init__",

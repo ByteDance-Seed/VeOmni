@@ -151,11 +151,26 @@ class TrainingMixin(TrainingModuleMixin):
         deepstack_features: List[torch.Tensor],
         image_grid_thw: torch.Tensor,
     ) -> Dict[str, Any]:
-        if get_parallel_state().sp_size > 1:
+        ps = get_parallel_state()
+        conversation = self._conversation_carrier
+        output_slots = self._visual_output_slots
+        self._conversation_carrier = None
+        self._visual_output_slots = None
+        if ps.sp_size > 1:
+            if ps.skip_sp_gather_between_modules:
+                self._sp_own_len = None
+                scatter_qwen3vl_visual_embeds(
+                    output_slots,
+                    image_embeds,
+                    deepstack_features,
+                    sp_rank=ps.sp_rank,
+                    sp_size=ps.sp_size,
+                )
+                return {"conversation_list": conversation}
             # SP output-gather: all-gather Ulysses shards of merged tokens (+
             # deepstack) back to the full sequence (autograd-aware; backward sums
             # grads across the SP group), then drop the sp-pad tail.
-            group = get_parallel_state().sp_group
+            group = ps.sp_group
 
             def _gather(t: torch.Tensor) -> torch.Tensor:
                 t = gather_outputs(t, gather_dim=0, group=group)
@@ -163,11 +178,8 @@ class TrainingMixin(TrainingModuleMixin):
 
             image_embeds = _gather(image_embeds)
             deepstack_features = [_gather(layer) for layer in deepstack_features]
+            self._sp_own_len = None
 
-        conversation = self._conversation_carrier
-        output_slots = self._visual_output_slots
-        self._conversation_carrier = None
-        self._visual_output_slots = None
         # forward returns merged tokens in slot order (real or dummy alike); scatter
         # them back onto the originating items.
         scatter_qwen3vl_visual_embeds(output_slots, image_embeds, deepstack_features)

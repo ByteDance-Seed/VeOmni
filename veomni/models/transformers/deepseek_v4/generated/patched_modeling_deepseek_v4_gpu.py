@@ -58,9 +58,9 @@
 #    - method_override: DeepseekV4SparseMoeBlock.__init__
 #      Flag routed experts to use the conservative max_M bound under non-distinct hash routing
 #    - method_override: DeepseekV4MLP.__init__
-#      Construct a local swiglu_mlp VeomniOp
+#      Construct a local gated_mlp VeomniOp
 #    - method_override: DeepseekV4MLP.forward
-#      Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules
+#      Call the gated_mlp row, which picks fused weights or the projection modules
 #    - method_override: DeepseekV4TopKRouter.forward
 #      Match the official DeepSeek-V4 FP32 router projection
 #    - method_override: DeepseekV4HashRouter.forward
@@ -135,7 +135,6 @@ from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs, MoeModelOutputWithIndexerKL
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
@@ -1647,26 +1646,13 @@ class DeepseekV4MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
         self.limit = config.swiglu_limit
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+        self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # One call covers every row: the quantizing rows fake-quantize the weights
-        # they are handed, and the clamp stays in the model dtype either way. The
-        # selection lives on the op, so this forward has no recipe to branch on.
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-            return self.veomni_swiglu_mlp(
-                x,
-                self.gate_proj.weight,
-                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                self.up_proj.weight,
-                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-                self.down_proj.weight,
-                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-                swiglu_limit=self.limit,
-            )
-        gate = self.gate_proj(x).float().clamp(max=self.limit)
-        up = self.up_proj(x).float().clamp(min=-self.limit, max=self.limit)
-        return self.down_proj((self.act_fn(gate) * up).to(x.dtype))
+        # The clamp is this model's own: it rides on the call, and every row applies it
+        # before the activation. The activation rides along too, so the row that serves
+        # the model is the only one that has to know what "served" means.
+        return self.veomni_gated_mlp(self, x, swiglu_limit=self.limit, activation=self.config.hidden_act)
 
 
 # ======================================================================
@@ -1696,7 +1682,7 @@ class DeepseekV4Experts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
+        self.use_swiglu = config.hidden_act in {"silu", "swish"}
         self.limit = config.swiglu_limit
         # Per-expert grouped-GEMM ``max_M`` launch bound selector. Defaults to
         # the conservative ``T * top_k`` (``assume_distinct_experts`` False):
@@ -1722,7 +1708,7 @@ class DeepseekV4Experts(nn.Module):
         # argument rather than part of the implementation name.
         down_proj = self.down_proj
         gate_up_proj = self.gate_up_proj
-        if not self.use_swiglu_mlp:
+        if not self.use_swiglu:
             # The act_fn loop does not use grouped-GEMM ``max_M``, so it cannot go
             # through the family row: the fused kernel bakes SiLU into both its
             # forward and its backward, so a different activation has no fused row
