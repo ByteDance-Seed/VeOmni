@@ -1782,12 +1782,13 @@ class TestExtraStateSaveLoad:
         DistributedCheckpointer._save_extra_state(str(tmp_path), {"model": MagicMock()})
         DistributedCheckpointer._load_extra_state(str(tmp_path), {"model": MagicMock()})
 
-    def test_load_missing_file_keeps_state_empty(self, mock_dist, tmp_path):
+    def test_load_missing_requested_extra_state_fails(self, mock_dist, tmp_path):
         mock_dist.is_initialized.return_value = False
         from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 
         state = {"extra_state": {}}
-        DistributedCheckpointer._load_extra_state(str(tmp_path), state)
+        with pytest.raises(FileNotFoundError):
+            DistributedCheckpointer._load_extra_state(str(tmp_path), state)
         assert state["extra_state"] == {}
 
 

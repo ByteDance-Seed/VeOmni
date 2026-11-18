@@ -76,60 +76,36 @@ def _fields(optimizer, accelerator, checkpoint):
 
 
 def establish(optimizer, accelerator, checkpoint, *, owner=None):
-    """Agree the file profile on every WORLD rank before optimizer branching."""
+    """Validate the file profile before optimizer branching on WORLD ranks."""
     global _receipt
     _receipt = None
-    error = None
+    result, error = None, None
     try:
         requested = bool(_requested(optimizer))
+        if not dist.is_initialized() and requested and int(os.environ.get("WORLD_SIZE", "1")) > 1:
+            raise RuntimeError("Distributed PLE file preflight requires an initialized WORLD process group")
+        if requested:
+            kind, world_profile, scratch, save_async, manager, opt, geometry = _fields(
+                optimizer, accelerator, checkpoint
+            )
+            if kind != "qwen38_muon" or not world_profile or not scratch or save_async or manager != "dcp":
+                raise ValueError(
+                    "PLE file profile requires Qwen Muon, full-world participation, local scratch and synchronous DCP"
+                )
+            result = _Receipt(
+                os.getpid(),
+                dist.group.WORLD if dist.is_initialized() else None,
+                None if owner is None else id(owner),
+                opt,
+                geometry,
+                save_async,
+                manager,
+            )
     except Exception as exc:
-        requested, error = False, f"{type(exc).__name__}: {exc}"
-    if not dist.is_initialized() and requested and int(os.environ.get("WORLD_SIZE", "1")) > 1:
-        raise RuntimeError("Distributed PLE file preflight requires an initialized WORLD process group")
-    payload = (requested, error)
-    if dist.is_initialized():
-        values = [None] * dist.get_world_size()
-        dist.all_gather_object(values, payload)
-    else:
-        values = [payload]
-    if any(item[1] is not None for item in values):
-        raise ValueError(f"Could not inspect PLE optimizer profile on all ranks: {values}")
-    if not any(item[0] for item in values):
-        return None
-
-    # Unrelated optimizers may carry custom, non-JSON-serializable options.
-    # Only inspect the full contract after at least one rank requests this
-    # opt-in profile, while keeping the same collectives on every WORLD rank.
-    error = None
-    try:
-        local = _fields(optimizer, accelerator, checkpoint)
-    except Exception as exc:
-        local, error = None, f"{type(exc).__name__}: {exc}"
-    payload = (local, error)
-    if dist.is_initialized():
-        values = [None] * dist.get_world_size()
-        dist.all_gather_object(values, payload)
-    else:
-        values = [payload]
-    if any(item[1] is not None for item in values):
-        raise ValueError(f"Could not inspect PLE optimizer profile on all ranks: {values}")
-    signatures = [item[0] for item in values]
-    if any(sig != signatures[0] for sig in signatures[1:]):
-        raise ValueError("PLE file optimizer profile differs across WORLD ranks")
-    kind, world_profile, scratch, save_async, manager, opt, geometry = signatures[0]
-    if kind != "qwen38_muon" or not world_profile or not scratch or save_async or manager != "dcp":
-        raise ValueError(
-            "PLE file profile requires Qwen Muon, full-world participation, local scratch and synchronous DCP"
-        )
-    result = _Receipt(
-        os.getpid(),
-        dist.group.WORLD if dist.is_initialized() else None,
-        None if owner is None else id(owner),
-        opt,
-        geometry,
-        save_async,
-        manager,
-    )
+        error = exc
+    # All ranks use the same configuration; coordinate real inspection errors
+    # before any rank enters optimizer construction.
+    raise_if_any_rank_failed(error, "inspecting the PLE optimizer profile")
     if owner is not None:
         _receipt = result
     return result
@@ -197,7 +173,6 @@ def validate_before_build(optimizer, accelerator, checkpoint, receipt, *, model_
     except Exception as exc:
         error = exc
     raise_if_any_rank_failed(error, "validating the PLE optimizer job profile")
-    require_same_rank_value(local, "PLE optimizer job profile")
 
 
 def validate_constructor(scratch, world_profile, receipt, permit):

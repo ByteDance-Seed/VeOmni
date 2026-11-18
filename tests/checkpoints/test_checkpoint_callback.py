@@ -465,13 +465,20 @@ class TestModelCheckpointManagerSaveContract:
         runtime.train_args.checkpoint.load_path = "/tmp/ckpt"
         mock_checkpointer = MagicMock()
         mock_build_ckpt.return_value = mock_checkpointer
+        scheduler_state = {"last_epoch": 7}
+
+        def load(_path, state, **_kwargs):
+            state["extra_state"]["lr_scheduler"] = scheduler_state
+
+        mock_checkpointer.load.side_effect = load
 
         manager = ModelCheckpointManager(runtime)
         manager.load()
 
         loaded = mock_checkpointer.load.call_args.args[1]
-        assert loaded["extra_state"] == {}
+        assert loaded["extra_state"] == {"lr_scheduler": scheduler_state}
         assert loaded["optimizer"] is runtime.optimizer
+        runtime.lr_scheduler.load_state_dict.assert_called_once_with(scheduler_state)
         assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is runtime.parallel_state
 
     def test_save_lora_writes_the_adapter_to_its_own_export_dir(
@@ -815,8 +822,8 @@ class TestGlobalStateCallbackJobState:
         assert trainer.state.global_step == 0
 
     @patch("veomni.trainer.callbacks.global_state_callback.get_device_type", return_value="cpu")
-    def test_load_skips_when_any_rank_is_missing_state(self, mock_device, mock_dist, tmp_path):
-        """A missing cursor on one rank must not leave the others at a different step."""
+    def test_load_rejects_when_any_rank_is_missing_state(self, mock_device, mock_dist, tmp_path):
+        """A missing cursor must not reuse an optimizer at a different step."""
         mock_dist.is_initialized.return_value = True
 
         def drop_presence(flag, op=None, group=None):
@@ -842,7 +849,8 @@ class TestGlobalStateCallbackJobState:
         )
 
         cb = GlobalStateCallback(trainer)
-        assert cb.load_global_state() is None
+        with pytest.raises(RuntimeError, match="Trainer state is missing"):
+            cb.load_global_state()
         trainer.channel_loss_callback.load_state_dict.assert_not_called()
         assert trainer.state.global_step == 0
         assert mock_dist.all_reduce.call_count == 3
@@ -854,7 +862,7 @@ class TestGlobalStateCallbackJobState:
         The pre-split layouts kept it in ``extra_state_rank_{R}.pt`` and
         ``trainer_state_rank_{R}.pt``. Both are gone with
         ``veomni/checkpoint/legacy_v0_1_12.py``: the step has no current-layout
-        cursor, so a resume falls back to weights only rather than restoring a
+        cursor, so an optimizer resume is rejected rather than restoring a
         step counter from a shape nothing writes any more.
         """
         mock_dist.is_initialized.return_value = False
@@ -871,5 +879,16 @@ class TestGlobalStateCallbackJobState:
         torch.save({"global_step": 9, "torch_rng_state": torch.get_rng_state()}, tmp_path / "trainer_state_rank_0.pt")
 
         cb = GlobalStateCallback(trainer)
-        assert cb.load_global_state() is None
+        with pytest.raises(RuntimeError, match="Trainer state is missing"):
+            cb.load_global_state()
+        assert trainer.state.global_step == 0
+
+    def test_missing_cursor_allows_a_genuine_weights_only_runtime(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.model = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
+        trainer.train_dataloader = None
+
+        assert GlobalStateCallback(trainer).load_global_state() is None
         assert trainer.state.global_step == 0

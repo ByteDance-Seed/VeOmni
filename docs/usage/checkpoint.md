@@ -53,7 +53,8 @@ share an allocation. It does not prove aliasing through independently imported
 shared mappings, empty allocations or external accelerator storage. Recognized
 file-backed model storage and externally mapped storage are not detected
 reliably and must not be used for model aliases. Lazy conjugate/negative model
-views, quantized, non-strided and meta model tensors are rejected.
+views are unsupported and must not be used. Quantized, non-strided and meta
+model tensors are rejected.
 File-backed optimizer moments are separate and are not restricted here.
 
 ## What each path holds
@@ -361,6 +362,12 @@ differs from the restored optimizer stops resume before training. An older
 unversioned sidecar requires a verified migration or a fresh weights-only run;
 it is not silently combined with a restored optimizer and scheduler. Matching
 step and generation alone do not prove exact dataloader or RNG recovery.
+For ordinary optimizers as well, resume fails if any rank is missing trainer
+state or a required RNG state, or if a completed-step checkpoint lacks the
+cursor for an active dataloader. This prevents restoring optimizer state while
+restarting the data, random stream or step counter. To start from weights only,
+use a model-only load without an optimizer rather than a training checkpoint
+resume.
 If a restored run has not established a same-step save receipt, an immediate
 export to the already completed step fails rather than overwriting that DCP.
 
@@ -373,6 +380,7 @@ not a sandbox or a proof about arbitrary Python code. Unregistered schedulers
 and checkpoints carrying only the older callable-hash identity require a
 verified migration or a new weights-only run. Scheduler step, optimizer group
 identity and checkpoint generation remain checked independently.
+See [custom scheduler checkpoint recipes](checkpoint_scheduler_recipes.md) for the registration contract and example.
 
 ```python
 from veomni.optim.lr_scheduler import register_checkpoint_scheduler
@@ -381,11 +389,10 @@ register_checkpoint_scheduler(scheduler, name="my.schedule", version=1,
                               parameters={"warmup_steps": 100})
 ```
 
-Unrecognized instance-level `state_dict` replacements on optimizer leaves are
-rejected: a wrapper could otherwise renumber parameter IDs after capture and
-silently assign the wrong learning rate. Known PyTorch DCP wrappers are allowed.
-Optimizer class implementations and registered state-dict hooks are trusted to
-preserve their declared parameter mapping and update semantics.
+Optimizer class implementations, instance-level `state_dict` wrappers and
+registered hooks are trusted to preserve parameter IDs, group mappings and
+update semantics. A wrapper that changes the serialized mapping needs a
+matching, validated restore implementation for exact continuation.
 
 With `stage_dir` the model half waits: a staged save has overwritten nothing
 until the copy to the destination, so it invalidates the destination there
@@ -474,9 +481,16 @@ export as a fresh run.
 
 A split-layout checkpoint containing only `model/[<module>/]lr_scheduler.pt`
 can pass marker discovery even when the per-rank model sidecars are missing.
-The current loader skips missing sidecars; the default runtime then keeps its
-initialized scheduler rather than restoring the saved schedule. Do not continue
-training assuming that discovery proves scheduler restoration.
+The training loader rejects a missing or unreadable requested sidecar. Optimizer
+continuation requires an explicit `lr_scheduler` entry, including `None` when
+no scheduler was used. A target scheduler requires a state mapping. Native
+`LambdaLR` also checks its required fields; custom schedulers are responsible
+for validating their own state schemas. Continuing an optimizer with a saved
+scheduler but no target scheduler is
+rejected. An older loader may instead keep its initialized scheduler, so
+discovery alone does not prove that the schedule was restored. A model-only
+load that does not request `extra_state`
+does not require this sidecar.
 
 For such a checkpoint, resume with the compatible revision/environment that
 wrote and reads that scheduler layout, and verify the restored step and learning
@@ -619,11 +633,9 @@ partial placements, or any active ExtraParallel dimension remain unproven.
 All ranks in a checkpoint operation must use the same logical model and
 checkpoint configuration, including the layout version and corresponding
 sharding specifications. Normal rank-local shard contents and mesh coordinates
-may differ. When any rank enables the canonical v2 layout, a preflight compares
-the v2 flag, shard specifications, optimizer presence and trainable-only
-selection before any checkpoint is modified. This is not a complete proof of
-all runtime provenance or replica equality. Legacy-only configurations still
-rely on agreement as an input contract. Rank-local layout validation errors are
+may differ. All ranks must use the same v2 flag, shard specifications, optimizer presence
+and trainable-only selection. This is an input contract, not a proof of runtime
+provenance or replica equality. Rank-local layout validation and I/O errors are
 propagated to peers.
 
 Raw `torch.distributed.checkpoint.load(..., planner=DefaultLoadPlanner(allow_partial_load=True))` is not a
