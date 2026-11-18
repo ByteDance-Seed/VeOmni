@@ -227,23 +227,6 @@ class JanusChatTemplate(TextEncoderChatTemplate):
         )
         return out
 
-    def image_span_start_ids(self) -> list[int]:
-        """Token ids that open a generated image span, in *training* order.
-
-        A training sample renders ``<|Assistant|>: <boi>`` — the separator belongs
-        to the first span of the response, and for a text-to-image turn that span
-        *is* the image. ``apply_generation_prompt`` stops at the bare marker
-        (matching upstream's ``{%if add_generation_prompt%}<|Assistant|>:{%endif%}``),
-        so the separator is emitted as part of the generation prompt and this is
-        just ``<boi>``.
-
-        Keeping the separator out of this list matters: the CFG bookkeeping in
-        :meth:`~.modeling.emit_image_start` counts the span's own tokens to place
-        the unconditional branch, and a two-token span would need that arithmetic
-        changed too.
-        """
-        return [self.boi_token_id]
-
     def render_template_string(self, parts: list[ConversationItem]) -> str:
         """
         For debug or demo.

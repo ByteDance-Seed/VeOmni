@@ -510,3 +510,49 @@ def test_a_generation_prompt_ends_with_the_training_separator():
         base(rendered, add_special_tokens=False)["input_ids"][-1]
         == base(" ", add_special_tokens=False)["input_ids"][0]
     )
+
+
+@_CPU
+def test_emit_image_start_feeds_one_embedding_row_to_the_backbone():
+    """``emit_image_start`` must hand the backbone a ``(1, H)`` row, not ``(1, 1, H)``.
+
+    ``_token_id_tensor`` builds ``[[token]]``, so passing it a *list* would nest one
+    dimension too many and ``encode`` would return ``(1, 1, H)``; the cached Llama
+    path unsqueezes again and the first image step fails. The row is the `<boi>`
+    embedding alone — the assistant separator already sits in the prompt.
+    """
+    import torch
+
+    from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import JanusChatTemplate
+
+    text_encoder = OMNI_ACCELERATED_MODEL_REGISTRY["janus_text_encoder"]()(
+        OMNI_CONFIG_REGISTRY["janus_text_encoder"]()(
+            vocab_size=32,
+            hidden_size=16,
+            tie_word_embeddings=False,
+            lm_head_bias=False,
+            ops_implementation=make_eager_ops_config(),
+        )
+    )
+
+    class _Tokenizer:
+        bos_token = "<s>"
+        eos_token = "</s>"
+        boi_token = "<begin_of_image>"
+        eoi_token = "<end_of_image>"
+        bos_token_id = 0
+        eos_token_id = 1
+        boi_token_id = 4
+        eoi_token_id = 5
+        pad_token_id = 0
+
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [ord(c) for c in text]}
+
+    text_encoder._chat_template = JanusChatTemplate(_Tokenizer())
+
+    priming = ConversationItem(type="output", value=torch.zeros(1, 16), role="assistant")
+    out = text_encoder.emit_image_start(conversation_list=[priming])
+    value = out["conversation_list"][-1].value
+
+    assert value.shape == (1, 16), f"emit_image_start produced {tuple(value.shape)}, expected (1, H)"

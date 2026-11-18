@@ -75,8 +75,11 @@ class JanusTextEncoder(TextEncoder):
         conversation_list.pop()
         # The prompt already ends with ``<|Assistant|>: `` (see
         # ``apply_generation_prompt``), so the span opens at ``<boi>`` exactly where
-        # a training sample does.
-        input_ids = self._token_id_tensor(self._chat_template.image_span_start_ids())
+        # a training sample does. One token here, not the separator as well: the
+        # separator is already in the prompt, and ``_token_id_tensor`` builds a
+        # ``(1, 1)`` id tensor — handing it a list would nest one dimension too
+        # many and the backbone would receive a 3-D embedding.
+        input_ids = self._token_id_tensor(self._chat_template.boi_token_id)
         inputs_embeds = self.encode(input_ids)["inputs_embeds"]
         cfg_uncond_inputs_embeds = self._maybe_arm_cfg_for_image_gen(
             conversation_list,
