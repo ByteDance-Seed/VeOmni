@@ -12,6 +12,7 @@ import torch
 from .......distributed.parallel_state import get_parallel_state
 from .......distributed.sequence_parallel import gather_outputs, sp_pad_and_slice
 from .....mixins.base_mixin import BaseMixin
+from .....mixins.data_balance_mixin import DataBalanceMixin, DataBalanceSpec, ItemTensorField, ModuleStructure
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem, iter_desired_items
@@ -106,6 +107,11 @@ class TrainingMixin(TrainingModuleMixin):
             spatial_merge_size=merge,
         )
         self._visual_output_slots = output_slots
+        if grid_thw is not None:
+            pixel_values, grid_thw, balanced = self._balance_vision_inputs("forward", pixel_values, grid_thw)
+            # A dummy owner can receive real items; encode the routed contents,
+            # never short-circuit based on the original owner's dummy flag.
+            dummy = dummy and not balanced
         # ViT metadata (cu_seqlens). ``build_qwen3vl_vit_metadata`` itself appends the sp-pad
         # tail segment when SP is enabled, so it matches the sliced patches below.
         vit_metadata = build_qwen3vl_vit_metadata(grid_thw.tolist(), merge) if grid_thw is not None else None
@@ -164,6 +170,10 @@ class TrainingMixin(TrainingModuleMixin):
             image_embeds = _gather(image_embeds)
             deepstack_features = [_gather(layer) for layer in deepstack_features]
 
+        restored = self.data_balance_post(
+            "forward", {"image_embeds": image_embeds, "deepstack_features": deepstack_features}
+        )
+        image_embeds, deepstack_features = restored["image_embeds"], restored["deepstack_features"]
         conversation = self._conversation_carrier
         output_slots = self._visual_output_slots
         self._conversation_carrier = None
@@ -182,6 +192,37 @@ class TrainingMixin(TrainingModuleMixin):
         image_grid_thw = torch.tensor([[t, h, w]], dtype=torch.long, device=self.device)
         vit_metadata = build_qwen3vl_vit_metadata([[t, h, w]], merge)
         return {"pixel_values": pixel_values, "image_grid_thw": image_grid_thw, "vit_metadata": vit_metadata}
+
+
+class BalanceMixin(DataBalanceMixin):
+    """Qwen owns only its item schema; routing and inverse live on the shared mixin."""
+
+    _vision_balance_spec = DataBalanceSpec(
+        fields=(ItemTensorField("pixel_values", "patch_lengths"), ItemTensorField("image_grid_thw", "item_lengths")),
+        output_names=("image_embeds", "deepstack_features"),
+        output_lengths_key="merged_lengths",
+        cost_lengths_key="attention_costs",
+        structure=ModuleStructure(global_attention=True, non_overlapping_patchify=True),
+        cost_exponent=1,
+    )
+    data_balance_specs = {"forward": _vision_balance_spec, "pack_encode": _vision_balance_spec}
+
+    def _balance_vision_inputs(self, method: str, pixels: torch.Tensor, grid: torch.Tensor) -> tuple:
+        grid_list = grid.tolist()
+        patch_lengths = [t * h * w for t, h, w in grid_list]
+        merged_lengths = [n // self.config.vision_config.spatial_merge_size**2 for n in patch_lengths]
+        merge_area = self.config.vision_config.spatial_merge_size**2
+        inputs, balanced = self.data_balance_pre(
+            method,
+            {"pixel_values": pixels, "image_grid_thw": grid},
+            {
+                "patch_lengths": patch_lengths,
+                "item_lengths": [1] * len(grid_list),
+                "merged_lengths": merged_lengths,
+                "attention_costs": [t * (h * w // merge_area) ** 2 for t, h, w in grid_list],
+            },
+        )
+        return inputs["pixel_values"], inputs["image_grid_thw"], balanced
 
 
 class VisionMeterMixin(MetricMeterMixin):
@@ -238,7 +279,7 @@ class VisionMeterMixin(MetricMeterMixin):
         return (dense_flops + attn_flops + patch_flops + merger_flops) / 1e12
 
 
-class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, VisionMeterMixin):
+class VeOmniMixin(BaseMixin, PackedTrainingMixin, TrainingMixin, BalanceMixin, VisionMeterMixin):
     """``generate()`` already lives on the native :class:`~.modeling.Qwen3VLVisionEncoder`
     (via its own :class:`~.modeling.InferenceMixin`), so no ``InferenceMixin`` is needed here.
     """

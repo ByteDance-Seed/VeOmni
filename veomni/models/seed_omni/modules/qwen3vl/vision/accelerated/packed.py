@@ -69,6 +69,7 @@ class PackedTrainingMixin:
         self._image_grid_thw = image_grid_thw
         pixels = pixel_values.to(device=self.device, dtype=self.dtype, non_blocking=True)
         grid = image_grid_thw.to(device=self.device, non_blocking=True)
+        pixels, grid, balanced = self._balance_vision_inputs("pack_encode", pixels, grid)
         merge = self.config.vision_config.spatial_merge_size
         vit_metadata = build_qwen3vl_vit_metadata(grid.tolist(), merge)
         if get_parallel_state().sp_size > 1:
@@ -88,7 +89,7 @@ class PackedTrainingMixin:
             "pixel_values": pixels,
             "image_grid_thw": grid,
             "vit_metadata": vit_metadata,
-            "is_dummy": not bool(visual_is_real.any()),
+            "is_dummy": not balanced and not bool(visual_is_real.any()),
         }
 
     def pack_encode(
@@ -126,6 +127,10 @@ class PackedTrainingMixin:
             image_embeds = _gather(image_embeds)
             deepstack_features = [_gather(layer) for layer in deepstack_features]
 
+        restored = self.data_balance_post(
+            "pack_encode", {"image_embeds": image_embeds, "deepstack_features": deepstack_features}
+        )
+        image_embeds, deepstack_features = restored["image_embeds"], restored["deepstack_features"]
         packed = self._packed_features
         mask = self._visual_pos_mask
         is_real = self._visual_is_real

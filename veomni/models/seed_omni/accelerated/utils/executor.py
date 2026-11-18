@@ -19,6 +19,7 @@ from contextlib import nullcontext
 from typing import Any, Callable, ContextManager, Dict, Optional
 
 from ...graphs.base import NodeDef
+from ...mixins.data_balance_mixin import DataBalanceMixin
 from ...modeling_omni import LOSS_KEY
 from ...utils.graph_profiler import GraphProfiler
 from .dispatch import call_graph_endpoint, unwrap_graph_module
@@ -57,7 +58,8 @@ def execute_train_node(
 
     inputs = batch
 
-    with module_context, profile_context:
+    balance_context = raw.data_balance_scope() if isinstance(raw, DataBalanceMixin) else nullcontext()
+    with module_context, profile_context, balance_context:
         pre_forward = getattr(raw, "pre_forward", None)
         if pre_forward is not None:
             inputs = pre_forward(method=method, **inputs)
