@@ -39,6 +39,7 @@ usage/support_new_models/dit_model_guide.md
 usage/checkpoint.md
 usage/exact_data_resume.md
 usage/checkpoint_scheduler_recipes.md
+usage/dpo_producer_contract.md
 usage/checkpoint_conversion.md
 usage/qwen38_muon.md
 usage/trainer.md
