@@ -548,7 +548,7 @@ def chunk_gated_delta_rule_bwd_dhu(
     else:
         N, NT, chunk_offsets = len(cu_seqlens) - 1, len(chunk_indices), prepare_chunk_offsets(cu_seqlens, BT)
 
-    # Ascend950 tile stores can read previous buffer contents. NaN survives
+    # Ascend 950PR&950DT products tile stores can read previous buffer contents. NaN survives
     # multiplication by zero, so keep arch35 destinations finite before launch.
     # arch22 uses ordinary stores and does not need the full-buffer memset.
     arch35 = is_arch35()

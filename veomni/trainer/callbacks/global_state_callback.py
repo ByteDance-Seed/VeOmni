@@ -558,11 +558,7 @@ class GlobalStateCallback(Callback):
             dist.all_gather_object(restored_generations, local_generations)
             if any(value != local_generations for value in restored_generations):
                 raise RuntimeError("Restored optimizer checkpoint generations differ across ranks")
-        coordinated_resume = (
-            strict_resume
-            or bool(legacy_checkpoints or unknown_checkpoints)
-            or offline_resume
-        )
+        coordinated_resume = strict_resume or bool(legacy_checkpoints or unknown_checkpoints) or offline_resume
 
         if strict_optimizer:
             completeness_error = None
@@ -741,34 +737,8 @@ class GlobalStateCallback(Callback):
             dist.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
             found = bool(flag.item())
         if not found:
-            if strict_resume:
-                raise RuntimeError("Trainer state is missing on at least one rank; exact cursor resume is unsafe")
-            same_output, error = False, None
-            try:
-                save_root = getattr(self.trainer.args.train.checkpoint, "save_path", None)
-                source_path = os.fspath(load_path)
-                if "://" not in source_path:
-                    source_path = os.path.realpath(source_path)
-                name = os.path.basename(os.path.normpath(source_path))
-                prefix = "global_step_"
-                if save_root and name.startswith(prefix) and name[len(prefix) :].isdecimal():
-                    source_step = int(name[len(prefix) :])
-                    same_output = layout.same_checkpoint_path(layout.step_dir(save_root, source_step), load_path)
-            except BaseException as exc:
-                error = exc
-            raise_if_any_rank_failed(error, "checking weights-only checkpoint output path")
-            # Resolved paths depend on each node's actual filesystem, not just
-            # the common launcher configuration.
-            if dist.is_initialized():
-                decisions = [None] * dist.get_world_size()
-                dist.all_gather_object(decisions, same_output)
-                if any(decision != same_output for decision in decisions):
-                    raise RuntimeError("Weights-only checkpoint output path differs across ranks")
-            if same_output and (legacy_checkpoints or unknown_checkpoints):
-                raise RuntimeError(
-                    "Cannot safely reuse a checkpoint without trainer state in its output directory; "
-                    "use a different output directory."
-                )
+            if strict_resume or legacy_checkpoints or unknown_checkpoints:
+                raise RuntimeError("Trainer state is missing on at least one rank; optimizer continuation is unsafe")
             logger.warning_rank0("Trainer state is missing; resuming weights only.")
             return None
 
@@ -791,6 +761,8 @@ class GlobalStateCallback(Callback):
             if type(global_step) is not int or global_step < 0:
                 raise ValueError("Trainer checkpoint global_step must be a non-negative integer")
             loader = self.trainer.train_dataloader
+            if (legacy_checkpoints or unknown_checkpoints) and loader is not None and global_step > 0 and not cursor:
+                raise ValueError("Trainer dataloader cursor is missing; optimizer continuation is unsafe")
             if offline_resume and loader is not None and (cursor is None or (global_step > 0 and not cursor)):
                 raise ValueError("Offline embedding checkpoint is missing its dataloader cursor")
             offline_runtime = _offline_condition_runtime(self.trainer)
@@ -823,6 +795,7 @@ class GlobalStateCallback(Callback):
                         "Resuming the existing loader cursor without a verified exact data-resume contract; "
                         "the optimizer state is validated, but the subsequent data sequence may differ."
                     )
+            if strict_optimizer or legacy_checkpoints or unknown_checkpoints:
                 if loader is not None and (cursor is None or (global_step > 0 and not cursor)):
                     raise ValueError("Trainer dataloader cursor is missing; optimizer continuation is unsafe")
                 rng = global_state.get("torch_rng_state")

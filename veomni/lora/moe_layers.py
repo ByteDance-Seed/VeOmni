@@ -170,13 +170,11 @@ def _moe_lora_op(base_layer: nn.Module, variant: str):
 
     base_op = getattr(base_layer, "veomni_moe", None)
     impl = "eager" if base_op is None else base_op.impl
-    # Two backends cannot be adapted, for different reasons and with the same
-    # consequence: running them through the adapter would quietly change precision
-    # or drop the quantization the config asked for. ``deepgemm_fp8`` has no adapter
-    # forward, and no ``moe_experts_lora`` row fake-quantizes the base weights the
-    # way ``qat`` does -- substituting ``eager`` there would train them at full
-    # precision while the config still claimed QAT.
-    if impl == "deepgemm_fp8" or impl in QUANTIZING_IMPLS:
+    # No ``moe_experts_lora`` row fake-quantizes the base weights, so a selection
+    # that does -- ``qat`` or ``deepgemm_fp8`` -- must be refused: substituting
+    # ``eager`` would train them at full precision while the config still claimed
+    # quantization.
+    if impl in QUANTIZING_IMPLS:
         raise ValueError(
             f"moe_implementation={impl!r} does not support MoE-LoRA on expert weights. "
             "Select a supported MoE-LoRA backend (for example 'fused_triton' on GPU), "

@@ -14,9 +14,9 @@
 #    - method_override: SeedOssRMSNorm.forward
 #      Always call the local rms_norm VeomniOp
 #    - method_override: SeedOssMLP.__init__
-#      Construct a local swiglu_mlp VeomniOp
+#      Construct a local gated_mlp VeomniOp
 #    - method_override: SeedOssMLP.forward
-#      Always call the local swiglu_mlp VeomniOp, then residual dropout
+#      Always call the local gated_mlp VeomniOp, then residual dropout
 #    - method_override: SeedOssDecoderLayer.__init__
 #      Pass config to SeedOssRMSNorm instances
 #    - method_override: SeedOssModel.__init__
@@ -64,7 +64,6 @@ from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -107,21 +106,10 @@ class SeedOssMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
         self.residual_dropout = config.residual_dropout
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+        self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-            down_proj = self.veomni_swiglu_mlp(
-                x,
-                self.gate_proj.weight,
-                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                self.up_proj.weight,
-                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-                self.down_proj.weight,
-                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-            )
-        else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        down_proj = self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
         return nn.functional.dropout(down_proj, p=self.residual_dropout, training=self.training)
 
 

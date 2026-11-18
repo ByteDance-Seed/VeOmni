@@ -474,9 +474,6 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         hidden_dim = grad_output.shape[-1]
         grad_output = grad_output.view(-1, hidden_dim)
 
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        fc1_activation = fc1_1_activation * fc1_2_output
-
         reshaped_gate_weight = gate_weights.reshape(-1, 1)
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
         scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
@@ -505,6 +502,15 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             tile_total_M=tile_total_M,
         )
 
+        fc1_activation, grad_fc1_output = swiglu.merged_swiglu_backward(
+            fc1_1_output,
+            fc1_2_output,
+            grad_fc1_activation,
+            mask_fc1_1 if swiglu_limit is not None else None,
+            mask_fc1_2 if swiglu_limit is not None else None,
+        )
+        del grad_fc1_activation
+
         # MOE Step 9 - wgrad
         grad_fc2_weight = None
         if fc2_weight.requires_grad:
@@ -519,23 +525,6 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 transpose_b=False,
             )
         del fc1_activation, grad_fc2_output
-
-        # MOE Step 7
-        grad_fc1_1_activation = grad_fc1_activation * fc1_2_output
-        grad_fc1_2_output = fc1_1_activation * grad_fc1_activation
-
-        # MOE Step 5
-        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
-        del fc1_1_activation, grad_fc1_activation, grad_fc1_1_activation
-
-        # Step 5a (backward): zero out gradients in saturated SwiGLU clamp regions.
-        if swiglu_limit is not None:
-            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
-            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
-
-        # Merge grad_fc1_1_output and grad_fc1_2_output back to [T, 2I]
-        grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
-        del grad_fc1_1_output, grad_fc1_2_output
 
         # MOE Step 4 - single dgrad for merged fc1
         grad_scatter_output = group_gemm_same_nk(

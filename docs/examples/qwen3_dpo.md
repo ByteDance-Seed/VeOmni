@@ -202,7 +202,9 @@ workload. Other tokenizer or template classes, including subclasses, must explic
 `dpo_unpadded_output_contract = True` on the concrete class and provide a stable
 `dpo_unpadded_output_contract_id` string (or zero-argument method). The identifier
 must change when the producer's behavior or configuration changes, and the
-producer must actually return unpadded sequences. The declaration is the producer's responsibility, not a
+producer must actually return unpadded sequences. See the
+[custom producer contract](../usage/dpo_producer_contract.md) for an example and
+the checkpoint consumers. The declaration is the producer's responsibility, not a
 mathematical proof derived from tensor values; an opaque custom producer is
 rejected. Already padded input must be unpadded by a separately validated
 producer before entering this path.

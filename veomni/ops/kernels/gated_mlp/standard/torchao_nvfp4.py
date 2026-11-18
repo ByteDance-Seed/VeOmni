@@ -24,34 +24,36 @@ BF16 projection outputs and clamps them there.
 from __future__ import annotations
 
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
+from ....activation import apply_activation
 from ....qat.torchao_nvfp4 import NVFP4_BLOCK_SIZE, nvfp4_fake_quant
 from . import eager as _eager
 
 
 def wrapper(
+    mlp: nn.Module,
     x: Tensor,
-    gate_w: Tensor,
-    gate_b: Tensor,
-    up_w: Tensor,
-    up_b: Tensor,
-    down_w: Tensor,
-    down_b: Tensor,
     *,
     swiglu_limit: float | None = None,
     block_size: int = NVFP4_BLOCK_SIZE,
+    activation: str = "silu",
 ) -> Tensor:
-    """Run SwiGLU with NVFP4 fake-quantized projections and the optional clamp.
+    """Run a gated MLP with NVFP4 fake-quantized projections and the optional clamp.
 
-    Empty bias tensors denote unused biases.
+    ``mlp`` is the model's MLP block; see the ``qat`` row for why this one reads
+    weights and therefore refuses a wrapped projection rather than quantizing
+    something the projection does not actually compute.
     """
+    from .._module import render
+
+    gate_w, gate_b, up_w, up_b, down_w, down_b = render(mlp, impl="torchao_nvfp4", activation=activation).weights
     x_q = nvfp4_fake_quant(x, block_size)
     gate = F.linear(x_q, nvfp4_fake_quant(gate_w, block_size), _eager.optional_bias(gate_b))
     up = F.linear(x_q, nvfp4_fake_quant(up_w, block_size), _eager.optional_bias(up_b))
 
     gate_c, up_c = _eager.clamp_gate_up(gate, up, swiglu_limit)
-    hidden = _eager.silu_mul(gate_c, up_c)
+    hidden = apply_activation(gate_c, activation) * up_c
     if hidden.dtype != x.dtype:
         hidden = hidden.to(dtype=x.dtype)
 
