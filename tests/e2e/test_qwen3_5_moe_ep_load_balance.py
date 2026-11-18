@@ -2,7 +2,7 @@
 
 This test requires four CUDA or Ascend NPU devices and the native hybrid
 Qwen3.5-MoE fixture. Its
-two synthetic-hotspot steps are functional/precision evidence only, never
+three synthetic-hotspot steps are functional/precision evidence only, never
 performance evidence.
 """
 
@@ -24,8 +24,8 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_
 _REQUIRED_DEVICES = 4
 _CONFIG_PATH = Path("tests/toy_config/qwen3_5_moe_toy/config.json")
 _STRICT_E2E_ENV = "VEOMNI_REQUIRE_EP_BALANCE_E2E"
-_RTOL = 0.1
-_ATOL = 0.1
+_RTOL = 1e-3
+_ATOL = 1e-4
 _TELEMETRY_KEYS = {
     "before": "moe/ep_rank_imbalance_before/avg",
     "after": "moe/ep_rank_imbalance_after/avg",
@@ -88,8 +88,51 @@ class EnvelopeLogSink(Callback):
         super().__init__(trainer)
         self.run_label = run_label
         self.metrics = defaultdict(list)
+        self.expert_grads = []
+        self.expert_updates = []
+        self.expert_deltas = []
+        self.initial_experts = self.snapshot()
+        self.previous_experts = self.initial_experts
+        self.step_lr = None
+        original_clip = trainer.model.clip_grad_norm
+
+        def capture_clipped_gradients(*args, **kwargs):
+            norm = original_clip(*args, **kwargs)
+            self.expert_grads.append(self.snapshot(gradients=True))
+            rates = {float(group["lr"]) for group in trainer.model.optimizer.param_groups}
+            if len(rates) != 1:
+                raise RuntimeError("The toy update comparison requires one matched learning rate")
+            self.step_lr = rates.pop()
+            return norm
+
+        trainer.model.clip_grad_norm = capture_clipped_gradients
+
+    def snapshot(self, *, gradients=False):
+        tensors = {}
+        for name, parameter in self.trainer.model.named_parameters():
+            if ".experts." not in name or not parameter.requires_grad:
+                continue
+            value = parameter.grad if gradients else parameter
+            if value is None:
+                raise RuntimeError(f"Missing expert gradient: {name}")
+            if hasattr(value, "to_local"):
+                value = value.to_local()
+            tensors[name] = value.detach().cpu().clone()
+        if not tensors:
+            raise RuntimeError("Expected trainable expert tensors")
+        return tensors
 
     def on_step_end(self, state, loss, loss_dict, grad_norm, **kwargs):
+        current = self.snapshot()
+        self.expert_updates.append(current)
+        if self.step_lr is None:
+            raise RuntimeError("Expert update capture must follow clipped gradients")
+        scale = self.step_lr if self.step_lr else 1.0
+        self.expert_deltas.append({
+            name: (value.float() - self.previous_experts[name].float()) / scale
+            for name, value in current.items()
+        })
+        self.previous_experts = current
         for name, value in (("loss", loss), ("grad_norm", grad_norm)):
             scalar = finite_scalar(value)
             if scalar is None:
@@ -102,10 +145,15 @@ class EnvelopeLogSink(Callback):
 
     def on_train_end(self, state, **kwargs):
         args = self.trainer.args
-        if args.train.global_rank != 0:
-            return
         output_dir = args.train.checkpoint.output_dir
         os.makedirs(output_dir, exist_ok=True)
+        torch.save(
+            {"initial": self.initial_experts, "gradients": self.expert_grads,
+             "parameters": self.expert_updates, "lr_scaled_updates": self.expert_deltas},
+            os.path.join(output_dir, f"expert_precision_rank{args.train.global_rank}.pt"),
+        )
+        if args.train.global_rank != 0:
+            return
         envelope = {
             "schema_version": 1,
             "metadata": {
@@ -285,7 +333,7 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(
     checkpoint_dir = tmp_path / "checkpoint"
     _materialize_checkpoint(config_path, checkpoint_dir)
     dataset = DummyDataset(
-        num_samples=16,
+        num_samples=24,
         seq_len=2048,
         dataset_type="qwen3vl",
         cache_name=f"qwen3_5_moe_ep_balance_{os.getpid()}",
@@ -322,6 +370,7 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(
         init_device="meta",
         model_name="qwen3_5_moe",
     )
+    baseline_command = _replace_exact_arg(baseline_command, "--train.max_steps=2", "--train.max_steps=3")
     candidate_command = _replace_exact_arg(
         baseline_command,
         f"--train.checkpoint.output_dir={baseline_output}",
@@ -354,8 +403,23 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(
     for name in ("loss", "grad_norm"):
         baseline_curve = _finite_curve(baseline, name)
         candidate_curve = _finite_curve(candidate, name)
-        assert len(baseline_curve) == len(candidate_curve) == 2
+        assert len(baseline_curve) == len(candidate_curve) == 3
         torch.testing.assert_close(candidate_curve, baseline_curve, rtol=_RTOL, atol=_ATOL)
+
+    # All local expert shards, after clipping and after the optimizer update.
+    # These copies are numerical evidence only, outside performance benchmarks.
+    for rank in range(_REQUIRED_DEVICES):
+        reference = torch.load(baseline_output / f"expert_precision_rank{rank}.pt", weights_only=True)
+        actual = torch.load(candidate_output / f"expert_precision_rank{rank}.pt", weights_only=True)
+        assert actual["initial"].keys() == reference["initial"].keys()
+        for name in reference["initial"]:
+            torch.testing.assert_close(actual["initial"][name], reference["initial"][name], rtol=0, atol=0)
+        for phase in ("gradients", "parameters", "lr_scaled_updates"):
+            assert len(actual[phase]) == len(reference[phase]) == 3
+            for step_actual, step_reference in zip(actual[phase], reference[phase], strict=True):
+                assert step_actual.keys() == step_reference.keys()
+                for name in step_reference:
+                    torch.testing.assert_close(step_actual[name], step_reference[name], rtol=_RTOL, atol=_ATOL)
 
     assert baseline["metadata"]["run_label"] == "baseline"
     assert baseline["metadata"]["feature_enabled"] is False
@@ -372,7 +436,7 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(
     moved_tokens = _finite_curve(candidate, _TELEMETRY_KEYS["moved_tokens"])
     moved_fraction = _finite_curve(candidate, _TELEMETRY_KEYS["moved_fraction"])
     total_tokens = _finite_curve(candidate, _TELEMETRY_KEYS["total_tokens"])
-    assert len(before) == len(after) == len(replicas) == len(moved_tokens) == len(moved_fraction) == 2
+    assert len(before) == len(after) == len(replicas) == len(moved_tokens) == len(moved_fraction) == 3
     assert all(value > 0 for value in replicas)
     assert all(value > 0 for value in moved_tokens)
     assert all(value > 0 for value in moved_fraction)
@@ -382,11 +446,11 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(
     # EP group. Both fixtures move exactly half the assignments.
     forward_calls = 2 if checkpointing else 1
     expected_total = toy_config["text_config"]["num_hidden_layers"] * 8 * 2048 * 2 * forward_calls
-    assert total_tokens == [expected_total] * 2
-    assert moved_tokens == [expected_total // 2] * 2
+    assert total_tokens == [expected_total] * 3
+    assert moved_tokens == [expected_total // 2] * 3
     # Two accumulated microbatches, four layers: EP2 has two groups with
     # one replica each; EP4 has one group with two replicas.
-    assert replicas == [16 * forward_calls] * 2
+    assert replicas == [16 * forward_calls] * 3
 
 
 @pytest.mark.parametrize("strict", [False, True])
