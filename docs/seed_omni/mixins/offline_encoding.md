@@ -116,11 +116,14 @@ both through `GlobalStateCallback`:
   or a leftover completion marker, which would otherwise make a later resume
   of the new run refuse the cache as already finalized.
 
-Both refusals happen in `finalize()`, which `OmniTrainer` calls after
-`on_train_end()`, so the checkpoint callback has already written the step
-directory: a refused run leaves a step and no cache. That is a consistent state
-- a rerun refuses the non-empty cache directory, and `load_path: auto` still
-finds the step - but it is worth knowing before suspecting the checkpointer.
+The failure checks happen at different stages. `open()` rejects a cache directory
+that already holds shards, a leftover completion marker, or shards written under a
+different data-parallel size, and the `offline_embedding` `max_steps` guard runs
+while the dataset step count is built. Only the empty-cache check runs in
+`finalize()`, which `OmniTrainer` calls after `on_train_end()`: if that check
+rejects the run, a step directory may or may not exist, depending on the checkpoint
+cadence and on whether the run saves weights, and no complete cache is available.
+Inspect the cache and checkpoint directories separately before retrying.
 
 ## How a run builds a cached module
 
