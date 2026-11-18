@@ -15,7 +15,7 @@ model:
     train_graph: configs/seed_omni/Cosmos3/cosmos3_nano/train/graph_online.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
-    swiglu_mlp_implementation: eager
+    gated_mlp_implementation: eager
     cross_entropy_loss_implementation: eager
     load_balancing_loss_implementation: eager
     moe_implementation: eager
