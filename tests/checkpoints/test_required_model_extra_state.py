@@ -16,6 +16,9 @@ from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.models.checkpoint.manager import ModelCheckpointManager
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
 def _missing_extra_state_worker(rank, root, failure, endpoint):
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
