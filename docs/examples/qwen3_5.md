@@ -288,7 +288,7 @@ There is no dedicated dense NPU config; reuse the GPU one and set the GatedDelta
 command line. Nothing else needs overriding: the YAML's `attn_implementation: flash_attention_2` is
 also the recommended NPU value (see [NPU-friendly operator
 configurations](../hardware_support/typical_usage.md)), and `rms_norm`, `rotary_pos_emb`,
-`swiglu_mlp` and `cross_entropy_loss` are left unset there, so `VeomniOp` resolves them to the NPU defaults
+`gated_mlp` and `cross_entropy_loss` are left unset there, so `VeomniOp` resolves them to the NPU defaults
 from `OP_REGISTRY.default_impl`. The three
 GatedDeltaNet ops default to `"fla"` instead, which is why they must be explicit:
 

@@ -74,11 +74,12 @@ def test_deepseek_v4_shared_mlp_passes_swiglu_limit():
     assert shared.limit == config.swiglu_limit
     captured: dict = {}
 
-    def record(x, *args, **kwargs):
+    def record(mlp, x, *args, **kwargs):
         captured.update(kwargs)
+        assert mlp is shared
         return torch.zeros_like(x)
 
-    shared.veomni_swiglu_mlp = record
+    shared.veomni_gated_mlp = record
     shared(torch.randn(2, 8, config.hidden_size))
     assert captured["swiglu_limit"] == config.swiglu_limit
 

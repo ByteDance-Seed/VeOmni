@@ -450,6 +450,32 @@ def tiny_minimax_h3_condition_config(architecture: str = "MiniMaxH3ConditionMode
     return MiniMaxH3ConditionModelConfig(**kwargs)
 
 
+def tiny_minimax_h3_image_config(architecture: str = "MiniMaxH3DiTModel", **overrides) -> PretrainedConfig:
+    return tiny_minimax_h3_config(
+        architecture=architecture,
+        audio_enabled=False,
+        num_pdd_heads=2,
+        **overrides,
+    )
+
+
+def tiny_minimax_h3_image_condition_config(
+    architecture: str = "MiniMaxH3ImageConditionModel", **overrides
+) -> PretrainedConfig:
+    from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition.configuration_minimax_h3_image_condition import (
+        MiniMaxH3ImageConditionModelConfig,
+    )
+
+    kwargs = {
+        "base_model_path": "",
+        "skip_encoder_load": True,
+        "architectures": [architecture],
+        "tie_word_embeddings": False,
+    }
+    kwargs.update(overrides)
+    return MiniMaxH3ImageConditionModelConfig(**kwargs)
+
+
 def tiny_qwen_image_config(architecture: str = "QwenImageTransformer2DModel", **overrides) -> PretrainedConfig:
     from veomni.models.diffusers.qwen_image.qwen_image_transformer.configuration_qwen_image_transformer import (
         QwenImageTransformer2DModelConfig,

@@ -68,6 +68,7 @@ hardware_support/mlu/README.md
 
 examples/qwen3.md
 examples/qwen3_5.md
+examples/qwen4_exp_frozen_ple.md
 examples/qwen3_moe.md
 examples/qwen3_vl.md
 examples/qwen_image_edit.md
@@ -75,6 +76,7 @@ examples/qwen3_omni_moe.md
 examples/qwen3_omni_offline_av.md
 examples/minimax_h3.md
 examples/minimax_h3_smoke_test.md
+examples/minimax_h3_image.md
 examples/hunyuanvideo15.md
 examples/wan2.1.md
 examples/wan2.1_I2V_1.3B.md
@@ -91,11 +93,14 @@ examples/kimi_k3.md
 key_features/model_loader.md
 key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
-key_features/async_activate_offload.md
 key_features/extra_parallel.md
 key_features/sharded_embedding.md
 key_features/ulysses.md
 key_features/lora.md
+key_features/activation_offload.md
+key_features/moe_router_monitor.md
+key_features/channel_loss.md
+key_features/dcp_async_save.md
 key_features/mtp.md
 
 ```

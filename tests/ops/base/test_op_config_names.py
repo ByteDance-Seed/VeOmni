@@ -49,7 +49,7 @@ _FIELD_TO_OP = {
     "rotary_pos_emb_implementation": "rope",
     "rotary_pos_emb_vision_implementation": "rope",
     "situ_and_mul_implementation": "situ_and_mul",
-    "swiglu_mlp_implementation": "swiglu_mlp",
+    "gated_mlp_implementation": "gated_mlp",
 }
 
 

@@ -253,9 +253,9 @@ _MODEL_CASES = (
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
-            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.mlp.veomni_gated_mlp", "gated_mlp"),
             ("model.layers.3.mlp.experts.veomni_moe", "moe_experts"),
-            ("model.layers.3.mlp.shared_experts.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.3.mlp.shared_experts.veomni_gated_mlp", "gated_mlp"),
         ),
         config_factory=_tiny_deepseek_v3_config,
         architectures=(
@@ -277,7 +277,7 @@ _MODEL_CASES = (
             ("model.layers.0.self_attn.veomni_dsa_attention", "dsa_attention"),
             ("model.layers.3.self_attn.compressor.indexer.veomni_dsa_indexer", "dsa_indexer"),
             ("model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
-            ("model.layers.0.mlp.shared_experts.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.mlp.shared_experts.veomni_gated_mlp", "gated_mlp"),
             ("model.hc_head.veomni_mhc_head", "mhc"),
         ),
         config_factory=_tiny_deepseek_v4_config,
@@ -377,7 +377,7 @@ _MODEL_CASES = (
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
-            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.mlp.veomni_gated_mlp", "gated_mlp"),
             ("model.layers.0.self_attn.veomni_rope", "rope"),
             ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),
@@ -403,7 +403,7 @@ _MODEL_CASES = (
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
-            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.mlp.veomni_gated_mlp", "gated_mlp"),
             ("model.layers.0.self_attn.veomni_rope", "rope"),
             ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),
@@ -422,7 +422,7 @@ _MODEL_CASES = (
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
-            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.mlp.veomni_gated_mlp", "gated_mlp"),
             ("model.layers.0.self_attn.veomni_rope", "rope"),
             ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),
@@ -479,7 +479,7 @@ _MODEL_CASES = (
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
             ("model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
-            ("model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.layers.0.mlp.veomni_gated_mlp", "gated_mlp"),
             ("model.layers.0.self_attn.veomni_rope", "rope"),
             ("model.layers.0.self_attn.veomni_attn", "attention"),
         ),
