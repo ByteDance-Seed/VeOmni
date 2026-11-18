@@ -68,41 +68,24 @@ def _check_cuda_fp32_policy():
 
 
 def _cuda_step_preflight(optimizers, group, *, closure=False):
-    """Validate policy on every participant before any child optimizer step."""
-    error = None
-    try:
-        _check_cuda_fp32_policy()
-        import torch.optim.optimizer as optimizer_module
-
-        if (
-            closure
-            or getattr(optimizer_module, "_global_optimizer_pre_hooks", None)
-            or getattr(optimizer_module, "_global_optimizer_post_hooks", None)
-        ):
-            raise RuntimeError("Qwen3.8 Muon CUDA steps do not support closures or global optimizer step hooks")
-        if any(
-            getattr(opt, "_optimizer_step_pre_hooks", None) or getattr(opt, "_optimizer_step_post_hooks", None)
-            for opt in optimizers
-        ):
-            raise RuntimeError("Qwen3.8 Muon CUDA steps do not support optimizer step hooks")
-        supported_children = (Qwen38MuonAdamW, torch.optim.AdamW, CPUOffloadAdamW, FullFP32AdamW, MasterFP32AdamW)
-        if any(type(opt) not in supported_children for opt in optimizers):
-            raise RuntimeError("Qwen3.8 Muon CUDA steps do not support custom optimizer children")
-    except Exception as exc:
-        error = exc
+    """Validate the local policy before any optimizer child updates."""
+    _check_cuda_fp32_policy()
+    import torch.optim.optimizer as optimizer_module
 
     if (
-        torch.distributed.is_available()
-        and torch.distributed.is_initialized()
-        and torch.distributed.get_world_size() > 1
+        closure
+        or getattr(optimizer_module, "_global_optimizer_pre_hooks", None)
+        or getattr(optimizer_module, "_global_optimizer_post_hooks", None)
     ):
-        if group is None:
-            raise RuntimeError("Distributed Qwen3.8 Muon CUDA steps require an explicit precision process group")
-        from veomni.utils.dist_utils import raise_if_any_rank_failed
-
-        raise_if_any_rank_failed(error, "checking Qwen3.8 Muon CUDA precision", group=group)
-    elif error is not None:
-        raise error
+        raise RuntimeError("Qwen3.8 Muon CUDA steps do not support closures or global optimizer step hooks")
+    if any(
+        getattr(opt, "_optimizer_step_pre_hooks", None) or getattr(opt, "_optimizer_step_post_hooks", None)
+        for opt in optimizers
+    ):
+        raise RuntimeError("Qwen3.8 Muon CUDA steps do not support optimizer step hooks")
+    supported_children = (Qwen38MuonAdamW, torch.optim.AdamW, CPUOffloadAdamW, FullFP32AdamW, MasterFP32AdamW)
+    if any(type(opt) not in supported_children for opt in optimizers):
+        raise RuntimeError("Qwen3.8 Muon CUDA steps do not support custom optimizer children")
 
 
 def _optimizer_uses_cuda(optimizer):

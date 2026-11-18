@@ -688,24 +688,12 @@ def _qwen38_cuda_training_group(parallel_state):
 def _qwen38_cuda_domain(optimizer_type, parallel_state, optimizers):
     if optimizer_type != "qwen38_muon":
         return False
-    local, error = False, None
-    try:
-        mesh = getattr(parallel_state, "device_mesh", None)
-        local = (mesh is not None and mesh.device_type == "cuda") or any(
-            _optimizer_uses_cuda(opt) for opt in optimizers
-        )
-    except BaseException as exc:
-        error = exc
-    if torch.distributed.is_initialized():
-        from ..utils.dist_utils import raise_if_any_rank_failed
-
-        raise_if_any_rank_failed(error, "inspecting Qwen3.8 CUDA optimizer domain")
-        flags = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(flags, local)
-        return any(flags) or torch.distributed.get_backend() == "nccl"
-    if error is not None:
-        raise error
-    return local
+    mesh = getattr(parallel_state, "device_mesh", None)
+    return (
+        (mesh is not None and mesh.device_type == "cuda")
+        or any(_optimizer_uses_cuda(opt) for opt in optimizers)
+        or (torch.distributed.is_initialized() and torch.distributed.get_backend() == "nccl")
+    )
 
 
 _QWEN_BUILD_DEFER_CUDA = ContextVar("qwen_build_defer_cuda", default=False)
@@ -735,9 +723,9 @@ def _coordinate_qwen_builder(builder):
             error = exc
         raise_if_any_rank_failed(error, "getting Qwen3.8 optimizer parallel state")
         children = tuple(result.optimizers_dict.values())
-        cuda_guard = _qwen38_cuda_domain(optimizer_type, parallel_state, children)
-        cuda_group, error = None, None
+        cuda_guard, cuda_group, error = False, None, None
         try:
+            cuda_guard = _qwen38_cuda_domain(optimizer_type, parallel_state, children)
             if cuda_guard:
                 cuda_group = _qwen38_cuda_training_group(parallel_state)
         except BaseException as exc:
