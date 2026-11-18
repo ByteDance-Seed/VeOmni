@@ -19,6 +19,7 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -711,7 +712,8 @@ def test_segmented_gmm_no_grad_reuses_single_output(counts):
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Real NPU fused MoE balance requires torch_npu and Ascend hardware")
 @pytest.mark.parametrize("optimize_memory", [False, True])
-def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(optimize_memory):
+@pytest.mark.parametrize("mixed_routing", [False, True])
+def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(optimize_memory, mixed_routing):
     world_size = dist.get_world_size() if dist.is_initialized() else int(os.environ.get("WORLD_SIZE", "1"))
     if world_size != 2:
         pytest.skip("Run with torchrun --standalone --nproc-per-node=2 on an Ascend host.")
@@ -740,7 +742,14 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(optimize_me
         dtype=torch.bfloat16,
         device=device,
     ).reshape(-1, 1)
+    if mixed_routing:
+        selected_experts[-1] = 1
+    hidden_states.requires_grad_(True)
+    routing_weights.requires_grad_(True)
     weights = _ExpertWeights(rank, dtype=torch.bfloat16, device=device)
+    reference_weights = _ExpertWeights(rank, dtype=torch.bfloat16, device=device)
+    reference_hidden = hidden_states.detach().clone().requires_grad_(True)
+    reference_routing = routing_weights.detach().clone().requires_grad_(True)
     parameter_names_before = tuple(dict(weights.named_parameters()))
     balancer = _RecordingBalancer(group, real_ep_load_balance, optimize_memory=optimize_memory)
     original_get_parallel_state = real_npu_moe.get_parallel_state
@@ -748,6 +757,17 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(optimize_me
     real_npu_moe.get_parallel_state = lambda: SimpleNamespace(ep_enabled=True, ep_group=group)
     real_ep_dispatch.get_parallel_state = lambda: SimpleNamespace(ep_group=group)
     try:
+        reference = real_npu_moe.npu_fused_moe_forward(
+            2,
+            reference_routing,
+            selected_experts,
+            reference_hidden,
+            None,
+            None,
+            reference_weights.down,
+            reference_weights.gate_up,
+        )
+        reference.float().sum().backward()
         output = real_npu_moe.npu_fused_moe_forward(
             2,
             routing_weights,
@@ -763,9 +783,12 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(optimize_me
         assert torch.equal(routing_weights, routing_before)
         assert balancer.build_calls == 1
         assert len(balancer.plan.replicas) == 1
-        assert int(balancer.plan.tokens_per_local_physical_expert[:, -1].sum().item()) == (0 if rank == 0 else 5)
+        replica_tokens = 3 if mixed_routing else 5
+        assert int(balancer.plan.tokens_per_local_physical_expert[:, -1].sum().item()) == (
+            0 if rank == 0 else replica_tokens
+        )
         expected_plan = real_ep_load_balance._build_ep_balance_plan_from_counts(
-            selected_experts.cpu(), torch.tensor([[6, 0], [4, 0]]), 2, rank, 1
+            selected_experts.cpu(), torch.tensor([[5, 1], [3, 1]] if mixed_routing else [[6, 0], [4, 0]]), 2, rank, 1
         )
         for name in ("replicas", "input_splits", "output_splits", "rank_loads_before", "rank_loads_after"):
             assert getattr(balancer.plan, name) == getattr(expected_plan, name)
@@ -778,18 +801,58 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(optimize_me
         output.float().sum().backward()
         assert torch.isfinite(weights.gate_up.grad.float()).all().item()
         assert torch.isfinite(weights.down.grad.float()).all().item()
-        expected_gate_grad, expected_down_grad = _reference_owner_gradients(
-            hidden_states.float(), routing_weights.float(), group
-        )
-        if rank == 0:
-            assert torch.allclose(weights.gate_up.grad[0, :, 0].float(), expected_gate_grad, rtol=0.05, atol=0.05)
-            assert torch.allclose(weights.down.grad[0, 0, 0].float(), expected_down_grad, rtol=0.05, atol=0.05)
-        else:
-            assert torch.count_nonzero(weights.gate_up.grad).item() == 0
-            assert torch.count_nonzero(weights.down.grad).item() == 0
+        for actual, expected in (
+            (output, reference),
+            (hidden_states.grad, reference_hidden.grad),
+            (routing_weights.grad, reference_routing.grad),
+            (weights.gate_up.grad, reference_weights.gate_up.grad),
+            (weights.down.grad, reference_weights.down.grad),
+        ):
+            torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-4)
         assert tuple(dict(weights.named_parameters())) == parameter_names_before
     finally:
         real_npu_moe.get_parallel_state = original_get_parallel_state
         real_ep_dispatch.get_parallel_state = original_ep_dispatch_get_parallel_state
         if owns_group:
             dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Real NPU grouped matmul requires Ascend hardware")
+@pytest.mark.parametrize(
+    "in_dim,out_dim,backward", [(2048, 1024, False), (512, 2048, False), (1024, 2048, True), (2048, 512, True)]
+)
+@pytest.mark.parametrize("replicas", [1, 8])
+def test_real_npu_mixed_segment_one_output_matches_fallback(in_dim, out_dim, backward, replicas):
+    import torch_npu
+
+    from veomni.ops.kernels.moe._kernels.kernel.npu_group_gemm import npu_group_gemm
+    from veomni.ops.kernels.moe.npu_ep_memory import segmented_group_gemm
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.npu.set_device(local_rank)
+    device = torch.device(f"npu:{local_rank}")
+    torch.manual_seed(761)
+    local_counts = [0 if j % 11 == 0 else 400 + 5 * j for j in range(32)]
+    replica_counts = [117] if replicas == 1 else [0, 700, 210, 0, 380, 0, 90, 1]
+    shape = (in_dim, out_dim) if backward else (out_dim, in_dim)
+    local = torch.randn(32, *shape, dtype=torch.bfloat16).to(device)
+    replica = torch.randn(replicas, *shape, dtype=torch.bfloat16).to(device)
+    if backward:
+        local, replica = local.transpose(1, 2), replica.transpose(1, 2)
+    tokens = torch.randn(sum(local_counts + replica_counts), in_dim, dtype=torch.bfloat16).to(device)
+    counts = torch.tensor(local_counts + replica_counts, dtype=torch.long, device=device)
+    local_tokens = sum(local_counts)
+    with torch.no_grad():
+        expected = torch.cat(
+            (
+                npu_group_gemm(tokens[:local_tokens], local.transpose(1, 2), counts[:32]),
+                npu_group_gemm(tokens[local_tokens:], replica.transpose(1, 2), counts[32:]),
+            )
+        )
+        with patch.object(torch_npu, "npu_grouped_matmul", wraps=torch_npu.npu_grouped_matmul) as calls:
+            actual = segmented_group_gemm(tokens, local, replica, counts, local_tokens, npu_group_gemm)
+            calls.assert_called_once()
+            assert all(weight.ndim == 2 for weight in calls.call_args.args[1])
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert actual.stride() == expected.stride()
+        assert torch_npu.get_npu_format(actual) == torch_npu.get_npu_format(expected)

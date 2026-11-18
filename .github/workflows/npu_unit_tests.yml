@@ -227,12 +227,13 @@ jobs:
       - name: Run NPU MoE EP load-balance CPU seams
         run: |
           uv run --frozen pytest -v -s -x tests/ops/test_npu_moe_ep_load_balance.py \
-            -k 'not test_real_npu_two_rank_alias_forward_backward_and_owner_gradient'
+            -k 'not real_npu'
       - name: Run real two-rank NPU MoE EP alias and gradient test
         # Launch only this node on two ranks, not the CPU seams or full ops suite.
         run: |
           uv run --frozen torchrun --standalone --nproc-per-node=2 -m pytest -v -s -x \
-            tests/ops/test_npu_moe_ep_load_balance.py::test_real_npu_two_rank_alias_forward_backward_and_owner_gradient
+            tests/ops/test_npu_moe_ep_load_balance.py::test_real_npu_two_rank_alias_forward_backward_and_owner_gradient \
+            tests/ops/test_npu_moe_ep_load_balance.py::test_real_npu_mixed_segment_one_output_matches_fallback
       - name: Run utils tests
         run: |
           uv run --frozen pytest -v -s -x tests/utils/test_count_flops.py
