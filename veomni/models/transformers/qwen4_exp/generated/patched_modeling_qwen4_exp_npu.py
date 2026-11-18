@@ -146,6 +146,7 @@ from veomni.models.transformers.qwen4_exp.packed_ple import (
 from veomni.models.transformers.qwen4_exp.qsa_metadata import PreparedQSAMetadata, prepare_qsa_metadata
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.gated_delta_rule import GROUPED_VALUE_HEAD_IMPLS
 from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.utils import logging
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -731,8 +732,6 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
         attention_mask: torch.Tensor | None = None,
         cu_seq_lens_q: torch.Tensor | None = None,
         packed_seq_lens: list[int] | tuple[int, ...] | None = None,
-        cu_seqlens_list: list[int] | None = None,
-        chunk_indices_list: dict[str, list[int] | None] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
         # --- Patch.1 ---
@@ -924,7 +923,7 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
         if self.num_v_heads // self.num_k_heads > 1 and not (
-            self.veomni_chunk_gated_delta_rule.impl in ("flash_qla", "fla_npu") and not use_precomputed_states
+            self.veomni_chunk_gated_delta_rule.impl in GROUPED_VALUE_HEAD_IMPLS and not use_precomputed_states
         ):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -941,8 +940,6 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
                 cu_seq_lens_q,
                 output_final_state=False,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens_list=cu_seqlens_list,
-                chunk_indices_list=chunk_indices_list,
             )
         elif packed_seq_lens is not None:
             # Eager has no varlen path, so run each packed segment on its own.
@@ -2158,11 +2155,6 @@ class Qwen4ExpTextDecoderLayer(GradientCheckpointingLayer):
                 packed_boundary_indices=ple_packed_boundary_indices,
             )
         # --- Patch.1 ---
-        # --- Patch.3: GDN varlen tables travel in kwargs; strip them so the
-        # full-attention path never sees them. ---
-        gdn_cu_seqlens_list = kwargs.pop("cu_seqlens_list_q", None)
-        gdn_chunk_indices_list = kwargs.pop("chunk_indices_list_q", None)
-        # --- Patch.3 ---
 
         hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
         if self.layer_type == "linear_attention":
@@ -2172,8 +2164,6 @@ class Qwen4ExpTextDecoderLayer(GradientCheckpointingLayer):
                 attention_mask=conv_mask,
                 cu_seq_lens_q=cu_seq_lens_q,
                 packed_seq_lens=packed_seq_lens,
-                cu_seqlens_list=gdn_cu_seqlens_list,
-                chunk_indices_list=gdn_chunk_indices_list,
                 **kwargs,
             )
         else:
@@ -2341,43 +2331,6 @@ class Qwen4ExpTextModel(Qwen4ExpPreTrainedModel):
         if cache_active and self.config.ple_layer_ids and cu_seq_lens_q is not None and not cached_single_segment:
             raise NotImplementedError("Packed PLE boundaries cannot be combined with cached PLE state.")
         # --- Patch.5 ---
-        # --- Patch.7: Build the fla_npu varlen tables once for every GDN layer. ---
-        # Without this each GDN layer re-derives cu_seqlens on the host (one
-        # device->host sync per layer) and rebuilds its chunk tables. The AscendC
-        # entry consumes only the host tables, so no device tensors are uploaded.
-        # This patch config is shared with the GPU target, where the impl guard
-        # below keeps the block inert.
-        _ops_config = getattr(self.config, "ops_config", None)
-        _gdn_impl = getattr(_ops_config, "chunk_gated_delta_rule_implementation", None)
-        if (
-            cu_seq_lens_q is not None
-            and _gdn_impl == "fla_npu"
-            and not cache_active
-            and "cu_seqlens_list_q" not in kwargs
-        ):
-            from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.fla_npu import (
-                precompute_varlen_metadata,
-            )
-
-            # Patch.5 guarantees packed_seq_lens whenever cu_seq_lens_q is set, so
-            # rebuilding the boundaries from that host list costs no extra sync.
-            _cu_list = [0]
-            for _length in packed_seq_lens:
-                _cu_list.append(_cu_list[-1] + int(_length))
-            _cu_cpu = torch.tensor(_cu_list, dtype=torch.int32)
-            _num_v_heads = self.config.linear_num_value_heads // (sp_size if sp_enabled else 1)
-            _chunk_size = 64
-            _cu_seqlens_list, _, _chunk_indices_list = precompute_varlen_metadata(
-                cu_seqlens=_cu_cpu,
-                num_heads=_num_v_heads,
-                chunk_size=_chunk_size,
-                device=None,
-            )
-            kwargs["cu_seqlens_list_q"] = _cu_seqlens_list
-            # The adapter only reads the key matching the chunk size it is called
-            # with; shipping just that entry keeps per-layer dict handling cheap.
-            kwargs["chunk_indices_list_q"] = {str(_chunk_size): _chunk_indices_list[str(_chunk_size)]}
-        # --- Patch.7 ---
         # CODEPATH: @ArthurZucker fix flagging for no reason here
         if self.config.ple_layer_ids and ple_input_ids is None:
             # If we do not have input_ids but have ple, we need to revert the embeddings to find back the ids

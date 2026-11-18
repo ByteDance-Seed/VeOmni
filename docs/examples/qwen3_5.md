@@ -127,8 +127,9 @@ decode mode), Qwen3.5 and Qwen3.5-MoE pass grouped `query` and `key` heads
 copies before the kernel. Other backends (`fla`, `eager`, NPU `triton`) and recurrent decode
 paths keep the expanded Q/K layout; Qwen3.5 and Qwen3.5-MoE still expand for `fla_npu` too.
 Qwen4-Exp is the exception: it passes grouped Q/K to `fla_npu` as well, because the AscendC
-chunk kernel supports grouped value attention (`Hv/Hk in {1,2,3,4}`, with `g`/`beta` staying in
-value-head space).
+chunk kernel supports grouped value attention (`Hv/Hk in {1, 2, 3, 4}`, with `g`/`beta` staying in
+value-head space). Grouped value heads require the 26.10 AscendC kernels described below; older
+`fla_npu` builds must keep the expanded Q/K path.
 
 ## Start training on NPU
 
@@ -276,7 +277,8 @@ The `fla_npu` backend requires manual installation and validation. The repositor
 cover the adapter contract: a mocked plumbing test runs everywhere, and a hardware-gated parity
 test compares grouped execution against an explicitly expanded eager reference (output plus
 `q`/`k`/`v`/`g`/`beta` gradients) and skips when `fla_npu` is absent. NPU CI does not install
-`fla_npu`.
+`fla_npu`, so neither the grouped dispatch nor the numerical parity of this backend has
+CI-enforced coverage; run that parity test on hardware before relying on it.
 
 If the `fla_npu` package is missing when `chunk_gated_delta_rule_implementation: fla_npu` is
 selected, the backend raises an actionable error when the model constructs its `VeomniOp` handle

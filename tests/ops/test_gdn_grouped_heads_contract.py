@@ -70,9 +70,7 @@ class _RecordingGdnOp:
         *,
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
-        cu_seqlens_list: list[int] | None = None,
         chunk_indices: object = None,
-        chunk_indices_list: object = None,
     ):
         self._calls.append(
             {
@@ -84,8 +82,6 @@ class _RecordingGdnOp:
                 "cu_seqlens": cu_seqlens,
                 "output_final_state": output_final_state,
                 "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
-                "cu_seqlens_list": cu_seqlens_list,
-                "chunk_indices_list": chunk_indices_list,
             }
         )
         state = None
@@ -146,6 +142,13 @@ def test_gdn_grouped_heads_dispatch_contract(
     packed: bool,
     ulysses: bool,
 ):
+    """Assert which q/k head count each backend is handed.
+
+    The kernel handles are stubbed on purpose: this covers the modeling-side
+    dispatch decision, so running on CPU says nothing about whether a backend
+    can resolve there. ``fla_npu`` is a real NPU pairing for Qwen3.5 as well;
+    only the Qwen4-Exp config keeps q/k grouped for it today.
+    """
     if ulysses and not packed:
         pytest.skip("Ulysses sequence parallelism uses packed cu_seq_lens_q")
     if ulysses and model_name == "qwen4_exp" and impl == "eager":
@@ -295,60 +298,3 @@ def test_gdn_precomputed_states_always_expand_qk_heads(
     )
     assert len(calls) == 0
     assert recurrent_calls == [((1, 1, 16, 8), (1, 1, 16, 8), (1, 1, 16, 8))]
-
-
-def test_qwen4_text_model_hoists_fla_npu_varlen_tables(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Qwen4-Exp builds the fla_npu varlen tables once per forward.
-
-    Every GDN layer would otherwise re-derive ``cu_seqlens`` on the host, so
-    the tables must be precomputed once and shared through ``kwargs``.
-    """
-    from tests.models.compare import eager_ops_config
-    from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_npu import (
-        Qwen4ExpTextModel,
-    )
-    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu
-
-    config = as_veomni_config(
-        Qwen4ExpTextConfig(
-            hidden_size=64,
-            intermediate_size=128,
-            num_hidden_layers=2,
-            layer_types=["linear_attention", "linear_attention"],
-            linear_num_key_heads=4,
-            linear_num_value_heads=16,
-            linear_key_head_dim=8,
-            linear_value_head_dim=8,
-            linear_conv_kernel_dim=4,
-            num_experts=2,
-            num_experts_per_tok=1,
-            moe_intermediate_size=64,
-        ),
-        validate=False,
-    )
-    config._set_ops_implementation(eager_ops_config())
-    model = Qwen4ExpTextModel(config).eval()
-
-    calls: list[dict[str, object]] = []
-    for layer in model.layers:
-        layer.linear_attn.veomni_chunk_gated_delta_rule = _RecordingGdnOp("fla_npu", calls)
-    config.ops_config.chunk_gated_delta_rule_implementation = "fla_npu"
-
-    chunk_table = [0, 0, 0, 1, 1, 0, 1, 1]
-    precompute_calls: list[tuple[tuple[int, ...], int, int, object]] = []
-
-    def fake_precompute(cu_seqlens, num_heads, chunk_size=64, device=None):
-        precompute_calls.append((tuple(int(x) for x in cu_seqlens.tolist()), num_heads, chunk_size, device))
-        return [0, 3, 6], {"64": None}, {"64": chunk_table}
-
-    monkeypatch.setattr(fla_npu, "precompute_varlen_metadata", fake_precompute)
-
-    input_ids = torch.randint(3, config.vocab_size, (1, 6))
-    with torch.no_grad():
-        model(input_ids=input_ids, use_cache=False, cu_seq_lens_q=torch.tensor([0, 3, 6], dtype=torch.int32))
-
-    assert precompute_calls == [((0, 3, 6), 16, 64, None)]
-    assert len(calls) == 2
-    assert [call["cu_seqlens_list"] for call in calls] == [[0, 3, 6]] * 2
-    assert [call["chunk_indices_list"] for call in calls] == [{"64": chunk_table}] * 2
-    assert calls[0]["cu_seqlens_list"] is calls[1]["cu_seqlens_list"]

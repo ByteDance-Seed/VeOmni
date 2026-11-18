@@ -26,6 +26,7 @@ intermediate arithmetic and reciprocal norms. QKV are materialized in BNSD.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 from torch import Tensor
@@ -129,6 +130,17 @@ def _prepare_chunk_indices_list(cu_seqlens: list[int] | Tensor, chunk_size: int)
     return indices
 
 
+@lru_cache(maxsize=8)
+def _chunk_indices_table(cu_seqlens: tuple[int, ...], chunk_size: int) -> tuple[int, ...]:
+    """Cache the host chunk-index table across the layers of one forward pass.
+
+    Keyed on the integer boundaries, never on the tensor: ``Tensor.__hash__``
+    is id-based, so a tensor key would hit for every layer while pinning device
+    memory and going cold whenever the caller rebuilds the tensor.
+    """
+    return tuple(_prepare_chunk_indices_list(list(cu_seqlens), chunk_size))
+
+
 def _as_int_list(value: list[int] | Tensor | None) -> list[int] | None:
     """Normalize an optional integer tensor or sequence to a Python list."""
     if value is None:
@@ -194,7 +206,7 @@ def _ensure_varlen_metadata(
     list_indices = _as_chunk_list_dict(chunk_indices_list, chunk_size)
     key = str(chunk_size)
     if list_indices.get(key) is None:
-        list_indices[key] = _prepare_chunk_indices_list(cu_seqlens_list, chunk_size)
+        list_indices[key] = list(_chunk_indices_table(tuple(cu_seqlens_list), chunk_size))
     return cu_seqlens, cu_seqlens_list, tensor_indices, list_indices
 
 
@@ -390,8 +402,9 @@ def forward(
     are rejected. Extra NPU varlen tables are accepted; missing
     host chunk tables are filled from ``cu_seqlens`` without device uploads.
     Grouped value attention is supported natively: ``q``/``k`` may have fewer
-    heads than ``v`` as long as the value head count is a multiple of theirs,
-    and ``g``/``beta`` stay in value-head space.
+    heads than ``v``, with ``Hv/Hk`` an integer in ``{1, 2, 3, 4}``, and
+    ``g``/``beta`` stay in value-head space. Grouped value heads require the
+    26.10 AscendC kernels; older builds must keep the expanded q/k path.
     """
     from ...vendor.triton.utils import input_guard
 
@@ -420,9 +433,13 @@ def forward(
         raise ValueError(f"q/k shape prefixes must match, got {query_h.shape}, {key_h.shape}.")
     if value_h.shape[0] != query_h.shape[0] or value_h.shape[2] != query_h.shape[2]:
         raise ValueError(f"q/k/v batch and sequence dims must match, got {query_h.shape}, {value_h.shape}.")
-    if value_h.shape[1] % query_h.shape[1] != 0:
+    key_heads, value_heads = query_h.shape[1], value_h.shape[1]
+    # The composite backward rejects Hv/Hk outside [1, 4]; refuse it here rather
+    # than surfacing an operator error after the forward has already run.
+    if value_heads % key_heads != 0 or value_heads // key_heads > 4:
         raise ValueError(
-            f"value head count must be a multiple of q/k head count (GVA), got q/k={query_h.shape[1]}, v={value_h.shape[1]}."
+            "value head count must be 1-4x the q/k head count (grouped value attention), "
+            f"got q/k={key_heads}, v={value_heads}."
         )
     if g.shape != beta.shape:
         raise ValueError(f"g and beta shapes must match, got {g.shape} and {beta.shape}.")

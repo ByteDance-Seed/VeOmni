@@ -899,6 +899,44 @@ def test_fla_npu_accepts_grouped_value_heads(
     assert seen == [("forward", *expected), ("backward", *expected)]
 
 
+def test_fla_npu_rejects_value_head_ratio_above_four(_stub_npu_input_guard: None) -> None:
+    """Hv/Hk above the composite backward's [1, 4] domain must be refused."""
+    module = import_module("veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.fla_npu")
+
+    batch, seq, key_heads, value_heads, head_dim = 1, 4, 1, 5, 128
+    query = torch.randn(batch, seq, key_heads, head_dim, dtype=torch.bfloat16)
+    key = torch.randn(batch, seq, key_heads, head_dim, dtype=torch.bfloat16)
+    value = torch.randn(batch, seq, value_heads, head_dim, dtype=torch.bfloat16)
+    g = torch.randn(batch, seq, value_heads, dtype=torch.float32)
+    beta = torch.randn(batch, seq, value_heads, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="1-4x the q/k head count"):
+        module.forward(query, key, value, g, beta)
+
+
+def test_fla_npu_chunk_table_cache_spans_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The host chunk table is built once per distinct boundary list."""
+    module = import_module("veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.fla_npu")
+    module._chunk_indices_table.cache_clear()
+
+    built: list[tuple[int, ...]] = []
+    original = module._prepare_chunk_indices_list
+
+    def counting(cu_seqlens, chunk_size):
+        built.append(tuple(int(x) for x in cu_seqlens))
+        return original(cu_seqlens, chunk_size)
+
+    monkeypatch.setattr(module, "_prepare_chunk_indices_list", counting)
+
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+    expected = original([0, 3, 6], 64)
+    for _ in range(3):
+        _, _, _, tables = module._ensure_varlen_metadata(None, cu_seqlens, 64)
+        assert tables["64"] == expected
+
+    assert built == [(0, 3, 6)]
+
+
 def _require_fla_npu() -> None:
     """Skip unless the optional AscendC fla_npu package and an NPU exist."""
     if not IS_NPU_AVAILABLE:
@@ -910,14 +948,19 @@ def _require_fla_npu() -> None:
 
 
 @pytest.mark.parametrize("packed", [False, True])
-def test_fla_npu_grouped_value_heads_match_expanded_reference(packed: bool) -> None:
-    """Grouped q/k heads must match the explicit-expansion reference kernel."""
+@pytest.mark.parametrize(("key_heads", "value_heads"), [(2, 4), (2, 6)])
+def test_fla_npu_grouped_value_heads_match_expanded_reference(packed: bool, key_heads: int, value_heads: int) -> None:
+    """Grouped q/k heads must match the explicit-expansion reference kernel.
+
+    ``(2, 4)`` is the ratio-2 layout Qwen3.5 and Qwen4-Exp use by default;
+    ``(2, 6)`` keeps a non-power-of-two ratio inside the documented domain.
+    """
     _require_fla_npu()
     grouped_op = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu").wrapper
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
 
     torch.manual_seed(0)
-    key_heads, value_heads, head_dim = 2, 6, 128
+    head_dim = 128
     ratio = value_heads // key_heads
     lengths = (128, 96, 160)
     total = sum(lengths)
