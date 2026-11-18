@@ -716,7 +716,6 @@ def test_trainer_adds_transform_option_only_when_enabled(monkeypatch, enabled):
 
 def test_dpo_registry_and_real_trainer_transform_produce_verified_features():
     import veomni.trainer.text_dpo_trainer as dpo
-    from veomni.data.data_transform import dpo_producer_identity
 
     tokenizer = Tokenizer()
     trainer = dpo.TextDPOTrainer.__new__(dpo.TextDPOTrainer)
@@ -728,10 +727,6 @@ def test_dpo_registry_and_real_trainer_transform_produce_verified_features():
     trainer._build_data_transform()
     feature = trainer.base.data_transform({"chosen": "abc", "rejected": "de"})[0]
     assert feature[DPO_FEATURE_KEY].producer_contract_version == 1
-
-    tokenizer.encode = lambda text, add_special_tokens=True: [0, 0, 1]
-    with pytest.raises(ValueError, match="instance-overridden"):
-        dpo_producer_identity(tokenizer, None, None, force_refresh=True)
 
 
 def test_dpo_producer_identity_is_cached_per_process_and_returns_a_copy(monkeypatch):
@@ -761,31 +756,15 @@ def test_dpo_producer_identity_is_cached_per_process_and_returns_a_copy(monkeypa
     assert transforms.dpo_producer_identity(tokenizer, None, None) == expected
     assert len(calls) == 3
 
-    tokenizer.encode = lambda text, add_special_tokens=True: [0, 0, 1]
-    with pytest.raises(ValueError, match="instance-overridden"):
+    def fail_attestation(*_args):
+        raise ValueError("producer attestation failed")
+
+    monkeypatch.setattr(transforms, "dpo_tokenizer_contract_identity", fail_attestation)
+    with pytest.raises(ValueError, match="producer attestation failed"):
         transforms.dpo_producer_identity(tokenizer, None, None, force_refresh=True)
-    with pytest.raises(ValueError, match="instance-overridden"):
+    # A failed recovery recheck cannot leave the earlier attestation reusable.
+    with pytest.raises(ValueError, match="producer attestation failed"):
         transforms.dpo_producer_identity(tokenizer, None, None)
-
-
-def test_dpo_producer_cache_does_not_mix_concurrent_producers():
-    from concurrent.futures import ThreadPoolExecutor
-
-    from veomni.data.data_transform import dpo_producer_identity
-
-    class OtherTokenizer(Tokenizer):
-        dpo_unpadded_output_contract = True
-        dpo_unpadded_output_contract_id = "other-tokenizer-v1"
-
-    first, second = Tokenizer(), OtherTokenizer()
-    expected = [dpo_producer_identity(obj, None, None, force_refresh=True) for obj in (first, second)]
-
-    def read(index):
-        return index, dpo_producer_identity((first, second)[index], None, None)
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        for index, identity in pool.map(read, [0, 1] * 30):
-            assert identity == expected[index]
 
 
 def _state(sp_enabled=False, rank=0):

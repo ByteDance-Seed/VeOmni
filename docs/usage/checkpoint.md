@@ -65,7 +65,7 @@ File-backed optimizer moments are separate and are not restricted here.
 | `model/**/optimizer/` | Optimizer state. | All ranks, via DCP |
 | `model/**/extra_state/extra_state_rank_{R}.pt` | Model-bound extra state: `lr_scheduler.state_dict()` and whatever the runtime contributes (e.g. the DiT condition model's RNG). | Rank R |
 | `loader/rank_{R}.pt` | Dataloader / sampler cursor. | Rank R |
-| `extra_state/rank_{R}.pt` | `global_step`, `environ_meter`, `channel_loss_callback`, `offline_cache_writer` (SeedOmni `offline_embedding` only), `torch_rng_state`; DPO runs also include `dpo_provenance_protocol` and `dpo_position`. | Rank R |
+| `extra_state/rank_{R}.pt` | `global_step`, `environ_meter`, `channel_loss_callback`, `torch_rng_state`, and `offline_cache_writer` for SeedOmni and DiT `offline_embedding`. Cursor-only DiT checkpoints also include `_veomni_offline_condition` for condition-model RNG; DPO runs include `dpo_provenance_protocol` and `dpo_position`. | Rank R |
 | `hf_ckpt/` | `model*.safetensors`, its index, and the model assets. Written when `train.checkpoint.save_hf_weights` is set and the run is not LoRA. | Rank 0, after a collective gather |
 | `lora_ckpt/` | `adapter_config.json`, `adapter_model.safetensors`. Written instead of `hf_ckpt/` when `model.lora_config` is set. | Rank 0, after a collective gather |
 | `checkpoint_manifest.json` | Format version, `global_step`, world size, and `model_state`: whether the step has a `model/` at all. Trainer-level completion only. | Rank 0, last |
