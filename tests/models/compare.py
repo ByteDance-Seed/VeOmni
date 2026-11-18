@@ -31,7 +31,7 @@ def eager_ops_config() -> SimpleNamespace:
         rms_norm_implementation="eager",
         rotary_pos_emb_implementation="eager",
         rotary_pos_emb_vision_implementation="eager",
-        swiglu_mlp_implementation="eager",
+        gated_mlp_implementation="eager",
         load_balancing_loss_implementation="eager",
         moe_implementation="eager",
         rms_norm_gated_implementation="eager",

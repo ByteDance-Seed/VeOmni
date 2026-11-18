@@ -32,14 +32,14 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _model(**ops_fields) -> SimpleNamespace:
-    ops = SimpleNamespace(**{"linear_implementation": None, "swiglu_mlp_implementation": None, **ops_fields})
+    ops = SimpleNamespace(**{"linear_implementation": None, "gated_mlp_implementation": None, **ops_fields})
     return SimpleNamespace(config=SimpleNamespace(ops_config=ops, sub_configs={}))
 
 
 def _nested_model(**ops_fields) -> SimpleNamespace:
-    child_ops = SimpleNamespace(**{"linear_implementation": None, "swiglu_mlp_implementation": None, **ops_fields})
+    child_ops = SimpleNamespace(**{"linear_implementation": None, "gated_mlp_implementation": None, **ops_fields})
     child = SimpleNamespace(ops_config=child_ops, sub_configs={})
-    root_ops = SimpleNamespace(linear_implementation=None, swiglu_mlp_implementation=None)
+    root_ops = SimpleNamespace(linear_implementation=None, gated_mlp_implementation=None)
     return SimpleNamespace(
         config=SimpleNamespace(ops_config=root_ops, sub_configs={"text_config": None}, text_config=child)
     )
@@ -59,7 +59,7 @@ _TORCHAO_ROWS = ("torchao_nvfp4", "torchao_mxfp4")
 
 
 @pytest.mark.parametrize("impl", _TORCHAO_ROWS)
-@pytest.mark.parametrize("field", ["linear_implementation", "swiglu_mlp_implementation"])
+@pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
 def test_refuses_a_torchao_row_below_sm80(monkeypatch, field, impl):
     _device(monkeypatch, cuda=True, capability=79)
     with pytest.raises(RuntimeError, match="native BF16 support"):

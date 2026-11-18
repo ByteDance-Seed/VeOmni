@@ -75,6 +75,34 @@ class VLMTrainingArguments(TrainingArguments):
         metadata={"help": "Maximum learning rate for vit parameters."},
     )
 
+    freeze_ple_embeddings: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Freeze Qwen4-Exp PLE n-gram embedding tables. The forward lookup still "
+                "reads them, but they are excluded from the optimizer and Adam states."
+            )
+        },
+    )
+    frozen_ple_dtype: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Training-time dtype for frozen PLE tables: float32 or bfloat16. Requires freeze_ple_embeddings=true."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        """Validate VLM freeze settings and initialize inherited training options."""
+        if not isinstance(self.freeze_ple_embeddings, bool):
+            raise ValueError("freeze_ple_embeddings must be a boolean (true or false).")
+        if self.frozen_ple_dtype is not None and (
+            not self.freeze_ple_embeddings or self.frozen_ple_dtype not in ("float32", "bfloat16")
+        ):
+            raise ValueError("frozen_ple_dtype requires freeze_ple_embeddings and must be float32 or bfloat16")
+        super().__post_init__()
+
 
 @dataclass
 class VLMMDataArguments(DataArguments):
@@ -187,10 +215,24 @@ class VLMModelRuntime(VeOmniModelRuntime):
                 )
                 audio_proj.requires_grad_(True)
 
+        if getattr(train_args, "freeze_ple_embeddings", False):
+            from ..models.frozen_ple import freeze_ple_embeddings
+
+            count = freeze_ple_embeddings(self.model)
+            logger.info_rank0("Frozen PLE: %d tables", count)
+
         pretty_print_trainable_parameters(self.model)
         helper.print_device_mem_info("VRAM usage after building model")
 
     def _build_optimizer(self, param_groups=None):
+        if getattr(self.train_args, "freeze_ple_embeddings", False):
+            from ..models.frozen_ple import prepare_ple_storage
+            from ..utils.device import get_device_type
+
+            # Parallelization can upcast frozen parameters. Apply the requested
+            # table dtype after wrapping/loading and before optimizer construction.
+            prepare_ple_storage(self.model, self.train_args.frozen_ple_dtype, expected_device=get_device_type())
+
         if param_groups is not None:
             return super()._build_optimizer(param_groups=param_groups)
 

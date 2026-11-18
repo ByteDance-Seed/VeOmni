@@ -35,7 +35,6 @@ from transformers.utils import TransformersKwargs
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
     CausalLMOutputWithLogProbs,
@@ -60,7 +59,6 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
@@ -271,10 +269,10 @@ def gemma3_rmsnorm_forward_patched(self, x):
     return self.veomni_rms_norm(x, self.weight, eps=self.eps)
 
 
-@config.modify_init("Gemma3MLP", description="Bind instance-local geglu swiglu_mlp VeomniOp")
+@config.modify_init("Gemma3MLP", description="Bind instance-local geglu gated_mlp VeomniOp")
 def gemma3_mlp_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "geglu", self.config.ops_config.swiglu_mlp_implementation)
+    self.veomni_gated_mlp = VeomniOp("gated_mlp", "geglu", self.config.ops_config.gated_mlp_implementation)
 
 
 @config.override_method(
@@ -338,22 +336,13 @@ def gemma3_multimodal_projector_init_patched(self, config):
 
 @config.override_method(
     "Gemma3MLP.forward",
-    description="Call geglu swiglu_mlp for gelu_pytorch_tanh on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the geglu gated_mlp row, which picks fused weights or the projection modules",
 )
 def gemma3_mlp_forward_patched(self, x):
-    if self.config.hidden_activation in {"gelu_pytorch_tanh", "gelu_python_tanh"} and has_plain_linear_projections(
-        self
-    ):
-        return self.veomni_swiglu_mlp(
-            x,
-            self.gate_proj.weight,
-            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-            self.up_proj.weight,
-            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-            self.down_proj.weight,
-            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-        )
-    return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    # `hidden_activation` travels with the call: the variant computes GELU-tanh, and
+    # the row falls back to this block's own `act_fn` if the config asks for
+    # something else. That check used to be an `if` around the handle call.
+    return self.veomni_gated_mlp(self, x, activation=self.config.hidden_activation)
 
 
 @config.modify_init("Gemma3Attention", description="Bind instance-local rope and attention VeomniOps")

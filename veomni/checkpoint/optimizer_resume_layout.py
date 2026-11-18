@@ -62,8 +62,6 @@ def _model_storage_alias_graph(names, tensors, safe_rope_pairs=()):
         local = value.to_local() if isinstance(value, DTensor) else value
         if local.layout != torch.strided or local.device.type == "meta" or local.is_quantized:
             raise RuntimeError("Cannot prove model tensor storage aliases for non-strided, meta or quantized tensors")
-        if local.is_conj() or local.is_neg():
-            raise RuntimeError("Cannot safely restore lazy conjugate or negative model views")
         storage = local.untyped_storage()
         if local.device.type == "cpu" and getattr(storage, "filename", None) is not None:
             raise RuntimeError("Cannot prove aliases for file-backed model tensor storage")

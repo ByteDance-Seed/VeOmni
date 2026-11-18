@@ -63,7 +63,7 @@ def _flex_config() -> BagelQwen2MoTConfig:
         ops_implementation={
             "attn_implementation": "veomni_flex_attention",
             "rms_norm_implementation": "eager",
-            "swiglu_mlp_implementation": "eager",
+            "gated_mlp_implementation": "eager",
             "rotary_pos_emb_implementation": "eager",
         },
     )
