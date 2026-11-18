@@ -132,7 +132,7 @@ full, or it is built on meta.
   read only the config, never a parameter or buffer: parameters are meta
   tensors, and buffers keep the values the constructor gave them, not the
   checkpoint's. Under `fsdp_scope: model`,
-  [`_parallelize_composed_model`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L241)
+  [`_parallelize_composed_model`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L267)
   detaches cache readers before the composed wrap so they stay on meta and are
   not materialised with the rest.
 - **`offline_embedding`.** Every module, cached or not, is built and
