@@ -1895,3 +1895,43 @@ def test_the_expert_parallel_functions_receive_the_activation_and_act_fn():
         assert "ctx.act_fn" in body, f"{cls.name}.backward does not read the saved act_fn"
 
     assert checked == 2, f"expected both EP Functions, checked {checked}"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_every_backward_keeps_its_weight_gradient_inside_the_requires_grad_guard():
+    """A ``requires_grad``-guarded wgrad must stay inside that guard.
+
+    Adding a branch around the activation is easy to get wrong in a way that reads
+    fine: the ``group_gemm_same_mn`` that produces ``grad_fc2_weight`` was left inside
+    the *non*-SiLU branch, so the SiLU path -- every real training run -- skipped that
+    weight's gradient entirely. Nothing raised; the loss simply diverged from the
+    configuration that computes it correctly, which is what the expert-parallel
+    alignment test caught.
+
+    Static because these paths need a GPU and an EP group.
+    """
+    import ast
+    import pathlib
+
+    from veomni.ops.kernels.moe_experts.shared import ep as ep_module
+
+    problems = []
+    for module in (triton_module, ep_module):
+        for cls in (
+            n for n in ast.parse(pathlib.Path(module.__file__).read_text()).body if isinstance(n, ast.ClassDef)
+        ):
+            backward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "backward"), None)
+            if backward is None:
+                continue
+            # every `if <weight>.requires_grad:` must contain the GEMM writing that weight
+            for node in ast.walk(backward):
+                if not isinstance(node, ast.If):
+                    continue
+                test = ast.unparse(node.test)
+                if "requires_grad" not in test:
+                    continue
+                body = ast.unparse(node)
+                if "group_gemm" not in body:
+                    problems.append(f"{cls.name}: `if {test}` computes no weight gradient")
+
+    assert not problems, f"a weight gradient moved out of its guard: {problems}"
