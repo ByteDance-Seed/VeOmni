@@ -13,13 +13,14 @@
 # limitations under the License.
 
 
+import copy
 import math
 from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
 from torch.utils.data import Dataset, IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
-from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+from torchdata.stateful_dataloader.sampler import BatchSampler, StatefulDistributedSampler
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
@@ -144,6 +145,50 @@ class DistributedDataloader(StatefulDataLoader):
 
     def state_dict(self):
         state = super().state_dict()
+        if (
+            self.num_workers == 0
+            and type(self.sampler) is StatefulDistributedSampler
+            and type(self.batch_sampler) is BatchSampler
+            and self.batch_sampler.sampler is self.sampler
+        ):
+            # torchdata applies a restored sampler cursor lazily on the first
+            # next(). A second checkpoint before that next() must serialize
+            # the pending cursor, not the sampler's initial yielded=0.
+            if not hasattr(self.sampler, "next_yielded"):
+                raise RuntimeError("Cannot serialize an unrecognized StatefulDistributedSampler cursor")
+            pending = self.sampler.next_yielded
+            batch_pending = getattr(self.batch_sampler, "next_yielded", None)
+            if pending is not None or batch_pending is not None:
+                iterator = state.get("_sampler_iter_state") if isinstance(state, dict) else None
+                index = state.get("_index_sampler_state") if isinstance(state, dict) else None
+                if isinstance(iterator, dict) and index is None:
+                    key = "_sampler_iter_state"
+                    if batch_pending is not None:
+                        raise RuntimeError("Cannot serialize an unrecognized torchdata batch sampler snapshot")
+                elif iterator is None and isinstance(index, dict):
+                    key = "_index_sampler_state"
+                else:
+                    raise RuntimeError("Cannot serialize an unrecognized torchdata sampler snapshot")
+                state = copy.deepcopy(state)
+                snapshot = state[key]
+                if pending is not None:
+                    sampler = snapshot.get("sampler_state")
+                    if (
+                        not isinstance(sampler, dict)
+                        or type(sampler.get("yielded")) is not int
+                        or type(pending) is not int
+                        or pending < 0
+                    ):
+                        raise RuntimeError("Cannot serialize an unrecognized torchdata sampler snapshot")
+                    sampler["yielded"] = pending
+                if batch_pending is not None:
+                    if (
+                        type(snapshot.get("samples_yielded")) is not int
+                        or type(batch_pending) is not int
+                        or batch_pending < 0
+                    ):
+                        raise RuntimeError("Cannot serialize an unrecognized torchdata batch sampler snapshot")
+                    snapshot["samples_yielded"] = batch_pending
         if self._weighted_resume_dataset is not None:
             state = dict(state)
             state["_veomni_weighted_geometry"] = self._weighted_resume_geometry()

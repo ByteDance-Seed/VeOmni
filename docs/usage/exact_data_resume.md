@@ -75,6 +75,16 @@ the standard `StatefulDistributedSampler` starts from the beginning of the
 new epoch rather than reusing the previous epoch's cursor. The normal
 new-epoch iterator is still created after RNG restoration.
 
+The locked runtime uses `torchdata` 0.11. With the older 0.9/0.10 batch
+sampler, restoring a nonzero-step plain `DistributedSampler` cursor is
+rejected because the sampler epoch cannot be proven. A native fixed loader
+with `StatefulDistributedSampler` and workers is also rejected at an epoch
+boundary on those versions, as is a dynamic loader with workers when the
+runtime cannot establish ordered delivery. Use the locked runtime for these
+cases. Saving again before a restored zero-worker sampler advances preserves
+its pending cursor; an unrecognized sampler snapshot fails rather than
+writing a cursor that may replay samples.
+
 `GlobalStateCallback.load_global_state` normally primes `iter(loader)` for a
 non-strict loader resumed at an epoch boundary. It primes the supported native
 loaders described above before restoring the CPU RNG, and other loaders after

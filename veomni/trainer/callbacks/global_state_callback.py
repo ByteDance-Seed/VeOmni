@@ -760,7 +760,7 @@ class GlobalStateCallback(Callback):
                             not source.persistent_workers
                             or (weighted_epoch_source and dataset.supports_persistent_epoch_cold_resume)
                         )
-                        and (source.num_workers == 0 or source.in_order is True)
+                        and (source.num_workers == 0 or getattr(source, "in_order", None) is True)
                         and isinstance(cursor.get("dataloader_state"), dict)
                         and bool(cursor["dataloader_state"])
                     )
@@ -789,6 +789,31 @@ class GlobalStateCallback(Callback):
             from ...data.data_loader import DistributedDataloader
 
             raw_loader = loader._dataloader if type(loader) is DynamicBatchSizeDataLoader else loader
+            if type(raw_loader) is DistributedDataloader and global_step > 0 and cursor is not None:
+                from torch.utils.data.distributed import DistributedSampler
+                from torchdata.stateful_dataloader.sampler import BatchSampler, StatefulDistributedSampler
+
+                if (
+                    type(raw_loader.batch_sampler) is BatchSampler
+                    and raw_loader.batch_sampler.sampler is raw_loader.sampler
+                    and raw_loader.generator is None
+                    and not isinstance(raw_loader.dataset, torch.utils.data.IterableDataset)
+                    and hasattr(raw_loader.batch_sampler, "next_yielded")
+                    and (
+                        type(raw_loader.sampler) is DistributedSampler
+                        or (
+                            type(loader) is DistributedDataloader
+                            and type(raw_loader.sampler) is StatefulDistributedSampler
+                            and raw_loader.num_workers > 0
+                            and args.train_steps > 0
+                            and global_step % args.train_steps == 0
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        "Exact resume with this torchdata BatchSampler cannot prove the saved epoch; "
+                        "use the locked torchdata 0.11 runtime"
+                    )
             if (
                 isinstance(raw_loader, DistributedDataloader)
                 and type(raw_loader) is not DistributedDataloader
@@ -968,14 +993,15 @@ class GlobalStateCallback(Callback):
             ):
                 from torchdata.stateful_dataloader.sampler import BatchSampler, StatefulDistributedSampler
 
-                if (
-                    type(loader.sampler) is StatefulDistributedSampler
-                    and type(loader.batch_sampler) is BatchSampler
-                    and loader.batch_sampler.sampler is loader.sampler
-                ):
+                if type(loader.batch_sampler) is BatchSampler and loader.batch_sampler.sampler is loader.sampler:
                     # Loading the old iterator installs a lazy sampler cursor.
                     # The training loop starts a new epoch, not that cursor.
-                    loader.sampler.load_state_dict({"yielded": 0})
+                    if type(loader.sampler) is StatefulDistributedSampler:
+                        loader.sampler.load_state_dict({"yielded": 0})
+                    # torchdata 0.9/0.10 additionally cache the old epoch's
+                    # batch-sampler cursor; 0.11 moved it to the iterator.
+                    if hasattr(loader.batch_sampler, "next_yielded"):
+                        loader.batch_sampler.next_yielded = 0
 
         restore_local(lambda: prime_epoch_loader(native=True), "initializing the native data iterator")
 

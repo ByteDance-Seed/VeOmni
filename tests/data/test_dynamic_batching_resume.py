@@ -1003,6 +1003,12 @@ def test_native_plain_loader_resume_preserves_sample_order_and_cpu_rng(workers, 
             "torch_rng_state": saved_rng,
             "device_rng_state": saved_rng,
         }
+        if (hasattr(restored.batch_sampler, "next_yielded") and phase not in {"initial", "initial_with_cursor"}) and (
+            sampler_kind == "torch" or (workers and phase in {"epoch_boundary", "exhausted_boundary"})
+        ):
+            with pytest.raises(ValueError, match="cannot prove the saved epoch"):
+                callback.load_global_state()
+            return
         callback.load_global_state()
         assert torch.equal(torch.get_rng_state(), saved_rng)
         restored.set_epoch(trainer.start_epoch)
@@ -1370,6 +1376,106 @@ def test_dynamic_trainer_state_records_epoch_and_input_contract():
     assert state["train_dataloader"]["_veomni_resume_geometry"]["dataset_fingerprint"]
 
 
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("advance", [0, 1])
+def test_resave_before_first_resumed_step_keeps_sampler_cursor(dynamic, advance):
+    from types import SimpleNamespace
+
+    from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
+    from veomni.data.data_loader import DistributedDataloader
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback, _dynamic_resume_context
+
+    class Meter:
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, _):
+            pass
+
+    def make_loader():
+        if dynamic:
+            return _native_mapping_loader()
+        dataset = torch.utils.data.TensorDataset(torch.arange(24))
+        sampler = StatefulDistributedSampler(dataset, num_replicas=1, rank=0, shuffle=True, seed=7)
+        return DistributedDataloader(dataset, sampler=sampler, batch_size=1, num_workers=0)
+
+    def make_trainer(loader):
+        trainer = (
+            _native_resume_trainer(loader)
+            if dynamic
+            else SimpleNamespace(
+                args=SimpleNamespace(
+                    train=SimpleNamespace(global_rank=0, checkpoint=SimpleNamespace(load_path="/unused")),
+                    train_steps=4,
+                ),
+                state=SimpleNamespace(global_step=0, epoch=0),
+                train_dataloader=loader,
+                channel_loss_callback=None,
+                offline_cache_writer=None,
+            )
+        )
+        trainer.environ_meter = Meter()
+        return trainer
+
+    def restore(state):
+        loader = make_loader()
+        trainer = make_trainer(loader)
+        callback = GlobalStateCallback.__new__(GlobalStateCallback)
+        callback.trainer = trainer
+        callback._read_current = lambda _: copy.deepcopy(state)
+        callback.load_global_state()
+        return callback, trainer, loader
+
+    def sample_id(batch):
+        return int(batch[0][0]["id"]) if dynamic else int(batch[0].item())
+
+    torch.manual_seed(12345)
+    source = make_loader()
+    source.set_epoch(0)
+    iterator = iter(source)
+    next(iterator)
+    next(iterator)
+    rng = torch.get_rng_state().clone()
+    state = {
+        "global_step": 2,
+        "train_dataloader": copy.deepcopy(source.state_dict()),
+        "torch_rng_state": rng,
+        "device_rng_state": rng,
+    }
+    if dynamic:
+        state["_veomni_dynamic_context"] = _dynamic_resume_context(make_trainer(source).args, 0)
+    expected = [(sample_id(next(iterator)), torch.rand(2)) for _ in range(advance + 3)]
+    callback, first_trainer, first_restored = restore(state)
+    if advance:
+        first_restored.set_epoch(first_trainer.start_epoch)
+        assert sample_id(next(iter(first_restored))) == expected[0][0]
+        torch.testing.assert_close(torch.rand(2), expected[0][1], rtol=0, atol=0)
+        callback.on_step_begin(SimpleNamespace(global_step=3, epoch=0))
+    resaved = callback.state_dict(SimpleNamespace(global_step=2 + advance, epoch=0))
+    _, trainer, restored = restore(resaved)
+    restored.set_epoch(trainer.start_epoch)
+    iterator = iter(restored)
+    for expected_id, expected_rng in expected[advance:]:
+        assert sample_id(next(iterator)) == expected_id
+        torch.testing.assert_close(torch.rand(2), expected_rng, rtol=0, atol=0)
+
+
+def test_unrecognized_pending_sampler_snapshot_fails_closed(monkeypatch):
+    from torchdata.stateful_dataloader import StatefulDataLoader
+    from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
+
+    from veomni.data.data_loader import DistributedDataloader
+
+    dataset = torch.utils.data.TensorDataset(torch.arange(5))
+    sampler = StatefulDistributedSampler(dataset, num_replicas=1, rank=0)
+    loader = DistributedDataloader(dataset, sampler=sampler, batch_size=1, num_workers=0)
+    sampler.next_yielded = 2
+    monkeypatch.setattr(StatefulDataLoader, "state_dict", lambda _: {"_sampler_iter_state": {"sampler_state": {}}})
+    with pytest.raises(RuntimeError, match="unrecognized torchdata sampler snapshot"):
+        loader.state_dict()
+
+
 def test_non_sft_loader_retains_legacy_resume_path(monkeypatch):
     from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 
@@ -1539,6 +1645,16 @@ def test_dynamic_epoch_boundary_fresh_process_matches_uninterrupted(tmp_path, wo
         iterator = getattr(loader, "_data_iter", None)
         if iterator is not None and hasattr(iterator, "_shutdown_workers"):
             iterator._shutdown_workers()
+    if workers and not hasattr(loader._dataloader, "in_order"):
+        from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+        target = _native_mapping_loader(workers=workers)
+        callback = GlobalStateCallback.__new__(GlobalStateCallback)
+        callback.trainer = _native_resume_trainer(target)
+        callback._read_current = lambda _: saved
+        with pytest.raises(RuntimeError, match="Cannot safely restore dynamic batching at this epoch boundary"):
+            callback.load_global_state()
+        return
     mp.spawn(_fresh_native_epoch_resume, args=(str(checkpoint_path), str(result_path), workers), nprocs=1, join=True)
     assert torch.load(result_path, weights_only=False) == expected
 
