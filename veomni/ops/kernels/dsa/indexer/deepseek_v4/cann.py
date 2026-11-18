@@ -47,10 +47,6 @@ from ......distributed.parallel_state import get_parallel_state, is_parallel_sta
 
 _SEGMENT_CAUSAL_MASK_MODE = 3
 
-#: Context-parallel shard shapes whose ranges have already been checked. The check
-#: reads a device tensor, so it runs once per shape rather than once per layer.
-_CHECKED_CONTEXT_PARALLEL_RANGES: set[tuple[int, int, int, int, int]] = set()
-
 
 def _ops():
     from cann_ops_transformer import ops
@@ -203,6 +199,17 @@ def _context_parallel_offset(local_seq_len: int) -> int | None:
     return parallel_state.cp_rank * local_seq_len
 
 
+@lru_cache(maxsize=8)
+def _context_parallel_range_ends(seq_len: int, query_offset: int, compress_ratio: int, device: torch.device) -> Tensor:
+    """The ends canonical global position ids imply for a shard's query rows.
+
+    Cached because the tensor is rebuilt otherwise on every layer, not because
+    validating against it can be skipped: ``_select_context_parallel`` compares
+    the caller's ranges with it on every call.
+    """
+    return ((query_offset + torch.arange(seq_len, device=device) + 1) // compress_ratio).to(torch.int32)
+
+
 def _select_context_parallel(
     q: Tensor,
     k: Tensor,
@@ -226,26 +233,23 @@ def _select_context_parallel(
     sees ``[0, (query_offset + t + 1) // compress_ratio)``. Causal selection
     never reads past the last local query, so nothing is recomputed and no
     padding rows are scored; the narrowing is a slice of the gathered buffer, so
-    only the ``contiguous()`` copy the operator already made shrinks with it.
+    only the canonical copy the operands need shrinks with it.
     """
     batch, seq_len, num_heads, head_dim = q.shape
     prefix_len = (query_offset + seq_len) // compress_ratio
-    # Reading the ranges back is the one device sync here, so it happens once per
-    # shape: the shard geometry is fixed at launch and the model refuses explicit
-    # position_ids under sequence parallelism, so a later step cannot change it.
-    plan_key = (batch, seq_len, query_offset, compress_ratio, q.device.index or -1)
-    if plan_key not in _CHECKED_CONTEXT_PARALLEL_RANGES:
-        expected_ends = ((query_offset + torch.arange(seq_len, device=q.device) + 1) // compress_ratio).to(torch.int32)
-        # A rank whose ranges were built for another shard would still run, and
-        # mask from the wrong origin.
-        if not bool(((cu_seqlen_ks == 0) & (cu_seqlen_ke == expected_ends)).all()):
-            raise ValueError(
-                "dsa_indexer deepseek_v4 cann under context parallelism masks each local query from its "
-                "global row, so cu_seqlen_ks/cu_seqlen_ke must be the ranges canonical global position_ids "
-                f"imply for query rows [{query_offset}, {query_offset + seq_len}); use the eager or tilelang "
-                "implementation otherwise"
-            )
-        _CHECKED_CONTEXT_PARALLEL_RANGES.add(plan_key)
+    # The kernel never receives these ranges: it re-derives visibility from the
+    # geometry, so a caller whose ranges disagree would be masked canonically
+    # instead of refused. Every call therefore compares them with the ends the
+    # global position ids imply; only that expected tensor is cached, because the
+    # shard geometry is fixed at launch.
+    expected_ends = _context_parallel_range_ends(seq_len, query_offset, compress_ratio, q.device)
+    if not bool(((cu_seqlen_ks == 0) & (cu_seqlen_ke == expected_ends)).all()):
+        raise ValueError(
+            "dsa_indexer deepseek_v4 cann under context parallelism masks each local query from its "
+            "global row, so cu_seqlen_ks/cu_seqlen_ke must be the ranges canonical global position_ids "
+            f"imply for query rows [{query_offset}, {query_offset + seq_len}); use the eager or tilelang "
+            "implementation otherwise"
+        )
     if prefix_len == 0:
         empty = (batch, seq_len, 0)
         return q.new_empty(empty, dtype=torch.float32), q.new_empty(empty, dtype=torch.int32)
@@ -263,7 +267,11 @@ def _select_context_parallel(
     )
     indices, values = _ops().lightning_indexer(
         q.to(torch.bfloat16).contiguous(),
-        k[:, :prefix_len].to(torch.bfloat16).unsqueeze(2).contiguous(),
+        # ``contiguous()`` is a no-op on this narrowed prefix: torch ignores the
+        # strides of the size-1 batch dimension, so the view keeps the gathered
+        # buffer's leading stride and offset. The kernel compares strides
+        # numerically, so the prefix is materialized into a canonical buffer.
+        k[:, :prefix_len].to(torch.bfloat16).clone(memory_format=torch.contiguous_format).unsqueeze(2),
         weights.float().contiguous(),
         top_k,
         cmp_residual_k=residual,
@@ -430,14 +438,20 @@ def _select_packed_context_parallel(
             q.device,
         )
         # The kernel rejects views: a mid-table slice keeps its storage offset
-        # and batch-major stride, which the kernel reads as addressing on the
-        # wrong axis, and while batch size is 1 ``.contiguous()`` is a no-op on
-        # them. Every operand is materialized into a fresh contiguous buffer
-        # instead; the copies cost one segment-sized buffer per call.
+        # and a sample slice keeps the parent's row stride, which the kernel reads
+        # as addressing on the wrong axis. ``.contiguous()`` does not help -- torch
+        # ignores the strides of size-1 dimensions, so a batch of one is already
+        # "contiguous" and the offset survives -- and neither does a plain
+        # ``.clone()``, which copies the layout as-is. Every operand is materialized
+        # into a fresh canonical buffer instead; the copies cost one segment-sized
+        # buffer per call.
         indices, values = _ops().lightning_indexer(
-            q[:, rows].to(torch.bfloat16).clone(),
-            k[:, compressed_start : compressed_start + available].to(torch.bfloat16).clone().unsqueeze(2),
-            weights[:, rows].float().clone(),
+            q[:, rows].to(torch.bfloat16).clone(memory_format=torch.contiguous_format),
+            k[:, compressed_start : compressed_start + available]
+            .to(torch.bfloat16)
+            .clone(memory_format=torch.contiguous_format)
+            .unsqueeze(2),
+            weights[:, rows].float().clone(memory_format=torch.contiguous_format),
             top_k,
             cmp_residual_k=residual,
             metadata=metadata,

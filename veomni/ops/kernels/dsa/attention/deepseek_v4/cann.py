@@ -53,10 +53,6 @@ _ORI_SLIDING_CAUSAL_MASK_MODE = 4
 _CMP_SEGMENT_CAUSAL_MASK_MODE = 3
 
 
-# TEMPORARY: one-shot layout dump for the packed CP call; remove after diagnosis.
-_DEBUG_LAYOUT_LOGGED: list[bool] = []
-
-
 def _standard_layout(x: Tensor) -> Tensor:
     """Return ``x`` with row-major strides and a zero storage offset.
 
@@ -137,17 +133,22 @@ def _packed_context_parallel_call(
         if available == 0:
             # No compressed row is causally visible in this sample (a padding tail,
             # or a sample narrower than the rate): the sliding window is the whole
-            # result, which the eager row already implements.
+            # result, which the eager row already implements. The offset rebases the
+            # local queries onto the sample-local buffer -- ``position_ids`` only
+            # masks visibility, it does not address KV rows. ``cmp_kv`` is passed as
+            # a zero-row slice rather than ``None`` because its all-gather is a
+            # collective: dropping it here would skip this rank's backward.
             positions = torch.arange(first - start, last - start, device=q.device)
             outputs.append(
                 eager.wrapper(
                     q[:, rows],
                     ori_kv[:, start:last],
-                    None,
+                    cmp_kv[:, compressed_start:compressed_start],
                     attn_sink,
                     positions.unsqueeze(0).expand(q.shape[0], -1),
                     sliding_window=sliding_window,
                     compress_ratio=compress_ratio,
+                    query_offset=first - start,
                     sm_scale=sm_scale,
                 )
             )
@@ -155,16 +156,6 @@ def _packed_context_parallel_call(
         seg_q = _standard_layout(q[:, rows])
         seg_kv = _standard_layout(ori_kv[:, start:last].unsqueeze(2))
         seg_cmp = _standard_layout(cmp_kv[:, compressed_start : compressed_start + available].unsqueeze(2))
-        if not _DEBUG_LAYOUT_LOGGED:
-            _DEBUG_LAYOUT_LOGGED.append(True)
-            print(
-                f"[cp-debug] dev={q.device} q={tuple(seg_q.shape)} {seg_q.stride()}"
-                f" off={seg_q.storage_offset()}"
-                f" | ori_kv={tuple(seg_kv.shape)} {seg_kv.stride()} off={seg_kv.storage_offset()}"
-                f" | cmp_kv={tuple(seg_cmp.shape)} {seg_cmp.stride()} off={seg_cmp.storage_offset()}"
-                f" | slice=({start},{last}) q_off={query_offset} samples={len(slices)}",
-                flush=True,
-            )
         outputs.append(
             npu_sparse_flash_mla(
                 seg_q,
@@ -212,9 +203,11 @@ def wrapper(
     rows to end at the last KV row: a non-zero ``query_offset`` (context
     parallelism) is served by narrowing ``ori_kv`` to that prefix, and packed
     slices then need one call per sample because the TND path segments queries
-    and KV alike. It validates its own dtype, window, ratio and head-size
-    limits. Packed calls without CP take the TND path, which needs batch size 1
-    and reads the slice boundaries on the host.
+    and KV alike. A prefix that ends inside the first compression window holds no
+    compressed row at all; those queries run the eager row, since the kernel has
+    no mask mode for an empty compressed table. It validates its own dtype,
+    window, ratio and head-size limits. Packed calls without CP take the TND
+    path, which needs batch size 1 and reads the slice boundaries on the host.
     """
     if cmp_kv is None or cmp_kv.shape[1] == 0:
         return eager.wrapper(
@@ -234,7 +227,6 @@ def wrapper(
             dropout=dropout,
             return_attn_weights=return_attn_weights,
         )
-    del position_ids, attention_mask
     if dropout:
         raise ValueError("cann DeepSeek-V4 sparse attention requires dropout=0.")
     if return_attn_weights:
@@ -279,6 +271,26 @@ def wrapper(
             compress_ratio=compress_ratio,
             sm_scale=sm_scale,
         )
+    if kv_len < compress_ratio:
+        # The last local query ends inside the first compression window, so no
+        # compressed row is visible and the sliding window is the whole result.
+        # The kernel has no mask mode for an empty compressed table, so run the
+        # eager row. The zero-row slice keeps the all-gather in the autograd graph
+        # instead of dropping this rank's share of its backward.
+        return eager.wrapper(
+            q,
+            ori_kv[:, :kv_len],
+            cmp_kv[:, :0],
+            attn_sink,
+            position_ids,
+            sliding_window=sliding_window,
+            compress_ratio=compress_ratio,
+            candidates=candidates,
+            query_offset=query_offset,
+            attention_mask=attention_mask,
+            sm_scale=sm_scale,
+        )
+    del position_ids, attention_mask
     if ori_kv.shape[1] != kv_len:
         ori_kv = ori_kv[:, :kv_len]
         cmp_kv = cmp_kv[:, : kv_len // compress_ratio]

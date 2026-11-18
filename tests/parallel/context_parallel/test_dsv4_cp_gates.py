@@ -61,8 +61,8 @@ def _enable_npu_cp(monkeypatch):
 
 
 def _npu_ops_for_cp() -> dict:
-    # Only the pair the gate admits matters here; a real CP run is the shipped NPU
-    # config with these two fields switched to ``eager``.
+    # The selections the shipped NPU config carries. The tests below swap a field
+    # to ``cann`` -- the other admitted value -- and to a rejected one.
     return {"dsa_indexer_implementation": "eager", "dsa_attention_implementation": "eager"}
 
 
@@ -116,6 +116,13 @@ def test_gate_allows_npu_dsv4_cp_with_cann_dsa_ops(monkeypatch, field):
     _enable_npu_cp(monkeypatch)
     ops = _npu_ops_for_cp()
     ops[field] = "cann"
+
+    check_context_parallel_supported(_dsv4_with_ops(ops))
+
+
+def test_gate_allows_npu_dsv4_cp_with_both_cann_dsa_ops(monkeypatch):
+    _enable_npu_cp(monkeypatch)
+    ops = dict.fromkeys(_npu_ops_for_cp(), "cann")
 
     check_context_parallel_supported(_dsv4_with_ops(ops))
 
