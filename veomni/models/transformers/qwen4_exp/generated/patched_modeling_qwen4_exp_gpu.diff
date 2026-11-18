@@ -1363,7 +1363,7 @@
 
      def forward(
          self,
-@@ -874,25 +1422,21 @@
+@@ -874,25 +1422,20 @@
          top_k_index: torch.Tensor,
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
@@ -1398,13 +1398,12 @@
 +            self.gate_up_proj,
 +            num_experts=self.num_experts,
 +            activation=self.activation,
-+            act_fn=self.act_fn,
 +        )
 +        # --- Patch.1 ---
 
 
  class Qwen4ExpTextTopKRouter(nn.Module):
-@@ -916,6 +1460,12 @@
+@@ -916,6 +1459,12 @@
          return router_logits, router_scores, router_indices
 
 
@@ -1417,7 +1416,7 @@
  class Qwen4ExpTextSparseMoeBlock(nn.Module):
      def __init__(self, config):
          super().__init__()
-@@ -924,11 +1474,33 @@
+@@ -924,11 +1473,33 @@
          self.shared_expert = Qwen4ExpTextMLP(config, intermediate_size=config.shared_expert_intermediate_size)
          self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -1453,7 +1452,7 @@
          expert_output = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
 
          shared_expert_output = F.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
-@@ -938,13 +1510,21 @@
+@@ -938,13 +1509,21 @@
          return expert_output
 
 
@@ -1478,7 +1477,7 @@
          self.input_mix_weight_down = nn.Linear(hc_hidden_size, config.hc_lowrank, bias=False)
          self.input_mix_weight_up = nn.Linear(config.hc_lowrank, hc_hidden_size, bias=False)
          self.block_inject_weight = nn.Linear(hc_hidden_size, self.hc_count, bias=False) if use_combine else None
-@@ -970,9 +1550,13 @@
+@@ -970,9 +1549,13 @@
 
 
  _MASK64 = (1 << 64) - 1
@@ -1492,7 +1491,7 @@
  _PRIME_1 = 10007
 
 
-@@ -1015,8 +1599,14 @@
+@@ -1015,8 +1598,14 @@
      return prime
 
 
@@ -1508,7 +1507,7 @@
          super().__init__()
          self.layer_idx = layer_idx
          self.ngram_size = config.ngram_size
-@@ -1028,7 +1618,6 @@
+@@ -1028,7 +1617,6 @@
          self.ngram_vocab_size_base = config.ngram_vocab_size_base
          head_dim_per_ngram = embedding_dim // self.ngram_heads
          self.seed = config.seed
@@ -1516,7 +1515,7 @@
          self.eos_token_id = config.eos_token_id[0] if isinstance(config.eos_token_id, list) else config.eos_token_id
 
          self.head_vocab_sizes = []
-@@ -1046,9 +1635,29 @@
+@@ -1046,9 +1634,29 @@
          )
          self.ngram_heads_vocab_sizes = nn.Buffer(torch.tensor(self.head_vocab_sizes, dtype=torch.long))
          self.ngram_heads_offsets = nn.Buffer(torch.tensor(self.head_offsets, dtype=torch.long))
@@ -1549,7 +1548,7 @@
 
      def _shift_right_ignore_eos(self, token_ids: torch.Tensor, shift: int) -> torch.Tensor:
          if shift == 0:
-@@ -1066,19 +1675,183 @@
+@@ -1066,19 +1674,183 @@
          valid = (position_in_segment >= shift) & (source_positions.unsqueeze(0) >= 0)
          return torch.where(valid, shifted, token_ids.new_full((), self.eos_token_id))
 
@@ -1740,7 +1739,7 @@
              if (
                  not past_key_values.has_previous_state(self.layer_idx, state_idx=2)
                  and input_ids.shape[1] < self.context_len
-@@ -1090,28 +1863,48 @@
+@@ -1090,28 +1862,48 @@
                  input_ids_to_cache, self.layer_idx, state_idx=2, conv_kernel_size=self.context_len
              )
 
@@ -1797,7 +1796,7 @@
 
 
  class Qwen4ExpTextPLELayer(nn.Module):
-@@ -1122,8 +1915,8 @@
+@@ -1122,8 +1914,8 @@
      The returned tensor has shape `(batch_size, sequence_length, hc_count * hidden_size)`.
      """
 
@@ -1808,7 +1807,7 @@
          self.layer_idx = layer_idx
          self.hidden_size = config.hidden_size
          self.hc_count = config.hc_count
-@@ -1135,9 +1928,15 @@
+@@ -1135,9 +1927,15 @@
          self.short_conv_state_len = (conv_kernel_size - 1) * conv_dilation
          self.key_proj = nn.Linear(ple_embed_dim, hc_hidden_size, bias=False)
          self.value_proj = nn.Linear(ple_embed_dim, self.hidden_size, bias=False)
@@ -1827,7 +1826,7 @@
          self.conv1d = nn.Conv1d(
              hc_hidden_size,
              hc_hidden_size,
-@@ -1147,24 +1946,91 @@
+@@ -1147,24 +1945,91 @@
              bias=False,
          )
 
@@ -1935,7 +1934,7 @@
 
      def forward(
          self,
-@@ -1172,8 +2038,25 @@
+@@ -1172,8 +2037,25 @@
          input_ids: torch.Tensor,
          past_key_values: Cache | None,
          conv_mask: torch.Tensor | None = None,
@@ -1962,7 +1961,7 @@
          key_normed = self.norm_key(self.key_proj(embeddings)).unflatten(-1, (self.hc_count, self.hidden_size))
          value = self.value_proj(embeddings)
          query_normed = self.norm_query(hidden_states).unflatten(-1, (self.hc_count, self.hidden_size))
-@@ -1185,8 +2068,21 @@
+@@ -1185,8 +2067,21 @@
          if conv_mask is not None:
              gated_value = apply_mask_to_padding_states(gated_value, conv_mask)
              gated_value_normed = apply_mask_to_padding_states(gated_value_normed, conv_mask)
@@ -1985,7 +1984,7 @@
 
 
  class Qwen4ExpTextDecoderLayer(GradientCheckpointingLayer):
-@@ -1204,6 +2100,15 @@
+@@ -1204,6 +2099,15 @@
          self.attn_hyper_connection = Qwen4ExpTextGatedResidual(config)
          self.mlp_hyper_connection = Qwen4ExpTextGatedResidual(config)
 
@@ -2001,7 +2000,7 @@
      def forward(
          self,
          hidden_states: torch.Tensor,
-@@ -1212,17 +2117,42 @@
+@@ -1212,17 +2116,42 @@
          conv_mask: torch.Tensor | None = None,
          past_key_values: Cache | None = None,
          ple_input_ids: torch.LongTensor | None = None,
@@ -2047,7 +2046,7 @@
              )
          else:
              hidden_states, _ = self.self_attn(
-@@ -1230,6 +2160,9 @@
+@@ -1230,6 +2159,9 @@
                  position_embeddings,
                  attention_mask=attention_mask,
                  past_key_values=past_key_values,
@@ -2057,7 +2056,7 @@
                  **kwargs,
              )
 
-@@ -1308,6 +2241,12 @@
+@@ -1308,6 +2240,12 @@
 
      rope_deltas: torch.LongTensor | None = None
      router_logits: tuple[torch.FloatTensor] | None = None
@@ -2070,7 +2069,7 @@
 
 
  @auto_docstring
-@@ -1352,20 +2291,73 @@
+@@ -1352,20 +2290,73 @@
          """
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -2146,7 +2145,7 @@
              past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
              position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
              position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
-@@ -1381,31 +2373,45 @@
+@@ -1381,31 +2372,45 @@
          else:
              text_position_ids = None
 
@@ -2198,7 +2197,7 @@
          # CODEPATH: @ArthurZucker fix flagging for no reason here
          if self.config.ple_layer_ids and conv_mask is not None:
              eos_token_id = self.config.eos_token_id
-@@ -1416,16 +2422,40 @@
+@@ -1416,16 +2421,40 @@
          position_embeddings = self.rotary_emb(hidden_states, position_ids)
          hidden_states = hidden_states.repeat(1, 1, self.config.hc_count)
 
@@ -2241,7 +2240,7 @@
 
          hidden_states = self.hyper_connection_mixer(hidden_states)
 
-@@ -1435,12 +2465,6 @@
+@@ -1435,12 +2464,6 @@
          )
 
      def reverse_embedding(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
@@ -2254,7 +2253,7 @@
          with torch.no_grad():
              input_ids = (
                  (inputs_embeds[:, :, None, :] == self.embed_tokens.weight[None, None, :, :]).all(dim=3).nonzero()[:, 2]
-@@ -1448,11 +2472,15 @@
+@@ -1448,11 +2471,15 @@
              try:
                  input_ids = input_ids.view(inputs_embeds.shape[:2])
              except RuntimeError:
@@ -2274,7 +2273,7 @@
          return input_ids
 
 
-@@ -1718,21 +2746,14 @@
+@@ -1718,21 +2745,14 @@
          return x
 
 
@@ -2301,7 +2300,7 @@
      def __init__(self, config: Qwen4ExpVisionConfig) -> None:
          super().__init__()
          self.dim = config.hidden_size
-@@ -1745,13 +2766,16 @@
+@@ -1745,13 +2765,16 @@
          self.config = config
          self.attention_dropout = 0.0
          self.is_causal = False
@@ -2319,7 +2318,7 @@
          **kwargs,
      ) -> torch.Tensor:
          seq_length = hidden_states.shape[0]
-@@ -1759,20 +2783,29 @@
+@@ -1759,20 +2782,29 @@
              self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
          )
          cos, sin = position_embeddings
@@ -2358,7 +2357,7 @@
                  self,
                  query_states,
                  key_states,
-@@ -1787,28 +2820,6 @@
+@@ -1787,28 +2819,6 @@
                  is_causal=False,
                  **kwargs,
              )
@@ -2387,7 +2386,7 @@
 
          attn_output = attn_output.reshape(seq_length, -1).contiguous()
          attn_output = self.proj(attn_output)
-@@ -1845,6 +2856,12 @@
+@@ -1845,6 +2855,12 @@
          return hidden_states
 
 
@@ -2400,7 +2399,7 @@
  @auto_docstring
  class Qwen4ExpVisionModel(Qwen4ExpPreTrainedModel):
      config: Qwen4ExpVisionConfig
-@@ -1884,30 +2901,127 @@
+@@ -1884,30 +2900,127 @@
 
          self.post_init()
 
@@ -2550,7 +2549,7 @@
 
      @merge_with_config_defaults
      @capture_outputs
-@@ -1922,33 +3036,145 @@
+@@ -1922,33 +3035,145 @@
          Returns:
              `torch.Tensor`: hidden_states.
          """
@@ -2711,7 +2710,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -1959,6 +3185,39 @@
+@@ -1959,6 +3184,39 @@
              last_hidden_state=hidden_states,
              pooler_output=merged_hidden_states,
          )
@@ -2751,7 +2750,7 @@
 
 
  @auto_docstring
-@@ -1970,11 +3229,12 @@
+@@ -1970,11 +3228,12 @@
 
      def __init__(self, config):
          super().__init__(config)
@@ -2769,7 +2768,7 @@
          self.post_init()
 
      def get_vision_position_ids(
-@@ -2260,53 +3520,226 @@
+@@ -2260,53 +3519,226 @@
          mm_token_type_ids: torch.IntTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
      ) -> tuple | Qwen4ExpModelOutputWithPast:
@@ -3027,7 +3026,7 @@
          outputs = self.language_model(
              input_ids=None,
              position_ids=position_ids,
-@@ -2316,11 +3749,7 @@
+@@ -2316,11 +3748,7 @@
              ple_input_ids=ple_input_ids,
              **kwargs,
          )
@@ -3040,7 +3039,7 @@
 
 
  @auto_docstring
-@@ -2337,6 +3766,27 @@
+@@ -2337,6 +3765,27 @@
      aux_loss: torch.FloatTensor | None = None
 
 
@@ -3068,7 +3067,7 @@
  @auto_docstring
  class Qwen4ExpForConditionalGeneration(Qwen4ExpPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
-@@ -2346,11 +3796,23 @@
+@@ -2346,11 +3795,23 @@
 
      _fsdp_plan = {"lm_head": "keep_full_weight"}
 
@@ -3093,7 +3092,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -2396,47 +3858,10 @@
+@@ -2396,47 +3857,10 @@
          mm_token_type_ids: torch.IntTensor | None = None,
          logits_to_keep: int | torch.Tensor = 0,
          **kwargs: Unpack[TransformersKwargs],
@@ -3145,7 +3144,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -2448,33 +3873,64 @@
+@@ -2448,33 +3872,64 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -3225,7 +3224,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -2483,6 +3939,7 @@
+@@ -2483,6 +3938,7 @@
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
              router_logits=outputs.router_logits,
@@ -3233,7 +3232,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -2696,6 +4153,32 @@
+@@ -2696,6 +4152,32 @@
          }
          return causal_mask_mapping
 

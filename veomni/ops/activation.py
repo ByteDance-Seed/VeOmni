@@ -62,6 +62,7 @@ from torch import Tensor
 
 __all__ = [
     "SUPPORTED_ACTIVATIONS",
+    "resolve",
     "apply_activation",
     "apply_activation_backward",
     "normalize_activation",
@@ -184,6 +185,29 @@ def normalize_activation(activation: str) -> str:
             f"row will refuse instead."
         )
     return name
+
+
+def resolve(activation: str):
+    """Return the transformers callable for *activation*, whatever the name.
+
+    Unlike :func:`apply_activation` this does not restrict itself to
+    :data:`SUPPORTED_ACTIVATIONS`: a row that falls back to a reference path needs to
+    evaluate any name the model configured, and ``ACT2FN`` is the same table the model
+    built its own ``act_fn`` from.
+
+    Raises:
+        ValueError: if transformers has no implementation for the name.
+    """
+    from transformers.activations import ACT2FN
+
+    name = activation.value if hasattr(activation, "value") else activation
+    implementation = _resolver(name)
+    if implementation is None:
+        raise ValueError(
+            f"transformers has no implementation for activation {name!r}, so it cannot "
+            f"be evaluated. Known names are {sorted(ACT2FN)}."
+        )
+    return implementation
 
 
 def apply_activation(hidden: Tensor, activation: str) -> Tensor:

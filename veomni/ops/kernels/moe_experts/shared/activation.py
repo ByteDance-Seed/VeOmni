@@ -1,68 +1,48 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: Apache-2.0
 
-"""Which activation a SiLU-fused expert row can compute itself."""
+"""Activation handling shared by the ``moe_experts`` rows.
+
+A fused row computes SiLU inside its grouped GEMM, so any other activation has to be
+evaluated outside it. The name the model configured is the whole input needed: every
+model in this repository builds its ``act_fn`` as ``ACT2FN[config.hidden_act]``, so
+``veomni.ops.activation`` can resolve the same callable from the name alone.
+"""
 
 from __future__ import annotations
 
 import torch
 
 
-__all__ = ["activation_backward", "activation_is_not_silu", "is_silu"]
-
-
-def activation_is_not_silu(activation: str) -> bool:
-    """Whether *activation* has to leave a SiLU-fused kernel.
-
-    ``veomni.ops.activation.normalize_activation`` raises for a name outside its
-    closed set, but such a config is still runnable: the ``eager`` row falls back to
-    the model's own ``act_fn``, which is what the model ran before the activation
-    became a call argument. So this compares spellings rather than validating them --
-    the fallback is exactly what handles the names that validation would reject.
-    """
-    name = activation.value if hasattr(activation, "value") else activation
-    return name not in ("silu", "swish")
+__all__ = ["activation_backward", "is_silu"]
 
 
 def is_silu(activation: str) -> bool:
     """Whether *activation* is the one a SiLU-fused kernel computes.
 
-    A plain spelling comparison, not ``normalize_activation``: that raises for a name
-    outside ``veomni.ops.activation``, and such a config is still runnable through the
-    model's own ``act_fn``. Asking "is this SiLU?" must answer ``False`` for those, not
-    raise.
+    A plain spelling comparison rather than ``normalize_activation``: that raises for a
+    name outside the served set, and such a config is still runnable through the
+    reference row. Asking "is this SiLU?" must answer ``False`` for those, not raise.
     """
     name = activation.value if hasattr(activation, "value") else activation
     return name in ("silu", "swish")
 
 
-def activation_backward(grad_output, hidden, activation: str, act_fn=None):
+def activation_backward(grad_output, hidden, activation: str):
     """``grad_output * activation'(hidden)``, for a row's hand-written backward.
 
-    The four names ``veomni.ops.activation`` serves go through its ATen backward ops.
-    Anything else is differentiated through the caller's own ``act_fn``, which is what
-    the model ran before the activation became a call argument -- so a ``relu`` or
-    ``mish`` config keeps working instead of failing at its first backward.
-
-    Args:
-        grad_output: Upstream gradient.
-        hidden: The activation's input, in whatever dtype forward used.
-        activation: The configured name.
-        act_fn: The model's activation module, required when *activation* is outside
-            the served set.
+    The names ``veomni.ops.activation`` serves go through its ATen backward ops --
+    bit-exact against ``ACT2FN``'s autograd. Anything else is differentiated through
+    the same callable the model configured, so a ``relu`` or ``mish`` expert keeps
+    working instead of failing at its first backward.
     """
-    from ....activation import apply_activation_backward, supported_activations, supports
+    from ....activation import apply_activation_backward, resolve, supports
 
     if supports(activation):
         return apply_activation_backward(grad_output, hidden, activation)
-    if act_fn is None:
-        raise ValueError(
-            f"No activation module for {activation!r}. This row evaluates "
-            f"{sorted(supported_activations())}, and the caller passed no ``act_fn`` "
-            f"to differentiate anything else."
-        )
     # A fresh leaf under ``enable_grad``: this runs inside a custom Function's
     # backward, where grad mode is already off.
+    act_fn = resolve(activation)
     with torch.enable_grad():
         leaf = hidden.detach().clone().requires_grad_(True)
         (grad,) = torch.autograd.grad(act_fn(leaf), leaf, grad_output)

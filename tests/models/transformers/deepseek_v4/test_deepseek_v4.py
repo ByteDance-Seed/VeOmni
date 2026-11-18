@@ -206,12 +206,10 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
         # implementation name: V4-Flash stores routed experts in FP4 and its
         # dense projections in FP8, so one recipe name cannot describe both.
         "expert_dtype": getattr(config, "expert_dtype", "fp8"),
-        # The activation travels with the call: the rows evaluate whatever the
-        # model configures, so a non-SiLU model keeps its activation here. The
-        # module comes along for the reference row's fallback, which handles a name
-        # ``veomni.ops.activation`` does not evaluate.
+        # The activation travels with the call, and the name is the whole input: the
+        # rows resolve a name outside ``veomni.ops.activation`` through ``ACT2FN``,
+        # which is where the model built its own ``act_fn`` from.
         "activation": config.hidden_act,
-        "act_fn": experts.act_fn,
     }
     torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
 

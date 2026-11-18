@@ -10,14 +10,12 @@ block-quantized expert weights directly through its optional FP8 all-gather.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
-from ..shared.activation import activation_is_not_silu
+from ..shared.activation import is_silu
 
 
 def _experts(x, counts, fc1, fc2, swiglu_limit, recompute_weights=(True, True)):
@@ -83,7 +81,6 @@ def wrapper(
     block_size: int = 128,
     expert_dtype: str = "fp8",
     activation: str = "silu",
-    act_fn: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
     """Run FP8 expert GEMMs with BF16 inputs, outputs and first-order gradients.
 
@@ -94,7 +91,7 @@ def wrapper(
     capture. Routing weights are applied after the down projection, matching the
     eager expert contract rather than moving them through FP8 quantization.
     """
-    if activation_is_not_silu(activation):
+    if not is_silu(activation):
         # Refused here, before any of the FP8 math, because this is where the
         # quantization is decided. ``RecomputedSwiGLU`` computes SiLU inside the
         # grouped GEMM and recomputes it in the backward instead of saving it, so

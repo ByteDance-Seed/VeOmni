@@ -20,13 +20,11 @@ this row without ``apex`` / ``torch_mlu``. See ByteDance-Seed/VeOmni#903.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
 import torch
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
-from ..shared.activation import activation_is_not_silu
+from ..shared.activation import is_silu
 from ..shared.swiglu import apply_swiglu_clamp
 
 
@@ -296,10 +294,9 @@ def wrapper(
     block_size: int = 128,
     expert_dtype: str = "fp8",
     activation: str = "silu",
-    act_fn: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
     """Call the MLU fused MoE path. Empty weights are ``None``."""
-    if activation_is_not_silu(activation):
+    if not is_silu(activation):
         # This kernel computes SiLU inside the grouped GEMM, so another activation has
         # no seam here. The ``eager`` row runs the reference expert loop, which also
         # owns the expert-parallel dispatch those sharded weights need.
@@ -319,7 +316,6 @@ def wrapper(
             block_size=block_size,
             expert_dtype=expert_dtype,
             activation=activation,
-            act_fn=act_fn,
         )
     return mlu_group_gemm_fused_moe_forward(
         num_experts,

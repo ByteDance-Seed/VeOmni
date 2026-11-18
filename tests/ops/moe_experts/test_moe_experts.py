@@ -1727,7 +1727,6 @@ def test_the_eager_row_evaluates_an_activation_outside_the_whitelist(activation)
         gate_up,
         num_experts=experts,
         activation=activation,
-        act_fn=act_fn,
     )
 
     expected = torch.zeros(tokens, hidden)
@@ -1740,8 +1739,8 @@ def test_the_eager_row_evaluates_an_activation_outside_the_whitelist(activation)
 
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
 
-    # Without an act_fn there is nothing to evaluate it with, so it says so.
-    with pytest.raises(ValueError, match="No activation module"):
+    # A name transformers does not know is the only case with no answer at all.
+    with pytest.raises(ValueError, match="no implementation for activation"):
         eager.wrapper(
             x,
             routing,
@@ -1751,7 +1750,7 @@ def test_the_eager_row_evaluates_an_activation_outside_the_whitelist(activation)
             down,
             gate_up,
             num_experts=experts,
-            activation=activation,
+            activation="not_an_activation",
         )
 
 
@@ -1791,7 +1790,6 @@ def test_a_quantizing_row_refuses_an_activation_it_cannot_evaluate():
     ``moe_experts``' bf16 fused rows are the contrast: they delegate, because they
     round nothing and the reference path is exactly as precise.
     """
-    from transformers.activations import ACT2FN
 
     from veomni.ops.kernels.moe_experts.standard import deepgemm, qat
 
@@ -1816,7 +1814,6 @@ def test_a_quantizing_row_refuses_an_activation_it_cannot_evaluate():
                 gate_up,
                 num_experts=experts,
                 activation="relu",
-                act_fn=ACT2FN["relu"],
             )
 
 
@@ -1865,7 +1862,7 @@ def test_no_triton_function_forward_reads_the_activation_without_its_ctx_copy():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_the_expert_parallel_functions_receive_the_activation_and_act_fn():
+def test_the_expert_parallel_functions_receive_the_activation():
     """The EP path is selected before any of the non-EP code, so it needs its own pass.
 
     `fused_triton` dispatches to `EPGroupGemm` / `EPMergedFc1GroupGemm` when expert
@@ -1889,10 +1886,9 @@ def test_the_expert_parallel_functions_receive_the_activation_and_act_fn():
         checked += 1
         arguments = [argument.arg for argument in forward.args.args]
         assert "activation" in arguments, f"{cls.name}.forward does not take the activation"
-        assert "act_fn" in arguments, f"{cls.name}.forward does not take act_fn"
         body = ast.unparse(forward) + ast.unparse(backward)
         assert "_expert_activation" in body, f"{cls.name} evaluates the activation directly"
-        assert "ctx.act_fn" in body, f"{cls.name}.backward does not read the saved act_fn"
+        assert "ctx.activation" in body, f"{cls.name}.backward does not read the saved act_fn"
 
     assert checked == 2, f"expected both EP Functions, checked {checked}"
 
@@ -1957,7 +1953,7 @@ def test_the_shared_activation_backward_matches_autograd(activation):
     hidden = torch.randn(256, dtype=torch.bfloat16)
     grad = torch.randn(256, dtype=torch.bfloat16)
 
-    got = activation_backward(grad, hidden, activation, act_fn)
+    got = activation_backward(grad, hidden, activation)
 
     leaf = hidden.detach().clone().requires_grad_(True)
     (expected,) = torch.autograd.grad(act_fn(leaf), leaf, grad)

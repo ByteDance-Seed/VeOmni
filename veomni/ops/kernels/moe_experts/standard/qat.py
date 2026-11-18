@@ -23,8 +23,6 @@ describe both.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
 from torch import Tensor
 
 from ....activation import supported_activations, supports
@@ -106,7 +104,6 @@ def wrapper(
     block_size: int = 128,
     expert_dtype: str = "fp8",
     activation: str = "silu",
-    act_fn: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
     """Run fused MoE experts with fake-quantized activations and expert weights.
 
@@ -150,5 +147,4 @@ def wrapper(
         swiglu_limit=swiglu_limit,
         assume_distinct_experts=assume_distinct_experts,
         activation=activation,
-        act_fn=act_fn,
     )

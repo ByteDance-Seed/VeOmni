@@ -1695,7 +1695,6 @@ class DeepseekV4Experts(nn.Module):
             gate_up_proj,
             num_experts=self.num_experts,
             activation=self.activation,
-            act_fn=self.act_fn,
             swiglu_limit=self.limit,
             assume_distinct_experts=self.assume_distinct_experts,
             expert_dtype=self.expert_dtype,

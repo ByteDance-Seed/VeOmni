@@ -16,33 +16,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ....activation import apply_activation, supported_activations, supports
+from ....activation import apply_activation, resolve, supports
 from ..shared.act_fn_experts import merged_experts_act_fn_forward
 
 
-def _expert_activation(gate: Tensor, activation: str, act_fn: Callable[[Tensor], Tensor] | None) -> Tensor:
-    """Evaluate the configured activation, falling back to the model's own module.
+def _expert_activation(gate: Tensor, activation: str) -> Tensor:
+    """Evaluate the configured activation, whichever name it is.
 
-    ``veomni.ops.activation`` serves a closed set of names. A config outside it still
-    has an ``act_fn`` -- that is what the model ran before the activation became a
-    call argument -- so the reference row evaluates it rather than refusing to run.
-    Passing neither raises, which is the only case that has no answer.
+    ``veomni.ops.activation`` serves a closed set through ATen spellings that match the
+    fused rows bit for bit; anything else resolves through ``ACT2FN``, the same table
+    the model built its own ``act_fn`` from. So the row needs no module handed to it.
     """
-    if supports(activation):
-        return apply_activation(gate, activation)
-    if act_fn is None:
-        raise ValueError(
-            f"No activation module for {activation!r}. This row evaluates "
-            f"{sorted(supported_activations())}, and the caller passed no ``act_fn`` "
-            f"to cover anything else."
-        )
-    return act_fn(gate)
+    from ....activation import resolve, supports
+
+    return apply_activation(gate, activation) if supports(activation) else resolve(activation)(gate)
 
 
 def wrapper(
@@ -60,7 +51,6 @@ def wrapper(
     block_size: int = 128,
     expert_dtype: str = "fp8",
     activation: str = "silu",
-    act_fn: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
     """Routed expert MLP. Empty ``fc1_*`` means that layout is unused.
 
@@ -71,15 +61,15 @@ def wrapper(
     Regular autograd, no custom backward. ``assume_distinct_experts`` only
     tightens the Triton grouped-GEMM launch bound, so it is unused here.
 
-    ``act_fn`` is the model's own activation module, used when ``activation`` names
-    something ``veomni.ops.activation`` does not evaluate. An activation a fused row
-    cannot serve reaches this row, and a config outside the served set has to keep
-    working -- ``act_fn`` is what the model ran before the activation became a call
-    argument. The expert loop that handles it also owns the expert-parallel dispatch,
-    because the weights it indexes are sharded per rank under EP.
+    An activation a fused row cannot serve reaches this row. A name outside
+    ``veomni.ops.activation`` is resolved through ``ACT2FN`` -- the same table the
+    model built its ``act_fn`` from -- so a config that trained before the activation
+    became a call argument still trains. The expert loop that handles it also owns the
+    expert-parallel dispatch, because the weights it indexes are sharded per rank
+    under EP.
     """
     del assume_distinct_experts, block_size, expert_dtype
-    if act_fn is not None and not supports(activation):
+    if not supports(activation):
         # One implementation of the reference path, shared with the fused rows that
         # delegate here. It carries the EP dispatch, which is why this cannot be
         # inlined: indexing a sharded weight by global expert id reads past the shard.
@@ -98,7 +88,7 @@ def wrapper(
             routing_weights,
             merged,
             fc2_weight,
-            act_fn,
+            resolve(activation),
             num_experts,
             swiglu_limit,
         )
@@ -125,7 +115,7 @@ def wrapper(
         if swiglu_limit is not None:
             gate = gate.clamp(max=swiglu_limit)
             up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-        y = F.linear(_expert_activation(gate, activation, act_fn) * up, fc2_weight[idx])
+        y = F.linear(_expert_activation(gate, activation) * up, fc2_weight[idx])
         y = y * routing_weights[token_idx, top_k_pos, None]
         output = output.index_add(0, token_idx, y.to(output.dtype))
     return output

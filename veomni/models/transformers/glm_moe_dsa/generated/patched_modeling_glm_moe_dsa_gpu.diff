@@ -665,7 +665,7 @@
 
      def forward(
          self,
-@@ -556,25 +651,25 @@
+@@ -556,25 +651,24 @@
          top_k_index: torch.Tensor,
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
@@ -699,7 +699,6 @@
 +            self.gate_up_proj,
 +            num_experts=self.num_experts,
 +            activation=self.activation,
-+            act_fn=self.act_fn,
 +        )
 +
 +
@@ -710,7 +709,7 @@
 
 
  class GlmMoeDsaMoE(nn.Module):
-@@ -591,26 +686,33 @@
+@@ -591,26 +685,33 @@
              config=config, intermediate_size=config.moe_intermediate_size * config.n_shared_experts
          )
 
@@ -751,7 +750,7 @@
 
      def forward(
          self,
-@@ -677,6 +779,12 @@
+@@ -677,6 +778,12 @@
              init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
 
 
@@ -764,7 +763,7 @@
  @auto_docstring
  class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
      def __init__(self, config: GlmMoeDsaConfig):
-@@ -686,13 +794,12 @@
+@@ -686,13 +793,12 @@
 
          self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
          self.layers = nn.ModuleList(
@@ -782,7 +781,7 @@
          self.post_init()
 
      @merge_with_config_defaults
-@@ -756,6 +863,12 @@
+@@ -756,6 +862,12 @@
          )
 
 
@@ -795,7 +794,7 @@
  @auto_docstring
  class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -768,8 +881,9 @@
+@@ -768,8 +880,9 @@
          self.model = GlmMoeDsaModel(config)
          self.vocab_size = config.vocab_size
          self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -807,7 +806,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -783,52 +897,61 @@
+@@ -783,52 +896,61 @@
          inputs_embeds: torch.FloatTensor | None = None,
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
