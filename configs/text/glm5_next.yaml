@@ -1,0 +1,77 @@
+# GLM-5.3-Flash text SFT (eager-first). Point model_path at a BF16 (or dequantized)
+# checkpoint; official HF releases ship FP8 and need conversion first.
+#
+# For VLM SFT see configs/multimodal/glm5_next/glm5_next.yaml (requires a
+# multimodal chat_template such as qwen3vl).
+#
+# EP is wired through get_parallel_plan. Ulysses SP all-gathers the collapsed
+# token stream before each KDA/DSA block (correct, non-fused). Prefer
+# moe_implementation: eager for the first bring-up; fused_npu / fused_triton
+# remain available once validated.
+
+model:
+  model_path: /path/to/GLM-5.3-Flash-bf16
+  # Optional shrink of the HF text tower for single-node bring-up.
+  # Keep list lengths == num_hidden_layers (and linear_attn_config indices in range).
+  # Random/meta init only — do not pair this with a full-size checkpoint.
+  # model_config:
+  #   text_config:
+  #     num_hidden_layers: 4
+  #     first_k_dense_replace: 3
+  #     num_nextn_predict_layers: 0
+  #     layer_types: [linear_attention, linear_attention, linear_attention, deepseek_sparse_attention]
+  #     mlp_layer_types: [dense, dense, dense, sparse]
+  #     indexer_types: [full, full, full, full]
+  #     linear_attn_config:
+  #       num_heads: 64
+  #       gate_lower_bound: -5.0
+  #       head_dim: 128
+  #       short_conv_kernel_size: 4
+  #       kda_layers: [0, 1, 2]
+  #       full_attn_layers: [3]
+  #   vision_config:
+  #     depth: 2
+  ops_implementation:
+    attn_implementation: eager
+    moe_implementation: eager
+    cross_entropy_loss_implementation: chunk_loss
+    rms_norm_implementation: eager
+    swiglu_mlp_implementation: eager
+    rotary_pos_emb_implementation: eager
+    load_balancing_loss_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    ulysses_size: 1
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+  chat_template: chatml
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  max_seq_len: 2048
+  train_size: 750000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  num_train_epochs: 1
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: glm5-next-flash-sft
+    manager: dcp
+    save_steps: 0
+    save_epochs: 1
+    save_hf_weights: true
+  wandb: {enable: false}

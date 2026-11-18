@@ -217,6 +217,7 @@ guarantees:
 | qwen2_vl | ✅ wired | Own `collate_multimodal_metadata` (non-window ViT, same formula as qwen3_vl). |
 | qwen2_5_vl | ✅ wired | Window-attention ViT. `collate_multimodal_metadata` ports `get_window_index` host-side; `get_metadata_collate_func` `partial`-closes the vision-config dims. |
 | qwen2_5_omni | ✅ wired | Same window-attention ViT as qwen2_5_vl. Also exposes `get_extra_collate_infos` (audio); `get_metadata_collate_func` is patched on the thinker, the top-level model delegates. |
+| glm5_next | ✅ wired | Same temporal-unroll cu_seqlens formula as qwen3_vl. No M-RoPE (`get_position_id_func` returns 1D arange). Video `get_video_features` flattens `grid_thw` before the ViT; metadata cu_seqlens still match because both paths unroll `t`. |
 
 ## Adding the hook to a new model (checklist)
 

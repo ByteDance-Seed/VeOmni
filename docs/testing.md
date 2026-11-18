@@ -195,8 +195,8 @@ contracts beside the maintained implementation.
 | Model contracts | Family-specific routing, masking, multimodal, or checkpoint behavior |
 
 **Models covered**:
-- Text / MoE: llama3_1, qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3, deepseek_v4, glm_moe_dsa (`eager` attention only)
-- VLM: qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe
+- Text / MoE: llama3_1, qwen2, qwen3_5, qwen3_5_moe, seed_oss, deepseek_v3, deepseek_v4, glm_moe_dsa (`eager` attention only), glm5_next (`eager` KDA/DSA + EP/SP)
+- VLM: qwen2_vl, qwen2_5_vl, qwen3_vl, qwen3_vl_moe, glm5_next (`eager` + multimodal metadata / dummy_forward)
 - Omni: qwen2_5_omni, qwen3_omni_moe
 
 Most eager and registry coverage runs on CPU. Tests for optimized operators or

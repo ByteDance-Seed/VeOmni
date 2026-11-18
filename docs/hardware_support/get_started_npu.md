@@ -84,6 +84,7 @@ VeOmni supports a wide range of models on Ascend NPUs, including large language 
 | | 30B | ✅ | ✅ | ✅ | ✅ | |
 | [Wan2.1](../examples/wan2.1.md) | 1.3B | ✅ | ✅ | | ✅ | Prototype |
 | [Qwen3-Omni](../examples/qwen3_omni_moe.md) | 30B | ✅ | ✅ | | ✅ | Prototype |
+| GLM-5.3-Flash (`glm5_next`) | — | ✅ | ✅ | ✅ | ✅ | Eager KDA/DSA (gather-before-attn SP); EP via routed experts; prototype |
 
 **Legend:**
 - **FSDP2**: PyTorch composable Fully Sharded Data Parallel, the only FSDP backend supported by VeOmni
