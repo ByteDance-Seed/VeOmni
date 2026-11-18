@@ -347,6 +347,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             grad_fc2_weight,  # fc2_weight
             None,  # swiglu_limit
             None,  # assume_distinct_experts
+            None,  # activation
         )
 
 
@@ -584,6 +585,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             grad_fc2_weight,  # fc2_weight
             None,  # swiglu_limit
             None,  # assume_distinct_experts
+            None,  # activation
         )
 
 

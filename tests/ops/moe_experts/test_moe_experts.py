@@ -1646,3 +1646,36 @@ def test_every_ctx_attribute_a_backward_reads_is_assigned_in_forward():
 
     assert checked == 2, f"expected both Triton Functions, checked {checked}"
     assert not missing, f"backward reads an attribute its forward never sets: {missing}"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_every_triton_function_backward_returns_one_gradient_per_argument():
+    """A custom ``autograd.Function``'s backward must return one entry per argument.
+
+    Adding ``activation`` to ``forward`` widened the argument list, and the backward
+    tuples have to grow with it -- PyTorch reports the mismatch only at the first
+    training step ("returned an incorrect number of gradients (expected 9, got 8)"),
+    which on CPU never runs because these rows need a GPU. Two consecutive CI runs
+    failed this way, so it is checked here statically instead.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(triton_module.__file__).read_text()
+    mismatches = []
+    checked = 0
+    for cls in (n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)):
+        forward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward"), None)
+        backward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "backward"), None)
+        if forward is None or backward is None:
+            continue
+        checked += 1
+        # ``ctx`` is not part of the tuple PyTorch compares against.
+        arguments = len([argument for argument in forward.args.args if argument.arg != "ctx"])
+        returned = next((node for node in ast.walk(backward) if isinstance(node, ast.Return)), None)
+        entries = len(returned.value.elts) if isinstance(returned.value, ast.Tuple) else 1
+        if arguments != entries:
+            mismatches.append((cls.name, arguments, entries))
+
+    assert checked == 2, f"expected both Triton Functions, checked {checked}"
+    assert not mismatches, f"backward tuple does not match forward's arguments: {mismatches}"
