@@ -20,11 +20,13 @@ this row without ``apex`` / ``torch_mlu``. See ByteDance-Seed/VeOmni#903.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
-from ....activation import normalize_activation
+from ..shared.activation import activation_is_not_silu
 from ..shared.swiglu import apply_swiglu_clamp
 
 
@@ -294,11 +296,13 @@ def wrapper(
     block_size: int = 128,
     expert_dtype: str = "fp8",
     activation: str = "silu",
+    act_fn: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
     """Call the MLU fused MoE path. Empty weights are ``None``."""
-    if normalize_activation(activation) != "silu":
+    if activation_is_not_silu(activation):
         # This kernel computes SiLU inside the grouped GEMM; any other activation
-        # runs on the ``eager`` row, which is the reference implementation.
+        # -- including one ``veomni.ops.activation`` does not evaluate, which the
+        # ``eager`` row covers through the model's own ``act_fn`` -- runs there.
         from . import eager as _eager
 
         return _eager.wrapper(
@@ -315,6 +319,7 @@ def wrapper(
             block_size=block_size,
             expert_dtype=expert_dtype,
             activation=activation,
+            act_fn=act_fn,
         )
     return mlu_group_gemm_fused_moe_forward(
         num_experts,

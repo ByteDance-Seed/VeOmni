@@ -23,6 +23,8 @@ describe both.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from torch import Tensor
 
 from ....qat import FP4_BLOCK_SIZE, fp4_fake_quant_weight, fp8_fake_quant_act, fp8_fake_quant_stacked_weight
@@ -103,6 +105,7 @@ def wrapper(
     block_size: int = 128,
     expert_dtype: str = "fp8",
     activation: str = "silu",
+    act_fn: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
     """Run fused MoE experts with fake-quantized activations and expert weights.
 
@@ -132,4 +135,5 @@ def wrapper(
         swiglu_limit=swiglu_limit,
         assume_distinct_experts=assume_distinct_experts,
         activation=activation,
+        act_fn=act_fn,
     )

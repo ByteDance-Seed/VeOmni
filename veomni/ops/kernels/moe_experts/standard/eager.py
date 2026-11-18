@@ -16,11 +16,32 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ....activation import apply_activation
+from ....activation import apply_activation, supported_activations, supports
+
+
+def _expert_activation(gate: Tensor, activation: str, act_fn: Callable[[Tensor], Tensor] | None) -> Tensor:
+    """Evaluate the configured activation, falling back to the model's own module.
+
+    ``veomni.ops.activation`` serves a closed set of names. A config outside it still
+    has an ``act_fn`` -- that is what the model ran before the activation became a
+    call argument -- so the reference row evaluates it rather than refusing to run.
+    Passing neither raises, which is the only case that has no answer.
+    """
+    if supports(activation):
+        return apply_activation(gate, activation)
+    if act_fn is None:
+        raise ValueError(
+            f"No activation module for {activation!r}. This row evaluates "
+            f"{sorted(supported_activations())}, and the caller passed no ``act_fn`` "
+            f"to cover anything else."
+        )
+    return act_fn(gate)
 
 
 def wrapper(
@@ -38,6 +59,7 @@ def wrapper(
     block_size: int = 128,
     expert_dtype: str = "fp8",
     activation: str = "silu",
+    act_fn: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
     """Routed expert MLP. Empty ``fc1_*`` means that layout is unused.
 
@@ -72,7 +94,7 @@ def wrapper(
         if swiglu_limit is not None:
             gate = gate.clamp(max=swiglu_limit)
             up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-        y = F.linear(apply_activation(gate, activation) * up, fc2_weight[idx])
+        y = F.linear(_expert_activation(gate, activation, act_fn) * up, fc2_weight[idx])
         y = y * routing_weights[token_idx, top_k_pos, None]
         output = output.index_add(0, token_idx, y.to(output.dtype))
     return output

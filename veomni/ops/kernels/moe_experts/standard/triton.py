@@ -20,6 +20,8 @@ key.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 from torch import Tensor
 
@@ -521,7 +523,11 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         else:
             gate_grad = apply_activation_backward(grad_fc1_activation * fc1_2_output, fc1_1_output, ctx.activation)
             up_grad = grad_fc1_activation * apply_activation(fc1_1_output, ctx.activation)
-            if mask_fc1_1 is not None:
+            # Gate on ``swiglu_limit``, not on the mask tensors: forward saves an
+            # empty float tensor when clamping is off, so "is not None" is always
+            # true and ``~`` would be applied to a float. Same check as the split
+            # backward, which passes ``None`` through in that case.
+            if swiglu_limit is not None:
                 gate_grad.masked_fill_(~mask_fc1_1, 0)
                 up_grad.masked_fill_(~mask_fc1_2, 0)
             fc1_activation = apply_activation(fc1_1_output, ctx.activation) * fc1_2_output
@@ -710,8 +716,16 @@ def wrapper(
     block_size: int = 128,
     expert_dtype: str = "fp8",
     activation: str = "silu",
+    act_fn: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
-    """Call the Triton fused MoE Function. Empty weights are ``None``."""
+    """Call the Triton fused MoE Function. Empty weights are ``None``.
+
+    ``act_fn`` is accepted for signature parity with the rows that need it and
+    ignored here: this row evaluates the four names ``veomni.ops.activation``
+    serves, and a model outside that set is refused by ``apply_activation`` rather
+    than silently taking the reference path.
+    """
+    del act_fn
     del block_size, expert_dtype
     # Empty tensor = unused layout. Registry args stay tensors.
     return group_gemm_fused_moe_forward(

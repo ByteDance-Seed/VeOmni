@@ -470,7 +470,7 @@
 
      def forward(
          self,
-@@ -104,25 +419,18 @@
+@@ -104,25 +419,19 @@
          top_k_index: torch.Tensor,
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
@@ -504,11 +504,12 @@
 +            self.gate_up_proj,
 +            num_experts=self.num_experts,
 +            activation=self.activation,
++            act_fn=self.act_fn,
 +        )
 
 
  class Qwen3VLMoeTextTopKRouter(nn.Module):
-@@ -156,13 +464,6 @@
+@@ -156,13 +465,6 @@
          _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
          final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
          return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
@@ -522,7 +523,7 @@
 
 
  def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-@@ -202,38 +503,24 @@
+@@ -202,38 +504,24 @@
      return attn_output, attn_weights
 
 
@@ -576,7 +577,7 @@
          self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
          self.config = config
          self.layer_idx = layer_idx
-@@ -256,11 +543,13 @@
+@@ -256,11 +544,13 @@
              config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
          )
          self.q_norm = Qwen3VLMoeTextRMSNorm(
@@ -592,7 +593,7 @@
 
      def forward(
          self,
-@@ -268,8 +557,20 @@
+@@ -268,8 +558,20 @@
          position_embeddings: tuple[torch.Tensor, torch.Tensor],
          attention_mask: torch.Tensor | None,
          past_key_values: Cache | None = None,
@@ -613,7 +614,7 @@
          input_shape = hidden_states.shape[:-1]
          hidden_shape = (*input_shape, -1, self.head_dim)
 
-@@ -278,16 +579,13 @@
+@@ -278,16 +580,13 @@
          value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
          cos, sin = position_embeddings
@@ -635,7 +636,7 @@
              self,
              query_states,
              key_states,
-@@ -303,9 +601,15 @@
+@@ -303,9 +602,15 @@
          return attn_output, attn_weights
 
 
@@ -652,7 +653,7 @@
          self.config = config
          self.hidden_size = config.hidden_size
          self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
-@@ -313,14 +617,20 @@
+@@ -313,14 +618,20 @@
          self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
          self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
          self.act_fn = ACT2FN[config.hidden_act]
@@ -676,7 +677,7 @@
          super().__init__()
          self.self_attn = Qwen3VLMoeTextAttention(config, layer_idx)
          if (layer_idx not in config.mlp_only_layers) and (
-@@ -329,8 +639,10 @@
+@@ -329,8 +640,10 @@
              self.mlp = Qwen3VLMoeTextSparseMoeBlock(config)
          else:
              self.mlp = Qwen3VLMoeTextMLP(config, intermediate_size=config.intermediate_size)
@@ -689,7 +690,7 @@
          self.hidden_size = config.hidden_size
 
      def forward(
-@@ -415,21 +727,14 @@
+@@ -415,21 +728,14 @@
          return (position_ids.unsqueeze(-1) * self.inv_freq).flatten(1)
 
 
@@ -716,7 +717,7 @@
      def __init__(self, config: Qwen3VLMoeVisionConfig) -> None:
          super().__init__()
          self.dim = config.hidden_size
-@@ -442,13 +747,19 @@
+@@ -442,13 +748,19 @@
          self.config = config
          self.attention_dropout = 0.0
          self.is_causal = False
@@ -737,7 +738,7 @@
          **kwargs,
      ) -> torch.Tensor:
          seq_length = hidden_states.shape[0]
-@@ -456,56 +767,33 @@
+@@ -456,56 +768,33 @@
              self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
          )
          cos, sin = position_embeddings
@@ -816,7 +817,7 @@
 
          attn_output = attn_output.reshape(seq_length, -1).contiguous()
          attn_output = self.proj(attn_output)
-@@ -525,6 +813,12 @@
+@@ -525,6 +814,12 @@
          return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
 
 
@@ -829,7 +830,7 @@
  class Qwen3VLMoeVisionBlock(GradientCheckpointingLayer):
      def __init__(self, config, attn_implementation: str = "sdpa") -> None:
          super().__init__()
-@@ -533,21 +827,42 @@
+@@ -533,21 +828,42 @@
          self.attn = Qwen3VLMoeVisionAttention(config=config)
          self.mlp = Qwen3VLMoeVisionMLP(config=config)
 
@@ -873,7 +874,7 @@
              position_embeddings=position_embeddings,
              **kwargs,
          )
-@@ -602,6 +917,12 @@
+@@ -602,6 +918,12 @@
          return x
 
 
@@ -886,7 +887,7 @@
  class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
      config: Qwen3VLMoeVisionConfig
      input_modalities = ("image", "video")
-@@ -651,74 +972,246 @@
+@@ -651,74 +973,246 @@
 
          self.post_init()
 
@@ -1183,7 +1184,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -730,11 +1223,88 @@
+@@ -730,11 +1224,88 @@
 
          merged_hidden_states = self.merger(hidden_states)
 
@@ -1272,7 +1273,7 @@
 
 
  class Qwen3VLMoeTextRotaryEmbedding(nn.Module):
-@@ -818,6 +1388,12 @@
+@@ -818,6 +1389,12 @@
          return freqs_t
 
 
@@ -1285,7 +1286,7 @@
  @auto_docstring(
      custom_intro=(
          "Text part of Qwen3VLMoe, "
-@@ -828,7 +1404,7 @@
+@@ -828,7 +1405,7 @@
      config: Qwen3VLMoeTextConfig
      input_modalities = ("text",)
 
@@ -1294,7 +1295,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -837,13 +1413,18 @@
+@@ -837,13 +1414,18 @@
          self.layers = nn.ModuleList(
              [Qwen3VLMoeTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
          )
@@ -1315,7 +1316,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -892,13 +1473,18 @@
+@@ -892,13 +1474,18 @@
          else:
              text_position_ids = None
 
@@ -1340,7 +1341,7 @@
 
          hidden_states = inputs_embeds
 
-@@ -932,9 +1518,23 @@
+@@ -932,9 +1519,23 @@
              past_key_values=past_key_values,
          )
 
@@ -1364,7 +1365,7 @@
          visual_pos_masks = visual_pos_masks.to(hidden_states.device)
          visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
          hidden_states = hidden_states.clone()
-@@ -970,6 +1570,12 @@
+@@ -970,6 +1571,12 @@
      aux_loss: torch.FloatTensor | None = None
 
 
@@ -1377,7 +1378,7 @@
  @auto_docstring
  class Qwen3VLMoeModel(Qwen3VLMoePreTrainedModel):
      base_model_prefix = "model"
-@@ -978,11 +1584,9 @@
+@@ -978,11 +1585,9 @@
 
      def __init__(self, config):
          super().__init__(config)
@@ -1392,7 +1393,7 @@
          self.post_init()
 
      def get_vision_position_ids(
-@@ -1142,6 +1746,13 @@
+@@ -1142,6 +1747,13 @@
          # Same implementation as for images
          return self.get_image_features(pixel_values_videos, video_grid_thw, **kwargs)
 
@@ -1406,7 +1407,7 @@
      @accepts_precomputed_kwargs(modality="image")
      @can_return_tuple
      @auto_docstring
-@@ -1150,57 +1761,40 @@
+@@ -1150,57 +1762,40 @@
          pixel_values: torch.FloatTensor,
          image_grid_thw: torch.LongTensor | None = None,
          **kwargs: Unpack[TransformersKwargs],
@@ -1486,7 +1487,7 @@
          return special_image_mask, special_video_mask
 
      def compute_3d_position_ids(
-@@ -1252,6 +1846,16 @@
+@@ -1252,6 +1847,16 @@
              position_ids = None
          return position_ids
 
@@ -1503,7 +1504,7 @@
      @auto_docstring
      @can_return_tuple
      def forward(
-@@ -1265,48 +1869,184 @@
+@@ -1265,48 +1870,184 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1705,7 +1706,7 @@
              visual_pos_masks = image_mask | video_mask
              deepstack_visual_embeds = []
              image_mask_joint = image_mask[visual_pos_masks]
-@@ -1316,25 +2056,63 @@
+@@ -1316,25 +2057,63 @@
                  embed_joint[image_mask_joint, :] = img_embed
                  embed_joint[video_mask_joint, :] = vid_embed
                  deepstack_visual_embeds.append(embed_joint)
@@ -1774,7 +1775,7 @@
 
          outputs = self.language_model(
              input_ids=None,
-@@ -1342,13 +2120,18 @@
+@@ -1342,13 +2121,18 @@
              attention_mask=attention_mask,
              past_key_values=past_key_values,
              inputs_embeds=inputs_embeds,
@@ -1794,7 +1795,7 @@
              rope_deltas=self.rope_deltas,
          )
 
-@@ -1422,16 +2205,34 @@
+@@ -1422,16 +2206,34 @@
      return overall_loss * num_experts
 
 
@@ -1830,7 +1831,7 @@
          self.post_init()
 
      @auto_docstring
-@@ -1460,6 +2261,11 @@
+@@ -1460,6 +2262,11 @@
          """
          return self.model.get_image_features(pixel_values, image_grid_thw, **kwargs)
 
@@ -1842,7 +1843,7 @@
      @can_return_tuple
      @auto_docstring
      def forward(
-@@ -1474,92 +2280,59 @@
+@@ -1474,92 +2281,59 @@
          pixel_values_videos: torch.FloatTensor | None = None,
          image_grid_thw: torch.LongTensor | None = None,
          video_grid_thw: torch.LongTensor | None = None,
@@ -1962,7 +1963,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -1567,7 +2340,8 @@
+@@ -1567,7 +2341,8 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              rope_deltas=outputs.rope_deltas,
@@ -1972,7 +1973,7 @@
          )
 
      def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
-@@ -1755,6 +2529,59 @@
+@@ -1755,6 +2530,59 @@
 
          return input_ids, model_kwargs
 

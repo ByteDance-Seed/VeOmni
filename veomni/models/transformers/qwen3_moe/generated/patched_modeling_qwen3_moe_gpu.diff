@@ -276,7 +276,7 @@
 
      def forward(
          self,
-@@ -225,25 +251,24 @@
+@@ -225,25 +251,25 @@
          top_k_index: torch.Tensor,
          top_k_weights: torch.Tensor,
      ) -> torch.Tensor:
@@ -310,6 +310,7 @@
 +            self.gate_up_proj,
 +            num_experts=self.num_experts,
 +            activation=self.activation,
++            act_fn=self.act_fn,
 +        )
 +
 +
@@ -320,7 +321,7 @@
 
 
  class Qwen3MoeTopKRouter(nn.Module):
-@@ -255,16 +280,31 @@
+@@ -255,16 +281,31 @@
          self.hidden_dim = config.hidden_size
          self.weight = nn.Parameter(torch.zeros(self.num_experts, self.hidden_dim))
 
@@ -358,7 +359,7 @@
 
 
  class Qwen3MoeSparseMoeBlock(nn.Module):
-@@ -273,37 +313,65 @@
+@@ -273,37 +314,65 @@
          self.experts = Qwen3MoeExperts(config)
          self.gate = Qwen3MoeTopKRouter(config)
 
@@ -437,7 +438,7 @@
          super().__init__()
          self.self_attn = Qwen3MoeAttention(config, layer_idx)
          if (layer_idx not in config.mlp_only_layers) and (
-@@ -312,8 +380,8 @@
+@@ -312,8 +381,8 @@
              self.mlp = Qwen3MoeSparseMoeBlock(config)
          else:
              self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
@@ -448,7 +449,7 @@
          self.hidden_size = config.hidden_size
 
      def forward(
-@@ -435,9 +503,15 @@
+@@ -435,9 +504,15 @@
          return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
@@ -465,7 +466,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -446,13 +520,19 @@
+@@ -446,13 +521,19 @@
          self.layers = nn.ModuleList(
              [Qwen3MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
          )
@@ -487,7 +488,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -464,8 +544,13 @@
+@@ -464,8 +545,13 @@
          past_key_values: Cache | None = None,
          inputs_embeds: torch.FloatTensor | None = None,
          use_cache: bool | None = None,
@@ -501,7 +502,7 @@
          if (input_ids is None) ^ (inputs_embeds is not None):
              raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-@@ -475,19 +560,31 @@
+@@ -475,19 +561,31 @@
          if inputs_embeds is None:
              inputs_embeds = self.embed_tokens(input_ids)
 
@@ -542,7 +543,7 @@
 
          hidden_states = inputs_embeds
          position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
-@@ -499,6 +596,7 @@
+@@ -499,6 +597,7 @@
                  position_ids=position_ids,
                  past_key_values=past_key_values,
                  use_cache=use_cache,
@@ -550,7 +551,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -580,6 +678,12 @@
+@@ -580,6 +679,12 @@
      return overall_loss * num_experts
 
 
@@ -563,7 +564,7 @@
  @auto_docstring
  class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
      _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-@@ -595,8 +699,15 @@
+@@ -595,8 +700,15 @@
          self.router_aux_loss_coef = config.router_aux_loss_coef
          self.num_experts = config.num_experts
          self.num_experts_per_tok = config.num_experts_per_tok
@@ -581,7 +582,7 @@
          self.post_init()
 
      @can_return_tuple
-@@ -611,37 +722,23 @@
+@@ -611,37 +723,23 @@
          labels: torch.LongTensor | None = None,
          use_cache: bool | None = None,
          output_router_logits: bool | None = None,
@@ -624,7 +625,7 @@
          outputs: MoeModelOutputWithPast = self.model(
              input_ids=input_ids,
              attention_mask=attention_mask,
-@@ -650,30 +747,41 @@
+@@ -650,30 +748,41 @@
              inputs_embeds=inputs_embeds,
              use_cache=use_cache,
              output_router_logits=output_router_logits,
@@ -674,7 +675,7 @@
              loss=loss,
              aux_loss=aux_loss,
              logits=logits,
-@@ -681,19 +789,116 @@
+@@ -681,19 +790,116 @@
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
              router_logits=outputs.router_logits,

@@ -1679,3 +1679,90 @@ def test_every_triton_function_backward_returns_one_gradient_per_argument():
 
     assert checked == 2, f"expected both Triton Functions, checked {checked}"
     assert not mismatches, f"backward tuple does not match forward's arguments: {mismatches}"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("activation", ["relu", "mish", "quick_gelu"])
+def test_the_eager_row_evaluates_an_activation_outside_the_whitelist(activation):
+    """A config outside the four served names still runs on the reference row.
+
+    ``veomni.ops.activation`` serves a closed set, and the fused rows refuse anything
+    else -- but before the activation became a call argument, every model evaluated
+    its own ``act_fn`` through ``merged_experts_act_fn_forward``. Dropping that made
+    ``hidden_act: relu`` construct and then fail at the first forward, which is a
+    regression for models that trained fine. ``act_fn`` restores the escape, the same
+    way ``gated_mlp``'s ``eager`` row uses ``mlp.act_fn``.
+    """
+    from transformers.activations import ACT2FN
+
+    from veomni.ops.kernels.moe_experts.standard import eager
+
+    torch.manual_seed(0)
+    experts, hidden, intermediate, tokens, top_k = 3, 8, 16, 5, 2
+    x = torch.randn(tokens, hidden)
+    gate_up = torch.randn(experts, 2 * intermediate, hidden)
+    down = torch.randn(experts, hidden, intermediate)
+    routes = torch.randint(0, experts, (tokens, top_k))
+    routing = torch.softmax(torch.randn(tokens, top_k), dim=-1)
+
+    act_fn = ACT2FN[activation]
+    got = eager.wrapper(
+        x,
+        routing,
+        routes,
+        gate_up.new_empty(0),
+        gate_up.new_empty(0),
+        down,
+        gate_up,
+        num_experts=experts,
+        activation=activation,
+        act_fn=act_fn,
+    )
+
+    expected = torch.zeros(tokens, hidden)
+    for token in range(tokens):
+        for slot in range(top_k):
+            expert = int(routes[token, slot])
+            gate = x[token] @ gate_up[expert][:intermediate].T
+            up = x[token] @ gate_up[expert][intermediate:].T
+            expected[token] += ((act_fn(gate) * up) @ down[expert].T) * routing[token, slot]
+
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
+
+    # Without an act_fn there is nothing to evaluate it with, so it says so.
+    with pytest.raises(ValueError, match="No activation module"):
+        eager.wrapper(
+            x,
+            routing,
+            routes,
+            gate_up.new_empty(0),
+            gate_up.new_empty(0),
+            down,
+            gate_up,
+            num_experts=experts,
+            activation=activation,
+        )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_absent_clamp_masks_are_never_inverted():
+    """The merged backward must not apply ``~`` to the empty placeholder tensor.
+
+    ``forward`` saves ``torch.empty(0)`` where a clamp mask would go, so checking
+    ``mask is not None`` is always true and ``~`` on a float tensor raises. The guard
+    has to be ``swiglu_limit is not None``, as the split backward already does. This
+    is a static check because the merged path needs a GPU.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(triton_module.__file__).read_text()
+    offenders = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.If):
+            continue
+        comparisons = ast.unparse(node.test)
+        body = ast.unparse(node)
+        if "mask_fc1_" in comparisons and "is not None" in comparisons and "~mask_fc1_" in body:
+            offenders.append(comparisons)
+    assert not offenders, f"a clamp mask is tested with `is not None`, but forward saves an empty tensor: {offenders}"

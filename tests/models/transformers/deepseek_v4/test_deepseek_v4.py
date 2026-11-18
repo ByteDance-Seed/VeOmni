@@ -207,8 +207,11 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
         # dense projections in FP8, so one recipe name cannot describe both.
         "expert_dtype": getattr(config, "expert_dtype", "fp8"),
         # The activation travels with the call: the rows evaluate whatever the
-        # model configures, so a non-SiLU model keeps its activation here.
+        # model configures, so a non-SiLU model keeps its activation here. The
+        # module comes along for the reference row's fallback, which handles a name
+        # ``veomni.ops.activation`` does not evaluate.
         "activation": config.hidden_act,
+        "act_fn": experts.act_fn,
     }
     torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
 

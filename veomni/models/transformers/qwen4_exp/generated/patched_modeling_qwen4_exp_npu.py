@@ -1434,6 +1434,7 @@ class Qwen4ExpTextExperts(nn.Module):
             self.gate_up_proj,
             num_experts=self.num_experts,
             activation=self.activation,
+            act_fn=self.act_fn,
         )
         # --- Patch.1 ---
 

@@ -10,12 +10,14 @@ block-quantized expert weights directly through its optional FP8 all-gather.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
-from ....activation import normalize_activation
+from ..shared.activation import activation_is_not_silu
 
 
 def _experts(x, counts, fc1, fc2, swiglu_limit, recompute_weights=(True, True)):
@@ -81,6 +83,7 @@ def wrapper(
     block_size: int = 128,
     expert_dtype: str = "fp8",
     activation: str = "silu",
+    act_fn: Callable[[Tensor], Tensor] | None = None,
 ) -> Tensor:
     """Run FP8 expert GEMMs with BF16 inputs, outputs and first-order gradients.
 
@@ -91,9 +94,10 @@ def wrapper(
     capture. Routing weights are applied after the down projection, matching the
     eager expert contract rather than moving them through FP8 quantization.
     """
-    if normalize_activation(activation) != "silu":
+    if activation_is_not_silu(activation):
         # This kernel computes SiLU inside the grouped GEMM; any other activation
-        # runs on the ``eager`` row, which is the reference implementation.
+        # -- including one ``veomni.ops.activation`` does not evaluate, which the
+        # ``eager`` row covers through the model's own ``act_fn`` -- runs there.
         from . import eager as _eager
 
         return _eager.wrapper(
@@ -110,6 +114,7 @@ def wrapper(
             block_size=block_size,
             expert_dtype=expert_dtype,
             activation=activation,
+            act_fn=act_fn,
         )
     if (
         hidden_states.device.type != "cuda"
