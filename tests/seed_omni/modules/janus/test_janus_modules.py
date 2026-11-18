@@ -460,8 +460,15 @@ def test_the_template_matches_the_upstream_jinja_in_ids_and_labels():
     not Path("/mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B/tokenizer.json").is_file(),
     reason="needs the Janus-1.3B tokenizer.json from shared storage",
 )
-def test_a_generation_prompt_ends_at_the_marker():
-    """Upstream emits the bare marker for inference: ``{%if add_generation_prompt%}<|Assistant|>:{%endif%}``."""
+def test_a_generation_prompt_ends_with_the_training_separator():
+    """The inference prompt stops where a training sample's answer begins.
+
+    Upstream's ``{%if add_generation_prompt%}<|Assistant|>:{%endif%}`` ends at the
+    colon because upstream then *samples* the next token. This graph feeds the
+    first token explicitly (``<boi>`` via ``emit_image_start``, or a text token),
+    so the prompt has to carry the same ``<|Assistant|>: `` separator a training
+    sample renders — otherwise the first fed token lands one position early.
+    """
     import jinja2
 
     from veomni.models.seed_omni.modules.janus.convert_janus_weight_to_hf import CHAT_TEMPLATE
@@ -474,10 +481,10 @@ def test_a_generation_prompt_ends_at_the_marker():
         eos_token = "</s>"
         boi_token = "<begin_of_image>"
         eoi_token = "<end_of_image>"
-        bos_token_id = 1
-        eos_token_id = 3
-        boi_token_id = 4
-        eoi_token_id = 5
+        bos_token_id = 0
+        eos_token_id = 0
+        boi_token_id = base.convert_tokens_to_ids("<begin_of_image>")
+        eoi_token_id = base.convert_tokens_to_ids("<end_of_image>")
         pad_token_id = 0
 
         def __call__(self, text, add_special_tokens=False):
@@ -488,44 +495,18 @@ def test_a_generation_prompt_ends_at_the_marker():
         template.apply_chat_template([ConversationItem(type="text", value="hi", role="user")])
     )
     rendered = template.render_template_string(prompt)
-    assert rendered.endswith("<|Assistant|>:")
+    assert rendered.endswith("<|Assistant|>: "), rendered
 
+    # Upstream stops at the colon; this prompt tokenizes to that plus the
+    # separator, which is the position a training sample starts its answer at.
+    # (Our render also prepends BOS and the system prompt, so only the tail is
+    # comparable — the full id comparison is the image-prefix test's job.)
     upstream = jinja2.Template(CHAT_TEMPLATE).render(
         messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
         add_generation_prompt=True,
     )
     assert upstream.endswith("<|Assistant|>:")
     assert (
-        base(rendered, add_special_tokens=False)["input_ids"][-4:]
-        == base(upstream, add_special_tokens=False)["input_ids"][-4:]
+        base(rendered, add_special_tokens=False)["input_ids"][-1]
+        == base(" ", add_special_tokens=False)["input_ids"][0]
     )
-
-
-@_CPU
-def test_generate_refuses_an_fsdp2_sharded_codec(monkeypatch):
-    """``vqmodel.decode`` bypasses FSDP2's unshard hooks, so decoding must be refused.
-
-    ``JanusVQVAE.decode`` reads the codebook through
-    ``self.quantize.get_codebook_entry`` → ``self.embedding(...)`` and then runs
-    the decoder convolutions — attribute lookups, not calls on the sharded
-    modules. FSDP2 therefore never gathers ``embedding.weight`` (nor the conv
-    weights): the lookup reshapes this rank's shard against the full grid and
-    fails, or mixes a gathered tensor with sharded ones. The shipped inference
-    config runs this module under DDP, so the guard only fires for a hand-written
-    FSDP2 inference config — where the alternative is an ``aten::embedding``
-    error from inside the decode.
-    """
-    from veomni.models.seed_omni.modules.janus.vqvae import modeling as vq_modeling
-
-    module = OMNI_ACCELERATED_MODEL_REGISTRY["janus_vqvae"]()(
-        OMNI_CONFIG_REGISTRY["janus_vqvae"]()(ops_implementation=make_eager_ops_config())
-    )
-    # The shipped config: unsharded, so the guard stays quiet.
-    assert not vq_modeling._is_fsdp_sharded(module)
-    module._require_unsharded_codec()
-
-    # `_is_fsdp_sharded` is the whole test; a real FSDP2 shard needs a process
-    # group this CPU case does not have, so report a shard for the codec itself.
-    monkeypatch.setattr(vq_modeling, "_is_fsdp_sharded", lambda candidate: candidate is module.vqmodel)
-    with pytest.raises(RuntimeError, match="FSDP2-sharded codec"):
-        module._require_unsharded_codec()

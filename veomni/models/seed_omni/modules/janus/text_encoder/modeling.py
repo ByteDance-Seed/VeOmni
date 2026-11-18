@@ -73,8 +73,10 @@ class JanusTextEncoder(TextEncoder):
     ) -> Dict[str, Any]:
         assert conversation_list[-1].type == "output" and conversation_list[-1].value.shape[0] == 1
         conversation_list.pop()
-        output_token_id = self._chat_template.boi_token_id
-        input_ids = self._token_id_tensor(output_token_id)
+        # The prompt already ends with ``<|Assistant|>: `` (see
+        # ``apply_generation_prompt``), so the span opens at ``<boi>`` exactly where
+        # a training sample does.
+        input_ids = self._token_id_tensor(self._chat_template.image_span_start_ids())
         inputs_embeds = self.encode(input_ids)["inputs_embeds"]
         cfg_uncond_inputs_embeds = self._maybe_arm_cfg_for_image_gen(
             conversation_list,

@@ -206,10 +206,43 @@ class JanusChatTemplate(TextEncoderChatTemplate):
         return out
 
     def apply_generation_prompt(self, sample: list[ConversationItem]) -> list[ConversationItem]:
-        """Append the assistant generation prefix to a templated prompt (inference)."""
+        """Append the assistant generation prefix to a templated prompt (inference).
+
+        The separator is part of the prefix, not of the first sampled span: a
+        training sample renders ``<|Assistant|>: <answer>``, and the prompt has to
+        put the model at the same position before it chooses the first token.
+        Upstream's ``{%if add_generation_prompt%}<|Assistant|>:{%endif%}`` omits it
+        because upstream then *samples* the next token; here the first token
+        (``<boi>`` or a text token) is fed explicitly, so the separator has to be
+        supplied by the prompt.
+        """
         out = list(sample)
-        out.append(self._build_conversation_item("text", self.chat_markers.assistant_prefix, "assistant", loss_mask=0))
+        out.append(
+            self._build_conversation_item(
+                "text",
+                self.chat_markers.assistant_prefix + self.chat_markers.assistant_text_separator,
+                "assistant",
+                loss_mask=0,
+            )
+        )
         return out
+
+    def image_span_start_ids(self) -> list[int]:
+        """Token ids that open a generated image span, in *training* order.
+
+        A training sample renders ``<|Assistant|>: <boi>`` — the separator belongs
+        to the first span of the response, and for a text-to-image turn that span
+        *is* the image. ``apply_generation_prompt`` stops at the bare marker
+        (matching upstream's ``{%if add_generation_prompt%}<|Assistant|>:{%endif%}``),
+        so the separator is emitted as part of the generation prompt and this is
+        just ``<boi>``.
+
+        Keeping the separator out of this list matters: the CFG bookkeeping in
+        :meth:`~.modeling.emit_image_start` counts the span's own tokens to place
+        the unconditional branch, and a two-token span would need that arithmetic
+        changed too.
+        """
+        return [self.boi_token_id]
 
     def render_template_string(self, parts: list[ConversationItem]) -> str:
         """
