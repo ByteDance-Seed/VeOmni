@@ -45,26 +45,15 @@ def is_qwen4_exp_model(model) -> bool:
 
 @contextmanager
 def qwen4_gdn_bf16_source_policy(model, group=None):
-    """Agree on and scope opt-in before collective HF weight loading.
+    """Scope opt-in before HF weight loading.
 
-    Only call from an entry point whose full process group already participates
-    in model loading. Ordinary CPU eager loading can be rank-zero only.
+    Distributed callers use the same configuration on all ranks. Ordinary
+    CPU eager loading can be rank-zero only.
     """
     models = model if isinstance(model, (tuple, list)) else (model,)
     configs = (qwen4_exp_model_config(item) for item in models)
     relevant = any(config is not None and expected_qwen4_gdn_layer_ids(config) != set() for config in configs)
     enabled = os.environ.get("VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE") == "1"
-    if relevant and torch.distributed.is_initialized():
-        world_size = torch.distributed.get_world_size(group=group)
-        if world_size > 1:
-            from veomni.utils.device import get_device_type
-
-            backend = str(torch.distributed.get_backend(group)).lower()
-            device = "cpu" if backend == "gloo" else get_device_type()
-            count = torch.tensor(int(enabled), dtype=torch.int32, device=device)
-            torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM, group=group)
-            if count.item() not in (0, world_size):
-                raise RuntimeError("Qwen4 BF16 GDN HF source policy differs across loading ranks")
     token = _BF16_HF_SOURCE_APPROVED.set(relevant and enabled)
     try:
         yield

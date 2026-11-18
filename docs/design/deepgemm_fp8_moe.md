@@ -24,7 +24,7 @@ first pass through its model's existing dequantization/weight-loading path.
 `deepgemm_fp8` and `qat` are two values of the same `moe_implementation` field,
 so the routed experts can never be quantized twice. The other families are
 independent: selecting `qat` for `linear_implementation` or
-`swiglu_mlp_implementation` alongside `deepgemm_fp8` is valid and covers a case
+`gated_mlp_implementation` alongside `deepgemm_fp8` is valid and covers a case
 DeepGEMM does not -- the attention projections and the **shared expert**, which is
 a dense SwiGLU FFN rather than one of the routed experts. Combine them freely;
 this is independent of rollout/export quantization.

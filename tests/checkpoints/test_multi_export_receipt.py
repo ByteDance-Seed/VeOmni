@@ -2,6 +2,7 @@
 
 import gc
 import hashlib
+import os
 import weakref
 from datetime import timedelta
 from pathlib import Path
@@ -21,7 +22,7 @@ from veomni.models.seed_omni.utils.checkpoint import OmniModuleCheckpointManager
 from veomni.optim.optimizer import MultiOptimizer
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import CheckpointCallback, _export_wrote_dcp
-from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback, _same_output_resume_owners
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -38,6 +39,37 @@ def _runtime(tmp_path):
     runtime.lr_scheduler = None
     runtime.parallel_state = SimpleNamespace(global_rank=0, dp_mode="ddp", extra_parallel_names=[])
     return runtime
+
+
+def _different_mount_resolution_worker(rank, root, endpoint):
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        os.chdir(Path(root) / f"node{rank}")
+        trainer = SimpleNamespace(
+            args=SimpleNamespace(train=SimpleNamespace(checkpoint=SimpleNamespace(save_path="out")))
+        )
+        # Both nodes receive the same paths, but their symlinks resolve differently.
+        with pytest.raises(RuntimeError, match="output path differs across ranks"):
+            _same_output_resume_owners(trainer, "input", 1)
+        value = torch.ones(1)
+        dist.all_reduce(value)
+        assert value.item() == 2
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_same_config_with_different_mount_resolution_fails_together(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    for rank in range(2):
+        node = tmp_path / f"node{rank}"
+        (node / "out" / "global_step_1").mkdir(parents=True)
+        if rank == 0:
+            (node / "input").symlink_to("out/global_step_1", target_is_directory=True)
+        else:
+            (node / "input").mkdir()
+    spawn_with_rendezvous(_different_mount_resolution_worker, args=(str(tmp_path),), nprocs=2)
 
 
 def test_export_does_not_reuse_an_unknown_owner():

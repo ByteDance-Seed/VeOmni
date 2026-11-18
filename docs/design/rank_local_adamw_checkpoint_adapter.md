@@ -64,7 +64,7 @@ the saved checkpoint. Change these only with an explicitly verified migration.
 
 ### Save and load call sites
 
-[`_local_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L143)
+[`_local_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L141)
 records `algorithm_identity`, each parameter's `state_dtype`, and
 `state_is_offloaded` in the checkpoint identity; a mismatch rejects resume
 before applying state. During save,
@@ -89,7 +89,7 @@ must also be validated for an offloading implementation.
 
 ## Framework call sites and restore behavior
 
-1. [`MultiOptimizer._sparse_state_dict()`](../../veomni/optim/optimizer.py#L648)
+1. [`MultiOptimizer._sparse_state_dict()`](../../veomni/optim/optimizer.py#L635)
    enters the context around PyTorch's
    optimizer-state serialization. Registered adapter implementations must
    preserve live state and serialize all initialized fields and group options
@@ -100,7 +100,7 @@ must also be validated for an offloading implementation.
    load checks the checkpoint's identity, field names, dtypes and shapes before
    preparing initialized state for the saved owners. Rank-local ownership and
    the supported parallel geometry are not automatically resharded.
-3. [`MultiOptimizer._dcp_load_state_dict()`](../../veomni/optim/optimizer.py#L699)
+3. [`MultiOptimizer._dcp_load_state_dict()`](../../veomni/optim/optimizer.py#L685)
    enters the context again while
    PyTorch applies the optimizer state. The trusted adapter must restore every
    validated field without changing its value or dtype. An optimizer may

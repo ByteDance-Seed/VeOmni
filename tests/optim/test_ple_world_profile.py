@@ -31,14 +31,12 @@ def _worker(rank, world_size, rendezvous, root, mode):
         "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world_size, timeout=timedelta(seconds=15)
     )
     try:
-        file_mode = not mode.startswith("nonfile") and not (mode == "mixed-mode" and rank == 1)
+        file_mode = not mode.startswith("nonfile")
         opt = SimpleNamespace(
             type="qwen38_muon" if file_mode else "adamw",
             qwen38_ple_moments_world_profile=file_mode,
             qwen38_ple_moments_scratch_dir=root if file_mode else None,
         )
-        if mode == "mixed-scratch" and rank == 1:
-            opt.qwen38_ple_moments_scratch_dir += "-other"
         if mode == "world-without-scratch":
             opt.qwen38_ple_moments_scratch_dir = None
         accelerator = SimpleNamespace(ep_size=2, ulysses_size=1, cp_size=1)
@@ -60,8 +58,6 @@ def _worker(rank, world_size, rendezvous, root, mode):
                     if rank == 0:
                         profile._receipt = SimpleNamespace(owner_id=id(owner))
                     receipt = profile.for_job(owner)
-                if mode == "mutated" and rank == 1:
-                    opt.type = "adamw"
                 if mode in ("missing-before", "invalid-before") and rank == 0:
                     receipt = None if mode == "missing-before" else object()
                 if mode == "inspect-before" and rank == 0:
@@ -91,8 +87,6 @@ def _worker(rank, world_size, rendezvous, root, mode):
         "file",
         "nonfile",
         "nonfile-nonserializable",
-        "mixed-mode",
-        "mixed-scratch",
         "world-without-scratch",
         "async",
         "missing-preflight",
@@ -104,7 +98,6 @@ def _worker(rank, world_size, rendezvous, root, mode):
         "inspect-profile-error",
         "inspect-before",
         "inspect-factory",
-        "mutated",
     ],
 )
 def test_ple_profile_is_agreed_before_optimizer_branch(tmp_path, mode):

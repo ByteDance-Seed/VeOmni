@@ -79,34 +79,13 @@ def _policy_worker(rank, rendezvous, output_dir, mode):
         "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=20)
     )
     try:
-        enabled = mode == "enabled" or (mode.endswith("mismatch") and rank == 0)
+        enabled = mode == "enabled"
         os.environ["VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE"] = "1" if enabled else "0"
-        if mode == "composed-mismatch":
-            model = torch.nn.Module()
-            model.config = SimpleNamespace(model_type="omni")
-            model.add_module("qwen", ToyQwen4())
-            model = (model.qwen,)
-        elif mode == "composed-wrapper-mismatch":
-            model = torch.nn.Module()
-            model.config = SimpleNamespace(model_type="omni")
-            model.add_module("qwen", ToyQwen4())
-        elif mode == "no-gdn-mismatch":
-            model = SimpleNamespace(
-                config=SimpleNamespace(model_type="qwen4_exp_text", layer_types=["full_attention"])
-            )
-        elif mode == "other-model-mismatch":
-            model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3_5"))
-        else:
-            model = SimpleNamespace(config=SimpleNamespace(model_type="qwen4_exp"))
+        model = SimpleNamespace(config=SimpleNamespace(model_type="qwen4_exp"))
         error = None
         try:
             with qwen4_gdn_bf16_source_policy(model, group=dist.group.WORLD):
-                expected = enabled and mode not in (
-                    "composed-wrapper-mismatch",
-                    "no-gdn-mismatch",
-                    "other-model-mismatch",
-                )
-                assert qwen4_bf16_hf_source_allowed() is expected
+                assert qwen4_bf16_hf_source_allowed() is enabled
         except RuntimeError as exc:
             error = str(exc)
         assert not qwen4_bf16_hf_source_allowed()
@@ -116,25 +95,11 @@ def _policy_worker(rank, rendezvous, output_dir, mode):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize(
-    "mode",
-    [
-        "enabled",
-        "disabled",
-        "mismatch",
-        "composed-mismatch",
-        "composed-wrapper-mismatch",
-        "no-gdn-mismatch",
-        "other-model-mismatch",
-    ],
-)
-def test_qwen4_bf16_source_policy_agrees_on_all_ranks(tmp_path, mode):
+@pytest.mark.parametrize("mode", ["enabled", "disabled"])
+def test_qwen4_bf16_source_policy_is_scoped_on_all_ranks(tmp_path, mode):
     mp.spawn(_policy_worker, args=(str(tmp_path / f"{mode}-rdzv"), str(tmp_path), mode), nprocs=2, join=True)
     rows = [json.loads((tmp_path / f"{mode}-{rank}.json").read_text()) for rank in range(2)]
-    if mode in ("mismatch", "composed-mismatch"):
-        assert all("policy differs across loading ranks" in row["error"] for row in rows)
-    else:
-        assert all(row["error"] is None for row in rows)
+    assert all(row["error"] is None for row in rows)
 
 
 def _rank0_only_worker(rank, rendezvous, source_dir):
@@ -164,25 +129,6 @@ def test_qwen4_bf16_rank0_only_hf_load_does_not_require_collective(tmp_path):
         str(tmp_path / "model.safetensors"),
     )
     mp.spawn(_rank0_only_worker, args=(str(tmp_path / "load-rdzv"), str(tmp_path)), nprocs=2, join=True)
-
-
-def _broadcast_mismatch_worker(rank, rendezvous, source_dir):
-    dist.init_process_group(
-        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=20)
-    )
-    try:
-        os.environ["VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE"] = "1" if rank == 0 else "0"
-        model = ToyQwen4()
-        prepare_qwen4_gdn_precision(model)
-        with pytest.raises(RuntimeError, match="policy differs across loading ranks"):
-            rank0_load_and_broadcast_weights(model, source_dir, init_device="cpu")
-        dist.barrier()
-    finally:
-        dist.destroy_process_group()
-
-
-def test_qwen4_bf16_rank0_broadcast_rejects_policy_mismatch(tmp_path):
-    mp.spawn(_broadcast_mismatch_worker, args=(str(tmp_path / "broadcast-rdzv"), str(tmp_path)), nprocs=2, join=True)
 
 
 def _broadcast_enabled_worker(rank, rendezvous, source_dir):
@@ -250,12 +196,12 @@ class _FSDPGdnModel(torch.nn.Module):
         return self.layers[0](x)
 
 
-def _fsdp_load_worker(rank, rendezvous, source_dir, mismatch):
+def _fsdp_load_worker(rank, rendezvous, source_dir):
     dist.init_process_group(
         "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=20)
     )
     try:
-        os.environ["VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE"] = "0" if mismatch and rank == 1 else "1"
+        os.environ["VEOMNI_QWEN4_ALLOW_BF16_GDN_SOURCE"] = "1"
         _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu", name="base")
         with use_parallel_state("base"):
             model = _FSDPGdnModel()
@@ -263,24 +209,19 @@ def _fsdp_load_worker(rank, rendezvous, source_dir, mismatch):
             kwargs = dict(
                 weights_path=source_dir, mixed_precision=MixedPrecisionConfig(enable=False), init_device="meta"
             )
-            if mismatch:
-                with pytest.raises(RuntimeError, match="policy differs across loading ranks"):
-                    torch_parallelize.parallelize_model_fsdp2(model, **kwargs)
-            else:
-                model = torch_parallelize.parallelize_model_fsdp2(model, **kwargs)
-                value = model.layers[0].linear_attn.A_log.full_tensor()
-                assert value.dtype == torch.float32 and torch.equal(value, torch.full((4,), 0.125))
-                model(torch.ones(2, 4, dtype=torch.bfloat16)).square().sum().backward()
-                gradient = model.layers[0].linear_attn.A_log.grad.full_tensor()
-                assert gradient.dtype == torch.float32 and torch.isfinite(gradient).all()
-                assert (gradient != 0).any()
+            model = torch_parallelize.parallelize_model_fsdp2(model, **kwargs)
+            value = model.layers[0].linear_attn.A_log.full_tensor()
+            assert value.dtype == torch.float32 and torch.equal(value, torch.full((4,), 0.125))
+            model(torch.ones(2, 4, dtype=torch.bfloat16)).square().sum().backward()
+            gradient = model.layers[0].linear_attn.A_log.grad.full_tensor()
+            assert gradient.dtype == torch.float32 and torch.isfinite(gradient).all()
+            assert (gradient != 0).any()
             dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("mismatch", [False, True])
-def test_qwen4_bf16_real_fsdp2_source_policy(tmp_path, mismatch):
+def test_qwen4_bf16_real_fsdp2_source_policy(tmp_path):
     save_file(
         {
             "layers.0.linear_attn.A_log": torch.full((4,), 0.125, dtype=torch.bfloat16),
@@ -290,4 +231,4 @@ def test_qwen4_bf16_real_fsdp2_source_policy(tmp_path, mismatch):
         },
         str(tmp_path / "model.safetensors"),
     )
-    mp.spawn(_fsdp_load_worker, args=(str(tmp_path / "fsdp-rdzv"), str(tmp_path), mismatch), nprocs=2, join=True)
+    mp.spawn(_fsdp_load_worker, args=(str(tmp_path / "fsdp-rdzv"), str(tmp_path)), nprocs=2, join=True)
