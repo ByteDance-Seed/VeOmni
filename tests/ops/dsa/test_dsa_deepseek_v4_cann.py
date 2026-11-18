@@ -71,11 +71,11 @@ def fake_ops(monkeypatch: pytest.MonkeyPatch) -> _FakeOps:
     monkeypatch.setattr(cann_indexer, "_ops", lambda: ops)
     cann_indexer._causal_plan.cache_clear()
     cann_indexer._packed_plan.cache_clear()
-    cann_indexer._CHECKED_CONTEXT_PARALLEL_RANGES.clear()
+    cann_indexer._context_parallel_range_ends.cache_clear()
     yield ops
     cann_indexer._causal_plan.cache_clear()
     cann_indexer._packed_plan.cache_clear()
-    cann_indexer._CHECKED_CONTEXT_PARALLEL_RANGES.clear()
+    cann_indexer._context_parallel_range_ends.cache_clear()
 
 
 def _bshd_inputs(batch: int, seq_len: int, compressed_len: int) -> tuple[Tensor, Tensor, Tensor]:
@@ -719,11 +719,12 @@ def test_attention_context_parallel_narrows_to_the_query_tail(
     )
 
     ((cann_q, cann_ori_kv, cann_cmp_kv, _), kwargs) = flash_mla.calls[0]
-    assert cann_q.data_ptr() == q.data_ptr()
-    # The narrowing is a view, so the prefix still points at the gathered buffer.
-    assert cann_ori_kv.data_ptr() == ori_kv.data_ptr()
+    assert cann_q.shape == q.shape and torch.equal(cann_q, q)
+    # The narrowed prefix is materialized into a canonical buffer, so compare values.
     assert cann_ori_kv.shape == (1, query_offset + 6, 1, _ATTN_DIM)
+    assert torch.equal(cann_ori_kv.squeeze(2), ori_kv[:, : query_offset + 6])
     assert cann_cmp_kv.shape == (1, cmp_rows, 1, _ATTN_DIM)
+    assert torch.equal(cann_cmp_kv.squeeze(2), cmp_kv[:, :cmp_rows])
     # The compressed table is aligned to the KV prefix, not to the local query count.
     assert kwargs["cmp_residual_kv"].tolist() == [residual]
 
@@ -756,7 +757,7 @@ def test_attention_packed_context_parallel_calls_each_intersected_sample(flash_m
 
     assert len(flash_mla.calls) == 2
     ((first_q, first_ori, first_cmp, first_idx), first_kwargs) = flash_mla.calls[0]
-    assert first_q.data_ptr() == q.data_ptr() and first_q.shape[1] == 6
+    assert first_q.shape[1] == 6 and torch.equal(first_q, q[:, :6])
     assert first_ori.shape == (1, 6, 1, _ATTN_DIM) and first_cmp.shape == (1, 1, 1, _ATTN_DIM)
     assert first_idx[0, :, 0].tolist() == [0] * 6
     # Each sample is its own single-segment call, so no TND slices reach the kernel.
@@ -764,7 +765,8 @@ def test_attention_packed_context_parallel_calls_each_intersected_sample(flash_m
 
     # The second sample's buffer starts at global row 6, not at the shard start.
     ((second_q, second_ori, second_cmp, second_idx), _) = flash_mla.calls[1]
-    assert second_q.shape[1] == 6 and second_ori.shape == (1, 6, 1, _ATTN_DIM)
+    assert second_q.shape[1] == 6 and torch.equal(second_q, q[:, 6:])
+    assert second_ori.shape == (1, 6, 1, _ATTN_DIM)
     assert second_cmp.shape == (1, 1, 1, _ATTN_DIM)
     # Its rows start at compressed row 1, so the selection is rebased by that start.
     assert second_idx[0, :, 0].tolist() == [0] * 6
@@ -796,6 +798,78 @@ def test_attention_packed_context_parallel_leaves_short_samples_to_eager(flash_m
     ((cann_q, cann_ori, cann_cmp, _), _) = flash_mla.calls[0]
     assert cann_q.shape[1] == 2 and cann_ori.shape == (1, 6, 1, _ATTN_DIM)
     assert cann_cmp.shape == (1, 1, 1, _ATTN_DIM)
+
+
+def test_attention_packed_context_parallel_rebases_the_eager_fallback(flash_mla: _FlashMlaRecorder):
+    # A sample can start before the shard and end inside its first compression
+    # window, so the truncated prefix holds no compressed row and the sample runs
+    # eagerly. Its local queries still start at a non-zero row of that buffer, which
+    # the eager row only reaches through ``query_offset``; without it they would
+    # read the sample's earlier rows.
+    slices = ((0, 7), (7, 10), (10, 26))
+    q = torch.randn(1, 8, _ATTN_HEADS, _ATTN_DIM).to(torch.bfloat16)
+    ori_kv = torch.randn(1, 26, _ATTN_DIM).to(torch.bfloat16)
+    cmp_kv = torch.randn(1, 5, _ATTN_DIM).to(torch.bfloat16)
+    sink = torch.randn(_ATTN_HEADS).to(torch.bfloat16)
+
+    out = cann_attention.wrapper(
+        q,
+        ori_kv,
+        cmp_kv,
+        sink,
+        _segment_positions((2, 6)),
+        sliding_window=_WINDOW,
+        compress_ratio=_RATE,
+        packed_sequence_slices=slices,
+        query_offset=8,
+    )
+
+    assert out.shape == q.shape and len(flash_mla.calls) == 1
+    ((cann_q, _, _, _), _) = flash_mla.calls[0]
+    assert cann_q.shape[1] == 6
+    # Rows 8 and 9 are rows 1 and 2 of the sample starting at row 7.
+    assert torch.equal(
+        out[:, :2],
+        eager_attention.wrapper(
+            q[:, :2],
+            ori_kv[:, 7:10],
+            cmp_kv[:, 0:0],
+            sink,
+            torch.arange(1, 3).unsqueeze(0),
+            sliding_window=_WINDOW,
+            compress_ratio=_RATE,
+            query_offset=1,
+        ),
+    )
+
+
+def test_attention_packed_context_parallel_keeps_the_gather_in_the_backward_graph(
+    flash_mla: _FlashMlaRecorder,
+):
+    # The compressed rows reach every rank through a collective all-gather, so a
+    # rank that takes the eager fallback must still produce a gradient for
+    # ``cmp_kv``. Passing ``None`` instead of a zero-row slice would detach it, and
+    # the other ranks would wait in the gather's backward.
+    q = torch.randn(1, 4, _ATTN_HEADS, _ATTN_DIM, requires_grad=True)
+    ori_kv = torch.randn(1, 8, _ATTN_DIM)
+    cmp_kv = torch.randn(1, 1, _ATTN_DIM, requires_grad=True)
+    sink = torch.randn(_ATTN_HEADS)
+
+    out = cann_attention.wrapper(
+        q,
+        ori_kv,
+        cmp_kv,
+        sink,
+        _segment_positions((2, 2)),
+        sliding_window=_WINDOW,
+        compress_ratio=_RATE,
+        packed_sequence_slices=((0, 6), (6, 7), (7, 8)),
+        query_offset=4,
+    )
+    out.sum().backward()
+
+    assert cmp_kv.grad is not None
+    assert torch.count_nonzero(cmp_kv.grad) == 0
 
 
 # FIXME: compare ``sparse_flash_mla`` / ``sparse_flash_mla_grad`` with eager on Ascend.
