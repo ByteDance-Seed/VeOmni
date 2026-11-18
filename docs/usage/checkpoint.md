@@ -46,9 +46,9 @@ weights-only run rather than silently assuming identical update behavior.
 For supported nonempty model storage, this includes distinct tensor views that
 share an allocation. It does not prove aliasing through independently imported
 shared mappings, empty allocations or external accelerator storage. Recognized
-file-backed model storage and lazy conjugate/negative model views are rejected;
-some externally mapped storage cannot be detected and must not be used for
-model aliases. Quantized, non-strided and meta model tensors are unsupported.
+file-backed model storage is rejected. Lazy conjugate/negative views and some
+externally mapped storage cannot be reliably identified and must not be used
+for model aliases. Quantized, non-strided and meta model tensors are unsupported.
 File-backed optimizer moments are separate and are not restricted here.
 
 ## What each path holds
