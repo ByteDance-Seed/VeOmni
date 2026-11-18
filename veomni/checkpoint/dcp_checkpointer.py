@@ -3224,8 +3224,7 @@ class DistributedCheckpointer(CheckpointerBase):
             return
         rank = dist.get_rank() if dist.is_initialized() else 0
         extra_state_path = os.path.join(checkpoint_dir, _EXTRA_STATE_DIRNAME, _EXTRA_STATE_FORMAT.format(rank))
-        if os.path.exists(extra_state_path):
-            state[_EXTRA_STATE_KEY] = torch.load(extra_state_path, weights_only=False)
+        state[_EXTRA_STATE_KEY] = torch.load(extra_state_path, weights_only=False)
 
 
 def get_dtype_size(dtype: torch.dtype) -> int:
