@@ -149,7 +149,7 @@ def test_hidden_act_routes_silu_to_fused_kernel(family, class_name, hf_cls, conf
 def test_merged_experts_act_fn_forward_rejects_ep_sharded_weights_without_ep():
     from transformers.activations import ACT2FN
 
-    from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
+    from veomni.ops.kernels.moe_experts.shared.act_fn_experts import merged_experts_act_fn_forward
 
     hidden = torch.randn(3, 4)
     top_k_index = torch.tensor([[3], [3], [3]], dtype=torch.long)

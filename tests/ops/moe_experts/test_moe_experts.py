@@ -1965,35 +1965,36 @@ def test_the_shared_activation_backward_matches_autograd(activation):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_a_silu_fused_row_delegates_to_triton_under_expert_parallelism():
-    """`eager` cannot serve a sharded expert weight, so EP delegation goes to `triton`.
+def test_the_reference_row_owns_the_expert_parallel_dispatch():
+    """A non-Swish activation under EP must be dispatched, not indexed by global id.
 
-    `eager` indexes the expert weights it is handed by global expert id -- correct when
-    one rank owns every expert, wrong under EP where each rank holds a shard: it reads
-    past the shard or picks the wrong expert, with no error. `triton` owns the EP
-    dispatch, so it is the only reference row a non-Swish activation can fall back to
-    there.
+    `eager` is what every SiLU-fused row hands a non-Swish activation to, so it has to
+    carry the expert-parallel path: under EP each rank holds a shard of the expert
+    weights, and the per-expert loop indexes by global id -- reading past the shard or
+    picking the wrong expert, silently. An earlier revision of this branch delegated
+    EP traffic to `triton` instead, which made one row call another; the dispatch
+    belongs to the row that runs the loop.
     """
+    from transformers.activations import ACT2FN
+
+    from veomni.ops.kernels.moe_experts.shared.act_fn_experts import merged_experts_act_fn_forward
+
+    # Sharded expert weights with EP off: refuse rather than read the wrong expert.
+    with pytest.raises(ValueError, match="expert-parallel sharded weights"):
+        merged_experts_act_fn_forward(
+            torch.randn(3, 4),
+            torch.tensor([[3], [3], [3]]),
+            torch.ones(3, 1),
+            torch.randn(2, 8, 4),
+            torch.randn(2, 4, 4),
+            ACT2FN["gelu"],
+            num_experts=4,
+        )
+
+    # And the fused rows delegate to a single row, which owns that dispatch.
     import pathlib
-    from types import SimpleNamespace
 
-    from veomni.ops.kernels.moe_experts.shared import activation as activation_module
-
-    with pytest.MonkeyPatch.context() as patcher:
-        patcher.setattr(
-            "veomni.distributed.parallel_state.get_parallel_state",
-            lambda: SimpleNamespace(ep_enabled=False),
-        )
-        assert activation_module.delegate_target("gelu") == "eager"
-
-    with pytest.MonkeyPatch.context() as patcher:
-        patcher.setattr(
-            "veomni.distributed.parallel_state.get_parallel_state",
-            lambda: SimpleNamespace(ep_enabled=True),
-        )
-        assert activation_module.delegate_target("gelu") == "triton"
-
-    # And the three SiLU-fused rows must consult it rather than calling eager directly.
     for module in ("quack", "npu", "mlu"):
         source = (pathlib.Path(triton_module.__file__).parent / f"{module}.py").read_text()
-        assert "delegate_target(activation)" in source, f"{module} delegates without checking EP"
+        assert "_eager.wrapper(" in source, f"{module} does not delegate to the reference row"
+        assert "_triton.wrapper(" not in source, f"{module} calls another row instead"

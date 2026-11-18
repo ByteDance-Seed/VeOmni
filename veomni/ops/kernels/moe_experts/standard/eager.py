@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ....activation import apply_activation, supported_activations, supports
+from ..shared.act_fn_experts import merged_experts_act_fn_forward
 
 
 def _expert_activation(gate: Tensor, activation: str, act_fn: Callable[[Tensor], Tensor] | None) -> Tensor:
@@ -69,8 +70,38 @@ def wrapper(
     intermediate before ``fc2`` and agrees with this row only to rounding.
     Regular autograd, no custom backward. ``assume_distinct_experts`` only
     tightens the Triton grouped-GEMM launch bound, so it is unused here.
+
+    ``act_fn`` is the model's own activation module, used when ``activation`` names
+    something ``veomni.ops.activation`` does not evaluate. An activation a fused row
+    cannot serve reaches this row, and a config outside the served set has to keep
+    working -- ``act_fn`` is what the model ran before the activation became a call
+    argument. The expert loop that handles it also owns the expert-parallel dispatch,
+    because the weights it indexes are sharded per rank under EP.
     """
-    del assume_distinct_experts
+    del assume_distinct_experts, block_size, expert_dtype
+    if act_fn is not None and not supports(activation):
+        # One implementation of the reference path, shared with the fused rows that
+        # delegate here. It carries the EP dispatch, which is why this cannot be
+        # inlined: indexing a sharded weight by global expert id reads past the shard.
+        merged = (
+            fc1_1_2_weight
+            if fc1_1_2_weight.numel()
+            else torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
+            if fc1_1_weight.numel()
+            else None
+        )
+        if merged is None:
+            raise ValueError("Provide either split fc1 weights or merged fc1_1_2_weight.")
+        return merged_experts_act_fn_forward(
+            hidden_states,
+            selected_experts,
+            routing_weights,
+            merged,
+            fc2_weight,
+            act_fn,
+            num_experts,
+            swiglu_limit,
+        )
     has_split = fc1_1_weight.numel() > 0
     has_merged = fc1_1_2_weight.numel() > 0
     if has_split == has_merged:

@@ -1,21 +1,17 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+# SPDX-License-Identifier: Apache-2.0
 
-"""Modeling-side MoE fallbacks that do not go through ``VeomniOp``.
+"""Reference expert math for an activation a fused kernel cannot compute.
 
-EP dispatch stays in ``veomni.distributed.moe``. This module only runs the
-non-SiLU expert loop, and calls that dispatch when weights are already sharded.
+Every fused ``moe_experts`` row bakes SiLU into its grouped GEMM, so any other
+activation -- including one ``veomni.ops.activation`` does not evaluate -- runs here.
+This is the same per-expert loop the models used before the activation became a call
+argument, moved into the family so the fallback belongs to a row instead of to seven
+patched forwards.
+
+Expert-parallel shards store only local rows on ``gate_up_proj``, so tokens must go
+through the EP dispatch rather than being indexed by global expert id. That dispatch
+stays in ``veomni.distributed.moe``; this module supplies the per-rank math.
 """
 
 from __future__ import annotations
@@ -26,8 +22,11 @@ import torch
 from torch import Tensor, nn
 
 
+__all__ = ["merged_experts_act_fn_forward"]
+
+
 class _MergedExpertsActFnEP:
-    """Local non-SiLU expert math on tokens already dispatched by EP."""
+    """Local expert math on tokens already dispatched by EP."""
 
     @staticmethod
     def apply(
@@ -85,24 +84,24 @@ def merged_experts_act_fn_forward(
     num_experts: int,
     swiglu_limit: float | None = None,
 ) -> Tensor:
-    """HF merged-expert loop: ``down(act_fn(gate) * up)`` then routing weights.
+    """Expert loop: ``down(act_fn(gate) * up)`` then routing weights.
 
-    Expert-parallel shards store only local rows on ``gate_up_proj``. Those
-    tokens must go through the same EP dispatch as ``veomni_moe``; indexing
-    with global expert ids would read past the local shard.
-    Optional ``swiglu_limit`` applies DeepSeek-V4's gate/up clamp first.
+    Expert-parallel shards store only local rows on ``gate_up_proj``. Those tokens must
+    go through the same EP dispatch as the fused rows; indexing with global expert ids
+    would read past the local shard. Optional ``swiglu_limit`` applies DeepSeek-V4's
+    gate/up clamp first.
     """
     local_experts = gate_up_proj.shape[0]
     if local_experts != num_experts:
-        from veomni.distributed.moe import dispatch_to_ep_class
-        from veomni.distributed.parallel_state import get_parallel_state
+        from .....distributed.moe import dispatch_to_ep_class
+        from .....distributed.parallel_state import get_parallel_state
 
         state = get_parallel_state()
         if not state.ep_enabled or local_experts != num_experts // state.ep_size:
             raise ValueError(
-                "non-SiLU MoE fallback received expert-parallel sharded weights "
-                f"(local {local_experts} vs global {num_experts}). "
-                "Enable EP so tokens are dispatched to local experts, or use silu."
+                "the non-SiLU expert fallback received expert-parallel sharded weights "
+                f"(local {local_experts} vs global {num_experts}). Enable expert "
+                "parallelism so tokens are dispatched to local experts."
             )
         return dispatch_to_ep_class(
             _MergedExpertsActFnEP,

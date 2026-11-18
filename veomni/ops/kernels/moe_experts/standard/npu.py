@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
-from ..shared.activation import activation_is_not_silu, delegate_target
+from ..shared.activation import activation_is_not_silu
 
 
 class GmmFunction(torch.autograd.Function):
@@ -391,30 +391,8 @@ def wrapper(
     """Call the NPU fused MoE path. Empty weights are ``None``."""
     if activation_is_not_silu(activation):
         # This kernel computes SiLU inside the grouped GEMM, so another activation has
-        # no seam here. Which row takes it depends on expert parallelism: ``eager`` is
-        # the reference implementation but indexes expert weights by global id, which
-        # is wrong for a local shard; ``triton`` owns the EP dispatch and evaluates any
-        # activation between its GEMMs.
-        if delegate_target(activation) == "triton":
-            from . import triton as _triton
-
-            return _triton.wrapper(
-                hidden_states,
-                routing_weights,
-                selected_experts,
-                fc1_1_weight,
-                fc1_2_weight,
-                fc2_weight,
-                fc1_1_2_weight,
-                num_experts=num_experts,
-                swiglu_limit=swiglu_limit,
-                assume_distinct_experts=assume_distinct_experts,
-                block_size=block_size,
-                expert_dtype=expert_dtype,
-                activation=activation,
-                act_fn=act_fn,
-            )
-
+        # no seam here. The ``eager`` row runs the reference expert loop, which also
+        # owns the expert-parallel dispatch those sharded weights need.
         from . import eager as _eager
 
         return _eager.wrapper(

@@ -8,7 +8,7 @@ from __future__ import annotations
 import torch
 
 
-__all__ = ["activation_backward", "activation_is_not_silu", "delegate_target", "is_silu"]
+__all__ = ["activation_backward", "activation_is_not_silu", "is_silu"]
 
 
 def activation_is_not_silu(activation: str) -> bool:
@@ -22,24 +22,6 @@ def activation_is_not_silu(activation: str) -> bool:
     """
     name = activation.value if hasattr(activation, "value") else activation
     return name not in ("silu", "swish")
-
-
-def delegate_target(activation: str) -> str:
-    """Which row serves a SiLU-fused kernel that cannot run *activation*.
-
-    ``eager`` is the reference implementation and handles every activation name,
-    including ones outside ``veomni.ops.activation``. But it indexes the expert
-    weights it is handed by *global* expert id, so under expert parallelism -- where
-    each rank holds a shard -- it would read past the shard or pick the wrong expert.
-    ``triton`` owns the EP dispatch, so it is the only row that can serve a
-    non-Swish activation there.
-
-    Returns:
-        ``"triton"`` when expert parallelism is on, ``"eager"`` otherwise.
-    """
-    from .....distributed.parallel_state import get_parallel_state
-
-    return "triton" if get_parallel_state().ep_enabled else "eager"
 
 
 def is_silu(activation: str) -> bool:
