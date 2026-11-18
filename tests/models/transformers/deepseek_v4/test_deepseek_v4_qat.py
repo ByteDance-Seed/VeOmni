@@ -63,9 +63,9 @@ _EXPECTED_LINEAR = {
     "DeepseekV4Indexer.forward": {"q_b_proj"},
     "DeepseekV4HCACompressor.forward": set(),
     "DeepseekV4CSACompressor.forward": set(),
-    # The shared expert runs through `swiglu_mlp`, which takes the three weight
-    # tensors directly rather than a projection module; see
-    # `test_the_shared_expert_uses_its_own_family_row` below.
+    # The shared expert runs through `gated_mlp`, whose row reads the projection
+    # weights itself. Nothing here names a projection module, so this method is
+    # listed with nothing -- and `_EXPECTED_PLAIN` below pins that it stays so.
     "DeepseekV4MLP.forward": set(),
 }
 _EXPECTED_PLAIN = {
@@ -73,8 +73,10 @@ _EXPECTED_PLAIN = {
     "DeepseekV4Indexer.forward": {"scorer.weights_proj", "kv_proj", "gate_proj"},
     "DeepseekV4HCACompressor.forward": {"kv_proj", "gate_proj"},
     "DeepseekV4CSACompressor.forward": {"kv_proj", "gate_proj"},
-    # Non-SwiGLU hidden_act falls back to the projection modules.
-    "DeepseekV4MLP.forward": {"gate_proj", "up_proj", "down_proj"},
+    # The row takes the MLP module and reaches its projections; no projection is
+    # called as a module here, whatever `hidden_act` is. A plain call appearing
+    # again would mean an `if`/`else` came back into this forward.
+    "DeepseekV4MLP.forward": set(),
 }
 
 # The activation-only recipe: tensors rounded because inference *stores* them
@@ -301,7 +303,7 @@ def _build_tiny_model(linear_impl: str):
         OpsImplementationConfig(
             attn_implementation="eager",
             rms_norm_implementation="eager",
-            swiglu_mlp_implementation="eager",
+            gated_mlp_implementation="eager",
             linear_implementation=linear_impl,
             moe_implementation="eager",
             dsa_attention_implementation="eager",
@@ -361,7 +363,7 @@ def test_a_non_silu_expert_activation_trains_in_the_model_dtype(modeling):
         OpsImplementationConfig(
             attn_implementation="eager",
             rms_norm_implementation="eager",
-            swiglu_mlp_implementation="eager",
+            gated_mlp_implementation="eager",
             linear_implementation="eager",
             moe_implementation="eager",
             dsa_attention_implementation="eager",
@@ -375,7 +377,7 @@ def test_a_non_silu_expert_activation_trains_in_the_model_dtype(modeling):
         pytest.skip("the DSV4 NPU build needs torch_npu")
 
     model = modeling.DeepseekV4Experts(config)
-    assert model.use_swiglu_mlp is False
+    assert model.use_swiglu is False
     # The parameters are allocated with `torch.empty`; a real build fills them from
     # a checkpoint, so give them finite values before the forward.
     with torch.no_grad():
@@ -408,7 +410,7 @@ def test_an_unquantized_shared_expert_keeps_the_non_silu_fallback(modeling):
         OpsImplementationConfig(
             attn_implementation="eager",
             rms_norm_implementation="eager",
-            swiglu_mlp_implementation="eager",
+            gated_mlp_implementation="eager",
             linear_implementation="eager",
             moe_implementation="eager",
             dsa_attention_implementation="eager",

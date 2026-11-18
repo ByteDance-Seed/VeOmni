@@ -77,6 +77,7 @@ class ParallelState:
     extra_parallel_fsdp_device_mesh: Dict[str, Optional["DeviceMesh"]] = field(default_factory=lambda: {"ep": None})
     extra_parallel_flat_device_mesh: Dict[str, Optional["DeviceMesh"]] = field(default_factory=lambda: {"ep": None})
     async_enabled: Optional[bool] = False
+    skip_sp_gather_between_modules: bool = False
 
     def __post_init__(self):
         if not isinstance(self.allow_hybrid_cp, bool):
@@ -510,6 +511,7 @@ def _init_parallel_state(
     extra_parallel_placement_innermost: Tuple[bool] = (False,),
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
+    skip_sp_gather_between_modules: bool = False,
     name: Optional[str] = "base",
     npu_ep_hccl_buffer_mib: Optional[int] = None,
     npu_ep_hccl_expansion_mode: Optional[str] = None,
@@ -597,6 +599,7 @@ def _init_parallel_state(
         extra_parallel_placement_innermost,
         extra_parallel_names,
         async_enabled,
+        skip_sp_gather_between_modules,
         npu_ep_hccl_buffer_mib,
         npu_ep_hccl_expansion_mode,
     )
@@ -744,6 +747,7 @@ def _init_parallel_state(
         extra_parallel_fsdp_device_mesh=extra_parallel_fsdp_device_mesh,
         extra_parallel_flat_device_mesh=extra_parallel_flat_device_mesh,
         async_enabled=async_enabled,
+        skip_sp_gather_between_modules=skip_sp_gather_between_modules,
     )
 
     if _PARALLEL_STATE is None:
@@ -776,6 +780,7 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
         extra_parallel_names=accelerator.extra_parallel_names,
         dp_mode=accelerator.fsdp_config.fsdp_mode,
         async_enabled=accelerator.enable_async,
+        skip_sp_gather_between_modules=accelerator.skip_sp_gather_between_modules,
         npu_ep_hccl_buffer_mib=accelerator.npu_ep_hccl_buffer_mib,
         npu_ep_hccl_expansion_mode=accelerator.npu_ep_hccl_expansion_mode,
         name=name,

@@ -176,7 +176,7 @@ def validate_compile_runtime(
 #: per-tensor scale) stay out of this table.
 _UNCOMPILABLE_IMPLS: dict[str, str] = {
     "linear_implementation": "torchao_mxfp4",
-    "swiglu_mlp_implementation": "torchao_mxfp4",
+    "gated_mlp_implementation": "torchao_mxfp4",
 }
 
 

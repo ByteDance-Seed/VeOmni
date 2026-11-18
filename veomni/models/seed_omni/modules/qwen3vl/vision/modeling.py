@@ -149,11 +149,25 @@ def scatter_qwen3vl_visual_embeds(
     output_slots: List[_VisualOutputSlot],
     embeds: torch.Tensor,
     deepstack_features: List[torch.Tensor],
+    *,
+    sp_rank: int = 0,
+    sp_size: int = 1,
 ) -> None:
-    """Scatter merged ViT tokens back onto conversation items."""
+    """Scatter merged ViT tokens back onto conversation items.
+
+    With ``sp_size > 1`` the tensors hold this rank's window only, so each item
+    receives its intersection with that window (:func:`split_sp_sharded_tensor`)
+    rather than a whole span; ``sp_size == 1`` keeps the plain split.
+    """
     sizes = [slot.num_merged for slot in output_slots]
-    embeds_split = torch.split(embeds, sizes, dim=0)
-    deepstack_split = [torch.split(layer, sizes, dim=0) for layer in deepstack_features]
+    if sp_size > 1:
+        from ...base.sp_shard import split_sp_sharded_tensor
+
+        embeds_split = split_sp_sharded_tensor(embeds, sizes, sp_rank, sp_size)
+        deepstack_split = [split_sp_sharded_tensor(layer, sizes, sp_rank, sp_size) for layer in deepstack_features]
+    else:
+        embeds_split = torch.split(embeds, sizes, dim=0)
+        deepstack_split = [torch.split(layer, sizes, dim=0) for layer in deepstack_features]
     for idx, slot in enumerate(output_slots):
         slot.item.value = embeds_split[idx]
         slot.item.meta["grid_thw"] = slot.grid
@@ -248,6 +262,9 @@ class Qwen3VLVisionEncoder(InferenceMixin, PretrainedOmniModule):
     """Qwen3-VL vision tower for image understanding."""
 
     config_class = Qwen3VLVisionEncoderConfig
+    # Merged tokens (and DeepStack features) are a run of carrier items, so both
+    # can be split at this rank's shard boundary and written back item by item.
+    supports_sp_sharded_handoff = True
     image_processor_class = Qwen3VLVisionImageProcessor
     video_processor_class = Qwen3VLVisionVideoProcessor
     preprocessor_class = Qwen3VLVisionPreprocessor

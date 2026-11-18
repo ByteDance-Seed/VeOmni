@@ -27,6 +27,8 @@ from ....mixins.base_mixin import BaseMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from ....utils.conversation import ConversationItem
+from ...base.llm_packing import item_token_len
+from ...base.sp_shard import sp_local_len, sp_valid_in_window, split_sp_sharded_tensor
 from ..chat_template import TextEncoderChatTemplate
 from ..configuration import TextEncoderConfig
 from ..modeling import TextEncoder, scatter_text_encoder_embeds
@@ -66,7 +68,7 @@ class TrainingMixin(TrainingModuleMixin):
             # sequence-sharded). Every SP rank already holds the same ``input_ids``
             # (the dataloader replicates each shard); pad it to a multiple of
             # ``sp_size`` and take this rank's contiguous chunk. ``encode_post``
-            # all-gathers the embeds back.
+            # all-gathers the embeds back unless ``skip_sp_gather_between_modules`` is enabled.
             self._sp_own_len = input_ids.size(0)
             input_ids = sp_pad(input_ids, dim=0, pad_value=0)
             input_ids = slice_input_tensor(input_ids, dim=0, padding=False, group=get_parallel_state().sp_group)
@@ -74,16 +76,26 @@ class TrainingMixin(TrainingModuleMixin):
 
     @post_forward("encode")
     def encode_post(self, inputs_embeds: torch.Tensor) -> Dict[str, Any]:
-        if get_parallel_state().sp_size > 1:
-            # SP output-gather: all-gather token shards back to the full sequence
-            # (autograd-aware; backward sums grads across the SP group), then drop
-            # the SP pad tail so the packed length matches its carrier below.
-            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=0, group=get_parallel_state().sp_group)
-            inputs_embeds = inputs_embeds.narrow(0, 0, self._sp_own_len)
+        ps = get_parallel_state()
         conversation = self._conversation_carrier
         self._conversation_carrier = None
         batch_shape = self._encode_batch_shape
         self._encode_batch_shape = None
+        if ps.sp_size > 1:
+            if ps.skip_sp_gather_between_modules:
+                self._sp_own_len = None
+                lengths = batch_shape.prod(-1).tolist()
+                scatter_text_encoder_embeds(
+                    conversation,
+                    split_sp_sharded_tensor(inputs_embeds, lengths, ps.sp_rank, ps.sp_size),
+                )
+                return {"conversation_list": conversation}
+            # SP output-gather: all-gather token shards back to the full sequence
+            # (autograd-aware; backward sums grads across the SP group), then drop
+            # the SP pad tail so the packed length matches its carrier below.
+            inputs_embeds = gather_outputs(inputs_embeds, gather_dim=0, group=ps.sp_group)
+            inputs_embeds = inputs_embeds.narrow(0, 0, self._sp_own_len)
+            self._sp_own_len = None
         scatter_text_encoder_embeds(conversation, unflatten(inputs_embeds, batch_shape))
         return {"conversation_list": conversation}
 
@@ -98,7 +110,15 @@ class TrainingMixin(TrainingModuleMixin):
         # framework metadata and sibling-module keys from failing the call.
         del kwargs
         self._conversation_carrier = conversation_list
-        hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier)
+        ps = get_parallel_state()
+        if ps.sp_size > 1 and ps.skip_sp_gather_between_modules:
+            # The switch decides, and the build gate guarantees every module in the
+            # graph honours it (`_reject_sp_handoff_unsupported_modules`), so a batch
+            # that had to gather its modalities still hands a shard on here: the
+            # consumer, not the producer, decides whether it wants full spans.
+            hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier, ps)
+        else:
+            hidden_states, shift_labels = self._prepare_decode_inputs(self._conversation_carrier)
         # No SP sharding here: the lm-head loss is a token-weighted mean over the whole
         # ``dp_sp`` (``fsdp_group``) mesh (``modeling.decode`` →
         # ``reduce_sequence_parallel_loss``), so each rank scoring only its OWN span
@@ -133,13 +153,23 @@ class TrainingMixin(TrainingModuleMixin):
     def _prepare_decode_inputs(
         self,
         conversation_list: Optional[list[list[ConversationItem]]],
+        ps: Any = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prepare decode ``(hidden_states, shift_labels)`` from the carrier.
+
+        With ``ps`` (the ``skip_sp_gather_between_modules`` path) every ``part.value``
+        already holds this rank's window, so a media segment contributes all of its
+        real rows and only this rank's label slice is scored. Without it the carrier
+        is the full packed sequence, and a media segment contributes one row — the
+        sequence only has to stay aligned across the causal label shift.
+        """
+        sharded = ps is not None
         hidden_states_chunks: list[torch.Tensor] = []
         label_chunks: list[torch.Tensor] = []
         sample_starts: list[int] = []
         decode_len = 0
 
-        for sample in conversation_list:
+        for sample in conversation_list or []:
             sample_start = decode_len
             for part in sample:
                 if part.is_dummy:
@@ -149,10 +179,17 @@ class TrainingMixin(TrainingModuleMixin):
                     hidden_states = hidden_states.squeeze(0)
                 if part.type == "text":
                     labels = part.meta["labels"]
-                    assert labels.shape[0] == hidden_states.shape[0]
+                    if not sharded:
+                        assert labels.shape[0] == hidden_states.shape[0]
                     hidden_states_chunks.append(hidden_states)
                     label_chunks.append(labels)
-                    decode_len += labels.shape[0]
+                    decode_len += int(labels.shape[0])
+                elif sharded:
+                    # The window keeps every real media row; none of them is a target.
+                    seg_len = item_token_len(part)
+                    hidden_states_chunks.append(hidden_states)
+                    label_chunks.append(torch.full((seg_len,), IGNORE_INDEX, dtype=torch.long))
+                    decode_len += seg_len
                 else:
                     # Non-text segment (image, video, audio, ...) carries projected
                     # media embeds; keep one row (no label) so the sequence stays
@@ -176,7 +213,17 @@ class TrainingMixin(TrainingModuleMixin):
             labels[start] = IGNORE_INDEX
 
         labels = labels[..., 1:].contiguous()
-        shift_labels = F.pad(labels, (0, 1), "constant", -100)
+        if not sharded:
+            shift_labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
+        else:
+            # Each rank scores exactly the rows its window holds. ``item.value`` keeps
+            # only real rows (padding never enters the carrier), so the label slice has
+            # to stop at the window's real row count, not at its padded width.
+            rows = sp_valid_in_window(decode_len, ps.sp_rank, ps.sp_size)
+            local_len = sp_local_len(decode_len, ps.sp_size)
+            shift_labels = F.pad(labels, (0, 1 + (local_len * ps.sp_size - decode_len)), "constant", IGNORE_INDEX)
+            shard_start = ps.sp_rank * local_len
+            shift_labels = shift_labels[shard_start : shard_start + rows].contiguous()
         # Single H2D move (labels are tiny host-side bookkeeping); the loss forward
         # orders after the backbone kernels on the GPU stream without a CPU stall.
         shift_labels = shift_labels.to(device=hidden_states.device, non_blocking=True)
