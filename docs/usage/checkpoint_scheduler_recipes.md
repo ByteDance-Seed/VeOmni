@@ -45,10 +45,15 @@ run; avoid hidden state such as environment values or mutable closure data.
 Registration records the caller's assertion and does not inspect or sandbox
 the callable.
 
-The owner-aware optimizer checkpoint records the registered leaf identities;
-`ModelCheckpointManager` also records and checks the scheduler recipe together
-with scheduler state. Recovery rejects missing or different recipes instead of
-silently attaching a new function to old optimizer state. Scheduler step,
-optimizer groups and trainer checkpoint generation are checked separately.
+The owner-aware optimizer checkpoint records the registered leaf identities:
+[`_scheduler_layout`](../../veomni/checkpoint/optimizer_resume_layout.py#L127)
+reads each leaf's registered recipe during layout construction. During save,
+[`ModelCheckpointManager._extra_state`](../../veomni/models/checkpoint/manager.py#L260)
+records the scheduler recipe alongside its state. During load, the
+[recipe compatibility check](../../veomni/models/checkpoint/manager.py#L323)
+compares it with the newly registered recipe. Recovery rejects missing or
+different recipes instead of silently attaching a new function to old
+optimizer state. Scheduler step, optimizer groups and trainer checkpoint
+generation are checked separately.
 An unregistered custom `LambdaLR` or an older callable-hash-only checkpoint
 needs an explicitly verified migration or a new weights-only run.
