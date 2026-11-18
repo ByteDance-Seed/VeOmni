@@ -291,10 +291,15 @@ export as a fresh run.
 
 A split-layout checkpoint containing only `model/[<module>/]lr_scheduler.pt`
 can pass marker discovery even when the per-rank model sidecars are missing.
-The training loader rejects a missing or unreadable requested sidecar, or a
-missing scheduler state when the target has a scheduler. An older loader may
-instead keep its initialized scheduler, so discovery alone does not prove that
-the schedule was restored. A model-only load that does not request `extra_state`
+The training loader rejects a missing or unreadable requested sidecar. Optimizer
+continuation requires an explicit `lr_scheduler` entry, including `None` when
+no scheduler was used. A target scheduler requires a state mapping. Native
+`LambdaLR` also checks its required fields; custom schedulers are responsible
+for validating their own state schemas. Continuing an optimizer with a saved
+scheduler but no target scheduler is
+rejected. An older loader may instead keep its initialized scheduler, so
+discovery alone does not prove that the schedule was restored. A model-only
+load that does not request `extra_state`
 does not require this sidecar.
 
 For such a checkpoint, resume with the compatible revision/environment that

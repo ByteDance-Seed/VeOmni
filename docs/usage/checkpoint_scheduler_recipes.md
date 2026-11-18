@@ -50,7 +50,7 @@ The owner-aware optimizer checkpoint records the registered leaf identities:
 reads each leaf's registered recipe during layout construction. During save,
 [`ModelCheckpointManager._extra_state`](../../veomni/models/checkpoint/manager.py#L260)
 records the scheduler recipe alongside its state. During load, the
-[recipe compatibility check](../../veomni/models/checkpoint/manager.py#L329)
+[recipe compatibility check](../../veomni/models/checkpoint/manager.py#L342)
 compares it with the newly registered recipe. Recovery rejects missing or
 different recipes instead of silently attaching a new function to old
 optimizer state. Scheduler step, optimizer groups and trainer checkpoint
