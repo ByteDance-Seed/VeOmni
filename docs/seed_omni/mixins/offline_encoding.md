@@ -132,7 +132,7 @@ full, or it is built on meta.
   read only the config, never a parameter or buffer: parameters are meta
   tensors, and buffers keep the values the constructor gave them, not the
   checkpoint's. Under `fsdp_scope: model`,
-  [`_parallelize_composed_model`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L241)
+  [`_parallelize_composed_model`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L267)
   detaches cache readers before the composed wrap so they stay on meta and are
   not materialised with the rest.
 - **`offline_embedding`.** Every module, cached or not, is built and
@@ -369,7 +369,7 @@ A missing module or method still fails before the first request runs.
   [the writer opens after the trainer state is restored](../../../tests/seed_omni/trainer/test_omni_trainer.py#L178), and
   [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L201).
 - [`tests/checkpoints/test_checkpoint_callback.py`](../../../tests/checkpoints/test_checkpoint_callback.py):
-  [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L660).
+  [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L739).
 - [`tests/checkpoints/test_dcp_checkpointer.py`](../../../tests/checkpoints/test_dcp_checkpointer.py):
   [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2798).
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):

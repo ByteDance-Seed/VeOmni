@@ -28,7 +28,7 @@ feature does not provide a validated optimizer-state migration across placements
 
 ## Placement and update lifecycle
 
-[`VeOmniModelRuntime._build_parallelized_model()`](../../veomni/models/model_runtime.py#L476)
+[`VeOmniModelRuntime._build_parallelized_model()`](../../veomni/models/model_runtime.py#L480)
 forwards these settings to
 [`parallelize_model_fsdp2()`](../../veomni/distributed/torch_parallelize.py#L437).
 The latter applies CPU offload only to non-excluded
