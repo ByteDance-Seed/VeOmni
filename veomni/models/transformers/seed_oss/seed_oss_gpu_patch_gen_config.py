@@ -33,7 +33,6 @@ from transformers.utils import TransformersKwargs
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
     CausalLMOutputWithLogProbs,
@@ -67,7 +66,6 @@ config.add_import(
     "veomni.models.utils.mask_utils",
     names=["create_causal_mask"],
 )
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
@@ -97,7 +95,7 @@ def seed_oss_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch
 
 @config.override_method(
     "SeedOssMLP.__init__",
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 def seed_oss_mlp_init_patched(self, config):
     nn.Module.__init__(self)
@@ -109,7 +107,7 @@ def seed_oss_mlp_init_patched(self, config):
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
     self.act_fn = ACT2FN[config.hidden_act]
     self.residual_dropout = config.residual_dropout
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+    self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
 
 @config.override_method(
@@ -215,21 +213,10 @@ def seed_oss_model_forward_patched(
 
 @config.override_method(
     "SeedOssMLP.forward",
-    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules, then residual dropout",
+    description="Call the gated_mlp row, then residual dropout",
 )
 def seed_oss_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-        down_proj = self.veomni_swiglu_mlp(
-            x,
-            self.gate_proj.weight,
-            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-            self.up_proj.weight,
-            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-            self.down_proj.weight,
-            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-        )
-    else:
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    down_proj = self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
     return nn.functional.dropout(down_proj, p=self.residual_dropout, training=self.training)
 
 
