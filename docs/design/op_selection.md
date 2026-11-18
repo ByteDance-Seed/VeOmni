@@ -196,7 +196,7 @@ the row cannot serve it:
 
 | Row | Activation evaluated | A name it cannot serve |
 | --- | --- | --- |
-| `fused_triton`, `eager` | between the GEMMs, or the model's own `act_fn` | runs it (`eager` also covers names outside `activation.py`) |
+| `fused_triton`, `eager` | between the GEMMs | runs it — both resolve a name outside `activation.py` through `ACT2FN`, the table the model built its own `act_fn` from |
 | `qat` | between the GEMMs | refuses — a fallback would train at full precision |
 | `fused_quack`, `fused_npu`, `fused_mlu` | inside the kernel (SiLU only) | delegates to `eager`; these rows do bf16 math, so nothing is lost |
 | `deepgemm_fp8` | inside the FP8 kernel (SiLU only) | refuses — delegating would skip the FP8 GEMMs |

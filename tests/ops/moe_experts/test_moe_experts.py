@@ -1994,3 +1994,53 @@ def test_the_reference_row_owns_the_expert_parallel_dispatch():
         source = (pathlib.Path(triton_module.__file__).parent / f"{module}.py").read_text()
         assert "_eager.wrapper(" in source, f"{module} does not delegate to the reference row"
         assert "_triton.wrapper(" not in source, f"{module} calls another row instead"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_every_backward_attribute_exists_on_the_ctx_its_forward_built():
+    """A `ctx.<name>` a backward reads must be one the forward set, across modules.
+
+    `ep.py` kept passing `ctx.act_fn` after that attribute was removed, so both EP
+    Functions raised `AttributeError` on the first backward -- including the default
+    SiLU path. The existing check only looked inside `triton.py`, which is how the
+    copy in `ep.py` survived.
+
+    Static because the EP path needs a distributed group and a GPU, and because the
+    failure is a name, not a number.
+    """
+    import ast
+    import pathlib
+
+    from veomni.ops.kernels.moe_experts.shared import ep as ep_module
+
+    missing = []
+    checked = 0
+    for module in (triton_module, ep_module):
+        for cls in (
+            n for n in ast.parse(pathlib.Path(module.__file__).read_text()).body if isinstance(n, ast.ClassDef)
+        ):
+            forward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward"), None)
+            backward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "backward"), None)
+            if forward is None or backward is None:
+                continue
+            checked += 1
+            assigned = {
+                node.attr
+                for node in ast.walk(forward)
+                if isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "ctx"
+                and isinstance(node.ctx, ast.Store)
+            }
+            read = {
+                node.attr
+                for node in ast.walk(backward)
+                if isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "ctx"
+                and isinstance(node.ctx, ast.Load)
+            }
+            missing.extend(f"{cls.name}.{name}" for name in read - assigned - {"saved_tensors", "needs_input_grad"})
+
+    assert checked == 4, f"expected four Functions across both modules, checked {checked}"
+    assert not missing, f"backward reads a ctx attribute its forward never sets: {missing}"

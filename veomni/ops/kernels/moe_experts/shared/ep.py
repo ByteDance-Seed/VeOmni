@@ -178,7 +178,7 @@ class EPGroupGemm(torch.autograd.Function):
                 transpose_b=False,
             )
 
-        grad_fc1_1_output = activation_backward(grad_fc1_1_activation, fc1_1_output, ctx.activation, ctx.act_fn)
+        grad_fc1_1_output = activation_backward(grad_fc1_1_activation, fc1_1_output, ctx.activation)
         if swiglu_limit is not None:
             grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
 
@@ -318,7 +318,7 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
                 mask_fc1_2 if swiglu_limit is not None else None,
             )
         else:
-            gate_grad = activation_backward(grad_fc1_result * fc1_2_output, fc1_1_output, ctx.activation, ctx.act_fn)
+            gate_grad = activation_backward(grad_fc1_result * fc1_2_output, fc1_1_output, ctx.activation)
             up_grad = grad_fc1_result * _expert_activation(fc1_1_output, ctx.activation)
             # Gate on ``swiglu_limit``: forward saves an empty float tensor where a
             # clamp mask would go, so "is not None" is always true and ``~`` would be
