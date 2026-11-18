@@ -937,6 +937,14 @@ class AcceleratorConfig:
         default=1,
         metadata={"help": "Context parallel size."},
     )
+    skip_sp_gather_between_modules: bool = field(
+        default=False,
+        metadata={
+            "help": "SeedOmni: every module's post_forward hands its sequence-parallel shard "
+            "directly to the next module instead of all-gathering full-sequence tensors onto "
+            "`conversation_list`. Global to the run: per-module overrides are ignored."
+        },
+    )
     init_device: Literal["cuda", "meta", "npu", "mlu"] = field(
         default="meta",
         metadata={
@@ -1279,7 +1287,6 @@ class TrainingArguments:
             )
         },
     )
-
     # sub-argument groups
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
@@ -1405,7 +1412,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
-    "swiglu_mlp_implementation": frozenset(),
+    "gated_mlp_implementation": frozenset(),
     "linear_implementation": frozenset(),
     "kv_round_implementation": frozenset({"none"}),
     "load_balancing_loss_implementation": frozenset(),
@@ -1432,7 +1439,7 @@ _MLU_ALLOWED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"liger_kernel"}),
     "rotary_pos_emb_implementation": frozenset({"liger_kernel"}),
     "rotary_pos_emb_vision_implementation": frozenset({"liger_kernel"}),
-    "swiglu_mlp_implementation": frozenset({"liger_kernel"}),
+    "gated_mlp_implementation": frozenset({"liger_kernel"}),
     "linear_implementation": frozenset(),
     "kv_round_implementation": frozenset({"none"}),
     "cross_entropy_loss_implementation": frozenset({"liger_kernel", "chunk_loss"}),
@@ -1490,7 +1497,7 @@ class OpsImplementationConfig:
 
     - **Config-parse time** (``__post_init__``) for the model-agnostic fields:
       ``rms_norm``, ``rotary_pos_emb``,
-      ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``linear``, ``load_balancing_loss``, plus
+      ``rotary_pos_emb_vision``, ``gated_mlp``, ``linear``, ``load_balancing_loss``, plus
       ``cross_entropy_loss`` and ``moe``. Errors fire immediately with a
       model-agnostic allow-list.
     - **Model-build time** (instance-local ``VeomniOp`` resolution) for
@@ -1570,10 +1577,10 @@ class OpsImplementationConfig:
             "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU."
         },
     )
-    swiglu_mlp_implementation: Optional[str] = field(
+    gated_mlp_implementation: Optional[str] = field(
         default=None,
         metadata={
-            "help": "SwiGLU MLP. 'liger_kernel' (GPU, MLU) | 'qat' (FP8 QAT, SM90+) | "
+            "help": "Gated MLP (act(gate(x)) * up(x)). 'liger_kernel' (SiLU only; GPU, MLU) | 'qat' (FP8 QAT, SM90+) | "
             "'torchao_nvfp4' (NVFP4 QAT, needs the 'torchao' package) | 'eager'. "
             "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
         },
@@ -1584,8 +1591,8 @@ class OpsImplementationConfig:
             "help": "Dense projection. 'qat' (FP8 fake quantization of both GEMM operands, SM90+) | "
             "'torchao_nvfp4' (NVFP4 fake quantization of both GEMM operands, 'standard' variant only, needs "
             "the 'torchao' package) | 'eager' (calls the projection module). "
-            "Unset: 'eager'. Selected independently of swiglu_mlp_implementation: a model that owns its "
-            "own projections reads this field, a model that runs the fused SwiGLU row reads that one."
+            "Unset: 'eager'. Selected independently of gated_mlp_implementation: a model that owns its "
+            "own projections reads this field, a model that runs the fused gated-MLP row reads that one."
         },
     )
     rotary_pos_emb_implementation: Optional[str] = field(
@@ -1825,9 +1832,9 @@ class OpsImplementationConfig:
         # No cross-family conflict needs rejecting here. ``deepgemm_fp8`` and
         # ``qat`` are two values of the same ``moe_implementation`` field, so they
         # cannot both be selected; ``linear_implementation`` and
-        # ``swiglu_mlp_implementation`` are separate GEMMs with separate operands,
+        # ``gated_mlp_implementation`` are separate GEMMs with separate operands,
         # so quantizing them alongside a DeepGEMM expert GEMM rounds nothing twice.
-        # The shared expert in particular is a dense SwiGLU FFN, not one of the
+        # The shared expert in particular is a dense gated MLP, not one of the
         # routed experts.
 
         from ..utils.device import IS_NPU_AVAILABLE

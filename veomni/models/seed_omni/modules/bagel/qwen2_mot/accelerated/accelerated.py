@@ -718,5 +718,4 @@ class BagelQwen2MoTAccelerated(VeOmniMixin, InferenceMixinAccelerated, BagelQwen
 
 register_accelerated_qkv_conversion_mapping()
 
-
 __all__ = ["BagelQwen2MoTAccelerated", "InferenceMixinAccelerated"]

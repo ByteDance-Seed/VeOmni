@@ -22,7 +22,18 @@ from .....mixins.base_mixin import BaseMixin
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem
-from ....base.llm_packing import pack_llm_conversations_for_forward, scatter_llm_hidden_states
+from ....base.llm_packing import (
+    item_token_len,
+    pack_llm_conversations_for_forward,
+    scatter_llm_hidden_states,
+)
+from ....base.sp_shard import (
+    gather_sp_sharded_groups,
+    modality_groups,
+    pack_sp_sharded_conversations_for_forward,
+    sp_varlen_row,
+    split_sp_sharded_tensor,
+)
 from ..configuration import Qwen3LlmConfig
 from ..modeling import Qwen3Llm
 
@@ -48,6 +59,36 @@ class TrainingMixin(TrainingModuleMixin):
         conversation_list: Optional[list[list[ConversationItem]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        ps = get_parallel_state()
+        if ps.sp_size > 1 and ps.skip_sp_gather_between_modules:
+            packed = pack_sp_sharded_conversations_for_forward(conversation_list, self.device)
+            if packed is not None:
+                local_embeds, attention_mask, position_ids, inputs_embeds_shape, sample_seqlens = packed
+                if self.training and ps.fsdp_enabled:
+                    local_embeds = _fold_fsdp_dummy_anchors(local_embeds, conversation_list)
+                self._conversation_carrier = conversation_list
+                self._pack_inputs_embeds_shape = inputs_embeds_shape
+                self._sp_own_len = int(inputs_embeds_shape.sum().item())
+                self.metric_meter_set_seqlens("forward", sample_seqlens)
+                mask, pids, (cu_q, cu_k, max_q, max_k) = sp_varlen_row(
+                    position_ids,
+                    attention_mask,
+                    self._sp_own_len,
+                    pos_dim=1,
+                    group=ps.sp_group,
+                    sample_seqlens=sample_seqlens,
+                )
+                return dict(
+                    inputs_embeds=local_embeds,
+                    attention_mask=mask,
+                    position_ids=pids,
+                    cu_seq_lens_q=cu_q,
+                    cu_seq_lens_k=cu_k,
+                    max_length_q=max_q,
+                    max_length_k=max_k,
+                )
+            gather_sp_sharded_groups(modality_groups(conversation_list), ps.sp_group, meta_list_keys=("deepstack",))
+
         inputs_embeds, attention_mask, position_ids, inputs_embeds_shape = pack_llm_conversations_for_forward(
             conversation_list, self.device
         )
@@ -119,18 +160,38 @@ class TrainingMixin(TrainingModuleMixin):
     @post_forward("forward")
     def forward_post(self, **outputs: Any) -> Dict[str, Any]:
         hidden_states = outputs.get("hidden_states")
+        ps = get_parallel_state()
+        conversation = self._conversation_carrier
+        pack_shape = self._pack_inputs_embeds_shape
+        # The switch governs this boundary, not the path ``forward_pre`` took: a
+        # batch that had to gather its modalities still hands a shard on, because
+        # the consumer is the one that decides whether it wants full spans. Lengths
+        # come from ``meta`` — the output is a window, so its row count cannot tell
+        # the segments apart.
+        item_lengths = (
+            [item_token_len(item) for sample in conversation for item in sample if not item.is_dummy]
+            if ps.sp_size > 1 and ps.skip_sp_gather_between_modules
+            else None
+        )
+        self._conversation_carrier = None
+        self._pack_inputs_embeds_shape = None
 
-        if get_parallel_state().sp_size > 1:
+        if ps.sp_size > 1:
+            if item_lengths is not None:
+                self._sp_own_len = None
+                if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
+                    hidden_states = hidden_states.squeeze(0)
+                scatter_llm_hidden_states(
+                    conversation,
+                    split_sp_sharded_tensor(hidden_states, item_lengths, ps.sp_rank, ps.sp_size),
+                )
+                return {"conversation_list": conversation}
             # SP output-gather: all-gather Ulysses shards back to the full sequence
             # (autograd-aware; backward sums grads across the SP group), then strip
             # the SP pad tail so the packed length matches its carrier below.
-            hidden_states = gather_outputs(hidden_states, gather_dim=1, group=get_parallel_state().sp_group)
+            hidden_states = gather_outputs(hidden_states, gather_dim=1, group=ps.sp_group)
             hidden_states = hidden_states.narrow(1, 0, self._sp_own_len)
-
-        conversation = self._conversation_carrier
-        pack_shape = self._pack_inputs_embeds_shape
-        self._conversation_carrier = None
-        self._pack_inputs_embeds_shape = None
+            self._sp_own_len = None
 
         if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
             hidden_states = hidden_states.squeeze(0)
@@ -183,7 +244,8 @@ def _fold_fsdp_dummy_anchors(
                 continue
             if not isinstance(part.value, torch.Tensor):
                 continue
-            fake = part.value.mean().to(device=inputs_embeds.device, dtype=inputs_embeds.dtype) * 0.0
+            # ``sum``, not ``mean``: a zero-row dummy slice is NaN under ``mean``.
+            fake = part.value.sum().to(device=inputs_embeds.device, dtype=inputs_embeds.dtype) * 0.0
             inputs_embeds = inputs_embeds + fake
     return inputs_embeds
 
