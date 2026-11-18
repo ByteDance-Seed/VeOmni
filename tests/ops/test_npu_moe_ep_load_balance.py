@@ -710,24 +710,36 @@ def test_segmented_gmm_no_grad_reuses_single_output(counts):
     assert actual.is_contiguous()
 
 
-@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Real NPU fused MoE balance requires torch_npu and Ascend hardware")
-@pytest.mark.parametrize("optimize_memory", [False, True])
-@pytest.mark.parametrize("mixed_routing", [False, True])
-def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(optimize_memory, mixed_routing):
+@pytest.fixture(scope="module")
+def real_npu_ep_group():
     world_size = dist.get_world_size() if dist.is_initialized() else int(os.environ.get("WORLD_SIZE", "1"))
     if world_size != 2:
         pytest.skip("Run with torchrun --standalone --nproc-per-node=2 on an Ascend host.")
-
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    torch.npu.set_device(local_rank)
+    torch.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     owns_group = not dist.is_initialized()
     if owns_group:
         dist.init_process_group("hccl")
+    try:
+        # Reuse the communicator across parameterized cases. Reinitializing an
+        # HCCL default group against the same torchrun store can reuse stale keys.
+        yield dist.group.WORLD
+    finally:
+        if owns_group:
+            dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Real NPU fused MoE balance requires torch_npu and Ascend hardware")
+@pytest.mark.parametrize("optimize_memory", [False, True])
+@pytest.mark.parametrize("mixed_routing", [False, True])
+def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(
+    optimize_memory, mixed_routing, real_npu_ep_group
+):
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
     real_npu_moe = importlib.import_module(_NPU_MOE_NAME)
     real_ep_dispatch = importlib.import_module(_EP_DISPATCH_NAME)
     real_ep_load_balance = importlib.import_module(_EP_LOAD_BALANCE_NAME)
-    group = dist.group.WORLD
+    group = real_npu_ep_group
     rank = dist.get_rank(group)
     device = torch.device(f"npu:{local_rank}")
     selected_experts = torch.zeros((6 if rank == 0 else 4, 1), dtype=torch.long, device=device)
@@ -813,8 +825,6 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(optimize_me
     finally:
         real_npu_moe.get_parallel_state = original_get_parallel_state
         real_ep_dispatch.get_parallel_state = original_ep_dispatch_get_parallel_state
-        if owns_group:
-            dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Real NPU grouped matmul requires Ascend hardware")
