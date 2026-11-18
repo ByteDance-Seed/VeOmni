@@ -134,6 +134,11 @@ class VeOmniModelRuntime:
         *,
         train: "TrainingArguments",
     ):
+        if args.accelerator.fsdp_config.fsdp_mode == "hyper_fsdp2" or args.optimizer.type == "hyper_muon":
+            from hyper_parallel.integration.veomni import apply_hyper_parallel_patch
+
+            apply_hyper_parallel_patch(args)
+
         self.args = args
         self.model_name = model_name
         self.train_args = train
@@ -436,7 +441,7 @@ class VeOmniModelRuntime:
             kwargs["adapter_path"] = args.lora_config.get("lora_adapter", None)
             kwargs["is_peft_model"] = True
 
-        muon_expert_zero_comm = args.optimizer.type == "muon" and args.optimizer.muon_expert_zero_comm
+        muon_expert_zero_comm = args.optimizer.type in ("muon", "hyper_muon") and args.optimizer.muon_expert_zero_comm
 
         if args.fqn_to_index_mapping is not None:
             kwargs["fqn_to_index_mapping"] = args.fqn_to_index_mapping

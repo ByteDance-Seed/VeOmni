@@ -264,6 +264,15 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         for_inference=for_inference,
         checkpoint_modules=ckpt_modules,
     )
+    if (
+        model_runtime.accelerator.fsdp_config.fsdp_mode == "hyper_fsdp2"
+        or model_runtime.optimizer.type == "hyper_muon"
+        or any(
+            module.accelerator.fsdp_config.fsdp_mode == "hyper_fsdp2" or module.optimizer.type == "hyper_muon"
+            for module in modules.values()
+        )
+    ):
+        raise ValueError("HyperParallel is not supported by SeedOmni training or inference.")
     _validate_hf_view_modules(
         seed_omni_model_path, modules, ep_sharded_stream_load=model_runtime.ep_sharded_stream_load
     )

@@ -704,6 +704,16 @@ def build_omni_model_runtime(
             ``training_task`` and the shared checkpoint ``save_path``/``output_dir``/``load_path``.
         for_inference: Build for generation, which skips the optimizer and the training-only checks.
     """
+    if (
+        omni_model_runtime_args.accelerator.fsdp_config.fsdp_mode == "hyper_fsdp2"
+        or omni_model_runtime_args.optimizer.type == "hyper_muon"
+        or any(
+            module.accelerator.fsdp_config.fsdp_mode == "hyper_fsdp2" or module.optimizer.type == "hyper_muon"
+            for module in omni_model_runtime_args.modules.values()
+        )
+    ):
+        raise ValueError("HyperParallel is not supported by SeedOmni training or inference.")
+
     from ..omni_module.omni_module_runtime import build_omni_module_runtime
 
     omni_config = omni_model_runtime_args.to_hf_config()

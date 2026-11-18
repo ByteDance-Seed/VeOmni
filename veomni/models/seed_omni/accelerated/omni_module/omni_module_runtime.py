@@ -715,6 +715,9 @@ def build_omni_module_runtime(
     hf_source: Optional["HFSource"] = None,
 ) -> ModuleRuntime:
     """Build the :class:`ModuleRuntime` for one module of a composed model."""
+    if args.accelerator.fsdp_config.fsdp_mode == "hyper_fsdp2" or args.optimizer.type == "hyper_muon":
+        raise ValueError("HyperParallel is not supported by SeedOmni training or inference.")
+
     return ModuleRuntime(
         args,
         module_name=module_name,

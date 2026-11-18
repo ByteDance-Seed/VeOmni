@@ -500,7 +500,7 @@ def _init_parallel_state(
     pp_size: int = 1,
     cp_size: int = 1,
     ulysses_size: int = 1,
-    dp_mode: Literal["ddp", "fsdp2"] = "fsdp2",
+    dp_mode: Literal["ddp", "fsdp2", "hyper_fsdp2"] = "fsdp2",
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
     extra_parallel_sizes: Tuple[int] = (1,),
@@ -568,6 +568,9 @@ def _init_parallel_state(
     assert len(extra_parallel_sizes) == len(extra_parallel_placement_innermost) == len(extra_parallel_names), (
         "each extra parallel should correspond to a size, a placement and a name"
     )
+
+    if dp_mode == "hyper_fsdp2":
+        dp_mode = "fsdp2"
 
     # Reuse an already-built state for an identical topology (e.g. the omni
     # orchestrator builds one ParallelState per module, many of which share the
