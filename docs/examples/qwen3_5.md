@@ -159,9 +159,8 @@ See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend
 for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,
 and `triton-ascend` on a mutually compatible release set.
 
-> **arch35:** the old `causal_conv1d` guard that raised `NotImplementedError` on
-> `Ascend910_95` / `Ascend950` has been removed. On 2026-10-31, forward/backward
-> parity passed on Ascend950DT_9582 with CANN 9.2.0.B080, torch 2.10.0+cpu,
+> **arch35:** On 2026-10-31, forward/backward
+> parity passed on Ascend 950PR&950DT products with CANN 9.2.0.B080, torch 2.10.0+cpu,
 > torch_npu 2.10.0.post4 and triton-ascend 3.2.2. Cases cover 256/640 channels
 > and both ordinary sequences and packed boundaries at 61/128 tokens. This is
 > operator validation; it does not claim full-model training coverage.
@@ -184,11 +183,11 @@ model:
     chunk_gated_delta_rule_implementation: fla_npu
 ```
 
-`fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It covers the A2
-(`ascend910b`), A3 (`ascend910_93`) and A5 / arch35 (`ascend950`) targets; the library picks the
+`fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It covers the Atlas A2 training products
+(`ascend910b`), Atlas A3 training products (`ascend910_93`) and Ascend 950PR&950DT products / arch35 (`ascend950`) targets; the library picks the
 arch22 or arch35 kernel path from the SoC, and this adapter uses the BF16 K=V=128,
 chunk_size=64 contract both paths share. The vendored `causal_conv1d` no longer rejects
-arch35 (`Ascend910_95` / `Ascend950`); the operator validation scope is recorded above.
+arch35 (Ascend 950PR&950DT products); the operator validation scope is recorded above.
 
 These instance-local GDN selectors also apply to Qwen4-Exp. Keep the model's
 configured output-gate activation: selecting AscendC does not change sigmoid
@@ -202,21 +201,21 @@ The following prebuilt NPU images on [quay.io](https://quay.io/repository/ascend
 bundle the legacy `fla_npu` build from `c2e3d83f`, which does not provide the GDN API required
 by this adapter:
 
-- A2: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A2-ubuntu22.04-py3.11-veomni-latest`
-- A3: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A3-ubuntu22.04-py3.11-veomni-latest`
+- Atlas A2 training products: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A2-ubuntu22.04-py3.11-veomni-latest`
+- Atlas A3 training products: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A3-ubuntu22.04-py3.11-veomni-latest`
 
 Before selecting the `fla_npu` backend in either image, replace its legacy package using the
-`a7c608f` wheel installation steps below. Follow the same steps on a bare host or an A5
-system, selecting the matching SoC target. A compatible A5 image is not listed here.
+`a7c608f` wheel installation steps below. Follow the same steps on a bare host or an Ascend 950PR&950DT products
+system, selecting the matching SoC target. A compatible Ascend 950PR&950DT products image is not listed here.
 
 Build and install the `a7c608f` wheel from the
 [`flash-linear-attention-npu`](https://github.com/flashserve/flash-linear-attention-npu) sources.
 The library does not install `torch`, `torch_npu` or `triton-ascend` for you; those must match
-your CANN and Python versions, and `FLA_NPU_SOC` must match the chip — A2 → `ascend910b`,
-A3 → `ascend910_93`, A5 → `ascend950`.
+your CANN and Python versions, and `FLA_NPU_SOC` must match the chip — Atlas A2 training products → `ascend910b`,
+Atlas A3 training products → `ascend910_93`, Ascend 950PR&950DT products → `ascend950`.
 
 ```bash
-# CANN first: A2/A3 need >= 8.5.2, A5 needs >= 9.0.0. Re-source it in every new shell.
+# CANN first: Atlas A2 training products/Atlas A3 training products need >= 8.5.2, Ascend 950PR&950DT products needs >= 9.0.0. Re-source it in every new shell.
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 git clone https://github.com/flashserve/flash-linear-attention-npu
@@ -243,7 +242,7 @@ python scripts/check_packaged_wheel_api.py
 
 **Compatibility change:** migrating to the stable complete forward/backward API
 removes the legacy adapter's wider-value training domain, including V=256 on
-A2/A3. Some individual operators and forward-only paths in the library accept
+Atlas A2 training products/Atlas A3 training products. Some individual operators and forward-only paths in the library accept
 wider values or chunk sizes, but its composite backward explicitly requires
 K=V=128 and chunk_size=64. VeOmni intentionally exposes the complete pair's
 common domain, rather than allowing a forward that fails during backward.
@@ -252,9 +251,9 @@ the fused backend cannot represent the requested configuration.
 
 | Target | Q/K/V dtype | K / V | Chunk size | Initial state |
 | --- | --- | --- | --- | --- |
-| A2 / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
-| A3 / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
-| A5 / arch35 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
+| Atlas A2 training products / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
+| Atlas A3 training products / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
+| Ascend 950PR&950DT products / arch35 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
 
 A returned FP32 final state can be passed to the next inference call without a
 lossy conversion. State gradients remain unsupported. Q/K normalization uses
