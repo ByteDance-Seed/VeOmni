@@ -168,7 +168,7 @@ def _bagel_fa4_async_worker() -> None:
             "attn_implementation": "flex_attention",
             "rms_norm_implementation": "liger_kernel",
             "rotary_pos_emb_implementation": "liger_kernel",
-            "swiglu_mlp_implementation": "eager",
+            "gated_mlp_implementation": "eager",
         },
     )
     reference = accelerated.BagelQwen2MoTAccelerated(config).to(device=device, dtype=dtype).train()

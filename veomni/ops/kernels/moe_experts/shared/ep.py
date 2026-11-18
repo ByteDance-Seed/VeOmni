@@ -282,8 +282,6 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
         tile_total_M = ctx.tile_prefix_total
         swiglu_limit = ctx.swiglu_limit
 
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        fc1_result = fc1_1_activation * fc1_2_output
         grad_fc1_result = group_gemm_same_nk(
             a=grad_output,
             b=fc2_weight,
@@ -293,6 +291,15 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
             tile_cumsum=tile_cumsum,
             tile_total_M=tile_total_M,
         )
+
+        fc1_result, grad_fc1_output = swiglu.merged_swiglu_backward(
+            fc1_1_output,
+            fc1_2_output,
+            grad_fc1_result,
+            mask_fc1_1 if swiglu_limit is not None else None,
+            mask_fc1_2 if swiglu_limit is not None else None,
+        )
+        del grad_fc1_result
 
         grad_fc2_weight = None
         if fc2_weight.requires_grad:
@@ -306,15 +313,8 @@ class EPMergedFc1GroupGemm(torch.autograd.Function):
                 transpose_a=True,
                 transpose_b=False,
             )
+        del fc1_result
 
-        grad_fc1_2_output = fc1_1_activation * grad_fc1_result
-        grad_fc1_1_activation = grad_fc1_result * fc1_2_output
-        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
-        if swiglu_limit is not None:
-            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
-            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
-
-        grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
         grad_permute_tokens = group_gemm_same_nk(
             a=grad_fc1_output,
             b=fc1_1_2_weight,
