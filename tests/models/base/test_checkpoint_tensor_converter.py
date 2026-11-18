@@ -47,6 +47,10 @@ from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
     create_deepseek_v4_checkpoint_tensor_converter,
     validate_deepseek_v4_export_quant_support,
 )
+from veomni.models.transformers.glm5_next.checkpoint_tensor_converter import (
+    Glm5NextCheckpointTensorConverter,
+    create_glm5_next_checkpoint_tensor_converter,
+)
 from veomni.models.transformers.glm_moe_dsa.checkpoint_tensor_converter import (
     GlmMoeDsaCheckpointTensorConverter,
     create_glm_moe_dsa_checkpoint_tensor_converter,
@@ -362,6 +366,7 @@ _PER_EXPERT_CONVERTERS = pytest.mark.parametrize(
         Qwen3OmniMoeCheckpointTensorConverter,
         DeepseekV3CheckpointTensorConverter,
         GlmMoeDsaCheckpointTensorConverter,
+        Glm5NextCheckpointTensorConverter,
     ],
 )
 
@@ -649,6 +654,76 @@ class TestDeepseekV3ConverterFactory:
         converter = create_deepseek_v3_checkpoint_tensor_converter(model)
         assert isinstance(converter, DeepseekV3CheckpointTensorConverter)
         assert converter.num_experts == 8
+
+
+class TestGlm5NextConverter:
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+    def test_factory_reads_routed_expert_count_from_text_or_flat_config(self):
+        flat = SimpleNamespace(config=SimpleNamespace(n_routed_experts=8))
+        converter = create_glm5_next_checkpoint_tensor_converter(flat)
+        assert isinstance(converter, Glm5NextCheckpointTensorConverter)
+        assert converter.num_experts == 8
+
+        nested = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(n_routed_experts=16)))
+        converter = create_glm5_next_checkpoint_tensor_converter(nested)
+        assert converter.num_experts == 16
+
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+    def test_per_expert_checkpoint_loads_into_fused_experts(self, tmp_path):
+        """Released Flash checkpoints may ship per-expert routed experts under language_model."""
+        from safetensors.torch import save_file
+
+        from tests.models.tiny_configs import tiny_glm5_next_config
+        from tests.tools.training_utils import make_eager_ops_config
+        from veomni.models.auto import build_foundation_model
+        from veomni.models.checkpoint.weights import load_model_weights
+
+        model = build_foundation_model(
+            config_path=tiny_glm5_next_config(),
+            weights_path=None,
+            torch_dtype="float32",
+            init_device="cpu",
+            ops_implementation=make_eager_ops_config(),
+        )
+        generator = torch.Generator().manual_seed(0)
+        expected = {name: torch.randn(param.shape, generator=generator) for name, param in model.state_dict().items()}
+
+        on_disk = {}
+        for name, tensor in expected.items():
+            if name.endswith(".mlp.experts.gate_up_proj"):
+                prefix = name.removesuffix(".gate_up_proj")
+                gate, up = tensor.chunk(2, dim=1)
+                for expert in range(tensor.shape[0]):
+                    on_disk[f"{prefix}.{expert}.gate_proj.weight"] = gate[expert].contiguous()
+                    on_disk[f"{prefix}.{expert}.up_proj.weight"] = up[expert].contiguous()
+            elif name.endswith(".mlp.experts.down_proj"):
+                prefix = name.removesuffix(".down_proj")
+                for expert in range(tensor.shape[0]):
+                    on_disk[f"{prefix}.{expert}.down_proj.weight"] = tensor[expert].contiguous()
+            else:
+                on_disk[name] = tensor
+        assert not any(name.endswith((".gate_up_proj", ".experts.down_proj")) for name in on_disk)
+
+        model.config.save_pretrained(tmp_path)
+        save_file(on_disk, str(tmp_path / "model.safetensors"))
+        loaded = build_foundation_model(
+            config_path=str(tmp_path),
+            weights_path=None,
+            torch_dtype="float32",
+            init_device="cpu",
+            ops_implementation=make_eager_ops_config(),
+        )
+        from veomni.utils.device import IS_NPU_AVAILABLE
+
+        expected_suffix = "_npu" if IS_NPU_AVAILABLE else "_gpu"
+        assert type(model).__module__.endswith(expected_suffix)
+        assert type(loaded).__module__.endswith(expected_suffix)
+        load_model_weights(loaded, str(tmp_path), init_device="cpu")
+
+        loaded_state = loaded.state_dict()
+        assert loaded_state.keys() == expected.keys()
+        mismatched = [name for name, tensor in loaded_state.items() if not torch.equal(tensor, expected[name])]
+        assert mismatched == []
 
 
 class TestGlmMoeDsaConverter:

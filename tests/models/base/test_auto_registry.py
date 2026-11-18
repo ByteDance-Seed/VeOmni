@@ -39,6 +39,12 @@ from tests.models.tiny_configs import (
     tiny_gemma3_text_config as _tiny_gemma3_text_config,
 )
 from tests.models.tiny_configs import (
+    tiny_glm5_next_config as _tiny_glm5_next_config,
+)
+from tests.models.tiny_configs import (
+    tiny_glm5_next_text_config as _tiny_glm5_next_text_config,
+)
+from tests.models.tiny_configs import (
     tiny_glm_moe_dsa_config as _tiny_glm_moe_dsa_config,
 )
 from tests.models.tiny_configs import (
@@ -149,6 +155,8 @@ _STANDALONE_HF_FAMILIES = frozenset(
         "deepseek_v3",
         "deepseek_v4",
         "gemma3_text",
+        "glm5_next",
+        "glm5_next_text",
         "glm_moe_dsa",
         "gpt_oss",
         "kimi_k3",
@@ -338,6 +346,30 @@ _MODEL_CASES = (
             "GptOssForTokenClassification",
             "GptOssModel",
         ),
+    ),
+    _ModelCase(
+        model_type="glm5_next",
+        eager_ops=(
+            ("veomni_ce", "cross_entropy_loss"),
+            ("veomni_lb", "load_balancing_loss"),
+            ("model.language_model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("model.language_model.layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("model.language_model.layers.2.mlp.experts.veomni_moe", "moe_experts"),
+        ),
+        isolation_op_path="model.language_model.layers.2.mlp.experts.veomni_moe",
+        config_factory=_tiny_glm5_next_config,
+        architectures=("Glm5NextForConditionalGeneration", "Glm5NextModel"),
+    ),
+    _ModelCase(
+        model_type="glm5_next_text",
+        eager_ops=(
+            ("layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
+            ("layers.0.mlp.veomni_swiglu_mlp", "swiglu_mlp"),
+            ("layers.2.mlp.experts.veomni_moe", "moe_experts"),
+        ),
+        isolation_op_path="layers.2.mlp.experts.veomni_moe",
+        config_factory=_tiny_glm5_next_text_config,
+        architectures=("Glm5NextTextModel",),
     ),
     _ModelCase(
         model_type="glm_moe_dsa",

@@ -74,6 +74,10 @@ _NPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # GLM-MoE-DSA folds its DSA top-k selection into the attention mask, which
     # flash attention cannot consume; the NPU build has no sparse DSA kernel.
     "glm_moe_dsa": {"attn_implementation": "eager"},
+    # GLM-5.3-Flash keeps HF KDA/DSA with gather-before-attn SP; no fused DSA
+    # attention/indexer VeomniOp on either GPU or NPU for this family yet.
+    "glm5_next": {"attn_implementation": "eager"},
+    "glm5_next_text": {"attn_implementation": "eager"},
     # Multimodal RoPE has no NPU backend in the Qwen-VL family.
     "qwen2vl": {"rotary_pos_emb_implementation": "eager"},
     "qwen25vl": {"rotary_pos_emb_implementation": "eager"},
@@ -109,6 +113,10 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # DSA top-k selection into the attention mask, which flash attention cannot
     # consume. The flashmla_cudnn kernel needs SM90+ and GLM-5-sized heads.
     "glm_moe_dsa": {"attn_implementation": "eager"},
+    # GLM-5.3-Flash wires RMS/SwiGLU/MoE/CE and gather-before-attn SP around HF
+    # KDA/DSA; keep attn eager until a dedicated DSA VeomniOp lands.
+    "glm5_next": {"attn_implementation": "eager"},
+    "glm5_next_text": {"attn_implementation": "eager"},
     # GPT-OSS intentionally does not register a Triton MoE backend because its
     # native interleaved gate/up training layout needs either eager reference
     # math or the dedicated SM90-only Quack path. Keep the shared helper on the

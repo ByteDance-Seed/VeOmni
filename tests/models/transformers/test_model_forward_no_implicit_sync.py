@@ -346,6 +346,7 @@ _MM_METADATA_WIRED_CASES: set[str] = {
     "qwen2_vl-fa2",
     "qwen2_5_vl-fa2",
     "qwen2_5_omni-fa2",
+    "glm5_next-eager",
 }
 
 
