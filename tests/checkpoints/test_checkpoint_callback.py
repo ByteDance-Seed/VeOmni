@@ -790,7 +790,9 @@ class TestGlobalStateCallbackJobState:
         )
 
     @pytest.mark.parametrize("cursor_file", ["missing", "empty"])
-    def test_offline_resume_rejects_missing_loader_cursor_before_writer_restore(self, mock_dist, tmp_path, cursor_file):
+    def test_offline_resume_rejects_missing_loader_cursor_before_writer_restore(
+        self, mock_dist, tmp_path, cursor_file
+    ):
         mock_dist.is_initialized.return_value = False
         trainer = _make_mock_trainer()
         trainer.args.train.training_task = "offline_embedding"

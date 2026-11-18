@@ -31,7 +31,7 @@ def test_exact_sft_flag_is_set_before_callbacks(monkeypatch, module, trainer_nam
         def _build_collate_fn(self):
             pass
 
-        def _build_dataloader(self):
+        def _build_sft_dataloader(self):
             pass
 
         def _build_lr_scheduler(self):

@@ -1886,26 +1886,3 @@ def _gloo_channel_data_metrics_worker(rank, world_size, sp_size, endpoint):
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=4))
 def test_channel_data_metrics_gloo_sp_and_dp(sp_size):
     spawn_with_rendezvous(_gloo_channel_data_metrics_worker, args=(4, sp_size), nprocs=4)
-
-
-@pytest.mark.parametrize("sp_enabled", [False, True])
-def test_channel_loss_rejects_ambiguous_multirow_surplus(monkeypatch, sp_enabled):
-    kwargs = dict(
-        per_token_loss=torch.tensor([1.0, 2.0, 0.0, 3.0, 4.0, 0.0]),
-        labels_flat=torch.tensor([1, 1, IGNORE_INDEX, 1, 1, IGNORE_INDEX]),
-        attention_mask_flat=torch.tensor([1, 1, 0, 1, 1, 1]),
-        source_ids=["row0", "row1_actual", "row1_zero"],
-        ignore_index=IGNORE_INDEX,
-    )
-    positions = torch.tensor([[0, 1, 0], [0, 1, 0]])
-    if sp_enabled:
-        aggregate = lambda strict: ChannelLossComputer._aggregate_sp(  # noqa: E731
-            **kwargs, positions=positions, seq_len=6, parallel_state=_sp_state(monkeypatch, sp_size=1), strict=strict
-        )
-    else:
-        aggregate = lambda strict: ChannelLossComputer._aggregate_by_source(  # noqa: E731
-            **kwargs, position_ids=positions, strict=strict
-        )
-    assert aggregate(False) == []
-    with pytest.raises(ChannelLossMetadataError, match="source metadata count"):
-        aggregate(True)

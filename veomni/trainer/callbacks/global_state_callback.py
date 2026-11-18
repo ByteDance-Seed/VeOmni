@@ -558,11 +558,7 @@ class GlobalStateCallback(Callback):
             dist.all_gather_object(restored_generations, local_generations)
             if any(value != local_generations for value in restored_generations):
                 raise RuntimeError("Restored optimizer checkpoint generations differ across ranks")
-        coordinated_resume = (
-            strict_resume
-            or bool(legacy_checkpoints or unknown_checkpoints)
-            or offline_resume
-        )
+        coordinated_resume = strict_resume or bool(legacy_checkpoints or unknown_checkpoints) or offline_resume
 
         if strict_optimizer:
             completeness_error = None

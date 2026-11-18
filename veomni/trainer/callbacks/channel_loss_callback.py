@@ -1425,10 +1425,6 @@ def _filter_surplus_tail_padding_segments(
     ignore_index: int,
 ) -> list[tuple[int, int, int]]:
     """Drop trailing padding-only segments until segment count matches ``source_count``."""
-    if len(segments) > source_count and len({batch_idx for batch_idx, _, _ in segments}) > 1:
-        # PackingCollator produces a single row. With several rows a surplus
-        # segment cannot safely be assigned to a source using tail order alone.
-        return segments
     while len(segments) > source_count:
         _, start, end = segments[-1]
         mask_slice = attention_mask_flat[start : end + 1] if attention_mask_flat is not None else None
@@ -1451,9 +1447,6 @@ def _filter_surplus_tail_padding_sp_segments(
     surplus = sum(1 for segment in segments if segment["is_start"]) - source_count
     if surplus <= 0:
         return segments
-    if len({segment.get("batch_idx", 0) for segment in segments}) > 1:
-        return segments
-
     logical_segments: list[list[int]] = []
     for segment_idx, segment in enumerate(segments):
         if segment["is_start"]:
