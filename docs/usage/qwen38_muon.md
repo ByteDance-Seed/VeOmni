@@ -91,6 +91,9 @@ On CUDA, matmul must already use IEEE FP32 (`highest`, TF32 disabled); each
 rank rejects an unsafe local policy before any optimizer child updates. The
 runtime must configure the same precision policy and step hooks on all ranks;
 the step does not run a collective to detect inconsistent configurations.
+If a rank's local check fails, peers may already have updated parameters or
+file-backed optimizer state. Stop the failed job on all ranks and resume from a
+completed checkpoint in fresh processes; do not save or reuse its live state.
 The optimizer does not change process-wide CUDA precision flags. The framework
 factory checks that its distributed CUDA training group covers the full world
 and uses `TP=PP=1`. Custom `MultiOptimizer` callers must enable

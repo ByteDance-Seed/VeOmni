@@ -474,8 +474,14 @@ def _ordinary_restore_failure_worker(rank, root, endpoint):
             runtime.load_extra_state.side_effect = OSError("local scheduler read failed")
         with patch("veomni.models.checkpoint.manager.build_checkpointer"):
             manager = ModelCheckpointManager(runtime)
-        with pytest.raises((OSError, RuntimeError), match="local scheduler read failed|failed on another rank"):
+        manager.checkpointer.load.side_effect = lambda _path, state, **_kwargs: state["extra_state"].update(
+            lr_scheduler=None
+        )
+        expected = (OSError, "local scheduler read failed") if rank == 1 else (RuntimeError, "failed on another rank")
+        with pytest.raises(expected[0], match=expected[1]):
             manager.load()
+        manager.checkpointer.load.assert_called_once()
+        runtime.load_extra_state.assert_called_once_with({"lr_scheduler": None})
         assert manager._loaded_checkpoint_path is None
         dist.barrier()
     finally:

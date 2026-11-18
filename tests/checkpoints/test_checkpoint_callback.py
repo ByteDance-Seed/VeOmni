@@ -460,13 +460,20 @@ class TestModelCheckpointManagerSaveContract:
         runtime.train_args.checkpoint.load_path = "/tmp/ckpt"
         mock_checkpointer = MagicMock()
         mock_build_ckpt.return_value = mock_checkpointer
+        scheduler_state = {"last_epoch": 7}
+
+        def load(_path, state, **_kwargs):
+            state["extra_state"]["lr_scheduler"] = scheduler_state
+
+        mock_checkpointer.load.side_effect = load
 
         manager = ModelCheckpointManager(runtime)
         manager.load()
 
         loaded = mock_checkpointer.load.call_args.args[1]
-        assert loaded["extra_state"] == {}
+        assert loaded["extra_state"] == {"lr_scheduler": scheduler_state}
         assert loaded["optimizer"] is runtime.optimizer
+        runtime.lr_scheduler.load_state_dict.assert_called_once_with(scheduler_state)
         assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is runtime.parallel_state
 
     def test_save_lora_writes_the_adapter_to_its_own_export_dir(
