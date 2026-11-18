@@ -43,10 +43,10 @@ receive another rank's items.
 
 Qwen3-VL is the reference integration:
 
-- Spec: [`_vision_balance_spec`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/accelerated.py#L174)
-- Metadata and `data_balance_pre`: [`_balance_vision_inputs`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/accelerated.py#L184)
-- Pre hooks: [`forward_pre`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/accelerated.py#L85) and [`pack_encode_pre`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/packed.py#L56)
-- Post hooks: [`forward_post`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/accelerated.py#L147) and [`pack_encode_post`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/packed.py#L114)
+- Spec: [`_vision_balance_spec`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/accelerated.py#L200)
+- Metadata and `data_balance_pre`: [`_balance_vision_inputs`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/accelerated.py#L210)
+- Pre hooks: [`forward_pre`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/accelerated.py#L74) and [`pack_encode_pre`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/packed.py#L37)
+- Post hooks: [`forward_post`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/accelerated.py#L154) and [`pack_encode_post`](../../veomni/models/seed_omni/modules/qwen3vl/vision/accelerated/packed.py#L112)
 
 A minimal module with one output token per input token:
 
