@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from .....distributed.parallel_state import get_parallel_state
 from ....activation import apply_activation, resolve, supports
 from ..shared.act_fn_experts import merged_experts_act_fn_forward
 
@@ -69,7 +70,12 @@ def wrapper(
     under EP.
     """
     del assume_distinct_experts, block_size, expert_dtype
-    if not supports(activation):
+    # Two reasons to take the shared loop rather than the inline one below: an
+    # activation no ATen spelling covers, and expert parallelism -- whose weights are
+    # sharded per rank, so the inline loop's ``num_experts`` mask indexes past the
+    # shard. ``gelu`` is in the served set, so keying on the activation alone would
+    # send it down the sharded-weight path.
+    if not supports(activation) or get_parallel_state().ep_enabled:
         # One implementation of the reference path, shared with the fused rows that
         # delegate here. It carries the EP dispatch, which is why this cannot be
         # inlined: indexing a sharded weight by global expert id reads past the shard.

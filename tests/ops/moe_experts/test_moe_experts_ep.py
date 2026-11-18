@@ -624,7 +624,7 @@ def test_fused_moe_routing_weights_match_ep_projection_order(swiglu_limit: float
     )
 
 
-def _distributed_standard_ep_worker(rank, merged, endpoint):
+def _distributed_standard_ep_worker(rank, merged, activation, endpoint):
     """Compare real token exchange and every gradient with a non-EP replica."""
     import torch.distributed as dist
 
@@ -665,9 +665,32 @@ def _distributed_standard_ep_worker(rank, merged, endpoint):
         fused = resolve_op("moe_experts", "standard", "fused_triton").wrapper
 
         def forward(x, weights, scores):
+            # ``activation`` is what makes this test exercise the EP dispatch at all:
+            # `fused_triton` evaluates the activation itself, and the sharded weights
+            # must reach the EP Functions rather than be indexed by global id.
             if merged:
-                return fused(x, scores, routes, empty, empty, weights[1], weights[0], num_experts=experts)
-            return fused(x, scores, routes, weights[0], weights[1], weights[2], empty, num_experts=experts)
+                return fused(
+                    x,
+                    scores,
+                    routes,
+                    empty,
+                    empty,
+                    weights[1],
+                    weights[0],
+                    num_experts=experts,
+                    activation=activation,
+                )
+            return fused(
+                x,
+                scores,
+                routes,
+                weights[0],
+                weights[1],
+                weights[2],
+                empty,
+                num_experts=experts,
+                activation=activation,
+            )
 
         nonep_state = _init_parallel_state(dp_size=world, device_type=get_device_type(), name="schedule_nonep")
         ep_state = _init_parallel_state(
@@ -705,10 +728,19 @@ def _distributed_standard_ep_worker(rank, merged, endpoint):
 
 
 @pytest.mark.launch_plan(provider=_EP_DISPATCH_PLAN)
+@pytest.mark.parametrize("activation", ["silu", "gelu"], ids=["silu", "gelu"])
 @pytest.mark.parametrize("merged", [False, True], ids=["split-fc1", "merged-fc1"])
-def test_distributed_standard_ep_dispatch_matches_nonep(merged):
-    """Exercise the compact expert schedule behind real all-to-all dispatch."""
+def test_distributed_standard_ep_dispatch_matches_nonep(merged, activation):
+    """Exercise the compact expert schedule behind real all-to-all dispatch.
+
+    Parametrized over the activation because that is where the dispatch was lost:
+    `gelu` is inside `SUPPORTED_ACTIVATIONS`, so a guard that keyed only on "is this
+    name served?" sent it down the inline expert loop -- which builds its mask from
+    the *global* expert count and then indexes a per-rank shard. A SiLU-only test
+    cannot see that, and ``rtol=0`` against the non-EP replica is what makes the
+    difference visible rather than a plausibility check.
+    """
     _skip_if_unsupported()
     if runner_device_count() < _EP_DISPATCH_PLAN.nproc:
         pytest.skip("Distributed EP dispatch requires its declared accelerator plan")
-    spawn_with_rendezvous(_distributed_standard_ep_worker, args=(merged,), nprocs=_EP_DISPATCH_PLAN.nproc)
+    spawn_with_rendezvous(_distributed_standard_ep_worker, args=(merged, activation), nprocs=_EP_DISPATCH_PLAN.nproc)
