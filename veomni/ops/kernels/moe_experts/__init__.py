@@ -46,11 +46,19 @@ from .standard import triton as standard_triton
 _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 
-#: ``moe_experts`` rows that fake-quantize the weights they are handed. Adapters
+#: ``moe_experts`` rows that fake-quantize the operands they are handed. Adapters
 #: need the real weights, and ``moe_experts_lora`` has no matching row, so an
 #: expert-LoRA request on one of these must be refused rather than silently
 #: falling back to a full-precision ``eager`` base.
-QUANTIZING_IMPLS = frozenset({"qat"})
+#:
+#: ``deepgemm_fp8`` belongs here for the same reason as ``qat``: its
+#: ``GroupedLinear`` runs the FP8 GEMM in forward, dgrad *and* wgrad. Leaving it
+#: out let a non-SwiGLU activation reach ``merged_experts_act_fn_forward`` -- plain
+#: ``F.linear`` in the model dtype -- and train the routed experts unquantized
+#: while the config said ``deepgemm_fp8``. The remaining rows (``fused_triton``,
+#: ``fused_quack``, ``fused_npu``, ``fused_mlu``, ``eager``) do bf16 math and
+#: ignore ``expert_dtype``, so falling back changes nothing for them.
+QUANTIZING_IMPLS = frozenset({"qat", "deepgemm_fp8"})
 
 
 def reject_quantizing_act_fn(owner: nn.Module) -> None:
@@ -67,18 +75,18 @@ def reject_quantizing_act_fn(owner: nn.Module) -> None:
     the routed experts at full precision while the config claims otherwise. Support
     for other activations is tracked in #1430.
 
-    The activation is read from ``owner.use_swiglu_mlp`` rather than a config:
+    The activation is read from ``owner.use_swiglu`` rather than a config:
     ``DeepseekV3Experts`` and its siblings are plain ``nn.Module`` objects that
     record the answer at construction and hold no config reference.
 
     Args:
         owner: The experts module that owns the ``veomni_moe`` handle and carries
-            ``use_swiglu_mlp``.
+            ``use_swiglu``.
 
     Raises:
         ValueError: when the selection quantizes and the activation is not SwiGLU.
     """
-    if getattr(owner, "use_swiglu_mlp", True):
+    if getattr(owner, "use_swiglu", True):
         return
     handle = getattr(owner, "veomni_moe", None)
     impl = getattr(handle, "impl", None)

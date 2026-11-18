@@ -114,7 +114,6 @@ config.add_import(
 )
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 # Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
 # packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
 # once in ``Qwen3_5MoeTextModel.forward``.
@@ -176,12 +175,12 @@ config.override_method(
 config.override_method(
     "Qwen3_5MoeMLP.__init__",
     replacement=qwen3_5_moe_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 config.override_method(
     "Qwen3_5MoeMLP.forward",
     replacement=qwen3_5_moe_mlp_forward_patched,
-    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the gated_mlp row, which picks fused weights or the projection modules",
 )
 config.override_method(
     "Qwen3_5MoeDecoderLayer.__init__",
