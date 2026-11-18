@@ -322,10 +322,11 @@ unversioned sidecar requires a verified migration or a fresh weights-only run;
 it is not silently combined with a restored optimizer and scheduler. Matching
 step and generation alone do not prove exact dataloader or RNG recovery.
 For ordinary optimizers as well, resume fails if any rank is missing trainer
-state, or if a completed-step checkpoint lacks the cursor for an active
-dataloader. This prevents restoring optimizer state while restarting the data
-or step counter. To start from weights only, use a model-only load without an
-optimizer rather than a training checkpoint resume.
+state or a required RNG state, or if a completed-step checkpoint lacks the
+cursor for an active dataloader. This prevents restoring optimizer state while
+restarting the data, random stream or step counter. To start from weights only,
+use a model-only load without an optimizer rather than a training checkpoint
+resume.
 If a restored run has not established a same-step save receipt, an immediate
 export to the already completed step fails rather than overwriting that DCP.
 
@@ -425,10 +426,15 @@ export as a fresh run.
 
 A split-layout checkpoint containing only `model/[<module>/]lr_scheduler.pt`
 can pass marker discovery even when the per-rank model sidecars are missing.
-The training loader rejects a missing or unreadable requested sidecar, or a
-missing scheduler state when the target has a scheduler. An older loader may
-instead keep its initialized scheduler, so discovery alone does not prove that
-the schedule was restored. A model-only load that does not request `extra_state`
+The training loader rejects a missing or unreadable requested sidecar. Optimizer
+continuation requires an explicit `lr_scheduler` entry, including `None` when
+no scheduler was used. A target scheduler requires a state mapping. Native
+`LambdaLR` also checks its required fields; custom schedulers are responsible
+for validating their own state schemas. Continuing an optimizer with a saved
+scheduler but no target scheduler is
+rejected. An older loader may instead keep its initialized scheduler, so
+discovery alone does not prove that the schedule was restored. A model-only
+load that does not request `extra_state`
 does not require this sidecar.
 
 For such a checkpoint, resume with the compatible revision/environment that

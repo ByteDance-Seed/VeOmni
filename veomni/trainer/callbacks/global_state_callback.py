@@ -620,6 +620,7 @@ class GlobalStateCallback(Callback):
                         "Resuming the existing loader cursor without a verified exact data-resume contract; "
                         "the optimizer state is validated, but the subsequent data sequence may differ."
                     )
+            if strict_optimizer or legacy_checkpoints or unknown_checkpoints:
                 if loader is not None and (cursor is None or (global_step > 0 and not cursor)):
                     raise ValueError("Trainer dataloader cursor is missing; optimizer continuation is unsafe")
                 rng = global_state.get("torch_rng_state")

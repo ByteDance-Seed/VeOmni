@@ -24,6 +24,8 @@ def _missing_extra_state_worker(rank, root, failure, endpoint):
         optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 0.9)
         state = {"model": model, "optimizer": optimizer, "extra_state": {"lr_scheduler": scheduler.state_dict()}}
+        if failure == "scheduler_missing_no_target":
+            state["extra_state"]["lr_scheduler"] = None
         parallel = SimpleNamespace(dp_mode="ddp")
         DistributedCheckpointer.save(root, state, parallel_state=parallel)
         dist.barrier()
@@ -31,9 +33,15 @@ def _missing_extra_state_worker(rank, root, failure, endpoint):
             path = Path(layout.model_dir(root)) / "extra_state" / "extra_state_rank_1.pt"
             if failure == "missing":
                 path.unlink()
-            elif failure in {"scheduler_missing", "scheduler_none", "scheduler_empty", "scheduler_partial"}:
+            elif failure in {
+                "scheduler_missing",
+                "scheduler_missing_no_target",
+                "scheduler_none",
+                "scheduler_empty",
+                "scheduler_partial",
+            }:
                 saved = torch.load(path, weights_only=False)
-                if failure == "scheduler_missing":
+                if failure in {"scheduler_missing", "scheduler_missing_no_target"}:
                     saved.pop("lr_scheduler")
                 elif failure == "scheduler_none":
                     saved["lr_scheduler"] = None
@@ -45,7 +53,11 @@ def _missing_extra_state_worker(rank, root, failure, endpoint):
         dist.barrier()
         target = torch.nn.Linear(2, 2)
         target_optimizer = torch.optim.AdamW(target.parameters(), lr=0.01)
-        target_scheduler = torch.optim.lr_scheduler.LambdaLR(target_optimizer, lambda _: 0.9)
+        target_scheduler = (
+            None
+            if failure in {"scheduler_unconfigured", "scheduler_missing_no_target"}
+            else torch.optim.lr_scheduler.LambdaLR(target_optimizer, lambda _: 0.9)
+        )
         runtime = SimpleNamespace(
             model=target,
             optimizer=target_optimizer,
@@ -66,8 +78,11 @@ def _missing_extra_state_worker(rank, root, failure, endpoint):
             return original_load(path, *args, **kwargs)
 
         with patch("torch.load", side_effect=load_with_io_error):
-            with pytest.raises((FileNotFoundError, OSError, RuntimeError)):
+            with pytest.raises((FileNotFoundError, OSError, RuntimeError)) as raised:
                 manager.load()
+        if failure == "scheduler_missing_no_target":
+            message = str(raised.value)
+            assert "scheduler state is missing" in message if rank == 1 else "failed on another rank" in message
         weights_only = torch.nn.Linear(2, 2)
         DistributedCheckpointer.load(root, {"model": weights_only}, parallel_state=parallel)
         for expected, actual in zip(model.parameters(), weights_only.parameters(), strict=True):
@@ -81,7 +96,17 @@ def _missing_extra_state_worker(rank, root, failure, endpoint):
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
 @pytest.mark.parametrize(
-    "failure", ["missing", "io_error", "scheduler_missing", "scheduler_none", "scheduler_empty", "scheduler_partial"]
+    "failure",
+    [
+        "missing",
+        "io_error",
+        "scheduler_missing",
+        "scheduler_none",
+        "scheduler_empty",
+        "scheduler_partial",
+        "scheduler_unconfigured",
+        "scheduler_missing_no_target",
+    ],
 )
 def test_missing_rank_extra_state_fails_on_all_ranks(tmp_path, failure):
     spawn_with_rendezvous(_missing_extra_state_worker, args=(str(tmp_path / "checkpoint"), failure), nprocs=2)
@@ -100,7 +125,8 @@ def test_missing_scheduler_state_is_rejected(state):
 
 
 def test_no_scheduler_accepts_none():
-    runtime = SimpleNamespace(lr_scheduler=None, load_extra_state=lambda _: None)
+    optimizer = torch.optim.AdamW(torch.nn.Linear(2, 2).parameters())
+    runtime = SimpleNamespace(optimizer=optimizer, lr_scheduler=None, load_extra_state=lambda _: None)
     manager = object.__new__(ModelCheckpointManager)
     manager.runtime = runtime
     manager._load_extra_state({"lr_scheduler": None})
@@ -131,3 +157,40 @@ def test_custom_scheduler_retains_its_own_state_contract():
     manager.runtime = runtime
     manager._load_extra_state({"lr_scheduler": {"custom_step": 3}})
     assert scheduler.state == {"custom_step": 3}
+
+
+def test_scheduler_source_requires_target_when_optimizer_continues():
+    optimizer = torch.optim.AdamW(torch.nn.Linear(2, 2).parameters(), lr=0.01)
+    runtime = SimpleNamespace(optimizer=optimizer, lr_scheduler=None, load_extra_state=lambda _: None)
+    manager = object.__new__(ModelCheckpointManager)
+    manager.runtime = runtime
+    with pytest.raises(RuntimeError, match="optimizer continuation has no scheduler"):
+        manager._load_extra_state({"lr_scheduler": {"last_epoch": 4}})
+
+
+def test_scheduler_source_is_ignored_for_model_only_runtime():
+    seen = []
+    runtime = SimpleNamespace(optimizer=None, lr_scheduler=None, load_extra_state=seen.append)
+    manager = object.__new__(ModelCheckpointManager)
+    manager.runtime = runtime
+    state = {"lr_scheduler": {"last_epoch": 4}}
+    manager._load_extra_state(state)
+    assert seen == [state]
+
+
+def test_absent_scheduler_key_is_rejected_for_optimizer_continuation():
+    optimizer = torch.optim.AdamW(torch.nn.Linear(2, 2).parameters())
+    runtime = SimpleNamespace(optimizer=optimizer, lr_scheduler=None, load_extra_state=lambda _: None)
+    manager = object.__new__(ModelCheckpointManager)
+    manager.runtime = runtime
+    with pytest.raises(RuntimeError, match="scheduler state is missing"):
+        manager._load_extra_state({})
+
+
+def test_absent_scheduler_key_is_allowed_for_model_only_runtime():
+    seen = []
+    runtime = SimpleNamespace(optimizer=None, lr_scheduler=None, load_extra_state=seen.append)
+    manager = object.__new__(ModelCheckpointManager)
+    manager.runtime = runtime
+    manager._load_extra_state({})
+    assert seen == [{}]

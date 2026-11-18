@@ -73,8 +73,17 @@ def _legacy_resume_worker(rank, root, missing, endpoint):
         )
         _callback(trainer).save_global_state(SimpleNamespace(global_step=5, epoch=0))
         dist.barrier()
-        if rank == 0 and missing != "none":
+        if rank == 0 and missing in {"extra_state", "loader"}:
             (step_dir / missing / "rank_1.pt").unlink()
+        elif rank == 0 and missing in {"rng_missing", "rng_invalid"}:
+            path = step_dir / "extra_state" / "rank_1.pt"
+            state = torch.load(path, weights_only=False)
+            if missing == "rng_missing":
+                state.pop("torch_rng_state", None)
+                state.pop("device_rng_state", None)
+            else:
+                state["torch_rng_state"] = torch.ones(1, dtype=torch.uint8)
+            torch.save(state, path)
         dist.barrier()
 
         target = torch.nn.Linear(2, 1)
@@ -110,9 +119,11 @@ def _legacy_resume_worker(rank, root, missing, endpoint):
             assert int(next(iter(resumed))[0].item()) == 10 + rank
             assert target_scheduler.last_epoch == 5
         else:
-            with pytest.raises((RuntimeError, ValueError), match="missing|failed on another rank"):
+            rng_before = torch.get_rng_state().clone()
+            with pytest.raises((RuntimeError, ValueError), match="missing|invalid|failed on another rank"):
                 callback.load_global_state()
             assert target_trainer.state.global_step == 0
+            assert torch.equal(torch.get_rng_state(), rng_before)
         alive = torch.ones(1)
         dist.all_reduce(alive)
         assert alive.item() == 2
@@ -121,6 +132,6 @@ def _legacy_resume_worker(rank, root, missing, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-@pytest.mark.parametrize("missing", ["none", "extra_state", "loader"])
+@pytest.mark.parametrize("missing", ["none", "extra_state", "loader", "rng_missing", "rng_invalid"])
 def test_legacy_optimizer_resume_requires_rank_local_cursor(tmp_path, missing):
     spawn_with_rendezvous(_legacy_resume_worker, args=(str(tmp_path), missing), nprocs=2)
