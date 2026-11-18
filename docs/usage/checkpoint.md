@@ -211,7 +211,9 @@ trusted deterministic implementation on resume. The recipe is an attestation,
 not a sandbox or a proof about arbitrary Python code. Unregistered schedulers
 and checkpoints carrying only the older callable-hash identity require a
 verified migration or a new weights-only run. Scheduler step, optimizer group
-identity and checkpoint generation remain checked independently.
+identity and checkpoint generation remain checked independently. See the
+[scheduler extension contract](checkpoint_scheduler_recipes.md) for registration,
+versioning, and a complete example.
 
 ```python
 from veomni.optim.lr_scheduler import register_checkpoint_scheduler
@@ -305,9 +307,16 @@ export as a fresh run.
 
 A split-layout checkpoint containing only `model/[<module>/]lr_scheduler.pt`
 can pass marker discovery even when the per-rank model sidecars are missing.
-The current loader skips missing sidecars; the default runtime then keeps its
-initialized scheduler rather than restoring the saved schedule. Do not continue
-training assuming that discovery proves scheduler restoration.
+The training loader rejects a missing or unreadable requested sidecar. Optimizer
+continuation requires an explicit `lr_scheduler` entry, including `None` when
+no scheduler was used. A target scheduler requires a state mapping. Native
+`LambdaLR` also checks its required fields; custom schedulers are responsible
+for validating their own state schemas. Continuing an optimizer with a saved
+scheduler but no target scheduler is
+rejected. An older loader may instead keep its initialized scheduler, so
+discovery alone does not prove that the schedule was restored. A model-only
+load that does not request `extra_state`
+does not require this sidecar.
 
 For such a checkpoint, resume with the compatible revision/environment that
 wrote and reads that scheduler layout, and verify the restored step and learning

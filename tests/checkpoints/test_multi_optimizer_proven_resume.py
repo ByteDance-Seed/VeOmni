@@ -344,14 +344,16 @@ def test_failed_final_load_barrier_does_not_certify_multi_optimizer():
         state["_veomni_optimizer_identity_verified"] = True
         state["_veomni_optimizer_checkpoint_generation"] = "generation"
         state["extra_state"].update(
+            lr_scheduler=None,
             _veomni_optimizer_global_step=2,
             _veomni_scheduler_recipe={"status": "supported", "value": _scheduler_recipe(None, optimizer)},
         )
 
     manager.checkpointer = SimpleNamespace(load=load)
-    with patch("torch.distributed.barrier", side_effect=RuntimeError("injected final barrier failure")):
+    with patch("torch.distributed.barrier", side_effect=RuntimeError("injected final barrier failure")) as barrier:
         with pytest.raises(RuntimeError, match="final barrier failure"):
             manager.load()
+    barrier.assert_called_once()
     assert manager._loaded_optimizer_global_step is None
     assert manager._loaded_optimizer_generation is None
     leaf.checkpoint_abort_file_backed_state.assert_called_once()
