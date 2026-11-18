@@ -1,4 +1,4 @@
-"""Coordinated CUDA precision preflight without requiring a CUDA device."""
+"""CUDA policy and checkpoint preflight without requiring a CUDA device."""
 
 from datetime import timedelta
 from pathlib import Path
