@@ -191,14 +191,18 @@ train at full precision under a config that says otherwise -- so it raises, and
 the error names `eager` as the way to keep the fallback.
 
 The routed experts take the same argument, so a non-SiLU model keeps its activation
-there too -- and no quantizing selection needs refusing on that account any more.
-Where the activation is evaluated depends on the row. `fused_triton` and `qat`
-compute it **between** the GEMMs through `apply_activation` /
-`apply_activation_backward`; those rows own a hand-written `autograd.Function`
-whose `forward` runs under `no_grad`, which is why the derivative is explicit. The
-rows whose kernel fuses SiLU internally (`fused_quack`, `deepgemm_fp8`,
-`fused_npu`, `fused_mlu`) delegate to `eager` for any other activation, which keeps
-the fused path for the default and the reference path for everything else.
+there too. Where it is evaluated depends on the row, and so does what happens when
+the row cannot serve it:
+
+| Row | Activation evaluated | A name it cannot serve |
+| --- | --- | --- |
+| `fused_triton`, `eager` | between the GEMMs, or the model's own `act_fn` | runs it (`eager` also covers names outside `activation.py`) |
+| `qat` | between the GEMMs | refuses — a fallback would train at full precision |
+| `fused_quack`, `fused_npu`, `fused_mlu` | inside the kernel (SiLU only) | delegates to `eager`; these rows do bf16 math, so nothing is lost |
+| `deepgemm_fp8` | inside the FP8 kernel (SiLU only) | refuses — delegating would skip the FP8 GEMMs |
+
+`fused_triton` and `qat` own a hand-written `autograd.Function` whose `forward` runs
+under `no_grad`, which is why the derivative is explicit there.
 
 There is no cross-family conflict to reject. `deepgemm_fp8` and `qat` are two
 values of the same `moe_implementation` field, so the routed experts cannot be

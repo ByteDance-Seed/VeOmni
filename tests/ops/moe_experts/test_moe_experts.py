@@ -1665,10 +1665,17 @@ def test_every_triton_function_backward_returns_one_gradient_per_argument():
     import ast
     import pathlib
 
-    source = pathlib.Path(triton_module.__file__).read_text()
+    from veomni.ops.kernels.moe_experts.shared import ep as ep_module
+
     mismatches = []
     checked = 0
-    for cls in (n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)):
+    modules = (triton_module, ep_module)
+    for cls in (
+        node
+        for module in modules
+        for node in ast.parse(pathlib.Path(module.__file__).read_text()).body
+        if isinstance(node, ast.ClassDef)
+    ):
         forward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward"), None)
         backward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "backward"), None)
         if forward is None or backward is None:
@@ -1681,7 +1688,7 @@ def test_every_triton_function_backward_returns_one_gradient_per_argument():
         if arguments != entries:
             mismatches.append((cls.name, arguments, entries))
 
-    assert checked == 2, f"expected both Triton Functions, checked {checked}"
+    assert checked == 4, f"expected both Triton and both EP Functions, checked {checked}"
     assert not mismatches, f"backward tuple does not match forward's arguments: {mismatches}"
 
 
@@ -1811,3 +1818,80 @@ def test_a_quantizing_row_refuses_an_activation_it_cannot_evaluate():
                 activation="relu",
                 act_fn=ACT2FN["relu"],
             )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_no_triton_function_forward_reads_the_activation_without_its_ctx_copy():
+    """Every activation site in the Triton Functions goes through one helper.
+
+    A row that evaluates the activation in `forward` with one expression and in
+    `backward` with another produces a forward that computes SiLU and a backward that
+    differentiates GELU -- a silently wrong training run, not a crash. The merged-fc1
+    forward had exactly that shape. Routing every site through `_expert_activation`
+    and the `ctx` copy of the same arguments makes the two halves agree by
+    construction, so this pins the shape rather than re-testing the arithmetic.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(triton_module.__file__).read_text()
+    offenders = []
+    for cls in (n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)):
+        for method in ("forward", "backward"):
+            function = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == method), None)
+            if function is None:
+                continue
+            # A direct call is fine inside an explicit ``== "silu"`` branch, which is
+            # how the fused kernel is chosen; what is not fine is one side of the
+            # function picking it and the other side not.
+            guarded = set()
+            for node in ast.walk(function):
+                if not isinstance(node, ast.If) or "silu" not in ast.unparse(node.test):
+                    continue
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Call):
+                        guarded.add(id(inner))
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call) or id(node) in guarded:
+                    continue
+                callee = ast.unparse(node.func)
+                if callee in {"apply_activation", "swiglu.merged_swiglu_forward", "swiglu.merged_swiglu_backward"}:
+                    offenders.append(f"{cls.name}.{method} calls {callee} directly")
+
+    assert not offenders, (
+        "an activation is evaluated outside _expert_activation, so forward and backward "
+        f"can pick different functions: {offenders}"
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_the_expert_parallel_functions_receive_the_activation_and_act_fn():
+    """The EP path is selected before any of the non-EP code, so it needs its own pass.
+
+    `fused_triton` dispatches to `EPGroupGemm` / `EPMergedFc1GroupGemm` when expert
+    parallelism is on, and those Functions are separate implementations with their own
+    `forward` and `backward`. They were left on `aten.silu` while the non-EP path took
+    the configured activation, which meant an EP run silently trained a different
+    function than the same config without EP.
+    """
+    import ast
+    import pathlib
+
+    from veomni.ops.kernels.moe_experts.shared import ep as ep_module
+
+    source = pathlib.Path(ep_module.__file__).read_text()
+    checked = 0
+    for cls in (n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)):
+        forward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward"), None)
+        backward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "backward"), None)
+        if forward is None or backward is None:
+            continue
+        checked += 1
+        arguments = [argument.arg for argument in forward.args.args]
+        assert "activation" in arguments, f"{cls.name}.forward does not take the activation"
+        assert "act_fn" in arguments, f"{cls.name}.forward does not take act_fn"
+        body = ast.unparse(forward) + ast.unparse(backward)
+        assert "_expert_activation" in body, f"{cls.name} evaluates the activation directly"
+        assert "ctx.act_fn" in body, f"{cls.name}.backward does not read the saved act_fn"
+
+    assert checked == 2, f"expected both EP Functions, checked {checked}"
