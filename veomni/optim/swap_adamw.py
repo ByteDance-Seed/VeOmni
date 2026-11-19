@@ -374,7 +374,7 @@ class SwapAdamW(Optimizer):
                 if step.ndim != 0:
                     raise RuntimeError("SwapAdamW checkpoint step must be a scalar")
                 step = step.item()
-            if not isinstance(step, (int, float)) or not math.isfinite(step):
+            if isinstance(step, bool) or not isinstance(step, (int, float)) or not math.isfinite(step):
                 raise RuntimeError("SwapAdamW checkpoint step must be a finite integer")
             if not 0 <= step <= 2**24 or int(step) != step:
                 raise RuntimeError("SwapAdamW checkpoint step cannot be represented exactly as float32")

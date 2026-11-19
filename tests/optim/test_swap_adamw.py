@@ -796,6 +796,17 @@ def test_rewrap_dtensor_local_preserves_non_contiguous_local(cpu_mesh):
     assert dt.to_local().stride() == (1, 3)
 
 
+@pytest.mark.parametrize("invalid_step", [True, torch.tensor(True)])
+def test_checkpoint_rejects_boolean_optimizer_step(invalid_step):
+    param = nn.Parameter(torch.ones(2))
+    optimizer = SwapAdamW([param], pin_memory=False)
+    param.grad = torch.ones_like(param)
+    optimizer.step()
+    optimizer.state[param]["step"] = invalid_step
+    with pytest.raises(RuntimeError, match="step must be a finite integer"):
+        optimizer.state_dict()
+
+
 def test_async_save_snapshots_state_before_later_steps(cpu_mesh, tmp_path):
     """``dcp.async_save`` must capture the state at the save call, not at write time.
 
