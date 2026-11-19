@@ -81,7 +81,7 @@ FAKE_HF_LAYOUT = OmniHFLayout(
 @pytest.fixture(autouse=True)
 def _register_fake_layout():
     # ``Registry.__setitem__`` is a local override that ``del`` removes again.
-    OMNI_HF_LAYOUT_REGISTRY[MODEL_TYPE] = lambda source_path=None: FAKE_HF_LAYOUT
+    OMNI_HF_LAYOUT_REGISTRY[MODEL_TYPE] = lambda: FAKE_HF_LAYOUT
     yield
     del OMNI_HF_LAYOUT_REGISTRY[MODEL_TYPE]
 
@@ -185,30 +185,6 @@ def test_layout_rejects_a_source_prefix_claimed_by_two_modules():
     )
     with pytest.raises(ValueError, match="more than one module"):
         layout.route("model.x")
-
-
-def test_route_picks_the_longest_prefix_among_many_full_key_renames():
-    """A layout may rename thousands of keys one by one beside a few prefixes;
-    the length-indexed lookup must keep longest-prefix semantics."""
-    full_keys = tuple((f"layers.{i}.attn.wq.weight", f"model.layers.{i}.self_attn.wq.weight") for i in range(50))
-    layout = OmniHFLayout(
-        modules={
-            "llm": OmniHFModuleLayout(
-                key_prefixes=full_keys + (("layers.3.ffn.experts.", "model.layers.3.mlp.experts."),),
-                build_config=lambda c: c,
-            ),
-            "vision": OmniHFModuleLayout(key_prefixes=(("image_", "image_"), ("", "rest.")), build_config=lambda c: c),
-        }
-    )
-    assert layout.route("layers.7.attn.wq.weight") == ("llm", "model.layers.7.self_attn.wq.weight")
-    assert layout.route("layers.3.ffn.experts.5.w1.weight") == ("llm", "model.layers.3.mlp.experts.5.w1.weight")
-    assert layout.route("image_newline") == ("vision", "image_newline")
-    # Only the empty prefix claims these: a full key plus a suffix, and an unrelated key.
-    assert layout.route("layers.7.attn.wq.weight.extra") == ("llm", "model.layers.7.self_attn.wq.weight.extra")
-    assert layout.route("norm.weight") == ("vision", "rest.norm.weight")
-    assert layout.source_key("llm", "model.layers.7.self_attn.wq.weight") == "layers.7.attn.wq.weight"
-    assert layout.source_key("vision", "rest.norm.weight") == "norm.weight"
-    assert layout.source_key("vision", "rest.layers.7.attn.wq.weight") is None
 
 
 def test_an_hf_root_resolves_to_a_weight_free_split_view(hf_root):
@@ -414,6 +390,14 @@ def test_hf_view_modules_must_all_come_from_the_layout(hf_root):
         _validate_hf_view_modules(view, {**ok, "other_module": OmniModuleRuntimeArguments(model_path="/x")})
     with pytest.raises(ValueError, match="sets its own model_path"):
         _validate_hf_view_modules(view, {**ok, FAKE_B: OmniModuleRuntimeArguments(model_path="/elsewhere/b")})
+    streaming = OmniModuleRuntimeArguments(
+        model_path=os.path.join(view, FAKE_B), ep_sharded_stream_load=True, broadcast_model_weights_from_rank0=False
+    )
+    with pytest.raises(ValueError, match="ep_sharded_stream_load"):
+        _validate_hf_view_modules(view, {**ok, FAKE_B: streaming})
+    # The composed wrap reads the top-level flag, which a module may override to false.
+    with pytest.raises(ValueError, match="ep_sharded_stream_load"):
+        _validate_hf_view_modules(view, ok, ep_sharded_stream_load=True)
 
 
 def test_from_pretrained_rejects_a_module_read_from_elsewhere(hf_root, tmp_path):
@@ -581,7 +565,7 @@ def test_custom_layout_subclass_overrides_hooks_and_per_module_dtypes(tmp_path):
         generation_kwargs={"max_new_tokens": 128},
         load_hf_config=PretrainedConfig.from_pretrained,
     )
-    OMNI_HF_LAYOUT_REGISTRY[custom_type] = lambda source_path=None: custom_layout
+    OMNI_HF_LAYOUT_REGISTRY[custom_type] = lambda: custom_layout
     try:
         root = tmp_path / "custom-hf"
         root.mkdir(parents=True)

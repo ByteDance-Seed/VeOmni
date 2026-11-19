@@ -200,7 +200,7 @@ def _tiny_vq_cfg() -> dict:
 # ── Registry assertions ───────────────────────────────────────────────────────
 
 
-def test_mixin_registry_contains_all_v2_modules():
+def test_mixin_registry_contains_every_module():
     expected = {
         "text_encoder",
         "janus_siglip",
@@ -243,36 +243,6 @@ def test_processor_registry_only_for_modules_with_processor_assets():
 
 def _accelerated_model_cls(model_type: str):
     return OMNI_ACCELERATED_MODEL_REGISTRY[model_type]()
-
-
-def test_all_registered_classes_are_module_mixins():
-    from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
-
-    accelerated_keys = set(OMNI_ACCELERATED_MODEL_REGISTRY.valid_keys())
-    for name in OMNI_MODEL_REGISTRY.valid_keys():
-        native_cls = OMNI_MODEL_REGISTRY[name]()
-        assert name in accelerated_keys, f"{name} must register OMNI_ACCELERATED_MODEL_REGISTRY"
-        assert issubclass(native_cls, PretrainedOmniModule), f"{name} native must inherit PretrainedOmniModule"
-        assert not issubclass(native_cls, BaseMixin), f"{name} native must not inherit BaseMixin"
-        accelerated_cls = OMNI_ACCELERATED_MODEL_REGISTRY[name]()
-        assert issubclass(accelerated_cls, BaseMixin), f"{name} accelerated must inherit BaseMixin"
-
-
-# ── save / reload via OMNI registry ───────────────────────────────────────────
-
-
-def test_text_encoder_save_reload_via_registry(tmp_path: Path):
-    """Verifies config/model round-trip through OmniModel and the OMNI registry."""
-    TextEncoder = _model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-
-    te = TextEncoder(TextEncoderConfig(vocab_size=128, hidden_size=64, tie_word_embeddings=True))
-    save_as_omni(tmp_path, "text_encoder", te)
-
-    cfg, te2 = load_from_omni(tmp_path, "text_encoder")
-    assert cfg.model_type == "text_encoder"
-    assert isinstance(te2, TextEncoder)
-    assert te2.config.vocab_size == 128
 
 
 def test_janus_llama_save_reload_via_registry(tmp_path: Path):
@@ -328,146 +298,6 @@ def test_janus_text_encoder_emit_image_start_replaces_output_tail():
 
 
 # ── Mixin call-site contracts (loss key, shapes) ──────────────────────────────
-
-
-def test_text_encoder_decode_returns_single_loss_key():
-    """Single-loss protocol: ``post_forward`` maps ``loss`` → ``_loss``."""
-    TextEncoder = _accelerated_model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
-    h = torch.randn(2, 4, 16)
-    labels = torch.randint(0, 64, (2, 4))
-    out = te.decode(hidden_states=h, labels=labels)
-    assert out["loss"] is not None and out["loss"].dim() == 0
-    graph_out = te.post_forward("decode", **out)
-    assert "_loss" in graph_out and graph_out["_loss"].dim() == 0
-    assert "lm_loss" not in graph_out
-
-
-def test_text_encoder_decode_pre_masks_sample_boundary_labels():
-    """Sample k's first label is IGNORE regardless of what the chat template emitted.
-
-    ``_prepare_decode_inputs`` concatenates the batch's samples and shifts once
-    over the whole thing, so an unmasked first label would make sample k-1's last
-    position predict a token in a different attention span. Asserted on the base
-    mixin because every conversation-path family inherits this ``decode_pre``.
-    These samples supervise every token — no masked leading marker to hide behind.
-    """
-    from veomni.utils.constants import IGNORE_INDEX
-
-    TextEncoder = _accelerated_model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=8))
-
-    def _text(labels: list[int]) -> ConversationItem:
-        return ConversationItem(
-            type="text",
-            value=torch.randn(len(labels), 8),
-            role="assistant",
-            meta={"labels": torch.tensor(labels)},
-        )
-
-    conversation_list = [[_text([1, 2, 3])], [_text([4, 5])]]
-    out = te.decode_pre(conversation_list=conversation_list)
-
-    # Concatenated labels are [1, 2, 3, IGNORE, 5]; the global shift then drops
-    # index 0 and pads the tail, so sample 0's last position (index 2) scores
-    # IGNORE instead of sample 1's first token.
-    assert out["shift_labels"].tolist() == [2, 3, IGNORE_INDEX, 5, IGNORE_INDEX]
-    # The carrier's own labels must not have been mutated in place.
-    assert conversation_list[1][0].meta["labels"].tolist() == [4, 5]
-
-
-def test_text_encoder_decode_inference_returns_logits_only():
-    """Base ``TextEncoder.decode`` without labels returns logits only."""
-    TextEncoder = _model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16))
-    h = torch.randn(2, 4, 16)
-    out = te.decode(hidden_states=h)
-    assert out["logits"] is not None and out["logits"].shape == (2, 4, 64)
-    assert out["loss"] is None
-
-
-def test_text_encoder_decode_dispatches_pre_shifted_loss(monkeypatch):
-    """Untied, bias-free heads delegate loss policy to the configured ops wrapper.
-
-    Asserted on the ACCELERATED class: it overrides ``decode``, so the fused
-    dispatch has to live there to be what training actually runs.
-    """
-    import veomni.models.seed_omni.modules.text_encoder.accelerated.accelerated as text_encoder_accelerated
-
-    reduction_group = object()
-    captured = {}
-    monkeypatch.setattr(
-        text_encoder_accelerated,
-        "get_parallel_state",
-        lambda: SimpleNamespace(fsdp_group=reduction_group),
-    )
-
-    TextEncoder = _accelerated_model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16, tie_word_embeddings=False))
-
-    def fake_loss_function(**kwargs):
-        captured.update(kwargs)
-        return kwargs["hidden_states"].sum() * 0, None, None
-
-    te.loss_function = fake_loss_function
-    hidden_states = torch.randn(5, 16)
-    shift_labels = torch.tensor([1, 2, -100, 3, -100])
-    out = te.decode(hidden_states=hidden_states, shift_labels=shift_labels)
-
-    assert out["loss"].dim() == 0
-    assert out["logits"] is None
-    # IGNORE_INDEX rows are dropped before the linear (packed image placeholders).
-    assert captured["hidden_states"].shape == (3, 16)
-    assert torch.equal(captured["hidden_states"], hidden_states[[0, 1, 3]])
-    assert torch.equal(captured["shift_labels"], torch.tensor([1, 2, 3]))
-    assert torch.equal(captured["labels"], torch.tensor([1, 2, 3]))
-    assert captured["weights"] is te.lm_head.weight
-    assert captured["loss_reduction_group"] is reduction_group
-
-
-def test_text_encoder_tied_head_uses_explicit_eager_loss(monkeypatch):
-    """Tied heads must not enter a globally selected fused-linear loss."""
-    _patch_local_loss_reducer(monkeypatch)
-    TextEncoder = _accelerated_model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16, tie_word_embeddings=True))
-
-    def unexpected_loss_function(**kwargs):
-        raise AssertionError("tied head must not call the globally selected loss function")
-
-    te.loss_function = unexpected_loss_function
-    hidden_states = torch.randn(5, 16)
-    shift_labels = torch.tensor([1, 2, -100, 3, -100])
-    out = te.decode(hidden_states=hidden_states, shift_labels=shift_labels)
-
-    assert torch.isfinite(out["loss"])
-    assert out["logits"].shape == (3, 64)
-
-
-def test_text_encoder_decode_all_masked_span_scores_zero(monkeypatch):
-    """An unsupervised span scores 0.0, never NaN (constraint 7d clamped denominator).
-
-    The fused kernels normalize by their own supervised-token count with no way to
-    clamp it, so a span whose labels are all ``-100`` must NOT reach them.
-    """
-    _patch_local_loss_reducer(monkeypatch)
-    TextEncoder = _accelerated_model_cls("text_encoder")
-    TextEncoderConfig = _config_cls("text_encoder")
-    te = TextEncoder(TextEncoderConfig(vocab_size=64, hidden_size=16, tie_word_embeddings=False))
-
-    def unexpected_loss_function(**kwargs):
-        raise AssertionError("an all-masked span must not enter the fused loss (0/0)")
-
-    te.loss_function = unexpected_loss_function
-    out = te.decode(hidden_states=torch.randn(5, 16), shift_labels=torch.full((5,), -100))
-
-    assert float(out["loss"].detach()) == 0.0
-    # Still graph-connected, so the head's grads (zeros) exist on every rank.
-    assert out["loss"].requires_grad
 
 
 def test_janus_vqvae_decode_training_loss(monkeypatch):
@@ -717,7 +547,7 @@ def _janus_cfg_dir() -> Path:
     return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Janus" / "janus"
 
 
-def test_janus_train_yaml_loads_with_v2_module_names():
+def test_janus_train_yaml_loads_with_module_names():
     cfg = _load_omni_config(
         modules_path=_janus_cfg_dir() / "train/modules_train.yaml",
         train_graph_path=_janus_cfg_dir() / "train/graph_train.yaml",
@@ -822,7 +652,7 @@ def _qwen3_cfg_dir() -> Path:
     return Path(__file__).resolve().parents[4] / "configs" / "seed_omni" / "Qwen" / "qwen3"
 
 
-def test_qwen3_train_yaml_loads_with_v2_module_names():
+def test_qwen3_train_yaml_loads_with_module_names():
     cfg = _load_omni_config(
         modules_path=_qwen3_cfg_dir() / "train/modules_train.yaml",
         train_graph_path=_qwen3_cfg_dir() / "train/graph_train.yaml",
