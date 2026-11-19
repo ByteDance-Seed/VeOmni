@@ -28,7 +28,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import noop_context_fn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.arguments import GradientCheckpointingConfig
+from veomni.arguments import GradientCheckpointingConfig, MixedPrecisionConfig, MXFP8Config
 from veomni.distributed import parallel_state
 from veomni.distributed.parallel_state import ParallelState, use_parallel_state
 from veomni.models.model_runtime import VeOmniModelRuntime
@@ -436,6 +436,25 @@ def test_a_module_under_the_omni_model_wrap_applies_async_activation_offload_fir
     runtime._build_parallelized_model()
 
     assert applied == [runtime]
+
+
+@pytest.mark.parametrize("override", [None, MXFP8Config(enable=False)], ids=["inherit", "explicit-disable"])
+def test_composed_wrap_resolves_saved_child_mxfp8_before_deferring(monkeypatch, override):
+    model = nn.Linear(2, 2)
+    model.config = SimpleNamespace(veomni_mxfp8={"enable": True})
+    runtime = _unbuilt(model)
+    runtime._global_accelerator = _fsdp("model")
+    runtime.args.accelerator.fsdp_config.mixed_precision = MixedPrecisionConfig(mxfp8=override)
+    applied = []
+    monkeypatch.setattr(ModuleRuntime, "_apply_async_activation_offload", lambda self: applied.append(self))
+
+    if override is None:
+        with pytest.raises(ValueError, match="fsdp_scope='model'.*MXFP8.*vision_encoder"):
+            runtime._build_parallelized_model()
+        assert not applied
+    else:
+        runtime._build_parallelized_model()
+        assert applied == [runtime]
 
 
 class _CheckpointableLinear(nn.Linear):

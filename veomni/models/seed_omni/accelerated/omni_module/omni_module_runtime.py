@@ -439,6 +439,17 @@ class ModuleRuntime(VeOmniModelRuntime):
         optimizer on the now-DTensor parameters.
         """
         if self.wrap_omni_model:
+            # The parent wrap only sees the root config. Check this child's HF recipe before deferring.
+            if getattr(getattr(self.model, "config", None), "veomni_mxfp8", None) is not None:
+                from .....distributed.mxfp8 import resolve_mxfp8_config
+
+                override = self.args.accelerator.fsdp_config.mixed_precision.mxfp8
+                recipe = resolve_mxfp8_config(self.model, override)
+                if recipe is not None and recipe.enable:
+                    raise ValueError(
+                        f"fsdp_scope='model' does not support MXFP8 on module {self.module_name!r}; "
+                        "use standalone dense Qwen3."
+                    )
             self._apply_async_activation_offload()
             logger.info_rank0(
                 f"ModuleRuntime '{self.module_name}': leaving the FSDP wrap to the composed "
