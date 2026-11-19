@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import builtins
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -57,6 +58,28 @@ class DenseModel(nn.Module):
     @property
     def fc(self):
         return self.model.layers[0].mlp.up_proj
+
+
+@cpu
+def test_dpo_reference_disables_float8_without_changing_policy(monkeypatch):
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.arguments import ModelArguments
+    from veomni.trainer import text_dpo_trainer as dpo
+
+    args = ModelArguments(config_path="/tmp/qwen3", ops_implementation=make_eager_ops_config())
+    args.accelerator.fsdp_config.mixed_precision = _precision(TARGET)
+    policy = deepcopy(args.accelerator.fsdp_config.mixed_precision)
+    monkeypatch.setattr(dpo.DPOReferenceModelRuntime, "setup", lambda self: None)
+    monkeypatch.setattr(dpo, "use_parallel_state", lambda _: nullcontext())
+    monkeypatch.setattr("veomni.models.auto.build_foundation_model", lambda **kwargs: DenseModel())
+
+    def validate_reference(self):
+        validate_float8_training(self.args.accelerator.fsdp_config.mixed_precision, _state())
+
+    monkeypatch.setattr(dpo.DPOReferenceModelRuntime, "_build_parallelized_model", validate_reference)
+    reference = dpo.DPOReferenceModelRuntime(args, train=None)
+    assert not reference.args.accelerator.fsdp_config.mixed_precision.float8.enable
+    assert args.accelerator.fsdp_config.mixed_precision == policy
 
 
 @cpu
