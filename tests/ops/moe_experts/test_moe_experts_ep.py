@@ -731,10 +731,26 @@ def _distributed_standard_ep_worker(rank, merged, activation, impl, endpoint):
 
 
 @pytest.mark.launch_plan(provider=_EP_DISPATCH_PLAN)
-@pytest.mark.parametrize("impl", ["eager", "fused_triton"], ids=["eager", "fused_triton"])
+# The rows this CUDA suite can reach. `fused_npu` and `fused_mlu` need their own
+# accelerators, and `deepgemm_fp8` needs SM90 plus its own distributed test
+# (`test_deepgemm_fp8_distributed.py`), so none of them appear here.
+#
+# `fused_quack` is listed for its SiLU cases only: `quack.wrapper` hands any other
+# activation to the `eager` row, so a `gelu` case labelled `fused_quack` would
+# actually run `eager`'s EP path. The ids say which is which.
+@pytest.mark.parametrize(
+    "impl",
+    ["eager", "fused_triton", "fused_quack"],
+    ids=["eager", "fused_triton", "fused_quack"],
+)
 @pytest.mark.parametrize("activation", ["silu", "gelu"], ids=["silu", "gelu"])
 @pytest.mark.parametrize("merged", [False, True], ids=["split-fc1", "merged-fc1"])
-def test_distributed_standard_ep_dispatch_matches_nonep(merged, activation, impl):
+def test_distributed_standard_ep_dispatch_matches_nonep(request, merged, activation, impl):
+    if impl == "fused_quack":
+        # ``fused_quack`` delegates a non-SiLU activation to the reference row, so only
+        # its SiLU cases exercise quack's own EP path.
+        if activation != "silu":
+            request.node.add_marker(pytest.mark.skip(reason="non-SiLU leaves fused_quack for eager"))
     """Exercise the compact expert schedule behind real all-to-all dispatch.
 
     Parametrized over the activation because that is where the dispatch was lost:
@@ -745,6 +761,8 @@ def test_distributed_standard_ep_dispatch_matches_nonep(merged, activation, impl
     difference visible rather than a plausibility check.
     """
     _skip_if_unsupported()
+    if impl == "fused_quack" and not is_quack_gemm_available():
+        pytest.skip("the fused_quack row needs the quack package")
     if runner_device_count() < _EP_DISPATCH_PLAN.nproc:
         pytest.skip("Distributed EP dispatch requires its declared accelerator plan")
     spawn_with_rendezvous(

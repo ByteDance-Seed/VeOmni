@@ -22,6 +22,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor
 
+from .....distributed.moe import dispatch_to_ep_class
 from .....distributed.parallel_state import get_parallel_state
 from ..shared.activation import is_silu
 
@@ -161,6 +162,24 @@ def _npu_fused_moe_forward(
     return hidden_states
 
 
+def _npu_expert_math(permute_tokens, cumsum, fc1_weight, fc2_weight, swiglu_limit=None):
+    """Two Ascend grouped GEMMs with the gated activation between them.
+
+    Takes the shape ``dispatch_to_ep_class`` provides, so the all-to-all plumbing is
+    shared with the other rows. No custom backward is needed: ``npu_group_gemm`` is
+    Ascend's grouped matmul wrapped in ``GmmFunction``, which builds the graph itself.
+
+    The shared helper hands over a *cumulative* count, but ``npu_group_gemm`` pins
+    ``group_list_type=1`` -- per-group sizes, whose sum must equal the row count. So
+    the running total is subtracted back out here, exactly as ``MLUGroupGemm`` does
+    internally and ``_deepgemm_expert_math`` does explicitly.
+    """
+    counts = cumsum - torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
+    intermediate = npu_group_gemm(permute_tokens, fc1_weight, counts)
+    activated = _swiglu(intermediate, swiglu_limit)
+    return npu_group_gemm(activated, fc2_weight, counts)
+
+
 def npu_ep_fused_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
@@ -175,41 +194,20 @@ def npu_ep_fused_moe_forward(
 ) -> torch.Tensor:
     """NPU expert-parallel fused MoE forward pass.
 
-    Accepts either split fc1 weights or a merged fc1_1_2_weight tensor.
-    Handles alltoall dispatch/combine for expert parallelism.
+    Accepts either split fc1 weights or a merged fc1_1_2_weight tensor. The all-to-all
+    plumbing is shared with every other fused row; only the per-rank math is Ascend's.
     """
-    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-    input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
-        dispatch_preprocess(selected_experts, num_experts, ep_group)
-    )
-    hidden_states, unpermute_indices = alltoall_dispatch(
-        hidden_states,
-        selected_experts,
-        input_splits,
-        output_splits,
-        num_experts,
-        num_global_tokens_per_local_expert,
-        ep_group,
-    )
-
     fc1_weight = _fc1_weight(fc1_1_weight, fc1_2_weight, fc1_1_2_weight).transpose(1, 2)
-    intermediate_hidden_states = npu_group_gemm(hidden_states, fc1_weight, num_global_sum_tokens_per_local_expert)
-    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
-    hidden_states = npu_group_gemm(
-        intermediate_activations, fc2_weight.transpose(1, 2), num_global_sum_tokens_per_local_expert
-    )
-
-    hidden_states = alltoall_combine(
-        hidden_states,
-        routing_weights,
-        unpermute_indices,
-        input_splits,
-        output_splits,
+    return dispatch_to_ep_class(
+        _npu_expert_math,
         num_experts,
-        num_global_tokens_per_local_expert,
-        ep_group,
+        routing_weights,
+        selected_experts,
+        hidden_states,
+        fc1_weight,
+        fc2_weight.transpose(1, 2),
+        swiglu_limit,
     )
-    return hidden_states
 
 
 def dispatch_preprocess(
@@ -217,6 +215,12 @@ def dispatch_preprocess(
     num_global_experts: int,
     ep_group: dist.ProcessGroup | None = None,
 ):
+    """Split sizes for the all-to-all. **Used by ``moe_experts_lora/helper.py``.**
+
+    This module's own EP path goes through ``dispatch_to_ep_class`` and no longer
+    calls this pair; deleting it would break the LoRA row, which has its own NPU
+    dispatch.
+    """
     """Build EP split sizes and per-expert token counts."""
     if ep_group is None:
         ep_size = 1

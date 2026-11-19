@@ -117,10 +117,19 @@ def dispatch_to_ep_class(
     the EP plumbing evolve in lock-step across LoRA / non-LoRA paths.
 
     Args:
-        ep_class: Caller-owned EP autograd ``Function``. Typical classes live
-            in ``veomni.ops.kernels.moe_experts`` or ``moe_experts_lora``.
-            ``ep_class.apply`` must accept ``(permute_tokens, cumsum, *ep_class_args)``
-            in that order and return a ``[T_local, H]`` permuted-output tensor.
+        ep_class: The per-rank expert math, either a caller-owned EP autograd
+            ``Function`` or a plain callable. Typical Functions live in
+            ``veomni.ops.kernels.moe_experts`` or ``moe_experts_lora``; a plain
+            callable is for rows whose grouped matmul is already a ``Function`` of
+            its own, so there is no derivative left to write (the Ascend and DeepGEMM
+            rows). Either way it must accept ``(permute_tokens, cumsum,
+            *ep_class_args)`` in that order and return a ``[T_local, H]``
+            permuted-output tensor.
+
+            Note that ``cumsum`` is a *cumulative* token count. A kernel wanting
+            per-expert counts -- Ascend's ``group_list_type=1``, DeepGEMM's
+            ``GroupedLayout.from_counts`` -- subtracts the running total back out
+            itself; ``MLUGroupGemm`` does it inside its own forward.
         num_experts: total expert count ``E`` for this MoE layer (global on EP).
         routing_weights: ``[B*S, topk]`` per-(token, slot) routing weights —
             applied later by ``tokens_post_all2all`` → ``unpermute``.
@@ -151,7 +160,13 @@ def dispatch_to_ep_class(
     del expert_mask
     cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
 
-    final_permute_tokens = ep_class.apply(permute_tokens, cumsum, *ep_class_args)
+    # An `autograd.Function` class exposes the entry point as `apply`; anything else is
+    # called directly. Keyed on the attribute rather than `isinstance(..., type)`, so a
+    # class without `apply` reports that instead of being called as a constructor.
+    entry = getattr(ep_class, "apply", None)
+    final_permute_tokens = (
+        entry(permute_tokens, cumsum, *ep_class_args) if entry else ep_class(permute_tokens, cumsum, *ep_class_args)
+    )
     del permute_tokens
 
     return tokens_post_all2all(

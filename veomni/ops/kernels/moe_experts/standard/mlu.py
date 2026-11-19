@@ -221,33 +221,43 @@ def mlu_group_gemm_fused_moe_forward(
     routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     del assume_distinct_experts
     if get_parallel_state().ep_enabled:
-        from .....distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all
+        # The all-to-all plumbing is the same for every fused row, so this shares it
+        # with ``fused_triton`` and ``fused_quack`` instead of keeping its own copy.
+        from .....distributed.moe import dispatch_to_ep_class
 
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
-        input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
-            preprocess(
-                expert_mask=expert_mask,
-                num_experts=num_experts,
-                ep_group=get_parallel_state().ep_group,
+        if fc1_1_2_weight is not None:
+            if fc1_1_weight is not None or fc1_2_weight is not None:
+                raise ValueError("Provide either split fc1 weights or merged fc1_1_2_weight, not both.")
+            return dispatch_to_ep_class(
+                MLUMergedFc1GroupGemm,
+                num_experts,
+                routing_weights,
+                selected_experts,
+                hidden_states,
+                fc1_1_2_weight,
+                fc2_weight,
+                swiglu_limit,
             )
+        if fc1_1_weight is None or fc1_2_weight is None:
+            raise ValueError("EP requires split fc1 weights (fc1_1_weight and fc1_2_weight).")
+        return dispatch_to_ep_class(
+            MLUGroupGemm,
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
+            swiglu_limit,
         )
-        permute_tokens, routing_map, local_input_permutation_mapping, org_hidden_states_shape = token_pre_all2all(
-            hidden_states=hidden_states,
-            expert_mask=expert_mask,
-            num_experts=num_experts,
-            input_splits=input_splits,
-            output_splits=output_splits,
-            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
-            ep_group=get_parallel_state().ep_group,
-        )
-        cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
-    else:
-        from apex.contrib.permute import permute
-        from apex.contrib.unpermute import unpermute
 
-        permute_tokens, sorted_indice = permute(hidden_states, selected_experts, -1)
-        splits = torch.bincount(selected_experts.view(-1), minlength=num_experts)
-        cumsum = torch.cumsum(splits, dim=0)
+    from apex.contrib.permute import permute
+    from apex.contrib.unpermute import unpermute
+
+    permute_tokens, sorted_indice = permute(hidden_states, selected_experts, -1)
+    splits = torch.bincount(selected_experts.view(-1), minlength=num_experts)
+    cumsum = torch.cumsum(splits, dim=0)
 
     if fc1_1_2_weight is not None:
         if fc1_1_weight is not None or fc1_2_weight is not None:
@@ -262,20 +272,6 @@ def mlu_group_gemm_fused_moe_forward(
             permute_tokens, cumsum, fc1_1_weight, fc1_2_weight, fc2_weight, swiglu_limit
         )
 
-    if get_parallel_state().ep_enabled:
-        return tokens_post_all2all(
-            expert_outputs=final_permute_tokens,
-            routing_weights=routing_weights,
-            selected_experts=selected_experts,
-            num_experts=num_experts,
-            input_splits=input_splits,
-            output_splits=output_splits,
-            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
-            routing_map=routing_map,
-            local_input_permutation_mapping=local_input_permutation_mapping,
-            org_hidden_states_shape=org_hidden_states_shape,
-            ep_group=get_parallel_state().ep_group,
-        )
     return unpermute(final_permute_tokens, sorted_indice, routing_weights)
 
 

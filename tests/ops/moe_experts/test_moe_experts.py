@@ -2146,3 +2146,74 @@ def test_an_unserved_activation_is_the_documented_compile_limit():
     compiled = torch.compile(_Row.apply, fullgraph=True, backend="eager")
     with pytest.raises(Exception, match="requires_grad_|Unsupported"):
         compiled(hidden, "relu").sum().backward()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_dispatch_to_ep_class_calls_the_expert_math_in_cumsum_order():
+    """Pin the ``(permute_tokens, cumsum, *weights)`` contract the rows rely on.
+
+    Every fused row hands its per-rank math to `dispatch_to_ep_class`, and the shared
+    helper decides what that argument order is. A swap there is invisible to the GPU
+    parity test when both sides call the same helper -- both would be wrong
+    identically. This stubs out the collectives and records what arrives.
+
+    Also covers the two accepted shapes: an `autograd.Function` class (`.apply`) and a
+    plain callable, which the Ascend and DeepGEMM rows pass because their grouped
+    matmul is already a `Function`.
+    """
+    from unittest import mock
+
+    import torch
+
+    from veomni.distributed.moe import moe_layer
+
+    seen = {}
+
+    def record(tokens, cumsum, *rest):
+        seen["args"] = (tokens, cumsum, *rest)
+        return tokens
+
+    counts = torch.tensor([3, 0, 5])
+    stubs = {
+        "preprocess": lambda **_: (
+            [3],
+            [3],
+            counts,
+            counts,
+        ),
+        "token_pre_all2all": lambda hidden_states, **_: (
+            hidden_states.reshape(-1, hidden_states.shape[-1]),
+            None,
+            None,
+            tuple(hidden_states.shape),
+        ),
+        "tokens_post_all2all": lambda expert_outputs, **_: expert_outputs,
+    }
+    with (
+        mock.patch.multiple(moe_layer, **stubs),
+        mock.patch.object(moe_layer, "get_parallel_state", lambda: mock.MagicMock(ep_group=mock.MagicMock())),
+    ):
+        hidden = torch.randn(6, 4)
+        weight = torch.randn(8, 4)
+
+        # a plain callable, as the Ascend and DeepGEMM rows pass
+        moe_layer.dispatch_to_ep_class(
+            record, 2, torch.rand(6, 1), torch.zeros(6, 1, dtype=torch.long), hidden, weight
+        )
+        tokens, cumsum, *rest = seen["args"]
+        assert rest[0] is weight
+        assert torch.equal(cumsum, torch.cumsum(counts, dim=0)), "the helper hands over a cumsum"
+
+        # and an autograd.Function class, as the Triton and LoRA rows pass
+        class _Math(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, tokens, cumsum, *rest):
+                seen["class_args"] = (tokens, cumsum, *rest)
+                return tokens
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                return (grad_output, None, None)
+
+        moe_layer.dispatch_to_ep_class(_Math, 2, torch.rand(6, 1), torch.zeros(6, 1, dtype=torch.long), hidden, weight)
+        assert seen["class_args"][2] is weight

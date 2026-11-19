@@ -11,7 +11,6 @@ block-quantized expert weights directly through its optional FP8 all-gather.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
@@ -26,43 +25,34 @@ def _experts(x, counts, fc1, fc2, swiglu_limit, recompute_weights=(True, True)):
     return GroupedLinear.apply(RecomputedSwiGLU.apply(projected, swiglu_limit), fc2, layout, recompute_weights[1])
 
 
+def _deepgemm_expert_math(tokens, cumsum, fc1, fc2, swiglu_limit, recompute_weights=(True, True)):
+    """The per-rank FP8 expert GEMMs, in the shape ``dispatch_to_ep_class`` provides.
+
+    ``dispatch_to_ep_class`` hands over a *cumulative* token count, while
+    ``GroupedLayout.from_counts`` wants each expert's own count -- so this subtracts
+    the running total back out. Everything else is unchanged: the grouped FP8 GEMMs
+    and ``RecomputedSwiGLU`` own their autograd nodes.
+    """
+    counts = cumsum - torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
+    return _experts(tokens, counts, fc1, fc2, swiglu_limit, recompute_weights)
+
+
 def _ep_forward(
     x, routing_weights, selected_experts, fc1, fc2, num_experts, swiglu_limit, recompute_weights=(True, True)
 ):
     """Dispatch tokens across EP ranks, run FP8 local experts, and combine outputs."""
-    from .....distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all
+    from .....distributed.moe import dispatch_to_ep_class
 
-    ep_group = get_parallel_state().ep_group
-    expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
-    input_splits, output_splits, per_rank_counts, counts = preprocess(expert_mask, num_experts, ep_group)
-    tokens, routing_map, permutation, original_shape = token_pre_all2all(
-        x,
-        expert_mask,
+    return dispatch_to_ep_class(
+        _deepgemm_expert_math,
         num_experts,
-        input_splits,
-        output_splits,
-        per_rank_counts,
-        ep_group,
-    )
-    del expert_mask
-    # Dispatch/collectives stay outside custom autograd Functions. Counts are
-    # already on the CPU for the SM90 K-grouped GEMM launch metadata.
-    outputs = _experts(tokens, counts, fc1, fc2, swiglu_limit, recompute_weights)
-    # The expert autograd nodes own their compact saved operands. Dispatch
-    # inputs need not overlap the combine's permutation and FP32 accumulation.
-    del tokens
-    return tokens_post_all2all(
-        outputs,
         routing_weights,
         selected_experts,
-        num_experts,
-        input_splits,
-        output_splits,
-        per_rank_counts,
-        routing_map,
-        permutation,
-        original_shape,
-        ep_group,
+        x,
+        fc1,
+        fc2,
+        swiglu_limit,
+        recompute_weights,
     )
 
 
