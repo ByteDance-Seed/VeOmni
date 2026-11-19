@@ -499,7 +499,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| type | `Literal["adamw", "anyprecision_adamw", "muon"]` | `"adamw"` | Optimizer type. `muon` builds Muon and AdamW parameter groups. |
+| type | `Literal["adamw", "anyprecision_adamw", "muon", "master_fp32_adamw", "full_fp32_adamw", "cpu_offload_adamw", "qwen38_muon"]` | `"adamw"` | Optimizer type. The FP32 variants use FP32 master weights; `cpu_offload_adamw` supports selective CPU state offload. `muon` and [`qwen38_muon`](qwen38_muon.md) combine Muon with AdamW. |
 | lr | `float` | `5e-5` | Maximum / default learning rate. |
 | lr_min | `float` | `1e-7` | Minimum learning rate. |
 | lr_start | `float` | `0.0` | Starting learning rate for warmup. |
@@ -525,7 +525,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 | muon_expert_zero_comm | `bool` | `False` | Use whole-expert `Shard(0)` when the FSDP+ExtraParallel topology permits zero-communication expert Muon updates. |
 | muon_ns_implementation | `Literal["std", "gram", "gram_quack"]` | `"gram_quack"` | Newton–Schulz backend: standard, pure-PyTorch Gram-NS, or Gram-NS with quack kernels (default; falls back to `gram` if unavailable). |
 | muon_gram_ns_reset_iterations | `List[int]` | `[2]` | Restart indices for Gram Newton–Schulz (ignored by `std`). |
-| state_offload | `Literal["none", "cpu"]` | `"none"` | Optimizer-managed state offload. `none` disables it (training state may still be offloaded by `model.accelerator.fsdp_config.offload`); `cpu` keeps the moment states in host buffers and streams them to the device in batches, lowering peak device memory (only with `type="adamw"`). |
+| state_offload | `Literal["none", "cpu"]` | `"none"` | Optimizer-managed state offload. `none` disables it (training state may still be offloaded by `model.accelerator.fsdp_config.offload`); `cpu` keeps the moment states in host buffers and streams them to the device in batches, lowering peak device memory (only with `type="adamw"`). It cannot be combined with selective ExtraParallel parameter CPU offload. |
 | state_offload_device_memory_fraction | `float` | `0.8` | With `state_offload="cpu"`, fraction of currently free device memory used to size one streamed batch of optimizer states. It is recomputed every step; a single parameter whose states exceed it cannot be swapped in and `step()` raises. |
 | state_offload_pin_memory | `bool` | `True` | With `state_offload="cpu"`, pin the host-side optimizer state buffers. Disable if page-locked memory is scarce. A failed pinned allocation degrades to pageable buffers (rank-0 warning) instead of failing the run. |
 
@@ -699,6 +699,7 @@ configured and never round-trip through a saved config.
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
 | enable_async | `bool` | `False` | Enable async Ulysses. |
 | cp_size | `int` | `1` | Ring-attention context parallel size. |
+| allow_hybrid_cp | `bool` | `False` | Explicit Qwen4-Exp opt-in for simultaneous Ulysses and context parallelism on compatible GPU/NPU backends. The combined degree must divide both GDN key and value head counts; other model families retain their capability guards. GDN uses sequence-to-head exchange, not recurrent-state context sharding. Hardware numerical and checkpoint-resume qualification remain profile-specific. |
 | skip_sp_gather_between_modules | `bool` | `False` | Run-wide SeedOmni switch: every module's `post_forward` hands its sequence-parallel shard directly to the next module instead of all-gathering full-sequence tensors onto `conversation_list` (`encode`/`vision` -> `llm` and `llm` -> `decode`). Global to the run — per-module YAML overrides are ignored, since one side of a handoff gathering while the other does not would leave the backbone with a shard-sized input and full-length positions. |
 | init_device | `Literal["cuda", "meta", "npu", "mlu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
 | fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
@@ -934,6 +935,7 @@ and is not intended to be captured by `torch.compile`.
 | hf_save_steps | `int` | `0` | Steps between HuggingFace weight saves. `0` to disable. |
 | hf_save_epochs | `int` | `0` | Epochs between HuggingFace weight saves. `0` to disable. |
 | save_hf_weights | `bool` | `True` | Save HuggingFace-format weights to the last checkpoint directory. |
+| extra_parallel_canonical_layout | `bool` | `False` | Opt in to versioned canonical EP/PLE model checkpoint layout. See [layout compatibility and migration restrictions](checkpoint.md#versioned-extraparallel-layout). |
 
 ### InferArguments
 
@@ -1019,6 +1021,11 @@ derived argument groups below.
 
 `dpo_config.*` — Direct Preference Optimization hyperparameters.
 
+`dpo_config.explicit_segment_provenance` (default `true`) requires built-in DPO
+segment metadata to distinguish one-token segments from padding. See the
+[DPO guide](../examples/qwen3_dpo.md#experimental-explicit-segment-provenance)
+for supported inputs, rank agreement, and checkpoint restrictions.
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | beta | `float` | `0.1` | KL penalty coefficient. Controls deviation from the reference model. |
@@ -1027,5 +1034,9 @@ derived argument groups below.
 | loss_type | `"sigmoid" \| "ipo"` | `"sigmoid"` | DPO loss variant: `sigmoid` for standard DPO, `ipo` for Identity Preference Optimization. |
 | average_log_prob | `bool` | `False` | If `True`, average log probs per token instead of summing. |
 | refer_model_precision | `"float32" \| "bfloat16"` | `"bfloat16"` | dtype used to load the frozen reference model. |
+| explicit_segment_provenance | `bool` | `True` | Required local packed-segment provenance and error coordination; same inputs across SP ranks are a caller contract. |
+| audited_unpadded_tokenizer_sha256 | `str \| null` | `null` | Fingerprint of an explicitly audited fast tokenizer; see the DPO guide. |
+| allow_legacy_data_resume | `bool` | `False` | Legacy compatibility field; it cannot bypass required provenance. |
+| allow_legacy_objective_resume | `bool` | `False` | Legacy compatibility field; it cannot bypass the producer-contract checkpoint gate. |
 
 The frozen reference always copies `model`. A custom `reference_model` config is not supported.

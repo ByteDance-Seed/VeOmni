@@ -492,7 +492,32 @@ def test_an_offline_embedding_run_skips_the_export_check(tmp_path, monkeypatch):
     assert len(checked) == 1
 
 
-def test_custom_layout_subclass_overrides_hooks_and_per_module_dtypes(tmp_path):
+def test_source_export_strips_canonical_extra_parallel_namespace(tmp_path, monkeypatch):
+    from veomni.checkpoint.dcp_checkpointer import (
+        ModelState,
+        _extra_parallel_layout_key,
+        _namespace_extra_parallel_layout_state,
+    )
+
+    root = tmp_path / "fake-hf"
+    original = _write_hf_checkpoint(root, sharded=False)
+    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    module = model.modules_dict[FAKE_A]
+    state_dict = ModelState.state_dict
+    marker = _extra_parallel_layout_key({})
+    monkeypatch.setattr(
+        ModelState, "state_dict", lambda self: _namespace_extra_parallel_layout_state(state_dict(self), marker)
+    )
+
+    out = tmp_path / "export"
+    save_hf_source_checkpoint(model.config._hf_source, {FAKE_A: (module, None)}, str(out))
+    restored, _ = _read_safetensors(root=out)
+    for key in original:
+        assert torch.equal(restored[key], original[key])
+
+
+@pytest.mark.parametrize("namespaced", [False, True])
+def test_custom_layout_subclass_overrides_hooks_and_per_module_dtypes(tmp_path, monkeypatch, namespaced):
     from veomni.arguments.omni_arguments_types import _check_hf_source_exportable
 
     custom_type = "custom_named_shards_omni"
@@ -593,6 +618,19 @@ def test_custom_layout_subclass_overrides_hooks_and_per_module_dtypes(tmp_path):
         assert split_model.config.generation_kwargs == {"max_new_tokens": 128}
         assert split_model.modules_dict[FAKE_A].proj.weight.dtype == torch.bfloat16
         assert split_model.modules_dict[FAKE_B].proj.weight.dtype == torch.float32
+
+        if namespaced:
+            from veomni.checkpoint.dcp_checkpointer import (
+                ModelState,
+                _extra_parallel_layout_key,
+                _namespace_extra_parallel_layout_state,
+            )
+
+            state_dict = ModelState.state_dict
+            marker = _extra_parallel_layout_key({})
+            monkeypatch.setattr(
+                ModelState, "state_dict", lambda self: _namespace_extra_parallel_layout_state(state_dict(self), marker)
+            )
 
         out = tmp_path / "export"
         save_hf_source_checkpoint(model.config._hf_source, {FAKE_A: (model.modules_dict[FAKE_A], None)}, str(out))

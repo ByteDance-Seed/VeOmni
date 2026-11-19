@@ -43,6 +43,7 @@ def _ce_loss_func(
     logits_bias: Tensor | None = None,
     logits_bias_weight: Tensor | None = None,
     observe: Callable[[Tensor, Tensor], None] | None = None,
+    loss_weights: Tensor | None = None,
 ) -> Tensor:
     """Per-chunk projection and CE, optionally recording detached token losses."""
     labels_flat = labels.reshape(-1)
@@ -54,9 +55,13 @@ def _ce_loss_func(
             logits = logits + F.linear(bias_flat, logits_bias_weight).float()
         else:
             logits = logits + bias_flat.float()
-    loss = _eager.cross_entropy_from_logits(
-        logits, labels_flat, ignore_index=ignore_index, num_items_in_batch=num_items_in_batch
-    )
+    if loss_weights is None:
+        loss = _eager.cross_entropy_from_logits(
+            logits, labels_flat, ignore_index=ignore_index, num_items_in_batch=num_items_in_batch
+        )
+    else:
+        per_token = F.cross_entropy(logits, labels_flat, ignore_index=ignore_index, reduction="none")
+        loss = (per_token * loss_weights.reshape(-1).to(per_token.dtype)).sum() / num_items_in_batch
     if observe is not None:
         observe(logits, labels)
     return loss
@@ -73,14 +78,19 @@ def forward(
     num_items_in_batch: int | None = None,
     chunk_size: int = 1024,
     grad_enabled: bool | None = None,
+    loss_weights: Tensor | None = None,
 ) -> tuple[Tensor, SavedState]:
     """Chunked fused linear + CE. ``weight`` must be present.
 
     Split the sequence, run ``torch.func.grad_and_value`` on ``F.linear``
     plus eager CE, and accumulate. Does not shift labels or reduce across
     SP. When ``num_items_in_batch`` is omitted, the shared denominator is
-    the valid-token count. Unused ``V×H`` grads require both
-    ``requires_grad`` and the caller's ``is_grad_enabled()``.
+    the valid-token count. When supplied, ``loss_weights`` must be a constant
+    tensor matching ``labels`` with values prevalidated in [0, 1]; positive
+    values must be normal float32 numbers. The data collator validates this
+    contract on CPU; the op does not synchronize the device to validate values.
+    Unused ``V×H`` grads require both ``requires_grad`` and the caller's
+    ``is_grad_enabled()``.
 
     When ``logits_bias`` is provided, ``hidden``, ``labels``, and
     ``logits_bias`` are split into ``chunk_size`` slices along the sequence
@@ -138,7 +148,17 @@ def forward(
         )
 
     denom: int | Tensor
-    if num_items_in_batch is None:
+    if loss_weights is not None and num_items_in_batch is not None:
+        raise ValueError("loss_weights cannot be combined with num_items_in_batch")
+    if loss_weights is not None and loss_weights.shape != labels.shape:
+        raise ValueError("loss_weights must match labels")
+    if loss_weights is not None:
+        # Sum and multiply in float32 even when callers provide fp16/bf16 masks.
+        loss_weights = loss_weights.to(device=labels.device, dtype=torch.float32)
+    if num_items_in_batch is None and loss_weights is not None:
+        weight_sum = (loss_weights * (labels != ignore_index)).sum()
+        denom = torch.where(weight_sum > 0, weight_sum, torch.ones_like(weight_sum))
+    elif num_items_in_batch is None:
         denom = (labels != ignore_index).sum().clamp(min=1)
     else:
         denom = num_items_in_batch
@@ -146,6 +166,9 @@ def forward(
     split_dim = 1 if hidden.ndim >= 3 else 0
     hidden_chunks = hidden.split(chunk_size, dim=split_dim)
     label_chunks = labels.split(chunk_size, dim=split_dim)
+    loss_weight_chunks = (
+        loss_weights.split(chunk_size, dim=split_dim) if loss_weights is not None else (None,) * len(label_chunks)
+    )
     bias_chunks = (
         logits_bias.split(chunk_size, dim=split_dim) if logits_bias is not None else (None,) * len(hidden_chunks)
     )
@@ -182,9 +205,19 @@ def forward(
     observe_chunk = observe if capture is not None else None
     accumulated_loss = torch.zeros((), device=hidden.device, dtype=torch.float32)
     if not (hidden_needs_grad or weight_needs_grad or bias_needs_grad or bias_weight_needs_grad):
-        for hidden_chunk, label_chunk, bias_chunk in zip(hidden_chunks, label_chunks, bias_chunks, strict=True):
+        for hidden_chunk, label_chunk, bias_chunk, loss_weight_chunk in zip(
+            hidden_chunks, label_chunks, bias_chunks, loss_weight_chunks, strict=True
+        ):
             chunk_loss = _ce_loss_func(
-                hidden_chunk, weight, label_chunk, denom, ignore_index, bias_chunk, logits_bias_weight, observe_chunk
+                hidden_chunk,
+                weight,
+                label_chunk,
+                denom,
+                ignore_index,
+                bias_chunk,
+                logits_bias_weight,
+                observe_chunk,
+                loss_weight_chunk,
             )
             accumulated_loss = accumulated_loss + chunk_loss
         finish_capture()
@@ -215,8 +248,8 @@ def forward(
     grad_bias_chunks = (
         grad_bias.split(chunk_size, dim=split_dim) if grad_bias is not None else (None,) * len(hidden_chunks)
     )
-    for hidden_chunk, label_chunk, bias_chunk, grad_hidden_chunk, grad_bias_chunk in zip(
-        hidden_chunks, label_chunks, bias_chunks, grad_hidden_chunks, grad_bias_chunks, strict=True
+    for hidden_chunk, label_chunk, bias_chunk, grad_hidden_chunk, grad_bias_chunk, loss_weight_chunk in zip(
+        hidden_chunks, label_chunks, bias_chunks, grad_hidden_chunks, grad_bias_chunks, loss_weight_chunks, strict=True
     ):
         grads, chunk_loss = _grad_and_value(
             _ce_loss_func,
@@ -229,6 +262,7 @@ def forward(
             bias_chunk,
             logits_bias_weight,
             observe_chunk,
+            loss_weight_chunk,
         )
         accumulated_loss = accumulated_loss + chunk_loss
         grad_iter = iter(grads)

@@ -30,6 +30,7 @@ import json
 import os
 import queue
 import threading
+import time
 from abc import ABC
 from collections import defaultdict
 from contextlib import nullcontext
@@ -55,6 +56,7 @@ from ..distributed.async_offload import reset_async_activation_offload
 from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import (
     clear_parallel_state,
+    get_parallel_state,
     init_parallel_state_from_config,
     use_parallel_state,
 )
@@ -69,7 +71,14 @@ from ..utils.device import (
     is_nccl_backend,
     synchronize,
 )
-from ..utils.loss_utils import count_loss_token, mean_global_loss, reduce_global_loss_token
+from ..utils.loss_utils import (
+    contains_padding,
+    count_loss_token,
+    is_padding_microbatch,
+    mean_global_loss,
+    prepare_loss_token_counts,
+    reject_distributed_padding,
+)
 from .callbacks import (
     RESERVED_TRAINING_METRIC_NAMES,
     ChannelLossCallback,
@@ -327,7 +336,11 @@ class BaseTrainer(Stateful, ABC):
             self._build_data_transform()
             self._build_dataset()
             self._build_collate_fn()
-            self._build_dataloader()
+            if type(self) is BaseTrainer:
+                self._build_sft_dataloader()
+            else:
+                # Subclasses may override the legacy no-argument builder.
+                self._build_dataloader()
         # The dataset fixes train_steps, which the schedule needs.
         self._build_lr_scheduler()
         self._build_training_context(self.model)
@@ -351,6 +364,12 @@ class BaseTrainer(Stateful, ABC):
         # Initialize distributed process group
         if not dist.is_initialized():
             dist.init_process_group(backend=get_dist_comm_backend())
+
+        from ..optim.ple_world_profile import establish as establish_ple_world_profile
+
+        establish_ple_world_profile(
+            args.model.optimizer, args.model.accelerator, args.train.checkpoint, owner=args.train
+        )
 
         logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
 
@@ -454,11 +473,15 @@ class BaseTrainer(Stateful, ABC):
             seq_classification=seq_classification,
         )
 
-    def _build_dataloader(self):
+    def _build_dataloader(self, *, dpo_no_synthetic_padding: bool = False):
         args: VeOmniArguments = self.args
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
         dataloader_kwargs.pop("use_background_prefetcher", None)
+        if dpo_no_synthetic_padding and dataloader_type == "native":
+            dataloader_kwargs["_dpo_no_synthetic_padding"] = True
+        if dataloader_type == "native":
+            dataloader_kwargs["resume_replay_timeout_seconds"] = args.data.resume_replay_timeout_seconds
         self.train_dataloader = build_dataloader(
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,
@@ -479,6 +502,112 @@ class BaseTrainer(Stateful, ABC):
             save_steps=args.train.checkpoint.save_steps,
             **dataloader_kwargs,
         )
+
+    def _build_sft_dataloader(self):
+        args: VeOmniArguments = self.args
+        dataloader_kwargs = asdict(args.data.dataloader)
+        dataloader_type = dataloader_kwargs.pop("type")
+        background_prefetch = dataloader_kwargs.pop("use_background_prefetcher", None)
+        cyclic_contract = getattr(args.train, "cyclic_input_contract", None)
+        cyclic_deterministic = getattr(args.train, "cyclic_input_deterministic", False)
+        cyclic_bytes = getattr(args.train, "cyclic_max_buffer_bytes", 512 * 1024 * 1024)
+        # Every rank must agree on the special loader before any rank enters
+        # its constructor's collectives or the ordinary loader path.
+        if dist.is_initialized():
+            device = "cpu" if dist.get_backend() == "gloo" else get_device_type()
+            is_cyclic = dataloader_type == "cyclic_packed"
+            modes = torch.tensor([int(is_cyclic), int(not is_cyclic)], dtype=torch.int32, device=device)
+            dist.all_reduce(modes, op=dist.ReduceOp.MAX)
+            if modes.tolist() == [1, 1]:
+                raise ValueError("ranks disagree about the cyclic_packed dataloader")
+        if dataloader_type == "cyclic_packed":
+            from ..utils.dist_utils import raise_if_any_rank_failed
+
+            error = None
+            try:
+                from ..data.cyclic_packing import CyclicPackedLoader, _StatelessMainCollator
+                from ..data.dataset import MappingDataset
+                from .callbacks import global_state_callback
+
+                state = get_parallel_state()
+                if (
+                    args.data.data_type not in ("conversation", "plaintext")
+                    or args.data.datasets_type != "mapping"
+                    or args.data.enable_multisource
+                    or args.train.micro_batch_size != 1
+                    or not args.train.dyn_bsz
+                    or args.train.dyn_bsz_runtime != "main"
+                    or args.train.dyn_bsz_count_mode != "total"
+                    or args.train.bsz_warmup_ratio != 0
+                    or args.train.checkpoint.save_async
+                    or state.dp_size != 1
+                    or state.tp_size != 1
+                    or state.sp_size <= 1
+                    or dataloader_kwargs["num_workers"] != 0
+                    or dataloader_kwargs["persistent_workers"]
+                    or not dataloader_kwargs["in_order"]
+                    or dataloader_kwargs["drop_last"]
+                    or dataloader_kwargs["shuffle"]
+                    or background_prefetch
+                ):
+                    raise ValueError(
+                        "cyclic_packed requires deterministic DP1/TP1 map-style SFT without prefetch or drop"
+                    )
+                if type(self.train_dataset) is not MappingDataset:
+                    raise ValueError("cyclic_packed requires the native map-style dataset")
+                checkpoint = getattr(self.model, "checkpoint", None)
+                if getattr(self.model.optimizer, "_is_multi_optimizer", False) is not True or not hasattr(
+                    checkpoint, "_last_saved_optimizer_generation"
+                ):
+                    raise ValueError("cyclic_packed requires a generation-aware MultiOptimizer checkpoint")
+                if not callable(getattr(global_state_callback, "_saved_multi_optimizer_generations", None)):
+                    raise ValueError("cyclic_packed requires generation-aware trainer checkpoint coordination")
+                source_fingerprint = getattr(self.train_dataset._data, "_fingerprint", None)
+                self.train_dataloader = CyclicPackedLoader(
+                    self.train_dataset,
+                    _StatelessMainCollator(self.collate_fn),
+                    max_seq_len=args.data.max_seq_len,
+                    micro_batches_per_step=args.train.global_batch_size,
+                    buffer_size=args.data.dyn_bsz_buffer_size,
+                    max_buffer_bytes=cyclic_bytes,
+                    input_contract=cyclic_contract,
+                    source_fingerprint=source_fingerprint,
+                    deterministic=cyclic_deterministic,
+                    train_steps=args.train_steps,
+                    train_epochs=args.train.num_train_epochs,
+                    sp_size=state.sp_size,
+                    step_getter=lambda: self.state.global_step,
+                    require_resume=args.train.checkpoint.load_path is not None,
+                    pin=dataloader_kwargs["pin_memory"],
+                    group=state.sp_group if state.sp_size > 1 else None,
+                )
+            except Exception as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "constructing the cyclic packing loader")
+            self.train_dataloader.validate_creation_consensus()
+            return
+        if cyclic_contract is not None or cyclic_deterministic:
+            raise ValueError("cyclic input attestation requires data.dataloader.type='cyclic_packed'")
+        self._build_dataloader()
+
+    def _complete_optimizer_step(self):
+        """Synchronize cyclic-loader optimizer failures before committing data."""
+        cyclic = getattr(getattr(self, "train_dataloader", None), "_veomni_requires_optimizer_commit", False)
+        error = None
+        try:
+            self.model.optimizer.step()
+            self.model.lr_scheduler.step()
+            self.model.optimizer.zero_grad()
+            if cyclic:
+                self.train_dataloader.validate_pending_step()
+        except Exception as exc:
+            if not cyclic:
+                raise
+            error = exc
+        if cyclic:
+            from ..utils.dist_utils import raise_if_any_rank_failed
+
+            raise_if_any_rank_failed(error, "completing the cyclic packing optimizer step")
 
     def _build_training_context(self, model) -> None:
         """Build fwd/bwd contexts from this model's offload config.
@@ -575,7 +704,21 @@ class BaseTrainer(Stateful, ABC):
 
     def on_train_begin(self):
         for callback in self._callbacks:
-            callback.on_train_begin(self.state)
+            cyclic = getattr(getattr(self, "train_dataloader", None), "_veomni_requires_optimizer_commit", False)
+            if cyclic and callback is self.global_state_callback:
+                from ..utils.dist_utils import raise_if_any_rank_failed
+
+                error = None
+                try:
+                    callback.on_train_begin(self.state)
+                    if self.args.train.checkpoint.load_path is not None and not self.train_dataloader._restored:
+                        raise ValueError("cyclic packing resume requires its matching data cursor")
+                except Exception as exc:
+                    error = exc
+                raise_if_any_rank_failed(error, "restoring the cyclic packing checkpoint")
+                self.train_dataloader.validate_restore_consensus()
+            else:
+                callback.on_train_begin(self.state)
 
     def on_train_end(self):
         for callback in self._callbacks:
@@ -590,10 +733,36 @@ class BaseTrainer(Stateful, ABC):
             callback.on_epoch_end(self.state)
 
     def on_step_begin(self, micro_batches=None, **kwargs):
-        for callback in self._callbacks:
+        callbacks = self._callbacks
+        channel = getattr(self, "channel_loss_callback", None)
+        meter = getattr(self, "environ_meter_callback", None)
+        reordered = (
+            channel is not None
+            and meter is not None
+            and channel in callbacks
+            and meter in callbacks
+            and callbacks.index(channel) > callbacks.index(meter)
+        )
+        if reordered:
+            # The meter consumes multisource metadata. Capture it first, while
+            # retaining the original callback order for step-end reporting.
+            callbacks = list(callbacks)
+            callbacks.remove(channel)
+            callbacks.insert(callbacks.index(meter), channel)
+        channel_elapsed = 0.0
+        for callback in callbacks:
+            started = time.perf_counter() if reordered and callback is channel else None
             callback.on_step_begin(self.state, micro_batches=micro_batches, **kwargs)
+            if started is not None:
+                channel_elapsed = time.perf_counter() - started
+            elif reordered and callback is meter and getattr(meter, "_step_timing_used_preflight", False) is not True:
+                # Keep the meter's previous timing contract: include channel
+                # capture, but exclude the meter's own metadata accounting.
+                meter.start_time -= channel_elapsed
 
     def on_step_end(self, loss=None, loss_dict=None, grad_norm=None, aux_metrics=None):
+        if getattr(getattr(self, "train_dataloader", None), "_veomni_requires_optimizer_commit", False):
+            self.train_dataloader.commit_step()
         for callback in self._callbacks:
             callback.on_step_end(
                 self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm, aux_metrics=aux_metrics
@@ -670,18 +839,28 @@ class BaseTrainer(Stateful, ABC):
         self, micro_batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         channel_loss_callback = getattr(self, "channel_loss_callback", None)
+        is_padding = is_padding_microbatch(micro_batch)
         micro_step_context = (
             channel_loss_callback.micro_step_context(self.state, micro_batch)
             if channel_loss_callback is not None
             else nullcontext()
         )
         with micro_step_context:
+            if is_padding and (not dist.is_initialized() or dist.get_world_size() == 1):
+                # Native distributed tail padding is rejected during loader
+                # construction. Avoid RNG consumption and zero-gradient AdamW
+                # updates for parameters touched only by a synthetic batch.
+                return torch.tensor(0.0), {}, {}
+            if isinstance(micro_batch, dict) and "padding_flag" in micro_batch:
+                micro_batch = {key: value for key, value in micro_batch.items() if key != "padding_flag"}
             micro_batch = self.preforward(micro_batch)
             if channel_loss_callback is not None:
                 channel_loss_callback.strip_model_inputs(micro_batch)
 
             channel_forward_context = (
-                channel_loss_callback.model_forward_context() if channel_loss_callback is not None else nullcontext()
+                channel_loss_callback.model_forward_context()
+                if channel_loss_callback is not None and not is_padding
+                else nullcontext()
             )
             with (
                 use_parallel_state(self.model.parallel_state),
@@ -693,6 +872,8 @@ class BaseTrainer(Stateful, ABC):
 
             with use_parallel_state(self.model.parallel_state):
                 loss, loss_dict, aux_metrics = self.postforward(outputs, micro_batch)
+            if is_padding:
+                aux_metrics = {name: torch.zeros_like(value) for name, value in aux_metrics.items()}
 
             with (
                 use_parallel_state(self.model.parallel_state),
@@ -739,16 +920,52 @@ class BaseTrainer(Stateful, ABC):
         if self.args.train.sync_each_train_step:
             synchronize()
 
+    def _fetch_sft_micro_batches(self, data_iterator):
+        error = None
+        try:
+            micro_batches = next(data_iterator)
+            self._step_preflight_start_time = time.time()
+        except Exception as exc:  # noqa: BLE001 - coordinate before peers enter model collectives
+            micro_batches, error = None, exc
+        has_auxiliary_targets = reject_distributed_padding(micro_batches, check_fetch=True, fetch_error=error)
+        return micro_batches, has_auxiliary_targets
+
+    def _sft_step_preflight(self, micro_batches, callback_owner, *, has_auxiliary_targets=None):
+        if has_auxiliary_targets is None:
+            self._step_preflight_start_time = time.time()
+            has_auxiliary_targets = reject_distributed_padding(micro_batches)
+        if any(contains_padding(batch) and not isinstance(batch, dict) for batch in micro_batches):
+            raise ValueError("Padding inside an unpacked micro-batch is unsupported")
+        real_micro_steps = sum(not is_padding_microbatch(batch) for batch in micro_batches)
+        if not real_micro_steps:
+            raise ValueError("A training step must contain at least one real micro-batch")
+        previous_step = self.state.global_step
+        self.state.global_step += 1
+        try:
+            error = None
+            try:
+                self._reset_async_activation_offload_if_enabled(self.model)
+                callback_owner.on_step_begin(micro_batches=micro_batches)
+            except Exception as exc:  # noqa: BLE001 - propagate on the existing token reduction
+                error = exc
+            # Callbacks may adjust labels; normalize the inputs actually consumed.
+            (
+                self._weighted_loss_normalization,
+                self.micro_batches_token_len,
+                self.global_micro_batches_token_len,
+            ) = prepare_loss_token_counts(micro_batches, self.model, error=error, sync_auxiliary=has_auxiliary_targets)
+        except BaseException:
+            self.state.global_step = previous_step
+            raise
+
+        return real_micro_steps
+
     def train_step(
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        self.state.global_step += 1
-
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
-
-        self._reset_async_activation_offload_if_enabled(self.model)
-        self.on_step_begin(micro_batches=micro_batches)
+        micro_batches, has_auxiliary_targets = self._fetch_sft_micro_batches(data_iterator)
+        real_micro_steps = self._sft_step_preflight(micro_batches, self, has_auxiliary_targets=has_auxiliary_targets)
 
         # Forward and backward for each micro batch
         self.sync_before_train_step()
@@ -757,20 +974,21 @@ class BaseTrainer(Stateful, ABC):
         total_loss_dict = defaultdict(int)
         total_aux_metrics = defaultdict(float)
 
-        # token num for fixed_ce_loss in postforward
-        self.micro_batches_token_len = count_loss_token(micro_batches)
-        self.global_micro_batches_token_len = reduce_global_loss_token(self.micro_batches_token_len)
-        num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
-        for micro_step, micro_batch in enumerate(micro_batches):
-            mark_compile_step_begin(getattr(self.model, "_veomni_compile_uses_cuda_graphs", False))
-            self.model_reshard(micro_step, num_micro_steps)
-            self._configure_hsdp_allreduce(micro_step, num_micro_steps)
+        real_micro_step = 0
+        for micro_batch in micro_batches:
+            if not is_padding_microbatch(micro_batch):
+                mark_compile_step_begin(getattr(self.model, "_veomni_compile_uses_cuda_graphs", False))
+                self.model_reshard(real_micro_step, real_micro_steps)
+                self._configure_hsdp_allreduce(real_micro_step, real_micro_steps)
+                real_micro_step += 1
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
             aux_metrics: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
-            self.micro_batch_token_len = count_loss_token(micro_batch)
+            self.micro_batch_token_len = count_loss_token(
+                micro_batch, weighted_normalization=self._weighted_loss_normalization
+            )
             loss, loss_dict, aux_metrics = self.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
@@ -783,15 +1001,13 @@ class BaseTrainer(Stateful, ABC):
         grad_norm = self.model.clip_grad_norm()
 
         # Optimizer and scheduler step
-        self.model.optimizer.step()
-        self.model.lr_scheduler.step()
-        self.model.optimizer.zero_grad()
+        self._complete_optimizer_step()
 
         self.on_step_end(
             loss=total_loss,
             loss_dict=total_loss_dict,
             grad_norm=grad_norm,
-            aux_metrics=mean_aux_metrics(total_aux_metrics, num_micro_steps),
+            aux_metrics=mean_aux_metrics(total_aux_metrics, max(real_micro_steps, 1)),
         )
 
     def train(self):

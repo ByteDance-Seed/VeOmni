@@ -91,6 +91,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor, Shard
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -134,7 +135,7 @@ from veomni.distributed.parallel_state import _init_parallel_state, get_parallel
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad_and_slice
 from veomni.distributed.sequence_parallel.gdn_exchange import coalesced_gather_aligned
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
-from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
+from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss, pop_loss_weights
 
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
@@ -191,9 +192,12 @@ def _qwen4_exp_sequence_parallel_state(parallel_state):
     ulysses_enabled = bool(getattr(parallel_state, "ulysses_enabled", False))
     cp_enabled = bool(getattr(parallel_state, "cp_enabled", False))
     if ulysses_enabled and cp_enabled:
-        raise NotImplementedError(
-            "Qwen4-Exp does not support simultaneous Ulysses and Context Parallelism (ulysses_size > 1 and cp_size > 1)."
-        )
+        if not getattr(parallel_state, "allow_hybrid_cp", False):
+            raise NotImplementedError("Combined Qwen4-Exp Ulysses/CP requires allow_hybrid_cp=True.")
+        # The collator slices contiguous sequence shards in unified SP rank
+        # order. QSA keeps those local queries and gathers KV over that group;
+        # GDN exchanges sequence for heads over the same complete group.
+        return True, parallel_state.sp_group, parallel_state.sp_rank, parallel_state.sp_size
     if cp_enabled:
         return True, parallel_state.cp_group, parallel_state.cp_rank, parallel_state.cp_size
     if ulysses_enabled:
@@ -228,7 +232,7 @@ def _qwen4_exp_vision_parallel_state(parallel_state):
         tp_size=parallel_state.tp_size,
         pp_size=parallel_state.pp_size,
         cp_size=1,
-        ulysses_size=parallel_state.cp_size,
+        ulysses_size=parallel_state.sp_size,
         dp_mode=parallel_state.dp_mode,
         device_type=parallel_state.device_type,
         include_sp_in_fsdp=parallel_state.include_sp_in_fsdp,
@@ -266,6 +270,23 @@ class _Qwen4ExpScaleGradient(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         return grad_output / ctx.divisor, None
+
+
+class _Qwen4ExpAttachZeroWeightGrad(torch.autograd.Function):
+    """Connect a globally active lookup shard without changing its output."""
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        # Only metadata is required in backward; saving the parameter would
+        # make activation-offload hooks copy the complete PLE shard.
+        ctx.weight_shape = weight.shape
+        ctx.weight_dtype = weight.dtype
+        ctx.weight_device = weight.device
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, torch.zeros(ctx.weight_shape, dtype=ctx.weight_dtype, device=ctx.weight_device)
 
 
 def qwen4_exp_mm_token_type_ids(input_ids, config):
@@ -923,7 +944,9 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
         if self.num_v_heads // self.num_k_heads > 1 and not (
-            self.veomni_chunk_gated_delta_rule.impl in GROUPED_VALUE_HEAD_IMPLS and not use_precomputed_states
+            self.veomni_chunk_gated_delta_rule.impl in GROUPED_VALUE_HEAD_IMPLS
+            and not use_precomputed_states
+            and (self.veomni_chunk_gated_delta_rule.impl != "fla_npu" or self.num_v_heads // self.num_k_heads <= 4)
         ):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -1416,6 +1439,7 @@ class Qwen4ExpTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        self._veomni_fp32_expert_wgrad = False
         self.use_swiglu = config.hidden_act in {"silu", "swish"}
         self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
@@ -1446,7 +1470,7 @@ class Qwen4ExpTextExperts(nn.Module):
             unused,
             self.down_proj,
             self.gate_up_proj,
-            num_experts=self.num_experts,
+            **dict(num_experts=self.num_experts, **({"fp32_wgrad": True} if self._veomni_fp32_expert_wgrad else {})),
         )
         # --- Patch.1 ---
 
@@ -1706,9 +1730,38 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         # nonzero-synced the match count to the host once per shard per lookup,
         # serialising the host against the device on the PLE hot path. ---
         order = torch.argsort(shard_ids, stable=True)
-        shard_counts = torch.bincount(shard_ids, minlength=len(self.ngram_embedding)).tolist()
+        local_counts = torch.bincount(shard_ids, minlength=len(self.ngram_embedding))
+        persistent_weight = first_embedding.weight
+        persistent_2d = (
+            isinstance(persistent_weight, DTensor)
+            and persistent_weight.device_mesh.mesh_dim_names == ("ple_fsdp", "ple")
+            and len(persistent_weight.placements) == 2
+            and isinstance(persistent_weight.placements[0], Shard)
+            and persistent_weight.placements[0].dim == 1
+            and isinstance(persistent_weight.placements[1], Shard)
+            and persistent_weight.placements[1].dim == 0
+        )
+        state = get_parallel_state() if persistent_2d else None
+        attach_zero_grad = bool(
+            state is not None
+            and state.extra_parallel_sizes.get("ple", 1) > 1
+            and torch.is_grad_enabled()
+            and any(embedding.weight.requires_grad for embedding in self.ngram_embedding.values())
+        )
+        global_counts = None
+        if attach_zero_grad:
+            group = state.extra_parallel_flat_group("ple")
+            if not dist.is_initialized() or group is None:
+                raise RuntimeError("Trainable persistent PLE lookup requires its initialized process group.")
+            global_counts = local_counts.clone()
+            dist.all_reduce(global_counts, group=group)
+            shard_counts, global_counts = torch.stack((local_counts, global_counts)).tolist()
+        else:
+            shard_counts = local_counts.tolist()
         shard_start = 0
-        for embedding, shard_count in zip(self.ngram_embedding.values(), shard_counts, strict=True):
+        for shard_index, (embedding, shard_count) in enumerate(
+            zip(self.ngram_embedding.values(), shard_counts, strict=True)
+        ):
             shard_end = shard_start + shard_count
             if shard_end > shard_start:
                 positions = order[shard_start:shard_end]
@@ -1717,6 +1770,9 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
                     weight = weight.to_local()
                 values = nn.functional.embedding(row_ids[positions], weight).to(output.dtype)
                 output = output.index_copy(0, positions, values)
+            elif attach_zero_grad and embedding.weight.requires_grad and global_counts[shard_index] > 0:
+                weight = embedding.weight.to_local()
+                output = _Qwen4ExpAttachZeroWeightGrad.apply(output, weight)
             shard_start = shard_end
         # --- Patch.7 ---
         return output
@@ -3872,7 +3928,7 @@ class Qwen4ExpForConditionalGeneration(Qwen4ExpPreTrainedModel, GenerationMixin)
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen4ExpCausalLMOutputWithLogProbs:
         # --- Patch.1: Forward the packed position-id layout to the VLM model. ---
-        position_ids_layout = kwargs.pop("qwen4_exp_position_ids_layout", None)
+        position_ids_layout, loss_weights = kwargs.pop("qwen4_exp_position_ids_layout", None), pop_loss_weights(kwargs)
         # --- Patch.1 ---
         outputs = self.model(
             input_ids=input_ids,
@@ -3904,7 +3960,7 @@ class Qwen4ExpForConditionalGeneration(Qwen4ExpPreTrainedModel, GenerationMixin)
                 vocab_size=self.config.text_config.vocab_size,
                 hidden_states=hidden_states,
                 weights=self.lm_head.weight,
-                **kwargs,
+                **dict(kwargs, loss_weights=loss_weights),
             )
         else:
             logits = self.lm_head(hidden_states)
@@ -4181,7 +4237,9 @@ class Qwen4ExpForConditionalGeneration(Qwen4ExpPreTrainedModel, GenerationMixin)
         # distinguish them from HF's canonical axis-first layout.
         # Precompute image/video ViT varlen metadata after SP padding so the local
         # VisionModel path does not synchronize GPU tensors back to the host.
-        return qwen4_exp_collate_metadata
+        from veomni.data.data_collator import SerializablePureCollatorHook
+
+        return SerializablePureCollatorHook(qwen4_exp_collate_metadata, "veomni:qwen4-exp-metadata-v1")
         # --- Patch.1 ---
 
     def get_parallel_plan(self):

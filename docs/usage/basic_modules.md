@@ -273,6 +273,33 @@ class CustomTemplate(ChatTemplate):
 
 `encode_messages` is the only method you have to write: training lays out tokens through it, including the assistant-only label mask that jinja cannot express. `get_jinja_template` is optional and read by nothing in the training or export path — an exported checkpoint keeps whatever chat template it shipped with, so selecting a template here never rewrites it.
 
+For text SFT examples containing message-level `loss_weight`, a custom template must
+expose `supports_loss_weights = True` and handle the weights in
+`encode_messages`. Otherwise [`process_conversation_example`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/data/data_transform.py)
+rejects the example before calling the template. The attribute can be inherited;
+an overriding encoder must preserve the weight handling or set it to `False`.
+When a fractional weight survives truncation on a supervised target, return
+`loss_weights` alongside `input_ids`, `attention_mask`, and `labels`: it must contain one finite float per
+token, aligned with `labels`, with values in `[0, 1]` (positive values must be
+normal FP32 values). Apply the same truncation to all four fields. Use zero for
+tokens excluded from supervision. For example, a three-token encoding could
+return labels `[-100, -100, 12]` and weights `[0.0, 0.0, 0.5]`.
+If all surviving target weights are binary, the template may instead encode
+weight 0 as label `-100`, leave weight 1 supervised, and omit `loss_weights`;
+the built-in ChatML template uses this optimization.
+
+The data collator packs and pads the weights with the corresponding labels. The
+training loss is `sum(weight * token_cross_entropy) / sum(weight)` over supervised
+targets: a single target weighted `0.5` is therefore not a halved mean loss. An
+entire step with zero supervised weight is rejected. An entirely unweighted step
+uses normal supervision. In a mixed batch, samples without `loss_weights` receive
+weight 1 for supervised labels and share the weighted denominator.
+
+Any non-`None` `loss_weights` field currently requires the VeOmni `qwen4_exp`
+VLM model and `chunk_loss`; it is not supported with DPO, MTP targets or router
+auxiliary loss. See [per-message loss weights](multimodal_data_processing.md#per-message-loss-weights-for-qwen-vl)
+for the supported configurations and other restrictions.
+
 
 ## DataLoader
 VeOmni offered a flexible and powerful dataloader implementation, which supports
@@ -377,18 +404,37 @@ model = build_parallelize_model(
 
 ### Optimizer and LR Scheduler
 
-`build_optimizer` supports three optimizer types via `model.optimizer.type`:
+`build_optimizer` supports the following optimizer types via `model.optimizer.type`:
 
 | Type | Description |
 |------|-------------|
 | `adamw` (default) | Standard `torch.optim.AdamW`. |
 | `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
+| `master_fp32_adamw` | FP32 master weights with BF16 first and second moments. |
+| `full_fp32_adamw` | FP32 master weights and FP32 first and second moments. |
+| `cpu_offload_adamw` | FP32 master weights and configurable moment precision, with selected parameter states on CPU. |
 | `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases and norms. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
+| `qwen38_muon` | Qwen4-Exp logical-matrix Muon and AdamW with FP32 master weights and optimizer states; see the [Qwen3.8 Muon recipe](qwen38_muon.md). |
+
+For `cpu_offload_adamw`, set `model.optimizer.cpu_offload_param_patterns` to
+full-parameter-name regular expressions selecting the optimizer states to
+offload. `cpu_offload_cpu_moment_dtype` and `cpu_offload_resident_moment_dtype`
+default to `float32`; `bfloat16` is an explicit lower-precision option. The
+compute parameters and gradients stay on their original device. Checkpoint
+resume for these optimizers requires the same proven parameter groups and
+parallel layout; see [checkpoint recovery](checkpoint.md).
 
 `model.optimizer.state_offload: cpu` (with `type: adamw`) keeps the AdamW moment
 states in host buffers — pinned by default, pageable when `state_offload_pin_memory`
 is `false` or a pinned allocation fails — and streams them to the device in
 batches, lowering peak device memory.
+
+With `state_offload: cpu`, the AdamW moments use the parameter dtype and no FP32
+master weights are created. BF16 parameters therefore have BF16 moments and
+BF16 parameter writes; select an optimizer with the desired precision policy
+when FP32 masters are required.
+`state_offload: cpu` cannot be combined with selective ExtraParallel parameter
+CPU offload (`cpu_offload_extra_parallel_names`).
 
 Muon-specific hyperparameters live under `model.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` continue to drive the AdamW sibling group.
 

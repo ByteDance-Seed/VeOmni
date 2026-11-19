@@ -16,6 +16,7 @@ import math
 import os
 import sys
 from dataclasses import asdict, dataclass, field
+from functools import wraps
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
@@ -76,6 +77,22 @@ def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
 #
 
 
+def _accept_positional_state_offload(cls):
+    """Keep both the upstream offload and historical learning-rate call forms."""
+    original_init = cls.__init__
+
+    @wraps(original_init)
+    def init(self, *args, **kwargs):
+        if len(args) > 1 and not isinstance(args[1], str):
+            offload = kwargs.pop("state_offload", "none")
+            args = (args[0], offload, *args[1:])
+        original_init(self, *args, **kwargs)
+
+    cls.__init__ = init
+    return cls
+
+
+@_accept_positional_state_offload
 @dataclass
 class OptimizerConfig:
     """model.optimizer.* — Optimizer and learning-rate schedule.
@@ -85,7 +102,15 @@ class OptimizerConfig:
     norms use AdamW.
     """
 
-    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    type: Literal[
+        "adamw",
+        "anyprecision_adamw",
+        "muon",
+        "master_fp32_adamw",
+        "full_fp32_adamw",
+        "cpu_offload_adamw",
+        "qwen38_muon",
+    ] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
@@ -96,7 +121,8 @@ class OptimizerConfig:
                 "Optimizer-managed state offload. 'none' disables it (training state may still be "
                 "offloaded by model.accelerator.fsdp_config.offload); 'cpu' keeps the moment states "
                 "in host buffers and streams them to the device in batches, lowering peak device "
-                "memory (type='adamw' only)."
+                "memory (type='adamw' only). This cannot be combined with selective ExtraParallel "
+                "CPU offload."
             )
         },
     )
@@ -280,7 +306,34 @@ class OptimizerConfig:
         },
     )
 
+    cpu_offload_param_patterns: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Full parameter-name regexes selecting CPU master and moments for optimizer offload."},
+    )
+    cpu_offload_resident_moment_dtype: Literal["float32", "bfloat16"] = field(
+        default="float32", metadata={"help": "Resident Adam moment precision; master remains FP32."}
+    )
+    cpu_offload_cpu_moment_dtype: Literal["float32", "bfloat16"] = field(
+        default="float32", metadata={"help": "CPU-offloaded Adam moment precision; master remains FP32."}
+    )
+    qwen38_ple_moments_scratch_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Local scratch directory for FP32 PLE moments; rebuilt from DCP on resume."},
+    )
+    qwen38_ple_moments_world_profile: bool = field(
+        default=False,
+        metadata={"help": "Declare that all world ranks participate in the PLE scratch optimizer profile."},
+    )
+
     def __post_init__(self):
+        if isinstance(self.lr, (list, tuple)):
+            raise TypeError("Pass CPU-offload options by keyword; the second positional argument is learning rate")
+        if isinstance(self.lr, str) and self.lr in ("none", "cpu"):
+            raise TypeError("Pass state_offload by keyword; the second positional argument is learning rate")
+        # YAML sequences arrive as lists; the declared tuple also prevents
+        # optimizer defaults and groups from sharing mutable beta options.
+        if isinstance(self.betas, list):
+            self.betas = tuple(self.betas)
         # Annotations are not enforced for YAML values (see constraints), so the
         # literal is validated explicitly; otherwise a typo would silently fall
         # back to the stock path in the builder.
@@ -652,9 +705,22 @@ class MixedPrecisionConfig:
         default=True,
         metadata={"help": "Enable mixed precision cast forward inputs (FSDP2)."},
     )
+    npu_expert_fp32_wgrad: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Compute NPU fused MoE expert weight gradients in FP32 while keeping BF16 forward and "
+                "input gradients. Currently supports Qwen4-Exp with FSDP2, BF16 parameters, FP32 "
+                "reduction, and native communication; increases expert gather and temporary memory."
+            )
+        },
+    )
     float8: Float8TrainingConfig = field(default_factory=Float8TrainingConfig)
 
     def __post_init__(self):
+        if not isinstance(self.npu_expert_fp32_wgrad, bool):
+            raise ValueError("npu_expert_fp32_wgrad must be a boolean (true or false).")
+
         def _check_dtype(dtype: str):
             if dtype is not None and dtype not in ["bfloat16", "float32", "float16"]:
                 raise ValueError(f"Invalid dtype {dtype} for mixed precision training.")
@@ -758,6 +824,14 @@ class FSDPConfig:
             )
         },
     )
+    cpu_offload_extra_parallel_names: List[str] = field(
+        default_factory=list,
+        metadata={"help": "CPU-offload selected ExtraParallel parameter/gradient groups (currently ep only)."},
+    )
+    cpu_offload_exclude_module_patterns: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Keep matching selected expert modules resident on the accelerator; complete FQN patterns."},
+    )
     expert_fsdp_shard_dim: Optional[int] = field(
         default=None,
         metadata={
@@ -793,6 +867,13 @@ class FSDPConfig:
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
 
     def __post_init__(self):
+        if self.cpu_offload_exclude_module_patterns and not self.cpu_offload_extra_parallel_names:
+            raise ValueError("Resident module exclusions require selective ExtraParallel CPU offload")
+        if self.cpu_offload_extra_parallel_names:
+            if self.fsdp_mode != "fsdp2" or self.offload:
+                raise ValueError("Selective ExtraParallel CPU offload requires FSDP2 and global offload=False")
+            if self.cpu_offload_extra_parallel_names != ["ep"]:
+                raise ValueError("Only the ep ExtraParallel axis supports selective CPU offload")
         if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
             raise ValueError(
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
@@ -956,7 +1037,15 @@ class AcceleratorConfig:
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
 
+    allow_hybrid_cp: bool = field(
+        default=False,
+        metadata={"help": "Opt in to model-qualified combined Ulysses/CP; currently Qwen4-Exp only."},
+    )
+
     def __post_init__(self):
+        if not isinstance(self.allow_hybrid_cp, bool):
+            raise ValueError(f"allow_hybrid_cp must be a boolean; got {self.allow_hybrid_cp!r}.")
+
         from ..distributed.hccl_options import validate_ep_hccl_options
 
         validate_ep_hccl_options(self.npu_ep_hccl_buffer_mib, self.npu_ep_hccl_expansion_mode)
@@ -1001,7 +1090,7 @@ class AcceleratorConfig:
             )
         assert self.tp_size == 1, "Tensor parallel size not supported yet."
         assert self.pp_size == 1, "Pipeline parallel size not supported yet."
-        if self.cp_size > 1 and self.ulysses_size > 1:
+        if self.cp_size > 1 and self.ulysses_size > 1 and not self.allow_hybrid_cp:
             raise NotImplementedError(
                 "Context parallelism cannot be combined with Ulysses yet; "
                 f"got cp_size={self.cp_size} with ulysses_size={self.ulysses_size}. "
@@ -1133,6 +1222,12 @@ class CheckpointConfig:
         default=True,
         metadata={"help": "Save the huggingface format weights to the last checkpoint dir."},
     )
+    extra_parallel_canonical_layout: bool = field(
+        default=False,
+        metadata={
+            "help": "Use the versioned canonical EP/PLE model checkpoint layout. Legacy checkpoints require migration."
+        },
+    )
 
     def __post_init__(self):
         """Reject a save configuration that cannot do what it says.
@@ -1141,6 +1236,12 @@ class CheckpointConfig:
         ``save_async`` too, but not until the first checkpoint is due -- a
         ``save_steps``-long wait to be told the configuration was never valid.
         """
+        if not isinstance(self.extra_parallel_canonical_layout, bool):
+            raise ValueError(
+                "extra_parallel_canonical_layout must be a boolean; use unquoted true or false in YAML, "
+                f"got {self.extra_parallel_canonical_layout!r}."
+            )
+
         if self.stage_dir and self.save_async:
             raise ValueError(
                 "stage_dir cannot be combined with save_async: the staged copy is dropped when the save "
@@ -1292,6 +1393,21 @@ class TrainingArguments:
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     channel_loss: ChannelLossConfig = field(default_factory=ChannelLossConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    cyclic_input_contract: Optional[str] = field(
+        default=None,
+        kw_only=True,
+        metadata={"help": "SHA256 identity of immutable inputs and deterministic preprocessing for cyclic packing."},
+    )
+    cyclic_input_deterministic: bool = field(
+        default=False,
+        kw_only=True,
+        metadata={"help": "Attest that cyclic packing inputs and collation are deterministic and stateless."},
+    )
+    cyclic_max_buffer_bytes: int = field(
+        default=512 * 1024 * 1024,
+        kw_only=True,
+        metadata={"help": "Soft decoded-feature storage budget for cyclic packing, plus one lookahead."},
+    )
 
     def __post_init__(self):
         if self.dyn_bsz_physical_overflow_ratio < 1.0:
@@ -2039,6 +2155,10 @@ class ModelArguments(BaseModelArguments):
                 "model.optimizer.state_offload='cpu' cannot be combined with "
                 "model.accelerator.fsdp_config.offload; both move training state to host."
             )
+        if self.optimizer.state_offload == "cpu" and self.accelerator.fsdp_config.cpu_offload_extra_parallel_names:
+            raise ValueError(
+                "model.optimizer.state_offload='cpu' cannot be combined with selective ExtraParallel CPU offload."
+            )
         # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
         # instead of silently ignoring the flag.
@@ -2145,6 +2265,36 @@ class DataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
+    resume_input_contract: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Caller-attested SHA256 identity of the immutable input snapshot, tokenizer, collator and "
+                "deterministic data transforms. "
+                "Required to resume a main-process dynamic batching cursor exactly."
+            )
+        },
+    )
+    resume_input_deterministic: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Attest that input decoding, preprocessing, tokenization and collation are deterministic and "
+                "semantically stateless: they neither depend on untracked mutable state nor consume untracked "
+                "worker RNG state. The input contract must identify the immutable data snapshot."
+            )
+        },
+    )
+    resume_replay_timeout_seconds: int = field(
+        default=7200,
+        metadata={
+            "help": (
+                "Timeout in seconds for each worker response during exact streaming replay. Rank coordination "
+                "uses (num_workers + 1) times this value plus 30 seconds. Replay can reread all source rows "
+                "consumed in the saved epoch."
+            )
+        },
+    )
     data_type: Literal["plaintext", "conversation", "diffusion", "classification", "dpo"] = field(
         default="conversation",
         metadata={"help": "Type of the training data."},
@@ -2189,6 +2339,8 @@ class DataArguments:
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
 
     def __post_init__(self):
+        if type(self.resume_replay_timeout_seconds) is not int or self.resume_replay_timeout_seconds <= 0:
+            raise ValueError("resume_replay_timeout_seconds must be a positive integer")
         self.enable_multisource = self.train_path.endswith(".yaml")
 
         if self.enable_multisource:

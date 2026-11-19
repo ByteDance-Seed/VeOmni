@@ -59,11 +59,18 @@ def _build_runtime(dtype):
     runtime.model = _qwen4_model()
     runtime.model_config = runtime.model.config
     runtime.train_args = SimpleNamespace(
-        freeze_ple_embeddings=True, frozen_ple_dtype=dtype, freeze_vit=False, freeze_audio_tower=False
+        freeze_ple_embeddings=True,
+        frozen_ple_dtype=dtype,
+        freeze_vit=False,
+        freeze_audio_tower=False,
+        checkpoint=SimpleNamespace(),
     )
     from veomni.arguments.arguments_types import OptimizerConfig
 
-    runtime.args = SimpleNamespace(optimizer=OptimizerConfig(lr=1e-3, weight_decay=0.0), lora_config=None)
+    runtime.args = SimpleNamespace(
+        optimizer=OptimizerConfig(lr=1e-3, weight_decay=0.0), lora_config=None, accelerator=SimpleNamespace()
+    )
+    runtime.model_name = "base"
     runtime._freeze_model_module()
     table = runtime.model.ple.ple_embedding.ngram_embedding["shard_0"].weight
     assert not table.requires_grad

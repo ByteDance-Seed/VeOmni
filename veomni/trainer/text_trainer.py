@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import torch
 
@@ -25,7 +25,10 @@ from ..distributed.parallel_state import use_parallel_state
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..utils import helper
 from ..utils.device import synchronize
-from ..utils.loss_utils import count_loss_token, reduce_global_loss_token
+from ..utils.loss_utils import (
+    count_loss_token,
+    is_padding_microbatch,
+)
 from .base import BaseTrainer, VeOmniIter, mean_aux_metrics
 
 
@@ -49,9 +52,10 @@ class TextTrainer:
             self._build_data_transform()
             self.base._build_dataset()
             self.base._build_collate_fn()
-            self.base._build_dataloader()
+            self.base._build_sft_dataloader()
         self.base._build_lr_scheduler()
         self.base._build_training_context(self.base.model)
+        self.base._sft_dynamic_exact_resume = args.data.data_type in ("plaintext", "conversation")
         self.base._init_callbacks()
 
     def _build_data_transform(self):
@@ -86,12 +90,10 @@ class TextTrainer:
         self,
         data_iterator: Any,
     ) -> Dict[str, float]:
-        self.base.state.global_step += 1
-
-        micro_batches: List[Dict[str, Any]] = next(data_iterator)
-
-        self.base._reset_async_activation_offload_if_enabled(self.base.model)
-        self.on_step_begin(micro_batches=micro_batches)
+        micro_batches, has_auxiliary_targets = self.base._fetch_sft_micro_batches(data_iterator)
+        real_micro_steps = self.base._sft_step_preflight(
+            micro_batches, self, has_auxiliary_targets=has_auxiliary_targets
+        )
 
         # Forward and backward for each micro batch
         self.base.sync_before_train_step()
@@ -100,20 +102,21 @@ class TextTrainer:
         total_loss_dict = defaultdict(int)
         total_aux_metrics = defaultdict(float)
 
-        # token num for fixed_ce_loss in postforward
-        self.base.micro_batches_token_len = count_loss_token(micro_batches)
-        self.base.global_micro_batches_token_len = reduce_global_loss_token(self.base.micro_batches_token_len)
-        num_micro_steps = len(micro_batches)
         # forward and backward pass with gradient_accumulationsteps
-        for micro_step, micro_batch in enumerate(micro_batches):
-            mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_uses_cuda_graphs", False))
-            self.base.model_reshard(micro_step, num_micro_steps)
-            self.base._configure_hsdp_allreduce(micro_step, num_micro_steps)
+        real_micro_step = 0
+        for micro_batch in micro_batches:
+            if not is_padding_microbatch(micro_batch):
+                mark_compile_step_begin(getattr(self.base.model, "_veomni_compile_uses_cuda_graphs", False))
+                self.base.model_reshard(real_micro_step, real_micro_steps)
+                self.base._configure_hsdp_allreduce(real_micro_step, real_micro_steps)
+                real_micro_step += 1
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
             aux_metrics: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
-            self.base.micro_batch_token_len = count_loss_token(micro_batch)
+            self.base.micro_batch_token_len = count_loss_token(
+                micro_batch, weighted_normalization=self.base._weighted_loss_normalization
+            )
             loss, loss_dict, aux_metrics = self.base.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
@@ -126,15 +129,13 @@ class TextTrainer:
         grad_norm = self.base.model.clip_grad_norm()
 
         # Optimizer and scheduler step
-        self.base.model.optimizer.step()
-        self.base.model.lr_scheduler.step()
-        self.base.model.optimizer.zero_grad()
+        self.base._complete_optimizer_step()
 
         self.on_step_end(
             loss=total_loss,
             loss_dict=total_loss_dict,
             grad_norm=grad_norm,
-            aux_metrics=mean_aux_metrics(total_aux_metrics, num_micro_steps),
+            aux_metrics=mean_aux_metrics(total_aux_metrics, max(real_micro_steps, 1)),
         )
 
     def train(self):

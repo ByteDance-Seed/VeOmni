@@ -21,6 +21,38 @@ from veomni.trainer.omni.omni_trainer import OmniTrainer, cascade_module_reshard
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
+def test_native_loader_accepts_omni_data_arguments_without_replay_override(monkeypatch):
+    from veomni.arguments.omni_arguments_types import OmniDataArguments
+    from veomni.trainer.omni import omni_trainer
+
+    build = MagicMock(return_value=object())
+    monkeypatch.setattr(omni_trainer, "build_dataloader", build)
+    trainer = OmniTrainer.__new__(OmniTrainer)
+    trainer.train_dataset = object()
+    trainer.collate_fn = object()
+    trainer.args = SimpleNamespace(
+        data=OmniDataArguments(train_path="text.jsonl"),
+        train_steps=2,
+        train=SimpleNamespace(
+            micro_batch_size=1,
+            global_batch_size=1,
+            dataloader_batch_size=1,
+            bsz_warmup_ratio=0,
+            bsz_warmup_init_mbtoken=0,
+            dyn_bsz=False,
+            dyn_bsz_runtime="main",
+            dyn_bsz_count_mode="full",
+            dyn_bsz_physical_overflow_ratio=1.0,
+            seed=5,
+            checkpoint=SimpleNamespace(save_steps=0),
+        ),
+    )
+
+    trainer._build_dataloader()
+
+    assert build.call_args.kwargs["resume_replay_timeout_seconds"] == 7200
+
+
 def test_the_export_stage_reaches_every_module_checkpoint_manager():
     """``train_end`` is what lets a manager drop the optimizer before the final
     export, so the stage ``CheckpointCallback`` passes must survive the fan-out."""
