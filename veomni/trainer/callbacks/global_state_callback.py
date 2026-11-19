@@ -862,18 +862,6 @@ class GlobalStateCallback(Callback):
             dist.all_reduce(timeout_tensor, op=dist.ReduceOp.MAX, group=default_group)
             replay_group_timeout = int(timeout_tensor.item())
         global_weighted_replay = replay_group_timeout > 0
-        owner_error = None
-        if global_weighted_replay:
-            try:
-                sp_leader_only = getattr(self.trainer, "_veomni_loader_sp_rank_zero_only", False) is True
-                expected_owner = (
-                    not sp_leader_only or not self.parallel_state.sp_enabled or self.parallel_state.sp_rank == 0
-                )
-                if (loader is not None) != expected_owner or (expected_owner and not weighted_replay):
-                    raise ValueError("Weighted replay loader ownership differs from the trainer's SP topology")
-            except BaseException as exc:
-                owner_error = exc
-        raise_if_any_rank_failed(owner_error, "validating weighted replay loader ownership", group=default_group)
         _agree_restored_position(
             global_step,
             saved_epoch,

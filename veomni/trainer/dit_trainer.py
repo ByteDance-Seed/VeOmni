@@ -537,7 +537,6 @@ class DiTTrainer:
     def _build_dataloader(self):
         """Build dataloader with dyn_bsz=False for DiT (fixed batch)."""
         args = self.base.args
-        self.base._veomni_loader_sp_rank_zero_only = True
         if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
             resume_kwargs = {}
             if args.data.dataloader.type == "native":
