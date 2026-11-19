@@ -299,25 +299,38 @@ def _equivalence_worker():
     # for. Comparing the local gradient instead would pass at sp=1 and be off by
     # exactly `sp_size` here.
     assert set(shard_grads) == set(full_grads), f"[Rank {rank}] SP changed which parameters have gradients"
-    worst, worst_name = 0.0, ""
+    errors = {}
     for name, expected in full_grads.items():
         averaged = shard_grads[name].clone()
         dist.all_reduce(averaged, op=dist.ReduceOp.SUM)
         averaged /= world_size
-        error = _relative_error(averaged, expected)
-        if error > worst:
-            worst, worst_name = error, name
-    assert worst < 5e-2, f"[Rank {rank}] {worst_name} is off by {worst:.2e} after averaging over the SP group"
+        errors[name] = _relative_error(averaged, expected)
+
+    # The median is the discriminator, not the worst parameter. A missing `sp_size`
+    # multiplies *every* gradient by `1/sp_size`, so it moves the whole
+    # distribution: measured here, the median goes from 8.5e-3 to 5.0e-1, a factor
+    # of 59. The worst single parameter does not have that property -- the MoE
+    # router's gradients amplify whatever the split changed in its routing, by an
+    # amount that moves with the torch release (2.9e-2 here on 2.9.1, 4.7e-1 on the
+    # 2.11 CI image, for `layers.0.router.per_expert_scale` alone). That is the same
+    # effect `_repeated_kv_worker` records at 3.4e-1 on the same parameter, and it is
+    # why a bound on the worst parameter would have to sit at 0.5 -- right on top of
+    # the signal, and unable to separate a dropped scale from a router that moved.
+    median_error = sorted(errors.values())[len(errors) // 2]
+    assert median_error < 1e-1, (
+        f"[Rank {rank}] the median gradient is off by {median_error:.2e} after averaging over the SP "
+        "group; a missing `sp_size` on the backward puts every parameter at about 1/sp_size"
+    )
 
     # (3) is where the `sp_size` on the backward is tested, and it is enough on its
     # own: without it every rank's local gradient is its own shard's contribution,
-    # so the mean over the group is `g_full / sp_size` and (3) fails by 50% at
-    # sp=2. An earlier version of this test added a fourth assertion -- that one
-    # rank's *un-averaged* gradient differs from the whole by more than 10% -- on
-    # the theory that (3) alone could not see a missing scale. That is backwards:
-    # the un-averaged comparison is off by about a factor of two either way, so it
-    # passed whether or not the scale was there. `test_the_backward_carries_the_sp_size_factor`
-    # pins the factor itself.
+    # so the mean over the group is `g_full / sp_size` and the median moves by 50%
+    # at sp=2 -- which is what the 1e-1 bound above reads as. An earlier version of
+    # this test added a fourth assertion -- that one rank's *un-averaged* gradient
+    # differs from the whole by more than 10% -- on the theory that (3) alone could
+    # not see a missing scale. That is backwards: the un-averaged comparison is off
+    # by about a factor of two either way, so it passed whether or not the scale was
+    # there. `test_the_backward_carries_the_sp_size_factor` pins the factor itself.
     dist.barrier()
 
 
