@@ -54,6 +54,34 @@ class PretrainedOmniModule(PreTrainedModel):
     #: leaves this ``False``, so the two sides of a handoff can never disagree.
     supports_sp_sharded_handoff: bool = False
 
+    #: Whether this module's blocks may be wrapped by ``torch.compile``.
+    #:
+    #: ``False`` by default. A module sets ``supports_torch_compile = True`` on
+    #: its own class once its compile path has been measured to pay off; the
+    #: flag is the per-module gate, and ``accelerator.torch_compile.enable``
+    #: remains the run-wide switch — a module that opts in is compiled only when
+    #: the run turns compile on, and a module that does not is never compiled.
+    #:
+    #: Measured on A100-80GB, one decoder block per module, forward+backward
+    #: (``dynamic=False``, ``backend="inductor"``; larger is better):
+    #:
+    #: * ``qwen3_llm`` / ``qwen3vl_llm`` / ``janus_llama`` — ~1.32-1.58x. The
+    #:   text backbones are where Inductor's fusion beats eager by the most.
+    #: * ``janus_vqvae`` — ~1.74x over its 37 conv/attention blocks.
+    #: * ``janus_siglip`` — ~1.12x, close to the noise floor for a 4-block
+    #:   tower; kept on because the cost is a one-off compile.
+    #: * ``bagel_siglip_navit`` — ~1.02x, i.e. nothing. Its patch embedding and
+    #:   positional add dominate, so it stays ``False``.
+    #:
+    #: What ``True`` claims: this module's ``forward``/``encode`` reaches every
+    #: block named in its ``_no_split_modules`` with shapes fixed by the
+    #: collator (``dyn_bsz`` + ``pad_to_length``), so a single Inductor graph per
+    #: block covers every step. A module whose input shape varies per step (a
+    #: vision tower over a variable patch grid, an FSM decoder over a growing
+    #: sequence) either stays ``False`` or must be measured under
+    #: ``dynamic=True`` first.
+    supports_torch_compile: bool = False
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
         """Load weights, then bind module-owned processor / tokenizer sidecars."""

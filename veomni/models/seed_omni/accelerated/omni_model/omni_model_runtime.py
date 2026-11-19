@@ -125,6 +125,20 @@ def _scoped_no_split_modules(module_runtimes: Mapping[str, ModuleRuntime]) -> li
     return list(dict.fromkeys(scoped))
 
 
+def _compilable_scope(module_runtimes: Mapping[str, ModuleRuntime]) -> list[str]:
+    """The child scopes whose modules opted into ``torch.compile``.
+
+    The composed wrap compiles one tree, so the per-module gate is applied
+    before the call: only children that declare
+    :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile`
+    contribute a scope, and everything else keeps running eagerly inside the
+    same compiled run.
+    """
+    return [
+        name for name, runtime in module_runtimes.items() if getattr(runtime.model, "supports_torch_compile", False)
+    ]
+
+
 def _reject_lora_that_matched_nothing(
     module_runtimes: Mapping[str, ModuleRuntime], train_args: OmniTrainingArguments | None = None
 ) -> None:
@@ -314,9 +328,21 @@ class OmniModelRuntime:
         from .....distributed.torch_compile import CompileConfig
         from .....distributed.torch_parallelize import build_parallelize_model
 
+        # One tree, one compile call, but only the modules that opted in. The
+        # rest keep running eagerly; a run where nothing opted in compiles
+        # nothing at all rather than failing the "found no decoder blocks" check.
+        compile_scopes = _compilable_scope(modules_to_wrap)
         compile_config = CompileConfig(
             **{field.name: getattr(acc.torch_compile, field.name) for field in fields(CompileConfig)}
         )
+        compile_config.enable = bool(compile_config.enable) and bool(compile_scopes)
+        if acc.torch_compile.enable and not compile_scopes:
+            logger.info_rank0(
+                "OmniModelRuntime: accelerator.torch_compile.enable is set but no module declares "
+                "supports_torch_compile=True; running eagerly."
+            )
+        elif compile_scopes:
+            logger.info_rank0(f"OmniModelRuntime: compiling blocks under {compile_scopes}; other modules stay eager.")
         opt = args.optimizer
         muon_expert_zero_comm = bool(opt) and opt.type == "muon" and opt.muon_expert_zero_comm
         weights_path = {name: runtime.weights_path for name, runtime in modules_to_wrap.items()}
@@ -350,6 +376,7 @@ class OmniModelRuntime:
                 expert_weight_fp8_all_gather=acc.fsdp_config.expert_weight_fp8_all_gather,
                 expert_fsdp_shard_dim=acc.fsdp_config.expert_fsdp_shard_dim,
                 compile_config=compile_config,
+                compile_scopes=compile_scopes,
                 **kwargs,
             )
 

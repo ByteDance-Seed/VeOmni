@@ -14,7 +14,7 @@
 
 import types
 from dataclasses import dataclass
-from typing import Collection, Optional
+from typing import Collection, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -46,11 +46,62 @@ class CompileConfig:
         return self.backend == "cudagraphs" or self.mode == "reduce-overhead"
 
 
-def _decoder_block_class_names(model: nn.Module) -> set[str]:
+def _decoder_block_specs(model: nn.Module, *, all_classes: bool = False) -> list[tuple[str, str | None]]:
+    """``(class name, child scope)`` for each compilable block in ``_no_split_modules``.
+
+    An entry is a bare class name (``LlamaDecoderLayer``, scope ``None``, matches
+    anywhere) or — on a SeedOmni composed model, where the children share one
+    FSDP tree — scoped to a child (``janus_llama.LlamaDecoderLayer``, matches
+    only under that child; see ``_scoped_no_split_modules`` in
+    ``models/seed_omni/accelerated/omni_model/omni_model_runtime.py``).
+
+    ``type(module).__name__`` never carries a scope, so the name half is what
+    ``_is_decoder_block`` compares and the scope half is what it matches against
+    the fqn.
+
+    ``all_classes`` decides which entries qualify. The default keeps only
+    ``*DecoderLayer``, which is what every single model wants: a Qwen2.5-Omni
+    lists its vision and audio towers alongside the decoder layers, and those
+    must stay eager. A SeedOmni run passes ``True`` because its modules declare
+    whatever their own blocks are called (``JanusVQVAEAttnBlock``), and the
+    per-module
+    :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile`
+    flag — not the class name — is what decides whether the module is compiled
+    at all.
+    """
     no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
     if no_split_modules is None:
-        return set()
-    return {name for name in no_split_modules if isinstance(name, str) and name.endswith("DecoderLayer")}
+        return []
+    specs: list[tuple[str, str | None]] = []
+    for entry in no_split_modules:
+        if not isinstance(entry, str):
+            continue
+        scope, _, class_name = entry.rpartition(".")
+        if all_classes or class_name.endswith("DecoderLayer"):
+            specs.append((class_name, scope or None))
+    return specs
+
+
+def _decoder_block_class_names(model: nn.Module) -> set[str]:
+    """Decoder-layer class names in ``_no_split_modules``, scopes stripped.
+
+    Kept for :func:`validate_compile_model`, which only asks whether a class is
+    declared at all.
+    """
+    return {class_name for class_name, _ in _decoder_block_specs(model)}
+
+
+def _is_composed_model(model: nn.Module) -> bool:
+    """Whether ``model`` is a SeedOmni composed :class:`OmniModel`.
+
+    Recognised by the per-module config map, which no single model carries. A
+    composed model presents as text-only to :func:`_is_multimodal_model`: it
+    inherits ``input_modalities = "text"`` from ``PreTrainedModel`` and its
+    ``OmniConfig`` has no ``vision_config`` / ``audio_config`` — the media
+    modalities live in ``_module_configs``.
+    """
+    config = getattr(model, "config", None)
+    return bool(getattr(config, "_module_configs", None))
 
 
 def _is_multimodal_model(model: nn.Module) -> bool:
@@ -78,6 +129,25 @@ def validate_compile_model(
     fail-closed because their towers and cross-modal injection points have
     different shape and lifecycle contracts.
     """
+
+    if _is_composed_model(model):
+        # Each child is compiled block-by-block under the same rules as a single
+        # model, but the cross-module graph and the per-module op selections make
+        # the CUDA-graph and sequence-parallel paths unverified: replay would need
+        # one mark per micro-batch across the whole composed forward, and Ulysses
+        # would slice activations the graph edges reorder. Keep them off.
+        if compile_config.uses_cuda_graphs():
+            raise RuntimeError(
+                "model.accelerator.torch_compile.enable does not support CUDA Graph replay for a composed "
+                "SeedOmni OmniModel; use backend='inductor' and mode=None."
+            )
+        if sequence_parallel_enabled or async_enabled:
+            raise RuntimeError(
+                "model.accelerator.torch_compile.enable does not support sequence parallelism or async Ulysses "
+                "for a composed SeedOmni OmniModel; set model.accelerator.ulysses_size=1, "
+                "model.accelerator.cp_size=1, and model.accelerator.enable_async=False."
+            )
+        return
 
     if not _is_multimodal_model(model):
         return
@@ -113,18 +183,43 @@ def validate_compile_model(
         )
 
 
-def _is_decoder_block(module: nn.Module, decoder_block_class_names: Optional[Collection[str]] = None) -> bool:
+def _is_decoder_block(
+    module: nn.Module,
+    decoder_block_class_names: Optional[Collection[str]] = None,
+    *,
+    fqn: Optional[str] = None,
+    decoder_block_specs: Optional[Sequence[tuple[str, str | None]]] = None,
+) -> bool:
     """Check decoder blocks using the model's ``_no_split_modules`` list.
 
     HuggingFace model classes typically list the decoder layer class in
     ``_no_split_modules`` for FSDP/Accelerate. Multimodal models may include
     vision/audio blocks in the same list, so the compile path keeps only
     entries that are decoder layers.
+
+    Given ``decoder_block_specs``, a scoped entry matches only modules under
+    that child, so a sibling that reuses the same layer class is left alone; a
+    bare entry still matches anywhere. The rule mirrors
+    ``_is_fsdp_wrap_target``, so the wrap plan and the compile plan agree on
+    what a block is.
     """
+
+    if decoder_block_specs is not None:
+        class_name = type(module).__name__
+        return any(
+            name == class_name and (scope is None or _under_scope(fqn, scope)) for name, scope in decoder_block_specs
+        )
 
     if decoder_block_class_names is None:
         decoder_block_class_names = _decoder_block_class_names(module)
     return type(module).__name__ in decoder_block_class_names
+
+
+def _under_scope(fqn: Optional[str], scope: str) -> bool:
+    """Whether ``fqn`` is ``scope`` itself or a descendant of it."""
+    if fqn is None:
+        return False
+    return fqn == scope or fqn.startswith(scope + ".")
 
 
 def validate_compile_config_for_fsdp2(compile_config: CompileConfig, enable_reshard_after_forward: bool) -> None:
@@ -211,7 +306,13 @@ def _reject_incompatible_ops(model: nn.Module) -> None:
 
 
 def _uncompilable_at(config, *, prefix: str) -> list[str]:
-    """Collect offending selections on ``config`` and every sub-config below it."""
+    """Collect offending selections on ``config`` and every sub-config below it.
+
+    A SeedOmni composed ``OmniConfig`` files its children in ``_module_configs``
+    rather than ``sub_configs`` (the latter describes one HF model's nesting), so
+    both are walked — otherwise a child's ``torchao_mxfp4`` selection would never
+    be seen and would fail at runtime instead, inside Inductor.
+    """
     if config is None:
         return []
     found = [f"{prefix}{item}" for item in _uncompilable_selections(getattr(config, "ops_config", None))]
@@ -219,6 +320,8 @@ def _uncompilable_at(config, *, prefix: str) -> list[str]:
         child = getattr(config, name, None)
         if child is not None:
             found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
+    for name, child in (getattr(config, "_module_configs", None) or {}).items():
+        found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
     return found
 
 
@@ -227,12 +330,18 @@ def compile_decoder_blocks(
     compile_config: CompileConfig,
     sequence_parallel_enabled: bool = False,
     async_enabled: bool = False,
+    scopes: Optional[Collection[str]] = None,
 ) -> int:
     """Compile forward of every decoder block inside ``model`` in place.
 
     Compiling the forward method (rather than wrapping the whole module)
     preserves module identity for FSDP2 — pre/post-forward all-gather and
     reshard hooks stay outside the compiled region.
+
+    ``scopes`` narrows the set to blocks under those children. A SeedOmni
+    composed model passes the modules that opted into ``torch.compile``, so a
+    sibling that did not opt in keeps running eagerly inside the same run.
+    ``None`` keeps every declared decoder block.
     """
 
     if not hasattr(torch, "compile"):
@@ -257,10 +366,15 @@ def compile_decoder_blocks(
             )
         compile_kwargs["mode"] = compile_config.mode
 
-    decoder_block_class_names = _decoder_block_class_names(model)
+    # ``scopes`` implies a SeedOmni run, where a module's blocks are named
+    # whatever its family calls them and the per-module flag decides who is
+    # compiled. Without it, keep the HF convention of ``*DecoderLayer`` only.
+    decoder_block_specs = _decoder_block_specs(model, all_classes=scopes is not None)
     compiled = 0
     for fqn, module in model.named_modules():
-        if not _is_decoder_block(module, decoder_block_class_names):
+        if not _is_decoder_block(module, fqn=fqn, decoder_block_specs=decoder_block_specs):
+            continue
+        if scopes is not None and not any(_under_scope(fqn, scope) for scope in scopes):
             continue
         if getattr(module, "_veomni_forward_compiled", False):
             continue

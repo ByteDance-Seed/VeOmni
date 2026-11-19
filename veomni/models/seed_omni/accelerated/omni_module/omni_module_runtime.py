@@ -67,6 +67,32 @@ def composed_model_owns_wrap(accelerator: "AcceleratorConfig") -> bool:
     return fsdp_config.fsdp_scope == "model" and fsdp_config.fsdp_mode != "eager"
 
 
+def module_compile_config(accelerator: "AcceleratorConfig", module: nn.Module):
+    """``CompileConfig`` for one module, disabled unless the module opts in.
+
+    ``accelerator.torch_compile.enable`` is the run-wide switch;
+    :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile`
+    is the per-module gate. Both must be on, so a module whose compile path has
+    not been measured simply never reaches ``compile_decoder_blocks`` — it still
+    trains, just eagerly.
+
+    Returned with ``enable=False`` rather than as ``None`` so the caller keeps
+    one code path: ``compile_decoder_blocks`` is still handed a config, it just
+    finds nothing enabled and returns without wrapping anything.
+    """
+    from .....distributed.torch_compile import CompileConfig
+
+    run_config = accelerator.torch_compile
+    supported = bool(getattr(module, "supports_torch_compile", False))
+    return CompileConfig(
+        enable=bool(run_config.enable) and supported,
+        backend=run_config.backend,
+        mode=run_config.mode,
+        fullgraph=run_config.fullgraph,
+        dynamic=run_config.dynamic,
+    )
+
+
 class ModuleRuntime(VeOmniModelRuntime):
     """One OmniModule's training unit (model + optimizer + lr_scheduler + FSDP2).
 
@@ -394,6 +420,17 @@ class ModuleRuntime(VeOmniModelRuntime):
             )
             return
         logger.info_rank0(f"ModuleRuntime '{label}': bound module assets.")
+
+    def _compile_config(self):
+        """This module's ``CompileConfig``: the run switch intersected with the module's opt-in.
+
+        ``accelerator.torch_compile.enable`` alone is not enough on a composed
+        model: modules differ in whether Inductor helps at all, so each declares
+        :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile`
+        and a module that leaves it ``False`` stays eager even in a
+        compile-enabled run.
+        """
+        return module_compile_config(self.args.accelerator, self.model)
 
     def _freeze_model_module(self) -> None:
         """Freeze + LoRA this module, heading the base's report with its name.

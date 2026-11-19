@@ -270,6 +270,118 @@ def test_compile_decoder_blocks_uses_no_split_modules(monkeypatch):
     assert calls == [{"fullgraph": True, "dynamic": False, "backend": "inductor"}]
 
 
+def test_compile_decoder_blocks_matches_a_scoped_no_split_entry(monkeypatch):
+    """A SeedOmni composed model scopes each entry to its child (``child.Class``).
+
+    ``_scoped_no_split_modules`` rewrites the composed ``OmniModel``'s
+    ``_no_split_modules`` to ``{child}.{ClassName}``, so the entry no longer
+    equals ``type(module).__name__``.
+    """
+
+    class ComposedModel(nn.Module):
+        _no_split_modules = ["llama.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llama = nn.Module()
+            self.llama.layers = nn.ModuleList([ToyDecoderLayer(), ToyDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    model = ComposedModel()
+    assert compile_decoder_blocks(model, CompileConfig()) == 2
+
+
+def test_compile_decoder_blocks_honours_compile_scopes(monkeypatch):
+    """``scopes`` compiles only the children that opted into torch.compile.
+
+    A composed model is one tree and one compile call, so the per-module opt-in
+    has to narrow the block set here rather than at the call site.
+    """
+
+    class ComposedModel(nn.Module):
+        _no_split_modules = ["llm.ToyDecoderLayer", "vision.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llm = nn.Module()
+            self.llm.layers = nn.ModuleList([ToyDecoderLayer(), ToyDecoderLayer()])
+            self.vision = nn.Module()
+            self.vision.layers = nn.ModuleList([ToyDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    model = ComposedModel()
+    compiled = compile_decoder_blocks(model, CompileConfig(enable=True), scopes=["llm"])
+
+    assert compiled == 2
+    assert all(block._veomni_forward_compiled for block in model.llm.layers)
+    assert not getattr(model.vision.layers[0], "_veomni_forward_compiled", False)
+
+
+def test_compile_decoder_blocks_with_empty_scopes_compiles_nothing(monkeypatch):
+    """A run where no module opted in compiles nothing instead of raising.
+
+    ``compile_decoder_blocks`` is only reached with ``enable=True``; the caller
+    clears the flag when no module declares support.
+    """
+
+    class ComposedModel(nn.Module):
+        _no_split_modules = ["llm.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llm = nn.Module()
+            self.llm.layers = nn.ModuleList([ToyDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+    assert compile_decoder_blocks(ComposedModel(), CompileConfig(enable=True), scopes=[]) == 0
+
+
+def test_compile_decoder_blocks_scopes_accept_non_decoder_block_names(monkeypatch):
+    """A SeedOmni module names its own blocks; the scope, not the spelling, gates them.
+
+    ``JanusVqvae`` lists ``JanusVQVAEAttnBlock`` in ``_no_split_modules``. Under a
+    scope that entry has to be compilable, because the module's
+    ``supports_torch_compile`` flag already decided it may be.
+    """
+
+    class JanusVQVAEAttnBlock(nn.Module):
+        def forward(self, x):
+            return x
+
+    class CodecModel(nn.Module):
+        _no_split_modules = ["vqvae.JanusVQVAEAttnBlock"]
+
+        def __init__(self):
+            super().__init__()
+            self.vqvae = nn.Module()
+            self.vqvae.blocks = nn.ModuleList([JanusVQVAEAttnBlock()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+    assert compile_decoder_blocks(CodecModel(), CompileConfig(enable=True), scopes=["vqvae"]) == 1
+
+
+def test_compile_decoder_blocks_without_scopes_keeps_decoder_layers_only(monkeypatch):
+    """The unscoped path keeps the HF convention: only ``*DecoderLayer`` is compiled."""
+
+    class SomeVisionBlock(nn.Module):
+        def forward(self, x):
+            return x
+
+    class MixedModel(nn.Module):
+        _no_split_modules = ["ToyDecoderLayer", "SomeVisionBlock"]
+
+        def __init__(self):
+            super().__init__()
+            self.decoder = ToyDecoderLayer()
+            self.vision = SomeVisionBlock()
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+    compiled = compile_decoder_blocks(MixedModel(), CompileConfig(enable=True))
+    assert compiled == 1
+
+
 def test_compile_decoder_blocks_rejects_unvalidated_multimodal_model(monkeypatch):
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
 

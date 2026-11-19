@@ -483,6 +483,27 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 
 `model.accelerator.torch_compile.*` — Per-block `torch.compile` options for text training and dense Qwen3-VL training. Both paths require FSDP2 on CUDA, `train.dyn_bsz=True`, and `train.pad_to_length=True`, so packed token tensors have stable shapes. For Qwen3-VL, only `Qwen3VLTextDecoderLayer` forwards are compiled; the vision tower, DeepStack injection, and language-model head remain eager. Different packed FlashAttention boundaries can produce separate Inductor specializations, so Qwen3-VL currently requires the default `backend="inductor"` and `mode=None` without CUDA Graph replay, `model.accelerator.torch_compile.dynamic=False`, `model.accelerator.ulysses_size=1`, `model.accelerator.cp_size=1`, and `model.accelerator.enable_async=False`. Qwen3-VL-MoE, ExtraParallel, DDP, non-FSDP, NPU, and other multimodal models remain unsupported and fail explicitly.
 
+#### SeedOmni: per-module opt-in
+
+SeedOmni compiles a module only when **two** switches are on:
+
+1. `model.accelerator.torch_compile.enable` — the run-wide switch, validated like any other accelerator field;
+2. the module's `supports_torch_compile = True` class attribute in its `modeling.py`.
+
+The second gate exists because compile pays off by module, not by model. Measured on A100-80GB per module (forward+backward, `backend="inductor"`, `dynamic=False`):
+
+| module | speedup |
+| --- | --- |
+| `qwen3_llm` / `qwen3vl_llm` | ~1.58x |
+| `janus_vqvae` | ~1.74x |
+| `janus_llama` | ~1.32x |
+| `janus_siglip` | ~1.12x |
+| `bagel_siglip_navit` | ~1.02x (stays `False`) |
+
+A module that leaves the flag `False` trains eagerly inside the same run: under `fsdp_scope='model'` the composed `OmniModel` is compiled once, and only the opted-in children contribute block scopes. A run that enables compile with no opted-in module logs that and compiles nothing rather than failing.
+
+CUDA Graph replay and sequence parallelism stay refused under SeedOmni (`backend='cudagraphs'` / `mode='reduce-overhead'` / `ulysses_size>1` / `cp_size>1` / `enable_async`): replay needs one `cudagraph_mark_step_begin()` per micro-batch across the composed graph, which `OmniTrainer` does not make, and Ulysses slices activations the graph edges reorder.
+
 The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `model.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
 
 | Field | Type | Default | Description |

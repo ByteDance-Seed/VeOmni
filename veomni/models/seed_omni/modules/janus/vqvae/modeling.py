@@ -274,6 +274,9 @@ class JanusVqvae(InferenceMixin, PretrainedOmniModule):
     _supports_sdpa = True
     _supports_flash_attn = True
     _supports_flex_attn = True
+    # Measured ~1.74x: 37 conv/attention blocks, where eager launch overhead
+    # dominates. The largest win of any SeedOmni module.
+    supports_torch_compile = True
 
     def __init__(self, config: JanusVqvaeConfig):
         super().__init__(config)
