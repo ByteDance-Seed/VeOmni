@@ -2370,14 +2370,14 @@ def test_gpt_oss_eager_ep_math_matches_the_hf_loop(ep_size):
     gate/up layout and the clamped activation are GPT-OSS's own, so the per-rank math
     stays in `gpt_oss/eager.py` and only the plumbing is shared.
 
-    The oracle is HF's `GptOssExperts` over the same permuted rows, which pins the
-    interleaved slicing (not `chunk(2, -1)`) and the post-`down` routing order.
+    The oracle is HF's `GptOssExperts` itself, run once per local expert over the rows
+    that expert owns. That pins the interleaved `[..., ::2]` slicing, which side of the
+    clamp each half takes, and `alpha` -- a restated formula in the test would not.
     """
     from veomni.ops.kernels.moe_experts.gpt_oss import eager as gpt_oss_eager
 
     torch.manual_seed(0)
-    experts, hidden, intermediate, tokens, top_k = 4, 16, 32, 8, 2
-    rows = tokens * top_k
+    experts, hidden, intermediate, rows = 4, 16, 32, 16
     routed = torch.randn(rows, hidden)
     # Right-multiplied layout, as the model builds it: [E, H, 2I] and [E, I, H].
     gate_up = torch.randn(experts, hidden, 2 * intermediate)
@@ -2385,25 +2385,30 @@ def test_gpt_oss_eager_ep_math_matches_the_hf_loop(ep_size):
     down = torch.randn(experts, intermediate, hidden)
     down_bias = torch.randn(experts, hidden)
 
-    # Even split, plus an empty expert to exercise a zero-length slice.
-    per = rows // experts
-    cumsum = torch.tensor([per * (i + 1) for i in range(experts)], dtype=torch.long)
-    cumsum[-1] = rows
+    # Expert 1 owns no rows, so its slice is zero-length and contributes nothing.
+    cumsum = torch.tensor([5, 5, 11, 16], dtype=torch.long)
 
     expected = torch.empty_like(routed)
-    starts = torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
+    row_starts = torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
+    units = torch.ones(1, 1)
     for e in range(experts):
-        s, t = int(starts[e]), int(cumsum[e])
-        state = routed[s:t]
-        gate_up_e = state @ gate_up[e] + gate_up_bias[e]
-        gate = gate_up_e[..., ::2].clamp(max=7.0)
-        up = gate_up_e[..., 1::2].clamp(min=-7.0, max=7.0)
-        expected[s:t] = ((up + 1) * (gate * torch.sigmoid(gate * 1.702))) @ down[e] + down_bias[e]
+        s, t = int(row_starts[e]), int(cumsum[e])
+        if t == s:
+            continue  # an empty expert: HF would be called with zero rows
+        # One expert, routing weight 1.0, so HF returns that expert's contribution.
+        oracle, _ = _gpt_oss_hf_loop(
+            routed[s:t],
+            units.expand(t - s, 1),
+            torch.zeros((t - s, 1), dtype=torch.long),  # local id 0 in the 1-expert slice
+            gate_up[e : e + 1],
+            gate_up_bias[e : e + 1],
+            down[e : e + 1],
+            down_bias[e : e + 1],
+            num_experts=1,
+        )
+        expected[s:t] = oracle
 
     per_rank = experts // ep_size
-    # Each rank gets the rows its local experts were assigned, then reports a cumsum
-    # local to that shard -- which is what `token_pre_all2all` delivers.
-    row_starts = torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
     pieces = [
         gpt_oss_eager._GptOssExpertMathEP.apply(
             routed[int(row_starts[rank * per_rank]) : int(cumsum[(rank + 1) * per_rank - 1])],
@@ -2417,7 +2422,55 @@ def test_gpt_oss_eager_ep_math_matches_the_hf_loop(ep_size):
         )
         for rank in range(ep_size)
     ]
-    torch.testing.assert_close(torch.cat(pieces, dim=0), expected, rtol=1e-5, atol=1e-6)
+    got = torch.cat(pieces, dim=0)
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
+    # The empty expert contributed exactly nothing, and its rows stayed put.
+    assert int(cumsum[1] - cumsum[0]) == 0
+    torch.testing.assert_close(got[5:5], expected[5:5])
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_gpt_oss_eager_wrapper_reaches_the_ep_branch():
+    """The EP branch of `wrapper` must actually be taken, not just reachable in theory.
+
+    The numeric test above calls the math class directly, so it cannot catch a wrapper
+    that forgets to dispatch -- which is the exact shape of the bug this fixed. Here the
+    collectives are stubbed and the branch is asserted through its output.
+    """
+    from unittest import mock
+
+    from veomni.distributed.moe import moe_layer
+    from veomni.ops.kernels.moe_experts.gpt_oss import eager as gpt_oss_eager
+
+    torch.manual_seed(0)
+    experts, hidden, intermediate, rows = 4, 8, 16, 6
+    called: dict[str, int] = {}
+
+    def fake_dispatch(ep_class, num_experts, routing_weights, *args, **kwargs):
+        """Record the dispatch and run the math on the local shard."""
+        called["dispatch"] = num_experts
+        called["routing_dtype"] = routing_weights.dtype
+        return torch.zeros(rows, hidden)
+
+    with mock.patch.object(gpt_oss_eager, "expert_parallel_size", lambda: 2):
+        with mock.patch.object(moe_layer, "dispatch_to_ep_class", fake_dispatch):
+            import veomni.distributed.moe as moe_pkg
+
+            with mock.patch.object(moe_pkg, "dispatch_to_ep_class", fake_dispatch):
+                out = gpt_oss_eager.wrapper(
+                    torch.randn(rows, hidden, dtype=torch.bfloat16),
+                    torch.ones(rows, 1, dtype=torch.float32),
+                    torch.zeros(rows, 1, dtype=torch.long),
+                    torch.randn(experts // 2, hidden, 2 * intermediate, dtype=torch.bfloat16),
+                    torch.randn(experts // 2, 2 * intermediate, dtype=torch.bfloat16),
+                    torch.randn(experts // 2, intermediate, hidden, dtype=torch.bfloat16),
+                    torch.randn(experts // 2, hidden, dtype=torch.bfloat16),
+                    num_experts=experts,
+                )
+
+    assert called.get("dispatch") == experts, "the EP branch was not taken"
+    assert called["routing_dtype"] == torch.bfloat16, "routing weights were not cast before dispatch"
+    assert out.shape == (rows, hidden)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

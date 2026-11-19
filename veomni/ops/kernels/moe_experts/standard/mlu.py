@@ -23,6 +23,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from .....distributed.moe import cumsum_to_counts
 from .....distributed.parallel_state import get_parallel_state
 from ..shared.activation import is_silu
 from ..shared.swiglu import apply_swiglu_clamp
@@ -41,7 +42,7 @@ class MLUGroupGemm(torch.autograd.Function):
     @staticmethod
     def forward(ctx, permute_tokens, cumsum, fc1_1_weight, fc1_2_weight, fc2_weight, swiglu_limit=None):
         """Permute tokens through split fc1, SwiGLU, and fc2."""
-        batch_sizes = torch.cat([cumsum[:1], cumsum[1:] - cumsum[:-1]])
+        batch_sizes = cumsum_to_counts(cumsum)
         fc1_1_output = _apex_gmm(
             a=permute_tokens, b=fc1_1_weight, batch_sizes=batch_sizes, trans_a=False, trans_b=True
         )
@@ -83,7 +84,7 @@ class MLUGroupGemm(torch.autograd.Function):
             mask_fc1_2,
         ) = ctx.saved_tensors
         swiglu_limit = ctx.swiglu_limit
-        batch_sizes = torch.cat([cumsum[:1], cumsum[1:] - cumsum[:-1]])
+        batch_sizes = cumsum_to_counts(cumsum)
         grad_fc1_output = _apex_gmm(a=grad_output, b=fc2_weight, batch_sizes=batch_sizes, trans_a=False, trans_b=False)
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
         fc1_output = fc1_1_activation * fc1_2_output
@@ -133,7 +134,7 @@ class MLUMergedFc1GroupGemm(torch.autograd.Function):
         """Permute tokens through merged fc1, SwiGLU, and fc2."""
         if fc1_1_2_weight.shape[1] % 2 != 0:
             raise ValueError(f"Merged fc1_1_2_weight dim 1 must be even, got {fc1_1_2_weight.shape[1]}")
-        batch_sizes = torch.cat([cumsum[:1], cumsum[1:] - cumsum[:-1]])
+        batch_sizes = cumsum_to_counts(cumsum)
         fc1_output = _apex_gmm(
             a=permute_tokens, b=fc1_1_2_weight, batch_sizes=batch_sizes, trans_a=False, trans_b=True
         )
@@ -173,7 +174,7 @@ class MLUMergedFc1GroupGemm(torch.autograd.Function):
         swiglu_limit = ctx.swiglu_limit
         fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
         fc1_result = fc1_1_activation * fc1_2_output
-        batch_sizes = torch.cat([cumsum[:1], cumsum[1:] - cumsum[:-1]])
+        batch_sizes = cumsum_to_counts(cumsum)
         grad_fc1_result = _apex_gmm(a=grad_output, b=fc2_weight, batch_sizes=batch_sizes, trans_b=False)
         grad_fc2_weight = None
         if fc2_weight.requires_grad:

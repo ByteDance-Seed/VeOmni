@@ -136,7 +136,7 @@ def merged_experts_act_fn_forward(
         from .....distributed.moe import dispatch_to_ep_class
 
         ep_size = expert_parallel_size()
-        if ep_size <= 1 or local_experts != num_experts // ep_size:
+        if ep_size <= 1 or num_experts % ep_size or local_experts * ep_size != num_experts:
             raise ValueError(
                 "the expert reference loop received expert-parallel sharded weights "
                 f"(local {local_experts} vs global {num_experts}). Enable expert "

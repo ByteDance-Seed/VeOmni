@@ -88,6 +88,12 @@ def token_pre_all2all(
     global_permuted_hidden_states = all_to_all(ep_group, local_permuted_hidden_states, output_splits, input_splits)
 
     # group tokens together by expert
+    #
+    # No explicit device sync is needed before this line, and it must not be added: the
+    # ``.tolist()`` calls above (``input_splits``, and ``num_global_tokens_per_local_expert``
+    # below) already force a host round-trip that drains the queued collectives. The
+    # Ascend path this replaced had a ``stream_synchronize()`` because it computed its
+    # per-expert counts from device tensors without leaving the device.
     num_local_experts = num_experts // ep_group.size()
     permute_order = torch.arange(num_experts).reshape(-1, num_local_experts).T.ravel().tolist()
     global_permuted_hidden_states = sort_chunks_by_idxs(
@@ -97,6 +103,18 @@ def token_pre_all2all(
     )
 
     return global_permuted_hidden_states, routing_map, local_input_permutation_mapping, org_hidden_states_shape
+
+
+def cumsum_to_counts(cumsum: torch.Tensor) -> torch.Tensor:
+    """Turn the cumulative expert bounds into per-expert row counts.
+
+    ``dispatch_to_ep_class`` hands its ``ep_class`` a **cumsum**, but several grouped
+    kernels want per-group sizes instead -- ``npu_group_gemm`` pins
+    ``group_list_type=1``, and ``GroupedLayout.from_counts`` says so in its name. This is
+    that conversion, kept in one place so the contract has a single encoding rather than
+    one per kernel.
+    """
+    return cumsum - torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
 
 
 def dispatch_to_ep_class(

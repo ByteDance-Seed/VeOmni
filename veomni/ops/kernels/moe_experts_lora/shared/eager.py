@@ -133,7 +133,7 @@ def wrapper(
         # Same validation the non-LoRA reference row does: an EP state with weights
         # that were never sharded would be indexed with a local expert count against a
         # global routing map, so name the problem instead of raising a shape mismatch.
-        if fc1_1_2_weight.shape[0] != num_experts // ep_size:
+        if num_experts % ep_size or fc1_1_2_weight.shape[0] * ep_size != num_experts:
             raise ValueError(
                 "MoE-LoRA (shared, eager) received expert-parallel weights that are not "
                 f"sharded as expected (local {fc1_1_2_weight.shape[0]} vs global "

@@ -131,7 +131,7 @@ def wrapper(
     if ep_size > 1:
         # As in the shared variant and the non-LoRA reference row: verify the weights
         # really are sharded before indexing them with local expert ids.
-        if fc1_1_2_weight.shape[0] != num_experts // ep_size:
+        if num_experts % ep_size or fc1_1_2_weight.shape[0] * ep_size != num_experts:
             raise ValueError(
                 "MoE-LoRA (independent, eager) received expert-parallel weights that are "
                 f"not sharded as expected (local {fc1_1_2_weight.shape[0]} vs global "

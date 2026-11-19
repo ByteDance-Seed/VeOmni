@@ -798,9 +798,9 @@ raise during config validation or op binding.
 The table above lists the **`standard`** variant's rows, which serve every MoE model in
 this repository. The `gpt_oss` variant registers its own `eager` and `fused_quack`
 rows instead, because GPT-OSS interleaves gate and up in one tensor and clamps them
-before a sigmoid gate. Both of those rows dispatch for EP as well; `gpt_oss`'s
-per-rank math stays local to `gpt_oss/eager.py` because of that layout, but the
-all-to-all plumbing is the same `dispatch_to_ep_class` call.
+before a sigmoid gate. Both of those rows dispatch for EP through the same
+`dispatch_to_ep_class` as everything else; only their per-rank math stays local to
+`gpt_oss/`, because that interleaved layout is GPT-OSS's own.
 
 Patched experts modules construct `VeomniOp("moe_experts", variant, config.ops_config.moe_implementation)`
 in `__init__` and always call that handle. On both variants `eager` is a registered row,

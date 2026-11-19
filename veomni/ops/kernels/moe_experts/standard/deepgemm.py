@@ -13,6 +13,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from .....distributed.moe import cumsum_to_counts
 from .....distributed.parallel_state import get_parallel_state
 from ..shared.activation import is_silu
 
@@ -33,7 +34,7 @@ def _deepgemm_expert_math(tokens, cumsum, fc1, fc2, swiglu_limit, recompute_weig
     the running total back out. Everything else is unchanged: the grouped FP8 GEMMs
     and ``RecomputedSwiGLU`` own their autograd nodes.
     """
-    counts = cumsum - torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
+    counts = cumsum_to_counts(cumsum)
     return _experts(tokens, counts, fc1, fc2, swiglu_limit, recompute_weights)
 
 

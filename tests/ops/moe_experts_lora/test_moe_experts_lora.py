@@ -440,7 +440,19 @@ def test_npu_ep_matches_nonep_single_rank(variant, _single_rank_dist):
             **_SCALES,
         )
         if ep:
-            out = _npu_ep_fused_lora_moe_forward(ep_group=None, **kwargs)
+            # The EP path reads the group from the parallel state now, so a bare
+            # `ep_group=None` no longer selects "single rank, no EP" -- it never reaches
+            # the group at all. Build a real one-rank EP state instead.
+            from veomni.distributed.parallel_state import (
+                _init_parallel_state,
+                get_parallel_state,
+                use_parallel_state,
+            )
+
+            if get_parallel_state().extra_parallel_sizes.get("ep", 1) != 1:
+                raise AssertionError("the single-rank NPU test expects ep_size 1")
+            with use_parallel_state(_init_parallel_state(dp_size=1, extra_parallel_sizes=(1,), name="npu_ep")):
+                out = _npu_ep_fused_lora_moe_forward(**kwargs)
         else:
             out = _npu_fused_lora_moe_forward(**kwargs)
         return out, (h, routing, fc1, fc2, *(lora[key] for key in _LORA_KEYS))
@@ -805,3 +817,95 @@ def test_lora_eager_ep_math_matches_the_non_ep_loop(mode, ep_size):
         expected[s:t] = F.linear(mid, fc2[e]) + lora_down
 
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_npu_lora_ep_math_applies_both_deltas_between_the_gemms(monkeypatch):
+    """The Ascend LoRA expert math must add each delta at the right seam.
+
+    `_NpuLoRADeltasEP` is the only place the LoRA adapters meet the Ascend grouped
+    GEMMs, and it cannot run without torch_npu, so it had no test at all. Stub the two
+    kernels and assert the order: `gate_up + gate_up_delta` -> `swiglu` ->
+    `down + down_delta`. A delta added on the wrong side of `swiglu` would train a
+    different function while every shape still lined up.
+    """
+    import sys
+    import types
+
+    import torch
+
+    from veomni.ops.kernels.moe_experts.standard import npu as std_npu
+    from veomni.ops.kernels.moe_experts_lora import helper
+
+    calls: list[str] = []
+
+    npu_mod = types.ModuleType("torch_npu")
+
+    def swiglu(x, dim=-1):
+        """Record the activation and halve the last dim."""
+        calls.append("swiglu")
+        return x[..., : x.shape[-1] // 2]
+
+    npu_mod.npu_swiglu = swiglu
+    monkeypatch.setitem(sys.modules, "torch_npu", npu_mod)
+
+    def group_gemm(a, b, counts):
+        """Record the GEMM and return the width ``b`` implies, so the deltas line up."""
+        calls.append("gemm")
+        return torch.zeros(a.shape[0], b.shape[-1])
+
+    monkeypatch.setattr(std_npu, "npu_group_gemm", group_gemm)
+
+    hidden, intermediate, experts = 4, 8, 2
+    tokens = torch.randn(6, hidden)
+    fc1 = torch.randn(experts, 2 * intermediate, hidden)
+    fc2 = torch.randn(experts, hidden, intermediate)
+    cumsum = torch.tensor([3, 6], dtype=torch.long)
+
+    def gate_up_delta(x, counts):
+        """Record the gate/up delta seam."""
+        calls.append("gate_up_delta")
+        return torch.ones(x.shape[0], 2 * intermediate)
+
+    def down_delta(mid, counts):
+        """Record the down delta seam."""
+        calls.append("down_delta")
+        return torch.ones(mid.shape[0], hidden)
+
+    out = helper._NpuLoRADeltasEP.apply(tokens, cumsum, fc1, fc2, gate_up_delta, down_delta)
+
+    assert calls == ["gemm", "gate_up_delta", "swiglu", "gemm", "down_delta"], (
+        f"delta seams are in the wrong order: {calls}"
+    )
+    assert out.shape == tokens.shape
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_npu_lora_ep_math_keeps_an_empty_rank_on_the_graph():
+    """A rank with no dispatched tokens must still produce a grad-carrying output."""
+    import sys
+    import types
+
+    import torch
+
+    from veomni.ops.kernels.moe_experts.standard import npu as std_npu
+    from veomni.ops.kernels.moe_experts_lora import helper
+
+    npu_mod = types.ModuleType("torch_npu")
+    npu_mod.npu_swiglu = lambda x, dim=-1: x[..., : x.shape[-1] // 2]
+    sys.modules["torch_npu"] = npu_mod
+    try:
+        original = std_npu.npu_group_gemm
+        std_npu.npu_group_gemm = lambda a, b, counts: torch.zeros(a.shape[0], b.shape[-1])
+        tokens = torch.zeros(0, 4, requires_grad=True)
+        out = helper._NpuLoRADeltasEP.apply(
+            tokens,
+            torch.tensor([0], dtype=torch.long),
+            torch.randn(1, 16, 4),
+            torch.randn(1, 4, 8),
+            lambda x, c: torch.zeros(x.shape[0], 16),
+            lambda x, c: torch.zeros(x.shape[0], 4),
+        )
+        assert out.requires_grad, "an empty rank detached from the graph"
+    finally:
+        std_npu.npu_group_gemm = original

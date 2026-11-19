@@ -98,7 +98,9 @@ def wrapper(
     if ep_size > 1:
         from .....distributed.moe import dispatch_to_ep_class
 
-        if gate_up_proj.shape[0] != num_experts // ep_size:
+        if num_experts % ep_size or gate_up_proj.shape[0] * ep_size != num_experts:
+            # Multiply back rather than compare against a floored quotient: an uneven
+            # split would make `num_experts // ep_size` pass for the wrong shard.
             raise ValueError(
                 "GPT-OSS eager experts received expert-parallel weights that are not sharded "
                 f"as expected (local {gate_up_proj.shape[0]} vs global {num_experts} over "

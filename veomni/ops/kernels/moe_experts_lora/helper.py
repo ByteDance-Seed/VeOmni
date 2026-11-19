@@ -31,17 +31,6 @@ GateUpDelta = Callable[[Tensor, Tensor], Tensor]
 DownDelta = Callable[[Tensor, Tensor], Tensor]
 
 
-def _counts_from_cumsum(cumsum: Tensor) -> Tensor:
-    """Turn the shared helper's cumulative bounds into per-expert row counts.
-
-    ``dispatch_to_ep_class`` hands over a cumsum, but ``npu_group_gemm`` pins
-    ``group_list_type=1`` -- per-group sizes, whose sum must equal the row count. The
-    non-LoRA ``_npu_expert_math`` subtracts the running total back out for the same
-    reason, as does ``MLUGroupGemm`` internally.
-    """
-    return cumsum - torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
-
-
 class _NpuLoRADeltasEP:
     """NPU grouped GEMMs with caller-supplied LoRA deltas, on dispatched tokens.
 
@@ -66,9 +55,10 @@ class _NpuLoRADeltasEP:
         """Run both grouped GEMMs with the LoRA deltas added between them."""
         import torch_npu
 
+        from ....distributed.moe import cumsum_to_counts
         from ..moe_experts.standard.npu import npu_group_gemm
 
-        counts = _counts_from_cumsum(cumsum)
+        counts = cumsum_to_counts(cumsum)
         gate_up = npu_group_gemm(permute_tokens, fc1_1_2_weight.transpose(1, 2), counts)
         gate_up = gate_up + gate_up_delta(permute_tokens, counts)
         intermediate = torch_npu.npu_swiglu(gate_up, dim=-1)
