@@ -369,7 +369,7 @@ A missing module or method still fails before the first request runs.
   [the writer opens after the trainer state is restored](../../../tests/seed_omni/trainer/test_omni_trainer.py#L210), and
   [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L233).
 - [`tests/checkpoints/test_checkpoint_callback.py`](../../../tests/checkpoints/test_checkpoint_callback.py):
-  [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L762).
+  [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L683).
 - [`tests/checkpoints/test_dcp_checkpointer.py`](../../../tests/checkpoints/test_dcp_checkpointer.py):
   [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2805).
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
