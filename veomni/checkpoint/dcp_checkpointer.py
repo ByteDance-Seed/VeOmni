@@ -120,8 +120,7 @@ def _apply_extra_parallel_dim(
 
     * ``"exact"`` (model): the state-dict key IS the FQN,
       e.g. ``"model.layers.0.mlp.experts.gate_proj"``.
-    * ``"substring"`` (optimizer): the state-dict key contains the FQN
-      with extra prefix/suffix, e.g.
+    * ``"substring"`` (optimizer): the key starts with ``state.<FQN>.``, e.g.
       ``"state.model.layers.0.mlp.experts.gate_proj.exp_avg"``.
 
     Non-tensor values and 0-D tensors are skipped unconditionally — they
@@ -138,12 +137,18 @@ def _apply_extra_parallel_dim(
     extra_parallel_keys = list(extra_parallel_fqn2spec_info.keys()) if key_match == "substring" else None
 
     for name in sorted(state_dict.keys()):
+        tensor = state_dict[name]
+        if not torch.is_tensor(tensor) or tensor.ndim == 0:
+            continue
+
         if key_match == "exact":
             if name not in extra_parallel_fqn2spec_info:
                 continue
             spec_info = extra_parallel_fqn2spec_info[name]
         else:  # "substring"
-            matches = [k for k in extra_parallel_keys if k in name]
+            # Anchor the optimizer namespace: a nested parameter may end with
+            # another parameter's FQN. Param-group fields are not tensor state.
+            matches = [k for k in extra_parallel_keys if name.startswith(f"state.{k}.")]
             if not matches:
                 continue
             assert len(matches) == 1, f"Ambiguous ExtraParallel spec match for state key '{name}': {matches}"
@@ -159,12 +164,6 @@ def _apply_extra_parallel_dim(
         if getattr(spec_info, "persistent_fsdp_shard_dim", None) is not None:
             continue
 
-        tensor = state_dict[name]
-        if not torch.is_tensor(tensor):
-            continue
-        if tensor.ndim == 0:
-            continue
-
         assert spec_info.para_fsdp_mesh is not None, f"ExtraParallel spec {name} must have an ExtraParallel FSDP mesh"
 
         # Drop the innermost ExtraParallel (e.g. ``ep``) dim and keep the FSDP
@@ -172,6 +171,16 @@ def _apply_extra_parallel_dim(
         # ``(ep_replicate, ep_fsdp)`` for HSDP. Mirrors the mesh slicing used
         # when sharding the module in ``torch_parallelize``.
         fsdp_submesh = spec_info.para_fsdp_mesh[spec_info.para_fsdp_mesh.mesh_dim_names[:-1]]
+        if (
+            action == "restore"
+            and key_match == "substring"
+            and not isinstance(tensor, DTensor)
+            and fsdp_submesh.size() > 1
+        ):
+            raise RuntimeError(
+                "Plain optimizer state on multiple ExtraParallel FSDP ranks has no proven replica layout; "
+                "use a rank-local optimizer checkpoint codec."
+            )
         # The ExtraParallel (e.g. ``ep``) dim shards the tensor along
         # ``spec_info.placement.dim`` (dim 0 for experts), while FSDP shards it
         # along ``spec_info.fsdp_shard_dim`` (1 by default, 0 for Muon zero-comm).
@@ -299,9 +308,10 @@ class OptimizerState(Stateful):
             MoE experts) in the checkpoint.
     """
 
-    def __init__(self, model, optimizer, parallel_state=None, *, load: bool = False):
+    def __init__(self, model, optimizer, parallel_state=None, *, load: bool = False, process_group=None):
         self.model = model
         self.optimizer = optimizer
+        self.process_group = process_group
         self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_extra_parallel_aware = (
@@ -314,12 +324,19 @@ class OptimizerState(Stateful):
             logger.info_rank0(
                 "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
             )
-            assert self.optimizer._is_multi_optimizer, (
-                "ExtraParallel is enabled but optimizer is not a MultiOptimizer instance"
-            )
-            vanilla_optim_sd = self.optimizer.state_dict()
-            optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
-                vanilla_optim_sd, "restore"
+            if not getattr(self.optimizer, "_is_multi_optimizer", False):
+                raise RuntimeError("ExtraParallel is enabled but optimizer is not a MultiOptimizer instance")
+
+            optim_sd_with_extra_parallel_dim, error = None, None
+            try:
+                vanilla_optim_sd = self.optimizer.state_dict()
+                optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
+                    vanilla_optim_sd, "restore"
+                )
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(
+                error, "preparing ExtraParallel optimizer checkpoint state", group=self.process_group
             )
             return optim_sd_with_extra_parallel_dim
 
@@ -371,6 +388,24 @@ class OptimizerState(Stateful):
         )
 
 
+def _from_local_preserve_device(local_tensor, device_mesh, placements, *, shape=None, stride=None):
+    """Wrap CPU optimizer shards without moving or changing their strides."""
+    if local_tensor.device.type != "cpu" or device_mesh.device_type == "cpu":
+        return DTensor.from_local(
+            local_tensor, device_mesh=device_mesh, placements=placements, run_check=False, shape=shape, stride=stride
+        )
+    wrapped = rewrap_dtensor_local(
+        local_tensor,
+        mesh=device_mesh,
+        placements=placements,
+        shape=shape,
+        stride=stride,
+    )
+    if wrapped.requires_grad != local_tensor.requires_grad:
+        wrapped = DTensor(local_tensor, wrapped._spec, requires_grad=local_tensor.requires_grad)
+    return wrapped
+
+
 def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh, fsdp_shard_dim: int = 1):
     """
     Drop ExtraParallel dims after loading from DCP so that ExtraParallel-FSDP would not be confused.
@@ -389,19 +424,21 @@ def drop_extra_parallel_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh
     """
 
     num_placements = len(loaded_tensor.placements)
-    if num_placements == 1:
+    has_fsdp_shard = any(not isinstance(p, Replicate) for p in loaded_tensor.placements[:-1])
+    if num_placements in (2, 3) and has_fsdp_shard:
+        ndim = loaded_tensor.ndim
+        if not -ndim <= fsdp_shard_dim < ndim:
+            raise RuntimeError("FSDP shard dimension is outside the tensor rank")
+        fsdp_shard_dim %= ndim
+    if num_placements == 1 or (num_placements in (2, 3) and not has_fsdp_shard):
         tensor_to_put = loaded_tensor.to_local()
     elif num_placements == 2:
-        tensor_to_put = rewrap_dtensor_local(
-            loaded_tensor._local_tensor,
-            mesh=device_mesh,
-            placements=[Shard(fsdp_shard_dim)],
+        tensor_to_put = _from_local_preserve_device(
+            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(fsdp_shard_dim)]
         )
     elif num_placements == 3:
-        tensor_to_put = rewrap_dtensor_local(
-            loaded_tensor._local_tensor,
-            mesh=device_mesh,
-            placements=[Replicate(), Shard(fsdp_shard_dim)],
+        tensor_to_put = _from_local_preserve_device(
+            loaded_tensor._local_tensor, device_mesh=device_mesh, placements=[Replicate(), Shard(fsdp_shard_dim)]
         )
     else:
         raise RuntimeError(
@@ -447,6 +484,11 @@ def restore_extra_parallel_dim(
     assert fsdp_mesh.ndim in (2, 3), f"global_mesh.ndim must be 2 or 3, got {fsdp_mesh.ndim}"
 
     if isinstance(orgin_tensor, DTensor):
+        ndim = orgin_tensor.ndim
+        if not (-ndim <= ep_shard_dim < ndim and -ndim <= fsdp_shard_dim < ndim):
+            raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
+        ep_shard_dim %= ndim
+        fsdp_shard_dim %= ndim
         # ExtraParallel+FSDP2. mesh order is (ep_fsdp, ep) or, for HSDP,
         # (ep_replicate, ep_fsdp, ep): ep_fsdp -> Shard(fsdp_shard_dim),
         # ep -> Shard(ep_shard_dim), ep_replicate -> Replicate().
@@ -459,21 +501,18 @@ def restore_extra_parallel_dim(
             placements = [Replicate(), fsdp_placement, Shard(ep_shard_dim)]
         else:
             placements = [fsdp_placement, Shard(ep_shard_dim)]
-        dtensor = rewrap_dtensor_local(
-            orgin_tensor._local_tensor,
-            mesh=fsdp_mesh,
-            placements=placements,
-        )
+        dtensor = _from_local_preserve_device(orgin_tensor._local_tensor, device_mesh=fsdp_mesh, placements=placements)
     elif torch.is_tensor(orgin_tensor):
-        # If there is no FSDP but only ExtraParallel. Use the helper here too:
-        # ``DTensor.from_local`` copies a host-resident local onto the mesh
-        # device, which would materialize the swap optimizer's host state on the
-        # accelerator during a save.
-        dtensor = rewrap_dtensor_local(
-            orgin_tensor,
-            mesh=extra_parallel_fsdp_mesh,
-            placements=[Shard(0)],
-        )
+        # Plain model tensors must be replicated across FSDP coordinates for
+        # the same ExtraParallel rank. Optimizer shards without that proof are
+        # rejected by the caller.
+        ndim = orgin_tensor.ndim
+        if not -ndim <= ep_shard_dim < ndim:
+            raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
+        if fsdp_mesh.mesh_dim_names is None:
+            raise RuntimeError("A plain ExtraParallel tensor requires named mesh dimensions")
+        placements = [Replicate()] * (fsdp_mesh.ndim - 1) + [Shard(ep_shard_dim % ndim)]
+        dtensor = _from_local_preserve_device(orgin_tensor, device_mesh=fsdp_mesh, placements=placements)
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
@@ -1005,6 +1044,7 @@ class DistributedCheckpointer(CheckpointerBase):
                 optimizer=state["optimizer"],
                 parallel_state=parallel_state,
                 load=True,
+                process_group=process_group,
             )
 
         wants_optimizer = state.get("optimizer") is not None

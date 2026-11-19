@@ -101,6 +101,8 @@ def test_parallelize_forwards_module_skip_decision(
                 forward_prefetch=False,
                 offload=False,
                 offload_pin_memory=False,
+                cpu_offload_extra_parallel_names=[],
+                cpu_offload_exclude_module_patterns=[],
                 low_precision_reduce_scatter_comm=False,
                 expert_weight_fp8_all_gather=expert_weight_fp8_all_gather,
                 expert_fsdp_shard_dim=0,
