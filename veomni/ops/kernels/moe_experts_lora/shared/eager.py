@@ -126,9 +126,20 @@ def wrapper(
     fused rows use; the adapters are replicated, so only the base weights are sharded.
     """
     from .....distributed.moe import dispatch_to_ep_class
-    from .....distributed.parallel_state import get_parallel_state
+    from .....ops.kernels.moe_experts.shared.act_fn_experts import expert_parallel_size
 
-    if get_parallel_state().extra_parallel_sizes.get("ep", 1) > 1:
+    ep_size = expert_parallel_size()
+    if ep_size > 1:
+        # Same validation the non-LoRA reference row does: an EP state with weights
+        # that were never sharded would be indexed with a local expert count against a
+        # global routing map, so name the problem instead of raising a shape mismatch.
+        if fc1_1_2_weight.shape[0] != num_experts // ep_size:
+            raise ValueError(
+                "MoE-LoRA (shared, eager) received expert-parallel weights that are not "
+                f"sharded as expected (local {fc1_1_2_weight.shape[0]} vs global "
+                f"{num_experts} over ep_size {ep_size}). Enable expert parallelism so "
+                "tokens are dispatched to local experts."
+            )
         return dispatch_to_ep_class(
             _SharedLoRAExpertMathEP,
             num_experts,

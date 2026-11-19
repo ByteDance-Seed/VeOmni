@@ -22,7 +22,7 @@ import torch
 from torch import Tensor, nn
 
 
-__all__ = ["merged_experts_act_fn_forward"]
+__all__ = ["expert_parallel_size", "merged_experts_act_fn_forward"]
 
 
 class _MergedExpertsActFnEP:
@@ -74,7 +74,7 @@ def _gated_expert_activation(
     return act_fn(gate) * up
 
 
-def _expert_parallel_size() -> int:
+def expert_parallel_size() -> int:
     """The ``ep`` axis size, read without assuming the axis is named ``ep``.
 
     ``ParallelState.ep_enabled`` indexes ``extra_parallel_sizes["ep"]``
@@ -135,7 +135,7 @@ def merged_experts_act_fn_forward(
     if local_experts != num_experts:
         from .....distributed.moe import dispatch_to_ep_class
 
-        ep_size = _expert_parallel_size()
+        ep_size = expert_parallel_size()
         if ep_size <= 1 or local_experts != num_experts // ep_size:
             raise ValueError(
                 "the expert reference loop received expert-parallel sharded weights "
@@ -170,4 +170,8 @@ def merged_experts_act_fn_forward(
         current_hidden_states = nn.functional.linear(current_hidden_states, down_proj[expert_idx])
         current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
         final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-    return final_hidden_states
+    # A rank that routed no tokens -- or a microbatch with none -- must still keep the
+    # block on the graph, or its backward never runs and a collective inside it is
+    # skipped on that rank alone. ``new_zeros`` + ``index_add_`` detaches when the loop
+    # body never executes. Every EP variant of this loop guards the same way.
+    return final_hidden_states + hidden_states * 0

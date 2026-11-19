@@ -2071,13 +2071,13 @@ def test_expert_sharding_is_read_without_assuming_the_axis_is_named_ep():
         )
 
     with with_sizes({"ep": 4}):
-        assert act_fn_experts._expert_parallel_size() == 4
+        assert act_fn_experts.expert_parallel_size() == 4
     with with_sizes({"ep": 1}):
-        assert act_fn_experts._expert_parallel_size() == 1
+        assert act_fn_experts.expert_parallel_size() == 1
     with with_sizes({"ple": 2}):
-        assert act_fn_experts._expert_parallel_size() == 1
+        assert act_fn_experts.expert_parallel_size() == 1
     with with_sizes({}):
-        assert act_fn_experts._expert_parallel_size() == 1
+        assert act_fn_experts.expert_parallel_size() == 1
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -2246,9 +2246,34 @@ def test_the_eager_row_has_one_reference_loop_not_two():
     loops = [node for node in ast.walk(wrapper) if isinstance(node, (ast.For, ast.AsyncFor))]
     assert not loops, "eager.wrapper runs the expert loop inline again; it must delegate to the shared one"
 
-    calls = [n for n in ast.walk(wrapper) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
-    assert any(c.func.id == "merged_experts_act_fn_forward" for c in calls), (
+    def _callee_tail(node: ast.AST) -> str | None:
+        """Last name of a call target, so an aliased import still counts as a call."""
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return None
+
+    calls = [n for n in ast.walk(wrapper) if isinstance(n, ast.Call)]
+    assert any(_callee_tail(c.func) == "merged_experts_act_fn_forward" for c in calls), (
         "eager.wrapper must call merged_experts_act_fn_forward"
+    )
+
+    # The property the name claims is "one reference loop in the repository", so check
+    # the module that actually owns it: exactly one loop over experts. A second copy
+    # reintroduced there would not show up in eager.py at all.
+    from veomni.ops.kernels.moe_experts.shared import act_fn_experts as shared_module
+
+    shared_tree = ast.parse(pathlib.Path(shared_module.__file__).read_text())
+    shared_loops = [
+        node
+        for node in ast.walk(shared_tree)
+        if isinstance(node, (ast.For, ast.AsyncFor))
+        and any(isinstance(n, ast.Name) and n.id == "expert_idx" for n in ast.walk(node))
+    ]
+    assert len(shared_loops) == 2, (
+        "act_fn_experts should hold exactly two per-expert loops (the EP math and the "
+        f"non-EP loop), found {len(shared_loops)}"
     )
 
 
@@ -2297,3 +2322,39 @@ def test_split_and_merged_fc1_agree_on_every_activation(activation):
         activation=activation,
     )
     assert torch.equal(merged, split), f"{activation}: a layout change altered the result"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_the_reference_loop_keeps_an_empty_microbatch_on_the_graph():
+    """Zero routed tokens must still produce a tensor with a `grad_fn`.
+
+    The loop builds its accumulator with `new_zeros` + `index_add_`, so when the loop
+    body never executes the result is detached and autograd skips the block. Under EP
+    that skips a rank's all-to-all backward while the other ranks block. The EP variants
+    guard with `+ tokens * 0`; the non-EP loop lost that guard when the two loops were
+    merged, so this pins it.
+    """
+    from veomni.ops.kernels.moe_experts.standard import eager
+
+    experts, hidden, intermediate, tokens = 3, 8, 16, 4
+    routed = torch.randn(tokens, hidden, requires_grad=True)
+    down = torch.randn(experts, hidden, intermediate, requires_grad=True)
+    gate_up = torch.randn(experts, 2 * intermediate, hidden, requires_grad=True)
+    empty = gate_up.new_empty(0)
+
+    # An empty microbatch: no token reaches any expert, so the loop body never runs.
+    out = eager.wrapper(
+        routed[:0],
+        torch.ones(0, 1),
+        torch.zeros(0, 1, dtype=torch.long),
+        empty,
+        empty,
+        down,
+        gate_up,
+        num_experts=experts,
+    )
+    assert out.requires_grad, "an empty microbatch detached from the graph"
+    assert out.grad_fn is not None
+
+    out.sum().backward()
+    assert routed.grad is not None, "the input got no gradient, so the block was skipped"

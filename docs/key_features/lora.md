@@ -410,9 +410,10 @@ MoE-LoRA requires SiLU experts and rejects other activations at wrap time.
 
 All three rows support the EP path: `fused_triton` on GPU, `fused_npu` via the Ascend
 GroupGEMM implementation in `veomni/ops/kernels/moe_experts_lora/{shared,independent}/npu.py`,
-and `eager` through plain-PyTorch expert math in the same directory. All of them hand
-the dispatched tokens to `veomni.distributed.moe.dispatch_to_ep_class`, so the
-all-to-all plumbing is one implementation.
+and `eager` through plain-PyTorch expert math in the same directory. `eager` and
+`fused_triton` share `veomni.distributed.moe.dispatch_to_ep_class`; `fused_npu` keeps
+the Ascend `alltoall_*` plumbing in `moe_experts_lora/helper.npu_ep_forward`, which is
+the same one its non-LoRA row uses.
 
 When `model.accelerator.ep_size > 1`, base experts are sharded along the expert dim by
 `ParallelPlan` (`Shard(0)` on `gate_up_proj` / `down_proj`). MoE-LoRA tracks this layout:

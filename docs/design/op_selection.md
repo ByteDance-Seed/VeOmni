@@ -816,8 +816,9 @@ the row, so the model-side branch and the row's private loop are both gone.
 (`shared` / `independent` × `eager` / `fused_triton` / `fused_npu`), and the two
 families are not interchangeable. MoE-LoRA follows the wrapped module's
 `veomni_moe.impl` and falls back to its own `eager` row when no `moe_experts_lora`
-row matches the device. All three of its rows support EP and share
-`dispatch_to_ep_class`, but every `moe_experts_lora` row hard-codes SwiGLU
+row matches the device. All three of its rows support EP — `eager` and
+`fused_triton` through `dispatch_to_ep_class`, `fused_npu` through the Ascend
+`alltoall_*` plumbing — but every `moe_experts_lora` row hard-codes SwiGLU
 regardless of `hidden_act`. See [MoE-LoRA](../key_features/lora.md#5-moe-lora) for
 the per-row table and for how the two adapter layouts shard under EP.
 

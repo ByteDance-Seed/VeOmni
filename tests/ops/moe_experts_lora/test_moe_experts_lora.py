@@ -548,8 +548,13 @@ def test_zero_b_preserves_fused_base_output_and_vjp(variant):
         assert torch.isfinite(lora[key].grad).all() and torch.count_nonzero(lora[key].grad) > 0
 
 
-def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
-    """Compare the full EP dispatch against non-EP with identical inputs and upstream gradients."""
+def _distributed_ep_parity_worker(rank: int, variant: str, impl: str, endpoint) -> None:
+    """Compare the full EP dispatch against non-EP with identical inputs and upstream gradients.
+
+    ``impl`` selects which registered row does the dispatch. ``eager`` was refused under
+    EP until it gained its own expert math, so its EP gradients had no coverage at all;
+    running the same parity check through it is the only thing that pins them.
+    """
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     torch.cuda.set_device(rank)
@@ -597,7 +602,7 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
 
         with use_parallel_state(non_ep_state):
             reference = _call(
-                "fused_triton",
+                impl,
                 variant,
                 hidden_reference,
                 routing_reference,
@@ -620,7 +625,7 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
         routing_ep = routing.detach().clone().requires_grad_(True)
         with use_parallel_state(ep_state):
             actual = _call(
-                "fused_triton",
+                impl,
                 variant,
                 hidden_ep,
                 routing_ep,
@@ -677,13 +682,14 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
     reason="distributed triton moe_experts_lora needs GPUs + triton",
 )
 @pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_distributed_ep_dispatch_matches_nonep_forward_and_gradients(variant):
+@pytest.mark.parametrize("impl", ["fused_triton", "eager"])
+def test_distributed_ep_dispatch_matches_nonep_forward_and_gradients(variant, impl):
     """Two GPUs exercise real all-to-all dispatch and both LoRA gradient layouts."""
     if runner_device_count() < _CI_ACCELERATOR_2.nproc:
         pytest.skip("Distributed EP parity requires two CUDA devices.")
     spawn_with_rendezvous(
         _distributed_ep_parity_worker,
-        args=(variant,),
+        args=(variant, impl),
         nprocs=_CI_ACCELERATOR_2.nproc,
     )
 
@@ -712,6 +718,7 @@ def _lora_ep_split_reference(impl_module, wrapper_kwargs, num_experts, ep_size, 
     return torch.cat(outputs, dim=0)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("mode", ["shared", "independent"])
 @pytest.mark.parametrize("ep_size", [2, 4])
 def test_lora_eager_ep_math_matches_the_non_ep_loop(mode, ep_size):

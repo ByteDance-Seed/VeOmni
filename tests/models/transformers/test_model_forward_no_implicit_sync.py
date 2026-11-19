@@ -762,10 +762,10 @@ _ALLOWED_SYNCS[_PACKED_DSV4_FAST_PATH_ID] = {
         "or attention_mask reduction."
     ),
     (
-        "veomni/ops/kernels/moe_experts/standard/eager.py",
-        "wrapper",
+        "veomni/ops/kernels/moe_experts/shared/act_fn_experts.py",
+        "merged_experts_act_fn_forward",
     ): (
-        "HF-eager-only: eager expert loop uses nonzero()/item() to iterate hit "
+        "HF-eager-only: the reference expert loop uses nonzero()/item() to iterate hit "
         "experts. This packed case forces eager_ops_config; production fused MoE "
         "bypasses the loop."
     ),
