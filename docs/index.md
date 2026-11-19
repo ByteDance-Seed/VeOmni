@@ -55,6 +55,7 @@ hardware_support/precision_analysis.md
 hardware_support/profiling_analysis.md
 hardware_support/AscendDockerUsage/build_a2_docker.md
 hardware_support/AscendDockerUsage/build_a3_docker.md
+hardware_support/AscendDockerUsage/build_a5_docker.md
 hardware_support/AscendDockerUsage/overview.md
 hardware_support/AscendDockerUsage/supported_tags.md
 hardware_support/FAQ.md
@@ -126,6 +127,7 @@ seed_omni/mixins/configure_optimizer.md
 :maxdepth: 1
 :caption: SeedOmni Models
 
+seed_omni/models/janus.md
 seed_omni/models/qwen3.md
 seed_omni/models/qwen3_moe.md
 seed_omni/models/qwen3vl.md

@@ -145,6 +145,7 @@ from veomni.models.transformers.qwen4_exp.packed_ple import (
 )
 from veomni.models.transformers.qwen4_exp.qsa_metadata import PreparedQSAMetadata, prepare_qsa_metadata
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.gated_delta_rule import GROUPED_VALUE_HEAD_IMPLS
 from veomni.utils import logging
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
@@ -920,7 +921,7 @@ class Qwen4ExpTextGatedDeltaNet(nn.Module):
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
         if self.num_v_heads // self.num_k_heads > 1 and not (
-            self.veomni_chunk_gated_delta_rule.impl == "flash_qla" and not use_precomputed_states
+            self.veomni_chunk_gated_delta_rule.impl in GROUPED_VALUE_HEAD_IMPLS and not use_precomputed_states
         ):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)

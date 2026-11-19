@@ -14,8 +14,6 @@ Each item is ``{type, value, role, is_dummy, meta}``:
 * ``type``  — ``"text"`` | ``"image"`` | ``"video"`` | ``"audio"`` | ``"output"``.
   ``"output"`` is the transient row a backbone appends while generating;
   :func:`seal_outputs` renames it to its final modality once the span closes.
-  Janus interleaved generation also accepts the legacy ``"image_output"`` on
-  input, which ``JanusSiglip.generate`` re-encodes and seals to ``"image"``.
   ``"audio"`` is a standalone sound item (speech in, or speech out once sealed).
   Sound carried *inside* a video clip is not an ``"audio"`` item — it rides on
   the video item's own ``value`` (``VideoInputs.audio``) so that one clip stays
@@ -62,7 +60,7 @@ import torch
 from PIL import Image
 
 
-ItemType = str  # "text" | "image" | "video" | "audio" | "output" (+ legacy "image_output")
+ItemType = str  # "text" | "image" | "video" | "audio" | "output"
 ItemRole = str  # "user" | "assistant"
 ItemValue = Union[str, torch.Tensor, Image.Image]
 

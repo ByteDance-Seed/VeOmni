@@ -72,6 +72,7 @@ from veomni.models.transformers.qwen4_exp.packed_ple import (
 )
 from veomni.models.transformers.qwen4_exp.qsa_metadata import PreparedQSAMetadata, prepare_qsa_metadata
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.gated_delta_rule import GROUPED_VALUE_HEAD_IMPLS
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils import logging
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -175,6 +176,7 @@ config.add_import(
 )
 config.add_import("veomni.distributed.sequence_parallel.gdn_exchange", names=["coalesced_gather_aligned"])
 config.add_import("veomni.ops", names=["VeomniOp"])
+config.add_import("veomni.ops.kernels.gated_delta_rule", names=["GROUPED_VALUE_HEAD_IMPLS"])
 config.add_import("veomni.models.loss_utils", names=["ForCausalLMLoss", "load_balancing_loss"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.add_import("veomni.utils.model_outputs", names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin"])
@@ -569,7 +571,7 @@ def qwen4_exp_gated_deltanet_forward_patched(
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
     if self.num_v_heads // self.num_k_heads > 1 and not (
-        self.veomni_chunk_gated_delta_rule.impl == "flash_qla" and not use_precomputed_states
+        self.veomni_chunk_gated_delta_rule.impl in GROUPED_VALUE_HEAD_IMPLS and not use_precomputed_states
     ):
         query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
