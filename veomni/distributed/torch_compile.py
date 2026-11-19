@@ -209,13 +209,17 @@ def _reject_incompatible_ops(model: nn.Module) -> None:
     selection is real and must be caught, and the message names the path so the
     offending level is unambiguous.
     """
+    from .mxfp8 import bound_linears
+
+    if bound_linears(model):
+        raise RuntimeError("torch_compile cannot lower MXFP8 linear row scales (float8_e8m0fnu).")
     config = getattr(model, "config", None)
     offending = _uncompilable_at(config, prefix="")
     if offending:
         raise RuntimeError(
             "model.accelerator.torch_compile cannot be combined with "
             f"{', '.join(offending)}: those selections emit tensors of a dtype Inductor cannot lower "
-            "(float8_e8m0fnu for the mxfp4 layout). Disable compilation or select a different dtype."
+            "(float8_e8m0fnu for MX block scales). Disable compilation or select a different dtype."
         )
 
 

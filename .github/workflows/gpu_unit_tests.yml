@@ -154,7 +154,7 @@ jobs:
         run: |
           uv run --frozen pytest -q tests/models/test_float8_training.py
           CUDA_VISIBLE_DEVICES="" uv run --no-sync pytest -q tests/ops/test_mxfp8_tensors.py -k "not native_linear"
-          CUDA_VISIBLE_DEVICES="" uv run --no-sync pytest -q tests/models/test_mxfp8_training.py -k "cpu_fsdp or portable_reload"
+          CUDA_VISIBLE_DEVICES="" uv run --no-sync pytest -q tests/models/test_mxfp8_training.py -k "cpu_fsdp or portable_reload or dpo_restores"
       - name: Run the torchao QAT tests
         shell: bash
         run: |
@@ -191,5 +191,5 @@ jobs:
           if not torch.version.cuda or torch.cuda.device_count() < 2 or any(torch.cuda.get_device_capability(i)[0] < 10 for i in range(2)):
               raise SystemExit("Native MXFP8 CI requires two visible NVIDIA SM100+ devices.")
           PY
-          uv run --no-sync pytest -q -rs -k "not cpu_fsdp and not portable_reload" tests/models/test_mxfp8_training.py \
+          uv run --no-sync pytest -q -rs -k "not cpu_fsdp and not portable_reload and not dpo_restores" tests/models/test_mxfp8_training.py \
             tests/ops/test_mxfp8_tensors.py::test_native_linear_matches_independent_quantized_oracle

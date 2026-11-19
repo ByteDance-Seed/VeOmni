@@ -79,6 +79,20 @@ def test_qwen3_row_selection_transport_and_portable_reload(tmp_path, monkeypatch
     model = build_foundation_model(config, torch_dtype="float32", init_device="meta", ops_implementation=ops)
     assert len(mxfp8.bound_linears(model)) == 3
     assert type(model.model.layers[0].self_attn.q_proj) is torch.nn.Linear
+    from tests.tools.training_utils import unbuilt_runtime
+    from veomni.arguments import ModelArguments
+    from veomni.distributed.torch_compile import _reject_incompatible_ops
+
+    with pytest.raises(RuntimeError, match="MXFP8"):
+        _reject_incompatible_ops(model)
+    runtime = unbuilt_runtime(ModelArguments(config_path=str(tmp_path), ops_implementation=ops))
+    runtime.model = model
+    for name in ("enable_activation", "enable_async_activation"):
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime.args.accelerator.offload_config, name, True)
+            with pytest.raises(ValueError, match="activation offload"):
+                runtime._build_parallelized_model()
+
     config = model.config
     config.save_pretrained(tmp_path)
     plain = build_foundation_model(
@@ -99,6 +113,55 @@ def test_qwen3_row_selection_transport_and_portable_reload(tmp_path, monkeypatch
     projection = model.model.layers[0].mlp.up_proj
     assert isinstance(projection, MXFP8Linear)
     assert isinstance(projection.weight, MXFP8Weight)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_dpo_restores_only_the_mxfp8_sites(monkeypatch, tmp_path):
+    pytest.importorskip("torchao")
+    from contextlib import nullcontext
+
+    from transformers import Qwen3Config
+
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.arguments import ModelArguments
+    from veomni.distributed.mxfp8 import bound_linears
+    from veomni.trainer import text_dpo_trainer as dpo
+
+    config = Qwen3Config(
+        architectures=["Qwen3ForCausalLM"],
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+    )
+    config.save_pretrained(tmp_path)
+    selection = {
+        "name": "eager",
+        "overrides": [
+            {"site": r"model\.layers\.0\.self_attn\.q_proj", "name": "torchao", "kwargs": {"dtype": "nvfp4"}},
+            {
+                "site": r"model\.layers\.0\.self_attn\.k_proj",
+                "name": "torchao",
+                "kwargs": {"dtype": "mxfp8", "emulated": False},
+            },
+        ],
+    }
+    args = ModelArguments(
+        config_path=str(tmp_path), ops_implementation=make_eager_ops_config(linear_implementation=selection)
+    )
+    args.accelerator.fsdp_config.mxfp8_all_gather = True
+    monkeypatch.setattr(dpo.DPOReferenceModelRuntime, "setup", lambda self: None)
+    monkeypatch.setattr(dpo, "use_parallel_state", lambda _: nullcontext())
+    monkeypatch.setattr(dpo.DPOReferenceModelRuntime, "_build_parallelized_model", lambda self: None)
+    ref = dpo.DPOReferenceModelRuntime(args, train=None)
+    handles = ref.model.model.layers[0].self_attn.veomni_linears
+    assert not bound_linears(ref.model)
+    assert handles["q_proj"].kwargs["dtype"] == "nvfp4"
+    assert handles["k_proj"].impl == "eager"
+    assert not ref.args.accelerator.fsdp_config.mxfp8_all_gather
+    assert args.accelerator.fsdp_config.mxfp8_all_gather
 
 
 def _build_fsdp(weights_path: Path, all_gather, *, skip_hf_load=False):

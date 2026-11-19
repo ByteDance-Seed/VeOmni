@@ -14,6 +14,25 @@ def bound_linears(model):
     return [module for module in model.modules() if isinstance(module, tensors.MXFP8Linear)]
 
 
+def restore_reference_linears(model):
+    """Run only the bound MXFP8 sites at the frozen reference model's requested precision."""
+    tensors = sys.modules.get(__name__ + ".tensors")
+    if tensors is None:
+        return
+    from veomni.ops import VeomniOp
+
+    for parent in model.modules():
+        for name, child in parent.named_children():
+            if isinstance(child, tensors.MXFP8Linear):
+                with torch.device("meta"):
+                    linear = nn.Linear(child.in_features, child.out_features, bias=child.bias is not None)
+                linear.weight, linear.bias = child.weight, child.bias
+                setattr(parent, name, linear)
+                handles = getattr(parent, "veomni_linears", {})
+                if name in handles:
+                    handles[name] = VeomniOp("linear", "standard", "eager")
+
+
 def prepare_fsdp_transport(model, precision, state, *, gather, compile_enabled, offload, incompatible_comm):
     projections = bound_linears(model)
     if not projections:

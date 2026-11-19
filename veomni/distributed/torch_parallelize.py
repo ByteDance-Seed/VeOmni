@@ -435,10 +435,11 @@ def parallelize_model_fsdp2(
     muon_expert_zero_comm: bool = False,
     low_precision_reduce_scatter_comm: bool = False,
     expert_weight_fp8_all_gather: bool = False,
-    mxfp8_all_gather: bool = False,
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
+    *,
+    mxfp8_all_gather: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -1064,10 +1065,11 @@ def build_parallelize_model(
     muon_expert_zero_comm: bool = False,
     low_precision_reduce_scatter_comm: bool = False,
     expert_weight_fp8_all_gather: bool = False,
-    mxfp8_all_gather: bool = False,
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
+    *,
+    mxfp8_all_gather: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.

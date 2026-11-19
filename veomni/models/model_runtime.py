@@ -414,6 +414,11 @@ class VeOmniModelRuntime:
                 "module inference (ModuleRuntime._init_eager_inference)."
             )
 
+        from ..distributed.mxfp8 import bound_linears
+
+        offload = args.accelerator.offload_config
+        if (offload.enable_activation or offload.enable_async_activation) and bound_linears(self.model):
+            raise ValueError("MXFP8 does not support activation offload.")
         self._apply_async_activation_offload()
 
         # Customized parallelize model.
