@@ -2178,7 +2178,7 @@ def test_storage_view_checkpoint_reference_cpu(tmp_path, matching):
 
 
 def _storage_view_accelerator_plan(context):
-    if context.capabilities.backend in ("cuda", "npu") and context.capabilities.devices:
+    if context.capabilities.backend != "cpu" and context.capabilities.devices:
         return LaunchSpec(device="accelerator")
     return LaunchSpec(device="cpu")
 
@@ -2186,20 +2186,16 @@ def _storage_view_accelerator_plan(context):
 @pytest.mark.launch_plan(provider=_storage_view_accelerator_plan)
 @pytest.mark.parametrize("matching", [False, True])
 def test_storage_view_checkpoint_native_accelerator(tmp_path, matching):
-    from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
+    from veomni.utils.device import get_device_type, get_torch_device
 
     ci_backend = runner_capabilities().backend if os.environ.get("VEOMNI_CI_CAPABILITIES") else None
     require_npu = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1" or ci_backend == "npu"
     if require_npu and ci_backend not in (None, "npu"):
         pytest.fail("A working npu device must be assigned to this test")
     backend = "npu" if require_npu else (ci_backend or get_device_type())
-    available = (
-        IS_NPU_AVAILABLE and torch.npu.is_available()
-        if backend == "npu"
-        else backend == "cuda" and torch.cuda.is_available()
-    )
+    available = backend != "cpu" and backend == get_device_type() and get_torch_device().is_available()
     if not available:
-        if require_npu or ci_backend == "cuda":
+        if require_npu or (ci_backend is not None and ci_backend != "cpu"):
             pytest.fail(f"A working {backend} device is required for storage-view recovery")
         pytest.skip("requires an available CUDA or NPU device")
     _storage_view_roundtrip(tmp_path, torch.device(backend, 0), matching)
