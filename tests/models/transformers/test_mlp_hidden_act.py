@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MLP hidden_act routing: silu/swish use swiglu_mlp, anything else uses act_fn."""
+"""MLP hidden_act routing: dense MLP sends every activation through gated_mlp.
+
+Routed experts cannot: their fused kernel bakes SiLU into the grouped GEMM, so any
+other activation takes the Python expert loop. Both halves are asserted here.
+"""
 
 from __future__ import annotations
 
@@ -26,7 +30,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Exper
 from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP as HFQwen2MLP
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts as HFQwen3MoeExperts
 
-from tests.models.compare import assert_module_forward_and_grads_match, eager_ops_config, ops_config_scope
+from tests.models.compare import assert_module_forward_and_grads_match, eager_ops_config
 from tests.models.tiny_configs import (
     tiny_deepseek_v4_config,
     tiny_qwen2_config,
@@ -53,7 +57,7 @@ class _CallCounter:
 
 
 def _raise_if_called(*_args, **_kwargs):
-    raise AssertionError("non-silu hidden_act must not call the fused SwiGLU / silu MoE kernel")
+    raise AssertionError("a non-SiLU hidden_act must not reach the fused SiLU-only MoE kernel")
 
 
 def _init_parameters(module: nn.Module) -> None:
@@ -72,19 +76,22 @@ def _generated_cls(family: str, class_name: str):
 def _pair(ours_cls, hf_cls, config):
     hf = hf_cls(config)
     _init_parameters(hf)
-    with ops_config_scope(eager_ops_config()):
-        ours = ours_cls(config)
+    config._set_ops_implementation(eager_ops_config())
+    ours = ours_cls(config)
     ours.load_state_dict(hf.state_dict())
+    # ``gated_mlp`` takes the activation as a call argument, so every activation
+    # goes through it. ``moe_experts`` cannot: its fused kernel bakes SiLU into
+    # both directions, so another activation falls back to the Python expert loop
+    # and the row must not be reached. Both cases are asserted below.
     counter = None
-    if config.hidden_act in {"silu", "swish"}:
-        handle_name = "veomni_swiglu_mlp" if hasattr(ours, "veomni_swiglu_mlp") else "veomni_moe"
-        counter = _CallCounter(getattr(ours, handle_name))
-        setattr(ours, handle_name, counter)
-    else:
-        if hasattr(ours, "veomni_swiglu_mlp"):
-            ours.veomni_swiglu_mlp = _raise_if_called
-        if hasattr(ours, "veomni_moe"):
-            ours.veomni_moe = _raise_if_called
+    if hasattr(ours, "veomni_gated_mlp"):
+        counter = _CallCounter(ours.veomni_gated_mlp)
+        ours.veomni_gated_mlp = counter
+    elif hasattr(ours, "veomni_moe") and config.hidden_act in {"silu", "swish"}:
+        counter = _CallCounter(ours.veomni_moe)
+        ours.veomni_moe = counter
+    elif hasattr(ours, "veomni_moe"):
+        ours.veomni_moe = _raise_if_called
     return hf, ours, counter
 
 

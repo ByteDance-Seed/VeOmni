@@ -3,14 +3,15 @@ from typing import Optional, Tuple
 
 import diffusers
 from diffusers import QwenImageTransformer2DModel
-from transformers import PretrainedConfig
+
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
 QWEN_IMAGE_INIT_SIGNATURE = inspect.signature(QwenImageTransformer2DModel.__init__)
 diffusers_version = diffusers.__version__
 
 
-class QwenImageTransformer2DModelConfig(PretrainedConfig):
+class QwenImageTransformer2DModelConfig(VeOmniPretrainedConfig):
     model_type = "QwenImageTransformer2DModel"
     condition_model_type = "QwenImageConditionModel"
 

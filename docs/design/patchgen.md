@@ -291,7 +291,7 @@ The generated file includes:
 See `veomni/models/transformers/qwen3/qwen3_gpu_patch_gen_config.py` for a complete example that includes:
 
 - **LigerRMSNorm**: Fused kernel replacement for `Qwen3RMSNorm`
-- **LigerSwiGLUMLP**: Fused SwiGLU MLP replacement for `Qwen3MLP`
+- **LigerGatedMLP**: fused gated MLP replacement for `Qwen3MLP`
 - **apply_rotary_pos_emb**: LigerKernel rotary position embedding
 
 Run it:
@@ -375,7 +375,7 @@ after `original_init(...)` are inlined into the upstream body:
 @config.modify_init("Qwen2Attention")
 def bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 ```
 
 ## CLI Reference

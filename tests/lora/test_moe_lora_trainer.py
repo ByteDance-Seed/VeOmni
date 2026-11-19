@@ -398,7 +398,7 @@ def _build_and_save_toy_base(dest_dir: str) -> None:
         moe_implementation="eager",
         cross_entropy_loss_implementation="eager",
         rms_norm_implementation="eager",
-        swiglu_mlp_implementation="eager",
+        gated_mlp_implementation="eager",
         rotary_pos_emb_implementation="eager",
     )
     model = build_lora_test_model(
@@ -420,7 +420,7 @@ def toy_base_dir(tmp_path_factory):
     in a *child process* (not in-process) so the fixture leaves the
     pytest-collection process free of foundation-model imports/state --
     which matters because the subprocess trainers also import veomni and
-    we don't want any singleton (ops config, parallel state, etc.) leaking
+    we don't want any process-level state (parallel state, etc.) leaking
     across.
     """
     import multiprocessing as mp

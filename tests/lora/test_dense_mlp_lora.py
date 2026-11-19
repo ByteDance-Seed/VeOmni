@@ -26,45 +26,75 @@ from tests.tools.common_utils import ieee_fp32_matmul
 from veomni.arguments import OpsImplementationConfig
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 from veomni.lora.layers import LoraLinear
+from veomni.models.configuration_base import get_veomni_config_class
 from veomni.ops import OP_REGISTRY
-from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils.device import get_device_type
 
 
-def _qwen3_mlp() -> nn.Module:
+def _qwen3_mlp(ops: OpsImplementationConfig) -> nn.Module:
     from transformers import Qwen3Config
 
     from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3MLP
 
-    return Qwen3MLP(Qwen3Config(hidden_size=16, intermediate_size=32, hidden_act="silu"))
+    Qwen3Config = get_veomni_config_class(Qwen3Config)
+
+    return Qwen3MLP(Qwen3Config(hidden_size=16, intermediate_size=32, hidden_act="silu", ops_implementation=ops))
 
 
-def _llama_mlp() -> nn.Module:
+def _llama_mlp(ops: OpsImplementationConfig) -> nn.Module:
     from transformers import LlamaConfig
 
     from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaMLP
 
-    config = LlamaConfig(hidden_size=16, intermediate_size=32, num_attention_heads=4, hidden_act="silu", mlp_bias=True)
+    LlamaConfig = get_veomni_config_class(LlamaConfig)
+
+    config = LlamaConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_attention_heads=4,
+        hidden_act="silu",
+        mlp_bias=True,
+        ops_implementation=ops,
+    )
     return LlamaMLP(config)
 
 
-def _gemma3_mlp() -> nn.Module:
+def _gemma3_mlp(ops: OpsImplementationConfig) -> nn.Module:
     from transformers import Gemma3TextConfig
 
     from veomni.models.transformers.gemma3.generated.patched_modeling_gemma3_gpu import Gemma3MLP
 
-    return Gemma3MLP(Gemma3TextConfig(hidden_size=16, intermediate_size=32, hidden_activation="gelu_pytorch_tanh"))
+    Gemma3TextConfig = get_veomni_config_class(Gemma3TextConfig)
+
+    return Gemma3MLP(
+        Gemma3TextConfig(
+            hidden_size=16,
+            intermediate_size=32,
+            hidden_activation="gelu_pytorch_tanh",
+            ops_implementation=ops,
+        )
+    )
 
 
-def _deepseek_v4_mlp() -> nn.Module:
+def _deepseek_v4_mlp(ops: OpsImplementationConfig) -> nn.Module:
     from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
     from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import DeepseekV4MLP
 
-    return DeepseekV4MLP(DeepseekV4Config(hidden_size=16, intermediate_size=32, hidden_act="silu", swiglu_limit=0.5))
+    DeepseekV4Config = get_veomni_config_class(DeepseekV4Config)
+
+    return DeepseekV4MLP(
+        DeepseekV4Config(
+            hidden_size=16,
+            intermediate_size=32,
+            hidden_act="silu",
+            swiglu_limit=0.5,
+            ops_implementation=ops,
+        )
+    )
 
 
-_FAMILIES: dict[str, tuple[Callable[[], nn.Module], str]] = {
+_FAMILIES: dict[str, tuple[Callable[[OpsImplementationConfig], nn.Module], str]] = {
     "qwen3": (_qwen3_mlp, "standard"),
     "llama": (_llama_mlp, "standard"),
     "gemma3": (_gemma3_mlp, "geglu"),
@@ -75,16 +105,11 @@ _PROJECTIONS = ["gate_proj", "up_proj", "down_proj"]
 
 def _build_mlp(family: str, impl: str, dtype: torch.dtype, device: str) -> nn.Module:
     build, variant = _FAMILIES[family]
-    if impl not in OP_REGISTRY.list_available("swiglu_mlp", variant):
-        pytest.skip(f"swiglu_mlp/{variant}/{impl} is unavailable on this device")
-    saved_cfg = get_ops_config()
-    set_ops_config(OpsImplementationConfig(swiglu_mlp_implementation=impl))
-    try:
-        torch.manual_seed(0)
-        mlp = build()
-    finally:
-        set_ops_config(saved_cfg)
-    assert mlp.veomni_swiglu_mlp.impl == impl
+    if impl not in OP_REGISTRY.list_available("gated_mlp", variant):
+        pytest.skip(f"gated_mlp/{variant}/{impl} is unavailable on this device")
+    torch.manual_seed(0)
+    mlp = build(OpsImplementationConfig(gated_mlp_implementation=impl))
+    assert mlp.veomni_gated_mlp.impl == impl
     with torch.no_grad():
         for name in _PROJECTIONS:
             getattr(mlp, name).weight.normal_(0.0, 0.5)
@@ -128,7 +153,7 @@ def test_lora_projections_match_merged_weights(family: str, impl: str):
 
 @pytest.mark.parametrize("family", list(_FAMILIES))
 def test_lora_projections_at_init_match_eager_row_bitwise(family: str):
-    """The module path that LoRA takes must reproduce the eager ``swiglu_mlp`` row in bf16."""
+    """The module path that LoRA takes must reproduce the eager ``gated_mlp`` row in bf16."""
     device = get_device_type()
     mlp = _build_mlp(family, "eager", torch.bfloat16, device)
     x = torch.randn(2, 5, 16, device=device, dtype=torch.bfloat16)
@@ -136,3 +161,39 @@ def test_lora_projections_at_init_match_eager_row_bitwise(family: str):
         base_out = mlp(x)
         lora_out = _wrap(mlp)(x)
     assert torch.equal(lora_out, base_out)
+
+
+@pytest.mark.parametrize("family", list(_FAMILIES))
+@pytest.mark.parametrize("impl", ["eager", "liger_kernel"])
+def test_mlp_lora_keeps_every_non_quantizing_row(family: str, impl: str):
+    """An adapter on the projections must not be blocked just because the row reads weights.
+
+    Only a fake-quantizing row needs the projection's own ``weight``; the fused
+    arithmetic rows keep the projection-module fallback that ``main`` has always
+    used for a wrapped projection. This is the case a "reject every non-eager
+    impl" guard breaks, and ``liger_kernel`` is the GPU/MLU default.
+    """
+    build, variant = _FAMILIES[family]
+    if impl not in OP_REGISTRY.list_available("gated_mlp", variant):
+        pytest.skip(f"gated_mlp/{variant}/{impl} is unavailable on this device")
+    mlp = _build_mlp(family, impl, torch.float32, get_device_type())
+    model = _wrap(mlp)
+
+    x = torch.randn(2, 5, 16, device=get_device_type())
+    out = model(x)
+    assert out.shape[0] == 2
+    out.sum().backward()
+
+
+@pytest.mark.skipif(
+    "qat" not in OP_REGISTRY.list_available("gated_mlp", "standard"),
+    reason="the qat row needs TileLang on SM90+",
+)
+def test_mlp_lora_refuses_the_quantizing_row():
+    """Silently running the base layer at full precision would leave the config claiming QAT."""
+    mlp = _build_mlp("qwen3", "qat", torch.float32, get_device_type())
+    model = _wrap(mlp)
+
+    x = torch.randn(2, 5, 16, device=get_device_type())
+    with pytest.raises(ValueError, match="cannot run on a wrapped projection"):
+        model(x)

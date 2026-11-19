@@ -24,10 +24,8 @@ import veomni.ops.registry as registry_mod
 import veomni.utils.device as device
 import veomni.utils.import_utils as import_utils
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.models.compare import ops_config_scope
 from veomni.arguments import OpsImplementationConfig
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.ops.platform import GpuKernelRequirement
 
 
@@ -38,7 +36,8 @@ _HOST_FIELDS = (
     "moe_implementation",
     "cross_entropy_loss_implementation",
     "rms_norm_implementation",
-    "swiglu_mlp_implementation",
+    "gated_mlp_implementation",
+    "linear_implementation",
     "rotary_pos_emb_implementation",
     "rotary_pos_emb_vision_implementation",
     "load_balancing_loss_implementation",
@@ -48,7 +47,8 @@ _FIELD_OP_VARIANTS: dict[str, tuple[str, str]] = {
     "moe_implementation": ("moe_experts", "standard"),
     "cross_entropy_loss_implementation": ("cross_entropy_loss", "standard"),
     "rms_norm_implementation": ("rms_norm", "standard"),
-    "swiglu_mlp_implementation": ("swiglu_mlp", "standard"),
+    "gated_mlp_implementation": ("gated_mlp", "standard"),
+    "linear_implementation": ("linear", "standard"),
     "rotary_pos_emb_implementation": ("rope", "partial"),
     "rotary_pos_emb_vision_implementation": ("rope", "full"),
     "load_balancing_loss_implementation": ("load_balancing_loss", "standard"),
@@ -59,7 +59,8 @@ _EXPECTED_DEFAULTS: dict[str, dict[str, str]] = {
         "moe_implementation": "fused_triton",
         "cross_entropy_loss_implementation": "liger_kernel",
         "rms_norm_implementation": "liger_kernel",
-        "swiglu_mlp_implementation": "liger_kernel",
+        "gated_mlp_implementation": "liger_kernel",
+        "linear_implementation": "eager",
         "rotary_pos_emb_implementation": "liger_kernel",
         "rotary_pos_emb_vision_implementation": "liger_kernel",
         "load_balancing_loss_implementation": "triton",
@@ -68,7 +69,8 @@ _EXPECTED_DEFAULTS: dict[str, dict[str, str]] = {
         "moe_implementation": "fused_npu",
         "cross_entropy_loss_implementation": "chunk_loss",
         "rms_norm_implementation": "torch_npu",
-        "swiglu_mlp_implementation": "eager",
+        "gated_mlp_implementation": "eager",
+        "linear_implementation": "eager",
         "rotary_pos_emb_implementation": "torch_npu",
         "rotary_pos_emb_vision_implementation": "torch_npu",
         "load_balancing_loss_implementation": "eager",
@@ -77,7 +79,8 @@ _EXPECTED_DEFAULTS: dict[str, dict[str, str]] = {
         "moe_implementation": "fused_triton",
         "cross_entropy_loss_implementation": "eager",
         "rms_norm_implementation": "eager",
-        "swiglu_mlp_implementation": "eager",
+        "gated_mlp_implementation": "eager",
+        "linear_implementation": "eager",
         "rotary_pos_emb_implementation": "eager",
         "rotary_pos_emb_vision_implementation": "eager",
         "load_balancing_loss_implementation": "eager",
@@ -115,11 +118,9 @@ def test_unset_fields_resolve_to_the_host_default(host: str, monkeypatch: pytest
     _set_host(monkeypatch, host)
     config = OpsImplementationConfig()
     assert {name: getattr(config, name) for name in _HOST_FIELDS} == dict.fromkeys(_HOST_FIELDS)
-    with ops_config_scope(config):
-        resolved = {
-            name: VeomniOp(op, variant, resolve_op_impl(name)).impl
-            for name, (op, variant) in _FIELD_OP_VARIANTS.items()
-        }
+    resolved = {
+        name: VeomniOp(op, variant, getattr(config, name)).impl for name, (op, variant) in _FIELD_OP_VARIANTS.items()
+    }
     assert resolved == _EXPECTED_DEFAULTS[host]
 
 
@@ -127,8 +128,7 @@ def test_unset_moe_resolves_to_fused_mlu_with_apex(monkeypatch: pytest.MonkeyPat
     _set_host(monkeypatch, "mlu", apex_mlu=True)
     config = OpsImplementationConfig()
     assert config.moe_implementation is None
-    with ops_config_scope(config):
-        assert VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation")).impl == "fused_mlu"
+    assert VeomniOp("moe_experts", "standard", config.moe_implementation).impl == "fused_mlu"
 
 
 @pytest.mark.parametrize("field_name", _HOST_FIELDS)
@@ -158,7 +158,9 @@ def test_explicit_npu_value_is_kept_on_npu(field_name: str, value: str, monkeypa
         ("moe_implementation", "fused_triton"),
         ("cross_entropy_loss_implementation", "liger_kernel"),
         ("rms_norm_implementation", "liger_kernel"),
-        ("swiglu_mlp_implementation", "liger_kernel"),
+        ("gated_mlp_implementation", "liger_kernel"),
+        ("linear_implementation", "torchao_mxfp4"),
+        ("kv_round_implementation", "triton"),
         ("rotary_pos_emb_implementation", "liger_kernel"),
         ("load_balancing_loss_implementation", "triton"),
     ],
@@ -197,15 +199,15 @@ def test_unset_fields_resolve_to_mlu_liger_defaults(monkeypatch: pytest.MonkeyPa
     _set_host(monkeypatch, "mlu", mlu_liger=True)
     config = OpsImplementationConfig()
     assert {name: getattr(config, name) for name in _HOST_FIELDS} == dict.fromkeys(_HOST_FIELDS)
-    with ops_config_scope(config):
-        resolved = {
-            name: VeomniOp(op, variant, resolve_op_impl(name)).impl
-            for name, (op, variant) in _FIELD_OP_VARIANTS.items()
-        }
+    resolved = {
+        name: VeomniOp(op, variant, getattr(config, name)).impl for name, (op, variant) in _FIELD_OP_VARIANTS.items()
+    }
     expected = _EXPECTED_DEFAULTS["mlu"] | {
         "cross_entropy_loss_implementation": "liger_kernel",
         "rms_norm_implementation": "liger_kernel",
-        "swiglu_mlp_implementation": "liger_kernel",
+        "gated_mlp_implementation": "liger_kernel",
+        "linear_implementation": "eager",
+        # The kv_round triton row is CUDA-only, so MLU keeps the eager reference.
         "rotary_pos_emb_implementation": "liger_kernel",
         "rotary_pos_emb_vision_implementation": "liger_kernel",
     }
@@ -218,5 +220,4 @@ def test_installed_torch_npu_without_runtime_keeps_gpu_defaults(monkeypatch: pyt
     monkeypatch.setattr(import_utils, "is_torch_npu_available", lambda: True)
     config = OpsImplementationConfig()
     assert config.moe_implementation is None
-    with ops_config_scope(config):
-        assert VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation")).impl == "fused_triton"
+    assert VeomniOp("moe_experts", "standard", config.moe_implementation).impl == "fused_triton"

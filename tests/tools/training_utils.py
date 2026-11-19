@@ -42,7 +42,7 @@ _NPU_OPS_DEFAULTS: Dict[str, str] = {
     "rms_norm_implementation": "torch_npu",
     "rotary_pos_emb_implementation": "torch_npu",
     "rotary_pos_emb_vision_implementation": "torch_npu",
-    "swiglu_mlp_implementation": "eager",  # no NPU backend
+    "gated_mlp_implementation": "eager",  # no NPU backend
     # The Triton load-balancing-loss row is CUDA-only, so NPU resolution rejects
     # it even when ``triton-ascend`` is installed. Pin to eager.
     "load_balancing_loss_implementation": "eager",
@@ -170,8 +170,13 @@ def make_eager_ops_config(**overrides) -> OpsImplementationConfig:
         moe_implementation=overrides.pop("moe_implementation", "eager"),
         cross_entropy_loss_implementation=overrides.pop("cross_entropy_loss_implementation", "eager"),
         rms_norm_implementation=overrides.pop("rms_norm_implementation", "eager"),
-        swiglu_mlp_implementation=overrides.pop("swiglu_mlp_implementation", "eager"),
+        gated_mlp_implementation=overrides.pop("gated_mlp_implementation", "eager"),
+        linear_implementation=overrides.pop("linear_implementation", "eager"),
+        # `eager` is not "off" for kv_round: it is a real row that rounds stored
+        # tensors, so an eager test config names the `none` row explicitly.
+        kv_round_implementation=overrides.pop("kv_round_implementation", "none"),
         rotary_pos_emb_implementation=overrides.pop("rotary_pos_emb_implementation", "eager"),
+        rotary_pos_emb_vision_implementation=overrides.pop("rotary_pos_emb_vision_implementation", "eager"),
         load_balancing_loss_implementation=overrides.pop("load_balancing_loss_implementation", "eager"),
         rms_norm_gated_implementation=overrides.pop("rms_norm_gated_implementation", "eager"),
         causal_conv1d_implementation=overrides.pop("causal_conv1d_implementation", "eager"),

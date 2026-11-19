@@ -50,6 +50,16 @@ uv sync --locked --extra gpu --extra magi
 MagiAttention uses CUTE DSL/JIT on SM100 and newer GPUs. On SM90, select
 FlexAttention instead; its FA4 backend is included in the `gpu` extra.
 
+### Optional float8 extra
+
+`torchao`, the backend for opt-in [float8 training](../../usage/float8_training.md)
+(NVIDIA SM89+), is an optional extra rather than part of `gpu`. Install it
+together with the `gpu` extra:
+
+```bash
+uv sync --locked --extra gpu --extra float8
+```
+
 > **Note**: video/audio processing also needs ffmpeg installed at the OS level:
 > ```bash
 > # Ubuntu/Debian

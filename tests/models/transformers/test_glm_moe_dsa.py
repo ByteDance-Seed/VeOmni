@@ -29,13 +29,11 @@ from tests.models.compare import (
     assert_eager_matches_hf,
     assert_outputs_and_grads_match,
     eager_ops_config,
-    ops_config_scope,
 )
 from tests.models.tiny_configs import tiny_glm_moe_dsa_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_RTOL
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.models.auto import build_foundation_model
-from veomni.ops.config import get_ops_config, set_ops_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 from veomni.utils.moe_monitor import MoERouterMonitor, attach_moe_router_monitor, set_active_monitor
 
@@ -55,8 +53,8 @@ def _build_ours(
     ops: SimpleNamespace | None = None,
     architecture: str = "GlmMoeDsaForCausalLM",
 ):
-    with ops_config_scope(ops if ops is not None else eager_ops_config()):
-        return _glm_cls(architecture)(config)
+    config._set_ops_implementation(ops if ops is not None else eager_ops_config())
+    return _glm_cls(architecture)(config)
 
 
 def _assert_dsa_wiring(attn) -> None:
@@ -380,9 +378,6 @@ _TOY_CONFIG = Path(__file__).resolve().parents[2] / "toy_config" / "glm_moe_dsa_
 
 @pytest.fixture
 def build_toy():
-    """``build_foundation_model`` installs the ops config process-wide; restore it afterwards."""
-    previous = get_ops_config()
-
     def build(init_device):
         return build_foundation_model(
             config_path=str(_TOY_CONFIG),
@@ -392,10 +387,7 @@ def build_toy():
             ops_implementation=make_eager_ops_config(),
         )
 
-    try:
-        yield build
-    finally:
-        set_ops_config(previous)
+    yield build
 
 
 def _sparse_layers(config):

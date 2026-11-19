@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import (
     AcceleratorConfig,
     DataArguments,
@@ -36,6 +37,7 @@ from veomni.distributed.torch_compile import (
     validate_compile_config_for_fsdp2,
     validate_compile_runtime,
 )
+from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
 
 
@@ -343,8 +345,10 @@ def test_compile_decoder_blocks_targets_qwen3_vl_text_layers_only(monkeypatch):
     assert all(not getattr(block, "_veomni_forward_compiled", False) for block in model.model.visual.blocks)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("use_checkpoint", [False, True])
 def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
+    from tests.tools.training_utils import make_eager_ops_config
     from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
         Qwen3VLTextConfig,
         Qwen3VLTextDecoderLayer,
@@ -367,7 +371,7 @@ def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
         hidden_act="silu",
         rope_theta=10000,
     )
-    config._attn_implementation = "eager"
+    as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
 
     eager_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)
     compiled_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0)
@@ -408,6 +412,7 @@ def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
 def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
     pytest.importorskip("flash_attn")
 
+    from tests.tools.training_utils import make_eager_ops_config
     from veomni.data.data_collator import add_flash_attention_kwargs_from_position_ids
     from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
         Qwen3VLTextConfig,
@@ -433,7 +438,9 @@ def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
         hidden_act="silu",
         rope_theta=10000,
     )
-    config._attn_implementation = "flash_attention_2"
+    as_veomni_config(config, validate=False)._set_ops_implementation(
+        make_eager_ops_config(attn_implementation="flash_attention_2")
+    )
 
     eager_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype)
     compiled_layer = Qwen3VLTextDecoderLayer(config, layer_idx=0).to(device=device, dtype=dtype)
@@ -833,16 +840,13 @@ def test_deepseek_v4_fused_decoder_fullgraph_forward_backward_matches_eager(comp
         DeepseekV4ForCausalLM,
     )
 
-    from ..models.compare import ops_config_scope
-
     torch.manual_seed(0)
     device = torch.device(get_device_type())
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
-    config._attn_implementation = "eager"
+    as_veomni_config(config, validate=False)._set_ops_implementation(_deepseek_v4_fused_moe_ops_config())
 
-    with ops_config_scope(_deepseek_v4_fused_moe_ops_config()):
-        eager_model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
-        compiled_model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
+    eager_model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
+    compiled_model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
     compiled_model.load_state_dict(eager_model.state_dict())
 
     inputs = torch.randint(0, config.vocab_size, (2, 16), device=device)
@@ -885,15 +889,12 @@ def test_deepseek_v4_inductor_fullgraph_executes_finite_optimizer_step():
         DeepseekV4ForCausalLM,
     )
 
-    from ..models.compare import ops_config_scope
-
     torch.manual_seed(0)
     device = torch.device(get_device_type())
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
-    config._attn_implementation = "eager"
+    as_veomni_config(config, validate=False)._set_ops_implementation(_deepseek_v4_fused_moe_ops_config())
 
-    with ops_config_scope(_deepseek_v4_fused_moe_ops_config()):
-        model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
+    model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     batches = [
@@ -939,14 +940,12 @@ def test_deepseek_v4_inductor_fixed_route_expert_vjp_matches_fp32_reference(seed
     )
     from veomni.ops import VeomniOp
 
-    from ..models.compare import ops_config_scope
-
     torch.manual_seed(seed)
     device = torch.device(get_device_type())
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    as_veomni_config(config, validate=False)._set_ops_implementation(_deepseek_v4_fused_moe_ops_config())
 
-    with ops_config_scope(_deepseek_v4_fused_moe_ops_config()):
-        model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
+    model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
     experts = model.model.layers[2].mlp.experts
 
     num_tokens = 12
@@ -1019,15 +1018,14 @@ def test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle(seed):
     )
     from veomni.ops.batch_invariant import set_batch_invariant_mode
 
-    from ..models.compare import eager_ops_config, ops_config_scope
+    from ..models.compare import eager_ops_config
 
     torch.manual_seed(seed)
     device = torch.device(get_device_type())
     config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
-    config._attn_implementation = "eager"
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
 
-    with ops_config_scope(eager_ops_config()):
-        oracle = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.float32)
+    oracle = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.float32)
     with torch.no_grad():
         for module in oracle.modules():
             if hasattr(module, "tid2eid"):
@@ -1038,8 +1036,8 @@ def test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle(seed):
     base_state = {name: value.detach().cpu() for name, value in oracle.state_dict().items()}
 
     def build_bf16_model():
-        with ops_config_scope(_deepseek_v4_fused_moe_ops_config()):
-            model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
+        as_veomni_config(config, validate=False)._set_ops_implementation(_deepseek_v4_fused_moe_ops_config())
+        model = DeepseekV4ForCausalLM(config).to(device=device, dtype=torch.bfloat16)
         model.load_state_dict(
             {
                 name: value.to(device=device, dtype=torch.bfloat16 if value.is_floating_point() else value.dtype)
@@ -1146,12 +1144,13 @@ def test_deepseek_v4_rms_norm_compiled_backward_matches_eager(compile_backend):
         DeepseekV4RMSNorm,
     )
 
-    from ..models.compare import eager_ops_config, ops_config_scope
+    from ..models.compare import eager_ops_config
 
     torch.manual_seed(0)
-    with ops_config_scope(eager_ops_config()):
-        eager_norm = DeepseekV4RMSNorm(64)
-        compiled_norm = copy.deepcopy(eager_norm)
+    config = AutoConfig.from_pretrained("tests/toy_config/deepseek_v4_toy")
+    as_veomni_config(config, validate=False)._set_ops_implementation(eager_ops_config())
+    eager_norm = DeepseekV4RMSNorm(64, config=config)
+    compiled_norm = copy.deepcopy(eager_norm)
 
     x_eager = torch.randn(2, 16, 64, dtype=torch.float32, requires_grad=True)
     x_compiled = x_eager.detach().clone().requires_grad_(True)
@@ -1165,3 +1164,57 @@ def test_deepseek_v4_rms_norm_compiled_backward_matches_eager(compile_backend):
     torch.testing.assert_close(compiled_out, eager_out, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(x_compiled.grad, x_eager.grad, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(compiled_norm.weight.grad, eager_norm.weight.grad, rtol=1e-5, atol=1e-5)
+
+
+def _model_with_ops(**ops_fields) -> nn.Module:
+    """A model whose config carries the given ops selections, as the registry reads them."""
+    ops = SimpleNamespace(**{"linear_implementation": None, "gated_mlp_implementation": None, **ops_fields})
+    model = nn.Linear(2, 2)
+    model.config = SimpleNamespace(ops_config=ops, sub_configs={})
+    return model
+
+
+@pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
+def test_compile_rejects_torchao_mxfp4(field):
+    """MXTensor emits float8_e8m0fnu scales, which Inductor has no lowering for."""
+    from veomni.distributed.torch_compile import _reject_incompatible_ops
+
+    with pytest.raises(RuntimeError, match=f"{field}='torchao_mxfp4'"):
+        _reject_incompatible_ops(_model_with_ops(**{field: "torchao_mxfp4"}))
+
+
+@pytest.mark.parametrize(
+    "ops_fields",
+    [
+        {},
+        {"linear_implementation": "eager"},
+        {"linear_implementation": "qat"},
+        {"linear_implementation": "torchao_nvfp4"},
+        {"gated_mlp_implementation": "torchao_nvfp4"},
+    ],
+)
+def test_compile_allows_other_rows(ops_fields):
+    """NVFP4's scales are a dtype Inductor knows, so only MXFP4 is refused."""
+    from veomni.distributed.torch_compile import _reject_incompatible_ops
+
+    _reject_incompatible_ops(_model_with_ops(**ops_fields))
+
+
+def test_compile_rejection_is_skipped_without_an_ops_config():
+    """A model with no ops config has nothing to reject and must not crash the build."""
+    from veomni.distributed.torch_compile import _reject_incompatible_ops
+
+    _reject_incompatible_ops(nn.Linear(4, 4))
+
+
+def test_compile_rejection_walks_sub_configs():
+    """A multimodal root carries its text tower's ops one level down, so the path is reported."""
+    from veomni.distributed.torch_compile import _uncompilable_at
+
+    def ops(lin=None):
+        return SimpleNamespace(linear_implementation=lin, gated_mlp_implementation=None)
+
+    child_only = SimpleNamespace(ops_config=ops(lin="torchao_mxfp4"), sub_configs={})
+    root = SimpleNamespace(ops_config=ops(lin="eager"), sub_configs={"text_config": None}, text_config=child_only)
+
+    assert _uncompilable_at(root, prefix="") == ["text_config.linear_implementation='torchao_mxfp4'"]

@@ -26,18 +26,16 @@ import torch
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import MoeModelOutputWithPast, SequenceClassifierOutputWithPast
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
@@ -48,6 +46,10 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_moe_gpu.py",
     description="Qwen3Moe with VeOmni patches and VeomniOp replacements",
 )
+
+config.drop_import_names("PreTrainedModel", "create_causal_mask", "create_sliding_window_causal_mask")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
 
 config.add_import("typing", names=["Optional"])
 
@@ -66,18 +68,17 @@ config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", 
 config.add_import("functools", names=["partial"])
 config.add_import("transformers.modeling_outputs", names=["SequenceClassifierOutputWithPast"])
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
-config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
 config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
 )
+# Replace HF's ``create_causal_mask`` / ``create_sliding_window_causal_mask`` with
+# ``veomni.models.utils.mask_utils`` so packed ``cu_seq_lens_q`` / ``cu_seq_lens_k``
+# inputs route through ``veomni.ops.mask`` once in ``Qwen3MoeModel.forward``.
+config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import(
-    "veomni.models.utils.attention_utils",
-    names=["prepare_dense_attention_inputs"],
+    "veomni.models.utils.mask_utils",
+    names=["create_causal_mask", "create_sliding_window_causal_mask"],
 )
 config.add_import(
     "veomni.models.loss_utils",
@@ -94,11 +95,12 @@ config.drop_import_names("use_kernelized_func")
     "Qwen3MoeRMSNorm.__init__",
     description="Construct a local rms_norm VeomniOp",
 )
-def qwen3_moe_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6) -> None:
+def qwen3_moe_rmsnorm_init_patched(self, hidden_size, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.weight = nn.Parameter(torch.ones(hidden_size))
     self.variance_epsilon = eps
-    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", resolve_op_impl("rms_norm_implementation"))
+    impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+    self.veomni_rms_norm = VeomniOp("rms_norm", "standard", impl)
 
 
 @config.override_method(
@@ -114,7 +116,7 @@ def qwen3_moe_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torc
 
 @config.override_method(
     "Qwen3MoeMLP.__init__",
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 def qwen3_moe_mlp_init_patched(self, config, intermediate_size=None):
     nn.Module.__init__(self)
@@ -125,25 +127,53 @@ def qwen3_moe_mlp_init_patched(self, config, intermediate_size=None):
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
+
+
+@config.override_method(
+    "Qwen3MoeDecoderLayer.__init__",
+    description="Pass config to Qwen3MoeRMSNorm instances",
+)
+def qwen3_moe_decoder_layer_init_patched(self, config, layer_idx: int):
+    super().__init__()
+    self.self_attn = Qwen3MoeAttention(config, layer_idx)
+    if (layer_idx not in config.mlp_only_layers) and (
+        config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+    ):
+        self.mlp = Qwen3MoeSparseMoeBlock(config)
+    else:
+        self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
+    self.input_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.post_attention_layernorm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.hidden_size = config.hidden_size
+
+
+@config.override_method(
+    "Qwen3MoeModel.__init__",
+    description="Pass config to final Qwen3MoeRMSNorm",
+)
+def qwen3_moe_model_init_patched(self, config):
+    super().__init__(config)
+    self.padding_idx = config.pad_token_id
+    self.vocab_size = config.vocab_size
+
+    self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+    self.layers = nn.ModuleList(
+        [Qwen3MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+    )
+    self.norm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
+    self.rotary_emb = Qwen3MoeRotaryEmbedding(config=config)
+    self.gradient_checkpointing = False
+
+    self.post_init()
 
 
 @config.override_method(
     "Qwen3MoeMLP.forward",
-    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the gated_mlp row, which picks fused weights or the projection modules",
 )
 def qwen3_moe_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-        return self.veomni_swiglu_mlp(
-            x,
-            self.gate_proj.weight,
-            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-            self.up_proj.weight,
-            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-            self.down_proj.weight,
-            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-        )
-    return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    return self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
 
 
 @config.replace_class("Qwen3MoeExperts", description="Always call moe_experts VeomniOp on v5 gate_up_proj weights")
@@ -158,8 +188,8 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
         )
         self.down_proj = torch.nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        self.use_swiglu = config.hidden_act in {"silu", "swish"}
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
         self,
@@ -167,7 +197,8 @@ class PatchedQwen3MoeExperts(torch.nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        if not self.use_swiglu_mlp:
+        if not self.use_swiglu:
+            reject_quantizing_act_fn(self)
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,
@@ -219,6 +250,13 @@ def qwen3_moe_topk_router_forward_patched(self, hidden_states: torch.Tensor):
     return router_logits, router_top_value, router_indices
 
 
+# ================================================================
+# Patch: Qwen3MoeModel.forward
+# 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+#    into ``veomni.models.utils.mask_utils.{create_causal_mask,
+#    create_sliding_window_causal_mask}`` so packed sequences build an
+#    isolated mask once in the model forward
+# ================================================================
 @config.override_method("Qwen3MoeModel.forward", description="Support SP in Qwen3MoeModel.forward")
 def qwen3_moe_model_forward_patched(
     self,
@@ -254,15 +292,21 @@ def qwen3_moe_model_forward_patched(
         position_ids = cache_position.unsqueeze(0)
 
     mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
+    # --- Patch.1 ---
     # transformers 5.9 dropped ``cache_position`` from these constructors
-    # ("Deprecated and unused" — see masking_utils.py:917).
+    # ("Deprecated and unused" — see masking_utils.py:917). Forward ``**kwargs``
+    # so ``veomni.models.utils.mask_utils`` can build packed masks from ``cu_seq_lens_q``.
     causal_mask = mask_function(
-        config=self.config,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        past_key_values=past_key_values,
-        position_ids=position_ids,
+        **{
+            **kwargs,
+            "config": self.config,
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+        }
     )
+    # --- Patch.1 ---
 
     hidden_states = inputs_embeds
     position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
@@ -299,13 +343,13 @@ def qwen3_moe_forcausallm_init_patched(self, config):
     self.router_aux_loss_coef = config.router_aux_loss_coef
     self.num_experts = config.num_experts
     self.num_experts_per_tok = config.num_experts_per_tok
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(
         "load_balancing_loss",
         "standard",
-        resolve_op_impl("load_balancing_loss_implementation"),
+        config.ops_config.load_balancing_loss_implementation,
     )
     self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
     self.post_init()
@@ -320,7 +364,7 @@ def qwen3_moe_for_sequence_classification_init_patched(self, config):
     self.num_labels = config.num_labels
     self.model = Qwen3MoeModel(config)
     self.score = nn.Linear(config.get_text_config().hidden_size, self.num_labels, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForSequenceClassificationLoss, op=self.veomni_ce)
     self.post_init()
@@ -538,8 +582,10 @@ def qwen3_moe_sparse_moe_block_forward_patched(self, hidden_states: torch.Tensor
 @config.modify_init("Qwen3MoeAttention", description="Bind instance-local rope and attention VeomniOps")
 def qwen3_moe_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.q_norm = Qwen3MoeRMSNorm(self.head_dim, eps=self.config.rms_norm_eps, config=self.config)
+    self.k_norm = Qwen3MoeRMSNorm(self.head_dim, eps=self.config.rms_norm_eps, config=self.config)
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
@@ -567,13 +613,6 @@ def qwen3_moe_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-        kwargs,
-        impl=self.veomni_attn.impl,
-        attention_mask=attention_mask,
-        hidden_states=hidden_states,
-    )
-
     attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
@@ -583,7 +622,7 @@ def qwen3_moe_attention_forward_patched(
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
         sliding_window=self.sliding_window,
-        **attn_kwargs,
+        **kwargs,
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()

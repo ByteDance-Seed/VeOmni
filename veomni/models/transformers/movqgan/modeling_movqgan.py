@@ -17,7 +17,8 @@
 import torch
 import torch.nn as nn
 from einops import rearrange
-from transformers import PreTrainedModel
+
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 from .configuration_movqgan import MoVQGANConfig
 
@@ -566,8 +567,11 @@ class VectorQuantizer(nn.Module):
 
 class MoVQGAN(PreTrainedModel):
     config_class = MoVQGANConfig
-    _supports_flash_attn_2 = True
     supports_gradient_checkpointing = True
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # The VAE uses fixed local torch attention, with no HF backend dispatch.
+        return attn_implementation
 
     def __init__(self, config: MoVQGANConfig, **kwargs):
         super().__init__(config, **kwargs)

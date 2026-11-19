@@ -8,6 +8,34 @@ from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
+@pytest.mark.parametrize("backend", ["cpu", "cuda", "npu", "mlu"])
+@pytest.mark.parametrize("cpu_plan", [False, True])
+def test_model_attention_guard_respects_supported_host_and_plan(monkeypatch, backend, cpu_plan):
+    """The CI guard protects CPU plans and leaves local MLU tests outside its resolver."""
+    from types import SimpleNamespace
+
+    import transformers.modeling_utils
+
+    from tests.tools import model_fixtures
+    from veomni.ops import install
+
+    def resolve(_node):
+        assert backend != "mlu", "Local MLU tests must not enter the CUDA/NPU CI planner"
+        return CasePlan.sequential(LaunchSpec(device="cpu" if cpu_plan else "accelerator"))
+
+    monkeypatch.setattr(model_fixtures, "get_device_type", lambda: backend)
+    monkeypatch.setattr(model_fixtures, "resolve_plan", resolve)
+    previous = transformers.modeling_utils.lazy_import_flash_attention, install._load_veomni_local_flash_kernel
+    model_fixtures.cpu_model_attention_kernel_guard.__wrapped__(monkeypatch, SimpleNamespace(node=object()))
+    current = transformers.modeling_utils.lazy_import_flash_attention, install._load_veomni_local_flash_kernel
+    if backend != "mlu" and (backend == "cpu" or cpu_plan):
+        for loader in current:
+            with pytest.raises(AssertionError, match="CPU model construction"):
+                loader()
+    else:
+        assert current == previous
+
+
 def test_device_pool_reservations_and_full_node_exclusion():
     import threading
 

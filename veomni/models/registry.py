@@ -75,31 +75,38 @@ def raise_unsupported_veomni_modeling(model_name: str) -> None:
 
 def get_model_config(config_path: str, **kwargs):
     """Load a config, replacing it with a registered class when one exists."""
-    modeling_backend = get_env("MODELING_BACKEND")
-    if modeling_backend == "hf":
-        logger.info_rank0("[CONFIG] Force loading model config from Huggingface.")
-        return AutoConfig.from_pretrained(config_path, **kwargs)
+    from .configuration_base import get_veomni_config_class
 
-    try:
-        config = AutoConfig.from_pretrained(config_path, **kwargs)
-        model_type = config.model_type
-        if model_type in MODEL_CONFIG_REGISTRY.valid_keys():
-            kwargs.pop("trust_remote_code", None)
-            config = MODEL_CONFIG_REGISTRY[model_type]().from_pretrained(config_path, **kwargs)
-            logger.info_rank0(f"[CONFIG] Loading {model_type} from Huggingface and replaced with customized config.")
-            return config
-        logger.info_rank0(f"[CONFIG] Loading {model_type} from Huggingface as no customized config registered.")
-        return config
-    except Exception:
-        config_dict, _ = PretrainedConfig.get_config_dict(config_path, **kwargs)
-        model_type = config_dict["model_type"] if "model_type" in config_dict else config_dict["_class_name"]
-        kwargs.pop("trust_remote_code", None)
-        omni_config_registry, _, _ = _omni_registries()
-        if model_type in set(omni_config_registry.valid_keys()):
-            logger.info_rank0(f"[CONFIG] Loading {model_type} from OMNI config registry.")
-            return omni_config_registry[model_type]().from_pretrained(config_path, **kwargs)
-        logger.info_rank0(f"[CONFIG] Loading {model_type} from custom config.")
-        return MODEL_CONFIG_REGISTRY[model_type]().from_pretrained(config_path, **kwargs)
+    config_dict, _ = PretrainedConfig.get_config_dict(config_path, **kwargs)
+    model_type = config_dict.get("model_type", config_dict.get("_class_name"))
+    config_class = None
+    if get_env("MODELING_BACKEND") != "hf":
+        if model_type == "omni":
+            from .seed_omni.configuration_omni import OmniConfig
+
+            config_class = OmniConfig
+        elif model_type in MODEL_CONFIG_REGISTRY.valid_keys():
+            config_class = MODEL_CONFIG_REGISTRY[model_type]()
+        else:
+            omni_config_registry, _, _ = _omni_registries()
+            if model_type in omni_config_registry.valid_keys():
+                config_class = omni_config_registry[model_type]()
+    if config_class is None:
+        # Resolve the schema before initialization so native parent attention
+        # broadcasts cannot erase explicit child choices.
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        if model_type in CONFIG_MAPPING and not config_dict.get("auto_map"):
+            config_class = CONFIG_MAPPING[model_type]
+        else:
+            schema_kwargs = {
+                key: value for key, value in kwargs.items() if key not in {"ops_implementation", "attn_implementation"}
+            }
+            config_class = type(AutoConfig.from_pretrained(config_path, **schema_kwargs))
+    kwargs.pop("trust_remote_code", None)
+    # Pass overrides through the selected class's own loader. Composed configs
+    # must apply root choices before they load and validate module sidecars.
+    return get_veomni_config_class(config_class).from_pretrained(config_path, **kwargs)
 
 
 def get_model_processor(processor_path: str, **kwargs):
@@ -180,28 +187,29 @@ def get_model_class(model_config: PretrainedConfig):
         if model_type not in MODELING_REGISTRY.valid_keys():
             raise_unsupported_veomni_modeling(model_type)
         return MODELING_REGISTRY[model_type](arch_name)
-    if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():
+    config_class = type(model_config).__dict__.get("_hf_config_class", type(model_config))
+    if config_class in AutoModelForImageTextToText._model_mapping.keys():
         load_class = AutoModelForImageTextToText
-    elif type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
+    elif config_class in AutoModelForVision2Seq._model_mapping.keys():
         load_class = AutoModelForVision2Seq
-    elif type(model_config) in AutoModelForTextToWaveform._model_mapping.keys():
+    elif config_class in AutoModelForTextToWaveform._model_mapping.keys():
         load_class = AutoModelForTextToWaveform
     elif (
         arch_name is not None
         and "ForCausalLM" in arch_name
-        and type(model_config) in AutoModelForCausalLM._model_mapping.keys()
+        and config_class in AutoModelForCausalLM._model_mapping.keys()
     ):
         load_class = AutoModelForCausalLM
     elif (
         arch_name is not None
         and "ForTokenClassification" in arch_name
-        and type(model_config) in AutoModelForTokenClassification._model_mapping.keys()
+        and config_class in AutoModelForTokenClassification._model_mapping.keys()
     ):
         load_class = AutoModelForTokenClassification
     elif (
         arch_name is not None
         and "ForSequenceClassification" in arch_name
-        and type(model_config) in AutoModelForSequenceClassification._model_mapping.keys()
+        and config_class in AutoModelForSequenceClassification._model_mapping.keys()
     ):
         load_class = AutoModelForSequenceClassification
     else:

@@ -43,6 +43,9 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import (
     Qwen4ExpModel,
     Qwen4ExpModelOutputWithPast,
     Qwen4ExpTextModel,
+    Qwen4ExpTextNGramEmbedding,
+    Qwen4ExpTextQSAIndexer,
+    Qwen4ExpTextRMSNorm,
     Qwen4ExpTextRMSNormGated,
     Qwen4ExpVisionModel,
     apply_mask_to_padding_states,
@@ -70,8 +73,8 @@ from veomni.models.transformers.qwen4_exp.packed_ple import (
 from veomni.models.transformers.qwen4_exp.qsa_metadata import PreparedQSAMetadata, prepare_qsa_metadata
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.gated_delta_rule import GROUPED_VALUE_HEAD_IMPLS
+from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils import logging
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
@@ -87,6 +90,10 @@ config = PatchConfig(
     target_file="patched_modeling_qwen4_exp_gpu.py",
     description="Qwen4-Exp initial GPU VLM-SFT integration with explicit PLE/QSA limits",
 )
+
+config.drop_import_names("PreTrainedModel")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
 config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
 
 config.add_import(
@@ -99,14 +106,17 @@ config.add_import(
     "Qwen4ExpTextRMSNorm.__init__",
     description="Construct a local rms_norm offset VeomniOp",
 )
-def qwen4_exp_rmsnorm_init_patched(self, dim: int, group_size: int | None = None, eps: float = 1e-6) -> None:
+def qwen4_exp_rmsnorm_init_patched(
+    self, dim: int, group_size: int | None = None, eps: float = 1e-6, config=None
+) -> None:
     nn.Module.__init__(self)
     self.eps = eps
     self.weight = nn.Parameter(torch.zeros(dim))
     self.group_size = group_size
     if group_size is not None and dim % group_size != 0:
         raise ValueError(f"hidden_size ({dim}) must be divisible by group_size ({group_size}).")
-    self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
+    rms_norm_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+    self.veomni_rms_norm = VeomniOp("rms_norm", "offset", rms_norm_impl)
 
 
 @config.override_method(
@@ -119,7 +129,7 @@ def qwen4_exp_rmsnorm_forward_patched(self, x):
 
 @config.override_method(
     "Qwen4ExpTextMLP.__init__",
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 def qwen4_exp_text_mlp_init_patched(self, config, intermediate_size=None):
     nn.Module.__init__(self)
@@ -130,25 +140,15 @@ def qwen4_exp_text_mlp_init_patched(self, config, intermediate_size=None):
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
 
 @config.override_method(
     "Qwen4ExpTextMLP.forward",
-    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the gated_mlp row, which picks fused weights or the projection modules",
 )
 def qwen4_exp_text_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-        return self.veomni_swiglu_mlp(
-            x,
-            self.gate_proj.weight,
-            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-            self.up_proj.weight,
-            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-            self.down_proj.weight,
-            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-        )
-    return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    return self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
 
 
 config.add_import(
@@ -178,8 +178,8 @@ config.add_import(
 )
 config.add_import("veomni.distributed.sequence_parallel.gdn_exchange", names=["coalesced_gather_aligned"])
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.config", names=["resolve_op_impl"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
+config.add_import("veomni.ops.kernels.gated_delta_rule", names=["GROUPED_VALUE_HEAD_IMPLS"])
+config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import("veomni.models.utils.moe_utils", names=["merged_experts_act_fn_forward"])
 config.add_import("veomni.models.loss_utils", names=["ForCausalLMLoss", "load_balancing_loss"])
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
@@ -228,19 +228,15 @@ def qwen4_exp_text_model_reverse_embedding_patched(self, inputs_embeds: torch.Te
 
 @config.override_method(
     "Qwen4ExpModel.__init__",
-    description="Build local patched submodels and propagate the VeOmni MoE implementation",
+    description="Build local patched submodels instead of AutoModel",
 )
 def qwen4_exp_model_init_patched(self, config):
-    # --- Patch.1: Propagate the selected MoE backend into the nested text config. ---
-    config.text_config._moe_implementation = getattr(config, "_moe_implementation", "eager")
-    # --- Patch.1 ---
-
     super().__init__(config)
-    # --- Patch.2: Build local patched submodels instead of AutoModel ---
+    # --- Patch.1: Build local patched submodels instead of AutoModel ---
     # VeOmni patches are retained inside the VLM wrapper. ---
     self.visual = Qwen4ExpVisionModel._from_config(config.vision_config)
     self.language_model = Qwen4ExpTextModel._from_config(config.text_config)
-    # --- Patch.2 ---
+    # --- Patch.1 ---
     self.rope_deltas = None
     self.post_init()
 
@@ -364,17 +360,17 @@ def qwen4_exp_gated_deltanet_init_patched(self, config, layer_idx):
     self.veomni_rms_norm_gated = VeomniOp(
         "rms_norm_gated",
         "standard",
-        resolve_op_impl("rms_norm_gated_implementation"),
+        config.ops_config.rms_norm_gated_implementation,
     )
     self.veomni_causal_conv1d = VeomniOp(
         "causal_conv1d",
         "standard",
-        resolve_op_impl("causal_conv1d_implementation"),
+        config.ops_config.causal_conv1d_implementation,
     )
     self.veomni_chunk_gated_delta_rule = VeomniOp(
         "chunk_gated_delta_rule",
         "standard",
-        resolve_op_impl("chunk_gated_delta_rule_implementation"),
+        config.ops_config.chunk_gated_delta_rule_implementation,
     )
     # --- Patch.1 ---
 
@@ -579,7 +575,7 @@ def qwen4_exp_gated_deltanet_forward_patched(
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
     if self.num_v_heads // self.num_k_heads > 1 and not (
-        self.veomni_chunk_gated_delta_rule.impl == "flash_qla" and not use_precomputed_states
+        self.veomni_chunk_gated_delta_rule.impl in GROUPED_VALUE_HEAD_IMPLS and not use_precomputed_states
     ):
         query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -671,10 +667,27 @@ def qwen4_exp_gated_deltanet_forward_patched(
     # --- Patch.1 ---
 
 
-@config.modify_init("Qwen4ExpTextQSAIndexer", description="Bind an instance-local partial rope VeomniOp")
-def qwen4_exp_text_qsa_indexer_bind_ops(original_init, self, *args, **kwargs):
-    original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
+@config.override_method(
+    "Qwen4ExpTextQSAIndexer.__init__",
+    description="Pass config to Qwen4ExpTextRMSNorm and bind an instance-local partial rope VeomniOp",
+)
+def qwen4_exp_text_qsa_indexer_init_patched(self, config, layer_idx: int):
+    nn.Module.__init__(self)
+    self.layer_idx = layer_idx
+    self.index_n_heads = config.indexer_n_heads
+    self.index_kv_heads = config.indexer_kv_heads
+    self.index_head_dim = config.indexer_head_dim
+    self.token_budget = config.indexer_budget
+    self.compress_ratio = config.indexer_compress_ratio
+    self.block_topk = self.token_budget // self.compress_ratio
+    self.index_qk_proj = nn.Linear(
+        config.hidden_size,
+        (self.index_n_heads + self.index_kv_heads) * self.index_head_dim,
+        bias=False,
+    )
+    self.q_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps, config=config)
+    self.k_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps, config=config)
+    self.veomni_rope = VeomniOp("rope", "partial", config.ops_config.rotary_pos_emb_implementation)
 
 
 @config.override_method(
@@ -846,11 +859,83 @@ def qwen4_exp_qsa_indexer_forward_patched(
     # --- Patch.1 ---
 
 
-@config.modify_init("Qwen4ExpTextAttention", description="Bind instance-local rope and QSA attention VeomniOps")
-def qwen4_exp_text_attention_bind_ops(original_init, self, *args, **kwargs):
-    original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "partial", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_qsa_attn = VeomniOp("qsa_attention", "standard", resolve_op_impl("qsa_attention_implementation"))
+@config.override_method(
+    "Qwen4ExpTextAttention.__init__",
+    description="Pass config to Qwen4ExpTextRMSNorm and bind instance-local rope and QSA attention VeomniOps",
+)
+def qwen4_exp_text_attention_init_patched(self, config, layer_idx: int):
+    nn.Module.__init__(self)
+    self.config = config
+    self.layer_idx = layer_idx
+    self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+    self.scaling = self.head_dim**-0.5
+    self.attention_dropout = config.attention_dropout
+    self.is_causal = True
+    self.q_proj = nn.Linear(
+        config.hidden_size, config.num_attention_heads * self.head_dim * 2, bias=config.attention_bias
+    )
+    self.k_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    self.v_proj = nn.Linear(config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+    self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
+    self.q_norm = Qwen4ExpTextRMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
+    self.k_norm = Qwen4ExpTextRMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
+    self.indexer = Qwen4ExpTextQSAIndexer(config, layer_idx)
+    self.veomni_rope = VeomniOp("rope", "partial", self.config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_qsa_attn = VeomniOp("qsa_attention", "standard", self.config.ops_config.qsa_attention_implementation)
+
+
+@config.override_method(
+    "Qwen4ExpTextGatedResidual.__init__",
+    description="Pass config to Qwen4ExpTextRMSNorm",
+)
+def qwen4_exp_text_gated_residual_init_patched(self, config, use_combine: bool = True):
+    nn.Module.__init__(self)
+    self.hc_count = config.hc_count
+    self.hidden_size = config.hidden_size
+    hc_hidden_size = self.hc_count * self.hidden_size
+    self.hc_norm = Qwen4ExpTextRMSNorm(
+        hc_hidden_size, group_size=self.hidden_size, eps=config.rms_norm_eps, config=config
+    )
+    self.input_mix_weight_down = nn.Linear(hc_hidden_size, config.hc_lowrank, bias=False)
+    self.input_mix_weight_up = nn.Linear(config.hc_lowrank, hc_hidden_size, bias=False)
+    self.block_inject_weight = nn.Linear(hc_hidden_size, self.hc_count, bias=False) if use_combine else None
+
+
+@config.override_method(
+    "Qwen4ExpTextPLELayer.__init__",
+    description="Pass config to Qwen4ExpTextRMSNorm",
+)
+def qwen4_exp_text_ple_layer_init_patched(self, config, layer_idx: int, ple_layer_index: int):
+    nn.Module.__init__(self)
+    self.layer_idx = layer_idx
+    self.hidden_size = config.hidden_size
+    self.hc_count = config.hc_count
+    ple_embed_dim = config.ple_embed_dim
+    hc_hidden_size = self.hidden_size * self.hc_count
+    self.ple_embedding = Qwen4ExpTextNGramEmbedding(config, ple_embed_dim, layer_idx, ple_layer_index)
+    conv_kernel_size = config.ple_conv_kernel_size
+    conv_dilation = config.ngram_size
+    self.short_conv_state_len = (conv_kernel_size - 1) * conv_dilation
+    self.key_proj = nn.Linear(ple_embed_dim, hc_hidden_size, bias=False)
+    self.value_proj = nn.Linear(ple_embed_dim, self.hidden_size, bias=False)
+    self.norm_key = Qwen4ExpTextRMSNorm(
+        hc_hidden_size, group_size=self.hidden_size, eps=config.rms_norm_eps, config=config
+    )
+    self.norm_query = Qwen4ExpTextRMSNorm(
+        hc_hidden_size, group_size=self.hidden_size, eps=config.rms_norm_eps, config=config
+    )
+    self.norm_conv = Qwen4ExpTextRMSNorm(
+        hc_hidden_size, group_size=self.hidden_size, eps=config.rms_norm_eps, config=config
+    )
+    self.conv1d = nn.Conv1d(
+        hc_hidden_size,
+        hc_hidden_size,
+        kernel_size=conv_kernel_size,
+        groups=hc_hidden_size,
+        dilation=conv_dilation,
+        bias=False,
+    )
 
 
 @config.override_method(
@@ -961,8 +1046,8 @@ class PatchedQwen4ExpTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
-        self.veomni_moe = VeomniOp("moe_experts", "standard", resolve_op_impl("moe_implementation"))
+        self.use_swiglu = config.hidden_act in {"silu", "swish"}
+        self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
         self,
@@ -971,7 +1056,8 @@ class PatchedQwen4ExpTextExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         # --- Patch.1 ---
-        if not self.use_swiglu_mlp:
+        if not self.use_swiglu:
+            reject_quantizing_act_fn(self)
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,
@@ -1829,8 +1915,8 @@ def qwen4_exp_vision_attention_forward_patched(
 @config.modify_init("Qwen4ExpVisionAttention", description="Bind instance-local rope and attention VeomniOps")
 def qwen4_exp_vision_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_vision_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_vision_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(
@@ -2246,13 +2332,13 @@ def qwen4_exp_for_conditional_generation_init_patched(self, config):
     super().__init__(config)
     self.model = Qwen4ExpModel(config)
     self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.veomni_lb = VeomniOp(
         "load_balancing_loss",
         "standard",
-        resolve_op_impl("load_balancing_loss_implementation"),
+        config.ops_config.load_balancing_loss_implementation,
     )
     self.load_balancing_loss = partial(load_balancing_loss, op=self.veomni_lb)
     self.post_init()

@@ -23,7 +23,6 @@ kernels to ``veomni.ops.kernels.loss.token_logprobs``.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Optional
 
 import torch
 
@@ -45,9 +44,9 @@ def chunk_topk_distill_function(
     teacher_topk_log_probs: torch.Tensor,
     chunk_size: int = 1024,
     ignore_index: int = -100,
-    shift_labels: Optional[torch.Tensor] = None,
+    shift_labels: torch.Tensor | None = None,
     temperature: float = 1.0,
-    log_prob_min_clamp: Optional[float] = None,
+    log_prob_min_clamp: float | None = None,
     *,
     op: Callable[..., torch.Tensor] | None = None,
     impl: str | None = None,

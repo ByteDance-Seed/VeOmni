@@ -68,17 +68,15 @@ def _stub_npu_input_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, _TRITON_UTILS_MODULE, triton_utils)
 
 
-def _require_npu_gdr_dependencies(*, ascendc: bool = False) -> None:
-    """Skip real NPU numerics unless the optional GDR runtime is installed."""
-    pytest.importorskip("triton")
+def _require_npu_gdr_dependencies() -> None:
+    """Skip native Triton cases when the optional Ascend runtime is absent."""
     try:
         from triton._C import libtriton
-    except ImportError:
-        pytest.skip("NPU GDR kernels require triton-ascend")
-    if not hasattr(libtriton, "ascend"):
-        pytest.skip("NPU GDR kernels require the Triton Ascend backend")
-    if ascendc:
-        pytest.importorskip("fla_npu")
+
+        if not hasattr(libtriton, "ascend"):
+            raise ImportError("Triton was built without the Ascend backend")
+    except (ImportError, RuntimeError) as error:
+        pytest.skip(f"Optional NPU GDN runtime is unavailable: {error}")
 
 
 def test_rms_norm_gated_eager_matches_hf():
@@ -321,17 +319,15 @@ def test_causal_conv1d_fla_matches_eager(device):
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="causal_conv1d npu needs torch_npu")
 @pytest.mark.parametrize("dim", (256, 640))
-@pytest.mark.parametrize("lengths", (None, (61, 67), (1, 127)))
+@pytest.mark.parametrize(
+    ("lengths", "boundary_device"),
+    ((None, "cpu"), ((61, 67), "cpu"), ((61, 67), "npu"), ((1, 127), "cpu"), ((1, 127), "npu")),
+)
 @pytest.mark.parametrize("checkpointed", (False, True))
-def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, lengths, checkpointed):
+def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, lengths, boundary_device, checkpointed):
     from torch.utils.checkpoint import checkpoint
 
     _require_npu_gdr_dependencies()
-    from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
-
-    if is_arch35():
-        pytest.skip("vendored NPU causal_conv1d does not support arch35")
-
     eager = resolve_op("causal_conv1d", "standard", "eager").wrapper
     other = resolve_op("causal_conv1d", "standard", "triton").wrapper
     torch.manual_seed(13)
@@ -347,7 +343,7 @@ def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, lengths, chec
     # accurate fused FP32 reduction (notably for the packed 640-channel shard).
     x_e, w_e, b_e = make_grad_leaves(*(tensor.cpu().double() for tensor in (x, weight, bias)))
     x_o, w_o, b_o = make_grad_leaves(x, weight, bias)
-    cu = torch.tensor([0, lengths[0], 128], dtype=torch.int32) if lengths else None
+    cu = torch.tensor([0, lengths[0], 128], dtype=torch.int32, device=boundary_device) if lengths else None
     if lengths:
         out_e = torch.cat([eager(chunk, w_e, b_e, activation="silu") for chunk in x_e.split(lengths, dim=1)], dim=1)
     else:
@@ -375,11 +371,6 @@ def test_causal_conv1d_npu_matches_eager_forward_and_backward(dim, lengths, chec
 def test_causal_conv1d_npu_accepts_cpu_cu_seqlens():
     """NPU fusion attention leaves ``cu_seqlens`` on CPU; the Triton adapter moves it."""
     _require_npu_gdr_dependencies()
-    from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
-
-    if is_arch35():
-        pytest.skip("vendored NPU causal_conv1d does not support arch35")
-
     fn = resolve_op("causal_conv1d", "standard", "triton").wrapper
     batch, seq, dim, kernel = 1, 64, 256, 4
     x = torch.randn(batch, seq, dim, device="npu", dtype=torch.bfloat16, requires_grad=True)
@@ -405,10 +396,6 @@ def test_causal_conv1d_npu_short_segment_packed_matches_unpacked():
         causal_conv1d_bwd_impl,
         causal_conv1d_fwd_impl,
     )
-    from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
-
-    if is_arch35():
-        pytest.skip("vendored NPU causal_conv1d does not support arch35")
 
     def run(x, weight, initial_state, cu_seqlens=None):
         y, _ = causal_conv1d_fwd_impl(
@@ -629,66 +616,6 @@ def test_chunk_gated_delta_rule_npu_l2norm_preserves_grad_chain(
     assert seen_scales == [("forward", explicit_scale), ("backward", explicit_scale)]
 
 
-def test_fla_npu_packed_backward_reuses_normalized_cu_seqlens(
-    monkeypatch: pytest.MonkeyPatch,
-    _stub_npu_input_guard: None,
-) -> None:
-    """Backward receives the accelerator/int64 boundaries used by forward."""
-    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu as module
-
-    observed: dict[str, Tensor] = {}
-
-    def fake_chunk_fwd(query, key, value, g, beta, scale, initial_state, output_final_state, cu_seqlens, *args):
-        del key, value, beta, scale, initial_state, output_final_state, args
-        observed["forward"] = cu_seqlens
-        return g, query.transpose(1, 2).contiguous(), query.new_empty(0), None
-
-    def fake_chunk_bwd(query, key, value, g, beta, a, scale, initial_state, grad_output, cu_seqlens, *args):
-        del a, scale, initial_state, args
-        observed["backward"] = cu_seqlens
-        grad_output = grad_output.transpose(1, 2).contiguous()
-        return (
-            grad_output,
-            torch.zeros_like(key),
-            torch.zeros_like(value),
-            torch.zeros_like(beta),
-            torch.zeros_like(g),
-        )
-
-    monkeypatch.setattr(module, "_chunk_fwd", fake_chunk_fwd)
-    monkeypatch.setattr(module, "_chunk_bwd", fake_chunk_bwd)
-
-    device = torch.device("cuda" if IS_CUDA_AVAILABLE else "cpu")
-    shape = (1, 4, 2, 8)
-    query = torch.randn(shape, device=device, dtype=torch.bfloat16, requires_grad=True)
-    key = torch.randn(shape, device=device, dtype=torch.bfloat16)
-    value = torch.randn(shape, device=device, dtype=torch.bfloat16)
-    g = torch.randn(shape[:3], device=device, dtype=torch.float32)
-    beta = torch.randn(shape[:3], device=device, dtype=torch.bfloat16)
-    original_cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
-    entry = OpEntry(
-        "test_chunk_gdr",
-        "standard",
-        "fla_npu",
-        module.forward,
-        module.backward,
-        description="Test AscendC packed metadata lifetime",
-    )
-
-    output, _final_state = entry.wrapper(query, key, value, g, beta, cu_seqlens=original_cu_seqlens)
-    output.sum().backward()
-
-    forward_cu_seqlens = observed["forward"]
-    backward_cu_seqlens = observed["backward"]
-    assert forward_cu_seqlens.device == query.device
-    assert forward_cu_seqlens.dtype == torch.int64
-    assert backward_cu_seqlens.device == query.device
-    assert backward_cu_seqlens.dtype == torch.int64
-    assert backward_cu_seqlens.data_ptr() == forward_cu_seqlens.data_ptr()
-    assert original_cu_seqlens.device.type == "cpu"
-    assert original_cu_seqlens.dtype == torch.int32
-
-
 @pytest.mark.parametrize("device", _FLA_DEVICE_CASES)
 def test_chunk_gated_delta_rule_fla_matches_eager(device):
     pytest.importorskip("fla")
@@ -736,49 +663,54 @@ def test_chunk_gated_delta_rule_fla_matches_eager(device):
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")
-@pytest.mark.parametrize(("impl", "dim"), (("triton", 64), ("triton", 128), ("fla_npu", 128), ("fla_npu", 256)))
-@pytest.mark.parametrize("packed", (False, True))
-def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, dim, packed):
-    _require_npu_gdr_dependencies(ascendc=impl == "fla_npu")
+@pytest.mark.parametrize(
+    ("impl", "seq", "dim", "repeats", "packed"),
+    (
+        pytest.param("triton", 64, 64, 1, False, id="triton-small-head"),
+        pytest.param("triton", 77, 128, 20, False, id="triton-repeated-partial-chunk"),
+        pytest.param("triton", 77, 256, 20, False, id="triton-repeated-partial-wide-head"),
+        pytest.param("triton", 128, 64, 1, True, id="triton-packed-small-head"),
+        pytest.param("triton", 128, 128, 1, True, id="triton-packed"),
+    ),
+)
+def test_chunk_gated_delta_rule_npu_matches_eager_forward_and_backward(impl, seq, dim, repeats, packed):
+    """Cover Triton small heads, packed inputs, and repeated backwards."""
+    _require_npu_gdr_dependencies()
     eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
     other = resolve_op("chunk_gated_delta_rule", "standard", impl).wrapper
     torch.manual_seed(19)
-    # Ascend910B v26.6 uses K=128 while V can be 128 or 256.
-    # Keep Triton padding coverage without testing AscendC with K=256.
-    batch, seq, heads = 1, 128, 4
-    key_dim = dim if impl == "triton" else 128
-    q = torch.randn(batch, seq, heads, key_dim, device="npu", dtype=torch.bfloat16)
-    k = torch.randn(batch, seq, heads, key_dim, device="npu", dtype=torch.bfloat16)
+    batch, heads = 1, 4
+    q = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
+    k = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
     v = torch.randn(batch, seq, heads, dim, device="npu", dtype=torch.bfloat16)
     g = -torch.rand(batch, seq, heads, device="npu", dtype=torch.float32) * 0.5
     beta = torch.rand(batch, seq, heads, device="npu", dtype=torch.bfloat16)
-
-    q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
-    q_o, k_o, v_o, g_o, b_o = make_grad_leaves(q, k, v, g, beta)
     lengths = (61, 67) if packed else (seq,)
-    cu = (
-        torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], device="npu", dtype=torch.int32)
-        if packed
-        else None
-    )
-    # Independent eager calls reset recurrent state at each packed boundary.
-    segments = [tensor.split(lengths, dim=1) for tensor in (q_e, k_e, v_e, g_e, b_e)]
-    out_e = torch.cat(
-        [eager(*inputs, use_qk_l2norm_in_kernel=True)[0] for inputs in zip(*segments, strict=True)], dim=1
-    )
-    out_o, _ = other(q_o, k_o, v_o, g_o, b_o, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)
-    torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
+    cu = torch.tensor([0, 61, 128], device="npu", dtype=torch.int32) if packed else None
+    grad_output = torch.randn_like(v)
 
-    grad_output = torch.randn_like(out_e)
-    out_e.backward(grad_output)
-    out_o.backward(grad_output)
-    for actual, expected in zip((q_o, k_o, v_o, g_o, b_o), (q_e, k_e, v_e, g_e, b_e), strict=True):
-        torch.testing.assert_close(
-            actual.grad.float(),
-            expected.grad.float(),
-            atol=GDN_CHUNK_GRAD_ATOL,
-            rtol=GDN_CHUNK_GRAD_RTOL,
+    for _ in range(repeats):
+        q_e, k_e, v_e, g_e, b_e = make_grad_leaves(q, k, v, g, beta)
+        q_o, k_o, v_o, g_o, b_o = make_grad_leaves(q, k, v, g, beta)
+        # Independent eager calls reset recurrent state at packed boundaries.
+        segments = [tensor.split(lengths, dim=1) for tensor in (q_e, k_e, v_e, g_e, b_e)]
+        out_e = torch.cat(
+            [eager(*inputs, use_qk_l2norm_in_kernel=True)[0] for inputs in zip(*segments, strict=True)], dim=1
         )
+        out_o, _ = other(q_o, k_o, v_o, g_o, b_o, cu_seqlens=cu, use_qk_l2norm_in_kernel=True)
+        assert torch.isfinite(out_o).all()
+        torch.testing.assert_close(out_o.float(), out_e.float(), atol=GDN_CHUNK_ATOL, rtol=GDN_CHUNK_RTOL)
+
+        out_e.backward(grad_output)
+        out_o.backward(grad_output)
+        for actual, expected in zip((q_o, k_o, v_o, g_o, b_o), (q_e, k_e, v_e, g_e, b_e), strict=True):
+            assert torch.isfinite(actual.grad).all()
+            torch.testing.assert_close(
+                actual.grad.float(),
+                expected.grad.float(),
+                atol=GDN_CHUNK_GRAD_ATOL,
+                rtol=GDN_CHUNK_GRAD_RTOL,
+            )
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="chunk_gated_delta_rule npu needs torch_npu")
@@ -901,6 +833,405 @@ def test_chunk_gated_delta_rule_flash_qla_matches_eager(group_size: int):
 
 
 @pytest.mark.parametrize(
+    "module_path",
+    (
+        "veomni.ops.kernels.gated_delta_rule.vendor.triton.chunk_scaled_dot_kkt",
+        "veomni.ops.kernels.gated_delta_rule.vendor.triton_core.chunk_scaled_dot_kkt",
+    ),
+)
+def test_chunk_scaled_dot_kkt_fwd_requires_g_and_beta(module_path: str) -> None:
+    """Pin the vendor signature without importing Triton driver helpers."""
+    source_path = Path(__file__).resolve().parents[3].joinpath(*module_path.split(".")).with_suffix(".py")
+    source = source_path.read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "chunk_scaled_dot_kkt_fwd"
+    )
+    positional = function.args.args
+    defaults = [None] * (len(positional) - len(function.args.defaults)) + list(function.args.defaults)
+    by_name = {arg.arg: default for arg, default in zip(positional, defaults, strict=True)}
+    assert by_name["g"] is None
+    assert by_name["beta"] is None
+    assert "requires g and beta" in source
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_convolution_boundary_cache_inference_to_training():
+    """Inference warmup cannot cache tensors that autograd refuses to save."""
+    from veomni.ops.kernels.gated_delta_rule.causal_conv1d.standard.triton import _cached_boundary_tensor
+
+    _cached_boundary_tensor.cache_clear()
+    with torch.inference_mode():
+        warm = _cached_boundary_tensor((0, 17, 64), torch.int64, "cpu", 0)
+    actual = _cached_boundary_tensor((0, 17, 64), torch.int64, "cpu", 0)
+    assert actual is warm
+    assert not actual.is_inference()
+
+    class SaveBoundaries(torch.autograd.Function):
+        """Exercise the integer saved-tensor contract used by the registry."""
+
+        @staticmethod
+        def forward(ctx, x):
+            ctx.save_for_backward(actual)
+            return x.clone()
+
+        @staticmethod
+        def backward(ctx, grad):
+            assert torch.equal(ctx.saved_tensors[0], actual)
+            return grad
+
+    value = torch.ones(1, requires_grad=True)
+    SaveBoundaries.apply(value).sum().backward()
+    assert value.grad.item() == 1
+    _cached_boundary_tensor.cache_clear()
+
+
+def _native_convolution_launch_plan(context):
+    if context.capabilities.backend != "npu":
+        # A non-NPU runner needs no accelerator to skip, or to fail explicitly.
+        return LaunchSpec(device="cpu")
+    return LaunchSpec(nproc=1)
+
+
+@pytest.mark.launch_plan(provider=_native_convolution_launch_plan)
+def test_causal_conv1d_npu_boundary_cache_inference_to_training():
+    """A real NPU cache hit after inference must remain usable by backward."""
+    explicitly_required = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1"
+    if not os.environ.get("VEOMNI_CI_CAPABILITIES") and get_device_type() == "mlu":
+        if explicitly_required:
+            pytest.fail("NPU CI or an explicit NPU test requires an available NPU")
+        pytest.skip("causal_conv1d npu needs torch_npu")
+    backend = runner_capabilities().backend
+    require_npu = explicitly_required or (bool(os.environ.get("VEOMNI_CI_CAPABILITIES")) and backend == "npu")
+    available = backend == "npu" and IS_NPU_AVAILABLE and torch.npu.is_available()
+    if not available:
+        if require_npu:
+            pytest.fail("NPU CI or an explicit NPU test requires an available NPU")
+        pytest.skip("causal_conv1d npu needs torch_npu")
+    try:
+        _require_npu_gdr_dependencies()
+    except pytest.skip.Exception as exc:
+        if require_npu:
+            pytest.fail(f"NPU causal convolution dependencies are missing: {exc}")
+        raise
+
+    from veomni.ops.kernels.gated_delta_rule.causal_conv1d.standard.triton import (
+        _cached_boundary_tensor,
+        _stage_boundaries,
+    )
+
+    eager = resolve_op("causal_conv1d", "standard", "eager").wrapper
+    native = resolve_op("causal_conv1d", "standard", "triton").wrapper
+    torch.manual_seed(137)
+    x = torch.randn(1, 64, 256, device="npu", dtype=torch.bfloat16)
+    weight = torch.randn(256, 4, device="npu", dtype=torch.bfloat16)
+    bias = torch.randn(256, device="npu", dtype=torch.bfloat16)
+    boundaries = torch.tensor([0, 17, 64], dtype=torch.int32)
+
+    _cached_boundary_tensor.cache_clear()
+    try:
+        with torch.inference_mode():
+            native(x, weight, bias, activation="silu", cu_seqlens=boundaries)
+        assert _cached_boundary_tensor.cache_info().misses == 1
+        staged = _stage_boundaries(boundaries, x.device)
+        assert staged.device == x.device and not staged.is_inference()
+
+        x_native, weight_native, bias_native = make_grad_leaves(x, weight, bias)
+        actual = native(x_native, weight_native, bias_native, activation="silu", cu_seqlens=boundaries)
+        assert _cached_boundary_tensor.cache_info().hits >= 2
+
+        x_ref, weight_ref, bias_ref = make_grad_leaves(*(tensor.cpu().double() for tensor in (x, weight, bias)))
+        expected = torch.cat(
+            [eager(part, weight_ref, bias_ref, activation="silu") for part in x_ref.split((17, 47), dim=1)], dim=1
+        )
+        torch.testing.assert_close(actual.float().cpu(), expected.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
+        grad_output = torch.randn_like(actual)
+        actual.backward(grad_output)
+        expected.backward(grad_output.cpu().double())
+        for got, ref in zip((x_native, weight_native, bias_native), (x_ref, weight_ref, bias_ref), strict=True):
+            torch.testing.assert_close(
+                got.grad.float().cpu(), ref.grad.float(), atol=GDN_FUSED_GRAD_ATOL, rtol=GDN_FUSED_GRAD_RTOL
+            )
+
+        misses = _cached_boundary_tensor.cache_info().misses
+        boundaries[1] = 23  # Mutate the same CPU tensor object, not just its identity.
+        changed = _stage_boundaries(boundaries, x.device)
+        assert _cached_boundary_tensor.cache_info().misses == misses + 1
+        assert changed is not staged
+        torch.testing.assert_close(changed.cpu(), torch.tensor([0, 23, 64], dtype=boundaries.dtype), rtol=0, atol=0)
+        torch.testing.assert_close(staged.cpu(), torch.tensor([0, 17, 64], dtype=boundaries.dtype), rtol=0, atol=0)
+    finally:
+        _cached_boundary_tensor.cache_clear()
+
+
+def test_fla_npu_accepts_grouped_value_heads(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_npu_input_guard: None,
+) -> None:
+    """Hk < Hv must reach the AscendC kernel and grads keep the input heads."""
+    module = import_module("veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.fla_npu")
+    seen: list[tuple[str, tuple[int, ...], tuple[int, ...], tuple[int, ...]]] = []
+
+    def fake_chunk_fwd(query, key, value, g, beta, scale, *args):
+        del beta, args
+        seen.append(("forward", tuple(query.shape), tuple(key.shape), tuple(value.shape)))
+        return g, value.transpose(1, 2).contiguous(), query.new_empty(0), None
+
+    def fake_chunk_bwd(query, key, value, g, beta, a, scale, initial_state, grad_output, *args):
+        del a, initial_state, grad_output, args
+        seen.append(("backward", tuple(query.shape), tuple(key.shape), tuple(value.shape)))
+        return (
+            torch.zeros_like(query),
+            torch.zeros_like(key),
+            torch.zeros_like(value),
+            torch.zeros_like(beta),
+            torch.zeros_like(g),
+        )
+
+    monkeypatch.setattr(module, "_chunk_fwd", fake_chunk_fwd)
+    monkeypatch.setattr(module, "_chunk_bwd", fake_chunk_bwd)
+
+    torch.manual_seed(0)
+    batch, seq, key_heads, value_heads, head_dim = 1, 4, 2, 6, 128
+    query = torch.randn(batch, seq, key_heads, head_dim, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.randn(batch, seq, key_heads, head_dim, dtype=torch.bfloat16, requires_grad=True)
+    value = torch.randn(batch, seq, value_heads, head_dim, dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn(batch, seq, value_heads, dtype=torch.float32, requires_grad=True)
+    beta = torch.randn(batch, seq, value_heads, dtype=torch.bfloat16, requires_grad=True)
+
+    entry = OpEntry(
+        "test_fla_npu_grouped_value_heads",
+        "standard",
+        "fla_npu",
+        module.forward,
+        module.backward,
+        description="Test grouped value heads",
+    )
+    output, _final_state = entry.wrapper(query, key, value, g, beta, use_qk_l2norm_in_kernel=True)
+    assert tuple(output.shape) == (batch, seq, value_heads, head_dim)
+    output.float().square().sum().backward()
+
+    assert tuple(query.grad.shape) == (batch, seq, key_heads, head_dim)
+    assert tuple(key.grad.shape) == (batch, seq, key_heads, head_dim)
+    assert tuple(value.grad.shape) == (batch, seq, value_heads, head_dim)
+    assert tuple(g.grad.shape) == (batch, seq, value_heads)
+    assert tuple(beta.grad.shape) == (batch, seq, value_heads)
+    expected = (
+        (batch, key_heads, seq, head_dim),
+        (batch, key_heads, seq, head_dim),
+        (batch, value_heads, seq, head_dim),
+    )
+    assert seen == [("forward", *expected), ("backward", *expected)]
+
+
+def test_fla_npu_rejects_value_head_ratio_above_four(_stub_npu_input_guard: None) -> None:
+    """Hv/Hk above the composite backward's [1, 4] domain must be refused."""
+    module = import_module("veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.fla_npu")
+
+    batch, seq, key_heads, value_heads, head_dim = 1, 4, 1, 5, 128
+    query = torch.randn(batch, seq, key_heads, head_dim, dtype=torch.bfloat16)
+    key = torch.randn(batch, seq, key_heads, head_dim, dtype=torch.bfloat16)
+    value = torch.randn(batch, seq, value_heads, head_dim, dtype=torch.bfloat16)
+    g = torch.randn(batch, seq, value_heads, dtype=torch.float32)
+    beta = torch.randn(batch, seq, value_heads, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="1-4x the q/k head count"):
+        module.forward(query, key, value, g, beta)
+
+
+def test_fla_npu_chunk_table_cache_spans_layers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The host chunk table is built once per distinct boundary list."""
+    module = import_module("veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.fla_npu")
+    module._chunk_indices_table.cache_clear()
+
+    built: list[tuple[int, ...]] = []
+    original = module._prepare_chunk_indices_list
+
+    def counting(cu_seqlens, chunk_size):
+        built.append(tuple(int(x) for x in cu_seqlens))
+        return original(cu_seqlens, chunk_size)
+
+    monkeypatch.setattr(module, "_prepare_chunk_indices_list", counting)
+
+    cu_seqlens = torch.tensor([0, 3, 6], dtype=torch.int32)
+    expected = original([0, 3, 6], 64)
+    for _ in range(3):
+        _, _, _, tables = module._ensure_varlen_metadata(None, cu_seqlens, 64)
+        assert tables["64"] == expected
+
+    assert built == [(0, 3, 6)]
+
+
+def _require_fla_npu() -> None:
+    """Skip unless the optional AscendC fla_npu package and an NPU exist."""
+    if not IS_NPU_AVAILABLE:
+        pytest.skip("fla_npu needs an Ascend NPU")
+    try:
+        import fla_npu  # noqa: F401
+    except Exception as error:  # pragma: no cover - optional dependency
+        pytest.skip(f"fla_npu is unavailable: {error}")
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize(("key_heads", "value_heads"), [(2, 2), (2, 4), (2, 6)])
+def test_fla_npu_grouped_value_heads_match_expanded_reference(packed: bool, key_heads: int, value_heads: int) -> None:
+    """Grouped q/k heads must match the explicit-expansion reference kernel.
+
+    ``(2, 4)`` is the ratio-2 layout Qwen3.5 and Qwen4-Exp use by default;
+    ``(2, 6)`` keeps a non-power-of-two ratio inside the documented domain.
+    """
+    _require_fla_npu()
+    grouped_op = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu").wrapper
+    eager = resolve_op("chunk_gated_delta_rule", "standard", "eager").wrapper
+
+    torch.manual_seed(0)
+    head_dim = 128
+    ratio = value_heads // key_heads
+    lengths = (128, 96, 160)
+    total = sum(lengths)
+    device = torch.device("npu")
+
+    base = (
+        torch.randn(1, total, key_heads, head_dim, dtype=torch.bfloat16, device=device),
+        torch.randn(1, total, key_heads, head_dim, dtype=torch.bfloat16, device=device),
+        torch.randn(1, total, value_heads, head_dim, dtype=torch.bfloat16, device=device),
+        -torch.rand(1, total, value_heads, dtype=torch.float32, device=device) * 0.5,
+        torch.rand(1, total, value_heads, dtype=torch.bfloat16, device=device),
+    )
+    cu_seqlens = None
+    if packed:
+        offsets = [0]
+        for length in lengths:
+            offsets.append(offsets[-1] + length)
+        cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device=device)
+
+    query_g, key_g, value_g, g_g, beta_g = make_grad_leaves(*base)
+    query_r, key_r, value_r, g_r, beta_r = make_grad_leaves(*base)
+
+    grouped_out, _ = grouped_op(
+        query_g,
+        key_g,
+        value_g,
+        g_g,
+        beta_g,
+        cu_seqlens=cu_seqlens,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    # The eager reference rejects varlen inputs. Replay it segment by segment
+    # when the input is packed, and as one continuous sequence otherwise, so the
+    # recurrent state resets at exactly the same boundaries as the kernel.
+    expanded_query = query_r.repeat_interleave(ratio, dim=2)
+    expanded_key = key_r.repeat_interleave(ratio, dim=2)
+    reference_lengths = lengths if packed else (total,)
+    pieces = []
+    start = 0
+    for length in reference_lengths:
+        end = start + length
+        piece, _ = eager(
+            expanded_query[:, start:end],
+            expanded_key[:, start:end],
+            value_r[:, start:end],
+            g_r[:, start:end],
+            beta_r[:, start:end],
+            use_qk_l2norm_in_kernel=True,
+        )
+        pieces.append(piece)
+        start = end
+    reference_out = torch.cat(pieces, dim=1)
+
+    torch.testing.assert_close(
+        grouped_out.float(),
+        reference_out.float(),
+        atol=GDN_NPU_ATOL,
+        rtol=GDN_NPU_RTOL,
+        msg="grouped value-head output does not match the expanded reference",
+    )
+
+    grad_output = torch.randn_like(grouped_out)
+    grouped_out.backward(grad_output)
+    reference_out.backward(grad_output)
+
+    for name, actual, expected in (
+        ("q", query_g.grad, query_r.grad),
+        ("k", key_g.grad, key_r.grad),
+        ("v", value_g.grad, value_r.grad),
+        ("g", g_g.grad, g_r.grad),
+        ("beta", beta_g.grad, beta_r.grad),
+    ):
+        assert actual is not None, f"{name} has no grouped gradient"
+        assert expected is not None, f"{name} has no reference gradient"
+        torch.testing.assert_close(
+            actual.float(),
+            expected.float(),
+            atol=GDN_CHUNK_GRAD_ATOL,
+            rtol=GDN_CHUNK_GRAD_RTOL,
+            msg=f"{name} gradient does not match the expanded reference",
+        )
+
+
+def test_fla_npu_packed_backward_reuses_original_cu_seqlens(
+    monkeypatch: pytest.MonkeyPatch,
+    _stub_npu_input_guard: None,
+) -> None:
+    """Backward receives the original host boundaries used by forward."""
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu as module
+
+    observed: dict[str, Tensor] = {}
+
+    def fake_chunk_fwd(query, key, value, g, beta, scale, initial_state, output_final_state, cu_seqlens, *args):
+        del key, value, beta, scale, initial_state, output_final_state, args
+        observed["forward"] = cu_seqlens
+        return g, query.transpose(1, 2).contiguous(), query.new_empty(0), None
+
+    def fake_chunk_bwd(query, key, value, g, beta, a, scale, initial_state, grad_output, cu_seqlens, *args):
+        del a, scale, initial_state, args
+        observed["backward"] = cu_seqlens
+        grad_output = grad_output.transpose(1, 2).contiguous()
+        return (
+            grad_output,
+            torch.zeros_like(key),
+            torch.zeros_like(value),
+            torch.zeros_like(beta),
+            torch.zeros_like(g),
+        )
+
+    monkeypatch.setattr(module, "_chunk_fwd", fake_chunk_fwd)
+    monkeypatch.setattr(module, "_chunk_bwd", fake_chunk_bwd)
+
+    device = torch.device("cuda" if IS_CUDA_AVAILABLE else "cpu")
+    shape = (1, 4, 2, 8)
+    query = torch.randn(shape, device=device, dtype=torch.bfloat16, requires_grad=True)
+    key = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    value = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    g = torch.randn(shape[:3], device=device, dtype=torch.float32)
+    beta = torch.randn(shape[:3], device=device, dtype=torch.bfloat16)
+    original_cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
+    entry = OpEntry(
+        "test_chunk_gdr",
+        "standard",
+        "fla_npu",
+        module.forward,
+        module.backward,
+        description="Test AscendC packed metadata lifetime",
+    )
+
+    output, _final_state = entry.wrapper(query, key, value, g, beta, cu_seqlens=original_cu_seqlens)
+    output.sum().backward()
+
+    forward_cu_seqlens = observed["forward"]
+    backward_cu_seqlens = observed["backward"]
+    assert forward_cu_seqlens.device == original_cu_seqlens.device
+    assert forward_cu_seqlens.dtype == original_cu_seqlens.dtype
+    assert backward_cu_seqlens.device == original_cu_seqlens.device
+    assert backward_cu_seqlens.dtype == original_cu_seqlens.dtype
+    assert backward_cu_seqlens.data_ptr() == forward_cu_seqlens.data_ptr()
+    assert original_cu_seqlens.device.type == "cpu"
+    assert original_cu_seqlens.dtype == torch.int32
+
+
+@pytest.mark.parametrize(
     "lengths,chunk_size,num_heads",
     [
         ([128, 256], 64, 4),
@@ -921,7 +1252,12 @@ def test_precompute_varlen_metadata_matches_ensure(
         chunk_size=chunk_size,
     )
     g = torch.zeros(1, sum(lengths), num_heads)
-    _, ref_list, ref_tensor, ref_list_dict = m._ensure_varlen_metadata(g, cu_seqlens, chunk_size)
+    _, ref_list, ref_tensor, ref_list_dict = m._ensure_varlen_metadata(
+        g, cu_seqlens, chunk_size, cu_seqlens_list, chunk_indices, chunk_indices_list
+    )
+    _, default_list, _, default_tables = m._ensure_varlen_metadata(g, cu_seqlens, chunk_size)
+    assert default_list == ref_list
+    assert default_tables[str(chunk_size)] == chunk_indices_list[str(chunk_size)]
 
     assert cu_seqlens_list == ref_list
     assert set(chunk_indices) == set(ref_tensor)
@@ -1058,146 +1394,7 @@ def test_fla_npu_missing_fla_npu_raises_actionable(monkeypatch: pytest.MonkeyPat
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", _import)
-    sys.modules.pop("fla_npu", None)
+    monkeypatch.delitem(sys.modules, "fla_npu", raising=False)
 
     with pytest.raises(RuntimeError, match="fla_npu"):
-        m._ensure_fla_npu_registered()
-
-
-@pytest.mark.parametrize(
-    "module_path",
-    (
-        "veomni.ops.kernels.gated_delta_rule.vendor.triton.chunk_scaled_dot_kkt",
-        "veomni.ops.kernels.gated_delta_rule.vendor.triton_core.chunk_scaled_dot_kkt",
-    ),
-)
-def test_chunk_scaled_dot_kkt_fwd_requires_g_and_beta(module_path: str) -> None:
-    """Pin the vendor signature without importing Triton driver helpers."""
-    source_path = Path(__file__).resolve().parents[3].joinpath(*module_path.split(".")).with_suffix(".py")
-    source = source_path.read_text(encoding="utf-8")
-    function = next(
-        node
-        for node in ast.parse(source).body
-        if isinstance(node, ast.FunctionDef) and node.name == "chunk_scaled_dot_kkt_fwd"
-    )
-    positional = function.args.args
-    defaults = [None] * (len(positional) - len(function.args.defaults)) + list(function.args.defaults)
-    by_name = {arg.arg: default for arg, default in zip(positional, defaults, strict=True)}
-    assert by_name["g"] is None
-    assert by_name["beta"] is None
-    assert "requires g and beta" in source
-
-
-@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_convolution_boundary_cache_inference_to_training():
-    """Inference warmup cannot cache tensors that autograd refuses to save."""
-    from veomni.ops.kernels.gated_delta_rule.causal_conv1d.standard.triton import _cached_boundary_tensor
-
-    _cached_boundary_tensor.cache_clear()
-    with torch.inference_mode():
-        warm = _cached_boundary_tensor((0, 17, 64), torch.int64, "cpu", 0)
-    actual = _cached_boundary_tensor((0, 17, 64), torch.int64, "cpu", 0)
-    assert actual is warm
-    assert not actual.is_inference()
-
-    class SaveBoundaries(torch.autograd.Function):
-        """Exercise the integer saved-tensor contract used by the registry."""
-
-        @staticmethod
-        def forward(ctx, x):
-            ctx.save_for_backward(actual)
-            return x.clone()
-
-        @staticmethod
-        def backward(ctx, grad):
-            assert torch.equal(ctx.saved_tensors[0], actual)
-            return grad
-
-    value = torch.ones(1, requires_grad=True)
-    SaveBoundaries.apply(value).sum().backward()
-    assert value.grad.item() == 1
-    _cached_boundary_tensor.cache_clear()
-
-
-def _native_convolution_launch_plan(context):
-    if context.capabilities.backend != "npu":
-        # A non-NPU runner needs no accelerator to skip, or to fail explicitly.
-        return LaunchSpec(device="cpu")
-    return LaunchSpec(nproc=1)
-
-
-@pytest.mark.launch_plan(provider=_native_convolution_launch_plan)
-def test_causal_conv1d_npu_boundary_cache_inference_to_training():
-    """A real NPU cache hit after inference must remain usable by backward."""
-    explicitly_required = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1"
-    if not os.environ.get("VEOMNI_CI_CAPABILITIES") and get_device_type() == "mlu":
-        if explicitly_required:
-            pytest.fail("NPU CI or an explicit NPU test requires an available NPU")
-        pytest.skip("causal_conv1d npu needs torch_npu")
-    backend = runner_capabilities().backend
-    require_npu = explicitly_required or (bool(os.environ.get("VEOMNI_CI_CAPABILITIES")) and backend == "npu")
-    available = backend == "npu" and IS_NPU_AVAILABLE and torch.npu.is_available()
-    if not available:
-        if require_npu:
-            pytest.fail("NPU CI or an explicit NPU test requires an available NPU")
-        pytest.skip("causal_conv1d npu needs torch_npu")
-    try:
-        _require_npu_gdr_dependencies()
-    except pytest.skip.Exception as exc:
-        if require_npu:
-            pytest.fail(f"NPU causal convolution dependencies are missing: {exc}")
-        raise
-
-    from veomni.ops.kernels.gated_delta_rule.causal_conv1d.standard.triton import (
-        _cached_boundary_tensor,
-        _stage_boundaries,
-    )
-    from veomni.ops.kernels.gated_delta_rule.vendor.triton.utils import is_arch35
-
-    if is_arch35():
-        if explicitly_required:
-            pytest.fail("vendored NPU causal_conv1d does not support arch35")
-        pytest.skip("vendored NPU causal_conv1d does not support arch35")
-
-    eager = resolve_op("causal_conv1d", "standard", "eager").wrapper
-    native = resolve_op("causal_conv1d", "standard", "triton").wrapper
-    torch.manual_seed(137)
-    x = torch.randn(1, 64, 256, device="npu", dtype=torch.bfloat16)
-    weight = torch.randn(256, 4, device="npu", dtype=torch.bfloat16)
-    bias = torch.randn(256, device="npu", dtype=torch.bfloat16)
-    boundaries = torch.tensor([0, 17, 64], dtype=torch.int32)
-
-    _cached_boundary_tensor.cache_clear()
-    try:
-        with torch.inference_mode():
-            native(x, weight, bias, activation="silu", cu_seqlens=boundaries)
-        assert _cached_boundary_tensor.cache_info().misses == 1
-        staged = _stage_boundaries(boundaries, x.device)
-        assert staged.device == x.device and not staged.is_inference()
-
-        x_native, weight_native, bias_native = make_grad_leaves(x, weight, bias)
-        actual = native(x_native, weight_native, bias_native, activation="silu", cu_seqlens=boundaries)
-        assert _cached_boundary_tensor.cache_info().hits >= 2
-
-        x_ref, weight_ref, bias_ref = make_grad_leaves(*(tensor.cpu().double() for tensor in (x, weight, bias)))
-        expected = torch.cat(
-            [eager(part, weight_ref, bias_ref, activation="silu") for part in x_ref.split((17, 47), dim=1)], dim=1
-        )
-        torch.testing.assert_close(actual.float().cpu(), expected.float(), atol=GDN_NPU_ATOL, rtol=GDN_NPU_RTOL)
-        grad_output = torch.randn_like(actual)
-        actual.backward(grad_output)
-        expected.backward(grad_output.cpu().double())
-        for got, ref in zip((x_native, weight_native, bias_native), (x_ref, weight_ref, bias_ref), strict=True):
-            torch.testing.assert_close(
-                got.grad.float().cpu(), ref.grad.float(), atol=GDN_FUSED_GRAD_ATOL, rtol=GDN_FUSED_GRAD_RTOL
-            )
-
-        misses = _cached_boundary_tensor.cache_info().misses
-        boundaries[1] = 23  # Mutate the same CPU tensor object, not just its identity.
-        changed = _stage_boundaries(boundaries, x.device)
-        assert _cached_boundary_tensor.cache_info().misses == misses + 1
-        assert changed is not staged
-        torch.testing.assert_close(changed.cpu(), torch.tensor([0, 23, 64], dtype=boundaries.dtype), rtol=0, atol=0)
-        torch.testing.assert_close(staged.cpu(), torch.tensor([0, 17, 64], dtype=boundaries.dtype), rtol=0, atol=0)
-    finally:
-        _cached_boundary_tensor.cache_clear()
+        m._get_gdn_ops()

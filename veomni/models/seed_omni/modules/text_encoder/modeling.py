@@ -97,7 +97,7 @@ class InferenceMixin:
     def generate(
         self,
         conversation_list: Optional[List[ConversationItem]] = None,
-        generation_kwargs: Dict[str, Any] = dict,
+        generation_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """One FSM inference step — implemented per module (see class docstring)."""
@@ -180,10 +180,18 @@ class TextEncoder(InferenceMixin, PretrainedOmniModule):
 
     config_class = TextEncoderConfig
     base_model_prefix = ""
+    # ``wte`` is a per-token lookup, so slicing the packed ids is exact: the shard
+    # ``encode_post`` writes back is the next module's input shard, item by item.
+    # ``decode`` likewise scores only this rank's label slice.
+    supports_sp_sharded_handoff = True
     # ``ShardedEmbedding`` must be its own FSDP2 unit: under ``emb`` its table is
     # vocab-split and a parent unit would mix different ranks' vocab slices.
     _no_split_modules: list = ["ShardedEmbedding"]
     main_input_name = "input_ids"
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # This module embeds and projects tokens; it does not execute attention.
+        return attn_implementation
 
     def __init__(self, config: TextEncoderConfig):
         super().__init__(config)

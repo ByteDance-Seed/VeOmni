@@ -27,10 +27,12 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_model_get_placeholder_mask_patched,
     qwen3_vl_rmsnorm_forward_patched,
     qwen3_vl_rmsnorm_init_patched,
+    qwen3_vl_text_attention_bind_ops,
     qwen3_vl_text_attention_forward_patched,
     qwen3_vl_text_deepstack_process_patched,
     qwen3_vl_text_mlp_forward_patched,
     qwen3_vl_text_mlp_init_patched,
+    qwen3_vl_text_model_init_patched,
     qwen3_vl_vision_attention_forward_patched,
     qwen3_vl_vision_block_forward_patched,
     qwen3_vl_vision_dummy_forward_patched,
@@ -45,6 +47,8 @@ from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config i
     qwen3_vl_moe_get_parallel_plan_patched,
     qwen3_vl_moe_model_forward_patched,
     qwen3_vl_moe_model_init_patched,
+    qwen3_vl_moe_text_decoder_layer_init_patched,
+    qwen3_vl_moe_text_model_forward_patched,
 )
 from veomni.models.transformers.qwen3_vl_moe.qwen3_vl_moe_gpu_patch_gen_config import (
     config as gpu_config,
@@ -97,13 +101,29 @@ config.override_method(
     "Qwen3VLMoeTextMLP.__init__",
     replacement=qwen3_vl_text_mlp_init_patched,
     name_map=_NAME_MAP,
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 config.override_method(
     "Qwen3VLMoeTextMLP.forward",
     replacement=qwen3_vl_text_mlp_forward_patched,
     name_map=_NAME_MAP,
-    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the gated_mlp row, which picks fused weights or the projection modules",
+)
+config.override_method(
+    "Qwen3VLMoeTextDecoderLayer.__init__",
+    replacement=qwen3_vl_moe_text_decoder_layer_init_patched,
+    description="Pass config to Qwen3VLMoeTextRMSNorm instances",
+)
+config.override_method(
+    "Qwen3VLMoeTextModel.__init__",
+    replacement=qwen3_vl_text_model_init_patched,
+    name_map=_NAME_MAP,
+    description="Pass config to final Qwen3VLMoeTextRMSNorm",
+)
+config.override_method(
+    "Qwen3VLMoeTextModel.forward",
+    replacement=qwen3_vl_moe_text_model_forward_patched,
+    description="Forward packed sequence metadata to VeOmni mask builders",
 )
 config.override_method(
     "Qwen3VLMoeVisionAttention.forward",
@@ -142,6 +162,12 @@ config.override_method(
     description="Provide dummy vision forward for FSDP path with SP-aware shape",
 )
 config.adopt_init_modifications(gpu_config)
+config.override_method(
+    "Qwen3VLMoeTextAttention.__init__",
+    replacement=qwen3_vl_text_attention_bind_ops,
+    name_map=_NAME_MAP,
+    description="Pass config to Qwen3VLMoeTextRMSNorm and bind instance-local rope and attention VeomniOps",
+)
 config.override_method(
     "Qwen3VLMoeTextAttention.forward",
     replacement=qwen3_vl_text_attention_forward_patched,

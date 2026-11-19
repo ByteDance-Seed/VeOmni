@@ -24,10 +24,12 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.processing_utils import Unpack
 
 from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
+    qwen3_5_attention_bind_ops,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_text_model_init_patched,
     qwen3_5_vision_attention_forward_patched,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
@@ -53,6 +55,7 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
     mm_token_type_ids_from_input_ids,
     qwen3_5_moe_attention_forward_patched,
     qwen3_5_moe_causal_lm_get_parallel_plan_patched,
+    qwen3_5_moe_decoder_layer_init_patched,
     qwen3_5_moe_forcausallm_forward_patched,
     qwen3_5_moe_forcausallm_init_patched,
     qwen3_5_moe_forconditional_generation_forward_patched,
@@ -70,7 +73,6 @@ from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config imp
 from veomni.models.transformers.qwen3_5_moe.qwen3_5_moe_gpu_patch_gen_config import (
     config as gpu_config,
 )
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
 from veomni.patchgen.patch_spec import PatchConfig
 
 
@@ -79,6 +81,10 @@ config = PatchConfig(
     target_file="patched_modeling_qwen3_5_moe_npu.py",
     description="Qwen3_5Moe with mojo_opset NPU replacements, fused MoE, and VeOmni SP/fused loss patches",
 )
+
+config.drop_import_names("PreTrainedModel", "create_causal_mask")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
 config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
 
 config.add_import("copy", names=["copy"])
@@ -108,19 +114,18 @@ config.add_import(
 )
 config.add_import("veomni.utils.moe_router_replay", names=["get_active_replay", "maybe_replay_indices"])
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
+# Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
+# packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
+# once in ``Qwen3_5MoeTextModel.forward``.
 config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
-config.add_import(
-    "veomni.models.utils.attention_utils",
-    names=["prepare_dense_attention_inputs"],
+    "veomni.models.utils.mask_utils",
+    names=["create_causal_mask"],
 )
 config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
 )
+config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "load_balancing_loss"],
@@ -170,12 +175,23 @@ config.override_method(
 config.override_method(
     "Qwen3_5MoeMLP.__init__",
     replacement=qwen3_5_moe_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 config.override_method(
     "Qwen3_5MoeMLP.forward",
     replacement=qwen3_5_moe_mlp_forward_patched,
-    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the gated_mlp row, which picks fused weights or the projection modules",
+)
+config.override_method(
+    "Qwen3_5MoeDecoderLayer.__init__",
+    replacement=qwen3_5_moe_decoder_layer_init_patched,
+    description="Pass config to Qwen3_5MoeRMSNorm instances",
+)
+config.override_method(
+    "Qwen3_5MoeTextModel.__init__",
+    replacement=qwen3_5_text_model_init_patched,
+    name_map={"Qwen3_5": "Qwen3_5Moe"},
+    description="Pass config to final Qwen3_5MoeRMSNorm",
 )
 
 # ── Construct generated vision / text towers ──────────────────────────────────
@@ -358,14 +374,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
             chunk_indices_list=linear_attn_chunk_indices_list,
         )
     elif self.block_type == "full_attention":
-        # Self Attention. SDPA/eager reject GDN cu_seq_lens metadata.
-        attn_impl = getattr(getattr(self, "self_attn", None), "veomni_attn", None)
-        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-            kwargs,
-            impl=attn_impl.impl if attn_impl is not None else "eager",
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-        )
+        # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -373,7 +382,7 @@ def qwen3_5_moe_decoder_layer_forward_patched(
             past_key_values=past_key_values,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            **attn_kwargs,
+            **kwargs,
         )
 
     hidden_states = residual + hidden_states
@@ -445,6 +454,12 @@ config.override_method(
         "the per-block host sync that flash_attn_varlen_func incurs when "
         "`max_length_q/k` are 0-D device tensors."
     ),
+)
+config.override_method(
+    "Qwen3_5MoeAttention.__init__",
+    replacement=qwen3_5_attention_bind_ops,
+    name_map=_NAME_MAP,
+    description="Pass config to Qwen3_5MoeRMSNorm and bind instance-local rope and attention VeomniOps",
 )
 config.override_method(
     "Qwen3_5MoeAttention.forward",

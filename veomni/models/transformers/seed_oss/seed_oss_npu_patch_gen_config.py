@@ -25,10 +25,13 @@ from veomni.models.transformers.seed_oss.seed_oss_gpu_patch_gen_config import (
 )
 from veomni.models.transformers.seed_oss.seed_oss_gpu_patch_gen_config import (
     seed_oss_attention_forward_patched,
+    seed_oss_decoder_layer_init_patched,
     seed_oss_forcausallm_forward_patched,
     seed_oss_forcausallm_init_patched,
     seed_oss_mlp_forward_patched,
     seed_oss_mlp_init_patched,
+    seed_oss_model_forward_patched,
+    seed_oss_model_init_patched,
     seed_oss_rmsnorm_forward_patched,
     seed_oss_rmsnorm_init_patched,
 )
@@ -60,12 +63,27 @@ config.override_method(
 config.override_method(
     "SeedOssMLP.__init__",
     replacement=seed_oss_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 config.override_method(
     "SeedOssMLP.forward",
     replacement=seed_oss_mlp_forward_patched,
-    description="Always call the local swiglu_mlp VeomniOp, then residual dropout",
+    description="Always call the local gated_mlp VeomniOp, then residual dropout",
+)
+config.override_method(
+    "SeedOssDecoderLayer.__init__",
+    replacement=seed_oss_decoder_layer_init_patched,
+    description="Pass config to SeedOssRMSNorm instances",
+)
+config.override_method(
+    "SeedOssModel.__init__",
+    replacement=seed_oss_model_init_patched,
+    description="Pass config to final SeedOssRMSNorm",
+)
+config.override_method(
+    "SeedOssModel.forward",
+    replacement=seed_oss_model_forward_patched,
+    description="Forward packed sequence metadata to VeOmni mask builders",
 )
 config.override_method(
     "SeedOssForCausalLM.__init__",

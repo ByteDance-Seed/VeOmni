@@ -42,7 +42,6 @@ from veomni.models.transformers.gemma3.gemma3_gpu_patch_gen_config import (
     config as gpu_config,
 )
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 
 
@@ -97,28 +96,22 @@ def create_gemma3_masks(
     if past_key_values is not None:
         raise ValueError("Packed Gemma 3 VLM attention does not support past_key_values.")
 
-    q_len = inputs_embeds.shape[1]
-    packed_kwargs = {
-        "impl": attention_impl,
-        "device": inputs_embeds.device,
-        "batch_size": inputs_embeds.shape[0],
-        "dtype": inputs_embeds.dtype,
-        "cu_seqlens": cu_seq_lens_q,
+    # Route packed inputs through ``veomni.models.utils.mask_utils`` so
+    # ``block_sequence_ids`` and ``cu_seq_lens_q`` compose into isolated masks.
+    block_sequence_ids = (
+        None
+        if token_type_ids is None
+        else get_block_sequence_ids_for_mask(token_type_ids, device=inputs_embeds.device)
+    )
+    packed_mask_kwargs = {
+        **mask_kwargs,
+        "block_sequence_ids": block_sequence_ids,
+        "cu_seq_lens_q": cu_seq_lens_q,
+        "attn_implementation": attention_impl,
     }
-    if attention_mask is not None:
-        packed_kwargs["attention_mask"] = attention_mask
-    if token_type_ids is not None:
-        block_sequence_ids = get_block_sequence_ids_for_mask(token_type_ids, device=inputs_embeds.device)
-        packed_kwargs["or_mask_function"] = blockwise_overlay(block_sequence_ids)
-
     return {
-        "full_attention": packed_causal_mask(q_len, q_len, **packed_kwargs),
-        "sliding_attention": sliding_window_mask(
-            q_len,
-            q_len,
-            sliding_window=config.sliding_window,
-            **packed_kwargs,
-        ),
+        "full_attention": create_causal_mask(**packed_mask_kwargs),
+        "sliding_attention": create_sliding_window_causal_mask(**packed_mask_kwargs),
     }
 
 
@@ -270,7 +263,7 @@ def gemma3_for_conditional_generation_init_npu(self, config):
         r"^vision_tower\.vision_model\.": "model.vision_tower.",
         r"^multi_modal_projector\.": "model.multi_modal_projector.",
     }
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()

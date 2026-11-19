@@ -28,16 +28,13 @@ from functools import partial
 import torch
 from torch import nn
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 
 from veomni.models.loss_utils import ForCausalLMLoss
+from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.config import resolve_op_impl
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
-from veomni.ops.mask import packed_causal_mask, sliding_window_mask
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.model_outputs import (  # noqa: F401  re-emitted into generated file
     CausalLMOutputWithLogProbs,
@@ -52,33 +49,42 @@ config = PatchConfig(
     description="Gemma 3 text model with VeomniOp fused-loss integration",
 )
 
+config.drop_import_names("PreTrainedModel", "create_causal_mask", "create_sliding_window_causal_mask")
+config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
+
+
 config.add_import("functools", names=["partial"])
 config.add_import(
     "veomni.utils.model_outputs",
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
-config.add_import(
-    "veomni.ops.config",
-    names=["resolve_op_impl"],
-)
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
 )
+# Replace HF's ``create_causal_mask`` / ``create_sliding_window_causal_mask`` with
+# ``veomni.models.utils.mask_utils`` so packed ``cu_seq_lens_q`` / ``cu_seq_lens_k``
+# inputs route through ``veomni.ops.mask`` once in ``Gemma3TextModel.forward``.
 config.add_import(
-    "veomni.ops.mask",
-    names=["packed_causal_mask", "sliding_window_mask"],
+    "veomni.models.utils.mask_utils",
+    names=["create_causal_mask", "create_sliding_window_causal_mask"],
 )
 config.exclude_from_output("apply_rotary_pos_emb", "rotate_half")
 config.drop_import_names("use_kernelized_func")
 _bidirectional_window_overlay = None  # noqa: E305  resolved from the generated modeling file
 
 
+# ================================================================
+# Patch: Gemma3TextModel.forward
+# 1. resolve this instance's bound attention implementation and forward
+#    ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``) into
+#    ``veomni.models.utils.mask_utils.{create_causal_mask,
+#    create_sliding_window_causal_mask}``
+# ================================================================
 @config.override_method(
     "Gemma3TextModel.forward",
-    description="Packed masks use veomni.ops.mask; non-packed uses HF cache-aware builders",
+    description="Route packed and non-packed masks through veomni.models.utils.mask_utils",
 )
 def gemma3_textmodel_forward_patched(
     self,
@@ -105,66 +111,33 @@ def gemma3_textmodel_forward_patched(
         position_ids = position_ids.unsqueeze(0)
 
     if not isinstance(causal_mask_mapping := attention_mask, dict):
-        # Mask builders must follow this instance's attention impl. Reading the
-        # global ops config would let SDPA return None while eager attention
-        # still needs a causal triangle.
-        attn_impl = resolve_op_impl("attn_implementation")
+        # --- Patch.1 ---
+        # Mask builders must follow this instance's attention impl.
         for layer in self.layers[: self.config.num_hidden_layers]:
             handle = getattr(getattr(layer, "self_attn", None), "veomni_attn", None)
             if handle is not None:
                 attn_impl = handle.impl
                 break
-        cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
-        if cu_seq_lens_q is not None:
-            impl = attn_impl
-            q_len = inputs_embeds.shape[1]
-            past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
-            kv_len = q_len + past_seen
-            packed_kwargs: dict = {
-                "impl": impl,
-                "device": inputs_embeds.device,
-                "batch_size": inputs_embeds.shape[0],
-                "dtype": inputs_embeds.dtype,
-            }
-            if attention_mask is not None:
-                packed_kwargs["attention_mask"] = attention_mask
-            sliding_kwargs = dict(packed_kwargs)
-            if self.config.use_bidirectional_attention:
-                packed_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
-                sliding_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
-            causal_mask_mapping = {
-                "full_attention": packed_causal_mask(q_len, kv_len, cu_seqlens=cu_seq_lens_q, **packed_kwargs),
-                "sliding_attention": sliding_window_mask(
-                    q_len,
-                    kv_len,
-                    sliding_window=self.config.sliding_window,
-                    cu_seqlens=cu_seq_lens_q,
-                    **sliding_kwargs,
-                ),
-            }
         else:
-            mask_kwargs = {
-                "config": self.config,
-                "inputs_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "past_key_values": past_key_values,
-                "position_ids": position_ids,
-            }
-            sliding_mask_kwargs = mask_kwargs.copy()
-            if self.config.use_bidirectional_attention:
-                mask_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
-                sliding_mask_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
-            # HF builders dispatch on config._attn_implementation; keep it aligned
-            # with this instance's attention impl so flex still receives a BlockMask.
-            previous_impl = self.config._attn_implementation
-            self.config._attn_implementation = attn_impl
-            try:
-                causal_mask_mapping = {
-                    "full_attention": create_causal_mask(**mask_kwargs),
-                    "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs),
-                }
-            finally:
-                self.config._attn_implementation = previous_impl
+            attn_impl = self.config.ops_config.attn_implementation
+        mask_kwargs = {
+            **kwargs,
+            "config": self.config,
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+            "attn_implementation": attn_impl,
+        }
+        sliding_mask_kwargs = mask_kwargs.copy()
+        if self.config.use_bidirectional_attention:
+            mask_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
+            sliding_mask_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
+        causal_mask_mapping = {
+            "full_attention": create_causal_mask(**mask_kwargs),
+            "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs),
+        }
+        # --- Patch.1 ---
 
     hidden_states = inputs_embeds
     position_embeddings = {}
@@ -198,7 +171,7 @@ def gemma3_forcausallm_init_patched(self, config):
     self.model = Gemma3TextModel(config)
     self.vocab_size = config.vocab_size
     self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-    impl = resolve_op_impl("cross_entropy_loss_implementation")
+    impl = config.ops_config.cross_entropy_loss_implementation
     self.veomni_ce = VeomniOp("cross_entropy_loss", "standard", impl)
     self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
     self.post_init()
@@ -280,11 +253,12 @@ def gemma3_forcausallm_forward_patched(
     "Gemma3RMSNorm.__init__",
     description="Construct a local rms_norm offset VeomniOp",
 )
-def gemma3_rmsnorm_init_patched(self, dim: int, eps: float = 1e-6) -> None:
+def gemma3_rmsnorm_init_patched(self, dim: int, eps: float = 1e-6, config=None) -> None:
     nn.Module.__init__(self)
     self.eps = eps
     self.weight = nn.Parameter(torch.zeros(dim))
-    self.veomni_rms_norm = VeomniOp("rms_norm", "offset", resolve_op_impl("rms_norm_implementation"))
+    impl = "eager" if config is None else config.ops_config.rms_norm_implementation
+    self.veomni_rms_norm = VeomniOp("rms_norm", "offset", impl)
 
 
 @config.override_method(
@@ -295,37 +269,89 @@ def gemma3_rmsnorm_forward_patched(self, x):
     return self.veomni_rms_norm(x, self.weight, eps=self.eps)
 
 
-@config.modify_init("Gemma3MLP", description="Bind instance-local geglu swiglu_mlp VeomniOp")
+@config.modify_init("Gemma3MLP", description="Bind instance-local geglu gated_mlp VeomniOp")
 def gemma3_mlp_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "geglu", resolve_op_impl("swiglu_mlp_implementation"))
+    self.veomni_gated_mlp = VeomniOp("gated_mlp", "geglu", self.config.ops_config.gated_mlp_implementation)
+
+
+@config.override_method(
+    "Gemma3DecoderLayer.__init__",
+    description="Pass config to Gemma3RMSNorm instances",
+)
+def gemma3_decoder_layer_init_patched(self, config, layer_idx: int):
+    super().__init__()
+    self.config = config
+    self.hidden_size = config.hidden_size
+    self.layer_idx = layer_idx
+    self.self_attn = Gemma3Attention(config=config, layer_idx=layer_idx)  # noqa: F821
+    self.mlp = Gemma3MLP(config)  # noqa: F821
+    self.input_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+    self.post_attention_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+    self.pre_feedforward_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+    self.post_feedforward_layernorm = Gemma3RMSNorm(self.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+
+
+@config.override_method(
+    "Gemma3TextModel.__init__",
+    description="Pass config to final Gemma3RMSNorm",
+)
+def gemma3_textmodel_init_patched(self, config):
+    super().__init__(config)
+    self.padding_idx = config.pad_token_id
+    self.vocab_size = config.vocab_size
+
+    self.embed_tokens = Gemma3TextScaledWordEmbedding(  # noqa: F821
+        config.vocab_size, config.hidden_size, self.padding_idx, embed_scale=self.config.hidden_size**0.5
+    )
+    self.layers = nn.ModuleList(
+        [Gemma3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]  # noqa: F821
+    )
+    self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)  # noqa: F821
+    self.rotary_emb = Gemma3RotaryEmbedding(config)  # noqa: F821
+    self.gradient_checkpointing = False
+
+    self.post_init()
+
+
+@config.override_method(
+    "Gemma3MultiModalProjector.__init__",
+    description="Pass config to Gemma3RMSNorm",
+)
+def gemma3_multimodal_projector_init_patched(self, config):
+    super().__init__()
+    self.mm_input_projection_weight = nn.Parameter(
+        torch.zeros(config.vision_config.hidden_size, config.text_config.hidden_size)
+    )
+    self.mm_soft_emb_norm = Gemma3RMSNorm(  # noqa: F821
+        config.vision_config.hidden_size,
+        eps=config.vision_config.layer_norm_eps,
+        config=config.vision_config,
+    )
+    self.patches_per_image = int(config.vision_config.image_size // config.vision_config.patch_size)
+    self.tokens_per_side = int(config.mm_tokens_per_image**0.5)
+    self.kernel_size = self.patches_per_image // self.tokens_per_side
+    self.avg_pool = nn.AvgPool2d(kernel_size=self.kernel_size, stride=self.kernel_size)
 
 
 @config.override_method(
     "Gemma3MLP.forward",
-    description="Call geglu swiglu_mlp for gelu_pytorch_tanh on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the geglu gated_mlp row, which picks fused weights or the projection modules",
 )
 def gemma3_mlp_forward_patched(self, x):
-    if self.config.hidden_activation in {"gelu_pytorch_tanh", "gelu_python_tanh"} and has_plain_linear_projections(
-        self
-    ):
-        return self.veomni_swiglu_mlp(
-            x,
-            self.gate_proj.weight,
-            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-            self.up_proj.weight,
-            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-            self.down_proj.weight,
-            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-        )
-    return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    # `hidden_activation` travels with the call: the variant computes GELU-tanh, and
+    # the row falls back to this block's own `act_fn` if the config asks for
+    # something else. That check used to be an `if` around the handle call.
+    return self.veomni_gated_mlp(self, x, activation=self.config.hidden_activation)
 
 
 @config.modify_init("Gemma3Attention", description="Bind instance-local rope and attention VeomniOps")
 def gemma3_attention_bind_ops(original_init, self, *args, **kwargs):
     original_init(self, *args, **kwargs)
-    self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
-    self.veomni_attn = VeomniOp("attention", "standard", self.config._attn_implementation)
+    self.q_norm = Gemma3RMSNorm(dim=self.config.head_dim, eps=self.config.rms_norm_eps, config=self.config)  # noqa: F821
+    self.k_norm = Gemma3RMSNorm(dim=self.config.head_dim, eps=self.config.rms_norm_eps, config=self.config)  # noqa: F821
+    self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
+    self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 
 
 @config.override_method(

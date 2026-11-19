@@ -126,7 +126,12 @@ class OmniModel(PreTrainedModel):
     supports_gradient_checkpointing = False
     _no_split_modules = []
 
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # The graph runtime delegates attention to its independently configured modules.
+        return attn_implementation
+
     def __init__(self, config: OmniConfig, modules: Mapping[str, PretrainedOmniModule]):
+        # Root ops are inheritance defaults; each built module validates its final selection.
         super().__init__(config)
         self.config = config
 
@@ -356,8 +361,10 @@ class OmniModel(PreTrainedModel):
         if load_kwargs:
             raise ValueError(f"Loading from a HuggingFace checkpoint does not take {sorted(load_kwargs)}.")
         if torch_dtype == "auto":
-            hf_config = source.layout.read_hf_config(source.path)
-            torch_dtype = getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", None)
+            torch_dtype = getattr(module_config, "dtype", None)
+            if torch_dtype is None:
+                hf_config = source.layout.read_hf_config(source.path)
+                torch_dtype = getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", None)
         if isinstance(torch_dtype, str):
             torch_dtype = getattr(torch, torch_dtype)
         module = load_module_from_hf_source(
@@ -661,9 +668,11 @@ class OmniModel(PreTrainedModel):
         generation_kwargs = self.resolve_generation_kwargs(generation_kwargs)
 
         max_new_tokens = generation_kwargs.get("max_new_tokens", 2048)
+        max_steps = max_new_tokens
         total_steps = 0
-        while not self.generation_graph.is_done() and total_steps < max_new_tokens:
+        while not self.generation_graph.is_done() and total_steps < max_steps:
             self._emit_progress(total_steps)
+            emitted_before = len(self._generated)
             for node in self.generation_graph.iter_nodes(ctx):
                 module = getattr(self, node.module)
                 self._run_generation_node(module, node, ctx, generation_kwargs)
@@ -673,6 +682,10 @@ class OmniModel(PreTrainedModel):
                 self._collect_generated(ctx)
             total_steps += 1
             self.generation_graph.maybe_transition(ctx)
+            if total_steps == 1 and len(self._generated) == emitted_before:
+                # Pass 1 emitted nothing: it was prompt prefill, so it must not
+                # consume the token budget.
+                max_steps += 1
 
         self._emit_progress(total_steps)
 

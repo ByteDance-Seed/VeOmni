@@ -21,19 +21,11 @@ import os
 import pytest
 import torch
 
-from tests.models.compare import ops_config_scope
+from tests.tools.model_fixtures import cpu_model_attention_kernel_guard as cpu_model_attention_kernel_guard
 from veomni.ops import VeomniOp
 from veomni.ops import registry as op_registry
-from veomni.ops.config import get_ops_config
 from veomni.ops.platform import GpuKernelRequirement, NvidiaGpuPlatform
 from veomni.utils.device import IS_NPU_AVAILABLE
-
-
-@pytest.fixture(autouse=True)
-def preserve_ops_config():
-    """Keep each model test's installed config from leaking into the next test."""
-    with ops_config_scope(get_ops_config()):
-        yield
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +36,7 @@ def restore_modeling_backend():
     assignment mid-test (it has to outlive the model build inside the same test),
     which otherwise persists for the whole pytest process. Every later test module
     then reads the last case's backend — and under ``hf`` the veomni-only config
-    normalization (``flex_attention`` -> ``veomni_flex_attention_with_sp``) stops
+    normalization (``flex_attention`` -> ``veomni_flex_attention``) stops
     happening, so unrelated suites fail only when run after this directory.
     """
     previous = os.environ.get("MODELING_BACKEND")
@@ -97,14 +89,36 @@ def cpu_safe_diffusers_rms_norm(monkeypatch, request):
     yield
 
 
+@pytest.fixture(
+    params=[
+        pytest.param(("gpu", "eager"), id="gpu-eager"),
+        pytest.param(("gpu", "liger_kernel"), id="gpu-liger"),
+        pytest.param(("npu", "eager"), id="npu-eager"),
+        pytest.param(("npu", "torch_npu"), id="npu-native"),
+        pytest.param(("mlu", "eager"), id="mlu-eager"),
+        pytest.param(("mlu", "liger_kernel"), id="mlu-liger"),
+    ]
+)
+def selected_rope_impl(monkeypatch, request):
+    """Use valid host selections while the consumer stubs kernel binding."""
+    host, impl = request.param
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", host == "npu")
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: host == "mlu")
+    monkeypatch.setattr("veomni.utils.import_utils.is_liger_kernel_mlu_available", lambda: host == "mlu")
+    return impl
+
+
 @pytest.fixture
 def available_nvidia_ops(monkeypatch):
     """Make static NVIDIA/package gates pass without executing a GPU kernel."""
     previous_handles = dict(VeomniOp._intern)
     VeomniOp._intern.clear()
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
     monkeypatch.setattr(op_registry, "get_device_type", lambda: GpuKernelRequirement.device)
     monkeypatch.setattr(NvidiaGpuPlatform, "matches", lambda self: True)
     monkeypatch.setattr(op_registry, "is_package_available", lambda _package: True)
+    monkeypatch.setattr("transformers.modeling_utils.lazy_import_flash_attention", lambda *_args, **_kwargs: None)
     yield
     VeomniOp._intern.clear()
     VeomniOp._intern.update(previous_handles)

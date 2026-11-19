@@ -16,28 +16,11 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
 
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
-from veomni.ops.config import get_ops_config, set_ops_config
-
-
-@contextmanager
-def ops_config_scope(config):
-    """Temporarily install a config, restoring the previous object even on failure.
-
-    Scopes nest; None is a valid installed state. This restores the binding,
-    not in-place changes to attributes of a caller-owned configuration object.
-    """
-    previous = get_ops_config()
-    set_ops_config(config)
-    try:
-        yield
-    finally:
-        set_ops_config(previous)
 
 
 def eager_ops_config() -> SimpleNamespace:
@@ -48,7 +31,7 @@ def eager_ops_config() -> SimpleNamespace:
         rms_norm_implementation="eager",
         rotary_pos_emb_implementation="eager",
         rotary_pos_emb_vision_implementation="eager",
-        swiglu_mlp_implementation="eager",
+        gated_mlp_implementation="eager",
         load_balancing_loss_implementation="eager",
         moe_implementation="eager",
         rms_norm_gated_implementation="eager",
