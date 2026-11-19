@@ -126,10 +126,9 @@ decode mode), Qwen3.5 and Qwen3.5-MoE pass grouped `query` and `key` heads
 (`num_k_heads < num_v_heads`) directly to `flash_qla` instead of materializing `repeat_interleave`
 copies before the kernel. Other backends (`fla`, `eager`, NPU `triton`) and recurrent decode
 paths keep the expanded Q/K layout; Qwen3.5 and Qwen3.5-MoE still expand for `fla_npu` too.
-Qwen4-Exp is the exception: it passes grouped Q/K to `fla_npu` as well, because the AscendC
-chunk kernel supports grouped value attention (`Hv/Hk in {1, 2, 3, 4}`, with `g`/`beta` staying in
-value-head space). Grouped value heads require a v26.9.1+ build that ships both AscendC GDN
-entries; the A2/A3 installs below pin the v26.10 line.
+Qwen4-Exp also passes grouped Q/K to `fla_npu` for `Hv/Hk in {1, 2, 3, 4}`, with `g`/`beta`
+staying in value-head space. Larger ratios use expanded Q/K. Grouped value heads require a
+v26.9.1+ build that ships both AscendC GDN entries; the A2/A3 installs below pin the v26.10 line.
 
 ## Start training on NPU
 
@@ -266,11 +265,12 @@ so `triton-ascend` remains a real dependency even with the AscendC GDN backend.
 Packed calls reuse host boundary/chunk tables instead of uploading unused
 legacy metadata on every layer.
 
-The adapter fixes `disable_recompute=True` to obtain the cumulative gates and
-A matrix consumed by the stable backward API. It does not expose a second
-retain/recompute policy or the legacy `fla_npu_reuse` implementation from
-#1346. Any future policy option needs matching library support and independent
-correctness and memory/performance validation.
+The `fla_npu` adapter fixes `disable_recompute=True` to retain the cumulative
+gates and A matrix needed by the stable backward API. The separate opt-in
+`fla_npu_reuse` row also retains forward state for backward on 910C and needs
+the stable decomposed GDN operators. Both paths compact empty packed segments
+while preserving their state slots. Reuse trades memory for less recomputation;
+measure correctness and memory/throughput on the actual image and configuration.
 
 The `fla_npu` backend requires manual installation and validation. The repository's GDN tests
 cover the adapter contract: a mocked plumbing test runs everywhere, and a hardware-gated parity
@@ -278,6 +278,8 @@ test compares grouped execution against an explicitly expanded eager reference (
 `q`/`k`/`v`/`g`/`beta` gradients) and skips when `fla_npu` is absent. NPU CI does not install
 `fla_npu`, so neither the grouped dispatch nor the numerical parity of this backend has
 CI-enforced coverage; run that parity test on hardware before relying on it.
+The same qualification applies to the optional `fla_npu_reuse` backend; its
+model path expands grouped q/k heads before dispatch.
 
 If the `fla_npu` package is missing when `chunk_gated_delta_rule_implementation: fla_npu` is
 selected, the backend raises an actionable error when the model constructs its `VeomniOp` handle

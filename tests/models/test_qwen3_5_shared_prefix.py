@@ -363,13 +363,22 @@ def test_text_model_past_key_values_raises_not_implemented(monkeypatch):
         )
 
 
-def test_npu_gated_delta_rule_eager_raises_runtime_error():
-    """NPU GatedDeltaNet with eager implementation must raise RuntimeError under shared-prefix training."""
+@pytest.mark.parametrize("family", ("dense", "moe"))
+@pytest.mark.parametrize("impl", ("eager", "fla_npu", "fla_npu_reuse"))
+@pytest.mark.parametrize("no_grad", (False, True))
+def test_npu_gated_delta_rule_rejects_unsupported_shared_prefix(family, impl, no_grad):
+    """Reject unsupported shared-prefix backends even in a no-grad checkpoint forward."""
+    from contextlib import nullcontext
     from unittest.mock import MagicMock
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_npu import (
-        Qwen3_5GatedDeltaNet,
-    )
+    if family == "dense":
+        from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_npu import (
+            Qwen3_5GatedDeltaNet as gated_delta_net,
+        )
+    else:
+        from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_npu import (
+            Qwen3_5MoeGatedDeltaNet as gated_delta_net,
+        )
 
     mock_self = MagicMock()
     mock_self.layer_idx = 0
@@ -391,15 +400,21 @@ def test_npu_gated_delta_rule_eager_raises_runtime_error():
     mock_self.dt_bias = torch.zeros(2)
     mock_self.veomni_causal_conv1d = MagicMock()
     mock_self.veomni_chunk_gated_delta_rule = MagicMock()
-    mock_self.veomni_chunk_gated_delta_rule.impl = "eager"
+    mock_self.veomni_chunk_gated_delta_rule.impl = impl
 
     mock_plan = MagicMock()
     mock_plan.causal_conv1d = MagicMock(return_value=torch.randn(1, 4, 32 * 2 + 32))
+    mock_plan.gated_delta_rule = MagicMock(side_effect=AssertionError("unsupported backend reached shared-prefix"))
     hidden_states = torch.randn(1, 4, 64)
 
-    with pytest.raises(RuntimeError, match="Shared-prefix training requires a varlen-capable chunk_gated_delta_rule"):
-        Qwen3_5GatedDeltaNet.forward(
+    error_type = RuntimeError if impl == "eager" else NotImplementedError
+    message = (
+        "varlen-capable chunk_gated_delta_rule" if impl == "eager" else "gradient propagation through recurrent state"
+    )
+    with torch.no_grad() if no_grad else nullcontext(), pytest.raises(error_type, match=message):
+        gated_delta_net.forward(
             mock_self,
             hidden_states=hidden_states,
             shared_prefix_plan=mock_plan,
         )
+    mock_plan.gated_delta_rule.assert_not_called()
