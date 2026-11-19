@@ -363,15 +363,15 @@ A missing module or method still fails before the first request runs.
   [a finalized cache](../../../tests/seed_omni/test_offline_cache_writer.py#L168) or [another dp size](../../../tests/seed_omni/test_offline_cache_writer.py#L181) cannot be resumed into, and
   [a shard only one rank sees fails every rank](../../../tests/seed_omni/test_offline_cache_writer.py#L324).
 - [`tests/seed_omni/trainer/test_omni_trainer.py`](../../../tests/seed_omni/trainer/test_omni_trainer.py):
-  [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L129),
-  [it saves no model state](../../../tests/seed_omni/trainer/test_omni_trainer.py#L141),
-  [a step from the other kind of run is refused before any module loads](../../../tests/seed_omni/trainer/test_omni_trainer.py#L155),
-  [the writer opens after the trainer state is restored](../../../tests/seed_omni/trainer/test_omni_trainer.py#L178), and
-  [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L201).
+  [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L161),
+  [it saves no model state](../../../tests/seed_omni/trainer/test_omni_trainer.py#L173),
+  [a step from the other kind of run is refused before any module loads](../../../tests/seed_omni/trainer/test_omni_trainer.py#L187),
+  [the writer opens after the trainer state is restored](../../../tests/seed_omni/trainer/test_omni_trainer.py#L210), and
+  [`offline_cache_step` writes every micro-batch without autograd](../../../tests/seed_omni/trainer/test_omni_trainer.py#L233).
 - [`tests/checkpoints/test_checkpoint_callback.py`](../../../tests/checkpoints/test_checkpoint_callback.py):
-  [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L675).
+  [the writer's position is saved and restored with the cursor, and the cursor-only step is complete](../../../tests/checkpoints/test_checkpoint_callback.py#L762).
 - [`tests/checkpoints/test_dcp_checkpointer.py`](../../../tests/checkpoints/test_dcp_checkpointer.py):
-  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2803).
+  [a step without `model/` is found only when its manifest says it carries no model state](../../../tests/checkpoints/test_dcp_checkpointer.py#L2805).
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
   [a step without an lr scheduler logs no lr](../../../tests/seed_omni/trainer/test_step_metrics_callback.py#L89).
 - [`tests/seed_omni/model/test_graph.py`](../../../tests/seed_omni/model/test_graph.py):

@@ -49,7 +49,7 @@ unpadding transform before this interface.
 
 [`dpo_declared_producer_identity`](../../veomni/utils/dpo_provenance.py#L160)
 checks the concrete declaration and binds its ID, class and live methods.
-[`dpo_producer_identity`](../../veomni/data/data_transform.py#L281) checks the
+[`dpo_producer_identity`](../../veomni/data/data_transform.py#L286) checks the
 tokenizer and template together, including a template-owned tokenizer. The
 standard DPO transform reuses the attestation within each process, and checks
 again on a worker's first sample after fork or spawn. Producers, their methods,

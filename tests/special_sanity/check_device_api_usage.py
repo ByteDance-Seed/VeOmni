@@ -110,8 +110,8 @@ SEARCH_KEYWORDS = [".cuda", '"cuda"', '"nccl"']
 LINE_EXCEPTIONS = {
     "veomni/optim/optimizer.py": {
         "_qwen38_cuda_domain": {
-            'local = (mesh is not None and mesh.device_type == "cuda") or any(',
-            'return any(flags) or torch.distributed.get_backend() == "nccl"',
+            '(mesh is not None and mesh.device_type == "cuda")',
+            'or (torch.distributed.is_initialized() and torch.distributed.get_backend() == "nccl")',
         },
         "build_optimizer": {
             'local_cuda = any(param.device.type == "cuda" for group in param_groups for param in group["params"])',
