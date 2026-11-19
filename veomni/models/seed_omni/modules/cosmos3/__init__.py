@@ -14,4 +14,4 @@
 ``core/`` is the framework-neutral numeric code, carried over from the DiT port.
 """
 
-from . import convert_model, flow_connector, mot, text_encoder, vae  # noqa: F401
+from . import flow_connector, hf_layout, mot, text_encoder, vae  # noqa: F401

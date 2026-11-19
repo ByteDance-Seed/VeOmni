@@ -4,7 +4,7 @@
 #   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Cosmos3/cosmos3_nano/train/offline_training.yaml
 
 model:
-  model_path: pretrained_models/Cosmos3-Nano-omni
+  model_path: pretrained_models/Cosmos3-Nano
   model_config:
     modules: configs/seed_omni/Cosmos3/cosmos3_nano/train/modules_train.yaml
     train_graph: configs/seed_omni/Cosmos3/cosmos3_nano/train/graph_offline_training.yaml

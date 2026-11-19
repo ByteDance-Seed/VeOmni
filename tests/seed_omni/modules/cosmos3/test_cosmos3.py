@@ -15,7 +15,6 @@ from veomni.data.seed_omni.utils.media_metadata import VIDEO_METADATA_KEY, Video
 from veomni.models.seed_omni import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modeling_omni import OmniModel
-from veomni.models.seed_omni.modules.cosmos3.convert_model import route_weight
 from veomni.models.seed_omni.modules.cosmos3.core import (
     add_time_conditioning,
     build_latent_grid,
@@ -28,6 +27,7 @@ from veomni.models.seed_omni.modules.cosmos3.core import (
     unpatchify_latent,
 )
 from veomni.models.seed_omni.modules.cosmos3.flow_connector.configuration import Cosmos3FlowConnectorConfig
+from veomni.models.seed_omni.modules.cosmos3.hf_layout import COSMOS3_HF_LAYOUT
 from veomni.models.seed_omni.modules.cosmos3.item_meta import FPS_KEY, LATENT_KEY
 from veomni.models.seed_omni.modules.cosmos3.mot.configuration import Cosmos3MotConfig
 from veomni.models.seed_omni.modules.cosmos3.mot.modeling import LAST_LAYER_REASONER_ONLY_KEYS, TRAINABLE_NAME_KEYS
@@ -254,16 +254,16 @@ def test_parameter_names_are_the_checkpoint_keys_of_their_own_module():
     names = set()
     for module_name, module in modules.items():
         for name, _ in module.named_parameters():
-            assert route_weight(name) == module_name, name
+            assert COSMOS3_HF_LAYOUT.route(name) == (module_name, name), name
             names.add(name)
     assert names == expected, sorted(names ^ expected)
 
 
 def test_dropped_and_unknown_checkpoint_keys():
-    assert route_weight("blocks.0.attn.qkv.weight") is None
-    assert route_weight("action_proj_in.weight") is None
+    assert COSMOS3_HF_LAYOUT.route("blocks.0.attn.qkv.weight") is None
+    assert COSMOS3_HF_LAYOUT.route("action_proj_in.weight") is None
     with pytest.raises(ValueError, match="no route"):
-        route_weight("visual.patch_embed.proj.weight")
+        COSMOS3_HF_LAYOUT.route("visual.patch_embed.proj.weight")
 
 
 def test_freezing_the_reasoner_keeps_only_the_generation_tower_trainable():

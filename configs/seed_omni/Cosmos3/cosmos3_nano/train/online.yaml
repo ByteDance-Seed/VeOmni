@@ -1,15 +1,13 @@
 # Cosmos3-Nano SFT on SeedOmni (open-source vision_sft_nano recipe), online: the
 # Wan2.2 VAE encodes inside the step.
 #
-#   python scripts/seed_omni/convert_model.py \
-#     --model_path pretrained_models/Cosmos3-Nano/transformer \
-#     --output_dir pretrained_models/Cosmos3-Nano-omni
+# Download Cosmos3-Nano first; no offline checkpoint conversion is needed.
 #   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Cosmos3/cosmos3_nano/train/online.yaml
 #
 # Joint training of both towers: see modules_train.yaml.
 
 model:
-  model_path: pretrained_models/Cosmos3-Nano-omni
+  model_path: pretrained_models/Cosmos3-Nano
   model_config:
     modules: configs/seed_omni/Cosmos3/cosmos3_nano/train/modules_train.yaml
     train_graph: configs/seed_omni/Cosmos3/cosmos3_nano/train/graph_online.yaml

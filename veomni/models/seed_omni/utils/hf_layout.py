@@ -235,6 +235,13 @@ class OmniHFLayout:
                 return dict.fromkeys(f.keys(), _SAFE_WEIGHTS_NAME)
         raise FileNotFoundError(f"{source_path} has neither {_SAFE_WEIGHTS_INDEX_NAME} nor {_SAFE_WEIGHTS_NAME}.")
 
+    def validate_module_state(self, source_path: str, name: str, model: torch.nn.Module) -> None:
+        """Optional source-specific key/shape checks on the bare module before parallel wrapping."""
+
+    def resolve_source_path(self, source_path: str) -> str:
+        """Canonical source root used for configs, assets, weights, and exports."""
+        return source_path
+
     def resolve_weights_path(self, source_path: str) -> str:
         """Directory :func:`load_model_weights` reads safetensors from for ``source_path``."""
         return source_path
@@ -284,6 +291,11 @@ class HFSource:
     path: str
     model_type: str
 
+    @classmethod
+    def from_path(cls, path: str, model_type: str) -> HFSource:
+        layout = get_hf_layout(model_type)
+        return cls(path=os.path.realpath(layout.resolve_source_path(path)), model_type=model_type)
+
     @property
     def layout(self) -> OmniHFLayout:
         return get_hf_layout(self.model_type)
@@ -319,10 +331,18 @@ def read_hf_source(checkpoint_root: str | os.PathLike | None) -> HFSource | None
 
 def _read_root_model_type(path: str) -> str | None:
     config_path = os.path.join(path, "config.json")
-    if not os.path.isfile(config_path):
-        return None
-    with open(config_path, encoding="utf-8") as f:
-        return json.load(f).get("model_type")
+    model_type = None
+    if os.path.isfile(config_path):
+        with open(config_path, encoding="utf-8") as f:
+            model_type = json.load(f).get("model_type")
+    if model_type in (None, "qwen3_vl_text"):
+        # Older Cosmos snapshots lack a root config; older conversion commands
+        # also name the transformer component instead of the release root.
+        from ..modules.cosmos3.hf_layout import is_cosmos3_component_tree
+
+        if is_cosmos3_component_tree(path):
+            return "cosmos3_omni"
+    return model_type
 
 
 _VIEW_CACHE: dict[str, str] = {}
@@ -331,9 +351,9 @@ _VIEW_CACHE: dict[str, str] = {}
 def resolve_omni_checkpoint_root(path: str | os.PathLike | None) -> str | os.PathLike | None:
     """Return ``path`` itself for a split checkpoint, or a weight-free view of an HF one.
 
-    Detection is by the root ``config.json``'s ``model_type``: ``omni`` (or no
-    ``config.json``) is a split checkpoint and passes through; a type with a
-    registered :class:`OmniHFLayout` gets a view; any other type is an error,
+    Detection is by the root ``config.json``'s ``model_type`` (or a recognized
+    component tree): ``omni`` and unrecognized config-less paths pass through;
+    a type with a registered :class:`OmniHFLayout` gets a view; any other type is an error,
     since reading it as an omni root would only fail later and more obscurely.
     The view is built once per process and source.
     """
@@ -350,11 +370,11 @@ def resolve_omni_checkpoint_root(path: str | os.PathLike | None) -> str | os.Pat
             f"for `{model_type}`. Convert it with scripts/seed_omni/convert_model.py, or register an "
             "OmniHFLayout for the family."
         )
-    key = os.path.realpath(path)
-    view = _VIEW_CACHE.get(key)
+    source = HFSource.from_path(str(path), model_type)
+    view = _VIEW_CACHE.get(source.path)
     if view is None or not os.path.isfile(os.path.join(view, HF_SOURCE_FILE)):
-        view = _write_hf_view(HFSource(path=key, model_type=model_type))
-        _VIEW_CACHE[key] = view
+        view = _write_hf_view(source)
+        _VIEW_CACHE[source.path] = view
     return view
 
 
@@ -477,6 +497,7 @@ def attach_hf_source_converter(model: torch.nn.Module, source: HFSource, module_
             f"Module {module_name!r} is not part of the `{source.model_type}` HF layout "
             f"(modules: {sorted(layout.modules)}). Under an HF model_path every module must come from the layout."
         )
+    layout.validate_module_state(source.path, module_name, model)
     inner_factory = getattr(type(model), "_create_checkpoint_tensor_converter", None)
     # Read off the bare module now: the factory may later be handed a LoRA
     # wrapper, whose names carry a ``base_model.model.`` prefix.
@@ -611,7 +632,7 @@ def convert_with_hf_layout(
     from .convert_registry import attach_module_assets
 
     model_type = _read_root_model_type(model_path)
-    source = HFSource(path=os.path.realpath(model_path), model_type=model_type)
+    source = HFSource.from_path(model_path, model_type)
     layout = source.layout
     hf_config = layout.read_hf_config(source.path)
     default_dtype = getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", None)

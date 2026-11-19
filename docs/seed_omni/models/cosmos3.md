@@ -38,22 +38,25 @@ There is no generation graph: the model is training-only for now, see
 
 ## 1. Checkpoint
 
-The release is a diffusers-style tree (`transformer/`, `vae/`, `text_tokenizer/`)
-with no root `config.json`, so the converter is registered on the transformer's
-`model_type` (`qwen3_vl_text`) and runs on that subfolder:
+Point `model.model_path` at the downloaded release. The recipes use
+`pretrained_models/Cosmos3-Nano` directly: the layout reads weights from
+`transformer/` and `vae/` and binds the tokenizer to the text encoder. No
+converted copy of the weights is needed. Component-only snapshots without a
+root config and the older `.../Cosmos3-Nano/transformer` path are also supported;
+keep the sibling VAE and tokenizer with the transformer.
 
 ```bash
 modelscope download --model nvidia/Cosmos3-Nano --local_dir pretrained_models/Cosmos3-Nano
+# Optional: materialize a standalone SeedOmni split checkpoint using the same layout.
 python scripts/seed_omni/convert_model.py \
-  --model_path pretrained_models/Cosmos3-Nano/transformer \
+  --model_path pretrained_models/Cosmos3-Nano \
   --output_dir pretrained_models/Cosmos3-Nano-omni
 ```
 
-Every transformer tensor is routed by a prefix table and loaded with
-`strict=True`, so a key that no module owns, or a module parameter the
-checkpoint lacks, stops the conversion. Two groups are dropped on purpose: the
-Qwen3-VL vision encoder (`blocks.`, `merger.`, `patch_embed.`, ...), which this
-recipe never runs, and the audio / action pathways, which Nano does not train.
+An existing split checkpoint remains usable as `model.model_path`. On direct
+load and conversion the layout checks parameter names and shapes. The training
+modules intentionally skip the vision encoder and the audio/action paths in
+the transformer shards; a source-layout HF export preserves those tensors.
 
 ## 2. The freeze switch
 

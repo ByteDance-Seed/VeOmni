@@ -4,7 +4,7 @@
 #   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Cosmos3/cosmos3_nano/train/offline_embedding.yaml
 
 model:
-  model_path: pretrained_models/Cosmos3-Nano-omni
+  model_path: pretrained_models/Cosmos3-Nano
   model_config:
     # Only the VAE: the prompts are cached as text and tokenized by the training run.
     modules: configs/seed_omni/Cosmos3/cosmos3_nano/train/modules_offline_embedding.yaml
