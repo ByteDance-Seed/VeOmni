@@ -507,21 +507,16 @@ class GlobalStateCallback(Callback):
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "checking restored optimizer providers")
+        # Optimizer ownership and the training task are replicated job configuration.
         has_legacy = bool(legacy_checkpoints)
         requires_manifest = strict_optimizer or bool(legacy_checkpoints or unknown_checkpoints)
         if dist.is_initialized():
             local_generations = tuple(sorted(generations.items()))
-            local_contract = (local_generations, requires_manifest, has_legacy, offline_resume)
-            restored_contracts = [None] * dist.get_world_size()
-            dist.all_gather_object(restored_contracts, local_contract)
-            if any(value[0] != local_generations for value in restored_contracts):
+            restored_generations = [None] * dist.get_world_size()
+            dist.all_gather_object(restored_generations, local_generations)
+            if any(value != local_generations for value in restored_generations):
                 raise RuntimeError("Restored optimizer checkpoint generations differ across ranks")
-            # Any optimizer owner requires all ranks to verify the source.
-            requires_manifest = any(value[1] for value in restored_contracts)
-            has_legacy = any(value[2] for value in restored_contracts)
-            if any(value[3] != offline_resume for value in restored_contracts):
-                raise RuntimeError("Offline checkpoint mode differs across ranks")
-        coordinated_resume = strict_resume or requires_manifest or offline_resume
+        coordinated_resume = strict_resume or requires_manifest
 
         manifest = None
         if requires_manifest or offline_resume:
@@ -1069,7 +1064,6 @@ class GlobalStateCallback(Callback):
                 legacy_checkpoints,
                 unknown_checkpoints,
                 legacy_cursor_proven,
-                has_legacy=has_legacy,
             )
 
         logger.info_rank0(
@@ -1087,11 +1081,9 @@ class GlobalStateCallback(Callback):
         legacy_checkpoints=(),
         unknown_checkpoints=(),
         legacy_cursor_proven=True,
-        has_legacy=None,
     ):
         """Reuse a proven checkpoint only at its original output location."""
-        if has_legacy is None:
-            has_legacy = bool(legacy_checkpoints)
+        has_legacy = bool(legacy_checkpoints)
         same_output, error = False, None
         try:
             save_root = getattr(self.trainer.args.train.checkpoint, "save_path", None)
