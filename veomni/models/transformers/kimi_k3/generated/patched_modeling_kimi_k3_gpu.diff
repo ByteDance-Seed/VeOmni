@@ -116,7 +116,7 @@
  import torch.utils.checkpoint
  from einops import rearrange
  from transformers.activations import ACT2FN, PytorchGELUTanh
-@@ -33,40 +100,266 @@
+@@ -33,40 +100,287 @@
  from transformers.configuration_utils import PretrainedConfig
  from transformers.generation import GenerationMixin
  from transformers.masking_utils import create_causal_mask
@@ -393,6 +393,27 @@
 +    if input_ids is None:
 +        return None
 +    return torch.arange(input_ids.shape[-1], device=input_ids.device).expand_as(input_ids)
++
++
++def _kimi_k3_decoder_attn_implementation(model):
++    """The attention implementation the decoder layers actually run.
++
++    The packed-batch guards in both entry points must consult the decoder's
++    own selection (round-6 review): the VLM root config permits per-child
++    attention selections that rank above the root value (the round-3
++    mapping form), so the text child is the authority; on the text-only
++    entry the config IS the text config and the same resolution applies.
++    Reading the root first let a root varlen / text eager pair slip a
++    packed row past the guard (the dense eager mask would attend across
++    samples) and, symmetrically, rejected a valid varlen-configured pack.
++    """
++    decoder_config = getattr(model.config, "text_config", None)
++    if decoder_config is None:
++        decoder_config = model.config
++    attn_impl = getattr(decoder_config, "_attn_implementation", None)
++    if attn_impl is None:
++        attn_impl = getattr(model.config, "_attn_implementation", None)
++    return attn_impl
 
 
  logger = logging.get_logger(__name__)
@@ -400,7 +421,7 @@
 
  # Flash attention (vision tower only): patchgen hoists conditional imports to
  # the module top level, so `flash_attn_varlen_func` is unconditionally None
-@@ -76,6 +369,12 @@
+@@ -76,6 +390,12 @@
  flash_attn_varlen_func = None
 
 
@@ -413,7 +434,7 @@
  # Register Moonshot-specific activation functions
  class SituAndMul(nn.Module):
      """
-@@ -83,19 +382,16 @@
+@@ -83,19 +403,16 @@
      When linear_beta is set, up is also transformed by linear_beta * tanh(up / linear_beta).
      """
 
@@ -438,7 +459,7 @@
 
 
  def _get_situ_activation_params(config: KimiLinearConfig):
-@@ -234,51 +530,112 @@
+@@ -245,51 +562,112 @@
          return self.conv_states[self.last_linear_layer] is not None
 
 
@@ -585,7 +606,7 @@
 
 
  class KimiMLP(nn.Module):
-@@ -340,12 +697,22 @@
+@@ -351,12 +729,22 @@
      return out, probs
 
 
@@ -609,7 +630,7 @@
          nn.Module.__init__(self)
          self.config = config
          self.layer_idx = layer_idx
-@@ -411,15 +778,59 @@
+@@ -422,15 +810,59 @@
              self.g_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
 
          self.rotary_emb = None
@@ -672,7 +693,7 @@
          batch_size, seq_length = hidden_states.shape[:-1]
          query_shape = (batch_size, seq_length, -1, self.q_head_dim)
          key_shape = (batch_size, seq_length, -1, self.qk_nope_head_dim + self.v_head_dim)
-@@ -450,11 +861,22 @@
+@@ -461,11 +893,22 @@
          if self.config._attn_implementation == "flash_attention_2" and self.q_head_dim != self.v_head_dim:
              value_states = F.pad(value_states, [0, self.q_head_dim - self.v_head_dim])
 
@@ -700,7 +721,7 @@
              self,
              query_states,
              key_states,
-@@ -462,7 +884,7 @@
+@@ -473,7 +916,7 @@
              attention_mask,
              dropout=0.0 if not self.training else self.attention_dropout,
              scaling=self.scaling,
@@ -709,7 +730,7 @@
          )
 
          if self.config._attn_implementation == "flash_attention_2" and self.q_head_dim != self.v_head_dim:
-@@ -473,11 +895,30 @@
+@@ -484,11 +927,30 @@
              g = self.g_proj(hidden_states).sigmoid()
              attn_output = attn_output * g
          attn_output = self.o_proj(attn_output)
@@ -741,7 +762,7 @@
          super().__init__()
          self.config = config
          self.mode = "chunk"
-@@ -535,14 +976,19 @@
+@@ -546,14 +1008,19 @@
 
          self.o_norm = FusedRMSNormGated(self.head_dim, eps=config.rms_norm_eps, activation="sigmoid")
          self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
@@ -764,7 +785,7 @@
          if attention_mask is not None:
              if attention_mask.dim() != 2:
                  attention_mask = kwargs.get("padding_mask")
-@@ -552,6 +998,23 @@
+@@ -563,6 +1030,23 @@
                      "attention_mask must be a 0-1 matrix of shape [batch_size, seq_len] "
                      "(0 = padding). 3D masks are not supported here.",
                  )
@@ -788,7 +809,7 @@
          use_cache = cache_params is not None
          batch_size, q_len, _ = hidden_states.shape
          mode = "fused_recurrent" if use_cache and q_len == 1 else self.mode
-@@ -570,10 +1033,25 @@
+@@ -581,10 +1065,25 @@
              assert mode == "chunk", "Only chunk mode is supported in training."
 
          cu_seqlens = kwargs.get("cu_seqlens")
@@ -814,7 +835,7 @@
 
          conv_state_q, conv_state_k, conv_state_v = None, None, None
          recurrent_state = None
-@@ -590,18 +1068,21 @@
+@@ -601,18 +1100,21 @@
              cache=conv_state_q,
              output_final_state=use_cache,
              cu_seqlens=cu_seqlens,
@@ -836,7 +857,7 @@
          )
          g = self.f_b_proj(self.f_a_proj(hidden_states))
          g = rearrange(g, "... (h d) -> ... h d", d=self.head_dim)
-@@ -612,7 +1093,7 @@
+@@ -623,7 +1125,7 @@
          v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
 
          if mode == "chunk":
@@ -845,7 +866,7 @@
                  q=q,
                  k=k,
                  v=v,
-@@ -629,6 +1110,7 @@
+@@ -640,6 +1142,7 @@
                  lower_bound=self.gate_lower_bound,
                  transpose_state_layout=True,
                  cu_seqlens=cu_seqlens,
@@ -853,7 +874,7 @@
                  disable_recompute=True,
              )
          else:
-@@ -664,8 +1146,16 @@
+@@ -675,8 +1178,16 @@
          o = self.o_proj(o)
          if attention_mask is not None:
              o = pad_input(o.squeeze(0), indices, batch_size, q_len)
@@ -870,7 +891,7 @@
 
 
  class KimiMoEGate(nn.Module):
-@@ -701,10 +1191,9 @@
+@@ -717,10 +1228,9 @@
          self.reset_parameters()
 
      def reset_parameters(self) -> None:
@@ -882,7 +903,7 @@
      def forward(self, hidden_states):
          bsz, seq_len, h = hidden_states.shape
          # compute gating score
-@@ -724,7 +1213,7 @@
+@@ -740,7 +1250,7 @@
              )
 
          # select top-k experts
@@ -891,7 +912,7 @@
          scores = scores.view(bsz * seq_len, -1)
          scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
          if self.num_expert_group > 1 and self.num_expert_group > self.topk_group:
-@@ -769,13 +1258,29 @@
+@@ -785,13 +1295,29 @@
          return topk_idx, topk_weight
 
 
@@ -926,7 +947,7 @@
          super().__init__()
          self.config = config
          self.hidden_dim = config.hidden_size
-@@ -787,20 +1292,16 @@
+@@ -803,20 +1329,16 @@
          self.moe_hidden_size = config.routed_expert_hidden_size if self.use_latent_moe else config.hidden_size
          self.latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
 
@@ -955,7 +976,7 @@
          if config.num_shared_experts is not None:
              intermediate_size = config.moe_intermediate_size * config.num_shared_experts
              self.shared_experts = KimiMLP(
-@@ -823,6 +1324,7 @@
+@@ -839,6 +1361,7 @@
                  self.routed_expert_norm = KimiRMSNorm(
                      self.moe_hidden_size,
                      eps=config.rms_norm_eps,
@@ -963,7 +984,7 @@
                  )
 
      def forward(self, hidden_states):
-@@ -834,10 +1336,9 @@
+@@ -850,10 +1373,9 @@
          if self.use_latent_moe:
              hidden_states = self.routed_expert_down_proj(hidden_states)
 
@@ -977,7 +998,7 @@
 
          if self.use_latent_moe:
              if self.latent_moe_use_norm:
-@@ -850,40 +1351,11 @@
+@@ -866,40 +1388,11 @@
              y = y + self.shared_experts(identity)
          return y
 
@@ -1023,7 +1044,7 @@
 
 
  class KimiDecoderLayer(GradientCheckpointingLayer):
-@@ -958,7 +1430,7 @@
+@@ -974,7 +1467,7 @@
          output_attentions: bool | None = False,
          use_cache: bool | None = False,
          block_residual: torch.Tensor | None = None,
@@ -1032,7 +1053,7 @@
      ):
          if self.use_attn_residuals:
              return self._forward_attn_residual(
-@@ -977,15 +1449,31 @@
+@@ -993,15 +1486,31 @@
          hidden_states = self.input_layernorm(hidden_states)
 
          # Self Attention
@@ -1073,7 +1094,7 @@
          hidden_states = residual + hidden_states
 
          # Fully Connected
-@@ -1008,7 +1496,7 @@
+@@ -1024,7 +1533,7 @@
          output_attentions: bool | None = False,
          use_cache: bool | None = False,
          block_residual: torch.Tensor | None = None,
@@ -1082,7 +1103,7 @@
      ):
          batch_size, seq_len, hidden_size = hidden_states.shape
          prefix_sum = hidden_states
-@@ -1028,15 +1516,31 @@
+@@ -1044,15 +1553,31 @@
          hidden_states = self.input_layernorm(hidden_states)
 
          # Self Attention
@@ -1123,7 +1144,7 @@
 
          if prefix_sum is not None:
              prefix_sum = prefix_sum + hidden_states
-@@ -1062,6 +1566,36 @@
+@@ -1078,6 +1603,36 @@
              prefix_sum = prefix_sum + hidden_states
 
          return prefix_sum, block_residual
@@ -1160,7 +1181,7 @@
 
 
  class KimiPreTrainedModel(PreTrainedModel):
-@@ -1078,8 +1612,58 @@
+@@ -1094,8 +1649,58 @@
      }
      _is_stateful = True
 
@@ -1219,7 +1240,7 @@
          if isinstance(module, nn.Linear):
              module.weight.data.normal_(mean=0.0, std=std)
              if module.bias is not None:
-@@ -1087,15 +1671,10 @@
+@@ -1103,15 +1708,10 @@
          elif isinstance(module, nn.Embedding):
              module.weight.data.normal_(mean=0.0, std=std)
              if module.padding_idx is not None:
@@ -1236,7 +1257,7 @@
              module.reset_parameters()
 
 
-@@ -1115,8 +1694,15 @@
+@@ -1131,8 +1731,15 @@
      return hidden_states.to(v.dtype)
 
 
@@ -1253,7 +1274,7 @@
          super().__init__(config)
          self.padding_idx = config.pad_token_id
          self.vocab_size = config.vocab_size
-@@ -1125,21 +1711,18 @@
+@@ -1141,21 +1748,18 @@
          self.layers = nn.ModuleList(
              [KimiDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
          )
@@ -1282,7 +1303,7 @@
          self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
          self.gradient_checkpointing = False
          # Initialize weights and apply final processing
-@@ -1258,6 +1841,12 @@
+@@ -1274,6 +1878,12 @@
          ).view(batch_size, seq_len, hidden_size)
 
 
@@ -1295,7 +1316,7 @@
  class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
      @classmethod
      def _supports_default_dynamic_cache(cls) -> bool:
-@@ -1265,46 +1854,98 @@
+@@ -1281,46 +1891,98 @@
 
      _tied_weights_keys = ["lm_head.weight"]
 
@@ -1396,7 +1417,7 @@
 +        # documented debug-only dense path (used by the CPU packing tests).
 +        _cu_seq_lens_q = fa_kwargs.get("cu_seq_lens_q")
 +        if _cu_seq_lens_q is not None and os.environ.get("K3_ALLOW_DENSE_PACKED", "0") != "1":
-+            _attn_impl = getattr(self.config, "_attn_implementation", None)
++            _attn_impl = _kimi_k3_decoder_attn_implementation(self)
 +            if _attn_impl in ("eager", "sdpa", "veomni_sdpa"):
 +                _cu_t = _cu_seq_lens_q
 +                if not isinstance(_cu_t, torch.Tensor):
@@ -1418,7 +1439,7 @@
 
          outputs = self.model(
              input_ids=input_ids,
-@@ -1317,26 +1958,64 @@
+@@ -1333,26 +1995,64 @@
              output_hidden_states=output_hidden_states,
              return_dict=return_dict,
              cache_position=cache_position,
@@ -1495,7 +1516,7 @@
  def multihead_attention(
      q: torch.Tensor,
      k: torch.Tensor,
-@@ -1347,20 +2026,14 @@
+@@ -1363,20 +2063,14 @@
      max_seqlen_k: int | None = None,
      deterministic: bool = False,
  ):
@@ -1523,7 +1544,7 @@
      attn_out = flash_attn_varlen_func(
          q,
          k,
-@@ -1374,10 +2047,7 @@
+@@ -1390,10 +2084,7 @@
      )
      if isinstance(attn_out, tuple):
          attn_out = attn_out[0]
@@ -1535,7 +1556,7 @@
 
 
  def eager_attention(
-@@ -1797,7 +2467,17 @@
+@@ -1813,7 +2504,17 @@
          return self.fc1(x)
 
 
@@ -1553,7 +1574,7 @@
      def __init__(
          self,
          num_heads: int,
-@@ -1819,6 +2499,12 @@
+@@ -1835,6 +2536,12 @@
          self.qkv_hidden_size = hidden_dim if qkv_hidden_size is None else qkv_hidden_size
          self.hidden_size_per_attention_head = self.qkv_hidden_size // self.num_heads
          self.attn_implementation = attn_implementation
@@ -1566,7 +1587,7 @@
          self.use_deterministic_attn = use_deterministic_attn
 
          if norm_type == "layernorm":
-@@ -1844,6 +2530,7 @@
+@@ -1860,6 +2567,7 @@
          cu_seqlens: torch.Tensor,
          max_seqlen: torch.Tensor,
          rope_freqs_cis: torch.Tensor | None = None,
@@ -1574,7 +1595,7 @@
      ):
          """
          Args:
-@@ -1863,8 +2550,12 @@
+@@ -1879,8 +2587,12 @@
 
          xq, xk = apply_rope(xq, xk, rope_freqs_cis)
 
@@ -1589,7 +1610,7 @@
              xq,
              xk,
              xv,
-@@ -1873,6 +2564,8 @@
+@@ -1889,6 +2601,8 @@
              max_seqlen_k=max_seqlen,
              max_seqlen_q=max_seqlen,
              deterministic=self.use_deterministic_attn,
@@ -1598,7 +1619,7 @@
          )
 
          attn_out = self.wo(attn_out)
-@@ -1884,11 +2577,16 @@
+@@ -1900,11 +2614,16 @@
          cu_seqlens: torch.Tensor,
          max_seqlen: int,
          rope_freqs_cis: torch.Tensor | None = None,
@@ -1616,7 +1637,7 @@
          hidden_states = residual + hidden_states
 
          residual = hidden_states
-@@ -1897,6 +2595,12 @@
+@@ -1913,6 +2632,12 @@
          hidden_states = residual + hidden_states
 
          return hidden_states
@@ -1629,7 +1650,7 @@
 
 
  class MoonViT3dEncoder(nn.Module):
-@@ -1940,8 +2644,23 @@
+@@ -1956,8 +2681,23 @@
 
          max_seqlen = lengths.max()
          cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
@@ -1654,7 +1675,7 @@
 
          hidden_states = self.final_layernorm(hidden_states)
          return hidden_states
-@@ -1969,6 +2688,12 @@
+@@ -1985,6 +2725,12 @@
          pre_sum += t * h * w
 
      return outputs
@@ -1667,7 +1688,7 @@
 
 
  class MoonViT3dPretrainedModel(PreTrainedModel):
-@@ -2035,6 +2760,50 @@
+@@ -2051,6 +2797,50 @@
 
          return hidden_states
 
@@ -1718,7 +1739,7 @@
 
  # ============================================================================
  # MM Projector Helper Classes (from mm_projector/modeling_mm_projectors.py)
-@@ -2122,6 +2891,12 @@
+@@ -2138,6 +2928,12 @@
              x = self.proj(x.view(B, -1, self.hidden_size))
              x = self.post_norm(x)
          return x
@@ -1731,7 +1752,7 @@
 
 
  class KimiK3PreTrainedModel(PreTrainedModel):
-@@ -2141,13 +2916,59 @@
+@@ -2157,13 +2953,59 @@
 
      def _init_weights(self, module):
          # important: this ported version of Llava isn't meant for training from scratch - only
@@ -1792,7 +1813,7 @@
 
          if hasattr(module, "class_embedding"):
              module.class_embedding.data.normal_(mean=0.0, std=std)
-@@ -2159,15 +2980,10 @@
+@@ -2175,15 +3017,10 @@
          elif isinstance(module, nn.Embedding):
              module.weight.data.normal_(mean=0.0, std=std)
              if module.padding_idx is not None:
@@ -1809,7 +1830,7 @@
              module.reset_parameters()
 
 
-@@ -2207,13 +3023,48 @@
+@@ -2223,13 +3060,48 @@
          self.projector_ln_eps = config.projector_ln_eps
 
 
@@ -1859,7 +1880,7 @@
          super().__init__(config)
 
          vt_config = VisionTowerConfig(config.vision_config)
-@@ -2232,7 +3083,23 @@
+@@ -2248,7 +3120,23 @@
              raise ValueError(f"Unsupported mm_projector_type: {proj_config.mm_projector_type}")
 
          self.language_model = KimiLinearForCausalLM(config.text_config)
@@ -1883,7 +1904,7 @@
 
          if hasattr(self.language_model, "dtype"):
              target_dtype = self.language_model.dtype
-@@ -2257,8 +3124,14 @@
+@@ -2273,8 +3161,14 @@
      def get_decoder(self):
          return self.language_model.get_decoder()
 
@@ -1900,7 +1921,7 @@
 
      def resize_token_embeddings(self, new_num_tokens: int | None = None, pad_to_multiple_of=None) -> nn.Embedding:
          model_embeds = self.language_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
-@@ -2267,6 +3140,7 @@
+@@ -2283,6 +3177,7 @@
          self.vocab_size = model_embeds.num_embeddings
          return model_embeds
 
@@ -1908,7 +1929,7 @@
      def _merge_input_ids_with_image_features(
          self,
          image_features: list[torch.Tensor],
-@@ -2274,28 +3148,74 @@
+@@ -2290,28 +3185,74 @@
          input_ids: torch.Tensor,
          attention_mask: torch.Tensor,
          labels: torch.Tensor | None = None,
@@ -2001,7 +2022,7 @@
          pad_token_id: int = self.config.pad_token_id
          ignore_index: int = self.config.ignore_index
 
-@@ -2413,27 +3333,20 @@
+@@ -2429,27 +3370,20 @@
 
      def forward(
          self,
@@ -2043,7 +2064,7 @@
          assert self.vision_tower is not None, "vision_tower is not loaded"
          output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
          output_hidden_states = (
-@@ -2441,31 +3354,63 @@
+@@ -2457,31 +3391,63 @@
          )
          return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -2116,7 +2137,7 @@
                  )
 
              # In case input_ids.shape[1] == 1 & pixel_values==None & past_key_values != None, we are in the case of
-@@ -2501,46 +3446,135 @@
+@@ -2517,46 +3483,133 @@
                  attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
                  position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
@@ -2156,9 +2177,7 @@
 +        # where no varlen kernel runs).
 +        _cu_seq_lens_q = fa_kwargs.get("cu_seq_lens_q")
 +        if _cu_seq_lens_q is not None and os.environ.get("K3_ALLOW_DENSE_PACKED", "0") != "1":
-+            _attn_impl = getattr(self.config, "_attn_implementation", None)
-+            if _attn_impl is None:
-+                _attn_impl = getattr(getattr(self.config, "text_config", None), "_attn_implementation", None)
++            _attn_impl = _kimi_k3_decoder_attn_implementation(self)
 +            if _attn_impl in ("eager", "sdpa", "veomni_sdpa"):
 +                _cu_t = _cu_seq_lens_q
 +                if not isinstance(_cu_t, torch.Tensor):
@@ -2276,7 +2295,7 @@
          )
 
      def prepare_inputs_for_generation(
-@@ -2606,3 +3640,17 @@
+@@ -2622,3 +3675,17 @@
 
      def _reorder_cache(self, *args, **kwargs):
          return self.language_model._reorder_cache(*args, **kwargs)

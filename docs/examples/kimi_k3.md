@@ -342,6 +342,13 @@ K3-specific behavior to know when writing configs or custom data pipelines:
    checkpointing would replay the MoE alltoall collectives inside backward
    and desynchronize them (all-NaN gradients); K3 therefore checkpoints only
    the attention stack and keeps MoE activations live.
+5. **FSDP2 only** — `fsdp_mode` must stay `fsdp2`. The first KDA layer's
+   attention-res parameters (`layers.0.self_attention_res_{norm,proj}`)
+   are architecturally unused — the block-residual chain starts with a
+   zero-width state, so they never receive a gradient — and the plain
+   `ddp` reducer aborts the second optimizer step over them (`Expected
+   to have finished reduction in the prior iteration`). FSDP2's flat-
+   parameter resharding is unaffected.
 
 Model code is patchgen-managed — never edit files under `generated/` by
 hand:
