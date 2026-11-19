@@ -131,12 +131,6 @@ class PinnedBufferPool:
                     del self._free_buffers[key]
                 self.reuses += 1
         if buffer is not None:
-            # The buffer may still be the destination of a D2H copy, or the
-            # source of an H2D copy, when it was released. Release does not wait
-            # for it (that is what keeps the pool off the host's critical path),
-            # so the wait belongs here, on the one path that hands the buffer to
-            # a new owner -- and outside the lock, so a slow transfer on one
-            # manager's stream does not serialize every other manager's release.
             self._wait_for_last_swap(buffer)
             return buffer, key
 
@@ -173,7 +167,8 @@ class PinnedBufferPool:
         here only for a buffer that leaves the pool for good (a drop or an
         eviction), because those two cannot be waited on later. Both happen outside
         the lock, so one manager's in-flight transfer does not hold up another's
-        release; the counters stay inside it.
+        release; the counters stay inside it, since the pool is shared and
+        ``release`` can run on any thread that drops a :class:`SwapTensor`.
         """
         if buffer is None:
             return
@@ -199,11 +194,6 @@ class PinnedBufferPool:
                 free_buffers.append(buffer)
                 self._free_buffers.move_to_end(key)
                 self._cached_bytes += buffer_nbytes
-        # Synchronize outside the lock: one manager's in-flight transfer must not
-        # hold up another manager's release. A dropped buffer leaves the pool for
-        # good and an evicted one is about to be freed, so both need their last
-        # transfer complete now. The counters stay inside the lock, since the pool
-        # is shared and ``release`` can run on any thread that drops a SwapTensor.
         if dropped:
             self._wait_for_last_swap(buffer)
         for oldest in evicted:
@@ -310,10 +300,6 @@ class SwapTensor:
         """
         if self._host_buffer_released or self.tensor_cpu is None:
             return
-        # A buffer that may still be the destination of a D2H copy is tagged with
-        # that copy's event and released without waiting; ``PinnedBufferPool``
-        # synchronizes the tag on the path that hands it to a new owner and when
-        # it drops or evicts it. An H2D source is tagged the same way.
         if self.stat == "h2d":
             self.tensor_cpu._last_swap_event = self.h2d_event
         self.pool.release(self.tensor_cpu, self._host_buffer_key)
