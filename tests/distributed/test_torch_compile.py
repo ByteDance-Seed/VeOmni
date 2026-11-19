@@ -270,15 +270,118 @@ def test_compile_decoder_blocks_uses_no_split_modules(monkeypatch):
     assert calls == [{"fullgraph": True, "dynamic": False, "backend": "inductor"}]
 
 
-def test_compile_decoder_blocks_rejects_unvalidated_multimodal_model(monkeypatch):
+def test_compile_decoder_blocks_matches_a_scoped_no_split_entry(monkeypatch):
+    """A SeedOmni composed model scopes each entry to its child (``child.Class``).
+
+    ``_scoped_no_split_modules`` rewrites the composed ``OmniModel``'s
+    ``_no_split_modules`` to ``{child}.{ClassName}``, so the entry no longer
+    equals ``type(module).__name__``. Matching the raw string found no block at
+    all and ``compile_decoder_blocks`` raised "found no decoder blocks to
+    compile" — before any ``fully_shard``, so the run failed fast rather than
+    leaving a half-wrapped model.
+    """
+
+    class ComposedModel(nn.Module):
+        _no_split_modules = ["llama.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llama = nn.Module()
+            self.llama.layers = nn.ModuleList([ToyDecoderLayer(), ToyDecoderLayer()])
+
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
 
+    model = ComposedModel()
+    assert compile_decoder_blocks(model, CompileConfig()) == 2
+    assert all(block._veomni_forward_compiled for block in model.llama.layers)
+
+
+def test_compile_decoder_blocks_leaves_a_sibling_that_reuses_the_layer_class(monkeypatch):
+    """A scoped entry covers its own child only, as ``_is_fsdp_wrap_target`` does.
+
+    Two children may hold the same layer class — a text backbone and a vision
+    tower both built from ``ToyDecoderLayer``, say — while only one is a
+    decoder stack the composed model declares. Reducing the entry to its bare
+    class name would make it match the sibling too and compile both, which is
+    what stripping the scope to fix the previous case introduces.
+    """
+
+    class TwoChildModel(nn.Module):
+        _no_split_modules = ["llama.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llama = nn.Module()
+            self.llama.layers = nn.ModuleList([ToyDecoderLayer()])
+            self.tower = nn.Module()
+            self.tower.layers = nn.ModuleList([ToyDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    model = TwoChildModel()
+
+    assert compile_decoder_blocks(model, CompileConfig()) == 1
+    assert model.llama.layers[0]._veomni_forward_compiled
+    assert not getattr(model.tower.layers[0], "_veomni_forward_compiled", False)
+
+
+def test_compile_decoder_blocks_keeps_bare_entries_matching_anywhere(monkeypatch):
+    """An unscoped entry keeps the HF meaning: that class anywhere in the tree."""
+
+    class NestedModel(nn.Module):
+        _no_split_modules = ["ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.a = nn.Module()
+            self.a.layers = nn.ModuleList([ToyDecoderLayer()])
+            self.b = nn.Module()
+            self.b.layers = nn.ModuleList([ToyDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    model = NestedModel()
+    assert compile_decoder_blocks(model, CompileConfig()) == 2
+
+
+def test_compile_decoder_blocks_rejects_unvalidated_multimodal_model(monkeypatch):
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
     model = ToyModel()
     model.config = SimpleNamespace(model_type="qwen2_vl", vision_config=SimpleNamespace())
     model.input_modalities = ("image", "text")
 
     with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
         compile_decoder_blocks(model, CompileConfig())
+
+
+def test_compile_decoder_blocks_rejects_a_composed_model(monkeypatch):
+    """A composed OmniModel looks text-only, so it needs its own refusal.
+
+    It inherits ``input_modalities = "text"`` and its config has no
+    ``vision_config`` / ``audio_config``, so every multimodal guard above is
+    skipped — including the Qwen3-VL rejections for ``dynamic``, CUDA graphs and
+    sequence parallelism. Teaching the matcher the scoped format without this
+    would turn a guaranteed failure into a silent compile under settings the
+    single-model path refuses.
+    """
+
+    class ComposedModel(nn.Module):
+        _no_split_modules = ["llama.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llama = nn.Module()
+            self.llama.layers = nn.ModuleList([ToyDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    model = ComposedModel()
+    model.config = SimpleNamespace(model_type="omni", _module_configs={"llama": SimpleNamespace()})
+
+    with pytest.raises(RuntimeError, match="not supported for a composed SeedOmni OmniModel"):
+        compile_decoder_blocks(
+            model, CompileConfig(dynamic=True, backend="cudagraphs"), sequence_parallel_enabled=True
+        )
 
 
 def test_compile_decoder_blocks_rejects_qwen3_vl_dynamic_shapes(monkeypatch):

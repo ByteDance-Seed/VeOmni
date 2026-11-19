@@ -14,7 +14,7 @@
 
 import types
 from dataclasses import dataclass
-from typing import Collection, Optional
+from typing import Collection, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -46,11 +46,45 @@ class CompileConfig:
         return self.backend == "cudagraphs" or self.mode == "reduce-overhead"
 
 
-def _decoder_block_class_names(model: nn.Module) -> set[str]:
+def _decoder_block_specs(model: nn.Module) -> list[tuple[str, str | None]]:
+    """``(class name, child scope)`` for each decoder layer in ``_no_split_modules``.
+
+    An entry is a bare class name (``LlamaDecoderLayer``, scope ``None``, matches
+    anywhere) or — on a SeedOmni composed model, where the children share one
+    FSDP tree — scoped to a child (``janus_llama.LlamaDecoderLayer``, matches
+    only under that child; see ``_scoped_no_split_modules`` in
+    ``models/seed_omni/accelerated/omni_model/omni_model_runtime.py``).
+
+    The scope is kept rather than reduced away: two children may use the same
+    layer class, and the composed-model contract says a scoped entry covers its
+    own child only. ``type(module).__name__`` never carries a scope, so the name
+    half is what ``_is_decoder_block`` compares and the scope half is what it
+    matches against the fqn.
+
+    Composed models are currently rejected earlier — ``_validate_omni_accelerator``
+    raises for ``torch_compile.enable`` under SeedOmni — so this keeps the matcher
+    correct for the composed format rather than fixing a reachable failure today.
+    """
     no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
     if no_split_modules is None:
-        return set()
-    return {name for name in no_split_modules if isinstance(name, str) and name.endswith("DecoderLayer")}
+        return []
+    specs: list[tuple[str, str | None]] = []
+    for entry in no_split_modules:
+        if not isinstance(entry, str):
+            continue
+        scope, _, class_name = entry.rpartition(".")
+        if class_name.endswith("DecoderLayer"):
+            specs.append((class_name, scope or None))
+    return specs
+
+
+def _decoder_block_class_names(model: nn.Module) -> set[str]:
+    """Decoder-layer class names in ``_no_split_modules``, scopes stripped.
+
+    Kept for :func:`validate_compile_model`, which only asks whether a class is
+    declared at all.
+    """
+    return {class_name for class_name, _ in _decoder_block_specs(model)}
 
 
 def _is_multimodal_model(model: nn.Module) -> bool:
@@ -66,6 +100,19 @@ def _is_multimodal_model(model: nn.Module) -> bool:
     return any(modality != "text" for modality in input_modalities)
 
 
+def _is_composed_model(model: nn.Module) -> bool:
+    """Whether ``model`` is a SeedOmni composed :class:`OmniModel`.
+
+    Recognised by the per-module config map, which no single model carries. A
+    composed model needs this separate test because it presents as text-only to
+    the checks above: it inherits ``input_modalities = "text"`` from
+    ``PreTrainedModel`` and its :class:`OmniConfig` has no ``vision_config`` /
+    ``audio_config`` — the media modalities live in ``_module_configs``.
+    """
+    config = getattr(model, "config", None)
+    return bool(getattr(config, "_module_configs", None))
+
+
 def validate_compile_model(
     model: nn.Module,
     compile_config: CompileConfig,
@@ -78,6 +125,13 @@ def validate_compile_model(
     fail-closed because their towers and cross-modal injection points have
     different shape and lifecycle contracts.
     """
+
+    if _is_composed_model(model):
+        raise RuntimeError(
+            "model.accelerator.torch_compile.enable is not supported for a composed SeedOmni OmniModel: "
+            "the per-module guards (multimodal decoder blocks, per-module op selections, per-step CUDA-graph "
+            "marking) do not reach the child configs yet. Run the modules as separate models to compile them."
+        )
 
     if not _is_multimodal_model(model):
         return
@@ -113,18 +167,43 @@ def validate_compile_model(
         )
 
 
-def _is_decoder_block(module: nn.Module, decoder_block_class_names: Optional[Collection[str]] = None) -> bool:
+def _is_decoder_block(
+    module: nn.Module,
+    decoder_block_class_names: Optional[Collection[str]] = None,
+    *,
+    fqn: Optional[str] = None,
+    decoder_block_specs: Optional[Sequence[tuple[str, str | None]]] = None,
+) -> bool:
     """Check decoder blocks using the model's ``_no_split_modules`` list.
 
     HuggingFace model classes typically list the decoder layer class in
     ``_no_split_modules`` for FSDP/Accelerate. Multimodal models may include
     vision/audio blocks in the same list, so the compile path keeps only
     entries that are decoder layers.
+
+    Given ``decoder_block_specs``, a scoped entry matches only modules under
+    that child, so a sibling that reuses the same layer class is left alone; a
+    bare entry still matches anywhere. The rule is the one
+    ``_is_fsdp_wrap_target`` applies to the same list, so the wrap plan and the
+    compile plan agree on what a decoder block is.
     """
+
+    if decoder_block_specs is not None:
+        class_name = type(module).__name__
+        return any(
+            name == class_name and (scope is None or _under_scope(fqn, scope)) for name, scope in decoder_block_specs
+        )
 
     if decoder_block_class_names is None:
         decoder_block_class_names = _decoder_block_class_names(module)
     return type(module).__name__ in decoder_block_class_names
+
+
+def _under_scope(fqn: Optional[str], scope: str) -> bool:
+    """Whether ``fqn`` is ``scope`` itself or a descendant of it."""
+    if fqn is None:
+        return False
+    return fqn == scope or fqn.startswith(scope + ".")
 
 
 def validate_compile_config_for_fsdp2(compile_config: CompileConfig, enable_reshard_after_forward: bool) -> None:
@@ -257,10 +336,10 @@ def compile_decoder_blocks(
             )
         compile_kwargs["mode"] = compile_config.mode
 
-    decoder_block_class_names = _decoder_block_class_names(model)
+    decoder_block_specs = _decoder_block_specs(model)
     compiled = 0
     for fqn, module in model.named_modules():
-        if not _is_decoder_block(module, decoder_block_class_names):
+        if not _is_decoder_block(module, fqn=fqn, decoder_block_specs=decoder_block_specs):
             continue
         if getattr(module, "_veomni_forward_compiled", False):
             continue
