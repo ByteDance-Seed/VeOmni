@@ -224,6 +224,10 @@ def test_a_missing_config_warns():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.skipif(
+    get_device_type() == "npu",
+    reason="`fused_triton` itself is refused at config parse on Ascend, before the activation gate",
+)
 def test_build_time_prerequisite_refuses_unsupported_activation():
     """The guard fires in ``check_model_build_prerequisites``, before ``load_model``."""
     DiffusionGemmaConfig = pytest.importorskip(
@@ -250,6 +254,10 @@ def test_eager_moe_keeps_serving_a_gelu_activation():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.skipif(
+    get_device_type() == "npu",
+    reason="`fused_triton` itself is refused at config parse on Ascend; the production pairing is `fused_npu` there",
+)
 def test_diffusion_gemma_builds_on_fused_triton():
     """The 26B recipe, which is ``fused_triton`` + ``gelu_pytorch_tanh``.
 
