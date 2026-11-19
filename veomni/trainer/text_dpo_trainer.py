@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..arguments import ModelArguments, VeOmniArguments
+from ..arguments import ModelArguments, MXFP8Config, VeOmniArguments
 from ..data import build_data_transform
 from ..data.data_collator import PostCollator
 from ..distributed.parallel_state import get_parallel_state, use_parallel_state
@@ -156,6 +156,8 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         args = copy.deepcopy(args)
         args.lora_config = {}
         args.accelerator.fsdp_config.mixed_precision.enable = False
+        # An explicit disable also overrides an MXFP8 recipe saved in the HF config.
+        args.accelerator.fsdp_config.mixed_precision.mxfp8 = MXFP8Config(enable=False)
         args.accelerator.gradient_checkpointing.enable = False
         args.accelerator.torch_compile.enable = False
         # A second PinnedBufferPool on the frozen copy is wasted host RAM.

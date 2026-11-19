@@ -5,6 +5,7 @@
 
 import copy
 import sys
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,9 +17,10 @@ from transformers import Qwen3Config
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.training_utils import make_eager_ops_config
-from veomni.arguments import MixedPrecisionConfig, MXFP8Config, VeOmniArguments
+from veomni.arguments import MixedPrecisionConfig, ModelArguments, MXFP8Config, VeOmniArguments
 from veomni.arguments.parser import _instantiate_recursive, parse_args, save_args
 from veomni.distributed import mxfp8, torch_parallelize
+from veomni.trainer import text_dpo_trainer
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -91,6 +93,53 @@ def test_unset_and_explicit_disable_survive_hf_config_round_trip(tmp_path):
     model.config.save_pretrained(tmp_path)
     model.config = Qwen3Config.from_pretrained(tmp_path)
     assert not mxfp8.resolve_mxfp8_config(model, None).enable
+
+
+@pytest.mark.parametrize(
+    ("override", "saved"),
+    [
+        pytest.param(MXFP8Config(enable=True), None, id="explicit-enable"),
+        pytest.param(None, MXFP8Config(enable=True, enable_fsdp_all_gather=True), id="inherit-hf"),
+        pytest.param(MXFP8Config(enable=False), MXFP8Config(enable=True), id="explicit-disable-over-hf"),
+    ],
+)
+def test_dpo_reference_disables_mxfp8_without_changing_policy(tmp_path, monkeypatch, override, saved):
+    config = _model().config
+    if saved is not None:
+        config.veomni_mxfp8 = asdict(saved)
+    config.save_pretrained(tmp_path)
+
+    def build_model(config_path, torch_dtype, **kwargs):
+        model = _model().to(dtype=getattr(torch, torch_dtype))
+        model.config = Qwen3Config.from_pretrained(config_path)
+        return model
+
+    args = ModelArguments(config_path=str(tmp_path), ops_implementation=make_eager_ops_config())
+    policy_precision = args.accelerator.fsdp_config.mixed_precision
+    policy_precision.mxfp8 = override
+    policy = build_model(args.config_path, "float32")
+    original_precision = copy.deepcopy(policy_precision)
+    expected_recipe = original_precision.mxfp8 if override is not None else saved
+
+    monkeypatch.setattr("veomni.models.auto.build_foundation_model", build_model)
+    monkeypatch.setattr(text_dpo_trainer.DPOReferenceModelRuntime, "setup", lambda self: None)
+    monkeypatch.setattr(text_dpo_trainer, "use_parallel_state", lambda name: nullcontext())
+    monkeypatch.setattr(torch_parallelize, "get_parallel_state", lambda: _state(tp_enabled=False))
+    monkeypatch.setattr(torch_parallelize, "parallelize_model_fsdp2", lambda **kwargs: kwargs["model"])
+    reference = text_dpo_trainer.DPOReferenceModelRuntime(args, train=None)
+
+    ref_precision = reference.args.accelerator.fsdp_config.mixed_precision
+    disabled = MXFP8Config(enable=False)
+    assert ref_precision is not policy_precision
+    assert not ref_precision.enable and ref_precision.mxfp8 == disabled
+    assert reference.model.config is not policy.config
+    assert reference.model.config.veomni_mxfp8 == asdict(disabled)
+    assert type(reference.model.model.layers[0].mlp.up_proj) is nn.Linear
+    assert not reference.model.training
+    assert not any(param.requires_grad for param in reference.model.parameters())
+    assert args.accelerator.fsdp_config.mixed_precision == original_precision
+    assert getattr(policy.config, "veomni_mxfp8", None) == (asdict(saved) if saved is not None else None)
+    assert mxfp8.resolve_mxfp8_config(policy, policy_precision.mxfp8) == expected_recipe
 
 
 @pytest.mark.parametrize("config", [None, MXFP8Config()])
