@@ -588,6 +588,45 @@ def _segment_positions(segment_lengths: tuple[int, ...], device: str = "cpu") ->
     return torch.cat([torch.arange(length) for length in segment_lengths]).unsqueeze(0).to(device)
 
 
+@pytest.mark.parametrize(
+    ("kv_len", "slices", "query_offset"),
+    [(8, None, 0), (16, ((0, 16),), 8)],
+    ids=["unpacked", "packed_context_parallel"],
+)
+def test_attention_explicit_mask_runs_the_eager_row(
+    flash_mla: _FlashMlaRecorder, kv_len: int, slices, query_offset: int
+):
+    # Mask modes express causality, not a per-key mask, so a mask the caller supplied
+    # must not be dropped: both the unpacked call and the packed per-sample path have
+    # to reproduce eager rather than attend to keys the caller excluded.
+    torch.manual_seed(11)
+    seq_len, compressed_len = 8, kv_len // _RATE
+    q = torch.randn(1, seq_len, _ATTN_HEADS, _ATTN_DIM)
+    ori_kv = torch.randn(1, kv_len, _ATTN_DIM)
+    cmp_kv = torch.randn(1, compressed_len, _ATTN_DIM)
+    sink = torch.randn(_ATTN_HEADS)
+    positions = (torch.arange(seq_len) + query_offset).unsqueeze(0)
+    topk = torch.zeros(1, seq_len, 2, dtype=torch.int32)
+    topk[..., 1] = -1
+    mask = torch.ones(1, 1, seq_len, kv_len, dtype=torch.bool)
+    mask[..., 6] = False
+    kwargs = {
+        "sliding_window": _WINDOW,
+        "compress_ratio": _RATE,
+        "candidates": CompressedCandidates(topk_indices=topk),
+        "attention_mask": mask,
+        "packed_sequence_slices": slices,
+        "query_offset": query_offset,
+        "sm_scale": 0.5,
+    }
+
+    expected = eager_attention.wrapper(q, ori_kv, cmp_kv, sink, positions, **kwargs)
+    actual = cann_attention.wrapper(q, ori_kv, cmp_kv, sink, positions, **kwargs)
+
+    assert flash_mla.calls == []
+    torch.testing.assert_close(actual, expected)
+
+
 def test_attention_packed_call_rebases_the_selection_per_segment(flash_mla: _FlashMlaRecorder):
     slices = ((0, 9), (9, 13))
     q, ori_kv, cmp_kv, sink = _attention_inputs(seq_len=13, compressed_len=3)
@@ -701,25 +740,6 @@ def test_attention_rejects_what_the_kernel_cannot_express(flash_mla: _FlashMlaRe
             **kwargs,
         )
     assert flash_mla.calls == []
-
-
-def test_attention_ignores_the_mask_and_leaves_kernel_limits_to_the_kernel(flash_mla: _FlashMlaRecorder):
-    q, ori_kv, cmp_kv, sink = _attention_inputs(seq_len=8, compressed_len=1, dtype=torch.float32)
-
-    cann_attention.wrapper(
-        q,
-        ori_kv,
-        cmp_kv,
-        sink,
-        torch.arange(8).unsqueeze(0),
-        sliding_window=64,
-        compress_ratio=8,
-        attention_mask=torch.ones(1, 1, 8, 8, dtype=torch.bool),
-    )
-
-    ((cann_q, _, _, _), kwargs) = flash_mla.calls[0]
-    assert cann_q.dtype == torch.float32
-    assert (kwargs["ori_win_left"], kwargs["cmp_ratio"]) == (63, 8)
 
 
 @pytest.mark.parametrize(

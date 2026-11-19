@@ -105,6 +105,10 @@ def _packed_context_parallel_call(
 ) -> Tensor:
     """Run one single-segment call per packed sample that intersects this shard.
 
+    A caller-supplied ``attention_mask`` never reaches here: the wrapper runs the
+    eager row for any call that carries one, because the kernel encodes
+    visibility as mask modes rather than a per-key mask.
+
     The packed TND path segments queries and KV alike, so it cannot express the
     prefix rows a local query still needs. Each sample instead becomes its own
     call whose buffer starts at that sample's first row, which is the origin the
@@ -197,9 +201,11 @@ def wrapper(
 ) -> Tensor | tuple[Tensor, ...]:
     """Run CANN sparse FlashMLA over the window and compressed selection.
 
-    Layers without compressed rows run the eager row. ``attention_mask`` is
-    not read, because the mask modes already carry causality and packed
-    isolation, so padded batches are unsupported. The kernel needs the query
+    Layers without compressed rows run the eager row. The kernel encodes
+    visibility as mask modes, not as a per-key mask, so a caller-supplied
+    ``attention_mask`` cannot be expressed: any call that carries one runs the
+    eager row, packed context-parallel shards included, rather than attending to
+    keys the caller excluded. The kernel needs the query
     rows to end at the last KV row: a non-zero ``query_offset`` (context
     parallelism) is served by narrowing ``ori_kv`` to that prefix, and packed
     slices then need one call per sample because the TND path segments queries
@@ -209,7 +215,7 @@ def wrapper(
     window, ratio and head-size limits. Packed calls without CP take the TND
     path, which needs batch size 1 and reads the slice boundaries on the host.
     """
-    if cmp_kv is None or cmp_kv.shape[1] == 0:
+    if attention_mask is not None or cmp_kv is None or cmp_kv.shape[1] == 0:
         return eager.wrapper(
             q,
             ori_kv,
