@@ -856,6 +856,10 @@ def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, O
             "give them fsdp2 / ddp."
         )
 
+    for name, module_args in modules.items():
+        if module_args.accelerator.fsdp_config.mxfp8_all_gather:
+            raise ValueError(f"mxfp8_all_gather on module {name!r} requires standalone dense Qwen3.")
+
 
 def _validate_omni_dp_size(
     top_accelerator: AcceleratorConfig,

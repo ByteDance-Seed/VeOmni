@@ -438,6 +438,8 @@ def parallelize_model_fsdp2(
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
+    *,
+    mxfp8_all_gather: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -472,6 +474,19 @@ def parallelize_model_fsdp2(
         cpu_offload=kwargs.get("enable_fsdp_offload", False),
         compile_enabled=bool(compile_config and compile_config.enable),
         is_peft_model=kwargs.get("is_peft_model", False),
+    )
+    from .mxfp8 import prepare_fsdp_transport
+
+    prepare_fsdp_transport(
+        model,
+        mixed_precision,
+        parallel_state,
+        gather=mxfp8_all_gather,
+        compile_enabled=bool(compile_config and compile_config.enable),
+        offload=bool(kwargs.get("enable_fsdp_offload") or kwargs.get("enable_activation_offload")),
+        incompatible_comm=bool(
+            expert_weight_fp8_all_gather or low_precision_reduce_scatter_comm or kwargs.get("is_peft_model")
+        ),
     )
     convert_float8_linears(model, mixed_precision.float8)
 
@@ -1053,6 +1068,8 @@ def build_parallelize_model(
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
+    *,
+    mxfp8_all_gather: bool = False,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -1098,6 +1115,12 @@ def build_parallelize_model(
     compile_config = compile_config or CompileConfig()
     if expert_weight_fp8_all_gather and compile_config.enable:
         raise ValueError("expert_weight_fp8_all_gather does not support torch.compile.")
+
+    if not parallel_state.fsdp_enabled or parallel_state.dp_mode != "fsdp2":
+        from .mxfp8 import bound_linears
+
+        if mxfp8_all_gather or bound_linears(model):
+            raise ValueError("MXFP8 requires ordinary multi-rank FSDP2.")
 
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu", "mlu"]:
@@ -1161,6 +1184,7 @@ def build_parallelize_model(
                 muon_expert_zero_comm=muon_expert_zero_comm,
                 low_precision_reduce_scatter_comm=low_precision_reduce_scatter_comm,
                 expert_weight_fp8_all_gather=expert_weight_fp8_all_gather,
+                mxfp8_all_gather=mxfp8_all_gather,
                 expert_fsdp_shard_dim=expert_fsdp_shard_dim,
                 compile_config=compile_config,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,

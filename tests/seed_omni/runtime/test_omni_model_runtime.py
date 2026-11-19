@@ -447,6 +447,7 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
                 offload=False,
                 offload_pin_memory=False,
                 max_load_broadcast_size=20.0,
+                mxfp8_all_gather=False,
                 expert_weight_fp8_all_gather=True,
                 expert_fsdp_shard_dim=0,
             ),

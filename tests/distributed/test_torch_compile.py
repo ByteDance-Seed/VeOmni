@@ -1174,13 +1174,21 @@ def _model_with_ops(**ops_fields) -> nn.Module:
     return model
 
 
-@pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
-def test_compile_rejects_torchao_mxfp4(field):
-    """MXTensor emits float8_e8m0fnu scales, which Inductor has no lowering for."""
+@pytest.mark.parametrize(
+    ("field", "dtype"),
+    [
+        ("linear_implementation", "mxfp4"),
+        ("linear_implementation", "mxfp8"),
+        ("gated_mlp_implementation", "mxfp4"),
+    ],
+)
+def test_compile_rejects_torchao_mx_formats(field, dtype):
     from veomni.distributed.torch_compile import _reject_incompatible_ops
+    from veomni.ops.selection import OpsSelection
 
-    with pytest.raises(RuntimeError, match=f"{field}='torchao_mxfp4'"):
-        _reject_incompatible_ops(_model_with_ops(**{field: "torchao_mxfp4"}))
+    selection = OpsSelection(name="torchao", kwargs={"dtype": dtype})
+    with pytest.raises(RuntimeError, match=dtype):
+        _reject_incompatible_ops(_model_with_ops(**{field: selection}))
 
 
 @pytest.mark.parametrize(
@@ -1214,7 +1222,11 @@ def test_compile_rejection_walks_sub_configs():
     def ops(lin=None):
         return SimpleNamespace(linear_implementation=lin, gated_mlp_implementation=None)
 
-    child_only = SimpleNamespace(ops_config=ops(lin="torchao_mxfp4"), sub_configs={})
+    from veomni.ops.selection import OpsSelection
+
+    child_only = SimpleNamespace(
+        ops_config=ops(lin=OpsSelection(name="torchao", kwargs={"dtype": "mxfp4"})), sub_configs={}
+    )
     root = SimpleNamespace(ops_config=ops(lin="eager"), sub_configs={"text_config": None}, text_config=child_only)
 
-    assert _uncompilable_at(root, prefix="") == ["text_config.linear_implementation='torchao_mxfp4'"]
+    assert _uncompilable_at(root, prefix="") == ["text_config.linear_implementation=torchao(dtype='mxfp4')"]

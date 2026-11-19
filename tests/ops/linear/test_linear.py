@@ -250,10 +250,9 @@ def test_linear_torchao_row_is_declared_with_torchao():
 @_requires_torchao
 def test_linear_torchao_nvfp4_forward_and_backward_round_trip():
     """The row equals F.linear over torchao's NVFP4 round trip, with straight-through gradients."""
-    from veomni.ops.kernels.linear.standard import torchao as impl
-    from veomni.ops.qat.torchao_fp4 import nvfp4_fake_quant
+    from veomni.ops.qat.torchao_fp4 import NVFP4_BLOCK_SIZE, nvfp4_fake_quant
 
-    assert impl.NVFP4_BLOCK_SIZE == 16
+    assert NVFP4_BLOCK_SIZE == 16
     op = VeomniOp("linear", "standard", "torchao")
     torch.manual_seed(0)
     # 48 is a whole number of 16-wide groups: NVFP4 needs nothing wider.

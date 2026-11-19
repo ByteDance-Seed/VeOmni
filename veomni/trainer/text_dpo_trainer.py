@@ -156,6 +156,7 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         args = copy.deepcopy(args)
         args.lora_config = {}
         args.accelerator.fsdp_config.mixed_precision.enable = False
+        args.accelerator.fsdp_config.mxfp8_all_gather = False
         args.accelerator.gradient_checkpointing.enable = False
         args.accelerator.torch_compile.enable = False
         # A second PinnedBufferPool on the frozen copy is wasted host RAM.
@@ -194,6 +195,9 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
             ops_implementation=args.ops_implementation,
             config_kwargs=args.model_config,
         )
+        from ..distributed.mxfp8 import restore_reference_linears
+
+        restore_reference_linears(self.model)
         self.model_config = self.model.config
 
 

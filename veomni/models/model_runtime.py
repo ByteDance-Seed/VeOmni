@@ -414,6 +414,11 @@ class VeOmniModelRuntime:
                 "module inference (ModuleRuntime._init_eager_inference)."
             )
 
+        from ..distributed.mxfp8 import bound_linears
+
+        offload = args.accelerator.offload_config
+        if (offload.enable_activation or offload.enable_async_activation) and bound_linears(self.model):
+            raise ValueError("MXFP8 does not support activation offload.")
         self._apply_async_activation_offload()
 
         # Customized parallelize model.
@@ -481,6 +486,7 @@ class VeOmniModelRuntime:
             ep_sharded_stream_load=args.ep_sharded_stream_load,
             max_load_broadcast_size=args.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
+            mxfp8_all_gather=args.accelerator.fsdp_config.mxfp8_all_gather,
             expert_weight_fp8_all_gather=args.accelerator.fsdp_config.expert_weight_fp8_all_gather,
             expert_fsdp_shard_dim=args.accelerator.fsdp_config.expert_fsdp_shard_dim,
             low_precision_reduce_scatter_comm=args.accelerator.fsdp_config.low_precision_reduce_scatter_comm,

@@ -153,6 +153,8 @@ jobs:
       - name: Run the torchao float8 tests
         run: |
           uv run --frozen pytest -q tests/models/test_float8_training.py
+          CUDA_VISIBLE_DEVICES="" uv run --no-sync pytest -q tests/ops/test_mxfp8_tensors.py -k "not native_linear"
+          CUDA_VISIBLE_DEVICES="" uv run --no-sync pytest -q tests/models/test_mxfp8_training.py -k "cpu_fsdp or portable_reload or dpo_restores"
       - name: Run the torchao QAT tests
         shell: bash
         run: |
@@ -166,3 +168,28 @@ jobs:
             files+=(tests/models/test_qat_fsdp.py)
           fi
           uv run --frozen pytest -q "${files[@]}"
+
+  mxfp8_native:
+    if: github.repository_owner == 'ByteDance-Seed' && vars.MXFP8_SM100_RUNNER_LABEL != ''
+    needs: lint
+    runs-on: [self-hosted, "${{ vars.MXFP8_SM100_RUNNER_LABEL }}"]
+    timeout-minutes: 30
+    container:
+      image: verl-ci-cn-beijing.cr.volces.com/veomni/open_veomni-gpu:v0.1.11_cu130
+      options: --gpus all --ipc host --shm-size 32g
+    env:
+      CUDA_VISIBLE_DEVICES: "0,1"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: uv sync --frozen --extra gpu --extra float8 --group dev
+      - name: Verify both MXFP8 devices and run native training and operator tests
+        run: |
+          uv run --no-sync python - <<'PY'
+          import torch
+          import torchao
+
+          if not torch.version.cuda or torch.cuda.device_count() < 2 or any(torch.cuda.get_device_capability(i)[0] < 10 for i in range(2)):
+              raise SystemExit("Native MXFP8 CI requires two visible NVIDIA SM100+ devices.")
+          PY
+          uv run --no-sync pytest -q -rs -k "not cpu_fsdp and not portable_reload and not dpo_restores" tests/models/test_mxfp8_training.py \
+            tests/ops/test_mxfp8_tensors.py::test_native_linear_matches_independent_quantized_oracle

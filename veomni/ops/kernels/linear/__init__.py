@@ -72,7 +72,7 @@ register_op(
     description="TorchAO FP4 fake-quantized dense linear projection",
     wrapper=standard_torchao.wrapper,
     requires=("torchao",),
-    dtypes=SUPPORTED_DTYPES,
+    dtypes=(*SUPPORTED_DTYPES, "mxfp8"),
 )
 
 register_op(

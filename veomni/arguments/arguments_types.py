@@ -765,6 +765,9 @@ class FSDPConfig:
             "help": "Override EP expert FSDP sharding: 0 keeps whole experts, 1 splits hidden dimensions. Null preserves existing placement/Muon policy. Dim 0 requires evenly divisible local expert stacks."
         },
     )
+    mxfp8_all_gather: bool = field(
+        default=False, metadata={"help": "Quantize native MXFP8 linear weight shards before FSDP2 AllGather."}
+    )
     expert_weight_fp8_all_gather: bool = field(
         default=False,
         metadata={
@@ -802,6 +805,8 @@ class FSDPConfig:
             )
         if self.fsdp_scope not in ("module", "model"):
             raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
+        if not isinstance(self.mxfp8_all_gather, bool):
+            raise ValueError("mxfp8_all_gather must be a boolean.")
         if not isinstance(self.expert_weight_fp8_all_gather, bool):
             raise ValueError("expert_weight_fp8_all_gather must be a boolean.")
         validate_expert_fsdp_shard_dim(self.expert_fsdp_shard_dim, fsdp_mode=self.fsdp_mode)

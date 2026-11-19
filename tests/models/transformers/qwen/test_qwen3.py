@@ -639,9 +639,12 @@ def test_qwen3_attention_binds_the_configured_linear_row():
     model = _qwen3_with_ops(_tiny_config(), linear_implementation="eager", gated_mlp_implementation="eager")
 
     attention = model.model.layers[0].self_attn
-    assert isinstance(attention.veomni_linear, VeomniOp)
-    assert (attention.veomni_linear.op, attention.veomni_linear.variant) == ("linear", "standard")
-    assert attention.veomni_linear.impl == "eager"
+    assert isinstance(attention.veomni_linears["q_proj"], VeomniOp)
+    assert (attention.veomni_linears["q_proj"].op, attention.veomni_linears["q_proj"].variant) == (
+        "linear",
+        "standard",
+    )
+    assert attention.veomni_linears["q_proj"].impl == "eager"
     assert model.model.layers[0].mlp.veomni_gated_mlp.impl == "eager"
 
 
@@ -710,24 +713,22 @@ def test_qwen3_nvfp4_qat_rounds_exactly_the_projection_weights(monkeypatch):
     A forward-output test cannot tell a recipe that quantizes one tensor too few
     from the right one, so this records which parameters reach the quantizer.
     """
-    import veomni.ops.kernels.gated_mlp.standard.torchao as mlp_row
-    import veomni.ops.kernels.linear.standard.torchao as linear_row
+    from veomni.ops.qat import torchao_fp4
 
     config = _tiny_config()
     model = _qwen3_with_ops(config, linear_implementation="torchao", gated_mlp_implementation="torchao")
     names_by_ptr = {param.data_ptr(): name for name, param in model.named_parameters()}
     rounded = set()
 
-    for row in (linear_row, mlp_row):
-        original = row.nvfp4_fake_quant
+    original = torchao_fp4._nvfp4_roundtrip
 
-        def record(tensor, *args, _original=original, **kwargs):
-            name = names_by_ptr.get(tensor.data_ptr())
-            if name is not None:
-                rounded.add(name)
-            return _original(tensor, *args, **kwargs)
+    def record(tensor, block_size):
+        name = names_by_ptr.get(tensor.data_ptr())
+        if name is not None:
+            rounded.add(name)
+        return original(tensor, block_size)
 
-        monkeypatch.setattr(row, "nvfp4_fake_quant", record)
+    monkeypatch.setattr(torchao_fp4, "_nvfp4_roundtrip", record)
 
     model(input_ids=torch.randint(3, config.vocab_size, (1, 8)), use_cache=False)
 

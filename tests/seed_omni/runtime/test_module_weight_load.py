@@ -102,6 +102,7 @@ def test_parallelize_forwards_module_skip_decision(
                 offload=False,
                 offload_pin_memory=False,
                 low_precision_reduce_scatter_comm=False,
+                mxfp8_all_gather=False,
                 expert_weight_fp8_all_gather=expert_weight_fp8_all_gather,
                 expert_fsdp_shard_dim=0,
                 max_load_broadcast_size=20.0,

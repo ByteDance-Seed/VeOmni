@@ -176,9 +176,9 @@ def validate_compile_runtime(
 #: because the row is ``torchao`` for both FP4 layouts: a config may compile with
 #: ``dtype: nvfp4`` (float8_e4m3fn scales plus an FP32 per-tensor scale, both of
 #: which Inductor knows) and must not with ``dtype: mxfp4``.
-_UNCOMPILABLE_FORMATS: dict[str, tuple[str, str]] = {
-    "linear_implementation": ("torchao", "mxfp4"),
-    "gated_mlp_implementation": ("torchao", "mxfp4"),
+_UNCOMPILABLE_FORMATS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "linear_implementation": ("torchao", ("mxfp4", "mxfp8")),
+    "gated_mlp_implementation": ("torchao", ("mxfp4",)),
 }
 
 
@@ -187,14 +187,15 @@ def _uncompilable_selections(ops) -> list[str]:
     if ops is None:
         return []
     offending: list[str] = []
-    for field, (impl, dtype) in _UNCOMPILABLE_FORMATS.items():
+    for field, (impl, dtypes) in _UNCOMPILABLE_FORMATS.items():
         value = getattr(ops, field, None)
         name = getattr(value, "name", value)
         if name != impl:
             continue
         # A bare row name means the row's default format, which is not this one.
         kwargs = getattr(value, "kwargs", {}) or {}
-        if kwargs.get("dtype") == dtype:
+        dtype = kwargs.get("dtype")
+        if dtype in dtypes:
             offending.append(f"{field}={impl}(dtype={dtype!r})")
     return offending
 
@@ -208,13 +209,17 @@ def _reject_incompatible_ops(model: nn.Module) -> None:
     selection is real and must be caught, and the message names the path so the
     offending level is unambiguous.
     """
+    from .mxfp8 import bound_linears
+
+    if bound_linears(model):
+        raise RuntimeError("torch_compile cannot lower MXFP8 linear row scales (float8_e8m0fnu).")
     config = getattr(model, "config", None)
     offending = _uncompilable_at(config, prefix="")
     if offending:
         raise RuntimeError(
             "model.accelerator.torch_compile cannot be combined with "
             f"{', '.join(offending)}: those selections emit tensors of a dtype Inductor cannot lower "
-            "(float8_e8m0fnu for the mxfp4 layout). Disable compilation or select a different dtype."
+            "(float8_e8m0fnu for MX block scales). Disable compilation or select a different dtype."
         )
 
 
