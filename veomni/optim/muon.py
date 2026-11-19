@@ -698,7 +698,7 @@ def _chunked_newton_schulz(local: Tensor, ns: "Callable[[Tensor], Tensor]") -> T
     The result is written into one preallocated stack chunk by chunk. Collecting the
     chunk outputs in a list and ``torch.cat``-ing them would hold two full stacks at
     peak (the list plus the concatenation), which is the opposite of the point: at
-    64 FP32 experts of ``2048 x 7168`` the second stack alone is 7 GiB.
+    64 experts of ``2048 x 7168`` the second stack alone is 7 GiB.
     """
     if local.shape[0] <= _MOE_LOCAL_3D_NS_CHUNK:
         return ns(local)
