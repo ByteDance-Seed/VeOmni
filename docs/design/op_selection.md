@@ -805,6 +805,13 @@ all-to-all because a global expert id would index past a local shard. `eager` is
 also the target every fused row delegates to for an activation its kernel cannot
 evaluate.
 
+That EP branch used to exist only on the model side: the seven patched forwards
+routed a non-SwiGLU activation to a shared fallback before ever constructing the
+handle, so the `eager` row itself indexed per-expert weights with global expert
+ids and raised `IndexError: index N is out of bounds` under EP. Now that the
+activation is a call argument, every model reaches the row, so the row carries
+the dispatch instead.
+
 `moe_experts_lora` is a **separate registered family** with its own rows
 (`shared` / `independent` × `eager` / `fused_triton` / `fused_npu`), and the two
 are not interchangeable. MoE-LoRA follows the wrapped module's `veomni_moe.impl`
