@@ -242,7 +242,7 @@ def test_offline_embedding_resume_rejects_unproven_or_extra_output(monkeypatch, 
     assert resumed.state.global_step == 0
 
 
-def _offline_embedding_writer_failure_worker(rank, endpoint):
+def _offline_embedding_writer_failure_worker(rank, source, endpoint):
     from datetime import timedelta
 
     import torch.distributed as dist
@@ -258,7 +258,7 @@ def _offline_embedding_writer_failure_worker(rank, endpoint):
         trainer.args.train.training_task = "offline_embedding"
         trainer.args.train.global_rank = rank
         trainer.args.train.world_size = 2
-        trainer.args.train.checkpoint.load_path = "/unused"
+        trainer.args.train.checkpoint.load_path = source
         trainer.model = SimpleNamespace(optimizer=None, checkpoint=None)
         trainer.train_dataloader = None
         trainer.data_iterator = None
@@ -293,10 +293,12 @@ def _offline_embedding_writer_failure_worker(rank, endpoint):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
-def test_offline_embedding_writer_failure_is_coordinated():
+def test_offline_embedding_writer_failure_is_coordinated(tmp_path):
     from tests.tools.launch_utils import spawn_with_rendezvous
+    from veomni.checkpoint import layout
 
-    spawn_with_rendezvous(_offline_embedding_writer_failure_worker, nprocs=2)
+    layout.write_manifest(str(tmp_path), global_step=2, world_size=2, model_state=False)
+    spawn_with_rendezvous(_offline_embedding_writer_failure_worker, args=(str(tmp_path),), nprocs=2)
 
 
 @pytest.mark.parametrize("shuffle", [True, False])

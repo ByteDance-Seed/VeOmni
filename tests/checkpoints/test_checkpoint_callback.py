@@ -658,6 +658,7 @@ class TestGlobalStateCallbackJobState:
     def test_load_restores_channel_loss_callback_state(self, mock_dist, tmp_path):
         mock_dist.is_initialized.return_value = False
         trainer = _make_mock_trainer()
+        trainer.model = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
         trainer.args.train.checkpoint.load_path = str(tmp_path)
         trainer.args.train.global_rank = 0
         trainer.train_dataloader = None
@@ -731,6 +732,7 @@ class TestGlobalStateCallbackJobState:
         extra_path = Path(layout.extra_state_path(str(tmp_path), 0))
         extra_path.parent.mkdir(parents=True)
         torch.save({"global_step": 7, "offline_cache_writer": {"shard_index": 1}}, extra_path)
+        layout.write_manifest(str(tmp_path), global_step=7, world_size=1, model_state=False)
         if cursor_file == "empty":
             loader_path = Path(layout.loader_path(str(tmp_path), 0))
             loader_path.parent.mkdir(parents=True)
@@ -742,10 +744,46 @@ class TestGlobalStateCallbackJobState:
         trainer.train_dataloader.load_state_dict.assert_not_called()
         assert trainer.state.global_step == 0
 
+    @pytest.mark.parametrize("case", ["missing", "wrong_model", "step_mismatch"])
+    def test_offline_resume_rejects_incomplete_source_before_restoring(self, mock_dist, tmp_path, case):
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer(save_path=str(tmp_path / "new"))
+        trainer.args.train.checkpoint.load_path = str(tmp_path / "old" / "global_step_7")
+        trainer.args.train.training_task = "offline_embedding"
+        trainer.model = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
+        trainer.train_dataloader = MagicMock()
+        trainer.offline_cache_writer = MagicMock()
+        callback = GlobalStateCallback(trainer)
+        callback._read_current = lambda _: {
+            "global_step": 7,
+            "train_dataloader": {"cursor": 9},
+            "offline_cache_writer": {"shard_index": 1},
+        }
+        manifest = {"model_state": False, "global_step": 7, "world_size": 1}
+        if case == "missing":
+            manifest = None
+        elif case == "wrong_model":
+            manifest["model_state"] = True
+        else:
+            manifest["global_step"] = 8
+        rng = torch.get_rng_state().clone()
+        with (
+            patch.object(layout, "read_manifest", return_value=manifest),
+            patch.object(layout, "checkpoint_is_complete", return_value=True),
+            pytest.raises((RuntimeError, ValueError), match="incomplete|unexpectedly|manifest steps differ"),
+        ):
+            callback.load_global_state()
+        trainer.train_dataloader.load_state_dict.assert_not_called()
+        trainer.offline_cache_writer.load_state_dict.assert_not_called()
+        assert trainer.state.global_step == 0
+        assert torch.equal(torch.get_rng_state(), rng)
+
     @patch("veomni.trainer.callbacks.global_state_callback.get_device_type", return_value="cpu")
     def test_load_rejects_when_any_rank_is_missing_state(self, mock_device, mock_dist, tmp_path):
         """A missing cursor must not reuse an optimizer at a different step."""
         mock_dist.is_initialized.return_value = True
+        mock_dist.get_world_size.return_value = 2
+        mock_dist.all_gather_object.side_effect = lambda output, value: output.__setitem__(slice(None), [value, value])
 
         def drop_presence(flag, op=None, group=None):
             if flag.numel() == 1:
@@ -770,7 +808,13 @@ class TestGlobalStateCallbackJobState:
         )
 
         cb = GlobalStateCallback(trainer)
-        with pytest.raises(RuntimeError, match="Trainer state is missing"):
+        with (
+            patch.object(layout, "checkpoint_is_complete", return_value=True),
+            patch.object(
+                layout, "read_manifest", return_value={"model_state": True, "global_step": 7, "world_size": 1}
+            ),
+            pytest.raises(RuntimeError, match="Trainer state is missing"),
+        ):
             cb.load_global_state()
         trainer.channel_loss_callback.load_state_dict.assert_not_called()
         assert trainer.state.global_step == 0
@@ -800,7 +844,13 @@ class TestGlobalStateCallbackJobState:
         torch.save({"global_step": 9, "torch_rng_state": torch.get_rng_state()}, tmp_path / "trainer_state_rank_0.pt")
 
         cb = GlobalStateCallback(trainer)
-        with pytest.raises(RuntimeError, match="Trainer state is missing"):
+        with (
+            patch.object(layout, "checkpoint_is_complete", return_value=True),
+            patch.object(
+                layout, "read_manifest", return_value={"model_state": True, "global_step": 7, "world_size": 1}
+            ),
+            pytest.raises(RuntimeError, match="Trainer state is missing"),
+        ):
             cb.load_global_state()
         assert trainer.state.global_step == 0
 

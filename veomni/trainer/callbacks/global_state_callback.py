@@ -552,23 +552,36 @@ class GlobalStateCallback(Callback):
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "checking restored optimizer providers")
+        has_legacy = bool(legacy_checkpoints)
+        requires_manifest = strict_optimizer or bool(legacy_checkpoints or unknown_checkpoints)
         if dist.is_initialized():
             local_generations = tuple(sorted(generations.items()))
-            restored_generations = [None] * dist.get_world_size()
-            dist.all_gather_object(restored_generations, local_generations)
-            if any(value != local_generations for value in restored_generations):
+            local_contract = (local_generations, requires_manifest, has_legacy, offline_resume)
+            restored_contracts = [None] * dist.get_world_size()
+            dist.all_gather_object(restored_contracts, local_contract)
+            if any(value[0] != local_generations for value in restored_contracts):
                 raise RuntimeError("Restored optimizer checkpoint generations differ across ranks")
-        coordinated_resume = strict_resume or bool(legacy_checkpoints or unknown_checkpoints) or offline_resume
+            # Any optimizer owner requires all ranks to verify the source.
+            requires_manifest = any(value[1] for value in restored_contracts)
+            has_legacy = any(value[2] for value in restored_contracts)
+            if any(value[3] != offline_resume for value in restored_contracts):
+                raise RuntimeError("Offline checkpoint mode differs across ranks")
+        coordinated_resume = strict_resume or requires_manifest or offline_resume
 
-        if strict_optimizer:
+        manifest = None
+        if requires_manifest or offline_resume:
             completeness_error = None
             try:
                 manifest = layout.read_manifest(load_path)
-                if not layout.checkpoint_is_complete(load_path) or manifest is None:
+                if not isinstance(manifest, Mapping) or not layout.checkpoint_is_complete(load_path):
                     raise RuntimeError("Trainer checkpoint is incomplete; optimizer continuation is unsafe")
-                if manifest.get("model_state") is not True:
+                model_state = manifest.get("model_state") if strict_optimizer else manifest.get("model_state", True)
+                if offline_resume and not requires_manifest:
+                    if model_state is not False:
+                        raise RuntimeError("Offline embedding checkpoint unexpectedly includes model state")
+                elif model_state is not True:
                     raise RuntimeError("Trainer checkpoint does not include model and optimizer state")
-                if manifest.get("global_step") != optimizer_step:
+                if strict_optimizer and manifest.get("global_step") != optimizer_step:
                     raise RuntimeError("Trainer and optimizer checkpoint steps differ")
                 if manifest.get("world_size") != args.train.world_size:
                     raise RuntimeError("Trainer checkpoint world size differs")
@@ -737,7 +750,7 @@ class GlobalStateCallback(Callback):
             dist.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
             found = bool(flag.item())
         if not found:
-            if strict_resume or legacy_checkpoints or unknown_checkpoints:
+            if strict_resume or requires_manifest:
                 raise RuntimeError("Trainer state is missing on at least one rank; optimizer continuation is unsafe")
             logger.warning_rank0("Trainer state is missing; resuming weights only.")
             return None
@@ -760,9 +773,9 @@ class GlobalStateCallback(Callback):
             global_step = global_state["global_step"]
             if type(global_step) is not int or global_step < 0:
                 raise ValueError("Trainer checkpoint global_step must be a non-negative integer")
+            if manifest is not None and not strict_optimizer and manifest.get("global_step") != global_step:
+                raise ValueError("Trainer and source checkpoint manifest steps differ")
             loader = self.trainer.train_dataloader
-            if (legacy_checkpoints or unknown_checkpoints) and loader is not None and global_step > 0 and not cursor:
-                raise ValueError("Trainer dataloader cursor is missing; optimizer continuation is unsafe")
             if offline_resume and loader is not None and (cursor is None or (global_step > 0 and not cursor)):
                 raise ValueError("Offline embedding checkpoint is missing its dataloader cursor")
             offline_runtime = _offline_condition_runtime(self.trainer)
@@ -795,7 +808,7 @@ class GlobalStateCallback(Callback):
                         "Resuming the existing loader cursor without a verified exact data-resume contract; "
                         "the optimizer state is validated, but the subsequent data sequence may differ."
                     )
-            if strict_optimizer or legacy_checkpoints or unknown_checkpoints:
+            if requires_manifest:
                 if loader is not None and (cursor is None or (global_step > 0 and not cursor)):
                     raise ValueError("Trainer dataloader cursor is missing; optimizer continuation is unsafe")
                 rng = global_state.get("torch_rng_state")
@@ -1274,7 +1287,7 @@ class GlobalStateCallback(Callback):
             self._unadvanced_boundary_state = global_state
 
         legacy_cursor_proven = True
-        if legacy_checkpoints:
+        if has_legacy:
             error = None
             try:
                 cpu_rng = global_state.get("torch_rng_state")
@@ -1301,7 +1314,7 @@ class GlobalStateCallback(Callback):
                 self._last_saved_step = -1
                 if strict_optimizer:
                     raise RuntimeError("Mixed optimizer resume lacks proven legacy trainer RNG or cursor state")
-        if strict_optimizer or legacy_checkpoints or unknown_checkpoints:
+        if requires_manifest:
             self._confirm_same_output_checkpoint(
                 global_step,
                 load_path,
@@ -1310,6 +1323,7 @@ class GlobalStateCallback(Callback):
                 legacy_checkpoints,
                 unknown_checkpoints,
                 legacy_cursor_proven,
+                has_legacy=has_legacy,
             )
 
         logger.info_rank0(
@@ -1327,8 +1341,11 @@ class GlobalStateCallback(Callback):
         legacy_checkpoints=(),
         unknown_checkpoints=(),
         legacy_cursor_proven=True,
+        has_legacy=None,
     ):
         """Reuse a proven checkpoint only at its original output location."""
+        if has_legacy is None:
+            has_legacy = bool(legacy_checkpoints)
         same_output, error = False, None
         try:
             save_root = getattr(self.trainer.args.train.checkpoint, "save_path", None)
@@ -1345,7 +1362,7 @@ class GlobalStateCallback(Callback):
                 raise RuntimeError("Restored checkpoint output path differs across ranks")
         if not same_output:
             return
-        if legacy_checkpoints:
+        if has_legacy:
             if not legacy_cursor_proven:
                 raise RuntimeError(
                     "Cannot safely reuse a legacy checkpoint without proven trainer RNG and cursor state; "
@@ -1357,7 +1374,7 @@ class GlobalStateCallback(Callback):
                 complete = bool(
                     isinstance(manifest, dict)
                     and layout.checkpoint_is_complete(load_path)
-                    and manifest.get("model_state") is True
+                    and manifest.get("model_state", True) is True
                     and manifest.get("global_step") == step
                     and manifest.get("world_size") == self.trainer.args.train.world_size
                 )

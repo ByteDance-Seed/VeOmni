@@ -1115,6 +1115,7 @@ def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint)
     from unittest.mock import patch
 
     from tests.data.test_dpo_provenance_checkpoint import _native_map_loader
+    from veomni.checkpoint import layout
     from veomni.data.data_loader import DistributedDataloader
     from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
     from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
@@ -1146,6 +1147,7 @@ def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint)
             "early_flush",
         )
         trainer.base.args.train.dyn_bsz = dynamic
+        trainer.base.args.train.world_size = world_size
         trainer._dpo_recovery_geometry = dpo._dpo_recovery_geometry(trainer.base.args)
         trainer.base.args.train.checkpoint = SimpleNamespace(load_path="/unused")
         trainer.base.args.train.global_rank = rank
@@ -1217,12 +1219,18 @@ def _invalid_dpo_cursor_worker(rank, world_size, scenario, native_npu, endpoint)
         callback._read_current = lambda _: checkpoint
         with (
             patch.object(DistributedDataloader, "__iter__", injected_iter),
+            patch.object(
+                layout, "read_manifest", return_value={"model_state": True, "global_step": 3, "world_size": world_size}
+            ),
+            patch.object(layout, "checkpoint_is_complete", return_value=True),
             pytest.raises((ValueError, RuntimeError)) as failure,
         ):
             callback.load_global_state()
         message = str(failure.value)
-        if scenario in ("global_mismatch", "position_mismatch"):
+        if scenario == "position_mismatch":
             assert "position differs across ranks" in message
+        elif scenario == "global_mismatch":
+            assert ("manifest steps differ" if rank == 1 else "another rank") in message
         elif rank == 1:
             expected = {
                 "missing": "rank-local dataloader cursor",

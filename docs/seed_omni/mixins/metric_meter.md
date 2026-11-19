@@ -100,12 +100,12 @@ and stored as `trainer.environ_meter`.
 
 ## Lifecycle of one training step
 
-- [`OmniTrainer.train_step`](../../../veomni/trainer/omni/omni_trainer.py#L552)
-  - [`on_step_begin`](../../../veomni/trainer/omni/omni_trainer.py#L564) →
+- [`OmniTrainer.train_step`](../../../veomni/trainer/omni/omni_trainer.py#L557)
+  - [`on_step_begin`](../../../veomni/trainer/omni/omni_trainer.py#L569) →
     [`OmniStepMetricsCallback.on_step_begin`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L64)
     - [`OmniEnvironMeter.add(micro_batch)`](../../../veomni/utils/omni_helper.py#L123) for each micro-batch: sample count, `ds_idx`.
     - [`start_time`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L68): use the preflight start time when present, otherwise `time.time()`.
-  - For each micro-batch: [`forward_backward_step`](../../../veomni/trainer/omni/omni_trainer.py#L506) →
+  - For each micro-batch: [`forward_backward_step`](../../../veomni/trainer/omni/omni_trainer.py#L511) →
     [`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L516) →
     [`TrainNodeRunner`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L78) →
     [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L27), for each node:
@@ -113,8 +113,8 @@ and stored as `trainer.environ_meter`.
       - Module code: `self.metric_meter_set_seqlens(method, full_lengths)`, before the SP slice.
     - [`raw.metric_meter_add(method)`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L66): moves the stash for this `method` into the step buffer and clears the rest.
     - [Endpoint](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L68), then `post_forward`.
-  - [`clip_grad_norm` / `optimizer.step` / `lr_scheduler.step`](../../../veomni/trainer/omni/omni_trainer.py#L584)
-  - [`on_step_end`](../../../veomni/trainer/omni/omni_trainer.py#L589) →
+  - [`clip_grad_norm` / `optimizer.step` / `lr_scheduler.step`](../../../veomni/trainer/omni/omni_trainer.py#L589)
+  - [`on_step_end`](../../../veomni/trainer/omni/omni_trainer.py#L594) →
     [`OmniStepMetricsCallback.on_step_end`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L71)
     - [`delta_time = time.time() - start_time`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L74)
     - [`OmniModelRuntime.metric_meter_collect()`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L636) →
