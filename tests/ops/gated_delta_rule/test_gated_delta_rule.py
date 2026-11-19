@@ -1074,12 +1074,13 @@ def _require_fla_npu() -> None:
 
 
 @pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize(("key_heads", "value_heads"), [(2, 2), (2, 4), (2, 6)])
+@pytest.mark.parametrize(("key_heads", "value_heads"), [(2, 2), (2, 4), (2, 6), (2, 10)])
 def test_fla_npu_grouped_value_heads_match_expanded_reference(packed: bool, key_heads: int, value_heads: int) -> None:
     """Grouped q/k heads must match the explicit-expansion reference kernel.
 
     ``(2, 4)`` is the ratio-2 layout Qwen3.5 and Qwen4-Exp use by default;
     ``(2, 6)`` keeps a non-power-of-two ratio inside the documented domain.
+    ``(2, 10)`` verifies the explicitly expanded fallback above that domain.
     """
     _require_fla_npu()
     grouped_op = resolve_op("chunk_gated_delta_rule", "standard", "fla_npu").wrapper
@@ -1109,9 +1110,11 @@ def test_fla_npu_grouped_value_heads_match_expanded_reference(packed: bool, key_
     query_g, key_g, value_g, g_g, beta_g = make_grad_leaves(*base)
     query_r, key_r, value_r, g_r, beta_r = make_grad_leaves(*base)
 
+    actual_query = query_g.repeat_interleave(ratio, dim=2) if ratio > 4 else query_g
+    actual_key = key_g.repeat_interleave(ratio, dim=2) if ratio > 4 else key_g
     grouped_out, _ = grouped_op(
-        query_g,
-        key_g,
+        actual_query,
+        actual_key,
         value_g,
         g_g,
         beta_g,
