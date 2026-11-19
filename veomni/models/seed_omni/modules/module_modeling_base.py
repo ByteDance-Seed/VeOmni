@@ -54,6 +54,56 @@ class PretrainedOmniModule(PreTrainedModel):
     #: leaves this ``False``, so the two sides of a handoff can never disagree.
     supports_sp_sharded_handoff: bool = False
 
+    #: Whether this module's blocks may be wrapped by ``torch.compile``.
+    #:
+    #: ``False`` by default. A module sets ``supports_torch_compile = True`` on
+    #: its own class once its compile path has been measured to pay off; the
+    #: flag is the per-module gate, and ``accelerator.torch_compile.enable``
+    #: remains the run-wide switch — a module that opts in is compiled only when
+    #: the run turns compile on, and a module that does not is never compiled.
+    #:
+    #: Measured on A100-80GB, one decoder block per module, forward+backward
+    #: (``dynamic=False``, ``backend="inductor"``; larger is better):
+    #:
+    #: * ``qwen3_llm`` / ``qwen3vl_llm`` / ``janus_llama`` — ~1.32-1.58x. The
+    #:   text backbones are where Inductor's fusion beats eager by the most.
+    #: * ``janus_vqvae`` — ~1.74x over its 37 conv/attention blocks.
+    #: * ``janus_siglip`` — ~1.12x, close to the noise floor for a 4-block
+    #:   tower; kept on because the cost is a one-off compile.
+    #: * ``bagel_siglip_navit`` — ~1.02x, i.e. nothing. Its patch embedding and
+    #:   positional add dominate, so it stays ``False``.
+    #:
+    #: What ``True`` claims: this module's ``forward``/``encode`` reaches every
+    #: block named in its ``_no_split_modules`` with shapes fixed by the
+    #: collator (``dyn_bsz`` + ``pad_to_length``), so a single Inductor graph per
+    #: block covers every step. A module whose input shape varies per step (a
+    #: vision tower over a variable patch grid, an FSM decoder over a growing
+    #: sequence) either stays ``False`` or must be measured under
+    #: ``dynamic=True`` first.
+    supports_torch_compile: bool = False
+
+    #: Whether this module's compile path tolerates ``dynamic=True``.
+    #:
+    #: ``dynamic`` lets one Inductor graph cover a range of shapes, which is what
+    #: a multimodal run wants when the packed token count moves between steps.
+    #: It is not free: Inductor emits shape-polymorphic kernels that cost more
+    #: per call, and on a kernel-heavy module the tax can exceed the compile win
+    #: outright. Measured per module (eager / static / dynamic, A100-80GB):
+    #:
+    #: * ``qwen3_llm`` / ``qwen3vl_llm`` / ``janus_llama`` — static and dynamic are
+    #:   indistinguishable (1.00x). Text blocks are a handful of large matmuls;
+    #:   shape polymorphism changes nothing.
+    #: * ``janus_vqvae`` — dynamic is **30% slower** than static (30.7 -> 44.2 ms
+    #:   per step, reproduced three times), i.e. it gives back most of the 1.73x
+    #:   compile win. Its 37 small conv/attention blocks are exactly the shape
+    #:   that pays the polymorphic-kernel tax.
+    #:
+    #: So a module whose input shape is fixed by the collator or the image
+    #: processor sets this ``False`` — the run-level ``dynamic`` flag is then
+    #: overridden off for this module only, and the other modules keep it. A
+    #: module whose shape really varies sets it ``True``.
+    supports_torch_compile_dynamic: bool = False
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
         """Load weights, then bind module-owned processor / tokenizer sidecars."""

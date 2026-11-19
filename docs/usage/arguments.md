@@ -483,6 +483,49 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 
 `model.accelerator.torch_compile.*` — Per-block `torch.compile` options for text training and dense Qwen3-VL training. Both paths require FSDP2 on CUDA, `train.dyn_bsz=True`, and `train.pad_to_length=True`, so packed token tensors have stable shapes. For Qwen3-VL, only `Qwen3VLTextDecoderLayer` forwards are compiled; the vision tower, DeepStack injection, and language-model head remain eager. Different packed FlashAttention boundaries can produce separate Inductor specializations, so Qwen3-VL currently requires the default `backend="inductor"` and `mode=None` without CUDA Graph replay, `model.accelerator.torch_compile.dynamic=False`, `model.accelerator.ulysses_size=1`, `model.accelerator.cp_size=1`, and `model.accelerator.enable_async=False`. Qwen3-VL-MoE, ExtraParallel, DDP, non-FSDP, NPU, and other multimodal models remain unsupported and fail explicitly.
 
+#### SeedOmni: per-module opt-in
+
+SeedOmni compiles a module only when **two** switches are on:
+
+1. `model.accelerator.torch_compile.enable` — the run-wide switch, validated like any other accelerator field;
+2. the module's `supports_torch_compile = True` class attribute in its `modeling.py`.
+
+The second gate exists because compile pays off by module, not by model. Measured on A100-80GB per module (forward+backward, `backend="inductor"`, `dynamic=False`):
+
+| module | speedup |
+| --- | --- |
+| `qwen3_llm` / `qwen3vl_llm` | ~1.58x |
+| `janus_vqvae` | ~1.74x |
+| `janus_llama` | ~1.32x |
+| `janus_siglip` | ~1.12x |
+| `bagel_siglip_navit` | ~1.02x (stays `False`) |
+
+A module that leaves the flag `False` trains eagerly inside the same run: under `fsdp_scope='model'` the composed `OmniModel` is compiled once, and only the opted-in children contribute block scopes. A run that enables compile with no opted-in module logs that and compiles nothing rather than failing.
+
+**`dynamic=True` is a second per-module opt-in.** `dynamic` lets one Inductor graph cover a range of shapes, which is what a multimodal run wants when the packed token count moves between steps (one image vs four). It is not free — Inductor emits shape-polymorphic kernels that cost more per call — so a module also declares `supports_torch_compile_dynamic`, and the run-level `dynamic` flag reaches only the modules that set it.
+
+Measured per module (eager / static / dynamic, A100-80GB, forward+backward):
+
+| module | static vs eager | dynamic vs static |
+| --- | --- | --- |
+| `qwen3_llm` | 1.57x | 1.000x |
+| `qwen3vl_llm` | 1.57x | 0.997x |
+| `janus_llama` | 1.32x | 1.000x |
+| `janus_vqvae` | 1.73x | **0.696x** |
+
+The text backbones are indifferent — a few large matmuls, where shape polymorphism changes nothing — so they set `supports_torch_compile_dynamic = True`. `janus_vqvae` is **30% slower** with `dynamic` on (30.7 → 44.2 ms/step, reproduced three times), giving back most of its compile win: its 37 small conv/attention blocks are exactly the shape that pays the polymorphic-kernel tax, and its input is a fixed-resolution image anyway. It leaves the flag off.
+
+So the rule for a new module: set `supports_torch_compile = True` once compile pays off, and `supports_torch_compile_dynamic = True` only if its input shape actually varies *and* you measured that `dynamic` does not cost more than it saves.
+
+Two more module-level notes:
+
+- A module is **not** held to the single-model multimodal rule. `janus_siglip` and `qwen3vl_vision` carry a `vision_config` because that is how their own config is shaped, so `_is_multimodal_model` sees them as multimodal — but a module holds one component and no cross-modal injection, so it gets the composed-path guards (no CUDA graphs, no SP, `dynamic` allowed) instead of the Qwen3-VL-only refusal. A single HF multimodal model (Qwen2.5-Omni, Qwen3-VL-MoE, ...) still fails closed.
+- Under `fsdp_scope='module'` each module is built standalone, so its fqns carry no module prefix and its blocks are named whatever the family calls them (`JanusVQVAEAttnBlock`). The wrap uses the empty scope `""` — "this whole tree" — so those blocks are reachable; without it the matcher applied the HF `*DecoderLayer` rule and compiled nothing.
+
+With `dynamic=True` on a text stack over six lengths spanning 300–2816 tokens: four graphs kept for six lengths, `21.6 → 15.3 ms/step` (1.41x) on a variable-shape step, and numerics identical to a static compile — `dynamic-vs-eager` and `static-vs-eager` both measured 2.4e-2 relative on a bf16 stack (Inductor reordering reductions), while `dynamic-vs-static` differed by 6e-3 and the drift saturated at four layers.
+
+CUDA Graph replay and sequence parallelism stay refused under SeedOmni (`backend='cudagraphs'` / `mode='reduce-overhead'` / `ulysses_size>1` / `cp_size>1` / `enable_async`): replay needs one `cudagraph_mark_step_begin()` per micro-batch across the composed graph, which `OmniTrainer` does not make, and Ulysses slices activations the graph edges reorder.
+
 The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `model.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
 
 | Field | Type | Default | Description |

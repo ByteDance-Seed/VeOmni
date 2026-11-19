@@ -270,6 +270,118 @@ def test_compile_decoder_blocks_uses_no_split_modules(monkeypatch):
     assert calls == [{"fullgraph": True, "dynamic": False, "backend": "inductor"}]
 
 
+def test_compile_decoder_blocks_matches_a_scoped_no_split_entry(monkeypatch):
+    """A SeedOmni composed model scopes each entry to its child (``child.Class``).
+
+    ``_scoped_no_split_modules`` rewrites the composed ``OmniModel``'s
+    ``_no_split_modules`` to ``{child}.{ClassName}``, so the entry no longer
+    equals ``type(module).__name__``.
+    """
+
+    class ComposedModel(nn.Module):
+        _no_split_modules = ["llama.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llama = nn.Module()
+            self.llama.layers = nn.ModuleList([ToyDecoderLayer(), ToyDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    model = ComposedModel()
+    assert compile_decoder_blocks(model, CompileConfig()) == 2
+
+
+def test_compile_decoder_blocks_honours_compile_scopes(monkeypatch):
+    """``scopes`` compiles only the children that opted into torch.compile.
+
+    A composed model is one tree and one compile call, so the per-module opt-in
+    has to narrow the block set here rather than at the call site.
+    """
+
+    class ComposedModel(nn.Module):
+        _no_split_modules = ["llm.ToyDecoderLayer", "vision.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llm = nn.Module()
+            self.llm.layers = nn.ModuleList([ToyDecoderLayer(), ToyDecoderLayer()])
+            self.vision = nn.Module()
+            self.vision.layers = nn.ModuleList([ToyDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    model = ComposedModel()
+    compiled = compile_decoder_blocks(model, CompileConfig(enable=True), scopes=["llm"])
+
+    assert compiled == 2
+    assert all(block._veomni_forward_compiled for block in model.llm.layers)
+    assert not getattr(model.vision.layers[0], "_veomni_forward_compiled", False)
+
+
+def test_compile_decoder_blocks_with_empty_scopes_compiles_nothing(monkeypatch):
+    """A run where no module opted in compiles nothing instead of raising.
+
+    ``compile_decoder_blocks`` is only reached with ``enable=True``; the caller
+    clears the flag when no module declares support.
+    """
+
+    class ComposedModel(nn.Module):
+        _no_split_modules = ["llm.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llm = nn.Module()
+            self.llm.layers = nn.ModuleList([ToyDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+    assert compile_decoder_blocks(ComposedModel(), CompileConfig(enable=True), scopes=[]) == 0
+
+
+def test_compile_decoder_blocks_scopes_accept_non_decoder_block_names(monkeypatch):
+    """A SeedOmni module names its own blocks; the scope, not the spelling, gates them.
+
+    ``JanusVqvae`` lists ``JanusVQVAEAttnBlock`` in ``_no_split_modules``. Under a
+    scope that entry has to be compilable, because the module's
+    ``supports_torch_compile`` flag already decided it may be.
+    """
+
+    class JanusVQVAEAttnBlock(nn.Module):
+        def forward(self, x):
+            return x
+
+    class CodecModel(nn.Module):
+        _no_split_modules = ["vqvae.JanusVQVAEAttnBlock"]
+
+        def __init__(self):
+            super().__init__()
+            self.vqvae = nn.Module()
+            self.vqvae.blocks = nn.ModuleList([JanusVQVAEAttnBlock()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+    assert compile_decoder_blocks(CodecModel(), CompileConfig(enable=True), scopes=["vqvae"]) == 1
+
+
+def test_compile_decoder_blocks_without_scopes_keeps_decoder_layers_only(monkeypatch):
+    """The unscoped path keeps the HF convention: only ``*DecoderLayer`` is compiled."""
+
+    class SomeVisionBlock(nn.Module):
+        def forward(self, x):
+            return x
+
+    class MixedModel(nn.Module):
+        _no_split_modules = ["ToyDecoderLayer", "SomeVisionBlock"]
+
+        def __init__(self):
+            super().__init__()
+            self.decoder = ToyDecoderLayer()
+            self.vision = SomeVisionBlock()
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+    compiled = compile_decoder_blocks(MixedModel(), CompileConfig(enable=True))
+    assert compiled == 1
+
+
 def test_compile_decoder_blocks_rejects_unvalidated_multimodal_model(monkeypatch):
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
 
@@ -289,6 +401,122 @@ def test_compile_decoder_blocks_rejects_qwen3_vl_dynamic_shapes(monkeypatch):
             ToyQwen3VLModel(ToyDecoderLayer()),
             CompileConfig(dynamic=True),
         )
+
+
+def test_compile_decoder_blocks_allows_a_seedomni_module_tower(monkeypatch):
+    """A SeedOmni module with a ``vision_config`` is not a whole multimodal model.
+
+    ``janus_siglip`` / ``qwen3vl_vision`` carry ``vision_config`` because that is
+    how their own config is shaped, so ``_is_multimodal_model`` sees them as
+    multimodal and the Qwen3-VL-only rule used to reject them — even though a
+    module holds one component and no cross-modal injection. Its own guards
+    apply instead.
+    """
+    from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+    class TowerConfig:
+        model_type = "qwen3_vl"  # even claiming the one supported type, the module branch wins
+        vision_config = object()
+        sub_configs = {}
+
+    class Tower(PretrainedOmniModule):
+        _no_split_modules = ["ToyDecoderLayer"]
+        config_class = TowerConfig
+
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = TowerConfig()
+            self.blocks = nn.ModuleList([ToyDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    tower = Tower()
+    # The Qwen3-VL rule would demand ``qwen3_vl`` in _no_split_modules; a module
+    # must not be held to it, so the tower's own declared block is compiled.
+    assert compile_decoder_blocks(tower, CompileConfig(enable=True, dynamic=True), scopes=[""]) == 1
+
+
+def test_compile_decoder_blocks_rejects_cuda_graphs_for_a_seedomni_module(monkeypatch):
+    """The same two refusals as the composed path, with the module named."""
+    from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+    class TowerConfig:
+        model_type = "janus_siglip"
+        vision_config = object()
+        sub_configs = {}
+
+    class Tower(PretrainedOmniModule):
+        _no_split_modules = ["ToyDecoderLayer"]
+        config_class = TowerConfig
+
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = TowerConfig()
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    with pytest.raises(RuntimeError, match="CUDA Graph replay for a SeedOmni module"):
+        compile_decoder_blocks(Tower(), CompileConfig(enable=True, backend="cudagraphs"), scopes=[""])
+
+
+def test_compile_decoder_blocks_still_rejects_an_unsupported_hf_multimodal_model(monkeypatch):
+    """A single HF multimodal model keeps the fail-closed rule: it holds the
+    towers *and* the cross-modal injection, unlike a SeedOmni module."""
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    model = ToyModel()
+    model.config = SimpleNamespace(model_type="qwen2_vl", vision_config=SimpleNamespace())
+    model.input_modalities = ("image", "text")
+
+    with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
+        compile_decoder_blocks(model, CompileConfig())
+
+
+def test_compile_decoder_blocks_allows_dynamic_shapes_for_a_composed_model(monkeypatch):
+    """A composed model may use ``dynamic=True``; the single-model Qwen3-VL rule
+    does not apply to it.
+
+    A multimodal step changes the packed token count (one image vs four), so a
+    static compile there recompiles per shape. Measured over six lengths
+    spanning 300-2816 tokens, ``dynamic=True`` kept four graphs and matched eager
+    to the same tolerance as a static compile.
+    """
+
+    class ComposedModel(nn.Module):
+        _no_split_modules = ["llm.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llm = nn.Module()
+            self.llm.layers = nn.ModuleList([ToyDecoderLayer(), ToyDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    model = ComposedModel()
+    model.config = SimpleNamespace(model_type="omni", _module_configs={"llm": SimpleNamespace()})
+
+    assert compile_decoder_blocks(model, CompileConfig(enable=True, dynamic=True), scopes=["llm"]) == 2
+
+
+def test_compile_decoder_blocks_rejects_cuda_graphs_for_a_composed_model(monkeypatch):
+    """Replay needs one ``cudagraph_mark_step_begin`` per micro-batch across the
+    composed graph, which ``OmniTrainer.train_step`` does not make."""
+
+    class ComposedModel(nn.Module):
+        _no_split_modules = ["llm.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llm = nn.Module()
+            self.llm.layers = nn.ModuleList([ToyDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    model = ComposedModel()
+    model.config = SimpleNamespace(model_type="omni", _module_configs={"llm": SimpleNamespace()})
+
+    with pytest.raises(RuntimeError, match="CUDA Graph replay for a composed"):
+        compile_decoder_blocks(model, CompileConfig(enable=True, backend="cudagraphs"), scopes=["llm"])
 
 
 @pytest.mark.parametrize(

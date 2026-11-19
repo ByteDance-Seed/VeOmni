@@ -688,3 +688,107 @@ def test_a_frozen_module_has_no_async_save_to_drain():
     runtime.checkpoint = None
 
     runtime.wait_for_pending_save()
+
+
+def test_compile_is_off_by_default_for_a_module():
+    """A module that has not been measured never compiles.
+
+    ``supports_torch_compile`` is the per-module gate; the class default has to be
+    ``False`` or every module would inherit the run switch.
+    """
+    from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+    assert PretrainedOmniModule.supports_torch_compile is False
+
+
+@pytest.mark.parametrize(
+    ("run_enable", "module_support", "expected"),
+    [
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, True),
+    ],
+)
+def test_module_compile_config_needs_both_switches(run_enable, module_support, expected):
+    """The run switch and the module's opt-in are ANDed.
+
+    The run switch alone must not compile a module that never opted in, and a
+    module's opt-in must not compile itself in a run that left compile off.
+    """
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    module = SimpleNamespace(supports_torch_compile=module_support)
+    accelerator = SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=run_enable, backend="inductor", mode=None, fullgraph=True, dynamic=False)
+    )
+
+    assert module_compile_config(accelerator, module).enable is expected
+
+
+def test_module_compile_config_carries_the_run_options_through():
+    """Gating changes ``enable`` only; the chosen backend and shape flags survive."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    accelerator = SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=False, dynamic=True)
+    )
+    module = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True)
+    config = module_compile_config(accelerator, module)
+
+    assert (config.backend, config.mode, config.fullgraph, config.dynamic) == ("inductor", None, False, True)
+
+
+def test_a_module_without_the_flag_is_treated_as_opted_out():
+    """``getattr`` default, so a module class predating the flag stays eager."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    accelerator = SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=False)
+    )
+
+    assert module_compile_config(accelerator, SimpleNamespace()).enable is False
+
+
+def test_compile_dynamic_is_off_by_default_for_a_module():
+    """A module opts into ``dynamic`` separately from compile itself.
+
+    ``dynamic`` pays Inductor's polymorphic-kernel tax, which on a kernel-heavy
+    codec exceeded the compile win entirely (``janus_vqvae``: 30% slower than
+    static), so it cannot be inherited from the run switch.
+    """
+    from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+    assert PretrainedOmniModule.supports_torch_compile_dynamic is False
+
+
+@pytest.mark.parametrize(
+    ("run_dynamic", "module_dynamic", "expected"),
+    [
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, True),
+    ],
+)
+def test_module_compile_config_intersects_dynamic(run_dynamic, module_dynamic, expected):
+    """The run-level ``dynamic`` only reaches modules that declared they can use it."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    module = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=module_dynamic)
+    accelerator = SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=run_dynamic)
+    )
+
+    assert module_compile_config(accelerator, module).dynamic is expected
+
+
+def test_a_module_without_the_dynamic_flag_gets_dynamic_off():
+    """``getattr`` default, so a module class predating the flag never turns it on."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    accelerator = SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=True)
+    )
+
+    assert module_compile_config(accelerator, SimpleNamespace(supports_torch_compile=True)).dynamic is False

@@ -437,6 +437,7 @@ def parallelize_model_fsdp2(
     expert_weight_fp8_all_gather: bool = False,
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
+    compile_scopes: Optional[Collection[str]] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
@@ -648,6 +649,7 @@ def parallelize_model_fsdp2(
             compile_config,
             sequence_parallel_enabled=parallel_state.sp_enabled,
             async_enabled=parallel_state.async_enabled,
+            scopes=compile_scopes,
         )
         if compiled_count == 0:
             raise RuntimeError("model.accelerator.torch_compile.enable found no decoder blocks to compile.")
@@ -1052,6 +1054,7 @@ def build_parallelize_model(
     expert_weight_fp8_all_gather: bool = False,
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
+    compile_scopes: Optional[Collection[str]] = None,
     should_skip_hf_weight_load: bool = False,
     **kwargs,
 ) -> "nn.Module":
@@ -1163,6 +1166,7 @@ def build_parallelize_model(
                 expert_weight_fp8_all_gather=expert_weight_fp8_all_gather,
                 expert_fsdp_shard_dim=expert_fsdp_shard_dim,
                 compile_config=compile_config,
+                compile_scopes=compile_scopes,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,
                 **kwargs,
             )
