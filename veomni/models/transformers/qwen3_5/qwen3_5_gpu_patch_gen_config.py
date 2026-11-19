@@ -481,6 +481,8 @@ def qwen3_5_gated_deltanet_forward_patched(
     else:
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
+    # Model policy, not a row capability: fla_npu accepts grouped heads as well,
+    # but Qwen3.5 keeps the expanded layout; Qwen4-Exp opts in explicitly.
     if self.num_v_heads // self.num_k_heads > 1 and not (
         self.veomni_chunk_gated_delta_rule.impl == "flash_qla" and not use_precomputed_states
     ):
