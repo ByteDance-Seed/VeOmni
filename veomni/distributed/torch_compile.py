@@ -117,6 +117,22 @@ def _is_multimodal_model(model: nn.Module) -> bool:
     return any(modality != "text" for modality in input_modalities)
 
 
+def _is_omni_module(model: nn.Module) -> bool:
+    """Whether ``model`` is one SeedOmni module built standalone.
+
+    Under ``fsdp_scope='module'`` each module is wrapped on its own, so the wrap
+    sees a single component rather than a whole multimodal model. That matters
+    for the guards below: a SeedOmni tower carries a ``vision_config`` because
+    that is how its own config is shaped, not because it also holds an LLM and
+    the cross-modal injection between them. A single HF multimodal model
+    (Qwen2.5-Omni, Qwen3-VL-MoE, ...) does hold all of that and stays
+    fail-closed.
+    """
+    from ..models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+    return isinstance(model, PretrainedOmniModule)
+
+
 def validate_compile_model(
     model: nn.Module,
     compile_config: CompileConfig,
@@ -153,6 +169,24 @@ def validate_compile_model(
             raise RuntimeError(
                 "model.accelerator.torch_compile.enable does not support sequence parallelism or async Ulysses "
                 "for a composed SeedOmni OmniModel; set model.accelerator.ulysses_size=1, "
+                "model.accelerator.cp_size=1, and model.accelerator.enable_async=False."
+            )
+        return
+
+    if _is_omni_module(model):
+        # A SeedOmni module is one component of the graph, compiled block by
+        # block like a composed model. The same two paths stay refused for the
+        # same reasons, and the per-module op selections are the module's own, so
+        # ``_reject_incompatible_ops`` reads them directly.
+        if compile_config.uses_cuda_graphs():
+            raise RuntimeError(
+                "model.accelerator.torch_compile.enable does not support CUDA Graph replay for a SeedOmni module; "
+                "use backend='inductor' and mode=None."
+            )
+        if sequence_parallel_enabled or async_enabled:
+            raise RuntimeError(
+                "model.accelerator.torch_compile.enable does not support sequence parallelism or async Ulysses "
+                "for a SeedOmni module; set model.accelerator.ulysses_size=1, "
                 "model.accelerator.cp_size=1, and model.accelerator.enable_async=False."
             )
         return

@@ -517,6 +517,11 @@ The text backbones are indifferent — a few large matmuls, where shape polymorp
 
 So the rule for a new module: set `supports_torch_compile = True` once compile pays off, and `supports_torch_compile_dynamic = True` only if its input shape actually varies *and* you measured that `dynamic` does not cost more than it saves.
 
+Two more module-level notes:
+
+- A module is **not** held to the single-model multimodal rule. `janus_siglip` and `qwen3vl_vision` carry a `vision_config` because that is how their own config is shaped, so `_is_multimodal_model` sees them as multimodal — but a module holds one component and no cross-modal injection, so it gets the composed-path guards (no CUDA graphs, no SP, `dynamic` allowed) instead of the Qwen3-VL-only refusal. A single HF multimodal model (Qwen2.5-Omni, Qwen3-VL-MoE, ...) still fails closed.
+- Under `fsdp_scope='module'` each module is built standalone, so its fqns carry no module prefix and its blocks are named whatever the family calls them (`JanusVQVAEAttnBlock`). The wrap uses the empty scope `""` — "this whole tree" — so those blocks are reachable; without it the matcher applied the HF `*DecoderLayer` rule and compiled nothing.
+
 With `dynamic=True` on a text stack over six lengths spanning 300–2816 tokens: four graphs kept for six lengths, `21.6 → 15.3 ms/step` (1.41x) on a variable-shape step, and numerics identical to a static compile — `dynamic-vs-eager` and `static-vs-eager` both measured 2.4e-2 relative on a bf16 stack (Inductor reordering reductions), while `dynamic-vs-static` differed by 6e-3 and the drift saturated at four layers.
 
 CUDA Graph replay and sequence parallelism stay refused under SeedOmni (`backend='cudagraphs'` / `mode='reduce-overhead'` / `ulysses_size>1` / `cp_size>1` / `enable_async`): replay needs one `cudagraph_mark_step_begin()` per micro-batch across the composed graph, which `OmniTrainer` does not make, and Ulysses slices activations the graph edges reorder.
