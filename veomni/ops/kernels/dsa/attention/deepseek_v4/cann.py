@@ -52,6 +52,29 @@ from . import eager
 _ORI_SLIDING_CAUSAL_MASK_MODE = 4
 _CMP_SEGMENT_CAUSAL_MASK_MODE = 3
 
+# ``cmp_topk`` widths the Sparse FlashMLA kernel is built for. The reference
+# implementation derives ``min(index_topk, compressed_len)`` and pads that up to the
+# configured width with ``-1``, so a selection is only ever the whole compressed
+# table or one of these two widths.
+_SFMLA_TOPK_WIDTHS = (512, 1024)
+
+
+def _check_selection_width(topk_indices: Tensor, compressed_len: int) -> None:
+    """Reject selections the kernel does not serve.
+
+    The vendor wrapper pads anything at most 512 wide up to 512, so a selection
+    that spans the whole compressed table is served. A narrower selection is not:
+    on CANN 9.2.1 it returns nonfinite rows and a nonfinite ``q`` gradient once the
+    table is wider than the selection, which the parity case used to hit. Refuse it
+    here instead of letting the kernel produce NaNs.
+    """
+    width = topk_indices.shape[-1]
+    if width not in _SFMLA_TOPK_WIDTHS and width != compressed_len:
+        raise ValueError(
+            "cann DeepSeek-V4 sparse attention needs the compressed selection to span the whole table "
+            f"or be 512/1024 wide; got {width} indices over {compressed_len} compressed rows."
+        )
+
 
 def _standard_layout(x: Tensor) -> Tensor:
     """Return ``x`` with row-major strides and a zero storage offset.
@@ -157,6 +180,8 @@ def _packed_context_parallel_call(
                 )
             )
             continue
+        if segment_topk is not None:
+            _check_selection_width(segment_topk, available)
         seg_q = _standard_layout(q[:, rows])
         seg_kv = _standard_layout(ori_kv[:, start:last].unsqueeze(2))
         seg_cmp = _standard_layout(cmp_kv[:, compressed_start : compressed_start + available].unsqueeze(2))
@@ -212,8 +237,10 @@ def wrapper(
     and KV alike. A prefix that ends inside the first compression window holds no
     compressed row at all; those queries run the eager row, since the kernel has
     no mask mode for an empty compressed table. It validates its own dtype,
-    window, ratio and head-size limits. Packed calls without CP take the TND
-    path, which needs batch size 1 and reads the slice boundaries on the host.
+    window, ratio and head-size limits, and this adapter rejects a compressed
+    selection that neither spans the table nor matches the kernel's 512/1024
+    width. Packed calls without CP take the TND path, which needs batch size 1
+    and reads the slice boundaries on the host.
     """
     if attention_mask is not None or cmp_kv is None or cmp_kv.shape[1] == 0:
         return eager.wrapper(
@@ -304,6 +331,8 @@ def wrapper(
     if topk_indices is not None and slices is not None and len(slices) > 1:
         segment_starts = _segment_compressed_starts(slices, compress_ratio, q.device)
         topk_indices = torch.where(topk_indices >= 0, topk_indices - segment_starts, -1)
+    if topk_indices is not None:
+        _check_selection_width(topk_indices, cmp_kv.shape[1])
 
     return npu_sparse_flash_mla(
         _standard_layout(q),
