@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.arguments import MixedPrecisionConfig
 from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
     MultiLRScheduler,
     OmniModelRuntime,
@@ -442,10 +443,12 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
             fsdp_config=SimpleNamespace(
                 fsdp_scope="model",
                 reshard_after_forward=True,
-                mixed_precision=SimpleNamespace(enable=False),
+                mixed_precision=MixedPrecisionConfig(enable=False),
                 forward_prefetch=False,
                 offload=False,
                 offload_pin_memory=False,
+                cpu_offload_extra_parallel_names=[],
+                cpu_offload_exclude_module_patterns=[],
                 max_load_broadcast_size=20.0,
                 expert_weight_fp8_all_gather=True,
                 expert_fsdp_shard_dim=0,

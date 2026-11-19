@@ -28,7 +28,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import noop_context_fn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.arguments import GradientCheckpointingConfig
+from veomni.arguments import GradientCheckpointingConfig, MixedPrecisionConfig
 from veomni.distributed import parallel_state
 from veomni.distributed.parallel_state import ParallelState, use_parallel_state
 from veomni.models.model_runtime import VeOmniModelRuntime
@@ -42,7 +42,11 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _fsdp(scope: str, mode: str = "fsdp2") -> SimpleNamespace:
-    return SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope=scope, fsdp_mode=mode))
+    return SimpleNamespace(
+        fsdp_config=SimpleNamespace(
+            fsdp_scope=scope, fsdp_mode=mode, mixed_precision=MixedPrecisionConfig(enable=False)
+        )
+    )
 
 
 def _unbuilt(model: nn.Module | None = None, **args_fields) -> ModuleRuntime:
@@ -141,7 +145,7 @@ def test_build_model_uses_the_config_the_omni_config_loaded(monkeypatch):
         accelerator=SimpleNamespace(
             init_device="meta",
             fsdp_config=SimpleNamespace(
-                fsdp_mode="fsdp2", fsdp_scope="module", mixed_precision=SimpleNamespace(enable=False)
+                fsdp_mode="fsdp2", fsdp_scope="module", mixed_precision=MixedPrecisionConfig(enable=False)
             ),
         ),
     )
@@ -277,7 +281,7 @@ def _offline_cache_runtime(training_task):
         accelerator=SimpleNamespace(
             init_device="cpu",
             fsdp_config=SimpleNamespace(
-                fsdp_mode="fsdp2", fsdp_scope="module", mixed_precision=SimpleNamespace(enable=False)
+                fsdp_mode="fsdp2", fsdp_scope="module", mixed_precision=MixedPrecisionConfig(enable=False)
             ),
         ),
     )
@@ -592,7 +596,7 @@ def test_distributed_inference_wraps_lora_before_loading_weights(monkeypatch):
     monkeypatch.setattr(ModuleRuntime, "_build_model", lambda self: setattr(self, "model", nn.Linear(2, 2)))
     monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
     accelerator = _fsdp("module")
-    accelerator.fsdp_config.mixed_precision = SimpleNamespace(enable=True)
+    accelerator.fsdp_config.mixed_precision = MixedPrecisionConfig(enable=True)
 
     ModuleRuntime(
         SimpleNamespace(accelerator=accelerator),
@@ -672,7 +676,11 @@ def test_an_eager_inference_module_forwards_without_a_parallel_state(monkeypatch
     enter; its scope is a no-op rather than a registry lookup that would fail."""
     model = _RecordAmbientState()
     monkeypatch.setattr(ModuleRuntime, "_init_eager_inference", lambda self: setattr(self, "model", model))
-    args = SimpleNamespace(accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="eager")))
+    args = SimpleNamespace(
+        accelerator=SimpleNamespace(
+            fsdp_config=SimpleNamespace(fsdp_mode="eager", mixed_precision=MixedPrecisionConfig(enable=False))
+        )
+    )
 
     runtime = ModuleRuntime(
         args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp("module"), for_inference=True
