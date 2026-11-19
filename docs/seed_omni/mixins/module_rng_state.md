@@ -1,15 +1,16 @@
-# Module Sampling State (`rng_state_dict`)
+# Module Extra State (`rng_state_dict`)
 
-A SeedOmni module that draws its own per-step randomness from a private
-generator can have that generator saved and restored with the module, so a
-resumed run continues the same stream instead of replaying it from the seed.
-Like [`OfflineEncodingMixin`](offline_encoding.md), this is a protocol, not a
-base class: a module opts in by defining two methods.
+A SeedOmni module may contribute rank-local state to its own checkpoint. The
+runtime stores that state in the module's per-rank `extra_state` file, so a
+resumed run can restore private state such as a sampling generator instead of
+replaying it from the seed. This page uses RNG state as the example of the
+broader module extra-state protocol. Like [`OfflineEncodingMixin`](offline_encoding.md),
+this is a protocol, not a base class: a module opts in by defining the relevant
+methods.
 
-- Save: [`ModuleRuntime.extra_state`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L663)
-- Load: [`ModuleRuntime.load_extra_state`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L676)
-- Where it is written: [`ModelCheckpointManager._extra_state`](../../../veomni/models/checkpoint/manager.py#L178)
-- Example: [`Cosmos3FlowConnector.rng_state_dict`](../../../veomni/models/seed_omni/modules/cosmos3/flow_connector/modeling.py#L204)
+- Runtime save/load: [`ModuleRuntime`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py)
+- Checkpoint writer: [`ModelCheckpointManager`](../../../veomni/models/checkpoint/manager.py)
+- Example module: [`Cosmos3FlowConnector`](../../../veomni/models/seed_omni/modules/cosmos3/flow_connector/modeling.py)
 
 ## Why a module needs it
 
@@ -32,15 +33,18 @@ class MyConnector(PretrainedOmniModule):
         self._generator.set_state(state["generator"])
 ```
 
-- `ModuleRuntime.extra_state()` returns `{"module_rng_state": module.rng_state_dict()}`
-  when the module defines `rng_state_dict`, and nothing otherwise. The module's
-  checkpoint manager merges it into that module's per-rank `extra_state` file,
-  next to its lr-scheduler state, so each rank restores its own stream.
-- `ModuleRuntime.load_extra_state()` calls `module.load_rng_state_dict(...)`
-  inside the module's own `ParallelState`, so a generator that is created on
-  first use and seeded from `dp_rank` reads this module's rank, not the
-  orchestrator's.
-- The pair mirrors the DiT condition model's, so a model ported from
+- `ModuleRuntime.extra_state()` returns an arbitrary module-owned dict. For this
+  RNG protocol it contributes `{"module_rng_state": module.rng_state_dict()}`;
+  another module-owned state must use its own key rather than colliding with
+  `module_rng_state`.
+- The runtime reserves `lr_scheduler` in the same outer dict. Module-owned state
+  stays in its own namespace; separate modules cannot collide because each
+  module has its own per-rank `extra_state` file under `model/<module>/`.
+- `ModelCheckpointManager` writes that file once per rank. On resume,
+  `ModuleRuntime.load_extra_state()` restores module-owned entries inside the
+  module's own `ParallelState`, so a generator seeded from `dp_rank` reads this
+  module's rank, not the orchestrator's.
+- The RNG pair mirrors the DiT condition model's, so a model ported from
   `DiTTrainer` keeps its method names.
 
 ## A fully frozen module saves nothing
