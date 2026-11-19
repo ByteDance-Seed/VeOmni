@@ -128,8 +128,8 @@ copies before the kernel. Other backends (`fla`, `eager`, NPU `triton`) and recu
 paths keep the expanded Q/K layout; Qwen3.5 and Qwen3.5-MoE still expand for `fla_npu` too.
 Qwen4-Exp is the exception: it passes grouped Q/K to `fla_npu` as well, because the AscendC
 chunk kernel supports grouped value attention (`Hv/Hk in {1, 2, 3, 4}`, with `g`/`beta` staying in
-value-head space). Grouped value heads require the 26.10 AscendC kernels described below; older
-`fla_npu` builds must keep the expanded Q/K path.
+value-head space). Grouped value heads require a v26.9.1+ build that ships both AscendC GDN
+entries; the A2/A3 installs below pin the v26.10 line.
 
 ## Start training on NPU
 

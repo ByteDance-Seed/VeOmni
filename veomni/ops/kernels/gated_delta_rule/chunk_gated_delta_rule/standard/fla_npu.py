@@ -403,8 +403,9 @@ def forward(
     host chunk tables are filled from ``cu_seqlens`` without device uploads.
     Grouped value attention is supported natively: ``q``/``k`` may have fewer
     heads than ``v``, with ``Hv/Hk`` an integer in ``{1, 2, 3, 4}``, and
-    ``g``/``beta`` stay in value-head space. Grouped value heads require the
-    26.10 AscendC kernels; older builds must keep the expanded q/k path.
+    ``g``/``beta`` stay in value-head space. Grouped value heads require a
+    v26.9.1+ build that ships both AscendC GDN entries; the A2/A3 installs in
+    ``docs/examples/qwen3_5.md`` pin the v26.10 line.
     """
     from ...vendor.triton.utils import input_guard
 
