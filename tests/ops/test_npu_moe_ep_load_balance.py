@@ -506,19 +506,29 @@ def _cpu_restore_owner_rows_worker(rank, rendezvous, top_k):
         assert prepared_counts.tolist() == counts
         assert torch.equal(host_counts, host_before)
         for device_counts in (None, prepared_counts):
-            for _ in range(2):
-                owner, owner_grad, owner_counts = npu_moe.npu_ep_memory.restore_owner_wgrad_inputs(
-                    physical,
-                    gradient,
-                    plan,
-                    dist.group.WORLD,
-                    device_counts=device_counts,
-                )
-                assert torch.equal(owner, reference)
-                assert torch.equal(owner_grad, reference[:, :2] * 0.25 + 1)
-                assert owner_counts.tolist() == counts
-                assert torch.equal(physical, physical_before)
-                assert torch.equal(gradient, gradient_before)
+            for reuse_views in (False, True):
+                for _ in range(2):
+                    with torch.no_grad():
+                        owner, owner_grad, owner_counts = npu_moe.npu_ep_memory.restore_owner_wgrad_inputs(
+                            physical,
+                            gradient,
+                            plan,
+                            dist.group.WORLD,
+                            device_counts=device_counts,
+                            reuse_views=reuse_views,
+                        )
+                    assert torch.equal(owner, reference)
+                    assert torch.equal(owner_grad, reference[:, :2] * 0.25 + 1)
+                    assert owner_counts.tolist() == counts
+                    assert torch.equal(physical, physical_before)
+                    assert torch.equal(gradient, gradient_before)
+                    if (
+                        reuse_views
+                        and device_counts is not None
+                        and not any(replica.source_rank == rank for replica in plan.replicas)
+                    ):
+                        assert owner.untyped_storage().data_ptr() == physical.untyped_storage().data_ptr()
+                        assert owner_grad.untyped_storage().data_ptr() == gradient.untyped_storage().data_ptr()
     finally:
         dist.destroy_process_group()
 
@@ -527,6 +537,37 @@ def _cpu_restore_owner_rows_worker(rank, rendezvous, top_k):
 def test_replica_prefixes_restore_exact_owner_rows_with_multiple_targets(tmp_path, top_k):
     rendezvous = f"file://{tmp_path / 'npu-owner-order'}"
     mp.spawn(_cpu_restore_owner_rows_worker, args=(rendezvous, top_k), nprocs=4, join=True)
+
+
+@pytest.mark.parametrize(
+    "case", ["views", "token_stride", "grad_stride", "legacy", "missing_counts", "grad_mode", "empty"]
+)
+def test_owner_prefix_views_preserve_fallback_and_borrowed_inputs(monkeypatch, case):
+    rows = 0 if case == "empty" else 3
+    tokens = torch.arange(rows * 8, dtype=torch.float32).reshape(rows, 8)[:, ::2]
+    gradient = torch.arange(rows * 6, dtype=torch.float32).reshape(rows, 6)[:, ::2]
+    if case != "token_stride":
+        tokens = tokens.contiguous()
+    if case != "grad_stride":
+        gradient = gradient.contiguous()
+    plan = SimpleNamespace(
+        num_local_experts=2, replicas=(), tokens_per_local_physical_expert=torch.tensor([[rows, 0]])
+    )
+    counts = None if case == "missing_counts" else torch.tensor([rows, 0])
+    before, grad_before = tokens.clone(), gradient.clone()
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    with torch.set_grad_enabled(case == "grad_mode"):
+        owner, owner_grad, owner_counts = npu_moe.npu_ep_memory.restore_owner_wgrad_inputs(
+            tokens, gradient, plan, object(), device_counts=counts, reuse_views=case != "legacy"
+        )
+    assert torch.equal(owner, before) and torch.equal(owner_grad, grad_before)
+    assert torch.equal(tokens, before) and torch.equal(gradient, grad_before)
+    assert owner_counts.tolist() == [rows, 0]
+    if rows:
+        views = case == "views"
+        assert (owner.untyped_storage().data_ptr() == tokens.untyped_storage().data_ptr()) == views
+        assert (owner_grad.untyped_storage().data_ptr() == gradient.untyped_storage().data_ptr()) == views
+    assert owner.is_contiguous() and owner_grad.is_contiguous()
 
 
 def _cpu_memory_lifetime_worker(rank, world_size, rendezvous):

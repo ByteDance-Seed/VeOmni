@@ -28,7 +28,7 @@ def _owner_token_counts(host_counts, plan, rank):
     return counts
 
 
-def restore_owner_wgrad_inputs(tokens, grad_output, plan, group, device_counts=None):
+def restore_owner_wgrad_inputs(tokens, grad_output, plan, group, device_counts=None, *, reuse_views=False):
     """Return replica prefixes to owners in the original logical token order.
 
     The planner allocates successive global sender-major prefixes, in replica
@@ -61,6 +61,18 @@ def restore_owner_wgrad_inputs(tokens, grad_output, plan, group, device_counts=N
     pending = dist.batch_isend_irecv(operations) if operations else []
     for work in pending:
         work.wait()
+
+    # Without returned replica rows, original owner rows are already a prefix.
+    if (
+        reuse_views
+        and not received
+        and device_counts is not None
+        and not torch.is_grad_enabled()
+        and tokens.is_contiguous()
+        and grad_output.is_contiguous()
+    ):
+        owner_rows = offsets[plan.num_local_experts]
+        return tokens[:owner_rows], grad_output[:owner_rows], device_counts
 
     owner_tokens, owner_grad, owner_counts = [], [], []
     for expert in range(plan.num_local_experts):
@@ -137,7 +149,7 @@ class _BalancedGroupGemm(torch.autograd.Function):
                     )
             if ctx.needs_input_grad[1]:
                 owner_tokens, owner_grad, owner_counts = restore_owner_wgrad_inputs(
-                    tokens, grad_output, ctx.plan, ctx.group, device_counts=device_owner_counts
+                    tokens, grad_output, ctx.plan, ctx.group, device_counts=device_owner_counts, reuse_views=ctx.memory
                 )
                 if owner_tokens.shape[0]:
                     grad_weight = torch_npu.npu_grouped_matmul(
