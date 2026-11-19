@@ -797,15 +797,23 @@ raise during config validation or op binding.
 
 Patched experts modules construct `VeomniOp("moe_experts", variant, config.ops_config.moe_implementation)`
 in `__init__` and always call that handle. `eager` is a registered row, not a
-separate `ModuleList` fork. Every row runs under expert parallelism: the fused
-rows dispatch inside their kernel, while `eager` detects sharded weights and
-hands the call to the reference loop in
+separate `ModuleList` fork. Every `moe_experts` row runs under expert
+parallelism: the fused rows dispatch inside their kernel, while `eager` detects
+sharded weights and hands the call to the reference loop in
 `veomni.ops.kernels.moe_experts.shared.act_fn_experts`, which carries the EP
 all-to-all because a global expert id would index past a local shard. `eager` is
 also the target every fused row delegates to for an activation its kernel cannot
-evaluate. LoRA experts follow the wrapped module's
-`veomni_moe.impl` and fall back to `eager` when that `moe_experts_lora` row is
-unavailable on the device.
+evaluate.
+
+`moe_experts_lora` is a **separate registered family** with its own rows
+(`shared` / `independent` × `eager` / `fused_triton` / `fused_npu`), and the two
+are not interchangeable. MoE-LoRA follows the wrapped module's `veomni_moe.impl`
+and falls back to its own `eager` row when no `moe_experts_lora` row matches the
+device. That `eager` row is not the row above: it rejects expert parallelism
+outright, so a LoRA run over sharded expert weights needs `fused_triton` on GPU
+or `fused_npu` on NPU. See [MoE-LoRA](../key_features/lora.md#5-moe-lora) for the
+per-row EP table, and note that every `moe_experts_lora` row hard-codes SwiGLU
+regardless of `hidden_act`.
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
 SM90+ `tilelang` and Ascend `cann` indexer and attention implementations, plus
