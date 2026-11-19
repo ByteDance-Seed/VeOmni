@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from typing import NamedTuple
 
 import torch
@@ -128,6 +129,14 @@ class MiniMaxH3Rope(nn.Module):
         return torch.cat((half, half), dim=-1)
 
 
+def _validate_fp32_metadata(timesteps: torch.Tensor, position_ids: torch.Tensor) -> None:
+    """Reject timestep and position inputs that have already lost FP32 precision."""
+    if any(tensor.is_floating_point() and tensor.element_size() < 4 for tensor in (timesteps, position_ids)):
+        raise ValueError(
+            "H3 floating-point timesteps and positions need FP32 or higher. Set cast_forward_inputs=False."
+        )
+
+
 def _cast_linear_input(module, args):
     """Adapt activations after FSDP has materialized this projection's parameters."""
     return (args[0].to(module.weight.dtype), *args[1:])
@@ -149,7 +158,13 @@ class MiniMaxH3FP32Linear(nn.Linear):
         return super()._apply(keep_fp32, recurse=recurse)
 
     def forward(self, x):
-        with torch.autocast(device_type=x.device.type, enabled=False):
+        device_type = x.device.type
+        autocast_context = (
+            torch.autocast(device_type=device_type, enabled=False)
+            if torch.amp.is_autocast_available(device_type)
+            else nullcontext()
+        )
+        with autocast_context:
             return super().forward(x.to(self.weight.dtype))
 
 
@@ -759,6 +774,7 @@ class MiniMaxH3DiT(nn.Module):
         """
         if self.audio_enabled:
             raise ValueError("MiniMax-H3-Image requires a transformer with audio_enabled=False.")
+        _validate_fp32_metadata(unique_timesteps, position_ids)
 
         if x.dim() == 3 and x.shape[0] == 1:
             x = x[0]
@@ -869,8 +885,7 @@ class MiniMaxH3DiT(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.audio_enabled:
             raise ValueError("This transformer has audio_enabled=False; use forward_image() instead.")
-        if any(t.is_floating_point() and t.element_size() < 4 for t in (unique_timesteps, img_position_ids)):
-            raise ValueError("H3 timesteps/positions were cast below FP32; set cast_forward_inputs=false.")
+        _validate_fp32_metadata(unique_timesteps, img_position_ids)
         inverse_indices = inverse_indices.view(-1).to(torch.long)
         token_tags = token_tags.view(-1).to(torch.long)
         text_selected = prompt_embeds

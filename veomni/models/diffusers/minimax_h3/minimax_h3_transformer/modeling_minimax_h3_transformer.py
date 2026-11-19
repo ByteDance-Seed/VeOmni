@@ -118,6 +118,17 @@ class MiniMaxH3DiTModel(PreTrainedModel):
 
         self._configure_packed_attention(config.ops_config.attn_implementation)
 
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None, every_n_layers: int = 1) -> None:
+        """Enable checkpointing that preserves gradients for keyword block inputs."""
+        checkpoint_kwargs = dict(gradient_checkpointing_kwargs or {})
+        if checkpoint_kwargs.get("use_reentrant"):
+            raise ValueError(
+                "MiniMax-H3 does not support reentrant checkpointing with differentiable keyword inputs. "
+                "Set model.accelerator.gradient_checkpointing.enable_reentrant=False."
+            )
+        checkpoint_kwargs["use_reentrant"] = False
+        super().gradient_checkpointing_enable(checkpoint_kwargs, every_n_layers=every_n_layers)
+
     def _configure_packed_attention(self, attn_implementation):
         """Record the attention backend. Do not bind it yet: FA4/NPU/pre-SM90
         cannot construct ``veomni_flash_attention_4``, so a flash name is

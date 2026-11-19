@@ -337,10 +337,13 @@ them, `MiniMaxH3DiT` is listed in `_no_split_modules`, which has side effects:
   block owns its checkpoint boundary, so offload leaves backward recomputation
   active.
 
-Set `mixed_precision.cast_forward_inputs=false`; H3 rejects timesteps or
-positions already cast below FP32. FSDP2 parallelization rejects LoRA on the six
-FP32 projections; other paths do not check. `save_hf_safetensor` exports still
-convert FP32 tensors, including these projections, to BF16.
+Set `mixed_precision.cast_forward_inputs=false`. Both the audio/video and image
+forwards reject floating-point timesteps or positions already cast below FP32.
+Set `gradient_checkpointing.enable_reentrant` to `false` so recomputation
+preserves gradients for the time embedding passed to each block. FSDP2
+parallelization rejects LoRA on the six FP32 projections; other paths do not
+check. `save_hf_safetensor` exports still convert FP32 tensors, including these
+projections, to BF16.
 
 ### Attention and validation
 

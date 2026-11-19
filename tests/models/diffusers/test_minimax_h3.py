@@ -514,7 +514,17 @@ def test_minimax_h3_fp32_linear_stays_fp32_after_bfloat16_conversion():
     torch.testing.assert_close(linear.bias, bias, rtol=0, atol=0)
     torch.testing.assert_close(linear.weight.grad, weight_grad, rtol=0, atol=0)
 
-    x = torch.randn(2, 4, dtype=torch.bfloat16)
-    out = linear(x)
+    inputs = torch.randn(2, 4, dtype=torch.bfloat16)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = linear(inputs)
     assert out.dtype == torch.float32
-    torch.testing.assert_close(out, torch.nn.functional.linear(x.float(), weight, bias), rtol=0, atol=0)
+    torch.testing.assert_close(out, torch.nn.functional.linear(inputs.float(), weight, bias), rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_fp32_linear_supports_meta_forward():
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3FP32Linear
+
+    linear = MiniMaxH3FP32Linear(4, 3, device="meta")
+    output = linear(torch.empty(2, 4, dtype=torch.bfloat16, device="meta"))
+    assert output.is_meta and output.shape == (2, 3) and output.dtype == torch.float32

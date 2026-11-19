@@ -477,11 +477,9 @@ class GradientCheckpointingConfig:
         default=False,
         metadata={
             "help": (
-                "Use reentrant gradient checkpointing. Kept off by default, and not usable "
-                "on a model whose block loop passes its block arguments by keyword "
-                "(MiniMax-H3): reentrant checkpointing saves positional tensors only, so "
-                "the first recomputed block raises. torch also refuses "
-                "enable_reentrant=True together with SAC."
+                "Use reentrant gradient checkpointing. Kept off by default. MiniMax-H3 rejects "
+                "this when enabling checkpointing because differentiable block inputs are passed "
+                "by keyword. Reentrant checkpointing also does not support SAC."
             )
         },
     )

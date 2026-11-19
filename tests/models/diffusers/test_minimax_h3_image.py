@@ -109,7 +109,7 @@ def test_minimax_h3_image_forward_uses_pdd_heads_and_has_no_audio_modules():
 def test_minimax_h3_image_forward_backpropagates_to_image_and_text_rows(checkpointing):
     model = _build_model()
     if checkpointing:
-        model.gradient_checkpointing_enable({"use_reentrant": False})
+        model.gradient_checkpointing_enable({})
     forward_calls = []
     model.dit.blocks[0].register_forward_pre_hook(lambda *_: forward_calls.append(1))
     inputs = _image_inputs()
@@ -129,6 +129,17 @@ def test_minimax_h3_image_forward_rejects_sequence_parallel(monkeypatch):
     monkeypatch.setattr(minimax_h3_dit, "get_ulysses_sequence_parallel_group", lambda: object())
     with pytest.raises(NotImplementedError, match="sequence parallelism"):
         model.forward_image(**_image_inputs(), pdd_step_index=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("input_name", ["unique_timesteps", "position_ids"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_minimax_h3_image_forward_rejects_rounded_inputs(input_name, dtype):
+    model = _build_model()
+    inputs = _image_inputs()
+    inputs[input_name] = inputs[input_name].to(dtype)
+    with pytest.raises(ValueError, match="cast_forward_inputs"):
+        model.forward_image(**inputs, pdd_step_index=0)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

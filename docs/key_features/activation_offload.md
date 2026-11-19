@@ -202,14 +202,25 @@ integration around the outer checkpoint call is needed before combining them.
 
 ### Automatic Module Discovery
 
-Explicit `activation_offload_modules` patterns take precedence. Otherwise, the
-framework uses `model._no_split_modules` by default. Models can set
-`_activation_offload_target_classes` to keep offload targets separate from FSDP
-sharding boundaries. See [Async Activation Offload Targets](async_activation_offload_targets.md)
-for the model contract and its interaction with checkpointing.
-For example, with Qwen3-MoE where `_no_split_modules = ["Qwen3MoeDecoderLayer"]`,
-all `Qwen3MoeDecoderLayer` instances are automatically identified as offload targets.
+Explicit `activation_offload_modules` patterns take precedence. When the list is
+empty, the framework reads the model class's optional
+`_activation_offload_target_classes` list in
+`apply_async_activation_offload` before FSDP2 wrapping. The list contains exact
+module class names. If the attribute is absent or `None`, discovery falls back to
+`_no_split_modules`. An empty list of target classes or no matching modules
+raises an error.
 
+Qwen3-MoE uses the fallback to select every `Qwen3MoeDecoderLayer` instance.
+MiniMax H3 sets the following targets because FSDP2 also wraps the parent DiT.
+
+```python
+_no_split_modules = ["MiniMaxH3DiTBlock", "MiniMaxH3DiT"]
+_activation_offload_target_classes = ["MiniMaxH3DiTBlock"]
+```
+
+For H3, automatic offload wraps only the blocks that own the checkpoint
+boundary. This keeps backward recomputation active and avoids overlapping
+offload hooks on the parent DiT and its children.
 
 ### Core API
 

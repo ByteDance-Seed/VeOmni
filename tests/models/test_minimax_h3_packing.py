@@ -1428,16 +1428,6 @@ def _run_h3_precision_fsdp(checkpointing, lora, weights_path, offload=False, bas
         clear_parallel_state()
 
 
-def _run_h3_precision_gloo(rank, rendezvous, checkpointing, lora, weights_path, offload, basic_modules):
-    import torch.distributed as dist
-
-    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
-    try:
-        _run_h3_precision_fsdp(checkpointing, lora, weights_path, offload, basic_modules)
-    finally:
-        dist.destroy_process_group()
-
-
 def _h3_precision_launch(context):
     """Reserve two CPU ranks locally or two accelerator cards in CI."""
     device = "cpu" if context.capabilities.backend == "cpu" else "accelerator"
@@ -1457,28 +1447,17 @@ def _h3_precision_launch(context):
     ],
 )
 def test_h3_precision_through_production_fsdp(tmp_path, checkpointing, lora, offload, basic_modules):
-    import torch.multiprocessing as mp
-
     from tests.tools.launch_utils import torchrun
-    from veomni.utils.device import get_device_type
 
-    if get_device_type() == "cpu":
-        mp.spawn(
-            _run_h3_precision_gloo,
-            args=(str(tmp_path / "rendezvous"), checkpointing, lora, str(tmp_path), offload, basic_modules),
-            nprocs=2,
-            join=True,
-        )
-    else:
-        torchrun(
-            _run_h3_precision_fsdp,
-            world_size=2,
-            checkpointing=checkpointing,
-            lora=lora,
-            weights_path=str(tmp_path),
-            offload=offload,
-            basic_modules=basic_modules,
-        )
+    torchrun(
+        _run_h3_precision_fsdp,
+        world_size=2,
+        checkpointing=checkpointing,
+        lora=lora,
+        weights_path=str(tmp_path),
+        offload=offload,
+        basic_modules=basic_modules,
+    )
 
 
 @pytest.mark.parametrize("task", ["fl2va", "ref2va"])

@@ -1042,6 +1042,21 @@ def test_the_h3_dit_arms_nothing_itself():
     assert all("_gradient_checkpointing_func" in vars(block) for block in dit.blocks)
 
 
+@pytest.mark.parametrize("recompute_layers", [-1, 2])
+def test_h3_rejects_reentrant_checkpointing_before_parallel_wrap(monkeypatch, recompute_layers):
+    monkeypatch.setattr(torch.utils.checkpoint, "CheckpointFunction", torch.utils.checkpoint.CheckpointFunction)
+    model = _tiny_h3_model()
+    with pytest.raises(ValueError, match=r"gradient_checkpointing\.enable_reentrant=False"):
+        _parallelize(
+            monkeypatch,
+            model,
+            enable_gradient_checkpointing=True,
+            enable_reentrant=True,
+            recompute_policy=recompute_utils.RecomputePolicy(recompute_layers=recompute_layers, use_reentrant=True),
+        )
+    assert not model.is_gradient_checkpointing
+
+
 def test_the_policy_decides_the_h3_blocks_flavour(monkeypatch):
     """Each H3 block owns the checkpoint entry point that the policy patches.
 
