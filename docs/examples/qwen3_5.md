@@ -126,10 +126,9 @@ decode mode), Qwen3.5 and Qwen3.5-MoE pass grouped `query` and `key` heads
 (`num_k_heads < num_v_heads`) directly to `flash_qla` instead of materializing `repeat_interleave`
 copies before the kernel. Other backends (`fla`, `eager`, NPU `triton`) and recurrent decode
 paths keep the expanded Q/K layout; Qwen3.5 and Qwen3.5-MoE still expand for `fla_npu` too.
-Qwen4-Exp is the exception: it passes grouped Q/K to `fla_npu` as well, because the AscendC
-chunk kernel supports grouped value attention (`Hv/Hk in {1, 2, 3, 4}`, with `g`/`beta` staying in
-value-head space). Grouped value heads require a v26.9.1+ build that ships both AscendC GDN
-entries; the A2/A3 installs below pin the v26.10 line.
+Qwen4-Exp also passes grouped Q/K to `fla_npu` for `Hv/Hk in {1, 2, 3, 4}`, with `g`/`beta`
+staying in value-head space. Larger ratios use expanded Q/K. Grouped value heads require a
+v26.9.1+ build that ships both AscendC GDN entries; the A2/A3 installs below pin the v26.10 line.
 
 ## Start training on NPU
 
