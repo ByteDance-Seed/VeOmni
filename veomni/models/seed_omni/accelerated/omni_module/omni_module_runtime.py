@@ -23,6 +23,7 @@ declared module, composes their models into one ``OmniModel`` and cascades the
 
 import os
 from contextlib import nullcontext
+from dataclasses import asdict
 from functools import partial
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -450,6 +451,9 @@ class ModuleRuntime(VeOmniModelRuntime):
                         f"fsdp_scope='model' does not support MXFP8 on module {self.module_name!r}; "
                         "use standalone dense Qwen3."
                     )
+                if override is not None:
+                    # The parent exports module_config, which the model loader may have copied.
+                    self.model.config.veomni_mxfp8 = self.module_config.veomni_mxfp8 = asdict(override)
             self._apply_async_activation_offload()
             logger.info_rank0(
                 f"ModuleRuntime '{self.module_name}': leaving the FSDP wrap to the composed "

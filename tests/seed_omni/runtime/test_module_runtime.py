@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import pytest
 import torch.nn as nn
 from torch.utils.checkpoint import noop_context_fn
+from transformers import Qwen3Config
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import GradientCheckpointingConfig, MixedPrecisionConfig, MXFP8Config
@@ -439,10 +440,15 @@ def test_a_module_under_the_omni_model_wrap_applies_async_activation_offload_fir
 
 
 @pytest.mark.parametrize("override", [None, MXFP8Config(enable=False)], ids=["inherit", "explicit-disable"])
-def test_composed_wrap_resolves_saved_child_mxfp8_before_deferring(monkeypatch, override):
+def test_composed_wrap_resolves_saved_child_mxfp8_before_deferring(monkeypatch, tmp_path, override):
+    from veomni.distributed.mxfp8 import resolve_mxfp8_config
+    from veomni.models.seed_omni.configuration_omni import OmniConfig
+
     model = nn.Linear(2, 2)
-    model.config = SimpleNamespace(veomni_mxfp8={"enable": True})
+    model.config = Qwen3Config(veomni_mxfp8={"enable": True})
     runtime = _unbuilt(model)
+    parent = OmniConfig(_module_entries={runtime.module_name: {}}, training_graphs={}, generation_graphs={})
+    runtime.module_config = parent._module_configs[runtime.module_name] = Qwen3Config.from_dict(model.config.to_dict())
     runtime._global_accelerator = _fsdp("model")
     runtime.args.accelerator.fsdp_config.mixed_precision = MixedPrecisionConfig(mxfp8=override)
     applied = []
@@ -455,6 +461,10 @@ def test_composed_wrap_resolves_saved_child_mxfp8_before_deferring(monkeypatch, 
     else:
         runtime._build_parallelized_model()
         assert applied == [runtime]
+        parent.save_pretrained(tmp_path)
+        reloaded = Qwen3Config.from_pretrained(tmp_path / runtime.module_name)
+        assert model.config.veomni_mxfp8 == reloaded.veomni_mxfp8
+        assert resolve_mxfp8_config(SimpleNamespace(config=reloaded), None) == override
 
 
 class _CheckpointableLinear(nn.Linear):
