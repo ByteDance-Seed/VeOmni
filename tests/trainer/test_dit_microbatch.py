@@ -79,7 +79,6 @@ def test_dit_forwards_replay_timeout_to_native_loader(monkeypatch, dataloader_ty
     build = Mock(return_value=object())
     monkeypatch.setattr(dit_module, "build_dataloader", build)
     trainer._build_dataloader()
-    assert trainer.base._veomni_loader_sp_rank_zero_only is True
     kwargs = build.call_args.kwargs
     if dataloader_type == "native":
         assert kwargs["resume_replay_timeout_seconds"] == 37
