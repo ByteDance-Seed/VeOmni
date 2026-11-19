@@ -129,9 +129,19 @@ def _check_hf_source_exportable(model_path: str) -> None:
         weight_files = source.layout.source_weight_files(source.path)
     except FileNotFoundError as e:
         raise ValueError(
-            f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights: {e} "
+            f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs recognised weights: {e} "
             "Convert the checkpoint to safetensors, or disable save_hf_weights."
         ) from e
+    # Reading the source for *loading* accepts either serialization, but writing
+    # it back keys the output on safetensors headers (`source_tensor_specs`), so
+    # a pickle root has to be refused here rather than deep inside the writer.
+    non_safetensors = sorted({name for name in weight_files.values() if not name.endswith(".safetensors")})
+    if non_safetensors:
+        raise ValueError(
+            "`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights; "
+            f"this checkpoint stores {non_safetensors}. Convert the checkpoint to safetensors "
+            "(e.g. `model.save_pretrained(out, safe_serialization=True)`), or disable save_hf_weights."
+        )
     try:
         source_tensor_specs(source.path, weight_files)
     except ValueError as e:
@@ -551,6 +561,21 @@ class OmniDataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
+    resume_input_contract: Optional[str] = field(
+        default=None,
+        kw_only=True,
+        metadata={"help": "Caller-attested SHA256 identity of the immutable input and deterministic transforms."},
+    )
+    resume_input_deterministic: bool = field(
+        default=False,
+        kw_only=True,
+        metadata={"help": "Attest that input processing is deterministic and has no untracked worker state."},
+    )
+    resume_replay_timeout_seconds: int = field(
+        default=7200,
+        kw_only=True,
+        metadata={"help": "Timeout per worker response during exact streaming replay, in seconds."},
+    )
     data_type: Literal["seedomni", "seedomni_cached"] = field(
         default="seedomni",
         metadata={"help": "Type of the training data; `seedomni_cached` reads an offline-cache dataset."},
@@ -595,6 +620,8 @@ class OmniDataArguments:
     )
 
     def __post_init__(self):
+        if type(self.resume_replay_timeout_seconds) is not int or self.resume_replay_timeout_seconds <= 0:
+            raise ValueError("resume_replay_timeout_seconds must be a positive integer")
         if self.data_type not in {"seedomni", "seedomni_cached"}:
             raise ValueError(
                 f"OmniTrainer only builds the seedomni transforms; got data.data_type={self.data_type!r}."

@@ -379,6 +379,8 @@ def qwen3_5_gated_deltanet_forward_patched(
     else:
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
+    # NPU always expands: Qwen3.5 keeps the expanded layout even for
+    # grouped-capable rows; Qwen4-Exp opts in via GROUPED_VALUE_HEAD_IMPLS.
     if self.num_v_heads // self.num_k_heads > 1:
         query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)

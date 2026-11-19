@@ -853,15 +853,36 @@ class GlobalStateCallback(Callback):
             cursor_error = exc
         default_group = dist.group.WORLD if dist.is_initialized() else None
         raise_if_any_rank_failed(cursor_error, "validating the training data cursor", group=default_group)
+        # DiT loads data only on SP rank zero. All ranks must still create the
+        # same replay control group and participate in its failure reduction.
+        replay_group_timeout = replay_timeout * (replay_workers + 1) + 30 if weighted_replay else 0
+        if dist.is_initialized():
+            device = "cpu" if dist.get_backend(default_group) == "gloo" else get_device_type()
+            timeout_tensor = torch.tensor([replay_group_timeout], dtype=torch.int64, device=device)
+            dist.all_reduce(timeout_tensor, op=dist.ReduceOp.MAX, group=default_group)
+            replay_group_timeout = int(timeout_tensor.item())
+        global_weighted_replay = replay_group_timeout > 0
+        owner_error = None
+        if global_weighted_replay:
+            try:
+                sp_leader_only = getattr(self.trainer, "_veomni_loader_sp_rank_zero_only", False) is True
+                expected_owner = (
+                    not sp_leader_only or not self.parallel_state.sp_enabled or self.parallel_state.sp_rank == 0
+                )
+                if (loader is not None) != expected_owner or (expected_owner and not weighted_replay):
+                    raise ValueError("Weighted replay loader ownership differs from the trainer's SP topology")
+            except BaseException as exc:
+                owner_error = exc
+        raise_if_any_rank_failed(owner_error, "validating weighted replay loader ownership", group=default_group)
         _agree_restored_position(
             global_step,
             saved_epoch,
             default_group,
-            replay_contract={"weighted": weighted_replay},
+            replay_contract={"weighted": global_weighted_replay},
         )
 
         def restore_local(action, description, group=default_group):
-            if not (coordinated_resume or weighted_replay):
+            if not (coordinated_resume or global_weighted_replay):
                 action()
                 return
             error = None
@@ -959,9 +980,8 @@ class GlobalStateCallback(Callback):
 
         replay_group = None
         try:
-            if weighted_replay and dist.is_initialized():
-                group_timeout = replay_timeout * (replay_workers + 1) + 30
-                replay_group = dist.new_group(backend="gloo", timeout=timedelta(seconds=group_timeout))
+            if global_weighted_replay and dist.is_initialized():
+                replay_group = dist.new_group(backend="gloo", timeout=timedelta(seconds=replay_group_timeout))
             restore_local(
                 restore_loader,
                 "restoring the training data cursor",
