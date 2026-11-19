@@ -18,6 +18,43 @@ The multimodal data pipeline lives in `veomni/data/multimodal/` and handles:
 
 All processing parameters are configured through the `mm_configs` section in your YAML config.
 
+## Per-message loss weights for Qwen-VL
+
+For `sharegpt4v_sft` and `sharegpt4v_captioner_sft` samples consumed by the
+Qwen2-VL or Qwen3-VL template, an assistant turn may set binary `loss_mask`
+and a `loss_weight` between 0 and 1. For example:
+
+```json
+{"conversations": [
+  {"from": "human", "value": "<image>Describe this image."},
+  {"from": "gpt", "value": "A short response.", "loss_mask": 1, "loss_weight": 0.25},
+  {"from": "gpt", "value": "Not supervised.", "loss_mask": 0}
+], "images": ["image.jpg"], "source": "sharegpt4v_sft"}
+```
+
+The weight scales each supervised token's cross-entropy and the weighted mean
+uses the sum of token weights. A zero mask excludes the turn. Missing weights
+default to the binary mask. Fractional weights are currently supported only by the `qwen4_exp` VLM model and require
+the `chunk_loss` cross entropy implementation. Other models reject weighted batches. Batches containing MTP labels are not supported. Other
+multimodal preprocessors reject a supplied weight rather than discarding it.
+Router auxiliary loss with fractional loss weights is not supported and is rejected.
+Uncollated list-valued micro-batches, including the RL trainer path, reject
+weighted loss; ordinary unweighted RL batches continue to use their normal path.
+Channel loss remains an unweighted per-source CE metric; it does not represent
+the weighted optimization objective.
+An entire step with no supervised target mass is rejected before the optimizer
+runs, avoiding momentum or weight decay without data supervision. Weighted DPO
+is not supported and is rejected.
+Distributed training also coordinates loader and validation failures before
+forward: this standalone path adds one small world all-reduce per SFT step and
+two per DPO step. Measure the effect on the target interconnect; the stacked
+padding-safe path can reuse its existing preflight instead. In single-process
+SFT, marked padding is excluded from the loss and metrics, and its model
+forward/backward is skipped. Distributed loaders must not inject padded
+micro-batches. Distributed main-process dynamic batching requires
+`drop_last=True` until tail step counts can be coordinated. DPO, Omni and DiT
+reject marked padding.
+
 ## Image Resolution Control
 
 Images are resized by `smart_resize` to satisfy three constraints simultaneously:

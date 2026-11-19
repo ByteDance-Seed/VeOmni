@@ -25,6 +25,7 @@ from collections.abc import Callable
 from functools import lru_cache
 from typing import Any
 
+import torch
 from torch import Tensor, nn
 
 from veomni.distributed.parallel_state import get_parallel_state
@@ -34,6 +35,14 @@ from veomni.utils.model_outputs import FusedLinearAuxOutput
 
 from .chunk_logprobs import chunk_logprobs_function
 from .chunk_topk_distill import chunk_topk_distill_function
+
+
+def pop_loss_weights(kwargs: dict[str, Any]) -> Tensor | None:
+    """Remove SFT weights after rejecting unsupported router auxiliary loss."""
+    loss_weights = kwargs.pop("loss_weights", None)
+    if loss_weights is not None and kwargs.get("output_router_logits", False):
+        raise ValueError("loss_weights cannot be combined with router auxiliary loss")
+    return loss_weights
 
 
 def _default_op() -> VeomniOp:
@@ -98,6 +107,7 @@ def _maybe_reduce_loss(
     ignore_index: int,
     sp_enabled: bool,
     loss_reduction_group: Any,
+    loss_weights: Tensor | None = None,
 ) -> Tensor:
     """Reduce on an explicit group, or on the default SP group when SP is on.
 
@@ -106,7 +116,9 @@ def _maybe_reduce_loss(
     """
     if loss_reduction_group is None and not sp_enabled:
         return loss
-    num_valid_tokens = (target != ignore_index).sum()
+    num_valid_tokens = (
+        (target != ignore_index).sum() if loss_weights is None else (loss_weights * (target != ignore_index)).sum()
+    )
     return reduce_sequence_parallel_loss(loss, num_valid_tokens, group=loss_reduction_group)
 
 
@@ -139,6 +151,7 @@ def ForCausalLMLoss(
     chunk_size = kwargs.pop("chunk_size", 1024)
     logits_bias = kwargs.pop("logits_bias", None)
     logits_bias_weight = kwargs.pop("logits_bias_weight", None)
+    loss_weights = kwargs.pop("loss_weights", None)
 
     if hidden_states is None and logits is None:
         raise ValueError("hidden_states or logits must be provided.")
@@ -148,6 +161,8 @@ def ForCausalLMLoss(
     if return_log_probs:
         if logits_bias is not None:
             raise NotImplementedError("logits_bias is supported by the chunk_loss loss path, not return_log_probs.")
+        if loss_weights is not None:
+            raise ValueError("Weighted loss is not supported with log-prob outputs")
         if hidden_states is None:
             raise ValueError("return_log_probs=True requires hidden_states (fused-linear path).")
         if weights is None:
@@ -224,6 +239,17 @@ def ForCausalLMLoss(
     sp_enabled = get_parallel_state().sp_enabled
     target = _select_causal_target(labels, shift_labels, ignore_index=ignore_index, sp_enabled=sp_enabled)
 
+    if loss_weights is not None:
+        if num_items_in_batch is not None:
+            raise ValueError("loss_weights cannot be combined with num_items_in_batch")
+        if shift_labels is not None:
+            raise ValueError("Weighted loss is not supported with log-prob or explicitly shifted labels")
+        if labels is None or loss_weights.shape != labels.shape:
+            raise ValueError("loss_weights must match labels")
+        if not sp_enabled:
+            loss_weights = nn.functional.pad(loss_weights, (0, 1), value=0)[..., 1:].contiguous()
+        loss_weights = loss_weights.reshape(-1).to(device=device, dtype=torch.float32)
+
     target = target.view(-1)
     if hidden_states is not None:
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
@@ -235,6 +261,10 @@ def ForCausalLMLoss(
     token_kwargs: dict[str, Any] = {}
     if getattr(token_op, "impl", None) == "chunk_loss":
         token_kwargs["chunk_size"] = chunk_size
+        if loss_weights is not None:
+            token_kwargs["loss_weights"] = loss_weights
+    elif loss_weights is not None:
+        raise ValueError("Weighted loss currently requires chunk_loss")
     if logits_bias is not None:
         token_kwargs["logits_bias"] = logits_bias
     if logits_bias_weight is not None:
@@ -253,6 +283,7 @@ def ForCausalLMLoss(
         ignore_index=ignore_index,
         sp_enabled=sp_enabled,
         loss_reduction_group=loss_reduction_group,
+        loss_weights=loss_weights,
     )
     return loss, out_logits, None
 

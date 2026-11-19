@@ -152,6 +152,7 @@ class DataCollateInfo:
 DEFAULT_DATA_COLLATE_INFO: Dict[str, DataCollateInfo] = {
     "input_ids": DataCollateInfo(-1, True, 0, 1),
     "labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
+    "loss_weights": DataCollateInfo(-1, True, 0, 1),
     "mtp_labels": DataCollateInfo(-1, True, IGNORE_INDEX, 1),
     "attention_mask": DataCollateInfo(-1, False, 1, 1),
     "position_ids": DataCollateInfo(-1, False, 0, 1),
@@ -223,6 +224,8 @@ class MakeMicroBatchCollator(DataCollator):
 @dataclass
 class PrecomputePositionIDsCollator(DataCollator):
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        # Never add derived keys to source dataset mappings shared across epochs.
+        features = [feature.copy() for feature in features]
         for feature in features:
             if "position_ids" not in feature:
                 # default position_ids is 0 ~ seq_len - 1 for text models
@@ -280,10 +283,34 @@ class PackingCollator(DataCollator):
         return batch
 
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """Pack features while keeping labels, weights and sequence boundaries aligned."""
         batch = defaultdict(list)
+        weighted = any(feature.get("loss_weights") is not None for feature in features)
+        mtp_example = next((feature["mtp_labels"] for feature in features if "mtp_labels" in feature), None)
         for feature in features:
+            weights = feature.get("loss_weights")
+            if weights is not None:
+                labels = feature.get("labels")
+                if not isinstance(weights, torch.Tensor) or not isinstance(labels, torch.Tensor):
+                    raise TypeError("loss_weights and labels must be tensors before packing")
+                if weights.shape != labels.shape:
+                    raise ValueError("loss_weights must match the corresponding labels before packing")
+                if (
+                    not torch.isfinite(weights).all()
+                    or (weights < 0).any()
+                    or (weights > 1).any()
+                    or ((weights > 0) & (weights < torch.finfo(torch.float32).tiny)).any()
+                ):
+                    raise ValueError("loss_weights must be in [0, 1] and positive weights must be normal float32")
             for key in feature.keys():
+                if key == "loss_weights" and weights is None:
+                    continue
                 batch[key].append(feature[key])
+            if weighted and weights is None:
+                batch["loss_weights"].append((feature["labels"] != IGNORE_INDEX).to(torch.float32))
+            if weighted and mtp_example is not None and "mtp_labels" not in feature:
+                shape = (*mtp_example.shape[:-1], feature["labels"].shape[-1])
+                batch["mtp_labels"].append(mtp_example.new_full(shape, IGNORE_INDEX))
 
         for key in batch.keys():
             collate_info: DataCollateInfo = self.collate_infos.get(key, None)
@@ -300,11 +327,28 @@ class PackingCollator(DataCollator):
                 pack_dim = collate_info.pack_dim
 
                 # first token of packed sequence must be IGNORE_INDEX
+                label_boundaries = None
                 if key == "labels" and not self.seq_classification:
-                    for i in range(1, len(batch[key])):
-                        batch[key][i][0] = IGNORE_INDEX
+                    if pack_dim in (-1, 0) and all(label.ndim == 1 for label in batch[key]):
+                        # Mask the concatenated output, preserving source labels
+                        # without allocating a full clone of every sample.
+                        label_boundaries = []
+                        offset = 0
+                        for i, label in enumerate(batch[key]):
+                            if i:
+                                if label.numel() == 0:
+                                    raise IndexError("Cannot mask the first token of an empty label")
+                                label_boundaries.append(offset)
+                            offset += label.numel()
+                    else:
+                        # Preserve custom non-1D/pack-dimension semantics.
+                        for i in range(1, len(batch[key])):
+                            batch[key][i] = batch[key][i].clone()
+                            batch[key][i][0] = IGNORE_INDEX
 
                 batch[key] = torch.cat(batch[key], dim=pack_dim)
+                if label_boundaries:
+                    batch[key][label_boundaries] = IGNORE_INDEX
                 if pack_dim == -1:
                     batch[key] = batch[key].unsqueeze(0)
 
@@ -384,11 +428,15 @@ class SequenceParallelCollator(DataCollator):
             return torch.cat((feature, pad), dim=dim)
 
     def __call__(self, batch: Dict[str, Union[torch.Tensor, List[torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        """Shift and slice sequence fields consistently for sequence parallelism."""
         if not self.seq_classification:
             # shift labels
             labels = batch["labels"][..., 1:].contiguous()
             labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
             batch["labels"] = labels
+            if "loss_weights" in batch:
+                weights = batch["loss_weights"][..., 1:].contiguous()
+                batch["loss_weights"] = F.pad(weights, (0, 1), "constant", 0)
 
         linear_attn_tail_padding_length = int(batch.pop(_LINEAR_ATTN_TAIL_PADDING_LENGTH, 0))
 
