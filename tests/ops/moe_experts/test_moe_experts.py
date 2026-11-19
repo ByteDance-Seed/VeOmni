@@ -634,20 +634,40 @@ def test_triton_split_and_merged_match_eager(swiglu_limit: float | None):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", [(0, 257), (5, 257), (17, 768)])
 @pytest.mark.parametrize("swiglu_limit", [None, 1.0])
-def test_triton_merged_swiglu_preserves_staged_rounding(dtype, shape, swiglu_limit):
-    """Match materialized ATen SiLU for merged views and clamped inputs."""
+@pytest.mark.parametrize("grad_layout", ["contiguous", "transposed"])
+def test_triton_merged_swiglu_preserves_staged_rounding(dtype, shape, swiglu_limit, grad_layout):
+    """Match staged ATen values for merged views and strided upstream gradients."""
     require_nvidia_cuda("triton")
-    from veomni.ops.kernels.moe_experts.shared.swiglu import apply_swiglu_clamp, merged_swiglu_forward
+    from veomni.ops.kernels.moe_experts.shared.swiglu import (
+        apply_swiglu_clamp,
+        merged_swiglu_backward,
+        merged_swiglu_forward,
+    )
 
     torch.manual_seed(919)
     rows, columns = shape
     merged = torch.randn(rows, 2 * columns, device="cuda", dtype=dtype)
-    gate, up = apply_swiglu_clamp(*merged.chunk(2, dim=-1), swiglu_limit)[:2]
+    gate, up, gate_mask, up_mask = apply_swiglu_clamp(*merged.chunk(2, dim=-1), swiglu_limit)
     gate_before, up_before = gate.clone(), up.clone()
     expected = torch.ops.aten.silu(gate) * up
     actual = merged_swiglu_forward(gate, up)
+    if grad_layout == "transposed":
+        grad = torch.randn(columns, rows, device="cuda", dtype=dtype).T
+        if rows:
+            assert not grad.is_contiguous()
+            assert grad.stride(1) > 1
+    else:
+        grad = torch.randn_like(gate)
+    activation, packed_grad = merged_swiglu_backward(gate, up, grad, gate_mask, up_mask)
+    expected_gate_grad = torch.ops.aten.silu_backward(grad * up, gate)
+    expected_up_grad = torch.ops.aten.silu(gate) * grad
+    if gate_mask is not None:
+        expected_gate_grad.masked_fill_(~gate_mask, 0)
+        expected_up_grad.masked_fill_(~up_mask, 0)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(activation, expected, rtol=0, atol=0)
+    torch.testing.assert_close(packed_grad, torch.cat([expected_gate_grad, expected_up_grad], dim=-1), rtol=0, atol=0)
     torch.testing.assert_close(gate, gate_before, rtol=0, atol=0)
     torch.testing.assert_close(up, up_before, rtol=0, atol=0)
     assert actual.shape == shape and actual.dtype == dtype and actual.is_contiguous()
@@ -706,6 +726,17 @@ def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, 
     assert calls == [(tokens * top_k, intermediate), (tokens, intermediate)]
 
     monkeypatch.setattr(swiglu, "merged_swiglu_forward", lambda gate_input, up: torch.ops.aten.silu(gate_input) * up)
+
+    def staged_backward(gate_input, up, grad, gate_mask=None, up_mask=None):
+        silu = torch.ops.aten.silu(gate_input)
+        grad_gate = torch.ops.aten.silu_backward(grad * up, gate_input)
+        grad_up = silu * grad
+        if gate_mask is not None:
+            grad_gate.masked_fill_(~gate_mask, 0)
+            grad_up.masked_fill_(~up_mask, 0)
+        return silu * up, torch.cat([grad_gate, grad_up], dim=-1)
+
+    monkeypatch.setattr(swiglu, "merged_swiglu_backward", staged_backward)
     expected, expected_grads = run()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
@@ -719,6 +750,23 @@ def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, 
     for actual_grad, expected_grad in zip(ep_grads, ep_ref_grads):
         assert torch.isfinite(actual_grad).all()
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_merged_swiglu_backward_cpu_preserves_clamp_gradients():
+    """The non-NVIDIA fallback matches autograd through the original clamped inputs."""
+    from veomni.ops.kernels.moe_experts.shared.swiglu import apply_swiglu_clamp, merged_swiglu_backward
+
+    torch.manual_seed(3)
+    gate = torch.randn(5, 33, requires_grad=True)
+    up = torch.randn_like(gate, requires_grad=True)
+    grad = torch.randn_like(gate)
+    clamped_gate, clamped_up, gate_mask, up_mask = apply_swiglu_clamp(gate, up, 0.5)
+    expected = torch.ops.aten.silu(clamped_gate) * clamped_up
+    expected_grads = torch.autograd.grad(expected, (gate, up), grad)
+    activation, packed_grad = merged_swiglu_backward(clamped_gate, clamped_up, grad, gate_mask, up_mask)
+    torch.testing.assert_close(activation, expected, rtol=0, atol=0)
+    torch.testing.assert_close(packed_grad, torch.cat(expected_grads, dim=-1), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -1423,7 +1471,7 @@ def test_reject_quantizing_act_fn_refuses_only_quantizing_rows():
     Python ``act_fn`` loop is the only path for another activation -- and that loop
     cannot reach the family row. Support is tracked in #1430.
 
-    The activation is read from ``use_swiglu_mlp`` because these experts modules are
+    The activation is read from ``use_swiglu`` because these experts modules are
     plain ``nn.Module`` objects with no config reference.
     """
     from types import SimpleNamespace
@@ -1431,7 +1479,7 @@ def test_reject_quantizing_act_fn_refuses_only_quantizing_rows():
     from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 
     def experts(impl, swiglu):
-        return SimpleNamespace(veomni_moe=SimpleNamespace(impl=impl), use_swiglu_mlp=swiglu)
+        return SimpleNamespace(veomni_moe=SimpleNamespace(impl=impl), use_swiglu=swiglu)
 
     # SwiGLU is what every fused row implements.
     reject_quantizing_act_fn(experts("qat", swiglu=True))
@@ -1439,5 +1487,16 @@ def test_reject_quantizing_act_fn_refuses_only_quantizing_rows():
     with pytest.raises(ValueError, match="moe_implementation='qat' cannot run with a non-SwiGLU activation"):
         reject_quantizing_act_fn(experts("qat", swiglu=False))
 
-    # A reference row may use the fallback; that is a deliberate precision choice.
-    reject_quantizing_act_fn(experts("eager", swiglu=False))
+    # ``deepgemm_fp8`` quantizes too -- its ``GroupedLinear`` runs the FP8 GEMM in
+    # forward, dgrad and wgrad -- so it must refuse for the same reason. It used to
+    # be absent from ``QUANTIZING_IMPLS``, which let a non-SwiGLU activation reach the
+    # plain-``F.linear`` fallback and train the routed experts at full precision
+    # while the config said ``deepgemm_fp8``.
+    reject_quantizing_act_fn(experts("deepgemm_fp8", swiglu=True))
+    with pytest.raises(ValueError, match="moe_implementation='deepgemm_fp8' cannot run"):
+        reject_quantizing_act_fn(experts("deepgemm_fp8", swiglu=False))
+
+    # The remaining rows do bf16 math and ignore ``expert_dtype``, so the fallback
+    # changes nothing for them: a reference row may take it deliberately.
+    for impl in ("eager", "fused_triton", "fused_quack", "fused_npu", "fused_mlu"):
+        reject_quantizing_act_fn(experts(impl, swiglu=False))

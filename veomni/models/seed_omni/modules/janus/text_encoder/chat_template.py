@@ -17,7 +17,7 @@ runs ``apply_chat_template`` → ``tokenize`` → ``merge_text_embeds`` → ``pa
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ....utils.conversation import ConversationItem
 from ...text_encoder.chat_template import TextEncoderChatTemplate
@@ -38,6 +38,12 @@ _JANUS_SYSTEM_PROMPT = (
 )
 _JANUS_USER_PREFIX = "<|User|>: "
 _JANUS_ASSISTANT_PREFIX = "\n\n<|Assistant|>:"
+# Upstream's Jinja emits a space after ``<|Assistant|>:`` only when a response
+# follows: ``...{%if not (loop.last and not add_generation_prompt and
+# message['content'][0]['text']=='')%} {%endif%}``. A bare generation prompt
+# ends at the colon. The tokenizer is byte-level and adds no spacing of its own,
+# so the two spellings are different tokens and the distinction has to be kept.
+_JANUS_ASSISTANT_TEXT_SEPARATOR = " "
 
 
 @dataclass(frozen=True)
@@ -51,6 +57,7 @@ class JanusChatMarkers:
     system_prompt: str = _JANUS_SYSTEM_PROMPT
     user_prefix: str = _JANUS_USER_PREFIX
     assistant_prefix: str = _JANUS_ASSISTANT_PREFIX
+    assistant_text_separator: str = _JANUS_ASSISTANT_TEXT_SEPARATOR
 
 
 class JanusChatTemplate(TextEncoderChatTemplate):
@@ -99,6 +106,9 @@ class JanusChatTemplate(TextEncoderChatTemplate):
         # Whether the assistant turn just closed ended on a generated image, which
         # decides if the EOS terminating it is supervised (see the two EOS sites).
         prev_turn_ended_on_image = False
+        # Whether the current assistant turn already emitted a text span, so the
+        # ``<|Assistant|>: `` separator is added to the first one only.
+        prev_turn_has_text = False
         for item in sample:
             if item.is_dummy:
                 dummy_parts.append(item)
@@ -122,6 +132,14 @@ class JanusChatTemplate(TextEncoderChatTemplate):
                         )
                     out.append(self._build_conversation_item("text", self.chat_markers.user_prefix, "user"))
                 elif role == "assistant":
+                    # The bare marker. Upstream emits ``<|Assistant|>: `` — with a
+                    # trailing space — only when a response follows, and that space
+                    # belongs to the *first supervised token*: a byte-level
+                    # tokenizer has one id for ``Hello`` and another for `` Hello``,
+                    # so putting the separator in this unscored part tokenized it as
+                    # a standalone space and left the answer's first token different
+                    # from the native template. It is prepended to the first text
+                    # span below instead, where it merges with the response.
                     out.append(
                         self._build_conversation_item(
                             type="text",
@@ -132,6 +150,7 @@ class JanusChatTemplate(TextEncoderChatTemplate):
                     )
                 prev_role = role
                 prev_was_user_image = False
+                prev_turn_has_text = False
                 if role == "assistant":
                     prev_turn_ended_on_image = False
 
@@ -139,6 +158,14 @@ class JanusChatTemplate(TextEncoderChatTemplate):
                 text = str(item.value)
                 if prev_was_user_image and role == "user" and not text.startswith("\n"):
                     text = "\n" + text
+                if role == "assistant" and not prev_turn_has_text:
+                    # First text span of an assistant turn: upstream renders
+                    # ``<|Assistant|>: Hello``, so the separator merges into this
+                    # span's first token rather than sitting in the unscored
+                    # marker part (where a byte-level tokenizer would emit it as a
+                    # standalone space and leave ``Hello`` on a different id).
+                    text = self.chat_markers.assistant_text_separator + text
+                    prev_turn_has_text = True
                 out.append(self._build_conversation_item("text", text, role))
                 prev_was_user_image = False
                 if role == "assistant":
@@ -149,7 +176,14 @@ class JanusChatTemplate(TextEncoderChatTemplate):
                 # supervising it costs tens of nats and swamps the real text loss.
                 # ``<eoi>`` is supervised — after a fixed-length image span the model
                 # predicts it near-perfectly, and the reference stack scores it too.
-                out.append(self._build_conversation_item("text", self.chat_markers.boi_token, role, loss_mask=0))
+                boi = self.chat_markers.boi_token
+                if role == "assistant" and not prev_turn_has_text:
+                    # An image opening a response takes the separator too: upstream
+                    # renders ``<|Assistant|>: <image_placeholder>``, and the boundary
+                    # before ``<boi>`` is the same position a text answer starts at.
+                    boi = self.chat_markers.assistant_text_separator + boi
+                    prev_turn_has_text = True
+                out.append(self._build_conversation_item("text", boi, role, loss_mask=0))
                 out.append(item)  # media row passed through verbatim (keeps value/role/meta)
                 out.append(self._build_conversation_item("text", self.chat_markers.eoi_token, role))
                 prev_was_user_image = role == "user"
@@ -171,10 +205,34 @@ class JanusChatTemplate(TextEncoderChatTemplate):
         out.extend(dummy_parts)
         return out
 
-    def apply_generation_prompt(self, sample: list[ConversationItem]) -> list[ConversationItem]:
-        """Append the assistant generation prefix to a templated prompt (inference)."""
+    def apply_generation_prompt(
+        self,
+        sample: list[ConversationItem],
+        *,
+        generation_kwargs: dict[str, Any] | None = None,
+    ) -> list[ConversationItem]:
+        """Append the assistant generation prefix to a templated prompt (inference).
+
+        The two response modalities need different tails, and that is what the
+        checkpoint was trained on (byte-level BPE, so the difference is real):
+
+        * **text** (``infer_und``) — training renders ``<|Assistant|>: Hello`` and
+          the space folds into ``Hello``, so the model predicts the merged
+          ``" Hello"`` token straight off the marker. The prompt therefore stops at
+          the bare marker, matching upstream's
+          ``{%if add_generation_prompt%}<|Assistant|>:{%endif%}``.
+        * **image** (anything else) — training renders ``<|Assistant|>: <boi>``,
+          where ``<boi>`` is a special token so nothing folds and the space stays
+          its own token. The prompt carries the separator, and
+          ``emit_image_start`` then feeds ``<boi>`` — the same two positions a
+          training sample has.
+        """
+        infer_type = None if generation_kwargs is None else generation_kwargs.get("infer_type")
+        value = self.chat_markers.assistant_prefix
+        if infer_type != "infer_und":
+            value += self.chat_markers.assistant_text_separator
         out = list(sample)
-        out.append(self._build_conversation_item("text", self.chat_markers.assistant_prefix, "assistant", loss_mask=0))
+        out.append(self._build_conversation_item("text", value, "assistant", loss_mask=0))
         return out
 
     def render_template_string(self, parts: list[ConversationItem]) -> str:

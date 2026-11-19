@@ -41,6 +41,9 @@ MODULES = ("janus_siglip", "janus_vqvae", "janus_text_encoder", "janus_llama")
 # runner default, which is "accelerator" on a GPU/NPU runner.
 _CPU = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
+_IMAGE = object()
+"""Sentinel for a generated-image turn in the chat-template parametrization."""
+
 
 def _per_backend_plan(context):
     """Accelerator lease for a fused CE row, CPU for the eager one.
@@ -337,3 +340,114 @@ def test_generate_refuses_sequence_parallelism(monkeypatch):
     monkeypatch.setattr("veomni.models.seed_omni.modules.janus.llama.modeling.get_parallel_state", lambda: _SpState())
     with pytest.raises(ValueError, match="Ulysses sequence parallelism"):
         llm.generate([ConversationItem(type="text", value="hi", role="user")])
+
+
+@_CPU
+@pytest.mark.parametrize(
+    ("sample", "messages", "add_generation_prompt", "infer_type"),
+    [
+        (
+            [
+                ConversationItem(type="text", value="hi", role="user"),
+                ConversationItem(type="text", value="Hello", role="assistant"),
+            ],
+            [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]},
+            ],
+            False,
+            None,
+        ),
+        (
+            [
+                ConversationItem(type="text", value="q1", role="user"),
+                ConversationItem(type="text", value="a1", role="assistant"),
+                ConversationItem(type="text", value="q2", role="user"),
+                ConversationItem(type="text", value="a2", role="assistant"),
+            ],
+            [
+                {"role": "user", "content": [{"type": "text", "text": "q1"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "a1"}]},
+                {"role": "user", "content": [{"type": "text", "text": "q2"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "a2"}]},
+            ],
+            False,
+            None,
+        ),
+        (
+            [ConversationItem(type="text", value="hi", role="user")],
+            [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            True,
+            "infer_und",
+        ),
+        (
+            [ConversationItem(type="text", value="a cat", role="user")],
+            [{"role": "user", "content": [{"type": "text", "text": "a cat"}]}],
+            True,
+            "infer_gen",
+        ),
+    ],
+    ids=["text-answer", "multi-turn", "gen-prompt-text", "gen-prompt-image"],
+)
+def test_the_prompt_matches_the_official_template(sample, messages, add_generation_prompt, infer_type):
+    """Our rendered prompt must match official Janus' Jinja, including after the marker.
+
+    The checkpoint was trained against that template, and its tokenizer is
+    byte-level, so the assistant tail is token-sensitive: a stray or missing
+    space is a different token, not a formatting preference.
+
+    Two divergences are deliberate and asserted rather than hidden:
+
+    * A generation prompt for an **image** response carries the assistant
+      separator, because ``<boi>`` is a special token and the space cannot fold
+      into it the way it folds into a sampled word. Official always stops at the
+      colon since it samples the next token.
+    * Our render appends an EOS to close the sample; official leaves that to the
+      caller.
+
+    A user-image turn also makes our template prepend the system prompt and the
+    official snippet emit an ``<image_placeholder>`` instead of our
+    ``<begin_of_image>``/``<end_of_image>`` span, so those cases are not
+    parametrized here — this test covers the text-only shapes, where the two
+    templates describe the same wire format.
+    """
+    import jinja2
+
+    from veomni.models.seed_omni.modules.janus.convert_janus_weight_to_hf import CHAT_TEMPLATE
+    from veomni.models.seed_omni.modules.janus.text_encoder.chat_template import JanusChatTemplate
+
+    class _Tokenizer:
+        """Only the marker strings; this case never tokenizes."""
+
+        bos_token = "<s>"
+        eos_token = "<\uff5cend\u2581of\u2581sentence\uff5c>"
+        boi_token = "<begin_of_image>"
+        eoi_token = "<end_of_image>"
+        bos_token_id = 0
+        eos_token_id = 1
+        boi_token_id = 2
+        eoi_token_id = 3
+        pad_token_id = 0
+
+    template = JanusChatTemplate(_Tokenizer())
+    markers = template.chat_markers
+
+    parts = template.apply_chat_template(sample)
+    if add_generation_prompt:
+        parts = template.apply_generation_prompt(parts, generation_kwargs={"infer_type": infer_type})
+    ours = template.render_template_string(parts)
+
+    official = jinja2.Template(CHAT_TEMPLATE).render(messages=messages, add_generation_prompt=add_generation_prompt)
+
+    # Compare from the first user marker: ours may prepend BOS and the system
+    # prompt, neither of which the official snippet emits for these inputs.
+    ours_trimmed = ours[ours.index(markers.user_prefix) :]
+    # We append an EOS to close the sample; official leaves that to the caller.
+    if not add_generation_prompt and ours_trimmed.endswith(markers.eos_token):
+        ours_trimmed = ours_trimmed[: -len(markers.eos_token)]
+
+    if add_generation_prompt and infer_type != "infer_und":
+        # The one deliberate divergence: see the docstring.
+        official += markers.assistant_text_separator
+
+    assert ours_trimmed == official, f"ours={ours_trimmed!r} official={official!r}"
