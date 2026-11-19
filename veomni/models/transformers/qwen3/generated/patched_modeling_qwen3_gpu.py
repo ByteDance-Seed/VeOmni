@@ -73,6 +73,7 @@ from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationL
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.linear.standard.torchao import bind_mxfp8
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -248,7 +249,16 @@ class Qwen3Attention(nn.Module):
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
         self.veomni_rope = VeomniOp("rope", "full", config.ops_config.rotary_pos_emb_implementation)
         self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
-        self.veomni_linear = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
+        self.veomni_linears = {}
+        for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            op = VeomniOp(
+                "linear",
+                "standard",
+                config.ops_config.linear_implementation,
+                site=f"model.layers.{layer_idx}.self_attn.{name}",
+            )
+            self.veomni_linears[name] = op
+            setattr(self, name, bind_mxfp8(getattr(self, name), op))
 
     def forward(
         self,
@@ -264,9 +274,13 @@ class Qwen3Attention(nn.Module):
         # The ``linear`` row takes the projection module: ``eager`` calls it (so a
         # ``basic_modules``-wrapped projection still unshards and a LoRA adapter still
         # runs), while a quantizing row reads its weight and refuses a wrapped one.
-        query_states = self.q_norm(self.veomni_linear(self.q_proj, hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.veomni_linear(self.k_proj, hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.veomni_linear(self.v_proj, hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states = self.q_norm(
+            self.veomni_linears["q_proj"](self.q_proj, hidden_states).view(hidden_shape)
+        ).transpose(1, 2)
+        key_states = self.k_norm(
+            self.veomni_linears["k_proj"](self.k_proj, hidden_states).view(hidden_shape)
+        ).transpose(1, 2)
+        value_states = self.veomni_linears["v_proj"](self.v_proj, hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
@@ -287,7 +301,7 @@ class Qwen3Attention(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.veomni_linear(self.o_proj, attn_output)
+        attn_output = self.veomni_linears["o_proj"](self.o_proj, attn_output)
         return attn_output, attn_weights
 
 
@@ -303,6 +317,19 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
         self.mlp = Qwen3MLP(config)
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            op = VeomniOp(
+                "linear",
+                "standard",
+                config.ops_config.linear_implementation,
+                site=f"model.layers.{layer_idx}.mlp.{name}",
+            )
+            projection = getattr(self.mlp, name)
+            bound = bind_mxfp8(projection, op)
+            if bound is not projection:
+                if self.mlp.veomni_gated_mlp.impl in ("qat", "torchao"):
+                    raise ValueError("A quantizing gated_mlp row cannot consume MXFP8 projections.")
+                setattr(self.mlp, name, bound)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
 

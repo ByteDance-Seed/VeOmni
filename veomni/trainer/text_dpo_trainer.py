@@ -156,6 +156,16 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         args = copy.deepcopy(args)
         args.lora_config = {}
         args.accelerator.fsdp_config.mixed_precision.enable = False
+        args.accelerator.fsdp_config.mxfp8_all_gather = False
+        # Run native MXFP8 policy projections at refer_model_precision on the frozen copy.
+        from ..ops.selection import OpsSelection
+
+        selection = args.ops_implementation.linear_implementation
+        if isinstance(selection, OpsSelection) and (
+            selection.kwargs.get("dtype") == "mxfp8"
+            or any((rule.kwargs or {}).get("dtype") == "mxfp8" for rule in selection.overrides)
+        ):
+            args.ops_implementation.linear_implementation = "eager"
         args.accelerator.gradient_checkpointing.enable = False
         args.accelerator.torch_compile.enable = False
         # A second PinnedBufferPool on the frozen copy is wasted host RAM.

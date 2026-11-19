@@ -17,14 +17,15 @@
 ``emulated=True`` (the default) rounds both GEMM operands to the target format and
 multiplies in the model dtype -- the same shape as the TileLang ``qat`` row next to
 it, and the only mode that needs no low-precision hardware. ``emulated=False``
-hands the operands to torchao's real low-precision GEMM for that layout.
+hands the operands to torchao's real low-precision GEMM for that layout. Native MXFP8 requires 32-wide groups.
 
 The two modes differ in what a guard may assume, which is why the row declares both
 rather than hiding one behind a second name: an emulated row reads the weight to
 round it and refuses a wrapped projection, while a native row that owns its own
 arithmetic does not need to.
 
-FP8 is not a ``dtype`` here. torchao's FP8 training is ``Float8Linear``, a module
+Native MXFP8 uses a bound dense Qwen3 projection with 32-wide scale blocks.
+Tensorwise FP8 is not a ``dtype`` here. torchao's FP8 training is ``Float8Linear``, a module
 swap that happens before FSDP wrapping; see ``veomni/distributed/float8.py`` and
 ``mixed_precision.float8``.
 """
@@ -34,20 +35,21 @@ from __future__ import annotations
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ....qat.torchao_fp4 import SUPPORTED_DTYPES as _FP4_DTYPES
 from ....qat.torchao_fp4 import torchao_fake_quant
 from .._module import resolve_projection
 
 
-#: Formats this row can round to, as its ``dtype`` argument.
-#:
-#: The FP4 layouts are the ones an op row can serve. ``fp8`` is deliberately absent:
-#: torchao's FP8 training path is ``Float8Linear``, a *module swap* done before FSDP
-#: wraps, and this row receives one already-built module per call. Driving FP8
-#: through a call-local wrapper would quantize per invocation rather than own the
-#: module, which is a different feature with different numerics -- it belongs behind
-#: ``mixed_precision.float8`` (``veomni/distributed/float8.py``), not here.
-SUPPORTED_DTYPES = _FP4_DTYPES
+def bind_mxfp8(linear, op):
+    """Bind MXFP8 arithmetic before FSDP sees the parameter of this projection."""
+    if op.impl != "torchao" or op.kwargs.get("dtype") != "mxfp8":
+        return linear
+    if op.kwargs.get("emulated", True) or op.kwargs.get("block_size") not in (None, 32):
+        raise ValueError("MXFP8 requires emulated=false and block_size=32.")
+    if linear.in_features % 32 or linear.out_features % 32:
+        raise ValueError("MXFP8 projection dimensions must be divisible by 32.")
+    from veomni.distributed.mxfp8.tensors import MXFP8Linear
+
+    return MXFP8Linear.from_float(linear, all_gather=False)
 
 
 def wrapper(
@@ -64,8 +66,14 @@ def wrapper(
     scale) or ``mxfp4`` (32-wide groups, an E8M0 power-of-two scale).
     ``block_size`` defaults to that format's group width, which is the only width it
     defines. ``emulated`` picks the mode: round-then-multiply-in-model-dtype, or the
-    real low-precision GEMM for that layout.
+    real low-precision GEMM for that layout. Native MXFP8 requires 32-wide groups.
     """
+    if dtype == "mxfp8":
+        from veomni.distributed.mxfp8.tensors import MXFP8Linear
+
+        if emulated or block_size not in (None, 32) or not isinstance(linear, MXFP8Linear):
+            raise ValueError("Native MXFP8 requires a bound Qwen3 projection and emulated=false.")
+        return linear(x)
     if not emulated:
         return _native(linear, x, dtype, block_size)
     # An emulated row always gets a weight: ``resolve_projection`` raises for a

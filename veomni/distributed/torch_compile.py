@@ -176,9 +176,9 @@ def validate_compile_runtime(
 #: because the row is ``torchao`` for both FP4 layouts: a config may compile with
 #: ``dtype: nvfp4`` (float8_e4m3fn scales plus an FP32 per-tensor scale, both of
 #: which Inductor knows) and must not with ``dtype: mxfp4``.
-_UNCOMPILABLE_FORMATS: dict[str, tuple[str, str]] = {
-    "linear_implementation": ("torchao", "mxfp4"),
-    "gated_mlp_implementation": ("torchao", "mxfp4"),
+_UNCOMPILABLE_FORMATS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "linear_implementation": ("torchao", ("mxfp4", "mxfp8")),
+    "gated_mlp_implementation": ("torchao", ("mxfp4",)),
 }
 
 
@@ -187,14 +187,15 @@ def _uncompilable_selections(ops) -> list[str]:
     if ops is None:
         return []
     offending: list[str] = []
-    for field, (impl, dtype) in _UNCOMPILABLE_FORMATS.items():
+    for field, (impl, dtypes) in _UNCOMPILABLE_FORMATS.items():
         value = getattr(ops, field, None)
         name = getattr(value, "name", value)
         if name != impl:
             continue
         # A bare row name means the row's default format, which is not this one.
         kwargs = getattr(value, "kwargs", {}) or {}
-        if kwargs.get("dtype") == dtype:
+        dtype = kwargs.get("dtype")
+        if dtype in dtypes:
             offending.append(f"{field}={impl}(dtype={dtype!r})")
     return offending
 

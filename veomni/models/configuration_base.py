@@ -296,7 +296,8 @@ def _resolve_ops(selections):
         resolved.attn_implementation = OpsImplementationConfig.normalize_attention_backend(
             selections["attn_implementation"], veomni_names=False
         )
-    return {key: getattr(resolved, key) if value is not None else None for key, value in selections.items()}, resolved
+    serialized = resolved.to_dict()
+    return {key: serialized.get(key) if value is not None else None for key, value in selections.items()}, resolved
 
 
 def _capture_selections(source):
