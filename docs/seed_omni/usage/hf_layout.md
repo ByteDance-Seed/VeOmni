@@ -208,10 +208,11 @@ in the exported module config; leave it unset to keep each config's default.
   `HFSource.from_path`. It returns the root used for config, assets, weights,
   and export; the default returns the input unchanged. A layout can override
   it when the user-facing path is an alias or points at a nested release root.
-- `validate_module_state(source_path, name, model)` runs after a module has
-  been loaded from the upstream checkpoint. The default is a no-op. A family
-  layout can validate or normalize module state that cannot be expressed by
-  the key-prefix mapping; it should raise a descriptive exception when the
+- `validate_module_state(source_path, name, model)` runs when a module
+  is attached to an HF source, before either loader reads its weights. The
+  module may still be on `meta`, so the default no-op hook is for validating
+  source/layout compatibility, not for inspecting loaded tensor values or
+  post-load normalization. It should raise a descriptive exception when the
   source state is incompatible.
 
 The generic resolver does not import a concrete family. For releases whose
