@@ -266,7 +266,7 @@ def causal_conv1d_bwd_kernel(
         o_d = i_d * BD + tl.arange(0, BD)
         m_d = o_d < D
 
-        is_tail_chunk = (bos + i_t * BT + BT * W) > TOTAL_ROWS
+        is_tail_chunk = (i_t * BT + BT * W) > T_len
 
         if HAS_WEIGHT:
             if is_tail_chunk:
