@@ -1,13 +1,15 @@
 # Op Selection in VeOmni
 
-VeOmni selects implementations for attention, RMSNorm, RoPE, SwiGLU, MoE,
+VeOmni selects implementations for attention, RMSNorm, RoPE, gated MLP, MoE,
 cross-entropy, load-balancing loss, GatedDeltaNet ops, DSA, mHC, and Qwen4-Exp QSA through
 `OpsImplementationConfig`. Modeling constructs instance-local `VeomniOp`
 handles. There is no process-global bind and no silent eager fallback after
 an optimized row is selected.
 
-`qat_implementation` is the one field that is not a registry row. It selects
-a fake-quantization recipe consumed by `veomni/ops/qat/`.
+Quantization-aware training is not a separate recipe. Each family that can round
+its operands owns a `qat` row, and stored KV/indexer activations round through the
+`kv_round` family. Selecting them is independent per family, so a run can quantize
+only the GEMMs, only the stored activations, or both.
 
 ## Quick Reference
 
@@ -24,30 +26,194 @@ If a field is not in this table, it is not an op-selection knob.
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| SwiGLU MLP | `swiglu_mlp_implementation` | `eager`, `liger_kernel` | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
+| Gated MLP | `gated_mlp_implementation` | `eager`, `liger_kernel`, `qat` (FP8 QAT, SM90+), `torchao_nvfp4` (NVFP4 QAT) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp`. The activation is a **call argument** (`activation=config.hidden_act`), so a `gelu` model quantizes like a `silu` one; `liger_kernel` computes SiLU only on the `standard` variant and is skipped for anything else (the `geglu` variant is not selectable here; Gemma3 binds it in code, and there `liger_kernel` computes GELU-tanh) |
+| Dense projection | `linear_implementation` | `eager`, `qat` (FP8 QAT, SM90+), `torchao_nvfp4` (NVFP4 QAT, `standard` only) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants). Consumers: DeepSeek-V4 (`standard` + `grouped`, so `torchao_nvfp4` is not selectable there) and Qwen3 attention `q/k/v/o` (`standard`) |
+| KV / indexer storage round | `kv_round_implementation` | `none`, `eager`, `triton` (NVIDIA SM89+, ROCm) | `"none"`; there is no host default | Model `__init__` via an instance-local `VeomniOp` on the `deepseek_v4` variant, which fixes the model's two geometries; the `standard` variant is model-agnostic and takes them as call arguments. **DeepSeek-V4 is the only consumer** |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `torch_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `triton` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `triton`, `fla_npu` | `"fla"` (GPU) | Qwen3.5 model `__init__` via an instance-local `VeomniOp` |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (GPU) | `"triton"` (GPU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
-| QAT recipe | `qat_implementation` | `none`, `fp8_blockwise` (DeepSeek-V4, SM90+) | `"none"` | Model `__init__` stores `self.qat_implementation`; patched helpers consume that bound recipe |
+| MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `qat` (FP8/FP4 QAT, SM90+), `deepgemm_fp8` (SM90/SM100), `fused_npu`, `fused_mlu` | `"fused_triton"` (GPU), `"fused_npu"` (NPU), `fused_mlu` (MLU) | Model `__init__` via an instance-local `VeomniOp` |
 
-`qat_implementation` has no per-model registry variants. `fp8_blockwise` is
-rejected at config-parse time on anything but an SM90+ NVIDIA CUDA GPU.
-It also cannot be combined with `moe_implementation: deepgemm_fp8`; that
-backend requires `qat_implementation: none` because it already quantizes
-the expert GEMM operands. Conflicting selections raise at config-parse time.
-Constructed DeepSeek-V4 modules freeze the recipe on `self.qat_implementation`
-from `config.ops_config.qat_implementation`; mutating `config.ops_implementation`
-later does not retarget an existing instance.
+### Quantization is chosen per op, not as a recipe
 
-**The seven general-purpose op fields default per host.** They default to
+Every family that can round its operands owns a `qat` row, and each is selected on
+its own field. There is no recipe name to switch on and no requirement that the
+selections agree: one run can fake-quantize the dense projections while the routed
+experts stay in the model dtype, or round the stored KV while every GEMM runs
+full precision. Any subset is valid, and the resulting numerics are simply the
+subset's.
+
+That independence is the point. A deployment kernel rounds whatever that kernel
+rounds, and the model's families are usually on different paths — the attention
+projections, the shared expert's gated MLP, the routed experts and the KV cache are
+four different kernels in inference, with four different granularities. Binding
+them to one switch forces a training run to simulate rounding it does not have.
+
+The geometry is independent too, at two levels.
+
+**Across rows:** every row carries its own keyword argument with its own default,
+so the three GEMM families and the storage round trip can each run a different
+width in the same job. Nothing links them: `linear` at 128 and `kv_round` at 64 is
+an ordinary combination.
+
+**Across call sites of one row:** the argument travels with the call, not with the
+implementation name, so one model can round the same row differently in different
+places. DeepSeek-V4 does exactly that: a stored KV entry passes
+`rope_features=qk_rope_head_dim`, which selects 64-wide groups over the NoPE prefix
+and leaves the RoPE tail in the model dtype, while an indexer activation passes
+`rope_features=None` and rounds its whole head in 128-wide groups — both through the
+same `kv_round`/`deepseek_v4` row. The variant owns the two geometries, so the
+numbers live in one place and neither call site repeats them; a row named after a
+width would have needed a second row for the second site without changing what the
+kernel does.
+
+| Argument | Row | What it selects |
+| --- | --- | --- |
+| `block_size` | `linear`, `gated_mlp`, `moe_experts` (`qat`) | Channels sharing one scale. One number drives **both** operands: the `1 x block_size` activation blocks and the square `block_size x block_size` weight tiles |
+| `block_size` | `kv_round` (`standard`) | Group width over the last dimension |
+| `quant_features` | `kv_round` (`standard`) | How many leading channels to round, so a call can stop partway through the last dimension |
+| `rope_features` | `kv_round` (`deepseek_v4`) | Which of the model's two geometries applies: pass the trailing RoPE channels for a KV entry, or `None` to round a whole indexer head |
+| `expert_dtype` | `moe_experts` (`qat`) | `fp8` tiles or `fp4` groups, following the checkpoint |
+
+One limitation worth stating plainly: on the GEMM rows a single `block_size` sets
+the activation block *and* the weight tile, because the deployment recipe ties them
+(the FP8 GEMM indexes a weight's scale by the same block counter as the
+activation's). A recipe that used different widths for the two operands would need
+the row to take them separately; none does today.
+
+These arguments are **not** `model.ops_implementation` fields. They are parameters
+of the registered row, resolved at the call site, so changing one is a modeling
+change rather than a config change. What the config decides is *which row runs*.
+
+The `linear` rows take the projection **module** rather than a weight tensor, so a
+model writes `self.veomni_q_a_proj(self.q_a_proj, x)`. Whether a projection can be
+driven by its weight, or has to run its own `forward`, is decided once inside the
+family (`veomni/ops/kernels/linear/_module.py`). Adapters are why: a `LoraLinear`
+keeps the real layer at `base_layer` and owns no `weight`, so a weight-taking call
+site would break the moment someone attached an adapter. A reference row calls the
+wrapped module; a quantizing row refuses rather than training at full precision
+under a config that claimed otherwise.
+
+Selecting every family is a legitimate configuration — it makes training see
+exactly what an FP8 deployment computes — and `configs/text/deepseek_v4_qat.yaml`
+is that example:
+
+```yaml
+ops_implementation:
+  linear_implementation: qat          # attention and indexer projections
+  gated_mlp_implementation: qat      # the shared expert's fused gated MLP
+  moe_implementation: qat             # routed experts, per the checkpoint's expert_dtype
+  kv_round_implementation: triton     # stored KV and indexer logits
+```
+
+Leaving any of them at its reference row trains that family in the model dtype.
+`kv_round_implementation` is the one field with an explicit `none` value, because
+its reference row rounds: every other family spells "off" as `eager`, which there
+already does nothing. Registering `none` as a row rather than asking callers to skip
+a missing handle keeps the field shaped like the rest — the model always builds its
+handle and the row decides. The variant is `deepseek_v4` whenever a model selects
+this row: the model names its own variant, and the config only chooses the
+implementation.
+
+One thing is rejected rather than run: a row's hardware and package `requires` are
+checked when its handle is built, so an unavailable selection raises instead of
+falling back to `eager`.
+
+A second rejection covers the paths a row cannot serve. A fake-quantizing row reads
+the weights it is handed, so a branch that bypasses it would train at full precision
+while the config still said QAT. Two of them refuse instead of falling through:
+
+- **A projection that is not an exact `nn.Linear`** is refused by
+  `gated_mlp._module.render`: a projection wrapped after construction (LoRA keeps
+  the base weights at `base_layer`, so there is no `weight`), or an `nn.Linear`
+  subclass such as torchao's `Float8Linear`, whose own forward computes the GEMM.
+- **Expert LoRA on a quantizing experts row** is refused by `_moe_lora_op`,
+  because no adapter forward would quantize the base weights.
+
+Only quantizing rows are affected — every reference row keeps its fallback.
+
+### The activation travels with the call
+
+The gated-MLP rows take the activation as an argument, so a model's `hidden_act`
+decides what its MLP computes whether or not the row quantizes. `veomni/ops/activation.py`
+serves a fixed set of five, delegating to transformers' own implementation of each.
+`gelu_new` and `gelu_pytorch_tanh` are *different* functions whose bf16 intermediates
+round differently, so they are not normalized onto one formula. SiLU keeps its ATen
+spelling so the quantizing row reuses `eager`'s gradient bit for bit.
+
+| Name | Why it is in the set |
+| --- | --- |
+| `silu`, `swish` | what every model in the repository actually passes today; `swish` is HF's own alias for `silu` |
+| `gelu` | the exact-erf form, the most likely hand-edited value |
+| `gelu_new`, `gelu_pytorch_tanh` | two different implementations, kept together because conflating them was a real bug earlier in this work |
+
+The set is explicit rather than derived from `ACT2FN`. Deriving means every
+activation transformers ships becomes a capability claimed here, and most of
+`ACT2FN` has no configuration in this repository to exercise it — including `mish`,
+whose fused ATen backward cannot be reproduced by any decomposed derivative
+(1.56e-2 absolute on ~25% of elements in bf16).
+
+A name outside the set is not an error for the reference row: `eager` runs the
+model's projection modules and calls the block's own `act_fn`, which is the
+expression the model used before this family existed and is exact for any
+activation. A *quantizing* row refuses instead, because falling back there would
+train at full precision under a config that claimed otherwise.
+
+A row takes the **MLP module**, not six weight tensors, so a model's forward is a
+single handle call with no branch. The row decides for itself how to run the block:
+`gated_mlp._module.render` returns either the six weight tensors (when all three
+projections are exact `nn.Linear` and the row serves the activation) or the three
+projection modules. A row that has to fall back to the modules runs them through
+their own `forward`, which is the path the model took before this family existed.
+Row support is part of the row's contract, and the checks below are about the
+**`standard`** variant. `geglu` is a fixed-function variant: it computes
+`gelu_pytorch_tanh` and takes `activation=` only to recognise when it is the wrong
+row, falling back to the block's `act_fn` for anything else. It registers no
+quantizing row, so the "refuses instead of falling back" rules do not apply to it.
+
+| Row (`standard`) | Activations | When it cannot serve the call |
+| --- | --- | --- |
+| `eager` | the five names, plus anything else through the block's `act_fn` | never — it is the reference |
+| `qat`, `torchao_nvfp4` | the five names | raises, because a fallback would train at full precision |
+| `liger_kernel` | SiLU only (Liger's `swiglu_forward`) | runs the projection modules instead |
+
+The refusal is a **forward-time** decision, inside `render` — not a config-layer or
+handle-construction check. A handle is built at `__init__`, where the selection is
+still legal; only running the row knows whether it can serve the activation.
+
+`liger_kernel` is the GPU default, so this matters in practice: a `gelu` model on
+GPU would otherwise reach a SiLU-only kernel and fail on its first forward. It is
+skipped, not entered. A quantizing row has no such option -- falling back would
+train at full precision under a config that says otherwise -- so it raises, and
+the error names `eager` as the way to keep the fallback.
+
+The routed experts are the exception, and the reason is structural: their
+activation is fused *into* the grouped GEMM (`aten.silu` in the forward,
+`silu_backward` in the backward), so the Python `act_fn` loop is the only path for
+another activation and it cannot reach the family row. A quantizing
+`moe_implementation` on a non-SiLU activation is therefore refused in each model's
+expert forward, via `reject_quantizing_act_fn`. Teaching those kernels an
+activation argument is tracked in #1430.
+
+There is no cross-family conflict to reject. `deepgemm_fp8` and `qat` are two
+values of the same `moe_implementation` field, so the routed experts cannot be
+quantized twice; the dense families are separate GEMMs, so pairing them with
+DeepGEMM experts is a valid recipe -- and the only way to quantize the shared
+expert, which DeepGEMM does not cover.
+
+torchao-backed formats register as further rows on the same families, on top of
+this mechanism. Their rows are added by the PRs that own those formats.
+
+**The nine general-purpose op fields default per host.** They default to
 `None`, and config `__post_init__` fills each unset field from the host table.
+`kv_round_implementation` is the exception: `None` there means *off*, not
+"use the host default", so an unset field never turns storage rounding on.
 On Ascend NPU, unset fields resolve to `torch_npu` for RMSNorm, rotary embedding and
 its vision-layout selection; to `chunk_loss` for cross-entropy; to `fused_npu`
-for MoE; and to `eager` for SwiGLU and load-balancing loss. Explicit
+for MoE; and to `eager` for gated MLP, dense projection and load-balancing loss. Explicit
 values are never rewritten, so an explicit GPU value such as `liger_kernel` or
 `fused_triton` raises on NPU. Qwen3.5's three GatedDeltaNet fields are
 model-specific and are not in the host table. Their `fla` default also registers on Ascend NPU. Set
@@ -67,7 +233,7 @@ Any variant without a row for the selected value fails and lists its registered
 implementations.
 
 **MLU `liger_kernel` rows require the Cambricon liger build.** `rms_norm`,
-`rope`, `swiglu_mlp`, and `cross_entropy_loss` register `liger_kernel`
+`rope`, `gated_mlp`, and `cross_entropy_loss` register `liger_kernel`
 rows for the `mlu` device that reuse the CUDA adapters — the
 Cambricon fork keeps the upstream `liger_kernel.ops.*` API over MLU backends.
 These rows use `MluKernelRequirement` for device matching and declare
@@ -85,6 +251,35 @@ former `npu` implementation names still parse with a deprecation warning; see th
 [Arguments](../usage/arguments.md#deprecated-values).
 
 ---
+
+### Loading a config written before the per-family rows
+
+Temporary. New saves never produce this shape, and the migration in
+`veomni/models/legacy_qat_selections.py` will be removed.
+
+A model config records whatever ops fields existed when it was written, so a
+checkpoint exported before this refactor still carries `qat_implementation`.
+`_resolve_ops()` translates it before validation — one choke point every path
+reaches, so `from_pretrained`, a re-save and a caller override all behave alike.
+
+| Retired value | Becomes |
+|---|---|
+| `qat_implementation: none` | *(dropped)* — "train in the model dtype" is an unset field today, so nothing else changes. This covers essentially every published checkpoint, because `none` was the default |
+| `qat_implementation: fp8_blockwise` | `ValueError` naming the replacement fields. It cannot translate here: which rows apply depends on the model's families, and a Qwen3 checkpoint has neither routed experts nor a KV cache |
+
+Select a quantized run explicitly instead:
+
+```yaml
+ops_implementation:
+  linear_implementation: qat
+  gated_mlp_implementation: qat
+  moe_implementation: qat
+  kv_round_implementation: triton
+```
+
+To drop the compatibility, delete `veomni/models/legacy_qat_selections.py` and the
+one import in `configuration_base._resolve_ops` (search for
+`legacy_qat_selections`). An old config then fails to load instead of migrating.
 
 ## Lifecycle Overview
 
@@ -109,12 +304,12 @@ VeOmniModelRuntime._build_model()             # (3) model build time
             ├─ VeomniOp("attention", "standard", config.ops_config.attn_implementation)
             ├─ self.veomni_ce = VeomniOp("cross_entropy_loss", ...)
             ├─ self.loss_function = partial(ForCausalLMLoss, op=self.veomni_ce)
-            └─ RMSNorm / RoPE / SwiGLU / MoE / DSA / mHC bind local handles
+            └─ RMSNorm / RoPE / gated MLP / MoE / DSA / mHC bind local handles
 
 model.forward()                               # (4) runtime
   ├─ attention: self.veomni_attn -> registered attention row
   ├─ loss: self.loss_function(...) -> model helper -> instance-local VeomniOp
-  ├─ RMSNorm / RoPE / SwiGLU: instance-local VeomniOp
+  ├─ RMSNorm / RoPE / gated MLP: instance-local VeomniOp
   ├─ mHC: instance-local VeomniOp handles (pre / post / head)
   └─ MoE: instance-local VeomniOp("moe_experts", variant, impl)
 ```
@@ -394,7 +589,7 @@ Key files:
 
 ---
 
-## 3. Per-Model Ops (RMSNorm, RoPE, SwiGLU MLP)
+## 3. Per-Model Ops (RMSNorm, RoPE, Gated MLP)
 
 Each operation can be independently controlled. These fields are not
 Liger-only: they also accept `torch_npu` and model-specific `triton` registry rows
@@ -406,7 +601,7 @@ Liger-only: they also accept `torch_npu` and model-specific `triton` registry ro
 model:
   ops_implementation:
     rms_norm_implementation: liger_kernel       # default; pin to "torch_npu" / "eager" on NPU
-    swiglu_mlp_implementation: liger_kernel     # default; pin to "eager" on NPU (no NPU backend)
+    gated_mlp_implementation: liger_kernel     # default; pin to "eager" on NPU (no NPU backend)
     rotary_pos_emb_implementation: liger_kernel # default; pin to "torch_npu" / "eager" on NPU
 ```
 
@@ -434,12 +629,27 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 | `triton` | Registered model-specific Triton row (DeepSeek-V3 deterministic RoPE, DeepSeek-V4 fused partial-interleaved RoPE, Wan DiT) | `triton` |
 | `eager` | Registered PyTorch reference row | — |
 
-#### `swiglu_mlp_implementation`
+#### `gated_mlp_implementation`
 
 | Value | Implementation | Requirements |
 |-------|---------------|---|
-| `liger_kernel` | Registered Liger SwiGLU row | `liger-kernel` package |
+| `liger_kernel` | Registered Liger SwiGLU row (SiLU only) | `liger-kernel` package |
+| `qat` | Registered TileLang blockwise FP8 fake-quant row | `tilelang`, NVIDIA SM90+ |
+| `torchao_nvfp4` | Registered NVFP4 fake-quant row ([FP4 QAT](../usage/mxfp4_qat.md)) | `torchao` package |
 | `eager` | Registered PyTorch reference row | — |
+
+#### `linear_implementation`
+
+| Value | Implementation | Requirements |
+|-------|---------------|---|
+| `eager` | Registered row that calls the projection module | — |
+| `qat` | Registered TileLang blockwise FP8 fake-quant row | `tilelang`, NVIDIA SM90+ |
+| `torchao_nvfp4` | Registered NVFP4 fake-quant row (`standard` only; [FP4 QAT](../usage/mxfp4_qat.md)) | `torchao` package |
+
+The quantizing rows refuse to run on a projection substituted after
+construction (LoRA keeps the base layer at `base_layer` and owns no `weight`):
+they raise instead of forwarding the unquantized base, because a graceful
+fallback would leave the config claiming quantization-aware training.
 
 ### What gets patched
 
@@ -452,7 +662,8 @@ weight stay on the model side.
 |---|---|---|
 | `rms_norm_implementation` | `{Model}RMSNorm` | `VeomniOp("rms_norm", variant, impl)` |
 | `rotary_pos_emb_implementation` | `apply_rotary_pos_emb` | `VeomniOp("rope", variant, impl)` |
-| `swiglu_mlp_implementation` | `{Model}MLP.forward` | `VeomniOp("swiglu_mlp", "standard", impl)` |
+| `gated_mlp_implementation` | `{Model}MLP.forward` | `VeomniOp("gated_mlp", "standard", impl)` |
+| `linear_implementation` | `{Model}Attention.q/k/v/o_proj` | `VeomniOp("linear", "standard", impl)` |
 
 The selected registry row determines the callable and validates its hardware
 and optional-package requirements when the handle is constructed.
@@ -470,7 +681,7 @@ supported values are `triton` and `eager`.
 
 - Config base class: `veomni/models/configuration_base.py` — `VeOmniPretrainedConfig`, `config.ops_config`
 - Unified registry: `veomni/ops/registry.py` — `register_op()`, `resolve_op()`, `VeomniOp`
-- Backend registration: `veomni/ops/kernels/{rms_norm,rope,swiglu_mlp}/__init__.py`
+- Backend registration: `veomni/ops/kernels/{rms_norm,rope,gated_mlp,linear}/__init__.py`
 - Model integration: `veomni/models/transformers/{model}/*_patch_gen_config.py`
 
 ---
@@ -795,7 +1006,7 @@ currently exist in the `kernels-community` hub.
 |-----------|-----------------|--------------------------|:-----------:|-----|
 | RMSNorm | Instance-local `VeomniOp` with variants | `@use_kernel_forward_from_hub` | Parallel — both can apply | VeOmni covers Qwen3.5's `+1` variant explicitly |
 | RoPE | Instance-local `VeomniOp` with variants | `@use_kernel_forward_from_hub` + `@use_kernelized_func` | Parallel | VeOmni adds an NPU partial-RoPE variant |
-| SwiGLU MLP | Instance-local `VeomniOp` | Not annotated in MoE models (MLP is per-expert, not standalone) | VeOmni only | — |
+| Gated MLP | Instance-local `VeomniOp` | Not annotated in MoE models (MLP is per-expert, not standalone) | VeOmni only | — |
 | Attention | Instance-local `VeomniOp("attention", "standard", config.ops_config.attn_implementation)` plus shared `ALL_ATTENTION_FUNCTIONS` | `ALL_ATTENTION_FUNCTIONS` (same registry) | Yes | VeOmni adds SP wrapping |
 | MoE experts | Instance-local `VeomniOp("moe_experts", ...)` | `@use_experts_implementation` (batched_mm/grouped_mm) | No — different dispatch paths | VeOmni uses registered fused rows; HF uses PyTorch native `grouped_mm` |
 | Cross-entropy | Instance-local `VeomniOp` + model helper | `LOSS_MAPPING` (standard `F.cross_entropy`) | VeOmni only | HF has no fused loss selection |
@@ -813,7 +1024,7 @@ model:
     moe_implementation: fused_triton
     cross_entropy_loss_implementation: liger_kernel
     rms_norm_implementation: liger_kernel
-    swiglu_mlp_implementation: eager           # disable Liger for MLP only
+    gated_mlp_implementation: eager           # disable Liger for MLP only
     rotary_pos_emb_implementation: liger_kernel
     load_balancing_loss_implementation: triton
 ```

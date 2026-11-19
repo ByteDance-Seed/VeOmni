@@ -634,20 +634,40 @@ def test_triton_split_and_merged_match_eager(swiglu_limit: float | None):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", [(0, 257), (5, 257), (17, 768)])
 @pytest.mark.parametrize("swiglu_limit", [None, 1.0])
-def test_triton_merged_swiglu_preserves_staged_rounding(dtype, shape, swiglu_limit):
-    """Match materialized ATen SiLU for merged views and clamped inputs."""
+@pytest.mark.parametrize("grad_layout", ["contiguous", "transposed"])
+def test_triton_merged_swiglu_preserves_staged_rounding(dtype, shape, swiglu_limit, grad_layout):
+    """Match staged ATen values for merged views and strided upstream gradients."""
     require_nvidia_cuda("triton")
-    from veomni.ops.kernels.moe_experts.shared.swiglu import apply_swiglu_clamp, merged_swiglu_forward
+    from veomni.ops.kernels.moe_experts.shared.swiglu import (
+        apply_swiglu_clamp,
+        merged_swiglu_backward,
+        merged_swiglu_forward,
+    )
 
     torch.manual_seed(919)
     rows, columns = shape
     merged = torch.randn(rows, 2 * columns, device="cuda", dtype=dtype)
-    gate, up = apply_swiglu_clamp(*merged.chunk(2, dim=-1), swiglu_limit)[:2]
+    gate, up, gate_mask, up_mask = apply_swiglu_clamp(*merged.chunk(2, dim=-1), swiglu_limit)
     gate_before, up_before = gate.clone(), up.clone()
     expected = torch.ops.aten.silu(gate) * up
     actual = merged_swiglu_forward(gate, up)
+    if grad_layout == "transposed":
+        grad = torch.randn(columns, rows, device="cuda", dtype=dtype).T
+        if rows:
+            assert not grad.is_contiguous()
+            assert grad.stride(1) > 1
+    else:
+        grad = torch.randn_like(gate)
+    activation, packed_grad = merged_swiglu_backward(gate, up, grad, gate_mask, up_mask)
+    expected_gate_grad = torch.ops.aten.silu_backward(grad * up, gate)
+    expected_up_grad = torch.ops.aten.silu(gate) * grad
+    if gate_mask is not None:
+        expected_gate_grad.masked_fill_(~gate_mask, 0)
+        expected_up_grad.masked_fill_(~up_mask, 0)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(activation, expected, rtol=0, atol=0)
+    torch.testing.assert_close(packed_grad, torch.cat([expected_gate_grad, expected_up_grad], dim=-1), rtol=0, atol=0)
     torch.testing.assert_close(gate, gate_before, rtol=0, atol=0)
     torch.testing.assert_close(up, up_before, rtol=0, atol=0)
     assert actual.shape == shape and actual.dtype == dtype and actual.is_contiguous()
@@ -706,6 +726,17 @@ def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, 
     assert calls == [(tokens * top_k, intermediate), (tokens, intermediate)]
 
     monkeypatch.setattr(swiglu, "merged_swiglu_forward", lambda gate_input, up: torch.ops.aten.silu(gate_input) * up)
+
+    def staged_backward(gate_input, up, grad, gate_mask=None, up_mask=None):
+        silu = torch.ops.aten.silu(gate_input)
+        grad_gate = torch.ops.aten.silu_backward(grad * up, gate_input)
+        grad_up = silu * grad
+        if gate_mask is not None:
+            grad_gate.masked_fill_(~gate_mask, 0)
+            grad_up.masked_fill_(~up_mask, 0)
+        return silu * up, torch.cat([grad_gate, grad_up], dim=-1)
+
+    monkeypatch.setattr(swiglu, "merged_swiglu_backward", staged_backward)
     expected, expected_grads = run()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
@@ -719,6 +750,23 @@ def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, 
     for actual_grad, expected_grad in zip(ep_grads, ep_ref_grads):
         assert torch.isfinite(actual_grad).all()
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_merged_swiglu_backward_cpu_preserves_clamp_gradients():
+    """The non-NVIDIA fallback matches autograd through the original clamped inputs."""
+    from veomni.ops.kernels.moe_experts.shared.swiglu import apply_swiglu_clamp, merged_swiglu_backward
+
+    torch.manual_seed(3)
+    gate = torch.randn(5, 33, requires_grad=True)
+    up = torch.randn_like(gate, requires_grad=True)
+    grad = torch.randn_like(gate)
+    clamped_gate, clamped_up, gate_mask, up_mask = apply_swiglu_clamp(gate, up, 0.5)
+    expected = torch.ops.aten.silu(clamped_gate) * clamped_up
+    expected_grads = torch.autograd.grad(expected, (gate, up), grad)
+    activation, packed_grad = merged_swiglu_backward(clamped_gate, clamped_up, grad, gate_mask, up_mask)
+    torch.testing.assert_close(activation, expected, rtol=0, atol=0)
+    torch.testing.assert_close(packed_grad, torch.cat(expected_grads, dim=-1), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -1195,6 +1243,15 @@ def test_same_nk_prefix_near_int32_limit(counts: tuple[int, ...], dtype):
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize(
+    "hidden,output_dim,transpose_b,value_dtype",
+    [
+        pytest.param(31, 145, True, torch.bfloat16, id="two-column-tail-bf16"),
+        pytest.param(65, 17, False, torch.float16, id="one-column-tail-fp16"),
+        pytest.param(33, 385, False, torch.bfloat16, id="four-column-tail-bf16"),
+        pytest.param(128, 256, True, torch.float16, id="aligned-columns-fp16"),
+    ],
+)
+@pytest.mark.parametrize(
     "counts,block_m",
     [
         pytest.param((0, 1, 127, 128, 129, 257), 128, id="tile-boundaries"),
@@ -1205,8 +1262,17 @@ def test_same_nk_prefix_near_int32_limit(counts: tuple[int, ...], dtype):
         pytest.param((1, 129, 0), 64, id="tile-fallback"),
     ],
 )
-def test_same_nk_device_prefix_matches_grouped_matmul(counts: tuple[int, ...] | str, block_m: int, dtype, monkeypatch):
-    """Cover tile tails, zero-load experts and shape fallbacks without a host read."""
+def test_same_nk_device_prefix_matches_grouped_matmul(
+    counts: tuple[int, ...] | str,
+    block_m: int,
+    dtype,
+    hidden,
+    output_dim,
+    transpose_b,
+    value_dtype,
+    monkeypatch,
+):
+    """Cover row/column tails, weight layouts and shape fallbacks without a host read."""
     require_nvidia_cuda("triton")
     from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
 
@@ -1218,16 +1284,17 @@ def test_same_nk_device_prefix_matches_grouped_matmul(counts: tuple[int, ...] | 
     monkeypatch.setitem(gemm_module._GROUP_GEMM_BLOCK, "BLOCK_M", block_m)
     torch.manual_seed(42)
     device = torch.device("cuda")
-    total, experts, hidden, output_dim = sum(counts), len(counts), 31, 145
+    total, experts = sum(counts), len(counts)
     cumsum = torch.tensor(counts, device=device, dtype=dtype).cumsum(0, dtype=dtype)
-    a = torch.randn(total, hidden, device=device, dtype=torch.bfloat16)
-    weights = torch.randn(experts, output_dim, hidden, device=device, dtype=torch.bfloat16)
+    a = torch.randn(total, hidden, device=device, dtype=value_dtype)
+    weight_shape = (experts, output_dim, hidden) if transpose_b else (experts, hidden, output_dim)
+    weights = torch.randn(weight_shape, device=device, dtype=value_dtype)
 
     def run():
         """Build a device prefix and consume it in the native grouped GEMM."""
         prefix = gemm_module.merged_same_nk_tile_prefix(cumsum, total)
         output = gemm_module.group_gemm_same_nk(
-            a, weights, cumsum, max_M=max(counts), transpose_b=True, tile_cumsum=prefix, tile_total_M=sum(counts)
+            a, weights, cumsum, max_M=max(counts), transpose_b=transpose_b, tile_cumsum=prefix, tile_total_M=total
         )
         return prefix, output
 
@@ -1239,13 +1306,14 @@ def test_same_nk_device_prefix_matches_grouped_matmul(counts: tuple[int, ...] | 
     finally:
         torch.cuda.set_sync_debug_mode(previous_mode)
 
-    classic = gemm_module.group_gemm_same_nk(a, weights, cumsum, max_M=max(counts), transpose_b=True)
+    classic = gemm_module.group_gemm_same_nk(a, weights, cumsum, max_M=max(counts), transpose_b=transpose_b)
     torch.testing.assert_close(output, classic, rtol=0, atol=0)
     expected_outputs, expected_prefix = [], []
     start, tile_count = 0, 0
     for expert, count in enumerate(counts):
         # Accumulate independently in high precision before the output cast.
-        reference = a[start : start + count].double() @ weights[expert].double().T
+        weight = weights[expert].double()
+        reference = a[start : start + count].double() @ (weight.T if transpose_b else weight)
         expected_outputs.append(reference.to(a.dtype))
         start += count
         tile_count += (count + 127) // 128
@@ -1256,6 +1324,40 @@ def test_same_nk_device_prefix_matches_grouped_matmul(counts: tuple[int, ...] | 
         assert prefix.cpu().tolist() == expected_prefix
     else:
         assert prefix is None
+
+
+@pytest.mark.parametrize("mode", ["accumulate", "silu_saved"])
+def test_same_nk_compact_epilogue_matches_shape_schedule(mode):
+    """N-fast tiles must preserve accumulated outputs and saved preactivations."""
+    require_nvidia_cuda("triton")
+    from veomni.ops.kernels.moe_experts.shared import group_gemm as gemm_module
+
+    torch.manual_seed(42)
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    counts = (129, 0, 1, 257)
+    total, hidden, output_dim = sum(counts), 33, 385
+    a = torch.randn(total, hidden, device=device, dtype=dtype)
+    weights = torch.randn(len(counts), hidden, output_dim, device=device, dtype=dtype)
+    cumsum = torch.tensor(counts, device=device, dtype=torch.int64).cumsum(0)
+    prefix = gemm_module.merged_same_nk_tile_prefix(cumsum, total)
+    assert prefix is not None
+    # The existing tl.dot accumulator requires FP32 even with BF16 operands.
+    initial = torch.randn(total, output_dim, device=device, dtype=torch.float32)
+
+    def run(tile_prefix):
+        return gemm_module.group_gemm_same_nk(
+            a,
+            weights,
+            cumsum,
+            max_M=max(counts),
+            c=initial.clone() if mode == "accumulate" else None,
+            activation=gemm_module.ActivationType.SILU if mode == "silu_saved" else None,
+            save_activation=mode == "silu_saved",
+            tile_cumsum=tile_prefix,
+            tile_total_M=total if tile_prefix is not None else None,
+        )
+
+    torch.testing.assert_close(run(prefix), run(None), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("reason", ["capture_unavailable", "unsupported_experts"])
@@ -1360,3 +1462,41 @@ def test_triton_merged_stream_capture_uses_shape_bound(monkeypatch: pytest.Monke
     for tensor in (x, w1, w2):
         assert tensor.grad is not None
         assert torch.isfinite(tensor.grad).all()
+
+
+def test_reject_quantizing_act_fn_refuses_only_quantizing_rows():
+    """A non-SwiGLU activation cannot use a fused expert row, so QAT must be refused.
+
+    The fused kernels call ``aten.silu`` / ``aten.silu_backward`` directly, so the
+    Python ``act_fn`` loop is the only path for another activation -- and that loop
+    cannot reach the family row. Support is tracked in #1430.
+
+    The activation is read from ``use_swiglu`` because these experts modules are
+    plain ``nn.Module`` objects with no config reference.
+    """
+    from types import SimpleNamespace
+
+    from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
+
+    def experts(impl, swiglu):
+        return SimpleNamespace(veomni_moe=SimpleNamespace(impl=impl), use_swiglu=swiglu)
+
+    # SwiGLU is what every fused row implements.
+    reject_quantizing_act_fn(experts("qat", swiglu=True))
+
+    with pytest.raises(ValueError, match="moe_implementation='qat' cannot run with a non-SwiGLU activation"):
+        reject_quantizing_act_fn(experts("qat", swiglu=False))
+
+    # ``deepgemm_fp8`` quantizes too -- its ``GroupedLinear`` runs the FP8 GEMM in
+    # forward, dgrad and wgrad -- so it must refuse for the same reason. It used to
+    # be absent from ``QUANTIZING_IMPLS``, which let a non-SwiGLU activation reach the
+    # plain-``F.linear`` fallback and train the routed experts at full precision
+    # while the config said ``deepgemm_fp8``.
+    reject_quantizing_act_fn(experts("deepgemm_fp8", swiglu=True))
+    with pytest.raises(ValueError, match="moe_implementation='deepgemm_fp8' cannot run"):
+        reject_quantizing_act_fn(experts("deepgemm_fp8", swiglu=False))
+
+    # The remaining rows do bf16 math and ignore ``expert_dtype``, so the fallback
+    # changes nothing for them: a reference row may take it deliberately.
+    for impl in ("eager", "fused_triton", "fused_quack", "fused_npu", "fused_mlu"):
+        reject_quantizing_act_fn(experts(impl, swiglu=False))

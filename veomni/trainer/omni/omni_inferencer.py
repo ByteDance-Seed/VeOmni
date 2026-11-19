@@ -145,7 +145,7 @@ class OmniInferencer:
             self.model = OmniModel.from_pretrained(
                 self.checkpoint_root,
                 config=config,
-                torch_dtype=torch.bfloat16,
+                torch_dtype="auto",
                 device_map="auto",
             ).eval()
             logger.info_rank0(

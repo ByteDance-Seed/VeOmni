@@ -39,6 +39,7 @@ checkpoint then works without an offline convert:
 from __future__ import annotations
 
 import atexit
+import gc
 import json
 import os
 import shutil
@@ -47,6 +48,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
+from inspect import Parameter, signature
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
@@ -85,6 +87,8 @@ _SAFE_WEIGHTS_NAME = "model.safetensors"
 # Per-rank files ``HuggingFaceStorageWriter`` stages before consolidating into the save root.
 _DCP_STAGING_DIRNAME = "sharded"
 _SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
+_PICKLE_WEIGHTS_NAME = "pytorch_model.bin"
+_PICKLE_WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
 _WEIGHT_FILE_SUFFIXES = (
     ".safetensors",
     ".bin",
@@ -100,6 +104,112 @@ _WEIGHT_FILE_SUFFIXES = (
 _WEIGHT_INDEX_SUFFIXES = (".safetensors.index.json", ".bin.index.json", ".h5.index.json", ".msgpack.index.json")
 
 
+def _accepts_source_path(build_config: Callable[..., Any]) -> bool:
+    """Whether a family's ``build_config`` takes the checkpoint directory.
+
+    A family declares ``build_config(hf_config, source_path)`` when its module
+    configs depend on what the checkpoint stores — Janus resolves its tie flags
+    against the weight files. Everything else keeps the one-argument form.
+    """
+    try:
+        params = list(signature(build_config).parameters.values())
+    except (TypeError, ValueError):  # builtins / C callables: assume the plain form
+        return False
+    positional = [p for p in params if p.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)]
+    return len(positional) >= 2 or any(p.kind is Parameter.VAR_POSITIONAL for p in params)
+
+
+def read_source_weight_files(source_path: str) -> dict[str, str]:
+    """``{weight key: shard filename}`` of an HF checkpoint, either serialization.
+
+    Covers ``model.safetensors[.index.json]`` and the legacy
+    ``pytorch_model.bin[.index.json]``, because both are things
+    ``from_pretrained`` accepts — a family layout resolving a decision against
+    the stored tensors (Janus' tie flags) must not silently fall back to the
+    config just because the checkpoint uses the other format.
+
+    Raises ``FileNotFoundError`` when the directory holds no recognised weights.
+    """
+    index_path = os.path.join(source_path, _SAFE_WEIGHTS_INDEX_NAME)
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            return dict(json.load(f)["weight_map"])
+    single = os.path.join(source_path, _SAFE_WEIGHTS_NAME)
+    if os.path.isfile(single):
+        from safetensors import safe_open
+
+        with safe_open(single, framework="pt", device="cpu") as f:
+            return dict.fromkeys(f.keys(), _SAFE_WEIGHTS_NAME)
+
+    pickle_index = os.path.join(source_path, _PICKLE_WEIGHTS_INDEX_NAME)
+    if os.path.isfile(pickle_index):
+        with open(pickle_index, encoding="utf-8") as f:
+            return dict(json.load(f)["weight_map"])
+    pickle_single = os.path.join(source_path, _PICKLE_WEIGHTS_NAME)
+    if os.path.isfile(pickle_single):
+        return dict.fromkeys(_pickle_state_dict_keys(pickle_single), _PICKLE_WEIGHTS_NAME)
+
+    raise FileNotFoundError(
+        f"{source_path} has none of {_SAFE_WEIGHTS_INDEX_NAME} / {_SAFE_WEIGHTS_NAME} / "
+        f"{_PICKLE_WEIGHTS_INDEX_NAME} / {_PICKLE_WEIGHTS_NAME}."
+    )
+
+
+def _pickle_state_dict_keys(path: str) -> list[str]:
+    """Top-level keys of a ``pytorch_model.bin`` state dict, without materialising it.
+
+    ``torch.load`` is the only reader that matches what the loader itself will
+    do, and the weights are read once here rather than twice: a 1.3B checkpoint
+    is a couple of GiB, so mapping it and dropping it is cheaper than keeping a
+    second copy alive next to the load.
+    """
+    state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    try:
+        return list(state.keys())
+    finally:
+        del state
+        gc.collect()
+
+
+def read_source_tensors(
+    source_path: str, weight_files: Mapping[str, str], keys: tuple[str, ...] | list[str]
+) -> dict[str, torch.Tensor]:
+    """Read ``keys`` out of an HF checkpoint, safetensors or pickle.
+
+    ``weight_files`` is :func:`read_source_weight_files`' mapping, so the shard
+    each key lives in is already known and each file is opened once per format.
+    The pickle path loads whole shards (there is no random access), then keeps
+    only the requested keys.
+    """
+    wanted = set(keys)
+    tensors: dict[str, torch.Tensor] = {}
+
+    safe_files = {name for key, name in weight_files.items() if key in wanted and name.endswith(".safetensors")}
+    if safe_files:
+        from safetensors import safe_open
+
+        for filename in sorted(safe_files):
+            with safe_open(os.path.join(source_path, filename), framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if key in wanted:
+                        tensors[key] = f.get_tensor(key)
+
+    pickle_files = {name for key, name in weight_files.items() if key in wanted and name.endswith(".bin")}
+    for filename in sorted(pickle_files):
+        state = torch.load(os.path.join(source_path, filename), map_location="cpu", weights_only=True, mmap=True)
+        try:
+            for key in state.keys() & wanted:
+                tensors[key] = state[key]
+        finally:
+            del state
+            gc.collect()
+
+    missing = wanted - tensors.keys()
+    if missing:
+        raise ValueError(f"{source_path} does not store {sorted(missing)}.")
+    return tensors
+
+
 @dataclass(frozen=True)
 class OmniHFModuleLayout:
     """How one module is cut out of the upstream checkpoint.
@@ -111,15 +221,28 @@ class OmniHFModuleLayout:
     ``"model.embed_tokens."``.
 
     ``build_config`` turns the upstream HF config into this module's
-    :class:`OmniModuleConfig`. ``build_assets`` (optional) loads the module's
-    HF assets from the checkpoint directory, keyed like
+    :class:`OmniModuleConfig`. It receives the checkpoint directory as a second
+    argument when it declares one, so a family whose config depends on what the
+    checkpoint actually stores (Janus' tie flags, which upstream resolves
+    against the weight files) can say so. ``build_assets`` (optional) loads the
+    module's HF assets from the checkpoint directory, keyed like
     :func:`~veomni.models.seed_omni.utils.convert_registry.attach_module_assets`
     (``tokenizer`` / ``processor`` / ``image_processor`` / ``video_processor``).
     """
 
     key_prefixes: tuple[tuple[str, str], ...]
-    build_config: Callable[[PretrainedConfig], OmniModuleConfig]
+    build_config: Callable[..., OmniModuleConfig]
     build_assets: Callable[[str], dict[str, Any]] | None = None
+
+    def config_for(self, hf_config: PretrainedConfig, source_path: str | None = None) -> OmniModuleConfig:
+        """Call ``build_config`` with ``source_path`` only when it asks for it.
+
+        Most families map the upstream config field by field and never look at
+        the checkpoint; those keep the one-argument signature.
+        """
+        if _accepts_source_path(self.build_config):
+            return self.build_config(hf_config, source_path)
+        return self.build_config(hf_config)
 
 
 @dataclass(frozen=True)
@@ -143,6 +266,7 @@ class OmniHFLayout:
     training_graphs: GraphFiles | None = None
     generation_graphs: GraphFiles | None = None
     infer_type: str | None = None
+    generation_kwargs: Mapping[str, Any] | None = None
     load_hf_config: Callable[[str], PretrainedConfig] | None = field(default=None, compare=False)
 
     @cached_property
@@ -187,7 +311,7 @@ class OmniHFLayout:
 
     def build_module_configs(self, source_path: str) -> dict[str, OmniModuleConfig]:
         hf_config = self.read_hf_config(source_path)
-        return {name: module.build_config(hf_config) for name, module in self.modules.items()}
+        return {name: module.config_for(hf_config, source_path) for name, module in self.modules.items()}
 
     def build_module_assets(self, source_path: str) -> dict[str, dict[str, Any]]:
         return {
@@ -220,6 +344,51 @@ class OmniHFLayout:
             logger.warning_rank0(f"OmniHFLayout: no default graphs ({e}); the launcher must supply them.")
             return {}, {}
 
+    def source_weight_files(self, source_path: str) -> dict[str, str]:
+        """``{weight key: shard filename}`` of a safetensors HF checkpoint."""
+        return read_source_weight_files(source_path)
+
+    def resolve_weights_path(self, source_path: str) -> str:
+        """Directory :func:`load_model_weights` reads safetensors from for ``source_path``."""
+        return source_path
+
+    def extract_module_save_state(
+        self,
+        module_name: str,
+        model: torch.nn.Module,
+        parallel_state: Any = None,
+    ) -> Mapping[str, torch.Tensor]:
+        """``{module_key: tensor}`` to export for live ``model`` of ``module_name``."""
+        from ....checkpoint.dcp_checkpointer import ModelState
+
+        del module_name
+        return ModelState(model, parallel_state=parallel_state).state_dict()
+
+    def build_fqn_to_index_mapping(self, weight_files: Mapping[str, str]) -> dict[str, int]:
+        """Map each source key in ``weight_files`` to its 1-based ``HuggingFaceStorageWriter`` shard index."""
+        single_file = set(weight_files.values()) == {_SAFE_WEIGHTS_NAME}
+        return {
+            key: 1 if single_file else shard_index_from_filename(filename) for key, filename in weight_files.items()
+        }
+
+    def finalize_exported_shards(
+        self,
+        source_path: str,
+        save_path: str,
+        weight_files: Mapping[str, str],
+    ) -> None:
+        """Finalize consolidated safetensors shard filenames in ``save_path`` on rank 0."""
+        del source_path
+        if set(weight_files.values()) != {_SAFE_WEIGHTS_NAME}:
+            return
+        shards = [name for name in os.listdir(save_path) if name.endswith(".safetensors")]
+        if len(shards) != 1:
+            raise RuntimeError(f"Expected one safetensors file in {save_path}, found {shards}.")
+        os.replace(os.path.join(save_path, shards[0]), os.path.join(save_path, _SAFE_WEIGHTS_NAME))
+        index = os.path.join(save_path, _SAFE_WEIGHTS_INDEX_NAME)
+        if os.path.isfile(index):
+            os.remove(index)
+
 
 @dataclass(frozen=True)
 class HFSource:
@@ -231,6 +400,10 @@ class HFSource:
     @property
     def layout(self) -> OmniHFLayout:
         return get_hf_layout(self.model_type)
+
+    @property
+    def weights_path(self) -> str:
+        return self.layout.resolve_weights_path(self.path)
 
 
 def get_hf_layout(model_type: str) -> OmniHFLayout:
@@ -313,6 +486,7 @@ def _write_hf_view(source: HFSource) -> str:
         training_graphs=training_graphs,
         generation_graphs=generation_graphs,
         infer_type=layout.infer_type,
+        generation_kwargs=dict(layout.generation_kwargs) if layout.generation_kwargs is not None else None,
     )
     config._module_configs = dict(module_configs)
     config.save_pretrained(view)
@@ -517,12 +691,12 @@ def load_module_from_hf_source(
             f"Loading '{module_name}' from a HuggingFace checkpoint cannot offload to disk: {device_map}."
         )
     if len(devices) == 1:
-        load_model_weights(model, source.path, init_device=devices.pop())
+        load_model_weights(model, source.weights_path, init_device=devices.pop())
         return model
 
     from accelerate import dispatch_model
 
-    load_model_weights(model, source.path, init_device="cpu")
+    load_model_weights(model, source.weights_path, init_device="cpu")
     dispatch_model(
         model,
         device_map=device_map,
@@ -553,14 +727,15 @@ def convert_with_hf_layout(
     source = HFSource(path=os.path.realpath(model_path), model_type=model_type)
     layout = source.layout
     hf_config = layout.read_hf_config(source.path)
-    dtype = getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", None)
-    if isinstance(dtype, str):
-        dtype = getattr(torch, dtype)
-    module_configs = {name: module.build_config(hf_config) for name, module in layout.modules.items()}
+    default_dtype = getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", None)
+    module_configs = {name: module.config_for(hf_config, source.path) for name, module in layout.modules.items()}
     assets = layout.build_module_assets(source.path)
     modules = {}
     for name, module_config in module_configs.items():
         logger.info_rank0(f"convert: loading module '{name}' from {source.path}")
+        module_dtype = getattr(module_config, "dtype", None) or default_dtype
+        if isinstance(module_dtype, str):
+            module_dtype = getattr(torch, module_dtype)
         module_cls = OMNI_MODEL_REGISTRY[module_config.model_type]()
         module = load_module_from_hf_source(
             module_cls,
@@ -568,7 +743,7 @@ def convert_with_hf_layout(
             source,
             name,
             device_map="cpu",
-            torch_dtype=dtype,
+            torch_dtype=module_dtype,
             attn_implementation=attn_implementation,
         )
         modules[name] = attach_module_assets(module, **assets[name])
@@ -580,22 +755,8 @@ def convert_with_hf_layout(
         "training_graphs": training_graphs,
         "generation_graphs": generation_graphs,
         "infer_type": layout.infer_type if layout.infer_type in generation_graphs else None,
+        "generation_kwargs": dict(layout.generation_kwargs) if layout.generation_kwargs is not None else None,
     }
-
-
-def source_weight_files(source_path: str) -> dict[str, str]:
-    """``{weight key: shard filename}`` of a safetensors HF checkpoint."""
-    index_path = os.path.join(source_path, _SAFE_WEIGHTS_INDEX_NAME)
-    if os.path.isfile(index_path):
-        with open(index_path, encoding="utf-8") as f:
-            return dict(json.load(f)["weight_map"])
-    single = os.path.join(source_path, _SAFE_WEIGHTS_NAME)
-    if os.path.isfile(single):
-        from safetensors import safe_open
-
-        with safe_open(single, framework="pt", device="cpu") as f:
-            return dict.fromkeys(f.keys(), _SAFE_WEIGHTS_NAME)
-    raise FileNotFoundError(f"{source_path} has neither {_SAFE_WEIGHTS_INDEX_NAME} nor {_SAFE_WEIGHTS_NAME}.")
 
 
 def source_tensor_specs(source_path: str, weight_files: Mapping[str, str]) -> dict[str, tuple[torch.dtype, tuple]]:
@@ -702,17 +863,16 @@ def save_hf_source_checkpoint(
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
-    from ....checkpoint.dcp_checkpointer import ModelState
     from ....checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
 
     apply_dcp_consolidation_patch()
     layout = source.layout
-    weight_files = source_weight_files(source.path)
+    weight_files = layout.source_weight_files(source.path)
     source_specs = source_tensor_specs(source.path, weight_files)
 
     save_state: dict[str, torch.Tensor] = {}
     for name, (model, parallel_state) in modules.items():
-        module_state = ModelState(model, parallel_state=parallel_state).state_dict()
+        module_state = layout.extract_module_save_state(name, model, parallel_state)
         tied = _tied_parameter_names(model)
         unmapped, reshaped = [], []
         for key, tensor in module_state.items():
@@ -750,10 +910,7 @@ def save_hf_source_checkpoint(
         if rank0:
             save_state.update(_read_source_tensors(source.path, weight_files, carried))
 
-    single_file = set(weight_files.values()) == {_SAFE_WEIGHTS_NAME}
-    fqn_to_index_mapping = {
-        key: 1 if single_file else shard_index_from_filename(filename) for key, filename in weight_files.items()
-    }
+    fqn_to_index_mapping = layout.build_fqn_to_index_mapping(weight_files)
     storage_writer = HuggingFaceStorageWriter(
         path=save_path,
         save_distributed=True,
@@ -771,8 +928,7 @@ def save_hf_source_checkpoint(
 
     if not dist.is_initialized() or dist.get_rank() == 0:
         shutil.rmtree(os.path.join(save_path, _DCP_STAGING_DIRNAME), ignore_errors=True)
-        if single_file:
-            _restore_single_file_name(save_path)
+        layout.finalize_exported_shards(source.path, save_path, weight_files)
         copy_source_non_weight_files(source.path, save_path)
     if dist.is_initialized():
         dist.barrier()
@@ -781,17 +937,6 @@ def save_hf_source_checkpoint(
         f"save_hf_source_checkpoint: `{source.model_type}` checkpoint saved at {save_path} "
         f"in {time.time() - start:.2f}s."
     )
-
-
-def _restore_single_file_name(save_path: str) -> None:
-    """Rename the writer's lone ``model-00001-of-00001.safetensors`` back to ``model.safetensors``."""
-    shards = [name for name in os.listdir(save_path) if name.endswith(".safetensors")]
-    if len(shards) != 1:
-        raise RuntimeError(f"Expected one safetensors file in {save_path}, found {shards}.")
-    os.replace(os.path.join(save_path, shards[0]), os.path.join(save_path, _SAFE_WEIGHTS_NAME))
-    index = os.path.join(save_path, _SAFE_WEIGHTS_INDEX_NAME)
-    if os.path.isfile(index):
-        os.remove(index)
 
 
 __all__ = [
@@ -811,5 +956,4 @@ __all__ = [
     "resolve_omni_checkpoint_root",
     "save_hf_source_checkpoint",
     "source_tensor_specs",
-    "source_weight_files",
 ]

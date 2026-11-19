@@ -156,7 +156,7 @@ def test_fp8_all_gather_rejects_non_swiglu_before_collectives():
 
     module = nn.Module()
     module.veomni_moe = SimpleNamespace(impl="deepgemm_fp8")
-    module.use_swiglu_mlp = False
+    module.use_swiglu = False
     with pytest.raises(ValueError, match="SwiGLU"):
         register_deepgemm_fp8_all_gather(module)
 

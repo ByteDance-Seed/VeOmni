@@ -115,7 +115,6 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
 )  # noqa: F401
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 # Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
 # packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
 # once in ``Qwen3_5TextModel.forward``.
@@ -192,12 +191,12 @@ config.override_method(
 config.override_method(
     "Qwen3_5MLP.__init__",
     replacement=qwen3_5_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 config.override_method(
     "Qwen3_5MLP.forward",
     replacement=qwen3_5_mlp_forward_patched,
-    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the gated_mlp row, which picks fused weights or the projection modules",
 )
 config.override_method(
     "Qwen3_5DecoderLayer.__init__",
@@ -380,6 +379,8 @@ def qwen3_5_gated_deltanet_forward_patched(
     else:
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
+    # NPU always expands: Qwen3.5 keeps the expanded layout even for
+    # grouped-capable rows; Qwen4-Exp opts in via GROUPED_VALUE_HEAD_IMPLS.
     if self.num_v_heads // self.num_k_heads > 1:
         query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)

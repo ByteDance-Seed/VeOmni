@@ -39,6 +39,7 @@ _GPU_SM80 = ("gpu", (("nvidia", 80, None), ("rocm", None, None)))
 _GPU_NVIDIA = ("gpu", (("nvidia", None, None),))
 _GPU_NVIDIA_SM70 = ("gpu", (("nvidia", 70, None),))
 _GPU_NVIDIA_SM80 = ("gpu", (("nvidia", 80, None),))
+_GPU_NVIDIA_SM89_ROCM = ("gpu", (("nvidia", 89, None), ("rocm", None, None)))
 _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
 _GPU_NVIDIA_SM90_OR_SM100 = ("gpu", (("nvidia", 90, 90), ("nvidia", 100, 100)))
 _GPU_NVIDIA_SM100 = ("gpu", (("nvidia", 100, None),))
@@ -162,6 +163,7 @@ _BUILTIN_ENTRIES = (
     ("moe_experts", "standard", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts", "standard", "fused_triton", "mlu", _MLU, ("triton",)),
     ("moe_experts", "standard", "fused_quack", "cuda", _GPU_NVIDIA_SM90, ("quack",)),
+    ("moe_experts", "standard", "qat", "cuda", _GPU_NVIDIA_SM90, ("tilelang", "triton")),
     ("moe_experts", "standard", "deepgemm_fp8", "cuda", _GPU_NVIDIA_SM90_OR_SM100, ("deep_gemm", "triton")),
     ("moe_experts", "standard", "fused_npu", "npu", _NPU, ()),
     ("moe_experts", "standard", "fused_mlu", "mlu", _MLU, ("apex",)),
@@ -173,8 +175,19 @@ _BUILTIN_ENTRIES = (
     ("moe_experts_lora", "independent", "eager", "any", _ANY, ()),
     ("moe_experts_lora", "independent", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts_lora", "independent", "fused_npu", "npu", _NPU, ()),
+    ("kv_round", "standard", "none", "any", _ANY, ()),
+    ("kv_round", "standard", "eager", "any", _ANY, ()),
+    ("kv_round", "standard", "triton", "cuda", _GPU_NVIDIA_SM89_ROCM, ("triton",)),
+    ("kv_round", "deepseek_v4", "none", "any", _ANY, ()),
+    ("kv_round", "deepseek_v4", "eager", "any", _ANY, ()),
+    ("kv_round", "deepseek_v4", "triton", "cuda", _GPU_NVIDIA_SM89_ROCM, ("triton",)),
     ("layer_norm", "standard", "eager", "any", _ANY, ()),
     ("layer_norm", "standard", "apex", "cuda", _GPU, ("fused_layer_norm_cuda",)),
+    ("linear", "standard", "eager", "any", _ANY, ()),
+    ("linear", "standard", "qat", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("linear", "standard", "torchao_nvfp4", "any", _ANY, ("torchao",)),
+    ("linear", "grouped", "eager", "any", _ANY, ()),
+    ("linear", "grouped", "qat", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
     ("rms_norm", "standard", "eager", "any", _ANY, ()),
     ("rms_norm", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("rms_norm", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
@@ -206,12 +219,14 @@ _BUILTIN_ENTRIES = (
     ("rope", "wan", "eager", "any", _ANY, ()),
     ("rope", "wan", "triton", "cuda", _GPU, ("triton",)),
     ("rope", "wan", "torch_npu", "npu", _NPU, ()),
-    ("swiglu_mlp", "standard", "eager", "any", _ANY, ()),
-    ("swiglu_mlp", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
-    ("swiglu_mlp", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
-    ("swiglu_mlp", "geglu", "eager", "any", _ANY, ()),
-    ("swiglu_mlp", "geglu", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
-    ("swiglu_mlp", "geglu", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
+    ("gated_mlp", "standard", "eager", "any", _ANY, ()),
+    ("gated_mlp", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("gated_mlp", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
+    ("gated_mlp", "standard", "qat", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("gated_mlp", "standard", "torchao_nvfp4", "any", _ANY, ("torchao",)),
+    ("gated_mlp", "geglu", "eager", "any", _ANY, ()),
+    ("gated_mlp", "geglu", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
+    ("gated_mlp", "geglu", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
 )
 
 
@@ -284,10 +299,12 @@ _BUILTIN_DEFAULT_ENTRIES = {
     ("rope", "partial", "liger_kernel", "cuda"),
     ("rope", "partial", "liger_kernel", "mlu"),
     ("rope", "partial", "torch_npu", "npu"),
-    ("swiglu_mlp", "standard", "liger_kernel", "cuda"),
-    ("swiglu_mlp", "standard", "liger_kernel", "mlu"),
-    ("swiglu_mlp", "geglu", "liger_kernel", "cuda"),
-    ("swiglu_mlp", "geglu", "liger_kernel", "mlu"),
+    ("gated_mlp", "standard", "liger_kernel", "cuda"),
+    ("gated_mlp", "standard", "liger_kernel", "mlu"),
+    ("gated_mlp", "geglu", "liger_kernel", "cuda"),
+    ("gated_mlp", "geglu", "liger_kernel", "mlu"),
+    ("kv_round", "standard", "triton", "cuda"),
+    ("kv_round", "deepseek_v4", "triton", "cuda"),
 }
 
 
