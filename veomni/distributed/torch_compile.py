@@ -25,6 +25,39 @@ from ..utils import device, logging
 logger = logging.get_logger(__name__)
 
 
+#: Which callers this module serves, and the signal each is recognised by.
+#:
+#: ``validate_compile_model`` gates four kinds of model, and the branch each one
+#: takes is decided from the model's *topology*, not from a single flag — the
+#: signals differ because the models differ:
+#:
+#: =========================  ==========================================  ====================================
+#: caller                     recognised by                               what it gets
+#: =========================  ==========================================  ====================================
+#: base trainer, text model   ``_is_multimodal_model`` is ``False``       the generic ``*DecoderLayer`` path
+#: base trainer, multimodal   ``_is_multimodal_model`` is ``True``        fail-closed: dense Qwen3-VL only
+#: SeedOmni module            ``_is_omni_module`` (``isinstance``)        composed guards (no CUDA graph, no SP)
+#: SeedOmni composed          ``_is_composed_model`` (``_module_configs``)  composed guards
+#: =========================  ==========================================  ====================================
+#:
+#: Why the multimodal branch is narrower than the SeedOmni ones: a single HF
+#: multimodal model holds its towers **and** the cross-modal injection between
+#: them in one ``forward``, so its block boundaries and lifecycle are not the
+#: plain decoder-block contract. Only dense Qwen3-VL has been validated, and
+#: ``_SUPPORTED_MULTIMODAL_DECODER_BLOCKS`` names what that validation covered.
+#: A SeedOmni module holds one component and no injection point, so it gets the
+#: composed guards instead — even though its config carries a ``vision_config``
+#: and so looks multimodal to ``_is_multimodal_model``.
+#:
+#: A new caller normally adds a branch here. The alternative — moving the answer
+#: onto the model as a capability flag, the way
+#: :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile`
+#: already works for SeedOmni — would collapse this to one check plus the shared
+#: runtime constraints, and retire ``_SUPPORTED_MULTIMODAL_DECODER_BLOCKS`` (the
+#: table exists only to express "we validated this one"). That refactor has not
+#: been done because re-validating the existing Qwen3-VL support needs a real
+#: training run.
+
 _SUPPORTED_MULTIMODAL_DECODER_BLOCKS = {
     "qwen3_vl": "Qwen3VLTextDecoderLayer",
 }
@@ -141,9 +174,12 @@ def validate_compile_model(
 ) -> None:
     """Validate model-specific contracts for per-block compilation.
 
-    Text models keep the generic decoder-layer path. Multimodal models are
-    fail-closed because their towers and cross-modal injection points have
-    different shape and lifecycle contracts.
+    Four callers, four branches — see the module docstring for the table and for
+    why the single-model multimodal rule is narrower than the SeedOmni ones.
+    Text models keep the generic decoder-layer path. A single multimodal model is
+    fail-closed because its towers and cross-modal injection points have
+    different shape and lifecycle contracts. A SeedOmni module or composed
+    ``OmniModel`` is compiled block by block and gets the composed guards.
     """
 
     if _is_composed_model(model):
