@@ -171,7 +171,10 @@ same digest and settings are required on resume. A missing contract emits a
 startup warning; training and export can proceed, but dynamic SFT trainer-state
 resume is rejected because its cursor cannot be proven exact. This also applies
 to weighted multi-source SFT: set the attestations before training if its
-trainer-state checkpoint must be exactly resumable. To start a new
+trainer-state checkpoint must be exactly resumable. For weighted HF streaming,
+Omni trainer-state recovery also requires these fields: configure them before
+the first training run, or recovery is rejected. This source check alone does not
+establish exact recovery of the whole training trajectory. To start a new
 data stream, load the model weights as a new run instead of resuming its trainer
 state. Other trainer paths retain their own optimizer, checkpoint-provider and
 data-codec checks.
@@ -193,7 +196,8 @@ Saved source order, weights, seed, worker and DP geometry must match. Version-0
 multi-source cursors lack that provenance and are rejected for exact resume; use
 weights-only initialization or a separately verified producer-specific migration.
 
-Distributed replay requires at least one worker per rank, in-order delivery and
+Distributed replay requires at least one worker on each rank that owns a loader,
+in-order delivery and
 a working Gloo control group. `data.resume_replay_timeout_seconds` limits each
 worker response; rank coordination uses `(num_workers + 1)` times that value
 plus 30 seconds, so the total wait can be much longer than the per-worker timeout.
@@ -331,7 +335,7 @@ Neither marker can stand in for the other. The manifest is written while the
 async DCP saves may still be in flight, so it says nothing about the model; a
 `.metadata` covers one directory and knows nothing about the loader, the job
 cursor, or its sibling modules. Module markers are not interchangeable either —
-in `configs/seed_omni/Janus/janus_1.3b/train/modules_train.yaml`, `janus_siglip`
+in `configs/seed_omni/Janus/janus/train/modules_train.yaml`, `janus_siglip`
 runs DDP while `janus_llama` runs FSDP2, so each records a different topology.
 
 Resume discovery accepts a `global_step_{N}/` directory only when both halves

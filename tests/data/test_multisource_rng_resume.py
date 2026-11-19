@@ -489,3 +489,85 @@ def test_multisource_worker_cold_resume_next_optimizer_update(tmp_path):
         source_iterator = getattr(loader._dataloader, "_iterator", None)
         if source_iterator is not None and hasattr(source_iterator, "_shutdown_workers"):
             source_iterator._shutdown_workers()
+
+
+def _weighted_sp_owner_resume_worker(rank, rendezvous, scenario):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    import veomni.data.dataset as dataset_module
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    dataset_module.get_parallel_state = lambda: SimpleNamespace(dp_rank=0, dp_size=1)
+    original = restored = iterator = None
+    try:
+        cursor = {}
+        expected = None
+        if rank == 0:
+            original = DistributedDataloader(make_dataset(seed=5), batch_size=None, num_workers=1)
+            iterator = iter(original)
+            next(iterator)
+            cursor = copy.deepcopy(original.state_dict())
+            saved_rng = torch.get_rng_state().clone()
+            expected = next(iterator)
+            iterator._shutdown_workers()
+            iterator = None
+            restored = DistributedDataloader(make_dataset(seed=5), batch_size=None, num_workers=1)
+            if scenario == "missing_cursor":
+                cursor = {}
+            if scenario == "restore_error":
+
+                def fail_restore(_state):
+                    raise RuntimeError("injected worker restore failure")
+
+                restored.load_state_dict = fail_restore
+        else:
+            saved_rng = torch.get_rng_state().clone()
+        trainer = SimpleNamespace(
+            args=SimpleNamespace(
+                train=SimpleNamespace(global_rank=rank, checkpoint=SimpleNamespace(load_path="/unused")),
+                train_steps=40,
+            ),
+            state=SimpleNamespace(global_step=0, epoch=0),
+            train_dataloader=restored,
+            channel_loss_callback=None,
+            offline_cache_writer=None,
+            environ_meter=None,
+            _veomni_loader_sp_rank_zero_only=not (scenario == "wrong_owner" and rank == 1),
+        )
+        callback = GlobalStateCallback.__new__(GlobalStateCallback)
+        callback.trainer = trainer
+        callback.parallel_state = SimpleNamespace(sp_enabled=True, sp_rank=rank)
+        callback._read_current = lambda _: {"global_step": 1, "train_dataloader": cursor, "torch_rng_state": saved_rng}
+        if scenario == "success":
+            callback.load_global_state()
+            assert torch.equal(torch.get_rng_state(), saved_rng)
+            if rank == 0:
+                iterator = iter(restored)
+                assert next(iterator) == expected
+        else:
+            with pytest.raises((RuntimeError, ValueError)):
+                callback.load_global_state()
+        still_alive = torch.tensor(1)
+        dist.all_reduce(still_alive)
+        assert still_alive.item() == 2
+    finally:
+        if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+            iterator._shutdown_workers()
+        if restored is not None:
+            preloaded = getattr(restored, "_preloaded_resume_iterator", None)
+            if preloaded is not None and hasattr(preloaded, "_shutdown_workers"):
+                preloaded._shutdown_workers()
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("scenario", ["success", "missing_cursor", "wrong_owner", "restore_error"])
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_weighted_resume_with_sp_leader_only_loader(tmp_path, scenario):
+    import torch.multiprocessing as mp
+
+    mp.spawn(_weighted_sp_owner_resume_worker, args=(str(tmp_path / "rendezvous"), scenario), nprocs=2, join=True)

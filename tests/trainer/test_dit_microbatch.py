@@ -70,6 +70,23 @@ def _load(trainer, samples):
     return iter(trainer.base.train_dataloader)
 
 
+@pytest.mark.parametrize("dataloader_type", ["native", "custom"])
+def test_dit_forwards_replay_timeout_to_native_loader(monkeypatch, dataloader_type):
+    trainer = _trainer(monkeypatch, "online_training", 1)
+    trainer.base.args.data.dataloader.type = dataloader_type
+    trainer.base.args.data.resume_replay_timeout_seconds = 37
+    trainer.base.train_dataset = []
+    build = Mock(return_value=object())
+    monkeypatch.setattr(dit_module, "build_dataloader", build)
+    trainer._build_dataloader()
+    assert trainer.base._veomni_loader_sp_rank_zero_only is True
+    kwargs = build.call_args.kwargs
+    if dataloader_type == "native":
+        assert kwargs["resume_replay_timeout_seconds"] == 37
+    else:
+        assert "resume_replay_timeout_seconds" not in kwargs
+
+
 @pytest.mark.parametrize("task", ["offline_training", "online_training"])
 @pytest.mark.parametrize("micro_batch_size", [1, 2, 4])
 @pytest.mark.parametrize("dp_size", [1, 2])

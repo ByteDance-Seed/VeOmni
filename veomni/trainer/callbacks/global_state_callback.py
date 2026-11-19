@@ -552,21 +552,16 @@ class GlobalStateCallback(Callback):
         except BaseException as exc:
             error = exc
         raise_if_any_rank_failed(error, "checking restored optimizer providers")
+        # Optimizer ownership and the training task are replicated job configuration.
         has_legacy = bool(legacy_checkpoints)
         requires_manifest = strict_optimizer or bool(legacy_checkpoints or unknown_checkpoints)
         if dist.is_initialized():
             local_generations = tuple(sorted(generations.items()))
-            local_contract = (local_generations, requires_manifest, has_legacy, offline_resume)
-            restored_contracts = [None] * dist.get_world_size()
-            dist.all_gather_object(restored_contracts, local_contract)
-            if any(value[0] != local_generations for value in restored_contracts):
+            restored_generations = [None] * dist.get_world_size()
+            dist.all_gather_object(restored_generations, local_generations)
+            if any(value != local_generations for value in restored_generations):
                 raise RuntimeError("Restored optimizer checkpoint generations differ across ranks")
-            # Any optimizer owner requires all ranks to verify the source.
-            requires_manifest = any(value[1] for value in restored_contracts)
-            has_legacy = any(value[2] for value in restored_contracts)
-            if any(value[3] != offline_resume for value in restored_contracts):
-                raise RuntimeError("Offline checkpoint mode differs across ranks")
-        coordinated_resume = strict_resume or requires_manifest or offline_resume
+        coordinated_resume = strict_resume or requires_manifest
 
         manifest = None
         if requires_manifest or offline_resume:
@@ -1041,11 +1036,32 @@ class GlobalStateCallback(Callback):
             cursor_error = exc
         default_group = dist.group.WORLD if dist.is_initialized() else None
         raise_if_any_rank_failed(cursor_error, "validating the training data cursor", group=default_group)
+        # DiT loads data only on SP rank zero. All ranks must still create the
+        # same replay control group and participate in its failure reduction.
+        replay_group_timeout = replay_timeout * (replay_workers + 1) + 30 if weighted_replay else 0
+        if dist.is_initialized():
+            device = "cpu" if dist.get_backend(default_group) == "gloo" else get_device_type()
+            timeout_tensor = torch.tensor([replay_group_timeout], dtype=torch.int64, device=device)
+            dist.all_reduce(timeout_tensor, op=dist.ReduceOp.MAX, group=default_group)
+            replay_group_timeout = int(timeout_tensor.item())
+        global_weighted_replay = replay_group_timeout > 0
+        owner_error = None
+        if global_weighted_replay:
+            try:
+                sp_leader_only = getattr(self.trainer, "_veomni_loader_sp_rank_zero_only", False) is True
+                expected_owner = (
+                    not sp_leader_only or not self.parallel_state.sp_enabled or self.parallel_state.sp_rank == 0
+                )
+                if (loader is not None) != expected_owner or (expected_owner and not weighted_replay):
+                    raise ValueError("Weighted replay loader ownership differs from the trainer's SP topology")
+            except BaseException as exc:
+                owner_error = exc
+        raise_if_any_rank_failed(owner_error, "validating weighted replay loader ownership", group=default_group)
         _agree_restored_position(
             global_step,
             saved_epoch,
             default_group,
-            replay_contract={"weighted": weighted_replay},
+            replay_contract={"weighted": global_weighted_replay},
         )
 
         if dpo_recovery and dist.is_initialized():
@@ -1086,7 +1102,7 @@ class GlobalStateCallback(Callback):
             same_output_checkpoint = _agree_dpo_output_checkpoint(same_output_checkpoint, group=default_group)
 
         def restore_local(action, description, group=default_group):
-            if not (coordinated_resume or dpo_recovery or weighted_replay):
+            if not (coordinated_resume or dpo_recovery or global_weighted_replay):
                 action()
                 return
             error = None
@@ -1214,11 +1230,8 @@ class GlobalStateCallback(Callback):
 
         replay_group = None
         try:
-            if weighted_replay and dist.is_initialized():
-                # Each worker startup can wait up to the loader timeout. Leave
-                # time for every worker timeout plus rank error coordination.
-                group_timeout = replay_timeout * (replay_workers + 1) + 30
-                replay_group = dist.new_group(backend="gloo", timeout=timedelta(seconds=group_timeout))
+            if global_weighted_replay and dist.is_initialized():
+                replay_group = dist.new_group(backend="gloo", timeout=timedelta(seconds=replay_group_timeout))
             restore_local(
                 restore_loader,
                 "restoring the training data cursor",
@@ -1323,7 +1336,6 @@ class GlobalStateCallback(Callback):
                 legacy_checkpoints,
                 unknown_checkpoints,
                 legacy_cursor_proven,
-                has_legacy=has_legacy,
             )
 
         logger.info_rank0(
@@ -1341,11 +1353,9 @@ class GlobalStateCallback(Callback):
         legacy_checkpoints=(),
         unknown_checkpoints=(),
         legacy_cursor_proven=True,
-        has_legacy=None,
     ):
         """Reuse a proven checkpoint only at its original output location."""
-        if has_legacy is None:
-            has_legacy = bool(legacy_checkpoints)
+        has_legacy = bool(legacy_checkpoints)
         same_output, error = False, None
         try:
             save_root = getattr(self.trainer.args.train.checkpoint, "save_path", None)
