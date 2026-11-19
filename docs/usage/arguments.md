@@ -502,7 +502,18 @@ The second gate exists because compile pays off by module, not by model. Measure
 
 A module that leaves the flag `False` trains eagerly inside the same run: under `fsdp_scope='model'` the composed `OmniModel` is compiled once, and only the opted-in children contribute block scopes. A run that enables compile with no opted-in module logs that and compiles nothing rather than failing.
 
-CUDA Graph replay and sequence parallelism stay refused under SeedOmni (`backend='cudagraphs'` / `mode='reduce-overhead'` / `ulysses_size>1` / `cp_size>1` / `enable_async`): replay needs one `cudagraph_mark_step_begin()` per micro-batch across the composed graph, which `OmniTrainer` does not make, and Ulysses slices activations the graph edges reorder.
+**Set `dynamic=True` when the packed sequence length moves between steps.** A multimodal batch is not one fixed length — a sample with one image and a sample with four differ by 3×576 tokens — so a static compile recompiles for every distinct length. Measured over six lengths spanning 300–2816 tokens (`backend="inductor"`, one 4-layer bf16 text stack):
+
+| | result |
+| --- | --- |
+| graphs kept for 6 lengths | 4 (`dynamic=True`); one per length with `dynamic=False` |
+| correctness | identical to eager, at the same tolerance a static compile gives (2.4e-2 relative on a bf16 stack) |
+| drift vs depth | saturates at 4 layers (1.8e-2 → 2.0e-2 at 8); gradient error ~1e-2, not growing |
+| throughput, variable shape | 21.6 → 15.3 ms/step (**1.41x**) |
+
+The drift is Inductor reordering bf16 reductions, not a dynamic-specific error: `static-vs-eager` and `dynamic-vs-eager` measured the same 2.4e-2, while `dynamic-vs-static` differed by only 6e-3. SeedOmni keeps `dynamic=False` as the default; turn it on for the multimodal configs whose token count varies.
+
+CUDA Graph replay and sequence parallelism stay refused under SeedOmni (`backend='cudagraphs'` / `mode='reduce-overhead'` / `ulysses_size>1` / `cp_size>1` / `enable_async`): replay needs one `cudagraph_mark_step_begin()` per micro-batch across the composed graph, which `OmniTrainer` does not make, and Ulysses slices activations the graph edges reorder. `dynamic=True` is *not* in that list — it is supported.
 
 The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `model.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
 

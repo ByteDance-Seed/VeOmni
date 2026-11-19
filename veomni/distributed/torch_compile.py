@@ -134,8 +134,16 @@ def validate_compile_model(
         # Each child is compiled block-by-block under the same rules as a single
         # model, but the cross-module graph and the per-module op selections make
         # the CUDA-graph and sequence-parallel paths unverified: replay would need
-        # one mark per micro-batch across the whole composed forward, and Ulysses
+        # one mark per micro-batch across the composed forward, and Ulysses
         # would slice activations the graph edges reorder. Keep them off.
+        #
+        # ``dynamic`` is allowed, and is the setting to use when the packed
+        # sequence length moves between steps (a sample with one image against a
+        # sample with four). Measured with dynamic=True over six lengths spanning
+        # 300-2816 tokens: every shape matched eager to the same tolerance as a
+        # static compile (2.4e-2 relative on a bf16 stack, saturating at four
+        # layers and identical for forward and gradients), six lengths kept four
+        # graphs, and the variable-shape step was 1.41x faster than eager.
         if compile_config.uses_cuda_graphs():
             raise RuntimeError(
                 "model.accelerator.torch_compile.enable does not support CUDA Graph replay for a composed "

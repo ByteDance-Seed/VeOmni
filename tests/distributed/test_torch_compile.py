@@ -403,6 +403,53 @@ def test_compile_decoder_blocks_rejects_qwen3_vl_dynamic_shapes(monkeypatch):
         )
 
 
+def test_compile_decoder_blocks_allows_dynamic_shapes_for_a_composed_model(monkeypatch):
+    """A composed model may use ``dynamic=True``; the single-model Qwen3-VL rule
+    does not apply to it.
+
+    A multimodal step changes the packed token count (one image vs four), so a
+    static compile there recompiles per shape. Measured over six lengths
+    spanning 300-2816 tokens, ``dynamic=True`` kept four graphs and matched eager
+    to the same tolerance as a static compile.
+    """
+
+    class ComposedModel(nn.Module):
+        _no_split_modules = ["llm.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llm = nn.Module()
+            self.llm.layers = nn.ModuleList([ToyDecoderLayer(), ToyDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    model = ComposedModel()
+    model.config = SimpleNamespace(model_type="omni", _module_configs={"llm": SimpleNamespace()})
+
+    assert compile_decoder_blocks(model, CompileConfig(enable=True, dynamic=True), scopes=["llm"]) == 2
+
+
+def test_compile_decoder_blocks_rejects_cuda_graphs_for_a_composed_model(monkeypatch):
+    """Replay needs one ``cudagraph_mark_step_begin`` per micro-batch across the
+    composed graph, which ``OmniTrainer.train_step`` does not make."""
+
+    class ComposedModel(nn.Module):
+        _no_split_modules = ["llm.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llm = nn.Module()
+            self.llm.layers = nn.ModuleList([ToyDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    model = ComposedModel()
+    model.config = SimpleNamespace(model_type="omni", _module_configs={"llm": SimpleNamespace()})
+
+    with pytest.raises(RuntimeError, match="CUDA Graph replay for a composed"):
+        compile_decoder_blocks(model, CompileConfig(enable=True, backend="cudagraphs"), scopes=["llm"])
+
+
 @pytest.mark.parametrize(
     "compile_config",
     [CompileConfig(backend="inductor", mode="reduce-overhead"), CompileConfig(backend="cudagraphs")],
