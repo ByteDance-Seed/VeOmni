@@ -130,10 +130,8 @@ def read_source_weight_files(source_path: str) -> dict[str, str]:
 
     Raises ``FileNotFoundError`` when the directory holds no recognised weights.
     """
-    index_path = os.path.join(source_path, _SAFE_WEIGHTS_INDEX_NAME)
-    if os.path.isfile(index_path):
-        with open(index_path, encoding="utf-8") as f:
-            return dict(json.load(f)["weight_map"])
+    # Match the actual weight loader: a single file takes precedence over an
+    # index in the same format. Otherwise a stale index can change tie decisions.
     single = os.path.join(source_path, _SAFE_WEIGHTS_NAME)
     if os.path.isfile(single):
         from safetensors import safe_open
@@ -141,13 +139,19 @@ def read_source_weight_files(source_path: str) -> dict[str, str]:
         with safe_open(single, framework="pt", device="cpu") as f:
             return dict.fromkeys(f.keys(), _SAFE_WEIGHTS_NAME)
 
+    index_path = os.path.join(source_path, _SAFE_WEIGHTS_INDEX_NAME)
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            return dict(json.load(f)["weight_map"])
+
+    pickle_single = os.path.join(source_path, _PICKLE_WEIGHTS_NAME)
+    if os.path.isfile(pickle_single):
+        return dict.fromkeys(_pickle_state_dict_keys(pickle_single), _PICKLE_WEIGHTS_NAME)
+
     pickle_index = os.path.join(source_path, _PICKLE_WEIGHTS_INDEX_NAME)
     if os.path.isfile(pickle_index):
         with open(pickle_index, encoding="utf-8") as f:
             return dict(json.load(f)["weight_map"])
-    pickle_single = os.path.join(source_path, _PICKLE_WEIGHTS_NAME)
-    if os.path.isfile(pickle_single):
-        return dict.fromkeys(_pickle_state_dict_keys(pickle_single), _PICKLE_WEIGHTS_NAME)
 
     raise FileNotFoundError(
         f"{source_path} has none of {_SAFE_WEIGHTS_INDEX_NAME} / {_SAFE_WEIGHTS_NAME} / "
