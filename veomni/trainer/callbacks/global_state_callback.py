@@ -126,9 +126,6 @@ def _same_output_resume_owners(trainer, load_path, step):
     except BaseException as exc:
         error = exc
     raise_if_any_rank_failed(error, "checking restored checkpoint output path")
-    # The decision resolves local symlinks and mount visibility, so identical
-    # configured paths can still resolve differently on different nodes. Agree
-    # before some ranks return while others enter checkpoint I/O collectives.
     if dist.is_initialized():
         decisions = [None] * dist.get_world_size()
         dist.all_gather_object(decisions, same_output)

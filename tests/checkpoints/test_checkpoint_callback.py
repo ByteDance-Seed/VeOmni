@@ -171,84 +171,6 @@ class TestCheckpointCallbackDcpLastSavedStep:
 class TestCheckpointCallbackHfLastSavedStep:
     """Tests for CheckpointCallback HF _last_hf_step placement."""
 
-    @pytest.mark.parametrize("cadence", ["epoch_only", "step_and_epoch", "hf_only"])
-    @pytest.mark.parametrize("fail_once", [False, True])
-    def test_hf_step_and_epoch_dcp_share_the_same_write(self, mock_helper, cadence, fail_once):
-        trainer = _make_mock_trainer()
-        cb = CheckpointCallback(trainer)
-        cb.dcp_every_n_steps = 5 if cadence == "step_and_epoch" else 0
-        cb.dcp_every_n_epochs = 0 if cadence == "hf_only" else 1
-        cb.save_hf_weights = True
-        cb.hf_every_n_steps = 5
-        cb.hf_every_n_epochs = 0
-        events = []
-
-        def save_dcp(state):
-            events.append("dcp")
-
-        def save_hf(state, stage):
-            events.append("hf")
-            if fail_once and events.count("hf") == 1:
-                raise RuntimeError("conversion failed")
-
-        trainer.save_dcp.side_effect = save_dcp
-        trainer.save_hf_or_lora.side_effect = save_hf
-        state = TrainerState(global_step=5, epoch=0)
-        if fail_once:
-            with pytest.raises(RuntimeError, match="conversion failed"):
-                cb.on_step_end(state)
-        cb.on_step_end(state)
-        cb.on_epoch_end(state)
-        assert events.count("dcp") == (0 if cadence == "hf_only" else 1)
-        assert events.count("hf") == (2 if fail_once else 1)
-        if cadence != "hf_only":
-            assert events[0] == "dcp"
-
-    def test_failed_async_export_requires_restart(self, mock_helper):
-        trainer = _make_mock_trainer(save_async=True)
-        cb = CheckpointCallback(trainer)
-        cb.dcp_every_n_steps = 0
-        cb.dcp_every_n_epochs = 1
-        cb.save_hf_weights = True
-        cb.hf_every_n_steps = 5
-        state = TrainerState(global_step=5, epoch=0)
-        trainer.save_hf_or_lora.side_effect = [RuntimeError("async save failed"), None]
-
-        with pytest.raises(RuntimeError, match="async save failed"):
-            cb.on_step_end(state)
-        assert cb._last_dcp_step == -1
-        with pytest.raises(RuntimeError, match="restart from a complete checkpoint"):
-            cb.on_step_end(state)
-        assert trainer.save_dcp.call_count == 1
-        assert cb._last_dcp_step == -1
-
-    @pytest.mark.parametrize("wait_fails", [False, True])
-    def test_async_hf_step_waits_for_previous_dcp(self, mock_helper, wait_fails):
-        trainer = _make_mock_trainer(save_async=True)
-        cb = CheckpointCallback(trainer)
-        cb.dcp_every_n_steps = 0
-        cb.dcp_every_n_epochs = 1
-        cb.save_hf_weights = True
-        cb.hf_every_n_steps = 5
-        events = []
-
-        def wait():
-            events.append("wait")
-            if wait_fails:
-                raise RuntimeError("previous save failed")
-
-        trainer.wait_for_pending_save.side_effect = wait
-        trainer.save_dcp.side_effect = lambda state: events.append("dcp")
-        trainer.save_hf_or_lora.side_effect = lambda state, stage: events.append("hf")
-        state = TrainerState(global_step=5, epoch=0)
-        if wait_fails:
-            with pytest.raises(RuntimeError, match="previous save failed"):
-                cb.on_step_end(state)
-            assert events == ["wait"]
-        else:
-            cb.on_step_end(state)
-            assert events == ["wait", "dcp", "hf"]
-
     def test_last_saved_step_updated_after_successful_hf_save(self, mock_helper):
         trainer = _make_mock_trainer()
         cb = CheckpointCallback(trainer)
@@ -543,12 +465,11 @@ class TestModelCheckpointManagerSaveContract:
         manager = ModelCheckpointManager(runtime)
 
         with patch.object(manager, "save_dcp") as save_dcp:
-            with patch("veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp") as save_adapter:
+            with patch("veomni.utils.save_safetensor_utils.save_lora_adapter_with_dcp") as adapter:
                 manager.save_lora(TrainerState(global_step=10))
 
         save_dcp.assert_called_once()
-        assert save_adapter.call_args.kwargs["parallel_state"] is runtime.parallel_state
-        assert manager.last_saved_step == -1
+        assert adapter.call_args.kwargs["parallel_state"] is runtime.parallel_state and manager.last_saved_step == -1
 
 
 @patch("veomni.trainer.callbacks.global_state_callback.dist")
@@ -836,3 +757,86 @@ class TestGlobalStateCallbackJobState:
         cb = GlobalStateCallback(trainer)
         assert cb.load_global_state() is None
         assert trainer.state.global_step == 0
+
+
+@patch("veomni.trainer.callbacks.checkpoint_callback.helper")
+class TestCheckpointCallbackHfDcpCadence:
+    """Verify checkpoint cadence and async export coordination."""
+
+    @pytest.mark.parametrize("cadence", ["epoch_only", "step_and_epoch", "hf_only"])
+    @pytest.mark.parametrize("fail_once", [False, True])
+    def test_hf_step_and_epoch_dcp_share_the_same_write(self, mock_helper, cadence, fail_once):
+        trainer = _make_mock_trainer()
+        cb = CheckpointCallback(trainer)
+        cb.dcp_every_n_steps = 5 if cadence == "step_and_epoch" else 0
+        cb.dcp_every_n_epochs = 0 if cadence == "hf_only" else 1
+        cb.save_hf_weights = True
+        cb.hf_every_n_steps = 5
+        cb.hf_every_n_epochs = 0
+        events = []
+
+        def save_dcp(state):
+            events.append("dcp")
+
+        def save_hf(state, stage):
+            events.append("hf")
+            if fail_once and events.count("hf") == 1:
+                raise RuntimeError("conversion failed")
+
+        trainer.save_dcp.side_effect = save_dcp
+        trainer.save_hf_or_lora.side_effect = save_hf
+        state = TrainerState(global_step=5, epoch=0)
+        if fail_once:
+            with pytest.raises(RuntimeError, match="conversion failed"):
+                cb.on_step_end(state)
+        cb.on_step_end(state)
+        cb.on_epoch_end(state)
+        assert events.count("dcp") == (0 if cadence == "hf_only" else 1)
+        assert events.count("hf") == (2 if fail_once else 1)
+        if cadence != "hf_only":
+            assert events[0] == "dcp"
+
+    def test_failed_async_export_requires_restart(self, mock_helper):
+        trainer = _make_mock_trainer(save_async=True)
+        cb = CheckpointCallback(trainer)
+        cb.dcp_every_n_steps = 0
+        cb.dcp_every_n_epochs = 1
+        cb.save_hf_weights = True
+        cb.hf_every_n_steps = 5
+        state = TrainerState(global_step=5, epoch=0)
+        trainer.save_hf_or_lora.side_effect = [RuntimeError("async save failed"), None]
+
+        with pytest.raises(RuntimeError, match="async save failed"):
+            cb.on_step_end(state)
+        assert cb._last_dcp_step == -1
+        with pytest.raises(RuntimeError, match="restart from a complete checkpoint"):
+            cb.on_step_end(state)
+        assert trainer.save_dcp.call_count == 1
+        assert cb._last_dcp_step == -1
+
+    @pytest.mark.parametrize("wait_fails", [False, True])
+    def test_async_hf_step_waits_for_previous_dcp(self, mock_helper, wait_fails):
+        trainer = _make_mock_trainer(save_async=True)
+        cb = CheckpointCallback(trainer)
+        cb.dcp_every_n_steps = 0
+        cb.dcp_every_n_epochs = 1
+        cb.save_hf_weights = True
+        cb.hf_every_n_steps = 5
+        events = []
+
+        def wait():
+            events.append("wait")
+            if wait_fails:
+                raise RuntimeError("previous save failed")
+
+        trainer.wait_for_pending_save.side_effect = wait
+        trainer.save_dcp.side_effect = lambda state: events.append("dcp")
+        trainer.save_hf_or_lora.side_effect = lambda state, stage: events.append("hf")
+        state = TrainerState(global_step=5, epoch=0)
+        if wait_fails:
+            with pytest.raises(RuntimeError, match="previous save failed"):
+                cb.on_step_end(state)
+            assert events == ["wait"]
+        else:
+            cb.on_step_end(state)
+            assert events == ["wait", "dcp", "hf"]
