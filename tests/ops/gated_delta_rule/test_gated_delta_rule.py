@@ -29,6 +29,7 @@ from torch import Tensor
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNormGated, torch_chunk_gated_delta_rule
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextRMSNormGated
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.tol import (
     EAGER_ATOL,
     EAGER_GRAD_ATOL,
@@ -1049,6 +1050,7 @@ def test_chunk_scaled_dot_kkt_fwd_requires_g_and_beta(module_path: str) -> None:
 
 
 @pytest.mark.parametrize("with_initial_state", (False, True))
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_fla_npu_grouped_empty_segments_keep_value_head_states(
     with_initial_state: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -1083,6 +1085,7 @@ def test_fla_npu_grouped_empty_segments_keep_value_head_states(
         assert torch.equal(seen[0], initial[[1, 3]])
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_fla_npu_reuse_rejects_unexpanded_grouped_heads(_stub_npu_input_guard: None) -> None:
     module = import_module("veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.fla_npu")
     query = torch.zeros(1, 4, 2, 128, dtype=torch.bfloat16)
