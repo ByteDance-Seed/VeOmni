@@ -1040,6 +1040,11 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         self.q_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps, config=config)
         self.k_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps, config=config)
         self.veomni_rope = VeomniOp("rope", "partial", config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_qsa_indexer = (
+            VeomniOp("qsa_indexer", "standard", "npu_ascendc")
+            if config.ops_config.qsa_indexer_implementation == "npu_ascendc"
+            else None
+        )
 
     def forward(
         self,
@@ -1152,7 +1157,16 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         output_width = self.token_budget + self.compress_ratio - 1
         query_positions = local_start + torch.arange(local_seq_len, device=hidden_states.device)
 
-        if block_starts.numel():
+        if self.veomni_qsa_indexer is not None and block_starts.numel():
+            selected_local = self.veomni_qsa_indexer(
+                q,
+                pooled_keys,
+                cu_seq_lens_q=cu_seq_lens_q,
+                packed_seq_lens=packed_seq_lens,
+                compress_ratio=self.compress_ratio,
+                block_topk=self.block_topk,
+            )
+        elif block_starts.numel():
             top_count = min(self.block_topk, block_starts.numel())
             block_offsets = torch.arange(self.compress_ratio, dtype=torch.int32, device=hidden_states.device)
             elements_per_query = max(1, batch_size * block_starts.numel() * self.index_n_heads)
