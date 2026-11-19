@@ -787,16 +787,23 @@ raise during config validation or op binding.
 
 | Value | Implementation | Hardware | EP support |
 |-------|--------|----------|:----------:|
-| `eager` | PyTorch expert loop | Any | No |
+| `eager` | PyTorch expert loop | Any | Yes |
 | `fused_triton` | Triton group-gemm | GPU, SM70+ or MLU | Yes |
 | `fused_quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | Yes |
+| `qat` | TileLang blockwise FP8/FP4 fake quantization over the Triton group-gemm | GPU, SM90+ (needs `tilelang`) | Yes |
 | `deepgemm_fp8` | DeepGEMM FP8 forward/dgrad/wgrad | NVIDIA Hopper SM90 / Blackwell SM100 | Yes |
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
 | `fused_mlu` | Apex grouped-GEMM | Cambricon MLU | Yes |
 
 Patched experts modules construct `VeomniOp("moe_experts", variant, config.ops_config.moe_implementation)`
 in `__init__` and always call that handle. `eager` is a registered row, not a
-separate `ModuleList` fork. LoRA experts follow the wrapped module's
+separate `ModuleList` fork. Every row runs under expert parallelism: the fused
+rows dispatch inside their kernel, while `eager` detects sharded weights and
+hands the call to the reference loop in
+`veomni.ops.kernels.moe_experts.shared.act_fn_experts`, which carries the EP
+all-to-all because a global expert id would index past a local shard. `eager` is
+also the target every fused row delegates to for an activation its kernel cannot
+evaluate. LoRA experts follow the wrapped module's
 `veomni_moe.impl` and fall back to `eager` when that `moe_experts_lora` row is
 unavailable on the device.
 
@@ -896,9 +903,9 @@ All four are defined in `transformers.integrations`:
 
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
-| **Mechanism** | Each patched experts module constructs `VeomniOp("moe_experts", variant, impl)` in `__init__` and always calls that handle in `forward`; the selected row may be eager, fused Triton, fused Quack, FP8 DeepGEMM, fused NPU, or fused MLU. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
-| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused_triton"` / `"fused_quack"` / `"deepgemm_fp8"` / `"fused_npu"` / `"fused_mlu"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
-| **EP support** | `fused_triton`, `fused_quack`, `deepgemm_fp8` and `fused_npu` support Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
+| **Mechanism** | Each patched experts module constructs `VeomniOp("moe_experts", variant, impl)` in `__init__` and always calls that handle in `forward`; the selected row may be eager, fused Triton, fused Quack, QAT, FP8 DeepGEMM, fused NPU, or fused MLU. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
+| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused_triton"` / `"fused_quack"` / `"qat"` / `"deepgemm_fp8"` / `"fused_npu"` / `"fused_mlu"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
+| **EP support** | Every row supports Expert Parallelism via VeOmni's EP sharding. The fused rows dispatch inside their fused kernel; `eager` detects sharded weights and dispatches through `merged_experts_act_fn_forward`, which carries the EP all-to-all | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
 | **When** | Handle resolution in model `__init__`; dispatch at forward time | Decorator at class definition time; dispatch at forward time |
 
 **Note:** Transformers v5 hardcodes two MoE experts implementations (`batched_mm` and `grouped_mm`) and does not expose a registration interface for external fused implementations, so VeOmni models call their local `VeomniOp` handles rather than routing through `ALL_EXPERTS_FUNCTIONS`.
