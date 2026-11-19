@@ -56,9 +56,10 @@ never been run.
 | constraint | enforced at | if violated |
 |----|----|----|
 | `cp_size <= S / max(config.compress_rates)` | `plan_compressor_shard`, called by all three window compressors before their halo exchange | `ValueError` on the first forward |
-| `cp_size > 1` requires `ulysses_size == 1` | `ParallelState.__post_init__` and `AcceleratorConfig._resolve_topology` | `NotImplementedError` at launch |
+| DeepSeek-V4 `cp_size > 1` requires `ulysses_size == 1` | `check_context_parallel_supported` | `NotImplementedError` at model build |
+| DeepSeek-V4 CP requires the VeOmni modeling backend | `check_context_parallel_supported` | `NotImplementedError` at model build with the native HF backend |
 | the model type must implement CP | `check_context_parallel_supported`, from `build_foundation_model` (the omni path reaches it the same way, once per sub-module) | `NotImplementedError` at model build |
-| on Ascend/NPU, the model type must be `deepseek_v4` | `check_context_parallel_supported` | `NotImplementedError` at model build |
+| on Ascend/NPU, the model type must support CP | `check_context_parallel_supported` | `NotImplementedError` at model build for unsupported models |
 | on Ascend/NPU, `dsa_indexer_implementation` and `dsa_attention_implementation` must be `eager` | `check_context_parallel_supported`, which reads the adapted config's `ops_config` | `NotImplementedError` at model build for any value other than `eager` |
 | explicit `position_ids` under either sequence-parallel mode | `DeepseekV4Model.forward` | `ValueError` on the first forward |
 | the attention mask spans the full sequence | `DeepseekV4Attention.forward`, ahead of the KV all-gather | `ValueError` on the first forward |
@@ -275,7 +276,7 @@ Recorded because the reasons were discoveries, not tidying.
 |----|----|----|
 | `sharding.py` holds contiguous slice / restore helpers and a divisibility check `L % max_compress_rate == 0` | window-ownership arithmetic plus the three helpers every window compressor shares | Slicing is already free — the collator's `sp_slice` narrows on `sp_rank`, which resolves to `cp_rank` under CP — and contiguous shards in rank order need no restore permutation. The divisibility check was the wrong constraint: ownership by first token absorbs any sample length, so `L % R == 0` is not required, while `R <= L` is. |
 | model-level validation belongs in the DSv4 forward, which raises if CP is enabled and the model is not DSv4 | positive allow-list `check_context_parallel_supported` in `veomni/models/auto.py`, called from `build_foundation_model`, which the omni path also calls — once per sub-module, with that sub-module's own config | The design's own mitigation is self-contradictory: a forward that never runs cannot observe that the model is not DSv4. An allow-list also fails safe as CP spreads — a newly ported model has to be added deliberately instead of the gate having to be remembered. Per-sub-module calls matter because the encoder/decoder branch constructs `SeedOmniModel._from_config` directly and the outer `SeedOmniConfig` model type says nothing about what runs the collectives. |
-| the plan scoped the CP admission gate to `parallel_state.py` | both `parallel_state.py` and `AcceleratorConfig._resolve_topology` | The arguments layer held its own model-agnostic `assert cp_size == 1`, which aborts on the CLI and trainer path before `ParallelState` is ever constructed. Two gates now carry the same hybrid-only refusal. |
+| the plan scoped the CP admission gate to `parallel_state.py` | topology checks plus a model-level gate | Hybrid Ulysses/CP requires explicit topology opt-in and model support. Qwen4-Exp supports the combination; DeepSeek-V4 rejects it at model build. |
 | no `shard_packed_compression_metadata` | new helper in `packed_utils.py` | Only the module holding the hidden states knows they are one shard, so only it can shard the global metadata — and per-window and per-query arrays shard differently (see the decision on index spaces above). |
 | "there is no sequence-length divisibility constraint beyond `S % cp_size == 0`" | `cp_size <= S / max(compress_rates)` | Found during implementation, from the halo geometry. See "Sequence length and compression rate". |
 
