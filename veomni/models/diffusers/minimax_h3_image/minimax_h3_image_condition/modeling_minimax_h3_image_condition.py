@@ -239,7 +239,7 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
 
     @torch.no_grad()
     def get_condition(self, inputs, images) -> dict[str, list[torch.Tensor]]:
-        """Encode one raw text-to-image training sample for offline caching."""
+        """Encode one raw text-to-image sample for online training or offline caching."""
         if len(inputs) != 1 or len(images) != 1:
             raise ValueError("MiniMax-H3-Image training requires micro_batch_size=1.")
         if len(images[0]) != 1:

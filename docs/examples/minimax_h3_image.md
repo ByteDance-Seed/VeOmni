@@ -1,4 +1,4 @@
-# MiniMax-H3-Image inference and offline T2I fine-tuning
+# MiniMax-H3-Image inference and T2I fine-tuning
 
 MiniMax-H3-Image is the image-generation member of the MiniMax-H3 family.
 It reuses the H3 text encoder and the H3 diffusion transformer without the
@@ -65,10 +65,10 @@ image = pipe(
 image.save("edit.png")
 ```
 
-## Offline text-to-image fine-tuning
+## Text-to-image fine-tuning
 
-This experimental path supports `micro_batch_size: 1` and `ulysses_size: 1`.
-It follows the public [DiffSynth fine-tuning recipe](https://github.com/modelscope/DiffSynth-Studio/blob/fc8b4be56759de06cac585929f608227ac58766b/examples/minimax_h3_image/model_training/full/MiniMax-H3-Image.sh): the DiT learns a flow-matching target while the six released PDD heads remain frozen. Each training sigma selects the nearest release head, excluding the terminal zero. This is fine-tuning, not a reproduction of the original PDD distillation. Image editing, packed batches, and online training are outside this example.
+The online and offline paths support `micro_batch_size: 1` and `ulysses_size: 1`.
+They follow the public [DiffSynth fine-tuning recipe](https://github.com/modelscope/DiffSynth-Studio/blob/fc8b4be56759de06cac585929f608227ac58766b/examples/minimax_h3_image/model_training/full/MiniMax-H3-Image.sh): the DiT learns a flow-matching target while the six released PDD heads remain frozen. Each training sigma selects the nearest release head, excluding the terminal zero. Both paths sample fresh noise and timesteps during training. The text encoder and VAE stay frozen: offline training reads their cached outputs; online training encodes each raw image/prompt before its DiT update. This is fine-tuning, not a reproduction of the original PDD distillation. Training currently covers T2I only; reference-image editing training and packed batches are outside this example.
 
 ### Prepare weights and data
 
@@ -90,7 +90,7 @@ for file in metadata.csv 1.jpg 2.jpg 3.jpg 4.jpg 5.jpg; do
 done
 ```
 
-### Cache and run one step
+### Offline training: cache and run one step
 
 Cache first on a device with enough room to hold the truncated BF16 text encoder (about 48 GiB of parameters), FP32 VAE, and their activations. The embedding run does not load the DiT. The cache stores text embeddings, token tags, and normalized VAE posterior modes. It contains serialized tensors; only load a cache you trust.
 
@@ -106,6 +106,21 @@ NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_
 ```
 
 The smoke config does not save weights. For longer runs, set a positive `train.checkpoint.save_steps` to save a DCP training checkpoint. The example does not export a new six-step inference checkpoint.
+
+### Online training: encode during each step
+
+Use the prepared transformer and the same `image,prompt` CSV directly. The online path calls the frozen text encoder and VAE on every sample, then uses the same condition processing and loss as offline training. No embedding-cache stage is needed.
+
+The online reference keeps the same FP32 DiT training policy as the offline config and additionally holds about 50.2 GiB of frozen encoder/VAE parameters on each rank. For eight ranks, the weights, gradients, and AdamW moments estimated above plus those encoders exceed 112 GiB per rank before activations and communication buffers. Use hardware with sufficient memory or increase the shard count; this full-parameter recipe does not fit an eight-rank 64 GiB node. Tiny-DiT online validation on a single 64 GiB Ascend NPU does not establish released-33B training capacity.
+
+As with offline training, the CSV must contain at least one row per data-parallel rank. For the eight-rank command below, duplicate the five sample rows once, keeping one header.
+
+```shell
+NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_t2i_online.yaml \
+  --train.global_batch_size 8 --train.max_steps 1
+```
+
+Both training configs use `dataset_repeat: true` and can run more updates by increasing `train.max_steps`. Set `train.checkpoint.save_steps` to save training checkpoints during a longer run. The online example uses its own output directory, `output/minimax_h3_image_t2i_online_sft`.
 
 ## Notes
 

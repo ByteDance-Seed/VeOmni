@@ -26,7 +26,7 @@ def process_dit_online_example(example, source_name, **kwargs):
 
 @DATA_TRANSFORM_REGISTRY.register("minimax_h3_image_t2i")
 def process_minimax_h3_image_t2i_example(example, data_dir="", **kwargs):
-    """Load one prompt and target image for MiniMax-H3-Image offline embedding."""
+    """Load one prompt and target image for MiniMax-H3-Image T2I training or caching."""
     prompt, image = example.get("prompt"), example.get("image")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("MiniMax-H3-Image training requires a non-empty 'prompt' column.")
