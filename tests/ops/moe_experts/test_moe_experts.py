@@ -2062,22 +2062,22 @@ def test_expert_sharding_is_read_without_assuming_the_axis_is_named_ep():
     from types import SimpleNamespace
     from unittest import mock
 
-    from veomni.ops.kernels.moe_experts.standard import eager
+    from veomni.ops.kernels.moe_experts.shared import act_fn_experts
 
     def with_sizes(sizes):
         return mock.patch(
-            "veomni.ops.kernels.moe_experts.standard.eager.get_parallel_state",
+            "veomni.distributed.parallel_state.get_parallel_state",
             lambda: SimpleNamespace(extra_parallel_sizes=sizes),
         )
 
     with with_sizes({"ep": 4}):
-        assert eager._experts_are_sharded()
+        assert act_fn_experts._expert_parallel_size() == 4
     with with_sizes({"ep": 1}):
-        assert not eager._experts_are_sharded()
+        assert act_fn_experts._expert_parallel_size() == 1
     with with_sizes({"ple": 2}):
-        assert not eager._experts_are_sharded()
+        assert act_fn_experts._expert_parallel_size() == 1
     with with_sizes({}):
-        assert not eager._experts_are_sharded()
+        assert act_fn_experts._expert_parallel_size() == 1
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -2217,3 +2217,83 @@ def test_dispatch_to_ep_class_calls_the_expert_math_in_cumsum_order():
 
         moe_layer.dispatch_to_ep_class(_Math, 2, torch.rand(6, 1), torch.zeros(6, 1, dtype=torch.long), hidden, weight)
         assert seen["class_args"][2] is weight
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_the_eager_row_has_one_reference_loop_not_two():
+    """`eager` must delegate, not carry a second copy of the expert loop.
+
+    It used to hold an inline non-EP loop beside the shared one, chosen by
+    ``if not supports(activation) or _experts_are_sharded()``. The inline copy indexed
+    expert weights with *global* ids, so it was wrong under EP and could not serve an
+    activation outside the whitelist -- two behaviours that the branch condition hid
+    rather than expressed. Keeping only the delegated path means one implementation of
+    "the reference row", and EP correctness is a property of the row rather than of
+    which branch a caller happened to take.
+
+    Static because the defect is structural: a second `for` loop over experts compiled
+    and passed the numeric tests on the non-EP path.
+    """
+    import ast
+    import pathlib
+
+    from veomni.ops.kernels.moe_experts.standard import eager as eager_module
+
+    source = pathlib.Path(eager_module.__file__).read_text()
+
+    tree = ast.parse(source)
+    wrapper = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "wrapper")
+    loops = [node for node in ast.walk(wrapper) if isinstance(node, (ast.For, ast.AsyncFor))]
+    assert not loops, "eager.wrapper runs the expert loop inline again; it must delegate to the shared one"
+
+    calls = [n for n in ast.walk(wrapper) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    assert any(c.func.id == "merged_experts_act_fn_forward" for c in calls), (
+        "eager.wrapper must call merged_experts_act_fn_forward"
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh", "relu"])
+def test_split_and_merged_fc1_agree_on_every_activation(activation):
+    """Both weight layouts take the same path, so they must agree bit for bit.
+
+    `eager` accepts a fused `gate_up_proj` or a `fc1_1`/`fc1_2` pair. Merging the two
+    loops made the split layout a concatenation inside the shared loop; a mismatch
+    there would silently train a different function depending on which layout a model
+    happened to build.
+    """
+    from veomni.ops.kernels.moe_experts.standard import eager
+
+    torch.manual_seed(0)
+    experts, hidden, intermediate, tokens, top_k = 3, 8, 16, 5, 2
+    routed = torch.randn(tokens, hidden)
+    routes = torch.randint(0, experts, (tokens, top_k))
+    routing = torch.softmax(torch.randn(tokens, top_k), dim=-1)
+    down = torch.randn(experts, hidden, intermediate)
+    gate_w = torch.randn(experts, intermediate, hidden)
+    up_w = torch.randn(experts, intermediate, hidden)
+    empty = gate_w.new_empty(0)
+
+    merged = eager.wrapper(
+        routed,
+        routing,
+        routes,
+        empty,
+        empty,
+        down,
+        torch.cat([gate_w, up_w], dim=1),
+        num_experts=experts,
+        activation=activation,
+    )
+    split = eager.wrapper(
+        routed,
+        routing,
+        routes,
+        gate_w,
+        up_w,
+        down,
+        empty,
+        num_experts=experts,
+        activation=activation,
+    )
+    assert torch.equal(merged, split), f"{activation}: a layout change altered the result"

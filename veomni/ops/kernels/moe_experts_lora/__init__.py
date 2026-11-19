@@ -18,6 +18,10 @@
 is a per-expert pair. Eager is the per-expert loop. ``fused_triton`` and
 ``fused_npu`` wrap the local fused Functions. ``fused_quack`` / ``fused_mlu`` are not registered; callers remap
 those ``moe_implementation`` values to eager.
+
+All three rows serve expert parallelism through ``dispatch_to_ep_class``. Only the
+base weights are sharded; ``eager`` walks the local experts with plain PyTorch, so it
+is the reference for the fused rows rather than a training choice.
 """
 
 from __future__ import annotations

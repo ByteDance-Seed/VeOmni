@@ -686,3 +686,115 @@ def test_distributed_ep_dispatch_matches_nonep_forward_and_gradients(variant):
         args=(variant,),
         nprocs=_CI_ACCELERATOR_2.nproc,
     )
+
+
+def _lora_ep_split_reference(impl_module, wrapper_kwargs, num_experts, ep_size, routed, cumsum, weights):
+    """Run the row's EP expert math by hand over ``ep_size`` shards, in one process.
+
+    The EP collective needs a real group, so the math is exercised directly: shard the
+    expert dim, feed each rank the rows ``cumsum`` assigns to its local experts, and
+    concatenate in rank order — which is what ``token_pre_all2all`` would deliver.
+    """
+
+    per_rank = num_experts // ep_size
+    outputs = []
+    for rank in range(ep_size):
+        lo, hi = rank * per_rank, (rank + 1) * per_rank
+        local_cumsum = cumsum[lo:hi] - (cumsum[lo - 1] if lo > 0 else 0)
+        start = cumsum[lo - 1] if lo > 0 else 0
+        local_tokens = routed[start : cumsum[hi - 1]]
+        local_weights = {
+            k: (v[lo:hi] if v.dim() >= 3 and v.shape[0] == num_experts else v) for k, v in weights.items()
+        }
+        outputs.append(
+            impl_module.apply(local_tokens, local_cumsum, **local_weights, **wrapper_kwargs),
+        )
+    return torch.cat(outputs, dim=0)
+
+
+@pytest.mark.parametrize("mode", ["shared", "independent"])
+@pytest.mark.parametrize("ep_size", [2, 4])
+def test_lora_eager_ep_math_matches_the_non_ep_loop(mode, ep_size):
+    """The new EP expert math must reproduce the non-EP loop on the scattered tokens.
+
+    Both LoRA families gained an EP branch; before this they raised, so no numeric
+    check existed. Routing weights are applied by ``token_post_all2all`` in the real
+    pipeline, so this compares the unweighted permuted output.
+    """
+    import torch
+
+    from veomni.ops.kernels.moe_experts_lora import independent, shared
+
+    if mode == "shared":
+        impl_module = shared.eager._SharedLoRAExpertMathEP
+    else:
+        impl_module = independent.eager._IndependentLoRAExpertMathEP
+
+    torch.manual_seed(0)
+    num_experts, hidden, inter, rank, tokens, top_k = 4, 8, 16, 2, 6, 2
+    routed = torch.randn(tokens * top_k, hidden)
+    cumsum = torch.tensor([tokens * top_k // num_experts * (i + 1) for i in range(num_experts)], dtype=torch.long)
+    cumsum[-1] = tokens * top_k
+    fc1 = torch.randn(num_experts, 2 * inter, hidden)
+    fc2 = torch.randn(num_experts, hidden, inter)
+    scales = {"lora_scale_gate": 0.5, "lora_scale_up": 0.5, "lora_scale_down": 0.5}
+
+    if mode == "shared":
+        lora = {
+            "lora_a_gate": torch.randn(rank, hidden),
+            "lora_b_gate": torch.randn(inter, rank),
+            "lora_a_up": torch.randn(rank, hidden),
+            "lora_b_up": torch.randn(inter, rank),
+            "lora_a_down": torch.randn(rank, inter),
+            "lora_b_down": torch.randn(hidden, rank),
+        }
+    else:
+        lora = {
+            "lora_a_gate": torch.randn(num_experts, rank, hidden),
+            "lora_b_gate": torch.randn(num_experts, inter, rank),
+            "lora_a_up": torch.randn(num_experts, rank, hidden),
+            "lora_b_up": torch.randn(num_experts, inter, rank),
+            "lora_a_down": torch.randn(num_experts, rank, inter),
+            "lora_b_down": torch.randn(num_experts, hidden, rank),
+        }
+
+    weights = {"fc1_1_2_weight": fc1, "fc2_weight": fc2, **lora}
+    got = _lora_ep_split_reference(impl_module, scales, num_experts, ep_size, routed, cumsum, weights)
+
+    # Expected: the non-EP per-expert loop over the same permuted rows, unweighted.
+    import torch.nn.functional as F
+
+    expected = torch.empty_like(routed)
+    starts = torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
+    for e in range(num_experts):
+        s, t = int(starts[e]), int(cumsum[e])
+        state = routed[s:t]
+        if mode == "shared":
+            gate_up = F.linear(state, fc1[e]) + torch.cat(
+                [
+                    F.linear(F.linear(state, lora["lora_a_gate"]), lora["lora_b_gate"]) * scales["lora_scale_gate"],
+                    F.linear(F.linear(state, lora["lora_a_up"]), lora["lora_b_up"]) * scales["lora_scale_up"],
+                ],
+                dim=-1,
+            )
+            gate, up = gate_up.chunk(2, dim=-1)
+            mid = F.silu(gate) * up
+            lora_down = F.linear(F.linear(mid, lora["lora_a_down"]), lora["lora_b_down"]) * scales["lora_scale_down"]
+        else:
+            gate, up = F.linear(state, fc1[e]).chunk(2, dim=-1)
+            gate = torch.addmm(
+                gate,
+                F.linear(state, lora["lora_a_gate"][e]),
+                lora["lora_b_gate"][e].T,
+                alpha=scales["lora_scale_gate"],
+            )
+            up = torch.addmm(
+                up, F.linear(state, lora["lora_a_up"][e]), lora["lora_b_up"][e].T, alpha=scales["lora_scale_up"]
+            )
+            mid = F.silu(gate) * up
+            lora_down = (
+                F.linear(F.linear(mid, lora["lora_a_down"][e]), lora["lora_b_down"][e]) * scales["lora_scale_down"]
+            )
+        expected[s:t] = F.linear(mid, fc2[e]) + lora_down
+
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)

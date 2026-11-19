@@ -16,37 +16,10 @@
 
 from __future__ import annotations
 
-import torch
-import torch.nn.functional as F
 from torch import Tensor
 
-from .....distributed.parallel_state import get_parallel_state
-from ....activation import apply_activation, resolve, supports
+from ....activation import resolve
 from ..shared.act_fn_experts import merged_experts_act_fn_forward
-
-
-def _experts_are_sharded() -> bool:
-    """Whether the expert weights this row is handed are sharded across ranks.
-
-    Reads ``extra_parallel_sizes`` directly rather than ``ep_enabled``: that property
-    indexes the dict unconditionally, and a parallel state built with a different
-    ``extra_parallel_names`` (some tests use one) has no ``"ep"`` key. The question
-    here is only "is expert parallelism on?", and an absent axis means no.
-    """
-    sizes = getattr(get_parallel_state(), "extra_parallel_sizes", None)
-    return bool(sizes) and sizes.get("ep", 1) > 1
-
-
-def _expert_activation(gate: Tensor, activation: str) -> Tensor:
-    """Evaluate the configured activation, whichever name it is.
-
-    ``veomni.ops.activation`` serves a closed set through ATen spellings that match the
-    fused rows bit for bit; anything else resolves through ``ACT2FN``, the same table
-    the model built its own ``act_fn`` from. So the row needs no module handed to it.
-    """
-    from ....activation import resolve, supports
-
-    return apply_activation(gate, activation) if supports(activation) else resolve(activation)(gate)
 
 
 def wrapper(
@@ -74,70 +47,24 @@ def wrapper(
     Regular autograd, no custom backward. ``assume_distinct_experts`` only
     tightens the Triton grouped-GEMM launch bound, so it is unused here.
 
-    An activation a fused row cannot serve reaches this row. A name outside
+    Every activation, and both weight layouts, run the one reference loop in
+    :mod:`veomni.ops.kernels.moe_experts.shared.act_fn_experts`. A name outside
     ``veomni.ops.activation`` is resolved through ``ACT2FN`` -- the same table the
     model built its ``act_fn`` from -- so a config that trained before the activation
-    became a call argument still trains. The expert loop that handles it also owns the
-    expert-parallel dispatch, because the weights it indexes are sharded per rank
-    under EP.
+    became a call argument still trains. That loop owns the expert-parallel dispatch
+    too, because the weights it indexes are sharded per rank under EP; a second
+    non-EP copy lived here and indexed a shard with global ids.
     """
     del assume_distinct_experts, block_size, expert_dtype
-    # Two reasons to take the shared loop rather than the inline one below: an
-    # activation no ATen spelling covers, and expert parallelism -- whose weights are
-    # sharded per rank, so the inline loop's ``num_experts`` mask indexes past the
-    # shard. ``gelu`` is in the served set, so keying on the activation alone would
-    # send it down the sharded-weight path.
-    if not supports(activation) or _experts_are_sharded():
-        # One implementation of the reference path, shared with the fused rows that
-        # delegate here. It carries the EP dispatch, which is why this cannot be
-        # inlined: indexing a sharded weight by global expert id reads past the shard.
-        merged = (
-            fc1_1_2_weight
-            if fc1_1_2_weight.numel()
-            else torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
-            if fc1_1_weight.numel()
-            else None
-        )
-        if merged is None:
-            raise ValueError("Provide either split fc1 weights or merged fc1_1_2_weight.")
-        return merged_experts_act_fn_forward(
-            hidden_states,
-            selected_experts,
-            routing_weights,
-            merged,
-            fc2_weight,
-            resolve(activation),
-            num_experts,
-            swiglu_limit,
-        )
-    has_split = fc1_1_weight.numel() > 0
-    has_merged = fc1_1_2_weight.numel() > 0
-    if has_split == has_merged:
-        raise ValueError("Provide either split fc1 weights or merged fc1_1_2_weight, not both or neither.")
-    if has_split and fc1_2_weight.numel() == 0:
-        raise ValueError("Split fc1 mode requires both fc1_1_weight and fc1_2_weight.")
-
-    output = torch.zeros_like(hidden_states)
-    expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
-    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-    for expert_idx in expert_hit:
-        idx = int(expert_idx[0].item())
-        top_k_pos, token_idx = torch.where(expert_mask[idx])
-        x = hidden_states[token_idx]
-        if has_merged:
-            gate, up = F.linear(x, fc1_1_2_weight[idx]).chunk(2, dim=-1)
-        else:
-            gate = F.linear(x, fc1_1_weight[idx])
-            up = F.linear(x, fc1_2_weight[idx])
-        if swiglu_limit is not None:
-            gate = gate.clamp(max=swiglu_limit)
-            up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-        y = F.linear(_expert_activation(gate, activation) * up, fc2_weight[idx])
-        y = y * routing_weights[token_idx, top_k_pos, None]
-        output = output.index_add(0, token_idx, y.to(output.dtype))
-    # A rank that routed no tokens still has to keep the block on the graph, or its
-    # backward never runs and the collective in it is skipped on one rank only. The
-    # shared loop guards this the same way; this branch is what routes a served
-    # activation here, so it needs the guard too.
-    return output + hidden_states * 0
+    return merged_experts_act_fn_forward(
+        hidden_states,
+        selected_experts,
+        routing_weights,
+        fc1_1_2_weight,
+        fc2_weight,
+        resolve(activation),
+        num_experts,
+        swiglu_limit,
+        fc1_1_proj=fc1_1_weight,
+        fc1_2_proj=fc1_2_weight,
+    )

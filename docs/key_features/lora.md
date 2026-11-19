@@ -392,7 +392,7 @@ Each MoE-LoRA wrapper follows the `moe_implementation` its wrapped experts modul
 |---|---|---|---|
 | `fused_triton` | fused Triton kernel | fused Triton kernel | Recommended on GPU. |
 | `fused_npu` | NPU GroupGEMM | NPU GroupGEMM | Recommended on Ascend NPU. |
-| `eager` | eager loop (reference) | not supported (raises) | Portable reference path. |
+| `eager` | eager loop (reference) | eager loop (reference) | Portable reference path; works under EP but is slow. |
 | `deepgemm_fp8` | not supported (raises) | not supported (raises) | No FP8 MoE-LoRA implementation; rejected at wrap time. |
 
 The fused GPU path lives in `veomni/ops/kernels/moe_experts_lora/` and reuses the same
@@ -408,8 +408,11 @@ MoE-LoRA requires SiLU experts and rejects other activations at wrap time.
 
 ### 5.4 Expert Parallelism (EP)
 
-Both `fused_triton` and `fused_npu` support the EP path; `fused_npu` uses the
-Ascend GroupGEMM implementation in `veomni/ops/kernels/moe_experts_lora/{shared,independent}/npu.py`.
+All three rows support the EP path: `fused_triton` on GPU, `fused_npu` via the Ascend
+GroupGEMM implementation in `veomni/ops/kernels/moe_experts_lora/{shared,independent}/npu.py`,
+and `eager` through plain-PyTorch expert math in the same directory. All of them hand
+the dispatched tokens to `veomni.distributed.moe.dispatch_to_ep_class`, so the
+all-to-all plumbing is one implementation.
 
 When `model.accelerator.ep_size > 1`, base experts are sharded along the expert dim by
 `ParallelPlan` (`Shard(0)` on `gate_up_proj` / `down_proj`). MoE-LoRA tracks this layout:
@@ -424,8 +427,10 @@ When `model.accelerator.ep_size > 1`, base experts are sharded along the expert 
   `_collect_ep_replicated_lora_param_ids` in `veomni/optim/optimizer.py` — to skip the
   EP all-reduce for these replicated params so the global grad-norm matches EP=1.
 
-Both modes work with FSDP2 + EP. EP requires a fused forward path:
-`triton` on GPU or `npu` on Ascend NPU; `eager` raises.
+Both modes work with FSDP2 + EP. `eager` also runs under EP — it is the reference
+path, kept correct so it can validate the fused rows — but it does per-expert Python
+loops on top of the all-to-all, so treat it as a debugging backend rather than a
+training one.
 
 ### 5.5 Save / load artefacts
 

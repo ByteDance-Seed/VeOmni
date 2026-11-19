@@ -74,6 +74,23 @@ def _gated_expert_activation(
     return act_fn(gate) * up
 
 
+def _expert_parallel_size() -> int:
+    """The ``ep`` axis size, read without assuming the axis is named ``ep``.
+
+    ``ParallelState.ep_enabled`` indexes ``extra_parallel_sizes["ep"]``
+    unconditionally, and ``_init_parallel_state`` builds that dict from
+    ``extra_parallel_names``. A state initialized with, say, ``("ple",)`` has no
+    ``"ep"`` key, so asking whether expert weights are sharded raised
+    ``KeyError: 'ep'`` -- which took out tests that never touch experts, because this
+    check runs on every call. The question here is only "is expert parallelism on?",
+    and a missing axis means no.
+    """
+    from .....distributed.parallel_state import get_parallel_state
+
+    sizes = getattr(get_parallel_state(), "extra_parallel_sizes", None) or {}
+    return sizes.get("ep", 1)
+
+
 def merged_experts_act_fn_forward(
     hidden_states: Tensor,
     top_k_index: Tensor,
@@ -83,6 +100,8 @@ def merged_experts_act_fn_forward(
     act_fn: Callable[[Tensor], Tensor],
     num_experts: int,
     swiglu_limit: float | None = None,
+    fc1_1_proj: Tensor | None = None,
+    fc1_2_proj: Tensor | None = None,
 ) -> Tensor:
     """Expert loop: ``down(act_fn(gate) * up)`` then routing weights.
 
@@ -90,20 +109,36 @@ def merged_experts_act_fn_forward(
     go through the same EP dispatch as the fused rows; indexing with global expert ids
     would read past the local shard. Optional ``swiglu_limit`` applies DeepSeek-V4's
     gate/up clamp first.
+
+    ``fc1_1_proj`` / ``fc1_2_proj`` carry the split layout, for a caller whose weights
+    are two tensors rather than one fused ``gate_up_proj``. Supplying them overrides
+    ``gate_up_proj``, which is what the ``eager`` row does when its split tensors are
+    non-empty. The EP branch concatenates them first: the dispatch is written against
+    a single 3-D weight.
     """
+    has_split = fc1_1_proj is not None and fc1_1_proj.numel() > 0
+    if has_split:
+        if fc1_2_proj is None or fc1_2_proj.numel() == 0:
+            raise ValueError("Split fc1 mode requires both fc1_1_proj and fc1_2_proj.")
+        if gate_up_proj.numel() > 0:
+            # Both layouts supplied: the caller's intent is ambiguous (which one is the
+            # model's weight?) and silently preferring one would hide a wiring bug.
+            raise ValueError("Provide either split fc1 weights or merged gate_up_proj, not both.")
+        gate_up_proj = torch.cat([fc1_1_proj, fc1_2_proj], dim=1)
+    elif gate_up_proj.numel() == 0:
+        # Neither layout supplied. Say so here: the shard check below compares
+        # ``gate_up_proj.shape[0]`` against ``num_experts``, and on an empty tensor that
+        # misfires as "sharded weights" instead of naming the real problem.
+        raise ValueError("Provide either split fc1 weights or merged gate_up_proj, not neither.")
+
     local_experts = gate_up_proj.shape[0]
     if local_experts != num_experts:
         from .....distributed.moe import dispatch_to_ep_class
-        from .....distributed.parallel_state import get_parallel_state
 
-        # ``ep_enabled`` indexes ``extra_parallel_sizes["ep"]`` unconditionally, and
-        # that dict is built from ``extra_parallel_names`` -- a state initialized with
-        # another axis has no such key. Read it directly, as ``eager`` does.
-        sizes = getattr(get_parallel_state(), "extra_parallel_sizes", None) or {}
-        ep_size = sizes.get("ep", 1)
+        ep_size = _expert_parallel_size()
         if ep_size <= 1 or local_experts != num_experts // ep_size:
             raise ValueError(
-                "the non-SiLU expert fallback received expert-parallel sharded weights "
+                "the expert reference loop received expert-parallel sharded weights "
                 f"(local {local_experts} vs global {num_experts}). Enable expert "
                 "parallelism so tokens are dispatched to local experts."
             )

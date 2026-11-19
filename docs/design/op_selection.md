@@ -797,30 +797,29 @@ raise during config validation or op binding.
 
 Patched experts modules construct `VeomniOp("moe_experts", variant, config.ops_config.moe_implementation)`
 in `__init__` and always call that handle. `eager` is a registered row, not a
-separate `ModuleList` fork. Every `moe_experts` row runs under expert
-parallelism: the fused rows dispatch inside their kernel, while `eager` detects
-sharded weights and hands the call to the reference loop in
-`veomni.ops.kernels.moe_experts.shared.act_fn_experts`, which carries the EP
-all-to-all because a global expert id would index past a local shard. `eager` is
-also the target every fused row delegates to for an activation its kernel cannot
-evaluate.
+separate `ModuleList` fork. It has no expert loop of its own: it delegates to
+`merged_experts_act_fn_forward` in
+`veomni.ops.kernels.moe_experts.shared.act_fn_experts` whatever the activation and
+whichever weight layout it is handed, so there is exactly one implementation of
+the reference path in the repository. That loop carries the EP dispatch, because
+the weights it indexes are sharded per rank and a global expert id would index
+past the shard.
 
-That EP branch used to exist only on the model side: the seven patched forwards
+Before, the dispatch existed only on the model side: the seven patched forwards
 routed a non-SwiGLU activation to a shared fallback before ever constructing the
-handle, so the `eager` row itself indexed per-expert weights with global expert
-ids and raised `IndexError: index N is out of bounds` under EP. Now that the
-activation is a call argument, every model reaches the row, so the row carries
-the dispatch instead.
+handle, and the `eager` row kept a second, non-EP copy of the loop that indexed
+per-expert weights with global ids and raised `IndexError: index N is out of
+bounds` under EP. Now that the activation is a call argument every model reaches
+the row, so the model-side branch and the row's private loop are both gone.
 
 `moe_experts_lora` is a **separate registered family** with its own rows
 (`shared` / `independent` × `eager` / `fused_triton` / `fused_npu`), and the two
-are not interchangeable. MoE-LoRA follows the wrapped module's `veomni_moe.impl`
-and falls back to its own `eager` row when no `moe_experts_lora` row matches the
-device. That `eager` row is not the row above: it rejects expert parallelism
-outright, so a LoRA run over sharded expert weights needs `fused_triton` on GPU
-or `fused_npu` on NPU. See [MoE-LoRA](../key_features/lora.md#5-moe-lora) for the
-per-row EP table, and note that every `moe_experts_lora` row hard-codes SwiGLU
-regardless of `hidden_act`.
+families are not interchangeable. MoE-LoRA follows the wrapped module's
+`veomni_moe.impl` and falls back to its own `eager` row when no `moe_experts_lora`
+row matches the device. All three of its rows support EP and share
+`dispatch_to_ep_class`, but every `moe_experts_lora` row hard-codes SwiGLU
+regardless of `hidden_act`. See [MoE-LoRA](../key_features/lora.md#5-moe-lora) for
+the per-row table and for how the two adapter layouts shard under EP.
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
 SM90+ `tilelang` and Ascend `cann` indexer and attention implementations, plus
