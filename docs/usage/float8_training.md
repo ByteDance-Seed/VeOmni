@@ -94,7 +94,7 @@ Model-specific eligible DiT projection patterns:
 | Parameters / optimizer | FP32 master parameters and standard optimizer updates |
 | Checkpoints | Existing HF weight loading, DCP model/optimizer resume, and floating-point HF export |
 
-Configuration is defined by [Float8TrainingConfig](../../veomni/arguments/arguments_types.py#L641),
+Configuration is defined by [Float8TrainingConfig](../../veomni/arguments/arguments_types.py#L657),
 validated by [validate_float8_training](../../veomni/distributed/float8.py#L51),
 and applied by [convert_float8_linears](../../veomni/distributed/float8.py#L86)
 inside [parallelize_model_fsdp2](../../veomni/distributed/torch_parallelize.py#L459)
