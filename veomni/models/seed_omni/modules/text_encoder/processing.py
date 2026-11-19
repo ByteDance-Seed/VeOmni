@@ -57,9 +57,15 @@ class TextEncoderPreprocessor(ModulePreprocessorBase):
         return cls(cls.build_chat_template(module_path, config_overrides=config_overrides), **kwargs)
 
     def _tokenize_conversation_kwargs(self, inference: bool, **kwargs: Any) -> dict[str, Any]:
-        """Extra kwargs forwarded to :meth:`TextEncoderChatTemplate.tokenize_conversation`."""
-        del kwargs
-        return {"add_generation_prompt": inference}
+        """Extra kwargs forwarded to :meth:`TextEncoderChatTemplate.tokenize_conversation`.
+
+        ``generation_kwargs`` goes through so a template can shape its assistant
+        prefix per scenario (Janus: text vs image response, Bagel: which phase).
+        """
+        return {
+            "add_generation_prompt": inference,
+            "generation_kwargs": kwargs.get("generation_kwargs"),
+        }
 
     def preprocess_conversations(
         self,

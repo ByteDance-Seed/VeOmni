@@ -537,7 +537,11 @@ class DiTTrainer:
     def _build_dataloader(self):
         """Build dataloader with dyn_bsz=False for DiT (fixed batch)."""
         args = self.base.args
+        self.base._veomni_loader_sp_rank_zero_only = True
         if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
+            resume_kwargs = {}
+            if args.data.dataloader.type == "native":
+                resume_kwargs["resume_replay_timeout_seconds"] = args.data.resume_replay_timeout_seconds
             self.base.train_dataloader = build_dataloader(
                 dataloader_type=args.data.dataloader.type,
                 dataset=self.base.train_dataset,
@@ -563,6 +567,7 @@ class DiTTrainer:
                 shuffle=args.data.dataloader.shuffle,
                 collate_fn=DiTDataCollator(),
                 save_steps=args.train.checkpoint.save_steps,
+                **resume_kwargs,
             )
         else:
             self.base.train_dataloader = None

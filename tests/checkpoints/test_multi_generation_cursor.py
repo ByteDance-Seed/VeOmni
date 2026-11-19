@@ -922,7 +922,7 @@ def _source_completeness_worker(rank, device_type, case, endpoint):
         if case == "offline_missing":
             trainer.args.train.training_task = "offline_embedding"
             trainer.model = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
-        elif rank == 0:
+        else:
             runtime = _make_mock_runtime(save_path=save_root)
             runtime.optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
             runtime.lr_scheduler = None
@@ -932,8 +932,6 @@ def _source_completeness_worker(rank, device_type, case, endpoint):
             manager._loaded_checkpoint_path = source
             runtime.checkpoint = manager
             trainer.model = runtime
-        else:
-            trainer.model = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
         callback = GlobalStateCallback(trainer)
         payload = {
             "global_step": 2,
@@ -978,7 +976,7 @@ def _source_completeness_worker(rank, device_type, case, endpoint):
     "case",
     ["missing_manifest", "missing_rng", "same_output", "different_output", "offline_missing", "omni_mode_mismatch"],
 )
-def test_source_completeness_is_coordinated_across_optimizer_owners(case):
+def test_source_completeness_is_coordinated_across_ranks(case):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
     spawn_with_rendezvous(_source_completeness_worker, args=("cpu", case), nprocs=2)
