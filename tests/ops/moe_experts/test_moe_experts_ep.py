@@ -747,4 +747,38 @@ def test_distributed_standard_ep_dispatch_matches_nonep(merged, activation, impl
     _skip_if_unsupported()
     if runner_device_count() < _EP_DISPATCH_PLAN.nproc:
         pytest.skip("Distributed EP dispatch requires its declared accelerator plan")
-    spawn_with_rendezvous(_distributed_standard_ep_worker, args=(merged, activation), nprocs=_EP_DISPATCH_PLAN.nproc)
+    spawn_with_rendezvous(
+        _distributed_standard_ep_worker, args=(merged, activation, impl), nprocs=_EP_DISPATCH_PLAN.nproc
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_the_spawned_ep_worker_is_called_with_all_of_its_arguments():
+    """The spawn call must supply every worker parameter but `rank` and `endpoint`.
+
+    `spawn_with_rendezvous` binds `rank` first and appends `endpoint`, so the explicit
+    `args` tuple has to cover everything between. Giving the worker a new parameter
+    without widening that tuple produces a `TypeError` inside a spawned process on a
+    GPU box -- two cards burnt to learn what a signature comparison shows on CPU. It
+    happened once already, when the `impl` axis was added.
+    """
+    import ast
+    import inspect
+
+    parameters = list(inspect.signature(_distributed_standard_ep_worker).parameters)
+    assert parameters[0] == "rank"
+    assert parameters[-1] == "endpoint"
+
+    tree = ast.parse(inspect.getsource(test_distributed_standard_ep_dispatch_matches_nonep))
+    call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and "spawn_with_rendezvous" in ast.unparse(node.func)
+    )
+    explicit = next(keyword.value for keyword in call.keywords if keyword.arg == "args")
+    supplied = 1 + len(explicit.elts) + 1
+
+    assert supplied == len(parameters), (
+        f"spawn passes {supplied} arguments to a worker that takes {len(parameters)}: {parameters}. "
+        f"`args` covers everything between `rank` and `endpoint`."
+    )

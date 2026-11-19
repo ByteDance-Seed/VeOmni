@@ -34,11 +34,20 @@ approximation, and they differ by far more than rounding. Mapping either onto a
 restated formula would change a model's outputs and gradients against the function
 it trained with.
 
-The derivative is deliberately absent. Every row is an opaque ``wrapper`` now, so
-autograd differentiates whatever the row computes and there is no hand-written
-backward to keep in sync -- which is also what keeps activation offload and
-``torch.compile(fullgraph=True)`` working (``torch.func.vjp`` refuses to run inside
-``saved_tensors_hooks``).
+The derivative is deliberately absent for the served names. Every row is an opaque
+``wrapper``, so autograd differentiates whatever the row computes and there is no
+hand-written backward to keep in sync -- which is also what keeps activation offload
+and ``torch.compile(fullgraph=True)`` working (``torch.func.vjp`` refuses to run
+inside ``saved_tensors_hooks``).
+
+A name outside the set is a different story. ``moe_experts`` owns hand-written
+``autograd.Function``s, so such a name needs :func:`apply_activation_backward` from
+:mod:`veomni.ops.kernels.moe_experts.shared.activation`, and the only way to
+differentiate an arbitrary transformers callable there is a fresh
+``requires_grad_(True)`` leaf under ``enable_grad``. Dynamo rejects that flip, so
+**a name outside :data:`SUPPORTED_ACTIVATIONS` runs but does not compile under
+``fullgraph=True``**. The four served names use ATen backward ops and do compile.
+No model in this repository configures a name outside the set.
 
 A Triton elementwise kernel was considered and rejected. The activation sits
 between GEMMs whose operands are already quantized through TileLang, so it is a

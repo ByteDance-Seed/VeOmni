@@ -2078,3 +2078,71 @@ def test_expert_sharding_is_read_without_assuming_the_axis_is_named_ep():
         assert not eager._experts_are_sharded()
     with with_sizes({}):
         assert not eager._experts_are_sharded()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh"])
+def test_a_served_activation_differentiates_under_fullgraph_compile(activation):
+    """The four served names compile; that is part of why they are the served set.
+
+    `activation_backward` routes them through ATen backward ops, and a row built on it
+    stays traceable under `torch.compile(fullgraph=True)`. A name outside the set has
+    to differentiate an arbitrary transformers callable through a fresh
+    `requires_grad_(True)` leaf, which Dynamo rejects -- a limit recorded in
+    `veomni/ops/activation.py` and `constraints.md` rather than worked around,
+    because no model here configures such a name.
+    """
+    import torch
+
+    from veomni.ops.kernels.moe_experts.shared.activation import activation_backward
+
+    class _Row(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, hidden, name):
+            from veomni.ops.activation import resolve
+
+            ctx.name = name
+            ctx.save_for_backward(hidden)
+            return resolve(name)(hidden)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            (hidden,) = ctx.saved_tensors
+            return activation_backward(grad_output, hidden, ctx.name), None
+
+    hidden = torch.randn(64, dtype=torch.bfloat16, requires_grad=True)
+    compiled = torch.compile(_Row.apply, fullgraph=True, backend="eager")
+    compiled(hidden, activation).sum().backward()
+    assert hidden.grad is not None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_an_unserved_activation_is_the_documented_compile_limit():
+    """The limit is real and pinned, so it is not mistaken for a regression later.
+
+    If a future change makes these compile too, this test fails and the documentation
+    in `activation.py` / `constraints.md` should be updated to match -- which is a
+    better outcome than silently having prose that no longer describes the code.
+    """
+    import torch
+
+    from veomni.ops.kernels.moe_experts.shared.activation import activation_backward
+
+    class _Row(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, hidden, name):
+            from veomni.ops.activation import resolve
+
+            ctx.name = name
+            ctx.save_for_backward(hidden)
+            return resolve(name)(hidden)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            (hidden,) = ctx.saved_tensors
+            return activation_backward(grad_output, hidden, ctx.name), None
+
+    hidden = torch.randn(64, dtype=torch.bfloat16, requires_grad=True)
+    compiled = torch.compile(_Row.apply, fullgraph=True, backend="eager")
+    with pytest.raises(Exception, match="requires_grad_|Unsupported"):
+        compiled(hidden, "relu").sum().backward()

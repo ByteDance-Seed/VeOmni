@@ -96,8 +96,12 @@ def merged_experts_act_fn_forward(
         from .....distributed.moe import dispatch_to_ep_class
         from .....distributed.parallel_state import get_parallel_state
 
-        state = get_parallel_state()
-        if not state.ep_enabled or local_experts != num_experts // state.ep_size:
+        # ``ep_enabled`` indexes ``extra_parallel_sizes["ep"]`` unconditionally, and
+        # that dict is built from ``extra_parallel_names`` -- a state initialized with
+        # another axis has no such key. Read it directly, as ``eager`` does.
+        sizes = getattr(get_parallel_state(), "extra_parallel_sizes", None) or {}
+        ep_size = sizes.get("ep", 1)
+        if ep_size <= 1 or local_experts != num_experts // ep_size:
             raise ValueError(
                 "the non-SiLU expert fallback received expert-parallel sharded weights "
                 f"(local {local_experts} vs global {num_experts}). Enable expert "

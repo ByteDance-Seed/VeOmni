@@ -136,4 +136,8 @@ def wrapper(
         y = F.linear(_expert_activation(gate, activation) * up, fc2_weight[idx])
         y = y * routing_weights[token_idx, top_k_pos, None]
         output = output.index_add(0, token_idx, y.to(output.dtype))
-    return output
+    # A rank that routed no tokens still has to keep the block on the graph, or its
+    # backward never runs and the collective in it is skipped on one rank only. The
+    # shared loop guards this the same way; this branch is what routes a served
+    # activation here, so it needs the guard too.
+    return output + hidden_states * 0
