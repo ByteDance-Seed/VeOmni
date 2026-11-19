@@ -14,8 +14,9 @@
 
 """``deepseek_v4`` ``cann`` indexer and sparse attention.
 
-CANN call layout is checked on any host. The indexer is compared with eager on Ascend.
-Sparse FlashMLA numerical parity is not; see the FIXME on
+CANN call layout is checked on any host, so those cases ask for no accelerator.
+The indexer is compared with eager on Ascend. Sparse FlashMLA has a parity case
+there too, currently expected to fail; see the note above
 ``test_sparse_flash_mla_rejects_selections_the_operator_cannot_take``.
 """
 
@@ -29,6 +30,7 @@ import pytest
 import torch
 from torch import Tensor
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.transformers.deepseek_v4.packed_utils import (
     build_packed_compression_metadata,
     packed_compressed_causal_ranges,
@@ -43,6 +45,11 @@ from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
 
 
 _HEADS, _DIM, _RATE = 4, 16, 4
+
+# Only the parity cases below execute kernels; every other case records the
+# arguments an adapter hands its kernel, which is host work. Without this marker
+# each of them would reserve an accelerator card per runner.
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class _FakeOps:
@@ -325,6 +332,28 @@ def test_context_parallel_rejects_ranges_from_another_shard(fake_ops: _FakeOps, 
     assert fake_ops.indexer_calls == []
 
 
+def test_context_parallel_rejects_range_tables_of_the_wrong_width(fake_ops: _FakeOps, monkeypatch: pytest.MonkeyPatch):
+    # A zero-row table compares equal to nothing, and ``.all()`` over an empty
+    # comparison reports agreement, so the values alone cannot screen it out.
+    _install_context_parallel(monkeypatch, cp_rank=1, cp_size=4)
+    q, k, weights = _bshd_inputs(batch=1, seq_len=4, compressed_len=4)
+    _, ends = _causal_ranges(4, 4)
+    empty = ends.unsqueeze(0)[0:0]
+    assert empty.shape == (0, 4)
+
+    with pytest.raises(ValueError, match="one cu_seqlen_ks per local query"):
+        cann_indexer.wrapper(
+            q.transpose(0, 1),
+            k.transpose(0, 1),
+            weights.transpose(0, 1),
+            _RATE,
+            4,
+            cu_seqlen_ks=empty,
+            cu_seqlen_ke=empty,
+        )
+    assert fake_ops.indexer_calls == []
+
+
 def test_ulysses_explicit_ranges_stay_unsupported(fake_ops: _FakeOps, monkeypatch: pytest.MonkeyPatch):
     # Ulysses also passes global ranges without slices, but it partitions the
     # full-sequence queries instead of handing over contiguous ``cp_rank * L``
@@ -452,6 +481,7 @@ def _assert_same_selection(actual: tuple[Tensor, Tensor], expected: tuple[Tensor
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
 @pytest.mark.skipif(
     not IS_NPU_AVAILABLE or importlib.util.find_spec("cann_ops_transformer") is None,
     reason="CANN Lightning Indexer requires Ascend NPU and cann_ops_transformer",
@@ -482,6 +512,7 @@ def test_cann_matches_eager(segment_lengths: tuple[int, ...]):
     _assert_same_selection(actual, expected)
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
 @pytest.mark.skipif(
     not IS_NPU_AVAILABLE or importlib.util.find_spec("cann_ops_transformer") is None,
     reason="CANN Lightning Indexer requires Ascend NPU and cann_ops_transformer",
@@ -872,12 +903,58 @@ def test_attention_packed_context_parallel_keeps_the_gather_in_the_backward_grap
     assert torch.count_nonzero(cmp_kv.grad) == 0
 
 
-# FIXME: compare ``sparse_flash_mla`` / ``sparse_flash_mla_grad`` with eager on Ascend.
-# On CANN 9.1.0 (causal CSA, seq 300, heads 2, dim 512, topk 16, bf16, fp32 sink)
-# the forward keeps the eager direction (cosine 0.99995) but scales some rows down
-# to about 0.77, past the attention tolerance. The backward ``q`` gradient matches
-# eager on the early rows and is NaN after that. A wider tolerance does not make
-# that gradient finite. Left out until the ``cann_ops_transformer`` kernel is fixed.
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+@pytest.mark.skipif(
+    not IS_NPU_AVAILABLE or importlib.util.find_spec("cann_ops_transformer") is None,
+    reason="CANN Sparse FlashMLA requires Ascend NPU and cann_ops_transformer",
+)
+@pytest.mark.xfail(strict=True, reason="CANN 9.1.0 returns a nonfinite query gradient; see the note below")
+def test_sparse_flash_mla_matches_eager_on_ascend():
+    """Compare the real kernel's forward and every input gradient with eager.
+
+    Most queries are past their first window here, so the compressed table has
+    visible rows and the call takes the index path rather than a fallback. The
+    marker is strict: a kernel that starts agreeing fails this case until the
+    marker is removed, instead of leaving a stale expected failure behind.
+    """
+    torch.manual_seed(5)
+    device = get_device_type()
+    seq_len, topk = 300, 16
+    compressed_len = seq_len // _RATE
+    q = torch.randn(1, seq_len, _ATTN_HEADS, _ATTN_DIM, device=device).to(torch.bfloat16).requires_grad_()
+    ori_kv = torch.randn(1, seq_len, _ATTN_DIM, device=device).to(torch.bfloat16).requires_grad_()
+    cmp_kv = torch.randn(1, compressed_len, _ATTN_DIM, device=device).to(torch.bfloat16).requires_grad_()
+    sink = (torch.randn(_ATTN_HEADS, device=device) * 0.5).requires_grad_()
+    position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+
+    # Compressed row ``j`` closes at token ``4j + 3``, so query ``i`` sees the rows
+    # below ``(i + 1) // 4``; the newest ``topk`` of them keep the K axis in range.
+    ends = (torch.arange(seq_len, device=device) + 1) // _RATE
+    starts = (ends - topk).clamp(min=0)
+    columns = torch.arange(topk, device=device)
+    selected = torch.where(columns[None, :] < (ends - starts)[:, None], columns[None, :] + starts[:, None], -1)
+    candidates = CompressedCandidates(topk_indices=selected.unsqueeze(0).to(torch.int32))
+    operands = (q, ori_kv, cmp_kv, sink, position_ids)
+    kwargs = {"sliding_window": _WINDOW, "compress_ratio": _RATE, "candidates": candidates}
+
+    expected = resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper(*operands, **kwargs)
+    actual = resolve_op("dsa_attention", "deepseek_v4", "cann").wrapper(*operands, **kwargs)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+    rows = torch.randn_like(expected)
+    inputs = (q, ori_kv, cmp_kv, sink)
+    expected_grads = torch.autograd.grad(expected, inputs, rows, allow_unused=True)
+    actual_grads = torch.autograd.grad(actual, inputs, rows, allow_unused=True)
+    for name, expected_grad, actual_grad in zip(("q", "ori_kv", "cmp_kv", "sink"), expected_grads, actual_grads):
+        assert actual_grad is not None and torch.isfinite(actual_grad).all(), f"{name} gradient is not finite"
+        torch.testing.assert_close(actual_grad.float(), expected_grad.float(), atol=2e-2, rtol=2e-2)
+
+
+# The parity case above is an expected failure rather than a loose tolerance: on
+# CANN 9.1.0 (causal CSA, seq 300, heads 2, dim 512, topk 16, bf16, fp32 sink) the
+# forward keeps the eager direction (cosine 0.99995) but scales some rows down to
+# about 0.77, and the ``q`` gradient matches eager on the early rows and is NaN
+# after that. No tolerance makes a nonfinite gradient equal.
 @pytest.mark.parametrize(
     ("index_topk", "cmp_ratio", "match"),
     [

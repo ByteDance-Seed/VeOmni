@@ -30,7 +30,7 @@ communication than necessary to get it.
 | Contiguous sharding, `cp_size` in {2, 4} verified | Zigzag / load-balanced sharding |
 | All-gather for full-resolution KV, compressed rows and compressor halos | P2P halos; multi-hop halos |
 | DeepSeek-V4 only, via an allow-list | Any other model |
-| GPU and Ascend/NPU, with the eager or CANN DSA operators | Device-measured CANN parity under CP |
+| GPU; Ascend/NPU with the eager or CANN DSA operators | Device-measured CANN parity under CP |
 | `cp_size > 1` with `ulysses_size == 1` | Hybrid CP x Ulysses |
 | Training | KV cache and decode paths |
 | Correctness | Measured performance; `cp_size=8` |
@@ -153,8 +153,9 @@ The rest of the NPU selections are CP-safe and stay on their kernels:
 `moe_implementation: fused_npu` / `cross_entropy_loss_implementation:
 chunk_loss` are unaffected. There is no separate CP configuration: a CP run is
 [`configs/text/deepseek_v4_npu.yaml`](../../configs/text/deepseek_v4_npu.yaml)
-with `cp_size` set above 1 and `ulysses_size` left at 1. The selections ship as
-the eager operators there; `cann` is a drop-in alternative for both DSA fields.
+with `cp_size` set above 1 and `ulysses_size` left at 1. That config ships with
+`dsa_indexer_implementation: cann` and `dsa_attention_implementation: cann`;
+override both to `eager` to reproduce the eager baseline.
 
 The gate validates that selection pair and nothing else: it cannot check that
 either kernel is numerically correct on Ascend, and
@@ -174,8 +175,11 @@ device; the four-rank and packed-model branches stay CUDA-only. The CANN
 adapters' CP geometry — the prefix narrowing, the per-sample rebasing and the
 eager fallbacks — is checked on any host by
 `tests/ops/dsa/test_dsa_deepseek_v4_cann.py`, which records the arguments the
-adapters hand their kernels. Neither kernel's numerical parity on Ascend nor a
-CP training run with them is covered.
+adapters hand their kernels. On Ascend the same file compares the real CANN
+indexer against eager selection, causally and on both packed CP shards. The CANN
+attention kernel's numbers stay uncovered: its parity case is marked an expected
+failure until a CANN release returns a finite query gradient, and no CP training
+run uses the CANN pair.
 
 ## Decisions that took more than one attempt
 

@@ -237,6 +237,15 @@ def _select_context_parallel(
     """
     batch, seq_len, num_heads, head_dim = q.shape
     prefix_len = (query_offset + seq_len) // compress_ratio
+    # A range table of the wrong width would be compared under broadcasting: a
+    # zero-row shard of it compares equal to nothing and ``.all()`` then reports
+    # agreement, while a batch axis would compare every query with row 0.
+    for name, ranges in (("cu_seqlen_ks", cu_seqlen_ks), ("cu_seqlen_ke", cu_seqlen_ke)):
+        if ranges.numel() != seq_len or ranges.shape[-1] != seq_len:
+            raise ValueError(
+                f"dsa_indexer deepseek_v4 cann under context parallelism needs one {name} per local "
+                f"query row; got shape {tuple(ranges.shape)} for seq_len={seq_len}"
+            )
     # The kernel never receives these ranges: it re-derives visibility from the
     # geometry, so a caller whose ranges disagree would be masked canonically
     # instead of refused. Every call therefore compares them with the ends the
