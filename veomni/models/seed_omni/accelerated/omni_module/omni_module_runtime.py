@@ -644,11 +644,12 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         if not any(p.requires_grad for p in self.model.parameters()):
             logger.info_rank0(f"ModuleRuntime[{self.module_name}]: fully frozen — skipping DCP/HF checkpoint.")
-            if getattr(self.omni_module, "rng_state_dict", None) is not None:
+            if any(
+                getattr(self.omni_module, hook, None) is not None for hook in ("extra_state_dict", "rng_state_dict")
+            ):
                 logger.warning_rank0(
-                    f"ModuleRuntime[{self.module_name}]: the module keeps its own sampling stream "
-                    "(rng_state_dict), but a fully frozen module has no checkpoint manager, so the stream is "
-                    "never saved and a resumed run restarts it. Keep such a stream on a trainable module."
+                    f"ModuleRuntime[{self.module_name}]: the fully frozen module contributes extra checkpoint state, "
+                    "but has no checkpoint manager, so that state is not saved. Keep it on a trainable module."
                 )
             self._has_trainable_parameters = False
             self.checkpoint = None
@@ -661,25 +662,41 @@ class ModuleRuntime(VeOmniModelRuntime):
             self.checkpoint.load()
 
     def extra_state(self) -> dict[str, Any]:
-        """This module's own sampling stream, for a module that draws from one.
+        """Return optional module-owned checkpoint state under a private namespace.
 
-        The trainer checkpoints the global RNGs; a module that keeps a private
-        generator (the Cosmos3 flow connector's sigma / noise stream) exposes it
-        as ``rng_state_dict`` / ``load_rng_state_dict``, the same pair a DiT
-        condition model does. Saved per rank beside this module's weights, by
-        this module's checkpoint manager: a fully frozen module has none (see
-        :meth:`build_checkpoint`), so its stream is never written.
+        ``extra_state_dict`` / ``load_extra_state_dict`` are the generic hooks.
+        The RNG pair remains a compatibility path for existing modules.
         """
+        save = getattr(self.omni_module, "extra_state_dict", None)
+        if save is not None:
+            if getattr(self.omni_module, "load_extra_state_dict", None) is None:
+                logger.warning_rank0(
+                    f"ModuleRuntime[{self.module_name}]: extra_state_dict is defined without "
+                    "load_extra_state_dict; saved state cannot be restored."
+                )
+            return {"module_extra_state": save()}
         rng_state_dict = getattr(self.omni_module, "rng_state_dict", None)
         return {} if rng_state_dict is None else {"module_rng_state": rng_state_dict()}
 
     def load_extra_state(self, extra_state: dict[str, Any]) -> None:
+        state = extra_state.get("module_extra_state")
+        load = getattr(self.omni_module, "load_extra_state_dict", None)
+        if state is not None and load is not None:
+            with self._scoped():
+                load(state)
+            return
         rng_state = extra_state.get("module_rng_state")
         if rng_state is None:
             return
-        # Scoped: a generator seeded on first use reads this module's dp rank.
+        load_rng = getattr(self.omni_module, "load_rng_state_dict", None)
+        if load_rng is None:
+            logger.warning_rank0(
+                f"ModuleRuntime[{self.module_name}]: checkpoint carries module RNG state, "
+                "but the module has no load_rng_state_dict hook; state was not restored."
+            )
+            return
         with self._scoped():
-            self.omni_module.load_rng_state_dict(rng_state)
+            load_rng(rng_state)
 
     def save_dcp(self, state: "TrainerState") -> None:
         """Write this module's distributed checkpoint (train resume)."""

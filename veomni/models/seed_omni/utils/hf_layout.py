@@ -79,6 +79,7 @@ if TYPE_CHECKING:
 logger = helper.create_logger(__name__)
 
 OMNI_HF_LAYOUT_REGISTRY = Registry("OmniHFLayout")
+OMNI_HF_LAYOUT_DETECTORS = Registry("OmniHFLayoutDetector")
 
 HF_SOURCE_FILE = "hf_source.json"
 """Sidecar in a weight-free view root naming the HF checkpoint its weights come from."""
@@ -353,10 +354,15 @@ class OmniHFLayout:
         return read_source_weight_files(source_path)
 
     def validate_module_state(self, source_path: str, name: str, model: torch.nn.Module) -> None:
-        """Optional source-specific key/shape checks on the bare module before parallel wrapping."""
+        """Validate a module against source weights before parallel wrapping.
+
+        The default is a no-op. A family layout may override this for source
+        formats whose key/shape contract cannot be expressed by prefixes alone.
+        Called after module construction and before source weights are loaded.
+        """
 
     def resolve_source_path(self, source_path: str) -> str:
-        """Canonical source root used for configs, assets, weights, and exports."""
+        """Return the canonical source root used for configs, assets, and exports."""
         return source_path
 
     def resolve_weights_path(self, source_path: str) -> str:
@@ -453,12 +459,14 @@ def _read_root_model_type(path: str) -> str | None:
         with open(config_path, encoding="utf-8") as f:
             model_type = json.load(f).get("model_type")
     if model_type in (None, "qwen3_vl_text"):
-        # Older Cosmos snapshots lack a root config; older conversion commands
-        # also name the transformer component instead of the release root.
-        from ..modules.cosmos3.hf_layout import is_cosmos3_component_tree
+        # Families with multi-directory releases register a detector next to
+        # their layout. The generic layer must not import one concrete family.
+        import veomni.models.seed_omni.modules  # noqa: F401
 
-        if is_cosmos3_component_tree(path):
-            return "cosmos3_omni"
+        for name in OMNI_HF_LAYOUT_DETECTORS.valid_keys():
+            detected = OMNI_HF_LAYOUT_DETECTORS[name](path)
+            if detected is not None:
+                return detected
     return model_type
 
 
@@ -976,6 +984,7 @@ __all__ = [
     "copy_source_non_weight_files",
     "get_hf_layout",
     "has_hf_layout",
+    "OMNI_HF_LAYOUT_DETECTORS",
     "load_module_from_hf_source",
     "read_hf_source",
     "resolve_omni_checkpoint_root",

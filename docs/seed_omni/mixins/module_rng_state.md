@@ -26,6 +26,14 @@ on the draws of the first steps again.
 
 ```python
 class MyConnector(PretrainedOmniModule):
+    # Generic hooks for arbitrary module-owned state:
+    def extra_state_dict(self) -> dict[str, object]:
+        return {"generator": self._generator.get_state()}
+
+    def load_extra_state_dict(self, state: dict[str, object]) -> None:
+        self._generator.set_state(state["generator"])
+
+    # Existing RNG-only modules may keep this compatibility pair instead.
     def rng_state_dict(self) -> dict[str, torch.Tensor]:
         return {"generator": self._generator.get_state()}
 
@@ -33,10 +41,10 @@ class MyConnector(PretrainedOmniModule):
         self._generator.set_state(state["generator"])
 ```
 
-- `ModuleRuntime.extra_state()` returns an arbitrary module-owned dict. For this
-  RNG protocol it contributes `{"module_rng_state": module.rng_state_dict()}`;
-  another module-owned state must use its own key rather than colliding with
-  `module_rng_state`.
+- `ModuleRuntime.extra_state()` returns an arbitrary module-owned dict under
+  `module_extra_state` when the module implements the generic
+  `extra_state_dict` hook. Existing RNG-only modules use the compatibility
+  `module_rng_state` key; another module-owned state must use its own key.
 - The runtime reserves `lr_scheduler` in the same outer dict. Module-owned state
   stays in its own namespace; separate modules cannot collide because each
   module has its own per-rank `extra_state` file under `model/<module>/`.

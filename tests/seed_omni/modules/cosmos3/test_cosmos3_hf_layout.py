@@ -16,6 +16,7 @@ from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.cosmos3.hf_layout import FLOW, MOT, TEXT, VAE
 from veomni.models.seed_omni.utils.convert_registry import convert_checkpoint
 from veomni.models.seed_omni.utils.hf_layout import (
+    OMNI_HF_LAYOUT_DETECTORS,
     read_hf_source,
     resolve_omni_checkpoint_root,
     save_hf_source_checkpoint,
@@ -166,6 +167,10 @@ def test_recipe_resolves_direct_checkpoint(task, tmp_path):
     runtime = build_omni_model_runtime_args(args)
     assert read_hf_source(runtime.seed_omni_model_path).model_type == "cosmos3_omni"
     assert set(runtime.modules) == ({VAE} if vae_only else {TEXT, MOT, VAE, FLOW})
+
+
+def test_cosmos3_detection_is_registered_not_hardcoded():
+    assert "cosmos3_omni" in OMNI_HF_LAYOUT_DETECTORS.valid_keys()
 
 
 def test_plain_qwen_text_is_not_a_cosmos3_release(tmp_path):

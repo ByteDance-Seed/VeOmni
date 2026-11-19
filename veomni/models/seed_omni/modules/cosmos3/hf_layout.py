@@ -18,7 +18,13 @@ from pathlib import Path
 from safetensors import safe_open
 from transformers import PretrainedConfig
 
-from ...utils.hf_layout import OMNI_HF_LAYOUT_REGISTRY, OmniHFLayout, OmniHFModuleLayout, copy_source_non_weight_files
+from ...utils.hf_layout import (
+    OMNI_HF_LAYOUT_DETECTORS,
+    OMNI_HF_LAYOUT_REGISTRY,
+    OmniHFLayout,
+    OmniHFModuleLayout,
+    copy_source_non_weight_files,
+)
 from .flow_connector.configuration import Cosmos3FlowConnectorConfig
 from .mot.configuration import Cosmos3MotConfig
 from .text_encoder.configuration import Cosmos3TextEncoderConfig
@@ -294,3 +300,8 @@ COSMOS3_HF_LAYOUT = Cosmos3HFLayout(
 @OMNI_HF_LAYOUT_REGISTRY.register("cosmos3_omni")
 def _register_cosmos3_hf_layout():
     return COSMOS3_HF_LAYOUT
+
+
+@OMNI_HF_LAYOUT_DETECTORS.register("cosmos3_omni")
+def _detect_cosmos3_hf_layout(path: str) -> str | None:
+    return "cosmos3_omni" if is_cosmos3_component_tree(path) else None
