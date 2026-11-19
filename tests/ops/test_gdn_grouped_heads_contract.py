@@ -70,6 +70,7 @@ class _RecordingGdnOp:
         *,
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
+        chunk_indices: object = None,
     ):
         self._calls.append(
             {
@@ -131,7 +132,7 @@ def _build_layer(model_name: str, impl: str, calls: list[dict[str, object]]):
 
 
 @pytest.mark.parametrize("model_name", ["qwen3_5", "qwen3_5_moe", "qwen4_exp"])
-@pytest.mark.parametrize("impl", ["flash_qla", "fla", "eager"])
+@pytest.mark.parametrize("impl", ["flash_qla", "fla_npu", "fla", "eager"])
 @pytest.mark.parametrize("packed", [True, False])
 @pytest.mark.parametrize("ulysses", [False, True])
 def test_gdn_grouped_heads_dispatch_contract(
@@ -141,6 +142,13 @@ def test_gdn_grouped_heads_dispatch_contract(
     packed: bool,
     ulysses: bool,
 ):
+    """Assert which q/k head count each backend is handed.
+
+    The kernel handles are stubbed on purpose: this covers the modeling-side
+    dispatch decision, so running on CPU says nothing about whether a backend
+    can resolve there. ``fla_npu`` is a real NPU pairing for Qwen3.5 as well;
+    only the Qwen4-Exp config keeps q/k grouped for it today.
+    """
     if ulysses and not packed:
         pytest.skip("Ulysses sequence parallelism uses packed cu_seq_lens_q")
     if ulysses and model_name == "qwen4_exp" and impl == "eager":
@@ -237,7 +245,8 @@ def test_gdn_grouped_heads_dispatch_contract(
     assert len(calls) == expected_calls
     local_k_heads = 2 if ulysses else 4
     local_v_heads = 8 if ulysses else 16
-    expected_qk_heads = local_k_heads if impl == "flash_qla" else local_v_heads
+    grouped_qk = impl == "flash_qla" or (impl == "fla_npu" and model_name == "qwen4_exp")
+    expected_qk_heads = local_k_heads if grouped_qk else local_v_heads
 
     for call in calls:
         expected_seq_len = 3 if expected_calls == 2 else 6

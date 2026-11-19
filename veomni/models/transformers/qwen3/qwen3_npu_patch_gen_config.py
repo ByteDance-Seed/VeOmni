@@ -71,12 +71,12 @@ config.override_method(
 config.override_method(
     "Qwen3MLP.__init__",
     replacement=qwen3_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 config.override_method(
     "Qwen3MLP.forward",
     replacement=qwen3_mlp_forward_patched,
-    description="Always call the local swiglu_mlp VeomniOp",
+    description="Always call the local gated_mlp VeomniOp",
 )
 config.override_method(
     "Qwen3DecoderLayer.__init__",
@@ -96,12 +96,12 @@ config.override_method(
 config.override_method(
     "Qwen3Attention.__init__",
     replacement=qwen3_attention_init_patched,
-    description="Construct local rope and attention VeomniOps",
+    description="Construct local rope, attention and linear VeomniOps",
 )
 config.override_method(
     "Qwen3Attention.forward",
     replacement=qwen3_attention_forward_patched,
-    description="Always call the local rope and attention VeomniOps",
+    description="Always call the local rope, attention and linear VeomniOps",
 )
 config.override_method(
     "Qwen3ForCausalLM.__init__",

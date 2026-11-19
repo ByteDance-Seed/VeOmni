@@ -187,16 +187,12 @@ def _samples() -> list[list[ConversationItem]]:
     # runs must see the *same* batch for their losses and gradients to be comparable.
     torch.manual_seed(1234)
     video_metadata = VideoMetadata(fps=2.0, total_num_frames=4, frames_indices=list(range(4)), requested_fps=2.0)
+    # The video turn comes before the image turn on purpose. A multimodal batch has
+    # to all-gather each producer's shards before interleaving, and the vision
+    # tower runs images then videos regardless of carrier order, so a carrier that
+    # lists video first is exactly where "gather in carrier order" would reassemble
+    # the two producers' windows from the wrong offsets.
     samples: list[list[ConversationItem]] = [
-        [
-            ConversationItem(type="text", value="hi", role="user"),
-            ConversationItem(
-                type="image",
-                value=torch.randint(0, 255, (3, 32, 32), dtype=torch.uint8),
-                role="user",
-            ),
-            ConversationItem(type="text", value="ok", role="assistant"),
-        ],
         [
             ConversationItem(type="text", value="hello there", role="user"),
             ConversationItem(
@@ -206,6 +202,15 @@ def _samples() -> list[list[ConversationItem]]:
                 meta={VIDEO_METADATA_KEY: video_metadata},
             ),
             ConversationItem(type="text", value="sure", role="assistant"),
+        ],
+        [
+            ConversationItem(type="text", value="hi", role="user"),
+            ConversationItem(
+                type="image",
+                value=torch.randint(0, 255, (3, 32, 32), dtype=torch.uint8),
+                role="user",
+            ),
+            ConversationItem(type="text", value="ok", role="assistant"),
         ],
         [
             ConversationItem(type="text", value="just text", role="user"),
@@ -294,20 +299,24 @@ def _graph_loss(
     regression in the parallelism guards looks like. Every module that slices
     imports the helper by name, so the counter wraps each of those bindings.
     """
-    calls = {"slice": 0, "pad": 0}
+    calls = {"slice": 0, "pad": 0, "post_gather": 0, "interleave_gather": 0}
     restores = []
     if count_sp:
+        from veomni.models.seed_omni.modules.base import sp_shard
         from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated import accelerated as llm_acc
         from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated import packed as llm_packed
         from veomni.models.seed_omni.modules.qwen3vl.text_encoder.accelerated import packed as te_packed
+        from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated import accelerated as vision_acc
         from veomni.models.seed_omni.modules.qwen3vl.vision.accelerated import packed as vision_packed
+        from veomni.models.seed_omni.modules.text_encoder.accelerated import accelerated as base_te_acc
 
-        targets = [llm_acc, llm_packed, te_packed, vision_packed]
+        targets = [llm_acc, llm_packed, te_packed, vision_acc, vision_packed, base_te_acc]
         for module in targets:
             for attr, key in (
                 ("slice_input_tensor", "slice"),
                 ("sp_pad", "pad"),
                 ("sp_pad_and_slice", "pad"),
+                ("gather_outputs", "post_gather"),
             ):
                 original = getattr(module, attr, None)
                 if original is None:
@@ -319,6 +328,15 @@ def _graph_loss(
 
                 restores.append((module, attr, original))
                 setattr(module, attr, wrapper)
+
+        orig_interleave_gather = sp_shard.gather_outputs
+
+        def _wrap_interleave_gather(*args, **kwargs):
+            calls["interleave_gather"] += 1
+            return orig_interleave_gather(*args, **kwargs)
+
+        restores.append((sp_shard, "gather_outputs", orig_interleave_gather))
+        sp_shard.gather_outputs = _wrap_interleave_gather
 
     try:
         model = _omni(modules, edges)
@@ -439,16 +457,21 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str, device_type: str) -> No
             ("conversation", _CONVERSATION_EDGES, _conversation_batch),
             ("packed", _PACKED_EDGES, _packed_batch),
         ):
-            for sp_size in (1, 2):
+            for sp_size, skip_gather, suffix in (
+                (1, False, "sp1"),
+                (2, False, "sp2"),
+                *([(2, True, "sp2_skip_gather")] if name == "conversation" else []),
+            ):
                 ps = _init_parallel_state(
                     dp_size=world if sp_size == 1 else 1,
                     dp_shard_size=world if sp_size == 1 else 1,
                     ulysses_size=sp_size,
                     dp_mode="fsdp2",
                     device_type=device_type,
-                    name=f"{name}_sp{sp_size}",
+                    skip_sp_gather_between_modules=skip_gather,
+                    name=f"{name}_{suffix}",
                 )
-                with use_parallel_state(f"{name}_sp{sp_size}"):
+                with use_parallel_state(f"{name}_{suffix}"):
                     modules = _build_modules(attn_implementation=attn, device=device, dtype=dtype)
                     # Shard on CPU too. FSDP2 is what reduces gradient across the
                     # group; without the wrap, SP=2 ranks each keep their own
@@ -465,8 +488,8 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str, device_type: str) -> No
                     # ranks are slices of one replicated batch.
                     batch = build_batch(samples)
                     loss, _, sp_calls = _graph_loss(modules, edges, batch, count_sp=True, backward=True)
-                    reports[f"{name}_sp{sp_size}"] = float(loss.detach().float())
-                    reports[f"{name}_sp{sp_size}_sp_calls"] = sp_calls
+                    reports[f"{name}_{suffix}"] = float(loss.detach().float())
+                    reports[f"{name}_{suffix}_sp_calls"] = sp_calls
                     # Compare *parameters after an optimizer step*, not pre-reduce
                     # gradients. Under FSDP2 the cross-rank reduction of `.grad`
                     # happens when the optimizer consumes it, so reading `param.grad`
@@ -477,7 +500,7 @@ def _sp_worker(rank: int, rendezvous: str, out_dir: str, device_type: str) -> No
                     # Every parameter, not a sample: two fingerprints per tensor
                     # catch both an offset and a scale difference, so a single
                     # divergent tensor cannot hide behind the ones not probed.
-                    reports[f"{name}_sp{sp_size}_param_probe"] = {
+                    reports[f"{name}_{suffix}_param_probe"] = {
                         f"{mod_name}.{param_name}": [
                             float(full.sum()),
                             float((full * full).sum()),
@@ -535,6 +558,30 @@ def test_sp_matches_single_rank_on_cpu(tmp_path: Path):
                 assert sq2 == pytest.approx(sq1, abs=1e-5), (rank, name, param_name, sq1, sq2)
 
         assert reports["conversation_sp1"] == pytest.approx(reports["packed_sp1"], abs=1e-5), (rank, reports)
+        assert reports["conversation_sp2_sp_calls"]["post_gather"] == 4, (rank, reports["conversation_sp2_sp_calls"])
+        assert reports["conversation_sp2_sp_calls"]["interleave_gather"] == 0, (
+            rank,
+            reports["conversation_sp2_sp_calls"],
+        )
+        assert reports["conversation_sp2_skip_gather_sp_calls"]["post_gather"] == 0, (
+            rank,
+            reports["conversation_sp2_skip_gather_sp_calls"],
+        )
+        assert reports["conversation_sp2_skip_gather_sp_calls"]["interleave_gather"] == 3, (
+            rank,
+            reports["conversation_sp2_skip_gather_sp_calls"],
+        )
+        assert reports["conversation_sp2_skip_gather"] == pytest.approx(reports["conversation_sp1"], abs=1e-5), (
+            rank,
+            reports,
+        )
+        probe_skip = reports["conversation_sp2_skip_gather_param_probe"]
+        probe_ref = reports["conversation_sp1_param_probe"]
+        assert probe_skip.keys() == probe_ref.keys()
+        for param_name, (sum1, sq1) in probe_ref.items():
+            sum2, sq2 = probe_skip[param_name]
+            assert sum2 == pytest.approx(sum1, abs=1e-5), (rank, param_name, sum1, sum2)
+            assert sq2 == pytest.approx(sq1, abs=1e-5), (rank, param_name, sq1, sq2)
 
 
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
@@ -557,6 +604,10 @@ def test_sp_matches_single_rank_on_accelerator(tmp_path: Path):
         assert reports
         for name in ("conversation", "packed"):
             assert reports[f"{name}_sp2"] == pytest.approx(reports[f"{name}_sp1"], rel=5e-3), (rank, name, reports)
+        assert reports["conversation_sp2_skip_gather"] == pytest.approx(reports["conversation_sp1"], rel=5e-3), (
+            rank,
+            reports,
+        )
         assert reports["conversation_sp1"] == pytest.approx(reports["packed_sp1"], rel=5e-3), (rank, reports)
 
 
@@ -616,3 +667,61 @@ def test_every_module_meters_its_own_tokens_on_both_graphs():
             at_raw = 6 * (block_n + patch_n) * raw / 1e12
             # Reported FLOPs must sit closer to the raw reading than the merged one.
             assert vision_flops > (at_merged + at_raw) / 2, (vision_flops, at_merged, at_raw)
+
+
+def _text_only_batch(n_samples: int) -> dict:
+    """``n_samples`` text-only conversations, so every sample gets a dummy image.
+
+    A text-only sample is a normal training shape in a VLM dataset, and it is the
+    one where the vision tower contributes nothing but its FSDP anchor.
+    """
+    template = Qwen3VLChatTemplate(_SmallTokenizer())
+    samples = [
+        [
+            ConversationItem(type="text", value="a", role="user"),
+            ConversationItem(type="text", value="b", role="assistant"),
+        ]
+        for _ in range(n_samples)
+    ]
+    return {"conversation_list": [template.tokenize_conversation(sample) for sample in samples]}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_vision_anchor_survives_a_zero_row_window():
+    """The FSDP dummy anchor has to reach the vision params from a rank holding none of it.
+
+    The dummy image placeholder is 4 merged tokens. At ``sp_size=2`` each rank's
+    window holds 2 of them, but at ``sp_size=3`` the third rank's window holds
+    **zero** (:func:`sp_valid_in_window`). A zero-row slice is ``NaN`` under
+    ``.mean()``, and ``0.0 * NaN`` is still ``NaN`` — so folding the anchor with
+    ``mean`` poisons the loss, while guarding it with ``numel() > 0`` drops the
+    vision tower from that rank's graph. FSDP2 has no unused-parameter pass, so a
+    rank that skipped the anchor never issues its reduce-scatter for the vision
+    parameters: the run hangs in ``backward`` instead of failing. ``.sum()`` is
+    ``0.0`` over no rows and keeps the ``grad_fn``, which is why both anchor sites
+    use it.
+    """
+    from veomni.models.seed_omni.modules.base.sp_shard import sp_valid_in_window
+    from veomni.models.seed_omni.modules.qwen3vl.llm.accelerated.accelerated import _fold_fsdp_dummy_anchors
+
+    # 4 merged dummy rows over 3 ranks: the last rank's window is empty.
+    dummy_rows = 4
+    assert [sp_valid_in_window(dummy_rows, rank, 3) for rank in range(3)] == [2, 2, 0]
+
+    vision = torch.nn.Linear(8, 8)
+    embeds = torch.zeros(1, 4, 8)
+
+    # A zero-row slice of a vision output: empty, but still carrying the ViT's graph.
+    empty = vision(torch.zeros(4, 8))[:0]
+    assert empty.numel() == 0
+    assert torch.isnan(empty.mean() * 0.0), "a zero-row mean must be the NaN this guards against"
+
+    item = ConversationItem(type="image", value=empty, role="user", is_dummy=True)
+    anchored = _fold_fsdp_dummy_anchors(embeds, [[item]])
+
+    # The anchor itself must stay finite and keep the ViT in this rank's graph.
+    assert torch.isfinite(anchored).all()
+    anchored.sum().backward()
+    assert vision.weight.grad is not None, "the dummy anchor must keep the vision params in the graph"
+    assert torch.isfinite(vision.weight.grad).all()
+    assert torch.equal(vision.weight.grad, torch.zeros_like(vision.weight.grad))

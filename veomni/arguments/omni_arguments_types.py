@@ -129,9 +129,19 @@ def _check_hf_source_exportable(model_path: str) -> None:
         weight_files = source.layout.source_weight_files(source.path)
     except FileNotFoundError as e:
         raise ValueError(
-            f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights: {e} "
+            f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs recognised weights: {e} "
             "Convert the checkpoint to safetensors, or disable save_hf_weights."
         ) from e
+    # Reading the source for *loading* accepts either serialization, but writing
+    # it back keys the output on safetensors headers (`source_tensor_specs`), so
+    # a pickle root has to be refused here rather than deep inside the writer.
+    non_safetensors = sorted({name for name in weight_files.values() if not name.endswith(".safetensors")})
+    if non_safetensors:
+        raise ValueError(
+            "`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights; "
+            f"this checkpoint stores {non_safetensors}. Convert the checkpoint to safetensors "
+            "(e.g. `model.save_pretrained(out, safe_serialization=True)`), or disable save_hf_weights."
+        )
     try:
         source_tensor_specs(source.path, weight_files)
     except ValueError as e:
@@ -333,11 +343,19 @@ def build_omni_module_runtime_args(
     )
 
     base_dict = _module_base(asdict(global_args))
+    # ``skip_sp_gather_between_modules`` is a property of the whole graph, not of
+    # one module: it says every module's ``post_forward`` hands its SP shard on
+    # instead of all-gathering. Enforcing the top-level value here means a
+    # per-module YAML entry cannot desynchronise the two sides of a handoff.
+    global_skip_sp_gather = bool(base_dict.get("accelerator", {}).get("skip_sp_gather_between_modules", False))
     runtime_modules: dict[str, OmniModuleRuntimeArguments] = {}
     for name, override in modules_overrides.items():
         merged = deepcopy(base_dict)
         for layer in (checkpoint_defaults.get(name, {}), inference_default, override or {}):
             _deep_update(merged, layer)
+        merged_acc = merged.setdefault("accelerator", {})
+        if isinstance(merged_acc, dict):
+            merged_acc["skip_sp_gather_between_modules"] = global_skip_sp_gather
         runtime_modules[name] = _instantiate_recursive(OmniModuleRuntimeArguments, merged)
     return runtime_modules
 

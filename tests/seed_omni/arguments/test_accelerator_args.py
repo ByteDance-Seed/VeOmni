@@ -79,6 +79,7 @@ def _fake_args(*, modules_override: dict | None = None, accelerator: Accelerator
 def test_accelerator_config_has_seed_omni_fields_with_expected_defaults():
     acc = AcceleratorConfig()
     assert acc.init_device == "meta"
+    assert acc.skip_sp_gather_between_modules is False
     assert isinstance(acc.gradient_checkpointing, GradientCheckpointingConfig)
     assert isinstance(acc.torch_compile, TorchCompileConfig)
     assert not hasattr(acc, "broadcast_model_weights_from_rank0")
@@ -448,3 +449,40 @@ def test_inference_ep_or_emb_with_default_eager_normalizes_to_extra_parallel_onl
         assert modules[name].accelerator.fsdp_config.extra_parallel_only is True
     assert modules["eager_mod"].needs_distributed_build is False
     assert modules["eager_mod"].accelerator.fsdp_config.fsdp_mode == "eager"
+
+
+def test_skip_sp_gather_between_modules_is_global_and_propagates_to_modules(monkeypatch):
+    """``skip_sp_gather_between_modules`` is a run-wide switch propagated to every module.
+
+    It describes the whole graph -- every ``post_forward`` either gathers or hands
+    its SP shard on -- so a per-module YAML entry cannot desynchronise the two
+    sides of a handoff; the top-level value wins.
+    """
+    from veomni.distributed import parallel_state
+    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state_from_config
+
+    class _DummyMesh:
+        def __getitem__(self, _key):
+            return self
+
+        def _flatten(self, **_kwargs):
+            return self
+
+    monkeypatch.setattr(parallel_state, "init_device_mesh", lambda *a, **kw: _DummyMesh())
+    args = _fake_args(
+        accelerator=AcceleratorConfig(skip_sp_gather_between_modules=True),
+        modules_override={
+            MODULE_A: {"accelerator": {"skip_sp_gather_between_modules": False}},
+        },
+    )
+    resolved = build_omni_model_runtime_args(args)
+    assert resolved.accelerator.skip_sp_gather_between_modules is True
+    for mod_args in resolved.modules.values():
+        assert mod_args.accelerator.skip_sp_gather_between_modules is True
+
+    clear_parallel_state()
+    try:
+        ps = init_parallel_state_from_config(resolved.accelerator, name="test_skip_sp_gather")
+        assert ps.skip_sp_gather_between_modules is True
+    finally:
+        clear_parallel_state()
