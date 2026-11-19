@@ -120,8 +120,11 @@ SM100+ devices:
 CUDA_VISIBLE_DEVICES=0,1 pytest tests/models/test_mxfp8_training.py -q
 ```
 
-The GPU unit workflow reruns the torchao-dependent tests after installing
-the optional `float8` extra. Native cases skip on unsupported hardware, including L20.
+The GPU unit workflow runs the CPU MXFP8 cases on the L20 fleet after installing
+the optional `float8` extra. To enable the native CI job, set the repository
+variable `MXFP8_SM100_RUNNER_LABEL` to the label of a self-hosted runner with
+two visible SM100+ GPUs. With the variable unset, GitHub skips the job.
+The job checks both devices before running the operator oracle and the training tests.
 All three native tests passed on two NVIDIA B200 GPUs with PyTorch
 2.11.0+cu130 and torchao 0.18.0. They cover checkpoint continuation with
 both transport modes and an independent full-weight quantization reference.
