@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.arguments import GradientCheckpointingConfig
+from veomni.arguments import GradientCheckpointingConfig, MixedPrecisionConfig
 from veomni.distributed.torch_compile import CompileConfig
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
 
@@ -97,10 +97,12 @@ def test_parallelize_forwards_module_skip_decision(
                 fsdp_mode="fsdp2",
                 fsdp_scope="module",
                 reshard_after_forward=True,
-                mixed_precision=SimpleNamespace(enable=False),
+                mixed_precision=MixedPrecisionConfig(enable=False),
                 forward_prefetch=False,
                 offload=False,
                 offload_pin_memory=False,
+                cpu_offload_extra_parallel_names=[],
+                cpu_offload_exclude_module_patterns=[],
                 low_precision_reduce_scatter_comm=False,
                 expert_weight_fp8_all_gather=expert_weight_fp8_all_gather,
                 expert_fsdp_shard_dim=0,

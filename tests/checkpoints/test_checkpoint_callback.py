@@ -269,6 +269,32 @@ class TestCheckpointCallbackTrainEndWait:
         with pytest.raises(RuntimeError, match="HDFS write failed"):
             cb.on_train_end(TrainerState(global_step=60))
 
+    def test_failed_async_epoch_wait_cannot_be_retried_as_success(self, mock_helper, monkeypatch):
+        from concurrent.futures import Future
+
+        from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+        failed = Future()
+        failed.set_exception(RuntimeError("HDFS write failed"))
+        monkeypatch.setattr(DistributedCheckpointer, "_async_save_failed", False)
+        monkeypatch.setattr(DistributedCheckpointer, "_save_futures", {"weights": failed})
+        monkeypatch.setattr(DistributedCheckpointer, "_async_process_groups", {})
+        trainer = _make_mock_trainer(save_async=True)
+        trainer.wait_for_pending_save.side_effect = DistributedCheckpointer.wait_for_pending_save
+        callback = CheckpointCallback(trainer)
+        callback._last_dcp_step = 5
+        state = TrainerState(global_step=5, epoch=0)
+
+        with pytest.raises(RuntimeError, match="HDFS write failed"):
+            callback.on_epoch_end(state)
+        assert not DistributedCheckpointer._save_futures
+        assert DistributedCheckpointer._async_save_failed is True
+        with pytest.raises(RuntimeError, match="restart from a complete checkpoint"):
+            callback.on_epoch_end(state)
+        with pytest.raises(RuntimeError, match="restart from a complete checkpoint"):
+            DistributedCheckpointer.wait_for_pending_save()
+        trainer.save_dcp.assert_not_called()
+
     def test_train_end_waits_even_without_async(self, mock_helper):
         """The call is unconditional; wait_for_pending_save is a no-op when nothing is pending."""
         trainer = _make_mock_trainer(save_async=False)
@@ -356,17 +382,25 @@ class TestModelCheckpointManagerSaveContract:
         assert saved["optimizer"] is runtime.optimizer
 
     def test_load_forwards_extra_state_like_optimizer(self, mock_helper, mock_dist, mock_build_ckpt):
+        mock_dist.is_initialized.return_value = False
         runtime = _make_mock_runtime()
         runtime.train_args.checkpoint.load_path = "/tmp/ckpt"
         mock_checkpointer = MagicMock()
         mock_build_ckpt.return_value = mock_checkpointer
+        scheduler_state = {"last_epoch": 7}
+
+        def load(_path, state, **_kwargs):
+            state["extra_state"]["lr_scheduler"] = scheduler_state
+
+        mock_checkpointer.load.side_effect = load
 
         manager = ModelCheckpointManager(runtime)
         manager.load()
 
         loaded = mock_checkpointer.load.call_args.args[1]
-        assert loaded["extra_state"] == {}
+        assert loaded["extra_state"] == {"lr_scheduler": scheduler_state}
         assert loaded["optimizer"] is runtime.optimizer
+        runtime.lr_scheduler.load_state_dict.assert_called_once_with(scheduler_state)
         assert mock_checkpointer.load.call_args.kwargs["parallel_state"] is runtime.parallel_state
 
     def test_save_lora_writes_the_adapter_to_its_own_export_dir(
@@ -446,6 +480,16 @@ class TestModelCheckpointManagerSaveContract:
 @patch("veomni.trainer.callbacks.global_state_callback.dist")
 class TestGlobalStateCallbackJobState:
     """Job-level state — dataloader, rng, meters, channel-loss — is not in the DCP sidecar."""
+
+    def test_fresh_run_does_not_coordinate_resume(self, mock_dist):
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = None
+        mock_dist.is_initialized.return_value = True
+        with patch("veomni.trainer.callbacks.global_state_callback.raise_if_any_rank_failed") as coordinate:
+            assert GlobalStateCallback(trainer).load_global_state() is None
+        coordinate.assert_not_called()
+        mock_dist.all_reduce.assert_not_called()
+        mock_dist.all_gather_object.assert_not_called()
 
     def test_state_dict_includes_channel_loss_callback_state(self, mock_dist):
         trainer = _make_mock_trainer()
@@ -555,8 +599,8 @@ class TestGlobalStateCallbackJobState:
         trainer.environ_meter.state_dict.return_value = {}
         cb = GlobalStateCallback(trainer)
 
-        def fail_the_write(_error, context):
-            if "trainer state" in context:
+        def fail_the_write(_error, context, group=None):
+            if context == "writing the trainer state":
                 raise RuntimeError("writing the trainer state failed on another rank")
 
         with patch(
@@ -614,6 +658,7 @@ class TestGlobalStateCallbackJobState:
     def test_load_restores_channel_loss_callback_state(self, mock_dist, tmp_path):
         mock_dist.is_initialized.return_value = False
         trainer = _make_mock_trainer()
+        trainer.model = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
         trainer.args.train.checkpoint.load_path = str(tmp_path)
         trainer.args.train.global_rank = 0
         trainer.train_dataloader = None
@@ -635,7 +680,8 @@ class TestGlobalStateCallbackJobState:
         trainer.channel_loss_callback.load_state_dict.assert_called_once_with(callback_state)
         assert trainer.state.global_step == 7
 
-    def test_the_offline_cache_writer_resumes_with_the_cursor(self, mock_dist, tmp_path):
+    @pytest.mark.parametrize("composed", [False, True])
+    def test_the_offline_cache_writer_resumes_with_the_cursor(self, mock_dist, tmp_path, composed):
         """The cursor is saved only after the writer flushed, and the position comes back with it.
 
         The run saves no model state, so the cursor alone makes the step complete for ``load_path: auto``.
@@ -659,7 +705,10 @@ class TestGlobalStateCallbackJobState:
         assert not os.path.exists(os.path.join(step_root, layout.MODEL_DIRNAME))
         assert layout.checkpoint_is_complete(step_root)
 
-        resumed = _make_mock_trainer()
+        resumed = _make_mock_trainer(save_path=str(tmp_path / "ckpt"))
+        resumed.args.train.training_task = "offline_embedding"
+        encoder = SimpleNamespace(optimizer=None, checkpoint=None)
+        resumed.model = SimpleNamespace(checkpoint=None, module_runtimes={"encoder": encoder}) if composed else encoder
         resumed.args.train.checkpoint.load_path = str(tmp_path / "ckpt" / "global_step_10")
         resumed.train_dataloader = None
         resumed.offline_cache_writer = MagicMock()
@@ -669,13 +718,76 @@ class TestGlobalStateCallbackJobState:
             {"shard_index": 1, "rows_written": 1, "world_size": 1}
         )
 
-    @patch("veomni.trainer.callbacks.global_state_callback.get_device_type", return_value="cpu")
-    def test_load_skips_when_any_rank_is_missing_state(self, mock_device, mock_dist, tmp_path):
-        """A missing cursor on one rank must not leave the others at a different step."""
-        mock_dist.is_initialized.return_value = True
+    @pytest.mark.parametrize("cursor_file", ["missing", "empty"])
+    def test_offline_resume_rejects_missing_loader_cursor_before_writer_restore(
+        self, mock_dist, tmp_path, cursor_file
+    ):
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer()
+        trainer.args.train.training_task = "offline_embedding"
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.model = SimpleNamespace(optimizer=None, checkpoint=None)
+        trainer.train_dataloader = MagicMock()
+        trainer.offline_cache_writer = MagicMock()
+        extra_path = Path(layout.extra_state_path(str(tmp_path), 0))
+        extra_path.parent.mkdir(parents=True)
+        torch.save({"global_step": 7, "offline_cache_writer": {"shard_index": 1}}, extra_path)
+        layout.write_manifest(str(tmp_path), global_step=7, world_size=1, model_state=False)
+        if cursor_file == "empty":
+            loader_path = Path(layout.loader_path(str(tmp_path), 0))
+            loader_path.parent.mkdir(parents=True)
+            torch.save({"train_dataloader": {}}, loader_path)
 
-        def drop_presence(flag, op=None):
-            flag.zero_()
+        with pytest.raises((RuntimeError, ValueError), match="[Oo]ffline embedding checkpoint.*dataloader cursor"):
+            GlobalStateCallback(trainer).load_global_state()
+        trainer.offline_cache_writer.load_state_dict.assert_not_called()
+        trainer.train_dataloader.load_state_dict.assert_not_called()
+        assert trainer.state.global_step == 0
+
+    @pytest.mark.parametrize("case", ["missing", "wrong_model", "step_mismatch"])
+    def test_offline_resume_rejects_incomplete_source_before_restoring(self, mock_dist, tmp_path, case):
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer(save_path=str(tmp_path / "new"))
+        trainer.args.train.checkpoint.load_path = str(tmp_path / "old" / "global_step_7")
+        trainer.args.train.training_task = "offline_embedding"
+        trainer.model = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
+        trainer.train_dataloader = MagicMock()
+        trainer.offline_cache_writer = MagicMock()
+        callback = GlobalStateCallback(trainer)
+        callback._read_current = lambda _: {
+            "global_step": 7,
+            "train_dataloader": {"cursor": 9},
+            "offline_cache_writer": {"shard_index": 1},
+        }
+        manifest = {"model_state": False, "global_step": 7, "world_size": 1}
+        if case == "missing":
+            manifest = None
+        elif case == "wrong_model":
+            manifest["model_state"] = True
+        else:
+            manifest["global_step"] = 8
+        rng = torch.get_rng_state().clone()
+        with (
+            patch.object(layout, "read_manifest", return_value=manifest),
+            patch.object(layout, "checkpoint_is_complete", return_value=True),
+            pytest.raises((RuntimeError, ValueError), match="incomplete|unexpectedly|manifest steps differ"),
+        ):
+            callback.load_global_state()
+        trainer.train_dataloader.load_state_dict.assert_not_called()
+        trainer.offline_cache_writer.load_state_dict.assert_not_called()
+        assert trainer.state.global_step == 0
+        assert torch.equal(torch.get_rng_state(), rng)
+
+    @patch("veomni.trainer.callbacks.global_state_callback.get_device_type", return_value="cpu")
+    def test_load_rejects_when_any_rank_is_missing_state(self, mock_device, mock_dist, tmp_path):
+        """A missing cursor must not reuse an optimizer at a different step."""
+        mock_dist.is_initialized.return_value = True
+        mock_dist.get_world_size.return_value = 2
+        mock_dist.all_gather_object.side_effect = lambda output, value: output.__setitem__(slice(None), [value, value])
+
+        def drop_presence(flag, op=None, group=None):
+            if flag.numel() == 1:
+                flag.zero_()
 
         mock_dist.all_reduce.side_effect = drop_presence
         trainer = _make_mock_trainer()
@@ -696,10 +808,17 @@ class TestGlobalStateCallbackJobState:
         )
 
         cb = GlobalStateCallback(trainer)
-        assert cb.load_global_state() is None
+        with (
+            patch.object(layout, "checkpoint_is_complete", return_value=True),
+            patch.object(
+                layout, "read_manifest", return_value={"model_state": True, "global_step": 7, "world_size": 1}
+            ),
+            pytest.raises(RuntimeError, match="Trainer state is missing"),
+        ):
+            cb.load_global_state()
         trainer.channel_loss_callback.load_state_dict.assert_not_called()
         assert trainer.state.global_step == 0
-        mock_dist.all_reduce.assert_called_once()
+        assert mock_dist.all_reduce.call_count == 3
         assert mock_dist.all_reduce.call_args.kwargs["op"] is torch.distributed.ReduceOp.MIN
 
     def test_a_pre_split_job_cursor_is_not_read(self, mock_dist, tmp_path):
@@ -708,7 +827,7 @@ class TestGlobalStateCallbackJobState:
         The pre-split layouts kept it in ``extra_state_rank_{R}.pt`` and
         ``trainer_state_rank_{R}.pt``. Both are gone with
         ``veomni/checkpoint/legacy_v0_1_12.py``: the step has no current-layout
-        cursor, so a resume falls back to weights only rather than restoring a
+        cursor, so an optimizer resume is rejected rather than restoring a
         step counter from a shape nothing writes any more.
         """
         mock_dist.is_initialized.return_value = False
@@ -725,5 +844,22 @@ class TestGlobalStateCallbackJobState:
         torch.save({"global_step": 9, "torch_rng_state": torch.get_rng_state()}, tmp_path / "trainer_state_rank_0.pt")
 
         cb = GlobalStateCallback(trainer)
-        assert cb.load_global_state() is None
+        with (
+            patch.object(layout, "checkpoint_is_complete", return_value=True),
+            patch.object(
+                layout, "read_manifest", return_value={"model_state": True, "global_step": 7, "world_size": 1}
+            ),
+            pytest.raises(RuntimeError, match="Trainer state is missing"),
+        ):
+            cb.load_global_state()
+        assert trainer.state.global_step == 0
+
+    def test_missing_cursor_allows_a_genuine_weights_only_runtime(self, mock_dist, tmp_path):
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.model = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
+        trainer.train_dataloader = None
+
+        assert GlobalStateCallback(trainer).load_global_state() is None
         assert trainer.state.global_step == 0

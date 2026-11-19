@@ -37,6 +37,9 @@ usage/support_new_models/qwen3_vl_example.md
 usage/support_new_models/qwen3_omni_moe_example.md
 usage/support_new_models/dit_model_guide.md
 usage/checkpoint.md
+usage/exact_data_resume.md
+usage/checkpoint_scheduler_recipes.md
+usage/dpo_producer_contract.md
 usage/checkpoint_conversion.md
 usage/trainer.md
 usage/agent_workflow.md
@@ -141,9 +144,11 @@ seed_omni/models/bagel.md
 design/ci_case_scheduling.md
 design/op_selection.md
 design/module_config.md
+design/rank_local_adamw_checkpoint_adapter.md
 design/fused_moe_ops.md
 design/deepgemm_fp8_moe.md
 design/local_parallel_state.md
+design/selective_expert_cpu_offload.md
 design/patchgen.md
 design/qwen4_exp_ple_2d_parallelism.md
 design/verl_topk_distill_integration.md

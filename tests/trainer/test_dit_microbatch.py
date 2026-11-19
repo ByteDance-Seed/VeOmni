@@ -70,6 +70,22 @@ def _load(trainer, samples):
     return iter(trainer.base.train_dataloader)
 
 
+@pytest.mark.parametrize("dataloader_type", ["native", "custom"])
+def test_dit_forwards_replay_timeout_to_native_loader(monkeypatch, dataloader_type):
+    trainer = _trainer(monkeypatch, "online_training", 1)
+    trainer.base.args.data.dataloader.type = dataloader_type
+    trainer.base.args.data.resume_replay_timeout_seconds = 37
+    trainer.base.train_dataset = []
+    build = Mock(return_value=object())
+    monkeypatch.setattr(dit_module, "build_dataloader", build)
+    trainer._build_dataloader()
+    kwargs = build.call_args.kwargs
+    if dataloader_type == "native":
+        assert kwargs["resume_replay_timeout_seconds"] == 37
+    else:
+        assert "resume_replay_timeout_seconds" not in kwargs
+
+
 @pytest.mark.parametrize("task", ["offline_training", "online_training"])
 @pytest.mark.parametrize("micro_batch_size", [1, 2, 4])
 @pytest.mark.parametrize("dp_size", [1, 2])
@@ -100,10 +116,205 @@ def test_dataloader_shuffle_reaches_sampler(monkeypatch, task, shuffle):
 def test_offline_embedding_keeps_the_last_batch(monkeypatch, task):
     trainer = _trainer(monkeypatch, task, micro_batch_size=1)
     expected = task != "offline_embedding"
+    assert trainer.base.saves_model_state is expected
     assert trainer.base.args.data.dataloader.drop_last is expected
     assert not hasattr(trainer.base.args.data, "drop_last")
     _load(trainer, [{"value": torch.ones(1)} for _ in range(4)])
     assert trainer.base.train_dataloader.drop_last is expected
+
+
+def test_dit_registers_offline_writer_before_callbacks(monkeypatch, tmp_path):
+    configured = _trainer(monkeypatch, "offline_embedding", micro_batch_size=1)
+    args = configured.base.args
+    writer = OfflineEmbeddingSaver(str(tmp_path), dataset_length=3)
+    seen = []
+    monkeypatch.setattr(BaseTrainer, "_setup", lambda self, args: torch.device("cpu"))
+    monkeypatch.setattr(BaseTrainer, "_init_callbacks", lambda self: seen.append(self.offline_cache_writer))
+    monkeypatch.setattr(DiTTrainer, "_build_model_runtime", lambda self: SimpleNamespace(parallel_state=object()))
+    monkeypatch.setattr(DiTTrainer, "_build_data_transform", lambda self: None)
+    monkeypatch.setattr(DiTTrainer, "_build_dataset", lambda self: setattr(self, "offline_embedding_saver", writer))
+    monkeypatch.setattr(DiTTrainer, "_build_dataloader", lambda self: None)
+    trainer = DiTTrainer(args)
+    assert seen == [writer]
+    assert trainer.base.offline_cache_writer is writer
+    assert trainer.base.saves_model_state is False
+
+
+def test_offline_embedding_checkpoint_restores_output_writer(monkeypatch, tmp_path):
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_trainer
+    from veomni.checkpoint import layout
+    from veomni.models.diffusers.hunyuanvideo15.hunyuanvideo15_condition.conditioning import FlowMatchingConditioner
+    from veomni.trainer.callbacks.base import TrainerState
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    dit = _trainer(monkeypatch, "offline_embedding", micro_batch_size=1)
+    output = tmp_path / "output"
+    writer = OfflineEmbeddingSaver(str(output), dataset_length=3)
+    for value in (0, 1):
+        writer.save({"value": torch.tensor(value)})
+    assert writer.buffer and not list(output.glob("*.parquet"))
+
+    checkpoint_root = str(tmp_path / "ckpt")
+    trainer = _make_mock_trainer(save_path=checkpoint_root)
+    trainer.args.train.training_task = "offline_embedding"
+    trainer.saves_model_state = dit.base.saves_model_state
+    trainer.model = DiTModelRuntime.__new__(DiTModelRuntime)
+    trainer.model.condition_model = FlowMatchingConditioner(seed=42, device="cpu")
+    trainer.offline_embedding_runtime = trainer.model
+    posterior = torch.zeros(1, 2, 2, 2)
+    trainer.model.condition_model.sample_posterior(posterior)
+    trainer.train_dataloader = None
+    trainer.data_iterator = None
+    trainer.offline_cache_writer = writer
+    trainer.environ_meter.state_dict.return_value = {}
+    trainer.channel_loss_callback = None
+    GlobalStateCallback(trainer).save_global_state(TrainerState(global_step=2))
+    expected_condition = trainer.model.condition_model.sample_posterior(posterior)
+
+    step = layout.step_dir(checkpoint_root, 2)
+    assert layout.checkpoint_is_complete(step)
+    assert layout.read_manifest(step)["model_state"] is False
+    assert not writer.buffer and writer.index == 1
+
+    resumed = _make_mock_trainer(save_path=checkpoint_root)
+    resumed.args.train.training_task = "offline_embedding"
+    resumed.args.train.checkpoint.load_path = step
+    resumed.model = DiTModelRuntime.__new__(DiTModelRuntime)
+    resumed.model.condition_model = FlowMatchingConditioner(seed=42, device="cpu")
+    resumed.offline_embedding_runtime = resumed.model
+    resumed.train_dataloader = None
+    resumed.data_iterator = None
+    resumed.channel_loss_callback = None
+    resumed.offline_cache_writer = OfflineEmbeddingSaver(str(output), dataset_length=3)
+    GlobalStateCallback(resumed).load_global_state()
+    assert resumed.state.global_step == 2
+    torch.testing.assert_close(
+        resumed.model.condition_model.sample_posterior(posterior), expected_condition, rtol=0, atol=0
+    )
+    resumed.offline_cache_writer.save({"value": torch.tensor(2)})
+    resumed.offline_cache_writer.save_last()
+
+    result = []
+    for path in sorted(output.glob("*.parquet")):
+        result.extend(int(pickle.loads(row["value"])) for row in Dataset.from_parquet(str(path)))
+    assert result == [0, 1, 2]
+
+
+def test_offline_embedding_rejects_uncheckpointable_private_rng():
+    runtime = DiTModelRuntime.__new__(DiTModelRuntime)
+    runtime.condition_model = SimpleNamespace(generator=torch.Generator())
+    with pytest.raises(RuntimeError, match="cannot save and restore its private RNG"):
+        runtime.offline_condition_state()
+
+
+def test_offline_embedding_resume_rejects_unproven_or_extra_output(monkeypatch, tmp_path):
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_trainer
+    from veomni.checkpoint import layout
+    from veomni.trainer.callbacks.base import TrainerState
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    _trainer(monkeypatch, "offline_embedding", micro_batch_size=1)
+    output = tmp_path / "output"
+    writer = OfflineEmbeddingSaver(str(output), dataset_length=3)
+    writer.save({"value": torch.tensor(0)})
+    root = str(tmp_path / "ckpt")
+    trainer = _make_mock_trainer(save_path=root)
+    trainer.args.train.training_task = "offline_embedding"
+    trainer.saves_model_state = False
+    trainer.model = SimpleNamespace(optimizer=None, checkpoint=None)
+    trainer.train_dataloader = None
+    trainer.data_iterator = None
+    trainer.offline_cache_writer = writer
+    trainer.environ_meter.state_dict.return_value = {}
+    trainer.channel_loss_callback = None
+    GlobalStateCallback(trainer).save_global_state(TrainerState(global_step=1))
+    step = layout.step_dir(root, 1)
+
+    resumed = _make_mock_trainer(save_path=root)
+    resumed.args.train.training_task = "offline_embedding"
+    resumed.args.train.checkpoint.load_path = step
+    resumed.model = SimpleNamespace(optimizer=None, checkpoint=None)
+    resumed.train_dataloader = None
+    resumed.data_iterator = None
+    resumed.offline_cache_writer = OfflineEmbeddingSaver(str(output), dataset_length=3)
+    (output / "rank_0_shard_1.parquet").write_bytes(b"unexpected later output")
+    with pytest.raises(ValueError, match="output shards differ"):
+        GlobalStateCallback(resumed).load_global_state()
+    assert resumed.state.global_step == 0
+
+    (output / "rank_0_shard_1.parquet").unlink()
+    for extra in ("rank_0_shard_00.parquet", "rank_0_shard_extra.parquet"):
+        (output / extra).write_bytes(b"unexpected output")
+        with pytest.raises(ValueError, match="unexpected shard name"):
+            GlobalStateCallback(resumed).load_global_state()
+        assert resumed.state.global_step == 0
+        (output / extra).unlink()
+    path = layout.extra_state_path(step, 0)
+    state = torch.load(path, weights_only=False)
+    state.pop("offline_cache_writer")
+    torch.save(state, path)
+    with pytest.raises(ValueError, match="missing its output writer state"):
+        GlobalStateCallback(resumed).load_global_state()
+    assert resumed.state.global_step == 0
+
+
+def _offline_embedding_writer_failure_worker(rank, source, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_trainer
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
+    try:
+        _init_parallel_state(dp_size=2, dp_mode="fsdp2", device_type="cpu")
+        trainer = _make_mock_trainer()
+        trainer.args.train.training_task = "offline_embedding"
+        trainer.args.train.global_rank = rank
+        trainer.args.train.world_size = 2
+        trainer.args.train.checkpoint.load_path = source
+        trainer.model = SimpleNamespace(optimizer=None, checkpoint=None)
+        trainer.train_dataloader = None
+        trainer.data_iterator = None
+        trainer.channel_loss_callback = None
+
+        def fail_restore(_state):
+            raise OSError("writer output became unreadable")
+
+        trainer.offline_cache_writer = (
+            SimpleNamespace(validate_state_dict=lambda _state: None, load_state_dict=fail_restore)
+            if rank == 0
+            else None
+        )
+        callback = GlobalStateCallback(trainer)
+        callback._read_current = lambda _path: {
+            "global_step": 2,
+            "train_dataloader": None,
+            "offline_cache_writer": {"version": 1} if rank == 0 else None,
+            "torch_rng_state": torch.get_rng_state(),
+        }
+        with pytest.raises((OSError, RuntimeError)) as failure:
+            callback.load_global_state()
+        assert ("writer output became unreadable" if rank == 0 else "restoring offline-cache state") in str(
+            failure.value
+        )
+        alive = torch.ones(1)
+        dist.all_reduce(alive)
+        assert alive.item() == 2
+    finally:
+        clear_parallel_state()
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+def test_offline_embedding_writer_failure_is_coordinated(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+    from veomni.checkpoint import layout
+
+    layout.write_manifest(str(tmp_path), global_step=2, world_size=2, model_state=False)
+    spawn_with_rendezvous(_offline_embedding_writer_failure_worker, args=(str(tmp_path),), nprocs=2)
 
 
 @pytest.mark.parametrize("shuffle", [True, False])

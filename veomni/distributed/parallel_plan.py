@@ -42,6 +42,13 @@ class SpecInfo:
     # of FSDP2. Its runtime parameter remains a DTensor on the complete
     # ``(para_fsdp, para)`` mesh for the entire forward/backward lifecycle.
     persistent_fsdp_shard_dim: Optional[int] = None
+    # Original model shape before ExtraParallel or FSDP sharding. Checkpoint
+    # restoration cannot recover an uneven ExtraParallel extent from an
+    # FSDP-only DTensor because its local storage already lost that slice.
+    global_shape: Optional[tuple[int, ...]] = None
+    # Opt in to the versioned EP-outer checkpoint layout. Existing plans and
+    # checkpoints retain their legacy layout until explicitly migrated.
+    checkpoint_layout_v2: bool = False
 
     @property
     def para_mesh(self):
@@ -149,6 +156,7 @@ class ParallelPlan:
                                 para_fsdp_mesh=para_fsdp_mesh,
                                 placement=shard,
                                 fqn=fqn,
+                                global_shape=tuple(param.shape),
                                 persistent_fsdp_shard_dim=persistent_fsdp_shard_dim,
                             )
                             if persistent_fsdp_shard_dim is not None:

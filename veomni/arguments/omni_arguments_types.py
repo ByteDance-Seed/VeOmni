@@ -561,6 +561,21 @@ class OmniDataArguments:
             "help": "Number of samples for training to compute training steps for non-dynamic batch dataloader."
         },
     )
+    resume_input_contract: Optional[str] = field(
+        default=None,
+        kw_only=True,
+        metadata={"help": "Caller-attested SHA256 identity of the immutable input and deterministic transforms."},
+    )
+    resume_input_deterministic: bool = field(
+        default=False,
+        kw_only=True,
+        metadata={"help": "Attest that input processing is deterministic and has no untracked worker state."},
+    )
+    resume_replay_timeout_seconds: int = field(
+        default=7200,
+        kw_only=True,
+        metadata={"help": "Timeout per worker response during exact streaming replay, in seconds."},
+    )
     data_type: Literal["seedomni", "seedomni_cached"] = field(
         default="seedomni",
         metadata={"help": "Type of the training data; `seedomni_cached` reads an offline-cache dataset."},
@@ -605,6 +620,8 @@ class OmniDataArguments:
     )
 
     def __post_init__(self):
+        if type(self.resume_replay_timeout_seconds) is not int or self.resume_replay_timeout_seconds <= 0:
+            raise ValueError("resume_replay_timeout_seconds must be a positive integer")
         if self.data_type not in {"seedomni", "seedomni_cached"}:
             raise ValueError(
                 f"OmniTrainer only builds the seedomni transforms; got data.data_type={self.data_type!r}."
