@@ -15,9 +15,10 @@
 """``deepseek_v4`` ``cann`` indexer and sparse attention.
 
 CANN call layout is checked on any host, so those cases ask for no accelerator.
-The indexer is compared with eager on Ascend. Sparse FlashMLA has a parity case
-there too, currently expected to fail; see the note above
-``test_sparse_flash_mla_rejects_selections_the_operator_cannot_take``.
+The indexer and Sparse FlashMLA are compared with eager on Ascend. The parity case
+uses a selection the kernel serves -- the whole compressed table, which is the only
+shape the model emits for a sequence this short. Narrower selections return
+nonfinite rows on CANN 9.2.1, so the adapter rejects them instead.
 """
 
 from __future__ import annotations
@@ -630,7 +631,7 @@ def test_attention_explicit_mask_runs_the_eager_row(
 def test_attention_packed_call_rebases_the_selection_per_segment(flash_mla: _FlashMlaRecorder):
     slices = ((0, 9), (9, 13))
     q, ori_kv, cmp_kv, sink = _attention_inputs(seq_len=13, compressed_len=3)
-    topk = torch.full((1, 13, 2), -1, dtype=torch.int32)
+    topk = torch.full((1, 13, 3), -1, dtype=torch.int32)
     topk[0, :9, 0] = 1
     topk[0, 9:, 0] = 2
 
@@ -652,7 +653,7 @@ def test_attention_packed_call_rebases_the_selection_per_segment(flash_mla: _Fla
     assert cann_ori_kv.shape == (1, 13, 1, _ATTN_DIM) and cann_cmp_kv.shape == (1, 3, 1, _ATTN_DIM)
     # The contract addresses the packed compressed buffer, TND each segment's own rows.
     assert indices[0, :9, 0].tolist() == [1] * 9 and indices[0, 9:, 0].tolist() == [0] * 4
-    assert (indices[..., 1] == -1).all()
+    assert (indices[..., 1:] == -1).all()
     assert kwargs["packed_sequence_slices"] == slices
     assert (kwargs["cmp_ratio"], kwargs["softmax_scale"]) == (_RATE, 0.5)
     assert (kwargs["ori_mask_mode"], kwargs["cmp_mask_mode"]) == (4, 3)
@@ -755,7 +756,7 @@ def test_attention_context_parallel_narrows_to_the_query_tail(
     ori_kv = torch.randn(1, 12, _ATTN_DIM).to(torch.bfloat16)
     cmp_kv = torch.randn(1, 3, _ATTN_DIM).to(torch.bfloat16)
     sink = torch.randn(_ATTN_HEADS).to(torch.bfloat16)
-    topk = torch.zeros(1, 6, 1, dtype=torch.int32)
+    topk = torch.zeros(1, 6, cmp_rows, dtype=torch.int32)
 
     cann_attention.wrapper(
         q,
@@ -928,18 +929,17 @@ def test_attention_packed_context_parallel_keeps_the_gather_in_the_backward_grap
     not IS_NPU_AVAILABLE or importlib.util.find_spec("cann_ops_transformer") is None,
     reason="CANN Sparse FlashMLA requires Ascend NPU and cann_ops_transformer",
 )
-@pytest.mark.xfail(strict=True, reason="CANN 9.1.0 returns a nonfinite query gradient; see the note below")
 def test_sparse_flash_mla_matches_eager_on_ascend():
     """Compare the real kernel's forward and every input gradient with eager.
 
     Most queries are past their first window here, so the compressed table has
     visible rows and the call takes the index path rather than a fallback. The
-    marker is strict: a kernel that starts agreeing fails this case until the
-    marker is removed, instead of leaving a stale expected failure behind.
+    selection is 512 wide, the narrowest width the kernel is built for, over a
+    75-row table; the slots past the table hold ``-1`` and the adapter accepts it.
     """
     torch.manual_seed(5)
     device = get_device_type()
-    seq_len, topk = 300, 16
+    seq_len, topk = 300, 512
     compressed_len = seq_len // _RATE
     q = torch.randn(1, seq_len, _ATTN_HEADS, _ATTN_DIM, device=device).to(torch.bfloat16).requires_grad_()
     ori_kv = torch.randn(1, seq_len, _ATTN_DIM, device=device).to(torch.bfloat16).requires_grad_()
@@ -948,7 +948,8 @@ def test_sparse_flash_mla_matches_eager_on_ascend():
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
     # Compressed row ``j`` closes at token ``4j + 3``, so query ``i`` sees the rows
-    # below ``(i + 1) // 4``; the newest ``topk`` of them keep the K axis in range.
+    # below ``(i + 1) // 4``; selecting all of them keeps the selection spanning the
+    # table, and the trailing slots stay ``-1``.
     ends = (torch.arange(seq_len, device=device) + 1) // _RATE
     starts = (ends - topk).clamp(min=0)
     columns = torch.arange(topk, device=device)
@@ -959,7 +960,11 @@ def test_sparse_flash_mla_matches_eager_on_ascend():
 
     expected = resolve_op("dsa_attention", "deepseek_v4", "eager").wrapper(*operands, **kwargs)
     actual = resolve_op("dsa_attention", "deepseek_v4", "cann").wrapper(*operands, **kwargs)
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    # bf16 accumulation over a 512-wide head: the worst forward element differs by
+    # 2e-2 and the worst gradient element by 4e-2, with a mean absolute error of
+    # about 1e-3. The tolerance has to sit above that and far below the row-scale
+    # error a wrong selection produced (0.2 on the forward alone).
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
 
     rows = torch.randn_like(expected)
     inputs = (q, ori_kv, cmp_kv, sink)
@@ -967,14 +972,33 @@ def test_sparse_flash_mla_matches_eager_on_ascend():
     actual_grads = torch.autograd.grad(actual, inputs, rows, allow_unused=True)
     for name, expected_grad, actual_grad in zip(("q", "ori_kv", "cmp_kv", "sink"), expected_grads, actual_grads):
         assert actual_grad is not None and torch.isfinite(actual_grad).all(), f"{name} gradient is not finite"
-        torch.testing.assert_close(actual_grad.float(), expected_grad.float(), atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(actual_grad.float(), expected_grad.float(), atol=5e-2, rtol=5e-2)
 
 
-# The parity case above is an expected failure rather than a loose tolerance: on
-# CANN 9.1.0 (causal CSA, seq 300, heads 2, dim 512, topk 16, bf16, fp32 sink) the
-# forward keeps the eager direction (cosine 0.99995) but scales some rows down to
-# about 0.77, and the ``q`` gradient matches eager on the early rows and is NaN
-# after that. No tolerance makes a nonfinite gradient equal.
+def test_attention_rejects_a_selection_narrower_than_the_kernel_serves():
+    # The shape the parity case used to run: 16 indices over a 75-row table. On CANN
+    # 9.2.1 the kernel keeps the eager direction in the forward (cosine 0.998) but
+    # scales some rows down and turns the ``q`` gradient into NaNs. No tolerance
+    # makes a nonfinite gradient equal, so the adapter refuses this before the call.
+    q = torch.randn(1, 300, _ATTN_HEADS, _ATTN_DIM).to(torch.bfloat16)
+    ori_kv = torch.randn(1, 300, _ATTN_DIM).to(torch.bfloat16)
+    cmp_kv = torch.randn(1, 75, _ATTN_DIM).to(torch.bfloat16)
+    sink = torch.randn(_ATTN_HEADS)
+    candidates = CompressedCandidates(topk_indices=torch.zeros(1, 300, 16, dtype=torch.int32))
+
+    with pytest.raises(ValueError, match=r"or be 512/1024 wide; got 16 indices over 75 compressed rows"):
+        cann_attention.wrapper(
+            q,
+            ori_kv,
+            cmp_kv,
+            sink,
+            torch.arange(300).unsqueeze(0),
+            sliding_window=_WINDOW,
+            compress_ratio=_RATE,
+            candidates=candidates,
+        )
+
+
 @pytest.mark.parametrize(
     ("index_topk", "cmp_ratio", "match"),
     [

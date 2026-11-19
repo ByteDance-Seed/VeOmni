@@ -139,7 +139,10 @@ buffer itself:
   at the last row on every rank. Packed shards then become one single-segment
   call per sample the shard intersects. A prefix — or a truncated packed sample —
   that ends inside its first compression window holds no visible compressed row,
-  so it runs the eager row with a zero-row compressed table.
+  so it runs the eager row with a zero-row compressed table. The compressed
+  selection must either span the table it indexes or be 512/1024 wide, which is
+  the shape `min(index_topk, compressed_len)` produces; a narrower selection
+  returns nonfinite rows on CANN 9.2.1, so the adapter refuses it.
 - `dsa_indexer_implementation: cann` derives causal visibility from the query
   row and accepts only the ranges the shard's global rows imply. CP supplies
   explicit `cu_seqlen_ks` / `cu_seqlen_ke` rebased onto the global sequence, so
@@ -176,10 +179,10 @@ adapters' CP geometry — the prefix narrowing, the per-sample rebasing and the
 eager fallbacks — is checked on any host by
 `tests/ops/dsa/test_dsa_deepseek_v4_cann.py`, which records the arguments the
 adapters hand their kernels. On Ascend the same file compares the real CANN
-indexer against eager selection, causally and on both packed CP shards. The CANN
-attention kernel's numbers stay uncovered: its parity case is marked an expected
-failure until a CANN release returns a finite query gradient, and no CP training
-run uses the CANN pair.
+indexer against eager selection, causally and on both packed CP shards. The same
+file compares the real CANN attention kernel with eager — forward and every input
+gradient — on a 512-wide selection over a 75-row table, the narrowest width the
+kernel serves. No CP training run uses the CANN pair.
 
 ## Decisions that took more than one attempt
 
