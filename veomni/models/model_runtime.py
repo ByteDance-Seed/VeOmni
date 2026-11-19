@@ -49,6 +49,23 @@ if TYPE_CHECKING:
     from ..trainer.callbacks import TrainerState
     from .checkpoint import ModelCheckpointManager
 
+
+def _configure_extra_parallel_checkpoint_layout(model, checkpoint, *, require_plan=True):
+    """Apply canonical ExtraParallel checkpoint layout after model wrapping."""
+    if not getattr(checkpoint, "extra_parallel_canonical_layout", False):
+        return
+    from torch.distributed.tensor import Shard
+
+    specs = getattr(model, "_fqn2spec_info", None)
+    if specs is None:
+        if require_plan:
+            raise RuntimeError("Canonical ExtraParallel checkpointing requires an ExtraParallel model plan")
+        return
+    for spec in specs.values():
+        if isinstance(spec.placement, Shard) and spec.persistent_fsdp_shard_dim is None:
+            spec.checkpoint_layout_v2 = True
+
+
 logger = logging.get_logger(__name__)
 
 
@@ -143,9 +160,71 @@ class VeOmniModelRuntime:
             self._build_model()
             self._freeze_model_module()
             self._build_parallelized_model()
-            self._build_optimizer()
+            from ..utils.dist_utils import raise_if_any_rank_failed
+
+            canonical = getattr(self.train_args.checkpoint, "extra_parallel_canonical_layout", False)
+            layout_error = None
+            try:
+                if canonical:
+                    from ..distributed.torch_parallelize import _has_extra_parallel_plan
+
+                    _configure_extra_parallel_checkpoint_layout(
+                        self.model,
+                        self.train_args.checkpoint,
+                        require_plan=(
+                            bool(getattr(self.parallel_state, "any_extra_parallel_enabled", False))
+                            and _has_extra_parallel_plan(self.model)
+                        ),
+                    )
+            except BaseException as exc:
+                layout_error = exc
+            raise_if_any_rank_failed(layout_error, "configuring ExtraParallel checkpoint layout")
+            checkpoint_path = self.train_args.checkpoint.load_path
+            recover_ownership = bool(
+                checkpoint_path
+                and self.model_name in ("base", "policy")
+                and (
+                    getattr(self.model, "_fqn2spec_info", None) is not None
+                    or self.args.optimizer.type
+                    in ("cpu_offload_adamw", "full_fp32_adamw", "master_fp32_adamw", "muon", "qwen38_muon")
+                )
+            )
+            self._build_optimizer_checked(checkpoint_path if recover_ownership else None)
         self._build_model_assets()
         self.build_checkpoint()
+
+    def _build_optimizer_checked(self, checkpoint_path: Optional[str] = None) -> None:
+        """Coordinate local build failures before entering checkpoint preflight."""
+        from ..utils.dist_utils import raise_if_any_rank_failed
+
+        error = None
+        try:
+            if checkpoint_path is not None:
+                from ..checkpoint.rank_local_optimizer import recover_frozen_optimizer_ownership
+
+                with recover_frozen_optimizer_ownership(self.model, checkpoint_path):
+                    self._build_optimizer()
+            else:
+                self._build_optimizer()
+        except BaseException as exc:
+            error = exc
+        raise_if_any_rank_failed(error, "building model optimizer")
+        self._validate_optimizer_checkpoint_mode()
+
+    def _validate_optimizer_checkpoint_mode(self) -> None:
+        """Reject unsupported checkpoint modes on all ranks before training."""
+        from ..utils.dist_utils import raise_if_any_rank_failed
+
+        checkpoint = getattr(self.train_args, "checkpoint", None)
+        manager = getattr(checkpoint, "manager", "dcp")
+        asynchronous = bool(getattr(checkpoint, "save_async", False))
+        if manager == "dcp" and asynchronous:
+            error = (
+                RuntimeError("MultiOptimizer checkpoints currently require synchronous DCP save")
+                if getattr(self.optimizer, "_is_multi_optimizer", False) is True
+                else None
+            )
+            raise_if_any_rank_failed(error, "checking MultiOptimizer checkpoint mode")
 
     def __getattr__(self, name: str) -> Any:
         """Forward unshadowed :class:`torch.nn.Module` APIs to the wrapped model."""
@@ -419,6 +498,8 @@ class VeOmniModelRuntime:
         # Customized parallelize model.
         customized_parallelize_model_function = getattr(self.model, "build_parallelize_model", None)
         if callable(customized_parallelize_model_function):
+            if args.accelerator.fsdp_config.mixed_precision.npu_expert_fp32_wgrad:
+                raise ValueError("NPU expert FP32 wgrad is unsupported with custom model parallelization")
             parallelized_model = customized_parallelize_model_function(weights_path=self.weights_path, args=self.args)
             if parallelized_model is not None:
                 self.model = parallelized_model
@@ -477,6 +558,8 @@ class VeOmniModelRuntime:
             enable_forward_prefetch=args.accelerator.fsdp_config.forward_prefetch,
             enable_fsdp_offload=args.accelerator.fsdp_config.offload,
             fsdp_offload_pin_memory=args.accelerator.fsdp_config.offload_pin_memory,
+            cpu_offload_extra_parallel_names=args.accelerator.fsdp_config.cpu_offload_extra_parallel_names,
+            cpu_offload_exclude_module_patterns=args.accelerator.fsdp_config.cpu_offload_exclude_module_patterns,
             broadcast_model_weights_from_rank0=args.broadcast_model_weights_from_rank0,
             ep_sharded_stream_load=args.ep_sharded_stream_load,
             max_load_broadcast_size=args.accelerator.fsdp_config.max_load_broadcast_size,
@@ -596,6 +679,13 @@ class VeOmniModelRuntime:
         """
         opt = self.args.optimizer
         from ..optim import build_optimizer
+        from ..optim.ple_world_profile import for_job, validate_before_build
+
+        receipt = for_job(self.train_args)
+        self._ple_profile_receipt = receipt
+        validate_before_build(
+            opt, self.args.accelerator, self.train_args.checkpoint, receipt, model_name=self.model_name
+        )
 
         self.optimizer = build_optimizer(
             self.model,
@@ -608,6 +698,7 @@ class VeOmniModelRuntime:
             no_decay_modules=opt.no_decay_modules,
             no_decay_params=opt.no_decay_params,
             optimizer_config=opt,
+            ple_profile_receipt=receipt,
         )
 
     def _build_lr_scheduler(self, total_steps: int) -> None:
@@ -664,7 +755,9 @@ class VeOmniModelRuntime:
 
         Models with extra state (e.g. the DiT condition model's noise/timestep
         generator) contribute it here. The checkpoint manager merges the result
-        into the model's extra_state blob. Default: nothing.
+        into the model's extra_state blob. Keys prefixed with ``_veomni_`` are
+        reserved for framework checkpoint metadata and must not be returned by
+        custom runtimes. Default: nothing.
         """
         return {}
 

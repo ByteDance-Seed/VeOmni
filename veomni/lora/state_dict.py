@@ -101,6 +101,17 @@ def get_lora_state_dict(
     return out
 
 
+def validate_lora_export_covers_trainable(model: nn.Module, state: dict[str, torch.Tensor]) -> None:
+    """Reject adapter-only exports that would silently lose trained base weights."""
+    exported = {id(value) for value in state.values()}
+    omitted = [name for name, param in model.named_parameters() if param.requires_grad and id(param) not in exported]
+    if omitted:
+        raise ValueError(
+            "Adapter-only export would omit trainable parameters: "
+            f"{', '.join(omitted[:5])}. Save a full training checkpoint and export the updated base separately."
+        )
+
+
 def _find_adapter_file(adapter_path: str) -> tuple[str, bool]:
     """Return ``(file_path, is_safetensors)`` for the adapter in ``adapter_path``."""
     safetensors_path = os.path.join(adapter_path, SAFETENSORS_NAME)

@@ -352,6 +352,12 @@ class BaseTrainer(Stateful, ABC):
         if not dist.is_initialized():
             dist.init_process_group(backend=get_dist_comm_backend())
 
+        from ..optim.ple_world_profile import establish as establish_ple_world_profile
+
+        establish_ple_world_profile(
+            args.model.optimizer, args.model.accelerator, args.train.checkpoint, owner=args.train
+        )
+
         logger.info(f"Process rank: {args.train.global_rank}, world size: {args.train.world_size}")
 
         # Register ParallelState before seed/determinism env vars. Mesh creation
