@@ -129,9 +129,19 @@ def _check_hf_source_exportable(model_path: str) -> None:
         weight_files = source.layout.source_weight_files(source.path)
     except FileNotFoundError as e:
         raise ValueError(
-            f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights: {e} "
+            f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs recognised weights: {e} "
             "Convert the checkpoint to safetensors, or disable save_hf_weights."
         ) from e
+    # Reading the source for *loading* accepts either serialization, but writing
+    # it back keys the output on safetensors headers (`source_tensor_specs`), so
+    # a pickle root has to be refused here rather than deep inside the writer.
+    non_safetensors = sorted({name for name in weight_files.values() if not name.endswith(".safetensors")})
+    if non_safetensors:
+        raise ValueError(
+            "`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights; "
+            f"this checkpoint stores {non_safetensors}. Convert the checkpoint to safetensors "
+            "(e.g. `model.save_pretrained(out, safe_serialization=True)`), or disable save_hf_weights."
+        )
     try:
         source_tensor_specs(source.path, weight_files)
     except ValueError as e:
