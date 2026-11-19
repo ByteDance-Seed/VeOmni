@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -26,8 +27,10 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.tensor import Partial, Replicate
 from torch.optim import AdamW
 from torch.optim.optimizer import Optimizer
+from transformers.optimization import Adafactor
 
 from ..distributed.parallel_state import get_parallel_state
 from ..utils import logging
@@ -148,6 +151,135 @@ def filter_empty_param_groups(
             total - len(non_empty),
         )
     return non_empty
+
+
+def restore_optimizer_param_group_defaults(optimizer: Any) -> None:
+    """Re-apply optimizer defaults to param groups after DCP load.
+
+    Recurses into containers of optimizers so the safety net reaches every real
+    optimizer regardless of how it was passed:
+
+    * a plain ``dict`` of optimizers (the form PyTorch DCP APIs natively accept),
+    * a ``MultiOptimizer`` (ExtraParallel+FSDP2 / Muon), which has no top-level
+      ``defaults``/``param_groups`` and wraps sub-optimizers in ``optimizers_dict``.
+    """
+    if isinstance(optimizer, dict):
+        for sub_optimizer in optimizer.values():
+            restore_optimizer_param_group_defaults(sub_optimizer)
+        return
+
+    sub_optimizers = getattr(optimizer, "optimizers_dict", None)
+    if sub_optimizers is not None:
+        for sub_optimizer in sub_optimizers.values():
+            restore_optimizer_param_group_defaults(sub_optimizer)
+        return
+
+    defaults = getattr(optimizer, "defaults", None)
+    param_groups = getattr(optimizer, "param_groups", None)
+    if not defaults or not param_groups:
+        return
+    for group in param_groups:
+        for key, value in defaults.items():
+            group.setdefault(key, value)
+
+
+def _replicate_partial_dtensor(value: torch.Tensor) -> torch.Tensor:
+    """Finish reductions before an Adafactor statistic is reused in a sharded update."""
+
+    if not isinstance(value, DTensor) or not any(isinstance(placement, Partial) for placement in value.placements):
+        return value
+    placements = tuple(Replicate() if isinstance(placement, Partial) else placement for placement in value.placements)
+    return value.redistribute(placements=placements)
+
+
+def _adafactor_state_like(value: torch.Tensor, reference: torch.Tensor, name: str) -> torch.Tensor:
+    if isinstance(reference, DTensor):
+        if not isinstance(value, DTensor):
+            raise RuntimeError(f"Adafactor state {name!r} lost its DTensor placement")
+        return value.to(dtype=reference.dtype)
+    return value.to(reference)
+
+
+class DistributedAdafactor(Adafactor):
+    """Hugging Face Adafactor with placement-correct FSDP2 statistic states."""
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.dtype in {torch.float16, torch.bfloat16}:
+                    grad = grad.float()
+                if grad.is_sparse:
+                    raise RuntimeError("Adafactor does not support sparse gradients.")
+
+                state = self.state[p]
+                factored, use_first_moment = self._get_options(group, grad.shape)
+                squared_update = (grad**2) + group["eps"][0]
+                row_update = _replicate_partial_dtensor(squared_update.mean(dim=-1)) if factored else None
+                col_update = _replicate_partial_dtensor(squared_update.mean(dim=-2)) if factored else None
+
+                if len(state) == 0:
+                    state["step"] = 0
+                    if use_first_moment:
+                        state["exp_avg"] = torch.zeros_like(grad)
+                    if factored:
+                        state["exp_avg_sq_row"] = torch.zeros_like(row_update)
+                        state["exp_avg_sq_col"] = torch.zeros_like(col_update)
+                    else:
+                        state["exp_avg_sq"] = torch.zeros_like(grad)
+                    state["RMS"] = 0
+                else:
+                    if use_first_moment:
+                        state["exp_avg"] = _adafactor_state_like(state["exp_avg"], grad, "exp_avg")
+                    if factored:
+                        state["exp_avg_sq_row"] = _adafactor_state_like(
+                            state["exp_avg_sq_row"], row_update, "exp_avg_sq_row"
+                        )
+                        state["exp_avg_sq_col"] = _adafactor_state_like(
+                            state["exp_avg_sq_col"], col_update, "exp_avg_sq_col"
+                        )
+                    else:
+                        state["exp_avg_sq"] = _adafactor_state_like(state["exp_avg_sq"], grad, "exp_avg_sq")
+
+                p_data_fp32 = p.float() if p.dtype in {torch.float16, torch.bfloat16} else p
+                state["step"] += 1
+                state["RMS"] = _replicate_partial_dtensor(self._rms(p_data_fp32))
+                lr = self._get_lr(group, state)
+                beta2t = 1.0 - math.pow(state["step"], group["decay_rate"])
+
+                if factored:
+                    exp_avg_sq_row = state["exp_avg_sq_row"]
+                    exp_avg_sq_col = state["exp_avg_sq_col"]
+                    exp_avg_sq_row.mul_(beta2t).add_(row_update, alpha=1.0 - beta2t)
+                    exp_avg_sq_col.mul_(beta2t).add_(col_update, alpha=1.0 - beta2t)
+                    update = self._approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col)
+                    update.mul_(grad)
+                else:
+                    exp_avg_sq = state["exp_avg_sq"]
+                    exp_avg_sq.mul_(beta2t).add_(squared_update, alpha=1.0 - beta2t)
+                    update = exp_avg_sq.rsqrt().mul_(grad)
+
+                update_rms = _replicate_partial_dtensor(self._rms(update))
+                update.div_((update_rms / group["clip_threshold"]).clamp_(min=1.0))
+                update.mul_(lr)
+                if use_first_moment:
+                    exp_avg = state["exp_avg"]
+                    exp_avg.mul_(group["beta1"]).add_(update, alpha=1.0 - group["beta1"])
+                    update = exp_avg
+                if group["weight_decay"] != 0:
+                    p_data_fp32.add_(p_data_fp32, alpha=-group["weight_decay"] * lr)
+                p_data_fp32.add_(-update)
+                if p.dtype in {torch.float16, torch.bfloat16}:
+                    p.copy_(p_data_fp32)
+
+        return loss
 
 
 # https://github.com/meta-llama/llama-recipes/blob/v0.0.4/src/llama_recipes/policies/anyprecision_optimizer.py
@@ -575,11 +707,24 @@ def build_optimizer(
         foreach = not fused
         fused = fused
         optim = AdamW(param_groups, lr, betas, eps, weight_decay, fused=fused, foreach=foreach)
+    elif optimizer_type == "adafactor":
+        optim = DistributedAdafactor(
+            param_groups,
+            lr=lr,
+            eps=(1e-30, 1e-3),
+            clip_threshold=1.0,
+            decay_rate=-0.8,
+            beta1=None,
+            weight_decay=weight_decay,
+            scale_parameter=False,
+            relative_step=False,
+            warmup_init=False,
+        )
     elif optimizer_type == "anyprecision_adamw":
         optim = AnyPrecisionAdamW(param_groups, lr, betas, eps, weight_decay)
     else:
         raise ValueError(
-            "Only adamw, anyprecision_adamw and muon are supported as optimizers; "
+            "Only adamw, adafactor, anyprecision_adamw and muon are supported as optimizers; "
             f"got optimizer_type={optimizer_type!r}."
         )
 
@@ -966,10 +1111,23 @@ def build_extra_parallel_fsdp2_optimizer(
             foreach = not fused
             _fused = fused
             return AdamW(groups, lr, betas, eps, weight_decay, fused=_fused, foreach=foreach)
+        elif optimizer_type == "adafactor":
+            return DistributedAdafactor(
+                groups,
+                lr=lr,
+                eps=(1e-30, 1e-3),
+                clip_threshold=1.0,
+                decay_rate=-0.8,
+                beta1=None,
+                weight_decay=weight_decay,
+                scale_parameter=False,
+                relative_step=False,
+                warmup_init=False,
+            )
         elif optimizer_type == "anyprecision_adamw":
             return AnyPrecisionAdamW(groups, lr, betas, eps, weight_decay)
         else:
-            raise ValueError("Only adamw and anyprecision_adamw are supported as optimizers.")
+            raise ValueError("Only adamw, adafactor and anyprecision_adamw are supported as optimizers.")
 
     optimizer_dict: Dict[str, Optimizer] = {}
     for para in parallel_state.extra_parallel_names:

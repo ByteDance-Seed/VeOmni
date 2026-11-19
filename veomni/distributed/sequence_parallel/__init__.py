@@ -35,7 +35,7 @@ from .data import (
     sp_pad_and_slice,
     sp_take_own_seq,
 )
-from .loss import reduce_sequence_parallel_loss
+from .loss import SumOverShards, reduce_sequence_parallel_loss, sum_over_ulysses_shards
 from .ulysses import (
     all_to_all_images,
     gather_heads_scatter_seq,
@@ -71,4 +71,6 @@ __all__ = [
     "pad_tensor",
     "unpad_tensor",
     "reduce_sequence_parallel_loss",
+    "SumOverShards",
+    "sum_over_ulysses_shards",
 ]

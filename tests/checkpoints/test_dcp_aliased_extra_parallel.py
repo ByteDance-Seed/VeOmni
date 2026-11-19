@@ -74,12 +74,39 @@ class ToyAliasedExpertsModel(nn.Module):
         return ParallelPlan(extra_parallel_plan={"ep": {"decoder.experts": Shard(0)}})
 
 
-def _build_model():
+class _TieInPostShardPlan(ParallelPlan):
+    def post_shard(self, model):
+        model.encoder = model.decoder
+
+
+class ToyLateTiedExpertsModel(ToyAliasedExpertsModel):
+    """The same alias, but only tied once the experts are sharded.
+
+    This is DiffusionGemma built with weights: the loader constructs it under
+    ``no_init_weights``, which skips the HF tie, so ``ParallelPlan.apply`` first walks
+    ``encoder.experts`` as a separate parameter outside the plan and records it as
+    ``Replicate``. ``post_shard`` restores the tie, and the alias must then take the
+    sharded parameter's spec instead of keeping the stale one.
+
+    The FSDP wrap targets are collected before ``apply``, so the detached original
+    ``encoder`` still gets a ``fully_shard`` unit of its own. It is unreachable from the
+    model afterwards and does not take part in the round trip.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.encoder = ToyExpertLayer()
+
+    def get_parallel_plan(self):
+        return _TieInPostShardPlan(extra_parallel_plan={"ep": {"decoder.experts": Shard(0)}})
+
+
+def _build_model(model_cls=ToyAliasedExpertsModel):
     from veomni.distributed.torch_parallelize import build_parallelize_model
 
     # FSDP2 requires meta init; the weights come from `ToyAliasedExpertsModel.init_weights`.
     return build_parallelize_model(
-        ToyAliasedExpertsModel(),
+        model_cls(),
         init_device="meta",
         weights_path=None,
         mixed_precision=MixedPrecisionConfig(enable=False),
@@ -97,7 +124,7 @@ def _fill_experts_distinctly(model, value: float) -> None:
                 local.fill_(value)
 
 
-def _aliased_extra_parallel_worker(ep_size: int = 2):
+def _aliased_extra_parallel_worker(ep_size: int = 2, model_cls=ToyAliasedExpertsModel):
     from veomni.checkpoint.dcp_checkpointer import ModelState
     from veomni.distributed.parallel_state import _init_parallel_state
     from veomni.utils.device import get_device_type
@@ -113,18 +140,23 @@ def _aliased_extra_parallel_worker(ep_size: int = 2):
         extra_parallel_names=("ep",),
     )
 
-    model = _build_model()
+    model = _build_model(model_cls)
 
     # Every state-dict name for a sharded parameter needs a spec, not just the canonical
     # one, or the ExtraParallel dimension is silently left collapsed for the rest.
     # The plan only runs when an ExtraParallel dimension is actually enabled, so there is
     # no `_fqn2spec_info` to inspect at ep_size 1.
     if ep_size > 1:
+        assert model.encoder is model.decoder, "the alias must be tied before the round trip"
         fqn2spec_info = model._fqn2spec_info
         assert "decoder.experts" in fqn2spec_info, sorted(fqn2spec_info)
         assert "encoder.experts" in fqn2spec_info, (
             f"[Rank {rank}] the aliased name has no ExtraParallel spec, so it will be saved "
             f"as a local shard: {sorted(fqn2spec_info)}"
+        )
+        assert fqn2spec_info["encoder.experts"] is fqn2spec_info["decoder.experts"], (
+            f"[Rank {rank}] the aliased name kept a spec of its own "
+            f"({fqn2spec_info['encoder.experts'].placement}), so it will be saved as a local shard"
         )
 
     _fill_experts_distinctly(model, value=1.0 + rank)
@@ -154,7 +186,7 @@ def _aliased_extra_parallel_worker(ep_size: int = 2):
 
     # Load side: a truncated alias landing on the shared parameter shows up here as one
     # rank holding another's values.
-    fresh = _build_model()
+    fresh = _build_model(model_cls)
     _fill_experts_distinctly(fresh, value=-1.0)
     dcp.load(state_dict={"model": ModelState(fresh)}, checkpoint_id=checkpoint_dir)
 
@@ -174,8 +206,12 @@ def _aliased_extra_parallel_worker(ep_size: int = 2):
 
 @pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
 @pytest.mark.skipif(runner_device_count() < 2, reason="needs 2 devices")
-def test_aliased_extra_parallel_parameters_survive_a_dcp_round_trip():
+@pytest.mark.parametrize("ep_size", [1, 2], ids=["no_ep", "ep2"])
+@pytest.mark.parametrize(
+    "model_cls", [ToyAliasedExpertsModel, ToyLateTiedExpertsModel], ids=["tied_at_init", "tied_in_post_shard"]
+)
+def test_aliased_extra_parallel_parameters_survive_a_dcp_round_trip(ep_size: int, model_cls):
     """Verify aliased ExtraParallel parameters preserve full expert shapes across DCP save/load."""
     from ..tools.launch_utils import torchrun
 
-    torchrun(partial(_aliased_extra_parallel_worker, 2), world_size=_CI_ACCELERATOR_2.nproc)
+    torchrun(partial(_aliased_extra_parallel_worker, ep_size, model_cls), world_size=_CI_ACCELERATOR_2.nproc)

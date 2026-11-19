@@ -95,3 +95,70 @@ def mean_global_loss(
 def reduce_global_loss_token(micro_batches_token_len: dict[str, torch.Tensor]) -> dict[str, float]:
     """All-reduce per-step loss-token denominators once for reuse across micro-batches."""
     return {key: all_reduce(value.item(), op="sum") for key, value in micro_batches_token_len.items()}
+
+
+def dllm_mean_global_loss(
+    local_weighted_sum: torch.Tensor,
+    micro_batches_num_samples: int,
+    sum_spans_sp_group: bool = False,
+):
+    """Global normalization for the dLLM masked-CE loss.
+
+    The dLLM objective normalizes by the **number of samples** (``B``), not by
+    token count (cf. ``mean_global_loss``). ``dllm_masked_cross_entropy`` with
+    ``reduction="sum"`` returns the *local* weighted sum ``Σ_i w_i · CE_i`` for one
+    micro-batch (``w_i = 1/(t_s·N_s)`` already baked in by the collator). This
+    function turns that into the contribution to the global per-sample mean::
+
+        loss = local_weighted_sum / global_num_samples * fsdp_size
+
+    where ``global_num_samples`` is the all-reduced (over DP) total sample count
+    across the whole optimizer step, and the ``* fsdp_size`` undoes FSDP's
+    gradient averaging (same rationale as ``mean_global_loss``).
+
+    Args:
+        local_weighted_sum: this micro-batch's ``Σ w_i·CE_i`` (scalar tensor).
+        micro_batches_num_samples: total sample count of all micro-batches in
+            this step on the local DP rank (summed before the call).
+        sum_spans_sp_group: the caller asserts that ``local_weighted_sum`` is the
+            *whole* sequence-parallel group's sum rather than this rank's shard of
+            it. Only then does the formula above hold unchanged under SP; see
+            below. Left ``False`` by default because it is a property of the
+            model, not of the topology, and the wrong answer here is a silently
+            mis-scaled loss.
+
+    Returns:
+        The normalized scalar loss contribution for this micro-batch.
+
+    Under sequence parallelism the formula needs no ``sp_size`` term, and it is
+    worth showing why rather than trusting it. With ``dp_shard = D`` and
+    ``ulysses = S``: ``dp_rank`` excludes the Ulysses dimension, so the ``S`` peers
+    of a group are handed the *same* micro-batch and report the same
+    ``micro_batches_num_samples``; the all-reduce below is over the world group,
+    so it counts every sample ``S`` times and ``global_num_samples`` is ``S`` times
+    the step's true count. ``fsdp_size`` is ``world_size // (pp * tp)``, which is
+    ``D * S``, so it carries the same factor. The two cancel, leaving exactly what
+    ``sp_size = 1`` over ``D`` ranks produces.
+
+    That cancellation rests entirely on ``local_weighted_sum`` being the group's
+    whole sum. A model that computes its loss on the sharded sequence hands in a
+    *shard* of the sum, and then the ``S`` in ``fsdp_size`` has nothing to cancel
+    against and the loss comes out ``S`` times small. DiffusionGemma qualifies for
+    the opposite reason on each of its two terms: the diffusion term runs on
+    canvases that SP replicates, and the AR term is passed through
+    ``sequence_parallel.sum_over_ulysses_shards`` before it arrives. Hence the flag.
+    """
+    if get_parallel_state().sp_enabled and not sum_spans_sp_group:
+        raise NotImplementedError(
+            "dLLM loss reduction under sequence parallelism needs the loss to be whole across the SP "
+            "group, and this caller has not said that it is. A model that computes its loss on the "
+            "sharded sequence must reduce it over the group first (see "
+            "`sequence_parallel.sum_over_ulysses_shards`) and pass `sum_spans_sp_group=True`; otherwise run "
+            "with `ulysses_size: 1`."
+        )
+
+    global_num_samples = all_reduce(int(micro_batches_num_samples), op="sum")
+    if global_num_samples == 0:
+        # Keep the autograd graph intact while contributing zero.
+        return local_weighted_sum * 0.0
+    return local_weighted_sum / global_num_samples * get_parallel_state().fsdp_size

@@ -669,15 +669,16 @@ class TestGlobalStateCallbackJobState:
             {"shard_index": 1, "rows_written": 1, "world_size": 1}
         )
 
-    @patch("veomni.trainer.callbacks.global_state_callback.get_device_type", return_value="cpu")
-    def test_load_skips_when_any_rank_is_missing_state(self, mock_device, mock_dist, tmp_path):
-        """A missing cursor on one rank must not leave the others at a different step."""
-        mock_dist.is_initialized.return_value = True
+    @patch("veomni.trainer.callbacks.global_state_callback.any_rank_failed", return_value=True)
+    def test_load_skips_when_any_rank_is_missing_state(self, mock_any_failed, tmp_path):
+        """A missing cursor on one rank must not leave the others at a different step.
 
-        def drop_presence(flag, op=None):
-            flag.zero_()
-
-        mock_dist.all_reduce.side_effect = drop_presence
+        The presence check is a reduced flag, not a local one: this rank has a cursor
+        on disk, and `any_rank_failed` stands in for a peer that does not. It also
+        owns the device the flag is allocated on, which is why the callback no longer
+        patches `get_device_type` here -- a gloo group reduces on CPU regardless of
+        which accelerator the host has.
+        """
         trainer = _make_mock_trainer()
         trainer.args.train.checkpoint.load_path = str(tmp_path)
         trainer.args.train.global_rank = 0
@@ -699,8 +700,8 @@ class TestGlobalStateCallbackJobState:
         assert cb.load_global_state() is None
         trainer.channel_loss_callback.load_state_dict.assert_not_called()
         assert trainer.state.global_step == 0
-        mock_dist.all_reduce.assert_called_once()
-        assert mock_dist.all_reduce.call_args.kwargs["op"] is torch.distributed.ReduceOp.MIN
+        # This rank found its cursor, so the flag it contributes is "not failed".
+        mock_any_failed.assert_called_once_with(False)
 
     def test_a_pre_split_job_cursor_is_not_read(self, mock_dist, tmp_path):
         """Only ``extra_state/rank_{R}.pt`` carries the cursor now.

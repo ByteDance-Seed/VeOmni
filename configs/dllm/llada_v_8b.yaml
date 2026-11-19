@@ -1,0 +1,55 @@
+# LLaDA-V (LLaDA-8B + SigLIP) image-text masked-diffusion SFT with DllmTrainer.
+#
+#   bash train.sh tasks/train_dllm.py configs/dllm/llada_v_8b.yaml
+#
+# Convert first (config rewrite, symlinked shards, SigLIP preprocessor config):
+#   python scripts/convert_lladav_to_veomni.py --src LLaDA-V --dst LLaDA-V-veomni
+#
+# `data_type: llada_v` reads ShareGPT / OpenAI-style `messages` with `<image>` placeholders
+# and the matching `images`. Each image is one 384px tile of 756 slots that are never
+# masked; only the answer text is. Ulysses sequence parallelism is supported
+# (`model.accelerator.ulysses_size`): every rank encodes every image and fills the slots
+# in its shard. The chat template stays on the tokenizer (`model.chat_template: llada`)
+# even though the checkpoint ships an image processor.
+model:
+  model_path: LLaDA-V-veomni
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  chat_template: llada
+  optimizer:
+    type: adamw
+    lr: 2.0e-5
+    lr_decay_style: cosine
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+  accelerator:
+    ulysses_size: 1  # Ulysses SP; must divide num_attention_heads (32)
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+
+data:
+  train_path: sharegpt4v
+  data_type: llada_v
+  max_seq_len: 4096
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  global_batch_size: 32
+  micro_batch_size: 1
+  num_train_epochs: 1
+  checkpoint:
+    output_dir: LLaDA-V-sft
+    manager: dcp
+    save_steps: 500
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: LLaDA-V-sft

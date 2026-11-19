@@ -1,0 +1,31 @@
+# Single-process eager inference overrides for LLaDA2.0-Uni-16B (I2T).
+llada2_uni_image_tokenizer:
+  model_path: llada2_uni_image_tokenizer
+  ops_implementation:
+    attn_implementation: sdpa
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+
+llada2_uni_text_encoder:
+  model_path: llada2_uni_text_encoder
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+
+llada2_uni_llm:
+  model_path: llada2_uni_llm
+  ops_implementation:
+    attn_implementation: sdpa
+    moe_implementation: eager
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+
+llada2_uni_decoder:
+  model_path: llada2_uni_decoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: eager

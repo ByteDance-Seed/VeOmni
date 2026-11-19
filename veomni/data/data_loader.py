@@ -82,6 +82,7 @@ def build_native_dataloader(
     dyn_bsz_physical_overflow_ratio: float = 1.5,
     dyn_bsz_dataset_save_by_idx: bool = False,  # Whether to save dynamic-batching buffers by index for worker-side checkpoint/resume.
     dyn_bsz_buffer_size: int = 200,
+    dyn_bsz_length_fn: Optional[Callable[[Dict[str, Any]], int]] = None,
     num_workers: int = 8,
     worker_num_threads: Optional[int] = None,
     drop_last: bool = True,
@@ -141,6 +142,16 @@ def build_native_dataloader(
                 trainer step input
                   │ ``list[list[dict]]``
 
+        dyn_bsz_length_fn: What one sample costs against the token budget, for both
+            runtimes. ``None`` takes the ``dyn_bsz_count_mode`` default (the
+            ``attention_mask`` sum for ``"total"``), which is right for a model whose
+            sample is one sequence through one stack. A model that runs a second stack
+            over tokens the first one also saw costs more than that per sample and has
+            to say so here, or the budget stops converting to a step time --
+            ``DllmTrainer`` supplies one for that reason. Only valid with
+            ``dyn_bsz_count_mode="total"``. Must be a module-level callable, since it is
+            pickled into spawned workers and into the dataloader's ``state_dict``.
+
         multiprocessing_context: Optional worker start method override.
             Use ``"spawn"`` when worker-side code must be pickle-safe and should not
             inherit parent-process state; keep ``"fork"`` for the legacy Linux behavior.
@@ -175,7 +186,13 @@ def build_native_dataloader(
             f"bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}."
         )
         dyn_bsz_collate_fn = collate_fn
-        dyn_bsz_length_fn = get_length_fn_by_count_mode(dyn_bsz_count_mode)
+        if dyn_bsz_length_fn is None:
+            dyn_bsz_length_fn = get_length_fn_by_count_mode(dyn_bsz_count_mode)
+        elif dyn_bsz_count_mode != "total":
+            raise ValueError(
+                f"dyn_bsz_length_fn replaces the dyn_bsz_count_mode length measure; it cannot be combined "
+                f"with dyn_bsz_count_mode={dyn_bsz_count_mode!r}."
+            )
         if dyn_bsz_count_mode == "effective":
             if dyn_bsz_physical_overflow_ratio < 1.0:
                 raise ValueError(

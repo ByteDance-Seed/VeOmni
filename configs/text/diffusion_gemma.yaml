@@ -1,0 +1,308 @@
+# DiffusionGemma-26B-A4B text-only block-diffusion training (FSDP2 + EP).
+#
+# DiffusionGemma is a uniform-state discrete diffusion LM, not an autoregressive one:
+# the encoder prefills the prompt and exports only its KV cache, and the decoder
+# denoises a fixed-length canvas that is bidirectional over `[cache | canvas]`.
+# Launch with `tasks/train_dllm.py`, which wires the matching data
+# transform, batching collator and per-sample loss reduction. For text+image training
+# see `configs/multimodal/diffusion_gemma/diffusion_gemma_mm.yaml`, which uses the same
+# entry point and differs only in `data.data_type`.
+
+model:
+  model_path: diffusiongemma-26B-A4B-it
+  ops_implementation:
+    # No flavour of FlashAttention: the decoder attends bidirectionally over `[encoder
+    # cache | canvas]`, which flash cannot represent -- it reads any mask as a padding mask
+    # over the query length. The model raises rather than letting it fail inside a kernel,
+    # and it refuses the whole family, including the `veomni_flash_attention_N_with_sp`
+    # names this backend rewrites to and the `kernels-community/flash-attn*` names
+    # transformers rewrites to when flash-attn is unavailable but `kernels` is installed.
+    # Installing flash-attn would not rescue the whole model anyway: FA2 and FA3 cap the
+    # head dimension at 256, and the 5 full-attention layers here are 512 wide (the 25
+    # sliding layers are 256).
+    #
+    # flex_attention trains correctly now -- it used to return zero dK and dV here; see
+    # `uncompiled_block_masks` in `modeling_diffusion_gemma.py` for what was wrong. At the real
+    # decoder geometry compiled flex sits closer to sdpa's math backend than sdpa's own
+    # memory-efficient kernel does (bf16 5.87e-3 against 6.47e-3), and its backward repeats
+    # itself without `enable_full_determinism` having to force sdpa onto math and that backend's
+    # quadratic memory.
+    #
+    # sdpa stays the default because flex is not yet the cheaper backend here -- at this
+    # geometry it is the more expensive one. Per-step over four steps of the 26B recipe: flex
+    # 87/30/34/26s, sdpa on math 29/20/26/26s, sdpa on its memory-efficient kernel 21/17/21/21s.
+    # A production run does not set `enable_full_determinism`, so that last row is the one flex
+    # has to beat, and sdpa is the one ahead: 21s against flex's 26s at step 4, and 80s against
+    # 177s over all four. Peak memory was 59.41GB on all three. The bench that
+    # motivated flex (prompt 16384, forward: 481 ms / 5029 MiB against sdpa's 1462 ms / 8951 MiB)
+    # was an isolated call, and nothing has reproduced that win inside the recipe -- flex was
+    # still recompiling at step 4, so 26s may not be its steady state. Constraint 31 in
+    # `.agents/knowledge/constraints.md` has the rest, and
+    # `scripts/bench_diffusion_gemma_decoder_backends.py` reproduces the accuracy numbers.
+    attn_implementation: sdpa
+    moe_implementation: fused_triton
+  model_config:
+    # Each sample supervises one canvas of its answer, drawn at random. The encoder is
+    # given the prompt plus every canvas uncorrupted -- Eq. 13's `P + K C` sequence --
+    # and the decoder is masked to the prefix in front of the draw, which is the
+    # conditioning block-autoregressive generation produces from the second canvas on.
+    # Tokens past `max_canvases * canvas_length` are never supervised; raising it
+    # lengthens the encoder context linearly, now by a full extra canvas rather than
+    # only the prefix in front of the last draw.
+    #
+    # A last canvas that is shorter than `canvas_length` is filled with EOS (id=1),
+    # not PAD or noise -- official CanvasChunker. Diffusion supervises the whole
+    # fill; AR defaults to the first EOS only (`mask_other_tail_eos`). PAD is for
+    # left-padding prompts in the collator. Empty answers stay empty (zero weight)
+    # rather than becoming a canvas of EOS.
+    #
+    # The drawn canvas carries a plain per-token mean, so every sample counts once
+    # however long its answer is. That is the paper's `1/C`; an earlier version scaled
+    # by the block count instead and only bought gradient norms in the hundreds.
+    max_canvases: 8
+    # 0-based offset into the answer where the canvas grid starts. 0 = first token after
+    # the prompt. `n` commits the first n answer tokens to the encoder and never denoises
+    # them; the drawn canvas is then answer[n + kC : n + (k+1)C].
+    canvas_start: 0
+    # Probability of conditioning a *sample* on the model's own prediction, which is
+    # what the sampler feeds at every denoising step. Packed rows still draw one
+    # Bernoulli per canvas, not one bit for the whole pack. Costs one extra forward
+    # per step; 0.0 skips it, at the price of a model that meets the signal cold
+    # at inference.
+    self_conditioning_prob: 0.5
+    # Add the encoder's causal next-token loss to the canvas denoising loss, summed with
+    # no weight between them, which is the paper's Eq. 13.
+    #
+    # Expect it to start high and fall fast. Nothing at inference reads the encoder's
+    # final hidden state -- only its KV cache -- so on the released 26B checkpoint that
+    # readout is unconstrained: measured on real prompts it scores 21.9 nats against the
+    # 12.5 of guessing uniformly over the 262k vocabulary, and its top-1 agrees with the
+    # next token 0% of the time. The term is therefore training a head from scratch, and
+    # on `tulu-3` it went 16.5 -> 4.6 within four steps while the canvas loss tracked a
+    # run without it (0.07 / 1.83 / 5.72 / 0.94 against 0.07 / 1.76 / 6.44 / 0.86).
+    # The cost lands on the gradient norm, 4.8 -> 875 on the first step and 231 -> 305 by
+    # the third, against `max_grad_norm: 1.0` below -- clipping was already the regime
+    # here, and this deepens it while the head converges.
+    encoder_ar_loss: true
+    # Drop the prompt from the encoder next-token term, leaving only the clean canvases.
+    # Default false is Eq. 13 (supervise P + K C). The first answer token is still
+    # predicted from the last prompt hidden state.
+    mask_prompt_ar_loss: false
+    # AR keeps the first EOS of the trailing fill (the stop) and drops the rest of
+    # that run. False is Eq. 13 over the whole suffix. Diffusion is unchanged.
+    mask_other_tail_eos: true
+    # False is Eq. 13: one drawn canvas, diffusion is that canvas's mean CE.
+    # True denoises every encoder canvas and averages those means
+    # (`(1/K) Σ_k mean_CE_k`). AR is still once over `P + K C`; the example
+    # still counts as one sample. The encoder runs once, whichever way
+    # `canvas_batching` below consumes the K canvases. Ranks all-reduce max K
+    # and pad so the per-canvas collectives stay aligned. Do not expand the
+    # encoder to K rows -- that OOMs the 26B run.
+    compute_all_canvas_df_loss: true
+    # How the decoder consumes those K canvases. `serial` runs one decoder pass per
+    # canvas over the shared encoder cache. `flat_batch` folds the canvas axis into the
+    # decoder's batch and runs a single pass of B*K rows, so the FSDP all-gathers and
+    # the EP all-to-alls fire once per micro-batch instead of K times and the MoE
+    # routes K canvases of tokens per call instead of one.
+    #
+    # Same computation either way: a canvas is still one segment in its own row,
+    # reading the same keys through the same key-side mask, so sliding attention and
+    # the leakage boundary are untouched.
+    #
+    # Memory is not unchanged, and this is the reason to measure before switching. The
+    # activations retained for the backward are the same -- the serial loop already
+    # keeps every canvas's alive. What grows is the transient inside a layer: `flat_batch`
+    # computes on B*K*C tokens at once where `serial` computes on B*C, so the MLP/MoE
+    # intermediates (`intermediate_size` plus two `moe_intermediate_size` wide) and each
+    # EP all-to-all payload scale with K, up to `max_canvases: 8`. That is where the
+    # saved launches come from, and also where the peak goes. On sdpa the repeated
+    # encoder cache is one more transient copy, which `attn_dg_prefix` avoids by
+    # gathering from the shared row. None of this is measured at 26B, where `serial`
+    # exists because of an 80GB OOM boundary in the first place.
+    #
+    # `flat_seq` packs the K canvases onto the sequence instead of the batch: one row
+    # of K*C tokens. It is the only mode that lowers what attention materialises,
+    # because each canvas hands the hole kernel its visible run as an interval rather
+    # than a gathered copy -- P + K*C keys per layer against `flat_batch`'s
+    # K*P + K^2*C/2. Measured on an A800 at these shapes (see
+    # `scripts/bench_diffusion_gemma_hole.py`), against `flat_batch` at K=4/8/16:
+    # sliding layers 3.1x/2.8x/2.6x faster at 1.2x/1.3x/1.4x less peak, global layers
+    # 1.1x/1.1x/1.2x faster at 2.4x/2.9x/3.6x less peak. The MLP/MoE transient above
+    # is unchanged by the packing axis -- it is still K*C tokens per pass.
+    #
+    # `flat_seq` needs the untruncated encoder cache (training already passes
+    # `past_key_values=None`), and each canvas's visible keys must be one contiguous
+    # run, which the standard layout always gives. Both are checked, not assumed.
+    # Without `attn_dg_prefix` it runs on sdpa through a dense hole mask -- correct,
+    # but it pays for the holes the kernel exists to skip.
+    #
+    # Equal is not bit-identical: in bf16 the GEMM reduction order follows the batch
+    # shape, so switching modes perturbs logits at the usual bf16 scale unless
+    # `train.enable_batch_invariant_mode` is on. Equivalence -- numeric in float64 and
+    # at the visibility boundary directly -- is pinned in
+    # `tests/models/test_diffusion_gemma_canvas_batching.py`.
+    #
+    # The default is `flat_seq`, paired with the `attn_dg_prefix` below so the interval
+    # reaches the hole kernel instead of a dense sdpa mask; with `attention_dropout: 0.0`
+    # here, `should_use_hole_kernel` takes the kernel. Under `ulysses_size > 1` the kernel
+    # is the only decoder path there is, so the sdpa fallback is refused rather than
+    # chosen -- its dense mask spans the encoder row that SP just sharded.
+    #
+    # Be clear about what this trades. The 26B run has trained on `serial`, and the
+    # numbers above are an A800 microbenchmark of the attention layers, not a measured
+    # step time or peak at this scale. `serial` is the fallback if this OOMs or diverges.
+    #
+    # `flat_seq_pack` goes one step further and puts several *examples* in the row,
+    # with the collator marking the boundaries by restarting `position_ids` and the
+    # encoder running varlen attention over the segments. That is what makes a
+    # micro-batch of several samples cost the tokens it holds rather than the longest
+    # prompt times the batch size -- on an A800 at production geometry, 2.4-3.0x over
+    # running the same samples as separate accumulation steps, for 0.96-1.8x the
+    # transient memory -- it is not a memory saving (`scripts/bench_flat_seq_pack.py`).
+    #
+    # Do not read that speedup as packing's, though. Most of it is having a
+    # micro-batch wider than one at all, which `micro_batch_size: N` under plain
+    # `flat_seq` collects too (1.4-2.8x, at 1.9-3.1x the transient memory).
+    # Packing's own share over that rises to 1.73x at a 1.8x encoder-row padding
+    # ratio, and falls to 1.10x with nothing to pad -- where what is left is the
+    # varlen kernels rather than the packing, since a packed encoder bypasses the
+    # sdpa dispatch. So it is worth what the data is ragged, and length bucketing
+    # is the competing answer.
+    #
+    # Left off here because it is unproven at 26B scale and text-only: with images
+    # the collator refuses the batch, since the varlen kernels carry no image block
+    # boundaries.
+    canvas_batching: flat_seq_pack
+    # Diagnostic: two backwards so each Eq. 13 term's param-grad L2 can be printed
+    # (and logged as encoder_ar_grad_norm / diffusion_grad_norm) before clip. Default
+    # false is one backward of the sum. The extra pass retains the graph, clones the
+    # sharded AR grads, and repeats FSDP/EP all-gather -- turn on only to debug.
+    print_ar_df_norm: false
+    # Optional: run the 5 full-attention layers on FFPA instead of sdpa. Nothing fused in
+    # sdpa accepts a 512-wide head -- flash caps at 256 and memory-efficient attention has
+    # no kernel -- so today those layers materialize the whole score matrix. Measured on an
+    # A800 at the real head shape, forward + backward, batch 1 prompt 2048:
+    # sdpa 46.9 ms / 1336 MiB against ffpa 23.1 ms / 320 MiB, and 2.0x again at prompt 4096.
+    # It only ever fires on the encoder: FFPA hands back anything under 512 queries, and the
+    # decoder's canvas is 256. Needs `uv pip install --no-deps ffpa-attn`, which is not in the
+    # lockfile and so has to be reinstalled after any `uv sync`; with it missing the flag
+    # refuses to build rather than downgrading, so a run cannot be misread as FFPA's when it
+    # was sdpa's. See `veomni/models/transformers/diffusion_gemma/ffpa_attention.py`
+    # and `scripts/bench_diffusion_gemma_ffpa.py`.
+    #
+    # Decoder: pack visible encoder cache (full layers: all visible keys; sliding: last
+    # W-1) plus the current noisy canvas and run the DG_PREFIX Triton kernel. Padding /
+    # the clean current canvas / future canvases are dropped physically. CUDA only.
+    # See `veomni/models/transformers/diffusion_gemma/dg_prefix.py`.
+    text_config:
+      attn_ffpa: true
+      attn_dg_prefix: true
+  # The checkpoint's own template, driven through `apply_chat_template`. Not a stylistic
+  # choice: this model's turn markers are `<|turn>` / `<turn|>` (single ids 105 and 106),
+  # while `chatml`'s `<|im_start|>` is absent from the vocabulary and splits into six
+  # ordinary pieces. Training on those would teach a format the checkpoint has never seen
+  # and that the generation script does not stop on, without anything reporting an error.
+  # `tokenizer_generation_prompt` supervises only what follows the generation prompt, so
+  # the label span matches what the sampler is handed; plain `tokenizer` would also
+  # supervise the `<|turn>model` header.
+  chat_template: tokenizer_generation_prompt
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_warmup_ratio: 0.01
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
+  accelerator:
+    # Raising this needs `canvas_batching: flat_seq_pack` and `attn_dg_prefix: true`, and
+    # is refused at model build otherwise -- the padded modes pad prompts to the batch
+    # maximum and sdpa needs a mask over the full length, neither of which shards. SP
+    # splits the encoder row only; the decoder's canvases stay replicated and its
+    # attention gathers the cache back through an all-to-all. Measured at sp=2 on 6 toy
+    # layers, the whole model is 0.92x at 2048 encoder tokens (i.e. *slower*), 1.07x at
+    # this recipe's 4096, and 1.37x at 16384, with transient memory near 0.50x
+    # throughout. So the reason to turn it on at 4096 is memory headroom, not speed.
+    # EP stays at 8 under SP: expert modules fully_shard on `ep_fsdp`, then
+    # `extra_parallel_gradient_divide_factor` sets the FSDP divide factor to
+    # `world_size`, which already folds the SP dimension in (same path as Qwen3-MoE /
+    # DeepSeek-V3). `sp_size` cannot exceed the *smaller* of the two KV head counts
+    # without repeating them: production has 8 sliding and only 2 global, so
+    # `ulysses_size > 2` walks the repeat path on every global layer and pays back some of
+    # the memory GQA was saving.
+    ulysses_size: 1
+    ep_size: 8
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+    gradient_checkpointing:
+      # Applies to both stacks. The encoder is the one that matters: it spans the whole
+      # `max_seq_len` context while the decoder spans one canvas, and it is not free to
+      # recompute -- its forward writes the KV cache, so `SealableCache` has to refuse the
+      # replayed write (see DiffusionGemmaEncoderTextLayer). Measured on one encoder layer,
+      # recompute cuts what the layer keeps alive by ~28x, which at this geometry is the
+      # difference between fitting and not.
+      enable: true
+      # Must stay false: the decoder reaches the encoder cache through the recompute closure,
+      # which a reentrant checkpoint would exclude from the backward pass. The model raises
+      # rather than training the encoder with no gradient.
+      enable_reentrant: false
+    init_device: meta
+
+data:
+  train_path: tulu-3-sft-mixture
+  # Emits prompt input_ids plus a corrupted canvas (decoder_input_ids/labels/loss_weight).
+  data_type: diffusion_gemma
+  # Encoder context budget: the prompt plus whichever clean canvases precede the one being
+  # supervised. Room for the canvases is reserved before the prompt is truncated, so how
+  # much prompt survives depends on how long the sample's answer is but not on which block
+  # it draws: an answer using all 8 canvases leaves 4096 - 7 * 256 = 2304 for the prompt,
+  # a single-canvas answer leaves all 4096. Set this near `max_canvases * canvas_length`
+  # and the prompt has nowhere to go; the trainer warns. The canvas itself is separate,
+  # sized by `canvas_length` (256).
+  max_seq_len: 4096
+  train_size: 750000
+  text_keys: messages
+
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  # Needs `canvas_batching: flat_seq_pack` and is refused without it: any other mode
+  # left-pads the encoder context to the batch maximum, so a batch selected to hold N
+  # tokens arrives as up to `micro_batch_size * max(L)` and the budget stops describing
+  # the step -- in the direction that OOMs. With packing there is no padding to waste,
+  # and block sampling makes the spread worth collecting: a sample supervising the first
+  # canvas carries the prompt alone, one supervising the last carries seven canvases too.
+  #
+  # Turning it on also needs `micro_batch_size` raised. The budget per micro-batch is
+  # `micro_batch_size * max_seq_len` = 4096 here, while a sample costs up to
+  # `max_seq_len + max_canvases * canvas_length` = 6144. At 1 the budget reads as set
+  # and packs one sample per row, which `micro_batch_size` already does; under packing
+  # that factor scales the budget, not the number of rows, so raise it. What happens to
+  # the sample that does not fit depends on `dyn_bsz_runtime`: `main` passes it through,
+  # `worker` *discards* it -- which would drop every sample with canvases here, so the
+  # trainer refuses that combination rather than emptying the dataset quietly.
+  #
+  # Turning it on changes the unit `data.train_size` is counted in. A sample costs
+  # `L + K*C` -- the encoder row plus the canvas tokens the decoder passes over a second
+  # time -- because the canvases go through both stacks. Declare `train_size` in that
+  # unit (its token count times the mean `1 + K*C/L`, between 1x and 2x), or the run
+  # spends its budget faster than `train_steps` predicts and stops with the learning-rate
+  # schedule unfinished. The trainer warns; it cannot fix it, since the ratio is a
+  # property of the data.
+  dyn_bsz: false
+  num_train_epochs: 1
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: diffusiongemma-26B-A4B-sft
+    manager: dcp
+    save_steps: 100
+    save_epochs: 1
+    save_hf_weights: true
+  # `EnvironMeter` counts tokens from `attention_mask`, which here covers the prompt only,
+  # so the canvas tokens are missing and the reported MFU / tokens-per-second read low.
+  wandb:
+    project: VeOmni
+    name: diffusiongemma-26B-A4B-sft

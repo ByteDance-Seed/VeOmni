@@ -1,0 +1,54 @@
+# LLaDA-8B-Instruct masked-diffusion SFT with DllmTrainer.
+#
+#   bash train.sh tasks/train_dllm.py configs/dllm/llada_8b.yaml
+#
+# The checkpoint must be in the Llama key layout first (a pure key rename):
+#   python scripts/convert_llada_to_veomni.py --src LLaDA-8B-Instruct --dst LLaDA-8B-Instruct-veomni
+#
+# `data_type: llada` draws one mask ratio t ~ U(1e-3, 1) per sample, masks the answer
+# tokens with probability t and weights them 1/(t*N). `mask_token_id` is read from the
+# model config. Ulysses sequence parallelism is supported (`model.accelerator.ulysses_size`);
+# context parallelism is refused.
+model:
+  model_path: LLaDA-8B-Instruct-veomni
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  chat_template: llada
+  optimizer:
+    type: adamw
+    lr: 2.5e-5
+    lr_decay_style: cosine
+    weight_decay: 0.1
+    max_grad_norm: 1.0
+  accelerator:
+    ulysses_size: 1  # Ulysses SP; must divide num_attention_heads (32)
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: llada
+  max_seq_len: 4096
+  train_size: 750000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  global_batch_size: 32
+  micro_batch_size: 1
+  num_train_epochs: 1
+  checkpoint:
+    output_dir: LLaDA-8B-Instruct-sft
+    manager: dcp
+    save_steps: 500
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: LLaDA-8B-Instruct-sft

@@ -44,8 +44,8 @@ import torch.distributed as dist
 
 from ...checkpoint import layout
 from ...utils import helper
-from ...utils.device import get_device_rng_state, get_device_type, set_device_rng_state
-from ...utils.dist_utils import raise_if_any_rank_failed
+from ...utils.device import get_device_rng_state, set_device_rng_state
+from ...utils.dist_utils import any_rank_failed, raise_if_any_rank_failed
 from .base import Callback, TrainerState
 
 
@@ -263,9 +263,12 @@ class GlobalStateCallback(Callback):
 
         found = current_state is not None
         if dist.is_initialized():
-            flag = torch.tensor([int(found)], dtype=torch.int32, device=get_device_type())
-            dist.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
-            found = bool(flag.item())
+            # A gloo group reduces on CPU, so the flag has to live there: allocating it on
+            # `get_device_type()` asks HCCL to reduce an NPU tensor over a group that has no
+            # HCCL backend and raises "No backend type associated with device type npu".
+            # `any_rank_failed` already derives the device from the group; MIN over a bool
+            # is ANY-of-false, which is what this needs.
+            found = not any_rank_failed(not found)
             if not found:
                 logger.warning_rank0("Trainer state missing on at least one rank; resuming weights only.")
                 return None

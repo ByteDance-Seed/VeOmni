@@ -116,7 +116,7 @@ def test_dataloader_shuffle_reaches_base_trainer_builders(monkeypatch, shuffle):
         return list(range(4))
 
     monkeypatch.setattr(base_module, "build_dataset", build_dataset)
-    base = SimpleNamespace(args=trainer.base.args, data_transform=None)
+    base = SimpleNamespace(args=trainer.base.args, data_transform=None, dyn_bsz_length_fn=None)
     BaseTrainer._build_dataset(base)
     assert built["shuffle"] is shuffle
 

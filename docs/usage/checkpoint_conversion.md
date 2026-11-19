@@ -34,8 +34,10 @@ python scripts/merge_dcp_to_hf.py \
 |----------|------|----------|---------|-------------|
 | `--load-dir` | str | Yes | - | A `global_step_{N}` directory, or a DCP directory directly |
 | `--save-dir` | str | No | `<load-dir>/hf_ckpt` | Output directory for HuggingFace format checkpoint |
-| `--model-assets-dir` | str | No | None | Directory containing model config and processor (e.g., tokenizer). For a multi-module run, point this at `output_dir/model_assets/<module>/`. |
+| `--model-assets-dir` | str | No | None | Directory containing model config and processor (e.g., tokenizer). For a multi-module run, point this at `output_dir/model_assets/<module>/`. Also used to identify tied-weight aliases (see below). |
 | `--shard-size` | int | No | 2000000000 | Maximum shard size in bytes (default: 2GB) |
+| `--num-workers` | int | No | 1 | Worker processes that load and write independent HF shards in parallel (spawned, CPU-only) |
+| `--local-staging-dir` | str | No | None | Write each shard to this local directory first, then stream it to `--save-dir`. Use it when the destination filesystem does not support safetensors mmap writes. |
 
 ## Examples
 
@@ -66,6 +68,9 @@ python scripts/merge_dcp_to_hf.py \
 ```
 
 This will copy the model configuration and tokenizer from `pretrained_models/qwen3-8b` to the output directory.
+When the directory has no processor, the tokenizer is exported on its own, and a
+`generation_config.json` is carried over. Processor, tokenizer or generation-config
+files that are present but fail to load stop the conversion before any weight is written.
 
 ### Customize Shard Size
 
@@ -113,6 +118,15 @@ The script automatically converts DCP key names to HuggingFace format:
 - Other `model.*` keys → strips "model." prefix with warning
 
 Non-model weights (keys not starting with `model.`) are filtered out.
+
+### Tied Weights
+
+A tensor shared under several names (e.g. `lm_head.weight` with `tie_word_embeddings`,
+or whole submodules a model shares between two stacks) appears once per name in the DCP.
+With `--model-assets-dir`, the script builds the model on the meta device and drops every
+state-dict name that `named_parameters()` / `named_buffers()` deduplicate away, so each
+tensor is exported once under its canonical name; `from_pretrained` re-establishes the ties.
+If the model class cannot be resolved, every DCP tensor is exported as before.
 
 ### Data Type Conversion
 

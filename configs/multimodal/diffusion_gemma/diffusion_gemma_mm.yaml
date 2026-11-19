@@ -1,0 +1,127 @@
+# DiffusionGemma-26B-A4B text+image block-diffusion training (FSDP2 + EP).
+#
+# Images are an encoder-only conditioning signal: the encoder prefills prompt text and
+# image soft tokens and exports its KV cache, while the canvas the decoder denoises
+# stays pure text. Launch with `tasks/train_dllm.py`, the same entry point as
+# the text-only run in `configs/text/diffusion_gemma.yaml`; `data.data_type` is what
+# selects the multimodal path.
+
+model:
+  model_path: diffusiongemma-26B-A4B-it
+  ops_implementation:
+    # No flavour of FlashAttention: the decoder attends bidirectionally over `[encoder
+    # cache | canvas]`, which flash cannot represent. The model raises rather than letting
+    # it fail inside a kernel, and refuses every name in the family -- including the ones
+    # this backend and transformers rewrite those names to.
+    # flex_attention trains correctly, but at this recipe's geometry it
+    # is the more expensive backend rather than the cheaper one, so sdpa stays the default.
+    # See `configs/text/diffusion_gemma.yaml` for the evidence and the numbers.
+    attn_implementation: sdpa
+    moe_implementation: fused_triton
+  model_config:
+    # See `configs/text/diffusion_gemma.yaml` for what these three do. The first two
+    # behave the same here -- images only ever enter through the prompt, so the block
+    # draw and the self-conditioning pass are identical on both paths.
+    max_canvases: 8
+    # Same offset as the text recipe: 0 starts the canvas at the first token after the
+    # prompt; `n` commits the first n answer tokens to the encoder.
+    canvas_start: 0
+    self_conditioning_prob: 0.5
+    # The encoder next-token term skips image spans: their ids are one placeholder
+    # repeated per soft token and their embeddings come from the vision tower, so
+    # supervising them would train the head to emit the placeholder. The first text token
+    # after an image stays supervised -- predicting it from the image is the point.
+    #
+    # It behaves as it does on text: 12.8 -> 4.3 over five steps while the canvas loss
+    # stayed inside the swing a run without the term already had (0.09 / 1.29 / 3.26 /
+    # 2.44 / 1.39 against 0.08 / 4.34 / 10.05 / 5.29 / 0.87 -- the sampled noise level
+    # moves that number far more than this term does). Gradient norm pays, 934 on the
+    # first step against 9.4, settling near 3x by the fifth.
+    encoder_ar_loss: true
+    # Same as the text recipe: false keeps Eq. 13 over the prompt as well as the
+    # canvases; true drops the prompt (and image spans already skip this term).
+    mask_prompt_ar_loss: false
+    # Same as the text recipe: AR keeps the first trailing EOS only.
+    mask_other_tail_eos: true
+    # Same as the text recipe: false is one drawn canvas; true averages DF
+    # over every encoder canvas, runs the encoder once, and still counts
+    # the example once.
+    compute_all_canvas_df_loss: false
+    # Same as the text recipe: how the decoder consumes a stacked canvas batch.
+    # `serial` is one pass per canvas, `flat_batch` one pass of B*K rows, `flat_seq`
+    # one row of K*C tokens. Inert while `compute_all_canvas_df_loss` is false, since
+    # there is only ever one canvas -- it tracks the text recipe so that turning that
+    # flag on here does not silently change the packing mode along with it.
+    canvas_batching: flat_seq
+    # Same diagnostic as the text recipe: default false is one backward.
+    print_ar_df_norm: false
+    # Same decoder packing as the text recipe. Images only live in the encoder
+    # prefix, so gather still drops pad / current / future from the cache.
+    text_config:
+      attn_ffpa: true
+      attn_dg_prefix: true
+  # The processor's own chat template lays out the prompt, so no `chat_template` is named.
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_warmup_ratio: 0.01
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
+  accelerator:
+    # Must stay 1 in this recipe, and the refusal is at model build rather than here:
+    # sequence parallelism needs `canvas_batching: flat_seq_pack`, and images are refused
+    # under packing (the varlen kernels take `cu_seqlens` and have nowhere to put an image
+    # block boundary). So the multimodal recipe cannot use SP at all. See
+    # `configs/text/diffusion_gemma.yaml` for what it buys on text.
+    ulysses_size: 1
+    ep_size: 8
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+    gradient_checkpointing:
+      # Applies to the decoder, the vision tower and the encoder text layers. The last of
+      # those is not free: the encoder's forward writes the KV cache, so `SealableCache`
+      # has to refuse the replayed write (see DiffusionGemmaEncoderTextLayer). It is also
+      # where the savings are, since the encoder spans the whole context.
+      enable: true
+      # Must stay false: the decoder reaches the encoder cache through the recompute closure,
+      # which a reentrant checkpoint would exclude from the backward pass. The model raises
+      # rather than training the encoder with no gradient.
+      enable_reentrant: false
+    init_device: meta
+
+data:
+  train_path: sharegpt4v
+  # Encodes prompt + images through the model's own Gemma4Processor and emits
+  # pixel_values / image_position_ids / mm_token_type_ids alongside the canvas.
+  data_type: diffusion_gemma_mm
+  # Encoder context budget, covering the prompt, its image soft tokens (up to
+  # `vision_soft_tokens_per_image`, 280, per image) and any clean canvases preceding the
+  # supervised one. Nothing here is ever truncated, since cutting an image span loose from
+  # its patches would desynchronize the encoder: prompts over budget are dropped, and
+  # canvases whose predecessors would not fit are simply never drawn.
+  max_seq_len: 4096
+  train_size: 750000
+  text_keys: messages
+
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  # Samples have a fixed canvas and a padded prompt, so token-budget batching would
+  # only add variance without saving compute.
+  dyn_bsz: false
+  num_train_epochs: 1
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: diffusiongemma-26B-A4B-mm-sft
+    manager: dcp
+    save_steps: 100
+    save_epochs: 1
+    save_hf_weights: true
+  wandb:
+    project: VeOmni
+    name: diffusiongemma-26B-A4B-mm-sft
