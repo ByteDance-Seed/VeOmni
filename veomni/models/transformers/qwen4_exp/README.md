@@ -76,8 +76,8 @@ Known limitations:
   With `chunk_gated_delta_rule_implementation=flash_qla`, GatedDeltaNet
   preserves grouped Q/K heads (`num_k_heads < num_v_heads`) directly into the
   FlashQLA chunk kernel instead of expanding Q/K with `repeat_interleave`.
-  Qwen4-Exp does the same for `fla_npu`, whose AscendC chunk kernel supports
-  grouped value attention.
+  Qwen4-Exp also passes grouped heads to `fla_npu` for `Hv/Hk <= 4`; larger
+  ratios and calls with precomputed recurrent state use expanded Q/K.
 - PLE n-gram history and its dilated convolution reset at explicit
   `cu_seq_lens_q` packed-sample boundaries. The halo-only fallback remains for
   direct component calls that do not provide packing metadata.

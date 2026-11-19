@@ -30,10 +30,9 @@ Scope (v1)
   supported: under ExtraParallel the factory builds one ``SwapAdamW`` per
   parameter group inside a ``MultiOptimizer``. Validated on Ascend NPU + FSDP2.
 * Checkpoint save/load reads and writes the host buffers directly (see
-  ``state_dict`` / ``load_state_dict``). Resuming across a changed FSDP/EP
-  mesh (resharding) works through DCP's byte-level planning — an EP=4 → EP=2
-  resume at world 8 replayed steps 11-20 with matching printed loss and
-  grad_norm in manual validation — but is not covered by automated tests.
+  ``state_dict`` / ``load_state_dict``). Proven MultiOptimizer recovery
+  requires the same optimizer ownership and FSDP/EP mesh; it does not support
+  elastic resharding.
 * The update kernel is ``torch._fused_adamw_`` on CUDA and Ascend NPU, issued
   once per ``(device, dtype)`` bucket inside a param group, within each
   swapped-in batch (torch's own fused path groups the same way). Other backends
@@ -321,12 +320,68 @@ class SwapAdamW(Optimizer):
         stager deep-copies them before writing, so a save transiently needs about
         twice the host optimizer-state memory (on top of the host buffers).
         """
-        self._bind_host_states()
-        state_dict = super().state_dict()
+        if getattr(self, "_veomni_dcp_restore_failed", False):
+            raise RuntimeError("SwapAdamW cannot save after a failed checkpoint restore; rebuild the optimizer")
+        staged = getattr(self, "_veomni_dcp_staged_state", None)
+        if staged is None:
+            self._bind_host_states()
+            state_dict = super().state_dict()
+        else:
+            # DCP loads into independent CPU buffers until its provenance and
+            # inventory checks have completed. Never expose the live host
+            # buffers as the load template. User hooks still observe the live
+            # optimizer, as they do outside DCP; only the serialized values
+            # come from the staged mapping.
+            live = getattr(self, "_veomni_dcp_live_state", self.state)
+            current = self.state
+            self.state = live
+            try:
+                for hook in self._optimizer_state_dict_pre_hooks.values():
+                    hook(self)
+            finally:
+                self.state = current
+            pre_hooks = self._optimizer_state_dict_pre_hooks
+            post_hooks = self._optimizer_state_dict_post_hooks
+            self._optimizer_state_dict_pre_hooks = type(pre_hooks)()
+            self._optimizer_state_dict_post_hooks = type(post_hooks)()
+            self.state = staged
+            try:
+                state_dict = super().state_dict()
+            finally:
+                self.state = current
+                self._optimizer_state_dict_pre_hooks = pre_hooks
+                self._optimizer_state_dict_post_hooks = post_hooks
+            # A normal SwapAdamW state-dict post hook sees Python integer
+            # steps. Keep that hook contract even though DCP's scratch uses
+            # tensors as its eventual destination.
+            state_dict["state"] = {
+                key: ({**value, "step": int(value["step"].item())} if "step" in value else value)
+                for key, value in state_dict["state"].items()
+            }
+            self.state = live
+            try:
+                for hook in post_hooks.values():
+                    result = hook(self, state_dict)
+                    if result is not None:
+                        state_dict = result
+            finally:
+                self.state = current
+
         # ``Optimizer.state_dict`` hands back the live inner state dicts; copy
         # them before swapping the int step for the tensor stock AdamW expects.
+        def serialize_step(step):
+            if torch.is_tensor(step):
+                if step.ndim != 0:
+                    raise RuntimeError("SwapAdamW checkpoint step must be a scalar")
+                step = step.item()
+            if isinstance(step, bool) or not isinstance(step, (int, float)) or not math.isfinite(step):
+                raise RuntimeError("SwapAdamW checkpoint step must be a finite integer")
+            if not 0 <= step <= 2**24 or int(step) != step:
+                raise RuntimeError("SwapAdamW checkpoint step cannot be represented exactly as float32")
+            return torch.tensor(float(step), dtype=torch.float32, device="cpu")
+
         state_dict["state"] = {
-            key: ({**value, "step": torch.tensor(float(value["step"]))} if "step" in value else value)
+            key: ({**value, "step": serialize_step(value["step"])} if "step" in value else value)
             for key, value in state_dict["state"].items()
         }
         return state_dict
@@ -349,11 +404,42 @@ class SwapAdamW(Optimizer):
         values for keys the planner does not overwrite (partial loads), so resume
         into a fresh optimizer to start omitted parameters from zero.
         """
+        state_dict = state_dict.copy()
+        live_state = getattr(self, "_veomni_dcp_live_state", None)
+        for hook in self._optimizer_load_state_dict_pre_hooks.values():
+            if live_state is not None and not getattr(hook, "_veomni_internal_dcp_filter", False):
+                staged_state = self.state
+                self.state = live_state
+                try:
+                    result = hook(self, state_dict)
+                finally:
+                    self.state = staged_state
+            else:
+                result = hook(self, state_dict)
+            if result is not None:
+                state_dict = result
+
+        if live_state is None:
+            self._apply_state_dict(state_dict)
+            for hook in self._optimizer_load_state_dict_post_hooks.values():
+                hook(self)
+        else:
+            staged_state = self.state
+            self.state = live_state
+            try:
+                self._apply_state_dict(state_dict)
+                for hook in self._optimizer_load_state_dict_post_hooks.values():
+                    hook(self)
+            finally:
+                self.state = staged_state
+
+    def _apply_state_dict(self, state_dict) -> None:
         groups = self.param_groups
         saved_groups = state_dict["param_groups"]
         if len(groups) != len(saved_groups):
             raise ValueError("loaded state dict has a different number of parameter groups")
         id_map = {}
+        group_updates = []
         for group, saved_group in zip(groups, saved_groups):
             if len(group["params"]) != len(saved_group["params"]):
                 raise ValueError(
@@ -369,12 +455,16 @@ class SwapAdamW(Optimizer):
             id_map.update(zip(saved_group["params"], group["params"]))
             # ``amsgrad`` is structural (it decides whether a third moment buffer
             # exists); keep the constructor's value rather than the checkpoint's.
-            group.update({k: v for k, v in saved_group.items() if k not in ("params", "amsgrad")})
+            group_updates.append({k: v for k, v in saved_group.items() if k not in ("params", "amsgrad")})
 
         loaded = set()
+        pending = []
+        staged = getattr(self, "_veomni_dcp_staged_state", None)
         for key, value in state_dict["state"].items():
             param = id_map.get(key)
             if param is None:
+                if staged is not None:
+                    raise RuntimeError("SwapAdamW checkpoint contains an unowned parameter state")
                 continue
             # A parameter absent from the checkpoint still gets an entry from the
             # flattened loader, carrying only empty dicts (``{"exp_avg": {}, ...}``),
@@ -382,6 +472,30 @@ class SwapAdamW(Optimizer):
             # existing or the entry being truthy.
             if any(isinstance(v, (torch.Tensor, int, float)) for v in value.values()):
                 loaded.add(param)
+            pending.append((param, value))
+
+        if staged is not None:
+            if loaded != set(staged):
+                raise RuntimeError("SwapAdamW loaded state does not match the proven checkpoint inventory")
+            for param, value in pending:
+                if param not in loaded:
+                    continue
+                if set(value) != {"step", *self._state_keys}:
+                    raise RuntimeError("SwapAdamW checkpoint parameter state is incomplete")
+                step = value["step"]
+                if not torch.is_tensor(step) or step.ndim != 0 or step.dtype != torch.float32:
+                    raise RuntimeError("SwapAdamW checkpoint step must be a float32 scalar")
+                step_value = step.item()
+                if not math.isfinite(step_value) or not 0 <= step_value <= 2**24 or not step_value.is_integer():
+                    raise RuntimeError("SwapAdamW checkpoint step is not an exact non-negative integer")
+                for field in self._state_keys:
+                    moment = value[field]
+                    if not torch.is_tensor(moment) or moment.shape != param.shape or moment.dtype != param.dtype:
+                        raise RuntimeError(f"SwapAdamW checkpoint state {field} has an incompatible shape or dtype")
+
+        for group, update in zip(groups, group_updates):
+            group.update(update)
+        for param, value in pending:
             self._load_param_state(param, value)
         # ``torch.optim.Optimizer.load_state_dict`` installs a fresh state mapping,
         # so an unseen parameter carries no history there; reset ours to match.
@@ -391,6 +505,11 @@ class SwapAdamW(Optimizer):
             for host_tensor in host_state.values():
                 host_tensor.zero_()
             self.state[param]["step"] = 0
+        if staged is not None:
+            for param in set(self._host_states) - loaded:
+                self._host_states.pop(param)
+                self._device_states.pop(param)
+                self.state.pop(param, None)
 
     def _load_param_state(self, p: Tensor, value: dict) -> None:
         # Reached from a direct ``load_state_dict`` call. The DCP resume path goes
@@ -658,6 +777,8 @@ class SwapAdamW(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        if getattr(self, "_veomni_dcp_restore_failed", False):
+            raise RuntimeError("SwapAdamW cannot train after a failed checkpoint restore; rebuild the optimizer")
         loss = None
         if closure is not None:
             with torch.enable_grad():
