@@ -412,14 +412,11 @@ All three rows support the EP path: `fused_triton` on GPU, `fused_npu` via the A
 GroupGEMM implementation in `veomni/ops/kernels/moe_experts_lora/{shared,independent}/npu.py`,
 and `eager` through plain-PyTorch expert math in the same directory.
 
-**There are two EP dispatch implementations, not one.** `eager` and `fused_triton` go
-through `veomni.distributed.moe.dispatch_to_ep_class`. `fused_npu` does not: it
-sequences the Ascend collectives itself in `moe_experts_lora/helper.py:npu_ep_forward`,
-building on the `dispatch_preprocess` / `alltoall_dispatch` / `alltoall_combine` /
-`npu_group_gemm` primitives from `moe_experts/standard/npu.py` rather than calling the
-shared helper. The non-LoRA NPU row, by contrast, does call `dispatch_to_ep_class`. So a
-change to the dispatch plumbing has to be validated in both orchestration paths, and
-the LoRA NPU path is what the Ascend CI job below exercises.
+All three rows share `veomni.distributed.moe.dispatch_to_ep_class`, so the all-to-all
+plumbing is one implementation across `moe_experts` and `moe_experts_lora`, and a change
+to it lands in one place. What differs is the per-rank math: `fused_npu` runs Ascend
+grouped GEMMs (`npu_group_gemm`) with the LoRA deltas added between them, in
+`moe_experts_lora/helper.py`, while `eager` and `fused_triton` use their own kernels.
 
 When `model.accelerator.ep_size > 1`, base experts are sharded along the expert dim by
 `ParallelPlan` (`Shard(0)` on `gate_up_proj` / `down_proj`). MoE-LoRA tracks this layout:

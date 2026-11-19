@@ -795,16 +795,16 @@ raise during config validation or op binding.
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
 | `fused_mlu` | Apex grouped-GEMM | Cambricon MLU | Yes |
 
-The table above describes the **`standard`** variant, which serves every MoE model in
-this repository. The `gpt_oss` variant registers only `eager` and `fused_quack`:
-`fused_quack` dispatches for EP, but its `eager` row indexes per-expert weights with
-global expert ids and has no EP dispatch, so `gpt_oss` + `eager` + sharded weights
-is out of bounds. Every EP claim on this page is scoped to `standard` unless it names
-`gpt_oss`.
+The table above lists the **`standard`** variant's rows, which serve every MoE model in
+this repository. The `gpt_oss` variant registers its own `eager` and `fused_quack`
+rows instead, because GPT-OSS interleaves gate and up in one tensor and clamps them
+before a sigmoid gate. Both of those rows dispatch for EP as well; `gpt_oss`'s
+per-rank math stays local to `gpt_oss/eager.py` because of that layout, but the
+all-to-all plumbing is the same `dispatch_to_ep_class` call.
 
 Patched experts modules construct `VeomniOp("moe_experts", variant, config.ops_config.moe_implementation)`
-in `__init__` and always call that handle. On the `standard` variant `eager` is a
-registered row, not a separate `ModuleList` fork. It has no expert loop of its own: it
+in `__init__` and always call that handle. On both variants `eager` is a registered row,
+not a separate `ModuleList` fork. On `standard` it has no expert loop of its own: it
 delegates to `merged_experts_act_fn_forward` in
 `veomni.ops.kernels.moe_experts.shared.act_fn_experts` whatever the activation and
 whichever weight layout it is handed, so there is exactly one implementation of
@@ -823,10 +823,9 @@ the row, so the model-side branch and the row's private loop are both gone.
 (`shared` / `independent` × `eager` / `fused_triton` / `fused_npu`), and the two
 families are not interchangeable. MoE-LoRA follows the wrapped module's
 `veomni_moe.impl` and falls back to its own `eager` row when no `moe_experts_lora`
-row matches the device. All three of its rows support EP — `eager` and
-`fused_triton` through `dispatch_to_ep_class`, `fused_npu` through its own sequencing
-of the Ascend collectives in `moe_experts_lora/helper.npu_ep_forward` — but every
-`moe_experts_lora` row hard-codes SwiGLU regardless of `hidden_act`. See
+row matches the device. All three of its rows support EP through the same
+`dispatch_to_ep_class`; only the per-rank math differs (`fused_npu` runs Ascend grouped
+GEMMs). Every `moe_experts_lora` row hard-codes SwiGLU regardless of `hidden_act`. See
 [MoE-LoRA](../key_features/lora.md#5-moe-lora) for the per-row table and for how the
 two adapter layouts shard under EP.
 

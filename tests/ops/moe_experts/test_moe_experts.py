@@ -2358,3 +2358,88 @@ def test_the_reference_loop_keeps_an_empty_microbatch_on_the_graph():
 
     out.sum().backward()
     assert routed.grad is not None, "the input got no gradient, so the block was skipped"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("ep_size", [2, 4])
+def test_gpt_oss_eager_ep_math_matches_the_hf_loop(ep_size):
+    """GPT-OSS's eager row dispatches under EP instead of indexing a shard.
+
+    It had no EP branch at all: the loop read `gate_up_proj[idx]` with a global expert
+    id against per-rank shards, so `gpt_oss + eager + ep_size>1` raised. The interleaved
+    gate/up layout and the clamped activation are GPT-OSS's own, so the per-rank math
+    stays in `gpt_oss/eager.py` and only the plumbing is shared.
+
+    The oracle is HF's `GptOssExperts` over the same permuted rows, which pins the
+    interleaved slicing (not `chunk(2, -1)`) and the post-`down` routing order.
+    """
+    from veomni.ops.kernels.moe_experts.gpt_oss import eager as gpt_oss_eager
+
+    torch.manual_seed(0)
+    experts, hidden, intermediate, tokens, top_k = 4, 16, 32, 8, 2
+    rows = tokens * top_k
+    routed = torch.randn(rows, hidden)
+    # Right-multiplied layout, as the model builds it: [E, H, 2I] and [E, I, H].
+    gate_up = torch.randn(experts, hidden, 2 * intermediate)
+    gate_up_bias = torch.randn(experts, 2 * intermediate)
+    down = torch.randn(experts, intermediate, hidden)
+    down_bias = torch.randn(experts, hidden)
+
+    # Even split, plus an empty expert to exercise a zero-length slice.
+    per = rows // experts
+    cumsum = torch.tensor([per * (i + 1) for i in range(experts)], dtype=torch.long)
+    cumsum[-1] = rows
+
+    expected = torch.empty_like(routed)
+    starts = torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
+    for e in range(experts):
+        s, t = int(starts[e]), int(cumsum[e])
+        state = routed[s:t]
+        gate_up_e = state @ gate_up[e] + gate_up_bias[e]
+        gate = gate_up_e[..., ::2].clamp(max=7.0)
+        up = gate_up_e[..., 1::2].clamp(min=-7.0, max=7.0)
+        expected[s:t] = ((up + 1) * (gate * torch.sigmoid(gate * 1.702))) @ down[e] + down_bias[e]
+
+    per_rank = experts // ep_size
+    # Each rank gets the rows its local experts were assigned, then reports a cumsum
+    # local to that shard -- which is what `token_pre_all2all` delivers.
+    row_starts = torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
+    pieces = [
+        gpt_oss_eager._GptOssExpertMathEP.apply(
+            routed[int(row_starts[rank * per_rank]) : int(cumsum[(rank + 1) * per_rank - 1])],
+            cumsum[rank * per_rank : (rank + 1) * per_rank] - (cumsum[rank * per_rank - 1] if rank > 0 else 0),
+            gate_up[rank * per_rank : (rank + 1) * per_rank],
+            gate_up_bias[rank * per_rank : (rank + 1) * per_rank],
+            down[rank * per_rank : (rank + 1) * per_rank],
+            down_bias[rank * per_rank : (rank + 1) * per_rank],
+            1.702,
+            7.0,
+        )
+        for rank in range(ep_size)
+    ]
+    torch.testing.assert_close(torch.cat(pieces, dim=0), expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_gpt_oss_eager_refuses_weights_sharded_by_the_wrong_factor():
+    """An EP state whose weights are not actually sharded must name the problem."""
+    from unittest import mock
+
+    from veomni.ops.kernels.moe_experts.gpt_oss import eager as gpt_oss_eager
+
+    hidden, intermediate, experts = 8, 16, 4
+    with mock.patch(
+        "veomni.ops.kernels.moe_experts.gpt_oss.eager.expert_parallel_size",
+        lambda: 2,
+    ):
+        with pytest.raises(ValueError, match="not sharded as expected"):
+            gpt_oss_eager.wrapper(
+                torch.randn(4, hidden),
+                torch.ones(4, 1),
+                torch.zeros(4, 1, dtype=torch.long),
+                torch.randn(experts, hidden, 2 * intermediate),
+                torch.randn(experts, 2 * intermediate),
+                torch.randn(experts, intermediate, hidden),
+                torch.randn(experts, hidden),
+                num_experts=experts,
+            )
