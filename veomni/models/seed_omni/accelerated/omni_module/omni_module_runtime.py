@@ -87,14 +87,23 @@ def module_compile_config(accelerator: "AcceleratorConfig", module: nn.Module):
     on (30.7 -> 44.2 ms/step), giving back most of its 1.73x compile win, while
     the text backbones were unaffected. So the run-level flag only reaches the
     modules that declared they can use it.
+
+    ``fsdp_mode`` is part of the gate because ``compile_decoder_blocks`` only
+    runs under FSDP2. A shipped launcher sets ``janus_siglip`` to ``ddp`` (it does
+    not need FSDP's meta-init dance), so without this check enabling compile
+    would fail that module's wrap outright instead of leaving it eager — and
+    "leaves it eager" is the documented contract for a module that cannot be
+    compiled. The returned message is logged by the caller; the config itself
+    just says ``enable=False``.
     """
     from .....distributed.torch_compile import CompileConfig
 
     run_config = accelerator.torch_compile
     supported = bool(getattr(module, "supports_torch_compile", False))
     dynamic_ok = bool(getattr(module, "supports_torch_compile_dynamic", False))
+    fsdp2 = accelerator.fsdp_config.fsdp_mode == "fsdp2"
     return CompileConfig(
-        enable=bool(run_config.enable) and supported,
+        enable=bool(run_config.enable) and supported and fsdp2,
         backend=run_config.backend,
         mode=run_config.mode,
         fullgraph=run_config.fullgraph,
@@ -451,8 +460,9 @@ class ModuleRuntime(VeOmniModelRuntime):
         right answer here: this wrap covers exactly this module, and the
         per-module flag already decided it may be compiled.
 
-        A module that opted out returns ``[]`` so nothing is compiled, and the
-        caller clears ``compile_config.enable`` to match.
+        A module that opted out returns ``[]``; ``module_compile_config`` already
+        returned ``enable=False`` for it, so no ``CompileConfig`` reaches the
+        "found no decoder blocks" check.
         """
         return [""] if getattr(self.model, "supports_torch_compile", False) else []
 

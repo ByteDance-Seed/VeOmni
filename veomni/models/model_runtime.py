@@ -414,9 +414,10 @@ class VeOmniModelRuntime:
     def _compile_scopes(self):
         """Children whose blocks this wrap may compile, or ``None`` for the HF rule.
 
-        A single model has one set of blocks and no scopes; SeedOmni's
-        :class:`ModuleRuntime` returns its own module name so a family whose
-        blocks are not named ``*DecoderLayer`` (``JanusVqvae``) still compiles.
+        A single model has one set of blocks and no scopes. SeedOmni's
+        :class:`ModuleRuntime` returns ``[""]`` — "this whole tree" — so a family
+        whose blocks are not named ``*DecoderLayer`` (``JanusVqvae``) still
+        compiles.
         """
         return None
 
@@ -485,7 +486,8 @@ class VeOmniModelRuntime:
             should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.accelerator.fsdp_config.mixed_precision,
-            enable_gradient_checkpointing=gc_cfg.enable,  # Configured classes only, in configuration order: parallelize reads
+            enable_gradient_checkpointing=gc_cfg.enable,
+            # Configured classes only, in configuration order: parallelize reads
             # the model's own ``_no_split_modules`` itself, and recompute needs
             # this list unmerged and ordered so it can rank the block stacks.
             basic_modules=list(args.basic_modules or []),

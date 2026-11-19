@@ -1446,3 +1446,61 @@ def test_compile_rejection_walks_sub_configs():
     root = SimpleNamespace(ops_config=ops(lin="eager"), sub_configs={"text_config": None}, text_config=child_only)
 
     assert _uncompilable_at(root, prefix="") == ["text_config.linear_implementation='torchao_mxfp4'"]
+
+
+def test_compile_decoder_blocks_applies_dynamic_per_scope(monkeypatch):
+    """``dynamic_scopes`` lets one tree mix static and dynamic blocks.
+
+    A text backbone needs ``dynamic`` (its packed length moves every step with
+    SeedOmni's no-padding collator) while a codec over a fixed-resolution image
+    pays Inductor's shape-polymorphic tax for nothing — measured 30% slower for
+    ``janus_vqvae``. One run-level flag cannot serve both, so the split is here.
+    """
+    calls = []
+
+    class ComposedModel(nn.Module):
+        _no_split_modules = ["llm.ToyDecoderLayer", "codec.ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.llm = nn.Module()
+            self.llm.layers = nn.ModuleList([ToyDecoderLayer()])
+            self.codec = nn.Module()
+            self.codec.blocks = nn.ModuleList([ToyDecoderLayer()])
+
+    def fake_compile(fn, **kwargs):
+        calls.append(kwargs["dynamic"])
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    model = ComposedModel()
+    compiled = compile_decoder_blocks(
+        model,
+        CompileConfig(enable=True, dynamic=True),
+        scopes=["llm", "codec"],
+        dynamic_scopes=["llm"],
+    )
+
+    assert compiled == 2
+    assert model.llm.layers[0]._veomni_compile_config["dynamic"] is True
+    assert model.codec.blocks[0]._veomni_compile_config["dynamic"] is False
+
+
+def test_compile_decoder_blocks_without_dynamic_scopes_applies_dynamic_everywhere(monkeypatch):
+    """``dynamic_scopes=None`` keeps the single-model meaning: one value, all blocks."""
+
+    class PlainModel(nn.Module):
+        _no_split_modules = ["ToyDecoderLayer"]
+
+        def __init__(self):
+            super().__init__()
+            self.a = ToyDecoderLayer()
+            self.b = ToyDecoderLayer()
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+
+    model = PlainModel()
+    assert compile_decoder_blocks(model, CompileConfig(enable=True, dynamic=True)) == 2
+    assert model.a._veomni_compile_config["dynamic"] is True
+    assert model.b._veomni_compile_config["dynamic"] is True

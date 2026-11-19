@@ -182,48 +182,31 @@ def validate_compile_model(
     ``OmniModel`` is compiled block by block and gets the composed guards.
     """
 
-    if _is_composed_model(model):
-        # Each child is compiled block-by-block under the same rules as a single
-        # model, but the cross-module graph and the per-module op selections make
-        # the CUDA-graph and sequence-parallel paths unverified: replay would need
-        # one mark per micro-batch across the composed forward, and Ulysses
-        # would slice activations the graph edges reorder. Keep them off.
-        #
-        # ``dynamic`` is allowed, and is the setting to use when the packed
-        # sequence length moves between steps (a sample with one image against a
-        # sample with four). Measured with dynamic=True over six lengths spanning
-        # 300-2816 tokens: every shape matched eager to the same tolerance as a
-        # static compile (2.4e-2 relative on a bf16 stack, saturating at four
-        # layers and identical for forward and gradients), six lengths kept four
-        # graphs, and the variable-shape step was 1.41x faster than eager.
+    # A composed ``OmniModel`` and a single SeedOmni module share these guards:
+    # both compile block by block, and the two paths that stay refused are
+    # refused for reasons that do not depend on which of the two it is. The
+    # parse-time twin lives in ``_validate_omni_accelerator`` — it runs for the
+    # top-level accelerator and every resolved module, so this is the backstop
+    # for a caller that built a config without going through the launcher.
+    #
+    # ``dynamic`` is allowed and is what a run wants when the packed length moves
+    # between steps. Measured over six lengths spanning 300-2816 tokens: every
+    # shape matched eager to the same tolerance a static compile gives (2.4e-2
+    # relative on a bf16 stack, saturating at four layers and identical for
+    # forward and gradients), six lengths kept four graphs, and the variable-shape
+    # step was 1.41x faster than eager.
+    if _is_composed_model(model) or _is_omni_module(model):
+        kind = "a composed SeedOmni OmniModel" if _is_composed_model(model) else "a SeedOmni module"
         if compile_config.uses_cuda_graphs():
             raise RuntimeError(
-                "model.accelerator.torch_compile.enable does not support CUDA Graph replay for a composed "
-                "SeedOmni OmniModel; use backend='inductor' and mode=None."
-            )
-        if sequence_parallel_enabled or async_enabled:
-            raise RuntimeError(
-                "model.accelerator.torch_compile.enable does not support sequence parallelism or async Ulysses "
-                "for a composed SeedOmni OmniModel; set model.accelerator.ulysses_size=1, "
-                "model.accelerator.cp_size=1, and model.accelerator.enable_async=False."
-            )
-        return
-
-    if _is_omni_module(model):
-        # A SeedOmni module is one component of the graph, compiled block by
-        # block like a composed model. The same two paths stay refused for the
-        # same reasons, and the per-module op selections are the module's own, so
-        # ``_reject_incompatible_ops`` reads them directly.
-        if compile_config.uses_cuda_graphs():
-            raise RuntimeError(
-                "model.accelerator.torch_compile.enable does not support CUDA Graph replay for a SeedOmni module; "
+                f"model.accelerator.torch_compile.enable does not support CUDA Graph replay for {kind}; "
                 "use backend='inductor' and mode=None."
             )
         if sequence_parallel_enabled or async_enabled:
             raise RuntimeError(
-                "model.accelerator.torch_compile.enable does not support sequence parallelism or async Ulysses "
-                "for a SeedOmni module; set model.accelerator.ulysses_size=1, "
-                "model.accelerator.cp_size=1, and model.accelerator.enable_async=False."
+                f"model.accelerator.torch_compile.enable does not support sequence parallelism or async Ulysses "
+                f"for {kind}; set model.accelerator.ulysses_size=1, model.accelerator.cp_size=1, "
+                "and model.accelerator.enable_async=False."
             )
         return
 
@@ -263,34 +246,24 @@ def validate_compile_model(
 
 def _is_decoder_block(
     module: nn.Module,
-    decoder_block_class_names: Optional[Collection[str]] = None,
     *,
     fqn: Optional[str] = None,
-    decoder_block_specs: Optional[Sequence[tuple[str, str | None]]] = None,
+    decoder_block_specs: Sequence[tuple[str, str | None]],
 ) -> bool:
-    """Check decoder blocks using the model's ``_no_split_modules`` list.
+    """Whether ``module`` is one of the blocks named in ``_no_split_modules``.
 
-    HuggingFace model classes typically list the decoder layer class in
-    ``_no_split_modules`` for FSDP/Accelerate. Multimodal models may include
-    vision/audio blocks in the same list, so the compile path keeps only
-    entries that are decoder layers.
-
-    Given ``decoder_block_specs``, a scoped entry matches only modules under
-    that child, so a sibling that reuses the same layer class is left alone; a
-    bare entry still matches anywhere. The rule mirrors
-    ``_is_fsdp_wrap_target``, so the wrap plan and the compile plan agree on
-    what a block is.
+    HuggingFace model classes list the decoder layer class there for
+    FSDP/Accelerate. A scoped entry (``janus_llama.LlamaDecoderLayer``) matches
+    only modules under that child, so a sibling that reuses the same layer class
+    is left alone; a bare entry matches anywhere. The rule mirrors
+    ``_is_fsdp_wrap_target``, so the wrap plan and the compile plan agree on what
+    a block is.
     """
 
-    if decoder_block_specs is not None:
-        class_name = type(module).__name__
-        return any(
-            name == class_name and (scope is None or _under_scope(fqn, scope)) for name, scope in decoder_block_specs
-        )
-
-    if decoder_block_class_names is None:
-        decoder_block_class_names = _decoder_block_class_names(module)
-    return type(module).__name__ in decoder_block_class_names
+    class_name = type(module).__name__
+    return any(
+        name == class_name and (scope is None or _under_scope(fqn, scope)) for name, scope in decoder_block_specs
+    )
 
 
 def _under_scope(fqn: Optional[str], scope: str) -> bool:
@@ -415,6 +388,7 @@ def compile_decoder_blocks(
     sequence_parallel_enabled: bool = False,
     async_enabled: bool = False,
     scopes: Optional[Collection[str]] = None,
+    dynamic_scopes: Optional[Collection[str]] = None,
 ) -> int:
     """Compile forward of every decoder block inside ``model`` in place.
 
@@ -426,6 +400,13 @@ def compile_decoder_blocks(
     composed model passes the modules that opted into ``torch.compile``, so a
     sibling that did not opt in keeps running eagerly inside the same run.
     ``None`` keeps every declared decoder block.
+
+    ``dynamic_scopes`` narrows ``dynamic`` the same way. It is a separate list
+    because a module can want compile without wanting ``dynamic``: the text
+    backbones see a packed length that moves every step and need it, while a
+    codec over a fixed-resolution image pays Inductor's shape-polymorphic tax
+    for nothing (``janus_vqvae`` measured 30% slower with it on). Blocks outside
+    every entry keep the run-level ``dynamic``; ``None`` applies it everywhere.
     """
 
     if not hasattr(torch, "compile"):
@@ -463,17 +444,25 @@ def compile_decoder_blocks(
         if getattr(module, "_veomni_forward_compiled", False):
             continue
 
+        # ``dynamic`` is a per-module decision: a module declared it only if its
+        # input shape actually moves, and shape-polymorphic kernels can cost more
+        # than they save (``janus_vqvae`` measured 30% slower with it on). Blocks
+        # outside every ``dynamic_scopes`` entry keep the run-level value.
+        block_kwargs = compile_kwargs
+        if dynamic_scopes is not None and not any(_under_scope(fqn, scope) for scope in dynamic_scopes):
+            block_kwargs = {**compile_kwargs, "dynamic": False}
+
         original_forward = module.forward
         if hasattr(original_forward, "__func__"):
             module._veomni_original_forward = original_forward.__func__
-            compiled_forward = torch.compile(original_forward.__func__, **compile_kwargs)
+            compiled_forward = torch.compile(original_forward.__func__, **block_kwargs)
             module.forward = types.MethodType(compiled_forward, module)
         else:
             module._veomni_original_forward = original_forward
-            module.forward = torch.compile(original_forward, **compile_kwargs)
+            module.forward = torch.compile(original_forward, **block_kwargs)
         module._veomni_forward_compiled = True
-        module._veomni_compile_config = dict(compile_kwargs)
-        logger.info_rank0(f"Compiled decoder block forward for {fqn} with torch.compile({compile_kwargs}).")
+        module._veomni_compile_config = dict(block_kwargs)
+        logger.info_rank0(f"Compiled decoder block forward for {fqn} with torch.compile({block_kwargs}).")
         compiled += 1
 
     logger.info_rank0(f"Compiled {compiled} decoder blocks with torch.compile.")

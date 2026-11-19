@@ -720,7 +720,8 @@ def test_module_compile_config_needs_both_switches(run_enable, module_support, e
 
     module = SimpleNamespace(supports_torch_compile=module_support)
     accelerator = SimpleNamespace(
-        torch_compile=SimpleNamespace(enable=run_enable, backend="inductor", mode=None, fullgraph=True, dynamic=False)
+        torch_compile=SimpleNamespace(enable=run_enable, backend="inductor", mode=None, fullgraph=True, dynamic=False),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
     )
 
     assert module_compile_config(accelerator, module).enable is expected
@@ -731,7 +732,8 @@ def test_module_compile_config_carries_the_run_options_through():
     from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
 
     accelerator = SimpleNamespace(
-        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=False, dynamic=True)
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=False, dynamic=True),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
     )
     module = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True)
     config = module_compile_config(accelerator, module)
@@ -744,7 +746,8 @@ def test_a_module_without_the_flag_is_treated_as_opted_out():
     from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
 
     accelerator = SimpleNamespace(
-        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=False)
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=False),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
     )
 
     assert module_compile_config(accelerator, SimpleNamespace()).enable is False
@@ -777,7 +780,8 @@ def test_module_compile_config_intersects_dynamic(run_dynamic, module_dynamic, e
 
     module = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=module_dynamic)
     accelerator = SimpleNamespace(
-        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=run_dynamic)
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=run_dynamic),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
     )
 
     assert module_compile_config(accelerator, module).dynamic is expected
@@ -788,7 +792,76 @@ def test_a_module_without_the_dynamic_flag_gets_dynamic_off():
     from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
 
     accelerator = SimpleNamespace(
-        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=True)
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=True),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
     )
 
     assert module_compile_config(accelerator, SimpleNamespace(supports_torch_compile=True)).dynamic is False
+
+
+def _fake_runtime(model, *, fsdp_mode="fsdp2"):
+    """A ``ModuleRuntime`` stub carrying just what the scope helpers read."""
+    return SimpleNamespace(
+        model=model,
+        args=SimpleNamespace(accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode=fsdp_mode))),
+    )
+
+
+@pytest.mark.parametrize(
+    ("support", "dynamic", "fsdp_mode", "compilable", "dynamic_scope"),
+    [
+        (True, True, "fsdp2", True, True),
+        (True, False, "fsdp2", True, False),
+        (False, True, "fsdp2", False, False),
+        # ddp cannot compile at all: `compile_decoder_blocks` only runs under fsdp2
+        (True, True, "ddp", False, False),
+    ],
+)
+def test_compilable_scope_intersects_the_three_gates(support, dynamic, fsdp_mode, compilable, dynamic_scope):
+    """Compiling needs the module's opt-in *and* fsdp2; ``dynamic`` is a third, separate opt-in.
+
+    The ``ddp`` row is the shipped ``janus_siglip`` case: it declares
+    ``supports_torch_compile`` but runs under DDP, so it has to stay eager
+    rather than fail its wrap.
+    """
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
+        _compilable_scope,
+        _dynamic_scope,
+    )
+
+    model = SimpleNamespace(supports_torch_compile=support, supports_torch_compile_dynamic=dynamic)
+    runtimes = {"m": _fake_runtime(model, fsdp_mode=fsdp_mode)}
+
+    assert bool(_compilable_scope(runtimes)) is compilable
+    assert bool(_dynamic_scope(runtimes)) is dynamic_scope
+
+
+def test_dynamic_scope_is_a_subset_of_the_compilable_scope():
+    """A module that does not compile is never offered the ``dynamic`` path."""
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
+        _compilable_scope,
+        _dynamic_scope,
+    )
+
+    runtimes = {
+        "llm": _fake_runtime(SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True)),
+        "vqvae": _fake_runtime(SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=False)),
+        "tower": _fake_runtime(SimpleNamespace(supports_torch_compile=False, supports_torch_compile_dynamic=True)),
+    }
+
+    assert set(_dynamic_scope(runtimes)) <= set(_compilable_scope(runtimes))
+    assert sorted(_compilable_scope(runtimes)) == ["llm", "vqvae"]
+    assert _dynamic_scope(runtimes) == ["llm"]
+
+
+def test_a_module_under_ddp_is_gated_off_rather_than_failing_its_wrap():
+    """``janus_siglip`` ships as ``fsdp_mode: ddp``; enabling compile must not break it."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    module = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True)
+    accelerator = SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=False),
+        fsdp_config=SimpleNamespace(fsdp_mode="ddp"),
+    )
+
+    assert module_compile_config(accelerator, module).enable is False

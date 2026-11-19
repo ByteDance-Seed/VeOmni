@@ -502,18 +502,28 @@ The second gate exists because compile pays off by module, not by model. Measure
 
 A module that leaves the flag `False` trains eagerly inside the same run: under `fsdp_scope='model'` the composed `OmniModel` is compiled once, and only the opted-in children contribute block scopes. A run that enables compile with no opted-in module logs that and compiles nothing rather than failing.
 
-**`dynamic=True` is a second per-module opt-in.** `dynamic` lets one Inductor graph cover a range of shapes, which is what a multimodal run wants when the packed token count moves between steps (one image vs four). It is not free — Inductor emits shape-polymorphic kernels that cost more per call — so a module also declares `supports_torch_compile_dynamic`, and the run-level `dynamic` flag reaches only the modules that set it.
+**`dynamic=True` is a second per-module opt-in, and for a text backbone it is required.** `dynamic` lets one Inductor graph cover a range of shapes. SeedOmni's collator does no padding (`SeedOmniCollator`: "no stacking, no padding"), so a text backbone's packed length differs every step, and a static compile recompiles per new length. Measured on a 4-layer stack over 40 drawn lengths spanning 280–2900 tokens:
 
-Measured per module (eager / static / dynamic, A100-80GB, forward+backward):
+| | first pass | second pass | graphs |
+| --- | --- | --- | --- |
+| eager | 1.43 s | 1.03 s | — |
+| `dynamic=False` | **362 s** | 0.70 s | 156 |
+| `dynamic=True` | 13.5 s | 0.70 s | 160 |
+
+So `torch_compile.dynamic` must be `True` for a SeedOmni run whose packed length moves — the `dynamic=False` column above is not a usable configuration outside a fixed-shape benchmark. `dynamic` is not free either (Inductor emits shape-polymorphic kernels that cost more per call), so a module declares `supports_torch_compile_dynamic` separately and gets the run-level flag only if it set it.
+
+Measured per module (eager / static / dynamic, A100-80GB, forward+backward, fixed shape):
 
 | module | static vs eager | dynamic vs static |
 | --- | --- | --- |
-| `qwen3_llm` | 1.57x | 1.000x |
-| `qwen3vl_llm` | 1.57x | 0.997x |
+| `qwen3_llm` | 1.58x | 1.000x |
+| `qwen3vl_llm` | 1.58x | 0.997x |
 | `janus_llama` | 1.32x | 1.000x |
 | `janus_vqvae` | 1.73x | **0.696x** |
 
-The text backbones are indifferent — a few large matmuls, where shape polymorphism changes nothing — so they set `supports_torch_compile_dynamic = True`. `janus_vqvae` is **30% slower** with `dynamic` on (30.7 → 44.2 ms/step, reproduced three times), giving back most of its compile win: its 37 small conv/attention blocks are exactly the shape that pays the polymorphic-kernel tax, and its input is a fixed-resolution image anyway. It leaves the flag off.
+The text backbones are indifferent on a fixed shape — a few large matmuls, where shape polymorphism changes nothing — so they set `supports_torch_compile_dynamic = True` and take the `dynamic` path their moving length needs. `janus_vqvae` is **30% slower** with `dynamic` on (30.7 → 44.2 ms/step, reproduced three times), giving back most of its compile win: its 37 small conv/attention blocks are exactly the shape that pays the polymorphic-kernel tax, and its input is a fixed-resolution image anyway. It leaves the flag off, so it stays static while the backbone beside it runs dynamic.
+
+A module under `fsdp_mode: ddp` is gated off entirely — `compile_decoder_blocks` only runs under FSDP2, and the shipped Janus launcher puts `janus_siglip` on DDP. It trains eagerly instead of failing its wrap.
 
 So the rule for a new module: set `supports_torch_compile = True` once compile pays off, and `supports_torch_compile_dynamic = True` only if its input shape actually varies *and* you measured that `dynamic` does not cost more than it saves.
 

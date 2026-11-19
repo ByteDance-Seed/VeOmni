@@ -133,9 +133,33 @@ def _compilable_scope(module_runtimes: Mapping[str, ModuleRuntime]) -> list[str]
     :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile`
     contribute a scope, and everything else keeps running eagerly inside the
     same compiled run.
+
+    A module under ``ddp`` is excluded for the same reason ``module_compile_config``
+    excludes it: ``compile_decoder_blocks`` only runs under FSDP2.
     """
     return [
-        name for name, runtime in module_runtimes.items() if getattr(runtime.model, "supports_torch_compile", False)
+        name
+        for name, runtime in module_runtimes.items()
+        if getattr(runtime.model, "supports_torch_compile", False)
+        and runtime.args.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+    ]
+
+
+def _dynamic_scope(module_runtimes: Mapping[str, ModuleRuntime]) -> list[str]:
+    """The compilable children that also opted into ``dynamic``.
+
+    Kept separate from :func:`_compilable_scope` because the two questions have
+    different answers per module: a text backbone's packed length moves every
+    step and needs ``dynamic``, while a codec over a fixed-resolution image pays
+    Inductor's shape-polymorphic tax for nothing (``janus_vqvae`` measured 30%
+    slower with it on). Applying one run-level flag to both would give the codec
+    the regression this PR exists to avoid.
+    """
+    compilable = set(_compilable_scope(module_runtimes))
+    return [
+        name
+        for name, runtime in module_runtimes.items()
+        if name in compilable and getattr(runtime.model, "supports_torch_compile_dynamic", False)
     ]
 
 
@@ -332,6 +356,7 @@ class OmniModelRuntime:
         # rest keep running eagerly; a run where nothing opted in compiles
         # nothing at all rather than failing the "found no decoder blocks" check.
         compile_scopes = _compilable_scope(modules_to_wrap)
+        dynamic_scopes = _dynamic_scope(modules_to_wrap)
         compile_config = CompileConfig(
             **{field.name: getattr(acc.torch_compile, field.name) for field in fields(CompileConfig)}
         )
@@ -339,10 +364,13 @@ class OmniModelRuntime:
         if acc.torch_compile.enable and not compile_scopes:
             logger.info_rank0(
                 "OmniModelRuntime: accelerator.torch_compile.enable is set but no module declares "
-                "supports_torch_compile=True; running eagerly."
+                "supports_torch_compile=True under fsdp2; running eagerly."
             )
         elif compile_scopes:
-            logger.info_rank0(f"OmniModelRuntime: compiling blocks under {compile_scopes}; other modules stay eager.")
+            logger.info_rank0(
+                f"OmniModelRuntime: compiling blocks under {compile_scopes} "
+                f"(dynamic for {dynamic_scopes or 'none'}); other modules stay eager."
+            )
         opt = args.optimizer
         muon_expert_zero_comm = bool(opt) and opt.type == "muon" and opt.muon_expert_zero_comm
         weights_path = {name: runtime.weights_path for name, runtime in modules_to_wrap.items()}
@@ -377,6 +405,7 @@ class OmniModelRuntime:
                 expert_fsdp_shard_dim=acc.fsdp_config.expert_fsdp_shard_dim,
                 compile_config=compile_config,
                 compile_scopes=compile_scopes,
+                compile_dynamic_scopes=dynamic_scopes,
                 **kwargs,
             )
 

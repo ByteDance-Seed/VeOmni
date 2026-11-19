@@ -73,13 +73,15 @@ class PretrainedOmniModule(PreTrainedModel):
     #: * ``bagel_siglip_navit`` — ~1.02x, i.e. nothing. Its patch embedding and
     #:   positional add dominate, so it stays ``False``.
     #:
-    #: What ``True`` claims: this module's ``forward``/``encode`` reaches every
-    #: block named in its ``_no_split_modules`` with shapes fixed by the
-    #: collator (``dyn_bsz`` + ``pad_to_length``), so a single Inductor graph per
-    #: block covers every step. A module whose input shape varies per step (a
-    #: vision tower over a variable patch grid, an FSM decoder over a growing
-    #: sequence) either stays ``False`` or must be measured under
-    #: ``dynamic=True`` first.
+    #: What ``True`` claims: this module's compile path was measured to pay off.
+    #: It does **not** claim the shapes are stable — SeedOmni's collator does no
+    #: padding (``SeedOmniCollator``: "no stacking, no padding"), so a text
+    #: backbone sees a different packed length every step and needs
+    #: :attr:`supports_torch_compile_dynamic` to avoid a fresh Inductor compile
+    #: per new length (measured: 40 distinct lengths cost 362 s with
+    #: ``dynamic=False`` against 13.5 s with ``dynamic=True``). A module whose
+    #: shapes are already fixed by the processor (a tower, a codec) sets that
+    #: flag ``False`` and pays nothing.
     supports_torch_compile: bool = False
 
     #: Whether this module's compile path tolerates ``dynamic=True``.
@@ -98,10 +100,11 @@ class PretrainedOmniModule(PreTrainedModel):
     #:   compile win. Its 37 small conv/attention blocks are exactly the shape
     #:   that pays the polymorphic-kernel tax.
     #:
-    #: So a module whose input shape is fixed by the collator or the image
-    #: processor sets this ``False`` — the run-level ``dynamic`` flag is then
-    #: overridden off for this module only, and the other modules keep it. A
-    #: module whose shape really varies sets it ``True``.
+    #: So a module whose input shape is fixed by the image processor sets this
+    #: ``False`` — the run-level ``dynamic`` flag is then overridden off for this
+    #: module only, and the other modules keep it. A module whose shape moves
+    #: sets it ``True``; for the text backbones that is not optional, since the
+    #: collator pads nothing (see :attr:`supports_torch_compile`).
     supports_torch_compile_dynamic: bool = False
 
     @classmethod
