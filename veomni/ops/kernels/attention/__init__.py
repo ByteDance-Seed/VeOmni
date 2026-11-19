@@ -292,3 +292,122 @@ _register_attention(
     rows=_SAGE_ROWS,
 )
 _register_attention("veomni_sdpa", "VeOmni scaled dot-product attention adapter through Transformers")
+
+
+# --- Vision attention (Kimi K3 MoonViT3d packed varlen) ------------------------
+#
+# The MoonViT3d vision tower keeps its three packed-varlen attention
+# implementations as module-level functions in the modeling file
+# (``eager_attention`` / ``multihead_attention`` / ``npu_fusion_vision_attention``,
+# dispatched by the vendored ``VL_VISION_ATTENTION_FUNCTIONS`` dict). Register
+# them as a selectable op family, mirroring the standard family's
+# module-resolved ``eager`` row: the wrapper resolves the function from the
+# encoder layer's defining module at call time, so the ops layer never imports
+# modeling code and the generated module's patched functions (e.g. the lazy
+# flash-attn ``multihead_attention``) are the ones dispatched. Binding the
+# handle at construction validates the selection and the backend requirement
+# (flash-attn availability) up front instead of failing inside forward.
+
+_VISION_ATTN_IMPLS = {
+    "eager": "eager_attention",
+    "flash_attention_2": "multihead_attention",
+    "veomni_flash_attention_2": "npu_fusion_vision_attention",
+}
+
+
+def _vision_attention(impl: str) -> Callable:
+    """Return a wrapper dispatching one MoonViT packed-varlen vision attention impl."""
+    fn_name = _VISION_ATTN_IMPLS[impl]
+
+    def wrapper(
+        module: torch.nn.Module,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        q_cu_seqlens: torch.Tensor | None = None,
+        k_cu_seqlens: torch.Tensor | None = None,
+        max_seqlen_q: int | None = None,
+        max_seqlen_k: int | None = None,
+        deterministic: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        defining = sys.modules.get(type(module).__module__)
+        fn = getattr(defining, fn_name, None) if defining is not None else None
+        if not callable(fn):
+            raise KeyError(f"vision attention impl {impl!r} is not available in {type(module).__module__}")
+        if impl == "veomni_flash_attention_2":
+            # The NPU fusion path consumes the hoisted host cu_seqlens copies
+            # (q_cu_seqlens_host / k_cu_seqlens_host) through **kwargs.
+            return fn(
+                q,
+                k,
+                v,
+                q_cu_seqlens=q_cu_seqlens,
+                k_cu_seqlens=k_cu_seqlens,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                deterministic=deterministic,
+                **kwargs,
+            )
+        # eager_attention takes **kwargs; multihead_attention declares a fixed
+        # packed-varlen signature -- pass only that contract, dropping the
+        # host-copy kwargs (only the NPU fusion path reads them).
+        return fn(
+            q,
+            k,
+            v,
+            q_cu_seqlens=q_cu_seqlens,
+            k_cu_seqlens=k_cu_seqlens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            deterministic=deterministic,
+        )
+
+    wrapper.__name__ = f"vision_attention_{impl}"
+    wrapper.__qualname__ = wrapper.__name__
+    return wrapper
+
+
+# The plain flash varlen row needs the flash_attn package on every platform it
+# serves (the vision tower has no NPU adapter behind this name).
+_VISION_FA2_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
+    (GpuKernelRequirement(platforms=(_NVIDIA_SM80_PLUS, ROCM_GPU)), ("flash_attn",)),
+    (NpuKernelRequirement(), ("flash_attn",)),
+)
+# The veomni adapter is the torch_npu fused kernel on NPU and falls back to
+# the flash-attn varlen path on GPU hosts.
+_VISION_NPU_ROWS: tuple[tuple[KernelRequirement, tuple[str, ...]], ...] = (
+    (NpuKernelRequirement(), ()),
+    (GpuKernelRequirement(platforms=(_NVIDIA_SM80_PLUS, ROCM_GPU)), ("flash_attn",)),
+)
+
+register_op(
+    "vision_attention",
+    "kimi_k3",
+    "eager",
+    description="MoonViT3d packed-varlen vision attention, pure-PyTorch reference (module-resolved)",
+    wrapper=_vision_attention("eager"),
+)
+for _requirement, _requires in _VISION_FA2_ROWS:
+    register_op(
+        "vision_attention",
+        "kimi_k3",
+        "flash_attention_2",
+        description=("MoonViT3d packed-varlen vision attention via the flash-attn varlen kernel (module-resolved)"),
+        wrapper=_vision_attention("flash_attention_2"),
+        requirement=_requirement,
+        requires=_requires,
+    )
+for _requirement, _requires in _VISION_NPU_ROWS:
+    register_op(
+        "vision_attention",
+        "kimi_k3",
+        "veomni_flash_attention_2",
+        description=(
+            "MoonViT3d packed-varlen vision attention via torch_npu.npu_fusion_attention "
+            "(TND varlen); non-NPU devices fall back to the flash-attn varlen path"
+        ),
+        wrapper=_vision_attention("veomni_flash_attention_2"),
+        requirement=_requirement,
+        requires=_requires,
+    )

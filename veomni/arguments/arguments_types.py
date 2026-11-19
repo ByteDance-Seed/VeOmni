@@ -1418,6 +1418,8 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "load_balancing_loss_implementation": frozenset(),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
     "moe_implementation": frozenset({"fused_npu"}),
+    "situ_and_mul_implementation": frozenset({"triton"}),
+    "chunk_kda_implementation": frozenset({"ascendc"}),
 }
 
 _NPU_REQUIRED: Dict[str, frozenset] = {
@@ -1639,6 +1641,28 @@ class OpsImplementationConfig:
             "'triton' uses the vendored Triton-Ascend kernel (requires triton-ascend, NPU). "
             "Only affects varlen (dyn_bsz) training; a non-eager value on hardware without a "
             "matching backend raises when the model resolves its kernel."
+        },
+    )
+    situ_and_mul_implementation: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Kimi-K3 SituGLU activation (beta*tanh(gate/beta)*sigmoid(gate) * up). "
+            "'eager' is the ops-side fp32 PyTorch reference. "
+            "'triton' is the fused Triton-Ascend kernel (requires triton-ascend, NPU). "
+            "Unset: 'triton' on NPU, 'eager' elsewhere."
+        },
+    )
+    chunk_kda_implementation: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Kimi-K3 KDA chunked linear attention. "
+            "'eager' is the ops-side pure-PyTorch reference (chunk_kda_naive, slow). "
+            "'fla' is fla.ops.kda.chunk_kda (requires flash-linear-attention with KDA "
+            "beta-sigmoid gating support, GPU). "
+            "'ascendc' is the fused AscendC kernel from the flash-linear-attention-npu "
+            "package (NPU; routes around two verified fused-kernel bugs, see "
+            "veomni/ops/kernels/kda/kimi_k3/ascendc.py). "
+            "Unset: 'ascendc' on NPU, 'eager' elsewhere."
         },
     )
     chunk_gated_delta_rule_implementation: str = field(
