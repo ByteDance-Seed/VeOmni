@@ -114,9 +114,10 @@ are rejected because iterator initialization may advance CPU RNG.
 
 When the model checkpoint manager provides strict MultiOptimizer generation
 receipts, the trainer sidecar records that generation and recovery requires it
-to match the optimizer checkpoint and step. Checkpoint managers without this
-protocol retain their existing behavior; their optimizer-to-cursor identity is
-not established by the dynamic-batching cursor checks alone.
+to match the optimizer checkpoint and step. Managers without this protocol must
+still provide the standard completion manifest and DCP markers for optimizer
+continuation; custom checkpoint layouts without that evidence are rejected.
+These checks do not establish optimizer-to-cursor identity for such managers.
 
 Set `data.resume_input_contract` to `sha256:<64 lowercase hex characters>`
 before training, and set `data.resume_input_deterministic=true` only when the
@@ -297,9 +298,11 @@ The one step with a single half is a run that saves no model state. SeedOmni's
 `offline_embedding` freezes every module, so no module has a checkpoint
 manager and the step has no `model/`. Its manifest records
 [`model_state: false`](../../veomni/checkpoint/layout.py#L187), and the manifest
-alone then marks the step complete. Without that field, the same tree would look
-like a step whose shards never started. A manifest written before the field
-existed counts as carrying model state.
+alone then marks the step complete. An explicit offline-embedding resume also
+requires that complete cursor-only manifest before restoring loader or writer
+state. Without the field, the same tree would look like a step whose shards
+never started. A manifest written before the field existed counts as carrying
+model state.
 
 Rewriting a step — a restarted run reaching the same step again — deletes the
 markers first, so an interrupted rewrite cannot leave a stale one standing over
@@ -324,9 +327,13 @@ step and generation alone do not prove exact dataloader or RNG recovery.
 For ordinary optimizers as well, resume fails if any rank is missing trainer
 state or a required RNG state, or if a completed-step checkpoint lacks the
 cursor for an active dataloader. This prevents restoring optimizer state while
-restarting the data, random stream or step counter. To start from weights only,
-use a model-only load without an optimizer rather than a training checkpoint
-resume.
+restarting the data, random stream or step counter. Optimizer continuation also
+requires a complete source manifest and matching step and world size, even when
+saving to a different output directory. For ordinary optimizers, a legacy
+manifest without `model_state` retains its documented model-state default; a
+MultiOptimizer requires `model_state: true`. A checkpoint without the required
+proof needs a verified migration. To start from weights only, use a model-only
+load without an optimizer rather than a training checkpoint resume.
 If a restored run has not established a same-step save receipt, an immediate
 export to the already completed step fails rather than overwriting that DCP.
 

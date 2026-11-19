@@ -3,6 +3,7 @@
 
 """The trainer cursor must belong to the same optimizer checkpoint generation."""
 
+import json
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -10,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_capabilities
 from tests.checkpoints.test_checkpoint_callback import _make_mock_trainer
 from veomni.checkpoint import layout
 from veomni.trainer.callbacks.base import TrainerState
@@ -464,8 +465,20 @@ def test_same_output_path_comparison_covers_uri_and_symlink(tmp_path):
 
 
 @pytest.mark.parametrize("stage", ["epoch", "train_end"])
-@pytest.mark.parametrize("incomplete", ["none", "manifest", "rng", "rng_conflict"])
-def test_legacy_same_output_resume_never_rewrites_completed_dcp(tmp_path, stage, incomplete):
+@pytest.mark.parametrize(
+    ("incomplete", "different_output"),
+    [
+        ("none", False),
+        ("legacy_manifest", False),
+        ("legacy_manifest", True),
+        ("manifest", False),
+        ("manifest", True),
+        ("step_conflict", True),
+        ("rng", False),
+        ("rng_conflict", False),
+    ],
+)
+def test_legacy_same_output_resume_never_rewrites_completed_dcp(tmp_path, stage, incomplete, different_output):
     from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime, _make_mock_trainer
     from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
     from veomni.models.checkpoint.manager import ModelCheckpointManager
@@ -479,8 +492,8 @@ def test_legacy_same_output_resume_never_rewrites_completed_dcp(tmp_path, stage,
         obj.train_args.checkpoint.load_path = load_path
         return obj
 
-    def trainer(obj, manager, load_path=None):
-        result = _make_mock_trainer(save_path=str(tmp_path))
+    def trainer(obj, manager, load_path=None, save_path=tmp_path):
+        result = _make_mock_trainer(save_path=str(save_path))
         result.args.train.checkpoint.load_path = load_path
         result.args.train.checkpoint.save_epochs = 1
         result.args.train.checkpoint.save_hf_weights = False
@@ -511,11 +524,18 @@ def test_legacy_same_output_resume_never_rewrites_completed_dcp(tmp_path, stage,
         assert layout.checkpoint_is_complete(load_path)
         if incomplete == "manifest":
             os.remove(layout.manifest_path(load_path))
-        elif incomplete in ("rng", "rng_conflict"):
+        elif incomplete == "legacy_manifest":
+            manifest = layout.read_manifest(load_path)
+            manifest.pop("model_state")
+            with open(layout.manifest_path(load_path), "w") as handle:
+                json.dump(manifest, handle)
+        elif incomplete in ("rng", "rng_conflict", "step_conflict"):
             state_path = layout.extra_state_path(load_path, 0)
             state = torch.load(state_path, map_location="cpu", weights_only=False)
             if incomplete == "rng":
                 state.pop("torch_rng_state")
+            elif incomplete == "step_conflict":
+                state["global_step"] += 1
             else:
                 alternate = torch.Generator().manual_seed(0).get_state()
                 if torch.equal(alternate, state["torch_rng_state"]):
@@ -525,17 +545,31 @@ def test_legacy_same_output_resume_never_rewrites_completed_dcp(tmp_path, stage,
         target = runtime(load_path)
         restored = ModelCheckpointManager(target)
         restored.load()
-        resumed = trainer(target, restored, load_path)
+        destination = tmp_path / "new_output" if different_output else tmp_path
+        resumed = trainer(target, restored, load_path, save_path=destination)
         resumed.checkpoint_callback = CheckpointCallback(resumed)
         cursor = GlobalStateCallback(resumed)
-        if incomplete != "none":
-            with pytest.raises(RuntimeError, match="Cannot safely reuse"):
+        if incomplete not in ("none", "legacy_manifest"):
+            errors = {
+                "manifest": (RuntimeError, "Trainer checkpoint is incomplete"),
+                "step_conflict": (ValueError, "Trainer and source checkpoint manifest steps differ"),
+                "rng": (ValueError, "Trainer CPU RNG state is missing"),
+                "rng_conflict": (ValueError, "Trainer CPU and device RNG states conflict"),
+            }
+            error_type, message = errors[incomplete]
+            with pytest.raises(error_type, match=message):
                 cursor.load_global_state()
+            assert resumed.state.global_step == 0
             assert restored._last_saved_step == -1
             assert resumed.checkpoint_callback._last_dcp_step == -1
             assert cursor._last_saved_step == -1
             return
         cursor.load_global_state()
+        if different_output:
+            assert resumed.state.global_step == 2
+            assert restored._last_saved_step == -1
+            assert layout.checkpoint_is_complete(load_path)
+            return
         with patch.object(DistributedCheckpointer, "_create_storage_writer", side_effect=OSError("must not rewrite")):
             if stage == "epoch":
                 resumed.checkpoint_callback.on_epoch_end(step)
@@ -602,12 +636,30 @@ def test_same_output_unknown_provider_cannot_be_certified(tmp_path, monkeypatch)
         callback, "_read_current", lambda _: {"global_step": 2, "torch_rng_state": torch.get_rng_state()}
     )
     monkeypatch.setattr(callback, "_restore_position", lambda _: None)
+    monkeypatch.setattr(layout, "checkpoint_is_complete", lambda _: True)
+    monkeypatch.setattr(layout, "read_manifest", lambda _: {"model_state": True, "global_step": 2, "world_size": 1})
     with pytest.raises(RuntimeError, match="cannot confirm optimizer identity"):
         callback.load_global_state()
 
 
+@pytest.mark.parametrize("source", ["missing_manifest", "missing_dcp_marker"])
+def test_custom_optimizer_requires_a_complete_source_before_reading_cursor(tmp_path, source):
+    trainer = _make_mock_trainer(save_path=str(tmp_path / "new"))
+    load_path = tmp_path / "old" / "global_step_2"
+    trainer.args.train.checkpoint.load_path = str(load_path)
+    trainer.model = SimpleNamespace(optimizer=torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))]), checkpoint=None)
+    callback = GlobalStateCallback(trainer)
+    callback._read_current = MagicMock(side_effect=AssertionError("incomplete source must not read cursor"))
+    if source == "missing_dcp_marker":
+        layout.write_manifest(str(load_path), global_step=2, world_size=1, model_state=True)
+    with pytest.raises(RuntimeError, match="Trainer checkpoint is incomplete"):
+        callback.load_global_state()
+    callback._read_current.assert_not_called()
+    assert trainer.state.global_step == 0
+
+
 @pytest.mark.parametrize("mode", ["different", "same", "symlink", "symlink_dotdot"])
-def test_weights_only_resume_does_not_overwrite_source_step_zero(tmp_path, monkeypatch, mode):
+def test_optimizer_resume_without_trainer_state_is_rejected(tmp_path, monkeypatch, mode):
     save_root = tmp_path / ("new" if mode == "different" else "old")
     trainer = _make_mock_trainer(save_path=str(save_root))
     source = tmp_path / "old" / "global_step_0"
@@ -623,14 +675,18 @@ def test_weights_only_resume_does_not_overwrite_source_step_zero(tmp_path, monke
         alias.symlink_to(nested, target_is_directory=True)
         source = alias / ".." / "global_step_0"
     trainer.args.train.checkpoint.load_path = str(source)
-    trainer.model = SimpleNamespace(optimizer=torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))]), checkpoint=None)
+    parameter = torch.nn.Parameter(torch.ones(1))
+    optimizer = torch.optim.AdamW([parameter])
+    trainer.model = SimpleNamespace(optimizer=optimizer, checkpoint=None)
     callback = GlobalStateCallback(trainer)
     monkeypatch.setattr(callback, "_read_current", lambda _: None)
-    if mode != "different":
-        with pytest.raises(RuntimeError, match="without trainer state"):
-            callback.load_global_state()
-    else:
-        assert callback.load_global_state() is None
+    monkeypatch.setattr(layout, "checkpoint_is_complete", lambda _: True)
+    monkeypatch.setattr(layout, "read_manifest", lambda _: {"model_state": True, "global_step": 0, "world_size": 1})
+    with pytest.raises(RuntimeError, match="Trainer state is missing.*optimizer continuation is unsafe"):
+        callback.load_global_state()
+    assert not optimizer.state
+    assert torch.equal(parameter, torch.ones_like(parameter))
+    assert trainer.state.global_step == 0
 
 
 def test_failed_load_barrier_cannot_certify_legacy_receipt(tmp_path):
@@ -640,11 +696,16 @@ def test_failed_load_barrier_cannot_certify_legacy_receipt(tmp_path):
 
     runtime = _make_mock_runtime(save_path=str(tmp_path))
     runtime.optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+    runtime.lr_scheduler = None
     load_path = layout.step_dir(str(tmp_path), 2)
     runtime.train_args.checkpoint.load_path = load_path
+
+    def load_with_scheduler(_path, state, **_kwargs):
+        state["extra_state"]["lr_scheduler"] = None
+
     with (
         patch("veomni.models.checkpoint.manager.build_checkpointer", return_value=DistributedCheckpointer),
-        patch.object(DistributedCheckpointer, "load"),
+        patch.object(DistributedCheckpointer, "load", side_effect=load_with_scheduler),
         patch("torch.distributed.barrier", side_effect=RuntimeError("barrier failed")),
     ):
         manager = ModelCheckpointManager(runtime)
@@ -786,3 +847,137 @@ def test_same_output_path_resolves_symlink_before_dotdot(tmp_path):
     assert not layout.same_checkpoint_path(
         str(output / "alias" / ".." / "global_step_3"), str(output / "global_step_3")
     )
+
+
+def _source_completeness_worker(rank, device_type, case, endpoint):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from tests.checkpoints.test_checkpoint_callback import _make_mock_runtime
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.models.checkpoint.manager import ModelCheckpointManager
+    from veomni.utils.device import get_device_rng_state
+
+    if device_type == "npu":
+        torch.npu.set_device(rank)
+    backend = "hccl" if device_type == "npu" else "gloo"
+    dist.init_process_group(backend, store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    try:
+        _init_parallel_state(dp_size=2, device_type=device_type, name="base")
+        if case == "omni_mode_mismatch":
+            from veomni.trainer.omni.omni_trainer import OmniTrainer
+
+            trainer = OmniTrainer.__new__(OmniTrainer)
+            trainer.args = SimpleNamespace(
+                train=SimpleNamespace(checkpoint=SimpleNamespace(load_path="/unused/source"))
+            )
+            trainer.model = MagicMock(module_runtimes={"model": SimpleNamespace(checkpoint=object())})
+            with (
+                patch.object(layout, "read_manifest", return_value={"model_state": rank == 0}),
+                pytest.raises((RuntimeError, ValueError), match="holds no model state|failed on another rank"),
+            ):
+                trainer.load()
+            trainer.model.load.assert_not_called()
+            ready = torch.tensor(1, device=torch.device(device_type, rank) if device_type == "npu" else "cpu")
+            dist.all_reduce(ready)
+            assert ready.item() == 2
+            return
+        source = "/unused/source/global_step_2"
+        save_root = "/unused/source" if case == "same_output" else "/unused/new_output"
+        trainer = _make_mock_trainer(save_path=save_root)
+        trainer.args.train.global_rank = rank
+        trainer.args.train.world_size = 2
+        trainer.args.train.checkpoint.load_path = source
+        trainer.train_dataloader = None
+        manager = None
+        if case == "offline_missing":
+            trainer.args.train.training_task = "offline_embedding"
+            trainer.model = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
+        elif rank == 0:
+            runtime = _make_mock_runtime(save_path=save_root)
+            runtime.optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+            runtime.lr_scheduler = None
+            runtime.has_trainable_parameters = True
+            with patch("veomni.models.checkpoint.manager.build_checkpointer"):
+                manager = ModelCheckpointManager(runtime)
+            manager._loaded_checkpoint_path = source
+            runtime.checkpoint = manager
+            trainer.model = runtime
+        else:
+            trainer.model = SimpleNamespace(optimizer=None, checkpoint=None, has_trainable_parameters=False)
+        callback = GlobalStateCallback(trainer)
+        payload = {
+            "global_step": 2,
+            "torch_rng_state": torch.get_rng_state(),
+            "device_rng_state": get_device_rng_state(),
+        }
+        if case == "missing_rng" and rank == 1:
+            payload.pop("torch_rng_state")
+        callback._read_current = lambda _: payload
+        manifest = {"model_state": case != "offline_missing", "global_step": 2, "world_size": 2}
+        if case in ("missing_manifest", "offline_missing") and rank == 1:
+            manifest = None
+        before_rng = torch.get_rng_state().clone()
+        with (
+            patch.object(layout, "read_manifest", return_value=manifest),
+            patch.object(layout, "checkpoint_is_complete", return_value=True),
+        ):
+            if case in ("missing_manifest", "missing_rng", "offline_missing"):
+                with pytest.raises(
+                    (RuntimeError, ValueError), match="incomplete|RNG state is missing|failed on another rank"
+                ):
+                    callback.load_global_state()
+                assert trainer.state.global_step == 0
+                assert torch.equal(torch.get_rng_state(), before_rng)
+                assert callback._last_saved_step == -1
+            else:
+                callback.load_global_state()
+                assert trainer.state.global_step == 2
+                assert callback._last_saved_step == (2 if case == "same_output" else -1)
+                if manager is not None:
+                    assert manager._last_saved_step == (2 if case == "same_output" else -1)
+        ready = torch.tensor(1, device=torch.device(device_type, rank) if device_type == "npu" else "cpu")
+        dist.all_reduce(ready)
+        assert ready.item() == 2
+    finally:
+        dist.destroy_process_group()
+        clear_parallel_state()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu", nproc=2))
+@pytest.mark.parametrize(
+    "case",
+    ["missing_manifest", "missing_rng", "same_output", "different_output", "offline_missing", "omni_mode_mismatch"],
+)
+def test_source_completeness_is_coordinated_across_optimizer_owners(case):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_source_completeness_worker, args=("cpu", case), nprocs=2)
+
+
+def _native_source_completeness_plan(context):
+    if context.capabilities.backend != "npu":
+        return LaunchSpec(device="cpu")
+    return LaunchSpec(nproc=2)
+
+
+@pytest.mark.launch_plan(provider=_native_source_completeness_plan)
+@pytest.mark.parametrize(
+    "case",
+    ["missing_manifest", "missing_rng", "same_output", "different_output", "offline_missing", "omni_mode_mismatch"],
+)
+def test_source_completeness_is_coordinated_native_npu(case):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+    from veomni.utils.device import IS_NPU_AVAILABLE
+
+    ci_backend = runner_capabilities().backend if os.environ.get("VEOMNI_CI_CAPABILITIES") else None
+    require_npu = os.environ.get("VEOMNI_REQUIRE_NPU_TESTS") == "1" or ci_backend == "npu"
+    available = ci_backend in (None, "npu") and IS_NPU_AVAILABLE and torch.npu.is_available()
+    if not available:
+        if require_npu:
+            pytest.fail("A working NPU is required for source-completeness recovery")
+        pytest.skip("source-completeness HCCL test requires NPU")
+    if torch.npu.device_count() < 2:
+        pytest.fail("source-completeness HCCL test requires two NPUs")
+    spawn_with_rendezvous(_source_completeness_worker, args=("npu", case), nprocs=2)

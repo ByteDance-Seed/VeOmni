@@ -10,6 +10,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.checkpoint import layout
 from veomni.data.dynamic_batching import DynamicBatchSizeDataLoader, TextBatchingStrategy
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
 
@@ -88,7 +89,9 @@ def _offline_missing_cursor_worker(rank, root):
         )
         trainer = SimpleNamespace(
             args=SimpleNamespace(
-                train=SimpleNamespace(global_rank=rank, checkpoint=checkpoint, training_task="offline_embedding"),
+                train=SimpleNamespace(
+                    global_rank=rank, world_size=2, checkpoint=checkpoint, training_task="offline_embedding"
+                ),
                 train_steps=10,
             ),
             model=SimpleNamespace(optimizer=None, checkpoint=None),
@@ -118,4 +121,5 @@ def _offline_missing_cursor_worker(rank, root):
 
 
 def test_offline_missing_cursor_is_rejected_on_all_ranks(tmp_path):
+    layout.write_manifest(str(tmp_path), global_step=3, world_size=2, model_state=False)
     mp.spawn(_offline_missing_cursor_worker, args=(str(tmp_path),), nprocs=2, join=True)

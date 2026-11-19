@@ -83,6 +83,7 @@ from ...utils.device import (
     is_nccl_backend,
     synchronize,
 )
+from ...utils.dist_utils import raise_if_any_rank_failed
 from ...utils.loss_utils import contains_padding, reject_objective_padding, synchronize_step_begin_error
 from ...utils.omni_helper import OmniEnvironMeter
 from ..base import VeOmniIter
@@ -413,18 +414,22 @@ class OmniTrainer:
                 step resumed by a training run, or the reverse.
         """
         load_path = self.args.train.checkpoint.load_path
-        manifest = layout.read_manifest(load_path) if load_path else None
-        if manifest is not None and bool(manifest.get("model_state", True)) != self.saves_model_state:
-            if self.saves_model_state:
-                mismatch = (
-                    f"{load_path} holds no model state (an offline_embedding step), but this run trains modules."
-                )
-            else:
-                mismatch = f"{load_path} holds model state, but this offline_embedding run saves none."
-            raise ValueError(
-                f"{mismatch} An offline_embedding run and a training run must not share "
-                "train.checkpoint.output_dir: load_path: auto resumes the newest complete step in it."
-            )
+        if load_path:
+            error = None
+            try:
+                manifest = layout.read_manifest(load_path)
+                if manifest is not None and bool(manifest.get("model_state", True)) != self.saves_model_state:
+                    if self.saves_model_state:
+                        mismatch = f"{load_path} holds no model state (an offline_embedding step), but this run trains modules."
+                    else:
+                        mismatch = f"{load_path} holds model state, but this offline_embedding run saves none."
+                    raise ValueError(
+                        f"{mismatch} An offline_embedding run and a training run must not share "
+                        "train.checkpoint.output_dir: load_path: auto resumes the newest complete step in it."
+                    )
+            except BaseException as exc:
+                error = exc
+            raise_if_any_rank_failed(error, "checking Omni checkpoint mode")
         self.model.load()
 
     @property
