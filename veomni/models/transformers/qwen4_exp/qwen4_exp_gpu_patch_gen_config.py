@@ -575,7 +575,9 @@ def qwen4_exp_gated_deltanet_forward_patched(
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
     if self.num_v_heads // self.num_k_heads > 1 and not (
-        self.veomni_chunk_gated_delta_rule.impl in GROUPED_VALUE_HEAD_IMPLS and not use_precomputed_states
+        self.veomni_chunk_gated_delta_rule.impl in GROUPED_VALUE_HEAD_IMPLS
+        and not use_precomputed_states
+        and (self.veomni_chunk_gated_delta_rule.impl != "fla_npu" or self.num_v_heads // self.num_k_heads <= 4)
     ):
         query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
         key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
@@ -1046,6 +1048,7 @@ class PatchedQwen4ExpTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
+        self._veomni_fp32_expert_wgrad = False
         self.use_swiglu = config.hidden_act in {"silu", "swish"}
         self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
@@ -1076,7 +1079,7 @@ class PatchedQwen4ExpTextExperts(nn.Module):
             unused,
             self.down_proj,
             self.gate_up_proj,
-            num_experts=self.num_experts,
+            **dict(num_experts=self.num_experts, **({"fp32_wgrad": True} if self._veomni_fp32_expert_wgrad else {})),
         )
         # --- Patch.1 ---
 

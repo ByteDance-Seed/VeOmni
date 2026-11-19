@@ -24,6 +24,15 @@
     ]
   },
   {
+    "name": "qwen38-sft-resume-modes-unit",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_sft_resume_modes.py"
+    ]
+  },
+  {
     "name": "02-unit",
     "suite": "unit",
     "conditional": false,
@@ -41,6 +50,16 @@
       "-s",
       "-x",
       "tests/parallel/ulysses/test_slice_input_tensor.py"
+    ]
+  },
+  {
+    "name": "gpu-selective-expert-cpu-clip-unit",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_fsdp2_clip_grad_norm.py"
     ]
   },
   {
@@ -203,7 +222,8 @@
     "args": [
       "-s",
       "-x",
-      "tests/trainer/test_aux_metrics.py"
+      "tests/trainer/test_aux_metrics.py",
+      "tests/trainer/test_padding_loss.py"
     ]
   },
   {
@@ -457,6 +477,16 @@
       "-s",
       "-x",
       "tests/optim/test_muon_unit.py"
+    ]
+  },
+  {
+    "name": "sparse-optimizer-state-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_multi_optimizer_sparse_lr.py"
     ]
   },
   {

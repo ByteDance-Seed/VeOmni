@@ -68,3 +68,25 @@ def test_a_non_seedomni_data_type_in_yaml_is_refused_at_parse_time():
     """``Literal`` only constrains the CLI flag; a YAML value reaches the dataclass unchecked."""
     with pytest.raises(ValueError, match="data_type='conversation'"):
         _instantiate_recursive(OmniDataArguments, {"train_path": "t.jsonl", "data_type": "conversation"}, "data")
+
+
+def test_multisource_resume_options_parse_and_validate():
+    contract = "sha256:" + "1" * 64
+    args = _instantiate_recursive(
+        OmniDataArguments,
+        {
+            "train_path": "sources.yaml",
+            "resume_input_contract": contract,
+            "resume_input_deterministic": True,
+            "resume_replay_timeout_seconds": 60,
+        },
+        "data",
+    )
+    assert args.resume_input_contract == contract
+    assert args.resume_input_deterministic is True
+    assert args.resume_replay_timeout_seconds == 60
+    with pytest.raises(ValueError, match="positive integer"):
+        OmniDataArguments(train_path="sources.yaml", resume_replay_timeout_seconds=0)
+    positional = OmniDataArguments("cache.parquet", 10, 10, "seedomni_cached")
+    assert positional.data_type == "seedomni_cached"
+    assert OmniDataArguments.__match_args__[:4] == ("train_path", "train_size", "train_sample", "data_type")
