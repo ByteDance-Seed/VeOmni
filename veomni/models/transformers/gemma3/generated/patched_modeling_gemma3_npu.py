@@ -10,7 +10,7 @@
 #
 #  Patches applied:
 #    - method_override: Gemma3TextModel.forward
-#      Packed masks use veomni.ops.mask; non-packed uses HF cache-aware builders
+#      Route packed and non-packed masks through veomni.models.utils.mask_utils
 #    - method_override: Gemma3ForCausalLM.__init__
 #      Bind ForCausalLMLoss to a local cross_entropy_loss VeomniOp
 #    - method_override: Gemma3ForCausalLM.forward
@@ -20,7 +20,7 @@
 #    - method_override: Gemma3RMSNorm.forward
 #      Always call the local rms_norm offset VeomniOp
 #    - init_modification: Gemma3MLP
-#      Bind instance-local geglu swiglu_mlp VeomniOp
+#      Bind instance-local geglu gated_mlp VeomniOp
 #    - method_override: Gemma3DecoderLayer.__init__
 #      Pass config to Gemma3RMSNorm instances
 #    - method_override: Gemma3TextModel.__init__
@@ -28,7 +28,7 @@
 #    - method_override: Gemma3MultiModalProjector.__init__
 #      Pass config to Gemma3RMSNorm
 #    - method_override: Gemma3MLP.forward
-#      Call geglu swiglu_mlp for gelu_pytorch_tanh on plain nn.Linear projections, otherwise the projection modules
+#      Call the geglu gated_mlp row, which picks fused weights or the projection modules
 #    - init_modification: Gemma3Attention
 #      Bind instance-local rope and attention VeomniOps
 #    - method_override: Gemma3Attention.forward
@@ -64,9 +64,7 @@ from transformers.generation import GenerationMixin
 from transformers.masking_utils import (
     _preprocess_mask_arguments,
     blockwise_overlay,
-    create_causal_mask,
     create_masks_for_generate,
-    create_sliding_window_causal_mask,
     maybe_pad_block_sequence_ids,
     sliding_window_overlay,
 )
@@ -97,9 +95,8 @@ from veomni.models.loss_utils import ForCausalLMLoss
 
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
+from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
-from veomni.ops.mask import packed_causal_mask, sliding_window_mask
 from veomni.utils.constants import IGNORE_INDEX
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
 
@@ -151,28 +148,22 @@ def create_gemma3_masks(
     if past_key_values is not None:
         raise ValueError("Packed Gemma 3 VLM attention does not support past_key_values.")
 
-    q_len = inputs_embeds.shape[1]
-    packed_kwargs = {
-        "impl": attention_impl,
-        "device": inputs_embeds.device,
-        "batch_size": inputs_embeds.shape[0],
-        "dtype": inputs_embeds.dtype,
-        "cu_seqlens": cu_seq_lens_q,
+    # Route packed inputs through ``veomni.models.utils.mask_utils`` so
+    # ``block_sequence_ids`` and ``cu_seq_lens_q`` compose into isolated masks.
+    block_sequence_ids = (
+        None
+        if token_type_ids is None
+        else get_block_sequence_ids_for_mask(token_type_ids, device=inputs_embeds.device)
+    )
+    packed_mask_kwargs = {
+        **mask_kwargs,
+        "block_sequence_ids": block_sequence_ids,
+        "cu_seq_lens_q": cu_seq_lens_q,
+        "attn_implementation": attention_impl,
     }
-    if attention_mask is not None:
-        packed_kwargs["attention_mask"] = attention_mask
-    if token_type_ids is not None:
-        block_sequence_ids = get_block_sequence_ids_for_mask(token_type_ids, device=inputs_embeds.device)
-        packed_kwargs["or_mask_function"] = blockwise_overlay(block_sequence_ids)
-
     return {
-        "full_attention": packed_causal_mask(q_len, q_len, **packed_kwargs),
-        "sliding_attention": sliding_window_mask(
-            q_len,
-            q_len,
-            sliding_window=config.sliding_window,
-            **packed_kwargs,
-        ),
+        "full_attention": create_causal_mask(**packed_mask_kwargs),
+        "sliding_attention": create_sliding_window_causal_mask(**packed_mask_kwargs),
     }
 
 
@@ -259,7 +250,7 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
 
 
 class Gemma3MLP(nn.Module):
-    # [modified __init__] Bind instance-local geglu swiglu_mlp VeomniOp
+    # [modified __init__] Bind instance-local geglu gated_mlp VeomniOp
     def __init__(self, config: Gemma3TextConfig):
         super().__init__()
         self.config = config
@@ -269,23 +260,14 @@ class Gemma3MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_activation]
-        # Bind instance-local geglu swiglu_mlp VeomniOp
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "geglu", self.config.ops_config.swiglu_mlp_implementation)
+        # Bind instance-local geglu gated_mlp VeomniOp
+        self.veomni_gated_mlp = VeomniOp("gated_mlp", "geglu", self.config.ops_config.gated_mlp_implementation)
 
     def forward(self, x):
-        if self.config.hidden_activation in {"gelu_pytorch_tanh", "gelu_python_tanh"} and has_plain_linear_projections(
-            self
-        ):
-            return self.veomni_swiglu_mlp(
-                x,
-                self.gate_proj.weight,
-                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                self.up_proj.weight,
-                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-                self.down_proj.weight,
-                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-            )
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        # `hidden_activation` travels with the call: the variant computes GELU-tanh, and
+        # the row falls back to this block's own `act_fn` if the config asks for
+        # something else. That check used to be an `if` around the handle call.
+        return self.veomni_gated_mlp(self, x, activation=self.config.hidden_activation)
 
 
 # ======================================================================
@@ -648,6 +630,13 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
 
         self.post_init()
 
+    # ================================================================
+    # Patch: Gemma3TextModel.forward
+    # 1. resolve this instance's bound attention implementation and forward
+    #    ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``) into
+    #    ``veomni.models.utils.mask_utils.{create_causal_mask,
+    #    create_sliding_window_causal_mask}``
+    # ================================================================
     @merge_with_config_defaults
     @capture_outputs
     @auto_docstring
@@ -676,6 +665,7 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
             position_ids = position_ids.unsqueeze(0)
 
         if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # --- Patch.1 ---
             # Mask builders must follow this instance's attention impl.
             for layer in self.layers[: self.config.num_hidden_layers]:
                 handle = getattr(getattr(layer, "self_attn", None), "veomni_attn", None)
@@ -684,57 +674,24 @@ class Gemma3TextModel(Gemma3PreTrainedModel):
                     break
             else:
                 attn_impl = self.config.ops_config.attn_implementation
-            cu_seq_lens_q = kwargs.get("cu_seq_lens_q")
-            if cu_seq_lens_q is not None:
-                impl = attn_impl
-                q_len = inputs_embeds.shape[1]
-                past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
-                kv_len = q_len + past_seen
-                packed_kwargs: dict = {
-                    "impl": impl,
-                    "device": inputs_embeds.device,
-                    "batch_size": inputs_embeds.shape[0],
-                    "dtype": inputs_embeds.dtype,
-                }
-                if attention_mask is not None:
-                    packed_kwargs["attention_mask"] = attention_mask
-                sliding_kwargs = dict(packed_kwargs)
-                if self.config.use_bidirectional_attention:
-                    packed_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
-                    sliding_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
-                causal_mask_mapping = {
-                    "full_attention": packed_causal_mask(q_len, kv_len, cu_seqlens=cu_seq_lens_q, **packed_kwargs),
-                    "sliding_attention": sliding_window_mask(
-                        q_len,
-                        kv_len,
-                        sliding_window=self.config.sliding_window,
-                        cu_seqlens=cu_seq_lens_q,
-                        **sliding_kwargs,
-                    ),
-                }
-            else:
-                mask_kwargs = {
-                    "config": self.config,
-                    "inputs_embeds": inputs_embeds,
-                    "attention_mask": attention_mask,
-                    "past_key_values": past_key_values,
-                    "position_ids": position_ids,
-                }
-                sliding_mask_kwargs = mask_kwargs.copy()
-                if self.config.use_bidirectional_attention:
-                    mask_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
-                    sliding_mask_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
-                # HF builders dispatch on config._attn_implementation; keep it aligned
-                # with this instance's attention impl so flex still receives a BlockMask.
-                previous_impl = self.config._attn_implementation
-                self.config._attn_implementation = attn_impl
-                try:
-                    causal_mask_mapping = {
-                        "full_attention": create_causal_mask(**mask_kwargs),
-                        "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs),
-                    }
-                finally:
-                    self.config._attn_implementation = previous_impl
+            mask_kwargs = {
+                **kwargs,
+                "config": self.config,
+                "inputs_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+                "attn_implementation": attn_impl,
+            }
+            sliding_mask_kwargs = mask_kwargs.copy()
+            if self.config.use_bidirectional_attention:
+                mask_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool)
+                sliding_mask_kwargs["or_mask_function"] = _bidirectional_window_overlay(self.config.sliding_window)
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs),
+            }
+            # --- Patch.1 ---
 
         hidden_states = inputs_embeds
         position_embeddings = {}

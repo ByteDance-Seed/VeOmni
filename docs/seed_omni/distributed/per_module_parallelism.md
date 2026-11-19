@@ -24,7 +24,7 @@ A module's choices live in its block of the `modules` YAML, under
 | DDP | `fsdp_config.fsdp_mode: ddp`, usually with `init_device: cuda` and `broadcast_model_weights_from_rank0: false` (module level, outside `accelerator:`) | Small encoders, where a full replica per rank is cheaper than FSDP2 all-gathers |
 | Eager (inference only) | `fsdp_config.fsdp_mode: eager` | A single-process replica with no mesh; rejected for training |
 | Embedding parallel | `extra_parallel_names: ["emb"]`, `extra_parallel_sizes: [N]`, `extra_parallel_placement_innermost: [false]` | A vocabulary-sharded text encoder; see [Sharded Embedding](../../key_features/sharded_embedding.md) |
-| Expert parallel | `ep_size: N`, `ep_outside: false` (shorthand for an `ep` extra parallel group) | A MoE backbone |
+| Expert parallel | `extra_parallel_names: ["ep"]`, `extra_parallel_sizes: [N]`, `extra_parallel_placement_innermost: [false]` | A MoE backbone. Write all three lists: they are paired by position, and a module entry inherits the global accelerator's, so overriding only `sizes` desynchronises the lengths when the launcher adds another dim (e.g. `emb`). Do **not** use `ep_size: N` here: it is only appended when `"ep"` is absent from `extra_parallel_names`, and a module entry already inherits `["ep"]`, so the field is inert and the run has no EP |
 | Sequence / Context parallel | `ulysses_size: U`, `cp_size: C` (one axis `> 1` per module, with `U * C = W / dp_size` and `pp_size = tp_size = 1` across all modules) | Ulysses SP on encoders/ViT, CP on long-context backbones |
 | Gradient checkpointing | `gradient_checkpointing.enable: false` | Off for cheap modules (text encoders, VAE, flow connector) |
 

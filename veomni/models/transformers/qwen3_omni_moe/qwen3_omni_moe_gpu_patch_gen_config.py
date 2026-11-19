@@ -44,7 +44,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import (
     BaseModelOutputWithPooling,
@@ -77,10 +76,10 @@ from veomni.distributed.sequence_parallel import (
 )
 from veomni.distributed.sequence_parallel.ulysses import _Gather
 from veomni.models.loss_utils import ForCausalLMLoss, load_balancing_loss
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
+from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import (
     AUDIO_INPUT_INDEX,
@@ -97,7 +96,7 @@ config = PatchConfig(
     description="Qwen3-Omni-MoE thinker with VeOmni v5 compatibility (SP + FSDP + fused MoE + fused loss)",
 )
 
-config.drop_import_names("PreTrainedModel")
+config.drop_import_names("PreTrainedModel", "create_causal_mask")
 config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
 
 
@@ -123,15 +122,18 @@ config.add_import(
 )
 config.add_import("veomni.distributed.sequence_parallel.ulysses", names=["_Gather"])
 config.add_import("veomni.ops", names=["VeomniOp"])
+# Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
+# packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
+# once in ``Qwen3OmniMoeThinkerTextModel.forward``.
 config.add_import(
-    "veomni.models.utils.attention_utils",
-    names=["prepare_dense_attention_inputs"],
+    "veomni.models.utils.mask_utils",
+    names=["create_causal_mask"],
 )
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.models.utils.moe_utils",
     names=["merged_experts_act_fn_forward"],
 )
+config.add_import("veomni.ops.kernels.moe_experts", names=["reject_quantizing_act_fn"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss", "load_balancing_loss"],
@@ -268,7 +270,7 @@ def qwen3_omni_moe_text_rmsnorm_forward_patched(self, hidden_states: torch.Tenso
 
 @config.override_method(
     "Qwen3OmniMoeThinkerTextMLP.__init__",
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 def qwen3_omni_moe_thinker_text_mlp_init_patched(self, config, intermediate_size=None):
     nn.Module.__init__(self)
@@ -279,25 +281,15 @@ def qwen3_omni_moe_thinker_text_mlp_init_patched(self, config, intermediate_size
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+    self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
 
 @config.override_method(
     "Qwen3OmniMoeThinkerTextMLP.forward",
-    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the gated_mlp row, which picks fused weights or the projection modules",
 )
 def qwen3_omni_moe_thinker_text_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-        return self.veomni_swiglu_mlp(
-            x,
-            self.gate_proj.weight,
-            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-            self.up_proj.weight,
-            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-            self.down_proj.weight,
-            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-        )
-    return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    return self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
 
 
 @config.override_method(
@@ -1059,6 +1051,9 @@ def qwen3_omni_moe_audio_dummy_forward_patched(self):
 #    index 0 is the text_position_ids used for the causal mask).
 # 2. Return MoeModelOutputWithPast so @capture_outputs can inject
 #    router_logits via the registered OutputRecorder.
+# 3. Forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``) into
+#    ``veomni.models.utils.mask_utils.create_causal_mask`` so packed sequences
+#    build an isolated mask once in the model forward.
 # NOTE: the @merge_with_config_defaults / @capture_outputs / @auto_docstring
 # decorators on the upstream method are preserved by patchgen.
 # ================================================================
@@ -1114,15 +1109,20 @@ def qwen3_omni_moe_thinker_text_model_forward_patched(
     else:
         text_position_ids = position_ids[0]
 
+    # --- Patch.3 ---
     # transformers 5.9 dropped ``cache_position`` from ``create_causal_mask``
     # ("Deprecated and unused" — see masking_utils.py:917).
     attention_mask = create_causal_mask(
-        config=self.config,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        past_key_values=past_key_values,
-        position_ids=text_position_ids,
+        **{
+            **kwargs,
+            "config": self.config,
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": text_position_ids,
+        }
     )
+    # --- Patch.3 ---
 
     hidden_states = inputs_embeds
 
@@ -1210,7 +1210,7 @@ class PatchedQwen3OmniMoeThinkerTextExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_swiglu_mlp = config.hidden_act in {"silu", "swish"}
+        self.use_swiglu = config.hidden_act in {"silu", "swish"}
         self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
@@ -1219,7 +1219,8 @@ class PatchedQwen3OmniMoeThinkerTextExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        if not self.use_swiglu_mlp:
+        if not self.use_swiglu:
+            reject_quantizing_act_fn(self)
             return merged_experts_act_fn_forward(
                 hidden_states,
                 top_k_index,
@@ -2017,13 +2018,6 @@ def qwen3_omni_moe_thinker_text_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-        kwargs,
-        impl=self.veomni_attn.impl,
-        attention_mask=attention_mask,
-        hidden_states=hidden_states,
-    )
-
     attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
@@ -2033,7 +2027,7 @@ def qwen3_omni_moe_thinker_text_attention_forward_patched(
         dropout=0.0 if not self.training else self.attention_dropout,
         scaling=self.scaling,
         sliding_window=self.sliding_window,
-        **attn_kwargs,
+        **kwargs,
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()

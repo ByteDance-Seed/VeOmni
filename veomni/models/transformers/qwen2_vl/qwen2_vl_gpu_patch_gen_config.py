@@ -28,9 +28,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_outputs import BaseModelOutputWithPooling
+from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPooling
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VLModel,
     Qwen2VLModelOutputWithPast,
@@ -46,9 +46,8 @@ from veomni.distributed.sequence_parallel import (
     sp_pad_and_slice,
 )
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import Qwen2VLCausalLMOutputWithLogProbs
@@ -60,7 +59,7 @@ config = PatchConfig(
     description="Qwen2-VL with VeOmni v5 compatibility and LigerKernel GPU replacements",
 )
 
-config.drop_import_names("PreTrainedModel")
+config.drop_import_names("PreTrainedModel", "create_causal_mask", "create_sliding_window_causal_mask")
 config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
 
 
@@ -77,9 +76,12 @@ config.add_import(
     names=["gather_outputs", "slice_input_tensor", "pad_tensor", "sp_pad_and_slice"],
 )
 config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
+# Replace HF's ``create_causal_mask`` / ``create_sliding_window_causal_mask`` with
+# ``veomni.models.utils.mask_utils`` so packed ``cu_seq_lens_q`` / ``cu_seq_lens_k``
+# inputs route through ``veomni.ops.mask`` once in ``Qwen2VLTextModel.forward``.
 config.add_import(
-    "veomni.models.utils.attention_utils",
-    names=["prepare_dense_attention_inputs"],
+    "veomni.models.utils.mask_utils",
+    names=["create_causal_mask", "create_sliding_window_causal_mask"],
 )
 # Surface ``Qwen2VLCausalLMOutputWithLogProbs`` so the patched multimodal
 # ``forward`` can return per-token log-probs / entropy as constructor fields
@@ -93,7 +95,6 @@ config.add_import(
     names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "Qwen2VLCausalLMOutputWithLogProbs"],
 )
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.add_import(
     "veomni.models.loss_utils",
     names=["ForCausalLMLoss"],
@@ -130,7 +131,7 @@ def qwen2_vl_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch
 
 @config.override_method(
     "Qwen2MLP.__init__",
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 def qwen2_vl_mlp_init_patched(self, config):
     nn.Module.__init__(self)
@@ -141,7 +142,7 @@ def qwen2_vl_mlp_init_patched(self, config):
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+    self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
 
 @config.override_method(
@@ -186,22 +187,101 @@ def qwen2_vl_text_model_init_patched(self, config):
     self.post_init()
 
 
+# ================================================================
+# Patch: Qwen2VLTextModel.forward
+# 1. forward ``**kwargs`` (carrying ``cu_seq_lens_q`` / ``cu_seq_lens_k``)
+#    into ``veomni.models.utils.mask_utils.{create_causal_mask,
+#    create_sliding_window_causal_mask}`` so packed sequences build an
+#    isolated mask once in the model forward
+# ================================================================
+@config.override_method(
+    "Qwen2VLTextModel.forward",
+    description="Forward packed sequence metadata to VeOmni mask builders",
+)
+def qwen2_vl_text_model_forward_patched(
+    self,
+    input_ids: torch.LongTensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values: Cache | None = None,
+    inputs_embeds: torch.FloatTensor | None = None,
+    use_cache: bool | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> BaseModelOutputWithPast:
+    if (input_ids is None) ^ (inputs_embeds is not None):
+        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+    # torch.jit.trace() doesn't support cache objects in the output
+    if use_cache and past_key_values is None and not torch.jit.is_tracing():
+        past_key_values = DynamicCache(config=self.config)
+
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_tokens(input_ids)
+
+    # the hard coded `3` is for temporal, height and width.
+    if position_ids is None:
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+        position_ids = position_ids.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
+    elif position_ids.ndim == 2:
+        position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+
+    if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+        text_position_ids = position_ids[0]
+        position_ids = position_ids[1:]
+    else:
+        # If inputs are not packed (usual 3D positions), do not prepare mask from position_ids
+        text_position_ids = None
+
+    # It may already have been prepared by e.g. `generate`
+    if not isinstance(causal_mask_mapping := attention_mask, dict):
+        # --- Patch.1 ---
+        # Prepare mask arguments
+        mask_kwargs = {
+            **kwargs,
+            "config": self.config,
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "position_ids": text_position_ids,
+        }
+        # Create the masks
+        causal_mask_mapping = {
+            "full_attention": create_causal_mask(**mask_kwargs),
+        }
+        # The sliding window alternating layers are not always activated depending on the config
+        if self.has_sliding_layers:
+            causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        # --- Patch.1 ---
+
+    hidden_states = inputs_embeds
+    position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+    for i, decoder_layer in enumerate(self.layers):
+        hidden_states = decoder_layer(
+            hidden_states,
+            attention_mask=causal_mask_mapping[self.config.layer_types[i]],
+            position_embeddings=position_embeddings,
+            position_ids=text_position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **kwargs,
+        )
+
+    hidden_states = self.norm(hidden_states)
+
+    return BaseModelOutputWithPast(
+        last_hidden_state=hidden_states,
+        past_key_values=past_key_values,
+    )
+
+
 @config.override_method(
     "Qwen2MLP.forward",
-    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the gated_mlp row, which picks fused weights or the projection modules",
 )
 def qwen2_vl_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-        return self.veomni_swiglu_mlp(
-            x,
-            self.gate_proj.weight,
-            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-            self.up_proj.weight,
-            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-            self.down_proj.weight,
-            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-        )
-    return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    return self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
 
 
 @config.modify_init("VisionAttention", description="Bind instance-local rope and attention VeomniOps")
@@ -901,13 +981,6 @@ def qwen2_vl_attention_forward_patched(
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-    attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-        kwargs,
-        impl=self.veomni_attn.impl,
-        attention_mask=attention_mask,
-        hidden_states=hidden_states,
-    )
-
     attn_output, attn_weights = self.veomni_attn(
         self,
         query_states,
@@ -918,7 +991,7 @@ def qwen2_vl_attention_forward_patched(
         scaling=self.scaling,
         sliding_window=self.sliding_window,
         position_ids=position_ids,
-        **attn_kwargs,
+        **kwargs,
     )
 
     attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()

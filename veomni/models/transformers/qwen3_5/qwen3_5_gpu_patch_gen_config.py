@@ -48,9 +48,8 @@ from transformers.utils import TransformersKwargs
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import sp_pad_and_slice
 from veomni.models.loss_utils import ForCausalLMLoss
-from veomni.models.utils.attention_utils import prepare_dense_attention_inputs
+from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import (  # noqa: F401  consumed by in-config dataclass + emitted forward
@@ -65,7 +64,7 @@ config = PatchConfig(
     description="Qwen3_5 with VeOmni language-model SP and fused loss patches",
 )
 
-config.drop_import_names("PreTrainedModel")
+config.drop_import_names("PreTrainedModel", "create_causal_mask")
 config.add_import("veomni.models.modeling_base", names=["VeOmniPreTrainedModel as PreTrainedModel"])
 
 config.exclude_from_output("apply_rotary_pos_emb", "apply_rotary_pos_emb_vision", "rotate_half")
@@ -113,16 +112,18 @@ config.add_import(
 )
 config.add_import("veomni.utils.constants", names=["IGNORE_INDEX", "IMAGE_INPUT_INDEX", "VIDEO_INPUT_INDEX"])
 config.add_import("veomni.ops", names=["VeomniOp"])
-config.add_import("veomni.ops.kernels.swiglu_mlp", names=["has_plain_linear_projections"])
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
     "chunk_gated_delta_rule",
     "fused_recurrent_gated_delta_rule",
 )
+# Replace HF's ``create_causal_mask`` with ``veomni.models.utils.mask_utils`` so
+# packed ``cu_seq_lens_q`` / ``cu_seq_lens_k`` inputs route through ``veomni.ops.mask``
+# once in ``Qwen3_5TextModel.forward``.
 config.add_import(
-    "veomni.models.utils.attention_utils",
-    names=["prepare_dense_attention_inputs"],
+    "veomni.models.utils.mask_utils",
+    names=["create_causal_mask"],
 )
 config.add_import(
     "veomni.models.loss_utils",
@@ -172,7 +173,7 @@ def qwen3_5_rmsnorm_forward_patched(self, x):
 
 @config.override_method(
     "Qwen3_5MLP.__init__",
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 def qwen3_5_mlp_init_patched(self, config: Qwen3_5Config, intermediate_size: int):
     nn.Module.__init__(self)
@@ -183,7 +184,7 @@ def qwen3_5_mlp_init_patched(self, config: Qwen3_5Config, intermediate_size: int
     self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
     self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
     self.act_fn = ACT2FN[config.hidden_act]
-    self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+    self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
 
 @config.override_method(
@@ -221,20 +222,10 @@ def qwen3_5_text_model_init_patched(self, config: Qwen3_5TextConfig):
 
 @config.override_method(
     "Qwen3_5MLP.forward",
-    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the gated_mlp row, which picks fused weights or the projection modules",
 )
 def qwen3_5_mlp_forward_patched(self, x):
-    if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-        return self.veomni_swiglu_mlp(
-            x,
-            self.gate_proj.weight,
-            self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-            self.up_proj.weight,
-            self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-            self.down_proj.weight,
-            self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-        )
-    return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+    return self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
 
 
 @config.override_method(
@@ -490,6 +481,8 @@ def qwen3_5_gated_deltanet_forward_patched(
     else:
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
+    # Model policy, not a row capability: fla_npu accepts grouped heads as well,
+    # but Qwen3.5 keeps the expanded layout; Qwen4-Exp opts in explicitly.
     if self.num_v_heads // self.num_k_heads > 1 and not (
         self.veomni_chunk_gated_delta_rule.impl == "flash_qla" and not use_precomputed_states
     ):
@@ -622,10 +615,15 @@ def qwen3_5_text_model_forward_patched(
             "past_key_values": past_key_values,
             "position_ids": text_position_ids,
         }
-        causal_mask_mapping = {
-            "full_attention": create_causal_mask(**mask_kwargs),
-            "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
-        }
+        # --- Patch.1 ---
+        # Only build the mask for layer types present in ``self.config.layer_types``
+        # and forward ``**kwargs`` into ``create_causal_mask`` for packed sequences.
+        causal_mask_mapping = {}
+        if "full_attention" in self.config.layer_types:
+            causal_mask_mapping["full_attention"] = create_causal_mask(**{**kwargs, **mask_kwargs})
+        if "linear_attention" in self.config.layer_types:
+            causal_mask_mapping["linear_attention"] = create_recurrent_attention_mask(**mask_kwargs)
+        # --- Patch.1 ---
 
     hidden_states = inputs_embeds
     position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -701,14 +699,7 @@ def qwen3_5_decoder_layer_forward_patched(
             shared_prefix_plan=shared_prefix_plan,
         )
     elif self.block_type == "full_attention":
-        # Self Attention. SDPA/eager reject GDN cu_seq_lens metadata.
-        attn_impl = getattr(getattr(self, "self_attn", None), "veomni_attn", None)
-        attn_kwargs, attention_mask = prepare_dense_attention_inputs(
-            kwargs,
-            impl=attn_impl.impl if attn_impl is not None else "eager",
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
-        )
+        # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -716,7 +707,7 @@ def qwen3_5_decoder_layer_forward_patched(
             past_key_values=past_key_values,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            **attn_kwargs,
+            **kwargs,
         )
 
     hidden_states = residual + hidden_states

@@ -31,6 +31,7 @@ from veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config imp
     deepseek_v3_get_parallel_plan_patched,
     deepseek_v3_mlp_forward_patched,
     deepseek_v3_mlp_init_patched,
+    deepseek_v3_model_forward_patched,
     deepseek_v3_model_init_patched,
     deepseek_v3_moe_forward_patched,
     deepseek_v3_rmsnorm_forward_patched,
@@ -90,12 +91,12 @@ config.override_method(
 config.override_method(
     "DeepseekV3MLP.__init__",
     replacement=deepseek_v3_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 config.override_method(
     "DeepseekV3MLP.forward",
     replacement=deepseek_v3_mlp_forward_patched,
-    description="Always call the local swiglu_mlp VeomniOp",
+    description="Always call the local gated_mlp VeomniOp",
 )
 config.override_method(
     "DeepseekV3DecoderLayer.__init__",
@@ -106,6 +107,11 @@ config.override_method(
     "DeepseekV3Model.__init__",
     replacement=deepseek_v3_model_init_patched,
     description="Pass config to final DeepseekV3RMSNorm",
+)
+config.override_method(
+    "DeepseekV3Model.forward",
+    replacement=deepseek_v3_model_forward_patched,
+    description="Forward packed sequence metadata to VeOmni mask builders",
 )
 config.replace_class(
     "DeepseekV3Experts",

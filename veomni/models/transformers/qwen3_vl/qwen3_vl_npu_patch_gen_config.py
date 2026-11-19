@@ -40,6 +40,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     qwen3_vl_text_deepstack_process_patched,
     qwen3_vl_text_mlp_forward_patched,
     qwen3_vl_text_mlp_init_patched,
+    qwen3_vl_text_model_forward_patched,
     qwen3_vl_text_model_init_patched,
     qwen3_vl_vision_attention_forward_patched,
     qwen3_vl_vision_block_forward_patched,
@@ -91,12 +92,12 @@ config.override_method(
 config.override_method(
     "Qwen3VLTextMLP.__init__",
     replacement=qwen3_vl_text_mlp_init_patched,
-    description="Construct a local swiglu_mlp VeomniOp",
+    description="Construct a local gated_mlp VeomniOp",
 )
 config.override_method(
     "Qwen3VLTextMLP.forward",
     replacement=qwen3_vl_text_mlp_forward_patched,
-    description="Call swiglu_mlp for silu/swish on plain nn.Linear projections, otherwise the projection modules",
+    description="Call the gated_mlp row, which picks fused weights or the projection modules",
 )
 config.override_method(
     "Qwen3VLTextDecoderLayer.__init__",
@@ -107,6 +108,11 @@ config.override_method(
     "Qwen3VLTextModel.__init__",
     replacement=qwen3_vl_text_model_init_patched,
     description="Pass config to final Qwen3VLTextRMSNorm",
+)
+config.override_method(
+    "Qwen3VLTextModel.forward",
+    replacement=qwen3_vl_text_model_forward_patched,
+    description="Forward packed sequence metadata to VeOmni mask builders",
 )
 config.override_method(
     "Qwen3VLVisionAttention.forward",
