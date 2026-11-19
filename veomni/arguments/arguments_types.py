@@ -16,6 +16,7 @@ import math
 import os
 import sys
 from dataclasses import asdict, dataclass, field
+from functools import wraps
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
@@ -76,6 +77,22 @@ def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
 #
 
 
+def _accept_positional_state_offload(cls):
+    """Keep both the upstream offload and historical learning-rate call forms."""
+    original_init = cls.__init__
+
+    @wraps(original_init)
+    def init(self, *args, **kwargs):
+        if len(args) > 1 and not isinstance(args[1], str):
+            offload = kwargs.pop("state_offload", "none")
+            args = (args[0], offload, *args[1:])
+        original_init(self, *args, **kwargs)
+
+    cls.__init__ = init
+    return cls
+
+
+@_accept_positional_state_offload
 @dataclass
 class OptimizerConfig:
     """model.optimizer.* — Optimizer and learning-rate schedule.
@@ -93,7 +110,6 @@ class OptimizerConfig:
     )
     state_offload: Literal["none", "cpu"] = field(
         default="none",
-        kw_only=True,
         metadata={
             "help": (
                 "Optimizer-managed state offload. 'none' disables it (training state may still be "
