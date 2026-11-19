@@ -21,7 +21,7 @@ test:
 	pytest tests/
 
 check-hf-modeling:
-	python3 scripts/sync_hf_modeling.py check
+	python3 scripts/sync_hf_modeling.py check --strict-version
 
 check-agent-docs:
 	python3 scripts/ci/docs/check_agent_doc_paths.py

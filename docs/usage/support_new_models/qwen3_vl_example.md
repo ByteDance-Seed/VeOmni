@@ -253,7 +253,7 @@ class Qwen3VLMoeTextExperts(nn.Module):
         )
 ```
 
-Use `@config.replace_class("Qwen3VLMoeTextExperts")` so the upstream `@use_experts_implementation` decorator is dropped. The SparseMoeBlock keeps passing compact top-k index/weight tensors into `Experts.forward`; do not reconstruct a full scatter tensor, split/transpose `gate_up_proj`, or call a public `fused_moe_forward`.
+Define the `Qwen3VLMoeTextExperts` class directly in the standalone modeling file and remove the upstream `@use_experts_implementation` decorator. The SparseMoeBlock keeps passing compact top-k index/weight tensors into `Experts.forward`; do not reconstruct a full scatter tensor, split/transpose `gate_up_proj`, or call a public `fused_moe_forward`.
 
 ---
 

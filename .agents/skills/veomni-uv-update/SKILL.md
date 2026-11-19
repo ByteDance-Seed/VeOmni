@@ -13,7 +13,8 @@ Read `.agents/knowledge/uv.md` for the full dependency architecture. The key thi
   matrix, so a version bump has to be applied file by file
 - torch uses **direct wheel URLs** (not just version bumps)
 - three mutually exclusive hardware extras (`gpu` / `npu` / `npu_aarch64`),
-  each a complete superset, plus optional `--extra magi` (combine with `gpu`)
+  each a complete superset, plus optional `--extra magi` and `--extra float8`
+  (combine with `gpu`)
 
 `pyproject.toml` is the source of truth for every version claim below. Read the
 relevant block before editing — this file describes *where* things live, not
@@ -128,7 +129,7 @@ transformers is pinned by the `transformers-stable` dependency group
 listed in `[tool.uv] default-groups` so `uv sync` installs it automatically.
 
 **Bump within v5** (e.g. 5.2.0 → 5.3.0):
-1. Edit the pinned version in `[dependency-groups] transformers-stable`.
+1. Keep an independent copy of the current `transformers` source for the merge base, then edit the pinned version in `[dependency-groups] transformers-stable`.
 2. Regenerate lockfile and sync:
 
 ```bash

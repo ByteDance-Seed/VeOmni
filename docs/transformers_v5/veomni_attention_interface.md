@@ -31,7 +31,7 @@ The model must call the attention implementation selected by
 `config._attn_implementation` and must supply a native `BlockMask` whose
 predicate preserves all model-specific visibility rules. A model that
 hard-codes SDPA/FlashAttention, constructs only dense masks, or bypasses
-Transformers' mask registry needs model-level patchgen adaptation first.
+Transformers' mask registry needs an adaptation in its standalone modeling file.
 
 With `MODELING_BACKEND=veomni`, `OpsImplementationConfig` rewrites this public
 value to `veomni_flex_attention`. Flash values are rewritten in the

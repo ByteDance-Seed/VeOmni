@@ -50,7 +50,6 @@ from veomni.models.loss_utils import ForCausalLMLoss, ForSequenceClassificationL
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.utils.mask_utils import create_causal_mask, create_sliding_window_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 
 
@@ -92,20 +91,10 @@ class Qwen3MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+        self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-            return self.veomni_swiglu_mlp(
-                x,
-                self.gate_proj.weight,
-                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                self.up_proj.weight,
-                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-                self.down_proj.weight,
-                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-            )
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
 
 
 class Qwen3RotaryEmbedding(nn.Module):
@@ -236,6 +225,7 @@ class Qwen3Attention(nn.Module):
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
         self.veomni_rope = VeomniOp("rope", "full", config.ops_config.rotary_pos_emb_implementation)
         self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
+        self.veomni_linear = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
 
     def forward(
         self,
@@ -248,9 +238,12 @@ class Qwen3Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # The ``linear`` row takes the projection module: ``eager`` calls it (so a
+        # ``basic_modules``-wrapped projection still unshards and a LoRA adapter still
+        # runs), while a quantizing row reads its weight and refuses a wrapped one.
+        query_states = self.q_norm(self.veomni_linear(self.q_proj, hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.veomni_linear(self.k_proj, hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.veomni_linear(self.v_proj, hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
@@ -271,7 +264,7 @@ class Qwen3Attention(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.veomni_linear(self.o_proj, attn_output)
         return attn_output, attn_weights
 
 

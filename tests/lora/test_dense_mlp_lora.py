@@ -105,11 +105,11 @@ _PROJECTIONS = ["gate_proj", "up_proj", "down_proj"]
 
 def _build_mlp(family: str, impl: str, dtype: torch.dtype, device: str) -> nn.Module:
     build, variant = _FAMILIES[family]
-    if impl not in OP_REGISTRY.list_available("swiglu_mlp", variant):
-        pytest.skip(f"swiglu_mlp/{variant}/{impl} is unavailable on this device")
+    if impl not in OP_REGISTRY.list_available("gated_mlp", variant):
+        pytest.skip(f"gated_mlp/{variant}/{impl} is unavailable on this device")
     torch.manual_seed(0)
-    mlp = build(OpsImplementationConfig(swiglu_mlp_implementation=impl))
-    assert mlp.veomni_swiglu_mlp.impl == impl
+    mlp = build(OpsImplementationConfig(gated_mlp_implementation=impl))
+    assert mlp.veomni_gated_mlp.impl == impl
     with torch.no_grad():
         for name in _PROJECTIONS:
             getattr(mlp, name).weight.normal_(0.0, 0.5)
@@ -153,7 +153,7 @@ def test_lora_projections_match_merged_weights(family: str, impl: str):
 
 @pytest.mark.parametrize("family", list(_FAMILIES))
 def test_lora_projections_at_init_match_eager_row_bitwise(family: str):
-    """The module path that LoRA takes must reproduce the eager ``swiglu_mlp`` row in bf16."""
+    """The module path that LoRA takes must reproduce the eager ``gated_mlp`` row in bf16."""
     device = get_device_type()
     mlp = _build_mlp(family, "eager", torch.bfloat16, device)
     x = torch.randn(2, 5, 16, device=device, dtype=torch.bfloat16)
@@ -174,8 +174,8 @@ def test_mlp_lora_keeps_every_non_quantizing_row(family: str, impl: str):
     impl" guard breaks, and ``liger_kernel`` is the GPU/MLU default.
     """
     build, variant = _FAMILIES[family]
-    if impl not in OP_REGISTRY.list_available("swiglu_mlp", variant):
-        pytest.skip(f"swiglu_mlp/{variant}/{impl} is unavailable on this device")
+    if impl not in OP_REGISTRY.list_available("gated_mlp", variant):
+        pytest.skip(f"gated_mlp/{variant}/{impl} is unavailable on this device")
     mlp = _build_mlp(family, impl, torch.float32, get_device_type())
     model = _wrap(mlp)
 
@@ -186,7 +186,7 @@ def test_mlp_lora_keeps_every_non_quantizing_row(family: str, impl: str):
 
 
 @pytest.mark.skipif(
-    "qat" not in OP_REGISTRY.list_available("swiglu_mlp", "standard"),
+    "qat" not in OP_REGISTRY.list_available("gated_mlp", "standard"),
     reason="the qat row needs TileLang on SM90+",
 )
 def test_mlp_lora_refuses_the_quantizing_row():

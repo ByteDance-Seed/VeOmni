@@ -76,7 +76,10 @@ def test_repo_hf_modeling_check_strict(tmp_path: Path):
 
     out_file = tmp_path / "modeling_llama.py"
     assert sync_hf_modeling.main(["init", "transformers.models.llama.modeling_llama", "-o", str(out_file)]) == 0
-    assert out_file.is_file()
+    original = out_file.read_bytes()
+    with pytest.raises(FileExistsError):
+        sync_hf_modeling.main(["init", "transformers.models.llama.modeling_llama", "-o", str(out_file)])
+    assert out_file.read_bytes() == original
     import shutil
     import subprocess
 
@@ -90,7 +93,9 @@ def test_repo_hf_modeling_check_strict(tmp_path: Path):
     fake_hf = tmp_path / "fake_hf"
     (fake_hf / "transformers").mkdir(parents=True)
     (fake_hf / "transformers" / "__init__.py").write_text('__version__ = "5.99.0"\n', encoding="utf-8")
-    assert sync_hf_modeling.transformers_version_from_root(fake_hf) == "5.99.0"
+    with pytest.raises(ValueError, match="recorded base"):
+        sync_hf_modeling.main(["merge", "--old-hf-root", str(fake_hf), str(out_file)])
+    assert out_file.read_bytes() == original
 
 
 def test_three_way_merge_preserves_local_veomni_op_and_absorbs_upstream_edit():
@@ -117,7 +122,7 @@ def test_three_way_merge_preserves_local_veomni_op_and_absorbs_upstream_edit():
         "        self.config = config\n"
         "        self.hidden_size = config.hidden_size\n"
         "        self.act_fn = ACT2FN[config.hidden_act]\n"
-        "        self.veomni_mlp = VeomniOp('swiglu_mlp', 'standard', config)\n\n"
+        "        self.veomni_mlp = VeomniOp('gated_mlp', 'standard', config)\n\n"
         "    def forward(self, x):\n"
         "        if self.veomni_mlp.use_non_eager_impl:\n"
         "            return self.veomni_mlp(self, x)\n"

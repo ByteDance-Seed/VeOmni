@@ -415,7 +415,9 @@ def cmd_init(args: argparse.Namespace) -> int:
     header = f"# Upstream-Module: {args.upstream_module}\n# Base-Transformers-Version: {installed_ver}\n\n"
     output_path: Path = args.output
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(ruff_format_text(header + normalized), encoding="utf-8")
+    contents = ruff_format_text(header + normalized)
+    with output_path.open("x", encoding="utf-8") as stream:
+        stream.write(contents)
     print(f"Initialized {output_path} from {args.upstream_module} (transformers=={installed_ver}).")
     return 0
 
@@ -435,7 +437,15 @@ def cmd_merge(args: argparse.Namespace) -> int:
             raise RuntimeError("Cannot determine installed `transformers` version; pass --new-version explicitly.")
     new_roots = [args.new_hf_root] if args.new_hf_root else None
     metas = resolve_targets(args.target, root=args.root)
+    old_ver = transformers_version_from_root(args.old_hf_root)
+    if old_ver is None:
+        raise ValueError(f"Cannot determine the transformers version under --old-hf-root={args.old_hf_root}.")
+    for meta in metas:
+        if meta.base_version != old_ver:
+            raise ValueError(f"{meta.path}: recorded base {meta.base_version} differs from --old-hf-root ({old_ver}).")
+
     any_conflicts = False
+    pending_writes = []
 
     for meta in metas:
         old_file = find_module_file(meta.upstream_module, search_roots=[args.old_hf_root])
@@ -452,7 +462,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
             new_version=new_ver,
         )
         if not args.dry_run:
-            meta.path.write_text(merged, encoding="utf-8")
+            pending_writes.append((meta.path, merged))
 
         status = "CONFLICT" if had_conflicts else "CLEAN"
         print(f"[{status}] {meta.path} ({meta.base_version} -> {new_ver})")
@@ -464,6 +474,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
         if had_conflicts:
             any_conflicts = True
 
+    for path, merged in pending_writes:
+        path.write_text(merged, encoding="utf-8")
     return 1 if any_conflicts else 0
 
 

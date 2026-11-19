@@ -27,10 +27,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from scripts.ci.accelerator.launch_plan import LaunchSpec, from_parameter, runner_device_count
+from scripts.ci.accelerator.launch_plan import (
+    LaunchSpec,
+    from_parameter,
+    runner_device_count,
+)
 from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.device import (
     IS_CUDA_AVAILABLE,
+    IS_NPU_AVAILABLE,
     get_device_type,
     get_dist_comm_backend,
     get_gpu_compute_capability,
@@ -54,15 +59,19 @@ def _load_dsv4_toy_config(**ops_overrides):
     return config
 
 
-def _cuda_device_count() -> int:
-    """Devices this suite can run on, which are CUDA devices and nothing else.
+def _accelerator_device_count() -> int:
+    """Devices this suite can run on: the runner's own accelerator cards.
 
-    Context parallelism is GPU-only -- ``check_context_parallel_supported``
-    refuses it on Ascend -- but these workers build the GPU patched module
-    directly instead of going through that gate, so a plain device count would
-    let a multi-NPU host start a suite that cannot run there.
+    Context parallelism is admitted on CUDA and, with the eager DSA operators,
+    on Ascend, and these workers build the backend's patched module directly, so
+    a plain device count is the right eligibility test. A host on any other
+    backend reports 0 and skips -- asking the scheduler for its capabilities
+    would raise, and this helper feeds a skip decorator, so it runs during
+    collection.
     """
-    return runner_device_count() if IS_CUDA_AVAILABLE else 0
+    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
+        return 0
+    return runner_device_count()
 
 
 def _all_devices_sm90_or_above() -> bool:
@@ -888,6 +897,9 @@ _ZERO_WINDOW_PACKED_SEQ_LEN = 16
 _ZERO_WINDOW_PACKED_SAMPLES = ((0, 6), (6, 16))
 _PACKED_MODEL_SEQ_LEN = 128
 _PACKED_MODEL_SAMPLES = ((0, 70), (70, 128))
+# Two ranks are enough to exercise CP's rank and local-query/global-KV geometry;
+# CUDA CI also runs the four-rank topology that covers the packed-model branches.
+_CP_SIZES = (2, 4) if IS_CUDA_AVAILABLE else (2,)
 
 
 def _run_model_cp_packed(
@@ -1166,11 +1178,11 @@ def _run_all_cp_scenarios(rank: int, world_size: int, init_file: str) -> None:
 
 
 @pytest.mark.launch_plan(provider=from_parameter("cp_size", device="accelerator"))
-@pytest.mark.skipif(_cuda_device_count() < 2, reason="needs 2 devices")
-@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.skipif(_accelerator_device_count() < 2, reason="needs 2 devices")
+@pytest.mark.parametrize("cp_size", _CP_SIZES)
 def test_deepseek_v4_cp_equivalence(cp_size):
     """Fused CP worker covering all DeepSeek-V4 CP attention, compressor, indexer, and model parity scenarios."""
-    if _cuda_device_count() < cp_size:
+    if _accelerator_device_count() < cp_size:
         pytest.skip(f"needs {cp_size} devices")
     with tempfile.TemporaryDirectory() as tmpdir:
         init_file = os.path.join(tmpdir, "init")

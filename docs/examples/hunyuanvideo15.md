@@ -235,7 +235,7 @@ missing weights or biases according to the same native rules.
 
 The latest review-fix run (2026-10-22) passed 26 focused CPU tests (nine
 accelerator or opt-in skips), 31 focused A100 tests (four NPU or opt-in skips),
-and 33 focused Ascend910_9382 tests (two opt-in skips). Both accelerator runs
+and 33 focused Atlas A3 training products tests (two opt-in skips). Both accelerator runs
 include the exact two-rank gradient comparison. The NPU run verified commit
 `593d28f` in an isolated snapshot on Computing-Lab container `80.5.27.194`,
 using driver 26.2.rc1.b081 and the shared CANN 9.2.0 B020 runtime. These
@@ -251,7 +251,7 @@ The shared registry, gradient-checkpointing, DiT microbatch and resume suites
 also passed 373 tests with one hardware-dependent skip. These shared tests do
 not establish full pretrained HunyuanVideo trainer resume equivalence.
 
-On Ascend910_9382, the full 8.33B/54-layer backbone also completed bf16 forward,
+On Atlas A3 training products, the full 8.33B/54-layer backbone also completed bf16 forward,
 backward and two SGD updates with activation checkpointing. Peak allocated tensor
 memory was 31.07 GiB. Latents were only [1,32,2,4,4], text had 8 tokens and ByT5
 had 4 tokens; weights and conditions were random. This does not establish memory

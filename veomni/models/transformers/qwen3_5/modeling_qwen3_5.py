@@ -72,7 +72,6 @@ from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.models.utils.mask_utils import create_causal_mask
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.swiglu_mlp import has_plain_linear_projections
 from veomni.utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutputMixin
@@ -776,21 +775,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         key = key.reshape(key.shape[0], key.shape[1], local_num_k_heads, self.head_k_dim)
         value = value.reshape(value.shape[0], value.shape[1], local_num_v_heads, self.head_v_dim)
 
-        # Modification: contiguous-ify q/k/v before chunk_gated_delta_rule.
-        # After torch.split + reshape above, query/key/value are views over mixed_qkv whose
-        # stride[1] equals the full QKV-pack width (2*key_dim + value_dim), not the per-tensor
-        # dim. The FLA kernel tolerates this stride layout, but FlashQLA's TileLang
-        # `tilelang_prepare_h_kernel` asserts `v.stride[1] == num_v_heads * head_v_dim` and
-        # raises (`expected 4096, but got 8192` for a Qwen3.5-4B-style config).
-        # Forcing contiguous here is a no-op when the layout already matches (so it stays
-        # cheap for FLA / eager paths) and unblocks the FlashQLA backend without bloating
-        # kernel factory wrappers. Fix all three for symmetry — q/k usually become contiguous
-        # via repeat_interleave below in GQA configs, but non-GQA models would otherwise hit
-        # the same stride mismatch on q/k from a stricter kernel.
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
-
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         # Modification: slice A_log/dt_bias for local V-heads under Ulysses SP.
@@ -801,9 +785,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         else:
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-        if self.num_v_heads // self.num_k_heads > 1 and not (
-            self.veomni_chunk_gated_delta_rule.impl == "flash_qla" and not use_precomputed_states
-        ):
+        if self.veomni_chunk_gated_delta_rule.impl == "flash_qla" and not use_precomputed_states:
+            # The FlashQLA kernel requires a tightly packed token stride after the QKV split.
+            query = query.contiguous()
+            key = key.contiguous()
+            value = value.contiguous()
+        elif self.num_v_heads // self.num_k_heads > 1:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
@@ -1031,20 +1018,10 @@ class Qwen3_5MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_swiglu_mlp = VeomniOp("swiglu_mlp", "standard", config.ops_config.swiglu_mlp_implementation)
+        self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
 
     def forward(self, x):
-        if self.config.hidden_act in {"silu", "swish"} and has_plain_linear_projections(self):
-            return self.veomni_swiglu_mlp(
-                x,
-                self.gate_proj.weight,
-                self.gate_proj.bias if self.gate_proj.bias is not None else self.gate_proj.weight.new_empty(0),
-                self.up_proj.weight,
-                self.up_proj.bias if self.up_proj.bias is not None else self.up_proj.weight.new_empty(0),
-                self.down_proj.weight,
-                self.down_proj.bias if self.down_proj.bias is not None else self.down_proj.weight.new_empty(0),
-            )
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
 
 
 # ======================================================================

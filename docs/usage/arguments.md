@@ -61,6 +61,7 @@ Model architecture, paths, and multimodal encoder / decoder setup.
     * `AcceleratorConfig` — `model.accelerator.*`
         * `FSDPConfig` — `model.accelerator.fsdp_config.*`
             * `MixedPrecisionConfig` — `model.accelerator.fsdp_config.mixed_precision.*`
+                * `Float8TrainingConfig` — `model.accelerator.fsdp_config.mixed_precision.float8.*`
         * `OffloadConfig` — `model.accelerator.offload_config.*`
         * `GradientCheckpointingConfig` — `model.accelerator.gradient_checkpointing.*`
         * `TorchCompileConfig` — `model.accelerator.torch_compile.*`
@@ -202,7 +203,7 @@ apart from the compatibility aliases documented below.
 | `moe_implementation` | `fused_triton` | `fused_npu` | `fused_mlu` |
 | `cross_entropy_loss_implementation` | `liger_kernel` | `chunk_loss` | `liger_kernel` |
 | `rms_norm_implementation` | `liger_kernel` | `torch_npu` (`eager` for `unweighted`) | `liger_kernel` |
-| `swiglu_mlp_implementation` | `liger_kernel` | `eager` | `liger_kernel` |
+| `gated_mlp_implementation` | `liger_kernel` | `eager` | `liger_kernel` |
 | `linear_implementation` | `eager` | `eager` | `eager` |
 | `kv_round_implementation` | `none` | `none` | `none` |
 | `rotary_pos_emb_implementation` | `liger_kernel` | `torch_npu` | `liger_kernel` |
@@ -224,7 +225,7 @@ NPU validation runs at two times:
 
 - **Config-parse time** (`OpsImplementationConfig.__post_init__`) for the
   nine general-purpose ops (`moe`, `cross_entropy_loss`, `rms_norm`,
-  `swiglu_mlp`, `linear`, `kv_round`, `rotary_pos_emb`, `rotary_pos_emb_vision`,
+  `gated_mlp`, `linear`, `kv_round`, `rotary_pos_emb`, `rotary_pos_emb_vision`,
   `load_balancing_loss`). Errors fire
   immediately with a model-agnostic allow-list.
 - **Model-build time** (instance-local `VeomniOp` resolution via the
@@ -241,8 +242,8 @@ NPU validation runs at two times:
 | moe_implementation | `Optional[str]` | host default | MoE experts forward implementation. `fused_triton` uses Triton group-gemm (GPU, SM70+ or MLU); `fused_quack` uses Quack CUTLASS/CuTe (GPU, SM90+); `qat` runs the same fused GEMM with FP8/FP4 fake-quantized operands (SM90+, TileLang); `deepgemm_fp8` runs native FP8 expert forward/dgrad/wgrad (Hopper SM90 / Blackwell SM100; see [requirements](../design/deepgemm_fp8_moe.md)); `fused_npu` uses the NPU group-gemm kernel; `fused_mlu` uses Apex grouped-GEMM on MLU; `eager` is the reference loop. Unset resolves to `fused_npu` on NPU, `fused_mlu` on MLU with Apex, and `fused_triton` otherwise; explicit incompatible values raise. |
 | cross_entropy_loss_implementation | `Optional[str]` | host default | Cross-entropy loss. `liger_kernel` (GPU/MLU default) fuses `lm_head` linear + CE; requires VeOmni-patched modeling files that pass `hidden_states=`/`weights=` to `self.loss_function(...)` — unpatched HF models that pass logits will RuntimeError. `chunk_loss` is the hardware-agnostic chunked F.linear+CE (CUDA + NPU). `eager` is `F.cross_entropy`. |
 | rms_norm_implementation | `Optional[str]` | host default | RMSNorm. Known values: `liger_kernel` (GPU/MLU default), `torch_npu` (NPU default for weighted variants; `unweighted` supports only `eager` on NPU and rejects explicit `torch_npu`/`npu`), `triton` (DeepSeek-V3 only; GPU only), `eager`. |
-| swiglu_mlp_implementation | `Optional[str]` | host default | SwiGLU MLP. Known values: `liger_kernel` (GPU/MLU default), `qat` (FP8 quantization-aware training, SM90+), `eager`. There is no NPU backend, so unset resolves to `eager` on NPU. |
-| linear_implementation | `Optional[str]` | host default | Dense projection for models that own their projections individually. Known values: `qat` (FP8 fake quantization of both GEMM operands, SM90+), `eager`. Unset resolves to `eager`. Independent of `swiglu_mlp_implementation`, which covers models that run the fused SwiGLU row. |
+| gated_mlp_implementation | `Optional[str]` | host default | Gated MLP (`act(gate(x)) * up(x)`). Known values: `liger_kernel` (GPU/MLU default), `qat` (FP8 quantization-aware training, SM90+), `torchao_nvfp4` (NVFP4 quantization-aware training; requires the optional `torchao` package, see [FP4 QAT](mxfp4_qat.md)), `eager`. There is no NPU backend, so unset resolves to `eager` on NPU. |
+| linear_implementation | `Optional[str]` | host default | Dense projection for models that own their projections individually. Known values: `qat` (FP8 fake quantization of both GEMM operands, SM90+), `torchao_nvfp4` (NVFP4 fake quantization of both GEMM operands, `standard` variant only; requires the optional `torchao` package, see [FP4 QAT](mxfp4_qat.md)), `eager`. Unset resolves to `eager`. Independent of `gated_mlp_implementation`, which covers models that run the fused SwiGLU row. |
 | rotary_pos_emb_implementation | `Optional[str]` | host default | Rotary pos emb. Known values: `liger_kernel` (GPU/MLU default), `torch_npu` (NPU default), `triton` (per-model: DeepSeek-V3, DeepSeek-V4, Wan; GPU only), `eager`. Variants without a default row (such as `deepseek_v4`, `wan`, `interleave`, `mrope`) resolve to `eager` when unset. |
 | rotary_pos_emb_vision_implementation | `Optional[str]` | host default | Independent implementation choice for the rank-3 vision layout of `rope/full`. Known values: `liger_kernel` (GPU/MLU default), `torch_npu` (NPU default). |
 | load_balancing_loss_implementation | `Optional[str]` | host default | MoE load-balancing loss. `triton` (GPU default) uses the fused GPU kernel; `eager` (NPU and MLU default) is the pure-PyTorch reference. |
@@ -698,6 +699,7 @@ configured and never round-trip through a saved config.
 | ulysses_size | `int` | `1` | Ulysses sequence parallel size. |
 | enable_async | `bool` | `False` | Enable async Ulysses. |
 | cp_size | `int` | `1` | Ring-attention context parallel size. |
+| skip_sp_gather_between_modules | `bool` | `False` | Run-wide SeedOmni switch: every module's `post_forward` hands its sequence-parallel shard directly to the next module instead of all-gathering full-sequence tensors onto `conversation_list` (`encode`/`vision` -> `llm` and `llm` -> `decode`). Global to the run — per-module YAML overrides are ignored, since one side of a handoff gathering while the other does not would leave the backbone with a shard-sized input and full-length positions. |
 | init_device | `Literal["cuda", "meta", "npu", "mlu"]` | `"meta"` | Device for model weight initialization. `"meta"` is required for FSDP2 and also works for multi-rank DDP; a run with no FSDP wrap (`fsdp_size == 1`) must name an accelerator. |
 | fsdp_config | `FSDPConfig` | — | FSDP sharding configuration. |
 | offload_config | `OffloadConfig` | — | Activation offload settings. |
@@ -880,6 +882,7 @@ implementations also differ. These timings measure collective latency, not model
 | reduce_dtype | `str` | `"float32"` | Dtype for gradient reduction (i.e. reduce-scatter or all-reduce). |
 | output_dtype | `str` | `None` | Dtype for casting floating-point forward outputs (FSDP2). |
 | cast_forward_inputs | `bool` | `True` | Enable mixed precision cast forward inputs (FSDP2). |
+| float8 | `Float8TrainingConfig` | disabled | Opt-in torchao float8 GEMMs for selected `nn.Linear` projections. Fields: `enable` (`bool`, default `False`), `recipe` (`"tensorwise"` (default) \| `"rowwise"` \| `"rowwise_with_gw_hp"`), `target_modules` (`List[str]`, full module names with `*` wildcards; required when enabled). Needs the optional `float8` extra; see [Float8 training](float8_training.md). |
 
 
 ### OffloadConfig

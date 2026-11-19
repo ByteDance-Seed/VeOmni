@@ -67,7 +67,7 @@ Model-specific normalization and loss semantics are correctness-critical. Select
 
 Keep a **single** `veomni/models/transformers/<model>/modeling_<model>.py` file across all backends (CUDA, ROCm, Ascend NPU, Cambricon MLU, CPU).
 
-Model classes must own instance-local `VeomniOp` handles. Resolve the configured implementation from `config.ops_config` during construction and call the handle unconditionally; `OP_REGISTRY` resolves the NPU row on Ascend hosts and falls back to `eager` on CPU.
+Model classes must own instance-local `VeomniOp` handles. Resolve the configured implementation from `config.ops_config` during construction and call the handle unconditionally; an explicit selection must have a row for the current host. Default selection uses the registered host default or the eager row.
 
 ```python
 from veomni.ops import VeomniOp

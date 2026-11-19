@@ -101,7 +101,7 @@ Phase 5: Knowledge capture           -> pending
    git worktree add ../bisect-b HEAD && (cd ../bisect-b && uv venv .venv && VIRTUAL_ENV=.venv uv sync --active --extra gpu --dev && VIRTUAL_ENV=.venv uv pip install "transformers==<other-version>")
    ```
    Compare the package sets using `uv pip freeze --python` with
-   `../bisect-a/.venv/bin/python` and `../bisect-b/.venv/bin/python`, reconcile
+   `../bisect-a/.venv/bin/python` and `../bisect-b/.venv/bin/python`. Normalize the editable VeOmni path in each listing to the same placeholder, reconcile
    non-transformers dependency differences as above, and run the reproducer from
    each worktree with its own environment activated:
    ```bash

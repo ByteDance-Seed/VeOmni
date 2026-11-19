@@ -238,7 +238,7 @@ class YourModelExperts(nn.Module):
         )
 ```
 
-Use `@config.replace_class("<M>Experts")` so the upstream `@use_experts_implementation` decorator is dropped. Pass the merged `gate_up_proj` as `fc1_1_2_weight`; leave the split `fc1_*` slots empty. Do not branch on `_moe_implementation in {"eager", "fused"}` or call a public `fused_moe_forward`.
+Define the `<M>Experts` class directly in the standalone modeling file and remove the upstream `@use_experts_implementation` decorator. Pass the merged `gate_up_proj` as `fc1_1_2_weight`; leave the split `fc1_*` slots empty. Do not branch on `_moe_implementation in {"eager", "fused"}` or call a public `fused_moe_forward`.
 
 Also patch `_init_weights` for the stacked parameters:
 

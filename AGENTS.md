@@ -107,6 +107,8 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 | Migrate existing GPU model to Ascend NPU | `/veomni-gpu-to-npu` |
 | Add / modify SeedOmni module or graph | `/veomni-seed-omni` |
 | Add new op/kernel | `/veomni-new-op` |
+| Generate NPU tests and CI for a module/feature | `/veomni-npu-ci-generate` |
+| Migrate existing GPU CI coverage to NPU | `/veomni-gpu-ci-migrate` |
 | Update dependencies (uv) | `/veomni-uv-update` |
 | Performance profiling | `/veomni-profile` |
 | Documentation audit / correction | `/veomni-fix-docs` |
@@ -120,6 +122,8 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 - **"Add a new kernel / fused op"** → `/veomni-new-op`
 - **"Fix this error" / "training hangs" / "wrong results"** → `/veomni-debug`
 - **"Add a new capability" / "refactor" / "clean up"** → `/veomni-develop`
+- **"Generate NPU tests / CI for this module"** → `/veomni-npu-ci-generate`
+- **"Migrate this GPU workflow / test scope to NPU"** → `/veomni-gpu-ci-migrate`
 - **"Update package X" / "bump uv" / "upgrade torch"** → `/veomni-uv-update`
 - **"Analyze this trace" / "why is training slow" / "profile" / "MFU"** → `/veomni-profile`
 - **"Scan docs" / "fix documentation" / "broken link"** → `/veomni-fix-docs`
