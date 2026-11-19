@@ -79,17 +79,26 @@ def module_compile_config(accelerator: "AcceleratorConfig", module: nn.Module):
     Returned with ``enable=False`` rather than as ``None`` so the caller keeps
     one code path: ``compile_decoder_blocks`` is still handed a config, it just
     finds nothing enabled and returns without wrapping anything.
+
+    ``dynamic`` is intersected with the module's
+    :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile_dynamic`
+    too. A module whose input shape is already fixed gains nothing from
+    ``dynamic`` and can lose a lot: ``janus_vqvae`` measured 30% slower with it
+    on (30.7 -> 44.2 ms/step), giving back most of its 1.73x compile win, while
+    the text backbones were unaffected. So the run-level flag only reaches the
+    modules that declared they can use it.
     """
     from .....distributed.torch_compile import CompileConfig
 
     run_config = accelerator.torch_compile
     supported = bool(getattr(module, "supports_torch_compile", False))
+    dynamic_ok = bool(getattr(module, "supports_torch_compile_dynamic", False))
     return CompileConfig(
         enable=bool(run_config.enable) and supported,
         backend=run_config.backend,
         mode=run_config.mode,
         fullgraph=run_config.fullgraph,
-        dynamic=run_config.dynamic,
+        dynamic=bool(run_config.dynamic) and dynamic_ok,
     )
 
 
@@ -431,6 +440,21 @@ class ModuleRuntime(VeOmniModelRuntime):
         compile-enabled run.
         """
         return module_compile_config(self.args.accelerator, self.model)
+
+    def _compile_scopes(self):
+        """``[""]`` for an opted-in module, ``[]`` otherwise.
+
+        A module under ``fsdp_scope='module'`` is built as a **standalone** model,
+        so its fqns carry no module prefix and its blocks are named whatever its
+        family calls them (``JanusVqvae`` names ``JanusVQVAEAttnBlock``, not
+        ``*DecoderLayer``). The empty scope matches the whole tree, which is the
+        right answer here: this wrap covers exactly this module, and the
+        per-module flag already decided it may be compiled.
+
+        A module that opted out returns ``[]`` so nothing is compiled, and the
+        caller clears ``compile_config.enable`` to match.
+        """
+        return [""] if getattr(self.model, "supports_torch_compile", False) else []
 
     def _freeze_model_module(self) -> None:
         """Freeze + LoRA this module, heading the base's report with its name.

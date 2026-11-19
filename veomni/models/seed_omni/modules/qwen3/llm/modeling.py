@@ -44,6 +44,9 @@ class Qwen3Llm(SimpleArGenerationMixin, PretrainedOmniModule):
     # Measured ~1.58x per-block over a 4-layer stack; the backbone is where
     # Inductor's fusion pays off most.
     supports_torch_compile = True
+    # Static and dynamic measure the same here (1.00x), so take the one
+    # that absorbs a packed length that moves with the image count.
+    supports_torch_compile_dynamic = True
 
     def __init__(self, config: Qwen3LlmConfig):
         super().__init__(config)

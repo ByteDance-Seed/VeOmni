@@ -208,6 +208,9 @@ class JanusLlama(InferenceMixin, PretrainedOmniModule):
     _supports_flex_attn = True
     # Measured ~1.32x per-block over a 4-layer Llama stack.
     supports_torch_compile = True
+    # Static and dynamic measure the same here (1.00x), so take the one
+    # that absorbs a packed length that moves with the image count.
+    supports_torch_compile_dynamic = True
 
     def __init__(self, config: JanusLlamaConfig):
         super().__init__(config)

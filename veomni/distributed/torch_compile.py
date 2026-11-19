@@ -224,7 +224,13 @@ def _is_decoder_block(
 
 
 def _under_scope(fqn: Optional[str], scope: str) -> bool:
-    """Whether ``fqn`` is ``scope`` itself or a descendant of it."""
+    """Whether ``fqn`` is ``scope`` itself or a descendant of it.
+
+    An empty scope means "this whole tree", which is how a standalone module
+    (``fsdp_scope='module'``) says its own root is the scope.
+    """
+    if not scope:
+        return True
     if fqn is None:
         return False
     return fqn == scope or fqn.startswith(scope + ".")

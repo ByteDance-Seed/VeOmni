@@ -411,6 +411,15 @@ class VeOmniModelRuntime:
             **{field.name: getattr(self.args.accelerator.torch_compile, field.name) for field in fields(CompileConfig)}
         )
 
+    def _compile_scopes(self):
+        """Children whose blocks this wrap may compile, or ``None`` for the HF rule.
+
+        A single model has one set of blocks and no scopes; SeedOmni's
+        :class:`ModuleRuntime` returns its own module name so a family whose
+        blocks are not named ``*DecoderLayer`` (``JanusVqvae``) still compiles.
+        """
+        return None
+
     def _build_parallelized_model(self) -> None:
         """FSDP2/DDP-wrap the model and load its weights.
 
@@ -476,8 +485,7 @@ class VeOmniModelRuntime:
             should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.accelerator.fsdp_config.mixed_precision,
-            enable_gradient_checkpointing=gc_cfg.enable,
-            # Configured classes only, in configuration order: parallelize reads
+            enable_gradient_checkpointing=gc_cfg.enable,  # Configured classes only, in configuration order: parallelize reads
             # the model's own ``_no_split_modules`` itself, and recompute needs
             # this list unmerged and ordered so it can rank the block stacks.
             basic_modules=list(args.basic_modules or []),
@@ -495,6 +503,7 @@ class VeOmniModelRuntime:
             expert_fsdp_shard_dim=args.accelerator.fsdp_config.expert_fsdp_shard_dim,
             low_precision_reduce_scatter_comm=args.accelerator.fsdp_config.low_precision_reduce_scatter_comm,
             compile_config=compile_config,
+            compile_scopes=self._compile_scopes(),
             **kwargs,
         )
         self.model.train()
