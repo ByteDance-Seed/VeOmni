@@ -122,7 +122,7 @@ def _hub_flash_kernel_version(repository: str) -> int:
 
 @lru_cache(maxsize=None)
 def _load_hub_flash_kernel(repository: str):
-    """Load a pinned Hub FlashAttention artifact through ``kernels``."""
+    """Load a Hub FlashAttention artifact through ``kernels`` at the version ``_hub_flash_kernel_version`` picks."""
     try:
         from kernels import get_kernel
     except ImportError as e:
