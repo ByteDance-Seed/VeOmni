@@ -301,7 +301,7 @@ SDPA, and every other call uses the configured kernel.
 - `flash_attention_2` / `flash_attention_3` in `model.ops_implementation` resolve
   to VeOmni's local FA2/FA3 backends, and `flash_attention_2_hub` /
   `flash_attention_3_hub` to the Hugging Face Hub kernels
-  (`kernels-community/flash-attn2` / `flash-attn3`, version 1). Single-sample
+  (`kernels-community/flash-attn2` / `flash-attn3`, version 1; on Intel XPU the version Transformers selects). Single-sample
   attention runs one dense call per segment. With multi-sample packing, each
   main-DiT layer uses one non-causal varlen call and refiner layers retain one
   call per sample. The kernel is loaded on the first multi-sample forward and

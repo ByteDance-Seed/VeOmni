@@ -25,6 +25,7 @@ from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ..utils import logging
+from ..utils.device import IS_XPU_AVAILABLE
 from ..utils.env import get_env
 from .kernels.attention.mask.flash import flash_attention_mask_builder
 from .kernels.attention.mask.flex import flex_attention_mask_builder
@@ -104,15 +105,19 @@ _HUB_FLASH_KERNEL_DEFAULT_VERSION = 1
 def _hub_flash_kernel_version(repository: str) -> int:
     """Major Hub version of ``repository`` to load.
 
-    Follows Transformers' own routing for Hub attention kernels, so the requested artifact is the
-    one that matches the installed torch and device builds. Falls back to version 1 when the
-    installed Transformers does not expose the resolver.
+    CUDA keeps the pinned default: a newer artifact has not been validated on SM90/SM100 or with the
+    pinned ``kernels`` release. Intel XPU follows Transformers' own routing for Hub attention kernels
+    so the artifact matches the installed torch and XPU builds. The default is also used when the
+    installed Transformers does not expose the resolver or the resolver returns no version.
     """
+    if not IS_XPU_AVAILABLE:
+        return _HUB_FLASH_KERNEL_DEFAULT_VERSION
     try:
         from transformers.integrations.hub_kernels import get_attn_kernel_version
     except ImportError:
         return _HUB_FLASH_KERNEL_DEFAULT_VERSION
-    return get_attn_kernel_version(repository)
+    version = get_attn_kernel_version(repository)
+    return _HUB_FLASH_KERNEL_DEFAULT_VERSION if version is None else version
 
 
 @lru_cache(maxsize=None)

@@ -608,7 +608,10 @@ def test_gpt_oss_attention_passes_learnable_sinks_through_hf_dict():
         ("veomni_flash_attention_3_hub", "kernels-community/flash-attn3"),
     ],
 )
-def test_hub_flash_loader_requests_the_transformers_selected_version(monkeypatch, implementation, repository):
+@pytest.mark.parametrize(("xpu", "expected_version"), [(False, 1), (True, 7)])
+def test_hub_flash_loader_requests_version_one_except_on_xpu(
+    monkeypatch, implementation, repository, xpu, expected_version
+):
     import sys
 
     import transformers.integrations.hub_kernels as hub_kernels
@@ -623,24 +626,44 @@ def test_hub_flash_loader_requests_the_transformers_selected_version(monkeypatch
         return kernel
 
     monkeypatch.setitem(sys.modules, "kernels", SimpleNamespace(get_kernel=get_kernel))
+    monkeypatch.setattr(install_backend, "IS_XPU_AVAILABLE", xpu)
     monkeypatch.setattr(hub_kernels, "get_attn_kernel_version", lambda repo: 7 if repo == repository else -1)
     install_backend._load_hub_flash_kernel.cache_clear()
     try:
         loaded = install_backend._load_veomni_local_flash_kernel(implementation)
         assert loaded is kernel
         assert install_backend._load_veomni_local_flash_kernel(implementation) is kernel
-        assert calls == [(repository, 7)]
+        assert calls == [(repository, expected_version)]
     finally:
         install_backend._load_hub_flash_kernel.cache_clear()
 
 
-def test_hub_flash_kernel_version_defaults_to_one_without_the_transformers_resolver(monkeypatch):
+def test_hub_flash_kernel_version_does_not_consult_transformers_off_xpu(monkeypatch):
     import transformers.integrations.hub_kernels as hub_kernels
 
     from veomni.ops import install as install_backend
 
-    monkeypatch.delattr(hub_kernels, "get_attn_kernel_version")
+    def unexpected(repo):
+        raise AssertionError("the Transformers resolver must not decide the CUDA artifact version")
+
+    monkeypatch.setattr(install_backend, "IS_XPU_AVAILABLE", False)
+    monkeypatch.setattr(hub_kernels, "get_attn_kernel_version", unexpected)
     assert install_backend._hub_flash_kernel_version("kernels-community/flash-attn2") == 1
+
+
+def test_hub_flash_kernel_version_defaults_to_one_on_xpu_without_a_resolved_version(monkeypatch):
+    import transformers.integrations.hub_kernels as hub_kernels
+
+    from veomni.ops import install as install_backend
+
+    monkeypatch.setattr(install_backend, "IS_XPU_AVAILABLE", True)
+    repository = "kernels-community/flash-attn2"
+
+    monkeypatch.setattr(hub_kernels, "get_attn_kernel_version", lambda repo: None)
+    assert install_backend._hub_flash_kernel_version(repository) == 1
+
+    monkeypatch.delattr(hub_kernels, "get_attn_kernel_version")
+    assert install_backend._hub_flash_kernel_version(repository) == 1
 
 
 def test_hub_flash_loader_reports_missing_kernels_dependency(monkeypatch):
