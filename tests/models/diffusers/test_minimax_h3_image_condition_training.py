@@ -12,6 +12,7 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
 from tests.models.tiny_configs import tiny_minimax_h3_config
 from veomni.data import build_data_transform
+from veomni.models.diffusers.minimax_h3.minimax_h3_core.flow_match_scheduler import FlowMatchScheduler
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
     MiniMaxH3DiTModel,
 )
@@ -222,6 +223,17 @@ def test_t2i_schedule_matches_public_fp32_objective(seed, step, sigma, model_tim
     target = unpatchify_image_rows(result["image_training_target"], 2, 4, 2, (1, 2, 2))
     torch.testing.assert_close(noised_latents, (1 - sigma) * clean_latents + sigma * noise)
     torch.testing.assert_close(target, noise - clean_latents)
+
+
+def test_t2i_schedule_matches_h3_scheduler_at_all_training_steps():
+    model = _condition_model(meta_init=True)
+    reference = FlowMatchScheduler(shift=2.22)
+    reference.set_timesteps(1000, training=True)
+    torch.testing.assert_close(model._scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
+    torch.testing.assert_close(
+        model._scheduler.linear_timesteps_weights, reference.linear_timesteps_weights, rtol=0, atol=0
+    )
+    torch.testing.assert_close(model._training_model_times, 1 - reference.timesteps / 1000, rtol=0, atol=0)
 
 
 def test_t2i_rng_checkpoint_replays_next_timestep_and_noise():
