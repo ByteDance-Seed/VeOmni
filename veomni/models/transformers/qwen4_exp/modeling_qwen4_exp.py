@@ -85,9 +85,9 @@ from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.gated_delta_rule import GROUPED_VALUE_HEAD_IMPLS
 from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
+from veomni.ops.kernels.qsa_attention import select_visible_topk_blocks
 from veomni.utils import logging
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 from veomni.utils.seqlen_pos_transform_utils import pos2culen
@@ -1109,15 +1109,7 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
                     block_starts[None, None] + self.compress_ratio - 1
                     <= query_positions[None, query_start:query_end, None]
                 )
-                # NPU TopKV2 faults on sparse -inf rows (ReLU scores >= 0).
-                mask_fill_value = -1.0 if IS_NPU_AVAILABLE else float("-inf")
-                scores = scores.masked_fill(~visible, mask_fill_value)
-                top_blocks = scores.topk(top_count, dim=-1).indices
-                top_valid = (
-                    visible.to(torch.int8).gather(-1, top_blocks).bool()
-                    if hidden_states.device.type == "npu"
-                    else visible.gather(-1, top_blocks)
-                )
+                top_blocks, top_valid = select_visible_topk_blocks(scores, visible, top_count)
                 selected_starts = block_starts[top_blocks].to(torch.int32)
                 selected_chunk = selected_starts[..., None] + block_offsets
                 selected_chunks.append(selected_chunk.masked_fill(~top_valid[..., None], -1).flatten(-2))

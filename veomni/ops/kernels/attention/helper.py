@@ -14,6 +14,7 @@
 
 """Shared helpers for attention adapters and mask builders."""
 
+import weakref
 from collections.abc import Callable
 
 import torch
@@ -21,6 +22,55 @@ import torch
 
 _SDPA_CU_SEQLENS_KEYS = ("cu_seqlens", "cu_seqlens_q", "cu_seqlens_k", "cu_seq_lens_q", "cu_seq_lens_k")
 _SDPA_PACKED_METADATA_KEYS = (*_SDPA_CU_SEQLENS_KEYS, "max_length_q", "max_length_k", "max_seqlen_q", "max_seqlen_k")
+_FA_CU_SEQLENS_KEYS = ("cu_seq_lens_q", "cu_seq_lens_k", "cu_seqlens_q", "cu_seqlens_k")
+_NPU_HOST_CU_SEQLENS_CACHE_MAX = 16
+# Cached per-tensor host copies keyed by (weakref, _version) so multi-layer
+# forwards reuse one D2H transfer for the same cu_seqlens tensor.
+_NPU_HOST_CU_SEQLENS_CACHE: list[tuple[weakref.ref[torch.Tensor], int, torch.Tensor]] = []
+
+
+def _cached_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a CPU copy of ``tensor``, reusing a cached copy across layers."""
+    if tensor.device.type == "cpu":
+        return tensor
+    version = tensor._version
+    alive: list[tuple[weakref.ref[torch.Tensor], int, torch.Tensor]] = []
+    cached: torch.Tensor | None = None
+    for ref, cached_version, cpu_tensor in _NPU_HOST_CU_SEQLENS_CACHE:
+        owner = ref()
+        if owner is None:
+            continue
+        alive.append((ref, cached_version, cpu_tensor))
+        if owner is tensor and cached_version == version:
+            cached = cpu_tensor
+    if cached is not None:
+        _NPU_HOST_CU_SEQLENS_CACHE[:] = alive
+        return cached
+    cpu_tensor = tensor.detach().cpu()
+    alive.append((weakref.ref(tensor), version, cpu_tensor))
+    if len(alive) > _NPU_HOST_CU_SEQLENS_CACHE_MAX:
+        alive = alive[-_NPU_HOST_CU_SEQLENS_CACHE_MAX:]
+    _NPU_HOST_CU_SEQLENS_CACHE[:] = alive
+    return cpu_tensor
+
+
+def ensure_npu_host_cu_seqlens(kwargs: dict, device_type: str) -> dict:
+    """Move FlashAttention varlen ``cu_seq_lens_*`` kwargs to CPU on Ascend NPU.
+
+    Ascend ``npu_fusion_attention`` consumes host-resident cumulative lengths.
+    Keeping this adaptation inside the attention op avoids model-level NPU
+    branches and caches the host copy per tensor across layers.
+    """
+    if device_type != "npu":
+        return kwargs
+    updated: dict | None = None
+    for key in _FA_CU_SEQLENS_KEYS:
+        value = kwargs.get(key)
+        if torch.is_tensor(value) and value.device.type != "cpu":
+            if updated is None:
+                updated = dict(kwargs)
+            updated[key] = _cached_cpu_tensor(value)
+    return kwargs if updated is None else updated
 
 
 def has_isolating_attention_mask(attention_mask: torch.Tensor | None) -> bool:

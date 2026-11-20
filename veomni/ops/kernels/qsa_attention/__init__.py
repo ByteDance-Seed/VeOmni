@@ -29,6 +29,7 @@ rows see one local attention call.
 
 from ...platform import NVIDIA_GPU, GpuKernelRequirement, NpuKernelRequirement
 from ...registry import register_op
+from .selection import select_visible_topk_blocks
 from .standard import eager as qsa_eager
 from .standard import tilelang as qsa_tilelang
 from .standard import torch_npu as qsa_torch_npu
@@ -60,3 +61,5 @@ register_op(
     wrapper=qsa_torch_npu.wrapper,
     requirement=NpuKernelRequirement(),
 )
+
+__all__ = ["select_visible_topk_blocks"]

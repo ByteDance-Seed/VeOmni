@@ -47,6 +47,51 @@ def _topk_to_additive_mask(topk_idxs: Tensor, kv_len: int, dtype: torch.dtype) -
     return torch.where(counts.unsqueeze(1) > 0, multiplicity_bias.unsqueeze(1), min_value)
 
 
+def dense_sparse_attn(
+    q: Tensor,
+    kv: Tensor,
+    attn_sink: Tensor,
+    topk_idxs: Tensor,
+    sm_scale: float | None = None,
+    return_lse: bool = False,
+) -> Tensor | tuple[Tensor, Tensor]:
+    """Sparse MQA by gather-and-softmax, matching ``sparse_attn_tilelang``.
+
+    Args:
+        q: ``[B, S, H, D]``.
+        kv: ``[B, S_kv, D]`` -- single MQA KV head shared across all ``H`` query heads.
+        attn_sink: ``[H]`` fp32 additive logit per head that takes softmax mass
+            without contributing a value.
+        topk_idxs: ``[B, S, topk]`` int32 indices into ``kv``'s row axis; negative
+            or out-of-range entries are masked.
+        sm_scale: softmax scale, defaulting to ``D ** -0.5``.
+        return_lse: also return the ``[B, S, H]`` fp32 base-2 log-sum-exp, sink included.
+    """
+    if sm_scale is None:
+        sm_scale = q.shape[-1] ** -0.5
+
+    batch, kv_len = kv.shape[:2]
+    valid = (topk_idxs >= 0) & (topk_idxs < kv_len)
+    safe = topk_idxs.clamp(0, max(kv_len - 1, 0)).long()
+
+    rows = safe + torch.arange(batch, device=kv.device).view(-1, 1, 1) * kv_len
+    gathered = kv.reshape(batch * kv_len, -1).index_select(0, rows.flatten()).view(*rows.shape, kv.shape[-1])
+
+    scores = torch.einsum("bmhd,bmkd->bmhk", q.float(), gathered.float()) * sm_scale
+    scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
+
+    sink = attn_sink.float().view(1, 1, -1)
+    shift = torch.maximum(scores.max(dim=-1).values, sink)
+    exp_scores = (scores - shift.unsqueeze(-1)).exp()
+    numerator = torch.einsum("bmhk,bmkd->bmhd", exp_scores, gathered.float())
+    denominator = exp_scores.sum(-1) + (sink - shift).exp()
+
+    out = (numerator / denominator.unsqueeze(-1)).to(q.dtype)
+    if not return_lse:
+        return out
+    return out, ((shift + denominator.log()) / math.log(2.0)).float()
+
+
 def wrapper(
     q: Tensor,
     ori_kv: Tensor,
@@ -64,25 +109,31 @@ def wrapper(
     return_lse: bool = False,
     dropout: float = 0.0,
     return_attn_weights: bool = False,
+    topk_idxs: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, ...]:
     """Sparse MQA with HF sink-softmax math.
 
     Takes the ``dsa_attention`` / ``deepseek_v4`` structured contract and expands
     it into the dense mask HF's attention applies. Repeated valid candidates
     retain their per-slot softmax multiplicity, matching the TileLang row. When
+    ``topk_idxs`` is supplied directly (e.g., DSpark draft attention), skips
+    index construction and runs O(S * K) gather-and-softmax directly. When
     requested, LSE is detached and returned in base-2 units.
     """
     del compress_ratio, packed_sequence_slices
     kv = ori_kv if cmp_kv is None else torch.cat((ori_kv, cmp_kv), dim=1)
-    topk_idxs = build_sparse_attention_indices(
-        position_ids=position_ids,
-        sliding_window=sliding_window,
-        kv_len=ori_kv.shape[1],
-        compressed_len=0 if cmp_kv is None else cmp_kv.shape[1],
-        candidates=candidates,
-        query_offset=query_offset,
-        attention_mask=attention_mask,
-    )
+    if topk_idxs is not None and dropout == 0.0 and not return_attn_weights:
+        return dense_sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale, return_lse=return_lse)
+    if topk_idxs is None:
+        topk_idxs = build_sparse_attention_indices(
+            position_ids=position_ids,
+            sliding_window=sliding_window,
+            kv_len=ori_kv.shape[1],
+            compressed_len=0 if cmp_kv is None else cmp_kv.shape[1],
+            candidates=candidates,
+            query_offset=query_offset,
+            attention_mask=attention_mask,
+        )
     scale = q.shape[-1] ** -0.5 if sm_scale is None else sm_scale
     query = q.transpose(1, 2).contiguous()
     key_states = kv.unsqueeze(1).expand(-1, q.shape[2], -1, -1).contiguous()

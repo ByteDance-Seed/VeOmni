@@ -22,6 +22,7 @@ from transformers.modeling_flash_attention_utils import _flash_attention_forward
 
 from .....distributed.parallel_state import get_parallel_state
 from .....utils import logging
+from ..helper import ensure_npu_host_cu_seqlens
 from ..ulysses import (
     prepare_ulysses_qkv,
     restore_ulysses_output,
@@ -233,6 +234,8 @@ def flash_attention_forward(
         )
     if value_head_dim < head_dim:
         value = torch.nn.functional.pad(value, (0, head_dim - value_head_dim))
+
+    kwargs = ensure_npu_host_cu_seqlens(kwargs, query.device.type)
 
     attn_output = _flash_attention_forward(
         query,

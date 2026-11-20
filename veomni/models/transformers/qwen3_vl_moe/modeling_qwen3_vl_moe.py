@@ -74,7 +74,6 @@ from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.model_outputs import (  # noqa: F401  surfaced for forward log_probs path
     FusedLinearAuxOutput,
     FusedLinearAuxOutputMixin,
@@ -1045,8 +1044,7 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
     #    so the padded tokens belong to a valid attention window
     # 4. precompute max_seqlen once here (single CPU-GPU sync hoisted out
     #    of the attention layer loop) and thread it into each block
-    # 5. on NPU, move cu_seqlens to CPU — NPU FA2 varlen path requires it
-    # 6. return BaseModelOutputWithDeepstackFeatures (v5 contract: the v4
+    # 5. return BaseModelOutputWithDeepstackFeatures (v5 contract: the v4
     #    path returned `(merged, deepstack_list)` as a bare tuple)
     # ================================================================
     @merge_with_config_defaults
@@ -1157,11 +1155,6 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
                 max_seqlen = max(max_seqlen, sp_pad_seq_len)
         # --- Patch.4 ---
 
-        # --- Patch.5 ---
-        if IS_NPU_AVAILABLE:
-            cu_seqlens = cu_seqlens.cpu()
-        # --- Patch.5 ---
-
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(
                 hidden_states,
@@ -1180,13 +1173,13 @@ class Qwen3VLMoeVisionModel(Qwen3VLMoePreTrainedModel):
 
         merged_hidden_states = self.merger(hidden_states)
 
-        # --- Patch.6 ---
+        # --- Patch.5 ---
         return BaseModelOutputWithDeepstackFeatures(
             last_hidden_state=hidden_states,
             pooler_output=merged_hidden_states,
             deepstack_features=deepstack_feature_lists,
         )
-        # --- Patch.6 ---
+        # --- Patch.5 ---
 
     # ================================================================
     # Patch: Qwen3VLMoeVisionModel.dummy_forward (new)

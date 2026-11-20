@@ -20,6 +20,7 @@ import torch
 from torch import Tensor
 
 from ...sparse_indices import CompressedCandidates, build_sparse_attention_indices
+from . import eager
 
 
 def wrapper(
@@ -39,6 +40,7 @@ def wrapper(
     return_lse: bool = False,
     dropout: float = 0.0,
     return_attn_weights: bool = False,
+    topk_idxs: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """Run Triton sparse MQA with the TileLang row's candidate contract.
 
@@ -53,18 +55,24 @@ def wrapper(
             "use the eager implementation."
         )
 
+    kv = ori_kv if cmp_kv is None else torch.cat((ori_kv, cmp_kv), dim=1)
+    if topk_idxs is not None:
+        if q.device.type != "cuda" or q.dtype != torch.bfloat16:
+            return eager.dense_sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale, return_lse=return_lse)
+        topk_idxs = topk_idxs.contiguous()
+    else:
+        topk_idxs = build_sparse_attention_indices(
+            position_ids=position_ids,
+            sliding_window=sliding_window,
+            kv_len=ori_kv.shape[1],
+            compressed_len=0 if cmp_kv is None else cmp_kv.shape[1],
+            candidates=candidates,
+            query_offset=query_offset,
+            attention_mask=attention_mask,
+        )
+
     from ...vendor.triton_sparse_mla import sparse_attn_triton
 
-    kv = ori_kv if cmp_kv is None else torch.cat((ori_kv, cmp_kv), dim=1)
-    topk_idxs = build_sparse_attention_indices(
-        position_ids=position_ids,
-        sliding_window=sliding_window,
-        kv_len=ori_kv.shape[1],
-        compressed_len=0 if cmp_kv is None else cmp_kv.shape[1],
-        candidates=candidates,
-        query_offset=query_offset,
-        attention_mask=attention_mask,
-    )
     return sparse_attn_triton(
         q.contiguous(),
         kv.contiguous(),

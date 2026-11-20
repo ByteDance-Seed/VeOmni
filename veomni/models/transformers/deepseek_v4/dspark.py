@@ -23,7 +23,6 @@ Stage 0 owns ``main_proj`` and ``main_norm``; the last stage owns ``hc_head``,
 from __future__ import annotations
 
 import copy
-import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -33,57 +32,12 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.dsa.attention.deepseek_v4.eager import dense_sparse_attn
 from veomni.ops.kernels.dsa.sparse_indices import mask_sparse_attention_indices
-from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_attn_tilelang
 
 
 if TYPE_CHECKING:
     from .configuration_deepseek_v4 import DeepseekV4Config
-
-
-def dense_sparse_attn(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    attn_sink: torch.Tensor,
-    topk_idxs: torch.Tensor,
-    sm_scale: float | None = None,
-    return_lse: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Sparse MQA by gather-and-softmax, matching ``sparse_attn_tilelang``.
-
-    Args:
-        q: ``[B, S, H, D]``.
-        kv: ``[B, S_kv, D]`` -- single MQA KV head shared across all ``H`` query heads.
-        attn_sink: ``[H]`` fp32 additive logit per head that takes softmax mass
-            without contributing a value.
-        topk_idxs: ``[B, S, topk]`` int32 indices into ``kv``'s row axis; negative
-            or out-of-range entries are masked.
-        sm_scale: softmax scale, defaulting to ``D ** -0.5``.
-        return_lse: also return the ``[B, S, H]`` fp32 base-2 log-sum-exp, sink included.
-    """
-    if sm_scale is None:
-        sm_scale = q.shape[-1] ** -0.5
-
-    batch, kv_len = kv.shape[:2]
-    valid = (topk_idxs >= 0) & (topk_idxs < kv_len)
-    safe = topk_idxs.clamp(0, max(kv_len - 1, 0)).long()
-
-    rows = safe + torch.arange(batch, device=kv.device).view(-1, 1, 1) * kv_len
-    gathered = kv.reshape(batch * kv_len, -1).index_select(0, rows.flatten()).view(*rows.shape, kv.shape[-1])
-
-    scores = torch.einsum("bmhd,bmkd->bmhk", q.float(), gathered.float()) * sm_scale
-    scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
-
-    sink = attn_sink.float().view(1, 1, -1)
-    shift = torch.maximum(scores.max(dim=-1).values, sink)
-    exp_scores = (scores - shift.unsqueeze(-1)).exp()
-    numerator = torch.einsum("bmhk,bmkd->bmhd", exp_scores, gathered.float())
-    denominator = exp_scores.sum(-1) + (sink - shift).exp()
-
-    out = (numerator / denominator.unsqueeze(-1)).to(q.dtype)
-    if not return_lse:
-        return out
-    return out, ((shift + denominator.log()) / math.log(2.0)).float()
 
 
 def main_window_indices(
@@ -331,21 +285,17 @@ class DeepseekV4DSparkBlock(GradientCheckpointingLayer):
         own_idxs = main_kv.shape[1] + torch.arange(seq_len, device=hidden_states.device, dtype=torch.int32)
         topk_idxs = torch.cat([main_idxs, own_idxs.view(1, -1, 1).expand(batch, -1, -1)], dim=-1)
 
-        use_tilelang = (
-            query.is_cuda
-            and query.dtype == torch.bfloat16
-            and getattr(attn.veomni_dsa_attention, "impl", None) == "tilelang"
+        output = attn.veomni_dsa_attention(
+            query,
+            pool,
+            None,
+            attn.sinks,
+            position_ids,
+            sliding_window=attn.sliding_window,
+            compress_ratio=1,
+            topk_idxs=topk_idxs,
+            sm_scale=attn.scaling,
         )
-        if use_tilelang:
-            output = sparse_attn_tilelang(
-                query.contiguous(),
-                pool.contiguous(),
-                attn.sinks.float().contiguous(),
-                topk_idxs.contiguous(),
-                attn.scaling,
-            )
-        else:
-            output = dense_sparse_attn(query, pool, attn.sinks, topk_idxs, attn.scaling)
 
         output = attn.veomni_rope(output.transpose(1, 2), cos, -sin).transpose(1, 2)
         grouped = output.reshape(batch, seq_len, attn.config.o_groups, -1)

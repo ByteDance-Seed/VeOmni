@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import functools
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -328,22 +327,6 @@ def build_foundation_model(
         empty_init=empty_init,
         init_device=init_device,
     )
-
-    if IS_NPU_AVAILABLE:
-        logger.info_rank0(
-            "We override the model’s forward method on NPU devices to ensure that the FA kwargs are on CPU, since the npu_fused_attention requires cpu FA kwargs"
-        )
-        original_forward = model.forward
-
-        @functools.wraps(original_forward)
-        def wrapped_forward(*args, **kwargs):
-            if "cu_seq_lens_q" in kwargs and kwargs["cu_seq_lens_q"] is not None:
-                kwargs["cu_seq_lens_q"] = kwargs["cu_seq_lens_q"].cpu()
-            if "cu_seq_lens_k" in kwargs and kwargs["cu_seq_lens_k"] is not None:
-                kwargs["cu_seq_lens_k"] = kwargs["cu_seq_lens_k"].cpu()
-            return original_forward(*args, **kwargs)
-
-        model.forward = wrapped_forward
 
     assert not getattr(model, "use_kernels", False), (
         "Still evaluating HF kernels hub integration with VeOmni patches; keep use_kernels disabled for now "

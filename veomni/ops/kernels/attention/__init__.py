@@ -39,6 +39,7 @@ from ...platform import (
 )
 from ...registry import register_op
 from .helper import (
+    ensure_npu_host_cu_seqlens,
     extract_packed_varlen_cu_seqlens,
     packed_split_attention_forward,
 )
@@ -138,6 +139,9 @@ def lookup(impl: str) -> Callable:
                 softcap=softcap,
                 **kwargs,
             )
+
+        if interface == "flash_attention_2":
+            kwargs = ensure_npu_host_cu_seqlens(kwargs, query.device.type)
 
         return forward(
             module,

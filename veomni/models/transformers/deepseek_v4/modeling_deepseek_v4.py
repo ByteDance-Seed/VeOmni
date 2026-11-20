@@ -698,18 +698,14 @@ class DeepseekV4Indexer(nn.Module):
         # replicated. So the compressed *keys* have to stay global, and the indexer
         # runs the same own-your-windows-then-all-gather compression its compressor
         # does -- it cannot reuse that result, because it summarises the same windows
-        # through its own projections at ``index_head_dim``. Only the query axis is
-        # local, and ``query_offset`` is what keeps a local query row addressing its
-        # absolute position.
+        # through its own projections at ``index_head_dim``.
         parallel_state = get_parallel_state()
         cp_enabled = parallel_state.cp_enabled and cache_layer is None
-        query_offset = 0
         if cp_enabled:
             cp_group = parallel_state.cp_group
             cp_rank = parallel_state.cp_rank
             local_seq_len = seq_len
             rate = self.compress_rate
-            query_offset = cp_rank * local_seq_len
             shard = plan_compressor_shard(
                 role="DeepSeek V4 Lightning Indexer",
                 rate=rate,
@@ -846,25 +842,9 @@ class DeepseekV4Indexer(nn.Module):
         query_weights = weights.transpose(0, 1)
         query_range_starts = None if packed_ranges is None else packed_ranges[0]
         query_range_ends = None if packed_ranges is None else packed_ranges[1]
-        # A local query row ``i`` is global row ``query_offset + i``; off the context
-        # parallel path ``query_offset`` is zero and this is the arange it always was.
-        # Only the CANN indexer kernel switches layout when ``query_range_starts`` is
-        # ``None``; ``eager`` and ``tilelang`` always construct causal ranges when none
-        # are passed, so computing them directly from ``position_ids`` avoids a
-        # data-dependent ``torch.equal`` check (host sync + ``torch.compile`` graph break).
-        if query_range_starts is None:
-            if cp_enabled or getattr(self.veomni_dsa_indexer, "impl", None) != "cann":
-                query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
-                query_range_ends = ((position_ids[0] + 1) // self.compress_rate).to(torch.int32)
-            else:
-                canonical_positions = (
-                    (torch.arange(seq_len, device=position_ids.device) + query_offset)
-                    .unsqueeze(0)
-                    .expand_as(position_ids)
-                )
-                if not torch.equal(position_ids, canonical_positions):
-                    query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
-                    query_range_ends = ((position_ids[0] + 1) // self.compress_rate).to(torch.int32)
+        if query_range_starts is None and cp_enabled:
+            query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
+            query_range_ends = ((position_ids[0] + 1) // self.compress_rate).to(torch.int32)
         # Ulysses partitions the full-sequence queries here and stitches the
         # selection back together below; CP received them already partitioned and
         # wants the result per shard, so both halves fall away together. One flag
@@ -873,8 +853,7 @@ class DeepseekV4Indexer(nn.Module):
         if ulysses_query_partition:
             if query_range_starts is None and query_range_ends is None:
                 query_range_starts = torch.zeros(seq_len, device=q.device, dtype=torch.int32)
-                query_positions = torch.arange(seq_len, device=q.device, dtype=torch.int32)
-                query_range_ends = (query_positions + 1) // self.compress_rate
+                query_range_ends = ((position_ids[0] + 1) // self.compress_rate).to(torch.int32)
             if seq_len % parallel_state.ulysses_size != 0:
                 raise ValueError(
                     f"DeepSeek-V4 indexer sequence length ({seq_len}) must be divisible by "
@@ -898,6 +877,8 @@ class DeepseekV4Indexer(nn.Module):
             cu_seqlen_ks=query_range_starts,
             cu_seqlen_ke=query_range_ends,
             packed_sequence_slices=packed_sequence_slices,
+            position_ids=position_ids if query_range_starts is None else None,
+            require_score_grad=build_indexer_loss,
         )
         if ulysses_query_partition:
             top_k_indices = gather_outputs(
@@ -971,12 +952,6 @@ class DeepseekV4CSACompressor(nn.Module):
     ) -> tuple[torch.Tensor, CompressedCandidates]:
         if (packed_sequence_slices is None) != (packed_compression_metadata is None):
             raise ValueError("Packed sequence slices and compression metadata must be provided together")
-        if IS_NPU_AVAILABLE and build_indexer_loss:
-            raise NotImplementedError(
-                "dsa_indexer_loss is not implemented on NPU: the objective's student "
-                "distribution is the TileLang Lightning Indexer's per-slot scores, and that "
-                "kernel is CUDA-only. Set dsa_indexer_loss: false under model.model_config."
-            )
         batch = hidden_states.shape[0]
         cache_layer: DeepseekV4CSACache = past_key_values.layers[layer_idx] if past_key_values is not None else None
         kv = self.kv_proj(hidden_states)

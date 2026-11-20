@@ -16,8 +16,8 @@ def _load_qwen4_exp_modeling():
     return importlib.import_module("veomni.models.transformers.qwen4_exp.modeling_qwen4_exp")
 
 
-def test_compact_qsa_npu_finite_mask_matches_gpu_packed_selection(monkeypatch):
-    """Verify NPU QSA indexer masks invisible blocks with -1.0 (not -inf) and matches GPU selection."""
+def test_compact_qsa_finite_mask_matches_inf_packed_selection(monkeypatch):
+    """Verify QSA indexer masks invisible blocks with finite -1.0 and matches -inf selection."""
     modeling = _load_qwen4_exp_modeling()
 
     torch.manual_seed(38)
@@ -37,15 +37,20 @@ def test_compact_qsa_npu_finite_mask_matches_gpu_packed_selection(monkeypatch):
     positions = (torch.ones(1, 25, 2), torch.zeros(1, 25, 2))
     boundaries = torch.tensor([0, 9, 25], dtype=torch.int32)
 
-    monkeypatch.setattr(modeling, "IS_NPU_AVAILABLE", False)
-    expected = modeling.Qwen4ExpTextQSAIndexer.forward(
-        indexer,
-        hidden,
-        positions,
-        attention_mask=None,
-        past_key_values=None,
-        cu_seq_lens_q=boundaries,
-    )
+    def inf_selection(scores: torch.Tensor, visible: torch.Tensor, top_count: int):
+        top_blocks = scores.masked_fill(~visible, float("-inf")).topk(top_count, dim=-1).indices
+        return top_blocks, visible.gather(-1, top_blocks)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(modeling, "select_visible_topk_blocks", inf_selection)
+        expected = modeling.Qwen4ExpTextQSAIndexer.forward(
+            indexer,
+            hidden,
+            positions,
+            attention_mask=None,
+            past_key_values=None,
+            cu_seq_lens_q=boundaries,
+        )
 
     orig_topk = torch.Tensor.topk
     topk_inputs: list[torch.Tensor] = []
@@ -55,7 +60,6 @@ def test_compact_qsa_npu_finite_mask_matches_gpu_packed_selection(monkeypatch):
         return orig_topk(self, k, dim=dim, largest=largest, sorted=sorted)
 
     monkeypatch.setattr(torch.Tensor, "topk", recording_topk)
-    monkeypatch.setattr(modeling, "IS_NPU_AVAILABLE", True)
     actual = modeling.Qwen4ExpTextQSAIndexer.forward(
         indexer,
         hidden,
@@ -67,7 +71,7 @@ def test_compact_qsa_npu_finite_mask_matches_gpu_packed_selection(monkeypatch):
 
     assert topk_inputs, "Expected Qwen4ExpTextQSAIndexer.forward to invoke Tensor.topk"
     for scores in topk_inputs:
-        assert torch.isfinite(scores).all(), "NPU QSA indexer must not pass -inf to topk"
+        assert torch.isfinite(scores).all(), "QSA indexer must not pass -inf to topk"
         assert (scores == -1.0).any(), "Expected invisible blocks to be masked with -1.0"
         assert (scores[scores != -1.0] >= 0.0).all(), "Unmasked ReLU block scores must be non-negative"
 

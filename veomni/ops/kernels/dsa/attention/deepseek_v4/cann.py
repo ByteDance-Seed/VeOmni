@@ -77,17 +77,19 @@ def wrapper(
     return_lse: bool = False,
     dropout: float = 0.0,
     return_attn_weights: bool = False,
+    topk_idxs: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, ...]:
     """Run CANN sparse FlashMLA over the window and compressed selection.
 
-    Layers without compressed rows run the eager row. ``attention_mask`` is
-    not read, because the mask modes already carry causality and packed
-    isolation, so padded batches are unsupported. The kernel needs one row per
-    query (no KV cache or context-parallel offset) and validates its own
-    dtype, window, ratio and head-size limits. Packed calls take the TND path,
-    which needs batch size 1 and reads the slice boundaries on the host.
+    Layers without compressed rows or callers with explicit ``topk_idxs`` run
+    the eager row. ``attention_mask`` is not read, because the mask modes
+    already carry causality and packed isolation, so padded batches are
+    unsupported. The kernel needs one row per query (no KV cache or
+    context-parallel offset) and validates its own dtype, window, ratio and
+    head-size limits. Packed calls take the TND path, which needs batch size 1
+    and reads the slice boundaries on the host.
     """
-    if cmp_kv is None or cmp_kv.shape[1] == 0:
+    if topk_idxs is not None or cmp_kv is None or cmp_kv.shape[1] == 0:
         return eager.wrapper(
             q,
             ori_kv,
@@ -104,6 +106,7 @@ def wrapper(
             return_lse=return_lse,
             dropout=dropout,
             return_attn_weights=return_attn_weights,
+            topk_idxs=topk_idxs,
         )
     del position_ids, attention_mask
     if dropout:

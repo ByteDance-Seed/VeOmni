@@ -246,6 +246,8 @@ def wrapper(
     cu_seqlen_ks: Tensor | None = None,
     cu_seqlen_ke: Tensor | None = None,
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
+    position_ids: Tensor | None = None,
+    require_score_grad: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Select compressed-KV entries with the CANN Lightning Indexer.
 
@@ -254,6 +256,12 @@ def wrapper(
     with shape ``[B, S, min(topk, S_kv)]``. Unselectable slots hold index -1
     and score ``-inf``. The kernel is forward-only, so scores carry no gradient.
     """
+    if require_score_grad:
+        raise NotImplementedError(
+            "dsa_indexer_loss is not implemented for the 'cann' dsa_indexer backend: "
+            "the CANN Lightning Indexer is forward-only and does not backpropagate through "
+            "per-slot scores. Set dsa_indexer_loss: false under model.model_config."
+        )
     if topk_indices is not None:
         raise NotImplementedError(
             "dsa_indexer deepseek_v4 cann selects its own top-k; scoring supplied topk_indices "
@@ -263,6 +271,11 @@ def wrapper(
         raise ValueError("cu_seqlen_ks and cu_seqlen_ke must be provided together")
 
     seq_len, batch = index_q.shape[:2]
+    if cu_seqlen_ks is None and position_ids is not None:
+        canonical_positions = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
+        if not torch.equal(position_ids, canonical_positions):
+            cu_seqlen_ks = torch.zeros(seq_len, device=index_q.device, dtype=torch.int32)
+            cu_seqlen_ke = ((position_ids[0].to(device=index_q.device) + 1) // compress_ratio).to(torch.int32)
     compressed_len = index_k.shape[0]
     q = index_q.transpose(0, 1)
     k = index_k.transpose(0, 1)
