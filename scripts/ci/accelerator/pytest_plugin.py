@@ -63,7 +63,8 @@ def validate_launch(nproc, *, command=None, env=None, nnodes=1, record=True):
         "xpu": "ZE_AFFINITY_MASK",
     }.get(caps.backend, "ASCEND_RT_VISIBLE_DEVICES")
     mask = env.get(key, "")
-    visible = [value for value in mask.split(",") if value and value != XPU_HIDDEN_MASK]
+    hidden = XPU_HIDDEN_MASK if caps.backend == "xpu" else None
+    visible = [value for value in mask.split(",") if value and value != hidden]
     cpu = not visible and any(spec.device == "cpu" for spec in specs)
     if cpu and caps.backend == "xpu" and mask != XPU_HIDDEN_MASK:
         # An empty or missing ZE_AFFINITY_MASK exposes every XPU.

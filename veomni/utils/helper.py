@@ -905,8 +905,9 @@ def create_profiler(
             p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
-        if hasattr(get_torch_device().memory, "_dump_snapshot"):
-            get_torch_device().memory._dump_snapshot(gpu_memory_file)
+        memory = getattr(get_torch_device(), "memory", None)
+        if profile_memory and hasattr(memory, "_dump_snapshot"):
+            memory._dump_snapshot(gpu_memory_file)
             logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
         if trace_dir.startswith("hdfs://"):
@@ -979,7 +980,7 @@ def create_profiler(
     if (
         (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE or IS_XPU_AVAILABLE)
         and profile_memory
-        and hasattr(get_torch_device().memory, "_record_memory_history")
+        and hasattr(getattr(get_torch_device(), "memory", None), "_record_memory_history")
     ):
         return ProfilerWithMem(base_profiler)
     else:
