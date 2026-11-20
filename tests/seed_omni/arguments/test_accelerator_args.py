@@ -145,6 +145,9 @@ def test_validate_omni_accelerator_allows_torch_compile():
     [
         ({"backend": "cudagraphs"}, {}),
         ({"mode": "reduce-overhead"}, {}),
+        # torch turns on Triton graph capture for this mode too, while
+        # ``max-autotune-no-cudagraphs`` deliberately does not.
+        ({"mode": "max-autotune"}, {}),
         ({}, {"ulysses_size": 2}),
         ({}, {"cp_size": 2}),
         ({}, {"enable_async": True}),
@@ -169,6 +172,17 @@ def test_validate_omni_accelerator_refuses_the_combinations_the_composed_path_ca
 
     with pytest.raises(ValueError, match="torch_compile"):
         _validate_omni_accelerator(acc)
+
+
+def test_validate_omni_accelerator_allows_max_autotune_without_cudagraphs():
+    """The no-cudagraphs spelling of max-autotune stays available."""
+    acc = SimpleNamespace(
+        torch_compile=TorchCompileConfig(enable=True, backend="inductor", mode="max-autotune-no-cudagraphs"),
+        ulysses_size=1,
+        cp_size=1,
+        enable_async=False,
+    )
+    _validate_omni_accelerator(acc)
 
 
 def test_validate_omni_accelerator_leaves_a_disabled_compile_alone():

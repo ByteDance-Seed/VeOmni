@@ -799,11 +799,20 @@ def test_a_module_without_the_dynamic_flag_gets_dynamic_off():
     assert module_compile_config(accelerator, SimpleNamespace(supports_torch_compile=True)).dynamic is False
 
 
-def _fake_runtime(model, *, fsdp_mode="fsdp2"):
-    """A ``ModuleRuntime`` stub carrying just what the scope helpers read."""
+def _fake_runtime(model, *, fsdp_mode="fsdp2", enable=True):
+    """A ``ModuleRuntime`` stub carrying just what the scope helpers read.
+
+    ``enable`` is the module's own resolved ``accelerator.torch_compile.enable``,
+    which a per-module YAML overlay can set.
+    """
     return SimpleNamespace(
         model=model,
-        args=SimpleNamespace(accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode=fsdp_mode))),
+        args=SimpleNamespace(
+            accelerator=SimpleNamespace(
+                torch_compile=SimpleNamespace(enable=enable),
+                fsdp_config=SimpleNamespace(fsdp_mode=fsdp_mode),
+            )
+        ),
     )
 
 
@@ -865,3 +874,36 @@ def test_a_module_under_ddp_is_gated_off_rather_than_failing_its_wrap():
     )
 
     assert module_compile_config(accelerator, module).enable is False
+
+
+def test_compilable_scope_honours_a_module_overlay_that_turns_compile_off():
+    """A per-module ``accelerator.torch_compile.enable: false`` keeps that module eager.
+
+    Modules carry per-module ``accelerator:`` overlays and ``_validate_omni_accelerator``
+    runs on each resolved copy, so an overlay is a supported way to opt a single
+    module out. The composed scope must read the merged value, not only the
+    top-level switch.
+    """
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import _compilable_scope
+
+    opted_in = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True)
+    runtimes = {
+        "llm": _fake_runtime(opted_in, enable=True),
+        "vision": _fake_runtime(opted_in, enable=False),
+    }
+
+    assert _compilable_scope(runtimes) == ["llm"]
+
+
+def test_compilable_scope_is_empty_when_every_module_overlay_turns_compile_off():
+    """Nothing to compile is a valid state, not an error: the run goes eager."""
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
+        _compilable_scope,
+        _dynamic_scope,
+    )
+
+    model = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True)
+    runtimes = {"llm": _fake_runtime(model, enable=False)}
+
+    assert _compilable_scope(runtimes) == []
+    assert _dynamic_scope(runtimes) == []

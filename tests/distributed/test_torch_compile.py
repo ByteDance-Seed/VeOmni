@@ -521,8 +521,12 @@ def test_compile_decoder_blocks_rejects_cuda_graphs_for_a_composed_model(monkeyp
 
 @pytest.mark.parametrize(
     "compile_config",
-    [CompileConfig(backend="inductor", mode="reduce-overhead"), CompileConfig(backend="cudagraphs")],
-    ids=["reduce-overhead", "cudagraphs-backend"],
+    [
+        CompileConfig(backend="inductor", mode="reduce-overhead"),
+        CompileConfig(backend="inductor", mode="max-autotune"),
+        CompileConfig(backend="cudagraphs"),
+    ],
+    ids=["reduce-overhead", "max-autotune", "cudagraphs-backend"],
 )
 def test_compile_decoder_blocks_rejects_qwen3_vl_cuda_graphs(monkeypatch, compile_config):
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)

@@ -848,10 +848,16 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
     """
     if not accelerator.torch_compile.enable:
         return
-    # ``TorchCompileConfig`` carries the raw fields; ``uses_cuda_graphs`` lives on
-    # the runtime ``CompileConfig``, so the same two spellings are checked here.
-    torch_compile = accelerator.torch_compile
-    if torch_compile.backend == "cudagraphs" or torch_compile.mode == "reduce-overhead":
+    # Reuse the runtime predicate rather than restating the spellings: a second
+    # copy is how ``max-autotune`` came to be missing from one of the two guards.
+    from ..distributed.torch_compile import CompileConfig as _RuntimeCompileConfig
+
+    as_compile_config = _RuntimeCompileConfig(
+        enable=True,
+        backend=accelerator.torch_compile.backend,
+        mode=accelerator.torch_compile.mode,
+    )
+    if as_compile_config.uses_cuda_graphs():
         raise ValueError(
             "accelerator.torch_compile does not support CUDA Graph replay under SeedOmni; "
             "use backend='inductor' and mode=None."

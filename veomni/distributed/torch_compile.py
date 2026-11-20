@@ -74,9 +74,19 @@ class CompileConfig:
     dynamic: bool = False
 
     def uses_cuda_graphs(self) -> bool:
-        """Return whether this config asks torch.compile to use graph replay."""
+        """Return whether this config asks torch.compile to use graph replay.
 
-        return self.backend == "cudagraphs" or self.mode == "reduce-overhead"
+        Both ``mode`` spellings are needed: ``reduce-overhead`` and
+        ``max-autotune`` each turn on Triton graph capture in torch's own mode
+        table (``torch/_inductor/__init__.py``), while
+        ``max-autotune-no-cudagraphs`` deliberately does not. Missing
+        ``max-autotune`` would let a run past the SeedOmni replay guard and record
+        ``_veomni_compile_uses_cuda_graphs=False``, so the per-step
+        ``cudagraph_mark_step_begin`` would never be called for a graph that does
+        replay.
+        """
+
+        return self.backend == "cudagraphs" or self.mode == "reduce-overhead" or self.mode == "max-autotune"
 
 
 def _decoder_block_specs(model: nn.Module, *, all_classes: bool = False) -> list[tuple[str, str | None]]:
@@ -343,17 +353,19 @@ def _uncompilable_selections(ops) -> list[str]:
     ]
 
 
-def _reject_incompatible_ops(model: nn.Module) -> None:
+def _reject_incompatible_ops(model: nn.Module, scopes: Optional[Collection[str]] = None) -> None:
     """Reject op selections ``torch.compile`` cannot lower, at any config depth.
 
     The walk covers nested configs because that is how the selections bind: a
     multimodal root carries its text tower's ops under ``sub_configs``, and a
-    module resolves the selection from the config it was built with. A child-only
-    selection is real and must be caught, and the message names the path so the
-    offending level is unambiguous.
+    module resolves the selection from the config it was built with.
+
+    ``scopes`` limits the walk to the modules that will actually be compiled. A
+    sibling left eager never reaches Inductor, so its selection is irrelevant —
+    refusing the run for it would block a compile that is safe.
     """
     config = getattr(model, "config", None)
-    offending = _uncompilable_at(config, prefix="")
+    offending = _uncompilable_at(config, prefix="", scopes=scopes)
     if offending:
         raise RuntimeError(
             "model.accelerator.torch_compile cannot be combined with "
@@ -362,13 +374,17 @@ def _reject_incompatible_ops(model: nn.Module) -> None:
         )
 
 
-def _uncompilable_at(config, *, prefix: str) -> list[str]:
+def _uncompilable_at(config, *, prefix: str, scopes: Optional[Collection[str]] = None) -> list[str]:
     """Collect offending selections on ``config`` and every sub-config below it.
 
     A SeedOmni composed ``OmniConfig`` files its children in ``_module_configs``
     rather than ``sub_configs`` (the latter describes one HF model's nesting), so
     both are walked — otherwise a child's ``torchao_mxfp4`` selection would never
     be seen and would fail at runtime instead, inside Inductor.
+
+    ``scopes`` skips the ``_module_configs`` children that are not compiled. It
+    does not filter ``sub_configs``: those belong to one model, and a single model
+    is compiled whole or not at all.
     """
     if config is None:
         return []
@@ -378,7 +394,9 @@ def _uncompilable_at(config, *, prefix: str) -> list[str]:
         if child is not None:
             found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
     for name, child in (getattr(config, "_module_configs", None) or {}).items():
-        found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
+        if scopes is not None and name not in scopes:
+            continue
+        found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}.", scopes=scopes))
     return found
 
 
@@ -415,7 +433,7 @@ def compile_decoder_blocks(
         )
 
     validate_compile_model(model, compile_config, sequence_parallel_enabled, async_enabled)
-    _reject_incompatible_ops(model)
+    _reject_incompatible_ops(model, scopes=scopes)
 
     compile_kwargs = {
         "fullgraph": compile_config.fullgraph,

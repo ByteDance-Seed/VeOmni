@@ -134,13 +134,21 @@ def _compilable_scope(module_runtimes: Mapping[str, ModuleRuntime]) -> list[str]
     contribute a scope, and everything else keeps running eagerly inside the
     same compiled run.
 
+    Each module's **own** resolved ``accelerator.torch_compile.enable`` is
+    consulted too, not just the run-wide one. Modules carry per-module
+    ``accelerator:`` YAML overlays and ``_validate_omni_accelerator`` runs on each
+    resolved copy, so an overlay is a supported way to say "not this module" —
+    ignoring it would compile a child that asked not to be, and would equally
+    ignore a child-only ``enable: true``.
+
     A module under ``ddp`` is excluded for the same reason ``module_compile_config``
     excludes it: ``compile_decoder_blocks`` only runs under FSDP2.
     """
     return [
         name
         for name, runtime in module_runtimes.items()
-        if getattr(runtime.model, "supports_torch_compile", False)
+        if runtime.args.accelerator.torch_compile.enable
+        and getattr(runtime.model, "supports_torch_compile", False)
         and runtime.args.accelerator.fsdp_config.fsdp_mode == "fsdp2"
     ]
 
