@@ -1,6 +1,6 @@
 ---
 name: veomni-new-model
-description: "Integrate an existing external model into VeOmni, author or update standalone `veomni/models/transformers/<model>/modeling_<model>.py` modules, or upgrade the pinned `transformers` version across models. Use for new model support or migration from Transformers, Diffusers, or standalone implementations."
+description: "Integrate an existing external model into VeOmni and author or update standalone `veomni/models/transformers/<model>/modeling_<model>.py` modules. Use for new model support or migration from Transformers, Diffusers, or standalone implementations."
 ---
 
 # Model migration into VeOmni
@@ -84,19 +84,13 @@ implementation route, affected areas, and explicit acceptance checks or blockers
 
 | Source implementation | VeOmni approach |
 |---|---|
-| Transformers modeling/configuration contracts | Bootstrap and author a single standalone `veomni/models/transformers/<m>/modeling_<m>.py` via `scripts/sync_hf_modeling.py init`. |
+| Transformers modeling/configuration contracts | Author a single standalone `veomni/models/transformers/<m>/modeling_<m>.py`. |
 | Diffusers components or pipelines | Follow a maintained integration; inspect the trainable components separately from the inference pipeline. |
 | Independent implementation or another framework | Wrap compatible PyTorch modules, port the required subset, or translate unsupported operations. |
 
 For Transformers models, every family ships a **single, explicit, self-contained**
 `veomni/models/transformers/<m>/modeling_<m>.py` file with `# Upstream-Module:` and
-`# Base-Transformers-Version:` headers at the top (verified by `make check-hf-modeling` /
-`scripts/sync_hf_modeling.py check`). Bootstrap with
-`python scripts/sync_hf_modeling.py init transformers.models.<m>.modeling_<m> -o veomni/models/transformers/<m>/modeling_<m>.py`,
-wire instance-local `VeomniOp` handles (`self.config.ops_config`), inspect deltas via
-`python scripts/sync_hf_modeling.py diff <m>`, and use
-`python scripts/sync_hf_modeling.py merge --old-hf-root <old-transformers>` during
-`transformers` upgrades. Never create separate `_gpu` / `_npu` modeling files; gate rare
+`# Base-Transformers-Version:` headers at the top. Adapt the upstream source directly and bind instance-local `VeomniOp` handles through `self.config.ops_config`. Never create separate `_gpu` / `_npu` modeling files; gate rare
 structural NPU branches explicitly with `IS_NPU_AVAILABLE` (never `not IS_CUDA_AVAILABLE`).
 
 Place DiT integrations, including independent diffusion backbones and their
@@ -290,7 +284,7 @@ Run checks in increasing cost order, omitting only those outside explicit scope.
 ### Import, forward, and numerical parity
 
 Check clean-process import, config/registry lookup, output shapes, and expected
-forward behavior. For HF-derived `modeling_<m>.py` modules, run `make check-hf-modeling`,
+forward behavior. For HF-derived `modeling_<m>.py` modules, run
 `tests/models/transformers/test_generated_modeling_imports.py`, and
 `tests/models/transformers/test_generated_call_site_signatures.py`.
 

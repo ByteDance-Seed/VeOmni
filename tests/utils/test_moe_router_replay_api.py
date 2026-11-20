@@ -26,8 +26,8 @@ real MoE model weights:
   values and fails fast with an actionable message otherwise.
 
 It also includes a static wiring guard: the ``modeling_*.py`` files for every
-wired MoE family MUST import and call ``maybe_replay_indices`` so no edit or
-HF 3-way merge drops a call site silently.
+wired MoE family MUST import and call ``maybe_replay_indices`` so no edit
+drops a call site silently.
 """
 
 from __future__ import annotations
@@ -223,7 +223,7 @@ def test_validate_accepts_ddp_style_module_wrapper():
 # --------------------------------------------------- router replay wiring guard
 #
 # The router-replay wiring lives inside HF-derived modeling_*.py files.
-# These checks ensure no edit or HF 3-way merge drops a `maybe_replay_indices`
+# These checks ensure no edit drops a `maybe_replay_indices`
 # import or call site silently.
 
 

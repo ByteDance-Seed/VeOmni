@@ -27,7 +27,7 @@ Before editing code, report a migration file inventory and ordered implementatio
 
 | File | Purpose | Planned change | Validation |
 |---|---|---|---|
-| `veomni/models/transformers/<model>/modeling_<model>.py` | Unified standalone modeling module | Add or update the minimum NPU-specific `VeomniOp` / `IS_NPU_AVAILABLE` branches | `make check-hf-modeling`, import, and focused model tests |
+| `veomni/models/transformers/<model>/modeling_<model>.py` | Unified standalone modeling module | Add or update the minimum NPU-specific `VeomniOp` / `IS_NPU_AVAILABLE` branches | Module import and focused model tests |
 | `veomni/models/transformers/<model>/__init__.py` | Model registration | Register any additional architecture (e.g., VLM wrapper) | Registry lookup test |
 | `tests/models/...` | Model adaptation coverage | Extend the closest existing test when needed | Run the focused test |
 
@@ -37,7 +37,6 @@ Adjust the rows to the target model. Do not add separate `_gpu` / `_npu` modelin
 python -c "import transformers; print(transformers.__version__)"
 rg -n "transformers==" pyproject.toml
 ls veomni/models/transformers/<model>/{__init__.py,modeling_*.py}
-python scripts/sync_hf_modeling.py diff <model>
 
 rg -n "cuda|triton|flash_attention|flex_attention|liger|is_cuda|\.cuda\(" \
   veomni/models/transformers/<model>
@@ -106,7 +105,6 @@ Run focused checks on `modeling_<model>.py` before hardware training:
 
 ```bash
 python -m py_compile veomni/models/transformers/<model>/modeling_<model>.py
-python scripts/sync_hf_modeling.py check
 PYTHONPATH=. pytest --noconftest tests/models/transformers/test_generated_call_site_signatures.py
 python -c "import veomni.models.transformers.<model>.modeling_<model>"
 make quality
@@ -116,7 +114,7 @@ Extend an existing model test when practical. Cover module import, local `Veomni
 
 ## Completion Checklist
 
-- [ ] Installed Transformers version matches the repository pin (`make check-hf-modeling` passes)
+- [ ] Installed Transformers version matches the repository pin
 - [ ] GPU-only model dependencies are classified
 - [ ] Device-neutral allocations, dtype conversions, and distributed APIs are verified
 - [ ] NPU backends are verified in the live operator registry

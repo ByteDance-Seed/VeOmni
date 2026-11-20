@@ -77,7 +77,7 @@ Each skill is a folder containing a `SKILL.md` file with YAML frontmatter (`name
 ├── veomni-develop/SKILL.md    # Feature development and refactoring
 ├── veomni-debug/SKILL.md      # Bug fix and debugging (quick path + full protocol)
 ├── veomni-review/SKILL.md     # Pre-PR code review (mandatory)
-├── veomni-new-model/SKILL.md  # Integrate a new model or sync HF modeling_<m>.py
+├── veomni-new-model/SKILL.md  # Integrate a new model or edit its standalone modeling file
 ├── veomni-gpu-to-npu/SKILL.md # Migrate an existing GPU model to Ascend NPU
 ├── veomni-new-op/SKILL.md     # Add a new kernel/operator
 ├── veomni-uv-update/SKILL.md  # Dependency management with uv

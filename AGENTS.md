@@ -33,7 +33,7 @@ Read on demand:
 - **Search Before You Act**: On unexpected behavior, search codebase + check constraints + review `git log` before attempting fixes.
 - **Planning Discipline**: Complex tasks (multi-file, >30 min) -> write a plan with the agent's todo/plan tool. The plan must state which skills will be used (e.g. `/veomni-develop` + `/veomni-review`). Simple tasks -> just do them.
 - **Cross-modality Awareness**: Changes in shared code (`BaseTrainer`, `data_collator`, `distributed/`) affect all modalities.
-- **Standalone HF Modeling**: HF-derived models live in a single `veomni/models/transformers/<m>/modeling_<m>.py` file with `# Upstream-Module:` and `# Base-Transformers-Version:` headers. Use `scripts/sync_hf_modeling.py` (`init` / `diff` / `check` / `merge`) to inspect upstream diffs or upgrade `transformers`.
+- **Standalone HF Modeling**: HF-derived models live in a single `veomni/models/transformers/<m>/modeling_<m>.py` file with `# Upstream-Module:` and `# Base-Transformers-Version:` headers.
 
 ---
 
@@ -60,7 +60,6 @@ source .venv/bin/activate
 make style             # ruff fix + format
 make quality           # ruff check (CI gate)
 make commit            # style + quality
-make check-hf-modeling # verify HF modeling headers against transformers pin
 pytest tests/          # all tests
 pytest tests/<mod>/    # specific module
 ```

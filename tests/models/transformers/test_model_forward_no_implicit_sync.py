@@ -4,17 +4,16 @@ Runs each model's forward under ``torch.cuda.set_sync_debug_mode("warn")``
 and fails if any new implicit host<->device sync site shows up in
 first-party ``veomni/models/`` or ``veomni/ops/`` reached by that forward.
 
-``vendor/`` is ignored. ``generated/`` is still allowlisted by
-``(basename, qualname)``. Other first-party files use
+``vendor/`` is ignored. First-party files use
 ``(veomni-relative path, qualname)``.
 
 The principle — two axes
 ------------------------
 For each surfaced sync site, decide along two independent axes:
 
-  1. **Owner** — VeOmni-patched (the line appears in the patchgen ``.diff``)
-     vs HF-verbatim (the line is unchanged from upstream HF, even though it
-     lives inside generated/).
+  1. **Owner** — VeOmni-patched (the line differs from the upstream model)
+     vs HF-verbatim (the line is unchanged from upstream HF, in the
+     standalone modeling file).
   2. **Path** — production (code runs every real training/inference step,
      no override above it) vs eager-only fallback (code only runs under a
      specific dev/fallback setting; production bypasses it via a ``VeomniOp``
@@ -24,8 +23,7 @@ The rule:
 
   - Production-path + VeOmni-patched  →  fix the patch (derive host-side,
     precompute in the collator, etc.).
-  - Production-path + HF-verbatim     →  add an ``override_method`` patch
-    and fix there (now becomes ours). **Don't leave a production sync in
+  - Production-path + HF-verbatim     →  fix the local modeling method. **Don't leave a production sync in
     just because the line originated upstream** — that's an unreasonable
     cost in our hot path.
   - Eager-only fallback + HF-verbatim (production bypasses via ``VeomniOp``/
@@ -73,9 +71,9 @@ backend for MoE cases.
 When a new model's first run surfaces sync sites, classify each per the
 two-axis rule above:
 
-- VeOmni-patched line (appears in the patchgen ``.diff``) → fix the patch.
+- VeOmni-specific line → fix the local implementation.
 - HF-verbatim line on a production path (code runs unconditionally, no
-  VeOmni override above) → add an ``override_method`` patch to fix it;
+  VeOmni override above) → fix the local modeling method;
   in the meantime allowlist with ``"HF-prod-pending-fix: ..."`` and
   reference the follow-up.
 - HF-verbatim line on an eager-only fallback path that production
@@ -83,9 +81,9 @@ two-axis rule above:
   dispatches to the fused MoE op) → allowlist with
   ``"HF-eager-only: ..."``.
 
-The allowlist is keyed by ``(generated-file, function qualname)``: each
+The allowlist is keyed by ``(veomni-relative path, function qualname)``: each
 sync warning's line number is resolved to its enclosing function via AST,
-so a ``make patchgen`` that shifts lines does **not** rot the gate. Dead
+so edits that shift lines preserve the key. Dead
 allowlist entries (a function that no longer issues a sync) still fail
 the test, so a landed fix can't silently leave a stale entry behind.
 """
@@ -151,8 +149,8 @@ def _scope_deterministic_backend_flags():
 # ``_forward_cases.py``. Eager-MoE cases stay absent because production uses
 # the fused expert op; the three fused cases above cover that path.
 
-# Acknowledged sync sites in generated/. Keyed by ``ForwardCase.case_id``;
-# value maps ``(basename, lineno)`` -> one-line reason.
+# Acknowledged sync sites in first-party code. Keyed by ``ForwardCase.case_id``;
+# value maps ``(veomni-relative path, qualname)`` -> one-line reason.
 #
 # Reasons MUST start with one of the category tags below — see the
 # module docstring's "principle" section for the two-axis triage. The
@@ -203,9 +201,9 @@ _ALG_ESSENTIAL_VL_GET_ROPE_INDEX = (
     "variable-shape mrope algorithm. Clean fix is to precompute position_ids in the data "
     "transform and skip the call; out-of-scope for this PR."
 )
-# Keyed by ``(generated-file basename, enclosing-function qualname)`` — NOT a
+# Keyed by ``(veomni-relative path, enclosing-function qualname)`` — NOT a
 # raw line number. The qualname is resolved from the sync warning's line via
-# AST (`_enclosing_qualname`), so patchgen line shifts no longer rot the
+# AST (`_enclosing_qualname`), so line shifts no longer rot the
 # allowlist, and each entry reads as the function it accepts. One entry
 # therefore covers *all* the sync sites inside that function.
 _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
@@ -419,7 +417,7 @@ def _def_spans(path: str) -> tuple[tuple[int, int, str], ...]:
 
     AST-parsed once per file (lru_cached). Used to map a sync warning's raw
     line number onto the *qualified name* of the function/method that
-    contains it — a key that survives patchgen line shifts, unlike the line
+    contains it — a key that survives line shifts, unlike the line
     number itself.
     """
     with open(path, encoding="utf-8") as f:
@@ -637,8 +635,7 @@ def test_no_implicit_sync_in_generated_forward(case):
     allowed = _ALLOWED_SYNCS.get(case.case_id, {})
 
     # Resolve each watched sync warning to the *qualified name* of the
-    # function it fired in. generated/ keys stay ``(basename, qualname)``;
-    # other first-party files use the veomni-relative path.
+    # function it fired in and its veomni-relative path.
     observed: dict[tuple[str, str], tuple[int, str]] = {}
     for f, ln, msg in captured:
         key = _sync_site_key(f, ln)
@@ -662,7 +659,7 @@ def test_no_implicit_sync_in_generated_forward(case):
                 f"{len(offending)} new implicit CUDA sync site(s) in first-party veomni/models or veomni/ops:\n"
                 f"{formatted}\n"
                 f"Each entry is the function the sync fires in. Triage along two axes (owner + path):\n"
-                f"  1. Run `python scripts/sync_hf_modeling.py diff <model>` to compare against upstream HF.\n"
+                f"  1. Compare the flagged call site with the corresponding upstream HF module.\n"
                 f"     Code is *added/modified by VeOmni* -> ours.\n"
                 f"     Code is *unchanged from HF* -> HF-verbatim.\n"
                 f"  2. Check whether the code is on the production path or only on an\n"
@@ -670,14 +667,14 @@ def test_no_implicit_sync_in_generated_forward(case):
                 f"Then act:\n"
                 f"  - Production + VeOmni-patched -> fix the patch (derive host-side,\n"
                 f"    precompute in the collator).\n"
-                f"  - Production + HF-verbatim -> add an override_method patch and fix\n"
-                f"    there. Don't leave a production sync in because it came from upstream.\n"
+                f"  - Production + HF-verbatim -> fix the local modeling method\n"
+                f"    to avoid the production sync.\n"
                 f"    In the meantime, allowlist with reason 'HF-prod-pending-fix: ...'.\n"
                 f"  - Eager-only fallback + HF-verbatim -> allowlist with reason\n"
                 f"    'HF-eager-only: ...'.\n"
                 f"  - Public entry that must read GPU metadata when the collator did not\n"
                 f"    precompute it -> allowlist with reason 'public-entry-fallback: ...'.\n"
-                f"Add the (basename-or-relpath, qualname) to _ALLOWED_SYNCS[{case.case_id!r}] with the\n"
+                f"Add the (veomni-relative path, qualname) to _ALLOWED_SYNCS[{case.case_id!r}] with the\n"
                 f"appropriate tag prefix."
             )
         if dead:
@@ -887,7 +884,7 @@ def test_no_implicit_sync_in_packed_deepseek_v4_fast_path():
         raise AssertionError("\n\n".join(problems))
 
 
-# MiniMax H3 (native diffusion model, not generated/): gate a training step through the
+# MiniMax H3 (native diffusion model): gate a training step through the
 # ordinary condition/model interface, single-sample and packed, with inputs already on
 # device as ``DiTTrainer.preforward`` leaves them. Keyed by ``(basename, qualname)``.
 _H3_CONDITION_SYNC = (

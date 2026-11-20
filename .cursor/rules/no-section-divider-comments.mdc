@@ -28,6 +28,5 @@ These add visual noise without value. If code needs grouping, use module-level o
 
 `veomni/models/transformers/*/modeling_*.py` files are exempt. There, inline
 `# --- Patch.N ---` markers and `[MODIFIED CLASS]` / `[PATCHED FUNCTION]` banners
-help distinguish VeOmni customizations from the upstream HuggingFace source
-during `scripts/sync_hf_modeling.py diff` and 3-way merges.
+help distinguish VeOmni customizations from the upstream HuggingFace source.
 See `.agents/skills/veomni-new-model/SKILL.md`.

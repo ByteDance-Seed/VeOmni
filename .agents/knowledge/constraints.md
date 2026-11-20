@@ -18,7 +18,7 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
      only when loading the upstream HuggingFace class without VeOmni model kernels.
 
 3. **Standalone HF-derived modeling files carry upstream tracking headers**
-   - Every HuggingFace-derived model under `veomni/models/transformers/<m>/` ships a single, self-contained `modeling_<m>.py` file with `# Upstream-Module: transformers.models.<m>.modeling_<m>` and `# Base-Transformers-Version: 5.16.1` headers (validated by `scripts/sync_hf_modeling.py check --strict-version` / `make check-hf-modeling`).
+   - Every HuggingFace-derived model under `veomni/models/transformers/<m>/` ships a single, self-contained `modeling_<m>.py` file with `# Upstream-Module: transformers.models.<m>.modeling_<m>` and `# Base-Transformers-Version: 5.16.1` headers.
    - Do not split HF-derived models into separate `_gpu` and `_npu` files. Use instance-local `VeomniOp` handles (`veomni/ops/registry.py`) for accelerator dispatch, and gate rare structural NPU-only differences explicitly with `IS_NPU_AVAILABLE` (never `not IS_CUDA_AVAILABLE`, which breaks ROCm and MLU).
 
 4. **Transformers version: pinned to v5.16.1**
@@ -32,7 +32,6 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
      gates (for HF APIs newer than the current pin) — do **not** add new
      version gates for versions `<= 5.16.1` (the legacy `>= 5.0.0` …
      `>= 5.15.x` interval is dead code).
-   - When upgrading `transformers`, preserve the old source tree, install the new version, and run `python scripts/sync_hf_modeling.py merge --old-hf-root <old-hf>` to 3-way merge upstream changes across all HF-derived `modeling_<m>.py` files.
 
 ## Distributed Training
 

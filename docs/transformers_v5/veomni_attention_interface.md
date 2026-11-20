@@ -418,8 +418,7 @@ Before enabling `attn_implementation: flex_attention` for a new model:
    those in `MODEL_CONFIG_REGISTRY` and `MODEL_PROCESSOR_REGISTRY` as well.
    Import the model package from `veomni.models.transformers` so every
    module-level registration runs at import time.
-5. Run `make check-hf-modeling`, review `python scripts/sync_hf_modeling.py diff <model>`,
-   and add model-level tests for registry routing, native BlockMask
+5. Add model-level tests for registry routing, native BlockMask
    type/visibility, forward/backward parity, packing, and Ulysses where
    supported.
 

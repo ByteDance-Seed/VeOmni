@@ -13,7 +13,7 @@ Each skill is a folder containing a `SKILL.md` with YAML frontmatter:
 ├── veomni-debug/
 │   └── SKILL.md
 ├── veomni-new-model/
-│   └── SKILL.md          # full migration workflow + HF modeling sync
+│   └── SKILL.md          # full model integration workflow
 ├── veomni-seed-omni/
 │   ├── SKILL.md          # the spine: SeedOmni graph & module workflow
 │   └── references/       # loaded on demand, per concern

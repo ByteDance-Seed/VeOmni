@@ -6,8 +6,7 @@
 
 > **Scope note:** VeOmni pins `transformers==5.16.1` and ships standalone,
 > multi-backend modeling files at
-> `veomni/models/transformers/<model>/modeling_<model>.py` (bootstrapped and
-> synced via `scripts/sync_hf_modeling.py`). The runtime monkey-patch flow this
+> `veomni/models/transformers/<model>/modeling_<model>.py`. The runtime monkey-patch flow this
 > document was originally written for has been retired. The high-level
 > checklists (registration, parallel plan, multimodal data transform, trainer
 > wiring, tests) still apply, with the modeling adaptations living directly in
@@ -44,9 +43,7 @@ Before writing any VeOmni code, answer:
 ```bash
 mkdir veomni/models/transformers/your_model_name/
 touch veomni/models/transformers/your_model_name/__init__.py
-python scripts/sync_hf_modeling.py init \
-    transformers.models.your_model_name.modeling_your_model_name \
-    -o veomni/models/transformers/your_model_name/modeling_your_model_name.py
+touch veomni/models/transformers/your_model_name/modeling_your_model_name.py
 # For complex models, also add:
 touch veomni/models/transformers/your_model_name/configuration_your_model_name.py  # if config fix needed
 touch veomni/models/transformers/your_model_name/processing_your_model_name.py    # if multimodal
@@ -105,9 +102,7 @@ from . import (
 Adapt `veomni/models/transformers/<model>/modeling_<model>.py` directly:
 replace `PreTrainedModel` with `VeOmniPreTrainedModel`, wire instance-local
 `VeomniOp` handles (`self.config.ops_config`), and keep `# Upstream-Module:` /
-`# Base-Transformers-Version:` headers intact. Inspect your exact diff against
-upstream HF with `python scripts/sync_hf_modeling.py diff <model>`, and verify
-with `make check-hf-modeling`. See the `/veomni-new-model` skill for the
+`# Base-Transformers-Version:` headers intact. See the `/veomni-new-model` skill for the
 complete workflow.
 
 ### Step 5: Define Expert Parallelism Plan (`parallel_plan.py`, MoE only)

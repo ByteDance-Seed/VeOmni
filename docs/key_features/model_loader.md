@@ -28,7 +28,7 @@ Users can directly load models from HuggingFace and start the training process b
 ### 1. Create Your Model Implementation
 
 Create a model package under `veomni/models/transformers/` with a standalone
-`modeling_<model>.py` bootstrapped via `scripts/sync_hf_modeling.py init` and
+`modeling_<model>.py` and
 instance-local `VeomniOp` handles.
 
 

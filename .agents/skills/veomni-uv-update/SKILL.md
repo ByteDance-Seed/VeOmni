@@ -129,7 +129,7 @@ transformers is pinned by the `transformers-stable` dependency group
 listed in `[tool.uv] default-groups` so `uv sync` installs it automatically.
 
 **Bump within v5** (e.g. 5.2.0 → 5.3.0):
-1. Keep an independent copy of the current `transformers` source for the merge base, then edit the pinned version in `[dependency-groups] transformers-stable`.
+1. Edit the pinned version in `[dependency-groups] transformers-stable`.
 2. Regenerate lockfile and sync:
 
 ```bash
@@ -137,13 +137,7 @@ uv lock
 uv sync --extra gpu --dev
 ```
 
-3. Run the 3-way merge helper across all HF-derived `modeling_<m>.py` modules
-   using the old `transformers` checkout/site-packages root, resolve any
-   conflict markers, and audit signature drift:
-   ```bash
-   python scripts/sync_hf_modeling.py merge --old-hf-root <path-to-old-transformers>
-   make check-hf-modeling
-   ```
+3. Check the local model implementations against the new Transformers APIs.
    Forward-looking guards may be expressed with
    `is_transformers_version_greater_or_equal_to()` from
    `veomni/utils/import_utils.py`.
