@@ -1,4 +1,4 @@
-# MiniMax-H3-Image inference and T2I fine-tuning
+# MiniMax-H3-Image inference and fine-tuning
 
 MiniMax-H3-Image is the image-generation member of the MiniMax-H3 family.
 It reuses the H3 text encoder and the H3 diffusion transformer without the
@@ -68,7 +68,7 @@ image.save("edit.png")
 ## Text-to-image fine-tuning
 
 The online and offline paths support `micro_batch_size: 1` and `ulysses_size: 1`.
-They follow the public [DiffSynth fine-tuning recipe](https://github.com/modelscope/DiffSynth-Studio/blob/fc8b4be56759de06cac585929f608227ac58766b/examples/minimax_h3_image/model_training/full/MiniMax-H3-Image.sh): the DiT learns a flow-matching target while the six released PDD heads remain frozen. Each training sigma selects the nearest release head, excluding the terminal zero. Both paths sample fresh noise and timesteps during training. The text encoder and VAE stay frozen: offline training reads their cached outputs; online training encodes each raw image/prompt before its DiT update. This is fine-tuning, not a reproduction of the original PDD distillation. Training currently covers T2I only; reference-image editing training and packed batches are outside this example.
+They follow the public [DiffSynth fine-tuning recipe](https://github.com/modelscope/DiffSynth-Studio/blob/fc8b4be56759de06cac585929f608227ac58766b/examples/minimax_h3_image/model_training/full/MiniMax-H3-Image.sh): the DiT learns a flow-matching target while the six released PDD heads remain frozen. Each training sigma selects the nearest release head, excluding the terminal zero. Both paths sample fresh noise and timesteps during training. The text encoder and VAE stay frozen: offline training reads their cached outputs; online training encodes each raw image/prompt before its DiT update. This is fine-tuning, not a reproduction of the original PDD distillation. Both T2I and reference-image editing train one sample per microbatch; multi-sample packing and Ulysses SP remain separate work.
 
 ### Prepare weights and data
 
@@ -121,6 +121,22 @@ NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_
 ```
 
 Both training configs use `dataset_repeat: true` and can run more updates by increasing `train.max_steps`. Set `train.checkpoint.save_steps` to save training checkpoints during a longer run. The online example uses its own output directory, `output/minimax_h3_image_t2i_online_sft`.
+
+## Reference-image editing fine-tuning
+
+The editing configs use the same prepared transformer as T2I. Supply `dataset/minimax_h3_image_edit/metadata.csv` with columns `image,prompt,reference_images`. `image` is the target image; `reference_images` is a JSON array of one or more reference-image paths, even when there is only one reference. Paths are relative to `dataset/minimax_h3_image_edit`. In CSV, double the JSON quotes, for example `"[""source.png""]"` for one reference. Use trusted image files and cache only data you trust. No editing dataset is bundled.
+
+For each sample, the reference images appear in the Qwen3-VL text presentation and as VAE latents in the DiT's `[text | references | target]` sequence. Reference resizing matches inference; cached reference latents use posterior modes. The DiT applies the same 0.999 reference timestep as inference, supervises only the target image rows, and excludes reference rows from the MSE. The six PDD heads still follow the nearest-timestep SFT objective, not original PDD distillation.
+
+The offline path caches text, target latents, and reference latents before training. The online path encodes them at every step:
+
+```shell
+NPROC_PER_NODE=1 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_i2i_embedding.yaml
+NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_i2i_offline.yaml
+NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_i2i_online.yaml
+```
+
+The default eight-rank smoke runs require at least eight editing examples, with one row per data-parallel rank. Set a positive `train.checkpoint.save_steps` for longer runs. Each reference adds text and DiT tokens as well as VAE encoding work; size the device memory for the reference count and resolution. Full-parameter released-checkpoint editing training has not been validated on GPU or NPU.
 
 ## Notes
 

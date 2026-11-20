@@ -206,6 +206,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         image_inputs=None,
         image_training_target=None,
         image_loss_weight=None,
+        image_num_reference_rows=0,
         **kwargs,
     ) -> MiniMaxH3DiTOutput:
         """Forward pass with unpatchify + negation + internal loss computation.
@@ -225,6 +226,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             ):
                 raise ValueError("H3-Image SFT requires image inputs, a PDD step index, a target, and a loss weight.")
             predictions = -self.forward_image(**image_inputs)
+            predictions = predictions[image_num_reference_rows:]
             if predictions.shape != image_training_target.shape:
                 raise ValueError("H3-Image predictions and target rows must have the same shape.")
             loss = torch.nn.functional.mse_loss(predictions.float(), image_training_target.float())

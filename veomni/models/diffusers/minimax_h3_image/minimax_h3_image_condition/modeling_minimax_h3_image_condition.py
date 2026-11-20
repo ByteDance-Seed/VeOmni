@@ -20,8 +20,10 @@ from ..layout import (
     DEFAULT_SIGMAS,
     MINIMAX_H3_IMAGE_TAG,
     MINIMAX_H3_TEXT_TAG,
+    REFERENCE_NOISE_AUG,
     build_image_packed_sequence,
     patchify_image_latents,
+    resize_reference,
 )
 from ..minimax_h3_image_vae.configuration_minimax_h3_image_vae import MiniMaxH3ImageVAEConfig
 from ..minimax_h3_image_vae.modeling_minimax_h3_image_vae import MiniMaxH3ImageVAE
@@ -238,8 +240,8 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
         return prompt_embeds.unsqueeze(0), torch.tensor(token_tags, dtype=torch.long)
 
     @torch.no_grad()
-    def get_condition(self, inputs, images) -> dict[str, list[torch.Tensor]]:
-        """Encode one raw text-to-image sample for online training or offline caching."""
+    def get_condition(self, inputs, images, reference_images=None) -> dict[str, list[torch.Tensor]]:
+        """Encode one raw T2I or image-editing sample for training or caching."""
         if len(inputs) != 1 or len(images) != 1:
             raise ValueError("MiniMax-H3-Image training requires micro_batch_size=1.")
         if len(images[0]) != 1:
@@ -247,7 +249,13 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
         if self._vae is None:
             raise RuntimeError("MiniMax-H3-Image VAE is not loaded.")
 
-        prompt_embeds, text_token_tags = self.encode_text(inputs[0])
+        references = reference_images[0] if reference_images is not None else []
+        vae_references = [resize_reference(image, 1024, 2048) for image in references]
+        vision_references = [resize_reference(image, 1024, 1024) for image in references]
+        if vision_references:
+            prompt_embeds, text_token_tags = self.encode_text(inputs[0], reference_images=vision_references)
+        else:
+            prompt_embeds, text_token_tags = self.encode_text(inputs[0])
         image = images[0][0].convert("RGB")
         target_height, target_width = self.config.height, self.config.width
         width, height = image.size
@@ -265,11 +273,14 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
         latents = posterior.mode().float()
         latents_mean = latents.new_tensor(self._vae.config.latents_mean).view(1, -1, 1, 1)
         latents_std = latents.new_tensor(self._vae.config.latents_std).view(1, -1, 1, 1)
-        return {
+        condition = {
             "prompt_embeds": [prompt_embeds],
             "text_token_tags": [text_token_tags],
             "clean_latents": [(latents - latents_mean) / latents_std],
         }
+        if reference_images is not None:
+            condition["reference_latents"] = [self.encode_reference_images(vae_references, sample_posterior=False)]
+        return condition
 
     def rng_state_dict(self) -> dict[str, torch.Tensor]:
         """Save the training noise and timestep stream for checkpoint resume."""
@@ -279,28 +290,49 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
         self.generator.set_state(state["generator"])
 
     @torch.no_grad()
-    def process_condition(self, prompt_embeds, text_token_tags, clean_latents) -> dict:
-        """Prepare one cached text-to-image sample for flow-matching training."""
+    def process_condition(self, prompt_embeds, text_token_tags, clean_latents, reference_latents=None) -> dict:
+        """Prepare one cached T2I or edit sample for flow-matching training."""
         if len(prompt_embeds) != 1 or len(text_token_tags) != 1 or len(clean_latents) != 1:
             raise ValueError("MiniMax-H3-Image training requires micro_batch_size=1.")
 
         latents = clean_latents[0].float()
         latent_height, latent_width = latents.shape[-2:]
         device = latents.device
-        position_ids, token_tags, image_indices, text_indices, _ = self.build_layout(
-            text_token_tags[0].cpu(), [], latent_height, latent_width, _IMAGE_PATCH_SIZE
+        references = reference_latents[0] if reference_latents is not None else []
+        reference_grids = [(ref.shape[-2], ref.shape[-1]) for ref in references]
+        position_ids, token_tags, image_indices, text_indices, num_reference_rows = self.build_layout(
+            text_token_tags[0].cpu(), reference_grids, latent_height, latent_width, _IMAGE_PATCH_SIZE
         )
 
         step = torch.randint(_TRAINING_STEPS, (), generator=self.generator, device="cpu").item()
         sigma = self._training_sigmas[step].to(device)
         noise = torch.randn(latents.shape, generator=self.generator, device="cpu", dtype=torch.float32).to(device)
         noised_latents = (1.0 - sigma) * latents + sigma * noise
+        target_rows = patchify_image_latents(noised_latents.unsqueeze(2), _IMAGE_PATCH_SIZE)
+        if references:
+            reference_rows = []
+            for ref in references:
+                ref = ref.float()
+                ref_noise = torch.randn(ref.shape, generator=self.generator, device="cpu", dtype=torch.float32).to(
+                    device
+                )
+                noised_ref = REFERENCE_NOISE_AUG * ref + (1.0 - REFERENCE_NOISE_AUG) * ref_noise
+                reference_rows.append(patchify_image_latents(noised_ref.unsqueeze(2), _IMAGE_PATCH_SIZE))
+            target_rows = torch.cat([*reference_rows, target_rows])
+            unique_timesteps = torch.cat(
+                [latents.new_tensor([REFERENCE_NOISE_AUG]), self._training_model_times[step : step + 1].to(device)]
+            )
+            timestep_indices = torch.ones(position_ids.shape[0], dtype=torch.long, device=device)
+            timestep_indices[image_indices[:num_reference_rows]] = 0
+        else:
+            unique_timesteps = self._training_model_times[step : step + 1].to(device)
+            timestep_indices = torch.zeros(position_ids.shape[0], dtype=torch.long, device=device)
         return {
             "image_inputs": {
-                "x": patchify_image_latents(noised_latents.unsqueeze(2), _IMAGE_PATCH_SIZE),
+                "x": target_rows,
                 "prompt_embeds": prompt_embeds[0],
-                "unique_timesteps": self._training_model_times[step : step + 1].to(device),
-                "timestep_indices": torch.zeros(position_ids.shape[0], dtype=torch.long, device=device),
+                "unique_timesteps": unique_timesteps,
+                "timestep_indices": timestep_indices,
                 "token_tags": token_tags.to(device),
                 "position_ids": position_ids.to(device, torch.float32),
                 "image_indices": image_indices.to(device),
@@ -309,6 +341,7 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
             },
             "image_training_target": patchify_image_latents((noise - latents).unsqueeze(2), _IMAGE_PATCH_SIZE),
             "image_loss_weight": self._training_weights[step].to(device),
+            "image_num_reference_rows": num_reference_rows,
         }
 
     @torch.no_grad()
@@ -317,6 +350,7 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
         images: list[Image.Image],
         generator: torch.Generator | None = None,
         device: torch.device | None = None,
+        sample_posterior: bool = True,
     ) -> list[torch.Tensor]:
         """Encode edit references into normalized conditioning latents."""
         if self._vae is None:
@@ -335,7 +369,9 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
             pixels = pixels[..., : pixels.shape[-2] // ratio * ratio, : pixels.shape[-1] // ratio * ratio]
             pixels = (pixels.to(torch.float32).div(255.0) - pixel_mean) / pixel_std
             posterior = self._vae.encode(pixels, return_dict=False)[0]
-            if generator is not None and generator.device.type != device.type:
+            if not sample_posterior:
+                latents = posterior.mode()
+            elif generator is not None and generator.device.type != device.type:
                 noise = torch.randn(posterior.mean.shape, generator=generator, device="cpu", dtype=torch.float32).to(
                     device
                 )

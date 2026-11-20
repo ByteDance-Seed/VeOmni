@@ -6,12 +6,27 @@ import math
 
 import numpy as np
 import torch
+from PIL import Image, ImageOps
 
 
 MINIMAX_H3_IMAGE_TAG = 0
 MINIMAX_H3_TEXT_TAG = 1
 DEFAULT_SIGMAS = (1.0, 0.9675236940383911, 0.8875485062599182, 0.75, 0.5327739119529724, 0.23200887441635132, 0.0)
+REFERENCE_NOISE_AUG = 0.999
 _ROPE_SPATIAL_SCALE = 32
+
+
+def resize_reference(image: Image.Image, min_short_edge: int, max_short_edge: int) -> Image.Image:
+    """Match inference reference sizing for both training encoders."""
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    if min(image.size) < 32:
+        raise ValueError(f"A reference image needs at least 32 pixels on each side, got {image.size}.")
+    short_edge = min(image.size)
+    if min_short_edge <= short_edge <= max_short_edge:
+        return image
+    scale = (min_short_edge if short_edge < min_short_edge else max_short_edge) / short_edge
+    width, height = (max(32, round(size * scale / 32) * 32) for size in image.size)
+    return image.resize((width, height), Image.Resampling.BICUBIC)
 
 
 def patchify_image_latents(latents: torch.Tensor, patch_size: tuple[int, int, int]) -> torch.Tensor:

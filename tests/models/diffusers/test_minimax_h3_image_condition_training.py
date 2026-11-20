@@ -1,5 +1,6 @@
-"""CPU coverage for MiniMax-H3-Image offline text-to-image conditions."""
+"""CPU coverage for MiniMax-H3-Image text-to-image and editing conditions."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +10,11 @@ from PIL import Image
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
+from tests.models.tiny_configs import tiny_minimax_h3_config
 from veomni.data import build_data_transform
+from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
+    MiniMaxH3DiTModel,
+)
 from veomni.models.diffusers.minimax_h3_image.layout import unpatchify_image_rows
 from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition import modeling_minimax_h3_image_condition
 from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition.configuration_minimax_h3_image_condition import (
@@ -93,6 +98,99 @@ def test_t2i_raw_condition_round_trips_through_dit_cache(tmp_path, monkeypatch):
     offline_model = _condition_model(meta_init=True)
     assert offline_model.text_encoder is None and offline_model.vae is None
     assert offline_model.process_condition(**cached_batch)["image_inputs"]["x"].shape == (2, 8)
+
+
+def test_i2i_raw_condition_round_trips_through_dit_cache(tmp_path, monkeypatch):
+    for name in ("target.png", "first.png", "second.png"):
+        Image.new("RGB", (64, 32), 192).save(tmp_path / name)
+    transform = build_data_transform("minimax_h3_image_i2i", data_dir=str(tmp_path))
+    rows = transform(
+        {"image": "target.png", "prompt": "Make it blue", "reference_images": json.dumps(["first.png", "second.png"])},
+        source_name="example",
+    )
+    assert len(rows[0]["reference_images"]) == 2
+    assert rows[0]["images"][0].size == (64, 32)
+
+    model = _condition_model()
+    target_mode = torch.ones(1, 2, 2, 4)
+    model._vae = SimpleNamespace(
+        device=torch.device("cpu"),
+        config=SimpleNamespace(latents_mean=(0, 0), latents_std=(1, 1)),
+        encode=lambda pixels, return_dict: (SimpleNamespace(mode=lambda: target_mode),),
+    )
+
+    def encode_text(prompt, reference_images):
+        assert prompt == "Make it blue"
+        assert [image.size for image in reference_images] == [(2048, 1024)] * 2
+        return torch.ones(1, 3, 8), torch.tensor([1, 0, 1])
+
+    def encode_references(images, sample_posterior):
+        assert not sample_posterior
+        assert [image.size for image in images] == [(2048, 1024)] * 2
+        return [torch.ones(1, 2, 2, 4), torch.ones(1, 2, 4, 2)]
+
+    monkeypatch.setattr(model, "encode_text", encode_text)
+    monkeypatch.setattr(model, "encode_reference_images", encode_references)
+    cached = model.get_condition(**DiTDataCollator()(rows))
+    assert [ref.shape for ref in cached["reference_latents"][0]] == [(1, 2, 2, 4), (1, 2, 4, 2)]
+    state = model.rng_state_dict()
+    online = model.process_condition(**cached)
+    assert online["image_num_reference_rows"] == 4
+    assert online["image_inputs"]["x"].shape == (6, 8)
+    assert online["image_training_target"].shape == (2, 8)
+    torch.testing.assert_close(
+        online["image_inputs"]["timestep_indices"][online["image_inputs"]["image_indices"]],
+        torch.tensor([0, 0, 0, 0, 1, 1]),
+    )
+    torch.testing.assert_close(online["image_inputs"]["unique_timesteps"][0], torch.tensor(0.999))
+
+    import veomni.distributed.parallel_state as parallel_state
+
+    monkeypatch.setattr(parallel_state, "get_parallel_state", lambda: SimpleNamespace(dp_rank=0, dp_size=1))
+    saver = OfflineEmbeddingSaver(str(tmp_path), dataset_length=1)
+    saver.save(DiTTrainer._unpack_dict_of_list(cached)[0])
+    dataset = load_dataset("parquet", data_files=str(tmp_path / "rank_0_shard_0.parquet"), split="train")
+    offline_batch = DiTDataCollator()(build_data_transform("dit_offline")(dataset[0]))
+    offline_model = _condition_model(meta_init=True)
+    offline_model.load_rng_state_dict(state)
+    torch.testing.assert_close(offline_model.process_condition(**offline_batch), online, rtol=0, atol=0)
+
+
+def test_i2i_requires_references_and_uses_deterministic_posterior(tmp_path):
+    Image.new("RGB", (32, 32)).save(tmp_path / "target.png")
+    transform = build_data_transform("minimax_h3_image_i2i", data_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="reference_images"):
+        transform({"image": "target.png", "prompt": "Edit it", "reference_images": "[]"}, source_name="example")
+
+    model = _condition_model()
+    model._vae = SimpleNamespace(
+        device=torch.device("cpu"),
+        spatial_compression_ratio=16,
+        config=SimpleNamespace(latents_mean=(0, 0), latents_std=(1, 1)),
+        encode=lambda pixels, return_dict: (SimpleNamespace(mode=lambda: torch.ones(1, 2, 2, 2)),),
+    )
+    state = model.rng_state_dict()
+    reference = model.encode_reference_images([Image.new("RGB", (32, 32))], sample_posterior=False)
+    torch.testing.assert_close(reference[0], torch.ones(1, 2, 2, 2))
+    torch.testing.assert_close(model.rng_state_dict(), state, rtol=0, atol=0)
+
+
+def test_i2i_condition_trains_tiny_transformer():
+    condition = _condition_model(meta_init=True)
+    cached = _cached_batch()
+    cached["prompt_embeds"] = [torch.zeros(1, 3, 8)]
+    cached["reference_latents"] = [[torch.ones(1, 2, 2, 4)]]
+    batch = condition.process_condition(**cached)
+    config = tiny_minimax_h3_config(
+        audio_enabled=False, num_pdd_heads=6, image_training=True, patch_size=(1, 2, 2), text_dim=8
+    )
+    config._set_ops_implementation(eager_ops_config())
+    model = MiniMaxH3DiTModel(config)
+    output = model(**batch)
+    assert output.predictions[0].shape == batch["image_training_target"].shape
+    assert torch.isfinite(output.loss["mse_image"])
+    output.loss["mse_image"].backward()
+    assert torch.count_nonzero(model.dit.video_patch_proj.weight.grad) > 0
 
 
 @pytest.mark.parametrize(

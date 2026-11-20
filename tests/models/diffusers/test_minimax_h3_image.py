@@ -151,6 +151,29 @@ def test_minimax_h3_image_training_updates_backbone_through_frozen_head():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_image_edit_training_excludes_reference_rows_from_loss():
+    torch.manual_seed(0)
+    config = tiny_minimax_h3_config(audio_enabled=False, num_pdd_heads=6, image_training=True)
+    config._set_ops_implementation(eager_ops_config())
+    model = MiniMaxH3DiTModel(config)
+    inputs = {**_image_inputs(), "pdd_step_index": 2}
+    target = torch.randn(2, inputs["x"].shape[-1])
+    with torch.no_grad():
+        raw_prediction = model.forward_image(**inputs)
+        expected = (-raw_prediction[2:] - target).square().mean()
+    output = model(
+        image_inputs=inputs,
+        image_training_target=target,
+        image_loss_weight=torch.tensor(1.0),
+        image_num_reference_rows=2,
+    )
+    torch.testing.assert_close(output.predictions[0], -raw_prediction[2:])
+    torch.testing.assert_close(output.loss["mse_image"], expected)
+    output.loss["mse_image"].backward()
+    assert torch.count_nonzero(model.dit.video_patch_proj.weight.grad) > 0
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_minimax_h3_image_forward_rejects_sequence_parallel(monkeypatch):
     from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_dit
 
