@@ -34,16 +34,8 @@ from tests.models.tiny_configs import tiny_deepseek_v3_config as _tiny_config
 
 
 def _dsv3_cls():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.deepseek_v3.generated.patched_modeling_deepseek_v3_npu import (
-            DeepseekV3ForCausalLM,
-        )
-    else:
-        from veomni.models.transformers.deepseek_v3.generated.patched_modeling_deepseek_v3_gpu import (
-            DeepseekV3ForCausalLM,
-        )
     return DeepseekV3ForCausalLM
 
 

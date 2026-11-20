@@ -15,27 +15,17 @@
 """SeedOss modeling that calls local ``VeomniOp`` handles."""
 
 from veomni.models.registry import MODELING_REGISTRY
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 @MODELING_REGISTRY.register("seed_oss")
 def register_seed_oss_modeling(architecture: str):
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_seed_oss_npu import (
-            SeedOssForCausalLM,
-            SeedOssForQuestionAnswering,
-            SeedOssForSequenceClassification,
-            SeedOssForTokenClassification,
-            SeedOssModel,
-        )
-    else:
-        from .generated.patched_modeling_seed_oss_gpu import (
-            SeedOssForCausalLM,
-            SeedOssForQuestionAnswering,
-            SeedOssForSequenceClassification,
-            SeedOssForTokenClassification,
-            SeedOssModel,
-        )
+    from .modeling_seed_oss import (
+        SeedOssForCausalLM,
+        SeedOssForQuestionAnswering,
+        SeedOssForSequenceClassification,
+        SeedOssForTokenClassification,
+        SeedOssModel,
+    )
 
     if "ForCausalLM" in architecture:
         return SeedOssForCausalLM

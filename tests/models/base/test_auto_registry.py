@@ -136,13 +136,22 @@ from veomni.utils.device import IS_NPU_AVAILABLE
 _CPU_LAUNCH = LaunchSpec(device="cpu")
 _ACCELERATOR_LAUNCH = LaunchSpec(device="accelerator")
 
-# Families whose MODELING_REGISTRY entry selects between *_npu and *_gpu generated modules
-# based on IS_NPU_AVAILABLE.
-_NPU_GENERATED_FAMILIES = frozenset(
+# Families whose MODELING_REGISTRY entry resolves from a standalone
+# ``veomni.models.transformers.<pkg>.modeling_<m>`` module.
+_STANDALONE_HF_FAMILIES = frozenset(
     {
         "deepseek_v3",
         "deepseek_v4",
+        "gemma3_text",
         "glm_moe_dsa",
+        "gpt_oss",
+        "llama",
+        "qwen2",
+        "qwen2_5_omni",
+        "qwen2_5_omni_thinker",
+        "qwen2_5_omni_text",
+        "qwen2_5_vl",
+        "qwen2_vl",
         "qwen3",
         "qwen3_5",
         "qwen3_5_text",
@@ -154,18 +163,22 @@ _NPU_GENERATED_FAMILIES = frozenset(
         "qwen3_omni_moe_text",
         "qwen3_vl",
         "qwen3_vl_moe",
+        "qwen4_exp",
         "seed_oss",
     }
 )
 
 
 def _assert_expected_generated_module_source(model_type: str, model_cls: type) -> None:
-    if model_type not in _NPU_GENERATED_FAMILIES:
+    if model_type not in _STANDALONE_HF_FAMILIES:
         return
-    expected_suffix = "_npu" if IS_NPU_AVAILABLE else "_gpu"
-    assert model_cls.__module__.endswith(expected_suffix), (
-        f"Expected {model_type} ({model_cls.__name__}) to resolve from a *{expected_suffix} module, "
-        f"got {model_cls.__module__!r}"
+    # Talker architectures on Omni models intentionally delegate to pristine HF.
+    if "Talker" in model_cls.__name__:
+        return
+    mod = model_cls.__module__
+    assert mod.startswith("veomni.models.transformers.") and ".modeling_" in mod and ".generated" not in mod, (
+        f"Expected {model_type} ({model_cls.__name__}) to resolve from a standalone "
+        f"veomni.models.transformers.<pkg>.modeling_<m> module, got {mod!r}"
     )
 
 
@@ -775,11 +788,7 @@ def _op_bindings(model, selected_path):
     return bindings
 
 
-@pytest.mark.launch_plan(
-    provider=lambda context: (
-        _ACCELERATOR_LAUNCH if context.params["model_case"].model_type in _NPU_GENERATED_FAMILIES else _CPU_LAUNCH
-    )
-)
+@pytest.mark.launch_plan(provider=_CPU_LAUNCH)
 @pytest.mark.parametrize(
     "model_case",
     [case for case in _MODEL_CASES if case.eager_ops],
@@ -980,7 +989,7 @@ def test_direct_generated_model_adapts_raw_hf_config_and_preserves_identity(tmp_
 
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.models.configuration_base import VeOmniPretrainedConfig
-    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
+    from veomni.models.transformers.llama.modeling_llama import LlamaForCausalLM
 
     config = LlamaConfig(
         vocab_size=32,

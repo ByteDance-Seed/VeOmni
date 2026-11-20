@@ -207,6 +207,13 @@ class SeedOmniOfflineCacheWriter:
 
     def finalize(self) -> None:
         self.flush()
+        if not _any_rank(self.rows_written > 0):
+            # A marker here would hand the next stage a "complete" cache with no rows,
+            # and make this directory refuse a rerun.
+            raise RuntimeError(
+                f"No rank wrote a row to {self.save_path}; not marking it complete. The dataset is likely "
+                "smaller than one step, or every sample was filtered out."
+            )
         distributed = dist.is_available() and dist.is_initialized()
         if distributed:
             dist.barrier()

@@ -51,20 +51,12 @@ AUDIO_TOKEN_ID = 122
 
 
 def _qwen3_omni_moe_classes():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeForConditionalGeneration,
+        Qwen3OmniMoeThinkerForConditionalGeneration,
+        Qwen3OmniMoeThinkerTextModel,
+    )
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3_omni_moe.generated.patched_modeling_qwen3_omni_moe_npu import (
-            Qwen3OmniMoeForConditionalGeneration,
-            Qwen3OmniMoeThinkerForConditionalGeneration,
-            Qwen3OmniMoeThinkerTextModel,
-        )
-    else:
-        from veomni.models.transformers.qwen3_omni_moe.generated.patched_modeling_qwen3_omni_moe_gpu import (
-            Qwen3OmniMoeForConditionalGeneration,
-            Qwen3OmniMoeThinkerForConditionalGeneration,
-            Qwen3OmniMoeThinkerTextModel,
-        )
     return (
         Qwen3OmniMoeForConditionalGeneration,
         Qwen3OmniMoeThinkerForConditionalGeneration,
@@ -228,7 +220,7 @@ def test_qwen3_omni_moe_vision_and_audio_attention_veomni_sdpa_matches_hf():
         Qwen3OmniMoeVisionAttention as HFQwen3OmniMoeVisionAttention,
     )
 
-    from veomni.models.transformers.qwen3_omni_moe.generated.patched_modeling_qwen3_omni_moe_gpu import (
+    from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import (
         Qwen3OmniMoeAudioAttention,
         Qwen3OmniMoeVisionAttention,
     )
