@@ -16,6 +16,7 @@ from veomni.distributed.parallel_state import get_parallel_state, is_parallel_st
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.utils import logging
 
+from ...minimax_h3.minimax_h3_core.flow_match_scheduler import FlowMatchScheduler
 from ..layout import (
     DEFAULT_SIGMAS,
     MINIMAX_H3_IMAGE_TAG,
@@ -70,13 +71,10 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
         self._tokenizer = None
         dp_rank = get_parallel_state().dp_rank if is_parallel_state_initialized() else 0
         self.generator = torch.Generator(device="cpu").manual_seed(config.seed + dp_rank)
-        base_sigmas = torch.linspace(1.0, 0.0, _TRAINING_STEPS + 1, device="cpu", dtype=torch.float32)[:-1]
-        self._training_sigmas = _TRAINING_SHIFT * base_sigmas / (1 + (_TRAINING_SHIFT - 1) * base_sigmas)
-        timesteps = self._training_sigmas * _TRAINING_STEPS
-        self._training_model_times = 1.0 - timesteps / _TRAINING_STEPS
-        weights = torch.exp(-2 * ((timesteps - _TRAINING_STEPS / 2) / _TRAINING_STEPS) ** 2)
-        weights = weights - weights.min()
-        self._training_weights = weights * (_TRAINING_STEPS / weights.sum())
+        self._scheduler = FlowMatchScheduler(shift=_TRAINING_SHIFT)
+        with torch.device("cpu"):
+            self._scheduler.set_timesteps(_TRAINING_STEPS, training=True)
+        self._training_model_times = 1.0 - self._scheduler.timesteps / _TRAINING_STEPS
         release_sigmas = torch.tensor(DEFAULT_SIGMAS[:-1], device="cpu", dtype=torch.float32)
         self._training_pdd_indices = ((1.0 - self._training_model_times[:, None]) - release_sigmas).abs().argmin(dim=1)
         if not config.skip_encoder_load:
@@ -288,11 +286,11 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
         latent_height, latent_width = latents.shape[-2:]
         device = latents.device
         position_ids, token_tags, image_indices, text_indices, _ = self.build_layout(
-            text_token_tags[0].cpu(), [], latent_height, latent_width, _IMAGE_PATCH_SIZE
+            text_token_tags[0], [], latent_height, latent_width, _IMAGE_PATCH_SIZE
         )
 
         step = torch.randint(_TRAINING_STEPS, (), generator=self.generator, device="cpu").item()
-        sigma = self._training_sigmas[step].to(device)
+        sigma = self._scheduler.sigmas[step].to(device)
         noise = torch.randn(latents.shape, generator=self.generator, device="cpu", dtype=torch.float32).to(device)
         noised_latents = (1.0 - sigma) * latents + sigma * noise
         return {
@@ -308,7 +306,7 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
                 "pdd_step_index": int(self._training_pdd_indices[step]),
             },
             "image_training_target": patchify_image_latents((noise - latents).unsqueeze(2), _IMAGE_PATCH_SIZE),
-            "image_loss_weight": self._training_weights[step].to(device),
+            "image_loss_weight": self._scheduler.linear_timesteps_weights[step].to(device),
         }
 
     @torch.no_grad()

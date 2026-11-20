@@ -425,6 +425,23 @@ def test_minimax_h3_image_layout_places_text_references_and_target():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_minimax_h3_image_layout_keeps_token_metadata_on_input_device(device):
+    tags = torch.tensor([1, 0, 1], device=device)
+    _, token_tags, image_indices, text_indices, references = build_image_packed_sequence(
+        tags, [(4, 4)], 8, 8, (1, 2, 2)
+    )
+    assert token_tags.device == tags.device
+    assert image_indices.device == tags.device
+    assert text_indices.device == tags.device
+    assert token_tags.shape == (23,)
+    assert references == 4
+    if device == "cpu":
+        torch.testing.assert_close(token_tags[:3], tags)
+        torch.testing.assert_close(token_tags[3:], torch.zeros(20, dtype=torch.long))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_minimax_h3_image_patchify_matches_unpatchify():
     latents = torch.randn(1, 24, 1, 8, 8)
     rows = patchify_image_latents(latents, (1, 2, 2))
