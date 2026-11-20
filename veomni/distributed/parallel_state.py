@@ -67,7 +67,6 @@ class ParallelState:
     pp_size: int = 1
     cp_size: int = 1
     ulysses_size: int = 1
-    allow_hybrid_cp: bool = False
     dp_mode: Literal["ddp", "fsdp2"] = "fsdp2"
     device_type: str = get_device_type()
     include_sp_in_fsdp: bool = True
@@ -78,6 +77,7 @@ class ParallelState:
     extra_parallel_flat_device_mesh: Dict[str, Optional["DeviceMesh"]] = field(default_factory=lambda: {"ep": None})
     async_enabled: Optional[bool] = False
     skip_sp_gather_between_modules: bool = False
+    allow_hybrid_cp: bool = False
 
     def __post_init__(self):
         if not isinstance(self.allow_hybrid_cp, bool):
@@ -503,7 +503,6 @@ def _init_parallel_state(
     pp_size: int = 1,
     cp_size: int = 1,
     ulysses_size: int = 1,
-    allow_hybrid_cp: bool = False,
     dp_mode: Literal["ddp", "fsdp2"] = "fsdp2",
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
@@ -515,6 +514,7 @@ def _init_parallel_state(
     name: Optional[str] = "base",
     npu_ep_hccl_buffer_mib: Optional[int] = None,
     npu_ep_hccl_expansion_mode: Optional[str] = None,
+    allow_hybrid_cp: bool = False,
 ) -> "ParallelState":
     """
     Initialize a parallel state, register it under ``name``, and set it as the

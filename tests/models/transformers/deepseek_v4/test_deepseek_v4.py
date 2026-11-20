@@ -38,12 +38,8 @@ from tests.models.tiny_configs import tiny_deepseek_v4_config as _tiny_config
 
 
 def _dsv4_module():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as gen
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as gen
-    else:
-        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gen
     return gen
 
 

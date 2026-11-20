@@ -26,8 +26,7 @@ from transformers import AutoConfig
 
 from tests.models.compare import eager_ops_config
 from veomni.models.configuration_base import as_veomni_config
-from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
-from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as npu_modeling
+from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as modeling
 from veomni.ops import resolve_op
 from veomni.ops.kernels.dsa.indexer.deepseek_v4 import cann as cann_indexer
 from veomni.ops.kernels.dsa.sparse_indices import CompressedCandidates, build_sparse_attention_indices
@@ -202,10 +201,13 @@ class _FakeCannOps:
         return torch.zeros(shape, dtype=torch.int32), torch.zeros(shape)
 
 
-@pytest.mark.parametrize("module", [modeling, npu_modeling], ids=["gpu", "npu"])
-def test_deepseek_v4_packed_indexer_op_receives_segments_cann_accepts(module, monkeypatch):
+@pytest.mark.parametrize("backend", ["gpu", "npu"])
+def test_deepseek_v4_packed_indexer_op_receives_segments_cann_accepts(backend, monkeypatch):
     """The packed CSA path hands the indexer op segment boundaries whose ranges CANN can mask."""
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
+
+    monkeypatch.setattr(modeling, "IS_NPU_AVAILABLE", backend == "npu")
+    module = modeling
 
     torch.manual_seed(13)
     config = _toy_config()
@@ -269,7 +271,7 @@ def test_deepseek_v4_npu_config_collator_preserves_packed_segments_for_model():
     seq_len = sum(lengths)
     assert batch["cu_seq_lens_q"].tolist() == [0, lengths[0], seq_len]
 
-    model = npu_modeling.DeepseekV4Model(_toy_config())
+    model = modeling.DeepseekV4Model(_toy_config())
     seen_slices = []
     for layer in model.layers:
 
@@ -388,9 +390,11 @@ def _packed_model_inputs(config, segment_lengths: tuple[int, ...]) -> dict[str, 
     }
 
 
-@pytest.mark.parametrize("module", [modeling, npu_modeling], ids=["gpu", "npu"])
-def test_deepseek_v4_packed_model_forward_skips_dense_mask(module, monkeypatch):
+@pytest.mark.parametrize("backend", ["gpu", "npu"])
+def test_deepseek_v4_packed_model_forward_skips_dense_mask(backend, monkeypatch):
     """Packed forwards hand the op segments and per-sample candidates, never an O(S^2) mask."""
+    monkeypatch.setattr(modeling, "IS_NPU_AVAILABLE", backend == "npu")
+    module = modeling
     torch.manual_seed(11)
     config = _toy_config()
     segment_lengths = (24, 40)

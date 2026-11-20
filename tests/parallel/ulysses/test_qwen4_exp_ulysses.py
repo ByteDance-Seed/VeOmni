@@ -41,9 +41,7 @@ _CUDA_ONLY = pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="This reference ca
 if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
     pytest.skip("Qwen4-Exp Ulysses tests require CUDA or Ascend", allow_module_level=True)
 
-_PATCHED_MODULE = "veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_" + (
-    "npu" if get_device_type() == "npu" else "gpu"
-)
+_PATCHED_MODULE = "veomni.models.transformers.qwen4_exp.modeling_qwen4_exp"
 _TOY_CONFIG = "tests/toy_config/qwen4_exp_toy"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
