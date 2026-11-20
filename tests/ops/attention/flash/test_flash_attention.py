@@ -608,10 +608,38 @@ def test_gpt_oss_attention_passes_learnable_sinks_through_hf_dict():
         ("veomni_flash_attention_3_hub", "kernels-community/flash-attn3"),
     ],
 )
-@pytest.mark.parametrize(("xpu", "expected_version"), [(False, 1), (True, 7)])
-def test_hub_flash_loader_requests_version_one_except_on_xpu(
-    monkeypatch, implementation, repository, xpu, expected_version
-):
+def test_hub_flash_loader_uses_pinned_kernels_artifact(monkeypatch, implementation, repository):
+    import sys
+
+    from veomni.ops import install as install_backend
+
+    calls = []
+    kernel = SimpleNamespace(flash_attn_func=object(), flash_attn_varlen_func=object())
+
+    def get_kernel(requested_repository, *, version):
+        calls.append((requested_repository, version))
+        return kernel
+
+    monkeypatch.setitem(sys.modules, "kernels", SimpleNamespace(get_kernel=get_kernel))
+    monkeypatch.setattr(install_backend, "IS_XPU_AVAILABLE", False)
+    install_backend._load_hub_flash_kernel.cache_clear()
+    try:
+        loaded = install_backend._load_veomni_local_flash_kernel(implementation)
+        assert loaded is kernel
+        assert install_backend._load_veomni_local_flash_kernel(implementation) is kernel
+        assert calls == [(repository, 1)]
+    finally:
+        install_backend._load_hub_flash_kernel.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("implementation", "repository"),
+    [
+        ("veomni_flash_attention_2_hub", "kernels-community/flash-attn2"),
+        ("veomni_flash_attention_3_hub", "kernels-community/flash-attn3"),
+    ],
+)
+def test_hub_flash_loader_requests_the_transformers_selected_version_on_xpu(monkeypatch, implementation, repository):
     import sys
 
     import transformers.integrations.hub_kernels as hub_kernels
@@ -626,14 +654,12 @@ def test_hub_flash_loader_requests_version_one_except_on_xpu(
         return kernel
 
     monkeypatch.setitem(sys.modules, "kernels", SimpleNamespace(get_kernel=get_kernel))
-    monkeypatch.setattr(install_backend, "IS_XPU_AVAILABLE", xpu)
+    monkeypatch.setattr(install_backend, "IS_XPU_AVAILABLE", True)
     monkeypatch.setattr(hub_kernels, "get_attn_kernel_version", lambda repo: 7 if repo == repository else -1)
     install_backend._load_hub_flash_kernel.cache_clear()
     try:
-        loaded = install_backend._load_veomni_local_flash_kernel(implementation)
-        assert loaded is kernel
         assert install_backend._load_veomni_local_flash_kernel(implementation) is kernel
-        assert calls == [(repository, expected_version)]
+        assert calls == [(repository, 7)]
     finally:
         install_backend._load_hub_flash_kernel.cache_clear()
 
