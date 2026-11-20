@@ -59,21 +59,37 @@ _CMP_SEGMENT_CAUSAL_MASK_MODE = 3
 _SFMLA_TOPK_WIDTHS = (512, 1024)
 
 
-def _check_selection_width(topk_indices: Tensor, compressed_len: int) -> None:
-    """Reject selections the kernel does not serve.
+def _selection_for_local_table(topk_indices: Tensor, compressed_len: int) -> Tensor:
+    """Return the selection columns this call serves, dropping producer padding.
 
-    The vendor wrapper pads anything at most 512 wide up to 512, so a selection
-    that spans the whole compressed table is served. A narrower selection is not:
-    on CANN 9.2.1 it returns nonfinite rows and a nonfinite ``q`` gradient once the
-    table is wider than the selection, which the parity case used to hit. Refuse it
-    here instead of letting the kernel produce NaNs.
+    A selection is served when it spans the whole compressed table or matches one of
+    the kernel widths: the vendor wrapper pads anything at most 512 wide up to 512,
+    so the short-table case (every row selected, ``-1`` after them) reaches the
+    kernel in the shape it was built for. A narrower selection is not: on CANN 9.2.1
+    it returns nonfinite rows and a nonfinite ``q`` gradient once the table is wider
+    than the selection, which the parity case used to hit.
+
+    Context parallelism narrows the compressed table to the local prefix while the
+    indexer pads its selection to the global width, so a rank can receive more
+    columns than it has rows. Those trailing columns are ``-1`` by construction;
+    trimming them restores the short-table shape above instead of rejecting a
+    selection the producer built correctly. A real index in them addresses a row
+    this call does not own, so that stays an error.
     """
     width = topk_indices.shape[-1]
-    if width not in _SFMLA_TOPK_WIDTHS and width != compressed_len:
+    if width in _SFMLA_TOPK_WIDTHS or width == compressed_len:
+        return topk_indices
+    if width < compressed_len:
         raise ValueError(
             "cann DeepSeek-V4 sparse attention needs the compressed selection to span the whole table "
             f"or be 512/1024 wide; got {width} indices over {compressed_len} compressed rows."
         )
+    if bool((topk_indices[..., compressed_len:] >= 0).any()):
+        raise ValueError(
+            "cann DeepSeek-V4 sparse attention received a selection wider than the compressed table this "
+            f"call serves ({width} indices over {compressed_len} rows) that selects a row past it."
+        )
+    return topk_indices[..., :compressed_len]
 
 
 def _standard_layout(x: Tensor) -> Tensor:
@@ -181,7 +197,7 @@ def _packed_context_parallel_call(
             )
             continue
         if segment_topk is not None:
-            _check_selection_width(segment_topk, available)
+            segment_topk = _selection_for_local_table(segment_topk, available)
         seg_q = _standard_layout(q[:, rows])
         seg_kv = _standard_layout(ori_kv[:, start:last].unsqueeze(2))
         seg_cmp = _standard_layout(cmp_kv[:, compressed_start : compressed_start + available].unsqueeze(2))
@@ -237,10 +253,11 @@ def wrapper(
     and KV alike. A prefix that ends inside the first compression window holds no
     compressed row at all; those queries run the eager row, since the kernel has
     no mask mode for an empty compressed table. It validates its own dtype,
-    window, ratio and head-size limits, and this adapter rejects a compressed
-    selection that neither spans the table nor matches the kernel's 512/1024
-    width. Packed calls without CP take the TND path, which needs batch size 1
-    and reads the slice boundaries on the host.
+    window, ratio and head-size limits, and this adapter trims the padding a
+    context-parallel call inherits from the producer's global selection width,
+    rejecting a selection that is narrower than the table or names a row past
+    it. Packed calls without CP take the TND path, which needs batch size 1 and
+    reads the slice boundaries on the host.
     """
     if attention_mask is not None or cmp_kv is None or cmp_kv.shape[1] == 0:
         return eager.wrapper(
@@ -332,7 +349,7 @@ def wrapper(
         segment_starts = _segment_compressed_starts(slices, compress_ratio, q.device)
         topk_indices = torch.where(topk_indices >= 0, topk_indices - segment_starts, -1)
     if topk_indices is not None:
-        _check_selection_width(topk_indices, cmp_kv.shape[1])
+        topk_indices = _selection_for_local_table(topk_indices, cmp_kv.shape[1])
 
     return npu_sparse_flash_mla(
         _standard_layout(q),
