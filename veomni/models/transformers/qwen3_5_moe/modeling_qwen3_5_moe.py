@@ -858,6 +858,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         else:
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
+        # Qwen3.5 expands heads for fla_npu. Qwen4-Exp also accepts grouped heads there.
         if self.veomni_chunk_gated_delta_rule.impl == "flash_qla" and not use_precomputed_states:
             # The FlashQLA kernel requires a tightly packed token stride after the QKV split.
             query = query.contiguous()

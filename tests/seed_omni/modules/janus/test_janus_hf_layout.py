@@ -237,6 +237,33 @@ def test_build_config_maps_the_upstream_config_per_module():
     assert text_encoder.build_config(disagreeing).tie_word_embeddings is True
 
 
+@pytest.mark.parametrize("serialization", ["safetensors", "bin"])
+def test_stored_head_uses_the_same_weight_file_as_the_loader(tmp_path, serialization):
+    """A stale shard index cannot override the single file selected by the loader."""
+    from veomni.models.checkpoint.weights import _load_state_dict
+    from veomni.models.seed_omni.utils.hf_layout import read_source_weight_files
+
+    embed_key = "model.language_model.embed_tokens.weight"
+    tensors = {embed_key: torch.zeros(2, 2), "lm_head.weight": torch.ones(2, 2)}
+    stale = {embed_key: torch.zeros(2, 2)}
+    if serialization == "safetensors":
+        single, shard, index = "model.safetensors", "model-00001-of-00001.safetensors", "model.safetensors.index.json"
+        save_file(tensors, tmp_path / single)
+        save_file(stale, tmp_path / shard)
+    else:
+        single, shard, index = "pytorch_model.bin", "pytorch_model-00001-of-00001.bin", "pytorch_model.bin.index.json"
+        torch.save(tensors, tmp_path / single)
+        torch.save(stale, tmp_path / shard)
+    (tmp_path / index).write_text(json.dumps({"weight_map": {embed_key: shard}}))
+
+    files = read_source_weight_files(str(tmp_path))
+    assert files == dict.fromkeys(tensors, single)
+    loaded = {key: value for iterator in _load_state_dict(str(tmp_path)) for key, value in iterator}
+    assert torch.equal(loaded["lm_head.weight"], tensors["lm_head.weight"])
+    config = JANUS_HF_LAYOUT.modules[TEXT_ENCODER].build_config(_janus_config(tied=False), str(tmp_path))
+    assert config.tie_word_embeddings is False
+
+
 def test_an_hf_root_resolves_to_a_weight_free_split_view(hf_root):
     root, _ = hf_root
     view = resolve_omni_checkpoint_root(root)
