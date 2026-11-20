@@ -79,6 +79,9 @@ class _RecordingGdnOp:
                 "q_shape": tuple(query.shape),
                 "k_shape": tuple(key.shape),
                 "v_shape": tuple(value.shape),
+                "q_contiguous": query.is_contiguous(),
+                "k_contiguous": key.is_contiguous(),
+                "v_contiguous": value.is_contiguous(),
                 "g_shape": tuple(g.shape),
                 "beta_shape": tuple(beta.shape),
                 "cu_seqlens": cu_seqlens,
@@ -255,6 +258,9 @@ def test_gdn_grouped_heads_dispatch_contract(
         assert call["q_shape"] == (1, expected_seq_len, expected_qk_heads, 8)
         assert call["k_shape"] == (1, expected_seq_len, expected_qk_heads, 8)
         assert call["v_shape"] == (1, expected_seq_len, local_v_heads, 8)
+        assert call["q_contiguous"] is True
+        assert call["k_contiguous"] is True
+        assert call["v_contiguous"] is True
         assert call["g_shape"] == (1, expected_seq_len, local_v_heads)
         assert call["beta_shape"] == (1, expected_seq_len, local_v_heads)
 

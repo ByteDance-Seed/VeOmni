@@ -720,7 +720,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Host-gated NPU kernels must follow the activation device. Unconditional
         # `.npu()` breaks CPU unit tests on Ascend hosts.
         if cu_seq_lens_q is not None and mixed_qkv.device.type == "npu":
-            cu_seq_lens_q = cu_seq_lens_q.npu()
+            cu_seq_lens_q = cu_seq_lens_q.to(mixed_qkv.device)
 
         if use_precomputed_states:
             # Modification: keep this disabled until FLA causal_conv1d_update decode path is validated.
@@ -775,6 +775,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         key = key.reshape(key.shape[0], key.shape[1], local_num_k_heads, self.head_k_dim)
         value = value.reshape(value.shape[0], value.shape[1], local_num_v_heads, self.head_v_dim)
 
+        # Contiguous-ify q/k/v before chunk_gated_delta_rule so views over mixed_qkv
+        # have tightly packed token strides (required by FlashQLA and non-GQA paths).
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+
         beta = b.sigmoid()
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         # Modification: slice A_log/dt_bias for local V-heads under Ulysses SP.
@@ -785,13 +791,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         else:
             g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
-        # Qwen3.5 expands heads for fla_npu. Qwen4-Exp also accepts grouped heads there.
-        if self.veomni_chunk_gated_delta_rule.impl == "flash_qla" and not use_precomputed_states:
-            # The FlashQLA kernel requires a tightly packed token stride after the QKV split.
-            query = query.contiguous()
-            key = key.contiguous()
-            value = value.contiguous()
-        elif self.num_v_heads // self.num_k_heads > 1:
+        # Model policy, not a row capability: fla_npu accepts grouped heads as well,
+        # but Qwen3.5 keeps the expanded layout; Qwen4-Exp opts in explicitly.
+        if self.num_v_heads // self.num_k_heads > 1 and not (
+            self.veomni_chunk_gated_delta_rule.impl == "flash_qla" and not use_precomputed_states
+        ):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
@@ -1867,8 +1871,8 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
             # --- Patch.1 ---
 
         if IS_NPU_AVAILABLE:
-            cu_seq_lens_q = kwargs.get("cu_seq_lens_q", None)
-            if cu_seq_lens_q is not None and "cu_seqlens_list_q" not in kwargs:
+            linear_cu_seq_lens_q = kwargs.get("linear_attn_cu_seq_lens_q", kwargs.get("cu_seq_lens_q", None))
+            if linear_cu_seq_lens_q is not None and "cu_seqlens_list_q" not in kwargs:
                 from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard.fla_npu import (
                     precompute_varlen_metadata,
                 )
@@ -1877,10 +1881,9 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
                 if get_parallel_state().sp_enabled:
                     num_v_heads //= get_parallel_state().sp_size
                 cu_seqlens_list, chunk_indices, chunk_indices_list = precompute_varlen_metadata(
-                    cu_seqlens=cu_seq_lens_q,
+                    cu_seqlens=linear_cu_seq_lens_q,
                     num_heads=num_v_heads,
                     chunk_size=64,
-                    device=inputs_embeds.device,
                 )
                 kwargs["cu_seqlens_list_q"] = cu_seqlens_list
                 kwargs["chunk_indices_q"] = chunk_indices
