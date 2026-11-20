@@ -121,6 +121,69 @@ def test_minimax_h3_image_forward_backpropagates_to_image_and_text_rows(checkpoi
     assert len(forward_calls) == (2 if checkpointing else 1)
 
 
+def _run_minimax_h3_image_fsdp_forward(rank, weights_path, rendezvous):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+    from torch.distributed._composable.fsdp import fully_shard
+
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.arguments import MixedPrecisionConfig
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.torch_parallelize import build_parallelize_model
+    from veomni.models.auto import build_foundation_model
+
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", store=rendezvous.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    try:
+        state = _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")
+        torch.manual_seed(42)
+        model = _build_model().eval()
+        reference = _build_model().eval()
+        reference.load_state_dict(model.state_dict())
+        inputs = _image_inputs()
+        with torch.no_grad():
+            expected = reference.forward_image(**inputs, pdd_step_index=0)
+
+        for block in model.dit.blocks:
+            fully_shard(block, mesh=state.fsdp_mesh)
+        fully_shard(model.dit, mesh=state.fsdp_mesh)
+        with torch.no_grad():
+            actual = model.forward_image(**inputs, pdd_step_index=0)
+
+        assert "forward_image" in model.dit.__dict__
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        if rank == 0:
+            save_file(reference.dit.state_dict(), str(weights_path / "model.safetensors"))
+        dist.barrier()
+        production = build_foundation_model(
+            _tiny_config(), init_device="meta", torch_dtype="float32", ops_implementation=make_eager_ops_config()
+        )
+        production = build_parallelize_model(
+            production,
+            weights_path=str(weights_path),
+            init_device="meta",
+            mixed_precision=MixedPrecisionConfig(enable=False),
+            enable_gradient_checkpointing=False,
+        ).eval()
+        with torch.no_grad():
+            for _ in range(2):
+                actual = production.forward_image(**inputs, pdd_step_index=0)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+        clear_parallel_state()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+def test_minimax_h3_image_forward_registers_with_fsdp2(tmp_path):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_run_minimax_h3_image_fsdp_forward, args=(tmp_path,), nprocs=2)
+
+
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_minimax_h3_image_forward_rejects_sequence_parallel(monkeypatch):
     from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_dit

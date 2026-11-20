@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from torch.distributed.fsdp import register_fsdp_forward_method
 from transformers.modeling_outputs import ModelOutput
 
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
@@ -195,6 +196,8 @@ class MiniMaxH3DiTModel(PreTrainedModel):
     ):
         """Run the audio-free MiniMax-H3-Image packed sequence."""
         self._load_packed_attention_kernel()
+        if "forward_image" not in self.dit.__dict__:
+            register_fsdp_forward_method(self.dit, "forward_image")
         return self.dit.forward_image(
             x=x,
             prompt_embeds=prompt_embeds,
