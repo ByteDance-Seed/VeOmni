@@ -72,11 +72,11 @@ RUN UV_PROJECT_ENVIRONMENT=/tmp/veomni-cache-env \
     rm -rf /tmp/veomni-cache-env
 
 # Install the complete locked dev group into the default Python as well.
-# Cache warm-up alone does not make patchgen available outside its temporary venv.
+# Cache warm-up alone does not make pytest available outside its temporary venv.
 RUN uv export --frozen --only-group dev --no-emit-project --no-hashes \
         --output-file /app/dev-requirements.txt && \
     uv pip install --python "$(command -v python3)" --no-deps -r /app/dev-requirements.txt && \
-    python -c "import patchgen, pytest" && patchgen --help
+    python -m pytest --version
 
 # Match the existing ARM installation path; pip does not install uv groups.
 RUN pip install -e ".[npu_aarch64]" "transformers==5.16.1" && \
@@ -145,6 +145,6 @@ RUN python -c "from importlib.metadata import version; assert version('torch').s
     python -m pip freeze > /app/a3-image-requirements.txt && \
     sha256sum /app/torch_npu-*.whl /app/triton-*.whl /app/triton_ascend-*.whl /app/flash_linear_attention_npu_a3-*.whl > /app/a3-ci-wheels.sha256
 
-RUN python -c "import patchgen, pytest" && patchgen --help
+RUN python -m pytest --version
 
 CMD ["/bin/bash"]

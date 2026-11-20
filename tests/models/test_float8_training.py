@@ -381,7 +381,7 @@ def test_float8_qwen3_fsdp2_dcp_resume_and_hf_export(tmp_path, monkeypatch, reci
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.distributed.torch_parallelize import parallelize_model_fsdp2
     from veomni.models.checkpoint.weights import init_empty_weights, save_model_weights
-    from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3ForCausalLM
+    from veomni.models.transformers.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
     config = Qwen3Config(
         vocab_size=128,
@@ -467,7 +467,7 @@ def _two_rank_fsdp2_worker(rank: int, checkpoint_str: str, dcp_str: str, recipe:
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.distributed.torch_parallelize import parallelize_model_fsdp2
     from veomni.models.checkpoint.weights import init_empty_weights
-    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
+    from veomni.models.transformers.llama.modeling_llama import LlamaForCausalLM
 
     device.get_torch_device().set_device(rank)
     dist.init_process_group(backend="cuda:nccl,cpu:gloo", store=endpoint.connect(), rank=rank, world_size=2)
@@ -629,7 +629,7 @@ def test_float8_two_rank_sharded_fsdp2(tmp_path, recipe):
     from transformers import LlamaConfig
 
     from tests.tools.launch_utils import spawn_with_rendezvous
-    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
+    from veomni.models.transformers.llama.modeling_llama import LlamaForCausalLM
 
     ckpt = tmp_path / "llama_hf"
     torch.manual_seed(0)
