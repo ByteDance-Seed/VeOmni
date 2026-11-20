@@ -292,52 +292,6 @@ def test_compile_decoder_blocks_matches_a_scoped_no_split_entry(monkeypatch):
     assert compile_decoder_blocks(model, CompileConfig()) == 2
 
 
-def test_compile_decoder_blocks_honours_compile_scopes(monkeypatch):
-    """``scopes`` compiles only the children that opted into torch.compile.
-
-    A composed model is one tree and one compile call, so the per-module opt-in
-    has to narrow the block set here rather than at the call site.
-    """
-
-    class ComposedModel(nn.Module):
-        _no_split_modules = ["llm.ToyDecoderLayer", "vision.ToyDecoderLayer"]
-
-        def __init__(self):
-            super().__init__()
-            self.llm = nn.Module()
-            self.llm.layers = nn.ModuleList([ToyDecoderLayer(), ToyDecoderLayer()])
-            self.vision = nn.Module()
-            self.vision.layers = nn.ModuleList([ToyDecoderLayer()])
-
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-
-    model = ComposedModel()
-    compiled = compile_decoder_blocks(model, CompileConfig(enable=True), scopes=["llm"])
-
-    assert compiled == 2
-    assert all(block._veomni_forward_compiled for block in model.llm.layers)
-    assert not getattr(model.vision.layers[0], "_veomni_forward_compiled", False)
-
-
-def test_compile_decoder_blocks_with_empty_scopes_compiles_nothing(monkeypatch):
-    """A run where no module opted in compiles nothing instead of raising.
-
-    ``compile_decoder_blocks`` is only reached with ``enable=True``; the caller
-    clears the flag when no module declares support.
-    """
-
-    class ComposedModel(nn.Module):
-        _no_split_modules = ["llm.ToyDecoderLayer"]
-
-        def __init__(self):
-            super().__init__()
-            self.llm = nn.Module()
-            self.llm.layers = nn.ModuleList([ToyDecoderLayer()])
-
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-    assert compile_decoder_blocks(ComposedModel(), CompileConfig(enable=True), scopes=[]) == 0
-
-
 def test_compile_decoder_blocks_scopes_accept_non_decoder_block_names(monkeypatch):
     """A SeedOmni module names its own blocks; the scope, not the spelling, gates them.
 
@@ -351,7 +305,7 @@ def test_compile_decoder_blocks_scopes_accept_non_decoder_block_names(monkeypatc
             return x
 
     class CodecModel(nn.Module):
-        _no_split_modules = ["vqvae.JanusVQVAEAttnBlock"]
+        _no_split_modules = ["JanusVQVAEAttnBlock"]
 
         def __init__(self):
             super().__init__()
@@ -359,7 +313,7 @@ def test_compile_decoder_blocks_scopes_accept_non_decoder_block_names(monkeypatc
             self.vqvae.blocks = nn.ModuleList([JanusVQVAEAttnBlock()])
 
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-    assert compile_decoder_blocks(CodecModel(), CompileConfig(enable=True), scopes=["vqvae"]) == 1
+    assert compile_decoder_blocks(CodecModel(), CompileConfig(enable=True), all_classes=True) == 1
 
 
 def test_compile_decoder_blocks_without_scopes_keeps_decoder_layers_only(monkeypatch):
@@ -433,7 +387,7 @@ def test_compile_decoder_blocks_allows_a_seedomni_module_tower(monkeypatch):
     tower = Tower()
     # The Qwen3-VL rule would demand ``qwen3_vl`` in _no_split_modules; a module
     # must not be held to it, so the tower's own declared block is compiled.
-    assert compile_decoder_blocks(tower, CompileConfig(enable=True, dynamic=True), scopes=[""]) == 1
+    assert compile_decoder_blocks(tower, CompileConfig(enable=True, dynamic=True), all_classes=True) == 1
 
 
 def test_compile_decoder_blocks_rejects_cuda_graphs_for_a_seedomni_module(monkeypatch):
@@ -456,7 +410,7 @@ def test_compile_decoder_blocks_rejects_cuda_graphs_for_a_seedomni_module(monkey
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
 
     with pytest.raises(RuntimeError, match="CUDA Graph replay for a SeedOmni module"):
-        compile_decoder_blocks(Tower(), CompileConfig(enable=True, backend="cudagraphs"), scopes=[""])
+        compile_decoder_blocks(Tower(), CompileConfig(enable=True, backend="cudagraphs"), all_classes=True)
 
 
 def test_compile_decoder_blocks_still_rejects_an_unsupported_hf_multimodal_model(monkeypatch):
@@ -470,53 +424,6 @@ def test_compile_decoder_blocks_still_rejects_an_unsupported_hf_multimodal_model
 
     with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
         compile_decoder_blocks(model, CompileConfig())
-
-
-def test_compile_decoder_blocks_allows_dynamic_shapes_for_a_composed_model(monkeypatch):
-    """A composed model may use ``dynamic=True``; the single-model Qwen3-VL rule
-    does not apply to it.
-
-    A multimodal step changes the packed token count (one image vs four), so a
-    static compile there recompiles per shape. Measured over six lengths
-    spanning 300-2816 tokens, ``dynamic=True`` kept four graphs and matched eager
-    to the same tolerance as a static compile.
-    """
-
-    class ComposedModel(nn.Module):
-        _no_split_modules = ["llm.ToyDecoderLayer"]
-
-        def __init__(self):
-            super().__init__()
-            self.llm = nn.Module()
-            self.llm.layers = nn.ModuleList([ToyDecoderLayer(), ToyDecoderLayer()])
-
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-
-    model = ComposedModel()
-    model.config = SimpleNamespace(model_type="omni", _module_configs={"llm": SimpleNamespace()})
-
-    assert compile_decoder_blocks(model, CompileConfig(enable=True, dynamic=True), scopes=["llm"]) == 2
-
-
-def test_compile_decoder_blocks_rejects_cuda_graphs_for_a_composed_model(monkeypatch):
-    """Replay needs one ``cudagraph_mark_step_begin`` per micro-batch across the
-    composed graph, which ``OmniTrainer.train_step`` does not make."""
-
-    class ComposedModel(nn.Module):
-        _no_split_modules = ["llm.ToyDecoderLayer"]
-
-        def __init__(self):
-            super().__init__()
-            self.llm = nn.Module()
-            self.llm.layers = nn.ModuleList([ToyDecoderLayer()])
-
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-
-    model = ComposedModel()
-    model.config = SimpleNamespace(model_type="omni", _module_configs={"llm": SimpleNamespace()})
-
-    with pytest.raises(RuntimeError, match="CUDA Graph replay for a composed"):
-        compile_decoder_blocks(model, CompileConfig(enable=True, backend="cudagraphs"), scopes=["llm"])
 
 
 @pytest.mark.parametrize(
@@ -1450,61 +1357,3 @@ def test_compile_rejection_walks_sub_configs():
     root = SimpleNamespace(ops_config=ops(lin="eager"), sub_configs={"text_config": None}, text_config=child_only)
 
     assert _uncompilable_at(root, prefix="") == ["text_config.linear_implementation='torchao_mxfp4'"]
-
-
-def test_compile_decoder_blocks_applies_dynamic_per_scope(monkeypatch):
-    """``dynamic_scopes`` lets one tree mix static and dynamic blocks.
-
-    A text backbone needs ``dynamic`` (its packed length moves every step with
-    SeedOmni's no-padding collator) while a codec over a fixed-resolution image
-    pays Inductor's shape-polymorphic tax for nothing — measured 30% slower for
-    ``janus_vqvae``. One run-level flag cannot serve both, so the split is here.
-    """
-    calls = []
-
-    class ComposedModel(nn.Module):
-        _no_split_modules = ["llm.ToyDecoderLayer", "codec.ToyDecoderLayer"]
-
-        def __init__(self):
-            super().__init__()
-            self.llm = nn.Module()
-            self.llm.layers = nn.ModuleList([ToyDecoderLayer()])
-            self.codec = nn.Module()
-            self.codec.blocks = nn.ModuleList([ToyDecoderLayer()])
-
-    def fake_compile(fn, **kwargs):
-        calls.append(kwargs["dynamic"])
-        return fn
-
-    monkeypatch.setattr(torch, "compile", fake_compile)
-
-    model = ComposedModel()
-    compiled = compile_decoder_blocks(
-        model,
-        CompileConfig(enable=True, dynamic=True),
-        scopes=["llm", "codec"],
-        dynamic_scopes=["llm"],
-    )
-
-    assert compiled == 2
-    assert model.llm.layers[0]._veomni_compile_config["dynamic"] is True
-    assert model.codec.blocks[0]._veomni_compile_config["dynamic"] is False
-
-
-def test_compile_decoder_blocks_without_dynamic_scopes_applies_dynamic_everywhere(monkeypatch):
-    """``dynamic_scopes=None`` keeps the single-model meaning: one value, all blocks."""
-
-    class PlainModel(nn.Module):
-        _no_split_modules = ["ToyDecoderLayer"]
-
-        def __init__(self):
-            super().__init__()
-            self.a = ToyDecoderLayer()
-            self.b = ToyDecoderLayer()
-
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-
-    model = PlainModel()
-    assert compile_decoder_blocks(model, CompileConfig(enable=True, dynamic=True)) == 2
-    assert model.a._veomni_compile_config["dynamic"] is True
-    assert model.b._veomni_compile_config["dynamic"] is True

@@ -455,22 +455,6 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         return module_compile_config(self.args.accelerator, self.model)
 
-    def _compile_scopes(self):
-        """``[""]`` for an opted-in module, ``[]`` otherwise.
-
-        A module under ``fsdp_scope='module'`` is built as a **standalone** model,
-        so its fqns carry no module prefix and its blocks are named whatever its
-        family calls them (``JanusVqvae`` names ``JanusVQVAEAttnBlock``, not
-        ``*DecoderLayer``). The empty scope matches the whole tree, which is the
-        right answer here: this wrap covers exactly this module, and the
-        per-module flag already decided it may be compiled.
-
-        A module that opted out returns ``[]``; ``module_compile_config`` already
-        returned ``enable=False`` for it, so no ``CompileConfig`` reaches the
-        "found no decoder blocks" check.
-        """
-        return [""] if getattr(self.model, "supports_torch_compile", False) else []
-
     def _freeze_model_module(self) -> None:
         """Freeze + LoRA this module, heading the base's report with its name.
 
@@ -506,14 +490,28 @@ class ModuleRuntime(VeOmniModelRuntime):
         )
 
     def _build_parallelized_model(self) -> None:
-        """FSDP2/DDP-wrap this module and load its weights.
+        """Compile this module's blocks, then either wrap it here or leave that to the composed model.
 
-        When ``fsdp_scope='model'``, only async activation offload is applied
-        here, since it must precede the wrap: the module stays on meta (freeze
-        already applied) so :class:`OmniModelRuntime` can wrap the composed
-        parent once, then :meth:`build_after_omni_model_wrap` builds the
-        optimizer on the now-DTensor parameters.
+        When ``fsdp_scope='model'`` the FSDP wrap belongs to
+        :class:`OmniModelRuntime`, so this returns after compiling and applying
+        async activation offload — both must precede the wrap. The module stays
+        on meta (freeze already applied) and
+        :meth:`build_after_omni_model_wrap` finishes once the parent is wrapped.
+
+        **Compilation is per module under both scopes.** ``compile_decoder_blocks``
+        runs before ``fully_shard`` in either case, so the module is still an
+        ordinary unwrapped tree here: its own ``_no_split_modules`` is the block
+        list and its own ``CompileConfig`` is the config. Nothing about the
+        composed wrap needs to know which modules were compiled, which is why
+        there is no scope list to thread through it.
         """
+        compile_config = self._compile_config()
+        if compile_config.enable:
+            compiled = self._compile_own_blocks(compile_config)
+            logger.info_rank0(
+                f"ModuleRuntime '{self.module_name}': compiled {compiled} blocks (dynamic={compile_config.dynamic})."
+            )
+
         if self.wrap_omni_model:
             self._apply_async_activation_offload()
             logger.info_rank0(
@@ -522,6 +520,19 @@ class ModuleRuntime(VeOmniModelRuntime):
             )
             return
         super()._build_parallelized_model()
+
+    def _compile_own_blocks(self, compile_config) -> int:
+        """Compile the blocks this module declares, under this module's own config.
+
+        ``compile_decoder_blocks`` is called without ``scopes``: a module is the
+        unit here, so there is no subtree to select. ``all_classes`` is what lets
+        a family whose blocks are not named ``*DecoderLayer``
+        (``JanusVQVAEAttnBlock``) still be compiled — the module already said it
+        may be, via ``supports_torch_compile``.
+        """
+        from .....distributed.torch_compile import compile_decoder_blocks
+
+        return compile_decoder_blocks(self.model, compile_config, all_classes=True)
 
     def build_after_omni_model_wrap(self) -> None:
         """Training steps that need the wrapped parameters, once the composed OmniModel is wrapped.

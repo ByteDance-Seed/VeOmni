@@ -501,12 +501,13 @@ The class attribute exists because compile pays off by module, not by model; (1)
 | `janus_siglip` | ~1.12x |
 | `bagel_siglip_navit` | ~1.02x (stays `False`) |
 
-A module that fails any of the three trains eagerly inside the same run: under `fsdp_scope='model'` the composed `OmniModel` is compiled once, and only the children that passed all three contribute block scopes. The run-level `enable` is the default each module's resolution starts from, not a second veto — a module whose overlay turns it on is compiled even when that default is off. A run where nothing passes logs that and compiles nothing rather than failing.
+A module that fails any of the three trains eagerly inside the same run. The run-level `enable` is the default each module's resolution starts from, not a second veto — a module whose overlay turns it on is compiled even when that default is off.
 
-Two constraints are about the **wrap**, not a child:
+**Compilation is per module, under either `fsdp_scope`.** `compile_decoder_blocks` runs before `fully_shard`, so the module is still an ordinary unwrapped tree at that point; `ModuleRuntime._build_parallelized_model` compiles its own blocks and only then either wraps itself (`fsdp_scope='module'`) or hands the wrap to the composed `OmniModel` (`fsdp_scope='model'`). The composed path therefore has no compile logic at all, and nothing about one module's compile decision reaches another's — including `dynamic`, since each module passes its own `CompileConfig`.
 
-- The composed wrap uses the **top-level** `fsdp_mode`. Under a top-level `ddp` wrap nothing is compiled, even for a child whose overlay says `fsdp2` — `build_parallelize_model` validates the top-level accelerator and refuses DDP outright, so selecting that child would fail startup rather than leave it eager.
-- `backend`, `mode` and `fullgraph` are **per tree**: one compile config covers every compiled block, so the compiled children must agree on them. They come from the children's resolved configs, not the launcher's — a launcher default of `{enable: false, mode: "reduce-overhead"}` is never validated (the block is skipped while `enable` is off) and must not leak into a child that left `mode` unset. Children that disagree are rejected, because either choice would compile a module with settings its own config did not pick.
+That also means a module's own `accelerator:` overlay is the whole story for that module: its `enable`, its `dynamic`, its `mode`. There is no run-wide compile config to reconcile because there is no single compile call covering the tree.
+
+The one wrap-level check that remains is `fsdp_mode`: a module under `ddp` stays eager, because `compile_decoder_blocks` does not run under DDP. Under `fsdp_scope='model'` that is the **top-level** value, since `build_parallelize_model` validates the top-level accelerator and refuses DDP outright.
 
 **`dynamic=True` is a second per-module opt-in, and for a text backbone it is required.** `dynamic` lets one Inductor graph cover a range of shapes. SeedOmni's collator does no padding (`SeedOmniCollator`: "no stacking, no padding"), so a text backbone's packed length differs every step, and a static compile recompiles per new length. Measured on a 4-layer stack over 40 drawn lengths spanning 280–2900 tokens:
 

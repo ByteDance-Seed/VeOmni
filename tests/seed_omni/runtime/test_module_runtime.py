@@ -41,8 +41,21 @@ from veomni.utils import recompute_utils
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def _fsdp(scope: str, mode: str = "fsdp2") -> SimpleNamespace:
-    return SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope=scope, fsdp_mode=mode))
+def _fsdp(
+    scope: str, mode: str = "fsdp2", *, compile_enable: bool = False, compile_dynamic: bool = False
+) -> SimpleNamespace:
+    """A minimal ``AcceleratorConfig`` stand-in.
+
+    ``torch_compile`` defaults to disabled: these tests are about the wrap and
+    the per-module steps, and leaving compile off keeps
+    ``_build_parallelized_model`` from reaching for the compiler.
+    """
+    return SimpleNamespace(
+        fsdp_config=SimpleNamespace(fsdp_scope=scope, fsdp_mode=mode),
+        torch_compile=SimpleNamespace(
+            enable=compile_enable, backend="inductor", mode=None, fullgraph=True, dynamic=compile_dynamic
+        ),
+    )
 
 
 def _unbuilt(model: nn.Module | None = None, **args_fields) -> ModuleRuntime:
@@ -799,300 +812,109 @@ def test_a_module_without_the_dynamic_flag_gets_dynamic_off():
     assert module_compile_config(accelerator, SimpleNamespace(supports_torch_compile=True)).dynamic is False
 
 
-def _fake_runtime(model, *, fsdp_mode="fsdp2", enable=True, dynamic=True, mode=None):
-    """A ``ModuleRuntime`` stub carrying just what the scope helpers read.
+# ---------------------------------------------------------------- compile gate
+#
+# Compilation is per module: `ModuleRuntime._build_parallelized_model` compiles
+# the module's own blocks before the FSDP wrap (which is also where the composed
+# wrap would have happened), so there is no scope list and nothing reads the
+# top-level accelerator. These tests pin that per-module decision.
 
-    ``enable`` / ``dynamic`` are the module's own resolved
-    ``accelerator.torch_compile.*`` values, which a per-module YAML overlay can
-    set and which both scope helpers consult alongside the class attributes.
-    """
+
+def _compile_accelerator(*, enable=True, dynamic=False, fsdp_mode="fsdp2", mode=None):
     return SimpleNamespace(
-        model=model,
-        args=SimpleNamespace(
-            accelerator=SimpleNamespace(
-                torch_compile=SimpleNamespace(
-                    enable=enable, dynamic=dynamic, mode=mode, backend="inductor", fullgraph=True
-                ),
-                fsdp_config=SimpleNamespace(fsdp_mode=fsdp_mode),
-            )
-        ),
+        torch_compile=SimpleNamespace(enable=enable, backend="inductor", mode=mode, fullgraph=True, dynamic=dynamic),
+        fsdp_config=SimpleNamespace(fsdp_mode=fsdp_mode),
     )
 
 
 @pytest.mark.parametrize(
-    ("support", "dynamic", "fsdp_mode", "compilable", "dynamic_scope"),
+    ("run_enable", "supports", "dynamic", "supports_dynamic", "fsdp_mode", "expected"),
     [
-        (True, True, "fsdp2", True, True),
-        (True, False, "fsdp2", True, False),
-        (False, True, "fsdp2", False, False),
-        # ddp cannot compile at all: `compile_decoder_blocks` only runs under fsdp2
-        (True, True, "ddp", False, False),
+        # enabled only when the run switch, the class attribute and fsdp2 all agree
+        (True, True, False, False, "fsdp2", (True, False)),
+        (True, True, True, True, "fsdp2", (True, True)),
+        (True, True, True, False, "fsdp2", (True, False)),
+        (True, True, False, True, "fsdp2", (True, False)),
+        (False, True, True, True, "fsdp2", (False, False)),
+        (True, False, True, True, "fsdp2", (False, False)),
+        # ddp cannot compile: `compile_decoder_blocks` only runs under FSDP2
+        (True, True, True, True, "ddp", (False, False)),
     ],
 )
-def test_compilable_scope_intersects_the_three_gates(support, dynamic, fsdp_mode, compilable, dynamic_scope):
-    """Compiling needs the module's opt-in *and* fsdp2; ``dynamic`` is a third, separate opt-in.
-
-    The ``ddp`` row is the shipped ``janus_siglip`` case: it declares
-    ``supports_torch_compile`` but runs under DDP, so it has to stay eager
-    rather than fail its wrap.
-    """
-    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
-        _compilable_scope,
-        _dynamic_scope,
-    )
-
-    model = SimpleNamespace(supports_torch_compile=support, supports_torch_compile_dynamic=dynamic)
-    runtimes = {"m": _fake_runtime(model, fsdp_mode=fsdp_mode)}
-
-    assert bool(_compilable_scope(runtimes)) is compilable
-    assert bool(_dynamic_scope(runtimes)) is dynamic_scope
-
-
-def test_dynamic_scope_is_a_subset_of_the_compilable_scope():
-    """A module that does not compile is never offered the ``dynamic`` path."""
-    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
-        _compilable_scope,
-        _dynamic_scope,
-    )
-
-    runtimes = {
-        "llm": _fake_runtime(SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True)),
-        "vqvae": _fake_runtime(SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=False)),
-        "tower": _fake_runtime(SimpleNamespace(supports_torch_compile=False, supports_torch_compile_dynamic=True)),
-    }
-
-    assert set(_dynamic_scope(runtimes)) <= set(_compilable_scope(runtimes))
-    assert sorted(_compilable_scope(runtimes)) == ["llm", "vqvae"]
-    assert _dynamic_scope(runtimes) == ["llm"]
-
-
-def test_a_module_under_ddp_is_gated_off_rather_than_failing_its_wrap():
-    """``janus_siglip`` ships as ``fsdp_mode: ddp``; enabling compile must not break it."""
+def test_module_compile_config_gates_on_run_switch_class_flag_and_fsdp2(
+    run_enable, supports, dynamic, supports_dynamic, fsdp_mode, expected
+):
+    """The module's own resolved switch, its class flag and its wrap mode, ANDed."""
     from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
 
-    module = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True)
-    accelerator = SimpleNamespace(
-        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=False),
-        fsdp_config=SimpleNamespace(fsdp_mode="ddp"),
+    module = SimpleNamespace(supports_torch_compile=supports, supports_torch_compile_dynamic=supports_dynamic)
+    config = module_compile_config(
+        _compile_accelerator(enable=run_enable, dynamic=dynamic, fsdp_mode=fsdp_mode), module
     )
 
-    assert module_compile_config(accelerator, module).enable is False
+    assert (config.enable, config.dynamic) == expected
 
 
-def test_compilable_scope_honours_a_module_overlay_that_turns_compile_off():
-    """A per-module ``accelerator.torch_compile.enable: false`` keeps that module eager.
+def test_a_module_under_ddp_stays_eager_rather_than_failing_its_wrap():
+    """The shipped Janus launcher puts ``janus_siglip`` on DDP."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
 
-    Modules carry per-module ``accelerator:`` overlays and ``_validate_omni_accelerator``
-    runs on each resolved copy, so an overlay is a supported way to opt a single
-    module out. The composed scope must read the merged value, not only the
-    top-level switch.
-    """
-    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import _compilable_scope
-
-    opted_in = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True)
-    runtimes = {
-        "llm": _fake_runtime(opted_in, enable=True),
-        "vision": _fake_runtime(opted_in, enable=False),
-    }
-
-    assert _compilable_scope(runtimes) == ["llm"]
-
-
-def test_compilable_scope_is_empty_when_every_module_overlay_turns_compile_off():
-    """Nothing to compile is a valid state, not an error: the run goes eager."""
-    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
-        _compilable_scope,
-        _dynamic_scope,
+    config = module_compile_config(
+        _compile_accelerator(enable=True, dynamic=True, fsdp_mode="ddp"),
+        SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True),
     )
-
-    model = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True)
-    runtimes = {"llm": _fake_runtime(model, enable=False)}
-
-    assert _compilable_scope(runtimes) == []
-    assert _dynamic_scope(runtimes) == []
+    assert config.enable is False
 
 
-def test_a_child_only_enable_is_not_vetoed_by_the_top_level_switch():
-    """`enable: true` on one module compiles it even when the launcher default is off.
+def test_a_compiling_module_compiles_itself_before_the_composed_wrap(monkeypatch):
+    """Under ``fsdp_scope='model'`` the module compiles its own blocks, then hands off the wrap.
 
-    Exercises the derivation the composed wrap actually performs, not the scope
-    helper alone: the config it hands to `compile_decoder_blocks` must have
-    `enable=True` from the child, and must not inherit the launcher's
-    ``mode='reduce-overhead'`` — that block is never validated while the launcher
-    ``enable`` is off, so inheriting it would fail at build time.
-    """
-    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
-        _compilable_scope,
-        _composed_compile_config,
-        _dynamic_scope,
-    )
-
-    model = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True)
-    runtimes = {"llm": _fake_runtime(model, enable=True, dynamic=True, mode=None)}
-    # The launcher default: off, and carrying a replay mode the child never asked for.
-    top = SimpleNamespace(
-        torch_compile=SimpleNamespace(
-            enable=False, backend="inductor", mode="reduce-overhead", fullgraph=True, dynamic=False
-        ),
-    )
-
-    scopes = _compilable_scope(runtimes, wrap_mode="fsdp2")
-    config = _composed_compile_config(top, runtimes, scopes, _dynamic_scope(runtimes, wrap_mode="fsdp2"))
-
-    assert scopes == ["llm"]
-    assert config.enable is True
-    assert config.mode is None
-    assert config.uses_cuda_graphs() is False
-
-
-def test_dynamic_scopes_reach_the_blocks_they_name():
-    """`dynamic_scopes` only bites when the run-level `dynamic` is also on.
-
-    That is why the composed wrap derives `compile_config.dynamic` from the
-    scopes: copying the top-level flag would leave a module that opted into
-    `dynamic` compiled static, silently.
+    ``compile_decoder_blocks`` runs before ``fully_shard`` under either scope, so
+    the module is still an ordinary tree here — no scope list, no reading the
+    top-level accelerator. The composed wrap only wraps and loads, which is why
+    it is handed ``CompileConfig(enable=False)``.
     """
     import torch.nn as nn
 
-    from veomni.distributed.torch_compile import CompileConfig, compile_decoder_blocks
+    from veomni.distributed import torch_compile
+
+    seen = {}
+    real = torch_compile.compile_decoder_blocks
+
+    def spy(model, config, **kwargs):
+        seen["enable"] = config.enable
+        seen["dynamic"] = config.dynamic
+        seen["kwargs"] = kwargs
+        return real(model, config, **kwargs)
+
+    monkeypatch.setattr(torch_compile, "compile_decoder_blocks", spy)
+    # the module imports it inside the method, so patch the module it will import
+    import veomni.distributed.torch_compile as tc_mod
+
+    monkeypatch.setattr(tc_mod, "compile_decoder_blocks", spy)
 
     class Block(nn.Module):
         def forward(self, x):
             return x
 
-    class TwoChildren(nn.Module):
-        _no_split_modules = ["llm.Block", "codec.Block"]
+    class Mod(nn.Module):
+        _no_split_modules = ["Block"]
+        supports_torch_compile = True
+        supports_torch_compile_dynamic = True
 
         def __init__(self):
             super().__init__()
-            self.llm = nn.Module()
-            self.llm.layers = nn.ModuleList([Block()])
-            self.codec = nn.Module()
-            self.codec.blocks = nn.ModuleList([Block()])
+            self.layers = nn.ModuleList([Block()])
 
-    import torch
+    runtime = _unbuilt(Mod())
+    runtime._global_accelerator = _fsdp("model", compile_enable=True, compile_dynamic=True)
+    runtime.args.accelerator = _fsdp("model", compile_enable=True, compile_dynamic=True)
+    runtime._apply_async_activation_offload = lambda: None
 
-    original = torch.compile
-    torch.compile = lambda fn, **_: fn
-    try:
-        model = TwoChildren()
-        compile_decoder_blocks(
-            model,
-            CompileConfig(enable=True, dynamic=True),  # derived as bool(dynamic_scopes)
-            scopes=["llm", "codec"],
-            dynamic_scopes=["llm"],
-        )
-    finally:
-        torch.compile = original
+    runtime._build_parallelized_model()
 
-    assert model.llm.layers[0]._veomni_compile_config["dynamic"] is True
-    assert model.codec.blocks[0]._veomni_compile_config["dynamic"] is False
-
-
-@pytest.mark.parametrize("run_enable", [False, True])
-@pytest.mark.parametrize("run_dynamic", [False, True])
-@pytest.mark.parametrize("supports", [False, True])
-@pytest.mark.parametrize("supports_dynamic", [False, True])
-@pytest.mark.parametrize("fsdp_mode", ["fsdp2", "ddp"])
-def test_both_compile_paths_agree_for_every_combination(
-    run_enable, run_dynamic, supports, supports_dynamic, fsdp_mode
-):
-    """A module compiles the same way under either ``fsdp_scope``.
-
-    The two paths reach the decision through different shapes — one builds a
-    ``CompileConfig`` per module, the other derives scope lists for a single
-    composed wrap — so they had drifted twice: a per-module opt-out ignored, then
-    a per-module opt-in vetoed. This pins all 32 combinations so a third drift
-    is a test failure rather than a reviewer finding.
-    """
-    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
-        _compilable_scope,
-        _dynamic_scope,
-    )
-    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
-
-    accelerator = SimpleNamespace(
-        torch_compile=SimpleNamespace(
-            enable=run_enable, backend="inductor", mode=None, fullgraph=True, dynamic=run_dynamic
-        ),
-        fsdp_config=SimpleNamespace(fsdp_mode=fsdp_mode),
-    )
-    module_flags = SimpleNamespace(supports_torch_compile=supports, supports_torch_compile_dynamic=supports_dynamic)
-
-    # fsdp_scope='module': one config for the module itself.
-    per_module = module_compile_config(accelerator, module_flags)
-
-    # fsdp_scope='model': the scope lists decide, and the caller derives the two
-    # config flags from them.
-    runtime = SimpleNamespace(
-        model=module_flags,
-        args=SimpleNamespace(accelerator=accelerator),
-    )
-    scopes = _compilable_scope({"m": runtime})
-    dynamic_scopes = _dynamic_scope({"m": runtime})
-
-    assert (per_module.enable, per_module.dynamic) == (bool(scopes), bool(dynamic_scopes))
-
-
-def test_a_top_level_ddp_wrap_selects_no_child():
-    """The composed wrap follows the **top-level** ``fsdp_mode``, not a child overlay.
-
-    ``build_parallelize_model`` validates the top-level accelerator and refuses
-    ``ddp``, so a child whose overlay says ``fsdp2`` cannot enable compilation
-    under a ``ddp`` wrap — it has to stay eager rather than fail the wrap.
-    """
-    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
-        _compilable_scope,
-        _dynamic_scope,
-    )
-
-    model = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True)
-    runtimes = {"llm": _fake_runtime(model, fsdp_mode="fsdp2", enable=True)}
-
-    assert _compilable_scope(runtimes, wrap_mode="ddp") == []
-    assert _dynamic_scope(runtimes, wrap_mode="ddp") == []
-    assert _compilable_scope(runtimes, wrap_mode="fsdp2") == ["llm"]
-
-
-def test_compiled_children_must_agree_on_the_tree_wide_options():
-    """One compose config covers the whole tree, so ``backend``/``mode``/``fullgraph`` cannot differ.
-
-    Silently picking one would compile a module with settings its own config did
-    not choose.
-    """
-    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
-        _compilable_scope,
-        _composed_compile_config,
-    )
-
-    model = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=False)
-    runtimes = {
-        "a": _fake_runtime(model, enable=True, mode=None),
-        "b": _fake_runtime(model, enable=True, mode="reduce-overhead"),
-    }
-    top = SimpleNamespace(
-        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=False),
-    )
-
-    with pytest.raises(ValueError, match="must agree on torch_compile.mode"):
-        _composed_compile_config(top, runtimes, _compilable_scope(runtimes, wrap_mode="fsdp2"), [])
-
-
-def test_compiled_children_agreeing_on_the_options_compile_with_their_own_values():
-    """The agreeing case uses the children's values, not the launcher's."""
-    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
-        _compilable_scope,
-        _composed_compile_config,
-    )
-
-    model = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=False)
-    runtimes = {"llm": _fake_runtime(model, enable=True, mode=None)}
-    top = SimpleNamespace(
-        torch_compile=SimpleNamespace(
-            enable=False, backend="inductor", mode="reduce-overhead", fullgraph=True, dynamic=False
-        ),
-    )
-
-    config = _composed_compile_config(top, runtimes, _compilable_scope(runtimes, wrap_mode="fsdp2"), [])
-    assert config.enable is True
-    assert config.mode is None
+    assert seen.get("enable") is True, "the module must compile itself"
+    assert seen.get("dynamic") is True
+    # no scope list: the module is the unit
+    assert "scopes" not in seen.get("kwargs", {})
+    assert seen.get("kwargs", {}).get("all_classes") is True

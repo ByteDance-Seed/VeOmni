@@ -14,7 +14,7 @@
 
 import types
 from dataclasses import dataclass
-from typing import Collection, Optional, Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -353,19 +353,18 @@ def _uncompilable_selections(ops) -> list[str]:
     ]
 
 
-def _reject_incompatible_ops(model: nn.Module, scopes: Optional[Collection[str]] = None) -> None:
+def _reject_incompatible_ops(model: nn.Module) -> None:
     """Reject op selections ``torch.compile`` cannot lower, at any config depth.
 
     The walk covers nested configs because that is how the selections bind: a
     multimodal root carries its text tower's ops under ``sub_configs``, and a
     module resolves the selection from the config it was built with.
 
-    ``scopes`` limits the walk to the modules that will actually be compiled. A
-    sibling left eager never reaches Inductor, so its selection is irrelevant —
-    refusing the run for it would block a compile that is safe.
+    Called once per compiled module, so a sibling that stayed eager never reaches
+    this — its selection is irrelevant because Inductor never sees it.
     """
     config = getattr(model, "config", None)
-    offending = _uncompilable_at(config, prefix="", scopes=scopes)
+    offending = _uncompilable_at(config, prefix="")
     if offending:
         raise RuntimeError(
             "model.accelerator.torch_compile cannot be combined with "
@@ -374,17 +373,14 @@ def _reject_incompatible_ops(model: nn.Module, scopes: Optional[Collection[str]]
         )
 
 
-def _uncompilable_at(config, *, prefix: str, scopes: Optional[Collection[str]] = None) -> list[str]:
+def _uncompilable_at(config, *, prefix: str) -> list[str]:
     """Collect offending selections on ``config`` and every sub-config below it.
 
     A SeedOmni composed ``OmniConfig`` files its children in ``_module_configs``
     rather than ``sub_configs`` (the latter describes one HF model's nesting), so
-    both are walked — otherwise a child's ``torchao_mxfp4`` selection would never
-    be seen and would fail at runtime instead, inside Inductor.
-
-    ``scopes`` skips the ``_module_configs`` children that are not compiled. It
-    does not filter ``sub_configs``: those belong to one model, and a single model
-    is compiled whole or not at all.
+    both are walked. Under the per-module design this only ever sees one module's
+    config, but the walk stays general so a single HF multimodal model is still
+    covered.
     """
     if config is None:
         return []
@@ -394,9 +390,7 @@ def _uncompilable_at(config, *, prefix: str, scopes: Optional[Collection[str]] =
         if child is not None:
             found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
     for name, child in (getattr(config, "_module_configs", None) or {}).items():
-        if scopes is not None and name not in scopes:
-            continue
-        found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}.", scopes=scopes))
+        found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
     return found
 
 
@@ -405,26 +399,21 @@ def compile_decoder_blocks(
     compile_config: CompileConfig,
     sequence_parallel_enabled: bool = False,
     async_enabled: bool = False,
-    scopes: Optional[Collection[str]] = None,
-    dynamic_scopes: Optional[Collection[str]] = None,
+    all_classes: bool = False,
 ) -> int:
-    """Compile forward of every decoder block inside ``model`` in place.
+    """Compile forward of every block inside ``model`` in place.
 
     Compiling the forward method (rather than wrapping the whole module)
     preserves module identity for FSDP2 — pre/post-forward all-gather and
     reshard hooks stay outside the compiled region.
 
-    ``scopes`` narrows the set to blocks under those children. A SeedOmni
-    composed model passes the modules that opted into ``torch.compile``, so a
-    sibling that did not opt in keeps running eagerly inside the same run.
-    ``None`` keeps every declared decoder block.
-
-    ``dynamic_scopes`` narrows ``dynamic`` the same way. It is a separate list
-    because a module can want compile without wanting ``dynamic``: the text
-    backbones see a packed length that moves every step and need it, while a
-    codec over a fixed-resolution image pays Inductor's shape-polymorphic tax
-    for nothing (``janus_vqvae`` measured 30% slower with it on). Blocks outside
-    every entry keep the run-level ``dynamic``; ``None`` applies it everywhere.
+    ``all_classes`` decides which ``_no_split_modules`` entries qualify. The
+    default keeps ``*DecoderLayer``, which is what a single HF model wants: a
+    Qwen2.5-Omni lists its vision and audio towers alongside its decoder layers,
+    and those must stay eager. SeedOmni passes ``True`` because its modules name
+    whatever their own blocks are called (``JanusVQVAEAttnBlock``) and already
+    opted in via ``supports_torch_compile`` — the module is the unit of
+    compilation, so there is no subtree left to select.
     """
 
     if not hasattr(torch, "compile"):
@@ -433,7 +422,7 @@ def compile_decoder_blocks(
         )
 
     validate_compile_model(model, compile_config, sequence_parallel_enabled, async_enabled)
-    _reject_incompatible_ops(model, scopes=scopes)
+    _reject_incompatible_ops(model)
 
     compile_kwargs = {
         "fullgraph": compile_config.fullgraph,
@@ -449,26 +438,17 @@ def compile_decoder_blocks(
             )
         compile_kwargs["mode"] = compile_config.mode
 
-    # ``scopes`` implies a SeedOmni run, where a module's blocks are named
-    # whatever its family calls them and the per-module flag decides who is
-    # compiled. Without it, keep the HF convention of ``*DecoderLayer`` only.
-    decoder_block_specs = _decoder_block_specs(model, all_classes=scopes is not None)
+    decoder_block_specs = _decoder_block_specs(model, all_classes=all_classes)
     compiled = 0
     for fqn, module in model.named_modules():
         if not _is_decoder_block(module, fqn=fqn, decoder_block_specs=decoder_block_specs):
             continue
-        if scopes is not None and not any(_under_scope(fqn, scope) for scope in scopes):
-            continue
         if getattr(module, "_veomni_forward_compiled", False):
             continue
 
-        # ``dynamic`` is a per-module decision: a module declared it only if its
-        # input shape actually moves, and shape-polymorphic kernels can cost more
-        # than they save (``janus_vqvae`` measured 30% slower with it on). Blocks
-        # outside every ``dynamic_scopes`` entry keep the run-level value.
+        # One config for this call: a SeedOmni module passes its own, so `dynamic`
+        # is already the answer for this module's blocks.
         block_kwargs = compile_kwargs
-        if dynamic_scopes is not None and not any(_under_scope(fqn, scope) for scope in dynamic_scopes):
-            block_kwargs = {**compile_kwargs, "dynamic": False}
 
         original_forward = module.forward
         if hasattr(original_forward, "__func__"):
