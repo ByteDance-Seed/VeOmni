@@ -313,6 +313,33 @@ def test_flash_attention_preserves_layout_and_backend_contract(monkeypatch):
     assert attention_weights is None
 
 
+def test_flash_attention_fp32_query_follows_autocast_of_the_query_device(monkeypatch):
+    """An fp32 query under autocast must be cast to that device's autocast dtype.
+
+    ``torch.is_autocast_enabled()`` without a device only reflects CUDA autocast, so this
+    used to fall through to the fp32 ``Linear`` weight dtype on every non-CUDA backend (XPU, NPU, CPU).
+    """
+    captured = {}
+
+    def replacement_backend(query, key, value, attention_mask, **kwargs):
+        captured.update(kwargs)
+        return query
+
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", replacement_backend)
+    monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+
+    module = _FakeAttentionModule("veomni_flash_attention_2")  # fp32 Linear weight: the fallback dtype
+    query = torch.randn(2, 4, 3, 4, dtype=torch.float32)
+    key, value = query.clone(), query.clone()
+
+    flash_backend.flash_attention_forward(module, query, key, value, None)
+    assert captured["target_dtype"] == torch.float32  # no autocast: weight dtype
+
+    with torch.autocast(query.device.type, dtype=torch.bfloat16):
+        flash_backend.flash_attention_forward(module, query, key, value, None)
+    assert captured["target_dtype"] == torch.bfloat16
+
+
 def test_flash_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
     group = object()
     state = SimpleNamespace(ulysses_group=group, ulysses_size=2)
