@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
-from dataclasses import fields
 from typing import TYPE_CHECKING, Any, Mapping
 
 import torch
@@ -125,7 +124,7 @@ def _scoped_no_split_modules(module_runtimes: Mapping[str, ModuleRuntime]) -> li
     return list(dict.fromkeys(scoped))
 
 
-def _compilable_scope(module_runtimes: Mapping[str, ModuleRuntime]) -> list[str]:
+def _compilable_scope(module_runtimes: Mapping[str, ModuleRuntime], *, wrap_mode: str | None = None) -> list[str]:
     """The child scopes whose modules opted into ``torch.compile``.
 
     The composed wrap compiles one tree, so the per-module gate is applied
@@ -141,9 +140,15 @@ def _compilable_scope(module_runtimes: Mapping[str, ModuleRuntime]) -> list[str]
     ignoring it would compile a child that asked not to be, and would equally
     ignore a child-only ``enable: true``.
 
-    A module under ``ddp`` is excluded for the same reason ``module_compile_config``
-    excludes it: ``compile_decoder_blocks`` only runs under FSDP2.
+    ``wrap_mode`` is the **top-level** ``fsdp_mode``, and it gates the whole list:
+    the composed wrap hands the composed model to one ``build_parallelize_model``,
+    which validates the top-level accelerator and refuses ``ddp`` outright. A
+    child overlay saying ``fsdp2`` cannot change that — its own ``fsdp_mode`` is
+    not what the wrap uses. Passing ``None`` skips the check for a caller that
+    only wants the per-module answer.
     """
+    if wrap_mode is not None and wrap_mode != "fsdp2":
+        return []
     return [
         name
         for name, runtime in module_runtimes.items()
@@ -153,7 +158,7 @@ def _compilable_scope(module_runtimes: Mapping[str, ModuleRuntime]) -> list[str]
     ]
 
 
-def _dynamic_scope(module_runtimes: Mapping[str, ModuleRuntime]) -> list[str]:
+def _dynamic_scope(module_runtimes: Mapping[str, ModuleRuntime], *, wrap_mode: str | None = None) -> list[str]:
     """The compilable children that also opted into ``dynamic``.
 
     Kept separate from :func:`_compilable_scope` because the two questions have
@@ -172,7 +177,7 @@ def _dynamic_scope(module_runtimes: Mapping[str, ModuleRuntime]) -> list[str]:
     attribute would make ``fsdp_scope='model'`` compile dynamic where
     ``fsdp_scope='module'`` compiles static for the same config.
     """
-    compilable = set(_compilable_scope(module_runtimes))
+    compilable = set(_compilable_scope(module_runtimes, wrap_mode=wrap_mode))
     return [
         name
         for name, runtime in module_runtimes.items()
@@ -180,6 +185,62 @@ def _dynamic_scope(module_runtimes: Mapping[str, ModuleRuntime]) -> list[str]:
         and runtime.args.accelerator.torch_compile.dynamic
         and getattr(runtime.model, "supports_torch_compile_dynamic", False)
     ]
+
+
+def _composed_compile_config(
+    top_accelerator,
+    module_runtimes: Mapping[str, ModuleRuntime],
+    compile_scopes: list[str],
+    dynamic_scopes: list[str],
+):
+    """The one ``CompileConfig`` a composed wrap hands to ``compile_decoder_blocks``.
+
+    The block selection is per module (the scope lists), but ``backend`` /
+    ``mode`` / ``fullgraph`` are per *tree*: ``compile_decoder_blocks`` takes one
+    value for all blocks, so a run cannot mix them. They therefore come from the
+    children that are actually compiled, not from the top-level accelerator — a
+    child-only ``enable: true`` next to a launcher default of
+    ``{enable: false, mode: "reduce-overhead"}`` is a valid parse (the launcher
+    block is never validated while ``enable`` is off) and must not inherit the
+    replay mode it never asked for.
+
+    Children that disagree on a tree-wide option are rejected rather than
+    silently resolved to one of them, because either outcome compiles a module
+    with settings its own config did not choose.
+
+    ``enable`` and ``dynamic`` stay derived from the scope lists, so the two
+    paths agree — see ``test_both_compile_paths_agree_for_every_combination``.
+    """
+    from .....distributed.torch_compile import CompileConfig
+
+    if not compile_scopes:
+        # Nothing to compile: the values are never read, but return a coherent
+        # object so the caller keeps one code path.
+        return CompileConfig(enable=False)
+
+    owners = [
+        (name, module_runtimes[name].args.accelerator.torch_compile)
+        for name in compile_scopes
+        if name in module_runtimes
+    ]
+    first_name, first = owners[0]
+    for name, other in owners[1:]:
+        for field_name in ("backend", "mode", "fullgraph"):
+            if getattr(other, field_name) != getattr(first, field_name):
+                raise ValueError(
+                    "Under fsdp_scope='model' one compile config covers the whole composed model, so every "
+                    f"compiled module must agree on torch_compile.{field_name}; "
+                    f"'{first_name}' has {getattr(first, field_name)!r} and '{name}' has "
+                    f"{getattr(other, field_name)!r}. Align the per-module accelerator overlays."
+                )
+
+    return CompileConfig(
+        enable=True,
+        backend=first.backend,
+        mode=first.mode,
+        fullgraph=first.fullgraph,
+        dynamic=bool(dynamic_scopes),
+    )
 
 
 def _reject_lora_that_matched_nothing(
@@ -368,7 +429,6 @@ class OmniModelRuntime:
         if any(kwargs["module_is_peft_model"].values()):
             kwargs["is_peft_model"] = True
 
-        from .....distributed.torch_compile import CompileConfig
         from .....distributed.torch_parallelize import build_parallelize_model
 
         # One tree, one compile call, but only the modules that opted in. The
@@ -382,16 +442,9 @@ class OmniModelRuntime:
         # starts from, so it does not get a second veto here — applying one would
         # drop a child-only ``enable: true``, which the overlay support exists to
         # allow.
-        compile_scopes = _compilable_scope(modules_to_wrap)
-        dynamic_scopes = _dynamic_scope(modules_to_wrap)
-        compile_config = CompileConfig(
-            **{field.name: getattr(acc.torch_compile, field.name) for field in fields(CompileConfig)}
-        )
-        compile_config.enable = bool(compile_scopes)
-        # ``dynamic`` is likewise per module: ``dynamic_scopes`` says which blocks
-        # take the shape-polymorphic path, and the scope list is what decides, not
-        # the top-level flag.
-        compile_config.dynamic = bool(dynamic_scopes)
+        compile_scopes = _compilable_scope(modules_to_wrap, wrap_mode=acc.fsdp_config.fsdp_mode)
+        dynamic_scopes = _dynamic_scope(modules_to_wrap, wrap_mode=acc.fsdp_config.fsdp_mode)
+        compile_config = _composed_compile_config(acc, modules_to_wrap, compile_scopes, dynamic_scopes)
         if acc.torch_compile.enable and not compile_scopes:
             logger.info_rank0(
                 "OmniModelRuntime: accelerator.torch_compile.enable is set but no module declares "

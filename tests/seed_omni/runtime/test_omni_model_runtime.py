@@ -446,6 +446,9 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
         accelerator=SimpleNamespace(
             fsdp_config=SimpleNamespace(
                 fsdp_scope="model",
+                # The composed wrap follows the top-level fsdp_mode; `fsdp2` keeps
+                # the compile path reachable (a `ddp` wrap would select no child).
+                fsdp_mode="fsdp2",
                 reshard_after_forward=True,
                 mixed_precision=SimpleNamespace(enable=False),
                 forward_prefetch=False,

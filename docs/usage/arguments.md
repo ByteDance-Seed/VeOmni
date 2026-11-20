@@ -503,6 +503,11 @@ The class attribute exists because compile pays off by module, not by model; (1)
 
 A module that fails any of the three trains eagerly inside the same run: under `fsdp_scope='model'` the composed `OmniModel` is compiled once, and only the children that passed all three contribute block scopes. The run-level `enable` is the default each module's resolution starts from, not a second veto — a module whose overlay turns it on is compiled even when that default is off. A run where nothing passes logs that and compiles nothing rather than failing.
 
+Two constraints are about the **wrap**, not a child:
+
+- The composed wrap uses the **top-level** `fsdp_mode`. Under a top-level `ddp` wrap nothing is compiled, even for a child whose overlay says `fsdp2` — `build_parallelize_model` validates the top-level accelerator and refuses DDP outright, so selecting that child would fail startup rather than leave it eager.
+- `backend`, `mode` and `fullgraph` are **per tree**: one compile config covers every compiled block, so the compiled children must agree on them. They come from the children's resolved configs, not the launcher's — a launcher default of `{enable: false, mode: "reduce-overhead"}` is never validated (the block is skipped while `enable` is off) and must not leak into a child that left `mode` unset. Children that disagree are rejected, because either choice would compile a module with settings its own config did not pick.
+
 **`dynamic=True` is a second per-module opt-in, and for a text backbone it is required.** `dynamic` lets one Inductor graph cover a range of shapes. SeedOmni's collator does no padding (`SeedOmniCollator`: "no stacking, no padding"), so a text backbone's packed length differs every step, and a static compile recompiles per new length. Measured on a 4-layer stack over 40 drawn lengths spanning 280–2900 tokens:
 
 | | first pass | second pass | graphs |
