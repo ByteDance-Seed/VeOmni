@@ -1,4 +1,4 @@
-# MiniMax-H3-Image inference and T2I fine-tuning
+# MiniMax-H3-Image inference and fine-tuning
 
 MiniMax-H3-Image is the image-generation member of the MiniMax-H3 family.
 It reuses the H3 text encoder and the H3 diffusion transformer without the
@@ -73,7 +73,7 @@ image.save("edit.png")
 The online and offline paths support `micro_batch_size: 1` and `ulysses_size: 1`.
 They follow the public [DiffSynth fine-tuning recipe](https://github.com/modelscope/DiffSynth-Studio/blob/fc8b4be56759de06cac585929f608227ac58766b/examples/minimax_h3_image/model_training/full/MiniMax-H3-Image.sh): the DiT learns a flow-matching target while the released PDD heads remain frozen. Image training uses the same H3 layout and DiT `forward()` as video, with one latent frame and no audio tokens. The image VAE and noise schedule are still image-specific.
 
-Both paths sample fresh noise and timesteps. The 1,000-step training schedule uses `shift=2.22`; each training sigma selects the nearest released sigma except the terminal zero. The resulting head buckets have unequal training weight, and their ranges extend beyond the exact inference sigmas. This is flow-matching fine-tuning, not a reproduction of the original PDD distillation. The provided training recipes cover T2I only; reference-image editing recipes and packed batches are outside this example.
+Both paths sample fresh noise and timesteps. The 1,000-step training schedule uses `shift=2.22`; each training sigma selects the nearest released sigma except the terminal zero. The resulting head buckets have unequal training weight, and their ranges extend beyond the exact inference sigmas. This is flow-matching fine-tuning, not a reproduction of the original PDD distillation. Reference-image editing uses the same objective; multi-sample packing and Ulysses SP are not supported by these recipes.
 
 ### Prepare weights and data
 
@@ -136,6 +136,51 @@ NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_
 ```
 
 Both training configs use `dataset_repeat: true` and can run more updates by increasing `train.max_steps`. Set `train.checkpoint.save_steps` to save training checkpoints during a longer run. The online example uses its own output directory, `output/minimax_h3_image_t2i_online_sft`.
+
+## Reference-image editing fine-tuning
+
+Reuse the prepared transformer and its paired `config.json` and `condition.json` from the T2I recipe. The input CSV has `image,prompt,reference_images` columns. The `image` is the target, and `reference_images` is a JSON array of one or more paths. Paths are relative to `data.mm_configs.data_dir`.
+
+The pinned DiffSynth editing sample below has one target and two references. For an eight-rank smoke test, write eight copies of its data row **before** generating the cache. For your own dataset, provide at least one row per data-parallel rank. If you already cached fewer rows, rerun the embedding stage into a fresh `data.offline_embedding_save_dir` and update the offline YAML's `data.train_path`.
+
+```shell
+dataset_url=https://modelscope.cn/datasets/DiffSynth-Studio/diffsynth_example_dataset/resolve/e1b8bcbb91db4097e6b595179238cb76556c8233/minimax_h3_image/MiniMax-H3-Image-Edit
+data_dir=dataset/minimax_h3_image_edit
+mkdir -p "$data_dir/edit"
+for file in metadata.json edit/image1.jpg edit/image_color.jpg edit/image2.jpg; do
+  curl -fsSL "$dataset_url/$file" -o "$data_dir/$file" || exit 1
+done
+uv run python - "$data_dir" <<'PY'
+import csv
+import json
+import sys
+from pathlib import Path
+
+data_dir = Path(sys.argv[1])
+(sample,) = json.loads((data_dir / "metadata.json").read_text(encoding="utf-8"))
+with (data_dir / "metadata.csv").open("w", encoding="utf-8", newline="") as handle:
+    writer = csv.writer(handle)
+    writer.writerow(["image", "prompt", "reference_images"])
+    writer.writerows([[sample["image"], sample["prompt"], json.dumps(sample["edit_image"])]] * 8)
+PY
+```
+
+References are resized as in inference, appear in the text encoder's visual prompt, and are encoded as normalized VAE posterior modes for training. The shared DiT applies the inference reference timestep of `0.999` to the reference rows and computes weighted MSE only over the target rows. Only load trusted caches.
+
+```shell
+NPROC_PER_NODE=1 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_i2i_embedding.yaml
+NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_i2i_offline.yaml
+```
+
+The online recipe reads the same expanded raw CSV directly without generating a cache. As in T2I, the online meter sees inputs before encoding and reports zero MFU, token throughput, and `consumed_chunk_num`; this does not indicate a failed step.
+
+The CUDA sync check covers VeOmni's H3 condition and DiT code, not the delegated Qwen3-VL vision encoder. Pageable host-memory transfers can still stall during staging.
+
+```shell
+NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_i2i_online.yaml
+```
+
+The [T2I memory estimates](#offline-training-cache-and-run-one-step) do not include the extra tokens and VAE work for each reference. Full-parameter released-checkpoint editing training has not been validated.
 
 ## Notes
 

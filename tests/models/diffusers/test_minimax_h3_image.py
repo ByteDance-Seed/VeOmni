@@ -234,7 +234,8 @@ def test_minimax_h3_image_forward_through_fsdp2(tmp_path, checkpointing, param_d
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_minimax_h3_image_training_updates_backbone_through_frozen_head():
+@pytest.mark.parametrize("cond_rows", [0, 2], ids=["t2i", "edit"])
+def test_minimax_h3_image_training_updates_backbone_through_frozen_head(cond_rows):
     torch.manual_seed(0)
     config = tiny_minimax_h3_config(
         audio_enabled=False, num_pdd_heads=6, condition_model_type="MiniMaxH3ImageConditionModel"
@@ -244,7 +245,11 @@ def test_minimax_h3_image_training_updates_backbone_through_frozen_head():
     assert all(param.requires_grad for param in model.dit.final_layer.pdd_out.parameters())
     model.freeze_model()
     inputs = {**_image_inputs(), "pdd_step_index": 2}
-    target = torch.randn_like(inputs["x"])
+    if cond_rows:
+        inputs["unique_timesteps"] = torch.tensor([0.999, 0.35])
+        inputs["timestep_indices"].fill_(1)
+        inputs["timestep_indices"][inputs["image_indices"][:cond_rows]] = 0
+    target = torch.randn_like(inputs["x"][cond_rows:])
     weight = torch.tensor(0.7)
     backbone_before = model.dit.video_patch_proj.weight.detach().clone()
     frozen_before = {
@@ -252,7 +257,7 @@ def test_minimax_h3_image_training_updates_backbone_through_frozen_head():
     }
 
     with torch.no_grad():
-        raw_prediction = model(**inputs)
+        raw_prediction = model(**inputs)[cond_rows:]
         expected = (raw_prediction + target).square().mean() * weight
     optimizer = torch.optim.AdamW((param for param in model.parameters() if param.requires_grad), lr=1e-3)
     training_inputs = {
@@ -266,6 +271,7 @@ def test_minimax_h3_image_training_updates_backbone_through_frozen_head():
         "img_pos_for_infer_output_info": {"position_ids": inputs["image_indices"]},
         "text_pos_info": {"position_ids": inputs["text_indices"]},
         "pdd_step_index": inputs["pdd_step_index"],
+        "cond_rows": cond_rows,
         "training_target": target,
         "image_loss_weight": weight,
     }

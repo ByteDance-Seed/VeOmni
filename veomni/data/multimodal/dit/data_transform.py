@@ -1,3 +1,4 @@
+import json
 import os
 
 import PIL
@@ -35,6 +36,26 @@ def process_minimax_h3_image_t2i_example(example, data_dir="", **kwargs):
     if data_dir and isinstance(image, str) and not os.path.isabs(image) and "://" not in image:
         image = os.path.join(data_dir, image)
     return [{"inputs": prompt, "images": [load_image(image)]}]
+
+
+@DATA_TRANSFORM_REGISTRY.register("minimax_h3_image_i2i")
+def process_minimax_h3_image_i2i_example(example, data_dir="", **kwargs):
+    """Load a target and one or more reference images for H3-Image editing."""
+    sample = process_minimax_h3_image_t2i_example(example, data_dir=data_dir)[0]
+    references = example.get("reference_images")
+    if isinstance(references, str):
+        references = json.loads(references)
+    if not isinstance(references, list) or not references:
+        raise ValueError("MiniMax-H3-Image editing requires a non-empty 'reference_images' list.")
+    images = []
+    for reference in references:
+        if not isinstance(reference, (str, bytes)) or not reference:
+            raise ValueError("MiniMax-H3-Image reference images must be paths or bytes.")
+        if data_dir and isinstance(reference, str) and not os.path.isabs(reference) and "://" not in reference:
+            reference = os.path.join(data_dir, reference)
+        images.append(load_image(reference))
+    sample["reference_images"] = images
+    return [sample]
 
 
 @DATA_TRANSFORM_REGISTRY.register("minimax_h3_online")

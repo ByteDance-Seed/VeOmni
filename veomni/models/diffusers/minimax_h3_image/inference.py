@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import Image
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
@@ -38,6 +38,7 @@ from .minimax_h3_image_condition.modeling_minimax_h3_image_condition import (
     REFERENCE_MODEL_TIME,
     MiniMaxH3ImageConditionModel,
 )
+from .minimax_h3_image_condition.modeling_minimax_h3_image_condition import resize_reference as _resize_reference
 from .pdd import DEFAULT_SIGMAS, load_pdd_release
 
 
@@ -61,29 +62,6 @@ class MiniMaxH3ImageScheduler:
         sigma = self.sigmas[index].to(sample.device)
         sigma_next = self.sigmas[index + 1].to(sample.device)
         return (sample.to(torch.float32) + (sigma - sigma_next) * model_output.to(torch.float32)).to(sample.dtype)
-
-
-def _bound_short_edge(
-    width: int, height: int, min_short_edge: int, max_short_edge: int, multiple: int
-) -> tuple[int, int]:
-    short_edge = min(width, height)
-    if min_short_edge <= short_edge <= max_short_edge:
-        return width, height
-    scale = (min_short_edge if short_edge < min_short_edge else max_short_edge) / short_edge
-    return (
-        max(multiple, round(width * scale / multiple) * multiple),
-        max(multiple, round(height * scale / multiple) * multiple),
-    )
-
-
-def _resize_reference(image: Image.Image, min_short_edge: int, max_short_edge: int) -> Image.Image:
-    image = ImageOps.exif_transpose(image).convert("RGB")
-    if min(image.size) < 32:
-        raise ValueError(f"A reference image needs at least 32 pixels on each side, got {image.size}.")
-    width, height = _bound_short_edge(*image.size, min_short_edge, max_short_edge, 32)
-    if image.size == (width, height):
-        return image
-    return image.resize((width, height), Image.Resampling.BICUBIC)
 
 
 class MiniMaxH3ImagePipeline(torch.nn.Module):
