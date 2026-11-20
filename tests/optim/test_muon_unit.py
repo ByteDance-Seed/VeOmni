@@ -185,6 +185,64 @@ class TestSplit:
         muon, adamw, *_ = split_muon_adamw_params(model)
         assert muon == [] and adamw == []
 
+    def test_routing_and_gating_matrices_go_to_adamw(self):
+        """A matrix that selects or mixes is not a feature transform, so NS must not touch it.
+
+        Covers the names the shipped models actually use: MoE router gates, scalar
+        expert gates, hyper-connection stream mixing, the DSA indexer's per-head
+        scores, and the compressors' softmax gates. The sibling feature projections
+        in each of those modules must stay on Muon, which is what the scoped
+        `compressor.gate_proj` / `indexer.gate_proj` entries are for.
+        """
+        model = nn.Module()
+        layer = nn.Module()
+        layer.attn_hc = nn.ParameterDict({"fn": nn.Parameter(torch.randn(24, 64))})
+        layer.ffn_hc = nn.ParameterDict({"fn": nn.Parameter(torch.randn(24, 64))})
+        layer.mlp = nn.Module()
+        layer.mlp.gate = nn.Linear(16, 8, bias=False)
+        layer.mlp.router = nn.Linear(16, 8, bias=False)
+        layer.mlp.shared_expert_gate = nn.Linear(16, 1, bias=False)
+        layer.mlp.experts = nn.ParameterDict({"gate_up_proj": nn.Parameter(torch.randn(4, 16, 16))})
+        layer.mlp.shared_experts = nn.ModuleDict({"gate_proj": nn.Linear(16, 8, bias=False)})
+        layer.self_attn = nn.Module()
+        layer.self_attn.compressor = nn.ModuleDict(
+            {
+                "kv_proj": nn.Linear(16, 8, bias=False),
+                "gate_proj": nn.Linear(16, 8, bias=False),
+            }
+        )
+        layer.self_attn.compressor.indexer = nn.ModuleDict(
+            {
+                "q_b_proj": nn.Linear(16, 32, bias=False),
+                "kv_proj": nn.Linear(16, 8, bias=False),
+                "gate_proj": nn.Linear(16, 8, bias=False),
+                "weights_proj": nn.Linear(16, 4, bias=False),
+            }
+        )
+        model.layers = nn.ModuleList([layer])
+        model.hc_head = nn.ParameterDict({"hc_fn": nn.Parameter(torch.randn(4, 64))})
+
+        _, _, muon_names, adamw_names = split_muon_adamw_params(model)
+
+        assert set(adamw_names) == {
+            "layers.0.attn_hc.fn",
+            "layers.0.ffn_hc.fn",
+            "layers.0.mlp.gate.weight",
+            "layers.0.mlp.router.weight",
+            "layers.0.mlp.shared_expert_gate.weight",
+            "layers.0.self_attn.compressor.gate_proj.weight",
+            "layers.0.self_attn.compressor.indexer.gate_proj.weight",
+            "layers.0.self_attn.compressor.indexer.weights_proj.weight",
+            "hc_head.hc_fn",
+        }
+        assert set(muon_names) == {
+            "layers.0.mlp.experts.gate_up_proj",
+            "layers.0.mlp.shared_experts.gate_proj.weight",
+            "layers.0.self_attn.compressor.kv_proj.weight",
+            "layers.0.self_attn.compressor.indexer.q_b_proj.weight",
+            "layers.0.self_attn.compressor.indexer.kv_proj.weight",
+        }
+
 
 class TestParamShapeEligibility:
     """``DistributedMuon`` must accept 2D/3D and reject 1D/4D+."""
