@@ -440,18 +440,24 @@ def test_npu_ep_matches_nonep_single_rank(variant, _single_rank_dist):
             **_SCALES,
         )
         if ep:
-            # The EP path reads the group from the parallel state now, so a bare
-            # `ep_group=None` no longer selects "single rank, no EP" -- it never reaches
-            # the group at all. Build a real one-rank EP state instead.
-            from veomni.distributed.parallel_state import (
-                _init_parallel_state,
-                get_parallel_state,
-                use_parallel_state,
-            )
+            # The EP path reads the group from the parallel state, so `ep_group=None` no
+            # longer selects "single rank, no EP" -- it never reaches the group at all.
+            # Point the state at the one-rank gloo group this fixture created instead of
+            # building a mesh: `_init_parallel_state` sizes the mesh from WORLD_SIZE,
+            # which under the NPU CI job is the job's device count, not 1.
+            from types import SimpleNamespace
+            from unittest import mock
 
-            if get_parallel_state().extra_parallel_sizes.get("ep", 1) != 1:
-                raise AssertionError("the single-rank NPU test expects ep_size 1")
-            with use_parallel_state(_init_parallel_state(dp_size=1, extra_parallel_sizes=(1,), name="npu_ep")):
+            state = SimpleNamespace(
+                ep_group=dist.group.WORLD,
+                extra_parallel_sizes={"ep": 1},
+                ep_size=1,
+                ep_enabled=True,
+            )
+            with mock.patch(
+                "veomni.distributed.moe.moe_layer.get_parallel_state",
+                lambda: state,
+            ):
                 out = _npu_ep_fused_lora_moe_forward(**kwargs)
         else:
             out = _npu_fused_lora_moe_forward(**kwargs)
@@ -881,8 +887,13 @@ def test_npu_lora_ep_math_applies_both_deltas_between_the_gemms(monkeypatch):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_npu_lora_ep_math_keeps_an_empty_rank_on_the_graph():
-    """A rank with no dispatched tokens must still produce a grad-carrying output."""
+def test_npu_lora_ep_math_keeps_an_empty_rank_on_the_graph(monkeypatch):
+    """A rank with no dispatched tokens must still produce a grad-carrying output.
+
+    Both stubs go through ``monkeypatch`` so the fake ``torch_npu`` is torn down with the
+    test: leaving it in ``sys.modules`` would make every later Ascend test import a
+    module that lacks the vendor functions (RMSNorm reaches for them on the next import).
+    """
     import sys
     import types
 
@@ -893,19 +904,16 @@ def test_npu_lora_ep_math_keeps_an_empty_rank_on_the_graph():
 
     npu_mod = types.ModuleType("torch_npu")
     npu_mod.npu_swiglu = lambda x, dim=-1: x[..., : x.shape[-1] // 2]
-    sys.modules["torch_npu"] = npu_mod
-    try:
-        original = std_npu.npu_group_gemm
-        std_npu.npu_group_gemm = lambda a, b, counts: torch.zeros(a.shape[0], b.shape[-1])
-        tokens = torch.zeros(0, 4, requires_grad=True)
-        out = helper._NpuLoRADeltasEP.apply(
-            tokens,
-            torch.tensor([0], dtype=torch.long),
-            torch.randn(1, 16, 4),
-            torch.randn(1, 4, 8),
-            lambda x, c: torch.zeros(x.shape[0], 16),
-            lambda x, c: torch.zeros(x.shape[0], 4),
-        )
-        assert out.requires_grad, "an empty rank detached from the graph"
-    finally:
-        std_npu.npu_group_gemm = original
+    monkeypatch.setitem(sys.modules, "torch_npu", npu_mod)
+    monkeypatch.setattr(std_npu, "npu_group_gemm", lambda a, b, counts: torch.zeros(a.shape[0], b.shape[-1]))
+
+    tokens = torch.zeros(0, 4, requires_grad=True)
+    out = helper._NpuLoRADeltasEP.apply(
+        tokens,
+        torch.tensor([0], dtype=torch.long),
+        torch.randn(1, 16, 4),
+        torch.randn(1, 4, 8),
+        lambda x, c: torch.zeros(x.shape[0], 16),
+        lambda x, c: torch.zeros(x.shape[0], 4),
+    )
+    assert out.requires_grad, "an empty rank detached from the graph"

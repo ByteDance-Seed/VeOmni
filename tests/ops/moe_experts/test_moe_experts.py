@@ -2066,7 +2066,7 @@ def test_expert_sharding_is_read_without_assuming_the_axis_is_named_ep():
 
     def with_sizes(sizes):
         return mock.patch(
-            "veomni.distributed.parallel_state.get_parallel_state",
+            "veomni.distributed.moe.moe_layer.get_parallel_state",
             lambda: SimpleNamespace(extra_parallel_sizes=sizes),
         )
 

@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..shared.act_fn_experts import expert_parallel_size
+from .....distributed.moe import expert_parallel_size
 
 
 def _gpt_oss_activation(gate_up: Tensor, alpha: float, limit: float) -> Tensor:

@@ -125,8 +125,7 @@ def wrapper(
     Under expert parallelism this dispatches through the same all-to-all pipeline the
     fused rows use; the adapters are replicated, so only the base weights are sharded.
     """
-    from .....distributed.moe import dispatch_to_ep_class
-    from .....ops.kernels.moe_experts.shared.act_fn_experts import expert_parallel_size
+    from .....distributed.moe import dispatch_to_ep_class, expert_parallel_size
 
     ep_size = expert_parallel_size()
     if ep_size > 1:

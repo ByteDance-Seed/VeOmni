@@ -118,10 +118,27 @@ def npu_ep_forward(
     at its entry point: ``dispatch_to_ep_class`` forwards them untouched and
     ``unpermute`` applies them to the expert outputs, so an fp32 router would upcast
     there.
+
+    With one EP rank there is nothing to dispatch, and the helper's ``preprocess``
+    requires a group wider than one (its ``all_gather_into_tensor`` is shaped by
+    ``ep_group.size()``). Take the local path instead: it is the same math without the
+    all-to-all, and it is what ``ep_size == 1`` means.
     """
-    from ....distributed.moe import dispatch_to_ep_class
+    from ....distributed.moe import dispatch_to_ep_class, expert_parallel_size
 
     routing_weights = routing_weights.to(dtype=hidden_states.dtype)
+
+    if expert_parallel_size() <= 1:
+        return npu_non_ep_forward(
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            fc1_1_2_weight,
+            fc2_weight,
+            gate_up_delta,
+            down_delta,
+        )
 
     return dispatch_to_ep_class(
         _NpuLoRADeltasEP,

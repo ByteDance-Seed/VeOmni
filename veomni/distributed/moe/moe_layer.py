@@ -105,6 +105,21 @@ def token_pre_all2all(
     return global_permuted_hidden_states, routing_map, local_input_permutation_mapping, org_hidden_states_shape
 
 
+def expert_parallel_size() -> int:
+    """The ``ep`` axis size, read without assuming the axis is named ``ep``.
+
+    ``ParallelState.ep_enabled`` indexes ``extra_parallel_sizes["ep"]``
+    unconditionally, and ``_init_parallel_state`` builds that dict from
+    ``extra_parallel_names``. A state initialized with, say, ``("ple",)`` has no
+    ``"ep"`` key, so asking whether expert weights are sharded raised
+    ``KeyError: 'ep'`` -- which took out tests that never touch experts, because this
+    check runs on every call. The question here is only "is expert parallelism on?",
+    and a missing axis means no.
+    """
+    sizes = getattr(get_parallel_state(), "extra_parallel_sizes", None) or {}
+    return sizes.get("ep", 1)
+
+
 def cumsum_to_counts(cumsum: torch.Tensor) -> torch.Tensor:
     """Turn the cumulative expert bounds into per-expert row counts.
 

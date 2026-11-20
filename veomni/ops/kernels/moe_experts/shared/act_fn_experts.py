@@ -24,6 +24,10 @@ from torch import Tensor, nn
 
 __all__ = ["expert_parallel_size", "merged_experts_act_fn_forward"]
 
+# Re-exported: the definition lives next to ``dispatch_to_ep_class``, which is what
+# documents the axis. Kept here because this module is its natural caller.
+from .....distributed.moe import expert_parallel_size  # noqa: E402
+
 
 class _MergedExpertsActFnEP:
     """Local expert math on tokens already dispatched by EP."""
@@ -72,23 +76,6 @@ def _gated_expert_activation(
         gate = gate.clamp(max=swiglu_limit)
         up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
     return act_fn(gate) * up
-
-
-def expert_parallel_size() -> int:
-    """The ``ep`` axis size, read without assuming the axis is named ``ep``.
-
-    ``ParallelState.ep_enabled`` indexes ``extra_parallel_sizes["ep"]``
-    unconditionally, and ``_init_parallel_state`` builds that dict from
-    ``extra_parallel_names``. A state initialized with, say, ``("ple",)`` has no
-    ``"ep"`` key, so asking whether expert weights are sharded raised
-    ``KeyError: 'ep'`` -- which took out tests that never touch experts, because this
-    check runs on every call. The question here is only "is expert parallelism on?",
-    and a missing axis means no.
-    """
-    from .....distributed.parallel_state import get_parallel_state
-
-    sizes = getattr(get_parallel_state(), "extra_parallel_sizes", None) or {}
-    return sizes.get("ep", 1)
 
 
 def merged_experts_act_fn_forward(

@@ -204,7 +204,9 @@ def test_lora_npu_helper_casts_routing_weights(monkeypatch):
 
     helper.npu_non_ep_forward(2, routing, selected, hidden, fc1, fc2, zero_delta, zero_delta)
 
-    # EP half: capture the dtype handed to the shared dispatch helper.
+    # EP half: capture the dtype handed to the shared dispatch helper. `ep_size` must be
+    # above 1 for that helper to be called at all -- with a single rank the LoRA helper
+    # takes the local path, which is the non-EP call already checked above.
     from veomni.distributed.moe import moe_layer
 
     captured: dict[str, torch.dtype] = {}
@@ -214,14 +216,16 @@ def test_lora_npu_helper_casts_routing_weights(monkeypatch):
         captured["dtype"] = routing_weights.dtype
         return hidden
 
-    monkeypatch.setattr(moe_layer, "dispatch_to_ep_class", fake_dispatch, raising=False)
+    monkeypatch.setattr(moe_layer, "dispatch_to_ep_class", fake_dispatch)
+    monkeypatch.setattr(moe_layer, "expert_parallel_size", lambda: 2)
     import veomni.distributed.moe as moe_pkg
 
-    monkeypatch.setattr(moe_pkg, "dispatch_to_ep_class", fake_dispatch, raising=False)
+    monkeypatch.setattr(moe_pkg, "dispatch_to_ep_class", fake_dispatch)
+    monkeypatch.setattr(moe_pkg, "expert_parallel_size", lambda: 2)
     helper.npu_ep_forward(2, routing, selected, hidden, fc1, fc2, zero_delta, zero_delta)
 
-    assert seen == [torch.bfloat16]
-    assert captured["dtype"] == torch.bfloat16
+    assert seen == [torch.bfloat16], "the non-EP cast"
+    assert captured["dtype"] == torch.bfloat16, "the EP cast before dispatch"
 
 
 @pytest.mark.parametrize("mode", ["shared", "independent"])
