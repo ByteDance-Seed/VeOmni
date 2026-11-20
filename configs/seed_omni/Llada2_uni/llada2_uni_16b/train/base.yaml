@@ -99,9 +99,41 @@ train:
 
 infer:
   generation_kwargs:
-    max_new_tokens: 512
+    # The FSM stops on a per-node signal, not on a token count, so this is an
+    # upper bound on *states visited* rather than on generated tokens. It has to
+    # clear the longest graph in one pass:
+    #
+    #   I2T (_diffusion_init)   gen_length=128, one state per unmask step
+    #   T2I (_t2i_prompts)      n = (image_h/2/16)*(image_w/2/16) VQ tokens, so
+    #                           1024x1024 is 1024 tokens and, at one token per
+    #                           state, ~1040 states over ~33 blocks
+    #   thinking (_think_init)  thinking_gen_length=4096 before T2I even starts,
+    #                           and the grid comes from the model's own
+    #                           <|reserved_token_h|>/<|reserved_token_w|> header,
+    #                           not from image_h/image_w -- so the T2I half of a
+    #                           thinking run is not bounded by these dimensions
+    #
+    # 512 was below the T2I requirement, so `vq_done` never fired and the run
+    # fell through to `finalize: generated:text` after burning the budget -- no
+    # image, only reply.txt. 8192 covers thinking + T2I at 1024x1024 with margin;
+    # an exhausted budget aborts silently, so the margin is the only warning.
+    max_new_tokens: 8192
     gen_length: 128
-    diffusion_steps: 128
+    # Keep this at or below `block_length` (32), which is the point of zero
+    # waste: `_vq_unmask` closes a block on `step_in_block >= diffusion_steps`
+    # OR on the block having no masked position left, so anything above 32 is
+    # already harmless -- replaying the two functions' state accounting gives 32,
+    # 64 and 128 the same 1040 states at 1024x1024. Lowering it below 32 *does*
+    # change quality: 16 steps unmaskes two tokens per state (520 states) rather
+    # than trading nothing for speed. 32 matches the archived runs' behaviour.
+    #
+    # Verified on one A800 with `diffusion_steps: 16` (I2T 1.5 min, T2I 21.6 min,
+    # thinking 25.5 min at 1024x1024). 32 itself has not been run; its equivalence
+    # to 128 is a reading of the code, not a measurement.
+    #
+    # This key is shared with I2T, thinking and edit (`thinking_steps` falls
+    # back to it), so a value chosen for T2I applies to all of them.
+    diffusion_steps: 32
     temperature: 0.0
     do_sample: false
     remasking: low_confidence
