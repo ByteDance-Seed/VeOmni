@@ -756,7 +756,10 @@ def test_attention_context_parallel_narrows_to_the_query_tail(
     ori_kv = torch.randn(1, 12, _ATTN_DIM).to(torch.bfloat16)
     cmp_kv = torch.randn(1, 3, _ATTN_DIM).to(torch.bfloat16)
     sink = torch.randn(_ATTN_HEADS).to(torch.bfloat16)
-    topk = torch.zeros(1, 6, cmp_rows, dtype=torch.int32)
+    # The indexer pads its selection to the global width (three compressed rows over
+    # twelve tokens), so rank 0 receives three columns over the single row it serves.
+    topk = torch.full((1, 6, 3), -1, dtype=torch.int32)
+    topk[..., 0] = 0
 
     cann_attention.wrapper(
         q,
@@ -770,13 +773,15 @@ def test_attention_context_parallel_narrows_to_the_query_tail(
         query_offset=query_offset,
     )
 
-    ((cann_q, cann_ori_kv, cann_cmp_kv, _), kwargs) = flash_mla.calls[0]
+    ((cann_q, cann_ori_kv, cann_cmp_kv, cann_topk), kwargs) = flash_mla.calls[0]
     assert cann_q.shape == q.shape and torch.equal(cann_q, q)
     # The narrowed prefix is materialized into a canonical buffer, so compare values.
     assert cann_ori_kv.shape == (1, query_offset + 6, 1, _ATTN_DIM)
     assert torch.equal(cann_ori_kv.squeeze(2), ori_kv[:, : query_offset + 6])
     assert cann_cmp_kv.shape == (1, cmp_rows, 1, _ATTN_DIM)
     assert torch.equal(cann_cmp_kv.squeeze(2), cmp_kv[:, :cmp_rows])
+    # Producer padding past the local table is trimmed instead of rejected.
+    assert cann_topk.shape[-1] == cmp_rows
     # The compressed table is aligned to the KV prefix, not to the local query count.
     assert kwargs["cmp_residual_kv"].tolist() == [residual]
 
@@ -790,7 +795,9 @@ def test_attention_packed_context_parallel_calls_each_intersected_sample(flash_m
     ori_kv = torch.randn(1, 24, _ATTN_DIM).to(torch.bfloat16)
     cmp_kv = torch.randn(1, 5, _ATTN_DIM).to(torch.bfloat16)
     sink = torch.randn(_ATTN_HEADS).to(torch.bfloat16)
-    topk = torch.full((1, 12, 1), -1, dtype=torch.int32)
+    # The selection is padded to the global table width, so each sample carries more
+    # columns than the rows it contributes to this shard.
+    topk = torch.full((1, 12, 5), -1, dtype=torch.int32)
     topk[0, :6, 0] = 0  # first sample owns compressed row 0
     topk[0, 6:, 0] = 1  # second sample owns rows [1, 4)
 
@@ -812,6 +819,8 @@ def test_attention_packed_context_parallel_calls_each_intersected_sample(flash_m
     assert first_q.shape[1] == 6 and torch.equal(first_q, q[:, :6])
     assert first_ori.shape == (1, 6, 1, _ATTN_DIM) and first_cmp.shape == (1, 1, 1, _ATTN_DIM)
     assert first_idx[0, :, 0].tolist() == [0] * 6
+    # Columns past this sample's own table are dropped before the kernel call.
+    assert first_idx.shape[-1] == 1
     # Each sample is its own single-segment call, so no TND slices reach the kernel.
     assert "packed_sequence_slices" not in first_kwargs
 
@@ -822,6 +831,7 @@ def test_attention_packed_context_parallel_calls_each_intersected_sample(flash_m
     assert second_cmp.shape == (1, 1, 1, _ATTN_DIM)
     # Its rows start at compressed row 1, so the selection is rebased by that start.
     assert second_idx[0, :, 0].tolist() == [0] * 6
+    assert second_idx.shape[-1] == 1
 
 
 def test_attention_packed_context_parallel_leaves_short_samples_to_eager(flash_mla: _FlashMlaRecorder):
@@ -996,6 +1006,31 @@ def test_attention_rejects_a_selection_narrower_than_the_kernel_serves():
             sliding_window=_WINDOW,
             compress_ratio=_RATE,
             candidates=candidates,
+        )
+
+
+def test_attention_rejects_padding_that_names_a_row_past_the_local_table():
+    # A context-parallel rank receives the producer's global-width selection, padded
+    # with ``-1``. Trailing padding is trimmed, but a real index there addresses a
+    # compressed row this call does not serve and must stay an error.
+    q = torch.randn(1, 6, _ATTN_HEADS, _ATTN_DIM).to(torch.bfloat16)
+    ori_kv = torch.randn(1, 6, _ATTN_DIM).to(torch.bfloat16)
+    cmp_kv = torch.randn(1, 1, _ATTN_DIM).to(torch.bfloat16)
+    sink = torch.randn(_ATTN_HEADS)
+    topk = torch.full((1, 6, 3), -1, dtype=torch.int32)
+    topk[..., 0] = 0
+    topk[..., 2] = 2
+
+    with pytest.raises(ValueError, match=r"selects a row past it"):
+        cann_attention.wrapper(
+            q,
+            ori_kv,
+            cmp_kv,
+            sink,
+            torch.arange(6).unsqueeze(0),
+            sliding_window=_WINDOW,
+            compress_ratio=_RATE,
+            candidates=CompressedCandidates(topk_indices=topk),
         )
 
 
