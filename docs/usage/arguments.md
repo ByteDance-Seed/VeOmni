@@ -485,12 +485,13 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 
 #### SeedOmni: per-module opt-in
 
-SeedOmni compiles a module only when **two** switches are on:
+SeedOmni compiles a module when **three** things allow it:
 
-1. `model.accelerator.torch_compile.enable` — the run-wide switch, validated like any other accelerator field;
-2. the module's `supports_torch_compile = True` class attribute in its `modeling.py`.
+1. the module's own resolved `accelerator.torch_compile.enable` — the launcher default, which a per-module `accelerator:` YAML overlay can flip either way for one module;
+2. the module's `supports_torch_compile = True` class attribute in its `modeling.py`;
+3. `fsdp_mode: fsdp2` for that module — `compile_decoder_blocks` does not run under DDP.
 
-The second gate exists because compile pays off by module, not by model. Measured on A100-80GB per module (forward+backward, `backend="inductor"`, `dynamic=False`):
+The class attribute exists because compile pays off by module, not by model; (1) is what lets an overlay say "not this one", and (3) is why the shipped Janus launcher's `ddp` setting for `janus_siglip` quietly keeps it eager. Measured on A100-80GB per module (forward+backward, `backend="inductor"`, `dynamic=False`):
 
 | module | speedup |
 | --- | --- |
@@ -500,7 +501,7 @@ The second gate exists because compile pays off by module, not by model. Measure
 | `janus_siglip` | ~1.12x |
 | `bagel_siglip_navit` | ~1.02x (stays `False`) |
 
-A module that leaves the flag `False` trains eagerly inside the same run: under `fsdp_scope='model'` the composed `OmniModel` is compiled once, and only the opted-in children contribute block scopes. A run that enables compile with no opted-in module logs that and compiles nothing rather than failing.
+A module that fails any of the three trains eagerly inside the same run: under `fsdp_scope='model'` the composed `OmniModel` is compiled once, and only the children that passed all three contribute block scopes. The run-level `enable` is the default each module's resolution starts from, not a second veto — a module whose overlay turns it on is compiled even when that default is off. A run where nothing passes logs that and compiles nothing rather than failing.
 
 **`dynamic=True` is a second per-module opt-in, and for a text backbone it is required.** `dynamic` lets one Inductor graph cover a range of shapes. SeedOmni's collator does no padding (`SeedOmniCollator`: "no stacking, no padding"), so a text backbone's packed length differs every step, and a static compile recompiles per new length. Measured on a 4-layer stack over 40 drawn lengths spanning 280–2900 tokens:
 

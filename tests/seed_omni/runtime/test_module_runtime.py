@@ -907,3 +907,71 @@ def test_compilable_scope_is_empty_when_every_module_overlay_turns_compile_off()
 
     assert _compilable_scope(runtimes) == []
     assert _dynamic_scope(runtimes) == []
+
+
+def test_a_child_only_enable_is_not_vetoed_by_the_top_level_switch():
+    """`enable: true` on one module compiles it even when the launcher default is off.
+
+    The composed path used to AND the top-level switch into
+    ``compile_config.enable``, which silently dropped a per-module opt-in — the
+    mirror of ignoring a per-module opt-out. The scopes carry the decision, and
+    the top-level switch is only the default each module's resolution starts
+    from.
+    """
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
+        _compilable_scope,
+        _dynamic_scope,
+    )
+
+    model = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True)
+    runtimes = {"llm": _fake_runtime(model, enable=True)}
+
+    # This is what the composed wrap derives, and what it hands compile_decoder_blocks.
+    scopes = _compilable_scope(runtimes)
+    assert scopes == ["llm"]
+    assert bool(scopes) is True  # `compile_config.enable` is `bool(scopes)`, not ANDed with the global flag
+    assert _dynamic_scope(runtimes) == ["llm"]
+
+
+def test_dynamic_scopes_reach_the_blocks_they_name():
+    """`dynamic_scopes` only bites when the run-level `dynamic` is also on.
+
+    That is why the composed wrap derives `compile_config.dynamic` from the
+    scopes: copying the top-level flag would leave a module that opted into
+    `dynamic` compiled static, silently.
+    """
+    import torch.nn as nn
+
+    from veomni.distributed.torch_compile import CompileConfig, compile_decoder_blocks
+
+    class Block(nn.Module):
+        def forward(self, x):
+            return x
+
+    class TwoChildren(nn.Module):
+        _no_split_modules = ["llm.Block", "codec.Block"]
+
+        def __init__(self):
+            super().__init__()
+            self.llm = nn.Module()
+            self.llm.layers = nn.ModuleList([Block()])
+            self.codec = nn.Module()
+            self.codec.blocks = nn.ModuleList([Block()])
+
+    import torch
+
+    original = torch.compile
+    torch.compile = lambda fn, **_: fn
+    try:
+        model = TwoChildren()
+        compile_decoder_blocks(
+            model,
+            CompileConfig(enable=True, dynamic=True),  # derived as bool(dynamic_scopes)
+            scopes=["llm", "codec"],
+            dynamic_scopes=["llm"],
+        )
+    finally:
+        torch.compile = original
+
+    assert model.llm.layers[0]._veomni_compile_config["dynamic"] is True
+    assert model.codec.blocks[0]._veomni_compile_config["dynamic"] is False

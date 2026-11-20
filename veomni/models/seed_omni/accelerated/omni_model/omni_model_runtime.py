@@ -363,12 +363,24 @@ class OmniModelRuntime:
         # One tree, one compile call, but only the modules that opted in. The
         # rest keep running eagerly; a run where nothing opted in compiles
         # nothing at all rather than failing the "found no decoder blocks" check.
+        #
+        # The scopes carry the decision: a module is compiled when its own
+        # resolved ``enable``, its ``supports_torch_compile`` and its ``fsdp_mode``
+        # all allow it, and that survives a per-module YAML overlay. The
+        # top-level switch is the launcher-level default each module's resolution
+        # starts from, so it does not get a second veto here — applying one would
+        # drop a child-only ``enable: true``, which the overlay support exists to
+        # allow.
         compile_scopes = _compilable_scope(modules_to_wrap)
         dynamic_scopes = _dynamic_scope(modules_to_wrap)
         compile_config = CompileConfig(
             **{field.name: getattr(acc.torch_compile, field.name) for field in fields(CompileConfig)}
         )
-        compile_config.enable = bool(compile_config.enable) and bool(compile_scopes)
+        compile_config.enable = bool(compile_scopes)
+        # ``dynamic`` is likewise per module: ``dynamic_scopes`` says which blocks
+        # take the shape-polymorphic path, and the scope list is what decides, not
+        # the top-level flag.
+        compile_config.dynamic = bool(dynamic_scopes)
         if acc.torch_compile.enable and not compile_scopes:
             logger.info_rank0(
                 "OmniModelRuntime: accelerator.torch_compile.enable is set but no module declares "
