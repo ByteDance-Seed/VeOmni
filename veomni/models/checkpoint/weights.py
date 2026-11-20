@@ -660,7 +660,7 @@ def _read_persistent_extra_parallel_slice(
 def load_model_weights_ep_sharded(
     model: Union["nn.Module", "PreTrainedModel"],
     weights_path: str,
-    init_device: Literal["cpu", "cuda", "npu"] = "cuda",
+    init_device: Literal["cpu", "cuda", "npu", "mlu", "xpu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     **kwargs,
 ) -> None:

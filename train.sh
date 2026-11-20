@@ -34,9 +34,11 @@ elif command -v cnmon &> /dev/null; then
   else
     NPROC_PER_NODE=${NPROC_PER_NODE:=$(cnmon -l 2>/dev/null | grep -c "MLU")}
   fi
-elif XPU_COUNT=$(python3 -c 'import torch; print(0 if hasattr(torch, "npu") else torch.xpu.device_count())' 2>/dev/null) && [[ "${XPU_COUNT:-0}" -gt 0 ]]; then
-  # Intel GPU (XPU). device_count() already honors ZE_AFFINITY_MASK. Like the
-  # runtime, prefer NPU when torch_npu is loaded.
+elif ! command -v npu-smi &> /dev/null && [[ ! -e /dev/davinci_manager ]] \
+  && XPU_COUNT=$(python3 -c 'import torch; print(torch.xpu.device_count() if hasattr(torch, "xpu") and not hasattr(torch, "npu") else 0)' 2>/dev/null) \
+  && [[ "${XPU_COUNT:-0}" -gt 0 ]]; then
+  # Intel GPU (XPU). Checked after NPU, like get_device_type(), so Ascend hosts
+  # never start Python here. device_count() already honors ZE_AFFINITY_MASK.
   NPROC_PER_NODE=${NPROC_PER_NODE:=${XPU_COUNT}}
 else
   # NPU
