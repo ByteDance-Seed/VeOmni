@@ -162,12 +162,23 @@ def _dynamic_scope(module_runtimes: Mapping[str, ModuleRuntime]) -> list[str]:
     Inductor's shape-polymorphic tax for nothing (``janus_vqvae`` measured 30%
     slower with it on). Applying one run-level flag to both would give the codec
     the regression this PR exists to avoid.
+
+    The conditions are the same three as :func:`_compilable_scope` plus the
+    ``dynamic`` declaration, ANDed, matching what
+    :func:`~...omni_module.omni_module_runtime.module_compile_config` computes for
+    a lone module. The module's own resolved ``torch_compile.dynamic`` is one of
+    them: it is the launcher default the module's overlay merges over, so a run
+    that left ``dynamic`` off stays static here too. Reading only the class
+    attribute would make ``fsdp_scope='model'`` compile dynamic where
+    ``fsdp_scope='module'`` compiles static for the same config.
     """
     compilable = set(_compilable_scope(module_runtimes))
     return [
         name
         for name, runtime in module_runtimes.items()
-        if name in compilable and getattr(runtime.model, "supports_torch_compile_dynamic", False)
+        if name in compilable
+        and runtime.args.accelerator.torch_compile.dynamic
+        and getattr(runtime.model, "supports_torch_compile_dynamic", False)
     ]
 
 

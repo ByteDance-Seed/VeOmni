@@ -799,17 +799,18 @@ def test_a_module_without_the_dynamic_flag_gets_dynamic_off():
     assert module_compile_config(accelerator, SimpleNamespace(supports_torch_compile=True)).dynamic is False
 
 
-def _fake_runtime(model, *, fsdp_mode="fsdp2", enable=True):
+def _fake_runtime(model, *, fsdp_mode="fsdp2", enable=True, dynamic=True):
     """A ``ModuleRuntime`` stub carrying just what the scope helpers read.
 
-    ``enable`` is the module's own resolved ``accelerator.torch_compile.enable``,
-    which a per-module YAML overlay can set.
+    ``enable`` / ``dynamic`` are the module's own resolved
+    ``accelerator.torch_compile.*`` values, which a per-module YAML overlay can
+    set and which both scope helpers consult alongside the class attributes.
     """
     return SimpleNamespace(
         model=model,
         args=SimpleNamespace(
             accelerator=SimpleNamespace(
-                torch_compile=SimpleNamespace(enable=enable),
+                torch_compile=SimpleNamespace(enable=enable, dynamic=dynamic),
                 fsdp_config=SimpleNamespace(fsdp_mode=fsdp_mode),
             )
         ),
@@ -975,3 +976,48 @@ def test_dynamic_scopes_reach_the_blocks_they_name():
 
     assert model.llm.layers[0]._veomni_compile_config["dynamic"] is True
     assert model.codec.blocks[0]._veomni_compile_config["dynamic"] is False
+
+
+@pytest.mark.parametrize("run_enable", [False, True])
+@pytest.mark.parametrize("run_dynamic", [False, True])
+@pytest.mark.parametrize("supports", [False, True])
+@pytest.mark.parametrize("supports_dynamic", [False, True])
+@pytest.mark.parametrize("fsdp_mode", ["fsdp2", "ddp"])
+def test_both_compile_paths_agree_for_every_combination(
+    run_enable, run_dynamic, supports, supports_dynamic, fsdp_mode
+):
+    """A module compiles the same way under either ``fsdp_scope``.
+
+    The two paths reach the decision through different shapes — one builds a
+    ``CompileConfig`` per module, the other derives scope lists for a single
+    composed wrap — so they had drifted twice: a per-module opt-out ignored, then
+    a per-module opt-in vetoed. This pins all 32 combinations so a third drift
+    is a test failure rather than a reviewer finding.
+    """
+    from veomni.models.seed_omni.accelerated.omni_model.omni_model_runtime import (
+        _compilable_scope,
+        _dynamic_scope,
+    )
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    accelerator = SimpleNamespace(
+        torch_compile=SimpleNamespace(
+            enable=run_enable, backend="inductor", mode=None, fullgraph=True, dynamic=run_dynamic
+        ),
+        fsdp_config=SimpleNamespace(fsdp_mode=fsdp_mode),
+    )
+    module_flags = SimpleNamespace(supports_torch_compile=supports, supports_torch_compile_dynamic=supports_dynamic)
+
+    # fsdp_scope='module': one config for the module itself.
+    per_module = module_compile_config(accelerator, module_flags)
+
+    # fsdp_scope='model': the scope lists decide, and the caller derives the two
+    # config flags from them.
+    runtime = SimpleNamespace(
+        model=module_flags,
+        args=SimpleNamespace(accelerator=accelerator),
+    )
+    scopes = _compilable_scope({"m": runtime})
+    dynamic_scopes = _dynamic_scope({"m": runtime})
+
+    assert (per_module.enable, per_module.dynamic) == (bool(scopes), bool(dynamic_scopes))

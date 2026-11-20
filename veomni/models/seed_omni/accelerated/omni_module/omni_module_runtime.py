@@ -102,12 +102,17 @@ def module_compile_config(accelerator: "AcceleratorConfig", module: nn.Module):
     supported = bool(getattr(module, "supports_torch_compile", False))
     dynamic_ok = bool(getattr(module, "supports_torch_compile_dynamic", False))
     fsdp2 = accelerator.fsdp_config.fsdp_mode == "fsdp2"
+    enabled = bool(run_config.enable) and supported and fsdp2
     return CompileConfig(
-        enable=bool(run_config.enable) and supported and fsdp2,
+        enable=enabled,
         backend=run_config.backend,
         mode=run_config.mode,
         fullgraph=run_config.fullgraph,
-        dynamic=bool(run_config.dynamic) and dynamic_ok,
+        # ``dynamic`` is meaningless unless this module is compiled, so it carries
+        # the same gates. Keeping the two derived from one ``enabled`` is what
+        # makes this agree with ``_dynamic_scope`` on the composed path, where the
+        # scope lists are the single source of truth.
+        dynamic=enabled and bool(run_config.dynamic) and dynamic_ok,
     )
 
 
