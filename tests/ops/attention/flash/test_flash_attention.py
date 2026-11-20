@@ -313,6 +313,33 @@ def test_flash_attention_preserves_layout_and_backend_contract(monkeypatch):
     assert attention_weights is None
 
 
+def test_flash_attention_fp32_query_follows_autocast_of_the_query_device(monkeypatch):
+    """An fp32 query under autocast must be cast to that device's autocast dtype.
+
+    ``torch.is_autocast_enabled()`` without a device only reflects CUDA autocast, so this
+    used to fall through to the fp32 ``Linear`` weight dtype on every non-CUDA backend (XPU, NPU, CPU).
+    """
+    captured = {}
+
+    def replacement_backend(query, key, value, attention_mask, **kwargs):
+        captured.update(kwargs)
+        return query
+
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", replacement_backend)
+    monkeypatch.setattr(flash_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: False)
+
+    module = _FakeAttentionModule("veomni_flash_attention_2")  # fp32 Linear weight: the fallback dtype
+    query = torch.randn(2, 4, 3, 4, dtype=torch.float32)
+    key, value = query.clone(), query.clone()
+
+    flash_backend.flash_attention_forward(module, query, key, value, None)
+    assert captured["target_dtype"] == torch.float32  # no autocast: weight dtype
+
+    with torch.autocast(query.device.type, dtype=torch.bfloat16):
+        flash_backend.flash_attention_forward(module, query, key, value, None)
+    assert captured["target_dtype"] == torch.bfloat16
+
+
 def test_flash_attention_delegates_active_ulysses_to_shared_helpers(monkeypatch):
     group = object()
     state = SimpleNamespace(ulysses_group=group, ulysses_size=2)
@@ -581,7 +608,38 @@ def test_gpt_oss_attention_passes_learnable_sinks_through_hf_dict():
         ("veomni_flash_attention_3_hub", "kernels-community/flash-attn3"),
     ],
 )
-def test_hub_flash_loader_requests_the_transformers_selected_version(monkeypatch, implementation, repository):
+def test_hub_flash_loader_uses_pinned_kernels_artifact(monkeypatch, implementation, repository):
+    import sys
+
+    from veomni.ops import install as install_backend
+
+    calls = []
+    kernel = SimpleNamespace(flash_attn_func=object(), flash_attn_varlen_func=object())
+
+    def get_kernel(requested_repository, *, version):
+        calls.append((requested_repository, version))
+        return kernel
+
+    monkeypatch.setitem(sys.modules, "kernels", SimpleNamespace(get_kernel=get_kernel))
+    monkeypatch.setattr(install_backend, "IS_XPU_AVAILABLE", False)
+    install_backend._load_hub_flash_kernel.cache_clear()
+    try:
+        loaded = install_backend._load_veomni_local_flash_kernel(implementation)
+        assert loaded is kernel
+        assert install_backend._load_veomni_local_flash_kernel(implementation) is kernel
+        assert calls == [(repository, 1)]
+    finally:
+        install_backend._load_hub_flash_kernel.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("implementation", "repository"),
+    [
+        ("veomni_flash_attention_2_hub", "kernels-community/flash-attn2"),
+        ("veomni_flash_attention_3_hub", "kernels-community/flash-attn3"),
+    ],
+)
+def test_hub_flash_loader_requests_the_transformers_selected_version_on_xpu(monkeypatch, implementation, repository):
     import sys
 
     import transformers.integrations.hub_kernels as hub_kernels
@@ -596,24 +654,42 @@ def test_hub_flash_loader_requests_the_transformers_selected_version(monkeypatch
         return kernel
 
     monkeypatch.setitem(sys.modules, "kernels", SimpleNamespace(get_kernel=get_kernel))
+    monkeypatch.setattr(install_backend, "IS_XPU_AVAILABLE", True)
     monkeypatch.setattr(hub_kernels, "get_attn_kernel_version", lambda repo: 7 if repo == repository else -1)
     install_backend._load_hub_flash_kernel.cache_clear()
     try:
-        loaded = install_backend._load_veomni_local_flash_kernel(implementation)
-        assert loaded is kernel
         assert install_backend._load_veomni_local_flash_kernel(implementation) is kernel
         assert calls == [(repository, 7)]
     finally:
         install_backend._load_hub_flash_kernel.cache_clear()
 
 
-def test_hub_flash_kernel_version_defaults_to_one_without_the_transformers_resolver(monkeypatch):
+def test_hub_flash_kernel_version_does_not_consult_transformers_off_xpu(monkeypatch):
     import transformers.integrations.hub_kernels as hub_kernels
 
     from veomni.ops import install as install_backend
 
-    monkeypatch.delattr(hub_kernels, "get_attn_kernel_version")
+    def unexpected(repo):
+        raise AssertionError("the Transformers resolver must not decide the CUDA artifact version")
+
+    monkeypatch.setattr(install_backend, "IS_XPU_AVAILABLE", False)
+    monkeypatch.setattr(hub_kernels, "get_attn_kernel_version", unexpected)
     assert install_backend._hub_flash_kernel_version("kernels-community/flash-attn2") == 1
+
+
+def test_hub_flash_kernel_version_defaults_to_one_on_xpu_without_a_resolved_version(monkeypatch):
+    import transformers.integrations.hub_kernels as hub_kernels
+
+    from veomni.ops import install as install_backend
+
+    monkeypatch.setattr(install_backend, "IS_XPU_AVAILABLE", True)
+    repository = "kernels-community/flash-attn2"
+
+    monkeypatch.setattr(hub_kernels, "get_attn_kernel_version", lambda repo: None)
+    assert install_backend._hub_flash_kernel_version(repository) == 1
+
+    monkeypatch.delattr(hub_kernels, "get_attn_kernel_version")
+    assert install_backend._hub_flash_kernel_version(repository) == 1
 
 
 def test_hub_flash_loader_reports_missing_kernels_dependency(monkeypatch):

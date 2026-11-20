@@ -25,6 +25,7 @@ from veomni.ops.platform import (
     GpuKernelRequirement,
     NvidiaGpuPlatform,
     RocmGpuPlatform,
+    XpuKernelRequirement,
 )
 
 
@@ -109,3 +110,23 @@ def test_gpu_requirement_requires_platforms():
     """An empty GPU requirement cannot match any platform and is rejected."""
     with pytest.raises(ValueError, match="at least one platform"):
         GpuKernelRequirement(platforms=())
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_xpu_requirement_matches_follows_xpu_availability(monkeypatch, available):
+    """XpuKernelRequirement mirrors ``IS_XPU_AVAILABLE`` and targets the ``xpu`` device."""
+    monkeypatch.setattr("veomni.ops.platform.requirement.IS_XPU_AVAILABLE", available)
+
+    requirement = XpuKernelRequirement()
+
+    assert requirement.device == "xpu"
+    assert requirement.matches() is available
+
+
+def test_xpu_requirement_check_passes_when_available_and_raises_otherwise(monkeypatch):
+    monkeypatch.setattr("veomni.ops.platform.requirement.IS_XPU_AVAILABLE", True)
+    XpuKernelRequirement().check()
+
+    monkeypatch.setattr("veomni.ops.platform.requirement.IS_XPU_AVAILABLE", False)
+    with pytest.raises(RuntimeError, match="torch.xpu device is unavailable"):
+        XpuKernelRequirement().check()

@@ -172,8 +172,8 @@ def flash_attention_forward(
     # in fp32. (usually our RMSNorm modules handle it correctly)
     target_dtype = None
     if query.dtype == torch.float32:
-        if torch.is_autocast_enabled():
-            target_dtype = torch.get_autocast_gpu_dtype()
+        if torch.is_autocast_enabled(query.device.type):
+            target_dtype = torch.get_autocast_dtype(query.device.type)
         # Handle the case where the model is quantized
         elif hasattr(module.config, "_pre_quantization_dtype"):
             target_dtype = module.config._pre_quantization_dtype

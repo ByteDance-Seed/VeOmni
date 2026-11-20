@@ -48,9 +48,9 @@ For VeOmni names, the adapter returns a kernel-like object exposing:
 mapped to local or explicitly selected Hub FA2/FA3/FA4/AITER backends:
 
 - `veomni_flash_attention_2` -> `flash_attn.flash_attn_func` / `flash_attn.flash_attn_varlen_func`
-- `veomni_flash_attention_2_hub` -> `kernels-community/flash-attn2` functions at the Hub major version Transformers selects for it (`get_attn_kernel_version`; version 1 if unavailable)
+- `veomni_flash_attention_2_hub` -> `kernels-community/flash-attn2` functions: version 1 on CUDA; on Intel XPU, the Hub major version Transformers selects for it (`get_attn_kernel_version`; version 1 if unavailable)
 - `veomni_flash_attention_3` -> `flash_attn_interface.flash_attn_func` / `flash_attn_interface.flash_attn_varlen_func`
-- `veomni_flash_attention_3_hub` -> `kernels-community/flash-attn3` functions at the Hub major version Transformers selects for it
+- `veomni_flash_attention_3_hub` -> `kernels-community/flash-attn3` functions: version 1 on CUDA; on Intel XPU, the Hub major version Transformers selects for it
 - `veomni_flash_attention_4` -> `flash_attn.cute.flash_attn_func` / `flash_attn.cute.flash_attn_varlen_func`
 - `veomni_flash_attention_aiter` -> AITER's FMHA-v3 dense / varlen functions through VeOmni's calling-convention adapter
 
@@ -80,7 +80,7 @@ After `import veomni`:
 - This adapter is a compatibility bridge for Transformers 5.x behavior around flash preload.
 - It does not change VeOmni SP attention semantics.
 - Hub FA2/FA3 require `MODELING_BACKEND=veomni` and are rejected on Ascend NPU, including their normalized `veomni_*_hub` aliases. Config parsing and model construction reject these requests before HF preloading, which would otherwise silently select built-in NPU attention instead of the requested Hub kernel.
-- Local FA2/FA3/FA4/AITER names do not require the `kernels` Python package. The explicit `flash_attention_2_hub` and `flash_attention_3_hub` backends require `kernels`, which is included in the GPU extra, and download or reuse version 1 of `kernels-community/flash-attn2` or `kernels-community/flash-attn3`, respectively.
+- Local FA2/FA3/FA4/AITER names do not require the `kernels` Python package. The explicit `flash_attention_2_hub` and `flash_attention_3_hub` backends require `kernels`, which is included in the GPU extra, and download or reuse version 1 of `kernels-community/flash-attn2` or `kernels-community/flash-attn3`, respectively (on Intel XPU, the Hub major version Transformers selects for the repository).
 - FA2 and local FA3 have dedicated branches in `_lazy_imports` and are resolved
   directly without reaching the hub-kernel path. The adapter is therefore a
   no-op for those two in practice, but is kept for safety.
