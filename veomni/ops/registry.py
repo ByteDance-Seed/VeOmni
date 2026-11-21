@@ -24,7 +24,7 @@ Hardware ``requirement`` and software ``requires`` decide availability.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import re
 from dataclasses import dataclass, field
 from inspect import Parameter, signature
 from typing import Any, Callable
@@ -35,7 +35,6 @@ from torch import Tensor
 from ..utils.device import get_device_type
 from ..utils.import_utils import is_package_available
 from .platform import ANY_DEVICE, KernelRequirement
-from .selection import OpsSelection
 
 
 Output = Tensor | tuple[Tensor, ...]
@@ -165,12 +164,6 @@ class OpEntry:
     requirement: KernelRequirement | None = None
     requires: tuple[str, ...] = ()
     default: bool = False
-    #: Numeric formats this row can round to, as the values its ``dtype`` argument
-    #: accepts. Empty for a row that rounds nothing. The format is a row *argument*
-    #: rather than part of the name: ``qat`` serves FP8 and FP4 checkpoints, and
-    #: ``torchao`` serves whatever torchao can quantize, so naming the row after one
-    #: format would either multiply rows or lie.
-    dtypes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate the raw/wrapper pairing and generate the wrapper if needed."""
@@ -184,10 +177,6 @@ class OpEntry:
             raise ValueError("requires must not contain duplicate package names")
         if not isinstance(self.default, bool):
             raise TypeError("default must be a bool")
-        if not isinstance(self.dtypes, tuple) or not all(
-            isinstance(name, str) and name.strip() for name in self.dtypes
-        ):
-            raise TypeError("dtypes must be a tuple of non-empty format names")
         if self.default and self.requirement is None:
             raise ValueError(
                 "default=True requires a device-specific requirement; eager is already the fallback default"
@@ -310,19 +299,6 @@ class OpRegistry:
                 seen.append(impl)
         return seen
 
-    def all_impls(self, op: str) -> list[str]:
-        """Return every registered impl name for ``op``, across variants and devices.
-
-        For the config-time checks that ask what a *family* can express rather than
-        what one variant on this host can run: a key written on a family field is
-        meaningful if any row of that family takes it.
-        """
-        seen: list[str] = []
-        for entry_op, _variant, impl, _device in self._entries:
-            if entry_op == op and impl not in seen:
-                seen.append(impl)
-        return seen
-
     def list_available(self, op: str, variant: str) -> list[str]:
         """Return impl names whose hardware and optional packages are available."""
         device = get_device_type()
@@ -339,65 +315,6 @@ class OpRegistry:
             if impl not in seen:
                 seen.append(impl)
         return seen
-
-    def first_entry(self, op: str, impl: str, *, variant: str | None = None) -> OpEntry | None:
-        """Some registered entry for ``(op, impl)`` (optionally matching ``variant``), ignoring device.
-
-        For the checks that must run before hardware resolution: the formats a row
-        accepts and the keys it takes do not depend on which device registered it, so
-        any entry answers. Returns ``None`` when no device registers the name, which
-        the caller leaves to ``resolve`` to report.
-        """
-        for (entry_op, entry_variant, entry_impl, _device), entry in self._entries.items():
-            if entry_op == op and entry_impl == impl and (variant is None or entry_variant == variant):
-                return entry
-        return None
-
-    def row_dtypes(self, op: str, impl: str, *, variant: str | None = None) -> tuple[str, ...] | None:
-        """The formats ``impl`` of ``op`` can round to, or ``None`` if unregistered.
-
-        An empty tuple is a valid answer: an ``EXACT`` row rounds nothing, so there is
-        no format to choose. ``None`` means the row does not exist at all.
-        """
-        entry = self.first_entry(op, impl, variant=variant)
-        return None if entry is None else entry.dtypes
-
-    def row_arguments(self, op: str, impl: str, *, variant: str | None = None) -> dict[str, Any] | None:
-        """The keyword arguments a selection may set on ``impl`` of ``op``, name to default.
-
-        Read from the raw ``forward``, which carries the real signature; the
-        generated ``wrapper`` is ``(*tensors, **attrs)`` and would accept anything.
-
-        Only keyword-only parameters *with a default* are listed. A parameter with
-        no default is one the row cannot run without, so the modeling always passes
-        it and it describes the shape of the computation -- ``num_experts`` is the
-        expert count of the module, not a preference. Letting a config set it would
-        let a YAML typo launch the kernel over the wrong number of experts. It stays
-        call-only, which is also why the third precedence step does not reach it.
-
-        When ``variant`` is given, inspects only that variant; otherwise aggregates
-        across variants so family-wide config checks see every row's arguments.
-        Returns ``None`` when ``impl`` is not registered for ``op`` on any device.
-        """
-        found = False
-        collected: dict[str, Any] = {}
-        for (entry_op, entry_variant, entry_impl, _device), entry in self._entries.items():
-            if entry_op != op or entry_impl != impl:
-                continue
-            if variant is not None and entry_variant != variant:
-                continue
-            fn = entry.forward or entry.wrapper
-            if fn is None:
-                continue
-            found = True
-            # ``KEYWORD_ONLY`` only: the tensor operands are positional, so a
-            # selection never supplies them and listing them would suggest it could.
-            for name, parameter in signature(fn).parameters.items():
-                if parameter.kind is Parameter.KEYWORD_ONLY and parameter.default is not Parameter.empty:
-                    collected.setdefault(name, parameter.default)
-            if variant is not None:
-                break
-        return collected if found else None
 
     def list_entries(self, op: str, variant: str) -> list[OpEntry]:
         """Return every registered row for ``(op, variant)``.
@@ -447,7 +364,6 @@ def register_op(
     requirement: KernelRequirement | None = None,
     requires: tuple[str, ...] = (),
     default: bool = False,
-    dtypes: tuple[str, ...] = (),
 ) -> None:
     """Register one row on ``OP_REGISTRY``.
 
@@ -459,9 +375,6 @@ def register_op(
     ``default=True`` marks a device-specific row as a host default candidate
     in registration order. ``resolve_op`` resolves ``impl=None`` through
     ``default_impl(op, variant)``.
-    ``dtypes`` lists the formats the row's ``dtype`` argument accepts. The format is
-    an argument, not part of the name: ``qat`` serves an FP8 and an FP4 checkpoint,
-    and ``torchao`` serves whatever torchao can quantize.
     """
     OP_REGISTRY.register(
         OpEntry(
@@ -475,7 +388,6 @@ def register_op(
             requirement=requirement,
             requires=requires,
             default=default,
-            dtypes=dtypes,
         )
     )
 
@@ -485,82 +397,78 @@ def resolve_op(op: str, variant: str, impl: str | None = None) -> OpEntry:
     return OP_REGISTRY.resolve(op, variant, impl)
 
 
-def _kwargs_key(kwargs: Mapping[str, Any]) -> tuple:
-    """Hashable form of a row-argument mapping, for the intern key."""
-    return tuple(sorted(kwargs.items()))
+@dataclass
+class SiteOverride:
+    """Regex override for a subset of sites within one op family."""
+
+    site: str
+    name: str | None = None
+    kwargs: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        self._pattern = re.compile(self.site)
+
+    def matches(self, site: str) -> bool:
+        """Return whether ``site`` matches this override pattern."""
+        return self._pattern.fullmatch(site) is not None
 
 
-def _rebuild_op(op: str, variant: str, impl: str, kwargs: Mapping[str, Any]) -> VeomniOp:
-    """Reconstruct an interned handle from its pickle payload."""
-    return VeomniOp(op, variant, impl).with_kwargs(kwargs)
+@dataclass
+class OpsSelection:
+    """Per-site op selection: default row name, row kwargs, and optional site overrides."""
 
+    name: str | None = None
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    overrides: list[SiteOverride] = field(default_factory=list)
 
-def _filter_kwargs(entry: OpEntry, kwargs: Mapping[str, Any]) -> dict[str, Any]:
-    """The subset of ``kwargs`` this row can honour, dropping the rest.
+    def resolve(self, site: str | None = None) -> tuple[str | None, dict[str, Any]]:
+        """Resolve ``(impl, kwargs)`` for ``site``, applying matching overrides in order."""
+        name, kwargs = self.name, dict(self.kwargs)
+        if not self.overrides or site is None:
+            return name, kwargs
+        for rule in self.overrides:
+            if not rule.matches(site):
+                continue
+            if rule.name is not None and name is not None and rule.name != name:
+                name = rule.name
+                kwargs = dict(rule.kwargs or {})
+            else:
+                if rule.name is not None:
+                    name = rule.name
+                if rule.kwargs:
+                    kwargs.update(rule.kwargs)
+        return name, kwargs
 
-    A row argument says how to round: ``dtype``, ``block_size``, the checkpoint's
-    ``expert_dtype``. A family field names one row for every site of a family, so
-    the enclosing block's ``kwargs`` describe *that* row; a site that overrides the
-    name to a row with a different signature is not asking for them. Passing a key
-    the row does not take would either raise on a legitimate config or -- worse,
-    for a row whose signature has a ``**attrs`` tail -- be dropped at the call.
+    def all_impls(self) -> list[str | None]:
+        """Every row name reachable from the default or any override."""
+        seen: list[str | None] = [self.name]
+        for rule in self.overrides:
+            if rule.name is not None and rule.name not in seen:
+                seen.append(rule.name)
+        return seen
 
-    Dropping is only safe because the config layer has already refused a key that
-    is meaningless for *every* row of the family (see
-    ``OpsImplementationConfig._validate_row_arguments``): a typo like ``block_siz``
-    is caught there, against the whole family, before any site is resolved. What
-    reaches here and is dropped is inherited, not requested at this site.
-
-    A parameter the row *requires* is never passed from a config either; it
-    describes the shape of the computation, so the modeling supplies it at the call.
-
-    A ``dtype`` the row cannot round to is **not** dropped, even when the key itself
-    is accepted: that is a config asking for a format this row does not implement,
-    and the run would quietly use another one. ``emulated`` is the same kind of
-    answer -- a row that offers only one mode cannot honour a request for the other,
-    so it is dropped, but a non-bool is a mistake in any row that takes it.
-    """
-    if not kwargs:
-        return {}
-    accepted = OP_REGISTRY.row_arguments(entry.op, entry.impl, variant=entry.variant)
-    if accepted is None:
-        # Unregistered for every device; ``resolve`` reports that, not this.
-        return dict(kwargs)
-    if "dtype" in kwargs and entry.dtypes:
-        _check_dtype(entry, kwargs["dtype"])
-    kept = {key: value for key, value in kwargs.items() if key in accepted}
-    if "emulated" in kept and kept["emulated"] is not None and type(kept["emulated"]) is not bool:
-        raise ValueError(
-            f"{entry.op}/{entry.variant}/{entry.impl}: emulated must be a bool, got {kept['emulated']!r}."
-        )
-    if "recipe" in kept and kept["recipe"] is not None and entry.impl == "torchao":
-        from .torchao import validate_float8_recipe
-
-        validate_float8_recipe(kept["recipe"])
-    return kept
-
-
-def _check_dtype(entry: OpEntry, dtype: Any) -> None:
-    """Refuse a format the row does not round to."""
-    if not entry.dtypes:
-        return
-    if dtype not in entry.dtypes:
-        raise ValueError(
-            f"{entry.op}/{entry.variant}/{entry.impl} cannot round to {dtype!r}; it supports "
-            f"{sorted(entry.dtypes)}. The format is a row argument, not part of the name, so a row that "
-            "handles several formats states which ones here."
+    @classmethod
+    def from_config_value(cls, raw: Any) -> OpsSelection:
+        """Accept a bare row name, an ``OpsSelection``, or a YAML mapping."""
+        if raw is None:
+            return cls()
+        if isinstance(raw, str):
+            return cls(name=raw)
+        if isinstance(raw, OpsSelection):
+            return raw
+        return cls(
+            name=raw.get("name"),
+            kwargs=dict(raw.get("kwargs") or {}),
+            overrides=[
+                SiteOverride(**item) if isinstance(item, dict) else item for item in raw.get("overrides") or ()
+            ],
         )
 
 
 class VeomniOp:
-    """Local handle for one ``(op, variant, impl)`` row plus its row arguments.
+    """Local handle for one ``(op, variant, impl)`` row plus optional row kwargs.
 
-    Interned by the resolved triple *and* the row arguments: two sites that
-    resolve to the same row but pass different ``dtype`` must not share a handle,
-    or one site's rounding would leak into the other. Sites with identical
-    arguments still share one object, which is the common case -- a family with no
-    overrides produces one handle no matter how many layers bind it.
-
+    Interned by ``(op, variant, impl, kwargs)``. Always calls ``entry.wrapper``.
     Compound Functions must use ``resolve_op(...).forward`` / ``.backward``, not
     this handle.
     """
@@ -575,34 +483,17 @@ class VeomniOp:
         *,
         site: str | None = None,
     ):
-        """Return the interned handle for the resolved row and its arguments."""
+        """Return the interned handle for the resolved row and its kwargs."""
         kwargs: dict[str, Any] = {}
         if isinstance(impl, OpsSelection):
-            kwargs = impl.resolve_kwargs(site)
-            impl = impl.resolve_impl(site)
-        # Drop arguments the row cannot honour *before* resolving it, so a key the
-        # site does not use never reaches a row that would reject it, and so the
-        # intern key is built from the arguments the row actually runs with.
-        # Filtering by name rather than by resolved entry keeps it working on a host
-        # where the row does not resolve: what a row accepts is a property of the
-        # row, not of which device registered it.
-        if kwargs and impl is not None:
-            offered = OP_REGISTRY.first_entry(op, impl, variant=variant)
-            if offered is not None:
-                kwargs = _filter_kwargs(offered, kwargs)
-        # The un-resolved name is checked first, exactly as before this change. A
-        # handle whose row was resolved under a different device view is reused
-        # instead of re-resolved: a test that mocks the host as NPU and then as CPU
-        # must get its earlier handle back, not a failure from a device where the
-        # row does not exist.
+            impl, kwargs = impl.resolve(site)
+        kwargs_key = tuple(sorted(kwargs.items()))
         if impl is not None:
-            cached = cls._intern.get((op, variant, impl, _kwargs_key(kwargs)))
+            cached = cls._intern.get((op, variant, impl, kwargs_key))
             if cached is not None:
                 return cached
         entry = resolve_op(op, variant, impl)
-        if kwargs and impl is None:
-            kwargs = _filter_kwargs(entry, kwargs)
-        key = (op, variant, entry.impl, _kwargs_key(kwargs))
+        key = (op, variant, entry.impl, kwargs_key)
         cached = cls._intern.get(key)
         if cached is not None:
             return cached
@@ -636,62 +527,23 @@ class VeomniOp:
         return self
 
     def __reduce__(self):
-        """Rebuild through the interned row and its arguments rather than a bare ``__new__``."""
-        return (_rebuild_op, (self.op, self.variant, self.impl, self.kwargs))
+        """Rebuild through the interned row and its kwargs rather than a bare ``__new__``."""
+        if self.kwargs:
+            return (VeomniOp, (self.op, self.variant, OpsSelection(name=self.impl, kwargs=self.kwargs)))
+        return (VeomniOp, (self.op, self.variant, self.impl))
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Call ``entry.wrapper``. Tensors are positional, non-tensors are keywords.
-
-        The handle's row arguments win over the call's. A row argument has three
-        sources, and each may correct the one before it: the row's own signature
-        default, the value the modeling passes from the checkpoint, and the value the
-        config sets. The checkpoint records what the weights were *stored* as
-        (``expert_dtype`` is ``"fp4"`` in a V4-Flash checkpoint), while the config
-        records what this run is *asked* to train at -- so the config has to be the
-        one that survives, or a YAML that says ``dtype: fp8`` over an FP4 checkpoint
-        would be silently ignored at every call site.
-
-        A call site therefore passes what the module knows and the handle corrects it.
-        Sites that the config says nothing about keep the modeling's value, because
-        then ``self.kwargs`` simply has no entry for that key.
-        """
+        """Call ``entry.wrapper``. Handle kwargs override call-site kwargs."""
         if self._entry.wrapper is None:
             raise RuntimeError(f"VeomniOp({self.op!r}, {self.variant!r}, {self.impl!r}) has no wrapper")
         if not self.kwargs:
             return self._entry.wrapper(*args, **kwargs)
         return self._entry.wrapper(*args, **{**kwargs, **self.kwargs})
 
-    def with_kwargs(self, kwargs: Mapping[str, Any]) -> VeomniOp:
-        """Return the interned handle for this row with ``kwargs`` as its arguments."""
-        kwargs = _filter_kwargs(self._entry, kwargs)
-        key = (self.op, self.variant, self.impl, _kwargs_key(kwargs))
-        cached = self._intern.get(key)
-        if cached is not None:
-            return cached
-        instance = super().__new__(VeomniOp)
-        instance.op = self.op
-        instance.variant = self.variant
-        instance.impl = self.impl
-        instance.kwargs = dict(kwargs)
-        instance._entry = self._entry
-        self._intern[key] = instance
-        return instance
-
     @property
     def entry(self) -> OpEntry:
         """The resolved ``OpEntry`` for this handle."""
         return self._entry
-
-    @property
-    def rounds(self) -> bool:
-        """Whether this row rounds the operands it is handed.
-
-        A row declares ``dtypes`` exactly when it rounds to one of them, so that
-        tuple is the registry-visible answer. The per-family ``QUANTIZING_IMPLS``
-        sets say the same thing for the families that own one; a guard that has a
-        handle should read this, because it is derived rather than hand-listed.
-        """
-        return bool(self._entry.dtypes)
 
     def __repr__(self) -> str:
         """Return ``VeomniOp(op=..., variant=..., impl=...)``."""

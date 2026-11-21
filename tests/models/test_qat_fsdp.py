@@ -38,7 +38,7 @@ _TORCHAO_FP4_DTYPES = ("nvfp4", "mxfp4")
 
 
 def _selection(dtype: str):
-    from veomni.ops.selection import OpsSelection
+    from veomni.ops import OpsSelection
 
     return OpsSelection(name="torchao", kwargs={"dtype": dtype})
 

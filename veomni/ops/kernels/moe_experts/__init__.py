@@ -136,7 +136,6 @@ register_op(
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang", "triton"),
-    dtypes=("fp8", "fp4"),
 )
 
 register_op(
@@ -149,10 +148,6 @@ register_op(
         platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=90), NvidiaGpuPlatform(min_cc=100, max_cc=100)),
     ),
     requires=("deep_gemm", "triton"),
-    # One format today. It is still an argument rather than a name because that is
-    # the shape every rounding row uses, and DeepGEMM gaining another layout is a
-    # new value, not a new row.
-    dtypes=("fp8",),
 )
 
 register_op(

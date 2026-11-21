@@ -290,10 +290,9 @@ fake quantization, `torchao` is torchao's, `deepgemm` is the vendor's real GEMM 
 that much is what the name says. *Which* format it rounds to is `dtype`
 (`fp8`/`fp4` for `qat`, `fp8`/`nvfp4`/`mxfp4` for `torchao`, `fp8` for `deepgemm`), because
 one row serves several checkpoints and naming it after one format would either
-multiply rows or lie about the rest. Each row declares its formats at registration
-(`OP_REGISTRY.row_dtypes`) and a `dtype` outside them raises. There is no separate `enable` flag to keep in sync with it: turning
-quantization off for a site means naming a reference row such as `eager` or
-`liger_kernel` in that rule.
+multiply rows or lie about the rest. There is no separate `enable` flag to keep in
+sync with it: turning quantization off for a site means naming a reference row such
+as `eager` or `liger_kernel` in that rule.
 
 **Emulated vs. native is also a call argument (`emulated`)**, because the same
 `torchao` row serves both native dynamic FP8 GEMMs (`dtype: fp8`, defaulting to
@@ -312,21 +311,12 @@ linear_implementation:
   kwargs: {dtype: nvfp4, emulated: true}      # round, then multiply in the model dtype
 ```
 
-Each quantizing row declares its supported `dtypes` on its `OpEntry`
-(`OP_REGISTRY.row_dtypes(op, impl)`), and `VeomniOp.rounds` derives directly from
-whether that tuple is non-empty. The per-family `QUANTIZING_IMPLS` sets are pinned
-to that registry declaration by unit test.
-
-**`kwargs` is what a row still needs per call.** A row declares its own arguments
-(`dtype`, `block_size`, `recipe`, `emulated`, `swiglu_limit` where they apply),
-and the selection passes them. Four rules:
-
-| Rule | Why |
-| --- | --- |
-| **`kwargs` merge key by key, and a key the resolved row does not accept is dropped** | The enclosing block describes the *family*; a site that overrides `name` is not asking for the enclosing row's arguments. `moe_implementation: {name: qat, kwargs: {block_size: 64}}` with an override naming `fused_triton` inherits `block_size` at that site and that row ignores it. There is nothing to clear, so there is no `replace_kwargs` |
-| A key **no** row of the family accepts raises at config parse | Dropping is only safe because a genuinely wrong key is caught before any site resolves, against the union of the family's arguments. A typo like `block_siz` cannot be silently dropped. A key a row *requires* rather than defaults (`num_experts`) is refused the same way: it describes the shape of the computation, so the modeling supplies it at the call |
-| **The config beats what the modeling passes at the call site** | A row argument has three sources, and each corrects the one before it: the row's own signature default, the value the modeling passes from the checkpoint (`expert_dtype` is `"fp4"` in a V4-Flash checkpoint), and the value the config sets. The checkpoint says what the weights were *stored* as; the config says what this run is *asked* to train at, so the config is the one that has to survive. A key the config leaves out keeps the modeling's value |
-| An override merges into the inherited set | Adjusting one argument should not repeat the rest |
+**`kwargs` semantics.** When an override keeps the same row (`name` omitted or
+unchanged), its `kwargs` merge over the enclosing block's `kwargs`. When an
+override switches `name` to a different row (for example `qat` -> `eager`), the
+previous row's `kwargs` are cleared so unrelated arguments do not leak into the
+new row. Config `kwargs` take precedence over call-site defaults supplied by the
+modeling.
 
 **Override semantics.** Only the keys a rule writes change; everything else is
 inherited from the enclosing block. Later rules win over earlier ones, which is why

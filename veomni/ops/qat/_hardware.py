@@ -48,25 +48,28 @@ def _torchao_configs_for_selection(value) -> list[tuple[str, bool]]:
     """
     base_name = getattr(value, "name", value)
     base_kwargs = dict(getattr(value, "kwargs", {}) or {})
-    states: set[tuple[bool, str, bool | None]] = {
-        (base_name == _TORCHAO_ROW, base_kwargs.get("dtype", "nvfp4"), base_kwargs.get("emulated"))
+    states: set[tuple[str | None, str, bool | None]] = {
+        (base_name, base_kwargs.get("dtype", "nvfp4"), base_kwargs.get("emulated"))
     }
     for rule in getattr(value, "overrides", ()) or ():
         rule_kwargs = rule.kwargs or {}
         next_states = set(states)
-        for is_torchao, dtype, emulated in states:
-            next_states.add(
-                (
-                    is_torchao if rule.name is None else (rule.name == _TORCHAO_ROW),
-                    rule_kwargs.get("dtype", dtype),
-                    rule_kwargs.get("emulated", emulated),
+        for name, dtype, emulated in states:
+            if rule.name is not None and name is not None and rule.name != name:
+                next_states.add((rule.name, rule_kwargs.get("dtype", "nvfp4"), rule_kwargs.get("emulated")))
+            else:
+                next_states.add(
+                    (
+                        rule.name if rule.name is not None else name,
+                        rule_kwargs.get("dtype", dtype),
+                        rule_kwargs.get("emulated", emulated),
+                    )
                 )
-            )
         states = next_states
     return [
         (dtype, (dtype != "fp8") if emulated is None else bool(emulated))
-        for is_torchao, dtype, emulated in states
-        if is_torchao
+        for name, dtype, emulated in states
+        if name == _TORCHAO_ROW
     ]
 
 

@@ -330,7 +330,7 @@ def test_linear_torchao_fp8_validates_arguments_and_dispatches(monkeypatch):
 @_requires_torchao
 def test_linear_torchao_mxfp4_forward_and_backward_round_trip():
     """The ``torchao`` row with ``dtype='mxfp4'`` runs MXFP4 forward and STE backward on BF16 and FP32."""
-    from veomni.ops.selection import OpsSelection
+    from veomni.ops import OpsSelection
 
     op = VeomniOp("linear", "standard", OpsSelection(name="torchao", kwargs={"dtype": "mxfp4"}))
     torch.manual_seed(0)

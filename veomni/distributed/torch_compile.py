@@ -186,19 +186,17 @@ def _selection_reaches(value, target_impl: str, target_dtype: str) -> bool:
     """Return whether any ordered subset of overrides on ``value`` reaches ``(target_impl, target_dtype)``."""
     base_name = getattr(value, "name", value)
     base_kwargs = getattr(value, "kwargs", {}) or {}
-    states: set[tuple[bool, str | None]] = {(base_name == target_impl, base_kwargs.get("dtype"))}
+    states: set[tuple[str | None, str | None]] = {(base_name, base_kwargs.get("dtype"))}
     for rule in getattr(value, "overrides", ()) or ():
         rule_kwargs = rule.kwargs or {}
         next_states = set(states)
-        for is_target, dtype in states:
-            next_states.add(
-                (
-                    is_target if rule.name is None else (rule.name == target_impl),
-                    rule_kwargs.get("dtype", dtype),
-                )
-            )
+        for name, dtype in states:
+            if rule.name is not None and name is not None and rule.name != name:
+                next_states.add((rule.name, rule_kwargs.get("dtype")))
+            else:
+                next_states.add((rule.name if rule.name is not None else name, rule_kwargs.get("dtype", dtype)))
         states = next_states
-    return (True, target_dtype) in states
+    return (target_impl, target_dtype) in states
 
 
 def _uncompilable_selections(ops) -> list[str]:

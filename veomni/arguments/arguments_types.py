@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
-from ..ops.selection import OpsSelection
+from ..ops.registry import OpsSelection
 from ..utils import logging
 from ..utils.env import get_env
 
@@ -1432,9 +1432,8 @@ _DEPRECATED_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, str]] = {
         )
     },
     "moe_implementation": {"fused_mlu_triton": "fused_triton"},
-    # The format moved from the name into the row's ``dtype`` argument, so these
-    # carry an implied argument rather than only a new name. See
-    # ``_DTYPE_IN_NAME_ALIASES``.
+    # ``npu`` named the hardware rather than the kernel behind it. Each row now
+    # says which third-party kernel it calls; the old CE ``npu`` was ``chunk_loss``.
     "cross_entropy_loss_implementation": {"npu": "chunk_loss"},
     "rms_norm_implementation": {"npu": "torch_npu"},
     "rotary_pos_emb_implementation": {"npu": "torch_npu"},
@@ -1442,24 +1441,6 @@ _DEPRECATED_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, str]] = {
     "rms_norm_gated_implementation": {"npu": "torch_npu"},
     "causal_conv1d_implementation": {"npu": "triton"},
     "chunk_gated_delta_rule_implementation": {"npu": "triton", "npu_ascendc": "fla_npu"},
-}
-
-#: Old row names that also carried a format. ``torchao_nvfp4`` said both which row
-#: to call and that it rounds to NVFP4; the row is now ``torchao`` and the format is
-#: its ``dtype`` argument, so a checkpoint written against the old name has to gain
-#: that argument when the name is rewritten.
-_DTYPE_IN_NAME_ALIASES: Dict[str, Dict[str, tuple[str, str]]] = {
-    "linear_implementation": {
-        "torchao_nvfp4": ("torchao", "nvfp4"),
-        "torchao_mxfp4": ("torchao", "mxfp4"),
-    },
-    "gated_mlp_implementation": {
-        "torchao_nvfp4": ("torchao", "nvfp4"),
-        "torchao_mxfp4": ("torchao", "mxfp4"),
-    },
-    "moe_implementation": {
-        "deepgemm_fp8": ("deepgemm", "fp8"),
-    },
 }
 
 # Values that were never implementation names and have no implementation equivalent.
@@ -1769,15 +1750,11 @@ class OpsImplementationConfig:
     def __post_init__(self):
         self._normalize_selections()
         self._apply_deprecated_aliases()
-        self._validate_row_arguments()
         self.validate_attention_backend(self.attn_implementation)
         self.validate_hub_attention_backend(self.attn_implementation)
         self.attn_implementation = self.normalize_attention_backend(self.attn_implementation)
         self._validate_implementations()
 
-    #: Fields that accept the per-site form. Every other field stays a bare string,
-    #: because a site override only means something where the model owns several
-    #: instances of one family.
     _PER_SITE_FIELDS = (
         "moe_implementation",
         "gated_mlp_implementation",
@@ -1785,143 +1762,40 @@ class OpsImplementationConfig:
         "kv_round_implementation",
     )
 
-    #: Which registry family each per-site field drives.
-    _FIELD_TO_OP = {
-        "moe_implementation": "moe_experts",
-        "gated_mlp_implementation": "gated_mlp",
-        "linear_implementation": "linear",
-        "kv_round_implementation": "kv_round",
-    }
-
-    def _validate_row_arguments(self) -> None:
-        """Validate row arguments against the family, not against one site's row.
-
-        A key has to be *possible* somewhere in the family it is written on: a typo
-        like ``block_siz`` must not be dropped silently. So the check below is
-        against the union of every row's accepted arguments for the field's op.
-
-        It deliberately does **not** compare a key against the row that one site
-        resolves to. A site may override ``name`` to a row with a different
-        signature -- ``moe_implementation: {name: qat, overrides: [{name: fused_triton}]}``
-        is the normal way to say "quantize these experts but not those" -- and the
-        inherited ``block_size`` is meaningless for ``fused_triton``. That is a
-        config describing a family, not a mistake: the handle drops the key when the
-        row it resolves cannot take it (``veomni/ops/registry.py:_filter_kwargs``).
-
-        Also refused here: a key the row *requires* rather than defaults, since that
-        describes the shape of the computation and the modeling supplies it.
-        """
-        from ..ops import OP_REGISTRY
-
-        for field_name in self._PER_SITE_FIELDS:
-            value = getattr(self, field_name)
-            if not isinstance(value, OpsSelection):
-                continue
-            op = self._FIELD_TO_OP[field_name]
-            offered_keys = set(value.kwargs)
-            for rule in value.overrides:
-                offered_keys.update(rule.kwargs or {})
-            if not offered_keys:
-                continue
-
-            # The family's space, taken from every registered row of this op. Rows on
-            # other devices count too: the row a site names may be one this host
-            # cannot resolve, and the key is still meaningful for the family.
-            family = {key for impl in OP_REGISTRY.all_impls(op) for key in (OP_REGISTRY.row_arguments(op, impl) or {})}
-            unknown = sorted(offered_keys - family)
-            if unknown:
-                raise ValueError(
-                    f"{field_name}: {unknown} is not a row argument of any {op!r} row; the family takes "
-                    f"{sorted(family)}. A parameter a row requires rather than defaults -- such as "
-                    "'num_experts' -- is passed by the modeling at the call site, not by a config."
-                )
-
     def _normalize_selections(self) -> None:
-        """Turn the mapping form of a per-site field into an ``OpsSelection``.
-
-        A bare string stays a bare string: that is the shape every config and
-        checkpoint in the wild uses, and it means "one row for every site of this
-        family", which is exactly ``OpsSelection(name=...)``. Normalizing here,
-        before validation, keeps ``_validate_implementations`` comparing strings.
-        """
+        """Convert mapping-form per-site op fields into ``OpsSelection``."""
         for field_name in self._PER_SITE_FIELDS:
             value = getattr(self, field_name)
-            if value is None or isinstance(value, OpsSelection):
-                continue
-            if isinstance(value, str):
-                continue
-            setattr(self, field_name, OpsSelection.from_config_value(value))
+            if isinstance(value, dict):
+                setattr(self, field_name, OpsSelection.from_config_value(value))
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize non-None op implementation selections to a dict."""
         return {k: v for k, v in asdict(self).items() if v is not None}
 
     def _apply_deprecated_aliases(self) -> None:
-        """Resolve renamed implementation values and reject values that were never implementations.
-
-        Both forms are rewritten: a bare string, and the ``name`` of a per-site
-        selection. Leaving the mapping form out would make the same deprecated
-        value work as a string and fail as ``name:``, which is the kind of
-        inconsistency that only shows up after someone copies a config.
-        """
+        """Resolve renamed implementation values and reject values that were never implementations."""
         for field_name, messages in _REJECTED_IMPLEMENTATION_VALUES.items():
             value = getattr(self, field_name)
-            if isinstance(value, OpsSelection):
-                continue
-            if value in messages:
+            if isinstance(value, str) and value in messages:
                 raise ValueError(f"{field_name}={value!r}: {messages[value]}")
 
         for field_name, aliases in _DEPRECATED_IMPLEMENTATION_ALIASES.items():
             value = getattr(self, field_name)
-            if isinstance(value, OpsSelection):
-                for holder in (value, *value.overrides):
-                    renamed = aliases.get(holder.name)
-                    if renamed is not None:
-                        self._warn_deprecated(field_name, holder.name, renamed)
-                        holder.name = renamed
-                continue
-            if value in aliases:
+            if isinstance(value, str) and value in aliases:
                 self._warn_deprecated(field_name, value, aliases[value])
                 setattr(self, field_name, aliases[value])
 
-        # A name that used to carry its format gains that format as an argument. The
-        # row is the same kernel, so this is a rename plus a default, not a different
-        # selection -- and a config that already sets ``dtype`` keeps its own value.
-        for field_name, renames in _DTYPE_IN_NAME_ALIASES.items():
-            value = getattr(self, field_name)
-            if isinstance(value, OpsSelection):
-                for holder in (value, *value.overrides):
-                    renamed = renames.get(holder.name)
-                    if renamed is None:
-                        continue
-                    new_name, dtype = renamed
-                    self._warn_deprecated(field_name, holder.name, f"{new_name} (dtype={dtype!r})")
-                    holder.name = new_name
-                    holder.kwargs = {"dtype": dtype, **(holder.kwargs or {})}
-                continue
-            if value in renames:
-                new_name, dtype = renames[value]
-                self._warn_deprecated(field_name, value, f"{new_name} (dtype={dtype!r})")
-                setattr(self, field_name, OpsSelection(name=new_name, kwargs={"dtype": dtype}))
-
-        def _resolve_legacy_fused_moe() -> str:
+        if self.moe_implementation == "fused":
             from ..utils.device import IS_NPU_AVAILABLE
             from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available
 
             if IS_NPU_AVAILABLE:
-                return "fused_npu"
-            if is_torch_mlu_available():
-                return "fused_mlu" if is_apex_mlu_available() else "fused_triton"
-            return "fused_quack"
-
-        if isinstance(self.moe_implementation, OpsSelection):
-            for holder in (self.moe_implementation, *self.moe_implementation.overrides):
-                if holder.name == "fused":
-                    resolved = _resolve_legacy_fused_moe()
-                    self._warn_deprecated("moe_implementation", "fused", resolved)
-                    holder.name = resolved
-        elif self.moe_implementation == "fused":
-            resolved = _resolve_legacy_fused_moe()
+                resolved = "fused_npu"
+            elif is_torch_mlu_available():
+                resolved = "fused_mlu" if is_apex_mlu_available() else "fused_triton"
+            else:
+                resolved = "fused_quack"
             self._warn_deprecated("moe_implementation", "fused", resolved)
             self.moe_implementation = resolved
 

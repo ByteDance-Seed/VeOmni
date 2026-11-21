@@ -25,8 +25,8 @@ import pytest
 import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.ops import OpsSelection, SiteOverride
 from veomni.ops.qat._hardware import reject_qat_without_native_bf16
-from veomni.ops.selection import OpsSelection, SiteOverride
 
 
 # The device is monkeypatched: these cases never touch an accelerator.
@@ -140,23 +140,13 @@ def test_chained_overrides_selecting_native_fp8_require_sm89(monkeypatch, field)
             SiteOverride(site=r"layers\.0\.q_a_proj", kwargs={"dtype": "fp8"}),
         ],
     )
-    chained_dtype_then_name = OpsSelection(
-        name="eager",
-        overrides=[
-            SiteOverride(site=r"layers\.0\.q_a_proj", kwargs={"dtype": "fp8"}),
-            SiteOverride(site=r"layers\.0\.q_a_proj", name="torchao"),
-        ],
-    )
 
     _device(monkeypatch, cuda=True, capability=80)
     with pytest.raises(RuntimeError, match="SM89"):
         reject_qat_without_native_bf16(_model(**{field: chained_name_then_dtype}))
-    with pytest.raises(RuntimeError, match="SM89"):
-        reject_qat_without_native_bf16(_model(**{field: chained_dtype_then_name}))
 
     _device(monkeypatch, cuda=True, capability=89)
     reject_qat_without_native_bf16(_model(**{field: chained_name_then_dtype}))
-    reject_qat_without_native_bf16(_model(**{field: chained_dtype_then_name}))
 
 
 def test_bound_veomni_op_handles_resolve_concrete_sites(monkeypatch):

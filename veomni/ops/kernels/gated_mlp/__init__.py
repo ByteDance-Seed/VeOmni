@@ -76,7 +76,6 @@ register_op(
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
-    dtypes=("fp8",),
 )
 
 register_op(
@@ -86,7 +85,6 @@ register_op(
     description="TorchAO low-precision (FP8 / NVFP4 / MXFP4) gated MLP with optional activation clamping",
     wrapper=standard_torchao.wrapper,
     requires=("torchao",),
-    dtypes=standard_torchao.SUPPORTED_DTYPES,
 )
 
 

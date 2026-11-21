@@ -27,8 +27,7 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.arguments import MixedPrecisionConfig, ModelArguments, OpsImplementationConfig
 from veomni.arguments.parser import parse_args, save_args
 from veomni.models.configuration_base import as_veomni_config
-from veomni.ops import VeomniOp
-from veomni.ops.selection import OpsSelection, SiteOverride
+from veomni.ops import OpsSelection, SiteOverride, VeomniOp
 from veomni.ops.torchao import torchao_fp8_linear
 from veomni.utils import device
 
@@ -118,12 +117,9 @@ def test_float8_ops_yaml_cli_and_saved_config_roundtrip(monkeypatch, tmp_path, r
     mlp = config.ops_implementation.gated_mlp_implementation
     assert isinstance(lin, OpsSelection)
     assert isinstance(mlp, OpsSelection)
-    assert lin.resolve_impl("layers.0.q_proj") == "torchao"
-    assert lin.resolve_kwargs("layers.0.q_proj") == {"dtype": "fp8", "recipe": recipe}
-    assert lin.resolve_impl("layers.0.k_proj") == "eager"
-    assert lin.resolve_kwargs("layers.0.k_proj") == {}
-    assert mlp.resolve_impl("layers.0.mlp") == "torchao"
-    assert mlp.resolve_kwargs("layers.0.mlp") == {"dtype": "fp8", "recipe": recipe}
+    assert lin.resolve("layers.0.q_proj") == ("torchao", {"dtype": "fp8", "recipe": recipe})
+    assert lin.resolve("layers.0.k_proj") == ("eager", {})
+    assert mlp.resolve("layers.0.mlp") == ("torchao", {"dtype": "fp8", "recipe": recipe})
 
     save_args(config, str(tmp_path / "saved"))
     monkeypatch.setattr("sys.argv", ["test", str(tmp_path / "saved" / "veomni_cli.yaml")])

@@ -1178,7 +1178,7 @@ def _model_with_ops(**ops_fields) -> nn.Module:
 def test_compile_rejects_torchao_mxfp4(field):
     """MXTensor emits float8_e8m0fnu scales, which Inductor has no lowering for."""
     from veomni.distributed.torch_compile import _reject_incompatible_ops
-    from veomni.ops.selection import OpsSelection, SiteOverride
+    from veomni.ops import OpsSelection, SiteOverride
 
     selection = OpsSelection(name="torchao", kwargs={"dtype": "mxfp4"})
     with pytest.raises(RuntimeError, match=rf"{field}=torchao\(dtype='mxfp4'\)"):
@@ -1229,7 +1229,7 @@ def test_compile_rejection_is_skipped_without_an_ops_config():
 def test_compile_rejection_walks_sub_configs():
     """A multimodal root carries its text tower's ops one level down, so the path is reported."""
     from veomni.distributed.torch_compile import _uncompilable_at
-    from veomni.ops.selection import OpsSelection
+    from veomni.ops import OpsSelection
 
     def ops(lin=None):
         return SimpleNamespace(linear_implementation=lin, gated_mlp_implementation=None)
