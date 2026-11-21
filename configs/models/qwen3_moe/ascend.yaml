@@ -1,5 +1,5 @@
 # Qwen3-30B-A3B on 8 × 910B2.
-# bash train.sh tasks/train_text.py configs/models/qwen3_moe/ascend.yaml
+# NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/qwen3_moe/ascend.yaml
 model:
   model_path: ./Qwen3-30B-A3B
   ops_implementation:

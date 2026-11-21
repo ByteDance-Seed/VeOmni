@@ -1,12 +1,12 @@
 # Qwen2-0.5B-Instruct on 8 × H20.
-# bash train.sh tasks/train_text.py configs/models/qwen2/cuda.yaml
+# NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/qwen2/cuda.yaml
 model:
   model_path: ./Qwen2-0.5B-Instruct
   ops_implementation:
     attn_implementation: flash_attention_2
   optimizer:
     type: adamw
-    lr: 0.0003
+    lr: 1.0e-05
     lr_warmup_ratio: 0.007
     lr_decay_style: constant
     lr_decay_ratio: 1.0

@@ -1,5 +1,5 @@
 # Qwen2-VL-7B-Instruct on 8 × 910B2.
-# bash train.sh tasks/train_vlm.py configs/models/qwen2_vl/ascend.yaml
+# NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py configs/models/qwen2_vl/ascend.yaml
 model:
   model_path: ./Qwen2-VL-7B-Instruct
   optimizer:

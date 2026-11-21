@@ -1,5 +1,5 @@
 # Seed-OSS-36B-Base on 8 × 910B2.
-# bash train.sh tasks/train_text.py configs/models/seed_oss/ascend.yaml
+# NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/seed_oss/ascend.yaml
 model:
   model_path: ./Seed-OSS-36B-Base
   optimizer:

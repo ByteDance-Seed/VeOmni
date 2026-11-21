@@ -1,0 +1,78 @@
+# Qwen-Image on 8 × 910B2.
+# NPROC_PER_NODE=8 bash train.sh tasks/train_dit.py configs/models/qwen_image/ascend.yaml
+model:
+  model_path: ./Qwen-Image/transformer
+  condition_model_path: ./Qwen-Image
+  config_path: ./Qwen-Image/transformer/config.json
+  condition_model_cfg:
+    height: 256
+    width: 256
+    max_sequence_length: 128
+    image_resize_mode: center_crop
+    training_recipe: diffsynth
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    gated_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    load_balancing_loss_implementation: eager
+    moe_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 1.0e-05
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    dp_replicate_size: 1
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: false
+    offload_config:
+      enable_activation: false
+  lora_config:
+    rank: 8
+    alpha: 16
+    lora_modules:
+    - to_k
+    - to_v
+    - to_out.0
+data:
+  train_path: ./data/image.parquet
+  dataloader:
+    num_workers: 0
+  datasets_type: mapping
+  data_type: diffusion
+  max_seq_len: 4096
+  text_keys: text
+  dyn_bsz_buffer_size: 200
+  source_name: Qwen-Image
+  data_transform: dit_online
+  mm_configs: {}
+train:
+  training_task: online_training
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: outputs/qwen_image/ascend
+    manager: dcp
+    save_steps: 3
+    save_epochs: 0
+    save_hf_weights: false
+  max_steps: 3
+  num_train_epochs: 1
+  wandb:
+    enable: false
+  profile:
+    enable: false

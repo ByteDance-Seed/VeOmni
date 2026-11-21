@@ -1,10 +1,10 @@
 # Meta-Llama-3-8B-Instruct on 8 × H20.
-# bash train.sh tasks/train_text.py configs/models/llama3/cuda.yaml
+# NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/llama3/cuda.yaml
 model:
   model_path: ./Meta-Llama-3-8B-Instruct
   optimizer:
     type: adamw
-    lr: 0.0003
+    lr: 1.0e-05
     lr_warmup_ratio: 0.007
     lr_decay_style: constant
     lr_decay_ratio: 1.0
