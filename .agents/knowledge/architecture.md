@@ -256,6 +256,14 @@ ordinary sample-mean scalar losses and per-sample prediction lists, without a
 Trainer packing API; samples may differ in target geometry. See
 `docs/examples/minimax_h3.md` for the model-specific support limits.
 
+MiniMax H3-Image uses the same model-owned fixed-microbatch contract for T2I
+and editing. Its image layout packs independent DiT/refiner attention segments,
+offsets timestep indices, and retains each sample's selected PDD head. The loss
+is the mean of weighted target-only sample losses; reference rows are excluded.
+Online encoders remain sample-local, while offline caches may mix target
+geometries. Image Ulysses SP and dynamic token-budget scheduling remain unsupported.
+See `docs/examples/minimax_h3_image.md`.
+
 ## Parallelization Flow
 
 VeOmni uses FSDP2 exclusively.

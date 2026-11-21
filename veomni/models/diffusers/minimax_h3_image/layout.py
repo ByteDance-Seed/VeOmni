@@ -6,11 +6,27 @@ import math
 
 import numpy as np
 import torch
+from PIL import Image, ImageOps
 
 
 MINIMAX_H3_IMAGE_TAG = 0
 MINIMAX_H3_TEXT_TAG = 1
+DEFAULT_SIGMAS = (1.0, 0.9675236940383911, 0.8875485062599182, 0.75, 0.5327739119529724, 0.23200887441635132, 0.0)
+REFERENCE_NOISE_AUG = 0.999
 _ROPE_SPATIAL_SCALE = 32
+
+
+def resize_reference(image: Image.Image, min_short_edge: int, max_short_edge: int) -> Image.Image:
+    """Match inference reference sizing for both training encoders."""
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    if min(image.size) < 32:
+        raise ValueError(f"A reference image needs at least 32 pixels on each side, got {image.size}.")
+    short_edge = min(image.size)
+    if min_short_edge <= short_edge <= max_short_edge:
+        return image
+    scale = (min_short_edge if short_edge < min_short_edge else max_short_edge) / short_edge
+    width, height = (max(32, round(size * scale / 32) * 32) for size in image.size)
+    return image.resize((width, height), Image.Resampling.BICUBIC)
 
 
 def patchify_image_latents(latents: torch.Tensor, patch_size: tuple[int, int, int]) -> torch.Tensor:
@@ -104,10 +120,65 @@ def build_image_packed_sequence(
     position_ids[cursor:, 0] = rotary_time
     position_ids[cursor:, 1:] = frame_grid
 
-    text_indices = torch.arange(num_text_tokens)
-    image_indices = torch.arange(num_text_tokens, sequence_length)
-    token_tags = torch.empty(sequence_length, dtype=torch.long)
+    device = text_token_tags.device
+    text_indices = torch.arange(num_text_tokens, device=device)
+    image_indices = torch.arange(num_text_tokens, sequence_length, device=device)
+    token_tags = torch.empty(sequence_length, dtype=torch.long, device=device)
     token_tags[text_indices] = text_token_tags.to(torch.long)
     token_tags[image_indices] = image_tag
 
     return position_ids, token_tags, image_indices, text_indices, num_reference_rows
+
+
+def pack_image_samples(samples: list[dict]) -> tuple[dict, list[int]]:
+    """Concatenate image samples, retaining independent attention, positions and heads."""
+    if not samples:
+        raise ValueError("H3-Image requires a nonempty microbatch.")
+    chunks = {
+        key: []
+        for key in (
+            "x",
+            "prompt_embeds",
+            "unique_timesteps",
+            "timestep_indices",
+            "token_tags",
+            "position_ids",
+            "image_indices",
+            "text_indices",
+        )
+    }
+    cu, refiner_cu, row_counts, heads = [0], [0], [], []
+    time_offset = 0
+    for sample in samples:
+        if sample["unique_timesteps"].dtype != torch.float32 or sample["position_ids"].dtype not in (
+            torch.float32,
+            torch.float64,
+        ):
+            raise ValueError(
+                "H3-Image packing must retain timestep/position precision; use cast_forward_inputs=false."
+            )
+        length = sample["position_ids"].shape[0]
+        text = sample["prompt_embeds"]
+        text = text[0] if text.dim() == 3 else text
+        for key in chunks:
+            value = text if key == "prompt_embeds" else sample[key]
+            if key in ("image_indices", "text_indices"):
+                value = value + cu[-1]
+            elif key == "timestep_indices":
+                value = value + time_offset
+            chunks[key].append(value)
+        cu.append(cu[-1] + length)
+        refiner_cu.append(refiner_cu[-1] + text.shape[0])
+        time_offset += sample["unique_timesteps"].numel()
+        row_counts.append(sample["image_indices"].numel())
+        heads.append((sample["pdd_step_index"], length))
+    result = {key: torch.cat(values, dim=0) for key, values in chunks.items()}
+    device = result["x"].device
+    for key, bounds in (("packed_seq_params", cu), ("refiner_packed_seq_params", refiner_cu)):
+        result[key] = {
+            "cu_seqlens_q": torch.tensor(bounds, dtype=torch.int32, device=device),
+            "cu_seqlens_host": tuple(bounds),
+            "max_seqlen_q": max(stop - start for start, stop in zip(bounds, bounds[1:])),
+        }
+    result["pdd_step_index"] = heads
+    return result, row_counts

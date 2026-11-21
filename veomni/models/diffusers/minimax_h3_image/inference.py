@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import Image
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
@@ -26,12 +26,15 @@ from veomni.utils.device import get_device_type, get_torch_device
 from ..minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 from ..minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import MiniMaxH3DiTModel
 from .layout import (
+    DEFAULT_SIGMAS,
     MINIMAX_H3_IMAGE_TAG,
+    REFERENCE_NOISE_AUG,
     build_image_packed_sequence,
     get_image_canvas_size,
     patchify_image_latents,
     unpatchify_image_rows,
 )
+from .layout import resize_reference as _resize_reference
 from .minimax_h3_image_condition.configuration_minimax_h3_image_condition import (
     MiniMaxH3ImageConditionModelConfig,
 )
@@ -42,7 +45,6 @@ logger = logging.get_logger(__name__)
 
 PIXEL_MEAN = (0.485, 0.456, 0.406)
 PIXEL_STD = (0.229, 0.224, 0.225)
-DEFAULT_SIGMAS = (1.0, 0.9675236940383911, 0.8875485062599182, 0.75, 0.5327739119529724, 0.23200887441635132, 0.0)
 
 
 class MiniMaxH3ImageScheduler:
@@ -59,29 +61,6 @@ class MiniMaxH3ImageScheduler:
         sigma = self.sigmas[index].to(sample.device)
         sigma_next = self.sigmas[index + 1].to(sample.device)
         return (sample.to(torch.float32) + (sigma - sigma_next) * model_output.to(torch.float32)).to(sample.dtype)
-
-
-def _bound_short_edge(
-    width: int, height: int, min_short_edge: int, max_short_edge: int, multiple: int
-) -> tuple[int, int]:
-    short_edge = min(width, height)
-    if min_short_edge <= short_edge <= max_short_edge:
-        return width, height
-    scale = (min_short_edge if short_edge < min_short_edge else max_short_edge) / short_edge
-    return (
-        max(multiple, round(width * scale / multiple) * multiple),
-        max(multiple, round(height * scale / multiple) * multiple),
-    )
-
-
-def _resize_reference(image: Image.Image, min_short_edge: int, max_short_edge: int) -> Image.Image:
-    image = ImageOps.exif_transpose(image).convert("RGB")
-    if min(image.size) < 32:
-        raise ValueError(f"A reference image needs at least 32 pixels on each side, got {image.size}.")
-    width, height = _bound_short_edge(*image.size, min_short_edge, max_short_edge, 32)
-    if image.size == (width, height):
-        return image
-    return image.resize((width, height), Image.Resampling.BICUBIC)
 
 
 class MiniMaxH3ImagePipeline(torch.nn.Module):
@@ -101,7 +80,7 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         self.patch_size = (1, 2, 2)
         self.vae_spatial_compression_ratio = 16
         self.latent_channels = 24
-        self.reference_noise_aug = 0.999
+        self.reference_noise_aug = REFERENCE_NOISE_AUG
         self.max_sequence_length = 4096
 
     @staticmethod
