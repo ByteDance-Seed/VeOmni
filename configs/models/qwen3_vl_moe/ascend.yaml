@@ -1,0 +1,61 @@
+# Qwen3-VL-30B-A3B-Instruct on 8 × 910B2.
+# bash train.sh tasks/train_vlm.py configs/models/qwen3_vl_moe/ascend.yaml
+model:
+  model_path: ./Qwen3-VL-30B-A3B-Instruct
+  ops_implementation:
+    moe_implementation: fused_npu
+    attn_implementation: flash_attention_2
+    cross_entropy_loss_implementation: eager
+    rms_norm_implementation: eager
+    gated_mlp_implementation: eager
+    rotary_pos_emb_implementation: eager
+  lora_config:
+    rank: 8
+    alpha: 16
+    lora_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+  optimizer:
+    lr: 0.0001
+    lr_decay_style: cosine
+  accelerator:
+    gradient_checkpointing:
+      enable_reentrant: false
+    init_device: meta
+    ep_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+  chat_template: qwen3vl
+data:
+  train_path: ./data/sharegpt4v.parquet
+  data_type: conversation
+  max_seq_len: 1024
+  mm_configs:
+    image_max_pixels: 200704
+    video_max_pixels: 602112
+    video_total_pixels: 2889523
+    max_frames: 16
+    fps: 2.0
+    use_audio_in_video: false
+  datasets_type: mapping
+  dataloader:
+    num_workers: 0
+  source_name: sharegpt4v_sft
+train:
+  num_train_epochs: 1
+  micro_batch_size: 1
+  global_batch_size: 8
+  max_steps: 3
+  checkpoint:
+    output_dir: outputs/qwen3_vl_moe/ascend
+    manager: dcp
+    save_steps: 3
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+  profile:
+    enable: false
+  dyn_bsz: false

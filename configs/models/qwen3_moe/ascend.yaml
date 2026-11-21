@@ -1,0 +1,60 @@
+# Qwen3-30B-A3B on 8 × 910B2.
+# bash train.sh tasks/train_text.py configs/models/qwen3_moe/ascend.yaml
+model:
+  model_path: ./Qwen3-30B-A3B
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_npu
+    cross_entropy_loss_implementation: eager
+    rms_norm_implementation: eager
+    gated_mlp_implementation: eager
+    rotary_pos_emb_implementation: eager
+  lora_config:
+    rank: 8
+    alpha: 16
+    lora_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+  optimizer:
+    type: adamw
+    lr: 0.0001
+    lr_decay_style: cosine
+    max_grad_norm: 1.0
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+  chat_template: chatml
+data:
+  train_path: ./data/tulu.parquet
+  data_type: conversation
+  max_seq_len: 1024
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+  datasets_type: mapping
+  dataloader:
+    num_workers: 0
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  num_train_epochs: 1
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: outputs/qwen3_moe/ascend
+    manager: dcp
+    save_steps: 3
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+  max_steps: 3
+  profile:
+    enable: false
+  dyn_bsz: false
