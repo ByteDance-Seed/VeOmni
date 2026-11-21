@@ -10,6 +10,7 @@ import torch
 
 MINIMAX_H3_IMAGE_TAG = 0
 MINIMAX_H3_TEXT_TAG = 1
+DEFAULT_SIGMAS = (1.0, 0.9675236940383911, 0.8875485062599182, 0.75, 0.5327739119529724, 0.23200887441635132, 0.0)
 _ROPE_SPATIAL_SCALE = 32
 
 
@@ -104,9 +105,10 @@ def build_image_packed_sequence(
     position_ids[cursor:, 0] = rotary_time
     position_ids[cursor:, 1:] = frame_grid
 
-    text_indices = torch.arange(num_text_tokens)
-    image_indices = torch.arange(num_text_tokens, sequence_length)
-    token_tags = torch.empty(sequence_length, dtype=torch.long)
+    device = text_token_tags.device
+    text_indices = torch.arange(num_text_tokens, device=device)
+    image_indices = torch.arange(num_text_tokens, sequence_length, device=device)
+    token_tags = torch.empty(sequence_length, dtype=torch.long, device=device)
     token_tags[text_indices] = text_token_tags.to(torch.long)
     token_tags[image_indices] = image_tag
 

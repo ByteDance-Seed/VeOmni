@@ -28,9 +28,14 @@ class MiniMaxH3DiTModelConfig(VeOmniPretrainedConfig):
         final_norm_eps: float = 1e-5,
         audio_enabled: bool = True,
         num_pdd_heads: int = 0,
+        image_training: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        if image_training and (audio_enabled or num_pdd_heads != 6):
+            raise ValueError("H3-Image training requires the audio-free DiT and all six released PDD heads.")
+        if image_training:
+            self.condition_model_type = "MiniMaxH3ImageConditionModel"
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.token_refiner_num_layers = token_refiner_num_layers
@@ -52,3 +57,4 @@ class MiniMaxH3DiTModelConfig(VeOmniPretrainedConfig):
         self.final_norm_eps = final_norm_eps
         self.audio_enabled = audio_enabled
         self.num_pdd_heads = num_pdd_heads
+        self.image_training = image_training

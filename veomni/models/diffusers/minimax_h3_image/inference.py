@@ -26,6 +26,7 @@ from veomni.utils.device import get_device_type, get_torch_device
 from ..minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 from ..minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import MiniMaxH3DiTModel
 from .layout import (
+    DEFAULT_SIGMAS,
     MINIMAX_H3_IMAGE_TAG,
     build_image_packed_sequence,
     get_image_canvas_size,
@@ -42,7 +43,6 @@ logger = logging.get_logger(__name__)
 
 PIXEL_MEAN = (0.485, 0.456, 0.406)
 PIXEL_STD = (0.229, 0.224, 0.225)
-DEFAULT_SIGMAS = (1.0, 0.9675236940383911, 0.8875485062599182, 0.75, 0.5327739119529724, 0.23200887441635132, 0.0)
 
 
 class MiniMaxH3ImageScheduler:
