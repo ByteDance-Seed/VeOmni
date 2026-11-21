@@ -234,6 +234,11 @@ def get_checkpoint_tensor_converter(
     """Return the checkpoint tensor converter registered on *model*, or ``None``."""
     while isinstance(getattr(model, "module", None), nn.Module):
         model = model.module
+    from ...lora import is_veomni_lora_model
+
+    # The loader adds the adapter prefix after converting the foundation model's keys.
+    if is_veomni_lora_model(model):
+        model = model.get_base_model()
     factory = getattr(model, "_create_checkpoint_tensor_converter", None)
     if factory is None:
         return None

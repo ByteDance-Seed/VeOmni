@@ -22,6 +22,7 @@ and per-model converter implementations (e.g. Qwen3MoeCheckpointTensorConverter)
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -96,6 +97,18 @@ class TestGetCheckpointTensorConverter:
         converter = get_checkpoint_tensor_converter(model)
         assert converter is not None
         assert converter.can_handle("handle_me.foo")
+
+    @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+    def test_lora_factory_receives_unwrapped_model(self):
+        from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+
+        base = torch.nn.Linear(4, 4)
+        factory = MagicMock(return_value=_DummyConverter())
+        base._create_checkpoint_tensor_converter = factory
+        wrapped = VeOmniLoraModel(base, VeOmniLoraConfig(target_modules=["q_proj"]), inject=False)
+
+        assert get_checkpoint_tensor_converter(wrapped) is factory.return_value
+        factory.assert_called_once_with(base)
 
     @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
     def test_ignores_non_callable_factory(self):
