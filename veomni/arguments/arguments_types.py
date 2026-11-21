@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
+from ..ops.registry import OpsSelection
 from ..utils import logging
 from ..utils.env import get_env
 
@@ -597,37 +598,6 @@ class TorchCompileConfig:
     )
 
 
-_FLOAT8_RECIPES = ("tensorwise", "rowwise", "rowwise_with_gw_hp")
-
-
-@dataclass
-class Float8TrainingConfig:
-    """Opt-in torchao float8 computation for explicitly selected dense Linear modules."""
-
-    enable: bool = False
-    recipe: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"] = field(
-        default="tensorwise",
-        metadata={"help": "Float8 scaling recipe: 'tensorwise', 'rowwise', or 'rowwise_with_gw_hp'."},
-    )
-    target_modules: List[str] = field(
-        default_factory=list,
-        metadata={"help": "Full Linear module names with optional '*' wildcards to convert to float8 training."},
-    )
-
-    def __post_init__(self):
-        """Validate float8 enable flag, scaling recipe, and explicit target module patterns."""
-        if type(self.enable) is not bool:
-            raise ValueError("float8.enable must be a boolean.")
-        if self.recipe not in _FLOAT8_RECIPES:
-            raise ValueError(f"float8.recipe must be one of {_FLOAT8_RECIPES}, got {self.recipe!r}.")
-        if not isinstance(self.target_modules, list) or any(
-            not isinstance(pattern, str) or not pattern for pattern in self.target_modules
-        ):
-            raise ValueError("float8.target_modules must be a list of nonempty module-name patterns.")
-        if self.enable and not self.target_modules:
-            raise ValueError("Enabled float8 training requires explicit target_modules.")
-
-
 @dataclass
 class MixedPrecisionConfig:
     """model.accelerator.fsdp_config.mixed_precision.* — Mixed precision settings."""
@@ -652,7 +622,6 @@ class MixedPrecisionConfig:
         default=True,
         metadata={"help": "Enable mixed precision cast forward inputs (FSDP2)."},
     )
-    float8: Float8TrainingConfig = field(default_factory=Float8TrainingConfig)
 
     def __post_init__(self):
         def _check_dtype(dtype: str):
@@ -1548,12 +1517,12 @@ class OpsImplementationConfig:
             "MODELING_BACKEND=veomni. Pass a veomni_* name to select that adapter directly."
         },
     )
-    moe_implementation: Optional[str] = field(
+    moe_implementation: Optional[str] | OpsSelection = field(
         default=None,
         metadata={
             "help": "MoE experts forward. 'fused_triton' (GPU SM70+ or MLU) | "
-            "'fused_quack' (GPU SM90+) | 'deepgemm_fp8' (SM90/SM100 FP8 training) | 'fused_npu' (NPU) | "
-            "'fused_mlu' (MLU Apex grouped-GEMM) | 'eager'. "
+            "'fused_quack' (GPU SM90+) | 'deepgemm' (SM90/SM100, dtype='fp8') | 'fused_npu' (NPU) | "
+            "'fused_mlu' (MLU Apex grouped-GEMM) | 'qat' (dtype='fp8' or 'fp4') | 'eager'. "
             "Unset: 'fused_triton' on GPU, 'fused_npu' on NPU, 'fused_mlu' on MLU with Apex "
             "and 'fused_triton' otherwise."
         },
@@ -1577,20 +1546,21 @@ class OpsImplementationConfig:
             "Unset: 'liger_kernel' on GPU/MLU, 'torch_npu' on NPU."
         },
     )
-    gated_mlp_implementation: Optional[str] = field(
+    gated_mlp_implementation: Optional[str] | OpsSelection = field(
         default=None,
         metadata={
-            "help": "Gated MLP (act(gate(x)) * up(x)). 'liger_kernel' (SiLU only; GPU, MLU) | 'qat' (FP8 QAT, SM90+) | "
-            "'torchao_nvfp4' (NVFP4 QAT, needs the 'torchao' package) | 'eager'. "
+            "help": "Gated MLP (act(gate(x)) * up(x)). 'liger_kernel' (SiLU only; GPU, MLU) | "
+            "'qat' (SM90+, dtype='fp8') | 'torchao' (dtype='fp8', 'nvfp4', or 'mxfp4', needs the "
+            "'torchao' package) | 'eager'. "
             "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
         },
     )
-    linear_implementation: Optional[str] = field(
+    linear_implementation: Optional[str] | OpsSelection = field(
         default=None,
         metadata={
-            "help": "Dense projection. 'qat' (FP8 fake quantization of both GEMM operands, SM90+) | "
-            "'torchao_nvfp4' (NVFP4 fake quantization of both GEMM operands, 'standard' variant only, needs "
-            "the 'torchao' package) | 'eager' (calls the projection module). "
+            "help": "Dense projection. 'qat' (fake quantization of both GEMM operands, SM90+, dtype='fp8') | "
+            "'torchao' (dynamic FP8 GEMMs or FP4 fake quantization, 'standard' variant only, needs the "
+            "'torchao' package, dtype='fp8', 'nvfp4', or 'mxfp4') | 'eager' (calls the projection module). "
             "Unset: 'eager'. Selected independently of gated_mlp_implementation: a model that owns its "
             "own projections reads this field, a model that runs the fused gated-MLP row reads that one."
         },
@@ -1693,7 +1663,7 @@ class OpsImplementationConfig:
             "and cann_ops_transformer); 'eager' uses PyTorch."
         },
     )
-    kv_round_implementation: Literal["none", "eager", "triton"] = field(
+    kv_round_implementation: Optional[str] | OpsSelection = field(
         default="none",
         metadata={
             "help": "KV-cache and indexer-activation storage rounding. 'none' leaves stored tensors "
@@ -1778,11 +1748,26 @@ class OpsImplementationConfig:
         return implementation
 
     def __post_init__(self):
+        self._normalize_selections()
         self._apply_deprecated_aliases()
         self.validate_attention_backend(self.attn_implementation)
         self.validate_hub_attention_backend(self.attn_implementation)
         self.attn_implementation = self.normalize_attention_backend(self.attn_implementation)
         self._validate_implementations()
+
+    _PER_SITE_FIELDS = (
+        "moe_implementation",
+        "gated_mlp_implementation",
+        "linear_implementation",
+        "kv_round_implementation",
+    )
+
+    def _normalize_selections(self) -> None:
+        """Convert mapping-form per-site op fields into ``OpsSelection``."""
+        for field_name in self._PER_SITE_FIELDS:
+            value = getattr(self, field_name)
+            if isinstance(value, dict):
+                setattr(self, field_name, OpsSelection.from_config_value(value))
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize non-None op implementation selections to a dict."""
@@ -1792,12 +1777,12 @@ class OpsImplementationConfig:
         """Resolve renamed implementation values and reject values that were never implementations."""
         for field_name, messages in _REJECTED_IMPLEMENTATION_VALUES.items():
             value = getattr(self, field_name)
-            if value in messages:
+            if isinstance(value, str) and value in messages:
                 raise ValueError(f"{field_name}={value!r}: {messages[value]}")
 
         for field_name, aliases in _DEPRECATED_IMPLEMENTATION_ALIASES.items():
             value = getattr(self, field_name)
-            if value in aliases:
+            if isinstance(value, str) and value in aliases:
                 self._warn_deprecated(field_name, value, aliases[value])
                 setattr(self, field_name, aliases[value])
 
@@ -1829,7 +1814,7 @@ class OpsImplementationConfig:
         compatibility are validated by instance-local ``VeomniOp``
         resolution — not duplicated here.
         """
-        # No cross-family conflict needs rejecting here. ``deepgemm_fp8`` and
+        # No cross-family conflict needs rejecting here. ``deepgemm`` and
         # ``qat`` are two values of the same ``moe_implementation`` field, so they
         # cannot both be selected; ``linear_implementation`` and
         # ``gated_mlp_implementation`` are separate GEMMs with separate operands,
@@ -1847,40 +1832,60 @@ class OpsImplementationConfig:
         on_npu = IS_NPU_AVAILABLE
         on_mlu = is_torch_mlu_available()
 
-        for field_name, npu_ok in _NPU_ALLOWED.items():
+        def impls_for(field_name: str):
+            """Every impl this field can resolve to, across its overrides.
+
+            A per-site selection carries one row per override, and each is a
+            separate kernel, so all of them have to clear the host check -- not
+            just the default. The site itself is unknown here, so a selection with
+            a low-precision block contributes its low-precision row and its
+            reference row.
+            """
             value = getattr(self, field_name)
-            if value is None or value == "eager":
-                continue
-            if on_npu and value not in npu_ok:
-                allowed = sorted(npu_ok | {"eager"})
-                raise ValueError(
-                    f"{field_name}={value!r} is not supported on Ascend NPU. "
-                    f"Set to one of {allowed}, or leave it unset for the NPU default; "
-                    f"'eager' is the universal fallback for ops with no NPU kernel for the current model."
-                )
-            if not on_npu and value in _NPU_REQUIRED.get(field_name, frozenset()):
-                raise ValueError(f"{field_name}={value!r} requires Ascend NPU but none is available.")
+            if isinstance(value, OpsSelection):
+                seen = []
+                for candidate in value.all_impls():
+                    if candidate not in seen:
+                        seen.append(candidate)
+                return seen
+            return [value]
+
+        for field_name, npu_ok in _NPU_ALLOWED.items():
+            for value in impls_for(field_name):
+                if value is None or value == "eager":
+                    continue
+                if on_npu and value not in npu_ok:
+                    allowed = sorted(npu_ok | {"eager"})
+                    raise ValueError(
+                        f"{field_name}={value!r} is not supported on Ascend NPU. "
+                        f"Set to one of {allowed}, or leave it unset for the NPU default; "
+                        f"'eager' is the universal fallback for ops with no NPU kernel for the current model."
+                    )
+                if not on_npu and value in _NPU_REQUIRED.get(field_name, frozenset()):
+                    raise ValueError(f"{field_name}={value!r} requires Ascend NPU but none is available.")
 
         for field_name, mlu_ok in _MLU_ALLOWED.items():
-            value = getattr(self, field_name)
-            if value is None or value == "eager":
-                continue
-            if on_mlu:
-                if value == "fused_mlu" and not is_apex_mlu_available():
-                    raise ValueError("moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU.")
-                if value == "liger_kernel" and not is_liger_kernel_mlu_available():
-                    raise ValueError(
-                        f"{field_name}='liger_kernel' requires the Cambricon MLU liger_kernel build on MLU "
-                        "(upstream GPU liger-kernel does not run on MLU). Install the MLU liger_kernel wheel, "
-                        "set 'eager', or leave the field unset."
-                    )
-                if value not in mlu_ok:
-                    allowed = sorted(mlu_ok | {"eager"})
-                    raise ValueError(
-                        f"{field_name}={value!r} is not supported on Cambricon MLU. "
-                        f"Set to one of {allowed}; 'eager' is the universal fallback "
-                        f"for ops with no MLU kernel for the current model."
-                    )
+            for value in impls_for(field_name):
+                if value is None or value == "eager":
+                    continue
+                if on_mlu:
+                    if value == "fused_mlu" and not is_apex_mlu_available():
+                        raise ValueError(
+                            "moe_implementation='fused_mlu' requires apex_mlu installed on Cambricon MLU."
+                        )
+                    if value == "liger_kernel" and not is_liger_kernel_mlu_available():
+                        raise ValueError(
+                            f"{field_name}='liger_kernel' requires the Cambricon MLU liger_kernel build on MLU "
+                            "(upstream GPU liger-kernel does not run on MLU). Install the MLU liger_kernel wheel, "
+                            "set 'eager', or leave the field unset."
+                        )
+                    if value not in mlu_ok:
+                        allowed = sorted(mlu_ok | {"eager"})
+                        raise ValueError(
+                            f"{field_name}={value!r} is not supported on Cambricon MLU. "
+                            f"Set to one of {allowed}; 'eager' is the universal fallback "
+                            f"for ops with no MLU kernel for the current model."
+                        )
 
 
 @dataclass

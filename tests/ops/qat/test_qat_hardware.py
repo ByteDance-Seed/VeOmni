@@ -12,18 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Training-path hardware precondition for the torchao QAT rows.
+"""Training-path hardware precondition for torchao low-precision rows.
 
-The fake quantizer runs on CPU, which is what the op-level tests use; only the
-distributed training GEMM needs native BF16, so the check must refuse an SM80-
-host but leave a CPU host alone.
+Emulated FP4/FP8 rows also run on CPU for op-level tests; only distributed
+training on CUDA requires SM80+ (native BF16) for emulated rows and NVIDIA
+SM89+ (Ada/Hopper/Blackwell) for native FP8.
 """
 
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.ops import OpsSelection, SiteOverride
 from veomni.ops.qat._hardware import reject_qat_without_native_bf16
 
 
@@ -45,9 +47,10 @@ def _nested_model(**ops_fields) -> SimpleNamespace:
     )
 
 
-def _device(monkeypatch, *, cuda: bool, capability: int):
+def _device(monkeypatch, *, cuda: bool, capability: int, hip: str | None = None):
     monkeypatch.setattr("veomni.utils.device.IS_CUDA_AVAILABLE", cuda)
     monkeypatch.setattr("veomni.utils.device.get_gpu_compute_capability", lambda _device=None: capability)
+    monkeypatch.setattr(torch.version, "hip", hip)
 
 
 def test_leaves_a_model_without_torchao_rows_alone(monkeypatch):
@@ -55,7 +58,7 @@ def test_leaves_a_model_without_torchao_rows_alone(monkeypatch):
     reject_qat_without_native_bf16(_model(linear_implementation="qat"))
 
 
-_TORCHAO_ROWS = ("torchao_nvfp4", "torchao_mxfp4")
+_TORCHAO_ROWS = ("torchao",)
 
 
 @pytest.mark.parametrize("impl", _TORCHAO_ROWS)
@@ -69,13 +72,13 @@ def test_refuses_a_torchao_row_below_sm80(monkeypatch, field, impl):
 @pytest.mark.parametrize("capability", [80, 89, 90])
 def test_allows_a_torchao_row_from_sm80(monkeypatch, capability):
     _device(monkeypatch, cuda=True, capability=capability)
-    reject_qat_without_native_bf16(_model(linear_implementation="torchao_nvfp4"))
+    reject_qat_without_native_bf16(_model(linear_implementation="torchao"))
 
 
 def test_leaves_a_cpu_host_alone(monkeypatch):
     """The fake quantizer is tensor math and runs on CPU; only training needs BF16 hardware."""
     _device(monkeypatch, cuda=False, capability=0)
-    reject_qat_without_native_bf16(_model(linear_implementation="torchao_mxfp4"))
+    reject_qat_without_native_bf16(_model(linear_implementation="torchao"))
 
 
 @pytest.mark.parametrize("impl", _TORCHAO_ROWS)
@@ -83,3 +86,34 @@ def test_walks_nested_configs(monkeypatch, impl):
     _device(monkeypatch, cuda=True, capability=70)
     with pytest.raises(RuntimeError, match=impl):
         reject_qat_without_native_bf16(_nested_model(linear_implementation=impl))
+
+
+@pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
+def test_native_fp8_requires_nvidia_sm89(monkeypatch, field):
+    fp8 = OpsSelection(name="torchao", kwargs={"dtype": "fp8", "recipe": "rowwise"})
+    fp8_chained = OpsSelection(
+        name="eager",
+        overrides=[
+            SiteOverride(site=r"layers\.0\.q_a_proj", name="torchao"),
+            SiteOverride(site=r"layers\.0\.q_a_proj", kwargs={"dtype": "fp8"}),
+        ],
+    )
+    fp8_emulated = OpsSelection(name="torchao", kwargs={"dtype": "fp8", "emulated": True})
+
+    # SM80 rejects native FP8 (top-level and chained overrides) but permits emulated FP8.
+    _device(monkeypatch, cuda=True, capability=80)
+    with pytest.raises(RuntimeError, match="SM89"):
+        reject_qat_without_native_bf16(_model(**{field: fp8}))
+    with pytest.raises(RuntimeError, match="SM89"):
+        reject_qat_without_native_bf16(_model(**{field: fp8_chained}))
+    reject_qat_without_native_bf16(_model(**{field: fp8_emulated}))
+
+    # ROCm rejects native FP8 even with capability >= 89.
+    _device(monkeypatch, cuda=True, capability=90, hip="6.0")
+    with pytest.raises(RuntimeError, match="SM89"):
+        reject_qat_without_native_bf16(_model(**{field: fp8}))
+
+    # NVIDIA SM89+ permits native FP8.
+    _device(monkeypatch, cuda=True, capability=89)
+    reject_qat_without_native_bf16(_model(**{field: fp8}))
+    reject_qat_without_native_bf16(_model(**{field: fp8_chained}))

@@ -1,6 +1,6 @@
 # FP8 MoE training with DeepGEMM on Hopper and Blackwell
 
-`moe_implementation: deepgemm_fp8` selects native FP8 grouped GEMMs for
+`moe_implementation: deepgemm` selects native FP8 grouped GEMMs for
 routed SwiGLU experts' forward, activation gradients (dgrad), and weight
 gradients (wgrad). It implements the existing `moe_experts/standard` contract
 and is opt-in. It does not require Transformer Engine.
@@ -12,7 +12,7 @@ For a model using the standard SwiGLU expert contract:
 ```yaml
 model:
   ops_implementation:
-    moe_implementation: deepgemm_fp8
+    moe_implementation: deepgemm
 ```
 
 The model's existing `VeomniOp` handle resolves the backend at construction.
@@ -21,15 +21,15 @@ is unchanged. Use trainable BF16 expert parameters, or FSDP2 BF16 parameter
 mixed precision with FP32 master weights. A packed inference checkpoint must
 first pass through its model's existing dequantization/weight-loading path.
 
-`deepgemm_fp8` and `qat` are two values of the same `moe_implementation` field,
+`deepgemm` and `qat` are two values of the same `moe_implementation` field,
 so the routed experts can never be quantized twice. The other families are
 independent: selecting `qat` for `linear_implementation` or
-`gated_mlp_implementation` alongside `deepgemm_fp8` is valid and covers a case
+`gated_mlp_implementation` alongside `deepgemm` is valid and covers a case
 DeepGEMM does not -- the attention projections and the **shared expert**, which is
 a dense SwiGLU FFN rather than one of the routed experts. Combine them freely;
 this is independent of rollout/export quantization.
 
-MoE-LoRA on routed expert weights is unsupported with `deepgemm_fp8`. Both
+MoE-LoRA on routed expert weights is unsupported with `deepgemm`. Both
 shared and independent LoRA wrappers raise before moving the base parameters,
 instead of silently switching to BF16 eager execution. Select a supported
 MoE-LoRA backend such as `fused_triton` on GPU, or exclude expert weights from
@@ -74,7 +74,7 @@ This is operator integration, not full-model convergence validation.
 ```yaml
 model:
   ops_implementation:
-    moe_implementation: deepgemm_fp8
+    moe_implementation: deepgemm
   accelerator:
     fsdp_config:
       expert_weight_fp8_all_gather: true
@@ -115,7 +115,7 @@ the weight payload/scale storage and restores it before backward; activation
 offload must not copy that container to CPU or count it against its GPU budget.
 
 `expert_weight_fp8_all_gather: true` applies only to modules whose actual `veomni_moe.impl`
-is `deepgemm_fp8`. If none match, the flag is silently ignored, for standalone
+is `deepgemm`. If none match, the flag is silently ignored, for standalone
 models, composed models and individual children alike. FP8-specific policy
 checks run only after this selection, so a dense child can inherit the flag
 while using DDP, FP16, CPU offload or compilation under its usual backend
@@ -130,7 +130,7 @@ no cross-rank expert parameter all-gather to compress.
 Constraints for selected experts:
 
 - Two merged expert weights `[E,2*I,H]` and `[E,H,I]`, selected by the actual
-  module's `veomni_moe.impl == "deepgemm_fp8"` handle.
+  module's `veomni_moe.impl == "deepgemm"` handle.
 - BF16 FSDP mixed precision, CUDA, contiguous BF16/FP32 master shards.
 - Even sharding, with complete 128x128 blocks inside every shard. The default
   EP FSDP `Shard(1)` layout must divide both `2*I` and `H` into multiples of
@@ -322,6 +322,6 @@ lazy-import checks remain available without the GPU dependency.
 
 - [Registry](../../veomni/ops/kernels/moe_experts/__init__.py)
 - [Standard expert wrapper](../../veomni/ops/kernels/moe_experts/standard/deepgemm.py)
-- [Quantizers and training autograd](../../veomni/ops/kernels/moe_experts/shared/deepgemm_fp8.py)
-- [Numerical tests](../../tests/ops/moe_experts/test_deepgemm_fp8.py)
-- [Distributed tests](../../tests/ops/moe_experts/test_deepgemm_fp8_distributed.py)
+- [Quantizers and training autograd](../../veomni/ops/kernels/moe_experts/shared/deepgemm.py)
+- [Numerical tests](../../tests/ops/moe_experts/test_deepgemm.py)
+- [Distributed tests](../../tests/ops/moe_experts/test_deepgemm_distributed.py)

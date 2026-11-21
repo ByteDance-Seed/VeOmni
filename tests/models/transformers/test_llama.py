@@ -63,7 +63,7 @@ def test_llama_rope_reads_selected_impl(monkeypatch, selected_rope_impl):
     selected: list[tuple[str, str, str]] = []
 
     class StubOp:
-        def __init__(self, op: str, variant: str, impl: str):
+        def __init__(self, op: str, variant: str, impl: str, *, site: str | None = None):
             selected.append((op, variant, impl))
 
         def __call__(self, *args, **_kwargs):
