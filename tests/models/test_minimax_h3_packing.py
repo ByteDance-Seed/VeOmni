@@ -632,7 +632,7 @@ def test_native_foundation_loader_uses_ordinary_batch_contract(backend):
         attn_implementation=backend,
         rms_norm_implementation="eager",
         rotary_pos_emb_implementation="eager",
-        swiglu_mlp_implementation="eager",
+        gated_mlp_implementation="eager",
         cross_entropy_loss_implementation="eager",
         moe_implementation="eager",
         load_balancing_loss_implementation="eager",

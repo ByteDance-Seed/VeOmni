@@ -3,7 +3,7 @@
 Registered under ``OMNI_HF_LAYOUT_REGISTRY["qwen3"]``. Point ``model.model_path``
 at an upstream Qwen3 checkpoint to train / infer from it directly, or split it
 offline with ``scripts/seed_omni/convert_model.py``. Graphs come from
-``configs/seed_omni/Qwen/qwen3_0.6b/train/``.
+``configs/seed_omni/Qwen/qwen3/`` (``train/`` DAG, ``infer/`` FSM).
 
 Modules::
 
@@ -53,9 +53,9 @@ QWEN3_HF_LAYOUT = OmniHFLayout(
     },
     # Small Qwen3 checkpoints tie the head yet still store it.
     tied_source_keys={"lm_head.weight": "model.embed_tokens.weight"},
-    graph_dir="configs/seed_omni/Qwen/qwen3_0.6b/train",
-    training_graphs="graph_train.yaml",
-    generation_graphs={"infer_text": "graph_infer.yaml"},
+    graph_dir="configs/seed_omni/Qwen/qwen3",
+    training_graphs="train/graph_train.yaml",
+    generation_graphs={"infer_text": "infer/graph_infer.yaml"},
     infer_type="infer_text",
 )
 

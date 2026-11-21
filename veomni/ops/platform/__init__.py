@@ -17,6 +17,7 @@
 from .gpu import (
     NVIDIA_GPU,
     NVIDIA_SM70_PLUS,
+    NVIDIA_SM89_PLUS,
     NVIDIA_SM90_PLUS,
     NVIDIA_SM100_PLUS,
     ROCM_GPU,
@@ -41,6 +42,7 @@ __all__ = [
     "MluKernelRequirement",
     "NVIDIA_GPU",
     "NVIDIA_SM70_PLUS",
+    "NVIDIA_SM89_PLUS",
     "NVIDIA_SM90_PLUS",
     "NVIDIA_SM100_PLUS",
     "NpuKernelRequirement",

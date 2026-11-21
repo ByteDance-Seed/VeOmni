@@ -67,7 +67,7 @@ model:
     cross_entropy_loss_implementation: chunk_loss
     rms_norm_implementation: torch_npu
     rotary_pos_emb_implementation: torch_npu
-    swiglu_mlp_implementation: eager           # no NPU backend available
+    gated_mlp_implementation: eager           # no NPU backend available
     load_balancing_loss_implementation: eager  # current NPU config normalization selects eager
     # Qwen3.5 GatedDeltaNet trio — for both dense and MoE Qwen3.5 models;
     # select the NPU kernels explicitly; the default `fla` backend is GPU-only:

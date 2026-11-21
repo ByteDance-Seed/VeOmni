@@ -361,8 +361,10 @@ class OmniModel(PreTrainedModel):
         if load_kwargs:
             raise ValueError(f"Loading from a HuggingFace checkpoint does not take {sorted(load_kwargs)}.")
         if torch_dtype == "auto":
-            hf_config = source.layout.read_hf_config(source.path)
-            torch_dtype = getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", None)
+            torch_dtype = getattr(module_config, "dtype", None)
+            if torch_dtype is None:
+                hf_config = source.layout.read_hf_config(source.path)
+                torch_dtype = getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", None)
         if isinstance(torch_dtype, str):
             torch_dtype = getattr(torch, torch_dtype)
         module = load_module_from_hf_source(
