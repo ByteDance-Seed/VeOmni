@@ -31,6 +31,7 @@ from veomni.models.loader import get_loader
 from veomni.models.registry import get_model_config, get_model_processor
 from veomni.utils import logging
 from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.utils.env import get_env
 
 
 if TYPE_CHECKING:
@@ -96,12 +97,28 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
     if not get_parallel_state().cp_enabled:
         return
 
-    # deepseek_v4's context parallelism is validated on Ascend; every other model
-    # stays GPU-only.
+    state = get_parallel_state()
+    model_type = getattr(config, "model_type", None)
+    if model_type in CONTEXT_PARALLEL_MODEL_TYPES and get_env("MODELING_BACKEND") == "hf":
+        raise NotImplementedError(f"{model_type} Context Parallelism requires the VeOmni modeling backend.")
+    if model_type == "qwen4_exp":
+        vision_config = getattr(config, "vision_config", None)
+        vision_heads = (
+            vision_config.get("num_heads")
+            if isinstance(vision_config, dict)
+            else getattr(vision_config, "num_heads", None)
+        )
+        if isinstance(vision_heads, int) and vision_heads % state.sp_size != 0:
+            raise ValueError(
+                f"Qwen4-Exp vision heads ({vision_heads}) must be divisible by "
+                f"the combined sequence-parallel size ({state.sp_size})."
+            )
+    if getattr(state, "ulysses_size", 1) > 1 and model_type != "qwen4_exp":
+        raise NotImplementedError("Combined Ulysses/CP is currently implemented for Qwen4-Exp only.")
     if IS_NPU_AVAILABLE:
-        if getattr(config, "model_type", None) != "deepseek_v4":
+        if model_type not in ("deepseek_v4", "qwen4_exp"):
             raise NotImplementedError(
-                "Context parallelism is GPU-only in this release except for deepseek_v4; "
+                "Context parallelism on Ascend/NPU is currently implemented for Qwen4-Exp and deepseek_v4 only; "
                 "set cp_size=1 on Ascend/NPU runs."
             )
 
@@ -111,19 +128,19 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
         # where CP supplies explicit ``cu_seqlen`` ranges over the global
         # sequence. Both reject the first compressed layer, so only the eager
         # operators are admitted.
-        ops_config = config.ops_config
-        for field in ("dsa_indexer_implementation", "dsa_attention_implementation"):
-            # ``ops_config`` resolves the dataclass defaults, so an unset field
-            # reads back as its default rather than ``None``.
-            implementation = getattr(ops_config, field)
-            if implementation != "eager":
-                raise NotImplementedError(
-                    f"Context parallelism on Ascend/NPU requires {field}='eager'; got {implementation!r}. "
-                    "The CANN DeepSeek-V4 sparse attention rejects CP's local-query/global-KV geometry and "
-                    "the CANN indexer rejects CP's explicit cu_seqlen ranges, so training fails in the first "
-                    "compressed layer. Set both DSA operators to 'eager' in configs/text/deepseek_v4_npu.yaml, "
-                    "or set cp_size=1."
-                )
+        if model_type == "deepseek_v4":
+            ops_config = getattr(config, "ops_config", None)
+            for field in ("dsa_indexer_implementation", "dsa_attention_implementation"):
+                # Resolved dataclass defaults supply unset fields.
+                implementation = getattr(ops_config, field, None)
+                if implementation != "eager":
+                    raise NotImplementedError(
+                        f"Context parallelism on Ascend/NPU requires {field}='eager'; got {implementation!r}. "
+                        "The CANN DeepSeek-V4 sparse attention rejects CP's local-query/global-KV geometry and "
+                        "the CANN indexer rejects CP's explicit cu_seqlen ranges, so training fails in the first "
+                        "compressed layer. Set both DSA operators to 'eager' in configs/text/deepseek_v4_npu.yaml, "
+                        "or set cp_size=1."
+                    )
 
     from .seed_omni.modules.module_configuration_base import OmniModuleConfig
 
@@ -135,7 +152,6 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
         if inner_model_type in CONTEXT_PARALLEL_MODEL_TYPES:
             return
 
-    model_type = getattr(config, "model_type", None)
     if model_type in CONTEXT_PARALLEL_MODEL_TYPES:
         return
 
