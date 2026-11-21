@@ -67,7 +67,7 @@ Our guiding principles when building VeOmni are:
 
 ## ✏️ Supported Models
 
-> ✅ Verified · ◐ Verified at reduced scale · — No passing check recorded · ❌ Unsupported
+> ✅ Supported · — Unconfirmed · ❌ Unsupported
 >
 > The default example uses CUDA. Look for `ascend.yaml` in the same [model directory](configs/models) for Ascend. The [validation report](docs/examples/eight_device_validation.md) lists results by checkpoint.
 >
@@ -77,10 +77,10 @@ Our guiding principles when building VeOmni are:
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | [BAGEL](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | ✅ | — | — | — | [YAML](configs/models/bagel/cuda.yaml) |
 | [Cosmos3-Nano](https://huggingface.co/nvidia/Cosmos3-Nano) | ✅ | ✅ | — | — | [YAML](configs/models/cosmos3/cuda.yaml) |
-| [DeepSeek-V2.5 / V3 / R1](https://huggingface.co/deepseek-ai) | ◐ | ◐ | ✅ | — | [YAML](configs/models/deepseek_v3/cuda.yaml) |
-| [DeepSeek-V4](https://huggingface.co/deepseek-ai) | ◐ | ◐ | ✅ | — | [YAML](configs/models/deepseek_v4/cuda.yaml) |
-| [Gemma 3](https://huggingface.co/google) | ◐ | ◐ | — | — | [YAML](configs/models/gemma3/cuda.yaml) |
-| [GLM-5](https://huggingface.co/zai-org) | ◐ | ◐ | — | — | [YAML](configs/models/glm5/cuda.yaml) |
+| [DeepSeek-V2.5 / V3 / R1](https://huggingface.co/deepseek-ai) | ✅ | ✅ | ✅ | — | [YAML](configs/models/deepseek_v3/cuda.yaml) |
+| [DeepSeek-V4](https://huggingface.co/deepseek-ai) | ✅ | ✅ | ✅ | — | [YAML](configs/models/deepseek_v4/cuda.yaml) |
+| [Gemma 3](https://huggingface.co/google) | ✅ | — | — | — | [YAML](configs/models/gemma3/cuda.yaml) |
+| [GLM-5](https://huggingface.co/zai-org) | ✅ | — | — | — | [YAML](configs/models/glm5/cuda.yaml) |
 | [GPT-OSS](https://huggingface.co/openai/gpt-oss-120b) | ✅ | ✅ | ❌ | ❌ | [YAML](configs/models/gpt_oss/cuda.yaml) |
 | [HunyuanVideo 1.5](https://huggingface.co/tencent/HunyuanVideo-1.5) | ✅ | ✅ | — | — | [YAML](configs/models/hunyuanvideo15/cuda.yaml) |
 | [Janus](https://huggingface.co/deepseek-ai/Janus-1.3B) | ✅ | ✅ | — | — | [YAML](configs/models/janus/cuda.yaml) |
@@ -98,7 +98,7 @@ Our guiding principles when building VeOmni are:
 | [Qwen3-Omni-MoE](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [YAML](configs/models/qwen3_omni_moe/cuda.yaml) |
 | [Qwen3.5](https://huggingface.co/Qwen) | ✅ | — | ✅ | ✅ | [YAML](configs/models/qwen3_5/cuda.yaml) |
 | [Qwen3.5-MoE](https://huggingface.co/Qwen) | ✅ | — | ✅ | ✅ | [YAML](configs/models/qwen3_5_moe/cuda.yaml) |
-| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen) | ◐ | — | — | — | [YAML](configs/models/qwen3_8_flash_next/cuda.yaml) |
+| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen) | ✅ | — | — | — | [YAML](configs/models/qwen3_8_flash_next/cuda.yaml) |
 | [Qwen-Image / Qwen-Image-Edit](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/qwen_image/cuda.yaml) |
 | [Seed-OSS](https://huggingface.co/ByteDance-Seed) | ✅ | ✅ | — | — | [YAML](configs/models/seed_oss/cuda.yaml) |
 | [Wan2.1 / Wan2.2](https://huggingface.co/Wan-AI) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/wan2_1/cuda.yaml) |
