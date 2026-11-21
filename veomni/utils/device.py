@@ -14,6 +14,7 @@
 
 # Following codes are inspired from https://github.com/volcengine/verl/blob/main/verl/utils/device.py
 
+import os
 from typing import Any
 
 import torch
@@ -81,6 +82,30 @@ def get_torch_device() -> Any:
 def get_device_id() -> int:
     """Get current device id based on device type."""
     return get_torch_device().current_device()
+
+
+def is_caching_allocator_active() -> bool:
+    """Whether ``record_stream`` can defer the free of an accelerator allocation.
+
+    Callers check this before relying on ``record_stream`` instead of a host-side
+    event synchronize. The native CUDA caching allocator is the only backend whose
+    ``record_stream`` keeps a block alive until the recording stream reaches it.
+    Every other backend returns False here, so the caller keeps the synchronize:
+
+    * NPU / MLU have their own allocators with no equivalent guarantee.
+    * The async backend has its own ``record_stream``, without the per-block
+      stream-use list the native one keeps, so it cannot defer a free.
+    * ``PYTORCH_NO_CUDA_MEMORY_CACHING`` bypasses the caching allocator entirely,
+      which makes ``record_stream`` a no-op and the free immediate.
+    """
+    if get_device_type() != "cuda":
+        return False
+    if os.environ.get("PYTORCH_NO_CUDA_MEMORY_CACHING", "0") not in ("0", ""):
+        return False
+    try:
+        return get_torch_device().memory.get_allocator_backend() == "native"
+    except Exception:
+        return False
 
 
 def is_moe_kernel_supported(device: torch.device | str) -> bool:
