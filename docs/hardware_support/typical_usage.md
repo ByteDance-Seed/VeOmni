@@ -53,7 +53,7 @@ python3 scripts/download_hf_model.py \
 
 ## Step 4: Configure Training
 
-VeOmni uses YAML configuration files for training. You can directly modify the configuration file at `configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml` to adjust parameters like batch size, learning rate, and other hyperparameters according to your needs.
+VeOmni uses YAML configuration files for training. You can directly modify the configuration file at `configs/models/qwen3_vl/recipes/multisource_8b.yaml` to adjust parameters like batch size, learning rate, and other hyperparameters according to your needs.
 
 ### NPU-Friendly Operator Configurations
 
@@ -92,7 +92,7 @@ fallbacks do not accept `cu_seqlens`.
 Run the training command with the appropriate parameters:
 
 ```bash
-bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
+bash train.sh tasks/train_vlm.py configs/models/qwen3_vl/recipes/multisource_8b.yaml \
     --model.model_path ./Qwen3-VL-8B-Instruct \
     --data.train_path ./sharegpt4v_instruct_gpt4-vision_cap100k_coco.json \
     --data.dataloader.type native \

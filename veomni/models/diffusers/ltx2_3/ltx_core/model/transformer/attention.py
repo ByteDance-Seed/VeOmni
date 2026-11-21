@@ -77,6 +77,9 @@ class VeomniLTXAttention:
         key = k.view(batch, -1, heads, dim_head).transpose(1, 2)
         value = v.view(batch, -1, heads, dim_head).transpose(1, 2)
         attention_mask = None if mask is None else _hf_attention_mask(mask)
+        # Ascend SDPA requires the query axis even when all queries share a padding mask.
+        if attention_mask is not None and attention_mask.size(-2) == 1:
+            attention_mask = attention_mask.expand(-1, -1, seq_q, -1)
         handle = self.veomni_attn_masked if attention_mask is not None else self.veomni_attn
         output, _ = handle(
             self,

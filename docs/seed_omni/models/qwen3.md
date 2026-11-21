@@ -216,7 +216,7 @@ classic text trainer (`tasks/train_text.py`). Run the classic text trainer on
 the same model + data and compare the loss curve:
 
 ```bash
-bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
+bash train.sh tasks/train_text.py configs/models/qwen3/recipes/sft_8b.yaml \
   --model.model_path /abs/path/to/Qwen3-0.6B \
   --data.train_path /abs/path/to/tulu-3-sft-mixture \
   --data.max_seq_len 2048 --train.global_batch_size 8 --train.micro_batch_size 1 \

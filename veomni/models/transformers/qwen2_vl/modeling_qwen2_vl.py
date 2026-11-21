@@ -1486,6 +1486,11 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
 
 class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
+    # Original HF releases placed the vision tower at the root and text layers under model.
+    _checkpoint_conversion_mapping = {
+        r"^visual\.": "model.visual.",
+        r"^model\.(?=embed_tokens\.|layers\.|norm\.)": "model.language_model.",
+    }
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
 
     def __init__(self, config):

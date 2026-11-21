@@ -1803,6 +1803,11 @@ class Qwen2_5_VLCausalLMOutputWithPast(CausalLMOutputWithPast):
 
 
 class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
+    # Original HF releases placed the vision tower at the root and text layers under model.
+    _checkpoint_conversion_mapping = {
+        r"^visual\.": "model.visual.",
+        r"^model\.(?=embed_tokens\.|layers\.|norm\.)": "model.language_model.",
+    }
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
     # Reference: fix gemma3 grad acc #37208
     accepts_loss_kwargs = False

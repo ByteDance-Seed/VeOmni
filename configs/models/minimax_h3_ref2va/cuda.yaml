@@ -1,0 +1,72 @@
+# modelscope download --model MiniMax/MiniMax-H3 --local_dir ./MiniMax-H3
+# Preparation: docs/examples/minimax_h3.md
+# bash train.sh tasks/train_dit.py configs/models/minimax_h3_ref2va/cuda.yaml
+
+model:
+  model_path: ./MiniMax-H3/Ref2VA/transformer
+  config_path: ./MiniMax-H3/Ref2VA/transformer/config.json
+  condition_model_path: ./MiniMax-H3/Ref2VA
+  condition_model_cfg:
+    skip_encoder_load: true
+    sigma_shift_video: 12.0
+    sigma_shift_audio: 3.0
+    training_cfg_scale: 4.0
+    training_cfg_schedule: constant
+    training_cfg_curvature_power: 2.0
+    base_model_path: ./MiniMax-H3/Ref2VA
+  lora_config:
+    rank: 4
+    alpha: 8
+    lora_modules:
+    - qkv_proj
+    - out_proj
+  ops_implementation:
+    attn_implementation: sdpa
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    gated_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    moe_implementation: eager
+    load_balancing_loss_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 2.0e-05
+    lr_decay_style: linear
+    lr_min: 2.0e-05
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    init_device: meta
+    ulysses_size: 1
+    gradient_checkpointing:
+      enable: true
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        cast_forward_inputs: false
+data:
+  train_path: ./data/ref2va_latents.parquet
+  data_type: diffusion
+  source_name: minimax_h3
+  data_transform: dit_offline
+  datasets_type: mapping
+  dataset_repeat: true
+  log_sample: false
+  text_keys: text
+train:
+  training_task: offline_training
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+  seed: 42
+  num_train_epochs: 1
+  checkpoint:
+    output_dir: outputs/minimax_h3_ref2va/cuda
+    manager: dcp
+    save_hf_weights: false
+  wandb:
+    enable: false

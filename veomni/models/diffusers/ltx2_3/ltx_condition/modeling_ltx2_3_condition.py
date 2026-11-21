@@ -595,7 +595,7 @@ class LTXVideoConditionModel(PreTrainedModel):
 
         elif "conditions" in kwargs:
             conditions_raw = kwargs.pop("conditions")
-            audio_latents_raw = kwargs.pop("audio_latents", None)
+            audio_latents_raw = kwargs.pop("audio_latents", audio_latents)
             if fps is None and "fps" in kwargs:
                 fps = kwargs.pop("fps")
 

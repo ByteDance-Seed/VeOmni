@@ -123,6 +123,27 @@ def test_ltx2_3_condition_builds_from_registered_class_without_assets(monkeypatc
     assert model.config.model_type == "LTXVideoConditionModel"
 
 
+@pytest.mark.parametrize("has_batch_axis", [False, True])
+def test_ltx_offline_audio_latents_have_batch_axis(monkeypatch, has_batch_axis):
+    from veomni.models.diffusers.ltx2_3.ltx_condition import modeling_ltx2_3_condition as condition
+
+    monkeypatch.setattr(condition.LTXVideoConditionModel, "_load_components", lambda self: None)
+    monkeypatch.setattr(condition, "get_device_type", lambda: "cpu")
+    model = condition.LTXVideoConditionModel(_tiny_condition_config())
+    sample = torch.randn(8, 4, 16)
+    batch = model._unpack_raw_batch(
+        {"conditions": [{"video_prompt_embeds": torch.zeros(2, 16)}]},
+        latents=None,
+        context=None,
+        context_mask=None,
+        audio_context=None,
+        audio_latents=[sample.unsqueeze(0) if has_batch_axis else sample],
+        reference_latents=None,
+        fps=None,
+    )
+    torch.testing.assert_close(batch[4][0], sample.unsqueeze(0))
+
+
 def test_ltx2_3_eager_forward_and_backward_match_vendored_reference():
     torch.manual_seed(2)
     config = _tiny_config()
@@ -331,6 +352,10 @@ def test_ltx_adapter_expands_mask_and_skips_ulysses():
     assert tuple(captured["attention_mask"].shape) == (1, 1, 4, 4)
     assert captured["attention_mask"].dtype == mask.dtype
     assert captured["skip_ulysses"] is True
+
+    padding_mask = torch.tensor([[[[0.0, 0.0, -1e4, -1e4]]]])
+    adapter(query, key, value, heads=2, mask=padding_mask)
+    torch.testing.assert_close(captured["attention_mask"], padding_mask.expand(1, 1, 4, 4))
 
 
 def test_ltx_adapter_matches_sdpa():

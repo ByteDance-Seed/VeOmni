@@ -1,0 +1,70 @@
+# hf download tencent/HunyuanVideo-1.5 --local-dir ./HunyuanVideo-1.5
+# Preparation: docs/examples/hunyuanvideo15.md
+# bash train.sh tasks/train_dit.py configs/models/hunyuanvideo15/ascend.yaml
+
+model:
+  model_path: ./HunyuanVideo-1.5/transformer/480p_t2v
+  config_path: ./configs/model_configs/hunyuanvideo15/480p_t2v.json
+  condition_model_path: ./HunyuanVideo-1.5
+  condition_model_cfg:
+    height: 256
+    width: 384
+    num_frames: 9
+    train_timestep_shift: 3.0
+    max_text_length: 256
+    base_model_path: ./HunyuanVideo-1.5
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 1.0e-05
+    lr_warmup_ratio: 0.0
+    lr_decay_style: constant
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    dp_replicate_size: 1
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+  lora_config:
+    rank: 4
+    alpha: 8
+    lora_modules:
+    - img_attn_q
+    - img_attn_k
+    - img_attn_v
+data:
+  train_path: ./data/video.parquet
+  source_name: Tom-and-Jerry-VideoGeneration-Dataset
+  datasets_type: mapping
+  data_type: diffusion
+  data_transform: dit_online
+  text_keys: prompt
+  max_seq_len: 32768
+  mm_configs:
+    fps: 4
+    min_frames: 9
+    max_frames: 9
+    frame_factor: 4
+    frame_factor_remainder: 1
+train:
+  training_task: online_training
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.0
+  checkpoint:
+    output_dir: outputs/hunyuanvideo15/ascend
+    manager: dcp
+    save_hf_weights: false
+  wandb:
+    enable: false

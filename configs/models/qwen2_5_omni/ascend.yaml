@@ -1,0 +1,43 @@
+# hf download Qwen/Qwen2.5-Omni-3B --local-dir ./Qwen2.5-Omni-3B
+# bash train.sh tasks/train_vlm.py configs/models/qwen2_5_omni/ascend.yaml
+
+model:
+  model_path: ./Qwen2.5-Omni-3B
+  optimizer:
+    lr: 1.0e-05
+    lr_decay_style: cosine
+  accelerator:
+    init_device: meta
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+data:
+  train_path: ./data/sharegpt4v.parquet
+  data_type: conversation
+  max_seq_len: 1024
+  mm_configs:
+    scale_factor: 28
+    image_min_pixels: 3136
+    image_max_pixels: 200704
+    video_min_pixels: 100352
+    video_max_pixels: 602112
+    max_ratio: 200
+    min_frames: 4
+    max_frames: 20
+    frame_factor: 2
+    sample_rate: 16000
+    fps: 2.0
+    use_audio_in_video: true
+  datasets_type: mapping
+  source_name: sharegpt4v_sft
+train:
+  wandb:
+    enable: false
+  num_train_epochs: 1
+  micro_batch_size: 1
+  global_batch_size: 8
+  checkpoint:
+    output_dir: outputs/qwen2_5_omni/ascend
+    manager: dcp
+    save_hf_weights: false
+  dyn_bsz: false
