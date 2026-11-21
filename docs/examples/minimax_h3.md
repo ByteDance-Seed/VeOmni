@@ -337,8 +337,11 @@ them, `MiniMaxH3DiT` is listed in `_no_split_modules`, which has side effects:
   block owns its checkpoint boundary, so offload leaves backward recomputation
   active.
 
-Set `mixed_precision.cast_forward_inputs=false`. Both the audio/video and image
-forwards reject floating-point timesteps or positions already cast below FP32.
+Set `mixed_precision.cast_forward_inputs=false`. The single `forward` entry point
+selects audio/video or image execution from `config.audio_enabled`; both paths
+reject floating-point timesteps or positions already cast below FP32. Call the
+model as `model(...)` so FSDP2 runs the wrapper and DiT unshard hooks. Image
+inference uses this entry point and returns patchified image rows.
 Set `gradient_checkpointing.enable_reentrant` to `false` so recomputation
 preserves gradients for the time embedding passed to each block. FSDP2
 parallelization rejects LoRA on the six FP32 projections; other paths do not

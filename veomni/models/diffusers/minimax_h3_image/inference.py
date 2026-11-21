@@ -333,7 +333,7 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
                     unique_timesteps = torch.tensor([timestep], dtype=torch.float32, device=self.device)
                     timestep_indices = torch.zeros(sequence_length, dtype=torch.long, device=self.device)
 
-                noise_pred = self.dit.forward_image(
+                noise_pred = self.dit(
                     x=rows,
                     prompt_embeds=prompt_embeds,
                     unique_timesteps=unique_timesteps,

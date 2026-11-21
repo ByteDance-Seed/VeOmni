@@ -15,7 +15,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from torch.distributed.fsdp import register_fsdp_forward_method
 from transformers.modeling_outputs import ModelOutput
 
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
@@ -180,38 +179,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             loss=losses,
         )
 
-    def forward_image(
-        self,
-        x,
-        prompt_embeds,
-        unique_timesteps,
-        timestep_indices,
-        token_tags,
-        position_ids,
-        image_indices,
-        text_indices,
-        pdd_step_index=None,
-        packed_seq_params=None,
-        refiner_packed_seq_params=None,
-    ):
-        """Run the audio-free MiniMax-H3-Image packed sequence."""
-        self._load_packed_attention_kernel()
-        if "forward_image" not in self.dit.__dict__:
-            register_fsdp_forward_method(self.dit, "forward_image")
-        return self.dit.forward_image(
-            x=x,
-            prompt_embeds=prompt_embeds,
-            unique_timesteps=unique_timesteps,
-            timestep_indices=timestep_indices,
-            token_tags=token_tags,
-            position_ids=position_ids,
-            image_indices=image_indices,
-            text_indices=text_indices,
-            pdd_step_index=pdd_step_index,
-            packed_seq_params=packed_seq_params,
-            refiner_packed_seq_params=refiner_packed_seq_params,
-        )
-
     def forward(
         self,
         x=None,
@@ -232,9 +199,17 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         training_target_audio=None,
         video_latent_shape=None,
         audio_latent_shape=None,
+        timestep_indices=None,
+        position_ids=None,
+        image_indices=None,
+        text_indices=None,
+        pdd_step_index=None,
         **kwargs,
-    ) -> MiniMaxH3DiTOutput:
-        """Forward pass with unpatchify + negation + internal loss computation.
+    ) -> MiniMaxH3DiTOutput | torch.Tensor:
+        """Run the image or audio/video variant selected by ``config.audio_enabled``.
+
+        The image variant returns image rows. The audio/video variant applies
+        unpatchify, negation and internal loss computation.
 
         Accepts all keys from condition_model.process_condition().
         Pops training_target* internally (not via trainer) and computes MSE loss.
@@ -242,6 +217,22 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         video_latent_shape: (T_v, latent_h//2, latent_w//2) for unpatchify_video
         audio_latent_shape: (audio_channel, T_a) for unpack_audio
         """
+        if not self.config.audio_enabled:
+            self._load_packed_attention_kernel()
+            return self.dit(
+                x=x,
+                prompt_embeds=prompt_embeds,
+                unique_timesteps=unique_timesteps,
+                timestep_indices=timestep_indices,
+                token_tags=token_tags,
+                position_ids=position_ids,
+                image_indices=image_indices,
+                text_indices=text_indices,
+                pdd_step_index=pdd_step_index,
+                packed_seq_params=packed_seq_params,
+                refiner_packed_seq_params=refiner_packed_seq_params,
+            )
+
         if isinstance(x, list):
             if not x:
                 raise ValueError("H3 requires a nonempty microbatch.")

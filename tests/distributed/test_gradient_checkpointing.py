@@ -1044,16 +1044,21 @@ def test_the_h3_dit_arms_nothing_itself():
 
 @pytest.mark.parametrize("recompute_layers", [-1, 2])
 def test_h3_rejects_reentrant_checkpointing_before_parallel_wrap(monkeypatch, recompute_layers):
-    monkeypatch.setattr(torch.utils.checkpoint, "CheckpointFunction", torch.utils.checkpoint.CheckpointFunction)
     model = _tiny_h3_model()
-    with pytest.raises(ValueError, match=r"gradient_checkpointing\.enable_reentrant=False"):
-        _parallelize(
-            monkeypatch,
-            model,
-            enable_gradient_checkpointing=True,
-            enable_reentrant=True,
-            recompute_policy=recompute_utils.RecomputePolicy(recompute_layers=recompute_layers, use_reentrant=True),
-        )
+    checkpoint_function = torch.utils.checkpoint.CheckpointFunction
+    try:
+        with pytest.raises(ValueError, match=r"gradient_checkpointing\.enable_reentrant=False"):
+            _parallelize(
+                monkeypatch,
+                model,
+                enable_gradient_checkpointing=True,
+                enable_reentrant=True,
+                recompute_policy=recompute_utils.RecomputePolicy(
+                    recompute_layers=recompute_layers, use_reentrant=True
+                ),
+            )
+    finally:
+        torch.utils.checkpoint.CheckpointFunction = checkpoint_function
     assert not model.is_gradient_checkpointing
 
 

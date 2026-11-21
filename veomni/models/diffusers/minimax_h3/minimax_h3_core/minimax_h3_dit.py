@@ -751,7 +751,7 @@ class MiniMaxH3DiT(nn.Module):
         t_emb = self.time_embedder(unique_timesteps.view(-1).to(device))
         return embeddings, t_emb
 
-    def forward_image(
+    def _forward_image(
         self,
         x,
         prompt_embeds,
@@ -772,8 +772,6 @@ class MiniMaxH3DiT(nn.Module):
         the Qwen3-VL text rows, and the index tensors place both in the packed
         sequence. The returned rows are in ``image_indices`` order.
         """
-        if self.audio_enabled:
-            raise ValueError("MiniMax-H3-Image requires a transformer with audio_enabled=False.")
         _validate_fp32_metadata(unique_timesteps, position_ids)
 
         if x.dim() == 3 and x.shape[0] == 1:
@@ -821,7 +819,7 @@ class MiniMaxH3DiT(nn.Module):
             refiner_host = tuple(int(value) for value in refiner_host)
 
         if get_ulysses_sequence_parallel_group() is not None:
-            raise NotImplementedError("MiniMax-H3-Image forward_image does not support sequence parallelism yet.")
+            raise NotImplementedError("MiniMax-H3-Image does not support sequence parallelism yet.")
 
         rope_freqs = self.rope(position_ids.unsqueeze(0)).to(device)
         decoder_input, t_emb = self._embed_image(
@@ -866,25 +864,42 @@ class MiniMaxH3DiT(nn.Module):
     def forward(
         self,
         x,
-        audio_x,
-        img_position_ids,
-        unique_timesteps,
-        inverse_indices,
-        update_mask,
-        token_tags,
-        prompt_embeds,
-        img_pos_info,
-        audio_pos_info,
-        text_pos_info,
-        img_pos_for_infer_output_info,
-        packed_seq_params,
-        refiner_packed_seq_params,
+        audio_x=None,
+        img_position_ids=None,
+        unique_timesteps=None,
+        inverse_indices=None,
+        update_mask=None,
+        token_tags=None,
+        prompt_embeds=None,
+        img_pos_info=None,
+        audio_pos_info=None,
+        text_pos_info=None,
+        img_pos_for_infer_output_info=None,
+        packed_seq_params=None,
+        refiner_packed_seq_params=None,
         update_audio_mask=None,
         skip_mask_out_condition=False,
         packed_batch=False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        timestep_indices=None,
+        position_ids=None,
+        image_indices=None,
+        text_indices=None,
+        pdd_step_index=None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
         if not self.audio_enabled:
-            raise ValueError("This transformer has audio_enabled=False; use forward_image() instead.")
+            return self._forward_image(
+                x=x,
+                prompt_embeds=prompt_embeds,
+                unique_timesteps=unique_timesteps,
+                timestep_indices=timestep_indices,
+                token_tags=token_tags,
+                position_ids=position_ids,
+                image_indices=image_indices,
+                text_indices=text_indices,
+                pdd_step_index=pdd_step_index,
+                packed_seq_params=packed_seq_params,
+                refiner_packed_seq_params=refiner_packed_seq_params,
+            )
         _validate_fp32_metadata(unique_timesteps, img_position_ids)
         inverse_indices = inverse_indices.view(-1).to(torch.long)
         token_tags = token_tags.view(-1).to(torch.long)

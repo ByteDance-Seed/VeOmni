@@ -96,8 +96,8 @@ def test_minimax_h3_image_forward_uses_pdd_heads_and_has_no_audio_modules():
 
     inputs = _image_inputs()
     with torch.no_grad():
-        first = model.forward_image(**inputs, pdd_step_index=0)
-        second = model.forward_image(**inputs, pdd_step_index=1)
+        first = model(**inputs, pdd_step_index=0)
+        second = model(**inputs, pdd_step_index=1)
 
     assert first.shape == (4, 2)
     assert second.shape == (4, 2)
@@ -113,7 +113,7 @@ def test_minimax_h3_image_forward_backpropagates_to_image_and_text_rows(checkpoi
     forward_calls = []
     model.dit.blocks[0].register_forward_pre_hook(lambda *_: forward_calls.append(1))
     inputs = _image_inputs()
-    output = model.forward_image(**inputs, pdd_step_index=0)
+    output = model(**inputs, pdd_step_index=0)
     output.sum().backward()
 
     assert inputs["x"].grad is not None
@@ -121,7 +121,7 @@ def test_minimax_h3_image_forward_backpropagates_to_image_and_text_rows(checkpoi
     assert len(forward_calls) == (2 if checkpointing else 1)
 
 
-def _run_minimax_h3_image_fsdp_forward(rank, weights_path, rendezvous):
+def _run_minimax_h3_image_fsdp_forward(rank, weights_path, checkpointing, rendezvous):
     from datetime import timedelta
 
     import torch.distributed as dist
@@ -143,15 +143,14 @@ def _run_minimax_h3_image_fsdp_forward(rank, weights_path, rendezvous):
         reference.load_state_dict(model.state_dict())
         inputs = _image_inputs()
         with torch.no_grad():
-            expected = reference.forward_image(**inputs, pdd_step_index=0)
+            expected = reference(**inputs, pdd_step_index=0)
 
         for block in model.dit.blocks:
             fully_shard(block, mesh=state.fsdp_mesh)
         fully_shard(model.dit, mesh=state.fsdp_mesh)
         with torch.no_grad():
-            actual = model.forward_image(**inputs, pdd_step_index=0)
+            actual = model(**inputs, pdd_step_index=0)
 
-        assert "forward_image" in model.dit.__dict__
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
         if rank == 0:
@@ -165,12 +164,23 @@ def _run_minimax_h3_image_fsdp_forward(rank, weights_path, rendezvous):
             weights_path=str(weights_path),
             init_device="meta",
             mixed_precision=MixedPrecisionConfig(enable=False),
-            enable_gradient_checkpointing=False,
-        ).eval()
-        with torch.no_grad():
-            for _ in range(2):
-                actual = production.forward_image(**inputs, pdd_step_index=0)
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            enable_gradient_checkpointing=checkpointing,
+        ).train()
+        block_calls = []
+        production.dit.blocks[0].register_forward_pre_hook(lambda *_: block_calls.append(1))
+        for step in range(2):
+            production.zero_grad(set_to_none=True)
+            actual = production(**inputs, pdd_step_index=step)
+            with torch.no_grad():
+                expected = reference(**inputs, pdd_step_index=step)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            forward_calls = len(block_calls)
+            actual.square().mean().backward()
+            if checkpointing:
+                assert len(block_calls) > forward_calls
+            assert inputs["x"].grad is not None and torch.isfinite(inputs["x"].grad).all()
+            gradients = [parameter.grad for parameter in production.parameters() if parameter.grad is not None]
+            assert gradients and all(torch.isfinite(gradient.to_local()).all() for gradient in gradients)
         dist.barrier()
     finally:
         dist.destroy_process_group()
@@ -178,10 +188,11 @@ def _run_minimax_h3_image_fsdp_forward(rank, weights_path, rendezvous):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-def test_minimax_h3_image_forward_registers_with_fsdp2(tmp_path):
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_minimax_h3_image_forward_through_fsdp2(tmp_path, checkpointing):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
-    spawn_with_rendezvous(_run_minimax_h3_image_fsdp_forward, args=(tmp_path,), nprocs=2)
+    spawn_with_rendezvous(_run_minimax_h3_image_fsdp_forward, args=(tmp_path, checkpointing), nprocs=2)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -191,7 +202,7 @@ def test_minimax_h3_image_forward_rejects_sequence_parallel(monkeypatch):
     model = _build_model()
     monkeypatch.setattr(minimax_h3_dit, "get_ulysses_sequence_parallel_group", lambda: object())
     with pytest.raises(NotImplementedError, match="sequence parallelism"):
-        model.forward_image(**_image_inputs(), pdd_step_index=0)
+        model(**_image_inputs(), pdd_step_index=0)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -202,7 +213,7 @@ def test_minimax_h3_image_forward_rejects_rounded_inputs(input_name, dtype):
     inputs = _image_inputs()
     inputs[input_name] = inputs[input_name].to(dtype)
     with pytest.raises(ValueError, match="cast_forward_inputs"):
-        model.forward_image(**inputs, pdd_step_index=0)
+        model(**inputs, pdd_step_index=0)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -225,7 +236,7 @@ def test_minimax_h3_image_forward_keeps_fp32_projection_modules():
     inputs["x"] = inputs["x"].to(torch.bfloat16)
     inputs["prompt_embeds"] = inputs["prompt_embeds"].to(torch.bfloat16)
     with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
-        output = model.forward_image(**inputs, pdd_step_index=0)
+        output = model(**inputs, pdd_step_index=0)
 
     assert output.shape == (4, 2)
     assert output.dtype == torch.float32
@@ -804,7 +815,7 @@ def test_minimax_h3_image_pipeline_offloads_dit_on_failure(monkeypatch, failure_
     failure = RuntimeError("boom")
 
     class FailingDiT(FakeModule):
-        def forward_image(self, **kwargs):
+        def forward(self, **kwargs):
             raise failure
 
     pipe = MiniMaxH3ImagePipeline(device="cpu")
@@ -931,7 +942,7 @@ def test_minimax_h3_image_pipeline_accelerator_offload_and_retry(failure_phase):
                 raise failure
             return super().to(device)
 
-        def forward_image(self, x, **kwargs):
+        def forward(self, x, **kwargs):
             assert all(tensor.device == pipe.device for tensor in [*self.parameters(), *self.buffers()])
             self.forward_calls += 1
             if self.fail:
