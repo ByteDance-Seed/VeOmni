@@ -228,17 +228,23 @@ class DeepseekV4Config(VeOmniPretrainedConfig, _DeepseekV4Config):
 
         kernels_config = self.ops_config
 
-        for field_name, reason in (
-            ("dsa_indexer_implementation", "the eager indexer discards the per-slot scores the KL trains against"),
+        for field_name, supported, reason in (
+            (
+                "dsa_indexer_implementation",
+                ("tilelang", "triton"),
+                "the eager indexer discards the per-slot scores the KL trains against",
+            ),
             (
                 "dsa_attention_implementation",
-                "the teacher distribution is derived from the TileLang attention's log-sum-exp",
+                ("tilelang", "triton"),
+                "the teacher distribution requires the full base-2 log-sum-exp returned by the fused attention",
             ),
         ):
             value = getattr(kernels_config, field_name, None)
-            if value != "tilelang":
+            if value not in supported:
+                choices = " or ".join(repr(choice) for choice in supported)
                 raise ValueError(
-                    f"dsa_indexer_loss requires {field_name}='tilelang', got {value!r}: {reason}. "
+                    f"dsa_indexer_loss requires {field_name}={choices}, got {value!r}: {reason}. "
                     "Set it under model.ops_implementation, or switch the objective off with "
                     "dsa_indexer_loss: false / dsa_indexer_loss_coef: 0.0 under model.model_config."
                 )
