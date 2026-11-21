@@ -1,5 +1,6 @@
-# Llama-3.3-70B-Instruct on 8 × H20.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/llama3_3/cuda.yaml
+# hf download meta-llama/Llama-3.3-70B-Instruct --local-dir ./Llama-3.3-70B-Instruct
+# bash train.sh tasks/train_text.py configs/models/llama3_3/cuda.yaml
+
 model:
   model_path: ./Llama-3.3-70B-Instruct
   optimizer:
@@ -31,8 +32,6 @@ model:
     - o_proj
 data:
   train_path: ./data/text.parquet
-  dataloader:
-    num_workers: 0
   datasets_type: mapping
   data_type: plaintext
   max_seq_len: 1024
@@ -46,13 +45,8 @@ train:
   checkpoint:
     output_dir: outputs/llama3_3/cuda
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
   wandb:
     enable: false
-  max_steps: 3
   num_train_epochs: 1
-  profile:
-    enable: false
   dyn_bsz: false

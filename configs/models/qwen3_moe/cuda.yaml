@@ -1,5 +1,7 @@
-# Qwen3-30B-A3B on 8 × H20.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/qwen3_moe/cuda.yaml
+# hf download Qwen/Qwen3-30B-A3B --local-dir ./Qwen3-30B-A3B
+# Preparation: docs/examples/qwen3_moe.md
+# bash train.sh tasks/train_text.py configs/models/qwen3_moe/cuda.yaml
+
 model:
   model_path: ./Qwen3-30B-A3B
   ops_implementation:
@@ -37,8 +39,6 @@ data:
   text_keys: messages
   dyn_bsz_buffer_size: 200
   datasets_type: mapping
-  dataloader:
-    num_workers: 0
 train:
   global_batch_size: 8
   micro_batch_size: 1
@@ -49,12 +49,7 @@ train:
   checkpoint:
     output_dir: outputs/qwen3_moe/cuda
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
   wandb:
-    enable: false
-  max_steps: 3
-  profile:
     enable: false
   dyn_bsz: false

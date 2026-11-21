@@ -1,5 +1,6 @@
-# gpt-oss-20b-BF16 on 8 × H20.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/gpt_oss/cuda.yaml
+# hf download unsloth/gpt-oss-20b-BF16 --local-dir ./gpt-oss-20b-BF16
+# bash train.sh tasks/train_text.py configs/models/gpt_oss/cuda.yaml
+
 model:
   model_path: ./gpt-oss-20b-BF16
   chat_template: chatml
@@ -32,8 +33,6 @@ data:
   text_keys: text
   max_seq_len: 512
   datasets_type: mapping
-  dataloader:
-    num_workers: 0
 train:
   dyn_bsz: false
   global_batch_size: 8
@@ -42,11 +41,6 @@ train:
   checkpoint:
     output_dir: outputs/gpt_oss/cuda
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
-  max_steps: 3
   wandb:
-    enable: false
-  profile:
     enable: false

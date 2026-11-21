@@ -1,5 +1,6 @@
-# Qwen-Image on 8 × H20.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_dit.py configs/models/qwen_image/cuda.yaml
+# hf download Qwen/Qwen-Image --local-dir ./Qwen-Image
+# bash train.sh tasks/train_dit.py configs/models/qwen_image/cuda.yaml
+
 model:
   model_path: ./Qwen-Image/transformer
   condition_model_path: ./Qwen-Image
@@ -47,8 +48,6 @@ model:
     - to_out.0
 data:
   train_path: ./data/image.parquet
-  dataloader:
-    num_workers: 0
   datasets_type: mapping
   data_type: diffusion
   max_seq_len: 4096
@@ -67,12 +66,7 @@ train:
   checkpoint:
     output_dir: outputs/qwen_image/cuda
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
-  max_steps: 3
   num_train_epochs: 1
   wandb:
-    enable: false
-  profile:
     enable: false

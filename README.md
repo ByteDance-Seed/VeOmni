@@ -67,41 +67,41 @@ Our guiding principles when building VeOmni are:
 
 ## ✏️ Supported Models
 
-> **Legend:** `✅` Verified · `—` Unverified · `❌` Unsupported
+> ✅ Verified · ◐ Verified at reduced scale · — No passing check recorded · ❌ Unsupported
 >
-> Passing H20 and 910B2 trainer entries link to their YAML under `configs/models/<model>/<backend>.yaml`. Reduced-model and component checks are labeled separately. The [eight-device results](docs/examples/eight_device_validation.md) include training scope, step losses and failed checks.
+> The default example uses CUDA. Look for `ascend.yaml` in the same [model directory](configs/models) for Ascend. The [validation report](docs/examples/eight_device_validation.md) lists results by checkpoint.
 >
 > **Hardware Guides:** [NVIDIA GPU](docs/get_started/installation/install.md) · [Ascend NPU](docs/hardware_support/get_started_npu.md) · [AMD ROCm](docs/hardware_support/rocm/README.md) · [Cambricon MLU](docs/hardware_support/mlu/README.md)
 
-| Model | NVIDIA GPU | Ascend NPU | AMD GPU | Cambricon MLU | Example Config / Guide |
+| Model | NVIDIA GPU | Ascend NPU | AMD GPU | Cambricon MLU | Default example |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| [BAGEL](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | [✅ 8× H20](configs/models/bagel/cuda.yaml) | [Check failed](docs/examples/eight_device_validation.md) | — | — | [base.yaml](configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml) · [Guide](docs/seed_omni/models/bagel.md) |
-| [Cosmos3-Nano](https://huggingface.co/nvidia/Cosmos3-Nano) | [✅ 8× H20](configs/models/cosmos3/cuda.yaml) | [✅ 8× 910B2](configs/models/cosmos3/ascend.yaml) | — | — | [online.yaml](configs/seed_omni/Cosmos3/cosmos3_nano/train/online.yaml) · [Guide](docs/seed_omni/models/cosmos3.md) |
-| [DeepSeek-V2.5 / V3 / R1](https://huggingface.co/deepseek-ai) | [V2.5 (reduced)](configs/models/deepseek_v2_5/cuda.yaml) · [V3 (reduced)](configs/models/deepseek_v3/cuda.yaml) · [R1 (reduced)](configs/models/deepseek_r1/cuda.yaml) | [V2.5 (reduced)](configs/models/deepseek_v2_5/ascend.yaml) · [V3 (reduced)](configs/models/deepseek_v3/ascend.yaml) · [R1 (reduced)](configs/models/deepseek_r1/ascend.yaml) | ✅ | — | [deepseek.yaml](configs/text/deepseek.yaml) |
-| [DeepSeek-V4](https://huggingface.co/deepseek-ai) | [Reduced model](configs/models/deepseek_v4/cuda.yaml) | [Reduced model](configs/models/deepseek_v4/ascend.yaml) | ✅ | — | [deepseek_v4.yaml](configs/text/deepseek_v4.yaml) · [NPU](configs/text/deepseek_v4_npu.yaml) |
-| [Gemma 3](https://huggingface.co/google) | [Reduced model](configs/models/gemma3/cuda.yaml) | [Reduced model](configs/models/gemma3/ascend.yaml) | — | — | [gemma3.yaml](configs/text/gemma3.yaml) |
-| [GLM-5 (`glm_moe_dsa`)](https://huggingface.co/zai-org) | [Reduced model](configs/models/glm5/cuda.yaml) | [Reduced model](configs/models/glm5/ascend.yaml) | — | — | — |
-| [GPT-OSS](https://huggingface.co/openai/gpt-oss-120b) | [20B BF16 ✅](configs/models/gpt_oss/cuda.yaml) | [20B BF16 ✅](configs/models/gpt_oss/ascend.yaml) | ❌ | ❌ | [gpt_oss_120b_lora_ep4.yaml](configs/text/gpt_oss_120b_lora_ep4.yaml) |
-| [HunyuanVideo 1.5](https://huggingface.co/tencent/HunyuanVideo-1.5) | [✅ 8× H20](configs/models/hunyuanvideo15/cuda.yaml) | [✅ 8× 910B2](configs/models/hunyuanvideo15/ascend.yaml) | — | — | [hunyuanvideo15_t2v.yaml](configs/dit/hunyuanvideo15_t2v.yaml) · [Guide](docs/examples/hunyuanvideo15.md) |
-| [Janus](https://huggingface.co/deepseek-ai/Janus-1.3B) | [✅ 8× H20](configs/models/janus/cuda.yaml) | [✅ 8× 910B2](configs/models/janus/ascend.yaml) | — | — | [base.yaml](configs/seed_omni/Janus/janus/train/base.yaml) · [Guide](docs/seed_omni/models/janus.md) |
-| [Kimi K3](docs/examples/kimi_k3.md) | ✅ | ✅ | — | — | [kimi_k3_vl.yaml](configs/multimodal/kimi_k3/kimi_k3_vl.yaml) · [Ascend](configs/multimodal/kimi_k3/kimi_k3_vl_ascendc.yaml) · [Guide](docs/examples/kimi_k3.md) |
-| [Llama 3 / 3.1 / 3.3](https://huggingface.co/meta-llama) | [3 ✅](configs/models/llama3/cuda.yaml) · [3.1 ✅](configs/models/llama3_1/cuda.yaml) · [3.3 ✅](configs/models/llama3_3/cuda.yaml) | [3 ✅](configs/models/llama3/ascend.yaml) · [3.1 ✅](configs/models/llama3_1/ascend.yaml) · [3.3 ✅](configs/models/llama3_3/ascend.yaml) | ✅ | ✅ | [llama3.yaml](configs/text/llama3.yaml) |
-| [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) | [✅ 8× H20](configs/models/ltx2_3/cuda.yaml) | [✅ 8× 910B2](configs/models/ltx2_3/ascend.yaml) | — | — | [ltx2_av_lora.yaml](configs/dit/ltx2_av_lora.yaml) · [Guide](docs/examples/ltx-2.3.md) |
-| [MiniMax-H3](https://huggingface.co/MiniMaxAI) | [FL2VA ✅](configs/models/minimax_h3_fl2va/cuda.yaml) · [Ref2VA (reduced)](configs/models/minimax_h3_ref2va/cuda.yaml) | [FL2VA ✅](configs/models/minimax_h3_fl2va/ascend.yaml) · [Ref2VA (reduced)](configs/models/minimax_h3_ref2va/ascend.yaml) | — | — | [FL2VA](configs/dit/minimax_h3_fl2va_offline.yaml) · [Ref2VA](configs/dit/minimax_h3_ref2va_cfg_offline.yaml) · [Guide](docs/examples/minimax_h3.md) |
-| [Qwen2 / Qwen2.5](https://huggingface.co/Qwen) | [2 ✅](configs/models/qwen2/cuda.yaml) · [2.5 ✅](configs/models/qwen2_5/cuda.yaml) | [2 ✅](configs/models/qwen2/ascend.yaml) · [2.5 ✅](configs/models/qwen2_5/ascend.yaml) | ✅ | — | [qwen2_5.yaml](configs/text/qwen2_5.yaml) |
-| [Qwen2-VL / Qwen2.5-VL](https://huggingface.co/Qwen) | [2-VL ✅](configs/models/qwen2_vl/cuda.yaml) · [2.5-VL ✅](configs/models/qwen2_5_vl/cuda.yaml) | [2-VL ✅](configs/models/qwen2_vl/ascend.yaml) · [2.5-VL ✅](configs/models/qwen2_5_vl/ascend.yaml) | ✅ | — | [qwen2_vl.yaml](configs/multimodal/qwen2_vl/qwen2_vl.yaml) · [qwen25_vl.yaml](configs/multimodal/qwen25_vl/qwen25_vl.yaml) |
-| [Qwen2.5-Omni](https://huggingface.co/Qwen) | [✅ 8× H20](configs/models/qwen2_5_omni/cuda.yaml) | [✅ 8× 910B2](configs/models/qwen2_5_omni/ascend.yaml) | ✅ | — | [qwen25_omni.yaml](configs/multimodal/qwen25_omni/qwen25_omni.yaml) |
-| [Qwen3](https://huggingface.co/Qwen) | [✅ 8× H20](configs/models/qwen3/cuda.yaml) | [✅ 8× 910B2](configs/models/qwen3/ascend.yaml) | ✅ | ✅ | [Training guide](docs/examples/qwen3.md) |
-| [Qwen3-MoE](https://huggingface.co/Qwen) | [✅ 8× H20](configs/models/qwen3_moe/cuda.yaml) | [✅ 8× 910B2](configs/models/qwen3_moe/ascend.yaml) | ✅ | ✅ | [qwen3-moe.yaml](configs/text/qwen3-moe.yaml) · [Guide](docs/examples/qwen3_moe.md) |
-| [Qwen3-VL](https://huggingface.co/Qwen) | [✅ 8× H20](configs/models/qwen3_vl/cuda.yaml) | [✅ 8× 910B2](configs/models/qwen3_vl/ascend.yaml) | ✅ | ✅ | [Training guide](docs/examples/qwen3_vl.md) |
-| [Qwen3-VL-MoE](https://huggingface.co/Qwen) | [✅ 8× H20](configs/models/qwen3_vl_moe/cuda.yaml) | [✅ 8× 910B2](configs/models/qwen3_vl_moe/ascend.yaml) | ✅ | ✅ | [qwen3_vl_moe.yaml](configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml) |
-| [Qwen3-Omni-MoE](https://huggingface.co/Qwen) | [✅ 8× H20](configs/models/qwen3_omni_moe/cuda.yaml) | [✅ 8× 910B2](configs/models/qwen3_omni_moe/ascend.yaml) | ✅ | — | [qwen3_omni.yaml](configs/multimodal/qwen3_omni/qwen3_omni.yaml) · [Guide](docs/examples/qwen3_omni_moe.md) |
-| [Qwen3.5](https://huggingface.co/Qwen) | [✅ 8× H20](configs/models/qwen3_5/cuda.yaml) | [Check failed](docs/examples/eight_device_validation.md) | ✅ | ✅ | [qwen3_5_vl.yaml](configs/multimodal/qwen3_5/qwen3_5_vl.yaml) · [Guide](docs/examples/qwen3_5.md) |
-| [Qwen3.5-MoE](https://huggingface.co/Qwen) | [✅ 8× H20](configs/models/qwen3_5_moe/cuda.yaml) | [Check failed](docs/examples/eight_device_validation.md) | ✅ | ✅ | [qwen3_5_moe_vl.yaml](configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl.yaml) · [Guide](docs/examples/qwen3_5.md) |
-| [Qwen3.8-Flash-Next (`qwen4_exp`)](https://huggingface.co/Qwen) | [Reduced model](configs/models/qwen3_8_flash_next/cuda.yaml) | [Check failed](docs/examples/eight_device_validation.md) | — | — | [qwen4exp.yaml](configs/text/qwen4exp.yaml) · [Guide](docs/examples/qwen4_exp_frozen_ple.md) |
-| [Qwen-Image / Qwen-Image-Edit](https://huggingface.co/Qwen) | [Image ✅](configs/models/qwen_image/cuda.yaml) · [Edit ✅](configs/models/qwen_image_edit/cuda.yaml) | [Image ✅](configs/models/qwen_image/ascend.yaml) · [Edit ✅](configs/models/qwen_image_edit/ascend.yaml) | ✅ | ✅ | [qwen_image_sft.yaml](configs/dit/qwen_image_sft.yaml) · [Edit](configs/dit/qwen_image_edit_2511.yaml) · [Guide](docs/examples/qwen_image_edit.md) |
-| [Seed-OSS](https://huggingface.co/ByteDance-Seed) | [✅ 8× H20](configs/models/seed_oss/cuda.yaml) | [✅ 8× 910B2](configs/models/seed_oss/ascend.yaml) | — | — | [seed_oss.yaml](configs/text/seed_oss.yaml) · [Guide](docs/examples/seed_oss.md) |
-| [Wan2.1 / Wan2.2](https://huggingface.co/Wan-AI) | [2.1 ✅](configs/models/wan2_1/cuda.yaml) · [2.2 ✅](configs/models/wan2_2/cuda.yaml) | [2.1 ✅](configs/models/wan2_1/ascend.yaml) · [2.2 ✅](configs/models/wan2_2/ascend.yaml) | ✅ | ✅ | [wan_sft.yaml](configs/dit/wan_sft.yaml) · [Wan2.2](configs/dit/wan2.2_I2V_14B.yaml) · [Guide](docs/examples/wan2.1.md) |
+| [BAGEL](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | ✅ | — | — | — | [YAML](configs/models/bagel/cuda.yaml) |
+| [Cosmos3-Nano](https://huggingface.co/nvidia/Cosmos3-Nano) | ✅ | ✅ | — | — | [YAML](configs/models/cosmos3/cuda.yaml) |
+| [DeepSeek-V2.5 / V3 / R1](https://huggingface.co/deepseek-ai) | ◐ | ◐ | ✅ | — | [YAML](configs/models/deepseek_v3/cuda.yaml) |
+| [DeepSeek-V4](https://huggingface.co/deepseek-ai) | ◐ | ◐ | ✅ | — | [YAML](configs/models/deepseek_v4/cuda.yaml) |
+| [Gemma 3](https://huggingface.co/google) | ◐ | ◐ | — | — | [YAML](configs/models/gemma3/cuda.yaml) |
+| [GLM-5](https://huggingface.co/zai-org) | ◐ | ◐ | — | — | [YAML](configs/models/glm5/cuda.yaml) |
+| [GPT-OSS](https://huggingface.co/openai/gpt-oss-120b) | ✅ | ✅ | ❌ | ❌ | [YAML](configs/models/gpt_oss/cuda.yaml) |
+| [HunyuanVideo 1.5](https://huggingface.co/tencent/HunyuanVideo-1.5) | ✅ | ✅ | — | — | [YAML](configs/models/hunyuanvideo15/cuda.yaml) |
+| [Janus](https://huggingface.co/deepseek-ai/Janus-1.3B) | ✅ | ✅ | — | — | [YAML](configs/models/janus/cuda.yaml) |
+| [Kimi K3](docs/examples/kimi_k3.md) | ✅ | ✅ | — | — | [YAML](configs/multimodal/kimi_k3/kimi_k3_vl.yaml) |
+| [Llama 3 / 3.1 / 3.3](https://huggingface.co/meta-llama) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/llama3/cuda.yaml) |
+| [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) | ✅ | ✅ | — | — | [YAML](configs/models/ltx2_3/cuda.yaml) |
+| [MiniMax-H3](https://huggingface.co/MiniMaxAI) | ✅ | ✅ | — | — | [YAML](configs/models/minimax_h3_fl2va/cuda.yaml) |
+| [Qwen2 / Qwen2.5](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [YAML](configs/models/qwen2_5/cuda.yaml) |
+| [Qwen2-VL / Qwen2.5-VL](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [YAML](configs/models/qwen2_5_vl/cuda.yaml) |
+| [Qwen2.5-Omni](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [YAML](configs/models/qwen2_5_omni/cuda.yaml) |
+| [Qwen3](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/qwen3/cuda.yaml) |
+| [Qwen3-MoE](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/qwen3_moe/cuda.yaml) |
+| [Qwen3-VL](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/qwen3_vl/cuda.yaml) |
+| [Qwen3-VL-MoE](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/qwen3_vl_moe/cuda.yaml) |
+| [Qwen3-Omni-MoE](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [YAML](configs/models/qwen3_omni_moe/cuda.yaml) |
+| [Qwen3.5](https://huggingface.co/Qwen) | ✅ | — | ✅ | ✅ | [YAML](configs/models/qwen3_5/cuda.yaml) |
+| [Qwen3.5-MoE](https://huggingface.co/Qwen) | ✅ | — | ✅ | ✅ | [YAML](configs/models/qwen3_5_moe/cuda.yaml) |
+| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen) | ◐ | — | — | — | [YAML](configs/models/qwen3_8_flash_next/cuda.yaml) |
+| [Qwen-Image / Qwen-Image-Edit](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/qwen_image/cuda.yaml) |
+| [Seed-OSS](https://huggingface.co/ByteDance-Seed) | ✅ | ✅ | — | — | [YAML](configs/models/seed_oss/cuda.yaml) |
+| [Wan2.1 / Wan2.2](https://huggingface.co/Wan-AI) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/wan2_1/cuda.yaml) |
 
 For inference-only models, see [MiniMax-H3-Image](docs/examples/minimax_h3_image.md).
 

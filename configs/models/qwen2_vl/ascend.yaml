@@ -1,5 +1,6 @@
-# Qwen2-VL-7B-Instruct on 8 × 910B2.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py configs/models/qwen2_vl/ascend.yaml
+# hf download Qwen/Qwen2-VL-7B-Instruct --local-dir ./Qwen2-VL-7B-Instruct
+# bash train.sh tasks/train_vlm.py configs/models/qwen2_vl/ascend.yaml
+
 model:
   model_path: ./Qwen2-VL-7B-Instruct
   optimizer:
@@ -22,8 +23,6 @@ data:
     use_audio_in_video: false
   datasets_type: mapping
   data_type: conversation
-  dataloader:
-    num_workers: 0
   source_name: sharegpt4v_sft
 train:
   wandb:
@@ -32,13 +31,8 @@ train:
   num_train_epochs: 1
   micro_batch_size: 1
   global_batch_size: 8
-  max_steps: 3
   checkpoint:
     output_dir: outputs/qwen2_vl/ascend
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
-  profile:
-    enable: false
   dyn_bsz: false

@@ -1,5 +1,9 @@
-# LTX-2.3 on 8 × H20.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_dit.py configs/models/ltx2_3/cuda.yaml
+# hf download Lightricks/LTX-2.3 ltx-2.3-22b-dev.safetensors --local-dir ./LTX-2.3
+# ln -s ltx-2.3-22b-dev.safetensors ./LTX-2.3/model.safetensors
+# cp configs/model_configs/ltx2_3/ltx2_3_av.json ./LTX-2.3/config.json
+# Preparation: docs/examples/ltx-2.3.md
+# bash train.sh tasks/train_dit.py configs/models/ltx2_3/cuda.yaml
+
 model:
   model_path: ./LTX-2.3
   condition_model_path: ./LTX-2.3
@@ -52,8 +56,6 @@ data:
   datasets_type: mapping
   text_keys: text
   max_seq_len: 8192
-  dataloader:
-    num_workers: 0
   data_transform: dit_offline
 train:
   training_task: offline_training
@@ -62,14 +64,9 @@ train:
   dyn_bsz: false
   seed: 42
   num_train_epochs: 1
-  max_steps: 3
   checkpoint:
     output_dir: outputs/ltx2_3/cuda
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
   wandb:
-    enable: false
-  profile:
     enable: false

@@ -1,5 +1,7 @@
-# Qwen3-Omni-30B-A3B-Instruct on 8 × H20.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py configs/models/qwen3_omni_moe/cuda.yaml
+# hf download Qwen/Qwen3-Omni-30B-A3B-Instruct --local-dir ./Qwen3-Omni-30B-A3B-Instruct
+# Preparation: docs/examples/qwen3_omni_moe.md
+# bash train.sh tasks/train_vlm.py configs/models/qwen3_omni_moe/cuda.yaml
+
 model:
   model_path: ./Qwen3-Omni-30B-A3B-Instruct
   ops_implementation:
@@ -30,8 +32,6 @@ data:
   data_type: conversation
   max_seq_len: 1024
   source_name: sharegpt4v_sft
-  dataloader:
-    num_workers: 0
   mm_configs:
     scale_factor: 28
     image_min_pixels: 3136
@@ -50,15 +50,10 @@ train:
   num_train_epochs: 1
   micro_batch_size: 1
   global_batch_size: 8
-  max_steps: 3
   checkpoint:
     output_dir: outputs/qwen3_omni_moe/cuda
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
   wandb:
-    enable: false
-  profile:
     enable: false
   dyn_bsz: false

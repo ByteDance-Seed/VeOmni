@@ -1,5 +1,6 @@
-# Qwen2.5-0.5B-Instruct on 8 × 910B2.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/qwen2_5/ascend.yaml
+# hf download Qwen/Qwen2.5-0.5B-Instruct --local-dir ./Qwen2.5-0.5B-Instruct
+# bash train.sh tasks/train_text.py configs/models/qwen2_5/ascend.yaml
+
 model:
   model_path: ./Qwen2.5-0.5B-Instruct
   ops_implementation:
@@ -25,8 +26,6 @@ model:
       enable_activation: false
 data:
   train_path: ./data/text.parquet
-  dataloader:
-    num_workers: 0
   datasets_type: mapping
   data_type: plaintext
   max_seq_len: 1024
@@ -41,13 +40,8 @@ train:
   checkpoint:
     output_dir: outputs/qwen2_5/ascend
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
   wandb:
     enable: false
-  max_steps: 3
   num_train_epochs: 1
-  profile:
-    enable: false
   dyn_bsz: false

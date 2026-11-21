@@ -1,9 +1,11 @@
-# Reduced-model check for MiniMax-H3 Ref2VA on 8 × 910B2.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_dit.py configs/models/minimax_h3_ref2va/ascend.yaml
+# modelscope download --model MiniMax/MiniMax-H3 --local_dir ./MiniMax-H3
+# Preparation: docs/examples/minimax_h3.md
+# bash train.sh tasks/train_dit.py configs/models/minimax_h3_ref2va/ascend.yaml
+
 model:
-  model_path: ./minimax_h3_ref2va-small
-  config_path: ./minimax_h3_ref2va-small/config.json
-  condition_model_path: ./MiniMax-H3/FL2VA
+  model_path: ./MiniMax-H3/Ref2VA/transformer
+  config_path: ./MiniMax-H3/Ref2VA/transformer/config.json
+  condition_model_path: ./MiniMax-H3/Ref2VA
   condition_model_cfg:
     skip_encoder_load: true
     sigma_shift_video: 12.0
@@ -11,7 +13,7 @@ model:
     training_cfg_scale: 4.0
     training_cfg_schedule: constant
     training_cfg_curvature_power: 2.0
-    base_model_path: ./MiniMax-H3/FL2VA
+    base_model_path: ./MiniMax-H3/Ref2VA
   lora_config:
     rank: 4
     alpha: 8
@@ -55,8 +57,6 @@ data:
   dataset_repeat: true
   log_sample: false
   text_keys: text
-  dataloader:
-    num_workers: 0
 train:
   training_task: offline_training
   global_batch_size: 8
@@ -64,14 +64,9 @@ train:
   dyn_bsz: false
   seed: 42
   num_train_epochs: 1
-  max_steps: 3
   checkpoint:
     output_dir: outputs/minimax_h3_ref2va/ascend
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
   wandb:
-    enable: false
-  profile:
     enable: false
