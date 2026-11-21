@@ -1,0 +1,53 @@
+# Qwen2-0.5B-Instruct on 8 × H20.
+# bash train.sh tasks/train_text.py configs/models/qwen2/cuda.yaml
+model:
+  model_path: ./Qwen2-0.5B-Instruct
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  optimizer:
+    type: adamw
+    lr: 0.0003
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+data:
+  train_path: ./data/text.parquet
+  dataloader:
+    num_workers: 0
+  datasets_type: mapping
+  data_type: plaintext
+  max_seq_len: 1024
+  text_keys: text
+  dyn_bsz_buffer_size: 200
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  checkpoint:
+    output_dir: outputs/qwen2/cuda
+    manager: dcp
+    save_steps: 3
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+  max_steps: 3
+  num_train_epochs: 1
+  profile:
+    enable: false
+  dyn_bsz: false
