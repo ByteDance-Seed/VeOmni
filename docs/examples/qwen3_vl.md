@@ -40,7 +40,7 @@ bash train.sh tasks/train_vlm.py configs/models/qwen3_vl/cuda.yaml
 bash train.sh tasks/train_vlm.py configs/models/qwen3_vl/ascend.yaml
 ```
 
-The Qwen3-VL-2B-Instruct example completed three FSDP2 optimizer steps on two H20 GPUs and on two Ascend 910B2 NPUs with the same ShareGPT4V image conversations and a global batch size of 8. To run this short check, append `--train.max_steps 3 --train.checkpoint.save_steps 3 --data.dataloader.num_workers 0` to the command. The step-3 checkpoint includes model and optimizer shards.
+The Qwen3-VL-2B-Instruct example completed three FSDP2 optimizer steps on a single node with eight H20 GPUs and on a single node with eight Ascend 910B2 NPUs with the same ShareGPT4V image conversations and a global batch size of 8. To run this short check, append `--train.max_steps 3 --train.checkpoint.save_steps 3 --data.dataloader.num_workers 0` to the command. The step-3 checkpoint includes model and optimizer shards.
 
 ## Download Qwen3 VL model
 
