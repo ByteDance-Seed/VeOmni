@@ -90,7 +90,8 @@ def test_deepseek_v3_experts_routing_weight_dtype_follows_impl(impl: str):
     assert args[1].dtype == torch.float32
     torch.testing.assert_close(args[1], top_k_weights, rtol=0, atol=0)
     assert args[2] is selected_experts
-    assert captured["kwargs"] == {"num_experts": experts.num_experts}
+    expected_kwargs = {"num_experts": experts.num_experts, "activation": config.hidden_act}
+    assert captured["kwargs"] == expected_kwargs
     torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
 
 
