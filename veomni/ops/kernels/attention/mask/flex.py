@@ -25,6 +25,7 @@ from transformers.masking_utils import (
     bidirectional_mask_function,
     causal_mask_function,
     fast_all,
+    or_masks,
     padding_mask_function,
     prepare_padding_mask,
 )
@@ -136,6 +137,8 @@ def flex_attention_mask_builder(
             return same_document & (causal | same_full_span)
     """
     sliding_window = kwargs.pop("sliding_window", None)
+    or_mask_function = kwargs.pop("or_mask_function", None)
+    and_mask_function = kwargs.pop("and_mask_function", None)
     if cu_seqlens_k is None:
         cu_seqlens_k = kwargs.pop("cu_seq_lens_k", None)
     device = kwargs.get("device", attention_mask.device if attention_mask is not None else "cpu")
@@ -145,7 +148,11 @@ def flex_attention_mask_builder(
         if (
             attention_mask is None
             and cu_seqlens is None
-            and mask_function not in (causal_mask_function, bidirectional_mask_function)
+            and (
+                mask_function not in (causal_mask_function, bidirectional_mask_function)
+                or or_mask_function is not None
+                or and_mask_function is not None
+            )
         ):
             raise ValueError(
                 "FlexAttention with Ulysses requires full-sequence metadata for a custom mask function; "
@@ -175,12 +182,24 @@ def flex_attention_mask_builder(
         window = torch.tensor([sliding_window], device=device, dtype=torch.int64).expand(
             max(q_length + max(q_offset, 0), kv_length + max(kv_offset, 0))
         )
+        if mask_function is bidirectional_mask_function:
 
-        def window_mask(batch_idx, head_idx, q_idx, kv_idx):
-            """Keep the window bound in indexed device metadata, not a Python capture."""
-            return kv_idx > q_idx - window[q_idx]
+            def window_mask(batch_idx, head_idx, q_idx, kv_idx):
+                """Keep the symmetric window bound in indexed device metadata, not a Python capture."""
+                bound = window[q_idx]
+                return (kv_idx >= q_idx - bound) & (kv_idx <= q_idx + bound)
+
+        else:
+
+            def window_mask(batch_idx, head_idx, q_idx, kv_idx):
+                """Keep the window bound in indexed device metadata, not a Python capture."""
+                return kv_idx > q_idx - window[q_idx]
 
         mask_function = and_masks(mask_function, window_mask)
+    if or_mask_function is not None:
+        mask_function = or_masks(mask_function, or_mask_function)
+    if and_mask_function is not None:
+        mask_function = and_masks(mask_function, and_mask_function)
     if cu_seqlens is not None:
         mask_function = packed_mask_function(
             mask_function=mask_function,

@@ -42,6 +42,10 @@ _EAGER_ROWS = (
     ("async_ulysses_o", "standard"),
     ("async_ulysses_o", "dit"),
 )
+_BAGEL_EAGER_ROWS = (
+    ("async_ulysses_qkv", "bagel"),
+    ("async_ulysses_o", "bagel"),
+)
 
 
 def test_linear_backward_matches_autograd_under_cpu_bf16_autocast():
@@ -134,7 +138,7 @@ def _mock_identity_comm(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_unpad(tensor: Tensor, dim, size, **kwargs):
         return tensor
 
-    for op, variant in _EAGER_ROWS:
+    for op, variant in (*_EAGER_ROWS, *_BAGEL_EAGER_ROWS):
         module = _eager_module(op, variant)
         monkeypatch.setattr(module, "all_to_all_tensor", fake_all_to_all)
         monkeypatch.setattr(module, "padding_tensor_for_seqeunce_parallel", fake_pad)
@@ -722,3 +726,193 @@ def test_dit_parity_world_size_matches_skip_gate():
     assert DIT_SP_WORLD_SIZE == 4
     assert AsyncUlyssesDiTSequenceParallelTest.world_size.fget(object()) == DIT_SP_WORLD_SIZE
     assert callable(AsyncUlyssesDiTSequenceParallelTest._configure_repro)
+
+
+@pytest.mark.parametrize("empty_route", [None, 0, 1])
+def test_bagel_qkv_and_o_match_sequential_and_use_nested_handles(
+    monkeypatch: pytest.MonkeyPatch,
+    empty_route: int | None,
+) -> None:
+    """Verify two-route BAGEL async Ulysses QKV and O projections match sequential execution."""
+    _mock_identity_comm(monkeypatch)
+    torch.manual_seed(6201)
+    seq, hidden, num_q_heads, num_kv_heads, head_dim = 6, 16, 4, 2, 4
+    query_size = num_q_heads * head_dim
+    kv_size = num_kv_heads * head_dim
+    eps = 1e-6
+
+    if empty_route == 0:
+        route_0_indices = torch.empty(0, dtype=torch.long)
+        route_1_indices = torch.arange(seq, dtype=torch.long)
+    elif empty_route == 1:
+        route_0_indices = torch.arange(seq, dtype=torch.long)
+        route_1_indices = torch.empty(0, dtype=torch.long)
+    else:
+        route_0_indices = torch.tensor([0, 2, 4], dtype=torch.long)
+        route_1_indices = torch.tensor([1, 3, 5], dtype=torch.long)
+
+    angles = torch.randn(seq, head_dim // 2, dtype=torch.float64)
+    cos = torch.cat((angles.cos(), angles.cos()), dim=-1)
+    sin = torch.cat((angles.sin(), angles.sin()), dim=-1)
+
+    hidden_states = torch.randn(seq, hidden, dtype=torch.float64, requires_grad=True)
+    weights_0 = _qkv_weights(hidden, query_size, kv_size, dtype=torch.float64)
+    weights_1 = _qkv_weights(hidden, query_size, kv_size, dtype=torch.float64)
+    norm_q_0 = torch.randn(head_dim, dtype=torch.float64, requires_grad=True)
+    norm_k_0 = torch.randn(head_dim, dtype=torch.float64, requires_grad=True)
+    norm_q_1 = torch.randn(head_dim, dtype=torch.float64, requires_grad=True)
+    norm_k_1 = torch.randn(head_dim, dtype=torch.float64, requires_grad=True)
+    o_weight_0 = torch.randn(hidden, query_size, dtype=torch.float64, requires_grad=True)
+    o_bias_0 = torch.randn(hidden, dtype=torch.float64, requires_grad=True)
+    o_weight_1 = torch.randn(hidden, query_size, dtype=torch.float64, requires_grad=True)
+    o_bias_1 = torch.randn(hidden, dtype=torch.float64, requires_grad=True)
+
+    diff_tensors = (
+        hidden_states,
+        *weights_0,
+        norm_q_0,
+        norm_k_0,
+        *weights_1,
+        norm_q_1,
+        norm_k_1,
+        o_weight_0,
+        o_bias_0,
+        o_weight_1,
+        o_bias_1,
+    )
+    actual_leaves = _leaf(*diff_tensors)
+    expected_leaves = _leaf(*diff_tensors)
+
+    (
+        h_a,
+        qw0_a,
+        qb0_a,
+        kw0_a,
+        kb0_a,
+        vw0_a,
+        vb0_a,
+        nq0_a,
+        nk0_a,
+        qw1_a,
+        qb1_a,
+        kw1_a,
+        kb1_a,
+        vw1_a,
+        vb1_a,
+        nq1_a,
+        nk1_a,
+        ow0_a,
+        ob0_a,
+        ow1_a,
+        ob1_a,
+    ) = actual_leaves
+    q_a, k_a, v_a = VeomniOp("async_ulysses_qkv", "bagel")(
+        h_a,
+        route_0_indices,
+        route_1_indices,
+        cos,
+        sin,
+        qw0_a,
+        qb0_a,
+        kw0_a,
+        kb0_a,
+        vw0_a,
+        vb0_a,
+        nq0_a,
+        nk0_a,
+        qw1_a,
+        qb1_a,
+        kw1_a,
+        kb1_a,
+        vw1_a,
+        vb1_a,
+        nq1_a,
+        nk1_a,
+        head_dim=head_dim,
+        rms_norm_eps=eps,
+        unpadded_dim_size=seq,
+        group=object(),
+        rms_norm=VeomniOp("rms_norm", "standard", "eager"),
+        rope=VeomniOp("rope", "full", "eager"),
+    )
+    attn_a = (
+        q_a
+        + k_a.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+        + v_a.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+    )
+    out_a = VeomniOp("async_ulysses_o", "bagel")(
+        attn_a,
+        route_0_indices,
+        route_1_indices,
+        ow0_a,
+        ob0_a,
+        ow1_a,
+        ob1_a,
+        group=object(),
+    )
+
+    (
+        h_e,
+        qw0_e,
+        qb0_e,
+        kw0_e,
+        kb0_e,
+        vw0_e,
+        vb0_e,
+        nq0_e,
+        nk0_e,
+        qw1_e,
+        qb1_e,
+        kw1_e,
+        kb1_e,
+        vw1_e,
+        vb1_e,
+        nq1_e,
+        nk1_e,
+        ow0_e,
+        ob0_e,
+        ow1_e,
+        ob1_e,
+    ) = expected_leaves
+    rms = VeomniOp("rms_norm", "standard", "eager")
+    rope = VeomniOp("rope", "full", "eager")
+
+    def routed_qkv(w0, b0, w1, b1, heads, n0=None, n1=None):
+        p0 = F.linear(h_e.index_select(0, route_0_indices), w0, b0).reshape(-1, heads, head_dim)
+        p1 = F.linear(h_e.index_select(0, route_1_indices), w1, b1).reshape(-1, heads, head_dim)
+        if n0 is not None and n1 is not None:
+            p0 = rms(p0, n0, eps=eps)
+            p1 = rms(p1, n1, eps=eps)
+        combined = p0.new_zeros((seq, heads, head_dim))
+        combined = combined.index_copy(0, route_0_indices, p0)
+        combined = combined.index_copy(0, route_1_indices, p1)
+        return combined
+
+    q_e = routed_qkv(qw0_e, qb0_e, qw1_e, qb1_e, num_q_heads, nq0_e, nq1_e)
+    k_e = routed_qkv(kw0_e, kb0_e, kw1_e, kb1_e, num_kv_heads, nk0_e, nk1_e)
+    v_e = routed_qkv(vw0_e, vb0_e, vw1_e, vb1_e, num_kv_heads)
+    q_e, k_e = rope(
+        q_e.transpose(0, 1).unsqueeze(0),
+        k_e.transpose(0, 1).unsqueeze(0),
+        cos.unsqueeze(0),
+        sin.unsqueeze(0),
+        unsqueeze_dim=1,
+    )
+    q_e = q_e.squeeze(0).transpose(0, 1).contiguous()
+    k_e = k_e.squeeze(0).transpose(0, 1).contiguous()
+    attn_e = (
+        q_e
+        + k_e.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+        + v_e.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+    )
+    flat_e = attn_e.reshape(seq, query_size)
+    out_e = flat_e.new_zeros((seq, hidden))
+    out_e = out_e.index_copy(0, route_0_indices, F.linear(flat_e.index_select(0, route_0_indices), ow0_e, ob0_e))
+    out_e = out_e.index_copy(0, route_1_indices, F.linear(flat_e.index_select(0, route_1_indices), ow1_e, ob1_e))
+
+    torch.testing.assert_close(out_a, out_e)
+    grad_out = torch.randn_like(out_a)
+    out_a.backward(grad_out)
+    out_e.backward(grad_out)
+    for actual, expected in zip(actual_leaves, expected_leaves, strict=True):
+        torch.testing.assert_close(actual.grad, expected.grad)

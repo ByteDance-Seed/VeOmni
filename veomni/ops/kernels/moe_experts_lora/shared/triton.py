@@ -21,7 +21,7 @@ from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
 from ...moe_experts.shared.dispatch import expert_histogram, moe_gather, moe_scatter
-from ...moe_experts.shared.group_gemm import group_gemm_same_mn, group_gemm_same_nk
+from ...moe_experts.shared.group_gemm import group_gemm_same_mn, group_gemm_same_nk, same_nk_tile_schedule
 
 
 class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
@@ -75,6 +75,7 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
         max_t = scatter_output.shape[0]
 
         # Base fc1 (group-gemm): [T, 2I]
+        tile_cumsum, tile_total_M = same_nk_tile_schedule(cumsum_t, scatter_output.shape[0])
         fc1_output = group_gemm_same_nk(
             a=scatter_output,
             b=fc1_1_2_weight,
@@ -82,6 +83,8 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
             max_M=max_t,
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # Two independent shared LoRA deltas on gate / up halves.
@@ -115,6 +118,8 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
             max_M=max_t,
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # LoRA fc2 delta on down (shared across experts).
@@ -130,6 +135,7 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
         ctx.lora_scale_gate = lora_scale_gate
         ctx.lora_scale_up = lora_scale_up
         ctx.lora_scale_down = lora_scale_down
+        ctx.tile_prefix_total = tile_total_M
         ctx.save_for_backward(
             gate_weights,
             fc1_1_2_weight,
@@ -152,6 +158,7 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
             tmp_gate,
             tmp_up,
             tmp_down,
+            tile_cumsum,
         )
 
         return output
@@ -181,7 +188,9 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
             tmp_gate,
             tmp_up,
             tmp_down,
+            tile_cumsum,
         ) = ctx.saved_tensors
+        tile_total_M = ctx.tile_prefix_total
         scale_gate = ctx.lora_scale_gate
         scale_up = ctx.lora_scale_up
         scale_down = ctx.lora_scale_down
@@ -213,6 +222,8 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
             cumsum_M=cumsum_t,
             max_M=max_t,
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )  # [T, I]
         grad_fc1_activation = grad_fc1_activation + grad_fc1_activation_lora
 
@@ -269,6 +280,8 @@ class MergedFc1TritonFusedLoRAMoeExpertFunction(torch.autograd.Function):
             cumsum_M=cumsum_t,
             max_M=max_t,
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         grad_scatter_output = grad_scatter_output + grad_scatter_output_gate + grad_scatter_output_up
 
@@ -366,6 +379,7 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
         max_t = permute_tokens.shape[0]
 
         # Base fc1: [T_local, 2I]
+        tile_cumsum, tile_total_M = same_nk_tile_schedule(cumsum, permute_tokens.shape[0])
         fc1_output = group_gemm_same_nk(
             a=permute_tokens,
             b=fc1_1_2_weight,
@@ -373,6 +387,8 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
             max_M=max_t,
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # Two independent shared LoRA deltas on gate / up halves —
@@ -397,6 +413,8 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
             max_M=max_t,
             transpose_a=False,
             transpose_b=True,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
 
         # Shared LoRA delta on down.
@@ -407,6 +425,7 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
         ctx.lora_scale_gate = lora_scale_gate
         ctx.lora_scale_up = lora_scale_up
         ctx.lora_scale_down = lora_scale_down
+        ctx.tile_prefix_total = tile_total_M
         ctx.save_for_backward(
             permute_tokens,
             cumsum,
@@ -424,6 +443,7 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
             tmp_gate,
             tmp_up,
             tmp_down,
+            tile_cumsum,
         )
 
         return fc2_output
@@ -450,7 +470,9 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
             tmp_gate,
             tmp_up,
             tmp_down,
+            tile_cumsum,
         ) = ctx.saved_tensors
+        tile_total_M = ctx.tile_prefix_total
         scale_gate = ctx.lora_scale_gate
         scale_up = ctx.lora_scale_up
         scale_down = ctx.lora_scale_down
@@ -470,6 +492,8 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
             cumsum_M=cumsum,
             max_M=max_t,
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )  # [T_local, I]
         grad_fc1_act = grad_fc1_act + grad_fc1_act_lora
 
@@ -518,6 +542,8 @@ class EPMergedFc1SharedLoRAGroupGemm(torch.autograd.Function):
             cumsum_M=cumsum,
             max_M=max_t,
             transpose_b=False,
+            tile_cumsum=tile_cumsum,
+            tile_total_M=tile_total_M,
         )
         grad_permute = grad_permute + grad_permute_gate + grad_permute_up
 

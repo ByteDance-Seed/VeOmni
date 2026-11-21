@@ -378,10 +378,7 @@ def _qwen4_exp_config(attention="eager"):
 def _vision_real_image_sp_non_fa_worker(attention, parallel_mode):
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
-    backend = "npu" if get_device_type() == "npu" else "gpu"
-    module = importlib.import_module(
-        f"veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_{backend}"
-    )
+    module = importlib.import_module("veomni.models.transformers.qwen4_exp.modeling_qwen4_exp")
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     try:
@@ -436,9 +433,7 @@ def test_qwen4_exp_vision_flash_adapter_binding():
 
         if "veomni_flash_attention_2" not in OP_REGISTRY.list_available("attention", "standard"):
             pytest.skip("FlashAttention 2 is unavailable on this GPU")
-    module = importlib.import_module(
-        f"veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_{backend}"
-    )
+    module = importlib.import_module("veomni.models.transformers.qwen4_exp.modeling_qwen4_exp")
     config = _qwen4_exp_config("veomni_flash_attention_2").vision_config
     vision = module.Qwen4ExpVisionModel(config)
     assert len(vision.blocks) > 0
@@ -470,9 +465,9 @@ def _install_vision_state(monkeypatch, module, sp_size, sp_rank):
 
 def _check_dummy_vision_inputs(family, backend):
     model_package = "qwen2_5vl" if family == "qwen2_5_vl" else family
-    module = importlib.import_module(
-        f"veomni.models.transformers.{model_package}.generated.patched_modeling_{family}_{backend}"
-    )
+    module = importlib.import_module(f"veomni.models.transformers.{model_package}.modeling_{family}")
+    if hasattr(module, "IS_NPU_AVAILABLE"):
+        module.IS_NPU_AVAILABLE = backend == "npu"
     vision_names = {
         "qwen2_5_vl": "Qwen2_5_VisionTransformerPretrainedModel",
         "qwen3_vl": "Qwen3VLVisionModel",
@@ -550,9 +545,9 @@ def _check_vlm_vision_forward(family, backend, attention):
     from tests.models.tiny_configs import tiny_qwen3_vl_config
     from tests.tools.training_utils import make_eager_ops_config
 
-    module = importlib.import_module(
-        f"veomni.models.transformers.{family}.generated.patched_modeling_{family}_{backend}"
-    )
+    module = importlib.import_module(f"veomni.models.transformers.{family}.modeling_{family}")
+    if hasattr(module, "IS_NPU_AVAILABLE"):
+        module.IS_NPU_AVAILABLE = backend == "npu"
     # Qwen3-VL's non-FA SP path is not the Qwen4 rejection contract. Cover its
     # regular single-rank path and its FA metadata path without inventing one.
     sp_sizes = (1,) if family == "qwen3_vl" and attention != "veomni_flash_attention_2" else (1, 2, 8, 16, 32)
@@ -625,7 +620,7 @@ if __name__ == "__main__":
     elif mode == "forward":
         _check_vlm_vision_forward(*arguments)
     elif mode == "qwen4_weights":
-        from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu import (
+        from veomni.models.transformers.qwen4_exp.modeling_qwen4_exp import (
             Qwen4ExpForConditionalGeneration,
         )
 

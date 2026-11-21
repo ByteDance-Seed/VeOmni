@@ -39,12 +39,8 @@ from veomni.utils.moe_monitor import MoERouterMonitor, attach_moe_router_monitor
 
 
 def _glm_cls(architecture: str):
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.glm_moe_dsa import modeling_glm_moe_dsa as gen
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.glm_moe_dsa.generated import patched_modeling_glm_moe_dsa_npu as gen
-    else:
-        from veomni.models.transformers.glm_moe_dsa.generated import patched_modeling_glm_moe_dsa_gpu as gen
     return getattr(gen, architecture)
 
 
