@@ -22,9 +22,10 @@ of the row rather than of the call site:
 
 * **A wrapped projection.** LoRA replaces ``gate_proj`` with a ``LoraLinear`` that
   keeps the real layer at ``base_layer``, so ``gate_proj.weight`` does not exist.
-* **An ``nn.Linear`` subclass.** torchao's ``Float8Linear`` exposes a ``weight``
-  but computes its float8 GEMM inside its own ``forward``, so reading the weight
-  would silently skip the float8 math.
+* **An ``nn.Linear`` subclass.** A projection listed in FSDP2 ``basic_modules``
+  becomes ``FSDPLinear`` and unshards inside its own ``forward``, or a custom
+  subclass computes extra math there, so reading its ``weight`` directly would
+  bypass it.
 * **An activation the row does not implement.** ``liger_kernel`` calls Liger's
   ``swiglu_forward``, which is SiLU only.
 
@@ -57,10 +58,10 @@ __all__ = [
 ]
 
 
-#: Rows that fake-quantize the weights they are handed. Only these require a real
+#: Rows that quantize the weights they are handed. Only these require a real
 #: ``weight``; every other row is arithmetic that also works on projection modules.
-#: ``torchao`` rounds to either FP4 layout; the format is its ``dtype`` argument and
-#: does not change whether it rounds.
+#: ``torchao`` serves FP8, NVFP4, and MXFP4; the format is its ``dtype`` argument
+#: and does not change whether it quantizes.
 QUANTIZING_IMPLS = frozenset({"qat", "torchao"})
 
 #: Activations each row implements, beyond the module shape check. A row absent
@@ -78,9 +79,9 @@ ROW_ACTIVATIONS: dict[str, frozenset[str] | None] = {
 def plain_projections(mlp: nn.Module) -> bool:
     """Whether all three projections are exact ``nn.Linear`` layers.
 
-    The exact type matters, not ``isinstance``: torchao's ``Float8Linear`` is an
-    ``nn.Linear`` subclass that computes its float8 GEMM inside ``forward``, so
-    reading its ``weight`` would skip the float8 math silently.
+    The exact type matters, not ``isinstance``: an ``nn.Linear`` subclass (such
+    as ``FSDPLinear`` from ``basic_modules``) does extra work inside ``forward``,
+    so reading its ``weight`` directly would bypass it.
     """
     return all(type(getattr(mlp, name)) is nn.Linear for name in ("gate_proj", "up_proj", "down_proj"))
 
@@ -149,11 +150,11 @@ def render(mlp: nn.Module, *, impl: str | None, activation: str) -> Rendered:
     if impl in QUANTIZING_IMPLS:
         if not plain:
             raise ValueError(
-                f"gated_mlp_implementation={impl!r} cannot run on this MLP: it fake-quantizes the "
+                f"gated_mlp_implementation={impl!r} cannot run on this MLP: it quantizes the "
                 "projection weights it is handed, and `gate_proj` / `up_proj` / `down_proj` are "
                 "either wrapped (LoRA keeps the base weights at `base_layer`) or an nn.Linear "
-                "subclass that computes its own GEMM in forward. Set "
-                "gated_mlp_implementation='eager' for adapter or float8 training."
+                "subclass that does extra work in forward. Set "
+                "gated_mlp_implementation='eager' for adapter training."
             )
         raise ValueError(
             f"gated_mlp_implementation={impl!r} cannot run on hidden_act={activation!r}: no "

@@ -26,8 +26,8 @@ If a field is not in this table, it is not an op-selection knob.
 | QSA attention | `qsa_attention_implementation` | `eager`, `tilelang` (Qwen4-Exp, NVIDIA CUDA), `torch_npu` (Qwen4-Exp, Ascend NPU) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` |
 | Cross-entropy loss | `cross_entropy_loss_implementation` | `eager`, `liger_kernel`, `chunk_loss` | `"liger_kernel"` (GPU, MLU), `"chunk_loss"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | RMSNorm | `rms_norm_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
-| Gated MLP | `gated_mlp_implementation` | `eager`, `liger_kernel`, `qat` (SM90+, `dtype=fp8`), `torchao` (`dtype=nvfp4|mxfp4`) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp`. The activation is a **call argument** (`activation=config.hidden_act`), so a `gelu` model quantizes like a `silu` one; `liger_kernel` computes SiLU only on the `standard` variant and is skipped for anything else (the `geglu` variant is not selectable here; Gemma3 binds it in code, and there `liger_kernel` computes GELU-tanh) |
-| Dense projection | `linear_implementation` | `eager`, `qat` (SM90+, `dtype=fp8`), `torchao` (`dtype=nvfp4|mxfp4`, `standard` only) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants). Consumers: DeepSeek-V4 (`standard` + `grouped`, so `torchao` is not selectable there) and Qwen3 attention `q/k/v/o` (`standard`) |
+| Gated MLP | `gated_mlp_implementation` | `eager`, `liger_kernel`, `qat` (SM90+, `dtype=fp8`), `torchao` (`dtype=fp8|nvfp4|mxfp4`) | `"liger_kernel"` (GPU, MLU), `"eager"` (NPU) | Model `__init__` via an instance-local `VeomniOp`. The activation is a **call argument** (`activation=config.hidden_act`), so a `gelu` model quantizes like a `silu` one; `liger_kernel` computes SiLU only on the `standard` variant and is skipped for anything else (the `geglu` variant is not selectable here; Gemma3 binds it in code, and there `liger_kernel` computes GELU-tanh) |
+| Dense projection | `linear_implementation` | `eager`, `qat` (SM90+, `dtype=fp8`), `torchao` (`dtype=fp8|nvfp4|mxfp4`, `standard` only) | `"eager"` | Model `__init__` via an instance-local `VeomniOp` (`standard` and `grouped` variants). Consumers: DeepSeek-V4 (`standard` + `grouped`), Qwen3 (`standard`), and Llama (`standard`) |
 | KV / indexer storage round | `kv_round_implementation` | `none`, `eager`, `triton` (NVIDIA SM89+, ROCm) | `"none"`; there is no host default | Model `__init__` via an instance-local `VeomniOp` on the `deepseek_v4` variant, which fixes the model's two geometries; the `standard` variant is model-agnostic and takes them as call arguments. **DeepSeek-V4 is the only consumer** |
 | Rotary embedding | `rotary_pos_emb_implementation` | `eager`, `liger_kernel`, `torch_npu`, `triton` (per-model; DeepSeek-V3, DeepSeek-V4, Wan) | `"liger_kernel"` (GPU, MLU), `"torch_npu"` (NPU) | Model `__init__` via an instance-local `VeomniOp` |
 | Vision-layout full rotary embedding | `rotary_pos_emb_vision_implementation` | `eager`, `torch_npu` | `"eager"` | Same `rope/full` op with an independent model-side implementation choice |
@@ -84,14 +84,11 @@ the activation block *and* the weight tile, because the deployment recipe ties t
 activation's). A recipe that used different widths for the two operands would need
 the row to take them separately; none does today.
 
-Note that `NumericMode` covers the op registry only.
-[float8 training](../usage/float8_training.md) is a module conversion
-(`Float8Linear`) driven from `fsdp_config`, outside the registry entirely: it is
-native in spirit, and it is why `torchao`'s native mode is not reachable through
-this row yet — that path replaces the module before FSDP wraps, while a row wraps one
-call. A quantizing row and a float8 target cannot share a projection, which the
-row-level guards already enforce because a converted projection is an `nn.Linear`
-subclass the rows refuse.
+[Float8 training](../usage/float8_training.md) lives on the same `torchao` row
+(`dtype: fp8`, with `recipe: tensorwise|rowwise|rowwise_with_gw_hp` and
+`emulated: false` by default). It calls torchao's functional
+`matmul_with_hp_or_float8_args` directly from plain `nn.Linear` weights without
+swapping modules or adding float8 hooks to `mixed_precision` or trainers.
 
 These arguments are **not** `model.ops_implementation` fields. They are parameters
 of the registered row, resolved at the call site, so changing one is a modeling
@@ -138,7 +135,8 @@ while the config still said QAT. Two of them refuse instead of falling through:
 - **A projection that is not an exact `nn.Linear`** is refused by
   `gated_mlp._module.render`: a projection wrapped after construction (LoRA keeps
   the base weights at `base_layer`, so there is no `weight`), or an `nn.Linear`
-  subclass such as torchao's `Float8Linear`, whose own forward computes the GEMM.
+  subclass such as `FSDPLinear` from FSDP2 `basic_modules`, whose own forward
+  unshards or computes extra math.
 - **Expert LoRA on a quantizing experts row** is refused by `_moe_lora_op`,
   because no adapter forward would quantize the base weights.
 
@@ -186,7 +184,7 @@ quantizing row, so the "refuses instead of falling back" rules do not apply to i
 | Row (`standard`) | Activations | When it cannot serve the call |
 | --- | --- | --- |
 | `eager` | the four names, plus anything else resolved through `ACT2FN` | never — it is the reference |
-| `qat`, `torchao_nvfp4` | the four names | raises, because a fallback would train at full precision |
+| `qat`, `torchao` | the four names | raises, because a fallback would train at full precision |
 | `liger_kernel` | SiLU only (Liger's `swiglu_forward`) | runs the projection modules instead |
 
 The refusal is a **forward-time** decision, inside `render` — not a config-layer or
@@ -305,42 +303,31 @@ multiply rows or lie about the rest. Each row declares its formats at registrati
 quantization off for a site means naming a reference row such as `eager` or
 `liger_kernel` in that rule.
 
-**But the name does not say whether the rounding is emulated or native**, and the
-two behave differently everywhere a guard has to make a decision. So each row
-declares the `NumericMode`s its wrapper implements, and — where it offers both — the
-`emulated` row argument picks which one a call runs in:
-
-| Value | What the call does | Rows |
-| --- | --- | --- |
-| `EXACT` | Computes on the operands unchanged | `eager`, `fused_triton`, `liger_kernel`, …. The default |
-| `EMULATED` | Rounds operands to the target format, then runs the GEMM in the model dtype. Training only: straight-through gradients, high-precision parameters | `qat`, and `torchao` when `emulated` is true (its default) |
-| `NATIVE` | Casts operands to the target format and runs the GEMM in it | `deepgemm`, and `torchao` with `emulated: false` |
-
-This is a property of the **call**, not only the row, because one kernel can do both.
-torchao's own `Float8LinearConfig.emulate` works the same way, and it is why the mode
-cannot be a constant on the row: a registry that fixes it per row name forces a second
-name for the same kernel.
+**Emulated vs. native is also a call argument (`emulated`)**, because the same
+`torchao` row serves both native dynamic FP8 GEMMs (`dtype: fp8`, defaulting to
+`emulated: false`) and fake-quantized FP4/FP8 training (`emulated: true`, the
+default for `nvfp4` and `mxfp4`).
 
 ```yaml
 linear_implementation:
   name: torchao
-  kwargs: {dtype: nvfp4, emulated: true}    # round, then multiply in the model dtype
+  kwargs: {dtype: fp8, recipe: rowwise}       # native aten::_scaled_mm on SM89+
 ```
 
-The guards follow the call, which is the part that matters. An emulated row reads the
-weight to round it, so a wrapped projection has none to give and an adapter cannot sit
-in front of it; a native row that owns its own arithmetic does not need to.
-`VeomniOp.mode` answers for the arguments a config resolved to, and that is what
-`_moe_lora_op`, `reject_quantizing_act_fn`, `reject_quantizing_row` and
-`resolve_projection` ask.
+```yaml
+linear_implementation:
+  name: torchao
+  kwargs: {dtype: nvfp4, emulated: true}      # round, then multiply in the model dtype
+```
 
-`OP_REGISTRY.rounding_impls(op)` is the one derived set that remains: every row that
-rounds in *any* of its modes, for the callers that only have a name.
+Each quantizing row declares its supported `dtypes` on its `OpEntry`
+(`OP_REGISTRY.row_dtypes(op, impl)`), and `VeomniOp.rounds` derives directly from
+whether that tuple is non-empty. The per-family `QUANTIZING_IMPLS` sets are pinned
+to that registry declaration by unit test.
 
 **`kwargs` is what a row still needs per call.** A row declares its own arguments
-(`block_size` for the GEMM rows, `expert_dtype` and `swiglu_limit` where they
-apply), and the selection passes them. Precision is not among them: it is what the
-row name says. Four rules:
+(`dtype`, `block_size`, `recipe`, `emulated`, `swiglu_limit` where they apply),
+and the selection passes them. Four rules:
 
 | Rule | Why |
 | --- | --- |

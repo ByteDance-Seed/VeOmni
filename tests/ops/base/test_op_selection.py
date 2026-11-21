@@ -435,8 +435,8 @@ def test_dtypes_declares_which_formats_a_row_rounds_to():
     """
     assert OP_REGISTRY.row_dtypes("moe_experts", "qat") == ("fp8", "fp4")
     assert OP_REGISTRY.row_dtypes("moe_experts", "deepgemm") == ("fp8",)
-    assert OP_REGISTRY.row_dtypes("linear", "torchao") == ("nvfp4", "mxfp4")
-    assert OP_REGISTRY.row_dtypes("gated_mlp", "torchao") == ("nvfp4", "mxfp4")
+    assert OP_REGISTRY.row_dtypes("linear", "torchao") == ("fp8", "nvfp4", "mxfp4")
+    assert OP_REGISTRY.row_dtypes("gated_mlp", "torchao") == ("fp8", "nvfp4", "mxfp4")
     # A reference row rounds nothing, so it declares no format.
     assert OP_REGISTRY.row_dtypes("moe_experts", "fused_triton") == ()
     assert OP_REGISTRY.row_dtypes("linear", "eager") == ()

@@ -25,7 +25,6 @@ can read the projection weights or has to run the projection modules. See
 """
 
 from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, MluKernelRequirement
-from ...qat.torchao_fp4 import SUPPORTED_DTYPES
 from ...registry import register_op
 from .geglu import eager as geglu_eager
 from .geglu import liger_kernel as geglu_liger
@@ -84,10 +83,10 @@ register_op(
     "gated_mlp",
     "standard",
     "torchao",
-    description="TorchAO FP4 fake-quantized gated MLP with optional activation clamping",
+    description="TorchAO low-precision (FP8 / NVFP4 / MXFP4) gated MLP with optional activation clamping",
     wrapper=standard_torchao.wrapper,
     requires=("torchao",),
-    dtypes=SUPPORTED_DTYPES,
+    dtypes=standard_torchao.SUPPORTED_DTYPES,
 )
 
 

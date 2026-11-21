@@ -27,17 +27,13 @@ must be BF16 or FP32; FP16 is rejected at runtime even though
 `mixed_precision.param_dtype` accepts `float16`). No native FP4 training kernels
 and no Blackwell requirement during QAT.
 
-The registry records that difference as `NumericMode`, and this row offers both:
-`emulated` (the default) rounds and multiplies in the model dtype, while
-`emulated: false` asks for the real low-precision GEMM. That mode is a property of the
-*call*, not of the row name, which is why the guard that refuses an adapter in front of
-a rounding row asks the handle rather than a list of names.
-
-**`emulated: false` is not implemented yet.** The native FP4 GEMM needs Blackwell
-SM100+ dispatch, so selecting it raises `NotImplementedError` rather than quietly
-training on emulation while the config says otherwise. FP8 is not a `dtype` here at
-all: torchao's FP8 training is `Float8Linear`, a module swap done before FSDP wrapping
-(see [float8 training](float8_training.md)), which is a different shape from an op row.
+The same `torchao` row also serves dynamic FP8 GEMMs (`dtype: fp8`, defaulting
+to `emulated: false` for native `aten::_scaled_mm` on SM89+ — see
+[float8 training](float8_training.md)). For the FP4 layouts (`nvfp4`, `mxfp4`),
+`emulated` defaults to `true` (fake quantization); **`emulated: false` for FP4
+is not implemented yet** because native FP4 GEMMs need Blackwell SM100+
+dispatch, so selecting it raises `NotImplementedError` rather than quietly
+falling back to emulation.
 
 See [op selection](../design/op_selection.md).
 
@@ -167,15 +163,6 @@ the same rule, and only for the quantizing value: with
 `gated_mlp_implementation='torchao' cannot run on a wrapped projection`.
 `liger_kernel` is **not** affected — it is an arithmetic rewrite that keeps the
 projection-module fallback.
-
-### Not supported: float8 training on the same projection
-
-[Float8 training](float8_training.md) converts its `target_modules` into
-torchao's `Float8Linear`, an `nn.Linear` subclass whose forward runs FP8 GEMMs.
-A quantizing `linear` or `gated_mlp` row only runs on an exact `nn.Linear`, so
-selecting `torchao` for a projection that float8 also targets raises
-`cannot run on nn.Linear subclass 'Float8Linear'` instead of silently skipping
-the FP8 GEMMs. Pick one recipe per projection.
 
 ## Distributed behaviour
 

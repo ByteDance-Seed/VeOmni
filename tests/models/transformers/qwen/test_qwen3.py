@@ -630,9 +630,11 @@ def test_qwen3_attention_binds_the_configured_linear_row():
     model = _qwen3_with_ops(_tiny_config(), linear_implementation="eager", gated_mlp_implementation="eager")
 
     attention = model.model.layers[0].self_attn
-    assert isinstance(attention.veomni_linear, VeomniOp)
-    assert (attention.veomni_linear.op, attention.veomni_linear.variant) == ("linear", "standard")
-    assert attention.veomni_linear.impl == "eager"
+    for attr in ("veomni_q_proj", "veomni_k_proj", "veomni_v_proj", "veomni_o_proj"):
+        handle = getattr(attention, attr)
+        assert isinstance(handle, VeomniOp)
+        assert (handle.op, handle.variant) == ("linear", "standard")
+        assert handle.impl == "eager"
     assert model.model.layers[0].mlp.veomni_gated_mlp.impl == "eager"
 
 

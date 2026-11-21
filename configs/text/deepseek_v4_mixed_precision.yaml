@@ -18,10 +18,11 @@
 #         kwargs: {...}           # optional, merged over the outer kwargs
 #
 # The row name says which kernel runs -- `qat` is TileLang's fake quantization,
-# `torchao` is torchao's, `deepgemm` is the vendor's real FP8 GEMM -- and the
-# *format* is a row argument: `dtype` is `fp8`/`fp4` for `qat`, `nvfp4`/`mxfp4` for
-# `torchao`, `fp8` for `deepgemm`. `block_size` is the other argument where the
-# format leaves a width to choose.
+# `torchao` is torchao's (dynamic FP8 GEMMs and NVFP4/MXFP4 QAT), `deepgemm` is
+# the vendor's real FP8 GEMM -- and the *format* is a row argument: `dtype` is
+# `fp8`/`fp4` for `qat`, `fp8`/`nvfp4`/`mxfp4` for `torchao`, `fp8` for
+# `deepgemm`. `block_size` / `recipe` / `emulated` are the other arguments where
+# the format leaves a choice.
 #
 # `kwargs` are arguments a row still needs per call -- `block_size` for the GEMM
 # rows, `expert_dtype` for the routed experts. Precision is not among them: it is
@@ -37,7 +38,7 @@
 # existing config and checkpoint records.
 #
 # Site strings this model publishes (see `DeepseekV4Attention.__init__` and the
-# compressors/indexer in `deepseek_v4_gpu_patch_gen_config.py`):
+# compressors/indexer in `veomni/models/transformers/deepseek_v4/modeling_deepseek_v4.py`):
 #
 #   layers.<i>.q_a_proj        layers.<i>.q_b_proj       layers.<i>.kv_proj
 #   layers.<i>.o_a_proj        layers.<i>.o_b_proj

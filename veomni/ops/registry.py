@@ -522,10 +522,14 @@ def _filter_kwargs(entry: OpEntry, kwargs: Mapping[str, Any]) -> dict[str, Any]:
     kept = {key: value for key, value in kwargs.items() if key in accepted}
     if "dtype" in kept:
         _check_dtype(entry, kept["dtype"])
-    if "emulated" in kept and type(kept["emulated"]) is not bool:
+    if "emulated" in kept and kept["emulated"] is not None and type(kept["emulated"]) is not bool:
         raise ValueError(
             f"{entry.op}/{entry.variant}/{entry.impl}: emulated must be a bool, got {kept['emulated']!r}."
         )
+    if "recipe" in kept and kept["recipe"] is not None and entry.impl == "torchao":
+        from .qat.torchao_fp8 import validate_float8_recipe
+
+        validate_float8_recipe(kept["recipe"])
     return kept
 
 

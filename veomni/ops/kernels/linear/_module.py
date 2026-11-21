@@ -58,7 +58,7 @@ def resolve_projection(
         x: Input activation, used only on the fallback path.
         allow_linear_subclass: Allow ``nn.Linear`` subclasses whose custom
             ``forward`` matches the row contract (used by the grouped QAT row for
-            ``DeepseekV4GroupedLinear``), except converted ``Float8Linear``.
+            ``DeepseekV4GroupedLinear``).
 
     Returns:
         ``(module.weight, None)`` when the module owns a weight the row may read,
@@ -66,23 +66,24 @@ def resolve_projection(
 
     Raises:
         ValueError: when the module is wrapped or is an ``nn.Linear`` subclass
-            whose own ``forward`` computes extra/quantized math while the row rounds.
-            Reading ``module.weight`` would bypass the module's ``forward`` (e.g.
-            ``Float8Linear`` GEMMs) and calling the fallback would train at full
-            precision under a QAT config.
+            whose own ``forward`` computes extra math or unsharding (e.g.
+            ``FSDPLinear`` from ``basic_modules``) while the row quantizes.
+            Reading ``module.weight`` would bypass the module's ``forward``,
+            and calling the fallback would train at full precision under a
+            low-precision config.
     """
     if type(module) is nn.Linear:
         return module.weight, None
-    if allow_linear_subclass and isinstance(module, nn.Linear) and type(module).__name__ != "Float8Linear":
+    if allow_linear_subclass and isinstance(module, nn.Linear):
         return module.weight, None
     if op_impl in QUANTIZING_IMPLS:
         if isinstance(module, nn.Linear):
             raise ValueError(
                 f"linear_implementation={op_impl!r} cannot run on nn.Linear subclass {type(module).__name__!r}: "
-                "its forward does more than F.linear on its weight (torchao's Float8Linear runs FP8 GEMMs; a "
-                "projection listed in FSDP2 `basic_modules` becomes FSDPLinear and unshards its weight there), "
-                "so reading `module.weight` would bypass it. Set linear_implementation='eager', or drop the "
-                "overlapping float8 target / `basic_modules` entry."
+                "its forward does more than F.linear on its weight (for example, a projection listed in "
+                "FSDP2 `basic_modules` becomes FSDPLinear and unshards its weight there), so reading "
+                "`module.weight` would bypass it. Set linear_implementation='eager', or drop the overlapping "
+                "`basic_modules` entry."
             )
         raise ValueError(
             f"linear_implementation={op_impl!r} cannot run on {type(module).__name__!r}: the row "

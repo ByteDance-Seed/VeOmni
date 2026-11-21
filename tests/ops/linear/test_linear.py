@@ -126,7 +126,7 @@ def test_a_quantizing_row_refuses_a_wrapped_projection(quantizing_impl):
 
 @pytest.mark.parametrize("quantizing_impl", sorted(QUANTIZING_IMPLS))
 def test_a_quantizing_row_refuses_a_linear_subclass_projection(quantizing_impl):
-    """A converted ``nn.Linear`` subclass such as ``Float8Linear`` owns a weight but runs its own GEMM."""
+    """An ``nn.Linear`` subclass (e.g. ``FSDPLinear`` from ``basic_modules``) runs extra work in forward."""
     from torch import nn
 
     from veomni.ops.kernels.linear._module import resolve_projection
@@ -147,14 +147,6 @@ def test_a_quantizing_row_refuses_a_linear_subclass_projection(quantizing_impl):
     weight, shortcut = resolve_projection("eager", sub, x)
     assert weight is None
     assert shortcut is not None
-
-    if is_package_available("torchao"):
-        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-
-        fp8_parent = nn.Sequential(nn.Linear(16, 16, bias=False))
-        convert_to_float8_training(fp8_parent, config=Float8LinearConfig())
-        with pytest.raises(ValueError, match="nn.Linear subclass"):
-            resolve_projection(quantizing_impl, fp8_parent[0], torch.randn(2, 16))
 
 
 class _GroupedProjection(torch.nn.Linear):
@@ -302,3 +294,35 @@ def test_linear_torchao_nvfp4_handles_empty_input():
     assert out.shape == (0, 8)
     out.sum().backward()
     torch.testing.assert_close(linear.weight.grad, torch.zeros_like(linear.weight))
+
+
+def test_linear_torchao_fp8_validates_arguments_and_dispatches(monkeypatch):
+    """``torchao`` with ``dtype='fp8'`` validates recipe/block_size and forwards to ``torchao_fp8_linear``."""
+    from veomni.ops.kernels.linear.standard import torchao as linear_torchao
+
+    linear = torch.nn.Linear(32, 16)
+    x = torch.randn(2, 32)
+
+    with pytest.raises(ValueError, match="does not accept block_size"):
+        linear_torchao.wrapper(linear, x, dtype="fp8", block_size=16)
+    with pytest.raises(ValueError, match="float8 recipe"):
+        linear_torchao.wrapper(linear, x, dtype="fp8", recipe="invalid")
+    with pytest.raises(ValueError, match="recipe is only valid for dtype='fp8'"):
+        linear_torchao.wrapper(linear, x, dtype="nvfp4", recipe="rowwise")
+    with pytest.raises(NotImplementedError, match="native FP4"):
+        linear_torchao.wrapper(linear, x, dtype="nvfp4", emulated=False)
+
+    seen = []
+
+    def fake_fp8(inp, weight, bias=None, *, recipe, emulated):
+        seen.append((inp.shape, weight.shape, bias is not None, recipe, emulated))
+        return F.linear(inp, weight, bias)
+
+    monkeypatch.setattr(linear_torchao, "torchao_fp8_linear", fake_fp8)
+    out = linear_torchao.wrapper(linear, x, dtype="fp8", recipe="rowwise")
+    torch.testing.assert_close(out, linear(x))
+    assert seen == [((2, 32), (16, 32), True, "rowwise", False)]
+
+    out_emulated = linear_torchao.wrapper(linear, x, dtype="fp8", emulated=True)
+    torch.testing.assert_close(out_emulated, linear(x))
+    assert seen[-1] == ((2, 32), (16, 32), True, "tensorwise", True)

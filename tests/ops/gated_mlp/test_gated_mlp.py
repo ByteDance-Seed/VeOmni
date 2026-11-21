@@ -825,10 +825,10 @@ def test_the_supported_set_is_the_bounded_whitelist():
 def test_a_linear_subclass_projection_runs_its_own_forward():
     """Only an exact ``nn.Linear`` may be read by weight; a subclass runs its own forward.
 
-    torchao's ``Float8Linear`` subclasses ``nn.Linear`` and does its float8 GEMM in
-    ``forward``. An ``isinstance`` check would let the fused row read its weight and
-    silently skip float8, so the check must be on the exact type. A quantizing row
-    on such a projection is refused instead of falling back.
+    An ``nn.Linear`` subclass (such as ``FSDPLinear`` from ``basic_modules``) does
+    extra work in ``forward``. An ``isinstance`` check would let the fused row read
+    its weight and bypass that work, so the check must be on the exact type. A
+    quantizing row on such a projection is refused instead of falling back.
     """
     from veomni.ops.kernels.gated_mlp._module import render
 
@@ -1114,3 +1114,37 @@ def test_torchao_nvfp4_handles_empty_input():
     out.sum().backward()
     for parameter in mlp.parameters():
         torch.testing.assert_close(parameter.grad, torch.zeros_like(parameter))
+
+
+@_cpu
+def test_torchao_fp8_validates_and_dispatches_three_projections(monkeypatch):
+    """``gated_mlp`` ``torchao`` with ``dtype='fp8'`` runs gate, up, and down via ``torchao_fp8_linear``."""
+    from veomni.ops.kernels.gated_mlp.standard import torchao as gated_torchao
+
+    mlp = _tiny_qwen3_mlp()
+    x = torch.randn(2, 4, mlp.hidden_size)
+
+    with pytest.raises(ValueError, match="does not accept block_size"):
+        gated_torchao.wrapper(mlp, x, dtype="fp8", block_size=16)
+    with pytest.raises(ValueError, match="float8 recipe"):
+        gated_torchao.wrapper(mlp, x, dtype="fp8", recipe="invalid")
+    with pytest.raises(ValueError, match="recipe is only valid for dtype='fp8'"):
+        gated_torchao.wrapper(mlp, x, dtype="nvfp4", recipe="rowwise")
+    with pytest.raises(NotImplementedError, match="native FP4"):
+        gated_torchao.wrapper(mlp, x, dtype="nvfp4", emulated=False)
+
+    seen = []
+
+    def fake_fp8(inp, weight, bias=None, *, recipe, emulated):
+        seen.append((weight.shape, recipe, emulated))
+        return F.linear(inp, weight, bias)
+
+    monkeypatch.setattr(gated_torchao, "torchao_fp8_linear", fake_fp8)
+    out = gated_torchao.wrapper(mlp, x, dtype="fp8", recipe="rowwise_with_gw_hp")
+    expected = mlp.down_proj(F.silu(mlp.gate_proj(x)) * mlp.up_proj(x))
+    torch.testing.assert_close(out, expected)
+    assert seen == [
+        (mlp.gate_proj.weight.shape, "rowwise_with_gw_hp", False),
+        (mlp.up_proj.weight.shape, "rowwise_with_gw_hp", False),
+        (mlp.down_proj.weight.shape, "rowwise_with_gw_hp", False),
+    ]
