@@ -199,9 +199,11 @@ indices and `cu_seqlens` are derived once per forward and reused by every
 block and checkpoint recomputation (Transformers' Ascend FA2 varlen integration
 still copies `cu_seqlens` to the host on each call). Removed query rows have
 zero raw attention output and are never attended to; compare valid-token
-outputs and gradients with SDPA, not ignored padding rows. The text mask is
-normalized to boolean by Diffusers on every path, so flash and SDPA accept the
-same masks.
+outputs and gradients with SDPA, not ignored padding rows. Text masks and
+packed-flash joint masks must be boolean or 0/1 integer keep-masks. Floating
+additive/soft masks and nonbinary integers raise before packing. The model
+validates text masks before Diffusers normalizes them; direct processor calls
+validate their mask when deriving varlen metadata.
 
 
 ### Wan I2V conditioning

@@ -31,6 +31,7 @@ from tests.models.tiny_configs import tiny_qwen_image_config as _tiny_config
 
 
 _OFFICIAL_FORWARD = OfficialQwenImageTransformer2DModel.forward
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _sdpa_ops_config() -> SimpleNamespace:
@@ -310,6 +311,17 @@ def test_qwen_image_flash_keeps_configured_row_for_middle_text_padding(
     for name, grad in expected[3].items():
         torch.testing.assert_close(actual[3][name], grad, msg=name)
 
+    with pytest.raises(ValueError, match="boolean or binary-integer keep-mask"):
+        modeling.QwenImageTransformer2DModel_forward(
+            flash,
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states_mask=text_mask.float(),
+            timestep=torch.tensor([0.25, 0.75]),
+            img_shapes=[[(1, height, width)]] * 2,
+            return_dict=False,
+        )
+
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_qwen_image_flash_processor_packs_mask_without_precomputed_metadata(monkeypatch, available_nvidia_ops):
@@ -343,6 +355,18 @@ def test_qwen_image_flash_processor_packs_mask_without_precomputed_metadata(monk
 
     with pytest.raises(ValueError, match="Broadcast masks are not supported"):
         flash(attn, hidden, encoder, attention_mask=mask[:1])
+
+    invalid_masks = [
+        torch.where(mask.bool(), 0.0, float("-inf")),
+        mask.float() * 0.5,
+        mask.float(),
+        mask * 2,
+        mask - 1,
+    ]
+    for invalid in invalid_masks:
+        with pytest.raises(ValueError, match="boolean or binary-integer keep-mask"):
+            flash(attn, hidden, encoder, attention_mask=invalid)
+    assert len(calls) == 1
 
 
 def test_qwen_image_processor_uses_primary_handle_without_mask(monkeypatch):

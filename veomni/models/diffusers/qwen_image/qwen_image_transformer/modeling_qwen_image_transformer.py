@@ -78,6 +78,18 @@ def _is_flash_attn_impl(impl: str) -> bool:
     return "flash_attention" in impl
 
 
+def _as_joint_keep_mask(mask: torch.Tensor) -> torch.Tensor:
+    """Accept boolean or binary-integer keep masks, never additive attention bias."""
+    if mask.dtype == torch.bool:
+        return mask
+    integer_dtypes = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
+    if mask.dtype not in integer_dtypes or bool(((mask != 0) & (mask != 1)).any()):
+        raise ValueError(
+            "Qwen-Image requires a boolean or binary-integer keep-mask; additive and soft masks are unsupported."
+        )
+    return mask.bool()
+
+
 def _joint_varlen_metadata(keep_mask: torch.Tensor) -> dict[str, Any]:
     """Varlen metadata for the tokens a boolean ``[B, S]`` joint keep-mask retains.
 
@@ -85,6 +97,7 @@ def _joint_varlen_metadata(keep_mask: torch.Tensor) -> dict[str, Any]:
     ``nonzero``, not prefix lengths), but run once per forward and reused by
     every block, so its host reads are not repeated per layer.
     """
+    keep_mask = _as_joint_keep_mask(keep_mask)
     seqlens = keep_mask.sum(dim=-1, dtype=torch.int32)
     return {
         "indices": keep_mask.flatten().nonzero().flatten(),
@@ -317,7 +330,7 @@ class QwenImageSPAttnProcessor:
                 f"got {tuple(attention_mask.shape)}. Broadcast masks are not supported."
             )
         if joint_varlen_metadata is None:
-            joint_varlen_metadata = _joint_varlen_metadata(attention_mask.bool())
+            joint_varlen_metadata = _joint_varlen_metadata(attention_mask)
         indices = joint_varlen_metadata["indices"]
         cu_seqlens = joint_varlen_metadata["cu_seqlens"]
         max_seqlen = joint_varlen_metadata["max_seqlen"]
@@ -369,6 +382,8 @@ def QwenImageTransformer2DModel_forward(
     :class:`QwenImageSPAttnProcessor`, and the image stream is gathered back
     before the output head so that the prediction is identical across SP ranks.
     """
+    if encoder_hidden_states_mask is not None:
+        encoder_hidden_states_mask = _as_joint_keep_mask(encoder_hidden_states_mask)
     sp_enabled = get_parallel_state().sp_enabled
 
     hidden_states = self.img_in(hidden_states)
@@ -465,8 +480,9 @@ def QwenImageTransformer2DModel_forward(
 
     # This forward is also patched onto the diffusers class, so consult the installed processor.
     if getattr(self.transformer_blocks[0].attn.processor, "flash_varlen", False):
-        if joint_mask is not None:
-            block_attention_kwargs["joint_varlen_metadata"] = _joint_varlen_metadata(joint_mask)
+        effective_mask = block_attention_kwargs.get("attention_mask")
+        if effective_mask is not None:
+            block_attention_kwargs["joint_varlen_metadata"] = _joint_varlen_metadata(effective_mask)
     elif "attention_mask" in block_attention_kwargs:
         joint_sequence_length = hidden_states.shape[1] + encoder_hidden_states.shape[1]
         if sp_enabled:
