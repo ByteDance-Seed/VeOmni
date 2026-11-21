@@ -160,7 +160,7 @@ projection module, so the adapter's own forward runs. The fused MLP row follows
 the same rule, and only for the quantizing value: with
 `gated_mlp_implementation: torchao` and an adapter on
 `gate_proj`/`up_proj`/`down_proj`, the forward raises
-`gated_mlp_implementation='torchao' cannot run on a wrapped projection`.
+`gated_mlp_implementation='torchao' cannot run on this MLP: ...`.
 `liger_kernel` is **not** affected — it is an arithmetic rewrite that keeps the
 projection-module fallback.
 
@@ -191,10 +191,11 @@ an ordinary tensor.
 
 ### `torch.compile`
 
-`torchao` uses `float8_e4m3fn` block scales and an FP32 per-tensor scale.
-Inductor compilation can fail on pre-SM89 CUDA GPUs because Triton does not
-support the E4M3 casts there; disable `torch.compile` on those GPUs when using
-`torchao`.
+`torchao` with `dtype: nvfp4` uses `float8_e4m3fn` block scales and an FP32
+per-tensor scale. Inductor compilation can fail on pre-SM89 CUDA GPUs because
+Triton does not support the E4M3 casts there; disable `torch.compile` on those
+GPUs when using `nvfp4`. With `dtype: mxfp4`, `torchao` uses `float8_e8m0fnu`
+scales and `torch_compile` refuses the selection outright.
 
 Whether compiled rounding matches the eager round trip depends on the GPU.
 `torch.compile(nvfp4_fake_quant)` was measured on a `4096 x 1024` BF16 tensor:

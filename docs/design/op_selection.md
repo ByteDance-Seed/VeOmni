@@ -206,7 +206,7 @@ the row cannot serve it:
 | `fused_triton`, `eager` | between the GEMMs | runs it — both resolve a name outside `activation.py` through `ACT2FN`, the table the model built its own `act_fn` from |
 | `qat` | between the GEMMs | refuses — a fallback would train at full precision |
 | `fused_quack`, `fused_npu`, `fused_mlu` | inside the kernel (SiLU only) | delegates to `eager`; these rows do bf16 math, so nothing is lost |
-| `deepgemm_fp8` | inside the FP8 kernel (SiLU only) | refuses — delegating would skip the FP8 GEMMs |
+| `deepgemm` | inside the FP8 kernel (SiLU only) | refuses — delegating would skip the FP8 GEMMs |
 
 `fused_triton` and `qat` own a hand-written `autograd.Function` whose `forward` runs
 under `no_grad`, which is why the derivative is explicit there.
@@ -296,7 +296,7 @@ existing config and checkpoint records.
 **The row name names the kernel; the format is an argument.** `qat` is TileLang's
 fake quantization, `torchao` is torchao's, `deepgemm` is the vendor's real GEMM --
 that much is what the name says. *Which* format it rounds to is `dtype`
-(`fp8`/`fp4` for `qat`, `nvfp4`/`mxfp4` for `torchao`, `fp8` for `deepgemm`), because
+(`fp8`/`fp4` for `qat`, `fp8`/`nvfp4`/`mxfp4` for `torchao`, `fp8` for `deepgemm`), because
 one row serves several checkpoints and naming it after one format would either
 multiply rows or lie about the rest. Each row declares its formats at registration
 (`OP_REGISTRY.row_dtypes`) and a `dtype` outside them raises. There is no separate `enable` flag to keep in sync with it: turning
@@ -362,9 +362,11 @@ layers.<i>.indexer_q_b_proj
 A model that publishes no sites is unaffected: its field is a bare string and the
 site argument is simply unused.
 
-**`kv_round` is not per-site.** It rounds *stored* tensors rather than GEMM
-operands, so `none` / `eager` / `triton` is already the whole space and there is no
-argument to choose per site. It keeps the plain row-name form.
+**`kv_round` also accepts per-site overrides.** It rounds *stored* tensors rather
+than GEMM operands, so it has no format/dtype argument — `none` / `eager` /
+`triton` is the whole space — and per-site overrides let a model enable or
+disable rounding selectively across `window_kv`, `hca_kv`, `csa_kv`, and
+`indexer`.
 
 ---
 
@@ -751,7 +753,7 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 |-------|---------------|---|
 | `liger_kernel` | Registered Liger SwiGLU row (SiLU only) | `liger-kernel` package |
 | `qat` | Registered TileLang blockwise FP8 fake-quant row | `tilelang`, NVIDIA SM90+ |
-| `torchao` | Registered FP4 fake-quant row, `dtype=nvfp4` or `mxfp4` ([FP4 QAT](../usage/mxfp4_qat.md)) | `torchao` package |
+| `torchao` | Registered dynamic FP8 GEMM and FP4 fake-quant row, `dtype=fp8`, `nvfp4`, or `mxfp4` ([Float8 Training](../usage/float8_training.md), [FP4 QAT](../usage/mxfp4_qat.md)) | `torchao` package |
 | `eager` | Registered PyTorch reference row | — |
 
 #### `linear_implementation`
@@ -760,7 +762,7 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 |-------|---------------|---|
 | `eager` | Registered row that calls the projection module | — |
 | `qat` | Registered TileLang blockwise FP8 fake-quant row | `tilelang`, NVIDIA SM90+ |
-| `torchao` | Registered FP4 fake-quant row (`standard` only, `dtype=nvfp4` or `mxfp4`; [FP4 QAT](../usage/mxfp4_qat.md)) | `torchao` package |
+| `torchao` | Registered dynamic FP8 GEMM and FP4 fake-quant row (`standard` only, `dtype=fp8`, `nvfp4`, or `mxfp4`; [Float8 Training](../usage/float8_training.md), [FP4 QAT](../usage/mxfp4_qat.md)) | `torchao` package |
 
 The quantizing rows refuse to run on a projection substituted after
 construction (LoRA keeps the base layer at `base_layer` and owns no `weight`):

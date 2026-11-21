@@ -66,11 +66,6 @@ def quantizing_row():
             del OP_REGISTRY._entries[key]
 
 
-# ---------------------------------------------------------------------------
-# Resolution
-# ---------------------------------------------------------------------------
-
-
 def test_a_bare_string_is_one_row_for_every_site():
     """The pre-override shape stays valid: a row name applies everywhere."""
     selection = OpsSelection.from_config_value("liger_kernel")
@@ -132,11 +127,6 @@ def test_matching_is_anchored_so_a_suffix_does_not_leak():
     assert selection.resolve_impl("layers.10.mlp") == "eager"
 
 
-# ---------------------------------------------------------------------------
-# Row arguments
-# ---------------------------------------------------------------------------
-
-
 def test_kwargs_travel_with_the_selection():
     """A row's arguments are part of the selection, not of the row's name."""
     selection = OpsSelection.from_config_value({"name": "qat", "kwargs": {"block_size": 64}})
@@ -184,11 +174,6 @@ def test_an_override_inherits_kwargs_it_does_not_use(quantizing_row):
     assert kept.kwargs == {"block_size": 64}
 
 
-# ---------------------------------------------------------------------------
-# Refusals
-# ---------------------------------------------------------------------------
-
-
 def test_an_unknown_key_is_named_rather_than_ignored():
     """A typo in YAML would otherwise silently drop the setting it meant to write."""
     with pytest.raises(ValueError, match=r"Unknown ops selection keys: \['kwarg'\]"):
@@ -203,11 +188,6 @@ def test_an_invalid_site_regex_is_refused():
 def test_an_override_without_a_site_is_refused():
     with pytest.raises(ValueError, match="requires a site pattern"):
         SiteOverride.from_dict({"name": "eager"})
-
-
-# ---------------------------------------------------------------------------
-# Wiring
-# ---------------------------------------------------------------------------
 
 
 def test_a_reference_row_simply_ignores_the_arguments_it_does_not_take(quantizing_row):
@@ -421,11 +401,6 @@ def test_a_quantizing_row_may_carry_arguments():
     assert configured.moe_implementation.kwargs == {"block_size": 64}
 
 
-# ---------------------------------------------------------------------------
-# The precision axis: emulated vs native
-# ---------------------------------------------------------------------------
-
-
 def test_dtypes_declares_which_formats_a_row_rounds_to():
     """A row that rounds names its formats; a reference row names none.
 
@@ -501,30 +476,62 @@ def test_the_per_family_sets_agree_with_the_registry():
         assert declared == rounds, f"{op}: QUANTIZING_IMPLS disagrees with the registry's dtypes"
 
 
-def test_a_native_row_ignores_the_arguments_it_does_not_take():
-    """Its format is fixed by the row, so ``dtype`` is not passed to it.
+def test_a_native_row_validates_dtype_and_drops_unrelated_kwargs():
+    """``deepgemm`` enforces its declared ``dtypes=('fp8',)`` and drops unrelated kwargs like ``block_size``."""
+    from veomni.ops.registry import _filter_kwargs
 
-    ``deepgemm_fp8`` casts to FP8 at the width DeepGEMM fixes. An enclosing
-    ``kwargs`` that sets ``dtype: fp4`` is filtered away rather than raising --
-    the block describes the family, and ``qat`` at another site does take it.
-    """
-    configured = OpsImplementationConfig(moe_implementation={"name": "deepgemm", "kwargs": {"dtype": "fp4"}})
-    assert configured.moe_implementation.kwargs == {"dtype": "fp4"}
-    # The handle is where the filtering happens, and it needs a device the row
-    # resolves on. What matters is that the key never reaches the call.
-    from veomni.ops.registry import OpEntry
+    deepgemm_entry = OP_REGISTRY.first_entry("moe_experts", "deepgemm", variant="standard")
+    assert deepgemm_entry is not None
+    assert _filter_kwargs(deepgemm_entry, {"dtype": "fp8", "block_size": 64}) == {"dtype": "fp8"}
+    with pytest.raises(ValueError, match="cannot round to 'fp4'"):
+        _filter_kwargs(deepgemm_entry, {"dtype": "fp4"})
 
-    seen = {}
 
-    def record(*args, **kwargs):
-        seen.update(kwargs)
-        return torch.zeros(1)
+def test_filter_kwargs_is_variant_aware_and_checks_gated_mlp_qat_dtype():
+    """``linear/grouped/qat`` and ``gated_mlp/standard/qat`` accept ``dtype='fp8'`` and reject ``dtype='fp4'``."""
+    from veomni.ops.registry import _filter_kwargs
 
-    handle = object.__new__(VeomniOp)
-    handle.op, handle.variant, handle.impl, handle.kwargs = "moe_experts", "standard", "deepgemm", {}
-    handle._entry = OpEntry(op="moe_experts", variant="standard", impl="deepgemm", description="probe", wrapper=record)
-    handle(torch.zeros(1), num_experts=8)
-    assert seen == {"num_experts": 8}
+    grouped_qat = OP_REGISTRY.first_entry("linear", "qat", variant="grouped")
+    assert grouped_qat is not None
+    assert _filter_kwargs(grouped_qat, {"dtype": "fp8", "block_size": 128}) == {"dtype": "fp8", "block_size": 128}
+    with pytest.raises(ValueError, match="cannot round to 'fp4'"):
+        _filter_kwargs(grouped_qat, {"dtype": "fp4"})
+
+    gated_qat = OP_REGISTRY.first_entry("gated_mlp", "qat", variant="standard")
+    assert gated_qat is not None
+    assert _filter_kwargs(gated_qat, {"dtype": "fp8", "block_size": 128}) == {"dtype": "fp8", "block_size": 128}
+    with pytest.raises(ValueError, match="cannot round to 'fp4'"):
+        _filter_kwargs(gated_qat, {"dtype": "fp4"})
+
+
+def test_unset_selection_filters_kwargs_for_host_default():
+    """An ``OpsSelection`` with ``name=None`` filters kwargs against the resolved host default."""
+    sel = OpsSelection(name=None, kwargs={"dtype": "fp8"})
+    handle = VeomniOp("linear", "standard", sel, site="layers.0.q_proj")
+    assert handle.impl == "eager"
+    assert handle.kwargs == {}
+    linear = torch.nn.Linear(16, 16)
+    out = handle(linear, torch.randn(2, 16))
+    assert out.shape == (2, 16)
+
+
+def test_deprecated_dtype_in_name_alias_preserves_explicit_dtype():
+    """Rewriting ``torchao_nvfp4`` keeps an explicit ``dtype`` already present in ``kwargs``."""
+    configured = OpsImplementationConfig(linear_implementation={"name": "torchao_nvfp4", "kwargs": {"dtype": "mxfp4"}})
+    assert configured.linear_implementation == OpsSelection(name="torchao", kwargs={"dtype": "mxfp4"})
+
+
+def test_kv_round_implementation_supports_per_site_overrides():
+    """``kv_round_implementation`` accepts per-site overrides matching DeepSeek-V4's site strings."""
+    configured = OpsImplementationConfig(
+        kv_round_implementation={
+            "name": "none",
+            "overrides": [{"site": r"layers\.0\.window_kv", "name": "eager"}],
+        }
+    )
+    assert isinstance(configured.kv_round_implementation, OpsSelection)
+    assert configured.kv_round_implementation.resolve_impl("layers.0.window_kv") == "eager"
+    assert configured.kv_round_implementation.resolve_impl("layers.1.window_kv") == "none"
 
 
 def test_the_native_row_still_takes_the_family_signature_at_the_call_site():

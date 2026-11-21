@@ -712,15 +712,20 @@ def test_qwen3_nvfp4_qat_rounds_exactly_the_projection_weights(monkeypatch):
     rounded = set()
 
     for row in (linear_row, mlp_row):
-        original = row.nvfp4_fake_quant
+        original_factory = row.torchao_fake_quant
 
-        def record(tensor, *args, _original=original, **kwargs):
-            name = names_by_ptr.get(tensor.data_ptr())
-            if name is not None:
-                rounded.add(name)
-            return _original(tensor, *args, **kwargs)
+        def make_recorder(dtype, _original_factory=original_factory):
+            quantize = _original_factory(dtype)
 
-        monkeypatch.setattr(row, "nvfp4_fake_quant", record)
+            def record(tensor, *args, **kwargs):
+                name = names_by_ptr.get(tensor.data_ptr())
+                if name is not None:
+                    rounded.add(name)
+                return quantize(tensor, *args, **kwargs)
+
+            return record
+
+        monkeypatch.setattr(row, "torchao_fake_quant", make_recorder)
 
     model(input_ids=torch.randint(3, config.vocab_size, (1, 8)), use_cache=False)
 

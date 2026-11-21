@@ -340,29 +340,29 @@ class OpRegistry:
                 seen.append(impl)
         return seen
 
-    def first_entry(self, op: str, impl: str) -> OpEntry | None:
-        """Some registered entry for ``(op, impl)``, ignoring variant and device.
+    def first_entry(self, op: str, impl: str, *, variant: str | None = None) -> OpEntry | None:
+        """Some registered entry for ``(op, impl)`` (optionally matching ``variant``), ignoring device.
 
         For the checks that must run before hardware resolution: the formats a row
         accepts and the keys it takes do not depend on which device registered it, so
         any entry answers. Returns ``None`` when no device registers the name, which
         the caller leaves to ``resolve`` to report.
         """
-        for (entry_op, _variant, entry_impl, _device), entry in self._entries.items():
-            if entry_op == op and entry_impl == impl:
+        for (entry_op, entry_variant, entry_impl, _device), entry in self._entries.items():
+            if entry_op == op and entry_impl == impl and (variant is None or entry_variant == variant):
                 return entry
         return None
 
-    def row_dtypes(self, op: str, impl: str) -> tuple[str, ...] | None:
+    def row_dtypes(self, op: str, impl: str, *, variant: str | None = None) -> tuple[str, ...] | None:
         """The formats ``impl`` of ``op`` can round to, or ``None`` if unregistered.
 
         An empty tuple is a valid answer: an ``EXACT`` row rounds nothing, so there is
         no format to choose. ``None`` means the row does not exist at all.
         """
-        entry = self.first_entry(op, impl)
+        entry = self.first_entry(op, impl, variant=variant)
         return None if entry is None else entry.dtypes
 
-    def row_arguments(self, op: str, impl: str) -> dict[str, Any] | None:
+    def row_arguments(self, op: str, impl: str, *, variant: str | None = None) -> dict[str, Any] | None:
         """The keyword arguments a selection may set on ``impl`` of ``op``, name to default.
 
         Read from the raw ``forward``, which carries the real signature; the
@@ -375,22 +375,29 @@ class OpRegistry:
         let a YAML typo launch the kernel over the wrong number of experts. It stays
         call-only, which is also why the third precedence step does not reach it.
 
+        When ``variant`` is given, inspects only that variant; otherwise aggregates
+        across variants so family-wide config checks see every row's arguments.
         Returns ``None`` when ``impl`` is not registered for ``op`` on any device.
         """
-        for (entry_op, _variant, entry_impl, _device), entry in self._entries.items():
+        found = False
+        collected: dict[str, Any] = {}
+        for (entry_op, entry_variant, entry_impl, _device), entry in self._entries.items():
             if entry_op != op or entry_impl != impl:
+                continue
+            if variant is not None and entry_variant != variant:
                 continue
             fn = entry.forward or entry.wrapper
             if fn is None:
-                return None
+                continue
+            found = True
             # ``KEYWORD_ONLY`` only: the tensor operands are positional, so a
             # selection never supplies them and listing them would suggest it could.
-            return {
-                name: parameter.default
-                for name, parameter in signature(fn).parameters.items()
-                if parameter.kind is Parameter.KEYWORD_ONLY and parameter.default is not Parameter.empty
-            }
-        return None
+            for name, parameter in signature(fn).parameters.items():
+                if parameter.kind is Parameter.KEYWORD_ONLY and parameter.default is not Parameter.empty:
+                    collected.setdefault(name, parameter.default)
+            if variant is not None:
+                break
+        return collected if found else None
 
     def list_entries(self, op: str, variant: str) -> list[OpEntry]:
         """Return every registered row for ``(op, variant)``.
@@ -515,13 +522,13 @@ def _filter_kwargs(entry: OpEntry, kwargs: Mapping[str, Any]) -> dict[str, Any]:
     """
     if not kwargs:
         return {}
-    accepted = OP_REGISTRY.row_arguments(entry.op, entry.impl)
+    accepted = OP_REGISTRY.row_arguments(entry.op, entry.impl, variant=entry.variant)
     if accepted is None:
         # Unregistered for every device; ``resolve`` reports that, not this.
         return dict(kwargs)
+    if "dtype" in kwargs and entry.dtypes:
+        _check_dtype(entry, kwargs["dtype"])
     kept = {key: value for key, value in kwargs.items() if key in accepted}
-    if "dtype" in kept:
-        _check_dtype(entry, kept["dtype"])
     if "emulated" in kept and kept["emulated"] is not None and type(kept["emulated"]) is not bool:
         raise ValueError(
             f"{entry.op}/{entry.variant}/{entry.impl}: emulated must be a bool, got {kept['emulated']!r}."
@@ -580,7 +587,7 @@ class VeomniOp:
         # where the row does not resolve: what a row accepts is a property of the
         # row, not of which device registered it.
         if kwargs and impl is not None:
-            offered = OP_REGISTRY.first_entry(op, impl)
+            offered = OP_REGISTRY.first_entry(op, impl, variant=variant)
             if offered is not None:
                 kwargs = _filter_kwargs(offered, kwargs)
         # The un-resolved name is checked first, exactly as before this change. A
@@ -593,6 +600,8 @@ class VeomniOp:
             if cached is not None:
                 return cached
         entry = resolve_op(op, variant, impl)
+        if kwargs and impl is None:
+            kwargs = _filter_kwargs(entry, kwargs)
         key = (op, variant, entry.impl, _kwargs_key(kwargs))
         cached = cls._intern.get(key)
         if cached is not None:

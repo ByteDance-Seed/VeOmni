@@ -1434,7 +1434,7 @@ _DEPRECATED_IMPLEMENTATION_ALIASES: Dict[str, Dict[str, str]] = {
     "moe_implementation": {"fused_mlu_triton": "fused_triton"},
     # The format moved from the name into the row's ``dtype`` argument, so these
     # carry an implied argument rather than only a new name. See
-    # ``_RENAMED_ROWS_CARRYING_A_DTYPE``.
+    # ``_DTYPE_IN_NAME_ALIASES``.
     "cross_entropy_loss_implementation": {"npu": "chunk_loss"},
     "rms_norm_implementation": {"npu": "torch_npu"},
     "rotary_pos_emb_implementation": {"npu": "torch_npu"},
@@ -1569,8 +1569,8 @@ class OpsImplementationConfig:
         default=None,
         metadata={
             "help": "Gated MLP (act(gate(x)) * up(x)). 'liger_kernel' (SiLU only; GPU, MLU) | "
-            "'qat' (SM90+, dtype='fp8') | 'torchao' (dtype='nvfp4' or 'mxfp4', needs the 'torchao' "
-            "package) | 'eager'. "
+            "'qat' (SM90+, dtype='fp8') | 'torchao' (dtype='fp8', 'nvfp4', or 'mxfp4', needs the "
+            "'torchao' package) | 'eager'. "
             "No NPU backend. Unset: 'liger_kernel' on GPU/MLU, 'eager' on NPU."
         },
     )
@@ -1578,8 +1578,8 @@ class OpsImplementationConfig:
         default=None,
         metadata={
             "help": "Dense projection. 'qat' (fake quantization of both GEMM operands, SM90+, dtype='fp8') | "
-            "'torchao' (FP4 fake quantization of both GEMM operands, 'standard' variant only, needs the "
-            "'torchao' package, dtype='nvfp4' or 'mxfp4') | 'eager' (calls the projection module). "
+            "'torchao' (dynamic FP8 GEMMs or FP4 fake quantization, 'standard' variant only, needs the "
+            "'torchao' package, dtype='fp8', 'nvfp4', or 'mxfp4') | 'eager' (calls the projection module). "
             "Unset: 'eager'. Selected independently of gated_mlp_implementation: a model that owns its "
             "own projections reads this field, a model that runs the fused gated-MLP row reads that one."
         },
@@ -1778,23 +1778,19 @@ class OpsImplementationConfig:
     #: Fields that accept the per-site form. Every other field stays a bare string,
     #: because a site override only means something where the model owns several
     #: instances of one family.
-    #: ``kv_round`` is deliberately absent: it rounds *stored* tensors rather than
-    #: GEMM operands, so there is no ``(dtype, qat, backend)`` triple to resolve --
-    #: ``none``/``eager``/``triton`` are already the whole space. It keeps the plain
-    #: row-name form.
     _PER_SITE_FIELDS = (
         "moe_implementation",
         "gated_mlp_implementation",
         "linear_implementation",
+        "kv_round_implementation",
     )
 
-    #: Which registry family each per-site field drives. ``kv_round`` is absent for
-    #: the same reason it is not per-site: its rows round stored tensors, so there is
-    #: no row argument for a selection to pass.
+    #: Which registry family each per-site field drives.
     _FIELD_TO_OP = {
         "moe_implementation": "moe_experts",
         "gated_mlp_implementation": "gated_mlp",
         "linear_implementation": "linear",
+        "kv_round_implementation": "kv_round",
     }
 
     def _validate_row_arguments(self) -> None:
@@ -1901,23 +1897,31 @@ class OpsImplementationConfig:
                     new_name, dtype = renamed
                     self._warn_deprecated(field_name, holder.name, f"{new_name} (dtype={dtype!r})")
                     holder.name = new_name
-                    holder.kwargs = {**(holder.kwargs or {}), "dtype": dtype}
+                    holder.kwargs = {"dtype": dtype, **(holder.kwargs or {})}
                 continue
             if value in renames:
                 new_name, dtype = renames[value]
                 self._warn_deprecated(field_name, value, f"{new_name} (dtype={dtype!r})")
                 setattr(self, field_name, OpsSelection(name=new_name, kwargs={"dtype": dtype}))
 
-        if self.moe_implementation == "fused":
+        def _resolve_legacy_fused_moe() -> str:
             from ..utils.device import IS_NPU_AVAILABLE
             from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available
 
             if IS_NPU_AVAILABLE:
-                resolved = "fused_npu"
-            elif is_torch_mlu_available():
-                resolved = "fused_mlu" if is_apex_mlu_available() else "fused_triton"
-            else:
-                resolved = "fused_quack"
+                return "fused_npu"
+            if is_torch_mlu_available():
+                return "fused_mlu" if is_apex_mlu_available() else "fused_triton"
+            return "fused_quack"
+
+        if isinstance(self.moe_implementation, OpsSelection):
+            for holder in (self.moe_implementation, *self.moe_implementation.overrides):
+                if holder.name == "fused":
+                    resolved = _resolve_legacy_fused_moe()
+                    self._warn_deprecated("moe_implementation", "fused", resolved)
+                    holder.name = resolved
+        elif self.moe_implementation == "fused":
+            resolved = _resolve_legacy_fused_moe()
             self._warn_deprecated("moe_implementation", "fused", resolved)
             self.moe_implementation = resolved
 

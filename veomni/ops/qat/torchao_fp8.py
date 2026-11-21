@@ -35,6 +35,7 @@ import torch
 import torch.nn.functional as F
 from packaging.version import Version
 from torch import Tensor
+from torch.distributed.tensor import DTensor
 
 from ...utils import device
 
@@ -145,6 +146,8 @@ def torchao_fp8_linear(
     validate_float8_recipe(recipe)
     if type(emulated) is not bool:
         raise ValueError(f"float8 emulated flag must be a bool, got {emulated!r}.")
+    if isinstance(x, DTensor) or isinstance(weight, DTensor):
+        raise TypeError("torchao float8 linear does not support a DTensor operand; pass the local tensor.")
     if weight.ndim != 2:
         raise ValueError(f"torchao float8 linear expects a 2D weight, got shape {tuple(weight.shape)}.")
     if weight.shape[0] % 16 or weight.shape[1] % 16:
@@ -165,10 +168,12 @@ def torchao_fp8_linear(
 
     from torchao.float8.float8_linear import matmul_with_hp_or_float8_args
 
-    # Mirror Float8Linear.forward's autocast handling so the output keeps the
+    # Mirror Float8Linear.forward's autocast handling so both operands keep the
     # active autocast precision just like F.linear.
     if torch.is_autocast_enabled(x.device.type):
-        x = x.to(torch.get_autocast_dtype(x.device.type))
+        autocast_dtype = torch.get_autocast_dtype(x.device.type)
+        x = x.to(autocast_dtype)
+        weight = weight.to(autocast_dtype)
 
     output = matmul_with_hp_or_float8_args.apply(
         x,

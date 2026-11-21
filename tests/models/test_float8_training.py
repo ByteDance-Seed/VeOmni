@@ -152,6 +152,19 @@ def test_float8_rejects_invalid_recipe_shape_and_hardware_before_torchao_import(
     with pytest.raises(ValueError, match="divisible by 16"):
         torchao_fp8_linear(torch.randn(2, 32), torch.randn(8, 32))
 
+    # DTensor operands are refused before importing torchao.
+    from torch.distributed.tensor import DTensor
+
+    class _FakeDTensor(DTensor):
+        @staticmethod
+        def __new__(cls):
+            return torch.Tensor._make_subclass(cls, torch.zeros(2, 32), require_grad=False)
+
+    with pytest.raises(TypeError, match="DTensor"):
+        torchao_fp8_linear(_FakeDTensor(), w)
+    with pytest.raises(TypeError, match="DTensor"):
+        torchao_fp8_linear(x, _FakeDTensor())
+
     # Native FP8 requires NVIDIA CUDA SM89+.
     monkeypatch.setattr(device, "IS_CUDA_AVAILABLE", False)
     with pytest.raises(RuntimeError, match="SM89"):
@@ -308,29 +321,63 @@ def _require_native_float8():
     ],
 )
 def test_float8_linear_and_gated_mlp_dispatch_scaled_mm(recipe, expected_linear_mms):
-    """Verify both ``linear`` and ``gated_mlp`` ``torchao`` FP8 rows dispatch native ``aten::_scaled_mm``."""
+    """Verify ``linear`` and ``gated_mlp`` ``torchao`` FP8 rows dispatch ``aten::_scaled_mm`` and match BF16."""
     _require_native_float8()
     from torch.profiler import ProfilerActivity, profile
 
+    torch.manual_seed(0)
     linear_op = VeomniOp("linear", "standard", _fp8_selection(recipe=recipe))
-    linear = nn.Linear(64, 64, bias=False, device="cuda", dtype=torch.bfloat16)
-    x = torch.randn(17, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as trace:
-        linear_op(linear, x).square().mean().backward()
-        device.synchronize()
-    assert sum(e.count for e in trace.key_averages() if e.key == "aten::_scaled_mm") == expected_linear_mms
+    ref_linear_op = VeomniOp("linear", "standard", "eager")
+    for tokens in (16, 17, 33):
+        linear = nn.Linear(64, 64, bias=False, device="cuda", dtype=torch.bfloat16)
+        ref_linear = nn.Linear(64, 64, bias=False, device="cuda", dtype=torch.bfloat16)
+        ref_linear.load_state_dict(linear.state_dict())
+        x = torch.randn(tokens, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as trace:
+            out = linear_op(linear, x)
+            out.square().mean().backward()
+            device.synchronize()
+        assert sum(e.count for e in trace.key_averages() if e.key == "aten::_scaled_mm") == expected_linear_mms
+
+        ref_out = ref_linear_op(ref_linear, x_ref)
+        ref_out.square().mean().backward()
+        for actual, expected in (
+            (out, ref_out),
+            (x.grad, x_ref.grad),
+            (linear.weight.grad, ref_linear.weight.grad),
+        ):
+            assert torch.isfinite(actual).all()
+            rel_err = (actual.float() - expected.float()).norm() / expected.float().norm().clamp(min=1e-6)
+            assert rel_err < 0.15
 
     mlp = SimpleNamespace(
         gate_proj=nn.Linear(64, 128, bias=False, device="cuda", dtype=torch.bfloat16),
         up_proj=nn.Linear(64, 128, bias=False, device="cuda", dtype=torch.bfloat16),
         down_proj=nn.Linear(128, 64, bias=False, device="cuda", dtype=torch.bfloat16),
     )
+    ref_mlp = SimpleNamespace(
+        gate_proj=nn.Linear(64, 128, bias=False, device="cuda", dtype=torch.bfloat16),
+        up_proj=nn.Linear(64, 128, bias=False, device="cuda", dtype=torch.bfloat16),
+        down_proj=nn.Linear(128, 64, bias=False, device="cuda", dtype=torch.bfloat16),
+    )
+    for attr in ("gate_proj", "up_proj", "down_proj"):
+        getattr(ref_mlp, attr).load_state_dict(getattr(mlp, attr).state_dict())
     mlp_op = VeomniOp("gated_mlp", "standard", _fp8_selection(recipe=recipe))
+    ref_mlp_op = VeomniOp("gated_mlp", "standard", "eager")
     x_mlp = torch.randn(17, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_mlp_ref = x_mlp.detach().clone().requires_grad_(True)
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as trace:
-        mlp_op(mlp, x_mlp, activation="silu").square().mean().backward()
+        mlp_out = mlp_op(mlp, x_mlp, activation="silu")
+        mlp_out.square().mean().backward()
         device.synchronize()
     assert sum(e.count for e in trace.key_averages() if e.key == "aten::_scaled_mm") == 3 * expected_linear_mms
+    ref_mlp_out = ref_mlp_op(ref_mlp, x_mlp_ref, activation="silu")
+    ref_mlp_out.square().mean().backward()
+    assert torch.isfinite(mlp_out).all() and torch.isfinite(x_mlp.grad).all()
+    rel_err = (mlp_out.float() - ref_mlp_out.float()).norm() / ref_mlp_out.float().norm().clamp(min=1e-6)
+    assert rel_err < 0.20
 
 
 @pytest.mark.parametrize("recipe", ["tensorwise", "rowwise", "rowwise_with_gw_hp"])

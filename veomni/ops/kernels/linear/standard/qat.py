@@ -35,7 +35,7 @@ from .._module import resolve_projection
 
 
 #: Formats this row can round to, as its ``dtype`` argument.
-SUPPORTED_DTYPES = ("fp8", "fp4")
+SUPPORTED_DTYPES = ("fp8",)
 
 
 def wrapper(linear: nn.Module, x: Tensor, *, dtype: str = "fp8", block_size: int | None = None) -> Tensor:
