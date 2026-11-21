@@ -649,6 +649,15 @@
     ]
   },
   {
+    "name": "qwen38-metric-schema-accelerator",
+    "suite": "unit",
+    "args": [
+      "-s",
+      "-x",
+      "tests/trainer/test_metric_schema_accelerator.py"
+    ]
+  },
+  {
     "name": "swap-adamw-unit",
     "suite": "unit",
     "conditional": false,
