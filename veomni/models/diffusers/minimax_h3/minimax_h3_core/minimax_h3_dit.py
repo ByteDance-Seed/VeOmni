@@ -90,36 +90,14 @@ class _PackedBounds(NamedTuple):
 _H3_REFERENCE_ATTN_IMPLS = frozenset({"eager", "sdpa", "veomni_sdpa"})
 _H3_FLASH_ATTN_IMPLS = frozenset(
     {
+        "flash_attention_2",
+        "flash_attention_3",
         "veomni_flash_attention_2",
         "veomni_flash_attention_2_hub",
         "veomni_flash_attention_3",
         "veomni_flash_attention_3_hub",
     }
 )
-
-
-def _h3_attention_impl(config=None) -> str:
-    """Resolve the configured ``attention/standard`` row for the H3 DiT and token refiner.
-
-    The SDPA reference makes unmasked per-segment calls, so ``eager`` (H3 has no
-    module-local eager attention) and ``veomni_sdpa`` (whose masked-SDPA backend
-    pin excludes PyTorch's flash SDPA kernel) both select the plain ``sdpa`` row.
-    """
-    impl = (
-        config.ops_config.attn_implementation
-        if config is not None and config.ops_implementation.get("attn_implementation") is not None
-        else "veomni_sdpa"
-    )
-    if impl in _H3_REFERENCE_ATTN_IMPLS:
-        return "sdpa"
-    if impl.startswith("flash_attention_"):
-        impl = f"veomni_{impl}"
-    if impl not in _H3_FLASH_ATTN_IMPLS:
-        raise ValueError(
-            f"Unsupported H3 attention implementation {impl!r}; use sdpa or a local/Hub "
-            "flash_attention_2 / flash_attention_3 name."
-        )
-    return impl
 
 
 class MiniMaxH3Rope(nn.Module):
@@ -172,7 +150,13 @@ class MiniMaxH3Attention(nn.Module):
         self.k_norm = VeomniRMSNorm(attention_head_dim, eps=qk_norm_eps, config=config)
         self.out_proj = nn.Linear(inner_dim, hidden_size, bias=False)
         # Bound once from the model ops selection, for single-sample, packed and Ulysses calls alike.
-        bind_minimax_attention(self, is_causal=False, impl=_h3_attention_impl(config), config=config)
+        impl = config.ops_config.attn_implementation if config is not None else "veomni_sdpa"
+        if impl not in _H3_REFERENCE_ATTN_IMPLS | _H3_FLASH_ATTN_IMPLS:
+            raise ValueError(
+                f"Unsupported H3 attention implementation {impl!r}; use sdpa or a local/Hub "
+                "flash_attention_2 / flash_attention_3 name."
+            )
+        bind_minimax_attention(self, is_causal=False, impl=impl, config=config)
         # 3-axis rope is shorter than head_dim (96 vs 128 in production). q/k are [S, H, D].
         rope_impl = config.ops_config.rotary_pos_emb_implementation if config is not None else "eager"
         self.veomni_rope = VeomniOp("rope", "partial", rope_impl)
@@ -656,7 +640,6 @@ class MiniMaxH3DiT(nn.Module):
             text_embed,
             cu_seqlens=refiner_cu_seqlens,
             max_seqlen=refiner_max_seqlen,
-            valid_seqlen=text_embed.shape[0],
         )
 
         dtype = text_embed.dtype
@@ -720,6 +703,7 @@ class MiniMaxH3DiT(nn.Module):
         if packed_seq_params is None:
             cu_host = (0, seq_len)
             max_seqlen = seq_len
+            cu_tensor = torch.tensor(cu_host, dtype=torch.int32, device=device)
         else:
             cu_tensor = packed_seq_params["cu_seqlens_q"].to(torch.int32)
             max_seqlen = int(packed_seq_params["max_seqlen_q"])
@@ -729,6 +713,7 @@ class MiniMaxH3DiT(nn.Module):
         if refiner_packed_seq_params is None:
             refiner_host = (0, int(text_pos.numel()))
             refiner_max = int(text_pos.numel())
+            refiner_cu = torch.tensor(refiner_host, dtype=torch.int32, device=device)
         else:
             refiner_cu = refiner_packed_seq_params["cu_seqlens_q"].to(torch.int32)
             refiner_max = int(refiner_packed_seq_params["max_seqlen_q"])
@@ -745,7 +730,7 @@ class MiniMaxH3DiT(nn.Module):
             unique_timesteps=unique_timesteps,
             image_pos=image_pos.to(device),
             text_pos=text_pos.to(device),
-            refiner_cu_seqlens=refiner_host,
+            refiner_cu_seqlens=_PackedBounds(refiner_cu.to(device), refiner_host),
             refiner_max_seqlen=refiner_max,
             seq_len=seq_len,
             device=device,
@@ -755,7 +740,7 @@ class MiniMaxH3DiT(nn.Module):
         rope_cos = torch.cos(rope_freqs).to(decoder_input.dtype)
         rope_sin = torch.sin(rope_freqs).to(decoder_input.dtype)
 
-        cu_seqlens = cu_host
+        cu_seqlens = _PackedBounds(cu_tensor.to(device), cu_host)
         block_kwargs = {
             "t_emb": t_emb,
             "combined_indices": combined_indices,
@@ -763,7 +748,6 @@ class MiniMaxH3DiT(nn.Module):
             "rope_sin": rope_sin,
             "cu_seqlens": cu_seqlens,
             "max_seqlen": max_seqlen,
-            "valid_seqlen": seq_len,
             "use_ulysses": False,
         }
         hidden = decoder_input

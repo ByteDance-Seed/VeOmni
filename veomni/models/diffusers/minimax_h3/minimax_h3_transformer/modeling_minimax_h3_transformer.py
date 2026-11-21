@@ -47,7 +47,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
     _checkpoint_conversion_mapping = {"^": "dit."}
 
     def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
-        # Attention validates and binds its backend on the first forward.
+        # Each attention layer validates and binds its backend during construction.
         return attn_implementation
 
     def __init__(self, config: MiniMaxH3DiTModelConfig, **kwargs):
@@ -131,7 +131,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         refiner_packed_seq_params=None,
     ):
         """Run the audio-free MiniMax-H3-Image packed sequence."""
-        self._load_packed_attention_kernel()
         return self.dit.forward_image(
             x=x,
             prompt_embeds=prompt_embeds,

@@ -31,7 +31,6 @@ from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RT
 from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import (
     MiniMaxH3Attention,
     VeomniRMSNorm,
-    _h3_attention_impl,
     _PackedBounds,
 )
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
@@ -40,6 +39,7 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_
 
 
 _VEOMNI_RMS_NORM_FORWARD = VeomniRMSNorm.forward
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _torch_rms_norm_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -60,14 +60,50 @@ def _build_norm(size: int = 16):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_minimax_h3_attention_defaults_to_sdpa_only_when_selection_is_omitted(available_nvidia_ops):
+@pytest.mark.parametrize(
+    ("selection", "expected"),
+    [
+        ({}, "veomni_flash_attention_2"),
+        ({"attn_implementation": None}, "veomni_flash_attention_2"),
+        ({"attn_implementation": "eager"}, "eager"),
+        ({"attn_implementation": "sdpa"}, "veomni_sdpa"),
+        ({"attn_implementation": "flash_attention_2"}, "veomni_flash_attention_2"),
+        ({"attn_implementation": "flash_attention_3_hub"}, "veomni_flash_attention_3_hub"),
+    ],
+    ids=["omitted", "none", "eager", "sdpa", "local-fa2", "hub-fa3"],
+)
+def test_minimax_h3_attention_binds_owning_config(available_nvidia_ops, selection, expected):
     cfg = _tiny_config()
+    cfg._set_ops_implementation(eager_ops_config())
     cfg.ops_implementation.pop("attn_implementation", None)
-    assert _h3_attention_impl(cfg) == "sdpa"
-    assert _h3_attention_impl(None) == "sdpa"
+    cfg._set_ops_implementation(selection)
+    model = MiniMaxH3DiTModel(cfg)
+    handles = [module.veomni_attn for module in model.modules() if isinstance(module, MiniMaxH3Attention)]
+    assert cfg.ops_config.attn_implementation == expected
+    assert handles and {handle.impl for handle in handles} == {expected}
 
-    cfg.ops_implementation["attn_implementation"] = "flash_attention_2"
-    assert _h3_attention_impl(cfg) == "veomni_flash_attention_2"
+
+@pytest.mark.parametrize("implementation", ["flash_attention_2", "flash_attention_3"])
+@pytest.mark.parametrize("builder", [False, True], ids=["from-config", "foundation-builder"])
+def test_minimax_h3_attention_preserves_explicit_load_override(available_nvidia_ops, implementation, builder):
+    from veomni.models.auto import build_foundation_model
+
+    config = _tiny_config()
+    ops = eager_ops_config()
+    if builder:
+        model = build_foundation_model(
+            config,
+            init_device="cpu",
+            torch_dtype="float32",
+            ops_implementation=ops,
+            attn_implementation=implementation,
+        )
+    else:
+        config._set_ops_implementation(ops)
+        model = MiniMaxH3DiTModel._from_config(config, attn_implementation=implementation)
+    assert model.config.ops_config.attn_implementation == implementation
+    handles = [module.veomni_attn for module in model.modules() if isinstance(module, MiniMaxH3Attention)]
+    assert handles and {handle.impl for handle in handles} == {implementation}
 
 
 def _build_model():
@@ -125,7 +161,7 @@ def test_minimax_h3_public_forward_matches_token_reference(monkeypatch, cond_row
     torch.manual_seed(1)
     reference = _build_model()
     ours = _build_model()
-    assert ours.dit.blocks[0].attn.veomni_attn.impl == "sdpa"
+    assert ours.dit.blocks[0].attn.veomni_attn.impl == "veomni_sdpa"
     ours.load_state_dict(reference.state_dict())
     inputs = _minimax_h3_inputs(cond_rows)
     ours_inputs = {
@@ -222,7 +258,7 @@ def _record_handle(attn):
 def test_minimax_h3_sdpa_reference_runs_one_dense_call_per_segment():
     """The SDPA row gets per-segment dense calls: no varlen kwargs and no S x S block-diagonal mask."""
     attn = _tiny_attention()
-    assert attn.veomni_attn.impl == "sdpa"
+    assert attn.veomni_attn.impl == "veomni_sdpa"
     calls = _record_handle(attn)
     bounds = _PackedBounds(torch.tensor([0, 2, 6], dtype=torch.int32), (0, 2, 6))
     attn(torch.randn(6, 16), rope_cos=None, rope_sin=None, cu_seqlens=bounds, max_seqlen=4)

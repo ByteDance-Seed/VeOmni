@@ -92,13 +92,13 @@ containers and the token embedding/projecting `TextEncoder`, override HF's
 This avoids unsupported capability checks and kernel preloading on a container;
 components that execute attention retain their own backend validation. Keep
 this override on the owning class, not on the shared model base. MiniMax's
-custom packed-attention dispatcher also overrides the HF check: it validates
-and binds FlashAttention on the first forward through
-`_load_packed_attention_kernel`, preserving deferred loading even when HF
-reads a canonical flash selection during construction.
-Unsupported MiniMax flash selections, including FA4, fail before DiT execution
-for scalar, singleton-list, and packed inputs; serial execution does not fall
-back to SDPA while the config advertises another backend.
+custom attention layers also override the HF check: each layer validates the
+supported backend and binds its `attention/standard` handle during construction,
+directly from `config.ops_config.attn_implementation`. Single-sample, image,
+packed and Ulysses execution reuse those handles without deferred rebinding.
+Unsupported MiniMax flash selections, including FA4, fail during construction;
+serial execution does not fall back to SDPA while the config advertises another
+backend. Name normalization and defaults remain owned by `OpsImplementationConfig`.
 HF mask builders still read the canonical attention selection at
 forward time, so keep it consistent with the constructed attention handle.
 

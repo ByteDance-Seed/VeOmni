@@ -6,7 +6,6 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -27,6 +26,9 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_
 from veomni.ops import OP_REGISTRY
 from veomni.ops.kernels.attention.standard import flash as flash_backend
 from veomni.trainer.dit_trainer import DiTDataCollator
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def segmented_flash_forward(calls: list):
@@ -838,7 +840,7 @@ def test_legacy_attention_environment_variable_warns_and_is_ignored(monkeypatch)
     monkeypatch.setattr(h3_modeling.logger, "warning_once", warnings.append)
     model = attention_model("sdpa")
     assert len(warnings) == 1 and "model.ops_implementation.attn_implementation" in warnings[0]
-    assert {module.veomni_attn.impl for module in attention_modules(model)} == {"sdpa"}
+    assert {module.veomni_attn.impl for module in attention_modules(model)} == {"veomni_sdpa"}
 
 
 def test_sample_isolation_boundaries_and_zero_valid_rows():
@@ -1028,10 +1030,12 @@ def test_sequence_parallel_padding_remains_forward_local(monkeypatch, task):
         model(**batch([sample, sample]))
 
 
-def _check_sequence_parallel_gradients(rank, init_method, cases):
-    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2, timeout=timedelta(seconds=60))
+def _check_sequence_parallel_gradients(rank, cases, rendezvous):
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+
+    dist.init_process_group("gloo", store=rendezvous.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=60))
     try:
-        minimax_h3_dit.get_ulysses_sequence_parallel_group = lambda: dist.group.WORLD
+        _init_parallel_state(dp_size=1, ulysses_size=2, device_type="cpu")
         for case, heads, state, sample, expected_loss, expected_grads in cases:
             model = tiny_model(heads)
             model.load_state_dict(state)
@@ -1045,11 +1049,14 @@ def _check_sequence_parallel_gradients(rank, init_method, cases):
                 torch.testing.assert_close(grad / 2, expected_grads[name], rtol=2e-4, atol=2e-5, msg=f"{case} {name}")
     finally:
         dist.destroy_process_group()
+        clear_parallel_state()
 
 
 @pytest.mark.launch_plan(provider=_CI_CPU_2)
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo required")
-def test_sequence_parallel_gradients_match_single_rank_after_sp_average(tmp_path):
+def test_sequence_parallel_gradients_match_single_rank_after_sp_average():
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
     cases = []
     # Two heads leave one head block per SP rank; four heads exercise the pipelined multi-block exchange.
     for task, heads in (("fl2va", 2), ("ref2va", 2), ("fl2va", 4)):
@@ -1060,9 +1067,7 @@ def test_sequence_parallel_gradients_match_single_rank_after_sp_average(tmp_path
         loss.backward()
         grads = {name: param.grad.clone() for name, param in model.named_parameters()}
         cases.append((f"{task} heads={heads}", heads, model.state_dict(), sample, loss.detach(), grads))
-    mp.spawn(
-        _check_sequence_parallel_gradients, args=((tmp_path / "rendezvous").as_uri(), cases), nprocs=_CI_CPU_2.nproc
-    )
+    spawn_with_rendezvous(_check_sequence_parallel_gradients, args=(cases,), nprocs=_CI_CPU_2.nproc)
 
 
 @pytest.mark.parametrize(
@@ -1106,7 +1111,7 @@ def test_flash_backend_drives_single_sample_refiner_and_packed_attention(
     for name, param in model.named_parameters():
         torch.testing.assert_close(param.grad, grads[name].grad, msg=name)
     # Building and running the flash model leaves the reference instance on its own row.
-    assert {module.veomni_attn.impl for module in attention_modules(reference)} == {"sdpa"}
+    assert {module.veomni_attn.impl for module in attention_modules(reference)} == {"veomni_sdpa"}
 
 
 @pytest.mark.parametrize("mode", ["single", "packed"])

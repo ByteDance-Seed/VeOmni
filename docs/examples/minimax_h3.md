@@ -319,22 +319,25 @@ backend.
 token-refiner attention layer when the model is built, as an instance-local
 `attention/standard` `VeomniOp`. The same handle serves single-sample (`M=1`),
 multi-sample packed and Ulysses forwards; there is no H3-specific kernel loader.
-The installed ops selection is the only source: `config._attn_implementation`
-is not read, so a model constructed directly without an ops selection uses the
-SDPA reference.
+Each layer reads `config.ops_config.attn_implementation` directly, including the
+framework default when the field is omitted. It does not inspect the sparse
+`config.ops_implementation` dictionary to substitute a model-private default.
+Choose `eager` or `sdpa` explicitly for a portable CPU reference; the example
+recipe selects `sdpa`.
 
 - `eager` / `sdpa` / `veomni_sdpa`: plain PyTorch SDPA, one dense call per segment.
-  H3 has no module-local eager attention, and these calls carry no mask, so all
-  three select the stock `sdpa` row rather than `veomni_sdpa`'s masked-SDPA
-  backend pin. No `S x S` block-diagonal mask is built.
+  The configured row is preserved: H3 has no module-local eager attention, so
+  the shared op supplies the SDPA reference for `eager`. No `S x S` block-diagonal
+  mask is built.
 - `flash_attention_2` / `flash_attention_3` and `flash_attention_2_hub` /
   `flash_attention_3_hub`: VeOmni's FlashAttention adapter with the local or
   Hugging Face Hub kernel (`kernels-community/flash-attn2` / `flash-attn3`,
   version 1). Each layer makes one non-causal varlen call over all segments;
   refiner layers keep one call per sample when packing. Kernels need BF16/FP16.
 - Other names (including `flash_attention_4`, flex, sage and magi) raise at model
-  build. An unavailable kernel or platform also fails at build instead of being
-  replaced with SDPA. FA3 and Hub rows are unavailable on Ascend NPU; the FA2 row
+  build. Static platform or dependency incompatibilities fail at build; kernel
+  loading and execution failures propagate at the first relevant use without
+  replacing the requested row with SDPA. FA3 and Hub rows are unavailable on Ascend NPU; the FA2 row
   maps to Transformers' NPU varlen integration, which copies `cu_seqlens` to the
   host on every call.
 
@@ -353,7 +356,9 @@ warning is logged when it is set. Use `model.ops_implementation` instead.
 check packed-versus-serial outputs, losses and gradients (including mixed target
 geometry and checkpoint recomputation), sample isolation, Ref2VA variable
 references, forward-local SP padding and fail-closed inputs. SP collectives are
-mocked there, so it does not establish distributed SP parity. For the FlashAttention
+mocked in the layout-only cases; a separate two-rank CPU/Gloo case checks loss
+and averaged parameter-gradient parity for FL2VA and Ref2VA, including the
+multi-head-block exchange. This does not establish accelerator SP parity. For the FlashAttention
 names, only the kernel below VeOmni's adapter is replaced by a segmented SDPA
 oracle; single-sample, refiner and packed calls are checked against the SDPA
 reference. Kernel correctness itself is covered by the GPU tests in
