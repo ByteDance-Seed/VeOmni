@@ -39,6 +39,7 @@ checkpoint then works without an offline convert:
 from __future__ import annotations
 
 import atexit
+import gc
 import json
 import os
 import shutil
@@ -47,6 +48,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
+from inspect import Parameter, signature
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
@@ -77,6 +79,7 @@ if TYPE_CHECKING:
 logger = helper.create_logger(__name__)
 
 OMNI_HF_LAYOUT_REGISTRY = Registry("OmniHFLayout")
+OMNI_HF_LAYOUT_DETECTORS = Registry("OmniHFLayoutDetector")
 
 HF_SOURCE_FILE = "hf_source.json"
 """Sidecar in a weight-free view root naming the HF checkpoint its weights come from."""
@@ -85,6 +88,8 @@ _SAFE_WEIGHTS_NAME = "model.safetensors"
 # Per-rank files ``HuggingFaceStorageWriter`` stages before consolidating into the save root.
 _DCP_STAGING_DIRNAME = "sharded"
 _SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
+_PICKLE_WEIGHTS_NAME = "pytorch_model.bin"
+_PICKLE_WEIGHTS_INDEX_NAME = "pytorch_model.bin.index.json"
 _WEIGHT_FILE_SUFFIXES = (
     ".safetensors",
     ".bin",
@@ -100,6 +105,116 @@ _WEIGHT_FILE_SUFFIXES = (
 _WEIGHT_INDEX_SUFFIXES = (".safetensors.index.json", ".bin.index.json", ".h5.index.json", ".msgpack.index.json")
 
 
+def _accepts_source_path(build_config: Callable[..., Any]) -> bool:
+    """Whether a family's ``build_config`` takes the checkpoint directory.
+
+    A family declares ``build_config(hf_config, source_path)`` when its module
+    configs depend on what the checkpoint stores — Janus resolves its tie flags
+    against the weight files. Everything else keeps the one-argument form.
+    """
+    try:
+        params = list(signature(build_config).parameters.values())
+    except (TypeError, ValueError):  # builtins / C callables: assume the plain form
+        return False
+    positional = [p for p in params if p.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)]
+    return len(positional) >= 2 or any(p.kind is Parameter.VAR_POSITIONAL for p in params)
+
+
+def read_source_weight_files(source_path: str) -> dict[str, str]:
+    """``{weight key: shard filename}`` of an HF checkpoint, either serialization.
+
+    Covers ``model.safetensors[.index.json]`` and the legacy
+    ``pytorch_model.bin[.index.json]``, because both are things
+    ``from_pretrained`` accepts — a family layout resolving a decision against
+    the stored tensors (Janus' tie flags) must not silently fall back to the
+    config just because the checkpoint uses the other format.
+
+    Raises ``FileNotFoundError`` when the directory holds no recognised weights.
+    """
+    # Match the actual weight loader: a single file takes precedence over an
+    # index in the same format. Otherwise a stale index can change tie decisions.
+    single = os.path.join(source_path, _SAFE_WEIGHTS_NAME)
+    if os.path.isfile(single):
+        from safetensors import safe_open
+
+        with safe_open(single, framework="pt", device="cpu") as f:
+            return dict.fromkeys(f.keys(), _SAFE_WEIGHTS_NAME)
+
+    index_path = os.path.join(source_path, _SAFE_WEIGHTS_INDEX_NAME)
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as f:
+            return dict(json.load(f)["weight_map"])
+
+    pickle_single = os.path.join(source_path, _PICKLE_WEIGHTS_NAME)
+    if os.path.isfile(pickle_single):
+        return dict.fromkeys(_pickle_state_dict_keys(pickle_single), _PICKLE_WEIGHTS_NAME)
+
+    pickle_index = os.path.join(source_path, _PICKLE_WEIGHTS_INDEX_NAME)
+    if os.path.isfile(pickle_index):
+        with open(pickle_index, encoding="utf-8") as f:
+            return dict(json.load(f)["weight_map"])
+
+    raise FileNotFoundError(
+        f"{source_path} has none of {_SAFE_WEIGHTS_INDEX_NAME} / {_SAFE_WEIGHTS_NAME} / "
+        f"{_PICKLE_WEIGHTS_INDEX_NAME} / {_PICKLE_WEIGHTS_NAME}."
+    )
+
+
+def _pickle_state_dict_keys(path: str) -> list[str]:
+    """Top-level keys of a ``pytorch_model.bin`` state dict, without materialising it.
+
+    ``torch.load`` is the only reader that matches what the loader itself will
+    do, and the weights are read once here rather than twice: a 1.3B checkpoint
+    is a couple of GiB, so mapping it and dropping it is cheaper than keeping a
+    second copy alive next to the load.
+    """
+    state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    try:
+        return list(state.keys())
+    finally:
+        del state
+        gc.collect()
+
+
+def read_source_tensors(
+    source_path: str, weight_files: Mapping[str, str], keys: tuple[str, ...] | list[str]
+) -> dict[str, torch.Tensor]:
+    """Read ``keys`` out of an HF checkpoint, safetensors or pickle.
+
+    ``weight_files`` is :func:`read_source_weight_files`' mapping, so the shard
+    each key lives in is already known and each file is opened once per format.
+    The pickle path loads whole shards (there is no random access), then keeps
+    only the requested keys.
+    """
+    wanted = set(keys)
+    tensors: dict[str, torch.Tensor] = {}
+
+    safe_files = {name for key, name in weight_files.items() if key in wanted and name.endswith(".safetensors")}
+    if safe_files:
+        from safetensors import safe_open
+
+        for filename in sorted(safe_files):
+            with safe_open(os.path.join(source_path, filename), framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if key in wanted:
+                        tensors[key] = f.get_tensor(key)
+
+    pickle_files = {name for key, name in weight_files.items() if key in wanted and name.endswith(".bin")}
+    for filename in sorted(pickle_files):
+        state = torch.load(os.path.join(source_path, filename), map_location="cpu", weights_only=True, mmap=True)
+        try:
+            for key in state.keys() & wanted:
+                tensors[key] = state[key]
+        finally:
+            del state
+            gc.collect()
+
+    missing = wanted - tensors.keys()
+    if missing:
+        raise ValueError(f"{source_path} does not store {sorted(missing)}.")
+    return tensors
+
+
 @dataclass(frozen=True)
 class OmniHFModuleLayout:
     """How one module is cut out of the upstream checkpoint.
@@ -111,15 +226,28 @@ class OmniHFModuleLayout:
     ``"model.embed_tokens."``.
 
     ``build_config`` turns the upstream HF config into this module's
-    :class:`OmniModuleConfig`. ``build_assets`` (optional) loads the module's
-    HF assets from the checkpoint directory, keyed like
+    :class:`OmniModuleConfig`. It receives the checkpoint directory as a second
+    argument when it declares one, so a family whose config depends on what the
+    checkpoint actually stores (Janus' tie flags, which upstream resolves
+    against the weight files) can say so. ``build_assets`` (optional) loads the
+    module's HF assets from the checkpoint directory, keyed like
     :func:`~veomni.models.seed_omni.utils.convert_registry.attach_module_assets`
     (``tokenizer`` / ``processor`` / ``image_processor`` / ``video_processor``).
     """
 
     key_prefixes: tuple[tuple[str, str], ...]
-    build_config: Callable[[PretrainedConfig], OmniModuleConfig]
+    build_config: Callable[..., OmniModuleConfig]
     build_assets: Callable[[str], dict[str, Any]] | None = None
+
+    def config_for(self, hf_config: PretrainedConfig, source_path: str | None = None) -> OmniModuleConfig:
+        """Call ``build_config`` with ``source_path`` only when it asks for it.
+
+        Most families map the upstream config field by field and never look at
+        the checkpoint; those keep the one-argument signature.
+        """
+        if _accepts_source_path(self.build_config):
+            return self.build_config(hf_config, source_path)
+        return self.build_config(hf_config)
 
 
 @dataclass(frozen=True)
@@ -188,7 +316,7 @@ class OmniHFLayout:
 
     def build_module_configs(self, source_path: str) -> dict[str, OmniModuleConfig]:
         hf_config = self.read_hf_config(source_path)
-        return {name: module.build_config(hf_config) for name, module in self.modules.items()}
+        return {name: module.config_for(hf_config, source_path) for name, module in self.modules.items()}
 
     def build_module_assets(self, source_path: str) -> dict[str, dict[str, Any]]:
         return {
@@ -223,17 +351,19 @@ class OmniHFLayout:
 
     def source_weight_files(self, source_path: str) -> dict[str, str]:
         """``{weight key: shard filename}`` of a safetensors HF checkpoint."""
-        index_path = os.path.join(source_path, _SAFE_WEIGHTS_INDEX_NAME)
-        if os.path.isfile(index_path):
-            with open(index_path, encoding="utf-8") as f:
-                return dict(json.load(f)["weight_map"])
-        single = os.path.join(source_path, _SAFE_WEIGHTS_NAME)
-        if os.path.isfile(single):
-            from safetensors import safe_open
+        return read_source_weight_files(source_path)
 
-            with safe_open(single, framework="pt", device="cpu") as f:
-                return dict.fromkeys(f.keys(), _SAFE_WEIGHTS_NAME)
-        raise FileNotFoundError(f"{source_path} has neither {_SAFE_WEIGHTS_INDEX_NAME} nor {_SAFE_WEIGHTS_NAME}.")
+    def validate_module_state(self, source_path: str, name: str, model: torch.nn.Module) -> None:
+        """Validate a module against source weights before parallel wrapping.
+
+        The default is a no-op. A family layout may override this for source
+        formats whose key/shape contract cannot be expressed by prefixes alone.
+        Called after module construction and before source weights are loaded.
+        """
+
+    def resolve_source_path(self, source_path: str) -> str:
+        """Return the canonical source root used for configs, assets, and exports."""
+        return source_path
 
     def resolve_weights_path(self, source_path: str) -> str:
         """Directory :func:`load_model_weights` reads safetensors from for ``source_path``."""
@@ -284,6 +414,11 @@ class HFSource:
     path: str
     model_type: str
 
+    @classmethod
+    def from_path(cls, path: str, model_type: str) -> HFSource:
+        layout = get_hf_layout(model_type)
+        return cls(path=os.path.realpath(layout.resolve_source_path(path)), model_type=model_type)
+
     @property
     def layout(self) -> OmniHFLayout:
         return get_hf_layout(self.model_type)
@@ -319,10 +454,20 @@ def read_hf_source(checkpoint_root: str | os.PathLike | None) -> HFSource | None
 
 def _read_root_model_type(path: str) -> str | None:
     config_path = os.path.join(path, "config.json")
-    if not os.path.isfile(config_path):
-        return None
-    with open(config_path, encoding="utf-8") as f:
-        return json.load(f).get("model_type")
+    model_type = None
+    if os.path.isfile(config_path):
+        with open(config_path, encoding="utf-8") as f:
+            model_type = json.load(f).get("model_type")
+    if model_type in (None, "qwen3_vl_text"):
+        # Families with multi-directory releases register a detector next to
+        # their layout. The generic layer must not import one concrete family.
+        import veomni.models.seed_omni.modules  # noqa: F401
+
+        for name in OMNI_HF_LAYOUT_DETECTORS.valid_keys():
+            detected = OMNI_HF_LAYOUT_DETECTORS[name](path)
+            if detected is not None:
+                return detected
+    return model_type
 
 
 _VIEW_CACHE: dict[str, str] = {}
@@ -331,9 +476,9 @@ _VIEW_CACHE: dict[str, str] = {}
 def resolve_omni_checkpoint_root(path: str | os.PathLike | None) -> str | os.PathLike | None:
     """Return ``path`` itself for a split checkpoint, or a weight-free view of an HF one.
 
-    Detection is by the root ``config.json``'s ``model_type``: ``omni`` (or no
-    ``config.json``) is a split checkpoint and passes through; a type with a
-    registered :class:`OmniHFLayout` gets a view; any other type is an error,
+    Detection is by the root ``config.json``'s ``model_type`` (or a recognized
+    component tree): ``omni`` and unrecognized config-less paths pass through;
+    a type with a registered :class:`OmniHFLayout` gets a view; any other type is an error,
     since reading it as an omni root would only fail later and more obscurely.
     The view is built once per process and source.
     """
@@ -350,11 +495,11 @@ def resolve_omni_checkpoint_root(path: str | os.PathLike | None) -> str | os.Pat
             f"for `{model_type}`. Convert it with scripts/seed_omni/convert_model.py, or register an "
             "OmniHFLayout for the family."
         )
-    key = os.path.realpath(path)
-    view = _VIEW_CACHE.get(key)
+    source = HFSource.from_path(str(path), model_type)
+    view = _VIEW_CACHE.get(source.path)
     if view is None or not os.path.isfile(os.path.join(view, HF_SOURCE_FILE)):
-        view = _write_hf_view(HFSource(path=key, model_type=model_type))
-        _VIEW_CACHE[key] = view
+        view = _write_hf_view(source)
+        _VIEW_CACHE[source.path] = view
     return view
 
 
@@ -477,6 +622,7 @@ def attach_hf_source_converter(model: torch.nn.Module, source: HFSource, module_
             f"Module {module_name!r} is not part of the `{source.model_type}` HF layout "
             f"(modules: {sorted(layout.modules)}). Under an HF model_path every module must come from the layout."
         )
+    layout.validate_module_state(source.path, module_name, model)
     inner_factory = getattr(type(model), "_create_checkpoint_tensor_converter", None)
     # Read off the bare module now: the factory may later be handed a LoRA
     # wrapper, whose names carry a ``base_model.model.`` prefix.
@@ -611,11 +757,11 @@ def convert_with_hf_layout(
     from .convert_registry import attach_module_assets
 
     model_type = _read_root_model_type(model_path)
-    source = HFSource(path=os.path.realpath(model_path), model_type=model_type)
+    source = HFSource.from_path(model_path, model_type)
     layout = source.layout
     hf_config = layout.read_hf_config(source.path)
     default_dtype = getattr(hf_config, "dtype", None) or getattr(hf_config, "torch_dtype", None)
-    module_configs = {name: module.build_config(hf_config) for name, module in layout.modules.items()}
+    module_configs = {name: module.config_for(hf_config, source.path) for name, module in layout.modules.items()}
     assets = layout.build_module_assets(source.path)
     modules = {}
     for name, module_config in module_configs.items():
@@ -838,6 +984,7 @@ __all__ = [
     "copy_source_non_weight_files",
     "get_hf_layout",
     "has_hf_layout",
+    "OMNI_HF_LAYOUT_DETECTORS",
     "load_module_from_hf_source",
     "read_hf_source",
     "resolve_omni_checkpoint_root",

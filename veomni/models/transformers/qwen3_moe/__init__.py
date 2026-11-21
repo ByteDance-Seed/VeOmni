@@ -16,7 +16,6 @@
 
 from veomni.lora.target_mapping import convert_fused_moe_lora_targets
 from veomni.models.registry import MODELING_REGISTRY
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 def _convert_qwen3_moe_wrapped_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
@@ -52,23 +51,13 @@ def register_qwen3_moe_modeling(architecture: str):
         convert_qwen3_moe_fqn_to_index_mapping,
         create_qwen3_moe_checkpoint_tensor_converter,
     )
-
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_qwen3_moe_npu import (
-            Qwen3MoeForCausalLM,
-            Qwen3MoeForQuestionAnswering,
-            Qwen3MoeForSequenceClassification,
-            Qwen3MoeForTokenClassification,
-            Qwen3MoeModel,
-        )
-    else:
-        from .generated.patched_modeling_qwen3_moe_gpu import (
-            Qwen3MoeForCausalLM,
-            Qwen3MoeForQuestionAnswering,
-            Qwen3MoeForSequenceClassification,
-            Qwen3MoeForTokenClassification,
-            Qwen3MoeModel,
-        )
+    from .modeling_qwen3_moe import (
+        Qwen3MoeForCausalLM,
+        Qwen3MoeForQuestionAnswering,
+        Qwen3MoeForSequenceClassification,
+        Qwen3MoeForTokenClassification,
+        Qwen3MoeModel,
+    )
 
     for model_cls in (
         Qwen3MoeForCausalLM,

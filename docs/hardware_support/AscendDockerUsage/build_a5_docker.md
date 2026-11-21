@@ -1,11 +1,11 @@
-# Ascend A5 Docker Image Build and Usage Guide
+# Ascend 950PR&950DT products Docker Image Build and Usage Guide
 
 ## Overview
-This guide provides step-by-step instructions for building and using the Ascend A5 Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Ascend A5 accelerators.
+This guide provides step-by-step instructions for building and using the Ascend 950PR&950DT products Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Ascend 950PR&950DT products accelerators.
 
 ## Prerequisites
 - Docker installed on your system
-- Access to Ascend A5 hardware accelerators
+- Access to Ascend 950PR&950DT products hardware accelerators
 - Network access to pull the base image and install dependencies
 - Proxy configuration (if required in your environment)
 
@@ -19,7 +19,7 @@ docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.2
 ```
 
 ## Step 2: Build the Custom Image
-Build the GDN-ready VeOmni Ascend A5 image using the provided Dockerfile. It includes `torch-npu==2.10.0.post7`, `triton-ascend`, and `fla_npu`. This ARM64 image uses pip and system Python; no virtual environment activation is required.
+Build the GDN-ready VeOmni Ascend 950PR&950DT products image using the provided Dockerfile. It includes `torch-npu==2.10.0.post7`, `triton-ascend`, and `fla_npu`. This ARM64 image uses pip and system Python; no virtual environment activation is required.
 
 **Note:** Proxy settings are optional and only needed if your server requires proxy access to the internet. Remove the proxy arguments if not needed.
 
@@ -51,7 +51,7 @@ The built image includes:
 - VeOmni framework with NPU support
 - PyTorch 2.10.0 and torch-npu 2.10.0.post7
 - Triton 3.6.0 and Triton Ascend 3.6.0 (base installed before the Ascend overlay)
-- A5 FLA wheel built with `FLA_NPU_SOC=ascend950` from revision `a7c608f2e3f828779ceeec1fcf155a6e37ede83c`
+- Ascend 950PR&950DT products FLA wheel built with `FLA_NPU_SOC=ascend950` from revision `a7c608f2e3f828779ceeec1fcf155a6e37ede83c`
 - Transformers 5.16.1; PyArrow 21.0.0; pandas 2.3.2
 - TorchCodec built from v0.10.0; uv 0.11.16 available for separate CI environments
 - TorchCodec for efficient video processing
@@ -63,8 +63,8 @@ The built image includes:
 
 Use the image name from Step 2, `ascend-a5-env:v1`. The container instance is
 named `ascend-a5-container`, matching the cleanup command in Step 5.
-The following configuration uses paths present on the A5 host.
-The runtime options follow the working A5 experiment command; private data
+The following configuration uses paths present on the Ascend 950PR&950DT products host.
+The runtime options follow the working Ascend 950PR&950DT products experiment command; private data
 and cache mounts are omitted.
 
 ```bash
@@ -90,7 +90,7 @@ docker run --runtime=runc -it --net=host --ipc=host \
   ascend-a5-env:v1 /bin/bash
 ```
 
-A5 uses `/dev/ummu` and `/dev/uburma` on this host; `/dev/devmm_svm` is absent.
+Ascend 950PR&950DT products uses `/dev/ummu` and `/dev/uburma` on this host; `/dev/devmm_svm` is absent.
 The URMA provider directory and libraries accompany these devices. Mount stable
 library names rather than copying versioned filenames from another machine:
 `libummu.so.1` currently resolves to `libummu.so.1.0.4` on this host.
@@ -200,7 +200,7 @@ docker run --runtime=runc -it --net=host --ipc=host \
 ```
 
 The basic and advanced commands are alternatives; do not create both using the
-same container name. The device and library paths follow the A5 host setup used by the experiment.
+same container name. The device and library paths follow the Ascend 950PR&950DT products host setup used by the experiment.
 
 ## Step 4: Run Training Inside the Container
 
@@ -210,7 +210,7 @@ Initialize CANN before running Python or training:
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ```
 
-The commands below are usage examples, not evidence of a full A5 UT pass.
+The commands below are usage examples, not evidence of a full Ascend 950PR&950DT products UT pass.
 
 ### General Qwen3-VL Smoke Test
 
