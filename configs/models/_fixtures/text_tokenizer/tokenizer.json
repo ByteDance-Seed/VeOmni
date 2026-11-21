@@ -1,0 +1,108 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "[PAD]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 1,
+      "content": "[UNK]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 2,
+      "content": "[EOS]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Whitespace"
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      }
+    ],
+    "pair": [
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "B",
+          "type_id": 1
+        }
+      }
+    ],
+    "special_tokens": {}
+  },
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "[PAD]": 0,
+      "[UNK]": 1,
+      "[EOS]": 2,
+      "a": 3,
+      "the": 4,
+      "of": 5,
+      "to": 6,
+      "and": 7,
+      "is": 8,
+      "in": 9,
+      "for": 10,
+      "this": 11,
+      "you": 12,
+      "can": 13,
+      "your": 14,
+      "me": 15,
+      "What": 16,
+      "I": 17,
+      "it": 18,
+      "as": 19,
+      "that": 20,
+      "on": 21,
+      "or": 22,
+      "are": 23,
+      "how": 24,
+      "The": 25,
+      "with": 26,
+      "please": 27,
+      "write": 28,
+      "when": 29,
+      "what": 30,
+      "was": 31,
+      "one": 32,
+      "at": 33,
+      "tell": 34,
+      "answer": 35,
+      "from": 36
+    },
+    "unk_token": "[UNK]"
+  }
+}

@@ -1,5 +1,5 @@
 # Qwen3-Omni-30B-A3B-Instruct on 8 × H20.
-# bash train.sh tasks/train_vlm.py configs/models/qwen3_omni_moe/cuda.yaml
+# NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py configs/models/qwen3_omni_moe/cuda.yaml
 model:
   model_path: ./Qwen3-Omni-30B-A3B-Instruct
   ops_implementation:

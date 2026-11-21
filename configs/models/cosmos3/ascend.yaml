@@ -1,0 +1,74 @@
+# Cosmos3-Nano on 8 × 910B2.
+# NPROC_PER_NODE=8 bash train.sh tasks/omni/train_omni.py configs/models/cosmos3/ascend.yaml
+model:
+  model_path: ./Cosmos3-Nano
+  model_config:
+    modules: configs/seed_omni/Cosmos3/cosmos3_nano/train/modules_train.yaml
+    train_graph: configs/seed_omni/Cosmos3/cosmos3_nano/train/graph_online.yaml
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    gated_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    load_balancing_loss_implementation: eager
+    moe_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 0.0001
+    lr_min: 0.0
+    lr_warmup_ratio: 0.1
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.0
+    max_grad_norm: 0.1
+    grad_clip_scope: global
+    betas:
+    - 0.9
+    - 0.95
+  accelerator:
+    init_device: meta
+    ulysses_size: 1
+    gradient_checkpointing:
+      enable: true
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      mixed_precision:
+        enable: false
+        param_dtype: bfloat16
+        reduce_dtype: bfloat16
+    offload_config:
+      enable_activation: false
+      enable_async_activation: false
+data:
+  train_path: ./data/cosmos.jsonl
+  datasets_type: mapping
+  data_type: seedomni
+  source_name: cosmos3_sft_jsonl
+  max_seq_len: 45056
+  dyn_bsz_buffer_size: 1
+  dataloader:
+    num_workers: 0
+  mm_configs:
+    data_dir: dataset/cosmos3-demo
+    fps: null
+    cfg_dropout_rate: 0.1
+    cfg_dropout_seed: 42
+train:
+  training_task: online_training
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: true
+  bsz_warmup_ratio: 0.0
+  max_steps: 3
+  num_train_epochs: 1
+  seed: 42
+  checkpoint:
+    output_dir: outputs/cosmos3/ascend
+    manager: dcp
+    save_steps: 3
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+  profile:
+    enable: false

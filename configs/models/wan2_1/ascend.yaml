@@ -1,0 +1,73 @@
+# Wan2.1-T2V-1.3B-Diffusers on 8 × 910B2.
+# NPROC_PER_NODE=8 bash train.sh tasks/train_dit.py configs/models/wan2_1/ascend.yaml
+model:
+  model_path: ./Wan2.1-T2V-1.3B-Diffusers/transformer
+  condition_model_path: ./Wan2.1-T2V-1.3B-Diffusers
+  config_path: ./Wan2.1-T2V-1.3B-Diffusers/transformer/config.json
+  ops_implementation:
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    gated_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    load_balancing_loss_implementation: eager
+    moe_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 0.0001
+    lr_warmup_ratio: 0.007
+    lr_decay_style: constant
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+      debug: false
+    init_device: meta
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      forward_prefetch: true
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: bfloat16
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+      enable_async_activation: false
+data:
+  train_path: ./data/video.parquet
+  source_name: Tom-and-Jerry-VideoGeneration-Dataset
+  mm_configs:
+    max_frames: 9
+    fps: 1
+    frame_factor: 4
+    frame_factor_remainder: 1
+    video_max_pixels: 65536
+    scale_factor: 32
+  datasets_type: mapping
+  data_type: diffusion
+  data_transform: dit_online
+  dataloader:
+    num_workers: 0
+  text_keys: prompt
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  bsz_warmup_ratio: 0.007
+  dyn_bsz: false
+  num_train_epochs: 1
+  training_task: online_training
+  checkpoint:
+    output_dir: outputs/wan2_1/ascend
+    manager: dcp
+    save_steps: 3
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+  max_steps: 3
+  profile:
+    enable: false

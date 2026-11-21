@@ -1,0 +1,52 @@
+# gpt-oss-20b-BF16 on 8 × 910B2.
+# NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/gpt_oss/ascend.yaml
+model:
+  model_path: ./gpt-oss-20b-BF16
+  chat_template: chatml
+  ops_implementation:
+    attn_implementation: eager
+    moe_implementation: eager
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    gated_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    load_balancing_loss_implementation: eager
+  accelerator:
+    init_device: meta
+    fsdp_config:
+      fsdp_mode: fsdp2
+  optimizer:
+    type: adamw
+    lr: 0.0001
+  lora_config:
+    rank: 8
+    alpha: 16
+    lora_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+data:
+  train_path: ./data/text.parquet
+  data_type: plaintext
+  text_keys: text
+  max_seq_len: 512
+  datasets_type: mapping
+  dataloader:
+    num_workers: 0
+train:
+  dyn_bsz: false
+  global_batch_size: 8
+  micro_batch_size: 1
+  num_train_epochs: 1
+  checkpoint:
+    output_dir: outputs/gpt_oss/ascend
+    manager: dcp
+    save_steps: 3
+    save_epochs: 0
+    save_hf_weights: false
+  max_steps: 3
+  wandb:
+    enable: false
+  profile:
+    enable: false

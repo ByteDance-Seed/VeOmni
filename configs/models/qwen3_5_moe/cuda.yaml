@@ -1,5 +1,5 @@
 # Qwen3.5-35B-A3B on 8 × H20.
-# bash train.sh tasks/train_vlm.py configs/models/qwen3_5_moe/cuda.yaml
+# NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py configs/models/qwen3_5_moe/cuda.yaml
 model:
   model_path: ./Qwen3.5-35B-A3B
   ops_implementation:

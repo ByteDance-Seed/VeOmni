@@ -1,5 +1,5 @@
 # Llama-3.3-70B-Instruct on 8 × 910B2.
-# bash train.sh tasks/train_text.py configs/models/llama3_3/ascend.yaml
+# NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/llama3_3/ascend.yaml
 model:
   model_path: ./Llama-3.3-70B-Instruct
   optimizer:

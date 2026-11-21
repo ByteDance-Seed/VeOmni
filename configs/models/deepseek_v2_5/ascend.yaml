@@ -1,0 +1,45 @@
+# Reduced-model check for DeepSeek-V2.5 on 8 × 910B2.
+# MODELING_BACKEND=hf NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/deepseek_v2_5/ascend.yaml
+model:
+  chat_template: chatml
+  ops_implementation:
+    attn_implementation: eager
+    moe_implementation: eager
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    gated_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    load_balancing_loss_implementation: eager
+  accelerator:
+    init_device: meta
+    fsdp_config:
+      fsdp_mode: fsdp2
+  optimizer:
+    type: adamw
+    lr: 0.0001
+  config_path: configs/models/deepseek_v2_5/small
+  tokenizer_path: configs/models/_fixtures/text_tokenizer
+data:
+  train_path: ./data/text.parquet
+  data_type: plaintext
+  text_keys: text
+  max_seq_len: 128
+  datasets_type: mapping
+  dataloader:
+    num_workers: 0
+train:
+  dyn_bsz: false
+  global_batch_size: 8
+  micro_batch_size: 1
+  num_train_epochs: 1
+  checkpoint:
+    output_dir: outputs/deepseek_v2_5/ascend
+    manager: dcp
+    save_steps: 3
+    save_epochs: 0
+    save_hf_weights: false
+  max_steps: 3
+  wandb:
+    enable: false
+  profile:
+    enable: false
