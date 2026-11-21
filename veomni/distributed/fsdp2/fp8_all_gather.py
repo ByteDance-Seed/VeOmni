@@ -20,7 +20,7 @@ class _ExpertAllGather:
         self.shard_dim = shard_dim
 
     def pre(self, local, mesh, outer_size, outer_stride, module, mp_policy):
-        from ...ops.kernels.moe_experts.shared.deepgemm_fp8 import quantize_weights
+        from ...ops.kernels.moe_experts.shared.deepgemm import quantize_weights
 
         qdata, scale, _, _ = quantize_weights(local, store_transpose=False, round_bf16=True)
         gathered = scale.new_empty((mesh.size(), *scale.shape))

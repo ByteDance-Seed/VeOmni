@@ -19,7 +19,7 @@ from ..shared.activation import is_silu
 
 
 def _experts(x, counts, fc1, fc2, swiglu_limit, recompute_weights=(True, True)):
-    from ..shared.deepgemm_fp8 import GroupedLayout, GroupedLinear, RecomputedSwiGLU
+    from ..shared.deepgemm import GroupedLayout, GroupedLinear, RecomputedSwiGLU
 
     layout = GroupedLayout.from_counts(counts, x.device)
     projected = GroupedLinear.apply(x, fc1, layout, recompute_weights[0])

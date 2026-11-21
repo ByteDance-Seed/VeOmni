@@ -1197,4 +1197,4 @@ applies to BF16 and FP8 MoE backends and has no separate YAML switch. The fused
 implementation requires Triton and does not silently fall back if it is
 unavailable. It preserves promoted-dtype multiplication followed by FP32
 scatter accumulation; the EP dispatcher casts the combined result back to the
-original token dtype. See [FP8 MoE](deepgemm_fp8_moe.md#whole-expert-fsdp-sharding-and-ep-combine).
+original token dtype. See [FP8 MoE](deepgemm_moe.md#whole-expert-fsdp-sharding-and-ep-combine).

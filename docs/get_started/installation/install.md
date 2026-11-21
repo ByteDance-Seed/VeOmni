@@ -35,7 +35,7 @@ DeepGEMM wheels cover Python 3.11/3.12 on Linux x86_64/aarch64 and require
 glibc >=2.38 plus a compatible libstdc++ (Ubuntu 24.04 / NGC 25.11).
 FP8 MoE remains opt-in with `moe_implementation: deepgemm` and requires
 Hopper SM90 or Blackwell SM100. Runtime GEMM JIT still needs NVCC and a C++20
-compiler; see [FP8 MoE training](../../design/deepgemm_fp8_moe.md).
+compiler; see [FP8 MoE training](../../design/deepgemm_moe.md).
 
 ### Optional MagiAttention extra
 

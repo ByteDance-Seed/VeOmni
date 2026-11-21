@@ -119,7 +119,7 @@ host extension and DeepJIT/CUTLASS headers; runtime kernel JIT still needs
 NVCC and a C++20 compiler (validated with GCC 13). The backend is lazy-imported
 and selected explicitly with `moe_implementation: deepgemm`; installing
 the GPU extra does not enable FP8 or import DeepGEMM on unsupported GPUs.
-See `docs/design/deepgemm_fp8_moe.md` for supported shapes and precision.
+See `docs/design/deepgemm_moe.md` for supported shapes and precision.
 
 ## Attention Kernels
 

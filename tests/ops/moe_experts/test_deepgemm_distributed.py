@@ -14,7 +14,7 @@ from torch.distributed.tensor import DTensor
 
 from scripts.ci.accelerator.launch_plan import from_parameter, runner_device_count
 from tests.ops.moe_experts.reference import standard_ep_reference
-from tests.ops.moe_experts.test_deepgemm_fp8 import _relative_error
+from tests.ops.moe_experts.test_deepgemm import _relative_error
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 from veomni.ops import VeomniOp
 
@@ -103,7 +103,7 @@ def _worker(
             assert register_deepgemm_fp8_all_gather(module) == 2
         expected_weights = []
         if expert_weight_fp8_all_gather:
-            from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import quantize_weights
+            from veomni.ops.kernels.moe_experts.shared.deepgemm import quantize_weights
             from veomni.ops.kernels.moe_experts.shared.fp8_weight import FP8ExpertWeight
 
             def check_gathered_weights(mod, args):

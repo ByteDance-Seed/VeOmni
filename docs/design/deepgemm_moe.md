@@ -322,6 +322,6 @@ lazy-import checks remain available without the GPU dependency.
 
 - [Registry](../../veomni/ops/kernels/moe_experts/__init__.py)
 - [Standard expert wrapper](../../veomni/ops/kernels/moe_experts/standard/deepgemm.py)
-- [Quantizers and training autograd](../../veomni/ops/kernels/moe_experts/shared/deepgemm_fp8.py)
-- [Numerical tests](../../tests/ops/moe_experts/test_deepgemm_fp8.py)
-- [Distributed tests](../../tests/ops/moe_experts/test_deepgemm_fp8_distributed.py)
+- [Quantizers and training autograd](../../veomni/ops/kernels/moe_experts/shared/deepgemm.py)
+- [Numerical tests](../../tests/ops/moe_experts/test_deepgemm.py)
+- [Distributed tests](../../tests/ops/moe_experts/test_deepgemm_distributed.py)

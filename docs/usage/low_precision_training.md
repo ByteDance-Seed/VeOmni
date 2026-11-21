@@ -24,7 +24,7 @@ is never imported.
 quantized by these selections.
 
 See [op selection](../design/op_selection.md) for the full registry design and
-[FP8 MoE training](../design/deepgemm_fp8_moe.md) for DeepGEMM MoE internals.
+[FP8 MoE training](../design/deepgemm_moe.md) for DeepGEMM MoE internals.
 
 ---
 
@@ -152,7 +152,7 @@ For models with MoE experts and stored KV/indexer caches (such as DeepSeek-V4):
   `gated_mlp_implementation` (which cover attention and shared experts).
 
 See [`configs/text/deepseek_v4_qat.yaml`](../../configs/text/deepseek_v4_qat.yaml)
-for an all-QAT configuration and [FP8 MoE training](../design/deepgemm_fp8_moe.md)
+for an all-QAT configuration and [FP8 MoE training](../design/deepgemm_moe.md)
 for DeepGEMM requirements, `expert_fsdp_shard_dim`, and optional
 `expert_weight_fp8_all_gather`.
 

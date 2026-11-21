@@ -210,7 +210,7 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
     torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
 
 
-def test_deepseek_v4_experts_deepgemm_fp8_forward_backward():
+def test_deepseek_v4_experts_deepgemm_forward_backward():
     """Select FP8 through the public config and execute the real expert module."""
     from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 

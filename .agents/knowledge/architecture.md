@@ -272,7 +272,7 @@ VeOmni uses FSDP2 exclusively.
    - `moe_experts/standard/deepgemm` uses the same dispatch with
      Hopper/Blackwell FP8 grouped forward/dgrad/wgrad in `ops/kernels/moe_experts/`.
      FSDP2 and EP communication retain their configured precision. Quantized
-     weights are invocation-local; see `docs/design/deepgemm_fp8_moe.md`.
+     weights are invocation-local; see `docs/design/deepgemm_moe.md`.
 6. Qwen4-Exp PLE is a model-specific exception: its embedding tables remain
    persistent DTensors on the full `(ple_fsdp, ple)` mesh with placements
    `[Shard(1), Shard(0)]`. FSDP2 ignores those parameters, and PLE routes sparse

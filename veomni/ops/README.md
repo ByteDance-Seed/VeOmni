@@ -123,7 +123,7 @@ Its hidden states and weight interface remain BF16; optional FSDP2
 `expert_weight_fp8_all_gather` supplies block-quantized expert payloads directly. Routing
 weights retain their supplied dtype. Hopper uses a bounded FP32 wgrad workspace; SM100 writes BF16
 gradients directly from the FP32 accumulator in the GEMM epilogue. Recomputing
-Triton SwiGLU limits temporary storage. See [FP8 MoE training](../../docs/design/deepgemm_fp8_moe.md)
+Triton SwiGLU limits temporary storage. See [FP8 MoE training](../../docs/design/deepgemm_moe.md)
 for dependency installation, configuration, precision and distributed coverage.
 
 The common EP combine uses the registered `moe_unpermute/standard` op:
