@@ -176,10 +176,29 @@ def validate_compile_runtime(
 #: because the row is ``torchao`` for both FP4 layouts: a config may compile with
 #: ``dtype: nvfp4`` (float8_e4m3fn scales plus an FP32 per-tensor scale, both of
 #: which Inductor knows) and must not with ``dtype: mxfp4``.
-_UNCOMPILABLE_FORMATS: dict[str, tuple[str, str]] = {
-    "linear_implementation": ("torchao", "mxfp4"),
-    "gated_mlp_implementation": ("torchao", "mxfp4"),
+_UNCOMPILABLE_FORMATS: dict[str, tuple[str, str, str]] = {
+    "linear_implementation": ("linear", "torchao", "mxfp4"),
+    "gated_mlp_implementation": ("gated_mlp", "torchao", "mxfp4"),
 }
+
+
+def _bound_uncompilable_ops(model: nn.Module) -> tuple[set[str], list[str]]:
+    """Inspect concrete ``VeomniOp`` handles bound on ``model`` for uncompilable formats."""
+    from ..ops.registry import VeomniOp
+
+    op_to_rule = {op: (field, impl, dtype) for field, (op, impl, dtype) in _UNCOMPILABLE_FORMATS.items()}
+    bound_ops: set[str] = set()
+    offending: list[str] = []
+    for module in model.modules():
+        for attr in vars(module).values():
+            if isinstance(attr, VeomniOp) and attr.op in op_to_rule:
+                bound_ops.add(attr.op)
+                field, impl, dtype = op_to_rule[attr.op]
+                if attr.impl == impl and attr.kwargs.get("dtype") == dtype:
+                    entry = f"{field}={impl}(dtype={dtype!r})"
+                    if entry not in offending:
+                        offending.append(entry)
+    return bound_ops, offending
 
 
 def _selection_reaches(value, target_impl: str, target_dtype: str) -> bool:
@@ -199,12 +218,14 @@ def _selection_reaches(value, target_impl: str, target_dtype: str) -> bool:
     return (target_impl, target_dtype) in states
 
 
-def _uncompilable_selections(ops) -> list[str]:
+def _uncompilable_selections(ops, *, skip_ops: set[str] | None = None) -> list[str]:
     """Return the offending ``field=row(dtype=...)`` strings on one ops config, if any."""
     if ops is None:
         return []
     offending: list[str] = []
-    for field, (impl, dtype) in _UNCOMPILABLE_FORMATS.items():
+    for field, (op, impl, dtype) in _UNCOMPILABLE_FORMATS.items():
+        if skip_ops and op in skip_ops:
+            continue
         if _selection_reaches(getattr(ops, field, None), impl, dtype):
             offending.append(f"{field}={impl}(dtype={dtype!r})")
     return offending
@@ -213,14 +234,14 @@ def _uncompilable_selections(ops) -> list[str]:
 def _reject_incompatible_ops(model: nn.Module) -> None:
     """Reject op selections ``torch.compile`` cannot lower, at any config depth.
 
-    The walk covers nested configs because that is how the selections bind: a
-    multimodal root carries its text tower's ops under ``sub_configs``, and a
-    module resolves the selection from the config it was built with. A child-only
-    selection is real and must be caught, and the message names the path so the
-    offending level is unambiguous.
+    Inspects concrete bound ``VeomniOp`` handles on ``model`` first so unmatched
+    ``overrides`` on real modules do not trigger false refusals, then falls back
+    to walking ``config`` / ``sub_configs`` for any tracked op with no bound
+    handles on ``model``.
     """
+    bound_ops, offending = _bound_uncompilable_ops(model)
     config = getattr(model, "config", None)
-    offending = _uncompilable_at(config, prefix="")
+    offending.extend(_uncompilable_at(config, prefix="", skip_ops=bound_ops))
     if offending:
         raise RuntimeError(
             "model.accelerator.torch_compile cannot be combined with "
@@ -229,15 +250,17 @@ def _reject_incompatible_ops(model: nn.Module) -> None:
         )
 
 
-def _uncompilable_at(config, *, prefix: str) -> list[str]:
+def _uncompilable_at(config, *, prefix: str, skip_ops: set[str] | None = None) -> list[str]:
     """Collect offending selections on ``config`` and every sub-config below it."""
     if config is None:
         return []
-    found = [f"{prefix}{item}" for item in _uncompilable_selections(getattr(config, "ops_config", None))]
+    found = [
+        f"{prefix}{item}" for item in _uncompilable_selections(getattr(config, "ops_config", None), skip_ops=skip_ops)
+    ]
     for name in getattr(config, "sub_configs", {}) or {}:
         child = getattr(config, name, None)
         if child is not None:
-            found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
+            found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}.", skip_ops=skip_ops))
     return found
 
 

@@ -30,11 +30,12 @@
 # `kv_round` Triton row is NVIDIA SM89+ (FP8 E4M3), so a host below those fails when the
 # handle is built rather than mid-training.
 #
-# Swapping `moe_implementation` to `deepgemm` is a valid variant of this config: it
-# runs native FP8 expert GEMMs instead of fake-quantizing the experts, while `linear`,
-# `gated_mlp` and `kv_round` stay on their QAT rows. Those are separate GEMMs -- in
-# particular `gated_mlp` is the shared expert, which DeepGEMM does not cover -- so the
-# two selections compose rather than conflict.
+# Swapping `moe_implementation` to `{name: deepgemm, kwargs: {dtype: fp8}}` is a valid
+# variant of this config (`kwargs: {dtype: fp8}` overrides V4-Flash's `expert_dtype='fp4'`
+# because DeepGEMM currently supports FP8 only): it runs native FP8 expert GEMMs instead
+# of fake-quantizing the experts, while `linear`, `gated_mlp` and `kv_round` stay on their
+# QAT rows. Those are separate GEMMs -- in particular `gated_mlp` is the shared expert,
+# which DeepGEMM does not cover -- so the two selections compose rather than conflict.
 #
 # Precision: BF16 parameters with FP32 gradient reduction. The fake quantizers are
 # straight-through, so the FP32 master weights keep updating normally and checkpoints

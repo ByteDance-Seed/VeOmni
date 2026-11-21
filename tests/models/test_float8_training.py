@@ -196,6 +196,91 @@ def test_float8_reports_missing_or_mismatched_torchao_extra(monkeypatch, install
 
 
 @cpu
+def test_float8_linear_compiles_fullgraph_without_tracing_metadata_io(monkeypatch):
+    """``_float8_linear_configs`` stays outside Dynamo so ``fullgraph=True`` traces cleanly."""
+    import sys
+    import types
+    from dataclasses import dataclass
+
+    import torch.nn.functional as F
+
+    from veomni.ops import torchao as torchao_ops
+
+    @dataclass(frozen=True)
+    class _FakeGemmCfg:
+        use_fast_accum: bool = False
+
+    @dataclass(frozen=True)
+    class _FakeFloat8Cfg:
+        recipe: str
+        pad_inner_dim: bool = False
+        emulate: bool = False
+        enable_fsdp_float8_all_gather: bool = False
+        gemm_config_output: _FakeGemmCfg = _FakeGemmCfg()
+        gemm_config_grad_input: _FakeGemmCfg = _FakeGemmCfg()
+        gemm_config_grad_weight: _FakeGemmCfg = _FakeGemmCfg()
+
+        @classmethod
+        def from_recipe_name(cls, name: str):
+            return cls(recipe=name)
+
+    @dataclass(frozen=True)
+    class _FakeScaledMMCfg:
+        emulate: bool
+        use_fast_accum: bool
+        fp8_output: bool
+        pad_inner_dim: bool
+
+    @dataclass(frozen=True)
+    class _FakeLinearMMCfg:
+        output: _FakeScaledMMCfg
+        grad_input: _FakeScaledMMCfg
+        grad_weight: _FakeScaledMMCfg
+
+    class _FakeMatmul(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, w_t, _mm_cfg, _cfg):
+            return F.linear(x, w_t.t())
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            return grad_output, None, None, None
+
+    fake_torchao = types.ModuleType("torchao")
+    fake_float8 = types.ModuleType("torchao.float8")
+    fake_cfg_mod = types.ModuleType("torchao.float8.config")
+    fake_cfg_mod.Float8LinearConfig = _FakeFloat8Cfg
+    fake_tensor_mod = types.ModuleType("torchao.float8.float8_training_tensor")
+    fake_tensor_mod.LinearMMConfig = _FakeLinearMMCfg
+    fake_tensor_mod.ScaledMMConfig = _FakeScaledMMCfg
+    fake_linear_mod = types.ModuleType("torchao.float8.float8_linear")
+    fake_linear_mod.matmul_with_hp_or_float8_args = _FakeMatmul
+    fake_torchao.float8 = fake_float8
+    fake_float8.config = fake_cfg_mod
+    fake_float8.float8_training_tensor = fake_tensor_mod
+    fake_float8.float8_linear = fake_linear_mod
+
+    for name, mod in (
+        ("torchao", fake_torchao),
+        ("torchao.float8", fake_float8),
+        ("torchao.float8.config", fake_cfg_mod),
+        ("torchao.float8.float8_training_tensor", fake_tensor_mod),
+        ("torchao.float8.float8_linear", fake_linear_mod),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setattr(torchao_ops, "version", lambda _pkg: torchao_ops.TORCHAO_REQUIRED_VERSION)
+    torchao_ops._float8_linear_configs.cache_clear()
+
+    compiled = torch.compile(lambda x, w: torchao_fp8_linear(x, w, recipe="rowwise", emulated=True), fullgraph=True)
+    x = torch.randn(2, 16)
+    w = torch.randn(16, 16)
+    try:
+        torch.testing.assert_close(compiled(x, w), F.linear(x, w))
+    finally:
+        torchao_ops._float8_linear_configs.cache_clear()
+
+
+@cpu
 def test_qwen3_and_llama_bind_float8_handles(monkeypatch):
     """Qwen3 and Llama bind torchao float8 handles while keeping every projection a plain ``nn.Linear``."""
     from transformers import LlamaConfig, Qwen3Config

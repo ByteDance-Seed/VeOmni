@@ -33,7 +33,6 @@ a host without the optional ``float8`` extra stays free.
 from __future__ import annotations
 
 from dataclasses import replace
-from functools import cache
 from importlib.metadata import PackageNotFoundError, version
 
 import torch
@@ -90,9 +89,22 @@ def _require_torchao_version() -> None:
         raise ImportError(f"float8 training requires torchao=={TORCHAO_REQUIRED_VERSION}; found {installed_version}.")
 
 
-@cache
+_FLOAT8_CONFIG_CACHE: dict[tuple[str, bool], tuple] = {}
+
+
+@torch._dynamo.assume_constant_result
 def _float8_linear_configs(recipe: str, emulated: bool):
-    """Build and cache torchao's ``(Float8LinearConfig, LinearMMConfig)`` pair."""
+    """Build and cache torchao's ``(Float8LinearConfig, LinearMMConfig)`` pair.
+
+    Marked ``assume_constant_result`` so ``torch.compile(fullgraph=True)`` treats
+    the immutable config pair as a compile-time constant instead of tracing
+    ``importlib.metadata.version`` I/O.
+    """
+    key = (recipe, emulated)
+    cached = _FLOAT8_CONFIG_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     _require_torchao_version()
 
     from torchao.float8.config import Float8LinearConfig
@@ -132,7 +144,12 @@ def _float8_linear_configs(recipe: str, emulated: bool):
             config.pad_inner_dim,
         ),
     )
-    return config, linear_mm_config
+    result = (config, linear_mm_config)
+    _FLOAT8_CONFIG_CACHE[key] = result
+    return result
+
+
+_float8_linear_configs.cache_clear = _FLOAT8_CONFIG_CACHE.clear
 
 
 def torchao_fp8_linear(

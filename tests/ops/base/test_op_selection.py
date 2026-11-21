@@ -138,7 +138,7 @@ def test_per_site_op_selection_and_overrides():
     assert ops.linear_implementation.resolve("layers.1.q_a_proj") == ("qat", {})
     assert ops.gated_mlp_implementation.resolve("layers.0.mlp") == ("liger_kernel", {})
     assert ops.gated_mlp_implementation.resolve("layers.1.mlp") == ("qat", {})
-    assert ops.moe_implementation == "deepgemm"
+    assert ops.moe_implementation.resolve("layers.0.experts") == ("deepgemm", {"dtype": "fp8"})
     assert ops.kv_round_implementation == "triton"
 
     from veomni.ops.kernels.moe_experts.standard import deepgemm

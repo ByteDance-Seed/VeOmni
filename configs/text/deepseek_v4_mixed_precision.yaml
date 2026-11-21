@@ -28,8 +28,11 @@ model:
       overrides:
         - site: 'layers\.0\.mlp'
           name: liger_kernel
-    # Whole-family selections need no overrides.
-    moe_implementation: deepgemm
+    # DeepSeek-V4-Flash checkpoints carry expert_dtype='fp4', while DeepGEMM
+    # currently supports FP8 only; pass dtype='fp8' explicitly to run FP8 MoE.
+    moe_implementation:
+      name: deepgemm
+      kwargs: {dtype: fp8}
     kv_round_implementation: triton
   accelerator:
     gradient_checkpointing:

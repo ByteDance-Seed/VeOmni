@@ -1195,6 +1195,28 @@ def test_compile_rejects_torchao_mxfp4(field):
         _reject_incompatible_ops(_model_with_ops(**{field: chained_override}))
 
 
+def test_compile_checks_bound_handles_for_unmatched_mxfp4_override(monkeypatch):
+    """An unmatched MXFP4 override on a real model with bound eager handles does not block compile."""
+    from veomni.distributed.torch_compile import _reject_incompatible_ops
+    from veomni.ops import OpsSelection, SiteOverride, VeomniOp
+    from veomni.ops import registry as ops_registry
+
+    monkeypatch.setattr(ops_registry, "is_package_available", lambda _pkg: True)
+    monkeypatch.setattr(VeomniOp, "_intern", dict(VeomniOp._intern))
+
+    selection = OpsSelection(
+        name="eager",
+        overrides=[SiteOverride(site=r"layers\.99\.q_proj", name="torchao", kwargs={"dtype": "mxfp4"})],
+    )
+    model = _model_with_ops(linear_implementation=selection)
+    model.veomni_q_proj = VeomniOp("linear", "standard", selection, site="layers.0.q_proj")
+    _reject_incompatible_ops(model)
+
+    model.veomni_q_proj = VeomniOp("linear", "standard", selection, site="layers.99.q_proj")
+    with pytest.raises(RuntimeError, match=r"linear_implementation=torchao\(dtype='mxfp4'\)"):
+        _reject_incompatible_ops(model)
+
+
 @pytest.mark.parametrize(
     "ops_fields",
     [
