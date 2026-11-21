@@ -1706,9 +1706,6 @@ class DeepseekV4Experts(nn.Module):
         down_proj = self.down_proj
         gate_up_proj = self.gate_up_proj
         unused = gate_up_proj.new_empty(0)
-        call_kwargs = {}
-        if self.veomni_moe.impl == "qat":
-            call_kwargs["dtype"] = self.expert_dtype
         return self.veomni_moe(
             hidden_states,
             top_k_weights,
@@ -1721,7 +1718,7 @@ class DeepseekV4Experts(nn.Module):
             activation=self.activation,
             swiglu_limit=self.limit,
             assume_distinct_experts=self.assume_distinct_experts,
-            **call_kwargs,
+            dtype=self.expert_dtype,
         )
 
 
