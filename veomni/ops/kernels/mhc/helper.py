@@ -23,10 +23,20 @@ separately restrict those rows to NVIDIA SM90 or later and require the
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 
 POST_MULTIPLIER = 2.0
+
+#: Query-axis tile the TileKernels mHC kernels index without a length guard.
+#: ``mhc_pre_norm_fn`` and its backward walk the token axis in steps of this size,
+#: so a packed sequence whose per-sample query span is not a multiple of it reads
+#: and writes past the tensor -- which is what turned a dynamic-batch step's
+#: ``grad_norm`` into NaN on a 256k run. Callers pad to it and slice the result.
+TOKEN_ALIGN = 128
+#: The inference-only fused collapse (``mhc_pre_big_fuse``) tiles more coarsely.
+FUSED_TOKEN_ALIGN = 32
 
 
 def unweighted_rms(x: Tensor, eps: float) -> Tensor:
@@ -44,3 +54,21 @@ def require_tilelang_input(x: Tensor, hc_mult: int) -> None:
         raise ValueError(f"TileKernels mHC expects [batch, sequence, hc, hidden], got {tuple(x.shape)}")
     if hc_mult != 4 or x.shape[-2] != 4:
         raise ValueError(f"TileKernels mHC backward currently requires hc_mult=4, got {hc_mult}")
+
+
+def pad_token_axis(x: Tensor, align: int) -> tuple[Tensor, int]:
+    """Pad the query axis of a ``[batch, sequence, hc, hidden]`` tensor to ``align``.
+
+    Returns ``(padded_or_original, seq_len)``. The caller slices every output of
+    the kernel back to ``seq_len``; a zero row carries no information the kernel
+    could leak into a kept row, because each query position's mix depends only on
+    its own row plus the shared ``fn`` / ``scale`` / ``base``.
+    """
+    seq_len = x.shape[1]
+    pad = -seq_len % align
+    if not pad:
+        return x.contiguous(), seq_len
+    # ``contiguous()`` after the pad, not before: ``F.pad`` preserves a
+    # ``channels_last`` memory format, and the kernels ``view(...)`` the result to
+    # flatten batch and sequence, which a preserved stride layout breaks.
+    return F.pad(x, (0, 0, 0, 0, 0, pad)).contiguous(), seq_len

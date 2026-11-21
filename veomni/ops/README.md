@@ -47,8 +47,8 @@ when the selected implementation runs.
 | `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `offset` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; all accept optional `group_size` (fused weighted rows delegate grouped calls to eager) |
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
-| `gated_mlp` | `standard`, `geglu` | `eager`, `liger_kernel`; `qat` (`dtype=fp8`, SM90+) and `torchao` (`dtype=fp8`, `nvfp4`, or `mxfp4`) are `standard` only. `liger_kernel` computes SiLU on `standard` and GELU-tanh on `geglu` — the variant fixes the activation, so it is not a choice on that row. Rows take the MLP **module** (`op(self, x, activation=...)`) and pick weights or projections themselves |
-| `linear` | `standard`, `grouped` | `eager`, `qat` (`dtype=fp8`, SM90+), `torchao` (`dtype=fp8`, `nvfp4`, or `mxfp4`, `standard` only). Rows take the projection **module** (`op(self.q_a_proj, x)`), not a weight tensor, so adapters work |
+| `gated_mlp` | `standard`, `geglu` | `eager`, `liger_kernel`; `qat` (`dtype=fp8`, SM90+), `torchao` (`dtype=fp8`, `nvfp4`, or `mxfp4`) and `deepgemm` (native FP8 GEMM, `dtype=fp8`, SM90/SM100) are `standard` only. `liger_kernel` computes SiLU on `standard` and GELU-tanh on `geglu` — the variant fixes the activation, so it is not a choice on that row. Rows take the MLP **module** (`op(self, x, activation=...)`) and pick weights or projections themselves |
+| `linear` | `standard`, `grouped` | `eager`, `qat` (`dtype=fp8`, SM90+), `torchao` (`dtype=fp8`, `nvfp4`, or `mxfp4`, `standard` only), `deepgemm` (native FP8 GEMM, `dtype=fp8`, SM90/SM100). Rows take the projection **module** (`op(self.q_a_proj, x)`), not a weight tensor, so adapters work |
 | `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `qat` (`dtype=fp8` or `fp4`), `deepgemm` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
@@ -56,7 +56,7 @@ when the selected implementation runs.
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
 | `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu` as supported by the family |
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `triton`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
-| `kv_round` | `standard`, `deepseek_v4` | `none` (leave stored tensors alone), `eager`, `triton` (NVIDIA SM89+/ROCm, FP8 E4M3); `standard` takes block width and quantized prefix as call arguments, `deepseek_v4` fixes the model's two geometries and takes `rope_features` |
+| `kv_round` | `standard`, `deepseek_v4`, `fp4` | `none` (leave stored tensors alone), `eager`, `triton` (NVIDIA SM89+/ROCm). `standard` rounds to FP8 E4M3 and takes block width and quantized prefix as call arguments; `deepseek_v4` fixes the model's two FP8 geometries and takes `rope_features`; `fp4` stores E2M1 and takes `block_size` plus `scale_fmt` (`e4m3` or `ue8m0`) |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
 
