@@ -31,6 +31,9 @@ class LTXVideoTransformerModelConfig(VeOmniPretrainedConfig):
         apply_gated_attention: bool = False,
         caption_proj_before_connector: bool = False,
         cross_attention_adaln: bool = False,
+        ff_bias: bool = True,
+        audio_ff_bias: bool = True,
+        use_keyframes_abs_pos_embedding: bool = False,
         has_image_input: bool = False,
         with_audio: bool = False,
         audio_num_attention_heads: int = 32,
@@ -42,6 +45,7 @@ class LTXVideoTransformerModelConfig(VeOmniPretrainedConfig):
         av_ca_timestep_scale_multiplier: int = 1,
         **kwargs,
     ):
+        """Store the shared LTX architecture settings while preserving LTX-2.3 defaults."""
         if positional_embedding_max_pos is None:
             positional_embedding_max_pos = [20, 2048, 2048]
         if audio_positional_embedding_max_pos is None:
@@ -63,6 +67,9 @@ class LTXVideoTransformerModelConfig(VeOmniPretrainedConfig):
         self.apply_gated_attention = apply_gated_attention
         self.caption_proj_before_connector = caption_proj_before_connector
         self.cross_attention_adaln = cross_attention_adaln
+        self.ff_bias = ff_bias
+        self.audio_ff_bias = audio_ff_bias
+        self.use_keyframes_abs_pos_embedding = use_keyframes_abs_pos_embedding
         self.has_image_input = has_image_input
         self.with_audio = with_audio
         self.audio_num_attention_heads = audio_num_attention_heads

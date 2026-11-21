@@ -83,6 +83,7 @@ Our guiding principles when building VeOmni are:
 | [MiniMax H3-Image](docs/examples/minimax_h3_image.md)    | Checkpoint-dependent          | Inference only (t2i/edit)                                              |
 | [HunyuanVideo 1.5](docs/examples/hunyuanvideo15.md) | 480p T2V (experimental; CPU and NPU backbone checks) | [hunyuanvideo15_t2v.yaml](configs/dit/hunyuanvideo15_t2v.yaml) |
 | [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3)     | Checkpoint-dependent          | [ltx2_av_lora.yaml](configs/dit/ltx2_av_lora.yaml); [training guide](docs/examples/ltx-2.3.md) |
+| [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) | 22B-dev (preview) | [ltx25_av_lora.yaml](configs/dit/ltx25_av_lora.yaml); [training guide](docs/examples/ltx-2.5.md) |
 
 Support new models to VeOmni see [Support New Models](https://veomni.readthedocs.io/en/latest/usage/support_new_models/guide_and_checklist.html)
 
