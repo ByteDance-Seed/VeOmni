@@ -43,9 +43,12 @@ type is an error.
   startup. A module whose checkpoint tensor converter renames or reshapes
   tensors, or that adds a parameter with no upstream counterpart (a freshly
   initialized projector or head), loads from the upstream root but cannot
-  export to it: the HF export raises rather than write the stale source copy
-  or drop the new weight. Export such a run from a split checkpoint, or
-  disable `save_hf_weights`. Each HF export reads every
+  export to it **unless the module declares `export_state`**: that hook runs
+  before the key/shape/dtype checks and returns the source-format tensors, which
+  is what makes such a module exportable. Without it the HF export raises rather
+  than write the stale source copy or drop the new weight. Export such a run from
+  a split checkpoint, declare `export_state`, or disable `save_hf_weights`. Each
+  HF export reads every
   source tensor no trained module produces (frozen modules, unclaimed keys)
   into rank 0's host memory, so a small trained module beside a large frozen
   one costs the frozen one's size in rank-0 RAM per export. Eager loads take
@@ -151,8 +154,8 @@ The family declares the fields below. Everything else is framework-provided.
 | `modules[name].key_prefixes` | must declare | `(source_prefix, module_prefix)` pairs. A source key belongs to the module whose source prefix is the longest match across the whole layout, so a backbone can claim `model.` while a sibling claims `model.embed_tokens.`. A prefix claimed twice is an error. Prefixes match source keys after the module class's `_checkpoint_conversion_mapping`, if it has one. | [`OmniHFLayout.route`](../../../veomni/models/seed_omni/utils/hf_layout.py#L323) when loading, and its reverse [`source_key`](../../../veomni/models/seed_omni/utils/hf_layout.py#L332) when saving | Each upstream weight lands on exactly one module, and exports under its upstream name. Unclaimed keys are never read, and are copied verbatim into an export. |
 | `modules[name].build_config` | must declare | Upstream HF config to the module's `OmniModuleConfig`. Declare a second parameter (`def build_config(hf, source_path)`) when the answer depends on what the checkpoint *stores* rather than only on its config — Janus resolves its tokenizer tie against the weight files. The path is passed only to a signature that asks for it. | [`build_module_configs`](../../../veomni/models/seed_omni/utils/hf_layout.py#L353) → [`config_for`](../../../veomni/models/seed_omni/utils/hf_layout.py#L254), called by [`_write_hf_view`](../../../veomni/models/seed_omni/utils/hf_layout.py#L522) and [`convert_with_hf_layout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L785) | The module config every load path builds the module from. |
 | `modules[name].build_assets` | optional | Loads the module's assets from the checkpoint directory, keyed `tokenizer` / `processor` / `image_processor` / `video_processor`. | [`build_module_assets`](../../../veomni/models/seed_omni/utils/hf_layout.py#L357), same callers | The assets are saved into the module's view subfolder, so the module and the collator bind them as from a split root. |
-| `modules[name].generated_tensors` | optional | `(source_path, module_config) -> {module_key: tensor}`: module tensors the checkpoint does not store, computed from the checkpoint directory and the config (a lookup table derived from the tokenizer, say). They load after the stored weights, under module keys. | [`HFSourceKeyConverter.finalize`](../../../veomni/models/seed_omni/utils/hf_layout.py#L619), called by both loaders and by `build_module_assets` | The module owns a tensor the source lacks. Such a key has no source key by construction, so an export neither writes it back nor reports it as unmapped. |
-| `modules[name].export_state` | optional | `(model, state) -> {module_key: tensor}`: turns the module's state dict -- **after** its weight conversions are reverted -- into the form the checkpoint stores (requantized weights and their scales, per-expert splits). | [`save_hf_source_checkpoint`](../../../veomni/models/seed_omni/utils/hf_layout.py#L998) | The model keeps transformers' fused layout while the export writes the release layout. Without it a module whose converter renames or reshapes tensors cannot export. |
+| `modules[name].generated_tensors` | optional | `(source_path, module_config) -> {module_key: tensor}`: module tensors the checkpoint does not store, computed from the checkpoint directory and the config (a lookup table derived from the tokenizer, say). They load after the stored weights, under module keys. | [`HFSourceKeyConverter.finalize`](../../../veomni/models/seed_omni/utils/hf_layout.py#L619), called by both loaders and by `build_module_assets` | The module owns a tensor the source lacks. Such a key has no source key by construction, so an export neither writes it back nor reports it as unmapped — which also means **a trained value of a generated tensor is lost**: reloading recomputes it from the source. Keep these tensors non-trainable and reproducible from the checkpoint plus the config; a module that has to train one needs a checkpoint format that stores it. |
+| `modules[name].export_state` | optional | `(model, state) -> {module_key: tensor}`: turns the module's state dict -- **after** its weight conversions are reverted -- into the form the checkpoint stores (requantized weights and their scales, per-expert splits). | [`save_hf_source_checkpoint`](../../../veomni/models/seed_omni/utils/hf_layout.py#L998) | The model keeps transformers' fused layout while the export writes the release layout. Without it a module whose converter renames or reshapes tensors cannot export. A key may be returned by **one** rank or by several: the rank(s) holding it write their own local value, their key sets are unioned (`_all_ranks_union`), and **values are never compared across ranks** — so a hook returning a rank-local value writes whichever replica the writer reads, silently. Return a value that is rank-invariant (a full tensor, or a shard of one), not something computed from this rank's slice. |
 | `tied_source_keys` | optional | Source key → the source key it duplicates when the model ties them (a checkpoint may store `lm_head.weight` although the config ties it). | [`attach_hf_source_converter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L641) and [`save_hf_source_checkpoint`](../../../veomni/models/seed_omni/utils/hf_layout.py#L998) | Loading skips the duplicate when the module does not hold it; an export writes the original's trained value under it, not the stale copy. |
 | `graph_dir`, `training_graphs`, `generation_graphs`, `infer_type`, `generation_kwargs` | optional | The family's default graph YAML (repo-relative, see `load_family_graphs`), default generation scenario, and default `generation_kwargs`. | [`load_graphs`](../../../veomni/models/seed_omni/utils/hf_layout.py#L363), [`_write_hf_view`](../../../veomni/models/seed_omni/utils/hf_layout.py#L522), [`convert_with_hf_layout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L785) | The view and split root carry these graphs and generation defaults; a launcher graph overrides them. Run outside a VeOmni checkout, the view carries none and the launcher has to supply them. |
 | `load_hf_config` | optional | Reads the upstream config; `AutoConfig.from_pretrained` when unset. | [`read_hf_config`](../../../veomni/models/seed_omni/utils/hf_layout.py#L346) | For checkpoints `AutoConfig` cannot read. |
@@ -208,10 +211,12 @@ in the exported module config; leave it unset to keep each config's default.
 ## Rules
 
 - Prefixes rename only. A module may still reshape, fuse or split tensors in
-  its checkpoint tensor converter, which receives the renamed keys, but such a
-  module only loads from the upstream root: the export writes live keys back
-  through the prefixes alone, and raises when that cannot reproduce the
-  source.
+  its checkpoint tensor converter, which receives the renamed keys. Such a
+  module loads from the upstream root, and exports only if it declares
+  `export_state`: that hook maps its live state back onto source keys before the
+  prefix reversal, so the write is not limited to what the prefixes can express.
+  Without the hook the export writes live keys back through the prefixes alone
+  and raises when that cannot reproduce the source.
 - Each module claims disjoint weights: a source key may route to one module
   only, and two modules must not export the same source key.
 - `build_config` must give the config the module had when split by the

@@ -139,6 +139,31 @@ def test_the_generic_runtime_forwards_extra_parallel_only_to_the_builder(monkeyp
     assert seen["extra_parallel_only"] is True
 
 
+@pytest.mark.parametrize(
+    "global_accelerator",
+    [
+        {"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)},
+        {"ep_size": 4},
+        {},
+    ],
+    ids=["extra_parallel_only", "ep", "plain"],
+)
+def test_inference_keeps_a_no_wrap_module_on_fsdp2(monkeypatch, global_accelerator):
+    """`extra_parallel_only` is refused beside `fsdp_mode='eager'`.
+
+    The inference overlay forces `eager`, so a module inheriting the no-wrap flag
+    would raise inside the nested `FSDPConfig` before `__post_init__` could
+    normalize it back. Each case asserts the resolved mode matches the flag.
+    """
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    global_args = OmniModuleRuntimeArguments(
+        model_path="/tmp/model", accelerator=AcceleratorConfig(**global_accelerator)
+    )
+    modules = build_omni_module_runtime_args(global_args, "/tmp/model", {"mod": {}}, for_inference=True)
+    resolved = modules["mod"].accelerator.fsdp_config
+    assert resolved.fsdp_mode == ("fsdp2" if resolved.extra_parallel_only else "eager")
+
+
 def test_module_runtime_arguments_inherit_weight_load_knobs():
     args = OmniModuleRuntimeArguments(model_path="/tmp/model")
     assert args.broadcast_model_weights_from_rank0 is True

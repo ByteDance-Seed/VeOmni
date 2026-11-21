@@ -264,12 +264,20 @@ def _size_balanced_index_mapping(save_state: Dict[str, torch.Tensor]) -> Dict[st
 # 10 min NCCL watchdog the other ranks would otherwise wait under.
 _CONSOLIDATION_TIMEOUT = timedelta(hours=4)
 _consolidation_group = None
+# Which process group the cached group belongs to. A group cannot outlive its
+# session: after `destroy_process_group()` it is unusable, and a later session in
+# the same process (a test, an in-process trainer restart) would otherwise reuse
+# it and fail or hang. Keyed on the active default group rather than reset from a
+# teardown hook, because teardown happens outside this module.
+_consolidation_group_owner = None
 
 
 def _consolidation_process_group():
-    global _consolidation_group
-    if _consolidation_group is None:
+    global _consolidation_group, _consolidation_group_owner
+    owner = dist.group.WORLD
+    if _consolidation_group is None or _consolidation_group_owner is not owner:
         _consolidation_group = dist.new_group(backend="gloo", timeout=_CONSOLIDATION_TIMEOUT)
+        _consolidation_group_owner = owner
     return _consolidation_group
 
 

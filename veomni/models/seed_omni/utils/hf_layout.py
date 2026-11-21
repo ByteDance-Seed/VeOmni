@@ -1026,7 +1026,13 @@ def save_hf_source_checkpoint(
         from torch.distributed.checkpoint._consolidate_hf_safetensors import (
             consolidate_safetensors_files_on_every_rank,
         )
-    except ImportError:  # torch 2.10 (the NPU stack) has only the single-process helper
+    except ImportError:  # pragma: no cover - both supported versions ship it
+        consolidate_safetensors_files_on_every_rank = None
+    if consolidate_safetensors_files_on_every_rank is not None and not _on_every_rank_writes_index():
+        # torch 2.10 (the pinned NPU stack) has the per-rank helper but its
+        # version never writes `model.safetensors.index.json` -- only 2.11 does.
+        # A multi-file export through it is unloadable, so route it to the
+        # single-process helper plus an explicit index instead.
         consolidate_safetensors_files_on_every_rank = None
 
     from ....checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
@@ -1166,6 +1172,20 @@ def save_hf_source_checkpoint(
         f"save_hf_source_checkpoint: `{source.model_type}` checkpoint saved at {save_path} "
         f"in {time.time() - start:.2f}s."
     )
+
+
+def _on_every_rank_writes_index() -> bool:
+    """Whether ``consolidate_safetensors_files_on_every_rank`` writes the HF index.
+
+    torch 2.10 ships the per-rank helper but its implementation only writes the
+    output files; it gained the rank-0 metadata write (`_write_overall_metadata_file`)
+    in 2.11. Version-gated rather than introspected: the helper is a plain
+    function whose behaviour is the version's, and a probe would have to run a
+    real consolidation to tell.
+    """
+    from ....utils.import_utils import is_torch_version_greater_than
+
+    return is_torch_version_greater_than("2.10.99")
 
 
 def _consolidate_and_write_index(

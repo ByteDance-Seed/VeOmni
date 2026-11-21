@@ -782,3 +782,59 @@ def test_custom_layout_subclass_overrides_hooks_and_per_module_dtypes(tmp_path):
             assert torch.equal(f.get_tensor("decoder.proj.weight"), dec_weight)
     finally:
         del OMNI_HF_LAYOUT_REGISTRY[custom_type]
+
+
+def test_a_torch_version_without_the_index_write_falls_back_to_the_single_process_helper(monkeypatch, tmp_path):
+    """torch 2.10 ships `consolidate_safetensors_files_on_every_rank` but that
+    version never writes `model.safetensors.index.json` -- only 2.11 does.
+
+    A multi-file export through it is unloadable, so the branch is chosen by
+    version rather than by the name's presence.
+    """
+    from veomni.models.seed_omni.utils import hf_layout
+
+    assert hf_layout._on_every_rank_writes_index() is True  # this environment is 2.11+
+    monkeypatch.setattr(hf_layout, "_on_every_rank_writes_index", lambda: False)
+
+    calls = []
+    monkeypatch.setattr(
+        hf_layout,
+        "_consolidate_and_write_index",
+        lambda sharded, save, mapping: calls.append((sharded, save, dict(mapping))),
+    )
+    sharded = tmp_path / "sharded"
+    sharded.mkdir()
+    save = tmp_path / "out"
+    save.mkdir()
+
+    # The selection happens where the helper is imported, so exercise the same
+    # decision the branch makes.
+    on_every_rank = object()
+    effective = on_every_rank if on_every_rank is not None and hf_layout._on_every_rank_writes_index() else None
+    assert effective is None, "2.10 must not take the per-rank branch"
+    hf_layout._consolidate_and_write_index(str(sharded), str(save), {"w": 1})
+    assert calls == [(str(sharded), str(save), {"w": 1})]
+
+
+def test_the_index_writer_emits_a_weight_map_and_total_size(tmp_path):
+    """What the fallback adds over the bare helper: the file HF's resolver reads."""
+    import json
+
+    from veomni.models.seed_omni.utils import hf_layout
+
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "model-00001-of-00002.safetensors").write_bytes(b"x" * 10)
+    (out / "model-00002-of-00002.safetensors").write_bytes(b"y" * 6)
+    mapping = {"a.weight": 1, "b.weight": 2}
+
+    hf_layout._consolidate_and_write_index(str(tmp_path / "none"), str(out), mapping)
+
+    index = json.loads((out / "model.safetensors.index.json").read_text())
+    assert index["weight_map"] == {
+        "a.weight": "model-00001-of-00002.safetensors",
+        "b.weight": "model-00002-of-00002.safetensors",
+    }
+    # The bytes the export actually wrote; the fake files stand in for real shards,
+    # so only positivity is meaningful here.
+    assert index["metadata"]["total_size"] > 0

@@ -356,6 +356,18 @@ def build_omni_module_runtime_args(
         merged_acc = merged.setdefault("accelerator", {})
         if isinstance(merged_acc, dict):
             merged_acc["skip_sp_gather_between_modules"] = global_skip_sp_gather
+            # `extra_parallel_only` is a property of the `fsdp2` path and
+            # `FSDPConfig` refuses it beside `fsdp_mode='eager'`. This overlay sits
+            # above the checkpoint but below the run's own YAML, so a module that
+            # inherits the flag must keep `fsdp2` here -- otherwise the nested
+            # config raises before `__post_init__` can normalize it back, and a
+            # global no-wrap inference config could not launch at all. A module the
+            # run itself pinned to `eager` keeps that value; `__post_init__`
+            # resolves it.
+            fsdp_config = merged_acc.get("fsdp_config")
+            if isinstance(fsdp_config, dict) and fsdp_config.get("extra_parallel_only", False):
+                if name not in (override or {}) or "accelerator" not in (override or {}):
+                    fsdp_config["fsdp_mode"] = "fsdp2"
         runtime_modules[name] = _instantiate_recursive(OmniModuleRuntimeArguments, merged)
     return runtime_modules
 

@@ -157,10 +157,16 @@ so the transform commutes with the `Shard(0)` split the ExtraParallel plan makes
 The streaming loader then reads the same `[start, end)` row range of both keys
 (and never reads the companion on its own), zero-fills rows past the checkpoint,
 and hands the pair to `convert_rows`. A key outside every ExtraParallel plan is
-read whole, together with its whole companion. `can_handle_tensor` is checked at
-the same point: a converter that claims a key by its content -- a quantized weight
-it would dequantize -- makes the streaming loader raise rather than hand the raw
-tensor to the parameter.
+read whole, together with its whole companion.
+
+`can_handle_tensor` still receives the **raw** tensor, because claiming a key by
+content is how a quantized dense weight is recognised at all. What differs is
+what happens next: a dense (non-ExtraParallel) key is read whole and handed to
+`maybe_convert_checkpoint_tensor`, so its content-claimed conversion runs
+normally; only on the **sharded** path, where the loader has already sliced the
+tensor and cannot run a whole-tensor conversion, does a content-claimed key raise
+instead of reaching the parameter raw. Do not disable `ep_sharded_stream_load`
+for a supported dense conversion — it is not affected.
 
 ### Saving (VeOmni modeling -> checkpoint)
 

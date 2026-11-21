@@ -541,10 +541,18 @@ def _divide_extra_parallel_grads_like_fsdp(model: "nn.Module", parallel_state, f
     (the world size), so without this an unwrapped module would take steps
     ``world_size`` times larger than the same module under FSDP2. A tensor hook
     runs before accumulation, so gradient accumulation stays correct.
+
+    Persistent parameters are skipped: their operator owns the whole sharded
+    parameter for the forward/backward lifecycle and already averages in its own
+    backward (Qwen4-Exp PLE's ``_Qwen4ExpScaleGradient`` divides by the same
+    factor), so a hook here would divide a second time and leave the gradient
+    ``world_size`` times too small.
     """
     for fqn, param in model.named_parameters():
         spec_info = (fqn2spec_info or {}).get(fqn)
         if not param.requires_grad or spec_info is None or not isinstance(spec_info.placement, Shard):
+            continue
+        if spec_info.persistent_fsdp_shard_dim is not None:
             continue
         para = spec_info.para_name
         if not parallel_state.extra_parallel_enabled(para):
@@ -607,6 +615,14 @@ def parallelize_model_fsdp2(
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
     parallel_state = get_parallel_state()
+    if extra_parallel_only and compile_config is not None and compile_config.enable:
+        # `validate_compile_runtime` below would reject ExtraParallel + compile,
+        # and the unwrapped path returns before reaching it. Fail up front rather
+        # than run eager while the config claims otherwise.
+        raise RuntimeError(
+            "model.accelerator.torch_compile.enable is not supported with "
+            "fsdp_config.extra_parallel_only: there is no FSDP2 wrap to compile decoder blocks under."
+        )
     reject_qat_without_native_bf16(model)
 
     validate_float8_training(

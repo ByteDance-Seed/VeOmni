@@ -840,6 +840,7 @@ class TestConsolidationWait(unittest.TestCase):
             patch(f"{_MOD}.dcp", MagicMock(save=MagicMock())),
             patch(f"{_MOD}.dist", fake_dist),
             patch(f"{_MOD}._consolidation_group", None),
+            patch(f"{_MOD}._consolidation_group_owner", None),
             patch(f"{_MOD}.save_model_assets", MagicMock()),
             patch(f"{_MOD}.helper", MagicMock()),
             patch(f"{_MOD}.gc", MagicMock()),
