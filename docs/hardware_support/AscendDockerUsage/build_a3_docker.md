@@ -1,11 +1,11 @@
-# Ascend A3 Docker Image Build and Usage Guide
+# Atlas A3 training products Docker Image Build and Usage Guide
 
 ## Overview
-This guide provides step-by-step instructions for building and using the Ascend A3 Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Ascend A3 accelerators.
+This guide provides step-by-step instructions for building and using the Atlas A3 training products Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Atlas A3 training products accelerators.
 
 ## Prerequisites
 - Docker installed on your system
-- Access to Ascend A3 hardware accelerators
+- Access to Atlas A3 training products hardware accelerators
 - Network access to pull the base image and install dependencies
 - Proxy configuration (if required in your environment)
 
@@ -19,7 +19,7 @@ docker pull --platform=arm64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1
 ```
 
 ## Step 2: Build the Custom Image
-Build the GDN-ready VeOmni Ascend A3 image using the provided Dockerfile. It includes `torch-npu==2.10.0.post2`, `triton-ascend`, and `fla_npu`. The existing `Dockerfile.ascend_9.0.0_a3` remains available for the general-purpose image.
+Build the GDN-ready VeOmni Atlas A3 training products image using the provided Dockerfile. It includes `torch-npu==2.10.0.post2`, `triton-ascend`, and `fla_npu`. The existing `Dockerfile.ascend_9.0.0_a3` remains available for the general-purpose image.
 
 **Note:** Proxy settings are optional and only needed if your server requires proxy access to the internet. Remove the proxy arguments if not needed.
 

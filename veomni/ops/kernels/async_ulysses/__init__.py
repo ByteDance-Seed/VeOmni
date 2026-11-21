@@ -14,13 +14,15 @@
 
 """Async Ulysses compound kernels.
 
-``async_ulysses_qkv`` / ``async_ulysses_o`` each have ``standard`` and ``dit``
-eager rows. Nested RMSNorm and LayerNorm use raw kernel pairs.
+``async_ulysses_qkv`` / ``async_ulysses_o`` each have ``standard``, ``dit``,
+and ``bagel`` eager rows. Nested RMSNorm, LayerNorm, and RoPE use raw kernel pairs.
 """
 
 from ...registry import register_op
+from .o_proj.bagel import eager as o_bagel
 from .o_proj.dit import eager as o_dit
 from .o_proj.standard import eager as o_standard
+from .qkv_proj.bagel import eager as qkv_bagel
 from .qkv_proj.dit import eager as qkv_dit
 from .qkv_proj.standard import eager as qkv_standard
 
@@ -42,6 +44,14 @@ register_op(
     description="VeOmni asynchronous Ulysses QKV projection for diffusion transformers",
 )
 register_op(
+    "async_ulysses_qkv",
+    "bagel",
+    "eager",
+    qkv_bagel.forward,
+    qkv_bagel.backward,
+    description="VeOmni asynchronous Ulysses QKV projection for BAGEL two-route MoT attention",
+)
+register_op(
     "async_ulysses_o",
     "standard",
     "eager",
@@ -56,4 +66,12 @@ register_op(
     o_dit.forward,
     o_dit.backward,
     description="VeOmni asynchronous Ulysses output projection for diffusion transformers",
+)
+register_op(
+    "async_ulysses_o",
+    "bagel",
+    "eager",
+    o_bagel.forward,
+    o_bagel.backward,
+    description="VeOmni asynchronous Ulysses output projection for BAGEL two-route MoT attention",
 )

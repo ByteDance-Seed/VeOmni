@@ -125,13 +125,21 @@ class OmniEnvironMeter:
 
         Called once per micro-batch.  **Token lengths are NOT computed here** —
         they come from the modules' metric meters at :meth:`step`.  Here we only count
-        the training samples (one per conversation) and, for multi-source, gather
-        the per-sample dataset indices.
+        the training samples (one per conversation, or one per packed sequence) and,
+        for multi-source, gather the per-sample dataset indices.
         """
         conversation_list = micro_batch.get("conversation_list")
         if conversation_list is not None:
             self.batch_count += len(conversation_list)
+        elif "packed_input_ids" in micro_batch:
+            # A packed batch carries no carrier, so the count above does not apply.
+            # Its samples are the packed sequences the collator joined, and
+            # `packed_cu_seqlens` has one boundary per sample — the count that does
+            # not depend on multi-source metadata being attached.
+            cu = micro_batch.get("packed_cu_seqlens")
+            self.batch_count += max(0, int(cu.numel()) - 1) if cu is not None else 1
         if self.enable_multisource:
+            # Pops `ds_idx` / `source_name` / `cur_token_num` off the batch.
             self.batch_ds_idx.extend(_get_multisource_ds_idx(micro_batch))
 
     def step(

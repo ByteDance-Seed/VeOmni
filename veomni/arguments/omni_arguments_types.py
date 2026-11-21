@@ -120,18 +120,28 @@ def _resolve_hf_checkpoint_view(model_runtime: OmniModelRuntimeArguments) -> str
 
 def _check_hf_source_exportable(model_path: str) -> None:
     """Fail at startup, not at the first HF save, when the source cannot be written back."""
-    from ..models.seed_omni.utils.hf_layout import read_hf_source, source_tensor_specs, source_weight_files
+    from ..models.seed_omni.utils.hf_layout import read_hf_source, source_tensor_specs
 
     source = read_hf_source(model_path)
     if source is None:
         return
     try:
-        weight_files = source_weight_files(source.path)
+        weight_files = source.layout.source_weight_files(source.path)
     except FileNotFoundError as e:
         raise ValueError(
-            f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights: {e} "
+            f"`train.checkpoint.save_hf_weights` exports in the source layout, which needs recognised weights: {e} "
             "Convert the checkpoint to safetensors, or disable save_hf_weights."
         ) from e
+    # Reading the source for *loading* accepts either serialization, but writing
+    # it back keys the output on safetensors headers (`source_tensor_specs`), so
+    # a pickle root has to be refused here rather than deep inside the writer.
+    non_safetensors = sorted({name for name in weight_files.values() if not name.endswith(".safetensors")})
+    if non_safetensors:
+        raise ValueError(
+            "`train.checkpoint.save_hf_weights` exports in the source layout, which needs safetensors weights; "
+            f"this checkpoint stores {non_safetensors}. Convert the checkpoint to safetensors "
+            "(e.g. `model.save_pretrained(out, safe_serialization=True)`), or disable save_hf_weights."
+        )
     try:
         source_tensor_specs(source.path, weight_files)
     except ValueError as e:
@@ -238,9 +248,11 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
     infer_graph_from_ckpt = not infer_graph and omni_cfg is not None
     if infer_graph_from_ckpt:
         infer_graph = omni_cfg.generation_graphs
-    if not infer_graph:
+    # A training-only model (no sampler yet) declares no generation graph; only
+    # inference needs one, and ``OmniModel.generate`` names what is missing.
+    if not infer_graph and for_inference:
         raise ValueError(
-            "`model.model_config.infer_graph` is required when `model_path` has no omni "
+            "`model.model_config.infer_graph` is required for inference when `model_path` has no omni "
             "`config.json` generation graphs."
         )
 
@@ -255,7 +267,15 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         infer_type = omni_cfg.infer_type
 
     train_type = _resolve_graph_type(args, model_runtime, train_graph, "train_type", train_type)
-    infer_type = _resolve_graph_type(args, model_runtime, infer_graph, "infer_type", infer_type)
+    if infer_graph:
+        infer_type = _resolve_graph_type(args, model_runtime, infer_graph, "infer_type", infer_type)
+    elif model_runtime.launcher_config("infer_type") is not None:
+        raise ValueError(
+            f"`model.model_config.infer_type` is {model_runtime.launcher_config('infer_type')!r}, "
+            "but no `infer_graph` is declared."
+        )
+    else:
+        infer_type = None
 
     modules = build_omni_module_runtime_args(
         _to_module_global_args(model_runtime),
@@ -272,7 +292,7 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
     _validate_composed_wrap(model_runtime.accelerator, modules)
     _validate_omni_dp_size(model_runtime.accelerator, modules)
     training_graphs = _load_graph_map(train_graph)
-    generation_graphs = _load_graph_map(infer_graph)
+    generation_graphs = _load_graph_map(infer_graph) if infer_graph else {}
     if train_type is not None and train_type not in training_graphs:
         known = ", ".join(training_graphs)
         raise KeyError(f"Unknown train_type {train_type!r}; expected one of: {known}.")
@@ -290,7 +310,10 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         generation_graphs=generation_graphs,
         train_type=train_type,
         infer_type=infer_type,
-        generation_kwargs=dict(args.infer.generation_kwargs),
+        generation_kwargs={
+            **(omni_cfg.generation_kwargs or {} if omni_cfg is not None else {}),
+            **args.infer.generation_kwargs,
+        },
     )
 
 
@@ -339,11 +362,19 @@ def build_omni_module_runtime_args(
     )
 
     base_dict = _module_base(asdict(global_args))
+    # ``skip_sp_gather_between_modules`` is a property of the whole graph, not of
+    # one module: it says every module's ``post_forward`` hands its SP shard on
+    # instead of all-gathering. Enforcing the top-level value here means a
+    # per-module YAML entry cannot desynchronise the two sides of a handoff.
+    global_skip_sp_gather = bool(base_dict.get("accelerator", {}).get("skip_sp_gather_between_modules", False))
     runtime_modules: dict[str, OmniModuleRuntimeArguments] = {}
     for name, override in modules_overrides.items():
         merged = deepcopy(base_dict)
         for layer in (checkpoint_defaults.get(name, {}), inference_default, override or {}):
             _deep_update(merged, layer)
+        merged_acc = merged.setdefault("accelerator", {})
+        if isinstance(merged_acc, dict):
+            merged_acc["skip_sp_gather_between_modules"] = global_skip_sp_gather
         runtime_modules[name] = _instantiate_recursive(OmniModuleRuntimeArguments, merged)
     return runtime_modules
 
@@ -938,19 +969,44 @@ class OmniArguments:
             train_size = int(self.data.train_size * (1 + self.train.bsz_warmup_ratio / 2))
             self._train_steps = math.ceil(train_size / (self.train.global_batch_size * self.data.max_seq_len))
         else:
-            if dataset_length is not None:
+            if (
+                dataset_length is not None
+                and self.train.training_task == "offline_embedding"
+                and self.data.datasets_type == "mapping"
+            ):
+                # Encode-only: every row must reach the cache. The sampler pads each dp rank to
+                # ceil(len / dp_size) rows, so round up and keep the last, shorter batch.
+                if self.train.gradient_accumulation_steps != 1 or self.data.dataloader.drop_last:
+                    raise ValueError(
+                        "train.training_task='offline_embedding' on a mapping dataset encodes every row, so it "
+                        "needs data.dataloader.drop_last=false and no gradient accumulation (leave "
+                        "train.global_batch_size unset or equal to micro_batch_size * dp_size)."
+                    )
+                self._train_steps = math.ceil(dataset_length / self.train.dataloader_batch_size)
+            elif dataset_length is not None:
                 self._train_steps = math.floor(dataset_length / self.train.dataloader_batch_size)
             else:
                 self._train_steps = math.ceil(self.data.train_sample / self.train.dataloader_batch_size)
 
     @property
     def train_steps(self) -> int:
+        if self._train_steps == -1:
+            raise ValueError("Please run `compute_train_steps` first!")
+
+        if (
+            self.train.training_task == "offline_embedding"
+            and self.train.max_steps is not None
+            and self._train_steps > self.train.max_steps
+        ):
+            raise ValueError(
+                "`train.max_steps` would truncate the offline_embedding dataset: "
+                f"the full run requires {self._train_steps} steps, but max_steps={self.train.max_steps}. "
+                "Remove `train.max_steps` or set it to at least the full step count."
+            )
+
         if self.train.max_steps is not None and self._train_steps >= self.train.max_steps:
             logger.warning_once(f"Set train_steps to {self.train.max_steps}. It should be for debug purpose only.")
             return self.train.max_steps
-
-        if self._train_steps == -1:
-            raise ValueError("Please run `compute_train_steps` first!")
 
         return self._train_steps
 
