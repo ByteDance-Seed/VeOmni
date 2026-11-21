@@ -4,7 +4,7 @@ Each linked YAML runs three optimizer steps with global batch size 8 on one node
 
 Full-weight checks also inspected the loader for missing foundation-model parameters. Qwen3.5 and the eight-layer DeepSeek-V4 checkpoint use the main training tower. Their optional MTP heads are outside these recipes. Qwen-Omni uses the thinker for understanding. Its speech-generation heads are outside those checks.
 
-The CUDA host used eight NVIDIA H20 GPUs with PyTorch 2.11. The Ascend host used eight 910B2 NPUs with torch-npu 2.10 and CANN 8.3.RC2. Both ran Transformers 5.16.1. The image-input Qwen VLM checks used ShareGPT4V conversations and confirmed an image tensor on each rank. Text checks used Tulu 3 conversations, either with the chat template or with message contents joined by newlines for plaintext training. LoRA checks load the checkpoint at its original model size and train adapters. Reduced-model entries identify narrower coverage explicitly.
+The CUDA host used eight NVIDIA H20 GPUs with PyTorch 2.11. The Ascend host used eight 910B2 NPUs with torch-npu 2.10 and CANN 8.3.RC2. Both ran Transformers 5.16.1. The image-input Qwen VLM checks used ShareGPT4V conversations and confirmed an image tensor on each rank. Text checks used Tulu 3 conversations, either with the chat template or with message contents joined by newlines for plaintext training. LoRA checks load the checkpoint at its original model size and train adapters. Reduced text models use a 37-token test vocabulary where the YAML specifies the shared test tokenizer.
 
 | Checkpoint or model | Training scope | 8 × H20 | 8 × 910B2 |
 | --- | --- | --- | --- |
@@ -29,7 +29,7 @@ The CUDA host used eight NVIDIA H20 GPUs with PyTorch 2.11. The Ascend host used
 | Qwen2.5-0.5B-Instruct | full tuning, text | [1.95 / 1.60 / 1.94](../../configs/models/qwen2_5/cuda.yaml) | [1.95 / 1.60 / 1.94](../../configs/models/qwen2_5/ascend.yaml) |
 | Qwen2-VL-7B-Instruct | full tuning, image + text | [1.18 / 0.92 / 0.77](../../configs/models/qwen2_vl/cuda.yaml) | [1.18 / 0.92 / 0.77](../../configs/models/qwen2_vl/ascend.yaml) |
 | Qwen2.5-VL-3B-Instruct | full tuning, image + text | [1.26 / 1.21 / 0.92](../../configs/models/qwen2_5_vl/cuda.yaml) | [1.26 / 1.21 / 0.93](../../configs/models/qwen2_5_vl/ascend.yaml) |
-| Qwen2.5-Omni-3B | Reduced architecture, full tuning, image + text | [12.76 / 12.10 / 11.71](../../configs/models/qwen2_5_omni/cuda.yaml) | [12.61 / 11.88 / 11.55](../../configs/models/qwen2_5_omni/ascend.yaml) |
+| Qwen2.5-Omni-3B | full tuning, image + text | [1.61 / 1.37 / 0.97](../../configs/models/qwen2_5_omni/cuda.yaml) | [1.62 / 1.37 / 0.97](../../configs/models/qwen2_5_omni/ascend.yaml) |
 | Qwen3-30B-A3B | LoRA, text | [1.71 / 1.51 / 1.50](../../configs/models/qwen3_moe/cuda.yaml) | [1.70 / 1.51 / 1.50](../../configs/models/qwen3_moe/ascend.yaml) |
 | Qwen3-VL-30B-A3B-Instruct | LoRA, image + text | [1.34 / 1.33 / 1.22](../../configs/models/qwen3_vl_moe/cuda.yaml) | [1.34 / 1.33 / 1.22](../../configs/models/qwen3_vl_moe/ascend.yaml) |
 | Qwen3-Omni-30B-A3B-Instruct | LoRA, image + text | [1.17 / 1.18 / 1.07](../../configs/models/qwen3_omni_moe/cuda.yaml) | [1.17 / 1.18 / 1.06](../../configs/models/qwen3_omni_moe/ascend.yaml) |
@@ -48,8 +48,8 @@ This sweep covers 33 variants across 24 support-matrix rows. Qwen3 and Qwen3-VL 
 
 | Host | Original-size checkpoint | Reduced model, trainer | Reduced DiT only | Without a passing check | Total |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 8 × H20 | 22 | 9 | 2 | 0 | 33 |
-| 8 × 910B2 | 19 | 8 | 2 | 4 | 33 |
+| 8 × H20 | 23 | 8 | 2 | 0 | 33 |
+| 8 × 910B2 | 20 | 7 | 2 | 4 | 33 |
 
 ## Running a linked example
 
@@ -57,7 +57,7 @@ From the repository root, put the checkpoint at the path in the YAML and provide
 
 For conversation or plaintext input, use a Parquet file with a `messages` column (role/content conversations) or a `text` column (strings), respectively. For image SFT, use ShareGPT4V rows with resolvable images and the configured source name. See the [Tulu data example](qwen3.md) and [image-data example](qwen3_vl.md).
 
-Video DiT checks use the Tom-and-Jerry sample schema (`prompt`, `video_bytes`). Qwen-Image accepts `text` and `image_bytes`. Qwen-Image-Edit also requires a source image. See the [diffusion image guide](qwen_image_edit.md) and [video preparation](hunyuanvideo15.md). MiniMax-H3 FL2VA and Ref2VA use precomputed conditioning and latent tensors in the [offline training schema](minimax_h3.md). Ref2VA also requires reference visual tokens and their unconditional CFG counterparts.
+Video DiT checks use the Tom-and-Jerry sample schema (`prompt`, `video_bytes`). Qwen-Image accepts `text` and `image_bytes`. Qwen-Image-Edit also requires a source image. See the [diffusion image guide](qwen_image_edit.md) and [video preparation](hunyuanvideo15.md). MiniMax-H3 FL2VA and Ref2VA use precomputed conditioning and latent tensors in the [offline training schema](minimax_h3.md). Ref2VA also requires reference visual tokens and their unconditional CFG counterparts. The MiniMax-H3 training row covers FL2VA and Ref2VA. The [H3-Image guide](minimax_h3_image.md) covers inference.
 
 DeepSeek-V3 and DeepSeek-R1 share the same released architecture. Their reduced runs used the same two-layer configuration and separately executed training. The loss values describe that configuration. The DeepSeek-V2.5 small run uses `MODELING_BACKEND=hf`; the native registry lacks `deepseek_v2`.
 
@@ -85,11 +85,11 @@ The [Qwen3-0.6B](qwen3.md) and [Qwen3-VL-2B-Instruct](qwen3_vl.md) guides give t
 | Qwen3.5-35B-A3B | 910B2 | Triton-Ascend linear-attention kernel did not compile in this environment |
 | Qwen3.8-Flash-Next | 910B2 | Triton-Ascend linear-attention kernel did not compile in this environment |
 
-## Additional audio-input check
+## Additional audio-input checks
 
-Qwen3-Omni thinker also trained on VoiceAssistant utterances in a separate eight-device run with audio features on every rank.
+The listed Qwen-Omni thinkers also trained on VoiceAssistant utterances in separate eight-device runs with audio features on every rank. The cells give the three training losses.
 
-| Host | Training losses |
-| --- | --- |
-| H20 | 2.17 / 2.28 / 2.35 |
-| 910B2 | 2.16 / 2.27 / 2.35 |
+| Checkpoint | 8 × H20 | 8 × 910B2 |
+| --- | --- | --- |
+| Qwen2.5-Omni-3B | 2.59 / 2.32 / 2.01 | 2.59 / 2.32 / 2.01 |
+| Qwen3-Omni-30B-A3B-Instruct | 2.17 / 2.28 / 2.35 | 2.16 / 2.27 / 2.35 |
