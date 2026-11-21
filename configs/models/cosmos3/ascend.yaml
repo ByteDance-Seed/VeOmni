@@ -1,5 +1,7 @@
-# Cosmos3-Nano on 8 × 910B2.
-# NPROC_PER_NODE=8 bash train.sh tasks/omni/train_omni.py configs/models/cosmos3/ascend.yaml
+# hf download nvidia/Cosmos3-Nano --local-dir ./Cosmos3-Nano
+# Preparation: docs/seed_omni/models/cosmos3.md
+# bash train.sh tasks/omni/train_omni.py configs/models/cosmos3/ascend.yaml
+
 model:
   model_path: ./Cosmos3-Nano
   model_config:
@@ -46,8 +48,6 @@ data:
   source_name: cosmos3_sft_jsonl
   max_seq_len: 45056
   dyn_bsz_buffer_size: 1
-  dataloader:
-    num_workers: 0
   mm_configs:
     data_dir: dataset/cosmos3-demo
     fps: null
@@ -59,16 +59,11 @@ train:
   micro_batch_size: 1
   dyn_bsz: true
   bsz_warmup_ratio: 0.0
-  max_steps: 3
   num_train_epochs: 1
   seed: 42
   checkpoint:
     output_dir: outputs/cosmos3/ascend
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
   wandb:
-    enable: false
-  profile:
     enable: false

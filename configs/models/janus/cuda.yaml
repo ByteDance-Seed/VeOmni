@@ -1,5 +1,8 @@
-# Janus-1.3B on 8 × H20.
-# NPROC_PER_NODE=8 bash train.sh tasks/omni/train_omni.py configs/models/janus/cuda.yaml
+# hf download deepseek-ai/Janus-1.3B --local-dir ./Janus-1.3B
+# python scripts/seed_omni/convert_model.py --model_path ./Janus-1.3B --output_dir ./Janus-1.3B-split
+# Preparation: docs/seed_omni/models/janus.md
+# bash train.sh tasks/omni/train_omni.py configs/models/janus/cuda.yaml
+
 model:
   model_path: ./Janus-1.3B-split
   model_config:
@@ -83,8 +86,6 @@ data:
   datasets_type: mapping
   multisource_datasets_type: veomni_weighted_multisource
   train_sample: 1000000
-  dataloader:
-    num_workers: 0
   source_name: sharegpt4v_sft
 train:
   seed: 42
@@ -95,13 +96,8 @@ train:
   checkpoint:
     output_dir: outputs/janus/cuda
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
   wandb:
-    enable: false
-  max_steps: 3
-  profile:
     enable: false
 infer:
   generation_kwargs:

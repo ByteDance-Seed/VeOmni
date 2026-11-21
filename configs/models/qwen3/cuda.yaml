@@ -1,4 +1,7 @@
-# Qwen3-0.6B SFT on NVIDIA CUDA. See docs/examples/qwen3.md for data preparation.
+# hf download Qwen/Qwen3-0.6B --local-dir ./Qwen3-0.6B
+# Preparation: docs/examples/qwen3.md
+# bash train.sh tasks/train_text.py configs/models/qwen3/cuda.yaml
+
 model:
   model_path: ./Qwen3-0.6B
   chat_template: chatml

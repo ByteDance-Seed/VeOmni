@@ -1,8 +1,0 @@
-{
-  "backend": "tokenizers",
-  "eos_token": "[EOS]",
-  "model_max_length": 128,
-  "pad_token": "[PAD]",
-  "tokenizer_class": "TokenizersBackend",
-  "unk_token": "[UNK]"
-}

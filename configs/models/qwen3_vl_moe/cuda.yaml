@@ -1,5 +1,6 @@
-# Qwen3-VL-30B-A3B-Instruct on 8 × H20.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py configs/models/qwen3_vl_moe/cuda.yaml
+# hf download Qwen/Qwen3-VL-30B-A3B-Instruct --local-dir ./Qwen3-VL-30B-A3B-Instruct
+# bash train.sh tasks/train_vlm.py configs/models/qwen3_vl_moe/cuda.yaml
+
 model:
   model_path: ./Qwen3-VL-30B-A3B-Instruct
   ops_implementation:
@@ -40,22 +41,15 @@ data:
     fps: 2.0
     use_audio_in_video: false
   datasets_type: mapping
-  dataloader:
-    num_workers: 0
   source_name: sharegpt4v_sft
 train:
   num_train_epochs: 1
   micro_batch_size: 1
   global_batch_size: 8
-  max_steps: 3
   checkpoint:
     output_dir: outputs/qwen3_vl_moe/cuda
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
   wandb:
-    enable: false
-  profile:
     enable: false
   dyn_bsz: false

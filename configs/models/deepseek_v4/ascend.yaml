@@ -1,7 +1,8 @@
-# Reduced-model check for DeepSeek-V4-Flash-Base-Mini-BF16 on 8 × 910B2.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/deepseek_v4/ascend.yaml
+# hf download deepseek-ai/DeepSeek-V4-Flash-Base --local-dir ./DeepSeek-V4-Flash-Base
+# bash train.sh tasks/train_text.py configs/models/deepseek_v4/ascend.yaml
+
 model:
-  model_path: ./DeepSeek-V4-Flash-Base-Mini-BF16
+  model_path: ./DeepSeek-V4-Flash-Base
   chat_template: chatml
   ops_implementation:
     attn_implementation: eager
@@ -30,23 +31,16 @@ data:
   train_path: ./data/text.parquet
   data_type: plaintext
   text_keys: text
-  max_seq_len: 192
+  max_seq_len: 2048
   datasets_type: mapping
-  dataloader:
-    num_workers: 0
 train:
   dyn_bsz: false
-  global_batch_size: 8
+  global_batch_size: null
   micro_batch_size: 1
   num_train_epochs: 1
   checkpoint:
     output_dir: outputs/deepseek_v4/ascend
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
-  max_steps: 3
   wandb:
-    enable: false
-  profile:
     enable: false

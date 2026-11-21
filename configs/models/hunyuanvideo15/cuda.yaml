@@ -1,5 +1,7 @@
-# HunyuanVideo 1.5 on 8 × H20.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_dit.py configs/models/hunyuanvideo15/cuda.yaml
+# hf download tencent/HunyuanVideo-1.5 --local-dir ./HunyuanVideo-1.5
+# Preparation: docs/examples/hunyuanvideo15.md
+# bash train.sh tasks/train_dit.py configs/models/hunyuanvideo15/cuda.yaml
+
 model:
   model_path: ./HunyuanVideo-1.5/transformer/480p_t2v
   config_path: ./configs/model_configs/hunyuanvideo15/480p_t2v.json
@@ -53,12 +55,9 @@ data:
     max_frames: 9
     frame_factor: 4
     frame_factor_remainder: 1
-  dataloader:
-    num_workers: 0
 train:
   training_task: online_training
   seed: 42
-  max_steps: 3
   num_train_epochs: 1
   global_batch_size: 8
   micro_batch_size: 1
@@ -66,10 +65,6 @@ train:
   checkpoint:
     output_dir: outputs/hunyuanvideo15/cuda
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
   wandb:
-    enable: false
-  profile:
     enable: false

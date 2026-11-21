@@ -1,5 +1,6 @@
-# Qwen2.5-Omni-3B on 8 × H20.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py configs/models/qwen2_5_omni/cuda.yaml
+# hf download Qwen/Qwen2.5-Omni-3B --local-dir ./Qwen2.5-Omni-3B
+# bash train.sh tasks/train_vlm.py configs/models/qwen2_5_omni/cuda.yaml
+
 model:
   model_path: ./Qwen2.5-Omni-3B
   optimizer:
@@ -14,8 +15,6 @@ data:
   train_path: ./data/sharegpt4v.parquet
   data_type: conversation
   max_seq_len: 1024
-  dataloader:
-    num_workers: 0
   mm_configs:
     scale_factor: 28
     image_min_pixels: 3136
@@ -37,13 +36,8 @@ train:
   num_train_epochs: 1
   micro_batch_size: 1
   global_batch_size: 8
-  max_steps: 3
   checkpoint:
     output_dir: outputs/qwen2_5_omni/cuda
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
-  profile:
-    enable: false
   dyn_bsz: false

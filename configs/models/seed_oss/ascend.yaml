@@ -1,5 +1,7 @@
-# Seed-OSS-36B-Base on 8 × 910B2.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/seed_oss/ascend.yaml
+# hf download ByteDance-Seed/Seed-OSS-36B-Base --local-dir ./Seed-OSS-36B-Base
+# Preparation: docs/examples/seed_oss.md
+# bash train.sh tasks/train_text.py configs/models/seed_oss/ascend.yaml
+
 model:
   model_path: ./Seed-OSS-36B-Base
   optimizer:
@@ -23,8 +25,6 @@ model:
     - o_proj
 data:
   train_path: ./data/text.parquet
-  dataloader:
-    num_workers: 0
   datasets_type: mapping
   data_type: plaintext
   max_seq_len: 1024
@@ -36,13 +36,8 @@ train:
   checkpoint:
     output_dir: outputs/seed_oss/ascend
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
   wandb:
     enable: false
-  max_steps: 3
   num_train_epochs: 1
-  profile:
-    enable: false
   dyn_bsz: false

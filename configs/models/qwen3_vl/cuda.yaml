@@ -1,4 +1,7 @@
-# Qwen3-VL-2B image SFT on NVIDIA CUDA. See docs/examples/qwen3_vl.md.
+# hf download Qwen/Qwen3-VL-2B-Instruct --local-dir ./Qwen3-VL-2B-Instruct
+# Preparation: docs/examples/qwen3_vl.md
+# bash train.sh tasks/train_vlm.py configs/models/qwen3_vl/cuda.yaml
+
 model:
   model_path: ./Qwen3-VL-2B-Instruct
   chat_template: qwen3vl

@@ -1,45 +1,45 @@
-# Reduced-model check for Qwen3.8-Flash-Next on 8 × H20.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/qwen3_8_flash_next/cuda.yaml
+# hf download Qwen/Qwen3.8-Flash-Next --local-dir ./Qwen3.8-Flash-Next
+# bash train.sh tasks/train_text.py configs/models/qwen3_8_flash_next/cuda.yaml
+
 model:
-  model_path: ./qwen3_8_flash_next-small
-  chat_template: chatml
+  model_path: ./Qwen3.8-Flash-Next
   ops_implementation:
     attn_implementation: sdpa
-    moe_implementation: eager
-    rotary_pos_emb_implementation: eager
-    rms_norm_implementation: eager
-    gated_mlp_implementation: eager
-    cross_entropy_loss_implementation: eager
-    load_balancing_loss_implementation: eager
+    moe_implementation: fused_triton
   accelerator:
-    init_device: meta
+    ulysses_size: 1
+    cp_size: 1
+    ep_size: 4
+    extra_parallel_names: [ple]
+    extra_parallel_sizes: [8]
+    extra_parallel_placement_innermost: [false]
     fsdp_config:
       fsdp_mode: fsdp2
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
   optimizer:
-    type: adamw
-    lr: 0.0001
-  tokenizer_path: configs/models/_fixtures/text_tokenizer
+    lr: 1.0e-5
+    lr_decay_style: cosine
+  broadcast_model_weights_from_rank0: false
+  ep_sharded_stream_load: true
+  chat_template: chatml
+
 data:
-  train_path: ./data/text.parquet
-  data_type: plaintext
-  text_keys: text
-  max_seq_len: 128
-  datasets_type: mapping
-  dataloader:
-    num_workers: 0
+  train_path: tulu-3-sft-mixture/data
+  data_type: conversation
+  max_seq_len: 16384
+  train_size: 750000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
 train:
-  dyn_bsz: false
-  global_batch_size: 8
+  wandb:
+    enable: false
+  num_train_epochs: 2
   micro_batch_size: 1
-  num_train_epochs: 1
+  global_batch_size: null
   checkpoint:
     output_dir: outputs/qwen3_8_flash_next/cuda
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
-  max_steps: 3
-  wandb:
-    enable: false
-  profile:
-    enable: false

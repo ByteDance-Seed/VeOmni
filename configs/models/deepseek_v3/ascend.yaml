@@ -1,6 +1,8 @@
-# Reduced-model check for DeepSeek-V3 on 8 × 910B2.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/deepseek_v3/ascend.yaml
+# hf download unsloth/DeepSeek-V3-bf16 --local-dir ./DeepSeek-V3-bf16
+# bash train.sh tasks/train_text.py configs/models/deepseek_v3/ascend.yaml
+
 model:
+  model_path: ./DeepSeek-V3-bf16
   chat_template: chatml
   ops_implementation:
     attn_implementation: flash_attention_2
@@ -17,29 +19,20 @@ model:
   optimizer:
     type: adamw
     lr: 0.0001
-  config_path: configs/models/deepseek_v3/small
-  tokenizer_path: configs/models/_fixtures/text_tokenizer
 data:
   train_path: ./data/text.parquet
   data_type: plaintext
   text_keys: text
-  max_seq_len: 128
+  max_seq_len: 2048
   datasets_type: mapping
-  dataloader:
-    num_workers: 0
 train:
   dyn_bsz: false
-  global_batch_size: 8
+  global_batch_size: null
   micro_batch_size: 1
   num_train_epochs: 1
   checkpoint:
     output_dir: outputs/deepseek_v3/ascend
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
-  max_steps: 3
   wandb:
-    enable: false
-  profile:
     enable: false

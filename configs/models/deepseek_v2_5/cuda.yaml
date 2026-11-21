@@ -1,6 +1,8 @@
-# Reduced-model check for DeepSeek-V2.5 on 8 × H20.
-# MODELING_BACKEND=hf NPROC_PER_NODE=8 bash train.sh tasks/train_text.py configs/models/deepseek_v2_5/cuda.yaml
+# hf download deepseek-ai/DeepSeek-V2.5 --local-dir ./DeepSeek-V2.5
+# MODELING_BACKEND=hf bash train.sh tasks/train_text.py configs/models/deepseek_v2_5/cuda.yaml
+
 model:
+  model_path: ./DeepSeek-V2.5
   chat_template: chatml
   ops_implementation:
     attn_implementation: eager
@@ -17,29 +19,20 @@ model:
   optimizer:
     type: adamw
     lr: 0.0001
-  config_path: configs/models/deepseek_v2_5/small
-  tokenizer_path: configs/models/_fixtures/text_tokenizer
 data:
   train_path: ./data/text.parquet
   data_type: plaintext
   text_keys: text
-  max_seq_len: 128
+  max_seq_len: 2048
   datasets_type: mapping
-  dataloader:
-    num_workers: 0
 train:
   dyn_bsz: false
-  global_batch_size: 8
+  global_batch_size: null
   micro_batch_size: 1
   num_train_epochs: 1
   checkpoint:
     output_dir: outputs/deepseek_v2_5/cuda
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
-  max_steps: 3
   wandb:
-    enable: false
-  profile:
     enable: false

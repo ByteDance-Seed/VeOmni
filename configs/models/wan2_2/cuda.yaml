@@ -1,5 +1,6 @@
-# Wan2.2-TI2V-5B-Diffusers on 8 × H20.
-# NPROC_PER_NODE=8 bash train.sh tasks/train_dit.py configs/models/wan2_2/cuda.yaml
+# hf download Wan-AI/Wan2.2-TI2V-5B-Diffusers --local-dir ./Wan2.2-TI2V-5B-Diffusers
+# bash train.sh tasks/train_dit.py configs/models/wan2_2/cuda.yaml
+
 model:
   model_path: ./Wan2.2-TI2V-5B-Diffusers/transformer
   condition_model_path: ./Wan2.2-TI2V-5B-Diffusers
@@ -50,8 +51,6 @@ data:
   datasets_type: mapping
   data_type: diffusion
   data_transform: dit_online
-  dataloader:
-    num_workers: 0
   text_keys: prompt
 train:
   global_batch_size: 8
@@ -63,11 +62,6 @@ train:
   checkpoint:
     output_dir: outputs/wan2_2/cuda
     manager: dcp
-    save_steps: 3
-    save_epochs: 0
     save_hf_weights: false
   wandb:
-    enable: false
-  max_steps: 3
-  profile:
     enable: false
