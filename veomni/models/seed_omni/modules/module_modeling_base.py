@@ -100,6 +100,35 @@ class PretrainedOmniModule(PreTrainedModel):
     #:   compile win. Its 37 small conv/attention blocks are exactly the shape
     #:   that pays the polymorphic-kernel tax.
     #:
+    #: Why the tax exists, from the generated Triton source of the VQ quantiser's
+    #: distance kernel. Static (sizes known, folded at compile time)::
+    #:
+    #:     def triton_red_fused_add_argmin_sub_2(..., xnumel, r0_numel, XBLOCK, R0_BLOCK):
+    #:         tmp3 = tl.load(in_ptr2 + (r0_1 + 8*x0))            # constant stride, no mask
+    #:
+    #: Dynamic (one stride becomes a runtime argument, every access masked)::
+    #:
+    #:     def triton_red_fused_add_argmin_sub_2(..., ks0, xnumel, r0_numel, XBLOCK, R0_BLOCK):
+    #:         xmask = xindex < xnumel                            # per-thread predicate
+    #:         tmp3 = tl.load(in_ptr2 + (r0_1 + ks0*x0),          # runtime multiply per element
+    #:                        r0_mask & xmask, other=0.0)          # two masks ANDed, filled
+    #:
+    #: Four costs follow: the per-element address stops being a compile-time
+    #: constant (``ks0*x0``); every load/store gains a predicate because Inductor
+    #: can no longer prove ``xnumel % XBLOCK == 0`` (its ``tt.divisibility`` table
+    #: loses the ``xnumel`` entry, visible in the generated ``triton_meta``); some
+    #: fusions break, so the same work compiles to more kernels (10 -> 12 loads and
+    #: stores here), each paying a fixed launch; and autotuning must pick one block
+    #: size that is safe for the whole symbolic range rather than the best one.
+    #:
+    #: That is a fixed per-call cost, so it is only visible when kernels are small
+    #: and called often — exactly a codec of many elementwise blocks. Measured on
+    #: the same quantiser kernel at four sizes (dynamic/static): 0.939x at
+    #: 1152x8192, 0.997x at 9216x8192, 0.984x at 36864x16384. Larger and more
+    #: compute-dense, the tax is hidden; a matmul-heavy backbone never sees it
+    #: because cuBLAS handles any shape itself and there is no per-element
+    #: elementwise code to degrade.
+    #:
     #: So a module whose input shape is fixed by the image processor sets this
     #: ``False`` — the run-level ``dynamic`` flag is then overridden off for this
     #: module only, and the other modules keep it. A module whose shape moves

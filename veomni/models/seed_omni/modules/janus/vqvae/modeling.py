@@ -275,9 +275,12 @@ class JanusVqvae(InferenceMixin, PretrainedOmniModule):
     _supports_flash_attn = True
     _supports_flex_attn = True
     # Measured ~1.73x: 37 conv/attention blocks, where eager launch overhead
-    # dominates. The largest win of any SeedOmni module. Dynamic is left off
-    # deliberately: those same small blocks pay Inductor's polymorphic-kernel
-    # tax, measured 30% slower than static (30.7 -> 44.2 ms/step).
+    # dominates. The largest win of any SeedOmni module.
+    #
+    # ``supports_torch_compile_dynamic`` stays at its ``False`` default: those
+    # same small, frequently-called blocks are what pays Inductor's
+    # shape-polymorphic tax (measured 30% slower than static, 30.7 -> 44.2
+    # ms/step). The mechanism is worked out in the base class docstring.
     #
     # Compiling this module does not change the VQ token ids beyond float noise,
     # and the noise is the codec's own, not the compiler's. Measured on the full
