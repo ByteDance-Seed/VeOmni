@@ -695,10 +695,10 @@ _MOE_LOCAL_3D_NS_CHUNK = 3
 def _chunked_newton_schulz(local: Tensor, ns: "Callable[[Tensor], Tensor]") -> Tensor:
     """Run ``ns`` over a 3D expert stack in chunks of ``_MOE_LOCAL_3D_NS_CHUNK`` experts.
 
-    The result is written into one preallocated stack chunk by chunk. Collecting the
-    chunk outputs in a list and ``torch.cat``-ing them would hold two full stacks at
-    peak (the list plus the concatenation), which is the opposite of the point: at
-    64 experts of ``2048 x 7168`` the second stack alone is 7 GiB.
+    The result is written into one preallocated stack chunk by chunk. Collecting
+    the chunk outputs in a list and ``torch.cat``-ing them would hold a second
+    full stack at peak (the list plus the concatenation), which is the opposite of
+    what the chunking is for.
     """
     if local.shape[0] <= _MOE_LOCAL_3D_NS_CHUNK:
         return ns(local)
