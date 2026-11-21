@@ -25,7 +25,8 @@ import torch
 import yaml
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.arguments import OpsImplementationConfig
+from veomni.arguments import OpsImplementationConfig, VeOmniArguments
+from veomni.arguments.parser import _instantiate_recursive
 from veomni.ops import OP_REGISTRY, OpsSelection, SiteOverride, VeomniOp, register_op
 from veomni.utils.device import IS_NPU_AVAILABLE
 
@@ -131,7 +132,8 @@ def test_per_site_op_selection_and_overrides():
 
     yaml_path = Path(__file__).resolve().parents[3] / "configs" / "text" / "deepseek_v4_mixed_precision.yaml"
     raw = yaml.safe_load(yaml_path.read_text())
-    ops = OpsImplementationConfig(**raw["model"]["ops_implementation"])
+    parsed = _instantiate_recursive(VeOmniArguments, raw)
+    ops = parsed.model.ops_implementation
     assert ops.linear_implementation.resolve("layers.0.q_a_proj") == ("eager", {})
     assert ops.linear_implementation.resolve("layers.1.q_a_proj") == ("qat", {})
     assert ops.gated_mlp_implementation.resolve("layers.0.mlp") == ("liger_kernel", {})

@@ -341,8 +341,10 @@ layers.<i>.indexer     the indexer's stored activations
 layers.<i>.indexer_q_b_proj
 ```
 
-A model that publishes no sites is unaffected: its field is a bare string and the
-site argument is simply unused.
+Projections that do not go through a site-tagged `VeomniOp` (such as plain
+`nn.Linear` router/compressor layers, or models that publish no sites) are
+unaffected by `overrides`, and regexes that match no published site are simply
+unused.
 
 **`kv_round` also accepts per-site overrides.** It rounds *stored* tensors rather
 than GEMM operands, so it has no format/dtype argument — `none` / `eager` /
