@@ -184,7 +184,6 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         dit_config._apply_ops_overrides(ops_implementation=ops_implementation, _validate=False)
         with init_empty_weights():
             pipe.dit = MiniMaxH3DiTModel._from_config(dit_config, torch_dtype=torch_dtype)
-        pipe._keep_dit_fp32_modules()
         load_model_weights(pipe.dit, os.path.join(model_path, "transformer"), init_device="cpu")
         pipe.dit.eval()
         pipe._load_pdd_heads(pdd_state)
@@ -203,20 +202,8 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
                 f"Transformer has {len(final_layer.pdd_out)} PDD heads but the checkpoint has {weight.shape[0]}."
             )
         for index, head in enumerate(final_layer.pdd_out):
-            head.weight.data = weight[index].clone()
-            head.bias.data = bias[index].clone()
-
-    def _keep_dit_fp32_modules(self) -> None:
-        """Preserve the released checkpoint's FP32 projections across loading."""
-        modules = (
-            self.dit.dit.video_patch_proj,
-            self.dit.dit.time_embedder,
-            self.dit.dit.final_layer.video_out,
-            self.dit.dit.final_layer.pdd_out,
-        )
-        for module in modules:
-            if module is not None:
-                module.to(torch.float32)
+            head.weight.data = weight[index].to(head.weight, copy=True)
+            head.bias.data = bias[index].to(head.bias, copy=True)
 
     @staticmethod
     def _parameter_on_device(parameter: torch.Tensor, device: torch.device) -> bool:
@@ -346,7 +333,7 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
                     unique_timesteps = torch.tensor([timestep], dtype=torch.float32, device=self.device)
                     timestep_indices = torch.zeros(sequence_length, dtype=torch.long, device=self.device)
 
-                noise_pred = self.dit.forward_image(
+                noise_pred = self.dit(
                     x=rows,
                     prompt_embeds=prompt_embeds,
                     unique_timesteps=unique_timesteps,

@@ -491,3 +491,68 @@ def test_minimax_native_text_encoder_adapts_qwen_config(monkeypatch):
     assert encoder.config.vision_config.ops_config.attn_implementation == "veomni_sdpa"
     output = encoder.model(input_ids=torch.tensor([[1, 2, 3]]), use_cache=False)
     assert output.last_hidden_state.shape == (1, 3, 16)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_fp32_linear_stays_fp32_after_bfloat16_conversion():
+    """A dtype conversion preserves the original FP32 parameters and gradients."""
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3FP32Linear
+
+    linear = MiniMaxH3FP32Linear(4, 4)
+    with torch.no_grad():
+        linear.weight.fill_(1.0 + 2**-12)
+        linear.bias.fill_(-1.0 - 2**-12)
+    weight, bias = linear.weight.detach().clone(), linear.bias.detach().clone()
+    assert not torch.equal(weight.to(torch.bfloat16).float(), weight)
+    linear(torch.full((2, 4), 1.0 + 2**-12)).sum().backward()
+    weight_grad = linear.weight.grad.clone()
+
+    linear.to(dtype=torch.bfloat16)
+    linear.bfloat16()
+    assert linear.weight.dtype == torch.float32 and linear.bias.dtype == torch.float32
+    torch.testing.assert_close(linear.weight, weight, rtol=0, atol=0)
+    torch.testing.assert_close(linear.bias, bias, rtol=0, atol=0)
+    torch.testing.assert_close(linear.weight.grad, weight_grad, rtol=0, atol=0)
+
+    inputs = torch.randn(2, 4, dtype=torch.bfloat16)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = linear(inputs)
+    assert out.dtype == torch.float32
+    torch.testing.assert_close(out, torch.nn.functional.linear(inputs.float(), weight, bias), rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+def test_minimax_h3_fp32_linear_accelerator_autocast():
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3FP32Linear
+    from veomni.utils.device import get_device_type, get_torch_device
+
+    device_api = get_torch_device()
+    if get_device_type() not in ("cuda", "npu") or not device_api.is_available():
+        pytest.skip("An accessible CUDA GPU or NPU is required")
+    device_api.set_device(0)
+    device = torch.device(get_device_type())
+    linear = MiniMaxH3FP32Linear(4, 3).to(device)
+    with torch.no_grad():
+        linear.weight.fill_(1.0 + 2**-12)
+        linear.bias.fill_(-1.0 - 2**-12)
+    weight = linear.weight.detach().clone()
+    bias = linear.bias.detach().clone()
+    inputs = torch.randn(2, 4, dtype=torch.bfloat16, device=device, requires_grad=True)
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+        output = linear(inputs)
+    assert output.dtype == torch.float32
+    torch.testing.assert_close(output, torch.nn.functional.linear(inputs.float(), weight, bias), rtol=0, atol=0)
+    torch.testing.assert_close(linear.weight, weight, rtol=0, atol=0)
+    torch.testing.assert_close(linear.bias, bias, rtol=0, atol=0)
+    output.square().mean().backward()
+    assert linear.weight.grad is not None and torch.isfinite(linear.weight.grad).all()
+    assert linear.bias.grad is not None and torch.isfinite(linear.bias.grad).all()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_fp32_linear_supports_meta_forward():
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3FP32Linear
+
+    linear = MiniMaxH3FP32Linear(4, 3, device="meta")
+    output = linear(torch.empty(2, 4, dtype=torch.bfloat16, device="meta"))
+    assert output.is_meta and output.shape == (2, 3) and output.dtype == torch.float32

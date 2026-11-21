@@ -477,11 +477,9 @@ class GradientCheckpointingConfig:
         default=False,
         metadata={
             "help": (
-                "Use reentrant gradient checkpointing. Kept off by default, and not usable "
-                "on a model whose block loop passes its block arguments by keyword "
-                "(MiniMax-H3): reentrant checkpointing saves positional tensors only, so "
-                "the first recomputed block raises. torch also refuses "
-                "enable_reentrant=True together with SAC."
+                "Use reentrant gradient checkpointing. Kept off by default. MiniMax-H3 rejects "
+                "this when enabling checkpointing because differentiable block inputs are passed "
+                "by keyword. Reentrant checkpointing also does not support SAC."
             )
         },
     )
@@ -829,8 +827,8 @@ class OffloadConfig:
             "help": (
                 "Enable async activation offload to CPU via stream-based D2H/H2D transfers. "
                 "More efficient than synchronous offload. Mutually exclusive with "
-                "`enable_activation`. Uses `model._no_split_modules` when "
-                "`activation_offload_modules` is empty."
+                "`enable_activation`. When `activation_offload_modules` is empty, uses "
+                "`model._activation_offload_target_classes` if defined, otherwise `model._no_split_modules`."
             )
         },
     )

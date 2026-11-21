@@ -102,7 +102,7 @@ All fields below are under `model.accelerator.offload_config`.
 | `enable_activation` | `false` | Enable synchronous offload. |
 | `activation_gpu_limit` | `0.0` | Synchronous retained-activation threshold, in units of 1,024³ bytes. Use a non-negative value; this field is not validated. A negative value bypasses retention for eligible tensors (the small-tensor and weight-view exclusions still apply). Does not tune async mode. |
 | `enable_async_activation` | `false` | Enable asynchronous offload for CUDA/NPU tensors only; MLU tensors are not offloaded. Cannot be combined with `enable_activation`. |
-| `activation_offload_modules` | `[]` | Async module paths. Empty means discover module classes from `model._no_split_modules`. Missing metadata or no matches raises an error. |
+| `activation_offload_modules` | `[]` | Async module paths. Empty means discover classes from `model._activation_offload_target_classes` if defined, otherwise from `model._no_split_modules`. Missing metadata or no matches raises an error. |
 | `activation_offload_host_cache_limit_gb` | `4.0` | Async idle host-buffer cache cap per pool, in units of 1,024³ bytes. Must be finite and non-negative and fit the implementation's byte conversion bound. Zero disables reuse. |
 
 Module patterns are segment-aware: `model.layers.*` matches direct children only,
@@ -202,12 +202,25 @@ integration around the outer checkpoint call is needed before combining them.
 
 ### Automatic Module Discovery
 
-Offload targets are automatically derived from `model._no_split_modules` — the same
-class names used for FSDP sharding boundaries. This mirrors the FSDP enablement pattern
-where `_no_split_modules` determines sharding units automatically.
-For example, with Qwen3-MoE where `_no_split_modules = ["Qwen3MoeDecoderLayer"]`,
-all `Qwen3MoeDecoderLayer` instances are automatically identified as offload targets.
+Explicit `activation_offload_modules` patterns take precedence. When the list is
+empty, the framework reads the model class's optional
+`_activation_offload_target_classes` list in
+`apply_async_activation_offload` before FSDP2 wrapping. The list contains exact
+module class names. If the attribute is absent or `None`, discovery falls back to
+`_no_split_modules`. An empty list of target classes or no matching modules
+raises an error.
 
+Qwen3-MoE uses the fallback to select every `Qwen3MoeDecoderLayer` instance.
+MiniMax H3 sets the following targets because FSDP2 also wraps the parent DiT.
+
+```python
+_no_split_modules = ["MiniMaxH3DiTBlock", "MiniMaxH3DiT"]
+_activation_offload_target_classes = ["MiniMaxH3DiTBlock"]
+```
+
+For H3, automatic offload wraps only the blocks that own the checkpoint
+boundary. This keeps backward recomputation active and avoids overlapping
+offload hooks on the parent DiT and its children.
 
 ### Core API
 
@@ -226,7 +239,8 @@ apply_async_activation_offload(model, activation_offload_modules=[])
 Args:
 - `model`: The model to apply offloading to.
 - `activation_offload_modules`: Explicit module-name patterns, or `[]` to discover
-  targets from `model._no_split_modules`. Missing or unmatched targets raise an error.
+  targets from `model._activation_offload_target_classes` if defined, otherwise
+  from `model._no_split_modules`. Missing or unmatched targets raise an error.
 - `host_cache_limit_bytes`: Optional idle pinned-buffer cache budget for this call.
 - `host_buffer_pool`: Optional shared `PinnedBufferPool` for multiple model roots;
   mutually exclusive with `host_cache_limit_bytes`.

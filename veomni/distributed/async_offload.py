@@ -522,12 +522,15 @@ def get_offload_modules(model, plan: List[str]):
     return matched_submodules
 
 
-def _get_no_split_offload_modules(model):
-    target_classes = set(getattr(model, "_no_split_modules", None) or [])
+def _get_auto_offload_modules(model):
+    target_classes = getattr(model, "_activation_offload_target_classes", None)
+    if target_classes is None:
+        target_classes = getattr(model, "_no_split_modules", None)
+    target_classes = set(target_classes or [])
     if not target_classes:
         raise ValueError(
-            "Async activation offload auto-discovery requires model._no_split_modules when "
-            "activation_offload_modules is empty."
+            "Async activation offload auto-discovery requires model._no_split_modules or "
+            "model._activation_offload_target_classes when activation_offload_modules is empty."
         )
 
     matched_submodules = [
@@ -538,7 +541,7 @@ def _get_no_split_offload_modules(model):
     ]
     if not matched_submodules:
         raise ValueError(
-            "Async activation offload did not match any modules listed in model._no_split_modules: "
+            "Async activation offload did not match any modules in the selected target classes: "
             f"{sorted(target_classes)!r}"
         )
 
@@ -718,5 +721,5 @@ def apply_async_activation_offload(
                 f"activation_offload_modules did not match any model modules: {activation_offload_modules!r}"
             )
     else:
-        matched_modules = _get_no_split_offload_modules(model)
+        matched_modules = _get_auto_offload_modules(model)
     async_offload_modules(matched_modules, host_buffer_pool=host_buffer_pool)
