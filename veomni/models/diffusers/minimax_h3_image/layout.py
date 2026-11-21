@@ -128,3 +128,57 @@ def build_image_packed_sequence(
     token_tags[image_indices] = image_tag
 
     return position_ids, token_tags, image_indices, text_indices, num_reference_rows
+
+
+def pack_image_samples(samples: list[dict]) -> tuple[dict, list[int]]:
+    """Concatenate image samples, retaining independent attention, positions and heads."""
+    if not samples:
+        raise ValueError("H3-Image requires a nonempty microbatch.")
+    chunks = {
+        key: []
+        for key in (
+            "x",
+            "prompt_embeds",
+            "unique_timesteps",
+            "timestep_indices",
+            "token_tags",
+            "position_ids",
+            "image_indices",
+            "text_indices",
+        )
+    }
+    cu, refiner_cu, row_counts, heads = [0], [0], [], []
+    time_offset = 0
+    for sample in samples:
+        if sample["unique_timesteps"].dtype != torch.float32 or sample["position_ids"].dtype not in (
+            torch.float32,
+            torch.float64,
+        ):
+            raise ValueError(
+                "H3-Image packing must retain timestep/position precision; use cast_forward_inputs=false."
+            )
+        length = sample["position_ids"].shape[0]
+        text = sample["prompt_embeds"]
+        text = text[0] if text.dim() == 3 else text
+        for key in chunks:
+            value = text if key == "prompt_embeds" else sample[key]
+            if key in ("image_indices", "text_indices"):
+                value = value + cu[-1]
+            elif key == "timestep_indices":
+                value = value + time_offset
+            chunks[key].append(value)
+        cu.append(cu[-1] + length)
+        refiner_cu.append(refiner_cu[-1] + text.shape[0])
+        time_offset += sample["unique_timesteps"].numel()
+        row_counts.append(sample["image_indices"].numel())
+        heads.append((sample["pdd_step_index"], length))
+    result = {key: torch.cat(values, dim=0) for key, values in chunks.items()}
+    device = result["x"].device
+    for key, bounds in (("packed_seq_params", cu), ("refiner_packed_seq_params", refiner_cu)):
+        result[key] = {
+            "cu_seqlens_q": torch.tensor(bounds, dtype=torch.int32, device=device),
+            "cu_seqlens_host": tuple(bounds),
+            "max_seqlen_q": max(stop - start for start, stop in zip(bounds, bounds[1:])),
+        }
+    result["pdd_step_index"] = heads
+    return result, row_counts

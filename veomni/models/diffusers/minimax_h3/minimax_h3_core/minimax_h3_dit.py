@@ -517,10 +517,17 @@ class MiniMaxH3FinalLayer(nn.Module):
         if pdd_step_index is not None:
             if self.pdd_out is None:
                 raise ValueError("pdd_step_index was provided but this model has no PDD output heads.")
-            if not 0 <= pdd_step_index < len(self.pdd_out):
-                raise IndexError(f"pdd_step_index {pdd_step_index} is outside [0, {len(self.pdd_out)}).")
-            head = self.pdd_out[pdd_step_index]
-            video = head(h.to(head.weight.dtype))
+            selections = pdd_step_index if isinstance(pdd_step_index, list) else [(pdd_step_index, h.shape[0])]
+            lengths = [length for _, length in selections]
+            if sum(lengths) != h.shape[0]:
+                raise ValueError("PDD segment lengths must cover all output rows.")
+            outputs = []
+            for (index, _), rows in zip(selections, h.split(lengths)):
+                if not 0 <= index < len(self.pdd_out):
+                    raise IndexError(f"pdd_step_index {index} is outside [0, {len(self.pdd_out)}).")
+                head = self.pdd_out[index]
+                outputs.append(head(rows.to(head.weight.dtype)))
+            video = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
         else:
             video = self.video_out(h.to(self.video_out.weight.dtype))
         audio = self.audio_out(h) if self.audio_out is not None else None
@@ -692,6 +699,7 @@ class MiniMaxH3DiT(nn.Module):
         refiner_max_seqlen,
         seq_len,
         device,
+        packed_batch=False,
     ):
         image_embed = self.video_patch_proj(x.to(self.video_patch_proj.weight.dtype))
         text_embed = self.condition_proj(text_embeddings.to(device=device).to(self.condition_proj.weight.dtype))
@@ -701,6 +709,7 @@ class MiniMaxH3DiT(nn.Module):
             cu_seqlens=refiner_cu_seqlens,
             max_seqlen=refiner_max_seqlen,
             valid_seqlen=text_embed.shape[0],
+            sample_local=packed_batch,
         )
 
         dtype = text_embed.dtype
@@ -725,10 +734,10 @@ class MiniMaxH3DiT(nn.Module):
         packed_seq_params=None,
         refiner_packed_seq_params=None,
     ):
-        """One packed MiniMax-H3-Image forward.
+        """Run independent MiniMax-H3-Image samples in one packed forward.
 
         ``x`` holds the patchified rows of every image in the sequence
-        (reference rows first, generated rows last), ``prompt_embeds`` holds
+        (reference rows before each target), ``prompt_embeds`` holds
         the Qwen3-VL text rows, and the index tensors place both in the packed
         sequence. The returned rows are in ``image_indices`` order.
         """
@@ -779,6 +788,13 @@ class MiniMaxH3DiT(nn.Module):
             refiner_host = refiner_packed_seq_params.get("cu_seqlens_host") or tuple(refiner_cu.tolist())
             refiner_host = tuple(int(value) for value in refiner_host)
 
+        packed_batch = len(cu_host) > 2
+        if packed_batch:
+            if refiner_packed_seq_params is None:
+                raise ValueError("Packed H3-Image samples require text-refiner sequence boundaries.")
+            cu_host = _PackedBounds(cu_tensor.to(device), cu_host)
+            refiner_host = _PackedBounds(refiner_cu.to(device), refiner_host)
+
         if get_ulysses_sequence_parallel_group() is not None:
             raise NotImplementedError("MiniMax-H3-Image forward_image does not support sequence parallelism yet.")
 
@@ -793,6 +809,7 @@ class MiniMaxH3DiT(nn.Module):
             refiner_max_seqlen=refiner_max,
             seq_len=seq_len,
             device=device,
+            packed_batch=packed_batch,
         )
 
         combined_indices = (timestep_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)

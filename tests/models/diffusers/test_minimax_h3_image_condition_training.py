@@ -157,6 +157,98 @@ def test_i2i_raw_condition_round_trips_through_dit_cache(tmp_path, monkeypatch):
     torch.testing.assert_close(offline_model.process_condition(**offline_batch), online, rtol=0, atol=0)
 
 
+def test_mixed_raw_microbatch_matches_online_and_offline_conditions(tmp_path, monkeypatch):
+    model = _condition_model()
+    model._vae = SimpleNamespace(
+        device=torch.device("cpu"),
+        config=SimpleNamespace(latents_mean=(0, 0), latents_std=(1, 1)),
+        encode=lambda pixels, return_dict: (SimpleNamespace(mode=lambda: pixels[:, :2, ::16, ::16]),),
+    )
+
+    def encode_text(prompt, reference_images=None):
+        length = len(prompt.split()) + len(reference_images or [])
+        embeds = torch.arange(length * 8, dtype=torch.float32).reshape(1, length, 8)
+        return embeds, torch.ones(length, dtype=torch.long)
+
+    def encode_references(images, sample_posterior):
+        assert not sample_posterior
+        return [torch.full((1, 2, 2, 4), index + 0.5) for index in range(len(images))]
+
+    monkeypatch.setattr(model, "encode_text", encode_text)
+    monkeypatch.setattr(model, "encode_reference_images", encode_references)
+    raw = DiTDataCollator()(
+        [
+            {"inputs": "A rectangle", "images": [Image.new("RGB", (64, 32), 128)]},
+            {
+                "inputs": "Make the rectangle blue",
+                "images": [Image.new("RGB", (32, 64), 192)],
+                "reference_images": [Image.new("RGB", (64, 32)), Image.new("RGB", (32, 64))],
+            },
+        ]
+    )
+    state = model.rng_state_dict()
+    cached = model.get_condition(**raw)
+    assert cached["reference_latents"][0] == []
+    assert len(cached["reference_latents"][1]) == 2
+    assert [embeds.shape[1] for embeds in cached["prompt_embeds"]] == [2, 6]
+    for index in range(2):
+        expected = model.get_condition(**{key: values[index : index + 1] for key, values in raw.items()})
+        torch.testing.assert_close({key: values[index : index + 1] for key, values in cached.items()}, expected)
+    torch.testing.assert_close(model.rng_state_dict(), state, rtol=0, atol=0)
+    online = model.process_condition(**cached)
+
+    import veomni.distributed.parallel_state as parallel_state
+
+    monkeypatch.setattr(parallel_state, "get_parallel_state", lambda: SimpleNamespace(dp_rank=0, dp_size=1))
+    saver = OfflineEmbeddingSaver(str(tmp_path), dataset_length=2)
+    for item in DiTTrainer._unpack_dict_of_list(cached):
+        saver.save(item)
+    dataset = load_dataset("parquet", data_files=str(tmp_path / "rank_0_shard_0.parquet"), split="train")
+    transform = build_data_transform("dit_offline")
+    offline = DiTDataCollator()([transform(item)[0] for item in dataset])
+    torch.testing.assert_close(dict(offline), cached, rtol=0, atol=0)
+    restored = _condition_model(meta_init=True)
+    restored.load_rng_state_dict(state)
+    torch.testing.assert_close(restored.process_condition(**offline), online, rtol=0, atol=0)
+    torch.testing.assert_close(restored.rng_state_dict(), model.rng_state_dict(), rtol=0, atol=0)
+
+
+def test_mixed_cached_microbatch_preserves_sample_geometry_and_rng_across_grouping():
+    samples = [
+        {key: values[0] for key, values in _cached_batch().items()},
+        {
+            "clean_latents": torch.ones(1, 2, 4, 2),
+            "prompt_embeds": torch.ones(1, 5, 8, dtype=torch.bfloat16),
+            "text_token_tags": torch.tensor([1, 0, 0, 1, 1]),
+            "reference_latents": [torch.zeros(1, 2, 2, 2)],
+        },
+        {
+            "clean_latents": torch.ones(1, 2, 4, 4),
+            "prompt_embeds": torch.ones(1, 2, 8, dtype=torch.bfloat16),
+            "text_token_tags": torch.ones(2, dtype=torch.long),
+            "reference_latents": [torch.zeros(1, 2, 2, 4), torch.ones(1, 2, 4, 2)],
+        },
+    ]
+    model, sequential = _condition_model(), _condition_model()
+    batch = DiTDataCollator()(samples)
+    packed = model.process_condition(**batch)
+    expected = [sequential.process_condition(**DiTDataCollator()([sample])) for sample in samples]
+    torch.testing.assert_close(DiTTrainer._unpack_dict_of_list(packed), expected, rtol=0, atol=0)
+    torch.testing.assert_close(model.rng_state_dict(), sequential.rng_state_dict(), rtol=0, atol=0)
+    assert [target.shape for target in packed["image_training_target"]] == [(2, 8), (2, 8), (4, 8)]
+    assert packed["image_num_reference_rows"] == [0, 1, 4]
+    assert [item["x"].shape[0] for item in packed["image_inputs"]] == [2, 3, 8]
+    assert [item["prompt_embeds"].shape[1] for item in packed["image_inputs"]] == [3, 5, 2]
+
+    state = model.rng_state_dict()
+    next_batch = model.process_condition(**batch)
+    restored = _condition_model(seed=0, meta_init=True)
+    restored.load_rng_state_dict(state)
+    replayed = [restored.process_condition(**DiTDataCollator()([sample])) for sample in samples]
+    torch.testing.assert_close(DiTTrainer._unpack_dict_of_list(next_batch), replayed, rtol=0, atol=0)
+    torch.testing.assert_close(model.rng_state_dict(), restored.rng_state_dict(), rtol=0, atol=0)
+
+
 def test_i2i_requires_references_and_uses_deterministic_posterior(tmp_path):
     Image.new("RGB", (32, 32)).save(tmp_path / "target.png")
     transform = build_data_transform("minimax_h3_image_i2i", data_dir=str(tmp_path))
@@ -276,7 +368,13 @@ def test_t2i_rejects_invalid_training_geometry_and_microbatch():
         MiniMaxH3ImageConditionModelConfig(width=1000)
 
     model = _condition_model()
-    with pytest.raises(ValueError, match="micro_batch_size=1"):
-        model.process_condition(**{key: values * 2 for key, values in _cached_batch().items()})
+    batch = _cached_batch()
+    batch["text_token_tags"] *= 2
+    with pytest.raises(ValueError, match="aligned condition columns"):
+        model.process_condition(**batch)
+    with pytest.raises(ValueError, match="nonempty aligned condition columns"):
+        model.process_condition(prompt_embeds=[], text_token_tags=[], clean_latents=[])
+    with pytest.raises(ValueError, match="aligned input and image columns"):
+        model.get_condition(["A rectangle", "Another rectangle"], [[]])
     with pytest.raises(ValueError, match="exactly one target image"):
         model.get_condition(["A rectangle"], [[]])

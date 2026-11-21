@@ -19,6 +19,7 @@ from transformers.modeling_outputs import ModelOutput
 
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
+from ...minimax_h3_image.layout import pack_image_samples
 from ..minimax_h3_core.batch_packing import pack_samples
 from ..minimax_h3_core.core import bind_minimax_attention, is_flash_attn_impl
 from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3Attention, MiniMaxH3DiT, unpack_audio, unpatchify_video
@@ -218,6 +219,22 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         audio_latent_shape: (audio_channel, T_a) for unpack_audio
         """
         if self.config.image_training:
+            if isinstance(image_inputs, list):
+                count = len(image_inputs)
+                if count == 0 or any(
+                    not isinstance(column, list) or len(column) != count
+                    for column in (image_training_target, image_loss_weight, image_num_reference_rows)
+                ):
+                    raise ValueError("H3-Image training requires aligned, nonempty sample columns.")
+                packed_inputs, row_counts = pack_image_samples(image_inputs)
+                parts = (-self.forward_image(**packed_inputs)).split(row_counts)
+                predictions = [rows[refs:] for rows, refs in zip(parts, image_num_reference_rows)]
+                losses = []
+                for prediction, target, weight in zip(predictions, image_training_target, image_loss_weight):
+                    if prediction.shape != target.shape:
+                        raise ValueError("H3-Image predictions and target rows must have the same shape.")
+                    losses.append(torch.nn.functional.mse_loss(prediction.float(), target.float()) * weight)
+                return MiniMaxH3DiTOutput(loss={"mse_image": torch.stack(losses).mean()}, predictions=predictions)
             if (
                 image_inputs is None
                 or image_inputs.get("pdd_step_index") is None

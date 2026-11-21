@@ -67,8 +67,8 @@ image.save("edit.png")
 
 ## Text-to-image fine-tuning
 
-The online and offline paths support `micro_batch_size: 1` and `ulysses_size: 1`.
-They follow the public [DiffSynth fine-tuning recipe](https://github.com/modelscope/DiffSynth-Studio/blob/fc8b4be56759de06cac585929f608227ac58766b/examples/minimax_h3_image/model_training/full/MiniMax-H3-Image.sh): the DiT learns a flow-matching target while the six released PDD heads remain frozen. Each training sigma selects the nearest release head, excluding the terminal zero. Both paths sample fresh noise and timesteps during training. The text encoder and VAE stay frozen: offline training reads their cached outputs; online training encodes each raw image/prompt before its DiT update. This is fine-tuning, not a reproduction of the original PDD distillation. Both T2I and reference-image editing train one sample per microbatch; multi-sample packing and Ulysses SP remain separate work.
+The online and offline paths support fixed microbatches with `ulysses_size: 1`.
+They follow the public [DiffSynth fine-tuning recipe](https://github.com/modelscope/DiffSynth-Studio/blob/fc8b4be56759de06cac585929f608227ac58766b/examples/minimax_h3_image/model_training/full/MiniMax-H3-Image.sh): the DiT learns a flow-matching target while the six released PDD heads remain frozen. Each training sigma selects the nearest release head, excluding the terminal zero. Both paths sample fresh noise and timesteps during training. The text encoder and VAE stay frozen: offline training reads their cached outputs; online training encodes each raw image/prompt before its DiT update. This is fine-tuning, not a reproduction of the original PDD distillation. Both T2I and reference-image editing support multi-sample packing as described below. Ulysses SP remains separate work.
 
 ### Prepare weights and data
 
@@ -137,6 +137,29 @@ NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_
 ```
 
 The default eight-rank smoke runs require at least eight editing examples, with one row per data-parallel rank. Set a positive `train.checkpoint.save_steps` for longer runs. Each reference adds text and DiT tokens as well as VAE encoding work; size the device memory for the reference count and resolution. Full-parameter released-checkpoint editing training has not been validated on GPU or NPU.
+
+## Packed microbatches
+
+Set `train.micro_batch_size` above one in any T2I or editing online/offline training config to pack samples inside the model. The existing examples default to one. For example, two samples per microbatch and a global batch of 16 use:
+
+```yaml
+train:
+  micro_batch_size: 2
+  global_batch_size: 16
+  dyn_bsz: false
+```
+
+The global batch must be divisible by `micro_batch_size * dp_size`. With eight data-parallel ranks this example takes one packed microbatch per update; with one rank it accumulates eight. Keep the same global batch when comparing packed training to `micro_batch_size: 1`.
+
+The model concatenates `[text_0 | references_0 | target_0 | text_1 | references_1 | target_1 | ...]` without padding between samples. Main-DiT and text-refiner attention each receive their own cumulative sequence lengths. Positions remain sample-local, while timestep indices are offset into the concatenated timestep table. Each sample keeps its own sampled timestep, PDD head, reference-row crop, and loss weight. The returned `mse_image` is the mean of per-sample weighted target losses, so larger images do not receive more weight just because they contain more rows. Gradient accumulation then preserves the same sample weighting as singleton microbatches.
+
+Cached samples may have different target sizes, aspect ratios, text lengths, and reference counts. Existing homogeneous T2I or editing caches need no conversion, and batched offline embedding writes one cache row per sample. To combine T2I and editing cache shards, first give every row and shard the same columns: T2I rows must store a serialized empty list in `reference_latents`, rather than an Arrow null or a missing column. The existing Parquet loader does not merge incompatible cache schemas.
+
+Online target preprocessing still crops to `condition_model_cfg.height` and `width`; reference images retain their individual sizes. The frozen text encoder and VAE encode samples independently. Only the DiT execution is packed.
+
+Single-sample condition processing keeps its existing dictionary format. Multiple samples return aligned lists of `image_inputs`, `image_training_target`, `image_loss_weight`, and `image_num_reference_rows`; the model returns one target prediction tensor per sample. The condition RNG consumes samples in input order, including their reference noise, and its saved state resumes the same stream across microbatch groupings.
+
+Keep `cast_forward_inputs: false` to preserve FP32 timesteps and position precision. FlashAttention 2/3 backends use variable-length attention for packed segments; eager/SDPA executes attention separately inside each segment while sharing the main DiT projections and MLP work. The text refiner keeps its per-sample arithmetic. This change supports fixed microbatches with `dyn_bsz: false` and `ulysses_size: 1`; token-budget scheduling, sequence parallelism, and full-model memory validation are separate work.
 
 ## Notes
 

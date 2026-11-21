@@ -239,15 +239,29 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
 
     @torch.no_grad()
     def get_condition(self, inputs, images, reference_images=None) -> dict[str, list[torch.Tensor]]:
-        """Encode one raw T2I or image-editing sample for training or caching."""
-        if len(inputs) != 1 or len(images) != 1:
-            raise ValueError("MiniMax-H3-Image training requires micro_batch_size=1.")
+        """Encode raw T2I or image-editing samples independently for training or caching."""
+        if (
+            not inputs
+            or len(images) != len(inputs)
+            or (reference_images is not None and len(reference_images) != len(inputs))
+        ):
+            raise ValueError("MiniMax-H3-Image requires nonempty aligned input and image columns.")
+        if len(inputs) > 1:
+            conditions = [
+                self.get_condition(
+                    inputs[index : index + 1],
+                    images[index : index + 1],
+                    None if reference_images is None else reference_images[index : index + 1],
+                )
+                for index in range(len(inputs))
+            ]
+            return {key: [value for condition in conditions for value in condition[key]] for key in conditions[0]}
         if len(images[0]) != 1:
             raise ValueError("MiniMax-H3-Image training requires exactly one target image.")
         if self._vae is None:
             raise RuntimeError("MiniMax-H3-Image VAE is not loaded.")
 
-        references = reference_images[0] if reference_images is not None else []
+        references = (reference_images[0] or []) if reference_images is not None else []
         vae_references = [resize_reference(image, 1024, 2048) for image in references]
         vision_references = [resize_reference(image, 1024, 1024) for image in references]
         if vision_references:
@@ -289,14 +303,30 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
 
     @torch.no_grad()
     def process_condition(self, prompt_embeds, text_token_tags, clean_latents, reference_latents=None) -> dict:
-        """Prepare one cached T2I or edit sample for flow-matching training."""
-        if len(prompt_embeds) != 1 or len(text_token_tags) != 1 or len(clean_latents) != 1:
-            raise ValueError("MiniMax-H3-Image training requires micro_batch_size=1.")
+        """Prepare sample-local flow-matching inputs, returning columns for a packed microbatch."""
+        if (
+            not prompt_embeds
+            or len(text_token_tags) != len(prompt_embeds)
+            or len(clean_latents) != len(prompt_embeds)
+            or (reference_latents is not None and len(reference_latents) != len(prompt_embeds))
+        ):
+            raise ValueError("MiniMax-H3-Image requires nonempty aligned condition columns.")
+        if len(prompt_embeds) > 1:
+            samples = [
+                self.process_condition(
+                    prompt_embeds[index : index + 1],
+                    text_token_tags[index : index + 1],
+                    clean_latents[index : index + 1],
+                    None if reference_latents is None else reference_latents[index : index + 1],
+                )
+                for index in range(len(prompt_embeds))
+            ]
+            return {key: [sample[key] for sample in samples] for key in samples[0]}
 
         latents = clean_latents[0].float()
         latent_height, latent_width = latents.shape[-2:]
         device = latents.device
-        references = reference_latents[0] if reference_latents is not None else []
+        references = (reference_latents[0] or []) if reference_latents is not None else []
         reference_grids = [(ref.shape[-2], ref.shape[-1]) for ref in references]
         position_ids, token_tags, image_indices, text_indices, num_reference_rows = self.build_layout(
             text_token_tags[0], reference_grids, latent_height, latent_width, _IMAGE_PATCH_SIZE
