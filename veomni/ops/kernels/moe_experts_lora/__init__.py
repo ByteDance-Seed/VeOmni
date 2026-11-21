@@ -18,6 +18,12 @@
 is a per-expert pair. Eager is the per-expert loop. ``fused_triton`` and
 ``fused_npu`` wrap the local fused Functions. ``fused_quack`` / ``fused_mlu`` are not registered; callers remap
 those ``moe_implementation`` values to eager.
+
+All three rows serve expert parallelism through ``dispatch_to_ep_class``, so the
+all-to-all plumbing is the same one ``moe_experts`` uses. Only the per-rank math
+differs: ``fused_npu`` runs Ascend grouped GEMMs in ``helper.npu_ep_forward``, while
+``eager`` walks the local experts with plain PyTorch -- which makes it the reference
+for the fused rows rather than a training choice. Only the base weights are sharded.
 """
 
 from __future__ import annotations

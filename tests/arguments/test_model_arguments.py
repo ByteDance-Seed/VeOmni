@@ -147,20 +147,6 @@ def test_fp8_all_gather_is_opt_in():
     assert FSDPConfig(expert_weight_fp8_all_gather=True).expert_weight_fp8_all_gather is True
 
 
-def test_fp8_all_gather_rejects_non_swiglu_before_collectives():
-    from types import SimpleNamespace
-
-    from torch import nn
-
-    from veomni.distributed.fsdp2.fp8_all_gather import register_deepgemm_fp8_all_gather
-
-    module = nn.Module()
-    module.veomni_moe = SimpleNamespace(impl="deepgemm")
-    module.use_swiglu = False
-    with pytest.raises(ValueError, match="SwiGLU"):
-        register_deepgemm_fp8_all_gather(module)
-
-
 @pytest.mark.parametrize("impl", [None, "fused_triton"])
 def test_fp8_all_gather_allows_empty_selection(impl):
     from types import SimpleNamespace

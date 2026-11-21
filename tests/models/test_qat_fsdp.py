@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Physical two-GPU acceptance for torchao FP4 QAT rows on a generated Qwen3.
+"""Physical two-GPU acceptance for torchao FP4 QAT rows on a VeOmni Qwen3.
 
 No CPU collective substitute: this case requires two CUDA devices and NCCL. It
 covers accumulated updates, DCP continuation and ordinary HF export/reload with
@@ -68,7 +68,7 @@ def _build_fsdp(weights_path: Path, impl: str, *, skip_hf_load: bool = False):
         config, init_device="meta", torch_dtype="float32", ops_implementation=_qat_ops(impl)
     )
     assert model.config.ops_config.linear_implementation == impl
-    assert ".generated." in type(model).__module__
+    assert type(model).__module__ == "veomni.models.transformers.qwen3.modeling_qwen3"
     model = build_parallelize_model(
         model,
         weights_path=str(weights_path),

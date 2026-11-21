@@ -189,13 +189,17 @@ def _uncompilable_selections(ops) -> list[str]:
     offending: list[str] = []
     for field, (impl, dtype) in _UNCOMPILABLE_FORMATS.items():
         value = getattr(ops, field, None)
-        name = getattr(value, "name", value)
-        if name != impl:
-            continue
-        # A bare row name means the row's default format, which is not this one.
-        kwargs = getattr(value, "kwargs", {}) or {}
-        if kwargs.get("dtype") == dtype:
+        base_name = getattr(value, "name", value)
+        base_kwargs = getattr(value, "kwargs", {}) or {}
+        if base_name == impl and base_kwargs.get("dtype") == dtype:
             offending.append(f"{field}={impl}(dtype={dtype!r})")
+            continue
+        for rule in getattr(value, "overrides", ()) or ():
+            rule_name = rule.name if rule.name is not None else base_name
+            rule_kwargs = {**base_kwargs, **(rule.kwargs or {})}
+            if rule_name == impl and rule_kwargs.get("dtype") == dtype:
+                offending.append(f"{field}={impl}(dtype={dtype!r})")
+                break
     return offending
 
 

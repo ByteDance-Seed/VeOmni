@@ -644,6 +644,13 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         if not any(p.requires_grad for p in self.model.parameters()):
             logger.info_rank0(f"ModuleRuntime[{self.module_name}]: fully frozen — skipping DCP/HF checkpoint.")
+            if any(
+                getattr(self.omni_module, hook, None) is not None for hook in ("extra_state_dict", "rng_state_dict")
+            ):
+                logger.warning_rank0(
+                    f"ModuleRuntime[{self.module_name}]: the fully frozen module contributes extra checkpoint state, "
+                    "but has no checkpoint manager, so that state is not saved. Keep it on a trainable module."
+                )
             self._has_trainable_parameters = False
             self.checkpoint = None
             return
@@ -653,6 +660,43 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Resume this module's DCP checkpoint, if one is configured."""
         if self.checkpoint is not None:
             self.checkpoint.load()
+
+    def extra_state(self) -> dict[str, Any]:
+        """Return optional module-owned checkpoint state under a private namespace.
+
+        ``extra_state_dict`` / ``load_extra_state_dict`` are the generic hooks.
+        The RNG pair remains a compatibility path for existing modules.
+        """
+        save = getattr(self.omni_module, "extra_state_dict", None)
+        if save is not None:
+            if getattr(self.omni_module, "load_extra_state_dict", None) is None:
+                logger.warning_rank0(
+                    f"ModuleRuntime[{self.module_name}]: extra_state_dict is defined without "
+                    "load_extra_state_dict; saved state cannot be restored."
+                )
+            return {"module_extra_state": save()}
+        rng_state_dict = getattr(self.omni_module, "rng_state_dict", None)
+        return {} if rng_state_dict is None else {"module_rng_state": rng_state_dict()}
+
+    def load_extra_state(self, extra_state: dict[str, Any]) -> None:
+        state = extra_state.get("module_extra_state")
+        load = getattr(self.omni_module, "load_extra_state_dict", None)
+        if state is not None and load is not None:
+            with self._scoped():
+                load(state)
+            return
+        rng_state = extra_state.get("module_rng_state")
+        if rng_state is None:
+            return
+        load_rng = getattr(self.omni_module, "load_rng_state_dict", None)
+        if load_rng is None:
+            logger.warning_rank0(
+                f"ModuleRuntime[{self.module_name}]: checkpoint carries module RNG state, "
+                "but the module has no load_rng_state_dict hook; state was not restored."
+            )
+            return
+        with self._scoped():
+            load_rng(rng_state)
 
     def save_dcp(self, state: "TrainerState") -> None:
         """Write this module's distributed checkpoint (train resume)."""

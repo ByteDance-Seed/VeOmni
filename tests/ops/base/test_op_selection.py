@@ -550,25 +550,15 @@ def test_the_native_row_still_takes_the_family_signature_at_the_call_site():
 
 
 def test_a_native_row_is_refused_where_a_deployment_kernel_is_not_reached():
-    """The non-SwiGLU guard asks "does this row round?", so it must catch both kinds.
+    """Quantizing moe_experts rows refuse activations their fused kernel cannot evaluate.
 
-    ``deepgemm_fp8`` bakes SwiGLU into its grouped GEMM exactly as ``qat`` does, so
-    falling back to the Python act_fn loop would run it at full precision. It was
-    the hand-written ``frozenset({"qat"})`` that let it through.
+    ``deepgemm`` bakes SiLU into its grouped GEMM, so it refuses non-SiLU activations
+    directly inside the wrapper rather than falling back to BF16 eager.
     """
-    from torch import nn
+    from veomni.ops.kernels.moe_experts.standard import deepgemm, qat
 
-    from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
-
-    class _Experts(nn.Module):
-        def __init__(self, impl):
-            super().__init__()
-            self.use_swiglu = False
-            self.veomni_moe = type("_Handle", (), {"impl": impl})()
-
-    for impl in ("qat", "deepgemm"):
-        with pytest.raises(ValueError, match="cannot run with a non-SwiGLU activation"):
-            reject_quantizing_act_fn(_Experts(impl))
-
-    # A row that rounds nothing keeps the fallback: it has no fused kernel to miss.
-    reject_quantizing_act_fn(_Experts("fused_triton"))
+    zero = torch.empty(0)
+    with pytest.raises(ValueError, match="moe_implementation='deepgemm' computes SiLU only"):
+        deepgemm.wrapper(zero, zero, zero, zero, zero, zero, zero, num_experts=1, activation="gelu")
+    with pytest.raises(ValueError, match="moe_implementation='qat' cannot run on hidden_act='relu'"):
+        qat.wrapper(zero, zero, zero, zero, zero, zero, zero, num_experts=1, activation="relu")

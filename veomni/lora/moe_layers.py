@@ -712,13 +712,6 @@ class LoraSharedExperts(nn.Module):
         # the lazy install at first forward rather than in ``__init__``.
         self._ensure_ep_grad_sync_hooks()
 
-        if get_parallel_state().ep_enabled and self.veomni_moe_lora.impl == "eager":
-            raise RuntimeError(
-                "LoraSharedExperts: eager forward does not support expert parallelism (EP). "
-                "Set moe_implementation='fused_triton' (GPU) or 'fused_npu' (NPU) "
-                "to use the EP-aware fused LoRA path, or disable EP."
-            )
-
         return self.veomni_moe_lora(
             hidden_states,
             top_k_weights,
@@ -1011,13 +1004,6 @@ class LoraIndependentExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         """Run routed experts with per-expert LoRA adapters through ``veomni_moe_lora``."""
-        if get_parallel_state().ep_enabled and self.veomni_moe_lora.impl == "eager":
-            raise RuntimeError(
-                "LoraIndependentExperts: eager forward does not support expert parallelism (EP). "
-                "Set moe_implementation='fused_triton' (GPU) or 'fused_npu' (NPU) "
-                "to use the EP-aware fused LoRA path, or disable EP."
-            )
-
         return self.veomni_moe_lora(
             hidden_states,
             top_k_weights,
