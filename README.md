@@ -88,9 +88,9 @@ Our guiding principles when building VeOmni are:
 | [Qwen2 / Qwen2.5](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [qwen2_5.yaml](configs/text/qwen2_5.yaml) |
 | [Qwen2-VL / Qwen2.5-VL](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [qwen2_vl.yaml](configs/multimodal/qwen2_vl/qwen2_vl.yaml) · [qwen25_vl.yaml](configs/multimodal/qwen25_vl/qwen25_vl.yaml) |
 | [Qwen2.5-Omni](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [qwen25_omni.yaml](configs/multimodal/qwen25_omni/qwen25_omni.yaml) |
-| [Qwen3](https://huggingface.co/Qwen) | [✅ 2× H20](configs/models/qwen3/cuda.yaml) | [✅ 2× 910B2](configs/models/qwen3/ascend.yaml) | ✅ | ✅ | [Training guide](docs/examples/qwen3.md) |
+| [Qwen3](https://huggingface.co/Qwen) | [✅ 8× H20](configs/models/qwen3/cuda.yaml) | [✅ 8× 910B2](configs/models/qwen3/ascend.yaml) | ✅ | ✅ | [Training guide](docs/examples/qwen3.md) |
 | [Qwen3-MoE](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [qwen3-moe.yaml](configs/text/qwen3-moe.yaml) · [Guide](docs/examples/qwen3_moe.md) |
-| [Qwen3-VL](https://huggingface.co/Qwen) | [✅ 2× H20](configs/models/qwen3_vl/cuda.yaml) | [✅ 2× 910B2](configs/models/qwen3_vl/ascend.yaml) | ✅ | ✅ | [Training guide](docs/examples/qwen3_vl.md) |
+| [Qwen3-VL](https://huggingface.co/Qwen) | [✅ 8× H20](configs/models/qwen3_vl/cuda.yaml) | [✅ 8× 910B2](configs/models/qwen3_vl/ascend.yaml) | ✅ | ✅ | [Training guide](docs/examples/qwen3_vl.md) |
 | [Qwen3-VL-MoE](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [qwen3_vl_moe.yaml](configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml) |
 | [Qwen3-Omni-MoE](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [qwen3_omni.yaml](configs/multimodal/qwen3_omni/qwen3_omni.yaml) · [Guide](docs/examples/qwen3_omni_moe.md) |
 | [Qwen3.5](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [qwen3_5_vl.yaml](configs/multimodal/qwen3_5/qwen3_5_vl.yaml) · [Guide](docs/examples/qwen3_5.md) |
