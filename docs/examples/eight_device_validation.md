@@ -4,7 +4,7 @@ Each linked YAML runs three optimizer steps with global batch size 8 on one node
 
 Full-weight checks also inspected the loader for missing foundation-model parameters. Qwen3.5 and the eight-layer DeepSeek-V4 checkpoint use the main training tower. Their optional MTP heads are outside these recipes. Qwen-Omni uses the thinker for understanding. Its speech-generation heads are outside those checks.
 
-The CUDA host used eight NVIDIA H20 GPUs with PyTorch 2.11. The Ascend host used eight 910B2 NPUs with torch-npu 2.10 and CANN 8.3.RC2. Both ran Transformers 5.16.1. The image-input Qwen VLM checks used ShareGPT4V conversations and confirmed an image tensor on each rank. Text checks used Tulu 3 conversations, either with the chat template or with message contents joined by newlines for plaintext training. LoRA checks load the checkpoint at its original model size and train adapters. Reduced text models use a 37-token test vocabulary where the YAML specifies the shared test tokenizer.
+The CUDA host used eight NVIDIA H20 GPUs with PyTorch 2.11. The Ascend host used eight 910B2 NPUs with torch-npu 2.10 and CANN 8.3.RC2. Both ran Transformers 5.16.1. The image-input Qwen VLM checks used ShareGPT4V conversations and confirmed an image tensor on each rank. Text checks used Tulu 3 conversations, either with the chat template or with message contents joined by newlines for plaintext training. LoRA rows train adapter parameters. The training scope identifies which checkpoints were reduced. Reduced text models use a 37-token test vocabulary where the YAML specifies the shared test tokenizer.
 
 | Checkpoint or model | Training scope | 8 × H20 | 8 × 910B2 |
 | --- | --- | --- | --- |
@@ -17,12 +17,12 @@ The CUDA host used eight NVIDIA H20 GPUs with PyTorch 2.11. The Ascend host used
 | Gemma 3 | Reduced architecture, full tuning, text | [4.88 / 4.68 / 4.43](../../configs/models/gemma3/cuda.yaml) | [4.88 / 4.71 / 4.53](../../configs/models/gemma3/ascend.yaml) |
 | GLM-5 | Reduced architecture, full tuning, text | [10.30 / 8.90 / 7.73](../../configs/models/glm5/cuda.yaml) | [10.65 / 9.15 / 8.07](../../configs/models/glm5/ascend.yaml) |
 | gpt-oss-20b-BF16 | LoRA, text | [4.14 / 4.08 / 3.76](../../configs/models/gpt_oss/cuda.yaml) | [4.15 / 4.08 / 3.84](../../configs/models/gpt_oss/ascend.yaml) |
-| HunyuanVideo 1.5 | Reduced DiT, DDP, synthetic video latents | 1.116 / 1.138 / 1.582 | 1.116 / 1.138 / 1.582 |
+| HunyuanVideo 1.5 | LoRA, 54-block 480p T2V checkpoint, video + text | [0.25 / 0.31 / 0.27](../../configs/models/hunyuanvideo15/cuda.yaml) | [0.24 / 0.26 / 0.20](../../configs/models/hunyuanvideo15/ascend.yaml) |
 | Janus-1.3B | SeedOmni, image understanding | [1.02 / 1.11 / 0.96](../../configs/models/janus/cuda.yaml) | [1.01 / 1.11 / 0.96](../../configs/models/janus/ascend.yaml) |
 | Meta-Llama-3-8B-Instruct | full tuning, text | [1.76 / 1.35 / 1.41](../../configs/models/llama3/cuda.yaml) | [1.76 / 1.35 / 1.41](../../configs/models/llama3/ascend.yaml) |
 | Meta-Llama-3.1-8B-Instruct | full tuning, text | [1.59 / 1.31 / 1.36](../../configs/models/llama3_1/cuda.yaml) | [1.59 / 1.31 / 1.36](../../configs/models/llama3_1/ascend.yaml) |
 | Llama-3.3-70B-Instruct | LoRA, text | [1.49 / 1.28 / 1.32](../../configs/models/llama3_3/cuda.yaml) | [1.49 / 1.28 / 1.32](../../configs/models/llama3_3/ascend.yaml) |
-| LTX-2.3 | Reduced DiT, DDP, synthetic video latents | 0.917 / 0.945 / 1.039 | 0.969 / 0.988 / 0.781 |
+| LTX-2.3 | LoRA, 22B dev checkpoint, synthetic cached audio/video latents | [5.26 / 4.55 / 5.32](../../configs/models/ltx2_3/cuda.yaml) | [5.00 / 5.60 / 5.39](../../configs/models/ltx2_3/ascend.yaml) |
 | MiniMax-H3 FL2VA | LoRA, synthetic cached audio/video latents | [1.83 / 11.96 / 7.33](../../configs/models/minimax_h3_fl2va/cuda.yaml) | [2.78 / 4.73 / 10.53](../../configs/models/minimax_h3_fl2va/ascend.yaml) |
 | MiniMax-H3 Ref2VA | Reduced architecture, LoRA, synthetic cached audio/video latents | [3.68 / 7.06 / 1.47](../../configs/models/minimax_h3_ref2va/cuda.yaml) | [4.29 / 2.48 / 1.77](../../configs/models/minimax_h3_ref2va/ascend.yaml) |
 | Qwen2-0.5B-Instruct | full tuning, text | [1.94 / 1.65 / 2.05](../../configs/models/qwen2/cuda.yaml) | [1.94 / 1.65 / 2.05](../../configs/models/qwen2/ascend.yaml) |
@@ -44,16 +44,16 @@ The CUDA host used eight NVIDIA H20 GPUs with PyTorch 2.11. The Ascend host used
 
 ## Coverage
 
-This sweep covers 33 variants across 24 support-matrix rows. Qwen3 and Qwen3-VL were checked separately on both hosts. A released checkpoint may use full tuning or LoRA. Reduced-model trainer runs and standalone DiT tests have their own columns.
+This sweep covers 33 variants across 24 support-matrix rows. Qwen3 and Qwen3-VL were checked separately on both hosts. A released checkpoint may use full tuning or LoRA. The reduced-model column counts completed trainer runs at smaller sizes.
 
-| Host | Original-size checkpoint | Reduced model, trainer | Reduced DiT only | Without a passing check | Total |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 8 × H20 | 23 | 8 | 2 | 0 | 33 |
-| 8 × 910B2 | 20 | 7 | 2 | 4 | 33 |
+| Host | Original-size checkpoint | Reduced model, trainer | Without a passing check | Total |
+| --- | ---: | ---: | ---: | ---: |
+| 8 × H20 | 25 | 8 | 0 | 33 |
+| 8 × 910B2 | 22 | 7 | 4 | 33 |
 
 ## Running a linked example
 
-From the repository root, put the checkpoint at the path in the YAML and provide the indicated local data file. The first two comment lines of each YAML identify its checkpoint and launch command. Each example writes its checkpoint under `outputs/<model>/<backend>`.
+Run from the repository root and provide the indicated local data file. For checkpoint-based training, put the weights at the path in the YAML. The first two comment lines of each YAML identify its checkpoint and launch command. Each example writes its checkpoint under `outputs/<model>/<backend>`.
 
 For conversation or plaintext input, use a Parquet file with a `messages` column (role/content conversations) or a `text` column (strings), respectively. For image SFT, use ShareGPT4V rows with resolvable images and the configured source name. See the [Tulu data example](qwen3.md) and [image-data example](qwen3_vl.md).
 
@@ -70,7 +70,19 @@ python scripts/prepare_reduced_model_example.py minimax_h3_ref2va
 
 The GPT-OSS runs used the [BF16 distribution of gpt-oss-20b](https://huggingface.co/unsloth/gpt-oss-20b-BF16/tree/5a6fe4c0c1a86147cb9dc1bb99486e61d12a3c9e). All nine local shard hashes matched that revision.
 
-Gemma 3 was tested with the repository’s reduced text-only configuration. The published checkpoint required gated access. HunyuanVideo and LTX component checks run only the reduced transformer on synthetic video latents, with three DDP updates and a DCP save and reload. These checks do not exercise the condition encoder or full data pipeline.
+Gemma 3 was tested with the repository’s reduced text-only configuration. The published checkpoint required gated access.
+
+The original-size HunyuanVideo check used the [480p T2V checkpoint](https://huggingface.co/tencent/HunyuanVideo-1.5/tree/9b49404b3f5df2a8f0b31df27a0c7ab872e7b038) with the online condition encoders. It trained on nine-frame clips at 256 × 384. Follow the [HunyuanVideo asset layout](hunyuanvideo15.md).
+
+For LTX, stage the [22B dev weights](https://huggingface.co/Lightricks/LTX-2.3/tree/c1521179de480464f366a98a9d9b2acc4cc097b9) in a directory with the following layout. This is the raw upstream audio-video checkpoint. The offline run used cached features and latents. Its scope includes the embedding connectors and the 48-block transformer.
+
+```bash
+mkdir -p LTX-2.3
+ln -s /absolute/path/to/ltx-2.3-22b-dev.safetensors LTX-2.3/model.safetensors
+cp configs/model_configs/ltx2_3/ltx2_3_av.json LTX-2.3/config.json
+```
+
+Use the [LTX preprocessing guide](ltx-2.3.md) to produce Parquet data. The checks used synthetic cached rows with the same per-sample layout as the audio-video preprocessor, including video latents of shape `[128, F, H, W]`, audio latents of shape `[8, T, 16]`, video/audio prompt features and their mask. Raw video and audio encoding were outside the LTX run.
 
 Cosmos uses a JSONL file with a video path and caption per row. The full configuration and supported media layout are described in the [Cosmos3 guide](../seed_omni/models/cosmos3.md). For Janus, convert the upstream DeepSeek weights to the split layout using the [Janus converter instructions](../seed_omni/models/janus.md).
 
@@ -81,9 +93,11 @@ The [Qwen3-0.6B](qwen3.md) and [Qwen3-VL-2B-Instruct](qwen3_vl.md) guides give t
 | Model | Eight-device host | Observation |
 | --- | --- | --- |
 | BAGEL-7B-MoT | 910B2 | BAGEL requested FlexAttention, which is registered only for CUDA |
-| Qwen3.5-9B-Base | 910B2 | Triton-Ascend linear-attention kernel did not compile in this environment |
-| Qwen3.5-35B-A3B | 910B2 | Triton-Ascend linear-attention kernel did not compile in this environment |
-| Qwen3.8-Flash-Next | 910B2 | Triton-Ascend linear-attention kernel did not compile in this environment |
+| Qwen3.5-9B-Base | 910B2 | CANN 8.3.RC2 failed to compile the GatedDeltaNet KKT kernel with Triton-Ascend 3.2.0rc4 |
+| Qwen3.5-35B-A3B | 910B2 | CANN 8.3.RC2 failed to compile the GatedDeltaNet KKT kernel with Triton-Ascend 3.2.0rc4 |
+| Qwen3.8-Flash-Next | 910B2 | CANN 8.3.RC2 failed to compile the GatedDeltaNet KKT kernel with Triton-Ascend 3.2.0rc4 |
+
+A separate eight-rank Triton vector-add passed on this host. The GatedDeltaNet failure occurs in the CANN compiler when building `chunk_scaled_dot_kkt_fwd_kernel`. The alternative `fla_npu` implementation requires CANN 8.5.2 or newer on Atlas A2. See the [upstream requirements](https://github.com/flashserve/flash-linear-attention-npu/blob/a7c608f/README.md).
 
 ## Additional audio-input checks
 
