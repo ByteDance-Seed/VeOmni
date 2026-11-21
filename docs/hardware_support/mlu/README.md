@@ -61,7 +61,7 @@ pip install -e .
 Example (real-model SFT, from `docs/examples/qwen3.md`):
 
 ```bash
-bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
+bash train.sh tasks/train_text.py configs/models/qwen3/recipes/sft_8b.yaml \
   --model.model_path ${model_path} \
   --data.train_path  ${dataset_path}
 ```

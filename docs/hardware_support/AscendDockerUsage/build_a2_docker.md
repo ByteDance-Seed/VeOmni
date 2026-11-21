@@ -188,7 +188,7 @@ source /app/.venv/bin/activate
 After starting the container with appropriate mounts (and activating the environment for x86), you can run training commands. Here's an example for Qwen3-VL training using generic paths:
 
 ```bash
-bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
+bash train.sh tasks/train_vlm.py configs/models/qwen3_vl/recipes/multisource_8b.yaml \
     --model.model_path /app/ckpt/your-model-checkpoint \
     --data.train_path /app/dataset/your-dataset.json \
     --data.datasets_type iterable \
