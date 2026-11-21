@@ -84,7 +84,7 @@ the activation block *and* the weight tile, because the deployment recipe ties t
 activation's). A recipe that used different widths for the two operands would need
 the row to take them separately; none does today.
 
-[Float8 training](../usage/float8_training.md) lives on the same `torchao` row
+[Low-precision training](../usage/low_precision_training.md) lives on the same `torchao` row
 (`dtype: fp8`, with `recipe: tensorwise|rowwise|rowwise_with_gw_hp` and
 `emulated: false` by default). It calls torchao's functional
 `matmul_with_hp_or_float8_args` directly from plain `nn.Linear` weights without
@@ -737,7 +737,7 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 |-------|---------------|---|
 | `liger_kernel` | Registered Liger SwiGLU row (SiLU only) | `liger-kernel` package |
 | `qat` | Registered TileLang blockwise FP8 fake-quant row | `tilelang`, NVIDIA SM90+ |
-| `torchao` | Registered dynamic FP8 GEMM and FP4 fake-quant row, `dtype=fp8`, `nvfp4`, or `mxfp4` ([Float8 Training](../usage/float8_training.md), [FP4 QAT](../usage/mxfp4_qat.md)) | `torchao` package |
+| `torchao` | Registered dynamic FP8 GEMM and FP4 fake-quant row, `dtype=fp8`, `nvfp4`, or `mxfp4` ([Low-Precision Training](../usage/low_precision_training.md)) | `torchao` package |
 | `eager` | Registered PyTorch reference row | — |
 
 #### `linear_implementation`
@@ -746,7 +746,7 @@ named `qwen3_5` in the former `OpSlot` registry. Kernel registrations must use
 |-------|---------------|---|
 | `eager` | Registered row that calls the projection module | — |
 | `qat` | Registered TileLang blockwise FP8 fake-quant row | `tilelang`, NVIDIA SM90+ |
-| `torchao` | Registered dynamic FP8 GEMM and FP4 fake-quant row (`standard` only, `dtype=fp8`, `nvfp4`, or `mxfp4`; [Float8 Training](../usage/float8_training.md), [FP4 QAT](../usage/mxfp4_qat.md)) | `torchao` package |
+| `torchao` | Registered dynamic FP8 GEMM and FP4 fake-quant row (`standard` only, `dtype=fp8`, `nvfp4`, or `mxfp4`; [Low-Precision Training](../usage/low_precision_training.md)) | `torchao` package |
 
 The quantizing rows refuse to run on a projection substituted after
 construction (LoRA keeps the base layer at `base_layer` and owns no `weight`):

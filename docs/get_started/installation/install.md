@@ -52,8 +52,8 @@ FlexAttention instead; its FA4 backend is included in the `gpu` extra.
 
 ### Optional float8 extra
 
-`torchao`, the backend for opt-in [float8 training](../../usage/float8_training.md)
-(NVIDIA SM89+), is an optional extra rather than part of `gpu`. Install it
+`torchao`, the backend for opt-in [low-precision training](../../usage/low_precision_training.md)
+(Float8 on NVIDIA SM89+ and emulated FP4 QAT), is an optional extra rather than part of `gpu`. Install it
 together with the `gpu` extra:
 
 ```bash

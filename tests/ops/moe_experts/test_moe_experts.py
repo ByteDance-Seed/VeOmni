@@ -1553,7 +1553,7 @@ def test_a_fused_row_delegates_a_non_silu_activation_to_eager(impl):
     ``rtol=0, atol=0`` here rather than a loose tolerance. They lose nothing by it:
     those rows do bf16 math and ignore ``expert_dtype``.
 
-    ``deepgemm_fp8`` is deliberately absent. Its GEMM is FP8, so handing the call
+    ``deepgemm`` is deliberately absent. Its GEMM is FP8, so handing the call
     away would skip the quantization and train the experts in bf16 under a config
     that said otherwise -- it refuses instead, covered below.
 
@@ -1782,7 +1782,7 @@ def test_absent_clamp_masks_are_never_inverted():
 def test_a_quantizing_row_refuses_an_activation_it_cannot_evaluate():
     """Neither quantizing row may quietly fall back to the model dtype.
 
-    ``qat`` and ``deepgemm_fp8`` round the expert GEMMs, so an activation they cannot
+    ``qat`` and ``deepgemm`` round the expert GEMMs, so an activation they cannot
     evaluate has no correct answer: handing it to a reference row, or to the model's
     own ``act_fn``, would train the experts at full precision while the config claimed
     quantization. Both refuse, and both say which selection to use instead.

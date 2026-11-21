@@ -59,7 +59,7 @@ def test_unweighted_rms_norm_rejects_unregistered_backend(monkeypatch, impl):
 def test_deepgemm_experts_coexist_with_quantizing_gemm_families(monkeypatch, parse_config, field):
     """A DeepGEMM expert GEMM and a quantizing dense family round different operands.
 
-    ``deepgemm_fp8`` and ``qat`` are two values of the same ``moe_implementation``
+    ``deepgemm`` and ``qat`` are two values of the same ``moe_implementation``
     field, so the routed experts can never be quantized twice. The shared expert
     (``gated_mlp``) and the attention projections (``linear``) are separate dense
     GEMMs, so quantizing them alongside is a valid recipe -- and a useful one, since

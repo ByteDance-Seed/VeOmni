@@ -69,13 +69,7 @@ def wrapper(
     num_experts: int,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
-    # Accepted to honour the family-wide call signature: ``DeepseekV4Experts``
-    # passes ``dtype`` at every call whatever row it resolved. It is dropped rather
-    # than forwarded -- DeepGEMM fixes its format and tile, and the row's registered
-    # ``dtypes`` says FP8 is the only one it implements, so a config asking for
-    # another is refused before this is reached. ``block_size`` is not declared: the
-    # family's call site does not pass it, and a config that sets one is filtered out
-    # as a key this row does not take.
+    # DeepGEMM currently implements FP8 only; any other dtype raises below.
     dtype: str = "fp8",
     activation: str = "silu",
 ) -> Tensor:
@@ -88,9 +82,8 @@ def wrapper(
     capture. Routing weights are applied after the down projection, matching the
     eager expert contract rather than moving them through FP8 quantization.
     """
-    # The format is fixed by the row, not by the caller: see the note on the
-    # signature. Dropping it here keeps the intent visible at the point of use.
-    del dtype
+    if dtype != "fp8":
+        raise ValueError(f"moe_implementation='deepgemm' currently supports dtype='fp8' only, got {dtype!r}.")
     if not is_silu(activation):
         # Refused here, before any of the FP8 math, because this is where the
         # quantization is decided. ``RecomputedSwiGLU`` computes SiLU inside the

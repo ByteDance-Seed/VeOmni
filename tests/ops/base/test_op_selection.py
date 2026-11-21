@@ -140,3 +140,9 @@ def test_per_site_op_selection_and_overrides():
     assert ops.gated_mlp_implementation.resolve("layers.1.mlp") == ("qat", {})
     assert ops.moe_implementation == "deepgemm"
     assert ops.kv_round_implementation == "triton"
+
+    from veomni.ops.kernels.moe_experts.standard import deepgemm
+
+    empty = torch.empty(0)
+    with pytest.raises(ValueError, match="dtype='fp8' only"):
+        deepgemm.wrapper(empty, empty, empty, empty, empty, empty, empty, num_experts=1, dtype="fp4")
