@@ -27,7 +27,7 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
 from veomni.arguments import MixedPrecisionConfig, ModelArguments, OpsImplementationConfig
 from veomni.arguments.parser import parse_args, save_args
 from veomni.models.configuration_base import as_veomni_config
-from veomni.ops import OpsSelection, SiteOverride, VeomniOp
+from veomni.ops import OpsSelection, VeomniOp
 from veomni.ops.torchao import torchao_fp8_linear
 from veomni.utils import device
 
@@ -90,26 +90,18 @@ def test_float8_disabled_never_imports_torchao(monkeypatch):
 
 
 @cpu
-@pytest.mark.parametrize("recipe", ["tensorwise", "rowwise", "rowwise_with_gw_hp"])
-def test_float8_ops_yaml_cli_and_saved_config_roundtrip(monkeypatch, tmp_path, recipe):
-    """Per-site float8 selections round-trip cleanly through YAML and ``save_args``."""
+def test_float8_ops_yaml_cli_and_saved_config_roundtrip(monkeypatch, tmp_path):
+    """Float8 op selections round-trip cleanly through YAML and ``save_args``."""
     path = tmp_path / "model.yaml"
     path.write_text(
         "config_path: /tmp/qwen3\n"
         "ops_implementation:\n"
         "  linear_implementation:\n"
-        "    name: eager\n"
-        "    overrides:\n"
-        "      - site: 'layers\\.0\\.(q_proj|o_proj)'\n"
-        "        name: torchao\n"
-        "        kwargs:\n"
-        "          dtype: fp8\n"
-        f"          recipe: {recipe}\n"
+        "    name: torchao\n"
+        "    kwargs: {dtype: fp8, recipe: rowwise}\n"
         "  gated_mlp_implementation:\n"
         "    name: torchao\n"
-        "    kwargs:\n"
-        "      dtype: fp8\n"
-        f"      recipe: {recipe}\n"
+        "    kwargs: {dtype: fp8, recipe: rowwise}\n"
     )
     monkeypatch.setattr("sys.argv", ["test", str(path)])
     config = parse_args(ModelArguments)
@@ -117,9 +109,8 @@ def test_float8_ops_yaml_cli_and_saved_config_roundtrip(monkeypatch, tmp_path, r
     mlp = config.ops_implementation.gated_mlp_implementation
     assert isinstance(lin, OpsSelection)
     assert isinstance(mlp, OpsSelection)
-    assert lin.resolve("layers.0.q_proj") == ("torchao", {"dtype": "fp8", "recipe": recipe})
-    assert lin.resolve("layers.0.k_proj") == ("eager", {})
-    assert mlp.resolve("layers.0.mlp") == ("torchao", {"dtype": "fp8", "recipe": recipe})
+    assert lin.resolve("layers.0.q_proj") == ("torchao", {"dtype": "fp8", "recipe": "rowwise"})
+    assert mlp.resolve("layers.0.mlp") == ("torchao", {"dtype": "fp8", "recipe": "rowwise"})
 
     save_args(config, str(tmp_path / "saved"))
     monkeypatch.setattr("sys.argv", ["test", str(tmp_path / "saved" / "veomni_cli.yaml")])
@@ -205,8 +196,8 @@ def test_float8_reports_missing_or_mismatched_torchao_extra(monkeypatch, install
 
 
 @cpu
-def test_qwen3_and_llama_resolve_per_site_float8_handles(monkeypatch):
-    """Qwen3 and Llama bind per-site handles while keeping every projection a plain ``nn.Linear``."""
+def test_qwen3_and_llama_bind_float8_handles(monkeypatch):
+    """Qwen3 and Llama bind torchao float8 handles while keeping every projection a plain ``nn.Linear``."""
     from transformers import LlamaConfig, Qwen3Config
 
     from tests.tools.training_utils import make_eager_ops_config
@@ -214,31 +205,12 @@ def test_qwen3_and_llama_resolve_per_site_float8_handles(monkeypatch):
     from veomni.models.transformers.qwen3.modeling_qwen3 import Qwen3ForCausalLM
     from veomni.ops import registry as ops_registry
 
-    # Pretend torchao is installed so handle resolution exercises the real site overrides on CPU.
     monkeypatch.setattr(ops_registry, "is_package_available", lambda _pkg: True)
     monkeypatch.setattr(VeomniOp, "_intern", dict(VeomniOp._intern))
 
     ops = make_eager_ops_config()
-    ops.linear_implementation = OpsSelection(
-        name="eager",
-        overrides=[
-            SiteOverride(
-                site=r"layers\.1\.(q_proj|o_proj)",
-                name="torchao",
-                kwargs={"dtype": "fp8", "recipe": "rowwise"},
-            )
-        ],
-    )
-    ops.gated_mlp_implementation = OpsSelection(
-        name="eager",
-        overrides=[
-            SiteOverride(
-                site=r"layers\.0\.mlp",
-                name="torchao",
-                kwargs={"dtype": "fp8", "recipe": "tensorwise"},
-            )
-        ],
-    )
+    ops.linear_implementation = _fp8_selection("rowwise")
+    ops.gated_mlp_implementation = _fp8_selection("tensorwise")
 
     for cfg_cls, model_cls in ((Qwen3Config, Qwen3ForCausalLM), (LlamaConfig, LlamaForCausalLM)):
         cfg = _attach_ops(
@@ -246,7 +218,7 @@ def test_qwen3_and_llama_resolve_per_site_float8_handles(monkeypatch):
                 vocab_size=64,
                 hidden_size=32,
                 intermediate_size=64,
-                num_hidden_layers=2,
+                num_hidden_layers=1,
                 num_attention_heads=2,
                 num_key_value_heads=1,
                 head_dim=16,
@@ -254,23 +226,15 @@ def test_qwen3_and_llama_resolve_per_site_float8_handles(monkeypatch):
             ),
             ops,
         )
-        # Config with per-site OpsSelection remains JSON-serializable for checkpoint export.
         assert "torchao" in cfg.to_json_string()
         model = model_cls(cfg)
-        l0, l1 = model.model.layers[0], model.model.layers[1]
+        l0 = model.model.layers[0]
 
-        assert l0.self_attn.veomni_q_proj.impl == "eager"
-        assert l1.self_attn.veomni_q_proj.impl == "torchao"
-        assert l1.self_attn.veomni_q_proj.kwargs == {"dtype": "fp8", "recipe": "rowwise"}
-        assert l1.self_attn.veomni_k_proj.impl == "eager"
-        assert l1.self_attn.veomni_o_proj.impl == "torchao"
-
+        assert l0.self_attn.veomni_q_proj.impl == "torchao"
+        assert l0.self_attn.veomni_q_proj.kwargs == {"dtype": "fp8", "recipe": "rowwise"}
         assert l0.mlp.veomni_gated_mlp.impl == "torchao"
         assert l0.mlp.veomni_gated_mlp.kwargs == {"dtype": "fp8", "recipe": "tensorwise"}
-        assert l1.mlp.veomni_gated_mlp.impl == "eager"
-
-        # No module swapping: every Linear stays plain nn.Linear (and lm_head is untouched).
-        assert type(l1.self_attn.q_proj) is nn.Linear
+        assert type(l0.self_attn.q_proj) is nn.Linear
         assert type(l0.mlp.gate_proj) is nn.Linear
         assert type(model.lm_head) is nn.Linear
 

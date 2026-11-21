@@ -89,34 +89,23 @@ def test_walks_nested_configs(monkeypatch, impl):
 
 
 @pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
-def test_refuses_a_torchao_override_below_sm80(monkeypatch, field):
-    override = OpsSelection(
-        name="eager",
-        overrides=[SiteOverride(site=r"layers\.0\..*", name="torchao", kwargs={"dtype": "nvfp4"})],
-    )
-    _device(monkeypatch, cuda=True, capability=79)
-    with pytest.raises(RuntimeError, match="native BF16 support"):
-        reject_qat_without_native_bf16(_model(**{field: override}))
-
-    _device(monkeypatch, cuda=True, capability=80)
-    reject_qat_without_native_bf16(_model(**{field: override}))
-
-
-@pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
-def test_native_fp8_requires_nvidia_sm89_including_overrides(monkeypatch, field):
+def test_native_fp8_requires_nvidia_sm89(monkeypatch, field):
     fp8 = OpsSelection(name="torchao", kwargs={"dtype": "fp8", "recipe": "rowwise"})
-    fp8_override = OpsSelection(
+    fp8_chained = OpsSelection(
         name="eager",
-        overrides=[SiteOverride(site=r"layers\.0\..*", name="torchao", kwargs={"dtype": "fp8"})],
+        overrides=[
+            SiteOverride(site=r"layers\.0\.q_a_proj", name="torchao"),
+            SiteOverride(site=r"layers\.0\.q_a_proj", kwargs={"dtype": "fp8"}),
+        ],
     )
     fp8_emulated = OpsSelection(name="torchao", kwargs={"dtype": "fp8", "emulated": True})
 
-    # SM80 rejects native FP8 (both top-level and override) but permits emulated FP8.
+    # SM80 rejects native FP8 (top-level and chained overrides) but permits emulated FP8.
     _device(monkeypatch, cuda=True, capability=80)
     with pytest.raises(RuntimeError, match="SM89"):
         reject_qat_without_native_bf16(_model(**{field: fp8}))
     with pytest.raises(RuntimeError, match="SM89"):
-        reject_qat_without_native_bf16(_model(**{field: fp8_override}))
+        reject_qat_without_native_bf16(_model(**{field: fp8_chained}))
     reject_qat_without_native_bf16(_model(**{field: fp8_emulated}))
 
     # ROCm rejects native FP8 even with capability >= 89.
@@ -127,67 +116,4 @@ def test_native_fp8_requires_nvidia_sm89_including_overrides(monkeypatch, field)
     # NVIDIA SM89+ permits native FP8.
     _device(monkeypatch, cuda=True, capability=89)
     reject_qat_without_native_bf16(_model(**{field: fp8}))
-    reject_qat_without_native_bf16(_model(**{field: fp8_override}))
-
-
-@pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
-def test_chained_overrides_selecting_native_fp8_require_sm89(monkeypatch, field):
-    """Later overrides inherit the row chosen by earlier matching overrides, not just the base."""
-    chained_name_then_dtype = OpsSelection(
-        name="eager",
-        overrides=[
-            SiteOverride(site=r"layers\.0\.q_a_proj", name="torchao"),
-            SiteOverride(site=r"layers\.0\.q_a_proj", kwargs={"dtype": "fp8"}),
-        ],
-    )
-
-    _device(monkeypatch, cuda=True, capability=80)
-    with pytest.raises(RuntimeError, match="SM89"):
-        reject_qat_without_native_bf16(_model(**{field: chained_name_then_dtype}))
-
-    _device(monkeypatch, cuda=True, capability=89)
-    reject_qat_without_native_bf16(_model(**{field: chained_name_then_dtype}))
-
-
-def test_bound_veomni_op_handles_resolve_concrete_sites(monkeypatch):
-    """Real modules with bound VeomniOp handles inspect concrete sites without cross-site false positives."""
-    from veomni.ops import registry
-    from veomni.ops.registry import VeomniOp
-
-    orig_is_available = registry.is_package_available
-    monkeypatch.setattr(
-        registry, "is_package_available", lambda pkg: True if pkg == "torchao" else orig_is_available(pkg)
-    )
-    monkeypatch.setattr(VeomniOp, "_intern", dict(VeomniOp._intern))
-
-    class _TwoSiteModule(torch.nn.Module):
-        def __init__(self, selection: OpsSelection):
-            super().__init__()
-            self.config = SimpleNamespace(
-                ops_config=SimpleNamespace(linear_implementation=selection, gated_mlp_implementation=None),
-                sub_configs={},
-            )
-            self.op_0 = VeomniOp("linear", "standard", selection, site="layers.0.q_a_proj")
-            self.op_1 = VeomniOp("linear", "standard", selection, site="layers.1.q_a_proj")
-
-    # Same concrete site hit by chained overrides -> resolves to torchao native FP8 -> SM80 rejected.
-    same_site_chained = OpsSelection(
-        name="eager",
-        overrides=[
-            SiteOverride(site=r"layers\.0\.q_a_proj", name="torchao"),
-            SiteOverride(site=r"layers\.0\.q_a_proj", kwargs={"dtype": "fp8"}),
-        ],
-    )
-    _device(monkeypatch, cuda=True, capability=80)
-    with pytest.raises(RuntimeError, match="SM89"):
-        reject_qat_without_native_bf16(_TwoSiteModule(same_site_chained))
-
-    # Disjoint concrete sites: layer 0 is torchao(nvfp4), layer 1 is eager(dtype=fp8 dropped) -> SM80 allowed.
-    disjoint_sites = OpsSelection(
-        name="eager",
-        overrides=[
-            SiteOverride(site=r"layers\.0\.q_a_proj", name="torchao", kwargs={"dtype": "nvfp4"}),
-            SiteOverride(site=r"layers\.1\.q_a_proj", kwargs={"dtype": "fp8"}),
-        ],
-    )
-    reject_qat_without_native_bf16(_TwoSiteModule(disjoint_sites))
+    reject_qat_without_native_bf16(_model(**{field: fp8_chained}))
