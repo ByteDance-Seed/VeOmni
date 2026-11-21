@@ -46,8 +46,10 @@ pyproject.toml
 │   ├── npu          Ascend NPU x86_64 — full superset, minus CUDA-only kernels:
 │   │                  torch 2.10.0+cpu + torch-npu 2.10.0
 │   │                  + diffusers / av / audio / video / peft / megatron-energon
+│   │                  + HyperParallel (pinned Git dependency)
 │   ├── npu_aarch64  Ascend NPU aarch64 — full superset except torchcodec:
 │   │                  torch 2.10.0 + torch-npu 2.10.0 + the same data/model deps
+│   │                  + HyperParallel (same pinned Git dependency)
 │   └── dev          pre-commit, ruff, pytest (legacy pip-style; modern uv path is the dev group)
 ├── [dependency-groups]                 Dev-only (uv-native)
 │   ├── dev                  includes lint + test
@@ -92,6 +94,11 @@ The `npu` and `npu_aarch64` extras both install the complete Ascend software
 stack and multimodal dependencies. Only `npu_aarch64` omits `torchcodec`
 because no compatible aarch64 wheel is available; build it from source when
 video decoding is required.
+
+Both NPU extras include `hyper-parallel` as a standard PEP 508 Git dependency
+at the same full commit SHA, without Hyper framework extras. uv records it in
+`uv.lock`; pip reads the same revision from package metadata. Backend execution
+remains an explicit training configuration choice. GPU extras are unchanged.
 
 ## Transformers Version
 

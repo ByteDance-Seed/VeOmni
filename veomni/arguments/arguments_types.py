@@ -85,7 +85,7 @@ class OptimizerConfig:
     norms use AdamW.
     """
 
-    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    type: Literal["adamw", "anyprecision_adamw", "muon", "hyper_muon"] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
@@ -698,15 +698,36 @@ def validate_low_precision_reduce_scatter_comm(
 
 def validate_expert_fsdp_shard_dim(dim, *, fsdp_mode="fsdp2"):
     """Validate an explicit expert FSDP placement independently of its optimizer."""
-    if dim is not None and (type(dim) is not int or dim not in (0, 1) or fsdp_mode != "fsdp2"):
+    if dim is not None and (type(dim) is not int or dim not in (0, 1) or fsdp_mode not in ("fsdp2", "hyper_fsdp2")):
         raise ValueError("expert_fsdp_shard_dim must be null, 0 or 1 and requires FSDP2.")
+
+
+@dataclass
+class HyperParallelFSDPConfig:
+    """Optional Hyper-specific controls under the shared FSDP configuration."""
+
+    comm_fusion: bool = False
+    comm_fusion_vit: Optional[bool] = None
+    forward_prefetch_depth: int = 1
+    backward_prefetch_depth: int = 1
+    reduce_comm_interval: int = 1
+
+    def __post_init__(self):
+        if type(self.comm_fusion) is not bool:
+            raise ValueError("hyper_parallel.comm_fusion must be bool.")
+        if self.comm_fusion_vit is not None and type(self.comm_fusion_vit) is not bool:
+            raise ValueError("hyper_parallel.comm_fusion_vit must be bool or null.")
+        for name in ("forward_prefetch_depth", "backward_prefetch_depth", "reduce_comm_interval"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"hyper_parallel.{name} must be a positive integer.")
 
 
 @dataclass
 class FSDPConfig:
     """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
-    fsdp_mode: Literal["ddp", "fsdp2", "eager"] = field(
+    fsdp_mode: Literal["ddp", "fsdp2", "hyper_fsdp2", "eager"] = field(
         default="fsdp2",
         metadata={
             "help": (
@@ -791,13 +812,14 @@ class FSDPConfig:
         },
     )
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
+    hyper_parallel: HyperParallelFSDPConfig = field(default_factory=HyperParallelFSDPConfig)
 
     def __post_init__(self):
-        if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
+        if self.fsdp_mode not in ("ddp", "fsdp2", "hyper_fsdp2", "eager"):
             raise ValueError(
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
                 "switch to fsdp_mode='fsdp2' (with model.accelerator.init_device='meta'), "
-                "'ddp', or 'eager'."
+                "'hyper_fsdp2', 'ddp', or 'eager'."
             )
         if self.fsdp_scope not in ("module", "model"):
             raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
@@ -1030,7 +1052,7 @@ class AcceleratorConfig:
             self.dp_shard_size = self.dp_size
 
     def _validate_init_device(self):
-        if self.fsdp_config.fsdp_mode == "fsdp2":
+        if self.fsdp_config.fsdp_mode in ("fsdp2", "hyper_fsdp2"):
             assert self.init_device == "meta", "Please use model.accelerator.init_device: meta for FSDP2 training"
         else:
             # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a

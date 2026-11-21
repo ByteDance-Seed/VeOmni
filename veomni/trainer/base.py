@@ -709,7 +709,7 @@ class BaseTrainer(Stateful, ABC):
         args: VeOmniArguments = self.args
         model = self.model if model is None else model
         if (
-            args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+            args.model.accelerator.fsdp_config.fsdp_mode in ("fsdp2", "hyper_fsdp2")
             and not args.model.accelerator.fsdp_config.reshard_after_backward
             and num_micro_steps > 1
         ):
@@ -722,7 +722,7 @@ class BaseTrainer(Stateful, ABC):
         args: VeOmniArguments = self.args
         model = self.model if model is None else model
         if (
-            args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+            args.model.accelerator.fsdp_config.fsdp_mode in ("fsdp2", "hyper_fsdp2")
             and args.model.accelerator.dp_replicate_size > 1
             and num_micro_steps > 1
         ):
