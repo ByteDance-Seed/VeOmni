@@ -39,6 +39,7 @@ from ltx_core.model.transformer.attention import (
 from ltx_core.model.transformer.model import LTXModel
 # isort: on
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import assert_outputs_and_grads_match, eager_ops_config
 from tests.models.tiny_configs import tiny_ltx2_3_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_ltx2_3_config as _tiny_config
@@ -55,6 +56,7 @@ def _sdpa_ops_config() -> SimpleNamespace:
 
 _VENDORED_ATTENTION_FORWARD = Attention.forward
 _OFFICIAL_LTX_MODEL_FORWARD = LTXModel.forward
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _official_attention_forward(self, *args, sp_valid_length=None, sp_context_length=None, **kwargs):
