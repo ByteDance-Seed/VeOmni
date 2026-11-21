@@ -622,6 +622,11 @@ def test_large_carried_tensors_are_sliced_across_ranks_and_consolidated_on_every
 
     # Lower the threshold so the 4x4 carried tensor ``decoder.proj.weight`` is sliced across ranks.
     monkeypatch.setattr(hf_layout_mod, "_SHARDED_CARRY_BYTES", 8)
+    # This case asserts the per-rank consolidation path. It is chosen by torch
+    # version (2.10 has the helper but writes no index, so it takes the fallback),
+    # and pinning it here keeps the test about slicing rather than about which
+    # branch the local torch happens to take -- that has its own test.
+    monkeypatch.setattr(hf_layout_mod, "_on_every_rank_writes_index", lambda: True)
     group = object()
     monkeypatch.setattr(save_utils_mod, "_consolidation_process_group", lambda: group)
 
