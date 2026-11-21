@@ -67,23 +67,41 @@ Our guiding principles when building VeOmni are:
 
 ## ✏️ Supported Models
 
-| Model                                                    | Model size                    | Example config File                                                   |
-| -------------------------------------------------------- | ----------------------------- | ----------------------------------------------------------------------|
-| [DeepSeek2.5/3/R1](https://huggingface.co/deepseek-ai)   | 236B/671B                     | [deepseek.yaml](configs/text/deepseek.yaml)                           |
-| [DeepSeek-V4](https://huggingface.co/deepseek-ai)        | Checkpoint-dependent          | [deepseek.yaml](configs/text/deepseek.yaml) template; DSA/mHC default to eager, with optional [SM90+ TileLang/TileKernels backends](docs/design/op_selection.md#deepseek-v4-dsa-and-mhc) |
-| [Llama3-3.3](https://huggingface.co/meta-llama)          | 1B/3B/8B/70B                  | [llama3.yaml](configs/text/llama3.yaml)                               |
-| [Qwen2-3](https://huggingface.co/Qwen)                   | 0.5B/1.5B/3B/7B/14B/32B/72B/  | [qwen2_5.yaml](configs/text/qwen2_5.yaml)                             |
-| [Qwen2-3 VL/QVQ](https://huggingface.co/Qwen)            | 2B/3B/7B/32B/72B              | [qwen3_vl_dense.yaml](configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml)|
-| [Qwen3-VL MoE](https://huggingface.co/Qwen)              | 30BA3B/235BA22B               | [qwen3_vl_moe.yaml](configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml)    |
-| [Qwen3-MoE](https://huggingface.co/Qwen)                 | 30BA3B/235BA22B               | [qwen3-moe.yaml](configs/text/qwen3-moe.yaml)                         |
-| [GPT-OSS](https://huggingface.co/openai/gpt-oss-120b)    | 120B                          | [gpt_oss_120b_lora_ep4.yaml](configs/text/gpt_oss_120b_lora_ep4.yaml) |
-| [Qwen2-3 Omni](https://huggingface.co/Qwen)              | 7B/30BA3B                     | [qwen25_omni.yaml](configs/multimodal/qwen25_omni/qwen25_omni.yaml)   |
-| [Kimi K3](docs/examples/kimi_k3.md)                      | Checkpoint-dependent          | [kimi_k3_vl_ascendc.yaml](configs/multimodal/kimi_k3/kimi_k3_vl_ascendc.yaml) |
-| [Wan](https://huggingface.co/Wan-AI)                     | Wan2.1-I2V-14B-480P           | [wan_sft.yaml](configs/dit/wan_sft.yaml)                              |
-| [MiniMax H3](docs/examples/minimax_h3.md)                | Checkpoint-dependent          | [FL2VA](configs/dit/minimax_h3_fl2va_offline.yaml); [Ref2VA](configs/dit/minimax_h3_ref2va_cfg_offline.yaml) |
-| [MiniMax H3-Image](docs/examples/minimax_h3_image.md)    | Checkpoint-dependent          | Inference only (t2i/edit)                                              |
-| [HunyuanVideo 1.5](docs/examples/hunyuanvideo15.md) | 480p T2V (experimental; CPU and NPU backbone checks) | [hunyuanvideo15_t2v.yaml](configs/dit/hunyuanvideo15_t2v.yaml) |
-| [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3)     | Checkpoint-dependent          | [ltx2_av_lora.yaml](configs/dit/ltx2_av_lora.yaml); [training guide](docs/examples/ltx-2.3.md) |
+> **Legend:** `✅` Verified · `—` Unverified · `❌` Unsupported
+>
+> **Hardware Guides:** [NVIDIA GPU](docs/get_started/installation/install.md) · [Ascend NPU](docs/hardware_support/get_started_npu.md) · [AMD ROCm](docs/hardware_support/rocm/README.md) · [Cambricon MLU](docs/hardware_support/mlu/README.md)
+
+| Model | NVIDIA GPU | Ascend NPU | AMD GPU | Cambricon MLU | Example Config / Guide |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| [BAGEL](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | ✅ | — | — | — | [base.yaml](configs/seed_omni/Bagel/bagel_7b_mot/train/base.yaml) · [Guide](docs/seed_omni/models/bagel.md) |
+| [Cosmos3-Nano](https://huggingface.co/nvidia/Cosmos3-Nano) | ✅ | — | — | — | [online.yaml](configs/seed_omni/Cosmos3/cosmos3_nano/train/online.yaml) · [Guide](docs/seed_omni/models/cosmos3.md) |
+| [DeepSeek-V2.5 / V3 / R1](https://huggingface.co/deepseek-ai) | ✅ | ✅ | ✅ | — | [deepseek.yaml](configs/text/deepseek.yaml) |
+| [DeepSeek-V4](https://huggingface.co/deepseek-ai) | ✅ | ✅ | ✅ | — | [deepseek_v4.yaml](configs/text/deepseek_v4.yaml) · [NPU](configs/text/deepseek_v4_npu.yaml) |
+| [Gemma 3](https://huggingface.co/google) | ✅ | — | — | — | [gemma3.yaml](configs/text/gemma3.yaml) |
+| [GLM-5 (`glm_moe_dsa`)](https://huggingface.co/zai-org) | ✅ | — | — | — | — |
+| [GPT-OSS](https://huggingface.co/openai/gpt-oss-120b) | ✅ | ❌ | ❌ | ❌ | [gpt_oss_120b_lora_ep4.yaml](configs/text/gpt_oss_120b_lora_ep4.yaml) |
+| [HunyuanVideo 1.5](https://huggingface.co/tencent/HunyuanVideo-1.5) | ✅ | ✅ | — | — | [hunyuanvideo15_t2v.yaml](configs/dit/hunyuanvideo15_t2v.yaml) · [Guide](docs/examples/hunyuanvideo15.md) |
+| [Janus](https://huggingface.co/deepseek-ai/Janus-1.3B) | ✅ | — | — | — | [base.yaml](configs/seed_omni/Janus/janus/train/base.yaml) · [Guide](docs/seed_omni/models/janus.md) |
+| [Kimi K3](docs/examples/kimi_k3.md) | ✅ | ✅ | — | — | [kimi_k3_vl.yaml](configs/multimodal/kimi_k3/kimi_k3_vl.yaml) · [Ascend](configs/multimodal/kimi_k3/kimi_k3_vl_ascendc.yaml) · [Guide](docs/examples/kimi_k3.md) |
+| [Llama 3 / 3.1 / 3.3](https://huggingface.co/meta-llama) | ✅ | ✅ | ✅ | ✅ | [llama3.yaml](configs/text/llama3.yaml) |
+| [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) | ✅ | ✅ | — | — | [ltx2_av_lora.yaml](configs/dit/ltx2_av_lora.yaml) · [Guide](docs/examples/ltx-2.3.md) |
+| [MiniMax-H3](https://huggingface.co/MiniMaxAI) | ✅ | ✅ | — | — | [FL2VA](configs/dit/minimax_h3_fl2va_offline.yaml) · [Ref2VA](configs/dit/minimax_h3_ref2va_cfg_offline.yaml) · [Guide](docs/examples/minimax_h3.md) |
+| [Qwen2 / Qwen2.5](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [qwen2_5.yaml](configs/text/qwen2_5.yaml) |
+| [Qwen2-VL / Qwen2.5-VL](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [qwen2_vl.yaml](configs/multimodal/qwen2_vl/qwen2_vl.yaml) · [qwen25_vl.yaml](configs/multimodal/qwen25_vl/qwen25_vl.yaml) |
+| [Qwen2.5-Omni](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [qwen25_omni.yaml](configs/multimodal/qwen25_omni/qwen25_omni.yaml) |
+| [Qwen3](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [qwen3.yaml](configs/text/qwen3.yaml) · [Guide](docs/examples/qwen3.md) |
+| [Qwen3-MoE](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [qwen3-moe.yaml](configs/text/qwen3-moe.yaml) · [Guide](docs/examples/qwen3_moe.md) |
+| [Qwen3-VL](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [qwen3_vl_dense.yaml](configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml) · [Guide](docs/examples/qwen3_vl.md) |
+| [Qwen3-VL-MoE](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [qwen3_vl_moe.yaml](configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml) |
+| [Qwen3-Omni-MoE](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [qwen3_omni.yaml](configs/multimodal/qwen3_omni/qwen3_omni.yaml) · [Guide](docs/examples/qwen3_omni_moe.md) |
+| [Qwen3.5](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [qwen3_5_vl.yaml](configs/multimodal/qwen3_5/qwen3_5_vl.yaml) · [Guide](docs/examples/qwen3_5.md) |
+| [Qwen3.5-MoE](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [qwen3_5_moe_vl.yaml](configs/multimodal/qwen3_5_moe/qwen3_5_moe_vl.yaml) · [Guide](docs/examples/qwen3_5.md) |
+| [Qwen3.8-Flash-Next (`qwen4_exp`)](https://huggingface.co/Qwen) | ✅ | ✅ | — | — | [qwen4exp.yaml](configs/text/qwen4exp.yaml) · [Guide](docs/examples/qwen4_exp_frozen_ple.md) |
+| [Qwen-Image / Qwen-Image-Edit](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [qwen_image_sft.yaml](configs/dit/qwen_image_sft.yaml) · [Edit](configs/dit/qwen_image_edit_2511.yaml) · [Guide](docs/examples/qwen_image_edit.md) |
+| [Seed-OSS](https://huggingface.co/ByteDance-Seed) | ✅ | ✅ | — | — | [seed_oss.yaml](configs/text/seed_oss.yaml) · [Guide](docs/examples/seed_oss.md) |
+| [Wan2.1 / Wan2.2](https://huggingface.co/Wan-AI) | ✅ | ✅ | ✅ | ✅ | [wan_sft.yaml](configs/dit/wan_sft.yaml) · [Wan2.2](configs/dit/wan2.2_I2V_14B.yaml) · [Guide](docs/examples/wan2.1.md) |
+
+For inference-only models, see [MiniMax-H3-Image](docs/examples/minimax_h3_image.md).
 
 Support new models to VeOmni see [Support New Models](https://veomni.readthedocs.io/en/latest/usage/support_new_models/guide_and_checklist.html)
 
