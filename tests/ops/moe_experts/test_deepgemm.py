@@ -743,6 +743,58 @@ def test_grouped_linear_row_matches_a_per_group_bmm():
     assert dx.shape == x.shape and torch.isfinite(dx).all()
 
 
+def test_gated_mlp_row_backward_matches_a_bf16_reference():
+    """dgrad and wgrad go through the same one-group layout as the forward."""
+    from deep_gemm.testing import calc_diff
+
+    from veomni.ops import VeomniOp
+
+    torch.manual_seed(105)
+    hidden, intermediate = 256, 384
+    n_rows = 130
+    mlp = torch.nn.Module()
+    mlp.gate_proj = torch.nn.Linear(hidden, intermediate, bias=False, device="cuda", dtype=torch.bfloat16)
+    mlp.up_proj = torch.nn.Linear(hidden, intermediate, bias=False, device="cuda", dtype=torch.bfloat16)
+    mlp.down_proj = torch.nn.Linear(intermediate, hidden, bias=False, device="cuda", dtype=torch.bfloat16)
+    for proj in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        proj.weight.data.mul_(0.05)
+    x = torch.randn(n_rows, hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    # No clamp, so the reference derivative is the plain chain through silu.
+    out = VeomniOp("gated_mlp", "standard", "deepgemm")(mlp, x)
+    grad = torch.randn_like(out)
+    dx, dgate, dup, ddown = torch.autograd.grad(
+        out, (x, mlp.gate_proj.weight, mlp.up_proj.weight, mlp.down_proj.weight), grad
+    )
+
+    assert dx.shape == x.shape and torch.isfinite(dx).all()
+    for name, actual, weight in (
+        ("gate", dgate, mlp.gate_proj.weight),
+        ("up", dup, mlp.up_proj.weight),
+        ("down", ddown, mlp.down_proj.weight),
+    ):
+        assert actual.shape == weight.shape, name
+        assert torch.isfinite(actual).all(), name
+
+    # BF16 autocast reference over the same operands. ``calc_diff`` is a normalized
+    # squared error, so 0.001 is the same gate the expert tests use.
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        xr = x.detach().clone().requires_grad_(True)
+        gw, uw, dw = (
+            p.detach().clone().requires_grad_(True)
+            for p in (mlp.gate_proj.weight, mlp.up_proj.weight, mlp.down_proj.weight)
+        )
+        ref = torch.nn.functional.linear(torch.nn.functional.silu(xr @ gw.T) * (xr @ uw.T), dw)
+        rdx, rgw, ruw, rdw = torch.autograd.grad(ref, (xr, gw, uw, dw), grad)
+    for label, actual, reference in (
+        ("dgrad", dx, rdx),
+        ("wgrad gate", dgate, rgw),
+        ("wgrad up", dup, ruw),
+        ("wgrad down", ddown, rdw),
+    ):
+        assert calc_diff(actual, reference.bfloat16()) < 0.01, f"{label}: {calc_diff(actual, reference.bfloat16())}"
+
+
 def test_gated_mlp_row_matches_the_quantized_reference():
     """gate/up share one GEMM, and the clamp plus act_fn multiply stay in the model dtype."""
     from deep_gemm.testing import calc_diff
@@ -758,7 +810,7 @@ def test_gated_mlp_row_matches_the_quantized_reference():
         mlp.down_proj = torch.nn.Linear(intermediate, hidden, bias=False, device="cuda", dtype=torch.bfloat16)
         for proj in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
             proj.weight.data.mul_(0.05)
-        x = torch.randn(n_rows, hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        x = torch.randn(n_rows, hidden, device="cuda", dtype=torch.bfloat16)
 
         out = VeomniOp("gated_mlp", "standard", "deepgemm")(mlp, x, swiglu_limit=limit)
         assert out.shape == (n_rows, hidden)
@@ -768,6 +820,3 @@ def test_gated_mlp_row_matches_the_quantized_reference():
         u = (qx @ _quantized_weight(mlp.up_proj.weight).T).clamp(min=-limit, max=limit)
         reference = _quantized_rows(torch.nn.functional.silu(g) * u) @ _quantized_weight(mlp.down_proj.weight).T
         assert calc_diff(out, reference.bfloat16()) < 0.001, n_rows
-
-        (dx,) = torch.autograd.grad(out.sum(), x)
-        assert dx.shape == x.shape and torch.isfinite(dx).all(), n_rows

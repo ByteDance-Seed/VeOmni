@@ -1182,3 +1182,51 @@ def test_the_deepgemm_row_refuses_a_block_size_it_cannot_honor():
     x = torch.randn(2, 256, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="only block_size=128"):
         deepgemm.wrapper(mlp, x, block_size=64)
+
+
+def test_the_deepgemm_row_refuses_a_wrapped_projection():
+    """It quantizes the weight it multiplies, so a LoRA wrapper has to be refused.
+
+    ``render`` raises instead of falling back to the projection modules, because a
+    fallback would train at full precision under a config that said otherwise.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+
+    class _Wrapped(nn.Module):
+        """Stand-in for ``LoraLinear``: no ``weight``, keeps the base at ``base_layer``."""
+
+        def __init__(self):
+            super().__init__()
+            self.base_layer = nn.Linear(256, 384, bias=False)
+
+        def forward(self, x):
+            return self.base_layer(x)
+
+    mlp = nn.Module()
+    mlp.gate_proj = _Wrapped()
+    mlp.up_proj = nn.Linear(256, 384, bias=False)
+    mlp.down_proj = nn.Linear(384, 256, bias=False)
+    with pytest.raises(ValueError, match="quantizes the projection weights"):
+        deepgemm.wrapper(mlp, torch.randn(2, 256), activation="silu")
+
+
+def test_the_deepgemm_row_refuses_an_activation_its_kernel_cannot_fuse():
+    """``render`` keeps a non-SiLU model off this row; a direct call must also refuse.
+
+    ``render`` raises first here, before the row's own check runs -- which is the
+    right order, because it has the wider message (it names the config field to
+    change). The row's ``_FUSED_ACTIVATIONS`` check is the second line of defence
+    for a caller that reaches the kernel some other way.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+
+    mlp = nn.Module()
+    mlp.gate_proj = nn.Linear(256, 384, bias=False)
+    mlp.up_proj = nn.Linear(256, 384, bias=False)
+    mlp.down_proj = nn.Linear(384, 256, bias=False)
+    with pytest.raises(ValueError, match="no quantizing row evaluates that activation"):
+        deepgemm.wrapper(mlp, torch.randn(2, 256), activation="gelu")
