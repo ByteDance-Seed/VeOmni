@@ -1,6 +1,7 @@
-# Reduced-model check for Qwen2.5-Omni-3B on 8 × 910B2.
+# Qwen2.5-Omni-3B on 8 × 910B2.
 # NPROC_PER_NODE=8 bash train.sh tasks/train_vlm.py configs/models/qwen2_5_omni/ascend.yaml
 model:
+  model_path: ./Qwen2.5-Omni-3B
   optimizer:
     lr: 1.0e-05
     lr_decay_style: cosine
@@ -9,8 +10,6 @@ model:
     ulysses_size: 1
     fsdp_config:
       fsdp_mode: fsdp2
-  config_path: tests/toy_config/qwen25omni_toy
-  tokenizer_path: ./Qwen2.5-Omni-3B
 data:
   train_path: ./data/sharegpt4v.parquet
   data_type: conversation
