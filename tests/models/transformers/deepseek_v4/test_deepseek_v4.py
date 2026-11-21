@@ -38,12 +38,8 @@ from tests.models.tiny_configs import tiny_deepseek_v4_config as _tiny_config
 
 
 def _dsv4_module():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as gen
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as gen
-    else:
-        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gen
     return gen
 
 
@@ -206,6 +202,10 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
         # implementation name: V4-Flash stores routed experts in FP4 and its
         # dense projections in FP8, so one recipe name cannot describe both.
         "expert_dtype": getattr(config, "expert_dtype", "fp8"),
+        # The activation travels with the call, and the name is the whole input: the
+        # rows resolve a name outside ``veomni.ops.activation`` through ``ACT2FN``,
+        # which is where the model built its own ``act_fn`` from.
+        "activation": config.hidden_act,
     }
     torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
 
