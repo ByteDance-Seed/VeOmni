@@ -89,6 +89,20 @@ def test_walks_nested_configs(monkeypatch, impl):
 
 
 @pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
+def test_refuses_a_torchao_override_below_sm80(monkeypatch, field):
+    override = OpsSelection(
+        name="eager",
+        overrides=[SiteOverride(site=r"layers\.0\..*", name="torchao", kwargs={"dtype": "nvfp4"})],
+    )
+    _device(monkeypatch, cuda=True, capability=79)
+    with pytest.raises(RuntimeError, match="native BF16 support"):
+        reject_qat_without_native_bf16(_model(**{field: override}))
+
+    _device(monkeypatch, cuda=True, capability=80)
+    reject_qat_without_native_bf16(_model(**{field: override}))
+
+
+@pytest.mark.parametrize("field", ["linear_implementation", "gated_mlp_implementation"])
 def test_native_fp8_requires_nvidia_sm89_including_overrides(monkeypatch, field):
     fp8 = OpsSelection(name="torchao", kwargs={"dtype": "fp8", "recipe": "rowwise"})
     fp8_override = OpsSelection(

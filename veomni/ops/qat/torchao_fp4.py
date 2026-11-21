@@ -128,7 +128,9 @@ def nvfp4_fake_quant(x: Tensor, block_size: int = NVFP4_BLOCK_SIZE) -> Tensor:
 
 def _mxfp4_roundtrip(x: Tensor, block_size: int) -> Tensor:
     """Quantize-dequantize ``x`` in ``1 x block_size`` groups to MXFP4 with an E8M0 scale."""
+    from torchao.prototype.mx_formats.config import ScaleCalculationMode
     from torchao.prototype.mx_formats.mx_tensor import MXTensor
+    from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     # ``MXFP4`` is torchao's `e2m1` element type with an `e8m0` scale, one per group;
@@ -137,10 +139,11 @@ def _mxfp4_roundtrip(x: Tensor, block_size: int) -> Tensor:
         x_2d,
         torch.float4_e2m1fn_x2,
         block_size=block_size,
-        scaling_mode="mxfp4",
-        use_triton_kernel=False,
+        scaling_mode=ScaleCalculationMode.FLOOR,
+        kernel_preference=KernelPreference.EMULATED,
+        is_swizzled_scales=False,
     )
-    return quantized.dequantize(torch.bfloat16).reshape(x.shape)
+    return quantized.dequantize(x.dtype).reshape(x.shape)
 
 
 def _check_operand(x: Tensor, dtype: str, block_size: int) -> None:

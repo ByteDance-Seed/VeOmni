@@ -1150,3 +1150,38 @@ def test_current_selections_are_untouched_by_the_migration():
     selections = {"linear_implementation": "qat", "kv_round_implementation": "triton"}
     assert migrate_retired_selections(selections) == selections
     assert migrate_retired_selections({"gated_mlp_implementation": "qat"}) == {"gated_mlp_implementation": "qat"}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_ops_config_refreshes_on_nested_kwargs_and_override_mutations():
+    """Mutating nested ``kwargs`` or ``overrides`` in ``ops_implementation`` invalidates ``ops_config``."""
+    from transformers import Qwen3Config
+
+    from veomni.models.configuration_base import as_veomni_config
+
+    config = as_veomni_config(
+        Qwen3Config(
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            intermediate_size=64,
+            ops_implementation={
+                "linear_implementation": {
+                    "name": "torchao",
+                    "kwargs": {"dtype": "nvfp4"},
+                    "overrides": [{"site": r"layers\.0\.q_proj", "name": "eager"}],
+                }
+            },
+        )
+    )
+    assert config.ops_config.linear_implementation.resolve_kwargs("layers.1.q_proj") == {"dtype": "nvfp4"}
+    assert config.ops_config.linear_implementation.resolve_impl("layers.0.q_proj") == "eager"
+
+    config.ops_implementation["linear_implementation"]["kwargs"]["dtype"] = "mxfp4"
+    assert config.ops_config.linear_implementation.resolve_kwargs("layers.1.q_proj") == {"dtype": "mxfp4"}
+
+    config.ops_implementation["linear_implementation"]["overrides"][0]["name"] = "torchao"
+    assert config.ops_config.linear_implementation.resolve_impl("layers.0.q_proj") == "torchao"
+    assert "mxfp4" in config.to_json_string()

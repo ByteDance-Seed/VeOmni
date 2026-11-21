@@ -325,3 +325,27 @@ def test_linear_torchao_fp8_validates_arguments_and_dispatches(monkeypatch):
     out_emulated = linear_torchao.wrapper(linear, x, dtype="fp8", emulated=True)
     torch.testing.assert_close(out_emulated, linear(x))
     assert seen[-1] == ((2, 32), (16, 32), True, "tensorwise", True)
+
+
+@_requires_torchao
+def test_linear_torchao_mxfp4_forward_and_backward_round_trip():
+    """The ``torchao`` row with ``dtype='mxfp4'`` runs MXFP4 forward and STE backward on BF16 and FP32."""
+    from veomni.ops.selection import OpsSelection
+
+    op = VeomniOp("linear", "standard", OpsSelection(name="torchao", kwargs={"dtype": "mxfp4"}))
+    torch.manual_seed(0)
+    for tensor_dtype in (torch.bfloat16, torch.float32):
+        # 64 is a whole number of 32-wide MXFP4 groups.
+        linear = torch.nn.Linear(64, 32).to(tensor_dtype)
+        x = torch.randn(2, 5, 64, dtype=tensor_dtype, requires_grad=True)
+
+        out = op(linear, x)
+        assert out.shape == (2, 5, 32)
+        assert out.dtype == tensor_dtype
+        assert torch.isfinite(out).all()
+        assert not torch.equal(out, linear(x))
+
+        out.sum().backward()
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+        assert linear.weight.grad is not None and torch.isfinite(linear.weight.grad).all()
+        torch.testing.assert_close(linear.bias.grad, torch.full_like(linear.bias.grad, 10.0))

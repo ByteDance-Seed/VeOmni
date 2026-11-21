@@ -534,6 +534,50 @@ def test_kv_round_implementation_supports_per_site_overrides():
     assert configured.kv_round_implementation.resolve_impl("layers.1.window_kv") == "none"
 
 
+@pytest.mark.parametrize(
+    ("on_npu", "expected"),
+    [
+        (True, "fused_npu"),
+        (False, "fused_quack"),
+    ],
+)
+def test_legacy_fused_moe_alias_resolves_in_mapping_defaults_and_overrides(monkeypatch, on_npu, expected):
+    """Both mapping default and override named ``fused`` rewrite to the host MoE row before validation."""
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", on_npu)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+
+    default_sel = OpsImplementationConfig(moe_implementation={"name": "fused"})
+    assert isinstance(default_sel.moe_implementation, OpsSelection)
+    assert default_sel.moe_implementation.name == expected
+    assert default_sel.moe_implementation.resolve_impl("layers.0.experts") == expected
+
+    override_sel = OpsImplementationConfig(
+        moe_implementation={
+            "name": "eager",
+            "overrides": [{"site": r"layers\.0\.experts", "name": "fused"}],
+        }
+    )
+    assert isinstance(override_sel.moe_implementation, OpsSelection)
+    assert override_sel.moe_implementation.resolve_impl("layers.0.experts") == expected
+    assert override_sel.moe_implementation.resolve_impl("layers.1.experts") == "eager"
+
+
+def test_shipped_deepseek_v4_mixed_precision_yaml_parses_cleanly():
+    """The worked mixed-precision example YAML stays valid as ops schemas evolve."""
+    from pathlib import Path
+
+    import yaml
+
+    yaml_path = Path(__file__).resolve().parents[3] / "configs" / "text" / "deepseek_v4_mixed_precision.yaml"
+    raw = yaml.safe_load(yaml_path.read_text())
+    ops = OpsImplementationConfig(**raw["model"]["ops_implementation"])
+    assert ops.linear_implementation.resolve_impl("layers.15.q_a_proj") == "torchao"
+    assert ops.linear_implementation.resolve_kwargs("layers.15.q_a_proj") == {"dtype": "nvfp4", "block_size": 16}
+    assert ops.linear_implementation.resolve_impl("layers.15.o_a_proj") == "qat"
+    assert ops.gated_mlp_implementation.resolve_impl("layers.0.mlp") == "liger_kernel"
+    assert ops.moe_implementation.resolve_impl("layers.0.experts") == "deepgemm"
+
+
 def test_the_native_row_still_takes_the_family_signature_at_the_call_site():
     """``_check_kwargs`` constrains a config, not a call.
 

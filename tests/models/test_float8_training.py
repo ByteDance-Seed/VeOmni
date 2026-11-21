@@ -389,7 +389,7 @@ def test_float8_qwen3_fsdp2_train_dcp_resume_and_hf_export(tmp_path, recipe):
     from transformers import Qwen3Config
     from transformers import Qwen3ForCausalLM as HFQwen3ForCausalLM
 
-    from tests.tools.launch_utils import get_free_port
+    from tests.tools.launch_utils import find_free_port
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.checkpoint.dcp_checkpointer import ModelState, OptimizerState
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
@@ -419,7 +419,7 @@ def test_float8_qwen3_fsdp2_train_dcp_resume_and_hf_export(tmp_path, recipe):
 
     dist.init_process_group(
         backend="cuda:nccl,cpu:gloo",
-        init_method=f"tcp://127.0.0.1:{get_free_port()}",
+        init_method=f"tcp://127.0.0.1:{find_free_port()}",
         rank=0,
         world_size=1,
     )
