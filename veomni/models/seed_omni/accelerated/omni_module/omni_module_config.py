@@ -46,6 +46,36 @@ def hf_module_model_config(model_config: dict | None) -> dict:
     return {key: value for key, value in model_config.items() if key not in LAUNCHER_CONFIG_KEYS}
 
 
+def accelerator_needs_distributed_build(accelerator) -> bool:
+    """Whether ``accelerator`` asks for a build under a process group.
+
+    ``eager`` means one rank holds the module entire, loaded through
+    ``device_map`` with no collectives. Anything else -- FSDP2, DDP, expert
+    parallelism, vocab parallelism -- needs a :class:`ParallelState` and a
+    sharded build.
+
+    The two parallelisms that are *not* ``fsdp_mode`` are the reason this is a
+    function rather than a comparison written out at each call site. A module can
+    ask for ``ep`` or ``emb`` while leaving ``fsdp_mode`` alone, and reading only
+    ``fsdp_mode`` then sends it down the single-process path -- where the sharding
+    quietly does not happen and the whole module is loaded on every rank. A
+    hashed n-gram table shards over ``emb`` and nothing else, and one of those
+    tables is tens of GiB.
+
+    Everything is read with ``getattr`` and the ``AcceleratorConfig`` defaults
+    because test stubs carry only the fields they exercise. This lives outside
+    the dataclass so :class:`~veomni.models.seed_omni.accelerated.omni_module.
+    omni_module_runtime.ModuleRuntime` can call it for a stub too.
+    """
+    fsdp_config = getattr(accelerator, "fsdp_config", None)
+    fsdp_mode = getattr(fsdp_config, "fsdp_mode", None)
+    if fsdp_mode and str(fsdp_mode).lower() not in ("eager",):
+        return True
+    if getattr(accelerator, "ep_size", 1) > 1:
+        return True
+    return any(size > 1 for size in getattr(accelerator, "extra_parallel_sizes", None) or ())
+
+
 @dataclass
 class OmniModuleRuntimeArguments(ModelArguments):
     """Per-module runtime — one module's slice of a composed Omni model.
@@ -56,6 +86,22 @@ class OmniModuleRuntimeArguments(ModelArguments):
     per index path (several modules routinely share one checkpoint). All this adds
     is the projection onto an HF module descriptor.
     """
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.accelerator.fsdp_config.fsdp_mode == "eager" and self.needs_distributed_build:
+            self.accelerator.fsdp_config.fsdp_mode = "fsdp2"
+            self.accelerator.fsdp_config.extra_parallel_only = True
+            self.accelerator._validate_init_device()
+
+    @property
+    def needs_distributed_build(self) -> bool:
+        """True when this module must be built under a process group, not loaded whole.
+
+        Delegates to :func:`accelerator_needs_distributed_build`; see there for
+        why ``ep`` / ``emb`` count even when ``fsdp_mode`` stays ``eager``.
+        """
+        return accelerator_needs_distributed_build(getattr(self, "accelerator", None))
 
     def to_hf_config(self) -> dict:
         """Project onto this module's ``OmniConfig._module_entries`` entry.
@@ -94,5 +140,6 @@ class OmniModuleRuntimeArguments(ModelArguments):
 
 __all__ = [
     "OmniModuleRuntimeArguments",
+    "accelerator_needs_distributed_build",
     "hf_module_model_config",
 ]
