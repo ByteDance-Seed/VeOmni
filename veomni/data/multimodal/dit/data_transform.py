@@ -1,7 +1,10 @@
+import json
+import os
+
 import PIL
 
 from ...data_transform import DATA_TRANSFORM_REGISTRY
-from ..image_utils import fetch_images
+from ..image_utils import fetch_images, load_image
 from ..preprocess import conv_preprocess
 from ..video_utils import fetch_videos
 
@@ -20,6 +23,39 @@ def process_dit_online_example(example, source_name, **kwargs):
         "videos": videos,
     }
     return [processed_example]
+
+
+@DATA_TRANSFORM_REGISTRY.register("minimax_h3_image_t2i")
+def process_minimax_h3_image_t2i_example(example, data_dir="", **kwargs):
+    """Load one prompt and target image for MiniMax-H3-Image T2I training or caching."""
+    prompt, image = example.get("prompt"), example.get("image")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("MiniMax-H3-Image training requires a non-empty 'prompt' column.")
+    if not isinstance(image, (str, bytes)) or not image:
+        raise ValueError("MiniMax-H3-Image training requires an image path or bytes in the 'image' column.")
+    if data_dir and isinstance(image, str) and not os.path.isabs(image) and "://" not in image:
+        image = os.path.join(data_dir, image)
+    return [{"inputs": prompt, "images": [load_image(image)]}]
+
+
+@DATA_TRANSFORM_REGISTRY.register("minimax_h3_image_i2i")
+def process_minimax_h3_image_i2i_example(example, data_dir="", **kwargs):
+    """Load a target and one or more reference images for H3-Image editing."""
+    sample = process_minimax_h3_image_t2i_example(example, data_dir=data_dir)[0]
+    references = example.get("reference_images")
+    if isinstance(references, str):
+        references = json.loads(references)
+    if not isinstance(references, list) or not references:
+        raise ValueError("MiniMax-H3-Image editing requires a non-empty 'reference_images' list.")
+    images = []
+    for reference in references:
+        if not isinstance(reference, (str, bytes)) or not reference:
+            raise ValueError("MiniMax-H3-Image reference images must be paths or bytes.")
+        if data_dir and isinstance(reference, str) and not os.path.isabs(reference) and "://" not in reference:
+            reference = os.path.join(data_dir, reference)
+        images.append(load_image(reference))
+    sample["reference_images"] = images
+    return [sample]
 
 
 @DATA_TRANSFORM_REGISTRY.register("minimax_h3_online")

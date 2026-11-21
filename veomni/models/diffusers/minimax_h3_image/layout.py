@@ -6,11 +6,27 @@ import math
 
 import numpy as np
 import torch
+from PIL import Image, ImageOps
 
 
 MINIMAX_H3_IMAGE_TAG = 0
 MINIMAX_H3_TEXT_TAG = 1
+DEFAULT_SIGMAS = (1.0, 0.9675236940383911, 0.8875485062599182, 0.75, 0.5327739119529724, 0.23200887441635132, 0.0)
+REFERENCE_NOISE_AUG = 0.999
 _ROPE_SPATIAL_SCALE = 32
+
+
+def resize_reference(image: Image.Image, min_short_edge: int, max_short_edge: int) -> Image.Image:
+    """Match inference reference sizing for both training encoders."""
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    if min(image.size) < 32:
+        raise ValueError(f"A reference image needs at least 32 pixels on each side, got {image.size}.")
+    short_edge = min(image.size)
+    if min_short_edge <= short_edge <= max_short_edge:
+        return image
+    scale = (min_short_edge if short_edge < min_short_edge else max_short_edge) / short_edge
+    width, height = (max(32, round(size * scale / 32) * 32) for size in image.size)
+    return image.resize((width, height), Image.Resampling.BICUBIC)
 
 
 def patchify_image_latents(latents: torch.Tensor, patch_size: tuple[int, int, int]) -> torch.Tensor:
@@ -104,9 +120,10 @@ def build_image_packed_sequence(
     position_ids[cursor:, 0] = rotary_time
     position_ids[cursor:, 1:] = frame_grid
 
-    text_indices = torch.arange(num_text_tokens)
-    image_indices = torch.arange(num_text_tokens, sequence_length)
-    token_tags = torch.empty(sequence_length, dtype=torch.long)
+    device = text_token_tags.device
+    text_indices = torch.arange(num_text_tokens, device=device)
+    image_indices = torch.arange(num_text_tokens, sequence_length, device=device)
+    token_tags = torch.empty(sequence_length, dtype=torch.long, device=device)
     token_tags[text_indices] = text_token_tags.to(torch.long)
     token_tags[image_indices] = image_tag
 
