@@ -995,6 +995,8 @@ def test_reentrant_refuses_keyword_arguments_through_checkpoint_forward():
 
 def _tiny_h3_model(depth=3):
     """The smallest MiniMaxH3DiTModel that builds: the real classes, so the wiring is the production one."""
+    from tests.tools.training_utils import make_eager_ops_config
+
     return MiniMaxH3DiTModel(
         MiniMaxH3DiTModelConfig(
             hidden_size=32,
@@ -1010,6 +1012,7 @@ def _tiny_h3_model(depth=3):
             adaln_out_features=576,
             final_adaln_out_features=64,
             rope_inv_freq_len=8,
+            ops_implementation=make_eager_ops_config(),
         )
     )
 
