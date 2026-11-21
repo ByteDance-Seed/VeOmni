@@ -26,6 +26,8 @@ Features:
     - Checkpointing
 """
 
+import copy
+import io
 import json
 import os
 import queue
@@ -51,6 +53,7 @@ from ..data import (
 )
 from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
+from ..data.dynamic_batching import DynamicBatchSizeDataLoader
 from ..distributed.async_offload import reset_async_activation_offload
 from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import (
@@ -88,10 +91,26 @@ from .callbacks import (
 logger = logging.get_logger(__name__)
 
 
+def _copy_prefetch_state(state):
+    """Detach a cursor using deepcopy or the checkpoint serialization contract."""
+    try:
+        return copy.deepcopy(state)
+    except Exception:  # noqa: BLE001 - try the actual checkpoint serialization contract
+        # torch.save can persist some objects, including non-leaf tensors, that
+        # deepcopy cannot handle. The loader's state is trusted runtime data.
+        buffer = io.BytesIO()
+        torch.save(state, buffer)
+        buffer.seek(0)
+        return torch.load(buffer, weights_only=False)
+
+
 class BackgroundPrefetcher:
     """
     Prefetches batches from a dataloader in a background thread to overlap data loading
     with GPU computation. Synchronizes dataloader state for correct checkpointing.
+    Before the first consumed batch, stateful loaders cannot provide a safe cursor
+    through this wrapper and checkpointing raises. Random transform state must be
+    managed separately by the data loader.
     """
 
     def __init__(self, dataloader, maxsize=1):
@@ -101,52 +120,65 @@ class BackgroundPrefetcher:
         self.stop_event = threading.Event()
         self.original_state_dict = getattr(dataloader, "state_dict", None)
         self.current_state = None
+        self._state_error = None
+        self._exhausted = False
         self.thread = threading.Thread(target=self._worker)
         self.thread.daemon = True
         self.thread.start()
 
     def _worker(self):
+        """Queue each batch with an optional isolated cursor and snapshot error."""
         try:
             while not self.stop_event.is_set():
                 try:
                     item = next(self.iterator)
                 except StopIteration:
-                    self.queue.put((StopIteration, None))
+                    self.queue.put((StopIteration, None, None))
                     break
 
-                # Ensure we capture the state so that subsequent dataloader advances
-                # don't mutate the captured state in-place. The underlying dataloader's
-                # state_dict() should handle deepcopying if necessary.
-                state = self.original_state_dict() if self.original_state_dict else None
-                self.queue.put((item, state))
+                # Subsequent advances must not mutate a consumed batch's cursor.
+                state, state_error = None, None
+                if self.original_state_dict:
+                    try:
+                        state = self.original_state_dict()
+                        # This method already returns an independent snapshot.
+                        if (
+                            getattr(self.original_state_dict, "__func__", None)
+                            is not DynamicBatchSizeDataLoader.state_dict
+                        ):
+                            state = _copy_prefetch_state(state)
+                    except Exception as exc:
+                        state = None
+                        state_error = exc
+                self.queue.put((item, state, state_error))
         except Exception as e:
-            self.queue.put((e, None))
+            self.queue.put((e, None, None))
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        res = self.queue.get()
-        if isinstance(res, tuple) and len(res) == 2:
-            item, state = res
-            if item is StopIteration:
-                raise StopIteration
-            if isinstance(item, Exception):
-                raise item
-            self.current_state = state
-            return item
-        else:
-            if res is StopIteration:
-                raise StopIteration
-            if isinstance(res, Exception):
-                raise res
-            return res
+        """Return a prefetched batch and publish only that batch's cursor."""
+        if self._exhausted:
+            raise StopIteration
+        item, state, state_error = self.queue.get()
+        if item is StopIteration:
+            self._exhausted = True
+            raise StopIteration
+        if isinstance(item, Exception):
+            raise item
+        self.current_state = state
+        self._state_error = state_error
+        return item
 
     def state_dict(self):
+        """Return the last consumed cursor or reject an unsafe checkpoint."""
+        if self._state_error is not None:
+            raise RuntimeError("Cannot checkpoint prefetcher without a recoverable data cursor") from self._state_error
         if self.current_state is not None:
             return self.current_state
         if self.original_state_dict:
-            return self.original_state_dict()
+            raise RuntimeError("Cannot checkpoint prefetcher without a recoverable data cursor") from self._state_error
         return {}
 
     def stop(self, timeout: float = 5.0):
