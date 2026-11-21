@@ -534,7 +534,7 @@ def _filter_kwargs(entry: OpEntry, kwargs: Mapping[str, Any]) -> dict[str, Any]:
             f"{entry.op}/{entry.variant}/{entry.impl}: emulated must be a bool, got {kept['emulated']!r}."
         )
     if "recipe" in kept and kept["recipe"] is not None and entry.impl == "torchao":
-        from .qat.torchao_fp8 import validate_float8_recipe
+        from .torchao import validate_float8_recipe
 
         validate_float8_recipe(kept["recipe"])
     return kept

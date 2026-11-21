@@ -12,17 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Functional TorchAO dynamic Float8 linear primitive.
+"""Shared TorchAO low-precision primitives for the ``linear`` and ``gated_mlp`` rows.
 
-Drives torchao's ``matmul_with_hp_or_float8_args`` directly from a plain
-``nn.Linear``'s ``weight`` and ``bias`` instead of replacing the module with
-``Float8Linear``. Dynamic scaling holds no persistent state or quantization
-buffers, so parameters, FSDP2 sharding, DCP checkpoints, and HF weight export
-stay completely unchanged while forward and backward run native ``aten::_scaled_mm``
-(``emulated=False``) or emulated float8 math (``emulated=True``).
+Covers both formats exposed by the ``torchao`` op row:
 
-``torchao`` is imported lazily on the first float8 call, so importing
-``veomni.ops`` on a host without the optional ``float8`` extra stays free.
+* **Dynamic FP8** (``torchao_fp8_linear``): drives torchao's functional
+  ``matmul_with_hp_or_float8_args`` directly from plain ``nn.Linear`` weights
+  without module swapping, supporting ``tensorwise``, ``rowwise``, and
+  ``rowwise_with_gw_hp`` scaling in native ``aten::_scaled_mm`` (SM89+) or
+  emulated mode.
+* **FP4 fake quantization** (``torchao_fake_quant``, ``nvfp4_fake_quant``):
+  emulated NVFP4 (16-wide groups, E4M3 block scale + FP32 per-tensor scale) and
+  MXFP4 (32-wide groups, E8M0 power-of-two block scale) straight-through
+  quantizers built on torchao tensor subclasses.
+
+``torchao`` is imported lazily on the first call, so importing ``veomni.ops`` on
+a host without the optional ``float8`` extra stays free.
 """
 
 from __future__ import annotations
@@ -37,13 +42,18 @@ from packaging.version import Version
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 
-from ...utils import device
+from ..utils import device
 
 
 __all__ = [
     "DEFAULT_FLOAT8_RECIPE",
     "FLOAT8_RECIPES",
+    "FP4_SUPPORTED_DTYPES",
+    "MXFP4_BLOCK_SIZE",
+    "NVFP4_BLOCK_SIZE",
     "TORCHAO_REQUIRED_VERSION",
+    "nvfp4_fake_quant",
+    "torchao_fake_quant",
     "torchao_fp8_linear",
     "validate_float8_recipe",
 ]
@@ -52,6 +62,12 @@ __all__ = [
 FLOAT8_RECIPES: tuple[str, ...] = ("tensorwise", "rowwise", "rowwise_with_gw_hp")
 DEFAULT_FLOAT8_RECIPE: str = "tensorwise"
 TORCHAO_REQUIRED_VERSION: str = "0.18.0"
+
+#: Group widths for the two torchao FP4 fake-quantization layouts.
+NVFP4_BLOCK_SIZE = 16
+MXFP4_BLOCK_SIZE = 32
+FP4_SUPPORTED_DTYPES: tuple[str, ...] = ("nvfp4", "mxfp4")
+_FP4_BLOCK_SIZES = {"nvfp4": NVFP4_BLOCK_SIZE, "mxfp4": MXFP4_BLOCK_SIZE}
 
 
 def validate_float8_recipe(recipe: str) -> str:
@@ -184,3 +200,89 @@ def torchao_fp8_linear(
     if bias is not None:
         output = output + bias.to(output.dtype)
     return output
+
+
+def _nvfp4_roundtrip(x: Tensor, block_size: int) -> Tensor:
+    """Quantize-dequantize ``x`` in ``1 x block_size`` groups to NVFP4 with two-level scaling."""
+    from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor, per_tensor_amax_to_scale
+
+    # `to_nvfp4` expects a 2D or 3D contiguous tensor; flatten leading dimensions
+    # into rows and restore the original shape after dequantizing.
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    # Clamp per_tensor_scale away from 0 so an all-zero operand dequantizes to
+    # zeros instead of dividing 0.0 / 0.0 inside torchao's nvfp4_quantize.
+    per_tensor_scale = per_tensor_amax_to_scale(torch.max(torch.abs(x_2d))).clamp(min=1e-12)
+    quantized = NVFP4Tensor.to_nvfp4(
+        x_2d,
+        block_size=block_size,
+        per_tensor_scale=per_tensor_scale,
+        is_swizzled_scales=False,
+        use_triton_kernel=False,
+    )
+    return quantized.dequantize(x.dtype).reshape(x.shape)
+
+
+def _mxfp4_roundtrip(x: Tensor, block_size: int) -> Tensor:
+    """Quantize-dequantize ``x`` in ``1 x block_size`` groups to MXFP4 with an E8M0 scale."""
+    from torchao.prototype.mx_formats.config import ScaleCalculationMode
+    from torchao.prototype.mx_formats.mx_tensor import MXTensor
+    from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
+
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    # ``MXFP4`` is torchao's `e2m1` element type with an `e8m0` scale, one per group;
+    # there is no per-tensor scale, which is the whole difference from NVFP4.
+    quantized = MXTensor.to_mx(
+        x_2d,
+        torch.float4_e2m1fn_x2,
+        block_size=block_size,
+        scaling_mode=ScaleCalculationMode.FLOOR,
+        kernel_preference=KernelPreference.EMULATED,
+        is_swizzled_scales=False,
+    )
+    return quantized.dequantize(x.dtype).reshape(x.shape)
+
+
+def _check_fp4_operand(x: Tensor, dtype: str, block_size: int) -> None:
+    """Validate the shared FP4 QAT contract: local operand, supported dtype, whole groups."""
+    # A DTensor reports the global shape, so the divisibility check below would
+    # validate a shape this rank does not hold, and a per-tensor ``amax`` would
+    # silently depend on how the tensor is partitioned. Same contract as the FP8
+    # primitives: the caller passes the local tensor.
+    if isinstance(x, DTensor):
+        raise TypeError(f"{dtype} fake quantization does not support a DTensor operand; pass the local tensor")
+    if x.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"{dtype} fake quantization expects a bfloat16 or float32 operand, got {x.dtype}")
+    width = _FP4_BLOCK_SIZES[dtype]
+    if block_size != width:
+        raise ValueError(f"{dtype} fake quantization requires block_size={width}, got {block_size}.")
+    if x.shape[-1] % block_size:
+        raise ValueError(
+            f"{dtype} fake quantization needs the last dimension ({x.shape[-1]}) divisible by block_size "
+            f"{block_size}; the deployment kernels index one scale per group and cannot pad a partial one."
+        )
+
+
+def torchao_fake_quant(dtype: str):
+    """Return ``(x, block_size=None) -> x`` fake-quantizing to ``dtype`` (``nvfp4`` or ``mxfp4``)."""
+    if dtype not in _FP4_BLOCK_SIZES:
+        raise ValueError(
+            f"torchao fake quantization does not support dtype={dtype!r}; it supports {FP4_SUPPORTED_DTYPES}"
+        )
+
+    def quantize(x: Tensor, block_size: int | None = None) -> Tensor:
+        width = _FP4_BLOCK_SIZES[dtype] if block_size is None else block_size
+        if isinstance(x, DTensor):
+            _check_fp4_operand(x, dtype, width)
+        if x.numel() == 0:
+            return x
+        _check_fp4_operand(x, dtype, width)
+        with torch.no_grad():
+            rounded = _nvfp4_roundtrip(x, width) if dtype == "nvfp4" else _mxfp4_roundtrip(x, width)
+        return rounded.detach() + (x - x.detach())
+
+    return quantize
+
+
+def nvfp4_fake_quant(x: Tensor, block_size: int = NVFP4_BLOCK_SIZE) -> Tensor:
+    """Fake-quantize ``x`` in NVFP4, differentiably into ``x`` via straight-through estimation."""
+    return torchao_fake_quant("nvfp4")(x, block_size)

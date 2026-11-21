@@ -1062,7 +1062,7 @@ _requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reas
 @pytest.mark.parametrize("swiglu_limit", [None, 1.0])
 def test_torchao_nvfp4_matches_manual_round_trip(swiglu_limit: float | None):
     """The fused row equals the same math with operands quantized by hand, clamp in the model dtype."""
-    from veomni.ops.qat.torchao_fp4 import nvfp4_fake_quant
+    from veomni.ops.torchao import nvfp4_fake_quant
 
     impl = resolve_op("gated_mlp", "standard", "torchao").wrapper
     torch.manual_seed(0)

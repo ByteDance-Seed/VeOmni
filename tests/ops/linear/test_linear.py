@@ -242,7 +242,7 @@ def test_linear_torchao_row_is_declared_with_torchao():
 @_requires_torchao
 def test_linear_torchao_nvfp4_forward_and_backward_round_trip():
     """The row equals F.linear over torchao's NVFP4 round trip, with straight-through gradients."""
-    from veomni.ops.qat.torchao_fp4 import NVFP4_BLOCK_SIZE, nvfp4_fake_quant
+    from veomni.ops.torchao import NVFP4_BLOCK_SIZE, nvfp4_fake_quant
 
     assert NVFP4_BLOCK_SIZE == 16
     op = VeomniOp("linear", "standard", "torchao")
@@ -268,7 +268,7 @@ def test_linear_torchao_nvfp4_forward_and_backward_round_trip():
 @_requires_torchao
 def test_linear_torchao_nvfp4_validates_its_operands():
     """16-wide groups only, BF16/FP32 only, and no partial group."""
-    from veomni.ops.qat.torchao_fp4 import nvfp4_fake_quant
+    from veomni.ops.torchao import nvfp4_fake_quant
 
     op = VeomniOp("linear", "standard", "torchao")
     with pytest.raises(ValueError, match="divisible by block_size 16"):

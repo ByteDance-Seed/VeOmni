@@ -32,9 +32,13 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ....activation import apply_activation
-from ....qat.torchao_fp4 import SUPPORTED_DTYPES as _FP4_DTYPES
-from ....qat.torchao_fp4 import torchao_fake_quant
-from ....qat.torchao_fp8 import DEFAULT_FLOAT8_RECIPE, torchao_fp8_linear, validate_float8_recipe
+from ....torchao import (
+    DEFAULT_FLOAT8_RECIPE,
+    torchao_fake_quant,
+    torchao_fp8_linear,
+    validate_float8_recipe,
+)
+from ....torchao import FP4_SUPPORTED_DTYPES as _FP4_DTYPES
 from . import eager as _eager
 
 

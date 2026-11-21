@@ -1,118 +1,26 @@
-# DeepSeek-V4-Flash SFT that quantizes only part of the model.
+# Standalone per-site `overrides` example for DeepSeek-V4-Flash.
 #
-# `deepseek_v4_qat.yaml` selects one row for every site of each family. This file
-# shows the other shape: a family field may be a mapping whose `overrides` list
-# changes the row for some sites and leaves the rest alone. Both halves are needed
-# in practice -- a deployment kernel often covers part of the network, and training
-# a rounding it will never perform is worse than not training it at all.
-#
-# The shape of one family field:
-#
-#   <family>_implementation:
-#     name: <row>                 # eager | qat | torchao | deepgemm | ...
-#     kwargs:                     # arguments the row takes; optional
-#       block_size: 128
-#     overrides:
-#       - site: <regex>           # fullmatch against the model's site string
-#         name: <row>             # optional, replaces `name` at these sites
-#         kwargs: {...}           # optional, merged over the outer kwargs
-#
-# The row name says which kernel runs -- `qat` is TileLang's fake quantization,
-# `torchao` is torchao's (dynamic FP8 GEMMs and NVFP4/MXFP4 QAT), `deepgemm` is
-# the vendor's real FP8 GEMM -- and the *format* is a row argument: `dtype` is
-# `fp8`/`fp4` for `qat`, `fp8`/`nvfp4`/`mxfp4` for `torchao`, `fp8` for
-# `deepgemm`. `block_size` / `recipe` / `emulated` are the other arguments where
-# the format leaves a choice.
-#
-# `kwargs` are arguments a row takes per call -- `dtype` picks the format
-# (`fp8`/`fp4`/`nvfp4`/`mxfp4`), and `block_size`/`recipe`/`emulated` select
-# format-specific options where the format leaves a choice.
-#
-# `kwargs` merge key by key, and a key the row a site resolves to does not accept
-# is simply not passed to it. A site that overrides `name` to `liger_kernel` inherits
-# `block_size: 128` from the enclosing block and that key is ignored there -- there
-# is nothing to clear. A key no row of the family accepts raises at config parse
-# time, so a typo cannot silently drop the setting it meant to write.
-#
-# A bare string still works and means "one row everywhere", which is what every
-# existing config and checkpoint records.
-#
-# Site strings this model publishes (see `DeepseekV4Attention.__init__` and the
-# compressors/indexer in `veomni/models/transformers/deepseek_v4/modeling_deepseek_v4.py`):
-#
-#   layers.<i>.q_a_proj        layers.<i>.q_b_proj       layers.<i>.kv_proj
-#   layers.<i>.o_a_proj        layers.<i>.o_b_proj
-#   layers.<i>.mlp             the shared expert
-#   layers.<i>.experts         the routed experts
-#   layers.<i>.window_kv       the main attention's stored KV
-#   layers.<i>.hca_kv          the heavily-compressed attention's stored KV
-#   layers.<i>.csa_kv          the compressed-sparse attention's stored KV
-#   layers.<i>.indexer         the indexer's stored activations
-#   layers.<i>.indexer_q_b_proj
+# Most runs only need a plain family selection without `overrides` — see
+# `deepseek_v4_qat.yaml` (all-QAT default) and `qwen3_nvfp4_qat.yaml`
+# (torchao NVFP4 default). Use `overrides` only when specific layers or
+# projections need a different row or kwargs (later rules win; `site` is
+# matched with `re.fullmatch`).
 
 model:
   model_path: DeepSeek-V4-Flash-Base
   ops_implementation:
-
-    # ------------------------------------------------------------------
-    # Dense projections. Layers 0-9 run in the model dtype: the deployment
-    # kernel covers 10-58 only, so rounding the first ten would train a
-    # rounding nothing performs. A standard projection (q_a_proj) can take
-    # `torchao`, which is why it gets its own rule after the broad one.
-    # (`o_a_proj` uses the `grouped` linear variant, which only registers
-    # `eager` and `qat`.)
-    # ------------------------------------------------------------------
+    # Quantize attention/indexer projections, keeping layer 0 in BF16.
     linear_implementation:
-      name: eager
+      name: qat
       overrides:
-        - site: "layers\\.(1[0-9]|[2-4][0-9]|5[0-8])\\.(q_a_proj|q_b_proj|kv_proj|o_a_proj|o_b_proj)"
-          name: qat
-          kwargs:
-            block_size: 128
-        # A different quantizer, and a different block width. `block_size` here
-        # overrides the inherited 128 rather than replacing the whole set.
-        - site: "layers\\.(1[0-9]|[2-4][0-9]|5[0-8])\\.q_a_proj"
-          name: torchao
-          kwargs:
-            dtype: nvfp4
-            block_size: 16
-
-    # ------------------------------------------------------------------
-    # Shared expert. Quantized everywhere except layer 0, which the
-    # checkpoint stores in BF16.
-    # ------------------------------------------------------------------
+        - site: 'layers\.0\..*'
+          name: eager
+    # Quantize the shared expert everywhere except layer 0.
     gated_mlp_implementation:
       name: qat
-      kwargs:
-        block_size: 128
       overrides:
-        # A reference row rounds nothing, so it takes no `block_size`. The
-        # inherited one is simply not passed to it -- nothing to clear.
-        - site: "layers\\.0\\.mlp"
+        - site: 'layers\.0\.mlp'
           name: liger_kernel
-
-    # ------------------------------------------------------------------
-    # Routed experts: the vendor's real FP8 grouped GEMM, not fake
-    # quantization. This is the "everything off, the experts on" shape.
-    #
-    # `dtype` is deliberately absent: the row falls back to the checkpoint's
-    # own (FP4 on V4-Flash, FP8 for `deepgemm`). Setting `dtype: fp8` on a
-    # `qat` row would override the checkpoint's format to train the experts at
-    # FP8 even though the checkpoint stored them in FP4.
-    # ------------------------------------------------------------------
-    moe_implementation:
-      name: fused_triton
-      overrides:
-        - site: "layers\\.\\d+\\.experts"
-          name: deepgemm
-
-    # ------------------------------------------------------------------
-    # Stored KV and indexer activations. Accepts a plain row name or per-site
-    # overrides over `window_kv`, `hca_kv`, `csa_kv`, and `indexer`.
-    # ------------------------------------------------------------------
+    # Whole-family selections need no overrides.
+    moe_implementation: deepgemm
     kv_round_implementation: triton
-
-# Hardware: `qat` needs NVIDIA SM90+ and the `tilelang` package; `deepgemm`
-# needs SM90/SM100 and `deep_gemm`; `torchao` needs the `torchao` package;
-# the Triton `kv_round` row needs SM89+ or ROCm. A selection this host cannot
-# serve fails when the handle is built, not mid-training.

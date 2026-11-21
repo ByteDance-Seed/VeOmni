@@ -274,24 +274,16 @@ per-*site* decisions, and a family field may be written as a mapping to express
 them:
 
 ```yaml
-moe_implementation:
-  name: fused_triton            # the row every site runs
-  kwargs:                       # arguments passed to that row
-    block_size: 128
+linear_implementation:
+  name: qat                     # default row for every site
   overrides:
-    # A different quantization: another row, with its own arguments.
-    - site: "layers\\.(1[0-9]|2[0-9])\\.experts"
-      name: qat
-      kwargs:
-        block_size: 64
-    # No quantization: a reference row. It rounds nothing, so the inherited
-    # `block_size` is not passed to it. Nothing to clear.
-    - site: "layers\\.0\\.experts"
+    - site: 'layers\.0\..*'     # keep layer 0 in BF16
       name: eager
 ```
 
-A bare string stays valid and means one row everywhere, which is what every
-existing config and checkpoint records.
+See [`configs/text/deepseek_v4_mixed_precision.yaml`](../../configs/text/deepseek_v4_mixed_precision.yaml)
+for a complete standalone override example. A bare string stays valid and means
+one row everywhere, which is what every existing config and checkpoint records.
 
 **The row name names the kernel; the format is an argument.** `qat` is TileLang's
 fake quantization, `torchao` is torchao's, `deepgemm` is the vendor's real GEMM --

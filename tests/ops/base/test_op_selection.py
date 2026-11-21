@@ -563,7 +563,7 @@ def test_legacy_fused_moe_alias_resolves_in_mapping_defaults_and_overrides(monke
 
 
 def test_shipped_deepseek_v4_mixed_precision_yaml_parses_cleanly():
-    """The worked mixed-precision example YAML stays valid as ops schemas evolve."""
+    """The standalone per-site override example YAML stays valid as ops schemas evolve."""
     from pathlib import Path
 
     import yaml
@@ -571,11 +571,12 @@ def test_shipped_deepseek_v4_mixed_precision_yaml_parses_cleanly():
     yaml_path = Path(__file__).resolve().parents[3] / "configs" / "text" / "deepseek_v4_mixed_precision.yaml"
     raw = yaml.safe_load(yaml_path.read_text())
     ops = OpsImplementationConfig(**raw["model"]["ops_implementation"])
-    assert ops.linear_implementation.resolve_impl("layers.15.q_a_proj") == "torchao"
-    assert ops.linear_implementation.resolve_kwargs("layers.15.q_a_proj") == {"dtype": "nvfp4", "block_size": 16}
-    assert ops.linear_implementation.resolve_impl("layers.15.o_a_proj") == "qat"
+    assert ops.linear_implementation.resolve_impl("layers.0.q_a_proj") == "eager"
+    assert ops.linear_implementation.resolve_impl("layers.1.q_a_proj") == "qat"
     assert ops.gated_mlp_implementation.resolve_impl("layers.0.mlp") == "liger_kernel"
-    assert ops.moe_implementation.resolve_impl("layers.0.experts") == "deepgemm"
+    assert ops.gated_mlp_implementation.resolve_impl("layers.1.mlp") == "qat"
+    assert ops.moe_implementation == "deepgemm"
+    assert ops.kv_round_implementation == "triton"
 
 
 def test_the_native_row_still_takes_the_family_signature_at_the_call_site():

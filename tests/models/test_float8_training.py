@@ -28,8 +28,8 @@ from veomni.arguments import MixedPrecisionConfig, ModelArguments, OpsImplementa
 from veomni.arguments.parser import parse_args, save_args
 from veomni.models.configuration_base import as_veomni_config
 from veomni.ops import VeomniOp
-from veomni.ops.qat.torchao_fp8 import torchao_fp8_linear
 from veomni.ops.selection import OpsSelection, SiteOverride
+from veomni.ops.torchao import torchao_fp8_linear
 from veomni.utils import device
 
 
@@ -193,9 +193,9 @@ def test_float8_reports_missing_or_mismatched_torchao_extra(monkeypatch, install
     """Missing or mismatched ``torchao`` raises a clear ``ImportError`` naming the extra."""
     from importlib.metadata import PackageNotFoundError
 
-    from veomni.ops.qat import torchao_fp8
+    from veomni.ops import torchao as torchao_ops
 
-    torchao_fp8._float8_linear_configs.cache_clear()
+    torchao_ops._float8_linear_configs.cache_clear()
 
     def fake_version(name):
         assert name == "torchao"
@@ -203,7 +203,7 @@ def test_float8_reports_missing_or_mismatched_torchao_extra(monkeypatch, install
             raise PackageNotFoundError(name)
         return installed
 
-    monkeypatch.setattr(torchao_fp8, "version", fake_version)
+    monkeypatch.setattr(torchao_ops, "version", fake_version)
     with pytest.raises(ImportError, match=message):
         torchao_fp8_linear(torch.randn(2, 32), torch.randn(32, 32), emulated=True)
 

@@ -32,14 +32,10 @@ model:
   ops_implementation:
     linear_implementation:
       name: torchao
-      kwargs:
-        dtype: fp8
-        recipe: rowwise
+      kwargs: {dtype: fp8, recipe: rowwise}
     gated_mlp_implementation:
       name: torchao
-      kwargs:
-        dtype: fp8
-        recipe: rowwise
+      kwargs: {dtype: fp8, recipe: rowwise}
   accelerator:
     init_device: meta
     fsdp_config:
@@ -50,29 +46,9 @@ model:
         reduce_dtype: float32
 ```
 
-Use per-site `overrides` to enable float8 only on selected layers or
-projections (for example, keeping layer 0 or `k_proj`/`v_proj` in BF16):
-
-```yaml
-model:
-  ops_implementation:
-    linear_implementation:
-      name: eager
-      overrides:
-        - site: 'layers\.(?:[1-9]\d*)\.(q_proj|o_proj)'
-          name: torchao
-          kwargs:
-            dtype: fp8
-            recipe: rowwise
-    gated_mlp_implementation:
-      name: liger_kernel
-      overrides:
-        - site: 'layers\.(?:[1-9]\d*)\.mlp'
-          name: torchao
-          kwargs:
-            dtype: fp8
-            recipe: rowwise
-```
+To apply float8 only to selected layers or projections, see the standalone
+per-site `overrides` usage in [op selection](../design/op_selection.md#choosing-different-rows-per-site)
+and [`configs/text/deepseek_v4_mixed_precision.yaml`](../../configs/text/deepseek_v4_mixed_precision.yaml).
 
 ## Supported surface
 
@@ -88,7 +64,7 @@ model:
 | Checkpoints | Existing HF weight loading, DCP model/optimizer resume, and floating-point HF export |
 
 The functional primitive lives in
-[`veomni/ops/qat/torchao_fp8.py`](../../veomni/ops/qat/torchao_fp8.py) and is
+[`veomni/ops/torchao.py`](../../veomni/ops/torchao.py) and is
 invoked by [`veomni/ops/kernels/linear/standard/torchao.py`](../../veomni/ops/kernels/linear/standard/torchao.py)
 and [`veomni/ops/kernels/gated_mlp/standard/torchao.py`](../../veomni/ops/kernels/gated_mlp/standard/torchao.py).
 
