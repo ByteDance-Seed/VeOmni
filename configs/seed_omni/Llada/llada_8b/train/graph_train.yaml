@@ -1,0 +1,6 @@
+# Launcher-style training DAG for LLaDA-8B: a single node.
+#
+# The mask predictor reads its own sequence and returns `_loss` from the masked
+# positions; there is no second module, so the edge list is one entry and the
+# executor sums a single per-node loss.
+- {from: llada_omni, to: end}

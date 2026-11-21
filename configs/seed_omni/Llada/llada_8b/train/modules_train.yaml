@@ -1,0 +1,13 @@
+# Per-module training overrides for LLaDA-8B (SeedOmni).
+#
+# One module: the mask predictor supervises itself in place, so there is no
+# sibling to hand activations to. Deep-merged onto the launcher's `model.*`
+# block, so only what differs is restated here.
+llada_omni:
+  model_path: llada_omni
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
