@@ -259,9 +259,10 @@ class VeOmniModelRuntime:
         Also assembles :attr:`model_assets`, the sidecars an export writes beside
         this model's weights, and :attr:`chat_template` when this model named one.
         The config is always among the sidecars; the preprocessor joins it if
-        there was one to load. The chat template is not in that list and is not
-        written onto the tokenizer: it is a data-layout choice, so an export
-        keeps the checkpoint's jinja.
+        there was one to load. The chat template is not in that list. Most
+        templates do not modify the tokenizer, so an export keeps the
+        checkpoint's jinja. The opt-in ``openai_chatml_qwenvl`` template instead
+        installs its jinja on the shared tokenizer and processor for export.
 
         ``processor_config`` is forwarded as kwargs to ``build_processor``, the
         way ``model_config`` overrides the architecture.
@@ -336,6 +337,10 @@ class VeOmniModelRuntime:
 
         from ..data.chat_template import build_chat_template
 
+        if self.args.chat_template == "openai_chatml_qwenvl":
+            from ..data.multimodal.openai_messages import validate_openai_chatml_model_config
+
+            validate_openai_chatml_model_config(self.model_config)
         self.chat_template = build_chat_template(self.args.chat_template, preprocessor)
 
     def _apply_async_activation_offload(self) -> None:

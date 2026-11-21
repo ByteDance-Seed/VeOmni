@@ -104,12 +104,11 @@ class ChatTemplate(ABC):
     def get_jinja_template(self) -> str:
         """This template's layout expressed as jinja, for whoever wants to serialise it.
 
-        Optional, and read by nothing in the training or export path: training
-        lays out tokens through :meth:`encode_messages`, and an export keeps the
-        jinja the checkpoint shipped with rather than substituting a job's
-        formatting choice. A layout that jinja cannot express — image
-        placeholders sized from the processor's grid parameters — says so by
-        leaving this alone.
+        Training lays out tokens through :meth:`encode_messages`. Most
+        templates leave the checkpoint's exported jinja unchanged. The opt-in
+        ``openai_chatml_qwenvl`` template installs its own jinja directly on
+        the shared tokenizer and processor, so exports preserve that template.
+        Jinja itself cannot express image placeholders sized from pixel grids.
         """
         return ""
 
@@ -608,6 +607,19 @@ class Qwen3VLChatTemplate(Qwen2VLTemplate):
             )
 
         return self._tokenize_and_remap(messages)
+
+
+@CHAT_TEMPLATE_REGISTRY.register("openai_chatml_qwenvl")
+class OpenAIChatMLQwenVLTemplate(Qwen3VLChatTemplate):
+    """Opt into ChatML training and persist its matching multimodal template."""
+
+    def __init__(self, processor):
+        from .multimodal.openai_messages import OPENAI_CHATML_VLM_JINJA
+
+        super().__init__(processor)
+        self._openai_chatml_vlm = True
+        self.tokenizer.chat_template = OPENAI_CHATML_VLM_JINJA
+        self.processor.chat_template = OPENAI_CHATML_VLM_JINJA
 
 
 @CHAT_TEMPLATE_REGISTRY.register("qwen3_5vl")
