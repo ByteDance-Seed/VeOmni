@@ -332,6 +332,10 @@ def test_ltx_adapter_expands_mask_and_skips_ulysses():
     assert captured["attention_mask"].dtype == mask.dtype
     assert captured["skip_ulysses"] is True
 
+    padding_mask = torch.tensor([[[[0.0, 0.0, -1e4, -1e4]]]])
+    adapter(query, key, value, heads=2, mask=padding_mask)
+    torch.testing.assert_close(captured["attention_mask"], padding_mask.expand(1, 1, 4, 4))
+
 
 def test_ltx_adapter_matches_sdpa():
     adapter = VeomniLTXAttention("sdpa")
