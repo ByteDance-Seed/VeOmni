@@ -39,6 +39,7 @@ from safetensors.torch import load_file
 from torch.distributed.tensor import Replicate, Shard
 
 import veomni.utils.save_safetensor_utils as save_utils
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint.layout import HF_PENDING_MERGE_FILENAME, HF_SHARDED_DIRNAME
 from veomni.models.checkpoint.weights import _resolve_safetensors_shards, _resolve_state_dict_iterators
 
@@ -115,6 +116,7 @@ def _load_export(save_path: str) -> dict:
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo required")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=WORLD_SIZE, device="cpu"))
 def test_an_emb_sharded_table_is_kept_split_and_merged_offline():
     with tempfile.TemporaryDirectory() as tmp:
         save_path = os.path.join(tmp, "hf_ckpt", "ngram")
