@@ -121,6 +121,16 @@ def test_per_site_op_selection_and_overrides():
     assert reloaded.linear_implementation.all_impls() == configured.linear_implementation.all_impls()
     assert reloaded.linear_implementation.kwargs == {"block_size": 64}
 
+    fused_mapping = OpsImplementationConfig(
+        moe_implementation={
+            "name": "fused",
+            "overrides": [{"site": r"layers\.0\.experts", "name": "fused"}],
+        }
+    )
+    expected_fused = "fused_npu" if IS_NPU_AVAILABLE else "fused_quack"
+    assert fused_mapping.moe_implementation.name == expected_fused
+    assert fused_mapping.moe_implementation.overrides[0].name == expected_fused
+
     if not IS_NPU_AVAILABLE:
         with pytest.raises(ValueError, match="requires Ascend NPU"):
             OpsImplementationConfig(

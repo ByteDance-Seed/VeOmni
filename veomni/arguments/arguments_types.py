@@ -1775,18 +1775,40 @@ class OpsImplementationConfig:
 
     def _apply_deprecated_aliases(self) -> None:
         """Resolve renamed implementation values and reject values that were never implementations."""
-        for field_name, messages in _REJECTED_IMPLEMENTATION_VALUES.items():
+
+        def _rewrite_field(field_name: str, transform) -> None:
             value = getattr(self, field_name)
-            if isinstance(value, str) and value in messages:
-                raise ValueError(f"{field_name}={value!r}: {messages[value]}")
+            if isinstance(value, str):
+                setattr(self, field_name, transform(value))
+            elif isinstance(value, OpsSelection):
+                if isinstance(value.name, str):
+                    value.name = transform(value.name)
+                for rule in value.overrides:
+                    if isinstance(rule.name, str):
+                        rule.name = transform(rule.name)
+
+        for field_name, messages in _REJECTED_IMPLEMENTATION_VALUES.items():
+
+            def _reject(name: str, *, _field=field_name, _msgs=messages) -> str:
+                if name in _msgs:
+                    raise ValueError(f"{_field}={name!r}: {_msgs[name]}")
+                return name
+
+            _rewrite_field(field_name, _reject)
 
         for field_name, aliases in _DEPRECATED_IMPLEMENTATION_ALIASES.items():
-            value = getattr(self, field_name)
-            if isinstance(value, str) and value in aliases:
-                self._warn_deprecated(field_name, value, aliases[value])
-                setattr(self, field_name, aliases[value])
 
-        if self.moe_implementation == "fused":
+            def _alias(name: str, *, _field=field_name, _aliases=aliases) -> str:
+                if name in _aliases:
+                    self._warn_deprecated(_field, name, _aliases[name])
+                    return _aliases[name]
+                return name
+
+            _rewrite_field(field_name, _alias)
+
+        def _resolve_fused_moe(name: str) -> str:
+            if name != "fused":
+                return name
             from ..utils.device import IS_NPU_AVAILABLE
             from ..utils.import_utils import is_apex_mlu_available, is_torch_mlu_available
 
@@ -1797,7 +1819,9 @@ class OpsImplementationConfig:
             else:
                 resolved = "fused_quack"
             self._warn_deprecated("moe_implementation", "fused", resolved)
-            self.moe_implementation = resolved
+            return resolved
+
+        _rewrite_field("moe_implementation", _resolve_fused_moe)
 
     @staticmethod
     def _warn_deprecated(field_name: str, old: str, new: str) -> None:

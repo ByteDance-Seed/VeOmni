@@ -1216,6 +1216,12 @@ def test_compile_checks_bound_handles_for_unmatched_mxfp4_override(monkeypatch):
     with pytest.raises(RuntimeError, match=r"linear_implementation=torchao\(dtype='mxfp4'\)"):
         _reject_incompatible_ops(model)
 
+    # Concrete model that binds gated_mlp (like Gemma3) but no linear handles:
+    # an unused linear_implementation MXFP4 selection must not block compile.
+    no_linear_model = _model_with_ops(linear_implementation=selection, gated_mlp_implementation="eager")
+    no_linear_model.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", "eager")
+    _reject_incompatible_ops(no_linear_model)
+
 
 @pytest.mark.parametrize(
     "ops_fields",
