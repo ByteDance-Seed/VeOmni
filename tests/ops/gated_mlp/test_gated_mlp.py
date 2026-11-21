@@ -1148,3 +1148,37 @@ def test_torchao_fp8_validates_and_dispatches_three_projections(monkeypatch):
         (mlp.up_proj.weight.shape, "rowwise_with_gw_hp", False),
         (mlp.down_proj.weight.shape, "rowwise_with_gw_hp", False),
     ]
+
+
+def test_the_deepgemm_row_is_registered_on_sm90_or_sm100():
+    from veomni.ops import OP_REGISTRY
+
+    assert "deepgemm" in OP_REGISTRY.list_registered("gated_mlp", "standard")
+    entry = {e.impl: e for e in OP_REGISTRY.list_entries("gated_mlp", "standard")}["deepgemm"]
+    assert entry.requires == ("deep_gemm", "triton")
+    assert {(p.min_cc, p.max_cc) for p in entry.requirement.platforms} == {(90, 90), (100, 100)}
+
+
+def test_the_deepgemm_row_declares_the_activations_its_kernel_fuses():
+    """``RecomputedSwiGLU`` fuses ``aten.silu``, so the row cannot serve another activation.
+
+    ``render`` consults ``ROW_ACTIVATIONS`` before the call, so a ``gelu`` model is
+    routed to its projection fallback. Declaring the set here is what makes that
+    routing right rather than accidental -- an entry missing from the map falls back
+    to ``eager``'s behaviour, which would claim the row can compute anything.
+    """
+    from veomni.ops.kernels.gated_mlp._module import ROW_ACTIVATIONS
+
+    assert ROW_ACTIVATIONS["deepgemm"] == frozenset({"silu", "swish"})
+
+
+def test_the_deepgemm_row_refuses_a_block_size_it_cannot_honor():
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+
+    mlp = torch.nn.Module()
+    mlp.gate_proj = torch.nn.Linear(256, 384, bias=False, dtype=torch.bfloat16)
+    mlp.up_proj = torch.nn.Linear(256, 384, bias=False, dtype=torch.bfloat16)
+    mlp.down_proj = torch.nn.Linear(384, 256, bias=False, dtype=torch.bfloat16)
+    x = torch.randn(2, 256, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="only block_size=128"):
+        deepgemm.wrapper(mlp, x, block_size=64)
