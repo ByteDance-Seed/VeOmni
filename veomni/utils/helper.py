@@ -814,76 +814,36 @@ def make_list(item):
 
 
 class ProfilerWithMem:
-    """Thin wrapper that records the CUDA-allocator history for the profiled steps.
-
-    The history captures a stack trace on every allocation, so it follows the
-    schedule rather than ``start()``: recorded from the first step, it costs
-    every step before ``start_step`` and fills the snapshot with them.
-    """
+    """Thin wrapper that toggles CUDA-allocator tracing around profiler.step()"""
 
     def __init__(self, inner):
         self._p = inner
-        self._recording = False
 
     # delegate ctx-manager behaviour
     def __enter__(self):
-        """Enter the inner profiler and return *this* wrapper.
-
-        ``torch.profiler.profile.__enter__`` returns the inner profiler, so
-        returning that would bind the caller to an object whose ``step()`` skips
-        the schedule-following below -- and with a window that starts later, the
-        allocator history would never be enabled at all.
-        """
-        self._p.__enter__()
-        self._follow_schedule()
-        return self
+        return self._p.__enter__()
 
     def __exit__(self, *a):
-        """Exit the inner profiler, then stop recording."""
-        out = self._p.__exit__(*a)
-        self._set_recording(False)
-        return out
-
-    def _set_recording(self, enabled: bool) -> None:
-        """Turn allocator-history recording on or off, idempotently."""
-        if enabled == self._recording:
-            return
-        memory = get_torch_device().memory
-        if enabled and get_device_type() == "cuda":
-            try:
-                # Keep stacks for live allocations; recording every free traceback
-                # can crash profiler-enabled training during activation recomputation.
-                memory._record_memory_history(enabled="all", context="state")
-            except TypeError:
-                memory._record_memory_history(enabled="all")
-        else:
-            memory._record_memory_history(enabled="all" if enabled else None)
-        self._recording = enabled
-
-    def _follow_schedule(self) -> None:
-        """Mirror the inner profiler's current action into the recording flag."""
-        # The trace handler dumps the snapshot inside the step that ends the
-        # window, before this runs, so stopping here keeps the dumped history.
-        action = getattr(self._p, "current_action", None)
-        self._set_recording(action is None or action.name != "NONE")
+        return self._p.__exit__(*a)
 
     def start(self):
-        """Start the inner profiler and begin following its schedule."""
         out = self._p.start()
-        self._follow_schedule()
+        memory = get_torch_device().memory
+        if get_device_type() == "cuda":
+            # Keep stacks for live allocations; recording every free traceback
+            # can crash profiler-enabled training during activation recomputation.
+            memory._record_memory_history(context="state")
+        else:
+            memory._record_memory_history()
         return out
 
     def stop(self):
-        """Stop the inner profiler and stop recording."""
         out = self._p.stop()
-        self._set_recording(False)
+        get_torch_device().memory._record_memory_history(enabled=None)  # step recording memory snapshot
         return out
 
     def step(self, *a, **kw):
-        """Advance the inner profiler one step, then follow its new action."""
-        out = self._p.step(*a, **kw)
-        self._follow_schedule()
-        return out
+        return self._p.step(*a, **kw)
 
 
 def create_profiler(
@@ -935,9 +895,8 @@ def create_profiler(
             p.export_chrome_trace(trace_file)
         logger.info(f"Profiling result saved at {trace_file}.")
 
-        if profile_memory:
-            get_torch_device().memory._dump_snapshot(gpu_memory_file)
-            logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
+        get_torch_device().memory._dump_snapshot(gpu_memory_file)
+        logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
 
         if trace_dir.startswith("hdfs://"):
             copy(trace_file, trace_dir)
