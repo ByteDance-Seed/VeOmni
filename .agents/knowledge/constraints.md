@@ -223,13 +223,13 @@ Core files:
 ## Hardware
 
 22. **Non-CUDA accelerator code paths require guards**
-    - There are three backends today: CUDA, Ascend NPU and Cambricon MLU. Guard vendor-specific code with `is_torch_npu_available()` / `IS_NPU_AVAILABLE` or `is_torch_mlu_available()` / `IS_MLU_AVAILABLE` (`veomni/utils/import_utils.py`, `veomni/utils/device.py`).
+    - There are four backends today: CUDA, Ascend NPU, Cambricon MLU and Intel GPU (XPU). Guard vendor-specific code with `is_torch_npu_available()` / `IS_NPU_AVAILABLE`, `is_torch_mlu_available()` / `IS_MLU_AVAILABLE` or `IS_XPU_AVAILABLE` (`veomni/utils/import_utils.py`, `veomni/utils/device.py`). XPU support is in stock PyTorch, so it has no package check; it communicates over `xccl`.
     - Vendor kernels live in their op family under `veomni/ops/kernels/`. The HCCL compatibility patch lives in `veomni/distributed/hccl_premul_sum.py`. Vendor-only dependencies must not be imported on hosts without that runtime.
     - Device-type sets, not `== "cuda"`, decide dispatch: `MOE_TRITON_DEVICE_TYPES` in `veomni/utils/device.py` is `("cuda", "mlu")` today. Adding a backend means auditing those sets, not just adding a branch.
 
 23. **Device-agnostic code must use `veomni.utils.device` helpers**
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
-   - Direct CUDA calls break NPU and MLU compatibility.
+   - Direct CUDA calls break NPU, MLU and XPU compatibility.
    - The opt-in DeepGEMM FP8 MoE backend is CUDA-only and requires one CUDA device per process. The pinned DeepGEMM `5081f85` caches device-bound kernel handles without a device key; switching GPUs can fail with `CUDA_ERROR_INVALID_HANDLE` even on identical GPUs. `GroupedLayout.from_counts()` enforces this restriction and sets the operand device context before accessing DeepGEMM. Other DeepGEMM calls in the worker must use the same device. `deepgemm_fp8` and `qat` are two values of the same `moe_implementation` field, so the routed experts are never quantized twice; do **not** reject a `qat` row on `linear_implementation` / `gated_mlp_implementation` alongside it — those are separate GEMMs, and the shared expert (`gated_mlp`) is a dense gated MLP that DeepGEMM does not cover. Both are quantizing rows and both appear in `moe_experts.QUANTIZING_IMPLS`: `deepgemm_fp8` runs the FP8 GEMM in forward, dgrad *and* wgrad through `GroupedLinear`, so a non-SwiGLU activation must be refused for it exactly as for `qat` — otherwise the activation falls back to plain-`F.linear` math and the routed experts train unquantized under a config that says DeepGEMM. The other rows (`fused_triton`, `fused_quack`, `fused_npu`, `fused_mlu`, `eager`) do bf16 math and ignore `expert_dtype`, so the fallback is harmless there and must stay allowed. Test non-current-device handling in a fresh spawned worker; standard one-worker-per-GPU EP/FSDP2 is supported.
 
 23a. **Quantization-aware training is per family, never a global recipe**
