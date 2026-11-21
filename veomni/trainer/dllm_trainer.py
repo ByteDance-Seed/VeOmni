@@ -39,7 +39,7 @@ from ..utils import helper
 from ..utils.constants import IGNORE_INDEX
 from ..utils.device import synchronize
 from ..utils.dist_utils import all_reduce
-from ..utils.loss_utils import dllm_mean_global_loss
+from ..utils.loss_utils import count_supervised_samples, dllm_mean_global_loss
 from .base import BaseTrainer, VeOmniIter
 
 
@@ -159,36 +159,6 @@ def _first_eos_token_id(eos_token_id: int | list[int] | None) -> int:
     if isinstance(eos_token_id, (list, tuple)):
         eos_token_id = eos_token_id[0] if eos_token_id else 1
     return int(eos_token_id) if eos_token_id is not None else 1
-
-
-def count_supervised_samples(micro_batch: Dict[str, torch.Tensor]) -> int:
-    """Count the supervised samples in one micro-batch.
-
-    `MainCollator` packs several samples into one row and marks where each starts
-    with ``position_ids == 0``, so under packing a row is not a sample. Segments are
-    counted when ``position_ids`` lines up with the supervision marker; otherwise
-    every row is one sample.
-
-    The marker is ``answer_mask`` when the transform emits it, else ``loss_weight``.
-    A LLaDA draw masks nothing in about 1/(N+1) of samples with an N-token answer;
-    its weights are all zero but the sample is still part of the mean, and leaving
-    it out would bias the loss up by that fraction.
-    """
-    marker = micro_batch.get("answer_mask", micro_batch["loss_weight"])
-    position_ids = micro_batch.get("position_ids")
-    if position_ids is not None and position_ids.dim() == 3:
-        position_ids = position_ids[:, 0, :]
-    if position_ids is None or position_ids.shape != marker.shape:
-        return int((marker.sum(dim=-1) > 0).sum())
-    count = 0
-    for row_positions, row_weight in zip(position_ids, marker):
-        starts = row_positions == 0
-        starts[0] = True
-        segment_ids = starts.cumsum(dim=0) - 1
-        per_segment = torch.zeros(int(segment_ids[-1]) + 1, dtype=torch.float64, device=row_weight.device)
-        per_segment.index_add_(0, segment_ids, row_weight.to(torch.float64))
-        count += int((per_segment > 0).sum())
-    return count
 
 
 def _attach_supervised_sample_count(micro_batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:

@@ -265,6 +265,16 @@ Three rules make this work:
 
 - Return at most one scalar `_loss` per node, token-mean reduced over the
   module's own micro-batch.
+- Declare `loss_is_step_mean` when your loss is **not** a micro-batch mean.
+  `OmniTrainer` scales every backward by `1 / num_micro_steps` so per-micro-batch
+  means accumulate into the step mean. A module that instead normalizes by a
+  quantity spanning the whole accumulation window — a dLLM module dividing by the
+  step's global sample count, which it learns from `on_micro_batches_ready` —
+  already emits the step mean from every micro-batch; that division would scale
+  its gradient down by the micro-batch count. Such a module sets
+  `loss_is_step_mean = True` and the trainer skips it. The flag is graph-wide:
+  a graph mixing both conventions raises rather than mis-scaling one of them,
+  because the per-node losses are summed into one tensor before the backward.
 - Read inputs in `pre_forward`, write results in `post_forward`. Conversation
   nodes return `{"conversation_list": ...}` so the carrier flows on.
 - Implement `dummy_inputs()` and `ModulePreprocessorBase.bind_dummy_inputs()` for

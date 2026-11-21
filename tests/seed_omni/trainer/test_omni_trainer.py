@@ -57,15 +57,23 @@ def test_cascade_module_reshard_keeps_params_gathered_between_micro_steps(micro_
             runtime._model_reshard.assert_called_once_with(expected)
 
 
-def _accumulate_grads(num_micro_steps: int) -> torch.Tensor:
+def _accumulate_grads(num_micro_steps: int, step_mean: bool | None = None) -> torch.Tensor:
     weight = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
 
     def forward(micro_batch):
         loss = (weight * micro_batch["x"]).pow(2).mean()
         return {"loss": loss, "losses": {}}
 
+    module_runtimes: dict[str, SimpleNamespace] = {}
+    if step_mean is not None:
+        module = SimpleNamespace()
+        module.loss_is_step_mean = step_mean
+        # `unwrap_module_chain` returns a `BaseMixin` unchanged and otherwise
+        # follows `.module`, so a plain object with the flag is enough here.
+        module_runtimes["m"] = SimpleNamespace(model=module)
+
     trainer = OmniTrainer.__new__(OmniTrainer)
-    trainer.model = SimpleNamespace(forward=forward, module_runtimes={})
+    trainer.model = SimpleNamespace(forward=forward, module_runtimes=module_runtimes)
     trainer.args = SimpleNamespace(train=SimpleNamespace(enable_batch_invariant_mode=False))
     trainer.model_fwd_context = nullcontext()
     trainer.model_bwd_context = nullcontext()
@@ -80,6 +88,32 @@ def _accumulate_grads(num_micro_steps: int) -> torch.Tensor:
 def test_gradient_accumulation_averages_micro_batch_gradients():
     """Accumulating N copies of one micro-batch must match a single step on it."""
     torch.testing.assert_close(_accumulate_grads(2), _accumulate_grads(1))
+
+
+def test_a_step_mean_module_is_not_averaged_again():
+    """A module that normalizes by the step's sample count already emits the step
+    mean from every micro-batch, so dividing its backward by ``num_micro_steps``
+    would shrink the gradient by exactly that factor. The flag is what tells the
+    two conventions apart; without it the dLLM path trains ``M`` times too slow."""
+    step_mean = _accumulate_grads(3, step_mean=True)
+    per_micro = _accumulate_grads(3, step_mean=False)
+
+    torch.testing.assert_close(step_mean, per_micro * 3)
+
+
+def test_a_graph_mixing_loss_conventions_is_refused():
+    """The graph's losses are summed into one tensor before the backward, so one
+    scale cannot serve both conventions. Refusing beats silently mis-scaling one
+    of them."""
+    trainer = OmniTrainer.__new__(OmniTrainer)
+
+    def _module(flag: bool) -> SimpleNamespace:
+        return SimpleNamespace(model=SimpleNamespace(loss_is_step_mean=flag))
+
+    trainer.model = SimpleNamespace(module_runtimes={"step": _module(True), "micro": _module(False)})
+
+    with pytest.raises(RuntimeError, match="mixes loss conventions"):
+        trainer._graph_loss_is_step_mean()
 
 
 def test_an_exhausted_iterator_does_not_count_a_step():

@@ -71,6 +71,7 @@ from ...distributed.offloading import build_activation_offloading_context
 from ...distributed.parallel_state import clear_parallel_state, init_parallel_state_from_config, use_parallel_state
 from ...models.seed_omni.accelerated import OmniModelRuntime, build_omni_model_runtime
 from ...models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
+from ...models.seed_omni.accelerated.utils.dispatch import unwrap_module_chain
 from ...models.seed_omni.processing_omni import OmniProcessor
 from ...models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
 from ...ops.batch_invariant import set_batch_invariant_mode
@@ -521,6 +522,16 @@ class OmniTrainer:
         scaled by ``1 / num_micro_steps``: accumulated gradients are then the mean
         over micro-batches, not a sum that grows with the accumulation count. The
         returned loss stays unscaled for logging.
+
+        A graph whose modules already emit the step's mean -- a dLLM module
+        normalizes by the global sample count of the whole accumulation window --
+        must not be divided again, or its gradient shrinks by the accumulation
+        factor. ``TrainingModuleMixin.loss_is_step_mean`` declares that, and this
+        method honors it graph-wide: the division is skipped only when every
+        module declares it, and a graph mixing both conventions is refused rather
+        than silently mis-scaled. The per-node ``_loss`` values are summed into
+        one tensor before the backward, so there is no per-node scale left to
+        apply here.
         """
         micro_batch = self.preforward(micro_batch)
 
@@ -532,12 +543,44 @@ class OmniTrainer:
         loss_dict: Dict[str, torch.Tensor] = result.get("losses", {})
         del result
 
+        scale = 1.0 if self._graph_loss_is_step_mean() else 1.0 / num_micro_steps
         # Backward: separate offload hook stack (may differ from forward when GC is on).
         with self.model_bwd_context, set_batch_invariant_mode(self.args.train.enable_batch_invariant_mode):
-            (total_loss / num_micro_steps).backward()
+            (total_loss * scale).backward()
 
         del micro_batch
         return total_loss, loss_dict
+
+    def _graph_loss_is_step_mean(self) -> bool:
+        """Whether every module in the graph already emits the step's mean loss.
+
+        ``TrainingModuleMixin.loss_is_step_mean`` is a per-module claim, but the
+        backward runs once over the summed loss, so only a graph-wide answer is
+        actionable. A mixed graph gets ``RuntimeError`` instead of an arbitrary
+        choice: scaling the sum would be wrong for whichever convention did not
+        win, and the error names the modules so the fix is obvious.
+        """
+        declared: dict[str, bool] = {}
+        for name, module_runtime in self.model.module_runtimes.items():
+            module = unwrap_module_chain(module_runtime.model)
+            flag = getattr(module, "loss_is_step_mean", None)
+            if flag is not None:
+                declared[name] = bool(flag)
+        if not declared:
+            return False
+        if all(declared.values()):
+            return True
+        if not any(declared.values()):
+            return False
+        step_mean = sorted(name for name, flag in declared.items() if flag)
+        per_micro = sorted(name for name, flag in declared.items() if not flag)
+        raise RuntimeError(
+            "OmniTrainer.forward_backward_step: the training graph mixes loss conventions. "
+            f"Modules already emitting the step's mean: {step_mean}; modules emitting a "
+            f"per-micro-batch mean: {per_micro}. The graph's losses are summed into one tensor "
+            "before the backward, so a single scale cannot serve both. Make every module agree on "
+            "`TrainingModuleMixin.loss_is_step_mean`."
+        )
 
     def model_reshard(self, micro_step: int, num_micro_steps: int) -> None:
         """Keep every module's params gathered across the grad-accumulation window."""
@@ -553,6 +596,24 @@ class OmniTrainer:
         if self.args.train.sync_each_train_step:
             synchronize()
 
+    def _notify_modules_of_step(self, micro_batches: List[Dict[str, Any]]) -> None:
+        """Tell every live module which micro-batches make up this optimizer step.
+
+        Modules whose loss is normalized per step rather than per micro-batch need
+        the whole accumulation window. ``DllmTrainer`` counts the step's samples
+        the same way before ``dllm_mean_global_loss``; a dLLM module in this graph
+        reads that contract through ``on_micro_batches_ready``.
+
+        Runs before the loop so ``pre_forward`` of the first micro-batch can rely
+        on the count already being set.
+        """
+        for module_runtime in self.model.module_runtimes.values():
+            # DDP / LoRA wrap the module, so the hook lives on the object below
+            # the wrapper chain rather than on `module_runtime.model` itself.
+            hook = getattr(unwrap_module_chain(module_runtime.model), "on_micro_batches_ready", None)
+            if hook is not None:
+                hook(micro_batches)
+
     def train_step(self, data_iterator: Any) -> None:
         # Fetch first: an iterator that runs dry before ``train_steps`` raises
         # here, and must not leave a step counted that never ran.
@@ -561,6 +622,7 @@ class OmniTrainer:
 
         self._reset_async_activation_offload_if_enabled()
         self.on_step_begin(micro_batches=micro_batches)
+        self._notify_modules_of_step(micro_batches)
         self.sync_before_train_step()
 
         total_loss = 0.0
