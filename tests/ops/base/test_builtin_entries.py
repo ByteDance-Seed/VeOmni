@@ -39,6 +39,7 @@ _GPU_SM80 = ("gpu", (("nvidia", 80, None), ("rocm", None, None)))
 _GPU_NVIDIA = ("gpu", (("nvidia", None, None),))
 _GPU_NVIDIA_SM70 = ("gpu", (("nvidia", 70, None),))
 _GPU_NVIDIA_SM80 = ("gpu", (("nvidia", 80, None),))
+_GPU_NVIDIA_SM89 = ("gpu", (("nvidia", 89, None),))
 _GPU_NVIDIA_SM89_ROCM = ("gpu", (("nvidia", 89, None), ("rocm", None, None)))
 _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
 _GPU_NVIDIA_SM90_OR_SM100 = ("gpu", (("nvidia", 90, 90), ("nvidia", 100, 100)))
@@ -181,13 +182,20 @@ _BUILTIN_ENTRIES = (
     ("kv_round", "deepseek_v4", "none", "any", _ANY, ()),
     ("kv_round", "deepseek_v4", "eager", "any", _ANY, ()),
     ("kv_round", "deepseek_v4", "triton", "cuda", _GPU_NVIDIA_SM89_ROCM, ("triton",)),
+    ("kv_round", "fp4", "none", "any", _ANY, ()),
+    ("kv_round", "fp4", "eager", "any", _ANY, ()),
+    # NVIDIA-only: ``triton_fp4_roundtrip`` hands every ROCm input to the eager row,
+    # so advertising ROCm would select a backend that never runs.
+    ("kv_round", "fp4", "triton", "cuda", _GPU_NVIDIA_SM89, ("triton",)),
     ("layer_norm", "standard", "eager", "any", _ANY, ()),
     ("layer_norm", "standard", "apex", "cuda", _GPU, ("fused_layer_norm_cuda",)),
     ("linear", "standard", "eager", "any", _ANY, ()),
     ("linear", "standard", "qat", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
     ("linear", "standard", "torchao", "any", _ANY, ("torchao",)),
+    ("linear", "standard", "deepgemm", "cuda", _GPU_NVIDIA_SM90_OR_SM100, ("deep_gemm", "triton")),
     ("linear", "grouped", "eager", "any", _ANY, ()),
     ("linear", "grouped", "qat", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("linear", "grouped", "deepgemm", "cuda", _GPU_NVIDIA_SM90_OR_SM100, ("deep_gemm", "triton")),
     ("rms_norm", "standard", "eager", "any", _ANY, ()),
     ("rms_norm", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("rms_norm", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
@@ -224,6 +232,7 @@ _BUILTIN_ENTRIES = (
     ("gated_mlp", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("gated_mlp", "standard", "qat", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
     ("gated_mlp", "standard", "torchao", "any", _ANY, ("torchao",)),
+    ("gated_mlp", "standard", "deepgemm", "cuda", _GPU_NVIDIA_SM90_OR_SM100, ("deep_gemm", "triton")),
     ("gated_mlp", "geglu", "eager", "any", _ANY, ()),
     ("gated_mlp", "geglu", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("gated_mlp", "geglu", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
@@ -305,6 +314,7 @@ _BUILTIN_DEFAULT_ENTRIES = {
     ("gated_mlp", "geglu", "liger_kernel", "mlu"),
     ("kv_round", "standard", "triton", "cuda"),
     ("kv_round", "deepseek_v4", "triton", "cuda"),
+    ("kv_round", "fp4", "triton", "cuda"),
 }
 
 

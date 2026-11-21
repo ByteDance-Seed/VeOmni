@@ -1148,3 +1148,85 @@ def test_torchao_fp8_validates_and_dispatches_three_projections(monkeypatch):
         (mlp.up_proj.weight.shape, "rowwise_with_gw_hp", False),
         (mlp.down_proj.weight.shape, "rowwise_with_gw_hp", False),
     ]
+
+
+def test_the_deepgemm_row_is_registered_on_sm90_or_sm100():
+    from veomni.ops import OP_REGISTRY
+
+    assert "deepgemm" in OP_REGISTRY.list_registered("gated_mlp", "standard")
+    entry = {e.impl: e for e in OP_REGISTRY.list_entries("gated_mlp", "standard")}["deepgemm"]
+    assert entry.requires == ("deep_gemm", "triton")
+    assert {(p.min_cc, p.max_cc) for p in entry.requirement.platforms} == {(90, 90), (100, 100)}
+
+
+def test_the_deepgemm_row_declares_the_activations_its_kernel_fuses():
+    """``RecomputedSwiGLU`` fuses ``aten.silu``, so the row cannot serve another activation.
+
+    ``render`` consults ``ROW_ACTIVATIONS`` before the call, so a ``gelu`` model is
+    routed to its projection fallback. Declaring the set here is what makes that
+    routing right rather than accidental -- an entry missing from the map falls back
+    to ``eager``'s behaviour, which would claim the row can compute anything.
+    """
+    from veomni.ops.kernels.gated_mlp._module import ROW_ACTIVATIONS
+
+    assert ROW_ACTIVATIONS["deepgemm"] == frozenset({"silu", "swish"})
+
+
+def test_the_deepgemm_row_refuses_a_block_size_it_cannot_honor():
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+
+    mlp = torch.nn.Module()
+    mlp.gate_proj = torch.nn.Linear(256, 384, bias=False, dtype=torch.bfloat16)
+    mlp.up_proj = torch.nn.Linear(256, 384, bias=False, dtype=torch.bfloat16)
+    mlp.down_proj = torch.nn.Linear(384, 256, bias=False, dtype=torch.bfloat16)
+    x = torch.randn(2, 256, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="only block_size=128"):
+        deepgemm.wrapper(mlp, x, block_size=64)
+
+
+def test_the_deepgemm_row_refuses_a_wrapped_projection():
+    """It quantizes the weight it multiplies, so a LoRA wrapper has to be refused.
+
+    ``render`` raises instead of falling back to the projection modules, because a
+    fallback would train at full precision under a config that said otherwise.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+
+    class _Wrapped(nn.Module):
+        """Stand-in for ``LoraLinear``: no ``weight``, keeps the base at ``base_layer``."""
+
+        def __init__(self):
+            super().__init__()
+            self.base_layer = nn.Linear(256, 384, bias=False)
+
+        def forward(self, x):
+            return self.base_layer(x)
+
+    mlp = nn.Module()
+    mlp.gate_proj = _Wrapped()
+    mlp.up_proj = nn.Linear(256, 384, bias=False)
+    mlp.down_proj = nn.Linear(384, 256, bias=False)
+    with pytest.raises(ValueError, match="quantizes the projection weights"):
+        deepgemm.wrapper(mlp, torch.randn(2, 256), activation="silu")
+
+
+def test_the_deepgemm_row_refuses_an_activation_its_kernel_cannot_fuse():
+    """``render`` keeps a non-SiLU model off this row; a direct call must also refuse.
+
+    ``render`` raises first here, before the row's own check runs -- which is the
+    right order, because it has the wider message (it names the config field to
+    change). The row's ``_FUSED_ACTIVATIONS`` check is the second line of defence
+    for a caller that reaches the kernel some other way.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+
+    mlp = nn.Module()
+    mlp.gate_proj = nn.Linear(256, 384, bias=False)
+    mlp.up_proj = nn.Linear(256, 384, bias=False)
+    mlp.down_proj = nn.Linear(384, 256, bias=False)
+    with pytest.raises(ValueError, match="no quantizing row evaluates that activation"):
+        deepgemm.wrapper(mlp, torch.randn(2, 256), activation="gelu")
