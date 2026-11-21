@@ -330,7 +330,7 @@ To enable Async Ulysses, simply set the `accelerator.enable_async` parameter to 
 Notice: Async Ulysses works when `accelerator.ulysses_size > 1`.
 
 ```shell
-bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
+bash train.sh tasks/train_vlm.py configs/models/qwen3_vl/recipes/multisource_8b.yaml \
     --model.accelerator.ulysses_size 4 \
     --model.accelerator.enable_async true
 ```

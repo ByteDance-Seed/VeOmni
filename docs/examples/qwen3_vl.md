@@ -21,6 +21,25 @@ with open('sharegpt4v_instruct_gpt4-vision_cap100k_coco.json', 'w', encoding='ut
     json.dump(filtered_data, f, ensure_ascii=False, indent=4)
 ```
 
+## Qwen3-VL-2B-Instruct training example
+
+Prepare the dataset above in the repository root, then download the checkpoint.
+For ShareGPT4V, each entry in `images` must resolve to an image file from the training working directory.
+
+```shell
+python scripts/download_hf_model.py --repo_id Qwen/Qwen3-VL-2B-Instruct --local_dir .
+```
+
+Run the command for your backend from the repository root.
+
+```shell
+# NVIDIA CUDA
+bash train.sh tasks/train_vlm.py configs/models/qwen3_vl/cuda.yaml
+
+# Ascend NPU
+bash train.sh tasks/train_vlm.py configs/models/qwen3_vl/ascend.yaml
+```
+
 ## Download Qwen3 VL model
 
 ### Qwen3-VL-8B
@@ -44,7 +63,7 @@ python3 scripts/download_hf_model.py \
 ### Qwen3-VL-8B
 
 ```shell
-bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
+bash train.sh tasks/train_vlm.py configs/models/qwen3_vl/recipes/multisource_8b.yaml \
     --model.model_path ./Qwen3-VL-8B-Instruct \
     --data.train_path ./sharegpt4v_instruct_gpt4-vision_cap100k_coco.json \
     --data.dataloader.type native \
@@ -72,7 +91,7 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml \
 Dense Qwen3-VL can compile each text decoder block before FSDP2 sharding while keeping the vision tower, DeepStack injection, and language-model head eager. Enable fixed-length packed inputs together with compile:
 
 ```shell
-bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
+bash train.sh tasks/train_vlm.py configs/models/qwen3_vl/recipes/multisource_8b.yaml \
     --model.model_path ./Qwen3-VL-8B-Instruct \
     --data.train_path ./sharegpt4v_instruct_gpt4-vision_cap100k_coco.json \
     --train.dyn_bsz true \

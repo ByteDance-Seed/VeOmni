@@ -111,11 +111,11 @@ activation outside that set is refused when the row runs, not at config load:
 falling back would train at full precision under a config that claimed
 otherwise, so the error names `eager` as the way to keep the projection path.
 
-Start from [the Qwen3 example](../../configs/text/qwen3_nvfp4_qat.yaml), set
+Start from [the Qwen3 example](../../configs/models/qwen3/recipes/nvfp4_qat.yaml), set
 `model.model_path` and `data.train_path`, then run:
 
 ```bash
-bash train.sh tasks/train_text.py configs/text/qwen3_nvfp4_qat.yaml
+bash train.sh tasks/train_text.py configs/models/qwen3/recipes/nvfp4_qat.yaml
 ```
 
 The example's learning rate and duration are starting settings, not a validated

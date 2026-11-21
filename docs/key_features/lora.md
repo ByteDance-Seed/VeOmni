@@ -521,7 +521,7 @@ dataset preparation and inference workflow.
 
 ### 6.2 Qwen3-0.6B LoRA (LLM, FSDP2)
 
-Config: [`configs/text/qwen3_lora.yaml`](../../configs/text/qwen3_lora.yaml)
+Config: [`configs/models/qwen3/recipes/lora.yaml`](../../configs/models/qwen3/recipes/lora.yaml)
 
 ```yaml
 model:
@@ -555,7 +555,7 @@ Launch (8 GPUs, SP=2):
 SP_SIZE=2
 NPROC_PER_NODE=8
 
-bash train.sh tasks/train_text.py configs/text/qwen3_lora.yaml \
+bash train.sh tasks/train_text.py configs/models/qwen3/recipes/lora.yaml \
     --model.model_path /path/to/Qwen3-0.6B-Base \
     --data.train_path  /path/to/tulu-3-sft-mixture/data \
     --train.global_batch_size 8 \
@@ -570,7 +570,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3_lora.yaml \
 To resume from a saved adapter:
 
 ```shell
-bash train.sh tasks/train_text.py configs/text/qwen3_lora.yaml \
+bash train.sh tasks/train_text.py configs/models/qwen3/recipes/lora.yaml \
     --model.model_path /path/to/Qwen3-0.6B-Base \
     --data.train_path  /path/to/tulu-3-sft-mixture/data \
     --train.checkpoint.output_dir ./exp/qwen3_lora \

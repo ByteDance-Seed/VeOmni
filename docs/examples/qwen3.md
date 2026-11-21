@@ -13,6 +13,24 @@ table_first_2000 = table.slice(0, 2000)
 pq.write_table(table_first_2000, output_path)
 ```
 
+## Qwen3-0.6B training example
+
+Prepare the dataset above in the repository root, then download the checkpoint.
+
+```shell
+python scripts/download_hf_model.py --repo_id Qwen/Qwen3-0.6B --local_dir .
+```
+
+Run the command for your backend from the repository root.
+
+```shell
+# NVIDIA CUDA
+bash train.sh tasks/train_text.py configs/models/qwen3/cuda.yaml
+
+# Ascend NPU
+bash train.sh tasks/train_text.py configs/models/qwen3/ascend.yaml
+```
+
 ## Download Qwen3 model
 
 ### Qwen3-8B
@@ -44,7 +62,7 @@ python3 scripts/download_hf_model.py \
 ### Qwen3-8B
 
 ```shell
-bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
+bash train.sh tasks/train_text.py configs/models/qwen3/recipes/sft_8b.yaml \
     --model.model_path ./Qwen3-8B \
     --data.train_path ./tulu-first2000.parquet \
     --model.accelerator.fsdp_config.fsdp_mode fsdp2 \
@@ -54,7 +72,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
 ### Qwen3-30B
 
 ```shell
-bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
+bash train.sh tasks/train_text.py configs/models/qwen3/recipes/sft_8b.yaml \
     --model.model_path ./Qwen3-30B-A3B-Instruct-2507 \
     --model.ops_implementation.moe_implementation fused_triton \
     --data.train_path ./tulu-first2000.parquet \
