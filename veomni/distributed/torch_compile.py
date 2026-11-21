@@ -14,7 +14,7 @@
 
 import types
 from dataclasses import dataclass
-from typing import Collection, Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -24,6 +24,39 @@ from ..utils import device, logging
 
 logger = logging.get_logger(__name__)
 
+
+#: Which callers this module serves, and the signal each is recognised by.
+#:
+#: ``validate_compile_model`` gates four kinds of model, and the branch each one
+#: takes is decided from the model's *topology*, not from a single flag — the
+#: signals differ because the models differ:
+#:
+#: =========================  ==========================================  ====================================
+#: caller                     recognised by                               what it gets
+#: =========================  ==========================================  ====================================
+#: base trainer, text model   ``_is_multimodal_model`` is ``False``       the generic ``*DecoderLayer`` path
+#: base trainer, multimodal   ``_is_multimodal_model`` is ``True``        fail-closed: dense Qwen3-VL only
+#: SeedOmni module            ``_is_omni_module`` (``isinstance``)        composed guards (no CUDA graph, no SP)
+#: SeedOmni composed          ``_is_composed_model`` (``_module_configs``)  composed guards
+#: =========================  ==========================================  ====================================
+#:
+#: Why the multimodal branch is narrower than the SeedOmni ones: a single HF
+#: multimodal model holds its towers **and** the cross-modal injection between
+#: them in one ``forward``, so its block boundaries and lifecycle are not the
+#: plain decoder-block contract. Only dense Qwen3-VL has been validated, and
+#: ``_SUPPORTED_MULTIMODAL_DECODER_BLOCKS`` names what that validation covered.
+#: A SeedOmni module holds one component and no injection point, so it gets the
+#: composed guards instead — even though its config carries a ``vision_config``
+#: and so looks multimodal to ``_is_multimodal_model``.
+#:
+#: A new caller normally adds a branch here. The alternative — moving the answer
+#: onto the model as a capability flag, the way
+#: :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile`
+#: already works for SeedOmni — would collapse this to one check plus the shared
+#: runtime constraints, and retire ``_SUPPORTED_MULTIMODAL_DECODER_BLOCKS`` (the
+#: table exists only to express "we validated this one"). That refactor has not
+#: been done because re-validating the existing Qwen3-VL support needs a real
+#: training run.
 
 _SUPPORTED_MULTIMODAL_DECODER_BLOCKS = {
     "qwen3_vl": "Qwen3VLTextDecoderLayer",
@@ -41,16 +74,77 @@ class CompileConfig:
     dynamic: bool = False
 
     def uses_cuda_graphs(self) -> bool:
-        """Return whether this config asks torch.compile to use graph replay."""
+        """Return whether this config asks torch.compile to use graph replay.
 
-        return self.backend == "cudagraphs" or self.mode == "reduce-overhead"
+        Both ``mode`` spellings are needed: ``reduce-overhead`` and
+        ``max-autotune`` each turn on Triton graph capture in torch's own mode
+        table (``torch/_inductor/__init__.py``), while
+        ``max-autotune-no-cudagraphs`` deliberately does not. Missing
+        ``max-autotune`` would let a run past the SeedOmni replay guard and record
+        ``_veomni_compile_uses_cuda_graphs=False``, so the per-step
+        ``cudagraph_mark_step_begin`` would never be called for a graph that does
+        replay.
+        """
+
+        return self.backend == "cudagraphs" or self.mode == "reduce-overhead" or self.mode == "max-autotune"
+
+
+def _decoder_block_specs(model: nn.Module, *, all_classes: bool = False) -> list[tuple[str, str | None]]:
+    """``(class name, child scope)`` for each compilable block in ``_no_split_modules``.
+
+    An entry is a bare class name (``LlamaDecoderLayer``, scope ``None``, matches
+    anywhere) or — on a SeedOmni composed model, where the children share one
+    FSDP tree — scoped to a child (``janus_llama.LlamaDecoderLayer``, matches
+    only under that child; see ``_scoped_no_split_modules`` in
+    ``models/seed_omni/accelerated/omni_model/omni_model_runtime.py``).
+
+    ``type(module).__name__`` never carries a scope, so the name half is what
+    ``_is_decoder_block`` compares and the scope half is what it matches against
+    the fqn.
+
+    ``all_classes`` decides which entries qualify. The default keeps only
+    ``*DecoderLayer``, which is what every single model wants: a Qwen2.5-Omni
+    lists its vision and audio towers alongside the decoder layers, and those
+    must stay eager. A SeedOmni run passes ``True`` because its modules declare
+    whatever their own blocks are called (``JanusVQVAEAttnBlock``), and the
+    per-module
+    :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile`
+    flag — not the class name — is what decides whether the module is compiled
+    at all.
+    """
+    no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
+    if no_split_modules is None:
+        return []
+    specs: list[tuple[str, str | None]] = []
+    for entry in no_split_modules:
+        if not isinstance(entry, str):
+            continue
+        scope, _, class_name = entry.rpartition(".")
+        if all_classes or class_name.endswith("DecoderLayer"):
+            specs.append((class_name, scope or None))
+    return specs
 
 
 def _decoder_block_class_names(model: nn.Module) -> set[str]:
-    no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
-    if no_split_modules is None:
-        return set()
-    return {name for name in no_split_modules if isinstance(name, str) and name.endswith("DecoderLayer")}
+    """Decoder-layer class names in ``_no_split_modules``, scopes stripped.
+
+    Kept for :func:`validate_compile_model`, which only asks whether a class is
+    declared at all.
+    """
+    return {class_name for class_name, _ in _decoder_block_specs(model)}
+
+
+def _is_composed_model(model: nn.Module) -> bool:
+    """Whether ``model`` is a SeedOmni composed :class:`OmniModel`.
+
+    Recognised by the per-module config map, which no single model carries. A
+    composed model presents as text-only to :func:`_is_multimodal_model`: it
+    inherits ``input_modalities = "text"`` from ``PreTrainedModel`` and its
+    ``OmniConfig`` has no ``vision_config`` / ``audio_config`` — the media
+    modalities live in ``_module_configs``.
+    """
+    config = getattr(model, "config", None)
+    return bool(getattr(config, "_module_configs", None))
 
 
 def _is_multimodal_model(model: nn.Module) -> bool:
@@ -66,6 +160,22 @@ def _is_multimodal_model(model: nn.Module) -> bool:
     return any(modality != "text" for modality in input_modalities)
 
 
+def _is_omni_module(model: nn.Module) -> bool:
+    """Whether ``model`` is one SeedOmni module built standalone.
+
+    Under ``fsdp_scope='module'`` each module is wrapped on its own, so the wrap
+    sees a single component rather than a whole multimodal model. That matters
+    for the guards below: a SeedOmni tower carries a ``vision_config`` because
+    that is how its own config is shaped, not because it also holds an LLM and
+    the cross-modal injection between them. A single HF multimodal model
+    (Qwen2.5-Omni, Qwen3-VL-MoE, ...) does hold all of that and stays
+    fail-closed.
+    """
+    from ..models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+    return isinstance(model, PretrainedOmniModule)
+
+
 def validate_compile_model(
     model: nn.Module,
     compile_config: CompileConfig,
@@ -74,10 +184,41 @@ def validate_compile_model(
 ) -> None:
     """Validate model-specific contracts for per-block compilation.
 
-    Text models keep the generic decoder-layer path. Multimodal models are
-    fail-closed because their towers and cross-modal injection points have
-    different shape and lifecycle contracts.
+    Four callers, four branches — see the module docstring for the table and for
+    why the single-model multimodal rule is narrower than the SeedOmni ones.
+    Text models keep the generic decoder-layer path. A single multimodal model is
+    fail-closed because its towers and cross-modal injection points have
+    different shape and lifecycle contracts. A SeedOmni module or composed
+    ``OmniModel`` is compiled block by block and gets the composed guards.
     """
+
+    # A composed ``OmniModel`` and a single SeedOmni module share these guards:
+    # both compile block by block, and the two paths that stay refused are
+    # refused for reasons that do not depend on which of the two it is. The
+    # parse-time twin lives in ``_validate_omni_accelerator`` — it runs for the
+    # top-level accelerator and every resolved module, so this is the backstop
+    # for a caller that built a config without going through the launcher.
+    #
+    # ``dynamic`` is allowed and is what a run wants when the packed length moves
+    # between steps. Measured over six lengths spanning 300-2816 tokens: every
+    # shape matched eager to the same tolerance a static compile gives (2.4e-2
+    # relative on a bf16 stack, saturating at four layers and identical for
+    # forward and gradients), six lengths kept four graphs, and the variable-shape
+    # step was 1.41x faster than eager.
+    if _is_composed_model(model) or _is_omni_module(model):
+        kind = "a composed SeedOmni OmniModel" if _is_composed_model(model) else "a SeedOmni module"
+        if compile_config.uses_cuda_graphs():
+            raise RuntimeError(
+                f"model.accelerator.torch_compile.enable does not support CUDA Graph replay for {kind}; "
+                "use backend='inductor' and mode=None."
+            )
+        if sequence_parallel_enabled or async_enabled:
+            raise RuntimeError(
+                f"model.accelerator.torch_compile.enable does not support sequence parallelism or async Ulysses "
+                f"for {kind}; set model.accelerator.ulysses_size=1, model.accelerator.cp_size=1, "
+                "and model.accelerator.enable_async=False."
+            )
+        return
 
     if not _is_multimodal_model(model):
         return
@@ -113,18 +254,39 @@ def validate_compile_model(
         )
 
 
-def _is_decoder_block(module: nn.Module, decoder_block_class_names: Optional[Collection[str]] = None) -> bool:
-    """Check decoder blocks using the model's ``_no_split_modules`` list.
+def _is_decoder_block(
+    module: nn.Module,
+    *,
+    fqn: Optional[str] = None,
+    decoder_block_specs: Sequence[tuple[str, str | None]],
+) -> bool:
+    """Whether ``module`` is one of the blocks named in ``_no_split_modules``.
 
-    HuggingFace model classes typically list the decoder layer class in
-    ``_no_split_modules`` for FSDP/Accelerate. Multimodal models may include
-    vision/audio blocks in the same list, so the compile path keeps only
-    entries that are decoder layers.
+    HuggingFace model classes list the decoder layer class there for
+    FSDP/Accelerate. A scoped entry (``janus_llama.LlamaDecoderLayer``) matches
+    only modules under that child, so a sibling that reuses the same layer class
+    is left alone; a bare entry matches anywhere. The rule mirrors
+    ``_is_fsdp_wrap_target``, so the wrap plan and the compile plan agree on what
+    a block is.
     """
 
-    if decoder_block_class_names is None:
-        decoder_block_class_names = _decoder_block_class_names(module)
-    return type(module).__name__ in decoder_block_class_names
+    class_name = type(module).__name__
+    return any(
+        name == class_name and (scope is None or _under_scope(fqn, scope)) for name, scope in decoder_block_specs
+    )
+
+
+def _under_scope(fqn: Optional[str], scope: str) -> bool:
+    """Whether ``fqn`` is ``scope`` itself or a descendant of it.
+
+    An empty scope means "this whole tree", which is how a standalone module
+    (``fsdp_scope='module'``) says its own root is the scope.
+    """
+    if not scope:
+        return True
+    if fqn is None:
+        return False
+    return fqn == scope or fqn.startswith(scope + ".")
 
 
 def validate_compile_config_for_fsdp2(compile_config: CompileConfig, enable_reshard_after_forward: bool) -> None:
@@ -196,9 +358,10 @@ def _reject_incompatible_ops(model: nn.Module) -> None:
 
     The walk covers nested configs because that is how the selections bind: a
     multimodal root carries its text tower's ops under ``sub_configs``, and a
-    module resolves the selection from the config it was built with. A child-only
-    selection is real and must be caught, and the message names the path so the
-    offending level is unambiguous.
+    module resolves the selection from the config it was built with.
+
+    Called once per compiled module, so a sibling that stayed eager never reaches
+    this — its selection is irrelevant because Inductor never sees it.
     """
     config = getattr(model, "config", None)
     offending = _uncompilable_at(config, prefix="")
@@ -211,7 +374,14 @@ def _reject_incompatible_ops(model: nn.Module) -> None:
 
 
 def _uncompilable_at(config, *, prefix: str) -> list[str]:
-    """Collect offending selections on ``config`` and every sub-config below it."""
+    """Collect offending selections on ``config`` and every sub-config below it.
+
+    A SeedOmni composed ``OmniConfig`` files its children in ``_module_configs``
+    rather than ``sub_configs`` (the latter describes one HF model's nesting), so
+    both are walked. Under the per-module design this only ever sees one module's
+    config, but the walk stays general so a single HF multimodal model is still
+    covered.
+    """
     if config is None:
         return []
     found = [f"{prefix}{item}" for item in _uncompilable_selections(getattr(config, "ops_config", None))]
@@ -219,6 +389,8 @@ def _uncompilable_at(config, *, prefix: str) -> list[str]:
         child = getattr(config, name, None)
         if child is not None:
             found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
+    for name, child in (getattr(config, "_module_configs", None) or {}).items():
+        found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
     return found
 
 
@@ -227,12 +399,21 @@ def compile_decoder_blocks(
     compile_config: CompileConfig,
     sequence_parallel_enabled: bool = False,
     async_enabled: bool = False,
+    all_classes: bool = False,
 ) -> int:
-    """Compile forward of every decoder block inside ``model`` in place.
+    """Compile forward of every block inside ``model`` in place.
 
     Compiling the forward method (rather than wrapping the whole module)
     preserves module identity for FSDP2 — pre/post-forward all-gather and
     reshard hooks stay outside the compiled region.
+
+    ``all_classes`` decides which ``_no_split_modules`` entries qualify. The
+    default keeps ``*DecoderLayer``, which is what a single HF model wants: a
+    Qwen2.5-Omni lists its vision and audio towers alongside its decoder layers,
+    and those must stay eager. SeedOmni passes ``True`` because its modules name
+    whatever their own blocks are called (``JanusVQVAEAttnBlock``) and already
+    opted in via ``supports_torch_compile`` — the module is the unit of
+    compilation, so there is no subtree left to select.
     """
 
     if not hasattr(torch, "compile"):
@@ -257,25 +438,29 @@ def compile_decoder_blocks(
             )
         compile_kwargs["mode"] = compile_config.mode
 
-    decoder_block_class_names = _decoder_block_class_names(model)
+    decoder_block_specs = _decoder_block_specs(model, all_classes=all_classes)
     compiled = 0
     for fqn, module in model.named_modules():
-        if not _is_decoder_block(module, decoder_block_class_names):
+        if not _is_decoder_block(module, fqn=fqn, decoder_block_specs=decoder_block_specs):
             continue
         if getattr(module, "_veomni_forward_compiled", False):
             continue
 
+        # One config for this call: a SeedOmni module passes its own, so `dynamic`
+        # is already the answer for this module's blocks.
+        block_kwargs = compile_kwargs
+
         original_forward = module.forward
         if hasattr(original_forward, "__func__"):
             module._veomni_original_forward = original_forward.__func__
-            compiled_forward = torch.compile(original_forward.__func__, **compile_kwargs)
+            compiled_forward = torch.compile(original_forward.__func__, **block_kwargs)
             module.forward = types.MethodType(compiled_forward, module)
         else:
             module._veomni_original_forward = original_forward
-            module.forward = torch.compile(original_forward, **compile_kwargs)
+            module.forward = torch.compile(original_forward, **block_kwargs)
         module._veomni_forward_compiled = True
-        module._veomni_compile_config = dict(compile_kwargs)
-        logger.info_rank0(f"Compiled decoder block forward for {fqn} with torch.compile({compile_kwargs}).")
+        module._veomni_compile_config = dict(block_kwargs)
+        logger.info_rank0(f"Compiled decoder block forward for {fqn} with torch.compile({block_kwargs}).")
         compiled += 1
 
     logger.info_rank0(f"Compiled {compiled} decoder blocks with torch.compile.")

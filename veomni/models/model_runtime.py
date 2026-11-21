@@ -398,6 +398,19 @@ class VeOmniModelRuntime:
             compile_enabled=self.args.accelerator.torch_compile.enable,
         )
 
+    def _compile_config(self):
+        """``CompileConfig`` for this model's wrap.
+
+        A single model has one compile decision, taken from its ``accelerator``.
+        SeedOmni's :class:`ModuleRuntime` overrides this to intersect it with the
+        module's own :attr:`supports_torch_compile` opt-in.
+        """
+        from ..distributed.torch_compile import CompileConfig
+
+        return CompileConfig(
+            **{field.name: getattr(self.args.accelerator.torch_compile, field.name) for field in fields(CompileConfig)}
+        )
+
     def _build_parallelized_model(self) -> None:
         """FSDP2/DDP-wrap the model and load its weights.
 
@@ -454,11 +467,8 @@ class VeOmniModelRuntime:
         recompute_policy = self._build_recompute_policy()
 
         from ..distributed import torch_parallelize
-        from ..distributed.torch_compile import CompileConfig
 
-        compile_config = CompileConfig(
-            **{field.name: getattr(args.accelerator.torch_compile, field.name) for field in fields(CompileConfig)}
-        )
+        compile_config = self._compile_config()
         self.model = torch_parallelize.build_parallelize_model(
             self.model,
             init_device=args.accelerator.init_device,

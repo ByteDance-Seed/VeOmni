@@ -347,6 +347,11 @@ class Qwen3VLLlm(InferenceMixin, PretrainedOmniModule):
     main_input_name = "inputs_embeds"
     _no_split_modules = ["Qwen3VLTextDecoderLayer"]
     supports_gradient_checkpointing = True
+    # Measured ~1.58x per-block; same decoder block as ``qwen3_llm``.
+    supports_torch_compile = True
+    # Static and dynamic measure the same here (1.00x), so take the one
+    # that absorbs a packed length that moves with the image count.
+    supports_torch_compile_dynamic = True
     # This wrapper owns no attention — `self.language_model` does, and it supports
     # both SDPA and eager. Without this the base `_supports_sdpa = False` rejects
     # `sdpa` / `veomni_sdpa` at construction.

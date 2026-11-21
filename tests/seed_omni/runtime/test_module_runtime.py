@@ -41,8 +41,21 @@ from veomni.utils import recompute_utils
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def _fsdp(scope: str, mode: str = "fsdp2") -> SimpleNamespace:
-    return SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope=scope, fsdp_mode=mode))
+def _fsdp(
+    scope: str, mode: str = "fsdp2", *, compile_enable: bool = False, compile_dynamic: bool = False
+) -> SimpleNamespace:
+    """A minimal ``AcceleratorConfig`` stand-in.
+
+    ``torch_compile`` defaults to disabled: these tests are about the wrap and
+    the per-module steps, and leaving compile off keeps
+    ``_build_parallelized_model`` from reaching for the compiler.
+    """
+    return SimpleNamespace(
+        fsdp_config=SimpleNamespace(fsdp_scope=scope, fsdp_mode=mode),
+        torch_compile=SimpleNamespace(
+            enable=compile_enable, backend="inductor", mode=None, fullgraph=True, dynamic=compile_dynamic
+        ),
+    )
 
 
 def _unbuilt(model: nn.Module | None = None, **args_fields) -> ModuleRuntime:
@@ -715,3 +728,220 @@ def test_a_frozen_module_has_no_async_save_to_drain():
     runtime.checkpoint = None
 
     runtime.wait_for_pending_save()
+
+
+def test_compile_is_off_by_default_for_a_module():
+    """A module that has not been measured never compiles.
+
+    ``supports_torch_compile`` is the per-module gate; the class default has to be
+    ``False`` or every module would inherit the run switch.
+    """
+    from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+    assert PretrainedOmniModule.supports_torch_compile is False
+
+
+@pytest.mark.parametrize(
+    ("run_enable", "module_support", "expected"),
+    [
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, True),
+    ],
+)
+def test_module_compile_config_needs_both_switches(run_enable, module_support, expected):
+    """The run switch and the module's opt-in are ANDed.
+
+    The run switch alone must not compile a module that never opted in, and a
+    module's opt-in must not compile itself in a run that left compile off.
+    """
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    module = SimpleNamespace(supports_torch_compile=module_support)
+    accelerator = SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=run_enable, backend="inductor", mode=None, fullgraph=True, dynamic=False),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
+    )
+
+    assert module_compile_config(accelerator, module).enable is expected
+
+
+def test_module_compile_config_carries_the_run_options_through():
+    """Gating changes ``enable`` only; the chosen backend and shape flags survive."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    accelerator = SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=False, dynamic=True),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
+    )
+    module = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True)
+    config = module_compile_config(accelerator, module)
+
+    assert (config.backend, config.mode, config.fullgraph, config.dynamic) == ("inductor", None, False, True)
+
+
+def test_a_module_without_the_flag_is_treated_as_opted_out():
+    """``getattr`` default, so a module class predating the flag stays eager."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    accelerator = SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=False),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
+    )
+
+    assert module_compile_config(accelerator, SimpleNamespace()).enable is False
+
+
+def test_compile_dynamic_is_off_by_default_for_a_module():
+    """A module opts into ``dynamic`` separately from compile itself.
+
+    ``dynamic`` pays Inductor's polymorphic-kernel tax, which on a kernel-heavy
+    codec exceeded the compile win entirely (``janus_vqvae``: 30% slower than
+    static), so it cannot be inherited from the run switch.
+    """
+    from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+    assert PretrainedOmniModule.supports_torch_compile_dynamic is False
+
+
+@pytest.mark.parametrize(
+    ("run_dynamic", "module_dynamic", "expected"),
+    [
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, True),
+    ],
+)
+def test_module_compile_config_intersects_dynamic(run_dynamic, module_dynamic, expected):
+    """The run-level ``dynamic`` only reaches modules that declared they can use it."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    module = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=module_dynamic)
+    accelerator = SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=run_dynamic),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
+    )
+
+    assert module_compile_config(accelerator, module).dynamic is expected
+
+
+def test_a_module_without_the_dynamic_flag_gets_dynamic_off():
+    """``getattr`` default, so a module class predating the flag never turns it on."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    accelerator = SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=True),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
+    )
+
+    assert module_compile_config(accelerator, SimpleNamespace(supports_torch_compile=True)).dynamic is False
+
+
+# ---------------------------------------------------------------- compile gate
+#
+# Compilation is per module: `ModuleRuntime._build_parallelized_model` compiles
+# the module's own blocks before the FSDP wrap (which is also where the composed
+# wrap would have happened), so there is no scope list and nothing reads the
+# top-level accelerator. These tests pin that per-module decision.
+
+
+def _compile_accelerator(*, enable=True, dynamic=False, fsdp_mode="fsdp2", mode=None):
+    return SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=enable, backend="inductor", mode=mode, fullgraph=True, dynamic=dynamic),
+        fsdp_config=SimpleNamespace(fsdp_mode=fsdp_mode),
+    )
+
+
+@pytest.mark.parametrize(
+    ("run_enable", "supports", "dynamic", "supports_dynamic", "fsdp_mode", "expected"),
+    [
+        # enabled only when the run switch, the class attribute and fsdp2 all agree
+        (True, True, False, False, "fsdp2", (True, False)),
+        (True, True, True, True, "fsdp2", (True, True)),
+        (True, True, True, False, "fsdp2", (True, False)),
+        (True, True, False, True, "fsdp2", (True, False)),
+        (False, True, True, True, "fsdp2", (False, False)),
+        (True, False, True, True, "fsdp2", (False, False)),
+        # ddp cannot compile: `compile_decoder_blocks` only runs under FSDP2
+        (True, True, True, True, "ddp", (False, False)),
+    ],
+)
+def test_module_compile_config_gates_on_run_switch_class_flag_and_fsdp2(
+    run_enable, supports, dynamic, supports_dynamic, fsdp_mode, expected
+):
+    """The module's own resolved switch, its class flag and its wrap mode, ANDed."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    module = SimpleNamespace(supports_torch_compile=supports, supports_torch_compile_dynamic=supports_dynamic)
+    config = module_compile_config(
+        _compile_accelerator(enable=run_enable, dynamic=dynamic, fsdp_mode=fsdp_mode), module
+    )
+
+    assert (config.enable, config.dynamic) == expected
+
+
+def test_a_module_under_ddp_stays_eager_rather_than_failing_its_wrap():
+    """The shipped Janus launcher puts ``janus_siglip`` on DDP."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    config = module_compile_config(
+        _compile_accelerator(enable=True, dynamic=True, fsdp_mode="ddp"),
+        SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=True),
+    )
+    assert config.enable is False
+
+
+def test_a_compiling_module_compiles_itself_before_the_composed_wrap(monkeypatch):
+    """Under ``fsdp_scope='model'`` the module compiles its own blocks, then hands off the wrap.
+
+    ``compile_decoder_blocks`` runs before ``fully_shard`` under either scope, so
+    the module is still an ordinary tree here — no scope list, no reading the
+    top-level accelerator. The composed wrap only wraps and loads, which is why
+    it is handed ``CompileConfig(enable=False)``.
+    """
+    import torch.nn as nn
+
+    from veomni.distributed import torch_compile
+
+    seen = {}
+    real = torch_compile.compile_decoder_blocks
+
+    def spy(model, config, **kwargs):
+        seen["enable"] = config.enable
+        seen["dynamic"] = config.dynamic
+        seen["kwargs"] = kwargs
+        return real(model, config, **kwargs)
+
+    monkeypatch.setattr(torch_compile, "compile_decoder_blocks", spy)
+    # the module imports it inside the method, so patch the module it will import
+    import veomni.distributed.torch_compile as tc_mod
+
+    monkeypatch.setattr(tc_mod, "compile_decoder_blocks", spy)
+
+    class Block(nn.Module):
+        def forward(self, x):
+            return x
+
+    class Mod(nn.Module):
+        _no_split_modules = ["Block"]
+        supports_torch_compile = True
+        supports_torch_compile_dynamic = True
+
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([Block()])
+
+    runtime = _unbuilt(Mod())
+    runtime._global_accelerator = _fsdp("model", compile_enable=True, compile_dynamic=True)
+    runtime.args.accelerator = _fsdp("model", compile_enable=True, compile_dynamic=True)
+    runtime._apply_async_activation_offload = lambda: None
+
+    runtime._build_parallelized_model()
+
+    assert seen.get("enable") is True, "the module must compile itself"
+    assert seen.get("dynamic") is True
+    # no scope list: the module is the unit
+    assert "scopes" not in seen.get("kwargs", {})
+    assert seen.get("kwargs", {}).get("all_classes") is True

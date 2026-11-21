@@ -54,6 +54,88 @@ class PretrainedOmniModule(PreTrainedModel):
     #: leaves this ``False``, so the two sides of a handoff can never disagree.
     supports_sp_sharded_handoff: bool = False
 
+    #: Whether this module's blocks may be wrapped by ``torch.compile``.
+    #:
+    #: ``False`` by default. A module sets ``supports_torch_compile = True`` on
+    #: its own class once its compile path has been measured to pay off; the
+    #: flag is the per-module gate, and ``accelerator.torch_compile.enable``
+    #: remains the run-wide switch — a module that opts in is compiled only when
+    #: the run turns compile on, and a module that does not is never compiled.
+    #:
+    #: Measured on A100-80GB, one decoder block per module, forward+backward
+    #: (``dynamic=False``, ``backend="inductor"``; larger is better):
+    #:
+    #: * ``qwen3_llm`` / ``qwen3vl_llm`` / ``janus_llama`` — ~1.32-1.58x. The
+    #:   text backbones are where Inductor's fusion beats eager by the most.
+    #: * ``janus_vqvae`` — ~1.74x over its 37 conv/attention blocks.
+    #: * ``janus_siglip`` — ~1.12x, close to the noise floor for a 4-block
+    #:   tower; kept on because the cost is a one-off compile.
+    #: * ``bagel_siglip_navit`` — ~1.02x, i.e. nothing. Its patch embedding and
+    #:   positional add dominate, so it stays ``False``.
+    #:
+    #: What ``True`` claims: this module's compile path was measured to pay off.
+    #: It does **not** claim the shapes are stable — SeedOmni's collator does no
+    #: padding (``SeedOmniCollator``: "no stacking, no padding"), so a text
+    #: backbone sees a different packed length every step and needs
+    #: :attr:`supports_torch_compile_dynamic` to avoid a fresh Inductor compile
+    #: per new length (measured: 40 distinct lengths cost 362 s with
+    #: ``dynamic=False`` against 13.5 s with ``dynamic=True``). A module whose
+    #: shapes are already fixed by the processor (a tower, a codec) sets that
+    #: flag ``False`` and pays nothing.
+    supports_torch_compile: bool = False
+
+    #: Whether this module's compile path tolerates ``dynamic=True``.
+    #:
+    #: ``dynamic`` lets one Inductor graph cover a range of shapes, which is what
+    #: a multimodal run wants when the packed token count moves between steps.
+    #: It is not free: Inductor emits shape-polymorphic kernels that cost more
+    #: per call, and on a kernel-heavy module the tax can exceed the compile win
+    #: outright. Measured per module (eager / static / dynamic, A100-80GB):
+    #:
+    #: * ``qwen3_llm`` / ``qwen3vl_llm`` / ``janus_llama`` — static and dynamic are
+    #:   indistinguishable (1.00x). Text blocks are a handful of large matmuls;
+    #:   shape polymorphism changes nothing.
+    #: * ``janus_vqvae`` — dynamic is **30% slower** than static (30.7 -> 44.2 ms
+    #:   per step, reproduced three times), i.e. it gives back most of the 1.73x
+    #:   compile win. Its 37 small conv/attention blocks are exactly the shape
+    #:   that pays the polymorphic-kernel tax.
+    #:
+    #: Why the tax exists, from the generated Triton source of the VQ quantiser's
+    #: distance kernel. Static (sizes known, folded at compile time)::
+    #:
+    #:     def triton_red_fused_add_argmin_sub_2(..., xnumel, r0_numel, XBLOCK, R0_BLOCK):
+    #:         tmp3 = tl.load(in_ptr2 + (r0_1 + 8*x0))            # constant stride, no mask
+    #:
+    #: Dynamic (one stride becomes a runtime argument, every access masked)::
+    #:
+    #:     def triton_red_fused_add_argmin_sub_2(..., ks0, xnumel, r0_numel, XBLOCK, R0_BLOCK):
+    #:         xmask = xindex < xnumel                            # per-thread predicate
+    #:         tmp3 = tl.load(in_ptr2 + (r0_1 + ks0*x0),          # runtime multiply per element
+    #:                        r0_mask & xmask, other=0.0)          # two masks ANDed, filled
+    #:
+    #: Four costs follow: the per-element address stops being a compile-time
+    #: constant (``ks0*x0``); every load/store gains a predicate because Inductor
+    #: can no longer prove ``xnumel % XBLOCK == 0`` (its ``tt.divisibility`` table
+    #: loses the ``xnumel`` entry, visible in the generated ``triton_meta``); some
+    #: fusions break, so the same work compiles to more kernels (10 -> 12 loads and
+    #: stores here), each paying a fixed launch; and autotuning must pick one block
+    #: size that is safe for the whole symbolic range rather than the best one.
+    #:
+    #: That is a fixed per-call cost, so it is only visible when kernels are small
+    #: and called often — exactly a codec of many elementwise blocks. Measured on
+    #: the same quantiser kernel at four sizes (dynamic/static): 0.939x at
+    #: 1152x8192, 0.997x at 9216x8192, 0.984x at 36864x16384. Larger and more
+    #: compute-dense, the tax is hidden; a matmul-heavy backbone never sees it
+    #: because cuBLAS handles any shape itself and there is no per-element
+    #: elementwise code to degrade.
+    #:
+    #: So a module whose input shape is fixed by the image processor sets this
+    #: ``False`` — the run-level ``dynamic`` flag is then overridden off for this
+    #: module only, and the other modules keep it. A module whose shape moves
+    #: sets it ``True``; for the text backbones that is not optional, since the
+    #: collator pads nothing (see :attr:`supports_torch_compile`).
+    supports_torch_compile_dynamic: bool = False
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
         """Load weights, then bind module-owned processor / tokenizer sidecars."""
