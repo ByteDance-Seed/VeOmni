@@ -131,23 +131,33 @@ class GroupedLayout:
         return cls(logical, padded, metadata, rows, unpad, groups, ks, _uses_ue8m0(device), is_identity_unpad)
 
 
-_UNIFORM_LAYOUT_CACHE: dict[tuple[int, int, int], GroupedLayout] = {}
-#: Distinct ``(rows, groups)`` shapes a run actually meets. A dense layer is one
-#: group and the same row count every step, and a fused MoE layer's groups all
-#: hold the same per-expert token count, so the cache is small; the cap only
-#: bounds a pathological dynamic-batch schedule.
+_UNIFORM_LAYOUT_CACHE: dict[tuple[int, int, int, int], GroupedLayout] = {}
+#: Distinct ``(rows, groups, device, stream)`` combinations a run actually meets. A
+#: dense layer is one group and the same row count every step, and a fused MoE
+#: layer's groups all hold the same per-expert token count, so the cache is small;
+#: the cap only bounds a pathological dynamic-batch schedule.
 _UNIFORM_LAYOUT_CACHE_LIMIT = 64
 
 
 def get_uniform_layout(n_rows: int, n_groups: int, device: torch.device) -> GroupedLayout:
     """Return a cached :class:`GroupedLayout` for ``n_groups`` groups of ``n_rows`` rows.
 
-    ``from_counts`` reads its counts on the host and JIT-compiles a layout kernel
-    per distinct shape, so a dense projection paying that every step was a visible
+    ``from_counts`` reads its counts on the host and JIT-compiles a layout kernel per
+    distinct shape, so a dense projection paying that every step was a visible
     per-layer cost. The layout depends only on the shape, so caching it is exact.
+
+    The cache key includes the current CUDA stream, because ``_layout_kernel`` writes
+    ``rows`` / ``unpad`` / ``groups`` asynchronously on whatever stream is current
+    when a layout is built. A cache hit hands those tensors back without ordering
+    them against the caller's stream, so a second stream could read them before the
+    first finished writing. Keying by stream keeps same-stream calls on the fast path
+    and makes a cross-stream caller build (and synchronize on) its own layout. No
+    caller in this repository overlaps these rows across streams today; this is what
+    makes that safe rather than accidental.
     """
     index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (n_rows, n_groups, index)
+    stream = torch.cuda.current_stream(index)
+    key = (n_rows, n_groups, index, stream.stream_id)
     cached = _UNIFORM_LAYOUT_CACHE.get(key)
     if cached is not None and cached.rows.device == device:
         return cached

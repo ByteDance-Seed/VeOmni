@@ -68,6 +68,12 @@ from .standard import triton as standard_triton
 #: row and then fail in compilation. ROCm is left as it was; nothing about the
 #: narrowing above says anything about it.
 _GPU_FP8 = GpuKernelRequirement(platforms=(NVIDIA_SM89_PLUS, ROCM_GPU))
+#: The FP4 Triton kernel has no ROCm path: ``triton_fp4_roundtrip`` gates on
+#: ``is_nvidia_cuda_device`` and hands every ROCm input to the eager row, so
+#: advertising ROCm here would let a config select a backend that never runs --
+#: the silent fallback a ``requirement`` exists to prevent. NVIDIA-only until
+#: there is a ROCm kernel. The eager row stays available everywhere.
+_GPU_FP4_TRITON = GpuKernelRequirement(platforms=(NVIDIA_SM89_PLUS,))
 
 register_op(
     "kv_round",
@@ -164,7 +170,7 @@ register_op(
     description=(
         "Triton blockwise FP4 (E2M1 + E4M3 or UE8M0 scale) storage round-trip with straight-through backward"
     ),
-    requirement=_GPU_FP8,
+    requirement=_GPU_FP4_TRITON,
     requires=("triton",),
     default=True,
 )

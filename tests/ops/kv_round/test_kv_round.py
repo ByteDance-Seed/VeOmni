@@ -398,16 +398,39 @@ def test_fp4_preserves_the_sign_of_negative_zero(scale_fmt: str):
     assert not torch.signbit(y[0, 0, 16:]).any()
 
 
-@pytest.mark.parametrize("scale_fmt", ["e4m3", "ue8m0"])
-def test_fp4_saturates_at_six_times_the_block_scale(scale_fmt: str):
-    """E2M1 has a hard top of 6, so a block of huge values clamps rather than wraps."""
+@pytest.mark.parametrize(
+    "scale_fmt, amax, expected",
+    [
+        # ``e4m3`` clamps: the ratio ``amax / 6`` is capped at the format's largest
+        # finite value, 448, so ``1e4 / 448`` clamps to 6 and the block stores
+        # ``6 * 448``. This is real saturation.
+        ("e4m3", 1e4, 6 * 448.0),
+        # ``ue8m0`` cannot saturate the same way, and that is a property of the
+        # format rather than a weaker test: the scale is ``2 ** ceil(log2(amax/6))``,
+        # so ``amax / scale`` always lands in ``[3, 6)`` and the ratio never needs
+        # clamping. ``1e4`` gives scale 2048 and a ratio of 4.88, which rounds to
+        # the E2M1 magnitude 4 -- so ``4 * 2048``, *not* ``6 * 2048``.
+        ("ue8m0", 1e4, 4 * 2048.0),
+        # A ratio of exactly 6 is reachable (``24 / 6 = 4``, a power of two), and
+        # there the block does store the top magnitude, ``6 * 4``.
+        ("ue8m0", 24.0, 6 * 4.0),
+    ],
+)
+def test_fp4_caps_the_stored_magnitude(scale_fmt: str, amax: float, expected: float):
+    """The round trip never stores more than E2M1 can represent, and scales exactly.
+
+    Asserting the expected value, not just "all elements equal": an all-zero result
+    and an unchanged input both satisfy a self-consistency check, and neither is
+    correct. The two formats reach the cap differently -- ``e4m3`` by clamping a
+    ratio above 448, ``ue8m0`` by rounding a ratio that cannot leave ``[3, 6)`` --
+    so each case carries its own number.
+    """
     from veomni.ops.kernels.kv_round.fp4.eager import fp4_roundtrip
 
-    x = torch.full((1, 2, 32), 1e4, dtype=torch.bfloat16)
+    x = torch.full((1, 2, 32), amax, dtype=torch.bfloat16)
     y = fp4_roundtrip(x, block_size=32, scale_fmt=scale_fmt)
-    # A saturated block stores one identical magnitude in every slot.
     assert torch.isfinite(y).all()
-    assert (y == y[..., :1]).all()
+    torch.testing.assert_close(y, torch.full_like(y, expected), rtol=0, atol=0)
 
 
 def test_fp4_rejects_an_unknown_scale_format():
@@ -535,3 +558,12 @@ def test_fp4_triton_row_falls_back_for_a_non_power_of_two_block(device: str, sca
         rtol=0,
         atol=0,
     )
+
+
+def test_fp4_triton_row_accepts_an_empty_operand():
+    """``0 // 0`` raises; an empty operand is legitimate and the eager row accepts it."""
+    from veomni.ops.kernels.kv_round.fp4 import triton as fp4_triton
+
+    x = torch.zeros(2, 0, dtype=torch.bfloat16)
+    out = fp4_triton.triton_fp4_roundtrip(x, block_size=16)
+    assert out.shape == x.shape

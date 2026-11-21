@@ -330,8 +330,9 @@ def test_mhc_cann_head_is_the_eager_math():
 
 
 @pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU")
-@pytest.mark.parametrize("seq_len", [32, 33, 95, 128, 160])
-def test_mhc_tilelang_matches_eager_at_unaligned_sequence_lengths(seq_len: int):
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("seq_len", [33, 95, 160])
+def test_mhc_tilelang_matches_eager_at_unaligned_sequence_lengths(batch: int, seq_len: int):
     """The kernels tile the query axis without a length guard, so the row pads.
 
     A packed dynamic-batch step puts each sample's span wherever it lands, and
@@ -343,9 +344,9 @@ def test_mhc_tilelang_matches_eager_at_unaligned_sequence_lengths(seq_len: int):
     Both directions are checked because they pad differently -- the fused
     inference collapse on 32, ``mhc_pre_norm_fn`` and its backward on 128.
     """
-    torch.manual_seed(seq_len)
+    torch.manual_seed(seq_len * 10 + batch)
     device = torch.device("cuda")
-    batch, hc_mult, hidden = 1, 4, 256
+    hc_mult, hidden = 4, 256
     norm_eps, hc_eps, sinkhorn_iters = 1e-6, 1e-6, 20
     mix = (2 + hc_mult) * hc_mult
     x = torch.randn(batch, seq_len, hc_mult, hidden, device=device, dtype=torch.bfloat16)
@@ -383,12 +384,18 @@ def test_mhc_tilelang_matches_eager_at_unaligned_sequence_lengths(seq_len: int):
 
 
 @pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU")
-@pytest.mark.parametrize("seq_len", [32, 33, 95])
-def test_mhc_tilelang_head_matches_eager_at_unaligned_sequence_lengths(seq_len: int):
-    """The final collapse runs the same unguarded tiling as ``pre``."""
-    torch.manual_seed(seq_len + 1)
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("seq_len", [33, 95])
+def test_mhc_tilelang_head_matches_eager_at_unaligned_sequence_lengths(batch: int, seq_len: int):
+    """The final collapse runs the same unguarded tiling as ``pre``.
+
+    ``batch=2`` is the case a single sample cannot check: padding leaves a gap
+    between the samples, so the trim has to restore each one's own rows rather than
+    a prefix of the flattened buffer.
+    """
+    torch.manual_seed(seq_len * 10 + batch + 1)
     device = torch.device("cuda")
-    batch, hc_mult, hidden = 1, 4, 256
+    hc_mult, hidden = 4, 256
     norm_eps, hc_eps = 1e-6, 1e-6
     x = torch.randn(batch, seq_len, hc_mult, hidden, device=device, dtype=torch.bfloat16)
     fn = torch.randn(hc_mult, hc_mult * hidden, device=device, dtype=torch.float32) * 0.01

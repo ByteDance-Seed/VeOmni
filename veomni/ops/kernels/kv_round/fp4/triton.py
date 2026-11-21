@@ -52,6 +52,10 @@ def triton_fp4_roundtrip(x: Tensor, block_size: int = 16, scale_fmt: str = "e4m3
     last = x.shape[-1]
     if block_size <= 0 or last % block_size != 0:
         raise ValueError(f"last dim {last} is not divisible by FP4 group size {block_size}")
+    if x.numel() == 0:
+        # Bail out before the row count: ``0 // 0`` raises, and an empty operand is a
+        # legitimate input the eager row accepts.
+        return x.clone()
 
     n_rows = x.numel() // last
     if not (

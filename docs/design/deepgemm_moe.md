@@ -13,10 +13,23 @@ All three run native FP8 GEMMs on the tensor cores and implement the existing
 contracts, so they are opt-in and a model's `VeomniOp` handles resolve them
 without a modeling change. They do not require Transformer Engine.
 
-`deepgemm` is not a recipe: it *is* the deployment GEMM. `qat` and `torchao`
-round the operands and multiply in the model dtype, which emulates one. On each
-field the two are different values, so a single GEMM is never rounded twice; across
-fields nothing links them, and a mixed selection is a valid recipe.
+Where `deepgemm` sits among the low-precision rows:
+
+| Row | Arithmetic |
+| --- | --- |
+| `qat` | fake-quantizes the operands, multiplies in the model dtype — emulation |
+| `torchao` `dtype=fp8` | native `aten::_scaled_mm` by default (`emulated=False`); `emulated=True` falls back to fake quantization for hosts below SM89 |
+| `torchao` `dtype=nvfp4` / `mxfp4` | fake quantization (`emulated=True`; native FP4 is not implemented) |
+| `deepgemm` | DeepGEMM's blockwise FP8 **grouped** GEMM, covering forward, dgrad and wgrad |
+
+So `torchao`'s FP8 mode is *not* emulation, and calling it one would misrepresent a
+genuine native path. What distinguishes `deepgemm` is the recipe and the shape it
+covers: 128-wide blockwise tiles driven through DeepGEMM's grouped-GEMM API, with
+dgrad and wgrad on FP8 as well, and one row that serves routed experts, dense
+projections and dense gated MLPs alike.
+
+On each field these are different values, so a single GEMM is never rounded twice;
+across fields nothing links them, and a mixed selection is a valid recipe.
 
 ## Configuration
 
@@ -62,17 +75,24 @@ the MLP **block** plus `activation=`. `deepgemm` validates `dtype` and
 128-wide tiles); accepting another value would let one field mean two formats
 depending on which row the config selected.
 
-MoE-LoRA on routed expert weights is unsupported with `deepgemm`. Both
-shared and independent LoRA wrappers raise before moving the base parameters,
-instead of silently switching to BF16 eager execution. Select a supported
-MoE-LoRA backend such as `fused_triton` on GPU, or exclude expert weights from
-the LoRA targets. This restriction does not apply to LoRA on dense modules.
+LoRA is unsupported on every `deepgemm` row, for one reason: it quantizes the
+weight it multiplies, so it reads `module.weight` instead of calling the module, and
+a wrapped projection keeps the real weight at `base_layer`. The expert path says so
+through the LoRA wrappers, which raise before moving the base parameters; the dense
+families say so through `resolve_projection` / `render`, which refuse a wrapped
+projection. Either way it is a refusal rather than a silent switch to BF16 eager
+execution. For MoE-LoRA select a supported backend such as `fused_triton` on GPU;
+for a dense adapter set `linear_implementation` / `gated_mlp_implementation` to
+`eager`.
 
 The mainline DeepSeek V4 expert module is covered by a real forward/backward
 integration test, using its existing merged weights and FP32 router scores. The
-dense `linear` and `gated_mlp` rows are covered the same way: forward, dgrad and
-wgrad against an independently quantized reference and a BF16 GEMM, at row counts
-that are and are not a multiple of the 128-column alignment.
+dense `linear` rows are covered the same way: forward, dgrad and wgrad compared
+against a BF16 reference GEMM, at row counts that are and are not a multiple of the
+128-column alignment, and forward additionally against an independently quantized
+reference. The `gated_mlp` row has forward against the quantized reference plus a
+separate dgrad/wgrad comparison against a BF16 autocast reference -- its clamped
+forward is not reproduced by the plain reference, so the two checks are split.
 
 All of these tests need SM90/SM100 hardware and `deep_gemm`, so they skip on the
 CPU-only hosts that run part of CI — a green CI run does not by itself prove the
