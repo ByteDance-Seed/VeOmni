@@ -1,0 +1,75 @@
+# LTX-2.3 on 8 × H20.
+# NPROC_PER_NODE=8 bash train.sh tasks/train_dit.py configs/models/ltx2_3/cuda.yaml
+model:
+  model_path: ./LTX-2.3
+  condition_model_path: ./LTX-2.3
+  config_path: configs/model_configs/ltx2_3/ltx2_3_av.json
+  condition_model_cfg:
+    with_audio: true
+    first_frame_conditioning_p: 0.5
+    timestep_sampling_mode: shifted_logit_normal
+  lora_config:
+    rank: 4
+    alpha: 8
+    lora_modules:
+    - to_k
+    - to_v
+    - to_out.0
+  ops_implementation:
+    attn_implementation: sdpa
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    gated_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    moe_implementation: eager
+    load_balancing_loss_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 0.0001
+    lr_decay_style: linear
+    lr_min: 1.0e-05
+    lr_warmup_ratio: 0.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      enable: true
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      offload: true
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        cast_forward_inputs: false
+    offload_config:
+      enable_activation: true
+      activation_gpu_limit: 2.0
+data:
+  train_path: ./data/ltx_latents.parquet
+  data_type: diffusion
+  datasets_type: mapping
+  text_keys: text
+  max_seq_len: 8192
+  dataloader:
+    num_workers: 0
+  data_transform: dit_offline
+train:
+  training_task: offline_training
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+  seed: 42
+  num_train_epochs: 1
+  max_steps: 3
+  checkpoint:
+    output_dir: outputs/ltx2_3/cuda
+    manager: dcp
+    save_steps: 3
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+  profile:
+    enable: false
