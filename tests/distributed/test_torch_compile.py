@@ -1191,6 +1191,16 @@ def test_compile_rejects_torchao_mxfp4(field):
     with pytest.raises(RuntimeError, match=rf"{field}=torchao\(dtype='mxfp4'\)"):
         _reject_incompatible_ops(_model_with_ops(**{field: override_selection}))
 
+    chained_override = OpsSelection(
+        name="eager",
+        overrides=[
+            SiteOverride(site=r"layers\.0\.q_proj", name="torchao"),
+            SiteOverride(site=r"layers\.0\.q_proj", kwargs={"dtype": "mxfp4"}),
+        ],
+    )
+    with pytest.raises(RuntimeError, match=rf"{field}=torchao\(dtype='mxfp4'\)"):
+        _reject_incompatible_ops(_model_with_ops(**{field: chained_override}))
+
 
 @pytest.mark.parametrize(
     "ops_fields",
