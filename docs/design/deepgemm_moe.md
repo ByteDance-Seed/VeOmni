@@ -40,8 +40,15 @@ same function under its other name, so both are served. Anything else — `gelu`
 `gelu_new`, `relu` — has no fused row to run. `render` refuses the selection and
 names `eager` as the way to keep the fallback, so such a model selects
 `gated_mlp_implementation: eager` and trains that family in the model dtype. Teaching
-the kernel another activation is tracked in #1430. The `linear` and `moe_experts`
-rows have no such limit — they take no activation.
+the kernel another activation is tracked in #1430.
+
+The routed experts have the same restriction for the same reason. `moe_experts`
+rows take `activation=` too, and `deepgemm` refuses anything `is_silu` rejects
+(`silu` / `swish`), because its grouped GEMM also fuses the activation — the error
+names the activation and says the FP8 GEMM would have to be dropped to substitute
+another.
+
+`linear` is the one row among the three with no such limit: it takes no activation.
 
 ## Configuration
 
@@ -112,13 +119,18 @@ for a dense adapter set `linear_implementation` / `gated_mlp_implementation` to
 `eager`.
 
 The mainline DeepSeek V4 expert module is covered by a real forward/backward
-integration test, using its existing merged weights and FP32 router scores. The
-dense `linear` rows are covered the same way: forward, dgrad and wgrad compared
-against a BF16 reference GEMM, at row counts that are and are not a multiple of the
-128-column alignment, and forward additionally against an independently quantized
-reference. The `gated_mlp` row has forward against the quantized reference plus a
-separate dgrad/wgrad comparison against a BF16 autocast reference -- its clamped
-forward is not reproduced by the plain reference, so the two checks are split.
+integration test, using its existing merged weights and FP32 router scores.
+
+The dense `linear` rows are covered in two places, and the two compare against
+different things: **forward** against an independently re-quantized reference (the
+values a deployment FP8 GEMM would produce), and **dgrad / wgrad** against a BF16
+reference GEMM (the operands are quantized, so a straight FP8 reference would only
+reproduce the same rounding). Row counts include one divisible and one not divisible
+by the 128-column alignment.
+
+The `gated_mlp` row splits the same way for a different reason: its clamp means the
+plain BF16 reference does not reproduce the forward, so forward is checked against
+the quantized reference and dgrad / wgrad against a BF16 autocast reference.
 
 All of these tests need SM90/SM100 hardware and `deep_gemm`, so they skip on the
 CPU-only hosts that run part of CI — a green CI run does not by itself prove the

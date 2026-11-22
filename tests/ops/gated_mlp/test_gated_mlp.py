@@ -1253,3 +1253,25 @@ def test_the_row_states_which_activations_it_serves():
     # ``swish`` is ``ACT2FN``'s alias for SiLU, so a SiLU kernel serves it; a set
     # without it would send those models down the unquantized path for nothing.
     assert declared == frozenset({"silu", "swish"})
+
+
+def test_the_routed_expert_row_has_the_same_activation_restriction():
+    """`moe_experts` rows take `activation=` too, so `linear` is the only row without one.
+
+    The doc claimed the routed experts "take no activation", which would imply no
+    restriction on them. They do take it, and `deepgemm` refuses anything outside
+    `{silu, swish}` because its grouped GEMM fuses the activation as well.
+    """
+    import inspect
+
+    from veomni.ops.kernels.moe_experts.shared.activation import is_silu
+    from veomni.ops.kernels.moe_experts.standard import deepgemm as moe_deepgemm
+
+    assert "activation" in inspect.signature(moe_deepgemm.wrapper).parameters
+    assert is_silu("silu") and is_silu("swish")
+    assert not is_silu("gelu")
+
+    # `linear` is the one row with no activation argument.
+    from veomni.ops.kernels.linear.standard import deepgemm as linear_deepgemm
+
+    assert "activation" not in inspect.signature(linear_deepgemm.wrapper).parameters
