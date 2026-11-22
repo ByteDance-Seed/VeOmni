@@ -90,14 +90,17 @@ def test_per_site_op_selection_and_overrides(monkeypatch):
         assert (h1.kwargs, h3.kwargs) == ({"block_size": 128}, {"block_size": 64})
         assert pickle.loads(pickle.dumps(h3)) is h3
 
-        # Structured dict/list kwargs intern safely; genuinely unhashable values bypass interning without raising.
-        struct_sel = OpsSelection(name="test_round", kwargs={"options": {"scale": 2, "axes": [0, 1]}})
-        hs1 = VeomniOp("linear", "standard", struct_sel)
+        # Mutable/unhashable kwargs bypass interning so construction does not raise TypeError
+        # and post-construction nested mutations cannot poison later handles.
+        opts = {"scale": 2, "axes": [0, 1]}
+        hs1 = VeomniOp("linear", "standard", OpsSelection(name="test_round", kwargs={"options": opts}))
+        opts["scale"] = 99
+        opts["axes"].append(2)
         hs2 = VeomniOp(
-            "linear", "standard", OpsSelection(name="test_round", kwargs={"options": {"axes": [0, 1], "scale": 2}})
+            "linear", "standard", OpsSelection(name="test_round", kwargs={"options": {"scale": 2, "axes": [0, 1]}})
         )
-        assert hs1 is hs2
-        assert hs1.kwargs == {"options": {"scale": 2, "axes": [0, 1]}}
+        assert hs1 is not hs2
+        assert hs2.kwargs == {"options": {"scale": 2, "axes": [0, 1]}}
 
         class _Unhashable:
             __hash__ = None
