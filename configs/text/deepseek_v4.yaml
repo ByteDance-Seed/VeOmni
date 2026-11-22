@@ -24,7 +24,8 @@ model:
     gated_mlp_implementation: liger_kernel
     rotary_pos_emb_implementation: triton
   optimizer:
-    # Muon + AdamW: 2D hidden / 3D expert stacks use Muon; embed/lm_head/norms/bias use AdamW.
+    # Muon + AdamW: 2D hidden / 3D expert stacks use Muon; embed/lm_head/norms/bias and
+    # routing/gating matrices (mHC, `gate`, `weights_proj`, compressor gates) use AdamW.
     # Switch back with `type: adamw` if needed.
     type: muon
     lr: 3.0e-4

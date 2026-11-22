@@ -41,7 +41,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _llama_classes():
-    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import (
+    from veomni.models.transformers.llama.modeling_llama import (
         LlamaForCausalLM,
         LlamaForSequenceClassification,
         LlamaForTokenClassification,
@@ -58,7 +58,7 @@ def _build_ours(config: LlamaConfig, ops: SimpleNamespace | None = None):
 
 
 def test_llama_rope_reads_selected_impl(monkeypatch, selected_rope_impl):
-    from veomni.models.transformers.llama.generated import patched_modeling_llama_gpu as modeling
+    from veomni.models.transformers.llama import modeling_llama as modeling
 
     selected: list[tuple[str, str, str]] = []
 

@@ -201,6 +201,34 @@ Its `attn_implementation` argument is forwarded to every module build, so an
 explicit selection (for example `eager` on a host without flash-attn) is recorded
 in the exported module config; leave it unset to keep each config's default.
 
+## Extension hooks and family detection
+
+`OmniHFLayout` provides two lifecycle hooks for checkpoint-specific behavior:
+
+- `resolve_source_path(source_path)` runs when the source is canonicalized by
+  `HFSource.from_path`. It returns the root used for config, assets, weights,
+  and export; the default returns the input unchanged. A layout can override
+  it when the user-facing path is an alias or points at a nested release root.
+- `validate_module_state(source_path, name, model)` runs when a module
+  is attached to an HF source, before either loader reads its weights. The
+  module may still be on `meta`, so the default no-op hook is for validating
+  source/layout compatibility, not for inspecting loaded tensor values or
+  post-load normalization. It should raise a descriptive exception when the
+  source state is incompatible.
+
+The generic resolver does not import a concrete family. For releases whose
+root `config.json` does not identify the model, a family registers a detector
+in `OMNI_HF_LAYOUT_DETECTORS` next to its layout. A detector receives the
+candidate checkpoint path and returns the registered `model_type` string when
+it recognizes the directory, or `None` otherwise. It must only inspect the
+layout's identifying files and must not load model weights. The resolver uses
+that result to select the registered `OmniHFLayout`; an unrecognized path is
+left as a regular split checkpoint or rejected later by the normal validation.
+
+The hooks are family-owned extensions: keep the generic behavior in
+`veomni/models/seed_omni/utils/hf_layout.py`, and register a detector/layout
+from the family's module package so importing SeedOmni modules makes it
+available to loading, offline conversion, and HF export.
 ## Rules
 
 - Prefixes rename only. A module may still reshape, fuse or split tensors in
