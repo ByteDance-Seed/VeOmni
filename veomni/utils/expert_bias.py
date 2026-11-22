@@ -232,7 +232,7 @@ class ExpertBiasUpdater:
         self._counts = None
 
 
-def ensure_lora_can_carry_the_bias(lora_config: Optional[dict], attached_routers: int) -> None:
+def ensure_lora_can_carry_the_bias(lora_config: Optional[dict], num_routers: int) -> None:
     """Reject a LoRA run that would train a bias no adapter file can carry.
 
     ``e_score_correction_bias`` is a registered buffer on every router this
@@ -251,14 +251,15 @@ def ensure_lora_can_carry_the_bias(lora_config: Optional[dict], attached_routers
     portable adapter, which is the point of training with LoRA, that cannot
     represent the result.
 
-    Checked after ``attach`` rather than at config-parse time so it stays
-    architecture-aware: a dense model has no such routers, and a rate set on
-    one is already handled by disabling the update with a warning.
+    Checked once the routers are known, before ``attach`` installs any hook,
+    rather than at config-parse time so it stays architecture-aware: a dense
+    model has no such routers, and a rate set on one is already handled by
+    disabling the update with a warning.
     """
-    if attached_routers > 0 and lora_config:
+    if num_routers > 0 and lora_config:
         raise ValueError(
             "moe_router_bias_update_rate > 0 cannot be combined with LoRA. The update writes "
-            f"'{BIAS_ATTR}' on {attached_routers} router module(s), which the routers register as "
+            f"'{BIAS_ATTR}' on {num_routers} router module(s), which the routers register as "
             "a buffer, while the adapter export collects named_parameters() only. The trained "
             "routing state would be dropped from the exported adapter, and reloading it against "
             "its original base would route differently with nothing to show for it. Set the rate "

@@ -279,6 +279,22 @@ def test_the_bias_update_is_rejected_together_with_lora():
     ensure_lora_can_carry_the_bias(None, attached)
 
 
+def test_lora_rejection_leaves_no_hooks_on_the_model():
+    from veomni.trainer.callbacks.trace_callback import ExpertBiasCallback
+
+    model = ModelWithRouter()
+    args = SimpleNamespace(
+        train=SimpleNamespace(moe_router_bias_update_rate=0.1),
+        model=SimpleNamespace(lora_config={"lora_rank": 8}),
+    )
+    callback = ExpertBiasCallback(SimpleNamespace(args=args, model=model))
+
+    with pytest.raises(ValueError, match="cannot be combined with LoRA"):
+        callback.on_train_begin(None)
+
+    assert not model.routers[0]._forward_hooks
+
+
 def test_routers_of_different_widths_update_independently():
     """Each router balances against its own expert count and its own mean."""
     model = nn.Module()

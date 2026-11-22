@@ -62,10 +62,10 @@ class ExpertBiasCallback(Callback):
         if self.updater is None:
             return
 
-        from ...utils.expert_bias import ensure_lora_can_carry_the_bias
+        from ...utils.expert_bias import ensure_lora_can_carry_the_bias, find_bias_routers
 
-        attached = self.updater.attach(self.trainer.model)
-        if attached == 0:
+        routers = find_bias_routers(self.trainer.model)
+        if not routers:
             logger.warning_rank0(
                 "moe_router_bias_update_rate > 0 but no router carrying "
                 "'e_score_correction_bias' was found in the model. The auxiliary-loss-free "
@@ -73,13 +73,15 @@ class ExpertBiasCallback(Callback):
             )
             self.updater.disable()
             self.updater = None
-        else:
-            # Only once routers are known: a LoRA adapter cannot carry these
-            # buffers, so the pair is rejected here rather than at config time,
-            # where a dense model would be rejected for a knob that does not
-            # apply to it.
-            ensure_lora_can_carry_the_bias(self.trainer.args.model.lora_config, attached)
-            logger.info_rank0(f"Expert bias update: attached to {attached} router module(s).")
+            return
+
+        # Before attach, so a rejected run leaves no hooks on the model. Only
+        # once routers are known: a LoRA adapter cannot carry these buffers, so
+        # the pair is rejected here rather than at config time, where a dense
+        # model would be rejected for a knob that does not apply to it.
+        ensure_lora_can_carry_the_bias(self.trainer.args.model.lora_config, len(routers))
+        attached = self.updater.attach(self.trainer.model)
+        logger.info_rank0(f"Expert bias update: attached to {attached} router module(s).")
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         if self.updater is None:
