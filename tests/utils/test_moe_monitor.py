@@ -38,6 +38,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 
 from veomni.utils import moe_monitor
+from veomni.utils.device import get_device_type, get_torch_device
 from veomni.utils.moe_monitor import (
     EXTERNAL_RECORD_ROUTERS,
     ROUTER_EXTRACTORS,
@@ -531,11 +532,11 @@ def test_qwen3_5_router_reuses_qwen_tuple_extractor():
     assert ROUTER_EXTRACTORS["Qwen3_5MoeTopKRouter"](output) is indices
 
 
-def _register_router_counts(monitor: MoERouterMonitor, num_layers: int = 1) -> list[nn.Module]:
+def _register_router_counts(monitor: MoERouterMonitor, num_layers: int = 1, *, device: str = "cpu") -> list[nn.Module]:
     routers = [nn.Identity() for _ in range(num_layers)]
     for layer_index, router in enumerate(routers):
         monitor._register_layer(router)
-        monitor.record(router, torch.tensor([[layer_index % monitor.num_experts]], dtype=torch.long))
+        monitor.record(router, torch.tensor([[layer_index % monitor.num_experts]], dtype=torch.long, device=device))
     return routers
 
 
@@ -634,10 +635,16 @@ def test_ep_balance_metrics_accumulate_exact_formulas_keys_and_reset(monkeypatch
     assert not any("/ep_" in key for key in second_interval)
 
 
-def test_ep_balance_accumulates_on_host_before_snapshot_transfer():
+@pytest.mark.parametrize("accelerated", [False, True], ids=["cpu", "accelerator"])
+def test_ep_balance_accumulates_on_host_before_snapshot_transfer(accelerated):
+    device = get_device_type() if accelerated else "cpu"
+    if accelerated and (device == "cpu" or not get_torch_device().is_available()):
+        pytest.skip("Snapshot transfer requires an available accelerator")
+
     monitor = MoERouterMonitor(num_experts=4)
-    routers = _register_router_counts(monitor)
+    routers = _register_router_counts(monitor, device=device)
     count_device = monitor._counts[id(routers[0])].device
+    assert count_device.type == device
     monitor.record_ep_balance(0, (4, 0), (2, 2), 1, 2)
     assert monitor._ep_rank_loads_before[0].device.type == "cpu"
     assert monitor._ep_rank_loads_after[0].device.type == "cpu"
