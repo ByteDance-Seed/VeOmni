@@ -22,6 +22,7 @@ logger = logging.get_logger(__name__)
 
 ENV_DEFAULTS = {
     "MODELING_BACKEND": "veomni",
+    "VEOMNI_NPU_CHUNK_LOSS_EMPTY_CACHE": "0",
 }
 
 

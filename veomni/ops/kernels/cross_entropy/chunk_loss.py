@@ -15,7 +15,8 @@
 """Chunked cross-entropy loss for causal LM heads.
 
 Composes ``F.linear`` and ``eager_cross_entropy`` on CUDA and Ascend NPU.
-NPU reclaims unused allocator cache before computing the loss. Selected via
+Set ``VEOMNI_NPU_CHUNK_LOSS_EMPTY_CACHE=1`` to opt into NPU cache reclamation
+before the loss for allocator fragmentation investigations. Selected via
 ``OpsImplementationConfig.cross_entropy_loss_implementation == "chunk_loss"``
 (the default); ``"npu"`` is kept as a back-compat alias for the same kernel.
 
@@ -37,6 +38,7 @@ import torch.nn.functional as F
 
 from ....distributed.parallel_state import get_parallel_state
 from ....distributed.sequence_parallel import reduce_sequence_parallel_loss
+from ....utils.env import get_env
 from .eager import eager_cross_entropy
 
 
@@ -97,8 +99,7 @@ def chunk_loss_function(
     shift_labels: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
-    # Reclaim inactive NPU cache once before allocating loss workspaces.
-    if hidden_states.device.type == "npu":
+    if hidden_states.device.type == "npu" and get_env("VEOMNI_NPU_CHUNK_LOSS_EMPTY_CACHE") == "1":
         torch.npu.empty_cache()
 
     sp_enabled = get_parallel_state().sp_enabled
