@@ -31,6 +31,16 @@ projections and dense gated MLPs alike.
 On each field these are different values, so a single GEMM is never rounded twice;
 across fields nothing links them, and a mixed selection is a valid recipe.
 
+### One restriction: the gated MLP is SiLU-only
+
+`gated_mlp_implementation: deepgemm` cannot serve a model whose `hidden_act` is not
+SiLU. Its Triton kernel fuses `aten.silu` and `aten.silu_backward` into the grouped
+GEMM's forward and backward, so `gelu` (or anything else) has no kernel to run.
+`render` refuses the selection and names `eager` as the way to keep the fallback, so
+a GELU model selects `gated_mlp_implementation: eager` and trains that family in the
+model dtype. Teaching the kernel another activation is tracked in #1430. The `linear`
+and `moe_experts` rows have no such limit -- they take no activation.
+
 ## Configuration
 
 For a model using the standard gated-expert contract:

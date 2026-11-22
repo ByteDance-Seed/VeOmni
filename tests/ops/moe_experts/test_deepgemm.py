@@ -713,7 +713,14 @@ def test_linear_row_backward_matches_a_bf16_reference():
 
 
 def test_grouped_linear_row_matches_a_per_group_bmm():
-    """The grouped row permutes to group-major, GEMMs, and permutes back."""
+    """The grouped row permutes to group-major, GEMMs, and permutes back.
+
+    Covers both row counts: 128 is a multiple of the 128-column alignment (so the
+    per-group layout is the identity) and 130 is not, which is where the padding and
+    the unpad round trip have to line up. dgrad and wgrad are compared against a
+    BF16 reference, not merely checked for finiteness -- the permute round trip is
+    exactly the place a silently transposed or truncated gradient would hide.
+    """
     from deep_gemm.testing import calc_diff
 
     from veomni.ops import VeomniOp
@@ -727,20 +734,35 @@ def test_grouped_linear_row_matches_a_per_group_bmm():
 
     torch.manual_seed(103)
     # ``out_per_group`` must be a multiple of 128; 192 is not and the row refuses it.
-    n_groups, in_per_group, out_per_group, n_rows = 4, 256, 256, 130
-    linear = _Grouped(in_per_group, n_groups, out_per_group).cuda().to(torch.bfloat16)
-    x = torch.randn(n_rows, n_groups, in_per_group, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    out = VeomniOp("linear", "grouped", "deepgemm")(linear, x)
+    n_groups, in_per_group, out_per_group = 4, 256, 256
+    for n_rows in (128, 130):
+        linear = _Grouped(in_per_group, n_groups, out_per_group).cuda().to(torch.bfloat16)
+        linear.weight.data.mul_(0.05)
+        x = torch.randn(n_rows, n_groups, in_per_group, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        out = VeomniOp("linear", "grouped", "deepgemm")(linear, x)
+        assert out.shape == (n_rows, n_groups, out_per_group)
 
-    assert out.shape == (n_rows, n_groups, out_per_group)
-    reference = torch.bmm(
-        _quantized_rows(x.reshape(-1, in_per_group)).reshape(n_rows, n_groups, in_per_group).transpose(0, 1),
-        _quantized_weight(linear.weight).view(n_groups, out_per_group, in_per_group).transpose(1, 2),
-    ).transpose(0, 1)
-    assert calc_diff(out, reference.bfloat16()) < 0.001
+        reference = torch.bmm(
+            _quantized_rows(x.reshape(-1, in_per_group)).reshape(n_rows, n_groups, in_per_group).transpose(0, 1),
+            _quantized_weight(linear.weight).view(n_groups, out_per_group, in_per_group).transpose(1, 2),
+        ).transpose(0, 1)
+        assert calc_diff(out, reference.bfloat16()) < 0.001, f"forward {n_rows}"
 
-    (dx,) = torch.autograd.grad(out.sum(), x)
-    assert dx.shape == x.shape and torch.isfinite(dx).all()
+        grad = torch.randn_like(out)
+        dx, dw = torch.autograd.grad(out, (x, linear.weight), grad)
+        assert dx.shape == x.shape and dw.shape == linear.weight.shape
+        # BF16 autocast reference over the same grouped layout, so the comparison
+        # exercises the permute-back rather than a dense product that happens to
+        # share the shapes.
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            xr = x.detach().clone().requires_grad_(True)
+            wr = linear.weight.detach().clone().requires_grad_(True)
+            grouped = xr.reshape(n_rows, n_groups, in_per_group).transpose(0, 1)
+            ref = torch.bmm(grouped, wr.view(n_groups, out_per_group, in_per_group).transpose(1, 2))
+            ref = ref.transpose(0, 1).reshape(n_rows, n_groups, out_per_group)
+            rdx, rdw = torch.autograd.grad(ref, (xr, wr), grad)
+        assert calc_diff(dx, rdx.bfloat16()) < 0.01, f"dgrad {n_rows}"
+        assert calc_diff(dw, rdw.bfloat16()) < 0.01, f"wgrad {n_rows}"
 
 
 def test_gated_mlp_row_backward_matches_a_bf16_reference():

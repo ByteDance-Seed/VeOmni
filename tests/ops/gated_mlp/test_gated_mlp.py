@@ -1230,3 +1230,23 @@ def test_the_deepgemm_row_refuses_an_activation_its_kernel_cannot_fuse():
     mlp.down_proj = nn.Linear(384, 256, bias=False)
     with pytest.raises(ValueError, match="no quantizing row evaluates that activation"):
         deepgemm.wrapper(mlp, torch.randn(2, 256), activation="gelu")
+
+
+def test_the_documented_activation_restriction_matches_the_code():
+    """A GELU model cannot select this row, and the docs say so.
+
+    Pins the pair: ``ROW_ACTIVATIONS`` decides what ``render`` allows, and
+    ``deepgemm_moe.md`` states the same set. A change to one without the other is
+    what this catches.
+    """
+    import pathlib
+
+    from veomni.ops.kernels.gated_mlp._module import ROW_ACTIVATIONS
+
+    allowed = ROW_ACTIVATIONS["deepgemm"]
+    assert allowed == frozenset({"silu", "swish"})
+    assert "gelu" not in allowed
+
+    doc = (pathlib.Path(__file__).resolve().parents[3] / "docs/design/deepgemm_moe.md").read_text()
+    assert "SiLU-only" in doc or "SiLU only" in doc
+    assert "gated_mlp_implementation: eager" in doc
