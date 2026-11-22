@@ -37,7 +37,13 @@ from veomni.distributed.async_offload import (
     get_offload_modules,
     reset_async_activation_offload,
 )
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
+from veomni.utils.device import (
+    IS_CUDA_AVAILABLE,
+    IS_NPU_AVAILABLE,
+    get_device_type,
+    get_torch_device,
+    is_nvidia_cuda_device,
+)
 
 
 _CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
@@ -396,9 +402,94 @@ def test_launch_d2h_gates_record_stream_on_deferred_free(monkeypatch):
     assert swap_owned.d2h_event.synced == 0
 
 
+def test_release_host_buffer_syncs_abandoned_d2h_without_deferred_free(monkeypatch):
+    """Dropping an in-flight ``d2h`` wrapper without ``record_stream`` must sync before releasing."""
+    from contextlib import nullcontext
+
+    from veomni.distributed import async_offload
+
+    class _FakeEvent:
+        def __init__(self):
+            self.synced = 0
+
+        def record(self):
+            pass
+
+        def synchronize(self):
+            self.synced += 1
+
+    class _FakeStream:
+        def wait_event(self, _event):
+            pass
+
+    monkeypatch.setattr(async_offload, "create_event", _FakeEvent)
+    monkeypatch.setattr(async_offload, "switch_to_specified_stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, _s: None)
+
+    stream = _FakeStream()
+
+    # Non-deferred path: abandoned forward graph (stat == "d2h") must sync d2h_event.
+    monkeypatch.setattr(async_offload, "is_caching_allocator_active", lambda: False)
+    pool_sync = PinnedBufferPool(max_cached_bytes=1 << 20)
+    swap_sync = SwapTensor(torch.arange(4.0), "0_0", pool_sync)
+    host_buf_sync = swap_sync.tensor_cpu
+    swap_sync.launch_d2h(stream)
+    assert swap_sync.stat == "d2h"
+    assert swap_sync._deferred_free is False
+    swap_sync.release_host_buffer()
+    assert swap_sync.d2h_event.synced == 1
+    assert "_last_swap_event" not in host_buf_sync.__dict__
+
+    # Native deferred path: abandoned forward graph skips host sync and keeps the tag for pool reuse.
+    monkeypatch.setattr(async_offload, "is_caching_allocator_active", lambda: True)
+    pool_async = PinnedBufferPool(max_cached_bytes=1 << 20)
+    swap_async = SwapTensor(torch.arange(4.0), "0_1", pool_async)
+    host_buf_async = swap_async.tensor_cpu
+    swap_async.launch_d2h(stream)
+    assert swap_async.stat == "d2h"
+    assert swap_async._deferred_free is True
+    swap_async.release_host_buffer()
+    assert swap_async.d2h_event.synced == 0
+    assert host_buf_async.__dict__.get("_last_swap_event") is swap_async.d2h_event
+
+
+def test_release_host_buffer_does_not_double_release_if_pool_raises():
+    """If ``pool.release`` raises after caching the buffer, a second release must be a no-op."""
+    pool = PinnedBufferPool(max_cached_bytes=16)
+
+    class _FailingEvent:
+        def synchronize(self):
+            raise RuntimeError("evicted sync failed")
+
+    # Pre-populate pool with a different-shaped 16B buffer whose eviction sync will raise.
+    evict_buf, evict_key = pool.acquire(torch.empty((2, 2), dtype=torch.float32))
+    evict_buf._last_swap_event = _FailingEvent()
+    pool.release(evict_buf, evict_key)
+
+    swap = SwapTensor(torch.arange(4.0), "0_0", pool)
+    cached_buf = swap.tensor_cpu
+    release_calls = []
+    orig_release = pool.release
+
+    def _tracking_release(buf, key):
+        release_calls.append(buf)
+        return orig_release(buf, key)
+
+    pool.release = _tracking_release
+
+    with pytest.raises(RuntimeError, match="evicted sync failed"):
+        swap.release_host_buffer()
+
+    assert swap._host_buffer_released is True
+    assert swap.tensor_cpu is None
+    # Calling release_host_buffer again (as __del__ would) must not re-insert cached_buf.
+    swap.release_host_buffer()
+    assert release_calls == [cached_buf]
+
+
 @pytest.mark.skipif(
-    not IS_CUDA_AVAILABLE,
-    reason="CUDA is required for cudaMallocAsync external-storage regression test",
+    not (IS_CUDA_AVAILABLE and is_nvidia_cuda_device(get_device_type())),
+    reason="NVIDIA CUDA is required for cudaMallocAsync external-storage regression test",
 )
 def test_launch_d2h_external_cuda_storage_under_cuda_malloc_async():
     """External DLPack CUDA storage under ``cudaMallocAsync`` must offload via host sync without failing ``recordStream``."""

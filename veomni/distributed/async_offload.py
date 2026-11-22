@@ -304,19 +304,28 @@ class SwapTensor:
         self.h2d_event = create_event()
 
     def release_host_buffer(self):
-        """Hand the host buffer back to the pool, tagging an in-flight H2D source.
+        """Hand the host buffer back to the pool, ordering any unguarded D2H source.
 
-        Never waits: a buffer that may still be the destination of a D2H copy is
-        tagged with that copy's event, and :class:`PinnedBufferPool` waits on the
-        tag when it hands the buffer to a new owner or drops/evicts it.
+        Never waits on the native deferred-free path: a buffer that may still be
+        the destination of a D2H copy or source of an H2D copy is tagged with that
+        copy's event, and :class:`PinnedBufferPool` waits on the tag when it hands
+        the buffer to a new owner or drops/evicts it. When ``launch_d2h`` skipped
+        ``record_stream`` (``not self._deferred_free``) and the wrapper is torn
+        down while still in ``"d2h"`` (e.g. an abandoned forward graph), we
+        synchronize ``d2h_event`` here before the device tensor's last reference
+        drops so the in-flight copy cannot read freed device memory.
         """
         if self._host_buffer_released or self.tensor_cpu is None:
             return
-        if self.stat == "h2d":
-            self.tensor_cpu._last_swap_event = self.h2d_event
-        self.pool.release(self.tensor_cpu, self._host_buffer_key)
+        if self.stat == "d2h" and not self._deferred_free:
+            self.d2h_event.synchronize()
+            self.tensor_cpu.__dict__.pop("_last_swap_event", None)
+        buffer, key = self.tensor_cpu, self._host_buffer_key
         self.tensor_cpu = None
         self._host_buffer_released = True
+        if self.stat == "h2d":
+            buffer._last_swap_event = self.h2d_event
+        self.pool.release(buffer, key)
 
     def __del__(self):
         try:
