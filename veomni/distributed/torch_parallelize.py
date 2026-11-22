@@ -59,6 +59,29 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
         _reset_hf_initialized_flag(child)
 
 
+def to_empty_preserving_spec_info(model: nn.Module, device: str | torch.device) -> None:
+    """``model.to_empty(device)`` without dropping the parallel plan's metadata.
+
+    ``to_empty`` rebuilds every ``Parameter`` object, so the ``spec_info`` a
+    parallel plan attached to the meta parameters is gone afterwards. Without it
+    a plan shard looks like a plain local tensor, and the optimizer then treats
+    rows that differ per rank as a replica -- averaging them in the gradient clip
+    and the step, which corrupts every ExtraParallel update.
+
+    Every loader that materializes a model *after* the plan was applied must go
+    through here rather than calling ``to_empty`` directly.
+    """
+    spec_infos = {
+        name: spec_info for name, param in model.named_parameters() if (spec_info := getattr(param, "spec_info", None))
+    }
+    model.to_empty(device=device)
+    if not spec_infos:
+        return
+    for name, param in model.named_parameters():
+        if name in spec_infos:
+            param.spec_info = spec_infos[name]
+
+
 def _to_empty_preserving_nonpersistent_buffers(
     model: nn.Module, device: str, preserve_persistent_buffers: bool = False
 ) -> None:
@@ -96,19 +119,9 @@ def _to_empty_preserving_nonpersistent_buffers(
                 continue
             buffers.append((module, name, buffer.detach().clone()))
 
-    # ``to_empty`` rebuilds every Parameter object, so the ``spec_info`` the
-    # parallel plan attached to the meta parameters is gone afterwards. Keep it
-    # by name and re-attach: without it a plan shard looks like a plain local
-    # tensor, and the optimizer then treats rows that differ per rank as a
-    # replica (averaging them in the gradient clip / step).
-    spec_infos = {
-        name: spec_info for name, param in model.named_parameters() if (spec_info := getattr(param, "spec_info", None))
-    }
-    model.to_empty(device=device)
-    if spec_infos:
-        for name, param in model.named_parameters():
-            if name in spec_infos:
-                param.spec_info = spec_infos[name]
+    # Buffers first, then materialize through the spec_info-preserving helper:
+    # the plan runs before this load, so its metadata has to survive it.
+    to_empty_preserving_spec_info(model, device)
 
     for module, name, buffer in buffers:
         materialized_buffer = module._buffers[name]

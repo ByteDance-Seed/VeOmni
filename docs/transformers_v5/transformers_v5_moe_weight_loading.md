@@ -160,13 +160,23 @@ and hands the pair to `convert_rows`. A key outside every ExtraParallel plan is
 read whole, together with its whole companion.
 
 `can_handle_tensor` still receives the **raw** tensor, because claiming a key by
-content is how a quantized dense weight is recognised at all. What differs is
-what happens next: a dense (non-ExtraParallel) key is read whole and handed to
-`maybe_convert_checkpoint_tensor`, so its content-claimed conversion runs
-normally; only on the **sharded** path, where the loader has already sliced the
-tensor and cannot run a whole-tensor conversion, does a content-claimed key raise
-instead of reaching the parameter raw. Do not disable `ep_sharded_stream_load`
-for a supported dense conversion — it is not affected.
+content is how a quantized dense weight is recognised at all. What happens next
+depends on the path, and there are three:
+
+- **Dense, not sharded**: read whole and handed to
+  `maybe_convert_checkpoint_tensor`, so its content-claimed conversion runs
+  normally.
+- **Sharded, with a row-wise companion**: the loader reads the matching row range
+  of the key and its companion and calls `convert_rows`, which *is* the
+  conversion — so the `can_handle_tensor` refusal is skipped, because the tensor
+  is already converted.
+- **Sharded, without a companion**: the loader has only a slice and cannot run a
+  whole-tensor conversion, so a content-claimed key raises instead of reaching
+  the parameter raw.
+
+So a supported dense conversion does not need `ep_sharded_stream_load` disabled,
+and neither does a row-sharded table that declares a companion. Only a sharded key
+with no companion and a content-claimed conversion is refused.
 
 ### Saving (VeOmni modeling -> checkpoint)
 

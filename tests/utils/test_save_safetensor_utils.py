@@ -962,6 +962,48 @@ class TestLegacySaveModelWeights(unittest.TestCase):
         self.assertIs(getattr(model.embed_tokens.weight, "spec_info", None), spec)
         self.assertFalse(getattr(model.linear.weight, "spec_info", None))
 
+    def test_every_loader_materializes_through_the_spec_info_preserving_helper(self):
+        """The three HF loaders must not call `to_empty` bare.
+
+        They materialize *after* the parallel plan tagged the model's meta
+        parameters, and a bare `to_empty` rebuilds each `Parameter`, dropping the
+        tag -- after which the optimizer averages plan shards as replicas. Asserted
+        on the source because the alternative is a full pretrained checkpoint per
+        loader; the helper's own behaviour has the test above.
+        """
+        import inspect
+
+        import veomni.models.checkpoint.weights as weights
+
+        for fn in (
+            weights.load_model_weights,
+            weights.load_model_weights_ep_sharded,
+            weights.rank0_load_and_broadcast_weights,
+        ):
+            source = inspect.getsource(fn)
+            self.assertNotIn("model.to_empty(", source, f"{fn.__name__} calls to_empty bare")
+            self.assertIn("to_empty_preserving_spec_info(model, init_device)", source, fn.__name__)
+
+        # And the helper really does keep the tag, which is the point.
+        from types import SimpleNamespace
+
+        from veomni.distributed.torch_parallelize import to_empty_preserving_spec_info
+        from veomni.models.checkpoint import init_empty_weights
+
+        with init_empty_weights():
+            model = _TinyModel()
+        spec = SimpleNamespace(para_name="emb", placement=object())
+        model.embed_tokens.weight.spec_info = spec
+
+        to_empty_preserving_spec_info(model, "cpu")
+        self.assertIs(model.embed_tokens.weight.spec_info, spec)
+
+        with init_empty_weights():
+            control = _TinyModel()
+        control.embed_tokens.weight.spec_info = spec
+        control.to_empty(device="cpu")
+        self.assertFalse(getattr(control.embed_tokens.weight, "spec_info", None))
+
 
 if __name__ == "__main__":
     unittest.main()

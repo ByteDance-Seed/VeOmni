@@ -431,7 +431,12 @@ def load_model_weights(
     """
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
-    model.to_empty(device=init_device)
+    # The parallel plan may already have tagged this model's meta parameters,
+    # and these loaders materialize *after* that; a bare `to_empty` would drop
+    # the tags and the optimizer would then average plan shards as replicas.
+    from veomni.distributed.torch_parallelize import to_empty_preserving_spec_info
+
+    to_empty_preserving_spec_info(model, init_device)
     dtensor_to_cpu = init_device == "cpu"
 
     # Get parallel plan if available -- via the runtime helper which
@@ -948,7 +953,12 @@ def load_model_weights_ep_sharded(
         for expert_range in sorted(set(range_by_target.values())):
             expert_converters[expert_range] = converter.for_expert_range(*expert_range)
 
-    model.to_empty(device=init_device)
+    # The parallel plan may already have tagged this model's meta parameters,
+    # and these loaders materialize *after* that; a bare `to_empty` would drop
+    # the tags and the optimizer would then average plan shards as replicas.
+    from veomni.distributed.torch_parallelize import to_empty_preserving_spec_info
+
+    to_empty_preserving_spec_info(model, init_device)
     dtensor_to_cpu = init_device == "cpu"
 
     keys_by_file: Dict[str, List[str]] = {}
@@ -1346,7 +1356,12 @@ def rank0_load_and_broadcast_weights(
 
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
-    model.to_empty(device=init_device)
+    # The parallel plan may already have tagged this model's meta parameters,
+    # and these loaders materialize *after* that; a bare `to_empty` would drop
+    # the tags and the optimizer would then average plan shards as replicas.
+    from veomni.distributed.torch_parallelize import to_empty_preserving_spec_info
+
+    to_empty_preserving_spec_info(model, init_device)
     dtensor_to_cpu = init_device == "cpu"
 
     # Get parallel plan if available -- routed through the runtime helper
