@@ -150,7 +150,9 @@ def test_moe_ep_load_balance_requires_expert_parallelism():
 
 
 @pytest.mark.parametrize("moe_implementation", ["eager", "fused_quack"])
-def test_moe_ep_load_balance_requires_supported_backend(moe_implementation):
+def test_moe_ep_load_balance_requires_supported_backend(monkeypatch, moe_implementation):
+    # Exercise the EP-specific guard after the generic backend validation.
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_npu_available", lambda: False)
     with pytest.raises(ValueError, match="fused_npu.*fused_triton"):
         _arguments(enabled=True, moe_implementation=moe_implementation)
 
