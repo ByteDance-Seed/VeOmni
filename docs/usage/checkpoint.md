@@ -758,7 +758,7 @@ identity covers parameters and buffers, including nonpersistent buffer aliases.
 Optimizer adapters and model serialization hooks are trusted to preserve their
 state and semantics. Identity tracks repeated tensor objects and supported
 nonempty shared-storage views as described above; separately imported shared
-mappings remain outside the contract. The upstream and VeOmni-generated Qwen3
+mappings remain outside the contract. The upstream and standalone VeOmni Qwen3
 dynamic RoPE reset alias is permitted when its current and original tables match
 a valid reconstruction; other reset aliases remain outside this contract.
 Dynamic RoPE frequencies and cached maximum lengths are not checkpointed. If
@@ -771,6 +771,9 @@ Qwen3 classes accept an exact CPU-built table moved to the accelerator as well a
 an exact table built on that accelerator; close-but-different tables are not
 interchangeable. The byte-level contract replaces the earlier configuration-only
 contract, so older dynamic or longrope checkpoints need a verified migration.
+For Qwen3 dynamic RoPE, the proof also binds the rotary class identity.
+Checkpoints produced with the generated Qwen3 model files require a verified
+migration to resume with the standalone implementation.
 Unversioned sources lack the source's RoPE configuration, including when the
 target is static; the operator must independently verify source and target.
 Matching the RoPE table alone does not establish whole-training determinism: the

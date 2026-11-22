@@ -32,10 +32,10 @@ try:
     import veomni.trainer.callbacks.base as callback_base_module
     import veomni.trainer.callbacks.channel_loss_callback as channel_loss_module
     from veomni.arguments.arguments_types import ChannelLossConfig
-    from veomni.models.transformers.qwen2_5_omni.generated.patched_modeling_qwen2_5_omni_gpu import (
+    from veomni.models.transformers.qwen2_5_omni.modeling_qwen2_5_omni import (
         Qwen2_5OmniForConditionalGeneration,
     )
-    from veomni.models.transformers.qwen3_omni_moe.generated.patched_modeling_qwen3_omni_moe_gpu import (
+    from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import (
         Qwen3OmniMoeForConditionalGeneration,
     )
     from veomni.trainer.base import BaseTrainer
