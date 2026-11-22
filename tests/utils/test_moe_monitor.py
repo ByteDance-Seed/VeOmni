@@ -634,14 +634,19 @@ def test_ep_balance_metrics_accumulate_exact_formulas_keys_and_reset(monkeypatch
     assert not any("/ep_" in key for key in second_interval)
 
 
-def test_ep_balance_accumulates_on_corresponding_router_count_device():
+def test_ep_balance_accumulates_on_host_before_snapshot_transfer():
     monitor = MoERouterMonitor(num_experts=4)
     routers = _register_router_counts(monitor)
     count_device = monitor._counts[id(routers[0])].device
     monitor.record_ep_balance(0, (4, 0), (2, 2), 1, 2)
-    assert monitor._ep_rank_loads_before[0].device == count_device
-    assert monitor._ep_rank_loads_after[0].device == count_device
-    assert monitor._ep_stats[0].device == count_device
+    assert monitor._ep_rank_loads_before[0].device.type == "cpu"
+    assert monitor._ep_rank_loads_after[0].device.type == "cpu"
+    assert monitor._ep_stats[0].device.type == "cpu"
+
+    snapshot = monitor._stack_and_reduce_ep_balance(len(routers), count_device, 2)
+    assert all(tensor.device == count_device for tensor in snapshot)
+    assert snapshot[0][0].tolist() == [4, 0]
+    assert snapshot[1][0].tolist() == [2, 2]
 
 
 def _two_rank_ep_monitor_worker(rank: int, world_size: int, rendezvous: str) -> None:

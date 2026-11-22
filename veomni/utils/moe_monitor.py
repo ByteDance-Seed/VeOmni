@@ -392,7 +392,8 @@ class MoERouterMonitor:
         after = self._normalize_rank_loads("after_rank_loads", after_rank_loads)
         if len(before) != len(after):
             raise ValueError("before_rank_loads and after_rank_loads must have the same shape.")
-        if sum(before) != sum(after):
+        total = sum(before)
+        if total != sum(after):
             raise ValueError("before_rank_loads and after_rank_loads must conserve routed tokens.")
         if self._ep_rank_size is not None and len(before) != self._ep_rank_size:
             raise ValueError(f"EP rank-load size must remain {self._ep_rank_size} across layers; got {len(before)}.")
@@ -406,13 +407,12 @@ class MoERouterMonitor:
                 f"layer_index {layer_index} has no router counts yet; physical telemetry must follow router recording."
             )
 
-        device = router_counts.device
-        before_tensor = torch.tensor(before, dtype=torch.long, device=device)
-        after_tensor = torch.tensor(after, dtype=torch.long, device=device)
+        before_tensor = torch.tensor(before, dtype=torch.long, device="cpu")
+        after_tensor = torch.tensor(after, dtype=torch.long, device="cpu")
         stats_tensor = torch.tensor(
-            (active_replicas, moved_tokens, sum(before)),
+            (active_replicas, moved_tokens, total),
             dtype=torch.long,
-            device=device,
+            device="cpu",
         )
         if layer_index in self._ep_rank_loads_before:
             self._ep_rank_loads_before[layer_index] += before_tensor
@@ -422,7 +422,6 @@ class MoERouterMonitor:
             self._ep_rank_loads_before[layer_index] = before_tensor
             self._ep_rank_loads_after[layer_index] = after_tensor
             self._ep_stats[layer_index] = stats_tensor
-        total = sum(before)
         rank_count = len(before)
         before_vio = sum(abs(rank_count * value / total - 1) for value in before) / rank_count if total else 0.0
         after_vio = sum(abs(rank_count * value / total - 1) for value in after) / rank_count if total else 0.0
@@ -468,13 +467,13 @@ class MoERouterMonitor:
         device: torch.device,
         rank_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        zero_loads = torch.zeros(rank_size, dtype=torch.long, device=device)
-        zero_stats = torch.zeros(3, dtype=torch.long, device=device)
+        zero_loads = torch.zeros(rank_size, dtype=torch.long, device="cpu")
+        zero_stats = torch.zeros(3, dtype=torch.long, device="cpu")
         before = torch.stack([self._ep_rank_loads_before.get(i, zero_loads) for i in range(num_layers)])
         after = torch.stack([self._ep_rank_loads_after.get(i, zero_loads) for i in range(num_layers)])
         stats = torch.stack([self._ep_stats.get(i, zero_stats) for i in range(num_layers)])
 
-        packed = torch.cat((before.reshape(-1), after.reshape(-1), stats.reshape(-1)))
+        packed = torch.cat((before.reshape(-1), after.reshape(-1), stats.reshape(-1))).to(device)
         if self.dp_group is not None and dist.is_initialized():
             dist.all_reduce(packed, op=dist.ReduceOp.SUM, group=self.dp_group)
         before_size = before.numel()
