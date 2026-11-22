@@ -42,7 +42,7 @@ must not exceed the original expert rows per EP rank. See the
   imbalance of each nonempty plan before aggregating EP groups or time. Thus
   opposite hotspots cannot cancel. `ep_rank_plan_imbalance_{before,after}_peak`
   preserves the worst plan per layer; `ep_rank_cumulative_imbalance_{before,after}`
-  separately describes the cumulative rank-load distribution used by heatmaps.
+  separately describes the cumulative physical rank-load distribution.
 
 ## Validation results and limits
 
