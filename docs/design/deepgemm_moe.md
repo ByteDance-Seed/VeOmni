@@ -31,7 +31,7 @@ projections and dense gated MLPs alike.
 On each field these are different values, so a single GEMM is never rounded twice;
 across fields nothing links them, and a mixed selection is a valid recipe.
 
-### One restriction: the gated MLP is SiLU-only
+## One restriction: the gated MLP is SiLU-only
 
 `gated_mlp_implementation: deepgemm` cannot serve a model whose `hidden_act` is not
 SiLU. Its Triton kernel fuses `aten.silu` and `aten.silu_backward` into the grouped
