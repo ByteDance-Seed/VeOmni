@@ -87,6 +87,11 @@ def _topk_indices_from_output(output: Any) -> Optional[torch.Tensor]:
     return None
 
 
+def find_bias_routers(model: nn.Module) -> list[nn.Module]:
+    """Every module carrying the bias buffer, in ``model.modules()`` order."""
+    return [module for module in model.modules() if isinstance(getattr(module, BIAS_ATTR, None), torch.Tensor)]
+
+
 class ExpertBiasUpdater:
     """Accumulates expert load and nudges the routers' correction bias.
 
@@ -101,6 +106,8 @@ class ExpertBiasUpdater:
             raise ValueError(f"update_rate must be positive, got {update_rate}")
         self.update_rate = update_rate
         self._routers: list[nn.Module] = []
+        # (start, width) of each router's slice of the flat counts tensor.
+        self._slices: list[tuple[int, int]] = []
         self._seen: set[int] = set()
         self._counts: Optional[torch.Tensor] = None
         self._handles: list[Any] = []
@@ -111,41 +118,34 @@ class ExpertBiasUpdater:
 
         ``model.modules()`` yields a deterministic order that is the same on
         every rank, since every rank builds the same model from the same
-        config, so the row each router owns in the counts tensor needs no
+        config, so the slice each router owns in the counts tensor needs no
         cross-rank agreement. Calling this twice is a no-op for routers already
         hooked, so a second call cannot silently double-count.
         """
-        for module in model.modules():
-            bias = getattr(module, BIAS_ATTR, None)
-            if not isinstance(bias, torch.Tensor) or id(module) in self._seen:
-                continue
+        new_routers = [module for module in find_bias_routers(model) if id(module) not in self._seen]
+        if not new_routers:
+            return len(self._routers)
+
+        offset = self._counts.numel() if self._counts is not None else 0
+        for module in new_routers:
+            width = getattr(module, BIAS_ATTR).numel()
             index = len(self._routers)
             self._seen.add(id(module))
             self._routers.append(module)
+            self._slices.append((offset, width))
             self._handles.append(module.register_forward_hook(self._make_hook(index)))
+            offset += width
 
-        if self._routers:
-            bias = getattr(self._routers[0], BIAS_ATTR)
-            # One rectangular tensor only works if every router has the same
-            # expert count. Nothing in the tree breaks that today, so this is
-            # the premise the preallocation below rests on rather than a
-            # defence: state it here, where it is cheap and names the module,
-            # instead of letting a mismatch surface as an out-of-range
-            # scatter_add_ inside a forward hook.
-            for module in self._routers:
-                width = getattr(module, BIAS_ATTR).numel()
-                if width != bias.numel():
-                    raise ValueError(
-                        f"{type(module).__name__} carries a '{BIAS_ATTR}' of {width} experts while "
-                        f"{type(self._routers[0]).__name__} carries {bias.numel()}. The bias update "
-                        "accumulates every router's load in one rectangular tensor, which assumes a "
-                        "uniform expert count across routers."
-                    )
-            # One row per router, allocated up front rather than on first use:
-            # a lazily built set of rows would differ between ranks whose
-            # micro-batches reached different layers, and step() issues one
-            # collective over the whole tensor.
-            self._counts = torch.zeros((len(self._routers), bias.numel()), dtype=torch.long, device=bias.device)
+        # One flat tensor, allocated up front rather than on first use: a lazily
+        # built set of slices would differ between ranks whose micro-batches
+        # reached different layers, and step() issues one collective over the
+        # whole tensor. Flat because routers can differ in width: DSpark stages
+        # have their own expert count (``dspark_n_routed_experts``).
+        device = getattr(self._routers[0], BIAS_ATTR).device
+        counts = torch.zeros(offset, dtype=torch.long, device=device)
+        if self._counts is not None:
+            counts[: self._counts.numel()] = self._counts
+        self._counts = counts
         return len(self._routers)
 
     def _make_hook(self, index: int):
@@ -172,15 +172,18 @@ class ExpertBiasUpdater:
             # Either way it is harmless here, and harmless only because step()
             # reduces the counts to a sign: scaling a router's whole row by the
             # same factor leaves the ordering, and so the sign, unchanged. Each
-            # row has its own mean, so a factor that differs between layers is
-            # fine too. Anything that later makes the update proportional to
+            # router has its own mean, so a factor that differs between layers
+            # is fine too. Anything that later makes the update proportional to
             # load, or reports these counts as an absolute token count, has to
             # divide the replay out first.
             #
             # scatter_add_ wants an int64 index and a src of the tensor's own
             # dtype; a router returning int32 indices would otherwise raise.
             flat = indices.detach().reshape(-1).to(device=self._counts.device, dtype=torch.long)
-            self._counts[index].scatter_add_(0, flat, torch.ones_like(flat))
+            start, width = self._slices[index]
+            # A view, so an out-of-range index raises instead of counting
+            # against the next router's experts.
+            self._counts[start : start + width].scatter_add_(0, flat, torch.ones_like(flat))
 
         return _hook
 
@@ -193,27 +196,28 @@ class ExpertBiasUpdater:
         per-router reduce skipped on empty counts would make the number of
         collectives depend on local data, which deadlocks rather than erroring
         as soon as any rank disagrees. A router that genuinely saw no tokens
-        contributes an all-zero row, whose sign is zero, so it is a no-op.
+        contributes an all-zero slice, whose sign is zero, so it is a no-op.
         """
         if self._counts is None:
             return
 
-        # Reduce in int64 and cast afterwards, not before. These are exact
-        # counts, and float32 stops representing consecutive integers past
-        # 2**24, which 4k tokens per rank at top-8 over a few hundred ranks
-        # reaches. Rounding there would land exactly on the near-average
-        # experts whose sign is already the marginal decision.
+        # Stay in int64 through the sign. These are exact counts, and float32
+        # stops representing consecutive integers past 2**24, which 4k tokens
+        # per rank at top-8 over a few hundred ranks reaches. Rounding there
+        # would land exactly on the near-average experts whose sign is already
+        # the marginal decision.
         if group is not None and dist.is_initialized():
             dist.all_reduce(self._counts, op=dist.ReduceOp.SUM, group=group)
-        load = self._counts.to(torch.float32)
 
-        # Underloaded experts (below their layer's mean) get a nudge up,
+        # Underloaded experts (below their router's mean) get a nudge up,
         # overloaded ones a nudge down, by a fixed step. torch.sign gives 0 for
         # an exactly-average expert, which correctly leaves it alone.
-        direction = torch.sign(load.mean(dim=1, keepdim=True) - load)
-        for index, module in enumerate(self._routers):
+        # ``sum - count * width`` is ``mean - count`` scaled by the width.
+        for module, (start, width) in zip(self._routers, self._slices):
+            counts = self._counts[start : start + width]
+            direction = torch.sign(counts.sum() - counts * width)
             bias = getattr(module, BIAS_ATTR)
-            bias.add_(self.update_rate * direction[index].to(bias.dtype))
+            bias.add_(self.update_rate * direction.to(device=bias.device, dtype=bias.dtype))
         self._counts.zero_()
 
     def disable(self) -> None:
@@ -223,6 +227,7 @@ class ExpertBiasUpdater:
             handle.remove()
         self._handles.clear()
         self._routers.clear()
+        self._slices.clear()
         self._seen.clear()
         self._counts = None
 

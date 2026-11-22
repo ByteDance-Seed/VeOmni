@@ -279,17 +279,69 @@ def test_the_bias_update_is_rejected_together_with_lora():
     ensure_lora_can_carry_the_bias(None, attached)
 
 
-def test_routers_of_different_widths_are_rejected_at_attach():
-    """The counts tensor is rectangular, so every router must agree on width.
-
-    Caught at attach, where the module can be named, rather than as an
-    out-of-range ``scatter_add_`` inside a forward hook, which on an
-    accelerator surfaces as an async assert far from the cause.
-    """
+def test_routers_of_different_widths_update_independently():
+    """Each router balances against its own expert count and its own mean."""
     model = nn.Module()
-    model.a = ToyRouter(NUM_EXPERTS)
-    model.b = ToyRouter(NUM_EXPERTS + 2)
+    model.wide = ToyRouter(4)
+    model.narrow = ToyRouter(2)
 
     updater = ExpertBiasUpdater(update_rate=0.1)
-    with pytest.raises(ValueError, match="uniform expert count"):
-        updater.attach(model)
+    assert updater.attach(model) == 2
+
+    model.wide.next_indices = torch.tensor([[0], [0], [0], [1]])
+    model.wide(torch.zeros(4, 4))
+    model.narrow.next_indices = torch.tensor([[1], [1]])
+    model.narrow(torch.zeros(2, 4))
+    updater.step()
+
+    assert torch.allclose(model.wide.e_score_correction_bias, torch.tensor([-0.1, 0.0, 0.1, 0.1]))
+    assert torch.allclose(model.narrow.e_score_correction_bias, torch.tensor([0.1, -0.1]))
+
+
+def test_out_of_range_index_does_not_count_against_the_next_router():
+    model = nn.Module()
+    model.narrow = ToyRouter(2)
+    model.wide = ToyRouter(4)
+    updater = ExpertBiasUpdater(update_rate=0.1)
+    updater.attach(model)
+
+    model.narrow.next_indices = torch.tensor([[2]])
+    with pytest.raises(RuntimeError):
+        model.narrow(torch.zeros(1, 4))
+
+
+def test_dspark_config_with_its_own_expert_count_updates_every_router():
+    """The real DSpark layout: four backbone experts, two per DSpark stage."""
+    from tests.models.compare import eager_ops_config
+    from tests.models.tiny_configs import tiny_deepseek_v4_config
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+
+    torch.manual_seed(0)
+    config = tiny_deepseek_v4_config()
+    config.dspark_block_size = 5
+    config.num_nextn_predict_layers = 1
+    config.dspark_target_layer_ids = [1, 2, 3]
+    config.dspark_markov_rank = 8
+    config.dspark_n_routed_experts = 2
+    config.dspark_num_experts_per_tok = 1
+    config._set_ops_implementation(eager_ops_config())
+    model = DeepseekV4ForCausalLM(config).train()
+
+    dspark_router = model.model.mtp[0].mlp.gate
+    backbone_router = model.model.layers[3].mlp.gate
+    assert getattr(dspark_router, BIAS_ATTR).numel() == 2
+    assert getattr(backbone_router, BIAS_ATTR).numel() == 4
+
+    updater = ExpertBiasUpdater(update_rate=0.1)
+    assert updater.attach(model) == 2
+
+    # A large starting bias fixes which experts win, so the expected update
+    # does not depend on what the random weights route to.
+    getattr(backbone_router, BIAS_ATTR).copy_(torch.tensor([10.0, 10.0, 0.0, 0.0]))
+    getattr(dspark_router, BIAS_ATTR).copy_(torch.tensor([10.0, 0.0]))
+    with torch.no_grad():
+        model.model(input_ids=torch.randint(3, config.vocab_size, (1, 8)), return_mtp_outputs=True, use_cache=False)
+    updater.step()
+
+    assert torch.allclose(getattr(backbone_router, BIAS_ATTR), torch.tensor([9.9, 9.9, 0.1, 0.1]))
+    assert torch.allclose(getattr(dspark_router, BIAS_ATTR), torch.tensor([9.9, 0.1]))
