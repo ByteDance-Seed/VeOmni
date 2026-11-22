@@ -126,6 +126,21 @@ class ExpertBiasUpdater:
         if not new_routers:
             return len(self._routers)
 
+        # Before any hook, so a rejected run leaves the model untouched. VeOmni
+        # builds through ``_from_config``, which does not apply
+        # ``_keep_in_fp32_modules_strict``, so with mixed precision off the
+        # DeepSeek routers hold this buffer in bf16, where a 1e-3 step rounds
+        # away once the bias reaches 0.5 and balancing stops with nothing raised.
+        for module in new_routers:
+            dtype = getattr(module, BIAS_ATTR).dtype
+            if dtype not in (torch.float32, torch.float64):
+                raise ValueError(
+                    f"The router bias update needs '{BIAS_ATTR}' in float32, but "
+                    f"{type(module).__name__} holds it in {dtype}, where the update can round to "
+                    "nothing. Set model.accelerator.fsdp_config.mixed_precision.enable=true, which "
+                    "builds the model in float32, or set moe_router_bias_update_rate to 0."
+                )
+
         offset = self._counts.numel() if self._counts is not None else 0
         for module in new_routers:
             width = getattr(module, BIAS_ATTR).numel()

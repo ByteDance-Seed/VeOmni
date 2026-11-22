@@ -310,6 +310,31 @@ def test_lora_rejection_leaves_no_hooks_on_the_model():
     assert not model.routers[0]._forward_hooks
 
 
+@pytest.mark.parametrize(
+    "torch_dtype, accepted",
+    [("float32", True), ("bfloat16", False), ("float16", False)],
+)
+def test_attach_requires_a_float32_bias_from_the_real_build(torch_dtype, accepted):
+    """Built the way the trainer builds it: float32 with mixed precision, else bf16."""
+    from tests.models.compare import eager_ops_config
+    from tests.models.tiny_configs import tiny_deepseek_v3_config
+    from veomni.models.auto import build_foundation_model
+
+    config = tiny_deepseek_v3_config()
+    config._set_ops_implementation(eager_ops_config())
+    model = build_foundation_model(config, torch_dtype=torch_dtype, init_device="cpu", attn_implementation="eager")
+    router = next(module for module in model.modules() if hasattr(module, BIAS_ATTR))
+
+    updater = ExpertBiasUpdater(update_rate=1e-3)
+    if accepted:
+        assert updater.attach(model) == 1
+        assert getattr(router, BIAS_ATTR).dtype == torch.float32
+    else:
+        with pytest.raises(ValueError, match="needs 'e_score_correction_bias' in float32"):
+            updater.attach(model)
+        assert not router._forward_hooks
+
+
 def test_routers_of_different_widths_update_independently():
     """Each router balances against its own expert count and its own mean."""
     model = nn.Module()
