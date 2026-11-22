@@ -56,7 +56,7 @@ def test_down_wait_follows_dx_and_precedes_gate_weight_grad(monkeypatch, needs, 
 
         sync.start = start
 
-    monkeypatch.setattr(moe, "group_gemm_same_nk", nk)
+    monkeypatch.setattr(moe, "group_gemm_same_nk", nk, raising=False)
 
     def backward():
         return moe.EPMergedFc1GroupGemm.backward(

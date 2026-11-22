@@ -118,8 +118,9 @@ def test_balanced_gemm_uses_sender_summed_group_bound_in_forward_and_dx(monkeypa
     assert bound < int(groups.sum())
     monkeypatch.setattr(dist, "get_rank", lambda *args, **kwargs: rank)
     monkeypatch.setattr(dist, "get_world_size", lambda *args, **kwargs: 2)
-    monkeypatch.setattr(moe, "group_gemm_same_nk", _reference_nk)
-    monkeypatch.setattr(moe, "group_gemm_same_mn", _reference_mn)
+    # Ascend does not import the CUDA GEMM symbols used by this CPU reference.
+    monkeypatch.setattr(moe, "group_gemm_same_nk", _reference_nk, raising=False)
+    monkeypatch.setattr(moe, "group_gemm_same_mn", _reference_mn, raising=False)
     torch.manual_seed(71 + rank)
     tokens = torch.randn(int(groups.sum()), 3, requires_grad=True)
     gate, down = torch.randn(2, 4, 3), torch.randn(2, 3, 2)
@@ -163,8 +164,8 @@ def _two_storage_worker(rank, rendezvous):
 
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
     patch = pytest.MonkeyPatch()
-    patch.setattr(moe, "group_gemm_same_nk", _reference_nk)
-    patch.setattr(moe, "group_gemm_same_mn", _reference_mn)
+    patch.setattr(moe, "group_gemm_same_nk", _reference_nk, raising=False)
+    patch.setattr(moe, "group_gemm_same_mn", _reference_mn, raising=False)
     patch.setattr(ep_dispatch, "get_parallel_state", lambda: SimpleNamespace(ep_group=dist.group.WORLD))
     original_cat = torch.cat
     original_start = ep.ExpertReplicaTransfer.start
@@ -358,8 +359,8 @@ def _recording_failure_worker(rank, rendezvous, consumer, stage):
     patch = pytest.MonkeyPatch()
     patch.setattr(ep_dispatch, "get_parallel_state", lambda: SimpleNamespace(ep_group=dist.group.WORLD))
     if consumer == "gpu":
-        patch.setattr(moe, "group_gemm_same_nk", _reference_nk)
-        patch.setattr(moe, "group_gemm_same_mn", _reference_mn)
+        patch.setattr(moe, "group_gemm_same_nk", _reference_nk, raising=False)
+        patch.setattr(moe, "group_gemm_same_mn", _reference_mn, raising=False)
     owners, attempts = [], []
     original_start = ep.ExpertReplicaTransfer.start
     original_record = ep.ExpertReplicaTransfer.record_stream_use
