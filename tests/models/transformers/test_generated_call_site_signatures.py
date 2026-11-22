@@ -12,18 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Every call inside a generated module must fit the signature it calls.
+"""Every call inside an HF-derived modeling module must fit the signature it calls.
 
-``patchgen --check`` regenerates and text-diffs, and the ruff pass it runs
-reports undefined names, not argument mismatches -- so a patched caller can pass
-a keyword its patched callee does not accept and every gate stays green. On
-DeepSeek-V4 that happened three times in a row, always the same way: the NPU
-config hand-forks a method the GPU config also patches, the GPU side gains a
-parameter, and the fork keeps the old signature. Nothing catches it until the
-model runs, and only on the hardware that selects the forked module.
-
-The check reads source rather than importing, so a module for an accelerator
-this host does not have is covered exactly like the local one.
+Ruff reports undefined names, not argument mismatches -- so a caller inside
+``modeling_<model>.py`` can pass a keyword its callee does not accept and lint
+stays green. Reading source rather than importing lets this check run on any
+host (including CPU-only CI without ``torch`` or ``transformers`` installed).
 """
 
 import ast
@@ -41,9 +35,10 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TRANSFORMERS_ROOT = REPO_ROOT / "veomni" / "models" / "transformers"
-GENERATED_MODULES = sorted(TRANSFORMERS_ROOT.glob("*/generated/patched_modeling_*.py"))
-if not GENERATED_MODULES:
-    raise RuntimeError(f"No generated modeling modules found under {TRANSFORMERS_ROOT}")
+NON_HF_DIRS = {"flux", "movqgan", "wan"}
+MODELING_MODULES = sorted(p for p in TRANSFORMERS_ROOT.glob("*/modeling_*.py") if p.parent.name not in NON_HF_DIRS)
+if not MODELING_MODULES:
+    raise RuntimeError(f"No HF-derived modeling modules found under {TRANSFORMERS_ROOT}")
 
 _UNKNOWN = object()
 
@@ -232,7 +227,7 @@ def _violations(path: Path) -> list[str]:
     return problems
 
 
-@pytest.mark.parametrize("path", GENERATED_MODULES, ids=lambda p: p.stem)
+@pytest.mark.parametrize("path", MODELING_MODULES, ids=lambda p: p.stem)
 def test_generated_call_sites_match_their_callees(path: Path):
     problems = _violations(path)
     assert not problems, "\n".join(problems)

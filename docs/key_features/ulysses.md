@@ -383,7 +383,7 @@ attn_output = VeomniOp("async_ulysses_o", "standard")(
 )
 ```
 
-See `veomni/models/transformers/qwen3_vl/qwen3_vl_gpu_patch_gen_config.py` for
+See `veomni/models/transformers/qwen3_vl/modeling_qwen3_vl.py` for
 the live transformer consume, and `veomni/models/transformers/wan/modeling_wan.py`
 for the `dit` consume. Registry rows live in
 `veomni/ops/kernels/async_ulysses/`.

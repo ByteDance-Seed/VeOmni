@@ -33,7 +33,7 @@ class Qwen3OmniMoeForConditionalGeneration(torch.nn.Module):
         self.register_load_state_dict_pre_hook(_drop_talker_and_code2wav_keys)
 
 
-Qwen3OmniMoeForConditionalGeneration.__module__ = "veomni.models.transformers.qwen3_omni_moe.generated.test"
+Qwen3OmniMoeForConditionalGeneration.__module__ = "veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe"
 
 
 class Qwen2_5OmniForConditionalGeneration(torch.nn.Module):
