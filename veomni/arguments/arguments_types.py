@@ -16,6 +16,7 @@ import math
 import os
 import sys
 from dataclasses import MISSING, dataclass, field, fields
+from operator import index
 from pathlib import Path
 from typing import ClassVar, Dict, List, Literal, Optional, Tuple
 
@@ -1987,10 +1988,18 @@ class VeOmniArguments:
 
             if is_torch_mlu_available():
                 raise ValueError("train.moe_ep_load_balance.enabled is unsupported on Cambricon MLU.")
-            if moe_ep_load_balance.max_replicas_per_rank <= 0:
-                raise ValueError(
-                    "train.moe_ep_load_balance.max_replicas_per_rank must be positive when load balancing is enabled."
-                )
+            replica_count = moe_ep_load_balance.max_replicas_per_rank
+            error = (
+                "train.moe_ep_load_balance.max_replicas_per_rank must be a positive integer "
+                "when load balancing is enabled."
+            )
+            try:
+                max_replicas = index(replica_count)
+            except TypeError as exc:
+                raise ValueError(error) from exc
+            if isinstance(replica_count, bool) or max_replicas <= 0:
+                raise ValueError(error)
+            moe_ep_load_balance.max_replicas_per_rank = max_replicas
             if self.model.accelerator.ep_size <= 1:
                 raise ValueError("train.moe_ep_load_balance.enabled requires model.accelerator.ep_size > 1.")
             if self.model.accelerator.fsdp_config.fsdp_mode != "fsdp2":

@@ -128,10 +128,20 @@ def test_moe_ep_load_balance_parses_nested_yaml_and_cli_override(tmp_path, monke
     )
 
 
-@pytest.mark.parametrize("max_replicas_per_rank", [0, -1])
-def test_moe_ep_load_balance_requires_positive_replica_count(max_replicas_per_rank):
-    with pytest.raises(ValueError, match="max_replicas_per_rank must be positive"):
+@pytest.mark.parametrize("max_replicas_per_rank", [0, -1, True, False, 1.5, "2"])
+def test_moe_ep_load_balance_requires_positive_integer_replica_count(max_replicas_per_rank):
+    with pytest.raises(ValueError, match="max_replicas_per_rank must be a positive integer"):
         _arguments(enabled=True, max_replicas_per_rank=max_replicas_per_rank)
+
+
+def test_moe_ep_load_balance_normalizes_integer_like_replica_count():
+    class ReplicaCount:
+        def __index__(self):
+            return 2
+
+    args = _arguments(enabled=True, max_replicas_per_rank=ReplicaCount())
+    assert type(args.train.moe_ep_load_balance.max_replicas_per_rank) is int
+    assert args.train.moe_ep_load_balance.max_replicas_per_rank == 2
 
 
 def test_moe_ep_load_balance_requires_expert_parallelism():
