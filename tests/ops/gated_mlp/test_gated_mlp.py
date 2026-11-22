@@ -646,10 +646,8 @@ def test_the_eager_row_evaluates_every_activation_it_claims(activation, dtype):
     """The row takes the activation as an argument, so a non-SiLU model can quantize.
 
     The oracle is ``ACT2FN[activation]``, not a formula restated here. That is the
-    point: ``gelu_new`` (``NewGELUActivation``) stages ``torch.pow(x, 3.0)`` while
-    ``gelu_pytorch_tanh`` (``PytorchGELUTanh``) writes ``x * x * x``, and the two
-    round differently in bf16. A hand-written tanh formula would have accepted the
-    wrong function for one of them.
+    point: ``gelu`` is the exact-erf form and ``gelu_pytorch_tanh`` the tanh
+    approximation, so a single restated formula would silently accept the wrong one.
 
     Parametrized over ``supported_activations()`` rather than a list here, so the
     test and the implementation cannot disagree about what is supported.
@@ -810,7 +808,7 @@ def test_the_supported_set_is_the_bounded_whitelist():
     """
     from veomni.ops.activation import SUPPORTED_ACTIVATIONS, normalize_activation, supports
 
-    assert set(SUPPORTED_ACTIVATIONS) == {"silu", "swish", "gelu", "gelu_new", "gelu_pytorch_tanh"}
+    assert set(SUPPORTED_ACTIVATIONS) == {"silu", "swish", "gelu", "gelu_pytorch_tanh"}
 
     for name in SUPPORTED_ACTIVATIONS:
         assert supports(name)
@@ -891,6 +889,31 @@ def test_render_routes_each_row_by_shape_and_activation():
 
 
 @_cpu
+def test_every_supported_activation_has_a_backward_and_nothing_else_does():
+    """The derivative covers exactly the served names, and refuses the rest.
+
+    ``apply_activation_backward`` is called from ``moe_experts``' hand-written
+    ``autograd.Function``s, where the derivative must be supplied explicitly. It is
+    a chain of explicit branches with no fallback, so a name it does not know raises
+    rather than differentiating as whichever branch came last -- and a name added to
+    :data:`SUPPORTED_ACTIVATIONS` without a branch here fails this test rather than
+    reaching a training run.
+    """
+    import torch
+
+    from veomni.ops.activation import SUPPORTED_ACTIVATIONS, apply_activation_backward
+
+    grad = torch.randn(8)
+    hidden = torch.randn(8)
+    for name in SUPPORTED_ACTIVATIONS:
+        assert apply_activation_backward(grad, hidden, name).shape == hidden.shape
+
+    for name in ("relu", "mish", "quick_gelu", "gelu_10"):
+        with pytest.raises(ValueError, match="No activation backward"):
+            apply_activation_backward(grad, hidden, name)
+
+
+@_cpu
 @pytest.mark.parametrize("activation", ["relu", "mish", "quick_gelu", "gelu_10"])
 def test_the_eager_row_runs_an_activation_outside_the_whitelist_exactly(activation):
     """The reference row keeps every config that worked before this family existed.
@@ -952,7 +975,7 @@ def test_render_refuses_a_quantizing_row_it_cannot_serve():
 
 
 @_cpu
-@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh", "gelu_new"])
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh"])
 def test_the_eager_row_compiles_fullgraph(activation):
     """A compiled forward must not regress against the plain projection path.
 
@@ -986,7 +1009,7 @@ def test_the_eager_row_compiles_fullgraph(activation):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_new"])
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh"])
 def test_the_eager_row_backward_survives_activation_offload(activation):
     """The row must run inside ``saved_tensors_hooks``, which is how offload works.
 

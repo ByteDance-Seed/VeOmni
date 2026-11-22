@@ -194,5 +194,4 @@ pytest tests/distributed/test_dummy_forward.py -k <model>
 - [ ] VLM: freeze-ViT case added to `tests/trainer/test_vlm_trainer.py`
 - [ ] VLM/omni with `dummy_forward`: asymmetric 2-GPU case added
 - [ ] `pytest --collect-only -k <model>` collects the expected tests
-- [ ] Patch generation is current: `make check-patchgen`
 - [ ] Focused tests and `make quality` pass

@@ -28,19 +28,26 @@ This module is deliberately pure PyTorch, with no kernel of its own:
 * :func:`apply_activation` evaluates one.
 
 **Every name delegates to the transformer's own implementation**, looked up by the
-name the config used. That is not redundancy: the names are not interchangeable.
-``gelu_new`` resolves to ``NewGELUActivation``, which stages ``torch.pow(x, 3.0)``,
-while ``gelu_pytorch_tanh`` resolves to ``PytorchGELUTanh``, which calls
-``F.gelu(approximate="tanh")`` and writes ``x * x * x`` internally. In bf16 the
-intermediates round differently -- max ~1.6e-2 on unit-scale inputs -- so mapping
-them onto one formula would change a model's outputs and gradients against the
-function it trained with.
+name the config used. That is not redundancy: the spellings are not interchangeable.
+``gelu`` is the exact-erf form, while ``gelu_pytorch_tanh`` is the tanh
+approximation, and they differ by far more than rounding. Mapping either onto a
+restated formula would change a model's outputs and gradients against the function
+it trained with.
 
-The derivative is deliberately absent. Every row is an opaque ``wrapper`` now, so
-autograd differentiates whatever the row computes and there is no hand-written
-backward to keep in sync -- which is also what keeps activation offload and
-``torch.compile(fullgraph=True)`` working (``torch.func.vjp`` refuses to run inside
-``saved_tensors_hooks``).
+The derivative is deliberately absent for the served names. Every row is an opaque
+``wrapper``, so autograd differentiates whatever the row computes and there is no
+hand-written backward to keep in sync -- which is also what keeps activation offload
+and ``torch.compile(fullgraph=True)`` working (``torch.func.vjp`` refuses to run
+inside ``saved_tensors_hooks``).
+
+A name outside the set is a different story. ``moe_experts`` owns hand-written
+``autograd.Function``s, so such a name needs :func:`apply_activation_backward` from
+:mod:`veomni.ops.kernels.moe_experts.shared.activation`, and the only way to
+differentiate an arbitrary transformers callable there is a fresh
+``requires_grad_(True)`` leaf under ``enable_grad``. Dynamo rejects that flip, so
+**a name outside :data:`SUPPORTED_ACTIVATIONS` runs but does not compile under
+``fullgraph=True``**. The four served names use ATen backward ops and do compile.
+No model in this repository configures a name outside the set.
 
 A Triton elementwise kernel was considered and rejected. The activation sits
 between GEMMs whose operands are already quantized through TileLang, so it is a
@@ -57,13 +64,16 @@ from __future__ import annotations
 import inspect
 from functools import lru_cache
 
+import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 
 __all__ = [
     "SUPPORTED_ACTIVATIONS",
+    "resolve",
     "apply_activation",
+    "apply_activation_backward",
     "normalize_activation",
     "supported_activations",
     "supports",
@@ -94,9 +104,16 @@ __all__ = [
 #:   the repository's own configs; refusing it would reject a value that is
 #:   bit-for-bit the row's default.
 #: * ``gelu`` -- the exact-erf form, the most likely hand-edited value.
-#: * ``gelu_pytorch_tanh`` / ``gelu_new`` -- two *different* implementations
-#:   (``torch.pow(x, 3.0)`` versus ``x * x * x``), which is the distinction that
-#:   produced a real bug earlier in this review. Keeping both keeps that pinned.
+#: * ``gelu_pytorch_tanh`` -- the tanh approximation Gemma uses; distinct from
+#:   ``gelu``, and the only GELU form ``aten.gelu_backward`` reproduces bit for bit.
+#:
+#: A third GELU spelling exists in transformers that stages ``torch.pow(x, 3.0)``
+#: where ``gelu_pytorch_tanh`` writes ``x * x * x``. It is not listed: no model in
+#: this repository configures it, and no ATen backward reproduces it in low
+#: precision -- ``aten.gelu_backward(approximate="tanh")`` differs by ~1% mean
+#: relative error in bf16, because the rounding of a staged ``pow`` is not the
+#: rounding of a closed-form derivative. A name with no user and no exact row is not
+#: a capability worth claiming; configure ``gelu_pytorch_tanh`` instead.
 #:
 #: Everything else -- ``gelu_10``, ``gelu_accurate``, ``gelu_fast``,
 #: ``gelu_python``, ``gelu_python_tanh``, ``hardswish``, ``laplace``,
@@ -113,7 +130,6 @@ SUPPORTED_ACTIVATIONS: tuple[str, ...] = (
     "silu",
     "swish",
     "gelu",
-    "gelu_new",
     "gelu_pytorch_tanh",
 )
 
@@ -180,6 +196,29 @@ def normalize_activation(activation: str) -> str:
     return name
 
 
+def resolve(activation: str):
+    """Return the transformers callable for *activation*, whatever the name.
+
+    Unlike :func:`apply_activation` this does not restrict itself to
+    :data:`SUPPORTED_ACTIVATIONS`: a row that falls back to a reference path needs to
+    evaluate any name the model configured, and ``ACT2FN`` is the same table the model
+    built its own ``act_fn`` from.
+
+    Raises:
+        ValueError: if transformers has no implementation for the name.
+    """
+    from transformers.activations import ACT2FN
+
+    name = activation.value if hasattr(activation, "value") else activation
+    implementation = _resolver(name)
+    if implementation is None:
+        raise ValueError(
+            f"transformers has no implementation for activation {name!r}, so it cannot "
+            f"be evaluated. Known names are {sorted(ACT2FN)}."
+        )
+    return implementation
+
+
 def apply_activation(hidden: Tensor, activation: str) -> Tensor:
     """Evaluate ``activation(hidden)`` through transformers' own implementation."""
     name = normalize_activation(activation)
@@ -188,3 +227,42 @@ def apply_activation(hidden: Tensor, activation: str) -> Tensor:
         # HF's autograd both use this spelling, so gradients stay bit-comparable.
         return F.silu(hidden)
     return _resolver(name)(hidden)
+
+
+def apply_activation_backward(grad_output: Tensor, hidden: Tensor, activation: str) -> Tensor:
+    """Return ``grad_output * activation'(hidden)``, for a hand-written backward.
+
+    Needed where a caller computes the activation itself: ``moe_experts`` owns
+    ``torch.autograd.Function``s, and an activation evaluated in their ``forward``
+    runs under ``no_grad``, so autograd never differentiates it. The ``gated_mlp``
+    rows do not use this -- they are opaque wrappers, and autograd handles them.
+
+    Four names, one branch each, and no fallback: each is an ATen backward op rather
+    than a restated formula, so the gradient is bit-exact against ``ACT2FN``'s
+    autograd in bf16 and fp32. A name outside :data:`SUPPORTED_ACTIVATIONS` raises
+    here rather than differentiating as whichever branch happened to come last.
+
+    Args:
+        grad_output: Upstream gradient.
+        hidden: The activation's input, in whatever dtype forward used.
+        activation: A name :data:`SUPPORTED_ACTIVATIONS` serves.
+
+    Returns:
+        The gradient with respect to ``hidden``, in ``hidden``'s dtype.
+    """
+    name = activation.value if hasattr(activation, "value") else activation
+    if name == "silu":
+        return torch.ops.aten.silu_backward(grad_output, hidden)
+    if name == "swish":
+        # HF aliases ``swish`` to SiLU, and naming it here keeps the second supported
+        # spelling visible rather than hidden inside a normalization step.
+        return torch.ops.aten.silu_backward(grad_output, hidden)
+    if name == "gelu":
+        return torch.ops.aten.gelu_backward(grad_output, hidden, approximate="none")
+    if name == "gelu_pytorch_tanh":
+        return torch.ops.aten.gelu_backward(grad_output, hidden, approximate="tanh")
+    raise ValueError(
+        f"No activation backward for {activation!r}. This supports exactly "
+        f"{sorted(SUPPORTED_ACTIVATIONS)}; adding another means adding its ATen "
+        f"backward here in the same change."
+    )

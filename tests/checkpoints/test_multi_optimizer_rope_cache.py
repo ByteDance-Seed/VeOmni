@@ -83,16 +83,13 @@ def _build(theta=10000, rope_class=Qwen3RotaryEmbedding):
     return model, MultiOptimizer(model, {"model": leaf}, ["model"])
 
 
-def _registry_rope_class(backend):
+def _registry_rope_class():
     import importlib
-    from unittest.mock import patch
 
     from veomni.models.registry import MODELING_REGISTRY
-    from veomni.models.transformers import qwen3
 
-    with patch.object(qwen3, "IS_NPU_AVAILABLE", backend == "npu"):
-        model_class = MODELING_REGISTRY["qwen3"]("Qwen3Model")
-    assert model_class.__module__.endswith(f"patched_modeling_qwen3_{backend}")
+    model_class = MODELING_REGISTRY["qwen3"]("Qwen3Model")
+    assert model_class.__module__ == "veomni.models.transformers.qwen3.modeling_qwen3"
     return importlib.import_module(model_class.__module__).Qwen3RotaryEmbedding
 
 
@@ -128,8 +125,8 @@ def _rope_transitions(model, optimizer):
     return result
 
 
-def _fresh_resume(_rank, checkpoint, expected_path, backend=None):
-    rope_class = Qwen3RotaryEmbedding if backend is None else _registry_rope_class(backend)
+def _fresh_resume(_rank, checkpoint, expected_path, use_registry=False):
+    rope_class = _registry_rope_class() if use_registry else Qwen3RotaryEmbedding
     model, optimizer = _build(rope_class=rope_class)
     DistributedCheckpointer.load(
         checkpoint,
@@ -293,9 +290,9 @@ def _skew_device_recomputation(monkeypatch):
     monkeypatch.setitem(ROPE_INIT_FUNCTIONS, "dynamic", skewed)
 
 
-@pytest.mark.parametrize("backend", ["hf", "gpu", "npu"])
+@pytest.mark.parametrize("backend", ["hf", "veomni"])
 def test_cpu_origin_rope_with_device_rounding_difference_resumes_exactly(tmp_path, monkeypatch, backend):
-    rope_class = Qwen3RotaryEmbedding if backend == "hf" else _registry_rope_class(backend)
+    rope_class = Qwen3RotaryEmbedding if backend == "hf" else _registry_rope_class()
     model, optimizer = _build(rope_class=rope_class)
     _update(model, optimizer, 1.0)
     _skew_device_recomputation(monkeypatch)
@@ -315,9 +312,9 @@ def test_cpu_origin_rope_with_device_rounding_difference_resumes_exactly(tmp_pat
         torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("backend", ["hf", "gpu", "npu"])
+@pytest.mark.parametrize("backend", ["hf", "veomni"])
 def test_distinct_cpu_and_device_origin_rope_is_rejected_before_restore(tmp_path, monkeypatch, backend):
-    rope_class = Qwen3RotaryEmbedding if backend == "hf" else _registry_rope_class(backend)
+    rope_class = Qwen3RotaryEmbedding if backend == "hf" else _registry_rope_class()
     model, optimizer = _build(rope_class=rope_class)
     _skew_device_recomputation(monkeypatch)
     checkpoint = str(tmp_path / "checkpoint")
@@ -388,7 +385,7 @@ def test_changed_qwen3_rope_implementation_is_rejected_before_restore(tmp_path):
     DistributedCheckpointer.save(
         checkpoint, {"model": model, "optimizer": optimizer, "_veomni_scheduler_object": None}, parallel_state=parallel
     )
-    target, restored = _build(rope_class=_registry_rope_class("gpu"))
+    target, restored = _build(rope_class=_registry_rope_class())
     torch.testing.assert_close(model.rope.inv_freq, target.rope.inv_freq, rtol=0, atol=0)
     before = target.projection.weight.detach().clone()
     with pytest.raises(RuntimeError, match="layout|identity"):
@@ -474,9 +471,8 @@ def test_real_qwen3_dynamic_rope_reset_fresh_process_matches_next_update(tmp_pat
     mp.spawn(_fresh_resume, args=(checkpoint, str(expected)), nprocs=1, join=True)
 
 
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
-def test_registry_qwen3_dynamic_rope_reset_fresh_process_matches_next_update(tmp_path, backend):
-    model, optimizer = _build(rope_class=_registry_rope_class(backend))
+def test_registry_qwen3_dynamic_rope_reset_fresh_process_matches_next_update(tmp_path):
+    model, optimizer = _build(rope_class=_registry_rope_class())
     _update(model, optimizer, 1.0)
     model.rope(torch.zeros((1, 1, 8)), torch.arange(32).view(1, -1))
     model.rope(torch.zeros((1, 1, 8)), torch.arange(4).view(1, -1))
@@ -490,7 +486,7 @@ def test_registry_qwen3_dynamic_rope_reset_fresh_process_matches_next_update(tmp
     trace = _rope_transitions(model, optimizer)
     expected = tmp_path / "expected.pt"
     torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "trace": trace}, expected)
-    mp.spawn(_fresh_resume, args=(checkpoint, str(expected), backend), nprocs=1, join=True)
+    mp.spawn(_fresh_resume, args=(checkpoint, str(expected), True), nprocs=1, join=True)
 
 
 def _rank_local_rope_reset(rank, checkpoint, directory, phase, endpoint):
