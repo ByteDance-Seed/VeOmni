@@ -694,10 +694,16 @@ def parallelize_model_fsdp2(
     if parallel_state.any_extra_parallel_enabled:
         parallel_plan = get_runtime_parallel_plan(model)
         assert parallel_plan is not None, (
-            "ExtraParallel needs parallel plan defined in the model! \
-            Please see veomni/models/transformers/qwen3_moe/parallel_plan.py for example of expert parallelism. \
-            Please see tests/utils/test_extra_parallel_clip_grad_norm.py::test_clip_grad_norm_fsdp2_ep2_emb4 \
-            for example of expert parallelism + embed parallelism."
+            f"ExtraParallel {parallel_state.extra_parallel_names} is enabled for this run, but "
+            f"{type(model).__name__} declares no parallel plan. Every ExtraParallel dimension the "
+            "run enables must be implemented by the modules it shards, so either:\n"
+            "  * give this module a plan (see veomni/models/transformers/qwen3_moe/parallel_plan.py "
+            "for expert parallelism, and tests/utils/test_extra_parallel_clip_grad_norm.py::"
+            "test_clip_grad_norm_fsdp2_ep2_emb4 for expert + embed); or\n"
+            "  * turn this dimension off for this module. A per-module overlay that inherits the "
+            "global mesh is the usual cause: set the module's own `ep_size: 1` (and drop the "
+            "matching `extra_parallel_*` entry) when it holds nothing that dimension shards, "
+            "e.g. a vision tower under a backbone's expert parallelism."
         )
         # Add SpecInfo to extra_parallel modules,
         #   e.g. embed_tokens.weight, decoder.regular_mlp, decoder.embed_tokens.weight, and decoder.moe.experts

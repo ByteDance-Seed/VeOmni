@@ -102,3 +102,40 @@ def test_extra_parallel_only_rejects_torch_compile_instead_of_running_eager(monk
             compile_config=CompileConfig(enable=True),
             init_device="meta",
         )
+
+
+def test_a_plan_less_module_under_an_enabled_extra_parallel_dim_says_how_to_fix_it(monkeypatch):
+    """The assertion is right to fire; what it says decides whether it is actionable.
+
+    A plan-less module is normally a per-module overlay that inherited the global
+    mesh (a vision tower under a backbone's `ep`). The bare message only pointed at
+    example plans, which does not tell that user the cheaper fix is to turn the
+    dimension off for this module.
+    """
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+
+    from veomni.distributed import torch_parallelize
+
+    monkeypatch.setattr(
+        torch_parallelize,
+        "get_parallel_state",
+        lambda: SimpleNamespace(
+            fsdp_enabled=True,
+            dp_mode="fsdp2",
+            any_extra_parallel_enabled=True,
+            extra_parallel_names=("ep",),
+            extra_parallel_enabled=lambda name: True,
+            extra_parallel_fsdp_device_mesh={"ep": None},
+        ),
+    )
+    monkeypatch.setattr(torch_parallelize, "get_runtime_parallel_plan", lambda model: None)
+
+    with pytest.raises(AssertionError) as excinfo:
+        torch_parallelize.parallelize_model_fsdp2(nn.Linear(2, 2), init_device="meta")
+
+    message = str(excinfo.value)
+    assert "parallel plan" in message
+    assert "ep_size: 1" in message, "must name the per-module opt-out, which is the usual fix"
+    assert "qwen3_moe/parallel_plan.py" in message, "must still point at a worked example"
