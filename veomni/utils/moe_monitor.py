@@ -256,8 +256,8 @@ class MoERouterMonitor:
         self._counts: Dict[int, torch.Tensor] = {}
 
         # Physical EP telemetry is keyed by the stable router-layer index used
-        # by the Qwen3.5 load-balancer attachment. Tensors live on the same
-        # device as the corresponding logical router counts.
+        # by the Qwen3.5 load-balancer attachment. Physical counts accumulate
+        # on the host until the interval snapshot.
         self._ep_rank_loads_before: Dict[int, torch.Tensor] = {}
         self._ep_rank_loads_after: Dict[int, torch.Tensor] = {}
         # Per-layer [active_replicas, moved_tokens, total_routed_tokens].
@@ -376,8 +376,8 @@ class MoERouterMonitor:
         """Accumulate physical EP-rank balance telemetry for one routing plan.
 
         The caller supplies one before/after load per EP rank. The monitor
-        validates each plan before mutating interval state and deliberately
-        stores the values on the corresponding router-count device.
+        validates each plan before mutating interval state and stores the
+        values on the host for transfer when the interval snapshot is collected.
         """
         if self._paused or self._disabled:
             return
