@@ -38,15 +38,21 @@ SCALE_FORMATS = ("e4m3", "ue8m0")
 
 
 def _round_to_fp4(values: Tensor) -> Tensor:
-    """Round to the nearest E2M1 magnitude, keeping the sign *including its zero*.
+    """Round to the nearest E2M1 magnitude, ties to even, keeping the sign's zero.
 
     The midpoints between consecutive magnitudes are ``0.25, 0.75, 1.25, 1.75,
-    2.5, 3.5, 5.0``; a value exactly on one rounds *down*. That is what the
-    released DeepSeek checkpoints were produced with and what the deployment
-    kernel reads back, so it is the convention here -- note it is not
-    round-half-to-even (``0.75 -> 0.5``, ``2.5 -> 2.0``), which is what a
-    hardware E2M1 convert typically does. Written out rather than derived from a
-    table because the table would have to be indexed by an already-quantized code.
+    2.5, 3.5, 5.0``, and a value exactly on one rounds to the **even code**, which
+    is what ``reference_fp4_act_quant`` does (its algorithm comes from the
+    release's ``inference/kernel.py``): ``0.75 -> 1.0``, ``1.75 -> 2.0``,
+    ``2.5 -> 2.0``, ``3.5 -> 4.0``. An earlier revision of this file rounded ties
+    down, which was wrong -- it stored ``0.75`` as ``0.5`` and would have put
+    training a whole code point away from what the deployment kernel produces.
+
+    Even code is decided by the index into ``(0, 0.5, 1, 1.5, 2, 3, 4, 6)``, so
+    the tie targets are ``0.25 -> 0.0`` (code 0), ``0.75 -> 1.0`` (2), ``1.25 ->
+    1.0`` (2), ``1.75 -> 2.0`` (4), ``2.5 -> 2.0`` (4), ``3.5 -> 4.0`` (6) and
+    ``5.0 -> 4.0`` (6). Written out rather than derived from a table because the
+    table would have to be indexed by an already-quantized code.
 
     The sign comes from the magnitude of the *encoded* value via ``signbit``
     rather than ``sign()``: ``sign()`` returns ``0`` for ``-0.0``, so a small
@@ -55,17 +61,24 @@ def _round_to_fp4(values: Tensor) -> Tensor:
     to survive the round trip.
     """
     a = values.abs()
+    # Half-open intervals with the tie on the even side: ``<=`` where the tie
+    # resolves down to an even code (0.25, 1.25, 2.5, 5.0) and ``<`` where it
+    # resolves up (0.75, 1.75, 3.5).
     nearest = torch.where(
-        a <= 1.75,
+        a <= 0.25,
+        0.0,
         torch.where(
-            a <= 0.75,
-            torch.where(a <= 0.25, 0.0, 0.5),
-            torch.where(a <= 1.25, 1.0, 1.5),
-        ),
-        torch.where(
-            a <= 3.5,
-            torch.where(a <= 2.5, 2.0, 3.0),
-            torch.where(a <= 5.0, 4.0, 6.0),
+            a < 0.75,
+            0.5,
+            torch.where(
+                a <= 1.25,
+                1.0,
+                torch.where(
+                    a < 1.75,
+                    1.5,
+                    torch.where(a <= 2.5, 2.0, torch.where(a < 3.5, 3.0, torch.where(a <= 5.0, 4.0, 6.0))),
+                ),
+            ),
         ),
     )
     return torch.where(torch.signbit(values), -nearest, nearest)

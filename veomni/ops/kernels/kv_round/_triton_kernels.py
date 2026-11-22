@@ -76,18 +76,25 @@ def _triton_fp4_roundtrip_kernel(
     v = tl.div_rn(x, scale)
     v = tl.minimum(tl.maximum(v, -6.0), 6.0)
     a = tl.abs(v)
-    # Nearest E2M1 magnitude; a value exactly on a midpoint rounds down.
+    # Nearest E2M1 magnitude, ties to even -- the same rule as the eager row and
+    # ``reference_fp4_act_quant``: 0.25/1.25/2.5/5.0 round down to an even code and
+    # 0.75/1.75/3.5 round up to one. Rounding every tie down (an earlier revision)
+    # stores 0.75 as 0.5, a whole code point away from the deployment kernel.
     nearest = tl.where(
-        a <= 1.75,
+        a <= 0.25,
+        0.0,
         tl.where(
-            a <= 0.75,
-            tl.where(a <= 0.25, 0.0, 0.5),
-            tl.where(a <= 1.25, 1.0, 1.5),
-        ),
-        tl.where(
-            a <= 3.5,
-            tl.where(a <= 2.5, 2.0, 3.0),
-            tl.where(a <= 5.0, 4.0, 6.0),
+            a < 0.75,
+            0.5,
+            tl.where(
+                a <= 1.25,
+                1.0,
+                tl.where(
+                    a < 1.75,
+                    1.5,
+                    tl.where(a <= 2.5, 2.0, tl.where(a < 3.5, 3.0, tl.where(a <= 5.0, 4.0, 6.0))),
+                ),
+            ),
         ),
     )
     # Preserve the input's sign bit, including ``-0.0``. ``v < 0`` alone makes a

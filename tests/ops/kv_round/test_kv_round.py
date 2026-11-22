@@ -567,3 +567,41 @@ def test_fp4_triton_row_accepts_an_empty_operand():
     x = torch.zeros(2, 0, dtype=torch.bfloat16)
     out = fp4_triton.triton_fp4_roundtrip(x, block_size=16)
     assert out.shape == x.shape
+
+
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_fp4_eager_matches_the_release_reference_quantizer(block_size: int):
+    """The row must reproduce ``reference_fp4_act_quant`` operation for operation.
+
+    That reference's algorithm comes from the release's own ``inference/kernel.py``,
+    so it is the authority on what deployment stores. ``ue8m0`` is the format it
+    implements; ``e4m3`` is this family's own addition and has no reference.
+    """
+    from tests.ops.qat.reference import reference_fp4_act_quant
+    from veomni.ops.kernels.kv_round.fp4.eager import fp4_roundtrip
+
+    torch.manual_seed(31)
+    for scale in (1.0, 1e-3, 50.0):
+        x = (torch.randn(4, 8, block_size * 2) * scale).to(torch.bfloat16)
+        actual = fp4_roundtrip(x, block_size=block_size, scale_fmt="ue8m0")
+        expected = reference_fp4_act_quant(x, block_size, dequant=True)
+        if not torch.equal(actual, expected):
+            bad = (actual != expected).sum().item()
+            raise AssertionError(f"scale={scale} block={block_size}: {bad}/{actual.numel()} differ")
+
+
+@pytest.mark.parametrize(
+    "value, expected", [(0.25, 0.0), (0.75, 1.0), (1.25, 1.0), (1.75, 2.0), (2.5, 2.0), (3.5, 4.0), (5.0, 4.0)]
+)
+def test_fp4_rounds_midpoints_to_the_even_code(value: float, expected: float):
+    """A value exactly between two magnitudes takes the even code, not the lower one.
+
+    This is the rule ``reference_fp4_act_quant`` implements; rounding every tie down
+    stores ``0.75`` as ``0.5``, one code point away from deployment. Checked on both
+    signs, because the sign is applied separately from the magnitude.
+    """
+    from veomni.ops.kernels.kv_round.fp4.eager import _round_to_fp4
+
+    for sign in (1.0, -1.0):
+        got = _round_to_fp4(torch.tensor([sign * value], dtype=torch.float32))
+        torch.testing.assert_close(got, torch.tensor([sign * expected], dtype=torch.float32), rtol=0, atol=0)
