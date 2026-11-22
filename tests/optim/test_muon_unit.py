@@ -28,7 +28,7 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.models.configuration_base import as_veomni_config
 from veomni.optim import muon as muon_impl
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_gpu_compute_capability
 
 
 muon_module = pytest.importorskip("torch.optim._muon")
@@ -1363,3 +1363,58 @@ def test_moe_local_3d_newton_schulz_skips_chunking_below_the_threshold():
     _chunked_newton_schulz(local, _ns)
 
     assert calls == [(3, 4, 4)]
+
+
+@pytest.mark.skipif(
+    not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE),
+    reason="CUDA or NPU required",
+)
+def test_moe_local_3d_newton_schulz_chunking_matches_whole_stack_on_accelerator(monkeypatch):
+    """Exercise rectangular 3D chunking (with a 1-expert tail) on accelerator Gram and CUDA gram_quack."""
+    import importlib.util
+
+    import veomni.optim.muon as muon_mod
+    from veomni.optim.muon import _MOE_LOCAL_3D_NS_CHUNK, _chunked_newton_schulz
+
+    torch.manual_seed(0)
+    experts, rows, cols = 7, 128, 256
+    assert experts % _MOE_LOCAL_3D_NS_CHUNK == 1
+    local = torch.randn(experts, rows, cols, device=get_device_type(), dtype=torch.bfloat16)
+
+    backends = ["gram"]
+    if IS_CUDA_AVAILABLE and importlib.util.find_spec("gram_newton_schulz") is not None:
+        backends.append("gram_quack")
+
+    for backend in backends:
+        if backend == "gram_quack":
+            monkeypatch.setattr(muon_mod, "_GRAM_QUACK_FALLBACK_WARNED", False)
+
+        shapes = []
+
+        def _ns(x, _backend=backend, _shapes=shapes):
+            _shapes.append(tuple(x.shape))
+            return run_newton_schulz(
+                x,
+                ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+                ns_steps=DEFAULT_NS_STEPS,
+                eps=1e-7,
+                ns_implementation=_backend,
+                gram_ns_reset_iterations=(2,),
+            )
+
+        chunked = _chunked_newton_schulz(local, _ns)
+        assert shapes == [(3, rows, cols), (3, rows, cols), (1, rows, cols)]
+
+        whole = run_newton_schulz(
+            local,
+            ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+            ns_steps=DEFAULT_NS_STEPS,
+            eps=1e-7,
+            ns_implementation=backend,
+            gram_ns_reset_iterations=(2,),
+        )
+        assert chunked.dtype == local.dtype
+        assert torch.isfinite(chunked).all()
+        torch.testing.assert_close(chunked.float(), whole.float(), atol=5e-3, rtol=5e-3)
+        if backend == "gram_quack":
+            assert muon_mod._GRAM_QUACK_FALLBACK_WARNED is (get_gpu_compute_capability(local.device) < 90)

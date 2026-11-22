@@ -292,12 +292,14 @@ def test_async_offload_rejects_cpu_tensors():
 
 
 def test_deferred_free_requires_an_allocator_owned_storage(monkeypatch):
-    """A tensor over foreign memory cannot rely on ``record_stream``.
+    """A tensor over foreign or copy-on-write memory cannot rely on ``record_stream``.
 
     ``from_numpy`` / ``from_dlpack`` / ``frombuffer`` hand the allocator a deleter
     it does not recognise, so ``record_stream`` returns without pinning anything
     and the storage can be freed the moment ``set_`` drops the last reference.
-    Those storages report ``resizable() == False``, which is the check.
+    Those storages report ``resizable() == False``. ``torch._lazy_clone`` keeps
+    ``resizable() == True`` but wraps the pointer in PyTorch's COW deleter, which
+    is rejected via ``torch._C._is_cow_tensor``.
     """
     from veomni.distributed import async_offload
 
@@ -311,6 +313,13 @@ def test_deferred_free_requires_an_allocator_owned_storage(monkeypatch):
     foreign = torch.from_numpy(np.zeros(4, dtype=np.float32))
     assert not foreign.untyped_storage().resizable()
     assert not async_offload._deferred_free_supported(foreign)
+
+    if hasattr(torch, "_lazy_clone") and hasattr(torch._C, "_is_cow_tensor"):
+        cow_source = torch.empty(4)
+        cow_clone = torch._lazy_clone(cow_source)
+        assert cow_clone.untyped_storage().resizable()
+        assert not async_offload._deferred_free_supported(cow_clone)
+        assert not async_offload._deferred_free_supported(cow_source)
 
 
 def test_deferred_free_is_false_without_the_native_allocator(monkeypatch):
@@ -417,6 +426,83 @@ def test_pinned_buffer_pool_refreshes_layout_recency_on_reuse():
     pool.acquire(layouts[1])
 
     assert pool.allocations == allocations_before + 1
+
+
+def test_pinned_buffer_pool_waits_for_pending_event_on_eviction():
+    """Evicting a pooled buffer before reuse must synchronize its pending event outside the lock."""
+    pool = PinnedBufferPool(max_cached_bytes=32)
+
+    class _FakeEvent:
+        def __init__(self):
+            self.sync_count = 0
+            self.lock_free_during_sync = None
+
+        def synchronize(self):
+            self.sync_count += 1
+            acquired = pool._lock.acquire(blocking=False)
+            self.lock_free_during_sync = acquired
+            if acquired:
+                pool._lock.release()
+
+    first, first_key = pool.acquire(torch.empty((4,), dtype=torch.float32))  # 16 bytes
+    second, second_key = pool.acquire(torch.empty((8,), dtype=torch.float32))  # 32 bytes
+    pending = _FakeEvent()
+    first._last_swap_event = pending
+
+    # Release fits in the cache: wait is deferred and the tag stays attached.
+    pool.release(first, first_key)
+    assert pending.sync_count == 0
+    assert "_last_swap_event" in first.__dict__
+
+    # Releasing a 32-byte buffer forces eviction of ``first`` without ever returning via ``acquire()``.
+    pool.release(second, second_key)
+    assert pool.evictions == 1
+    assert pending.sync_count == 1
+    assert pending.lock_free_during_sync is True
+    assert "_last_swap_event" not in first.__dict__
+
+
+def test_pinned_buffer_pool_waits_for_pending_event_on_reuse_and_drop():
+    """Both reuse (``acquire``) and direct drop (``release``) synchronize and clear ``_last_swap_event``."""
+    pool = PinnedBufferPool(max_cached_bytes=16)
+
+    class _FakeEvent:
+        def __init__(self, target_pool):
+            self._pool = target_pool
+            self.sync_count = 0
+            self.lock_free_during_sync = None
+
+        def synchronize(self):
+            self.sync_count += 1
+            acquired = self._pool._lock.acquire(blocking=False)
+            self.lock_free_during_sync = acquired
+            if acquired:
+                self._pool._lock.release()
+
+    # Reuse path: release defers, acquire synchronizes outside the lock and clears the tag.
+    small_src = torch.empty((4,), dtype=torch.float32)  # 16 bytes
+    buf, key = pool.acquire(small_src)
+    reuse_event = _FakeEvent(pool)
+    buf._last_swap_event = reuse_event
+    pool.release(buf, key)
+    assert reuse_event.sync_count == 0
+
+    reused, _ = pool.acquire(small_src)
+    assert reused is buf
+    assert reuse_event.sync_count == 1
+    assert reuse_event.lock_free_during_sync is True
+    assert "_last_swap_event" not in reused.__dict__
+
+    # Drop path: oversized buffer bypasses cache and synchronizes on release outside the lock.
+    big_src = torch.empty((8,), dtype=torch.float32)  # 32 bytes > max_cached_bytes=16
+    big_buf, big_key = pool.acquire(big_src)
+    drop_event = _FakeEvent(pool)
+    big_buf._last_swap_event = drop_event
+    pool.release(big_buf, big_key)
+    assert pool.drops == 1
+    assert drop_event.sync_count == 1
+    assert drop_event.lock_free_during_sync is True
+    assert "_last_swap_event" not in big_buf.__dict__
 
 
 def test_async_offload_manager_resets_at_step_boundary():

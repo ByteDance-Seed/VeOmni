@@ -276,9 +276,10 @@ lifecycle across GPU and CPU:
    alive, so the copy is ordered by the stream rather than by a blocking event wait.
    Every other case keeps the event synchronize, because `record_stream` cannot defer
    a free there: NPU and MLU allocators, CUDA's async allocator,
-   `PYTORCH_NO_CUDA_MEMORY_CACHING`, and any tensor whose storage the allocator does
-   not own (`torch.from_numpy`, `from_dlpack`, `frombuffer` — those storages report
-   `resizable() == False`). `veomni.utils.device.is_caching_allocator_active()`
+   `PYTORCH_NO_CUDA_MEMORY_CACHING`, tensors over foreign storage
+   (`torch.from_numpy`, `from_dlpack`, `frombuffer` — those storages report
+   `resizable() == False`), and copy-on-write tensors (`torch._lazy_clone`, whose
+   deleter wraps the underlying storage). `veomni.utils.device.is_caching_allocator_active()`
    answers the allocator half of that question, and it is deliberately conservative.
 4. **H2D (launch_h2d):** On the swap stream, allocate new device storage with the
    saved size/stride, copy from the pinned CPU buffer (non-blocking), and bind

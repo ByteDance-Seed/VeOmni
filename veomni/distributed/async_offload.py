@@ -255,21 +255,32 @@ class GetCnt:
         return self._block_tensor_nums[block_idx]
 
 
+_is_cow_tensor = getattr(torch._C, "_is_cow_tensor", None)
+
+
 def _deferred_free_supported(tensor=None) -> bool:
     """Whether ``record_stream`` can keep ``tensor``'s storage alive, as this path assumes.
 
     Delegates to :func:`~veomni.utils.device.is_caching_allocator_active` for the
-    allocator question, and additionally requires the storage to belong to that
-    allocator: a tensor built over foreign memory (``torch.from_numpy``,
-    ``from_dlpack``, ``frombuffer``) carries a deleter the allocator does not
-    recognise, so ``record_stream`` returns without doing anything and the memory
-    can be released the moment ``set_`` drops the last reference. Those storages
-    report ``resizable() == False``.
+    allocator question, and additionally requires the storage to belong directly
+    to that allocator:
+    - A tensor built over foreign memory (``torch.from_numpy``, ``from_dlpack``,
+      ``frombuffer``) carries a deleter the allocator does not recognise, so
+      ``record_stream`` returns without doing anything and the memory can be
+      released the moment ``set_`` drops the last reference. Those storages report
+      ``resizable() == False``.
+    - A copy-on-write tensor (``torch._lazy_clone``) keeps ``resizable() == True``
+      while wrapping the pointer in PyTorch's COW deleter instead of the native
+      caching allocator's deleter; reject it via ``torch._C._is_cow_tensor`` so it
+      takes the host-synchronize path.
     """
     if not is_caching_allocator_active():
         return False
-    if tensor is not None and not tensor.untyped_storage().resizable():
-        return False
+    if tensor is not None:
+        if not tensor.untyped_storage().resizable():
+            return False
+        if _is_cow_tensor is not None and _is_cow_tensor(tensor):
+            return False
     return True
 
 
