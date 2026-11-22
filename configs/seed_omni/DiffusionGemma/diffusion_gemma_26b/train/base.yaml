@@ -1,0 +1,105 @@
+# DiffusionGemma-26B-A4B block-diffusion training as a single SeedOmni module.
+#
+#   bash train.sh tasks/omni/train_omni.py \
+#     configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/train/base.yaml \
+#     --model.model_path /path/to/diffusiongemma-26B-A4B-it \
+#     --data.train_path /path/to/train.jsonl
+#
+# The batch is built by `DiffusionGemmaCollator` itself, instantiated inside the
+# module's `batch_pre` -- that is where packing, the left-padded prompt path and the
+# canvas stack live, and a second copy would be a second canvas geometry.
+#
+# Memory is the binding constraint at 26B: the weights are 49GB and an FSDP
+# all-gather of a fully unsharded layer does not fit on one card. `ep_size` must
+# therefore cover the whole world so the expert tensors are sharded, and
+# `max_canvases` stays small -- the encoder sequence is `P + K*C`, so every extra
+# canvas is another `canvas_length` tokens of context. Measured on 8 x A800-80GB
+# with ~8GB already resident per card: `ep_size: 8` + `max_canvases: 2` peaks at
+# 63.7GB; without EP, or with `max_canvases: 8`, it OOMs during the unshard.
+model:
+  model_path: diffusiongemma-26B-A4B-it
+  model_config:
+    modules: configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/train/modules_train.yaml
+    train_graph: configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/train/graph_train.yaml
+    max_seq_len: 1024
+    text_keys: messages
+    # The checkpoint's own template, driven through `apply_chat_template` -- the same
+    # one the non-Omni config uses. There is no `gemma3` registry entry.
+    chat_template: tokenizer_generation_prompt
+    # The canvas geometry the preprocessor cuts the answer with. `max_canvases`
+    # bounds the encoder sequence; `compute_all_canvas_df_loss` keeps the `(K, C)`
+    # stack on one feature rather than repeating the encoder.
+    canvas_length: 256
+    max_canvases: 2
+    canvas_start: 0
+    compute_all_canvas_df_loss: true
+    canvas_batching: flat_seq_pack
+    self_conditioning_prob: 0.5
+    encoder_ar_loss: true
+    # Required by `OmniArguments` even for a training-only launch. The graph is a
+    # placeholder: this module has no denoising FSM yet, so inference through it is
+    # not a validated path (see the graph's own comment).
+    infer_graph:
+      infer_gen: configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/infer/graph_infer_gen.yaml
+    infer_type: infer_gen
+  ops_implementation:
+    # No flavour of FlashAttention: the decoder attends bidirectionally over
+    # `[encoder cache | canvas]`, which flash cannot represent.
+    attn_implementation: sdpa
+    moe_implementation: fused_triton
+
+  accelerator:
+    ulysses_size: 1
+    ep_size: 8
+    init_device: meta
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_decay_style: cosine
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+
+data:
+  data_type: seedomni
+  train_path: /mnt/hdfs/user_dir/text_diff/data/sudoku/train.jsonl
+  datasets_type: mapping
+  # `source_name` selects a `SEED_OMNI_PREPROCESSOR_REGISTRY` entry; the text-only
+  # conversation layout is the same one the non-Omni path reads.
+  source_name: tulu-3-sft-mixture
+  max_seq_len: 1024
+  dataloader:
+    type: native
+    num_workers: 0
+    drop_last: true
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+  max_steps: 2
+
+  checkpoint:
+    output_dir: /mnt/hdfs/user_dir/text_diff/dllm_trainer/ckpt/omni_diffusion_gemma_26b
+    save_steps: 1000
+    save_epochs: 0
+    save_hf_weights: false
+
+  wandb:
+    enable: true
+    project: VeOmni_dLLM_omni
+    name: diffusion_gemma_26b_omni
+
+infer:
+  output_dir: /mnt/hdfs/user_dir/text_diff/dllm_trainer/ckpt/omni_diffusion_gemma_26b_infer

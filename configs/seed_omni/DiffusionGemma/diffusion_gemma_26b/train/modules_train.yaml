@@ -1,0 +1,14 @@
+# Per-module training overrides for DiffusionGemma (SeedOmni).
+#
+# One module: the encoder and decoder run inside the same node, so there is no
+# sibling to hand the KV cache to. Deep-merged onto the launcher's `model.*` block,
+# so only what differs is restated here.
+diffusion_gemma_omni:
+  model_path: diffusion_gemma_omni
+  ops_implementation:
+    attn_implementation: sdpa
+    moe_implementation: fused_triton
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false

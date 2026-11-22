@@ -1,0 +1,17 @@
+# DiffusionGemma generation FSM -- placeholder for the training-only phase.
+#
+# `OmniArguments` requires an `infer_graph` even for a training-only launch, and this
+# module does not wire the denoising loop into the FSM yet: its preprocessor raises
+# for `inference=True` because generation's own masking is not implemented.
+#
+# The vendored model does ship a `generate`, but reaching it through this graph would
+# run the stock sampler without the per-module carrier contract, so it is not a
+# validated path. The single state exists so a launcher parses; it is not a contract.
+initial: run
+
+states:
+  run:
+    body:
+      - { from: diffusion_gemma_omni, to: end }
+    transitions:
+      - { condition: { type: default }, next_state: done }
