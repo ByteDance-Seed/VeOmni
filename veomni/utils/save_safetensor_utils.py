@@ -593,11 +593,21 @@ def _save_hf_safetensor_distributed(
         deferred = {fqn: descriptor for part in gathered if part for fqn, descriptor in part.items()}
     if deferred:
         fqn_to_index_mapping = _isolate_deferred(fqn_to_index_mapping, set(deferred))
-        total_size = sum(_saved_shape_and_nbytes(fqn, tensor)[1] for fqn, tensor in save_state.items())
+        # Per-FQN sizes, then the largest claim per FQN across ranks. Summing per
+        # rank would overcount: an ordinary `ModelState` tensor has its **global**
+        # shape on every rank, so four ranks would record four copies of it. The
+        # max is also what makes this work for rank-partitioned output, where only
+        # the owner holds a given FQN at all.
+        local_sizes = {fqn: _saved_shape_and_nbytes(fqn, tensor)[1] for fqn, tensor in save_state.items()}
         if dist.is_initialized() and dist.get_world_size() > 1:
-            sizes = [None] * dist.get_world_size()
-            dist.all_gather_object(sizes, total_size)
-            total_size = sum(size for size in sizes if size is not None)
+            gathered_sizes = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered_sizes, local_sizes)
+            merged_sizes: Dict[str, int] = {}
+            for part in gathered_sizes:
+                for fqn, size in (part or {}).items():
+                    merged_sizes[fqn] = max(merged_sizes.get(fqn, 0), size)
+            local_sizes = merged_sizes
+        total_size = sum(local_sizes.values())
 
     # Consolidation runs on every rank, one output file each, instead of in the
     # writer's finish step: there only the coordinator rewrites the whole model

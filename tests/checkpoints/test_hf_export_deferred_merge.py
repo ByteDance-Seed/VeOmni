@@ -126,6 +126,18 @@ def test_an_emb_sharded_table_is_kept_split_and_merged_offline():
         pending = json.loads((Path(save_path) / HF_PENDING_MERGE_FILENAME).read_text())["tensors"]
         assert set(weight_map) == {"table", "wide", "dense", "bias"}
         assert pending == {"table": {"file": weight_map["table"], "shape": [WORLD_SIZE * ROWS, COLS], "nbytes": 192}}
+        # `total_size` counts each FQN once: the replicated tensors are global-shaped on
+        # every rank, so a per-rank sum would record the model `WORLD_SIZE` times.
+        index = json.loads((Path(save_path) / "model.safetensors.index.json").read_text())
+        one_copy = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (
+                torch.cat([_local_rows(rank) for rank in range(WORLD_SIZE)]),
+                _wide_table(),
+                *(v for v in _replicated().values()),
+            )
+        )
+        assert index["metadata"]["total_size"] == one_copy
         # Only the table waits: the replicated dense weight is just as oversized but has
         # one copy, and the column-split table's shards are not whole rows.
         assert not (Path(save_path) / weight_map["table"]).exists()
