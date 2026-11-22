@@ -769,6 +769,47 @@ def real_npu_ep_group():
             dist.destroy_process_group()
 
 
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Real singleton FSDP2 requires Ascend hardware")
+@pytest.mark.parametrize("reduce_dtype", [torch.float32, torch.bfloat16])
+def test_real_npu_singleton_fsdp_gradient_accumulation(real_npu_ep_group, reduce_dtype):
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+    from veomni.distributed.fsdp2.grad_scaling import configure_singleton_gradient_scaling
+
+    device = torch.device("npu", int(os.environ.get("LOCAL_RANK", "0")))
+    mesh = init_device_mesh("npu", (dist.get_world_size(real_npu_ep_group), 1), mesh_dim_names=("ep", "efsdp"))[
+        "efsdp"
+    ]
+    policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=reduce_dtype)
+    reference = nn.Linear(32, 16, device=device, dtype=torch.float32)
+    candidate = nn.Linear(32, 16, device=device, dtype=torch.float32)
+    candidate.load_state_dict(reference.state_dict())
+    fully_shard(reference, mesh=mesh, mp_policy=policy)
+    fully_shard(candidate, mesh=mesh, mp_policy=policy)
+    native_divide = (
+        getattr(reference, "set_gradient_divide_factor", None) or reference.set_reduce_scatter_divide_factor
+    )
+    native_divide(8)
+    assert configure_singleton_gradient_scaling(
+        candidate, mesh_size=1, reduce_dtype=reduce_dtype, gradient_divide_factor=8
+    )
+
+    generator = torch.Generator().manual_seed(17 + dist.get_rank(real_npu_ep_group))
+    for _ in range(2):
+        inputs = torch.randn(4, 32, generator=generator).to(device=device, dtype=torch.bfloat16)
+        upstream = torch.randn(4, 16, generator=generator).to(device=device, dtype=torch.bfloat16)
+        saved = upstream.clone()
+        reference_output, candidate_output = reference(inputs), candidate(inputs)
+        torch.testing.assert_close(candidate_output, reference_output, rtol=0, atol=0)
+        reference_output.backward(upstream)
+        candidate_output.backward(upstream)
+        torch.npu.synchronize()
+        for actual, expected in zip(candidate.parameters(), reference.parameters(), strict=True):
+            torch.testing.assert_close(actual.grad.to_local(), expected.grad.to_local(), rtol=0, atol=0)
+        torch.testing.assert_close(upstream, saved, rtol=0, atol=0)
+
+
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Real NPU fused MoE balance requires torch_npu and Ascend hardware")
 @pytest.mark.parametrize("optimize_memory", [False, True])
 @pytest.mark.parametrize("mixed_routing", [False, True])
