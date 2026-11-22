@@ -90,6 +90,24 @@ def test_per_site_op_selection_and_overrides(monkeypatch):
         assert (h1.kwargs, h3.kwargs) == ({"block_size": 128}, {"block_size": 64})
         assert pickle.loads(pickle.dumps(h3)) is h3
 
+        # When name=None relies on the host default ("eager" for linear/standard), switching to a different row
+        # resets inherited kwargs, whereas targeting the same host-default row merges them.
+        default_sel = OpsSelection.from_config_value(
+            {
+                "kwargs": {"block_size": 64},
+                "overrides": [
+                    {"site": r"layers\.0\..*", "name": "test_round", "kwargs": {"dtype": "fp8"}},
+                    {"site": r"layers\.1\..*", "name": "eager", "kwargs": {"extra": 1}},
+                ],
+            }
+        )
+        hd_switch = VeomniOp("linear", "standard", default_sel, site="layers.0.q_a_proj")
+        hd_same = VeomniOp("linear", "standard", default_sel, site="layers.1.q_a_proj")
+        hd_keep = VeomniOp("linear", "standard", default_sel, site="layers.2.q_a_proj")
+        assert (hd_switch.impl, hd_switch.kwargs) == ("test_round", {"dtype": "fp8"})
+        assert (hd_same.impl, hd_same.kwargs) == ("eager", {"block_size": 64, "extra": 1})
+        assert (hd_keep.impl, hd_keep.kwargs) == ("eager", {"block_size": 64})
+
         # Mutable/unhashable kwargs bypass interning so construction does not raise TypeError
         # and post-construction nested mutations cannot poison later handles.
         opts = {"scale": 2, "axes": [0, 1]}

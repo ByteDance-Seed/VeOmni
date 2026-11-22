@@ -421,15 +421,26 @@ class OpsSelection:
     kwargs: dict[str, Any] = field(default_factory=dict)
     overrides: list[SiteOverride] = field(default_factory=list)
 
-    def resolve(self, site: str | None = None) -> tuple[str | None, dict[str, Any]]:
-        """Resolve ``(impl, kwargs)`` for ``site``, applying matching overrides in order."""
-        name, kwargs = self.name, dict(self.kwargs)
+    def resolve(
+        self,
+        site: str | None = None,
+        *,
+        default_name: str | None = None,
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Resolve ``(impl, kwargs)`` for ``site``, applying matching overrides in order.
+
+        When ``self.name`` is ``None``, ``default_name`` supplies the resolved host
+        default row so an override that switches to a different row resets inherited
+        kwargs while an override targeting the same row merges them.
+        """
+        name = self.name if self.name is not None else default_name
+        kwargs = dict(self.kwargs)
         if not self.overrides or site is None:
             return name, kwargs
         for rule in self.overrides:
             if not rule.matches(site):
                 continue
-            if rule.name is not None and name is not None and rule.name != name:
+            if rule.name is not None and rule.name != name:
                 name = rule.name
                 kwargs = dict(rule.kwargs or {})
             else:
@@ -500,7 +511,8 @@ class VeomniOp:
         """Return the interned handle for the resolved row and its kwargs."""
         kwargs: dict[str, Any] = {}
         if isinstance(impl, OpsSelection):
-            impl, kwargs = impl.resolve(site)
+            default_name = OP_REGISTRY.default_impl(op, variant) if impl.name is None else None
+            impl, kwargs = impl.resolve(site, default_name=default_name)
         kwargs_key = _kwargs_cache_key(kwargs)
         if impl is not None and kwargs_key is not None:
             cached = cls._intern.get((op, variant, impl, kwargs_key))
