@@ -165,7 +165,13 @@ def test_lora_triton_casts_routing_weights(monkeypatch, variant: str):
 
 
 def test_lora_npu_helper_casts_routing_weights(monkeypatch):
-    """MoE-LoRA NPU non-EP and EP helpers cast FP32 routing weights to activation dtype."""
+    """MoE-LoRA NPU helpers cast FP32 routing weights to the activation dtype.
+
+    Both halves are checked at their entry point rather than through the expert math:
+    the EP half now delegates to `dispatch_to_ep_class`, so the dtype it hands that
+    helper is the property worth pinning. The math itself is covered numerically by
+    the eager/fused parity tests.
+    """
     from veomni.ops.kernels.moe_experts_lora import helper
 
     hidden, routing, selected, fc1, fc2 = _inputs()
@@ -173,10 +179,15 @@ def test_lora_npu_helper_casts_routing_weights(monkeypatch):
 
     npu_mod = types.ModuleType("torch_npu")
     npu_mod.npu_moe_token_permute = lambda h, s: (h, torch.arange(h.shape[0]))
-    npu_mod.npu_swiglu = lambda x, dim=-1: x[:, : x.shape[-1] // 2]
+
+    def swiglu(x, dim=-1):
+        """Halve the last dim, as the fused gate/up activation does."""
+        return x[..., : x.shape[-1] // 2]
+
+    npu_mod.npu_swiglu = swiglu
 
     def unpermute(output, row_ids_map, probs=None):
-        """Record the routing-weight dtype passed to NPU token unpermute."""
+        """Record the routing-weight dtype the non-EP path applies."""
         seen.append(probs.dtype)
         return output
 
@@ -186,27 +197,35 @@ def test_lora_npu_helper_casts_routing_weights(monkeypatch):
     from veomni.ops.kernels.moe_experts.standard import npu as std_npu
 
     monkeypatch.setattr(std_npu, "npu_group_gemm", lambda a, b, g: a)
-    monkeypatch.setattr(
-        std_npu,
-        "dispatch_preprocess",
-        lambda s, e, g: ([1], [1], torch.ones(1, e, dtype=torch.int64), torch.ones(e, dtype=torch.int64)),
-    )
-    monkeypatch.setattr(std_npu, "alltoall_dispatch", lambda h, *args: (h, torch.arange(h.shape[0])))
-
-    def combine(output, routing_weights, *args):
-        """Record the routing-weight dtype passed to NPU EP combine."""
-        seen.append(routing_weights.dtype)
-        return output
-
-    monkeypatch.setattr(std_npu, "alltoall_combine", combine)
 
     def zero_delta(x, _g):
         """Return a zero LoRA delta matching ``x``."""
         return torch.zeros_like(x)
 
     helper.npu_non_ep_forward(2, routing, selected, hidden, fc1, fc2, zero_delta, zero_delta)
+
+    # EP half: capture the dtype handed to the shared dispatch helper. `ep_size` must be
+    # above 1 for that helper to be called at all -- with a single rank the LoRA helper
+    # takes the local path, which is the non-EP call already checked above.
+    from veomni.distributed.moe import moe_layer
+
+    captured: dict[str, torch.dtype] = {}
+
+    def fake_dispatch(ep_class, num_experts, routing_weights, *args, **kwargs):
+        """Record the routing dtype and short-circuit the collectives."""
+        captured["dtype"] = routing_weights.dtype
+        return hidden
+
+    monkeypatch.setattr(moe_layer, "dispatch_to_ep_class", fake_dispatch)
+    monkeypatch.setattr(moe_layer, "expert_parallel_size", lambda: 2)
+    import veomni.distributed.moe as moe_pkg
+
+    monkeypatch.setattr(moe_pkg, "dispatch_to_ep_class", fake_dispatch)
+    monkeypatch.setattr(moe_pkg, "expert_parallel_size", lambda: 2)
     helper.npu_ep_forward(2, routing, selected, hidden, fc1, fc2, zero_delta, zero_delta)
-    assert seen == [torch.bfloat16, torch.bfloat16]
+
+    assert seen == [torch.bfloat16], "the non-EP cast"
+    assert captured["dtype"] == torch.bfloat16, "the EP cast before dispatch"
 
 
 @pytest.mark.parametrize("mode", ["shared", "independent"])

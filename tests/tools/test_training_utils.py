@@ -185,5 +185,7 @@ def test_make_eager_ops_config_covers_every_kernel_field():
 
     selection = training_utils.make_eager_ops_config()
     for field in fields(OpsImplementationConfig):
-        expected = "none" if field.name == "qat_implementation" else "eager"
+        # `eager` is not "off" for kv_round: it is a real row that rounds stored
+        # tensors, so the eager config names the `none` row instead.
+        expected = "none" if field.name == "kv_round_implementation" else "eager"
         assert getattr(selection, field.name) == expected, field.name

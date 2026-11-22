@@ -52,6 +52,14 @@ from .rms_norm_gated.standard import torch_npu as rms_torch_npu
 _GPU = GpuKernelRequirement()
 _FLASH_QLA_GPU = GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=100),))
 
+#: ``chunk_gated_delta_rule`` rows that consume grouped q/k heads directly, so a
+#: model must not expand ``Hk`` up to ``Hv`` before the call. The flat ``fla``
+#: and vendored ``triton`` rows index q/k/v with one head count and silently
+#: mis-index ``Hk < Hv``, so models expand for every other implementation.
+#: This is a backend fact, not model policy: models opt in individually, and a
+#: model may keep the expanded layout for a grouped-capable row.
+GROUPED_VALUE_HEAD_IMPLS = frozenset({"flash_qla", "fla_npu"})
+
 
 register_op(
     "rms_norm_gated",
@@ -216,5 +224,6 @@ register_op(
     chunk_fla_npu.backward,
     description="AscendC chunked gated delta rule with variable-length support",
     requirement=NpuKernelRequirement(),
+    # AscendC runs GDN; input guarding and Q/K L2Norm still use Triton-Ascend.
     requires=("fla_npu", "triton"),
 )

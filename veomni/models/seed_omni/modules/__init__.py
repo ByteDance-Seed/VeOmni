@@ -76,6 +76,13 @@ def read_hf_model_type(model_path: str) -> str:
     reading the raw dict sidesteps that.  See :mod:`veomni.models.registry`
     for the same pattern in the foundation-model loader.
     """
+    # A registered layout may represent a multi-directory diffusion release
+    # whose family config lives under ``transformer/`` rather than at the root.
+    from ..utils.hf_layout import _read_root_model_type
+
+    model_type = _read_root_model_type(model_path)
+    if model_type is not None:
+        return model_type
     config_dict, _ = PretrainedConfig.get_config_dict(model_path)
     model_type = config_dict.get("model_type")
     if not model_type:
@@ -110,8 +117,11 @@ def read_model_type(model_path: str) -> str:
     return model_type
 
 
-# Side-effect only: attach @register factories under base/, fake_model/, qwen3/, text_encoder/.
-from . import base, fake_model, qwen3, text_encoder  # noqa: F401  E402
+# Side-effect only: attach @register factories under bagel/, base/, cosmos3/, fake_model/, janus/,
+# qwen3/, qwen3_moe/, qwen3vl/, text_encoder/. Imported after ``read_hf_model_type`` so the
+# convert_registry ↔ modules cycle resolves: each family's ``convert_model`` imports
+# ``convert_registry``, whose ``convert_checkpoint`` reads ``read_hf_model_type`` back from this module.
+from . import bagel, base, cosmos3, fake_model, janus, qwen3, qwen3_moe, qwen3vl, text_encoder  # noqa: F401  E402
 
 
 __all__ = [

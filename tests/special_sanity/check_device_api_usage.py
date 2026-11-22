@@ -64,6 +64,9 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "tests/arguments/test_model_arguments.py",
     # EP option tests use literal backend names to verify cross-device rejection.
     "tests/ci/test_ep_hccl_options.py",
+    # Gloo failure-propagation tests mock an available CUDA device to verify
+    # that the process-group backend still selects CPU tensors.
+    "tests/utils/test_dist_utils_group.py",
     # Implicit-CUDA-sync gate. Calls ``torch.cuda.{get,set}_sync_debug_mode``
     # directly because the API is intrinsically CUDA-only and has no
     # ``veomni.utils.device`` equivalent; the test is gated on
@@ -73,8 +76,13 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # name to exercise accelerator-specific code paths; the literal "cuda" is
     # a test fixture, not a production device-API call.
     "tests/distributed/test_async_activation_offload.py",
+    "tests/models/test_float8_training.py",
     "tests/models/test_qwen_image_precision.py",
     "tests/precision/qwen_image.py",
+    # Compute-unit lookup is asserted per backend by name (cuda / npu / xpu /
+    # mlu), with each namespace stubbed; the literals are fixtures, not device
+    # management.
+    "tests/utils/test_get_compute_units.py",
     # Vendored Ascend Triton kernels for Qwen3.5 gated delta-rule (FLA + Huawei
     # port) are kept byte-identical to upstream; the FLA-origin code references
     # ``.cuda`` in fallback/util paths. Excluded wholesale, matching the ruff

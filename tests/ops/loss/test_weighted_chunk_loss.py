@@ -842,12 +842,10 @@ def test_weighted_router_aux_rejected_consistently_before_forward(monkeypatch):
 
 
 def test_weighted_qwen4_direct_forward_rejects_router_aux_before_model_execution():
-    from veomni.models.transformers.qwen4_exp.qwen4_exp_gpu_patch_gen_config import (
-        qwen4_exp_for_conditional_generation_forward_patched,
-    )
+    from veomni.models.transformers.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
 
     with pytest.raises(ValueError, match="router auxiliary"):
-        qwen4_exp_for_conditional_generation_forward_patched(
+        Qwen4ExpForConditionalGeneration.forward(
             object(), labels=torch.tensor([[1]]), loss_weights=torch.tensor([[0.0]]), output_router_logits=True
         )
 

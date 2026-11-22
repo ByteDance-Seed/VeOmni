@@ -46,11 +46,6 @@ def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
     covers the other — the manifest is written the moment the cursor lands, while
     the shards beside it may still be streaming out of an async save, and a
     module's markers say nothing about the cursor.
-
-    A pre-split checkpoint has no manifest and is recognised by the ``.metadata``
-    that used to sit at the step root, but only while the step is *entirely*
-    pre-split. Drop that branch together with
-    ``veomni/checkpoint/legacy_v0_1_12.py``.
     """
     if not entry.startswith(_GLOBAL_STEP_PREFIX):
         return None
@@ -67,23 +62,11 @@ def _validate_dcp_checkpoint_entry(checkpoints_dir: str, entry: str):
 
     # Imported here rather than at module scope: ``veomni.checkpoint.layout``
     # imports this module for the step-directory prefix.
-    from ..checkpoint.layout import MODEL_DIRNAME, checkpoint_is_complete
+    from ..checkpoint.layout import checkpoint_is_complete
 
     # Both halves, not just the manifest: the manifest lands as soon as the
     # cursor files do, while the shards of an async save are still streaming.
     if checkpoint_is_complete(checkpoint_path):
-        return step
-
-    # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to stop
-    # accepting pre-split checkpoints. A ``model/`` beside the old marker means a
-    # current-layout write landed on such a step and did not finish — the step
-    # has no manifest, so it is not complete, and the loader would take the new
-    # tree in preference and fail on whatever part of it never arrived. The old
-    # marker describes data that write has already begun overwriting, so it
-    # cannot vouch for the step.
-    from ..checkpoint.legacy_v0_1_12 import marker_path
-
-    if exists(marker_path(checkpoint_path)) and not isdir(os.path.join(checkpoint_path, MODEL_DIRNAME)):
         return step
 
     return None
