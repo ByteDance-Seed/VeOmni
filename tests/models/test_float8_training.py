@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import builtins
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -57,6 +58,28 @@ class DenseModel(nn.Module):
     @property
     def fc(self):
         return self.model.layers[0].mlp.up_proj
+
+
+@cpu
+def test_dpo_reference_disables_float8_without_changing_policy(monkeypatch):
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.arguments import ModelArguments
+    from veomni.trainer import text_dpo_trainer as dpo
+
+    args = ModelArguments(config_path="/tmp/qwen3", ops_implementation=make_eager_ops_config())
+    args.accelerator.fsdp_config.mixed_precision = _precision(TARGET)
+    policy = deepcopy(args.accelerator.fsdp_config.mixed_precision)
+    monkeypatch.setattr(dpo.DPOReferenceModelRuntime, "setup", lambda self: None)
+    monkeypatch.setattr(dpo, "use_parallel_state", lambda _: nullcontext())
+    monkeypatch.setattr("veomni.models.auto.build_foundation_model", lambda **kwargs: DenseModel())
+
+    def validate_reference(self):
+        validate_float8_training(self.args.accelerator.fsdp_config.mixed_precision, _state())
+
+    monkeypatch.setattr(dpo.DPOReferenceModelRuntime, "_build_parallelized_model", validate_reference)
+    reference = dpo.DPOReferenceModelRuntime(args, train=None)
+    assert not reference.args.accelerator.fsdp_config.mixed_precision.float8.enable
+    assert args.accelerator.fsdp_config.mixed_precision == policy
 
 
 @cpu
@@ -381,7 +404,7 @@ def test_float8_qwen3_fsdp2_dcp_resume_and_hf_export(tmp_path, monkeypatch, reci
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.distributed.torch_parallelize import parallelize_model_fsdp2
     from veomni.models.checkpoint.weights import init_empty_weights, save_model_weights
-    from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import Qwen3ForCausalLM
+    from veomni.models.transformers.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
     config = Qwen3Config(
         vocab_size=128,
@@ -467,7 +490,7 @@ def _two_rank_fsdp2_worker(rank: int, checkpoint_str: str, dcp_str: str, recipe:
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
     from veomni.distributed.torch_parallelize import parallelize_model_fsdp2
     from veomni.models.checkpoint.weights import init_empty_weights
-    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
+    from veomni.models.transformers.llama.modeling_llama import LlamaForCausalLM
 
     device.get_torch_device().set_device(rank)
     dist.init_process_group(backend="cuda:nccl,cpu:gloo", store=endpoint.connect(), rank=rank, world_size=2)
@@ -629,7 +652,7 @@ def test_float8_two_rank_sharded_fsdp2(tmp_path, recipe):
     from transformers import LlamaConfig
 
     from tests.tools.launch_utils import spawn_with_rendezvous
-    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
+    from veomni.models.transformers.llama.modeling_llama import LlamaForCausalLM
 
     ckpt = tmp_path / "llama_hf"
     torch.manual_seed(0)

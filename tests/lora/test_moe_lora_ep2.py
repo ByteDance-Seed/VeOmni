@@ -118,10 +118,10 @@ __all__ = [
 ]
 
 
-# Override yaml's eager MoE impl: EP requires the fused triton kernel
-# (LoraSharedExperts / LoraIndependentExperts raise under ep_enabled if
-# the eager path is selected -- only the fused triton kernel implements
-# the EP dispatch via ``dispatch_to_ep_class``).
+# Override yaml's eager MoE impl: the fused triton kernel is the supported training
+# backend for these tests. ``eager`` also runs under EP now (it has its own expert
+# math on the same dispatch), but it does per-expert Python loops, which would make
+# these EP/trainer tests slow without testing anything the kernel does not.
 _FUSED_OPS_OVERRIDE = "--model.ops_implementation.moe_implementation=fused_triton"
 
 # Two different log lines fire during EP plan application; we grep for
