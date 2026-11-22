@@ -78,7 +78,10 @@ __all__ = [
 
 DEFAULT_NS_COEFFICIENTS: Tuple[float, float, float] = (DEFAULT_A, DEFAULT_B, DEFAULT_C)
 
-# Lookup-table-like 2D weights are kept on AdamW.
+# 2D weights that route, mix or gate rather than transform features are kept on
+# AdamW. Newton-Schulz orthogonalizes a matrix and then scales it by
+# ``0.2 * sqrt(max(A, B))``, which is the wrong geometry for a matrix that only
+# selects or mixes, and a large multiplier on a small row block.
 _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
     "embed_tokens",
     "embedding",
@@ -87,6 +90,17 @@ _DEFAULT_ADAMW_NAME_PATTERNS: Tuple[str, ...] = (
     "confidence_head",
     "output_layer",
     "conv1d",
+    ".gate.",
+    ".router.",
+    "shared_expert_gate",
+    "_hc.fn",
+    "hc_head.",
+    "weights_proj",
+    # Compressor/indexer `gate_proj` are softmax gates over pooled KV entries, so
+    # they are scoped rather than matched by a bare `gate_proj`, which would also
+    # catch the shared-expert and MLP feature projections.
+    "compressor.gate_proj",
+    "indexer.gate_proj",
 )
 
 # Attribute names carrying a head count and a per-head row stride. MLA modules

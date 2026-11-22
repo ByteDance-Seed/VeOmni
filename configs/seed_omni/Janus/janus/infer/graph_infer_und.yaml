@@ -1,0 +1,28 @@
+# Janus-1.3B inference — image understanding (I2T / VQA).
+#
+# Optional per-module load overrides — see ``infer_gen.yaml`` header for the
+# ``modules:`` deep-merge pattern (e.g. FSDP2 for a large vision encoder).
+#
+# Conversation-list path: each AR step appends one ``type='text'`` item
+# (``meta.generated=True``) to ``conversation_list``; the backbone reads
+# the tail embed on subsequent steps.
+initial: prompt_encode
+
+states:
+  prompt_encode:
+    body:
+      - { from: janus_siglip,       to: janus_llama }
+      - { from: janus_text_encoder, to: janus_llama }
+      - { from: janus_llama,        to: janus_text_encoder }
+      - { from: janus_text_encoder, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: done }
+      - { condition: { type: default }, next_state: text_ar }
+
+  text_ar:
+    body:
+      - { from: janus_text_encoder, to: janus_llama }
+      - { from: janus_llama,        to: janus_text_encoder }
+      - { from: janus_text_encoder, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: done }

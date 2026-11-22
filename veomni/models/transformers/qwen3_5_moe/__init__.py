@@ -16,7 +16,6 @@
 
 from veomni.lora.target_mapping import convert_fused_moe_lora_targets
 from veomni.models.registry import MODELING_REGISTRY
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 _LANGUAGE_GATE_UP = "model.language_model.layers.*.mlp.experts.gate_up_proj"
@@ -91,21 +90,13 @@ def _create_qwen3_5_moe_checkpoint_tensor_converter(model):
 
 @MODELING_REGISTRY.register("qwen3_5_moe")
 def register_qwen3_5_moe_modeling(architecture: str):
-    """Register and return the device-specific Qwen3.5-MoE modeling class."""
+    """Register and return the Qwen3.5-MoE modeling class."""
     from ..qwen3_moe.checkpoint_tensor_converter import convert_qwen3_moe_fqn_to_index_mapping
-
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_qwen3_5_moe_npu import (
-            Qwen3_5MoeForCausalLM,
-            Qwen3_5MoeForConditionalGeneration,
-            Qwen3_5MoeModel,
-        )
-    else:
-        from .generated.patched_modeling_qwen3_5_moe_gpu import (
-            Qwen3_5MoeForCausalLM,
-            Qwen3_5MoeForConditionalGeneration,
-            Qwen3_5MoeModel,
-        )
+    from .modeling_qwen3_5_moe import (
+        Qwen3_5MoeForCausalLM,
+        Qwen3_5MoeForConditionalGeneration,
+        Qwen3_5MoeModel,
+    )
 
     Qwen3_5MoeForConditionalGeneration._convert_lora_targets_to_parameters = staticmethod(
         _convert_qwen3_5_moe_wrapped_lora_targets_to_parameters
@@ -130,12 +121,8 @@ def register_qwen3_5_moe_modeling(architecture: str):
 
 @MODELING_REGISTRY.register("qwen3_5_moe_text")
 def register_qwen3_5_moe_text_modeling(architecture: str):
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_qwen3_5_moe_npu import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextModel
-    else:
-        from .generated.patched_modeling_qwen3_5_moe_gpu import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextModel
-
     from ..qwen3_moe.checkpoint_tensor_converter import convert_qwen3_moe_fqn_to_index_mapping
+    from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextModel
 
     Qwen3_5MoeForCausalLM._convert_lora_targets_to_parameters = staticmethod(
         _convert_qwen3_5_moe_causal_lora_targets_to_parameters

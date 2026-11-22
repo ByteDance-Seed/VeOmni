@@ -24,12 +24,48 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import torch
-import torch.distributed as dist
 from torch import Tensor
 
 
 GateUpDelta = Callable[[Tensor, Tensor], Tensor]
 DownDelta = Callable[[Tensor, Tensor], Tensor]
+
+
+class _NpuLoRADeltasEP:
+    """NPU grouped GEMMs with caller-supplied LoRA deltas, on dispatched tokens.
+
+    This is the per-rank math half of the LoRA NPU path. The all-to-all plumbing is
+    ``dispatch_to_ep_class``'s, shared with every other row; only the grouped GEMMs and
+    the delta injection are Ascend's and LoRA's.
+
+    ``gate_up_delta`` / ``down_delta`` are closures the variant ``npu.py`` builds from
+    its own adapter layout, so shared (2-D, replicated) and independent (3-D, sharded)
+    keep their distinct semantics without this class knowing which is which.
+    """
+
+    @staticmethod
+    def apply(
+        permute_tokens: Tensor,
+        cumsum: Tensor,
+        fc1_1_2_weight: Tensor,
+        fc2_weight: Tensor,
+        gate_up_delta: GateUpDelta,
+        down_delta: DownDelta,
+    ) -> Tensor:
+        """Run both grouped GEMMs with the LoRA deltas added between them."""
+        import torch_npu
+
+        from ....distributed.moe import cumsum_to_counts
+        from ..moe_experts.standard.npu import npu_group_gemm
+
+        counts = cumsum_to_counts(cumsum)
+        gate_up = npu_group_gemm(permute_tokens, fc1_1_2_weight.transpose(1, 2), counts)
+        gate_up = gate_up + gate_up_delta(permute_tokens, counts)
+        intermediate = torch_npu.npu_swiglu(gate_up, dim=-1)
+        output = npu_group_gemm(intermediate, fc2_weight.transpose(1, 2), counts)
+        output = output + down_delta(intermediate, counts)
+        # An empty rank must stay on the graph so its all-to-all backward runs.
+        return output + permute_tokens * 0
 
 
 def npu_non_ep_forward(
@@ -72,47 +108,46 @@ def npu_ep_forward(
     fc2_weight: Tensor,
     gate_up_delta: GateUpDelta,
     down_delta: DownDelta,
-    ep_group: dist.ProcessGroup | None = None,
 ) -> Tensor:
-    """NPU expert-parallel fused MoE plus caller-supplied LoRA deltas."""
-    import torch_npu
+    """NPU expert-parallel fused MoE plus caller-supplied LoRA deltas.
 
-    from ..moe_experts.standard.npu import (
-        alltoall_combine,
-        alltoall_dispatch,
-        dispatch_preprocess,
-        npu_group_gemm,
-    )
+    Goes through ``dispatch_to_ep_class``, so the all-to-all plumbing is the same one
+    every other row uses and a change to it lands in one place.
+
+    Casts the routing weights to the activation dtype first, as every non-LoRA row does
+    at its entry point: ``dispatch_to_ep_class`` forwards them untouched and
+    ``unpermute`` applies them to the expert outputs, so an fp32 router would upcast
+    there.
+
+    With one EP rank there is nothing to dispatch, and the helper's ``preprocess``
+    requires a group wider than one (its ``all_gather_into_tensor`` is shaped by
+    ``ep_group.size()``). Take the local path instead: it is the same math without the
+    all-to-all, and it is what ``ep_size == 1`` means.
+    """
+    from ....distributed.moe import dispatch_to_ep_class, expert_parallel_size
 
     routing_weights = routing_weights.to(dtype=hidden_states.dtype)
-    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-    selected_experts = selected_experts.to(torch.int32)
-    input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
-        dispatch_preprocess(selected_experts, num_experts, ep_group)
-    )
-    hidden_states, unpermute_indices = alltoall_dispatch(
-        hidden_states,
-        selected_experts,
-        input_splits,
-        output_splits,
-        num_experts,
-        num_global_tokens_per_local_expert,
-        ep_group,
-    )
 
-    group_list = num_global_sum_tokens_per_local_expert.to(torch.int64)
-    gate_up = npu_group_gemm(hidden_states, fc1_1_2_weight.transpose(1, 2), group_list)
-    gate_up = gate_up + gate_up_delta(hidden_states, group_list)
-    intermediate = torch_npu.npu_swiglu(gate_up, dim=-1)
-    output = npu_group_gemm(intermediate, fc2_weight.transpose(1, 2), group_list)
-    output = output + down_delta(intermediate, group_list)
-    return alltoall_combine(
-        output,
-        routing_weights,
-        unpermute_indices,
-        input_splits,
-        output_splits,
+    if expert_parallel_size() <= 1:
+        return npu_non_ep_forward(
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
+            fc1_1_2_weight,
+            fc2_weight,
+            gate_up_delta,
+            down_delta,
+        )
+
+    return dispatch_to_ep_class(
+        _NpuLoRADeltasEP,
         num_experts,
-        num_global_tokens_per_local_expert,
-        ep_group,
+        routing_weights,
+        selected_experts,
+        hidden_states,
+        fc1_1_2_weight,
+        fc2_weight,
+        gate_up_delta,
+        down_delta,
     )

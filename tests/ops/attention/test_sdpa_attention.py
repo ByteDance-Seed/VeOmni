@@ -41,7 +41,7 @@ from veomni.ops.kernels.attention import ulysses as ulysses_backend
 from veomni.ops.kernels.attention.mask import sdpa as sdpa_mask
 from veomni.ops.kernels.attention.standard import sdpa as sdpa_backend
 from veomni.ops.mask import causal_mask, packed_causal_mask, sliding_window_mask
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
 
 
 class _FakeAttentionModule(nn.Module):
@@ -684,9 +684,13 @@ def test_sdpa_attention_matches_math_reference(mask_case, entrypoint):
         )
 
 
-@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="CUDA SDPA numerical comparison")
+@pytest.mark.skipif(
+    not ((IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and get_torch_device().is_available()),
+    reason="SDPA numerical comparison requires a visible CUDA or NPU device",
+)
 @pytest.mark.parametrize("mask_case", ("causal", "2d_mask"))
-def test_sdpa_attention_matches_math_reference_on_cuda(mask_case):
+def test_sdpa_attention_matches_math_reference_on_accelerator(mask_case):
+    """Compare accelerator SDPA outputs and Q/K/V gradients with independent FP32 eager math."""
     device = torch.device(get_device_type())
     dtype = torch.bfloat16
     sequence_length = 64
@@ -701,12 +705,15 @@ def test_sdpa_attention_matches_math_reference_on_cuda(mask_case):
     scaling = head_dim**-0.5
     dense = dense_mask(mask_case, sequence_length, device)
 
-    reference_qkv = clone_qkv(query, key, value)
-    reference_output, _ = math_sdpa_reference(*reference_qkv, dense, scaling=scaling)
-    reference_gradients = torch.autograd.grad(reference_output, reference_qkv, output_gradient)
-
     module = _FakeAttentionModule()
+    module.eval()
     module.num_key_value_groups = query_heads // kv_heads
+    reference_qkv = clone_qkv(query.float(), key.float(), value.float())
+    additive_mask = torch.zeros_like(dense, dtype=torch.float32).masked_fill(~dense, -torch.inf)
+    reference_output, _ = eager_attention_forward(
+        module, *reference_qkv, attention_mask=additive_mask, scaling=scaling
+    )
+    reference_gradients = torch.autograd.grad(reference_output, reference_qkv, output_gradient.float())
     sdpa_qkv = clone_qkv(query, key, value)
     sdpa_output, _ = sdpa_backend.sdpa_attention_forward(
         module,
@@ -717,7 +724,7 @@ def test_sdpa_attention_matches_math_reference_on_cuda(mask_case):
     )
     sdpa_gradients = torch.autograd.grad(sdpa_output, sdpa_qkv, output_gradient)
 
-    torch.testing.assert_close(sdpa_output, reference_output, rtol=ATTN_RTOL, atol=ATTN_ATOL)
+    torch.testing.assert_close(sdpa_output, reference_output.to(dtype), rtol=ATTN_RTOL, atol=ATTN_ATOL)
     for name, gradient, reference_gradient in zip(
         ("query", "key", "value"),
         sdpa_gradients,
@@ -726,7 +733,7 @@ def test_sdpa_attention_matches_math_reference_on_cuda(mask_case):
     ):
         torch.testing.assert_close(
             gradient,
-            reference_gradient,
+            reference_gradient.to(dtype),
             rtol=ATTN_GRAD_RTOL,
             atol=ATTN_GRAD_ATOL,
             msg=lambda message, tensor_name=name: f"{tensor_name}: {message}",

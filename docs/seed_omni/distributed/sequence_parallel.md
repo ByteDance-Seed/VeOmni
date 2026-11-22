@@ -119,6 +119,62 @@ for node in training_graph:
   sequence, the backbone assembles its packed sequence from full-length
   embeddings, then slices again for its own forward. There is no extra reshard
   mechanism between modules.
+- **Skipping inter-module SP all-gathers (`skip_sp_gather_between_modules: true`).**
+  On ultra-long sequences (e.g. `128k`–`256k` tokens), materializing the
+  full-sequence embeddings after `text_encoder.encode` / `vision.forward` and
+  the full-sequence hidden states after `llm.forward` adds full-sequence
+  `AllGather` / `ReduceScatter` collectives and keeps full-sequence autograd
+  buffers alive across module boundaries. Setting
+  `model.accelerator.skip_sp_gather_between_modules: true` (propagated to
+  `ParallelState.skip_sp_gather_between_modules`) lets every module's
+  `post_forward` (`text_encoder.encode_post`, `vision.forward_post`,
+  `llm.forward_post`) skip `gather_outputs` and scatter its rank-local `1/S`
+  shard directly onto `item.value` via `split_sp_sharded_tensor`
+  (`veomni/models/seed_omni/modules/base/sp_shard.py`):
+  - **An item never holds padding.** `split_sp_sharded_tensor` emits each
+    segment's intersection with this rank's window and drops the SP pad tail, so
+    `item.value` is always real rows; the consumer restores the padded width with
+    `pad_sp_shard`. Padding belongs to the window, not the data — carrying it in
+    the carrier made `meta[_OMNI_TOKEN_LEN]` and `value.size(0)` disagree on
+    exactly one item.
+  - **Lengths come from `meta`.** Once a value is a window, its row count is the
+    window's, so every length is read through `item_token_len`, which prefers
+    `_OMNI_TOKEN_LEN` (stamped at full span length and never sliced).
+  - When a micro-batch carries only a single modality
+    (`single_modality_shard_batch`, such as text-only or vision-only), the
+    backbone's `forward_pre` pads the sharded `item.value`s to the window and
+    concatenates them with no `AllGather` at all
+    (`pack_sp_sharded_conversations_for_forward` returns `None` when it cannot,
+    which is how the fallback is selected). That decision is made from
+    `item.type` and `meta` alone, so every rank reaches it together — it selects
+    between a path with a collective and one without.
+  - Otherwise several producers must be interleaved, and `llm.forward_pre`
+    all-gathers each producer's items (`gather_sp_sharded_groups` over
+    `modality_groups`) before interleaving them. A group must be one producer's
+    **whole** output in the order that producer concatenated it, because that is
+    the sequence it sliced: text is taken in carrier order (how the text encoder
+    embeds), media as a single images-then-videos run (how the ViT is called),
+    skipping non-`user` media. Grouping media in carrier order instead would
+    break as soon as a video turn precedes an image turn.
+  - After `llm.forward`, `llm.forward_post` scatters its `1/S` output shard
+    directly onto `item.value`, and `text_encoder.decode_pre`
+    (`_prepare_decode_inputs(..., ps)`) concatenates those sharded `item.value`s
+    and slices the shifted labels to its own window so each rank projects and
+    scores only its `1/S` share before `reduce_sequence_parallel_loss` combines
+    the numerators and denominators over `fsdp_group` (`dp_sp`).
+
+Which modules can take part is declared per module, on
+`PretrainedOmniModule.supports_sp_sharded_handoff`
+(`veomni/models/seed_omni/modules/module_modeling_base.py`). It defaults to
+`False`; a model that implements the handoff sets it to `True` on its own
+modeling class — for example
+[`TextEncoder`](../../../veomni/models/seed_omni/modules/text_encoder/modeling.py#L188)
+and
+[`Qwen3VLVisionEncoder`](../../../veomni/models/seed_omni/modules/qwen3vl/vision/modeling.py#L268).
+`build_omni_model_runtime` refuses a run that enables
+`skip_sp_gather_between_modules` while any participating module still leaves it
+`False`, naming those modules, so one boundary cannot quietly keep gathering
+while the rest hand their shards on.
 
 The SP logic lives entirely in each module's `pre_forward` / `post_forward`;
 there is no separate SP hook. Inside the module's forward and backward pass,
@@ -183,6 +239,15 @@ There are two ways to distribute encoder work across the `S` ranks of an
 
 ## 6. Limitations and future work
 
+- **Inference runs at `sp_size = cp_size = ulysses_size = 1`.** SP and CP are
+  training-only: the generation FSM decodes one token at a time on every rank
+  and has no all-to-all in its step, so nothing in the inference path slices.
+  `OmniInferencer` accepts a launcher YAML, and that YAML may well be the
+  training `base.yaml`, but any `ulysses_size` / `cp_size` it carries is not
+  honoured — and a module that is asked to generate under `sp_size > 1` refuses
+  rather than returning wrong tokens (for example
+  `Qwen3VLLlm.generate`). Keep the parallel sizes at 1 for
+  `tasks/omni/infer_omni.py` and for `tasks/omni/infer_omni_native.py`.
 - **Local operators in audio and video encoders.** Whisper-style conv1d
   downsampling and video 3D-conv patchify or temporal windows act on the sharded
   sequence **before** any all-to-all, so shard boundaries would need halo

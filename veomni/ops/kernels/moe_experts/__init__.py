@@ -19,6 +19,8 @@ interleaved gate/up layout with bias and ``alpha`` / ``limit``. Eager is
 the HF expert loop (regular autograd). Fused rows wrap the local Functions.
 """
 
+from torch import nn
+
 from ...platform import (
     NVIDIA_SM70_PLUS,
     NVIDIA_SM90_PLUS,
@@ -36,12 +38,27 @@ from .standard import deepgemm as standard_deepgemm
 from .standard import eager as standard_eager
 from .standard import mlu as standard_mlu
 from .standard import npu as standard_npu
+from .standard import qat as standard_qat
 from .standard import quack as standard_quack
 from .standard import triton as standard_triton
 
 
 _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+
+#: ``moe_experts`` rows that fake-quantize the operands they are handed. Adapters
+#: need the real weights, and ``moe_experts_lora`` has no matching row, so an
+#: expert-LoRA request on one of these must be refused rather than silently
+#: falling back to a full-precision ``eager`` base.
+#:
+#: ``deepgemm_fp8`` belongs here for the same reason as ``qat``: its
+#: ``GroupedLinear`` runs the FP8 GEMM in forward, dgrad *and* wgrad. Leaving it
+#: out let a non-SwiGLU activation reach ``merged_experts_act_fn_forward`` -- plain
+#: ``F.linear`` in the model dtype -- and train the routed experts unquantized
+#: while the config said ``deepgemm_fp8``. The remaining rows (``fused_triton``,
+#: ``fused_quack``, ``fused_npu``, ``fused_mlu``, ``eager``) do bf16 math and
+#: ignore ``expert_dtype``, so falling back changes nothing for them.
+QUANTIZING_IMPLS = frozenset({"qat", "deepgemm_fp8"})
 
 
 register_op(
@@ -111,6 +128,16 @@ register_op(
     wrapper=standard_quack.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("quack",),
+)
+
+register_op(
+    "moe_experts",
+    "standard",
+    "qat",
+    description="TileLang blockwise FP8/FP4 fake-quantized Triton grouped-GEMM routed SwiGLU MoE experts",
+    wrapper=standard_qat.wrapper,
+    requirement=_NVIDIA_SM90_PLUS,
+    requires=("tilelang", "triton"),
 )
 
 register_op(

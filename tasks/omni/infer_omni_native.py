@@ -77,7 +77,7 @@ def main() -> None:
         torch_dtype="auto",
         **scenario,
     ).eval()
-    processor = OmniProcessor.from_pretrained(args.model_path)
+    processor = OmniProcessor.from_pretrained(args.model_path, **scenario)
     model_input = processor(
         text=args.prompt,
         images=args.image or None,

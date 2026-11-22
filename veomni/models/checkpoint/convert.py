@@ -86,6 +86,15 @@ class CheckpointTensorConverter(Protocol):
         """
         ...
 
+    def checkpoint_row_counts(self) -> Dict[str, Tuple[int, int]]:
+        """Optionally map weight FQNs to (checkpoint rows, padded runtime rows).
+
+        Omit this method or return an empty dict when no row cropping is needed.
+        The checkpoint planners consume this metadata without importing model code.
+        Padding must be semantically inert; optimizer tensors keep runtime shapes.
+        """
+        ...
+
     def is_dim0_zero_pad(self, name: str) -> bool:
         """Optional streaming capability: whether this converter's *only* transform for
         ``name`` is appending trailing zero rows on dim-0 (no fusion/reshape/dtype change).
@@ -223,6 +232,8 @@ def get_checkpoint_tensor_converter(
     model: Union["nn.Module", "PreTrainedModel"],
 ) -> Optional["CheckpointTensorConverter"]:
     """Return the checkpoint tensor converter registered on *model*, or ``None``."""
+    while isinstance(getattr(model, "module", None), nn.Module):
+        model = model.module
     factory = getattr(model, "_create_checkpoint_tensor_converter", None)
     if factory is None:
         return None
