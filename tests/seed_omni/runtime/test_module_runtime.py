@@ -918,3 +918,88 @@ def test_a_compiling_module_compiles_itself_before_the_composed_wrap(monkeypatch
     # no scope list: the module is the unit
     assert "scopes" not in seen.get("kwargs", {})
     assert seen.get("kwargs", {}).get("all_classes") is True
+
+
+def test_the_wrap_after_compiling_does_not_compile_again():
+    """P1: compiling in the module and again in the base build raises "found no decoder blocks".
+
+    `ModuleRuntime._build_parallelized_model` compiles the module, then calls the
+    base build to offload/load/wrap. The base reads `self._compile_config()`, which
+    would hand it an enabled config a second time; `compile_decoder_blocks` then
+    skips every already-compiled block, counts 0, and `build_parallelize_model`
+    raises. `_build_wrap_without_compiling` turns the flag off for that one call.
+    """
+
+    class OptedIn(nn.Linear):
+        supports_torch_compile = True
+        supports_torch_compile_dynamic = False
+
+    runtime = ModuleRuntime.__new__(ModuleRuntime)
+    runtime.model = OptedIn(2, 2)
+    runtime._global_accelerator = _fsdp("module", compile_enable=True)
+    runtime.args = SimpleNamespace(accelerator=_fsdp("module", compile_enable=True), basic_modules=[])
+
+    assert runtime._compile_config().enable is True
+
+    runtime._skip_compile = True
+    assert runtime._compile_config().enable is False
+    runtime._skip_compile = False
+    assert runtime._compile_config().enable is True
+
+
+def test_a_lora_wrapped_module_is_still_a_seedomni_module():
+    """P2: the LoRA wrapper must not send a tower through the single-model VLM rule.
+
+    `VeOmniLoraModel` is a plain `nn.Module` holding the SeedOmni module, so an
+    `isinstance` on the outer object missed it and every family except dense
+    Qwen3-VL was rejected — under both `fsdp_scope` values.
+    """
+    from veomni.distributed.torch_compile import _is_omni_module
+    from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+    class Cfg:
+        model_type = "janus_siglip"
+        vision_config = object()
+        sub_configs = {}
+
+    class Tower(PretrainedOmniModule):
+        _no_split_modules = ["Block"]
+        config_class = Cfg
+
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.config = Cfg()
+
+    class LoraWrapper(nn.Module):
+        """Shape of ``VeOmniLoraModel``: holds the base, exposes ``get_base_model``."""
+
+        def __init__(self, inner):
+            super().__init__()
+            self.model = inner
+
+        def get_base_model(self):
+            return self.model
+
+    assert _is_omni_module(Tower())
+    assert _is_omni_module(LoraWrapper(Tower()))
+
+
+def test_a_module_overlay_cannot_outrun_a_top_level_ddp_wrap():
+    """P3: a `fsdp2` overlay under a `ddp` wrap stays eager, as documented.
+
+    The composed wrap follows the **top-level** `fsdp_mode`, and
+    `build_parallelize_model` refuses DDP outright — so selecting the module would
+    fail startup rather than fall back to eager.
+    """
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    module = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=False)
+    module_acc = SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=False),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
+    )
+    ddp_top = SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope="model", fsdp_mode="ddp"))
+    fsdp2_top = SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope="model", fsdp_mode="fsdp2"))
+
+    assert module_compile_config(module_acc, module, global_accelerator=ddp_top).enable is False
+    assert module_compile_config(module_acc, module, global_accelerator=fsdp2_top).enable is True

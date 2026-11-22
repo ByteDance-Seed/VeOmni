@@ -161,7 +161,7 @@ def _is_multimodal_model(model: nn.Module) -> bool:
 
 
 def _is_omni_module(model: nn.Module) -> bool:
-    """Whether ``model`` is one SeedOmni module built standalone.
+    """Whether ``model`` is one SeedOmni module, possibly behind a wrapper.
 
     Under ``fsdp_scope='module'`` each module is wrapped on its own, so the wrap
     sees a single component rather than a whole multimodal model. That matters
@@ -170,10 +170,18 @@ def _is_omni_module(model: nn.Module) -> bool:
     the cross-modal injection between them. A single HF multimodal model
     (Qwen2.5-Omni, Qwen3-VL-MoE, ...) does hold all of that and stays
     fail-closed.
+
+    The wrapper is looked through. A LoRA module is a
+    :class:`~veomni.lora.VeOmniLoraModel` (a plain ``nn.Module``) holding the
+    SeedOmni module on ``get_base_model()`` / ``.model``, so an ``isinstance``
+    against the outer object would miss it and send the tower through the
+    single-model multimodal rule instead — which rejects every SeedOmni family
+    except dense Qwen3-VL.
     """
+    from ..models.seed_omni.accelerated.utils.dispatch import unwrap_module_chain
     from ..models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
 
-    return isinstance(model, PretrainedOmniModule)
+    return isinstance(unwrap_module_chain(model), PretrainedOmniModule)
 
 
 def validate_compile_model(

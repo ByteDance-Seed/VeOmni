@@ -67,10 +67,10 @@ def composed_model_owns_wrap(accelerator: "AcceleratorConfig") -> bool:
     return fsdp_config.fsdp_scope == "model" and fsdp_config.fsdp_mode != "eager"
 
 
-def module_compile_config(accelerator: "AcceleratorConfig", module: nn.Module):
+def module_compile_config(accelerator: "AcceleratorConfig", module: nn.Module, *, global_accelerator=None):
     """``CompileConfig`` for one module, disabled unless the module opts in.
 
-    ``accelerator.torch_compile.enable`` is the run-wide switch;
+    ``accelerator.torch_compile.enable`` is the module's resolved switch;
     :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile`
     is the per-module gate. Both must be on, so a module whose compile path has
     not been measured simply never reaches ``compile_decoder_blocks`` — it still
@@ -93,8 +93,15 @@ def module_compile_config(accelerator: "AcceleratorConfig", module: nn.Module):
     not need FSDP's meta-init dance), so without this check enabling compile
     would fail that module's wrap outright instead of leaving it eager — and
     "leaves it eager" is the documented contract for a module that cannot be
-    compiled. The returned message is logged by the caller; the config itself
-    just says ``enable=False``.
+    compiled.
+
+    ``global_accelerator`` is the launcher-level accelerator, passed when the
+    module is built under ``fsdp_scope='model'``. There the FSDP wrap is the
+    **top-level** one: ``build_parallelize_model`` validates the top-level
+    accelerator and refuses DDP outright, so a module overlay saying ``fsdp2``
+    cannot make the wrap able to compile. Checking only the module's own
+    ``fsdp_mode`` would select a module for compilation under a ``ddp`` wrap and
+    fail startup instead of falling back to eager.
     """
     from .....distributed.torch_compile import CompileConfig
 
@@ -102,16 +109,17 @@ def module_compile_config(accelerator: "AcceleratorConfig", module: nn.Module):
     supported = bool(getattr(module, "supports_torch_compile", False))
     dynamic_ok = bool(getattr(module, "supports_torch_compile_dynamic", False))
     fsdp2 = accelerator.fsdp_config.fsdp_mode == "fsdp2"
-    enabled = bool(run_config.enable) and supported and fsdp2
+    # Under ``fsdp_scope='model'`` the wrap is the top-level one, so its mode is
+    # what decides whether ``compile_decoder_blocks`` can run at all.
+    wrap_fsdp2 = global_accelerator is None or global_accelerator.fsdp_config.fsdp_mode == "fsdp2"
+    enabled = bool(run_config.enable) and supported and fsdp2 and wrap_fsdp2
     return CompileConfig(
         enable=enabled,
         backend=run_config.backend,
         mode=run_config.mode,
         fullgraph=run_config.fullgraph,
         # ``dynamic`` is meaningless unless this module is compiled, so it carries
-        # the same gates. Keeping the two derived from one ``enabled`` is what
-        # makes this agree with ``_dynamic_scope`` on the composed path, where the
-        # scope lists are the single source of truth.
+        # the same gates.
         dynamic=enabled and bool(run_config.dynamic) and dynamic_ok,
     )
 
@@ -498,12 +506,17 @@ class ModuleRuntime(VeOmniModelRuntime):
         on meta (freeze already applied) and
         :meth:`build_after_omni_model_wrap` finishes once the parent is wrapped.
 
-        **Compilation is per module under both scopes.** ``compile_decoder_blocks``
-        runs before ``fully_shard`` in either case, so the module is still an
-        ordinary unwrapped tree here: its own ``_no_split_modules`` is the block
-        list and its own ``CompileConfig`` is the config. Nothing about the
-        composed wrap needs to know which modules were compiled, which is why
-        there is no scope list to thread through it.
+        **Compilation is per module under both scopes**, and it happens exactly
+        once, here. ``compile_decoder_blocks`` runs before ``fully_shard`` in
+        either case, so the module is still an ordinary unwrapped tree at this
+        point: its own ``_no_split_modules`` is the block list and its own
+        ``CompileConfig`` is the config.
+
+        The wrap below is then told to compile nothing. Without that it runs
+        ``compile_decoder_blocks`` a second time on the same tree, finds every
+        block already marked ``_veomni_forward_compiled``, counts zero, and raises
+        "found no decoder blocks to compile" — see
+        :meth:`_build_wrap_without_compiling`.
         """
         compile_config = self._compile_config()
         if compile_config.enable:
@@ -519,7 +532,32 @@ class ModuleRuntime(VeOmniModelRuntime):
                 "OmniModel (accelerator.fsdp_config.fsdp_scope='model')."
             )
             return
-        super()._build_parallelized_model()
+        self._build_wrap_without_compiling()
+
+    def _build_wrap_without_compiling(self) -> None:
+        """Run the base build (offload, load, wrap) with compilation already done.
+
+        ``BaseModelRuntime._build_parallelized_model`` reads ``self._compile_config()``,
+        so the flag is turned off for the duration of that one call rather than
+        duplicating the base sequence here.
+        """
+        self._skip_compile = True
+        try:
+            super()._build_parallelized_model()
+        finally:
+            self._skip_compile = False
+
+    def _compile_config(self):
+        """This module's ``CompileConfig``: the run switch intersected with the module's opt-in.
+
+        Returns a disabled config while :meth:`_build_wrap_without_compiling` runs
+        the base build, so compilation is not attempted twice.
+        """
+        from .....distributed.torch_compile import CompileConfig
+
+        if getattr(self, "_skip_compile", False):
+            return CompileConfig(enable=False)
+        return module_compile_config(self.args.accelerator, self.model, global_accelerator=self._global_accelerator)
 
     def _compile_own_blocks(self, compile_config) -> int:
         """Compile the blocks this module declares, under this module's own config.
