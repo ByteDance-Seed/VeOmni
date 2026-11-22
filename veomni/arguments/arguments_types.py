@@ -1314,14 +1314,22 @@ class TrainingArguments:
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
 
-        if self.moe_router_bias_update_rate < 0.0:
-            # Caught here rather than in the callback, which treats anything
-            # non-positive as "disabled": a typo would otherwise switch
-            # balancing off silently on every rank.
+        # YAML reads an exponent literal without a decimal point (``1e-3``) as a
+        # string, so coerce before the range check. Rejected here rather than in
+        # the callback, which treats anything non-positive as "disabled": a typo
+        # would otherwise switch balancing off silently on every rank, and a NaN
+        # rate would write NaN into the routing buffer.
+        rate = self.moe_router_bias_update_rate
+        try:
+            parsed_rate = float("nan") if isinstance(rate, bool) else float(rate)
+        except (TypeError, ValueError):
+            parsed_rate = float("nan")
+        if not math.isfinite(parsed_rate) or parsed_rate < 0.0:
             raise ValueError(
-                f"moe_router_bias_update_rate must be >= 0, got {self.moe_router_bias_update_rate}. "
+                f"moe_router_bias_update_rate must be a finite number >= 0, got {rate!r}. "
                 "Use 0 to disable the auxiliary-loss-free bias update."
             )
+        self.moe_router_bias_update_rate = parsed_rate
 
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))

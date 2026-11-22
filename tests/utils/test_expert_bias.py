@@ -188,6 +188,21 @@ def test_rejects_a_nonpositive_rate():
         ExpertBiasUpdater(update_rate=0.0)
 
 
+@pytest.mark.parametrize("value, expected", [("1e-3", 1e-3), (1e-3, 1e-3), (0, 0.0), ("0", 0.0)])
+def test_rate_config_accepts_yaml_numbers(value, expected):
+    from veomni.arguments.arguments_types import TrainingArguments
+
+    assert TrainingArguments(moe_router_bias_update_rate=value).moe_router_bias_update_rate == expected
+
+
+@pytest.mark.parametrize("value", [-1e-3, "nan", float("nan"), float("inf"), "fast", None, True])
+def test_rate_config_rejects_invalid_values(value):
+    from veomni.arguments.arguments_types import TrainingArguments
+
+    with pytest.raises(ValueError, match="moe_router_bias_update_rate"):
+        TrainingArguments(moe_router_bias_update_rate=value)
+
+
 def test_attach_is_idempotent():
     """A second attach must not double-count through two hooks."""
     model = ModelWithRouter()
