@@ -1,0 +1,8 @@
+# Launcher-style training DAG for LLaDA-MoE: a single node.
+#
+# The mask predictor reads its own sequence and returns `_loss` (the local
+# weighted CE sum) plus an unweighted `aux_loss` from the router. There is no
+# second module, so the edge list is one entry and the executor sums a single
+# per-node loss; the module folds `router_aux_loss_coef * aux_loss` into `_loss`
+# after the sample-count division.
+- { from: llada_moe_omni, to: end }

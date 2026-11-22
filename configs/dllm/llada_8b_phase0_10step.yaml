@@ -1,0 +1,64 @@
+# 10-step LLaDA-8B run for the Phase 0 loss-shape comparison.
+#
+# Mirrors `configs/seed_omni/Llada/llada_8b/train/base.yaml` field for field so
+# the two trainers see the same data, batch shape and optimizer; only the trainer
+# differs. Kept in-tree because reproducing the comparison needs the exact
+# settings, including the two that are easy to get wrong:
+#
+#   * `dyn_bsz: false` -- it defaults to on, and then `data.train_size` is a
+#     *token* budget rather than a sample count, so a small value stops the run
+#     after one optimizer step.
+#   * `init_device: meta` with >= 2 ranks -- `meta` is only accepted on the FSDP
+#     path, and FSDP needs `fsdp_size > 1`, so a single-card launch cannot run.
+#
+#   bash train.sh tasks/train_dllm.py configs/dllm/llada_8b_phase0_10step.yaml
+model:
+  model_path: /mnt/hdfs/user_dir/omni_v2/ckpt/LLaDA-8B-Instruct-VeOmni
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  chat_template: llada
+  optimizer:
+    type: adamw
+    lr: 2.5e-5
+    lr_decay_style: cosine
+    weight_decay: 0.1
+    max_grad_norm: 1.0
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+
+data:
+  train_path: /mnt/hdfs/user_dir/text_diff/data/sudoku/train.jsonl
+  data_type: llada
+  max_seq_len: 2048
+  train_sample: 100000
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  seed: 42
+  global_batch_size: 8
+  micro_batch_size: 1
+  # `dyn_bsz` is on by default and then `data.train_size` is a *token* budget,
+  # not a sample count: 1000 tokens is less than one step's worth and the run
+  # stops after a single optimizer step. Turning it off makes `train_steps` come
+  # from `train_sample`, which is what a fixed-batch loss comparison wants.
+  dyn_bsz: false
+  num_train_epochs: 1
+  max_steps: 10
+  checkpoint:
+    output_dir: /tmp/llada_phase0_dllm
+    manager: dcp
+    save_steps: 100000
+    save_hf_weights: false
+    save_epochs: 0
+  wandb:
+    enable: false

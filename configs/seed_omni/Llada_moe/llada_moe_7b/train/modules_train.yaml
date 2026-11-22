@@ -1,0 +1,14 @@
+# Per-module training overrides for LLaDA-MoE (SeedOmni).
+#
+# One module: the mask predictor supervises itself in place, so there is no
+# sibling to hand activations to. Deep-merged onto the launcher's `model.*`
+# block, so only what differs is restated here.
+llada_moe_omni:
+  model_path: llada_moe_omni
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_triton
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
