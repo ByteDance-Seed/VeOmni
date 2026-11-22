@@ -21,26 +21,21 @@ from transformers.initialization import no_init_weights
 
 from veomni.models.checkpoint.weights import init_empty_weights
 from veomni.utils import logging
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 from ...utils.convert_registry import OMNI_CONVERT_REGISTRY, attach_module_assets, load_family_graphs
 
 
 def _qwen3vl_for_causal_lm():
-    """The patched Qwen3-VL class for this accelerator.
+    """The patched Qwen3-VL class.
 
     Imported inside the call, not at module import time: the family package is
     imported by every ``veomni.models.seed_omni.modules`` load, and building the
     patched modeling eagerly would make every SeedOmni run pay for it.
     """
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_npu import (
-            Qwen3VLForConditionalGeneration,
-        )
-    else:
-        from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
-            Qwen3VLForConditionalGeneration,
-        )
+    from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import (
+        Qwen3VLForConditionalGeneration,
+    )
+
     return Qwen3VLForConditionalGeneration
 
 

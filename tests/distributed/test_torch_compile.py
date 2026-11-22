@@ -349,7 +349,7 @@ def test_compile_decoder_blocks_targets_qwen3_vl_text_layers_only(monkeypatch):
 @pytest.mark.parametrize("use_checkpoint", [False, True])
 def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
     from tests.tools.training_utils import make_eager_ops_config
-    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+    from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import (
         Qwen3VLTextConfig,
         Qwen3VLTextDecoderLayer,
         Qwen3VLTextRotaryEmbedding,
@@ -414,7 +414,7 @@ def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
 
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.data.data_collator import add_flash_attention_kwargs_from_position_ids
-    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+    from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import (
         Qwen3VLTextConfig,
         Qwen3VLTextDecoderLayer,
         Qwen3VLTextRotaryEmbedding,
@@ -836,7 +836,7 @@ def _deepseek_v4_fused_moe_ops_config():
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek V4 fused MoE kernel requires CUDA")
 @pytest.mark.parametrize("compile_backend", ["eager"])
 def test_deepseek_v4_fused_decoder_fullgraph_forward_backward_matches_eager(compile_backend):
-    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4ForCausalLM,
     )
 
@@ -885,7 +885,7 @@ def test_deepseek_v4_fused_decoder_fullgraph_forward_backward_matches_eager(comp
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek V4 fused MoE kernel requires CUDA")
 def test_deepseek_v4_inductor_fullgraph_executes_finite_optimizer_step():
-    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4ForCausalLM,
     )
 
@@ -935,7 +935,7 @@ def test_deepseek_v4_inductor_fullgraph_executes_finite_optimizer_step():
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek V4 fused MoE kernel requires CUDA")
 @pytest.mark.parametrize("seed", [1, 2, 3])
 def test_deepseek_v4_inductor_fixed_route_expert_vjp_matches_fp32_reference(seed):
-    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4ForCausalLM,
     )
     from veomni.ops import VeomniOp
@@ -1013,7 +1013,7 @@ def test_deepseek_v4_inductor_fixed_route_expert_vjp_matches_fp32_reference(seed
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek V4 fused MoE kernel requires CUDA")
 @pytest.mark.parametrize("seed", [1, 2])
 def test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle(seed):
-    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4ForCausalLM,
     )
     from veomni.ops.batch_invariant import set_batch_invariant_mode
@@ -1140,7 +1140,7 @@ def test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle(seed):
 
 @pytest.mark.parametrize("compile_backend", ["eager", "inductor"])
 def test_deepseek_v4_rms_norm_compiled_backward_matches_eager(compile_backend):
-    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4RMSNorm,
     )
 

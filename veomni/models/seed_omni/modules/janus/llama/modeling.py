@@ -38,7 +38,7 @@ import torch
 import torch.nn as nn
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaModel
+from veomni.models.transformers.llama.modeling_llama import LlamaModel
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 
 from ....utils.conversation import ConversationItem

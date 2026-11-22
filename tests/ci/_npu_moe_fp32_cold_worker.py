@@ -29,7 +29,7 @@ from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
-from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_npu import Qwen4ExpTextExperts
+from veomni.models.transformers.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextExperts
 from veomni.optim.optimizer import build_optimizer
 
 
