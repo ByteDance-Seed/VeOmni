@@ -386,7 +386,7 @@ model = build_parallelize_model(
 | `master_fp32_adamw` | FP32 master weights with BF16 first and second moments. |
 | `full_fp32_adamw` | FP32 master weights and FP32 first and second moments. |
 | `cpu_offload_adamw` | FP32 master weights and configurable moment precision, with selected parameter states on CPU. |
-| `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases and norms. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
+| `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases, norms, and 2D matrices that route, mix or gate rather than transform features (MoE router gates, mHC stream mixing, the DSA indexer's `weights_proj`, compressor `gate_proj`) — see `_DEFAULT_ADAMW_NAME_PATTERNS` in `veomni/optim/muon.py`. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
 
 For `cpu_offload_adamw`, set `model.optimizer.cpu_offload_param_patterns` to
 full-parameter-name regular expressions selecting the optimizer states to
