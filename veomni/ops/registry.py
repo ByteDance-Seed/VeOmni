@@ -465,12 +465,37 @@ class OpsSelection:
         )
 
 
+def _freeze_kwarg_value(value: Any) -> Any:
+    """Convert structured YAML/JSON container values into a stable hashable key."""
+    if isinstance(value, dict):
+        return ("__dict__", tuple(sorted((k, _freeze_kwarg_value(v)) for k, v in value.items())))
+    if isinstance(value, list):
+        return ("__list__", tuple(_freeze_kwarg_value(v) for v in value))
+    if isinstance(value, tuple):
+        return ("__tuple__", tuple(_freeze_kwarg_value(v) for v in value))
+    if isinstance(value, set):
+        return ("__set__", frozenset(_freeze_kwarg_value(v) for v in value))
+    return value
+
+
+def _kwargs_cache_key(kwargs: dict[str, Any]) -> tuple | None:
+    """Return a hashable intern key for ``kwargs``, or ``None`` if any value is unhashable."""
+    if not kwargs:
+        return ()
+    try:
+        key = tuple(sorted((k, _freeze_kwarg_value(v)) for k, v in kwargs.items()))
+        hash(key)
+    except TypeError:
+        return None
+    return key
+
+
 class VeomniOp:
     """Local handle for one ``(op, variant, impl)`` row plus optional row kwargs.
 
-    Interned by ``(op, variant, impl, kwargs)``. Always calls ``entry.wrapper``.
-    Compound Functions must use ``resolve_op(...).forward`` / ``.backward``, not
-    this handle.
+    Interned by ``(op, variant, impl, kwargs)`` when ``kwargs`` can be reduced to
+    a hashable key. Always calls ``entry.wrapper``. Compound Functions must use
+    ``resolve_op(...).forward`` / ``.backward``, not this handle.
     """
 
     _intern: dict[tuple[str, str, str, tuple], VeomniOp] = {}
@@ -487,23 +512,25 @@ class VeomniOp:
         kwargs: dict[str, Any] = {}
         if isinstance(impl, OpsSelection):
             impl, kwargs = impl.resolve(site)
-        kwargs_key = tuple(sorted(kwargs.items()))
-        if impl is not None:
+        kwargs_key = _kwargs_cache_key(kwargs)
+        if impl is not None and kwargs_key is not None:
             cached = cls._intern.get((op, variant, impl, kwargs_key))
             if cached is not None:
                 return cached
         entry = resolve_op(op, variant, impl)
-        key = (op, variant, entry.impl, kwargs_key)
-        cached = cls._intern.get(key)
-        if cached is not None:
-            return cached
+        if kwargs_key is not None:
+            key = (op, variant, entry.impl, kwargs_key)
+            cached = cls._intern.get(key)
+            if cached is not None:
+                return cached
         instance = super().__new__(cls)
         instance.op = op
         instance.variant = variant
         instance.impl = entry.impl
         instance.kwargs = kwargs
         instance._entry = entry
-        cls._intern[key] = instance
+        if kwargs_key is not None:
+            cls._intern[(op, variant, entry.impl, kwargs_key)] = instance
         return instance
 
     def __init__(

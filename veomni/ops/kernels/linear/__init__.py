@@ -30,8 +30,8 @@ model dtype, which is what an emulated low-precision deployment GEMM computes.
 ``standard`` only, so a model that also binds ``grouped`` (DeepSeek-V4) uses it
 only on ``standard`` sites.
 
-The precision is a row *argument* (``dtype``), not part of the name: ``qat`` serves
-FP8 and FP4 checkpoints, and ``torchao`` serves FP8, NVFP4, and MXFP4.
+The precision is a row *argument* (``dtype``), not part of the name: ``qat`` is
+FP8-only (``dtype="fp8"``), and ``torchao`` serves FP8, NVFP4, and MXFP4.
 """
 
 from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement

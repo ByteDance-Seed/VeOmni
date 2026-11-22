@@ -15,6 +15,17 @@ model:
     moe_implementation: deepgemm
 ```
 
+For checkpoints whose config sets `expert_dtype: "fp4"` (such as DeepSeek-V4 Flash),
+pass the explicit FP8 override so the row accepts the call instead of rejecting `dtype="fp4"`:
+
+```yaml
+model:
+  ops_implementation:
+    moe_implementation:
+      name: deepgemm
+      kwargs: {dtype: fp8}
+```
+
 The model's existing `VeomniOp` handle resolves the backend at construction.
 Other operators keep their configured implementations. The default MoE backend
 is unchanged. Use trainable BF16 expert parameters, or FSDP2 BF16 parameter
@@ -74,7 +85,7 @@ This is operator integration, not full-model convergence validation.
 ```yaml
 model:
   ops_implementation:
-    moe_implementation: deepgemm
+    moe_implementation: deepgemm  # Use {name: deepgemm, kwargs: {dtype: fp8}} on expert_dtype="fp4" checkpoints (e.g. DeepSeek-V4 Flash)
   accelerator:
     fsdp_config:
       expert_weight_fp8_all_gather: true

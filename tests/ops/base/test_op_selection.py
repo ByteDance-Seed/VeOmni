@@ -90,6 +90,24 @@ def test_per_site_op_selection_and_overrides(monkeypatch):
         assert (h1.kwargs, h3.kwargs) == ({"block_size": 128}, {"block_size": 64})
         assert pickle.loads(pickle.dumps(h3)) is h3
 
+        # Structured dict/list kwargs intern safely; genuinely unhashable values bypass interning without raising.
+        struct_sel = OpsSelection(name="test_round", kwargs={"options": {"scale": 2, "axes": [0, 1]}})
+        hs1 = VeomniOp("linear", "standard", struct_sel)
+        hs2 = VeomniOp(
+            "linear", "standard", OpsSelection(name="test_round", kwargs={"options": {"axes": [0, 1], "scale": 2}})
+        )
+        assert hs1 is hs2
+        assert hs1.kwargs == {"options": {"scale": 2, "axes": [0, 1]}}
+
+        class _Unhashable:
+            __hash__ = None
+
+        marker = _Unhashable()
+        hu1 = VeomniOp("linear", "standard", OpsSelection(name="test_round", kwargs={"ctx": marker}))
+        hu2 = VeomniOp("linear", "standard", OpsSelection(name="test_round", kwargs={"ctx": marker}))
+        assert hu1 is not hu2
+        assert hu1.kwargs["ctx"] is marker
+
         seen = {}
         probe = object.__new__(VeomniOp)
         probe.op, probe.variant, probe.impl, probe.kwargs = "linear", "standard", "test_round", {"block_size": 64}
@@ -105,6 +123,8 @@ def test_per_site_op_selection_and_overrides(monkeypatch):
     finally:
         for key in [k for k in OP_REGISTRY._entries if k[2] == "test_round"]:
             del OP_REGISTRY._entries[key]
+        for key in [k for k in VeomniOp._intern if k[2] == "test_round"]:
+            del VeomniOp._intern[key]
 
     # 3. Config dict round-trip, kv_round overrides, host validation across overrides, and shipped YAML.
     configured = OpsImplementationConfig(

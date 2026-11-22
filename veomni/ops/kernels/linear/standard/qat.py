@@ -19,10 +19,9 @@ and the multiply itself runs in the model dtype, which is what an emulated
 low-precision deployment GEMM computes: the rounded values are read back and
 accumulated in high precision.
 
-``dtype`` picks the format. ``fp8`` uses square ``block_size`` tiles with an
-optional power-of-two scale; ``fp4`` groups only along the input dimension at a
-fixed 32 channels, because that is the layout a V4-Flash checkpoint stores its
-routed experts in.
+``dtype`` is FP8-only (``"fp8"``), using ``1 x block_size`` activation blocks
+and square ``block_size x block_size`` weight tiles with optional power-of-two
+scales.
 """
 
 from __future__ import annotations
@@ -41,14 +40,11 @@ SUPPORTED_DTYPES = ("fp8",)
 def wrapper(linear: nn.Module, x: Tensor, *, dtype: str = "fp8", block_size: int | None = None) -> Tensor:
     """Run ``linear`` with blockwise fake-quantized activation and weight.
 
-    ``dtype`` picks the format. For ``fp8``, ``block_size`` (default 128) sets both
-    operands' granularity: ``1 x block_size`` activation blocks and square
+    ``dtype`` must be ``"fp8"``. ``block_size`` (default 128) sets both operands'
+    granularity: ``1 x block_size`` activation blocks and square
     ``block_size x block_size`` weight tiles. The deployment GEMM ties them together
     -- it indexes a weight's scale by the same block counter as the activation's --
     so one number describes its recipe, not two.
-
-    ``fp4`` groups only along the input dimension, at the fixed width the checkpoint's
-    scale layout defines, so ``block_size`` does not apply to it.
     """
     # A quantizing row always gets a weight: ``resolve_projection`` raises for a
     # wrapped projection instead of handing back a shortcut.
