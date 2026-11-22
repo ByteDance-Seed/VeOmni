@@ -40,6 +40,7 @@ def validate_expert_precision_config(mixed, fsdp_mode, low_precision_comm, tp_si
 def validate_qwen4_experts(model):
     """Check the local constructed expert modules before any FSDP wrapping."""
     from ..lora.moe_layers import has_lora_moe_experts
+    from ..ops.kernels.moe_experts.shared.activation import is_silu
 
     if has_lora_moe_experts(model):
         raise ValueError("NPU expert FP32 wgrad does not support MoE LoRA expert wrappers")
@@ -50,7 +51,7 @@ def validate_qwen4_experts(model):
         raise ValueError("NPU expert FP32 wgrad currently requires Qwen4-Exp expert modules")
     if any(
         getattr(getattr(module, "veomni_moe", None), "impl", None) != "fused_npu"
-        or not getattr(module, "use_swiglu", False)
+        or not is_silu(getattr(module, "activation", ""))
         for _, module in experts
     ):
         raise ValueError("NPU expert FP32 wgrad requires Qwen4-Exp SiLU fused_npu experts")
