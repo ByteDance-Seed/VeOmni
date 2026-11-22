@@ -43,6 +43,8 @@ must not exceed the original expert rows per EP rank. See the
   opposite hotspots cannot cancel. `ep_rank_plan_imbalance_{before,after}_peak`
   preserves the worst plan per layer; `ep_rank_cumulative_imbalance_{before,after}`
   separately describes the cumulative physical rank-load distribution.
+  Physical counts accumulate on the host and transfer to the collective
+  device when an interval snapshot is collected.
 
 ## Validation results and limits
 
@@ -61,6 +63,10 @@ repeatable 5% gain. Five-percent gain is aspirational, not the acceptance gate.
 GPU timing excludes 20 warmup steps; NPU qualification excludes five. Timing
 uses the slowest-rank synchronized whole window and one global token count.
 Thresholds and hardware/software/source cohorts are not pooled across runs.
+The older A3 comparison at `639469d` used pre-loss NPU cache reclamation.
+Chunk loss now uses the default allocator behavior. To reproduce that
+fragmentation workaround, set `VEOMNI_NPU_CHUNK_LOSS_EMPTY_CACHE=1` for every
+comparison arm. The workaround synchronizes the device while freeing cached blocks.
 Native precision uses abs(delta)<=1e-4+1e-3*abs(reference). Short NPU windows
 are qualification evidence, not the five-group formal performance protocol.
 Memory C04 allocated peak is 50.283 GiB, near OFF 50.624–50.626 GiB and below
