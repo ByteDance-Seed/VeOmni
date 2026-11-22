@@ -44,16 +44,10 @@ VIDEO_TOKEN_ID = 121
 
 
 def _qwen3_vl_moe_cls():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.qwen3_vl_moe.modeling_qwen3_vl_moe import (
+        Qwen3VLMoeForConditionalGeneration,
+    )
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3_vl_moe.generated.patched_modeling_qwen3_vl_moe_npu import (
-            Qwen3VLMoeForConditionalGeneration,
-        )
-    else:
-        from veomni.models.transformers.qwen3_vl_moe.generated.patched_modeling_qwen3_vl_moe_gpu import (
-            Qwen3VLMoeForConditionalGeneration,
-        )
     return Qwen3VLMoeForConditionalGeneration
 
 
@@ -133,7 +127,7 @@ def test_qwen3_vl_moe_eager_matches_hf_aux_loss():
 
 
 def test_qwen3_vl_moe_npu_generated_attention_binds_ops_and_runs_eager_forward():
-    from veomni.models.transformers.qwen3_vl_moe.generated.patched_modeling_qwen3_vl_moe_npu import (
+    from veomni.models.transformers.qwen3_vl_moe.modeling_qwen3_vl_moe import (
         Qwen3VLMoeForConditionalGeneration,
     )
 

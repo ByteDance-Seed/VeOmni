@@ -237,11 +237,9 @@ MTP per step (median, +3.9%). Peak memory increased from 43.95GB to 44.89GB (+2.
 ## Supporting MTP for a new model
 
 The trainer-side loss plumbing (`output.loss` dictionaries and
-`count_loss_token`'s `{prefix}_tokens`) is model-agnostic. Per model you need,
-in its patch config:
+`count_loss_token`'s `{prefix}_tokens`) is model-agnostic. Add the following in the model's standalone `modeling_<model>.py` and its integration files:
 
-1. An MTP `nn.Module` whose submodule names match the checkpoint's `mtp.*` FQNs,
-   added with `config.add_helper_after(...)`.
+1. An MTP `nn.Module` whose submodule names match the checkpoint's `mtp.*` FQNs.
 2. A way to reach the trunk's `inputs_embeds` / `position_embeddings` / masks —
    for Qwen3.5 that meant overriding the text model's `forward` to emit
    `mtp_context`.
@@ -261,6 +259,3 @@ in its patch config:
    FSDP2 shards them again over the regular mesh, so each rank gathers a mix of
    other ranks' experts without any error (see
    [Plan owners](./extra_parallel.md#plan-owners)).
-
-Note `config.modify_init()` looks like the natural fit for step 3 but is a **dead API**: `PatchType.INIT_MODIFICATION` has no implementation in patchgen's codegen, so
-the patch is silently dropped. Use `override_method("<Class>.__init__")`.

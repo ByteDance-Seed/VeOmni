@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import importlib
 import os
 import tempfile
 from contextlib import ExitStack
@@ -44,22 +43,7 @@ from veomni.utils.device import (
 )
 
 
-def _modeling():
-    """The generated DeepSeek-V4 module for the backend this worker runs on.
-
-    The GPU and NPU modules are the same modeling with backend-specific patches;
-    the CP code under test is shared, so a worker must build the one that matches
-    its device instead of always the GPU module.
-    """
-    suffix = "npu" if get_device_type() == "npu" else "gpu"
-    return importlib.import_module(
-        f"veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_{suffix}"
-    )
-
-
-# The in-process tests patch the parallel-state accessor of the module they build
-# layers from, so this has to name the same backend the workers do.
-_PATCHED_MODULE = _modeling().__name__
+_PATCHED_MODULE = "veomni.models.transformers.deepseek_v4.modeling_deepseek_v4"
 
 
 def _load_dsv4_toy_config(**ops_overrides):
@@ -228,8 +212,8 @@ def _init_cp_attention(
         )
 
     from veomni.distributed.parallel_state import _init_parallel_state
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as dsv4
 
-    dsv4 = _modeling()
     cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
     dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
 
@@ -496,9 +480,9 @@ def _run_compressor_cp(
             world_size=world_size,
         )
 
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
 
-    dsv4 = _modeling()
     cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
     dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
 
@@ -625,10 +609,10 @@ def _run_indexer_cp(rank: int, world_size: int, init_file: str, seq_len: int, *,
             world_size=world_size,
         )
 
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as dsv4
     from veomni.models.transformers.deepseek_v4.packed_utils import build_packed_compression_metadata
     from veomni.ops import resolve_op
 
-    dsv4 = _modeling()
     cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
     dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
 
@@ -744,7 +728,7 @@ def _build_local_attention(with_compressor: bool, local_len: int, cp_size: int, 
     so that a guard moved after the halo exchange is caught by the unusable group
     rather than by the compressor's own shard-width check.
     """
-    dsv4 = _modeling()
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as dsv4
 
     config = _load_dsv4_toy_config()
     torch.manual_seed(0)
@@ -811,7 +795,7 @@ def test_deepseek_v4_cp_rejects_a_narrow_shard(kind):
     or none does, which is the property that keeps this a clean error instead of
     a ten-minute watchdog timeout.
     """
-    dsv4 = _modeling()
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as dsv4
 
     class_name, role = _WINDOW_COMPRESSORS[kind]
     config = _load_dsv4_toy_config()
@@ -855,7 +839,7 @@ def test_deepseek_v4_attention_cp_rejects_a_local_length_mask(with_compressor):
 
 def _build_toy_model(seq_len: int):
     """A whole toy model on CPU plus one batch of ids, for the model-forward guards."""
-    dsv4 = _modeling()
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as dsv4
 
     config = _load_dsv4_toy_config()
     torch.manual_seed(0)
@@ -934,7 +918,8 @@ def _run_model_cp_packed(
             world_size=world_size,
         )
 
-    dsv4 = _modeling()
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as dsv4
+
     cp_state = _init_parallel_state(dp_size=1, cp_size=world_size, ulysses_size=1, device_type=device_type, name="cp")
     dp_state = _init_parallel_state(dp_size=world_size, cp_size=1, ulysses_size=1, device_type=device_type, name="dp")
     if tilelang:
