@@ -59,13 +59,13 @@ model:
     dsa_indexer_implementation: tilelang
     mhc_implementation: tilelang
     rms_norm_implementation: liger_kernel
-    swiglu_mlp_implementation: liger_kernel
+    gated_mlp_implementation: liger_kernel
     rotary_pos_emb_implementation: triton
   optimizer:
     # Muon + AdamW, as the sibling config ships. The indexer's parameters carry gradients for
-    # the first time under this objective, so they join Muon's 2D group by dimensionality --
-    # which is the paper-faithful routing (V4 §2.4 puts everything but embeddings, the head,
-    # mHC biases and norms on Muon), and needs no configuration.
+    # the first time under this objective, so they join the split by name: `q_b_proj` and
+    # `kv_proj` stay on Muon, while `weights_proj` and the compressor/indexer `gate_proj`
+    # softmax gates go to AdamW.
     #
     # muon_head_split_modules is deliberately unset. Head-split Muon reaches the indexer,
     # whose up-projection is named q_b_proj like the main attention's, and this objective is

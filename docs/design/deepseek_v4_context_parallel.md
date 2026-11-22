@@ -30,7 +30,7 @@ communication than necessary to get it.
 | Contiguous sharding, `cp_size` in {2, 4} verified | Zigzag / load-balanced sharding |
 | All-gather for full-resolution KV, compressed rows and compressor halos | P2P halos; multi-hop halos |
 | DeepSeek-V4 only, via an allow-list | Any other model |
-| GPU-only (`check_context_parallel_supported` rejects NPU) | Ascend/NPU CP |
+| GPU, and Ascend/NPU with the eager DSA operators | CANN DSA operators under CP |
 | `cp_size > 1` with `ulysses_size == 1` | Hybrid CP x Ulysses |
 | Training | KV cache and decode paths |
 | Correctness | Measured performance; `cp_size=8` |
@@ -46,8 +46,10 @@ the indexer independently — all three derive the shard's origin from
 
 The safety net for any such change is `tests/parallel/context_parallel/`, which
 compares forward output, input gradient and every parameter gradient against a
-single-rank baseline at `cp_size` 2 and 4, packed and unpacked, with and without
-the compressor. It needs four GPUs. `cp_size=8` has never been run.
+single-rank baseline at `cp_size` 2, and on CUDA also at 4, packed and unpacked,
+with and without the compressor. CUDA CI runs both topologies; NPU CI runs the
+two-rank case, where the packed-model branches do not execute. `cp_size=8` has
+never been run.
 
 ## Constraints the code enforces
 
@@ -55,14 +57,15 @@ the compressor. It needs four GPUs. `cp_size=8` has never been run.
 |----|----|----|
 | `cp_size <= S / max(config.compress_rates)` | `plan_compressor_shard`, called by all three window compressors before their halo exchange | `ValueError` on the first forward |
 | `cp_size > 1` requires `ulysses_size == 1` | `ParallelState.__post_init__` and `AcceleratorConfig._resolve_topology` | `NotImplementedError` at launch |
-| the model type must implement CP | `check_context_parallel_supported`, from `build_foundation_model` and `build_omni_model` | `NotImplementedError` at model build |
-| CP is GPU-only | `check_context_parallel_supported` | `NotImplementedError` at model build on Ascend/NPU |
+| the model type must implement CP | `check_context_parallel_supported`, from `build_foundation_model` (the omni path reaches it the same way, once per sub-module) | `NotImplementedError` at model build |
+| on Ascend/NPU, the model type must be `deepseek_v4` | `check_context_parallel_supported` | `NotImplementedError` at model build |
+| on Ascend/NPU, `dsa_indexer_implementation` and `dsa_attention_implementation` must be `eager` | `check_context_parallel_supported`, which reads the adapted config's `ops_config` | `NotImplementedError` at model build for any value other than `eager` |
 | explicit `position_ids` under either sequence-parallel mode | `DeepseekV4Model.forward` | `ValueError` on the first forward |
 | the attention mask spans the full sequence | `DeepseekV4Attention.forward`, ahead of the KV all-gather | `ValueError` on the first forward |
 | no KV cache under CP | `DeepseekV4Attention.forward` | `NotImplementedError` |
 | shards are contiguous and equally sized, carrying global `position_ids` | not checkable from one rank; see below | silently wrong results |
 
-Two of these are worth more than a table row.
+Three of these are worth more than a table row.
 
 ### Sequence length and compression rate
 
@@ -118,6 +121,56 @@ defect on this branch: `arange(local_seq_len)` tells every rank its shard starts
 at position 0, which keeps every shape self-consistent while every rank above 0
 compresses the wrong rows and the indexer's canonical-position check admits the
 TileLang kernel on rank 0 alone. Hence the refusal rather than a default.
+
+### Ascend/NPU operator selections
+
+`check_context_parallel_supported` admits DeepSeek-V4 on Ascend/NPU and then
+checks the operator pair on the config it was handed, which is why the check
+lives there rather than on the model config: a native checkpoint config is
+adapted into a generic class that keeps `ops_config` but not
+`DeepseekV4Config.validate_build_prerequisites`. Only the eager DSA path is
+accepted. The CANN adapters on either side of the sparse attention reject the
+geometry CP hands them:
+
+- `dsa_attention_implementation: cann` requires one KV row per query row. Under
+  CP a rank owns `L` queries while the KV buffer is all-gathered to `S_global`,
+  so the adapter sees `ori_kv.shape[1] != q.shape[1]` (and `query_offset != 0`)
+  and raises before the first compressed layer produces an output.
+- `dsa_indexer_implementation: cann` derives causal visibility from the query
+  row and only accepts selection ranges that match its own segment-causal plan.
+  CP supplies explicit `cu_seqlen_ks` / `cu_seqlen_ke` rebased onto the global
+  sequence without the slices those ranges would have to imply, so the adapter
+  raises instead of masking from the wrong origin — the same class of failure
+  the indexer's canonical-position check guards against.
+
+The rest of the NPU selections are CP-safe and stay on their kernels:
+`mhc_implementation: cann` sees per-token tensors with no sequence geometry, and
+`moe_implementation: fused_npu` / `cross_entropy_loss_implementation:
+chunk_loss` are unaffected. There is no separate CP configuration: a CP run is
+[`configs/text/deepseek_v4_npu.yaml`](../../configs/text/deepseek_v4_npu.yaml)
+with `dsa_indexer_implementation` and `dsa_attention_implementation` edited to
+`eager` and `cp_size` set above 1. Do the edit only for the CP run: the CANN
+DSA selections remain the right choice for non-CP runs, and switching them
+costs those runs their kernels.
+
+The gate validates that selection pair and nothing else: it cannot check that
+the eager operators are numerically correct on Ascend, and
+`cp_size <= S / max(config.compress_rates)` applies unchanged. CANN CP support
+would be a kernel change — teaching both adapters the `query_offset` /
+`ori_kv` geometry and the explicit ranges — not a gate change; until then an
+NPU job that needs the CANN operators has to run with `cp_size=1`.
+
+Validation beyond configuration is one non-CI training comparison, not tensor
+parity: starting from `configs/text/deepseek_v4_npu.yaml` and overriding the run
+to GSM8K, `max_seq_len=512`, `global_batch_size=32`, lr `3e-4`, seed 42,
+`enable_full_determinism: true`, `dp_size=4`, `ep_size=4`, `cp_size=1` and
+`cp_size=2` trained on Ascend over the same 71 steps and the loss relative error
+stayed within ±4%. That is evidence the eager path trains, not a per-tensor
+bound, and it says nothing about `cp_size=8`, which has never been run.
+
+`tests/parallel/context_parallel/` runs its two-rank eager case on the NPU
+suite, so the eager path's rank and local-query/global-KV geometry is checked on
+device; the four-rank and packed-model branches stay CUDA-only.
 
 ## Decisions that took more than one attempt
 
@@ -221,7 +274,7 @@ Recorded because the reasons were discoveries, not tidying.
 | document said | built instead | why |
 |----|----|----|
 | `sharding.py` holds contiguous slice / restore helpers and a divisibility check `L % max_compress_rate == 0` | window-ownership arithmetic plus the three helpers every window compressor shares | Slicing is already free — the collator's `sp_slice` narrows on `sp_rank`, which resolves to `cp_rank` under CP — and contiguous shards in rank order need no restore permutation. The divisibility check was the wrong constraint: ownership by first token absorbs any sample length, so `L % R == 0` is not required, while `R <= L` is. |
-| model-level validation belongs in the DSv4 forward, which raises if CP is enabled and the model is not DSv4 | positive allow-list `check_context_parallel_supported` in `veomni/models/auto.py`, called from `build_foundation_model`, plus a second call in `build_omni_model` | The design's own mitigation is self-contradictory: a forward that never runs cannot observe that the model is not DSv4. An allow-list also fails safe as CP spreads — a newly ported model has to be added deliberately instead of the gate having to be remembered. The omni call is keyed on the *foundation's* model type, because the encoder/decoder branch constructs `SeedOmniModel._from_config` directly and the outer `SeedOmniConfig` model type says nothing about what runs the collectives. |
+| model-level validation belongs in the DSv4 forward, which raises if CP is enabled and the model is not DSv4 | positive allow-list `check_context_parallel_supported` in `veomni/models/auto.py`, called from `build_foundation_model`, which the omni path also calls — once per sub-module, with that sub-module's own config | The design's own mitigation is self-contradictory: a forward that never runs cannot observe that the model is not DSv4. An allow-list also fails safe as CP spreads — a newly ported model has to be added deliberately instead of the gate having to be remembered. Per-sub-module calls matter because the encoder/decoder branch constructs `SeedOmniModel._from_config` directly and the outer `SeedOmniConfig` model type says nothing about what runs the collectives. |
 | the plan scoped the CP admission gate to `parallel_state.py` | both `parallel_state.py` and `AcceleratorConfig._resolve_topology` | The arguments layer held its own model-agnostic `assert cp_size == 1`, which aborts on the CLI and trainer path before `ParallelState` is ever constructed. Two gates now carry the same hybrid-only refusal. |
 | no `shard_packed_compression_metadata` | new helper in `packed_utils.py` | Only the module holding the hidden states knows they are one shard, so only it can shard the global metadata — and per-window and per-query arrays shard differently (see the decision on index spaces above). |
 | "there is no sequence-length divisibility constraint beyond `S % cp_size == 0`" | `cp_size <= S / max(compress_rates)` | Found during implementation, from the halo geometry. See "Sequence length and compression rate". |

@@ -180,17 +180,15 @@ placeholders when it reaches `DynamicBatchingSizeDataset` / `TextBatchingStrateg
 
 ## Multisource training
 
-In-tree smoke configs live under `configs/seed_omni/fake_model/train/base.yaml`.
-For full model families (such as Janus on the `omniv2` branch / follow-up model
-PRs, where data sources are declared in `configs/seed_omni/Janus/data.yaml`),
-launch with:
+A family declares its data sources in its own `data.yaml` (Janus:
+`configs/seed_omni/Janus/data.yaml`). Launch with:
 
 ```bash
 # In-tree stand-in config:
 bash train.sh tasks/omni/train_omni.py configs/seed_omni/fake_model/train/base.yaml
 
-# Janus family config (on omniv2 / follow-up model PRs):
-bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus_1.3b/train/base.yaml
+# Janus family config:
+bash train.sh tasks/omni/train_omni.py configs/seed_omni/Janus/janus/train/base.yaml
 ```
 
 See [Training and Inference](training_and_inference.md) for the full convert → train → resume → infer pipeline.

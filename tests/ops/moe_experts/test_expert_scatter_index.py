@@ -133,3 +133,22 @@ def test_max_expert_tokens_rejects_non_2d_index(bad_shape):
     expert_index = torch.zeros(bad_shape, dtype=torch.int64)
     with pytest.raises(ValueError, match="2-D"):
         compute_max_expert_tokens(expert_index, top_k=2)
+
+
+def test_moe_qat_row_rejects_an_unknown_expert_dtype():
+    """``expert_dtype`` comes from a free-form checkpoint key, so a typo must not train FP8 silently."""
+    from veomni.ops.kernels.moe_experts.standard import qat as moe_qat
+
+    empty = torch.empty(0, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="expert_dtype must be 'fp8' or 'fp4'"):
+        moe_qat.wrapper(
+            torch.zeros(2, 4, dtype=torch.bfloat16),
+            torch.zeros(2, dtype=torch.float32),
+            torch.zeros(2, 1, dtype=torch.long),
+            empty,
+            empty,
+            empty,
+            empty,
+            num_experts=1,
+            expert_dtype="FP4",
+        )

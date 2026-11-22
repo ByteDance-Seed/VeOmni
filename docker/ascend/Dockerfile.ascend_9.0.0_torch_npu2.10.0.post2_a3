@@ -63,9 +63,9 @@ RUN pip install "pyarrow==21.0.0" "pandas==2.3.2"
 
 # ============================================================================
 # GDN / fla_npu (AscendC fused ops) — ported from Dockerfile.ascend_9.0.0_a2.x86.
-# The aarch64 A3 image build is CI-validated, and GDN runtime behavior was validated
-# on physical A3 hardware. Differences vs x86: pip not uv, runs as root (.run writes
-# the CANN opp dir directly, no sudo), no venv, and the A3 SOC target below.
+# The aarch64 Atlas A3 training products image build is CI-validated, and GDN runtime behavior was validated
+# on physical Atlas A3 training products hardware. Differences vs x86: pip not uv, runs as root (.run writes
+# the CANN opp dir directly, no sudo), no venv, and the Atlas A3 training products SOC target below.
 # ============================================================================
 
 # fla_npu's check_npu_env maps torch 2.10.0 -> torch_npu 2.10.0.post2 (npu_aarch64

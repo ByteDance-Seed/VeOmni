@@ -1,15 +1,15 @@
-# Ascend A2 Docker Image Build and Usage Guide
+# Atlas A2 training products Docker Image Build and Usage Guide
 
 ## Overview
-This guide provides step-by-step instructions for building and using the Ascend A2 Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Ascend A2 accelerators.
+This guide provides step-by-step instructions for building and using the Atlas A2 training products Docker image for VeOmni framework. The image is based on Huawei's Ascend CANN platform and includes all necessary dependencies for running multi-modal models on Atlas A2 training products accelerators.
 
-**Note**: Ascend A2 supports both x86 and ARM64 architectures, with different environment management approaches for each:
+**Note**: Atlas A2 training products supports both x86 and ARM64 architectures, with different environment management approaches for each:
 - **x86 Architecture**: Uses `uv` for dependency management, requires virtual environment activation
 - **ARM64 Architecture**: Uses `pip` for dependency management, no virtual environment required
 
 ## Prerequisites
 - Docker installed on your system
-- Access to Ascend A2 hardware accelerators
+- Access to Atlas A2 training products hardware accelerators
 - Network access to pull the base image and install dependencies
 - Proxy configuration (if required in your environment)
 
@@ -28,7 +28,7 @@ docker pull --platform=amd64 swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1
 
 ## Step 2: Build the Custom Image
 
-Build the GDN-ready VeOmni Ascend A2 image using
+Build the GDN-ready VeOmni Atlas A2 training products image using
 `Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86` for x86 or
 `Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm` for ARM64. These Dockerfiles include
 `torch-npu==2.10.0.post2`, `triton-ascend`, and `fla_npu`.

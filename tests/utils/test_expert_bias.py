@@ -210,9 +210,7 @@ def test_real_deepseek_router_satisfies_the_output_contract():
     so none of them would notice if DeepseekV3TopkRouter stopped returning
     (logits, weights, indices) and balancing quietly stopped.
     """
-    from veomni.models.transformers.deepseek_v3.generated.patched_modeling_deepseek_v3_gpu import (
-        DeepseekV3TopkRouter,
-    )
+    from veomni.models.transformers.deepseek_v3.modeling_deepseek_v3 import DeepseekV3TopkRouter
 
     cfg = SimpleNamespace(
         num_experts_per_tok=2,

@@ -20,7 +20,7 @@ import torch
 from transformers import PreTrainedModel
 from transformers.initialization import no_init_weights
 
-from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
+from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights, tie_word_embeddings_if_requested
 from veomni.models.configuration_base import as_hf_config
 from veomni.models.registry import get_model_class
 from veomni.utils import logging
@@ -121,21 +121,14 @@ class CustomizedModelingLoader(BaseModelLoader):
 
             if not empty_init:
                 load_model_weights(model, weights_path, init_device)
-
-            text_config = (
-                model.config.get_text_config(decoder=True)
-                if hasattr(model.config, "get_text_config")
-                else model.config
-            )
-            if (
-                (hasattr(model.config, "tie_word_embeddings") or hasattr(text_config, "tie_word_embeddings"))
-                and getattr(model.config, "tie_word_embeddings", True)
-                and getattr(text_config, "tie_word_embeddings", True)
-            ):
+            else:
+                # ``load_model_weights`` re-ties at the end of its own
+                # ``post_process_after_weight_loading``, so when weights were read
+                # the tie has already happened. ``empty_init`` skips that call — the
+                # model was built under ``init_empty_weights()``, which leaves a tied
+                # pair as two separate storages — so the tie is owed here instead.
                 try:
-                    input_embeddings = model.get_input_embeddings()
-                    output_embeddings = model.get_output_embeddings()
-                    output_embeddings._parameters["weight"] = input_embeddings._parameters["weight"]
+                    tie_word_embeddings_if_requested(model)
                 except Exception as e:
                     logger.info_rank0(f"Failed to tie embeddings: {e}")
 

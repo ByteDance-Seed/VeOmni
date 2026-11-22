@@ -29,8 +29,7 @@ Design notes, in case they are not obvious:
 
 * **Keyed on the buffer, not on a class name.** Any module carrying
   ``e_score_correction_bias`` is updated, so a future model gets this without
-  touching a registry. That also keeps the change outside
-  ``veomni/models/transformers/*/generated/``, which must not be hand-edited.
+  touching a registry or its modeling file.
 * **Counts are accumulated in a forward hook and consumed once per optimizer
   step**, not once per micro-batch, so gradient accumulation sees the load of
   the whole step. This is the same placement torchtitan uses.

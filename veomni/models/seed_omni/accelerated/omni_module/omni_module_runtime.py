@@ -129,6 +129,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         for_inference: bool = False,
         hf_source: Optional["HFSource"] = None,
     ):
+        """Bind the arguments, config and accelerator settings for one module."""
         self.args = args
         self.model_name = module_name
         self.module_config = module_config
@@ -237,7 +238,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         ``model_path`` it is the weight-free view's, where the config and assets
         are read from.
         """
-        return self.hf_source.path if self.hf_source is not None else self.args.model_path
+        return self.hf_source.weights_path if self.hf_source is not None else self.args.model_path
 
     @property
     def module_name(self) -> str:
@@ -280,6 +281,9 @@ class ModuleRuntime(VeOmniModelRuntime):
         model_path = args.model_path
         model_type = self.module_config.model_type
         cls = OMNI_MODEL_REGISTRY[model_type]()
+        module_dtype = getattr(self.module_config, "dtype", None) or torch.bfloat16
+        if isinstance(module_dtype, str):
+            module_dtype = getattr(torch, module_dtype)
         if dist.is_initialized():
             device_map = {"": f"{get_device_type()}:{int(os.getenv('LOCAL_RANK', 0))}"}
         else:
@@ -297,7 +301,7 @@ class ModuleRuntime(VeOmniModelRuntime):
                 self.hf_source,
                 self.module_name,
                 device_map=device_map,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=module_dtype,
             ).eval()
             self.model_config = self.model.config
             self._build_model_assets()
@@ -309,7 +313,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         self.model = cls.from_pretrained(
             model_path,
             config=self.module_config,
-            torch_dtype=torch.bfloat16,
+            torch_dtype=module_dtype,
             device_map=device_map,
         ).eval()
         self.model_config = self.model.config
@@ -348,7 +352,7 @@ class ModuleRuntime(VeOmniModelRuntime):
             # Mirrors the loaders' ``empty_init``: off rank 0 a CPU init stays on meta.
             off_rank0 = dist.is_initialized() and dist.get_rank() != 0
             if init_device != "meta" and not (init_device == "cpu" and off_rank0):
-                load_model_weights(self.model, self.hf_source.path, init_device)
+                load_model_weights(self.model, self.hf_source.weights_path, init_device)
         self.model_config = self.model.config
 
     def _build_model_assets(self) -> None:
@@ -517,6 +521,7 @@ class ModuleRuntime(VeOmniModelRuntime):
 
     @property
     def has_trainable_parameters(self) -> bool:
+        """Whether any parameter of this module requires grad (cached after first use)."""
         if self._has_trainable_parameters is None:
             self._has_trainable_parameters = any(param.requires_grad for param in self.model.parameters())
         return self._has_trainable_parameters
@@ -556,11 +561,18 @@ class ModuleRuntime(VeOmniModelRuntime):
         A distributed optimizer (Muon) reads ``get_parallel_state()`` at build
         time, so it must resolve to this module's mesh, not the orchestrator's.
         A no-op for a fully-frozen module: there is nothing to step.
+
+        A module that defines ``configure_optimizer(optimizer)`` gets the built
+        optimizer before the lr-scheduler is built and a checkpoint is loaded into
+        it, so it can adjust its param groups or register step hooks.
         """
         if not self.has_trainable_parameters:
             return
         with self._scoped():
             super()._build_optimizer(param_groups)
+            configure_optimizer = getattr(self.omni_module, "configure_optimizer", None)
+            if callable(configure_optimizer):
+                configure_optimizer(self.optimizer)
 
     def _build_lr_scheduler(self, total_steps: int) -> None:
         """Build this module's lr-scheduler over ``total_steps``.
@@ -632,6 +644,13 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         if not any(p.requires_grad for p in self.model.parameters()):
             logger.info_rank0(f"ModuleRuntime[{self.module_name}]: fully frozen — skipping DCP/HF checkpoint.")
+            if any(
+                getattr(self.omni_module, hook, None) is not None for hook in ("extra_state_dict", "rng_state_dict")
+            ):
+                logger.warning_rank0(
+                    f"ModuleRuntime[{self.module_name}]: the fully frozen module contributes extra checkpoint state, "
+                    "but has no checkpoint manager, so that state is not saved. Keep it on a trainable module."
+                )
             self._has_trainable_parameters = False
             self.checkpoint = None
             return
@@ -641,6 +660,43 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Resume this module's DCP checkpoint, if one is configured."""
         if self.checkpoint is not None:
             self.checkpoint.load()
+
+    def extra_state(self) -> dict[str, Any]:
+        """Return optional module-owned checkpoint state under a private namespace.
+
+        ``extra_state_dict`` / ``load_extra_state_dict`` are the generic hooks.
+        The RNG pair remains a compatibility path for existing modules.
+        """
+        save = getattr(self.omni_module, "extra_state_dict", None)
+        if save is not None:
+            if getattr(self.omni_module, "load_extra_state_dict", None) is None:
+                logger.warning_rank0(
+                    f"ModuleRuntime[{self.module_name}]: extra_state_dict is defined without "
+                    "load_extra_state_dict; saved state cannot be restored."
+                )
+            return {"module_extra_state": save()}
+        rng_state_dict = getattr(self.omni_module, "rng_state_dict", None)
+        return {} if rng_state_dict is None else {"module_rng_state": rng_state_dict()}
+
+    def load_extra_state(self, extra_state: dict[str, Any]) -> None:
+        state = extra_state.get("module_extra_state")
+        load = getattr(self.omni_module, "load_extra_state_dict", None)
+        if state is not None and load is not None:
+            with self._scoped():
+                load(state)
+            return
+        rng_state = extra_state.get("module_rng_state")
+        if rng_state is None:
+            return
+        load_rng = getattr(self.omni_module, "load_rng_state_dict", None)
+        if load_rng is None:
+            logger.warning_rank0(
+                f"ModuleRuntime[{self.module_name}]: checkpoint carries module RNG state, "
+                "but the module has no load_rng_state_dict hook; state was not restored."
+            )
+            return
+        with self._scoped():
+            load_rng(rng_state)
 
     def save_dcp(self, state: "TrainerState") -> None:
         """Write this module's distributed checkpoint (train resume)."""

@@ -88,15 +88,20 @@ def test_run_places_request_tensors_like_training_when_distributed(distributed, 
         seen["input_ids"] = request["input_ids"]
         return []
 
+    def processor(**kwargs):
+        seen["processor_kwargs"] = kwargs
+        return {"input_ids": torch.ones(2, dtype=torch.long)}
+
     inferencer = _inferencer_with("infer_gen", {})
     inferencer._distributed = distributed
     inferencer.device = torch.device("meta")
-    inferencer.processor = lambda **kwargs: {"input_ids": torch.ones(2, dtype=torch.long)}
+    inferencer.processor = processor
     inferencer.model = SimpleNamespace(reset=lambda: None, generate=generate)
 
-    inferencer._run(InferenceRequest(prompt="hi"))
+    inferencer._run(InferenceRequest(prompt="hi", generation_kwargs={"infer_type": "infer_edit"}))
 
     assert seen["input_ids"].device.type == expected_device
+    assert seen["processor_kwargs"]["infer_type"] == "infer_edit"
 
 
 def test_extract_generated_text_keeps_only_filled_text_items():
