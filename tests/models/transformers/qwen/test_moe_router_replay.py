@@ -220,7 +220,7 @@ def _init_block_deterministic(block: nn.Module, seed: int = 0) -> None:
 
 
 def _build_patched_qwen3_moe_block(config, device=_DEVICE, dtype=torch.float32):
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (
+    from veomni.models.transformers.qwen3_moe.modeling_qwen3_moe import (
         Qwen3MoeSparseMoeBlock as PatchedQwen3MoeSparseMoeBlock,
     )
 
@@ -246,7 +246,7 @@ def _build_vanilla_qwen3_moe_block(config, device=_DEVICE, dtype=torch.float32):
 
 
 def _build_patched_qwen3_5_moe_block(config, device=_DEVICE, dtype=torch.float32):
-    from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu import (
+    from veomni.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import (
         Qwen3_5MoeSparseMoeBlock as PatchedQwen3_5MoeSparseMoeBlock,
     )
 
@@ -273,15 +273,10 @@ def _moe_block_hidden(output):
 
 
 def _build_patched_qwen4_exp_block(config, backend="gpu", device=_DEVICE, dtype=torch.float32):
-    """Build either generated Qwen4-Exp block with an instance-local eager expert op."""
-    if backend == "npu":
-        from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_npu import (
-            Qwen4ExpTextSparseMoeBlock as PatchedQwen4ExpTextSparseMoeBlock,
-        )
-    else:
-        from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu import (
-            Qwen4ExpTextSparseMoeBlock as PatchedQwen4ExpTextSparseMoeBlock,
-        )
+    """Build the Qwen4-Exp block with an instance-local eager expert op."""
+    from veomni.models.transformers.qwen4_exp.modeling_qwen4_exp import (
+        Qwen4ExpTextSparseMoeBlock as PatchedQwen4ExpTextSparseMoeBlock,
+    )
 
     block = PatchedQwen4ExpTextSparseMoeBlock(config).to(device=device, dtype=dtype)
     assert block.experts.veomni_moe.impl == "eager"

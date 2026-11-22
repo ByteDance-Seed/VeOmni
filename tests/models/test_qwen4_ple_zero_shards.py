@@ -20,8 +20,8 @@ _CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
 _CI_CPU_4 = LaunchSpec(nproc=4, device="cpu")
 
 
-def _model_module(backend):
-    return import_module(f"veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_{backend}")
+def _model_module():
+    return import_module("veomni.models.transformers.qwen4_exp.modeling_qwen4_exp")
 
 
 def _isolate_cpu_spawn(monkeypatch):
@@ -38,9 +38,9 @@ def _configure_cpu_worker():
     assert DefaultDeviceType.get_device_type() == "cpu"
 
 
-def _worker(rank, rendezvous, dtype, backend, world_size):
+def _worker(rank, rendezvous, dtype, world_size):
     _configure_cpu_worker()
-    model_module = _model_module(backend)
+    model_module = _model_module()
 
     dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world_size)
     try:
@@ -88,11 +88,11 @@ def _worker(rank, rendezvous, dtype, backend, world_size):
         dist.destroy_process_group()
 
 
-def _trainability_worker(rank, rendezvous, backend, mode):
+def _trainability_worker(rank, rendezvous, mode):
     from datetime import timedelta
 
     _configure_cpu_worker()
-    model_module = _model_module(backend)
+    model_module = _model_module()
     dist.init_process_group(
         "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=20)
     )
@@ -144,19 +144,18 @@ def _trainability_worker(rank, rendezvous, backend, mode):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
 @pytest.mark.parametrize("mode", ["all_frozen", "partial_agreed"])
 @pytest.mark.launch_plan(provider=_CI_CPU_2)
-def test_ple_shard_trainability_agreement(tmp_path, monkeypatch, backend, mode):
+def test_ple_shard_trainability_agreement(tmp_path, monkeypatch, mode):
     _isolate_cpu_spawn(monkeypatch)
-    mp.spawn(_trainability_worker, args=(str(tmp_path / "gloo"), backend, mode), nprocs=2, join=True)
+    mp.spawn(_trainability_worker, args=(str(tmp_path / "gloo"), mode), nprocs=2, join=True)
 
 
-def _distributed_partly_frozen_worker(rank, rendezvous, backend):
+def _distributed_partly_frozen_worker(rank, rendezvous):
     from datetime import timedelta
 
     _configure_cpu_worker()
-    model_module = _model_module(backend)
+    model_module = _model_module()
     dist.init_process_group(
         "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=20)
     )
@@ -202,28 +201,21 @@ def _distributed_partly_frozen_worker(rank, rendezvous, backend):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
 @pytest.mark.launch_plan(provider=_CI_CPU_2)
-def test_distributed_ple_partly_frozen_backward(tmp_path, monkeypatch, backend):
+def test_distributed_ple_partly_frozen_backward(tmp_path, monkeypatch):
     _isolate_cpu_spawn(monkeypatch)
-    mp.spawn(_distributed_partly_frozen_worker, args=(str(tmp_path / "gloo"), backend), nprocs=2, join=True)
+    mp.spawn(_distributed_partly_frozen_worker, args=(str(tmp_path / "gloo"),), nprocs=2, join=True)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
 @pytest.mark.launch_plan(provider=_CI_CPU_2)
-def test_trainable_ple_empty_shards_preserve_outputs_and_gradients_under_checkpoint(
-    tmp_path, monkeypatch, dtype, backend
-):
+def test_trainable_ple_empty_shards_preserve_outputs_and_gradients_under_checkpoint(tmp_path, monkeypatch, dtype):
     _isolate_cpu_spawn(monkeypatch)
-    mp.spawn(
-        _worker, args=(str(tmp_path / "gloo"), dtype, backend, _CI_CPU_2.nproc), nprocs=_CI_CPU_2.nproc, join=True
-    )
+    mp.spawn(_worker, args=(str(tmp_path / "gloo"), dtype, _CI_CPU_2.nproc), nprocs=_CI_CPU_2.nproc, join=True)
 
 
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
-def test_ple_empty_identity_does_not_save_weight_as_activation(backend):
-    identity = _model_module(backend)._Qwen4ExpAttachZeroWeightGrad
+def test_ple_empty_identity_does_not_save_weight_as_activation():
+    identity = _model_module()._Qwen4ExpAttachZeroWeightGrad
     weight = torch.nn.Parameter(torch.randn(8, 4))
     output = torch.randn(2, 4, requires_grad=True)
     saved = []
@@ -236,9 +228,9 @@ def test_ple_empty_identity_does_not_save_weight_as_activation(backend):
     torch.testing.assert_close(weight.grad, torch.zeros_like(weight), rtol=0, atol=0)
 
 
-def _distributed_lookup_worker(rank, rendezvous, dtype, backend, world_size):
+def _distributed_lookup_worker(rank, rendezvous, dtype, world_size):
     _configure_cpu_worker()
-    model_module = _model_module(backend)
+    model_module = _model_module()
 
     dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world_size)
     try:
@@ -288,36 +280,31 @@ def _distributed_lookup_worker(rank, rendezvous, dtype, backend, world_size):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
 @pytest.mark.launch_plan(provider=_CI_CPU_2)
-def test_distributed_ple_empty_owner_under_checkpoint(tmp_path, monkeypatch, dtype, backend):
+def test_distributed_ple_empty_owner_under_checkpoint(tmp_path, monkeypatch, dtype):
     _isolate_cpu_spawn(monkeypatch)
     mp.spawn(
         _distributed_lookup_worker,
-        args=(str(tmp_path / "gloo"), dtype, backend, _CI_CPU_2.nproc),
+        args=(str(tmp_path / "gloo"), dtype, _CI_CPU_2.nproc),
         nprocs=_CI_CPU_2.nproc,
         join=True,
     )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
 @pytest.mark.launch_plan(provider=_CI_CPU_4)
-def test_trainable_ple_column_shards_with_empty_requests(tmp_path, monkeypatch, dtype, backend):
+def test_trainable_ple_column_shards_with_empty_requests(tmp_path, monkeypatch, dtype):
     _isolate_cpu_spawn(monkeypatch)
-    mp.spawn(
-        _worker, args=(str(tmp_path / "gloo"), dtype, backend, _CI_CPU_4.nproc), nprocs=_CI_CPU_4.nproc, join=True
-    )
+    mp.spawn(_worker, args=(str(tmp_path / "gloo"), dtype, _CI_CPU_4.nproc), nprocs=_CI_CPU_4.nproc, join=True)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
 @pytest.mark.launch_plan(provider=_CI_CPU_4)
-def test_distributed_ple_column_shards_with_empty_owner(tmp_path, monkeypatch, dtype, backend):
+def test_distributed_ple_column_shards_with_empty_owner(tmp_path, monkeypatch, dtype):
     _isolate_cpu_spawn(monkeypatch)
     mp.spawn(
         _distributed_lookup_worker,
-        args=(str(tmp_path / "gloo"), dtype, backend, _CI_CPU_4.nproc),
+        args=(str(tmp_path / "gloo"), dtype, _CI_CPU_4.nproc),
         nprocs=_CI_CPU_4.nproc,
         join=True,
     )

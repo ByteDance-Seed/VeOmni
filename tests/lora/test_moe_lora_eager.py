@@ -379,7 +379,7 @@ def test_wrapper_constructs_on_mocked_mlu_with_default_ops_config(monkeypatch, m
     from transformers import Qwen3MoeConfig
 
     from veomni.arguments import OpsImplementationConfig
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import Qwen3MoeExperts
+    from veomni.models.transformers.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
     from veomni.ops import OP_REGISTRY, VeomniOp
 
     monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: True)
