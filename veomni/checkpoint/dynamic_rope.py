@@ -13,12 +13,11 @@ from .tensor_bytes import tensor_byte_chunks
 
 
 def _is_native_qwen3_dynamic(module):
-    """Recognize upstream and VeOmni-generated Qwen3 rotary implementations."""
+    """Recognize upstream and standalone VeOmni Qwen3 rotary implementations."""
     cls = type(module)
     approved_modules = {
         "transformers.models.qwen3.modeling_qwen3",
-        "veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu",
-        "veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_npu",
+        "veomni.models.transformers.qwen3.modeling_qwen3",
     }
     if cls.__module__ not in approved_modules or cls.__name__ != "Qwen3RotaryEmbedding":
         return False

@@ -11,18 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Import every patchgen-generated modeling module.
+"""Import every HF-derived standalone modeling module.
 
-Cheap smoke gate for transformers upgrades. The generated files are full copies
-of upstream modeling with VeOmni patches spliced in, so an upstream change can
-make one fail at *import* time — HF's ``@auto_docstring`` validates patched
-signatures and return dataclass docstrings while the class body is executed, and
-it raises rather than warns for some shapes.
+Cheap smoke gate for transformers upgrades. Each ``modeling_<model>.py`` file is
+a standalone copy of upstream modeling with VeOmni customizations, so an upstream
+change can make one fail at *import* time — HF's ``@auto_docstring`` validates
+patched signatures and return dataclass docstrings while the class body is
+executed, and it raises rather than warns for some shapes.
 
-The bitwise logits suite does not cover this: it only builds the GPU models it
-has toy configs for, so an NPU-only generated file (or a family with no toy
-config) can be broken without any test noticing. The transformers 5.9 -> 5.16
-bump shipped exactly that failure in ``patched_modeling_qwen3_5_npu.py``.
+The bitwise logits suite does not cover every family (some have no toy config on
+the current accelerator), so importing all 19 HF-derived modeling modules
+directly catches import-time regressions across the board.
 """
 
 import ast
@@ -31,23 +30,22 @@ import pathlib
 
 import pytest
 
-import veomni  # noqa: F401  installs the ops/attention patches the generated files expect
-from veomni.utils.device import IS_NPU_AVAILABLE
+import veomni  # noqa: F401  installs the ops/attention patches the modeling files expect
 
 
 _VEOMNI_ROOT = pathlib.Path(veomni.__file__).parent
+_NON_HF_DIRS = {"flux", "movqgan", "wan"}
+_EXPECTED_HF_MODEL_COUNT = 19
 
 
-def _generated_modules() -> list[str]:
+def _hf_modeling_modules() -> list[str]:
     modules = []
-    for path in sorted((_VEOMNI_ROOT / "models" / "transformers").glob("*/generated/patched_modeling_*.py")):
+    for path in sorted((_VEOMNI_ROOT / "models" / "transformers").glob("*/modeling_*.py")):
+        if path.parent.name in _NON_HF_DIRS:
+            continue
         rel = path.relative_to(_VEOMNI_ROOT.parent)
         modules.append(str(rel.with_suffix("")).replace("/", "."))
     return modules
-
-
-def _patch_config_count() -> int:
-    return len(list((_VEOMNI_ROOT / "models" / "transformers").glob("*/*patch_gen_config.py")))
 
 
 def _kernelized_functions(module_name: str) -> list[str]:
@@ -65,30 +63,13 @@ def _kernelized_functions(module_name: str) -> list[str]:
     return sorted(set(names))
 
 
-def _import_generated_module(module_name: str):
-    if module_name.endswith("_gpu") and IS_NPU_AVAILABLE:
-        pytest.skip("GPU modeling may depend on CUDA-only packages absent from the NPU environment")
-    try:
-        return importlib.import_module(module_name)
-    except ImportError as exc:
-        if module_name.endswith("_npu") and not IS_NPU_AVAILABLE and "torch_npu" in str(exc):
-            pytest.skip(f"{module_name} needs torch_npu at import time")
-        raise
-
-
-_MODULES = _generated_modules()
+_MODULES = _hf_modeling_modules()
 _KERNELIZED_MODULES = [module for module in _MODULES if _kernelized_functions(module)]
 
 
 def test_generated_modeling_modules_discovered():
-    # Every patch config emits exactly one generated modeling file, so the two
-    # counts must agree. Deriving the expectation this way means a family that
-    # stops being generated fails here instead of silently dropping out of the
-    # parametrisation below.
-    expected = _patch_config_count()
-    assert len(_MODULES) == expected, (
-        f"found {len(_MODULES)} generated modeling files for {expected} patch configs; "
-        f"run `make patchgen`. Discovered: {_MODULES}"
+    assert len(_MODULES) == _EXPECTED_HF_MODEL_COUNT, (
+        f"found {len(_MODULES)} HF-derived modeling files, expected {_EXPECTED_HF_MODEL_COUNT}. Discovered: {_MODULES}"
     )
 
 
@@ -112,7 +93,7 @@ def test_kernelized_modeling_imports_with_real_kernels(module_name: str):
     if not hub_kernels._kernels_enabled:
         pytest.skip("Transformers Hub kernel decorators are disabled by USE_HUB_KERNELS")
 
-    module = _import_generated_module(module_name)
+    module = importlib.import_module(module_name)
 
     for name in _kernelized_functions(module_name):
         assert hasattr(getattr(module, name), "kernel_layer_name"), f"{module_name}.{name}"
@@ -120,17 +101,4 @@ def test_kernelized_modeling_imports_with_real_kernels(module_name: str):
 
 @pytest.mark.parametrize("module_name", _MODULES, ids=lambda name: name.rsplit(".", 1)[-1])
 def test_generated_modeling_imports(module_name: str):
-    if module_name.endswith("_gpu") and IS_NPU_AVAILABLE:
-        pytest.skip("GPU modeling may depend on CUDA-only packages absent from the NPU environment")
-    if module_name.endswith("_npu") and not IS_NPU_AVAILABLE:
-        # Most NPU files import fine on GPU hosts (the device split lives inside
-        # the patched bodies), but a few pull ``torch_npu`` at module scope.
-        try:
-            importlib.import_module(module_name)
-        except ImportError as exc:
-            if "torch_npu" in str(exc):
-                pytest.skip(f"{module_name} needs torch_npu at import time")
-            raise
-        return
-
     importlib.import_module(module_name)

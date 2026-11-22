@@ -74,6 +74,8 @@ tasks:
 a run whose `data.data_type` does not match: only `offline_training` reads
 `seedomni_cached`.
 
+For a mapping dataset, `offline_embedding` rounds the step count up so the sampler's padded final batch reaches every input row. It also requires `drop_last: false` and no gradient accumulation. Do not use `train.max_steps` as a debug cap for this task: if it is smaller than the full dataset step count, argument validation rejects the run instead of allowing a partial cache to be marked complete. Remove it or set it to at least the computed full step count. The cache writer also refuses to create a completion marker when no rank wrote a row.
+
 Which modules exist and which method each graph node calls stay in the
 modules / graph YAML: each task has its own pair. `training_task` only decides
 how the trainer loops and how a cacheable module is built. Nothing checks that
@@ -113,6 +115,15 @@ both through `GlobalStateCallback`:
   [refuses a directory that holds shards](../../../veomni/models/seed_omni/utils/offline_cache.py#L108)
   or a leftover completion marker, which would otherwise make a later resume
   of the new run refuse the cache as already finalized.
+
+The failure checks happen at different stages. `open()` rejects a cache directory
+that already holds shards, a leftover completion marker, or shards written under a
+different data-parallel size, and the `offline_embedding` `max_steps` guard runs
+while the dataset step count is built. Only the empty-cache check runs in
+`finalize()`, which `OmniTrainer` calls after `on_train_end()`: if that check
+rejects the run, a step directory may or may not exist, depending on the checkpoint
+cadence and on whether the run saves weights, and no complete cache is available.
+Inspect the cache and checkpoint directories separately before retrying.
 
 ## How a run builds a cached module
 

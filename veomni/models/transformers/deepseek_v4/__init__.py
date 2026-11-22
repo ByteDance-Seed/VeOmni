@@ -15,7 +15,6 @@
 """DeepSeek-V4 modeling that calls local VeomniOp handles."""
 
 from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 from .configuration_deepseek_v4 import DeepseekV4Config
 
@@ -30,14 +29,7 @@ def register_deepseek_v4_modeling(architecture: str):
     from .checkpoint_tensor_converter import (
         create_deepseek_v4_checkpoint_tensor_converter,
     )
-
-    if IS_NPU_AVAILABLE:
-        from .generated import patched_modeling_deepseek_v4_npu as gen
-    else:
-        from .generated import patched_modeling_deepseek_v4_gpu as gen
-
-    DeepseekV4ForCausalLM = gen.DeepseekV4ForCausalLM
-    DeepseekV4Model = gen.DeepseekV4Model
+    from .modeling_deepseek_v4 import DeepseekV4ForCausalLM, DeepseekV4Model
 
     DeepseekV4ForCausalLM._create_checkpoint_tensor_converter = staticmethod(
         create_deepseek_v4_checkpoint_tensor_converter

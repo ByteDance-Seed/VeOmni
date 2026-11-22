@@ -99,10 +99,7 @@ def _native_exchange_worker(rank, device_type, family, mixed_dtype, endpoint):
             assert torch.equal(source.grad, torch.cat([p.chunk(2, 1)[rank] for p in peers], 2))
 
         _init_parallel_state(ulysses_size=2, device_type=device_type)
-        module = importlib.import_module(
-            f"veomni.models.transformers.{family}.generated.patched_modeling_{family}_"
-            + ("npu" if device_type == "npu" else "gpu")
-        )
+        module = importlib.import_module(f"veomni.models.transformers.{family}.modeling_{family}")
         config = AutoConfig.from_pretrained(f"tests/toy_config/{family}_toy/config.json").text_config
         config.num_hidden_layers = 1
         config.layer_types = ["linear_attention"]
