@@ -61,45 +61,6 @@ _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 QUANTIZING_IMPLS = frozenset({"qat", "deepgemm_fp8"})
 
 
-def reject_quantizing_act_fn(owner: nn.Module) -> None:
-    """Raise when a non-SwiGLU activation would bypass a quantizing ``moe_experts`` row.
-
-    Every fused row bakes SiLU into both directions -- ``standard/triton.py`` calls
-    ``aten.silu`` in the forward and ``aten.silu_backward`` in the backward, and the
-    TileLang ``qat`` rows have the same structure -- so an activation outside
-    ``{"silu", "swish"}`` has no fused row and falls back to
-    ``merged_experts_act_fn_forward``, which loops over experts in Python and cannot
-    reach the family row.
-
-    Call this on that fallback. Refusing keeps a quantizing selection from training
-    the routed experts at full precision while the config claims otherwise. Support
-    for other activations is tracked in #1430.
-
-    The activation is read from ``owner.use_swiglu`` rather than a config:
-    ``DeepseekV3Experts`` and its siblings are plain ``nn.Module`` objects that
-    record the answer at construction and hold no config reference.
-
-    Args:
-        owner: The experts module that owns the ``veomni_moe`` handle and carries
-            ``use_swiglu``.
-
-    Raises:
-        ValueError: when the selection quantizes and the activation is not SwiGLU.
-    """
-    if getattr(owner, "use_swiglu", True):
-        return
-    handle = getattr(owner, "veomni_moe", None)
-    impl = getattr(handle, "impl", None)
-    if impl not in QUANTIZING_IMPLS:
-        return
-    raise ValueError(
-        f"moe_implementation={impl!r} cannot run with a non-SwiGLU activation: every `moe_experts` row "
-        "with a fused kernel implements SwiGLU only, in both forward and backward, so these routed "
-        "experts would train through the Python act_fn loop and round nothing. Use hidden_act='silu' "
-        "to quantize them, or moe_implementation='eager' to train them in the model dtype."
-    )
-
-
 register_op(
     "moe_unpermute",
     "standard",

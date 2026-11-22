@@ -26,7 +26,7 @@ def register_qwen2_vl_model_config():
 
 @MODELING_REGISTRY.register("qwen2_vl")
 def register_qwen2_vl_modeling(architecture: str | None):
-    from .generated.patched_modeling_qwen2_vl_gpu import (
+    from .modeling_qwen2_vl import (
         Qwen2VLForConditionalGeneration,
         Qwen2VLModel,
     )
