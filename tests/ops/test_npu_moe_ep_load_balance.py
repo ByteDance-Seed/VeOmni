@@ -782,31 +782,37 @@ def test_real_npu_singleton_fsdp_gradient_accumulation(real_npu_ep_group, reduce
         "efsdp"
     ]
     policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=reduce_dtype)
-    reference = nn.Linear(32, 16, device=device, dtype=torch.float32)
-    candidate = nn.Linear(32, 16, device=device, dtype=torch.float32)
+    reference = nn.Sequential(*(nn.Linear(32, 32, device=device, dtype=torch.float32) for _ in range(2)))
+    candidate = nn.Sequential(*(nn.Linear(32, 32, device=device, dtype=torch.float32) for _ in range(2)))
     candidate.load_state_dict(reference.state_dict())
+    for native_layer, hooked_layer in zip(reference, candidate, strict=True):
+        fully_shard(native_layer, mesh=mesh, mp_policy=policy)
+        fully_shard(hooked_layer, mesh=mesh, mp_policy=policy)
+        native_divide = (
+            getattr(native_layer, "set_gradient_divide_factor", None) or native_layer.set_reduce_scatter_divide_factor
+        )
+        native_divide(8)
+        assert configure_singleton_gradient_scaling(
+            hooked_layer, mesh_size=1, reduce_dtype=reduce_dtype, gradient_divide_factor=8
+        )
     fully_shard(reference, mesh=mesh, mp_policy=policy)
     fully_shard(candidate, mesh=mesh, mp_policy=policy)
-    native_divide = (
-        getattr(reference, "set_gradient_divide_factor", None) or reference.set_reduce_scatter_divide_factor
-    )
-    native_divide(8)
-    assert configure_singleton_gradient_scaling(
-        candidate, mesh_size=1, reduce_dtype=reduce_dtype, gradient_divide_factor=8
-    )
 
     generator = torch.Generator().manual_seed(17 + dist.get_rank(real_npu_ep_group))
     for _ in range(2):
         inputs = torch.randn(4, 32, generator=generator).to(device=device, dtype=torch.bfloat16)
-        upstream = torch.randn(4, 16, generator=generator).to(device=device, dtype=torch.bfloat16)
+        reference_inputs = inputs.clone().requires_grad_()
+        candidate_inputs = inputs.clone().requires_grad_()
+        upstream = torch.randn(4, 32, generator=generator).to(device=device, dtype=torch.bfloat16)
         saved = upstream.clone()
-        reference_output, candidate_output = reference(inputs), candidate(inputs)
+        reference_output, candidate_output = reference(reference_inputs), candidate(candidate_inputs)
         torch.testing.assert_close(candidate_output, reference_output, rtol=0, atol=0)
         reference_output.backward(upstream)
         candidate_output.backward(upstream)
         torch.npu.synchronize()
         for actual, expected in zip(candidate.parameters(), reference.parameters(), strict=True):
             torch.testing.assert_close(actual.grad.to_local(), expected.grad.to_local(), rtol=0, atol=0)
+        torch.testing.assert_close(candidate_inputs.grad, reference_inputs.grad, rtol=0, atol=0)
         torch.testing.assert_close(upstream, saved, rtol=0, atol=0)
 
 

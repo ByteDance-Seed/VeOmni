@@ -17,12 +17,18 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ...utils.device import get_current_stream
+
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp import FSDPModule
 
 
 def _divide_owned_output(output: torch.Tensor, *, factor: float) -> None:
+    if output.device.type == "npu":
+        # FSDP allocates the reduction output on the reduce-scatter stream.
+        # The hook and following cast or accumulation consume it on another stream.
+        output.record_stream(get_current_stream())
     output.div_(factor)
 
 
