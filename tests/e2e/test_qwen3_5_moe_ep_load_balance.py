@@ -478,6 +478,11 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(
     # one replica each; EP4 has one group with two replicas.
     assert replicas == [16 * forward_calls] * 3
 
+    # Keep the precision dumps available when an assertion fails.
+    for output_dir in (baseline_output, candidate_output):
+        for rank in range(_REQUIRED_DEVICES):
+            (output_dir / f"expert_precision_rank{rank}.pt").unlink()
+
 
 @pytest.mark.parametrize("strict", [False, True])
 def test_required_ci_cannot_silently_skip_missing_hardware(monkeypatch, strict):
