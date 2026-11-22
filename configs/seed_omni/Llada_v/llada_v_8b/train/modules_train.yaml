@@ -1,0 +1,13 @@
+# Per-module training overrides for LLaDA-V (SeedOmni).
+#
+# One module: the SigLIP tower and projector run inside the same node as the mask
+# predictor, so there is no sibling to hand activations to. Deep-merged onto the
+# launcher's `model.*` block, so only what differs is restated here.
+llada_v_omni:
+  model_path: llada_v_omni
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false

@@ -1,0 +1,7 @@
+# Launcher-style training DAG for LLaDA-V: a single node.
+#
+# The SigLIP tower, the projector and the mask predictor all live in one module:
+# image rows are scattered into the text embeddings before the backbone, so the
+# node reads its own sequence and returns `_loss` the way the dense LLaDA module
+# does. The edge list is one entry and the executor sums a single per-node loss.
+- { from: llada_v_omni, to: end }

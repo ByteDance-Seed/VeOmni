@@ -1,0 +1,59 @@
+# 10-step LLaDA-V run for the migration baseline.
+#
+# Same shape as `configs/dllm/llada_8b_phase0_10step.yaml`: a short fixed-batch run
+# on the local image-text set, so the Omni module can be compared against this
+# trainer on identical settings.
+#
+#   bash train.sh tasks/train_dllm.py configs/dllm/llada_v_8b_10step.yaml
+#
+# Two settings are not defaults and both stop the run early if omitted:
+#   * `dyn_bsz: false` -- it defaults to on, and then `data.train_size` is a *token*
+#     budget rather than a sample count.
+#   * `>= 2` ranks -- `meta` init is only accepted on the FSDP path, and FSDP needs
+#     `fsdp_size > 1`.
+model:
+  model_path: /mnt/hdfs/user_dir/omni_v2/ckpt/LLaDA-V-VeOmni
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  chat_template: llada
+  optimizer:
+    type: adamw
+    lr: 2.0e-5
+    lr_decay_style: cosine
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+  accelerator:
+    ulysses_size: 1
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+    offload_config:
+      enable_activation: false
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+
+data:
+  train_path: /tmp/llada_v_data/train.jsonl
+  data_type: llada_v
+  max_seq_len: 2048
+  train_sample: 64
+  text_keys: messages
+  dyn_bsz_buffer_size: 200
+
+train:
+  seed: 42
+  global_batch_size: 2
+  micro_batch_size: 1
+  dyn_bsz: false
+  num_train_epochs: 1
+  max_steps: 5
+  checkpoint:
+    output_dir: /tmp/llada_v_baseline
+    manager: dcp
+    save_steps: 100000
+    save_hf_weights: false
+    save_epochs: 0
+  wandb:
+    enable: false
