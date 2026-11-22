@@ -614,3 +614,74 @@ def test_omni_module_config_owns_descriptor_conversion():
     assert exported["processor_config"] == {"image_size": 224}
     assert "model_path" not in exported
     assert "ops_implementation" not in exported
+
+
+def test_a_training_run_needs_no_infer_graph():
+    """A training-only model (no sampler yet) declares no generation graph."""
+    args = _omni_args()
+    args.model.model_config.pop("infer_graph")
+    cfg = build_omni_model_runtime_args(args)
+    assert cfg.generation_graphs == {}
+    assert cfg.infer_type is None
+    assert cfg.to_hf_config().generation_graphs == {}
+
+
+def test_inference_still_needs_an_infer_graph():
+    args = _omni_args()
+    args.model.model_config.pop("infer_graph")
+    with pytest.raises(ValueError, match="infer_graph` is required for inference"):
+        build_omni_model_runtime_args(args, for_inference=True)
+
+
+def test_an_infer_type_without_an_infer_graph_is_refused():
+    args = _omni_args(infer_type="infer_gen")
+    args.model.model_config.pop("infer_graph")
+    with pytest.raises(ValueError, match="no `infer_graph` is declared"):
+        build_omni_model_runtime_args(args)
+
+
+def _steps_for(
+    training_task: str,
+    dataset_length: float,
+    *,
+    drop_last: bool = False,
+    accumulation: int = 1,
+    max_steps: int | None = None,
+) -> int:
+    args = _omni_args()
+    args.train.training_task = training_task
+    args.train.dyn_bsz = False
+    args.train.max_steps = max_steps
+    args.train.gradient_accumulation_steps = accumulation
+    args.train.dataloader_batch_size = 1
+    args.data.datasets_type = "mapping"
+    args.data.dataloader.drop_last = drop_last
+    args.compute_train_steps(dataset_length)
+    return args.train_steps
+
+
+def test_encode_only_mapping_run_reaches_every_row():
+    """18 rows on 4 dp ranks: the sampler pads each rank to 5, and all 5 steps run (training would floor to 4)."""
+    assert _steps_for("offline_embedding", 18 / 4) == 5
+    assert _steps_for("online_training", 18 / 4) == 4
+
+
+def test_encode_only_mapping_run_refuses_settings_that_drop_rows():
+    with pytest.raises(ValueError, match="drop_last=false"):
+        _steps_for("offline_embedding", 18 / 4, drop_last=True)
+    with pytest.raises(ValueError, match="no gradient accumulation"):
+        _steps_for("offline_embedding", 18 / 4, accumulation=4)
+
+
+def test_encode_only_mapping_run_refuses_a_truncating_max_steps():
+    with pytest.raises(ValueError, match="would truncate the offline_embedding dataset"):
+        _steps_for("offline_embedding", 18 / 4, max_steps=4)
+
+
+def test_encode_only_mapping_run_allows_a_non_truncating_max_steps():
+    assert _steps_for("offline_embedding", 18 / 4, max_steps=5) == 5
+    assert _steps_for("offline_embedding", 18 / 4, max_steps=6) == 5
+
+
+def test_training_max_steps_remains_a_debug_cap():
+    assert _steps_for("online_training", 18 / 4, max_steps=3) == 3

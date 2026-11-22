@@ -26,7 +26,7 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_merged_experts_act_fn_ep_keeps_empty_tokens_on_graph():
-    from veomni.models.utils.moe_utils import _MergedExpertsActFnEP
+    from veomni.ops.kernels.moe_experts.shared.act_fn_experts import _MergedExpertsActFnEP
 
     hidden = 4
     permute_tokens = torch.zeros(0, hidden, dtype=torch.float32, requires_grad=True)

@@ -23,7 +23,7 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
 from tests.models.tiny_configs import tiny_gemma3_text_config
 from veomni.models.configuration_base import as_veomni_config
-from veomni.models.transformers.gemma3.generated import patched_modeling_gemma3_npu as gemma3_modeling
+from veomni.models.transformers.gemma3 import modeling_gemma3 as gemma3_modeling
 from veomni.ops import VeomniOp
 
 

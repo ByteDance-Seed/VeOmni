@@ -8,7 +8,7 @@ from transformers import Qwen4ExpConfig
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.models.configuration_base import as_veomni_config
-from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu import (
+from veomni.models.transformers.qwen4_exp.modeling_qwen4_exp import (
     Qwen4ExpForConditionalGeneration,
 )
 

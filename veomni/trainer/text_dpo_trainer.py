@@ -584,6 +584,7 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
         args = copy.deepcopy(args)
         args.lora_config = {}
         args.accelerator.fsdp_config.mixed_precision.enable = False
+        args.accelerator.fsdp_config.mixed_precision.float8.enable = False
         # The frozen reference never computes expert weight gradients; the
         # policy's FP32-wgrad option requires mixed precision and must not be
         # passed to this separate, non-AMP reference build.

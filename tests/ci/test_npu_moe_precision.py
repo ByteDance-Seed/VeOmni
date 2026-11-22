@@ -42,13 +42,9 @@ def test_valid_or_disabled_configuration_needs_no_process_group():
     _validate_config(MixedPrecisionConfig(npu_expert_fp32_wgrad=False), mode="ddp", tp=2)
 
 
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
-def test_qwen4_expert_forwards_fp32_wgrad_option_only_when_enabled(backend):
-    import importlib
+def test_qwen4_expert_forwards_fp32_wgrad_option_only_when_enabled():
+    from veomni.models.transformers.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextExperts
 
-    module = importlib.import_module(
-        f"veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_{backend}"
-    )
     config = SimpleNamespace(
         num_experts=2,
         hidden_size=4,
@@ -56,7 +52,7 @@ def test_qwen4_expert_forwards_fp32_wgrad_option_only_when_enabled(backend):
         hidden_act="silu",
         ops_config=SimpleNamespace(moe_implementation="eager"),
     )
-    experts = module.Qwen4ExpTextExperts(config)
+    experts = Qwen4ExpTextExperts(config)
     calls = []
 
     def capture(*args, **kwargs):
@@ -68,20 +64,16 @@ def test_qwen4_expert_forwards_fp32_wgrad_option_only_when_enabled(backend):
     indices = torch.zeros(2, 1, dtype=torch.int64)
     weights = torch.ones(2, 1)
     assert experts(inputs, indices, weights) is inputs
-    assert calls.pop() == {"num_experts": 2}
+    assert calls.pop() == {"num_experts": 2, "activation": "silu"}
     experts._veomni_fp32_expert_wgrad = True
     assert experts(inputs, indices, weights) is inputs
-    assert calls.pop() == {"num_experts": 2, "fp32_wgrad": True}
+    assert calls.pop() == {"num_experts": 2, "activation": "silu", "fp32_wgrad": True}
 
 
-@pytest.mark.parametrize("backend", ["gpu", "npu"])
 @pytest.mark.parametrize("activation", ["silu", "gelu"])
-def test_precision_validator_uses_actual_qwen4_activation_flag(backend, activation):
-    import importlib
+def test_precision_validator_uses_actual_qwen4_activation_flag(activation):
+    from veomni.models.transformers.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextExperts
 
-    module = importlib.import_module(
-        f"veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_{backend}"
-    )
     config = SimpleNamespace(
         num_experts=2,
         hidden_size=4,
@@ -89,7 +81,7 @@ def test_precision_validator_uses_actual_qwen4_activation_flag(backend, activati
         hidden_act=activation,
         ops_config=SimpleNamespace(moe_implementation="eager"),
     )
-    experts = module.Qwen4ExpTextExperts(config)
+    experts = Qwen4ExpTextExperts(config)
     experts.veomni_moe = SimpleNamespace(impl="fused_npu")
     model = torch.nn.Module()
     model.config = SimpleNamespace(model_type="qwen4_exp")
@@ -140,7 +132,7 @@ class Qwen4ExpTextExperts(torch.nn.Module):
     def __init__(self, impl="fused_npu", swiglu=True, dtype=torch.float32):
         super().__init__()
         self.veomni_moe = SimpleNamespace(impl=impl)
-        self.use_swiglu = swiglu
+        self.activation = "silu" if swiglu else "gelu"
         self.weight = torch.nn.Parameter(torch.ones(2, 2, dtype=dtype))
 
 
@@ -228,7 +220,7 @@ def test_qwen4_vlm_decoder_layers_are_fsdp_targets():
     from tests.models.compare import eager_ops_config
     from veomni.distributed.torch_parallelize import _fsdp_target_classes, _is_fsdp_wrap_target
     from veomni.models.configuration_base import as_veomni_config
-    from veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_npu import (
+    from veomni.models.transformers.qwen4_exp.modeling_qwen4_exp import (
         Qwen4ExpForConditionalGeneration,
     )
 

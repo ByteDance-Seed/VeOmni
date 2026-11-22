@@ -95,6 +95,44 @@ def test_npu_wrapper_accepts_quantization_options_and_forwards_fp32_wgrad(monkey
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("merged", [False, True])
+def test_ep_dispatch_preserves_fp32_wgrad_and_fc1_rematerialization(monkeypatch, merged):
+    from veomni.ops.kernels.moe_experts.standard import npu
+
+    activations = torch.ones(3, 4, dtype=torch.bfloat16)
+    routing_weights = torch.ones(3, 1)
+    selected_experts = torch.zeros(3, 1, dtype=torch.int64)
+    gate_up = torch.ones(2, 6, 4)
+    down = torch.ones(2, 4, 3)
+    calls = []
+
+    def dispatch(expert_math, num_experts, weights, indices, inputs, *args):
+        assert num_experts == 2
+        assert weights is routing_weights and indices is selected_experts
+        return expert_math(inputs, torch.tensor([1, 3]), *args)
+
+    def grouped_gemm(inputs, weight, counts, fp32_wgrad=False, rematerialize_weight=False):
+        assert counts.tolist() == [1, 2]
+        calls.append((weight, fp32_wgrad, rematerialize_weight))
+        return inputs
+
+    monkeypatch.setattr(npu, "dispatch_to_ep_class", dispatch)
+    monkeypatch.setattr(npu, "npu_group_gemm", grouped_gemm)
+    monkeypatch.setattr(npu, "_swiglu", lambda inputs, limit: inputs)
+    gate, up = (None, None) if merged else gate_up.chunk(2, dim=1)
+    result = npu.npu_ep_fused_moe_forward(
+        2, routing_weights, selected_experts, activations, gate, up, down, gate_up if merged else None, fp32_wgrad=True
+    )
+
+    assert result is activations
+    assert len(calls) == 2
+    assert torch.equal(calls[0][0], gate_up.transpose(1, 2))
+    assert calls[0][1:] == (True, merged)
+    assert torch.equal(calls[1][0], down.transpose(1, 2))
+    assert calls[1][1:] == (True, False)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_fp32_wgrad_keeps_bf16_forward_and_input_gradient(fake_npu):
     x, master, dy = _cpu_inputs()
     counts = [6, 7]
