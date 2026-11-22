@@ -57,6 +57,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 
 from ....utils import helper
+from ....utils.import_utils import is_torch_version_greater_than
 from ....utils.registry import Registry
 from ...checkpoint.convert import (
     ConvertedCheckpointTensor,
@@ -1182,9 +1183,10 @@ def _on_every_rank_writes_index() -> bool:
     in 2.11. Version-gated rather than introspected: the helper is a plain
     function whose behaviour is the version's, and a probe would have to run a
     real consolidation to tell.
-    """
-    from ....utils.import_utils import is_torch_version_greater_than
 
+    Reads the version from the imported name so a test can pin the answer on
+    either stack; the Ascend job runs 2.10 and must take the fallback.
+    """
     return is_torch_version_greater_than("2.10.99")
 
 

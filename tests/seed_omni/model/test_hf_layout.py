@@ -789,36 +789,27 @@ def test_custom_layout_subclass_overrides_hooks_and_per_module_dtypes(tmp_path):
         del OMNI_HF_LAYOUT_REGISTRY[custom_type]
 
 
-def test_a_torch_version_without_the_index_write_falls_back_to_the_single_process_helper(monkeypatch, tmp_path):
+def test_the_per_rank_consolidation_branch_is_gated_on_the_torch_version(monkeypatch):
     """torch 2.10 ships `consolidate_safetensors_files_on_every_rank` but that
     version never writes `model.safetensors.index.json` -- only 2.11 does.
 
     A multi-file export through it is unloadable, so the branch is chosen by
-    version rather than by the name's presence.
+    version rather than by the name being importable (it is, on both stacks).
     """
+    import torch
+
     from veomni.models.seed_omni.utils import hf_layout
 
-    assert hf_layout._on_every_rank_writes_index() is True  # this environment is 2.11+
-    monkeypatch.setattr(hf_layout, "_on_every_rank_writes_index", lambda: False)
+    # Against the real interpreter, so the claim is meaningful on both the CUDA
+    # (2.11) and Ascend (2.10) stacks instead of asserting one of them.
+    major, minor = (int(part) for part in torch.__version__.split("+")[0].split(".")[:2])
+    assert hf_layout._on_every_rank_writes_index() is ((major, minor) >= (2, 11))
 
-    calls = []
-    monkeypatch.setattr(
-        hf_layout,
-        "_consolidate_and_write_index",
-        lambda sharded, save, mapping: calls.append((sharded, save, dict(mapping))),
-    )
-    sharded = tmp_path / "sharded"
-    sharded.mkdir()
-    save = tmp_path / "out"
-    save.mkdir()
-
-    # The selection happens where the helper is imported, so exercise the same
-    # decision the branch makes.
-    on_every_rank = object()
-    effective = on_every_rank if on_every_rank is not None and hf_layout._on_every_rank_writes_index() else None
-    assert effective is None, "2.10 must not take the per-rank branch"
-    hf_layout._consolidate_and_write_index(str(sharded), str(save), {"w": 1})
-    assert calls == [(str(sharded), str(save), {"w": 1})]
+    # And the predicate follows torch, not the host build.
+    monkeypatch.setattr(hf_layout, "is_torch_version_greater_than", lambda value: False)
+    assert hf_layout._on_every_rank_writes_index() is False
+    monkeypatch.setattr(hf_layout, "is_torch_version_greater_than", lambda value: True)
+    assert hf_layout._on_every_rank_writes_index() is True
 
 
 def test_the_index_writer_emits_a_weight_map_and_total_size(tmp_path):
