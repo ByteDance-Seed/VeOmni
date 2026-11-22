@@ -139,3 +139,42 @@ def test_a_plan_less_module_under_an_enabled_extra_parallel_dim_says_how_to_fix_
     assert "parallel plan" in message
     assert "ep_size: 1" in message, "must name the per-module opt-out, which is the usual fix"
     assert "qwen3_moe/parallel_plan.py" in message, "must still point at a worked example"
+
+
+def test_cpu_offload_is_refused_even_when_every_parameter_is_plan_sharded():
+    """The narrower guard missed the tied-`TextEncoder` shape.
+
+    Its only parameter is `emb`-sharded, so nothing was replicated and a
+    `replicated_bytes`-only guard passed -- but `ShardedEmbedding._project`
+    all-gathers the vocabulary table with accelerator activations, and a
+    host-resident table cannot take part. Driven at `_finish_without_fsdp_wrap`:
+    that is the function that owns the check, and reaching it through
+    `parallelize_model_fsdp2` would need a stub for every earlier config check.
+    """
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+    from torch.distributed.tensor import Shard
+
+    from veomni.distributed.torch_parallelize import _finish_without_fsdp_wrap
+
+    model = nn.Linear(4, 4)
+    spec_info = {
+        fqn: SimpleNamespace(para_name="emb", placement=Shard(0), persistent_fsdp_shard_dim=None)
+        for fqn, _ in model.named_parameters()
+    }
+    parallel_state = SimpleNamespace(
+        extra_parallel_names=("emb",),
+        extra_parallel_enabled=lambda name: True,
+        extra_parallel_fsdp_size=lambda name: 1,
+    )
+
+    with pytest.raises(ValueError, match="offload cannot be combined"):
+        _finish_without_fsdp_wrap(
+            model,
+            weights_path=None,
+            parallel_state=parallel_state,
+            fqn2spec_info=spec_info,
+            should_skip_hf_weight_load=True,
+            kwargs={"enable_fsdp_offload": True, "init_device": "meta"},
+        )

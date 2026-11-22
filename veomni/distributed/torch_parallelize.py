@@ -501,20 +501,26 @@ def _finish_without_fsdp_wrap(
     enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False) or bool(
         getattr(getattr(model, "config", None), "cpu_offload", False)
     )
-    if enable_fsdp_cpu_offload and replicated_bytes:
-        # FSDP CPU offload works by staging parameters back onto the accelerator
-        # in a pre-forward hook. There is no hook here, so the parameters the plan
-        # does not name would be materialized on the host and stay there, and the
-        # first operator to meet an accelerator activation raises a device
-        # mismatch. Refuse instead of producing that later.
+    if enable_fsdp_cpu_offload:
+        # FSDP CPU offload materializes on the host and stages parameters back onto
+        # the accelerator in a pre-forward hook. This path installs no such hook, so
+        # *every* parameter stays on the host -- including the ones the plan shards,
+        # which is why this refuses unconditionally rather than only when some
+        # parameter is replicated. A tied `ShardedEmbedding` is the case that made
+        # the narrower guard wrong: its only parameter is plan-sharded, so nothing
+        # was replicated, and its `_project` all-gathers the vocab table with
+        # accelerator activations, which cannot read a host tensor.
         raise ValueError(
             "fsdp_config.offload cannot be combined with fsdp_config.extra_parallel_only: FSDP CPU "
             "offload stages parameters back onto the accelerator through FSDP's own hooks, and this "
             "path has none. Keep the wrap, or leave offload off."
         )
+    # `enable_fsdp_cpu_offload` is refused above, so materialization is always on
+    # the accelerator here; the flag is kept on the model only because the
+    # optimizer and checkpoint code read it.
     model._fsdp_cpu_offload_enabled = enable_fsdp_cpu_offload
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
-    materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
+    materialize_device = get_device_type()
 
     _materialize_and_load_weights(
         model,
@@ -532,9 +538,6 @@ def _finish_without_fsdp_wrap(
         module_is_peft_model=kwargs.pop("module_is_peft_model", None),
         module_adapter_path=kwargs.pop("module_adapter_path", None),
     )
-
-    if materialize_device == "cpu":
-        _move_buffers_to_device(model, get_device_type())
 
     _divide_extra_parallel_grads_like_fsdp(model, parallel_state, fqn2spec_info)
     # Read by the grad clipper, which averages the replicated parameters' grads.
