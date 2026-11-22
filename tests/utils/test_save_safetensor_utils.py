@@ -42,6 +42,22 @@ _MOD = "veomni.utils.save_safetensor_utils"
 _CONSOLIDATE = "torch.distributed.checkpoint._consolidate_hf_safetensors"
 
 
+class _IdentityPlan:
+    """Minimal parallel plan: `ep_sharded_stream_load` only requires a plan to exist."""
+
+    extra_parallel_plan = {"emb": {}}
+    extra_parallel_persistent_modules = {}
+
+    def shard_tensor(self, tensor, fqn, shape):
+        return tensor
+
+    def _get_shard_parameter_groupname(self, name):
+        return None
+
+    def apply(self, model, mesh):
+        return {}
+
+
 class _TinyModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -962,32 +978,81 @@ class TestLegacySaveModelWeights(unittest.TestCase):
         self.assertIs(getattr(model.embed_tokens.weight, "spec_info", None), spec)
         self.assertFalse(getattr(model.linear.weight, "spec_info", None))
 
-    def test_every_loader_materializes_through_the_spec_info_preserving_helper(self):
-        """The three HF loaders must not call `to_empty` bare.
+    def test_a_pretrained_load_keeps_the_plan_spec_info(self):
+        """Drive each real loader and check the tag survives it.
 
-        They materialize *after* the parallel plan tagged the model's meta
-        parameters, and a bare `to_empty` rebuilds each `Parameter`, dropping the
-        tag -- after which the optimizer averages plan shards as replicas. Asserted
-        on the source because the alternative is a full pretrained checkpoint per
-        loader; the helper's own behaviour has the test above.
+        The plan tags meta parameters *before* the loader runs, and the loader
+        materializes the model itself -- so this is the path that decides whether a
+        plan shard still looks sharded to the optimizer afterwards. Asserted by
+        running the loader rather than by inspecting its source: a source-string
+        check fails on harmless refactors and passes when the call is unreachable.
         """
-        import inspect
-
-        import veomni.models.checkpoint.weights as weights
-
-        for fn in (
-            weights.load_model_weights,
-            weights.load_model_weights_ep_sharded,
-            weights.rank0_load_and_broadcast_weights,
-        ):
-            source = inspect.getsource(fn)
-            self.assertNotIn("model.to_empty(", source, f"{fn.__name__} calls to_empty bare")
-            self.assertIn("to_empty_preserving_spec_info(model, init_device)", source, fn.__name__)
-
-        # And the helper really does keep the tag, which is the point.
+        import json
+        import tempfile
+        from pathlib import Path
         from types import SimpleNamespace
 
-        from veomni.distributed.torch_parallelize import to_empty_preserving_spec_info
+        from safetensors.torch import save_file
+
+        import veomni.models.checkpoint.weights as checkpoint_weights
+        from veomni.models.checkpoint import init_empty_weights
+
+        class _LoadableModel(nn.Module):
+            """`_TinyModel` plus the config the tie step reads.
+
+            No `tie_word_embeddings` attribute, so that step returns early and the
+            test does not need a real HF config.
+            """
+
+            config = SimpleNamespace()
+
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = nn.Embedding(32, 16)
+                self.linear = nn.Linear(16, 16)
+
+            def get_input_embeddings(self):
+                return self.embed_tokens
+
+            def get_output_embeddings(self):
+                return None
+
+        spec = SimpleNamespace(para_name="emb", placement=object())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            save_file(
+                {
+                    "embed_tokens.weight": torch.zeros(32, 16, dtype=torch.bfloat16),
+                    "linear.weight": torch.zeros(16, 16, dtype=torch.bfloat16),
+                    "linear.bias": torch.zeros(16, dtype=torch.bfloat16),
+                },
+                str(root / "model.safetensors"),
+            )
+            (root / "config.json").write_text(json.dumps({"model_type": "llama"}), encoding="utf-8")
+
+            # Both loaders materialize the model themselves, so both must keep the
+            # tag. A plain loop rather than `parametrize`: this class is a
+            # `TestCase`, whose methods pytest does not parameterize.
+            for loader_name in ("load_model_weights", "load_model_weights_ep_sharded"):
+                with init_empty_weights():
+                    model = _LoadableModel()
+                model.embed_tokens.weight.spec_info = spec
+                if loader_name == "load_model_weights_ep_sharded":
+                    # It refuses a model with no plan; one identity entry is enough
+                    # for it to take the streaming path.
+                    model.get_parallel_plan = _IdentityPlan
+
+                getattr(checkpoint_weights, loader_name)(model, str(root), init_device="cpu")
+
+                self.assertFalse(model.embed_tokens.weight.is_meta, f"{loader_name} must materialize")
+                self.assertIs(model.embed_tokens.weight.spec_info, spec, f"{loader_name} dropped the plan tag")
+                self.assertFalse(getattr(model.linear.weight, "spec_info", None))
+
+    def test_a_bare_to_empty_drops_the_tag_which_is_why_the_helper_exists(self):
+        """The regression this guards: `to_empty` alone loses the tag."""
+        from types import SimpleNamespace
+
         from veomni.models.checkpoint import init_empty_weights
 
         with init_empty_weights():
@@ -995,15 +1060,6 @@ class TestLegacySaveModelWeights(unittest.TestCase):
         spec = SimpleNamespace(para_name="emb", placement=object())
         model.embed_tokens.weight.spec_info = spec
 
-        to_empty_preserving_spec_info(model, "cpu")
-        self.assertIs(model.embed_tokens.weight.spec_info, spec)
+        model.to_empty(device="cpu")
 
-        with init_empty_weights():
-            control = _TinyModel()
-        control.embed_tokens.weight.spec_info = spec
-        control.to_empty(device="cpu")
-        self.assertFalse(getattr(control.embed_tokens.weight, "spec_info", None))
-
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertFalse(getattr(model.embed_tokens.weight, "spec_info", None))
