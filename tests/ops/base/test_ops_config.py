@@ -1105,11 +1105,14 @@ def test_current_selections_are_untouched_by_the_migration():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_ops_config_refreshes_on_nested_kwargs_and_override_mutations():
+def test_ops_config_refreshes_on_nested_kwargs_and_override_mutations(monkeypatch):
     """Mutating nested ``kwargs`` or ``overrides`` in ``ops_implementation`` invalidates ``ops_config``."""
     from transformers import Qwen3Config
 
     from veomni.models.configuration_base import as_veomni_config
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
 
     config = as_veomni_config(
         Qwen3Config(

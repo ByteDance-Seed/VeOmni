@@ -92,6 +92,8 @@ def test_float8_disabled_never_imports_torchao(monkeypatch):
 @cpu
 def test_float8_ops_yaml_cli_and_saved_config_roundtrip(monkeypatch, tmp_path):
     """Float8 op selections round-trip cleanly through YAML and ``save_args``."""
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
     path = tmp_path / "model.yaml"
     path.write_text(
         "config_path: /tmp/qwen3\n"
@@ -290,6 +292,8 @@ def test_qwen3_and_llama_bind_float8_handles(monkeypatch):
     from veomni.models.transformers.qwen3.modeling_qwen3 import Qwen3ForCausalLM
     from veomni.ops import registry as ops_registry
 
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
     monkeypatch.setattr(ops_registry, "is_package_available", lambda _pkg: True)
     monkeypatch.setattr(VeomniOp, "_intern", dict(VeomniOp._intern))
 
@@ -645,8 +649,10 @@ def test_float8_two_rank_sharded_fsdp2(tmp_path, recipe):
 
 
 @cpu
-def test_ops_implementation_config_accepts_float8_row_kwargs():
+def test_ops_implementation_config_accepts_float8_row_kwargs(monkeypatch):
     """``OpsImplementationConfig`` accepts ``dtype``, ``recipe``, and ``emulated`` from ``torchao``'s signature."""
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
     ops = OpsImplementationConfig(
         linear_implementation={"name": "torchao", "kwargs": {"dtype": "fp8", "recipe": "rowwise", "emulated": False}},
         gated_mlp_implementation={"name": "torchao", "kwargs": {"dtype": "fp8", "recipe": "rowwise_with_gw_hp"}},
