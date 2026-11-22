@@ -481,6 +481,7 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
         captured["expert_fsdp_shard_dim"] = kwargs["expert_fsdp_shard_dim"]
         captured["weights_path"] = kwargs["weights_path"]
         captured["children"] = list(dict(model.named_children()))
+        captured["compile_config"] = kwargs.get("compile_config")
         return model
 
     monkeypatch.setattr(
@@ -511,6 +512,13 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
     assert vae.model is meta_module
     llm.build_after_omni_model_wrap.assert_called_once()
     vae.build_after_omni_model_wrap.assert_not_called()
+
+    # The composed wrap must not compile: every module compiled itself before
+    # handing the wrap over (see `ModuleRuntime._build_parallelized_model`).
+    # Asserting the forwarded config here is what catches a launcher-level enable
+    # being reintroduced in this caller — the per-module helper test cannot.
+    assert captured["compile_config"] is not None
+    assert captured["compile_config"].enable is False
 
 
 def _exporting_runtime(checkpoint):
