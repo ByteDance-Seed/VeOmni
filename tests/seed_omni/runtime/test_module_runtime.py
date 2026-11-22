@@ -70,6 +70,33 @@ def test_omni_runtime_arguments_are_model_arguments():
     assert issubclass(OmniModelRuntimeArguments, ModelArguments)
 
 
+def test_generic_module_extra_state_hooks_are_saved_and_loaded(monkeypatch):
+    class ModuleWithExtraState(nn.Linear):
+        def __init__(self):
+            super().__init__(2, 2)
+            self.saved = None
+
+        def extra_state_dict(self):
+            return {"value": 7}
+
+        def load_extra_state_dict(self, state):
+            self.saved = state
+
+    module = ModuleWithExtraState()
+    runtime = _unbuilt(module)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    assert runtime.extra_state() == {"module_extra_state": {"value": 7}}
+    runtime.load_extra_state({"module_extra_state": {"value": 9}})
+    assert module.saved == {"value": 9}
+
+
+def test_missing_rng_load_hook_does_not_raise(monkeypatch):
+    module = nn.Linear(2, 2)
+    runtime = _unbuilt(module)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    runtime.load_extra_state({"module_rng_state": {"generator": "state"}})
+
+
 def test_module_checkpoint_manager_is_a_model_checkpoint_manager():
     from veomni.models.checkpoint import ModelCheckpointManager
     from veomni.models.seed_omni.utils.checkpoint import OmniModuleCheckpointManager

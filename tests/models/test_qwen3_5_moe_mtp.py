@@ -14,21 +14,14 @@ from veomni.distributed.utils import check_fqn_match
 from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel, resolve_fused_moe_lora_targets
 from veomni.models.checkpoint.convert import maybe_convert_checkpoint_tensor
 from veomni.models.configuration_base import as_veomni_config
+from veomni.models.transformers.qwen3_5 import modeling_qwen3_5 as dense_modeling
+from veomni.models.transformers.qwen3_5_moe import modeling_qwen3_5_moe as modeling
 from veomni.models.transformers.qwen3_5_moe import (
     register_qwen3_5_moe_modeling,
     register_qwen3_5_moe_text_modeling,
 )
 from veomni.models.transformers.qwen3_5_moe.parallel_plan import get_parallel_plan
 from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import Qwen3MoeCheckpointTensorConverter
-from veomni.utils.device import IS_NPU_AVAILABLE
-
-
-if IS_NPU_AVAILABLE:
-    from veomni.models.transformers.qwen3_5.generated import patched_modeling_qwen3_5_npu as dense_modeling
-    from veomni.models.transformers.qwen3_5_moe.generated import patched_modeling_qwen3_5_moe_npu as modeling
-else:
-    from veomni.models.transformers.qwen3_5.generated import patched_modeling_qwen3_5_gpu as dense_modeling
-    from veomni.models.transformers.qwen3_5_moe.generated import patched_modeling_qwen3_5_moe_gpu as modeling
 
 
 TOY_CONFIG = Path(__file__).parents[1] / "toy_config" / "qwen3_5_moe_toy"

@@ -268,7 +268,7 @@ def test_forward_missing_cu_seq_lens_q_raises_value_error():
     """Shared-prefix training without cu_seq_lens_q must raise a clear ValueError."""
     from unittest.mock import MagicMock
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+    from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5ForConditionalGeneration,
     )
 
@@ -290,7 +290,7 @@ def test_forward_incompatible_attn_impl_raises_not_implemented():
     """Shared-prefix training with non-flash attention backend must raise NotImplementedError."""
     from unittest.mock import MagicMock
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+    from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5ForConditionalGeneration,
     )
 
@@ -312,12 +312,12 @@ def test_forward_sp_enabled_raises_not_implemented(monkeypatch):
     """Shared-prefix training with sequence parallelism enabled must raise NotImplementedError."""
     from unittest.mock import MagicMock
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+    from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5ForConditionalGeneration,
     )
 
     monkeypatch.setattr(
-        "veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu.get_parallel_state",
+        "veomni.models.transformers.qwen3_5.modeling_qwen3_5.get_parallel_state",
         lambda: MagicMock(sp_enabled=True),
     )
     mock_self = MagicMock()
@@ -338,12 +338,12 @@ def test_text_model_past_key_values_raises_not_implemented(monkeypatch):
     """Shared-prefix training in TextModel must raise NotImplementedError if past_key_values is passed."""
     from unittest.mock import MagicMock
 
-    from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import (
+    from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5TextModel,
     )
 
     monkeypatch.setattr(
-        "veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu.get_parallel_state",
+        "veomni.models.transformers.qwen3_5.modeling_qwen3_5.get_parallel_state",
         lambda: MagicMock(sp_enabled=False),
     )
     mock_self = MagicMock()
@@ -372,11 +372,11 @@ def test_npu_gated_delta_rule_rejects_unsupported_shared_prefix(family, impl, no
     from unittest.mock import MagicMock
 
     if family == "dense":
-        from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_npu import (
+        from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import (
             Qwen3_5GatedDeltaNet as gated_delta_net,
         )
     else:
-        from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_npu import (
+        from veomni.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import (
             Qwen3_5MoeGatedDeltaNet as gated_delta_net,
         )
 
