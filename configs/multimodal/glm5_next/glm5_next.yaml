@@ -5,6 +5,9 @@
 # VeomniOp attention's internal Ulysses path. Use a multimodal chat template
 # (qwen3vl) so VeOmni's IMAGE/VIDEO_INPUT_INDEX placeholders are emitted;
 # there is no native GLM multimodal chat template in VeOmni yet.
+#
+# Packed multi-sample dyn_bsz is NOT supported yet (KDA recurrent state + DSA
+# visibility ignore pack boundaries). Keep train.dyn_bsz=false for bring-up.
 
 model:
   # model_path: /path/to/GLM-5.3-Flash-bf16
@@ -13,7 +16,7 @@ model:
     moe_implementation: eager
     cross_entropy_loss_implementation: chunk_loss
     rms_norm_implementation: eager
-    swiglu_mlp_implementation: eager
+    gated_mlp_implementation: eager
     rotary_pos_emb_implementation: eager
     rotary_pos_emb_vision_implementation: eager
     load_balancing_loss_implementation: eager
@@ -41,6 +44,8 @@ data:
   dyn_bsz_buffer_size: 200
 
 train:
+  # See file header: packing / dyn_bsz multi-sample is unsupported for KDA+DSA.
+  dyn_bsz: false
   global_batch_size: 8
   micro_batch_size: 1
   bsz_warmup_ratio: 0.007

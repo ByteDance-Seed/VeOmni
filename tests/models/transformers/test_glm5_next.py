@@ -25,16 +25,16 @@ from tests.models.compare import assert_outputs_and_grads_match, eager_ops_confi
 from tests.models.tiny_configs import tiny_glm5_next_config as _tiny_mm_config
 from tests.models.tiny_configs import tiny_glm5_next_text_config as _tiny_config
 from veomni.models.auto import build_foundation_model
-from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.models.transformers.glm5_next.modeling_glm5_next import (
+    Glm5NextForConditionalGeneration,
+    Glm5NextTextModel,
+)
 
 
 def _glm5_cls(architecture: str):
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.glm5_next.generated import patched_modeling_glm5_next_npu as gen
-    else:
-        from veomni.models.transformers.glm5_next.generated import patched_modeling_glm5_next_gpu as gen
-
-    return getattr(gen, architecture)
+    if architecture == "Glm5NextForConditionalGeneration":
+        return Glm5NextForConditionalGeneration
+    return Glm5NextTextModel
 
 
 def _build_ours(config, ops: SimpleNamespace | None = None, architecture: str = "Glm5NextTextModel"):
@@ -47,7 +47,7 @@ def test_glm5_next_text_eager_matches_hf():
     config = _tiny_config()
     hf = HFGlm5NextTextModel(config)
     ours = _build_ours(config)
-    assert hasattr(ours.layers[0].mlp, "veomni_swiglu_mlp")
+    assert hasattr(ours.layers[0].mlp, "veomni_gated_mlp")
     assert hasattr(ours.layers[2].mlp.experts, "veomni_moe")
     ours.load_state_dict(hf.state_dict())
 

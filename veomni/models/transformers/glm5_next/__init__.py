@@ -16,7 +16,6 @@
 
 from veomni.lora.target_mapping import convert_fused_moe_lora_targets
 from veomni.models.registry import MODELING_REGISTRY
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 def _convert_wrapped_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
@@ -46,44 +45,40 @@ def _convert_text_lora_targets_to_parameters(_model, lora_modules, target_parame
     )
 
 
-def _load_generated():
-    if IS_NPU_AVAILABLE:
-        from .generated import patched_modeling_glm5_next_npu as gen
-    else:
-        from .generated import patched_modeling_glm5_next_gpu as gen
-    return gen
-
-
 @MODELING_REGISTRY.register("glm5_next")
 def register_glm5_next_modeling(architecture: str):
     from .checkpoint_tensor_converter import (
         convert_glm5_next_fqn_to_index_mapping,
         create_glm5_next_checkpoint_tensor_converter,
     )
+    from .modeling_glm5_next import (
+        Glm5NextForConditionalGeneration,
+        Glm5NextModel,
+        Glm5NextTextModel,
+    )
 
-    gen = _load_generated()
     classes = (
-        gen.Glm5NextForConditionalGeneration,
-        gen.Glm5NextModel,
-        gen.Glm5NextTextModel,
+        Glm5NextForConditionalGeneration,
+        Glm5NextModel,
+        Glm5NextTextModel,
     )
     for model_cls in classes:
         model_cls._create_checkpoint_tensor_converter = staticmethod(create_glm5_next_checkpoint_tensor_converter)
         model_cls._convert_fqn_to_index_mapping = staticmethod(convert_glm5_next_fqn_to_index_mapping)
 
-    gen.Glm5NextForConditionalGeneration._convert_lora_targets_to_parameters = staticmethod(
+    Glm5NextForConditionalGeneration._convert_lora_targets_to_parameters = staticmethod(
         _convert_wrapped_lora_targets_to_parameters
     )
-    gen.Glm5NextModel._convert_lora_targets_to_parameters = staticmethod(_convert_model_lora_targets_to_parameters)
-    gen.Glm5NextTextModel._convert_lora_targets_to_parameters = staticmethod(_convert_text_lora_targets_to_parameters)
+    Glm5NextModel._convert_lora_targets_to_parameters = staticmethod(_convert_model_lora_targets_to_parameters)
+    Glm5NextTextModel._convert_lora_targets_to_parameters = staticmethod(_convert_text_lora_targets_to_parameters)
 
     if "ForConditionalGeneration" in architecture:
-        return gen.Glm5NextForConditionalGeneration
+        return Glm5NextForConditionalGeneration
     if "TextModel" in architecture:
-        return gen.Glm5NextTextModel
+        return Glm5NextTextModel
     if architecture.endswith("Model") or "Glm5NextModel" == architecture:
-        return gen.Glm5NextModel
-    return gen.Glm5NextForConditionalGeneration
+        return Glm5NextModel
+    return Glm5NextForConditionalGeneration
 
 
 @MODELING_REGISTRY.register("glm5_next_text")
@@ -92,11 +87,9 @@ def register_glm5_next_text_modeling(architecture: str):
         convert_glm5_next_fqn_to_index_mapping,
         create_glm5_next_checkpoint_tensor_converter,
     )
+    from .modeling_glm5_next import Glm5NextTextModel
 
-    gen = _load_generated()
-    gen.Glm5NextTextModel._create_checkpoint_tensor_converter = staticmethod(
-        create_glm5_next_checkpoint_tensor_converter
-    )
-    gen.Glm5NextTextModel._convert_fqn_to_index_mapping = staticmethod(convert_glm5_next_fqn_to_index_mapping)
-    gen.Glm5NextTextModel._convert_lora_targets_to_parameters = staticmethod(_convert_text_lora_targets_to_parameters)
-    return gen.Glm5NextTextModel
+    Glm5NextTextModel._create_checkpoint_tensor_converter = staticmethod(create_glm5_next_checkpoint_tensor_converter)
+    Glm5NextTextModel._convert_fqn_to_index_mapping = staticmethod(convert_glm5_next_fqn_to_index_mapping)
+    Glm5NextTextModel._convert_lora_targets_to_parameters = staticmethod(_convert_text_lora_targets_to_parameters)
+    return Glm5NextTextModel

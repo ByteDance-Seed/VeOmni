@@ -8,27 +8,27 @@
 # token stream before each KDA/DSA block (correct, non-fused). Prefer
 # moe_implementation: eager for the first bring-up; fused_npu / fused_triton
 # remain available once validated.
+#
+# Packed multi-sample dyn_bsz is NOT supported yet: KDA keeps a recurrent state
+# across the packed row, and DSA visibility is only causal+padding (no pack
+# boundaries). Keep train.dyn_bsz=false until those paths are isolated or reject
+# multi-sample packs.
 
 model:
   model_path: /path/to/GLM-5.3-Flash-bf16
   # Optional shrink of the HF text tower for single-node bring-up.
-  # Keep list lengths == num_hidden_layers (and linear_attn_config indices in range).
+  # Keep layer_types / mlp_layer_types / indexer_types length == num_hidden_layers.
   # Random/meta init only — do not pair this with a full-size checkpoint.
   # model_config:
   #   text_config:
   #     num_hidden_layers: 4
-  #     first_k_dense_replace: 3
-  #     num_nextn_predict_layers: 0
   #     layer_types: [linear_attention, linear_attention, linear_attention, deepseek_sparse_attention]
   #     mlp_layer_types: [dense, dense, dense, sparse]
   #     indexer_types: [full, full, full, full]
-  #     linear_attn_config:
-  #       num_heads: 64
-  #       gate_lower_bound: -5.0
-  #       head_dim: 128
-  #       short_conv_kernel_size: 4
-  #       kda_layers: [0, 1, 2]
-  #       full_attn_layers: [3]
+  #     linear_num_heads: 64
+  #     linear_head_dim: 128
+  #     linear_conv_kernel_dim: 4
+  #     linear_lower_bound: -5.0
   #   vision_config:
   #     depth: 2
   ops_implementation:
@@ -36,7 +36,7 @@ model:
     moe_implementation: eager
     cross_entropy_loss_implementation: chunk_loss
     rms_norm_implementation: eager
-    swiglu_mlp_implementation: eager
+    gated_mlp_implementation: eager
     rotary_pos_emb_implementation: eager
     load_balancing_loss_implementation: eager
   optimizer:
@@ -60,9 +60,12 @@ data:
   max_seq_len: 2048
   train_size: 750000
   text_keys: messages
+  # Unused while train.dyn_bsz=false; kept for when packing support lands.
   dyn_bsz_buffer_size: 200
 
 train:
+  # See file header: packing / dyn_bsz multi-sample is unsupported for KDA+DSA.
+  dyn_bsz: false
   global_batch_size: 8
   micro_batch_size: 1
   num_train_epochs: 1
