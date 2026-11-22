@@ -267,9 +267,11 @@ lifecycle across GPU and CPU:
 1. **Creation:** A pinned CPU buffer (`tensor_cpu`) is allocated matching the tensor's
    shape and dtype.
 2. **D2H (launch_d2h):** On the swap stream, copy GPU tensor to pinned CPU buffer
-   (non-blocking), with `record_stream` on that stream so the native caching
-   allocator holds the old storage until the copy finishes. Record a `d2h_event`
-   and store it on the host buffer as `_last_swap_event`.
+   (non-blocking), calling `record_stream` on that stream only when
+   `_deferred_free_supported(self.tensor)` confirms the native caching allocator
+   owns the storage (so allocators such as `cudaMallocAsync` never receive
+   `record_stream` for external pointers). Record a `d2h_event` and store it on the
+   host buffer as `_last_swap_event`.
 3. **Wait D2H (wait_d2h_finished):** Detach the GPU storage by binding the tensor to
    fresh empty storage. With CUDA's **native** caching allocator this does **not**
    host-synchronize: the `record_stream` above already keeps the source storage

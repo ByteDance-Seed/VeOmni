@@ -298,6 +298,7 @@ class SwapTensor:
 
         self.stat = "device"
         self.key = key
+        self._deferred_free = False
 
         self.d2h_event = create_event()
         self.h2d_event = create_event()
@@ -326,19 +327,23 @@ class SwapTensor:
     def launch_d2h(self, stream):
         """Queue the GPU-to-host copy of ``self.tensor`` on ``stream``.
 
-        ``record_stream`` is what lets :meth:`wait_d2h_finished` detach the source
-        storage without a host wait, so it is queued on the same stream as the copy
-        and before it.
+        ``record_stream`` is called only when :func:`_deferred_free_supported`
+        confirms the allocator and storage support deferred freeing; other
+        allocators (such as ``cudaMallocAsync`` over foreign DLPack memory) can
+        reject ``record_stream`` on external pointers and instead rely on the
+        host synchronize in :meth:`wait_d2h_finished`.
         """
         if self.stat != "device":
             return
 
+        self._deferred_free = _deferred_free_supported(self.tensor)
         forward_event = create_event()
         forward_event.record()
         with torch.no_grad():
             with switch_to_specified_stream(stream):
                 stream.wait_event(forward_event)
-                self.tensor.record_stream(stream)
+                if self._deferred_free:
+                    self.tensor.record_stream(stream)
                 self.tensor_cpu.copy_(self.tensor, non_blocking=True)
                 self.d2h_event.record()
                 self.tensor_cpu._last_swap_event = self.d2h_event
@@ -348,15 +353,16 @@ class SwapTensor:
         """Detach the offloaded GPU storage once the D2H copy is ordered or complete.
 
         See :func:`_deferred_free_supported`: the host wait is skipped only where
-        ``record_stream`` actually defers the free of this storage.
+        :meth:`launch_d2h` recorded the swap stream on storage whose allocator
+        defers the free.
         """
         if self.stat != "d2h":
             return
-        if not _deferred_free_supported(self.tensor):
+        if not self._deferred_free:
             # No allocator hook to keep the source storage alive -- either the
             # allocator is not the native caching one, or the storage is foreign
-            # (a DLPack / from_numpy view the allocator's deleter check skips) --
-            # so the copy must be host-complete before the storage is detached.
+            # (a DLPack / from_numpy view or COW storage) -- so the copy must be
+            # host-complete before the storage is detached.
             self.d2h_event.synchronize()
         # Point this tensor at a fresh empty storage instead of resize_(0).
         # resize_ would free a StorageImpl that a Tensor.set_() alias can still

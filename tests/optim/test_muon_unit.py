@@ -28,7 +28,13 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.models.configuration_base import as_veomni_config
 from veomni.optim import muon as muon_impl
-from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_gpu_compute_capability
+from veomni.utils.device import (
+    IS_CUDA_AVAILABLE,
+    IS_NPU_AVAILABLE,
+    get_device_type,
+    get_gpu_compute_capability,
+    get_torch_device,
+)
 
 
 muon_module = pytest.importorskip("torch.optim._muon")
@@ -1366,8 +1372,8 @@ def test_moe_local_3d_newton_schulz_skips_chunking_below_the_threshold():
 
 
 @pytest.mark.skipif(
-    not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE),
-    reason="CUDA or NPU required",
+    not ((IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and get_torch_device().is_available()),
+    reason="Visible CUDA or NPU device required",
 )
 def test_moe_local_3d_newton_schulz_chunking_matches_whole_stack_on_accelerator(monkeypatch):
     """Exercise rectangular 3D chunking (with a 1-expert tail) on accelerator Gram and CUDA gram_quack."""
