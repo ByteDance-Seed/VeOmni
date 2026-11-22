@@ -1232,21 +1232,24 @@ def test_the_deepgemm_row_refuses_an_activation_its_kernel_cannot_fuse():
         deepgemm.wrapper(mlp, torch.randn(2, 256), activation="gelu")
 
 
-def test_the_documented_activation_restriction_matches_the_code():
-    """A GELU model cannot select this row, and the docs say so.
+def test_the_row_states_which_activations_it_serves():
+    """The served set is declared once and is what both the router and the row use.
 
-    Pins the pair: ``ROW_ACTIVATIONS`` decides what ``render`` allows, and
-    ``deepgemm_moe.md`` states the same set. A change to one without the other is
-    what this catches.
+    This replaces a test that asserted substrings of `deepgemm_moe.md`. That test
+    passed while the prose was wrong — it required "SiLU-only" and an `eager`
+    mention, and the wrong sentence contained both, since it said every non-SiLU
+    activation was rejected and `swish` is SiLU under its other name. So it pinned
+    wording rather than behaviour, and would fail on any equivalent rephrasing.
+
+    What is worth pinning is the set: `render` routes on `ROW_ACTIVATIONS` and the
+    row re-checks the same names, so a row that serves a name it does not declare (or
+    declares one it cannot compute) is the bug this catches.
     """
-    import pathlib
-
     from veomni.ops.kernels.gated_mlp._module import ROW_ACTIVATIONS
+    from veomni.ops.kernels.gated_mlp.standard.deepgemm import _FUSED_ACTIVATIONS
 
-    allowed = ROW_ACTIVATIONS["deepgemm"]
-    assert allowed == frozenset({"silu", "swish"})
-    assert "gelu" not in allowed
-
-    doc = (pathlib.Path(__file__).resolve().parents[3] / "docs/design/deepgemm_moe.md").read_text()
-    assert "SiLU-only" in doc or "SiLU only" in doc
-    assert "gated_mlp_implementation: eager" in doc
+    declared = ROW_ACTIVATIONS["deepgemm"]
+    assert declared == _FUSED_ACTIVATIONS
+    # ``swish`` is ``ACT2FN``'s alias for SiLU, so a SiLU kernel serves it; a set
+    # without it would send those models down the unquantized path for nothing.
+    assert declared == frozenset({"silu", "swish"})
