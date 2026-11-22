@@ -73,25 +73,25 @@ def _torchao_configs_for_selection(value) -> list[tuple[str, bool]]:
     ]
 
 
-def _bound_torchao_configs(model) -> tuple[set[str], list[tuple[str, bool]]]:
+def _bound_torchao_configs(model) -> tuple[bool, list[tuple[str, bool]]]:
     """Inspect concrete ``VeomniOp`` handles bound on ``model`` for ``linear`` / ``gated_mlp``."""
     if not isinstance(model, nn.Module):
-        return set(), []
+        return False, []
     from ..registry import VeomniOp
 
     tracked_ops = {op for op, _ in _TORCHAO_FIELDS}
-    bound_ops: set[str] = set()
+    has_bound_ops = False
     found: list[tuple[str, bool]] = []
     for module in model.modules():
         for attr in vars(module).values():
-            if isinstance(attr, VeomniOp) and attr.op in tracked_ops:
-                bound_ops.add(attr.op)
-                if attr.impl == _TORCHAO_ROW:
+            if isinstance(attr, VeomniOp):
+                has_bound_ops = True
+                if attr.op in tracked_ops and attr.impl == _TORCHAO_ROW:
                     found.append(_torchao_pair(attr.kwargs))
-    return bound_ops, found
+    return has_bound_ops, found
 
 
-def _iter_torchao_configs(config, *, skip_ops: set[str] | None = None) -> list[tuple[str, bool]]:
+def _iter_torchao_configs(config) -> list[tuple[str, bool]]:
     """Collect ``(dtype, emulated)`` pairs reachable for ``torchao`` across ``config`` and sub-configs."""
     found: list[tuple[str, bool]] = []
     if config is None:
@@ -99,28 +99,29 @@ def _iter_torchao_configs(config, *, skip_ops: set[str] | None = None) -> list[t
 
     ops = getattr(config, "ops_config", None)
     if ops is not None:
-        for op, field in _TORCHAO_FIELDS:
-            if skip_ops and op in skip_ops:
-                continue
+        for _op, field in _TORCHAO_FIELDS:
             found.extend(_torchao_configs_for_selection(getattr(ops, field, None)))
 
     for name in getattr(config, "sub_configs", {}) or {}:
         child = getattr(config, name, None)
         if child is not None:
-            found.extend(_iter_torchao_configs(child, skip_ops=skip_ops))
+            found.extend(_iter_torchao_configs(child))
     return found
 
 
 def _model_torchao_configs(model: nn.Module) -> list[tuple[str, bool]]:
     """Collect ``torchao`` ``(dtype, emulated)`` pairs for ``model``.
 
-    Prefers concrete bound ``VeomniOp`` handles when present for an op family so
-    disjoint per-site overrides resolve exactly, and falls back to reachable-state
-    config inspection otherwise.
+    On a concrete model that binds ``VeomniOp`` handles, inspect only those
+    resolved handles so unmatched overrides or op families the model never
+    binds (such as ``linear_implementation`` on Gemma3) do not falsely fail
+    hardware checks. Fall back to reachable-state config inspection when no
+    handles are bound on ``model``.
     """
-    bound_ops, found = _bound_torchao_configs(model)
-    found.extend(_iter_torchao_configs(getattr(model, "config", None), skip_ops=bound_ops))
-    return found
+    has_bound_ops, found = _bound_torchao_configs(model)
+    if has_bound_ops:
+        return found
+    return _iter_torchao_configs(getattr(model, "config", None))
 
 
 def _native_bf16_qat_selections(model: nn.Module) -> set[str]:

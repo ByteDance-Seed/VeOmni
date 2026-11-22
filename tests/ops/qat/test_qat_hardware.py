@@ -117,3 +117,27 @@ def test_native_fp8_requires_nvidia_sm89(monkeypatch, field):
     _device(monkeypatch, cuda=True, capability=89)
     reject_qat_without_native_bf16(_model(**{field: fp8}))
     reject_qat_without_native_bf16(_model(**{field: fp8_chained}))
+
+
+def test_bound_handles_are_authoritative_for_unused_families(monkeypatch):
+    """Concrete models without a ``linear`` handle (e.g. Gemma3) ignore unused ``linear_implementation`` FP8."""
+    from torch import nn
+
+    from veomni.ops import VeomniOp
+    from veomni.ops import registry as ops_registry
+
+    monkeypatch.setattr(ops_registry, "is_package_available", lambda _pkg: True)
+    monkeypatch.setattr(VeomniOp, "_intern", dict(VeomniOp._intern))
+
+    fp8 = OpsSelection(name="torchao", kwargs={"dtype": "fp8", "recipe": "rowwise"})
+    ops = SimpleNamespace(linear_implementation=fp8, gated_mlp_implementation="eager")
+    model = nn.Linear(2, 2)
+    model.config = SimpleNamespace(ops_config=ops, sub_configs={})
+    model.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", "eager")
+
+    _device(monkeypatch, cuda=True, capability=80)
+    reject_qat_without_native_bf16(model)
+
+    model.veomni_q_proj = VeomniOp("linear", "standard", fp8, site="layers.0.q_proj")
+    with pytest.raises(RuntimeError, match="SM89"):
+        reject_qat_without_native_bf16(model)

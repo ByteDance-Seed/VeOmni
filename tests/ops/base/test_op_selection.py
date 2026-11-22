@@ -28,15 +28,18 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import OpsImplementationConfig, VeOmniArguments
 from veomni.arguments.parser import _instantiate_recursive
 from veomni.ops import OP_REGISTRY, OpsSelection, SiteOverride, VeomniOp, register_op
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def test_per_site_op_selection_and_overrides():
+def test_per_site_op_selection_and_overrides(monkeypatch):
     """End-to-end check for OpsSelection overrides, handle interning/pickle, config round-trip, and shipped YAML."""
     from veomni.ops.registry import SavedState
+
+    # Isolate from real host accelerator detection so ordinary pytest passes on GPU, NPU, and CPU hosts alike.
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
 
     # 1. Bare string / unset / ordered anchored regex matching / kwargs merge vs row-switch reset.
     assert OpsSelection.from_config_value("liger_kernel").resolve("layers.0.mlp") == ("liger_kernel", {})
@@ -127,18 +130,16 @@ def test_per_site_op_selection_and_overrides():
             "overrides": [{"site": r"layers\.0\.experts", "name": "fused"}],
         }
     )
-    expected_fused = "fused_npu" if IS_NPU_AVAILABLE else "fused_quack"
-    assert fused_mapping.moe_implementation.name == expected_fused
-    assert fused_mapping.moe_implementation.overrides[0].name == expected_fused
+    assert fused_mapping.moe_implementation.name == "fused_quack"
+    assert fused_mapping.moe_implementation.overrides[0].name == "fused_quack"
 
-    if not IS_NPU_AVAILABLE:
-        with pytest.raises(ValueError, match="requires Ascend NPU"):
-            OpsImplementationConfig(
-                moe_implementation={
-                    "name": "eager",
-                    "overrides": [{"site": r"layers\.0\.experts", "name": "fused_npu"}],
-                }
-            )
+    with pytest.raises(ValueError, match="requires Ascend NPU"):
+        OpsImplementationConfig(
+            moe_implementation={
+                "name": "eager",
+                "overrides": [{"site": r"layers\.0\.experts", "name": "fused_npu"}],
+            }
+        )
 
     yaml_path = Path(__file__).resolve().parents[3] / "configs" / "text" / "deepseek_v4_mixed_precision.yaml"
     raw = yaml.safe_load(yaml_path.read_text())
@@ -150,6 +151,17 @@ def test_per_site_op_selection_and_overrides():
     assert ops.gated_mlp_implementation.resolve("layers.1.mlp") == ("qat", {})
     assert ops.moe_implementation.resolve("layers.0.experts") == ("deepgemm", {"dtype": "fp8"})
     assert ops.kv_round_implementation == "triton"
+
+    # Mocked NPU host: mapping-form `fused` resolves to `fused_npu` for both default and override.
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
+    npu_fused = OpsImplementationConfig(
+        moe_implementation={
+            "name": "fused",
+            "overrides": [{"site": r"layers\.0\.experts", "name": "fused"}],
+        }
+    )
+    assert npu_fused.moe_implementation.name == "fused_npu"
+    assert npu_fused.moe_implementation.overrides[0].name == "fused_npu"
 
     from veomni.ops.kernels.moe_experts.standard import deepgemm
 
