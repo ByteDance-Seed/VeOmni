@@ -975,6 +975,46 @@ def test_wan_eager_real_pair_matches_complex_reference(seqlen: int):
     assert torch.allclose(x_e.grad.reshape_as(x_h.grad), x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+@pytest.mark.parametrize("seqlen", (1, 16))
+def test_wan_npu_real_pair_backward_stays_real(monkeypatch, seqlen: int):
+    from veomni.ops.kernels.rope.wan import torch_npu as wan_npu
+
+    def fail_complex(*_args, **_kwargs):
+        raise AssertionError("real-pair NPU RoPE must not construct a complex frequency table")
+
+    torch.manual_seed(0)
+    head_dim = 64
+    heads = 4
+    x = torch.randn(2, seqlen, heads, head_dim, dtype=torch.float32)
+    angle = torch.randn(seqlen, 1, head_dim // 2, dtype=torch.float64)
+    freqs = torch.polar(torch.ones_like(angle), angle)
+    freqs_cos = freqs.real.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+    freqs_sin = freqs.imag.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+    x_e = x.detach().requires_grad_(True)
+    out_e = resolve_op("rope", "wan", "eager").wrapper(x_e, (freqs_cos, freqs_sin), head_dim=head_dim)
+    grad_output = torch.randn_like(out_e)
+    out_e.backward(grad_output)
+
+    monkeypatch.setattr(wan_npu.torch, "complex", fail_complex)
+    saved_cos, saved_sin = wan_npu._saved_real_pair((freqs_cos, freqs_sin))
+    assert saved_cos.dtype == torch.float32
+    assert saved_sin.dtype == torch.float32
+    assert not torch.is_complex(saved_cos)
+    assert saved_cos.shape == (seqlen, 1, head_dim // 2)
+
+    dx = wan_npu._real_pair_dx(grad_output, saved_cos, saved_sin, head_dim, tuple(x.shape))
+    assert dx.shape == x.shape
+    assert torch.allclose(dx, x_e.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+    empty = torch.empty(2, 0, heads, head_dim)
+    empty_out, saved = wan_npu.forward(empty, (freqs_cos, freqs_sin), head_dim=head_dim)
+    assert empty_out.shape == empty.shape
+    assert all(not torch.is_complex(tensor) for tensor in saved.tensors)
+    restored, grad_freqs = wan_npu.backward(empty_out, saved)
+    assert restored.shape == empty.shape
+    assert grad_freqs is None
+
+
 @pytest.mark.parametrize(
     ("seqlen", "head_dim"),
     (
