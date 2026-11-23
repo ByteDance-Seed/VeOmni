@@ -1970,7 +1970,7 @@ class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
 
     # Parallel plans (EP for the fused expert weights)
     def get_parallel_plan(self):
-        from ..parallel_plan import get_parallel_plan as _get_parallel_plan
+        from .parallel_plan import get_parallel_plan as _get_parallel_plan
 
         return _get_parallel_plan("model")
 
@@ -3619,6 +3619,6 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         }
 
     def get_parallel_plan(self):
-        from ..parallel_plan import get_parallel_plan as _get_parallel_plan
+        from .parallel_plan import get_parallel_plan as _get_parallel_plan
 
         return _get_parallel_plan()

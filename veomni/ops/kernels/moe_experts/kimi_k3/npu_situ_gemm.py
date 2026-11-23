@@ -17,8 +17,8 @@
 A sibling of ``npu_group_gemm.py``'s swiglu fused MoE where the activation
 between the two group gemms is Kimi-K3's SituGLU
 (``beta * tanh(gate/beta) * sigmoid(gate) * up``) instead of SwiGLU. Both the
-single-device and the expert-parallel (alltoall dispatch/combine) paths are
-provided; the token-permute / group-gemm / alltoall helpers are reused from
+single-device and the expert-parallel paths are provided; the token-permute /
+group-gemm helpers are reused from
 ``npu_group_gemm`` so the numerics and scheduling stay identical to the
 standard fused MoE.
 """
@@ -28,15 +28,11 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
+from .....distributed.moe import cumsum_to_counts, dispatch_to_ep_class
 from .....distributed.parallel_state import get_parallel_state
 from .....utils.device import IS_NPU_AVAILABLE
 from ...situ_and_mul.kimi_k3.triton import situ_and_mul
-from ..standard.npu import (
-    alltoall_combine,
-    alltoall_dispatch,
-    dispatch_preprocess,
-    npu_group_gemm,
-)
+from ..standard.npu import npu_group_gemm
 
 
 # NPU-only op: guard torch_npu so the module stays importable on non-NPU hosts
@@ -80,6 +76,21 @@ def _npu_situ_fused_moe_forward(
     return hidden_states
 
 
+def _npu_situ_expert_math(permute_tokens, cumsum, fc1_weight, fc2_weight, beta=1.0, linear_beta=None):
+    """Two Ascend grouped GEMMs with SituGLU between them.
+
+    Takes the shape ``dispatch_to_ep_class`` provides, so the all-to-all plumbing is
+    shared with every other fused row; only the per-rank math is this variant's
+    (mirrors ``standard/npu._npu_expert_math`` with SituGLU in place of SwiGLU).
+    ``npu_group_gemm`` pins ``group_list_type=1`` -- per-group sizes -- so the
+    cumulative ``cumsum`` is converted back to counts first.
+    """
+    counts = cumsum_to_counts(cumsum)
+    intermediate = npu_group_gemm(permute_tokens, fc1_weight, counts)
+    activated = _situ(intermediate, beta, linear_beta)
+    return npu_group_gemm(activated, fc2_weight, counts)
+
+
 def npu_situ_ep_fused_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
@@ -93,43 +104,28 @@ def npu_situ_ep_fused_moe_forward(
     beta: float = 1.0,
     linear_beta: float | None = None,
 ) -> torch.Tensor:
-    """NPU expert-parallel situ fused MoE forward pass (alltoall dispatch/combine)."""
-    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-    input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
-        dispatch_preprocess(selected_experts, num_experts, ep_group)
-    )
-    hidden_states, unpermute_indices = alltoall_dispatch(
-        hidden_states,
-        selected_experts,
-        input_splits,
-        output_splits,
-        num_experts,
-        num_global_tokens_per_local_expert,
-        ep_group,
-    )
+    """NPU expert-parallel situ fused MoE forward pass.
 
+    The all-to-all plumbing is shared with every other fused row through
+    ``dispatch_to_ep_class`` (which also applies the routing weights on the
+    combined tokens); only the per-rank math is Ascend's SituGLU group GEMM.
+    """
     if fc1_1_2_weight is not None:
         fc1_weight = fc1_1_2_weight
     else:
         fc1_weight = torch.cat([fc1_1_weight, fc1_2_weight], dim=1)
     fc1_weight = fc1_weight.transpose(1, 2)
-    intermediate_hidden_states = npu_group_gemm(hidden_states, fc1_weight, num_global_sum_tokens_per_local_expert)
-    intermediate_activations = _situ(intermediate_hidden_states, beta, linear_beta)
-    hidden_states = npu_group_gemm(
-        intermediate_activations, fc2_weight.transpose(1, 2), num_global_sum_tokens_per_local_expert
-    )
-
-    hidden_states = alltoall_combine(
-        hidden_states,
-        routing_weights,
-        unpermute_indices,
-        input_splits,
-        output_splits,
+    return dispatch_to_ep_class(
+        _npu_situ_expert_math,
         num_experts,
-        num_global_tokens_per_local_expert,
-        ep_group,
+        routing_weights,
+        selected_experts,
+        hidden_states,
+        fc1_weight,
+        fc2_weight.transpose(1, 2),
+        beta,
+        linear_beta,
     )
-    return hidden_states
 
 
 def npu_situ_fused_moe_forward(
