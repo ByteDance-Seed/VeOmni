@@ -141,7 +141,7 @@ class LlamaRotaryEmbedding(nn.Module):
 
 
 class LlamaMLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx: int | None = None):
         nn.Module.__init__(self)
         self.config = config
         self.hidden_size = config.hidden_size
@@ -150,7 +150,10 @@ class LlamaMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
+        site = f"layers.{layer_idx}.mlp" if layer_idx is not None else None
+        self.veomni_gated_mlp = VeomniOp(
+            "gated_mlp", "standard", config.ops_config.gated_mlp_implementation, site=site
+        )
 
     def forward(self, x):
         return self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
@@ -225,9 +228,14 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        # Bind instance-local rope and attention VeomniOps
+        # Bind instance-local rope, attention, and linear VeomniOps
         self.veomni_rope = VeomniOp("rope", "full", self.config.ops_config.rotary_pos_emb_implementation)
         self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
+        linear_impl = self.config.ops_config.linear_implementation
+        self.veomni_q_proj = VeomniOp("linear", "standard", linear_impl, site=f"layers.{layer_idx}.q_proj")
+        self.veomni_k_proj = VeomniOp("linear", "standard", linear_impl, site=f"layers.{layer_idx}.k_proj")
+        self.veomni_v_proj = VeomniOp("linear", "standard", linear_impl, site=f"layers.{layer_idx}.v_proj")
+        self.veomni_o_proj = VeomniOp("linear", "standard", linear_impl, site=f"layers.{layer_idx}.o_proj")
 
     def forward(
         self,
@@ -240,9 +248,9 @@ class LlamaAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states = self.veomni_q_proj(self.q_proj, hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.veomni_k_proj(self.k_proj, hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.veomni_v_proj(self.v_proj, hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
@@ -262,7 +270,7 @@ class LlamaAttention(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.veomni_o_proj(self.o_proj, attn_output)
         return attn_output, attn_weights
 
 
@@ -277,7 +285,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
-        self.mlp = LlamaMLP(config)
+        self.mlp = LlamaMLP(config, layer_idx=layer_idx)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
 

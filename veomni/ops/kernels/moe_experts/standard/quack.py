@@ -760,7 +760,7 @@ def wrapper(
     assume_distinct_experts: bool = False,
     activation: str = "silu",
     block_size: int = 128,
-    expert_dtype: str = "fp8",
+    dtype: str = "fp8",
 ) -> Tensor:
     """Call the Quack fused MoE Function. Empty weights are ``None``."""
     if not is_silu(activation):
@@ -781,9 +781,10 @@ def wrapper(
             swiglu_limit=swiglu_limit,
             assume_distinct_experts=assume_distinct_experts,
             block_size=block_size,
-            expert_dtype=expert_dtype,
+            dtype=dtype,
             activation=activation,
         )
+    del block_size, dtype
     # Empty tensor = unused layout. Registry args stay tensors.
     return quack_gemm_fused_moe_forward(
         num_experts,
