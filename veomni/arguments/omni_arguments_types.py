@@ -356,18 +356,42 @@ def build_omni_module_runtime_args(
         merged_acc = merged.setdefault("accelerator", {})
         if isinstance(merged_acc, dict):
             merged_acc["skip_sp_gather_between_modules"] = global_skip_sp_gather
-            # `extra_parallel_only` is a property of the `fsdp2` path and
-            # `FSDPConfig` refuses it beside `fsdp_mode='eager'`. This overlay sits
-            # above the checkpoint but below the run's own YAML, so a module that
-            # inherits the flag must keep `fsdp2` here -- otherwise the nested
-            # config raises before `__post_init__` can normalize it back, and a
-            # global no-wrap inference config could not launch at all. A module the
-            # run itself pinned to `eager` keeps that value; `__post_init__`
-            # resolves it.
+            # `extra_parallel_only` is a property of the `fsdp2` path: it removes
+            # the wrap and leaves the ExtraParallel plan doing the sharding, and
+            # `FSDPConfig` refuses it beside any other `fsdp_mode`. Two layers
+            # above the checkpoint can hand a module the flag it did not ask for
+            # -- the run's global `model:` block, and the synthesized `eager`
+            # inference default -- so this block reconciles the flag with the
+            # mode the module ends up with.
+            #
+            # Which mode that is depends on whether the module's own YAML named
+            # one. If it did not, the inherited flag wins and the mode is
+            # promoted to `fsdp2`: that is what makes a global no-wrap inference
+            # config launch at all, since the `eager` default would otherwise
+            # reach `FSDPConfig` and raise before `__post_init__` could
+            # normalize it. If it did, that choice is authoritative -- a module
+            # pinned to `ddp` or `eager` stays there, and the flag is dropped
+            # instead of raising or, worse, rewriting the mode. Testing for an
+            # `accelerator:` block was too coarse to see the difference:
+            # `{"fsdp_config": {"fsdp_mode": "ddp"}}` is exactly such a choice,
+            # and it was being overwritten to `fsdp2` in silence.
+            #
+            # Only the module's own layer counts, for the reason the layer order
+            # above gives: parallelism belongs to a run, so a checkpoint's
+            # `accelerator` block is not a run decision (and `to_hf_config`
+            # never writes one), while the inference default is this function's
+            # own eager fallback.
             fsdp_config = merged_acc.get("fsdp_config")
             if isinstance(fsdp_config, dict) and fsdp_config.get("extra_parallel_only", False):
-                if name not in (override or {}) or "accelerator" not in (override or {}):
+                module_mode = _explicit_fsdp_config(override).get("fsdp_mode")
+                if module_mode is None:
                     fsdp_config["fsdp_mode"] = "fsdp2"
+                elif str(module_mode).lower() != "fsdp2":
+                    # Meaningless without the wrap, and `ddp` / `eager` have no
+                    # plan pass to keep it meaningful. `__post_init__` restores
+                    # `fsdp2` for an `eager` module that does need a sharded
+                    # build.
+                    fsdp_config["extra_parallel_only"] = False
         runtime_modules[name] = _instantiate_recursive(OmniModuleRuntimeArguments, merged)
     return runtime_modules
 
@@ -482,6 +506,22 @@ def _resolve_model_path(
             resolved = os.path.join(checkpoint_root, resolved)
         mod_cfg["model_path"] = resolved
     return modules_config
+
+
+def _explicit_fsdp_config(override: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """The module's own ``accelerator.fsdp_config`` entry, if it carries one.
+
+    Used to tell an inherited default apart from a deliberate choice. Only the
+    module's own layer counts: the checkpoint's entry and the synthesized
+    inference default are layers the module's YAML may still override.
+    """
+    if not isinstance(override, dict):
+        return {}
+    accelerator = override.get("accelerator")
+    if not isinstance(accelerator, dict):
+        return {}
+    fsdp_config = accelerator.get("fsdp_config")
+    return fsdp_config if isinstance(fsdp_config, dict) else {}
 
 
 def _module_base(global_dict: dict[str, Any]) -> dict[str, Any]:

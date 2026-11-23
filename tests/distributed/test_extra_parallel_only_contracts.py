@@ -110,7 +110,10 @@ def test_a_plan_less_module_under_an_enabled_extra_parallel_dim_says_how_to_fix_
     A plan-less module is normally a per-module overlay that inherited the global
     mesh (a vision tower under a backbone's `ep`). The bare message only pointed at
     example plans, which does not tell that user the cheaper fix is to turn the
-    dimension off for this module.
+    dimension off for this module -- and the first attempt at saying so named
+    `ep_size: 1`, which is inert in a module overlay, so following the message
+    reproduced the failure. What is asserted here is that the message names the
+    field that does nothing as a non-fix and points at the lists that do.
     """
     from types import SimpleNamespace
 
@@ -126,6 +129,7 @@ def test_a_plan_less_module_under_an_enabled_extra_parallel_dim_says_how_to_fix_
             dp_mode="fsdp2",
             any_extra_parallel_enabled=True,
             extra_parallel_names=("ep",),
+            extra_parallel_sizes={"ep": 4},
             extra_parallel_enabled=lambda name: True,
             extra_parallel_fsdp_device_mesh={"ep": None},
         ),
@@ -137,8 +141,16 @@ def test_a_plan_less_module_under_an_enabled_extra_parallel_dim_says_how_to_fix_
 
     message = str(excinfo.value)
     assert "parallel plan" in message
-    assert "ep_size: 1" in message, "must name the per-module opt-out, which is the usual fix"
     assert "qwen3_moe/parallel_plan.py" in message, "must still point at a worked example"
+    # The message must not send the user to a field that does nothing. `ep_size`
+    # is appended to `extra_parallel_*` only when `"ep"` is absent from the
+    # inherited names, so an overlay setting `ep_size: 1` keeps EP on and the same
+    # assertion fires again -- which is what made the earlier wording useless.
+    assert "does NOT do this" in message and "inert" in message
+    assert "ep_size: 1" in message, "must name the non-fix explicitly, or users will try it"
+    # And it must say what to actually edit: the inherited lists, by dimension.
+    assert "ep" in message and "extra_parallel_names" in message
+    assert "Enabled dimensions" in message
 
 
 def test_cpu_offload_is_refused_even_when_every_parameter_is_plan_sharded():

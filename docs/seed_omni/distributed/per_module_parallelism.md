@@ -25,6 +25,17 @@ A module's choices live in its block of the `modules` YAML, under
 | Eager (inference only) | `fsdp_config.fsdp_mode: eager` | A single-process replica with no mesh; rejected for training |
 | Embedding parallel | `extra_parallel_names: ["emb"]`, `extra_parallel_sizes: [N]`, `extra_parallel_placement_innermost: [false]` | A vocabulary-sharded text encoder; see [Sharded Embedding](../../key_features/sharded_embedding.md) |
 | Expert parallel | `extra_parallel_names: ["ep"]`, `extra_parallel_sizes: [N]`, `extra_parallel_placement_innermost: [false]` | A MoE backbone. Write all three lists: they are paired by position, and a module entry inherits the global accelerator's, so overriding only `sizes` desynchronises the lengths when the launcher adds another dim (e.g. `emb`). Do **not** use `ep_size: N` here: it is only appended when `"ep"` is absent from `extra_parallel_names`, and a module entry already inherits `["ep"]`, so the field is inert and the run has no EP |
+
+A module that holds nothing a dimension shards — a vision tower under a
+backbone's `ep`, say — has to **remove** that dimension from its own block,
+not shrink it. A module entry inherits all three global lists, and a module
+with no parallel plan cannot be built under an enabled mesh, so the build
+raises. `ep_size: 1` is not the opt-out (`ep_size` is inert for the reason in
+the table row above, and leaving `"ep"` in `extra_parallel_sizes` with a size of
+1 still builds the dimension): drop `"ep"` from `extra_parallel_names`, its
+entry from `extra_parallel_sizes` and its entry from
+`extra_parallel_placement_innermost`, keeping the three lists the same length.
+The build's error message lists the dimensions it saw enabled.
 | Sequence / Context parallel | `ulysses_size: U`, `cp_size: C` (one axis `> 1` per module, with `U * C = W / dp_size` and `pp_size = tp_size = 1` across all modules) | Ulysses SP on encoders/ViT, CP on long-context backbones |
 | Gradient checkpointing | `gradient_checkpointing.enable: false` | Off for cheap modules (text encoders, VAE, flow connector) |
 

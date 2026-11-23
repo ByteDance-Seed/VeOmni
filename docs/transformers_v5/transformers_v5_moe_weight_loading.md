@@ -160,7 +160,8 @@ and hands the pair to `convert_rows`.
 
 Which keys may declare one:
 
-- **Dense, not sharded**: read whole, together with its whole companion.
+- **Dense, not sharded**: read whole, together with its whole companion, and
+  both handed to `convert_rows`.
 - **ExtraParallel, row-sharded**: streamed with its companion, as above.
 - **Persistent ExtraParallel** (`persistent_fsdp_shard_dim` set, e.g. Qwen4-Exp
   PLE): **refused** with `NotImplementedError`. A persistent parameter stays a 2D
@@ -169,11 +170,15 @@ Which keys may declare one:
 
 `can_handle_tensor` still receives the **raw** tensor, because claiming a key by
 content is how a quantized dense weight is recognised at all. What happens next
-depends on the path, and there are three:
+depends on the path, and there are four:
 
-- **Dense, not sharded**: read whole and handed to
+- **Dense, not sharded, no companion**: read whole and handed to
   `maybe_convert_checkpoint_tensor`, so its content-claimed conversion runs
   normally.
+- **Dense, not sharded, with a row-wise companion**: read whole together with
+  its whole companion and handed straight to `convert_rows`, which replaces the
+  `maybe_convert_checkpoint_tensor` call rather than feeding it — the companion
+  *is* the conversion, and passing the result on would convert it twice.
 - **Sharded, with a row-wise companion**: the loader reads the matching row range
   of the key and its companion and calls `convert_rows`, which *is* the
   conversion — so the `can_handle_tensor` refusal is skipped, because the tensor

@@ -164,6 +164,37 @@ def test_inference_keeps_a_no_wrap_module_on_fsdp2(monkeypatch, global_accelerat
     assert resolved.fsdp_mode == ("fsdp2" if resolved.extra_parallel_only else "eager")
 
 
+@pytest.mark.parametrize(
+    "module_mode, expected_mode, expected_flag",
+    [
+        ("ddp", "ddp", False),
+        ("eager", "eager", False),
+        ("fsdp2", "fsdp2", True),
+    ],
+)
+def test_a_module_that_names_its_own_fsdp_mode_overrides_the_inherited_no_wrap_flag(
+    monkeypatch, module_mode, expected_mode, expected_flag
+):
+    """A module's own `fsdp_mode` is authoritative over an inherited `extra_parallel_only`.
+
+    The reconciliation above the checkpoint promotes an unnamed mode to `fsdp2`
+    so the flag keeps its meaning; a module that did name one keeps it. `ddp` and
+    `eager` have no plan pass, so the flag is dropped rather than raising inside
+    `FSDPConfig` or, worse, rewriting the mode -- which is what an
+    `"accelerator" in override` check did to an explicit `ddp`.
+    """
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    global_args = OmniModuleRuntimeArguments(
+        model_path="/tmp/model",
+        accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)),
+    )
+    override = {"mod": {"accelerator": {"fsdp_config": {"fsdp_mode": module_mode}}}}
+    modules = build_omni_module_runtime_args(global_args, "/tmp/model", override, for_inference=True)
+    resolved = modules["mod"].accelerator.fsdp_config
+    assert resolved.fsdp_mode == expected_mode
+    assert resolved.extra_parallel_only is expected_flag
+
+
 def test_module_runtime_arguments_inherit_weight_load_knobs():
     args = OmniModuleRuntimeArguments(model_path="/tmp/model")
     assert args.broadcast_model_weights_from_rank0 is True

@@ -592,6 +592,28 @@ def _configure_fsdp_gradient_reduction(
         module.set_gradient_divide_factor(gradient_divide_factor)
 
 
+def _enabled_extra_parallel(parallel_state) -> dict[str, int]:
+    """``{name: size}`` for the ExtraParallel dimensions this state actually enables.
+
+    Used by the missing-plan assertion so its message names the dimensions to
+    remove from the module's overlay instead of only naming the field to edit.
+    Read defensively: the state may be a test stub carrying only what the
+    assertion touches.
+    """
+    sizes = getattr(parallel_state, "extra_parallel_sizes", None) or {}
+    names = getattr(parallel_state, "extra_parallel_names", ()) or ()
+    enabled = getattr(parallel_state, "extra_parallel_enabled", None)
+    out: dict[str, int] = {}
+    for name in names:
+        size = sizes.get(name) if isinstance(sizes, dict) else None
+        try:
+            if enabled is not None and enabled(name):
+                out[name] = int(size) if size is not None else 1
+        except (AssertionError, KeyError, TypeError):
+            continue
+    return out
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str | Mapping[str, str]] = None,
@@ -699,14 +721,23 @@ def parallelize_model_fsdp2(
         assert parallel_plan is not None, (
             f"ExtraParallel {parallel_state.extra_parallel_names} is enabled for this run, but "
             f"{type(model).__name__} declares no parallel plan. Every ExtraParallel dimension the "
-            "run enables must be implemented by the modules it shards, so either:\n"
+            "run enables must be implemented by the modules it shards, and the check is on the "
+            "dimension, not on whether this module holds anything it would shard: a module that "
+            "declares no plan cannot be built under an enabled mesh, so either\n"
             "  * give this module a plan (see veomni/models/transformers/qwen3_moe/parallel_plan.py "
             "for expert parallelism, and tests/utils/test_extra_parallel_clip_grad_norm.py::"
             "test_clip_grad_norm_fsdp2_ep2_emb4 for expert + embed); or\n"
-            "  * turn this dimension off for this module. A per-module overlay that inherits the "
-            "global mesh is the usual cause: set the module's own `ep_size: 1` (and drop the "
-            "matching `extra_parallel_*` entry) when it holds nothing that dimension shards, "
-            "e.g. a vision tower under a backbone's expert parallelism."
+            "  * take this dimension out of the module's own `accelerator` block. A module entry "
+            "inherits the global `extra_parallel_*` lists, which is the usual cause (a vision "
+            "tower under a backbone's expert parallelism). The three lists are paired by "
+            "position, so rewrite all three without the dimension rather than only shrinking "
+            "one of them, e.g. drop `ep` from `extra_parallel_names`, its size from "
+            "`extra_parallel_sizes` and its placement from "
+            "`extra_parallel_placement_innermost`.\n"
+            f"  Enabled dimensions are {_enabled_extra_parallel(parallel_state)}.\n"
+            "  `ep_size: 1` does NOT do this: `ep_size` is only appended when `'ep'` is absent "
+            "from `extra_parallel_names`, and an inherited entry already has it, so the field is "
+            "inert in a module overlay."
         )
         # Add SpecInfo to extra_parallel modules,
         #   e.g. embed_tokens.weight, decoder.regular_mlp, decoder.embed_tokens.weight, and decoder.moe.experts
