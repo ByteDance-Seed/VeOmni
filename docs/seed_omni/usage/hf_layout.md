@@ -6,7 +6,7 @@ splits into its modules. With one registered, `model.model_path` (and
 upstream checkpoint itself: no offline convert, and the HF export is written
 back in the upstream layout, so it loads wherever the source does.
 
-- Declaration: [`OmniHFLayout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L253) and [`OmniHFModuleLayout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L218)
+- Declaration: [`OmniHFLayout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L254) and [`OmniHFModuleLayout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L219)
 - Registry: [`OMNI_HF_LAYOUT_REGISTRY`](../../../veomni/models/seed_omni/utils/hf_layout.py#L81), keyed by the upstream `model_type`
 
 The layout is framework code; each family registers its own layout together
@@ -127,7 +127,7 @@ OmniHFModuleLayout(
 )
 ```
 
-[`config_for`](../../../veomni/models/seed_omni/utils/hf_layout.py#L241) inspects
+[`config_for`](../../../veomni/models/seed_omni/utils/hf_layout.py#L242) inspects
 the signature and passes `source_path` only to a builder that declares it, so
 every other family keeps the one-argument form and never opens the weight files.
 Janus is the in-tree example: whether its output head ties to the input
@@ -144,22 +144,22 @@ The family declares the fields below. Everything else is framework-provided.
 
 | Field | Owner | What it does | Where the framework reads it | End effect |
 |-------|-------|--------------|------------------------------|------------|
-| `modules[name].key_prefixes` | must declare | `(source_prefix, module_prefix)` pairs. A source key belongs to the module whose source prefix is the longest match across the whole layout, so a backbone can claim `model.` while a sibling claims `model.embed_tokens.`. A prefix claimed twice is an error. Prefixes match source keys after the module class's `_checkpoint_conversion_mapping`, if it has one. | [`OmniHFLayout.route`](../../../veomni/models/seed_omni/utils/hf_layout.py#L288) when loading, and its reverse [`source_key`](../../../veomni/models/seed_omni/utils/hf_layout.py#L295) when saving | Each upstream weight lands on exactly one module, and exports under its upstream name. Unclaimed keys are never read, and are copied verbatim into an export. |
-| `modules[name].build_config` | must declare | Upstream HF config to the module's `OmniModuleConfig`. Declare a second parameter (`def build_config(hf, source_path)`) when the answer depends on what the checkpoint *stores* rather than only on its config — Janus resolves output-head weight tying against the weight files. The path is passed only to a signature that asks for it. | [`build_module_configs`](../../../veomni/models/seed_omni/utils/hf_layout.py#L316) → [`config_for`](../../../veomni/models/seed_omni/utils/hf_layout.py#L241), called by [`_write_hf_view`](../../../veomni/models/seed_omni/utils/hf_layout.py#L478) and [`convert_with_hf_layout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L712) | The module config every load path builds the module from. |
-| `modules[name].build_assets` | optional | Loads the module's assets from the checkpoint directory, keyed `tokenizer` / `processor` / `image_processor` / `video_processor`. | [`build_module_assets`](../../../veomni/models/seed_omni/utils/hf_layout.py#L320), same callers | The assets are saved into the module's view subfolder, so the module and the collator bind them as from a split root. |
-| `tied_source_keys` | optional | Source key → the source key it duplicates when the model ties them (a checkpoint may store `lm_head.weight` although the config ties it). | [`attach_hf_source_converter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L580) and [`save_hf_source_checkpoint`](../../../veomni/models/seed_omni/utils/hf_layout.py#L847) | Loading skips the duplicate when the module does not hold it; an export writes the original's trained value under it, not the stale copy. |
-| `graph_dir`, `training_graphs`, `generation_graphs`, `infer_type`, `generation_kwargs` | optional | The family's default graph YAML (repo-relative, see `load_family_graphs`), default generation scenario, and default `generation_kwargs`. | [`load_graphs`](../../../veomni/models/seed_omni/utils/hf_layout.py#L326), [`_write_hf_view`](../../../veomni/models/seed_omni/utils/hf_layout.py#L478), [`convert_with_hf_layout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L712) | The view and split root carry these graphs and generation defaults; a launcher graph overrides them. Run outside a VeOmni checkout, the view carries none and the launcher has to supply them. |
-| `load_hf_config` | optional | Reads the upstream config; `AutoConfig.from_pretrained` when unset. | [`read_hf_config`](../../../veomni/models/seed_omni/utils/hf_layout.py#L309) | For checkpoints `AutoConfig` cannot read. |
-| Subclass hooks (`source_weight_files`, `resolve_weights_path`, `extract_module_save_state`, `build_fqn_to_index_mapping`, `finalize_exported_shards`) | optional | Methods on `OmniHFLayout` that default to standard HF single-file / numbered-shard layout and `ModelState` extraction. A family subclass (such as [`BagelHFLayout`](../../../veomni/models/seed_omni/modules/bagel/hf_layout.py)) can override them for named safetensors shards (`ae.safetensors` + `ema.safetensors`) or converter-driven weight splitting on export. | [`_check_hf_source_exportable`](../../../veomni/arguments/omni_arguments_types.py#L121), [`HFSource.weights_path`](../../../veomni/models/seed_omni/utils/hf_layout.py#L409), and [`save_hf_source_checkpoint`](../../../veomni/models/seed_omni/utils/hf_layout.py#L847) | Non-standard upstream shard layouts and reversible runtime fusions stay encapsulated in the family's subclass. |
-| registration | must call | `OMNI_HF_LAYOUT_REGISTRY.register("<upstream model_type>")` on a function returning the layout. | [`resolve_omni_checkpoint_root`](../../../veomni/models/seed_omni/utils/hf_layout.py#L448) | A root whose `config.json` has that `model_type` loads through the layout; an unregistered non-`omni` type is an error. |
+| `modules[name].key_prefixes` | must declare | `(source_prefix, module_prefix)` pairs. A source key belongs to the module whose source prefix is the longest match across the whole layout, so a backbone can claim `model.` while a sibling claims `model.embed_tokens.`. A prefix claimed twice is an error. Prefixes match source keys after the module class's `_checkpoint_conversion_mapping`, if it has one. | [`OmniHFLayout.route`](../../../veomni/models/seed_omni/utils/hf_layout.py#L289) when loading, and its reverse [`source_key`](../../../veomni/models/seed_omni/utils/hf_layout.py#L296) when saving | Each upstream weight lands on exactly one module, and exports under its upstream name. Unclaimed keys are never read, and are copied verbatim into an export. |
+| `modules[name].build_config` | must declare | Upstream HF config to the module's `OmniModuleConfig`. Declare a second parameter (`def build_config(hf, source_path)`) when the answer depends on what the checkpoint *stores* rather than only on its config — Janus resolves output-head weight tying against the weight files. The path is passed only to a signature that asks for it. | [`build_module_configs`](../../../veomni/models/seed_omni/utils/hf_layout.py#L317) → [`config_for`](../../../veomni/models/seed_omni/utils/hf_layout.py#L242), called by [`_write_hf_view`](../../../veomni/models/seed_omni/utils/hf_layout.py#L506) and [`convert_with_hf_layout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L741) | The module config every load path builds the module from. |
+| `modules[name].build_assets` | optional | Loads the module's assets from the checkpoint directory, keyed `tokenizer` / `processor` / `image_processor` / `video_processor`. | [`build_module_assets`](../../../veomni/models/seed_omni/utils/hf_layout.py#L321), same callers | The assets are saved into the module's view subfolder, so the module and the collator bind them as from a split root. |
+| `tied_source_keys` | optional | Source key → the source key it duplicates when the model ties them (a checkpoint may store `lm_head.weight` although the config ties it). | [`attach_hf_source_converter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L608) and [`save_hf_source_checkpoint`](../../../veomni/models/seed_omni/utils/hf_layout.py#L876) | Loading skips the duplicate when the module does not hold it; an export writes the original's trained value under it, not the stale copy. |
+| `graph_dir`, `training_graphs`, `generation_graphs`, `infer_type`, `generation_kwargs` | optional | The family's default graph YAML (repo-relative, see `load_family_graphs`), default generation scenario, and default `generation_kwargs`. | [`load_graphs`](../../../veomni/models/seed_omni/utils/hf_layout.py#L327), [`_write_hf_view`](../../../veomni/models/seed_omni/utils/hf_layout.py#L506), [`convert_with_hf_layout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L741) | The view and split root carry these graphs and generation defaults; a launcher graph overrides them. Run outside a VeOmni checkout, the view carries none and the launcher has to supply them. |
+| `load_hf_config` | optional | Reads the upstream config; `AutoConfig.from_pretrained` when unset. | [`read_hf_config`](../../../veomni/models/seed_omni/utils/hf_layout.py#L310) | For checkpoints `AutoConfig` cannot read. |
+| Subclass hooks (`source_weight_files`, `resolve_weights_path`, `extract_module_save_state`, `build_fqn_to_index_mapping`, `finalize_exported_shards`) | optional | Methods on `OmniHFLayout` that default to standard HF single-file / numbered-shard layout and `ModelState` extraction. A family subclass (such as [`BagelHFLayout`](../../../veomni/models/seed_omni/modules/bagel/hf_layout.py)) can override them for named safetensors shards (`ae.safetensors` + `ema.safetensors`) or converter-driven weight splitting on export. | [`_check_hf_source_exportable`](../../../veomni/arguments/omni_arguments_types.py#L121), [`HFSource.weights_path`](../../../veomni/models/seed_omni/utils/hf_layout.py#L427), and [`save_hf_source_checkpoint`](../../../veomni/models/seed_omni/utils/hf_layout.py#L876) | Non-standard upstream shard layouts and reversible runtime fusions stay encapsulated in the family's subclass. |
+| registration | must call | `OMNI_HF_LAYOUT_REGISTRY.register("<upstream model_type>")` on a function returning the layout. | [`resolve_omni_checkpoint_root`](../../../veomni/models/seed_omni/utils/hf_layout.py#L476) | A root whose `config.json` has that `model_type` loads through the layout; an unregistered non-`omni` type is an error. |
 
 Framework-provided, not to be overridden:
-[`resolve_omni_checkpoint_root`](../../../veomni/models/seed_omni/utils/hf_layout.py#L448),
-[`HFSourceKeyConverter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L508),
-[`attach_hf_source_converter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L580),
-[`load_module_from_hf_source`](../../../veomni/models/seed_omni/utils/hf_layout.py#L660),
-[`convert_with_hf_layout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L712) and
-[`save_hf_source_checkpoint`](../../../veomni/models/seed_omni/utils/hf_layout.py#L847).
+[`resolve_omni_checkpoint_root`](../../../veomni/models/seed_omni/utils/hf_layout.py#L476),
+[`HFSourceKeyConverter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L536),
+[`attach_hf_source_converter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L608),
+[`load_module_from_hf_source`](../../../veomni/models/seed_omni/utils/hf_layout.py#L689),
+[`convert_with_hf_layout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L741) and
+[`save_hf_source_checkpoint`](../../../veomni/models/seed_omni/utils/hf_layout.py#L876).
 
 ## Call flow
 
@@ -167,8 +167,8 @@ Training from an upstream root:
 
 - [`build_omni_model_runtime_args`](../../../veomni/arguments/omni_arguments_types.py#L198) calls
   [`_resolve_hf_checkpoint_view`](../../../veomni/arguments/omni_arguments_types.py#L97):
-  - [`resolve_omni_checkpoint_root`](../../../veomni/models/seed_omni/utils/hf_layout.py#L448) reads the root `model_type`, and
-    [`_write_hf_view`](../../../veomni/models/seed_omni/utils/hf_layout.py#L478) writes the weight-free view once per process (module configs, assets, root config, graphs, `hf_source.json`);
+  - [`resolve_omni_checkpoint_root`](../../../veomni/models/seed_omni/utils/hf_layout.py#L476) reads the root `model_type`, and
+    [`_write_hf_view`](../../../veomni/models/seed_omni/utils/hf_layout.py#L506) writes the weight-free view once per process (module configs, assets, root config, graphs, `hf_source.json`);
   - `model.seed_omni_model_path` is set to the view; `model.model_path` is unchanged.
 - [`_validate_hf_view_modules`](../../../veomni/arguments/omni_arguments_types.py#L151) checks every module comes from the layout; with `save_hf_weights`,
   [`_check_hf_source_exportable`](../../../veomni/arguments/omni_arguments_types.py#L121) checks the source has safetensors
@@ -179,23 +179,23 @@ Training from an upstream root:
   [`weights_path`](../../../veomni/models/seed_omni/accelerated/omni_module/omni_module_runtime.py#L234) resolves through `HFSource.weights_path`.
 - For a fresh load, non-meta modules load weights during `_build_model`; meta-initialized modules load during the FSDP2 / DDP wrap (per module, or [composed](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L267)):
   - [`load_model_weights`](../../../veomni/models/checkpoint/weights.py#L410) and the [rank-0 broadcast loader](../../../veomni/models/checkpoint/weights.py#L1208) skip keys the converter declares, without reading them;
-  - [`HFSourceKeyConverter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L508) renames the module's own keys and hands them to the module's converter.
+  - [`HFSourceKeyConverter`](../../../veomni/models/seed_omni/utils/hf_layout.py#L536) renames the module's own keys and hands them to the module's converter.
 
   For a full non-LoRA DCP resume, meta-initialized trainable modules skip the HF weight load and are restored from DCP. Non-meta initialization, LoRA modules and frozen modules with persistent state still load their HF weights as needed.
 
 HF export (`CheckpointCallback` → [`OmniModelRuntime.save_hf_or_lora`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L645)):
 
 - [`_save_hf_source_layout`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L658) exports LoRA modules' adapters per module, skips frozen modules, and makes sure each trained module's DCP exists;
-- [`save_hf_source_checkpoint`](../../../veomni/models/seed_omni/utils/hf_layout.py#L847) extracts each module's save state (via `layout.extract_module_save_state`), renames keys back (raising on a key with no source key or a different shape), casts to the source dtypes, fills tied duplicates, copies every other source tensor on rank 0, and writes `global_step_N/hf_ckpt/` with the source's shard files and non-weight files.
+- [`save_hf_source_checkpoint`](../../../veomni/models/seed_omni/utils/hf_layout.py#L876) extracts each module's save state (via `layout.extract_module_save_state`), renames keys back (raising on a key with no source key or a different shape), casts to the source dtypes, fills tied duplicates, copies every other source tensor on rank 0, and writes `global_step_N/hf_ckpt/` with the source's shard files and non-weight files.
 
 Bare `OmniModel.from_pretrained` and eager inference:
 
 - [`OmniModel.from_pretrained`](../../../veomni/models/seed_omni/modeling_omni.py#L208) resolves the root first;
-- [`_load_module_from_hf_source`](../../../veomni/models/seed_omni/modeling_omni.py#L335) loads each module with [`load_module_from_hf_source`](../../../veomni/models/seed_omni/utils/hf_layout.py#L660) (preferring the module config's `dtype` under `torch_dtype="auto"`) and binds its assets from the view;
-- [`resolve_hf_source_device_map`](../../../veomni/models/seed_omni/utils/hf_layout.py#L626) gives `device_map` its `from_pretrained` meaning (`"auto"` is planned by accelerate over `_no_split_modules`). A multi-device map loads on CPU, then `accelerate.dispatch_model` places the module.
+- [`_load_module_from_hf_source`](../../../veomni/models/seed_omni/modeling_omni.py#L335) loads each module with [`load_module_from_hf_source`](../../../veomni/models/seed_omni/utils/hf_layout.py#L689) (preferring the module config's `dtype` under `torch_dtype="auto"`) and binds its assets from the view;
+- [`resolve_hf_source_device_map`](../../../veomni/models/seed_omni/utils/hf_layout.py#L655) gives `device_map` its `from_pretrained` meaning (`"auto"` is planned by accelerate over `_no_split_modules`). A multi-device map loads on CPU, then `accelerate.dispatch_model` places the module.
 
 Offline convert: a family with a layout and no converter splits through
-[`convert_with_hf_layout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L712),
+[`convert_with_hf_layout`](../../../veomni/models/seed_omni/utils/hf_layout.py#L741),
 called from [`_run_converter`](../../../veomni/models/seed_omni/utils/convert_registry.py#L200).
 Its `attn_implementation` argument is forwarded to every module build, so an
 explicit selection (for example `eager` on a host without flash-attn) is recorded
