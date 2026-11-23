@@ -76,7 +76,6 @@ from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
-from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.model_outputs import MoeCausalLMOutputWithLogProbs, MoeModelOutputWithIndexerKL
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
@@ -422,8 +421,8 @@ class DeepseekV4HCACompressor(nn.Module):
         self.position_bias = nn.Parameter(torch.empty(self.compress_rate, self.head_dim))
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-        if IS_NPU_AVAILABLE:
-            self.position_bias._veomni_fsdp_shard_dim = 1
+        # compress_rate can be smaller than the FSDP world; shard the long dim.
+        self.position_bias._veomni_fsdp_shard_dim = 1
         self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
         self.veomni_kv_round = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
 
@@ -505,10 +504,8 @@ class DeepseekV4HCACompressor(nn.Module):
                 rate_metadata,
                 overlap=False,
                 apply_rope=self.veomni_rope,
+                anchor_empty=True,
             )
-            if IS_NPU_AVAILABLE and compressed.shape[1] == 0:
-                anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
-                compressed = compressed + anchor.to(compressed.dtype)
             if cp_enabled:
                 compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
             compressed = self.veomni_kv_round(compressed, rope_features=self.rotary_emb.config.qk_rope_head_dim)
@@ -648,8 +645,8 @@ class DeepseekV4Indexer(nn.Module):
         self.veomni_q_b_proj = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.scorer = DeepseekV4IndexerScorer(config)
-        if IS_NPU_AVAILABLE:
-            self.position_bias._veomni_fsdp_shard_dim = 1
+        # compress_rate can be smaller than the FSDP world; shard the long dim.
+        self.position_bias._veomni_fsdp_shard_dim = 1
         self.veomni_dsa_indexer = VeomniOp(
             "dsa_indexer",
             "deepseek_v4",
@@ -934,8 +931,8 @@ class DeepseekV4CSACompressor(nn.Module):
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps, config=config)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
         self.indexer = DeepseekV4Indexer(config)
-        if IS_NPU_AVAILABLE:
-            self.position_bias._veomni_fsdp_shard_dim = 1
+        # compress_rate can be smaller than the FSDP world; shard the long dim.
+        self.position_bias._veomni_fsdp_shard_dim = 1
         self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
         self.veomni_kv_round = VeomniOp("kv_round", "deepseek_v4", config.ops_config.kv_round_implementation)
 
@@ -1006,10 +1003,8 @@ class DeepseekV4CSACompressor(nn.Module):
                 rate_metadata,
                 overlap=True,
                 apply_rope=self.veomni_rope,
+                anchor_empty=True,
             )
-            if IS_NPU_AVAILABLE and compressed.shape[1] == 0:
-                anchor = (self.kv_norm(kv[..., : self.head_dim]).sum() + gate.sum() + self.position_bias.sum()) * 0.0
-                compressed = compressed + anchor.to(compressed.dtype)
             if cp_enabled:
                 compressed = all_gather_compressed_rows(compressed, shard.counts, cp_group)
             compressed = self.veomni_kv_round(compressed, rope_features=self.rotary_emb.config.qk_rope_head_dim)

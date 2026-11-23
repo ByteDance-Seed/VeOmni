@@ -183,6 +183,7 @@ def compress_packed_windows(
     *,
     overlap: bool,
     apply_rope: Callable[..., torch.Tensor],
+    anchor_empty: bool = False,
 ) -> torch.Tensor:
     """Compress complete windows without crossing packed sequence boundaries.
 
@@ -206,13 +207,26 @@ def compress_packed_windows(
     half from the wrong tokens instead, because ``clamp_min(0)`` cannot tell the
     difference. ``position_ids`` and ``window_starts`` stay unhaloed and
     shard-local, since positions are per-sample and never cross a rank.
+
+    ``anchor_empty`` keeps ``kv_norm`` and ``position_bias`` in the autograd graph
+    when this micro-batch forms no window. ``empty_compressed_rows`` already
+    touches ``kv`` and ``gate``; without the anchor a rank with no window drops
+    the norm and bias while a rank with a window keeps them, and FSDP2 then
+    issues different gradient collectives for the same bucket. The anchor is
+    multiplied by zero, so the compressed values stay unchanged. The Lightning
+    Indexer leaves this off: its top-k indices are non-differentiable, so its
+    parameters already receive no gradient on every rank.
     """
     if kv.shape[0] != 1:
         raise ValueError(f"Packed DeepSeek V4 compression expects batch size 1, got {kv.shape[0]}")
 
     window_starts = packed_metadata["window_starts"]
     if window_starts.numel() == 0:
-        return empty_compressed_rows(kv, gate, head_dim)
+        compressed = empty_compressed_rows(kv, gate, head_dim)
+        if not anchor_empty:
+            return compressed
+        anchor = (kv_norm(kv[..., :head_dim]).sum() + gate.sum() + position_bias.sum()) * 0.0
+        return compressed + anchor.to(compressed.dtype)
 
     current_indices = packed_metadata["window_indices"]
     current_kv = kv[0, current_indices]
