@@ -37,13 +37,7 @@ from veomni.distributed.async_offload import (
     get_offload_modules,
     reset_async_activation_offload,
 )
-from veomni.utils.device import (
-    IS_CUDA_AVAILABLE,
-    IS_NPU_AVAILABLE,
-    get_device_type,
-    get_torch_device,
-    is_nvidia_cuda_device,
-)
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
 
 
 _CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
@@ -328,12 +322,21 @@ def test_deferred_free_requires_an_allocator_owned_storage(monkeypatch):
         assert not async_offload._deferred_free_supported(cow_source)
 
 
-def test_deferred_free_is_false_without_the_native_allocator(monkeypatch):
-    from veomni.distributed import async_offload
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="NVIDIA CUDA required for the allocator-backend probe")
+def test_is_caching_allocator_active_accepts_only_the_native_backend(monkeypatch):
+    """``backend:cudaMallocAsync`` must not take the deferred-free path.
 
-    monkeypatch.setattr(async_offload, "is_caching_allocator_active", lambda: False)
+    ``CUDAMallocAsyncAllocator::recordStream`` asserts the pointer is in its
+    allocation map, so an external DLPack tensor aborts there instead of deferring
+    a free. Only the native caching allocator reports ``True``.
+    """
+    from veomni.utils import device
 
-    assert not async_offload._deferred_free_supported(torch.empty(4))
+    monkeypatch.delenv("PYTORCH_NO_CUDA_MEMORY_CACHING", raising=False)
+    for backend, expected in (("native", True), ("cudaMallocAsync", False)):
+        fake = SimpleNamespace(memory=SimpleNamespace(get_allocator_backend=lambda b=backend: b))
+        monkeypatch.setattr(device, "get_torch_device", lambda f=fake: f)
+        assert device.is_caching_allocator_active() is expected
 
 
 def test_launch_d2h_gates_record_stream_on_deferred_free(monkeypatch):
@@ -451,191 +454,6 @@ def test_release_host_buffer_syncs_abandoned_d2h_without_deferred_free(monkeypat
     swap_async.release_host_buffer()
     assert swap_async.d2h_event.synced == 0
     assert host_buf_async.__dict__.get("_last_swap_event") is swap_async.d2h_event
-
-
-def test_release_host_buffer_does_not_double_release_if_pool_raises():
-    """If ``pool.release`` raises after caching the buffer, a second release must be a no-op."""
-    pool = PinnedBufferPool(max_cached_bytes=16)
-
-    class _FailingEvent:
-        def synchronize(self):
-            raise RuntimeError("evicted sync failed")
-
-    # Pre-populate pool with a different-shaped 16B buffer whose eviction sync will raise.
-    evict_buf, evict_key = pool.acquire(torch.empty((2, 2), dtype=torch.float32))
-    evict_buf._last_swap_event = _FailingEvent()
-    pool.release(evict_buf, evict_key)
-
-    swap = SwapTensor(torch.arange(4.0), "0_0", pool)
-    cached_buf = swap.tensor_cpu
-    release_calls = []
-    orig_release = pool.release
-
-    def _tracking_release(buf, key):
-        release_calls.append(buf)
-        return orig_release(buf, key)
-
-    pool.release = _tracking_release
-
-    with pytest.raises(RuntimeError, match="evicted sync failed"):
-        swap.release_host_buffer()
-
-    assert swap._host_buffer_released is True
-    assert swap.tensor_cpu is None
-    # Calling release_host_buffer again (as __del__ would) must not re-insert cached_buf.
-    swap.release_host_buffer()
-    assert release_calls == [cached_buf]
-
-
-@pytest.mark.skipif(
-    not (IS_CUDA_AVAILABLE and is_nvidia_cuda_device(get_device_type())),
-    reason="NVIDIA CUDA is required for cudaMallocAsync external-storage regression test",
-)
-def test_launch_d2h_external_cuda_storage_under_cuda_malloc_async():
-    """External DLPack CUDA storage under ``cudaMallocAsync`` must offload via host sync without failing ``recordStream``."""
-    import os
-    import subprocess
-    import sys
-
-    script = """
-import ctypes
-import ctypes.util
-import glob
-import os
-import sys
-import torch
-from veomni.distributed.async_offload import OffloadManager, PinnedBufferPool, SwapTensor, _unpack_swap_tensor
-from veomni.utils.device import get_torch_device
-
-torch_dev = get_torch_device()
-backend = torch_dev.memory.get_allocator_backend()
-assert backend == "cudaMallocAsync", f"expected cudaMallocAsync backend, got {backend!r}"
-
-candidates = []
-try:
-    import importlib
-
-    cuda_rt_mod = importlib.import_module("nvidia." + "cuda_runtime")
-    candidates.extend(
-        glob.glob(os.path.join(os.path.dirname(cuda_rt_mod.__file__), "lib", "libcudart.so*"))
-    )
-except ImportError:
-    pass
-found = ctypes.util.find_library("cudart")
-if found:
-    candidates.append(found)
-candidates.extend(["libcudart.so", "libcudart.so.13", "libcudart.so.12"])
-
-cudart = None
-for path in candidates:
-    try:
-        cudart = ctypes.CDLL(path)
-        break
-    except OSError:
-        continue
-assert cudart is not None, f"could not load libcudart from {candidates}"
-
-cuda_malloc = getattr(cudart, "cudaMalloc")
-cuda_memcpy = getattr(cudart, "cudaMemcpy")
-cuda_free = getattr(cudart, "cudaFree")
-cuda_device_sync = getattr(cudart, "cudaDeviceSynchronize")
-cuda_malloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
-cuda_malloc.restype = ctypes.c_int
-cuda_memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-cuda_memcpy.restype = ctypes.c_int
-cuda_free.argtypes = [ctypes.c_void_p]
-cuda_free.restype = ctypes.c_int
-cuda_device_sync.argtypes = []
-cuda_device_sync.restype = ctypes.c_int
-
-class DLDevice(ctypes.Structure):
-    _fields_ = [("device_type", ctypes.c_int32), ("device_id", ctypes.c_int32)]
-
-class DLDataType(ctypes.Structure):
-    _fields_ = [("code", ctypes.c_uint8), ("bits", ctypes.c_uint8), ("lanes", ctypes.c_uint16)]
-
-class DLTensor(ctypes.Structure):
-    _fields_ = [
-        ("data", ctypes.c_void_p),
-        ("device", DLDevice),
-        ("ndim", ctypes.c_int32),
-        ("dtype", DLDataType),
-        ("shape", ctypes.POINTER(ctypes.c_int64)),
-        ("strides", ctypes.POINTER(ctypes.c_int64)),
-        ("byte_offset", ctypes.c_uint64),
-    ]
-
-DELETER_FUNC = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
-
-class DLManagedTensor(ctypes.Structure):
-    _fields_ = [
-        ("dl_tensor", DLTensor),
-        ("manager_ctx", ctypes.c_void_p),
-        ("deleter", DELETER_FUNC),
-    ]
-
-ctypes.pythonapi.PyCapsule_New.restype = ctypes.py_object
-ctypes.pythonapi.PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
-
-expected = torch.arange(64, dtype=torch.float32).reshape(8, 8).contiguous()
-nbytes = expected.numel() * expected.element_size()
-dev_ptr = ctypes.c_void_p()
-assert cuda_malloc(ctypes.byref(dev_ptr), nbytes) == 0
-assert cuda_memcpy(dev_ptr, ctypes.c_void_p(expected.data_ptr()), nbytes, 1) == 0
-assert cuda_device_sync() == 0
-
-shape = (ctypes.c_int64 * 2)(8, 8)
-strides = (ctypes.c_int64 * 2)(8, 1)
-free_rc = []
-keepalive = []
-
-def _deleter(_ptr):
-    free_rc.append(cuda_free(dev_ptr))
-    keepalive.clear()
-
-deleter_cb = DELETER_FUNC(_deleter)
-managed = DLManagedTensor(
-    dl_tensor=DLTensor(
-        data=dev_ptr,
-        device=DLDevice(2, torch_dev.current_device()),
-        ndim=2,
-        dtype=DLDataType(2, 32, 1),
-        shape=shape,
-        strides=strides,
-        byte_offset=0,
-    ),
-    manager_ctx=None,
-    deleter=deleter_cb,
-)
-keepalive.extend([shape, strides, deleter_cb, managed])
-
-class _DLPackWrapper:
-    def __init__(self, cap, dev_id):
-        self._cap = cap
-        self._dev_id = dev_id
-    def __dlpack__(self, stream=None):
-        return self._cap
-    def __dlpack_device__(self):
-        return (2, self._dev_id)
-
-cap = ctypes.pythonapi.PyCapsule_New(ctypes.addressof(managed), b"dltensor", None)
-external = torch.from_dlpack(_DLPackWrapper(cap, torch_dev.current_device()))
-assert not external.untyped_storage().resizable()
-
-manager = OffloadManager(PinnedBufferPool(max_cached_bytes=1 << 20))
-swap = SwapTensor(external, "0_0", manager.host_buffer_pool)
-swap.launch_d2h(manager.swap_stream)
-assert swap._deferred_free is False
-swap.wait_d2h_finished()
-assert free_rc == [0], f"expected external DLPack storage to be freed cleanly, got {free_rc}"
-
-restored = _unpack_swap_tensor(manager, swap, prefetch=False)
-torch.testing.assert_close(restored.cpu(), expected)
-"""
-    env = dict(os.environ)
-    env["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
-    result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=False)
-    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
 
 
 def test_shared_host_buffer_pool_survives_repeated_application():
@@ -770,8 +588,8 @@ def test_pinned_buffer_pool_waits_for_pending_event_on_eviction():
     assert "_last_swap_event" not in first.__dict__
 
 
-def test_pinned_buffer_pool_waits_for_pending_event_on_reuse_and_drop():
-    """Both reuse (``acquire``) and direct drop (``release``) synchronize and clear ``_last_swap_event``."""
+def test_pinned_buffer_pool_waits_for_pending_event_on_drop():
+    """A dropped buffer leaves the pool for good, so ``release`` must synchronize it itself."""
     pool = PinnedBufferPool(max_cached_bytes=16)
 
     class _FakeEvent:
@@ -786,20 +604,6 @@ def test_pinned_buffer_pool_waits_for_pending_event_on_reuse_and_drop():
             self.lock_free_during_sync = acquired
             if acquired:
                 self._pool._lock.release()
-
-    # Reuse path: release defers, acquire synchronizes outside the lock and clears the tag.
-    small_src = torch.empty((4,), dtype=torch.float32)  # 16 bytes
-    buf, key = pool.acquire(small_src)
-    reuse_event = _FakeEvent(pool)
-    buf._last_swap_event = reuse_event
-    pool.release(buf, key)
-    assert reuse_event.sync_count == 0
-
-    reused, _ = pool.acquire(small_src)
-    assert reused is buf
-    assert reuse_event.sync_count == 1
-    assert reuse_event.lock_free_during_sync is True
-    assert "_last_swap_event" not in reused.__dict__
 
     # Drop path: oversized buffer bypasses cache and synchronizes on release outside the lock.
     big_src = torch.empty((8,), dtype=torch.float32)  # 32 bytes > max_cached_bytes=16

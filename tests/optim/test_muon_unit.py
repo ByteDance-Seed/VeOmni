@@ -1341,33 +1341,24 @@ def test_moe_local_3d_newton_schulz_handles_a_tall_expert_stack():
     torch.testing.assert_close(_chunked_newton_schulz(local, _ns), _ns(local))
 
 
-def test_moe_local_3d_newton_schulz_output_keeps_the_input_dtype():
-    """The preallocated stack must not widen or narrow the update."""
+def test_moe_local_3d_newton_schulz_preserves_dtype_and_short_circuits():
+    """The preallocated stack must not widen the update, and small stacks skip chunking."""
     from veomni.optim.muon import _chunked_newton_schulz
 
     for dtype in (torch.bfloat16, torch.float32):
         local = torch.randn(5, 4, 6, dtype=dtype)
-
-        def _ns(x, dtype=dtype):
-            return torch.zeros_like(x)
-
-        out = _chunked_newton_schulz(local, _ns)
+        out = _chunked_newton_schulz(local, torch.zeros_like)
         assert out.dtype == dtype
         assert out.shape == local.shape
 
-
-def test_moe_local_3d_newton_schulz_skips_chunking_below_the_threshold():
-    from veomni.optim.muon import _chunked_newton_schulz
-
-    local = torch.randn(3, 4, 4)
+    small = torch.randn(3, 4, 4)
     calls = []
 
-    def _ns(x):
+    def _recording(x):
         calls.append(tuple(x.shape))
         return x
 
-    _chunked_newton_schulz(local, _ns)
-
+    _chunked_newton_schulz(small, _recording)
     assert calls == [(3, 4, 4)]
 
 
