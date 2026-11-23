@@ -19,6 +19,7 @@ from transformers.modeling_outputs import ModelOutput
 
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
+from veomni.ops.layout.confusion_transpose import confusion_transpose
 
 from .....distributed.parallel_state import get_parallel_state
 from .....distributed.sequence_parallel import (
@@ -28,14 +29,7 @@ from .....distributed.sequence_parallel import (
     slice_input_tensor,
 )
 from .....utils import logging
-from .....utils.device import IS_NPU_AVAILABLE, get_device_type
 from .configuration_wan_transformer import WanTransformer3DModelConfig
-
-
-try:
-    import torch_npu
-except ImportError:
-    torch_npu = None
 
 
 logger = logging.get_logger(__name__)
@@ -76,20 +70,18 @@ def _get_wan_full_sequence_varlen_kwargs(
     batch_size = query.shape[0]
     query_length = query.shape[1] if query_length is None else query_length
     key_length = key.shape[1] if key_length is None else key_length
-    _q_device = "cpu" if get_device_type() == "npu" else query.device
-    _k_device = "cpu" if get_device_type() == "npu" else key.device
     cu_seq_lens_q = torch.arange(
         0,
         (batch_size + 1) * query_length,
         query_length,
-        device=_q_device,
+        device=query.device,
         dtype=torch.int32,
     )
     cu_seq_lens_k = torch.arange(
         0,
         (batch_size + 1) * key_length,
         key_length,
-        device=_k_device,
+        device=key.device,
         dtype=torch.int32,
     )
     return {
@@ -140,7 +132,11 @@ class WanSPAttnProcessor(WanAttnProcessor):
 
     def __init__(self, config=None):
         impl = config.ops_config.attn_implementation if config is not None else "veomni_sdpa"
+        rms_impl = config.ops_config.rms_norm_implementation if config is not None else "eager"
+        rope_impl = config.ops_config.rotary_pos_emb_implementation if config is not None else "eager"
         self.veomni_attn = VeomniOp("attention", "standard", impl)
+        self.veomni_rms_norm = VeomniOp("rms_norm", "standard", rms_impl)
+        self.veomni_rope = VeomniOp("rope", "wan", rope_impl)
         self._use_flash = impl in _WAN_FLASH_IMPLS
         self.config = SimpleNamespace(_attn_implementation=impl)
         super().__init__()
@@ -194,12 +190,8 @@ class WanSPAttnProcessor(WanAttnProcessor):
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
         query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
 
-        if IS_NPU_AVAILABLE and torch_npu is not None and query.device.type == "npu":
-            query = torch_npu.npu_rms_norm(query, attn.norm_q.weight, epsilon=attn.norm_q.eps)[0]
-            key = torch_npu.npu_rms_norm(key, attn.norm_k.weight, epsilon=attn.norm_k.eps)[0]
-        else:
-            query = attn.norm_q(query)
-            key = attn.norm_k(key)
+        query = self.veomni_rms_norm(query, attn.norm_q.weight, eps=attn.norm_q.eps)
+        key = self.veomni_rms_norm(key, attn.norm_k.weight, eps=attn.norm_k.eps)
 
         query = query.unflatten(2, (attn.heads, -1))
         key = key.unflatten(2, (attn.heads, -1))
@@ -223,38 +215,9 @@ class WanSPAttnProcessor(WanAttnProcessor):
             query, key, value = (tensor[:, :sequence_length] for tensor in (query, key, value))
 
         if rotary_emb is not None:
-
-            def apply_rotary_emb(
-                hidden_states: torch.Tensor,
-                freqs_cos: torch.Tensor,
-                freqs_sin: torch.Tensor,
-            ):
-                x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-                cos = freqs_cos[..., 0::2]
-                sin = freqs_sin[..., 1::2]
-                out = torch.empty_like(hidden_states)
-                out[..., 0::2] = x1 * cos - x2 * sin
-                out[..., 1::2] = x1 * sin + x2 * cos
-                return out.type_as(hidden_states)
-
-            def apply_rotary_emb_npu(
-                hidden_states: torch.Tensor,
-                freqs_cos: torch.Tensor,
-                freqs_sin: torch.Tensor,
-            ):
-                cos = freqs_cos[..., 0::2].to(torch.float32).repeat_interleave(2, dim=-1).contiguous()
-                sin = freqs_sin[..., 1::2].to(torch.float32).repeat_interleave(2, dim=-1).contiguous()
-                x_float = hidden_states.to(torch.float32)
-                x_out = torch_npu.npu_rotary_mul(x_float, cos, sin, rotary_mode="interleave")
-                return x_out.to(hidden_states.dtype)
-
-            _apply_rope = (
-                apply_rotary_emb_npu
-                if IS_NPU_AVAILABLE and torch_npu is not None and query.device.type == "npu"
-                else apply_rotary_emb
-            )
-            query = _apply_rope(query, *rotary_emb)
-            key = _apply_rope(key, *rotary_emb)
+            head_dim = query.shape[-1]
+            query = self.veomni_rope(query, rotary_emb, head_dim=head_dim).reshape(query.shape)
+            key = self.veomni_rope(key, rotary_emb, head_dim=head_dim).reshape(key.shape)
 
         if self._use_flash:
             _assert_wan_flash_attention_bf16(query, key, value, attn)
@@ -373,12 +336,7 @@ def WanTransformer3DModel_forward(
     rotary_emb = self.rope(hidden_states)
     # 2. Patch embedding: (B, C, F, H, W) → (B, seq, inner_dim)
     hidden_states = self.patch_embedding(hidden_states)
-    if IS_NPU_AVAILABLE and torch_npu is not None and hidden_states.device.type == "npu":
-        B, C = hidden_states.shape[:2]
-        S = hidden_states.shape[2:].numel()
-        hidden_states = torch_npu.npu_confusion_transpose(hidden_states, [0, 2, 1], [B, C, S], transpose_first=False)
-    else:
-        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+    hidden_states = confusion_transpose(hidden_states)
 
     # 3. Condition embedding
     if timestep.ndim == 2:

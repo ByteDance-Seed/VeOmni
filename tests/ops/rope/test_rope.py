@@ -950,6 +950,31 @@ def test_wan_eager_matches_reference():
     assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
 
 
+@pytest.mark.parametrize("seqlen", (1, 16))
+def test_wan_eager_real_pair_matches_complex_reference(seqlen: int):
+    torch.manual_seed(0)
+    head_dim = 64
+    heads = 4
+    x = torch.randn(2, seqlen, heads, head_dim, dtype=torch.float32, requires_grad=True)
+    angle = torch.randn(seqlen, 1, head_dim // 2, dtype=torch.float64)
+    freqs = torch.polar(torch.ones_like(angle), angle)
+    freqs_cos = freqs.real.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+    freqs_sin = freqs.imag.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+
+    x_h = x.detach().reshape(2, seqlen, heads * head_dim).requires_grad_(True)
+    out_h = _wan_reference_rope_apply(x_h, freqs, head_dim)
+
+    x_e = x.detach().requires_grad_(True)
+    out_e = resolve_op("rope", "wan", "eager").wrapper(x_e, (freqs_cos, freqs_sin), head_dim=head_dim)
+    assert out_e.shape == (2, seqlen, heads * head_dim)
+    assert torch.allclose(out_e, out_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    go = torch.randn_like(out_e)
+    out_h.backward(go)
+    out_e.backward(go)
+    assert torch.allclose(x_e.grad.reshape_as(x_h.grad), x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
 @pytest.mark.parametrize(
     ("seqlen", "head_dim"),
     (
@@ -982,6 +1007,29 @@ def test_wan_triton_preserves_singleton_frequency_axes(monkeypatch, seqlen: int,
     torch.testing.assert_close(grad_x, grad_output)
     assert grad_freqs is None
     assert conjugate_calls == [False, True]
+
+
+def test_wan_triton_real_pair_preserves_sequence_axis(monkeypatch):
+    from veomni.ops.kernels.rope.wan import triton as wan_triton
+
+    seqlen = 1
+    head_dim = 8
+    seen: list[tuple[int, ...]] = []
+
+    def record_launch(shaped: Tensor, cos: Tensor, sin: Tensor, *, conjugate: bool = False) -> Tensor:
+        seen.append(tuple(cos.shape))
+        assert sin.shape == cos.shape
+        return shaped
+
+    monkeypatch.setattr(wan_triton, "apply_rotary_interleaved", record_launch)
+    x = torch.randn(2, seqlen, 4 * head_dim)
+    angle = torch.randn(seqlen, 1, head_dim // 2, dtype=torch.float64)
+    freqs = torch.polar(torch.ones_like(angle), angle)
+    freqs_cos = freqs.real.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+    freqs_sin = freqs.imag.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+
+    wan_triton.forward(x, (freqs_cos, freqs_sin), head_dim=head_dim)
+    assert seen == [(seqlen, head_dim // 2)]
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="Wan Triton RoPE needs a GPU")

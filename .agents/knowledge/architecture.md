@@ -75,6 +75,7 @@ veomni/
 │   ├── platform/       GPU/NPU/MLU availability requirements
 │   ├── install.py      Idempotent process-wide attention integration
 │   ├── batch_invariant/  Scoped deterministic ATen patch
+│   ├── layout/         Tensor layout helpers outside the op registry
 │   ├── qat/            Fake-quantization primitives called by the qat rows
 │   │                   (DeepSeek-V4 FP8/FP4 TileLang)
 │   └── kernels/        Registered per-op/variant eager and optimized rows

@@ -18,6 +18,7 @@ veomni/ops/
 ├── config.py            Installed op-selection config read during model construction
 ├── install.py           Idempotent process-wide attention integration
 ├── batch_invariant/     Opt-in ATen patch; not a registered op family
+├── layout/              Tensor layout helpers; not a registered op family
 └── kernels/             Tensor-level implementations and registrations
 ```
 
@@ -300,7 +301,8 @@ implementations. It is skipped when `MODELING_BACKEND=hf`.
 
 `batch_invariant/` is deliberately separate from `kernels/`: it temporarily
 patches ATen implementations through `set_batch_invariant_mode(...)` and is not
-selected through `VeomniOp`.
+selected through `VeomniOp`. `layout/` is separate for the same reason.
+`confusion_transpose` follows the tensor device and is not a `VeomniOp` row.
 
 ## Tests and further documentation
 
