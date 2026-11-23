@@ -336,7 +336,7 @@ def WanTransformer3DModel_forward(
     rotary_emb = self.rope(hidden_states)
     # 2. Patch embedding: (B, C, F, H, W) → (B, seq, inner_dim)
     hidden_states = self.patch_embedding(hidden_states)
-    hidden_states = confusion_transpose(hidden_states)
+    hidden_states = confusion_transpose(hidden_states, flatten_dim=2, transpose_dims=(1, 2))
 
     # 3. Condition embedding
     if timestep.ndim == 2:

@@ -17,12 +17,35 @@
 import pytest
 import torch
 
-from veomni.ops.layout.confusion_transpose import confusion_transpose
+from veomni.ops.layout.confusion_transpose import _confusion_transpose_args, confusion_transpose
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 def _npu_ready() -> bool:
     return bool(IS_NPU_AVAILABLE and torch.npu.is_available())
+
+
+@pytest.mark.parametrize(
+    ("shape", "flatten_dim", "transpose_dims", "perm"),
+    [
+        ((2, 3, 2, 4, 5), 2, (1, 2), [0, 2, 1]),
+        ((2, 3, 4, 5), 1, (0, 1), [1, 0]),
+        ((2, 3, 2, 4, 5), 3, (1, 3), [0, 3, 2, 1]),
+        ((2, 3, 4), -1, (0, -1), [2, 1, 0]),
+    ],
+)
+def test_confusion_transpose_layout_follows_flatten_and_transpose(shape, flatten_dim, transpose_dims, perm):
+    hidden = torch.randn(*shape)
+    actual = confusion_transpose(hidden, flatten_dim=flatten_dim, transpose_dims=transpose_dims)
+    dim0, dim1 = transpose_dims
+    expected = hidden.flatten(flatten_dim).transpose(dim0, dim1)
+    torch.testing.assert_close(actual, expected)
+
+    derived_perm, derived_shape = _confusion_transpose_args(hidden.shape, flatten_dim, transpose_dims)
+    assert derived_perm == perm
+    assert derived_shape == list(hidden.flatten(flatten_dim).shape)
+    reshaped = hidden.reshape(derived_shape).permute(derived_perm)
+    torch.testing.assert_close(reshaped, expected)
 
 
 def test_confusion_transpose_matches_flatten_on_cpu(monkeypatch):
