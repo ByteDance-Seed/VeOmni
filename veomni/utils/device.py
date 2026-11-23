@@ -87,16 +87,11 @@ def get_device_id() -> int:
 def is_caching_allocator_active() -> bool:
     """Whether ``record_stream`` can defer the free of an accelerator allocation.
 
-    Callers check this before relying on ``record_stream`` instead of a host-side
-    event synchronize. The native CUDA caching allocator is the only backend whose
-    ``record_stream`` keeps a block alive until the recording stream reaches it.
-    Every other backend returns False here, so the caller keeps the synchronize:
-
-    * NPU / MLU have their own allocators with no equivalent guarantee.
-    * The async backend has its own ``record_stream``, without the per-block
-      stream-use list the native one keeps, so it cannot defer a free.
-    * ``PYTORCH_NO_CUDA_MEMORY_CACHING`` bypasses the caching allocator entirely,
-      which makes ``record_stream`` a no-op and the free immediate.
+    Only the native CUDA caching allocator keeps a block alive until the recording
+    stream reaches it. Every other backend returns False so the caller keeps its
+    host synchronize: NPU / MLU allocators, the async backend (its
+    ``record_stream`` keeps no per-block stream-use list), and
+    ``PYTORCH_NO_CUDA_MEMORY_CACHING`` (which makes ``record_stream`` a no-op).
     """
     if get_device_type() != "cuda":
         return False

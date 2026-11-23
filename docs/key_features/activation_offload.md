@@ -267,22 +267,18 @@ lifecycle across GPU and CPU:
 1. **Creation:** A pinned CPU buffer (`tensor_cpu`) is allocated matching the tensor's
    shape and dtype.
 2. **D2H (launch_d2h):** On the swap stream, copy GPU tensor to pinned CPU buffer
-   (non-blocking), calling `record_stream` on that stream only when
-   `_deferred_free_supported(self.tensor)` confirms the native caching allocator
-   owns the storage (so allocators such as `cudaMallocAsync` never receive
-   `record_stream` for external pointers). Record a `d2h_event` and store it on the
-   host buffer as `_last_swap_event`.
+   (non-blocking). `record_stream` is called only when `_deferred_free_supported()`
+   confirms the native caching allocator owns the storage, so other backends never
+   see it for external pointers. Record a `d2h_event` and store it on the host
+   buffer as `_last_swap_event`.
 3. **Wait D2H (wait_d2h_finished):** Detach the GPU storage by binding the tensor to
    fresh empty storage. With CUDA's **native** caching allocator this does **not**
-   host-synchronize: the `record_stream` above already keeps the source storage
-   alive, so the copy is ordered by the stream rather than by a blocking event wait.
-   Every other case keeps the event synchronize, because `record_stream` cannot defer
-   a free there: NPU and MLU allocators, CUDA's async allocator,
-   `PYTORCH_NO_CUDA_MEMORY_CACHING`, tensors over foreign storage
-   (`torch.from_numpy`, `from_dlpack`, `frombuffer` — those storages report
-   `resizable() == False`), and copy-on-write tensors (`torch._lazy_clone`, whose
-   deleter wraps the underlying storage). `veomni.utils.device.is_caching_allocator_active()`
-   answers the allocator half of that question, and it is deliberately conservative.
+   host-synchronize: `record_stream` already keeps the source storage alive, so the
+   copy is ordered by the stream. Every other case keeps the event synchronize,
+   because `record_stream` cannot defer a free there: NPU and MLU allocators, CUDA's
+   async allocator, `PYTORCH_NO_CUDA_MEMORY_CACHING`, foreign storage
+   (`from_numpy` / `from_dlpack` / `frombuffer`) and copy-on-write tensors
+   (`torch._lazy_clone`).
 4. **H2D (launch_h2d):** On the swap stream, allocate new device storage with the
    saved size/stride, copy from the pinned CPU buffer (non-blocking), and bind
    the tensor to that restored storage. Record an `h2d_event`, also stored on the
@@ -291,12 +287,9 @@ lifecycle across GPU and CPU:
 
 State transitions: `device` → (D2H) → `host` → (H2D) → `device`
 
-The `_last_swap_event` tag is what lets the host pool stay asynchronous: handing a
-buffer to a new owner waits on that buffer's own last transfer, and so does the
-moment a buffer is dropped or evicted — the only two points where the pool has to
-care. Both run outside the pool lock, so one manager's in-flight transfer does not
-serialize another manager's release, and the tag is popped when it is waited on so
-a completed event is not retained.
+The `_last_swap_event` tag is what lets the host pool stay asynchronous: a buffer is
+waited on only when handed to a new owner or when dropped or evicted. Both waits run
+outside the pool lock, and the tag is popped so a completed event is not retained.
 
 #### OffloadManager Ownership
 

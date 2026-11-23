@@ -112,11 +112,9 @@ class PinnedBufferPool:
     def acquire(self, tensor):
         """Return a host buffer matching ``tensor``'s layout, waiting for its last transfer.
 
-        A buffer handed back by :meth:`release` may still be the destination of a
-        D2H copy, or the source of an H2D one, because ``release`` deliberately
-        does not block. The wait therefore belongs here -- the one path that hands
-        a buffer to a new owner -- and runs outside the lock so a slow transfer on
-        one manager's stream cannot serialize another manager's acquire.
+        ``release`` does not block, so a pooled buffer may still be a D2H
+        destination or an H2D source. The wait belongs here and runs outside the
+        lock, so one manager's slow transfer cannot serialize another's acquire.
         """
         key = self._key(tensor)
         with self._lock:
@@ -161,14 +159,11 @@ class PinnedBufferPool:
         return buffer, key
 
     def release(self, buffer, key):
-        """Return a host buffer to the pool, without waiting for its last transfer.
+        """Return a host buffer to the pool without waiting, except on drop/eviction.
 
-        The wait is deferred to :meth:`acquire` for the reuse path and performed
-        here only for a buffer that leaves the pool for good (a drop or an
-        eviction), because those two cannot be waited on later. Both happen outside
-        the lock, so one manager's in-flight transfer does not hold up another's
-        release; the counters stay inside it, since the pool is shared and
-        ``release`` can run on any thread that drops a :class:`SwapTensor`.
+        Reuse is covered by :meth:`acquire`. A dropped or evicted buffer leaves the
+        pool for good, so its wait happens here. Both waits run outside the lock;
+        the counters stay inside it, since ``release`` can run on any thread.
         """
         if buffer is None:
             return
@@ -201,11 +196,9 @@ class PinnedBufferPool:
 
     @staticmethod
     def _wait_for_last_swap(buffer) -> None:
-        """Wait for the transfer that last wrote or read ``buffer``, then forget it.
+        """Wait for the transfer that last touched ``buffer``, then forget its event.
 
-        The tag is attached by :class:`SwapTensor` on every D2H and H2D copy. It
-        is popped rather than kept so a long-idle buffer does not pin a completed
-        event, and released outside the pool lock by every caller.
+        Popped rather than kept so an idle buffer does not pin a completed event.
         """
         event = buffer.__dict__.pop("_last_swap_event", None)
         if event is not None:
@@ -261,18 +254,10 @@ _is_cow_tensor = getattr(torch._C, "_is_cow_tensor", None)
 def _deferred_free_supported(tensor=None) -> bool:
     """Whether ``record_stream`` can keep ``tensor``'s storage alive, as this path assumes.
 
-    Delegates to :func:`~veomni.utils.device.is_caching_allocator_active` for the
-    allocator question, and additionally requires the storage to belong directly
-    to that allocator:
-    - A tensor built over foreign memory (``torch.from_numpy``, ``from_dlpack``,
-      ``frombuffer``) carries a deleter the allocator does not recognise, so
-      ``record_stream`` returns without doing anything and the memory can be
-      released the moment ``set_`` drops the last reference. Those storages report
-      ``resizable() == False``.
-    - A copy-on-write tensor (``torch._lazy_clone``) keeps ``resizable() == True``
-      while wrapping the pointer in PyTorch's COW deleter instead of the native
-      caching allocator's deleter; reject it via ``torch._C._is_cow_tensor`` so it
-      takes the host-synchronize path.
+    Besides the allocator check, the storage must belong to that allocator:
+    foreign storage (``from_numpy`` / ``from_dlpack`` / ``frombuffer``) and
+    copy-on-write storage (``torch._lazy_clone``) carry deleters ``record_stream``
+    ignores, so detaching would free memory an in-flight copy is reading.
     """
     if not is_caching_allocator_active():
         return False
@@ -306,14 +291,9 @@ class SwapTensor:
     def release_host_buffer(self):
         """Hand the host buffer back to the pool, ordering any unguarded D2H source.
 
-        Never waits on the native deferred-free path: a buffer that may still be
-        the destination of a D2H copy or source of an H2D copy is tagged with that
-        copy's event, and :class:`PinnedBufferPool` waits on the tag when it hands
-        the buffer to a new owner or drops/evicts it. When ``launch_d2h`` skipped
-        ``record_stream`` (``not self._deferred_free``) and the wrapper is torn
-        down while still in ``"d2h"`` (e.g. an abandoned forward graph), we
-        synchronize ``d2h_event`` here before the device tensor's last reference
-        drops so the in-flight copy cannot read freed device memory.
+        On the deferred path the pool's event tag covers reuse. When
+        ``launch_d2h`` skipped ``record_stream`` and the wrapper is torn down
+        mid-D2H, nothing else keeps the source alive, so it is synchronized here.
         """
         if self._host_buffer_released or self.tensor_cpu is None:
             return
@@ -336,11 +316,9 @@ class SwapTensor:
     def launch_d2h(self, stream):
         """Queue the GPU-to-host copy of ``self.tensor`` on ``stream``.
 
-        ``record_stream`` is called only when :func:`_deferred_free_supported`
-        confirms the allocator and storage support deferred freeing; other
-        allocators (such as ``cudaMallocAsync`` over foreign DLPack memory) can
-        reject ``record_stream`` on external pointers and instead rely on the
-        host synchronize in :meth:`wait_d2h_finished`.
+        ``record_stream`` is issued only where the allocator can defer the free;
+        other backends (e.g. ``cudaMallocAsync`` over foreign memory) reject it and
+        rely on the host synchronize in :meth:`wait_d2h_finished`.
         """
         if self.stat != "device":
             return
@@ -361,17 +339,14 @@ class SwapTensor:
     def wait_d2h_finished(self):
         """Detach the offloaded GPU storage once the D2H copy is ordered or complete.
 
-        See :func:`_deferred_free_supported`: the host wait is skipped only where
-        :meth:`launch_d2h` recorded the swap stream on storage whose allocator
-        defers the free.
+        The host wait is skipped only where :meth:`launch_d2h` recorded the swap
+        stream on storage whose allocator defers the free.
         """
         if self.stat != "d2h":
             return
         if not self._deferred_free:
-            # No allocator hook to keep the source storage alive -- either the
-            # allocator is not the native caching one, or the storage is foreign
-            # (a DLPack / from_numpy view or COW storage) -- so the copy must be
-            # host-complete before the storage is detached.
+            # Nothing keeps the source alive, so the copy must be host-complete
+            # before the storage is detached.
             self.d2h_event.synchronize()
         # Point this tensor at a fresh empty storage instead of resize_(0).
         # resize_ would free a StorageImpl that a Tensor.set_() alias can still

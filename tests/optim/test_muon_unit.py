@@ -613,16 +613,10 @@ class TestGramNewtonSchulz:
     def test_resume_keeps_the_configured_expert_ns_budget(self, use_dcp):
         """The chunking switch must not be resumable state, on either restore path.
 
-        It is a constructor-level switch, so a checkpoint must neither require it
-        nor override it. Both directions are checked because each fails differently:
-
-        * a checkpoint written while chunking was off has no such key, and torch's
-          DCP unflatten indexes the checkpoint by the *current* group keys, so
-          restoring it into an instance configured with a budget raised
-          ``KeyError``;
-        * a checkpoint that did carry a budget would overwrite the one this run
-          configured, so a job asking for a tighter workspace could resume with the
-          old, larger value and OOM again.
+        Both directions fail differently: a keyless checkpoint makes torch's DCP
+        unflatten raise ``KeyError`` if the live group declares the key, and a
+        checkpoint carrying a value would overwrite this run's, so a job lowering
+        the budget to fit could resume with the old larger one and OOM.
         """
         import torch.nn as nn
 
@@ -1350,14 +1344,11 @@ class TestGramQuackFallback:
 
 
 def test_moe_expert_ns_chunk_sizes_schedule():
-    """The slicer produces a valid, balanced, minimal-call schedule for any budget.
+    """The slicer must produce a valid, balanced, minimal-call schedule for any budget.
 
-    One concern: what ``_expert_ns_chunk_sizes`` returns. The invariants are
-    (a) every expert is covered exactly once, (b) no call exceeds the workspace
-    budget, (c) the spread stays within one expert so no call degenerates into a
-    single-expert ``bmm``, and (d) the call count is the fewest the budget allows.
-    ``-1`` (the default) means "chunking off" and must reproduce the pre-chunking
-    one-call shape.
+    Invariants: every expert covered once, no call over budget, spread within one
+    expert (so no single-expert ``bmm``), and the fewest calls the budget allows.
+    ``-1`` (the default) means "off" and must reproduce the one-call shape.
     """
     from veomni.optim.muon import _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS, _expert_ns_chunk_sizes
 
@@ -1396,13 +1387,9 @@ def test_moe_expert_ns_chunk_sizes_schedule():
 def test_moe_expert_ns_chunking_handles_an_empty_local_shard():
     """A non-owner rank's FSDP shard of a 3D param is empty and must not divide by zero.
 
-    One concern: the end-to-end shape of the empty-shard case, not just the
-    slicer. Wan's ``[1, 6, dim]`` modulation parameters leave non-owner ranks
-    holding ``[0, 6, dim]``; those are Muon-eligible DTensors that
-    ``_classify_param`` routes to the local-3D path, where a naive ``divmod`` on
-    zero would raise ``ZeroDivisionError`` inside the optimizer step. The DTensor
-    is real (single-process gloo mesh), so the classification and the dispatch are
-    both exercised rather than stubbed.
+    Wan's ``[1, 6, dim]`` modulation parameters leave non-owner ranks holding
+    ``[0, 6, dim]``; those are Muon-eligible and reach this path. The DTensor is
+    real (single-process gloo mesh), so classification and dispatch both run.
     """
     import tempfile
 
@@ -1451,13 +1438,11 @@ def test_moe_expert_ns_chunking_handles_an_empty_local_shard():
     ],
 )
 def test_moe_expert_ns_chunking_matches_a_whole_stack_call(experts, rows, cols):
-    """Chunking must be numerically identical to one whole-stack call, and must actually chunk.
+    """Chunking must match one whole-stack call numerically, and must actually chunk.
 
-    One concern: the chunked path changes only the workspace. Both Gram-NS shape
-    branches are covered because slicing dim 0 is branch-agnostic while the
-    trailing-matrix math is not. The recorded shapes also pin that the helper
-    really split the stack -- a silent regression to a single whole-stack call
-    would otherwise still pass an equivalence check.
+    Both Gram-NS branches are covered: slicing dim 0 is branch-agnostic but the
+    trailing-matrix math is not. The recorded shapes also fail a silent regression
+    to a single whole-stack call, which equivalence alone would not catch.
     """
     from veomni.optim.muon import _chunked_newton_schulz, _expert_ns_chunk_sizes
 
@@ -1489,11 +1474,8 @@ def test_moe_expert_ns_chunking_matches_a_whole_stack_call(experts, rows, cols):
 def test_moe_expert_ns_chunking_preserves_dtype_and_short_circuits():
     """The preallocated output must keep the update's dtype and skip work when unchunked.
 
-    One concern: the two things the preallocated-stack implementation could get
-    wrong besides numerics. Widening the output silently promotes the update and
-    breaks the later ``_apply_ortho``; a stack that fits in one slice -- and every
-    stack when chunking is off (the default) -- must not pay a useless
-    ``empty_like`` copy.
+    Widening the output would silently promote the update and break
+    ``_apply_ortho``; an unchunked call must not pay a useless ``empty_like`` copy.
     """
     from veomni.optim.muon import _chunked_newton_schulz
 
@@ -1528,11 +1510,8 @@ def test_moe_expert_ns_chunking_preserves_dtype_and_short_circuits():
 def test_moe_expert_ns_chunking_matches_whole_stack_on_accelerator(monkeypatch):
     """The chunked NS path must agree with a whole-stack call on a real accelerator.
 
-    One concern: the CPU tests prove the slicing arithmetic; this proves the
-    device kernels tolerate it. Both configured Gram backends run on a
-    rectangular stack whose Gram matrices are big enough to hit the same kernels
-    production uses, and ``gram_quack`` asserts it did not silently fall back on
-    Hopper-class hardware.
+    The CPU tests prove the slicing arithmetic; this proves the device kernels
+    tolerate it, and that ``gram_quack`` did not silently fall back on Hopper.
     """
     import importlib.util
 

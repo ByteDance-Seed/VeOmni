@@ -700,11 +700,9 @@ _KIND_FSDP_GATHER_2D = "fsdp_gather_2d"
 _KIND_MOE_LOCAL_3D = "moe_local_3d"
 _KIND_MOE_GATHER_3D = "moe_gather_3d"
 
-#: Experts per Newton-Schulz call on a 3D local-expert stack. Dim 0 is a pure
-#: batch dim for ``batched_*_newton_schulz``, so a positive value bounds the
-#: workspace at ``value * min(M, K)**2`` instead of ``local_experts * min(M, K)**2``.
-#: ``-1`` (the default) disables chunking: the whole local stack is orthogonalized
-#: in one call, which is the fastest shape and needs the most workspace.
+#: Experts per Newton-Schulz call on a 3D local-expert stack; dim 0 is a pure
+#: batch dim, so a positive value bounds the workspace at ``value * min(M, K)**2``.
+#: ``-1`` (default) disables chunking: one call, fastest, largest workspace.
 _MOE_LOCAL_3D_NS_CHUNK_DISABLED = -1
 _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS = _MOE_LOCAL_3D_NS_CHUNK_DISABLED
 
@@ -712,15 +710,10 @@ _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS = _MOE_LOCAL_3D_NS_CHUNK_DISABLED
 def _expert_ns_chunk_sizes(num_experts: int, max_experts: int = _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS) -> List[int]:
     """Balanced Newton-Schulz chunk sizes for one 3D local-expert pass.
 
-    Uses as few calls as the ``max_experts`` workspace budget allows and keeps the
-    sizes within one of each other, so the remainder never collapses into a
-    single-expert call -- that is a ``bmm`` launch with no batch efficiency, and it
-    is what a fixed chunk size produces whenever ``num_experts % chunk == 1``.
-
-    An empty stack (a non-owner rank's FSDP shard of a 3D parameter) returns no
-    sizes: there is nothing to orthogonalize, and ``divmod`` would divide by zero.
-    ``max_experts <= 0`` (the default ``-1``) disables chunking and yields one
-    whole-stack call.
+    Uses as few calls as ``max_experts`` allows and keeps sizes within one of each
+    other, so the remainder never becomes a single-expert call. An empty stack (a
+    non-owner rank's FSDP shard) returns no sizes rather than dividing by zero.
+    ``max_experts <= 0`` disables chunking and yields one whole-stack call.
     """
     if num_experts <= 0:
         return []
@@ -738,16 +731,14 @@ def _chunked_newton_schulz(
 ) -> Tensor:
     """Run ``ns`` over a 3D expert stack in balanced chunks of at most ``max_experts``.
 
-    Disabled by default (``max_experts < 0``): one call over the whole stack, which
-    is the fastest shape because it amortizes the per-call fp32 normalize/cast and
-    ``bmm`` launches over every expert at once. Enable it only when that stack's NS
-    workspace is what stands between the run and an OOM -- it costs a few percent
-    of step time.
+    Disabled by default: one whole-stack call is fastest because it amortizes the
+    per-call fp32 normalize/cast and ``bmm`` launches over every expert. Enable it
+    only when that stack's NS workspace would otherwise OOM; it costs a few
+    percent of step time.
 
     When enabled, the result is written into one preallocated stack chunk by
-    chunk. Collecting the chunk outputs in a list and ``torch.cat``-ing them would
-    hold a second full stack at peak (the list plus the concatenation), which is
-    the opposite of what the chunking is for.
+    chunk; collecting outputs in a list and ``torch.cat``-ing them would hold a
+    second full stack at peak.
 
     An empty stack (a non-owner rank's shard) returns without calling ``ns``.
     """
@@ -947,12 +938,9 @@ class DistributedMuon(Optimizer):
             "ns_implementation": ns_implementation,
             "gram_ns_reset_iterations": tuple(int(i) for i in gram_ns_reset_iterations),
         }
-        # ``expert_ns_max_experts`` is a constructor-level switch, not resumable
-        # per-group state: it is deliberately NOT in ``defaults``. Keeping it out
-        # of ``param_groups`` means a flattened optimizer state dict never carries
-        # it, so resuming cannot KeyError on a checkpoint written with the other
-        # value, and a resume cannot silently restore the checkpoint's budget over
-        # the one this run configured (which could OOM again).
+        # A constructor-level switch, deliberately not in ``param_groups``: keeping
+        # it out of the optimizer state dict is what lets a resume neither
+        # KeyError on it nor restore the checkpoint's value over this run's.
         self._expert_ns_max_experts = int(expert_ns_max_experts)
         # Only carried when splitting is on: as a default it would add a
         # ``param_groups.<fqn>.head_blocks`` entry to every flattened optimizer
@@ -1039,8 +1027,6 @@ class DistributedMuon(Optimizer):
             ns_implementation = str(group.get("ns_implementation", "gram_quack"))
             gram_ns_reset_iterations = tuple(group.get("gram_ns_reset_iterations", (2,)))
             head_blocks = int(group.get("head_blocks", 1))
-            # Read the constructor switch, not a group key: it is not resumable
-            # state, so a checkpoint must never be able to change it.
             expert_ns_max_experts = self._expert_ns_max_experts
             # Scope settings travel inside ns_kwargs so the all-to-all owner path
             # reads them from one dict.

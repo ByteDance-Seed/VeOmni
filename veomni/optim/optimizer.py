@@ -421,7 +421,7 @@ def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
         # Resolved against the model in _build_muon_with_adamw, not ctor kwargs.
         "head_group_size": int(optimizer_cfg.muon_head_group_size),
         "head_split_modules": tuple(optimizer_cfg.muon_head_split_modules),
-        # NS workspace bound for a local-expert stack (muon_expert_zero_comm path).
+        # NS workspace bound; only meaningful on the muon_expert_zero_comm path.
         "expert_ns_max_experts": int(optimizer_cfg.muon_expert_ns_max_experts),
         # Surface for startup summary only; not a DistributedMuon ctor kwarg.
         "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
