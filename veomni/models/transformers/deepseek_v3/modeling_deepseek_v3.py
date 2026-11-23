@@ -538,6 +538,8 @@ class DeepseekV3DecoderLayer(GradientCheckpointingLayer):
 
 @auto_docstring
 class DeepseekV3PreTrainedModel(PreTrainedModel):
+    # A pure decoder stack: every block is a measured compile target.
+    supports_torch_compile = True
     config: DeepseekV3Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True

@@ -850,6 +850,9 @@ class Qwen3VLPreTrainedModel(PreTrainedModel):
 class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
     config: Qwen3VLVisionConfig
     input_modalities = ("image", "video")
+    # No ``supports_torch_compile``: the tower is not a measured compile target,
+    # and DeepStack injection between its blocks is not block-local. Inheriting
+    # the ``False`` default is what keeps it eager.
     _can_record_outputs = {
         "hidden_states": Qwen3VLVisionBlock,
         "attentions": Qwen3VLVisionAttention,
@@ -1245,6 +1248,9 @@ class Qwen3VLVisionModel(Qwen3VLPreTrainedModel):
 class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
     config: Qwen3VLTextConfig
     input_modalities = ("text",)
+    # The decoder stack is the measured compile target for Qwen3-VL; see
+    # ``VeOmniPreTrainedModel.supports_torch_compile`` for how the flag is read.
+    supports_torch_compile = True
 
     def __init__(self, config):
         super().__init__(config)

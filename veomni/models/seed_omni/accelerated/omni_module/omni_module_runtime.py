@@ -68,40 +68,17 @@ def composed_model_owns_wrap(accelerator: "AcceleratorConfig") -> bool:
 
 
 def module_compile_config(accelerator: "AcceleratorConfig", module: nn.Module, *, global_accelerator=None):
-    """``CompileConfig`` for one module, disabled unless the module opts in.
+    """One module's compile settings, or everything off unless it opts in.
 
-    ``accelerator.torch_compile.enable`` is the module's resolved switch;
-    :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile`
-    is the per-module gate. Both must be on, so a module whose compile path has
-    not been measured simply never reaches ``compile_decoder_blocks`` — it still
-    trains, just eagerly.
+    Four conditions, all required: the module's resolved
+    ``torch_compile.enable``, its ``supports_torch_compile`` class flag, an
+    ``fsdp2`` wrap, and — only when ``global_accelerator`` is given, i.e. under
+    ``fsdp_scope='model'`` — an ``fsdp2`` launcher. ``dynamic`` additionally
+    needs the module's ``supports_torch_compile_dynamic``.
 
-    Returned with ``enable=False`` rather than as ``None`` so the caller keeps
-    one code path: ``compile_decoder_blocks`` is still handed a config, it just
-    finds nothing enabled and returns without wrapping anything.
-
-    ``dynamic`` is intersected with the module's
-    :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile_dynamic`
-    too. A module whose input shape is already fixed gains nothing from
-    ``dynamic`` and can lose a lot: ``janus_vqvae`` measured 30% slower with it
-    on (30.7 -> 44.2 ms/step), giving back most of its 1.73x compile win, while
-    the text backbones were unaffected. So the run-level flag only reaches the
-    modules that declared they can use it.
-
-    ``fsdp_mode`` is part of the gate because ``compile_decoder_blocks`` only
-    runs under FSDP2. A shipped launcher sets ``janus_siglip`` to ``ddp`` (it does
-    not need FSDP's meta-init dance), so without this check enabling compile
-    would fail that module's wrap outright instead of leaving it eager — and
-    "leaves it eager" is the documented contract for a module that cannot be
-    compiled.
-
-    ``global_accelerator`` is the launcher-level accelerator, passed when the
-    module is built under ``fsdp_scope='model'``. There the FSDP wrap is the
-    **top-level** one: ``build_parallelize_model`` validates the top-level
-    accelerator and refuses DDP outright, so a module overlay saying ``fsdp2``
-    cannot make the wrap able to compile. Checking only the module's own
-    ``fsdp_mode`` would select a module for compilation under a ``ddp`` wrap and
-    fail startup instead of falling back to eager.
+    Each condition has a measured or structural reason, recorded at
+    :attr:`PretrainedOmniModule <...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile>`;
+    ``False`` is returned rather than ``None`` so callers keep one code path.
     """
     from .....distributed.torch_compile import CompileConfig
 
@@ -487,71 +464,46 @@ class ModuleRuntime(VeOmniModelRuntime):
         )
 
     def _build_parallelized_model(self) -> None:
-        """Compile this module's blocks, then either wrap it here or leave that to the composed model.
+        """Let the base build compile and wrap — except when the composed model owns the wrap.
 
-        When ``fsdp_scope='model'`` the FSDP wrap belongs to
-        :class:`OmniModelRuntime`, so this returns after compiling and applying
-        async activation offload — both must precede the wrap. The module stays
-        on meta (freeze already applied) and
-        :meth:`build_after_omni_model_wrap` finishes once the parent is wrapped.
-
-        **Compilation is per module under both scopes**, and it happens exactly
-        once, here. ``compile_decoder_blocks`` runs before ``fully_shard`` in
-        either case, so the module is still an ordinary unwrapped tree at this
-        point: its own ``_no_split_modules`` is the block list and its own
-        ``CompileConfig`` is the config.
-
-        The wrap below is then told to compile nothing. Without that it runs
-        ``compile_decoder_blocks`` a second time on the same tree, finds every
-        block already marked ``_veomni_forward_compiled``, counts zero, and raises
-        "found no decoder blocks to compile" — see
-        :meth:`_build_wrap_without_compiling`.
+        The base sequence already compiles this module's blocks (it reads
+        :meth:`_compile_config`, which this class narrows to the module's own
+        opt-in) and then wraps. The only thing to do differently is stop before
+        the wrap under ``fsdp_scope='model'``: there the composed ``OmniModel``
+        wraps once, so the module applies what must precede that wrap and returns.
         """
-        compile_config = self._compile_config()
-        if compile_config.enable:
-            compiled = self._compile_own_blocks(compile_config)
-            logger.info_rank0(
-                f"ModuleRuntime '{self.module_name}': compiled {compiled} blocks (dynamic={compile_config.dynamic})."
-            )
-
         if self.wrap_omni_model:
+            # Compilation must happen before the composed wrap, and the base build
+            # is the only place that does both, so compile here and stop.
+            self._compile_blocks()
             self._apply_async_activation_offload()
             logger.info_rank0(
-                f"ModuleRuntime '{self.module_name}': leaving the FSDP wrap to the composed "
+                f"ModuleRuntime '{self.module_name}': compiled, leaving the FSDP wrap to the composed "
                 "OmniModel (accelerator.fsdp_config.fsdp_scope='model')."
             )
             return
-        self._build_wrap_without_compiling()
+        super()._build_parallelized_model()
 
-    def _build_wrap_without_compiling(self) -> None:
-        """Run the base build (offload, load, wrap) with compilation already done.
-
-        ``BaseModelRuntime._build_parallelized_model`` reads ``self._compile_config()``,
-        so the flag is turned off for the duration of that one call rather than
-        duplicating the base sequence here.
-        """
-        self._skip_compile = True
-        try:
-            super()._build_parallelized_model()
-        finally:
-            self._skip_compile = False
+    def _compile_blocks(self) -> None:
+        """Compile this module's blocks when its config says to, and log which."""
+        compile_config = self._compile_config()
+        if not compile_config.enable:
+            return
+        compiled = self._compile_own_blocks(compile_config)
+        logger.info_rank0(
+            f"ModuleRuntime '{self.module_name}': compiled {compiled} blocks (dynamic={compile_config.dynamic})."
+        )
 
     def _compile_config(self):
-        """This module's ``CompileConfig``: the run switch intersected with the module's opt-in.
+        """This module's compile settings, or everything off if it did not opt in.
 
-        Returns a disabled config while :meth:`_build_wrap_without_compiling` runs
-        the base build, so compilation is not attempted twice.
-
-        The launcher-level accelerator is passed only under ``fsdp_scope='model'``,
-        where the composed ``OmniModel`` owns the wrap. Under ``fsdp_scope='module'``
-        the module's own overlay *is* its wrap, so consulting the launcher's
-        ``fsdp_mode`` there would disable a child that selected ``fsdp2`` itself
-        just because the launcher default says ``ddp``.
+        Under ``fsdp_scope='model'`` the composed ``OmniModel`` does the wrapping,
+        so the launcher's ``fsdp_mode`` has to be consulted as well: that wrap
+        refuses DDP, and a module overlay saying ``fsdp2`` cannot change it.
+        Under ``fsdp_scope='module'`` the module's own overlay *is* its wrap, so
+        the launcher is not consulted — otherwise a ``fsdp2`` child would be
+        disabled by a ``ddp`` launcher default it never uses.
         """
-        from .....distributed.torch_compile import CompileConfig
-
-        if getattr(self, "_skip_compile", False):
-            return CompileConfig(enable=False)
         return module_compile_config(
             self.args.accelerator,
             self.model,
@@ -559,21 +511,12 @@ class ModuleRuntime(VeOmniModelRuntime):
         )
 
     def _compile_own_blocks(self, compile_config) -> int:
-        """Compile the blocks this module declares, under this module's own config.
+        """Compile this module's blocks for the composed-wrap path, where the base build never runs.
 
-        ``compile_decoder_blocks`` is called without ``scopes``: a module is the
-        unit here, so there is no subtree to select. ``all_classes`` is what lets
-        a family whose blocks are not named ``*DecoderLayer``
-        (``JanusVQVAEAttnBlock``) still be compiled — the module already said it
-        may be, via ``supports_torch_compile``.
-
-        The runtime contract is validated **here**, not left to
-        ``build_parallelize_model``. That function normally runs
-        ``validate_compile_runtime`` before compiling, but this module hands the
-        wrap a disabled config so it never compiles twice — which would also skip
-        the validation, letting a CUDA-only restriction, a DDP wrap or an
-        ExtraParallel mesh through. Validating first keeps those refusals where
-        they belong while compilation happens exactly once.
+        ``validate_compile_runtime`` is called first: it normally lives inside
+        ``build_parallelize_model``, and that is the path not taken here, so
+        without this call the CUDA-only, DDP and ExtraParallel refusals would be
+        skipped.
         """
         from .....distributed.parallel_state import get_parallel_state
         from .....distributed.torch_compile import compile_decoder_blocks, validate_compile_runtime
@@ -588,7 +531,7 @@ class ModuleRuntime(VeOmniModelRuntime):
             any_extra_parallel_enabled=parallel_state.any_extra_parallel_enabled,
             enable_reshard_after_forward=self.args.accelerator.fsdp_config.reshard_after_forward,
         )
-        return compile_decoder_blocks(self.model, compile_config, all_classes=True)
+        return compile_decoder_blocks(self.model, compile_config)
 
     def build_after_omni_model_wrap(self) -> None:
         """Training steps that need the wrapped parameters, once the composed OmniModel is wrapped.

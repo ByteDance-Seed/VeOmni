@@ -893,90 +893,6 @@ def test_a_module_under_ddp_stays_eager_rather_than_failing_its_wrap():
     assert config.enable is False
 
 
-def test_a_compiling_module_compiles_itself_before_the_composed_wrap(monkeypatch):
-    """Under ``fsdp_scope='model'`` the module compiles its own blocks, then hands off the wrap.
-
-    ``compile_decoder_blocks`` runs before ``fully_shard`` under either scope, so
-    the module is still an ordinary tree here — no scope list, no reading the
-    top-level accelerator. The composed wrap only wraps and loads, which is why
-    it is handed ``CompileConfig(enable=False)``.
-    """
-    import torch.nn as nn
-
-    from veomni.distributed import torch_compile
-
-    seen = {}
-    real = torch_compile.compile_decoder_blocks
-
-    def spy(model, config, **kwargs):
-        seen["enable"] = config.enable
-        seen["dynamic"] = config.dynamic
-        seen["kwargs"] = kwargs
-        return real(model, config, **kwargs)
-
-    monkeypatch.setattr(torch_compile, "compile_decoder_blocks", spy)
-    # the module imports it inside the method, so patch the module it will import
-    import veomni.distributed.torch_compile as tc_mod
-
-    monkeypatch.setattr(tc_mod, "compile_decoder_blocks", spy)
-    # This test is about compiling once, not about the runtime contract; that is
-    # covered separately. No parallel state is set up here, so stub the check.
-    monkeypatch.setattr(tc_mod, "validate_compile_runtime", lambda *a, **k: None)
-
-    class Block(nn.Module):
-        def forward(self, x):
-            return x
-
-    class Mod(nn.Module):
-        _no_split_modules = ["Block"]
-        supports_torch_compile = True
-        supports_torch_compile_dynamic = True
-
-        def __init__(self):
-            super().__init__()
-            self.layers = nn.ModuleList([Block()])
-
-    runtime = _unbuilt(Mod())
-    runtime._global_accelerator = _fsdp("model", compile_enable=True, compile_dynamic=True)
-    runtime.args.accelerator = _fsdp("model", compile_enable=True, compile_dynamic=True)
-    runtime._apply_async_activation_offload = lambda: None
-
-    runtime._build_parallelized_model()
-
-    assert seen.get("enable") is True, "the module must compile itself"
-    assert seen.get("dynamic") is True
-    # no scope list: the module is the unit
-    assert "scopes" not in seen.get("kwargs", {})
-    assert seen.get("kwargs", {}).get("all_classes") is True
-
-
-def test_the_wrap_after_compiling_does_not_compile_again():
-    """P1: compiling in the module and again in the base build raises "found no decoder blocks".
-
-    `ModuleRuntime._build_parallelized_model` compiles the module, then calls the
-    base build to offload/load/wrap. The base reads `self._compile_config()`, which
-    would hand it an enabled config a second time; `compile_decoder_blocks` then
-    skips every already-compiled block, counts 0, and `build_parallelize_model`
-    raises. `_build_wrap_without_compiling` turns the flag off for that one call.
-    """
-
-    class OptedIn(nn.Linear):
-        supports_torch_compile = True
-        supports_torch_compile_dynamic = False
-
-    runtime = ModuleRuntime.__new__(ModuleRuntime)
-    runtime.model = OptedIn(2, 2)
-    runtime._global_accelerator = _fsdp("module", compile_enable=True)
-    runtime.args = SimpleNamespace(accelerator=_fsdp("module", compile_enable=True), basic_modules=[])
-
-    assert runtime._compile_config().enable is True
-
-    runtime._skip_compile = True
-    assert runtime._compile_config().enable is False
-    runtime._skip_compile = False
-    assert runtime._compile_config().enable is True
-
-
 def test_a_lora_wrapped_module_is_still_a_seedomni_module():
     """P2: the LoRA wrapper must not send a tower through the single-model VLM rule.
 
@@ -1096,3 +1012,50 @@ def test_compiling_validates_the_runtime_contract_first(monkeypatch):
         torch.compile = original_compile
 
     assert order == ["validate", "compile"]
+
+
+def test_a_composed_wrap_module_compiles_once_then_stops_before_the_wrap(monkeypatch):
+    """Under `fsdp_scope='model'` the module compiles, then leaves the wrap to the composed model.
+
+    The base build is what compiles and wraps in one go, so this path has to
+    compile first (before the composed `fully_shard`) and return instead of
+    calling the base — otherwise the module would be wrapped twice.
+    """
+    import torch.nn as nn
+
+    from veomni.distributed import torch_compile as tc_mod
+
+    calls = []
+    monkeypatch.setattr(tc_mod, "validate_compile_runtime", lambda *a, **k: None)
+    monkeypatch.setattr(
+        tc_mod, "compile_decoder_blocks", lambda model, config, **k: (calls.append(config.enable), 1)[1]
+    )
+
+    class Block(nn.Module):
+        def forward(self, x):
+            return x
+
+    class Mod(nn.Module):
+        _no_split_modules = ["Block"]
+        supports_torch_compile = True
+        supports_torch_compile_dynamic = False
+
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([Block()])
+
+    runtime = _unbuilt(Mod())
+    runtime._global_accelerator = _fsdp("model", compile_enable=True)
+    runtime.args.accelerator = _fsdp("model", compile_enable=True)
+    runtime._apply_async_activation_offload = lambda: calls.append("offload")
+
+    # if the composed path fell through to the base build, this would run
+    def base(*a, **k):
+        calls.append("base-build")
+        raise AssertionError("the composed path must not call the base build")
+
+    monkeypatch.setattr(type(runtime).__mro__[1], "_build_parallelized_model", base)
+
+    runtime._build_parallelized_model()
+
+    assert calls == [True, "offload"], calls

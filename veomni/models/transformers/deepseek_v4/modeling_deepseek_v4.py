@@ -1914,6 +1914,8 @@ class DeepseekV4DecoderLayer(GradientCheckpointingLayer):
 
 @auto_docstring
 class DeepseekV4PreTrainedModel(PreTrainedModel):
+    # A pure decoder stack: every block is a measured compile target.
+    supports_torch_compile = True
     config: DeepseekV4Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True

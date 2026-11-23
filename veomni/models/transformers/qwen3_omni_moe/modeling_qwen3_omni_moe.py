@@ -1781,6 +1781,9 @@ class Qwen3OmniMoeThinkerTextPreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["Qwen3OmniMoeThinkerTextDecoderLayer"]
+    # The text decoder is the measured compile target; audio/vision towers keep
+    # the ``False`` default.
+    supports_torch_compile = True
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True

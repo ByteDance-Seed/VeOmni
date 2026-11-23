@@ -293,27 +293,91 @@ def test_compile_decoder_blocks_matches_a_scoped_no_split_entry(monkeypatch):
 
 
 def test_compile_decoder_blocks_scopes_accept_non_decoder_block_names(monkeypatch):
-    """A SeedOmni module names its own blocks; the scope, not the spelling, gates them.
+    """A SeedOmni module names its own blocks; its declaration, not the spelling, gates them.
 
-    ``JanusVqvae`` lists ``JanusVQVAEAttnBlock`` in ``_no_split_modules``. Under a
-    scope that entry has to be compilable, because the module's
-    ``supports_torch_compile`` flag already decided it may be.
+    ``JanusVqvae`` lists ``JanusVQVAEAttnBlock`` in ``_no_split_modules``. That
+    entry is compilable because the module declared ``supports_torch_compile`` —
+    the class name never mattered.
     """
+    from veomni.models.modeling_base import VeOmniPreTrainedModel
 
     class JanusVQVAEAttnBlock(nn.Module):
         def forward(self, x):
             return x
 
-    class CodecModel(nn.Module):
+    class CodecModel(VeOmniPreTrainedModel):
+        supports_torch_compile = True
         _no_split_modules = ["JanusVQVAEAttnBlock"]
 
         def __init__(self):
-            super().__init__()
+            nn.Module.__init__(self)
             self.vqvae = nn.Module()
             self.vqvae.blocks = nn.ModuleList([JanusVQVAEAttnBlock()])
 
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-    assert compile_decoder_blocks(CodecModel(), CompileConfig(enable=True), all_classes=True) == 1
+    assert compile_decoder_blocks(CodecModel(), CompileConfig(enable=True)) == 1
+
+
+def test_a_veomni_model_that_does_not_declare_support_never_compiles(monkeypatch):
+    """The declaration decides, and its absence is decisive.
+
+    This is what keeps a vision tower eager without any naming convention: the
+    tower's class simply does not set ``supports_torch_compile``.
+    """
+    from veomni.models.modeling_base import VeOmniPreTrainedModel
+
+    class SomeDecoderLayer(nn.Module):
+        def forward(self, x):
+            return x
+
+    class Undeclared(VeOmniPreTrainedModel):
+        _no_split_modules = ["SomeDecoderLayer"]
+
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.layers = nn.ModuleList([SomeDecoderLayer()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+    # `*DecoderLayer` in the name would have been enough under the old rule.
+    assert compile_decoder_blocks(Undeclared(), CompileConfig(enable=True)) == 0
+
+
+def test_a_multimodal_model_compiles_its_declared_submodel_only(monkeypatch):
+    """The nearest declaring ancestor decides, so one model can qualify one tower of two."""
+    from veomni.models.modeling_base import VeOmniPreTrainedModel
+
+    class TextBlock(nn.Module):
+        def forward(self, x):
+            return x
+
+    class VisionBlock(nn.Module):
+        def forward(self, x):
+            return x
+
+    class TextModel(VeOmniPreTrainedModel):
+        supports_torch_compile = True
+        _no_split_modules = ["TextBlock"]
+
+    class VisionModel(VeOmniPreTrainedModel):
+        _no_split_modules = ["VisionBlock"]
+
+    class Composed(VeOmniPreTrainedModel):
+        _no_split_modules = ["TextBlock", "VisionBlock"]
+
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.language_model = TextModel.__new__(TextModel)
+            nn.Module.__init__(self.language_model)
+            self.language_model.layers = nn.ModuleList([TextBlock(), TextBlock()])
+            self.visual = VisionModel.__new__(VisionModel)
+            nn.Module.__init__(self.visual)
+            self.visual.blocks = nn.ModuleList([VisionBlock()])
+
+    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
+    model = Composed()
+    assert compile_decoder_blocks(model, CompileConfig(enable=True)) == 2
+    assert all(getattr(b, "_veomni_forward_compiled", False) for b in model.language_model.layers)
+    assert not getattr(model.visual.blocks[0], "_veomni_forward_compiled", False)
 
 
 def test_compile_decoder_blocks_without_scopes_keeps_decoder_layers_only(monkeypatch):
@@ -374,6 +438,8 @@ def test_compile_decoder_blocks_allows_a_seedomni_module_tower(monkeypatch):
         sub_configs = {}
 
     class Tower(PretrainedOmniModule):
+        # A module opts in on its class; the block names then no longer matter.
+        supports_torch_compile = True
         _no_split_modules = ["ToyDecoderLayer"]
         config_class = TowerConfig
 
@@ -387,7 +453,7 @@ def test_compile_decoder_blocks_allows_a_seedomni_module_tower(monkeypatch):
     tower = Tower()
     # The Qwen3-VL rule would demand ``qwen3_vl`` in _no_split_modules; a module
     # must not be held to it, so the tower's own declared block is compiled.
-    assert compile_decoder_blocks(tower, CompileConfig(enable=True, dynamic=True), all_classes=True) == 1
+    assert compile_decoder_blocks(tower, CompileConfig(enable=True, dynamic=True)) == 1
 
 
 def test_compile_decoder_blocks_rejects_cuda_graphs_for_a_seedomni_module(monkeypatch):
@@ -400,6 +466,7 @@ def test_compile_decoder_blocks_rejects_cuda_graphs_for_a_seedomni_module(monkey
         sub_configs = {}
 
     class Tower(PretrainedOmniModule):
+        supports_torch_compile = True
         _no_split_modules = ["ToyDecoderLayer"]
         config_class = TowerConfig
 
@@ -410,7 +477,7 @@ def test_compile_decoder_blocks_rejects_cuda_graphs_for_a_seedomni_module(monkey
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
 
     with pytest.raises(RuntimeError, match="CUDA Graph replay for a SeedOmni module"):
-        compile_decoder_blocks(Tower(), CompileConfig(enable=True, backend="cudagraphs"), all_classes=True)
+        compile_decoder_blocks(Tower(), CompileConfig(enable=True, backend="cudagraphs"))
 
 
 def test_compile_decoder_blocks_still_rejects_an_unsupported_hf_multimodal_model(monkeypatch):

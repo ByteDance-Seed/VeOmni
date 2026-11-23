@@ -1993,6 +1993,9 @@ class Qwen3_5MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Moe
 
 
 class Qwen3_5MoeTextModel(Qwen3_5MoePreTrainedModel):
+    # The text decoder is the measured compile target; the tower keeps the
+    # ``False`` default and stays eager.
+    supports_torch_compile = True
     config: Qwen3_5MoeTextConfig
 
     def __init__(self, config: Qwen3_5MoeTextConfig):

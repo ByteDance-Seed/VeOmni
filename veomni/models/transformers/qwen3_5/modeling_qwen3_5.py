@@ -1784,6 +1784,9 @@ class Qwen3_5MTPContextOutput(Qwen3_5ModelOutputWithPast):
 
 
 class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
+    # The text decoder is the measured compile target; the tower keeps the
+    # ``False`` default and stays eager.
+    supports_torch_compile = True
     config: Qwen3_5TextConfig
 
     def __init__(self, config: Qwen3_5TextConfig):

@@ -2117,6 +2117,8 @@ class Qwen4ExpTextDecoderLayer(GradientCheckpointingLayer):
 
 @auto_docstring
 class Qwen4ExpPreTrainedModel(PreTrainedModel):
+    # A pure decoder stack: every block is a measured compile target.
+    supports_torch_compile = True
     config: Qwen4ExpConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True

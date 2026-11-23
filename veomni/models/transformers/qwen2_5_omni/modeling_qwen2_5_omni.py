@@ -1968,6 +1968,9 @@ class Qwen2_5OmniThinkerTextModel(Qwen2_5OmniPreTrainedModel):
         "attentions": Qwen2_5OmniAttention,
     }
     _no_split_modules = ["Qwen2_5OmniDecoderLayer"]
+    # The text decoder is the measured compile target; audio/vision towers keep
+    # the ``False`` default.
+    supports_torch_compile = True
 
     def __init__(self, config):
         super(Qwen2_5OmniThinkerTextModel, self).__init__(config)

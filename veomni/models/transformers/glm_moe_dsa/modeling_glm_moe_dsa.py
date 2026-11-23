@@ -733,6 +733,8 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
 
 @auto_docstring
 class GlmMoeDsaPreTrainedModel(PreTrainedModel):
+    # A pure decoder stack: every block is a measured compile target.
+    supports_torch_compile = True
     config: GlmMoeDsaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True

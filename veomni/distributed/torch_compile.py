@@ -89,7 +89,47 @@ class CompileConfig:
         return self.backend == "cudagraphs" or self.mode == "reduce-overhead" or self.mode == "max-autotune"
 
 
-def _decoder_block_specs(model: nn.Module, *, all_classes: bool = False) -> list[tuple[str, str | None]]:
+def _compile_decision(model: nn.Module, fqn: str) -> bool | None:
+    """What the nearest ``VeOmniPreTrainedModel`` owning ``fqn`` says, or ``None`` if there is none.
+
+    Walks the block's module path outwards and takes the **nearest** ancestor that
+    is a ``VeOmniPreTrainedModel``, so a multimodal model can qualify one submodel
+    and not another: ``model.language_model.layers.0`` finds
+    ``Qwen3VLTextModel`` while ``model.visual.blocks.0`` finds
+    ``Qwen3VLVisionModel``, which inherits the ``False`` default.
+
+    ``None`` means the model is not built from ``VeOmniPreTrainedModel`` at all —
+    a bare ``nn.Module`` in a test, say — so there is no declaration to honour and
+    the caller keeps its old rule.
+    """
+    from ..models.modeling_base import VeOmniPreTrainedModel
+
+    parts = fqn.split(".")
+    for end in range(len(parts) - 1, -1, -1):
+        path = ".".join(parts[:end])
+        try:
+            candidate = model if not path else model.get_submodule(path)
+        except AttributeError:
+            continue
+        if isinstance(candidate, VeOmniPreTrainedModel):
+            return bool(getattr(candidate, "supports_torch_compile", False))
+    return None
+
+
+def _block_compiles(model: nn.Module, fqn: str, class_name: str) -> bool:
+    """Whether the block at ``fqn`` should be compiled.
+
+    The model answers through :func:`_compile_decision`. Only when nothing in the
+    path declares anything does the old ``*DecoderLayer`` suffix rule apply, which
+    keeps bare-``nn.Module`` callers working.
+    """
+    declared = _compile_decision(model, fqn)
+    if declared is not None:
+        return declared
+    return class_name.endswith("DecoderLayer")
+
+
+def _decoder_block_specs(model: nn.Module) -> list[tuple[str, str | None]]:
     """``(class name, child scope)`` for each compilable block in ``_no_split_modules``.
 
     An entry is a bare class name (``LlamaDecoderLayer``, scope ``None``, matches
@@ -102,25 +142,29 @@ def _decoder_block_specs(model: nn.Module, *, all_classes: bool = False) -> list
     ``_is_decoder_block`` compares and the scope half is what it matches against
     the fqn.
 
-    ``all_classes`` decides which entries qualify. The default keeps only
-    ``*DecoderLayer``, which is what every single model wants: a Qwen2.5-Omni
-    lists its vision and audio towers alongside the decoder layers, and those
-    must stay eager. A SeedOmni run passes ``True`` because its modules declare
-    whatever their own blocks are called (``JanusVQVAEAttnBlock``), and the
-    per-module
-    :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile`
-    flag — not the class name — is what decides whether the module is compiled
-    at all.
+    Whether an entry is compiled is decided by the model, not by its name: the
+    nearest enclosing ``VeOmniPreTrainedModel`` in the block's path answers
+    through :attr:`~veomni.models.modeling_base.VeOmniPreTrainedModel.supports_torch_compile`
+    (see :func:`_block_compiles`), which is what lets a SeedOmni module name its
+    own blocks (``JanusVQVAEAttnBlock``) without a naming convention.
     """
     no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
     if no_split_modules is None:
         return []
+    by_class: dict[str, list[str]] = {}
+    for name, submodule in model.named_modules():
+        if name:
+            by_class.setdefault(type(submodule).__name__, []).append(name)
+
     specs: list[tuple[str, str | None]] = []
     for entry in no_split_modules:
         if not isinstance(entry, str):
             continue
         scope, _, class_name = entry.rpartition(".")
-        if all_classes or class_name.endswith("DecoderLayer"):
+        matches = by_class.get(class_name, [])
+        if not matches:
+            continue
+        if any(_block_compiles(model, fqn, class_name) for fqn in matches):
             specs.append((class_name, scope or None))
     return specs
 
@@ -450,7 +494,6 @@ def compile_decoder_blocks(
     compile_config: CompileConfig,
     sequence_parallel_enabled: bool = False,
     async_enabled: bool = False,
-    all_classes: bool = False,
 ) -> int:
     """Compile forward of every block inside ``model`` in place.
 
@@ -458,13 +501,10 @@ def compile_decoder_blocks(
     preserves module identity for FSDP2 — pre/post-forward all-gather and
     reshard hooks stay outside the compiled region.
 
-    ``all_classes`` decides which ``_no_split_modules`` entries qualify. The
-    default keeps ``*DecoderLayer``, which is what a single HF model wants: a
-    Qwen2.5-Omni lists its vision and audio towers alongside its decoder layers,
-    and those must stay eager. SeedOmni passes ``True`` because its modules name
-    whatever their own blocks are called (``JanusVQVAEAttnBlock``) and already
-    opted in via ``supports_torch_compile`` — the module is the unit of
-    compilation, so there is no subtree left to select.
+    Which entries qualify is the model's own answer: the nearest enclosing
+    ``VeOmniPreTrainedModel`` opts in per submodel (see
+    :func:`_decoder_block_specs`). A tower that did not opt in stays eager, so a
+    multimodal model can qualify its decoder stack and not its vision tower.
     """
 
     if not hasattr(torch, "compile"):
@@ -489,7 +529,7 @@ def compile_decoder_blocks(
             )
         compile_kwargs["mode"] = compile_config.mode
 
-    decoder_block_specs = _decoder_block_specs(model, all_classes=all_classes)
+    decoder_block_specs = _decoder_block_specs(model)
     compiled = 0
     for fqn, module in model.named_modules():
         if not _is_decoder_block(module, fqn=fqn, decoder_block_specs=decoder_block_specs):

@@ -890,6 +890,9 @@ class Qwen2VisionTransformerPretrainedModel(Qwen2VLPreTrainedModel):
 
 @auto_docstring
 class Qwen2VLTextModel(Qwen2VLPreTrainedModel):
+    # The text decoder is the measured compile target; the tower keeps the
+    # ``False`` default and stays eager.
+    supports_torch_compile = True
     config: Qwen2VLTextConfig
     input_modalities = ("text",)
     _can_record_outputs = {
