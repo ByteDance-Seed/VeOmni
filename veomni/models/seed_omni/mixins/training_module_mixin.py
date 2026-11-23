@@ -118,6 +118,21 @@ class TrainingModuleMixin:
         del micro_batches
         return None
 
+    def on_step_context(self, *, seed: int, global_step: int, batch_invariant: bool = False) -> None:
+        """Called once per optimizer step, before any micro-batch, with where training is.
+
+        A module whose forward draws randomness per micro-batch needs to derive it
+        from something a checkpoint can restore. ``(seed, global_step, micro_step)``
+        is that: `_extra_state` persists only the default CPU RNG, so a generator
+        carried across steps would rewind to step 0 on resume and replay the first
+        steps' draws at step N. This hook hands over the step half of the key and is
+        the reset point for the micro-batch counter the forward increments.
+
+        Default: no-op, which is right for every deterministic forward.
+        """
+        del seed, global_step, batch_invariant
+        return None
+
     #: Whether this module's ``_loss`` is already the step's mean, so the trainer
     #: must not divide the backward by ``num_micro_steps`` again.
     #:

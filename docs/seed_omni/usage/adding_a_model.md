@@ -286,6 +286,12 @@ Three rules make this work:
   because the per-node losses are summed into one tensor before the backward.
 - Read inputs in `pre_forward`, write results in `post_forward`. Conversation
   nodes return `{"conversation_list": ...}` so the carrier flows on.
+- Read `on_step_context(seed, global_step, batch_invariant)` in any module whose
+  forward draws randomness per micro-batch. It fires once per optimizer step, before
+  the first `pre_forward`, and is where a per-micro-batch counter resets. Key the draw
+  on `(seed, global_step, micro_step)`, not on a generator carried across steps:
+  `_extra_state` persists only the default CPU RNG, so a carried generator rewinds to
+  step 0 on resume, and Triton compile/autotune pollutes both default generators.
 - Implement `dummy_inputs()` and `ModulePreprocessorBase.bind_dummy_inputs()` for
   any encoder whose modality can be absent from a sample, and inject `is_dummy=True`
   placeholders **per sample** in `preprocess_conversations(..., inference=False)` so

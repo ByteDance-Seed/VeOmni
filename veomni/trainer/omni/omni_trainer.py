@@ -610,9 +610,20 @@ class OmniTrainer:
         for module_runtime in self.model.module_runtimes.values():
             # DDP / LoRA wrap the module, so the hook lives on the object below
             # the wrapper chain rather than on `module_runtime.model` itself.
-            hook = getattr(unwrap_module_chain(module_runtime.model), "on_micro_batches_ready", None)
+            module = unwrap_module_chain(module_runtime.model)
+            hook = getattr(module, "on_micro_batches_ready", None)
             if hook is not None:
                 hook(micro_batches)
+            # Where this step sits, for a module whose forward draws per micro-batch.
+            # Same object and same moment: the micro-batch counter has to reset before
+            # the first `pre_forward` that increments it.
+            step_context = getattr(module, "on_step_context", None)
+            if step_context is not None:
+                step_context(
+                    seed=int(self.args.train.seed),
+                    global_step=int(self.state.global_step),
+                    batch_invariant=bool(self.args.train.enable_batch_invariant_mode),
+                )
 
     def train_step(self, data_iterator: Any) -> None:
         # Fetch first: an iterator that runs dry before ``train_steps`` raises

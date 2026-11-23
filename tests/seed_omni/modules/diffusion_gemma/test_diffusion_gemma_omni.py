@@ -41,11 +41,19 @@ def _item(feature: dict | None = None) -> ConversationItem:
 
 
 def _module(pack: bool = False) -> mod.TrainingMixin:
+    """The mixin alone, as it runs inside a `DiffusionGemmaOmni` subclass.
+
+    `attach_self_conditioning` is defined on the model below the mixin, so the bare
+    mixin carries a pass-through stand-in here; the draw itself is exercised on the
+    model in `test_a_k_canvas_example_counts_once_not_k_times` and in
+    `tests/models/test_diffusion_gemma.py`.
+    """
     module = mod.TrainingMixin()
     module.config = SimpleNamespace(
         canvas_batching="flat_seq_pack" if pack else "serial",
         pad_token_id=0,
     )
+    module.attach_self_conditioning = lambda micro_batch, **kwargs: micro_batch
     return module
 
 
@@ -170,6 +178,41 @@ def test_a_packed_batch_skips_the_canvas_alignment(monkeypatch):
     _module(pack=True).batch_pre(conversation_list=[[_item()]])
 
     assert called["all_reduce"] is False
+
+
+def test_the_draw_is_keyed_on_the_step_and_advances_per_micro_batch():
+    """`(seed, global_step, micro_step)` is what a resume can restore, and the
+    micro-batch counter is what stops gradient accumulation from turning the
+    Bernoulli into a per-step coin."""
+    keys = []
+    module = _module(pack=True)
+    module.attach_self_conditioning = (
+        lambda micro_batch, **kwargs: keys.append((kwargs["seed"], kwargs["global_step"], kwargs["micro_step"]))
+        or micro_batch
+    )
+
+    module.on_step_context(seed=42, global_step=7)
+    for _ in range(2):
+        module.batch_pre(conversation_list=[[_item()]])
+
+    assert keys == [(42, 7, 0), (42, 7, 1)]
+
+
+def test_a_new_step_resets_the_micro_batch_counter():
+    """Without the reset, step N's draws would keep counting from step N-1 and the
+    resume replay would not reproduce them."""
+    keys = []
+    module = _module(pack=True)
+    module.attach_self_conditioning = (
+        lambda micro_batch, **kwargs: keys.append((kwargs["global_step"], kwargs["micro_step"])) or micro_batch
+    )
+
+    module.on_step_context(seed=42, global_step=7)
+    module.batch_pre(conversation_list=[[_item()]])
+    module.on_step_context(seed=42, global_step=8)
+    module.batch_pre(conversation_list=[[_item()]])
+
+    assert keys == [(7, 0), (8, 0)]
 
 
 def test_a_sample_without_processed_tensors_is_refused():

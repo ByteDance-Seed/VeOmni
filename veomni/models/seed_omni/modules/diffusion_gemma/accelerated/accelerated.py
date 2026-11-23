@@ -59,6 +59,22 @@ from ..modeling import DiffusionGemmaOmni
 class TrainingMixin(LladaTrainingMixin):
     """Dense LLaDA's per-sample normalization, plus the canvas-aware batching."""
 
+    #: Where this step sits, from :meth:`on_step_context`. `_self_conditioning_micro_step`
+    #: counts micro-batches within it, so the self-conditioning draw keys on
+    #: ``(seed, global_step, micro_step)`` -- a pure function of training position that a
+    #: resume restores, rather than a generator a checkpoint cannot express.
+    _self_conditioning_seed: int = 0
+    _self_conditioning_global_step: int = 0
+    _self_conditioning_micro_step: int = 0
+    _self_conditioning_batch_invariant: bool = False
+
+    def on_step_context(self, *, seed: int, global_step: int, batch_invariant: bool = False) -> None:
+        """Start a new step's draw key, and reset the micro-batch counter."""
+        self._self_conditioning_seed = int(seed)
+        self._self_conditioning_global_step = int(global_step)
+        self._self_conditioning_micro_step = 0
+        self._self_conditioning_batch_invariant = bool(batch_invariant)
+
     def batch_pre(self, conversation_list: list[Any] = None, **kwargs: Any) -> dict[str, Any]:
         """Collate the carrier into the encoder/canvas batch the model reads.
 
@@ -108,6 +124,20 @@ class TrainingMixin(LladaTrainingMixin):
         if mode != "flat_seq_pack" and dist.is_available() and dist.is_initialized():
             target_k = int(all_reduce(_local_canvas_count(micro_batch["decoder_input_ids"]), op="max"))
             micro_batch = pad_decoder_canvases(micro_batch, target_k)
+
+        # Every denoising step at inference hands the model its own previous prediction,
+        # so training without that signal would meet it cold at generation. The draw is a
+        # pure function of where training is (see `attach_self_conditioning`), and the
+        # counter advances per micro-batch so gradient accumulation does not turn the
+        # Bernoulli into a per-step coin.
+        micro_batch = self.attach_self_conditioning(
+            micro_batch,
+            seed=self._self_conditioning_seed,
+            global_step=self._self_conditioning_global_step,
+            micro_step=self._self_conditioning_micro_step,
+            batch_invariant=self._self_conditioning_batch_invariant,
+        )
+        self._self_conditioning_micro_step += 1
         return micro_batch
 
     @staticmethod
