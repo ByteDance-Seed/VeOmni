@@ -78,7 +78,6 @@ def triton_fp4_roundtrip(x: Tensor, block_size: int = 16, scale_fmt: str = "e4m3
                 y,
                 x_stride,
                 last,
-                n_blocks,
                 BLOCK_SIZE=block_size,
                 USE_E4M3_SCALE=scale_fmt == "e4m3",
             )

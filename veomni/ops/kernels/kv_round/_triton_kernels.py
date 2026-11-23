@@ -46,7 +46,6 @@ def _triton_fp4_roundtrip_kernel(
     Y,
     X_STRIDE_ROW,
     Y_STRIDE_ROW,
-    N_BLOCKS,
     BLOCK_SIZE: tl.constexpr,
     USE_E4M3_SCALE: tl.constexpr,
 ):
@@ -69,7 +68,10 @@ def _triton_fp4_roundtrip_kernel(
         # Smallest E8M0 exponent step, then round the ratio up to a power of two.
         scaled = tl.maximum(amax, 6.0 * (2.0**-126)) * (1.0 / 6.0)
         bits = scaled.to(tl.int32, bitcast=True)
-        exp_byte = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        # Clamped to 254 as in the eager row and DeepGEMM's ``ceil_to_ue8m0``: only
+        # an ``inf`` / ``NaN`` block reaches 255, where ``255 << 23`` is ``inf`` and
+        # the block's zeros would dequantize to ``NaN``.
+        exp_byte = (((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)).minimum(254)
         scale = (exp_byte << 23).to(tl.float32, bitcast=True)
     # Same reason as the scale above: ``div_rn`` keeps ``x / scale`` identical to
     # the eager row's ``div.rn.f32`` for a non-power-of-two scale.

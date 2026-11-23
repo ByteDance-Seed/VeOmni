@@ -19,7 +19,14 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from ..helper import FUSED_TOKEN_ALIGN, POST_MULTIPLIER, TOKEN_ALIGN, pad_token_axis, require_tilelang_input
+from ..helper import (
+    FUSED_TOKEN_ALIGN,
+    POST_MULTIPLIER,
+    TOKEN_ALIGN,
+    pad_token_axis,
+    require_tilelang_input,
+    trim_token_axis,
+)
 
 
 def wrapper(
@@ -47,7 +54,9 @@ def wrapper(
     base = base.float().contiguous()
 
     if not torch.is_grad_enabled():
-        # Inference: ``mhc_pre_big_fuse`` tiles the query axis too.
+        # Inference: ``mhc_pre_big_fuse`` launches per token but its inner
+        # ``_mhc_pre_norm_fn_fwd_mul`` tiles the query axis at 32, so that is the
+        # granularity this path has to pad to.
         hs, seq_len = pad_token_axis(hidden_streams, FUSED_TOKEN_ALIGN)
         post, comb, collapsed = mhc_pre_big_fuse(
             hs,
@@ -61,8 +70,8 @@ def wrapper(
             sinkhorn_repeat=sinkhorn_iters,
             n_splits=16,
         )
-        if hs is not hidden_streams:
-            post, comb, collapsed = post[:, :seq_len], comb[:, :seq_len], collapsed[:, :seq_len]
+        post, comb = trim_token_axis(post, seq_len), trim_token_axis(comb, seq_len)
+        collapsed = trim_token_axis(collapsed, seq_len)
     else:
         hs, seq_len = pad_token_axis(hidden_streams, TOKEN_ALIGN)
         mixes = mhc_pre_norm_fn(
@@ -82,6 +91,6 @@ def wrapper(
         )
         comb = sinkhorn_normalize(comb, repeat=sinkhorn_iters, eps=hc_eps)
         collapsed = mhc_pre_apply_mix(hs, pre)
-        if hs is not hidden_streams:
-            post, comb, collapsed = post[:, :seq_len], comb[:, :seq_len], collapsed[:, :seq_len]
+        post, comb = trim_token_axis(post, seq_len), trim_token_axis(comb, seq_len)
+        collapsed = trim_token_axis(collapsed, seq_len)
     return post.squeeze(-1), comb, collapsed

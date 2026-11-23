@@ -56,7 +56,7 @@ when the selected implementation runs.
 | `load_balancing_loss` | `standard` | `eager`, `triton` |
 | `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu` as supported by the family |
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `triton`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
-| `kv_round` | `standard`, `deepseek_v4`, `fp4` | `none` (leave stored tensors alone), `eager`, `triton` (NVIDIA SM89+/ROCm). `standard` rounds to FP8 E4M3 and takes block width and quantized prefix as call arguments; `deepseek_v4` fixes the model's two FP8 geometries and takes `rope_features`; `fp4` stores E2M1 and takes `block_size` plus `scale_fmt` (`e4m3` or `ue8m0`) |
+| `kv_round` | `standard`, `deepseek_v4`, `fp4` | `none` (leave stored tensors alone), `eager`, `triton` (NVIDIA SM89+; `standard` and `deepseek_v4` also on ROCm, `fp4` is NVIDIA-only). `standard` rounds to FP8 E4M3 and takes block width and quantized prefix as call arguments; `deepseek_v4` fixes the model's two FP8 geometries and takes `rope_features`; `fp4` stores E2M1 and takes `block_size` plus `scale_fmt` (`e4m3` or `ue8m0`) |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
 

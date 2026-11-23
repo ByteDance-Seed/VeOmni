@@ -44,10 +44,11 @@ def wrapper(
     """Run gated-MLP GEMMs on the FP8 tensor cores: forward, dgrad and wgrad.
 
     One fused FP8 grouped GEMM produces gate and up together, the clamp and
-    ``act_fn(gate) * up`` run in the model dtype through
-    :func:`~veomni.ops.activation.apply_activation`, and a second FP8 GEMM
-    produces the down projection. Hidden and intermediate sizes must be positive
-    multiples of 128.
+    ``act_fn(gate) * up`` run in the model dtype inside
+    :class:`RecomputedSwiGLU` -- which fuses the activation into its own backward
+    rather than calling :func:`~veomni.ops.activation.apply_activation` -- and a
+    second FP8 GEMM produces the down projection. Hidden and intermediate sizes
+    must be positive multiples of 128.
 
     ``mlp`` is the model's MLP block. This row quantizes the weights it multiplies,
     so :func:`.._module.render` refuses a wrapped projection or an ``nn.Linear``
@@ -109,6 +110,11 @@ def wrapper(
     # which is why this row is SiLU-only; ``render`` already kept a non-SiLU model
     # off it. The exact spelling is checked here so a direct call cannot slip a
     # ``gelu`` request into a kernel that would compute SiLU.
+    #
+    # This is a plain membership check, and that is sufficient: ``ActivationType``
+    # is a ``str`` enum, so ``ActivationType.SILU in _FUSED_ACTIVATIONS`` is ``True``
+    # because ``__hash__`` is ``str.__hash__``. Only a non-``str`` enum would need
+    # ``is_silu``'s ``.value`` unwrapping, and no config field carries one today.
     if activation not in _FUSED_ACTIVATIONS:
         raise ValueError(
             f"gated_mlp/standard/deepgemm implements {sorted(_FUSED_ACTIVATIONS)} only, got "

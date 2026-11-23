@@ -1255,6 +1255,39 @@ def test_the_row_states_which_activations_it_serves():
     assert declared == frozenset({"silu", "swish"})
 
 
+def test_the_deepgemm_row_accepts_a_str_enum_activation():
+    """The row's membership check accepts ``ActivationType`` without unwrapping it.
+
+    ``render`` canonicalizes through ``normalize_activation``, which unwraps
+    ``Enum.value``; a raw ``activation in _FUSED_ACTIVATIONS`` then still has to
+    agree with it. It does, and only because ``ActivationType`` is a ``str`` enum:
+    ``__hash__`` is ``str.__hash__``, so the set lookup matches ``"silu"``. Pinning
+    that keeps a future non-``str`` enum (which *would* need ``is_silu``'s ``.value``
+    unwrapping) from silently diverging from ``render``.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+    from veomni.ops.kernels.moe_experts.shared.group_gemm import ActivationType
+
+    assert issubclass(ActivationType, str), "premise: a str enum hashes like its value"
+    assert ActivationType.SILU in deepgemm._FUSED_ACTIVATIONS
+    assert ActivationType.GELU not in deepgemm._FUSED_ACTIVATIONS
+
+    mlp = nn.Module()
+    mlp.gate_proj = nn.Linear(128, 128, bias=False)
+    mlp.up_proj = nn.Linear(128, 128, bias=False)
+    mlp.down_proj = nn.Linear(128, 128, bias=False)
+
+    # ``SILU`` gets past the activation check and stops at the hardware guard: on a
+    # host without SM90/SM100 that is a ``RuntimeError``, which is how this proves
+    # the activation check let it through. ``GELU`` is refused by ``render`` first.
+    with pytest.raises(RuntimeError, match="deepgemm requires NVIDIA"):
+        deepgemm.wrapper(mlp, torch.randn(2, 128), activation=ActivationType.SILU)
+    with pytest.raises(ValueError, match="no quantizing row evaluates that activation"):
+        deepgemm.wrapper(mlp, torch.randn(2, 128), activation=ActivationType.GELU)
+
+
 def test_the_routed_expert_row_has_the_same_activation_restriction():
     """`moe_experts` rows take `activation=` too, so `linear` is the only row without one.
 

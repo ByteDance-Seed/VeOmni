@@ -159,7 +159,12 @@ def get_uniform_layout(n_rows: int, n_groups: int, device: torch.device) -> Grou
     stream = torch.cuda.current_stream(index)
     key = (n_rows, n_groups, index, stream.stream_id)
     cached = _UNIFORM_LAYOUT_CACHE.get(key)
-    if cached is not None and cached.rows.device == device:
+    if cached is not None:
+        # ``index`` is already in the key, so the entry is necessarily for this
+        # device -- there is nothing left to check. Comparing
+        # ``cached.rows.device == device`` here would be wrong *and* slow: PyTorch
+        # says ``torch.device("cuda:0") != torch.device("cuda")``, so a caller
+        # passing an unindexed device would miss on every call.
         return cached
     if len(_UNIFORM_LAYOUT_CACHE) >= _UNIFORM_LAYOUT_CACHE_LIMIT:
         _UNIFORM_LAYOUT_CACHE.clear()

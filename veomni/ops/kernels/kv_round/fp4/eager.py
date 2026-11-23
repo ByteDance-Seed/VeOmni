@@ -85,10 +85,19 @@ def _round_to_fp4(values: Tensor) -> Tensor:
 
 
 def _pow2_scale(amax: Tensor) -> Tensor:
-    """Round ``amax / 6`` up to a power of two, as a bare E8M0 exponent."""
+    """Round ``amax / 6`` up to a power of two, as a bare E8M0 exponent.
+
+    ``exp_byte`` is clamped to 254, matching :func:`..moe_experts.shared.deepgemm._quant_scale`
+    and DeepGEMM's ``ceil_to_ue8m0``. For a finite input the clamp never binds: the
+    largest E8M0 exponent any finite ``amax / 6`` can reach is 253 (``float32`` max is
+    ``3.4e38``, below ``6 * 2**127``). It binds only on an ``inf`` / ``NaN`` block,
+    where the raw exponent field is already 255 and ``255 << 23`` is ``inf`` -- which
+    would then turn every ``0 * scale`` entry in the block into ``NaN`` instead of
+    keeping this a bounded, saturating format.
+    """
     ratio = (amax * (1.0 / FP4_MAX)).clamp_min(torch.finfo(torch.float32).tiny).contiguous()
     bits = ratio.view(torch.int32)
-    exp_byte = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    exp_byte = (((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(torch.int32)).clamp(max=254)
     return (exp_byte << 23).view(torch.float32)
 
 

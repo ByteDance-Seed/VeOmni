@@ -407,12 +407,15 @@ def test_fp4_preserves_the_sign_of_negative_zero(scale_fmt: str):
         ("e4m3", 1e4, 6 * 448.0),
         # ``ue8m0`` cannot saturate the same way, and that is a property of the
         # format rather than a weaker test: the scale is ``2 ** ceil(log2(amax/6))``,
-        # so ``amax / scale`` always lands in ``[3, 6)`` and the ratio never needs
-        # clamping. ``1e4`` gives scale 2048 and a ratio of 4.88, which rounds to
-        # the E2M1 magnitude 4 -- so ``4 * 2048``, *not* ``6 * 2048``.
+        # so ``amax / scale`` always lands in ``(3, 6]`` -- below 6 because the
+        # scale rounds up, and *at* 6 when ``amax / 6`` is already a power of two --
+        # and the ratio never needs clamping. ``1e4`` gives scale 2048 and a ratio
+        # of 4.88, which rounds to the E2M1 magnitude 4 -- so ``4 * 2048``, *not*
+        # ``6 * 2048``.
         ("ue8m0", 1e4, 4 * 2048.0),
-        # A ratio of exactly 6 is reachable (``24 / 6 = 4``, a power of two), and
-        # there the block does store the top magnitude, ``6 * 4``.
+        # The closed upper end: a ratio of exactly 6 (``24 / 6 = 4``, a power of
+        # two), where the block does store the top magnitude, ``6 * 4``. This is
+        # the case that makes the interval ``(3, 6]`` rather than ``[3, 6)``.
         ("ue8m0", 24.0, 6 * 4.0),
     ],
 )
@@ -422,7 +425,7 @@ def test_fp4_caps_the_stored_magnitude(scale_fmt: str, amax: float, expected: fl
     Asserting the expected value, not just "all elements equal": an all-zero result
     and an unchanged input both satisfy a self-consistency check, and neither is
     correct. The two formats reach the cap differently -- ``e4m3`` by clamping a
-    ratio above 448, ``ue8m0`` by rounding a ratio that cannot leave ``[3, 6)`` --
+    ratio above 448, ``ue8m0`` by rounding a ratio that cannot leave ``(3, 6]`` --
     so each case carries its own number.
     """
     from veomni.ops.kernels.kv_round.fp4.eager import fp4_roundtrip
@@ -431,6 +434,30 @@ def test_fp4_caps_the_stored_magnitude(scale_fmt: str, amax: float, expected: fl
     y = fp4_roundtrip(x, block_size=32, scale_fmt=scale_fmt)
     assert torch.isfinite(y).all()
     torch.testing.assert_close(y, torch.full_like(y, expected), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("scale_fmt", ["e4m3", "ue8m0"])
+def test_fp4_keeps_a_non_finite_block_free_of_nan(scale_fmt: str):
+    """An ``inf`` amax must not turn the block's *finite* entries into ``NaN``.
+
+    The E8M0 exponent is clamped to 254, as DeepGEMM's ``ceil_to_ue8m0`` does. Only
+    an ``inf`` / ``NaN`` block can reach the raw field value 255, where
+    ``255 << 23`` is ``inf`` -- and then ``0 * inf`` poisons every smaller entry in
+    that block instead of leaving this a saturating format. A finite input can never
+    reach 255 (``float32`` max is below ``6 * 2**127``), so the clamp costs nothing
+    on the normal path.
+    """
+    from veomni.ops.kernels.kv_round.fp4.eager import fp4_roundtrip
+
+    x = torch.tensor([[float("inf")] + [0.0] * 15 + [1.0] * 16], dtype=torch.float32)
+    y = fp4_roundtrip(x, block_size=16, scale_fmt=scale_fmt)
+    assert not torch.isnan(y).any(), "an inf amax must not produce NaN in its block"
+    # The finite block must come out exactly as it would on its own: an inf in a
+    # different block must not perturb it. Compared against a separate round trip
+    # rather than against ``1.0`` because ``e4m3`` scales are not powers of two, so
+    # even this block does not round-trip to its input.
+    alone = fp4_roundtrip(x[:, 16:], block_size=16, scale_fmt=scale_fmt)
+    torch.testing.assert_close(y[0, 16:], alone[0], rtol=0, atol=0)
 
 
 def test_fp4_rejects_an_unknown_scale_format():
@@ -605,3 +632,39 @@ def test_fp4_rounds_midpoints_to_the_even_code(value: float, expected: float):
     for sign in (1.0, -1.0):
         got = _round_to_fp4(torch.tensor([sign * value], dtype=torch.float32))
         torch.testing.assert_close(got, torch.tensor([sign * expected], dtype=torch.float32), rtol=0, atol=0)
+
+
+@_TRITON_DEVICE
+@pytest.mark.parametrize("scale_fmt", ["e4m3", "ue8m0"])
+def test_fp4_triton_rounds_midpoints_to_the_even_code(device: str, scale_fmt: str):
+    """The kernel's tie rule has to match the eager row, not merely be "close".
+
+    A midpoint is the one place where a kernel and its reference can differ by a
+    whole code point, so covering them on ``_round_to_fp4`` alone leaves the GPU
+    path -- the one that actually runs -- unverified.
+
+    Each block holds one midpoint plus one element that sets the scale to a power of
+    two (``6 * 8`` gives ``scale = 8`` under both formats), so ``value / scale``
+    lands on the midpoint exactly and the tie is what decides the code. Dividing or
+    multiplying by a power of two is exact, so neither step perturbs the value.
+    """
+    triton = _triton_op("fp4", device)
+    eager = VeomniOp("kv_round", "fp4", "eager")
+    # midpoint -> the even code it must round to.
+    midpoints = {0.25: 0.0, 0.75: 1.0, 1.25: 1.0, 1.75: 2.0, 2.5: 2.0, 3.5: 4.0, 5.0: 4.0}
+    scale_power = 8.0
+    rows = []
+    for m in midpoints:
+        block = torch.zeros(16, dtype=torch.float32)
+        block[0] = 6.0 * scale_power  # amax -> scale = 6 * 8 / 6 = 8
+        block[1] = m * scale_power  # ratio 8 * m / 8 = m, exactly on the midpoint
+        rows.append(block)
+    x = torch.stack(rows).to(device=device, dtype=torch.bfloat16)
+
+    got = triton(x, block_size=16, scale_fmt=scale_fmt)
+    expected = eager(x, block_size=16, scale_fmt=scale_fmt)
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+    # The even-code rule holds on the Triton path itself, not only on eager.
+    for row, (m, even) in enumerate(midpoints.items()):
+        stored = got[row, 1].to(torch.float32).item()
+        assert stored == even * scale_power, f"midpoint {m} stored as {stored}, expected {even * scale_power}"

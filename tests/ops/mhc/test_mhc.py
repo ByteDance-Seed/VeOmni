@@ -362,6 +362,11 @@ def test_mhc_tilelang_matches_eager_at_unaligned_sequence_lengths(batch: int, se
     for actual, expected in zip(inference, eager_inference, strict=True):
         torch.testing.assert_close(actual, expected, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
         assert actual.shape[1] == seq_len
+        # ``batch=2`` is where a plain slice is not enough: the padded buffer leaves
+        # a gap between the samples, so ``[:, :seq_len]`` of it is non-contiguous and
+        # keeps the whole padded allocation alive. Each returned tensor has to be
+        # contiguous in its own right.
+        assert actual.is_contiguous(), f"batch={batch}: padded output must be trimmed to a contiguous tensor"
 
     x_o, fn_o, scale_o, base_o = make_grad_leaves(x, fn, scale, base)
     x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
@@ -374,10 +379,27 @@ def test_mhc_tilelang_matches_eager_at_unaligned_sequence_lengths(batch: int, se
     ):
         assert actual.shape == expected.shape, (name, actual.shape, expected.shape)
         torch.testing.assert_close(actual, expected, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+        assert actual.is_contiguous(), f"batch={batch} {name}: gradient-carrying output must be contiguous"
 
-    grad = torch.randn_like(collapsed_o)
-    other_grads = torch.autograd.grad((collapsed_o * grad).sum(), (x_o, fn_o, scale_o, base_o))
-    eager_grads = torch.autograd.grad((collapsed_e * grad).sum(), (x_e, fn_e, scale_e, base_e))
+    # All three outputs get a non-zero upstream gradient. Differentiating only
+    # ``collapsed`` would leave ``post`` and ``comb`` at zero and never exercise
+    # ``_mhc_sinkhorn_bwd`` or the ``post`` / ``comb`` branches of
+    # ``_mhc_pre_split_mixes_bwd`` -- which tile at ``token_block_size=32`` with no
+    # length guard, the same class of bug the forward padding fixes. The seed is
+    # fixed so both rows see identical gradients.
+    gen = torch.Generator(device=device).manual_seed(seq_len * 10 + batch)
+    weights = {
+        name: torch.randn(out.shape, device=device, dtype=out.dtype, generator=gen)
+        for name, out in (("post", post_o), ("comb", comb_o), ("collapsed", collapsed_o))
+    }
+
+    def weighted_sum(post, comb, collapsed):
+        return (
+            (post * weights["post"]).sum() + (comb * weights["comb"]).sum() + (collapsed * weights["collapsed"]).sum()
+        )
+
+    other_grads = torch.autograd.grad(weighted_sum(post_o, comb_o, collapsed_o), (x_o, fn_o, scale_o, base_o))
+    eager_grads = torch.autograd.grad(weighted_sum(post_e, comb_e, collapsed_e), (x_e, fn_e, scale_e, base_e))
     for actual, expected in zip(other_grads, eager_grads, strict=True):
         assert torch.isfinite(actual).all(), "padded backward must not read uninitialized memory"
         assert_gradient_direction_and_scale(actual, expected, min_cosine=MHC_FUSED_GRAD_COSINE, norm_rtol=0.25)
@@ -410,6 +432,20 @@ def test_mhc_tilelang_head_matches_eager_at_unaligned_sequence_lengths(batch: in
     y_e = eager(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, hc_eps)
     assert y_o.shape == y_e.shape
     torch.testing.assert_close(y_o, y_e, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+    assert y_o.is_contiguous(), f"batch={batch}: padded collapse output must be trimmed to a contiguous tensor"
+
+    # ``make_grad_leaves`` above is only meaningful if a backward actually runs: the
+    # head path goes through ``_mhc_pre_norm_fn_bwd_mul``, whose 128-token tiling has
+    # the same missing length guard as the forward's 32-token one. Comparing against
+    # eager is what pins the padded rows' gradients, and the finiteness check is what
+    # catches a tail block reading uninitialized memory.
+    gen = torch.Generator(device=device).manual_seed(seq_len * 10 + batch + 1)
+    grad = torch.randn(y_o.shape, device=device, dtype=y_o.dtype, generator=gen)
+    other_grads = torch.autograd.grad((y_o * grad).sum(), (x_o, fn_o, scale_o, base_o))
+    eager_grads = torch.autograd.grad((y_e * grad).sum(), (x_e, fn_e, scale_e, base_e))
+    for actual, expected in zip(other_grads, eager_grads, strict=True):
+        assert torch.isfinite(actual).all(), "padded backward must not read uninitialized memory"
+        assert_gradient_direction_and_scale(actual, expected, min_cosine=MHC_FUSED_GRAD_COSINE, norm_rtol=0.25)
 
 
 def test_pad_token_axis_returns_row_major_contiguous():
@@ -422,3 +458,52 @@ def test_pad_token_axis_returns_row_major_contiguous():
         assert reported == seq_len
         assert padded.is_contiguous(), seq_len
         assert padded.shape[1] % TOKEN_ALIGN == 0
+
+
+def test_pad_token_axis_returns_a_new_tensor_for_aligned_but_strided_input():
+    """An aligned input still comes back contiguous, so identity is not the trim test.
+
+    This is the case that made ``hs is not hidden_streams`` wrong: a non-contiguous
+    input of an already-aligned length is copied by ``.contiguous()``, so the
+    identity check sees "changed" even though nothing was padded. Callers must
+    compare shapes instead -- and then the trim is a no-op.
+    """
+    from veomni.ops.kernels.mhc.helper import TOKEN_ALIGN, pad_token_axis, trim_token_axis
+
+    base = torch.randn(2, TOKEN_ALIGN, 4, 512)
+    strided = base[..., ::2]  # aligned length, non-contiguous
+    assert not strided.is_contiguous()
+    padded, reported = pad_token_axis(strided, TOKEN_ALIGN)
+    assert reported == TOKEN_ALIGN
+    assert padded.shape[1] == TOKEN_ALIGN
+    assert padded.is_contiguous()
+    assert padded is not strided, "a copy here is expected; the trim must not rely on identity"
+
+    trimmed = trim_token_axis(padded, reported)
+    assert trimmed.shape[1] == reported
+    assert trimmed.is_contiguous()
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+def test_trim_token_axis_drops_padding_and_stays_contiguous(batch: int):
+    """A slice of a padded ``[batch, aligned, ...]`` buffer is not contiguous for ``batch > 1``.
+
+    The gap between samples is what a plain slice keeps: it both strides over the
+    padding and pins the whole padded allocation. ``trim_token_axis`` has to return
+    a fresh contiguous tensor, and a no-op when nothing was padded.
+    """
+    from veomni.ops.kernels.mhc.helper import trim_token_axis
+
+    aligned, seq_len = 128, 33
+    padded = torch.randn(batch, aligned, 4, 8)
+    trimmed = trim_token_axis(padded, seq_len)
+    assert trimmed.shape == (batch, seq_len, 4, 8)
+    assert trimmed.is_contiguous()
+    torch.testing.assert_close(trimmed, padded[:, :seq_len])
+    if batch > 1:
+        assert not padded[:, :seq_len].is_contiguous(), "the premise: a batch-2 slice is strided"
+
+    # Nothing padded: same tensor back when it is already contiguous.
+    whole = trim_token_axis(padded, aligned)
+    assert whole.shape[1] == aligned
+    assert whole.is_contiguous()

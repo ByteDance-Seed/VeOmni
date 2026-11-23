@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..helper import TOKEN_ALIGN, pad_token_axis, require_tilelang_input
+from ..helper import TOKEN_ALIGN, pad_token_axis, require_tilelang_input, trim_token_axis
 
 
 def wrapper(
@@ -53,5 +53,4 @@ def wrapper(
         base.float().contiguous(),
         hc_eps,
     )
-    out = mhc_pre_apply_mix(hs, mix.unsqueeze(-1))
-    return out[:, :seq_len] if hs is not hidden_streams else out
+    return trim_token_axis(mhc_pre_apply_mix(hs, mix.unsqueeze(-1)), seq_len)
