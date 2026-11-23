@@ -120,9 +120,12 @@ def test_a_rank_that_does_not_write_leaves_no_shard(tmp_path) -> None:
     writer.writes = False
 
     writer.save_conversation_list([[ConversationItem(type="text", value="prompt", role="user")]])
-    writer.finalize()
+    # The only rank wrote nothing, so the cache is empty and must not be marked complete.
+    with pytest.raises(RuntimeError, match="not marking it complete"):
+        writer.finalize()
 
     assert not list(tmp_path.glob("shard_*.parquet"))
+    assert not (tmp_path / ".offline_cache_complete").exists()
 
 
 def _text(value: str) -> list[list[ConversationItem]]:
@@ -336,3 +339,11 @@ def test_existing_shard_check_fails_on_every_rank_together(tmp_path) -> None:
     for rank in range(2):
         payload = json.loads((tmp_path / f"rank{rank}.json").read_text())
         assert payload["raised"] is True
+
+
+def test_a_cache_with_rows_is_marked_complete(tmp_path) -> None:
+    writer = SeedOmniOfflineCacheWriter(str(tmp_path), max_rows_per_shard=4)
+    writer.open()
+    writer.save_conversation_list(_text("s0"))
+    writer.finalize()
+    assert (tmp_path / ".offline_cache_complete").exists()

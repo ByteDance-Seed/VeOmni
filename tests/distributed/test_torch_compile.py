@@ -488,7 +488,7 @@ def test_compile_decoder_blocks_targets_qwen3_vl_text_layers_only(monkeypatch):
 @pytest.mark.parametrize("use_checkpoint", [False, True])
 def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
     from tests.tools.training_utils import make_eager_ops_config
-    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+    from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import (
         Qwen3VLTextConfig,
         Qwen3VLTextDecoderLayer,
         Qwen3VLTextRotaryEmbedding,
@@ -553,7 +553,7 @@ def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
 
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.data.data_collator import add_flash_attention_kwargs_from_position_ids
-    from veomni.models.transformers.qwen3_vl.generated.patched_modeling_qwen3_vl_gpu import (
+    from veomni.models.transformers.qwen3_vl.modeling_qwen3_vl import (
         Qwen3VLTextConfig,
         Qwen3VLTextDecoderLayer,
         Qwen3VLTextRotaryEmbedding,
@@ -975,7 +975,7 @@ def _deepseek_v4_fused_moe_ops_config():
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek V4 fused MoE kernel requires CUDA")
 @pytest.mark.parametrize("compile_backend", ["eager"])
 def test_deepseek_v4_fused_decoder_fullgraph_forward_backward_matches_eager(compile_backend):
-    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4ForCausalLM,
     )
 
@@ -1024,7 +1024,7 @@ def test_deepseek_v4_fused_decoder_fullgraph_forward_backward_matches_eager(comp
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek V4 fused MoE kernel requires CUDA")
 def test_deepseek_v4_inductor_fullgraph_executes_finite_optimizer_step():
-    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4ForCausalLM,
     )
 
@@ -1074,7 +1074,7 @@ def test_deepseek_v4_inductor_fullgraph_executes_finite_optimizer_step():
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek V4 fused MoE kernel requires CUDA")
 @pytest.mark.parametrize("seed", [1, 2, 3])
 def test_deepseek_v4_inductor_fixed_route_expert_vjp_matches_fp32_reference(seed):
-    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4ForCausalLM,
     )
     from veomni.ops import VeomniOp
@@ -1152,7 +1152,7 @@ def test_deepseek_v4_inductor_fixed_route_expert_vjp_matches_fp32_reference(seed
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="DeepSeek V4 fused MoE kernel requires CUDA")
 @pytest.mark.parametrize("seed", [1, 2])
 def test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle(seed):
-    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4ForCausalLM,
     )
     from veomni.ops.batch_invariant import set_batch_invariant_mode
@@ -1279,7 +1279,7 @@ def test_deepseek_v4_compiled_decoder_gradients_track_the_fp32_oracle(seed):
 
 @pytest.mark.parametrize("compile_backend", ["eager", "inductor"])
 def test_deepseek_v4_rms_norm_compiled_backward_matches_eager(compile_backend):
-    from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+    from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
         DeepseekV4RMSNorm,
     )
 
@@ -1317,9 +1317,49 @@ def _model_with_ops(**ops_fields) -> nn.Module:
 def test_compile_rejects_torchao_mxfp4(field):
     """MXTensor emits float8_e8m0fnu scales, which Inductor has no lowering for."""
     from veomni.distributed.torch_compile import _reject_incompatible_ops
+    from veomni.ops import OpsSelection, SiteOverride
 
-    with pytest.raises(RuntimeError, match=f"{field}='torchao_mxfp4'"):
-        _reject_incompatible_ops(_model_with_ops(**{field: "torchao_mxfp4"}))
+    selection = OpsSelection(name="torchao", kwargs={"dtype": "mxfp4"})
+    with pytest.raises(RuntimeError, match=rf"{field}=torchao\(dtype='mxfp4'\)"):
+        _reject_incompatible_ops(_model_with_ops(**{field: selection}))
+
+    chained_override = OpsSelection(
+        name="eager",
+        overrides=[
+            SiteOverride(site=r"layers\.0\.q_proj", name="torchao"),
+            SiteOverride(site=r"layers\.0\.q_proj", kwargs={"dtype": "mxfp4"}),
+        ],
+    )
+    with pytest.raises(RuntimeError, match=rf"{field}=torchao\(dtype='mxfp4'\)"):
+        _reject_incompatible_ops(_model_with_ops(**{field: chained_override}))
+
+
+def test_compile_checks_bound_handles_for_unmatched_mxfp4_override(monkeypatch):
+    """An unmatched MXFP4 override on a real model with bound eager handles does not block compile."""
+    from veomni.distributed.torch_compile import _reject_incompatible_ops
+    from veomni.ops import OpsSelection, SiteOverride, VeomniOp
+    from veomni.ops import registry as ops_registry
+
+    monkeypatch.setattr(ops_registry, "is_package_available", lambda _pkg: True)
+    monkeypatch.setattr(VeomniOp, "_intern", dict(VeomniOp._intern))
+
+    selection = OpsSelection(
+        name="eager",
+        overrides=[SiteOverride(site=r"layers\.99\.q_proj", name="torchao", kwargs={"dtype": "mxfp4"})],
+    )
+    model = _model_with_ops(linear_implementation=selection)
+    model.veomni_q_proj = VeomniOp("linear", "standard", selection, site="layers.0.q_proj")
+    _reject_incompatible_ops(model)
+
+    model.veomni_q_proj = VeomniOp("linear", "standard", selection, site="layers.99.q_proj")
+    with pytest.raises(RuntimeError, match=r"linear_implementation=torchao\(dtype='mxfp4'\)"):
+        _reject_incompatible_ops(model)
+
+    # Concrete model that binds gated_mlp (like Gemma3) but no linear handles:
+    # an unused linear_implementation MXFP4 selection must not block compile.
+    no_linear_model = _model_with_ops(linear_implementation=selection, gated_mlp_implementation="eager")
+    no_linear_model.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", "eager")
+    _reject_incompatible_ops(no_linear_model)
 
 
 @pytest.mark.parametrize(
@@ -1328,8 +1368,8 @@ def test_compile_rejects_torchao_mxfp4(field):
         {},
         {"linear_implementation": "eager"},
         {"linear_implementation": "qat"},
-        {"linear_implementation": "torchao_nvfp4"},
-        {"gated_mlp_implementation": "torchao_nvfp4"},
+        {"linear_implementation": "torchao"},
+        {"gated_mlp_implementation": "torchao"},
     ],
 )
 def test_compile_allows_other_rows(ops_fields):
@@ -1349,11 +1389,13 @@ def test_compile_rejection_is_skipped_without_an_ops_config():
 def test_compile_rejection_walks_sub_configs():
     """A multimodal root carries its text tower's ops one level down, so the path is reported."""
     from veomni.distributed.torch_compile import _uncompilable_at
+    from veomni.ops import OpsSelection
 
     def ops(lin=None):
         return SimpleNamespace(linear_implementation=lin, gated_mlp_implementation=None)
 
-    child_only = SimpleNamespace(ops_config=ops(lin="torchao_mxfp4"), sub_configs={})
+    mxfp4 = OpsSelection(name="torchao", kwargs={"dtype": "mxfp4"})
+    child_only = SimpleNamespace(ops_config=ops(lin=mxfp4), sub_configs={})
     root = SimpleNamespace(ops_config=ops(lin="eager"), sub_configs={"text_config": None}, text_config=child_only)
 
-    assert _uncompilable_at(root, prefix="") == ["text_config.linear_implementation='torchao_mxfp4'"]
+    assert _uncompilable_at(root, prefix="") == ["text_config.linear_implementation=torchao(dtype='mxfp4')"]

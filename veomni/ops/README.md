@@ -47,9 +47,9 @@ when the selected implementation runs.
 | `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `offset` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; all accept optional `group_size` (fused weighted rows delegate grouped calls to eager) |
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
 | `rope` | `full`, `partial`, `interleave`, `mrope`, `deepseek_v4`, `wan` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; `full` also accepts rank-3 vision layout |
-| `gated_mlp` | `standard`, `geglu` | `eager`, `liger_kernel`; `qat` (FP8 QAT) and `torchao_nvfp4` (NVFP4 QAT) are `standard` only. `liger_kernel` computes SiLU on `standard` and GELU-tanh on `geglu` — the variant fixes the activation, so it is not a choice on that row. Rows take the MLP **module** (`op(self, x, activation=...)`) and pick weights or projections themselves |
-| `linear` | `standard`, `grouped` | `eager`, `qat` (FP8 QAT), `torchao_nvfp4` (NVFP4 QAT, `standard` only). Rows take the projection **module** (`op(self.q_a_proj, x)`), not a weight tensor, so adapters work |
-| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `qat` (FP8/FP4 QAT), `deepgemm_fp8` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant |
+| `gated_mlp` | `standard`, `geglu` | `eager`, `liger_kernel`; `qat` (`dtype=fp8`, SM90+) and `torchao` (`dtype=fp8`, `nvfp4`, or `mxfp4`) are `standard` only. `liger_kernel` computes SiLU on `standard` and GELU-tanh on `geglu` — the variant fixes the activation, so it is not a choice on that row. Rows take the MLP **module** (`op(self, x, activation=...)`) and pick weights or projections themselves |
+| `linear` | `standard`, `grouped` | `eager`, `qat` (`dtype=fp8`, SM90+), `torchao` (`dtype=fp8`, `nvfp4`, or `mxfp4`, `standard` only). Rows take the projection **module** (`op(self.q_a_proj, x)`), not a weight tensor, so adapters work |
+| `moe_experts` | `standard`, `gpt_oss` | `eager`, `fused_triton`, `fused_quack`, `qat` (`dtype=fp8` or `fp4`), `deepgemm` (standard, SM90/SM100), `fused_npu`, `fused_mlu` as supported by the variant |
 | `moe_experts_lora` | `independent`, `shared` | `eager`, `fused_triton`, `fused_npu` |
 | `cross_entropy_loss` | `standard` | `eager`, `chunk_loss`, `liger_kernel` |
 | `token_logprobs` | `standard` | `eager`, `flash_attn` (GPU Triton cross-entropy), `torch_npu` (Ascend NPU cross-entropy) |
@@ -117,13 +117,13 @@ and is optional; install it with:
 uv sync --extra gpu --extra magi --dev
 ```
 
-The opt-in `deepgemm_fp8` MoE backend uses native FP8 grouped GEMMs
+The opt-in `deepgemm` MoE backend uses native FP8 grouped GEMMs
 for forward, input gradients and weight gradients on Hopper and Blackwell SM100.
 Its hidden states and weight interface remain BF16; optional FSDP2
 `expert_weight_fp8_all_gather` supplies block-quantized expert payloads directly. Routing
 weights retain their supplied dtype. Hopper uses a bounded FP32 wgrad workspace; SM100 writes BF16
 gradients directly from the FP32 accumulator in the GEMM epilogue. Recomputing
-Triton SwiGLU limits temporary storage. See [FP8 MoE training](../../docs/design/deepgemm_fp8_moe.md)
+Triton SwiGLU limits temporary storage. See [FP8 MoE training](../../docs/design/deepgemm_moe.md)
 for dependency installation, configuration, precision and distributed coverage.
 
 The common EP combine uses the registered `moe_unpermute/standard` op:
