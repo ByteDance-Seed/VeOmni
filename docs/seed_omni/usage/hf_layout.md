@@ -56,12 +56,17 @@ type is an error.
   module's weights, an unclaimed key) is *carried*: the export copies it from the
   source instead of gathering it. Carried tensors are spread over the ranks —
   small ones go whole to one rank each, round-robin, and one at or above 64 MiB
-  is read as a `Shard(0)` slice per rank — so the read is not a rank-0 cost the
-  size of the frozen checkpoint. What is *not* spread is DCP consolidation: it
-  rebuilds each output file's tensors in one process, so peak host memory on a
-  rank is the largest tensor in the output files that rank writes, not the
-  checkpoint's total. Shrink `save_hf_weights`' shard file size or export from a
-  split checkpoint when one tensor alone does not fit.- **Load host memory.** Eager loads take `device_map` as `from_pretrained` does;
+  is read as a `Shard(0)` slice per rank — so reading them is not a rank-0 cost
+  the size of the frozen checkpoint.
+  DCP consolidation is not spread the same way: it rebuilds one tensor at a time
+  into a single process, so a carried tensor is allocated whole on whichever rank
+  consolidates the output file it lands in. Peak host memory is therefore the
+  largest single carried tensor, not the checkpoint's total — but a single
+  carried tensor that large still does not fit, and no shard-file setting changes
+  that, since the allocation is per tensor. Keep such a table out of a
+  layout-based export (split checkpoint, or `save_hf_weights` off) until the
+  consolidation is chunked.
+- **Load host memory.** Eager loads take `device_map` as `from_pretrained` does;
   a module spread over several devices (`"auto"`) is loaded on CPU first, so host
   memory must hold it once.
 
