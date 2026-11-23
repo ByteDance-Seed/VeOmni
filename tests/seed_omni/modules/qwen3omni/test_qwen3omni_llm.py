@@ -393,6 +393,42 @@ def test_thinker_states_are_not_collected_by_default():
     assert module._accept_hidden_cache == []
 
 
+def test_a_single_sample_batch_gets_an_explicit_causal_mask():
+    """A one-segment ``cu_seq_lens`` is declined by the packed-mask router.
+
+    ``mask_utils._should_use_packed_mask`` requires more segments than batch rows
+    ("one segment per row is not packing"), so a single-sample batch falls through
+    to Transformers' ``find_packed_sequence_indices``. That helper treats a
+    position *gap* as a boundary, and TMRoPE's temporal row both repeats across a
+    vision span and jumps after it — so the row reads as several sequences, and
+    the resulting mask indexes past the row count. The wrapper supplies an
+    explicit mask for exactly that shape.
+    """
+    import inspect
+
+    from veomni.models.utils.mask_utils import _should_use_packed_mask
+
+    module = _accelerated_llm()
+    sample = [_text(3), _text(4)]
+    inputs = module.pre_forward(method="forward", conversation_list=[sample])
+
+    # The shape really is the declined one — otherwise this test proves nothing.
+    assert inputs["cu_seq_lens_q"].numel() == 2
+    assert not _should_use_packed_mask(inputs["cu_seq_lens_q"], "eager", 1)
+    # ...and that is exactly the shape the wrapper answers with its own mask.
+    from veomni.models.seed_omni.modules.qwen3omni.llm.modeling import Qwen3OmniLlm
+
+    assert "cu.numel()) == 2" in inspect.getsource(Qwen3OmniLlm.forward)
+    # The backend's own heuristic misreads a TMRoPE row containing a vision span
+    # (it repeats there, then jumps) — that is the case this mask guards. A
+    # text-only row is contiguous and needs no guard, which is why the branch is
+    # keyed on the segment count rather than on positions.
+    from transformers.masking_utils import find_packed_sequence_indices
+
+    tmrope_with_vision = torch.tensor([[0.0, 1.0, 2.0, 3.0, 3.0, 3.0, 5.0, 6.0]])
+    assert find_packed_sequence_indices(tmrope_with_vision) is not None
+
+
 def test_generate_refuses_sequence_parallelism():
     """`forward_pre` slices the sample per rank; `generate` has no such hook.
 

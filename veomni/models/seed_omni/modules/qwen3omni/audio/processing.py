@@ -88,7 +88,12 @@ class Qwen3OmniAudioPreprocessor(ModulePreprocessorBase):
         dummy_features: torch.Tensor | None = None,
         n_window: int = 50,
     ) -> None:
-        self._feature_extractor = feature_extractor
+        # ``_processor`` is the attribute ``bind_module_assets`` copies onto the
+        # live module and ``save_pretrained`` writes beside the weights, so the
+        # extractor has to live there or a split module loses its mel config:
+        # the loaded module would have nothing to save, and the exported one
+        # nothing to reload. ``sampling_rate`` reads it off that same attribute.
+        self._processor = feature_extractor
         self._dtype = dtype
         self._dummy_features = dummy_features
         # Only used to predict the tower's output row count for ``dyn_bsz``; the
@@ -102,7 +107,7 @@ class Qwen3OmniAudioPreprocessor(ModulePreprocessorBase):
 
     @property
     def sampling_rate(self) -> int:
-        return int(self._feature_extractor.sampling_rate)
+        return int(self._processor.sampling_rate)
 
     def bind_dummy_inputs(self, config: Qwen3OmniAudioEncoderConfig, dtype: torch.dtype | None = None) -> None:
         """Training-only FSDP anchor. 100 mel frames is one full CNN block, the
@@ -118,7 +123,7 @@ class Qwen3OmniAudioPreprocessor(ModulePreprocessorBase):
         for sample in conversation_list:
             items = [it for it in iter_desired_items([sample], types=["audio"], roles=["user"]) if not it.is_dummy]
             if items:
-                out = self._feature_extractor(
+                out = self._processor(
                     [self._checked_clip(item) for item in items],
                     sampling_rate=self.sampling_rate,
                     return_attention_mask=True,
@@ -173,7 +178,7 @@ class Qwen3OmniAudioPreprocessor(ModulePreprocessorBase):
         can fake, so the honest response is to name the limit.
         """
         samples = self._to_encoder_rate(item)
-        window = int(self._feature_extractor.n_samples)
+        window = int(self._processor.n_samples)
         if samples.shape[0] > window:
             raise ValueError(
                 f"{type(self).__name__}: clip is {samples.shape[0] / self.sampling_rate:.1f}s but the encoder's "

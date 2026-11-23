@@ -67,12 +67,15 @@ QWEN3_IT_CKPT=${QWEN3_IT_CKPT:-/mnt/hdfs/veomni/models/seed_omni/Qwen3-0.6B-Visu
 IMAGE=${IMAGE:-/mnt/hdfs/user_dir/veomni_omni/models/transformers/Janus-1.3B/teaser.png}
 # qwen3_it uses its own understanding image (seedream debug sample).
 QWEN3_IT_IMAGE=${QWEN3_IT_IMAGE:-/mnt/hdfs/user_dir/seedream/debug/output/sample_1/0.png}
+# Qwen3-Omni's split checkpoint. Needs the Mimi encoder half, which the
+# converter fetches from the hub by default (`--extra mimi_path=kyutai/mimi`).
+QWEN3OMNI_CKPT=${QWEN3OMNI_CKPT:-/mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct}
 
 CFG_DIR="configs/seed_omni"
 TRAIN_PY="tasks/omni/train_omni.py"
 INFER_PY="tasks/omni/infer_omni.py"
 
-ALL_MODELS=(janus qwen3 qwen3_it qwen3vl qwen3moe)
+ALL_MODELS=(janus qwen3 qwen3_it qwen3vl qwen3moe qwen3omni)
 
 # Selected models (default: all). Normalize to lower-case.
 if [[ $# -gt 0 ]]; then
@@ -120,12 +123,16 @@ infer_overrides() {
         --infer.generation_kwargs.max_new_tokens $MAX_NEW_TOKENS"
 }
 
+# Each family's launcher, by the directory it ships under. The size is a
+# property of the checkpoint (`--model.model_path`), not of the config, so one
+# launcher per family is what exists here.
 declare -A CONFIG=(
-  [janus]="$CFG_DIR/Janus/janus_1.3b/train/base.yaml"
-  [qwen3]="$CFG_DIR/Qwen/qwen3_0.6b/train/base.yaml"
-  [qwen3_it]="$CFG_DIR/Qwen/qwen3_0.6b/visual_instruction_tuning/base.yaml"
-  [qwen3vl]="$CFG_DIR/Qwen/qwen3vl_2b/train/base.yaml"
-  [qwen3moe]="$CFG_DIR/Qwen/qwen3_30b_a3b/train/base.yaml"
+  [janus]="$CFG_DIR/Janus/janus/train/base.yaml"
+  [qwen3]="$CFG_DIR/Qwen/qwen3/train/base.yaml"
+  [qwen3_it]="$CFG_DIR/Qwen/qwen3/visual_instruction_tuning/base.yaml"
+  [qwen3vl]="$CFG_DIR/Qwen/qwen3vl/train/base.yaml"
+  [qwen3moe]="$CFG_DIR/Qwen/moe/train/base.yaml"
+  [qwen3omni]="$CFG_DIR/Qwen/qwen3omni_30b_a3b/train/base.yaml"
 )
 
 declare -A TRAIN_STATUS
@@ -155,7 +162,7 @@ run_infer() {
       # T2I needs the full image-token grid, so override the shared short cap.
       # shellcheck disable=SC2046
       run_logged "$log" bash train.sh "$INFER_PY" "${CONFIG[$name]}" \
-        --model.model_config.modules "$CFG_DIR/Janus/janus_1.3b/infer/modules_infer_fsdp.yaml" \
+        --model.model_config.modules "$CFG_DIR/Janus/janus/infer/modules_infer_fsdp.yaml" \
         --model.model_config.infer_type infer_gen \
         --infer.prompt "A photo of a cat sitting on a chair." \
         $common \
@@ -188,11 +195,23 @@ run_infer() {
         --infer.images "$TEST_IMAGE" \
         $common
       ;;
+    qwen3omni)
+      # Speech output, eager on one device: the talker's sampling loop mixes
+      # pad_token_id with next_tokens without a device cast, so a multi-GPU
+      # "auto" split dies on a cuda:0/cuda:N mismatch.
+      # shellcheck disable=SC2046
+      run_logged "$log" python "$INFER_PY" "${CONFIG[$name]}" \
+        --model.model_path "$QWEN3OMNI_CKPT" \
+        --model.model_config.modules "$CFG_DIR/Qwen/qwen3omni_30b_a3b/infer/modules_infer_eager_audio.yaml" \
+        --model.model_config.infer_type audio_output \
+        --infer.prompt "Hello! Please say this sentence out loud." \
+        $common
+      ;;
     qwen3moe)
       # Distributed (FSDP2 + Expert-Parallel) text inference (eager would OOM at 30B).
       # shellcheck disable=SC2046
       run_logged "$log" bash train.sh "$INFER_PY" "${CONFIG[$name]}" \
-        --model.model_config.modules "$CFG_DIR/Qwen/qwen3_30b_a3b/infer/modules_infer_fsdp.yaml" \
+        --model.model_config.modules "$CFG_DIR/Qwen/moe/infer/modules_infer_fsdp.yaml" \
         --infer.prompt "What is 2+2? Answer briefly." \
         $common
       ;;

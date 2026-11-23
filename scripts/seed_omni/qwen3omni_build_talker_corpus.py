@@ -75,6 +75,8 @@ from typing import Any
 
 import torch
 
+from veomni.data.seed_omni.utils.media_metadata import AUDIO_METADATA_KEY
+
 
 SOURCE_NAME = "voice_assistant_talker"
 PROMPTS_DEFAULT = "/mnt/hdfs/veomni/datasets/voice_assistant"
@@ -207,11 +209,15 @@ def reply_of(generated: list[dict[str, Any]]) -> tuple[str, torch.Tensor | None,
     )
     if audio is None:
         return "\n".join(texts), None, None
-    rate = (audio.get("meta") or {}).get("sampling_rate")
+    # The codec declares its timeline as typed ``AudioMetadata`` under
+    # ``AUDIO_METADATA_KEY`` — not a flat ``meta["sampling_rate"]``. Reading the
+    # flat key finds nothing on every valid reply, so every row would be skipped.
+    metadata = (audio.get("meta") or {}).get(AUDIO_METADATA_KEY)
+    rate = getattr(metadata, "sampling_rate", None)
     if rate is None:
         # The rate is the vocoder's to declare; a corpus row without it cannot
         # be read back, since the data layer refuses to assume one.
-        raise ValueError("generated audio carries no meta['sampling_rate']")
+        raise ValueError(f"generated audio carries no meta[{AUDIO_METADATA_KEY!r}].sampling_rate")
     return "\n".join(texts), audio["value"], int(rate)
 
 

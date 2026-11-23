@@ -68,6 +68,8 @@ import re
 import sys
 import time
 
+from veomni.data.seed_omni.utils.media_metadata import AUDIO_METADATA_KEY, AudioMetadata
+
 
 TRANSCRIBE_PROMPT = "Transcribe this audio verbatim. Output only the words spoken."
 
@@ -166,7 +168,21 @@ def score_corpus(script_args: argparse.Namespace) -> None:
                 said = next((c["value"] for c in row["conversations"] if c["from"] == "gpt"), "")
                 samples, rate = sf.read(io.BytesIO(row["audios"][0]), dtype="float32")
                 conversation = [
-                    ConversationItem(type="audio", value=samples, role="user", meta={"sampling_rate": int(rate)}),
+                    ConversationItem(
+                        type="audio",
+                        value=samples,
+                        role="user",
+                        # Typed, because that is what the audio preprocessor reads
+                        # to resample: a flat ``sampling_rate`` key leaves a 24 kHz
+                        # corpus wav read as 16 kHz, which inflates every clip's
+                        # apparent duration by 1.5x and pushes valid ones past the
+                        # tower's 30 s window (they then score zero and get culled).
+                        meta={
+                            AUDIO_METADATA_KEY: AudioMetadata(
+                                sampling_rate=int(rate), num_samples=int(samples.shape[0])
+                            )
+                        },
+                    ),
                     ConversationItem(type="text", value=TRANSCRIBE_PROMPT, role="user"),
                 ]
                 try:

@@ -89,7 +89,6 @@ def test_generate_scatters_merged_tokens_and_deepstack_per_item():
     for item, grid in zip(items, grids, strict=True):
         expected_merged = (grid[0] * grid[1] * grid[2]) // merge_area
         assert item.value.shape == (expected_merged, cfg.out_hidden_size)
-        assert item.source == "qwen3omni_vision"
         # grid_thw is republished for the backbone's TMRoPE; the private stash is gone.
         assert item.meta["grid_thw"].tolist() == list(grid)
         assert _OMNI_GRID not in item.meta

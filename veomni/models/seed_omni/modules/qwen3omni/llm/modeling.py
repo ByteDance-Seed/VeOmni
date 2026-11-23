@@ -383,6 +383,24 @@ class Qwen3OmniLlm(InferenceMixin, PretrainedOmniModule):
         use_cache: Optional[bool] = None,
         **kwargs,
     ) -> Dict[str, Any]:
+        # The backbone's causal mask must come from an explicit one whenever it
+        # cannot be derived from ``cu_seq_lens``.
+        #
+        # ``mask_utils._should_use_packed_mask`` declines a single-segment
+        # ``cu_seq_lens`` ("one segment per row is not packing"), which would
+        # leave the mask to Transformers' ``find_packed_sequence_indices``. That
+        # helper treats a position *gap* as a sequence boundary, and TMRoPE
+        # guarantees gaps — its temporal row repeats across a vision span and
+        # jumps at the segment after it. A single-sample image+text batch then
+        # reads as several packed sequences, and the resulting mask indexes past
+        # the row count and raises.
+        if attention_mask is None and position_ids is not None and "cu_seq_lens_q" in kwargs:
+            cu = kwargs["cu_seq_lens_q"]
+            if cu is not None and int(cu.numel()) == 2:
+                # One sequence: plain causal over the whole packed row.
+                rows = int(inputs_embeds.size(1)) if inputs_embeds is not None else position_ids.size(-1)
+                attention_mask = torch.ones(1, rows, dtype=torch.long, device=position_ids.device)
+
         outputs = self.language_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,

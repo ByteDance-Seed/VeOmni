@@ -59,6 +59,13 @@ model:
         enable: true
         param_dtype: bfloat16
         reduce_dtype: float32
+        # Off for the same reason as the thinker launcher, and it matters more
+        # here: this round freezes the thinker but still runs it to produce the
+        # talker's prefill, so a module-level cast would round the backbone's
+        # float TMRoPE coordinates to bf16 — at 4096 that is 769 distinct values,
+        # up to 8 token positions of error — changing the conditioning the talker
+        # is trained against relative to the thinker round that produced it.
+        cast_forward_inputs: false
     offload_config:
       enable_activation: false
       activation_gpu_limit: 0.0

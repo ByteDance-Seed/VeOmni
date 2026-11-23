@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from veomni.models.seed_omni.modules.qwen3omni.carrier import TALKER_CODES_KEY
 from veomni.models.seed_omni.modules.qwen3omni.talker.configuration import Qwen3OmniTalkerConfig
 from veomni.models.seed_omni.modules.qwen3omni.talker.modeling import Qwen3OmniTalker
 from veomni.models.seed_omni.modules.qwen3omni.text_encoder.modeling import PromptSegment
@@ -352,7 +353,9 @@ def test_generate_appends_a_codes_item_and_signals_done(monkeypatch):
     assert outputs[FSM_SIGNAL_KEY] == SIGNAL_CODES_DONE
     codes_item = outputs["conversation_list"][-1]
     assert codes_item.type == "output"
-    assert codes_item.source == "qwen3omni_talker"
+    # The codec finds these by a metadata stamp, not a `source` tag —
+    # `ConversationItem` has no such field.
+    assert codes_item.meta[TALKER_CODES_KEY] is True
     # The codec accepts (num_code_groups, T); keep the talker's output on that contract.
     assert codes_item.value.shape == (num_groups, 12)
 
