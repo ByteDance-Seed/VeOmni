@@ -42,6 +42,7 @@ def wrapper(
     x: Tensor,
     *,
     swiglu_limit: float | None = None,
+    dtype: str = "fp8",
     block_size: int = 128,
     activation: str = "silu",
 ) -> Tensor:
@@ -55,6 +56,8 @@ def wrapper(
     """
     from .._module import render
 
+    if dtype != "fp8":
+        raise ValueError(f"gated_mlp/standard/qat only supports dtype='fp8', got {dtype!r}.")
     gate_w, gate_b, up_w, up_b, down_w, down_b = render(mlp, impl="qat", activation=activation).weights
     x_gate_q = fp8_fake_quant_act(x, block_size=block_size) if x.numel() > 0 else x
     gate = F.linear(x_gate_q, fp8_fake_quant_weight(gate_w, block_size=block_size), _eager.optional_bias(gate_b))
