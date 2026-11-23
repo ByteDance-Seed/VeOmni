@@ -421,15 +421,26 @@ class OpsSelection:
     kwargs: dict[str, Any] = field(default_factory=dict)
     overrides: list[SiteOverride] = field(default_factory=list)
 
-    def resolve(self, site: str | None = None) -> tuple[str | None, dict[str, Any]]:
-        """Resolve ``(impl, kwargs)`` for ``site``, applying matching overrides in order."""
-        name, kwargs = self.name, dict(self.kwargs)
+    def resolve(
+        self,
+        site: str | None = None,
+        *,
+        default_name: str | None = None,
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Resolve ``(impl, kwargs)`` for ``site``, applying matching overrides in order.
+
+        When ``self.name`` is ``None``, ``default_name`` supplies the resolved host
+        default row so an override that switches to a different row resets inherited
+        kwargs while an override targeting the same row merges them.
+        """
+        name = self.name if self.name is not None else default_name
+        kwargs = dict(self.kwargs)
         if not self.overrides or site is None:
             return name, kwargs
         for rule in self.overrides:
             if not rule.matches(site):
                 continue
-            if rule.name is not None and name is not None and rule.name != name:
+            if rule.name is not None and rule.name != name:
                 name = rule.name
                 kwargs = dict(rule.kwargs or {})
             else:
@@ -465,25 +476,12 @@ class OpsSelection:
         )
 
 
-def _freeze_kwarg_value(value: Any) -> Any:
-    """Convert structured YAML/JSON container values into a stable hashable key."""
-    if isinstance(value, dict):
-        return ("__dict__", tuple(sorted((k, _freeze_kwarg_value(v)) for k, v in value.items())))
-    if isinstance(value, list):
-        return ("__list__", tuple(_freeze_kwarg_value(v) for v in value))
-    if isinstance(value, tuple):
-        return ("__tuple__", tuple(_freeze_kwarg_value(v) for v in value))
-    if isinstance(value, set):
-        return ("__set__", frozenset(_freeze_kwarg_value(v) for v in value))
-    return value
-
-
 def _kwargs_cache_key(kwargs: dict[str, Any]) -> tuple | None:
-    """Return a hashable intern key for ``kwargs``, or ``None`` if any value is unhashable."""
+    """Return a hashable intern key for immutable ``kwargs``, or ``None`` to bypass interning."""
     if not kwargs:
         return ()
     try:
-        key = tuple(sorted((k, _freeze_kwarg_value(v)) for k, v in kwargs.items()))
+        key = tuple(sorted(kwargs.items()))
         hash(key)
     except TypeError:
         return None
@@ -493,9 +491,11 @@ def _kwargs_cache_key(kwargs: dict[str, Any]) -> tuple | None:
 class VeomniOp:
     """Local handle for one ``(op, variant, impl)`` row plus optional row kwargs.
 
-    Interned by ``(op, variant, impl, kwargs)`` when ``kwargs`` can be reduced to
-    a hashable key. Always calls ``entry.wrapper``. Compound Functions must use
-    ``resolve_op(...).forward`` / ``.backward``, not this handle.
+    Interned by ``(op, variant, impl, kwargs)`` when ``kwargs`` are hashable
+    (immutable); handles with mutable or unhashable kwargs bypass interning so
+    later mutations cannot poison cached handles. Always calls ``entry.wrapper``.
+    Compound Functions must use ``resolve_op(...).forward`` / ``.backward``, not
+    this handle.
     """
 
     _intern: dict[tuple[str, str, str, tuple], VeomniOp] = {}
@@ -511,7 +511,8 @@ class VeomniOp:
         """Return the interned handle for the resolved row and its kwargs."""
         kwargs: dict[str, Any] = {}
         if isinstance(impl, OpsSelection):
-            impl, kwargs = impl.resolve(site)
+            default_name = OP_REGISTRY.default_impl(op, variant) if impl.name is None else None
+            impl, kwargs = impl.resolve(site, default_name=default_name)
         kwargs_key = _kwargs_cache_key(kwargs)
         if impl is not None and kwargs_key is not None:
             cached = cls._intern.get((op, variant, impl, kwargs_key))
