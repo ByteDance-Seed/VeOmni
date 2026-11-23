@@ -20,8 +20,7 @@ inside one node, so the graph is one entry deep -- there is no cache to hand to 
 sibling module.
 
 ``model_type`` is ``diffusion_gemma_omni`` so the composed-model registries stay
-disjoint from the vendored ``veomni.models.transformers.diffusion_gemma`` entry the
-non-Omni trainer resolves.
+disjoint from the vendored ``veomni.models.transformers.diffusion_gemma`` entry.
 """
 
 from .. import (

@@ -81,7 +81,7 @@ class TrainingMixin(TrainingModuleMixin):
         boundaries come from ``cu_seq_lens_*``, which this module derives from
         ``position_ids``. A ``[B, L]`` block without those boundaries would let
         every row attend across the whole batch, and no mask would say otherwise.
-        Packing is also what the non-Omni LLaDA path does (``MainCollator`` packs
+        Packing is also what ``MainCollator`` does (it packs
         several samples into one row and marks each start with ``position_ids ==
         0``), so the two paths describe the same batch.
 
@@ -163,9 +163,9 @@ class TrainingMixin(TrainingModuleMixin):
     def on_micro_batches_ready(self, micro_batches: list[dict[str, Any]]) -> None:
         """Record this step's supervised sample count.
 
-        Mirrors ``DllmTrainer.on_micro_batches_ready``. The count is what
-        ``dllm_mean_global_loss`` divides by, so it has to match the non-Omni
-        path exactly: :func:`~veomni.utils.loss_utils.count_supervised_samples`
+        The count is what ``dllm_mean_global_loss`` divides by, so it has to match
+        the single-model training step exactly:
+        :func:`~veomni.utils.loss_utils.count_supervised_samples`
         marks a sample when it has any *answer* token, not when its weights are
         non-zero. A LLaDA draw masks nothing in about ``1/(N+1)`` of samples with
         an ``N``-token answer; those contribute zero to the sum but are still one
@@ -189,7 +189,7 @@ class TrainingMixin(TrainingModuleMixin):
         than from a ``loss_weight`` key that does not exist yet at this point.
 
         The per-item dicts carry the same ``answer_mask`` /
-        ``loss_weight`` / ``position_ids`` keys the non-Omni collator produces, so
+        ``loss_weight`` / ``position_ids`` keys the shared collator produces, so
         the shared predicate decides the count unchanged. LLaDA is a single
         stream with no canvas expansion, so no ``canvas_length`` reshaping
         applies.
@@ -213,11 +213,11 @@ class TrainingMixin(TrainingModuleMixin):
 
         ``dllm_mean_global_loss`` all-reduces that count over data parallel ranks
         and multiplies by ``fsdp_size`` to undo FSDP's gradient averaging -- the
-        same step ``DllmTrainer.postforward`` performs for the LLaDA family.
+        same reduction the single-model training step performs for the LLaDA family.
 
         A MoE router's load-balancing term is already a per-token mean, so it is
         added after this normalization rather than divided by the sample count,
-        matching ``DllmTrainer.postforward``.
+        which is what that step does too.
 
         The divisor covers the whole accumulation window, so the result is the
         step's mean rather than one micro-batch's contribution. That is what

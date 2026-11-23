@@ -16,7 +16,7 @@
 
 The module keeps the vendored ``LLaDAMoEConfig`` fields unchanged and only adds
 the ``model_type`` the SeedOmni registries key on; ``llada_moe_omni`` stays
-disjoint from the vendored ``llada_moe`` entry the non-Omni trainer resolves.
+disjoint from the vendored ``llada_moe`` architecture entry.
 """
 
 from __future__ import annotations

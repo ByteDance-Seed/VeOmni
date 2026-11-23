@@ -23,9 +23,9 @@ Only ``_loss`` leaves this module. The vendored forward also returns
 ``diffusion_loss`` and ``encoder_ar_loss`` as the two ``Eq. 13`` components, but
 ``OmniModel.forward`` collects nothing but the ``_loss`` key, so a component cannot
 reach the trainer's log through this graph. Reporting them would need a
-component-loss channel in the graph runtime; until that exists, the split is
-visible only through the non-Omni trainer. The summed ``_loss`` is unaffected --
-the vendored forward already added the two terms together.
+component-loss channel in the graph runtime, which does not exist yet. The summed
+``_loss`` is unaffected -- the vendored forward already added the two terms
+together.
 """
 
 from __future__ import annotations
@@ -206,12 +206,18 @@ class DiffusionGemmaOmni(DiffusionGemmaForBlockDiffusion, PretrainedOmniModule):
         forwards every canvas input straight to the vendored implementation. The
         component losses are passed through for logging only -- ``loss`` already
         contains them, so reporting them must not add them a second time.
+
+        ``return_logits=False`` is forced here: this is the training entry, the batch
+        always carries ``labels``, and the alternative is materialising a
+        ``(B, K*C, vocab)`` fp32 logit tensor for a 262k vocabulary. With logits off the
+        vendored forward scores the canvas through ``chunked_weighted_diffusion_loss``.
         """
         kwargs.pop("conversation_list", None)
         # `num_supervised_examples` is the collator's own bookkeeping for the
         # trainer's per-sample divisor; the module counts samples itself from the
         # carrier, so forwarding it would let two counters disagree.
         kwargs.pop("num_supervised_examples", None)
+        kwargs.setdefault("return_logits", False)
         outputs = super().forward(**kwargs)
         result: dict[str, Any] = {}
         if outputs.loss is not None:

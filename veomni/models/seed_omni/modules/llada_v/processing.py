@@ -23,8 +23,7 @@ embeddings go.
 This reuses ``process_llada_v_example`` rather than re-deriving the pipeline: the
 mask ratio is drawn from a generator keyed on ``(mask_seed, mask_epoch, tokens)``
 and the image slots come from the chat template's placeholder count, so a second
-implementation would drift from the one the non-Omni trainer uses -- exactly the
-comparison this module exists to support.
+implementation would drift from the one the shared data transform draws.
 """
 
 from __future__ import annotations

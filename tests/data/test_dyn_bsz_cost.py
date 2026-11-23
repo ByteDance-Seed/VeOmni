@@ -28,8 +28,8 @@ checks the arithmetic of the DG charge and that a buffer spends it.
 import pytest
 import torch
 
+from veomni.data.data_collator import diffusion_gemma_sample_cost
 from veomni.data.dynamic_batching import DynBszBuffer
-from veomni.trainer.dllm_trainer import diffusion_gemma_sample_cost
 
 
 CANVAS = 256

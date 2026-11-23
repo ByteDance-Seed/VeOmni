@@ -21,8 +21,8 @@ has to stack and pad them.
 
 This reuses ``process_llada_example`` rather than re-deriving the corruption:
 the mask ratio is drawn from a generator keyed on ``(mask_seed, mask_epoch,
-tokens)``, and a second implementation would drift from the one the non-Omni
-trainer uses, which is exactly the comparison this module exists to support.
+tokens)``, and a second implementation would drift from the one the shared data
+transform draws.
 """
 
 from __future__ import annotations

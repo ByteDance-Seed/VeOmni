@@ -23,8 +23,8 @@ model:
     train_graph: configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/train/graph_train.yaml
     max_seq_len: 1024
     text_keys: messages
-    # The checkpoint's own template, driven through `apply_chat_template` -- the same
-    # one the non-Omni config uses. There is no `gemma3` registry entry.
+    # The checkpoint's own template, driven through `apply_chat_template`. There is
+    # no `gemma3` registry entry.
     chat_template: tokenizer_generation_prompt
     # The canvas geometry the preprocessor cuts the answer with. `max_canvases`
     # bounds the encoder sequence; `compute_all_canvas_df_loss` keeps the `(K, C)`
@@ -34,7 +34,6 @@ model:
     canvas_start: 0
     compute_all_canvas_df_loss: true
     canvas_batching: flat_seq_pack
-    self_conditioning_prob: 0.5
     encoder_ar_loss: true
     # Generation FSM for `tasks/omni/infer_omni.py`: one node that calls the
     # block-diffusion sampler. Not usable under `ep_size > 1` -- the sampler drives the

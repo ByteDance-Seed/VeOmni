@@ -49,12 +49,13 @@ VeOmni deviations from upstream:
   (``config.attn_dg_prefix``). See ``dg_prefix.py``.
 """
 
+import hashlib
 import warnings
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import lru_cache, partial
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch._dynamo.config as dynamo_config
@@ -94,6 +95,7 @@ from transformers.utils.output_capturing import OutputRecorder, capture_outputs
 
 from ....distributed.parallel_state import get_parallel_state
 from ....ops import VeomniOp
+from ....ops.batch_invariant import set_batch_invariant_mode
 from ....ops.kernels.moe_experts.standard.activation_gate import refuse_fused_moe_on_unsupported_activation
 from ....utils import logging
 from ....utils.constants import IGNORE_INDEX
@@ -3660,6 +3662,101 @@ class DiffusionGemmaForBlockDiffusion(DiffusionGemmaPreTrainedModel):
     def set_input_embeddings(self, value):
         self.model.decoder.embed_tokens = value
         self.model.encoder.language_model.set_input_embeddings(value)
+
+    def canvas_sample_count(self, decoder_input_ids: torch.Tensor) -> int:
+        """How many Bernoulli draws a canvas batch needs: one per canvas.
+
+        A `(B, K, C)` stack carries `B*K`, and a flat row carries one per
+        `canvas_length` block, so a packed row counts its canvases rather than its rows.
+        """
+        if decoder_input_ids.ndim == 3:
+            return int(decoder_input_ids.shape[0] * decoder_input_ids.shape[1])
+        canvas_length = int(self.config.canvas_length)
+        batch, seq = decoder_input_ids.shape[:2]
+        if seq == canvas_length:
+            return batch
+        if canvas_length < 1 or seq % canvas_length != 0:
+            raise ValueError(f"A canvas row of {seq} tokens is not a whole number of {canvas_length}-token canvases.")
+        return batch * (seq // canvas_length)
+
+    def self_conditioning_generator(self, *, seed: int, global_step: int, micro_step: int) -> torch.Generator:
+        """CPU generator for this micro-batch's Bernoulli, derived rather than carried.
+
+        Keyed on ``(seed, global_step, micro_step)``. Seeding from ``seed`` alone and
+        letting one long-lived generator advance is what a checkpoint cannot express:
+        ``CheckpointerCallback._extra_state`` persists only the default CPU RNG, so a
+        resumed run rewinds that stream to step 0 and replays the first steps' masks at
+        step N. Deriving from the step counter makes the mask a pure function of where
+        training is, which resume already restores.
+
+        The default generators are not an option either: Triton compile / autotune
+        consumes both the CUDA generator and the default CPU one, so a later
+        ``torch.rand`` -- even on CPU -- disagrees across DP ranks that share a seed, and
+        between attention backends on the same seed.
+        """
+        digest = hashlib.blake2b(digest_size=8)
+        for value in (int(seed), int(global_step), int(micro_step)):
+            digest.update((value & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little"))
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int.from_bytes(digest.digest(), "little"))
+        return generator
+
+    def attach_self_conditioning(
+        self,
+        micro_batch: Dict[str, Any],
+        *,
+        seed: int,
+        global_step: int,
+        micro_step: int,
+        probability: float | None = None,
+        batch_invariant: bool = False,
+    ) -> Dict[str, Any]:
+        """Attach this micro-batch's self-conditioning signal, in place and returned.
+
+        Every denoising step hands the model the previous step's prediction, so a model
+        finetuned without that signal would meet it cold at inference. Here the signal is
+        the model's own prediction for the *same* noisy sequence rather than for the
+        previous, differently-noised one -- the standard self-conditioning approximation,
+        which costs one extra forward instead of a second denoising step.
+
+        The draw is a pure function of ``(seed, global_step, micro_step)``, which is what
+        makes a resumed run reproduce the masks it would have drawn (see
+        :meth:`self_conditioning_generator`). The caller owns those three counters; this
+        method keeps no history between calls.
+
+        Set ``config.self_conditioning_prob`` to 0 (or leave ``probability`` at 0) to skip
+        the extra pass entirely.
+        """
+        if "decoder_input_ids" not in micro_batch:
+            return micro_batch
+        if not self.training:
+            return micro_batch
+        prob = (
+            float(getattr(self.config, "self_conditioning_prob", 0.0) or 0.0) if probability is None else probability
+        )
+        if prob <= 0.0:
+            return micro_batch
+
+        n_samples = self.canvas_sample_count(micro_batch["decoder_input_ids"])
+        condition = (
+            torch.rand(
+                n_samples,
+                generator=self.self_conditioning_generator(seed=seed, global_step=global_step, micro_step=micro_step),
+            )
+            < prob
+        )
+        conditioning_batch = {k: v for k, v in micro_batch.items() if k not in ("labels", "loss_weight")}
+        with torch.no_grad(), set_batch_invariant_mode(batch_invariant):
+            embeddings = self(
+                **conditioning_batch,
+                use_cache=False,
+                return_logits=False,
+                return_self_conditioning_embeddings=True,
+            ).self_conditioning_embeddings
+
+        micro_batch["self_conditioning_embeddings"] = embeddings
+        micro_batch["self_conditioning_mask"] = condition.to(device=embeddings.device)
+        return micro_batch
 
     def encoder_ar_term(
         self,

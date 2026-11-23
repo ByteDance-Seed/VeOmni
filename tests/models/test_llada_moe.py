@@ -1,18 +1,15 @@
-"""LLaDA-MoE under DllmTrainer: bidirectional packed loss, aux loss, EP plan, checkpoint fusion."""
+"""LLaDA-MoE: bidirectional packed loss, aux loss, EP plan, checkpoint fusion."""
 
 import fnmatch
 import importlib.util
 import json
 import os
-import types
 
 import pytest
 import torch
 
 from tests.models.test_llada import REPO_ROOT, _packed_vs_separate, _sample, _toy_model
 from veomni.models.transformers.llada_moe.checkpoint_tensor_converter import LLaDAMoECheckpointTensorConverter
-from veomni.trainer import dllm_trainer
-from veomni.trainer.dllm_trainer import DllmTrainer
 
 
 TOY_CONFIG = "./tests/toy_config/llada_moe_toy"
@@ -66,26 +63,6 @@ def test_aux_loss_is_returned_apart_from_the_masked_loss():
     torch.testing.assert_close(routed.loss, plain.loss)
     (routed.loss + routed.aux_loss).backward()
     assert model.model.layers[0].mlp.gate.weight.grad is not None
-
-
-def test_trainer_adds_weighted_aux_after_sample_normalization(monkeypatch):
-    monkeypatch.setattr(dllm_trainer, "dllm_mean_global_loss", lambda s, n, sum_spans_sp_group=False: s / n)
-    trainer = DllmTrainer.__new__(DllmTrainer)
-    trainer.base = types.SimpleNamespace(
-        model=types.SimpleNamespace(model_config=types.SimpleNamespace(router_aux_loss_coef=0.01))
-    )
-    trainer.micro_batches_num_samples = 4
-    # two micro-batches: the step's aux terms add up to one coef * mean(aux), not to twice it
-    trainer.num_micro_batches = 2
-    step_loss, step_aux = 0.0, 0.0
-    for aux in (3.0, 5.0):
-        outputs = types.SimpleNamespace(loss=torch.tensor(4.0), aux_loss=torch.tensor(aux))
-        loss, loss_dict = trainer.postforward(outputs, {})
-        step_loss, step_aux = step_loss + float(loss), step_aux + float(loss_dict["aux_loss"])
-    assert step_aux == pytest.approx(0.01 * 4.0)
-    assert step_loss == pytest.approx(2.0 + 0.01 * 4.0)
-    loss, loss_dict = trainer.postforward(types.SimpleNamespace(loss=torch.tensor(8.0), aux_loss=None), {})
-    assert "aux_loss" not in loss_dict and float(loss) == 2.0
 
 
 def test_ep_plan_covers_every_expert_weight_and_nothing_else():

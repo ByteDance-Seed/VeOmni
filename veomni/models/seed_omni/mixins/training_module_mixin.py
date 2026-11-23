@@ -107,10 +107,10 @@ class TrainingModuleMixin:
         ``backward``, and a loss normalized per *step* (rather than per
         micro-batch) needs the step's total.
 
-        ``DllmTrainer`` uses the equivalent hook to count the step's samples
-        before ``dllm_mean_global_loss`` divides by them; a dLLM module in this
-        graph reads the same contract. Default: no-op, which is right for every
-        module whose loss is a per-micro-batch mean.
+        The dLLM loss is normalized per *step*: its sample count spans the whole
+        accumulation window and ``dllm_mean_global_loss`` divides by it; a dLLM
+        module in this graph reads that contract from this hook. Default: no-op,
+        which is right for every module whose loss is a per-micro-batch mean.
 
         Runs on the live module instance (below the FSDP2 wrap), before the
         first ``pre_forward`` of the step.

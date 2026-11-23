@@ -20,7 +20,7 @@ Two things differ from an autoregressive decoder, and both have to hold under
   The varlen flash backends get that from the ``cu_seq_lens`` the collator
   precomputes; sdpa / eager need an explicit block-diagonal mask.
 - The loss is the in-place masked CE ``sum_i w_i * CE_i`` over masked positions
-  (no label shift), left un-normalized for `DllmTrainer` to divide by the global
+  (no label shift), left un-normalized for the training step to divide by the global
   sample count.
 """
 

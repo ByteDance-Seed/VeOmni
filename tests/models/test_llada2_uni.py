@@ -1,4 +1,4 @@
-"""LLaDA2.0-Uni under DllmTrainer: understand_image template, VQ-id transform, packed loss, converter."""
+"""LLaDA2.0-Uni: understand_image template, VQ-id transform, packed loss, converter."""
 
 import importlib.util
 import json
@@ -304,25 +304,6 @@ def _converter():
 
 def test_converter_self_test():
     _converter().self_test()
-
-
-def test_trainer_refuses_image_data_without_a_chat_template(monkeypatch):
-    from veomni.trainer import dllm_trainer
-
-    image_processor = types.SimpleNamespace(patch_size=PATCH, merge_size=1, temporal_patch_size=1)
-    monkeypatch.setattr(dllm_trainer.AutoImageProcessor, "from_pretrained", lambda path: image_processor)
-    trainer = object.__new__(dllm_trainer.DllmTrainer)
-    model_config = types.SimpleNamespace(
-        model_type="llada2_uni", vision_config=types.SimpleNamespace(patch_size=PATCH)
-    )
-    trainer.base = types.SimpleNamespace(
-        args=types.SimpleNamespace(
-            data=types.SimpleNamespace(data_type="llada2_uni"), model=types.SimpleNamespace(tokenizer_path="ckpt")
-        ),
-        model=types.SimpleNamespace(model_config=model_config, chat_template=None, processor=None, model_assets=[]),
-    )
-    with pytest.raises(ValueError, match="needs `model.chat_template`"):
-        trainer._build_image_processor()
 
 
 @pytest.mark.skipif(not os.path.exists(REAL_CKPT), reason="LLaDA2.0-Uni checkpoint not mounted")

@@ -258,7 +258,7 @@ Core files:
 ## Trainer Extensions
 
 24. **Trainer callback lifecycle changes must cover composed trainers**
-   - `TextDPOTrainer`, `DiTTrainer`, and `DllmTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
+   - `TextDPOTrainer` and `DiTTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
 25. **Kernel handles belong to model instances**

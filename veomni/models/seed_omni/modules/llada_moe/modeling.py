@@ -22,9 +22,8 @@ of which live in ``accelerated/``.
 ``_loss`` stays the *local weighted sum* ``sum_i w_i * CE_i`` and ``aux_loss``
 travels beside it, unweighted and unfolded: the objective divides the CE term by
 the step's global sample count, and folding a per-token mean into that would
-rescale it with the batch composition. ``LladaMoeTrainingMixin.normalize_loss``
-adds ``router_aux_loss_coef * aux_loss`` after the division, matching
-``DllmTrainer.postforward``.
+rescale it with the batch composition. ``TrainingMixin.normalize_loss`` adds
+``router_aux_loss_coef * aux_loss`` after the division.
 """
 
 from __future__ import annotations

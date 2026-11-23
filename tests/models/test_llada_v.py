@@ -1,4 +1,4 @@
-"""LLaDA-V under DllmTrainer: image-aware template and transform, packed multimodal loss, converter."""
+"""LLaDA-V: image-aware template and transform, packed multimodal loss, converter."""
 
 import importlib.util
 import json

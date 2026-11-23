@@ -17,7 +17,9 @@ import torch
 
 from veomni.models.seed_omni.modules.diffusion_gemma.accelerated import DiffusionGemmaOmniAccelerated
 from veomni.models.seed_omni.modules.diffusion_gemma.accelerated import accelerated as mod
+from veomni.models.seed_omni.modules.diffusion_gemma.modeling import DiffusionGemmaOmni
 from veomni.models.seed_omni.utils.conversation import ConversationItem
+from veomni.models.transformers.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
 
 
 def _feature(canvas_length: int = 4, num_canvases: int = 1, prompt: int = 3) -> dict:
@@ -99,7 +101,7 @@ def test_packing_is_read_off_the_canvas_batching_mode(monkeypatch):
         def __init__(self, **kwargs):
             seen.update(kwargs)
 
-        def __call__(self, features):
+        def __call__(self, features, **kwargs):
             return {"input_ids": torch.zeros(1, 1, dtype=torch.long)}
 
     monkeypatch.setattr(mod, "DiffusionGemmaCollator", Recorder)
@@ -108,6 +110,66 @@ def test_packing_is_read_off_the_canvas_batching_mode(monkeypatch):
     _module(pack=False).batch_pre(conversation_list=[[_item()]])
 
     assert seen["pack_samples"] is False
+
+
+def test_the_canvas_axis_is_aligned_across_ranks_when_canvases_are_serial(monkeypatch):
+    """``serial`` issues one decoder pass per canvas, so an unequal `K` across ranks
+    means an unequal number of FSDP/EP collectives -- a hang, not a wrong number.
+
+    The collator only pads to the longest `K` inside one micro-batch, and ranks draw
+    different samples, so the module has to reduce the max `K` itself.
+    """
+    captured = {}
+
+    class Collator:
+        def __init__(self, **kwargs):
+            pass
+
+        def __call__(self, features):
+            return {
+                "decoder_input_ids": torch.zeros(1, 2, 4, dtype=torch.long),
+                "labels": torch.zeros(1, 2, 4, dtype=torch.long),
+                "loss_weight": torch.ones(1, 2, 4),
+            }
+
+    monkeypatch.setattr(mod, "DiffusionGemmaCollator", Collator)
+    monkeypatch.setattr(mod, "get_parallel_state", lambda: SimpleNamespace(sp_size=1))
+    monkeypatch.setattr(mod.dist, "is_available", lambda: True)
+    monkeypatch.setattr(mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mod, "all_reduce", lambda value, op: 5)
+    monkeypatch.setattr(
+        mod,
+        "pad_decoder_canvases",
+        lambda micro_batch, target_k: captured.update(k=micro_batch, target_k=target_k) or micro_batch,
+    )
+
+    _module(pack=False).batch_pre(conversation_list=[[_item()]])
+
+    assert captured["target_k"] == 5
+    assert captured["k"]["decoder_input_ids"].shape[1] == 2  # the move itself is covered by data_collator's test
+
+
+def test_a_packed_batch_skips_the_canvas_alignment(monkeypatch):
+    """A padded slot has no sample to belong to under packing, and the mode decodes in
+    one pass, so no collective count depends on `K`."""
+    called = {"all_reduce": False}
+
+    class Collator:
+        def __init__(self, **kwargs):
+            pass
+
+        def __call__(self, features):
+            return {"decoder_input_ids": torch.zeros(1, 2, 4, dtype=torch.long)}
+
+    monkeypatch.setattr(mod, "DiffusionGemmaCollator", Collator)
+    monkeypatch.setattr(mod, "get_parallel_state", lambda: SimpleNamespace(sp_size=1))
+    monkeypatch.setattr(mod.dist, "is_available", lambda: True)
+    monkeypatch.setattr(mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(mod, "all_reduce", lambda *args, **kwargs: called.update(all_reduce=True))
+
+    _module(pack=True).batch_pre(conversation_list=[[_item()]])
+
+    assert called["all_reduce"] is False
 
 
 def test_a_sample_without_processed_tensors_is_refused():
@@ -123,3 +185,51 @@ def test_the_module_declares_that_its_loss_spans_the_step():
     """``dllm_mean_global_loss`` divides by the whole accumulation window's sample
     count, so the trainer must not apply ``1 / num_micro_steps`` on top."""
     assert DiffusionGemmaOmniAccelerated.loss_is_step_mean is True
+
+
+def test_a_k_canvas_example_counts_once_not_k_times():
+    """An all-canvas example's ``K`` rows already sum to one example's mean.
+
+    ``_build_diffusion_gemma_decoder_targets`` divides each canvas's ``1/C`` weights by
+    ``K``, so the whole stack sums to 1 for a fully supervised answer. Counting rows
+    would divide that mean by ``K`` again, and the error would track the answer-length
+    distribution instead of showing up as a constant factor.
+    """
+    stacked = _feature(num_canvases=3)
+    stacked["loss_weight"] = torch.full((3, 4), 1.0 / 12.0)  # (1/K) * (1/C) per row
+    assert float(stacked["loss_weight"].sum()) == pytest.approx(1.0)
+
+    count = mod.TrainingMixin._micro_batch_sample_count({"conversation_list": [[_item(stacked)]]})
+
+    assert count == 1
+
+
+def test_an_example_whose_draw_masked_nothing_still_counts():
+    """Zero weights but a supervised sample: leaving it out biases the mean up."""
+    empty = _feature()
+    empty["loss_weight"] = torch.zeros(1, 4)
+
+    count = mod.TrainingMixin._micro_batch_sample_count({"conversation_list": [[_item(empty)], [_item(_feature())]]})
+
+    assert count == 1
+
+
+def test_the_training_forward_scores_the_canvas_without_materialising_logits(monkeypatch):
+    """``(B, K*C, 262144)`` fp32 logits is the one allocation this recipe cannot afford.
+
+    The vendored forward only takes the chunked path when ``return_logits=False``, so
+    the module has to ask for it: nothing above this sends the flag, and the default is
+    `True`.
+    """
+    seen = {}
+
+    def fake_vendored_forward(self, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(loss=None, aux_loss=None)
+
+    monkeypatch.setattr(DiffusionGemmaForBlockDiffusion, "forward", fake_vendored_forward)
+
+    module = DiffusionGemmaOmni.__new__(DiffusionGemmaOmni)
+    module.forward(decoder_input_ids=torch.zeros(1, 1, 4, dtype=torch.long), labels=torch.zeros(1, 1, 4))
+
+    assert seen["return_logits"] is False

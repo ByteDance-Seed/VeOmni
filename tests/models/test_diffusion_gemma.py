@@ -65,12 +65,14 @@ def toy_runtime(model, **assets):
     """Wrap a built model in the runtime handle a trainer reads it through, skipping the build.
 
     Bound to whatever parallel state is current, so no mesh has to be registered by name.
+    Derived from ``VeOmniModelRuntime`` directly: the tests here exercise the model and
+    the training spine, not the checkpoint-asset handling a dLLM-specific subclass adds.
     """
     from veomni.distributed.clip_grad_norm import veomni_compute_grad_norm
     from veomni.distributed.parallel_state import get_parallel_state
-    from veomni.trainer.dllm_trainer import DllmModelRuntime
+    from veomni.models.model_runtime import VeOmniModelRuntime
 
-    class _ToyRuntime(DllmModelRuntime):
+    class _ToyRuntime(VeOmniModelRuntime):
         @property
         def parallel_state(self):
             return get_parallel_state()
@@ -214,101 +216,6 @@ class TestRegistration:
         monkeypatch.setenv("MODELING_BACKEND", "veomni")
         resolved = OpsImplementationConfig(attn_implementation=f"flash_attention_{version}")
         assert resolved.attn_implementation == f"veomni_flash_attention_{version}"
-
-
-class TestModelAssets:
-    def _runtime(self, model_path="/model"):
-        from types import SimpleNamespace
-
-        from veomni.trainer.dllm_trainer import DllmModelRuntime
-
-        runtime = DllmModelRuntime.__new__(DllmModelRuntime)
-        runtime.args = SimpleNamespace(model_path=model_path, tokenizer_path="/tokenizer")
-        runtime.model_config = DiffusionGemmaConfig.from_pretrained(TOY_CONFIG_PATH)
-        return runtime
-
-    def test_text_checkpoint_serializes_source_generation_config(self, monkeypatch, tmp_path):
-        from transformers import GenerationConfig
-
-        from veomni.models import save_model_assets
-        from veomni.models.model_runtime import VeOmniModelRuntime
-
-        runtime = self._runtime()
-        generation_config = GenerationConfig(max_new_tokens=17)
-
-        def build_base_assets(self):
-            self.tokenizer = None
-            self.model_assets = [self.model_config]
-
-        monkeypatch.setattr(VeOmniModelRuntime, "_build_model_assets", build_base_assets)
-        monkeypatch.setattr(
-            "veomni.trainer.dllm_trainer.GenerationConfig.from_pretrained",
-            lambda *args, **_: generation_config if args[-1] == "/model" else None,
-        )
-
-        runtime._build_model_assets()
-        save_model_assets(str(tmp_path), [runtime.model_assets[-1]])
-
-        saved = json.loads((tmp_path / "generation_config.json").read_text())
-        assert saved["max_new_tokens"] == 17
-
-    def test_missing_source_generation_config_falls_back_to_model_defaults(self, monkeypatch):
-        from transformers import GenerationConfig
-
-        from veomni.models.model_runtime import VeOmniModelRuntime
-
-        runtime = self._runtime()
-        derived = GenerationConfig(max_new_tokens=23)
-
-        def build_base_assets(self):
-            self.tokenizer = None
-            self.model_assets = [self.model_config]
-
-        def missing(*_args, **_kwargs):
-            raise OSError("missing generation config")
-
-        monkeypatch.setattr(VeOmniModelRuntime, "_build_model_assets", build_base_assets)
-        monkeypatch.setattr(
-            "veomni.trainer.dllm_trainer.GenerationConfig.from_pretrained",
-            missing,
-        )
-        monkeypatch.setattr(
-            "veomni.trainer.dllm_trainer.GenerationConfig.from_model_config",
-            lambda *args, **_: derived,
-        )
-
-        runtime._build_model_assets()
-
-        assert runtime.model_assets[-1] is derived
-
-    def test_random_init_derives_generation_config_without_loading_a_checkpoint(self, monkeypatch):
-        from transformers import GenerationConfig
-
-        from veomni.models.model_runtime import VeOmniModelRuntime
-
-        runtime = self._runtime(model_path=None)
-        derived = GenerationConfig(max_new_tokens=31)
-
-        def build_base_assets(self):
-            self.tokenizer = None
-            self.model_assets = [self.model_config]
-
-        def unexpected_load(*_args, **_kwargs):
-            raise AssertionError("random init must not load generation assets from a checkpoint")
-
-        monkeypatch.setattr(VeOmniModelRuntime, "_build_model_assets", build_base_assets)
-        monkeypatch.setattr(
-            "veomni.trainer.dllm_trainer.GenerationConfig.from_pretrained",
-            unexpected_load,
-        )
-        monkeypatch.setattr(
-            "veomni.trainer.dllm_trainer.GenerationConfig.from_model_config",
-            lambda *args, **_: derived,
-        )
-
-        runtime._build_model_assets()
-
-        assert runtime.model_assets[-1] is derived
 
 
 class TestWeightTying:
@@ -2050,20 +1957,8 @@ class TestCollator:
         assert float(batch["loss_weight"][1, 1].sum()) == 0.0
         assert int(batch["num_supervised_examples"]) == 2
 
-    def test_example_sample_count_uses_the_collator_tally(self):
-        from veomni.trainer.dllm_trainer import DllmTrainer
-
-        trainer = DllmTrainer.__new__(DllmTrainer)
-        stacked = {
-            "loss_weight": torch.ones(1, 3, 4),
-            "num_supervised_examples": torch.tensor(1),
-        }
-        assert trainer._example_sample_count(stacked) == 1
-        assert trainer._example_sample_count({"loss_weight": torch.ones(1, 3, 4)}) == 1
-        assert trainer._example_sample_count({"loss_weight": torch.ones(3, 4)}) == 3
-
     def test_pad_decoder_canvases_aligns_a_short_rank_to_the_step_max(self):
-        from veomni.trainer.dllm_trainer import pad_decoder_canvases
+        from veomni.data.data_collator import pad_decoder_canvases
 
         single = {
             "decoder_input_ids": torch.ones(1, 4, dtype=torch.long),
@@ -2539,162 +2434,6 @@ class TestSelfConditioning:
             ).logits
         torch.testing.assert_close(implicit, masked, rtol=2e-5, atol=2e-5)
 
-    def _trainer(self, model, probability, global_step=0):
-        from types import SimpleNamespace
-
-        from veomni.trainer.base import BaseTrainer
-        from veomni.trainer.dllm_trainer import DllmTrainer
-
-        trainer = DllmTrainer.__new__(DllmTrainer)
-        trainer.base = BaseTrainer.__new__(BaseTrainer)
-        trainer.base.device = torch.device("cpu")
-        trainer.base.LOG_SAMPLE = False
-        trainer.base.args = SimpleNamespace(
-            train=SimpleNamespace(local_rank=0, enable_batch_invariant_mode=False, seed=42)
-        )
-        trainer.base.state = SimpleNamespace(global_step=global_step)
-        trainer.base.model = toy_runtime(model)
-        model.config.self_conditioning_prob = probability
-        return trainer
-
-    def test_the_signal_is_attached_during_training(self):
-        model = build_toy_model().train()
-        batch = self._trainer(model, 1.0).preforward(build_toy_batch(model.config))
-
-        assert batch["self_conditioning_embeddings"].shape == (
-            2,
-            model.config.canvas_length,
-            model.config.text_config.hidden_size,
-        )
-        assert not batch["self_conditioning_embeddings"].requires_grad
-        assert batch["self_conditioning_mask"].tolist() == [True, True]
-
-    def test_probability_zero_skips_the_extra_pass_entirely(self):
-        model = build_toy_model().train()
-        batch = self._trainer(model, 0.0).preforward(build_toy_batch(model.config))
-        assert "self_conditioning_logits" not in batch
-        assert "self_conditioning_embeddings" not in batch
-        assert "self_conditioning_mask" not in batch
-
-    def test_nothing_is_attached_outside_training(self):
-        model = build_toy_model().eval()
-        batch = self._trainer(model, 1.0).preforward(build_toy_batch(model.config))
-        assert "self_conditioning_logits" not in batch
-        assert "self_conditioning_embeddings" not in batch
-
-    def test_the_pass_runs_even_when_the_draw_selects_nothing(self):
-        """Skipping it looks free and is not: the pass carries an FSDP2 all-gather and an
-        expert-parallel all-to-all, so gating it on a random draw lets data-parallel ranks
-        disagree on how many collectives to issue, which deadlocks."""
-        model = build_toy_model().train()
-        batch = self._trainer(model, 1e-9).preforward(build_toy_batch(model.config))
-        assert batch["self_conditioning_mask"].tolist() == [False, False]
-        assert batch["self_conditioning_embeddings"].shape[0] == 2
-
-    def test_the_mask_is_drawn_per_example(self):
-        model = build_toy_model().train()
-        trainer = self._trainer(model, 0.5)
-        batch = build_toy_batch(model.config)
-        # Ten micro-steps, each deriving its own generator from a different key. The
-        # default generator `build_toy_batch` reseeds is not in this stream.
-        enabled = sum(
-            int(trainer.preforward({k: v.clone() for k, v in batch.items()})["self_conditioning_mask"].sum())
-            for _ in range(10)
-        )
-        assert 0 < enabled < 20
-
-    def test_the_conditioning_draw_ignores_the_default_cpu_generator(self):
-        """Triton autotune also burns the default CPU generator. A later `torch.rand`
-        on CPU would still desync `attn_dg_prefix` vs sdpa after the first step."""
-        model = build_toy_model().train()
-        batch = build_toy_batch(model.config, batch_size=self.AGREEMENT_SAMPLES)
-
-        def draw(pollute: bool):
-            trainer = self._trainer(model, 0.5)
-            if pollute:
-                torch.randn(4096)
-            return trainer.preforward({k: v.clone() for k, v in batch.items()})["self_conditioning_mask"]
-
-        assert draw(False).tolist() == draw(True).tolist()
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA generator to pollute")
-    def test_the_conditioning_draw_ignores_the_cuda_generator(self):
-        model = build_toy_model(dtype=torch.bfloat16).cuda().train()
-        batch = {k: v.cuda() for k, v in build_toy_batch(model.config, batch_size=self.AGREEMENT_SAMPLES).items()}
-
-        def draw(pollute: bool):
-            trainer = self._trainer(model, 0.5)
-            trainer.base.device = torch.device("cuda")
-            if pollute:
-                torch.randn(4096, device="cuda")
-            return trainer.preforward({k: v.clone() for k, v in batch.items()})["self_conditioning_mask"].cpu()
-
-        assert draw(False).tolist() == draw(True).tolist()
-
-    def test_trainers_that_share_a_seed_draw_the_same_first_mask(self):
-        """DP ranks seed from `train.seed`; the first step must agree even if something
-        else has already consumed the default CPU generator."""
-        model = build_toy_model().train()
-        batch = build_toy_batch(model.config, batch_size=self.AGREEMENT_SAMPLES)
-        left = self._trainer(model, 0.5)
-        torch.randn(4096)
-        right = self._trainer(model, 0.5)
-        assert (
-            left.preforward({k: v.clone() for k, v in batch.items()})["self_conditioning_mask"].tolist()
-            == right.preforward({k: v.clone() for k, v in batch.items()})["self_conditioning_mask"].tolist()
-        )
-
-    def _step_mask(self, trainer, batch, global_step):
-        """One step's worth of draws: advance the counter, then one micro-batch."""
-        trainer.base.state.global_step = global_step
-        trainer.on_micro_batches_ready([batch])
-        return trainer.preforward({k: v.clone() for k, v in batch.items()})["self_conditioning_mask"].tolist()
-
-    def test_a_resumed_step_draws_the_mask_that_step_would_have_drawn(self):
-        """`_extra_state` persists only the default CPU RNG, so a generator carried
-        across steps would rewind to `train.seed` on resume and replay step 0's masks."""
-        model = build_toy_model().train()
-        batch = self._packed_batch(model.config, n_samples=8)
-
-        walked = self._trainer(model, 0.5)
-        for step in range(1, 8):
-            before_crash = self._step_mask(walked, batch, step)
-
-        resumed = self._trainer(model, 0.5)
-        after_resume = self._step_mask(resumed, batch, 7)
-
-        assert before_crash == after_resume
-
-    def test_consecutive_steps_do_not_repeat_the_mask(self):
-        """Otherwise the resume check above would pass on a constant draw."""
-        model = build_toy_model().train()
-        batch = self._packed_batch(model.config, n_samples=8)
-        trainer = self._trainer(model, 0.5)
-        masks = [self._step_mask(trainer, batch, step) for step in range(1, 8)]
-        assert len({tuple(mask) for mask in masks}) > 1
-
-    def test_each_micro_batch_of_a_step_draws_its_own_mask(self):
-        """Gradient accumulation would otherwise condition the same canvases in every
-        micro-batch of the step, turning the Bernoulli into a per-step coin."""
-        model = build_toy_model().train()
-        batch = self._packed_batch(model.config, n_samples=8)
-        trainer = self._trainer(model, 0.5)
-        trainer.base.state.global_step = 3
-        trainer.on_micro_batches_ready([batch, batch, batch])
-        masks = [
-            tuple(trainer.preforward({k: v.clone() for k, v in batch.items()})["self_conditioning_mask"].tolist())
-            for _ in range(3)
-        ]
-        assert len(set(masks)) > 1
-
-    def test_the_signal_actually_reaches_the_loss(self):
-        """A conditioning tensor the model ignored would make the extra forward pointless."""
-        model = build_toy_model().train()
-        batch = build_toy_batch(model.config)
-        without = model(**batch, use_cache=False).loss
-        with_signal = model(**self._trainer(model, 1.0).preforward(batch), use_cache=False).loss
-        assert not torch.allclose(without, with_signal)
-
     @staticmethod
     def _packed_batch(config, n_samples=2):
         """One padded row holding ``n_samples`` concatenated canvases."""
@@ -2705,9 +2444,169 @@ class TestSelfConditioning:
         packed["loss_weight"] = unpacked["loss_weight"].reshape(1, -1)
         return packed
 
+    @staticmethod
+    def _attached(model, batch, probability, *, seed=7, global_step=1, micro_step=0):
+        """Run the model's draw on a batch, the way a training step would."""
+        return model.attach_self_conditioning(
+            batch, seed=seed, global_step=global_step, micro_step=micro_step, probability=probability
+        )
+
+    @staticmethod
+    def _with_probability(model, probability):
+        """A model whose draw probability is what the recipe would set."""
+        model.config.self_conditioning_prob = probability
+        return model
+
+    def _draw(self, model, batch, *, seed=42, global_step=0, micro_step=0):
+        """One micro-batch's draw, keyed the way a training step keys it.
+
+        No `probability`: the draw reads `config.self_conditioning_prob`, which is the
+        path a recipe takes.
+        """
+        return model.attach_self_conditioning(batch, seed=seed, global_step=global_step, micro_step=micro_step)
+
+    def test_the_signal_is_attached_during_training(self):
+        model = self._with_probability(build_toy_model().train(), 1.0)
+        batch = self._draw(model, build_toy_batch(model.config))
+
+        assert batch["self_conditioning_embeddings"].shape == (
+            2,
+            model.config.canvas_length,
+            model.config.text_config.hidden_size,
+        )
+        assert not batch["self_conditioning_embeddings"].requires_grad
+        assert batch["self_conditioning_mask"].tolist() == [True, True]
+
+    def test_probability_zero_skips_the_extra_pass_entirely(self):
+        model = self._with_probability(build_toy_model().train(), 0.0)
+        batch = self._draw(model, build_toy_batch(model.config))
+        assert "self_conditioning_logits" not in batch
+        assert "self_conditioning_embeddings" not in batch
+        assert "self_conditioning_mask" not in batch
+
+    def test_nothing_is_attached_outside_training(self):
+        model = self._with_probability(build_toy_model().eval(), 1.0)
+        batch = self._draw(model, build_toy_batch(model.config))
+        assert "self_conditioning_logits" not in batch
+        assert "self_conditioning_embeddings" not in batch
+
+    def test_the_pass_runs_even_when_the_draw_selects_nothing(self):
+        """Skipping it looks free and is not: the pass carries an FSDP2 all-gather and an
+        expert-parallel all-to-all, so gating it on a random draw lets data-parallel ranks
+        disagree on how many collectives to issue, which deadlocks."""
+        model = self._with_probability(build_toy_model().train(), 1e-9)
+        batch = self._draw(model, build_toy_batch(model.config))
+        assert batch["self_conditioning_mask"].tolist() == [False, False]
+        assert batch["self_conditioning_embeddings"].shape[0] == 2
+
+    def test_the_mask_is_drawn_per_example(self):
+        model = self._with_probability(build_toy_model().train(), 0.5)
+        batch = build_toy_batch(model.config)
+        # Ten micro-steps, each deriving its own generator from a different key. The
+        # default generator `build_toy_batch` reseeds is not in this stream.
+        enabled = sum(
+            int(
+                self._draw(model, {k: v.clone() for k, v in batch.items()}, micro_step=index)[
+                    "self_conditioning_mask"
+                ].sum()
+            )
+            for index in range(10)
+        )
+        assert 0 < enabled < 20
+
+    def test_the_conditioning_draw_ignores_the_default_cpu_generator(self):
+        """Triton autotune also burns the default CPU generator. A later `torch.rand`
+        on CPU would still desync `attn_dg_prefix` vs sdpa after the first step."""
+        model = self._with_probability(build_toy_model().train(), 0.5)
+        batch = build_toy_batch(model.config, batch_size=self.AGREEMENT_SAMPLES)
+
+        def draw(pollute):
+            if pollute:
+                torch.randn(4096)
+            return self._draw(model, {k: v.clone() for k, v in batch.items()})["self_conditioning_mask"]
+
+        assert draw(False).tolist() == draw(True).tolist()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA generator to pollute")
+    def test_the_conditioning_draw_ignores_the_cuda_generator(self):
+        model = self._with_probability(build_toy_model(dtype=torch.bfloat16).cuda().train(), 0.5)
+        batch = {k: v.cuda() for k, v in build_toy_batch(model.config, batch_size=self.AGREEMENT_SAMPLES).items()}
+
+        def draw(pollute):
+            if pollute:
+                torch.randn(4096, device="cuda")
+            return self._draw(model, {k: v.clone() for k, v in batch.items()})["self_conditioning_mask"].cpu()
+
+        assert draw(False).tolist() == draw(True).tolist()
+
+    def test_callers_that_share_a_seed_draw_the_same_first_mask(self):
+        """DP ranks seed from `train.seed`; the first step must agree even if something
+        else has already consumed the default CPU generator."""
+        model = self._with_probability(build_toy_model().train(), 0.5)
+        batch = build_toy_batch(model.config, batch_size=self.AGREEMENT_SAMPLES)
+        torch.randn(4096)
+        left = self._draw(model, {k: v.clone() for k, v in batch.items()})["self_conditioning_mask"]
+        right = self._draw(model, {k: v.clone() for k, v in batch.items()})["self_conditioning_mask"]
+        assert left.tolist() == right.tolist()
+
+    def test_the_draw_depends_on_the_step_counter_not_on_history(self):
+        """`_extra_state` persists only the default CPU RNG, so a generator carried
+        across steps would rewind to `train.seed` on resume and replay step 0's masks.
+        Deriving from `(seed, global_step, micro_step)` makes the mask a pure function
+        of where training is, so reaching step 7 by any route draws the same masks."""
+        model = self._with_probability(build_toy_model().train(), 0.5)
+        batch = self._packed_batch(model.config, n_samples=8)
+
+        def mask_at(global_step, micro_step=0):
+            return self._draw(
+                model, {k: v.clone() for k, v in batch.items()}, global_step=global_step, micro_step=micro_step
+            )["self_conditioning_mask"].tolist()
+
+        # A run that walked every step to 7, then one that jumped there after a resume.
+        for step in range(1, 8):
+            walked = mask_at(step)
+        assert walked == mask_at(7)
+
+    def test_consecutive_steps_do_not_repeat_the_mask(self):
+        """Otherwise the check above would pass on a constant draw."""
+        model = self._with_probability(build_toy_model().train(), 0.5)
+        batch = self._packed_batch(model.config, n_samples=8)
+        masks = [
+            tuple(
+                self._draw(model, {k: v.clone() for k, v in batch.items()}, global_step=step)[
+                    "self_conditioning_mask"
+                ].tolist()
+            )
+            for step in range(1, 8)
+        ]
+        assert len(set(masks)) > 1
+
+    def test_each_micro_batch_of_a_step_draws_its_own_mask(self):
+        """Gradient accumulation would otherwise condition the same canvases in every
+        micro-batch of the step, turning the Bernoulli into a per-step coin."""
+        model = self._with_probability(build_toy_model().train(), 0.5)
+        batch = self._packed_batch(model.config, n_samples=8)
+        masks = {
+            tuple(
+                self._draw(model, {k: v.clone() for k, v in batch.items()}, global_step=3, micro_step=micro_step)[
+                    "self_conditioning_mask"
+                ].tolist()
+            )
+            for micro_step in range(3)
+        }
+        assert len(masks) > 1
+
+    def test_the_signal_actually_reaches_the_loss(self):
+        """A conditioning tensor the model ignored would make the extra forward pointless."""
+        model = self._with_probability(build_toy_model().train(), 1.0)
+        batch = build_toy_batch(model.config)
+        without = model(**batch, use_cache=False).loss
+        with_signal = model(**self._draw(model, dict(batch)), use_cache=False).loss
+        assert not torch.allclose(without, with_signal)
+
     def test_a_packed_row_draws_one_flag_per_canvas(self):
         model = build_toy_model().train()
-        batch = self._trainer(model, 1.0).preforward(self._packed_batch(model.config, n_samples=3))
+        batch = self._attached(model, self._packed_batch(model.config, n_samples=3), 1.0)
         assert batch["self_conditioning_mask"].tolist() == [True, True, True]
         assert batch["self_conditioning_embeddings"].shape == (
             1,
@@ -2718,11 +2617,12 @@ class TestSelfConditioning:
     def test_a_packed_row_is_not_all_or_nothing(self):
         """The old batch-dim draw would emit a single bit and zero every canvas together."""
         model = build_toy_model().train()
-        trainer = self._trainer(model, 0.5)
         batch = self._packed_batch(model.config, n_samples=4)
         mixed = False
-        for _ in range(20):
-            mask = trainer.preforward({k: v.clone() for k, v in batch.items()})["self_conditioning_mask"]
+        for micro_step in range(20):
+            mask = self._attached(model, {k: v.clone() for k, v in batch.items()}, 0.5, micro_step=micro_step)[
+                "self_conditioning_mask"
+            ]
             if bool(mask.any()) and not bool(mask.all()):
                 mixed = True
                 break
@@ -2948,162 +2848,6 @@ class TestBlockAutoregressiveGeneration:
             generation.block_autoregressive_generate(model, prompt, eos_token_ids=[])
 
 
-class TestLossNormalization:
-    def _trainer(self):
-        from types import SimpleNamespace
-
-        from veomni.trainer.dllm_trainer import DllmTrainer
-
-        trainer = DllmTrainer.__new__(DllmTrainer)
-        trainer.base = SimpleNamespace(
-            model=SimpleNamespace(model_config=SimpleNamespace(model_type="diffusion_gemma"))
-        )
-        return trainer
-
-    def test_zero_weight_samples_stay_out_of_the_denominator(self):
-        """Counting them would shrink the gradient by a data-dependent ratio nothing logs."""
-        loss_weight = torch.zeros(3, 8)
-        loss_weight[:2] = 1.0 / 8
-        trainer = self._trainer()
-        trainer.on_micro_batches_ready([{"loss_weight": loss_weight}] * 2)
-        assert trainer.micro_batches_num_samples == 4
-
-    def test_a_rank_whose_samples_all_degraded_reports_zero(self):
-        """`dllm_mean_global_loss` all-reduces the count and handles a global zero, so
-        this rank should report 0 rather than put a phantom sample in the denominator."""
-        trainer = self._trainer()
-        trainer.on_micro_batches_ready([{"loss_weight": torch.zeros(2, 8)}])
-        assert trainer.micro_batches_num_samples == 0
-
-    def test_a_packed_row_counts_each_canvas(self):
-        from types import SimpleNamespace
-
-        trainer = self._trainer()
-        trainer.base.model = SimpleNamespace(model_config=SimpleNamespace(canvas_length=8))
-        loss_weight = torch.zeros(1, 16)
-        loss_weight[0, :8] = 1.0 / 8
-        trainer.on_micro_batches_ready([{"loss_weight": loss_weight}])
-        assert trainer.micro_batches_num_samples == 1
-        loss_weight[0, 8:] = 1.0 / 8
-        trainer.on_micro_batches_ready([{"loss_weight": loss_weight}])
-        assert trainer.micro_batches_num_samples == 2
-
-
-class TestComponentGradNorms:
-    """``print_ar_df_norm`` splits Eq. 13 into two backwards and logs each param-grad L2."""
-
-    def _trainer(self, model):
-        from types import SimpleNamespace
-
-        from veomni.trainer.dllm_trainer import DllmTrainer
-
-        trainer = DllmTrainer.__new__(DllmTrainer)
-        trainer.base = SimpleNamespace(model=toy_runtime(model))
-        return trainer
-
-    def test_the_flag_defaults_to_off(self):
-        model = build_toy_model()
-        assert model.config.print_ar_df_norm is False
-        assert self._trainer(model)._print_ar_df_norm_enabled() is False
-
-    def test_each_term_gets_its_own_param_grad_norm(self):
-        model = build_toy_model().train()
-        trainer = self._trainer(model)
-        batch = build_toy_batch(model.config)
-        outputs = model(**batch, use_cache=False)
-        loss_dict = {"encoder_ar_loss": outputs.encoder_ar_loss, "diffusion_loss": outputs.diffusion_loss}
-        trainer._backward_and_print_component_grad_norms(outputs.loss, loss_dict)
-        assert float(loss_dict["encoder_ar_grad_norm"]) > 0
-        assert float(loss_dict["diffusion_grad_norm"]) > 0
-        assert not torch.allclose(loss_dict["encoder_ar_grad_norm"], loss_dict["diffusion_grad_norm"])
-        assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in model.parameters())
-
-    def test_two_backwards_match_a_single_backward_of_the_sum(self):
-        """Tolerances hold float32 accumulation noise, not a margin for a real deviation.
-
-        `model.decoder.embed_tokens.weight` is tied across the encoder embedding, the
-        decoder embedding and `lm_head`, so its gradient is a cancelling sum over the
-        whole vocabulary and reaches ~11 in magnitude; splitting that sum into two
-        batches moves the last bits by ~1.7e-5. Plain `ar.backward(retain_graph=True)`
-        followed by `diffusion.backward()` -- no clone, no add -- deviates from one
-        backward by exactly the same amount, and reversing the order does not change
-        it, which is what rules out the trainer's grad bookkeeping. Note that `logits`
-        and `loss` are cast to float32 even on a float64 model, so a wider dtype does
-        not shrink this.
-        """
-        torch.manual_seed(0)
-        split = build_toy_model().train()
-        summed = build_toy_model().train()
-        summed.load_state_dict(split.state_dict())
-        batch = build_toy_batch(split.config)
-        out_split = split(**batch, use_cache=False)
-        out_sum = summed(**batch, use_cache=False)
-        self._trainer(split)._backward_and_print_component_grad_norms(
-            out_split.loss,
-            {"encoder_ar_loss": out_split.encoder_ar_loss, "diffusion_loss": out_split.diffusion_loss},
-        )
-        out_sum.loss.backward()
-        for split_param, sum_param in zip(split.parameters(), summed.parameters(), strict=True):
-            if split_param.grad is None and sum_param.grad is None:
-                continue
-            torch.testing.assert_close(split_param.grad, sum_param.grad, rtol=1e-4, atol=1e-4)
-
-    def test_more_than_one_micro_batch_is_refused(self):
-        """The split backward has no way to tell an accumulation apart from its own work.
-
-        It needs each micro-batch to start from no gradient, and under FSDP2 it cannot
-        check that: an accumulation behind a parameter left unsharded -- the root group
-        always, every parameter when `reshard_after_backward` is false -- shows up as
-        `grad is None` and is missed by `zero_grad` too. The AR term then adds onto it
-        and reports two micro-batches as one. So the refusal lives here, where the
-        micro-batch count is known before the first forward and is the same on every
-        rank, rather than in the backward where it would need a collective to agree.
-        """
-        from veomni.trainer.dllm_trainer import DllmTrainer
-
-        model = build_toy_model().train()
-        model.config.print_ar_df_norm = True
-        trainer = self._trainer(model)
-        batch = build_toy_batch(model.config)
-
-        with pytest.raises(ValueError, match="one micro-batch per step"):
-            DllmTrainer.on_micro_batches_ready(trainer, [batch, batch])
-
-    def test_one_micro_batch_is_accepted(self):
-        from veomni.trainer.dllm_trainer import DllmTrainer
-
-        model = build_toy_model().train()
-        model.config.print_ar_df_norm = True
-        trainer = self._trainer(model)
-        batch = build_toy_batch(model.config)
-
-        DllmTrainer.on_micro_batches_ready(trainer, [batch])
-        assert trainer._remaining_micro_steps == 1
-
-    def test_a_disabled_ar_term_logs_zero_grad(self):
-        model = build_toy_model().train()
-        model.config.encoder_ar_loss = False
-        trainer = self._trainer(model)
-        batch = build_toy_batch(model.config)
-        outputs = model(**batch, use_cache=False)
-        loss_dict = {"encoder_ar_loss": outputs.encoder_ar_loss, "diffusion_loss": outputs.diffusion_loss}
-        trainer._backward_and_print_component_grad_norms(outputs.loss, loss_dict)
-        assert float(loss_dict["encoder_ar_grad_norm"]) == 0.0
-        assert float(loss_dict["diffusion_grad_norm"]) > 0
-
-    def test_works_with_non_reentrant_checkpointing(self):
-        model = build_toy_model().train()
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        trainer = self._trainer(model)
-        batch = build_toy_batch(model.config)
-        outputs = model(**batch, use_cache=False)
-        loss_dict = {"encoder_ar_loss": outputs.encoder_ar_loss, "diffusion_loss": outputs.diffusion_loss}
-        trainer._backward_and_print_component_grad_norms(outputs.loss, loss_dict)
-        assert float(loss_dict["encoder_ar_grad_norm"]) > 0
-        assert float(loss_dict["diffusion_grad_norm"]) > 0
-        assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in model.parameters())
-
-
 class TestStrictLayout:
     """Eq. 13 puts every canvas in the encoder; the decoder must not see the draw."""
 
@@ -3178,32 +2922,6 @@ class TestStrictLayout:
             assert (dropped < -1e30).all()
             assert (kept_prefix > -1e5).all()
             assert (canvas > -1e5).all()
-
-
-class TestEncoderBudget:
-    """`max_seq_len` has to hold every canvas and still leave room for a prompt."""
-
-    def _warn_count(self, **options):
-        from unittest import mock
-
-        from veomni.trainer import dllm_trainer
-
-        with mock.patch.object(dllm_trainer.logger, "warning") as warning:
-            dllm_trainer.DllmTrainer._warn_if_the_encoder_budget_is_tight(options)
-        return warning.call_count
-
-    def test_a_budget_the_canvases_would_swallow_is_flagged(self):
-        # All 8 canvases occupy 2048 tokens, over a 1024 budget.
-        assert self._warn_count(canvas_length=256, max_canvases=8, max_seq_len=1024) == 1
-
-    def test_filling_the_budget_with_canvases_alone_is_flagged(self):
-        assert self._warn_count(canvas_length=256, max_canvases=8, max_seq_len=2048) == 1
-
-    def test_one_canvas_of_headroom_for_the_prompt_is_enough(self):
-        assert self._warn_count(canvas_length=256, max_canvases=8, max_seq_len=2304) == 0
-
-    def test_the_shipped_geometry_is_quiet(self):
-        assert self._warn_count(canvas_length=256, max_canvases=8, max_seq_len=4096) == 0
 
 
 class TestDgPrefixGather:

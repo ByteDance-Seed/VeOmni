@@ -15,8 +15,8 @@
 """LLaDA2.0-Uni bidirectional Bailing/DeepSeek-MoE backbone (no wte / lm_head).
 
 Directly composes the layers, norms, rotary embeddings, and fused MoE blocks of
-:mod:`veomni.models.transformers.llada2_uni.modeling_llada2_uni` so the single-model
-``DllmTrainer`` path and the ``SeedOmni`` ``OmniTrainer`` path share one implementation.
+:mod:`veomni.models.transformers.llada2_uni.modeling_llada2_uni` so the ``SeedOmni``
+``OmniTrainer`` path and any other consumer share one implementation.
 """
 
 from __future__ import annotations

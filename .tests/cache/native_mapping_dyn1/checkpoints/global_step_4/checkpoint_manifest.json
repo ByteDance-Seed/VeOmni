@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "global_step": 4,
+  "world_size": 4,
+  "model_state": true
+}

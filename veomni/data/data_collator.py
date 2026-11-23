@@ -633,6 +633,95 @@ def _pad_canvas_stack(tensor: "torch.Tensor", max_canvases: int, value: float | 
     return F.pad(tensor, (0, 0, 0, extra), value=value)
 
 
+def diffusion_gemma_sample_cost(sample: Dict[str, torch.Tensor]) -> int:
+    """What one sample costs a ``dyn_bsz`` token budget: `L + K*C`.
+
+    The default measure is the sample's ``attention_mask`` sum, which for
+    DiffusionGemma is the encoder row `L = P + K*C` -- the prompt plus every canvas.
+    Nothing is missing from it on the encoder's side. What is missing is the
+    *decoder*, which runs a second pass over the `K*C` canvas tokens against that
+    cache, so a canvas token is paid for twice and a prompt token once. Two samples
+    with the same `L` and different `K` therefore cost differently while the default
+    measure calls them equal.
+
+    Measured at production attention geometry with `scripts/bench_dg_step_cost.py`:
+    holding `L` fixed and raising `K` from 1 to 7 moves the step time by 1.3-1.6x,
+    and charging the canvas tokens twice is what flattens it. Least squares puts a
+    canvas token higher still, at 2.6-2.7x a prompt token rather than 2x, because the
+    decoder's attention over the cache grows faster than its token count -- but 2x is
+    where the spread of time-per-budget-unit is smallest at the production expert
+    count, and it needs no fitted constant to explain. Do not raise it to the fitted
+    value without re-measuring: past 2x the measure over-charges the cases that
+    dominate. Self-conditioning is a third decoder pass and so the term one would
+    expect to matter here; sweeping it moved the fit by under 1%, so there is none.
+
+    Memory is a separate question and the default measure already answers it: at
+    fixed `L`, the transient allocation within a step moved by 4% across the same `K`
+    sweep. So a budget that undercharges canvases misses a step time, not the memory
+    the step holds. Transient allocation and not peak -- see source 32 in the
+    ``diffusion_gemma`` package notes on why the two are not interchangeable; no total
+    was collected.
+
+    The encoder half is counted off ``input_ids`` rather than the mask, because the
+    packed collator concatenates the whole of ``input_ids`` -- so this is the row the
+    model is handed, with no assumption that the mask happens to be all ones.
+    """
+    for key in ("input_ids", "decoder_input_ids"):
+        if key not in sample:
+            raise KeyError(
+                f"Expected '{key}' in sample: a DiffusionGemma sample costs its encoder row plus "
+                "its canvas tokens, and neither half can be defaulted -- a missing canvas count "
+                "would silently cost the sample as if the decoder were free."
+            )
+    return int(sample["input_ids"].numel()) + int(sample["decoder_input_ids"].numel())
+
+
+def _local_canvas_count(decoder_input_ids: torch.Tensor) -> int:
+    """Canvas slots one sample carries: `K` for a `(K, C)` stack, 1 for a 2-D row."""
+    return int(decoder_input_ids.shape[1]) if decoder_input_ids.ndim == 3 else 1
+
+
+def pad_decoder_canvases(micro_batch: Dict[str, torch.Tensor], target_k: int) -> Dict[str, torch.Tensor]:
+    """Pad a 2-D or short 3-D canvas batch to ``target_k`` decoder slots.
+
+    Dummy slots are ``IGNORE_INDEX`` / zero-weight so they add no diffusion
+    gradient. They are still decoded, which is the point: under
+    ``canvas_batching: serial`` FSDP and expert-parallel collectives fire once per
+    canvas, so every rank must loop the same number of times. ``flat_batch`` decodes in one
+    pass and so cannot desynchronize that way; the padding is kept for it anyway,
+    because the decoder's canvas axis must still line up across ranks.
+
+    Never reached under ``flat_seq_pack``, where a dummy slot has no sample to belong
+    to and the all-visible mask below would read across the packed row.
+    """
+    if target_k <= 1:
+        return micro_batch
+    decoder_input_ids = micro_batch["decoder_input_ids"]
+    if decoder_input_ids.ndim == 2:
+        micro_batch["decoder_input_ids"] = decoder_input_ids.unsqueeze(1)
+        if "labels" in micro_batch:
+            micro_batch["labels"] = micro_batch["labels"].unsqueeze(1)
+        if "loss_weight" in micro_batch:
+            micro_batch["loss_weight"] = micro_batch["loss_weight"].unsqueeze(1)
+        mask = micro_batch.get("decoder_attention_mask")
+        if mask is not None and mask.ndim == 2:
+            micro_batch["decoder_attention_mask"] = mask.unsqueeze(1)
+        decoder_input_ids = micro_batch["decoder_input_ids"]
+    current_k = int(decoder_input_ids.shape[1])
+    if current_k >= target_k:
+        return micro_batch
+    extra = target_k - current_k
+    micro_batch["decoder_input_ids"] = F.pad(decoder_input_ids, (0, 0, 0, extra), value=0)
+    if "labels" in micro_batch:
+        micro_batch["labels"] = F.pad(micro_batch["labels"], (0, 0, 0, extra), value=IGNORE_INDEX)
+    if "loss_weight" in micro_batch:
+        micro_batch["loss_weight"] = F.pad(micro_batch["loss_weight"], (0, 0, 0, extra), value=0)
+    mask = micro_batch.get("decoder_attention_mask")
+    if mask is not None and mask.ndim == 3:
+        micro_batch["decoder_attention_mask"] = F.pad(mask, (0, 0, 0, extra), value=True)
+    return micro_batch
+
+
 @dataclass
 class DiffusionGemmaCollator(DataCollator):
     """Batching collator for DiffusionGemma's encoder-prompt / decoder-canvas layout.

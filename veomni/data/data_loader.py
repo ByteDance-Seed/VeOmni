@@ -147,10 +147,10 @@ def build_native_dataloader(
             ``attention_mask`` sum for ``"total"``), which is right for a model whose
             sample is one sequence through one stack. A model that runs a second stack
             over tokens the first one also saw costs more than that per sample and has
-            to say so here, or the budget stops converting to a step time --
-            ``DllmTrainer`` supplies one for that reason. Only valid with
+            to say so here, or the budget stops converting to a step time. Only valid with
             ``dyn_bsz_count_mode="total"``. Must be a module-level callable, since it is
             pickled into spawned workers and into the dataloader's ``state_dict``.
+            A canvas model supplies ``diffusion_gemma_sample_cost`` for that reason.
 
         multiprocessing_context: Optional worker start method override.
             Use ``"spawn"`` when worker-side code must be pickle-safe and should not

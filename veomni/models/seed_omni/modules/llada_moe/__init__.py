@@ -17,8 +17,7 @@
 The sparse sibling of :mod:`..llada`. Same one-node graph, same sample-mean
 objective, plus a router load-balancing term and an Expert Parallel plan.
 ``model_type`` is ``llada_moe_omni`` so the composed-model registries stay
-disjoint from the vendored ``veomni.models.transformers.llada_moe`` entries the
-non-Omni trainer resolves.
+disjoint from the vendored ``veomni.models.transformers.llada_moe`` entries.
 """
 
 from .. import (

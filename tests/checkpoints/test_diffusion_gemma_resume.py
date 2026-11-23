@@ -47,7 +47,6 @@ from veomni.models.transformers.diffusion_gemma import modeling_diffusion_gemma
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
-from veomni.trainer.dllm_trainer import DllmTrainer
 
 
 TOTAL_STEPS = 6
@@ -101,10 +100,11 @@ class _StatefulStub:
 class _Harness:
     """The parts of the training loop the self-conditioning draw actually depends on.
 
-    `DllmTrainer.train_step` advances `global_step`, calls `on_micro_batches_ready`, then
-    loops `forward_backward_step` over the micro-batches. Clipping, resharding, callbacks
-    and the environ meter cannot reach the draw, so this rebuilds only that spine and
-    keeps the real `forward_backward_step`.
+    A step advances `global_step`, then for each micro-batch attaches the
+    self-conditioning signal and runs a forward/backward. The draw itself now lives on
+    the model (`DiffusionGemmaForBlockDiffusion.attach_self_conditioning`), keyed on
+    `(seed, global_step, micro_step)`, so this harness only has to carry the counters
+    and the optimizer -- which is exactly the contract a trainer has to honour.
     """
 
     def __init__(self, model, save_path, device="cpu"):
@@ -112,6 +112,7 @@ class _Harness:
         self.optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         self.lr_scheduler = torch.optim.lr_scheduler.ConstantLR(self.optimizer, factor=0.5, total_iters=4)
         self.masks = []
+        self._micro_step = 0
         self.data_iterator = _StatefulStub("data_iterator")
         self.train_dataloader = _StatefulStub("train_dataloader")
         self.environ_meter = _StatefulStub("environ_meter")
@@ -139,36 +140,41 @@ class _Harness:
         base.data_iterator = self.data_iterator
         base.train_dataloader = self.train_dataloader
         base.environ_meter = self.environ_meter
-
-        trainer = DllmTrainer.__new__(DllmTrainer)
-        trainer.base = base
-        # The mask is attached inside `preforward` and the micro-batch is dropped before
-        # `forward_backward_step` returns, so record it on the way through.
-        inner_preforward = trainer.preforward
-
-        def recording_preforward(micro_batch):
-            micro_batch = inner_preforward(micro_batch)
-            self.masks.append(micro_batch["self_conditioning_mask"].tolist())
-            return micro_batch
-
-        trainer.preforward = recording_preforward
-        self.trainer = trainer
+        self.base = base
 
         self.callback = GlobalStateCallback.__new__(GlobalStateCallback)
         self.callback.trainer = base
         self.callback._last_saved_step = -1
 
+    def _attach(self, micro_batch):
+        """The draw, recorded on the way through so the test can compare masks."""
+        micro_batch = self.model.attach_self_conditioning(
+            micro_batch,
+            seed=self.base.args.train.seed,
+            global_step=self.base.state.global_step,
+            micro_step=self._micro_step,
+            batch_invariant=self.base.args.train.enable_batch_invariant_mode,
+        )
+        self._micro_step += 1
+        self.masks.append(micro_batch["self_conditioning_mask"].tolist())
+        return micro_batch
+
     @property
     def global_step(self):
-        return self.trainer.base.state.global_step
+        return self.base.state.global_step
 
     def step(self, micro_batches):
-        """One optimizer step over its micro-batches, in `train_step`'s order."""
-        self.trainer.base.state.global_step += 1
-        self.trainer.on_micro_batches_ready(micro_batches)
+        """One optimizer step over its micro-batches."""
+        self.base.state.global_step += 1
+        self._micro_step = 0
         losses = []
         for micro_batch in micro_batches:
-            loss, _ = self.trainer.forward_backward_step({k: v.clone() for k, v in micro_batch.items()})
+            micro_batch = self._attach({k: v.clone() for k, v in micro_batch.items()})
+            with self.base.model_fwd_context:
+                outputs = self.model(**micro_batch, use_cache=False)
+            loss = outputs.loss
+            with self.base.model_bwd_context:
+                loss.backward()
             losses.append(float(loss.detach()))
         gradients = {n: p.grad.clone() for n, p in self.model.named_parameters() if p.grad is not None}
         self.optimizer.step()
@@ -177,20 +183,20 @@ class _Harness:
         return losses, gradients
 
     def snapshot(self):
-        state = self.trainer.base.state
+        state = self.base.state
         self.callback.save_global_state(state)
         return {
             "model": deepcopy(self.model.state_dict()),
             "optimizer": deepcopy(self.optimizer.state_dict()),
             "lr_scheduler": deepcopy(self.lr_scheduler.state_dict()),
-            "step_dir": layout.step_dir(self.trainer.base.args.train.checkpoint.save_path, state.global_step),
+            "step_dir": layout.step_dir(self.base.args.train.checkpoint.save_path, state.global_step),
         }
 
     def restore(self, snapshot):
         self.model.load_state_dict(snapshot["model"])
         self.optimizer.load_state_dict(snapshot["optimizer"])
         self.lr_scheduler.load_state_dict(snapshot["lr_scheduler"])
-        self.trainer.base.args.train.checkpoint.load_path = snapshot["step_dir"]
+        self.base.args.train.checkpoint.load_path = snapshot["step_dir"]
         assert self.callback.load_global_state() is not None
 
 
@@ -278,7 +284,7 @@ class TestResumeReproducesTheSelfConditioningDraw:
         rewound_model, _ = _toy_run()
         rewound = _Harness(rewound_model, tmp_path)
         rewound.restore(snapshot)
-        rewound.trainer.base.state.global_step = 0
+        rewound.base.state.global_step = 0
         _run(rewound, batches[RESUME_AFTER:])
 
         assert continuous.masks[DRAWS_BEFORE_RESUME:] != rewound.masks

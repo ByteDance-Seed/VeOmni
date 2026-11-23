@@ -22,10 +22,6 @@ carries a fraction of the independent noise samples it appears to.
 These tests pin the replacement: a generator derived from `(seed, sample, canvas)`.
 """
 
-from functools import partial
-from types import SimpleNamespace
-
-import pytest
 import torch
 
 from veomni.data.data_transform import (
@@ -53,38 +49,6 @@ class FakeChatTemplate:
         input_ids = [7] * self.prompt_length + answer
         labels = [-100] * self.prompt_length + answer
         return {"input_ids": input_ids[:max_seq_len], "labels": labels[:max_seq_len]}
-
-
-def build_trainer():
-    """A `DllmTrainer` with just enough state for `_build_data_transform`.
-
-    Built with `__new__`, matching the trainer unit tests in
-    `tests/models/test_diffusion_gemma.py`.
-    """
-    DllmTrainer = pytest.importorskip("veomni.trainer.dllm_trainer").DllmTrainer
-
-    trainer = DllmTrainer.__new__(DllmTrainer)
-    text_config = SimpleNamespace(vocab_size=VOCAB_SIZE, pad_token_id=0, eos_token_id=EOS_TOKEN_ID)
-    trainer.base = SimpleNamespace(
-        args=SimpleNamespace(
-            data=SimpleNamespace(max_seq_len=1024, text_keys="messages", data_type="diffusion_gemma"),
-            train=SimpleNamespace(seed=42, dyn_bsz=False, num_train_epochs=1),
-        ),
-        model=SimpleNamespace(
-            model_config=SimpleNamespace(
-                canvas_length=CANVAS_LENGTH,
-                max_canvases=4,
-                canvas_start=0,
-                compute_all_canvas_df_loss=True,
-                get_text_config=lambda: text_config,
-            ),
-            tokenizer=None,
-            chat_template=FakeChatTemplate(),
-        ),
-        state=SimpleNamespace(epoch=0),
-        on_epoch_begin=lambda: None,
-    )
-    return trainer
 
 
 def build_targets(
@@ -223,30 +187,3 @@ def test_transform_end_to_end_decorrelates_and_spares_the_global_rng():
     first_corrupted = first["decoder_input_ids"] != 11
     second_corrupted = second["decoder_input_ids"] != 12
     assert not torch.equal(first_corrupted, second_corrupted)
-
-
-def test_the_trainer_epoch_survives_the_dataset_re_wrapping_the_transform():
-    """The epoch has to reach the transform object the *dataset* ends up holding.
-
-    `build_mapping_dataset` / `build_iterable_dataset` wrap the trainer's transform in
-    a second `functools.partial` to bind `source_name`, and partial flattens a nested
-    partial by copying its keyword dict. Anything the trainer writes into its own
-    partial's keywords is therefore invisible downstream; only mutating a shared object
-    that the copied dict points at gets through.
-    """
-    trainer = build_trainer()
-    # `_build_data_transform` has to hand over the shared object, not `holder.epoch`.
-    trainer._build_data_transform()
-    assert trainer.base.data_transform.keywords["corruption_epoch"] is trainer._corruption_epoch
-
-    # Exactly what `build_mapping_dataset` / `build_iterable_dataset` do to it.
-    dataset_transform = partial(trainer.base.data_transform, source_name=None)
-    example = {"messages": [11] * (2 * CANVAS_LENGTH)}
-
-    trainer.on_epoch_begin()
-    first = dataset_transform(example)[0]["decoder_input_ids"]
-    trainer.base.state.epoch = 1
-    trainer.on_epoch_begin()
-    second = dataset_transform(example)[0]["decoder_input_ids"]
-
-    assert not torch.equal(first, second)

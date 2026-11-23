@@ -18,8 +18,9 @@ The module keeps the vendored ``DiffusionGemmaConfig`` fields unchanged -- the
 canvas geometry, the encoder/decoder split, and every ``Eq. 13`` switch
 (``encoder_ar_loss``, ``compute_all_canvas_df_loss``, ``canvas_batching``, ...) --
 and only adds the ``model_type`` the SeedOmni registries key on.
-``diffusion_gemma_omni`` stays disjoint from the vendored ``diffusion_gemma``
-entry the non-Omni trainer resolves.
+``diffusion_gemma_omni`` is the only ``model_type`` for this family now: the
+non-Omni entry that used to resolve ``diffusion_gemma`` was served by the removed
+trainer and is not reachable from any launcher.
 """
 
 from __future__ import annotations

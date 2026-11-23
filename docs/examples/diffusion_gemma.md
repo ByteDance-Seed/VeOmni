@@ -5,15 +5,23 @@ is an encoder-decoder **block-diffusion** MoE, not an autoregressive LM: the enc
 prefills the prompt (and optional images) and exports a KV cache; the decoder denoises
 a fixed-length canvas that is bidirectional over `[encoder cache | canvas]`.
 
-Launch with `tasks/train_dllm.py`. Do not reuse `tasks/train_text.py` or
-`tasks/train_vlm.py` — those collators and losses are for causal LMs.
+Launch with `tasks/omni/train_omni.py`: the model runs as one **SeedOmni module**
+under `OmniTrainer`, so the data transform, the collator and the per-sample loss
+reduction all come from the module rather than from a task-specific trainer. Do not
+reuse `tasks/train_text.py` or `tasks/train_vlm.py` — those collators and losses are
+for causal LMs.
 
-Configs:
+Config:
 
-- Text-only: [`configs/text/diffusion_gemma.yaml`](../../configs/text/diffusion_gemma.yaml)
-- Text+image: [`configs/multimodal/diffusion_gemma/diffusion_gemma_mm.yaml`](../../configs/multimodal/diffusion_gemma/diffusion_gemma_mm.yaml)
+- [`configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/train/base.yaml`](../../configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/train/base.yaml)
 
 The default recipe uses FSDP2 + expert parallelism (`ep_size: 8`). Run on **8 GPUs**.
+
+Training is **text-only** here: the module's CPU preprocessor runs
+`process_diffusion_gemma_example`, which chat-templates an answer into canvases and
+draws the corruption. The text+image transform (`diffusion_gemma_mm`) is not wired
+into the Omni module; images are accepted on the *inference* path, where the prompt
+row is encoded directly.
 
 ---
 
@@ -34,35 +42,29 @@ pq.write_table(table_first_2000, output_path)
 ```
 
 The transform reads OpenAI-style `messages` (the parquet column name). Keep
-`model.chat_template: tokenizer_generation_prompt` so the checkpoint's own
+`model.model_config.chat_template: tokenizer_generation_prompt` so the checkpoint's own
 `<|turn>` / `<turn|>` markers are used and only the generation-prompt suffix is
 supervised. Plain `tokenizer` would also supervise the `<|turn>model` header.
 `chatml` is not in this vocabulary.
 
-### Vision-Language
+### Vision-Language (inference only)
 
-Download the [COCO2017](https://images.cocodataset.org/zips/train2017.zip) dataset
-and the annotation JSON
-[sharegpt4v_instruct_gpt4-vision_cap100k.json](https://huggingface.co/datasets/Lin-Chen/ShareGPT4V/tree/main).
+Images reach the model on the **inference** path only — the training module's
+preprocessor is text-only and runs `process_diffusion_gemma_example`, which has no
+pixel path. At inference the prompt row is encoded with the checkpoint's own
+processor, so a plain image file plus a question is all that is needed:
 
-Modify the ShareGPT4V JSON so each row has an `images` list. The multimodal
-transform accepts ShareGPT `from`/`value` conversations, so pass
-`--data.text_keys conversations` at launch:
-
-```python
-import json
-with open('sharegpt4v_instruct_gpt4-vision_cap100k.json', 'r', encoding='utf-8') as f:
-    data = json.load(f)
-filtered_data = []
-for item in data:
-    if item.get('image', '').startswith('coco'):
-        new_item = item.copy()
-        image_path = new_item.pop('image')
-        new_item['images'] = [image_path]
-        filtered_data.append(new_item)
-with open('sharegpt4v_instruct_gpt4-vision_cap100k_coco.json', 'w', encoding='utf-8') as f:
-    json.dump(filtered_data, f, ensure_ascii=False, indent=4)
+```shell
+python tasks/omni/infer_omni.py \
+    configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/infer/base.yaml \
+    --model.model_path /path/to/diffusiongemma-26B-A4B-it \
+    --infer.prompt "Describe this image." \
+    --infer.images /path/to/cat.jpg
 ```
+
+Any image works — [COCO2017](https://images.cocodataset.org/zips/train2017.zip) and the
+[ShareGPT4V](https://huggingface.co/datasets/Lin-Chen/ShareGPT4V/tree/main)
+captions are convenient sources of paired prompts and images.
 
 Images are encoder-only conditioning. The canvas the decoder denoises stays text.
 
@@ -98,39 +100,42 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ### Text-only
 
 ```shell
-bash train.sh tasks/train_dllm.py configs/text/diffusion_gemma.yaml \
+bash train.sh tasks/omni/train_omni.py \
+    configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/train/base.yaml \
     --model.model_path ./diffusiongemma-26B-A4B-it \
-    --data.train_path ./tulu-first2000.parquet \
-    --model.accelerator.fsdp_config.fsdp_mode fsdp2 \
-    --model.accelerator.init_device meta
+    --data.train_path ./tulu-first2000.parquet
 ```
 
-### Text+image
+`fsdp_mode: fsdp2` and `init_device: meta` are already in the recipe.
 
-```shell
-bash train.sh tasks/train_dllm.py configs/multimodal/diffusion_gemma/diffusion_gemma_mm.yaml \
-    --model.model_path ./diffusiongemma-26B-A4B-it \
-    --data.train_path ./sharegpt4v_instruct_gpt4-vision_cap100k_coco.json \
-    --data.text_keys conversations \
-    --model.accelerator.fsdp_config.fsdp_mode fsdp2 \
-    --model.accelerator.init_device meta
-```
-
-Key config values:
+Key config values (`configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/train/base.yaml`):
 
 | Parameter | Value |
 |---|---|
 | `model.ops_implementation.attn_implementation` | `sdpa` |
 | `model.ops_implementation.moe_implementation` | `fused_triton` |
-| `model.model_config.text_config.attn_dg_prefix` | `true` (decoder Triton kernel) |
-| `model.model_config.text_config.attn_ffpa` | `true` (optional full-attn speedup) |
-| `model.chat_template` | `tokenizer_generation_prompt` (text-only; omit on the mm recipe) |
-| `data.max_seq_len` | `4096` |
+| `model.model_config.chat_template` | `tokenizer_generation_prompt` |
+| `model.model_config.canvas_length` | `256` |
+| `model.model_config.max_canvases` | `2` |
+| `model.model_config.canvas_batching` | `flat_seq_pack` |
+| `data.max_seq_len` | `1024` |
 | `model.accelerator.ep_size` | `8` |
 | `model.accelerator.ulysses_size` | `1` |
 | `train.global_batch_size` | `8` |
 | `train.micro_batch_size` | `1` |
 | `model.accelerator.gradient_checkpointing.enable_reentrant` | `false` |
+
+`max_canvases: 2` is a memory bound, not a preference: the encoder sequence is
+`P + K*C`, so every extra canvas is another `canvas_length` tokens of context. The
+26B weights are ~49 GB and an unsharded FSDP all-gather does not fit on one card, so
+`ep_size` has to cover the whole world.
+
+**Self-conditioning is not wired on this path.** Training used to attach it through the
+non-Omni trainer; nothing does now, so the model trains without the signal that
+`block_autoregressive_generate` feeds it at every denoising step. The module and its
+`attach_self_conditioning` / `canvas_sample_count` / `self_conditioning_generator` are
+in place, so wiring it is a `@pre_forward` hook plus a per-micro-step counter, not new
+model code.
 
 ---
 
@@ -168,7 +173,8 @@ Do not read a `grad_norm` gap on this recipe as a backend fault — the differen
 between backends is far smaller than the one sdpa's own two kernels show against
 each other. See constraint 31 (source numbering) in `.agents/knowledge/constraints.md`.
 
-With the defaults:
+"With the defaults" is misleading here — **the shipped recipe sets neither flag**, so
+both are off and the encoder/decoder take plain sdpa:
 
 - Encoder full-attention layers can use FFPA instead of materializing the score
   matrix (`attn_ffpa: true`). Install it with `uv pip install --no-deps ffpa-attn`
@@ -178,11 +184,14 @@ With the defaults:
   `attn_ffpa: false` — including when loading a checkpoint that was trained with the
   flag on, since it round-trips.
 - The decoder packs the visible encoder cache plus the noisy canvas and runs the
-  `dllm_attention` Triton kernel (`attn_dg_prefix: true`, CUDA only).
+  `dllm_attention` Triton kernel (`attn_dg_prefix: true`, CUDA only). Enable it when
+  step time is the constraint; it is not required for the recipe to run.
 
 Ulysses sequence parallelism needs `attn_dg_prefix: true` — it is the decoder's
 only shardable path — and `canvas_batching: flat_seq_pack`. See
-[Sequence parallelism](#sequence-parallelism-ulysses_size) below.
+[Sequence parallelism](#sequence-parallelism-ulysses_size) below. The shipped recipe
+sets `flat_seq_pack` but leaves `attn_dg_prefix` off and `ulysses_size: 1`, so SP is
+something you turn on rather than something it starts with.
 
 ---
 
@@ -229,10 +238,11 @@ skip. The kernel does not support attention dropout and raises on it. Under
 sequence parallelism the kernel is the only decoder path there is, so the sdpa
 fallback is refused instead.
 
-The shipped recipes set `flat_seq`, paired with `attn_dg_prefix` so the interval reaches
-the kernel. `DiffusionGemmaConfig`'s own default is still `serial`, which is the path
-that has trained at 26B and the fallback if `flat_seq` OOMs or diverges there — the
-numbers above are an attention-layer microbenchmark, not a measured step time at scale.
+The shipped recipe sets `flat_seq_pack` (see its own section below).
+`DiffusionGemmaConfig`'s own default is still `serial`, which is the path that has
+trained at 26B; both `serial` and `flat_batch` need the canvas axis aligned across
+ranks, which the module's `batch_pre` does. The numbers above are an attention-layer
+microbenchmark, not a measured step time at scale.
 
 ---
 
@@ -290,7 +300,7 @@ another job at about a third of its GPUs throughout.
 The single-GPU setting cuts both ways. Production's per-micro-step parameter all-gather
 would make A relatively worse, so B's lead is understated. Against that, production's
 wider MoE GEMMs are better occupied at `micro_batch_size: 1` than this benchmark's toy
-expert width, and the benchmark runs with `attn_ffpa` off although the recipe turns it on
+expert width, and the benchmark runs with `attn_ffpa` off although a recipe could turn it on
 — which only A and D could have benefited from, since the packed encoder bypasses the
 attention-implementation dispatch entirely. Both of those overstate B's lead.
 
@@ -324,18 +334,24 @@ single-GPU measurement without FSDP or expert parallelism.
 
 ### A token budget on top: `dyn_bsz`
 
-Packing is what makes `dyn_bsz: true` mean anything here, and the trainer refuses the
-combination without it. Under any other mode the collator left-pads prompts to the
+**The recipe ships `dyn_bsz: false` and the Omni path does not wire a canvas-aware
+cost function yet**, so this section records the design rather than a shipped
+behaviour. What a DiffusionGemma sample costs a token budget is `L + K*C`, not `L`:
+the default measure is the `attention_mask` sum, which is the encoder row
+`L = P + K*C` and misses nothing about the encoder; what it misses is the *decoder*,
+which passes over the `K*C` canvas tokens a second time against that cache. So a
+canvas token is paid for twice and a prompt token once, and two samples with the same
+`L` and different `K` cost differently while the default calls them equal. The
+measure that charges canvas tokens twice is `diffusion_gemma_sample_cost` in
+`veomni/data/data_collator.py`. Wiring it needs a `dyn_bsz_length_fn` on the dataloader,
+and `OmniTrainer` does not forward one, so enabling `dyn_bsz` today would silently fall
+back to the default measure — treat this section as the design, not a switch.
+
+Charging the canvas half is also what makes `dyn_bsz` compatible with packing at
+all. Under any mode other than `flat_seq_pack` the collator left-pads prompts to the
 batch maximum, so a batch the buffer selected to hold `N` tokens reaches the model as
 up to `micro_batch_size * max(L)` — the budget stops predicting the step, in the
-direction that OOMs, and nothing in between would notice.
-
-What a DiffusionGemma sample costs the budget is `L + K*C`, not `L`. The default
-measure is the `attention_mask` sum, which is the encoder row `L = P + K*C` and misses
-nothing about the encoder; what it misses is the *decoder*, which passes over the `K*C`
-canvas tokens a second time against that cache. So a canvas token is paid for twice
-and a prompt token once, and two samples with the same `L` and different `K` cost
-differently while the default calls them equal.
+direction that OOMs.
 
 Measured at production attention geometry (`scripts/bench_dg_step_cost.py`): holding
 `L` fixed at 2048 and raising `K` from 1 to 7 moves the step time by **1.3–1.6x**, and
@@ -345,28 +361,26 @@ faster than its token count — but 2x is where the spread of time-per-budget-un
 smallest at the production expert count, and it needs no fitted constant. Memory is a
 separate question that the default measure already answers: across the same sweep the
 transient allocation within a step moved 4%. The benchmark runs at reduced depth on
-sdpa rather than the recipe's FFPA, so read the ratios and not the absolutes;
-self-conditioning is the one term you would expect to matter here, being a third
-decoder pass, and sweeping it moved the fit by under 1%.
+sdpa, which is also what the recipe sets, so the absolutes are the ones to read against
+each other; self-conditioning is the one term you would expect to matter here, being a
+third decoder pass, and sweeping it moved the fit by under 1%.
 
-Two things have to be set by hand. First, `micro_batch_size` — the budget per
-micro-batch is `micro_batch_size * max_seq_len`, and the recipe's `micro_batch_size: 1`
-gives 4096 where a sample costs up to `4096 + 8*256 = 6144`. Under packing that factor
-scales the budget instead of the number of rows, so raising it is the fix; the trainer
-warns below twice the worst-case sample. What happens to a sample that does not fit at
-all depends on `dyn_bsz_runtime`, in opposite directions: `main` passes it through, so
-the budget stops bounding the row; `worker` **discards** it, and cannot be told not to,
-so at `micro_batch_size: 1` every sample with canvases would be dropped and an epoch
-could produce nothing. The trainer refuses that combination rather than emptying the
-dataset quietly.
+Two things have to be set by hand if you enable it. First, `micro_batch_size` — the
+budget per micro-batch is `micro_batch_size * max_seq_len`, and the recipe's
+`micro_batch_size: 1` gives 1024 where a sample costs up to `1024 + 2*256 = 1536`.
+Under packing that factor scales the budget instead of the number of rows, so raising
+it is the fix. What happens to a sample that does not fit at all depends on
+`dyn_bsz_runtime`, in opposite directions: `main` passes it through, so the budget
+stops bounding the row; `worker` **discards** it, and cannot be told not to, so at
+`micro_batch_size: 1` every sample with canvases would be dropped and an epoch could
+produce nothing.
 
 Second, `train_steps` is estimated as
-`data.train_size / (global_batch_size * max_seq_len)`, so `train_size` now has to be
+`data.train_size / (global_batch_size * max_seq_len)`, so `train_size` has to be
 declared in the same unit the budget spends — the dataset's token count times its mean
 `1 + K*C/L`, between 1x and 2x. Declared in plain tokens, the run spends its budget
 faster than the estimate, stops early, and leaves the learning-rate schedule unfinished
-with nothing in the logs to say so. The trainer warns and does not correct it: the
-ratio is a property of the data.
+with nothing in the logs to say so.
 
 ---
 
@@ -412,9 +426,9 @@ gives a different table from this one:
 
 Read the whole-model column before turning this on. The replicated decoder is why it
 lags the encoder one — the `K*C` canvas tokens cost every rank what they cost one — and
-at short lengths the collectives are not earned back at all. At the recipe's
-`max_seq_len: 4096` the case for SP is the **halved memory**, not the 1.07x; the time
-argument starts around 8k. Memory is the more dependable half, sitting near 0.5x at
+at short lengths the collectives are not earned back at all. At the shipped recipe's
+`max_seq_len: 1024` — and well beyond it, up to ~8k — the case for SP is the **halved
+memory**, not the 1.07x; the time argument starts around 8k. Memory is the more dependable half, sitting near 0.5x at
 every length because it is activations that halve rather than arithmetic. (Caveat on the
 time column: that arm holds 1, 2, 4 and 4 samples across the four rows, so canvas work
 is not constant down it. The 8192/16384 pair is the controlled one.)
@@ -438,8 +452,8 @@ Constraints worth knowing before choosing a topology:
 
 ## Generation
 
-Block-autoregressive sampling against a checkpoint (HF weights or a training
-`save_hf_weights` dump):
+Two ways in. The standalone script loads a checkpoint (HF weights or a training
+`save_hf_weights` dump) and samples directly:
 
 ```shell
 python -m scripts.generate_diffusion_gemma ./diffusiongemma-26B-A4B-it \
@@ -453,3 +467,28 @@ python -m scripts.generate_diffusion_gemma ./diffusiongemma-26B-A4B-it \
     --prompt "Describe this image." \
     --image cat.jpg
 ```
+
+`tasks/omni/infer_omni.py` runs the same sampler as a **SeedOmni graph**, which is what
+the recipe ships and what a training run's own checkpoint should be evaluated
+through:
+
+```shell
+python tasks/omni/infer_omni.py \
+    configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/infer/base.yaml \
+    --model.model_path /path/to/diffusiongemma-26B-A4B-it \
+    --infer.prompt "What is the capital of France? Answer in one sentence."
+```
+
+The sampler's budget lives under `infer.generation_kwargs`: `num_steps` caps denoising
+steps per canvas, `entropy_budget` is the nats one step may commit, `stop_threshold` the
+mean entropy that ends a canvas, and `max_blocks` how many canvases to try before giving
+up on an end-of-turn token. `max_new_tokens` bounds **FSM steps**, not tokens, and a
+small value is enough here because the sampler loops internally.
+
+**This path cannot run under expert parallelism.** The sampler reaches into
+`model.model.encoder` and owns the KV cache across canvases, which bypasses both the
+FSDP2 root pre-forward hook and the EP dispatch, so the router's global expert index
+lands on a tensor holding only the local shard. The recipe pins `device_map: cuda:0`
+for the reason noted in the file: `accelerate`'s `infer_auto_device_map` cannot size a
+model whose encoder and decoder share every transformer weight, and the shared weights
+make `to_empty(device=...)` allocate them twice.

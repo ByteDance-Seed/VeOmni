@@ -10,8 +10,7 @@
 # LLaDA is a mask predictor, so the graph is a single node: the CPU preprocessor
 # draws the corruption (`t ~ U(1e-3, 1)` per sample, weights `1/(t*N)`) and
 # `LladaOmniTrainingMixin` divides the local sum by the step's sample count --
-# the same `Eq. 13` normalization `DllmTrainer` applies, which is what makes the
-# two paths comparable.
+# the `Eq. 13` normalization the objective defines.
 model:
   model_path: LLaDA-8B-Instruct-veomni
   model_config:

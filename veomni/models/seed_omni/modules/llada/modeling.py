@@ -21,11 +21,9 @@ preprocessor has already drawn the corruption before the batch reaches the GPU.
 
 The forward returns ``_loss`` as the *local weighted sum* ``sum_i w_i * CE_i``
 with ``w_i = 1/(t_s * N_s)`` baked in by the collator, exactly as
-``LLaDAForCausalLM`` produces it. Dividing by the step's global sample count is
-the trainer's job and stays where it is for the non-Omni path
-(``dllm_mean_global_loss``); the Omni wrapper does the same division in
-``LladaOmniTrainingMixin.post_forward`` using the count
-``on_micro_batches_ready`` recorded for this step, and declares
+``LLaDAForCausalLM`` produces it. ``dllm_mean_global_loss`` divides by the step's
+global sample count; this module's ``TrainingMixin.normalize_loss`` calls it with the
+count ``on_micro_batches_ready`` recorded for this step, and declares
 ``loss_is_step_mean`` so the trainer does not divide the backward again.
 
 Inference is the same predictor run the other way: ``generate`` starts from a

@@ -1,4 +1,4 @@
-"""LLaDA under DllmTrainer: masking transform, templates, packed bidirectional loss, converter."""
+"""LLaDA: masking transform, templates, packed bidirectional loss, converter."""
 
 import importlib.util
 import os

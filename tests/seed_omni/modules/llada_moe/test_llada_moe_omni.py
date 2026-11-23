@@ -32,8 +32,7 @@ def test_the_expert_weights_are_sharded_over_the_ep_group():
 def test_the_router_term_joins_after_the_sample_count_division():
     """`aux_loss` is a per-token mean, so folding it into the sample-mean CE term
     before the division would rescale it with the batch composition. The module
-    therefore divides first and adds `coef * aux_loss` afterwards, matching
-    `DllmTrainer.postforward`.
+    therefore divides first and adds `coef * aux_loss` afterwards.
 
     The hook itself is inherited from the dense module, so the patch targets that
     definition -- which also pins the reuse: a copy of `normalize_loss` here would

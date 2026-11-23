@@ -600,9 +600,9 @@ class OmniTrainer:
         """Tell every live module which micro-batches make up this optimizer step.
 
         Modules whose loss is normalized per step rather than per micro-batch need
-        the whole accumulation window. ``DllmTrainer`` counts the step's samples
-        the same way before ``dllm_mean_global_loss``; a dLLM module in this graph
-        reads that contract through ``on_micro_batches_ready``.
+        the whole accumulation window: ``dllm_mean_global_loss`` divides by a sample
+        count taken over all of it, and a dLLM module in this graph reads that
+        contract through ``on_micro_batches_ready``.
 
         Runs before the loop so ``pre_forward`` of the first micro-batch can rely
         on the count already being set.

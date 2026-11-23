@@ -24,7 +24,7 @@ argmin is not differentiable, so nothing upstream of it can train.
 
 Weights load from the checkpoint's own key layout (see
 ``scripts/convert_llada2uni_to_veomni.py``); per-expert weights are fused at load time.
-Trained by `DllmTrainer` with ``data_type: llada2_uni``; generation is not ported.
+Trained with the masked-diffusion objective and ``data_type: llada2_uni``; generation is not ported.
 """
 
 from collections.abc import Callable
@@ -476,7 +476,7 @@ class LLaDA2UniForConditionalGeneration(LLaDA2UniPreTrainedModel):
             The original token at each masked position and `-100` elsewhere, not shifted.
         loss_weight (`torch.Tensor`, *optional*):
             Per-token weight `1 / (t * N)` drawn with the mask; the returned `loss` is the local
-            `sum_i w_i * CE_i`, which `DllmTrainer` divides by the global sample count.
+            `sum_i w_i * CE_i`, which the training step divides by the global sample count.
         """
         if (labels is None) != (loss_weight is None):
             raise ValueError(

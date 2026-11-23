@@ -18,8 +18,7 @@ The vision sibling of :mod:`..llada`. Same one-node graph and same sample-mean
 objective; the SigLIP tower and projector run inside that node, scattering image
 rows into the text embeddings before the backbone.
 ``model_type`` is ``llada_v_omni`` so the composed-model registries stay disjoint
-from the vendored ``veomni.models.transformers.llada_v`` entries the non-Omni
-trainer resolves.
+from the vendored ``veomni.models.transformers.llada_v`` entries.
 """
 
 from .. import (

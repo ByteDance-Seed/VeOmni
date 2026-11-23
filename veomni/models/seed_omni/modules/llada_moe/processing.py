@@ -18,8 +18,7 @@ The objective is identical to :mod:`..llada`: chat-template, tokenize and draw t
 dLLM corruption in one call, then hand the tensors to the graph. Only the chat
 template differs (Bailing's ``llada_moe``), so this subclasses the dense worker
 and overrides that one default rather than duplicating the pipeline -- a second
-implementation would drift from the corruption the non-Omni trainer draws, which
-is exactly the comparison this module exists to support.
+implementation would drift from the corruption the shared data transform draws.
 """
 
 from __future__ import annotations

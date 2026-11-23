@@ -17,8 +17,7 @@
 The module keeps the vendored ``LLaDAVConfig`` fields unchanged -- the text
 backbone, the SigLIP ``vision_config``, ``mm_hidden_size`` and the projector's
 source layer -- and only adds the ``model_type`` the SeedOmni registries key on.
-``llada_v_omni`` stays disjoint from the vendored ``llada_v`` entry the non-Omni
-trainer resolves.
+``llada_v_omni`` stays disjoint from the vendored ``llada_v`` architecture entry.
 """
 
 from __future__ import annotations

@@ -23,7 +23,7 @@ bidirectional attention, and is maintained directly (no patchgen). Weights load 
 Qwen3-MoE key layout (see ``scripts/convert_lladamoe_to_veomni.py``); per-expert
 checkpoints are fused at load time by ``checkpoint_tensor_converter``.
 
-Trained by `DllmTrainer` (``data_type: llada``, ``chat_template: llada_moe``), which
+Trained by the LLaDA-family objective (``data_type: llada``, ``chat_template: llada_moe``), which
 shares the packed mask and in-place loss of ``llada.dllm_utils``.
 """
 
@@ -688,11 +688,11 @@ class LLaDAMoEForCausalLM(LLaDAMoEPreTrainedModel, GenerationMixin):
             predictor recovers the token in place.
         loss_weight (`torch.Tensor`, *optional*):
             Per-token weight `1 / (t * N)` drawn with the mask. Required with `labels`; the returned
-            `loss` is the local `sum_i w_i * CE_i`, which `DllmTrainer` divides by the global sample count.
+            `loss` is the local `sum_i w_i * CE_i`, which the training step divides by the global sample count.
 
         `aux_loss` is returned unweighted and is not folded into `loss`: `loss` is still to be divided by
         the global sample count, which would rescale the load-balancing term with the batch composition.
-        `DllmTrainer` adds `router_aux_loss_coef * aux_loss` after that normalization.
+        The router term is added as `router_aux_loss_coef * aux_loss` after that normalization.
         """
         if (labels is None) != (loss_weight is None):
             raise ValueError(

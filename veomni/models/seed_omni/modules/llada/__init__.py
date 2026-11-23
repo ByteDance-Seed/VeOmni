@@ -17,8 +17,7 @@
 The mask predictor supervises itself in place, so the graph is one node deep and
 the module needs no sibling to hand anything to. ``model_type`` is
 ``llada_omni`` rather than ``llada`` so the composed-model registries stay
-disjoint from the vendored ``veomni.models.transformers.llada`` entries that the
-non-Omni trainer resolves.
+disjoint from the vendored ``veomni.models.transformers.llada`` entries.
 
 This family currently covers LLaDA only -- the dense 8B mask predictor. The
 ``llada_moe`` / ``llada_v`` / ``llada2_uni`` variants each need their own module

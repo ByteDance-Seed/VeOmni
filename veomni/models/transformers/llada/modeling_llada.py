@@ -22,8 +22,8 @@ VeOmni's OpSlot fused kernels (RMSNorm / SwiGLU / RoPE / fused-CE) plus a bidire
 and is now maintained directly (no patchgen). Weights load in the Llama key layout
 (see ``scripts/convert_llada_to_veomni.py``).
 
-Trained by `DllmTrainer` (``data_type: llada``): the forward takes the
-``labels`` / ``loss_weight`` the LLaDA transform draws and returns the local
+Trained on the masked-diffusion objective (``data_type: llada``): the forward takes
+the ``labels`` / ``loss_weight`` the LLaDA transform draws and returns the local
 masked-CE sum as ``loss``; see ``dllm_utils``.
 """
 
@@ -455,7 +455,7 @@ class LLaDAForCausalLM(LLaDAPreTrainedModel, GenerationMixin):
             predictor recovers the token in place.
         loss_weight (`torch.Tensor`, *optional*):
             Per-token weight `1 / (t * N)` drawn with the mask. Required with `labels`; the returned
-            `loss` is the local `sum_i w_i * CE_i`, which `DllmTrainer` divides by the global sample count.
+            `loss` is the local `sum_i w_i * CE_i`, which the training step divides by the global sample count.
         """
         if (labels is None) != (loss_weight is None):
             raise ValueError(

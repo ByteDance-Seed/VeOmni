@@ -184,7 +184,7 @@ def process_llada_example(
     """Chat-template a conversation and apply `apply_dllm_masking` to its answers.
 
     Used with the LLaDA-family templates (``chat_template: llada`` / ``llada_moe``);
-    ``mask_token_id`` comes from the model config (`DllmTrainer` passes it).
+    ``mask_token_id`` comes from the model config (the training step passes it).
 
     The mask is drawn from a generator keyed on ``(mask_seed, mask_epoch, tokens)``,
     for the reason `diffusion_gemma_noise_generator` gives: the process RNG is one

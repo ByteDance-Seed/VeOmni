@@ -285,42 +285,6 @@ class TestTheCollatorAlignsTheRow:
         assert batch["input_ids"].shape == (1, 11)
         assert bool(batch["attention_mask"].all())
 
-    def test_the_trainer_hands_the_topology_to_the_collator(self):
-        """The wiring, not the constructor.
-
-        An earlier version of this asserted that constructing the collator does not
-        call `get_parallel_state` -- true by construction, and green on the day the
-        trainer stopped passing `sp_size` at all, which is the thing the name
-        promised. So this drives `_build_collate_fn` and reads back what it built.
-        """
-        from types import MethodType, SimpleNamespace
-
-        from veomni.models.transformers.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaConfig
-        from veomni.trainer import dllm_trainer as trainer_module
-        from veomni.trainer.dllm_trainer import DllmTrainer
-
-        trainer = SimpleNamespace(
-            base=SimpleNamespace(
-                args=SimpleNamespace(
-                    data=SimpleNamespace(max_seq_len=4096),
-                    train=SimpleNamespace(dyn_bsz=False, dyn_bsz_runtime="main", micro_batch_size=1),
-                ),
-                model=SimpleNamespace(
-                    model_config=DiffusionGemmaConfig(
-                        canvas_batching="flat_seq_pack", canvas_length=256, max_canvases=8
-                    )
-                ),
-            ),
-            _is_canvas_model=True,
-            _is_multimodal=False,
-        )
-        for name in ("_warn_if_the_budget_unit_does_not_match_train_size", "_check_the_budget_can_hold_a_sample"):
-            setattr(trainer, name, MethodType(getattr(DllmTrainer, name), trainer))
-
-        with patch.object(trainer_module, "get_parallel_state", return_value=parallel_state(4)):
-            DllmTrainer._build_collate_fn(trainer)
-        assert trainer.base.collate_fn.sp_size == 4
-
     def test_the_collator_does_not_read_the_topology_itself(self):
         """It is pickled into dataloader workers, whose global state is not this one."""
         with patch.object(collator_module, "get_parallel_state") as spy:

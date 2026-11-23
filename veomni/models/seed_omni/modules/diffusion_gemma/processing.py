@@ -23,8 +23,7 @@ This reuses ``process_diffusion_gemma_example`` rather than re-deriving the
 pipeline. The corruption is keyed on ``(corruption_seed, corruption_epoch,
 tokens)`` and the canvas grid is cut from the answer by
 ``_build_diffusion_gemma_canvas``; a second implementation would drift from the one
-the non-Omni trainer draws, which is exactly the comparison this module exists to
-support.
+the shared data transform draws.
 """
 
 from __future__ import annotations
@@ -97,10 +96,10 @@ class DiffusionGemmaOmniPreprocessor(ModulePreprocessorBase):
         template_name = overrides.pop("chat_template", None)
         if template_name is None:
             # The checkpoint's own template: `tokenizer_generation_prompt` drives
-            # `apply_chat_template` rather than a registered spelling, which is what
-            # the non-Omni DiffusionGemma config uses too. Defaulting to a literal
-            # name here (`gemma3`) would fail whenever this worker is built through
-            # `bind_module_assets`, which binds assets without launcher overrides.
+            # `apply_chat_template` rather than a registered spelling. Defaulting to a
+            # literal name here (`gemma3`) would fail whenever this worker is built
+            # through `bind_module_assets`, which binds assets without launcher
+            # overrides.
             template_name = "tokenizer_generation_prompt"
         chat_template = build_chat_template(template_name, tokenizer)
 
@@ -108,8 +107,7 @@ class DiffusionGemmaOmniPreprocessor(ModulePreprocessorBase):
 
         config_dict, _ = PretrainedConfig.get_config_dict(module_path)
         # The 26B checkpoint nests every text field under `text_config`
-        # (`vocab_size`, `eos_token_id`, ...), which is also what the non-Omni
-        # transform reads.
+        # (`vocab_size`, `eos_token_id`, ...), which is also what the transform reads.
         text_config = config_dict.get("text_config") or {}
 
         def _pick(key: str, default: Any) -> Any:

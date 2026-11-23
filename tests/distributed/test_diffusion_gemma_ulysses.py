@@ -562,21 +562,28 @@ def _sum_over_shards_worker():
 
 
 def _postforward_worker():
-    """The trainer's reduction, which no other test here goes through.
+    """The per-sample reduction under SP, which no other test here goes through.
 
     Every other worker calls the model directly, and that is how the shipped path
     came to be broken while all of them passed: `dllm_mean_global_loss` refused
-    `sp_enabled` outright, so a run that got past the preflight died in
-    `postforward` on the first micro-step. A model-level test cannot see that.
+    `sp_enabled` outright, so a run that got past the preflight died on the first
+    micro-step. A model-level test cannot see that.
 
     What is asserted is the reduction's *value* against the same reduction at
     sp=1. The two `sp_size` factors it relies on -- the world-group all-reduce
     counting each sample once per SP peer, and `fsdp_size` carrying the Ulysses
     dimension -- cancel only if both are present, so getting either wrong moves
     this by exactly `sp_size`.
+
+    The reduction is called directly rather than through a trainer: `postforward`
+    did nothing to the loss but hand it to `dllm_mean_global_loss` with the sample
+    count and the SP-span flag, and both of those are spelled out below. The flag is
+    `True` because a canvas model's two terms already arrive whole across the group
+    -- the diffusion term runs on canvases SP replicates and the AR term goes through
+    `sum_over_ulysses_shards` inside the model.
     """
     from veomni.distributed.parallel_state import use_parallel_state
-    from veomni.trainer.dllm_trainer import DllmTrainer
+    from veomni.utils.loss_utils import count_supervised_samples, dllm_mean_global_loss
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -585,14 +592,18 @@ def _postforward_worker():
     replicated, sharded = _both_topologies(world_size)
 
     def reduced(state, sp_size):
-        """One arm's `postforward`, with the trainer reduced to what it reads."""
+        """One arm's reduction, over the tensors the trainer would have handed it."""
         with use_parallel_state(state):
             model = _build_model(device)
             batch = _build_row(model.config, device, sp_size=sp_size)
             outputs = model(**batch, use_cache=False)
-            trainer = DllmTrainer.__new__(DllmTrainer)
-            trainer.micro_batches_num_samples = trainer._supervised_sample_count(batch["loss_weight"])
-            loss, metrics = DllmTrainer.postforward(trainer, outputs, batch)
+            num_samples = count_supervised_samples(batch)
+            loss = dllm_mean_global_loss(outputs.loss, num_samples, sum_spans_sp_group=True)
+            metrics = {
+                name: dllm_mean_global_loss(getattr(outputs, name), num_samples, sum_spans_sp_group=True)
+                for name in ("diffusion_loss", "encoder_ar_loss")
+                if getattr(outputs, name, None) is not None
+            }
             return float(loss.detach()), {k: float(v.detach()) for k, v in metrics.items()}
 
     # The reference arm still runs on two ranks, so its `fsdp_size` and its

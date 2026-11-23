@@ -192,9 +192,9 @@ def run_veomni(
 
     conditioning = {}
     if self_conditioning:
-        # The two-pass scheme lives in `DllmTrainer.preforward` on this side,
-        # not in the model, so it is restated here. Every sample is conditioned, which
-        # is what `do_self_conditioning=True` asks NeMo for.
+        # The two-pass scheme is driven by the training step, not the model, so it is
+        # restated here. Every sample is conditioned, which is what
+        # `do_self_conditioning=True` asks NeMo for.
         with torch.no_grad():
             embeddings = model(**batch, return_logits=False, return_self_conditioning_embeddings=True)
         conditioning = {

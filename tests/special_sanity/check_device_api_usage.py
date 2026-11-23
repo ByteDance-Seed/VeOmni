@@ -83,7 +83,6 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # a test fixture, not a production device-API call.
     "tests/distributed/test_async_activation_offload.py",
     "tests/distributed/test_diffusion_gemma_",
-    "tests/distributed/test_dllm_ulysses.py",
     "tests/checkpoints/test_diffusion_gemma_resume.py",
     "tests/optim/test_adafactor_fsdp2.py",
     "tests/models/test_diffusion_gemma",

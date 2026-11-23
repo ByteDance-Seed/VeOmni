@@ -1,20 +1,26 @@
 # LLaDA family training guide
 
 The LLaDA models are **masked-diffusion** LMs: a bidirectional mask predictor trained
-to recover masked answer tokens in place. They train with the generic `DllmTrainer`
-through `tasks/train_dllm.py`; do not use `tasks/train_text.py`, whose collator shifts
+to recover masked answer tokens in place. They train as **SeedOmni modules** under
+`OmniTrainer` — one node per model, launched from
+`tasks/omni/train_omni.py`. Do not use `tasks/train_text.py`, whose collator shifts
 labels for next-token prediction.
 
 | Model | `model_type` | Chat template | `[MASK]` id | Config |
 |-------|--------------|---------------|-------------|--------|
-| LLaDA-8B-Instruct | `llada` | `llada` | 126336 | [`configs/dllm/llada_8b.yaml`](../../configs/dllm/llada_8b.yaml) |
-| LLaDA-MoE-7B-A1B-Instruct | `llada_moe` | `llada_moe` | 156895 | [`configs/dllm/llada_moe_7b.yaml`](../../configs/dllm/llada_moe_7b.yaml) |
-| LLaDA-V | `llada_v` | `llada` | 126336 | [`configs/dllm/llada_v_8b.yaml`](../../configs/dllm/llada_v_8b.yaml) |
-| LLaDA2.0-Uni (I2T) | `llada2_uni` | `llada2_uni` | 156895 | [`configs/dllm/llada2_uni_16b.yaml`](../../configs/dllm/llada2_uni_16b.yaml) |
+| LLaDA-8B-Instruct | `llada` | `llada` | 126336 | [`configs/seed_omni/Llada/llada_8b/train/base.yaml`](../../configs/seed_omni/Llada/llada_8b/train/base.yaml) |
+| LLaDA-MoE-7B-A1B-Instruct | `llada_moe` | `llada_moe` | 156895 | [`configs/seed_omni/Llada_moe/llada_moe_7b/train/base.yaml`](../../configs/seed_omni/Llada_moe/llada_moe_7b/train/base.yaml) |
+| LLaDA-V | `llada_v` | `llada` | 126336 | [`configs/seed_omni/Llada_v/llada_v_8b/train/base.yaml`](../../configs/seed_omni/Llada_v/llada_v_8b/train/base.yaml) |
+| LLaDA2.0-Uni (I2T) | `llada2_uni` | `llada2_uni` | 156895 | [`configs/seed_omni/Llada2_uni/llada2_uni_16b/train/base.yaml`](../../configs/seed_omni/Llada2_uni/llada2_uni_16b/train/base.yaml) |
 
-The text models use `data_type: llada`, and `model.chat_template` is what differs
-between them. LLaDA-V uses `data_type: llada_v`. LLaDA2.0-Uni I2T uses
+The text models use `data_type: llada`, and `model.chat_template` is what
+differs between them. LLaDA-V uses `data_type: llada_v`. LLaDA2.0-Uni I2T uses
 `data_type: llada2_uni`. Image generation (`decoder/`, T2I) is not part of this path.
+
+Under SeedOmni the launcher's `data.data_type` is `seedomni` for all of them — the
+preprocessor registered for each module is what applies `llada` / `llada_v` /
+`llada2_uni`. The names above are the *transform* names, which the module's
+`processing.py` calls directly.
 
 ## Objective
 
@@ -26,11 +32,13 @@ between them. LLaDA-V uses `data_type: llada_v`. LLaDA2.0-Uni I2T uses
 3. Keep `labels` only at masked positions (no shift) and give them `loss_weight = 1 / (t * N)`,
    `N` being the sample's answer length.
 
-The model returns the local `sum_i w_i * CE_i`, and `DllmTrainer` divides it by the
-number of samples with an answer across the step and all data-parallel ranks, including
-the ones whose draw masked nothing. The `[MASK]` id is read from the model config's
-`mask_token_id`. Each sample's draw comes from a generator keyed on `train.seed`, the
-epoch and the sample's tokens, so ranks do not share masks and a resume replays them.
+The model returns the local `sum_i w_i * CE_i`, and the module's per-step
+normalization divides it by the number of samples with an answer across the step and
+all data-parallel ranks, including the ones whose draw masked nothing (that divisor is
+`dllm_mean_global_loss` in `veomni/utils/loss_utils.py`). The `[MASK]` id is read from
+the model config's `mask_token_id`. Each sample's draw comes from a generator keyed on
+the mask seed, the epoch and the sample's tokens, so ranks do not share masks and a
+resume replays them.
 
 The answer is supervised up to its own end-of-turn token. LLaDA's SFT recipe also pads
 short answers with `|EOS|` and supervises that padding, which is what its fixed-length
@@ -43,38 +51,46 @@ checkpoint's template back unchanged, so a saved tokenizer keeps the original te
 
 ## Packing
 
-`MainCollator` packs samples into one row, with `position_ids` restarting at 0 at each
-sample. Attention stays inside a sample: the varlen flash backends read the collator's
-`cu_seq_lens`, and sdpa / eager get a block-diagonal mask built from `position_ids`.
-`DllmTrainer` counts one sample per segment rather than per row, so packing
+The Omni module packs the preprocessed rows itself (`batch_pre` concatenates them and
+carries the boundaries in `position_ids`, restoring them at 0). Attention stays inside a
+sample: the varlen flash backends read the collator's `cu_seq_lens`, and sdpa / eager
+get a block-diagonal mask built from `position_ids`.
+The sample count is one per segment rather than per row
+(`count_supervised_samples`), so packing
 (`dyn_bsz: true`) and `micro_batch_size` change nothing in the loss.
 
 ## Sequence parallelism
 
-All four models train under Ulysses sequence parallelism: set
-`model.accelerator.ulysses_size` (it combines with `ep_size` for the MoE models). It needs a
-flash backend (`attn_implementation: flash_attention_2` or 3/4, which VeOmni maps to
-its `_with_sp` variants), and `ulysses_size` must divide `num_attention_heads`; KV
-heads are repeated when there are fewer of them than ranks.
+**The dense LLaDA, LLaDA-MoE and LLaDA-V Omni modules refuse `ulysses_size > 1`**: their
+`batch_pre` hands the whole packed row to every rank, so the loss would be wrong at
+`sp_size > 1`, and the module raises at build rather than training a wrong objective.
+Run them with `ulysses_size: 1` and `cp_size: 1`. LLaDA2.0-Uni's text encoder is the
+family member with a sharded path.
 
-- Samples are counted before the sequence is sliced, so every rank divides by the
-  whole row's sample count.
-- Each rank's masked loss covers its shard, and `DllmTrainer` sums it over the group.
-- LLaDA-MoE's load-balancing loss sums its expert statistics over the group, so it
-  equals the unsharded loss. The exception is the few tokens of SP padding
-  (fewer than `ulysses_size` per micro-batch), which are routed like real tokens.
-- LLaDA-V and LLaDA2.0-Uni keep the pixels and `image_mask` whole on every rank: each
-  rank encodes every image and fills only the image slots in its own shard, so an
-  image cut by a shard boundary is split correctly. The vision encoding is therefore
-  repeated on each of the `ulysses_size` ranks rather than divided among them.
-- The vision towers always use sdpa, so they never pick up the backbone's
-  all-to-all attention. This holds without SP too, so LLaDA-V's SigLIP no longer runs
-  the backbone's flash kernel at `ulysses_size: 1`.
+What the non-Omni path did under SP — count samples before slicing, sum each rank's
+masked loss over the Ulysses group — no longer applies, because there is no sharded
+LLaDA row to sum.
 
 ## Limitations
 
 - **No context parallelism.** `cp_size > 1` is refused; use `ulysses_size`.
-- **Training only.** Diffusion sampling (`generate`) is not part of this path.
+
+## Generation
+
+Each family has an inference graph next to its training config, driven by
+`tasks/omni/infer_omni.py`:
+
+```shell
+python tasks/omni/infer_omni.py configs/seed_omni/Llada/llada_8b/infer/base.yaml \
+    --model.model_path /path/to/LLaDA-8B-Instruct-veomni \
+    --infer.prompt "What is the capital of France? Answer in one sentence."
+```
+
+A mask predictor's generation loops on itself: `diffusion_steps` bounds the denoising
+passes inside the module, while `infer.generation_kwargs.max_new_tokens` bounds FSM
+steps overall and must leave headroom for the pass that lays out the prompt. See
+[SeedOmni training and inference](../seed_omni/usage/training_and_inference.md) for the
+per-family FSM shapes and budgets.
 
 ## Checkpoint conversion
 
@@ -86,9 +102,10 @@ python scripts/convert_llada_to_veomni.py --src LLaDA-8B-Instruct --dst LLaDA-8B
 python scripts/convert_llada_to_veomni.py --self-test   # key mapping only, no weights
 ```
 
-Checkpoints saved by training (`save_hf_weights: true`) stay in the Llama layout with
-`model_type: llada`. Upstream LLaDA code (`trust_remote_code`) cannot load them without
-renaming the keys back.
+Checkpoints saved by training (`save_hf_weights: true`) stay in the Llama key layout.
+The Omni module declares `model_type: llada_omni`, so a dump is a split SeedOmni
+checkpoint rather than a drop-in replacement for the `llada` entry; upstream LLaDA code
+(`trust_remote_code`) cannot load either without renaming the keys back.
 
 LLaDA-MoE's weights are already in the Qwen3-MoE key layout, so its conversion only
 rewrites `config.json` (`model_type: llada_moe`) and links the shards; the per-expert
@@ -121,7 +138,7 @@ are fused into `gate_up_proj` / `down_proj` at load time. `decoder/` and `vae/` 
 The GlmImage `preprocessor_config.json` is written without its `processor_class`: with
 it, `AutoProcessor` tries to build the full GlmImage processor, which needs a
 `processor_config.json` the checkpoint does not ship, and the run is left with no
-tokenizer for the chat template. With `data_type: llada2_uni`, `DllmTrainer` refuses a
+tokenizer for the chat template. With `data_type: llada2_uni`, the transform refuses a
 checkpoint converted before this change at startup; reconvert it.
 
 ```shell
@@ -133,7 +150,7 @@ python scripts/convert_llada2uni_to_veomni.py --src LLaDA2.0-Uni --dst LLaDA2.0-
 The experts are sharded over `model.accelerator.ep_size` and run on the fused MoE kernel
 (`moe_implementation: fused_triton`). The load-balancing loss is off by default
 (`output_router_logits: false`), as in upstream LLaDA-MoE training. When it is on, the
-model returns it apart from the masked-diffusion loss and `DllmTrainer` adds
+model returns it apart from the masked-diffusion loss, and the module adds
 `router_aux_loss_coef * aux_loss` after the per-sample normalization, averaged over the
 step's micro-batches and logged as `aux_loss`.
 
@@ -204,12 +221,12 @@ a high starting loss: SFT here also adapts the model to the bidirectional object
 ## Launch
 
 ```shell
-bash train.sh tasks/train_dllm.py configs/dllm/llada_8b.yaml \
+bash train.sh tasks/omni/train_omni.py configs/seed_omni/Llada/llada_8b/train/base.yaml \
     --model.model_path LLaDA-8B-Instruct-veomni \
-    --data.train_path tulu-3-sft-mixture \
-    --model.accelerator.fsdp_config.fsdp_mode fsdp2 \
-    --model.accelerator.init_device meta
+    --data.train_path tulu-3-sft-mixture
 ```
 
 The data reads OpenAI-style `messages`; assistant turns are the answer unless a message
-sets `loss_mask`.
+sets `loss_mask`. The other three families use the same entry point with their own
+config path (see the table above); `model.accelerator.fsdp_config` and
+`init_device: meta` are already set in each `base.yaml`.
