@@ -825,10 +825,10 @@ def test_the_supported_set_is_the_bounded_whitelist():
 def test_a_linear_subclass_projection_runs_its_own_forward():
     """Only an exact ``nn.Linear`` may be read by weight; a subclass runs its own forward.
 
-    torchao's ``Float8Linear`` subclasses ``nn.Linear`` and does its float8 GEMM in
-    ``forward``. An ``isinstance`` check would let the fused row read its weight and
-    silently skip float8, so the check must be on the exact type. A quantizing row
-    on such a projection is refused instead of falling back.
+    An ``nn.Linear`` subclass (such as ``FSDPLinear`` from ``basic_modules``) does
+    extra work in ``forward``. An ``isinstance`` check would let the fused row read
+    its weight and bypass that work, so the check must be on the exact type. A
+    quantizing row on such a projection is refused instead of falling back.
     """
     from veomni.ops.kernels.gated_mlp._module import render
 
@@ -855,7 +855,7 @@ def test_a_linear_subclass_projection_runs_its_own_forward():
     with pytest.raises(ValueError, match="nn.Linear subclass"):
         render(mlp, impl="qat", activation="silu")
     with pytest.raises(ValueError, match="nn.Linear subclass"):
-        render(mlp, impl="torchao_nvfp4", activation="silu")
+        render(mlp, impl="torchao", activation="silu")
 
 
 @_cpu
@@ -872,7 +872,7 @@ def test_render_routes_each_row_by_shape_and_activation():
 
     mlp = _tiny_qwen3_mlp()
 
-    for impl in ("eager", "qat", "torchao_nvfp4", "liger_kernel"):
+    for impl in ("eager", "qat", "torchao", "liger_kernel"):
         for activation in ("silu", "swish"):
             assert render(mlp, impl=impl, activation=activation).projections is None, (impl, activation)
 
@@ -880,7 +880,7 @@ def test_render_routes_each_row_by_shape_and_activation():
     # knows it: a ``gelu`` model never enters the row, so there is no second guard
     # inside ``liger_kernel.forward`` to keep in sync (or to test separately).
     assert render(mlp, impl="liger_kernel", activation="gelu").projections is not None
-    for impl in ("eager", "qat", "torchao_nvfp4"):
+    for impl in ("eager", "qat", "torchao"):
         assert render(mlp, impl=impl, activation="gelu").projections is None
 
     # An activation outside the set is never served by a row.
@@ -969,7 +969,7 @@ def test_render_refuses_a_quantizing_row_it_cannot_serve():
         render(mlp, impl="qat", activation="silu")
 
     # Both messages name `eager` as the way to keep the projection path.
-    for impl, activation in (("qat", "mish"), ("torchao_nvfp4", "mish")):
+    for impl, activation in (("qat", "mish"), ("torchao", "mish")):
         with pytest.raises(ValueError, match="gated_mlp_implementation='eager'"):
             render(mlp, impl=impl, activation=activation)
 
@@ -1054,7 +1054,7 @@ def test_the_eager_row_backward_survives_activation_offload(activation):
     torch.testing.assert_close(offloaded, plain, rtol=0, atol=0)
 
 
-_requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reason="torchao_nvfp4 row needs torchao")
+_requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reason="torchao row needs torchao")
 
 
 @_cpu
@@ -1062,9 +1062,9 @@ _requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reas
 @pytest.mark.parametrize("swiglu_limit", [None, 1.0])
 def test_torchao_nvfp4_matches_manual_round_trip(swiglu_limit: float | None):
     """The fused row equals the same math with operands quantized by hand, clamp in the model dtype."""
-    from veomni.ops.qat.torchao_nvfp4 import nvfp4_fake_quant
+    from veomni.ops.torchao import nvfp4_fake_quant
 
-    impl = resolve_op("gated_mlp", "standard", "torchao_nvfp4").wrapper
+    impl = resolve_op("gated_mlp", "standard", "torchao").wrapper
     torch.manual_seed(0)
     mlp = _tiny_qwen3_mlp(64, 128).to(dtype=torch.bfloat16)
     x = torch.randn(2, 16, 64, dtype=torch.bfloat16)
@@ -1088,7 +1088,7 @@ def test_torchao_nvfp4_matches_manual_round_trip(swiglu_limit: float | None):
 @_requires_torchao
 def test_torchao_nvfp4_backward_produces_finite_gradients():
     """Straight-through gradients reach the input and every projection weight."""
-    impl = resolve_op("gated_mlp", "standard", "torchao_nvfp4").wrapper
+    impl = resolve_op("gated_mlp", "standard", "torchao").wrapper
     torch.manual_seed(0)
     mlp = _tiny_qwen3_mlp().to(dtype=torch.bfloat16)
     x = torch.randn(2, 16, mlp.hidden_size, dtype=torch.bfloat16, requires_grad=True)
@@ -1105,7 +1105,7 @@ def test_torchao_nvfp4_backward_produces_finite_gradients():
 @_requires_torchao
 def test_torchao_nvfp4_handles_empty_input():
     """Zero-token inputs keep their shape and propagate zero gradients to the MLP weights."""
-    impl = resolve_op("gated_mlp", "standard", "torchao_nvfp4").wrapper
+    impl = resolve_op("gated_mlp", "standard", "torchao").wrapper
     mlp = _tiny_qwen3_mlp().to(dtype=torch.bfloat16)
     x = torch.randn(0, 8, mlp.hidden_size, dtype=torch.bfloat16, requires_grad=True)
 
@@ -1114,3 +1114,37 @@ def test_torchao_nvfp4_handles_empty_input():
     out.sum().backward()
     for parameter in mlp.parameters():
         torch.testing.assert_close(parameter.grad, torch.zeros_like(parameter))
+
+
+@_cpu
+def test_torchao_fp8_validates_and_dispatches_three_projections(monkeypatch):
+    """``gated_mlp`` ``torchao`` with ``dtype='fp8'`` runs gate, up, and down via ``torchao_fp8_linear``."""
+    from veomni.ops.kernels.gated_mlp.standard import torchao as gated_torchao
+
+    mlp = _tiny_qwen3_mlp()
+    x = torch.randn(2, 4, mlp.hidden_size)
+
+    with pytest.raises(ValueError, match="does not accept block_size"):
+        gated_torchao.wrapper(mlp, x, dtype="fp8", block_size=16)
+    with pytest.raises(ValueError, match="float8 recipe"):
+        gated_torchao.wrapper(mlp, x, dtype="fp8", recipe="invalid")
+    with pytest.raises(ValueError, match="recipe is only valid for dtype='fp8'"):
+        gated_torchao.wrapper(mlp, x, dtype="nvfp4", recipe="rowwise")
+    with pytest.raises(NotImplementedError, match="native FP4"):
+        gated_torchao.wrapper(mlp, x, dtype="nvfp4", emulated=False)
+
+    seen = []
+
+    def fake_fp8(inp, weight, bias=None, *, recipe, emulated):
+        seen.append((weight.shape, recipe, emulated))
+        return F.linear(inp, weight, bias)
+
+    monkeypatch.setattr(gated_torchao, "torchao_fp8_linear", fake_fp8)
+    out = gated_torchao.wrapper(mlp, x, dtype="fp8", recipe="rowwise_with_gw_hp")
+    expected = mlp.down_proj(F.silu(mlp.gate_proj(x)) * mlp.up_proj(x))
+    torch.testing.assert_close(out, expected)
+    assert seen == [
+        (mlp.gate_proj.weight.shape, "rowwise_with_gw_hp", False),
+        (mlp.up_proj.weight.shape, "rowwise_with_gw_hp", False),
+        (mlp.down_proj.weight.shape, "rowwise_with_gw_hp", False),
+    ]

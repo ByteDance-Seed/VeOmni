@@ -52,7 +52,7 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # DeepGEMM is CUDA-only: these files select the SM90/SM100 recipe and
     # establish operand-device contexts for its device-bound JIT kernels.
     "veomni/ops/kernels/moe_experts/standard/deepgemm.py",
-    "veomni/ops/kernels/moe_experts/shared/deepgemm_fp8.py",
+    "veomni/ops/kernels/moe_experts/shared/deepgemm.py",
     # Kernel tests intentionally select and probe hardware-specific backends.
     "tests/ops/",
     "tests/special_sanity/check_device_api_usage.py",

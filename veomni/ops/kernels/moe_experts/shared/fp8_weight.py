@@ -43,6 +43,6 @@ class FP8ExpertWeight(torch.Tensor):
             return torch.empty(
                 args[1], device=kwargs.get("device", weight.device), dtype=kwargs.get("dtype", weight.dtype)
             )
-        raise NotImplementedError(f"FP8ExpertWeight does not support {func}; use the deepgemm_fp8 MoE backend.")
+        raise NotImplementedError(f"FP8ExpertWeight does not support {func}; use the deepgemm MoE backend.")
 
     __torch_function__ = torch._C._disabled_torch_function_impl
