@@ -82,7 +82,7 @@ class Qwen3RMSNorm(nn.Module):
 
 
 class Qwen3MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx: int | None = None):
         nn.Module.__init__(self)
         self.config = config
         self.hidden_size = config.hidden_size
@@ -91,7 +91,10 @@ class Qwen3MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self.veomni_gated_mlp = VeomniOp("gated_mlp", "standard", config.ops_config.gated_mlp_implementation)
+        site = f"layers.{layer_idx}.mlp" if layer_idx is not None else None
+        self.veomni_gated_mlp = VeomniOp(
+            "gated_mlp", "standard", config.ops_config.gated_mlp_implementation, site=site
+        )
 
     def forward(self, x):
         return self.veomni_gated_mlp(self, x, activation=self.config.hidden_act)
@@ -225,7 +228,11 @@ class Qwen3Attention(nn.Module):
         self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
         self.veomni_rope = VeomniOp("rope", "full", config.ops_config.rotary_pos_emb_implementation)
         self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
-        self.veomni_linear = VeomniOp("linear", "standard", config.ops_config.linear_implementation)
+        linear_impl = config.ops_config.linear_implementation
+        self.veomni_q_proj = VeomniOp("linear", "standard", linear_impl, site=f"layers.{layer_idx}.q_proj")
+        self.veomni_k_proj = VeomniOp("linear", "standard", linear_impl, site=f"layers.{layer_idx}.k_proj")
+        self.veomni_v_proj = VeomniOp("linear", "standard", linear_impl, site=f"layers.{layer_idx}.v_proj")
+        self.veomni_o_proj = VeomniOp("linear", "standard", linear_impl, site=f"layers.{layer_idx}.o_proj")
 
     def forward(
         self,
@@ -241,9 +248,9 @@ class Qwen3Attention(nn.Module):
         # The ``linear`` row takes the projection module: ``eager`` calls it (so a
         # ``basic_modules``-wrapped projection still unshards and a LoRA adapter still
         # runs), while a quantizing row reads its weight and refuses a wrapped one.
-        query_states = self.q_norm(self.veomni_linear(self.q_proj, hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.veomni_linear(self.k_proj, hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.veomni_linear(self.v_proj, hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states = self.q_norm(self.veomni_q_proj(self.q_proj, hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.veomni_k_proj(self.k_proj, hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.veomni_v_proj(self.v_proj, hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = self.veomni_rope(query_states, key_states, cos, sin)
@@ -264,7 +271,7 @@ class Qwen3Attention(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.veomni_linear(self.o_proj, attn_output)
+        attn_output = self.veomni_o_proj(self.o_proj, attn_output)
         return attn_output, attn_weights
 
 
@@ -279,7 +286,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
-        self.mlp = Qwen3MLP(config)
+        self.mlp = Qwen3MLP(config, layer_idx=layer_idx)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, config=config)
 

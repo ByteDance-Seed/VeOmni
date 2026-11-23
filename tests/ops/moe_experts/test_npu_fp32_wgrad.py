@@ -87,7 +87,7 @@ def test_npu_wrapper_accepts_quantization_options_and_forwards_fp32_wgrad(monkey
         tensor,
         num_experts=1,
         block_size=64,
-        expert_dtype="fp4",
+        dtype="fp4",
         fp32_wgrad=enabled,
     )
     assert result is tensor

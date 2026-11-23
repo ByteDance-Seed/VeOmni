@@ -29,9 +29,9 @@ what block width, is chosen by the op row that calls them -- ``linear`` /
 implementation name for it. Quantizing calls require an NVIDIA SM90 or later GPU
 and load the backend lazily, so importing this package on CPU or NPU stays free.
 
-:mod:`veomni.ops.qat.torchao_nvfp4` is separate: it builds the NVFP4 round trip
-on torchao instead of TileLang, has no SM90 requirement, and is imported
-directly rather than re-exported here.
+:mod:`veomni.ops.torchao` is separate: it holds the torchao FP8/FP4 primitives
+used by the ``torchao`` rows, has no SM90 TileLang requirement, and lives at the
+top level of :mod:`veomni.ops`.
 """
 
 from ._hardware import require_tilelang_sm90

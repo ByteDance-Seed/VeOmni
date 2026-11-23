@@ -309,7 +309,7 @@ def wrapper(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
     block_size: int = 128,
-    expert_dtype: str = "fp8",
+    dtype: str = "fp8",
     activation: str = "silu",
     fp32_wgrad: bool = False,
 ) -> Tensor:
@@ -334,9 +334,10 @@ def wrapper(
             swiglu_limit=swiglu_limit,
             assume_distinct_experts=assume_distinct_experts,
             block_size=block_size,
-            expert_dtype=expert_dtype,
+            dtype=dtype,
             activation=activation,
         )
+    del block_size, dtype
     # Empty tensor = unused layout. Registry args stay tensors.
     return npu_fused_moe_forward(
         num_experts,
