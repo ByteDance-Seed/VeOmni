@@ -68,17 +68,13 @@ def composed_model_owns_wrap(accelerator: "AcceleratorConfig") -> bool:
 
 
 def module_compile_config(accelerator: "AcceleratorConfig", module: nn.Module, *, global_accelerator=None):
-    """One module's compile settings, or everything off unless it opts in.
+    """This module's compile settings, or everything off unless it opts in.
 
-    Four conditions, all required: the module's resolved
-    ``torch_compile.enable``, its ``supports_torch_compile`` class flag, an
-    ``fsdp2`` wrap, and — only when ``global_accelerator`` is given, i.e. under
-    ``fsdp_scope='model'`` — an ``fsdp2`` launcher. ``dynamic`` additionally
-    needs the module's ``supports_torch_compile_dynamic``.
-
-    Each condition has a measured or structural reason, recorded at
-    :attr:`PretrainedOmniModule <...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile>`;
-    ``False`` is returned rather than ``None`` so callers keep one code path.
+    ``enable`` needs all of: the module's resolved ``torch_compile.enable``, its
+    ``supports_torch_compile`` class flag, an ``fsdp2`` wrap, and — when
+    ``global_accelerator`` is given, i.e. under ``fsdp_scope='model'`` — an
+    ``fsdp2`` launcher, because that wrap is the top-level one. ``dynamic`` adds
+    the module's ``supports_torch_compile_dynamic``.
     """
     from .....distributed.torch_compile import CompileConfig
 
@@ -86,8 +82,6 @@ def module_compile_config(accelerator: "AcceleratorConfig", module: nn.Module, *
     supported = bool(getattr(module, "supports_torch_compile", False))
     dynamic_ok = bool(getattr(module, "supports_torch_compile_dynamic", False))
     fsdp2 = accelerator.fsdp_config.fsdp_mode == "fsdp2"
-    # Under ``fsdp_scope='model'`` the wrap is the top-level one, so its mode is
-    # what decides whether ``compile_decoder_blocks`` can run at all.
     wrap_fsdp2 = global_accelerator is None or global_accelerator.fsdp_config.fsdp_mode == "fsdp2"
     enabled = bool(run_config.enable) and supported and fsdp2 and wrap_fsdp2
     return CompileConfig(
@@ -95,8 +89,6 @@ def module_compile_config(accelerator: "AcceleratorConfig", module: nn.Module, *
         backend=run_config.backend,
         mode=run_config.mode,
         fullgraph=run_config.fullgraph,
-        # ``dynamic`` is meaningless unless this module is compiled, so it carries
-        # the same gates.
         dynamic=enabled and bool(run_config.dynamic) and dynamic_ok,
     )
 

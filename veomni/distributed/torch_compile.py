@@ -25,39 +25,15 @@ from ..utils import device, logging
 logger = logging.get_logger(__name__)
 
 
-#: Which callers this module serves, and the signal each is recognised by.
+#: Multimodal models whose compile path has been validated, and the block each
+#: compiles.
 #:
-#: ``validate_compile_model`` gates four kinds of model, and the branch each one
-#: takes is decided from the model's *topology*, not from a single flag — the
-#: signals differ because the models differ:
-#:
-#: =========================  ==========================================  ====================================
-#: caller                     recognised by                               what it gets
-#: =========================  ==========================================  ====================================
-#: base trainer, text model   ``_is_multimodal_model`` is ``False``       the generic ``*DecoderLayer`` path
-#: base trainer, multimodal   ``_is_multimodal_model`` is ``True``        fail-closed: dense Qwen3-VL only
-#: SeedOmni module            ``_is_omni_module`` (``isinstance``)        composed guards (no CUDA graph, no SP)
-#: SeedOmni composed          ``_is_composed_model`` (``_module_configs``)  composed guards
-#: =========================  ==========================================  ====================================
-#:
-#: Why the multimodal branch is narrower than the SeedOmni ones: a single HF
-#: multimodal model holds its towers **and** the cross-modal injection between
-#: them in one ``forward``, so its block boundaries and lifecycle are not the
-#: plain decoder-block contract. Only dense Qwen3-VL has been validated, and
-#: ``_SUPPORTED_MULTIMODAL_DECODER_BLOCKS`` names what that validation covered.
-#: A SeedOmni module holds one component and no injection point, so it gets the
-#: composed guards instead — even though its config carries a ``vision_config``
-#: and so looks multimodal to ``_is_multimodal_model``.
-#:
-#: A new caller normally adds a branch here. The alternative — moving the answer
-#: onto the model as a capability flag, the way
+#: A single HF multimodal model holds its towers *and* the cross-modal injection
+#: between them in one ``forward``, so its blocks are not the plain decoder-block
+#: contract — hence an allowlist rather than an opt-in. SeedOmni modules and
+#: composed models do not appear here: their parts declare
 #: :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile`
-#: already works for SeedOmni — would collapse this to one check plus the shared
-#: runtime constraints, and retire ``_SUPPORTED_MULTIMODAL_DECODER_BLOCKS`` (the
-#: table exists only to express "we validated this one"). That refactor has not
-#: been done because re-validating the existing Qwen3-VL support needs a real
-#: training run.
-
+#: and get the composed guards instead.
 _SUPPORTED_MULTIMODAL_DECODER_BLOCKS = {
     "qwen3_vl": "Qwen3VLTextDecoderLayer",
 }
@@ -92,15 +68,12 @@ class CompileConfig:
 def _compile_decision(model: nn.Module, fqn: str) -> bool | None:
     """What the nearest ``VeOmniPreTrainedModel`` owning ``fqn`` says, or ``None`` if there is none.
 
-    Walks the block's module path outwards and takes the **nearest** ancestor that
-    is a ``VeOmniPreTrainedModel``, so a multimodal model can qualify one submodel
-    and not another: ``model.language_model.layers.0`` finds
-    ``Qwen3VLTextModel`` while ``model.visual.blocks.0`` finds
-    ``Qwen3VLVisionModel``, which inherits the ``False`` default.
-
-    ``None`` means the model is not built from ``VeOmniPreTrainedModel`` at all —
-    a bare ``nn.Module`` in a test, say — so there is no declaration to honour and
-    the caller keeps its old rule.
+    Walking outwards from the block and taking the nearest declarer is what lets a
+    multimodal model qualify one submodel and not another
+    (``language_model.layers.0`` finds ``Qwen3VLTextModel``;
+    ``visual.blocks.0`` finds the tower, which inherits ``False``). ``None`` means
+    no ``VeOmniPreTrainedModel`` in the path at all, so the caller keeps its old
+    rule.
     """
     from ..models.modeling_base import VeOmniPreTrainedModel
 
@@ -119,9 +92,8 @@ def _compile_decision(model: nn.Module, fqn: str) -> bool | None:
 def _block_compiles(model: nn.Module, fqn: str, class_name: str) -> bool:
     """Whether the block at ``fqn`` should be compiled.
 
-    The model answers through :func:`_compile_decision`. Only when nothing in the
-    path declares anything does the old ``*DecoderLayer`` suffix rule apply, which
-    keeps bare-``nn.Module`` callers working.
+    A declaration wins. Only a model that declares nothing falls back to the
+    ``*DecoderLayer`` suffix, which keeps bare-``nn.Module`` callers working.
     """
     declared = _compile_decision(model, fqn)
     if declared is not None:
@@ -132,21 +104,13 @@ def _block_compiles(model: nn.Module, fqn: str, class_name: str) -> bool:
 def _decoder_block_specs(model: nn.Module) -> list[tuple[str, str | None]]:
     """``(class name, child scope)`` for each compilable block in ``_no_split_modules``.
 
-    An entry is a bare class name (``LlamaDecoderLayer``, scope ``None``, matches
-    anywhere) or — on a SeedOmni composed model, where the children share one
-    FSDP tree — scoped to a child (``janus_llama.LlamaDecoderLayer``, matches
-    only under that child; see ``_scoped_no_split_modules`` in
-    ``models/seed_omni/accelerated/omni_model/omni_model_runtime.py``).
+    A bare class name has scope ``None`` and matches anywhere; on a SeedOmni
+    composed model each entry is scoped to its child (``janus_llama.LlamaDecoderLayer``,
+    see ``_scoped_no_split_modules``) so it matches only there. The name half is
+    compared against ``type(module).__name__``, which never carries a scope.
 
-    ``type(module).__name__`` never carries a scope, so the name half is what
-    ``_is_decoder_block`` compares and the scope half is what it matches against
-    the fqn.
-
-    Whether an entry is compiled is decided by the model, not by its name: the
-    nearest enclosing ``VeOmniPreTrainedModel`` in the block's path answers
-    through :attr:`~veomni.models.modeling_base.VeOmniPreTrainedModel.supports_torch_compile`
-    (see :func:`_block_compiles`), which is what lets a SeedOmni module name its
-    own blocks (``JanusVQVAEAttnBlock``) without a naming convention.
+    Whether an entry compiles is the model's answer, not its class name's — see
+    :func:`_block_compiles`.
     """
     no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
     if no_split_modules is None:

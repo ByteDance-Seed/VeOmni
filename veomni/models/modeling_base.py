@@ -24,19 +24,12 @@ class VeOmniPreTrainedModel(PreTrainedModel):
 
     #: Whether ``torch.compile`` may wrap this model's blocks.
     #:
-    #: ``False`` by default: a model turns it on once its blocks have been
-    #: measured to benefit. The flag is read per *block*, from the nearest
-    #: enclosing ``VeOmniPreTrainedModel`` in the block's module path — so a
-    #: multimodal model sets it on the submodels that qualify and leaves the
-    #: others off::
-    #:
-    #:     class Qwen3VLTextModel(...):     supports_torch_compile = True
-    #:     class Qwen3VLVisionModel(...):   # inherits False
-    #:
-    #: which makes ``model.language_model.layers.0`` compile and
-    #: ``model.visual.blocks.0`` stay eager. The block classes themselves are
-    #: unchanged, so ``_no_split_modules`` — which FSDP depends on — keeps
-    #: meaning exactly what it meant before.
+    #: Off by default. Read per block, from the nearest enclosing
+    #: ``VeOmniPreTrainedModel`` in the block's module path — so a multimodal model
+    #: sets it on the submodels that qualify: a ``Qwen3VLTextModel`` that opts in
+    #: compiles ``model.language_model.layers.*`` while a sibling tower stays
+    #: eager. The block classes are untouched, so ``_no_split_modules`` keeps
+    #: meaning what it meant to FSDP.
     supports_torch_compile: bool = False
 
     def __init_subclass__(cls, **kwargs):
