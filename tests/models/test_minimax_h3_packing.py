@@ -7,8 +7,11 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.utils._pytree import tree_flatten, tree_map
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.ops.utils import assert_gradient_direction_and_scale, require_nvidia_cuda
 from veomni.models.diffusers.minimax_h3.minimax_h3_condition.configuration_minimax_h3_condition import (
     MiniMaxH3ConditionModelConfig,
 )
@@ -26,9 +29,13 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_
 from veomni.ops import OP_REGISTRY
 from veomni.ops.kernels.attention.standard import flash as flash_backend
 from veomni.trainer.dit_trainer import DiTDataCollator
+from veomni.utils.device import get_device_type
 
 
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+pytestmark = [
+    pytest.mark.launch_plan(provider=LaunchSpec(device="cpu")),
+    pytest.mark.usefixtures("veomni_modeling_backend"),
+]
 
 
 def segmented_flash_forward(calls: list):
@@ -70,7 +77,7 @@ def attention_modules(model):
 _CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
 
 
-def tiny_model(num_attention_heads=2, *, attn_implementation="eager"):
+def tiny_model(num_attention_heads=2, *, attn_implementation="eager", attention_head_dim=16):
     from tests.models.compare import eager_ops_config
 
     ops = eager_ops_config()
@@ -81,7 +88,7 @@ def tiny_model(num_attention_heads=2, *, attn_implementation="eager"):
             num_layers=2,
             token_refiner_num_layers=1,
             num_attention_heads=num_attention_heads,
-            attention_head_dim=16,
+            attention_head_dim=attention_head_dim,
             ffn_hidden_size=64,
             text_dim=32,
             timestep_input_dim=16,
@@ -1112,6 +1119,69 @@ def test_flash_backend_drives_single_sample_refiner_and_packed_attention(
         torch.testing.assert_close(param.grad, grads[name].grad, msg=name)
     # Building and running the flash model leaves the reference instance on its own row.
     assert {module.veomni_attn.impl for module in attention_modules(reference)} == {"veomni_sdpa"}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+@pytest.mark.parametrize("mode", ["single", "packed"])
+@pytest.mark.parametrize(
+    ("backend", "package", "min_cc"),
+    [("flash_attention_2", "flash_attn", 80), ("flash_attention_3", "flash_attn_interface", 90)],
+)
+def test_real_flash_bf16_predictions_and_parameter_gradients_match_sdpa(monkeypatch, mode, backend, package, min_cc):
+    """Compare the real bound vendor kernel with math SDPA, including H3 packing/refinement."""
+    require_nvidia_cuda(package, min_cc=min_cc)
+    device = get_device_type()
+    torch.manual_seed(17)
+    reference = tiny_model(attn_implementation="sdpa", attention_head_dim=64).to(device, torch.bfloat16)
+    model = tiny_model(attn_implementation=backend, attention_head_dim=64).to(device, torch.bfloat16)
+    model.load_state_dict(reference.state_dict())
+    assert {module.veomni_attn.impl for module in attention_modules(model)} == {f"veomni_{backend}"}
+    samples = prepare(condition_model(), [raw_sample(3), raw_sample(7)])
+    lengths = [sample["x"].shape[1] for sample in samples]
+    inputs = samples[0] if mode == "single" else batch(samples)
+    # Timesteps stay FP32 and indices stay integer, as in the training input contract.
+    inputs = tree_map(lambda value: value.to(device) if torch.is_tensor(value) else value, inputs)
+    calls = []
+    real_flash_forward = flash_backend._flash_attention_forward
+
+    def record_flash(query, key, value, *args, **kwargs):
+        assert all(tensor.device.type == device and tensor.dtype == torch.bfloat16 for tensor in (query, key, value))
+        assert kwargs["attn_implementation"] == backend
+        cu_q, cu_k = kwargs["cu_seq_lens_q"], kwargs["cu_seq_lens_k"]
+        assert cu_q.device.type == device and cu_q.dtype == torch.int32
+        torch.testing.assert_close(cu_q, cu_k)
+        calls.append(cu_q.tolist())
+        # Forward to the installed kernel; this is a spy, not the CPU segmented oracle.
+        return real_flash_forward(query, key, value, *args, **kwargs)
+
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", record_flash)
+    actual = model(**inputs)
+    expected_calls = [[0, 3], [0, lengths[0]], [0, lengths[0]]]
+    if mode == "packed":
+        packed = [0, lengths[0], sum(lengths)]
+        expected_calls = [[0, 3], [0, 7], packed, packed]
+    assert calls == expected_calls
+    with sdpa_kernel(backends=[SDPBackend.MATH]):
+        expected = reference(**inputs)
+        sum(expected.loss.values()).backward()
+    actual_predictions, _ = tree_flatten(actual.predictions)
+    expected_predictions, _ = tree_flatten(expected.predictions)
+    for prediction, target in zip(actual_predictions, expected_predictions, strict=True):
+        torch.testing.assert_close(prediction, target, rtol=3e-2, atol=3e-3)
+    for key in expected.loss:
+        torch.testing.assert_close(actual.loss[key], expected.loss[key], rtol=1e-2, atol=1e-3)
+    sum(actual.loss.values()).backward()
+    reference_params = dict(reference.named_parameters())
+    for name, parameter in model.named_parameters():
+        target = reference_params[name].grad
+        assert parameter.grad is not None and target is not None, name
+        torch.testing.assert_close(parameter.grad, target, rtol=8e-2, atol=2e-4, msg=name)
+        # Small gradients must also agree in direction and scale, rather than pass on atol alone.
+        if target.float().norm() > 1e-6:
+            assert_gradient_direction_and_scale(parameter.grad, target, min_cosine=0.995, norm_rtol=5e-2)
+    for name, parameter in reference.named_parameters():
+        if "attn.qkv_proj.weight" in name:
+            assert parameter.grad.float().norm() > 1e-6, name
 
 
 @pytest.mark.parametrize("mode", ["single", "packed"])

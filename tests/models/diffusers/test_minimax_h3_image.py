@@ -46,6 +46,9 @@ from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_vae.modeling_mini
 )
 
 
+pytestmark = pytest.mark.usefixtures("veomni_modeling_backend")
+
+
 def _build_model() -> MiniMaxH3DiTModel:
     config = _tiny_config()
     config._set_ops_implementation(eager_ops_config())

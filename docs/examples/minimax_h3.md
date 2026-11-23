@@ -358,12 +358,33 @@ geometry and checkpoint recomputation), sample isolation, Ref2VA variable
 references, forward-local SP padding and fail-closed inputs. SP collectives are
 mocked in the layout-only cases; a separate two-rank CPU/Gloo case checks loss
 and averaged parameter-gradient parity for FL2VA and Ref2VA, including the
-multi-head-block exchange. This does not establish accelerator SP parity. For the FlashAttention
-names, only the kernel below VeOmni's adapter is replaced by a segmented SDPA
-oracle; single-sample, refiner and packed calls are checked against the SDPA
-reference. Kernel correctness itself is covered by the GPU tests in
-`tests/ops/attention/flash/test_flash_attention.py`. Ascend NPU execution of
-this path has not been validated.
+multi-head-block exchange. This does not establish accelerator SP parity. CPU
+FlashAttention contract tests replace the kernel below VeOmni's adapter with a
+segmented SDPA oracle; single-sample, refiner and packed calls are checked
+against that reference.
+
+The same module also includes
+`test_real_flash_bf16_predictions_and_parameter_gradients_match_sdpa`, which
+calls the installed local FlashAttention kernel on CUDA without a numerical
+stand-in. It compares BF16 video/audio predictions, losses and every parameter
+gradient with math SDPA, for both single-sample (`M=1`) and two-sample packed
+forwards. A forwarding spy verifies that the refiner and main blocks use CUDA
+BF16 Q/K/V and the expected varlen segment bounds. Elementwise gradient checks
+are supplemented by direction/norm checks so small gradients cannot pass on
+absolute tolerance alone. Each case declares a one-accelerator launch plan.
+FA2 requires an SM80+ NVIDIA GPU and `flash_attn`; FA3 requires SM90+ and
+`flash_attn_interface`. Unavailable hardware/packages are reported as skips.
+
+```bash
+uv run --no-sync python -m pytest -q -rs \
+  tests/models/test_minimax_h3_packing.py \
+  -k real_flash_bf16_predictions_and_parameter_gradients_match_sdpa
+```
+
+CPU collection or skips do not validate these real-kernel cases. Current-head
+CUDA execution and Ascend NPU execution of this path have not been validated.
+The standalone adapter/kernel suite is
+`tests/ops/attention/flash/test_flash_attention.py`.
 No end-to-end speedup or convergence is claimed. Benchmark against an equivalent,
 tuned non-packed baseline before claiming a performance improvement.
 

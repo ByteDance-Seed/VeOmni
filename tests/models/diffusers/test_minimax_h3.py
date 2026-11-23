@@ -39,7 +39,10 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_
 
 
 _VEOMNI_RMS_NORM_FORWARD = VeomniRMSNorm.forward
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+pytestmark = [
+    pytest.mark.launch_plan(provider=LaunchSpec(device="cpu")),
+    pytest.mark.usefixtures("veomni_modeling_backend"),
+]
 
 
 def _torch_rms_norm_forward(self, x: torch.Tensor) -> torch.Tensor:
