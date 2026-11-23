@@ -26,9 +26,12 @@ branches on the row itself.
 The ``qat`` row sits next to the eager reference: it fake-quantizes both GEMM
 operands with the DeepSeek-V4 TileLang quantizers and keeps the multiply in the
 model dtype, which is what an emulated low-precision deployment GEMM computes.
-``torchao_nvfp4`` does the same with torchao's NVFP4 round trip; it is
-``standard`` only, so a model that also binds ``grouped`` (DeepSeek-V4) cannot
-select it.
+``torchao`` serves TorchAO's dynamic FP8 GEMMs and FP4 fake quantization; it is
+``standard`` only, so a model that also binds ``grouped`` (DeepSeek-V4) uses it
+only on ``standard`` sites.
+
+The precision is a row *argument* (``dtype``), not part of the name: ``qat`` is
+FP8-only (``dtype="fp8"``), and ``torchao`` serves FP8, NVFP4, and MXFP4.
 """
 
 from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement
@@ -37,7 +40,7 @@ from .grouped import eager as grouped_eager
 from .grouped import qat as grouped_qat
 from .standard import eager as standard_eager
 from .standard import qat as standard_qat
-from .standard import torchao_nvfp4 as standard_torchao_nvfp4
+from .standard import torchao as standard_torchao
 
 
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
@@ -64,9 +67,9 @@ register_op(
 register_op(
     "linear",
     "standard",
-    "torchao_nvfp4",
-    description="TorchAO NVFP4 fake-quantized dense linear projection",
-    wrapper=standard_torchao_nvfp4.wrapper,
+    "torchao",
+    description="TorchAO low-precision (FP8 / NVFP4 / MXFP4) dense linear projection",
+    wrapper=standard_torchao.wrapper,
     requires=("torchao",),
 )
 

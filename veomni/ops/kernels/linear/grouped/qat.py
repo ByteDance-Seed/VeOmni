@@ -45,8 +45,10 @@ def wrapper(
     return grouped_eager.wrapper(x_q, w_q, bias, n_groups=n_groups, block_size=block_size)
 
 
-def module_wrapper(linear: nn.Module, x: Tensor, *, block_size: int = 128) -> Tensor:
+def module_wrapper(linear: nn.Module, x: Tensor, *, dtype: str = "fp8", block_size: int = 128) -> Tensor:
     """Row entry point: take the projection module and dispatch to :func:`wrapper`."""
+    if dtype != "fp8":
+        raise ValueError(f"linear/grouped/qat only supports dtype='fp8', got {dtype!r}.")
     # A quantizing row always gets a weight: ``resolve_projection`` raises for a
     # wrapped projection instead of handing back a shortcut. Grouped projections
     # use ``DeepseekV4GroupedLinear`` (an ``nn.Linear`` subclass holding the flat weight).
