@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from torch import Tensor
 
+from ....activation import supported_activations, supports
 from ....qat import FP4_BLOCK_SIZE, fp4_fake_quant_weight, fp8_fake_quant_act, fp8_fake_quant_stacked_weight
 from . import triton as standard_triton
 
@@ -36,7 +37,7 @@ def quantize_expert_operands(
     fc2_weight: Tensor,
     fc1_1_2_weight: Tensor,
     *,
-    expert_dtype: str = "fp8",
+    dtype: str = "fp8",
     block_size: int = 128,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Apply this row's rounding to the activations and expert weights.
@@ -54,7 +55,7 @@ def quantize_expert_operands(
         fc1_2_weight: Second gate/up slab, or an empty tensor when unused.
         fc2_weight: Down-projection weights.
         fc1_1_2_weight: Fused gate/up slab, or an empty tensor when unused.
-        expert_dtype: ``"fp8"`` for stacked FP8 tiles, ``"fp4"`` for 32-wide groups.
+        dtype: ``"fp8"`` for stacked FP8 tiles, ``"fp4"`` for 32-wide groups.
         block_size: Side length of the FP8 weight tile; ignored for FP4, whose
             group width is fixed by the checkpoint's scale layout.
 
@@ -62,17 +63,17 @@ def quantize_expert_operands(
         The rounded activation followed by the four rounded weights.
 
     Raises:
-        ValueError: if ``expert_dtype`` is neither ``"fp8"`` nor ``"fp4"``. The
+        ValueError: if ``dtype`` is neither ``"fp8"`` nor ``"fp4"``. The
             value comes from a free-form checkpoint key, so a typo would
             otherwise train FP8 while the config claims something else.
     """
-    if expert_dtype not in ("fp8", "fp4"):
-        raise ValueError(f"expert_dtype must be 'fp8' or 'fp4', got {expert_dtype!r}")
+    if dtype not in ("fp8", "fp4"):
+        raise ValueError(f"dtype must be 'fp8' or 'fp4', got {dtype!r}")
 
     def _quant_weight(weight: Tensor) -> Tensor:
         if weight.numel() == 0:
             return weight
-        if expert_dtype == "fp4":
+        if dtype == "fp4":
             # FP4 group width is fixed by the checkpoint's scale layout, which is
             # one scale per 32 input channels; ``block_size`` is the FP8 tile.
             return fp4_fake_quant_weight(weight, block_size=FP4_BLOCK_SIZE)
@@ -101,14 +102,29 @@ def wrapper(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
     block_size: int = 128,
-    expert_dtype: str = "fp8",
+    dtype: str = "fp8",
+    activation: str = "silu",
 ) -> Tensor:
     """Run fused MoE experts with fake-quantized activations and expert weights.
 
     Empty weight tensors denote unused layouts and are passed through. Routing
     weights are not quantized: they decide which experts run, so rounding them
     would change the selection, not just the arithmetic.
+
+    Refuses an activation this row cannot evaluate, before quantizing anything. The
+    reference rows fall back to the model's own ``act_fn`` for a name outside
+    ``veomni.ops.activation``, but a quantizing row cannot: it would round nothing
+    while the config still claimed QAT. ``gated_mlp``'s quantizing rows refuse on the
+    same grounds, so both families fail at the same place with the same advice.
     """
+    if not supports(activation):
+        raise ValueError(
+            f"moe_implementation='qat' cannot run on hidden_act={activation!r}: it "
+            f"fake-quantizes the expert GEMMs, and falling back to the model's own "
+            f"``act_fn`` would train them at full precision. Use an activation "
+            f"{sorted(supported_activations())}, or moe_implementation='eager' to keep "
+            f"the reference path."
+        )
 
     hidden_q, fc1_1_q, fc1_2_q, fc2_q, fc1_1_2_q = quantize_expert_operands(
         hidden_states,
@@ -116,7 +132,7 @@ def wrapper(
         fc1_2_weight,
         fc2_weight,
         fc1_1_2_weight,
-        expert_dtype=expert_dtype,
+        dtype=dtype,
         block_size=block_size,
     )
     return standard_triton.wrapper(
@@ -130,4 +146,5 @@ def wrapper(
         num_experts=num_experts,
         swiglu_limit=swiglu_limit,
         assume_distinct_experts=assume_distinct_experts,
+        activation=activation,
     )

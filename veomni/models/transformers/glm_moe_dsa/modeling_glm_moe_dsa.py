@@ -41,10 +41,8 @@ from veomni.models.loss_utils import ForCausalLMLoss
 
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
-from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, create_standard_causal_mask, translate_fused_dsa_mask
-from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
 from veomni.utils.moe_monitor import record_router_indices
 
@@ -614,7 +612,7 @@ class GlmMoeDsaExperts(nn.Module):
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
-        self.use_swiglu = config.hidden_act in {"silu", "swish"}
+        self.activation = config.hidden_act
         self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
 
     def forward(
@@ -623,17 +621,6 @@ class GlmMoeDsaExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        if not self.use_swiglu:
-            reject_quantizing_act_fn(self)
-            return merged_experts_act_fn_forward(
-                hidden_states,
-                top_k_index,
-                top_k_weights,
-                self.gate_up_proj,
-                self.down_proj,
-                self.act_fn,
-                self.num_experts,
-            )
         unused = self.gate_up_proj.new_empty(0)
         return self.veomni_moe(
             hidden_states,
@@ -644,6 +631,7 @@ class GlmMoeDsaExperts(nn.Module):
             self.down_proj,
             self.gate_up_proj,
             num_experts=self.num_experts,
+            activation=self.activation,
         )
 
 

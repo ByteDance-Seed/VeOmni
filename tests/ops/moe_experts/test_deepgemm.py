@@ -91,7 +91,7 @@ def _quantized_moe_reference(x, routing, selected, w1, w2, limit):
 
 def test_dynamic_routed_sizes_reuse_preparation_kernels():
     """Changing token counts reuses row-quantization and SwiGLU binaries."""
-    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import (
+    from veomni.ops.kernels.moe_experts.shared.deepgemm import (
         GroupedLayout,
         RecomputedSwiGLU,
         _row_quant_kernel,
@@ -127,7 +127,7 @@ def test_dynamic_routed_sizes_reuse_preparation_kernels():
 def test_grouped_linear_quantization_axes(counts):
     from deep_gemm.testing import calc_diff
 
-    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import GroupedLayout, GroupedLinear
+    from veomni.ops.kernels.moe_experts.shared.deepgemm import GroupedLayout, GroupedLinear
 
     torch.manual_seed(42)
     # Adjacent experts have very different ranges; sharing a token block across
@@ -165,7 +165,7 @@ def test_grouped_linear_quantization_axes(counts):
 @pytest.mark.parametrize("recompute_weight", [True, False])
 def test_grouped_linear_compact_saved_state_and_retained_graph(input_grad, weight_grad, counts, recompute_weight):
     """Saved state stays compact while frozen operands and repeated backward work."""
-    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import GroupedLayout, GroupedLinear
+    from veomni.ops.kernels.moe_experts.shared.deepgemm import GroupedLayout, GroupedLinear
 
     torch.manual_seed(57)
     x = torch.randn(sum(counts), 256, device="cuda", dtype=torch.bfloat16).requires_grad_(input_grad)
@@ -199,7 +199,7 @@ def test_grouped_linear_compact_saved_state_and_retained_graph(input_grad, weigh
 @pytest.mark.parametrize("limit", [None, 0.7, 1.0, 10.0])
 @pytest.mark.parametrize("strided", [False, True])
 def test_recomputed_swiglu_matches_eager_rounding(limit, strided):
-    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import RecomputedSwiGLU
+    from veomni.ops.kernels.moe_experts.shared.deepgemm import RecomputedSwiGLU
 
     torch.manual_seed(2026)
     projected = (torch.randn(131, 256, device="cuda") * 10).bfloat16()
@@ -229,7 +229,7 @@ def test_recomputed_swiglu_matches_eager_rounding(limit, strided):
 
 @pytest.mark.parametrize("chunk_size", [1, 2, 4])
 def test_chunked_wgrad_matches_full_expert_group(monkeypatch, chunk_size):
-    import veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 as fp8
+    import veomni.ops.kernels.moe_experts.shared.deepgemm as fp8
 
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("Only SM90 uses the bounded FP32 wgrad workspace.")
@@ -255,7 +255,7 @@ def test_chunked_wgrad_matches_full_expert_group(monkeypatch, chunk_size):
 def test_sm100_direct_wgrad_matches_fp32_accumulation(experts, monkeypatch):
     import deep_gemm
 
-    from veomni.ops.kernels.moe_experts.shared import deepgemm_fp8 as fp8
+    from veomni.ops.kernels.moe_experts.shared import deepgemm as fp8
 
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("Direct K-grouped BF16 output requires SM100.")
@@ -309,7 +309,7 @@ def test_sm100_direct_wgrad_matches_fp32_accumulation(experts, monkeypatch):
 def test_quantizers_match_deepgemm_reference(use_ue8m0):
     from deep_gemm.utils import per_block_cast_to_fp8, per_channel_cast_to_fp8, per_token_cast_to_fp8
 
-    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import (
+    from veomni.ops.kernels.moe_experts.shared.deepgemm import (
         GroupedLayout,
         quantize_columns,
         quantize_rows,
@@ -372,7 +372,7 @@ def test_full_moe_forward_backward(merged, limit, routing_dtype):
     # Expert 3 is empty. Duplicate assignments are legal on the non-EP path.
     selected = torch.randint(0, e - 1, (t, 2), device="cuda")
     grad = torch.randn_like(x) * 0.1
-    backend = resolve_op("moe_experts", "standard", "deepgemm_fp8").wrapper
+    backend = resolve_op("moe_experts", "standard", "deepgemm").wrapper
     empty = torch.empty(0, device="cuda")
     results = []
     for reference in ("kernel", "bf16", "quantized"):
@@ -507,7 +507,7 @@ def test_invalid_operands_fail_explicitly(bad):
 
 
 def test_quantization_offsets_above_int32():
-    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import GroupedLayout, quantize_columns, quantize_rows
+    from veomni.ops.kernels.moe_experts.shared.deepgemm import GroupedLayout, quantize_columns, quantize_rows
 
     # Only the last two rows are touched; the allocation makes their genuine
     # device addresses exceed 2^31 elements while strides themselves stay int32.
@@ -540,7 +540,7 @@ def test_quantization_offsets_above_int32():
 def test_many_experts_with_empty_groups():
     from deep_gemm.testing import calc_diff
 
-    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import GroupedLayout, GroupedLinear
+    from veomni.ops.kernels.moe_experts.shared.deepgemm import GroupedLayout, GroupedLinear
 
     torch.manual_seed(51)
     counts = [0] * 384
@@ -573,7 +573,7 @@ def test_grouped_linear_uses_tensor_device():
 def _non_current_device_worker(rank):
     from deep_gemm.testing import calc_diff
 
-    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import GroupedLayout, GroupedLinear
+    from veomni.ops.kernels.moe_experts.shared.deepgemm import GroupedLayout, GroupedLinear
 
     torch.manual_seed(104)
     operand_device = f"cuda:{1 - rank}"
@@ -618,7 +618,7 @@ def _non_current_device_worker(rank):
 
 
 def test_fp8_weight_transpose_preserves_every_byte():
-    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import transpose_fp8_weight
+    from veomni.ops.kernels.moe_experts.shared.deepgemm import transpose_fp8_weight
 
     # Include all 256 bit patterns, including NaN encodings: a byte transpose
     # must not decode, canonicalize or requantize even those payloads.
@@ -636,7 +636,7 @@ def test_grouped_linear_activation_offload_preserves_output_and_gradients(fp8_we
     from contextlib import nullcontext
 
     from veomni.distributed.offloading import custom_save_on_cpu
-    from veomni.ops.kernels.moe_experts.shared.deepgemm_fp8 import GroupedLayout, GroupedLinear, quantize_weights
+    from veomni.ops.kernels.moe_experts.shared.deepgemm import GroupedLayout, GroupedLinear, quantize_weights
     from veomni.ops.kernels.moe_experts.shared.fp8_weight import FP8ExpertWeight
 
     torch.manual_seed(42)

@@ -1,0 +1,63 @@
+# Standalone per-site `overrides` example for DeepSeek-V4-Flash.
+#
+# Most runs only need a plain family selection without `overrides` — see
+# `deepseek_v4_qat.yaml` (all-QAT default) and `qwen3_nvfp4_qat.yaml`
+# (torchao NVFP4 default). Use `overrides` only when specific layers or
+# projections need a different row or kwargs (later rules win; `site` is
+# matched with `re.fullmatch`).
+
+model:
+  model_path: DeepSeek-V4-Flash-Base
+  ops_implementation:
+    attn_implementation: eager
+    cross_entropy_loss_implementation: liger_kernel
+    dsa_attention_implementation: tilelang
+    dsa_indexer_implementation: tilelang
+    mhc_implementation: tilelang
+    rms_norm_implementation: liger_kernel
+    rotary_pos_emb_implementation: triton
+    # Quantize attention/indexer projections, keeping layer 0 in BF16.
+    linear_implementation:
+      name: qat
+      overrides:
+        - site: 'layers\.0\..*'
+          name: eager
+    # Quantize the shared expert everywhere except layer 0.
+    gated_mlp_implementation:
+      name: qat
+      overrides:
+        - site: 'layers\.0\.mlp'
+          name: liger_kernel
+    # DeepSeek-V4-Flash checkpoints carry expert_dtype='fp4', while DeepGEMM
+    # currently supports FP8 only; pass dtype='fp8' explicitly to run FP8 MoE.
+    moe_implementation:
+      name: deepgemm
+      kwargs: {dtype: fp8}
+    kv_round_implementation: triton
+  accelerator:
+    gradient_checkpointing:
+      enable: true
+    init_device: meta
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+  chat_template: chatml
+
+data:
+  train_path: tulu-3-sft-mixture
+  data_type: conversation
+  max_seq_len: 2048
+  text_keys: messages
+
+train:
+  global_batch_size: 8
+  micro_batch_size: 1
+  max_steps: 1000
+  checkpoint:
+    output_dir: deepseek_v4_flash_mixed_precision
+    manager: dcp
+    save_steps: 100
+    save_hf_weights: true

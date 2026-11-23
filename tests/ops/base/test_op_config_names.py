@@ -56,6 +56,22 @@ def _registered_implementations(op: str) -> set[str]:
     return {key[2] for key in OP_REGISTRY._entries if key[0] == op}
 
 
+def _selected_names(implementation):
+    """Every row name a YAML selection can produce.
+
+    A bare string is one row for every site. A mapping carries a reference ``name``
+    and one per override, so all of them have to be registered -- a typo in a rule
+    that never runs on this host is still a typo.
+    """
+    if isinstance(implementation, str):
+        return [implementation]
+    if isinstance(implementation, dict):
+        names = [implementation.get("name")]
+        names.extend(rule.get("name") for rule in implementation.get("overrides") or () if isinstance(rule, dict))
+        return [name for name in names if isinstance(name, str)]
+    return []
+
+
 def test_yaml_op_implementation_names_are_registered():
     """Reject in-tree op selections that do not name a registered implementation."""
     invalid: list[str] = []
@@ -78,8 +94,9 @@ def test_yaml_op_implementation_names_are_registered():
                 if op is None:
                     invalid.append(f"{path.relative_to(REPO_ROOT)}: unmapped implementation field {field!r}")
                     continue
-                if implementation in _registered_implementations(op):
-                    continue
-                invalid.append(f"{path.relative_to(REPO_ROOT)}: {field}={implementation!r} ({op})")
+                for name in _selected_names(implementation):
+                    if name in _registered_implementations(op):
+                        continue
+                    invalid.append(f"{path.relative_to(REPO_ROOT)}: {field}={name!r} ({op})")
 
     assert not invalid, "YAML op implementation names are not registered:\n" + "\n".join(invalid)
