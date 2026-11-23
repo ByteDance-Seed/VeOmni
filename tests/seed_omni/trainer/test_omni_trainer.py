@@ -254,8 +254,9 @@ def test_offline_cache_step_writes_every_micro_batch_without_autograd():
     items_before = [mb["conversation_list"][0][0] for mb in micro_batches]
 
     trainer = OmniTrainer.__new__(OmniTrainer)
-    trainer.model = SimpleNamespace(forward=forward)
-    trainer.args = SimpleNamespace(train=SimpleNamespace(enable_batch_invariant_mode=False))
+    # `module_runtimes` is always present on the real runtime; the step-context hook walks it.
+    trainer.model = SimpleNamespace(forward=forward, module_runtimes={})
+    trainer.args = SimpleNamespace(train=SimpleNamespace(seed=42, enable_batch_invariant_mode=False))
     trainer.model_fwd_context = nullcontext()
     trainer.state = TrainerState(global_step=0)
     trainer.offline_cache_writer = MagicMock()

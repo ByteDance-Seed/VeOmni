@@ -35,9 +35,12 @@ class TrainingMixin(BaseTrainingMixin):
         self._chat_template: Optional[BagelChatTemplate] = None
 
     def dummy_inputs(self, kind: str = "encode") -> Dict[str, torch.Tensor]:
-        """Delegate to native impl — overrides ``TrainingModuleMixin.dummy_inputs``'s
-        unrelated ``(*, batch_size, device, dtype)`` signature, which otherwise wins
-        this name collision by sitting ahead of :class:`BagelTextEncoder` in MRO.
+        """Delegate to the native implementation.
+
+        ``TrainingModuleMixin`` deliberately declares no ``dummy_inputs`` of its own:
+        the modules that need one take different shapes (an image grid here, a text
+        batch there), and a mixin stub under this name would shadow every one of them
+        by sitting ahead of the modeling class in MRO.
         """
         return BagelTextEncoder.dummy_inputs(self, kind=kind)
 

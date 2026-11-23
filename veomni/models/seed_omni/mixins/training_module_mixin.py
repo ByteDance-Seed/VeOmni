@@ -93,11 +93,6 @@ class TrainingModuleMixin:
             "Override it on the native modeling class if this module appears in the training graph."
         )
 
-    def dummy_inputs(self, *, batch_size: int, device: Any, dtype: Any) -> dict[str, Any]:
-        """Zero-tensor placeholders for training-side dummy forward."""
-        del batch_size, device, dtype
-        return {}
-
     def on_micro_batches_ready(self, micro_batches: list[dict[str, Any]]) -> None:
         """Called once per optimizer step, with every micro-batch of that step.
 
