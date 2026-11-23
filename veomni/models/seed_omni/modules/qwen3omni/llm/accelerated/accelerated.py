@@ -126,6 +126,11 @@ class TrainingMixin(TrainingModuleMixin):
 
         return dict(
             inputs_embeds=inputs_embeds,
+            # 3-axis TMRoPE only. Every training return below also carries
+            # ``cu_seq_lens_q``, so the causal mask is built from the packed
+            # boundaries and never from these positions — the extra contiguous
+            # text row the non-packed path needs (see ``pack_*_for_forward``)
+            # would just be a fourth row nobody reads.
             position_ids=packed["position_ids"],
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,

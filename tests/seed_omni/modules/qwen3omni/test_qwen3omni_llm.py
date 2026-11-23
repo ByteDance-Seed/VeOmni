@@ -307,13 +307,31 @@ def test_a_silent_video_reaches_the_packer(tmp_path):
 def test_zero_length_segments_are_skipped():
     """An empty text row (e.g. an empty assistant turn) must not break packing.
 
-    It carries no position, so the ``seg_pos.max()`` cursor would raise on it,
-    and a 0-row embed would corrupt the flatten/unflatten shape bookkeeping that
-    ``forward_post`` relies on to scatter hidden states back.
+    It carries no position — so it contributes no rows to the packed sequence —
+    but it keeps its *slot* in the shape metadata: the hidden-state scatter pairs
+    rows to items by position, so an item the packer dropped while the scatter
+    still visited it would take the next item's slice and raise ``StopIteration``
+    on the one after, leaving the carrier half-overwritten.
     """
     packed = _pack([_text(2), _text(0), _text(3)])
     assert packed["inputs_embeds"].shape == (1, 5, HIDDEN)
     assert packed["position_ids"][0, 0, :].tolist() == [0, 1, 2, 3, 4]
+    # Three segments out, one of them empty — not two.
+    assert packed["inputs_embeds_shape"].tolist() == [[2], [0], [3]]
+
+
+def test_an_empty_segment_survives_the_round_trip_to_the_carrier():
+    """Packing and the scatter must agree on how many segments there are."""
+    from veomni.models.seed_omni.modules.base.llm_packing import scatter_llm_hidden_states
+    from veomni.utils.tensor_utils import unflatten
+
+    sample = [_text(2), _text(0), _text(3)]
+    packed = _pack(sample)
+    segments = unflatten(packed["inputs_embeds"][0], packed["inputs_embeds_shape"])
+
+    scatter_llm_hidden_states([sample], segments)
+
+    assert [tuple(item.value.shape) for item in sample] == [(2, HIDDEN), (0, HIDDEN), (3, HIDDEN)]
 
 
 def test_thinker_state_collection_matches_a_one_shot_run():
@@ -373,6 +391,27 @@ def test_thinker_states_are_not_collected_by_default():
     with torch.no_grad():
         module.generate(conversation_list=conversation)
     assert module._accept_hidden_cache == []
+
+
+def test_generate_refuses_sequence_parallelism():
+    """`forward_pre` slices the sample per rank; `generate` has no such hook.
+
+    So under Ulysses the exchange would rebuild the full sequence from a prompt
+    every rank already holds (4 rows in, 8 out) while `cu_seq_lens` still
+    described the original — a wrong answer rather than a crash. The shared
+    `SimpleArGenerationMixin` refuses the same configuration.
+    """
+    from unittest import mock
+
+    module = _accelerated_llm()
+    module.reset_global_inference_state()
+    conversation = [ConversationItem(type="text", value=torch.randn(4, HIDDEN), role="user")]
+
+    fake_ps = mock.MagicMock()
+    fake_ps.sp_size = 2
+    with mock.patch("veomni.models.seed_omni.modules.qwen3omni.llm.modeling.get_parallel_state", return_value=fake_ps):
+        with pytest.raises(ValueError, match="sp_size=1"):
+            module.generate(conversation_list=conversation)
 
 
 def test_dummy_items_are_excluded_but_donate_deepstack():

@@ -4,6 +4,9 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.sequence_parallel import gather_outputs
+
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem, iter_desired_items
@@ -35,6 +38,9 @@ class TrainingMixin(TrainingModuleMixin):
         super().__init__(*args, **kwargs)
         self._audio_items: Optional[List[ConversationItem]] = None
         self._conversation_carrier: Any = None
+        # Row count of the tower's output before this rank's SP slice, so
+        # ``forward_post`` can drop the all-gathered pad tail.
+        self._sp_own_len: Optional[int] = None
 
     @pre_forward("forward")
     def forward_pre(
@@ -62,12 +68,24 @@ class TrainingMixin(TrainingModuleMixin):
         # unshards, so ``self.dtype`` here is the fp32 master shard, not the
         # bf16 weight the conv will actually meet.
         input_features = torch.cat([item.value.to(device=self.device) for item in items], dim=0)
+        # The tower slices its own hidden states to this rank's Ulysses shard and
+        # returns the shard, so remember the full row count for the gather.
+        self._sp_own_len = int(sum(audio_output_lengths(feature_lens.cpu(), self.config.audio_config.n_window)))
         return {"input_features": input_features, "feature_lens": feature_lens}
 
     @post_forward("forward")
     def forward_post(self, **outputs: Any) -> Dict[str, Any]:
         items = self._audio_items or []
         embeds = outputs.get("audio_embeds")
+        if embeds is not None and get_parallel_state().sp_size > 1:
+            # The tower hands back only this rank's shard: gather it (autograd-
+            # aware, so backward sums across the SP group) and strip the pad tail
+            # before splitting by the full-clip lengths below. Without this the
+            # split sizes do not sum to the local row count and ``torch.split``
+            # raises inside the post hook.
+            embeds = gather_outputs(embeds, gather_dim=0, group=get_parallel_state().sp_group)
+            embeds = embeds.narrow(0, 0, self._sp_own_len)
+        self._sp_own_len = None
         if items and embeds is not None:
             mel_lengths = torch.tensor([int(item.meta[_OMNI_MEL_LEN]) for item in items], dtype=torch.long)
             sizes = audio_output_lengths(mel_lengths, self.config.audio_config.n_window).tolist()

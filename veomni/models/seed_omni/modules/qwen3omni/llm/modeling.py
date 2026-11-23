@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 
+from veomni.distributed.parallel_state import get_parallel_state
 from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextModel,
 )
@@ -124,9 +125,19 @@ def pack_qwen3omni_conversations_for_forward(
             embeds = item.value.to(device)
             length = embeds.size(0)
             if length == 0:
-                # An empty segment carries no position and would break both the
-                # ``seg_pos.max()`` cursor below and the naflatten/unflatten shape
-                # bookkeeping that ``forward_post`` uses to scatter hidden states.
+                # An empty segment carries no position and would break the
+                # ``seg_pos.max()`` cursor below. It is kept in the packed
+                # sequence as a zero-row entry rather than dropped, because the
+                # hidden-state scatter pairs rows to items by position: dropping
+                # it here while ``scatter_llm_hidden_states`` visits every
+                # backbone-input item would hand this row's slice to the empty
+                # item and raise ``StopIteration`` on the next — after the
+                # carrier had already been partly overwritten.
+                inputs_embeds_list.append(embeds.reshape(0, -1) if embeds.dim() == 1 else embeds)
+                position_ids_list.append(torch.zeros(3, 0, dtype=torch.float, device=device))
+                visual_pos_masks_list.append(torch.zeros(0, dtype=torch.bool, device=device))
+                if item.type in ("image", "video") and "deepstack" in item.meta:
+                    deepstack_chunks.append([d.to(device)[:0] for d in item.meta["deepstack"]])
                 continue
             inputs_embeds_list.append(embeds)
             is_visual = item.type in ("image", "video")
@@ -244,6 +255,17 @@ class InferenceMixin:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         del kwargs
+        # ``forward_pre`` slices the packed sample to this rank's Ulysses shard;
+        # ``generate`` has no such hook, so under sequence parallelism the
+        # Ulysses exchange would rebuild the full sequence from a prompt every
+        # rank already holds (4 rows in, 8 out) while ``cu_seq_lens`` still
+        # described the original — a wrong answer rather than a crash. The shared
+        # ``SimpleArGenerationMixin`` refuses this the same way.
+        if get_parallel_state().sp_size > 1:
+            raise ValueError(
+                "qwen3omni_llm.generate feeds the full prompt to the backbone, which conflicts with Ulysses "
+                "sequence parallelism (attention expects this rank's shard). Run inference with sp_size=1."
+            )
         if self._past_key_values is None:
             packed = pack_qwen3omni_conversations_for_forward(
                 [conversation_list],

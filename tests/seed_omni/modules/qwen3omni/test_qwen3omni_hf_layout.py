@@ -65,13 +65,72 @@ def test_the_vocabulary_tensors_go_to_the_text_encoder_not_the_backbone():
 def test_each_tower_claims_only_its_own_prefix():
     layout = QWEN3OMNI_HF_LAYOUT
 
-    assert layout.route("thinker.audio_tower.conv2d1.weight") == (AUDIO, "conv2d1.weight")
+    # The audio module wraps the tower as ``self.audio_tower``, so the prefix is
+    # kept: stripping it would produce ``conv2d1.weight``, which names no
+    # parameter and would leave the tower unloaded — silently, since nothing
+    # raises on a key that matches nothing.
+    assert layout.route("thinker.audio_tower.conv2d1.weight") == (AUDIO, "audio_tower.conv2d1.weight")
     assert layout.route("thinker.visual.blocks.0.attn.qkv.weight") == (VISION, "visual.blocks.0.attn.qkv.weight")
     assert layout.route("talker.model.layers.0.self_attn.q_proj.weight") == (
         TALKER,
         "talker.model.layers.0.self_attn.q_proj.weight",
     )
     assert layout.route("code2wav.decoder.0.weight") == (CODEC, "code2wav.decoder.0.weight")
+
+
+@pytest.mark.parametrize("module_name", [AUDIO, VISION, TEXT_ENCODER, LLM, TALKER, CODEC])
+def test_every_layout_destination_names_a_real_parameter_prefix(module_name):
+    """A destination that matches no parameter loads nothing and raises nothing.
+
+    Checked against a really-built module rather than the string, because that is
+    the only way to catch a prefix that looks plausible (``conv2d1.weight`` under
+    an audio module) but is not where the weights live.
+    """
+    import json
+    from pathlib import Path
+
+    import torch
+    from transformers import MimiConfig
+
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
+
+    toy = json.loads(
+        (Path(__file__).parents[4] / "tests" / "toy_config" / "qwen3omni_toy" / "config.json").read_text()
+    )
+    thinker, talker = toy["thinker_config"], toy["talker_config"]
+    ops = make_eager_ops_config()
+    builds = {
+        AUDIO: dict(audio_config=thinker["audio_config"], audio_token_id=thinker["audio_token_id"]),
+        VISION: dict(vision_config=thinker["vision_config"]),
+        TEXT_ENCODER: dict(
+            vocab_size=thinker["text_config"]["vocab_size"],
+            hidden_size=thinker["text_config"]["hidden_size"],
+            tie_word_embeddings=False,
+            lm_head_bias=False,
+        ),
+        LLM: dict(
+            text_config=thinker["text_config"],
+            spatial_merge_size=thinker["vision_config"]["spatial_merge_size"],
+            position_id_per_seconds=thinker["position_id_per_seconds"],
+        ),
+        TALKER: dict(talker_config=talker),
+        CODEC: dict(code2wav_config=toy["code2wav_config"], mimi_config=MimiConfig().to_dict()),
+    }
+    with torch.device("meta"):
+        module = OMNI_MODEL_REGISTRY[module_name]()(
+            OMNI_CONFIG_REGISTRY[module_name]()(ops_implementation=ops, **builds[module_name])
+        )
+    # ``_layout_parameter_names`` is the check itself: every destination prefix
+    # must be a real prefix of some parameter name on this module.
+    names = set(dict(module.named_parameters()))
+
+    for source_prefix, destination_prefix in QWEN3OMNI_HF_LAYOUT.modules[module_name].key_prefixes:
+        del source_prefix
+        assert any(name.startswith(destination_prefix) or not destination_prefix for name in names), (
+            f"{module_name}: destination prefix {destination_prefix!r} names no parameter on "
+            f"{type(module).__name__}; its weights would never load"
+        )
 
 
 def test_every_routed_key_maps_back_to_itself():

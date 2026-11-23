@@ -158,7 +158,10 @@ def _mel_extractor(model_path: str) -> dict[str, Any]:
 QWEN3OMNI_HF_LAYOUT = OmniHFLayout(
     modules={
         "qwen3omni_audio": OmniHFModuleLayout(
-            key_prefixes=(("thinker.audio_tower.", ""),),
+            # The module wraps the tower as ``self.audio_tower`` (the converter
+            # loads the same bucket into it), so the prefix is *kept* rather than
+            # stripped: ``conv2d1.weight`` would name no parameter.
+            key_prefixes=(("thinker.audio_tower.", "audio_tower."),),
             build_config=_audio_config,
             build_assets=_mel_extractor,
         ),
