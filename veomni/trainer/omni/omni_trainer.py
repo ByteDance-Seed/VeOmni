@@ -663,6 +663,10 @@ class OmniTrainer:
         self.state.global_step += 1
 
         self.on_step_begin(micro_batches=micro_batches)
+        # Same step context as a training step: an encode-only pass still runs the graph's
+        # `pre_forward`, and a module whose forward draws per micro-batch would otherwise
+        # read the previous step's key and keep counting across the whole encode.
+        self._notify_modules_of_step(micro_batches)
         self.sync_before_train_step()
 
         num_micro_steps = len(micro_batches)

@@ -43,17 +43,19 @@ def _item(feature: dict | None = None) -> ConversationItem:
 def _module(pack: bool = False) -> mod.TrainingMixin:
     """The mixin alone, as it runs inside a `DiffusionGemmaOmni` subclass.
 
-    `attach_self_conditioning` is defined on the model below the mixin, so the bare
-    mixin carries a pass-through stand-in here; the draw itself is exercised on the
-    model in `test_a_k_canvas_example_counts_once_not_k_times` and in
-    `tests/models/test_diffusion_gemma.py`.
+    `attach_self_conditioning` and `get_input_embeddings` are defined on the model below
+    the mixin, so the bare mixin carries stand-ins here. The real wiring -- a graph
+    module going through `attach_self_conditioning` and back -- is covered by
+    `test_the_self_conditioning_pass_survives_the_graph_dict_return`.
     """
     module = mod.TrainingMixin()
     module.config = SimpleNamespace(
         canvas_batching="flat_seq_pack" if pack else "serial",
         pad_token_id=0,
+        self_conditioning_prob=0.0,
     )
     module.attach_self_conditioning = lambda micro_batch, **kwargs: micro_batch
+    module.get_input_embeddings = lambda: SimpleNamespace(weight=torch.zeros(1))
     return module
 
 
@@ -276,3 +278,75 @@ def test_the_training_forward_scores_the_canvas_without_materialising_logits(mon
     module.forward(decoder_input_ids=torch.zeros(1, 1, 4, dtype=torch.long), labels=torch.zeros(1, 1, 4))
 
     assert seen["return_logits"] is False
+
+
+def test_the_self_conditioning_pass_survives_the_graph_dict_return(monkeypatch):
+    """The graph module's ``forward`` returns a dict, not the vendored output object.
+
+    ``attach_self_conditioning`` calls ``self(...)`` for the extra pass. On an Omni class
+    that lands on ``DiffusionGemmaOmni.forward``, which collects a loss dict -- so reading
+    ``.self_conditioning_embeddings`` off the result raises ``AttributeError`` on the
+    first training step. The embeddings have to ride through that dict.
+    """
+    embeddings = torch.randn(1, 4, 2)
+
+    def fake_vendored_forward(self, **kwargs):
+        # `attach_self_conditioning` asks for embeddings and no logits; a real batch here
+        # would come from the collator, so the toy stands in for the encoder/decoder pair.
+        return SimpleNamespace(
+            loss=None,
+            aux_loss=None,
+            self_conditioning_embeddings=embeddings,
+        )
+
+    monkeypatch.setattr(DiffusionGemmaForBlockDiffusion, "forward", fake_vendored_forward)
+
+    module = DiffusionGemmaOmni.__new__(DiffusionGemmaOmni)
+    torch.nn.Module.__init__(module)
+    module.training = True
+    module.config = SimpleNamespace(canvas_length=4, self_conditioning_prob=1.0)
+
+    attached = DiffusionGemmaForBlockDiffusion.attach_self_conditioning(
+        module,
+        {"decoder_input_ids": torch.zeros(1, 1, 4, dtype=torch.long)},
+        seed=1,
+        global_step=1,
+        micro_step=0,
+    )
+
+    assert attached["self_conditioning_embeddings"] is embeddings
+    assert attached["self_conditioning_mask"].tolist() == [True]
+
+
+def test_the_mixin_is_registered_as_the_forward_pre_hook():
+    """`batch_pre` is what `execute_train_node` calls before the endpoint, and the hook
+    registry resolves it by name from the MRO. Relying on an ancestor's decorator alone
+    means a rename on either side stops the draw silently."""
+    from veomni.models.seed_omni.mixins.base_mixin import hook_name
+
+    assert hook_name(DiffusionGemmaOmniAccelerated, "_omni_pre_context", "forward") == "batch_pre"
+
+
+def test_the_batch_is_moved_onto_the_modules_device(monkeypatch):
+    """The carrier comes from the CPU preprocessor and was never moved, and the
+    self-conditioning pass runs a real forward over it."""
+    seen = {}
+
+    class Collator:
+        def __init__(self, **kwargs):
+            pass
+
+        def __call__(self, features):
+            return {"decoder_input_ids": torch.zeros(1, 1, 4, dtype=torch.long)}
+
+    device = torch.device("meta")
+    monkeypatch.setattr(mod, "DiffusionGemmaCollator", Collator)
+    monkeypatch.setattr(mod, "get_parallel_state", lambda: SimpleNamespace(sp_size=1))
+
+    module = _module(pack=True)
+    module.attach_self_conditioning = lambda micro_batch, **kwargs: seen.update(micro_batch) or micro_batch
+    module.get_input_embeddings = lambda: SimpleNamespace(weight=torch.zeros(1, device=device))
+
+    module.batch_pre(conversation_list=[[_item()]])
+
+    assert seen["decoder_input_ids"].device == device

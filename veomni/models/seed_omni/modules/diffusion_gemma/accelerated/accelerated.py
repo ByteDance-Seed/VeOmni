@@ -45,6 +45,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
 import torch.distributed as dist
 
 from ......data.data_collator import DiffusionGemmaCollator, _local_canvas_count, pad_decoder_canvases
@@ -52,6 +53,7 @@ from ......distributed.parallel_state import get_parallel_state
 from ......utils.dist_utils import all_reduce
 from ....mixins.base_mixin import BaseMixin
 from ....mixins.inference_module_mixin import InferenceModuleMixin
+from ....mixins.training_module_mixin import pre_forward
 from ...llada.accelerated.accelerated import TrainingMixin as LladaTrainingMixin
 from ..modeling import DiffusionGemmaOmni
 
@@ -75,6 +77,7 @@ class TrainingMixin(LladaTrainingMixin):
         self._self_conditioning_micro_step = 0
         self._self_conditioning_batch_invariant = bool(batch_invariant)
 
+    @pre_forward("forward")
     def batch_pre(self, conversation_list: list[Any] = None, **kwargs: Any) -> dict[str, Any]:
         """Collate the carrier into the encoder/canvas batch the model reads.
 
@@ -120,6 +123,14 @@ class TrainingMixin(LladaTrainingMixin):
             sp_size=state.sp_size,
         )
         micro_batch = collator(features)
+
+        # The carrier's items were built by the CPU preprocessor and were never moved,
+        # so the batch is placed on the module's device here -- the self-conditioning
+        # pass below runs a real forward, which cannot read CPU tensors.
+        device = self.get_input_embeddings().weight.device
+        micro_batch = {
+            key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in micro_batch.items()
+        }
 
         if mode != "flat_seq_pack" and dist.is_available() and dist.is_initialized():
             target_k = int(all_reduce(_local_canvas_count(micro_batch["decoder_input_ids"]), op="max"))

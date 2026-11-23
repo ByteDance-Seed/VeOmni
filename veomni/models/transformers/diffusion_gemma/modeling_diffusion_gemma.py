@@ -3684,9 +3684,10 @@ class DiffusionGemmaForBlockDiffusion(DiffusionGemmaPreTrainedModel):
 
         Keyed on ``(seed, global_step, micro_step)``. Seeding from ``seed`` alone and
         letting one long-lived generator advance is what a checkpoint cannot express:
-        ``CheckpointerCallback._extra_state`` persists only the default CPU RNG, so a
-        resumed run rewinds that stream to step 0 and replays the first steps' masks at
-        step N. Deriving from the step counter makes the mask a pure function of where
+        ``CheckpointerCallback._extra_state`` persists the default CPU and device RNGs and
+        nothing about a generator of this model's own, so a resumed run rewinds that stream
+        to step 0 and replays the first steps' masks at step N. Deriving from the step
+        counter makes the mask a pure function of where
         training is, which resume already restores.
 
         The default generators are not an option either: Triton compile / autotune
@@ -3747,12 +3748,19 @@ class DiffusionGemmaForBlockDiffusion(DiffusionGemmaPreTrainedModel):
         )
         conditioning_batch = {k: v for k, v in micro_batch.items() if k not in ("labels", "loss_weight")}
         with torch.no_grad(), set_batch_invariant_mode(batch_invariant):
-            embeddings = self(
+            conditioning_outputs = self(
                 **conditioning_batch,
                 use_cache=False,
                 return_logits=False,
                 return_self_conditioning_embeddings=True,
-            ).self_conditioning_embeddings
+            )
+        # A graph module's `forward` returns the loss dict the training graph collects,
+        # not the vendored output object; the embeddings ride along in that dict instead.
+        embeddings = (
+            conditioning_outputs["self_conditioning_embeddings"]
+            if isinstance(conditioning_outputs, dict)
+            else conditioning_outputs.self_conditioning_embeddings
+        )
 
         micro_batch["self_conditioning_embeddings"] = embeddings
         micro_batch["self_conditioning_mask"] = condition.to(device=embeddings.device)

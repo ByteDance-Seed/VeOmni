@@ -225,6 +225,12 @@ class DiffusionGemmaOmni(DiffusionGemmaForBlockDiffusion, PretrainedOmniModule):
         aux_loss = getattr(outputs, "aux_loss", None)
         if aux_loss is not None:
             result["aux_loss"] = aux_loss
+        # The self-conditioning pass asks the module for embeddings rather than a loss,
+        # so that one call has no `_loss` to report. Surfacing the tensor here is what
+        # lets `attach_self_conditioning` read it off the graph's dict return.
+        embeddings = getattr(outputs, "self_conditioning_embeddings", None)
+        if embeddings is not None:
+            result["self_conditioning_embeddings"] = embeddings
         return result
 
 
