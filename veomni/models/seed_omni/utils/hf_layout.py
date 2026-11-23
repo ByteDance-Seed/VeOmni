@@ -506,6 +506,27 @@ def _device_str(device: str | int | torch.device) -> str:
     return str(device)
 
 
+def _move_parameter_data_in_place(model: torch.nn.Module, device: str | int | torch.device) -> None:
+    """Move a loaded model to ``device`` without `Module._apply`.
+
+    `.to()` installs a *new* `Parameter` per owning module when the source and
+    destination are not shallow-copy compatible (CPU vs accelerator). For a model
+    whose encoder and decoder share every transformer weight, that both doubles peak
+    memory and silently unties them -- the same mechanism that makes `to_empty`
+    require a `retie_shared_weights` pass afterwards. Assigning `.data` in place keeps
+    one shared object, so a 51.6 GiB checkpoint stays 51.6 GiB.
+
+    `parameters()` is already deduplicated by `nn.Module`, so a shared tensor is
+    moved exactly once.
+    """
+    for param in model.parameters():
+        param.data = param.data.to(device)
+    for module in model.modules():
+        for name, buffer in module._buffers.items():
+            if buffer is not None:
+                module._buffers[name] = buffer.to(device)
+
+
 def resolve_hf_source_device_map(
     model: torch.nn.Module,
     device_map: str | int | torch.device | Mapping[str, Any] | None,
@@ -584,7 +605,16 @@ def load_module_from_hf_source(
 
             _to_empty_preserving_nonpersistent_buffers(model, target_device)
             return model
-        load_model_weights(model, source.weights_path, init_device=target_device)
+        # `to_empty(device=<gpu>)` copies every tensor individually, which for a model
+        # whose encoder and decoder share each transformer weight allocates the shared
+        # ones twice -- measured at 70.7 GiB for a 51.6 GiB checkpoint, i.e. an OOM on
+        # a 71 GiB card. Loading on CPU first and moving parameter data in place keeps
+        # one object per shared tensor. Only models that declare the hook take this
+        # path; for everyone else the direct materialisation is cheaper.
+        keep_ties = callable(getattr(type(model), "retie_shared_weights", None))
+        load_model_weights(model, source.weights_path, init_device="cpu" if keep_ties else target_device)
+        if keep_ties and str(target_device) != "cpu":
+            _move_parameter_data_in_place(model, target_device)
         return model
 
     from accelerate import dispatch_model

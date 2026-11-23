@@ -94,7 +94,14 @@ class DiffusionGemmaOmniPreprocessor(ModulePreprocessorBase):
         overrides = dict(config_overrides or {})
         overrides.update(kwargs)
         tokenizer = build_tokenizer(module_path)
-        template_name = overrides.pop("chat_template", "gemma3")
+        template_name = overrides.pop("chat_template", None)
+        if template_name is None:
+            # The checkpoint's own template: `tokenizer_generation_prompt` drives
+            # `apply_chat_template` rather than a registered spelling, which is what
+            # the non-Omni DiffusionGemma config uses too. Defaulting to a literal
+            # name here (`gemma3`) would fail whenever this worker is built through
+            # `bind_module_assets`, which binds assets without launcher overrides.
+            template_name = "tokenizer_generation_prompt"
         chat_template = build_chat_template(template_name, tokenizer)
 
         from transformers import PretrainedConfig
@@ -145,11 +152,8 @@ class DiffusionGemmaOmniPreprocessor(ModulePreprocessorBase):
         its canvas stack, not a per-turn structure.
         """
         if inference:
-            raise NotImplementedError(
-                "DiffusionGemmaOmni: inference through this module is not implemented yet. "
-                "Training uses `process_diffusion_gemma_example`, which draws the canvas "
-                "corruption; the FSM's own denoising loop is not wired."
-            )
+            self._encode_for_inference(conversation_list)
+            return
         corruption_epoch = kwargs.get("mask_epoch", 0)
         for index, sample in enumerate(conversation_list):
             messages = [
@@ -181,6 +185,54 @@ class DiffusionGemmaOmniPreprocessor(ModulePreprocessorBase):
             # fixed `canvas_length` per canvas and adds no variance worth counting.
             item.meta["_omni_token_len"] = int(processed["input_ids"].numel())
             conversation_list[index] = [item]
+
+    def _encode_for_inference(self, conversation_list: list[list[Any]]) -> None:
+        """Encode the prompt for the block-diffusion sampler, with no canvas corruption.
+
+        Block diffusion generates by denoising a fresh canvas against a prompt KV
+        cache, so the request carries the prompt row alone -- no canvas stack, no
+        loss tensors. The chat template is applied here through the *processor*
+        path rather than through `process_diffusion_gemma_example`, because that
+        transform's whole job is to cut an answer into canvases and draw their
+        corruption, and generation has no answer to cut. The tokenizer and template
+        are the same objects, so the prompt tokens match what training saw.
+        """
+        for index, sample in enumerate(conversation_list):
+            content: list[dict[str, Any]] = []
+            for item in sample:
+                if getattr(item, "type", None) == "image":
+                    content.append({"type": "image", "image": _to_pil(item.value)})
+                elif getattr(item, "type", None) == "text":
+                    content.append({"type": "text", "text": getattr(item, "value", "")})
+            if not content:
+                continue
+            encoded = self._chat_template.tokenizer.apply_chat_template(
+                [{"role": "user", "content": content}],
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            processed = {k: v for k, v in encoded.items() if k != "token_type_ids"}
+            item = ConversationItem(type="text", value=processed, role="assistant")
+            item.meta["_omni_token_len"] = int(processed["input_ids"].numel())
+            conversation_list[index] = [item]
+
+
+def _to_pil(value: Any) -> Any:
+    """Carrier image payload to the PIL image the processor accepts.
+
+    The carrier holds pixels as a ``(C, H, W)`` uint8 tensor (``fetch_media``
+    decodes once and keeps uint8 so the worker's IPC stays cheap) while the
+    processor speaks PIL. A payload that is already acceptable passes through, so
+    a carrier built by a different preprocessor still works.
+    """
+    import torch
+    from PIL import Image
+
+    if isinstance(value, torch.Tensor):
+        return Image.fromarray(value.permute(1, 2, 0).contiguous().cpu().numpy())
+    return value
 
 
 __all__ = ["DiffusionGemmaOmniPreprocessor"]

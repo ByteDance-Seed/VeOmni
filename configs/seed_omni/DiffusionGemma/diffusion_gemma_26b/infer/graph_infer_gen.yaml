@@ -1,17 +1,21 @@
-# DiffusionGemma generation FSM -- placeholder for the training-only phase.
+# DiffusionGemma generation FSM: one node, one pass.
 #
-# `OmniArguments` requires an `infer_graph` even for a training-only launch, and this
-# module does not wire the denoising loop into the FSM yet: its preprocessor raises
-# for `inference=True` because generation's own masking is not implemented.
+# Block diffusion is not a per-token loop. `diffusion_gemma_omni.generate` calls
+# `block_autoregressive_generate`, which prefills the prompt into a KV cache, denoises
+# a whole canvas against it, re-encodes that canvas back into the cache (Equation 4),
+# and repeats until an end-of-turn token or `max_blocks`. The canvas cache lives inside
+# that call, so there is no state to carry between FSM passes and the graph is a single
+# node that emits `text_done` immediately.
 #
-# The vendored model does ship a `generate`, but reaching it through this graph would
-# run the stock sampler without the per-module carrier contract, so it is not a
-# validated path. The single state exists so a launcher parses; it is not a contract.
-initial: run
+# The budgets are the sampler's, not the framework's: `num_steps` caps denoising steps
+# per canvas, `max_blocks` caps canvases, and `max_new_tokens` here only has to be
+# large enough to admit the single pass.
+initial: generate
 
 states:
-  run:
+  generate:
     body:
       - { from: diffusion_gemma_omni, to: end }
     transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: done }
       - { condition: { type: default }, next_state: done }
