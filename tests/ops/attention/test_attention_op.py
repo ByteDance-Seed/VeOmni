@@ -378,3 +378,27 @@ def test_ensure_npu_host_cu_seqlens_converts_and_caches_only_for_npu(monkeypatch
     assert _FakeNpuTensor.cpu_calls == 2
     assert third_out["cu_seq_lens_q"].tolist() == [0, 4, 6]
     attn_helper._NPU_HOST_CU_SEQLENS_CACHE.clear()
+
+
+def test_ensure_npu_host_cu_seqlens_copies_inference_tensors_without_version():
+    from veomni.ops.kernels.attention import helper as attn_helper
+
+    attn_helper._NPU_HOST_CU_SEQLENS_CACHE.clear()
+
+    class _FakeNpuTensor(torch.Tensor):
+        @property
+        def device(self):
+            return SimpleNamespace(type="npu")
+
+        def cpu(self) -> torch.Tensor:
+            return torch.tensor(torch.Tensor.tolist(self), dtype=self.dtype)
+
+    with torch.inference_mode():
+        cu = torch.tensor([0, 3, 6], dtype=torch.int32)
+    fake_cu = cu.as_subclass(_FakeNpuTensor)
+    assert fake_cu.is_inference()
+
+    updated = attn_helper.ensure_npu_host_cu_seqlens({"cu_seq_lens_q": fake_cu}, "npu")
+    assert updated["cu_seq_lens_q"].tolist() == [0, 3, 6]
+    assert updated["cu_seq_lens_q"].device.type == "cpu"
+    attn_helper._NPU_HOST_CU_SEQLENS_CACHE.clear()

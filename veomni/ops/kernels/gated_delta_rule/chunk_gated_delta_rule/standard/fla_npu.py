@@ -153,6 +153,9 @@ def _as_int_list(value: list[int] | Tensor | None) -> list[int] | None:
     if value is None:
         return None
     if isinstance(value, Tensor):
+        # Inference tensors have no version counter, including CPU metadata.
+        if value.is_inference():
+            return [int(x) for x in value.detach().cpu().flatten().tolist()]
         version = value._version
         alive: list[tuple[weakref.ref[Tensor], int, tuple[int, ...]]] = []
         cached: tuple[int, ...] | None = None

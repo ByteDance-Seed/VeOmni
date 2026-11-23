@@ -191,6 +191,21 @@ def test_gate_allows_seed_omni_module_config_under_cp(monkeypatch):
 
     check_context_parallel_supported(_WrappedCPModuleConfig())
 
+    # The wrapper's own model_type is not deepseek_v4, so the outer check returns
+    # before seeing cann. The inner text config still has to be refused.
+    class _WrappedCannModuleConfig(OmniModuleConfig):
+        model_type = "dummy_cp_llm"
+        _supports_context_parallel = True
+
+        def __init__(self):
+            ops = _npu_ops_for_cp()
+            ops["dsa_attention_implementation"] = "cann"
+            self.text_config = _dsv4_with_ops(ops)
+            super().__init__()
+
+    with pytest.raises(NotImplementedError, match="dsa_attention_implementation"):
+        check_context_parallel_supported(_WrappedCannModuleConfig())
+
     # An unported OmniModuleConfig subclass is still rejected under cp_enabled=True.
     with pytest.raises(
         NotImplementedError, match="Context parallelism is not implemented for model type 'fake_module_a'"

@@ -190,8 +190,11 @@ class WanSPAttnProcessor(WanAttnProcessor):
             encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
         query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
 
-        query = self.veomni_rms_norm(query, attn.norm_q.weight, eps=attn.norm_q.eps)
-        key = self.veomni_rms_norm(key, attn.norm_k.weight, eps=attn.norm_k.eps)
+        # ``nn.RMSNorm`` returns the activation dtype. Eager RMSNorm follows the
+        # Qwen formula ``weight * normalized``, which promotes when the norm
+        # weight is FP32 and the projection is BF16.
+        query = self.veomni_rms_norm(query, attn.norm_q.weight, eps=attn.norm_q.eps).to(dtype=query.dtype)
+        key = self.veomni_rms_norm(key, attn.norm_k.weight, eps=attn.norm_k.eps).to(dtype=key.dtype)
 
         query = query.unflatten(2, (attn.heads, -1))
         key = key.unflatten(2, (attn.heads, -1))

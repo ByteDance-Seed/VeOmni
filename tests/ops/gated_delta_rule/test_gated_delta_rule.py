@@ -1070,3 +1070,15 @@ def test_fla_npu_as_int_list_caches_tensor_conversion_across_layers():
     assert third == [0, 5, 10]
     assert _TrackedTensor.tolist_calls == 2
     fla_npu._HOST_CU_SEQLENS_LIST_CACHE.clear()
+
+
+def test_fla_npu_as_int_list_accepts_inference_tensors():
+    from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu
+
+    fla_npu._HOST_CU_SEQLENS_LIST_CACHE.clear()
+    with torch.inference_mode():
+        cu = torch.tensor([0, 4, 10], dtype=torch.int32)
+    assert cu.is_inference()
+    assert fla_npu._as_int_list(cu) == [0, 4, 10]
+    assert fla_npu._as_int_list(cu) == [0, 4, 10]
+    fla_npu._HOST_CU_SEQLENS_LIST_CACHE.clear()

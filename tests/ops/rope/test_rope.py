@@ -1123,3 +1123,34 @@ def test_wan_npu_matches_eager():
     out_e.backward(go)
     out_o.backward(go)
     assert torch.allclose(x_e.grad.float(), x_o.grad.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)
+
+
+def _npu_ready() -> bool:
+    return bool(IS_NPU_AVAILABLE and torch.npu.is_available())
+
+
+@pytest.mark.skipif(not _npu_ready(), reason="NPU Wan RoPE needs an available NPU")
+def test_wan_npu_real_pair_matches_eager():
+    eager = resolve_op("rope", "wan", "eager").wrapper
+    other = resolve_op("rope", "wan", "torch_npu").wrapper
+    torch.manual_seed(0)
+    head_dim = 64
+    heads = 4
+    seqlen = 16
+    x = torch.randn(2, seqlen, heads, head_dim, dtype=torch.bfloat16)
+    angle = torch.randn(seqlen, 1, head_dim // 2, dtype=torch.float64)
+    freqs = torch.polar(torch.ones_like(angle), angle)
+    freqs_cos = freqs.real.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+    freqs_sin = freqs.imag.repeat_interleave(2, dim=-1).reshape(1, seqlen, 1, head_dim)
+
+    x_e = x.detach().requires_grad_(True)
+    out_e = eager(x_e, (freqs_cos, freqs_sin), head_dim=head_dim)
+    x_o = x.to("npu").detach().requires_grad_(True)
+    out_o = other(x_o, (freqs_cos.to("npu"), freqs_sin.to("npu")), head_dim=head_dim)
+    assert out_o.shape == out_e.shape
+    assert torch.allclose(out_o.float().cpu(), out_e.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)
+
+    grad_output = torch.randn_like(out_e)
+    out_e.backward(grad_output)
+    out_o.backward(grad_output.to("npu"))
+    assert torch.allclose(x_o.grad.float().cpu(), x_e.grad.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)

@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU contract for the Wan confusion-transpose helper."""
+"""Contract for the Wan confusion-transpose helper."""
 
 import pytest
 import torch
 
 from veomni.ops.layout.confusion_transpose import confusion_transpose
+from veomni.utils.device import IS_NPU_AVAILABLE
+
+
+def _npu_ready() -> bool:
+    return bool(IS_NPU_AVAILABLE and torch.npu.is_available())
 
 
 def test_confusion_transpose_matches_flatten_on_cpu(monkeypatch):
@@ -28,8 +33,25 @@ def test_confusion_transpose_matches_flatten_on_cpu(monkeypatch):
         "veomni.ops.layout.confusion_transpose._npu_confusion_transpose",
         reject,
     )
-    hidden = torch.randn(2, 3, 2, 2, 2)
+    hidden = torch.randn(2, 3, 2, 4, 5)
     actual = confusion_transpose(hidden)
     expected = hidden.flatten(2).transpose(1, 2)
     torch.testing.assert_close(actual, expected)
-    assert actual.shape == (2, 8, 3)
+    assert actual.shape == (2, 40, 3)
+
+
+@pytest.mark.skipif(not _npu_ready(), reason="NPU confusion transpose needs an available NPU")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_confusion_transpose_matches_flatten_on_npu(dtype: torch.dtype):
+    hidden = torch.randn(2, 3, 2, 4, 5, device="npu", dtype=dtype, requires_grad=True)
+    actual = confusion_transpose(hidden)
+    reference_input = hidden.detach().to("cpu").requires_grad_(True)
+    reference = reference_input.flatten(2).transpose(1, 2)
+    tolerance = {"atol": 1e-5, "rtol": 1e-5} if dtype == torch.float32 else {"atol": 1e-2, "rtol": 1e-2}
+    torch.testing.assert_close(actual.detach().cpu(), reference.detach(), **tolerance)
+
+    grad_out = torch.randn_like(reference)
+    actual.backward(grad_out.to(device="npu", dtype=dtype))
+    reference.backward(grad_out)
+    assert hidden.grad is not None
+    torch.testing.assert_close(hidden.grad.cpu(), reference_input.grad, **tolerance)

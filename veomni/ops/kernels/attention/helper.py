@@ -33,6 +33,9 @@ def _cached_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
     """Return a CPU copy of ``tensor``, reusing a cached copy across layers."""
     if tensor.device.type == "cpu":
         return tensor
+    # Inference tensors have no version counter. Reading ``_version`` raises.
+    if tensor.is_inference():
+        return tensor.detach().cpu()
     version = tensor._version
     alive: list[tuple[weakref.ref[torch.Tensor], int, torch.Tensor]] = []
     cached: torch.Tensor | None = None
