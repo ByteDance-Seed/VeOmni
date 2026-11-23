@@ -362,7 +362,7 @@ class TestGetModelSaveState(unittest.TestCase):
         from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
             create_deepseek_v4_checkpoint_tensor_converter,
         )
-        from veomni.models.transformers.deepseek_v4.generated.patched_modeling_deepseek_v4_gpu import (
+        from veomni.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
             DeepseekV4ForCausalLM,
         )
         from veomni.utils.save_safetensor_utils import get_model_save_state
