@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
 from torch import Tensor
 
 
@@ -157,7 +156,6 @@ def _npu_ep_fused_lora_moe_forward(
     lora_scale_gate: float,
     lora_scale_up: float,
     lora_scale_down: float,
-    ep_group: dist.ProcessGroup | None = None,
 ) -> Tensor:
     """NPU EP fused MoE + independent LoRA."""
     from ..helper import npu_ep_forward
@@ -182,7 +180,6 @@ def _npu_ep_fused_lora_moe_forward(
         fc2_weight,
         gate_up,
         down,
-        ep_group=ep_group,
     )
 
 
@@ -224,7 +221,7 @@ def npu_fused_lora_moe_forward(
         lora_scale_down=lora_scale_down,
     )
     if get_parallel_state().ep_enabled:
-        return _npu_ep_fused_lora_moe_forward(ep_group=get_parallel_state().ep_group, **kwargs)
+        return _npu_ep_fused_lora_moe_forward(**kwargs)
     return _npu_fused_lora_moe_forward(**kwargs)
 
 

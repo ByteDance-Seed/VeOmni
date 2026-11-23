@@ -31,7 +31,7 @@ from .geglu import liger_kernel as geglu_liger
 from .standard import eager as standard_eager
 from .standard import liger_kernel as standard_liger
 from .standard import qat as standard_qat
-from .standard import torchao_nvfp4 as standard_torchao_nvfp4
+from .standard import torchao as standard_torchao
 
 
 _GPU = GpuKernelRequirement()
@@ -72,7 +72,7 @@ register_op(
     "gated_mlp",
     "standard",
     "qat",
-    description="TileLang blockwise FP8 fake-quantized SwiGLU MLP with optional activation clamping",
+    description="TileLang blockwise FP8 fake-quantized gated MLP with optional activation clamping",
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
@@ -81,9 +81,9 @@ register_op(
 register_op(
     "gated_mlp",
     "standard",
-    "torchao_nvfp4",
-    description="TorchAO NVFP4 fake-quantized SwiGLU MLP with optional activation clamping",
-    wrapper=standard_torchao_nvfp4.wrapper,
+    "torchao",
+    description="TorchAO low-precision (FP8 / NVFP4 / MXFP4) gated MLP with optional activation clamping",
+    wrapper=standard_torchao.wrapper,
     requires=("torchao",),
 )
 
