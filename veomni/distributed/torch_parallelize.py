@@ -1197,8 +1197,8 @@ def parallelize_model_ddp(
     # ``broadcast_buffers=False`` because FSDP2 syncs no buffers at all, and a
     # module's buffer semantics must not change with the ``fsdp_mode`` a config
     # happened to pick. Nothing is lost: rank0's copy is either identical to the
-    # others or, for dynamic-rope ``inv_freq``, wrong for them. See constraint 7a
-    # in `.agents/knowledge/constraints.md`.
+    # others or, for dynamic-rope ``inv_freq``, wrong for them. See constraint 9
+    # in `.agents/knowledge/constraints.md` and `.agents/knowledge/topics/distributed.md`.
     return DDP(
         model,
         device_ids=[parallel_state.local_rank],

@@ -67,6 +67,12 @@ knowledge_base:
         applyTo: "**/*"
       - files: ".agents/knowledge/constraints.md"
         applyTo: "veomni/**/*.py,veomni/**/*.yaml,veomni/**/*.yml"
+      - files: ".agents/knowledge/topics/distributed.md"
+        applyTo: "veomni/distributed/**/*.py,veomni/models/checkpoint/**/*.py,veomni/models/transformers/qwen4_exp/**/*.py"
+      - files: ".agents/knowledge/topics/qat_and_ops.md"
+        applyTo: "veomni/ops/**/*.py"
+      - files: ".agents/knowledge/topics/flex_attention.md"
+        applyTo: "veomni/ops/kernels/attention/**/*.py"
       - files: "CONTRIBUTING.md"
         applyTo: "**/*"
 chat:

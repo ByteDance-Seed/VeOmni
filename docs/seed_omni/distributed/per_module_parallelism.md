@@ -119,7 +119,8 @@ norm over the groups its wrap requires:
   the group itself;
 - DDP without SP: the local sum, since DDP already all-reduced the gradients;
 - DDP with SP: gradients are first averaged over `fsdp_group`, which includes
-  the SP ranks (constraint 7a in `.agents/knowledge/constraints.md`).
+  the SP ranks (constraint 9 in `.agents/knowledge/constraints.md` and
+  `.agents/knowledge/topics/distributed.md`).
 
 `model.optimizer.grad_clip_scope` selects `per_module` (each module clipped to
 `max_grad_norm` on its own, the default) or `global` (one coefficient for all
