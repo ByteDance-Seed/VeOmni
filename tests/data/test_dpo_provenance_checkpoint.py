@@ -294,6 +294,33 @@ def test_dpo_config_accepts_versioned_and_legacy_audit(fingerprint):
     assert _dpo_objective_parameters(trainer.base.args.dpo_config)["audited_unpadded_tokenizer_sha256"] == fingerprint
 
 
+@pytest.mark.parametrize("selection_kind", ["torchao", "qat", "deepgemm", "per_site"])
+def test_dpo_resume_binds_reference_low_precision_ops(selection_kind):
+    from veomni.ops.registry import OpsSelection, SiteOverride
+
+    trainer = _trainer(True)
+    trainer.base.train_dataloader = _native_map_loader(list(range(8)))
+    args = trainer.base.args
+    old = trainer.dpo_provenance_checkpoint_state()
+    trainer.validate_dpo_provenance_checkpoint(old)
+    selection = (
+        selection_kind
+        if selection_kind != "per_site"
+        else OpsSelection(name="eager", overrides=[SiteOverride("proj", "torchao", {"dtype": "fp8"})])
+    )
+    args.model.ops_implementation = SimpleNamespace(linear_implementation=selection)
+    trainer._dpo_recovery_geometry = _dpo_recovery_geometry(args)
+    with pytest.raises(ValueError, match="provenance mode"):
+        trainer.validate_dpo_provenance_checkpoint(old)
+    current = trainer.dpo_provenance_checkpoint_state()
+    trainer.validate_dpo_provenance_checkpoint(current)
+
+    args.model.ops_implementation.linear_implementation = "eager"
+    trainer._dpo_recovery_geometry = _dpo_recovery_geometry(args)
+    with pytest.raises(ValueError, match="provenance mode"):
+        trainer.validate_dpo_provenance_checkpoint(current)
+
+
 def test_dpo_resume_rejects_changed_dataset_fingerprint():
     trainer = _trainer(True)
     saved = trainer.dpo_provenance_checkpoint_state()

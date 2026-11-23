@@ -19,7 +19,7 @@ import re
 import time
 from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
@@ -444,6 +444,25 @@ def _dpo_recovery_geometry(args: Any) -> dict[str, Any]:
     result["reference_model"] = {
         key: getattr(args.model, key, None) for key in ("model_path", "config_path", "tokenizer_path")
     }
+    # Per-site selections can change frozen reference log-probs, even with FSDP
+    # mixed precision disabled. Older checkpoints cannot attest these selections.
+    from ..ops.registry import OpsSelection
+
+    ops = getattr(args.model, "ops_implementation", None)
+    selected = {}
+    for field_name in (
+        "moe_implementation",
+        "gated_mlp_implementation",
+        "linear_implementation",
+        "kv_round_implementation",
+    ):
+        selection = getattr(ops, field_name, None)
+        if isinstance(selection, OpsSelection):
+            selected[field_name] = asdict(selection)
+        elif isinstance(selection, str) and selection in {"torchao", "qat", "deepgemm"}:
+            selected[field_name] = selection
+    if selected:
+        result["reference_model"]["site_ops"] = selected
     return result
 
 
@@ -583,8 +602,11 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
     ):
         args = copy.deepcopy(args)
         args.lora_config = {}
+        # Disable FSDP mixed precision on the frozen reference. Note that
+        # ``args.ops_implementation`` is intentionally kept as copied from the
+        # policy (any low-precision op rows configured there also apply to the
+        # reference model unless changed explicitly in the caller's config).
         args.accelerator.fsdp_config.mixed_precision.enable = False
-        args.accelerator.fsdp_config.mixed_precision.float8.enable = False
         # The frozen reference never computes expert weight gradients; the
         # policy's FP32-wgrad option requires mixed precision and must not be
         # passed to this separate, non-AMP reference build.

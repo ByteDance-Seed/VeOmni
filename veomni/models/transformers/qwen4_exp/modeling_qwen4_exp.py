@@ -1379,6 +1379,8 @@ class Qwen4ExpTextExperts(nn.Module):
         self.activation = config.hidden_act
         self._veomni_fp32_expert_wgrad = False
         self.veomni_moe = VeomniOp("moe_experts", "standard", config.ops_config.moe_implementation)
+        if "fp32_wgrad" in self.veomni_moe.kwargs:
+            raise ValueError("Set npu_expert_fp32_wgrad in mixed_precision, not fp32_wgrad in MoE op kwargs")
 
     def forward(
         self,
