@@ -947,11 +947,13 @@ class DistributedMuon(Optimizer):
             "ns_implementation": ns_implementation,
             "gram_ns_reset_iterations": tuple(int(i) for i in gram_ns_reset_iterations),
         }
-        # Only carried when it differs: as a default it would add an
-        # ``param_groups.<fqn>.expert_ns_max_experts`` entry to every flattened
-        # optimizer state dict, which checkpoints written before this option lack.
-        if int(expert_ns_max_experts) != _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS:
-            defaults["expert_ns_max_experts"] = int(expert_ns_max_experts)
+        # ``expert_ns_max_experts`` is a constructor-level switch, not resumable
+        # per-group state: it is deliberately NOT in ``defaults``. Keeping it out
+        # of ``param_groups`` means a flattened optimizer state dict never carries
+        # it, so resuming cannot KeyError on a checkpoint written with the other
+        # value, and a resume cannot silently restore the checkpoint's budget over
+        # the one this run configured (which could OOM again).
+        self._expert_ns_max_experts = int(expert_ns_max_experts)
         # Only carried when splitting is on: as a default it would add a
         # ``param_groups.<fqn>.head_blocks`` entry to every flattened optimizer
         # state dict, which checkpoints written before this option lack.
@@ -1037,7 +1039,9 @@ class DistributedMuon(Optimizer):
             ns_implementation = str(group.get("ns_implementation", "gram_quack"))
             gram_ns_reset_iterations = tuple(group.get("gram_ns_reset_iterations", (2,)))
             head_blocks = int(group.get("head_blocks", 1))
-            expert_ns_max_experts = int(group.get("expert_ns_max_experts", _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS))
+            # Read the constructor switch, not a group key: it is not resumable
+            # state, so a checkpoint must never be able to change it.
+            expert_ns_max_experts = self._expert_ns_max_experts
             # Scope settings travel inside ns_kwargs so the all-to-all owner path
             # reads them from one dict.
             ns_kwargs = {

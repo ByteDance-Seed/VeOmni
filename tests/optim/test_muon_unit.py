@@ -609,25 +609,99 @@ class TestGramNewtonSchulz:
         opt.step()
         assert torch.isfinite(p).all()
 
-    def test_distributed_muon_validates_and_carries_the_expert_ns_budget(self):
-        """The chunking switch must reach the param group the step loop reads, defaulting off."""
-        p = nn.Parameter(torch.randn(8, 16))
-        # Default is -1 (chunking disabled) and must stay out of the group so older
-        # checkpoints' flattened state dicts still match.
-        opt_default = DistributedMuon([p], lr=1e-3)
-        assert "expert_ns_max_experts" not in opt_default.param_groups[0]
+    def test_distributed_muon_keeps_the_expert_ns_budget_out_of_the_state_dict(self):
+        """The chunking switch must not be resumable state, in either direction.
 
-        # Enabling it carries the budget in the group the step loop reads.
-        opt_custom = DistributedMuon([p], lr=1e-3, expert_ns_max_experts=3)
-        assert opt_custom.param_groups[0]["expert_ns_max_experts"] == 3
+        Two failures it prevents, both reachable on a resume:
+        * a checkpoint written while chunking was off has no such key, and torch's
+          DCP unflatten indexes the checkpoint by the *current* group keys, so
+          restoring it into an instance configured with a budget raises ``KeyError``;
+        * a checkpoint that did carry a budget would overwrite the one this run
+          configured, so a new job asking for a tighter workspace could resume with
+          the old, larger value and OOM again.
+        """
+        import torch.nn as nn
 
-        # -1 is the explicit "off" value; below that is a typo.
-        assert (
-            DistributedMuon([p], lr=1e-3, expert_ns_max_experts=-1).param_groups[0].get("expert_ns_max_experts", -1)
-            == -1
-        )
+        def make(budget):
+            model = nn.Linear(4, 4, bias=False)
+            kwargs = {} if budget is None else {"expert_ns_max_experts": budget}
+            return model, DistributedMuon(model.parameters(), lr=1e-3, **kwargs)
+
+        model, saver = make(8)
+        for p in model.parameters():
+            p.grad = torch.randn_like(p)
+        saver.step()
+        saved = saver.state_dict()
+        assert "expert_ns_max_experts" not in saved["param_groups"][0]
+
+        # Saved 8, configured 1: the configuration wins.
+        _, restored = make(1)
+        restored.load_state_dict(saved)
+        assert restored._expert_ns_max_experts == 1
+
+        # Saved off (keyless), configured 3: no KeyError, configuration wins.
+        off_model, off_saver = make(None)
+        for p in off_model.parameters():
+            p.grad = torch.randn_like(p)
+        off_saver.step()
+        _, from_keyless = make(3)
+        from_keyless.load_state_dict(off_saver.state_dict())
+        assert from_keyless._expert_ns_max_experts == 3
+
+        # Validation still rejects a value below the "off" sentinel.
         with pytest.raises(ValueError, match="must be >= -1"):
-            DistributedMuon([p], lr=1e-3, expert_ns_max_experts=-2)
+            DistributedMuon([nn.Parameter(torch.randn(8, 16))], lr=1e-3, expert_ns_max_experts=-2)
+
+    def test_dcp_resume_keeps_the_configured_expert_ns_budget(self):
+        """The same two guarantees must hold on the standard DCP path.
+
+        ``set_optimizer_state_dict`` unflattens by indexing every key the *live*
+        optimizer's param groups declare, so a budget key in the groups would
+        make a resume from a keyless checkpoint raise ``KeyError`` there, and a
+        present key would restore the checkpoint's value over this run's.
+        """
+        import torch.nn as nn
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            get_optimizer_state_dict,
+            set_optimizer_state_dict,
+        )
+
+        def make(budget):
+            model = nn.Linear(4, 4, bias=False)
+            kwargs = {} if budget is None else {"expert_ns_max_experts": budget}
+            return model, DistributedMuon(model.parameters(), lr=1e-3, **kwargs)
+
+        def snapshot(budget):
+            model, opt = make(budget)
+            for p in model.parameters():
+                p.grad = torch.randn_like(p)
+            opt.step()
+            return get_optimizer_state_dict(model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True))
+
+        # Nothing about the switch is persisted, whichever value produced it.
+        for budget in (None, 8):
+            assert not any("expert_ns_max_experts" in key for key in snapshot(budget))
+
+        # Keyless checkpoint -> configured 3: no KeyError, configuration wins.
+        model, opt = make(3)
+        set_optimizer_state_dict(
+            model,
+            opt,
+            optim_state_dict=snapshot(None),
+            options=StateDictOptions(flatten_optimizer_state_dict=True),
+        )
+        assert opt._expert_ns_max_experts == 3
+
+        # Checkpoint saved 8 -> configured 1: configuration wins.
+        model, opt = make(1)
+        set_optimizer_state_dict(
+            model,
+            opt,
+            optim_state_dict=snapshot(8),
+            options=StateDictOptions(flatten_optimizer_state_dict=True),
+        )
+        assert opt._expert_ns_max_experts == 1
 
 
 class TestMuonLrResolution:
