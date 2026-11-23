@@ -730,10 +730,10 @@ def test_short_convolution_reuses_hoisted_host_boundaries():
 
 def test_decoder_layer_forward_runs():
     """The KimiDecoderLayer runs end-to-end standalone. The
-attention-residual block packing is threaded with the production shape the
-model uses -- a (num_tokens, 0, hidden) zero tensor that each
-block-boundary layer appends to -- spanning both attention families and
-both feed paths: KDA+dense-MLP, KDA+MoE, and MLA+MoE layers."""
+    attention-residual block packing is threaded with the production shape the
+    model uses -- a (num_tokens, 0, hidden) zero tensor that each
+    block-boundary layer appends to -- spanning both attention families and
+    both feed paths: KDA+dense-MLP, KDA+MoE, and MLA+MoE layers."""
     from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import KimiDecoderLayer as DecoderLayer
 
     config = _tiny_config().text_config
