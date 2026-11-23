@@ -1,0 +1,8 @@
+# Per-module inference overrides for LLaDA-V-8B (SeedOmni).
+llada_v_omni:
+  model_path: llada_v_omni
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    gradient_checkpointing:
+      enable: false

@@ -1,19 +1,15 @@
-# LLaDA-V generation FSM -- placeholder for the training-only phase.
+# LLaDA-V generation FSM: the dense module's remasking loop over an image prompt.
 #
-# `OmniArguments` requires an `infer_graph` even for a training-only launch, and
-# this module does not implement a mask-predictor `generate` yet: the preprocessor
-# raises for `inference=True` because the FSM's own masking is not wired.
-#
-# `LladaVOmni` inherits `LLaDAVForConditionalGeneration`, so `generate` resolves to
-# the vendored autoregressive one, which is NOT the low-confidence remasking this
-# model needs. Until that is implemented, inference through this graph produces
-# decoded text from the stock generator and must not be treated as a validated
-# result. The single state exists so a launcher parses; it is not a contract.
-initial: run
+# Same loop as `Llada/llada_8b/infer/graph_infer_gen.yaml`. The difference is that
+# the prompt carries image slots, which the module scatters into the embeddings on
+# its first pass (`pixel_values` / `image_mask` from the carrier); later passes
+# decode tokens against that already-embedded context.
+initial: diffuse
 
 states:
-  run:
+  diffuse:
     body:
       - { from: llada_v_omni, to: end }
     transitions:
-      - { condition: { type: default }, next_state: done }
+      - { condition: { type: module_signal, key: text_done }, next_state: done }
+      - { condition: { type: default }, next_state: diffuse }

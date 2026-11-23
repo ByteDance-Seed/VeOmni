@@ -1,19 +1,23 @@
-# LLaDA-8B generation FSM -- placeholder for Phase 0.
+# LLaDA-8B generation FSM: low-confidence remasking over a fully masked span.
 #
-# `OmniArguments` requires an `infer_graph` even for a training-only launch, and
-# this module does not implement a mask-predictor `generate` yet: Phase 0 covers
-# the training path only (the loss curve comparison against `DllmTrainer`).
+# LLaDA is a mask predictor, so a pass is not a token: `llada_omni.generate`
+# either lays out the prompt plus a masked answer span (first pass, no logits in
+# the ctx) or commits the most confident masked positions and re-encodes the row
+# (`llada_logits` in the ctx). The `default` transition loops back until the
+# module emits `text_done`, which is when the span is fully decoded or an EOS
+# closed it.
 #
-# `LladaOmni` inherits `LLaDAForCausalLM`, so `generate` resolves to the
-# vendored autoregressive one, which is NOT the low-confidence remasking this
-# model needs. Until that is implemented, inference through this graph produces
-# decoded text from the stock generator and must not be treated as a validated
-# result. The single state exists so a launcher parses; it is not a contract.
-initial: run
+# Two budgets apply, and they are not interchangeable: `diffusion_steps` bounds
+# denoising passes inside the module, while `max_new_tokens` bounds FSM steps
+# overall (the framework's own cut). Leave headroom in the latter -- an
+# exhausted FSM calls `finalize`, which emits a truncated answer rather than
+# nothing, but it is truncated.
+initial: diffuse
 
 states:
-  run:
+  diffuse:
     body:
       - { from: llada_omni, to: end }
     transitions:
-      - { condition: { type: default }, next_state: done }
+      - { condition: { type: module_signal, key: text_done }, next_state: done }
+      - { condition: { type: default }, next_state: diffuse }

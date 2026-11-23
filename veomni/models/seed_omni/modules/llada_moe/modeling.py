@@ -31,7 +31,10 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 from ....transformers.llada_moe.modeling_llada_moe import LLaDAMoEForCausalLM
+from ..llada.modeling import LladaOmni
 from ..module_modeling_base import PretrainedOmniModule
 from .configuration import LladaMoeOmniConfig
 from .processing import LladaMoeOmniPreprocessor
@@ -48,12 +51,66 @@ class LladaMoeOmni(LLaDAMoEForCausalLM, PretrainedOmniModule):
     ``preprocessor_class`` is what ``OmniProcessor.from_config`` reads to build the
     CPU worker; without it the sample reaches the graph unprocessed and
     ``batch_pre`` finds no tensors to stack.
+
+    The denoising loop is **not** restated here. LLaDA-MoE is the same mask
+    predictor over the same row layout -- the router changes how a token is
+    computed, not which positions are masked or in what order they are committed
+    -- so the generation methods are borrowed from the dense module rather than
+    copied. A second copy is how the two would drift apart on the one thing that
+    matters: which positions count as decoded.
     """
 
     config_class = LladaMoeOmniConfig
     preprocessor_class = LladaMoeOmniPreprocessor
     base_model_prefix = "llada_moe_omni"
     _no_split_modules = ["LLaDAMoEDecoderLayer"]
+
+    # Borrowed from the dense module: the loop reads only `config.mask_token_id`,
+    # the tokenizer and its EOS, all of which this module also holds.
+    SIGNAL_TEXT_DONE = LladaOmni.SIGNAL_TEXT_DONE
+    tokenizer = LladaOmni.tokenizer
+    _eos_token_id = LladaOmni._eos_token_id
+    _reset_diffusion_state = LladaOmni._reset_diffusion_state
+    _make_num_transfer_schedule = staticmethod(LladaOmni._make_num_transfer_schedule)
+    _prompt_ids = LladaOmni._prompt_ids
+    _diffusion_init = LladaOmni._diffusion_init
+    _diffusion_step = LladaOmni._diffusion_step
+    _finish_diffusion = LladaOmni._finish_diffusion
+    generate = LladaOmni.generate
+    finalize = LladaOmni.finalize
+
+    def __init__(self, config: LladaMoeOmniConfig):
+        super().__init__(config)
+        self._reset_diffusion_state()
+
+    def reset_local_inference_state(self) -> None:
+        """Clear the denoising row between requests.
+
+        Stated here rather than borrowed: the dense module's version calls
+        ``super().reset_local_inference_state()``, and a zero-argument ``super()``
+        is bound to the class it was written in -- borrowing it makes the call
+        fail with "obj must be an instance or subtype of type", because ``self``
+        is this class and not that one.
+        """
+        super().reset_local_inference_state()
+        self._reset_diffusion_state()
+
+    def _decode_forward(self) -> dict[str, Any]:
+        """Run the mask predictor over the whole row and return its logits.
+
+        One line different from the dense module -- the LM head is applied here --
+        and kept separate rather than borrowed so the backbone attribute this
+        class uses is stated in this class.
+        """
+        x = self._diff_x
+        if x is None:
+            raise RuntimeError("LladaMoeOmni: decode forward without an initialised row.")
+        outputs = self.model(
+            input_ids=x.unsqueeze(0),
+            attention_mask=torch.ones_like(x, dtype=torch.long).unsqueeze(0),
+            use_cache=False,
+        )
+        return {"llada_logits": self.lm_head(outputs.last_hidden_state)}
 
     def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
         # LLaDA-MoE owns attention and validates its backend: the bidirectional

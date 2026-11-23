@@ -24,9 +24,8 @@ model:
     max_seq_len: 2048
     text_keys: messages
     mask_eps: 1.0e-3
-    # Required by `OmniArguments` even for a training-only launch. The graph is a
-    # placeholder: this module has no mask-predictor `generate` yet, so inference
-    # through it is not a validated path (see the graph's own comment).
+    # Denoising FSM for `tasks/omni/infer_omni.py`: the mask predictor starts from a
+    # fully masked answer span and commits the most confident positions per pass.
     infer_graph:
       infer_gen: configs/seed_omni/Llada/llada_8b/infer/graph_infer_gen.yaml
     infer_type: infer_gen

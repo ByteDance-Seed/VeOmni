@@ -1,0 +1,12 @@
+# Per-module inference overrides for LLaDA-8B (SeedOmni).
+#
+# One module: the mask predictor denoises its own answer span, so there is no
+# sibling to hand activations to. Deep-merged onto the launcher's `model.*`
+# block.
+llada_omni:
+  model_path: llada_omni
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    gradient_checkpointing:
+      enable: false

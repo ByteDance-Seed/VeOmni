@@ -1,18 +1,16 @@
-# LLaDA-MoE generation FSM -- placeholder for the training-only phase.
+# LLaDA-MoE generation FSM: the dense module's low-confidence remasking loop.
 #
-# `OmniArguments` requires an `infer_graph` even for a training-only launch, and
-# this module does not implement a mask-predictor `generate` yet.
-#
-# `LladaMoeOmni` inherits `LLaDAMoEForCausalLM`, so `generate` resolves to the
-# vendored autoregressive one, which is NOT the low-confidence remasking this
-# model needs. Until that is implemented, inference through this graph produces
-# decoded text from the stock generator and must not be treated as a validated
-# result. The single state exists so a launcher parses; it is not a contract.
-initial: run
+# Same loop as `Llada/llada_8b/infer/graph_infer_gen.yaml`: `generate` lays out the
+# prompt plus a masked answer span on the first pass and commits the most
+# confident masked positions on each later one. The router changes how a token is
+# computed, not which positions are masked or the order they are committed, so
+# the FSM is identical and only the module name differs.
+initial: diffuse
 
 states:
-  run:
+  diffuse:
     body:
       - { from: llada_moe_omni, to: end }
     transitions:
-      - { condition: { type: default }, next_state: done }
+      - { condition: { type: module_signal, key: text_done }, next_state: done }
+      - { condition: { type: default }, next_state: diffuse }

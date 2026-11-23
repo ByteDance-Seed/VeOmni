@@ -85,7 +85,7 @@ class LladaOmniPreprocessor(ModulePreprocessorBase):
 
             config_dict, _ = PretrainedConfig.get_config_dict(module_path)
             mask_token_id = config_dict.get("mask_token_id")
-        return cls(
+        worker = cls(
             chat_template,
             mask_token_id=mask_token_id,
             max_seq_len=int(overrides.pop("max_seq_len", 4096)),
@@ -94,6 +94,12 @@ class LladaOmniPreprocessor(ModulePreprocessorBase):
             mask_seed=int(overrides.pop("mask_seed", 0)),
             **overrides,
         )
+        # Held directly so `bind_module_assets` can reach it: that helper copies
+        # only the names in `MODULE_ASSET_ATTRS`, and a tokenizer reachable
+        # solely through the chat template would leave the module unable to
+        # decode the ids it generated.
+        worker._tokenizer = tokenizer
+        return worker
 
     def preprocess_conversations(
         self, conversation_list: list[list[Any]], inference: bool = False, **kwargs: Any
@@ -140,16 +146,36 @@ class LladaOmniPreprocessor(ModulePreprocessorBase):
             conversation_list[index] = [item]
 
     def _encode_for_inference(self, example: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """Tokenize without corrupting; generation supplies its own masks later."""
+        """Tokenize without corrupting, and open the assistant turn.
+
+        The chat template renders the *supervised* form, which stops after the
+        user turn: training appends the answer itself, so there is no assistant
+        header in what it returns. Generation starts where the answer would have
+        started, so the header has to be appended here -- without it the mask
+        predictor continues the template's own text instead of answering, and
+        the observed failure is a prompt-conditioned echo (`The capital of is
+        Paris.`) rather than a reply.
+        """
         (tokenized,) = process_conversation_example(example, self._chat_template, self._max_seq_len, self._text_keys)
+        input_ids = tokenized["input_ids"]
         labels = tokenized["labels"]
+        tokenizer = self._chat_template.tokenizer
+        header = tokenizer(_ASSISTANT_HEADER, add_special_tokens=False)["input_ids"]
+        if header:
+            input_ids = torch.cat([input_ids, torch.tensor(header, dtype=input_ids.dtype)])
+        n = int(input_ids.numel())
         return {
-            "input_ids": tokenized["input_ids"],
-            "attention_mask": tokenized["attention_mask"],
-            "labels": torch.full_like(labels, IGNORE_INDEX),
-            "loss_weight": torch.zeros(labels.shape, dtype=torch.float32),
-            "answer_mask": torch.zeros(labels.shape, dtype=torch.long),
+            "input_ids": input_ids,
+            "attention_mask": torch.ones(n, dtype=torch.long),
+            "labels": torch.full((n,), IGNORE_INDEX, dtype=labels.dtype),
+            "loss_weight": torch.zeros(n, dtype=torch.float32),
+            "answer_mask": torch.zeros(n, dtype=torch.long),
         }
+
+
+#: Llama-3 style turn opener, the same one ``LladaTemplate`` uses. LLaDA-Instruct
+#: writes the answer after this header and nothing before it.
+_ASSISTANT_HEADER = "<|start_header_id|>assistant<|end_header_id|>\n\n"
 
 
 def processed_len(value: Any) -> int:
