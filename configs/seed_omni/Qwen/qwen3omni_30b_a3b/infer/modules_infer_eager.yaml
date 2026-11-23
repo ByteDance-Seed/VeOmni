@@ -1,0 +1,43 @@
+# Single-process eager inference: no FSDP wrap, plain HF load on one device.
+#
+# The 30B-A3B weights fit on one H20. Keep it to one device: the talker's
+# sampling loop mixes `pad_token_id` with `next_tokens` without a device cast,
+# so an "auto" split across GPUs dies on a cuda:0/cuda:N mismatch.
+qwen3omni_audio:
+  model_path: qwen3omni_audio
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+qwen3omni_vision:
+  model_path: qwen3omni_vision
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+qwen3omni_text_encoder:
+  model_path: qwen3omni_text_encoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: eager
+qwen3omni_llm:
+  model_path: qwen3omni_llm
+  # The talker reads an interior thinker layer, so the backbone has to keep the
+  # whole layer stack. Set here rather than in the checkpoint because it is a
+  # property of the graph: `graph_infer_audio.yaml` needs it, and
+  # `graph_infer_thinker_only.yaml` would not, but both share this module list.
+  model_config:
+    collect_thinker_states: true
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+qwen3omni_talker:
+  model_path: qwen3omni_talker
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager
+qwen3omni_codec:
+  model_path: qwen3omni_codec
+  accelerator:
+    fsdp_config:
+      fsdp_mode: eager

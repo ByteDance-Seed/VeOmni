@@ -1,0 +1,129 @@
+# VeOmni talker-training config for OmniModel V2 — Qwen3-Omni-30B-A3B-Instruct.
+#
+# Trains the speech head only. The thinker (audio / vision / text_encoder / llm)
+# is frozen and runs to produce the talker's prefill; the codec turns the
+# assistant's waveform into the RVQ codes the talker is scored against.
+#
+# Prerequisite — split the upstream checkpoint, exactly as for thinker training.
+# Qwen3-Omni ships no audio tokenizer, so the codec's encoder half comes from a
+# second checkpoint, and this round *requires* it (the thinker round does not):
+#   python scripts/convert_model.py \
+#     --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-Omni-30B-A3B-Instruct \
+#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct \
+#     --extra mimi_path=/mnt/hdfs/veomni/models/kyutai/mimi
+#
+# Launch:
+#   bash train.sh tasks/omni/train_omni.py \
+#     configs/seed_omni/Qwen/qwen3omni_30b_a3b/train_talker/base.yaml
+#
+# The corpus this points at is the model's own speech, built in two passes —
+# `scripts/seed_omni/qwen3omni_build_talker_corpus.py` records it, then
+# `qwen3omni_filter_talker_corpus.py` transcribes every clip back through the
+# audio tower and drops the rows whose speech does not say their text
+# (`--score`, then `--apply --min-overlap 0.6`). The second pass is not
+# optional: the generator's own filters read metadata and cannot hear that a
+# clip is fluent noise.
+#
+# Being the model's own speech makes this self-distillation, which is enough to
+# make the round runnable and overfittable but cannot teach the talker anything
+# it does not already say. Swap in a TTS corpus of the same row shape for a run
+# whose output is meant to be a better talker. See `data.yaml`.
+
+model:
+  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct
+  model_config:
+    modules: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train_talker/modules_train.yaml
+    train_graph: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train_talker/graph_train.yaml
+    infer_graph:
+      audio_output: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/graph_infer_audio.yaml
+      thinker_only: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/graph_infer_thinker_only.yaml
+    infer_type: audio_output
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      # Per-module overrides in `modules_train.yaml` turn this off for the four
+      # frozen thinker modules; only the talker recomputes.
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+
+  optimizer:
+    # Over the talker alone: the frozen modules have no trainable parameter, so
+    # `ModuleRuntime` gives them no optimizer at all.
+    type: adamw
+    lr: 1.0e-5
+    lr_min: 1.0e-6
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
+
+data:
+  data_type: seedomni
+  max_seq_len: 4096
+  train_path: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train_talker/data.yaml
+  datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  train_sample: 1000000
+  dataloader:
+    type: native
+    num_workers: 4
+    # Required, not merely tidy: the talker all-gathers its sharded layers once
+    # per utterance, so a short final batch would give the ranks different call
+    # counts. It raises rather than hangs, but the run still stops.
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 2
+  mm_configs:
+    use_audio_in_video: false
+    fps: 2.0
+    min_frames: 4
+    max_frames: 8
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 32
+  micro_batch_size: 1
+  # Same reason as `drop_last`: a data-dependent micro-batch size desynchronises
+  # the talker's per-rank utterance count.
+  dyn_bsz: false
+
+  checkpoint:
+    output_dir: outputs/qwen3omni_30b_a3b_talker_sft
+    save_steps: 500
+    save_epochs: 0
+    save_hf_weights: true
+    hf_save_steps: 500
+    hf_save_epochs: 0
+  wandb:
+    enable: true
+    project: VeOmni_omni
+    name: qwen3omni_30b_a3b_talker_sft
+
+infer:
+  generation_kwargs:
+    max_new_tokens: 2048
+    temperature: 0.0
+    top_p: 1.0
+    do_sample: false

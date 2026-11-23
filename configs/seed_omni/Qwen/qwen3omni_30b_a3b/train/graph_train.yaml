@@ -1,0 +1,16 @@
+# Qwen3-Omni thinker training DAG — omni understanding SFT (A/I/V/T -> T).
+#
+# Flat list of edges; each endpoint is a self-describing `module[.method]`
+# string (bare module -> `.forward`). Active nodes derived from endpoints:
+#
+#   {qwen3omni_audio, qwen3omni_vision, qwen3omni_text_encoder.encode}
+#       -> qwen3omni_llm -> qwen3omni_text_encoder.decode -> end
+#
+# The talker and codec are absent on purpose: this trains the thinker only.
+# Talker training needs (text, audio-code) pairs, which is a separate graph
+# built on `qwen3omni_codec.encode_wav` as the audio tokenizer.
+- { from: qwen3omni_audio,                to: qwen3omni_llm }                  # speech/sound embeds -> carrier
+- { from: qwen3omni_vision,               to: qwen3omni_llm }                  # image/video embeds -> carrier
+- { from: qwen3omni_text_encoder.encode,  to: qwen3omni_llm }                  # chat-template tokenise + wte
+- { from: qwen3omni_llm,                  to: qwen3omni_text_encoder.decode }  # text CE head
+- { from: qwen3omni_text_encoder.decode,  to: end }

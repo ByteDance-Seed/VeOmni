@@ -131,6 +131,7 @@ seed_omni/models/cosmos3.md
 seed_omni/models/janus.md
 seed_omni/models/qwen3.md
 seed_omni/models/qwen3_moe.md
+seed_omni/models/qwen3omni.md
 seed_omni/models/qwen3vl.md
 seed_omni/models/bagel.md
 ```

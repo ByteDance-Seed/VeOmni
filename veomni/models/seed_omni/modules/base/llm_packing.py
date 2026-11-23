@@ -34,7 +34,7 @@ from veomni.distributed.parallel_state import get_parallel_state
 from veomni.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 from veomni.utils.tensor_utils import naflatten
 
-from ...utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
+from ...utils.conversation import _OMNI_TOKEN_LEN, ConversationItem, is_backbone_input
 
 
 def item_value_2d(item: ConversationItem) -> Any:
@@ -77,7 +77,7 @@ def conversation_metadata(
     for sample in conversations:
         sample_length = 0
         for item in sample:
-            if item.is_dummy:
+            if not is_backbone_input(item):
                 continue
             length = item_token_len(item)
             mask = item.meta.get("attention_mask")
@@ -103,7 +103,7 @@ def pack_llm_conversations_for_forward(
     Returns ``(inputs_embeds, attention_mask, position_ids, inputs_embeds_shape)``
     with batch dim 0 when the packed sample is a single varlen sequence.
     """
-    values = [item_value_2d(item).to(device) for sample in conversations for item in sample if not item.is_dummy]
+    values = [item_value_2d(item).to(device) for sample in conversations for item in sample if is_backbone_input(item)]
     position_ids, attention_mask, _ = conversation_metadata(conversations, device)
     inputs_embeds, inputs_embeds_shape = naflatten(values)
     if inputs_embeds.dim() == 2:
@@ -115,15 +115,19 @@ def scatter_llm_hidden_states(
     conversation_list: list[list[ConversationItem]],
     hidden_states_list: Sequence[torch.Tensor],
 ) -> None:
-    """Write unflattened backbone hidden states back onto non-dummy conversation segments."""
+    """Write unflattened backbone hidden states back onto packed conversation segments.
+
+    Pairs rows to tensors by position, so it must skip exactly the rows the
+    packer skipped — see :func:`~...utils.conversation.is_backbone_input`.
+    """
     hidden_states_list_iter = iter(hidden_states_list)
     for sample in conversation_list:
         for part in sample:
-            if part.is_dummy:
+            if not is_backbone_input(part):
                 continue
             part.value = next(hidden_states_list_iter)
     if next(hidden_states_list_iter, None) is not None:
-        raise RuntimeError("scatter_llm_hidden_states: segment count exceeds non-dummy conversation items.")
+        raise RuntimeError("scatter_llm_hidden_states: segment count exceeds packed conversation items.")
 
 
 class SimpleArGenerationMixin:

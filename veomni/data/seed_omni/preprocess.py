@@ -133,6 +133,128 @@ def voice_assistant_preprocess(conversations, example, **kwargs):
     return constructed, {"audio": audio_refs}
 
 
+@SEED_OMNI_PREPROCESSOR_REGISTRY.register("voice_assistant_talker")
+def voice_assistant_talker_preprocess(conversations, example, **kwargs):
+    """Text question -> spoken answer: the shape talker training needs.
+
+    The assistant turn carries **both** its text and its speech. Both are
+    required and they are not interchangeable: the talker is taught to say this
+    text, so the text is the content of the speech span, while the waveform is
+    the label the RVQ codes are derived from. A row with only one of them is not
+    a training pair.
+
+    Order within the turn is deliberate — text first. The waveform is held out
+    of the thinker's packed sequence entirely (see ``qwen3omni/carrier.py``), so
+    it takes no position in the conversation and only the codec reads it; the
+    chat template defers it to the tail of the sample.
+
+    Produced by `scripts/seed_omni/qwen3omni_build_talker_corpus.py`, which
+    records the model answering out loud. That makes it self-distilled: useful
+    for bringing the round up and for overfitting a sample, not for a run whose
+    output is meant to be a better talker than the checkpoint it came from.
+    """
+    del kwargs
+    audio_refs = list(example.get("audios", []) or [])
+
+    constructed = []
+    spoken = 0
+
+    for message in conversations:
+        if message["from"] == "human":
+            constructed.append(["user", ("text", message["value"])])
+        elif message["from"] == "gpt":
+            constructed.append(["assistant", ("text", message["value"]), ("audio", None)])
+            spoken += 1
+        else:
+            raise ValueError(f"voice_assistant_talker: unexpected speaker {message['from']!r}")
+
+    if spoken != len(audio_refs):
+        raise ValueError(
+            f"voice_assistant_talker: sample has {spoken} spoken assistant turn(s) but {len(audio_refs)} clip(s); "
+            f"they are paired by position, so an unequal count would attach the wrong speech to the wrong text."
+        )
+    if not spoken:
+        raise ValueError(
+            "voice_assistant_talker: sample carries no assistant turn to speak. Every sample needs one — the "
+            "talker all-gathers its sharded layers once per utterance, so a partly-speech mix would give the "
+            "ranks different call counts."
+        )
+    return constructed, {"audio": audio_refs}
+
+
+@SEED_OMNI_PREPROCESSOR_REGISTRY.register("voice_assistant_talker_omni")
+def voice_assistant_talker_omni_preprocess(conversations, example, **kwargs):
+    """Omni question -> spoken answer: every Qwen3-Omni module on the same sample.
+
+    Same assistant side as ``voice_assistant_talker`` — text plus the waveform
+    the RVQ targets come from — with the user side carrying an image and a
+    spoken turn as well as text. That is the one shape where all six modules do
+    real work at once: audio tower on the user's clip, vision tower on the
+    image, backbone on the joined sequence, codec on the assistant's clip, and
+    the talker on the codes.
+
+    Both audio turns are ``type="audio"`` and only ``role`` separates them, so
+    ``audios`` is ordered user-first to match the turn order — they are paired
+    by position, and swapping them would feed the assistant's speech to the
+    encoder and train the talker on the question.
+
+    ``images`` may be empty (an audio+text row); the user turn then carries no
+    image placeholder. ``audios`` may hold one clip (assistant only) or two.
+    """
+    del kwargs
+    audio_refs = list(example.get("audios", []) or [])
+    image_refs = list(example.get("images", []) or [])
+    has_user_audio = bool(example.get("user_audio", False))
+
+    constructed = []
+    # Counted while building rather than derived afterwards: the placeholders are
+    # what gets paired with the refs by position, so counting anything else
+    # (turns, roles) is a restatement of the layout that can disagree with it.
+    spoken = 0
+    n_image_slots = 0
+    n_audio_slots = 0
+    for message in conversations:
+        if message["from"] == "human":
+            turn = ["user"]
+            if image_refs:
+                turn.append(("image", None, {_IMG_TAG_KEY: "und"}))
+                n_image_slots += 1
+            if has_user_audio:
+                turn.append(("audio", None))
+                n_audio_slots += 1
+            turn.append(("text", message["value"]))
+            constructed.append(turn)
+        elif message["from"] == "gpt":
+            constructed.append(["assistant", ("text", message["value"]), ("audio", None)])
+            n_audio_slots += 1
+            spoken += 1
+        else:
+            raise ValueError(f"voice_assistant_talker_omni: unexpected speaker {message['from']!r}")
+
+    if n_audio_slots != len(audio_refs):
+        raise ValueError(
+            f"voice_assistant_talker_omni: sample lays out {n_audio_slots} audio placeholder(s) "
+            f"({spoken} spoken assistant turn(s)"
+            f"{f', {n_audio_slots - spoken} user turn(s)' if has_user_audio else ''}) "
+            f"but carries {len(audio_refs)} clip(s); they are paired by position, so an unequal count would "
+            f"attach the wrong speech to the wrong turn — and could feed the talker's target to the encoder. "
+            f"A multi-turn row lands here: this layout puts a user clip on every human turn."
+        )
+    if n_image_slots != len(image_refs):
+        raise ValueError(
+            f"voice_assistant_talker_omni: sample lays out {n_image_slots} image placeholder(s) but carries "
+            f"{len(image_refs)}. One image per human turn is the layout, so a row with several images, or "
+            f"several human turns, needs its own preprocessor rather than a silent positional shift."
+        )
+    if not spoken:
+        raise ValueError(
+            "voice_assistant_talker_omni: sample carries no assistant turn to speak. Every sample needs one — "
+            "the talker all-gathers its sharded layers once per utterance, so a partly-speech mix would give "
+            "the ranks different call counts."
+        )
+    return constructed, {"image": image_refs, "audio": audio_refs}
+
+
 def _sharegpt4v_sft_layout(conversations):
     role_mapping = {"human": "user", "gpt": "assistant"}
     constructed_conversation = []

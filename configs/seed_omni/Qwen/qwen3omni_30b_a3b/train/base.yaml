@@ -1,0 +1,127 @@
+# VeOmni training / inference config for OmniModel V2 — Qwen3-Omni-30B-A3B-Instruct.
+#
+# Prerequisite — split the upstream checkpoint. Qwen3-Omni ships no audio
+# tokenizer, so the codec's encoder half comes from a second checkpoint:
+#   python scripts/convert_model.py \
+#     --model_path /mnt/hdfs/veomni/models/Qwen/Qwen3-Omni-30B-A3B-Instruct \
+#     --output_dir /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct \
+#     --extra mimi_path=/mnt/hdfs/veomni/models/kyutai/mimi
+#
+# Produces six module sub-folders under model.model_path (audio / vision /
+# text_encoder / llm / talker / codec).
+#
+# Speech output (single-process eager, one GPU):
+#   python tasks/omni/infer_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/base.yaml \
+#     --model.model_config.modules configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/modules_infer_eager.yaml \
+#     --model.model_config.infer_type audio_output \
+#     --infer.prompt "Hello! Please say this sentence out loud." \
+#     --infer.output_dir qwen3omni_out
+#
+# Text reply only, talker not run: --model.model_config.infer_type thinker_only
+#
+# Launch thinker training (omni understanding SFT):
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/base.yaml
+
+model:
+  model_path: /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct
+  model_config:
+    modules: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/modules_train.yaml
+    train_graph: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/graph_train.yaml
+    infer_graph:
+      audio_output: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/graph_infer_audio.yaml
+      thinker_only: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/graph_infer_thinker_only.yaml
+    infer_type: audio_output
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        # Off, because what FSDP2 would cast depends on where the wrap
+        # boundaries fall. Under `fsdp_scope: module` the boundary is each
+        # module, so the backbone's TMRoPE `position_ids` — float, running up
+        # to `max_seq_len` — arrive as bf16, which at 4096 resolves only 769
+        # distinct values (up to 8 token positions of error) and at 16384 only
+        # 1025 (32 positions). Under `fsdp_scope: model` the boundary is the
+        # `OmniModel` entry and it is the carrier's raw mel/patch tensors
+        # instead. Every module casts inside its own `forward` off the real
+        # weight dtype, which is also the only place that reads bf16 rather
+        # than the fp32 master shard.
+        cast_forward_inputs: false
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_min: 1.0e-6
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
+
+data:
+  data_type: seedomni
+  max_seq_len: 4096
+  train_path: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train/data.yaml
+  datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  train_sample: 1000000
+  dataloader:
+    type: native
+    num_workers: 4
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 2
+  mm_configs:
+    # Qwen3-Omni can consume a video's audio track, but the modules reject it
+    # for now (see the guard in the vision preprocessor), so decode video
+    # without audio and feed speech as its own `type="audio"` item.
+    use_audio_in_video: false
+    fps: 2.0
+    min_frames: 4
+    max_frames: 8
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 32
+  micro_batch_size: 1
+  dyn_bsz: false
+
+  checkpoint:
+    output_dir: outputs/qwen3omni_30b_a3b_omni_sft
+    save_steps: 500
+    save_epochs: 0
+    save_hf_weights: true
+    hf_save_steps: 500
+    hf_save_epochs: 0
+  wandb:
+    enable: true
+    project: VeOmni_omni
+    name: qwen3omni_30b_a3b_omni_sft
+
+infer:
+  generation_kwargs:
+    max_new_tokens: 2048
+    temperature: 0.0
+    top_p: 1.0
+    do_sample: false
