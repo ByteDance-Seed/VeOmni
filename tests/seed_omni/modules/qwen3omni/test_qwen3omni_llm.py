@@ -403,30 +403,48 @@ def test_a_single_sample_batch_gets_an_explicit_causal_mask():
     vision span and jumps after it — so the row reads as several sequences, and
     the resulting mask indexes past the row count. The wrapper supplies an
     explicit mask for exactly that shape.
-    """
-    import inspect
 
+    Asserted on behaviour, not on the source: the point is that the forward runs
+    and its result does not depend on the mask the backend would have derived.
+    """
     from veomni.models.utils.mask_utils import _should_use_packed_mask
 
     module = _accelerated_llm()
-    sample = [_text(3), _text(4)]
+    sample = _text_sample(module, [3, 4])
     inputs = module.pre_forward(method="forward", conversation_list=[sample])
 
     # The shape really is the declined one — otherwise this test proves nothing.
     assert inputs["cu_seq_lens_q"].numel() == 2
     assert not _should_use_packed_mask(inputs["cu_seq_lens_q"], "eager", 1)
-    # ...and that is exactly the shape the wrapper answers with its own mask.
-    from veomni.models.seed_omni.modules.qwen3omni.llm.modeling import Qwen3OmniLlm
 
-    assert "cu.numel()) == 2" in inspect.getsource(Qwen3OmniLlm.forward)
     # The backend's own heuristic misreads a TMRoPE row containing a vision span
-    # (it repeats there, then jumps) — that is the case this mask guards. A
-    # text-only row is contiguous and needs no guard, which is why the branch is
-    # keyed on the segment count rather than on positions.
+    # (it repeats there, then jumps) — that is the case the explicit mask guards.
     from transformers.masking_utils import find_packed_sequence_indices
 
     tmrope_with_vision = torch.tensor([[0.0, 1.0, 2.0, 3.0, 3.0, 3.0, 5.0, 6.0]])
     assert find_packed_sequence_indices(tmrope_with_vision) is not None
+
+    # ...and the wrapper answers it with a mask of the packed row's own width, so
+    # the backend never runs that heuristic. A mask of the wrong length is exactly
+    # what made this raise, so its shape is the observable.
+    seen: dict[str, object] = {}
+    real_forward = module.language_model.forward
+
+    def spy(*args, **kwargs):
+        seen["attention_mask"] = kwargs.get("attention_mask")
+        return real_forward(*args, **kwargs)
+
+    module.language_model.forward = spy
+    try:
+        with torch.no_grad():
+            module.forward(**inputs)
+    finally:
+        del module.language_model.forward
+
+    mask = seen["attention_mask"]
+    assert mask is not None, "the backend would derive the mask from TMRoPE positions and misread them"
+    assert mask.shape == (1, inputs["inputs_embeds"].size(1))
+    assert mask.all()
 
 
 def test_generate_refuses_sequence_parallelism():

@@ -53,6 +53,9 @@ export WANDB_MODE=${WANDB_MODE:-offline}
 
 STEPS=${STEPS:-2}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-16}
+# Qwen3-Omni's speech graph spends tokens on the thinking phase before the talker
+# even starts, so the shared cap is too small for it; see the qwen3omni phase.
+QWEN3OMNI_MAX_NEW_TOKENS=${QWEN3OMNI_MAX_NEW_TOKENS:-256}
 OUT=${OUT:-/tmp/seed_omni_smoke}
 SKIP_TRAIN=${SKIP_TRAIN:-0}
 SKIP_INFER=${SKIP_INFER:-0}
@@ -116,11 +119,13 @@ train_overrides() {
         --train.checkpoint.hf_save_epochs 0"
 }
 
-# Common inference overrides: short generation, scratch output dir.
+# Common inference overrides: short generation, scratch output dir. ``tokens``
+# is an argument rather than the global because Qwen3-Omni's speech graph needs a
+# larger budget than a text reply (see its phase below).
 infer_overrides() {
-  local outdir="$1"
+  local outdir="$1" tokens="${2:-$MAX_NEW_TOKENS}"
   echo "--infer.output_dir $outdir \
-        --infer.generation_kwargs.max_new_tokens $MAX_NEW_TOKENS"
+        --infer.generation_kwargs.max_new_tokens $tokens"
 }
 
 # Each family's launcher, by the directory it ships under. The size is a
@@ -155,7 +160,9 @@ run_train() {
 # Inference is model-specific: scenario, eager vs distributed, image vs text.
 run_infer() {
   local name="$1" outdir="$2" log="$3"
-  local common; common=$(infer_overrides "$outdir/infer")
+  local tokens="$MAX_NEW_TOKENS"
+  [[ "$name" == "qwen3omni" ]] && tokens="$QWEN3OMNI_MAX_NEW_TOKENS"
+  local common; common=$(infer_overrides "$outdir/infer" "$tokens")
   case "$name" in
     janus)
       # Distributed (FSDP2 + emb-parallel) text-to-image generation.
@@ -199,6 +206,15 @@ run_infer() {
       # Speech output, eager on one device: the talker's sampling loop mixes
       # pad_token_id with next_tokens without a device cast, so a multi-GPU
       # "auto" split dies on a cuda:0/cuda:N mismatch.
+      #
+      # The shared $common caps generation at $MAX_NEW_TOKENS, which is the wrong
+      # budget here: this graph runs prompt_encode -> text_ar -> talker_bridge ->
+      # talker_ar -> vocode, so the thinking phase alone consumes the tokens and
+      # the FSM ends after `vocode`'s *first* enter -- which raises no signal, so
+      # `generate` returns normally with a text reply and **no waveform**. Treating
+      # the exit code as the verdict would report PASS for a run that produced no
+      # audio, so the audio is what gets checked, and the cap is raised enough for
+      # the thinker to finish a short sentence.
       # shellcheck disable=SC2046
       run_logged "$log" python "$INFER_PY" "${CONFIG[$name]}" \
         --model.model_path "$QWEN3OMNI_CKPT" \
@@ -206,6 +222,13 @@ run_infer() {
         --model.model_config.infer_type audio_output \
         --infer.prompt "Hello! Please say this sentence out loud." \
         $common
+      rc=$?
+      if [[ $rc -eq 0 ]] && ! compgen -G "$outdir/infer/*.wav" >/dev/null; then
+        # Exit code alone is not evidence for this graph: see the comment above.
+        echo "FAIL: speech graph produced no .wav (generation stopped before vocode)" | tee -a "$log"
+        return 1
+      fi
+      return $rc
       ;;
     qwen3moe)
       # Distributed (FSDP2 + Expert-Parallel) text inference (eager would OOM at 30B).
