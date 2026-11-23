@@ -291,6 +291,37 @@ def test_async_offload_rejects_cpu_tensors():
     assert not base_check_fn(torch.ones(4))
 
 
+class _FakeEvent:
+    """Minimal stand-in for the device events the swap path records and waits on."""
+
+    def __init__(self):
+        self.recorded = 0
+        self.synced = 0
+
+    def record(self):
+        self.recorded += 1
+
+    def synchronize(self):
+        self.synced += 1
+
+
+class _FakeStream:
+    """Stand-in for a swap stream: only ``wait_event`` is touched."""
+
+    def wait_event(self, _event):
+        pass
+
+
+def _patch_swap_stream(monkeypatch):
+    """Route event creation and stream switching to the stand-ins above."""
+    from contextlib import nullcontext
+
+    from veomni.distributed import async_offload
+
+    monkeypatch.setattr(async_offload, "create_event", _FakeEvent)
+    monkeypatch.setattr(async_offload, "switch_to_specified_stream", lambda _stream: nullcontext())
+
+
 def test_deferred_free_requires_an_allocator_owned_storage(monkeypatch):
     """``_deferred_free_supported`` accepts only storage the native allocator actually owns.
 
@@ -348,29 +379,11 @@ def test_launch_d2h_gates_record_stream_on_deferred_free(monkeypatch):
     cases cover both decisions: unsupported allocator, foreign storage on the
     native allocator, and allocator-owned storage.
     """
-    from contextlib import nullcontext
-
     import numpy as np
 
     from veomni.distributed import async_offload
 
-    class _FakeEvent:
-        def __init__(self):
-            self.recorded = 0
-            self.synced = 0
-
-        def record(self):
-            self.recorded += 1
-
-        def synchronize(self):
-            self.synced += 1
-
-    class _FakeStream:
-        def wait_event(self, _event):
-            pass
-
-    monkeypatch.setattr(async_offload, "create_event", _FakeEvent)
-    monkeypatch.setattr(async_offload, "switch_to_specified_stream", lambda _stream: nullcontext())
+    _patch_swap_stream(monkeypatch)
 
     recorded_streams = []
     monkeypatch.setattr(
@@ -422,26 +435,9 @@ def test_release_host_buffer_syncs_abandoned_d2h_without_deferred_free(monkeypat
     the deferred path (``record_stream`` pinned the storage) must not, because the
     pool's reused buffer carries the event tag instead.
     """
-    from contextlib import nullcontext
-
     from veomni.distributed import async_offload
 
-    class _FakeEvent:
-        def __init__(self):
-            self.synced = 0
-
-        def record(self):
-            pass
-
-        def synchronize(self):
-            self.synced += 1
-
-    class _FakeStream:
-        def wait_event(self, _event):
-            pass
-
-    monkeypatch.setattr(async_offload, "create_event", _FakeEvent)
-    monkeypatch.setattr(async_offload, "switch_to_specified_stream", lambda _stream: nullcontext())
+    _patch_swap_stream(monkeypatch)
     monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, _s: None)
 
     stream = _FakeStream()
