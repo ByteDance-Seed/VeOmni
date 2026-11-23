@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from torch import Tensor
 
+from ....activation import supported_activations, supports
 from ....qat import FP4_BLOCK_SIZE, fp4_fake_quant_weight, fp8_fake_quant_act, fp8_fake_quant_stacked_weight
 from . import triton as standard_triton
 
@@ -102,13 +103,28 @@ def wrapper(
     assume_distinct_experts: bool = False,
     block_size: int = 128,
     expert_dtype: str = "fp8",
+    activation: str = "silu",
 ) -> Tensor:
     """Run fused MoE experts with fake-quantized activations and expert weights.
 
     Empty weight tensors denote unused layouts and are passed through. Routing
     weights are not quantized: they decide which experts run, so rounding them
     would change the selection, not just the arithmetic.
+
+    Refuses an activation this row cannot evaluate, before quantizing anything. The
+    reference rows fall back to the model's own ``act_fn`` for a name outside
+    ``veomni.ops.activation``, but a quantizing row cannot: it would round nothing
+    while the config still claimed QAT. ``gated_mlp``'s quantizing rows refuse on the
+    same grounds, so both families fail at the same place with the same advice.
     """
+    if not supports(activation):
+        raise ValueError(
+            f"moe_implementation='qat' cannot run on hidden_act={activation!r}: it "
+            f"fake-quantizes the expert GEMMs, and falling back to the model's own "
+            f"``act_fn`` would train them at full precision. Use an activation "
+            f"{sorted(supported_activations())}, or moe_implementation='eager' to keep "
+            f"the reference path."
+        )
 
     hidden_q, fc1_1_q, fc1_2_q, fc2_q, fc1_1_2_q = quantize_expert_operands(
         hidden_states,
@@ -130,4 +146,5 @@ def wrapper(
         num_experts=num_experts,
         swiglu_limit=swiglu_limit,
         assume_distinct_experts=assume_distinct_experts,
+        activation=activation,
     )

@@ -1192,7 +1192,7 @@ def tiny_kimi_k3_config(architecture: str = "KimiK3ForConditionalGeneration") ->
     """
     from pathlib import Path
 
-    from veomni.models.transformers.kimi_k3.source.configuration_kimi_k3 import KimiK3Config
+    from veomni.models.transformers.kimi_k3.configuration_kimi_k3 import KimiK3Config
 
     toy_dir = Path(__file__).resolve().parents[1] / "toy_config" / "kimi_k3_toy"
     config = KimiK3Config.from_pretrained(str(toy_dir))

@@ -30,7 +30,7 @@ import torch
 from PIL import Image
 
 from veomni.data.data_transform import process_sample_kimi_k3
-from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import tpool_patch_merger
+from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import tpool_patch_merger
 
 
 MEDIA_END_ID = 9

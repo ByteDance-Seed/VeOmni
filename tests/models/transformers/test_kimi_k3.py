@@ -61,7 +61,7 @@ from tests.models.tiny_configs import (
 from veomni.arguments import AcceleratorConfig
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state_from_config
 from veomni.models.auto import build_foundation_model
-from veomni.models.transformers.kimi_k3.generated.patched_modeling_kimi_k3_gpu import (
+from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import (
     _shard_dim0_offset_length,
 )
 from veomni.ops.registry import VeomniOp
@@ -538,27 +538,6 @@ def test_packed_forward_forwards_collator_coalesced_tail_pads(dense_packed_debug
     assert torch.equal(recorded["position_ids"], position_ids)
 
 
-def test_kda_module_matches_source_layout():
-    """The patched KDA ``__init__`` is a full-body override (patchgen has no
-    init-append mechanism); pin that it still constructs the same parameters
-    as the vendored source module so silent source drift is caught."""
-    from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import (
-        KimiDeltaAttention as SourceKDA,
-    )
-
-    model = _build_model()
-    patched_cls = type(model.language_model.model.layers[1].self_attn)
-    assert patched_cls is not SourceKDA
-    config = model.config.text_config
-    source = SourceKDA(config, layer_idx=1)
-    patched = patched_cls(config, layer_idx=1)
-    source_state = source.state_dict()
-    patched_state = patched.state_dict()
-    assert set(source_state) == set(patched_state)
-    for key, tensor in source_state.items():
-        assert tensor.shape == patched_state[key].shape, key
-
-
 def test_use_cache_forward_matches_no_cache_logits():
     """A one-step ``use_cache=True`` forward goes through the 5.16.1 cache
     contract (the mask builder calls ``get_query_offset`` /
@@ -644,7 +623,7 @@ def test_position_id_func_is_picklable():
     pickle round-trip and keep the arange-stub behaviour."""
     import pickle
 
-    from veomni.models.transformers.kimi_k3.generated.patched_modeling_kimi_k3_gpu import (
+    from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import (
         _kimi_k3_position_ids,
     )
 
@@ -678,7 +657,7 @@ def test_vlm_attention_override_preserves_child_selections():
     suite's cpu_model_attention_kernel_guard forbids FlashAttention
     preloading under CPU launch plans, and HF's preload path fires before
     any registry row, so even a mocked row would not construct."""
-    from veomni.models.transformers.kimi_k3.generated.patched_modeling_kimi_k3_gpu import (
+    from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import (
         KimiK3ForConditionalGeneration,
     )
 
@@ -749,44 +728,18 @@ def test_short_convolution_reuses_hoisted_host_boundaries():
     torch.testing.assert_close(y_host_tensor, y_ref)
 
 
-def test_source_kda_module_forward_runs():
-    """The vendored source must stay runnable on its own: its package
-    docstring is the re-sync reference, and the round-3 review caught call
-    sites left behind after their definitions moved to the patch layer
-    (``SourceKDA(...)(x)`` raised ``AttributeError`` at forward). This
-    exercises the module-level eager ``chunk_kda`` reference call site (and
-    the eager ShortConvolution / FusedRMSNormGated imports) end to end."""
-    from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import (
-        KimiDeltaAttention as SourceKDA,
-    )
+def test_decoder_layer_forward_runs():
+    """The KimiDecoderLayer runs end-to-end standalone. The
+attention-residual block packing is threaded with the production shape the
+model uses -- a (num_tokens, 0, hidden) zero tensor that each
+block-boundary layer appends to -- spanning both attention families and
+both feed paths: KDA+dense-MLP, KDA+MoE, and MLA+MoE layers."""
+    from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import KimiDecoderLayer as DecoderLayer
 
     config = _tiny_config().text_config
-    torch.manual_seed(0)
-    module = SourceKDA(config, layer_idx=1).eval()
-    for p in module.parameters():
-        torch.nn.init.normal_(p, std=0.02)
-    hidden_states = torch.randn(1, 32, config.hidden_size)
-    with torch.no_grad():
-        out = module(hidden_states)
-    assert out.shape == hidden_states.shape
-    assert torch.isfinite(out).all()
-
-
-def test_source_decoder_layer_forward_runs():
-    """The vendored KimiDecoderLayer runs end-to-end standalone, covering
-    the decoder half of the round-3 drift class (a definition moved to the
-    patch layer while its call site stayed in source/, raising
-    ``AttributeError`` only at forward -- construction-only tests cannot
-    see it). The attention-residual block packing is threaded with the
-    production shape the model uses -- a (num_tokens, 0, hidden) zero
-    tensor that each block-boundary layer appends to -- spanning both
-    attention families and both feed paths: KDA+dense-MLP, KDA+MoE, and
-    MLA+MoE layers."""
-    from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import (
-        KimiDecoderLayer as SourceDecoderLayer,
-    )
-
-    config = _tiny_config().text_config
+    # All-eager rows: the raw module is exercised outside build_foundation_model,
+    # so stamp the eager selection the builder would have applied.
+    config.ops_implementation.update(vars(eager_ops_config()))
     config._attn_implementation = "eager"
     torch.manual_seed(0)
     hidden_states = torch.randn(1, 32, config.hidden_size)
@@ -794,7 +747,7 @@ def test_source_decoder_layer_forward_runs():
     # chain starting from an empty block list (KimiLinearModel.forward)
     block_residual = hidden_states.new_zeros(hidden_states.shape[0] * hidden_states.shape[1], 0, config.hidden_size)
     for layer_idx in (0, 1, 3):
-        module = SourceDecoderLayer(config, layer_idx=layer_idx).eval()
+        module = DecoderLayer(config, layer_idx=layer_idx).eval()
         for p in module.parameters():
             torch.nn.init.normal_(p, std=0.02)
         with torch.no_grad():
@@ -1067,7 +1020,7 @@ def _shard_ones(vocab, mesh, rank):
 def _pad_row_worker(rank, rendezvous):
     from torch.distributed.device_mesh import DeviceMesh
 
-    from veomni.models.transformers.kimi_k3.generated.patched_modeling_kimi_k3_gpu import (
+    from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import (
         _zero_embedding_padding_row,
     )
 
@@ -1131,7 +1084,7 @@ def test_init_weights_padding_row_zeroed_on_shard(tmp_path):
 
 
 def test_zero_embedding_padding_row_plain_tensor():
-    from veomni.models.transformers.kimi_k3.generated.patched_modeling_kimi_k3_gpu import (
+    from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import (
         _zero_embedding_padding_row,
     )
 
@@ -1185,7 +1138,7 @@ def test_init_weights_reinits_o_norm_and_vision_pos_emb():
     model._init_weights(pos_emb)
     assert torch.isfinite(pos_emb.weight).all() and pos_emb.weight.abs().sum() > 0
 
-    # FusedRMSNormGated is shared with the generated modules (they import it
+    # FusedRMSNormGated is shared with the modeling module (it imports it
     # from the ops-tree eager reference), so a standalone instance dispatches.
     o_norm = FusedRMSNormGated(8)
     o_norm.weight.data.fill_(float("nan"))
@@ -1265,7 +1218,7 @@ def test_moe_rejects_unsupported_activation():
 def test_get_seq_length_with_no_full_attention_layers():
     """A configuration with no full-attention layer has nothing cached:
     get_seq_length must return 0 instead of indexing an empty list."""
-    from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import KimiDynamicCache
+    from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import KimiDynamicCache
 
     cache = KimiDynamicCache.__new__(KimiDynamicCache)
     cache.transformer_layers = []
@@ -1277,9 +1230,7 @@ def test_vision_attention_registry_rows_match_dispatch_dict():
     """The vision_attention op family must cover exactly the tower's vendored
     dispatch dict (round-3 review: the vision tower was the one attention site
     with no kernel abstraction)."""
-    from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import (
-        VL_VISION_ATTENTION_FUNCTIONS,
-    )
+    from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import VL_VISION_ATTENTION_FUNCTIONS
     from veomni.ops.registry import OP_REGISTRY
 
     registered = set(OP_REGISTRY.list_registered("vision_attention", "kimi_k3"))
@@ -1296,9 +1247,7 @@ def test_vision_tower_dispatches_through_bound_op_handle():
         assert isinstance(blk.veomni_vision_attn, VeomniOp)
         assert blk.veomni_vision_attn.impl == "eager"
 
-    from veomni.models.transformers.kimi_k3.source.modeling_kimi_k3 import (
-        VL_VISION_ATTENTION_FUNCTIONS,
-    )
+    from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import VL_VISION_ATTENTION_FUNCTIONS
 
     grids = [[1, 4, 4], [1, 2, 2], [2, 2, 2]]
     grid_thws = torch.tensor(grids)
@@ -1352,7 +1301,7 @@ def test_vision_flash_row_fails_at_construction_without_flash_attn(monkeypatch):
     # the op row itself declares its flash_attn package requirement
     with pytest.raises(RuntimeError, match="flash_attn"):
         VeomniOp("vision_attention", "kimi_k3", "flash_attention_2")
-    from veomni.models.transformers.kimi_k3.generated.patched_modeling_kimi_k3_gpu import (
+    from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import (
         KimiK3ForConditionalGeneration,
     )
 

@@ -38,7 +38,6 @@ K3-specific operators need extra packages (inside the container):
 
 ```bash
 pip install transformers==5.16.1
-pip install -e patchgen-pkg --no-build-isolation
 pip install ruff==0.13.2 pytest expecttest rich
 # KDA AscendC kernels (chunked KDA fwd/bwd): local build of fla-npu; its
 # setup.py also builds and installs the AscendC OPP custom-op pack (needs
@@ -350,10 +349,6 @@ K3-specific behavior to know when writing configs or custom data pipelines:
    to have finished reduction in the prior iteration`). FSDP2's flat-
    parameter resharding is unaffected.
 
-Model code is patchgen-managed — never edit files under `generated/` by
-hand:
-
-```bash
-make patchgen          # regenerate patchgen configs
-make check-patchgen    # CI gate: generated files up to date
-```
+Model code is a standalone module — edit
+`veomni/models/transformers/kimi_k3/modeling_kimi_k3.py` directly (the same
+layout every VeOmni family uses; there is no generation step).

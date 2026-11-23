@@ -55,6 +55,7 @@ hardware_support/precision_analysis.md
 hardware_support/profiling_analysis.md
 hardware_support/AscendDockerUsage/build_a2_docker.md
 hardware_support/AscendDockerUsage/build_a3_docker.md
+hardware_support/AscendDockerUsage/build_a5_docker.md
 hardware_support/AscendDockerUsage/overview.md
 hardware_support/AscendDockerUsage/supported_tags.md
 hardware_support/FAQ.md
@@ -121,12 +122,15 @@ seed_omni/mixins/module_preprocessor.md
 seed_omni/mixins/metric_meter.md
 seed_omni/mixins/offline_encoding.md
 seed_omni/mixins/configure_optimizer.md
+seed_omni/mixins/module_rng_state.md
 ```
 
 ```{toctree}
 :maxdepth: 1
 :caption: SeedOmni Models
 
+seed_omni/models/cosmos3.md
+seed_omni/models/janus.md
 seed_omni/models/qwen3.md
 seed_omni/models/qwen3_moe.md
 seed_omni/models/qwen3vl.md
@@ -143,7 +147,6 @@ design/module_config.md
 design/fused_moe_ops.md
 design/deepgemm_fp8_moe.md
 design/local_parallel_state.md
-design/patchgen.md
 design/qwen4_exp_ple_2d_parallelism.md
 design/verl_topk_distill_integration.md
 design/deepseek_v4_context_parallel.md

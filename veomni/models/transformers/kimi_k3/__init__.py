@@ -12,36 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 @MODEL_CONFIG_REGISTRY.register("kimi_k3")
 def register_kimi_k3_config():
-    from .source.configuration_kimi_k3 import KimiK3Config
+    from .configuration_kimi_k3 import KimiK3Config
 
     return KimiK3Config
 
 
 @MODEL_CONFIG_REGISTRY.register("kimi_linear")
 def register_kimi_linear_config():
-    from .source.configuration_kimi_k3 import KimiLinearConfig
+    from .configuration_kimi_k3 import KimiLinearConfig
 
     return KimiLinearConfig
 
 
 def _load_kimi_k3_modeling():
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_kimi_k3_npu import (
-            KimiK3ForConditionalGeneration,
-            KimiLinearForCausalLM,
-            KimiLinearModel,
-        )
-    else:
-        from .generated.patched_modeling_kimi_k3_gpu import (
-            KimiK3ForConditionalGeneration,
-            KimiLinearForCausalLM,
-            KimiLinearModel,
-        )
+    from .modeling_kimi_k3 import (
+        KimiK3ForConditionalGeneration,
+        KimiLinearForCausalLM,
+        KimiLinearModel,
+    )
+
     return KimiK3ForConditionalGeneration, KimiLinearForCausalLM, KimiLinearModel
 
 
