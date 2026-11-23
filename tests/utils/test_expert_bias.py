@@ -12,19 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Auxiliary-loss-free expert bias update. CPU only, no distributed setup."""
+"""Auxiliary-loss-free expert bias update unit and multi-rank distributed tests."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.utils.device import get_device_type
 from veomni.utils.expert_bias import BIAS_ATTR, ExpertBiasUpdater
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+_CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 NUM_EXPERTS = 8
 TOP_K = 2
@@ -401,3 +404,62 @@ def test_dspark_config_with_its_own_expert_count_updates_every_router():
 
     assert torch.allclose(getattr(backbone_router, BIAS_ATTR), torch.tensor([9.9, 9.9, 0.1, 0.1]))
     assert torch.allclose(getattr(dspark_router, BIAS_ATTR), torch.tensor([9.9, 0.1]))
+
+
+def _distributed_expert_bias_worker() -> None:
+    rank = dist.get_rank()
+    device = torch.device(f"{get_device_type()}:{rank}") if dist.get_backend() != "gloo" else torch.device("cpu")
+
+    model = nn.Module()
+    model.router_a = ToyRouter(4)
+    model.router_b = ToyRouter(4)
+    model.to(device)
+
+    updater = ExpertBiasUpdater(update_rate=0.1)
+    assert updater.attach(model) == 2
+
+    # Step 1: opposing local loads on router_a (rank 0 heavier on 0,1; rank 1 only on 2,3 -> global [6, 6, 2, 2]).
+    # On router_b, only rank 0 sees traffic while rank 1 skips forward completely -> global [4, 0, 0, 0].
+    if rank == 0:
+        model.router_a.next_indices = torch.tensor([[0, 1]] * 6, dtype=torch.long, device=device)
+        model.router_a(torch.zeros(6, 4, device=device))
+        model.router_b.next_indices = torch.tensor([[0]] * 4, dtype=torch.long, device=device)
+        model.router_b(torch.zeros(4, 4, device=device))
+    else:
+        model.router_a.next_indices = torch.tensor([[2, 3]] * 2, dtype=torch.long, device=device)
+        model.router_a(torch.zeros(2, 4, device=device))
+
+    updater.step(group=dist.group.WORLD)
+
+    expected_a = torch.tensor([-0.1, -0.1, 0.1, 0.1], device=device)
+    expected_b = torch.tensor([-0.1, 0.1, 0.1, 0.1], device=device)
+    torch.testing.assert_close(model.router_a.e_score_correction_bias, expected_a, rtol=0, atol=1e-6)
+    torch.testing.assert_close(model.router_b.e_score_correction_bias, expected_b, rtol=0, atol=1e-6)
+
+    # Step 2: no traffic on any rank; biases must stay unchanged if counts were cleared.
+    updater.step(group=dist.group.WORLD)
+    torch.testing.assert_close(model.router_a.e_score_correction_bias, expected_a, rtol=0, atol=1e-6)
+    torch.testing.assert_close(model.router_b.e_score_correction_bias, expected_b, rtol=0, atol=1e-6)
+
+    # Step 3: only rank 1 routes router_b to expert 3 -> global [0, 0, 0, 4], delta [+0.1, +0.1, +0.1, -0.1].
+    if rank == 1:
+        model.router_b.next_indices = torch.tensor([[3]] * 4, dtype=torch.long, device=device)
+        model.router_b(torch.zeros(4, 4, device=device))
+    updater.step(group=dist.group.WORLD)
+
+    torch.testing.assert_close(model.router_a.e_score_correction_bias, expected_a, rtol=0, atol=1e-6)
+    torch.testing.assert_close(
+        model.router_b.e_score_correction_bias,
+        torch.tensor([0.0, 0.2, 0.2, 0.0], device=device),
+        rtol=0,
+        atol=1e-6,
+    )
+    dist.barrier()
+
+
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_2)
+def test_distributed_step_all_reduces_opposing_loads_and_idle_router():
+    """Verify step(group=...) reduces opposing local loads and idle routers identically across ranks."""
+    from tests.tools.launch_utils import torchrun
+
+    torchrun(_distributed_expert_bias_worker, world_size=_CI_ACCELERATOR_2.nproc)
