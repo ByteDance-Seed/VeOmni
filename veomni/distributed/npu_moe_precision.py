@@ -52,6 +52,7 @@ def validate_qwen4_experts(model):
     if any(
         getattr(getattr(module, "veomni_moe", None), "impl", None) != "fused_npu"
         or not is_silu(getattr(module, "activation", ""))
+        or not is_silu(getattr(module.veomni_moe, "kwargs", {}).get("activation", module.activation))
         for _, module in experts
     ):
         raise ValueError("NPU expert FP32 wgrad requires Qwen4-Exp SiLU fused_npu experts")
