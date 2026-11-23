@@ -1282,15 +1282,34 @@ class TestGramQuackFallback:
         assert muon_mod._gram_quack_unavailable_reason(grad) is None
 
 
+def test_moe_local_3d_newton_schulz_chunk_sizes_are_balanced_and_bounded():
+    """Chunking uses the fewest calls the workspace budget allows, with no tiny tail.
+
+    A fixed chunk size produces a single-expert call whenever ``experts % chunk ==
+    1``, which is a ``bmm`` launch with no batch efficiency. Balanced sizes keep
+    every call within one expert of the others and never exceed the budget.
+    """
+    from veomni.optim.muon import _MOE_LOCAL_3D_NS_MAX_EXPERTS, _expert_ns_chunk_sizes
+
+    for experts in range(1, 65):
+        sizes = _expert_ns_chunk_sizes(experts)
+        assert sum(sizes) == experts
+        assert max(sizes) <= _MOE_LOCAL_3D_NS_MAX_EXPERTS
+        assert all(later - earlier <= 1 for earlier, later in zip(sizes, sizes[1:])), (experts, sizes)
+        # Fewest calls the budget allows: dropping one call must overflow it.
+        if len(sizes) > 1:
+            assert -(-experts // (len(sizes) - 1)) > _MOE_LOCAL_3D_NS_MAX_EXPERTS, (experts, sizes)
+
+
 def test_moe_local_3d_newton_schulz_chunking_matches_a_whole_stack_call():
     """The 3D-expert NS chunk must be identical to one call on the whole stack.
 
-    The local expert stack is processed in groups of ``_MOE_LOCAL_3D_NS_CHUNK`` so
-    the Newton-Schulz workspace stops scaling with the local expert count. Dim 0
-    is a pure batch dim for ``batched_*_newton_schulz``, so the chunking only
-    changes the workspace.
+    The local expert stack is processed in balanced groups of at most
+    ``_MOE_LOCAL_3D_NS_MAX_EXPERTS`` so the Newton-Schulz workspace stops scaling
+    with the local expert count. Dim 0 is a pure batch dim for
+    ``batched_*_newton_schulz``, so the chunking only changes the workspace.
     """
-    from veomni.optim.muon import _MOE_LOCAL_3D_NS_CHUNK, _chunked_newton_schulz
+    from veomni.optim.muon import _chunked_newton_schulz
 
     torch.manual_seed(0)
     experts, rows, cols = 7, 4, 6
@@ -1317,8 +1336,7 @@ def test_moe_local_3d_newton_schulz_chunking_matches_a_whole_stack_call():
     torch.testing.assert_close(chunked, _ns(local))
     # Pins the workspace bound: without this the test would also pass if the
     # helper called ``ns`` once on all seven experts.
-    assert shapes == [(3, rows, cols), (3, rows, cols), (1, rows, cols)]
-    assert experts % _MOE_LOCAL_3D_NS_CHUNK == 1, "the final chunk is meant to hold a single expert"
+    assert shapes == [(3, rows, cols), (2, rows, cols), (2, rows, cols)]
 
 
 def test_moe_local_3d_newton_schulz_handles_a_tall_expert_stack():
@@ -1367,15 +1385,14 @@ def test_moe_local_3d_newton_schulz_preserves_dtype_and_short_circuits():
     reason="Visible CUDA or NPU device required",
 )
 def test_moe_local_3d_newton_schulz_chunking_matches_whole_stack_on_accelerator(monkeypatch):
-    """Exercise rectangular 3D chunking (with a 1-expert tail) on accelerator Gram and CUDA gram_quack."""
+    """Exercise balanced 3D chunking on accelerator Gram and CUDA gram_quack."""
     import importlib.util
 
     import veomni.optim.muon as muon_mod
-    from veomni.optim.muon import _MOE_LOCAL_3D_NS_CHUNK, _chunked_newton_schulz
+    from veomni.optim.muon import _chunked_newton_schulz
 
     torch.manual_seed(0)
     experts, rows, cols = 7, 128, 256
-    assert experts % _MOE_LOCAL_3D_NS_CHUNK == 1
     local = torch.randn(experts, rows, cols, device=get_device_type(), dtype=torch.bfloat16)
 
     backends = ["gram"]
@@ -1400,7 +1417,8 @@ def test_moe_local_3d_newton_schulz_chunking_matches_whole_stack_on_accelerator(
             )
 
         chunked = _chunked_newton_schulz(local, _ns)
-        assert shapes == [(3, rows, cols), (3, rows, cols), (1, rows, cols)]
+        # The CPU test pins the size policy; here it only has to happen on-device.
+        assert shapes == [(3, rows, cols), (2, rows, cols), (2, rows, cols)]
 
         whole = run_newton_schulz(
             local,

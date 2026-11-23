@@ -700,28 +700,46 @@ _KIND_FSDP_GATHER_2D = "fsdp_gather_2d"
 _KIND_MOE_LOCAL_3D = "moe_local_3d"
 _KIND_MOE_GATHER_3D = "moe_gather_3d"
 
-#: Local experts per Newton-Schulz call on a 3D expert stack. Dim 0 is a pure
-#: batch dim for ``batched_*_newton_schulz``, so slicing it changes only the
-#: workspace size -- which otherwise scales with the local expert count.
-_MOE_LOCAL_3D_NS_CHUNK = 3
+#: Experts per Newton-Schulz call on a 3D local-expert stack. Dim 0 is a pure
+#: batch dim for ``batched_*_newton_schulz``, so this bounds the workspace at
+#: ``budget * min(M, K)**2`` instead of ``local_experts * min(M, K)**2``.
+_MOE_LOCAL_3D_NS_MAX_EXPERTS = 3
+
+
+def _expert_ns_chunk_sizes(num_experts: int) -> List[int]:
+    """Balanced Newton-Schulz chunk sizes for one 3D local-expert pass.
+
+    Uses as few calls as the ``_MOE_LOCAL_3D_NS_MAX_EXPERTS`` workspace budget
+    allows and keeps the sizes within one of each other, so the remainder never
+    collapses into a single-expert call -- that is a ``bmm`` launch with no batch
+    efficiency, and it is what a fixed chunk size produces whenever
+    ``num_experts % chunk == 1``.
+    """
+    calls = -(-num_experts // _MOE_LOCAL_3D_NS_MAX_EXPERTS)
+    base, remainder = divmod(num_experts, calls)
+    return [base + 1] * remainder + [base] * (calls - remainder)
 
 
 def _chunked_newton_schulz(local: Tensor, ns: "Callable[[Tensor], Tensor]") -> Tensor:
-    """Run ``ns`` over a 3D expert stack in chunks of ``_MOE_LOCAL_3D_NS_CHUNK`` experts.
+    """Run ``ns`` over a 3D expert stack in balanced chunks of at most
+    ``_MOE_LOCAL_3D_NS_MAX_EXPERTS`` experts.
 
     The result is written into one preallocated stack chunk by chunk. Collecting
     the chunk outputs in a list and ``torch.cat``-ing them would hold a second
     full stack at peak (the list plus the concatenation), which is the opposite of
     what the chunking is for.
     """
-    if local.shape[0] <= _MOE_LOCAL_3D_NS_CHUNK:
+    sizes = _expert_ns_chunk_sizes(local.shape[0])
+    if len(sizes) == 1:
         return ns(local)
     out = torch.empty_like(local)
-    for start in range(0, local.shape[0], _MOE_LOCAL_3D_NS_CHUNK):
-        end = start + _MOE_LOCAL_3D_NS_CHUNK
+    start = 0
+    for size in sizes:
+        end = start + size
         # In-place: the chunk's ortho lands directly in ``out``, so only one chunk
         # of workspace is live on top of the result the caller needs anyway.
         out[start:end] = ns(local[start:end])
+        start = end
     return out
 
 
