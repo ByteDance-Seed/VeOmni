@@ -700,11 +700,13 @@ _KIND_FSDP_GATHER_2D = "fsdp_gather_2d"
 _KIND_MOE_LOCAL_3D = "moe_local_3d"
 _KIND_MOE_GATHER_3D = "moe_gather_3d"
 
-#: Default experts per Newton-Schulz call on a 3D local-expert stack. Dim 0 is a
-#: pure batch dim for ``batched_*_newton_schulz``, so this bounds the workspace at
-#: ``budget * min(M, K)**2`` instead of ``local_experts * min(M, K)**2``. ``0``
-#: disables chunking and orthogonalizes the whole local stack in one call.
-_DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS = 3
+#: Experts per Newton-Schulz call on a 3D local-expert stack. Dim 0 is a pure
+#: batch dim for ``batched_*_newton_schulz``, so a positive value bounds the
+#: workspace at ``value * min(M, K)**2`` instead of ``local_experts * min(M, K)**2``.
+#: ``-1`` (the default) disables chunking: the whole local stack is orthogonalized
+#: in one call, which is the fastest shape and needs the most workspace.
+_MOE_LOCAL_3D_NS_CHUNK_DISABLED = -1
+_DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS = _MOE_LOCAL_3D_NS_CHUNK_DISABLED
 
 
 def _expert_ns_chunk_sizes(num_experts: int, max_experts: int = _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS) -> List[int]:
@@ -717,7 +719,8 @@ def _expert_ns_chunk_sizes(num_experts: int, max_experts: int = _DEFAULT_MOE_LOC
 
     An empty stack (a non-owner rank's FSDP shard of a 3D parameter) returns no
     sizes: there is nothing to orthogonalize, and ``divmod`` would divide by zero.
-    ``max_experts <= 0`` disables chunking and yields one whole-stack call.
+    ``max_experts <= 0`` (the default ``-1``) disables chunking and yields one
+    whole-stack call.
     """
     if num_experts <= 0:
         return []
@@ -735,13 +738,18 @@ def _chunked_newton_schulz(
 ) -> Tensor:
     """Run ``ns`` over a 3D expert stack in balanced chunks of at most ``max_experts``.
 
-    The result is written into one preallocated stack chunk by chunk. Collecting
-    the chunk outputs in a list and ``torch.cat``-ing them would hold a second
-    full stack at peak (the list plus the concatenation), which is the opposite of
-    what the chunking is for.
+    Disabled by default (``max_experts < 0``): one call over the whole stack, which
+    is the fastest shape because it amortizes the per-call fp32 normalize/cast and
+    ``bmm`` launches over every expert at once. Enable it only when that stack's NS
+    workspace is what stands between the run and an OOM -- it costs a few percent
+    of step time.
 
-    An empty stack returns a zero-sized tensor of the same shape without calling
-    ``ns``, matching the empty local shard a non-owner rank holds.
+    When enabled, the result is written into one preallocated stack chunk by
+    chunk. Collecting the chunk outputs in a list and ``torch.cat``-ing them would
+    hold a second full stack at peak (the list plus the concatenation), which is
+    the opposite of what the chunking is for.
+
+    An empty stack (a non-owner rank's shard) returns without calling ``ns``.
     """
     sizes = _expert_ns_chunk_sizes(local.shape[0], max_experts)
     if not sizes:
@@ -922,8 +930,10 @@ class DistributedMuon(Optimizer):
             raise ValueError(f"ns_implementation must be one of {NS_IMPLEMENTATIONS}, got {ns_implementation!r}")
         if int(head_blocks) < 1:
             raise ValueError(f"head_blocks must be >= 1 but is: {head_blocks}")
-        if int(expert_ns_max_experts) < 0:
-            raise ValueError(f"expert_ns_max_experts must be >= 0 but is: {expert_ns_max_experts}")
+        if int(expert_ns_max_experts) < -1:
+            raise ValueError(
+                f"expert_ns_max_experts must be >= -1 (-1 disables chunking) but is: {expert_ns_max_experts}"
+            )
 
         defaults: Dict[str, Any] = {
             "lr": lr,
