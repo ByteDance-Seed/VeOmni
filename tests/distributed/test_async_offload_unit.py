@@ -292,14 +292,13 @@ def test_async_offload_rejects_cpu_tensors():
 
 
 def test_deferred_free_requires_an_allocator_owned_storage(monkeypatch):
-    """A tensor over foreign or copy-on-write memory cannot rely on ``record_stream``.
+    """``_deferred_free_supported`` accepts only storage the native allocator actually owns.
 
-    ``from_numpy`` / ``from_dlpack`` / ``frombuffer`` hand the allocator a deleter
-    it does not recognise, so ``record_stream`` returns without pinning anything
-    and the storage can be freed the moment ``set_`` drops the last reference.
-    Those storages report ``resizable() == False``. ``torch._lazy_clone`` keeps
-    ``resizable() == True`` but wraps the pointer in PyTorch's COW deleter, which
-    is rejected via ``torch._C._is_cow_tensor``.
+    One concern: the predicate that decides whether the D2H path may skip its host
+    wait. Three storage families must be rejected because ``record_stream`` is a
+    no-op for them, so detaching would free memory an in-flight copy is reading:
+    ``from_numpy`` / ``frombuffer`` / ``from_dlpack`` (foreign deleter) and
+    ``torch._lazy_clone`` (COW deleter wrapping a resizable storage).
     """
     from veomni.distributed import async_offload
 
@@ -324,11 +323,12 @@ def test_deferred_free_requires_an_allocator_owned_storage(monkeypatch):
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="NVIDIA CUDA required for the allocator-backend probe")
 def test_is_caching_allocator_active_accepts_only_the_native_backend(monkeypatch):
-    """``backend:cudaMallocAsync`` must not take the deferred-free path.
+    """Only the native caching allocator may take the deferred-free path.
 
-    ``CUDAMallocAsyncAllocator::recordStream`` asserts the pointer is in its
-    allocation map, so an external DLPack tensor aborts there instead of deferring
-    a free. Only the native caching allocator reports ``True``.
+    One concern: the allocator half of the predicate, which the storage checks
+    above cannot see. ``backend:cudaMallocAsync`` has its own ``recordStream``
+    that asserts the pointer is in its allocation map, so an external DLPack
+    tensor aborts there instead of deferring a free.
     """
     from veomni.utils import device
 
@@ -340,7 +340,14 @@ def test_is_caching_allocator_active_accepts_only_the_native_backend(monkeypatch
 
 
 def test_launch_d2h_gates_record_stream_on_deferred_free(monkeypatch):
-    """``launch_d2h`` calls ``record_stream`` iff ``_deferred_free_supported`` is true."""
+    """``record_stream`` and the host wait in ``wait_d2h_finished`` must be strictly paired.
+
+    One concern: the invariant the D2H fast path rests on. Skipping
+    ``record_stream`` without the host synchronize frees memory mid-copy; calling
+    it where the allocator ignores it is a no-op that hides the same bug. Three
+    cases cover both decisions: unsupported allocator, foreign storage on the
+    native allocator, and allocator-owned storage.
+    """
     from contextlib import nullcontext
 
     import numpy as np
@@ -406,7 +413,15 @@ def test_launch_d2h_gates_record_stream_on_deferred_free(monkeypatch):
 
 
 def test_release_host_buffer_syncs_abandoned_d2h_without_deferred_free(monkeypatch):
-    """Dropping an in-flight ``d2h`` wrapper without ``record_stream`` must sync before releasing."""
+    """A wrapper torn down mid-D2H must not leave a copy reading freed device memory.
+
+    One concern: teardown, as opposed to the normal ``wait_d2h_finished`` path.
+    When ``record_stream`` was skipped (non-deferred storage) and the forward graph
+    is dropped before the copy completes, ``__del__`` returns the host buffer and
+    the last device reference goes with it. The event must be synchronized here;
+    the deferred path (``record_stream`` pinned the storage) must not, because the
+    pool's reused buffer carries the event tag instead.
+    """
     from contextlib import nullcontext
 
     from veomni.distributed import async_offload
@@ -555,7 +570,12 @@ def test_pinned_buffer_pool_refreshes_layout_recency_on_reuse():
 
 
 def test_pinned_buffer_pool_waits_for_pending_event_on_eviction():
-    """Evicting a pooled buffer before reuse must synchronize its pending event outside the lock."""
+    """A buffer evicted from the cache must be synchronized even though it never returns via ``acquire``.
+
+    One concern: the release path with no later ``acquire`` to defer to. Eviction
+    frees the buffer for good, so ``release`` itself must wait -- and must do it
+    outside the pool lock, since the pool is shared across managers and threads.
+    """
     pool = PinnedBufferPool(max_cached_bytes=32)
 
     class _FakeEvent:
@@ -589,7 +609,12 @@ def test_pinned_buffer_pool_waits_for_pending_event_on_eviction():
 
 
 def test_pinned_buffer_pool_waits_for_pending_event_on_drop():
-    """A dropped buffer leaves the pool for good, so ``release`` must synchronize it itself."""
+    """An oversized buffer that bypasses the cache must be synchronized on ``release``.
+
+    One concern: the other path that ends a buffer's life without a later
+    ``acquire``. A drop is chosen by size, not by cache pressure, so it exercises
+    a different branch than eviction above.
+    """
     pool = PinnedBufferPool(max_cached_bytes=16)
 
     class _FakeEvent:

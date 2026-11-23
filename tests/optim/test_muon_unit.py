@@ -609,6 +609,25 @@ class TestGramNewtonSchulz:
         opt.step()
         assert torch.isfinite(p).all()
 
+    def test_distributed_muon_validates_and_carries_the_expert_ns_budget(self):
+        """The budget must reach the param group (not just the ctor) and reject negatives."""
+        from veomni.optim.muon import _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS
+
+        p = nn.Parameter(torch.randn(8, 16))
+        # Default: omitted from the group so older checkpoints' state dicts still match.
+        opt_default = DistributedMuon([p], lr=1e-3)
+        assert "expert_ns_max_experts" not in opt_default.param_groups[0]
+
+        # Non-default: carried in the group the step loop reads.
+        opt_custom = DistributedMuon([p], lr=1e-3, expert_ns_max_experts=8)
+        assert opt_custom.param_groups[0]["expert_ns_max_experts"] == 8
+        assert opt_custom.param_groups[0]["expert_ns_max_experts"] != _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS
+
+        # 0 is valid (disables chunking); negative is not.
+        assert DistributedMuon([p], lr=1e-3, expert_ns_max_experts=0).param_groups[0]["expert_ns_max_experts"] == 0
+        with pytest.raises(ValueError, match="expert_ns_max_experts must be >= 0"):
+            DistributedMuon([p], lr=1e-3, expert_ns_max_experts=-1)
+
 
 class TestMuonLrResolution:
     def test_muon_lr_inherits_adamw_lr_under_match_rms(self):
@@ -1282,37 +1301,120 @@ class TestGramQuackFallback:
         assert muon_mod._gram_quack_unavailable_reason(grad) is None
 
 
-def test_moe_local_3d_newton_schulz_chunk_sizes_are_balanced_and_bounded():
-    """Chunking uses the fewest calls the workspace budget allows, with no tiny tail.
+def _chunk_sizes_of(experts: int):
+    """Default-budget slice schedule, resolved through the implementation under test."""
+    from veomni.optim.muon import _expert_ns_chunk_sizes
 
-    A fixed chunk size produces a single-expert call whenever ``experts % chunk ==
-    1``, which is a ``bmm`` launch with no batch efficiency. Balanced sizes keep
-    every call within one expert of the others and never exceed the budget.
+    return _expert_ns_chunk_sizes(experts)
+
+
+def test_moe_expert_ns_chunk_sizes_schedule():
+    """The slicer produces a valid, balanced, minimal-call schedule for any budget.
+
+    One concern: what ``_expert_ns_chunk_sizes`` returns. The invariants are
+    (a) every expert is covered exactly once, (b) no call exceeds the workspace
+    budget, (c) the spread stays within one expert so no call degenerates into a
+    single-expert ``bmm``, and (d) the call count is the fewest the budget allows.
+    Budget ``0`` means "no chunking" and must reproduce the pre-chunking shape.
     """
-    from veomni.optim.muon import _MOE_LOCAL_3D_NS_MAX_EXPERTS, _expert_ns_chunk_sizes
+    from veomni.optim.muon import _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS, _expert_ns_chunk_sizes
 
+    # Budget = default, across a range that exercises every remainder class.
     for experts in range(1, 65):
         sizes = _expert_ns_chunk_sizes(experts)
         assert sum(sizes) == experts
-        assert max(sizes) <= _MOE_LOCAL_3D_NS_MAX_EXPERTS
-        assert all(later - earlier <= 1 for earlier, later in zip(sizes, sizes[1:])), (experts, sizes)
+        assert max(sizes) <= _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS
+        # Spread, not adjacent pairs: ``[3, 3, 1]`` has adjacent diffs 0 and -2 but
+        # still ends in the single-expert tail this scheme exists to avoid.
+        assert max(sizes) - min(sizes) <= 1, (experts, sizes)
         # Fewest calls the budget allows: dropping one call must overflow it.
         if len(sizes) > 1:
-            assert -(-experts // (len(sizes) - 1)) > _MOE_LOCAL_3D_NS_MAX_EXPERTS, (experts, sizes)
+            assert -(-experts // (len(sizes) - 1)) > _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS, (experts, sizes)
+
+    # Budget 0 (and any budget >= the stack) means one whole-stack call.
+    assert _expert_ns_chunk_sizes(7, 0) == [7]
+    assert _expert_ns_chunk_sizes(7, 7) == [7]
+    assert _expert_ns_chunk_sizes(7, 64) == [7]
+
+    # A larger budget trades workspace for fewer calls, and stays balanced.
+    assert _expert_ns_chunk_sizes(32, 8) == [8, 8, 8, 8]
+    assert _expert_ns_chunk_sizes(32, 1) == [1] * 32
+    for budget in (1, 2, 3, 5, 8):
+        for experts in (7, 10, 13, 31):
+            sizes = _expert_ns_chunk_sizes(experts, budget)
+            assert sum(sizes) == experts
+            assert max(sizes) - min(sizes) <= 1, (budget, experts, sizes)
 
 
-def test_moe_local_3d_newton_schulz_chunking_matches_a_whole_stack_call():
-    """The 3D-expert NS chunk must be identical to one call on the whole stack.
+def test_moe_expert_ns_chunking_handles_an_empty_local_shard():
+    """A non-owner rank's FSDP shard of a 3D param is empty and must not divide by zero.
 
-    The local expert stack is processed in balanced groups of at most
-    ``_MOE_LOCAL_3D_NS_MAX_EXPERTS`` so the Newton-Schulz workspace stops scaling
-    with the local expert count. Dim 0 is a pure batch dim for
-    ``batched_*_newton_schulz``, so the chunking only changes the workspace.
+    One concern: the end-to-end shape of the empty-shard case, not just the
+    slicer. Wan's ``[1, 6, dim]`` modulation parameters leave non-owner ranks
+    holding ``[0, 6, dim]``; those are Muon-eligible DTensors that
+    ``_classify_param`` routes to the local-3D path, where a naive ``divmod`` on
+    zero would raise ``ZeroDivisionError`` inside the optimizer step. The DTensor
+    is real (single-process gloo mesh), so the classification and the dispatch are
+    both exercised rather than stubbed.
+    """
+    import tempfile
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    from veomni.optim.muon import _chunked_newton_schulz, _classify_param, _expert_ns_chunk_sizes
+
+    assert _expert_ns_chunk_sizes(0) == []
+    assert _expert_ns_chunk_sizes(0, 0) == []
+
+    empty = torch.empty(0, 6, 4)
+    out = _chunked_newton_schulz(empty, lambda x: torch.zeros_like(x))
+    assert out.shape == empty.shape
+    assert out.numel() == 0
+
+    created = False
+    if not (dist.is_available() and dist.is_initialized()):
+        rendezvous = tempfile.mkdtemp()
+        dist.init_process_group(
+            "gloo",
+            init_method=f"file://{rendezvous}/rendezvous",
+            rank=0,
+            world_size=1,
+        )
+        created = True
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        sharded = DTensor.from_local(empty, device_mesh=mesh, placements=(Shard(0),), run_check=False)
+        assert _classify_param(sharded) == "moe_local_3d"
+        chunked = _chunked_newton_schulz(sharded._local_tensor, lambda x: torch.zeros_like(x))
+        assert chunked.shape == sharded._local_tensor.shape
+    finally:
+        if created:
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "experts,rows,cols",
+    [
+        # Wide (rows <= cols): Gram-NS iterates on ``X @ X.T``.
+        pytest.param(7, 4, 6, id="wide-remainder"),
+        # Tall (rows > cols): Gram-NS iterates on ``X.T @ X``, the other branch.
+        pytest.param(4, 8, 3, id="tall"),
+    ],
+)
+def test_moe_expert_ns_chunking_matches_a_whole_stack_call(experts, rows, cols):
+    """Chunking must be numerically identical to one whole-stack call, and must actually chunk.
+
+    One concern: the chunked path changes only the workspace. Both Gram-NS shape
+    branches are covered because slicing dim 0 is branch-agnostic while the
+    trailing-matrix math is not. The recorded shapes also pin that the helper
+    really split the stack -- a silent regression to a single whole-stack call
+    would otherwise still pass an equivalence check.
     """
     from veomni.optim.muon import _chunked_newton_schulz
 
     torch.manual_seed(0)
-    experts, rows, cols = 7, 4, 6
     local = torch.randn(experts, rows, cols)
 
     def _ns(x):
@@ -1334,33 +1436,17 @@ def test_moe_local_3d_newton_schulz_chunking_matches_a_whole_stack_call():
     chunked = _chunked_newton_schulz(local, _recording_ns)
 
     torch.testing.assert_close(chunked, _ns(local))
-    # Pins the workspace bound: without this the test would also pass if the
-    # helper called ``ns`` once on all seven experts.
-    assert shapes == [(3, rows, cols), (2, rows, cols), (2, rows, cols)]
+    assert shapes == [(size, rows, cols) for size in _chunk_sizes_of(experts)]
 
 
-def test_moe_local_3d_newton_schulz_handles_a_tall_expert_stack():
-    """Rectangular experts exercise the Gram path, which the square case can skip."""
-    from veomni.optim.muon import _chunked_newton_schulz
+def test_moe_expert_ns_chunking_preserves_dtype_and_short_circuits():
+    """The preallocated output must keep the update's dtype and skip work when unchunked.
 
-    torch.manual_seed(0)
-    local = torch.randn(4, 8, 3)
-
-    def _ns(x):
-        return run_newton_schulz(
-            x,
-            ns_coefficients=DEFAULT_NS_COEFFICIENTS,
-            ns_steps=DEFAULT_NS_STEPS,
-            eps=1e-7,
-            ns_implementation="gram",
-            gram_ns_reset_iterations=(2,),
-        )
-
-    torch.testing.assert_close(_chunked_newton_schulz(local, _ns), _ns(local))
-
-
-def test_moe_local_3d_newton_schulz_preserves_dtype_and_short_circuits():
-    """The preallocated stack must not widen the update, and small stacks skip chunking."""
+    One concern: the two things the preallocated-stack implementation could get
+    wrong besides numerics. Widening the output silently promotes the update and
+    breaks the later ``_apply_ortho``; chunking a stack that fits in one call
+    would add a useless ``empty_like`` copy.
+    """
     from veomni.optim.muon import _chunked_newton_schulz
 
     for dtype in (torch.bfloat16, torch.float32):
@@ -1369,23 +1455,30 @@ def test_moe_local_3d_newton_schulz_preserves_dtype_and_short_circuits():
         assert out.dtype == dtype
         assert out.shape == local.shape
 
-    small = torch.randn(3, 4, 4)
-    calls = []
+    single_call = []
 
     def _recording(x):
-        calls.append(tuple(x.shape))
+        single_call.append(tuple(x.shape))
         return x
 
+    small = torch.randn(3, 4, 4)  # exactly the default budget
     _chunked_newton_schulz(small, _recording)
-    assert calls == [(3, 4, 4)]
+    assert single_call == [(3, 4, 4)]
 
 
 @pytest.mark.skipif(
     not ((IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and get_torch_device().is_available()),
     reason="Visible CUDA or NPU device required",
 )
-def test_moe_local_3d_newton_schulz_chunking_matches_whole_stack_on_accelerator(monkeypatch):
-    """Exercise balanced 3D chunking on accelerator Gram and CUDA gram_quack."""
+def test_moe_expert_ns_chunking_matches_whole_stack_on_accelerator(monkeypatch):
+    """The chunked NS path must agree with a whole-stack call on a real accelerator.
+
+    One concern: the CPU tests prove the slicing arithmetic; this proves the
+    device kernels tolerate it. Both configured Gram backends run on a
+    rectangular stack whose Gram matrices are big enough to hit the same kernels
+    production uses, and ``gram_quack`` asserts it did not silently fall back on
+    Hopper-class hardware.
+    """
     import importlib.util
 
     import veomni.optim.muon as muon_mod

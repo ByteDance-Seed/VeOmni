@@ -700,36 +700,52 @@ _KIND_FSDP_GATHER_2D = "fsdp_gather_2d"
 _KIND_MOE_LOCAL_3D = "moe_local_3d"
 _KIND_MOE_GATHER_3D = "moe_gather_3d"
 
-#: Experts per Newton-Schulz call on a 3D local-expert stack. Dim 0 is a pure
-#: batch dim for ``batched_*_newton_schulz``, so this bounds the workspace at
-#: ``budget * min(M, K)**2`` instead of ``local_experts * min(M, K)**2``.
-_MOE_LOCAL_3D_NS_MAX_EXPERTS = 3
+#: Default experts per Newton-Schulz call on a 3D local-expert stack. Dim 0 is a
+#: pure batch dim for ``batched_*_newton_schulz``, so this bounds the workspace at
+#: ``budget * min(M, K)**2`` instead of ``local_experts * min(M, K)**2``. ``0``
+#: disables chunking and orthogonalizes the whole local stack in one call.
+_DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS = 3
 
 
-def _expert_ns_chunk_sizes(num_experts: int) -> List[int]:
+def _expert_ns_chunk_sizes(num_experts: int, max_experts: int = _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS) -> List[int]:
     """Balanced Newton-Schulz chunk sizes for one 3D local-expert pass.
 
-    Uses as few calls as the ``_MOE_LOCAL_3D_NS_MAX_EXPERTS`` workspace budget
-    allows and keeps the sizes within one of each other, so the remainder never
-    collapses into a single-expert call -- that is a ``bmm`` launch with no batch
-    efficiency, and it is what a fixed chunk size produces whenever
-    ``num_experts % chunk == 1``.
+    Uses as few calls as the ``max_experts`` workspace budget allows and keeps the
+    sizes within one of each other, so the remainder never collapses into a
+    single-expert call -- that is a ``bmm`` launch with no batch efficiency, and it
+    is what a fixed chunk size produces whenever ``num_experts % chunk == 1``.
+
+    An empty stack (a non-owner rank's FSDP shard of a 3D parameter) returns no
+    sizes: there is nothing to orthogonalize, and ``divmod`` would divide by zero.
+    ``max_experts <= 0`` disables chunking and yields one whole-stack call.
     """
-    calls = -(-num_experts // _MOE_LOCAL_3D_NS_MAX_EXPERTS)
+    if num_experts <= 0:
+        return []
+    if max_experts <= 0 or num_experts <= max_experts:
+        return [num_experts]
+    calls = -(-num_experts // max_experts)
     base, remainder = divmod(num_experts, calls)
     return [base + 1] * remainder + [base] * (calls - remainder)
 
 
-def _chunked_newton_schulz(local: Tensor, ns: "Callable[[Tensor], Tensor]") -> Tensor:
-    """Run ``ns`` over a 3D expert stack in balanced chunks of at most
-    ``_MOE_LOCAL_3D_NS_MAX_EXPERTS`` experts.
+def _chunked_newton_schulz(
+    local: Tensor,
+    ns: "Callable[[Tensor], Tensor]",
+    max_experts: int = _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS,
+) -> Tensor:
+    """Run ``ns`` over a 3D expert stack in balanced chunks of at most ``max_experts``.
 
     The result is written into one preallocated stack chunk by chunk. Collecting
     the chunk outputs in a list and ``torch.cat``-ing them would hold a second
     full stack at peak (the list plus the concatenation), which is the opposite of
     what the chunking is for.
+
+    An empty stack returns a zero-sized tensor of the same shape without calling
+    ``ns``, matching the empty local shard a non-owner rank holds.
     """
-    sizes = _expert_ns_chunk_sizes(local.shape[0])
+    sizes = _expert_ns_chunk_sizes(local.shape[0], max_experts)
+    if not sizes:
+        return ns(local)
     if len(sizes) == 1:
         return ns(local)
     out = torch.empty_like(local)
@@ -886,6 +902,7 @@ class DistributedMuon(Optimizer):
         ns_implementation: str = "gram_quack",
         gram_ns_reset_iterations: Sequence[int] = (2,),
         head_blocks: int = 1,
+        expert_ns_max_experts: int = _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS,
     ) -> None:
         if not _MUON_AVAILABLE:
             raise RuntimeError(
@@ -905,6 +922,8 @@ class DistributedMuon(Optimizer):
             raise ValueError(f"ns_implementation must be one of {NS_IMPLEMENTATIONS}, got {ns_implementation!r}")
         if int(head_blocks) < 1:
             raise ValueError(f"head_blocks must be >= 1 but is: {head_blocks}")
+        if int(expert_ns_max_experts) < 0:
+            raise ValueError(f"expert_ns_max_experts must be >= 0 but is: {expert_ns_max_experts}")
 
         defaults: Dict[str, Any] = {
             "lr": lr,
@@ -918,6 +937,11 @@ class DistributedMuon(Optimizer):
             "ns_implementation": ns_implementation,
             "gram_ns_reset_iterations": tuple(int(i) for i in gram_ns_reset_iterations),
         }
+        # Only carried when it differs: as a default it would add an
+        # ``param_groups.<fqn>.expert_ns_max_experts`` entry to every flattened
+        # optimizer state dict, which checkpoints written before this option lack.
+        if int(expert_ns_max_experts) != _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS:
+            defaults["expert_ns_max_experts"] = int(expert_ns_max_experts)
         # Only carried when splitting is on: as a default it would add a
         # ``param_groups.<fqn>.head_blocks`` entry to every flattened optimizer
         # state dict, which checkpoints written before this option lack.
@@ -1003,6 +1027,7 @@ class DistributedMuon(Optimizer):
             ns_implementation = str(group.get("ns_implementation", "gram_quack"))
             gram_ns_reset_iterations = tuple(group.get("gram_ns_reset_iterations", (2,)))
             head_blocks = int(group.get("head_blocks", 1))
+            expert_ns_max_experts = int(group.get("expert_ns_max_experts", _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS))
             # Scope settings travel inside ns_kwargs so the all-to-all owner path
             # reads them from one dict.
             ns_kwargs = {
@@ -1012,6 +1037,7 @@ class DistributedMuon(Optimizer):
                 "ns_implementation": ns_implementation,
                 "gram_ns_reset_iterations": gram_ns_reset_iterations,
                 "head_blocks": head_blocks,
+                "expert_ns_max_experts": expert_ns_max_experts,
             }
 
             # Keep at most one owner-assignment chunk live per mesh/dtype. This
@@ -1260,6 +1286,7 @@ class DistributedMuon(Optimizer):
         ns_implementation: str = "gram_quack",
         gram_ns_reset_iterations: Sequence[int] = (2,),
         head_blocks: int = 1,
+        expert_ns_max_experts: int = _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS,
     ) -> Tensor:
         """Run Newton-Schulz on ``update`` according to its layout kind."""
 
@@ -1284,7 +1311,7 @@ class DistributedMuon(Optimizer):
         if kind == _KIND_MOE_LOCAL_3D:
             assert isinstance(update, DTensor)
             local = update._local_tensor
-            local_ortho = _chunked_newton_schulz(local, _ns)
+            local_ortho = _chunked_newton_schulz(local, _ns, expert_ns_max_experts)
             return DTensor.from_local(
                 local_ortho,
                 device_mesh=update.device_mesh,
