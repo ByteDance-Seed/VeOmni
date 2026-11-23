@@ -452,17 +452,6 @@ class ModuleRuntime(VeOmniModelRuntime):
             return
         logger.info_rank0(f"ModuleRuntime '{label}': bound module assets.")
 
-    def _compile_config(self):
-        """This module's ``CompileConfig``: the run switch intersected with the module's opt-in.
-
-        ``accelerator.torch_compile.enable`` alone is not enough on a composed
-        model: modules differ in whether Inductor helps at all, so each declares
-        :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile`
-        and a module that leaves it ``False`` stays eager even in a
-        compile-enabled run.
-        """
-        return module_compile_config(self.args.accelerator, self.model)
-
     def _freeze_model_module(self) -> None:
         """Freeze + LoRA this module, heading the base's report with its name.
 
@@ -552,12 +541,22 @@ class ModuleRuntime(VeOmniModelRuntime):
 
         Returns a disabled config while :meth:`_build_wrap_without_compiling` runs
         the base build, so compilation is not attempted twice.
+
+        The launcher-level accelerator is passed only under ``fsdp_scope='model'``,
+        where the composed ``OmniModel`` owns the wrap. Under ``fsdp_scope='module'``
+        the module's own overlay *is* its wrap, so consulting the launcher's
+        ``fsdp_mode`` there would disable a child that selected ``fsdp2`` itself
+        just because the launcher default says ``ddp``.
         """
         from .....distributed.torch_compile import CompileConfig
 
         if getattr(self, "_skip_compile", False):
             return CompileConfig(enable=False)
-        return module_compile_config(self.args.accelerator, self.model, global_accelerator=self._global_accelerator)
+        return module_compile_config(
+            self.args.accelerator,
+            self.model,
+            global_accelerator=self._global_accelerator if self.wrap_omni_model else None,
+        )
 
     def _compile_own_blocks(self, compile_config) -> int:
         """Compile the blocks this module declares, under this module's own config.
@@ -567,9 +566,28 @@ class ModuleRuntime(VeOmniModelRuntime):
         a family whose blocks are not named ``*DecoderLayer``
         (``JanusVQVAEAttnBlock``) still be compiled — the module already said it
         may be, via ``supports_torch_compile``.
-        """
-        from .....distributed.torch_compile import compile_decoder_blocks
 
+        The runtime contract is validated **here**, not left to
+        ``build_parallelize_model``. That function normally runs
+        ``validate_compile_runtime`` before compiling, but this module hands the
+        wrap a disabled config so it never compiles twice — which would also skip
+        the validation, letting a CUDA-only restriction, a DDP wrap or an
+        ExtraParallel mesh through. Validating first keeps those refusals where
+        they belong while compilation happens exactly once.
+        """
+        from .....distributed.parallel_state import get_parallel_state
+        from .....distributed.torch_compile import compile_decoder_blocks, validate_compile_runtime
+        from .....utils.device import get_device_type
+
+        parallel_state = get_parallel_state()
+        validate_compile_runtime(
+            compile_config,
+            device_type=get_device_type(),
+            fsdp_enabled=parallel_state.fsdp_enabled,
+            fsdp_mode=parallel_state.dp_mode,
+            any_extra_parallel_enabled=parallel_state.any_extra_parallel_enabled,
+            enable_reshard_after_forward=self.args.accelerator.fsdp_config.reshard_after_forward,
+        )
         return compile_decoder_blocks(self.model, compile_config, all_classes=True)
 
     def build_after_omni_model_wrap(self) -> None:

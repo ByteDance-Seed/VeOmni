@@ -51,7 +51,7 @@ def _fsdp(
     ``_build_parallelized_model`` from reaching for the compiler.
     """
     return SimpleNamespace(
-        fsdp_config=SimpleNamespace(fsdp_scope=scope, fsdp_mode=mode),
+        fsdp_config=SimpleNamespace(fsdp_scope=scope, fsdp_mode=mode, reshard_after_forward=True),
         torch_compile=SimpleNamespace(
             enable=compile_enable, backend="inductor", mode=None, fullgraph=True, dynamic=compile_dynamic
         ),
@@ -919,6 +919,9 @@ def test_a_compiling_module_compiles_itself_before_the_composed_wrap(monkeypatch
     import veomni.distributed.torch_compile as tc_mod
 
     monkeypatch.setattr(tc_mod, "compile_decoder_blocks", spy)
+    # This test is about compiling once, not about the runtime contract; that is
+    # covered separately. No parallel state is set up here, so stub the check.
+    monkeypatch.setattr(tc_mod, "validate_compile_runtime", lambda *a, **k: None)
 
     class Block(nn.Module):
         def forward(self, x):
@@ -1030,3 +1033,66 @@ def test_a_module_overlay_cannot_outrun_a_top_level_ddp_wrap():
 
     assert module_compile_config(module_acc, module, global_accelerator=ddp_top).enable is False
     assert module_compile_config(module_acc, module, global_accelerator=fsdp2_top).enable is True
+
+
+def test_the_launcher_gate_applies_only_when_the_composed_model_owns_the_wrap():
+    """A `fsdp2` child under a `ddp` launcher compiles when it owns its own wrap.
+
+    Under `fsdp_scope='module'` the module's own overlay *is* its wrap, so
+    consulting the launcher's `fsdp_mode` would disable a child that selected
+    `fsdp2` itself. The gate belongs to `fsdp_scope='model'`, where the composed
+    `OmniModel` does the wrapping and validates the top-level accelerator.
+    """
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    module = SimpleNamespace(supports_torch_compile=True, supports_torch_compile_dynamic=False)
+    child_acc = SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=True, backend="inductor", mode=None, fullgraph=True, dynamic=False),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
+    )
+    ddp_launcher = SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope="module", fsdp_mode="ddp"))
+
+    # fsdp_scope='module': the child owns the wrap, so the launcher is not consulted.
+    assert module_compile_config(child_acc, module).enable is True
+    # fsdp_scope='model': the launcher's mode is what the wrap will use.
+    assert module_compile_config(child_acc, module, global_accelerator=ddp_launcher).enable is False
+
+
+def test_compiling_validates_the_runtime_contract_first(monkeypatch):
+    """Compiling itself must not skip `validate_compile_runtime`.
+
+    Handing the wrap a disabled config stops the double compile but also skips
+    the validator inside `build_parallelize_model`. Without an explicit call the
+    CUDA-only restriction, a DDP wrap and an ExtraParallel mesh would all be
+    bypassed. Also pins the order: validate before compile.
+    """
+    import torch
+
+    from veomni.distributed import torch_compile as tc_mod
+
+    order = []
+    monkeypatch.setattr(tc_mod, "validate_compile_runtime", lambda *a, **k: order.append("validate"))
+    monkeypatch.setattr(tc_mod, "compile_decoder_blocks", lambda *a, **k: (order.append("compile"), 0)[1])
+    monkeypatch.setattr(
+        "veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime.get_parallel_state",
+        lambda: SimpleNamespace(fsdp_enabled=True, dp_mode="fsdp2", any_extra_parallel_enabled=False),
+        raising=False,
+    )
+
+    class OptedIn(nn.Linear):
+        supports_torch_compile = True
+        supports_torch_compile_dynamic = False
+
+    runtime = ModuleRuntime.__new__(ModuleRuntime)
+    runtime.model = OptedIn(2, 2)
+    runtime.args = SimpleNamespace(accelerator=_fsdp("module", compile_enable=True), basic_modules=[])
+    runtime._global_accelerator = _fsdp("module", compile_enable=True)
+
+    original_compile = torch.compile
+    torch.compile = lambda fn, **_: fn
+    try:
+        runtime._compile_own_blocks(runtime._compile_config())
+    finally:
+        torch.compile = original_compile
+
+    assert order == ["validate", "compile"]
