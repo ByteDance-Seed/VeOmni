@@ -31,7 +31,7 @@ veomni/
 │   ├── moe/            MoE expert parallelism: token routing, all-to-all, EPGroupGemm
 │   ├── context_parallel/  DeepSeek-V4 sparse-attention CP: window sharding and collectives
 │   └── sequence_parallel/  Ulysses SP: all-to-all head/seq exchange, async variants
-├── models/      Model loading, patchgen configs, and kernel-aware modeling
+├── models/      Model loading, standalone HF-derived modeling, and kernel-aware modules
 │   ├── auto.py         High-level API: build_foundation_model, build_tokenizer, build_processor
 │   ├── registry.py     Import-time model/config/processor registries
 │   ├── model_runtime.py  VeOmniModelRuntime: the model-bound half of a job
@@ -82,9 +82,6 @@ veomni/
 │                        subpackage, e.g. kv_round/deepseek_v4)
 ├── lora/               LoRA / PEFT injection: linear + MoE-expert adapters,
 │                       DCP + HF-adapter save/load, target mapping
-├── patchgen/           Patch specs + codegen driver consumed by the `patchgen`
-│                       CLI, which is a separate package under patchgen-pkg/
-│                       (installed via the `patchgen` dependency group)
 ├── schedulers/         LR scheduler implementations (flow matching)
 ├── trainer/            Training loop implementations
 │   ├── base.py         BaseTrainer (ABC): VeOmniModelRuntime + the job-bound
@@ -272,10 +269,10 @@ VeOmni uses FSDP2 exclusively.
    - `fully_shard()` on root model
 4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
-   - `moe_experts/standard/deepgemm_fp8` uses the same dispatch with
+   - `moe_experts/standard/deepgemm` uses the same dispatch with
      Hopper/Blackwell FP8 grouped forward/dgrad/wgrad in `ops/kernels/moe_experts/`.
      FSDP2 and EP communication retain their configured precision. Quantized
-     weights are invocation-local; see `docs/design/deepgemm_fp8_moe.md`.
+     weights are invocation-local; see `docs/design/deepgemm_moe.md`.
 6. Qwen4-Exp PLE is a model-specific exception: its embedding tables remain
    persistent DTensors on the full `(ple_fsdp, ple)` mesh with placements
    `[Shard(1), Shard(0)]`. FSDP2 ignores those parameters, and PLE routes sparse

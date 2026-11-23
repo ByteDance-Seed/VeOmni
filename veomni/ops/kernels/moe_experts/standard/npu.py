@@ -22,7 +22,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor
 
+from .....distributed.moe import cumsum_to_counts, dispatch_to_ep_class
 from .....distributed.parallel_state import get_parallel_state
+from ..shared.activation import is_silu
 
 
 class GmmFunction(torch.autograd.Function):
@@ -160,6 +162,24 @@ def _npu_fused_moe_forward(
     return hidden_states
 
 
+def _npu_expert_math(permute_tokens, cumsum, fc1_weight, fc2_weight, swiglu_limit=None):
+    """Two Ascend grouped GEMMs with the gated activation between them.
+
+    Takes the shape ``dispatch_to_ep_class`` provides, so the all-to-all plumbing is
+    shared with the other rows. No custom backward is needed: ``npu_group_gemm`` is
+    Ascend's grouped matmul wrapped in ``GmmFunction``, which builds the graph itself.
+
+    The shared helper hands over a *cumulative* count, but ``npu_group_gemm`` pins
+    ``group_list_type=1`` -- per-group sizes, whose sum must equal the row count. So
+    the running total is subtracted back out here, exactly as ``MLUGroupGemm`` does
+    internally and ``_deepgemm_expert_math`` does explicitly.
+    """
+    counts = cumsum_to_counts(cumsum)
+    intermediate = npu_group_gemm(permute_tokens, fc1_weight, counts)
+    activated = _swiglu(intermediate, swiglu_limit)
+    return npu_group_gemm(activated, fc2_weight, counts)
+
+
 def npu_ep_fused_moe_forward(
     num_experts: int,
     routing_weights: torch.Tensor,
@@ -174,149 +194,20 @@ def npu_ep_fused_moe_forward(
 ) -> torch.Tensor:
     """NPU expert-parallel fused MoE forward pass.
 
-    Accepts either split fc1 weights or a merged fc1_1_2_weight tensor.
-    Handles alltoall dispatch/combine for expert parallelism.
+    Accepts either split fc1 weights or a merged fc1_1_2_weight tensor. The all-to-all
+    plumbing is shared with every other fused row; only the per-rank math is Ascend's.
     """
-    hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-    input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
-        dispatch_preprocess(selected_experts, num_experts, ep_group)
-    )
-    hidden_states, unpermute_indices = alltoall_dispatch(
-        hidden_states,
-        selected_experts,
-        input_splits,
-        output_splits,
-        num_experts,
-        num_global_tokens_per_local_expert,
-        ep_group,
-    )
-
     fc1_weight = _fc1_weight(fc1_1_weight, fc1_2_weight, fc1_1_2_weight).transpose(1, 2)
-    intermediate_hidden_states = npu_group_gemm(hidden_states, fc1_weight, num_global_sum_tokens_per_local_expert)
-    intermediate_activations = _swiglu(intermediate_hidden_states, swiglu_limit)
-    hidden_states = npu_group_gemm(
-        intermediate_activations, fc2_weight.transpose(1, 2), num_global_sum_tokens_per_local_expert
-    )
-
-    hidden_states = alltoall_combine(
-        hidden_states,
-        routing_weights,
-        unpermute_indices,
-        input_splits,
-        output_splits,
+    return dispatch_to_ep_class(
+        _npu_expert_math,
         num_experts,
-        num_global_tokens_per_local_expert,
-        ep_group,
-    )
-    return hidden_states
-
-
-def dispatch_preprocess(
-    selected_experts: torch.Tensor,
-    num_global_experts: int,
-    ep_group: dist.ProcessGroup | None = None,
-):
-    """Build EP split sizes and per-expert token counts."""
-    if ep_group is None:
-        ep_size = 1
-        ep_rank = 0
-    else:
-        ep_size = dist.get_world_size(ep_group)
-        ep_rank = dist.get_rank(ep_group)
-    assert num_global_experts % ep_size == 0, (
-        f"Number of experts ({num_global_experts}) must be divisible by expert parallel size ({ep_size})."
-    )
-    num_local_experts = num_global_experts // ep_size
-
-    num_local_tokens_per_expert = torch.bincount(selected_experts.view(-1), minlength=num_global_experts)
-
-    if ep_group is None or ep_size <= 1:
-        num_global_tokens_per_expert = num_local_tokens_per_expert.view(1, -1)
-    else:
-        num_global_tokens_per_expert = torch.zeros(
-            ep_size,
-            num_global_experts,
-            dtype=num_local_tokens_per_expert.dtype,
-            device=num_local_tokens_per_expert.device,
-        )
-        dist.all_gather_into_tensor(num_global_tokens_per_expert, num_local_tokens_per_expert, group=ep_group)
-
-    start_idx, end_idx = ep_rank * num_local_experts, (ep_rank + 1) * num_local_experts
-    num_global_tokens_per_local_expert = num_global_tokens_per_expert[:, start_idx:end_idx].contiguous()
-
-    input_splits = num_local_tokens_per_expert.reshape(ep_size, num_local_experts).sum(dim=1).tolist()
-    output_splits = num_global_tokens_per_local_expert.sum(dim=1).tolist()
-
-    num_global_sum_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0)
-    num_global_tokens_per_local_expert = num_global_tokens_per_local_expert.to(torch.device("cpu"), non_blocking=True)
-    return input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert
-
-
-def alltoall_dispatch(
-    hidden_states: torch.Tensor,
-    selected_experts: torch.Tensor,
-    input_splits: list,
-    output_splits: list,
-    num_global_experts: int,
-    num_global_tokens_per_local_expert: torch.Tensor,
-    ep_group: dist.ProcessGroup | None = None,
-):
-    """Permute tokens and all-to-all them to local experts."""
-    import torch_npu
-
-    from .....distributed.moe.comm import all_to_all
-    from .....distributed.moe.moe_utils import sort_chunks_by_idxs
-    from .....utils.device import stream_synchronize
-
-    hidden_states, unpermute_indices = torch_npu.npu_moe_token_permute(hidden_states, selected_experts.to(torch.int32))
-    hidden_states = all_to_all(ep_group, hidden_states, output_splits, input_splits)
-
-    stream_synchronize()
-    ep_size = 1 if ep_group is None else dist.get_world_size(ep_group)
-    num_local_experts = num_global_experts // ep_size
-    assert num_global_experts % ep_size == 0, (
-        f"Number of experts ({num_global_experts}) must be divisible by expert parallel size ({ep_size})."
-    )
-    permute_order = torch.arange(num_global_experts).reshape(-1, num_local_experts).T.ravel().tolist()
-    hidden_states = sort_chunks_by_idxs(
+        routing_weights,
+        selected_experts,
         hidden_states,
-        num_global_tokens_per_local_expert.ravel(),
-        permute_order,
+        fc1_weight,
+        fc2_weight.transpose(1, 2),
+        swiglu_limit,
     )
-    return hidden_states, unpermute_indices
-
-
-def alltoall_combine(
-    hidden_states: torch.Tensor,
-    routing_weights: torch.Tensor,
-    unpermute_indices: torch.Tensor,
-    input_splits: list,
-    output_splits: list,
-    num_global_experts: int,
-    num_global_tokens_per_local_expert: torch.Tensor,
-    ep_group: dist.ProcessGroup | None = None,
-):
-    """Reverse all-to-all and unpermute expert outputs."""
-    import torch_npu
-
-    from .....distributed.moe.comm import all_to_all
-    from .....distributed.moe.moe_utils import sort_chunks_by_idxs
-
-    ep_size = 1 if ep_group is None else dist.get_world_size(ep_group)
-    num_local_experts = num_global_experts // ep_size
-    assert num_global_experts % ep_size == 0, (
-        f"Number of experts ({num_global_experts}) must be divisible by expert parallel size ({ep_size})."
-    )
-    unpermute_order = torch.arange(num_global_experts).reshape(num_local_experts, -1).T.ravel().tolist()
-    hidden_states = sort_chunks_by_idxs(
-        hidden_states,
-        num_global_tokens_per_local_expert.T.ravel(),
-        unpermute_order,
-    )
-
-    hidden_states = all_to_all(ep_group, hidden_states, input_splits, output_splits)
-    hidden_states = torch_npu.npu_moe_token_unpermute(hidden_states, unpermute_indices, probs=routing_weights)
-    return hidden_states
 
 
 def npu_fused_moe_forward(
@@ -381,9 +272,32 @@ def wrapper(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
     block_size: int = 128,
-    expert_dtype: str = "fp8",
+    dtype: str = "fp8",
+    activation: str = "silu",
 ) -> Tensor:
     """Call the NPU fused MoE path. Empty weights are ``None``."""
+    if not is_silu(activation):
+        # This kernel computes SiLU inside the grouped GEMM, so another activation has
+        # no seam here. The ``eager`` row runs the reference expert loop, which also
+        # owns the expert-parallel dispatch those sharded weights need.
+        from . import eager as _eager
+
+        return _eager.wrapper(
+            hidden_states,
+            routing_weights,
+            selected_experts,
+            fc1_1_weight,
+            fc1_2_weight,
+            fc2_weight,
+            fc1_1_2_weight,
+            num_experts=num_experts,
+            swiglu_limit=swiglu_limit,
+            assume_distinct_experts=assume_distinct_experts,
+            block_size=block_size,
+            dtype=dtype,
+            activation=activation,
+        )
+    del block_size, dtype
     # Empty tensor = unused layout. Registry args stay tensors.
     return npu_fused_moe_forward(
         num_experts,

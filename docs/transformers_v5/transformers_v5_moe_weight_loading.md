@@ -8,7 +8,7 @@ This note documents VeOmni MoE weight-loading expectations under
 Transformers v5 introduced expert-dispatch integration points (`use_experts_implementation` and `ALL_EXPERTS_FUNCTIONS`).
 
 For VeOmni's qwen3_moe path, we use a simpler approach:
-- patch experts behavior in `models` patchgen-generated modeling;
+- implement expert dispatch in the standalone modeling file;
 - construct an instance-local `VeomniOp("moe_experts", "standard", impl)`;
 - always call that handle from the patched expert forward. The eager reference
   is itself a registry row, so no separate module-global gate is needed.
@@ -37,7 +37,7 @@ self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, sel
 ```
 
 Handling summary:
-- safetensor keys are per expert, while VeOmni's patchgen modeling holds
+- safetensor keys are per expert, while VeOmni's standalone modeling holds
   merged expert tensors;
 - a runtime `CheckpointTensorConverter` performs the per-expert -> fused
   conversion on load — no offline preprocessing required.
@@ -90,16 +90,15 @@ Handling summary:
 
 ## Qwen3Moe Handling in VeOmni
 
-VeOmni's patchgen-generated modeling uses the native v5 fused expert layout:
+VeOmni's standalone modeling uses the native v5 fused expert layout:
 - `gate_up_proj` `[E, 2*I, H]`
 - `down_proj` `[E, H, I]`
 
-See `veomni/models/transformers/qwen3_moe/qwen3_moe_gpu_patch_gen_config.py` for the patchgen config.
+See `veomni/models/transformers/qwen3_moe/modeling_qwen3_moe.py` for the implementation.
 
 ### Loading (HF safetensors -> VeOmni modeling)
 
-A runtime `CheckpointTensorConverter` is registered on every patchgen-generated
-model class. For per-expert HF checkpoints, Qwen3-MoE, Qwen3.5-MoE (its MTP
+For per-expert HF checkpoints, Qwen3-MoE, Qwen3.5-MoE (its MTP
 experts), Qwen3-Omni-MoE, DeepSeek-V3 and GLM-MoE-DSA (GLM-5) all use thin
 subclasses of `PerExpertFusedCheckpointTensorConverter`
 (`veomni/models/_moe_per_expert_converter.py`). It converts per-expert HF keys

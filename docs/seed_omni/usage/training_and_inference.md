@@ -46,6 +46,10 @@ model:
 `infer_type` selects the active one, so an exported checkpoint keeps serving
 every scenario.
 
+`infer_graph` is optional for training. A model with no sampler yet leaves it
+(and `infer_type`) out: training and export run without a generation graph, and
+inference, or `OmniModel.generate`, says that one is missing.
+
 ### How a module's arguments are resolved
 
 `build_omni_module_runtime_args` (`veomni/arguments/omni_arguments_types.py`)

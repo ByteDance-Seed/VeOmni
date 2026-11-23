@@ -41,12 +41,12 @@ The build's error message lists the dimensions it saw enabled.
 
 Children can inherit `expert_weight_fp8_all_gather: true` from the global accelerator.
 It enables FP8 transport only for experts whose actual `veomni_moe.impl` is
-`deepgemm_fp8`. A child without matching experts silently skips FP8 registration
+`deepgemm`. A child without matching experts silently skips FP8 registration
 and its compatibility checks, including when the child uses DDP, FP16 or CPU
 offload. Selected experts still undergo all shape, device and FSDP checks.
 The same selection rule applies to standalone models and the composed
 `fsdp_scope: model` wrap; no separate scope flag is needed.
-See [DeepGEMM FP8 transport](../../design/deepgemm_fp8_moe.md#optional-fp8-parameter-all-gather).
+See [DeepGEMM FP8 transport](../../design/deepgemm_moe.md#optional-fp8-parameter-all-gather).
 
 Two per-module properties are not accelerator settings but change how the
 module is wrapped and saved:

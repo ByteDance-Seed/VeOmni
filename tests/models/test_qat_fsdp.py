@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Physical two-GPU acceptance for torchao FP4 QAT rows on a generated Qwen3.
+"""Physical two-GPU acceptance for torchao FP4 QAT rows on a VeOmni Qwen3.
 
 No CPU collective substitute: this case requires two CUDA devices and NCCL. It
 covers accumulated updates, DCP continuation and ordinary HF export/reload with
@@ -34,45 +34,42 @@ from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_comp
 
 
 _LAUNCH = LaunchSpec(nproc=2)
-_QUANT_FUNCTION = {"torchao_mxfp4": "mxfp4_fake_quant", "torchao_nvfp4": "nvfp4_fake_quant"}
+_TORCHAO_FP4_DTYPES = ("nvfp4", "mxfp4")
 
 
-def _torchao_qat_impls() -> list[str]:
-    """Every torchao FP4 row this branch registers, so both formats share one gate."""
-    from veomni.ops import OP_REGISTRY
+def _selection(dtype: str):
+    from veomni.ops import OpsSelection
 
-    return [
-        impl
-        for impl in ("torchao_nvfp4", "torchao_mxfp4")
-        if impl in OP_REGISTRY.list_registered("linear", "standard")
-    ]
+    return OpsSelection(name="torchao", kwargs={"dtype": dtype})
 
 
-def _rows(impl: str) -> dict[str, str]:
-    return {"linear_implementation": impl, "gated_mlp_implementation": impl}
+def _rows(dtype: str) -> dict[str, dict]:
+    sel = {"name": "torchao", "kwargs": {"dtype": dtype}}
+    return {"linear_implementation": sel, "gated_mlp_implementation": sel}
 
 
-def _qat_ops(impl: str):
+def _qat_ops(dtype: str):
     """The selections a training run passes for these rows, as the trainer does on every build."""
     from tests.tools.training_utils import make_eager_ops_config
 
-    return make_eager_ops_config(**_rows(impl))
+    return make_eager_ops_config(**_rows(dtype))
 
 
-def _build_fsdp(weights_path: Path, impl: str, *, skip_hf_load: bool = False):
+def _build_fsdp(weights_path: Path, dtype: str, *, skip_hf_load: bool = False):
     from veomni.arguments import MixedPrecisionConfig
     from veomni.distributed.torch_parallelize import build_parallelize_model
     from veomni.models import build_config, build_foundation_model
 
+    expected = _selection(dtype)
     config = build_config(str(weights_path))
     # The trainer passes its own ops instance, which replaces the recorded rows.
-    assert config.ops_config.linear_implementation == impl
-    assert config.ops_config.gated_mlp_implementation == impl
+    assert config.ops_config.linear_implementation == expected
+    assert config.ops_config.gated_mlp_implementation == expected
     model = build_foundation_model(
-        config, init_device="meta", torch_dtype="float32", ops_implementation=_qat_ops(impl)
+        config, init_device="meta", torch_dtype="float32", ops_implementation=_qat_ops(dtype)
     )
-    assert model.config.ops_config.linear_implementation == impl
-    assert ".generated." in type(model).__module__
+    assert model.config.ops_config.linear_implementation == expected
+    assert type(model).__module__ == "veomni.models.transformers.qwen3.modeling_qwen3"
     model = build_parallelize_model(
         model,
         weights_path=str(weights_path),
@@ -111,42 +108,44 @@ def _optimizer_snapshot(model, optimizer):
 
 
 @contextlib.contextmanager
-def _record_quantizer_calls(impl: str):
+def _record_quantizer_calls():
     """Count fake-quantizer calls per family, so a step proves both rows ran."""
-    from importlib import import_module
-
-    quant = _QUANT_FUNCTION[impl]
-    linear_row = import_module(f"veomni.ops.kernels.linear.standard.{impl}")
-    mlp_row = import_module(f"veomni.ops.kernels.gated_mlp.standard.{impl}")
+    import veomni.ops.kernels.gated_mlp.standard.torchao as mlp_row
+    import veomni.ops.kernels.linear.standard.torchao as linear_row
 
     calls = {"linear": 0, "gated_mlp": 0}
-    originals = {"linear": getattr(linear_row, quant), "gated_mlp": getattr(mlp_row, quant)}
+    originals = {"linear": linear_row.torchao_fake_quant, "gated_mlp": mlp_row.torchao_fake_quant}
 
     def _recorder(family):
-        def _wrapped(tensor, block_size=None):
-            calls[family] += 1
-            if block_size is None:
-                return originals[family](tensor)
-            return originals[family](tensor, block_size)
+        def _factory(dtype):
+            quantize = originals[family](dtype)
 
-        return _wrapped
+            def _wrapped(tensor, block_size=None):
+                calls[family] += 1
+                if block_size is None:
+                    return quantize(tensor)
+                return quantize(tensor, block_size)
 
-    setattr(linear_row, quant, _recorder("linear"))
-    setattr(mlp_row, quant, _recorder("gated_mlp"))
+            return _wrapped
+
+        return _factory
+
+    linear_row.torchao_fake_quant = _recorder("linear")
+    mlp_row.torchao_fake_quant = _recorder("gated_mlp")
     try:
         yield calls
     finally:
-        setattr(linear_row, quant, originals["linear"])
-        setattr(mlp_row, quant, originals["gated_mlp"])
+        linear_row.torchao_fake_quant = originals["linear"]
+        mlp_row.torchao_fake_quant = originals["gated_mlp"]
 
 
-def _step(model, optimizer, step, impl):
+def _step(model, optimizer, step):
     from torch.distributed.tensor import DTensor
 
     before = {name: param.to_local().detach().clone() for name, param in model.named_parameters()}
     optimizer.zero_grad(set_to_none=True)
     losses = []
-    with _record_quantizer_calls(impl) as calls:
+    with _record_quantizer_calls() as calls:
         # Unequal microbatch lengths exercise per-forward dynamic MX quantization.
         for microbatch, length in enumerate((17, 31)):
             generator = torch.Generator().manual_seed(1000 + 100 * step + 10 * dist.get_rank() + microbatch)
@@ -164,7 +163,7 @@ def _step(model, optimizer, step, impl):
     # input once for gate/up, the hidden state once, three weights). Gradient
     # checkpointing reruns every layer's forward in backward, so each micro-batch
     # makes two passes. Both rows must be reached. The counts were verified for
-    # torchao_nvfp4; a new row must re-check them against its own implementation.
+    # torchao; a new row must re-check them against its own implementation.
     layers, microbatches, passes = model.config.num_hidden_layers, 2, 2
     assert calls == {
         "linear": 4 * 2 * layers * microbatches * passes,
@@ -182,7 +181,7 @@ def _step(model, optimizer, step, impl):
     return torch.stack(losses)
 
 
-def _fsdp_worker(root: str, impl: str):
+def _fsdp_worker(root: str, dtype: str):
     from safetensors import safe_open
     from transformers import Qwen3Config
 
@@ -212,37 +211,37 @@ def _fsdp_worker(root: str, impl: str):
                 tie_word_embeddings=False,
                 use_cache=False,
             )
-            config.ops_implementation = _rows(impl)
+            config.ops_implementation = _rows(dtype)
             source = build_foundation_model(
-                config, init_device="cpu", torch_dtype="float32", ops_implementation=_qat_ops(impl)
+                config, init_device="cpu", torch_dtype="float32", ops_implementation=_qat_ops(dtype)
             )
             source.save_pretrained(base_path, safe_serialization=True)
             del source
         dist.barrier()
 
-        model, optimizer = _build_fsdp(base_path, impl)
+        model, optimizer = _build_fsdp(base_path, dtype)
         initial = _master_snapshot(model)
         with safe_open(base_path / "model.safetensors", framework="pt", device="cpu") as checkpoint:
             assert set(checkpoint.keys()) == set(initial)
             for name, param in model.named_parameters():
                 torch.testing.assert_close(param.full_tensor().cpu(), checkpoint.get_tensor(name), atol=0, rtol=0)
-        _step(model, optimizer, 0, impl)
+        _step(model, optimizer, 0)
         saved_weights = _master_snapshot(model)
         assert initial.keys() == saved_weights.keys()
         saved_optimizer = _optimizer_snapshot(model, optimizer)
         assert all(state for state in saved_optimizer.values())
         DistributedCheckpointer.save(str(dcp_path), {"model": model, "optimizer": optimizer})
 
-        expected_losses = _step(model, optimizer, 1, impl)
+        expected_losses = _step(model, optimizer, 1)
         expected_weights = _master_snapshot(model)
         expected_optimizer = _optimizer_snapshot(model, optimizer)
         del model, optimizer
 
-        resumed, resumed_optimizer = _build_fsdp(base_path, impl, skip_hf_load=True)
+        resumed, resumed_optimizer = _build_fsdp(base_path, dtype, skip_hf_load=True)
         DistributedCheckpointer.load(str(dcp_path), {"model": resumed, "optimizer": resumed_optimizer})
         torch.testing.assert_close(_master_snapshot(resumed), saved_weights, atol=0, rtol=0)
         torch.testing.assert_close(_optimizer_snapshot(resumed, resumed_optimizer), saved_optimizer, atol=0, rtol=0)
-        torch.testing.assert_close(_step(resumed, resumed_optimizer, 1, impl), expected_losses, atol=0, rtol=0)
+        torch.testing.assert_close(_step(resumed, resumed_optimizer, 1), expected_losses, atol=0, rtol=0)
         torch.testing.assert_close(_master_snapshot(resumed), expected_weights, atol=0, rtol=0)
         torch.testing.assert_close(_optimizer_snapshot(resumed, resumed_optimizer), expected_optimizer, atol=0, rtol=0)
 
@@ -254,9 +253,10 @@ def _fsdp_worker(root: str, impl: str):
             model_assets=[resumed.config],
         )
         torch.testing.assert_close(_master_snapshot(resumed), expected_weights, atol=0, rtol=0)
-        reloaded, _ = _build_fsdp(hf_path, impl)
-        assert reloaded.config.ops_config.linear_implementation == impl
-        assert reloaded.config.ops_config.gated_mlp_implementation == impl
+        reloaded, _ = _build_fsdp(hf_path, dtype)
+        expected = _selection(dtype)
+        assert reloaded.config.ops_config.linear_implementation == expected
+        assert reloaded.config.ops_config.gated_mlp_implementation == expected
         rounded_weights = {name: weight.bfloat16().float() for name, weight in expected_weights.items()}
         torch.testing.assert_close(_master_snapshot(reloaded), rounded_weights, atol=0, rtol=0)
     finally:
@@ -264,12 +264,12 @@ def _fsdp_worker(root: str, impl: str):
 
 
 @pytest.mark.launch_plan(provider=_LAUNCH)
-@pytest.mark.parametrize("impl", _torchao_qat_impls())
-def test_qwen3_torchao_qat_two_gpu_fsdp2_checkpoint_resume(tmp_path, monkeypatch, impl):
+@pytest.mark.parametrize("dtype", _TORCHAO_FP4_DTYPES)
+def test_qwen3_torchao_qat_two_gpu_fsdp2_checkpoint_resume(tmp_path, monkeypatch, dtype):
     if torch.version.hip is not None or not IS_CUDA_AVAILABLE or runner_device_count() < _LAUNCH.nproc:
         pytest.skip("Requires two NVIDIA CUDA GPUs; no CPU/Gloo substitute.")
     if not all(get_gpu_compute_capability(rank) >= 80 for rank in range(_LAUNCH.nproc)):
         pytest.skip("Requires CUDA GPUs with native BF16 support.")
     pytest.importorskip("torchao")
     monkeypatch.setenv("MODELING_BACKEND", "veomni")
-    torchrun(_fsdp_worker, _LAUNCH.nproc, str(tmp_path), impl)
+    torchrun(_fsdp_worker, _LAUNCH.nproc, str(tmp_path), dtype)
