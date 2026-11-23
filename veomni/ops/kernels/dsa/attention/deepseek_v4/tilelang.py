@@ -61,7 +61,7 @@ def wrapper(
 
     kv = ori_kv if cmp_kv is None else torch.cat((ori_kv, cmp_kv), dim=1)
     if topk_idxs is not None:
-        if q.device.type != "cuda" or q.dtype != torch.bfloat16:
+        if not q.is_cuda or q.dtype != torch.bfloat16:
             return eager.dense_sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale, return_lse=return_lse)
         topk_idxs = topk_idxs.contiguous()
     else:
