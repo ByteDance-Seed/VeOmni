@@ -19,8 +19,6 @@ interleaved gate/up layout with bias and ``alpha`` / ``limit``. Eager is
 the HF expert loop (regular autograd). Fused rows wrap the local Functions.
 """
 
-from torch import nn
-
 from ...platform import (
     NVIDIA_SM70_PLUS,
     NVIDIA_SM90_PLUS,
@@ -53,14 +51,14 @@ _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 #: expert-LoRA request on one of these must be refused rather than silently
 #: falling back to a full-precision ``eager`` base.
 #:
-#: ``deepgemm_fp8`` belongs here for the same reason as ``qat``: its
+#: ``deepgemm`` belongs here for the same reason as ``qat``: its
 #: ``GroupedLinear`` runs the FP8 GEMM in forward, dgrad *and* wgrad. Leaving it
 #: out let a non-SwiGLU activation reach ``merged_experts_act_fn_forward`` -- plain
 #: ``F.linear`` in the model dtype -- and train the routed experts unquantized
-#: while the config said ``deepgemm_fp8``. The remaining rows (``fused_triton``,
+#: while the config said ``deepgemm``. The remaining rows (``fused_triton``,
 #: ``fused_quack``, ``fused_npu``, ``fused_mlu``, ``eager``) do bf16 math and
-#: ignore ``expert_dtype``, so falling back changes nothing for them.
-QUANTIZING_IMPLS = frozenset({"qat", "deepgemm_fp8"})
+#: ignore ``dtype``, so falling back changes nothing for them.
+QUANTIZING_IMPLS = frozenset({"qat", "deepgemm"})
 
 
 register_op(
@@ -145,7 +143,7 @@ register_op(
 register_op(
     "moe_experts",
     "standard",
-    "deepgemm_fp8",
+    "deepgemm",
     description="DeepGEMM blockwise FP8 expert forward, input gradients and weight gradients",
     wrapper=standard_deepgemm.wrapper,
     requirement=GpuKernelRequirement(
