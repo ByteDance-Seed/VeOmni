@@ -9,7 +9,7 @@ import torch
 from transformers import WhisperFeatureExtractor
 
 from ......data.seed_omni.utils.media_metadata import AUDIO_METADATA_KEY
-from ....utils.conversation import ConversationItem, iter_desired_items
+from ....utils.conversation import _OMNI_TOKEN_LEN, ConversationItem, iter_desired_items
 from ...module_processing_base import ModulePreprocessorBase
 from .configuration import Qwen3OmniAudioEncoderConfig
 
@@ -17,6 +17,53 @@ from .configuration import Qwen3OmniAudioEncoderConfig
 # Per-item mel length, stashed so the GPU forward can split the flat encoder
 # output back per item without recomputing it from the feature tensor.
 _OMNI_MEL_LEN = "audio_mel_len"
+
+# Upstream's ``_get_feat_extract_output_lengths`` hardcodes a 100-frame chunk in
+# its ``(length // 100) * 13`` term, and the tower builds its attention
+# ``cu_seqlens`` from that helper while deriving the actual hidden length from
+# the real chunking. The two only agree when ``n_window * 2 == 100``. At any
+# other window the tower crashes inside attention with an opaque
+# ``split_with_sizes`` mismatch, so the module rejects it at construction.
+UPSTREAM_CHUNK_FRAMES = 100
+
+
+def _conv_stack_output_length(length: int) -> int:
+    """Length after the tower's three stride-2, pad-1, kernel-3 convolutions."""
+    for _ in range(3):
+        length = (length - 1) // 2 + 1
+    return length
+
+
+def audio_output_lengths(mel_lengths: torch.Tensor, n_window: int) -> torch.Tensor:
+    """Encoder output length per clip, given its mel length.
+
+    The tower does not convolve a clip whole: it cuts it into ``n_window * 2``
+    frame chunks, pads each, and keeps the unpadded part of each chunk's conv
+    output. So the total is a sum over chunks, and a clip of 100 frames in two
+    50-frame chunks does *not* give the same length as one 100-frame chunk.
+
+    Upstream's ``_get_feat_extract_output_lengths`` hardcodes a chunk of 100
+    (its ``(length // 100) * 13`` term), which is right for the shipped
+    ``n_window=50`` and silently wrong for anything else. This computes it from
+    the config instead. Getting it wrong desynchronises the sibling text
+    encoder's placeholder count from the embed count, and the scatter then
+    misaligns without raising.
+
+    Lives beside the preprocessor rather than in ``modeling.py`` because the
+    *worker* needs it: the encoder's output length is what this row contributes
+    to the sample's token count, and ``dyn_bsz`` reads that before any model
+    exists. ``modeling.py`` imports it from here for the reverse direction
+    (splitting the tower's flat output back per item).
+    """
+    chunk = n_window * 2
+    out = []
+    for length in mel_lengths.tolist():
+        full, remainder = divmod(int(length), chunk)
+        total = full * _conv_stack_output_length(chunk)
+        if remainder:
+            total += _conv_stack_output_length(remainder)
+        out.append(total)
+    return torch.tensor(out, dtype=torch.long, device=mel_lengths.device)
 
 
 class Qwen3OmniAudioPreprocessor(ModulePreprocessorBase):
@@ -39,10 +86,14 @@ class Qwen3OmniAudioPreprocessor(ModulePreprocessorBase):
         feature_extractor: Any,
         dtype: torch.dtype | None = None,
         dummy_features: torch.Tensor | None = None,
+        n_window: int = 50,
     ) -> None:
         self._feature_extractor = feature_extractor
         self._dtype = dtype
         self._dummy_features = dummy_features
+        # Only used to predict the tower's output row count for ``dyn_bsz``; the
+        # tower itself reads the same value from its own checkpoint.
+        self._n_window = int(n_window)
 
     @classmethod
     def from_pretrained(cls, module_path: str, **kwargs: Any) -> Qwen3OmniAudioPreprocessor:
@@ -57,6 +108,7 @@ class Qwen3OmniAudioPreprocessor(ModulePreprocessorBase):
         """Training-only FSDP anchor. 100 mel frames is one full CNN block, the
         smallest length that exercises the length formula."""
         self._dtype = dtype
+        self._n_window = int(config.audio_config.n_window)
         self._dummy_features = torch.zeros(100, config.audio_config.num_mel_bins, dtype=dtype)
 
     def preprocess_conversations(
@@ -77,9 +129,18 @@ class Qwen3OmniAudioPreprocessor(ModulePreprocessorBase):
                 # is the only record of true length, so trim with it here rather
                 # than shipping 3000 padded frames per clip to the GPU.
                 lengths = out["attention_mask"].sum(dim=-1).tolist()
-                for item, features, length in zip(items, out["input_features"], lengths, strict=True):
+                # The encoder's *output* row count is what this item contributes
+                # to the backbone's sequence, so that is what ``dyn_bsz`` has to
+                # count. Stamping the mel-frame count instead would over-report
+                # by ~8x; leaving the key off drops the row from the count
+                # entirely, which is what made an audio-heavy sample look short.
+                token_lens = audio_output_lengths(torch.tensor(lengths, dtype=torch.long), self._n_window).tolist()
+                for item, features, length, token_len in zip(
+                    items, out["input_features"], lengths, token_lens, strict=True
+                ):
                     item.value = features[:, :length].transpose(0, 1).contiguous().to(dtype=self._dtype)
                     item.meta[_OMNI_MEL_LEN] = int(length)
+                    item.meta[_OMNI_TOKEN_LEN] = int(token_len)
                 continue
             if inference:
                 continue
@@ -171,4 +232,4 @@ class Qwen3OmniAudioPreprocessor(ModulePreprocessorBase):
         return librosa.resample(waveform, orig_sr=rate, target_sr=self.sampling_rate)
 
 
-__all__ = ["Qwen3OmniAudioPreprocessor", "_OMNI_MEL_LEN"]
+__all__ = ["Qwen3OmniAudioPreprocessor", "UPSTREAM_CHUNK_FRAMES", "_OMNI_MEL_LEN", "audio_output_lengths"]

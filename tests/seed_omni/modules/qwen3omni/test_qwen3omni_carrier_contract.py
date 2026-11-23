@@ -203,6 +203,30 @@ def test_the_codec_refuses_assistant_audio_that_declares_no_rate():
         preprocessor.preprocess_conversations([[item]])
 
 
+def test_resampled_to_refuses_a_conversion_that_retimed_the_clip():
+    """Retuning must not retime it: the codes are scored against text, so a clip
+    that silently got longer trains the talker against shifted targets.
+
+    Both fields move together, and the duration is checked across them — the one
+    caller (the codec preprocessor) resamples with librosa, whose length is
+    rounded, so the tolerance is a single sample at the coarser rate.
+    """
+    original = AudioMetadata(sampling_rate=22050, num_samples=22050)  # 1.0 s
+
+    # 24 kHz for the same second, rounded to a whole sample: accepted.
+    assert original.resampled_to(24000, 24000).duration_seconds == pytest.approx(1.0)
+    assert original.resampled_to(24000, 24001).duration_seconds == pytest.approx(1.0, abs=1e-3)
+    # A count that only makes sense as a *different* clip: refused.
+    with pytest.raises(ValueError, match="would retime it"):
+        original.resampled_to(24000, 48000)
+
+    for sampling_rate in (0, -1):
+        with pytest.raises(ValueError, match="sampling_rate must be positive"):
+            original.resampled_to(sampling_rate, 24000)
+    with pytest.raises(ValueError, match="num_samples must be non-negative"):
+        original.resampled_to(24000, -1)
+
+
 def test_the_codec_does_nothing_at_inference():
     """The assistant's speech is generation's output there, not its input."""
     preprocessor = Qwen3OmniCodecPreprocessor(sampling_rate=24000)
@@ -258,6 +282,36 @@ def test_the_tower_refuses_a_clip_its_window_would_silently_truncate():
 
     with pytest.raises(ValueError, match="silently truncate"):
         tower.preprocess_conversations([[item]], inference=True)
+
+
+def test_the_audio_preprocessor_stamps_the_towers_output_row_count():
+    """`dyn_bsz` counts a sample's backbone tokens before any model exists, so the
+    worker has to stamp what the row *will* contribute.
+
+    Stamping the mel-frame count would over-report by ~8x (13 rows per 100 mel
+    frames); leaving the key off drops the row from the count entirely, which is
+    what made an audio-heavy sample look short and let the batcher pack too many
+    of them.
+    """
+    from transformers import WhisperFeatureExtractor
+
+    from veomni.models.seed_omni.modules.qwen3omni.audio.processing import audio_output_lengths
+
+    tower = Qwen3OmniAudioPreprocessor(WhisperFeatureExtractor(feature_size=128, sampling_rate=16000), n_window=50)
+    item = ConversationItem(
+        type="audio",
+        value=np.zeros(16000 * 2, dtype=np.float32),  # 2 s at the tower's rate
+        role="user",
+        meta={AUDIO_METADATA_KEY: AudioMetadata(sampling_rate=16000, num_samples=16000 * 2)},
+    )
+
+    tower.preprocess_conversations([[item]], inference=True)
+
+    mel_len = item.meta[_OMNI_MEL_LEN]
+    expected = int(audio_output_lengths(torch.tensor([mel_len]), n_window=50)[0])
+    assert item.meta["_omni_token_len"] == expected
+    # The prediction is the encoder's row count, not the mel-frame count.
+    assert expected < mel_len
 
 
 # ── the carrier predicate the packers and scatters share ──────────────────────

@@ -42,6 +42,11 @@ Three Qwen3-Omni specifics worth knowing before you touch the configs:
     makes a 4 s clip occupy 5.54 s of the clock and drift against video by 38%.
     Note `WhisperFeatureExtractor` never resamples on its own.
 
+    The preprocessor also stamps `_omni_token_len` with the encoder's *output*
+    row count (13 per 100 mel frames), which is what `dyn_bsz` counts — a
+    sample's backbone length has to be known before any model exists, and an
+    audio row left unmarked contributes zero.
+
   A video's *own* soundtrack (`use_audio_in_video`) is a separate matter:
   upstream merge-sorts the two streams' tokens by timestamp on that shared clock.
   VeOmni does not implement that interleave yet, so the chat template and the
@@ -216,7 +221,7 @@ reads bf16 rather than the fp32 master shard.
 
 | Key | Published by | Carried on |
 |-----|--------------|------------|
-| `thinker_embed` / `thinker_hidden` | `qwen3omni_llm.forward` post-hook | `item.meta`, one slice per non-dummy row |
+| `thinker_embed` / `thinker_hidden` | `qwen3omni_llm.forward` post-hook | `item.meta`, one slice per **backbone-input** row (`is_backbone_input`) |
 | `qwen3omni_talker_prompt` | `qwen3omni_text_encoder.encode` post-hook | `item.meta` on the sample's first backbone row |
 | `qwen3omni_talker_labels` | `qwen3omni_codec.encode` post-hook | `item.meta` on the assistant audio row |
 

@@ -31,8 +31,8 @@ from ..modeling import (
 class TrainingMixin(TrainingModuleMixin):
     """Graph hooks for the Qwen3-Omni thinker backbone (training path).
 
-    Packs every non-dummy ``conversation_list`` item's embedding segment into one
-    bs=1 varlen sequence, rebuilds 3-row TMRoPE position ids (text / audio runs +
+    Packs every backbone-input ``conversation_list`` item's embedding segment into
+    one bs=1 varlen sequence, rebuilds 3-row TMRoPE position ids (text / audio runs +
     per-image grid positions), marks visual positions for DeepStack, and threads
     the per-layer DeepStack features into the thinker text model.
     """

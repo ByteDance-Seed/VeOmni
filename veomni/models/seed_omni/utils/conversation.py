@@ -87,6 +87,11 @@ _OMNI_TOKEN_LEN = "_omni_token_len"
 # from ``type``: the same ``type="audio"`` row is backbone input on the user's
 # side and a target on the assistant's, so ``role`` alone is a family
 # convention, while this is a statement the row itself makes.
+#
+# Only Qwen3-Omni sets it today. A future family that keeps a non-embedding row
+# on the carrier for a downstream head must set it too, or the shared packers
+# will read that row as backbone input; a family whose sequence diverges further
+# than that (Qwen3-VL's M-RoPE, BAGEL's MoT mask) keeps its own packer instead.
 _NOT_BACKBONE_INPUT = "_not_backbone_input"
 
 

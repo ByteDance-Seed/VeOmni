@@ -9,49 +9,12 @@ from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import Qw
 from ....utils.conversation import ConversationItem
 from ...module_modeling_base import PretrainedOmniModule
 from .configuration import Qwen3OmniAudioEncoderConfig
-from .processing import _OMNI_MEL_LEN, Qwen3OmniAudioPreprocessor
-
-
-# Upstream's ``_get_feat_extract_output_lengths`` hardcodes a 100-frame chunk in
-# its ``(length // 100) * 13`` term, and the tower builds its attention
-# ``cu_seqlens`` from that helper while deriving the actual hidden length from
-# the real chunking. The two only agree when ``n_window * 2 == 100``. At any
-# other window the tower crashes inside attention with an opaque
-# ``split_with_sizes`` mismatch, so we reject it at construction instead.
-_UPSTREAM_CHUNK_FRAMES = 100
-
-
-def _conv_stack_output_length(length: int) -> int:
-    """Length after the tower's three stride-2, pad-1, kernel-3 convolutions."""
-    for _ in range(3):
-        length = (length - 1) // 2 + 1
-    return length
-
-
-def audio_output_lengths(mel_lengths: torch.Tensor, n_window: int) -> torch.Tensor:
-    """Encoder output length per clip, given its mel length.
-
-    The tower does not convolve a clip whole: it cuts it into ``n_window * 2``
-    frame chunks, pads each, and keeps the unpadded part of each chunk's conv
-    output. So the total is a sum over chunks, and a clip of 100 frames in two
-    50-frame chunks does *not* give the same length as one 100-frame chunk.
-
-    Upstream's ``_get_feat_extract_output_lengths`` hardcodes a chunk of 100
-    (its ``(length // 100) * 13`` term), which is right for the shipped
-    ``n_window=50`` and silently wrong for anything else. This computes it from
-    the config instead. Getting it wrong desynchronises the sibling text
-    encoder's placeholder count from the embed count, and the scatter then
-    misaligns without raising.
-    """
-    chunk = n_window * 2
-    out = []
-    for length in mel_lengths.tolist():
-        full, remainder = divmod(int(length), chunk)
-        total = full * _conv_stack_output_length(chunk)
-        if remainder:
-            total += _conv_stack_output_length(remainder)
-        out.append(total)
-    return torch.tensor(out, dtype=torch.long, device=mel_lengths.device)
+from .processing import (
+    _OMNI_MEL_LEN,
+    UPSTREAM_CHUNK_FRAMES,
+    Qwen3OmniAudioPreprocessor,
+    audio_output_lengths,
+)
 
 
 def encode_qwen3omni_audio_items(
@@ -112,11 +75,11 @@ class Qwen3OmniAudioEncoder(InferenceMixin, PretrainedOmniModule):
         super().__init__(config)
         self.config = config
         chunk = config.audio_config.n_window * 2
-        if chunk != _UPSTREAM_CHUNK_FRAMES:
+        if chunk != UPSTREAM_CHUNK_FRAMES:
             raise ValueError(
                 f"qwen3omni_audio: n_window={config.audio_config.n_window} gives a {chunk}-frame chunk, but the "
-                f"upstream audio tower hardcodes {_UPSTREAM_CHUNK_FRAMES} frames when building its attention "
-                f"cu_seqlens. Only n_window={_UPSTREAM_CHUNK_FRAMES // 2} (as shipped) is consistent; anything "
+                f"upstream audio tower hardcodes {UPSTREAM_CHUNK_FRAMES} frames when building its attention "
+                f"cu_seqlens. Only n_window={UPSTREAM_CHUNK_FRAMES // 2} (as shipped) is consistent; anything "
                 "else crashes inside attention with a split_with_sizes mismatch."
             )
         self.audio_tower = Qwen3OmniMoeAudioEncoder._from_config(self.config.audio_config)
