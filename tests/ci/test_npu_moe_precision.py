@@ -70,8 +70,11 @@ def test_qwen4_expert_forwards_fp32_wgrad_option_only_when_enabled():
     assert calls.pop() == {"num_experts": 2, "activation": "silu", "fp32_wgrad": True}
 
 
-@pytest.mark.parametrize("activation", ["silu", "gelu"])
-def test_precision_validator_uses_actual_qwen4_activation_flag(activation):
+@pytest.mark.parametrize(
+    "activation, override, valid",
+    [("silu", None, True), ("gelu", None, False), ("silu", "gelu", False), ("gelu", "silu", False)],
+)
+def test_precision_validator_uses_actual_qwen4_activation_flag(activation, override, valid):
     from veomni.models.transformers.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextExperts
 
     config = SimpleNamespace(
@@ -82,15 +85,32 @@ def test_precision_validator_uses_actual_qwen4_activation_flag(activation):
         ops_config=SimpleNamespace(moe_implementation="eager"),
     )
     experts = Qwen4ExpTextExperts(config)
-    experts.veomni_moe = SimpleNamespace(impl="fused_npu")
+    kwargs = {"activation": override} if override is not None else {}
+    experts.veomni_moe = SimpleNamespace(impl="fused_npu", kwargs=kwargs)
     model = torch.nn.Module()
     model.config = SimpleNamespace(model_type="qwen4_exp")
     model.experts = experts
-    if activation == "silu":
+    if valid:
         assert validate_qwen4_experts(model) == {id(experts)}
     else:
         with pytest.raises(ValueError, match="SiLU fused_npu experts"):
             validate_qwen4_experts(model)
+
+
+@pytest.mark.parametrize("value", [False, True])
+def test_qwen4_rejects_op_selection_override_of_fp32_wgrad(value):
+    from veomni.models.transformers.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextExperts
+    from veomni.ops.registry import OpsSelection
+
+    config = SimpleNamespace(
+        num_experts=2,
+        hidden_size=4,
+        moe_intermediate_size=3,
+        hidden_act="silu",
+        ops_config=SimpleNamespace(moe_implementation=OpsSelection(name="eager", kwargs={"fp32_wgrad": value})),
+    )
+    with pytest.raises(ValueError, match="Set npu_expert_fp32_wgrad in mixed_precision"):
+        Qwen4ExpTextExperts(config)
 
 
 @pytest.mark.parametrize(

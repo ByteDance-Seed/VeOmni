@@ -56,9 +56,9 @@ again on a worker's first sample after fork or spawn. Producers, their methods,
 configuration, and the template-owned tokenizer must remain immutable for the
 process lifetime. Call `dpo_producer_identity(..., force_refresh=True)` to
 explicitly check the current live objects. The
-[trainer initialization](../../veomni/trainer/text_dpo_trainer.py#L768) captures
-the identity; its [checkpoint state](../../veomni/trainer/text_dpo_trainer.py#L808)
-and [restore validation](../../veomni/trainer/text_dpo_trainer.py#L874) bind it
+[trainer initialization](../../veomni/trainer/text_dpo_trainer.py#L786) captures
+the identity; its [checkpoint state](../../veomni/trainer/text_dpo_trainer.py#L826)
+and [restore validation](../../veomni/trainer/text_dpo_trainer.py#L892) bind it
 alongside objective, data and parallel geometry. Changed or missing provenance
 is rejected for exact trainer-state recovery; use weights-only initialization
 or an independently verified migration when the old identity cannot be proven.
@@ -66,3 +66,11 @@ or an independently verified migration when the old identity cannot be proven.
 The identity detects changes to the declared ID and observed methods; it does
 not inspect every external dependency or prove that the producer's declaration
 is true. The application owns the audit and versioning of external state.
+
+Exact recovery records per-site op selections and explicit `torchao`, `qat`,
+and `deepgemm` rows because they
+can change the frozen reference's log probabilities. To resume with those
+selections, use a checkpoint that records the same configuration or migrate
+the source through an independently verified procedure. For an older checkpoint
+without this record, verify the original run configuration before resuming.
+The old proof did not cover the former nested Float8 policy.

@@ -106,7 +106,7 @@ and stored as `trainer.environ_meter`.
     - [`OmniEnvironMeter.add(micro_batch)`](../../../veomni/utils/omni_helper.py#L123) for each micro-batch: sample count, `ds_idx`.
     - [`start_time`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L68): use the preflight start time when present, otherwise `time.time()`.
   - For each micro-batch: [`forward_backward_step`](../../../veomni/trainer/omni/omni_trainer.py#L511) →
-    [`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L516) →
+    [`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L518) →
     [`TrainNodeRunner`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L78) →
     [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L27), for each node:
     - [`raw.pre_forward(method, **batch)`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L63)
@@ -121,12 +121,12 @@ and stored as `trainer.environ_meter`.
       per metered module [`(estimate_flops(buffer), buffer)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L150); buffer reset.
     - [`OmniEnvironMeter.step(delta_time, global_step, module_metrics)`](../../../veomni/utils/omni_helper.py#L145)
     - [`trainer.step_env_metrics = ...`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L109),
-      logged by [`WandbTraceCallback`](../../../veomni/trainer/callbacks/trace_callback.py#L157).
+      logged by [`WandbTraceCallback`](../../../veomni/trainer/callbacks/trace_callback.py#L160).
 
 `delta_time` covers every micro-batch's forward and backward plus the optimizer
 step. Metering only happens through `TrainNodeRunner`: calling
 `OmniModel.forward` without a `node_runner` (the eager, framework-free path,
-[`OmniModel._run_train_node`](../../../veomni/models/seed_omni/modeling_omni.py#L495))
+[`OmniModel._run_train_node`](../../../veomni/models/seed_omni/modeling_omni.py#L497))
 runs `pre_forward` but never drains the stash, so nothing is counted there.
 
 ## Resulting metrics
@@ -219,7 +219,7 @@ warning. To make a backbone eligible, stash exactly one length per conversation.
 - [`tests/seed_omni/mixins/test_metric_meter_mixin.py`](../../../tests/seed_omni/mixins/test_metric_meter_mixin.py):
   the mixin's stash/accumulate/reset contract and the `OmniEnvironMeter` roll-up,
   including a two-rank gloo run.
-- [`test_metric_meter_collect_drains_only_the_metered_modules`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L399):
+- [`test_metric_meter_collect_drains_only_the_metered_modules`](../../../tests/seed_omni/runtime/test_omni_model_runtime.py#L400):
   the runtime drain.
 - [`tests/seed_omni/trainer/test_step_metrics_callback.py`](../../../tests/seed_omni/trainer/test_step_metrics_callback.py):
   the callback wiring.

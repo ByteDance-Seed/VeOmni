@@ -6,8 +6,12 @@ model:
     # `linear_implementation` covers the attention projections, and
     # `gated_mlp_implementation` covers the fused Qwen3 MLP. Set both to
     # quantize every projection; either alone is a valid partial recipe.
-    linear_implementation: torchao_nvfp4
-    gated_mlp_implementation: torchao_nvfp4
+    linear_implementation:
+      name: torchao
+      kwargs: {dtype: nvfp4}
+    gated_mlp_implementation:
+      name: torchao
+      kwargs: {dtype: nvfp4}
   optimizer:
     type: adamw
     lr: 1.0e-5

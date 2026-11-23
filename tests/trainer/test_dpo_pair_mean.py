@@ -1303,16 +1303,16 @@ def test_native_hccl_rank_local_dpo_checkpoint_cursor_failure_is_coordinated(sce
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize("float8_enabled", [False, True])
-def test_reference_does_not_inherit_expert_fp32_wgrad(monkeypatch, float8_enabled):
-    from veomni.arguments.arguments_types import Float8TrainingConfig, MixedPrecisionConfig
+def test_reference_does_not_inherit_expert_fp32_wgrad(monkeypatch):
+    from veomni.arguments.arguments_types import MixedPrecisionConfig
+    from veomni.ops.registry import OpsSelection
 
-    mixed = MixedPrecisionConfig(
-        npu_expert_fp32_wgrad=not float8_enabled,
-        float8=Float8TrainingConfig(enable=float8_enabled, target_modules=["proj"] if float8_enabled else []),
-    )
+    mixed = MixedPrecisionConfig(npu_expert_fp32_wgrad=True)
+    linear = OpsSelection(name="torchao", kwargs={"dtype": "fp8"})
+    ops = SimpleNamespace(linear_implementation=linear)
     args = SimpleNamespace(
         lora_config={"rank": 8},
+        ops_implementation=ops,
         accelerator=SimpleNamespace(
             fsdp_config=SimpleNamespace(mixed_precision=mixed),
             gradient_checkpointing=SimpleNamespace(enable=True),
@@ -1328,13 +1328,15 @@ def test_reference_does_not_inherit_expert_fp32_wgrad(monkeypatch, float8_enable
 
     def check_reference(self):
         precision = self.args.accelerator.fsdp_config.mixed_precision
-        assert not precision.enable and not precision.npu_expert_fp32_wgrad and not precision.float8.enable
+        assert not precision.enable and not precision.npu_expert_fp32_wgrad
+        assert self.args.ops_implementation.linear_implementation == linear
+        assert self.args.ops_implementation is not ops
         assert all(not parameter.requires_grad for parameter in self.model.parameters())
 
     monkeypatch.setattr(dpo.DPOReferenceModelRuntime, "_build_parallelized_model", check_reference)
     reference = dpo.DPOReferenceModelRuntime(args, train=SimpleNamespace())
     assert args.accelerator.fsdp_config.mixed_precision is mixed
-    assert mixed.enable and mixed.npu_expert_fp32_wgrad is not float8_enabled
-    assert mixed.float8.enable is float8_enabled
+    assert mixed.enable and mixed.npu_expert_fp32_wgrad
+    assert args.ops_implementation is ops
     assert args.lora_config == {"rank": 8}
     assert not reference.model.training

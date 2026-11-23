@@ -732,8 +732,8 @@ def _distributed_standard_ep_worker(rank, merged, activation, impl, endpoint):
 
 @pytest.mark.launch_plan(provider=_EP_DISPATCH_PLAN)
 # The rows this CUDA suite can reach. `fused_npu` and `fused_mlu` need their own
-# accelerators, and `deepgemm_fp8` needs SM90 plus its own distributed test
-# (`test_deepgemm_fp8_distributed.py`), so none of them appear here.
+# accelerators, and `deepgemm` needs SM90 plus its own distributed test
+# (`test_deepgemm_distributed.py`), so none of them appear here.
 #
 # `fused_quack` is listed for its SiLU cases only: `quack.wrapper` hands any other
 # activation to the `eager` row, so a `gelu` case labelled `fused_quack` would
