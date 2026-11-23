@@ -113,17 +113,19 @@ def _talker_config(hf_config: Any) -> Qwen3OmniTalkerConfig:
 
 
 def _codec_config(hf_config: Any) -> Qwen3OmniCodecConfig:
-    """Placeholder: this family's codec needs a second checkpoint.
+    """The decoder half, plus a default Mimi config for the encoder half.
 
-    Implemented so a mistyped route fails with the fix in the message rather than
-    with a ``KeyError``. The family converter builds the codec half properly; see
-    :mod:`veomni.models.seed_omni.modules.qwen3omni.convert_model`.
+    Built rather than refused: ``resolve_omni_checkpoint_root`` materialises every
+    registered module's config before any module is chosen, so raising here would
+    block a thinker-only run that never selects the codec. The encoder's *weights*
+    are what genuinely cannot come from this checkpoint, and
+    ``Qwen3OmniCodec`` refuses at construction when its Mimi half is unloaded —
+    the right place, because that fires only when the module is actually built.
     """
-    del hf_config
-    raise NotImplementedError(
-        "qwen3omni: qwen3omni_codec cannot be built from the Qwen3-Omni checkpoint alone — Qwen3-Omni "
-        "ships only the decoder half and the encoder comes from kyutai/mimi. Convert offline with "
-        "`python scripts/seed_omni/convert_model.py --extra mimi_path=kyutai/mimi`."
+    return Qwen3OmniCodecConfig(
+        code2wav_config=getattr(hf_config, "code2wav_config", None).to_dict()
+        if getattr(hf_config, "code2wav_config", None) is not None
+        else None
     )
 
 

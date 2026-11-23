@@ -43,6 +43,13 @@ class Qwen3OmniCodecConfig(OmniModuleConfig):
         self.code2wav_config = (
             Qwen3OmniMoeCode2WavConfig(**code2wav_config) if code2wav_config else Qwen3OmniMoeCode2WavConfig()
         )
+        # Whether the encoder half was named by whoever built this split. The
+        # converter passes the real Mimi config; a bare upstream checkpoint has
+        # none, so its codec can decode but not encode. Recorded rather than
+        # inferred from the config's *values*, because a default ``MimiConfig``
+        # is indistinguishable from a real one and the difference only shows up
+        # as unloaded weights, long after the fact.
+        self.encoder_from_checkpoint = mimi_config is not None
         self.mimi_config = MimiConfig(**mimi_config) if mimi_config else MimiConfig()
         self.chunk_size = chunk_size
         self.left_context_size = left_context_size

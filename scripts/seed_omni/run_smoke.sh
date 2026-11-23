@@ -162,7 +162,10 @@ run_infer() {
   local name="$1" outdir="$2" log="$3"
   local tokens="$MAX_NEW_TOKENS"
   [[ "$name" == "qwen3omni" ]] && tokens="$QWEN3OMNI_MAX_NEW_TOKENS"
-  local common; common=$(infer_overrides "$outdir/infer" "$tokens")
+  # A per-run directory: `OmniInferencer` appends `<infer_type>` under this, and
+  # a reused path would let a previous run's artefacts satisfy the audio check.
+  local infer_dir="$outdir/infer/$(date +%s%N)"
+  local common; common=$(infer_overrides "$infer_dir" "$tokens")
   case "$name" in
     janus)
       # Distributed (FSDP2 + emb-parallel) text-to-image generation.
@@ -223,9 +226,14 @@ run_infer() {
         --infer.prompt "Hello! Please say this sentence out loud." \
         $common
       rc=$?
-      if [[ $rc -eq 0 ]] && ! compgen -G "$outdir/infer/*.wav" >/dev/null; then
-        # Exit code alone is not evidence for this graph: see the comment above.
-        echo "FAIL: speech graph produced no .wav (generation stopped before vocode)" | tee -a "$log"
+      # Exit code alone is not evidence for this graph: see the comment above.
+      # `OmniInferencer` nests under `<output_dir>/<infer_type>` and writes
+      # `generated_audio_<idx>.wav`, so the search is under this run's own
+      # directory and requires a nonempty file — a stale or zero-length artefact
+      # must not read as a passing speech round.
+      wav=$(find "$infer_dir" -name 'generated_audio_*.wav' -size +0c -print -quit 2>/dev/null)
+      if [[ $rc -eq 0 && -z "$wav" ]]; then
+        echo "FAIL: speech graph wrote no nonempty .wav (generation stopped before vocode)" | tee -a "$log"
         return 1
       fi
       return $rc

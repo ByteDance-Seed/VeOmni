@@ -199,9 +199,14 @@ bash train.sh tasks/omni/train_omni.py configs/seed_omni/Qwen/qwen3omni_30b_a3b/
   --model.model_path /mnt/hdfs/veomni/models/seed_omni/Qwen3-Omni-30B-A3B-Instruct
 ```
 
-The backbone is MoE, so `qwen3omni_llm` and `qwen3omni_talker` declare an expert
-parallel plan (`mlp.experts.gate_up_proj` / `down_proj`); set
-`--accelerator.ep_size N` to use it.
+The backbone is MoE, so `qwen3omni_llm` declares an expert parallel plan
+(`mlp.experts.gate_up_proj` / `down_proj`); set `--model.accelerator.ep_size N`
+to use it. Accelerator settings nest under `model`, so a bare
+`--accelerator.ep_size` is rejected as an unknown root key.
+
+`qwen3omni_talker` is MoE too but ships **no** EP plan yet: its experts are
+sharded by FSDP only, and the talker round is not EP-tested. Adding one is a
+`get_parallel_plan` on its accelerated mixin plus coverage.
 
 `graph_train.yaml` trains the thinker only — the talker and codec are not
 declared, so they are neither built nor sharded.

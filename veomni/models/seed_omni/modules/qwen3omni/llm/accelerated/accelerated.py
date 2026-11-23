@@ -12,6 +12,7 @@ from torch.distributed.tensor.placement_types import Shard
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
+from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import load_balancing_loss_func
 from veomni.utils.tensor_utils import unflatten
 
 from .......distributed.parallel_plan import ParallelPlan
@@ -173,7 +174,9 @@ class TrainingMixin(TrainingModuleMixin):
 
     @post_forward("forward")
     def forward_post(self, **outputs: Any) -> Dict[str, Any]:
-        hidden_states = outputs.get("hidden_states")
+        hidden_states = outputs.pop("hidden_states")
+        router_logits = outputs.pop("router_logits", None)
+        router_mask = outputs.pop("router_attention_mask", None)
         traces = self._thinker_traces(outputs)
 
         if get_parallel_state().sp_size > 1:
@@ -197,7 +200,27 @@ class TrainingMixin(TrainingModuleMixin):
         scatter_llm_hidden_states(conversation, unflatten(hidden_states, pack_shape))
         if traces:
             _scatter_thinker_traces(conversation, *(unflatten(_unbatch(t), pack_shape) for t in traces))
-        return {"conversation_list": conversation}
+
+        result: Dict[str, Any] = {"conversation_list": conversation}
+        if router_logits is not None:
+            # ``OmniModel.forward`` sums every node's ``_loss``, so a mid-graph
+            # module contributes by returning one. Without this the objective was
+            # configured and the logits were collected, then dropped: the run
+            # silently trained on the decode head's CE alone.
+            cfg = self.config.text_config
+            aux_loss = load_balancing_loss_func(
+                router_logits,
+                cfg.num_experts,
+                cfg.num_experts_per_tok,
+                router_mask,
+            )
+            if isinstance(aux_loss, torch.Tensor):
+                # ``router_aux_loss_coef`` is applied here rather than inside the
+                # loss so a zero coefficient still reports the raw term.
+                coefficient = getattr(cfg, "router_aux_loss_coef", 0.0)
+                device = conversation[0][0].value.device
+                result["_loss"] = aux_loss.to(device=device) * coefficient
+        return result
 
     def _thinker_traces(self, outputs: Dict[str, Any]) -> tuple:
         """The talker's two inputs, pulled out of the layer stack this forward kept.

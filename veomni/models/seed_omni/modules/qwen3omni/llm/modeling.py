@@ -367,6 +367,15 @@ class Qwen3OmniLlm(InferenceMixin, PretrainedOmniModule):
     def _spatial_merge_size(self) -> int:
         return self.config.spatial_merge_size
 
+    def _router_aux_loss_enabled(self) -> bool:
+        """Whether the upstream router-balancing objective is configured.
+
+        Mirrors ``Qwen3OmniMoeThinkerForConditionalGeneration.forward``:
+        ``output_router_logits`` defaults to the config field. Off by default, so
+        the common path collects nothing.
+        """
+        return bool(getattr(self.config.text_config, "output_router_logits", False))
+
     def freeze_model(self) -> None:
         """Freeze the whole backbone when ``config.freeze`` (talker training)."""
         if self.config.freeze:
@@ -397,10 +406,18 @@ class Qwen3OmniLlm(InferenceMixin, PretrainedOmniModule):
         if attention_mask is None and position_ids is not None and "cu_seq_lens_q" in kwargs:
             cu = kwargs["cu_seq_lens_q"]
             if cu is not None and int(cu.numel()) == 2:
-                # One sequence: plain causal over the whole packed row.
-                rows = int(inputs_embeds.size(1)) if inputs_embeds is not None else position_ids.size(-1)
+                # One sequence: plain causal, over the *full* sequence. Taken from
+                # ``cu_seqlens`` and not from ``inputs_embeds``, because under
+                # Ulysses that tensor already holds this rank's shard — and the
+                # backends that consume a mask (SDPA in particular) describe the
+                # full sequence that ``cu_seqlens`` names.
+                rows = cu[-1].item()
                 attention_mask = torch.ones(1, rows, dtype=torch.long, device=position_ids.device)
 
+        # Router logits are only collected when the router-balancing objective is
+        # configured; passing the flag unconditionally would make every layer
+        # build the list for nothing. Same gate as the qwen3_moe sibling.
+        output_router_logits = self._router_aux_loss_enabled()
         outputs = self.language_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -409,11 +426,16 @@ class Qwen3OmniLlm(InferenceMixin, PretrainedOmniModule):
             deepstack_visual_embeds=deepstack_visual_embeds,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            output_router_logits=output_router_logits,
             **kwargs,
         )
         result = {
             "hidden_states": outputs.last_hidden_state,
             "past_key_values": outputs.past_key_values,
+            # ``None`` unless the objective is on, and popped by the graph hook
+            # rather than carried through the DAG.
+            "router_logits": outputs.router_logits if output_router_logits else None,
+            "router_attention_mask": attention_mask if output_router_logits else None,
         }
         if kwargs.get("output_hidden_states"):
             # Named apart from ``hidden_states`` (the last layer, what the lm_head

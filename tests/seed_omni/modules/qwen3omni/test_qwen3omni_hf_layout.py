@@ -152,13 +152,34 @@ def test_every_routed_key_maps_back_to_itself():
         assert layout.source_key(module, module_key) == key
 
 
-def test_the_codec_refuses_to_be_built_from_one_checkpoint():
-    """Half a codec is worse than none: a decode-only module loads cleanly and
-    then breaks talker training far from here."""
+def test_the_codec_defers_its_second_checkpoint_to_build_time():
+    """Half a codec is worse than none — but the refusal belongs at build.
+
+    ``resolve_omni_checkpoint_root`` materialises every module's config before
+    any module is selected, so raising here would block a thinker-only run that
+    never touches the codec. The config therefore builds (recording that its
+    encoder half did not come from this checkpoint), and ``Qwen3OmniCodec``
+    refuses in ``__init__`` — which only runs when the module is actually built.
+    """
     from transformers import Qwen3OmniMoeConfig
 
+    from tests.tools.training_utils import make_eager_ops_config
+
+    config = QWEN3OMNI_HF_LAYOUT.modules[CODEC].build_config(Qwen3OmniMoeConfig())
+    config.ops_implementation = make_eager_ops_config().to_dict()
+    assert config.encoder_from_checkpoint is False
+
+    from veomni.models.seed_omni.modules.qwen3omni.codec.modeling import Qwen3OmniCodec
+
     with pytest.raises(NotImplementedError, match="kyutai/mimi"):
-        QWEN3OMNI_HF_LAYOUT.modules[CODEC].build_config(Qwen3OmniMoeConfig())
+        Qwen3OmniCodec(config)
+
+    # The offline converter names the Mimi config, so it does not trip the guard.
+    from transformers import MimiConfig
+
+    from veomni.models.seed_omni.modules.qwen3omni.codec.configuration import Qwen3OmniCodecConfig
+
+    assert Qwen3OmniCodecConfig(mimi_config=MimiConfig().to_dict()).encoder_from_checkpoint is True
 
 
 def test_the_thinker_states_flag_is_the_graphs_call_not_the_checkpoints():

@@ -69,6 +69,7 @@ import argparse
 import io
 import json
 import os
+import re
 import sys
 import time
 from typing import Any
@@ -233,9 +234,24 @@ class ShardWriter:
         self._shard_size = shard_size
         self._tag = tag
         self._rows: list[dict[str, Any]] = []
-        self._shard = 0
+        self._shard = self._next_free_shard(out_dir, tag)
         self._written = 0
         os.makedirs(out_dir, exist_ok=True)
+
+    def _next_free_shard(self, out_dir: str, tag: str) -> int:
+        """First shard number this tag has not used yet.
+
+        Counting from zero would silently overwrite the previous run's shards on
+        ``--append`` — the very rows the flag exists to keep — because the tag is
+        the worker index and does not change between runs.
+        """
+        pattern = re.compile(rf"^{re.escape(tag)}-(\d+)\.parquet$")
+        used = (
+            [int(m.group(1)) for name in os.listdir(out_dir) if (m := pattern.match(name))]
+            if os.path.isdir(out_dir)
+            else []
+        )
+        return max(used, default=-1) + 1
 
     def add(self, row: dict[str, Any]) -> None:
         self._rows.append(row)
@@ -312,9 +328,9 @@ def main() -> None:
     )
     if existing and not script_args.append:
         raise ValueError(
-            f"{script_args.corpus_out} already holds {len(existing)} shard(s). Shard numbering restarts at 0, so "
-            f"this run would overwrite them and mix two generations. Pass --append if that is what you want, or "
-            f"choose a fresh directory."
+            f"{script_args.corpus_out} already holds {len(existing)} shard(s). A new run would add to them; "
+            f"pass --append if that is what you want (shard numbering continues past the existing ones, so "
+            f"nothing is overwritten), or choose a fresh directory."
         )
 
     prompts = read_prompts(script_args.prompts_from, script_args.num_samples)

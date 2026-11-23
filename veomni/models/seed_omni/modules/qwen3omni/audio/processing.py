@@ -156,13 +156,21 @@ class Qwen3OmniAudioPreprocessor(ModulePreprocessorBase):
                 )
             # Per sample: this module's forward still runs on a step with no real
             # audio so its FSDP collectives stay in step with the other ranks.
+            dummy_len = int(self._dummy_features.size(0))
             sample.append(
                 ConversationItem(
                     type="audio",
                     value=self._dummy_features.clone(),
                     role="user",
                     is_dummy=True,
-                    meta={_OMNI_MEL_LEN: int(self._dummy_features.size(0))},
+                    meta={
+                        _OMNI_MEL_LEN: dummy_len,
+                        # The anchor is a real forward for this tower, so it costs
+                        # real rows: 13 per 100 mel frames. Leaving the count off
+                        # made `dyn_bsz` bill a no-audio sample as zero audio tokens
+                        # while the hook still processed the dummy.
+                        _OMNI_TOKEN_LEN: int(audio_output_lengths(torch.tensor([dummy_len]), self._n_window)[0]),
+                    },
                 )
             )
 

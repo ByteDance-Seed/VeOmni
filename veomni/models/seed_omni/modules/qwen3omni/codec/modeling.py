@@ -174,6 +174,16 @@ class Qwen3OmniCodec(InferenceMixin, PretrainedOmniModule):
 
     def __init__(self, config: Qwen3OmniCodecConfig):
         super().__init__(config)
+        if not getattr(config, "encoder_from_checkpoint", True):
+            # Only reachable when the codec is actually selected, which is what
+            # makes this the right place: a thinker-only run never builds it, and
+            # a run that does would otherwise train the talker against codes from
+            # an encoder whose weights were never loaded.
+            raise NotImplementedError(
+                "qwen3omni_codec: this checkpoint was loaded from the upstream root, which ships only the "
+                "decoder half of the audio codec. The encoder comes from kyutai/mimi, so split the checkpoint "
+                "offline first: `python scripts/seed_omni/convert_model.py --extra mimi_path=kyutai/mimi`."
+            )
         self.config = config
         self.code2wav = Qwen3OmniMoeCode2Wav._from_config(self.config.code2wav_config)
         # The full MimiModel, decoder included, even though only ``encode`` is

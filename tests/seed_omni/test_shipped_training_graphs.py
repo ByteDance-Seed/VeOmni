@@ -83,44 +83,6 @@ def _launcher_beside(graph_path: str) -> dict:
     return _load(path) or {}
 
 
-# Modules whose graph endpoints reach a submodule's parameters without calling
-# that submodule, so FSDP2's pre-forward unshard never runs for it. Sharding
-# them fails inside upstream code with a bare "mixed torch.Tensor and DTensor",
-# naming neither the module nor the cause.
-#
-#   Empty today, and that is the point of keeping it: `qwen3omni_codec` used to
-#   be here (`MimiModel._encode_frame` reaches `self.quantizer.encode(...)`, a
-#   method, on a unit upstream's `_no_split_modules` creates) and it left by
-#   being fixed rather than by being exempted — it registers that method with
-#   `register_fsdp_forward_method`, so FSDP's hooks do run. The check that
-#   protects it is `test_encode_works_with_the_quantizer_sharded` in
-#   `test_qwen3omni_codec.py`, which shards the unit and runs the node; a
-#   config-level assertion cannot tell whether the registration is still there.
-#
-#   Add a module here when it reaches a submodule's parameters without calling
-#   that submodule AND does not register the method, so the config has to keep
-#   it out of FSDP2 instead.
-REACHES_WEIGHTS_BY_METHOD_CALL: set[str] = set()
-
-
-def _fsdp_mode(launcher: dict, overrides: dict) -> str:
-    """The effective mode for one module: its own override, else the launcher's.
-
-    ``fsdp_scope: model`` is reported as ``fsdp2`` whatever the module asked
-    for, and that is not a shortcut: at model scope ``ModuleRuntime`` does not
-    parallelize at all and ``OmniModelRuntime`` FSDP2-wraps the composed model
-    using every child's scoped ``_no_split_modules``, so a per-module
-    ``fsdp_mode`` is never read.
-    """
-    for source in (overrides, launcher.get("model", {})):
-        section = source.get("accelerator", {}).get("fsdp_config", {})
-        if str(section.get("fsdp_scope", "")) == "model":
-            return "fsdp2"
-        if "fsdp_mode" in section:
-            return str(section["fsdp_mode"])
-    return "fsdp2"
-
-
 def _gradient_checkpointing_enabled(launcher: dict, overrides: dict) -> bool:
     """The effective flag for one module: its own override, else the launcher's.
 
@@ -223,35 +185,4 @@ def test_no_module_is_asked_to_gradient_checkpoint_when_it_cannot(path: str, sce
                 f"{_relative(list_path)}: {module_type} is asked to gradient-checkpoint but {cls.__name__}"
                 f".supports_gradient_checkpointing is False — the build would raise. Either set "
                 f"accelerator.gradient_checkpointing.enable: false for it, or declare support on the class."
-            )
-
-
-@pytest.mark.parametrize(("path", "scenario", "edges"), GRAPHS, ids=GRAPH_IDS)
-def test_no_module_that_bypasses_its_submodules_is_sharded(path: str, scenario: str, edges: list) -> None:
-    """A module that reads its weights by method call cannot be an FSDP2 shard.
-
-    Vacuous while ``REACHES_WEIGHTS_BY_METHOD_CALL`` is empty — see the note
-    there for why the set is empty and where the real check lives. It stays so
-    that the next module with that shape is caught by config rather than by a
-    step-0 crash: the trap is the inherited value, since a module block that
-    says nothing about ``fsdp_mode`` gets the launcher's, which is ``fsdp2`` for
-    every training config here.
-    """
-    del scenario
-    graph = TrainingGraph(edges)
-    launcher = _launcher_beside(path)
-
-    for list_path, modules in _module_lists_beside(path):
-        for name in graph.execution_order:
-            if is_end(name):
-                continue
-            module_type = graph.module_of(name)
-            if module_type not in REACHES_WEIGHTS_BY_METHOD_CALL:
-                continue
-            mode = _fsdp_mode(launcher, modules.get(module_type) or {})
-            assert mode != "fsdp2", (
-                f"{_relative(list_path)}: {module_type} would be FSDP2-sharded, but it reaches its submodules' "
-                f"parameters by method call, so their unshard hooks never fire. Either register that method with "
-                f"`torch.distributed.fsdp.register_fsdp_forward_method` (and drop it from "
-                f"REACHES_WEIGHTS_BY_METHOD_CALL), or set accelerator.fsdp_config.fsdp_mode: ddp for it."
             )
