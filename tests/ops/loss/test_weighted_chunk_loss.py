@@ -36,6 +36,30 @@ def test_weighted_chunk_loss_and_grads(weights, chunk_size):
         torch.testing.assert_close(actual_g, expected_g, atol=2e-7, rtol=1e-5)
 
 
+def test_weighted_chunk_loss_bypasses_unweighted_native_ce(monkeypatch):
+    from veomni.ops.kernels.loss.cross_entropy_loss.standard import chunk_loss
+
+    def unsupported(*args):
+        raise AssertionError("native CE cannot apply per-token weights")
+
+    monkeypatch.setattr(chunk_loss, "can_use_fused_ce", lambda *args: True)
+    monkeypatch.setattr(chunk_loss, "fused_linear_ce", unsupported)
+    labels = torch.tensor([1, 2, -100])
+    loss_weights = torch.tensor([0.25, 0.75, 0.0])
+    hidden = torch.randn(3, 4, requires_grad=True)
+    weight = torch.randn(5, 4, requires_grad=True)
+    loss = resolve_op("cross_entropy_loss", "standard", "chunk_loss").wrapper(
+        hidden, labels, weight, loss_weights=loss_weights, chunk_size=2
+    )
+    actual_grads = torch.autograd.grad(loss, (hidden, weight))
+    logits = F.linear(hidden, weight)
+    reference = (F.cross_entropy(logits, labels, reduction="none") * loss_weights).sum()
+    expected_grads = torch.autograd.grad(reference, (hidden, weight))
+    torch.testing.assert_close(loss, reference)
+    for actual, expected in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual, expected)
+
+
 def test_causal_weighting_shifts_with_targets_and_matches_dense():
     """Shift token weights with causal targets and compare the dense loss."""
     from veomni.models.loss_utils.cross_entropy_loss import ForCausalLMLoss

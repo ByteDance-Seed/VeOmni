@@ -35,7 +35,7 @@ def wrapper(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
     block_size: int = 128,
-    expert_dtype: str = "fp8",
+    dtype: str = "fp8",
     activation: str = "silu",
 ) -> Tensor:
     """Routed expert MLP. Empty ``fc1_*`` means that layout is unused.
@@ -55,7 +55,7 @@ def wrapper(
     too, because the weights it indexes are sharded per rank under EP; a second
     non-EP copy lived here and indexed a shard with global ids.
     """
-    del assume_distinct_experts, block_size, expert_dtype
+    del assume_distinct_experts, block_size, dtype
     return merged_experts_act_fn_forward(
         hidden_states,
         selected_experts,

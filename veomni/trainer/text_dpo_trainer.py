@@ -161,8 +161,11 @@ class DPOReferenceModelRuntime(VeOmniModelRuntime):
     ):
         args = copy.deepcopy(args)
         args.lora_config = {}
+        # Disable FSDP mixed precision on the frozen reference. Note that
+        # ``args.ops_implementation`` is intentionally kept as copied from the
+        # policy (any low-precision op rows configured there also apply to the
+        # reference model unless changed explicitly in the caller's config).
         args.accelerator.fsdp_config.mixed_precision.enable = False
-        args.accelerator.fsdp_config.mixed_precision.float8.enable = False
         args.accelerator.gradient_checkpointing.enable = False
         args.accelerator.torch_compile.enable = False
         # A second PinnedBufferPool on the frozen copy is wasted host RAM.
