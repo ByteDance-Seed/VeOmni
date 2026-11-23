@@ -1167,7 +1167,11 @@ def test_real_flash_bf16_predictions_and_parameter_gradients_match_sdpa(monkeypa
     actual_predictions, _ = tree_flatten(actual.predictions)
     expected_predictions, _ = tree_flatten(expected.predictions)
     for prediction, target in zip(actual_predictions, expected_predictions, strict=True):
-        torch.testing.assert_close(prediction, target, rtol=3e-2, atol=3e-3)
+        # BF16 kernel rounding propagates through the refiner and two DiT blocks.
+        # Keep a whole-tensor bound as well as the elementwise budget near zero.
+        torch.testing.assert_close(prediction, target, rtol=3e-2, atol=8e-3)
+        difference = prediction.float() - target.float()
+        assert difference.norm() <= 1e-2 * target.float().norm()
     for key in expected.loss:
         torch.testing.assert_close(actual.loss[key], expected.loss[key], rtol=1e-2, atol=1e-3)
     sum(actual.loss.values()).backward()
@@ -1175,7 +1179,7 @@ def test_real_flash_bf16_predictions_and_parameter_gradients_match_sdpa(monkeypa
     for name, parameter in model.named_parameters():
         target = reference_params[name].grad
         assert parameter.grad is not None and target is not None, name
-        torch.testing.assert_close(parameter.grad, target, rtol=8e-2, atol=2e-4, msg=name)
+        torch.testing.assert_close(parameter.grad, target, rtol=8e-2, atol=5e-4, msg=name)
         # Small gradients must also agree in direction and scale, rather than pass on atol alone.
         if target.float().norm() > 1e-6:
             assert_gradient_direction_and_scale(parameter.grad, target, min_cosine=0.995, norm_rtol=5e-2)

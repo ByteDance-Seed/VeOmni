@@ -381,8 +381,29 @@ uv run --no-sync python -m pytest -q -rs \
   -k real_flash_bf16_predictions_and_parameter_gradients_match_sdpa
 ```
 
-CPU collection or skips do not validate these real-kernel cases. Current-head
-CUDA execution and Ascend NPU execution of this path have not been validated.
+CPU collection or skips do not validate these real-kernel cases. On 2026-11-23,
+the FA2 single-sample and packed cases passed on an OpenI A100-PCIE-40GB
+(SM80, driver 580.65.06), with Python 3.12.15, Torch 2.11.0+cu130,
+Transformers 5.16.1, Diffusers 0.37.0 and local FlashAttention 2.8.4:
+**2 passed, 2 skipped** in 4.13 seconds. The FA3 package was absent; FA3 also
+requires SM90+, so this run provides no FA3 validation.
+
+BF16 predictions use elementwise `rtol=3e-2`, `atol=8e-3` and a relative
+L2 error bound of 1% for every output tensor. Parameter gradients use
+`rtol=8e-2`, `atol=5e-4`; gradients above the signal floor additionally need
+cosine similarity above 0.995 and norm agreement within 5%. An FP32 SDPA
+comparison with the same BF16-rounded weights was used to check the initial
+near-zero tolerance failures: FA2 versus BF16 SDPA output relative L2 errors
+were approximately 0.16%–0.32%, and both BF16 paths differed from FP32 on the
+same scale. The independent whole-output and gradient checks retain sensitivity
+when individual near-zero values need a BF16 rounding allowance.
+
+The source was based on `e68ecb0c`, with the calibrated packing test having
+SHA256 `f8555b76db8931ce1aaf6c19b8e7f7889a320ed39fa3511b3b3a1a30537d5322`.
+The inherited image contained an unrelated top-level `scripts` package;
+the test process explicitly selected the repository's `scripts` namespace.
+No numerical kernel stand-in was used. This single-device test does not
+establish accelerator SP/FSDP parity or Ascend NPU execution.
 The standalone adapter/kernel suite is
 `tests/ops/attention/flash/test_flash_attention.py`.
 No end-to-end speedup or convergence is claimed. Benchmark against an equivalent,
