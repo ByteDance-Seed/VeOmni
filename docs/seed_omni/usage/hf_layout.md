@@ -39,8 +39,10 @@ type is an error.
   another checkpoint) still needs split checkpoints. Per-module `model_config`
   overrides apply to the run but not to the exported `config.json`, which is
   the source's (a warning lists them). Expert-parallel streaming load
-  (`ep_sharded_stream_load`) does not apply the renames and is rejected at
-  startup. A module whose checkpoint tensor converter renames or reshapes
+  (`ep_sharded_stream_load`) does apply the layout: it renames each raw key
+  through this layout's `source_key` before streaming that rank's slice, so a
+  module loaded from the upstream root streams directly. A module whose
+  checkpoint tensor converter renames or reshapes
   tensors, or that adds a parameter with no upstream counterpart (a freshly
   initialized projector or head), loads from the upstream root but cannot
   export to it **unless the module declares `export_state`**: that hook runs

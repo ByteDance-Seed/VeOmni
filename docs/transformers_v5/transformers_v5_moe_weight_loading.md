@@ -156,8 +156,16 @@ Row `i` of the output may depend only on row `i` of the key and of its companion
 so the transform commutes with the `Shard(0)` split the ExtraParallel plan makes.
 The streaming loader then reads the same `[start, end)` row range of both keys
 (and never reads the companion on its own), zero-fills rows past the checkpoint,
-and hands the pair to `convert_rows`. A key outside every ExtraParallel plan is
-read whole, together with its whole companion.
+and hands the pair to `convert_rows`.
+
+Which keys may declare one:
+
+- **Dense, not sharded**: read whole, together with its whole companion.
+- **ExtraParallel, row-sharded**: streamed with its companion, as above.
+- **Persistent ExtraParallel** (`persistent_fsdp_shard_dim` set, e.g. Qwen4-Exp
+  PLE): **refused** with `NotImplementedError`. A persistent parameter stays a 2D
+  DTensor over the whole `(para_fsdp, para)` mesh for its entire lifetime, so the
+  loader has no per-rank row slice to pair with a companion's row slice.
 
 `can_handle_tensor` still receives the **raw** tensor, because claiming a key by
 content is how a quantized dense weight is recognised at all. What happens next
