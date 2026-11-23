@@ -135,14 +135,30 @@ def test_swiglu_experts_are_what_every_backend_computes(kernel, activation):
     refuse_fused_moe_on_unsupported_activation(SimpleNamespace(hidden_act=activation), kernel)
 
 
-@pytest.mark.parametrize("activation", ["gelu_pytorch_tanh", "gelu_tanh", "gelu", "gelu_new"])
+@pytest.mark.parametrize("activation", ["gelu_pytorch_tanh", "gelu"])
 def test_triton_serves_the_gelu_family(activation):
     """The Triton path resolves the activation at runtime, so GELU is in scope."""
     config = SimpleNamespace(text_config=SimpleNamespace(hidden_activation=activation))
     refuse_fused_moe_on_unsupported_activation(config, "triton")
 
 
-@pytest.mark.parametrize("activation", ["gelu_pytorch_tanh", "gelu", "gelu_new"])
+@pytest.mark.parametrize("activation", ["gelu_tanh", "gelu_new"])
+def test_the_unserved_gelu_aliases_are_refused_everywhere(activation):
+    """``gelu_tanh`` / ``gelu_new`` are HF spellings that no row computes.
+
+    ``veomni.ops.activation`` serves the tanh approximation under
+    ``gelu_pytorch_tanh`` only, deliberately: the staged-``pow`` variant those
+    aliases name rounds differently in bf16 and no ATen backward reproduces it.
+    Admitting them at the gate would pass build time and then crash or silently
+    diverge on the first forward, so every kernel refuses them.
+    """
+    config = SimpleNamespace(text_config=SimpleNamespace(hidden_activation=activation))
+    for kernel in ("triton", "quack", "npu"):
+        with pytest.raises(ValueError, match="cannot compute the expert activation"):
+            refuse_fused_moe_on_unsupported_activation(config, kernel)
+
+
+@pytest.mark.parametrize("activation", ["gelu_pytorch_tanh", "gelu"])
 @pytest.mark.parametrize("kernel", ["quack", "npu"])
 def test_the_silu_only_backends_refuse_the_gelu_family(activation, kernel):
     """Quack and NPU take the ``activation`` argument only to reject it."""
@@ -171,19 +187,22 @@ def test_an_unrecognised_backend_is_held_to_swiglu():
         refuse_fused_moe_on_unsupported_activation(config, "seed-kernels")
 
 
-def test_the_triton_gate_matches_the_kernel_alias_table():
-    """The gate duplicates the kernel's alias table; pin them together.
+def test_the_triton_gate_matches_the_supported_activation_table():
+    """The gate duplicates the served-activation set; pin them together.
 
-    ``activation_gate`` cannot import the table -- it lives behind a
-    module-level ``import triton`` and the gate runs on CPU-only config paths --
-    so the two drift silently. A name added to the kernel but not the gate is
-    refused at build time even though it works; a name added to the gate but not
-    the kernel turns a build-time refusal into a first-forward crash.
+    ``activation_gate`` cannot import the table -- it lives behind a module-level
+    ``import triton`` and the gate runs on CPU-only config paths -- so the two drift
+    silently. A name added to the served set but not the gate is refused at build time
+    even though it works; a name added to the gate but not the kernels turns a
+    build-time refusal into a first-forward crash.
     """
     _skip_without_triton_moe()
-    from veomni.ops.kernels.moe_experts.shared.activation import _ACTIVATION_ALIASES
+    from veomni.ops.activation import supported_activations
 
-    assert _KERNEL_ACTIVATIONS["triton"] == frozenset(_ACTIVATION_ALIASES)
+    gate_wide = set(_KERNEL_ACTIVATIONS["triton"])
+    # The Triton row computes the whole served set; anything it claims must be
+    # something `veomni.ops.activation` actually resolves.
+    assert gate_wide <= supported_activations()
 
 
 def test_the_refusal_names_the_activation_and_a_way_out():

@@ -10,17 +10,11 @@ from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import (
     Qwen3MoeCheckpointTensorConverter,
     convert_qwen3_moe_fqn_to_index_mapping,
 )
-from veomni.utils.device import IS_NPU_AVAILABLE
+from veomni.models.transformers.qwen3_moe.modeling_qwen3_moe import Qwen3MoeModel
 
 from ...base.llm_packing import SimpleArGenerationMixin
 from ...module_modeling_base import PretrainedOmniModule
 from .configuration import Qwen3MoeLlmConfig
-
-
-if IS_NPU_AVAILABLE:
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_npu import Qwen3MoeModel
-else:
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import Qwen3MoeModel
 
 
 class Qwen3MoeLlm(SimpleArGenerationMixin, PretrainedOmniModule):

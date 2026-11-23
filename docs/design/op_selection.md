@@ -139,16 +139,16 @@ Only quantizing rows are affected — every reference row keeps its fallback.
 
 The gated-MLP rows take the activation as an argument, so a model's `hidden_act`
 decides what its MLP computes whether or not the row quantizes. `veomni/ops/activation.py`
-serves a fixed set of five, delegating to transformers' own implementation of each.
-`gelu_new` and `gelu_pytorch_tanh` are *different* functions whose bf16 intermediates
-round differently, so they are not normalized onto one formula. SiLU keeps its ATen
+serves a fixed set of four, delegating to transformers' own implementation of each.
+`gelu` and `gelu_pytorch_tanh` are *different* functions, so they are not normalized
+onto one formula. SiLU keeps its ATen
 spelling so the quantizing row reuses `eager`'s gradient bit for bit.
 
 | Name | Why it is in the set |
 | --- | --- |
 | `silu`, `swish` | what every model in the repository actually passes today; `swish` is HF's own alias for `silu` |
 | `gelu` | the exact-erf form, the most likely hand-edited value |
-| `gelu_new`, `gelu_pytorch_tanh` | two different implementations, kept together because conflating them was a real bug earlier in this work |
+| `gelu_pytorch_tanh` | the tanh approximation Gemma uses; distinct from `gelu`, and the only GELU form `aten.gelu_backward` reproduces bit for bit |
 
 The set is explicit rather than derived from `ACT2FN`. Deriving means every
 activation transformers ships becomes a capability claimed here, and most of
@@ -176,8 +176,8 @@ quantizing row, so the "refuses instead of falling back" rules do not apply to i
 
 | Row (`standard`) | Activations | When it cannot serve the call |
 | --- | --- | --- |
-| `eager` | the five names, plus anything else through the block's `act_fn` | never — it is the reference |
-| `qat`, `torchao_nvfp4` | the five names | raises, because a fallback would train at full precision |
+| `eager` | the four names, plus anything else resolved through `ACT2FN` | never — it is the reference |
+| `qat`, `torchao_nvfp4` | the four names | raises, because a fallback would train at full precision |
 | `liger_kernel` | SiLU only (Liger's `swiglu_forward`) | runs the projection modules instead |
 
 The refusal is a **forward-time** decision, inside `render` — not a config-layer or
@@ -190,13 +190,19 @@ skipped, not entered. A quantizing row has no such option -- falling back would
 train at full precision under a config that says otherwise -- so it raises, and
 the error names `eager` as the way to keep the fallback.
 
-The routed experts are the exception, and the reason is structural: their
-activation is fused *into* the grouped GEMM (`aten.silu` in the forward,
-`silu_backward` in the backward), so the Python `act_fn` loop is the only path for
-another activation and it cannot reach the family row. A quantizing
-`moe_implementation` on a non-SiLU activation is therefore refused in each model's
-expert forward, via `reject_quantizing_act_fn`. Teaching those kernels an
-activation argument is tracked in #1430.
+The routed experts take the same argument, so a non-SiLU model keeps its activation
+there too. Where it is evaluated depends on the row, and so does what happens when
+the row cannot serve it:
+
+| Row | Activation evaluated | A name it cannot serve |
+| --- | --- | --- |
+| `fused_triton`, `eager` | between the GEMMs | runs it — both resolve a name outside `activation.py` through `ACT2FN`, the table the model built its own `act_fn` from |
+| `qat` | between the GEMMs | refuses — a fallback would train at full precision |
+| `fused_quack`, `fused_npu`, `fused_mlu` | inside the kernel (SiLU only) | delegates to `eager`; these rows do bf16 math, so nothing is lost |
+| `deepgemm_fp8` | inside the FP8 kernel (SiLU only) | refuses — delegating would skip the FP8 GEMMs |
+
+`fused_triton` and `qat` own a hand-written `autograd.Function` whose `forward` runs
+under `no_grad`, which is why the derivative is explicit there.
 
 There is no cross-family conflict to reject. `deepgemm_fp8` and `qat` are two
 values of the same `moe_implementation` field, so the routed experts cannot be
@@ -516,7 +522,7 @@ Selecting `liger_kernel` requires that the model's forward pass provide
 `hidden_states=` and `weights=self.lm_head.weight` through
 `self.loss_function(...)` — the Liger fused linear+CE implementation does the
 projection itself and has no full logits tensor to fall back on. VeOmni's
-patched modeling files (`patched_modeling_*.py`) already do this. If a model
+standalone modeling files (`modeling_*.py`) already do this. If a model
 whose forward was not patched calls `self.loss_function` without these
 kwargs while `cross_entropy_loss_implementation="liger_kernel"`, the Liger
 row raises `RuntimeError` with a pointer to the patch pattern — it does
@@ -653,7 +659,7 @@ fallback would leave the config claiming quantization-aware training.
 
 ### What gets patched
 
-Patchgen-generated modeling constructs a model-local `VeomniOp` handle and
+Standalone HF modeling constructs a model-local `VeomniOp` handle and
 calls it from the relevant method. Every implementation of a variant shares
 that tensor contract. Consumer-specific arguments such as an optional RMSNorm
 weight stay on the model side.
@@ -682,7 +688,7 @@ supported values are `triton` and `eager`.
 - Config base class: `veomni/models/configuration_base.py` — `VeOmniPretrainedConfig`, `config.ops_config`
 - Unified registry: `veomni/ops/registry.py` — `register_op()`, `resolve_op()`, `VeomniOp`
 - Backend registration: `veomni/ops/kernels/{rms_norm,rope,gated_mlp,linear}/__init__.py`
-- Model integration: `veomni/models/transformers/{model}/*_patch_gen_config.py`
+- Model integration: `veomni/models/transformers/{model}/modeling_{model}.py`
 
 ---
 
@@ -781,18 +787,47 @@ raise during config validation or op binding.
 
 | Value | Implementation | Hardware | EP support |
 |-------|--------|----------|:----------:|
-| `eager` | PyTorch expert loop | Any | No |
+| `eager` | PyTorch expert loop | Any | Yes |
 | `fused_triton` | Triton group-gemm | GPU, SM70+ or MLU | Yes |
 | `fused_quack` | Quack CUTLASS/CuTe | GPU, SM90+ (H100+) | Yes |
+| `qat` | TileLang blockwise FP8/FP4 fake quantization over the Triton group-gemm | GPU, SM90+ (needs `tilelang`) | Yes |
 | `deepgemm_fp8` | DeepGEMM FP8 forward/dgrad/wgrad | NVIDIA Hopper SM90 / Blackwell SM100 | Yes |
 | `fused_npu` | NPU group-gemm | Ascend NPU | Yes |
 | `fused_mlu` | Apex grouped-GEMM | Cambricon MLU | Yes |
 
+The table above lists the **`standard`** variant's rows, which serve every MoE model in
+this repository. The `gpt_oss` variant registers its own `eager` and `fused_quack`
+rows instead, because GPT-OSS interleaves gate and up in one tensor and clamps them
+before a sigmoid gate. Both of those rows dispatch for EP through the same
+`dispatch_to_ep_class` as everything else; only their per-rank math stays local to
+`gpt_oss/`, because that interleaved layout is GPT-OSS's own.
+
 Patched experts modules construct `VeomniOp("moe_experts", variant, config.ops_config.moe_implementation)`
-in `__init__` and always call that handle. `eager` is a registered row, not a
-separate `ModuleList` fork. LoRA experts follow the wrapped module's
-`veomni_moe.impl` and fall back to `eager` when that `moe_experts_lora` row is
-unavailable on the device.
+in `__init__` and always call that handle. On both variants `eager` is a registered row,
+not a separate `ModuleList` fork. On `standard` it has no expert loop of its own: it
+delegates to `merged_experts_act_fn_forward` in
+`veomni.ops.kernels.moe_experts.shared.act_fn_experts` whatever the activation and
+whichever weight layout it is handed, so there is exactly one implementation of
+the reference path in the repository. That loop carries the EP dispatch, because
+the weights it indexes are sharded per rank and a global expert id would index
+past the shard.
+
+Before, the dispatch existed only on the model side: the seven patched forwards
+routed a non-SwiGLU activation to a shared fallback before ever constructing the
+handle, and the `eager` row kept a second, non-EP copy of the loop that indexed
+per-expert weights with global ids and raised `IndexError: index N is out of
+bounds` under EP. Now that the activation is a call argument every model reaches
+the row, so the model-side branch and the row's private loop are both gone.
+
+`moe_experts_lora` is a **separate registered family** with its own rows
+(`shared` / `independent` × `eager` / `fused_triton` / `fused_npu`), and the two
+families are not interchangeable. MoE-LoRA follows the wrapped module's
+`veomni_moe.impl` and falls back to its own `eager` row when no `moe_experts_lora`
+row matches the device. All three of its rows support EP through the same
+`dispatch_to_ep_class`; only the per-rank math differs (`fused_npu` runs Ascend grouped
+GEMMs). Every `moe_experts_lora` row hard-codes SwiGLU regardless of `hidden_act`. See
+[MoE-LoRA](../key_features/lora.md#5-moe-lora) for the per-row table and for how the
+two adapter layouts shard under EP.
 
 DeepSeek-V4 keeps eager DSA indexer and attention as its defaults, with optional
 SM90+ `tilelang` and Ascend `cann` indexer and attention implementations, plus
@@ -831,7 +866,7 @@ fixed order (stable argsort, fp32 accumulation) instead of relying on
 - Registration: `veomni/ops/kernels/moe_experts/__init__.py`
 - Activation gate: `veomni/ops/kernels/moe_experts/standard/activation_gate.py`
 - Config base class: `veomni/models/configuration_base.py` — `config.ops_config.moe_implementation`
-- Model integration: `veomni/models/transformers/*/*_patch_gen_config.py`
+- Model integration: `veomni/models/transformers/*/modeling_*.py`
 - Plumbing: `veomni/models/auto.py` — `build_foundation_model(ops_implementation=...)`
 
 ---
@@ -906,9 +941,9 @@ All four are defined in `transformers.integrations`:
 
 | | VeOmni | Transformers v5 |
 |---|--------|----------------|
-| **Mechanism** | Each patched experts module constructs `VeomniOp("moe_experts", variant, impl)` in `__init__` and always calls that handle in `forward`; the selected row may be eager, fused Triton, fused Quack, FP8 DeepGEMM, fused NPU, or fused MLU. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
-| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused_triton"` / `"fused_quack"` / `"deepgemm_fp8"` / `"fused_npu"` / `"fused_mlu"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
-| **EP support** | `fused_triton`, `fused_quack`, `deepgemm_fp8` and `fused_npu` support Expert Parallelism via VeOmni's EP sharding | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
+| **Mechanism** | Each patched experts module constructs `VeomniOp("moe_experts", variant, impl)` in `__init__` and always calls that handle in `forward`; the selected row may be eager, fused Triton, fused Quack, QAT, FP8 DeepGEMM, fused NPU, or fused MLU. | `@use_experts_implementation` decorator on `Qwen3MoeExperts` class; at forward time dispatches via `ALL_EXPERTS_FUNCTIONS.get_interface(config._experts_implementation, original_forward)`. Built-in implementations: `"batched_mm"` (BMM-based), `"grouped_mm"` (PyTorch `torch.nn.functional.grouped_mm`, requires PT 2.9+). |
+| **Config** | `OpsImplementationConfig.moe_implementation` (`"eager"` / `"fused_triton"` / `"fused_quack"` / `"qat"` / `"deepgemm_fp8"` / `"fused_npu"` / `"fused_mlu"`) | `config._experts_implementation` (`"eager"` / `"batched_mm"` / `"grouped_mm"`) |
+| **EP support** | Every row supports Expert Parallelism via VeOmni's EP sharding. The fused rows dispatch inside their fused kernel; `eager` detects sharded weights and dispatches through `merged_experts_act_fn_forward`, which carries the EP all-to-all | `batched_mm` handles invalid expert IDs (sentinel `>= num_experts`) for EP compatibility |
 | **When** | Handle resolution in model `__init__`; dispatch at forward time | Decorator at class definition time; dispatch at forward time |
 
 **Note:** Transformers v5 hardcodes two MoE experts implementations (`batched_mm` and `grouped_mm`) and does not expose a registration interface for external fused implementations, so VeOmni models call their local `VeomniOp` handles rather than routing through `ALL_EXPERTS_FUNCTIONS`.

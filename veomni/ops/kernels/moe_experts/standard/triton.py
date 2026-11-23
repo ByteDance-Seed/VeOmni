@@ -24,9 +24,24 @@ import torch
 from torch import Tensor
 
 from .....distributed.parallel_state import get_parallel_state
+from ....activation import apply_activation
 from ..shared import swiglu
+from ..shared.activation import activation_backward, is_silu
 from ..shared.scatter import compute_expert_scatter_index, compute_max_expert_tokens
 from ..shared.swiglu import apply_swiglu_clamp
+
+
+def _expert_activation(gate: Tensor, activation: str) -> Tensor:
+    """Evaluate the configured activation, whichever name it is.
+
+    ``fused_triton`` is the GPU default, so a config outside the four served names
+    reaches it first. Refusing there would break models that ran fine before the
+    activation became a call argument; ``ACT2FN`` resolves the same callable those
+    models used, and this row does not quantize, so nothing is lost by evaluating it.
+    """
+    from ....activation import resolve, supports
+
+    return apply_activation(gate, activation) if supports(activation) else resolve(activation)(gate)
 
 
 class TritonFusedMoeExpertFunction(torch.autograd.Function):
@@ -51,11 +66,9 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
         # MOE Step 3-1: compute the token num for each expert
         # splits shape (num_experts)
         """Scatter, split fc1 GEMMs, SwiGLU, fc2, gather."""
-        from ..shared.activation import apply_activation, normalize_activation
         from ..shared.dispatch import expert_histogram, moe_gather, moe_scatter
         from ..shared.group_gemm import group_gemm_same_nk, same_nk_tile_schedule
 
-        activation = normalize_activation(activation)
         splits = expert_histogram(expert_index, num_experts)
 
         # MOE Step 3-2: compute the each token's index in result
@@ -125,9 +138,12 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc1_1_output, fc1_2_output, swiglu_limit
         )
 
-        # MOE Step 5: compute the activation of linear layer 1-1
-        # fc1_1_activation shape is (batch_size * sequence_len * topk, ffn_dim)
-        fc1_1_activation = apply_activation(fc1_1_output, activation)
+        # MOE Step 5: apply the model's activation to linear layer 1-1.
+        # fc1_1_activation shape is (batch_size * sequence_len * topk, ffn_dim).
+        # The activation travels with the call because it is a property of the
+        # model, and it is evaluated through ``veomni.ops.activation`` so its
+        # backward matches HF's own autograd bit for bit.
+        fc1_1_activation = _expert_activation(fc1_1_output, activation)
 
         # MOE Step 7: compute final result of linear layer 1
         fc1_activation = fc1_1_activation * fc1_2_output
@@ -185,7 +201,6 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Split-fc1 grads through gather/scatter and grouped GEMM."""
-        from ..shared.activation import apply_activation, apply_activation_backward
         from ..shared.dispatch import moe_gather, moe_scatter
         from ..shared.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 
@@ -251,8 +266,8 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
                 transpose_b=False,
             )
 
-        # recompute during backward
-        fc1_1_activation = apply_activation(fc1_1_output, ctx.activation)
+        # Recompute during backward through the same path forward used.
+        fc1_1_activation = _expert_activation(fc1_1_output, ctx.activation)
 
         # MOE Step 7
         grad_fc1_1_activation = grad_fc1_activation * fc1_2_output
@@ -293,7 +308,7 @@ class TritonFusedMoeExpertFunction(torch.autograd.Function):
             )
 
         # MOE Step 5
-        grad_fc1_1_output = apply_activation_backward(grad_fc1_1_activation.contiguous(), fc1_1_output, ctx.activation)
+        grad_fc1_1_output = activation_backward(grad_fc1_1_activation, fc1_1_output, ctx.activation)
         if swiglu_limit is not None:
             grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
 
@@ -372,12 +387,10 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         assume_distinct_experts=False,
         activation="silu",
     ):
-        """Scatter, merged fc1 GEMM, SwiGLU, fc2, gather."""
-        from ..shared.activation import apply_activation, normalize_activation
+        """Scatter, merged fc1 GEMM, gated activation, fc2, gather."""
         from ..shared.dispatch import expert_histogram, moe_gather, moe_scatter
         from ..shared.group_gemm import group_gemm_same_nk, same_nk_tile_schedule
 
-        activation = normalize_activation(activation)
         splits = expert_histogram(expert_index, num_experts)
         _, scatter_index = compute_expert_scatter_index(expert_index)
         scatter_output = moe_scatter(hidden_states, scatter_index)
@@ -412,11 +425,13 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             fc1_1_output, fc1_2_output, swiglu_limit
         )
 
-        if activation == "silu":
+        # SiLU keeps the fused Triton kernel; any other activation is evaluated the
+        # same way the split-fc1 forward does it, so ``forward`` and ``backward``
+        # cannot disagree about which function was applied.
+        if is_silu(activation):
             fc1_activation = swiglu.merged_swiglu_forward(fc1_1_output, fc1_2_output)
         else:
-            fc1_1_activation = apply_activation(fc1_1_output, activation)
-            fc1_activation = fc1_1_activation * fc1_2_output
+            fc1_activation = _expert_activation(fc1_1_output, activation) * fc1_2_output
 
         reshaped_gate_weight = gate_weights.reshape(-1, 1)
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
@@ -464,7 +479,6 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Merged-fc1 grads through gather/scatter and grouped GEMM."""
-        from ..shared.activation import apply_activation, apply_activation_backward
         from ..shared.dispatch import moe_gather, moe_scatter
         from ..shared.group_gemm import group_gemm_same_mn, group_gemm_same_nk
 
@@ -516,7 +530,7 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             tile_total_M=tile_total_M,
         )
 
-        if ctx.activation == "silu":
+        if is_silu(ctx.activation):
             fc1_activation, grad_fc1_output = swiglu.merged_swiglu_backward(
                 fc1_1_output,
                 fc1_2_output,
@@ -524,12 +538,19 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 mask_fc1_1 if swiglu_limit is not None else None,
                 mask_fc1_2 if swiglu_limit is not None else None,
             )
-            recomputed_fc1_1_activation = None
-            del grad_fc1_activation
         else:
-            # The fused kernel is SiLU-specific; the GELU family keeps the staged path.
-            recomputed_fc1_1_activation = apply_activation(fc1_1_output, ctx.activation)
-            fc1_activation = recomputed_fc1_1_activation * fc1_2_output
+            gate_grad = activation_backward(grad_fc1_activation * fc1_2_output, fc1_1_output, ctx.activation)
+            up_grad = grad_fc1_activation * _expert_activation(fc1_1_output, ctx.activation)
+            # Gate on ``swiglu_limit``, not on the mask tensors: forward saves an
+            # empty float tensor when clamping is off, so "is not None" is always
+            # true and ``~`` would be applied to a float. Same check as the split
+            # backward, which passes ``None`` through in that case.
+            if swiglu_limit is not None:
+                gate_grad.masked_fill_(~mask_fc1_1, 0)
+                up_grad.masked_fill_(~mask_fc1_2, 0)
+            fc1_activation = _expert_activation(fc1_1_output, ctx.activation) * fc1_2_output
+            grad_fc1_output = torch.cat([gate_grad, up_grad], dim=-1)
+        del grad_fc1_activation
 
         # MOE Step 9 - wgrad
         grad_fc2_weight = None
@@ -545,24 +566,6 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
                 transpose_b=False,
             )
         del fc1_activation, grad_fc2_output
-
-        if recomputed_fc1_1_activation is not None:
-            # MOE Step 7 / Step 5 for the GELU family, which has no fused backward.
-            grad_fc1_1_activation = grad_fc1_activation * fc1_2_output
-            grad_fc1_2_output = recomputed_fc1_1_activation * grad_fc1_activation
-            grad_fc1_1_output = apply_activation_backward(
-                grad_fc1_1_activation.contiguous(), fc1_1_output, ctx.activation
-            )
-            del recomputed_fc1_1_activation, grad_fc1_activation, grad_fc1_1_activation
-
-            # Step 5a (backward): zero out gradients in saturated SwiGLU clamp regions.
-            if swiglu_limit is not None:
-                grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
-                grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
-
-            # Merge grad_fc1_1_output and grad_fc1_2_output back to [T, 2I]
-            grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
-            del grad_fc1_1_output, grad_fc1_2_output
 
         # MOE Step 4 - single dgrad for merged fc1
         grad_scatter_output = group_gemm_same_nk(
@@ -626,9 +629,7 @@ def group_gemm_fused_moe_forward(
     """Triton grouped-gemm fused MoE forward pass.
 
     Accepts either split fc1 weights (fc1_1_weight, fc1_2_weight) or a merged
-    fc1_1_2_weight tensor. Model activation names are normalized to the
-    corresponding Triton activation (for example, ``gelu_pytorch_tanh`` maps
-    to ``gelu_new``).
+    fc1_1_2_weight tensor.
 
     - Non-EP path: dispatches to ``MergedFc1TritonFusedMoeExpertFunction`` when
       merged weights are provided, or ``TritonFusedMoeExpertFunction`` when split
@@ -651,15 +652,7 @@ def group_gemm_fused_moe_forward(
     ``False`` uses ``T * top_k``. Eligible eager split/merged execution uses a
     device tile prefix without a host scalar read, including EP-local GEMMs.
     This flag does not change EP's original fallback row bounds.
-
-    ``activation``: the expert activation named by the model config (for
-    example ``gelu_pytorch_tanh``), normalized to the Triton activation it maps
-    to. SiLU keeps the merged/swiglu kernels; the GELU family runs a Triton
-    elementwise kernel.
     """
-    from ..shared.activation import normalize_activation
-
-    activation = normalize_activation(activation)
     routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     # EP comm is outside the Function so all2all is not under no_grad.
     if get_parallel_state().ep_enabled:
@@ -740,11 +733,17 @@ def wrapper(
     num_experts: int,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
-    activation: str = "silu",
     block_size: int = 128,
     expert_dtype: str = "fp8",
+    activation: str = "silu",
 ) -> Tensor:
-    """Call the Triton fused MoE Function. Empty weights are ``None``."""
+    """Call the Triton fused MoE Function. Empty weights are ``None``.
+
+    This is the GPU default row, so a config outside the four served names reaches it
+    first; the activation is evaluated from its name alone, through ATen for the served
+    set and ``ACT2FN`` otherwise.
+    """
+
     del block_size, expert_dtype
     # Empty tensor = unused layout. Registry args stay tensors.
     return group_gemm_fused_moe_forward(

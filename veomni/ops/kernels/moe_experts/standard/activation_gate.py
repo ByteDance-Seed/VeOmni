@@ -52,7 +52,11 @@ _SWIGLU_ACTIVATIONS = frozenset({"silu", "swish"})
 # An unrecognised kernel name gets the SwiGLU set, because an unknown kernel's
 # activation support cannot be assumed.
 _KERNEL_ACTIVATIONS: dict[str, frozenset[str]] = {
-    "triton": frozenset({"silu", "swish", "gelu", "gelu_new", "gelu_pytorch_tanh", "gelu_tanh"}),
+    # Matches `veomni.ops.activation.supported_activations()`, which is what the
+    # kernels actually resolve. `gelu_new` / `gelu_tanh` are *not* in that set --
+    # the served GELU-tanh spelling is `gelu_pytorch_tanh` -- so admitting them
+    # here would pass the build-time gate and then fail the first forward.
+    "triton": frozenset({"silu", "swish", "gelu", "gelu_pytorch_tanh"}),
     "quack": _SWIGLU_ACTIVATIONS,
     "npu": _SWIGLU_ACTIVATIONS,
 }

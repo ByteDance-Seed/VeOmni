@@ -392,7 +392,7 @@ model = build_parallelize_model(
 | `adamw` (default) | Standard `torch.optim.AdamW`. |
 | `adafactor` | `DistributedAdafactor`: Hugging Face Adafactor whose factored row/column statistics keep their FSDP2 DTensor placement. Fixed `lr` (no relative step), `beta1=None`, `decay_rate=-0.8`, `clip_threshold=1.0`; `betas` and `eps` are ignored. Works with FSDP2 and FSDP2 + ExtraParallel. |
 | `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
-| `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases and norms. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
+| `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases, norms, and 2D matrices that route, mix or gate rather than transform features (MoE router gates, mHC stream mixing, the DSA indexer's `weights_proj`, compressor `gate_proj`) — see `_DEFAULT_ADAMW_NAME_PATTERNS` in `veomni/optim/muon.py`. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
 
 `model.optimizer.state_offload: cpu` (with `type: adamw`) keeps the AdamW moment
 states in host buffers — pinned by default, pageable when `state_offload_pin_memory`

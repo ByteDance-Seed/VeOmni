@@ -11,7 +11,9 @@ Reusable skills and knowledge for AI coding agents working on VeOmni. Follows th
 │   ├── veomni-debug/
 │   ├── veomni-review/
 │   ├── veomni-new-model/
-│   ├── veomni-patchgen-model/
+│   ├── veomni-gpu-to-npu/
+│   ├── veomni-gpu-ci-migrate/
+│   ├── veomni-npu-ci-generate/
 │   ├── veomni-seed-omni/
 │   ├── veomni-new-op/
 │   ├── veomni-uv-update/
