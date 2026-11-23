@@ -118,6 +118,7 @@ Key config values (`configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/train/b
 | `model.model_config.canvas_length` | `256` |
 | `model.model_config.max_canvases` | `2` |
 | `model.model_config.canvas_batching` | `flat_seq_pack` |
+| `model.model_config.self_conditioning_prob` | `0.5` |
 | `data.max_seq_len` | `1024` |
 | `model.accelerator.ep_size` | `8` |
 | `model.accelerator.ulysses_size` | `1` |
@@ -130,12 +131,14 @@ Key config values (`configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/train/b
 26B weights are ~49 GB and an unsharded FSDP all-gather does not fit on one card, so
 `ep_size` has to cover the whole world.
 
-**Self-conditioning is not wired on this path.** Training used to attach it through the
-non-Omni trainer; nothing does now, so the model trains without the signal that
-`block_autoregressive_generate` feeds it at every denoising step. The module and its
-`attach_self_conditioning` / `canvas_sample_count` / `self_conditioning_generator` are
-in place, so wiring it is a `@pre_forward` hook plus a per-micro-step counter, not new
-model code.
+**Self-conditioning** (`self_conditioning_prob: 0.5`) costs one extra no-grad forward per
+micro-batch. The draw is a pure function of `(seed, global_step, micro_step)`, so a
+resumed run reproduces the masks it would have drawn; the module derives it in
+`batch_pre` rather than carrying a generator, because `_extra_state` persists only the
+default CPU RNG and Triton compile/autotune disturbs that. Set the probability to 0 to
+skip the pass entirely — the extra pass carries an FSDP all-gather and an EP all-to-all,
+so it runs even on a draw that selects nothing, or the ranks would disagree on how many
+collectives to issue.
 
 ---
 

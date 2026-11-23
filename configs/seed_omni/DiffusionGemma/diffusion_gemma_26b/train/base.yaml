@@ -34,6 +34,10 @@ model:
     canvas_start: 0
     compute_all_canvas_df_loss: true
     canvas_batching: flat_seq_pack
+    # The signal `block_autoregressive_generate` feeds at every denoising step, so
+    # training has to show the model the same one. Drawn per micro-batch from
+    # `(seed, global_step, micro_step)` by the module's `batch_pre`.
+    self_conditioning_prob: 0.5
     encoder_ar_loss: true
     # Generation FSM for `tasks/omni/infer_omni.py`: one node that calls the
     # block-diffusion sampler. Not usable under `ep_size > 1` -- the sampler drives the
