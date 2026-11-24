@@ -70,6 +70,19 @@ class MiniMaxH3DiTModel(PreTrainedModel):
     _no_split_modules = ["MiniMaxH3DiTBlock", "MiniMaxH3DiT"]
     _activation_offload_target_classes = ["MiniMaxH3DiTBlock"]
     _checkpoint_conversion_mapping = {"^": "dit."}
+    _keep_in_fp32_modules_strict = [
+        "video_patch_proj",
+        "audio_patch_proj",
+        "time_embedder",
+        "video_out",
+        "audio_out",
+        "pdd_out",
+    ]
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Report the backbone dtype to HF, independently of the FP32 projections."""
+        return self.dit.condition_proj.weight.dtype
 
     def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
         # Attention validates and binds its backend on the first forward.
@@ -117,6 +130,19 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         )
 
         self._configure_packed_attention(config.ops_config.attn_implementation)
+        # Native constructors initialized real tensors; HF must still initialize
+        # missing checkpoint keys when construction happened on meta.
+        if not any(parameter.is_meta for parameter in self.parameters()):
+            for module in self.modules():
+                module._is_hf_initialized = True
+        self.post_init()
+
+    @torch.no_grad()
+    def _init_weights(self, module):
+        if isinstance(module, torch.nn.Linear):
+            module.reset_parameters()
+        else:
+            super()._init_weights(module)
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None, every_n_layers: int = 1) -> None:
         """Enable checkpointing that preserves gradients for keyword block inputs."""

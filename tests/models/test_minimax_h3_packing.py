@@ -1218,7 +1218,7 @@ def test_h3_async_offload_auto_discovers_blocks_only():
     model = tiny_model()
     apply_async_activation_offload(model, [])
 
-    assert model._no_split_modules == ["MiniMaxH3DiTBlock", "MiniMaxH3DiT"]
+    assert set(model._no_split_modules) == {"MiniMaxH3DiTBlock", "MiniMaxH3DiT"}
     assert not hasattr(model.dit, "_veomni_offload_manager")
     assert [block._veomni_offload_layer_idx for block in model.dit.blocks] == list(range(len(model.dit.blocks)))
 

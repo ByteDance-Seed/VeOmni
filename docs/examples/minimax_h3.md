@@ -348,6 +348,11 @@ parallelization rejects LoRA on the six FP32 projections; other paths do not
 check. `save_hf_safetensor` exports still convert FP32 tensors, including these
 projections, to BF16.
 
+Native HF `model.save_pretrained(...)` preserves the mixed parameter dtypes and
+records the backbone dtype in `config.json`. Reloading with
+`MiniMaxH3DiTModel.from_pretrained(..., dtype="auto")` retains the BF16 backbone
+and the FP32 projections, including image PDD heads.
+
 ### Attention and validation
 
 The DiT and VAE attention backend comes from

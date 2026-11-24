@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -547,6 +548,27 @@ def test_minimax_h3_fp32_linear_accelerator_autocast():
     output.square().mean().backward()
     assert linear.weight.grad is not None and torch.isfinite(linear.weight.grad).all()
     assert linear.bias.grad is not None and torch.isfinite(linear.bias.grad).all()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("audio_enabled", [True, False])
+def test_minimax_h3_save_auto_dtype_preserves_mixed_precision(tmp_path, audio_enabled):
+    config = _tiny_config(audio_enabled=audio_enabled, num_pdd_heads=0 if audio_enabled else 2)
+    config._set_ops_implementation(eager_ops_config())
+    model = MiniMaxH3DiTModel(config).bfloat16()
+    with torch.no_grad():
+        model.dit.video_patch_proj.weight.fill_(1.0 + 2**-12)
+    original = model.state_dict()
+    model.save_pretrained(tmp_path)
+
+    assert model.dtype == torch.bfloat16
+    assert json.loads((tmp_path / "config.json").read_text())["dtype"] == "bfloat16"
+    restored = MiniMaxH3DiTModel.from_pretrained(tmp_path, dtype="auto")
+    assert restored.dtype == torch.bfloat16
+    assert restored.dit.condition_proj.weight.dtype == torch.bfloat16
+    assert restored.dit.video_patch_proj.weight.dtype == torch.float32
+    for name, actual in restored.state_dict().items():
+        torch.testing.assert_close(actual, original[name], rtol=0, atol=0)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
