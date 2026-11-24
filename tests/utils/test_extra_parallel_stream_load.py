@@ -12,30 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-expert -> fused stacking under ``load_model_weights_ep_sharded``, on CPU.
+"""Tests for ``extra_parallel_stream_load`` (``load_model_weights_ep_sharded``).
 
-Each EP rank is simulated in turn with a stub parallel state over a model whose
-expert parameters already hold the rank-local ``[E/ep, ...]`` shape. Most cases
-mirror Qwen3.5-MoE: the trunk experts are fused in the checkpoint while the MTP
-experts are stored per expert and go through ``Qwen3MoeCheckpointTensorConverter``.
-The all-per-expert trunk case covers the Qwen3-MoE, DeepSeek-V3 and
-Qwen3-Omni-MoE checkpoint layouts.
+Covers three layers in one file:
+- CPU unit tests (``LaunchSpec(device="cpu")``): per-expert -> fused stacking
+  (Qwen3-MoE, DeepSeek-V3/V4, GLM-5, Qwen3-Omni-MoE) and ``dim0_rowwise_companion``.
+- 2-accelerator non-PEFT MoE matrix (``LaunchSpec(nproc=2)``): bit-identical load
+  across plain, rank0-broadcast, and streaming for merged / per-expert checkpoints.
+- 2-accelerator PEFT MoE-LoRA (``LaunchSpec(nproc=2)``): bit-identical streaming vs
+  broadcast load for independent and shared MoE-LoRA adapters.
 """
 
+from __future__ import annotations
+
+import argparse
+import gc
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+import yaml
 from safetensors import safe_open
 from safetensors.torch import save_file
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import DTensor, Shard
 
 import veomni.models.checkpoint.weights as checkpoint_weights
-from scripts.ci.accelerator.launch_plan import LaunchSpec
+from scripts.ci.accelerator.launch_plan import LaunchSpec, runner_device_count
+from veomni.arguments.arguments_types import MixedPrecisionConfig
 from veomni.distributed.parallel_plan import ParallelPlan
+from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, get_parallel_state
+from veomni.distributed.torch_parallelize import build_parallelize_model
+from veomni.models.checkpoint.convert import ConvertedCheckpointTensor
 from veomni.models.transformers.deepseek_v3.checkpoint_tensor_converter import DeepseekV3CheckpointTensorConverter
 from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import DeepseekV4CheckpointTensorConverter
 from veomni.models.transformers.glm_moe_dsa.checkpoint_tensor_converter import GlmMoeDsaCheckpointTensorConverter
@@ -43,6 +57,7 @@ from veomni.models.transformers.qwen3_moe.checkpoint_tensor_converter import Qwe
 from veomni.models.transformers.qwen3_omni_moe.checkpoint_tensor_converter import (
     Qwen3OmniMoeCheckpointTensorConverter,
 )
+from veomni.utils.device import get_dist_comm_backend, get_torch_device
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -643,3 +658,513 @@ def test_dim0_rowwise_companion_streams_sharded_with_zero_pad_and_dense(monkeypa
     local_expected = expected_full_table[ep_rank * 4 : (ep_rank + 1) * 4]
     torch.testing.assert_close(model.table.weight.data, local_expected, atol=0, rtol=0)
     torch.testing.assert_close(model.dense.weight.data, dense_w * dense_s, atol=0, rtol=0)
+
+
+# ======================================================================
+# 2-accelerator non-PEFT MoE load matrix (plain / rank0 / stream load)
+# ======================================================================
+
+_CI_LAUNCH_2 = LaunchSpec(nproc=2)
+_MATRIX_E, _MATRIX_OUT, _MATRIX_IN = 8, 6, 4
+_MATRIX_DENSE_OUT, _MATRIX_DENSE_IN = 3, 4
+_MATRIX_VOCAB, _MATRIX_EMB = 10, 4
+
+
+class _PerExpertFuseConverter:
+    """Per-expert -> fused converter without expert-streaming hooks (streaming must bail)."""
+
+    _PREFIX = "moe.experts."
+
+    def __init__(self) -> None:
+        self._buf: dict[int, torch.Tensor] = {}
+
+    def can_handle(self, name: str) -> bool:
+        return name.startswith(self._PREFIX) and name[len(self._PREFIX) :].isdigit()
+
+    def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
+        idx = int(name[len(self._PREFIX) :])
+        self._buf[idx] = tensor.clone()
+        return self._flush() if len(self._buf) == _MATRIX_E else None
+
+    def finalize(self) -> list[ConvertedCheckpointTensor]:
+        return [self._flush()] if self._buf else []
+
+    def _flush(self) -> ConvertedCheckpointTensor:
+        fused = torch.stack([self._buf[i] for i in sorted(self._buf)], dim=0)
+        self._buf.clear()
+        return ConvertedCheckpointTensor(name="moe.experts", tensor=fused)
+
+    def is_dim0_zero_pad(self, name: str) -> bool:
+        return False
+
+
+class _StreamablePerExpertFuseConverter(_PerExpertFuseConverter):
+    """Per-expert -> fused converter with expert-streaming hooks."""
+
+    def __init__(self, num_experts: int = _MATRIX_E, offset: int = 0) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        self.offset = offset
+
+    def convert(self, name: str, tensor: torch.Tensor) -> ConvertedCheckpointTensor | None:
+        idx = int(name[len(self._PREFIX) :]) - self.offset
+        assert 0 <= idx < self.num_experts, f"{name} is outside [{self.offset}, {self.offset + self.num_experts})"
+        self._buf[idx] = tensor.clone()
+        return self._flush() if len(self._buf) == self.num_experts else None
+
+    def fused_expert_target(self, name: str) -> tuple[str, int]:
+        return "moe.experts", int(name[len(self._PREFIX) :])
+
+    def for_expert_range(self, start: int, num_local: int) -> _StreamablePerExpertFuseConverter:
+        return _StreamablePerExpertFuseConverter(num_local, self.offset + start)
+
+
+class _FakeExperts(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.experts = nn.Parameter(torch.empty(_MATRIX_E, _MATRIX_OUT, _MATRIX_IN))
+
+
+class FakeMoeModel(nn.Module):
+    _no_split_modules = ["_FakeExperts"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed = nn.Parameter(torch.empty(_MATRIX_VOCAB, _MATRIX_EMB))
+        self.linear = nn.Linear(_MATRIX_DENSE_IN, _MATRIX_DENSE_OUT, bias=True)
+        self.moe = _FakeExperts()
+        self.config = SimpleNamespace(tie_word_embeddings=False)
+
+    def init_weights(self) -> None:
+        with torch.no_grad():
+            self.embed.normal_()
+            nn.init.xavier_uniform_(self.linear.weight)
+            self.linear.bias.fill_(0.0)
+            nn.init.xavier_uniform_(self.moe.experts)
+
+    def get_parallel_plan(self) -> ParallelPlan:
+        plan = ParallelPlan(extra_parallel_plan={"ep": {"moe.experts": Shard(0)}})
+        plan.extra_parallel_fsdp_no_shard_module = {"ep": {"moe"}}
+        return plan
+
+    @staticmethod
+    def _create_checkpoint_tensor_converter(model):
+        return _PerExpertFuseConverter()
+
+
+class FakeStreamableMoeModel(FakeMoeModel):
+    @staticmethod
+    def _create_checkpoint_tensor_converter(model):
+        return _StreamablePerExpertFuseConverter()
+
+
+def _matrix_reference_state() -> dict[str, torch.Tensor]:
+    g = torch.Generator().manual_seed(1234)
+    return {
+        "embed": torch.randn(_MATRIX_VOCAB, _MATRIX_EMB, generator=g),
+        "linear.weight": torch.randn(_MATRIX_DENSE_OUT, _MATRIX_DENSE_IN, generator=g),
+        "linear.bias": torch.randn(_MATRIX_DENSE_OUT, generator=g),
+        "moe.experts": torch.randn(_MATRIX_E, _MATRIX_OUT, _MATRIX_IN, generator=g),
+    }
+
+
+def _matrix_write_merged(ckpt_dir: Path, ref: dict[str, torch.Tensor]) -> str:
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    save_file({k: v.clone() for k, v in ref.items()}, str(ckpt_dir / "model.safetensors"))
+    return str(ckpt_dir)
+
+
+def _matrix_write_per_expert(ckpt_dir: Path, ref: dict[str, torch.Tensor]) -> str:
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    state = {k: v.clone() for k, v in ref.items() if k != "moe.experts"}
+    for e in range(_MATRIX_E):
+        state[f"moe.experts.{e}"] = ref["moe.experts"][e].clone()
+    save_file(state, str(ckpt_dir / "model.safetensors"))
+    return str(ckpt_dir)
+
+
+def _matrix_full_cpu(t: torch.Tensor) -> torch.Tensor:
+    if isinstance(t, DTensor):
+        t = t.full_tensor()
+    return t.detach().float().cpu()
+
+
+def _matrix_local_expert_shard(t: torch.Tensor) -> torch.Tensor:
+    if isinstance(t, DTensor):
+        t = t.to_local()
+    return t.detach().float().cpu()
+
+
+def _matrix_build_fresh(weights_path, *, loader: str, model_cls=FakeMoeModel):
+    kwargs = dict(
+        weights_path=weights_path,
+        init_device="meta",
+        mixed_precision=MixedPrecisionConfig(enable=False),
+        enable_gradient_checkpointing=False,
+        enable_fsdp_offload=False,
+        basic_modules=[],
+    )
+    if loader == "rank0":
+        kwargs["broadcast_model_weights_from_rank0"] = True
+    elif loader == "ep_sharded":
+        kwargs["extra_parallel_stream_load"] = True
+    return build_parallelize_model(model_cls(), **kwargs)
+
+
+def _run_matrix_worker() -> None:
+    rank = int(os.environ["RANK"])
+    world = int(os.environ["WORLD_SIZE"])
+    get_torch_device().set_device(rank)
+    dist.init_process_group(backend=get_dist_comm_backend())
+    _init_parallel_state(dp_size=world, extra_parallel_sizes=(world,), extra_parallel_names=("ep",), dp_mode="fsdp2")
+
+    tmp = Path(os.environ["MOE_MATRIX_TMP"])
+    ref = _matrix_reference_state()
+    merged_dir = str(tmp / "merged")
+    per_expert_dir = str(tmp / "per_expert")
+    if rank == 0:
+        _matrix_write_merged(tmp / "merged", ref)
+        _matrix_write_per_expert(tmp / "per_expert", ref)
+    dist.barrier()
+
+    ps = get_parallel_state()
+    ep_rank = ps.extra_parallel_rank("ep")
+    per = _MATRIX_E // ps.extra_parallel_sizes["ep"]
+    results = []
+
+    def check(model, tag):
+        params = dict(model.named_parameters())
+        got_experts = _matrix_local_expert_shard(params["moe.experts"])
+        want_experts = ref["moe.experts"][ep_rank * per : (ep_rank + 1) * per]
+        torch.testing.assert_close(got_experts, want_experts, atol=0.0, rtol=0.0)
+        for name in ("linear.weight", "linear.bias", "embed"):
+            torch.testing.assert_close(_matrix_full_cpu(params[name]), ref[name], atol=0.0, rtol=0.0)
+        results.append(f"  [OK] {tag}: experts slice + dense params bit-identical to reference")
+
+    for fmt, path, model_cls in [
+        ("merged", merged_dir, FakeMoeModel),
+        ("nonmerged", per_expert_dir, FakeMoeModel),
+        ("nonmerged-streamable", per_expert_dir, FakeStreamableMoeModel),
+    ]:
+        for loader in ["plain", "rank0", "ep_sharded"]:
+            tag = f"{fmt} x {loader}"
+            expect_bail = fmt == "nonmerged" and loader == "ep_sharded"
+            try:
+                model = _matrix_build_fresh(path, loader=loader, model_cls=model_cls)
+            except NotImplementedError as e:
+                if expect_bail:
+                    results.append(f"  [OK] {tag}: bailed as expected ({str(e)[:60]}...)")
+                else:
+                    results.append(f"  [FAIL] {tag}: unexpected NotImplementedError: {e}")
+                dist.barrier()
+                continue
+            if expect_bail:
+                results.append(f"  [FAIL] {tag}: expected NotImplementedError bail, but load succeeded")
+                dist.barrier()
+                continue
+            check(model, tag)
+            del model
+            dist.barrier()
+
+    if rank == 0:
+        print(f"\n=== NON-PEFT MoE load matrix (world={world}, ep={world}) ===")
+        print("\n".join(results))
+    failed = [r for r in results if "[FAIL]" in r]
+    dist.barrier()
+    dist.destroy_process_group()
+    if failed:
+        raise SystemExit(f"{len(failed)} case(s) FAILED:\n" + "\n".join(failed))
+
+
+_ACCEL = get_torch_device()
+
+
+@pytest.mark.launch_plan(provider=_CI_LAUNCH_2)
+@pytest.mark.skipif(
+    not _ACCEL.is_available() or runner_device_count() < 2,
+    reason="requires >= 2 accelerator devices (CUDA or NPU)",
+)
+def test_moe_extra_parallel_load_matrix(tmp_path):
+    env = dict(os.environ, MOE_MATRIX_TMP=str(tmp_path))
+    cmd = [
+        "torchrun",
+        f"--nproc_per_node={_CI_LAUNCH_2.nproc}",
+        "--standalone",
+        os.path.abspath(__file__),
+        "--worker=matrix",
+    ]
+    subprocess.run(cmd, check=True, env=env)
+
+
+# ======================================================================
+# 2-accelerator PEFT MoE-LoRA streaming vs broadcast load
+# ======================================================================
+
+
+def _peft_fused_ops_override() -> str:
+    from veomni.utils.import_utils import is_torch_npu_available
+
+    backend = "fused_npu" if is_torch_npu_available() else "fused_triton"
+    return f"--model.ops_implementation.moe_implementation={backend}"
+
+
+def _build_and_save_peft_stream_load_assets(root_dir: str) -> None:
+    """Single-process (spawned): build fused base, per-expert base, and non-zero LoRA adapters."""
+    import copy
+    import shutil as _shutil
+
+    from tests.lora.test_moe_lora_trainer import _TOY_CONFIG_PATH, _yaml_for_mode
+    from tests.lora.utils import build_lora_test_model
+    from veomni.arguments.arguments_types import OpsImplementationConfig
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.utils import helper as _helper
+
+    _helper.set_seed(42)
+    ops = OpsImplementationConfig(
+        attn_implementation="eager",
+        moe_implementation="eager",
+        cross_entropy_loss_implementation="eager",
+        rms_norm_implementation="eager",
+        gated_mlp_implementation="eager",
+        rotary_pos_emb_implementation="eager",
+    )
+    model = build_lora_test_model(
+        config_path=_TOY_CONFIG_PATH,
+        weights_path=None,
+        torch_dtype="bfloat16",
+        init_device="cpu",
+        ops_implementation=ops,
+    )
+
+    fused_dir = os.path.join(root_dir, "fused_base")
+    os.makedirs(fused_dir, exist_ok=True)
+    state = {k: v.detach().clone().contiguous() for k, v in model.state_dict().items()}
+    save_file(state, os.path.join(fused_dir, "model.safetensors"))
+    _shutil.copy(_TOY_CONFIG_PATH, os.path.join(fused_dir, "config.json"))
+
+    per_expert_dir = os.path.join(root_dir, "per_expert_base")
+    os.makedirs(per_expert_dir, exist_ok=True)
+    model.save_pretrained(per_expert_dir, safe_serialization=True)
+
+    adapters_dir = os.path.join(root_dir, "adapters")
+    for mode in ("independent", "shared"):
+        with open(_yaml_for_mode(mode)) as f:
+            ycfg = yaml.safe_load(f)
+        lcfg = VeOmniLoraConfig.from_yaml(ycfg["model"]["lora_config"])
+        peft_model = VeOmniLoraModel(copy.deepcopy(model), lcfg)
+        with torch.no_grad():
+            for idx, (name, p) in enumerate(peft_model.named_parameters()):
+                if "lora_A" not in name and "lora_B" not in name:
+                    continue
+                numel = p.numel()
+                vals = (
+                    (torch.arange(1, numel + 1, dtype=torch.float32).remainder(997) + 1.0) / 1024.0
+                    + (idx + 1) * 0.03125
+                ).reshape(p.shape)
+                if p.ndim == 3:
+                    expert_offset = torch.arange(1, p.shape[0] + 1, dtype=torch.float32).view(-1, 1, 1) * 0.125
+                    vals = vals + expert_offset
+                p.copy_(vals.to(p.dtype))
+                assert bool((p != 0).all().item()), f"Expected all non-zero adapter values for {name}"
+        peft_model.save_pretrained(os.path.join(adapters_dir, mode), safe_serialization=True)
+
+
+@pytest.fixture(scope="module")
+def _peft_stream_load_assets_root(tmp_path_factory):
+    import multiprocessing as mp
+
+    from tests.lora.test_moe_lora_ep2 import _expected_qwen3_moe_toy_adapter_shapes, _load_adapter
+
+    root_dir = str(tmp_path_factory.mktemp("stream_load_assets"))
+    ctx = mp.get_context("spawn")
+    proc = ctx.Process(target=_build_and_save_peft_stream_load_assets, args=(root_dir,))
+    proc.start()
+    proc.join()
+    if proc.exitcode != 0:
+        raise RuntimeError(f"stream load assets build subprocess exited with code {proc.exitcode}")
+
+    adapters_dir = os.path.join(root_dir, "adapters")
+    for mode in ("independent", "shared"):
+        mode_dir = os.path.join(adapters_dir, mode)
+        with open(os.path.join(mode_dir, "adapter_config.json")) as f:
+            acfg = json.load(f)
+        assert acfg.get("veomni_lora", {}).get("moe_mode") == mode
+        sd = _load_adapter(mode_dir)
+        expected_shapes = _expected_qwen3_moe_toy_adapter_shapes(mode)
+        assert set(sd) == set(expected_shapes)
+        for k, exp_shape in expected_shapes.items():
+            assert tuple(sd[k].shape) == exp_shape
+            assert bool((sd[k] != 0).all().item()), f"{mode}/{k} has zero elements in fixture"
+
+    return root_dir
+
+
+def _make_adapter_resume_yaml(base_yaml: str, adapter_path: str, dest: str) -> str:
+    with open(base_yaml) as f:
+        cfg = yaml.safe_load(f)
+    cfg["model"]["lora_config"]["lora_adapter"] = adapter_path
+    cfg["train"]["max_steps"] = 1
+    cfg["train"]["checkpoint"]["save_steps"] = 0
+    cfg["train"]["checkpoint"]["save_hf_weights"] = False
+    cfg["train"]["checkpoint"]["hf_save_steps"] = 0
+    cfg["train"]["checkpoint"].pop("load_path", None)
+    with open(dest, "w") as f:
+        yaml.safe_dump(cfg, f)
+    return dest
+
+
+_PEFT_STREAM_LOAD_SCENARIOS: tuple[tuple[str, str], ...] = (
+    ("independent", "fused"),
+    ("shared", "fused"),
+    ("independent", "per_expert"),
+)
+
+
+def _peft_scenario_argv(yaml_path: str, output_dir: str, base_dir: str, *, stream_load: bool) -> list[str]:
+    argv = [
+        "tests/utils/test_extra_parallel_stream_load.py",
+        yaml_path,
+        f"--train.checkpoint.output_dir={output_dir}",
+        f"--model.model_path={base_dir}",
+        f"--model.config_path={base_dir}",
+        _peft_fused_ops_override(),
+        "--model.accelerator.ep_size=2",
+    ]
+    if stream_load:
+        argv.extend(
+            [
+                "--model.broadcast_model_weights_from_rank0=False",
+                "--model.extra_parallel_stream_load=True",
+            ]
+        )
+    else:
+        argv.extend(
+            [
+                "--model.broadcast_model_weights_from_rank0=True",
+                "--model.extra_parallel_stream_load=False",
+            ]
+        )
+    return argv
+
+
+def _peft_load_and_snapshot(
+    yaml_path: str, output_dir: str, base_dir: str, *, stream_load: bool
+) -> dict[str, torch.Tensor]:
+    from tests.lora.test_moe_lora_trainer import MoeLoraTrainer
+    from veomni.arguments import VeOmniArguments, parse_args
+
+    sys.argv = _peft_scenario_argv(yaml_path, output_dir, base_dir, stream_load=stream_load)
+    args = parse_args(VeOmniArguments)
+    trainer = MoeLoraTrainer(args)
+    trainer.snapshot_callback._dump("pre")
+    base_local = {
+        n: (p.to_local() if hasattr(p, "to_local") else p).detach().cpu().clone()
+        for n, p in trainer.model.named_parameters()
+        if ".base_layer.weight" in n
+    }
+    del trainer
+    gc.collect()
+    if dist.is_initialized():
+        dist.barrier()
+    return base_local
+
+
+def _run_peft_stream_load_worker(argv: list[str]) -> None:
+    from tests.lora.test_moe_lora_trainer import SNAPSHOT_PRE, _compare_snapshots_bit_exact, _yaml_for_mode
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--work-dir", required=True)
+    parser.add_argument("--fused-base-dir", required=True)
+    parser.add_argument("--per-expert-base-dir", required=True)
+    parser.add_argument("--adapters-dir", required=True)
+    parser.add_argument("--reverse-scenarios", action="store_true")
+    cli_args = parser.parse_args(argv)
+
+    scenarios = list(_PEFT_STREAM_LOAD_SCENARIOS)
+    if cli_args.reverse_scenarios or os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1":
+        scenarios = list(reversed(scenarios))
+
+    local_rank = os.environ.get("LOCAL_RANK", "0")
+    try:
+        for mode, base_layout in scenarios:
+            label = f"{mode}_{base_layout}"
+            base_dir = cli_args.fused_base_dir if base_layout == "fused" else cli_args.per_expert_base_dir
+            adapter_dir = os.path.join(cli_args.adapters_dir, mode)
+            resume_yaml = _make_adapter_resume_yaml(
+                _yaml_for_mode(mode),
+                adapter_dir,
+                os.path.join(cli_args.work_dir, f"resume_{label}_rank{local_rank}.yaml"),
+            )
+            ref_dir = os.path.join(cli_args.work_dir, f"ref_{label}")
+            stream_dir = os.path.join(cli_args.work_dir, f"stream_{label}")
+
+            ref_base_local = _peft_load_and_snapshot(resume_yaml, ref_dir, base_dir, stream_load=False)
+            stream_base_local = _peft_load_and_snapshot(resume_yaml, stream_dir, base_dir, stream_load=True)
+
+            assert set(ref_base_local) == set(stream_base_local)
+            for name, ref_t in ref_base_local.items():
+                assert torch.equal(stream_base_local[name], ref_t), (
+                    f"[{label}] base expert local shard mismatch for {name}"
+                )
+
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                _compare_snapshots_bit_exact(
+                    actual_path=os.path.join(stream_dir, SNAPSHOT_PRE),
+                    ref_path=os.path.join(ref_dir, SNAPSHOT_PRE),
+                    label=f"{mode}/{base_layout}/extra_parallel_stream_vs_broadcast",
+                )
+            if dist.is_initialized():
+                dist.barrier()
+        if dist.is_initialized():
+            dist.barrier()
+    finally:
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        finally:
+            clear_parallel_state()
+
+
+@pytest.mark.launch_plan(provider=_CI_LAUNCH_2)
+@pytest.mark.skipif(
+    not _ACCEL.is_available() or runner_device_count() < 2,
+    reason="requires >= 2 accelerator devices (CUDA or NPU)",
+)
+def test_peft_extra_parallel_stream_load_matches_broadcast(tmp_path, _peft_stream_load_assets_root):
+    """Fused 2-rank worker comparing streaming vs broadcast PEFT MoE-LoRA load across all 3 layouts."""
+    from tests.lora.test_moe_lora_trainer import _gpu_count_or_skip
+
+    nproc = _gpu_count_or_skip(min_count=_CI_LAUNCH_2.nproc, max_count=_CI_LAUNCH_2.nproc)
+    work_dir = str(tmp_path / "stream_load_work")
+    os.makedirs(work_dir, exist_ok=True)
+    fused_base_dir = os.path.join(_peft_stream_load_assets_root, "fused_base")
+    per_expert_base_dir = os.path.join(_peft_stream_load_assets_root, "per_expert_base")
+    adapters_dir = os.path.join(_peft_stream_load_assets_root, "adapters")
+
+    cmd = [
+        "torchrun",
+        "--nnodes=1",
+        f"--nproc_per_node={nproc}",
+        "--standalone",
+        os.path.abspath(__file__),
+        "--worker=peft",
+        f"--work-dir={work_dir}",
+        f"--fused-base-dir={fused_base_dir}",
+        f"--per-expert-base-dir={per_expert_base_dir}",
+        f"--adapters-dir={adapters_dir}",
+    ]
+    res = subprocess.run(cmd, check=True)
+    assert res.returncode == 0
+
+
+if __name__ == "__main__":
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", choices=("matrix", "peft"), default="matrix")
+    mode_args, rest = parser.parse_known_args()
+    if mode_args.worker == "matrix":
+        os.environ.setdefault("MOE_MATRIX_TMP", "/tmp/moe_ep_matrix_fixture")
+        _run_matrix_worker()
+        print("ALL CASES PASSED", file=sys.stderr)
+    else:
+        _run_peft_stream_load_worker(rest)

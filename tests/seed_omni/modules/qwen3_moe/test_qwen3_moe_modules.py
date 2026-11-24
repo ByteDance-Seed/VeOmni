@@ -25,7 +25,7 @@ converter is a no-op there; it only acts on a plain per-expert HF release. That
 the two layouts coincide is what makes ``extra_parallel_stream_load``'s dim-0 slice
 valid; the converter's fuse/no-op behaviour is covered by
 ``tests/models/base/test_checkpoint_tensor_converter.py``, the streaming loader by
-``tests/utils/test_ep_sharded_expert_stream_load.py``, and this file only pins the
+``tests/utils/test_extra_parallel_stream_load.py``, and this file only pins the
 wiring that attaches it (``num_experts`` lives on ``config.text_config``).
 """
 

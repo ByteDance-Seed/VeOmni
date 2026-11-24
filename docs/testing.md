@@ -99,7 +99,7 @@ tests/
 │
 ├── utils/                          # Misc utility tests
 │   ├── test_count_flops.py                       # FLOPs estimation
-│   ├── test_ep_sharded_expert_stream_load.py     # extra_parallel_stream_load per-rank per-expert stacking (CPU)
+│   ├── test_extra_parallel_stream_load.py        # extra_parallel_stream_load: CPU stacking + 2-device MoE & PEFT LoRA matrix
 │   ├── test_extra_parallel_clip_grad_norm.py      # Grad clipping with EP/EMB dims (8 GPUs)
 │   ├── test_helper.py                             # EnvironMeter utility (8 GPUs)
 │   ├── test_model_loader.py                       # Model loading (4 GPUs)

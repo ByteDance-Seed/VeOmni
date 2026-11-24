@@ -200,23 +200,13 @@
     ]
   },
   {
-    "name": "npu-unit-17",
-    "suite": "unit",
-    "args": [
-      "-v",
-      "-s",
-      "-x",
-      "tests/utils/test_moe_extra_parallel_load_matrix.py"
-    ]
-  },
-  {
     "name": "npu-unit-18",
     "suite": "unit",
     "args": [
       "-v",
       "-s",
       "-x",
-      "tests/utils/test_ep_sharded_expert_stream_load.py"
+      "tests/utils/test_extra_parallel_stream_load.py"
     ]
   },
   {
@@ -383,16 +373,6 @@
       "-s",
       "-x",
       "tests/lora/test_qwen3_5_moe_lora.py"
-    ]
-  },
-  {
-    "name": "npu-unit-35",
-    "suite": "unit",
-    "args": [
-      "-v",
-      "-s",
-      "-x",
-      "tests/lora/test_moe_lora_extra_parallel_stream_load.py"
     ]
   },
   {

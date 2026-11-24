@@ -281,23 +281,13 @@
     ]
   },
   {
-    "name": "25-unit",
-    "suite": "unit",
-    "conditional": false,
-    "args": [
-      "-s",
-      "-x",
-      "tests/utils/test_moe_extra_parallel_load_matrix.py"
-    ]
-  },
-  {
     "name": "26-unit",
     "suite": "unit",
     "conditional": false,
     "args": [
       "-s",
       "-x",
-      "tests/utils/test_ep_sharded_expert_stream_load.py"
+      "tests/utils/test_extra_parallel_stream_load.py"
     ]
   },
   {
@@ -571,16 +561,6 @@
       "-s",
       "-x",
       "tests/lora/test_moe_lora_ep2.py"
-    ]
-  },
-  {
-    "name": "54-unit",
-    "suite": "unit",
-    "conditional": false,
-    "args": [
-      "-s",
-      "-x",
-      "tests/lora/test_moe_lora_extra_parallel_stream_load.py"
     ]
   },
   {
