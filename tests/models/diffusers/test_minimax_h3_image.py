@@ -751,6 +751,15 @@ def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_image_pipeline_rejects_audio_before_loading(tmp_path):
+    # No checkpoint files exist: the invalid override must fail before any weight I/O.
+    with pytest.raises(ValueError, match="audio_enabled=False"):
+        MiniMaxH3ImagePipeline.from_pretrained(
+            str(tmp_path), device="cpu", transformer_config_kwargs={"audio_enabled": True}
+        )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("sigmas", [[1.0, 0.0], [1.0, 0.75, 0.5, 0.0]])
 def test_minimax_h3_image_pipeline_rejects_mismatched_pdd_schedule_before_loading(tmp_path, sigmas):
     save_file(

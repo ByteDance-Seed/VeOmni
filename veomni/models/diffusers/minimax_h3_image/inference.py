@@ -123,6 +123,10 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         transformer_config_kwargs: dict | None = None,
         ops_implementation=None,
     ) -> "MiniMaxH3ImagePipeline":
+        transformer_config_kwargs = dict(transformer_config_kwargs or {})
+        transformer_config_kwargs.setdefault("audio_enabled", False)
+        if transformer_config_kwargs["audio_enabled"]:
+            raise ValueError("MiniMax-H3-Image requires audio_enabled=False.")
         model_path = str(Path(model_path))
         pipe = MiniMaxH3ImagePipeline(device=device, torch_dtype=torch_dtype)
         if ops_implementation is None and pipe.device.type == "cpu":
@@ -174,9 +178,7 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
             pipe.vae_spatial_compression_ratio = pipe.vae.spatial_compression_ratio
             pipe.latent_channels = pipe.vae.config.latent_channels
 
-        transformer_config_kwargs = dict(transformer_config_kwargs or {})
         transformer_config_kwargs.setdefault("num_pdd_heads", num_pdd_heads)
-        transformer_config_kwargs.setdefault("audio_enabled", False)
         transformer_config_path = os.path.join(model_path, "transformer", "config.json")
         dit_config = MiniMaxH3DiTModelConfig.from_pretrained(
             transformer_config_path, _validate_ops=False, **transformer_config_kwargs
