@@ -24,7 +24,7 @@ model:
     - v_proj
     - o_proj
 data:
-  train_path: ./data/text.parquet
+  train_path: ./fineweb/sample/10BT
   datasets_type: mapping
   data_type: plaintext
   max_seq_len: 1024

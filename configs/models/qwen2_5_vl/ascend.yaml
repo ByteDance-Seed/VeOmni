@@ -17,7 +17,7 @@ model:
       fsdp_mode: fsdp2
   chat_template: qwen2_5vl
 data:
-  train_path: ./data/sharegpt4v.parquet
+  train_path: sharegpt4v_instruct_gpt4-vision_cap100k_coco.json
   data_type: conversation
   max_seq_len: 1024
   mm_configs:

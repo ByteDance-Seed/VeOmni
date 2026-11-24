@@ -72,7 +72,7 @@ bash train.sh tasks/train_vlm.py configs/models/qwen3_vl/recipes/multisource_8b.
     --data.datasets_type iterable \
     --data.source_name sharegpt4v_sft \
     --data.dataloader.num_workers 8 \
-    --train.micro_batch_size 3
+    --train.micro_batch_size 1
 ```
 
 ### Qwen3-VL-30B

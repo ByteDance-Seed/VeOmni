@@ -79,8 +79,8 @@ Our guiding principles when building VeOmni are:
 | [Cosmos3-Nano](https://huggingface.co/nvidia/Cosmos3-Nano) | ✅ | ✅ | — | — | [YAML](configs/models/cosmos3/cuda.yaml) |
 | [DeepSeek-V2.5 / V3 / R1](https://huggingface.co/deepseek-ai) | ✅ | ✅ | ✅ | — | [YAML](configs/models/deepseek_v3/cuda.yaml) |
 | [DeepSeek-V4](https://huggingface.co/deepseek-ai) | ✅ | ✅ | ✅ | — | [YAML](configs/models/deepseek_v4/cuda.yaml) |
-| [Gemma 3](https://huggingface.co/google) | ✅ | — | — | — | [YAML](configs/models/gemma3/cuda.yaml) |
-| [GLM-5](https://huggingface.co/zai-org) | ✅ | — | — | — | [YAML](configs/models/glm5/cuda.yaml) |
+| [Gemma 3](https://huggingface.co/google) | ✅ | ✅ | — | — | [YAML](configs/models/gemma3/cuda.yaml) |
+| [GLM-5](https://huggingface.co/zai-org) | ✅ | ✅ | — | — | [YAML](configs/models/glm5/cuda.yaml) |
 | [GPT-OSS](https://huggingface.co/openai/gpt-oss-120b) | ✅ | ✅ | ❌ | ❌ | [YAML](configs/models/gpt_oss/cuda.yaml) |
 | [HunyuanVideo 1.5](https://huggingface.co/tencent/HunyuanVideo-1.5) | ✅ | ✅ | — | — | [YAML](configs/models/hunyuanvideo15/cuda.yaml) |
 | [Janus](https://huggingface.co/deepseek-ai/Janus-1.3B) | ✅ | ✅ | — | — | [YAML](configs/models/janus/cuda.yaml) |

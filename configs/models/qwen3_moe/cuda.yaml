@@ -33,7 +33,7 @@ model:
       fsdp_mode: fsdp2
   chat_template: chatml
 data:
-  train_path: ./data/tulu.parquet
+  train_path: tulu-first2000.parquet
   data_type: conversation
   max_seq_len: 1024
   text_keys: messages
