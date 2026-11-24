@@ -692,7 +692,7 @@ class LoraSharedExperts(nn.Module):
                     buffer_to_scale = local_storage
                 # Without an FSDP wrap (`extra_parallel_only`), divide the EP-summed
                 # accumulated grad by world_size here so multi-microbatch scaling stays exact.
-                if getattr(self, "_extra_parallel_only", False):
+                if getattr(ps, "extra_parallel_only", False):
                     buffer_to_scale.div_(ps.world_size)
 
             return _hook

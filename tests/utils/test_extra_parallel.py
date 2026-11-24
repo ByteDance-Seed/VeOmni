@@ -1313,7 +1313,7 @@ def _run_clip_scenario(
     assert world_size % dp_replicate == 0
     dp_shard = world_size // dp_replicate
 
-    state_name = f"clip_w{world_size}_rep{dp_replicate}_ep{ep_size}_emb{emb_size}"
+    state_name = f"clip_w{world_size}_rep{dp_replicate}_ep{ep_size}_emb{emb_size}_epo{int(extra_parallel_only)}"
     ps = _init_parallel_state(
         dp_size=world_size,
         dp_replicate_size=dp_replicate,
@@ -1326,6 +1326,7 @@ def _run_clip_scenario(
         extra_parallel_placement_innermost=(False, False),
         extra_parallel_names=("ep", "emb"),
         dp_mode="fsdp2",
+        extra_parallel_only=extra_parallel_only,
         name=state_name,
     )
 
@@ -1753,7 +1754,7 @@ def test_persistent_ple_and_ep_norm_use_independent_reduction_groups():
 def test_omni_module_clip_grad_norm_extra_parallel_only_averages_replicated_grads_and_skips_fsdp_sum():
     """``veomni_omni_module_clip_grad_norm`` averages replicated grads on ``fsdp_group``
     and skips the ``fsdp`` norm reduction on ``non_extra_parallel`` when
-    ``model._extra_parallel_only`` is set."""
+    ``ParallelState.extra_parallel_only`` is set."""
     omni_cgn_mod = importlib.import_module("veomni.distributed.clip_grad_norm")
 
     class _FakeMesh:
@@ -1773,6 +1774,7 @@ def test_omni_module_clip_grad_norm_extra_parallel_only_averages_replicated_grad
     )
     fake_ps.any_extra_parallel_enabled = True
     fake_ps.sp_size = 1
+    fake_ps.extra_parallel_only = True
     fake_ps.extra_parallel_enabled = lambda _name: True
     fake_ps.extra_parallel_group = lambda name: f"{name}_group"
 
@@ -1780,7 +1782,6 @@ def test_omni_module_clip_grad_norm_extra_parallel_only_averages_replicated_grad
         {"non_extra_parallel": [p_non], "emb": [p_emb]},
         replicated_ids=set(),
     )
-    model._extra_parallel_only = True
 
     reduce_calls = []
     avg_calls = []

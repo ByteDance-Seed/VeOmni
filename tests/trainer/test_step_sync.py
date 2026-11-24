@@ -137,9 +137,13 @@ def test_model_reshard_is_a_no_op_for_an_unwrapped_model():
     trainer = object.__new__(BaseTrainer)
     trainer.args = SimpleNamespace(
         model=SimpleNamespace(
-            accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_mode="fsdp2", reshard_after_backward=False))
+            accelerator=SimpleNamespace(
+                dp_replicate_size=2,
+                fsdp_config=SimpleNamespace(fsdp_mode="fsdp2", reshard_after_backward=False),
+            )
         )
     )
-    trainer.model = nn.Linear(2, 2)  # no `set_reshard_after_backward`
+    trainer.model = nn.Linear(2, 2)  # no `set_reshard_after_backward` or `set_requires_all_reduce`
 
     trainer.model_reshard(micro_step=0, num_micro_steps=4)  # must not raise
+    trainer._configure_hsdp_allreduce(micro_step=0, num_micro_steps=4)  # must not raise

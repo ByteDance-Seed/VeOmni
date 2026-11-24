@@ -339,12 +339,15 @@ def test_an_out_of_range_id_on_one_rank_fails_every_rank(tmp_path):
     assert [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in range(_WORLD)] == [True, True]
 
 
-def _emb_state(group=None, enabled: bool = True, size: int = 2, rank: int = 0) -> SimpleNamespace:
+def _emb_state(
+    group=None, enabled: bool = True, size: int = 2, rank: int = 0, *, extra_parallel_only: bool = False
+) -> SimpleNamespace:
     return SimpleNamespace(
         extra_parallel_sizes={"emb": size} if enabled else {},
         extra_parallel_enabled=lambda name: enabled,
         extra_parallel_group=lambda name: group,
         extra_parallel_rank=lambda name: rank,
+        extra_parallel_only=extra_parallel_only,
     )
 
 
@@ -427,9 +430,8 @@ def test_a_split_table_outside_its_own_fsdp_unit_is_rejected(emb_state):
 def test_a_split_table_outside_any_fsdp_wrap_dispatches(emb_state, monkeypatch):
     """``extra_parallel_only`` builds no FSDP unit at all, so no parent can regather the rows."""
     group = object()
-    emb_state(_emb_state(group=group, size=2))
+    emb_state(_emb_state(group=group, size=2, extra_parallel_only=True))
     embedding = _sliced(ShardedEmbedding(8, 4), rows=4)
-    embedding._extra_parallel_only = True
     groups = []
 
     def fake_all_to_all(dispatch_group, ids, weight):

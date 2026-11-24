@@ -17,7 +17,7 @@ logger = get_logger(__name__)
 def clip_grad_norm(
     model, max_norm: float, norm_type: float = 2.0, error_if_nonfinite: bool = False, foreach: bool | None = None
 ) -> torch.Tensor:
-    if getattr(model, "_extra_parallel_only", False):
+    if getattr(get_parallel_state(), "extra_parallel_only", False):
         _average_extra_parallel_only_replicated_grads(model)
     if hasattr(model, "_extra_parallel_param_groups"):
         return extra_parallel_fsdp2_clip_grad_norm(
@@ -186,7 +186,7 @@ def extra_parallel_fsdp2_clip_grad_norm(
     non_extra_parallel_total = _fsdp2_reduce_group(
         params=non_extra_parallel_params,
         norm_type=norm_type,
-        reduce_groups=[] if getattr(model, "_extra_parallel_only", False) else _fsdp_grad_norm_reduce_groups(ps),
+        reduce_groups=[] if getattr(ps, "extra_parallel_only", False) else _fsdp_grad_norm_reduce_groups(ps),
     )
     logger.debug_rank0(f"non_extra_parallel total grad norm: {non_extra_parallel_total}")
 

@@ -37,7 +37,6 @@ from ..ops.qat._hardware import reject_qat_without_native_bf16
 from ..utils import logging, recompute_utils
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
-from .emb_parallel import ShardedEmbedding
 from .fsdp2.reduce_scatter import (
     ReduceScatterTransportPolicy,
     register_fp32_reduce_scatter_with_low_precision_transport,
@@ -452,6 +451,11 @@ def _finish_without_fsdp_wrap(
     (otherwise ``model.float()`` would leave parameters in FP32 with no cast back
     to the compute dtype).
     """
+    if not parallel_state.extra_parallel_only:
+        raise ValueError(
+            "extra_parallel_only=True requires the active ParallelState to be initialized with "
+            "extra_parallel_only=True (via AcceleratorConfig.fsdp_config.extra_parallel_only)."
+        )
     for para in parallel_state.extra_parallel_names:
         if not parallel_state.extra_parallel_enabled(para):
             continue
@@ -506,14 +510,6 @@ def _finish_without_fsdp_wrap(
     )
 
     _divide_extra_parallel_grads_like_fsdp(model, parallel_state, fqn2spec_info)
-    # Marked on the root model (grad clipper / shared-LoRA param collector) and on
-    # ShardedEmbedding / LoraSharedExperts submodules that behave differently unwrapped.
-    model._extra_parallel_only = True
-    for module in model.modules():
-        if isinstance(module, ShardedEmbedding) or any(
-            base.__name__ == "LoraSharedExperts" for base in type(module).__mro__
-        ):
-            module._extra_parallel_only = True
     return model
 
 

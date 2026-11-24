@@ -104,8 +104,9 @@ def test_the_gradient_hook_skips_persistent_parameters():
     assert torch.all(_apply_backward_hooks(model.plain, grad) == 1.0)
 
 
-def test_shared_lora_params_are_collected_when_the_model_is_unwrapped():
+def test_shared_lora_params_are_collected_when_the_model_is_unwrapped(monkeypatch):
     """``extra_parallel_only`` keeps shared-expert LoRA params as plain tensors, which the collector accepts."""
+    from veomni.optim import optimizer as opt_mod
     from veomni.optim.optimizer import _collect_ep_replicated_lora_param_ids
 
     class LoraSharedExperts(nn.Module):
@@ -114,7 +115,7 @@ def test_shared_lora_params_are_collected_when_the_model_is_unwrapped():
             self.gate_up_proj = nn.Parameter(torch.zeros(2, 2))
 
     model = nn.Sequential(LoraSharedExperts())
-    model._extra_parallel_only = True
+    monkeypatch.setattr(opt_mod, "get_parallel_state", lambda: SimpleNamespace(extra_parallel_only=True))
 
     assert _collect_ep_replicated_lora_param_ids(model) == {id(model[0].gate_up_proj)}
 
@@ -130,10 +131,9 @@ def test_shared_lora_grad_accumulation_survives_multiple_microbatches(monkeypatc
     layer = object.__new__(LoraSharedExperts)
     nn.Module.__init__(layer)
     layer.lora_A = nn.Parameter(torch.zeros(2, 2))
-    layer._extra_parallel_only = True
     layer._ep_grad_hooks_done = False
 
-    fake_ps = SimpleNamespace(ep_enabled=True, ep_group="ep_group", world_size=world_size)
+    fake_ps = SimpleNamespace(ep_enabled=True, ep_group="ep_group", world_size=world_size, extra_parallel_only=True)
 
     def fake_all_reduce(tensor, op=None, group=None):
         assert group == "ep_group"

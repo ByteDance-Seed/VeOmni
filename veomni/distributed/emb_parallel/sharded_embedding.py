@@ -114,7 +114,9 @@ class ShardedEmbedding(nn.Embedding):
         return True
 
     def _check_own_fsdp_unit(self) -> None:
-        if not isinstance(self, FSDPModule) and not getattr(self, "_extra_parallel_only", False):
+        if not isinstance(self, FSDPModule) and not (
+            is_parallel_state_initialized() and getattr(get_parallel_state(), "extra_parallel_only", False)
+        ):
             # Inside a parent unit the rows are plain and correctly shaped, but that unit sharded and
             # gathered them over the whole FSDP mesh, mixing different ranks' vocab slices.
             raise RuntimeError(

@@ -125,7 +125,7 @@ def veomni_omni_module_clip_grad_norm(
     ps = get_parallel_state()
     if ps.dp_mode == "ddp" and ps.sp_size > 1:
         _allreduce_ddp_sp_grads(model, ps)
-    elif getattr(model, "_extra_parallel_only", False):
+    elif getattr(ps, "extra_parallel_only", False):
         _average_extra_parallel_only_replicated_grads(model)
 
     pth_sums: list[torch.Tensor] = []
@@ -135,7 +135,7 @@ def veomni_omni_module_clip_grad_norm(
     if ep_param_groups is not None and ps.any_extra_parallel_enabled:
         non_ep = [p for p in ep_param_groups.get("non_extra_parallel", []) if p.grad is not None]
         if non_ep:
-            reduce_groups = [] if getattr(model, "_extra_parallel_only", False) else [("fsdp", ps.fsdp_group)]
+            reduce_groups = [] if getattr(ps, "extra_parallel_only", False) else [("fsdp", ps.fsdp_group)]
             pth_sums.append(_fsdp2_reduce_group(non_ep, norm_type, reduce_groups))
             groups_to_clip.append(non_ep)
         for para in ps.extra_parallel_names:

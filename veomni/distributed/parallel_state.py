@@ -77,6 +77,7 @@ class ParallelState:
     extra_parallel_flat_device_mesh: Dict[str, Optional["DeviceMesh"]] = field(default_factory=lambda: {"ep": None})
     async_enabled: Optional[bool] = False
     skip_sp_gather_between_modules: bool = False
+    extra_parallel_only: bool = False
 
     def __post_init__(self):
         if not self.include_sp_in_fsdp:
@@ -508,6 +509,7 @@ def _init_parallel_state(
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
     skip_sp_gather_between_modules: bool = False,
+    extra_parallel_only: bool = False,
     name: Optional[str] = "base",
     npu_ep_hccl_buffer_mib: Optional[int] = None,
     npu_ep_hccl_expansion_mode: Optional[str] = None,
@@ -576,6 +578,7 @@ def _init_parallel_state(
     # the same order, so cache hits/misses are rank-consistent and no duplicate
     # groups are created. The key spans every field that shapes the mesh or the
     # state's behaviour (e.g. ``dp_mode`` is read by grad-clip).
+    extra_parallel_only = bool(extra_parallel_only and dp_mode == "fsdp2")
     cache_key = (
         dp_size,
         dp_replicate_size,
@@ -592,6 +595,7 @@ def _init_parallel_state(
         extra_parallel_names,
         async_enabled,
         skip_sp_gather_between_modules,
+        extra_parallel_only,
         npu_ep_hccl_buffer_mib,
         npu_ep_hccl_expansion_mode,
     )
@@ -739,6 +743,7 @@ def _init_parallel_state(
         extra_parallel_flat_device_mesh=extra_parallel_flat_device_mesh,
         async_enabled=async_enabled,
         skip_sp_gather_between_modules=skip_sp_gather_between_modules,
+        extra_parallel_only=extra_parallel_only,
     )
 
     if _PARALLEL_STATE is None:
@@ -772,6 +777,7 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
         dp_mode=accelerator.fsdp_config.fsdp_mode,
         async_enabled=accelerator.enable_async,
         skip_sp_gather_between_modules=accelerator.skip_sp_gather_between_modules,
+        extra_parallel_only=accelerator.fsdp_config.extra_parallel_only,
         npu_ep_hccl_buffer_mib=accelerator.npu_ep_hccl_buffer_mib,
         npu_ep_hccl_expansion_mode=accelerator.npu_ep_hccl_expansion_mode,
         name=name,

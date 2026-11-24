@@ -99,7 +99,7 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
                 # these stay plain tensors by design and the snapshot is already
                 # final. Distinguish the two by asking whether the model was
                 # wrapped at all, rather than by the parameter's type.
-                if not isinstance(p, DTensor) and getattr(model, "_extra_parallel_only", False):
+                if not isinstance(p, DTensor) and getattr(get_parallel_state(), "extra_parallel_only", False):
                     out.add(id(p))
                     continue
                 assert isinstance(p, DTensor), (

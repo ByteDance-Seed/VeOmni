@@ -731,6 +731,7 @@ class BaseTrainer(Stateful, ABC):
             args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
             and args.model.accelerator.dp_replicate_size > 1
             and num_micro_steps > 1
+            and hasattr(model, "set_requires_all_reduce")
         ):
             if micro_step == 0:
                 model.set_requires_all_reduce(False)
