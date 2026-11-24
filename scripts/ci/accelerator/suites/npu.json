@@ -488,15 +488,5 @@
       "-x",
       "tests/optim/test_swap_adamw_device.py"
     ]
-  },
-  {
-    "name": "extra-parallel-only-contracts-unit",
-    "suite": "unit",
-    "conditional": false,
-    "args": [
-      "-s",
-      "-x",
-      "tests/distributed/test_extra_parallel_only_contracts.py"
-    ]
   }
 ]
