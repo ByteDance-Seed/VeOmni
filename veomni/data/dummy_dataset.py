@@ -49,6 +49,8 @@ class DummyTextDataset(Dataset):
 
 
 class DummyQwenVLDataset(Dataset):
+    _media_shape = (2, 10, 4, 4)  # image count, video frames, grid height and width
+
     def __init__(
         self, size: int, seq_length: int, patch_size: int = 14, temporal_patch_size: int = 2, merge_size: int = 2
     ):
@@ -61,9 +63,7 @@ class DummyQwenVLDataset(Dataset):
         self.seq_length = seq_length
         self.vocab_size = 1024
 
-        image_t = 2
-        video_t = 10
-        h, w = 4, 4
+        image_t, video_t, h, w = self._media_shape
         channel_size = 3
 
         self.image_size = [image_t * h * w, patch_size * patch_size * temporal_patch_size * channel_size]
@@ -87,13 +87,16 @@ class DummyQwenVLDataset(Dataset):
         return self.size
 
     def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
-        input_ids = torch.randint(low=0, high=self.vocab_size, size=(self.seq_length,))
+        return self._make_example()
+
+    def _make_example(self, generator=None) -> List[Dict[str, "torch.Tensor"]]:
+        input_ids = torch.randint(low=0, high=self.vocab_size, size=(self.seq_length,), generator=generator)
         attention_mask = torch.ones((self.seq_length,), dtype=torch.long)
         labels = input_ids.clone()
         labels[0] = IGNORE_INDEX
         position_ids = torch.arange(0, self.seq_length).unsqueeze(0).repeat(3, 1)
-        pixel_values = torch.rand(self.image_size, dtype=torch.float32)
-        pixel_values_videos = torch.rand(self.video_size, dtype=torch.float32)
+        pixel_values = torch.rand(self.image_size, dtype=torch.float32, generator=generator)
+        pixel_values_videos = torch.rand(self.video_size, dtype=torch.float32, generator=generator)
         return [
             {
                 "input_ids": input_ids,
@@ -131,58 +134,24 @@ class DummyQwen4ExpDataset(DummyQwenVLDataset):
         return [example]
 
 
-class DummyMiniMaxM3VLDataset(Dataset):
-    """Tiny image+video dataset matching MiniMax's 1-D position-id path."""
+class DummyMiniMaxM3VLDataset(DummyQwenVLDataset):
+    """One image and one video with MiniMax's 1-D text positions."""
+
+    _media_shape = (1, 1, 2, 2)
 
     def __init__(
-        self,
-        size: int,
-        seq_length: int,
-        patch_size: int = 14,
-        temporal_patch_size: int = 2,
-        merge_size: int = 2,
+        self, size: int, seq_length: int, patch_size: int = 14, temporal_patch_size: int = 2, merge_size: int = 2
     ):
-        self.size = size
+        super().__init__(size, seq_length, patch_size, temporal_patch_size, merge_size)
         self.vocab_size = 256
-        t, h, w = 1, 2, 2
-        self.image_size = [t * h * w, patch_size * patch_size * temporal_patch_size * 3]
-        self.video_size = list(self.image_size)
-        self.image_grid_thw = torch.tensor([[t, h, w]], dtype=torch.long)
-        self.video_grid_thw = self.image_grid_thw.clone()
-        self.image_seqlen = t * h * w // merge_size**2
-        self.video_seqlen = self.image_seqlen
-        self.text_seqlen = seq_length - self.image_seqlen - self.video_seqlen
         if self.text_seqlen <= 0:
             raise ValueError("MiniMax M3 VL dummy seq_length must leave room for text tokens.")
-        self.seq_length = self.text_seqlen + self.image_seqlen + self.video_seqlen
-        self.image_mask = torch.zeros(self.seq_length, dtype=torch.bool)
-        self.image_mask[: self.image_seqlen] = True
-        self.video_mask = torch.zeros(self.seq_length, dtype=torch.bool)
-        self.video_mask[-self.video_seqlen :] = True
-
-    def __len__(self) -> int:
-        return self.size
 
     def __getitem__(self, index: int) -> List[Dict[str, "torch.Tensor"]]:
-        gen = torch.Generator().manual_seed(index)
-        input_ids = torch.randint(0, self.vocab_size, (self.seq_length,), generator=gen)
-        labels = input_ids.clone()
-        labels[0] = IGNORE_INDEX
-        labels[self.image_mask | self.video_mask] = IGNORE_INDEX
-        return [
-            {
-                "input_ids": input_ids,
-                "attention_mask": torch.ones(self.seq_length, dtype=torch.long),
-                "labels": labels,
-                "position_ids": torch.arange(self.seq_length),
-                "pixel_values": torch.rand(self.image_size, generator=gen),
-                "pixel_values_videos": torch.rand(self.video_size, generator=gen),
-                "image_mask": self.image_mask,
-                "video_mask": self.video_mask,
-                "image_grid_thw": self.image_grid_thw,
-                "video_grid_thw": self.video_grid_thw,
-            }
-        ]
+        example = self._make_example(generator=torch.Generator().manual_seed(index))[0]
+        example["position_ids"] = torch.arange(self.seq_length)
+        example["labels"].masked_fill_(self.image_mask | self.video_mask, IGNORE_INDEX)
+        return [example]
 
 
 class DummyQwenOmniDataset(Dataset):
