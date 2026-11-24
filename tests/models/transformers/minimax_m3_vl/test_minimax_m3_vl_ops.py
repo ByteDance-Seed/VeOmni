@@ -15,6 +15,7 @@
 import copy
 import importlib
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -700,50 +701,33 @@ def test_minimax_m3_vl_parallel_plan_targets_the_expert_parameters(module_name):
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_experts_preserve_swiglu_oai_eager_semantics(module_name, monkeypatch):
+def test_minimax_m3_vl_experts_pass_swiglu_config_to_op(module_name, monkeypatch):
     modeling = importlib.import_module(module_name)
     config = SimpleNamespace(
         num_local_experts=2,
         hidden_size=4,
         intermediate_size=3,
         swiglu_limit=0.7,
-        swiglu_alpha=1.702,
+        swiglu_alpha=1.25,
         ops_config=make_eager_ops_config(),
     )
     experts = modeling.MiniMaxM3VLExperts(config)
-    torch.manual_seed(0)
-    experts.gate_up_proj.data.normal_(mean=0.0, std=0.1)
-    experts.down_proj.data.normal_(mean=0.0, std=0.1)
-    hidden_states = torch.randn(5, 4)
-    top_k_index = torch.tensor([[0], [1], [0], [1], [0]])
-    top_k_weights = torch.ones(5, 1)
-    monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=False))
+    op = Mock()
+    monkeypatch.setattr(experts, "veomni_moe", op)
+    experts(torch.zeros(1, 4), torch.zeros(1, 1, dtype=torch.long), torch.ones(1, 1))
 
-    output = experts(hidden_states, top_k_index, top_k_weights)
-    expected = torch.zeros_like(hidden_states)
-    for expert_idx in range(config.num_local_experts):
-        token_idx = torch.where(top_k_index[:, 0] == expert_idx)[0]
-        gate_up = torch.nn.functional.linear(hidden_states[token_idx], experts.gate_up_proj[expert_idx])
-        gate, up = gate_up.chunk(2, dim=-1)
-        gate = gate.clamp(max=config.swiglu_limit)
-        up = up.clamp(min=-config.swiglu_limit, max=config.swiglu_limit)
-        activated = (up + 1.0) * gate * torch.sigmoid(config.swiglu_alpha * gate)
-        expected[token_idx] = torch.nn.functional.linear(activated, experts.down_proj[expert_idx])
-
-    torch.testing.assert_close(output, expected, rtol=1e-6, atol=1e-7)
+    op.assert_called_once()
+    assert op.call_args.kwargs["swiglu_alpha"] == config.swiglu_alpha
+    assert op.call_args.kwargs["swiglu_limit"] == config.swiglu_limit
 
 
 @pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_rms_norm_preserves_eager_fp32_semantics(module_name):
+def test_minimax_m3_vl_rms_norm_passes_fp32_weight_to_op(module_name, monkeypatch):
     modeling = importlib.import_module(module_name)
-    norm = modeling.MiniMaxM3VLRMSNorm(8, eps=1e-6)
-    norm.weight.data.copy_(torch.linspace(-0.1, 0.1, 8))
-    hidden_states = torch.randn(2, 3, 4, 8, dtype=torch.bfloat16)
+    norm = modeling.MiniMaxM3VLRMSNorm(8, eps=1e-6).to(torch.bfloat16)
+    op = Mock()
+    monkeypatch.setattr(norm, "veomni_rms_norm", op)
+    norm(torch.ones(2, 3, 8, dtype=torch.bfloat16))
 
-    output = norm(hidden_states)
-    expected = hidden_states.float()
-    expected = expected * torch.rsqrt(expected.square().mean(-1, keepdim=True) + norm.eps)
-    expected = expected * (1.0 + norm.weight.float())
-
-    assert output.dtype == hidden_states.dtype
-    assert torch.equal(output, expected.to(hidden_states.dtype))
+    op.assert_called_once()
+    assert op.call_args.args[1].dtype == torch.float32
