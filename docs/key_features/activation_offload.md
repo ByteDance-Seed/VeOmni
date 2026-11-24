@@ -267,15 +267,29 @@ lifecycle across GPU and CPU:
 1. **Creation:** A pinned CPU buffer (`tensor_cpu`) is allocated matching the tensor's
    shape and dtype.
 2. **D2H (launch_d2h):** On the swap stream, copy GPU tensor to pinned CPU buffer
-   (non-blocking). Record a `d2h_event` for synchronization.
-3. **Wait D2H (wait_d2h_finished):** After the D2H transfer completes, bind the tensor
-   to fresh empty storage. Aliases may keep its original allocation alive.
+   (non-blocking). `record_stream` is called only when `_deferred_free_supported()`
+   confirms the native caching allocator owns the storage, so other backends never
+   see it for external pointers. Record a `d2h_event` and store it on the host
+   buffer as `_last_swap_event`.
+3. **Wait D2H (wait_d2h_finished):** Detach the GPU storage by binding the tensor to
+   fresh empty storage. With CUDA's **native** caching allocator this does **not**
+   host-synchronize: `record_stream` already keeps the source storage alive, so the
+   copy is ordered by the stream. Every other case keeps the event synchronize,
+   because `record_stream` cannot defer a free there: NPU and MLU allocators, CUDA's
+   async allocator, `PYTORCH_NO_CUDA_MEMORY_CACHING`, foreign storage
+   (`from_numpy` / `from_dlpack` / `frombuffer`) and copy-on-write tensors
+   (`torch._lazy_clone`).
 4. **H2D (launch_h2d):** On the swap stream, allocate new device storage with the
    saved size/stride, copy from the pinned CPU buffer (non-blocking), and bind
-   the tensor to that restored storage. Record an `h2d_event`.
+   the tensor to that restored storage. Record an `h2d_event`, also stored on the
+   host buffer as `_last_swap_event`.
 5. **Wait H2D:** The default stream waits on `h2d_event` before accessing the tensor.
 
 State transitions: `device` → (D2H) → `host` → (H2D) → `device`
+
+The `_last_swap_event` tag is what lets the host pool stay asynchronous: a buffer is
+waited on only when handed to a new owner or when dropped or evicted. Both waits run
+outside the pool lock, and the tag is popped so a completed event is not retained.
 
 #### OffloadManager Ownership
 

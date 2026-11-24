@@ -114,6 +114,16 @@
     ]
   },
   {
+    "name": "08b-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_kimi_k3_vision_tower_sp.py"
+    ]
+  },
+  {
     "name": "09-unit",
     "suite": "unit",
     "conditional": false,
