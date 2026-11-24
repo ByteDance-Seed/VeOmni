@@ -289,7 +289,7 @@ def _noncontiguous_last_dim(shape: tuple[int, ...], *, dtype: torch.dtype, seed:
 
 
 @pytest.mark.skipif(not _TRITON_ROCM_AVAILABLE, reason="Triton mHC requires an AMD ROCm GPU")
-@pytest.mark.parametrize(("batch", "seq_len", "hidden"), [(1, 32, 256), (2, 37, 320)])
+@pytest.mark.parametrize(("batch", "seq_len", "hidden"), [(1, 5, 1), (1, 32, 256), (2, 37, 320)])
 def test_mhc_triton_pre_post_matches_eager(batch: int, seq_len: int, hidden: int):
     hc_mult = 4
     norm_eps, hc_eps, sinkhorn_iters = 1e-6, 1e-6, 20

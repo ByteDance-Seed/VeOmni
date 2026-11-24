@@ -513,7 +513,7 @@ def _collapse_fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    d64 = D.to(tl.int64)
+    d64 = tl.cast(D, tl.int64)
     rm = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
     rd = tl.program_id(1).to(tl.int64) * BLOCK_D + tl.arange(0, BLOCK_D).to(tl.int64)
     k_ax = tl.arange(0, K)
@@ -546,7 +546,7 @@ def _collapse_bwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    d64 = D.to(tl.int64)
+    d64 = tl.cast(D, tl.int64)
     pid_d = tl.program_id(1).to(tl.int64)
     rm = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
     rd = pid_d * BLOCK_D + tl.arange(0, BLOCK_D).to(tl.int64)
@@ -637,7 +637,7 @@ def _post_mix_fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    d64 = D.to(tl.int64)
+    d64 = tl.cast(D, tl.int64)
     rm = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
     rd = tl.program_id(1).to(tl.int64) * BLOCK_D + tl.arange(0, BLOCK_D).to(tl.int64)
     k_ax = tl.arange(0, K)
@@ -680,7 +680,7 @@ def _post_mix_bwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    d64 = D.to(tl.int64)
+    d64 = tl.cast(D, tl.int64)
     pid_d = tl.program_id(1).to(tl.int64)
     rm = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
     rd = pid_d * BLOCK_D + tl.arange(0, BLOCK_D).to(tl.int64)
