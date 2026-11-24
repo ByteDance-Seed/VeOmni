@@ -28,6 +28,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 from transformers.optimization import Adafactor
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.launch_utils import find_free_port
 from veomni.checkpoint.dcp_checkpointer import drop_extra_parallel_dim, restore_extra_parallel_dim
 from veomni.optim import build_optimizer
@@ -141,6 +142,7 @@ def _distributed_gate() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_fsdp2_adafactor_2gpu():
     cmd = [
         sys.executable,

@@ -807,6 +807,7 @@ def test_a_loss_that_is_only_a_shard_is_still_refused():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 devices")
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2))
 def test_the_collectives_survive_being_replayed_by_recompute():
     from ..tools.launch_utils import torchrun
 
