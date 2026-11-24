@@ -123,19 +123,16 @@ def check_fqn_match(fqn_pattern: str, fqn: str, prefix: str = None):
 
 
 def sort_fqn_by_submodule_first(fqn_list: list[str]) -> list[str]:
-    """
-    Sort FQN list purely by string nesting relationship (ignore depth calculation)
-    """
-
-    def _fqn_nesting_compare(a: str, b: str) -> int:
-        if a in b and a != b:
-            return 1
-        elif b in a and b != a:
-            return -1
-        else:
-            return 0
-
-    from functools import cmp_to_key
-
-    sorted_list = sorted(fqn_list, key=cmp_to_key(_fqn_nesting_compare))
-    return sorted_list
+    """Sort FQNs so every descendant precedes its ancestors while preserving sibling order."""
+    result: list[str] = []
+    remaining = list(fqn_list)
+    while remaining:
+        for i, fqn in enumerate(remaining):
+            prefix = f"{fqn}." if fqn else ""
+            has_descendant = any(
+                (other.startswith(prefix) if prefix else bool(other)) for other in remaining if other != fqn
+            )
+            if not has_descendant:
+                result.append(remaining.pop(i))
+                break
+    return result
