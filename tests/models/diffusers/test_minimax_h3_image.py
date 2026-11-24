@@ -173,6 +173,8 @@ def _run_minimax_h3_image_fsdp_forward(rank, weights_path, checkpointing, rendez
         production.dit.blocks[0].register_forward_pre_hook(lambda *_: block_calls.append(1))
         for step in range(2):
             production.zero_grad(set_to_none=True)
+            inputs["x"].grad = None
+            inputs["prompt_embeds"].grad = None
             actual = production(**inputs, pdd_step_index=step)
             with torch.no_grad():
                 expected = reference(**inputs, pdd_step_index=step)
