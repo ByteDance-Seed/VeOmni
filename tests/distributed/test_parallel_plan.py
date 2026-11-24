@@ -21,20 +21,24 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
 from torch.distributed.tensor import Shard
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.tools.launch_utils import spawn_with_rendezvous
+from tests.tools.launch_utils import spawn_with_rendezvous, torchrun
 from veomni.arguments import MixedPrecisionConfig
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
 from veomni.distributed.torch_parallelize import _configure_fsdp2_manual_prefetch, parallelize_model_fsdp2
 from veomni.distributed.utils import sort_fqn_by_submodule_first
 from veomni.models.transformers.qwen3_5_moe.parallel_plan import get_parallel_plan as qwen3_5_moe_plan
+from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+_CI_ACCELERATOR_4 = LaunchSpec(nproc=4, device="accelerator")
 
 
 def test_every_planned_parameter_owner_is_a_para_module():
@@ -199,10 +203,11 @@ class _ToyBlock(nn.Module):
         super().__init__()
         self.proj = nn.Linear(hidden, hidden, bias=False)
         self.experts = _ToyExperts(num_experts, hidden)
+        self.post_proj = nn.Linear(hidden, hidden, bias=False)
         self.use_checkpoint = use_checkpoint
 
     def _run(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.experts(self.proj(x))
+        return x + self.post_proj(self.experts(self.proj(x)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_checkpoint and self.training:
@@ -242,75 +247,163 @@ class _ToyMultiStackMoe(nn.Module):
         return x
 
 
-def _fsdp2_prefetch_worker(rank: int, use_checkpoint: bool, endpoint) -> None:
+def _run_and_verify_fsdp2_manual_prefetch(*, world_size: int, device_type: str, use_checkpoint: bool) -> None:
+    _init_parallel_state(
+        dp_size=world_size,
+        dp_replicate_size=1,
+        dp_shard_size=world_size,
+        tp_size=1,
+        pp_size=1,
+        cp_size=1,
+        ulysses_size=1,
+        extra_parallel_sizes=(2,),
+        extra_parallel_names=("ep",),
+        dp_mode="fsdp2",
+        device_type=device_type,
+    )
+    with torch.device("meta"):
+        model = _ToyMultiStackMoe(use_checkpoint=use_checkpoint)
+
+    model = parallelize_model_fsdp2(
+        model,
+        weights_path=None,
+        mixed_precision=MixedPrecisionConfig(enable=False),
+        enable_forward_prefetch=True,
+        init_device="meta",
+        broadcast_model_weights_from_rank0=False,
+    )
+
+    # Confirm the expert FSDP group has the expected shard width (world_size // ep_size).
+    assert model.layers[0].experts.weight.device_mesh.size() == world_size // 2
+
+    # Verify actual FSDP2 prefetch wiring across the two stacks.
+    def _fwd_targets(mod):
+        return list(mod._get_fsdp_state()._states_to_forward_prefetch)
+
+    def _bwd_targets(mod):
+        return list(mod._get_fsdp_state()._states_to_backward_prefetch)
+
+    assert _fwd_targets(model.layers[0]) == [
+        model.layers[1]._get_fsdp_state(),
+        model.layers[1].experts._get_fsdp_state(),
+    ]
+    assert _fwd_targets(model.layers[1]) == []
+    assert _fwd_targets(model.mtp[0]) == [
+        model.mtp[1]._get_fsdp_state(),
+        model.mtp[1].experts._get_fsdp_state(),
+    ]
+    assert _bwd_targets(model.layers[1].experts) == [
+        model.layers[0]._get_fsdp_state(),
+        model.layers[0].experts._get_fsdp_state(),
+    ]
+    assert _bwd_targets(model.layers[1]) == []
+    assert _bwd_targets(model.mtp[0].experts) == []
+    assert _bwd_targets(model.mtp[1].experts) == [
+        model.mtp[0]._get_fsdp_state(),
+        model.mtp[0].experts._get_fsdp_state(),
+    ]
+
+    # Instrument real FSDP2 unshard launches and pre-backward hooks to validate runtime prefetch timing.
+    pg_to_name = {}
+    state_to_name = {}
+    for name, mod in model.named_modules():
+        if hasattr(mod, "_get_fsdp_state"):
+            state = mod._get_fsdp_state()
+            state_to_name[state] = name or "root"
+            if state._fsdp_param_group is not None:
+                pg_to_name[state._fsdp_param_group] = name or "root"
+
+    events: list[tuple[str, str]] = []
+    orig_unshard = FSDPParamGroup.unshard
+    orig_pre_bwd = FSDPState._pre_backward
+
+    def _recording_unshard(self, async_op: bool = False):
+        if self._all_gather_result is None and not self.is_unsharded:
+            events.append(("unshard", pg_to_name.get(self, "?")))
+        return orig_unshard(self, async_op=async_op)
+
+    def _recording_pre_bwd(self, grad):
+        events.append(("pre_bwd", state_to_name.get(self, "?")))
+        return orig_pre_bwd(self, grad)
+
+    device = torch.device(device_type)
+    FSDPParamGroup.unshard = _recording_unshard
+    FSDPState._pre_backward = _recording_pre_bwd
+    try:
+        # Exercise both a skipped-MTP step and an active-MTP step end to end.
+        for run_mtp in (False, True):
+            events.clear()
+            model.zero_grad(set_to_none=True)
+            x = torch.randn(2, 4, 8, device=device, requires_grad=True)
+            loss = model(x, run_mtp=run_mtp).square().mean()
+            bwd_start = len(events)
+            loss.backward()
+            assert torch.isfinite(loss)
+
+            fwd_events = events[:bwd_start]
+            bwd_events = events[bwd_start:]
+
+            if not run_mtp:
+                # Skipped MTP stack must never be unsharded in forward or backward.
+                assert all(not target.startswith("mtp.") for _, target in fwd_events)
+                assert all(not target.startswith("mtp.") for _, target in bwd_events)
+            else:
+                # Forward of layers.1 must not prefetch mtp.0; mtp.1 backward prefetches mtp.0 from mtp.1.experts.
+                idx_mtp1_pre_bwd = bwd_events.index(("pre_bwd", "mtp.1"))
+                idx_mtp1_exp_unshard = bwd_events.index(("unshard", "mtp.1.experts"))
+                idx_mtp1_exp_pre_bwd = bwd_events.index(("pre_bwd", "mtp.1.experts"))
+                idx_mtp0_unshard = bwd_events.index(("unshard", "mtp.0"))
+                idx_mtp0_exp_unshard = bwd_events.index(("unshard", "mtp.0.experts"))
+                assert idx_mtp1_pre_bwd < idx_mtp1_exp_unshard < idx_mtp1_exp_pre_bwd < idx_mtp0_unshard
+                assert idx_mtp1_exp_pre_bwd < idx_mtp0_exp_unshard
+
+            # In backward, layers.1 prefetches its own experts first, and layers.0 (+ experts) are
+            # triggered only when layers.1.experts enters pre-backward.
+            idx_l1_pre_bwd = bwd_events.index(("pre_bwd", "layers.1"))
+            idx_l1_exp_unshard = bwd_events.index(("unshard", "layers.1.experts"))
+            idx_l1_exp_pre_bwd = bwd_events.index(("pre_bwd", "layers.1.experts"))
+            idx_l0_unshard = bwd_events.index(("unshard", "layers.0"))
+            idx_l0_exp_unshard = bwd_events.index(("unshard", "layers.0.experts"))
+            assert idx_l1_pre_bwd < idx_l1_exp_unshard < idx_l1_exp_pre_bwd < idx_l0_unshard
+            assert idx_l1_exp_pre_bwd < idx_l0_exp_unshard
+
+            for param in model.parameters():
+                if param.grad is not None:
+                    local_grad = param.grad.to_local() if hasattr(param.grad, "to_local") else param.grad
+                    assert torch.isfinite(local_grad).all()
+    finally:
+        FSDPParamGroup.unshard = orig_unshard
+        FSDPState._pre_backward = orig_pre_bwd
+
+
+def _fsdp2_prefetch_cpu_worker(rank: int, use_checkpoint: bool, endpoint) -> None:
     import veomni.distributed.torch_parallelize as torch_parallelize
 
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2)
     orig_get_device_type = torch_parallelize.get_device_type
+    orig_ckpt_device_type = DefaultDeviceType._default_device_type
     torch_parallelize.get_device_type = lambda: "cpu"
+    # Keep non-reentrant checkpointing on CPU even when torch_npu/CUDA sets a non-CPU default
+    # device type while accelerator devices are masked off for CPU unit tests.
+    DefaultDeviceType.set_device_type("cpu")
     try:
-        _init_parallel_state(
-            dp_size=2,
-            dp_replicate_size=1,
-            dp_shard_size=2,
-            tp_size=1,
-            pp_size=1,
-            cp_size=1,
-            ulysses_size=1,
-            extra_parallel_sizes=(2,),
-            extra_parallel_names=("ep",),
-            dp_mode="fsdp2",
-            device_type="cpu",
-        )
-        with torch.device("meta"):
-            model = _ToyMultiStackMoe(use_checkpoint=use_checkpoint)
-
-        model = parallelize_model_fsdp2(
-            model,
-            weights_path=None,
-            mixed_precision=MixedPrecisionConfig(enable=False),
-            enable_forward_prefetch=True,
-            init_device="meta",
-            broadcast_model_weights_from_rank0=False,
-        )
-
-        # Verify actual FSDP2 prefetch wiring across the two stacks.
-        def _fwd_targets(mod):
-            return list(mod._get_fsdp_state()._states_to_forward_prefetch)
-
-        def _bwd_targets(mod):
-            return list(mod._get_fsdp_state()._states_to_backward_prefetch)
-
-        assert _fwd_targets(model.layers[0]) == [
-            model.layers[1]._get_fsdp_state(),
-            model.layers[1].experts._get_fsdp_state(),
-        ]
-        assert _fwd_targets(model.layers[1]) == []
-        assert _fwd_targets(model.mtp[0]) == [
-            model.mtp[1]._get_fsdp_state(),
-            model.mtp[1].experts._get_fsdp_state(),
-        ]
-        assert _bwd_targets(model.layers[1].experts) == [
-            model.layers[0]._get_fsdp_state(),
-            model.layers[0].experts._get_fsdp_state(),
-        ]
-        assert _bwd_targets(model.layers[1]) == []
-        assert _bwd_targets(model.mtp[0].experts) == []
-        assert _bwd_targets(model.mtp[1].experts) == [
-            model.mtp[0]._get_fsdp_state(),
-            model.mtp[0].experts._get_fsdp_state(),
-        ]
-
-        # Exercise both a skipped-MTP step and an active-MTP step end to end.
-        for run_mtp in (False, True):
-            model.zero_grad(set_to_none=True)
-            x = torch.randn(2, 4, 8, requires_grad=True)
-            loss = model(x, run_mtp=run_mtp).square().mean()
-            loss.backward()
-            assert torch.isfinite(loss)
+        _run_and_verify_fsdp2_manual_prefetch(world_size=2, device_type="cpu", use_checkpoint=use_checkpoint)
     finally:
         torch_parallelize.get_device_type = orig_get_device_type
+        DefaultDeviceType._default_device_type = orig_ckpt_device_type
         dist.destroy_process_group()
+        clear_parallel_state()
+
+
+def _fsdp2_prefetch_accelerator_worker(use_checkpoint: bool) -> None:
+    try:
+        _run_and_verify_fsdp2_manual_prefetch(
+            world_size=dist.get_world_size(),
+            device_type=get_device_type(),
+            use_checkpoint=use_checkpoint,
+        )
+        dist.barrier()
+    finally:
         clear_parallel_state()
 
 
@@ -318,4 +411,14 @@ def _fsdp2_prefetch_worker(rank: int, use_checkpoint: bool, endpoint) -> None:
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="requires the CPU Gloo backend")
 @pytest.mark.parametrize("use_checkpoint", [False, True])
 def test_parallelize_model_fsdp2_manual_prefetch_e2e_gloo(use_checkpoint: bool) -> None:
-    spawn_with_rendezvous(_fsdp2_prefetch_worker, args=(use_checkpoint,), nprocs=2)
+    spawn_with_rendezvous(_fsdp2_prefetch_cpu_worker, args=(use_checkpoint,), nprocs=2)
+
+
+@pytest.mark.launch_plan(provider=_CI_ACCELERATOR_4)
+@pytest.mark.skipif(
+    not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE),
+    reason="requires 4 CUDA or NPU devices",
+)
+@pytest.mark.parametrize("use_checkpoint", [False, True])
+def test_parallelize_model_fsdp2_manual_prefetch_e2e_accelerator(use_checkpoint: bool) -> None:
+    torchrun(_fsdp2_prefetch_accelerator_worker, _CI_ACCELERATOR_4.nproc, use_checkpoint)
