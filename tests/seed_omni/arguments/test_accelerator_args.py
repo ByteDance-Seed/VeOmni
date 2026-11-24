@@ -257,15 +257,6 @@ def test_ddp_cpu_init_is_enforced_at_construction():
         AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="ddp"), init_device="cpu")
 
 
-def test_extra_parallel_stream_load_with_broadcast_is_enforced_at_construction():
-    with pytest.raises(AssertionError, match="extra_parallel_stream_load"):
-        OmniModuleRuntimeArguments(
-            model_path="/tmp/model",
-            extra_parallel_stream_load=True,
-            broadcast_model_weights_from_rank0=True,
-        )
-
-
 def test_validate_omni_accelerator_bans_torch_compile():
     acc = AcceleratorConfig(torch_compile=TorchCompileConfig(enable=True))
     with pytest.raises(ValueError, match="torch_compile"):

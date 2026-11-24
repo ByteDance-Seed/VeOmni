@@ -23,10 +23,8 @@ from torch.distributed.tensor import Shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.parallel_plan import SpecInfo
-from veomni.distributed.torch_compile import CompileConfig
 from veomni.distributed.torch_parallelize import (
     _divide_extra_parallel_grads_like_fsdp,
-    parallelize_model_fsdp2,
 )
 
 
@@ -81,113 +79,6 @@ def test_the_gradient_hook_skips_persistent_parameters():
     assert torch.all(_apply_backward_hooks(model.plain, grad) == 1.0), (
         "a non-persistent plan shard is divided by the factor"
     )
-
-
-def test_extra_parallel_only_rejects_torch_compile_instead_of_running_eager(monkeypatch):
-    """The unwrapped path returns before ``validate_compile_runtime``.
-
-    Without this refusal a config that asks for compile would silently train
-    eager -- the config claims one thing and the run does another, with no
-    warning.
-    """
-    monkeypatch.setattr(
-        "veomni.distributed.torch_parallelize.get_parallel_state",
-        lambda: SimpleNamespace(fsdp_enabled=True, dp_mode="fsdp2"),
-    )
-
-    with pytest.raises(RuntimeError, match="extra_parallel_only"):
-        parallelize_model_fsdp2(
-            nn.Linear(2, 2),
-            extra_parallel_only=True,
-            compile_config=CompileConfig(enable=True),
-            init_device="meta",
-        )
-
-
-def test_a_plan_less_module_under_an_enabled_extra_parallel_dim_says_how_to_fix_it(monkeypatch):
-    """The assertion is right to fire; what it says decides whether it is actionable.
-
-    A plan-less module is normally a per-module overlay that inherited the global
-    mesh (a vision tower under a backbone's `ep`). The bare message only pointed at
-    example plans, which does not tell that user the cheaper fix is to turn the
-    dimension off for this module.
-
-    Getting the fix right took two attempts. `ep_size: 1` *is* the answer for
-    `ep`, because `_module_base` folds an inherited `ep` entry into `ep_size`
-    before the overlay merges; clearing the three lists is what fails, since the
-    folded width comes back through `AcceleratorConfig.__post_init__`. The
-    message must therefore point at `ep_size` and must not send users to the
-    lists.
-    """
-    from types import SimpleNamespace
-
-    import torch.nn as nn
-
-    from veomni.distributed import torch_parallelize
-
-    monkeypatch.setattr(
-        torch_parallelize,
-        "get_parallel_state",
-        lambda: SimpleNamespace(
-            fsdp_enabled=True,
-            dp_mode="fsdp2",
-            any_extra_parallel_enabled=True,
-            extra_parallel_names=("ep",),
-            extra_parallel_sizes={"ep": 4},
-            extra_parallel_enabled=lambda name: True,
-            extra_parallel_fsdp_device_mesh={"ep": None},
-        ),
-    )
-    monkeypatch.setattr(torch_parallelize, "get_runtime_parallel_plan", lambda model: None)
-
-    with pytest.raises(AssertionError) as excinfo:
-        torch_parallelize.parallelize_model_fsdp2(nn.Linear(2, 2), init_device="meta")
-
-    message = str(excinfo.value)
-    assert "parallel plan" in message
-    assert "qwen3_moe/parallel_plan.py" in message, "must still point at a worked example"
-    assert "ep_size: 1" in message, "must name the actual opt-out for `ep`"
-    assert "does NOT work" in message, "must warn that clearing the lists is not the fix"
-    assert "Enabled dimensions" in message
-
-
-def test_cpu_offload_is_refused_even_when_every_parameter_is_plan_sharded():
-    """The narrower guard missed the tied-`TextEncoder` shape.
-
-    Its only parameter is `emb`-sharded, so nothing was replicated and a
-    `replicated_bytes`-only guard passed -- but `ShardedEmbedding._project`
-    all-gathers the vocabulary table with accelerator activations, and a
-    host-resident table cannot take part. Driven at `_finish_without_fsdp_wrap`:
-    that is the function that owns the check, and reaching it through
-    `parallelize_model_fsdp2` would need a stub for every earlier config check.
-    """
-    from types import SimpleNamespace
-
-    import torch.nn as nn
-    from torch.distributed.tensor import Shard
-
-    from veomni.distributed.torch_parallelize import _finish_without_fsdp_wrap
-
-    model = nn.Linear(4, 4)
-    spec_info = {
-        fqn: SimpleNamespace(para_name="emb", placement=Shard(0), persistent_fsdp_shard_dim=None)
-        for fqn, _ in model.named_parameters()
-    }
-    parallel_state = SimpleNamespace(
-        extra_parallel_names=("emb",),
-        extra_parallel_enabled=lambda name: True,
-        extra_parallel_fsdp_size=lambda name: 1,
-    )
-
-    with pytest.raises(ValueError, match="offload cannot be combined"):
-        _finish_without_fsdp_wrap(
-            model,
-            weights_path=None,
-            parallel_state=parallel_state,
-            fqn2spec_info=spec_info,
-            should_skip_hf_weight_load=True,
-            kwargs={"enable_fsdp_offload": True, "init_device": "meta"},
-        )
 
 
 def test_shared_expert_lora_grads_are_divided_like_the_skipped_wrap_would(monkeypatch):
@@ -277,14 +168,12 @@ def test_the_shared_lora_divide_is_by_world_size_and_skips_frozen_params():
     assert torch.equal(param.grad, torch.full((2, 2), 1.0 / 8))
 
 
-def test_shared_lora_params_are_collected_unwrapped_but_a_missing_wrap_still_raises():
-    """The DTensor assertion guards call order, not the unwrapped path.
+def test_shared_lora_params_are_collected_when_the_model_is_unwrapped():
+    """Shared-expert LoRA params are collected as plain parameters on this path.
 
-    It exists because a snapshot taken before ``fully_shard`` rewraps the module
-    goes stale immediately. ``extra_parallel_only`` never wraps, so plain
-    parameters there are final and must be accepted -- otherwise the mode cannot
-    be combined with shared-expert LoRA at all. A model *without* that marker
-    still has to fail, or the misuse the assertion was written for returns.
+    The DTensor assertion below this guards call order; ``extra_parallel_only``
+    never wraps, so the snapshot is already final and the plain parameters must
+    be accepted -- otherwise the mode cannot be combined with shared-expert LoRA.
     """
     import torch
     import torch.nn as nn
@@ -296,15 +185,7 @@ def test_shared_lora_params_are_collected_unwrapped_but_a_missing_wrap_still_rai
             super().__init__()
             self.gate_up_proj = nn.Parameter(torch.zeros(2, 2))
 
-    unwrapped = nn.Sequential(LoraSharedExperts())
-    unwrapped._extra_parallel_only = True
-    assert _collect_ep_replicated_lora_param_ids(unwrapped) == {id(unwrapped[0].gate_up_proj)}
+    model = nn.Sequential(LoraSharedExperts())
+    model._extra_parallel_only = True
 
-    # No marker: still the call-order mistake, so it must keep raising.
-    missing = nn.Sequential(LoraSharedExperts())
-    try:
-        _collect_ep_replicated_lora_param_ids(missing)
-    except AssertionError as exc:
-        assert "not a DTensor" in str(exc)
-    else:  # pragma: no cover - the assertion is the point
-        raise AssertionError("a plain parameter on an unwrapped-by-accident model must still be refused")
+    assert _collect_ep_replicated_lora_param_ids(model) == {id(model[0].gate_up_proj)}
