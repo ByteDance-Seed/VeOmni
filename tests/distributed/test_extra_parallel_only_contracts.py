@@ -190,23 +190,25 @@ def test_cpu_offload_is_refused_even_when_every_parameter_is_plan_sharded():
         )
 
 
-def test_shared_expert_lora_is_refused_before_the_optimizer_can_assert_on_it():
-    """No wrap means the shared adapters never become DTensors.
+def test_shared_expert_lora_grads_are_divided_like_the_skipped_wrap_would(monkeypatch):
+    """Shared-expert LoRA stays usable without the wrap, with the same grad scale.
 
-    `build_extra_parallel_fsdp2_optimizer` snapshots them through
-    `_collect_ep_replicated_lora_param_ids`, which asserts every hit is a
-    DTensor (they are pulled into the inner `ep_fsdp` shard by the wrapped
-    build). Unwrapped they stay plain `nn.Parameter`, so the failure surfaces at
-    optimizer construction with an assertion pointing at call order rather than
-    at this config choice. Refused here instead, by class name so the check
-    needs no import of the LoRA layer.
+    The adapters are replicated across the EP group; ``_ensure_ep_grad_sync_hooks``
+    SUMs their grads over that group and counts on the wrap's
+    ``set_gradient_divide_factor(world_size)`` to turn that sum into
+    ``total_grad / world_size``. Without a wrap the division has to be reinstated,
+    or every step is ``world_size`` times too large.
+
+    Driven through ``_finish_without_fsdp_wrap`` rather than through the helper
+    directly: calling the helper would still pass if the call site forgot it.
     """
     from types import SimpleNamespace
 
+    import torch
     import torch.nn as nn
     from torch.distributed.tensor import Shard
 
-    from veomni.distributed.torch_parallelize import _finish_without_fsdp_wrap
+    from veomni.distributed import torch_parallelize
 
     class LoraSharedExperts(nn.Module):
         def __init__(self):
@@ -222,14 +224,87 @@ def test_shared_expert_lora_is_refused_before_the_optimizer_can_assert_on_it():
         extra_parallel_names=("ep",),
         extra_parallel_enabled=lambda name: True,
         extra_parallel_fsdp_size=lambda name: 1,
+        world_size=8,
+        extra_parallel_gradient_divide_factor=lambda name: 8,
     )
 
-    with pytest.raises(ValueError, match="shared-expert LoRA"):
-        _finish_without_fsdp_wrap(
-            model,
-            weights_path=None,
-            parallel_state=parallel_state,
-            fqn2spec_info=spec_info,
-            should_skip_hf_weight_load=True,
-            kwargs={"init_device": "meta"},
-        )
+    seen = {}
+
+    def _record(m, ps):
+        seen["model"] = m
+        seen["world_size"] = ps.world_size
+
+    monkeypatch.setattr(torch_parallelize, "_divide_replicated_lora_grads_like_fsdp", _record)
+    torch_parallelize._finish_without_fsdp_wrap(
+        model,
+        weights_path=None,
+        parallel_state=parallel_state,
+        fqn2spec_info=spec_info,
+        should_skip_hf_weight_load=True,
+        kwargs={"init_device": "meta"},
+    )
+
+    assert seen.get("model") is model, "the no-wrap path must reinstate the shared-LoRA divide"
+    assert seen.get("world_size") == 8
+
+
+def test_the_shared_lora_divide_is_by_world_size_and_skips_frozen_params():
+    """The factor itself: grads shrink by ``world_size``, frozen params get no hook."""
+    from types import SimpleNamespace
+
+    import torch
+    import torch.nn as nn
+
+    from veomni.distributed.torch_parallelize import _divide_replicated_lora_grads_like_fsdp
+
+    class LoraSharedExperts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = nn.Parameter(torch.zeros(2, 2))
+            self.frozen = nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+
+    # factor 1 registers nothing: the wrapped path's divide factor is 1 there too.
+    plain = nn.Sequential(LoraSharedExperts())
+    _divide_replicated_lora_grads_like_fsdp(plain, SimpleNamespace(world_size=1))
+    assert not plain[0].gate_up_proj._backward_hooks
+
+    model = nn.Sequential(LoraSharedExperts())
+    _divide_replicated_lora_grads_like_fsdp(model, SimpleNamespace(world_size=8))
+    param = model[0].gate_up_proj
+    assert not model[0].frozen._backward_hooks, "a frozen parameter has no grad to divide"
+    # A real backward, so the hook's output lands in `.grad` as it will in training.
+    param.sum().backward()
+    assert torch.equal(param.grad, torch.full((2, 2), 1.0 / 8))
+
+
+def test_shared_lora_params_are_collected_unwrapped_but_a_missing_wrap_still_raises():
+    """The DTensor assertion guards call order, not the unwrapped path.
+
+    It exists because a snapshot taken before ``fully_shard`` rewraps the module
+    goes stale immediately. ``extra_parallel_only`` never wraps, so plain
+    parameters there are final and must be accepted -- otherwise the mode cannot
+    be combined with shared-expert LoRA at all. A model *without* that marker
+    still has to fail, or the misuse the assertion was written for returns.
+    """
+    import torch
+    import torch.nn as nn
+
+    from veomni.optim.optimizer import _collect_ep_replicated_lora_param_ids
+
+    class LoraSharedExperts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = nn.Parameter(torch.zeros(2, 2))
+
+    unwrapped = nn.Sequential(LoraSharedExperts())
+    unwrapped._extra_parallel_only = True
+    assert _collect_ep_replicated_lora_param_ids(unwrapped) == {id(unwrapped[0].gate_up_proj)}
+
+    # No marker: still the call-order mistake, so it must keep raising.
+    missing = nn.Sequential(LoraSharedExperts())
+    try:
+        _collect_ep_replicated_lora_param_ids(missing)
+    except AssertionError as exc:
+        assert "not a DTensor" in str(exc)
+    else:  # pragma: no cover - the assertion is the point
+        raise AssertionError("a plain parameter on an unwrapped-by-accident model must still be refused")

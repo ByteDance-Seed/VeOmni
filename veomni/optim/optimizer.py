@@ -92,11 +92,16 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
             for n, p in mod.named_parameters(recurse=True):
                 if not p.requires_grad:
                     continue
-                # Catches wrong call-order misuse: if any matched LoRA param
-                # is still a plain ``nn.Parameter`` (not a DTensor) at this
-                # point, FSDP2 hasn't wrapped yet -- ``build_optimizer`` was
-                # invoked before ``build_parallelize_model``. The snapshot
-                # we are about to take would be stale immediately.
+                # A plain ``nn.Parameter`` here used to mean "build_optimizer ran
+                # before build_parallelize_model" -- a real misuse, because the
+                # snapshot would be stale the moment FSDP2 rewrapped the module.
+                # Under ``extra_parallel_only`` there is no wrap to wait for, so
+                # these stay plain tensors by design and the snapshot is already
+                # final. Distinguish the two by asking whether the model was
+                # wrapped at all, rather than by the parameter's type.
+                if not isinstance(p, DTensor) and getattr(model, "_extra_parallel_only", False):
+                    out.add(id(p))
+                    continue
                 assert isinstance(p, DTensor), (
                     f"_collect_ep_replicated_lora_param_ids: LoRA param {n!r} on a "
                     f"LoraSharedExperts wrapper is not a DTensor -- call "
