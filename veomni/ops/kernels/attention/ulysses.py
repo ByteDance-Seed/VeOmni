@@ -72,7 +72,12 @@ def ulysses_mask_lengths(q_length: int, kv_length: int, mask_length: int | None)
 
 
 def _gather_seq_scatter_heads_bshd(tensor: torch.Tensor, *, group: ProcessGroup) -> torch.Tensor:
-    """Gather sequence and scatter heads for one tensor in ``[B, S, H, D]`` layout."""
+    """Gather sequence and scatter heads for one tensor in ``[B, S, H, D]`` layout.
+
+    Each tensor is squeezed independently when its batch size is one.
+    Q/K/V share a batch size, so this matches the previous check on Q and lets the
+    MiniMax index query use the same exchange independently.
+    """
     if tensor.ndim == 4 and tensor.size(0) == 1:
         tensor = gather_seq_scatter_heads(tensor.squeeze(0), seq_dim=0, head_dim=1, group=group)
         return tensor.unsqueeze(0)
