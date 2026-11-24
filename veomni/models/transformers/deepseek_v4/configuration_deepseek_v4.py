@@ -227,27 +227,33 @@ class DeepseekV4Config(VeOmniPretrainedConfig, _DeepseekV4Config):
             return
 
         kernels_config = self.ops_config
-
-        for field_name, supported, reason in (
+        indexer_implementation = kernels_config.dsa_indexer_implementation
+        attention_implementation = kernels_config.dsa_attention_implementation
+        for field_name, value, reason in (
             (
                 "dsa_indexer_implementation",
-                ("tilelang", "triton"),
+                indexer_implementation,
                 "the eager indexer discards the per-slot scores the KL trains against",
             ),
             (
                 "dsa_attention_implementation",
-                ("tilelang", "triton"),
+                attention_implementation,
                 "the teacher distribution requires the full base-2 log-sum-exp returned by the fused attention",
             ),
         ):
-            value = getattr(kernels_config, field_name, None)
-            if value not in supported:
-                choices = " or ".join(repr(choice) for choice in supported)
+            if value not in ("tilelang", "triton"):
                 raise ValueError(
-                    f"dsa_indexer_loss requires {field_name}={choices}, got {value!r}: {reason}. "
+                    f"dsa_indexer_loss requires {field_name}='tilelang' or 'triton', got {value!r}: {reason}. "
                     "Set it under model.ops_implementation, or switch the objective off with "
                     "dsa_indexer_loss: false / dsa_indexer_loss_coef: 0.0 under model.model_config."
                 )
+        if indexer_implementation != attention_implementation:
+            raise ValueError(
+                "dsa_indexer_loss requires a matched DSA backend pair: "
+                "(dsa_indexer_implementation, dsa_attention_implementation) must be "
+                "('tilelang', 'tilelang') or ('triton', 'triton'), got "
+                f"({indexer_implementation!r}, {attention_implementation!r})."
+            )
 
 
 __all__ = ["DeepseekV4Config"]

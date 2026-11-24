@@ -95,8 +95,7 @@ distinguish the correct teacher from Megatron's.
 | constraint | enforced at | if violated |
 |----|----|----|
 | `dsa_indexer_loss_coef` finite and non-negative | `DeepseekV4Config.validate_build_prerequisites`, from `build_foundation_model` | `ValueError` at model build |
-| `dsa_indexer_implementation` in `("tilelang", "triton")` | `validate_build_prerequisites`, and `_indexer_loss_enabled` again | `ValueError` at model build |
-| `dsa_attention_implementation` in `("tilelang", "triton")` | `validate_build_prerequisites`, and `_indexer_loss_enabled` again | `ValueError` at model build |
+| `(dsa_indexer_implementation, dsa_attention_implementation)` is `("tilelang", "tilelang")` or `("triton", "triton")` | `validate_build_prerequisites`; each field is checked again by `_indexer_loss_enabled` | `ValueError` at model build |
 | `ulysses_size == 1` and `cp_size == 1` | `_indexer_loss_enabled` | `ValueError` on the first forward |
 | at least one `compressed_sparse_attention` layer | `DeepseekV4Model.forward` | `RuntimeError` on the first forward |
 | the compressor handed over its scores | `DeepseekV4Attention.forward` | `RuntimeError` on the first forward |

@@ -359,7 +359,7 @@ def test_target_kernel_rejects_empty_kv():
 
 
 def test_rocm_target_allows_empty_pool_when_candidate_width_is_zero():
-    if torch.version.hip is None:
+    if not (IS_CUDA_AVAILABLE and torch.version.hip is not None):
         pytest.skip("requires the ROCm Triton teacher")
     from veomni.ops.kernels.dsa.sparse_mqa_target import sparse_mqa_target_fwd
 
