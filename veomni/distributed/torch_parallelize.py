@@ -1222,6 +1222,8 @@ def build_parallelize_model(
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
+    freeze_ple_embeddings: bool = False,
+    frozen_ple_dtype: Optional[str] = None,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -1238,7 +1240,16 @@ def build_parallelize_model(
             enabled gradient checkpointing and before FSDP2 shards the blocks.
         expert_weight_fp8_all_gather: Gather weights of actual DeepGEMM experts in FP8.
             Ignored when the model contains no matching experts.
+        freeze_ple_embeddings: Freeze Qwen4-Exp PLE n-gram tables before parallelization
+            and omit them during in-memory ``export_weights`` calls.
+        frozen_ple_dtype: Optional storage dtype (``"float32"`` or ``"bfloat16"``) applied
+            to frozen PLE tables after parallelization and weight loading.
     """
+    if not isinstance(freeze_ple_embeddings, bool):
+        raise ValueError("freeze_ple_embeddings must be a boolean (true or false).")
+    if frozen_ple_dtype is not None and (not freeze_ple_embeddings or frozen_ple_dtype not in ("float32", "bfloat16")):
+        raise ValueError("frozen_ple_dtype requires freeze_ple_embeddings and must be float32 or bfloat16")
+
     parallel_state = get_parallel_state()
     reject_qat_without_native_bf16(model)
     validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim, fsdp_mode=parallel_state.dp_mode)
@@ -1271,6 +1282,14 @@ def build_parallelize_model(
             "MixedPrecisionPolicy requires the FSDP2 wrap, so without it weights would stay in FP32. "
             "Set fsdp_config.mixed_precision.enable=false."
         )
+
+    if freeze_ple_embeddings:
+        from ..models.frozen_ple import freeze_ple_embeddings as _freeze_ple_embeddings
+        from ..models.frozen_ple import has_frozen_ple_embeddings
+
+        if not has_frozen_ple_embeddings(model):
+            count = _freeze_ple_embeddings(model)
+            logger.info_rank0("Frozen PLE: %d tables", count)
 
     if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
         model = model.float()
@@ -1360,5 +1379,11 @@ def build_parallelize_model(
         raise RuntimeError(
             "model.accelerator.torch_compile.enable requires FSDP2; compile without FSDP is not supported."
         )
+
+    if freeze_ple_embeddings:
+        from ..models.frozen_ple import prepare_ple_storage
+        from ..utils.device import get_device_type
+
+        prepare_ple_storage(model, frozen_ple_dtype, expected_device=get_device_type())
 
     return model

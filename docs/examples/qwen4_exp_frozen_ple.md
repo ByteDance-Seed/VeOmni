@@ -44,13 +44,15 @@ keep the dtype they have after model parallelization.
 
 ## Weight export
 
-- **Full checkpoint export ([`export_weights`](../../veomni/models/checkpoint/convert.py#L395)).**
-  Frozen PLE lookup tables remain included by default (`skip_frozen_engram=False`),
-  and padded runtime PLE shards are cropped back to their logical checkpoint row
-  counts via [`crop_hf_export_tensor`](../../veomni/models/transformers/qwen4_exp/checkpoint_tensor_converter.py#L107).
-- **Partial / rollout weight sync (`export_weights(model, skip_frozen_engram=True)`).**
-  Callers synchronizing only updated parameters (such as RL actor-to-rollout weight
-  sync) can pass `skip_frozen_engram=True` to [`export_weights`](../../veomni/models/checkpoint/convert.py#L395),
-  which consults [`collect_frozen_engram_state_dict_keys`](../../veomni/models/frozen_ple.py#L56)
-  to omit frozen PLE / Engram lookup tables (and companion scale tensors) before
-  unsharding `DTensor` shards.
+- **In-memory weight iteration ([`export_weights`](../../veomni/models/checkpoint/convert.py#L403)).**
+  When `freeze_ple_embeddings` is enabled (via `VLMTrainer` or
+  [`build_parallelize_model`](../../veomni/distributed/torch_parallelize.py#L1032)),
+  [`freeze_ple_embeddings`](../../veomni/models/frozen_ple.py#L53) marks the model so
+  [`export_weights`](../../veomni/models/checkpoint/convert.py#L403) omits frozen PLE
+  tables before unsharding `DTensor` shards. When `freeze_ple_embeddings` is disabled,
+  [`export_weights`](../../veomni/models/checkpoint/convert.py#L403) unshards PLE tables
+  and crops padded runtime rows back to their logical checkpoint row counts via
+  [`crop_hf_export_tensor`](../../veomni/models/transformers/qwen4_exp/checkpoint_tensor_converter.py#L107).
+- **Distributed Hugging Face checkpoint save (`save_hf_safetensor`).**
+  Saves all model parameters (including frozen PLE tables) directly from `DTensor`
+  shards at their logical row counts via `RowCropSavePlanner`.

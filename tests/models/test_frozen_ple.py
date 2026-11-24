@@ -10,9 +10,8 @@ from torch.distributed.tensor import Shard, distribute_tensor
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.frozen_ple import (
-    collect_frozen_engram_state_dict_keys,
     freeze_ple_embeddings,
-    is_engram_or_ple_table,
+    has_frozen_ple_embeddings,
     is_ple_table,
     prepare_ple_storage,
 )
@@ -218,57 +217,65 @@ def test_dtensor_cast_preserves_local_shard_and_metadata(dtype, tmp_path):
         dist.destroy_process_group()
 
 
-def test_is_engram_or_ple_table_matches_qwen4_and_deepseek_v41_only():
-    assert is_engram_or_ple_table("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight")
-    assert is_engram_or_ple_table(
-        "module.model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight"
+def test_has_frozen_ple_embeddings_unwraps_ddp_wrapper():
+    """Track frozen PLE state on the model and through DDP ``.module`` wrappers."""
+    model = _qwen4_model()
+    assert not has_frozen_ple_embeddings(model)
+    assert freeze_ple_embeddings(model) == 1
+    assert has_frozen_ple_embeddings(model)
+
+    ddp_like = nn.Module()
+    ddp_like.module = model
+    assert has_frozen_ple_embeddings(ddp_like)
+
+
+def test_build_parallelize_model_freezes_and_sets_ple_dtype(monkeypatch):
+    """Apply PLE freezing before upcast/parallelization and storage dtype afterwards."""
+    from veomni.arguments.arguments_types import MixedPrecisionConfig
+    from veomni.distributed import torch_parallelize
+
+    monkeypatch.setattr(
+        torch_parallelize,
+        "get_parallel_state",
+        lambda: SimpleNamespace(dp_mode="fsdp2", tp_enabled=False, fsdp_enabled=True),
     )
-    assert is_engram_or_ple_table("layers.1.engram.embed.weight")
-    assert is_engram_or_ple_table("layers.1.engram.embed.scale")
-    assert is_engram_or_ple_table("model.layers.14.engram.embed_tokens.weight")
-    assert is_engram_or_ple_table("model.ngram_embeddings.tables.0.weight")
+    monkeypatch.setattr("veomni.utils.device.get_device_type", lambda: "cpu")
 
-    assert not is_engram_or_ple_table("model.language_model.layers.1.ple.key_proj.weight")
-    assert not is_engram_or_ple_table("model.language_model.layers.1.ple.value_proj.weight")
-    assert not is_engram_or_ple_table("model.language_model.layers.1.ple.norm_key.weight")
-    assert not is_engram_or_ple_table("model.language_model.layers.1.ple.conv1d.weight")
-    assert not is_engram_or_ple_table("layers.1.engram.q_weight")
-    assert not is_engram_or_ple_table("layers.1.engram.k_weight")
-    assert not is_engram_or_ple_table("layers.1.engram.wkv.weight")
-    assert not is_engram_or_ple_table("layers.1.engram.wkv.scale")
-    assert not is_engram_or_ple_table("embed.weight")
-    assert not is_engram_or_ple_table("model.embed_tokens.weight")
+    seen_frozen_in_parallelize = False
 
+    def _fake_parallelize_fsdp2(model, **kwargs):
+        nonlocal seen_frozen_in_parallelize
+        table = model.ple.ple_embedding.ngram_embedding["shard_0"].weight
+        seen_frozen_in_parallelize = (not table.requires_grad) and table.dtype == torch.float32
+        return model
 
-def test_collect_frozen_engram_state_dict_keys_tracks_shard_scopes_and_preserves_mid_fqn_module():
-    model = nn.Module()
-    model.layers = nn.ModuleList([nn.Module()])
-    model.layers[0].ple = nn.Module()
-    model.layers[0].ple.ple_embedding = nn.Module()
-    shard0 = nn.Module()
-    shard0.weight = nn.Parameter(torch.ones(4, 2), requires_grad=False)
-    shard0.register_buffer("scale", torch.ones(4, 1, dtype=torch.uint8))
-    shard1 = nn.Module()
-    shard1.weight = nn.Parameter(torch.ones(4, 2), requires_grad=True)
-    shard1.register_buffer("scale", torch.ones(4, 1, dtype=torch.uint8))
-    model.layers[0].ple.ple_embedding.ngram_embedding = nn.ModuleDict({"shard_0": shard0, "shard_1": shard1})
-    # A legitimate submodule named ``module`` mid-FQN must not have ``.module.`` stripped.
-    model.layers[0].module = nn.Linear(2, 2)
+    monkeypatch.setattr(torch_parallelize, "parallelize_model_fsdp2", _fake_parallelize_fsdp2)
 
-    wrapper = nn.Module()
-    wrapper.module = model
+    with pytest.raises(ValueError, match="must be a boolean"):
+        torch_parallelize.build_parallelize_model(_qwen4_model(), freeze_ple_embeddings="true")
 
-    frozen = collect_frozen_engram_state_dict_keys(wrapper, wrapper.state_dict().keys())
-    assert "layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight" in frozen
-    assert "module.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight" in frozen
-    assert "layers.0.ple.ple_embedding.ngram_embedding.shard_0.scale" in frozen
-    assert "module.layers.0.ple.ple_embedding.ngram_embedding.shard_0.scale" in frozen
-    assert "layers.0.ple.ple_embedding.ngram_embedding.shard_1.weight" not in frozen
-    assert "layers.0.ple.ple_embedding.ngram_embedding.shard_1.scale" not in frozen
-    assert "layers.0.module.weight" not in frozen
+    with pytest.raises(ValueError, match="frozen_ple_dtype"):
+        torch_parallelize.build_parallelize_model(
+            _qwen4_model(), freeze_ple_embeddings=False, frozen_ple_dtype="bfloat16"
+        )
+
+    model = _qwen4_model().to(torch.bfloat16)
+    parallelized = torch_parallelize.build_parallelize_model(
+        model,
+        mixed_precision=MixedPrecisionConfig(enable=True),
+        enable_gradient_checkpointing=False,
+        freeze_ple_embeddings=True,
+        frozen_ple_dtype="bfloat16",
+    )
+    assert seen_frozen_in_parallelize
+    assert has_frozen_ple_embeddings(parallelized)
+    table = parallelized.ple.ple_embedding.ngram_embedding["shard_0"].weight
+    assert not table.requires_grad
+    assert table.dtype == torch.bfloat16
+    assert parallelized.other.weight.dtype == torch.float32
 
 
-def test_export_weights_skips_frozen_ple_dtensor_without_full_tensor_and_crops_when_kept(monkeypatch, tmp_path):
+def test_export_weights_skips_frozen_ple_dtensor_without_full_tensor_and_crops_when_trainable(monkeypatch, tmp_path):
     from veomni.models.checkpoint.convert import export_weights
     from veomni.models.transformers.qwen4_exp.checkpoint_tensor_converter import (
         create_qwen4_exp_checkpoint_tensor_converter,
@@ -283,26 +290,29 @@ def test_export_weights_skips_frozen_ple_dtensor_without_full_tensor_and_crops_w
     dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'rendezvous_export'}", rank=0, world_size=1)
     try:
         mesh = init_device_mesh("cpu", (1,))
-        model = nn.Module()
-        model.config = SimpleNamespace(
-            model_type="qwen4_exp",
-            text_config=SimpleNamespace(split_ngram_parts=1, make_ngram_vocab_size_divisible_by=8),
-        )
-        ple = nn.Module()
-        ple.rows_per_checkpoint_shard = 6
-        ple.padded_rows_per_shard = 8
-        ple.ngram_embedding = nn.ModuleDict({"shard_0": nn.Embedding(8, 4)})
-        raw_table = torch.arange(32, dtype=torch.bfloat16).reshape(8, 4)
-        raw_table[6:] = 0
-        ple.ngram_embedding["shard_0"].weight = nn.Parameter(
-            distribute_tensor(raw_table, mesh, [Shard(0)]),
-            requires_grad=False,
-        )
-        model.layers = nn.ModuleList([nn.Module()])
-        model.layers[0].ple = nn.Module()
-        model.layers[0].ple.ple_embedding = ple
-        model.layers[0].ple.key_proj = nn.Linear(4, 4, bias=False)
-        model._create_checkpoint_tensor_converter = create_qwen4_exp_checkpoint_tensor_converter
+
+        def _make_export_model():
+            model = nn.Module()
+            model.config = SimpleNamespace(
+                model_type="qwen4_exp",
+                text_config=SimpleNamespace(split_ngram_parts=1, make_ngram_vocab_size_divisible_by=8),
+            )
+            ple = nn.Module()
+            ple.rows_per_checkpoint_shard = 6
+            ple.padded_rows_per_shard = 8
+            ple.ngram_embedding = nn.ModuleDict({"shard_0": nn.Embedding(8, 4)})
+            raw_table = torch.arange(32, dtype=torch.bfloat16).reshape(8, 4)
+            raw_table[6:] = 0
+            ple.ngram_embedding["shard_0"].weight = nn.Parameter(
+                distribute_tensor(raw_table, mesh, [Shard(0)]),
+                requires_grad=True,
+            )
+            model.layers = nn.ModuleList([nn.Module()])
+            model.layers[0].ple = nn.Module()
+            model.layers[0].ple.ple_embedding = ple
+            model.layers[0].ple.key_proj = nn.Linear(4, 4, bias=False)
+            model._create_checkpoint_tensor_converter = create_qwen4_exp_checkpoint_tensor_converter
+            return model, raw_table
 
         orig_full_tensor = torch.distributed.tensor.DTensor.full_tensor
         ple_full_tensor_calls = 0
@@ -315,28 +325,29 @@ def test_export_weights_skips_frozen_ple_dtensor_without_full_tensor_and_crops_w
 
         monkeypatch.setattr(torch.distributed.tensor.DTensor, "full_tensor", _guarded_full_tensor)
 
-        skipped_export = dict(export_weights(model, skip_frozen_engram=True))
+        # 1. With freeze_ple_embeddings applied: export_weights skips PLE before full_tensor().
+        frozen_model, _ = _make_export_model()
+        assert freeze_ple_embeddings(frozen_model) == 1
+        skipped_export = dict(export_weights(frozen_model))
         assert ple_full_tensor_calls == 0
         assert "layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight" not in skipped_export
         assert "layers.0.ple.key_proj.weight" in skipped_export
 
-        # Also verify DDP-style ``model.module`` wrapper unwrapping for both skip and crop paths.
         wrapped = nn.Module()
-        wrapped.module = model
-        wrapped_skipped = dict(export_weights(wrapped, skip_frozen_engram=True))
+        wrapped.module = frozen_model
+        wrapped_skipped = dict(export_weights(wrapped))
         assert ple_full_tensor_calls == 0
         assert "layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight" not in wrapped_skipped
         assert "layers.0.ple.key_proj.weight" in wrapped_skipped
 
-        full_export = dict(export_weights(wrapped, skip_frozen_engram=False))
+        # 2. Without freeze_ple_embeddings: export_weights unshards and crops PLE to logical rows.
+        trainable_model, raw_table = _make_export_model()
+        trainable_wrapped = nn.Module()
+        trainable_wrapped.module = trainable_model
+        full_export = dict(export_weights(trainable_wrapped))
         assert ple_full_tensor_calls == 1
         ple_exported = full_export["layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"]
         assert ple_exported.shape == (6, 4)
         torch.testing.assert_close(ple_exported, raw_table[:6], rtol=0, atol=0)
-
-        # Unfrozen PLE must NOT be skipped even when skip_frozen_engram=True, and is still cropped.
-        ple.ngram_embedding["shard_0"].weight.requires_grad_(True)
-        trainable_export = dict(export_weights(model, skip_frozen_engram=True))
-        assert trainable_export["layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"].shape == (6, 4)
     finally:
         dist.destroy_process_group()

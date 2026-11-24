@@ -474,15 +474,16 @@ full CPU tensors. Without a model, legacy conversion skips cropping; older padde
 checkpoints need model metadata to export logical rows. Optimizer state
 retains its runtime shapes. The checkpoint layer imports no model packages.
 
-For in-memory weight iteration via [`export_weights`](../../veomni/models/checkpoint/convert.py#L395),
+For in-memory weight iteration via [`export_weights`](../../veomni/models/checkpoint/convert.py#L403),
 the model converter may also implement [`crop_hf_export_tensor(name, tensor)`](../../veomni/models/checkpoint/convert.py#L162)
 (for Qwen4-Exp, [`Qwen4ExpCheckpointTensorConverter.crop_hf_export_tensor`](../../veomni/models/transformers/qwen4_exp/checkpoint_tensor_converter.py#L107)):
 given an unprefixed weight FQN and its full unsharded matrix, it returns the
 logical-row slice `[0, logical_rows)` for retained non-expert tensors at the
-[`export_weights` call site](../../veomni/models/checkpoint/convert.py#L454). A
-missing method opts out and leaves exported tensors unchanged; passing
-`skip_frozen_engram=True` omits frozen PLE / Engram lookup tables before
-unsharding `DTensor` shards.
+[`export_weights` call site](../../veomni/models/checkpoint/convert.py#L464). A
+missing method opts out and leaves exported tensors unchanged; when
+[`freeze_ple_embeddings`](../../veomni/models/frozen_ple.py#L53) was applied to
+the model, [`export_weights`](../../veomni/models/checkpoint/convert.py#L403)
+omits frozen PLE tables before unsharding `DTensor` shards.
 
 See the [converter protocol](../../veomni/models/checkpoint/convert.py#L89)
 and [row-count lookup](../../veomni/checkpoint/row_crop.py#L15).
