@@ -72,7 +72,6 @@ def convert_gemma4_config_dict(source: dict) -> dict:
             "mask_other_tail_eos": True,
             "compute_all_canvas_df_loss": False,
             "canvas_batching": "serial",
-            "print_ar_df_norm": False,
         }
     )
     text_config = converted["text_config"]

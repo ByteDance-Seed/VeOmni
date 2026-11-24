@@ -298,22 +298,6 @@ class DiffusionGemmaConfig(VeOmniPretrainedConfig, PreTrainedConfig):
         `tests/models/test_diffusion_gemma_packed_canvases.py` pins. Text only:
         the varlen kernels carry no image block boundaries, so the collator
         refuses image features rather than attending an image span as text.
-    print_ar_df_norm (`bool`, *optional*, defaults to `False`):
-        VeOmni extension. When true, each training micro-batch runs two backwards --
-        encoder AR with ``retain_graph``, then diffusion -- and logs that term's
-        param-grad L2 before clipping, under ``encoder_ar_grad_norm`` /
-        ``diffusion_grad_norm``. The two grad buffers are added so the optimizer still
-        steps on ``grad(AR + diffusion)``. Default false is a single backward of the
-        sum, with no extra all-gather or sharded-grad clone.
-
-        A diagnostic, not something to leave on. It refuses a step with more than one
-        micro-batch rather than print a number it cannot stand behind: under FSDP2 an
-        accumulated gradient behind an unsharded parameter is reachable by neither the
-        stash nor ``zero_grad``, so the AR term would add onto it and report two
-        micro-batches as one. It is also expensive -- ``retain_graph`` holds the first
-        backward's saved tensors through the second and the AR gradients are cloned
-        whole, which on the 26B recipe (80GB, ``ep_size: 8``, ``max_seq_len`` 1024) runs
-        out of memory after the first step, with or without recompute.
 
     Example:
 
@@ -366,7 +350,6 @@ class DiffusionGemmaConfig(VeOmniPretrainedConfig, PreTrainedConfig):
     mask_other_tail_eos: bool = True
     compute_all_canvas_df_loss: bool = False
     canvas_batching: Literal["serial", "flat_batch", "flat_seq", "flat_seq_pack"] = "serial"
-    print_ar_df_norm: bool = False
 
     def __post_init__(self, **kwargs):
         if self.text_config is None:

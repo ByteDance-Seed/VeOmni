@@ -70,6 +70,11 @@ def fold_per_expert_scale(model: nn.Module) -> int:
     Must run after the weights land and before the optimizer is built: it is the
     parameter list that this changes, and an optimizer already holding
     ``per_expert_scale`` would carry a moment for a tensor that no longer moves.
+    No trainer calls it: the training path that did was removed with ``DllmTrainer``,
+    so today the callers are the parity scripts and the tests that pin this function's
+    contract. A future trainer that wants NeMo's optimizer problem hooks it in at the
+    point above; the switch existing without that call is deliberate rather than a
+    silently-ignored setting, because nothing advertises it as a training knob.
 
     Encoder and decoder share one transformer stack, so the same ``down_proj``
     object is reachable from two layer modules; the fold is keyed on tensor
