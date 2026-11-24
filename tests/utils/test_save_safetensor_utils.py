@@ -39,7 +39,6 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 # via "veomni.utils.save_safetensor_utils.<name>".
 
 _MOD = "veomni.utils.save_safetensor_utils"
-_CONSOLIDATE = "torch.distributed.checkpoint._consolidate_hf_safetensors"
 
 
 class _IdentityPlan:
@@ -94,9 +93,8 @@ def _call_save_distributed(model, save_path, fqn_to_index_mapping, model_assets,
         # --- deferred imports: patch at source ---
         patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", mock_writer_cls),
         patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
-        patch(f"{_CONSOLIDATE}.consolidate_safetensors_files", MagicMock()),
-        patch(f"{_CONSOLIDATE}.consolidate_safetensors_files_on_every_rank", MagicMock()),
         # --- module-level imports: patch on consumer ---
+        patch(f"{_MOD}._consolidate_hf_safetensors", MagicMock()),
         patch(f"{_MOD}.get_model_save_state", mock_get_state),
         patch(f"{_MOD}.dcp", MagicMock(save=mock_dcp_save)),
         patch(f"{_MOD}.dist", MagicMock(is_initialized=MagicMock(return_value=False))),
@@ -771,7 +769,7 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
         with (
             patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", mock_writer_cls),
             patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
-            patch(f"{_CONSOLIDATE}.consolidate_safetensors_files_on_every_rank", MagicMock()),
+            patch(f"{_MOD}._consolidate_hf_safetensors", MagicMock()),
             patch(f"{_MOD}.get_model_save_state", MagicMock(return_value=rank0_state)),
             patch(f"{_MOD}.dcp", MagicMock(save=MagicMock())),
             patch(f"{_MOD}.dist", mock_dist),
@@ -814,7 +812,7 @@ class TestExecutionOrdering(unittest.TestCase):
         with (
             patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", MagicMock(side_effect=fake_writer)),
             patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
-            patch(f"{_CONSOLIDATE}.consolidate_safetensors_files", MagicMock()),
+            patch(f"{_MOD}._consolidate_hf_safetensors", MagicMock()),
             patch(f"{_MOD}.get_model_save_state", fake_get_state),
             patch(f"{_MOD}.dcp", MagicMock(save=MagicMock())),
             patch(f"{_MOD}.dist", MagicMock(is_initialized=MagicMock(return_value=False))),
@@ -847,11 +845,11 @@ class TestConsolidationWait(unittest.TestCase):
             get_world_size=MagicMock(return_value=2),
             new_group=MagicMock(return_value=group),
         )
-        on_every_rank = MagicMock()
+        consolidate = MagicMock()
         with (
             patch("torch.distributed.checkpoint.HuggingFaceStorageWriter", MagicMock()),
             patch("veomni.checkpoint.dcp_consolidation.apply_dcp_consolidation_patch", MagicMock()),
-            patch(f"{_CONSOLIDATE}.consolidate_safetensors_files_on_every_rank", on_every_rank),
+            patch(f"{_MOD}._consolidate_hf_safetensors", consolidate),
             patch(f"{_MOD}.get_model_save_state", lambda m, f, parallel_state=None: {"a": torch.zeros(2)}),
             patch(f"{_MOD}.dcp", MagicMock(save=MagicMock())),
             patch(f"{_MOD}.dist", fake_dist),
@@ -869,7 +867,7 @@ class TestConsolidationWait(unittest.TestCase):
         kwargs = fake_dist.new_group.call_args.kwargs
         self.assertEqual(kwargs["backend"], "gloo")
         self.assertGreaterEqual(kwargs["timeout"].total_seconds(), 3600)
-        self.assertIs(on_every_rank.call_args.kwargs["process_group"], group)
+        self.assertIs(consolidate.call_args.kwargs["process_group"], group)
 
 
 class TestLegacySaveModelWeights(unittest.TestCase):
