@@ -79,13 +79,15 @@ docker pull quay.io/ascend/veomni:v0.1.12-cann9.2.1-torch_npu2.10.0.post7-a3-ubu
 docker pull quay.io/ascend/veomni:v0.1.12-cann9.2.1-torch_npu2.10.0.post7-a5-ubuntu22.04-py3.12-veomni
 ```
 
-To run the container, mount the Ascend device files and the host driver directories:
+The following command starts the A2 image with one NPU device. For A3, replace the image tag with the A3 tag you pulled above. For A5, use the launch command in the [A5 build guide](https://github.com/ByteDance-Seed/VeOmni/blob/main/docs/hardware_support/AscendDockerUsage/build_a5_docker.md), which maps the devices required on that platform.
+
+To expose more NPUs, add a separate device argument for each one, for example `--device=/dev/davinci1` for a second device.
 
 ```bash
 docker run --runtime=runc -it \
   --ulimit nproc=65535 \
   --ulimit nofile=65535 \
-  --device=/dev/davinci* \
+  --device=/dev/davinci0 \
   --device=/dev/davinci_manager \
   --device=/dev/devmm_svm \
   --device=/dev/hisi_hdc \
