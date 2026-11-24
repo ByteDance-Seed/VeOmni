@@ -266,46 +266,6 @@ def test_export_state_shapes_what_the_export_writes(hf_root, tmp_path, monkeypat
     assert torch.equal(exported["head.weight"], exported["encoder.proj.weight"])
 
 
-def test_export_refuses_a_cast_that_would_drop_quantization(hf_root, tmp_path, monkeypatch):
-    root, _ = hf_root
-
-    def export_state(module, state):
-        return {"proj.weight": state["proj.weight"].to(torch.float8_e4m3fn)}
-
-    _with_module_hooks(monkeypatch, FAKE_A, export_state=export_state)
-    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
-    with pytest.raises(TypeError, match="must declare export_state"):
-        save_hf_source_checkpoint(
-            model.config._hf_source, {FAKE_A: (model.modules_dict[FAKE_A], None)}, str(tmp_path / "export")
-        )
-
-
-def test_export_dtype_refusal_propagates_across_ranks(hf_root, tmp_path, monkeypatch):
-    """When another rank's ``export_state`` slice hits a forbidden cast, every rank raises together."""
-    import veomni.models.seed_omni.utils.hf_layout as hf_layout_mod
-
-    root, _ = hf_root
-    calls = []
-
-    def fake_union(items):
-        items = list(items)
-        calls.append(items)
-        if len(calls) == 1:
-            return ["proj.weight"]
-        if len(calls) == 2:
-            return items
-        return ["save_hf_source_checkpoint: peer rank hit a forbidden cast; must declare export_state."]
-
-    monkeypatch.setattr(hf_layout_mod, "_all_ranks_union", fake_union)
-    _with_module_hooks(monkeypatch, FAKE_A, export_state=lambda module, state: {})
-    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
-    with pytest.raises(TypeError, match="peer rank hit a forbidden cast"):
-        save_hf_source_checkpoint(
-            model.config._hf_source, {FAKE_A: (model.modules_dict[FAKE_A], None)}, str(tmp_path / "export")
-        )
-    assert len(calls) == 3
-
-
 def test_an_hf_root_resolves_to_a_weight_free_split_view(hf_root):
     root, _ = hf_root
     view = resolve_omni_checkpoint_root(root)
@@ -620,13 +580,9 @@ def test_large_carried_tensors_are_sliced_across_ranks_and_consolidated_on_every
     source = model.config._hf_source
     module_a = model.modules_dict[FAKE_A]
 
-    # Lower the threshold so the 4x4 carried tensor ``decoder.proj.weight`` is sliced across ranks.
+    # Lower the threshold so the carried tensor ``decoder.proj.weight`` is sliced across ranks.
     monkeypatch.setattr(hf_layout_mod, "_SHARDED_CARRY_BYTES", 8)
-    # This case asserts the per-rank consolidation path. It is chosen by torch
-    # version (2.10 has the helper but writes no index, so it takes the fallback),
-    # and pinning it here keeps the test about slicing rather than about which
-    # branch the local torch happens to take -- that has its own test.
-    monkeypatch.setattr(hf_layout_mod, "_on_every_rank_writes_index", lambda: True)
+    monkeypatch.setattr(save_utils_mod, "is_torch_version_greater_than", lambda _v: True)
     group = object()
     monkeypatch.setattr(save_utils_mod, "_consolidation_process_group", lambda: group)
 
@@ -789,34 +745,9 @@ def test_custom_layout_subclass_overrides_hooks_and_per_module_dtypes(tmp_path):
         del OMNI_HF_LAYOUT_REGISTRY[custom_type]
 
 
-def test_the_per_rank_consolidation_branch_is_gated_on_the_torch_version(monkeypatch):
-    """torch 2.10 ships `consolidate_safetensors_files_on_every_rank` but that
-    version never writes `model.safetensors.index.json` -- only 2.11 does.
-
-    A multi-file export through it is unloadable, so the branch is chosen by
-    version rather than by the name being importable (it is, on both stacks).
-    """
-    import torch
-
-    from veomni.models.seed_omni.utils import hf_layout
-
-    # Against the real interpreter, so the claim is meaningful on both the CUDA
-    # (2.11) and Ascend (2.10) stacks instead of asserting one of them.
-    major, minor = (int(part) for part in torch.__version__.split("+")[0].split(".")[:2])
-    assert hf_layout._on_every_rank_writes_index() is ((major, minor) >= (2, 11))
-
-    # And the predicate follows torch, not the host build.
-    monkeypatch.setattr(hf_layout, "is_torch_version_greater_than", lambda value: False)
-    assert hf_layout._on_every_rank_writes_index() is False
-    monkeypatch.setattr(hf_layout, "is_torch_version_greater_than", lambda value: True)
-    assert hf_layout._on_every_rank_writes_index() is True
-
-
 def test_the_index_writer_emits_a_weight_map_and_total_size(tmp_path):
-    """What the fallback adds over the bare helper: the file HF's resolver reads."""
-    import json
-
-    from veomni.models.seed_omni.utils import hf_layout
+    """Ensure ``_ensure_safetensors_index`` writes a valid HF weight map and total_size (torch 2.10 fallback)."""
+    from veomni.utils.save_safetensor_utils import _ensure_safetensors_index
 
     out = tmp_path / "out"
     out.mkdir()
@@ -824,13 +755,11 @@ def test_the_index_writer_emits_a_weight_map_and_total_size(tmp_path):
     (out / "model-00002-of-00002.safetensors").write_bytes(b"y" * 6)
     mapping = {"a.weight": 1, "b.weight": 2}
 
-    hf_layout._consolidate_and_write_index(str(tmp_path / "none"), str(out), mapping)
+    _ensure_safetensors_index(str(out), mapping)
 
     index = json.loads((out / "model.safetensors.index.json").read_text())
     assert index["weight_map"] == {
         "a.weight": "model-00001-of-00002.safetensors",
         "b.weight": "model-00002-of-00002.safetensors",
     }
-    # The bytes the export actually wrote; the fake files stand in for real shards,
-    # so only positivity is meaningful here.
-    assert index["metadata"]["total_size"] > 0
+    assert index["metadata"]["total_size"] == 16

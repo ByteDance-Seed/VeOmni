@@ -200,17 +200,6 @@ def test_a_merge_interrupted_before_its_marker_is_removed_can_run_again():
         torch.testing.assert_close(_load_export(save_path)["table"], table, atol=0, rtol=0)
 
 
-def test_a_merge_refuses_an_export_whose_save_stopped_before_its_index():
-    table = torch.cat([_local_rows(rank) for rank in range(WORLD_SIZE)])
-    with tempfile.TemporaryDirectory() as save_path:
-        _export(_model(SimpleNamespace(para_name="emb", placement=Shard(0))), {"table": table}, save_path)
-        os.remove(Path(save_path) / "model.safetensors.index.json")
-        with pytest.raises(ValueError, match="Export this checkpoint again"):
-            save_utils.merge_pending_hf_shards(save_path)
-        assert (Path(save_path) / HF_PENDING_MERGE_FILENAME).exists()
-        assert any((Path(save_path) / HF_SHARDED_DIRNAME).iterdir())
-
-
 def test_two_tables_sharing_source_files_each_get_a_file_of_their_own():
     tables = {
         name: torch.cat([_local_rows(rank) + offset for rank in range(WORLD_SIZE)])

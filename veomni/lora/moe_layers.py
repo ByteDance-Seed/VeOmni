@@ -690,15 +690,9 @@ class LoraSharedExperts(nn.Module):
                     dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=ep_group)
                     local_storage.copy_(buf)
                     buffer_to_scale = local_storage
-                # The wrapped path divides by the world size through FSDP's own
-                # ``set_gradient_divide_factor``; without a wrap
-                # (``extra_parallel_only``) nothing does, and the SUM above would
-                # leave the grad ``world_size`` times too large. Scale here, right
-                # after the sum, rather than in a tensor hook: this callback sees
-                # the *accumulated* grad, so dividing the same buffer keeps
-                # gradient accumulation correct -- a per-contribution hook would
-                # re-scale every earlier microbatch on each new backward.
-                if getattr(self, "_extra_parallel_only_unwrapped", False):
+                # Without an FSDP wrap (`extra_parallel_only`), divide the EP-summed
+                # accumulated grad by world_size here so multi-microbatch scaling stays exact.
+                if getattr(self, "_extra_parallel_only", False):
                     buffer_to_scale.div_(ps.world_size)
 
             return _hook

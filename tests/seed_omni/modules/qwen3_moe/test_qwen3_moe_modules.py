@@ -619,13 +619,7 @@ def test_qwen3_moe_flops_account_for_dense_layers_mixed_into_the_stack():
 
 
 def test_qwen3_moe_shipped_base_yaml_targets_a_split_root():
-    """``base.yaml`` must not point at an upstream root while streaming is on.
-
-    The HF-view validator rejects ``extra_parallel_stream_load`` because streaming reads
-    raw checkpoint slices and cannot apply the layout's key renames, so an upstream
-    ``model_path`` plus the shipped streaming overlay fails at startup. Guard the
-    pairing here rather than in a doc note a reader can miss.
-    """
+    """``base.yaml`` ships with the split root placeholder matching ``modules_train.yaml``."""
     import yaml
 
     config_dir = Path(__file__).resolve().parents[4] / "configs/seed_omni/Qwen/moe/train"

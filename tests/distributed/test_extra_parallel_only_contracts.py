@@ -104,48 +104,41 @@ def test_shared_lora_params_are_collected_when_the_model_is_unwrapped():
     assert _collect_ep_replicated_lora_param_ids(model) == {id(model[0].gate_up_proj)}
 
 
-def test_shared_lora_grad_accumulation_survives_multiple_microbatches():
-    """One division per backward, applied to the whole accumulated grad.
+def test_shared_lora_grad_accumulation_survives_multiple_microbatches(monkeypatch):
+    """Unwrapped ``LoraSharedExperts`` divides its EP-summed grad once per backward, preserving accumulation."""
+    import torch.distributed as dist
 
-    ``LoraSharedExperts`` reduces through ``register_post_accumulate_grad_hook``,
-    which fires on every backward over the *whole* accumulated ``p.grad``: the
-    all-reduce SUMs every rank's contribution, so a replicated parameter ends up
-    holding ``world_size`` times its own value, and dividing that buffer once
-    restores it. Modelled here at the level the hooks operate on, since the real
-    one needs a process group.
-
-    What this pins is that the division rides on the same callback as the sum. A
-    division installed as a tensor hook instead runs on each new contribution
-    while the sum covers the accumulation, so micro-batch 2 re-scales
-    micro-batch 1 and the grad grows by the EP width per step.
-    """
-    import torch
-    import torch.nn as nn
+    from veomni.lora import moe_layers
+    from veomni.lora.moe_layers import LoraSharedExperts
 
     world_size = 4
-    # Each EP rank holds the same replicated adapter and computes only its own
-    # experts' contribution, for two micro-batches.
-    my_contributions = [1.0, 3.0]
-    expected = sum(my_contributions)  # replicated: the value is rank-invariant
+    layer = object.__new__(LoraSharedExperts)
+    nn.Module.__init__(layer)
+    layer.lora_A = nn.Parameter(torch.zeros(2, 2))
+    layer._extra_parallel_only = True
+    layer._ep_grad_hooks_done = False
 
-    param = nn.Parameter(torch.zeros(1))
+    fake_ps = SimpleNamespace(ep_enabled=True, ep_group="ep_group", world_size=world_size)
 
-    def ep_sum_hook(p):
-        # SUM over the EP group: a replicated param accumulates world_size copies
-        # of its own value. Then undo it, which is what FSDP's divide factor did.
-        p.grad.mul_(world_size).div_(world_size)
+    def fake_all_reduce(tensor, op=None, group=None):
+        assert group == "ep_group"
+        # Every rank holds the same replicated shared-LoRA grad, so EP SUM multiplies by world_size.
+        tensor.mul_(world_size)
 
-    param.register_post_accumulate_grad_hook(ep_sum_hook)
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(moe_layers, "get_parallel_state", lambda: fake_ps)
 
-    for contribution in my_contributions:
-        # `+=` is what an accumulation step does to `.grad`.
-        if param.grad is None:
-            param.grad = torch.tensor([contribution])
-        else:
-            param.grad += torch.tensor([contribution])
-        for hook in list(param._post_accumulate_grad_hooks.values()):
-            hook(param)
+    layer._ensure_ep_grad_sync_hooks()
+    hooks = list(layer.lora_A._post_accumulate_grad_hooks.values())
+    assert len(hooks) == 1
 
-    assert torch.allclose(param.grad, torch.tensor([expected])), (
-        f"grad accumulation drifted: {param.grad.item()} vs {expected}"
-    )
+    # Simulate two microbatches accumulating into `.grad`, with the post-accumulate hook firing after each.
+    for value in (1.0, 3.0):
+        step_grad = torch.full((2, 2), value)
+        layer.lora_A.grad = step_grad if layer.lora_A.grad is None else layer.lora_A.grad + step_grad
+        for hook in hooks:
+            hook(layer.lora_A)
+
+    torch.testing.assert_close(layer.lora_A.grad, torch.full((2, 2), 4.0))

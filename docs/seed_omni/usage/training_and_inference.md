@@ -108,10 +108,10 @@ and any other type is an error.
   module. DCP checkpoints and resume stay per module.
 - **Requirements.** Direct HF loading applies when all active modules come from
   that single upstream checkpoint with their default `model_path` (the module
-  name) and standard weight loading (`extra_parallel_stream_load: false`). Direct HF
+  name); both standard loading and `extra_parallel_stream_load` are supported. Direct HF
   export (`save_hf_weights`) is supported when module tensor converters preserve
-  upstream parameter names and shapes; if a model composes multiple source
-  checkpoints or adds new parameters, convert to a split checkpoint first.
+  upstream parameter names and shapes (or declare `export_state`); if a model composes
+  multiple source checkpoints or adds new parameters, convert to a split checkpoint first.
 
 The offline convert of such a family goes through the same layout, so a split
 checkpoint and the direct load hold identical module weights. To add a layout

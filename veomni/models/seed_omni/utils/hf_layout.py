@@ -57,7 +57,6 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 
 from ....utils import helper
-from ....utils.import_utils import is_torch_version_greater_than
 from ....utils.registry import Registry
 from ...checkpoint.convert import (
     ConvertedCheckpointTensor,
@@ -1056,21 +1055,8 @@ def save_hf_source_checkpoint(
     """
     from torch.distributed.checkpoint import HuggingFaceStorageWriter
 
-    try:
-        from torch.distributed.checkpoint._consolidate_hf_safetensors import (
-            consolidate_safetensors_files_on_every_rank,
-        )
-    except ImportError:  # pragma: no cover - both supported versions ship it
-        consolidate_safetensors_files_on_every_rank = None
-    if consolidate_safetensors_files_on_every_rank is not None and not _on_every_rank_writes_index():
-        # torch 2.10 (the pinned NPU stack) has the per-rank helper but its
-        # version never writes `model.safetensors.index.json` -- only 2.11 does.
-        # A multi-file export through it is unloadable, so route it to the
-        # single-process helper plus an explicit index instead.
-        consolidate_safetensors_files_on_every_rank = None
-
     from ....checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
-    from ....utils.save_safetensor_utils import _consolidation_process_group
+    from ....utils.save_safetensor_utils import _consolidate_hf_safetensors, _consolidation_process_group
 
     apply_dcp_consolidation_patch()
     layout = source.layout
@@ -1176,24 +1162,7 @@ def save_hf_source_checkpoint(
     del save_state
     if dist.is_initialized():
         dist.barrier(group=group)
-        if consolidate_safetensors_files_on_every_rank is not None:
-            consolidate_safetensors_files_on_every_rank(
-                input_dir=sharded_path,
-                output_dir=save_path,
-                fqn_to_index_mapping=fqn_to_index_mapping,
-                process_group=group,
-            )
-        else:
-            # torch 2.10 has no per-rank consolidation, and the single-process
-            # helper writes no index. Rank 0 consolidates every file and writes
-            # `model.safetensors.index.json` from the same mapping, so the export
-            # is still loadable; the others wait.
-            if dist.get_rank(group=group) == 0:
-                _consolidate_and_write_index(sharded_path, save_path, fqn_to_index_mapping)
-            dist.barrier(group=group)
-    else:
-        # Single process: the same helper, which also writes the index.
-        _consolidate_and_write_index(sharded_path, save_path, fqn_to_index_mapping)
+    _consolidate_hf_safetensors(sharded_path, save_path, fqn_to_index_mapping, process_group=group)
 
     if not dist.is_initialized() or dist.get_rank() == 0:
         shutil.rmtree(sharded_path, ignore_errors=True)
@@ -1206,56 +1175,6 @@ def save_hf_source_checkpoint(
         f"save_hf_source_checkpoint: `{source.model_type}` checkpoint saved at {save_path} "
         f"in {time.time() - start:.2f}s."
     )
-
-
-def _on_every_rank_writes_index() -> bool:
-    """Whether ``consolidate_safetensors_files_on_every_rank`` writes the HF index.
-
-    torch 2.10 ships the per-rank helper but its implementation only writes the
-    output files; it gained the rank-0 metadata write (`_write_overall_metadata_file`)
-    in 2.11. Version-gated rather than introspected: the helper is a plain
-    function whose behaviour is the version's, and a probe would have to run a
-    real consolidation to tell.
-
-    Reads the version from the imported name so a test can pin the answer on
-    either stack; the Ascend job runs 2.10 and must take the fallback.
-    """
-    return is_torch_version_greater_than("2.10.99")
-
-
-def _consolidate_and_write_index(
-    sharded_path: str,
-    save_path: str,
-    fqn_to_index_mapping: dict[str, int],
-) -> None:
-    """Consolidate every output file, then write the index the writer would have.
-
-    ``consolidate_safetensors_files_on_every_rank`` gathers its per-file metadata
-    onto rank 0 and writes ``model.safetensors.index.json`` itself. torch 2.10
-    (the NPU stack) ships only the synchronous helper, which writes the files but
-    not the index -- and an export without an index over several files does not
-    load. Derive the index from ``fqn_to_index_mapping`` and the files it wrote.
-    """
-    from torch.distributed.checkpoint._consolidate_hf_safetensors import consolidate_safetensors_files
-    from torch.distributed.checkpoint._hf_utils import _gen_file_name
-
-    consolidate_safetensors_files(
-        input_dir=sharded_path,
-        output_dir=save_path,
-        fqn_to_index_mapping=fqn_to_index_mapping,
-        num_threads=5,
-    )
-    if len(set(fqn_to_index_mapping.values())) == 1:
-        return
-    max_index = max(fqn_to_index_mapping.values())
-    weight_map = {fqn: _gen_file_name(index, max_index) for fqn, index in fqn_to_index_mapping.items()}
-    total_size = 0
-    for filename in set(weight_map.values()):
-        path = os.path.join(save_path, filename)
-        if os.path.isfile(path):
-            total_size += os.path.getsize(path)
-    with open(os.path.join(save_path, "model.safetensors.index.json"), "w") as f:
-        json.dump({"metadata": {"total_size": total_size}, "weight_map": weight_map}, f, indent=2)
 
 
 def _restore_single_file_name(save_path: str) -> None:

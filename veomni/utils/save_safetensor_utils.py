@@ -259,16 +259,10 @@ def _size_balanced_index_mapping(save_state: Dict[str, torch.Tensor]) -> Dict[st
     return mapping
 
 
-# One rank writes each output file, and one tensor cannot span files: a single
-# tens-of-GB tensor through an HDFS mount (~50 MB/s a stream) runs far past the
-# 10 min NCCL watchdog the other ranks would otherwise wait under.
+# Long-timeout Gloo group for slow multi-GB HDFS consolidation; keyed on WORLD so
+# recreating the default process group in the same process does not reuse a dead handle.
 _CONSOLIDATION_TIMEOUT = timedelta(hours=4)
 _consolidation_group = None
-# Which process group the cached group belongs to. A group cannot outlive its
-# session: after `destroy_process_group()` it is unusable, and a later session in
-# the same process (a test, an in-process trainer restart) would otherwise reuse
-# it and fail or hang. Keyed on the active default group rather than reset from a
-# teardown hook, because teardown happens outside this module.
 _consolidation_group_owner = None
 
 
@@ -279,6 +273,59 @@ def _consolidation_process_group():
         _consolidation_group = dist.new_group(backend="gloo", timeout=_CONSOLIDATION_TIMEOUT)
         _consolidation_group_owner = owner
     return _consolidation_group
+
+
+def _ensure_safetensors_index(save_path: str, fqn_to_index_mapping: Dict[str, int]) -> None:
+    """Write ``model.safetensors.index.json`` for multi-file exports if absent (torch <= 2.10)."""
+    index_path = os.path.join(save_path, "model.safetensors.index.json")
+    if len(set(fqn_to_index_mapping.values())) <= 1 or os.path.isfile(index_path):
+        return
+    from torch.distributed.checkpoint._hf_utils import _gen_file_name
+
+    max_index = max(fqn_to_index_mapping.values())
+    weight_map = {fqn: _gen_file_name(index, max_index) for fqn, index in fqn_to_index_mapping.items()}
+    total_size = sum(
+        os.path.getsize(path)
+        for filename in set(weight_map.values())
+        if os.path.isfile(path := os.path.join(save_path, filename))
+    )
+    with open(index_path, "w") as f:
+        json.dump({"metadata": {"total_size": total_size}, "weight_map": weight_map}, f, indent=2)
+
+
+def _consolidate_hf_safetensors(
+    sharded_path: str,
+    save_path: str,
+    fqn_to_index_mapping: Dict[str, int],
+    *,
+    process_group=None,
+) -> None:
+    """Consolidate DCP-sharded safetensors into final HF files and ensure the index exists."""
+    from torch.distributed.checkpoint._consolidate_hf_safetensors import (
+        consolidate_safetensors_files,
+        consolidate_safetensors_files_on_every_rank,
+    )
+
+    if dist.is_initialized() and is_torch_version_greater_than("2.10.99"):
+        consolidate_safetensors_files_on_every_rank(
+            input_dir=sharded_path,
+            output_dir=save_path,
+            fqn_to_index_mapping=fqn_to_index_mapping,
+            process_group=process_group,
+        )
+        return
+
+    # Single-process, or torch <= 2.10 (Ascend NPU) where the per-rank helper does not write the index.
+    if not dist.is_initialized() or dist.get_rank(group=process_group) == 0:
+        consolidate_safetensors_files(
+            input_dir=sharded_path,
+            output_dir=save_path,
+            fqn_to_index_mapping=fqn_to_index_mapping,
+            num_threads=5,
+        )
+        _ensure_safetensors_index(save_path, fqn_to_index_mapping)
+    if dist.is_initialized():
+        dist.barrier(group=process_group)
 
 
 def _whole_rows(tensor: torch.Tensor) -> bool:
@@ -462,38 +509,16 @@ def _merge_rows(sharded_path: str, output_path: str, fqn: str, shape: List[int],
     os.replace(partial_path, output_path)
 
 
-def _export_path(save_path: str, relative: str) -> str:
-    """Resolve ``relative`` inside ``save_path``, refusing an escape.
-
-    Both the marker and the index name files the merge then deletes and
-    rewrites, and an export is a directory that can be copied or downloaded. An
-    absolute path, a ``..`` segment, or a symlink pointing out would otherwise
-    let either file reach outside the export.
-    """
-    if not relative or os.path.isabs(relative):
-        raise ValueError(f"{relative!r} is not a relative path inside {save_path}.")
-    root = os.path.realpath(save_path)
-    resolved = os.path.realpath(os.path.join(root, relative))
-    if resolved != root and not resolved.startswith(root + os.sep):
-        raise ValueError(f"{relative!r} resolves outside {save_path} ({resolved}).")
-    return resolved
-
-
 def merge_pending_hf_shards(save_path: str, num_threads: Optional[int] = None) -> None:
-    """Write out the files an HF export deferred, then drop its marker and shards.
-
-    Each file is written sequentially, which an append-only mount accepts, and
-    memory stays at one copy chunk per file. Files are written in parallel, one
-    thread each by default. Nothing is removed unless every file checks out.
-    """
+    """Write out deferred HF export files, then remove the pending marker and shard directory."""
     from concurrent.futures import ThreadPoolExecutor
 
-    marker = _export_path(save_path, layout.HF_PENDING_MERGE_FILENAME)
+    marker = os.path.join(save_path, layout.HF_PENDING_MERGE_FILENAME)
     with open(marker) as f:
         pending = json.load(f)
     tensors = pending["tensors"]
-    sharded_path = _export_path(save_path, pending["sharded_dir"])
-    index_path = _export_path(save_path, "model.safetensors.index.json")
+    sharded_path = os.path.join(save_path, pending["sharded_dir"])
+    index_path = os.path.join(save_path, "model.safetensors.index.json")
     weight_map = {}
     if os.path.exists(index_path):
         with open(index_path) as f:
@@ -503,7 +528,7 @@ def merge_pending_hf_shards(save_path: str, num_threads: Optional[int] = None) -
             f"{index_path} is missing or does not name the files {marker} lists: the save stopped "
             "before writing it. Export this checkpoint again."
         )
-    output_paths = {fqn: _export_path(save_path, t["file"]) for fqn, t in tensors.items()}
+    output_paths = {fqn: os.path.join(save_path, t["file"]) for fqn, t in tensors.items()}
     start_time = time.time()
     with ThreadPoolExecutor(max_workers=num_threads or len(tensors)) as pool:
         futures = [
@@ -512,8 +537,7 @@ def merge_pending_hf_shards(save_path: str, num_threads: Optional[int] = None) -
         ]
         for future in futures:
             future.result()
-    # Marker first: a crash after it leaves a complete export and stray shards,
-    # never a marker pointing at shards that are gone.
+    # Remove marker before shards so a crash never leaves a marker pointing at deleted shards.
     os.remove(marker)
     shutil.rmtree(sharded_path, ignore_errors=True)
     logger.info(f"Merged {len(tensors)} deferred tensor(s) into {save_path} in {time.time() - start_time:.2f}s")
@@ -609,14 +633,6 @@ def _save_hf_safetensor_distributed(
             local_sizes = merged_sizes
         total_size = sum(local_sizes.values())
 
-    # Consolidation runs on every rank, one output file each, instead of in the
-    # writer's finish step: there only the coordinator rewrites the whole model
-    # while the others wait on a collective that times out for a large one.
-    from torch.distributed.checkpoint._consolidate_hf_safetensors import (
-        consolidate_safetensors_files,
-        consolidate_safetensors_files_on_every_rank,
-    )
-
     sharded_path = os.path.join(save_path, layout.HF_SHARDED_DIRNAME)
     storage_writer = HuggingFaceStorageWriter(
         path=sharded_path,
@@ -639,17 +655,9 @@ def _save_hf_safetensor_distributed(
         dist.barrier()
     if deferred:
         _consolidate_all_but_deferred(sharded_path, save_path, fqn_to_index_mapping, deferred, total_size)
-    elif dist.is_initialized():
-        consolidate_safetensors_files_on_every_rank(
-            input_dir=sharded_path,
-            output_dir=save_path,
-            fqn_to_index_mapping=fqn_to_index_mapping,
-            process_group=_consolidation_process_group(),
-        )
     else:
-        consolidate_safetensors_files(
-            input_dir=sharded_path, output_dir=save_path, fqn_to_index_mapping=fqn_to_index_mapping
-        )
+        group = _consolidation_process_group() if dist.is_initialized() else None
+        _consolidate_hf_safetensors(sharded_path, save_path, fqn_to_index_mapping, process_group=group)
     # Rank 0 returns from the consolidation gather only after every rank has written its files.
     if not deferred and (not dist.is_initialized() or dist.get_rank() == 0):
         shutil.rmtree(sharded_path, ignore_errors=True)

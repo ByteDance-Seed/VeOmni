@@ -335,14 +335,8 @@ def build_omni_module_runtime_args(
     # it off alongside `fsdp_mode: eager` keeps the single-process eager-inference
     # default from inheriting a rank0-broadcast load policy that cannot run
     # without a wrap.
-    # Mixed precision is off for the same reason it is on when training: it
-    # exists to keep fp32 master weights for an optimizer, and inference has no
-    # optimizer. Left on, it builds every module at float32 and calls
-    # `model.float()`, which upcasts whatever the checkpoint stored -- including
-    # a quantized model's fp8 weights and scales, since those are floating point
-    # too. A large quantized backbone replicates tens of GiB of fp32 that way,
-    # and its fp8 GEMMs would have been handed fp32 operands. These are defaults,
-    # so a config that wants fp32 inference can still ask for it.
+    # Inference defaults to eager with mixed precision off (no fp32 master weights
+    # are needed, and `model.float()` would upcast quantized fp8 weights/scales).
     inference_default = (
         {
             "broadcast_model_weights_from_rank0": False,
@@ -366,41 +360,17 @@ def build_omni_module_runtime_args(
         merged_acc = merged.setdefault("accelerator", {})
         if isinstance(merged_acc, dict):
             merged_acc["skip_sp_gather_between_modules"] = global_skip_sp_gather
-            # `extra_parallel_only` is a property of the `fsdp2` path: it removes
-            # the wrap and leaves the ExtraParallel plan doing the sharding, and
-            # `FSDPConfig` refuses it beside any other `fsdp_mode`. Two layers
-            # above the checkpoint can hand a module the flag it did not ask for
-            # -- the run's global `model:` block, and the synthesized `eager`
-            # inference default -- so this block reconciles the flag with the
-            # mode the module ends up with.
-            #
-            # Which mode that is depends on whether the module's own YAML named
-            # one. If it did not, the inherited flag wins and the mode is
-            # promoted to `fsdp2`: that is what makes a global no-wrap inference
-            # config launch at all, since the `eager` default would otherwise
-            # reach `FSDPConfig` and raise before `__post_init__` could
-            # normalize it. If it did, that choice is authoritative -- a module
-            # pinned to `ddp` or `eager` stays there, and the flag is dropped
-            # instead of raising or, worse, rewriting the mode. Testing for an
-            # `accelerator:` block was too coarse to see the difference:
-            # `{"fsdp_config": {"fsdp_mode": "ddp"}}` is exactly such a choice,
-            # and it was being overwritten to `fsdp2` in silence.
-            #
-            # Only the module's own layer counts, for the reason the layer order
-            # above gives: parallelism belongs to a run, so a checkpoint's
-            # `accelerator` block is not a run decision (and `to_hf_config`
-            # never writes one), while the inference default is this function's
-            # own eager fallback.
+            # Reconcile inherited `extra_parallel_only` with the module's own `fsdp_mode`:
+            # promote an unnamed mode (e.g. inference `eager` default) to `fsdp2`, or drop
+            # the flag when the module explicitly chose `ddp` / `eager`.
             fsdp_config = merged_acc.get("fsdp_config")
             if isinstance(fsdp_config, dict) and fsdp_config.get("extra_parallel_only", False):
-                module_mode = _explicit_fsdp_config(override).get("fsdp_mode")
+                override_acc = override.get("accelerator") if isinstance(override, dict) else None
+                override_fsdp = override_acc.get("fsdp_config") if isinstance(override_acc, dict) else None
+                module_mode = override_fsdp.get("fsdp_mode") if isinstance(override_fsdp, dict) else None
                 if module_mode is None:
                     fsdp_config["fsdp_mode"] = "fsdp2"
                 elif str(module_mode).lower() != "fsdp2":
-                    # Meaningless without the wrap, and `ddp` / `eager` have no
-                    # plan pass to keep it meaningful. `__post_init__` restores
-                    # `fsdp2` for an `eager` module that does need a sharded
-                    # build.
                     fsdp_config["extra_parallel_only"] = False
         runtime_modules[name] = _instantiate_recursive(OmniModuleRuntimeArguments, merged)
     return runtime_modules
@@ -518,32 +488,11 @@ def _resolve_model_path(
     return modules_config
 
 
-def _explicit_fsdp_config(override: Optional[dict[str, Any]]) -> dict[str, Any]:
-    """The module's own ``accelerator.fsdp_config`` entry, if it carries one.
-
-    Used to tell an inherited default apart from a deliberate choice. Only the
-    module's own layer counts: the checkpoint's entry and the synthesized
-    inference default are layers the module's YAML may still override.
-    """
-    if not isinstance(override, dict):
-        return {}
-    accelerator = override.get("accelerator")
-    if not isinstance(accelerator, dict):
-        return {}
-    fsdp_config = accelerator.get("fsdp_config")
-    return fsdp_config if isinstance(fsdp_config, dict) else {}
-
-
 def _module_base(global_dict: dict[str, Any]) -> dict[str, Any]:
-    """The module base a per-module overlay is merged onto.
+    """Prepare the inherited global config dict before merging a per-module overlay.
 
-    ``AcceleratorConfig.__post_init__`` folds ``ep_size`` into
-    ``extra_parallel_*``, so the base carries a folded ``ep`` entry that the user
-    never wrote. Leaving it there would make a module's own ``ep_size`` inert --
-    ``extra_parallel_sizes`` already holds the inherited width, so ``__post_init__``
-    has nothing to append. Dropping the entry lets the module's ``ep_size``
-    re-fold. ``ep_size`` and ``ep_outside`` keep their values, so a module that
-    says nothing inherits the same width.
+    Strips the auto-folded ``"ep"`` entry from ``extra_parallel_*`` while keeping
+    ``ep_size`` / ``ep_outside``, so per-module ``ep_size`` overrides re-fold cleanly.
     """
     acc = global_dict.get("accelerator")
     if isinstance(acc, dict):

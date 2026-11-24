@@ -47,29 +47,10 @@ def hf_module_model_config(model_config: dict | None) -> dict:
 
 
 def accelerator_needs_distributed_build(accelerator) -> bool:
-    """Whether ``accelerator`` asks for a build under a process group.
-
-    ``eager`` means one rank holds the module entire, loaded through
-    ``device_map`` with no collectives. Anything else -- FSDP2, DDP, expert
-    parallelism, vocab parallelism -- needs a :class:`ParallelState` and a
-    sharded build.
-
-    The two parallelisms that are *not* ``fsdp_mode`` are the reason this is a
-    function rather than a comparison written out at each call site. A module can
-    ask for ``ep`` or ``emb`` while leaving ``fsdp_mode`` alone, and reading only
-    ``fsdp_mode`` then sends it down the single-process path -- where the sharding
-    quietly does not happen and the whole module is loaded on every rank. A
-    hashed n-gram table shards over ``emb`` and nothing else, and one of those
-    tables is tens of GiB.
-
-    Everything is read with ``getattr`` and the ``AcceleratorConfig`` defaults
-    because test stubs carry only the fields they exercise. This lives outside
-    the dataclass so :class:`~veomni.models.seed_omni.accelerated.omni_module.
-    omni_module_runtime.ModuleRuntime` can call it for a stub too.
-    """
+    """True when ``accelerator`` requires a distributed build (non-eager ``fsdp_mode`` or ``ep``/``emb`` > 1)."""
     fsdp_config = getattr(accelerator, "fsdp_config", None)
     fsdp_mode = getattr(fsdp_config, "fsdp_mode", None)
-    if fsdp_mode and str(fsdp_mode).lower() not in ("eager",):
+    if fsdp_mode and str(fsdp_mode).lower() != "eager":
         return True
     if getattr(accelerator, "ep_size", 1) > 1:
         return True

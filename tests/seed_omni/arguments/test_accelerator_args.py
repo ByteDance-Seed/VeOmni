@@ -140,59 +140,70 @@ def test_the_generic_runtime_forwards_extra_parallel_only_to_the_builder(monkeyp
 
 
 @pytest.mark.parametrize(
-    "global_accelerator",
+    "global_accelerator, module_override, expected_mode, expected_flag, expected_dist",
     [
-        {"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)},
-        {"ep_size": 4},
-        {},
+        ({"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)}, {}, "fsdp2", True, True),
+        ({"ep_size": 4}, {}, "fsdp2", True, True),
+        ({}, {"accelerator": {"ep_size": 4}}, "fsdp2", True, True),
+        (
+            {},
+            {
+                "accelerator": {
+                    "extra_parallel_names": ["emb"],
+                    "extra_parallel_sizes": [8],
+                    "extra_parallel_placement_innermost": [False],
+                }
+            },
+            "fsdp2",
+            True,
+            True,
+        ),
+        ({}, {}, "eager", False, False),
+        (
+            {"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)},
+            {"accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}}},
+            "ddp",
+            False,
+            True,
+        ),
+        (
+            {"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)},
+            {"accelerator": {"fsdp_config": {"fsdp_mode": "eager"}}},
+            "eager",
+            False,
+            False,
+        ),
+        (
+            {"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)},
+            {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}}},
+            "fsdp2",
+            True,
+            True,
+        ),
     ],
-    ids=["extra_parallel_only", "ep", "plain"],
+    ids=[
+        "global_no_wrap",
+        "global_ep",
+        "module_ep",
+        "module_emb",
+        "plain_eager",
+        "explicit_ddp",
+        "explicit_eager",
+        "explicit_fsdp2",
+    ],
 )
-def test_inference_keeps_a_no_wrap_module_on_fsdp2(monkeypatch, global_accelerator):
-    """`extra_parallel_only` is refused beside `fsdp_mode='eager'`.
-
-    The inference overlay forces `eager`, so a module inheriting the no-wrap flag
-    would raise inside the nested `FSDPConfig` before `__post_init__` could
-    normalize it back. Each case asserts the resolved mode matches the flag.
-    """
+def test_inference_reconciles_extra_parallel_only_and_fsdp_mode(
+    monkeypatch, global_accelerator, module_override, expected_mode, expected_flag, expected_dist
+):
     monkeypatch.setenv("WORLD_SIZE", "8")
     global_args = OmniModuleRuntimeArguments(
         model_path="/tmp/model", accelerator=AcceleratorConfig(**global_accelerator)
     )
-    modules = build_omni_module_runtime_args(global_args, "/tmp/model", {"mod": {}}, for_inference=True)
-    resolved = modules["mod"].accelerator.fsdp_config
-    assert resolved.fsdp_mode == ("fsdp2" if resolved.extra_parallel_only else "eager")
-
-
-@pytest.mark.parametrize(
-    "module_mode, expected_mode, expected_flag",
-    [
-        ("ddp", "ddp", False),
-        ("eager", "eager", False),
-        ("fsdp2", "fsdp2", True),
-    ],
-)
-def test_a_module_that_names_its_own_fsdp_mode_overrides_the_inherited_no_wrap_flag(
-    monkeypatch, module_mode, expected_mode, expected_flag
-):
-    """A module's own `fsdp_mode` is authoritative over an inherited `extra_parallel_only`.
-
-    The reconciliation above the checkpoint promotes an unnamed mode to `fsdp2`
-    so the flag keeps its meaning; a module that did name one keeps it. `ddp` and
-    `eager` have no plan pass, so the flag is dropped rather than raising inside
-    `FSDPConfig` or, worse, rewriting the mode -- which is what an
-    `"accelerator" in override` check did to an explicit `ddp`.
-    """
-    monkeypatch.setenv("WORLD_SIZE", "8")
-    global_args = OmniModuleRuntimeArguments(
-        model_path="/tmp/model",
-        accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)),
-    )
-    override = {"mod": {"accelerator": {"fsdp_config": {"fsdp_mode": module_mode}}}}
-    modules = build_omni_module_runtime_args(global_args, "/tmp/model", override, for_inference=True)
-    resolved = modules["mod"].accelerator.fsdp_config
-    assert resolved.fsdp_mode == expected_mode
-    assert resolved.extra_parallel_only is expected_flag
+    modules = build_omni_module_runtime_args(global_args, "/tmp/model", {"mod": module_override}, for_inference=True)
+    mod = modules["mod"]
+    assert mod.needs_distributed_build is expected_dist
+    assert mod.accelerator.fsdp_config.fsdp_mode == expected_mode
+    assert mod.accelerator.fsdp_config.extra_parallel_only is expected_flag
 
 
 def test_module_runtime_arguments_inherit_weight_load_knobs():
@@ -204,7 +215,8 @@ def test_module_runtime_arguments_inherit_weight_load_knobs():
 @pytest.mark.parametrize(
     "override, expected_ep_size",
     [
-        ({}, 4),
+        ({}, 8),
+        ({"accelerator": {"ep_size": 4}}, 4),
         ({"accelerator": {"ep_size": 1}}, 1),
         (
             {
@@ -214,24 +226,15 @@ def test_module_runtime_arguments_inherit_weight_load_knobs():
                     "extra_parallel_placement_innermost": [],
                 }
             },
-            4,
+            8,
         ),
     ],
-    ids=["inherited", "ep_size_1", "lists_cleared"],
+    ids=["inherited", "shrink_ep4", "disable_ep1", "lists_cleared_keeps_ep"],
 )
-def test_only_ep_size_turns_off_an_inherited_expert_parallel_dimension(monkeypatch, override, expected_ep_size):
-    """`ep_size: 1` is the per-module opt-out; clearing the three lists is not.
-
-    `_module_base` folds an inherited `ep` entry into `ep_size` before the overlay
-    merges, so the lists are re-derived from that scalar and
-    `AcceleratorConfig.__post_init__` appends the dimension back. Asserting the
-    resolved width, not the field the user wrote, is what distinguishes the two:
-    a module that believed it had opted out would otherwise still build a mesh
-    over four ranks. This is the contract the plan-less-module assertion's
-    message points at.
-    """
+def test_module_override_ep_size_replaces_or_disables_inherited_ep(monkeypatch, override, expected_ep_size):
+    """Per-module ``ep_size`` overrides or disables an inherited global ``ep_size``."""
     monkeypatch.setenv("WORLD_SIZE", "8")
-    global_args = OmniModuleRuntimeArguments(model_path="/tmp/model", accelerator=AcceleratorConfig(ep_size=4))
+    global_args = OmniModuleRuntimeArguments(model_path="/tmp/model", accelerator=AcceleratorConfig(ep_size=8))
     modules = build_omni_module_runtime_args(global_args, "/tmp/model", {"mod": override})
     resolved = modules["mod"].accelerator
     assert resolved.ep_size == expected_ep_size
@@ -479,60 +482,6 @@ def test_build_omni_model_runtime_args_rejects_top_level_dp_size_mismatch(monkey
     )
     with pytest.raises(ValueError, match="Top-level `model.accelerator` resolved to dp_size=4"):
         build_omni_model_runtime_args(args_sp2)
-
-
-def test_module_override_can_change_or_disable_inherited_ep_size(monkeypatch):
-    """Stripping the inherited folded ``ep`` entry in ``_module_base`` lets a module
-    override ``ep_size`` from 8 to 4 or disable it with ``ep_size=1``."""
-    monkeypatch.setenv("WORLD_SIZE", "8")
-    global_args = OmniModuleRuntimeArguments(
-        model_path="/tmp/model",
-        accelerator=AcceleratorConfig(ep_size=8),
-    )
-    modules = build_omni_module_runtime_args(
-        global_args,
-        "/tmp/model",
-        {
-            "keep_ep8": {"model_path": "keep_ep8"},
-            "shrink_ep4": {"accelerator": {"ep_size": 4}},
-            "disable_ep": {"accelerator": {"ep_size": 1}},
-        },
-    )
-    assert modules["keep_ep8"].accelerator.ep_size == 8
-    assert modules["keep_ep8"].accelerator.extra_parallel_sizes == [8]
-    assert modules["shrink_ep4"].accelerator.ep_size == 4
-    assert modules["shrink_ep4"].accelerator.extra_parallel_sizes == [4]
-    assert modules["disable_ep"].accelerator.ep_size == 1
-    assert modules["disable_ep"].accelerator.extra_parallel_sizes == [1]
-
-
-def test_inference_ep_or_emb_with_default_eager_normalizes_to_extra_parallel_only(monkeypatch):
-    """An inference module that sets ``ep_size`` or ``emb`` without overriding
-    ``fsdp_mode='eager'`` is normalized to ``fsdp_mode='fsdp2', extra_parallel_only=True``."""
-    monkeypatch.setenv("WORLD_SIZE", "8")
-    global_args = OmniModuleRuntimeArguments(model_path="/tmp/model")
-    modules = build_omni_module_runtime_args(
-        global_args,
-        "/tmp/model",
-        {
-            "ep_mod": {"accelerator": {"ep_size": 4}},
-            "emb_mod": {
-                "accelerator": {
-                    "extra_parallel_names": ["emb"],
-                    "extra_parallel_sizes": [8],
-                    "extra_parallel_placement_innermost": [False],
-                }
-            },
-            "eager_mod": {"model_path": "eager_mod"},
-        },
-        for_inference=True,
-    )
-    for name in ("ep_mod", "emb_mod"):
-        assert modules[name].needs_distributed_build is True
-        assert modules[name].accelerator.fsdp_config.fsdp_mode == "fsdp2"
-        assert modules[name].accelerator.fsdp_config.extra_parallel_only is True
-    assert modules["eager_mod"].needs_distributed_build is False
-    assert modules["eager_mod"].accelerator.fsdp_config.fsdp_mode == "eager"
 
 
 def test_skip_sp_gather_between_modules_is_global_and_propagates_to_modules(monkeypatch):

@@ -185,17 +185,8 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Whether this module is loaded unwrapped in one process (``fsdp_mode='eager'``).
 
         Inference only: it skips :meth:`setup`, so it has no mesh, no
-        :class:`ParallelState` and no wrap. The generic parallelize step rejects
-        ``eager`` for training. A module that asks for ``ep`` or ``emb`` is not
-        eager even with ``fsdp_mode='eager'``; see
-        :func:`accelerator_needs_distributed_build`.
-
-        The accelerator is read directly rather than through
-        ``self.args.needs_distributed_build``: an ``AttributeError`` raised inside
-        a property is indistinguishable from "not defined", and
-        :meth:`VeOmniModelRuntime.__getattr__` then forwards the lookup to the
-        wrapped model -- so a config field that was missing would surface as a
-        model attribute instead.
+        :class:`ParallelState` and no wrap. Modules requesting ``ep`` or ``emb``
+        always take the distributed path (see :func:`accelerator_needs_distributed_build`).
         """
         return not accelerator_needs_distributed_build(getattr(self.args, "accelerator", None))
 

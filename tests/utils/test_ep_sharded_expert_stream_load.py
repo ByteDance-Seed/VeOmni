@@ -106,13 +106,6 @@ class _WholeSetOnlyConverter:
         self.finalize = self._inner.finalize
 
 
-class _ClaimsFusedSlabConverter(Qwen3MoeCheckpointTensorConverter):
-    """Expert-streaming converter that also claims one fused ExtraParallel slab."""
-
-    def can_handle(self, name: str) -> bool:
-        return name == "model.layers.0.mlp.experts.gate_up_proj" or super().can_handle(name)
-
-
 def _write_checkpoint(path: Path) -> dict:
     generator = torch.Generator().manual_seed(0)
     state = {
@@ -134,14 +127,8 @@ def _write_checkpoint(path: Path) -> dict:
     return state
 
 
-def _load_as_rank(
-    monkeypatch, weights_path: Path, ep_rank: int, model: nn.Module, *, wrap_safe_open: bool = True
-) -> list:
-    """Stream ``weights_path`` into ``model`` as ``ep_rank``; return the keys read whole.
-
-    ``wrap_safe_open=False`` leaves ``checkpoint_weights.safe_open`` alone, so a
-    caller that has already installed its own proxy (e.g. a no-read guard) keeps it.
-    """
+def _load_as_rank(monkeypatch, weights_path: Path, ep_rank: int, model: nn.Module) -> list:
+    """Stream ``weights_path`` into ``model`` as ``ep_rank``; return the keys read whole."""
     parallel_state = SimpleNamespace(
         extra_parallel_enabled=lambda name: True,
         extra_parallel_sizes={"ep": EP_SIZE},
@@ -173,8 +160,7 @@ def _load_as_rank(
         def __exit__(self, *exc):
             return self._handle.__exit__(*exc)
 
-    if wrap_safe_open:
-        monkeypatch.setattr(checkpoint_weights, "safe_open", _RecordingSafeOpen)
+    monkeypatch.setattr(checkpoint_weights, "safe_open", _RecordingSafeOpen)
     checkpoint_weights.load_model_weights_ep_sharded(model, str(weights_path), init_device="cpu")
     return read_keys
 
@@ -593,3 +579,67 @@ def test_deepseek_v4_orphan_expert_scales_beside_bf16_experts_are_dropped(monkey
     want_down = torch.stack([state[expert.format(e, "w2")] for e in local])
     torch.testing.assert_close(model.model.layers[0].mlp.experts.down_proj.data, want_down, atol=0, rtol=0)
     assert {int(k.split(".experts.")[1].split(".")[0]) for k in read_keys if ".ffn.experts." in k} == set(local)
+
+
+@pytest.mark.parametrize("ep_rank", range(EP_SIZE))
+def test_dim0_rowwise_companion_streams_sharded_with_zero_pad_and_dense(monkeypatch, tmp_path, ep_rank):
+    """``dim0_rowwise_companion`` + ``convert_rows`` streams matching row slices for sharded tables
+    (zero-filling padded tail rows) and converts non-sharded keys whole without loading companion keys separately."""
+
+    class _RowScaleConverter:
+        def can_handle(self, name: str) -> bool:
+            return name.endswith(".scale")
+
+        def convert(self, name: str, tensor: torch.Tensor):
+            return None
+
+        def dim0_rowwise_companion(self, name: str):
+            return f"{name}.scale" if name.endswith(".weight") else None
+
+        def convert_rows(self, name: str, rows: torch.Tensor, companion_rows: torch.Tensor) -> torch.Tensor:
+            return rows.float() * companion_rows.float()
+
+        def finalize(self):
+            return []
+
+    class _CompanionModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # 6 logical rows padded to 8 across EP_SIZE=2 ranks -> 4 local rows per rank.
+            self.table = nn.Embedding(4, HIDDEN)
+            self.dense = nn.Linear(HIDDEN, 3, bias=False)
+            self.config = SimpleNamespace(tie_word_embeddings=False)
+
+        def get_parallel_plan(self) -> ParallelPlan:
+            return ParallelPlan(extra_parallel_plan={"ep": {"table.weight": Shard(0)}})
+
+        @staticmethod
+        def _create_checkpoint_tensor_converter(_model):
+            return _RowScaleConverter()
+
+    table_w = torch.arange(6 * HIDDEN, dtype=torch.float32).view(6, HIDDEN)
+    table_s = torch.arange(1, 7, dtype=torch.float32).view(6, 1)
+    dense_w = torch.arange(3 * HIDDEN, dtype=torch.float32).view(3, HIDDEN)
+    dense_s = torch.tensor([[2.0], [3.0], [4.0]])
+    save_file(
+        {
+            "table.weight": table_w,
+            "table.weight.scale": table_s,
+            "dense.weight": dense_w,
+            "dense.weight.scale": dense_s,
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+
+    with torch.device("meta"):
+        model = _CompanionModel()
+    read_keys = _load_as_rank(monkeypatch, tmp_path, ep_rank, model)
+
+    # Sharded table is never read whole, and companion keys are never dispatched standalone.
+    assert "table.weight" not in read_keys
+    assert "table.weight.scale" not in read_keys
+
+    expected_full_table = torch.cat([table_w * table_s, torch.zeros(2, HIDDEN)], dim=0)
+    local_expected = expected_full_table[ep_rank * 4 : (ep_rank + 1) * 4]
+    torch.testing.assert_close(model.table.weight.data, local_expected, atol=0, rtol=0)
+    torch.testing.assert_close(model.dense.weight.data, dense_w * dense_s, atol=0, rtol=0)

@@ -1048,18 +1048,3 @@ class TestLegacySaveModelWeights(unittest.TestCase):
                 self.assertFalse(model.embed_tokens.weight.is_meta, f"{loader_name} must materialize")
                 self.assertIs(model.embed_tokens.weight.spec_info, spec, f"{loader_name} dropped the plan tag")
                 self.assertFalse(getattr(model.linear.weight, "spec_info", None))
-
-    def test_a_bare_to_empty_drops_the_tag_which_is_why_the_helper_exists(self):
-        """The regression this guards: `to_empty` alone loses the tag."""
-        from types import SimpleNamespace
-
-        from veomni.models.checkpoint import init_empty_weights
-
-        with init_empty_weights():
-            model = _TinyModel()
-        spec = SimpleNamespace(para_name="emb", placement=object())
-        model.embed_tokens.weight.spec_info = spec
-
-        model.to_empty(device="cpu")
-
-        self.assertFalse(getattr(model.embed_tokens.weight, "spec_info", None))

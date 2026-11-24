@@ -11,20 +11,13 @@
 #     --infer.prompt "What is 2+2?" \
 #     --infer.output_dir qwen3_moe_out
 #
-# Prerequisite — split the upstream Qwen3-MoE checkpoint. This recipe enables
-# `extra_parallel_stream_load` on the backbone (see `train/modules_train.yaml`), which
-# needs the split layout: an upstream root is loaded through the `qwen3_moe` HF
-# layout, and that path rejects streaming because it cannot apply the layout's key
-# renames.
+# Checkpoint: point `model.model_path` either at an offline split checkpoint:
 #   python scripts/seed_omni/convert_model.py \
 #     --model_path Qwen3-MoE \
 #     --output_dir Qwen3-MoE-split
-#
-# The upstream root also works as `model_path` — `qwen3_moe/hf_layout.py` registers
-# a `qwen3_moe` layout, so no offline split is needed. Streaming load works there
-# too: the loader applies the layout's key renames before slicing, so each rank
-# reads its own experts' raw keys. HF export works either way: the layout splits
-# the fused expert tensors back to per-expert keys on the way out.
+# or directly at the upstream Qwen3-MoE root (`qwen3_moe/hf_layout.py` registers
+# the layout, so no offline split is needed). `extra_parallel_stream_load` and
+# HF export work in both layouts.
 #
 # `model_path` and `data.yaml`'s `sources` are placeholders: replace them with
 # absolute paths this job can read before training.

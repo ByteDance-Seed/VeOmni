@@ -59,17 +59,7 @@ def _reset_hf_initialized_flag(module: nn.Module) -> None:
 
 
 def to_empty_preserving_spec_info(model: nn.Module, device: str | torch.device) -> None:
-    """``model.to_empty(device)`` without dropping the parallel plan's metadata.
-
-    ``to_empty`` rebuilds every ``Parameter`` object, so the ``spec_info`` a
-    parallel plan attached to the meta parameters is gone afterwards. Without it
-    a plan shard looks like a plain local tensor, and the optimizer then treats
-    rows that differ per rank as a replica -- averaging them in the gradient clip
-    and the step, which corrupts every ExtraParallel update.
-
-    Every loader that materializes a model *after* the plan was applied must go
-    through here rather than calling ``to_empty`` directly.
-    """
+    """``model.to_empty(device)`` preserving ``param.spec_info`` set by ``ParallelPlan``."""
     spec_infos = {
         name: spec_info for name, param in model.named_parameters() if (spec_info := getattr(param, "spec_info", None))
     }
@@ -465,24 +455,16 @@ def _finish_without_fsdp_wrap(
     does not hit this. The mode does *not* remove fp32 master weights --
     ``model.float()`` still runs when ``mixed_precision.enable`` is true.
     """
-    # The plan builds its DTensors over a 2D ``(para_fsdp, para)`` mesh and
-    # leaves the first axis to FSDP. With no wrap nothing shards it, so a
-    # topology that expects one would silently hold every expert `para_fsdp`
-    # times over -- exactly the kind of quiet growth this path exists to avoid.
     for para in parallel_state.extra_parallel_names:
         if not parallel_state.extra_parallel_enabled(para):
             continue
         para_fsdp_size = parallel_state.extra_parallel_fsdp_size(para)
         if para_fsdp_size != 1:
             raise ValueError(
-                f"fsdp_config.extra_parallel_only needs {para} to span the whole shard axis, but "
-                f"{para}_fsdp_size={para_fsdp_size}: the plan leaves that axis to FSDP, and without "
-                f"the wrap it would not be sharded at all. Set {para}_size to the dp_shard size."
+                f"fsdp_config.extra_parallel_only requires {para}_fsdp_size=1, got {para_fsdp_size}. "
+                f"Set {para}_size to the dp_shard size."
             )
 
-    # Keyed on the plan, not on `isinstance(param, DTensor)`: ExtraParallel
-    # leaves a plain local tensor behind with its SpecInfo alongside, so a
-    # DTensor test calls every parameter replicated and reports the whole model.
     sharded_bytes = replicated_bytes = 0
     for fqn, param in model.named_parameters():
         spec_info = (fqn2spec_info or {}).get(fqn)
@@ -493,31 +475,19 @@ def _finish_without_fsdp_wrap(
             replicated_bytes += size
     logger.info_rank0(
         "ExtraParallel only: skipping the FSDP2 wrap. "
-        f"{sharded_bytes / 1024**3:.2f} GiB a rank is sharded by the plan; "
-        f"{replicated_bytes / 1024**3:.2f} GiB it does not name is replicated on every rank."
+        f"{sharded_bytes / 1024**3:.2f} GiB/rank sharded by plan; "
+        f"{replicated_bytes / 1024**3:.2f} GiB replicated per rank."
     )
 
     enable_fsdp_cpu_offload = kwargs.pop("enable_fsdp_offload", False) or bool(
         getattr(getattr(model, "config", None), "cpu_offload", False)
     )
     if enable_fsdp_cpu_offload:
-        # FSDP CPU offload materializes on the host and stages parameters back onto
-        # the accelerator in a pre-forward hook. This path installs no such hook, so
-        # *every* parameter stays on the host -- including the ones the plan shards,
-        # which is why this refuses unconditionally rather than only when some
-        # parameter is replicated. A tied `ShardedEmbedding` is the case that made
-        # the narrower guard wrong: its only parameter is plan-sharded, so nothing
-        # was replicated, and its `_project` all-gathers the vocab table with
-        # accelerator activations, which cannot read a host tensor.
         raise ValueError(
-            "fsdp_config.offload cannot be combined with fsdp_config.extra_parallel_only: FSDP CPU "
-            "offload stages parameters back onto the accelerator through FSDP's own hooks, and this "
-            "path has none. Keep the wrap, or leave offload off."
+            "fsdp_config.offload cannot be combined with fsdp_config.extra_parallel_only: "
+            "CPU offload relies on FSDP2 pre-forward hooks to stage weights onto the accelerator."
         )
-    # `enable_fsdp_cpu_offload` is refused above, so materialization is always on
-    # the accelerator here; the flag is kept on the model only because the
-    # optimizer and checkpoint code read it.
-    model._fsdp_cpu_offload_enabled = enable_fsdp_cpu_offload
+    model._fsdp_cpu_offload_enabled = False
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
     materialize_device = get_device_type()
 
@@ -538,46 +508,23 @@ def _finish_without_fsdp_wrap(
         module_adapter_path=kwargs.pop("module_adapter_path", None),
     )
 
-    # Shared-expert LoRA (``share_expert_lora: true``) needs its grad division
-    # moved into ``LoraSharedExperts``' own EP sum, because only that callback
-    # sees the accumulated grad. Mark the wrappers so its hook knows the wrap's
-    # ``set_gradient_divide_factor`` will not supply the factor.
-    marked = 0
-    for module in model.modules():
-        if any(base.__name__ == "LoraSharedExperts" for base in type(module).__mro__):
-            module._extra_parallel_only_unwrapped = True
-            marked += 1
-    if marked:
-        logger.info_rank0(
-            f"ExtraParallel only: {marked} LoraSharedExperts wrapper(s) divide their EP-summed shared "
-            "adapter grads by the world size, in place of the skipped FSDP divide factor."
-        )
-
     _divide_extra_parallel_grads_like_fsdp(model, parallel_state, fqn2spec_info)
-    # Read by the grad clipper (averages the replicated params' grads) and by
-    # ``ShardedEmbedding`` (no FSDP unit exists to own a split table).
+    # Marked on the root model (grad clipper / shared-LoRA param collector) and on
+    # ShardedEmbedding / LoraSharedExperts submodules that behave differently unwrapped.
     model._extra_parallel_only = True
     for module in model.modules():
-        if isinstance(module, ShardedEmbedding):
+        if isinstance(module, ShardedEmbedding) or any(
+            base.__name__ == "LoraSharedExperts" for base in type(module).__mro__
+        ):
             module._extra_parallel_only = True
     return model
 
 
 def _divide_extra_parallel_grads_like_fsdp(model: "nn.Module", parallel_state, fqn2spec_info) -> None:
-    """Scale plan-sharded grads the way the skipped FSDP2 wrap would have.
+    """Divide non-persistent plan-sharded grads by ``extra_parallel_gradient_divide_factor``.
 
-    A row-sharded table's gradient is complete after ``AllToAllEmbedding``'s
-    backward, but as the *sum* of every rank's contribution. The wrapped path
-    divides ExtraParallel grads by ``extra_parallel_gradient_divide_factor``
-    (the world size), so without this an unwrapped module would take steps
-    ``world_size`` times larger than the same module under FSDP2. A tensor hook
-    runs before accumulation, so gradient accumulation stays correct.
-
-    Persistent parameters are skipped: their operator owns the whole sharded
-    parameter for the forward/backward lifecycle and already averages in its own
-    backward (Qwen4-Exp PLE's ``_Qwen4ExpScaleGradient`` divides by the same
-    factor), so a hook here would divide a second time and leave the gradient
-    ``world_size`` times too small.
+    Matches FSDP2's ``set_gradient_divide_factor``; persistent params are skipped
+    because their own backward operator already divides.
     """
     for fqn, param in model.named_parameters():
         spec_info = (fqn2spec_info or {}).get(fqn)
@@ -605,28 +552,6 @@ def _configure_fsdp_gradient_reduction(
     else:
         # Singleton, cross-node and unknown-placement groups keep native scaling.
         module.set_gradient_divide_factor(gradient_divide_factor)
-
-
-def _enabled_extra_parallel(parallel_state) -> dict[str, int]:
-    """``{name: size}`` for the ExtraParallel dimensions this state actually enables.
-
-    Used by the missing-plan assertion so its message names the dimensions to
-    remove from the module's overlay instead of only naming the field to edit.
-    Read defensively: the state may be a test stub carrying only what the
-    assertion touches.
-    """
-    sizes = getattr(parallel_state, "extra_parallel_sizes", None) or {}
-    names = getattr(parallel_state, "extra_parallel_names", ()) or ()
-    enabled = getattr(parallel_state, "extra_parallel_enabled", None)
-    out: dict[str, int] = {}
-    for name in names:
-        size = sizes.get(name) if isinstance(sizes, dict) else None
-        try:
-            if enabled is not None and enabled(name):
-                out[name] = int(size) if size is not None else 1
-        except (AssertionError, KeyError, TypeError):
-            continue
-    return out
 
 
 def parallelize_model_fsdp2(
@@ -726,27 +651,11 @@ def parallelize_model_fsdp2(
         parallel_plan = get_runtime_parallel_plan(model)
         assert parallel_plan is not None, (
             f"ExtraParallel {parallel_state.extra_parallel_names} is enabled for this run, but "
-            f"{type(model).__name__} declares no parallel plan. Every ExtraParallel dimension the "
-            "run enables must be implemented by the modules it shards, and the check is on the "
-            "dimension, not on whether this module holds anything it would shard: a module that "
-            "declares no plan cannot be built under an enabled mesh, so either\n"
-            "  * give this module a plan (see veomni/models/transformers/qwen3_moe/parallel_plan.py "
-            "for expert parallelism, and tests/utils/test_extra_parallel_clip_grad_norm.py::"
-            "test_clip_grad_norm_fsdp2_ep2_emb4 for expert + embed); or\n"
-            "  * take this dimension out of the module's own `accelerator` block. A module entry "
-            "inherits the global `ep` dimension, which is the usual cause (a vision tower under a "
-            "backbone's expert parallelism). For `ep` the switch is `ep_size`:\n"
-            "      accelerator:\n"
-            "        ep_size: 1\n"
-            "  `_module_base` folds an inherited `ep` entry into `ep_size` before the overlay "
-            "merges, so `ep_size: 1` is what turns it off -- and it must be stated explicitly, "
-            "because inheriting leaves the global width in place. Clearing "
-            "`extra_parallel_names` / `extra_parallel_sizes` / "
-            "`extra_parallel_placement_innermost` does NOT work: the inherited width is folded "
-            "back into `ep_size` and `AcceleratorConfig.__post_init__` re-appends the dimension. "
-            "A non-`ep` dimension (e.g. `emb`) has no such scalar, so drop it from all three "
-            "lists.\n"
-            f"  Enabled dimensions are {_enabled_extra_parallel(parallel_state)}."
+            f"{type(model).__name__} declares no parallel plan. Either:\n"
+            "  * define a parallel plan on this model (see veomni/models/transformers/qwen3_moe/parallel_plan.py "
+            "or tests/utils/test_extra_parallel_clip_grad_norm.py::test_clip_grad_norm_fsdp2_ep2_emb4); or\n"
+            "  * disable the inherited ExtraParallel dimension on this module's `accelerator` block "
+            "(set `ep_size: 1` for `ep`, or drop non-`ep` dimensions from `extra_parallel_*`)."
         )
         # Add SpecInfo to extra_parallel modules,
         #   e.g. embed_tokens.weight, decoder.regular_mlp, decoder.embed_tokens.weight, and decoder.moe.experts
@@ -892,20 +801,8 @@ def parallelize_model_fsdp2(
         "shard_placement_fn": _veomni_shard_placement_fn,
     }
     ignored_params = set(persistent_extra_parallel_params or ())
-    # A parameter that is not floating point cannot be an FSDP2 parameter at
-    # all: sharding one ends in `nn.Parameter(...)` with the default
-    # `requires_grad=True`, which torch refuses for an integer tensor. This is
-    # not a policy that could be configured differently.
-    #
-    # What lands here is packed quantized storage -- 4-bit experts are two values
-    # to an int8 byte, because safetensors has no 4-bit float. Such a tensor is
-    # frozen and dequantized inside the kernel that reads it.
-    #
-    # Only the ones an ExtraParallel plan has already placed are ignored, not
-    # every non-float parameter. One that nothing has sharded would then be held
-    # whole on every rank, and silently: the unsharded fp4 experts were 4.22 GiB
-    # a layer. Left to FSDP it raises instead, which is the honest answer to
-    # "nothing can shard this".
+    # FSDP2 cannot shard non-floating parameters (e.g. packed int8 4-bit quantized weights);
+    # ignore those already sharded by the ExtraParallel plan so ancestor FSDP groups leave them alone.
     for fqn, param in model.named_parameters():
         if param.is_floating_point():
             continue

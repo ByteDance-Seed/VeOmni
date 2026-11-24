@@ -4,7 +4,7 @@ from typing import List
 
 import torch
 import torch.distributed as dist
-from torch.distributed._tensor import DTensor
+from torch.distributed._tensor import DTensor, Shard
 
 from ...utils.device import get_device_type
 from ...utils.logging import get_logger
@@ -51,17 +51,7 @@ def clip_grad_norm(
 
 @torch.no_grad()
 def _average_extra_parallel_only_replicated_grads(model) -> None:
-    """Average the grads of parameters an unwrapped ExtraParallel-only module replicates.
-
-    Without the FSDP2 wrap nothing reduces a parameter the plan does not name, so
-    every rank would step its full replica with its own micro-batch's gradient
-    and the replicas would drift apart. Averaging over the FSDP group is what the
-    wrap's reduce-scatter computes, and repeating it is harmless.
-
-    Every rank all-reduces every trainable replicated parameter in the same
-    order, so a parameter that got no gradient on one rank takes a zero one
-    instead of leaving the collectives misaligned.
-    """
+    """Average grads of replicated params across ``fsdp_group`` when FSDP2 wrap is skipped."""
     ps = get_parallel_state()
     group = ps.fsdp_group
     group_size = dist.get_world_size(group) if group is not None else 1
@@ -71,7 +61,13 @@ def _average_extra_parallel_only_replicated_grads(model) -> None:
     if ep_param_groups is not None:
         replicated_params = ep_param_groups.get("non_extra_parallel", [])
     else:
-        replicated_params = [p for p in model.parameters() if p.requires_grad and not isinstance(p, DTensor)]
+        replicated_params = [
+            p
+            for p in model.parameters()
+            if p.requires_grad
+            and not isinstance(p, DTensor)
+            and not isinstance(getattr(getattr(p, "spec_info", None), "placement", None), Shard)
+        ]
     for param in replicated_params:
         if param.grad is None:
             param.grad = torch.zeros_like(param)
