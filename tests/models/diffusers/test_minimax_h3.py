@@ -572,6 +572,31 @@ def test_minimax_h3_save_auto_dtype_preserves_mixed_precision(tmp_path, audio_en
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("audio_enabled", [True, False])
+def test_minimax_h3_checkpoint_matches_cpu_and_meta_init(tmp_path, audio_enabled):
+    from safetensors.torch import save_file
+
+    from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
+
+    config = _tiny_config(audio_enabled=audio_enabled, num_pdd_heads=0 if audio_enabled else 2)
+    config._set_ops_implementation(eager_ops_config())
+    # Match the released checkpoints, which store keys without the HF wrapper prefix.
+    state = MiniMaxH3DiTModel._from_config(config, dtype=torch.bfloat16).dit.state_dict()
+    for tensor in state.values():
+        if tensor.dtype == torch.float32:
+            tensor.fill_(1.0 + 2**-12)
+    save_file(state, tmp_path / "model.safetensors")
+
+    regular = MiniMaxH3DiTModel._from_config(config, dtype=torch.bfloat16)
+    with init_empty_weights():
+        empty = MiniMaxH3DiTModel._from_config(config, dtype=torch.bfloat16)
+    assert all(parameter.is_meta for parameter in empty.parameters())
+    for model in (regular, empty):
+        load_model_weights(model, str(tmp_path), init_device="cpu")
+        torch.testing.assert_close(model.dit.state_dict(), state, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_minimax_h3_backbone_dtype_with_lora():
     from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 
