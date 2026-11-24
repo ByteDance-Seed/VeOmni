@@ -11,12 +11,17 @@
 This wrapper binds the fused AscendC ``chunk_kda`` forward/backward kernels
 from flash-linear-attention-npu (https://github.com/flashserve/flash-linear-attention-npu,
 fla_npu @ 3f4c016) plus the Triton-Ascend l2norm / fallback backward, and
-guards two verified, data-independent vendor bugs in the fused kernels:
+guards three verified, data-independent vendor bugs in the fused kernels:
 
 1. Varlen segments shorter than ``_KDA_MIN_FUSED_SEGMENT`` tokens corrupt the
    outputs of the *following* segments (NaN).
 2. Varlen calls whose total chunk count exceeds ``_KDA_MAX_FUSED_CHUNKS``
    corrupt the first heads' outputs.
+3. Stateless varlen calls with more than ``_KDA_MAX_FUSED_HEADS`` qk
+   heads corrupt the first heads' outputs on some segment structures
+   (full-head sp1 / non-SP training); the guard splits those calls into
+   head groups within the bound, which is output-identical because qk
+   heads are independent in the chunked KDA recurrence.
 
 The eager reference (``.eager.chunk_kda_naive``) is correct on the same
 inputs, so the guard routes the affected calls around the fused kernels with
@@ -65,12 +70,13 @@ from .eager import chunk_kda_naive
 
 logger = logging.get_logger(__name__)
 
-# One-shot warning flags for the short-segment and chunk-budget split
-# dispatches in ``chunk_kda_ascendc`` (see the guard near the entry's
+# One-shot warning flags for the short-segment, chunk-budget, and head-count
+# split dispatches in ``chunk_kda_ascendc`` (see the guard near the entry's
 # dispatch), and for the finite-output corruption fallback.
 _KDA_SHORT_SEG_WARNED = False
 _KDA_CHUNK_BUDGET_WARNED = False
 _KDA_CORRUPT_WARNED = False
+_KDA_HEAD_SPLIT_WARNED = False
 
 
 def _finite_check_enabled() -> bool:
@@ -99,6 +105,22 @@ _KDA_MIN_FUSED_SEGMENT = 4
 # the threshold, verified bitwise). The budget keeps a margin below the measured
 # 35-chunk clean bound; the eager reference is unaffected.
 _KDA_MAX_FUSED_CHUNKS = 32
+
+# Third verified failure mode (full-head sp1 / non-SP training): the fused
+# AscendC chunk_kda forward returns non-finite outputs from finite inputs
+# once a stateless varlen call carries more than this many qk heads. The
+# boundary is segment-structure dependent: on the captured sp1 batches the
+# corruption fires at H=96/94 and disappears at H<=92, while 12 random
+# varlen structures and the head-sharded 48-head SP matrix runs stay clean.
+# Heads are independent in the chunked KDA recurrence (no cross-head state;
+# contiguous qk-head slicing keeps GVA v-head blocks aligned), so calls
+# above the bound are split into head groups of at most this size: outputs
+# are bit-identical to a single fused call below the bound (verified with
+# torch.equal), match the eager reference within bf16 tolerance, and keep
+# the fused kernels' memory profile (no eager fallback, which does not fit
+# device memory at full heads). The bound keeps a 2x margin below the
+# measured ~92-96 corruption boundary, mirroring the chunk budget's margin.
+_KDA_MAX_FUSED_HEADS = 48
 
 # The characterization above (and the fused backward contract) was measured
 # against this fla_npu line; other builds must be re-verified before use.
@@ -1168,7 +1190,60 @@ def chunk_kda_ascendc(
     assert g.shape == (B, T, HV, K), f"g must have shape [B, T, HV, K]={[B, T, HV, K]}, got {list(g.shape)}"
     assert beta.shape == (B, T, HV), f"beta must have shape [B, T, HV]={[B, T, HV]}, got {list(beta.shape)}"
 
-    # Two verified fused-AscendC failure modes are routed around per segment
+    # Third verified fused-AscendC failure mode (see _KDA_MAX_FUSED_HEADS):
+    # stateless calls whose qk head count exceeds the bound are split into
+    # head groups within it, each re-entering this wrapper so the varlen
+    # guards below (short-segment dispatch, chunk budget) and the debug
+    # finite-output check apply per group. The chunked KDA recurrence is
+    # independent per qk head (contiguous qk-head slices keep the GVA v-head
+    # blocks aligned), so the split is output-identical to a single fused
+    # call below the bound. Stateful calls (initial_state consumed, final or
+    # intermediate states produced) are not split and keep the direct path
+    # below, exactly like the varlen guard, which also only reroutes
+    # stateless calls.
+    _stateless_call = initial_state is None and not output_final_state and not return_intermediate_states
+    if _guarded_routing_enabled() and _stateless_call and H > _KDA_MAX_FUSED_HEADS:
+        global _KDA_HEAD_SPLIT_WARNED
+        if not _KDA_HEAD_SPLIT_WARNED:
+            _KDA_HEAD_SPLIT_WARNED = True
+            warnings.warn(
+                f"chunk_kda_ascendc: stateless call with {H} qk heads exceeds "
+                f"{_KDA_MAX_FUSED_HEADS}; splitting into head groups of at most "
+                f"{_KDA_MAX_FUSED_HEADS} heads because the fused AscendC kernel "
+                f"corrupts the first heads' outputs above the head bound.",
+                stacklevel=2,
+            )
+        _gva = HV // H
+        _head_groups = []
+        for _a in range(0, H, _KDA_MAX_FUSED_HEADS):
+            _b = min(_a + _KDA_MAX_FUSED_HEADS, H)
+            _sub_kwargs = dict(kwargs)
+            _sub_kwargs["A_log"] = None if A_log is None else A_log[_a:_b]
+            _sub_kwargs["dt_bias"] = None if dt_bias is None else dt_bias[_a * K : _b * K]
+            _sub_kwargs["chunk_size"] = chunk_size
+            _o, _ = chunk_kda_ascendc(
+                q[:, :, _a:_b],
+                k[:, :, _a:_b],
+                v[:, :, _gva * _a : _gva * _b],
+                g[:, :, _gva * _a : _gva * _b],
+                beta[:, :, _gva * _a : _gva * _b],
+                scale=scale,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                use_gate_in_kernel=use_gate_in_kernel,
+                use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+                allow_neg_eigval=allow_neg_eigval,
+                safe_gate=safe_gate,
+                lower_bound=lower_bound,
+                disable_recompute=disable_recompute,
+                state_v_first=state_v_first,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+                **_sub_kwargs,
+            )
+            _head_groups.append(_o)
+        return torch.cat(_head_groups, dim=2), None
+
+    # Two further verified fused-AscendC failure modes are routed around per segment
     # group (see _chunk_kda_dispatch_segments): (a) segments shorter than
     # _KDA_MIN_FUSED_SEGMENT tokens corrupt the outputs of the *following*
     # segments, and (b) calls whose total chunk count exceeds

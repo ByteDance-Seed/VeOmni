@@ -26,6 +26,7 @@ from collections.abc import Sequence
 from copy import deepcopy
 from functools import partial
 from math import sqrt
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import numpy as np
@@ -49,7 +50,11 @@ from transformers.utils.generic import check_model_inputs
 from transformers.utils.output_capturing import OutputRecorder
 
 from veomni.distributed.parallel_state import get_parallel_state
-from veomni.distributed.sequence_parallel.data import gather_outputs, slice_input_tensor
+from veomni.distributed.sequence_parallel.data import (
+    gather_outputs,
+    slice_input_tensor,
+    sp_pad_and_slice,
+)
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.transformers.kimi_k3.configuration_kimi_k3 import KimiK3Config, KimiLinearConfig
@@ -322,11 +327,12 @@ def _kimi_k3_decoder_attn_implementation(model):
 logger = logging.get_logger(__name__)
 
 
-# Flash attention (vision tower only): no guarded import lives at the
-# module top level, so `flash_attn_varlen_func` is unconditionally None
-# here; the vision tower selects the eager implementation through
-# VL_VISION_ATTENTION_FUNCTIONS. The "flash_attention_2" vision implementation
-# requires a flash_attn installation and is not supported on NPU.
+# Flash attention (vision reference path): no guarded import lives at the
+# module top level, so `flash_attn_varlen_func` is unconditionally None here.
+# Since the round-9 review the tower dispatches through the attention/standard
+# family rows; the module-local packed-varlen functions further down
+# (eager_attention / multihead_attention / npu_fusion_vision_attention) stay
+# as the parity reference for tests -- no kernel is lost.
 flash_attn_varlen_func = None
 
 
@@ -606,6 +612,7 @@ class KimiBlockSparseMLP(nn.Module):
             self.down_proj,
             self.gate_up_proj,
             num_experts=self.num_experts,
+            activation=self.config.hidden_act,
         )
 
 
@@ -2128,13 +2135,6 @@ def npu_fusion_vision_attention(
     return attn_out.flatten(start_dim=-2)
 
 
-VL_VISION_ATTENTION_FUNCTIONS = {
-    "flash_attention_2": multihead_attention,
-    "eager": eager_attention,
-    "veomni_flash_attention_2": npu_fusion_vision_attention,
-}
-
-
 def _apply_rope_input_validation(x, freqs_cis):
     assert x.ndim == freqs_cis.ndim + 1, (x.shape, freqs_cis.shape)
     assert x.shape[:-2] == freqs_cis.shape[:-1], (x.shape, freqs_cis.shape)
@@ -2161,7 +2161,7 @@ def _npu_safe_compile(func):
     # compile the backward graph of this interpolation (AOTAutograd bwd
     # triton store failure during vision pos-emb backward), so run eager on
     # NPU; GPU keeps the original torch.compile path.
-    if getattr(torch, chr(110) + chr(112) + chr(117), None) is not None and torch.npu.is_available():
+    if getattr(torch, "npu", None) is not None and torch.npu.is_available():
         return func
     return torch.compile(func, dynamic=True)
 
@@ -2280,8 +2280,14 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
 
             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
 
-        out = x + torch.cat(pos_embs)
-        return out
+        pos_table = torch.cat(pos_embs)
+        # Modification (round-9 review, SP): the table is built for the GLOBAL
+        # packed vision sequence (grid_thws stays global); slice it down to this
+        # rank's rows with the same pad+split the collator applied to
+        # pixel_values so the add stays row-aligned on the local rows.
+        if get_parallel_state().sp_enabled:
+            pos_table = sp_pad_and_slice(pos_table, dim=0, pad_value=0, pad_scale=4)
+        return x + pos_table
 
 
 class MoonVision3dPatchEmbed(nn.Module):
@@ -2446,10 +2452,10 @@ class MLP2(nn.Module):
 
 
 class MoonViTEncoderLayer(nn.Module):
-    # MoonViT3d vision tower: instance-local vision_attention VeomniOp + hoisted
-    # host cu_seqlens (round-3 review: the tower was the one attention site with
-    # no kernel abstraction -- a hand-written dict dispatch validating nothing and
-    # a per-layer .tolist() D2H sync inside the NPU fusion kernel).
+    # MoonViT3d vision tower: instance-local attention/standard VeomniOp (the
+    # round-9 review removed the kimi_k3 vision_attention family -- the tower
+    # binds the same rows every other VL model binds; the module-local
+    # packed-varlen functions further down remain as the parity reference).
     def __init__(
         self,
         num_heads: int,
@@ -2463,21 +2469,40 @@ class MoonViTEncoderLayer(nn.Module):
         activation=F.gelu,
         attn_bias: bool = False,
         linear_bias: bool = True,
-        use_deterministic_attn: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
         self.qkv_hidden_size = hidden_dim if qkv_hidden_size is None else qkv_hidden_size
         self.hidden_size_per_attention_head = self.qkv_hidden_size // self.num_heads
+        # The module-resolved eager row (the attention/standard 'eager' row
+        # dispatches through this file's text-side eager_attention_forward,
+        # round-9 review) reads num_key_value_groups for repeat_kv; the vision
+        # tower is MHA (q/k/v share the same head count), so the group size is
+        # 1 -- the same marker the qwen3_vl vision attention module sets.
+        self.num_key_value_groups = 1
         self.attn_implementation = attn_implementation
-        # Modification: bind the op handle right after the selection lands, so
-        # the row's hardware / package requirements are validated at construction
-        # (a 'flash_attention_2' vision selection on a host without flash-attn
-        # fails here with a registry-attributable error, not an ImportError
-        # raised from inside a modeling function at the first image forward).
-        self.veomni_vision_attn = VeomniOp("vision_attention", "kimi_k3", attn_implementation)
-        self.use_deterministic_attn = use_deterministic_attn
+        # The other standard rows read the module's config for kernel
+        # selection (flash_attention_forward resolves
+        # module.config._attn_implementation) and the causal marker when
+        # the call omits it. MoonViT3dEncoder threads config-derived
+        # values via block_cfg dicts instead of a config object, so carry
+        # a one-attribute shim stamped with the bound selection -- the
+        # same markers the qwen3_vl vision attention modules set
+        # (self.config / self.is_causal = False). _pre_quantization_dtype
+        # stays absent so the fp32-cast fallback resolves the layer's own
+        # Linear dtype.
+        self.config = SimpleNamespace(_attn_implementation=attn_implementation)
+        self.is_causal = False
+        # Modification (round-9 review): bind the standard attention family row
+        # (the same contract as every other VL model here) instead of a
+        # kimi_k3-specific vision_attention family. The row's hardware / package
+        # requirements are still validated at construction -- a 'flash_attention_2'
+        # selection on a host without flash-attn fails here with a
+        # registry-attributable error, not an ImportError raised from inside a
+        # modeling function at the first image forward.
+        self.veomni_attn = VeomniOp("attention", "standard", attn_implementation)
+        self.scaling = self.hidden_size_per_attention_head**-0.5
 
         if norm_type == "layernorm":
             self.norm0 = nn.LayerNorm(hidden_dim)
@@ -2502,7 +2527,6 @@ class MoonViTEncoderLayer(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor,
         rope_freqs_cis: torch.Tensor | None = None,
-        cu_seqlens_host: list | None = None,
     ):
         """
         Args:
@@ -2522,23 +2546,32 @@ class MoonViTEncoderLayer(nn.Module):
 
         xq, xk = apply_rope(xq, xk, rope_freqs_cis)
 
-        # Modification: dispatch through the bound op handle (the vendored dict
-        # lookup served the same three functions but validated nothing); the
-        # hoisted host copy rides along as q_cu_seqlens_host / k_cu_seqlens_host
-        # and is consumed only by the NPU fusion implementation.
-        attn_out = self.veomni_vision_attn(
+        # Modification (round-9 review): the standard-row vision-attention
+        # contract (the qwen3_vl vision tower reference): hand the op 4D
+        # [1, H, T, D] tensors and keep cu_seq_lens describing the GLOBAL packed
+        # sequence -- the attention-internal Ulysses exchange in the veomni_*
+        # adapter consumes exactly that, and the eager/sdpa rows consume the same
+        # packed varlen kwargs through the wrapper's per-segment split. Flatten
+        # the output back to [T, H * D] here -- the caller owns the layout
+        # change, the op never flattens.
+        seq_length = xq.shape[0]
+        query_states = xq.transpose(0, 1).unsqueeze(0)
+        key_states = xk.transpose(0, 1).unsqueeze(0)
+        value_states = xv.transpose(0, 1).unsqueeze(0)
+        attn_out, _ = self.veomni_attn(
             self,
-            xq,
-            xk,
-            xv,
-            q_cu_seqlens=cu_seqlens,
-            k_cu_seqlens=cu_seqlens,
-            max_seqlen_k=max_seqlen,
-            max_seqlen_q=max_seqlen,
-            deterministic=self.use_deterministic_attn,
-            q_cu_seqlens_host=cu_seqlens_host,
-            k_cu_seqlens_host=cu_seqlens_host,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask=None,
+            scaling=self.scaling,
+            cu_seq_lens_q=cu_seqlens,
+            cu_seq_lens_k=cu_seqlens,
+            max_length_q=max_seqlen,
+            max_length_k=max_seqlen,
+            is_causal=False,
         )
+        attn_out = attn_out.reshape(seq_length, -1).contiguous()
 
         attn_out = self.wo(attn_out)
         return attn_out
@@ -2549,16 +2582,11 @@ class MoonViTEncoderLayer(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         rope_freqs_cis: torch.Tensor | None = None,
-        cu_seqlens_host: list | None = None,
     ):
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
 
-        # Modification: pass the hoisted host copy through (None keeps the
-        # per-call .tolist() behavior for direct callers of the layer).
-        hidden_states = self.attention_qkvpacked(
-            hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis, cu_seqlens_host
-        )
+        hidden_states = self.attention_qkvpacked(hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -2576,22 +2604,14 @@ class MoonViTEncoderLayer(nn.Module):
 
 
 class MoonViT3dEncoder(nn.Module):
-    def __init__(
-        self, hidden_dim: int, num_layers: int, block_cfg: dict, use_deterministic_attn: bool = False
-    ) -> None:
+    def __init__(self, hidden_dim: int, num_layers: int, block_cfg: dict) -> None:
         super().__init__()
-        self.use_deterministic_attn = use_deterministic_attn
 
         qkv_hidden_size = (
             block_cfg["hidden_dim"] if block_cfg.get("qkv_hidden_size") is None else block_cfg["qkv_hidden_size"]
         )
         self.rope_2d = Rope2DPosEmbRepeated(qkv_hidden_size // block_cfg["num_heads"], 512, 512)
-        self.blocks = nn.ModuleList(
-            [
-                MoonViTEncoderLayer(**block_cfg, use_deterministic_attn=self.use_deterministic_attn)
-                for _ in range(num_layers)
-            ]
-        )
+        self.blocks = nn.ModuleList([MoonViTEncoderLayer(**block_cfg) for _ in range(num_layers)])
         norm_type = block_cfg.get("norm_type", "layernorm")
         if norm_type == "layernorm":
             self.final_layernorm = nn.LayerNorm(hidden_dim)
@@ -2605,6 +2625,18 @@ class MoonViT3dEncoder(nn.Module):
         hidden_states: torch.Tensor,
         grid_thws: torch.Tensor,
     ) -> torch.Tensor:
+        # Modification (round-9 review, SP): grid_thws stays GLOBAL (the
+        # collator only sp-slices pixel_values), so the rope table and cu_seqlens
+        # describe the full packed vision sequence. The rope table is
+        # sp_pad_and_slice'd down to this rank's rows with the same pad+split the
+        # collator applied to pixel_values (pad_scale=4 keeps every 2x2 merge
+        # window whole), while cu_seqlens keeps the GLOBAL layout -- the
+        # attention-internal Ulysses exchange in the veomni_* adapter consumes
+        # exactly that, with the sp-pad tail riding along as one trailing
+        # segment (mirrors the qwen3_vl vision tower). Raw eager/sdpa/flash rows
+        # refuse to run under Ulysses themselves (the wrapper raises for
+        # non-SP-capable implementations), so the SP path requires a veomni_*
+        # selection -- the same constraint every other VL tower here has.
         rope_freqs_cis = self.rope_2d.get_freqs_cis(grid_thws=grid_thws, device=hidden_states.device)
 
         lengths = torch.cat(
@@ -2613,25 +2645,25 @@ class MoonViT3dEncoder(nn.Module):
                 grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2],
             )
         )
+        total_seq_len = int(lengths.sum().item())
 
-        max_seqlen = lengths.max()
+        sp = get_parallel_state()
+        if sp.sp_enabled:
+            # the collator padded pixel rows so every rank's chunk is equal; the
+            # pad tail rides along as one extra isolated attention segment
+            sp_pad_seq_len = hidden_states.shape[0] * sp.sp_size - total_seq_len
+            if sp_pad_seq_len > 0:
+                lengths = torch.cat((lengths, lengths.new_tensor([sp_pad_seq_len])))
+            rope_freqs_cis = sp_pad_and_slice(rope_freqs_cis, dim=0, pad_value=0, pad_scale=4)
+
+        max_seqlen = int(lengths.max().item())
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
-        # Modification: materialize the host copy of the cumulative lengths once
-        # per tower forward instead of once per attention layer: grid_thws arrives
-        # host-side in the collator flow, so the CPU cumsum needs no device sync;
-        # on hosts that stage grid_thws on device this is a single .tolist() (the
-        # NPU fusion kernel previously paid two D2H syncs per vision layer).
-        if lengths.device.type == "cpu":
-            cu_seqlens_host = lengths.cumsum(dim=0, dtype=torch.int32).tolist()
-        else:
-            cu_seqlens_host = cu_seqlens.tolist()
         for block in self.blocks:
             hidden_states = block(
                 hidden_states,
                 cu_seqlens,
                 max_seqlen,
                 rope_freqs_cis=rope_freqs_cis,
-                cu_seqlens_host=cu_seqlens_host,
             )
 
         hidden_states = self.final_layernorm(hidden_states)
@@ -2708,7 +2740,6 @@ class MoonViT3dPretrainedModel(PreTrainedModel):
                 "linear_bias": getattr(config, "linear_bias", True),
                 "attn_implementation": config._attn_implementation,
             },
-            use_deterministic_attn=getattr(self, "use_deterministic_attn", False),
         )
 
     def forward(self, pixel_values: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
@@ -2725,6 +2756,23 @@ class MoonViT3dPretrainedModel(PreTrainedModel):
         assert grid_thws.size(1) == 3, f"No support for thw: {grid_thws}"
         hidden_states = self.patch_embed(pixel_values, grid_thws)
         hidden_states = self.encoder(hidden_states, grid_thws)
+        sp = get_parallel_state()
+        if sp.sp_enabled:
+            # Modification (SP, round-9 review): the tower used to run
+            # redundantly at full width on every SP rank (pixel_values was
+            # sp_slice=False in get_extra_collate_infos). The collator now
+            # sp-slices pixel_values and the attention-internal Ulysses exchange
+            # keeps the global attention contract, so the full tower computes
+            # 1/sp of the token rows per rank. The t-pool merger is image-atomic
+            # (temporal pooling needs whole images), so gather the tower features
+            # across the SP group and trim the sp-pad tail before merging --
+            # gather_outputs' backward all-reduces the grads across the group
+            # (each rank consumed a different slice of the full features), so the
+            # cheap feature gather replaces the redundant tower compute without
+            # losing cross-rank gradient contributions.
+            hidden_states = gather_outputs(hidden_states, gather_dim=0, group=sp.sp_group)
+            total_seq_len = int(sum(t * h * w for t, h, w in grid_thws.tolist()))
+            hidden_states = hidden_states[:total_seq_len]
         if self.merge_type == "sd2_tpool":  # spatial downsampling 2x with temporal pooling all
             hidden_states = tpool_patch_merger(hidden_states, grid_thws, merge_kernel_size=self.merge_kernel_size)
         else:
@@ -3007,34 +3055,21 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
     def _supports_default_dynamic_cache(cls) -> bool:
         return False
 
-    # KimiK3ForConditionalGeneration.__init__ (vision attention validation) --
-    # full __init__ override: the validation must run before submodule construction.
+    # KimiK3ForConditionalGeneration.__init__ (FSDP2 _no_split_modules
+    # aggregation) -- full __init__ override retained for the vision-tower
+    # FSDP2 unit wiring at the bottom.
     def __init__(self, config):
-        # Modification: validate / remap the vision tower's attention selection
-        # before submodule construction. text_config is intentionally NOT stamped
-        # here: VeOmniPretrainedConfig's root->child propagation already resolves
-        # the selection with an explicit per-child choice (the mapping form)
-        # ranking above the root value, and writing text_config._attn_implementation
-        # here would clobber that explicit choice (round-3 review). The MoonViT3d
-        # vision tower has no 'sdpa' implementation (VL_VISION_ATTENTION_FUNCTIONS
-        # registers only 'eager'/'flash_attention_2'/'veomni_flash_attention_2'), so
-        # 'sdpa'/'veomni_sdpa' fall back to 'eager'; any other unsupported name
-        # raises at construction instead of key-erroring at the first image
-        # forward.
-        vision_config = getattr(config, "vision_config", None)
-        if vision_config is not None:
-            vision_impl = vision_config._attn_implementation
-            if vision_impl in ("sdpa", "veomni_sdpa"):
-                vision_impl = "eager"
-            if vision_impl not in VL_VISION_ATTENTION_FUNCTIONS:
-                raise ValueError(
-                    f"Unsupported vision attention implementation {vision_impl!r} for the "
-                    "MoonViT3d vision tower; supported implementations are "
-                    f"{sorted(VL_VISION_ATTENTION_FUNCTIONS)} (plus 'sdpa'/'veomni_sdpa', "
-                    "which fall back to 'eager')"
-                )
-            vision_config._attn_implementation = vision_impl
-
+        # Modification (round-9 review): the vision tower now binds the
+        # attention/standard family row (the same contract as every other VL
+        # model here), so the selection validation moved into the
+        # MoonViTEncoderLayer's VeomniOp construction -- a bad selection fails
+        # there with a registry-attributable error instead of KeyErroring at
+        # the first image forward. text_config is intentionally NOT stamped
+        # here: VeOmniPretrainedConfig's root->child propagation already
+        # resolves the selection with an explicit per-child choice (the
+        # mapping form) ranking above the root value, and writing
+        # text_config._attn_implementation here would clobber that explicit
+        # choice (round-3 review).
         super().__init__(config)
 
         vt_config = VisionTowerConfig(config.vision_config)
@@ -3613,8 +3648,15 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         return _kimi_k3_position_ids
 
     def get_extra_collate_infos(self):
+        # Modification (SP, round-9 review): the vision tower used to run
+        # redundantly on every SP rank because this override pinned pixel_values
+        # to sp_slice=False. pixel_values now rides the repo's default SP-sliced
+        # contract for that key (pad_scale=4 keeps every 2x2 merge window inside
+        # one rank's chunk), while grid_thws stays GLOBAL: the tower derives the
+        # global cu_seqlens / pos-emb / rope tables from it and sp-slices those
+        # down to this rank's row range.
         return {
-            "pixel_values": (0, False, None, None),
+            "pixel_values": (0, True, 0, 4),
             "grid_thws": (0, False, None, None),
         }
 

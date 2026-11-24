@@ -51,7 +51,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from tests.models.compare import eager_ops_config
+from tests.models.compare import eager_ops_config, stamp_attn_implementation
 from tests.models.tiny_configs import (
     tiny_kimi_k3_config as _tiny_config,
 )
@@ -60,11 +60,43 @@ from tests.models.tiny_configs import (
 )
 from veomni.arguments import AcceleratorConfig
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state_from_config
+from veomni.distributed.sequence_parallel.data import sp_pad_and_slice
 from veomni.models.auto import build_foundation_model
 from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import (
     _shard_dim0_offset_length,
 )
 from veomni.ops.registry import VeomniOp
+
+
+def _sp2_build_model():
+    """Build the SP(2) numerics model with every attention row on veomni_sdpa.
+
+    The round-9 SP contract: raw eager/sdpa rows refuse the Ulysses
+    exchange, so the SP(2) workers (and the single-rank reference they
+    are compared against) must run a ``veomni_*`` attention row.
+    Construction still goes through the all-eager ops config -- the
+    flat ``ops_implementation`` override stamps root and children
+    alike, and an accelerator-flavored root selection dies in HF's
+    construction check (the wrapper class supports neither sdpa nor
+    flash dispatch) -- and the rows are then rebound: every K3
+    attention layer holds an instance-local ``veomni_attn`` VeomniOp
+    bound at construction, so swap the handles and stamp the configs
+    (the forward-time SP routing reads ``config._attn_implementation``)
+    -- the same surgery ``pin_eager_attn_implementation`` performs, in
+    the other direction. veomni_sdpa leases on any device and its
+    all_to_all_single-based exchange is gloo-compatible, so the
+    sharded vision tower and the attention-internal MLA exchange -- the
+    production SP path -- run end to end on plain CPU tensors over the
+    gloo group.
+    """
+    model = _build_model()
+    stamp_attn_implementation(getattr(model, "config", None), "veomni_sdpa")
+    for module in model.modules():
+        stamp_attn_implementation(getattr(module, "config", None), "veomni_sdpa")
+        handle = getattr(module, "veomni_attn", None)
+        if getattr(handle, "op", None) == "attention":
+            module.veomni_attn = VeomniOp("attention", "standard", "veomni_sdpa")
+    return model
 
 
 def _build_model(ops_cfg=None):
@@ -642,9 +674,10 @@ def test_vlm_attention_override_preserves_child_selections():
     selections (round-3 review): ``VeOmniPretrainedConfig``'s
     ``_attn_implementation`` mapping form records per-child choices that
     rank above the root value, and the patched ``__init__`` used to
-    re-stamp both sub-configs with the root selection. The vision tower
-    only supports ``VL_VISION_ATTENTION_FUNCTIONS`` -- unsupported names
-    must raise at construction, not KeyError at the first image forward.
+    re-stamp both sub-configs with the root selection. The tower's attention
+    selection is validated by the attention/standard row binding at
+    construction (round-9 review) -- unsupported names raise there, not
+    KeyError at the first image forward.
 
     The construction is CPU-native end to end (round-4 review): both
     children pin 'eager' explicitly -- the toy config's text default is
@@ -679,11 +712,12 @@ def test_vlm_attention_override_preserves_child_selections():
 
     # an sdpa-flavored selection on the vision child itself (raw dict
     # spelling -- both the normalizing setter and HF's own 'sdpa'
-    # construction guard live elsewhere) falls back to 'eager': the old
-    # patch only remapped the root selection onto children and left a
-    # child-level selection to KeyError at the first image forward. The
-    # text side pins an explicit eager default instead of the toy config's
-    # accelerator-bound 'veomni_flash_attention_2' (round-4 review).
+    # construction guard live elsewhere) is honored as a real
+    # attention/standard row (round-9 review: the tower binds the standard
+    # family, so 'veomni_sdpa' no longer silently falls back to 'eager').
+    # The text side pins an explicit eager default instead of the toy
+    # config's accelerator-bound 'veomni_flash_attention_2' (round-4
+    # review).
     cfg = _tiny_config()
     cfg.text_config.ops_implementation["attn_implementation"] = "eager"
     cfg.vision_config.ops_implementation["attn_implementation"] = "veomni_sdpa"
@@ -694,12 +728,21 @@ def test_vlm_attention_override_preserves_child_selections():
     cfg.ops_implementation["attn_implementation"] = "eager"
     model = KimiK3ForConditionalGeneration(cfg)
     assert model.config.text_config._attn_implementation == "eager"
-    assert model.config.vision_config._attn_implementation == "eager"
+    assert model.config.vision_config._attn_implementation == "veomni_sdpa"
 
-    # unsupported vision selection raises at construction
+    # unsupported vision selection raises at construction: the row binding
+    # in MoonViTEncoderLayer.__init__ refuses it (veomni_sage_attention is a
+    # CUDA-SM80 attention/standard row, so a non-CUDA lease dies at the
+    # device-registration check). Written per-child -- the scenario-2
+    # spelling, root pinned to eager -- because the root mapping form hands
+    # HF's own construction check a non-eager root value first, which drags
+    # the optional flash preload into a CPU launch plan before any
+    # registry row gets to refuse the selection.
     cfg = _tiny_config()
-    cfg._attn_implementation = {"text_config": "eager", "vision_config": "veomni_sage_attention"}
-    with pytest.raises(ValueError, match="vision attention"):
+    cfg.text_config.ops_implementation["attn_implementation"] = "eager"
+    cfg.ops_implementation["attn_implementation"] = "eager"
+    cfg.vision_config.ops_implementation["attn_implementation"] = "veomni_sage_attention"
+    with pytest.raises((ValueError, RuntimeError)):
         KimiK3ForConditionalGeneration(cfg)
 
 
@@ -833,8 +876,8 @@ def _sp2_full_row(model):
     expanded by the data transform (V slots carry the media placeholder id).
     The collator keeps packed rows sp_size-divisible, so the shards split
     evenly (6 + 6) and no slice pad is introduced; full-row cu = [0, 9, 12].
-    Deterministic pixels keep both ranks' replicated vision tower in
-    lockstep.
+    Deterministic pixels keep the ranks' sharded tower halves in lockstep
+    with the single-rank tower after the gather.
     """
     ignore = model.config.ignore_index
     ph = model.config.media_placeholder_token_id
@@ -851,16 +894,22 @@ def _sp2_collator_shard(model, rank):
     The collator pre-shifts labels on the FULL row before slicing (the
     VeOmni SP loss contract: the CE consumes pre-shifted labels as-is),
     slices input_ids / labels / position_ids to the rank's even shard,
-    replicates pixel data, and publishes the FULL-row varlen metadata
-    (cu_seq_lens / max_length) on every rank. The forward gathers the
-    shards back, runs the length-preserving merge on the full sequence,
-    then slices the merged embeds to the local shard again -- the
-    slice-handling under test lives in that second slicing.
+    slices pixel_values to the rank's even chunk of the padded global
+    token rows (the (0, True, 0, 4) contract -- dim 0, pad 0, pad_scale 4
+    keeps every 2x2 merge window whole), keeps grid_thws global, and
+    publishes the FULL-row varlen metadata (cu_seq_lens / max_length) on
+    every rank. The forward gathers the text shards back, runs the
+    length-preserving merge on the full sequence, then slices the merged
+    embeds to the local shard again -- the text slice-handling under test
+    lives in that second slicing. The tower derives the global cu / pos /
+    rope tables from the global grid and sp-slices them to the rank's
+    local pixel rows.
     """
     input_ids, labels, _, pixel_values = _sp2_full_row(model)
     pre_shifted = torch.nn.functional.pad(labels, (0, 1), value=model.config.ignore_index)[..., 1:]
     position_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 1, 2]])
     shard = slice(rank * 6, (rank + 1) * 6)
+    pixel_values = sp_pad_and_slice(pixel_values, dim=0, pad_value=0, pad_scale=4)
     return (
         input_ids[:, shard].contiguous(),
         pre_shifted[:, shard].contiguous(),
@@ -892,7 +941,7 @@ def _sp2_worker(rank, rendezvous, result_dir, seed):
         assert get_parallel_state().sp_enabled
 
         torch.manual_seed(seed)
-        model = _build_model()
+        model = _sp2_build_model()
         model.train()
         input_ids, labels, position_ids, attention_mask, grid_thws, pixel_values = _sp2_collator_shard(model, rank)
         cu = torch.tensor([0, 9, 12], dtype=torch.int32)
@@ -944,10 +993,14 @@ def _sp2_worker(rank, rendezvous, result_dir, seed):
 def test_sp2_packed_forward_matches_single_rank(tmp_path, dense_packed_debug):
     """End-to-end SP(2) forward/backward over a pre-expanded packed row.
 
-    Everything runs on plain eager ops: the KDA a2a head-shard route is
-    gated on SP + ``K3_KDA_HEAD_SHARD`` (default on), not on the attention
-    implementation; only the MLA layers pick their route from the impl and
-    take the legacy full-sequence gather under eager. The SP run consumes
+    The attention rows bind veomni_sdpa on every config level (the
+    round-9 SP contract: raw eager/sdpa rows refuse the Ulysses
+    exchange), so the SP run exercises the production sharded path --
+    the tower computes 1/sp of the pixel rows with the
+    attention-internal exchange, and the MLA layers exchange instead
+    of the legacy full-sequence gather. The KDA a2a head-shard route
+    is gated on SP + ``K3_KDA_HEAD_SHARD`` (default on), not on the
+    attention implementation. The SP run consumes
     the collator's pre-shifted labels (the VeOmni SP loss contract: CE
     uses them as-is) while the single-rank reference uses raw labels (CE
     applies its own causal shift), so both supervise the same pairs and
@@ -965,7 +1018,7 @@ def test_sp2_packed_forward_matches_single_rank(tmp_path, dense_packed_debug):
     with torch._dynamo.config.patch(disable=True, suppress_errors=True):
         seed = 1234
         torch.manual_seed(seed)
-        model = _build_model()
+        model = _sp2_build_model()
         model.train()
         input_ids, labels, position_ids, pixel_values = _sp2_full_row(model)
         cu = torch.tensor([0, 9, 12], dtype=torch.int32)
@@ -1226,28 +1279,41 @@ def test_get_seq_length_with_no_full_attention_layers():
     assert cache.get_seq_length() == 0
 
 
-def test_vision_attention_registry_rows_match_dispatch_dict():
-    """The vision_attention op family must cover exactly the tower's vendored
-    dispatch dict (round-3 review: the vision tower was the one attention site
-    with no kernel abstraction)."""
-    from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import VL_VISION_ATTENTION_FUNCTIONS
+def test_vision_attention_family_removed_tower_binds_standard_row():
+    """Round-9 review: the kimi_k3 vision_attention op family is gone -- the
+    MoonViT3d tower binds the attention/standard family row like every other
+    VL model in the repo, and no stale kimi_k3 vision rows remain."""
     from veomni.ops.registry import OP_REGISTRY
 
-    registered = set(OP_REGISTRY.list_registered("vision_attention", "kimi_k3"))
-    assert registered == set(VL_VISION_ATTENTION_FUNCTIONS)
+    try:
+        stale = OP_REGISTRY.list_registered("vision_attention", "kimi_k3")
+    except (KeyError, ValueError):
+        stale = None
+    assert not stale
+
+    model = _build_model()
+    for blk in model.vision_tower.encoder.blocks:
+        assert isinstance(blk.veomni_attn, VeomniOp)
+        assert blk.veomni_attn.impl == "eager"
 
 
 def test_vision_tower_dispatches_through_bound_op_handle():
-    """The patched tower dispatches through the bound vision_attention
-    VeomniOp and is output-identical to the vendored dict dispatch across
-    multimodal shapes (multi-image rows, mixed grids, video-style T>1)."""
+    """The patched tower dispatches through the bound attention/standard
+    VeomniOp and is output-identical to the module-local packed eager
+    reference (the vendored math the dedicated family used to dispatch to)
+    across multimodal shapes (multi-image rows, mixed grids, video-style
+    T>1) -- round-9 review: no kernel is lost by the family removal. The
+    two paths run the same eager math with different kernels (the row goes
+    through the wrapper's per-segment split of the module-resolved
+    ``eager_attention_forward``, the reference stays packed-varlen), so the
+    comparison carries a tolerance instead of bit-equality."""
     model = _build_model()
     model.eval()
     for blk in model.vision_tower.encoder.blocks:
-        assert isinstance(blk.veomni_vision_attn, VeomniOp)
-        assert blk.veomni_vision_attn.impl == "eager"
+        assert isinstance(blk.veomni_attn, VeomniOp)
+        assert blk.veomni_attn.impl == "eager"
 
-    from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import VL_VISION_ATTENTION_FUNCTIONS
+    from veomni.models.transformers.kimi_k3 import modeling_kimi_k3 as k3_modeling
 
     grids = [[1, 4, 4], [1, 2, 2], [2, 2, 2]]
     grid_thws = torch.tensor(grids)
@@ -1255,60 +1321,73 @@ def test_vision_tower_dispatches_through_bound_op_handle():
     with torch.no_grad():
         out_handle = model.vision_tower(pixel_values, grid_thws)
 
-    def dict_dispatch(module, q, k, v, **kwargs):
-        eager_kwargs = {
-            key: value
-            for key, value in kwargs.items()
-            if key in ("q_cu_seqlens", "k_cu_seqlens", "max_seqlen_q", "max_seqlen_k", "deterministic")
-        }
-        return VL_VISION_ATTENTION_FUNCTIONS[module.attn_implementation](q, k, v, **eager_kwargs)
+    def local_eager_adapter(module, q, k, v, **kwargs):
+        # [1, H, T, D] -> the module-local packed [T, H, D] eager reference
+        q3 = q.squeeze(0).transpose(0, 1)
+        k3 = k.squeeze(0).transpose(0, 1)
+        v3 = v.squeeze(0).transpose(0, 1)
+        cu_q = kwargs["cu_seq_lens_q"]
+        max_len = (cu_q[1:] - cu_q[:-1]).max()
+        out = k3_modeling.eager_attention(
+            q3,
+            k3,
+            v3,
+            q_cu_seqlens=cu_q,
+            k_cu_seqlens=kwargs["cu_seq_lens_k"],
+            max_seqlen_q=max_len,
+            max_seqlen_k=max_len,
+        )
+        return out, None
 
-    saved = [blk.veomni_vision_attn for blk in model.vision_tower.encoder.blocks]
+    saved = [blk.veomni_attn for blk in model.vision_tower.encoder.blocks]
     try:
         for blk in model.vision_tower.encoder.blocks:
-            blk.veomni_vision_attn = dict_dispatch
+            blk.veomni_attn = local_eager_adapter
         with torch.no_grad():
             out_dict = model.vision_tower(pixel_values, grid_thws)
     finally:
         for blk, handle in zip(model.vision_tower.encoder.blocks, saved):
-            blk.veomni_vision_attn = handle
+            blk.veomni_attn = handle
     assert len(out_handle) == len(out_dict) == len(grids)
     for a, b in zip(out_handle, out_dict):
-        torch.testing.assert_close(a, b)
+        torch.testing.assert_close(a, b, atol=2e-4, rtol=2e-4)
 
 
 def test_vision_flash_row_fails_at_construction_without_flash_attn(monkeypatch):
     """A 'flash_attention_2' vision selection on a host without flash-attn
-    fails at construction with an attributable error -- the registry row's
-    flash_attn package requirement, or HF's tower availability guard for the
-    raw spelling -- never an ImportError raised from inside the modeling
-    function at the first image forward (round-3 review).
+    fails at construction with an attributable error -- the standard-family
+    row's flash_attn package requirement, or HF's tower availability guard
+    for the raw spelling -- never an ImportError raised from inside the
+    modeling function at the first image forward (round-3 review). The
+    tower has bound the same attention/standard rows as every other VL
+    model since the round-9 family removal.
 
     The dependency attribution is pinned by mocking a supported platform
-    and hiding only the flash_attn package (round-4 review): unmocked, a
-    CPU-only lease dies at the device-registration check first, whose
-    message names the impl ('flash_attention_2') instead of the package,
-    so the flash_attn attribution never gets a chance to fire there."""
-    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "npu")
+    and hiding only the flash_attn package (round-4 review): the mocked
+    cuda lease with the GPU requirement forced to match isolates the
+    package requirement, and the model build below must fail the same way
+    before any forward."""
+    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
     monkeypatch.setattr(
-        "veomni.ops.platform.requirement.NpuKernelRequirement.matches",
+        "veomni.ops.platform.requirement.GpuKernelRequirement.matches",
         lambda self: True,
     )
     monkeypatch.setattr(
         "veomni.ops.registry.is_package_available",
         lambda package: package != "flash_attn",
     )
-    # the op row itself declares its flash_attn package requirement
+    # the standard family's flash_attention_2 cuda row declares the flash_attn
+    # package requirement for the mocked lease
     with pytest.raises(RuntimeError, match="flash_attn"):
-        VeomniOp("vision_attention", "kimi_k3", "flash_attention_2")
+        VeomniOp("attention", "standard", "flash_attention_2")
     from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import (
         KimiK3ForConditionalGeneration,
     )
 
     # and a model carrying the raw spelling never reaches forward: the tower
-    # is refused at construction (HF's guard or the row binding). The text
-    # side and the root pin explicit eager defaults so the refusal cannot
-    # be masked by the toy config's accelerator-bound flash-flavored
+    # row binding (or HF's construction guard) refuses it at construction.
+    # The text side and the root pin explicit eager defaults so the refusal
+    # cannot be masked by the toy config's accelerator-bound flash-flavored
     # defaults under the CPU construction guard.
     cfg = _tiny_config()
     cfg.text_config.ops_implementation["attn_implementation"] = "eager"
@@ -1327,10 +1406,13 @@ def _npu_available():
 
 @pytest.mark.skipif(not _npu_available(), reason="needs the torch_npu fused vision kernel")
 def test_npu_fused_vision_attention_matches_eager_across_multimodal_shapes():
-    """The fused vision path (VeomniOp dispatch + hoisted host cu copy) stays
-    numerically equivalent to the eager reference across multimodal shapes:
-    single image, multi-image packed rows, mixed grids, video-style T>1 -- with
-    grid_thws staged on host and on device (both hoist branches)."""
+    """The fused vision path (attention/standard row dispatch through the
+    veomni_flash_attention_2 NPU adapter) stays numerically equivalent to the
+    eager reference across multimodal shapes: single image, multi-image packed
+    rows, mixed grids, video-style T>1 -- with grid_thws staged on host and on
+    device. Repointed at the standard row in round-9 (the dedicated
+    vision_attention family is gone; the qwen families exercise the same
+    adapter on packed vision varlen)."""
     cfg = _tiny_config()
     cfg._attn_implementation = {"vision_config": "veomni_flash_attention_2"}
     fused = build_foundation_model(cfg, torch_dtype="float32", init_device="cpu")
@@ -1340,8 +1422,8 @@ def test_npu_fused_vision_attention_matches_eager_across_multimodal_shapes():
     fused.vision_tower.to("npu").eval()
     eager.vision_tower.to("npu").eval()
     # the comparison must actually exercise the two different kernels
-    fused_impls = {blk.veomni_vision_attn.impl for blk in fused.vision_tower.encoder.blocks}
-    eager_impls = {blk.veomni_vision_attn.impl for blk in eager.vision_tower.encoder.blocks}
+    fused_impls = {blk.veomni_attn.impl for blk in fused.vision_tower.encoder.blocks}
+    eager_impls = {blk.veomni_attn.impl for blk in eager.vision_tower.encoder.blocks}
     assert fused_impls == {"veomni_flash_attention_2"}
     assert eager_impls == {"eager"}
 

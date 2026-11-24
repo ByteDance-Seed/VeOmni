@@ -164,8 +164,9 @@ distributed model checkpoint and the resumable trainer state).
 
 The model package runs the same trainer on NVIDIA GPUs. Install the GPU
 extra on an x86_64 Linux host (Python 3.11 or 3.12, glibc >= 2.28, CUDA
-12.x / 13.x) - the extra's `flash-attn` build, which K3's vision attention
-imports directly, is published for x86_64 only:
+12.x / 13.x) - the extra's `flash-attn` build, which the attention/standard
+FA2 rows require on GPU (the text decoder and the vision tower both bind
+them), is published for x86_64 only:
 
 ```bash
 uv sync --extra gpu
@@ -308,17 +309,24 @@ reduced 10-layer / 16-expert shape will not match the full weights.
 | | `model_path: null` | random init (to_empty-safe re-init is patched) |
 | | `tokenizer_path` | HF-format tokenizer + AutoProcessor (auto_map) |
 | model.ops_implementation | six knobs | `attn: veomni_flash_attention_2`, `rms_norm: torch_npu`, `ce: chunk_loss`, `moe: fused_npu`, `chunk_kda: ascendc`, `situ: triton` |
-| model.accelerator | `ulysses_size: 2`, `ep_size: 2`, fsdp2, `init_device: meta` | SP=2 (text-sharded) + EP=2 + FSDP2 |
+| model.accelerator | `ulysses_size: 2`, `ep_size: 2`, fsdp2, `init_device: meta` | SP=2 (text + vision sharded) + EP=2 + FSDP2 |
 | data | `train_path` (manifest), `conversation`, `max_seq_len: 1024` | the transform pre-expands the media span, so plain token counts already budget vision tokens (see below) |
 | train | `max_steps: 30`, micro 1, global 8 | smoke scale; lr 1e-3 cosine |
 
 K3-specific behavior to know when writing configs or custom data pipelines:
 
-1. **Vision-redundant SP** — under `ulysses_size > 1` the text tensors are
-   sequence-sharded, but `pixel_values` / `grid_thws` stay **full on every SP
-   rank** (each rank runs the whole vision tower); the model hook
-   `get_extra_collate_infos` exempts them from sp-slicing. This is the
-   opposite of the qwen convention (patch-sharded ViT).
+1. **Vision-sharded SP** — under `ulysses_size > 1` the collator sp-slices
+   `pixel_values` (pad_scale=4 keeps every 2x2 merge window whole), so each
+   rank runs the vision tower on 1/sp of the token rows; `grid_thws` stays
+   global, and the tower derives the global cu_seqlens / pos-emb / rope
+   tables from it and sp-slices those to the local rows. The tower's
+   attention/standard rows exchange the packed sequence internally
+   (Ulysses), and the features are gathered back across the SP group
+   before the image-atomic `tpool_patch_merger` (the gather's backward
+   all-reduces the grads, so no cross-rank contribution is lost). This
+   mirrors the qwen convention (patch-sharded ViT); the SP path requires a
+   `veomni_*` attention selection — raw eager/sdpa/flash rows refuse the
+   attention-internal exchange — which both recipes already pin.
 2. **Pre-expanded media span** — the kimi_k3 data transform materializes
    one `<|media_pad|>` per merged vision token (`(h // mh) * (w // mw)`,
    independent of `t`: the temporal axis is pooled by `tpool_patch_merger`,

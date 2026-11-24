@@ -57,7 +57,6 @@ when the selected implementation runs.
 | `rms_norm_gated`, `causal_conv1d`, `chunk_gated_delta_rule` | `standard` | `eager`, `fla` (CUDA, MLU, NPU), `flash_qla`, `torch_npu`, `triton` (Triton-Ascend), `fla_npu` as supported by the family |
 | `chunk_kda` | `kimi_k3` | `eager` (the `chunk_kda_naive` reference), `ascendc` (fused AscendC NPU, guarded routing), `fla` (CUDA, version-asserted against the K3 gating contract) |
 | `situ_and_mul` | `kimi_k3` | `eager` (fp32 core, shared by the MoE expert loops), `triton` (Triton-Ascend NPU) |
-| `vision_attention` | `kimi_k3` | `eager`, `flash_attention_2` (GPU SM80+/ROCm and NPU, requires `flash_attn`), `veomni_flash_attention_2` (NPU `npu_fusion_attention`; on GPU falls back to flash-attn, so it requires `flash_attn` too) |
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `triton`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
 | `kv_round` | `standard`, `deepseek_v4` | `none` (leave stored tensors alone), `eager`, `triton` (NVIDIA SM89+/ROCm, FP8 E4M3); `standard` takes block width and quantized prefix as call arguments, `deepseek_v4` fixes the model's two geometries and takes `rope_features` |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
