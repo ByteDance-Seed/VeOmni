@@ -29,6 +29,7 @@ Features:
 import json
 import os
 import queue
+import sys
 import threading
 from abc import ABC
 from collections import defaultdict
@@ -377,6 +378,19 @@ class BaseTrainer(Stateful, ABC):
         return device
 
     def destroy_distributed(self):
+        adapter = sys.modules.get("hyper_parallel.integration.veomni")
+        if adapter is not None and (
+            self.args.model.accelerator.fsdp_config.fsdp_mode == "hyper_fsdp2"
+            or self.args.model.optimizer.type == "hyper_muon"
+        ):
+            from ..checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+            # Checkpoint conversion still needs the bindings until all saves finish.
+            try:
+                DistributedCheckpointer.wait_for_pending_save()
+            finally:
+                adapter.remove_hyper_parallel_patch()
+
         if not dist.is_available() or not dist.is_initialized():
             return
 
@@ -714,7 +728,7 @@ class BaseTrainer(Stateful, ABC):
         # the model, not the config, or generic text/VLM training raises
         # `AttributeError` before the first forward.
         if (
-            args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+            args.model.accelerator.fsdp_config.fsdp_mode in ("fsdp2", "hyper_fsdp2")
             and not args.model.accelerator.fsdp_config.reshard_after_backward
             and num_micro_steps > 1
             and hasattr(model, "set_reshard_after_backward")
@@ -728,7 +742,7 @@ class BaseTrainer(Stateful, ABC):
         args: VeOmniArguments = self.args
         model = self.model if model is None else model
         if (
-            args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+            args.model.accelerator.fsdp_config.fsdp_mode in ("fsdp2", "hyper_fsdp2")
             and args.model.accelerator.dp_replicate_size > 1
             and num_micro_steps > 1
             and hasattr(model, "set_requires_all_reduce")

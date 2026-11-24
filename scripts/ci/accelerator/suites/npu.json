@@ -59,6 +59,16 @@
     ]
   },
   {
+    "name": "npu-unit-03c",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_kimi_k3_vision_tower_sp.py"
+    ]
+  },
+  {
     "name": "npu-unit-04",
     "suite": "unit",
     "args": [
@@ -117,6 +127,16 @@
       "-x",
       "--ignore=tests/models/transformers/test_generated_call_site_signatures.py",
       "tests/models"
+    ]
+  },
+  {
+    "name": "hyper-parallel-training",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_hyper_parallel.py"
     ]
   },
   {

@@ -426,6 +426,8 @@ def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
         # Resolved against the model in _build_muon_with_adamw, not ctor kwargs.
         "head_group_size": int(optimizer_cfg.muon_head_group_size),
         "head_split_modules": tuple(optimizer_cfg.muon_head_split_modules),
+        # NS workspace bound; only meaningful on the muon_expert_zero_comm path.
+        "expert_ns_max_experts": int(optimizer_cfg.muon_expert_ns_max_experts),
         # Surface for startup summary only; not a DistributedMuon ctor kwarg.
         "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
     }
@@ -752,7 +754,9 @@ def _build_muon_with_adamw(
         f"momentum={float(muon_kwargs.get('momentum', 0.95)):g}, "
         f"nesterov={bool(muon_kwargs.get('nesterov', True))}, "
         f"expert_zero_comm={expert_zero_comm} "
-        "(applied at FSDP parallelize; see [muon_expert_zero_comm] logs)."
+        "(applied at FSDP parallelize; see [muon_expert_zero_comm] logs), "
+        f"expert_ns_max_experts={int(muon_kwargs.get('expert_ns_max_experts', -1))} "
+        "(-1 = NS chunking disabled)."
     )
     if head_split_names:
         blocks_hist: Dict[int, int] = {}
@@ -784,6 +788,7 @@ def _build_muon_with_adamw(
             adjust_lr_fn=muon_kwargs.get("adjust_lr_fn", "match_rms_adamw"),
             ns_implementation=muon_kwargs.get("ns_implementation", "gram_quack"),
             gram_ns_reset_iterations=muon_kwargs.get("gram_ns_reset_iterations", (2,)),
+            expert_ns_max_experts=muon_kwargs.get("expert_ns_max_experts", -1),
         )
 
     def _make_adamw(params: List[torch.nn.Parameter]) -> AdamW:

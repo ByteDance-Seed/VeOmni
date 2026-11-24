@@ -34,13 +34,22 @@ class _Meta:
 
 
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
-    """NPU fused affine RMSNorm (offset 0).
+    """NPU fused affine RMSNorm (offset 0) under a same-dtype contract.
 
-    Empty ``x`` falls back to the eager pair. Otherwise saves ``(x, weight, rstd)``.
+    ``x`` and ``weight`` must share one dtype: ``aclnnRmsNorm`` has no
+    mixed-dtype overload, so misaligned inputs are rejected instead of being
+    silently cast (callers align on their side). Empty ``x`` falls back to
+    the eager pair. Otherwise saves ``(x, weight, rstd)``.
     """
     if x.numel() == 0:
         output, saved = _eager.forward(x, weight, eps=eps)
         return output, SavedState(saved.tensors, _Meta(True, eps))
+
+    if x.dtype != weight.dtype:
+        raise TypeError(
+            "rms_norm/torch_npu requires x and weight to share one dtype "
+            f"(got x={x.dtype}, weight={weight.dtype}); cast on the caller side."
+        )
 
     import torch_npu
 
