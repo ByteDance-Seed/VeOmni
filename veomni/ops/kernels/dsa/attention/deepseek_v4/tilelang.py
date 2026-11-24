@@ -19,8 +19,12 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from ......utils import logging
 from ...sparse_indices import CompressedCandidates, build_sparse_attention_indices
 from . import eager
+
+
+logger = logging.get_logger(__name__)
 
 
 def wrapper(
@@ -62,6 +66,10 @@ def wrapper(
     kv = ori_kv if cmp_kv is None else torch.cat((ori_kv, cmp_kv), dim=1)
     if topk_idxs is not None:
         if not q.is_cuda or q.dtype != torch.bfloat16:
+            logger.warning_once(
+                "tilelang DeepSeek-V4 sparse attention with explicit topk_idxs requires a bfloat16 query "
+                f"on its registered device; running the eager row for dtype={q.dtype} on {q.device.type}."
+            )
             return eager.dense_sparse_attn(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale, return_lse=return_lse)
         topk_idxs = topk_idxs.contiguous()
     else:

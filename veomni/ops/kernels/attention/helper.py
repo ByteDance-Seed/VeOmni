@@ -24,33 +24,38 @@ _SDPA_CU_SEQLENS_KEYS = ("cu_seqlens", "cu_seqlens_q", "cu_seqlens_k", "cu_seq_l
 _SDPA_PACKED_METADATA_KEYS = (*_SDPA_CU_SEQLENS_KEYS, "max_length_q", "max_length_k", "max_seqlen_q", "max_seqlen_k")
 _FA_CU_SEQLENS_KEYS = ("cu_seq_lens_q", "cu_seq_lens_k", "cu_seqlens_q", "cu_seqlens_k")
 _NPU_HOST_CU_SEQLENS_CACHE_MAX = 16
-# Cached per-tensor host copies keyed by (weakref, _version) so multi-layer
-# forwards reuse one D2H transfer for the same cu_seqlens tensor.
-_NPU_HOST_CU_SEQLENS_CACHE: list[tuple[weakref.ref[torch.Tensor], int, torch.Tensor]] = []
+# Trainable tensors key on ``_version``. Inference tensors have no version
+# counter, so they key on storage identity and are not rewritten in place.
+_HostCacheKey = int | tuple[int, tuple[int, ...], torch.dtype]
+_NPU_HOST_CU_SEQLENS_CACHE: list[tuple[weakref.ref[torch.Tensor], _HostCacheKey, torch.Tensor]] = []
+
+
+def _host_cache_key(tensor: torch.Tensor) -> _HostCacheKey:
+    """Key a host copy without reading ``_version`` on an inference tensor."""
+    if tensor.is_inference():
+        return (tensor.data_ptr(), tuple(tensor.shape), tensor.dtype)
+    return tensor._version
 
 
 def _cached_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
     """Return a CPU copy of ``tensor``, reusing a cached copy across layers."""
     if tensor.device.type == "cpu":
         return tensor
-    # Inference tensors have no version counter. Reading ``_version`` raises.
-    if tensor.is_inference():
-        return tensor.detach().cpu()
-    version = tensor._version
-    alive: list[tuple[weakref.ref[torch.Tensor], int, torch.Tensor]] = []
+    key = _host_cache_key(tensor)
+    alive: list[tuple[weakref.ref[torch.Tensor], _HostCacheKey, torch.Tensor]] = []
     cached: torch.Tensor | None = None
-    for ref, cached_version, cpu_tensor in _NPU_HOST_CU_SEQLENS_CACHE:
+    for ref, cached_key, cpu_tensor in _NPU_HOST_CU_SEQLENS_CACHE:
         owner = ref()
         if owner is None:
             continue
-        alive.append((ref, cached_version, cpu_tensor))
-        if owner is tensor and cached_version == version:
+        alive.append((ref, cached_key, cpu_tensor))
+        if owner is tensor and cached_key == key:
             cached = cpu_tensor
     if cached is not None:
         _NPU_HOST_CU_SEQLENS_CACHE[:] = alive
         return cached
     cpu_tensor = tensor.detach().cpu()
-    alive.append((weakref.ref(tensor), version, cpu_tensor))
+    alive.append((weakref.ref(tensor), key, cpu_tensor))
     if len(alive) > _NPU_HOST_CU_SEQLENS_CACHE_MAX:
         alive = alive[-_NPU_HOST_CU_SEQLENS_CACHE_MAX:]
     _NPU_HOST_CU_SEQLENS_CACHE[:] = alive
@@ -58,11 +63,13 @@ def _cached_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def ensure_npu_host_cu_seqlens(kwargs: dict, device_type: str) -> dict:
-    """Move FlashAttention varlen ``cu_seq_lens_*`` kwargs to CPU on Ascend NPU.
+    """Cache host copies of FlashAttention varlen ``cu_seq_lens_*`` on Ascend NPU.
 
     Ascend ``npu_fusion_attention`` consumes host-resident cumulative lengths.
-    Keeping this adaptation inside the attention op avoids model-level NPU
-    branches and caches the host copy per tensor across layers.
+    Hugging Face's own NPU flash attention already copies these tensors to the
+    host. This helper keeps that copy so one forward does not repeat the
+    transfer at every layer. Inference tensors have no ``_version``, so those
+    copies are keyed by storage identity instead.
     """
     if device_type != "npu":
         return kwargs

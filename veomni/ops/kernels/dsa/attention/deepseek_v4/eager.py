@@ -65,7 +65,7 @@ def dense_sparse_attn(
         topk_idxs: ``[B, S, topk]`` int32 indices into ``kv``'s row axis; negative
             or out-of-range entries are masked.
         sm_scale: softmax scale, defaulting to ``D ** -0.5``.
-        return_lse: also return the ``[B, S, H]`` fp32 base-2 log-sum-exp, sink included.
+        return_lse: also return the detached ``[B, S, H]`` fp32 base-2 log-sum-exp, sink included.
     """
     if sm_scale is None:
         sm_scale = q.shape[-1] ** -0.5
@@ -89,7 +89,7 @@ def dense_sparse_attn(
     out = (numerator / denominator.unsqueeze(-1)).to(q.dtype)
     if not return_lse:
         return out
-    return out, ((shift + denominator.log()) / math.log(2.0)).float()
+    return out, ((shift + denominator.log()) / math.log(2.0)).float().detach()
 
 
 def wrapper(

@@ -1125,6 +1125,51 @@ def test_wan_npu_matches_eager():
     assert torch.allclose(x_e.grad.float(), x_o.grad.float(), atol=ROPE_NPU_ATOL, rtol=ROPE_NPU_RTOL)
 
 
+def test_host_default_torch_npu_rope_accepts_cpu_tensors(monkeypatch):
+    """Full and partial NPU defaults must keep CPU activations on eager."""
+    from veomni.ops.kernels.rope.full import eager as full_eager
+    from veomni.ops.kernels.rope.full import torch_npu as full_npu
+    from veomni.ops.kernels.rope.partial import eager as partial_eager
+    from veomni.ops.kernels.rope.partial import torch_npu as partial_npu
+
+    def reject_fused(*args, **kwargs):
+        raise AssertionError("npu_rotary_mul ran on a CPU tensor")
+
+    try:
+        import torch_npu
+    except ImportError:
+        pass
+    else:
+        monkeypatch.setattr(torch_npu, "npu_rotary_mul", reject_fused)
+
+    torch.manual_seed(0)
+    q = torch.randn(2, 2, 4, 8)
+    k = torch.randn(2, 2, 4, 8)
+    grad_q = torch.randn_like(q)
+    grad_k = torch.randn_like(k)
+    cases = (
+        (full_npu, full_eager, torch.randn(2, 4, 8), torch.randn(2, 4, 8)),
+        (partial_npu, partial_eager, torch.randn(2, 4, 4), torch.randn(2, 4, 4)),
+    )
+    for fused, eager, cos, sin in cases:
+        (ref_q, ref_k), ref_saved = eager.forward(q, k, cos, sin)
+        (out_q, out_k), saved = fused.forward(q, k, cos, sin)
+        torch.testing.assert_close(out_q, ref_q)
+        torch.testing.assert_close(out_k, ref_k)
+        ref_grads = eager.backward((grad_q, grad_k), ref_saved)
+        grads = fused.backward((grad_q, grad_k), saved)
+        torch.testing.assert_close(grads[0], ref_grads[0])
+        torch.testing.assert_close(grads[1], ref_grads[1])
+
+        empty = torch.empty(0, 2, 4, 8)
+        (empty_q, empty_k), empty_saved = fused.forward(empty, empty, cos, sin)
+        assert empty_q.shape == empty.shape
+        assert empty_k.shape == empty.shape
+        empty_grads = fused.backward((torch.empty_like(empty_q), torch.empty_like(empty_k)), empty_saved)
+        assert empty_grads[0].shape == empty.shape
+        assert empty_grads[1].shape == empty.shape
+
+
 def _npu_ready() -> bool:
     return bool(IS_NPU_AVAILABLE and torch.npu.is_available())
 

@@ -36,9 +36,13 @@ from itertools import accumulate
 import torch
 from torch import Tensor
 
+from ......utils import logging
 from ...sparse_indices import CompressedCandidates
 from ...vendor.npu_sparse_flash_mla import npu_sparse_flash_mla
 from . import eager
+
+
+logger = logging.get_logger(__name__)
 
 
 _ORI_SLIDING_CAUSAL_MASK_MODE = 4
@@ -89,6 +93,10 @@ def wrapper(
     head-size limits. Packed calls take the TND path, which needs batch size 1
     and reads the slice boundaries on the host.
     """
+    if topk_idxs is not None:
+        logger.warning_once(
+            "cann DeepSeek-V4 sparse attention does not consume explicit topk_idxs; running the eager row."
+        )
     if topk_idxs is not None or cmp_kv is None or cmp_kv.shape[1] == 0:
         return eager.wrapper(
             q,

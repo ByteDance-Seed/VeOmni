@@ -386,11 +386,14 @@ def test_ensure_npu_host_cu_seqlens_copies_inference_tensors_without_version():
     attn_helper._NPU_HOST_CU_SEQLENS_CACHE.clear()
 
     class _FakeNpuTensor(torch.Tensor):
+        cpu_calls = 0
+
         @property
         def device(self):
             return SimpleNamespace(type="npu")
 
         def cpu(self) -> torch.Tensor:
+            type(self).cpu_calls += 1
             return torch.tensor(torch.Tensor.tolist(self), dtype=self.dtype)
 
     with torch.inference_mode():
@@ -398,7 +401,12 @@ def test_ensure_npu_host_cu_seqlens_copies_inference_tensors_without_version():
     fake_cu = cu.as_subclass(_FakeNpuTensor)
     assert fake_cu.is_inference()
 
-    updated = attn_helper.ensure_npu_host_cu_seqlens({"cu_seq_lens_q": fake_cu}, "npu")
-    assert updated["cu_seq_lens_q"].tolist() == [0, 3, 6]
-    assert updated["cu_seq_lens_q"].device.type == "cpu"
+    # Q and K share the tensor, and the next layer sees it again.
+    first = attn_helper.ensure_npu_host_cu_seqlens({"cu_seq_lens_q": fake_cu, "cu_seq_lens_k": fake_cu}, "npu")
+    second = attn_helper.ensure_npu_host_cu_seqlens({"cu_seq_lens_q": fake_cu}, "npu")
+    assert _FakeNpuTensor.cpu_calls == 1
+    assert first["cu_seq_lens_q"].tolist() == [0, 3, 6]
+    assert first["cu_seq_lens_q"].device.type == "cpu"
+    assert first["cu_seq_lens_q"] is first["cu_seq_lens_k"]
+    assert second["cu_seq_lens_q"] is first["cu_seq_lens_q"]
     attn_helper._NPU_HOST_CU_SEQLENS_CACHE.clear()

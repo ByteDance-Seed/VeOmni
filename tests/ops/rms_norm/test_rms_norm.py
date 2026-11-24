@@ -57,6 +57,10 @@ from tests.ops.tol import (
 )
 from tests.ops.utils import make_grad_leaves
 from veomni.ops import resolve_op
+from veomni.ops.kernels.rms_norm.deepseek_v4 import eager as deepseek_v4_eager
+from veomni.ops.kernels.rms_norm.deepseek_v4 import torch_npu as deepseek_v4_npu
+from veomni.ops.kernels.rms_norm.offset import eager as offset_eager
+from veomni.ops.kernels.rms_norm.offset import torch_npu as offset_npu
 from veomni.ops.kernels.rms_norm.standard import eager as standard_eager
 from veomni.ops.kernels.rms_norm.standard import liger_kernel as standard_liger
 from veomni.ops.kernels.rms_norm.standard import torch_npu as standard_npu
@@ -607,3 +611,44 @@ def test_standard_fused_rms_norm_accepts_cpu_tensors(monkeypatch):
         assert output.shape == empty.shape
         assert grads[0].shape == empty.shape
         assert grads[1].shape == weight.shape
+
+
+@pytest.mark.parametrize(
+    ("fused", "eager"),
+    (
+        (offset_npu, offset_eager),
+        (deepseek_v4_npu, deepseek_v4_eager),
+    ),
+)
+def test_host_default_torch_npu_rms_norm_accepts_cpu_tensors(monkeypatch, fused, eager):
+    """Offset and DeepSeek-V4 NPU defaults must keep CPU activations on eager."""
+
+    def reject_fused(*args, **kwargs):
+        raise AssertionError("fused RMSNorm ran on a CPU tensor")
+
+    try:
+        import torch_npu
+    except ImportError:
+        pass
+    else:
+        monkeypatch.setattr(torch_npu, "npu_rms_norm", reject_fused)
+        monkeypatch.setattr(torch_npu, "npu_rms_norm_backward", reject_fused)
+
+    x = torch.randn(2, 8)
+    weight = torch.randn(8)
+    eps = 1e-6
+    grad = torch.randn_like(x)
+    reference, reference_saved = eager.forward(x, weight, eps=eps)
+    reference_grads = eager.backward(grad, reference_saved)
+    output, saved = fused.forward(x, weight, eps=eps)
+    grads = fused.backward(grad, saved)
+    torch.testing.assert_close(output, reference)
+    torch.testing.assert_close(grads[0], reference_grads[0])
+    torch.testing.assert_close(grads[1], reference_grads[1])
+
+    empty = torch.empty(0, 8)
+    output, saved = fused.forward(empty, weight, eps=eps)
+    grads = fused.backward(torch.empty_like(output), saved)
+    assert output.shape == empty.shape
+    assert grads[0].shape == empty.shape
+    assert grads[1].shape == weight.shape

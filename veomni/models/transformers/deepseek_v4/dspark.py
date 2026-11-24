@@ -32,7 +32,6 @@ from transformers.modeling_layers import GradientCheckpointingLayer
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs
 from veomni.ops import VeomniOp
-from veomni.ops.kernels.dsa.attention.deepseek_v4.eager import dense_sparse_attn
 from veomni.ops.kernels.dsa.sparse_indices import mask_sparse_attention_indices
 
 
@@ -379,6 +378,5 @@ __all__ = [
     "DSparkMarkovHead",
     "DeepseekV4DSparkBlock",
     "build_dspark_blocks",
-    "dense_sparse_attn",
     "main_window_indices",
 ]
