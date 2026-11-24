@@ -2104,6 +2104,7 @@ class TestQwen3OmniMoeConverterIntegration:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 class TestMiniMaxM3VLConverter:
     def test_dense_and_projector_renaming(self):
         converter = MiniMaxM3VLCheckpointTensorConverter(num_experts=2)
