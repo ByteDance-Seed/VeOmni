@@ -33,7 +33,7 @@ from veomni.ops.kernels.minimax_sparse_attention._common import (
     _packed_to_padded_indices,
     _unpack,
 )
-from veomni.utils.import_utils import is_torch_npu_available
+from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 # The last segment stands in for the collator's synthetic SP tail padding: it is
@@ -279,32 +279,33 @@ def test_bfloat16_block_expansion_matches_boolean_expansion(seq_len, block_size)
     torch.manual_seed(0)
     num_key_blocks = -(-seq_len // block_size)
     selected = torch.rand(2, _NUM_GROUPS, seq_len, num_key_blocks) > 0.5
-    kwargs = dict(block_size=block_size, seq_len=seq_len, heads_per_group=_NUM_QUERY_HEADS // _NUM_GROUPS)
+    kwargs = dict(block_size=block_size, seq_len=seq_len)
 
     expected = _expand_selected_blocks(selected, via_bfloat16=False, **kwargs)
     actual = _expand_selected_blocks(selected, via_bfloat16=True, **kwargs)
 
     assert actual.dtype == torch.bool
-    assert actual.shape == (2, _NUM_QUERY_HEADS, seq_len, seq_len)
+    assert actual.shape == (2, _NUM_GROUPS, seq_len, seq_len)
     assert torch.equal(actual, expected)
 
 
-@pytest.mark.skipif(not is_torch_npu_available(), reason="Requires Ascend NPU")
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Requires Ascend NPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-def test_npu_fused_attention_matches_eager_forward_and_backward(dtype):
+@pytest.mark.parametrize("num_groups", [1, _NUM_GROUPS], ids=["single-group", "multi-group"])
+def test_npu_fused_attention_matches_eager_forward_and_backward(dtype, num_groups):
     torch.manual_seed(42)
     lengths = _SEQUENCE_LENGTHS
     total_length, head_dim = sum(lengths), 64
     cu_seqlens = _cu_seqlens(lengths)
     cpu_inputs = [
         torch.randn(total_length, heads, head_dim).to(dtype).float().requires_grad_()
-        for heads in (_NUM_QUERY_HEADS, _NUM_GROUPS, _NUM_GROUPS)
+        for heads in (_NUM_QUERY_HEADS, num_groups, num_groups)
     ]
     npu_inputs = [tensor.detach().to(device="npu", dtype=dtype).requires_grad_() for tensor in cpu_inputs]
     # Group 0 attends to the first block, group 1 to the current block of each sequence.
     positions = torch.cat([torch.arange(length) for length in lengths])
     blocks = (positions // _BLOCK_SIZE).to(torch.int32)
-    block_indices = torch.stack((torch.zeros_like(blocks), blocks), dim=1).unsqueeze(-1)
+    block_indices = torch.stack((torch.zeros_like(blocks), blocks), dim=1)[:, :num_groups, None]
     kwargs = dict(block_size=_BLOCK_SIZE, scale=head_dim**-0.5)
     eager = VeomniOp("minimax_sparse_attention", "standard", "eager")
     fused = VeomniOp("minimax_sparse_attention", "standard")

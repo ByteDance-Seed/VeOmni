@@ -71,28 +71,24 @@ def _expand_selected_blocks(
     *,
     block_size: int,
     seq_len: int,
-    heads_per_group: int,
     via_bfloat16: bool,
 ) -> torch.Tensor:
-    """Expand ``[B, G, S, num_key_blocks]`` block flags to a ``[B, Hq, S, S]`` token-level keep mask."""
+    """Expand ``[B, G, S, num_key_blocks]`` block flags to a ``[B, G, S, S]`` token-level keep mask."""
     if via_bfloat16:
         # Boolean ``repeat_interleave`` along the key axis is very slow on NPU; 0/1 are
         # exact in bfloat16, so expanding there and casting back gives the same mask.
-        block_keep = selected.to(torch.bfloat16).repeat_interleave(block_size, dim=-1)[..., :seq_len].bool()
-    else:
-        block_keep = selected.repeat_interleave(block_size, dim=-1)[..., :seq_len]
-    return block_keep.repeat_interleave(heads_per_group, dim=1)
+        return selected.to(torch.bfloat16).repeat_interleave(block_size, dim=-1)[..., :seq_len].bool()
+    return selected.repeat_interleave(block_size, dim=-1)[..., :seq_len]
 
 
 def _block_causal_keep(
     block_indices: torch.Tensor,
     padding: torch.Tensor,
     *,
-    num_query_heads: int,
     via_bfloat16: bool,
     block_size: int,
 ) -> torch.Tensor:
-    """Expand ``[B, G, S, K]`` block indices into a ``[B, Hq, S, S]`` keep mask with padding and causality."""
+    """Expand ``[B, G, S, K]`` block indices into a ``[B, G, S, S]`` keep mask with padding and causality."""
     batch, num_groups, seq_len, _ = block_indices.shape
     num_key_blocks = -(-seq_len // block_size)
 
@@ -106,7 +102,6 @@ def _block_causal_keep(
         selected[..., :num_key_blocks],
         block_size=block_size,
         seq_len=seq_len,
-        heads_per_group=num_query_heads // num_groups,
         via_bfloat16=via_bfloat16,
     )
 
@@ -149,7 +144,6 @@ def _run_padded_attention(
         padded_block_indices,
         padding,
         via_bfloat16=via_bfloat16,
-        num_query_heads=num_query_heads,
         block_size=block_size,
     )
 

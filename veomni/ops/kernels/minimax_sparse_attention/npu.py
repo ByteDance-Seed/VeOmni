@@ -30,13 +30,17 @@ def _npu_fusion_attention(
 ) -> torch.Tensor:
     import torch_npu
 
+    # BNSD masks can broadcast a single head or specify all query heads.
+    blocked = ~keep
+    if 1 < keep.size(1) < query.size(1):
+        blocked = blocked.repeat_interleave(query.size(1) // keep.size(1), dim=1)
     output = torch_npu.npu_fusion_attention(
         query.contiguous(),
         key.contiguous(),
         value.contiguous(),
         head_num=query.shape[1],
         input_layout="BNSD",
-        atten_mask=(~keep).contiguous(),
+        atten_mask=blocked.contiguous(),
         sparse_mode=1,
         inner_precise=2,
         scale=scale,

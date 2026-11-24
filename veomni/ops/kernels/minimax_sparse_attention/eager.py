@@ -64,15 +64,18 @@ def _eager_attention(
     scale: float,
     dropout_p: float,
 ) -> torch.Tensor:
-    num_groups = query.shape[1] // key.shape[1]
-    key = key.repeat_interleave(num_groups, dim=1)
-    value = value.repeat_interleave(num_groups, dim=1)
-    attention_mask = torch.zeros(keep.shape, dtype=query.dtype, device=query.device).masked_fill(
+    num_groups = key.shape[1]
+    heads_per_group = query.shape[1] // num_groups
+    key = key.repeat_interleave(heads_per_group, dim=1)
+    value = value.repeat_interleave(heads_per_group, dim=1)
+    attention_mask = torch.zeros(keep.shape, dtype=query.dtype, device=query.device).masked_fill_(
         ~keep, torch.finfo(query.dtype).min
     )
 
     attention_weights = torch.matmul(query, key.transpose(2, 3)) * scale
-    attention_weights = attention_weights + attention_mask
+    # Contiguous query heads in one GQA group share the same selected blocks.
+    attention_weights = attention_weights.unflatten(1, (num_groups, heads_per_group))
+    attention_weights = (attention_weights + attention_mask.unsqueeze(2)).flatten(1, 2)
     attention_weights = F.softmax(attention_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     if dropout_p > 0:
         attention_weights = F.dropout(attention_weights, p=dropout_p, training=True)

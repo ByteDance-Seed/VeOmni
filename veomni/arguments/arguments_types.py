@@ -1377,6 +1377,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "load_balancing_loss_implementation": frozenset(),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
     "moe_implementation": frozenset({"fused_npu"}),
+    "minimax_sparse_attention_implementation": frozenset({"npu"}),
 }
 
 _NPU_REQUIRED: Dict[str, frozenset] = {
@@ -1384,6 +1385,7 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
     "moe_implementation": frozenset({"fused_npu"}),
+    "minimax_sparse_attention_implementation": frozenset({"npu"}),
 }
 
 _AITER_ATTENTION_IMPLEMENTATIONS = frozenset(
