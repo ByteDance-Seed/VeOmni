@@ -86,6 +86,53 @@ def _reference_linear(master, x, dy):
     return expected, dx[: x2d.shape[0]].reshape_as(x), dw
 
 
+@pytest.mark.parametrize("staging_device", ["cpu", "meta"])
+def test_native_conversion_rejects_hopper_before_quantizing(monkeypatch, staging_device):
+    from veomni.distributed.mxfp8 import tensors
+    from veomni.utils import device
+
+    monkeypatch.setattr(tensors, "_CHECKED_MXFP8_DEVICES", set())
+    monkeypatch.setattr(device, "IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr(device, "get_device_id", lambda: 0)
+    monkeypatch.setattr(device, "get_gpu_compute_capability", lambda device: 90)
+    monkeypatch.setattr(torch.version, "hip", None)
+    with pytest.raises(RuntimeError, match="SM100"):
+        MXFP8Linear.from_float(nn.Linear(64, 64, device=staging_device), all_gather=False)
+
+
+def test_meta_conversion_rechecks_native_device_at_execution(monkeypatch):
+    from veomni.utils import device
+
+    monkeypatch.setattr(device, "IS_CUDA_AVAILABLE", False)
+    layer = MXFP8Linear.from_float(nn.Linear(64, 64, device="meta"), all_gather=False)
+    layer.to_empty(device="cpu")
+    with pytest.raises(RuntimeError, match="SM100"):
+        layer(torch.ones(32, 64, dtype=torch.bfloat16))
+
+
+def test_native_fsdp_weight_checks_hardware_before_gather():
+    weight = MXFP8Weight(torch.ones(32, 64))
+    with pytest.raises(RuntimeError, match="SM100"):
+        weight.fsdp_pre_all_gather(
+            SimpleNamespace(size=lambda: 1),
+            weight.shape,
+            weight.stride(),
+            None,
+            SimpleNamespace(param_dtype=torch.bfloat16),
+        )
+
+
+@pytest.mark.parametrize("emulate", [False, True])
+def test_conversion_rejects_incompatible_torchao(monkeypatch, emulate):
+    from veomni.distributed.mxfp8 import tensors
+    from veomni.ops import torchao
+
+    monkeypatch.setattr(tensors, "_CHECKED_MXFP8_DEVICES", set())
+    monkeypatch.setattr(torchao, "version", lambda package: "0.19.0")
+    with pytest.raises(ImportError, match=r"torchao==0\.18\.0; found 0\.19\.0"):
+        MXFP8Linear.from_float(nn.Linear(64, 64), all_gather=False, emulate=emulate)
+
+
 @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
 def test_native_linear_matches_independent_quantized_oracle():
     if not IS_CUDA_AVAILABLE or torch.version.hip is not None or get_gpu_compute_capability() < 100:

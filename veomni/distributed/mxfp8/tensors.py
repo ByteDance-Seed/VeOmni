@@ -24,12 +24,17 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.utils import _pytree as pytree
 
+from ...ops.platform import NVIDIA_SM100_PLUS
+from ...ops.torchao import _require_torchao_version
+from ...utils import device
+
 
 if TYPE_CHECKING:
     from torchao.prototype.mx_formats.mx_tensor import MXTensor
 
 
 _BLOCK_SIZE = 32
+_CHECKED_MXFP8_DEVICES: set[torch.device | None] = set()
 _MASTER_PRESERVING_OPS = {
     torch.ops.aten.detach.default,
     torch.ops.aten.alias.default,
@@ -45,8 +50,22 @@ _MASTER_PRESERVING_OPS = {
 }
 
 
+@torch._dynamo.assume_constant_result
+def _require_mxfp8_runtime(native_device: torch.device | None) -> None:
+    """Check the pinned prototype API once per execution device, outside the compiled graph."""
+    if native_device in _CHECKED_MXFP8_DEVICES:
+        return
+    _require_torchao_version()
+    if native_device is not None and (
+        not device.is_nvidia_cuda_device(native_device)
+        or device.get_gpu_compute_capability(native_device) < NVIDIA_SM100_PLUS.min_cc
+    ):
+        raise RuntimeError(f"Native MXFP8 requires an NVIDIA CUDA SM100+ device, got {native_device}.")
+    _CHECKED_MXFP8_DEVICES.add(native_device)
+
+
 def _quantize(tensor: torch.Tensor, emulate: bool) -> MXTensor:
-    """Use torchao's RCEIL quantizer; AUTO always selects its native MX GEMM."""
+    """Quantize each MXFP8 block to E4M3 using torchao's RCEIL scaling."""
     from torchao.prototype.mx_formats.config import ScaleCalculationMode
     from torchao.prototype.mx_formats.mx_tensor import MXTensor
     from torchao.quantization.quantize_.common import KernelPreference
@@ -135,6 +154,7 @@ class MXFP8Weight(torch.Tensor):
 
     def fsdp_pre_all_gather(self, mesh, outer_size, outer_stride, module, mp_policy):
         del module
+        _require_mxfp8_runtime(None if self._emulate else self._master.device)
         world_size = mesh.size()
         if (
             len(outer_size) != 2
@@ -366,6 +386,12 @@ class MXFP8Linear(nn.Linear):
             )
         ):
             raise ValueError("MXFP8Linear conversion would discard module hooks. Convert before attaching hooks.")
+
+        target = module.weight.device
+        if not emulate and target.type in ("cpu", "meta") and device.IS_CUDA_AVAILABLE:
+            # Staged weights will be materialized on this rank's GPU by FSDP.
+            target = torch.device(device.get_device_type(), device.get_device_id())
+        _require_mxfp8_runtime(None if emulate or target.type == "meta" else target)
         with torch.device("meta"):
             result = cls(module.in_features, module.out_features, bias=module.bias is not None)
         result.weight = (
@@ -380,6 +406,7 @@ class MXFP8Linear(nn.Linear):
         return result
 
     def forward(self, input_tensor):
+        _require_mxfp8_runtime(None if self._emulate else input_tensor.device)
         if torch.is_autocast_enabled(input_tensor.device.type):
             input_tensor = input_tensor.to(torch.get_autocast_dtype(input_tensor.device.type))
         output = _MXFP8LinearFunction.apply(input_tensor, self.weight, self._emulate)
