@@ -9,7 +9,7 @@ qwen3_moe_llm:
   # straight from the checkpoint instead of every rank reading all of them.
   # Needs the every-rank-reads path, so the rank0 broadcast is off here.
   broadcast_model_weights_from_rank0: false
-  ep_sharded_stream_load: true
+  extra_parallel_stream_load: true
   accelerator:
     # Size the `ep` dim by list, not `ep_size`. A per-module entry starts from
     # `asdict(ModelArguments)`, which already carries

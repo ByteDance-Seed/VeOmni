@@ -919,7 +919,7 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
     """Checks an ``AcceleratorConfig`` cannot make for itself, for the Omni launcher.
 
     Mesh self-checks (``init_device`` vs ``fsdp_mode`` / ``ep_size``) run in
-    ``AcceleratorConfig.__post_init__``; the ``ep_sharded_stream_load`` /
+    ``AcceleratorConfig.__post_init__``; the ``extra_parallel_stream_load`` /
     ``broadcast_model_weights_from_rank0`` exclusion runs in
     ``ModelArguments.__post_init__``. Neither is repeated here. What is left is the
     SeedOmni-only ``torch_compile`` ban (single-model trainers support it, with

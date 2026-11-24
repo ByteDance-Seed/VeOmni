@@ -545,7 +545,7 @@ def _resolve_safetensors_shards(weights_path: str, **kwargs) -> Tuple[Dict[str, 
             keys = list(fh.keys())
         return dict.fromkeys(keys, base), {base: resolved_file}
 
-    raise ValueError(f"ep_sharded_stream_load: no safetensors checkpoint found under {weights_path}.")
+    raise ValueError(f"extra_parallel_stream_load: no safetensors checkpoint found under {weights_path}.")
 
 
 def _ep_dim0_slice_meta(parallel_state: Any, shard_group: str, target0: int) -> Tuple[int, int, int]:
@@ -577,8 +577,8 @@ def _refuse_unconverted_tensor(converter: Optional["CheckpointTensorConverter"],
     can_handle_tensor = getattr(converter, "can_handle_tensor", None)
     if callable(can_handle_tensor) and can_handle_tensor(name, tensor):
         raise NotImplementedError(
-            f"ep_sharded_stream_load: converter {type(converter).__name__} needs the whole-tensor "
-            f"conversion for '{name}' ({tensor.dtype}); disable model.ep_sharded_stream_load."
+            f"extra_parallel_stream_load: converter {type(converter).__name__} needs the whole-tensor "
+            f"conversion for '{name}' ({tensor.dtype}); disable model.extra_parallel_stream_load."
         )
 
 
@@ -798,7 +798,7 @@ def load_model_weights_ep_sharded(
 
     parallel_plan = get_runtime_parallel_plan(model)
     if parallel_plan is None or not getattr(parallel_plan, "extra_parallel_plan", None):
-        raise NotImplementedError("ep_sharded_stream_load requires a model with an ExtraParallel parallel_plan.")
+        raise NotImplementedError("extra_parallel_stream_load requires a model with an ExtraParallel parallel_plan.")
 
     # Base-checkpoint keys (bare base-model FQNs) -> their PEFT-wrapped destinations
     # (``base_model.model.<...>.base_layer.weight``). No-op when not PEFT.
@@ -817,7 +817,7 @@ def load_model_weights_ep_sharded(
             _dim = getattr(_placement, "dim", None)
             if _dim is not None and _dim != 0:
                 raise NotImplementedError(
-                    f"ep_sharded_stream_load only supports dim-0 ExtraParallel sharding (Shard(0)); "
+                    f"extra_parallel_stream_load only supports dim-0 ExtraParallel sharding (Shard(0)); "
                     f"'{_pname}' pattern '{_fqn_pattern}' uses Shard({_dim})."
                 )
 
@@ -838,7 +838,7 @@ def load_model_weights_ep_sharded(
         spec_info = getattr(model, "_fqn2spec_info", {}).get(fused_name)
         if spec_info is not None and spec_info.persistent_fsdp_shard_dim is not None:
             raise NotImplementedError(
-                f"ep_sharded_stream_load: converter target '{fused_name}' is a persistent ExtraParallel parameter."
+                f"extra_parallel_stream_load: converter target '{fused_name}' is a persistent ExtraParallel parameter."
             )
         _, para_rank, expected_full0 = _ep_dim0_slice_meta(parallel_state, shard_group, target0)
         return para_rank * target0, target0, expected_full0
@@ -907,20 +907,20 @@ def load_model_weights_ep_sharded(
                     if parallel_plan._get_shard_parameter_groupname(_apply_peft_override(bare_name)) is not None:
                         # The main loop would read it whole and refuse it there; refuse before any read.
                         raise NotImplementedError(
-                            f"ep_sharded_stream_load: checkpoint-tensor converter {type(converter).__name__} "
+                            f"extra_parallel_stream_load: checkpoint-tensor converter {type(converter).__name__} "
                             f"transforms ExtraParallel key '{bare_name}' as a whole tensor (e.g. renames it), "
-                            f"so its rank slice cannot be planned. Disable model.ep_sharded_stream_load to "
+                            f"so its rank slice cannot be planned. Disable model.extra_parallel_stream_load to "
                             f"use the whole-tensor loader."
                         )
                     # Non-expert convert (rename / dequant); handled in the main loop.
                     continue
                 raise NotImplementedError(
-                    f"ep_sharded_stream_load: checkpoint-tensor converter "
+                    f"extra_parallel_stream_load: checkpoint-tensor converter "
                     f"{type(converter).__name__} needs a non-dim0-zero-pad transform for key "
                     f"'{bare_name}' and cannot stream it per expert. Per-rank slice streaming "
                     f"cannot reconstruct the whole tensor set from a single shard, so this "
                     f"model/checkpoint combination is unsupported. Either save the checkpoint "
-                    f"in the model's fused expert layout, or disable model.ep_sharded_stream_load "
+                    f"in the model's fused expert layout, or disable model.extra_parallel_stream_load "
                     f"to use the whole-tensor loader (broadcast or every-rank-read)."
                 )
             fused_name = _apply_peft_override(target[0])
@@ -947,7 +947,7 @@ def load_model_weights_ep_sharded(
                 problems.append(f"experts {short} have fewer than {full} source keys")
             if problems:
                 raise RuntimeError(
-                    f"ep_sharded_stream_load: incomplete checkpoint detected for '{fused_name}' "
+                    f"extra_parallel_stream_load: incomplete checkpoint detected for '{fused_name}' "
                     f"({len(expected)} experts): " + "; ".join(problems) + "."
                 )
         for expert_range in sorted(set(range_by_target.values())):
@@ -973,7 +973,7 @@ def load_model_weights_ep_sharded(
         dest = _apply_peft_override(converted.name)
         if parallel_plan._get_shard_parameter_groupname(dest) is not None:
             raise NotImplementedError(
-                f"ep_sharded_stream_load: converter emitted ExtraParallel key '{dest}' from non-expert "
+                f"extra_parallel_stream_load: converter emitted ExtraParallel key '{dest}' from non-expert "
                 f"source '{source}'. Per-expert keys must go through fused_expert_target / for_expert_range."
             )
         if dest in buffer_dict:
@@ -1026,12 +1026,12 @@ def load_model_weights_ep_sharded(
                         fused_name = _apply_peft_override(converted.name)
                         if fused_name not in parameter_names_to_load:
                             raise RuntimeError(
-                                f"ep_sharded_stream_load: converter emitted '{fused_name}', which is not a "
+                                f"extra_parallel_stream_load: converter emitted '{fused_name}', which is not a "
                                 f"parameter left to load."
                             )
                         if tuple(converted.tensor.shape) != param_shapes[fused_name]:
                             raise RuntimeError(
-                                f"ep_sharded_stream_load: converter emitted {fused_name} with shape "
+                                f"extra_parallel_stream_load: converter emitted {fused_name} with shape "
                                 f"{tuple(converted.tensor.shape)}, expected the local {param_shapes[fused_name]}."
                             )
                         # Already the local slice -> parallel_plan=None (do not slice again).
@@ -1071,7 +1071,7 @@ def load_model_weights_ep_sharded(
                     if _converter_transforms(bare_name):
                         # A converter that fuses/reshapes this key can't be streamed.
                         raise NotImplementedError(
-                            f"ep_sharded_stream_load: converter applies a non-dim0-zero-pad "
+                            f"extra_parallel_stream_load: converter applies a non-dim0-zero-pad "
                             f"transform to ExtraParallel key '{name}'."
                         )
                     row_transform = None
@@ -1091,7 +1091,7 @@ def load_model_weights_ep_sharded(
                     if spec_info is not None and spec_info.persistent_fsdp_shard_dim is not None:
                         if row_transform is not None:
                             raise NotImplementedError(
-                                f"ep_sharded_stream_load: row-wise conversion of persistent ExtraParallel "
+                                f"extra_parallel_stream_load: row-wise conversion of persistent ExtraParallel "
                                 f"parameter '{name}' is not supported."
                             )
                         parameter = params_by_name[name]
@@ -1159,7 +1159,7 @@ def load_model_weights_ep_sharded(
                         # Only a dim-0 zero-pad key gets here (other claimed keys took
                         # the whole-tensor converter path); it must be an ExtraParallel table.
                         raise NotImplementedError(
-                            f"ep_sharded_stream_load: converter handles non-ExtraParallel key '{name}'."
+                            f"extra_parallel_stream_load: converter handles non-ExtraParallel key '{name}'."
                         )
                     tensor = f.get_tensor(raw_name)
                     # ``can_handle_tensor`` catches quantized dense weights whose names
@@ -1176,7 +1176,7 @@ def load_model_weights_ep_sharded(
         finalized = converter.finalize()
         if finalized and not supports_expert_streaming:
             raise NotImplementedError(
-                "ep_sharded_stream_load cannot dispatch converter outputs produced only at finalize time."
+                "extra_parallel_stream_load cannot dispatch converter outputs produced only at finalize time."
             )
         # E.g. DeepSeek-V4's orphan block scales: whole tensors, dispatched as the
         # whole-tensor loader does (typically logged as unexpected keys).
@@ -1195,13 +1195,13 @@ def load_model_weights_ep_sharded(
             dest = _apply_peft_override(result.name)
             if dest in parameter_names_to_load or dest in buffer_dict:
                 raise NotImplementedError(
-                    f"ep_sharded_stream_load: expert-range converter emitted '{dest}' at finalize time; "
+                    f"extra_parallel_stream_load: expert-range converter emitted '{dest}' at finalize time; "
                     f"rank-local finalize outputs cannot be dispatched."
                 )
             logger.info_rank0(f"Unexpected key in state dict: {dest}.")
 
     logger.info_rank0(
-        f"ep_sharded_stream_load: read {n_ep} ExtraParallel-sliced, {n_dense} dense, {n_buf} buffer tensors/rank; "
+        f"extra_parallel_stream_load: read {n_ep} ExtraParallel-sliced, {n_dense} dense, {n_buf} buffer tensors/rank; "
         f"skipped {n_skipped} converter-declared tensors without reading; stacked {n_expert_reads} local "
         f"per-expert tensors and skipped {n_remote_experts} other ranks' without reading."
     )

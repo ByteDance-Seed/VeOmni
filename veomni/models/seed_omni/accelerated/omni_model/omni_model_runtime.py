@@ -348,7 +348,7 @@ class OmniModelRuntime:
                 enable_fsdp_offload=acc.fsdp_config.offload,
                 fsdp_offload_pin_memory=acc.fsdp_config.offload_pin_memory,
                 broadcast_model_weights_from_rank0=args.broadcast_model_weights_from_rank0,
-                ep_sharded_stream_load=args.ep_sharded_stream_load,
+                extra_parallel_stream_load=args.extra_parallel_stream_load,
                 max_load_broadcast_size=acc.fsdp_config.max_load_broadcast_size,
                 muon_expert_zero_comm=muon_expert_zero_comm,
                 expert_weight_fp8_all_gather=acc.fsdp_config.expert_weight_fp8_all_gather,

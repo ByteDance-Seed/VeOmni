@@ -820,12 +820,12 @@ class TestMaterializeAndLoadDispatch:
         [
             ({}, False, "plain"),
             ({"broadcast_from_rank0": True}, False, "broadcast"),
-            ({"ep_sharded_stream_load": True}, True, "ep_sharded"),
-            # ``ep_sharded_stream_load`` is set once per run but this helper runs
+            ({"extra_parallel_stream_load": True}, True, "ep_sharded"),
+            # ``extra_parallel_stream_load`` is set once per run but this helper runs
             # once per model, so a model with no ExtraParallel plan -- every
             # SeedOmni V2 sub-module that owns no experts -- must fall through to
             # the loader it would have used anyway, not raise.
-            ({"ep_sharded_stream_load": True}, False, "plain"),
+            ({"extra_parallel_stream_load": True}, False, "plain"),
         ],
     )
     def test_dispatches_to_one_loader(self, loaders, monkeypatch, flags, has_plan, expected):

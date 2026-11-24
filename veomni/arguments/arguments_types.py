@@ -2069,7 +2069,7 @@ class ModelArguments(BaseModelArguments):
             "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
         },
     )
-    ep_sharded_stream_load: bool = field(
+    extra_parallel_stream_load: bool = field(
         default=False,
         metadata={
             "help": "Opt-in fast/low-memory loader for large ExtraParallel-sharded checkpoint tensors (for example MoE experts or PLE embedding tables): each rank reads only its dim-0 slice straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
@@ -2087,11 +2087,11 @@ class ModelArguments(BaseModelArguments):
                 "model.optimizer.state_offload='cpu' cannot be combined with "
                 "model.accelerator.fsdp_config.offload; both move training state to host."
             )
-        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
+        # extra_parallel_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
         # instead of silently ignoring the flag.
-        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
-            "model.ep_sharded_stream_load requires "
+        assert not (self.extra_parallel_stream_load and self.broadcast_model_weights_from_rank0), (
+            "model.extra_parallel_stream_load requires "
             "model.broadcast_model_weights_from_rank0=False "
             "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
         )
@@ -2106,9 +2106,9 @@ class ModelArguments(BaseModelArguments):
                 raise ValueError(
                     f"PLE size ({ple_size}) must divide the effective FSDP shard size ({effective_fsdp_shard_size})."
                 )
-            if not self.ep_sharded_stream_load:
+            if not self.extra_parallel_stream_load:
                 raise ValueError(
-                    "PLE two-dimensional parallelism requires model.ep_sharded_stream_load=true so each rank "
+                    "PLE two-dimensional parallelism requires model.extra_parallel_stream_load=true so each rank "
                     "reads only its local row-by-column checkpoint rectangle."
                 )
 

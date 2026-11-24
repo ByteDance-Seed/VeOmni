@@ -55,7 +55,7 @@ Model architecture, paths, and multimodal encoder / decoder setup.
 
 * `ModelArguments` — `model.*` (root and per-module overlay share this shape)
     * `OpsImplementationConfig` — `model.ops_implementation.*`
-    * `broadcast_model_weights_from_rank0` / `ep_sharded_stream_load` — weight-load policy
+    * `broadcast_model_weights_from_rank0` / `extra_parallel_stream_load` — weight-load policy
     * `tokenizer_path` / `safetensor_idx_path` — identity paths on `BaseModelArguments` (a tower that never tokenizes simply does not call them)
     * `OptimizerConfig` — `model.optimizer.*`
     * `AcceleratorConfig` — `model.accelerator.*`
@@ -163,7 +163,7 @@ own `safetensor_idx_path`.
 | lora_config | `Optional[Dict]` | `{}` | Native VeOmni LoRA configuration. See the LoRA feature guide. |
 | ops_implementation | `OpsImplementationConfig` | — | Attention / MoE op configuration. |
 | broadcast_model_weights_from_rank0 | `bool` | `True` | Only rank 0 reads weights from disk; other ranks receive via broadcast. |
-| ep_sharded_stream_load | `bool` | `False` | Opt-in fast/low-memory MoE loader: each rank reads only its ExtraParallel dim-0 slice from the checkpoint (for an HF per-expert MoE checkpoint, only its own experts' tensors, when the model's checkpoint converter supports it, e.g. Qwen3-MoE / Qwen3.5-MoE / DeepSeek-V3 / GLM-5 / DeepSeek-V4, including DeepSeek-V4's FP4/FP8 experts). Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
+| extra_parallel_stream_load | `bool` | `False` | Opt-in fast/low-memory loader: each rank reads only its dim-0 ExtraParallel slice from the checkpoint. Covers every ExtraParallel dimension the plan declares, not just experts — an `ep` expert stack (for an HF per-expert MoE checkpoint, only its own experts' tensors, when the model's checkpoint converter supports it, e.g. Qwen3-MoE / Qwen3.5-MoE / DeepSeek-V3 / GLM-5 / DeepSeek-V4, including DeepSeek-V4's FP4/FP8 experts), an `emb` vocabulary table (including one whose per-row block scales must be read with the same row range), or a `ple` table. Requires `broadcast_model_weights_from_rank0=False` and a model with an ExtraParallel parallel_plan. |
 | optimizer | `OptimizerConfig` | — | Optimizer and learning-rate schedule for this model. |
 | accelerator | `AcceleratorConfig` | — | Parallelism, sharding, and placement for this model. |
 
@@ -674,7 +674,7 @@ parallel state current.
 
 `model.accelerator.*` — Everything about how one model is placed on the hardware:
 topology, device initialization, activation recomputation, and compilation.
-Weight loading (`broadcast_model_weights_from_rank0`, `ep_sharded_stream_load`)
+Weight loading (`broadcast_model_weights_from_rank0`, `extra_parallel_stream_load`)
 lives on `model.*`, not here.
 
 The config resolves itself. `__post_init__` reads `WORLD_SIZE`, derives `dp_size`

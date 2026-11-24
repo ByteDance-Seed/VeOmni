@@ -19,7 +19,7 @@ model:
     lr: 1.0e-5
     lr_decay_style: cosine
   broadcast_model_weights_from_rank0: false
-  ep_sharded_stream_load: true
+  extra_parallel_stream_load: true
   chat_template: chatml
 
 data:

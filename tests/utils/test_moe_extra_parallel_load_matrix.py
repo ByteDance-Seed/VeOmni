@@ -40,7 +40,7 @@ Assertions:
 
 Run directly (2 GPUs):
     torchrun --standalone --nproc_per_node=2 \
-        tests/utils/test_moe_ep_sharded_load_matrix.py
+        tests/utils/test_moe_extra_parallel_load_matrix.py
 """
 
 from __future__ import annotations
@@ -249,7 +249,7 @@ def _build_fresh(weights_path, *, loader: str, model_cls=FakeMoeModel):
     if loader == "rank0":
         kwargs["broadcast_model_weights_from_rank0"] = True
     elif loader == "ep_sharded":
-        kwargs["ep_sharded_stream_load"] = True
+        kwargs["extra_parallel_stream_load"] = True
     # loader == "plain": defaults (every-rank-reads)
     return build_parallelize_model(model_cls(), **kwargs)
 
@@ -341,7 +341,7 @@ _ACCEL = get_torch_device()
     not _ACCEL.is_available() or runner_device_count() < 2,
     reason="requires >= 2 accelerator devices (CUDA or NPU)",
 )
-def test_moe_ep_sharded_load_matrix(tmp_path):
+def test_moe_extra_parallel_load_matrix(tmp_path):
     env = dict(os.environ, MOE_MATRIX_TMP=str(tmp_path))
     cmd = [
         "torchrun",

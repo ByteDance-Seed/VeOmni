@@ -88,7 +88,7 @@ def test_parallelize_forwards_module_skip_decision(
         basic_modules=[],
         optimizer=SimpleNamespace(type="adamw", muon_expert_zero_comm=False),
         broadcast_model_weights_from_rank0=False,
-        ep_sharded_stream_load=False,
+        extra_parallel_stream_load=False,
         accelerator=SimpleNamespace(
             init_device="meta",
             torch_compile=CompileConfig(),

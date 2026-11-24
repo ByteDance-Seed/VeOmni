@@ -168,7 +168,7 @@ def _materialize_and_load_weights(
     cpu_load_param_name: Optional[List[str]] = None,
     max_load_broadcast_size: float = 20.0,
     fqn_to_index_mapping: Optional[dict] = None,
-    ep_sharded_stream_load: bool = False,
+    extra_parallel_stream_load: bool = False,
     module_skip_hf_weight_load: Optional[Mapping[str, bool]] = None,
     module_is_peft_model: Optional[Mapping[str, bool]] = None,
     module_adapter_path: Optional[Mapping[str, Optional[str]]] = None,
@@ -207,7 +207,7 @@ def _materialize_and_load_weights(
                 cpu_load_param_name=cpu_load_param_name,
                 max_load_broadcast_size=max_load_broadcast_size,
                 fqn_to_index_mapping=fqn_to_index_mapping,
-                ep_sharded_stream_load=ep_sharded_stream_load,
+                extra_parallel_stream_load=extra_parallel_stream_load,
             )
         leftover_meta = [
             name
@@ -275,7 +275,7 @@ def _materialize_and_load_weights(
         )
     else:
         _dt_local_split = partial(distribute_tensor, src_data_rank=None)
-        if ep_sharded_stream_load and _has_extra_parallel_plan(model):
+        if extra_parallel_stream_load and _has_extra_parallel_plan(model):
             # Opt-in fast/low-memory path for large MoE checkpoints: each rank
             # reads only its ExtraParallel dim-0 slice of the expert tensors
             # straight from the checkpoint (see ``load_model_weights_ep_sharded``).
@@ -284,7 +284,7 @@ def _materialize_and_load_weights(
             # we surface directly rather than silently falling back -- an opt-in
             # flag that quietly degrades is hard to reason about.
             logger.info_rank0(
-                "Loading model weights via per-rank ExtraParallel-slice streaming (ep_sharded_stream_load)..."
+                "Loading model weights via per-rank ExtraParallel-slice streaming (extra_parallel_stream_load)..."
             )
             load_model_weights_ep_sharded(
                 model,
@@ -296,7 +296,7 @@ def _materialize_and_load_weights(
                 fqn_to_index_mapping=fqn_to_index_mapping,
             )
         else:
-            if ep_sharded_stream_load:
+            if extra_parallel_stream_load:
                 # The flag is set once for a whole run, but this helper runs once
                 # per model -- once per OmniModule under SeedOmni V2 -- and a model
                 # with no ExtraParallel plan (vision encoder, VAE, connector) has
@@ -304,7 +304,9 @@ def _materialize_and_load_weights(
                 # there was never a fast path to take here, and refusing instead
                 # would make the flag unusable for any heterogeneous model whose
                 # MoE backbone wants it.
-                logger.info_rank0("Ignoring ep_sharded_stream_load for a model with no ExtraParallel parallel_plan.")
+                logger.info_rank0(
+                    "Ignoring extra_parallel_stream_load for a model with no ExtraParallel parallel_plan."
+                )
             logger.info_rank0("Every rank would read weights from disk and expect this to be slow!")
             load_model_weights(
                 model,
@@ -546,7 +548,7 @@ def _finish_without_fsdp_wrap(
         cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
         max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
         fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
-        ep_sharded_stream_load=bool(kwargs.get("ep_sharded_stream_load")),
+        extra_parallel_stream_load=bool(kwargs.get("extra_parallel_stream_load")),
         module_skip_hf_weight_load=kwargs.pop("module_skip_hf_weight_load", None),
         module_is_peft_model=kwargs.pop("module_is_peft_model", None),
         module_adapter_path=kwargs.pop("module_adapter_path", None),
@@ -1200,7 +1202,7 @@ def parallelize_model_fsdp2(
         cpu_load_param_name=kwargs.get("cpu_load_param_name", None),
         max_load_broadcast_size=kwargs.get("max_load_broadcast_size", 20.0),
         fqn_to_index_mapping=kwargs.get("fqn_to_index_mapping"),
-        ep_sharded_stream_load=bool(kwargs.get("ep_sharded_stream_load")),
+        extra_parallel_stream_load=bool(kwargs.get("extra_parallel_stream_load")),
         module_skip_hf_weight_load=kwargs.pop("module_skip_hf_weight_load", None),
         module_is_peft_model=kwargs.pop("module_is_peft_model", None),
         module_adapter_path=kwargs.pop("module_adapter_path", None),

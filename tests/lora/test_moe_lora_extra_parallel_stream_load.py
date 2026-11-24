@@ -11,15 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-r"""Trainer-driven EP=2 test for the **PEFT** ``ep_sharded_stream_load`` path.
+r"""Trainer-driven EP=2 test for the **PEFT** ``extra_parallel_stream_load`` path.
 
-Companion to ``tests/utils/test_moe_ep_sharded_load_matrix.py`` (which
+Companion to ``tests/utils/test_moe_extra_parallel_load_matrix.py`` (which
 covers the *non-PEFT* MoE load matrix with a fake model). This one
 exercises the real veomni LoRA stack on the Qwen3-MoE toy and asserts
 that streaming a LoRA-wrapped MoE checkpoint reconstructs **bit-identical**
 weights to the reference broadcast loader.
 
-What ``ep_sharded_stream_load`` does for a PEFT model
+What ``extra_parallel_stream_load`` does for a PEFT model
 -----------------------------------------------------
 ``load_model_weights_ep_sharded`` under ``is_peft_model=True`` (wired in
 ``veomni/models/checkpoint/weights.py``):
@@ -47,7 +47,7 @@ Both LoRA flavours are covered:
     experts are EP-streamed.
 
 Run (2 GPUs):
-    pytest -v -s tests/lora/test_moe_lora_ep_sharded_stream_load.py
+    pytest -v -s tests/lora/test_moe_lora_extra_parallel_stream_load.py
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ _CI_EP_LAUNCH = LaunchSpec(nproc=2)
 __all__ = [
     "fused_toy_base_dir",
     "seeded_lora_adapters_dir",
-    "test_peft_ep_sharded_stream_load_matches_broadcast",
+    "test_peft_extra_parallel_stream_load_matches_broadcast",
 ]
 
 
@@ -112,14 +112,14 @@ def _fused_ops_override() -> str:
 # Fused base checkpoint fixture
 # ──────────────────────────────────────────────────────────────────────
 #
-# ``ep_sharded_stream_load`` streams each rank's dim-0 expert slice
+# ``extra_parallel_stream_load`` streams each rank's dim-0 expert slice
 # straight from the checkpoint when the on-disk expert layout *is* the
 # model's fused layout (``...experts.gate_up_proj`` / ``down_proj`` with
 # shape ``[E, ...]``). The shared ``toy_base_dir`` fixture in
 # ``test_moe_lora_trainer`` writes the standard HF **per-expert** layout
 # (``...experts.<e>.gate_proj.weight``), which instead goes through the
 # ``Qwen3MoeCheckpointTensorConverter`` per-rank expert stacking (covered
-# by ``tests/utils/test_moe_ep_sharded_load_matrix.py`` and
+# by ``tests/utils/test_moe_extra_parallel_load_matrix.py`` and
 # ``tests/utils/test_ep_sharded_expert_stream_load.py``).
 #
 # This test builds its *own* base by dumping the fused
@@ -258,7 +258,7 @@ _STREAM_LOAD_SCENARIOS: tuple[tuple[str, str], ...] = (
 
 def _scenario_argv(yaml_path: str, output_dir: str, base_dir: str, *, stream_load: bool) -> list[str]:
     argv = [
-        "tests/lora/test_moe_lora_ep_sharded_stream_load.py",
+        "tests/lora/test_moe_lora_extra_parallel_stream_load.py",
         yaml_path,
         f"--train.checkpoint.output_dir={output_dir}",
         f"--model.model_path={base_dir}",
@@ -270,14 +270,14 @@ def _scenario_argv(yaml_path: str, output_dir: str, base_dir: str, *, stream_loa
         argv.extend(
             [
                 "--model.broadcast_model_weights_from_rank0=False",
-                "--model.ep_sharded_stream_load=True",
+                "--model.extra_parallel_stream_load=True",
             ]
         )
     else:
         argv.extend(
             [
                 "--model.broadcast_model_weights_from_rank0=True",
-                "--model.ep_sharded_stream_load=False",
+                "--model.extra_parallel_stream_load=False",
             ]
         )
     return argv
@@ -357,7 +357,7 @@ def _run_stream_load_worker() -> None:
 
 
 @pytest.mark.launch_plan(provider=_CI_EP_LAUNCH)
-def test_peft_ep_sharded_stream_load_matches_broadcast(
+def test_peft_extra_parallel_stream_load_matches_broadcast(
     tmp_path, _stream_load_assets_root, fused_toy_base_dir, seeded_lora_adapters_dir
 ):
     """Fused 2-rank worker comparing streaming vs broadcast PEFT MoE-LoRA load across all 3 layouts."""

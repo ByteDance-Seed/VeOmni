@@ -115,7 +115,7 @@ This eliminates the need for offline `moe_merge.py` preprocessing. The converter
 does not dequantize: an FP8 per-expert checkpoint, such as the official
 DeepSeek-V3 release, raises `ValueError` and must be converted to BF16 first.
 
-With `model.ep_sharded_stream_load=true`, the converter also streams per rank.
+With `model.extra_parallel_stream_load=true`, the converter also streams per rank.
 It reports each per-expert key's fused target and expert index
 (`fused_expert_target`), and builds a converter restricted to this rank's
 `Shard(0)` expert range (`for_expert_range`). Each EP rank then reads only its
@@ -186,7 +186,7 @@ depends on the path, and there are four:
   whole-tensor conversion, so a content-claimed key raises instead of reaching
   the parameter raw.
 
-So a supported dense conversion does not need `ep_sharded_stream_load` disabled,
+So a supported dense conversion does not need `extra_parallel_stream_load` disabled,
 and neither does a row-sharded table that declares a companion. Only a sharded key
 with no companion and a content-claimed conversion is refused.
 

@@ -12,7 +12,7 @@
 #     --infer.output_dir qwen3_moe_out
 #
 # Prerequisite — split the upstream Qwen3-MoE checkpoint. This recipe enables
-# `ep_sharded_stream_load` on the backbone (see `train/modules_train.yaml`), which
+# `extra_parallel_stream_load` on the backbone (see `train/modules_train.yaml`), which
 # needs the split layout: an upstream root is loaded through the `qwen3_moe` HF
 # layout, and that path rejects streaming because it cannot apply the layout's key
 # renames.
@@ -23,7 +23,7 @@
 # The upstream root does work as `model_path` — `qwen3_moe/hf_layout.py` registers
 # a `qwen3_moe` layout, so no offline split is needed — but then you must also pass
 # `--model.model_config.modules` pointing at an overlay with
-# `ep_sharded_stream_load: false` (and `broadcast_model_weights_from_rank0: true`).
+# `extra_parallel_stream_load: false` (and `broadcast_model_weights_from_rank0: true`).
 # Streaming cannot apply the layout's key renames, so the parser refuses that
 # combination at startup. HF export works either way: the layout splits the fused
 # expert tensors back to per-expert keys on the way out.

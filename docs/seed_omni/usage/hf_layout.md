@@ -39,7 +39,7 @@ type is an error.
   another checkpoint) still needs split checkpoints. Per-module `model_config`
   overrides apply to the run but not to the exported `config.json`, which is
   the source's (a warning lists them). Expert-parallel streaming load
-  (`ep_sharded_stream_load`) does apply the layout: it maps each raw key onto a
+  (`extra_parallel_stream_load`) does apply the layout: it maps each raw key onto a
   module key through this layout's [`route`](../../../veomni/models/seed_omni/utils/hf_layout.py#L329)
   (`HFSourceKeyConverter.module_key`) before streaming that rank's slice, so a
   module loaded from the upstream root streams directly. That is the loading

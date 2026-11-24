@@ -43,7 +43,7 @@ _CONSOLIDATE = "torch.distributed.checkpoint._consolidate_hf_safetensors"
 
 
 class _IdentityPlan:
-    """Minimal parallel plan: `ep_sharded_stream_load` only requires a plan to exist."""
+    """Minimal parallel plan: `extra_parallel_stream_load` only requires a plan to exist."""
 
     extra_parallel_plan = {"emb": {}}
     extra_parallel_persistent_modules = {}

@@ -287,7 +287,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/utils/test_moe_ep_sharded_load_matrix.py"
+      "tests/utils/test_moe_extra_parallel_load_matrix.py"
     ]
   },
   {
@@ -580,7 +580,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/lora/test_moe_lora_ep_sharded_stream_load.py"
+      "tests/lora/test_moe_lora_extra_parallel_stream_load.py"
     ]
   },
   {

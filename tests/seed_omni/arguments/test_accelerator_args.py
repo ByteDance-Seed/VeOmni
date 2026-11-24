@@ -83,7 +83,7 @@ def test_accelerator_config_has_seed_omni_fields_with_expected_defaults():
     assert isinstance(acc.gradient_checkpointing, GradientCheckpointingConfig)
     assert isinstance(acc.torch_compile, TorchCompileConfig)
     assert not hasattr(acc, "broadcast_model_weights_from_rank0")
-    assert not hasattr(acc, "ep_sharded_stream_load")
+    assert not hasattr(acc, "extra_parallel_stream_load")
 
 
 def test_fsdp_scope_defaults_to_module_and_rejects_unknown_values():
@@ -128,7 +128,7 @@ def test_the_generic_runtime_forwards_extra_parallel_only_to_the_builder(monkeyp
         lora_config=None,
         fqn_to_index_mapping=None,
         broadcast_model_weights_from_rank0=False,
-        ep_sharded_stream_load=False,
+        extra_parallel_stream_load=False,
         model_path=None,
         optimizer=SimpleNamespace(type="adamw", muon_expert_zero_comm=False),
     )
@@ -198,7 +198,7 @@ def test_a_module_that_names_its_own_fsdp_mode_overrides_the_inherited_no_wrap_f
 def test_module_runtime_arguments_inherit_weight_load_knobs():
     args = OmniModuleRuntimeArguments(model_path="/tmp/model")
     assert args.broadcast_model_weights_from_rank0 is True
-    assert args.ep_sharded_stream_load is False
+    assert args.extra_parallel_stream_load is False
 
 
 @pytest.mark.parametrize(
@@ -257,13 +257,33 @@ def test_ddp_cpu_init_is_enforced_at_construction():
         AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="ddp"), init_device="cpu")
 
 
-def test_ep_sharded_stream_load_with_broadcast_is_enforced_at_construction():
-    with pytest.raises(AssertionError, match="ep_sharded_stream_load"):
+def test_extra_parallel_stream_load_with_broadcast_is_enforced_at_construction():
+    with pytest.raises(AssertionError, match="extra_parallel_stream_load"):
         OmniModuleRuntimeArguments(
             model_path="/tmp/model",
-            ep_sharded_stream_load=True,
+            extra_parallel_stream_load=True,
             broadcast_model_weights_from_rank0=True,
         )
+
+
+def test_the_streaming_load_knob_is_named_for_every_extra_parallel_dimension():
+    """The knob is `extra_parallel_stream_load`, not `ep_`-scoped.
+
+    It streams the dim-0 slice of whatever the plan shards -- `ep` experts, an
+    `emb` table, a `ple` table -- so a name that said `ep` described one caller.
+    Pinned here because a rename that misses one layer fails quietly: the field
+    parses and the loader never runs, because `build_parallelize_model` forwards
+    the flag through `**kwargs` and reads it back by string key. Both spellings
+    are asserted, so neither reintroducing the old name nor dropping the new one
+    passes.
+    """
+    from dataclasses import fields
+
+    from veomni.arguments.arguments_types import ModelArguments
+
+    names = {field.name for field in fields(ModelArguments)}
+    assert "extra_parallel_stream_load" in names
+    assert "ep_sharded_stream_load" not in names
 
 
 def test_validate_omni_accelerator_bans_torch_compile():

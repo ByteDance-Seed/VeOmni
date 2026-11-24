@@ -22,7 +22,7 @@ Three independent contracts are covered:
 The split checkpoint the converter writes stores experts **already fused**
 (``experts.gate_up_proj`` / ``experts.down_proj``), so the attached per-expert
 converter is a no-op there; it only acts on a plain per-expert HF release. That
-the two layouts coincide is what makes ``ep_sharded_stream_load``'s dim-0 slice
+the two layouts coincide is what makes ``extra_parallel_stream_load``'s dim-0 slice
 valid; the converter's fuse/no-op behaviour is covered by
 ``tests/models/base/test_checkpoint_tensor_converter.py``, the streaming loader by
 ``tests/utils/test_ep_sharded_expert_stream_load.py``, and this file only pins the
@@ -217,8 +217,8 @@ def test_qwen3_moe_declares_the_expert_parallel_plan():
     assert all(spec.dim == 0 for spec in plan["ep"].values())
 
 
-def test_qwen3_moe_ep_sharded_stream_load_applies_to_the_backbone_only():
-    """``ep_sharded_stream_load`` is opt-in per module, so the text encoder keeps the broadcast load.
+def test_qwen3_moe_extra_parallel_stream_load_applies_to_the_backbone_only():
+    """``extra_parallel_stream_load`` is opt-in per module, so the text encoder keeps the broadcast load.
 
     This is the per-module accelerator override the split config depends on: the
     flag reads each rank's own expert rows, and the encoder has none.
@@ -246,11 +246,11 @@ def test_qwen3_moe_ep_sharded_stream_load_applies_to_the_backbone_only():
     assert effective_ep_dim(backbone) == 4
     assert effective_ep_dim(encoder) == 1
 
-    assert backbone.ep_sharded_stream_load is True
+    assert backbone.extra_parallel_stream_load is True
     # Streaming reads every rank's own slice, so rank0-broadcast must be off.
     assert backbone.broadcast_model_weights_from_rank0 is False
 
-    assert encoder.ep_sharded_stream_load is False
+    assert encoder.extra_parallel_stream_load is False
     assert encoder.broadcast_model_weights_from_rank0 is True
 
 
@@ -621,7 +621,7 @@ def test_qwen3_moe_flops_account_for_dense_layers_mixed_into_the_stack():
 def test_qwen3_moe_shipped_base_yaml_targets_a_split_root():
     """``base.yaml`` must not point at an upstream root while streaming is on.
 
-    The HF-view validator rejects ``ep_sharded_stream_load`` because streaming reads
+    The HF-view validator rejects ``extra_parallel_stream_load`` because streaming reads
     raw checkpoint slices and cannot apply the layout's key renames, so an upstream
     ``model_path`` plus the shipped streaming overlay fails at startup. Guard the
     pairing here rather than in a doc note a reader can miss.
@@ -632,7 +632,7 @@ def test_qwen3_moe_shipped_base_yaml_targets_a_split_root():
     base = yaml.safe_load((config_dir / "base.yaml").read_text(encoding="utf-8"))
     modules = yaml.safe_load((config_dir / "modules_train.yaml").read_text(encoding="utf-8"))
 
-    assert modules["qwen3_moe_llm"]["ep_sharded_stream_load"] is True
+    assert modules["qwen3_moe_llm"]["extra_parallel_stream_load"] is True
     # A split root: the converted output, not the upstream checkpoint directory.
     assert str(base["model"]["model_path"]).endswith("-split"), base["model"]["model_path"]
 

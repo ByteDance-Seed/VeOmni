@@ -54,12 +54,12 @@ per-expert converter bridges that on load.
 
 One thing does **not** work against an upstream root:
 
-- **`ep_sharded_stream_load: false` is required.** The shipped
+- **`extra_parallel_stream_load: false` is required.** The shipped
   `train/modules_train.yaml` enables streaming, and the HF-view validator rejects
   it (`...does not apply the qwen3_moe HF layout's key renames`) because streaming
   reads raw checkpoint slices and so cannot go through the layout's renaming. Point
   `--model.model_config.modules` at an overlay that sets
-  `ep_sharded_stream_load: false` and `broadcast_model_weights_from_rank0: true`.
+  `extra_parallel_stream_load: false` and `broadcast_model_weights_from_rank0: true`.
 
 That combination is rejected at startup rather than mid-run — the argument parser
 fails before a 30B checkpoint is loaded, so a misconfigured job does not waste the
@@ -113,7 +113,7 @@ Notes:
   (`experts.gate_up_proj` / `experts.down_proj`), so the backbone's per-expert
   converter is a no-op when loading it (it fires only on an upstream per-expert
   root, as §1 describes). The fused layout is also what makes
-  `ep_sharded_stream_load` valid: each rank slices its own rows on dim 0 instead
+  `extra_parallel_stream_load` valid: each rank slices its own rows on dim 0 instead
   of every rank reading the full expert set.
 - `output_dir` becomes `model.model_path`, for training and inference alike.
 
@@ -322,7 +322,7 @@ surfaced (and fixed) a few omni-specific interactions:
   (`ModuleRuntime._recompute_context`, carried by the recompute policy) so EP stays enabled
   during backward recompute.
 - **Checkpoint load**: a split checkpoint stores fused experts, so every loader
-  takes them whole (or, with `ep_sharded_stream_load`, slices this rank's rows on
+  takes them whole (or, with `extra_parallel_stream_load`, slices this rank's rows on
   dim 0) and the attached per-expert converter is a no-op there. Pointing
   `model.model_path` at an upstream per-expert root instead goes through the HF
   layout, and the converter fuses in place (§1). The stacked `*-merge` checkpoint
