@@ -134,12 +134,21 @@ class GroupedLayout:
 
 _UNIFORM_LAYOUT_CACHE: OrderedDict[tuple[int, int, int, int], GroupedLayout] = OrderedDict()
 #: Distinct ``(rows, groups, device, stream)`` combinations a *step* actually meets.
-#: Each entry is ``16 * n_groups * n_rows`` bytes plus the metadata rows, so a
-#: 256K-token dense layer is ~4 MiB -- 64 of those is a quarter of a GiB held for
-#: shapes that will not return. ``dyn_bsz`` defaults on, so ``n_rows`` changes almost
-#: every micro-batch and an unbounded cache would fill with dead shapes. A handful of
-#: entries covers the shapes live within one step (dense + grouped per layer, one
-#: row count each); anything past that is a shape this step will not ask for again.
+#: ``dyn_bsz`` defaults on, so ``n_rows`` changes almost every micro-batch and an
+#: unbounded cache would fill with shapes that never return. A handful of entries
+#: covers what is live within one step (dense + grouped per layer, one row count
+#: each); anything past that is a shape this step will not ask for again.
+#:
+#: The per-entry size is ``16 * n_groups * n_rows`` bytes (``unpad`` is int64) plus
+#: ``8 * n_groups * n_rows`` for ``rows``/``groups`` and the metadata blocks. It
+#: depends on what ``n_rows`` means per family:
+#:   - a dense projection is one group over the full packed sequence, so a 256K
+#:     layer is ~4 MiB;
+#:   - ``linear/grouped`` gives *every* head group the full token count, so the
+#:     same 256K sequence costs ``o_groups`` times that -- ~32 MiB at 8 groups;
+#:   - a fused MoE splits the tokens among the experts, so the total stays ~4 MiB.
+#: The bound is therefore "8 x the largest live entry", i.e. tens of MiB for a dense
+#: layer and a few hundred MiB for a wide grouped one at 256K -- not a flat 32 MiB.
 _UNIFORM_LAYOUT_CACHE_LIMIT = 8
 
 
