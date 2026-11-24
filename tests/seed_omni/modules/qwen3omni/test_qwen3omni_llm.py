@@ -480,22 +480,22 @@ def test_the_router_loss_is_computed_over_the_whole_sequence_under_sp():
 def test_an_empty_segment_keeps_its_slot_without_inferring_a_width():
     """`reshape(0, -1)` is ambiguous on an empty tensor, so the width is carried.
 
-    A 1-D empty segment has no row to infer the hidden width from — torch raises
-    rather than producing `(0, H)` — so the packer takes the width from the
-    sequence it is building.
+    Checked in every position: an empty segment can come *before* the one that
+    would supply the hidden width, so resolving it from the first non-empty
+    segment as the packer walks would leave a leading empty row at width 0 and
+    `naflatten` then fails concatenating `(0, 0)` with `(N, H)`.
     """
-    packed = _pack([_text(2), _text(0), _text(3)])
-
-    assert packed["inputs_embeds_shape"].tolist() == [[2], [0], [3]]
-    assert packed["inputs_embeds"].shape == (1, 5, HIDDEN)
-    # A 1-D empty row goes through the same path rather than raising.
-    sample = [
-        _text(2),
-        ConversationItem(type="text", value=torch.zeros(0), role="user"),
-        _text(3),
-    ]
-    packed_1d = _pack(sample)
-    assert packed_1d["inputs_embeds"].shape == (1, 5, HIDDEN)
+    for label, sample in (
+        ("leading 1-D", [ConversationItem(type="text", value=torch.zeros(0), role="user"), _text(3)]),
+        ("leading 2-D", [_text(0), _text(3)]),
+        ("middle", [_text(2), _text(0), _text(3)]),
+        ("trailing", [_text(2), ConversationItem(type="text", value=torch.zeros(0), role="user")]),
+    ):
+        packed = _pack(sample)
+        rows = sum(int(n) for n in [item.value.size(0) for item in sample])
+        assert packed["inputs_embeds"].shape == (1, rows, HIDDEN), label
+        # The empty row keeps its slot, so packing and the scatter agree.
+        assert packed["inputs_embeds_shape"].shape[0] == len(sample), label
 
 
 def test_the_backbone_registers_the_expert_fusion_converter():

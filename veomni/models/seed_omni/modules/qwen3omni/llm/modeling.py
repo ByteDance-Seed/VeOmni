@@ -101,6 +101,28 @@ def collect_qwen3omni_dummy_deepstack(
     return None
 
 
+def _resolve_embeddings_width(conversations: list[list[ConversationItem]]) -> int:
+    """Hidden width every packed segment must share.
+
+    Read from the first backbone-input row that carries a width, which is needed
+    *before* shaping the empty ones: ``reshape(0, -1)`` cannot infer a width with
+    no elements, and an empty segment may come before any non-empty one. A batch
+    that is empty throughout has no width to share, which only happens when there
+    is also nothing to pack — so ``0`` is safe there and the caller raises before
+    using it.
+    """
+    for sample in conversations:
+        for item in sample:
+            value = item.value
+            if not isinstance(value, torch.Tensor):
+                continue
+            if item.is_dummy or item.meta.get("_not_backbone_input", False):
+                continue
+            if value.numel() > 0:
+                return int(value.shape[-1])
+    return 0
+
+
 def pack_qwen3omni_conversations_for_forward(
     conversations: list[list[ConversationItem]],
     device: torch.device,
@@ -120,10 +142,11 @@ def pack_qwen3omni_conversations_for_forward(
     visual_pos_masks_list: list[torch.Tensor] = []
     sample_lengths: list[int] = []
     deepstack_chunks: list[list[torch.Tensor]] = []
-    # Hidden width of the packed sequence, learnt from the first non-empty
-    # segment. An empty row cannot infer it: ``reshape(0, -1)`` is ambiguous when
-    # there are no elements, so the zero-row entries are given this width.
-    embeddings_width: Optional[int] = None
+    # Hidden width of the packed sequence. Resolved up front rather than learnt
+    # from the first non-empty segment: an empty row cannot infer it
+    # (``reshape(0, -1)`` is ambiguous with no elements), and an empty segment
+    # can come *before* the one that would have supplied it.
+    embeddings_width = _resolve_embeddings_width(conversations)
 
     for sample in conversations:
         sample_len = 0
@@ -134,8 +157,6 @@ def pack_qwen3omni_conversations_for_forward(
                 continue
             embeds = item.value.to(device)
             length = embeds.size(0)
-            if length > 0 and embeddings_width is None:
-                embeddings_width = int(embeds.shape[-1])
             if length == 0:
                 # An empty segment carries no position and would break the
                 # ``seg_pos.max()`` cursor below. It is kept in the packed
