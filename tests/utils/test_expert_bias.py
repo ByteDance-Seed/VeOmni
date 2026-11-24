@@ -22,11 +22,11 @@ import torch.distributed as dist
 from torch import nn
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.utils.device import get_device_type
+from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torch_device
 from veomni.utils.expert_bias import BIAS_ATTR, ExpertBiasUpdater
 
 
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+_CI_CPU = LaunchSpec(device="cpu")
 _CI_ACCELERATOR_2 = LaunchSpec(nproc=2, device="accelerator")
 
 NUM_EXPERTS = 8
@@ -48,7 +48,7 @@ class ToyRouter(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor):
         indices = self.next_indices
-        logits = torch.zeros(indices.shape[0], self.num_experts)
+        logits = torch.zeros(indices.shape[0], self.num_experts, device=indices.device)
         weights = torch.ones_like(indices, dtype=torch.float32)
         return logits, weights, indices
 
@@ -64,6 +64,7 @@ class ModelWithRouter(nn.Module):
             router(torch.zeros(indices.shape[0], 4))
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_attach_finds_routers_by_buffer_not_by_class_name():
     model = ModelWithRouter(num_routers=3)
     # A module without the buffer must not be picked up.
@@ -73,6 +74,7 @@ def test_attach_finds_routers_by_buffer_not_by_class_name():
     assert updater.attach(model) == 3
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_overloaded_expert_bias_goes_down_and_underloaded_goes_up():
     model = ModelWithRouter()
     updater = ExpertBiasUpdater(update_rate=0.1)
@@ -91,6 +93,7 @@ def test_overloaded_expert_bias_goes_down_and_underloaded_goes_up():
     assert torch.allclose(bias.abs(), torch.full_like(bias, 0.1))
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_bias_is_untouched_when_load_is_already_even():
     model = ModelWithRouter()
     updater = ExpertBiasUpdater(update_rate=0.1)
@@ -104,6 +107,7 @@ def test_bias_is_untouched_when_load_is_already_even():
     assert torch.all(getattr(model.routers[0], BIAS_ATTR) == 0)
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_updates_accumulate_in_one_direction():
     """A persistent imbalance keeps pushing the bias the same way."""
     model = ModelWithRouter()
@@ -124,6 +128,7 @@ def test_updates_accumulate_in_one_direction():
     assert bias[7] - bias[0] == pytest.approx(0.4)
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_counts_do_not_leak_across_steps():
     model = ModelWithRouter()
     updater = ExpertBiasUpdater(update_rate=0.1)
@@ -144,6 +149,7 @@ def test_counts_do_not_leak_across_steps():
     assert bias[NUM_EXPERTS - 1] == pytest.approx(0.0)
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_step_without_traffic_is_a_noop():
     model = ModelWithRouter()
     updater = ExpertBiasUpdater(update_rate=0.1)
@@ -153,6 +159,7 @@ def test_step_without_traffic_is_a_noop():
     assert torch.all(getattr(model.routers[0], BIAS_ATTR) == 0)
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_unrecognised_router_output_raises():
     """A router carrying the buffer but breaking the output contract must fail loudly.
 
@@ -174,6 +181,7 @@ def test_unrecognised_router_output_raises():
         model.gate(torch.zeros(4, 4))
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_disable_removes_hooks():
     model = ModelWithRouter()
     updater = ExpertBiasUpdater(update_rate=0.1)
@@ -186,11 +194,13 @@ def test_disable_removes_hooks():
     assert torch.all(getattr(model.routers[0], BIAS_ATTR) == 0)
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_rejects_a_nonpositive_rate():
     with pytest.raises(ValueError):
         ExpertBiasUpdater(update_rate=0.0)
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 @pytest.mark.parametrize("value, expected", [("1e-3", 1e-3), (1e-3, 1e-3), (0, 0.0), ("0", 0.0)])
 def test_rate_config_accepts_yaml_numbers(value, expected):
     from veomni.arguments.arguments_types import TrainingArguments
@@ -198,6 +208,7 @@ def test_rate_config_accepts_yaml_numbers(value, expected):
     assert TrainingArguments(moe_router_bias_update_rate=value).moe_router_bias_update_rate == expected
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 @pytest.mark.parametrize("value", [-1e-3, "nan", float("nan"), float("inf"), "fast", None, True])
 def test_rate_config_rejects_invalid_values(value):
     from veomni.arguments.arguments_types import TrainingArguments
@@ -206,6 +217,7 @@ def test_rate_config_rejects_invalid_values(value):
         TrainingArguments(moe_router_bias_update_rate=value)
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_attach_is_idempotent():
     """A second attach must not double-count through two hooks."""
     model = ModelWithRouter()
@@ -221,6 +233,7 @@ def test_attach_is_idempotent():
     assert bias[0] == pytest.approx(-0.1)
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_real_deepseek_router_satisfies_the_output_contract():
     """Pin the assumption the whole module rests on, against the real router.
 
@@ -262,6 +275,7 @@ def test_real_deepseek_router_satisfies_the_output_contract():
     assert torch.all(moved_by_rate | (bias == 0))
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_the_bias_update_is_rejected_together_with_lora():
     """LoRA plus attached routers must fail loudly, not silently lose routing.
 
@@ -297,6 +311,7 @@ def test_the_bias_update_is_rejected_together_with_lora():
     ensure_lora_can_carry_the_bias(None, attached)
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_lora_rejection_leaves_no_hooks_on_the_model():
     from veomni.trainer.callbacks.trace_callback import ExpertBiasCallback
 
@@ -313,6 +328,7 @@ def test_lora_rejection_leaves_no_hooks_on_the_model():
     assert not model.routers[0]._forward_hooks
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 @pytest.mark.parametrize(
     "torch_dtype, accepted",
     [("float32", True), ("bfloat16", False), ("float16", False)],
@@ -338,6 +354,7 @@ def test_attach_requires_a_float32_bias_from_the_real_build(torch_dtype, accepte
         assert not router._forward_hooks
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_routers_of_different_widths_update_independently():
     """Each router balances against its own expert count and its own mean."""
     model = nn.Module()
@@ -357,6 +374,7 @@ def test_routers_of_different_widths_update_independently():
     assert torch.allclose(model.narrow.e_score_correction_bias, torch.tensor([0.1, -0.1]))
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_out_of_range_index_does_not_count_against_the_next_router():
     model = nn.Module()
     model.narrow = ToyRouter(2)
@@ -369,6 +387,7 @@ def test_out_of_range_index_does_not_count_against_the_next_router():
         model.narrow(torch.zeros(1, 4))
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_dspark_config_with_its_own_expert_count_updates_every_router():
     """The real DSpark layout: four backbone experts, two per DSpark stage."""
     from tests.models.compare import eager_ops_config
@@ -408,7 +427,15 @@ def test_dspark_config_with_its_own_expert_count_updates_every_router():
 
 def _distributed_expert_bias_worker() -> None:
     rank = dist.get_rank()
-    device = torch.device(f"{get_device_type()}:{rank}") if dist.get_backend() != "gloo" else torch.device("cpu")
+    device_type = get_device_type()
+    if device_type != "cpu" and get_torch_device().is_available():
+        expected_backend = get_dist_comm_backend()
+        assert dist.get_backend() == expected_backend, (
+            f"expected accelerator collective backend {expected_backend!r}, got {dist.get_backend()!r}"
+        )
+        device = torch.device(f"{device_type}:{rank}")
+    else:
+        device = torch.device("cpu")
 
     model = nn.Module()
     model.router_a = ToyRouter(4)
@@ -417,6 +444,7 @@ def _distributed_expert_bias_worker() -> None:
 
     updater = ExpertBiasUpdater(update_rate=0.1)
     assert updater.attach(model) == 2
+    assert updater._counts is not None and updater._counts.device == device
 
     # Step 1: opposing local loads on router_a (rank 0 heavier on 0,1; rank 1 only on 2,3 -> global [6, 6, 2, 2]).
     # On router_b, only rank 0 sees traffic while rank 1 skips forward completely -> global [4, 0, 0, 0].
