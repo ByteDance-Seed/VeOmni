@@ -940,20 +940,28 @@ class AcceleratorConfig:
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
 
+    @property
+    def resolved_extra_parallel(self) -> tuple[list[str], list[int], list[bool]]:
+        """Effective ``(names, sizes, placement_innermost)`` with ``ep`` folded in on demand.
+
+        Keeps the raw dataclass fields untouched so ``asdict()`` and per-module overlay
+        merging never inherit a pre-folded ``"ep"`` entry that shadows ``ep_size``.
+        """
+        names = list(self.extra_parallel_names)
+        sizes = list(self.extra_parallel_sizes)
+        innermost = list(self.extra_parallel_placement_innermost)
+        if "ep" not in names:
+            names.append("ep")
+            sizes.append(self.ep_size)
+            innermost.append(self.ep_outside)
+        return names, sizes, innermost
+
     def __post_init__(self):
         from ..distributed.hccl_options import validate_ep_hccl_options
 
         validate_ep_hccl_options(self.npu_ep_hccl_buffer_mib, self.npu_ep_hccl_expansion_mode)
-        # although expert parallel and extra parallel are both provided in the arguments,
-        # the implementation is configuring extra parallelism to include expert parallelism.
-        # Guarded so re-instantiating from a saved config (asdict round-trip) does not
-        # append a second "ep" dimension.
-        if "ep" not in self.extra_parallel_names:
-            self.extra_parallel_sizes.append(self.ep_size)
-            self.extra_parallel_names.append("ep")
-            self.extra_parallel_placement_innermost.append(self.ep_outside)
-
-        ep_size = dict(zip(self.extra_parallel_names, self.extra_parallel_sizes)).get("ep", 1)
+        ep_names, ep_sizes, _ = self.resolved_extra_parallel
+        ep_size = dict(zip(ep_names, ep_sizes)).get("ep", 1)
         if (self.npu_ep_hccl_buffer_mib is not None or self.npu_ep_hccl_expansion_mode is not None) and ep_size <= 1:
             raise ValueError("HCCL expert-parallel options require an enabled ep dimension")
 
@@ -2092,7 +2100,8 @@ class ModelArguments(BaseModelArguments):
             "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
         )
 
-        extra_parallel_sizes = dict(zip(self.accelerator.extra_parallel_names, self.accelerator.extra_parallel_sizes))
+        ep_names, ep_sizes, _ = self.accelerator.resolved_extra_parallel
+        extra_parallel_sizes = dict(zip(ep_names, ep_sizes))
         ple_size = extra_parallel_sizes.get("ple", 1)
         if ple_size > 1:
             effective_fsdp_shard_size = (

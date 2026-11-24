@@ -44,10 +44,12 @@ def test_config_accepts_hccl_options_for_effective_ep_and_default_without_ep(mon
     monkeypatch.setenv("WORLD_SIZE", "2")
     assert AcceleratorConfig(ep_size=1).ep_size == 1
     config = AcceleratorConfig(ep_size=2, npu_ep_hccl_buffer_mib=32)
-    assert dict(zip(config.extra_parallel_names, config.extra_parallel_sizes))["ep"] == 2
+    ep_names, ep_sizes, _ = config.resolved_extra_parallel
+    assert dict(zip(ep_names, ep_sizes))["ep"] == 2
     roundtrip = _instantiate_recursive(AcceleratorConfig, asdict(config))
-    assert roundtrip.extra_parallel_names.count("ep") == 1
-    assert dict(zip(roundtrip.extra_parallel_names, roundtrip.extra_parallel_sizes))["ep"] == 2
+    rt_names, rt_sizes, _ = roundtrip.resolved_extra_parallel
+    assert rt_names.count("ep") == 1
+    assert dict(zip(rt_names, rt_sizes))["ep"] == 2
     assert isinstance(roundtrip.fsdp_config.mixed_precision, MixedPrecisionConfig)
     restored = AcceleratorConfig(
         ep_size=1,
@@ -56,7 +58,8 @@ def test_config_accepts_hccl_options_for_effective_ep_and_default_without_ep(mon
         extra_parallel_placement_innermost=[False],
         npu_ep_hccl_expansion_mode="host",
     )
-    assert dict(zip(restored.extra_parallel_names, restored.extra_parallel_sizes))["ep"] == 2
+    res_names, res_sizes, _ = restored.resolved_extra_parallel
+    assert dict(zip(res_names, res_sizes))["ep"] == 2
 
 
 @pytest.mark.parametrize("size,mode", [(0, None), (-1, None), (True, None), (1.5, None), (None, "invalid")])

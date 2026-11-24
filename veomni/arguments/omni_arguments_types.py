@@ -477,20 +477,10 @@ def _resolve_model_path(
 
 
 def _module_base(global_dict: dict[str, Any]) -> dict[str, Any]:
-    """Prepare the inherited global config dict before merging a per-module overlay.
-
-    Strips the auto-folded ``"ep"`` entry from ``extra_parallel_*`` while keeping
-    ``ep_size`` / ``ep_outside``, so per-module ``ep_size`` overrides re-fold cleanly.
-    """
     acc = global_dict.get("accelerator")
     if isinstance(acc, dict):
         acc["dp_replicate_size"] = -1
         acc["dp_shard_size"] = -1
-        names = acc.get("extra_parallel_names") or []
-        if "ep" in names:
-            i = names.index("ep")
-            for key in ("extra_parallel_names", "extra_parallel_sizes", "extra_parallel_placement_innermost"):
-                acc[key] = [v for j, v in enumerate(acc.get(key) or ()) if j != i]
     return global_dict
 
 
