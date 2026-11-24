@@ -14,12 +14,13 @@
 
 from .chat_template import build_chat_template
 from .data_collator import (
+    DiffusionGemmaCollator,
     MainCollator,
     MakeMicroBatchCollator,
     UnpackDataCollator,
 )
 from .data_loader import DistributedDataloader, build_dataloader
-from .data_transform import DATA_TRANSFORM_REGISTRY, build_data_transform
+from .data_transform import DATA_TRANSFORM_REGISTRY, DiffusionGemmaCorruptionEpoch, build_data_transform
 from .dataset import build_dataset
 from .dummy_dataset import build_dummy_dataset
 
@@ -30,6 +31,8 @@ __all__ = [
     "build_data_transform",
     "build_dummy_dataset",
     "DATA_TRANSFORM_REGISTRY",
+    "DiffusionGemmaCollator",
+    "DiffusionGemmaCorruptionEpoch",
     "MainCollator",
     "MakeMicroBatchCollator",
     "UnpackDataCollator",

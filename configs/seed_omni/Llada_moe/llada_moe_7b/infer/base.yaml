@@ -1,0 +1,41 @@
+# LLaDA-MoE-7B-A1B inference: low-confidence remasking, one module.
+#
+#   bash train.sh tasks/omni/infer_omni.py configs/seed_omni/Llada_moe/llada_moe_7b/infer/base.yaml \
+#     --model.model_path /path/to/LLaDA-MoE-7B-A1B-Instruct-VeOmni \
+#     --infer.prompt "The capital of France is"
+#
+# `gen_length` is the answer budget and `diffusion_steps` the denoising passes
+# inside the module; `max_new_tokens` bounds FSM passes and must be at least
+# `diffusion_steps` plus the pass that lays out the prompt.
+model:
+  model_path: LLaDA-MoE-7B-A1B-Instruct-VeOmni
+  model_config:
+    modules: configs/seed_omni/Llada_moe/llada_moe_7b/infer/modules_infer.yaml
+    chat_template: llada_moe
+    max_seq_len: 2048
+    text_keys: messages
+    infer_graph:
+      infer_gen: configs/seed_omni/Llada_moe/llada_moe_7b/infer/graph_infer_gen.yaml
+    infer_type: infer_gen
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_triton
+
+# `OmniArguments` requires a data block even for a generation-only launch;
+# nothing under it is read on this path.
+data:
+  data_type: seedomni
+  train_path: /mnt/hdfs/user_dir/text_diff/data/sudoku/train.jsonl
+  datasets_type: mapping
+  source_name: tulu-3-sft-mixture
+  max_seq_len: 2048
+  dataloader:
+    type: native
+    num_workers: 0
+
+infer:
+  output_dir: /tmp/omni_llada_moe_infer
+  generation_kwargs:
+    gen_length: 128
+    diffusion_steps: 64
+    max_new_tokens: 128

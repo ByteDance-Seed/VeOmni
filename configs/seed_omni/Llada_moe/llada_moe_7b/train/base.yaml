@@ -1,0 +1,88 @@
+# LLaDA-MoE-7B-A1B-Instruct masked-diffusion SFT as a single SeedOmni module.
+#
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Llada_moe/llada_moe_7b/train/base.yaml \
+#     --model.model_path /path/to/LLaDA-MoE-7B-A1B-Instruct-VeOmni \
+#     --data.train_path /path/to/train.jsonl
+#
+# The checkpoint needs the Qwen3-MoE-schema config the non-Omni path also uses
+# (weight keys unchanged; per-expert tensors are fused at load time):
+#   python scripts/convert_lladamoe_to_veomni.py --src LLaDA-MoE-7B-A1B-Instruct \
+#     --dst LLaDA-MoE-7B-A1B-Instruct-VeOmni
+#
+# Same objective as the dense LLaDA module: the CPU preprocessor draws the
+# corruption (`t ~ U(1e-3, 1)`, weights `1/(t*N)`) and the module divides the
+# local sum by the step's global sample count. The router load-balancing term is
+# added *after* that division, because folding a per-token mean into a
+# sample-mean would rescale it with the batch composition.
+model:
+  model_path: LLaDA-MoE-7B-A1B-Instruct-VeOmni
+  model_config:
+    modules: configs/seed_omni/Llada_moe/llada_moe_7b/train/modules_train.yaml
+    train_graph: configs/seed_omni/Llada_moe/llada_moe_7b/train/graph_train.yaml
+    # Fed to `LladaMoeOmniPreprocessor.from_pretrained`. `mask_token_id` is read
+    # from the checkpoint's config.json so the worker needs no live model.
+    chat_template: llada_moe
+    max_seq_len: 2048
+    text_keys: messages
+    mask_eps: 1.0e-3
+    # Required by `OmniArguments` even for a training-only launch.
+    infer_graph:
+      infer_gen: configs/seed_omni/Llada_moe/llada_moe_7b/infer/graph_infer_gen.yaml
+    infer_type: infer_gen
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_triton
+
+  accelerator:
+    ulysses_size: 1  # Ulysses SP; must divide num_attention_heads (16)
+    ep_size: 1  # Expert Parallel; raise to shard the fused experts over ep ranks
+    init_device: meta
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_decay_style: cosine
+    weight_decay: 0.1
+    max_grad_norm: 1.0
+
+data:
+  data_type: seedomni
+  train_path: /mnt/hdfs/user_dir/text_diff/data/sudoku/train.jsonl
+  datasets_type: mapping
+  source_name: tulu-3-sft-mixture
+  max_seq_len: 2048
+  dataloader:
+    type: native
+    num_workers: 0
+    drop_last: true
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+  max_steps: 3
+
+  checkpoint:
+    output_dir: /mnt/hdfs/user_dir/text_diff/dllm_trainer/ckpt/omni_llada_moe_7b
+    save_steps: 1000
+    save_epochs: 0
+    save_hf_weights: false
+
+  wandb:
+    enable: true
+    project: VeOmni_dLLM_omni
+    name: llada_moe_7b_omni
+
+infer:
+  output_dir: /mnt/hdfs/user_dir/text_diff/dllm_trainer/ckpt/omni_llada_moe_7b_infer

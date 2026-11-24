@@ -1,0 +1,54 @@
+# DiffusionGemma-26B-A4B inference: block diffusion, one module.
+#
+#   bash train.sh tasks/omni/infer_omni.py configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/infer/base.yaml \
+#     --model.model_path /path/to/diffusiongemma-26B-A4B-it \
+#     --infer.prompt "What is the capital of France? Answer in one sentence."
+#
+# The sampler's budgets live under `infer.generation_kwargs`, not the trainer's:
+# `num_steps` caps denoising steps per canvas, `entropy_budget` is the nats one step
+# may commit, `stop_threshold` the mean entropy that ends a canvas, and `max_blocks`
+# how many canvases to try before giving up on an end-of-turn token.
+model:
+  model_path: diffusiongemma-26B-A4B-it
+  model_config:
+    modules: configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/infer/modules_infer.yaml
+    chat_template: tokenizer_generation_prompt
+    max_seq_len: 1024
+    text_keys: messages
+    # Pinned to one device on purpose. DiffusionGemma shares every transformer
+    # weight between its encoder and decoder, and accelerate's
+    # `infer_auto_device_map` cannot size such a model: it looks up each tied
+    # parameter's owning module and raises `IndexError` when none matches. Naming
+    # the device takes the single-device branch, which needs no sizing.
+    device_map: cuda:0
+    # Stated rather than inferred: the checkpoint is bf16, and an fp32 load would
+    # double it to ~98GB and OOM on a card with ~71GB usable. Same dtype the
+    # reference sampler sets explicitly.
+    torch_dtype: bfloat16
+    infer_graph:
+      infer_gen: configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/infer/graph_infer_gen.yaml
+    infer_type: infer_gen
+  ops_implementation:
+    attn_implementation: sdpa
+
+# `OmniArguments` requires a data block even for a generation-only launch;
+# nothing under it is read on this path.
+data:
+  data_type: seedomni
+  train_path: /mnt/hdfs/user_dir/text_diff/data/sudoku/train.jsonl
+  datasets_type: mapping
+  source_name: tulu-3-sft-mixture
+  max_seq_len: 1024
+  dataloader:
+    type: native
+    num_workers: 0
+
+infer:
+  output_dir: /tmp/omni_diffusion_gemma_infer
+  generation_kwargs:
+    num_steps: 48
+    entropy_budget: 0.1
+    stop_threshold: 0.005
+    max_blocks: 4
+    # One FSM pass; the sampler's own budgets do the rest.
+    max_new_tokens: 4

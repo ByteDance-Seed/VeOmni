@@ -1,0 +1,9 @@
+# Per-module inference overrides for LLaDA-MoE-7B-A1B (SeedOmni).
+llada_moe_omni:
+  model_path: llada_moe_omni
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: fused_triton
+  accelerator:
+    gradient_checkpointing:
+      enable: false

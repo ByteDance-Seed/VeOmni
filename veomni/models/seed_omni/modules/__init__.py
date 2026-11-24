@@ -117,11 +117,28 @@ def read_model_type(model_path: str) -> str:
     return model_type
 
 
-# Side-effect only: attach @register factories under bagel/, base/, cosmos3/, fake_model/, janus/,
-# qwen3/, qwen3_moe/, qwen3vl/, text_encoder/. Imported after ``read_hf_model_type`` so the
-# convert_registry ↔ modules cycle resolves: each family's ``convert_model`` imports
-# ``convert_registry``, whose ``convert_checkpoint`` reads ``read_hf_model_type`` back from this module.
-from . import bagel, base, cosmos3, fake_model, janus, qwen3, qwen3_moe, qwen3vl, text_encoder  # noqa: F401  E402
+# Side-effect only: attach @register factories under bagel/, base/, cosmos3/, fake_model/,
+# diffusion_gemma/, janus/, llada/, llada_moe/, llada_v/, llada2_uni/, qwen3/, qwen3_moe/,
+# qwen3vl/, and text_encoder/. Imported after
+# ``read_hf_model_type`` so the convert_registry ↔ modules cycle resolves: each family's
+# ``convert_model`` imports ``convert_registry``, whose ``convert_checkpoint`` reads
+# ``read_hf_model_type`` back from this module.
+from . import (
+    bagel,
+    base,
+    cosmos3,
+    diffusion_gemma,
+    fake_model,
+    janus,
+    llada,
+    llada2_uni,
+    llada_moe,
+    llada_v,
+    qwen3,
+    qwen3_moe,
+    qwen3vl,
+    text_encoder,
+)  # noqa: F401  E402
 
 
 __all__ = [

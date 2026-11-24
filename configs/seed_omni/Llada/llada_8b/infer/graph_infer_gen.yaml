@@ -1,0 +1,23 @@
+# LLaDA-8B generation FSM: low-confidence remasking over a fully masked span.
+#
+# LLaDA is a mask predictor, so a pass is not a token: `llada_omni.generate`
+# either lays out the prompt plus a masked answer span (first pass, no logits in
+# the ctx) or commits the most confident masked positions and re-encodes the row
+# (`llada_logits` in the ctx). The `default` transition loops back until the
+# module emits `text_done`, which is when the span is fully decoded or an EOS
+# closed it.
+#
+# Two budgets apply, and they are not interchangeable: `diffusion_steps` bounds
+# denoising passes inside the module, while `max_new_tokens` bounds FSM steps
+# overall (the framework's own cut). Leave headroom in the latter -- an
+# exhausted FSM calls `finalize`, which emits a truncated answer rather than
+# nothing, but it is truncated.
+initial: diffuse
+
+states:
+  diffuse:
+    body:
+      - { from: llada_omni, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: done }
+      - { condition: { type: default }, next_state: diffuse }

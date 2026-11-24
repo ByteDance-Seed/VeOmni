@@ -1,0 +1,85 @@
+# LLaDA-8B-Instruct masked-diffusion SFT as a single SeedOmni module.
+#
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Llada/llada_8b/train/base.yaml \
+#     --model.model_path /path/to/LLaDA-8B-Instruct-veomni \
+#     --data.train_path /path/to/train.jsonl
+#
+# The checkpoint must already be in the Llama key layout (a pure key rename):
+#   python scripts/convert_llada_to_veomni.py --src LLaDA-8B-Instruct --dst LLaDA-8B-Instruct-veomni
+#
+# LLaDA is a mask predictor, so the graph is a single node: the CPU preprocessor
+# draws the corruption (`t ~ U(1e-3, 1)` per sample, weights `1/(t*N)`) and
+# `LladaOmniTrainingMixin` divides the local sum by the step's sample count --
+# the `Eq. 13` normalization the objective defines.
+model:
+  model_path: LLaDA-8B-Instruct-veomni
+  model_config:
+    modules: configs/seed_omni/Llada/llada_8b/train/modules_train.yaml
+    train_graph: configs/seed_omni/Llada/llada_8b/train/graph_train.yaml
+    # Fed to `LladaOmniPreprocessor.from_pretrained`, which needs the template and
+    # the sequence budget at CPU time; `mask_token_id` is read from the
+    # checkpoint's config.json so the worker needs no live model.
+    chat_template: llada
+    max_seq_len: 2048
+    text_keys: messages
+    mask_eps: 1.0e-3
+    # Denoising FSM for `tasks/omni/infer_omni.py`: the mask predictor starts from a
+    # fully masked answer span and commits the most confident positions per pass.
+    infer_graph:
+      infer_gen: configs/seed_omni/Llada/llada_8b/infer/graph_infer_gen.yaml
+    infer_type: infer_gen
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+  accelerator:
+    ulysses_size: 1  # Ulysses SP; must divide num_attention_heads (32)
+    init_device: meta
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+
+  optimizer:
+    type: adamw
+    lr: 2.5e-5
+    lr_decay_style: cosine
+    weight_decay: 0.1
+    max_grad_norm: 1.0
+
+data:
+  data_type: seedomni
+  train_path: /mnt/hdfs/user_dir/text_diff/data/sudoku/train.jsonl
+  datasets_type: mapping
+  source_name: tulu-3-sft-mixture
+  max_seq_len: 2048
+  dataloader:
+    type: native
+    num_workers: 0
+    drop_last: true
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+  max_steps: 3
+
+  checkpoint:
+    output_dir: /mnt/hdfs/user_dir/text_diff/dllm_trainer/ckpt/omni_llada8b
+    save_steps: 1000
+    save_epochs: 0
+    save_hf_weights: false
+
+  wandb:
+    enable: true
+    project: VeOmni_dLLM_omni
+    name: llada8b_omni
+
+infer:
+  output_dir: /mnt/hdfs/user_dir/text_diff/dllm_trainer/ckpt/omni_llada8b_infer

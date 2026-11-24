@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import torch
 from transformers import PretrainedConfig
 
-from ..distributed.clip_grad_norm import veomni_clip_grad_norm
+from ..distributed.clip_grad_norm import veomni_clip_grad_norm, veomni_compute_grad_norm
 from ..distributed.parallel_state import (
     get_parallel_state_by_name,
     use_parallel_state,
@@ -636,6 +636,11 @@ class VeOmniModelRuntime:
             max_norm = self.args.optimizer.max_grad_norm
         with use_parallel_state(self.model_name):
             return veomni_clip_grad_norm(self.model, max_norm)
+
+    def compute_grad_norm(self, norm_type: float = 2.0) -> float:
+        """This model's global gradient norm, measured without clipping."""
+        with use_parallel_state(self.model_name):
+            return veomni_compute_grad_norm(self.model, norm_type)
 
     def build_checkpoint(self) -> None:
         """Attach the component that checkpoints this model.

@@ -1,0 +1,91 @@
+# LLaDA-V (LLaDA-8B + SigLIP) masked-diffusion SFT as a single SeedOmni module.
+#
+#   bash train.sh tasks/omni/train_omni.py configs/seed_omni/Llada_v/llada_v_8b/train/base.yaml \
+#     --model.model_path /path/to/LLaDA-V-VeOmni \
+#     --data.train_path /path/to/train.jsonl
+#
+# Convert first (config rewrite, symlinked shards, SigLIP preprocessor config):
+#   python scripts/convert_lladav_to_veomni.py --src LLaDA-V --dst LLaDA-V-VeOmni
+#
+# Each image is one 384px tile of `image_seq_len` slots (27 * 28 = 756) that are
+# never masked; only the answer text is. The upstream AnyRes tiling is not
+# implemented -- the converter says so too -- so a sample that upstream would
+# split into up to four tiles trains on a single one here.
+model:
+  model_path: LLaDA-V-VeOmni
+  model_config:
+    modules: configs/seed_omni/Llada_v/llada_v_8b/train/modules_train.yaml
+    train_graph: configs/seed_omni/Llada_v/llada_v_8b/train/graph_train.yaml
+    # Fed to `LladaVOmniPreprocessor.from_pretrained`. `mask_token_id` and
+    # `image_seq_len` are read from the checkpoint's config.json so the worker
+    # needs no live model; the template stays on the tokenizer even though the
+    # checkpoint ships an image processor.
+    chat_template: llada
+    max_seq_len: 2048
+    text_keys: messages
+    mask_eps: 1.0e-3
+    # Denoising FSM for `tasks/omni/infer_omni.py`: the prompt carries image slots,
+    # which the module scatters into the embeddings on every denoising pass.
+    infer_graph:
+      infer_gen: configs/seed_omni/Llada_v/llada_v_8b/infer/graph_infer_gen.yaml
+    infer_type: infer_gen
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+  accelerator:
+    ulysses_size: 1  # Ulysses SP; must divide num_attention_heads (32)
+    init_device: meta
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+
+  optimizer:
+    type: adamw
+    lr: 2.0e-5
+    lr_decay_style: cosine
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+
+data:
+  data_type: seedomni
+  train_path: /tmp/llada_v_data/train.jsonl
+  datasets_type: mapping
+  # `source_name` is the key of a `SEED_OMNI_PREPROCESSOR_REGISTRY` entry, not a
+  # free-form label: it selects how the conversation and its media are split into
+  # carrier items. `sharegpt4v_sft` is the image-text layout -- it reads both
+  # `role`/`content` and `from`/`value`, lifts `<image>` out of the text turn into
+  # an image turn, and pairs those turns with `example["images"]` in order.
+  source_name: sharegpt4v_sft
+  max_seq_len: 2048
+  dataloader:
+    type: native
+    num_workers: 0
+    drop_last: true
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 2
+  micro_batch_size: 1
+  dyn_bsz: false
+  max_steps: 5
+
+  checkpoint:
+    output_dir: /mnt/hdfs/user_dir/text_diff/dllm_trainer/ckpt/omni_llada_v_8b
+    save_steps: 1000
+    save_epochs: 0
+    save_hf_weights: false
+
+  wandb:
+    enable: true
+    project: VeOmni_dLLM_omni
+    name: llada_v_8b_omni
+
+infer:
+  output_dir: /mnt/hdfs/user_dir/text_diff/dllm_trainer/ckpt/omni_llada_v_8b_infer

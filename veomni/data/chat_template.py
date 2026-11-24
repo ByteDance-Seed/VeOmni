@@ -17,14 +17,14 @@ import json
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Sequence, Union
 
 import torch
 import torch.nn.functional as F
 
 from veomni.utils import logging
 
-from ..utils.constants import IGNORE_INDEX, TYPE2INDEX
+from ..utils.constants import IGNORE_INDEX, IMAGE_INPUT_INDEX, TYPE2INDEX
 from ..utils.registry import Registry
 
 
@@ -277,6 +277,471 @@ class Llama2Template(ChatTemplate):
             "{{ ' ' + content | trim + ' ' + eos_token }}"
             "{% endif %}"
             "{% endfor %}"
+        )
+
+
+@CHAT_TEMPLATE_REGISTRY.register("tokenizer_generation_prompt")
+class GenerationPromptTokenizerTemplate(ChatTemplate):
+    """Drives the tokenizer's own chat template, supervising only what follows the generation prompt.
+
+    Unlike ``tokenizer``, which supervises every token a message appends (the assistant
+    role header included), this supervises exactly what a model produces after being
+    given ``add_generation_prompt=True``, so the label span matches inference input ids.
+
+    Labels come from a prefix diff rather than from a ``{% generation %}`` block, since
+    most published templates do not mark one: encoding through turn ``k``'s generation
+    prompt and then through turn ``k`` itself brackets exactly that turn's tokens. The
+    supervised span deliberately includes the trailing turn terminator, so the model
+    learns to end its turn. This assumes each turn only appends to the last encoding,
+    which is checked rather than trusted -- a template that rewrites earlier turns (some
+    reorder thinking blocks once a later turn arrives) would otherwise silently shift the
+    label mask off the answer.
+    """
+
+    def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+        if self.tokenizer.chat_template is None:
+            raise ValueError(
+                "The tokenizer has no chat template of its own, so "
+                "`chat_template: tokenizer_generation_prompt` cannot be used. Pick one of the templates defined in veomni/data/chat_template.py instead."
+            )
+
+        input_ids = self._encode(messages)
+        labels = [IGNORE_INDEX] * len(input_ids)
+        for index, message in enumerate(messages):
+            loss_mask = message.get("loss_mask", 1 if message["role"] == "assistant" else 0)
+            if loss_mask != 1 or index == 0:
+                continue
+            prompt = self._encode(messages[:index], add_generation_prompt=True)
+            through_turn = self._encode(messages[: index + 1])
+            if input_ids[: len(through_turn)] != through_turn or through_turn[: len(prompt)] != prompt:
+                raise ValueError(
+                    f"Encoding the conversation through turn {index} is not a prefix of the full encoding, so the "
+                    "turn's token span cannot be recovered. The tokenizer's chat template is not append-only and "
+                    "this template class cannot mask its labels."
+                )
+            labels[len(prompt) : len(through_turn)] = input_ids[len(prompt) : len(through_turn)]
+
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": [1] * len(input_ids),
+            "labels": labels,
+        }
+        return {k: v[-max_seq_len:] for k, v in model_inputs.items()}
+
+    def _encode(self, messages: Sequence[Dict[str, str]], add_generation_prompt: bool = False) -> List[int]:
+        return self.tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=add_generation_prompt, return_dict=True
+        )["input_ids"]
+
+    def get_jinja_template(self) -> str:
+        return self.tokenizer.chat_template
+
+
+@CHAT_TEMPLATE_REGISTRY.register("gemma4_thinking")
+class Gemma4ThinkingTokenizerTemplate(GenerationPromptTokenizerTemplate):
+    """Render Gemma 4 reasoning fields into an append-only training transcript."""
+
+    _reasoning_guard = "thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls')"
+
+    def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
+        super().__init__(tokenizer)
+        template = tokenizer.chat_template
+        if template is None or template.count(self._reasoning_guard) != 1:
+            raise ValueError("Gemma 4 chat template does not contain the expected reasoning guard")
+        # The serving template hides reasoning from earlier context and only emits
+        # ``reasoning_content`` alongside tool calls. SFT must instead include the
+        # reasoning field for ordinary math answers. This private rendering copy is
+        # used only to build labels; ``save_pretrained`` retains the official template.
+        self._training_chat_template = template.replace(self._reasoning_guard, "thinking_text")
+
+    def _encode(self, messages: Sequence[Dict[str, str]], add_generation_prompt: bool = False) -> List[int]:
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            return_dict=True,
+            enable_thinking=True,
+            chat_template=self._training_chat_template,
+        )["input_ids"]
+
+
+@CHAT_TEMPLATE_REGISTRY.register("gemma4_no_thinking")
+class Gemma4NoThinkingTokenizerTemplate(GenerationPromptTokenizerTemplate):
+    """Match Gemma 4's no-thinking serving prompt while keeping SFT append-only.
+
+    The official template appends an empty thought channel to a generation prompt when
+    ``enable_thinking`` is false, but omits it when rendering an assistant turn that
+    already has content. Training needs the former to be an exact prefix of the latter
+    so label boundaries and inference input ids agree. This private rendering copy adds
+    that same empty channel before each newly opened model turn and suppresses stored
+    reasoning fields. ``get_jinja_template`` still exports the tokenizer's official
+    serving template.
+    """
+
+    _reasoning_guard = "thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls')"
+    _model_turn_anchor = """{%- if not continue_same_model_turn -%}
+        {{- '<|turn>' + role + '\\n' }}
+    {%- endif -%}"""
+    _model_turn_replacement = """{%- if not continue_same_model_turn -%}
+        {{- '<|turn>' + role + '\\n' }}
+        {%- if role == 'model' -%}
+            {{- '<|channel>thought\\n<channel|>' -}}
+        {%- endif -%}
+    {%- endif -%}"""
+
+    def __init__(self, tokenizer: "PreTrainedTokenizer") -> None:
+        super().__init__(tokenizer)
+        template = tokenizer.chat_template
+        if template is None or template.count(self._reasoning_guard) != 1:
+            raise ValueError("Gemma 4 chat template does not contain the expected reasoning guard")
+        if template.count(self._model_turn_anchor) != 1:
+            raise ValueError("Gemma 4 chat template does not contain the expected model-turn anchor")
+        self._training_chat_template = template.replace(self._reasoning_guard, "false").replace(
+            self._model_turn_anchor, self._model_turn_replacement
+        )
+
+    def _encode(self, messages: Sequence[Dict[str, str]], add_generation_prompt: bool = False) -> List[int]:
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            return_dict=True,
+            enable_thinking=False,
+            chat_template=self._training_chat_template,
+        )["input_ids"]
+
+
+@CHAT_TEMPLATE_REGISTRY.register("diffusion_gemma_sudoku_official")
+class DiffusionGemmaSudokuOfficialTemplate(ChatTemplate):
+    """Exact single-turn boundary used by the aligned NeMo Sudoku SFT."""
+
+    SYSTEM = (
+        "Solve the following Sudoku puzzle. Empty cells are represented by 0. "
+        "Output ONLY the solved puzzle immediately as a 9x9 grid of numbers separated by spaces. "
+        "Do not include ####, explanations, or any other text."
+    )
+
+    def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+        if [message.get("role") for message in messages] != ["system", "user", "assistant"]:
+            raise ValueError("The official Sudoku template requires exactly system, user, assistant turns")
+        if messages[0].get("content", "").strip() != self.SYSTEM:
+            raise ValueError("The Sudoku system instruction differs from the released SFT prompt")
+        prompt = (
+            f"<|turn>system\n{self.SYSTEM}<turn|>\n"
+            f"<|turn>user\n{messages[1]['content'].strip()}<turn|>\n"
+            "<|turn>model\n"
+        )
+        if self.tokenizer.bos_token_id is None:
+            raise ValueError("The official Sudoku template requires a BOS token id")
+        prompt_ids = [self.tokenizer.bos_token_id] + self.tokenizer.encode(prompt, add_special_tokens=False)
+        answer_ids = self.tokenizer.encode(messages[2]["content"].strip() + "<turn|>\n", add_special_tokens=False)
+        input_ids = prompt_ids + answer_ids
+        labels = [IGNORE_INDEX] * len(prompt_ids) + answer_ids
+        model_inputs = {"input_ids": input_ids, "attention_mask": [1] * len(input_ids), "labels": labels}
+        return {key: value[-max_seq_len:] for key, value in model_inputs.items()}
+
+    def get_jinja_template(self) -> str:
+        template = (
+            "{% if messages | length not in [2, 3] %}"
+            "{{ raise_exception('The aligned Sudoku template requires one system/user turn and an optional answer') }}"
+            "{% endif %}"
+            "{% if messages[0]['role'] != 'system' or messages[0]['content'] | trim != '__EXPECTED_SYSTEM__' %}"
+            "{{ raise_exception('The Sudoku system instruction differs from the aligned NeMo prompt') }}"
+            "{% endif %}"
+            "{% if messages[1]['role'] != 'user' %}"
+            "{{ raise_exception('The aligned Sudoku template requires a user puzzle after the system turn') }}"
+            "{% endif %}"
+            "{% if messages | length == 3 and messages[2]['role'] != 'assistant' %}"
+            "{{ raise_exception('The aligned Sudoku template accepts only an assistant answer as the third turn') }}"
+            "{% endif %}"
+            "{{ bos_token }}"
+            "{% for message in messages %}"
+            "{% if message['role'] == 'system' %}<|turn>system\n"
+            "{{ message['content'] | trim }}<turn|>\n"
+            "{% elif message['role'] == 'user' %}<|turn>user\n"
+            "{{ message['content'] | trim }}<turn|>\n"
+            "{% elif message['role'] == 'assistant' %}<|turn>model\n"
+            "{{ message['content'] | trim }}<turn|>\n"
+            "{% else %}{{ raise_exception('Unsupported role: ' + message['role']) }}{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}<|turn>model\n{% endif %}"
+        )
+        return template.replace("__EXPECTED_SYSTEM__", self.SYSTEM)
+
+
+def _encode_segments(
+    tokenizer: "PreTrainedTokenizer", segments: Sequence[tuple], max_seq_len: int
+) -> Dict[str, List[int]]:
+    """Tokenize ``(text, is_target)`` segments one by one and concatenate them.
+
+    The LLaDA checkpoints were fine-tuned on exactly this segmentation (header,
+    content and terminator encoded separately), so encoding a turn in one go could
+    merge BPE pieces across a boundary the model never saw merged.
+    """
+    input_ids, labels = [], []
+    for text, is_target in segments:
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        input_ids += ids
+        labels += ids if is_target else [IGNORE_INDEX] * len(ids)
+    model_inputs = {"input_ids": input_ids, "attention_mask": [1] * len(input_ids), "labels": labels}
+    return {k: v[-max_seq_len:] for k, v in model_inputs.items()}
+
+
+def _is_target(message: Dict[str, str]) -> bool:
+    return message.get("loss_mask", 1 if message["role"] == "assistant" else 0) == 1
+
+
+@CHAT_TEMPLATE_REGISTRY.register("llada")
+class LladaTemplate(ChatTemplate):
+    """LLaDA-8B-Instruct / LLaDA-V: Llama-3 headers, BOS on the first message only.
+
+    ``{bos}<|start_header_id|>{role}<|end_header_id|>\\n\\n{content}<|eot_id|>...``; an
+    answer's content and its closing ``<|eot_id|>`` are the loss targets.
+    """
+
+    start_header = "<|start_header_id|>"
+    end_header = "<|end_header_id|>"
+    eot = "<|eot_id|>"
+
+    def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+        segments = []
+        for index, message in enumerate(messages):
+            header = self.start_header + message["role"] + self.end_header + "\n\n"
+            if index == 0:
+                header = self.tokenizer.bos_token + header
+            target = _is_target(message)
+            segments += [(header, False), (str(message["content"]).strip(), target), (self.eot, target)]
+        return _encode_segments(self.tokenizer, segments, max_seq_len)
+
+    def encode_multimodal_messages(
+        self, messages: Sequence[Dict[str, Any]], image_seq_len: int
+    ) -> Dict[str, List[int]]:
+        """LLaDA-V: messages whose content is a list of ``text`` / ``image`` parts.
+
+        Each image becomes ``image_seq_len`` ``IMAGE_INPUT_INDEX`` slots, and text that
+        follows an image starts on a new line (LLaVA's ``<image>\\n{question}``). A message's
+        content is trimmed at its two ends only, as the checkpoint's template trims the
+        string it was rendered from. Nothing is truncated: cutting an image span would
+        leave pixels without their slots, so the caller decides what to do with an
+        over-long sample.
+        """
+        input_ids, labels = [], []
+
+        def add_text(text: str, is_target: bool) -> None:
+            ids = self.tokenizer.encode(text, add_special_tokens=False)
+            input_ids.extend(ids)
+            labels.extend(ids if is_target else [IGNORE_INDEX] * len(ids))
+
+        for index, message in enumerate(messages):
+            header = self.start_header + message["role"] + self.end_header + "\n\n"
+            if index == 0:
+                header = self.tokenizer.bos_token + header
+            add_text(header, False)
+            target = _is_target(message)
+            parts = message["content"]
+            if not isinstance(parts, list):
+                parts = [{"type": "text", "text": str(parts)}]
+            after_image = False
+            for part_index, part in enumerate(parts):
+                if part["type"] == "image":
+                    if target:
+                        raise ValueError("LLaDA-V supervises text only; an image cannot be part of an answer.")
+                    input_ids.extend([IMAGE_INPUT_INDEX] * image_seq_len)
+                    labels.extend([IGNORE_INDEX] * image_seq_len)
+                    after_image = True
+                    continue
+                text = str(part["text"])
+                if part_index == 0:
+                    text = text.lstrip()
+                if part_index == len(parts) - 1:
+                    text = text.rstrip()
+                if after_image and not text.startswith("\n"):
+                    text = "\n" + text
+                if text:
+                    add_text(text, target)
+                after_image = False
+            add_text(self.eot, target)
+        return {"input_ids": input_ids, "attention_mask": [1] * len(input_ids), "labels": labels}
+
+    def get_jinja_template(self) -> str:
+        if self.tokenizer.chat_template is not None:
+            return self.tokenizer.chat_template
+        return (
+            "{% for message in messages %}"
+            "{% if loop.index0 == 0 %}{{ bos_token }}{% endif %}"
+            "{{ '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n' + message['content'] | trim + '<|eot_id|>' }}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% endif %}"
+        )
+
+
+@CHAT_TEMPLATE_REGISTRY.register("llada_moe")
+class LladaMoeTemplate(ChatTemplate):
+    """LLaDA-MoE-7B-A1B-Instruct: Bailing role markers, no BOS, text-only SFT subset.
+
+    ``<role>SYSTEM</role>{system\\n?}detailed thinking off<|role_end|><role>HUMAN</role>{q}<|role_end|>``
+    ``<role>ASSISTANT</role>{a}<|role_end|>``, as the checkpoint's own template renders it
+    without tools or reasoning. A leading system message folds into the always-present
+    preamble, and an answer's content plus its ``<|role_end|>`` is the loss target.
+    """
+
+    system_prefix = "<role>SYSTEM</role>"
+    human_prefix = "<role>HUMAN</role>"
+    assistant_prefix = "<role>ASSISTANT</role>"
+    role_end = "<|role_end|>"
+    thinking = "detailed thinking off"
+
+    def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+        body = list(messages)
+        system_text = ""
+        if body and body[0]["role"] == "system":
+            system_text = str(body[0]["content"]) + "\n"
+            body = body[1:]
+        segments = [(self.system_prefix + system_text + self.thinking + self.role_end, False)]
+        for message in body:
+            if message["role"] == "assistant":
+                segments += [
+                    (self.assistant_prefix, False),
+                    (str(message["content"]) + self.role_end, _is_target(message)),
+                ]
+            else:
+                prefix = self.system_prefix if message["role"] == "system" else self.human_prefix
+                segments.append((prefix + str(message["content"]) + self.role_end, False))
+        return _encode_segments(self.tokenizer, segments, max_seq_len)
+
+    def get_jinja_template(self) -> str:
+        if self.tokenizer.chat_template is not None:
+            return self.tokenizer.chat_template
+        return (
+            "{% set ns = namespace(system='') %}"
+            "{% if messages and messages[0]['role'] == 'system' %}{% set ns.system = messages[0]['content'] + '\n' %}"
+            "{% set body = messages[1:] %}{% else %}{% set body = messages %}{% endif %}"
+            "{{ '<role>SYSTEM</role>' + ns.system + 'detailed thinking off<|role_end|>' }}"
+            "{% for message in body %}"
+            "{% if message['role'] == 'assistant' %}{{ '<role>ASSISTANT</role>' + message['content'] + '<|role_end|>' }}"
+            "{% elif message['role'] == 'system' %}{{ '<role>SYSTEM</role>' + message['content'] + '<|role_end|>' }}"
+            "{% else %}{{ '<role>HUMAN</role>' + message['content'] + '<|role_end|>' }}{% endif %}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<role>ASSISTANT</role>' }}{% endif %}"
+        )
+
+
+@CHAT_TEMPLATE_REGISTRY.register("llada2_uni")
+class Llada2UniTemplate(ChatTemplate):
+    """LLaDA2.0-Uni image understanding, laid out as the checkpoint's ``understand_image`` prompt.
+
+    ``<role>SYSTEM</role> {system} <role>HUMAN</role>{parts}<role>ASSISTANT</role>{a}<|endoftext|>``:
+    role tags are concatenated with no separator, the system text (default
+    ``understand_system``) is space-joined to the first turn's header, and consecutive
+    messages of one role share a header. An image is
+    ``<|image|><|reserved_token_{h}|><|reserved_token_{w}|><boi>`` + ``h*w`` VQ slots +
+    ``<|/image|>``, ``(h, w)`` being its patch grid. Each segment is tokenized on its own,
+    and an answer's text plus its ``<|endoftext|>`` are the loss targets.
+    """
+
+    role_open = "<role>"
+    role_close = "</role>"
+    eos = "<|endoftext|>"
+    understand_system = "You are a multimodal understanding assistant."
+    image_start = "<|image|>"
+    image_end = "<|/image|>"
+    boi = "<boi>"
+    role_names = {"system": "SYSTEM", "user": "HUMAN", "assistant": "ASSISTANT", "tool": "OBSERVATION"}
+
+    def grid_token_id(self, size: int) -> int | None:
+        """``<|reserved_token_{size}|>``'s id, or ``None`` when the vocabulary has no such token."""
+        token = f"<|reserved_token_{size}|>"
+        token_id = self.tokenizer.convert_tokens_to_ids(token)
+        if token_id is None or self.tokenizer.convert_ids_to_tokens(token_id) != token:
+            return None
+        return token_id
+
+    def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
+        tokenized = self.encode_multimodal_messages(messages, image_grids=[])
+        return {key: value[:max_seq_len] for key, value in tokenized.items()}
+
+    def encode_multimodal_messages(
+        self, messages: Sequence[Dict[str, Any]], image_grids: Sequence[tuple[int, int]]
+    ) -> Dict[str, List[int]]:
+        """Messages whose content is a string or a list of ``text`` / ``image`` parts.
+
+        ``image_grids`` holds each image's ``(h, w)`` in order of appearance; every grid
+        side must have a ``<|reserved_token_*|>`` (see `grid_token_id`). Nothing is
+        truncated, for the reason `LladaTemplate.encode_multimodal_messages` gives.
+        """
+        input_ids, labels = [], []
+
+        def add_ids(ids: List[int], is_target: bool) -> None:
+            input_ids.extend(ids)
+            labels.extend(ids if is_target else [IGNORE_INDEX] * len(ids))
+
+        def add_text(text: str, is_target: bool) -> None:
+            add_ids(self.tokenizer.encode(text, add_special_tokens=False), is_target)
+
+        def token_id(token: str) -> int:
+            idx = self.tokenizer.convert_tokens_to_ids(token)
+            if idx is None or self.tokenizer.convert_ids_to_tokens(idx) != token:
+                raise ValueError(f"The tokenizer has no `{token}` token; is this the LLaDA2.0-Uni tokenizer?")
+            return idx
+
+        system = "".join(str(m["content"]) for m in messages if m["role"] == "system") or self.understand_system
+        body = [m for m in messages if m["role"] != "system"]
+        grids = iter(image_grids)
+        previous_role, previous_target = None, False
+        for message in body:
+            role = message["role"]
+            target = _is_target(message)
+            if role != previous_role:
+                header = self.role_open + self.role_names.get(role, role.upper()) + self.role_close
+                if previous_role is None:
+                    header = f"{self.role_open}SYSTEM{self.role_close} {system} {header}"
+                if previous_role == "assistant":
+                    add_text(self.eos, previous_target)
+                add_text(header, False)
+                previous_role = role
+            previous_target = target
+            parts = message["content"]
+            if not isinstance(parts, list):
+                parts = [{"type": "text", "text": str(parts)}]
+            for part in parts:
+                if part["type"] != "image":
+                    add_text(str(part["text"]), target)
+                    continue
+                if target:
+                    raise ValueError("LLaDA2.0-Uni supervises text only; an image cannot be part of an answer.")
+                try:
+                    height, width = next(grids)
+                except StopIteration:
+                    raise ValueError("The conversation has more image parts than image grids.") from None
+                grid_ids = [self.grid_token_id(height), self.grid_token_id(width)]
+                if None in grid_ids:
+                    raise ValueError(f"No `<|reserved_token_*|>` encodes an image grid of {height}x{width}.")
+                add_ids([token_id(self.image_start), *grid_ids, token_id(self.boi)], False)
+                add_ids([IMAGE_INPUT_INDEX] * (height * width), False)
+                add_ids([token_id(self.image_end)], False)
+        if previous_role == "assistant":
+            add_text(self.eos, previous_target)
+        if next(grids, None) is not None:
+            raise ValueError("The conversation has fewer image parts than image grids.")
+        return {"input_ids": input_ids, "attention_mask": [1] * len(input_ids), "labels": labels}
+
+    def get_jinja_template(self) -> str:
+        return (
+            "{% set ns = namespace(system='', prev='') %}"
+            "{% for m in messages %}{% if m['role'] == 'system' %}{% set ns.system = ns.system + m['content'] %}"
+            "{% endif %}{% endfor %}"
+            "{% if not ns.system %}{% set ns.system = 'You are a multimodal understanding assistant.' %}{% endif %}"
+            "{% set roles = {'user': 'HUMAN', 'assistant': 'ASSISTANT', 'tool': 'OBSERVATION'} %}"
+            "{% for m in messages if m['role'] != 'system' %}"
+            "{% if m['role'] != ns.prev %}"
+            "{% if ns.prev == 'assistant' %}{{ '<|endoftext|>' }}{% endif %}"
+            "{% if not ns.prev %}{{ '<role>SYSTEM</role> ' + ns.system + ' ' }}{% endif %}"
+            "{{ '<role>' + roles.get(m['role'], m['role'] | upper) + '</role>' }}"
+            "{% set ns.prev = m['role'] %}{% endif %}"
+            "{{ m['content'] }}"
+            "{% endfor %}"
+            "{% if ns.prev == 'assistant' %}{{ '<|endoftext|>' }}{% endif %}"
+            "{% if add_generation_prompt %}{{ '<role>ASSISTANT</role>' }}{% endif %}"
         )
 
 

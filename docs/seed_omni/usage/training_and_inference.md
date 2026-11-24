@@ -288,6 +288,45 @@ for m in janus_siglip janus_vqvae janus_text_encoder janus_llama; do
 done
 ```
 
+### Diffusion language models (dLLM)
+
+The dLLM families generate by denoising rather than by decoding left to right, so
+their FSM shape and their budgets differ from a causal LM's. Four families are
+wired, in two groups:
+
+| Family | Algorithm | FSM shape | Budget that matters |
+|---|---|---|---|
+| `llada`, `llada_moe` | Mask predictor: start with the whole answer masked, commit the most confident positions each pass | one state looping on itself until `text_done` | `diffusion_steps` (passes inside the module) |
+| `llada_v` | Same, with image slots scattered into the prompt embeddings on **every** pass | same | same |
+| `diffusion_gemma` | Block diffusion: prefill the prompt into a KV cache, denoise a whole canvas, re-encode it back into the cache | one state, one pass, then `done` | `num_steps` and `max_blocks` (the sampler's) |
+
+Two budgets are easy to confuse. `infer.generation_kwargs.max_new_tokens` bounds
+**FSM steps**, not tokens, and an exhausted budget calls the module's `finalize`,
+which emits a truncated answer instead of none. For the mask predictors it must be
+at least `diffusion_steps` plus the pass that lays out the prompt; for
+`diffusion_gemma` a small value is enough because the sampler loops internally.
+
+```bash
+# Mask predictor (LLaDA-8B); llada_moe is the same with its own config path.
+python tasks/omni/infer_omni.py configs/seed_omni/Llada/llada_8b/infer/base.yaml \
+    --model.model_path /path/to/LLaDA-8B-Instruct-veomni \
+    --infer.prompt "What is the capital of France? Answer in one sentence."
+
+# Block diffusion; single process, because the sampler drives the KV cache itself.
+python tasks/omni/infer_omni.py configs/seed_omni/DiffusionGemma/diffusion_gemma_26b/infer/base.yaml \
+    --model.model_path /path/to/diffusiongemma-26B-A4B-it \
+    --infer.prompt "What is the capital of France? Answer in one sentence."
+```
+
+**`diffusion_gemma` cannot run under expert parallelism.** Its sampler
+(`block_autoregressive_generate`) reaches into `model.model.encoder` and owns the KV
+cache across canvases, which bypasses both the FSDP2 root pre-forward hook and the
+expert-parallel dispatch; under `ep_size > 1` the router's global expert index lands
+on a tensor holding only the local shard. Run it single-process with an explicit
+`device_map` — accelerate's `infer_auto_device_map` cannot size a model whose encoder
+and decoder share every transformer weight, and the shared weights make
+`to_empty(device=<accelerator>)` allocate them twice.
+
 ## 6. Debugging the graph
 
 ### Graph profiler

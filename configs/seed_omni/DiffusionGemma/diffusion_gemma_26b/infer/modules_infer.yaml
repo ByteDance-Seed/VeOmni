@@ -1,0 +1,17 @@
+# Per-module inference overrides for DiffusionGemma-26B-A4B (SeedOmni).
+#
+# Single-process eager, not FSDP2 + EP. The sampler
+# (`block_autoregressive_generate`) reaches into `model.model.encoder` and drives the
+# KV cache itself, which bypasses the FSDP2 root pre-forward hook and the expert
+# parallel dispatch -- under `ep_size: 8` the router's global expert index lands on a
+# tensor holding only the local shard (measured: `index 19 out of bounds for
+# dimension 0 with size 16`). Its own docstring states the same limit.
+diffusion_gemma_omni:
+  model_path: diffusion_gemma_omni
+  ops_implementation:
+    attn_implementation: sdpa
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: eager

@@ -38,12 +38,14 @@ veomni/
 │   │                   (build, freeze/LoRA, parallelize, optimizer,
 │   │                   lr-scheduler, grad clip, its own ParallelState)
 │   ├── checkpoint/     Weight I/O, tensor conversion, and ModelCheckpointManager
-│   ├── transformers/   Model classes/configs with instance-local VeomniOp handles
+│   ├── transformers/   Model classes/configs with instance-local VeomniOp handles.
+│   │                   `diffusion_gemma` and `llada*` are vendored modeling,
+│   │                   not patchgen `generated/` trees.
 │   ├── diffusers/      Diffusion model families
 │   ├── seed_omni/      SeedOmni V2 composed model: config/modeling/processing,
 │   │                   train/generation graphs, and per-module bases
 │   ├── utils/          Modeling-side attention helpers and non-VeomniOp MoE fallbacks
-│   └── loss_utils/     Model-facing CE, load-balancing, and chunked-loss policy
+│   └── loss_utils/     Model-facing CE, load-balancing, dLLM, and chunked-loss policy
 ├── optim/              Optimizer and LR scheduler construction
 │   ├── optimizer.py    build_optimizer() factory + MultiOptimizer wrapper.
 │   │                   For optimizer.type=="muon" splits params Muon vs AdamW
@@ -79,7 +81,9 @@ veomni/
 │   │                   (DeepSeek-V4 FP8/FP4 TileLang)
 │   └── kernels/        Registered per-op/variant eager and optimized rows
 │                       (a model-specific variant sits in a model-named
-│                        subpackage, e.g. kv_round/deepseek_v4)
+│                        subpackage, e.g. kv_round/deepseek_v4), plus the
+│                       dLLM/DiffusionGemma attention kernels (dllm_attention,
+│                       dllm_hole_attention, wide_varlen_attention)
 ├── lora/               LoRA / PEFT injection: linear + MoE-expert adapters,
 │                       DCP + HF-adapter save/load, target mapping
 ├── schedulers/         LR scheduler implementations (flow matching)
@@ -363,6 +367,7 @@ pytest workflow lines. See `.agents/knowledge/testing.md` before adding a test.
 | VLM SFT | `tasks/train_vlm.py` | `VLMTrainer` |
 | VLM RL | `tasks/train_vlm_rl.py` | `BaseRLTrainer` |
 | DiT | `tasks/train_dit.py` | `DitTrainer` |
+| dLLM (LLaDA family & DiffusionGemma) | `tasks/omni/train_omni.py` | `OmniTrainer` (one SeedOmni node per family) |
 | Inference (text) | `tasks/infer/infer_text.py` | N/A |
 | Inference (VLM) | `tasks/infer/infer_qwen2_vl.py` | N/A |
 

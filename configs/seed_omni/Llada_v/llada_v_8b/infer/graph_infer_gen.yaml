@@ -1,0 +1,15 @@
+# LLaDA-V generation FSM: the dense module's remasking loop over an image prompt.
+#
+# Same loop as `Llada/llada_8b/infer/graph_infer_gen.yaml`. The difference is that
+# the prompt carries image slots, which the module scatters into the embeddings on
+# its first pass (`pixel_values` / `image_mask` from the carrier); later passes
+# decode tokens against that already-embedded context.
+initial: diffuse
+
+states:
+  diffuse:
+    body:
+      - { from: llada_v_omni, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: done }
+      - { condition: { type: default }, next_state: diffuse }

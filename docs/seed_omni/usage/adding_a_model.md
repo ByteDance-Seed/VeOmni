@@ -274,8 +274,24 @@ Three rules make this work:
 
 - Return at most one scalar `_loss` per node, token-mean reduced over the
   module's own micro-batch.
+- Declare `loss_is_step_mean` when your loss is **not** a micro-batch mean.
+  `OmniTrainer` scales every backward by `1 / num_micro_steps` so per-micro-batch
+  means accumulate into the step mean. A module that instead normalizes by a
+  quantity spanning the whole accumulation window — a dLLM module dividing by the
+  step's global sample count, which it learns from `on_micro_batches_ready` —
+  already emits the step mean from every micro-batch; that division would scale
+  its gradient down by the micro-batch count. Such a module sets
+  `loss_is_step_mean = True` and the trainer skips it. The flag is graph-wide:
+  a graph mixing both conventions raises rather than mis-scaling one of them,
+  because the per-node losses are summed into one tensor before the backward.
 - Read inputs in `pre_forward`, write results in `post_forward`. Conversation
   nodes return `{"conversation_list": ...}` so the carrier flows on.
+- Read `on_step_context(seed, global_step, batch_invariant)` in any module whose
+  forward draws randomness per micro-batch. It fires once per optimizer step, before
+  the first `pre_forward`, and is where a per-micro-batch counter resets. Key the draw
+  on `(seed, global_step, micro_step)`, not on a generator carried across steps:
+  `_extra_state` persists only the default CPU RNG, so a carried generator rewinds to
+  step 0 on resume, and Triton compile/autotune pollutes both default generators.
 - Implement `dummy_inputs()` and `ModulePreprocessorBase.bind_dummy_inputs()` for
   any encoder whose modality can be absent from a sample, and inject `is_dummy=True`
   placeholders **per sample** in `preprocess_conversations(..., inference=False)` so

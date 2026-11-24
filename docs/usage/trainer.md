@@ -171,7 +171,7 @@ trainer._callbacks.append(MyCustomCallback(trainer))
 
 ## Customizing the Trainer
 
-To implement a specific training task (like VLM training), compose a `BaseTrainer` and override the step that differs. Model-bound differences belong on a `VeOmniModelRuntime` subclass, not on the trainer. [`VLMTrainer`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py) is the in-tree example.
+To implement a specific training task (like VLM training), compose a `BaseTrainer` and override the step that differs. Model-bound differences belong on a `VeOmniModelRuntime` subclass, not on the trainer. [`VLMTrainer`](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/trainer/vlm_trainer.py) is the in-tree example. Discrete-diffusion LMs go one step further and are not trainers at all: each dLLM family (LLaDA family and the DiffusionGemma encoder-decoder canvas) is a single-node SeedOmni module under [`OmniTrainer`](../../veomni/trainer/omni/omni_trainer.py), launched from `tasks/omni/train_omni.py`. See [LLaDA](../examples/llada.md) and [DiffusionGemma](../examples/diffusion_gemma.md).
 
 ### Key Methods to Override
 

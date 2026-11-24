@@ -1,0 +1,16 @@
+# LLaDA-MoE generation FSM: the dense module's low-confidence remasking loop.
+#
+# Same loop as `Llada/llada_8b/infer/graph_infer_gen.yaml`: `generate` lays out the
+# prompt plus a masked answer span on the first pass and commits the most
+# confident masked positions on each later one. The router changes how a token is
+# computed, not which positions are masked or the order they are committed, so
+# the FSM is identical and only the module name differs.
+initial: diffuse
+
+states:
+  diffuse:
+    body:
+      - { from: llada_moe_omni, to: end }
+    transitions:
+      - { condition: { type: module_signal, key: text_done }, next_state: done }
+      - { condition: { type: default }, next_state: diffuse }

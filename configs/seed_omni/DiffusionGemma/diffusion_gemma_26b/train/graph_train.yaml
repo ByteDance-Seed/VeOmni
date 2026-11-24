@@ -1,0 +1,7 @@
+# Launcher-style training DAG for DiffusionGemma: a single node.
+#
+# The encoder prefill and the decoder denoising both run inside the one module --
+# the KV cache never leaves the call -- so the node returns `_loss` the same way
+# the LLaDA modules do, and the executor sums a single per-node loss. The two
+# component terms (`diffusion_loss`, `encoder_ar_loss`) ride along for logging.
+- { from: diffusion_gemma_omni, to: end }

@@ -49,14 +49,22 @@ NODE_RANK=${NODE_RANK:=0}
 MASTER_ADDR=${MASTER_ADDR:=0.0.0.0}
 MASTER_PORT=${MASTER_PORT:=12345}
 
+additional_args=()
 if [[ "$NNODES" == "1" ]]; then
-  additional_args="$additional_args --standalone"
+  additional_args+=(--standalone)
 else
-  additional_args="--rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT}"
+  if [[ -z "${RDZV_ENDPOINT:-}" ]]; then
+    if [[ "${MASTER_ADDR}" == *:* ]]; then
+      RDZV_ENDPOINT="[${MASTER_ADDR}]:${MASTER_PORT}"
+    else
+      RDZV_ENDPOINT="${MASTER_ADDR}:${MASTER_PORT}"
+    fi
+  fi
+  additional_args+=("--rdzv_endpoint=${RDZV_ENDPOINT}")
 fi
 
 torchrun \
   --nnodes=$NNODES \
   --nproc-per-node=$NPROC_PER_NODE \
   --node-rank=$NODE_RANK \
-  $additional_args $@ 2>&1 | tee log.txt
+  "${additional_args[@]}" "$@" 2>&1 | tee log.txt
