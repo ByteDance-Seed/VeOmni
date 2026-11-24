@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from functools import cache
 from types import SimpleNamespace
@@ -103,7 +104,7 @@ class VeOmniPretrainedConfig(PretrainedConfig):
         if cached is None or cached[0] != self.ops_implementation:
             selections, resolved = _resolve_ops(self.ops_implementation)
             self.ops_implementation.update(selections)
-            self._ops_config_cache = (dict(self.ops_implementation), resolved)
+            self._ops_config_cache = (copy.deepcopy(self.ops_implementation), resolved)
         return self._ops_config_cache[1]
 
     @property
@@ -204,7 +205,7 @@ class VeOmniPretrainedConfig(PretrainedConfig):
             config.ops_implementation = proposed
             config.__dict__.pop("_ops_config_cache", None)
             if ops_config is not None:
-                config._ops_config_cache = (dict(proposed), ops_config)
+                config._ops_config_cache = (copy.deepcopy(proposed), ops_config)
 
     def _apply_ops_overrides(
         self,
@@ -214,8 +215,6 @@ class VeOmniPretrainedConfig(PretrainedConfig):
         _validate: bool = True,
     ) -> None:
         """Apply load-time overrides atomically; explicit attention ranks highest."""
-        import copy
-
         candidate = copy.deepcopy(self)
         if ops_implementation is not None:
             candidate._set_ops_implementation(ops_implementation, _validate=False)
@@ -228,12 +227,12 @@ class VeOmniPretrainedConfig(PretrainedConfig):
             candidate._attn_implementation = attn_implementation
 
         def apply(config, source):
-            config.ops_implementation = dict(source.ops_implementation)
+            config.ops_implementation = copy.deepcopy(source.ops_implementation)
             config.__dict__.pop("_ops_config_cache", None)
             if "_ops_config_cache" in vars(source):
                 resolved = source._ops_config_cache[1]
                 resolved.attn_implementation = source._attn_implementation
-                config._ops_config_cache = (dict(config.ops_implementation), resolved)
+                config._ops_config_cache = (copy.deepcopy(config.ops_implementation), resolved)
             for key in config.sub_configs:
                 child, proposed = getattr(config, key, None), getattr(source, key, None)
                 if isinstance(child, VeOmniPretrainedConfig) and isinstance(proposed, VeOmniPretrainedConfig):
@@ -284,14 +283,20 @@ def _ops_dict(value):
 def _resolve_ops(selections):
     """Validate final selections through the standard ops dataclass constructor."""
     from ..arguments import OpsImplementationConfig
+    from .legacy_qat_selections import migrate_retired_selections
 
+    # Configs written before QAT became per-family still carry the retired names.
+    # See veomni/models/legacy_qat_selections.py -- deleting that module and this
+    # line drops the compatibility.
+    selections = migrate_retired_selections(selections)
     resolved = OpsImplementationConfig(**{key: value for key, value in selections.items() if value is not None})
     # Explicit HF attention spellings retain their original dispatch semantics.
     if selections.get("attn_implementation") is not None:
         resolved.attn_implementation = OpsImplementationConfig.normalize_attention_backend(
             selections["attn_implementation"], veomni_names=False
         )
-    return {key: getattr(resolved, key) if value is not None else None for key, value in selections.items()}, resolved
+    serialized = resolved.to_dict()
+    return {key: serialized.get(key) if value is not None else None for key, value in selections.items()}, resolved
 
 
 def _capture_selections(source):

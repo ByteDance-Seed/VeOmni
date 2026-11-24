@@ -28,7 +28,7 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 from veomni.arguments.arguments_types import OpsImplementationConfig
 from veomni.models.configuration_base import get_veomni_config_class
-from veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_gpu import Qwen3_5GatedDeltaNet
+from veomni.models.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
 from veomni.ops import resolve_op
 from veomni.utils.import_utils import is_package_available
 

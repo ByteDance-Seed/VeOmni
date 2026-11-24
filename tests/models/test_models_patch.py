@@ -141,7 +141,7 @@ class ModelMode:
 
 _KERNEL_FIELDS = (
     "rms_norm_implementation",
-    "swiglu_mlp_implementation",
+    "gated_mlp_implementation",
     "rotary_pos_emb_implementation",
     "rotary_pos_emb_vision_implementation",
     "cross_entropy_loss_implementation",
@@ -221,7 +221,7 @@ def prepare_model_modes(is_moe: bool, *, include_fa3: bool = False) -> tuple[lis
 
 _KERNEL_OP_FIELDS = {
     "rms_norm": ("rms_norm_implementation",),
-    "swiglu_mlp": ("swiglu_mlp_implementation",),
+    "gated_mlp": ("gated_mlp_implementation",),
     "rope": ("rotary_pos_emb_implementation", "rotary_pos_emb_vision_implementation"),
     "cross_entropy_loss": ("cross_entropy_loss_implementation",),
 }

@@ -124,8 +124,12 @@ model:
 When `chunk_gated_delta_rule_implementation: flash_qla` is active (and not in recurrent cache
 decode mode), Qwen3.5 and Qwen3.5-MoE pass grouped `query` and `key` heads
 (`num_k_heads < num_v_heads`) directly to `flash_qla` instead of materializing `repeat_interleave`
-copies before the kernel. Other backends (`fla`, `eager`, NPU `triton`, `fla_npu`) and recurrent
-decode paths keep the expanded Q/K layout.
+copies before the kernel. Other backends (`fla`, `eager`, NPU `triton`) and recurrent decode
+paths keep the expanded Q/K layout; Qwen3.5 and Qwen3.5-MoE still expand for `fla_npu` too.
+Qwen4-Exp is the exception: it passes grouped Q/K to `fla_npu` as well, because the AscendC
+chunk kernel supports grouped value attention (`Hv/Hk in {1, 2, 3, 4}`, with `g`/`beta` staying in
+value-head space). Grouped value heads require a v26.9.1+ build that ships both AscendC GDN
+entries; the A2/A3 installs below pin the v26.10 line.
 
 ## Start training on NPU
 
@@ -159,9 +163,8 @@ See the [triton-ascend quick-start](https://github.com/triton-lang/triton-ascend
 for the compatibility matrix and troubleshooting. Keep CANN, `torch_npu`,
 and `triton-ascend` on a mutually compatible release set.
 
-> **arch35:** the old `causal_conv1d` guard that raised `NotImplementedError` on
-> `Ascend910_95` / `Ascend950` has been removed. On 2026-10-31, forward/backward
-> parity passed on Ascend950DT_9582 with CANN 9.2.0.B080, torch 2.10.0+cpu,
+> **arch35:** On 2026-10-31, forward/backward
+> parity passed on Ascend 950PR&950DT products with CANN 9.2.0.B080, torch 2.10.0+cpu,
 > torch_npu 2.10.0.post4 and triton-ascend 3.2.2. Cases cover 256/640 channels
 > and both ordinary sequences and packed boundaries at 61/128 tokens. This is
 > operator validation; it does not claim full-model training coverage.
@@ -184,11 +187,11 @@ model:
     chunk_gated_delta_rule_implementation: fla_npu
 ```
 
-`fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It covers the A2
-(`ascend910b`), A3 (`ascend910_93`) and A5 / arch35 (`ascend950`) targets; the library picks the
+`fla_npu` is not a declared VeOmni dependency (same as `triton-ascend`). It covers the Atlas A2 training products
+(`ascend910b`), Atlas A3 training products (`ascend910_93`) and Ascend 950PR&950DT products / arch35 (`ascend950`) targets; the library picks the
 arch22 or arch35 kernel path from the SoC, and this adapter uses the BF16 K=V=128,
 chunk_size=64 contract both paths share. The vendored `causal_conv1d` no longer rejects
-arch35 (`Ascend910_95` / `Ascend950`); the operator validation scope is recorded above.
+arch35 (Ascend 950PR&950DT products); the operator validation scope is recorded above.
 
 These instance-local GDN selectors also apply to Qwen4-Exp. Keep the model's
 configured output-gate activation: selecting AscendC does not change sigmoid
@@ -202,21 +205,21 @@ The following prebuilt NPU images on [quay.io](https://quay.io/repository/ascend
 bundle the legacy `fla_npu` build from `c2e3d83f`, which does not provide the GDN API required
 by this adapter:
 
-- A2: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A2-ubuntu22.04-py3.11-veomni-latest`
-- A3: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A3-ubuntu22.04-py3.11-veomni-latest`
+- Atlas A2 training products: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A2-ubuntu22.04-py3.11-veomni-latest`
+- Atlas A3 training products: `quay.io/ascend/veomni:v0.1.11-cann9.0.0-torch_npu2.10.0.post2-A3-ubuntu22.04-py3.11-veomni-latest`
 
 Before selecting the `fla_npu` backend in either image, replace its legacy package using the
-`a7c608f` wheel installation steps below. Follow the same steps on a bare host or an A5
-system, selecting the matching SoC target. A compatible A5 image is not listed here.
+`a7c608f` wheel installation steps below. Follow the same steps on a bare host or an Ascend 950PR&950DT products
+system, selecting the matching SoC target. A compatible Ascend 950PR&950DT products image is not listed here.
 
 Build and install the `a7c608f` wheel from the
 [`flash-linear-attention-npu`](https://github.com/flashserve/flash-linear-attention-npu) sources.
 The library does not install `torch`, `torch_npu` or `triton-ascend` for you; those must match
-your CANN and Python versions, and `FLA_NPU_SOC` must match the chip — A2 → `ascend910b`,
-A3 → `ascend910_93`, A5 → `ascend950`.
+your CANN and Python versions, and `FLA_NPU_SOC` must match the chip — Atlas A2 training products → `ascend910b`,
+Atlas A3 training products → `ascend910_93`, Ascend 950PR&950DT products → `ascend950`.
 
 ```bash
-# CANN first: A2/A3 need >= 8.5.2, A5 needs >= 9.0.0. Re-source it in every new shell.
+# CANN first: Atlas A2 training products/Atlas A3 training products need >= 8.5.2, Ascend 950PR&950DT products needs >= 9.0.0. Re-source it in every new shell.
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 git clone https://github.com/flashserve/flash-linear-attention-npu
@@ -243,7 +246,7 @@ python scripts/check_packaged_wheel_api.py
 
 **Compatibility change:** migrating to the stable complete forward/backward API
 removes the legacy adapter's wider-value training domain, including V=256 on
-A2/A3. Some individual operators and forward-only paths in the library accept
+Atlas A2 training products/Atlas A3 training products. Some individual operators and forward-only paths in the library accept
 wider values or chunk sizes, but its composite backward explicitly requires
 K=V=128 and chunk_size=64. VeOmni intentionally exposes the complete pair's
 common domain, rather than allowing a forward that fails during backward.
@@ -252,9 +255,9 @@ the fused backend cannot represent the requested configuration.
 
 | Target | Q/K/V dtype | K / V | Chunk size | Initial state |
 | --- | --- | --- | --- | --- |
-| A2 / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
-| A3 / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
-| A5 / arch35 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
+| Atlas A2 training products / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
+| Atlas A3 training products / arch22 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
+| Ascend 950PR&950DT products / arch35 | BF16 | 128 / 128 | 64 | BF16 for backward; BF16 or FP32 for inference |
 
 A returned FP32 final state can be passed to the next inference call without a
 lossy conversion. State gradients remain unsupported. Q/K normalization uses
@@ -269,8 +272,12 @@ retain/recompute policy or the legacy `fla_npu_reuse` implementation from
 #1346. Any future policy option needs matching library support and independent
 correctness and memory/performance validation.
 
-The `fla_npu` backend requires manual installation and validation; it is not
-covered by the repository's GDN tests or NPU CI.
+The `fla_npu` backend requires manual installation and validation. The repository's GDN tests
+cover the adapter contract: a mocked plumbing test runs everywhere, and a hardware-gated parity
+test compares grouped execution against an explicitly expanded eager reference (output plus
+`q`/`k`/`v`/`g`/`beta` gradients) and skips when `fla_npu` is absent. NPU CI does not install
+`fla_npu`, so neither the grouped dispatch nor the numerical parity of this backend has
+CI-enforced coverage; run that parity test on hardware before relying on it.
 
 If the `fla_npu` package is missing when `chunk_gated_delta_rule_implementation: fla_npu` is
 selected, the backend raises an actionable error when the model constructs its `VeomniOp` handle
@@ -288,7 +295,7 @@ There is no dedicated dense NPU config; reuse the GPU one and set the GatedDelta
 command line. Nothing else needs overriding: the YAML's `attn_implementation: flash_attention_2` is
 also the recommended NPU value (see [NPU-friendly operator
 configurations](../hardware_support/typical_usage.md)), and `rms_norm`, `rotary_pos_emb`,
-`swiglu_mlp` and `cross_entropy_loss` are left unset there, so `VeomniOp` resolves them to the NPU defaults
+`gated_mlp` and `cross_entropy_loss` are left unset there, so `VeomniOp` resolves them to the NPU defaults
 from `OP_REGISTRY.default_impl`. The three
 GatedDeltaNet ops default to `"fla"` instead, which is why they must be explicit:
 

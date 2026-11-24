@@ -5,6 +5,9 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops.kernels.moe_experts.shared.swiglu import (
+    apply_swiglu_clamp,
+    merged_swiglu_backward,
+    merged_swiglu_forward,
     swiglu_activation,
     swiglu_activation_backward,
     swiglu_oai,
@@ -22,6 +25,27 @@ def test_swiglu_oai_moe_variant_registers_eager_gpu_and_npu_rows():
 
     # Only the merged-fc1 paths implement SwiGLU-OAI, so e.g. fused_quack must not resolve.
     assert impls == {"eager", "fused_triton", "fused_npu"}
+
+
+def test_swiglu_oai_eager_rejects_sharded_experts():
+    from veomni.ops import VeomniOp
+
+    eager = VeomniOp("moe_experts", "swiglu_oai", "eager")
+    hidden, routing = torch.ones(1, 2), torch.ones(1, 1)
+    selected = torch.zeros(1, 1, dtype=torch.long)
+    unused = torch.empty(0)
+    with pytest.raises(ValueError, match="requires all experts locally"):
+        eager(
+            hidden,
+            routing,
+            selected,
+            unused,
+            unused,
+            torch.ones(1, 2, 2),
+            torch.ones(1, 4, 2),
+            num_experts=2,
+            swiglu_alpha=1.702,
+        )
 
 
 def test_swiglu_oai_manual_backward_matches_autograd():
@@ -61,9 +85,13 @@ def test_swiglu_oai_clamp_backward_masks_saturated_gate_and_up_values():
     output = swiglu_oai(gate, up, alpha)
     expected_grad_gate, expected_grad_up = torch.autograd.grad(output, (raw_gate, raw_up), grad_output)
 
-    actual_grad_gate, actual_grad_up = swiglu_oai_backward(grad_output, gate.detach(), up.detach(), alpha)
-    actual_grad_gate.masked_fill_(raw_gate.detach() > limit, 0)
-    actual_grad_up.masked_fill_((raw_up.detach() < -limit) | (raw_up.detach() > limit), 0)
+    gate, up, gate_mask, up_mask = apply_swiglu_clamp(raw_gate.detach(), raw_up.detach(), limit)
+    actual = merged_swiglu_forward(gate, up, alpha)
+    recomputed, packed_grad = merged_swiglu_backward(gate, up, grad_output, gate_mask, up_mask, alpha)
+    actual_grad_gate, actual_grad_up = packed_grad.chunk(2, dim=-1)
+
+    torch.testing.assert_close(actual, output)
+    torch.testing.assert_close(recomputed, output)
 
     torch.testing.assert_close(actual_grad_gate, expected_grad_gate)
     torch.testing.assert_close(actual_grad_up, expected_grad_up)

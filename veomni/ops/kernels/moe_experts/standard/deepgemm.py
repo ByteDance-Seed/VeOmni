@@ -11,57 +11,49 @@ block-quantized expert weights directly through its optional FP8 all-gather.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
+from .....distributed.moe import cumsum_to_counts
 from .....distributed.parallel_state import get_parallel_state
+from ..shared.activation import is_silu
 
 
 def _experts(x, counts, fc1, fc2, swiglu_limit, recompute_weights=(True, True)):
-    from ..shared.deepgemm_fp8 import GroupedLayout, GroupedLinear, RecomputedSwiGLU
+    from ..shared.deepgemm import GroupedLayout, GroupedLinear, RecomputedSwiGLU
 
     layout = GroupedLayout.from_counts(counts, x.device)
     projected = GroupedLinear.apply(x, fc1, layout, recompute_weights[0])
     return GroupedLinear.apply(RecomputedSwiGLU.apply(projected, swiglu_limit), fc2, layout, recompute_weights[1])
 
 
+def _deepgemm_expert_math(tokens, cumsum, fc1, fc2, swiglu_limit, recompute_weights=(True, True)):
+    """The per-rank FP8 expert GEMMs, in the shape ``dispatch_to_ep_class`` provides.
+
+    ``dispatch_to_ep_class`` hands over a *cumulative* token count, while
+    ``GroupedLayout.from_counts`` wants each expert's own count -- so this subtracts
+    the running total back out. Everything else is unchanged: the grouped FP8 GEMMs
+    and ``RecomputedSwiGLU`` own their autograd nodes.
+    """
+    counts = cumsum_to_counts(cumsum)
+    return _experts(tokens, counts, fc1, fc2, swiglu_limit, recompute_weights)
+
+
 def _ep_forward(
     x, routing_weights, selected_experts, fc1, fc2, num_experts, swiglu_limit, recompute_weights=(True, True)
 ):
     """Dispatch tokens across EP ranks, run FP8 local experts, and combine outputs."""
-    from .....distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all
+    from .....distributed.moe import dispatch_to_ep_class
 
-    ep_group = get_parallel_state().ep_group
-    expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
-    input_splits, output_splits, per_rank_counts, counts = preprocess(expert_mask, num_experts, ep_group)
-    tokens, routing_map, permutation, original_shape = token_pre_all2all(
-        x,
-        expert_mask,
+    return dispatch_to_ep_class(
+        _deepgemm_expert_math,
         num_experts,
-        input_splits,
-        output_splits,
-        per_rank_counts,
-        ep_group,
-    )
-    del expert_mask
-    # Dispatch/collectives stay outside custom autograd Functions. Counts are
-    # already on the CPU for the SM90 K-grouped GEMM launch metadata.
-    outputs = _experts(tokens, counts, fc1, fc2, swiglu_limit, recompute_weights)
-    # The expert autograd nodes own their compact saved operands. Dispatch
-    # inputs need not overlap the combine's permutation and FP32 accumulation.
-    del tokens
-    return tokens_post_all2all(
-        outputs,
         routing_weights,
         selected_experts,
-        num_experts,
-        input_splits,
-        output_splits,
-        per_rank_counts,
-        routing_map,
-        permutation,
-        original_shape,
-        ep_group,
+        x,
+        fc1,
+        fc2,
+        swiglu_limit,
+        recompute_weights,
     )
 
 
@@ -77,6 +69,9 @@ def wrapper(
     num_experts: int,
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
+    # DeepGEMM currently implements FP8 only; any other dtype raises below.
+    dtype: str = "fp8",
+    activation: str = "silu",
 ) -> Tensor:
     """Run FP8 expert GEMMs with BF16 inputs, outputs and first-order gradients.
 
@@ -87,14 +82,31 @@ def wrapper(
     capture. Routing weights are applied after the down projection, matching the
     eager expert contract rather than moving them through FP8 quantization.
     """
+    if dtype != "fp8":
+        raise ValueError(f"moe_implementation='deepgemm' currently supports dtype='fp8' only, got {dtype!r}.")
+    if not is_silu(activation):
+        # Refused here, before any of the FP8 math, because this is where the
+        # quantization is decided. ``RecomputedSwiGLU`` computes SiLU inside the
+        # grouped GEMM and recomputes it in the backward instead of saving it, so
+        # there is no seam to substitute another activation into. Handing the call
+        # to a reference row -- what the bf16 fused rows do, losing nothing -- would
+        # skip the FP8 GEMMs and train the experts in bf16 under a config that says
+        # ``deepgemm``.
+        raise ValueError(
+            f"moe_implementation='deepgemm' computes SiLU only, and the model asks "
+            f"for {activation!r}. Its grouped GEMM runs in FP8 and fuses the activation, "
+            f"so another activation cannot be substituted without dropping the "
+            f"quantization. Use hidden_act='silu', or moe_implementation='eager' to train "
+            f"the experts in the model dtype."
+        )
     if (
         hidden_states.device.type != "cuda"
         or torch.version.hip is not None
         or torch.cuda.get_device_capability(hidden_states.device) not in ((9, 0), (10, 0))
     ):
-        raise RuntimeError("deepgemm_fp8 requires NVIDIA Hopper SM90 or Blackwell SM100.")
+        raise RuntimeError("deepgemm requires NVIDIA Hopper SM90 or Blackwell SM100.")
     if hidden_states.ndim != 2 or hidden_states.dtype != torch.bfloat16:
-        raise ValueError("deepgemm_fp8 requires BF16 hidden_states with shape [tokens, hidden].")
+        raise ValueError("deepgemm requires BF16 hidden_states with shape [tokens, hidden].")
     if (
         selected_experts.ndim != 2
         or selected_experts.shape[1] == 0

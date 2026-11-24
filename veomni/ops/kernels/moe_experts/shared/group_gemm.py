@@ -37,10 +37,9 @@ _COMPACT_SCHEDULE_MAX_EXPERTS = 256
 
 
 class ActivationType(str, Enum):
-    """Optional fused activation applied after grouped GEMM."""
+    """Activation a grouped GEMM can apply to its own output."""
 
     GELU = "gelu"
-    GELU_NEW = "gelu_new"
     SILU = "silu"
 
 
@@ -136,25 +135,21 @@ def make_blocked(t: tl.tensor, intermediate_type: tl.dtype) -> tl.tensor:
     return t.to(intermediate_type).expand_dims(0).reshape(t.shape)
 
 
-_sqrt2pi: triton.language.constexpr = math.sqrt(2.0 / math.pi)
 _sqrt1_2: triton.language.constexpr = math.sqrt(1.0 / 2)
 
 
 @triton.jit
-def _tanh(x):
-    """Tanh via a scaled sigmoid."""
-    return 2 * tl.sigmoid(2 * x) - 1
-
-
-@triton.jit
 def activation_fwd(x: tl.tensor, ACTIVATION: tl.constexpr):
-    """Apply ``gelu``, ``gelu_new``, or ``silu`` in the GEMM epilogue."""
+    """Apply ``gelu`` or ``silu`` to a GEMM result, before it leaves the kernel.
+
+    Only the names ``veomni.ops.activation`` serves through ATen's own backward ops
+    appear here, so what this computes and what the autograd path computes stay the
+    same function.
+    """
     orig_dtype = x.dtype
     x = x.to(tl.float32)
     if ACTIVATION == "gelu":
         y = x * 0.5 * (1.0 + tl.erf(x * _sqrt1_2))
-    elif ACTIVATION == "gelu_new":
-        y = 0.5 * x * (1.0 + _tanh(_sqrt2pi * x * (1.0 + 0.044715 * x * x)))
     elif ACTIVATION == "silu":
         y = x * tl.sigmoid(x)
     else:
@@ -229,11 +224,12 @@ def group_gemm_same_nk_kernel(
 ):
     """Grouped GEMM over tokens (M) with shared N/K per expert."""
     if COMPACT_SCHEDULE:
-        # Flatten both logical axes into grid.x, preserving the column range
-        # accepted by the original launch instead of adding a grid.y limit.
-        row_tiles = tl.cdiv(tl.cast(total_M, tl.int64), BLOCK_M) + G - 1
-        tile_id = tl.program_id(0) % row_tiles
-        n = tl.program_id(0) // row_tiles
+        # Keep both logical axes in grid.x, with adjacent programs varying N
+        # first so column tiles of the same row tile can reuse their A block.
+        column_tiles = tl.cdiv(N, BLOCK_N)
+        pid = tl.cast(tl.program_id(0), tl.int64)
+        tile_id = pid // column_tiles
+        n = pid % column_tiles
         if tile_id >= tl.load(tile_cumsum + G - 1):
             return
         lo = tl.full((), 0, tl.int32)

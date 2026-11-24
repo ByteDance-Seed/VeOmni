@@ -42,11 +42,12 @@ def wrapper(
     """Routed SwiGLU-OAI expert MLP on merged fc1_1_2_weight.
 
     Matches the Hugging Face MiniMax M3 expert loop: clamp, the SwiGLU-OAI
-    activation, fc2, then the routing weights in their own dtype. Fused rows
-    scale before fc2 (Triton) or after it (NPU), so they agree with this row
-    only to rounding. Regular autograd, no custom backward.
+    activation, fc2, then the routing weights in their own dtype. Regular autograd
+    differentiates the local expert loop.
     """
     _check_merged_layout(fc1_1_weight, fc1_2_weight, fc1_1_2_weight)
+    if fc1_1_2_weight.shape[0] != num_experts:
+        raise ValueError("SwiGLU-OAI eager requires all experts locally. Use fused_triton or fused_npu for EP.")
     output = torch.zeros_like(hidden_states)
     with torch.no_grad():
         expert_mask = F.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)

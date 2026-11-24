@@ -326,7 +326,7 @@ def test_wrapper_uses_eager_when_lora_row_is_unavailable(monkeypatch, mode: str,
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("mode", _MODE_CASES)
-def test_wrapper_rejects_deepgemm_fp8_before_moving_parameters(mode: str):
+def test_wrapper_rejects_deepgemm_before_moving_parameters(mode: str):
     from types import SimpleNamespace
 
     base_layer = torch.nn.Module()
@@ -337,11 +337,11 @@ def test_wrapper_rejects_deepgemm_fp8_before_moving_parameters(mode: str):
     base_layer.gate_up_proj = torch.nn.Parameter(torch.empty(2, 16, 8))
     base_layer.down_proj = torch.nn.Parameter(torch.empty(2, 8, 8))
     base_layer.register_buffer("residual_mask", torch.ones(2))
-    base_layer.veomni_moe = SimpleNamespace(impl="deepgemm_fp8")
+    base_layer.veomni_moe = SimpleNamespace(impl="deepgemm")
     original_parameters = dict(base_layer.named_parameters())
     original_buffers = dict(base_layer.named_buffers())
 
-    with pytest.raises(ValueError, match="deepgemm_fp8.*does not support MoE-LoRA"):
+    with pytest.raises(ValueError, match="deepgemm.*does not support MoE-LoRA"):
         _wrapper_cls(mode)(base_layer, r=2, lora_alpha=4)
 
     assert dict(base_layer.named_parameters()).keys() == original_parameters.keys()
@@ -353,6 +353,25 @@ def test_wrapper_rejects_deepgemm_fp8_before_moving_parameters(mode: str):
         assert buffer is original_buffers[name]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("mode", _MODE_CASES)
+def test_moe_lora_rejects_a_quantizing_expert_row(mode: str):
+    """`qat` has no `moe_experts_lora` row, so substituting `eager` would round nothing.
+
+    The adapter forward multiplies the base weights it is handed; silently falling
+    back to a full-precision base while `moe_implementation='qat'` is set is the
+    same silent-precision-loss failure the `deepgemm` guard covers.
+    """
+    from types import SimpleNamespace
+
+    from veomni.lora.moe_layers import _moe_lora_op
+
+    base_layer = SimpleNamespace(veomni_moe=SimpleNamespace(impl="qat"))
+
+    with pytest.raises(ValueError, match="qat.*does not support MoE-LoRA"):
+        _moe_lora_op(base_layer, mode)
+
+
 @pytest.mark.parametrize("mode", _MODE_CASES)
 def test_wrapper_constructs_on_mocked_mlu_with_default_ops_config(monkeypatch, mode: str):
     """MLU keeps the default ``fused_triton`` MoE row, but has no ``fused_triton`` MoE-LoRA row."""
@@ -360,7 +379,7 @@ def test_wrapper_constructs_on_mocked_mlu_with_default_ops_config(monkeypatch, m
     from transformers import Qwen3MoeConfig
 
     from veomni.arguments import OpsImplementationConfig
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import Qwen3MoeExperts
+    from veomni.models.transformers.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
     from veomni.ops import OP_REGISTRY, VeomniOp
 
     monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: True)

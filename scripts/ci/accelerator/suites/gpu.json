@@ -1,5 +1,10 @@
 [
   {
+    "name": "distributed-default-gloo-group",
+    "suite": "unit",
+    "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
+  },
+  {
     "name": "01-unit",
     "suite": "unit",
     "conditional": false,
@@ -109,6 +114,16 @@
     ]
   },
   {
+    "name": "08b-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_kimi_k3_vision_tower_sp.py"
+    ]
+  },
+  {
     "name": "09-unit",
     "suite": "unit",
     "conditional": false,
@@ -166,7 +181,6 @@
       "-s",
       "-x",
       "--ignore=tests/models/test_omni_fsdp.py",
-      "--ignore=tests/models/base/test_modify_init.py",
       "--ignore=tests/models/transformers/test_generated_call_site_signatures.py",
       "tests/models"
     ]

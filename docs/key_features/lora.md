@@ -233,7 +233,7 @@ infix (PEFT convention — e.g. `lora_A.weight`), whereas the live model stores 
 `trainer.model.save_dcp` and lands in `ModelCheckpointManager`
 (`veomni/models/checkpoint/manager.py`). That writes the
 weights to `model/ckpt/` and the optimizer to `model/optimizer/` — two separate DCP
-directories — plus a replicated `model/lr_scheduler.pt`. For LoRA training the DCP
+directories — plus the scheduler in each rank's `model/extra_state/`. For LoRA training the DCP
 stores only the trainable adapter parameters and optimizer state; the frozen base is
 reloaded from `model.model_path`. Job-level state is written separately by
 `GlobalStateCallback`, as `loader/rank_{R}.pt` for the dataloader cursor and
@@ -265,7 +265,7 @@ Output structure for each checkpoint:
 │       ├── model/
 │       │   ├── ckpt/                    ← adapter weights, DCP
 │       │   ├── optimizer/               ← adapter optimizer state, DCP
-│       │   └── lr_scheduler.pt
+│       │   └── extra_state/             ← scheduler, per rank
 │       ├── loader/rank_{R}.pt
 │       ├── extra_state/rank_{R}.pt
 │       └── lora_ckpt/                   ← the inference artifact
@@ -392,8 +392,8 @@ Each MoE-LoRA wrapper follows the `moe_implementation` its wrapped experts modul
 |---|---|---|---|
 | `fused_triton` | fused Triton kernel | fused Triton kernel | Recommended on GPU. |
 | `fused_npu` | NPU GroupGEMM | NPU GroupGEMM | Recommended on Ascend NPU. |
-| `eager` | eager loop (reference) | not supported (raises) | Portable reference path. |
-| `deepgemm_fp8` | not supported (raises) | not supported (raises) | No FP8 MoE-LoRA implementation; rejected at wrap time. |
+| `eager` | eager loop (reference) | eager loop (reference) | Portable reference path; works under EP but is slow. |
+| `deepgemm` | not supported (raises) | not supported (raises) | No FP8 MoE-LoRA implementation; rejected at wrap time. |
 
 The fused GPU path lives in `veomni/ops/kernels/moe_experts_lora/` and reuses the same
 `group_gemm_same_nk` / `group_gemm_same_mn` primitives as the non-LoRA MoE forward, so it
@@ -401,15 +401,22 @@ inherits the same EP `all-to-all` dispatch pipeline. Each wrapper constructs
 `VeomniOp("moe_experts_lora", variant, impl)` from the wrapped experts'
 `veomni_moe.impl`. If no LoRA row is available (for example `fused_quack`, or
 `fused_triton` on MLU), the wrapper uses `eager`. The exception is
-`deepgemm_fp8`: both shared and independent wrappers reject it before moving
+`deepgemm`: both shared and independent wrappers reject it before moving
 the base parameters, to avoid silently changing precision. This restriction
 only applies to LoRA targeting expert weights; dense-module LoRA is unaffected.
 MoE-LoRA requires SiLU experts and rejects other activations at wrap time.
 
 ### 5.4 Expert Parallelism (EP)
 
-Both `fused_triton` and `fused_npu` support the EP path; `fused_npu` uses the
-Ascend GroupGEMM implementation in `veomni/ops/kernels/moe_experts_lora/{shared,independent}/npu.py`.
+All three rows support the EP path: `fused_triton` on GPU, `fused_npu` via the Ascend
+GroupGEMM implementation in `veomni/ops/kernels/moe_experts_lora/{shared,independent}/npu.py`,
+and `eager` through plain-PyTorch expert math in the same directory.
+
+All three rows share `veomni.distributed.moe.dispatch_to_ep_class`, so the all-to-all
+plumbing is one implementation across `moe_experts` and `moe_experts_lora`, and a change
+to it lands in one place. What differs is the per-rank math: `fused_npu` runs Ascend
+grouped GEMMs (`npu_group_gemm`) with the LoRA deltas added between them, in
+`moe_experts_lora/helper.py`, while `eager` and `fused_triton` use their own kernels.
 
 When `model.accelerator.ep_size > 1`, base experts are sharded along the expert dim by
 `ParallelPlan` (`Shard(0)` on `gate_up_proj` / `down_proj`). MoE-LoRA tracks this layout:
@@ -424,8 +431,10 @@ When `model.accelerator.ep_size > 1`, base experts are sharded along the expert 
   `_collect_ep_replicated_lora_param_ids` in `veomni/optim/optimizer.py` — to skip the
   EP all-reduce for these replicated params so the global grad-norm matches EP=1.
 
-Both modes work with FSDP2 + EP. EP requires a fused forward path:
-`triton` on GPU or `npu` on Ascend NPU; `eager` raises.
+Both modes work with FSDP2 + EP. `eager` also runs under EP — it is the reference
+path, kept correct so it can validate the fused rows — but it does per-expert Python
+loops on top of the all-to-all, so treat it as a debugging backend rather than a
+training one.
 
 ### 5.5 Save / load artefacts
 
@@ -530,7 +539,7 @@ model:
     attn_implementation: flash_attention_2
     cross_entropy_loss_implementation: eager
     rms_norm_implementation: eager
-    swiglu_mlp_implementation: eager
+    gated_mlp_implementation: eager
     rotary_pos_emb_implementation: eager
   lora_config:
     rank: 64

@@ -23,7 +23,7 @@ The public MiniMaxAI/MiniMax-M3 safetensors index uses an older layout:
     language_model.model.layers.{i}.self_attn.index_{q,k}_{proj,norm}.weight
     language_model.model.layers.{i}.block_sparse_moe.e_score_correction_bias
 
-The transformers>=5.16 modeling that VeOmni patchgen consumes expects:
+The standalone MiniMax model uses the Transformers 5.16 checkpoint layout:
 
     model.language_model.layers.{i}.mlp.gate_up_proj.weight
     model.language_model.layers.{i}.mlp.experts.gate_up_proj

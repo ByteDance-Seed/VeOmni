@@ -33,6 +33,7 @@ from ..arguments.arguments_types import (
     validate_low_precision_reduce_scatter_comm,
 )
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
+from ..ops.qat._hardware import reject_qat_without_native_bf16
 from ..utils import logging, recompute_utils
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
@@ -462,6 +463,7 @@ def parallelize_model_fsdp2(
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
     parallel_state = get_parallel_state()
+    reject_qat_without_native_bf16(model)
 
     if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather
@@ -1059,6 +1061,7 @@ def build_parallelize_model(
             Ignored when the model contains no matching experts.
     """
     parallel_state = get_parallel_state()
+    reject_qat_without_native_bf16(model)
     validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim, fsdp_mode=parallel_state.dp_mode)
     if expert_weight_fp8_all_gather is not False:
         from .fsdp2.fp8_all_gather import resolve_fp8_all_gather

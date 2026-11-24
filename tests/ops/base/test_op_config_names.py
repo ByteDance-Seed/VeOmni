@@ -34,10 +34,13 @@ _FIELD_TO_OP = {
     "attn_implementation": "attention",
     "causal_conv1d_implementation": "causal_conv1d",
     "chunk_gated_delta_rule_implementation": "chunk_gated_delta_rule",
+    "chunk_kda_implementation": "chunk_kda",
     "cross_entropy_loss_implementation": "cross_entropy_loss",
     "dsa_attention_implementation": "dsa_attention",
     "dsa_indexer_implementation": "dsa_indexer",
     "load_balancing_loss_implementation": "load_balancing_loss",
+    "linear_implementation": "linear",
+    "kv_round_implementation": "kv_round",
     "mhc_implementation": "mhc",
     "moe_implementation": "moe_experts",
     "qsa_attention_implementation": "qsa_attention",
@@ -45,15 +48,30 @@ _FIELD_TO_OP = {
     "rms_norm_implementation": "rms_norm",
     "rotary_pos_emb_implementation": "rope",
     "rotary_pos_emb_vision_implementation": "rope",
-    "swiglu_mlp_implementation": "swiglu_mlp",
+    "situ_and_mul_implementation": "situ_and_mul",
+    "gated_mlp_implementation": "gated_mlp",
 }
-
-_FUNCTIONAL_IMPLEMENTATION_FIELDS = {"qat_implementation"}
 
 
 def _registered_implementations(op: str) -> set[str]:
     """Return implementation names registered across every op variant and device."""
     return {key[2] for key in OP_REGISTRY._entries if key[0] == op}
+
+
+def _selected_names(implementation):
+    """Every row name a YAML selection can produce.
+
+    A bare string is one row for every site. A mapping carries a reference ``name``
+    and one per override, so all of them have to be registered -- a typo in a rule
+    that never runs on this host is still a typo.
+    """
+    if isinstance(implementation, str):
+        return [implementation]
+    if isinstance(implementation, dict):
+        names = [implementation.get("name")]
+        names.extend(rule.get("name") for rule in implementation.get("overrides") or () if isinstance(rule, dict))
+        return [name for name in names if isinstance(name, str)]
+    return []
 
 
 def test_yaml_op_implementation_names_are_registered():
@@ -72,14 +90,15 @@ def test_yaml_op_implementation_names_are_registered():
                 continue
 
             for field, implementation in implementations.items():
+                # Every op-selection field names a registered family, so an
+                # unmapped key is a stale config rather than a field to skip.
                 op = _FIELD_TO_OP.get(field)
                 if op is None:
-                    if field in _FUNCTIONAL_IMPLEMENTATION_FIELDS:
-                        continue
                     invalid.append(f"{path.relative_to(REPO_ROOT)}: unmapped implementation field {field!r}")
                     continue
-                if implementation in _registered_implementations(op):
-                    continue
-                invalid.append(f"{path.relative_to(REPO_ROOT)}: {field}={implementation!r} ({op})")
+                for name in _selected_names(implementation):
+                    if name in _registered_implementations(op):
+                        continue
+                    invalid.append(f"{path.relative_to(REPO_ROOT)}: {field}={name!r} ({op})")
 
     assert not invalid, "YAML op implementation names are not registered:\n" + "\n".join(invalid)

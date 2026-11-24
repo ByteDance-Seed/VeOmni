@@ -38,12 +38,8 @@ from tests.models.tiny_configs import tiny_deepseek_v4_config as _tiny_config
 
 
 def _dsv4_module():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as gen
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_npu as gen
-    else:
-        from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as gen
     return gen
 
 
@@ -74,11 +70,12 @@ def test_deepseek_v4_shared_mlp_passes_swiglu_limit():
     assert shared.limit == config.swiglu_limit
     captured: dict = {}
 
-    def record(x, *args, **kwargs):
+    def record(mlp, x, *args, **kwargs):
         captured.update(kwargs)
+        assert mlp is shared
         return torch.zeros_like(x)
 
-    shared.veomni_swiglu_mlp = record
+    shared.veomni_gated_mlp = record
     shared(torch.randn(2, 8, config.hidden_size))
     assert captured["swiglu_limit"] == config.swiglu_limit
 
@@ -164,7 +161,7 @@ def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes():
     assert not torch.equal(captured["query"], wrong_fp32_multiply)
 
 
-@pytest.mark.parametrize("impl", ["eager", "fused_triton", "deepgemm_fp8"])
+@pytest.mark.parametrize("impl", ["eager", "fused_triton", "deepgemm"])
 def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
     """DeepSeek-V4 experts forward passes merged weights, raw routing weights, and ``swiglu_limit``."""
     config = _tiny_config()
@@ -201,11 +198,19 @@ def test_deepseek_v4_experts_pass_merged_weights_dtype_and_swiglu_limit(impl):
         "num_experts": experts.num_experts,
         "swiglu_limit": config.swiglu_limit,
         "assume_distinct_experts": True,
+        # The checkpoint's expert format is a call argument, not part of the
+        # implementation name: V4-Flash stores routed experts in FP4 and its
+        # dense projections in FP8, so one row name cannot describe both.
+        "dtype": getattr(config, "expert_dtype", "fp8"),
+        # The activation travels with the call, and the name is the whole input: the
+        # rows resolve a name outside ``veomni.ops.activation`` through ``ACT2FN``,
+        # which is where the model built its own ``act_fn`` from.
+        "activation": config.hidden_act,
     }
     torch.testing.assert_close(actual, torch.zeros_like(hidden_states), rtol=0, atol=0)
 
 
-def test_deepseek_v4_experts_deepgemm_fp8_forward_backward():
+def test_deepseek_v4_experts_deepgemm_forward_backward():
     """Select FP8 through the public config and execute the real expert module."""
     from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 
@@ -219,7 +224,7 @@ def test_deepseek_v4_experts_deepgemm_fp8_forward_backward():
     from tests.ops.moe_experts.reference import standard_ep_reference
     from veomni.arguments import OpsImplementationConfig
 
-    ops = OpsImplementationConfig(moe_implementation="deepgemm_fp8", qat_implementation="none")
+    ops = OpsImplementationConfig(moe_implementation="deepgemm")
     config = SimpleNamespace(
         num_local_experts=4,
         hidden_size=256,
@@ -230,7 +235,7 @@ def test_deepseek_v4_experts_deepgemm_fp8_forward_backward():
     )
     device = get_device_type()
     experts = _dsv4_module().DeepseekV4Experts(config).to(device=device, dtype=torch.bfloat16)
-    assert experts.veomni_moe.impl == "deepgemm_fp8"
+    assert experts.veomni_moe.impl == "deepgemm"
     torch.manual_seed(91)
     with torch.no_grad():
         experts.gate_up_proj.normal_(std=0.03)

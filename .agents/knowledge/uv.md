@@ -12,7 +12,6 @@ CI install a concrete pin and use `--locked` / `--frozen` for reproducibility.
 |----------|--------|
 | `pyproject.toml` -> `[tool.uv]` -> `required-version` | range |
 | `docker/**/Dockerfile.*` | concrete pin, per file: `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` |
-| `.github/workflows/check_patchgen.yml` | `setup-uv` `version: "X.Y.Z"` |
 
 Every Dockerfile is standalone and hand-maintained — the Jinja template
 generator and its matrix were dropped in #1133, so nothing fans a pin out for
@@ -30,7 +29,7 @@ grep -rnE "torch(-npu)?==" docker/  # same for torch; -npu is the ascend form
 ```
 pyproject.toml
 ├── [project.dependencies]              Core deps (always installed, transformers NOT included here)
-├── [project.optional-dependencies]     Hardware extras + optional Magi extra + legacy `dev`
+├── [project.optional-dependencies]     Hardware extras + optional Magi / float8 / Hyper extras + legacy `dev`
 │   ├── gpu          NVIDIA x86_64 / aarch64 — full superset (kernel-specific libc requirements):
 │   │                  torch 2.11.0+cu130 + cu130 nvidia stack + cuda-python
 │   │                  + FA2 on x86_64 (cp311/cp312 wheels)
@@ -42,17 +41,19 @@ pyproject.toml
 │   ├── magi         Optional NVIDIA SM100+ MagiAttention FFA (combine with gpu):
 │   │                  magi-attention + create-block-mask-cuda + flash-attn-cute
 │   │                  + magi-to-hstu-cuda + debugpy; source-built CUDA extensions
+│   ├── float8       Optional torchao==0.18.0 for float8 training and the torchao FP4 QAT rows (combine with gpu);
+│   │                  kept out of gpu so jobs that use neither skip the wheel (and keep PEFT interop)
 │   ├── npu          Ascend NPU x86_64 — full superset, minus CUDA-only kernels:
 │   │                  torch 2.10.0+cpu + torch-npu 2.10.0
 │   │                  + diffusers / av / audio / video / peft / megatron-energon
 │   ├── npu_aarch64  Ascend NPU aarch64 — full superset except torchcodec:
 │   │                  torch 2.10.0 + torch-npu 2.10.0 + the same data/model deps
+│   ├── hyper        Optional HyperParallel (combine with npu or npu_aarch64; pinned Git source)
 │   └── dev          pre-commit, ruff, pytest (legacy pip-style; modern uv path is the dev group)
 ├── [dependency-groups]                 Dev-only (uv-native)
-│   ├── dev                  includes lint + test + patchgen
+│   ├── dev                  includes lint + test
 │   ├── lint                 pre-commit, ruff
 │   ├── test                 pytest, expecttest, rich
-│   ├── patchgen             patchgen (path source under patchgen-pkg/)
 │   └── transformers-stable  transformers==5.16.1 (default, in default-groups)
 ├── [tool.uv]
 │   ├── required-version     Allowed uv version range
@@ -74,6 +75,7 @@ conflicts with the NPU extras.
 ```bash
 uv sync --extra gpu --dev                      # NVIDIA GPU
 uv sync --extra gpu --extra magi --dev         # NVIDIA GPU + MagiAttention (SM100+)
+uv sync --extra gpu --extra float8 --dev       # NVIDIA GPU + torchao (float8 training SM89+, FP4 QAT rows)
 uv sync --extra npu --dev                      # Ascend NPU x86
 uv sync --extra npu_aarch64 --dev              # Ascend NPU ARM
 ```
@@ -91,6 +93,10 @@ The `npu` and `npu_aarch64` extras both install the complete Ascend software
 stack and multimodal dependencies. Only `npu_aarch64` omits `torchcodec`
 because no compatible aarch64 wheel is available; build it from source when
 video decoding is required.
+
+HyperParallel is optional: add `--extra hyper` alongside `npu` or `npu_aarch64`.
+Its Git revision is pinned in `tool.uv.sources` and `uv.lock`.
+See `docs/key_features/hyper_parallel.md` for installation instructions.
 
 ## Transformers Version
 
@@ -116,9 +122,9 @@ These native Ubuntu 24.04 wheels require glibc >=2.38 and libstdc++ symbols
 through GLIBCXX_3.4.31 (x86_64) or GLIBCXX_3.4.29 (aarch64). They package the
 host extension and DeepJIT/CUTLASS headers; runtime kernel JIT still needs
 NVCC and a C++20 compiler (validated with GCC 13). The backend is lazy-imported
-and selected explicitly with `moe_implementation: deepgemm_fp8`; installing
+and selected explicitly with `moe_implementation: deepgemm`; installing
 the GPU extra does not enable FP8 or import DeepGEMM on unsupported GPUs.
-See `docs/design/deepgemm_fp8_moe.md` for supported shapes and precision.
+See `docs/design/deepgemm_moe.md` for supported shapes and precision.
 
 ## Attention Kernels
 
@@ -132,6 +138,7 @@ See `docs/design/deepgemm_fp8_moe.md` for supported shapes and precision.
 | `flash-qla` | PyPI `0.1.2` | pure-Python wheel with usable metadata; requires TileLang 0.1.9; full forward/backward support on SM90 and SM100 |
 | `tile-kernels` | PyPI `1.0.0` | DeepSeek V4 mHC forward/backward; requires TileLang 0.1.9 and SM90+ |
 | `magi-attention` + `create-block-mask-cuda`, `flash-attn-cute`, `magi-to-hstu-cuda` | git revs | optional `--extra magi`; SM100 source builds, omitted by the default GPU CI install |
+| `torchao` | PyPI `0.18.0` | optional `--extra float8`, backend of the `torchao` low-precision op rows (`fp8`, `nvfp4`, `mxfp4`); exact pin checked at runtime by `veomni/ops/torchao.py`, omitted by the default GPU CI install, so the float8 GPU tests and the torchao QAT tests skip there. Incompatible with the `gpu` extra's `peft==0.18.1` torchao integration (`LinearActivationQuantizedTensor` removed), so PEFT interop fails with the extra installed |
 
 FlashQLA 0.1.2 supports full forward/backward execution on NVIDIA SM90 and
 SM100. Its SM120 path is forward-only, so VeOmni's full op registration is
@@ -185,4 +192,4 @@ uv sync --locked --all-packages --extra gpu --dev  # docker / CI (no magi)
 4. **uv bumps require Docker rebuilds**; concrete pins must stay in range.
 5. **`override-dependencies` `extra == '...'` markers are load-bearing.**
 6. **`transformers==5.16.1` is the only supported version.** New code targets
-   v5 + FSDP2 + patchgen-generated modeling.
+   v5 + FSDP2 + standalone `modeling_<m>.py` modules.

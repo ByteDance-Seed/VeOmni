@@ -24,6 +24,7 @@ Hardware ``requirement`` and software ``requires`` decide availability.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from inspect import Parameter, signature
 from typing import Any, Callable
@@ -124,6 +125,18 @@ def _make_autograd_fn(raw_forward: Callable, raw_backward: Callable) -> Callable
         # accept ``grad_enabled`` still see the caller's autograd mode.
         if accepts_grad_enabled:
             attrs.setdefault("grad_enabled", torch.is_grad_enabled())
+        # Nothing needs a backward, so skip the autograd node. This is not only
+        # cheaper: Dynamo cannot bind ``_OpFn.forward`` in inference mode, where
+        # the variadic tensors are followed by a non-tensor argument. Inlining it
+        # reports ``args = []`` and fails with "failed to bind arguments when
+        # attempting to inline", which breaks every ``torch.compile``d forward
+        # that runs under ``no_grad``/``inference_mode``. Calling the raw pair
+        # directly keeps that path compilable and produces the same values.
+        needs_graph = torch.is_grad_enabled() and any(
+            isinstance(tensor, Tensor) and tensor.requires_grad for tensor in bound_tensors
+        )
+        if not needs_graph:
+            return raw_forward(*bound_tensors, **attrs)[0]
         return _OpFn.apply(*bound_tensors, attrs)
 
     return wrapper
@@ -384,35 +397,151 @@ def resolve_op(op: str, variant: str, impl: str | None = None) -> OpEntry:
     return OP_REGISTRY.resolve(op, variant, impl)
 
 
-class VeomniOp:
-    """Local handle for one ``(op, variant, impl)`` row.
+@dataclass
+class SiteOverride:
+    """Regex override for a subset of sites within one op family."""
 
-    Interned by resolved triple. Always calls ``entry.wrapper``. Compound
-    Functions must use ``resolve_op(...).forward`` / ``.backward``, not this
-    handle.
+    site: str
+    name: str | None = None
+    kwargs: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        self._pattern = re.compile(self.site)
+
+    def matches(self, site: str) -> bool:
+        """Return whether ``site`` matches this override pattern."""
+        return self._pattern.fullmatch(site) is not None
+
+
+@dataclass
+class OpsSelection:
+    """Per-site op selection: default row name, row kwargs, and optional site overrides."""
+
+    name: str | None = None
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    overrides: list[SiteOverride] = field(default_factory=list)
+
+    def resolve(
+        self,
+        site: str | None = None,
+        *,
+        default_name: str | None = None,
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Resolve ``(impl, kwargs)`` for ``site``, applying matching overrides in order.
+
+        When ``self.name`` is ``None``, ``default_name`` supplies the resolved host
+        default row so an override that switches to a different row resets inherited
+        kwargs while an override targeting the same row merges them.
+        """
+        name = self.name if self.name is not None else default_name
+        kwargs = dict(self.kwargs)
+        if not self.overrides or site is None:
+            return name, kwargs
+        for rule in self.overrides:
+            if not rule.matches(site):
+                continue
+            if rule.name is not None and rule.name != name:
+                name = rule.name
+                kwargs = dict(rule.kwargs or {})
+            else:
+                if rule.name is not None:
+                    name = rule.name
+                if rule.kwargs:
+                    kwargs.update(rule.kwargs)
+        return name, kwargs
+
+    def all_impls(self) -> list[str | None]:
+        """Every row name reachable from the default or any override."""
+        seen: list[str | None] = [self.name]
+        for rule in self.overrides:
+            if rule.name is not None and rule.name not in seen:
+                seen.append(rule.name)
+        return seen
+
+    @classmethod
+    def from_config_value(cls, raw: Any) -> OpsSelection:
+        """Accept a bare row name, an ``OpsSelection``, or a YAML mapping."""
+        if raw is None:
+            return cls()
+        if isinstance(raw, str):
+            return cls(name=raw)
+        if isinstance(raw, OpsSelection):
+            return raw
+        return cls(
+            name=raw.get("name"),
+            kwargs=dict(raw.get("kwargs") or {}),
+            overrides=[
+                SiteOverride(**item) if isinstance(item, dict) else item for item in raw.get("overrides") or ()
+            ],
+        )
+
+
+def _kwargs_cache_key(kwargs: dict[str, Any]) -> tuple | None:
+    """Return a hashable intern key for immutable ``kwargs``, or ``None`` to bypass interning."""
+    if not kwargs:
+        return ()
+    try:
+        key = tuple(sorted(kwargs.items()))
+        hash(key)
+    except TypeError:
+        return None
+    return key
+
+
+class VeomniOp:
+    """Local handle for one ``(op, variant, impl)`` row plus optional row kwargs.
+
+    Interned by ``(op, variant, impl, kwargs)`` when ``kwargs`` are hashable
+    (immutable); handles with mutable or unhashable kwargs bypass interning so
+    later mutations cannot poison cached handles. Always calls ``entry.wrapper``.
+    Compound Functions must use ``resolve_op(...).forward`` / ``.backward``, not
+    this handle.
     """
 
-    _intern: dict[tuple[str, str, str], VeomniOp] = {}
+    _intern: dict[tuple[str, str, str, tuple], VeomniOp] = {}
 
-    def __new__(cls, op: str, variant: str, impl: str | None = None):
-        """Return the interned handle for ``(op, variant, impl)``."""
-        if impl is not None:
-            cached = cls._intern.get((op, variant, impl))
+    def __new__(
+        cls,
+        op: str,
+        variant: str,
+        impl: str | OpsSelection | None = None,
+        *,
+        site: str | None = None,
+    ):
+        """Return the interned handle for the resolved row and its kwargs."""
+        kwargs: dict[str, Any] = {}
+        if isinstance(impl, OpsSelection):
+            default_name = OP_REGISTRY.default_impl(op, variant) if impl.name is None else None
+            impl, kwargs = impl.resolve(site, default_name=default_name)
+        kwargs_key = _kwargs_cache_key(kwargs)
+        if impl is not None and kwargs_key is not None:
+            cached = cls._intern.get((op, variant, impl, kwargs_key))
             if cached is not None:
                 return cached
         entry = resolve_op(op, variant, impl)
-        cached = cls._intern.get((op, variant, entry.impl))
-        if cached is not None:
-            return cached
+        if kwargs_key is not None:
+            key = (op, variant, entry.impl, kwargs_key)
+            cached = cls._intern.get(key)
+            if cached is not None:
+                return cached
         instance = super().__new__(cls)
         instance.op = op
         instance.variant = variant
         instance.impl = entry.impl
+        instance.kwargs = kwargs
         instance._entry = entry
-        cls._intern[(op, variant, entry.impl)] = instance
+        if kwargs_key is not None:
+            cls._intern[(op, variant, entry.impl, kwargs_key)] = instance
         return instance
 
-    def __init__(self, op: str, variant: str, impl: str | None = None):
+    def __init__(
+        self,
+        op: str,
+        variant: str,
+        impl: str | OpsSelection | None = None,
+        *,
+        site: str | None = None,
+    ):
         """Resolve the registry row and intern this handle."""
         return None
 
@@ -426,14 +555,18 @@ class VeomniOp:
         return self
 
     def __reduce__(self):
-        """Rebuild through interned ``(op, variant, impl)`` rather than a bare ``__new__``."""
+        """Rebuild through the interned row and its kwargs rather than a bare ``__new__``."""
+        if self.kwargs:
+            return (VeomniOp, (self.op, self.variant, OpsSelection(name=self.impl, kwargs=self.kwargs)))
         return (VeomniOp, (self.op, self.variant, self.impl))
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        """Call ``entry.wrapper``. Tensors are positional, non-tensors are keywords."""
+        """Call ``entry.wrapper``. Handle kwargs override call-site kwargs."""
         if self._entry.wrapper is None:
             raise RuntimeError(f"VeomniOp({self.op!r}, {self.variant!r}, {self.impl!r}) has no wrapper")
-        return self._entry.wrapper(*args, **kwargs)
+        if not self.kwargs:
+            return self._entry.wrapper(*args, **kwargs)
+        return self._entry.wrapper(*args, **{**kwargs, **self.kwargs})
 
     @property
     def entry(self) -> OpEntry:
@@ -442,4 +575,6 @@ class VeomniOp:
 
     def __repr__(self) -> str:
         """Return ``VeomniOp(op=..., variant=..., impl=...)``."""
+        if self.kwargs:
+            return f"VeomniOp(op={self.op!r}, variant={self.variant!r}, impl={self.impl!r}, kwargs={self.kwargs!r})"
         return f"VeomniOp(op={self.op!r}, variant={self.variant!r}, impl={self.impl!r})"

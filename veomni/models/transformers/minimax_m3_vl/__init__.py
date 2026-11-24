@@ -11,12 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ....utils.device import IS_NPU_AVAILABLE
 from ...registry import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
 
 
 # Registered so ``get_model_config`` swaps the checkpoint's ``auto_map`` remote
-# config class for the transformers-native one the generated modeling targets.
+# config class for the transformers-native one the local modeling targets.
 @MODEL_CONFIG_REGISTRY.register("minimax_m3_vl")
 def register_minimax_m3_vl_config():
     from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import MiniMaxM3VLConfig
@@ -47,11 +46,7 @@ def register_minimax_m3_vl_modeling(architecture: str):
         convert_minimax_m3_vl_fqn_to_index_mapping,
         create_minimax_m3_vl_checkpoint_tensor_converter,
     )
-
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_minimax_m3_vl_npu import MiniMaxM3SparseForConditionalGeneration
-    else:
-        from .generated.patched_modeling_minimax_m3_vl_gpu import MiniMaxM3SparseForConditionalGeneration
+    from .modeling_minimax_m3_vl import MiniMaxM3SparseForConditionalGeneration
 
     if architecture != "MiniMaxM3SparseForConditionalGeneration":
         raise ValueError(

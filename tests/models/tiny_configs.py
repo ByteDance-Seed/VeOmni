@@ -503,6 +503,32 @@ def tiny_minimax_h3_condition_config(architecture: str = "MiniMaxH3ConditionMode
     return MiniMaxH3ConditionModelConfig(**kwargs)
 
 
+def tiny_minimax_h3_image_config(architecture: str = "MiniMaxH3DiTModel", **overrides) -> PretrainedConfig:
+    return tiny_minimax_h3_config(
+        architecture=architecture,
+        audio_enabled=False,
+        num_pdd_heads=2,
+        **overrides,
+    )
+
+
+def tiny_minimax_h3_image_condition_config(
+    architecture: str = "MiniMaxH3ImageConditionModel", **overrides
+) -> PretrainedConfig:
+    from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition.configuration_minimax_h3_image_condition import (
+        MiniMaxH3ImageConditionModelConfig,
+    )
+
+    kwargs = {
+        "base_model_path": "",
+        "skip_encoder_load": True,
+        "architectures": [architecture],
+        "tie_word_embeddings": False,
+    }
+    kwargs.update(overrides)
+    return MiniMaxH3ImageConditionModelConfig(**kwargs)
+
+
 def tiny_qwen_image_config(architecture: str = "QwenImageTransformer2DModel", **overrides) -> PretrainedConfig:
     from veomni.models.diffusers.qwen_image.qwen_image_transformer.configuration_qwen_image_transformer import (
         QwenImageTransformer2DModelConfig,
@@ -1208,3 +1234,27 @@ def tiny_qwen3_vl_moe_config(
         architectures=[architecture],
         attn_implementation="eager",
     )
+
+
+def tiny_kimi_k3_config(architecture: str = "KimiK3ForConditionalGeneration") -> PretrainedConfig:
+    """Load the Kimi K3 VLM toy config (``tests/toy_config/kimi_k3_toy``).
+
+    The vendored K3 config carries the full MoonViT3d vision section and a
+    hybrid KDA/MLA text stack; loading the checked-in toy config keeps the
+    factory in sync with the layout the bitwise-parity suites build.
+    """
+    from pathlib import Path
+
+    from veomni.models.transformers.kimi_k3.configuration_kimi_k3 import KimiK3Config
+
+    toy_dir = Path(__file__).resolve().parents[1] / "toy_config" / "kimi_k3_toy"
+    config = KimiK3Config.from_pretrained(str(toy_dir))
+    config.architectures = [architecture]
+    return config
+
+
+def tiny_kimi_linear_config(architecture: str = "KimiLinearForCausalLM") -> PretrainedConfig:
+    """Kimi K3 text stack standalone (the ``kimi_linear`` model type)."""
+    config = tiny_kimi_k3_config().text_config
+    config.architectures = [architecture]
+    return config

@@ -58,7 +58,7 @@ class MiniMaxM3VLProcessor(HfMiniMaxM3VLProcessor):
     """MiniMax M3 VL processor built purely from the transformers-native classes.
 
     VeOmni pins MiniMax M3 to the transformers>=5.16 implementation -- that is
-    what the generated modeling is written against -- and
+    what the standalone model uses -- and
     the checkpoint's bundled ``processing_minimax.py`` is unusable regardless: its
     ``MiniMaxVLProcessor.__init__`` drops ``**kwargs`` and so loses the
     ``chat_template.jinja`` that ``from_pretrained`` passes through, and its

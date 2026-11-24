@@ -28,7 +28,13 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.models.configuration_base import as_veomni_config
 from veomni.optim import muon as muon_impl
-from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_capability
+from veomni.utils.device import (
+    IS_CUDA_AVAILABLE,
+    IS_NPU_AVAILABLE,
+    get_device_type,
+    get_gpu_compute_capability,
+    get_torch_device,
+)
 
 
 muon_module = pytest.importorskip("torch.optim._muon")
@@ -112,7 +118,7 @@ def _dsv4_csa_attention_model() -> nn.Module:
     """
     from transformers import AutoConfig
 
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as modeling
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as modeling
 
     config = AutoConfig.from_pretrained(str(_TOY_CONFIG_ROOT / "deepseek_v4_toy"))
     as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
@@ -128,7 +134,7 @@ def _glm_dsa_attention_model() -> nn.Module:
     """A real ``GlmMoeDsaAttention``, whose indexer names ``wq_b`` and never collides."""
     from transformers import AutoConfig
 
-    from veomni.models.transformers.glm_moe_dsa.generated import patched_modeling_glm_moe_dsa_gpu as modeling
+    from veomni.models.transformers.glm_moe_dsa import modeling_glm_moe_dsa as modeling
 
     config = AutoConfig.from_pretrained(str(_TOY_CONFIG_ROOT / "glm_moe_dsa_toy"))
     as_veomni_config(config, validate=False)._set_ops_implementation(make_eager_ops_config())
@@ -184,6 +190,64 @@ class TestSplit:
             p.requires_grad_(False)
         muon, adamw, *_ = split_muon_adamw_params(model)
         assert muon == [] and adamw == []
+
+    def test_routing_and_gating_matrices_go_to_adamw(self):
+        """A matrix that selects or mixes is not a feature transform, so NS must not touch it.
+
+        Covers the names the shipped models actually use: MoE router gates, scalar
+        expert gates, hyper-connection stream mixing, the DSA indexer's per-head
+        scores, and the compressors' softmax gates. The sibling feature projections
+        in each of those modules must stay on Muon, which is what the scoped
+        `compressor.gate_proj` / `indexer.gate_proj` entries are for.
+        """
+        model = nn.Module()
+        layer = nn.Module()
+        layer.attn_hc = nn.ParameterDict({"fn": nn.Parameter(torch.randn(24, 64))})
+        layer.ffn_hc = nn.ParameterDict({"fn": nn.Parameter(torch.randn(24, 64))})
+        layer.mlp = nn.Module()
+        layer.mlp.gate = nn.Linear(16, 8, bias=False)
+        layer.mlp.router = nn.Linear(16, 8, bias=False)
+        layer.mlp.shared_expert_gate = nn.Linear(16, 1, bias=False)
+        layer.mlp.experts = nn.ParameterDict({"gate_up_proj": nn.Parameter(torch.randn(4, 16, 16))})
+        layer.mlp.shared_experts = nn.ModuleDict({"gate_proj": nn.Linear(16, 8, bias=False)})
+        layer.self_attn = nn.Module()
+        layer.self_attn.compressor = nn.ModuleDict(
+            {
+                "kv_proj": nn.Linear(16, 8, bias=False),
+                "gate_proj": nn.Linear(16, 8, bias=False),
+            }
+        )
+        layer.self_attn.compressor.indexer = nn.ModuleDict(
+            {
+                "q_b_proj": nn.Linear(16, 32, bias=False),
+                "kv_proj": nn.Linear(16, 8, bias=False),
+                "gate_proj": nn.Linear(16, 8, bias=False),
+                "weights_proj": nn.Linear(16, 4, bias=False),
+            }
+        )
+        model.layers = nn.ModuleList([layer])
+        model.hc_head = nn.ParameterDict({"hc_fn": nn.Parameter(torch.randn(4, 64))})
+
+        _, _, muon_names, adamw_names = split_muon_adamw_params(model)
+
+        assert set(adamw_names) == {
+            "layers.0.attn_hc.fn",
+            "layers.0.ffn_hc.fn",
+            "layers.0.mlp.gate.weight",
+            "layers.0.mlp.router.weight",
+            "layers.0.mlp.shared_expert_gate.weight",
+            "layers.0.self_attn.compressor.gate_proj.weight",
+            "layers.0.self_attn.compressor.indexer.gate_proj.weight",
+            "layers.0.self_attn.compressor.indexer.weights_proj.weight",
+            "hc_head.hc_fn",
+        }
+        assert set(muon_names) == {
+            "layers.0.mlp.experts.gate_up_proj",
+            "layers.0.mlp.shared_experts.gate_proj.weight",
+            "layers.0.self_attn.compressor.kv_proj.weight",
+            "layers.0.self_attn.compressor.indexer.q_b_proj.weight",
+            "layers.0.self_attn.compressor.indexer.kv_proj.weight",
+        }
 
 
 class TestParamShapeEligibility:
@@ -544,6 +608,67 @@ class TestGramNewtonSchulz:
         p.grad = torch.randn_like(p)
         opt.step()
         assert torch.isfinite(p).all()
+
+    @pytest.mark.parametrize("use_dcp", [False, True], ids=["plain", "dcp"])
+    def test_resume_keeps_the_configured_expert_ns_budget(self, use_dcp):
+        """The chunking switch must not be resumable state, on either restore path.
+
+        Both directions fail differently: a keyless checkpoint makes torch's DCP
+        unflatten raise ``KeyError`` if the live group declares the key, and a
+        checkpoint carrying a value would overwrite this run's, so a job lowering
+        the budget to fit could resume with the old larger one and OOM.
+        """
+        import torch.nn as nn
+
+        if use_dcp:
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+                get_optimizer_state_dict,
+                set_optimizer_state_dict,
+            )
+
+        def make(budget):
+            model = nn.Linear(4, 4, bias=False)
+            kwargs = {} if budget is None else {"expert_ns_max_experts": budget}
+            return model, DistributedMuon(model.parameters(), lr=1e-3, **kwargs)
+
+        def snapshot(budget):
+            model, opt = make(budget)
+            for p in model.parameters():
+                p.grad = torch.randn_like(p)
+            opt.step()
+            if use_dcp:
+                return get_optimizer_state_dict(
+                    model, opt, options=StateDictOptions(flatten_optimizer_state_dict=True)
+                )
+            return opt.state_dict()
+
+        def restore(budget, saved):
+            model, opt = make(budget)
+            if use_dcp:
+                set_optimizer_state_dict(
+                    model, opt, optim_state_dict=saved, options=StateDictOptions(flatten_optimizer_state_dict=True)
+                )
+            else:
+                opt.load_state_dict(saved)
+            return opt
+
+        # Nothing about the switch is persisted, whichever value produced the checkpoint.
+        for budget in (None, 8):
+            saved = snapshot(budget)
+            if use_dcp:
+                assert not any("expert_ns_max_experts" in key for key in saved)
+            else:
+                assert "expert_ns_max_experts" not in saved["param_groups"][0]
+
+        # Saved off (keyless) -> configured 3: no KeyError, the configuration wins.
+        assert restore(3, snapshot(None))._expert_ns_max_experts == 3
+        # Saved 8 -> configured 1: the configuration wins.
+        assert restore(1, snapshot(8))._expert_ns_max_experts == 1
+
+        # Validation still rejects a value below the "off" sentinel.
+        with pytest.raises(ValueError, match="must be >= -1"):
+            DistributedMuon([nn.Parameter(torch.randn(8, 16))], lr=1e-3, expert_ns_max_experts=-2)
 
 
 class TestMuonLrResolution:
@@ -1216,3 +1341,222 @@ class TestGramQuackFallback:
         monkeypatch.setattr(muon_mod, "get_gpu_compute_capability", lambda _device: 90)
         grad = type("FakeTensor", (), {"device": torch.device(device_type)})()
         assert muon_mod._gram_quack_unavailable_reason(grad) is None
+
+
+def test_moe_expert_ns_chunk_sizes_schedule():
+    """The slicer must produce a valid, balanced, minimal-call schedule for any budget.
+
+    Invariants: every expert covered once, no call over budget, spread within one
+    expert (so no single-expert ``bmm``), and the fewest calls the budget allows.
+    ``-1`` (the default) means "off" and must reproduce the one-call shape.
+    """
+    from veomni.optim.muon import _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS, _expert_ns_chunk_sizes
+
+    # Chunking is off by default, whatever the expert count.
+    assert _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS == -1
+    for experts in (1, 4, 6, 7, 32, 64):
+        assert _expert_ns_chunk_sizes(experts) == [experts]
+
+    # Enabled at 3: every remainder class across a wide range.
+    for experts in range(1, 65):
+        sizes = _expert_ns_chunk_sizes(experts, 3)
+        assert sum(sizes) == experts
+        assert max(sizes) <= 3
+        # Spread, not adjacent pairs: ``[3, 3, 1]`` has adjacent diffs 0 and -2 but
+        # still ends in the single-expert tail this scheme exists to avoid.
+        assert max(sizes) - min(sizes) <= 1, (experts, sizes)
+        # Fewest calls the budget allows: dropping one call must overflow it.
+        if len(sizes) > 1:
+            assert -(-experts // (len(sizes) - 1)) > 3, (experts, sizes)
+
+    # A budget at or above the stack size is effectively off.
+    assert _expert_ns_chunk_sizes(7, 0) == [7]
+    assert _expert_ns_chunk_sizes(7, 7) == [7]
+    assert _expert_ns_chunk_sizes(7, 64) == [7]
+
+    # A larger budget trades workspace for fewer calls, and stays balanced.
+    assert _expert_ns_chunk_sizes(32, 8) == [8, 8, 8, 8]
+    assert _expert_ns_chunk_sizes(32, 1) == [1] * 32
+    for budget in (1, 2, 3, 5, 8):
+        for experts in (7, 10, 13, 31):
+            sizes = _expert_ns_chunk_sizes(experts, budget)
+            assert sum(sizes) == experts
+            assert max(sizes) - min(sizes) <= 1, (budget, experts, sizes)
+
+
+def test_moe_expert_ns_chunking_handles_an_empty_local_shard():
+    """A non-owner rank's FSDP shard of a 3D param is empty and must not divide by zero.
+
+    Wan's ``[1, 6, dim]`` modulation parameters leave non-owner ranks holding
+    ``[0, 6, dim]``; those are Muon-eligible and reach this path. The DTensor is
+    real (single-process gloo mesh), so classification and dispatch both run.
+    """
+    import tempfile
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    from veomni.optim.muon import _chunked_newton_schulz, _classify_param, _expert_ns_chunk_sizes
+
+    assert _expert_ns_chunk_sizes(0) == []
+    assert _expert_ns_chunk_sizes(0, 0) == []
+
+    empty = torch.empty(0, 6, 4)
+    out = _chunked_newton_schulz(empty, lambda x: torch.zeros_like(x))
+    assert out.shape == empty.shape
+    assert out.numel() == 0
+
+    created = False
+    if not (dist.is_available() and dist.is_initialized()):
+        rendezvous = tempfile.mkdtemp()
+        dist.init_process_group(
+            "gloo",
+            init_method=f"file://{rendezvous}/rendezvous",
+            rank=0,
+            world_size=1,
+        )
+        created = True
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        sharded = DTensor.from_local(empty, device_mesh=mesh, placements=(Shard(0),), run_check=False)
+        assert _classify_param(sharded) == "moe_local_3d"
+        chunked = _chunked_newton_schulz(sharded._local_tensor, lambda x: torch.zeros_like(x))
+        assert chunked.shape == sharded._local_tensor.shape
+    finally:
+        if created:
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "experts,rows,cols",
+    [
+        # Wide (rows <= cols): Gram-NS iterates on ``X @ X.T``.
+        pytest.param(7, 4, 6, id="wide-remainder"),
+        # Tall (rows > cols): Gram-NS iterates on ``X.T @ X``, the other branch.
+        pytest.param(4, 8, 3, id="tall"),
+    ],
+)
+def test_moe_expert_ns_chunking_matches_a_whole_stack_call(experts, rows, cols):
+    """Chunking must match one whole-stack call numerically, and must actually chunk.
+
+    Both Gram-NS branches are covered: slicing dim 0 is branch-agnostic but the
+    trailing-matrix math is not. The recorded shapes also fail a silent regression
+    to a single whole-stack call, which equivalence alone would not catch.
+    """
+    from veomni.optim.muon import _chunked_newton_schulz, _expert_ns_chunk_sizes
+
+    torch.manual_seed(0)
+    local = torch.randn(experts, rows, cols)
+
+    def _ns(x):
+        return run_newton_schulz(
+            x,
+            ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+            ns_steps=DEFAULT_NS_STEPS,
+            eps=1e-7,
+            ns_implementation="gram",
+            gram_ns_reset_iterations=(2,),
+        )
+
+    shapes = []
+
+    def _recording_ns(x):
+        shapes.append(tuple(x.shape))
+        return _ns(x)
+
+    chunked = _chunked_newton_schulz(local, _recording_ns, max_experts=3)
+
+    torch.testing.assert_close(chunked, _ns(local))
+    assert shapes == [(size, rows, cols) for size in _expert_ns_chunk_sizes(experts, 3)]
+
+
+def test_moe_expert_ns_chunking_preserves_dtype_and_short_circuits():
+    """The preallocated output must keep the update's dtype and skip work when unchunked.
+
+    Widening the output would silently promote the update and break
+    ``_apply_ortho``; an unchunked call must not pay a useless ``empty_like`` copy.
+    """
+    from veomni.optim.muon import _chunked_newton_schulz
+
+    for dtype in (torch.bfloat16, torch.float32):
+        local = torch.randn(5, 4, 6, dtype=dtype)
+        out = _chunked_newton_schulz(local, torch.zeros_like, max_experts=3)
+        assert out.dtype == dtype
+        assert out.shape == local.shape
+
+    single_call = []
+
+    def _recording(x):
+        single_call.append(tuple(x.shape))
+        return x
+
+    # Chunking off (default): one call even for a stack far above the budget.
+    big = torch.randn(32, 4, 4)
+    _chunked_newton_schulz(big, _recording)
+    assert single_call == [(32, 4, 4)]
+
+    # Chunking on but the stack fits one slice: still one call.
+    single_call.clear()
+    small = torch.randn(3, 4, 4)
+    _chunked_newton_schulz(small, _recording, max_experts=3)
+    assert single_call == [(3, 4, 4)]
+
+
+@pytest.mark.skipif(
+    not ((IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) and get_torch_device().is_available()),
+    reason="Visible CUDA or NPU device required",
+)
+def test_moe_expert_ns_chunking_matches_whole_stack_on_accelerator(monkeypatch):
+    """The chunked NS path must agree with a whole-stack call on a real accelerator.
+
+    The CPU tests prove the slicing arithmetic; this proves the device kernels
+    tolerate it, and that ``gram_quack`` did not silently fall back on Hopper.
+    """
+    import importlib.util
+
+    import veomni.optim.muon as muon_mod
+    from veomni.optim.muon import _chunked_newton_schulz
+
+    torch.manual_seed(0)
+    experts, rows, cols = 7, 128, 256
+    local = torch.randn(experts, rows, cols, device=get_device_type(), dtype=torch.bfloat16)
+
+    backends = ["gram"]
+    if IS_CUDA_AVAILABLE and importlib.util.find_spec("gram_newton_schulz") is not None:
+        backends.append("gram_quack")
+
+    for backend in backends:
+        if backend == "gram_quack":
+            monkeypatch.setattr(muon_mod, "_GRAM_QUACK_FALLBACK_WARNED", False)
+
+        shapes = []
+
+        def _ns(x, _backend=backend, _shapes=shapes):
+            _shapes.append(tuple(x.shape))
+            return run_newton_schulz(
+                x,
+                ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+                ns_steps=DEFAULT_NS_STEPS,
+                eps=1e-7,
+                ns_implementation=_backend,
+                gram_ns_reset_iterations=(2,),
+            )
+
+        chunked = _chunked_newton_schulz(local, _ns, max_experts=3)
+        # The CPU test pins the size policy; here it only has to happen on-device.
+        assert shapes == [(3, rows, cols), (2, rows, cols), (2, rows, cols)]
+
+        whole = run_newton_schulz(
+            local,
+            ns_coefficients=DEFAULT_NS_COEFFICIENTS,
+            ns_steps=DEFAULT_NS_STEPS,
+            eps=1e-7,
+            ns_implementation=backend,
+            gram_ns_reset_iterations=(2,),
+        )
+        assert chunked.dtype == local.dtype
+        assert torch.isfinite(chunked).all()
+        torch.testing.assert_close(chunked.float(), whole.float(), atol=5e-3, rtol=5e-3)
+        if backend == "gram_quack":
+            assert muon_mod._GRAM_QUACK_FALLBACK_WARNED is (get_gpu_compute_capability(local.device) < 90)

@@ -24,14 +24,10 @@ import torch.nn.functional as F
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.models.configuration_base import as_veomni_config
+from veomni.models.transformers.minimax_m3_vl import modeling_minimax_m3_vl as modeling
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-
-_MODELING_MODULES = (
-    "veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_gpu",
-    "veomni.models.transformers.minimax_m3_vl.generated.patched_modeling_minimax_m3_vl_npu",
-)
 
 
 def _upstream_text_model(model):
@@ -110,11 +106,9 @@ class _VarlenReferenceAttention:
         return torch.cat(outputs, dim=2).transpose(1, 2), None
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
 @pytest.mark.parametrize("layer_type", ["minimax_m3_sparse", "full_attention"], ids=["sparse", "full"])
-def test_minimax_m3_vl_packed_attention_matches_separate_samples(module_name, layer_type):
+def test_minimax_m3_vl_packed_attention_matches_separate_samples(layer_type):
     """Packed samples match the upstream model run per sample, in forward and backward."""
-    modeling = importlib.import_module(module_name)
     model = modeling.MiniMaxM3VLTextModel(_text_config(modeling, layer_types=[layer_type])).eval()
     reference = _upstream_text_model(model)
     attention = model.layers[0].self_attn
@@ -160,10 +154,8 @@ def test_minimax_m3_vl_packed_attention_matches_separate_samples(module_name, la
     torch.testing.assert_close(packed_grad, torch.cat((first_grad, second_grad), dim=1))
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_sparse_layers_never_bind_the_standard_attention(module_name):
+def test_minimax_m3_vl_sparse_layers_never_bind_the_standard_attention():
     """Each layer binds only the operators its layer type calls."""
-    modeling = importlib.import_module(module_name)
     model = modeling.MiniMaxM3VLTextModel(
         _text_config(
             modeling,
@@ -183,7 +175,6 @@ def test_minimax_m3_vl_sparse_layers_never_bind_the_standard_attention(module_na
     assert not hasattr(dense, "veomni_msa_attention")
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
 @pytest.mark.parametrize(
     ("attn_implementation", "cu_seq_lens", "ulysses_enabled", "rejected"),
     [
@@ -206,10 +197,9 @@ def test_minimax_m3_vl_sparse_layers_never_bind_the_standard_attention(module_na
     ],
 )
 def test_minimax_m3_vl_dense_language_attention_requires_varlen_backend(
-    module_name, attn_implementation, cu_seq_lens, ulysses_enabled, rejected, monkeypatch
+    attn_implementation, cu_seq_lens, ulysses_enabled, rejected, monkeypatch
 ):
     """Without a mask, non-varlen dense attention leaks future tokens or mixes packed samples; non-VeOmni backends skip the Ulysses exchange."""
-    modeling = importlib.import_module(module_name)
     model = modeling.MiniMaxM3VLTextModel(_text_config(modeling, layer_types=["full_attention"])).eval()
     model.config._attn_implementation = attn_implementation
     model.layers[0].self_attn.veomni_attn = _VarlenReferenceAttention()
@@ -235,11 +225,9 @@ def test_minimax_m3_vl_dense_language_attention_requires_varlen_backend(
         model(**forward_kwargs)
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
 @pytest.mark.parametrize("with_attention_mask", [False, True], ids=["no_mask", "all_ones_mask"])
-def test_minimax_m3_vl_text_model_runs_unpacked_single_sequence_as_one_segment(module_name, with_attention_mask):
+def test_minimax_m3_vl_text_model_runs_unpacked_single_sequence_as_one_segment(with_attention_mask):
     """Without varlen kwargs a lone unpadded sequence runs as a one-segment pack and matches upstream."""
-    modeling = importlib.import_module(module_name)
     model = _single_layer_sparse_text_model(modeling)
     hidden_states = torch.randn(1, 7, model.config.hidden_size)
     position_ids = torch.arange(7).unsqueeze(0)
@@ -267,10 +255,8 @@ def test_minimax_m3_vl_text_model_runs_unpacked_single_sequence_as_one_segment(m
     torch.testing.assert_close(output.last_hidden_state, expected.last_hidden_state)
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_indexer_is_frozen_and_stays_out_of_autograd(module_name):
+def test_minimax_m3_vl_indexer_is_frozen_and_stays_out_of_autograd():
     """Top-k block selection is not differentiable: the indexer is frozen and builds no dead autograd graph."""
-    modeling = importlib.import_module(module_name)
     model = _single_layer_sparse_text_model(modeling)
     attention = model.layers[0].self_attn
     assert not any(param.requires_grad for param in attention.indexer.parameters())
@@ -298,7 +284,6 @@ def test_minimax_m3_vl_indexer_is_frozen_and_stays_out_of_autograd(module_name):
     assert attention.q_proj.weight.grad is not None
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
 @pytest.mark.parametrize(
     ("forward_kwargs", "message"),
     [
@@ -321,18 +306,15 @@ def test_minimax_m3_vl_indexer_is_frozen_and_stays_out_of_autograd(module_name):
     ],
     ids=["padded_batch", "kv_cache", "packed_batch_gt_1", "padded_single_sequence"],
 )
-def test_minimax_m3_vl_text_model_rejects_inputs_it_cannot_pack(module_name, forward_kwargs, message):
-    modeling = importlib.import_module(module_name)
+def test_minimax_m3_vl_text_model_rejects_inputs_it_cannot_pack(forward_kwargs, message):
     model = _single_layer_sparse_text_model(modeling)
 
     with pytest.raises(ValueError, match=message):
         model(**forward_kwargs)
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_text_model_rejects_unpacked_input_under_sequence_parallelism(module_name, monkeypatch):
+def test_minimax_m3_vl_text_model_rejects_unpacked_input_under_sequence_parallelism(monkeypatch):
     """A local SP shard cannot describe the global sequence, so the collator's metadata is mandatory."""
-    modeling = importlib.import_module(module_name)
     model = _single_layer_sparse_text_model(modeling)
     monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=True))
 
@@ -340,9 +322,7 @@ def test_minimax_m3_vl_text_model_rejects_unpacked_input_under_sequence_parallel
         model(inputs_embeds=torch.randn(1, 4, model.config.hidden_size))
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_metadata_preserves_visual_batch_boundaries_and_isolates_sp_padding(module_name):
-    modeling = importlib.import_module(module_name)
+def test_minimax_m3_vl_metadata_preserves_visual_batch_boundaries_and_isolates_sp_padding():
     batch = {
         "image_grid_thw": torch.tensor([[1, 2, 2], [2, 1, 2]], dtype=torch.long),
         "video_grid_thw": torch.tensor([[1, 2, 2]], dtype=torch.long),
@@ -360,12 +340,10 @@ def test_minimax_m3_vl_metadata_preserves_visual_batch_boundaries_and_isolates_s
     assert metadata["vit_video_max_seqlen"] == 8
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
 @pytest.mark.parametrize("merge_size", [1, 2, 3])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_minimax_m3_vl_vision_rope_grid_list_matches_upstream(module_name, merge_size, dtype):
+def test_minimax_m3_vl_vision_rope_grid_list_matches_upstream(merge_size, dtype):
     """Preserve temporal order and spatial merge blocks across mixed image/video grids."""
-    modeling = importlib.import_module(module_name)
     upstream = importlib.import_module("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
     grid_list = [[1, 2 * merge_size, 3 * merge_size], [3, 3 * merge_size, 2 * merge_size]]
     grid = torch.tensor(grid_list, dtype=torch.long)
@@ -379,9 +357,7 @@ def test_minimax_m3_vl_vision_rope_grid_list_matches_upstream(module_name, merge
         torch.testing.assert_close(slow, ref, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_vision_rope_preserves_precomputed_positions(module_name):
-    modeling = importlib.import_module(module_name)
+def test_minimax_m3_vl_vision_rope_preserves_precomputed_positions():
     upstream = importlib.import_module("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
     grid_list = [[2, 4, 6]]
     grid = torch.tensor(grid_list, dtype=torch.long)
@@ -418,7 +394,6 @@ _TWO_MEDIA = [[1, 2, 2], [1, 2, 2]]
 _ONE_MEDIUM = [[1, 2, 2]]
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
 @pytest.mark.parametrize(
     ("attn_implementation", "grid_thw_list", "ulysses_enabled", "rejected"),
     [
@@ -439,10 +414,9 @@ _ONE_MEDIUM = [[1, 2, 2]]
     ],
 )
 def test_minimax_m3_vl_vision_requires_varlen_attention_to_isolate_media(
-    module_name, attn_implementation, grid_thw_list, ulysses_enabled, rejected, monkeypatch
+    attn_implementation, grid_thw_list, ulysses_enabled, rejected, monkeypatch
 ):
     """Without a mask, non-varlen vision attention would mix media samples; non-VeOmni backends skip the Ulysses exchange."""
-    modeling = importlib.import_module(module_name)
     vision_model = _tiny_vision_model(modeling, attn_implementation)
     monkeypatch.setattr(
         modeling,
@@ -463,10 +437,8 @@ def test_minimax_m3_vl_vision_requires_varlen_attention_to_isolate_media(
         vision_model(**forward_kwargs)
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_lists_every_veomni_varlen_backend_as_flash_compatible(module_name):
+def test_minimax_m3_vl_lists_every_veomni_varlen_backend_as_flash_compatible():
     """HF replaces a flash backend missing from this list with its first entry, MiniMax's own Hub kernel."""
-    modeling = importlib.import_module(module_name)
     compatible = modeling.MiniMaxM3VLPreTrainedModel._compatible_flash_implementations
     sp_backends = [
         "veomni_flash_attention_2",
@@ -489,14 +461,11 @@ def test_minimax_m3_vl_lists_every_veomni_varlen_backend_as_flash_compatible(mod
         )
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
 @pytest.mark.parametrize("precompute_attention_metadata", [False, True])
 def test_minimax_m3_vl_vision_forward_threads_global_sp_metadata(
-    module_name,
     precompute_attention_metadata,
     monkeypatch,
 ):
-    modeling = importlib.import_module(module_name)
     config = modeling.MiniMaxM3VLVisionConfig(
         hidden_size=12,
         intermediate_size=24,
@@ -562,12 +531,10 @@ def test_minimax_m3_vl_vision_forward_threads_global_sp_metadata(
     assert cos.shape[0] == sin.shape[0] == 8
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_placeholder_mask_fallback_gathers_input_ids_under_sp(module_name, monkeypatch):
+def test_minimax_m3_vl_placeholder_mask_fallback_gathers_input_ids_under_sp(monkeypatch):
     """Without precomputed masks, SP must derive them from the full sequence, not this rank's slice."""
     from veomni.models.registry import get_model_config
 
-    modeling = importlib.import_module(module_name)
     config = get_model_config("./tests/toy_config/minimax_m3_vl_toy", ops_implementation=make_eager_ops_config())
     model = modeling.MiniMaxM3SparseForConditionalGeneration(config).model.eval()
     sp_size, local_len = 2, 4
@@ -618,12 +585,10 @@ def test_minimax_m3_vl_placeholder_mask_fallback_gathers_input_ids_under_sp(modu
 
 @pytest.mark.parametrize("with_metadata", [False, True], ids=["grid_tensor", "grid_list"])
 @pytest.mark.parametrize("modality", ["image", "video"])
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_sp_drops_vision_padding_features(module_name, modality, with_metadata, monkeypatch):
+def test_minimax_m3_vl_sp_drops_vision_padding_features(modality, with_metadata, monkeypatch):
     """SP=2 with a 1x2x2 grid gathers two features (one from the padding) for a single placeholder."""
     from veomni.models.registry import get_model_config
 
-    modeling = importlib.import_module(module_name)
     config = get_model_config("./tests/toy_config/minimax_m3_vl_toy", ops_implementation=make_eager_ops_config())
     model = modeling.MiniMaxM3SparseForConditionalGeneration(config).model.eval()
     assert model.vision_tower.config.spatial_merge_size == 2
@@ -681,14 +646,12 @@ def test_minimax_m3_vl_sp_drops_vision_padding_features(module_name, modality, w
     torch.testing.assert_close(getattr(output, f"{modality}_hidden_states"), real_feature)
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_parallel_plan_targets_the_expert_parameters(module_name):
+def test_minimax_m3_vl_parallel_plan_targets_the_expert_parameters():
     """Every EP plan pattern must match the stacked expert weights of the multimodal model."""
     import fnmatch
 
     from veomni.models.registry import get_model_config
 
-    modeling = importlib.import_module(module_name)
     config = get_model_config("./tests/toy_config/minimax_m3_vl_toy", ops_implementation=make_eager_ops_config())
     with torch.device("meta"):
         model = modeling.MiniMaxM3SparseForConditionalGeneration(config)
@@ -704,9 +667,7 @@ def test_minimax_m3_vl_parallel_plan_targets_the_expert_parameters(module_name):
         assert fnmatch.filter(parameter_names, pattern), pattern
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_experts_pass_swiglu_config_to_op(module_name, monkeypatch):
-    modeling = importlib.import_module(module_name)
+def test_minimax_m3_vl_experts_pass_swiglu_config_to_op(monkeypatch):
     config = SimpleNamespace(
         num_local_experts=2,
         hidden_size=4,
@@ -725,9 +686,7 @@ def test_minimax_m3_vl_experts_pass_swiglu_config_to_op(module_name, monkeypatch
     assert op.call_args.kwargs["swiglu_limit"] == config.swiglu_limit
 
 
-@pytest.mark.parametrize("module_name", _MODELING_MODULES)
-def test_minimax_m3_vl_rms_norm_passes_fp32_weight_to_op(module_name, monkeypatch):
-    modeling = importlib.import_module(module_name)
+def test_minimax_m3_vl_rms_norm_passes_fp32_weight_to_op(monkeypatch):
     norm = modeling.MiniMaxM3VLRMSNorm(8, eps=1e-6).to(torch.bfloat16)
     op = Mock()
     monkeypatch.setattr(norm, "veomni_rms_norm", op)
