@@ -20,9 +20,11 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import (
     AcceleratorConfig,
     DataArguments,
+    FSDPConfig,
     ModelArguments,
     OffloadConfig,
     OpsImplementationConfig,
+    OptimizerConfig,
     TrainingArguments,
     VeOmniArguments,
 )
@@ -626,11 +628,13 @@ def test_vlm_runtime_rejects_unsupported_compile_model_while_building(monkeypatc
 
     args = SimpleNamespace(
         accelerator=SimpleNamespace(
+            fsdp_config=FSDPConfig(),
             torch_compile=ArgumentsTorchCompileConfig(enable=True),
             ulysses_size=1,
             cp_size=1,
             enable_async=False,
         ),
+        optimizer=OptimizerConfig(),
     )
     with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
         VLMModelRuntime(args, train=SimpleNamespace())

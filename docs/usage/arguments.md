@@ -498,7 +498,7 @@ The default `mode=None` follows TorchTitan's main path by using the `inductor` b
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| type | `Literal["adamw", "anyprecision_adamw", "muon"]` | `"adamw"` | Optimizer type. `muon` builds Muon and AdamW parameter groups. |
+| type | `Literal["adamw", "anyprecision_adamw", "muon", "hyper_muon"]` | `"adamw"` | Optimizer type. `muon` and `hyper_muon` build Muon and AdamW parameter groups using VeOmni and HyperParallel respectively. Hyper FSDP does not support `anyprecision_adamw`. |
 | lr | `float` | `5e-5` | Maximum / default learning rate. |
 | lr_min | `float` | `1e-7` | Minimum learning rate. |
 | lr_start | `float` | `0.0` | Starting learning rate for warmup. |
@@ -711,7 +711,7 @@ configured and never round-trip through a saved config.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| fsdp_mode | `Literal["ddp", "fsdp2", "eager"]` | `"fsdp2"` | Data parallel mode. `"eager"` skips every wrapper for the single-process Omni inference path (`_init_eager_inference`). |
+| fsdp_mode | `Literal["ddp", "fsdp2", "hyper_fsdp2", "eager"]` | `"fsdp2"` | Data parallel mode. `"hyper_fsdp2"` selects HyperParallel FSDP/HSDP for training, excluding SeedOmni. `"eager"` skips every wrapper for the single-process Omni inference path (`_init_eager_inference`). |
 | fsdp_scope | `Literal["module", "model"]` | `"module"` | SeedOmni: `"module"` wraps each OmniModule independently; `"model"` wraps the composed `OmniModel` once (one FSDP tree). Wrap targets are each child's `_no_split_modules` scoped as `{child}.{ClassName}`; leftover params unshard on `OmniModel.forward()`. Per-module DDP / ExtraParallel / `init_device` / SP-CP-TP-PP overlays are unused under `"model"` (module YAML is not rewritten); the top-level accelerator topology is used. |
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
@@ -723,6 +723,7 @@ configured and never round-trip through a saved config.
 | low_precision_reduce_scatter_comm | `bool` | `False` | Use `mixed_precision.param_dtype` (BF16 or FP16) for node-local FSDP2 ReduceScatter communication while keeping FP32 accumulation. See the precision and topology tables below. |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
+| hyper_parallel | `HyperParallelFSDPConfig` | — | Hyper FSDP communication and prefetch settings; see below. |
 
 Set `low_precision_reduce_scatter_comm: true` to communicate gradients in `mixed_precision.param_dtype`
 while keeping `mixed_precision.reduce_dtype: float32`. There is no separate communication-dtype setting;
@@ -869,6 +870,19 @@ search of all NCCL tuning or buffer-registration settings.
 Native BF16 was faster (about 2.76 ms at 1024 MiB), but changes reduction precision; its entire
 gap cannot be attributed to conversion alone because the communication and accumulation
 implementations also differ. These timings measure collective latency, not model throughput.
+
+#### HyperParallelFSDPConfig
+
+`model.accelerator.fsdp_config.hyper_parallel.*` — controls for `hyper_fsdp2`.
+See [HyperParallel](../key_features/hyper_parallel.md) for installation and configuration.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| comm_fusion | `bool` | `False` | Fuse parameter and gradient communication buffers. |
+| comm_fusion_vit | `Optional[bool]` | `None` | Override communication fusion for the visual tower; `None` inherits `comm_fusion`. |
+| forward_prefetch_depth | `int` | `1` | Number of following blocks to prefetch when `forward_prefetch` is enabled. |
+| backward_prefetch_depth | `int` | `1` | Number of blocks to prefetch in backward execution order. |
+| reduce_comm_interval | `int` | `1` | Gradient-reduction communication wait interval. |
 
 ### MixedPrecisionConfig
 
