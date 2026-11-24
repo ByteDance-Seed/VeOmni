@@ -635,6 +635,13 @@ recomputing the rest; the blocks after them recompute in full. A count larger
 than the stack means the whole stack, and `recompute_layers: 0` keeps every
 block's activations while checkpointing stays on.
 
+When calling `build_parallelize_model` directly with an active
+`RecomputePolicy`, its `use_reentrant` must match `enable_reentrant`; conflicting
+settings raise before checkpointing is enabled. Model-specific restrictions
+still apply, such as H3's requirement for non-reentrant checkpointing. The
+framework installs its reentrant checkpoint function only after the model and
+policy have accepted the setup.
+
 When its context cannot be carried, SAC is dropped and the blocks in its range
 recompute in full, with a warning naming the reason:
 

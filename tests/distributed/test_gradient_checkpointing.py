@@ -44,6 +44,8 @@ def test_build_parallelize_model_forwards_checkpoint_early_stop(monkeypatch, ear
         lambda: types.SimpleNamespace(fsdp_enabled=True, tp_enabled=False, dp_mode="fsdp2"),
     )
     monkeypatch.setattr(torch_parallelize, "parallelize_model_fsdp2", lambda model, **kwargs: model)
+    checkpoint_function = torch.utils.checkpoint.CheckpointFunction
+    monkeypatch.setattr(torch.utils.checkpoint, "CheckpointFunction", checkpoint_function)
     model = _CheckpointingModel()
 
     result = build_parallelize_model(
@@ -61,6 +63,7 @@ def test_build_parallelize_model_forwards_checkpoint_early_stop(monkeypatch, ear
     if not use_reentrant:
         expected["early_stop"] = early_stop
     assert model.gradient_checkpointing_kwargs == expected
+    assert torch.utils.checkpoint.CheckpointFunction is (CheckpointFunction if use_reentrant else checkpoint_function)
 
 
 def test_gradient_checkpointing_config_enables_early_stop_by_default():
@@ -1057,9 +1060,34 @@ def test_h3_rejects_reentrant_checkpointing_before_parallel_wrap(monkeypatch, re
                     recompute_layers=recompute_layers, use_reentrant=True
                 ),
             )
+        assert torch.utils.checkpoint.CheckpointFunction is checkpoint_function
     finally:
         torch.utils.checkpoint.CheckpointFunction = checkpoint_function
     assert not model.is_gradient_checkpointing
+
+
+@pytest.mark.parametrize("enable_reentrant", [False, True])
+@pytest.mark.parametrize("h3", [False, True])
+def test_parallelize_rejects_conflicting_reentrant_policy(monkeypatch, enable_reentrant, h3):
+    model = _tiny_h3_model() if h3 else _CheckpointingModel()
+    checkpoint_function = torch.utils.checkpoint.CheckpointFunction
+    try:
+        with pytest.raises(ValueError, match=r"recompute_policy.use_reentrant must match enable_reentrant"):
+            _parallelize(
+                monkeypatch,
+                model,
+                enable_reentrant=enable_reentrant,
+                recompute_policy=recompute_utils.RecomputePolicy(
+                    recompute_layers=2, use_reentrant=not enable_reentrant
+                ),
+            )
+        assert torch.utils.checkpoint.CheckpointFunction is checkpoint_function
+        if h3:
+            assert not model.is_gradient_checkpointing
+        else:
+            assert model.gradient_checkpointing_kwargs is None
+    finally:
+        torch.utils.checkpoint.CheckpointFunction = checkpoint_function
 
 
 def test_the_policy_decides_the_h3_blocks_flavour(monkeypatch):

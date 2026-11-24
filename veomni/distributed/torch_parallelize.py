@@ -1090,11 +1090,16 @@ def build_parallelize_model(
         model = model.float()
 
     checkpoint_early_stop = kwargs.pop("early_stop", True)
+    use_reentrant = False
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         logger.info_rank0("Enable gradient checkpointing.")
         use_reentrant = kwargs.pop("enable_reentrant", False)
-        if use_reentrant:
-            torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
+        if (
+            recompute_policy is not None
+            and recompute_policy.active
+            and recompute_policy.use_reentrant != use_reentrant
+        ):
+            raise ValueError("recompute_policy.use_reentrant must match enable_reentrant.")
 
         # The entry points the policy does not bind keep whatever HF is given here,
         # so the run's own recompute context has to be in it — otherwise a module
@@ -1124,6 +1129,10 @@ def build_parallelize_model(
     # themselves still need their blocks bound.
     if recompute_policy is not None:
         recompute_utils.apply_recompute_policy(model, recompute_policy, basic_modules=basic_modules)
+
+    if use_reentrant:
+        # Install only after the model and policy have accepted checkpoint setup.
+        torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
     if parallel_state.tp_enabled:
         logger.info_rank0("Apply tensor parallel to the model.")
