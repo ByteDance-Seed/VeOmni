@@ -233,6 +233,25 @@ def test_export_rejects_lossy_compute_representation():
         unwrap_mxfp8_tensor(gathered)
 
 
+@pytest.mark.parametrize("all_gather", [False, True])
+@pytest.mark.parametrize(
+    "in_features,out_features,dtype,error",
+    [(32, 32, torch.bfloat16, "FP32"), (48, 32, torch.float32, "32"), (32, 48, torch.float32, "32")],
+)
+def test_from_float_rejects_invalid_master_weights(all_gather, in_features, out_features, dtype, error):
+    layer = nn.Linear(in_features, out_features, dtype=dtype)
+    with pytest.raises(ValueError, match=error):
+        MXFP8Linear.from_float(layer, all_gather=all_gather, emulate=True)
+
+
+@pytest.mark.parametrize("all_gather", [False, True])
+def test_from_float_rejects_hooked_projection(all_gather):
+    layer = nn.Linear(32, 32)
+    layer.register_forward_hook(lambda module, args, kwargs, output: 2 * output, with_kwargs=True)
+    with pytest.raises(ValueError, match="hooks"):
+        MXFP8Linear.from_float(layer, all_gather=all_gather, emulate=True)
+
+
 @pytest.mark.parametrize("gathered", [False, True])
 def test_mxfp8_aot_autograd_matches_eager_for_ragged_tokens(gathered):
     torch.manual_seed(81)

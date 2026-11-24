@@ -345,6 +345,27 @@ class MXFP8Linear(nn.Linear):
 
     @classmethod
     def from_float(cls, module: nn.Linear, *, all_gather: bool, emulate: bool = False):
+        if module.weight.dtype != torch.float32:
+            raise ValueError(f"MXFP8Linear conversion requires an FP32 master weight, got {module.weight.dtype}.")
+        shape = module.weight.shape
+        if len(shape) != 2 or any(size == 0 or size % _BLOCK_SIZE for size in shape):
+            raise ValueError(
+                f"MXFP8Linear requires a nonempty 2-D weight with both dimensions divisible by {_BLOCK_SIZE}, "
+                f"got {tuple(shape)}."
+            )
+        if any(
+            (
+                module._forward_pre_hooks,
+                module._forward_hooks,
+                module._backward_pre_hooks,
+                module._backward_hooks,
+                module._state_dict_pre_hooks,
+                module._state_dict_hooks,
+                module._load_state_dict_pre_hooks,
+                module._load_state_dict_post_hooks,
+            )
+        ):
+            raise ValueError("MXFP8Linear conversion would discard module hooks. Convert before attaching hooks.")
         with torch.device("meta"):
             result = cls(module.in_features, module.out_features, bias=module.bias is not None)
         result.weight = (
