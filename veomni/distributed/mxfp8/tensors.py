@@ -16,14 +16,17 @@ or block-splitting layout is rejected rather than changing the quantizer.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.utils import _pytree as pytree
-from torchao.prototype.mx_formats.config import ScaleCalculationMode
-from torchao.prototype.mx_formats.mx_tensor import MXTensor
-from torchao.quantization.quantize_.common import KernelPreference
+
+
+if TYPE_CHECKING:
+    from torchao.prototype.mx_formats.mx_tensor import MXTensor
 
 
 _BLOCK_SIZE = 32
@@ -44,6 +47,10 @@ _MASTER_PRESERVING_OPS = {
 
 def _quantize(tensor: torch.Tensor, emulate: bool) -> MXTensor:
     """Use torchao's RCEIL quantizer; AUTO always selects its native MX GEMM."""
+    from torchao.prototype.mx_formats.config import ScaleCalculationMode
+    from torchao.prototype.mx_formats.mx_tensor import MXTensor
+    from torchao.quantization.quantize_.common import KernelPreference
+
     quantized = MXTensor.to_mx(
         tensor.contiguous(),
         torch.float8_e4m3fn,
@@ -64,6 +71,9 @@ def _quantize(tensor: torch.Tensor, emulate: bool) -> MXTensor:
 
 
 def _from_payload(data: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype, emulate: bool) -> MXTensor:
+    from torchao.prototype.mx_formats.mx_tensor import MXTensor
+    from torchao.quantization.quantize_.common import KernelPreference
+
     return MXTensor.from_qdata_and_scales(
         data.view(torch.float8_e4m3fn),
         scale.view(torch.float8_e8m0fnu),

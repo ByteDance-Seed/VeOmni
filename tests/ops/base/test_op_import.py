@@ -38,6 +38,8 @@ def test_import_veomni_without_optional_kernel_packages() -> None:
 import builtins
 import sys
 
+# Hide the optional float8 extra from both imports and third-party package discovery.
+sys.modules["torchao"] = None
 real_import = builtins.__import__
 attempted_optional_imports = []
 optional_roots = {
@@ -81,6 +83,7 @@ import veomni.ops.qat
 from veomni.ops import OP_REGISTRY
 from veomni.ops.kernels.moe_experts.shared import swiglu
 from veomni.distributed.moe import EPMergedFc1GroupGemm
+from veomni.distributed.mxfp8.tensors import MXFP8Linear
 import torch
 
 gate = torch.tensor([[0.5, -1.0]])
