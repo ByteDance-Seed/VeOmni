@@ -258,6 +258,21 @@ class OptimizerConfig:
             )
         },
     )
+    muon_expert_ns_max_experts: int = field(
+        default=-1,
+        metadata={
+            "help": (
+                "Enable chunked Newton-Schulz for a local-expert stack on device (the "
+                "muon_expert_zero_comm path). -1 (default) disables chunking: the whole local "
+                "stack is orthogonalized in one call, which is fastest and needs the most NS "
+                "workspace. A positive value bounds the workspace at max_experts * min(M, K)**2 "
+                "instead of local_experts * min(M, K)**2, splitting the stack into balanced "
+                "slices of at most that many experts (a remainder never becomes a single-expert "
+                "call). Costs a few percent of step time; use it only when the unchunked "
+                "workspace would OOM."
+            )
+        },
+    )
     muon_ns_implementation: Literal["std", "gram", "gram_quack"] = field(
         default="gram_quack",
         metadata={
