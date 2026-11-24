@@ -342,6 +342,9 @@ selects audio/video or image execution from `config.audio_enabled`; both paths
 reject floating-point timesteps or positions already cast below FP32. Call the
 model as `model(...)` so FSDP2 runs the wrapper and DiT unshard hooks. Image
 inference uses this entry point and returns patchified image rows.
+Serial and packed audio/video calls both accept FP64 metadata. Packing validates
+each sample before concatenation, so mixing FP32 with BF16/FP16 metadata still
+raises instead of hiding the rounded input through dtype promotion.
 Set `gradient_checkpointing.enable_reentrant` to `false` so recomputation
 preserves gradients for the time embedding passed to each block. FSDP2
 parallelization rejects LoRA on the six FP32 projections; other paths do not

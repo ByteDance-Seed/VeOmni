@@ -19,6 +19,7 @@ from veomni.distributed.sequence_parallel.ulysses import (
 )
 from veomni.ops import VeomniOp
 
+from .batch_packing import _validate_fp32_metadata
 from .core import (
     bind_minimax_attention,
     is_flash_attn_impl,
@@ -127,14 +128,6 @@ class MiniMaxH3Rope(nn.Module):
         t_f, h_f, w_f = per_axis.unbind(dim=1)
         half = torch.cat((t_f, h_f, w_f), dim=-1)
         return torch.cat((half, half), dim=-1)
-
-
-def _validate_fp32_metadata(timesteps: torch.Tensor, position_ids: torch.Tensor) -> None:
-    """Reject timestep and position inputs that have already lost FP32 precision."""
-    if any(tensor.is_floating_point() and tensor.element_size() < 4 for tensor in (timesteps, position_ids)):
-        raise ValueError(
-            "H3 floating-point timesteps and positions need FP32 or higher. Set cast_forward_inputs=False."
-        )
 
 
 def _cast_linear_input(module, args):

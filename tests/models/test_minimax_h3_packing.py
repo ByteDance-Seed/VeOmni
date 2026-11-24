@@ -1212,6 +1212,35 @@ def test_h3_rejects_rounded_inputs_and_fp32_island_lora():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("key", ["unique_timesteps", "img_position_ids"])
+def test_h3_packing_accepts_fp64_metadata(key):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.batch_packing import pack_samples
+
+    model = tiny_model().eval()
+    samples = prepare(condition_model(), [raw_sample(text_len=3), raw_sample(text_len=7)])
+    samples[1][key] = samples[1][key].double()
+    packed_inputs, _ = pack_samples(samples)
+    assert packed_inputs[key].dtype == torch.float64
+    expected = [model(**sample).predictions for sample in samples]
+    actual = model(**batch(samples)).predictions
+    for index, predictions in enumerate(expected):
+        for modality in range(2):
+            torch.testing.assert_close(actual[modality][index], predictions[modality], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("key", ["unique_timesteps", "img_position_ids"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_h3_packing_rejects_rounded_sample_before_dtype_promotion(key, dtype):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.batch_packing import pack_samples
+
+    samples = prepare(condition_model(), [raw_sample(), raw_sample()])
+    samples[1][key] = samples[1][key].to(dtype)
+    with pytest.raises(ValueError, match="cast_forward_inputs"):
+        pack_samples(samples)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_h3_async_offload_auto_discovers_blocks_only():
     from veomni.distributed.async_offload import apply_async_activation_offload
 
