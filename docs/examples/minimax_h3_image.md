@@ -68,11 +68,13 @@ image.save("edit.png")
 ## Text-to-image fine-tuning
 
 The online and offline paths support `micro_batch_size: 1` and `ulysses_size: 1`.
-They follow the public [DiffSynth fine-tuning recipe](https://github.com/modelscope/DiffSynth-Studio/blob/fc8b4be56759de06cac585929f608227ac58766b/examples/minimax_h3_image/model_training/full/MiniMax-H3-Image.sh): the DiT learns a flow-matching target while the six released PDD heads remain frozen. Each training sigma selects the nearest release head, excluding the terminal zero. Both paths sample fresh noise and timesteps during training. The text encoder and VAE stay frozen: offline training reads their cached outputs; online training encodes each raw image/prompt before its DiT update. This is fine-tuning, not a reproduction of the original PDD distillation. Training currently covers T2I only; reference-image editing training and packed batches are outside this example.
+They follow the public [DiffSynth fine-tuning recipe](https://github.com/modelscope/DiffSynth-Studio/blob/fc8b4be56759de06cac585929f608227ac58766b/examples/minimax_h3_image/model_training/full/MiniMax-H3-Image.sh): the DiT learns a flow-matching target while the released PDD heads remain frozen. Image training uses the same H3 layout and DiT `forward()` as video, with one latent frame and no audio tokens. The image VAE and noise schedule are still image-specific.
+
+Both paths sample fresh noise and timesteps. The 1,000-step training schedule uses `shift=2.22`; each training sigma selects the nearest released sigma except the terminal zero. The resulting head buckets have unequal training weight, and their ranges extend beyond the exact inference sigmas. This is flow-matching fine-tuning, not a reproduction of the original PDD distillation. The provided training recipes cover T2I only; reference-image editing recipes and packed batches are outside this example.
 
 ### Prepare weights and data
 
-After downloading the release, prepare a training transformer directory. The original shards are linked by absolute path, not copied. Keep the release and its shards accessible at those paths on every training node.
+After downloading the release, prepare a training transformer directory. Preparation reads the number of heads from `pdd_fused_heads.safetensors` and the matching sampling schedule from `pdd_config.json`. The example YAMLs use the generated `condition.json` next to the transformer `config.json`. When updating a prepared checkpoint from an older recipe, prepare it again in a new directory and point the YAMLs at both generated configs. The original shards are linked by absolute path, not copied. Keep the release and its shards accessible at those paths on every training node.
 
 ```shell
 uv run python -m scripts.prepare_minimax_h3_image_t2i \
@@ -93,6 +95,8 @@ done
 ### Offline training: cache and run one step
 
 Cache first on a device with enough room to hold the truncated BF16 text encoder (about 48 GiB of parameters), FP32 VAE, and their activations. The embedding run does not load the DiT. The cache stores text embeddings, token tags, and normalized VAE posterior modes. It contains serialized tensors; only load a cache you trust.
+
+For a training target, bilinear cover resizing preserves the source aspect ratio before center-cropping to the configured `height` and `width`. The crop fixes the canvas and can cut content near the edges. Training uses the VAE posterior mode so cache creation is deterministic and does not consume training noise RNG. Inference references serve a different purpose: they are resized by short-edge bounds with bicubic interpolation to preserve their composition, and use posterior samples as in the release.
 
 ```shell
 NPROC_PER_NODE=1 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_t2i_embedding.yaml

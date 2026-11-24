@@ -4,6 +4,8 @@ from typing import Optional
 
 from veomni.models.configuration_base import VeOmniPretrainedConfig
 
+from ..pdd import DEFAULT_SIGMAS, validate_pdd_sigmas
+
 
 class MiniMaxH3ImageConditionModelConfig(VeOmniPretrainedConfig):
     model_type = "MiniMaxH3ImageConditionModel"
@@ -20,6 +22,8 @@ class MiniMaxH3ImageConditionModelConfig(VeOmniPretrainedConfig):
         height: int = 1024,
         width: int = 1024,
         seed: int = 42,
+        pdd_sigmas: tuple[float, ...] = DEFAULT_SIGMAS,
+        num_pdd_heads: int | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -35,3 +39,5 @@ class MiniMaxH3ImageConditionModelConfig(VeOmniPretrainedConfig):
         self.height = height
         self.width = width
         self.seed = seed
+        self.pdd_sigmas = validate_pdd_sigmas(pdd_sigmas, num_pdd_heads)
+        self.num_pdd_heads = len(self.pdd_sigmas) - 1

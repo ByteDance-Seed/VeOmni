@@ -29,6 +29,8 @@ from tests.models.compare import eager_ops_config
 from tests.models.tiny_configs import tiny_minimax_h3_config
 from tests.models.tiny_configs import tiny_minimax_h3_image_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_minimax_h3_image_config as _tiny_config
+from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import patchify_video, unpatchify_video
+from veomni.models.diffusers.minimax_h3.minimax_h3_core.packed_sequence import build_packed_fl2va, build_packed_ref2va
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
     MiniMaxH3DiTModel,
 )
@@ -119,10 +121,13 @@ def test_minimax_h3_image_forward_backpropagates_to_image_and_text_rows():
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_minimax_h3_image_training_updates_backbone_through_frozen_head():
     torch.manual_seed(0)
-    config = tiny_minimax_h3_config(audio_enabled=False, num_pdd_heads=6, image_training=True)
+    config = tiny_minimax_h3_config(
+        audio_enabled=False, num_pdd_heads=6, condition_model_type="MiniMaxH3ImageConditionModel"
+    )
     config._set_ops_implementation(eager_ops_config())
     model = MiniMaxH3DiTModel(config)
-    assert config.condition_model_type == "MiniMaxH3ImageConditionModel"
+    assert all(param.requires_grad for param in model.dit.final_layer.pdd_out.parameters())
+    model.freeze_model()
     inputs = {**_image_inputs(), "pdd_step_index": 2}
     target = torch.randn_like(inputs["x"])
     weight = torch.tensor(0.7)
@@ -135,7 +140,26 @@ def test_minimax_h3_image_training_updates_backbone_through_frozen_head():
         raw_prediction = model.forward_image(**inputs)
         expected = (raw_prediction + target).square().mean() * weight
     optimizer = torch.optim.AdamW((param for param in model.parameters() if param.requires_grad), lr=1e-3)
-    output = model(image_inputs=inputs, image_training_target=target, image_loss_weight=weight)
+    training_inputs = {
+        "x": inputs["x"],
+        "prompt_embeds": inputs["prompt_embeds"],
+        "img_position_ids": inputs["position_ids"].unsqueeze(0),
+        "unique_timesteps": inputs["unique_timesteps"],
+        "inverse_indices": inputs["timestep_indices"],
+        "token_tags": inputs["token_tags"],
+        "img_pos_info": {"position_ids": inputs["image_indices"]},
+        "img_pos_for_infer_output_info": {"position_ids": inputs["image_indices"]},
+        "text_pos_info": {"position_ids": inputs["text_indices"]},
+        "pdd_step_index": inputs["pdd_step_index"],
+        "training_target": target,
+        "image_loss_weight": weight,
+    }
+    with pytest.raises(ValueError, match="without audio/video training metadata"):
+        model(**training_inputs, training_cfg_scales=(2.0, 2.0))
+    dit_calls = []
+    with model.dit.register_forward_pre_hook(lambda module, args: dit_calls.append(module)):
+        output = model(**training_inputs)
+    assert dit_calls == [model.dit]
     torch.testing.assert_close(output.predictions[0], -raw_prediction)
     torch.testing.assert_close(output.loss["mse_image"], expected)
     output.loss["mse_image"].backward()
@@ -425,6 +449,33 @@ def test_minimax_h3_image_layout_places_text_references_and_target():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("reference_grids", [[], [(16, 16), (20, 40)]], ids=["t2i", "with-references"])
+def test_minimax_h3_image_layout_matches_single_frame_video(reference_grids):
+    tags = torch.tensor([1, 0, 1])
+    latent_height, latent_width = 16, 24
+    positions, token_tags, image_indices, text_indices, num_reference_rows = build_image_packed_sequence(
+        tags, reference_grids, latent_height, latent_width, (1, 2, 2)
+    )
+
+    layout_args = (tags.numel(), 1, latent_height, latent_width, 0)
+    if reference_grids:
+        ref_blocks = [
+            {"kind": "image", "latent_t": 1, "latent_h": height, "latent_w": width}
+            for height, width in reference_grids
+        ]
+        video = build_packed_ref2va(*layout_args, ref_blocks, text_token_tags=tags)
+    else:
+        video = build_packed_fl2va(*layout_args, [], text_token_tags=tags)
+
+    torch.testing.assert_close(positions, video["img_position_ids"][0], rtol=0, atol=0)
+    torch.testing.assert_close(token_tags, video["token_tags"], rtol=0, atol=0)
+    torch.testing.assert_close(image_indices, video["img_pos"], rtol=0, atol=0)
+    torch.testing.assert_close(text_indices, video["text_pos"], rtol=0, atol=0)
+    assert num_reference_rows == video["cond_rows"]
+    assert video["audio_pos"].numel() == 0
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("device", ["cpu", "meta"])
 def test_minimax_h3_image_layout_keeps_token_metadata_on_input_device(device):
     tags = torch.tensor([1, 0, 1], device=device)
@@ -442,12 +493,16 @@ def test_minimax_h3_image_layout_keeps_token_metadata_on_input_device(device):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_minimax_h3_image_patchify_matches_unpatchify():
-    latents = torch.randn(1, 24, 1, 8, 8)
-    rows = patchify_image_latents(latents, (1, 2, 2))
-    restored = unpatchify_image_rows(rows, 8, 8, 24, (1, 2, 2))
-    assert rows.shape == (16, 96)
-    assert torch.equal(restored, latents[:, :, 0])
+@pytest.mark.parametrize("autocast_enabled", [False, True], ids=["fp32", "autocast"])
+def test_minimax_h3_image_patchify_matches_unpatchify(autocast_enabled):
+    latents = torch.randn(1, 24, 1, 8, 12)
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast_enabled):
+        rows = patchify_image_latents(latents, (1, 2, 2))
+        restored = unpatchify_image_rows(rows, 8, 12, 24, (1, 2, 2))
+    assert rows.shape == (24, 96)
+    torch.testing.assert_close(rows, patchify_video(latents), rtol=0, atol=0)
+    torch.testing.assert_close(restored, unpatchify_video(rows, 1, 8, 12).squeeze(2), rtol=0, atol=0)
+    torch.testing.assert_close(restored, latents[:, :, 0], rtol=0, atol=0)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

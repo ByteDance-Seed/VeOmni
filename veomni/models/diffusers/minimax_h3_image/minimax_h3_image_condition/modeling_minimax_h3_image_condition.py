@@ -18,7 +18,6 @@ from veomni.utils import logging
 
 from ...minimax_h3.minimax_h3_core.flow_match_scheduler import FlowMatchScheduler
 from ..layout import (
-    DEFAULT_SIGMAS,
     MINIMAX_H3_IMAGE_TAG,
     MINIMAX_H3_TEXT_TAG,
     build_image_packed_sequence,
@@ -33,6 +32,7 @@ logger = logging.get_logger(__name__)
 
 PIXEL_MEAN = (0.485, 0.456, 0.406)
 PIXEL_STD = (0.229, 0.224, 0.225)
+REFERENCE_MODEL_TIME = 0.999
 _TRAINING_STEPS = 1000
 _TRAINING_SHIFT = 2.22
 _IMAGE_PATCH_SIZE = (1, 2, 2)
@@ -75,7 +75,7 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
         with torch.device("cpu"):
             self._scheduler.set_timesteps(_TRAINING_STEPS, training=True)
         self._training_model_times = 1.0 - self._scheduler.timesteps / _TRAINING_STEPS
-        release_sigmas = torch.tensor(DEFAULT_SIGMAS[:-1], device="cpu", dtype=torch.float32)
+        release_sigmas = torch.tensor(config.pdd_sigmas[:-1], device="cpu", dtype=torch.float32)
         self._training_pdd_indices = ((1.0 - self._training_model_times[:, None]) - release_sigmas).abs().argmin(dim=1)
         if not config.skip_encoder_load:
             self._init_encoders(config)
@@ -277,36 +277,63 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
         self.generator.set_state(state["generator"])
 
     @torch.no_grad()
-    def process_condition(self, prompt_embeds, text_token_tags, clean_latents) -> dict:
-        """Prepare one cached text-to-image sample for flow-matching training."""
-        if len(prompt_embeds) != 1 or len(text_token_tags) != 1 or len(clean_latents) != 1:
+    def process_condition(self, prompt_embeds, text_token_tags, clean_latents, reference_latents=None) -> dict:
+        """Prepare one image sample, optionally with cached references, for flow matching."""
+        columns = (prompt_embeds, text_token_tags, clean_latents)
+        if any(len(column) != 1 for column in columns) or (
+            reference_latents is not None and len(reference_latents) != 1
+        ):
             raise ValueError("MiniMax-H3-Image training requires micro_batch_size=1.")
 
         latents = clean_latents[0].float()
         latent_height, latent_width = latents.shape[-2:]
         device = latents.device
-        position_ids, token_tags, image_indices, text_indices, _ = self.build_layout(
-            text_token_tags[0], [], latent_height, latent_width, _IMAGE_PATCH_SIZE
+        references = [] if reference_latents is None else reference_latents[0]
+        reference_grids = [reference.shape[-2:] for reference in references]
+        position_ids, token_tags, image_indices, text_indices, cond_rows = self.build_layout(
+            text_token_tags[0], reference_grids, latent_height, latent_width, _IMAGE_PATCH_SIZE
         )
+        image_indices = image_indices.to(device)
 
         step = torch.randint(_TRAINING_STEPS, (), generator=self.generator, device="cpu").item()
         sigma = self._scheduler.sigmas[step].to(device)
         noise = torch.randn(latents.shape, generator=self.generator, device="cpu", dtype=torch.float32).to(device)
         noised_latents = (1.0 - sigma) * latents + sigma * noise
+        image_rows = patchify_image_latents(noised_latents.unsqueeze(2), _IMAGE_PATCH_SIZE)
+        prompt_rows = prompt_embeds[0]
+        if prompt_rows.ndim == 3:
+            prompt_rows = prompt_rows.squeeze(0)
+        unique_timesteps = self._training_model_times[step : step + 1].to(device)
+        inverse_indices = torch.zeros(position_ids.shape[0], dtype=torch.long, device=device)
+        if references:
+            reference_rows = []
+            for reference in references:
+                reference = reference.to(device=device, dtype=torch.float32)
+                reference_noise = torch.randn(
+                    reference.shape, generator=self.generator, device="cpu", dtype=torch.float32
+                ).to(device)
+                noised_reference = REFERENCE_MODEL_TIME * reference + (1.0 - REFERENCE_MODEL_TIME) * reference_noise
+                reference_rows.append(patchify_image_latents(noised_reference.unsqueeze(2), _IMAGE_PATCH_SIZE))
+            image_rows = torch.cat([*reference_rows, image_rows])
+            unique_timesteps = torch.cat([unique_timesteps.new_full((1,), REFERENCE_MODEL_TIME), unique_timesteps])
+            inverse_indices.fill_(1)
+            inverse_indices[image_indices[:cond_rows]] = 0
+
         return {
-            "image_inputs": {
-                "x": patchify_image_latents(noised_latents.unsqueeze(2), _IMAGE_PATCH_SIZE),
-                "prompt_embeds": prompt_embeds[0],
-                "unique_timesteps": self._training_model_times[step : step + 1].to(device),
-                "timestep_indices": torch.zeros(position_ids.shape[0], dtype=torch.long, device=device),
-                "token_tags": token_tags.to(device),
-                "position_ids": position_ids.to(device, torch.float32),
-                "image_indices": image_indices.to(device),
-                "text_indices": text_indices.to(device),
-                "pdd_step_index": int(self._training_pdd_indices[step]),
-            },
-            "image_training_target": patchify_image_latents((noise - latents).unsqueeze(2), _IMAGE_PATCH_SIZE),
+            "x": image_rows,
+            "prompt_embeds": prompt_rows,
+            "unique_timesteps": unique_timesteps,
+            "inverse_indices": inverse_indices,
+            "token_tags": token_tags.to(device),
+            "img_position_ids": position_ids.unsqueeze(0).to(device, torch.float32),
+            "img_pos_info": {"position_ids": image_indices},
+            "text_pos_info": {"position_ids": text_indices.to(device)},
+            "img_pos_for_infer_output_info": {"position_ids": image_indices},
+            "pdd_step_index": int(self._training_pdd_indices[step]),
+            "num_pdd_heads": self.config.num_pdd_heads,
+            "training_target": patchify_image_latents((noise - latents).unsqueeze(2), _IMAGE_PATCH_SIZE),
             "image_loss_weight": self._scheduler.linear_timesteps_weights[step].to(device),
+            "cond_rows": cond_rows,
         }
 
     @torch.no_grad()

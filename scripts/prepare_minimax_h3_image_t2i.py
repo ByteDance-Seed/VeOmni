@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME
 
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import (
@@ -17,9 +17,12 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.configuration_min
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
     MiniMaxH3DiTModel,
 )
+from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition.configuration_minimax_h3_image_condition import (
+    MiniMaxH3ImageConditionModelConfig,
+)
+from veomni.models.diffusers.minimax_h3_image.pdd import load_pdd_release
 
 
-_PDD_HEADS = 6
 _PDD_PREFIX = "final_layer.pdd_out."
 _PDD_SHARD = "model-pdd-heads.safetensors"
 
@@ -66,16 +69,12 @@ def _validate_transformer(transformer_dir, config_dict, weight_map):
     return shards.keys(), shapes
 
 
-def _read_pdd_heads(model_dir, shapes):
-    state = load_file(model_dir / "pdd_fused_heads.safetensors", device="cpu")
-    if state.keys() != {"video_out.weight", "video_out.bias"}:
-        raise ValueError("Expected only video_out.weight and video_out.bias in pdd_fused_heads.safetensors.")
-
+def _split_pdd_heads(state, shapes):
     heads = {}
     for suffix in ("weight", "bias"):
         name = f"video_out.{suffix}"
         stacked = state[name]
-        expected = (_PDD_HEADS, *shapes[f"{_PDD_PREFIX}0.{suffix}"])
+        expected = (stacked.shape[0], *shapes[f"{_PDD_PREFIX}0.{suffix}"])
         if tuple(stacked.shape) != expected or not stacked.is_floating_point():
             raise ValueError(
                 f"PDD {name} must be floating point with shape {expected}; got {stacked.dtype} {stacked.shape}."
@@ -86,7 +85,7 @@ def _read_pdd_heads(model_dir, shapes):
 
 
 def prepare_checkpoint(model_dir: Path, out_dir: Path) -> None:
-    """Link the release's transformer shards and add its six PDD heads as one shard."""
+    """Link the release's transformer shards and write its PDD heads and condition config."""
     model_dir = model_dir.resolve()
     if out_dir.is_symlink() or (out_dir.exists() and (not out_dir.is_dir() or any(out_dir.iterdir()))):
         raise FileExistsError(f"Output must be a new or empty directory: {out_dir}")
@@ -101,16 +100,24 @@ def prepare_checkpoint(model_dir: Path, out_dir: Path) -> None:
         or config.get("audio_enabled") is not False
     ):
         raise ValueError("Expected a native MiniMax-H3-Image transformer config (MiniMaxH3DiTModel without audio).")
+    pdd_state, sigmas = load_pdd_release(model_dir)
+    num_pdd_heads = pdd_state["video_out.weight"].shape[0]
+    condition_model_type = MiniMaxH3ImageConditionModelConfig.model_type
     config.update(
         model_type="MiniMaxH3DiTModel",
         architectures=["MiniMaxH3DiTModel"],
-        condition_model_type="MiniMaxH3ImageConditionModel",
-        image_training=True,
-        num_pdd_heads=_PDD_HEADS,
+        condition_model_type=condition_model_type,
+        num_pdd_heads=num_pdd_heads,
     )
+    condition_config = {
+        "model_type": condition_model_type,
+        "architectures": [condition_model_type],
+        "pdd_sigmas": sigmas,
+        "num_pdd_heads": num_pdd_heads,
+    }
     index = json.loads((transformer_dir / SAFE_WEIGHTS_INDEX_NAME).read_text())
     shard_names, shapes = _validate_transformer(transformer_dir, config, index["weight_map"])
-    heads = _read_pdd_heads(model_dir, shapes)
+    heads = _split_pdd_heads(pdd_state, shapes)
     index["weight_map"].update(dict.fromkeys(heads, _PDD_SHARD))
     index["metadata"]["total_size"] += sum(tensor.numel() * tensor.element_size() for tensor in heads.values())
 
@@ -121,6 +128,7 @@ def prepare_checkpoint(model_dir: Path, out_dir: Path) -> None:
             (staging / filename).symlink_to(transformer_dir / filename)
         save_file(heads, staging / _PDD_SHARD, metadata={"format": "pt"})
         (staging / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+        (staging / "condition.json").write_text(json.dumps(condition_config, indent=2) + "\n")
         (staging / SAFE_WEIGHTS_INDEX_NAME).write_text(json.dumps(index, indent=2) + "\n")
         staging.rename(out_dir)
 

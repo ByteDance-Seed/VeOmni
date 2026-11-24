@@ -9,7 +9,6 @@ its audio branch.
 
 from __future__ import annotations
 
-import json
 import os
 from itertools import chain
 from pathlib import Path
@@ -26,7 +25,6 @@ from veomni.utils.device import get_device_type, get_torch_device
 from ..minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 from ..minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import MiniMaxH3DiTModel
 from .layout import (
-    DEFAULT_SIGMAS,
     MINIMAX_H3_IMAGE_TAG,
     build_image_packed_sequence,
     get_image_canvas_size,
@@ -36,7 +34,11 @@ from .layout import (
 from .minimax_h3_image_condition.configuration_minimax_h3_image_condition import (
     MiniMaxH3ImageConditionModelConfig,
 )
-from .minimax_h3_image_condition.modeling_minimax_h3_image_condition import MiniMaxH3ImageConditionModel
+from .minimax_h3_image_condition.modeling_minimax_h3_image_condition import (
+    REFERENCE_MODEL_TIME,
+    MiniMaxH3ImageConditionModel,
+)
+from .pdd import DEFAULT_SIGMAS, load_pdd_release
 
 
 logger = logging.get_logger(__name__)
@@ -101,7 +103,7 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         self.patch_size = (1, 2, 2)
         self.vae_spatial_compression_ratio = 16
         self.latent_channels = 24
-        self.reference_noise_aug = 0.999
+        self.reference_noise_aug = REFERENCE_MODEL_TIME
         self.max_sequence_length = 4096
 
     @staticmethod
@@ -139,27 +141,14 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
                 chunk_gated_delta_rule_implementation="eager",
             )
 
-        pdd_path = os.path.join(model_path, "pdd_fused_heads.safetensors")
-        if not os.path.isfile(pdd_path):
-            raise FileNotFoundError(f"MiniMax-H3-Image PDD heads not found: {pdd_path}")
-        from safetensors.torch import load_file
-
-        pdd_state = load_file(pdd_path)
-        num_pdd_heads = int(pdd_state["video_out.weight"].shape[0])
-        pdd_config_path = os.path.join(model_path, "pdd_config.json")
-        sigmas = DEFAULT_SIGMAS
-        if os.path.isfile(pdd_config_path):
-            with open(pdd_config_path) as handle:
-                sigmas = json.load(handle).get("sigmas", DEFAULT_SIGMAS)
-        if len(sigmas) - 1 != num_pdd_heads:
-            raise ValueError(
-                f"Sigma schedule has {len(sigmas) - 1} transitions but the checkpoint has {num_pdd_heads} PDD heads."
-            )
+        pdd_state, sigmas = load_pdd_release(model_path)
+        num_pdd_heads = pdd_state["video_out.weight"].shape[0]
         pipe.scheduler = MiniMaxH3ImageScheduler(sigmas)
 
         condition_cfg = dict(condition_model_cfg or {})
         condition_cfg.setdefault("base_model_path", model_path)
         condition_cfg.setdefault("skip_encoder_load", False)
+        condition_cfg.update(pdd_sigmas=sigmas, num_pdd_heads=num_pdd_heads)
         condition_config = MiniMaxH3ImageConditionModelConfig(**condition_cfg)
         condition_config._apply_ops_overrides(ops_implementation=ops_implementation, _validate=False)
         condition_model = MiniMaxH3ImageConditionModel._from_config(condition_config)
