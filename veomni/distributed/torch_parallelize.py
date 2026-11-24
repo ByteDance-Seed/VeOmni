@@ -656,7 +656,7 @@ def parallelize_model_fsdp2(
             f"ExtraParallel {parallel_state.extra_parallel_names} is enabled for this run, but "
             f"{type(model).__name__} declares no parallel plan. Either:\n"
             "  * define a parallel plan on this model (see veomni/models/transformers/qwen3_moe/parallel_plan.py "
-            "or tests/utils/test_extra_parallel_clip_grad_norm.py::test_clip_grad_norm_fsdp2_ep2_emb4); or\n"
+            "or tests/utils/test_extra_parallel.py::test_clip_grad_norm_fsdp2_4gpu); or\n"
             "  * disable the inherited ExtraParallel dimension on this module's `accelerator` block "
             "(set `ep_size: 1` for `ep`, or drop non-`ep` dimensions from `extra_parallel_*`)."
         )

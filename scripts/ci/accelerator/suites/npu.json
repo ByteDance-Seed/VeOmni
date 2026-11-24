@@ -196,17 +196,7 @@
       "-v",
       "-s",
       "-x",
-      "tests/utils/test_extra_parallel_clip_grad_norm.py"
-    ]
-  },
-  {
-    "name": "npu-unit-18",
-    "suite": "unit",
-    "args": [
-      "-v",
-      "-s",
-      "-x",
-      "tests/utils/test_extra_parallel_stream_load.py"
+      "tests/utils/test_extra_parallel.py"
     ]
   },
   {

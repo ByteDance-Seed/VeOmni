@@ -193,8 +193,7 @@ by a `pytest.param` table, so a new case is a few lines:
 | Ulysses SP behaviour | `tests/parallel/ulysses/test_ulysses.py` and siblings |
 | Checkpoint callback / DCP round-trip | `tests/checkpoints/test_checkpoint_callback.py`, `test_trainer_saveload.py`, `test_dcp_checkpointer.py` |
 | DiT resume / noise-stream equivalence | `tests/checkpoints/test_dit_resume_align.py` |
-| Weight loading / broadcast / EP shard | `tests/utils/test_rank0_load_and_broadcast_weights.py`, `tests/utils/test_extra_parallel_stream_load.py` |
-| Grad clipping with ExtraParallel | `tests/utils/test_extra_parallel_clip_grad_norm.py` |
+| Weight loading / broadcast / ExtraParallel stream load & grad clipping | `tests/utils/test_rank0_load_and_broadcast_weights.py`, `tests/utils/test_extra_parallel.py` |
 | FLOPs / MFU accounting | `tests/utils/test_count_flops.py` |
 | Optimizer / Muon / swap | `tests/optim/test_muon_*.py`, `test_optimizer_vlm_param_groups.py`, `test_swap_adamw*.py` (CPU parity; the `_device` file runs on one real card; both swap files are enumerated per file in the suite manifests) |
 | LoRA / MoE-LoRA | the enumerated `tests/lora/test_*.py` set |

@@ -33,7 +33,7 @@ The lookup of a vocab-sharded embedding is described in [sharded_embedding.md](.
 
 ## Usage
 
-> File: tests/utils/test_extra_parallel_clip_grad_norm.py
+> File: tests/utils/test_extra_parallel.py
 
 When using train script (e.g. [tasks/train_vlm.py](../../tasks/train_vlm.py)), add the arguments:
 ```shell

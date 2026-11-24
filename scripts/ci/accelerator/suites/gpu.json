@@ -267,7 +267,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/utils/test_extra_parallel_clip_grad_norm.py"
+      "tests/utils/test_extra_parallel.py"
     ]
   },
   {
@@ -278,16 +278,6 @@
       "-s",
       "-x",
       "tests/utils/test_rank0_load_and_broadcast_weights.py"
-    ]
-  },
-  {
-    "name": "26-unit",
-    "suite": "unit",
-    "conditional": false,
-    "args": [
-      "-s",
-      "-x",
-      "tests/utils/test_extra_parallel_stream_load.py"
     ]
   },
   {
