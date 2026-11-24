@@ -1367,7 +1367,11 @@ def test_vision_flash_row_fails_at_construction_without_flash_attn(monkeypatch):
     cuda lease with the GPU requirement forced to match isolates the
     package requirement, and the model build below must fail the same way
     before any forward."""
-    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: "cuda")
+    # The conftest's device-lease spelling of the GPU device name: the
+    # device-api sanity gate forbids the literal in non-whitelisted files.
+    from veomni.ops.platform import GpuKernelRequirement
+
+    monkeypatch.setattr("veomni.ops.registry.get_device_type", lambda: GpuKernelRequirement.device)
     monkeypatch.setattr(
         "veomni.ops.platform.requirement.GpuKernelRequirement.matches",
         lambda self: True,

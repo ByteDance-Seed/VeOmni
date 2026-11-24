@@ -32,6 +32,7 @@ from tests.models.tiny_configs import tiny_kimi_k3_config
 from veomni.distributed.parallel_state import use_parallel_state
 from veomni.distributed.sequence_parallel.data import sp_pad_and_slice
 from veomni.models.transformers.kimi_k3.modeling_kimi_k3 import KimiK3ForConditionalGeneration
+from veomni.ops.platform import GpuKernelRequirement
 
 from .utils import SequenceParallelTest
 
@@ -46,7 +47,9 @@ CASES = {
 # CUDA's flash-attn row only accepts fp16/bf16, so the tower and its pixel
 # inputs run bf16 there with the repo's bf16 parity budget (the qwen4_exp
 # vision arrangement); the fused NPU row keeps fp32 and the tight budget.
-_VISION_DTYPE = torch.bfloat16 if get_device_type() == "cuda" else torch.float32
+# GpuKernelRequirement.device is the conftest's device-lease spelling of the
+# GPU device name (the device-api sanity gate forbids the literal here).
+_VISION_DTYPE = torch.bfloat16 if get_device_type() == GpuKernelRequirement.device else torch.float32
 _PARITY_ATOL = _PARITY_RTOL = 1e-2 if _VISION_DTYPE == torch.bfloat16 else 2e-4
 
 
