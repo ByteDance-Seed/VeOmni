@@ -478,23 +478,22 @@ def test_the_router_loss_is_computed_over_the_whole_sequence_under_sp():
 
 
 def test_an_empty_segment_keeps_its_slot_without_inferring_a_width():
-    """`reshape(0, -1)` is ambiguous on an empty tensor, so the width is carried.
+    """An empty row is kept so packing and the hidden-state scatter agree.
 
-    Checked in every position: an empty segment can come *before* the one that
-    would supply the hidden width, so resolving it from the first non-empty
-    segment as the packer walks would leave a leading empty row at width 0 and
-    `naflatten` then fails concatenating `(0, 0)` with `(N, H)`.
+    Every backbone-input producer emits a 2-D `(rows, hidden)` row, and an empty
+    one keeps its hidden width (`(0, hidden)`), so the packer only has to *keep*
+    the row. Checked in every position, since an empty segment may come before
+    the one that would otherwise supply the width.
     """
     for label, sample in (
-        ("leading 1-D", [ConversationItem(type="text", value=torch.zeros(0), role="user"), _text(3)]),
-        ("leading 2-D", [_text(0), _text(3)]),
+        ("leading", [_text(0), _text(3)]),
         ("middle", [_text(2), _text(0), _text(3)]),
-        ("trailing", [_text(2), ConversationItem(type="text", value=torch.zeros(0), role="user")]),
+        ("trailing", [_text(2), _text(0)]),
     ):
         packed = _pack(sample)
-        rows = sum(int(n) for n in [item.value.size(0) for item in sample])
+        rows = sum(int(item.value.size(0)) for item in sample)
         assert packed["inputs_embeds"].shape == (1, rows, HIDDEN), label
-        # The empty row keeps its slot, so packing and the scatter agree.
+        # The empty row keeps its slot, so the two sides count the same items.
         assert packed["inputs_embeds_shape"].shape[0] == len(sample), label
 
 

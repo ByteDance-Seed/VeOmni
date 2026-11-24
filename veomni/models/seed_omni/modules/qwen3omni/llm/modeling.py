@@ -101,28 +101,6 @@ def collect_qwen3omni_dummy_deepstack(
     return None
 
 
-def _resolve_embeddings_width(conversations: list[list[ConversationItem]]) -> int:
-    """Hidden width every packed segment must share.
-
-    Read from the first backbone-input row that carries a width, which is needed
-    *before* shaping the empty ones: ``reshape(0, -1)`` cannot infer a width with
-    no elements, and an empty segment may come before any non-empty one. A batch
-    that is empty throughout has no width to share, which only happens when there
-    is also nothing to pack — so ``0`` is safe there and the caller raises before
-    using it.
-    """
-    for sample in conversations:
-        for item in sample:
-            value = item.value
-            if not isinstance(value, torch.Tensor):
-                continue
-            if item.is_dummy or item.meta.get("_not_backbone_input", False):
-                continue
-            if value.numel() > 0:
-                return int(value.shape[-1])
-    return 0
-
-
 def pack_qwen3omni_conversations_for_forward(
     conversations: list[list[ConversationItem]],
     device: torch.device,
@@ -142,12 +120,6 @@ def pack_qwen3omni_conversations_for_forward(
     visual_pos_masks_list: list[torch.Tensor] = []
     sample_lengths: list[int] = []
     deepstack_chunks: list[list[torch.Tensor]] = []
-    # Hidden width of the packed sequence. Resolved up front rather than learnt
-    # from the first non-empty segment: an empty row cannot infer it
-    # (``reshape(0, -1)`` is ambiguous with no elements), and an empty segment
-    # can come *before* the one that would have supplied it.
-    embeddings_width = _resolve_embeddings_width(conversations)
-
     for sample in conversations:
         sample_len = 0
         current_pos = 0.0
@@ -167,14 +139,13 @@ def pack_qwen3omni_conversations_for_forward(
                 # item and raise ``StopIteration`` on the next — after the
                 # carrier had already been partly overwritten.
                 #
-                # ``reshape(0, -1)`` is not usable for this: on a 1-D empty tensor
-                # there is no row count to infer, so torch raises. Take the width
-                # from the first non-empty segment when there is one, and fall
-                # back to the item's own declared width otherwise.
-                width = embeddings_width
-                if width is None:
-                    width = embeds.shape[-1] if embeds.dim() != 1 else 0
-                inputs_embeds_list.append(embeds.reshape(0, width))
+                # ``embeds`` is already ``(0, H)``: every backbone-input producer
+                # emits a 2-D ``(rows, hidden)`` row, and an empty one keeps its
+                # hidden width (a text row is embedded to `(0, hidden)`, a clip to
+                # `(0, num_mel_bins)` patches). So there is no width to recover
+                # here — only the row to keep, so packing and the hidden-state
+                # scatter visit the same segments.
+                inputs_embeds_list.append(embeds)
                 position_ids_list.append(torch.zeros(3, 0, dtype=torch.float, device=device))
                 visual_pos_masks_list.append(torch.zeros(0, dtype=torch.bool, device=device))
                 if item.type in ("image", "video") and "deepstack" in item.meta:

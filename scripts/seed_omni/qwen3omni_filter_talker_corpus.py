@@ -274,9 +274,6 @@ def apply_scores(script_args: argparse.Namespace) -> None:
             f"match every file by row position. Re-score the surviving shards, or restart from the unfiltered "
             f"copy; delete the marker only if you have done one of those."
         )
-    with open(in_progress, "w", encoding="utf-8") as handle:
-        json.dump({"when": time.strftime("%Y-%m-%dT%H:%M:%S"), "min_overlap": script_args.min_overlap}, handle)
-
     scores = load_scores(script_args.corpus)
     shards = sorted(glob.glob(os.path.join(script_args.corpus, "*.parquet")))
 
@@ -291,6 +288,13 @@ def apply_scores(script_args: argparse.Namespace) -> None:
         # Rewriting now would silently keep unscored rows, which is the thing
         # this pass exists to remove.
         raise ValueError(f"{len(missing)} row(s) have no score (e.g. {missing[:3]}). Finish scoring before applying.")
+
+    # Written only here: everything above is read-only, so bailing out there must
+    # not leave a marker behind. Creating it earlier made "run --apply too soon,
+    # then finish scoring and retry" fail as an interrupted rewrite even though no
+    # shard had been touched.
+    with open(in_progress, "w", encoding="utf-8") as handle:
+        json.dump({"when": time.strftime("%Y-%m-%dT%H:%M:%S"), "min_overlap": script_args.min_overlap}, handle)
 
     kept_total = dropped_total = 0
     for shard, table in tables.items():
