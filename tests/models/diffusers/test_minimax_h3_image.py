@@ -126,6 +126,7 @@ def _run_minimax_h3_image_fsdp_forward(rank, weights_path, checkpointing, rendez
 
     import torch.distributed as dist
     from torch.distributed._composable.fsdp import fully_shard
+    from torch.utils.checkpoint import DefaultDeviceType
 
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.arguments import MixedPrecisionConfig
@@ -134,6 +135,8 @@ def _run_minimax_h3_image_fsdp_forward(rank, weights_path, checkpointing, rendez
     from veomni.models.auto import build_foundation_model
 
     torch.set_num_threads(1)
+    # Spawned ranks do not inherit the CPU checkpoint default set by the CI plugin.
+    DefaultDeviceType.set_device_type("cpu")
     dist.init_process_group("gloo", store=rendezvous.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=60))
     try:
         state = _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")

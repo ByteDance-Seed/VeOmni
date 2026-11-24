@@ -1146,6 +1146,7 @@ def test_invalid_precision_and_legacy_tail_fail_closed():
         model(x=[])
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_h3_foundation_loader_preserves_official_fp32_islands(dtype):
     from tests.tools.training_utils import make_eager_ops_config
@@ -1177,6 +1178,7 @@ def test_h3_foundation_loader_preserves_official_fp32_islands(dtype):
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_h3_adaln_activates_before_casting_fp32_time_embedding():
     from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3AdalnProj
 
@@ -1190,6 +1192,7 @@ def test_h3_adaln_activates_before_casting_fp32_time_embedding():
     assert time.grad.dtype == torch.float32 and torch.isfinite(time.grad).all()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_h3_rejects_rounded_inputs_and_fp32_island_lora():
     from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
 
@@ -1208,6 +1211,7 @@ def test_h3_rejects_rounded_inputs_and_fp32_island_lora():
         lora.get_base_model().get_ignore_modules_in_mixed_precision()
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_h3_async_offload_auto_discovers_blocks_only():
     from veomni.distributed.async_offload import apply_async_activation_offload
 
@@ -1460,6 +1464,7 @@ def test_h3_precision_through_production_fsdp(tmp_path, checkpointing, lora, off
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("task", ["fl2va", "ref2va"])
 def test_h3_fp32_heads_support_multistep_bf16_anchors(task):
     from tests.tools.training_utils import make_eager_ops_config
