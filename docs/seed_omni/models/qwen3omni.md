@@ -377,6 +377,21 @@ RVQ residual sensitivity rather than an encoder/decoder mismatch. Validate this
 codec — and any talker trained on it — on audio, never on exact code match
 beyond group 0.
 
+**Reproduced on `kyutai/mimi`.** Those numbers need the Qwen checkpoint too. What
+was checked without it, on a 1 s 220 Hz tone against the real Mimi weights:
+
+| Check | Result |
+|-------|--------|
+| Mimi loads, fp32 | 79.3 M params, 350 tensors |
+| config halves agree | 24 kHz, 16 quantizers, 1920 samples/frame on **both** sides |
+| `encode` → `decode` round trip | `(1, 16, 13)` codes → 1.04 s audio; 13 frames/s = 12.5 Hz ✓ |
+| our codec module, real Mimi config | builds (213.5 M params) and `encode_wav` returns `(16, 13)` — the talker's target contract |
+
+That pins the *plumbing*: the encoder half the converter fetches is the one this
+module's config was written against, the per-frame timing matches on both sides,
+and the target-tensor contract holds. It does not measure the index-space
+agreement above, which still needs both checkpoints.
+
 ---
 
 ## 5. Tests
@@ -389,3 +404,20 @@ is absent, so the CPU suite runs without it.
 ```bash
 pytest tests/seed_omni/modules/qwen3omni/ tests/seed_omni/test_shipped_training_graphs.py
 ```
+
+The codec is the one module that can be exercised against real weights without
+that checkpoint, and was — see §4. To repeat it, point `--mimi` at a local copy:
+
+```bash
+python scripts/seed_omni/qwen3omni_audio_check.py \
+  --model /path/to/Qwen3-Omni-30B-A3B-Instruct \
+  --mimi /path/to/kyutai-mimi \
+  --out-dir /tmp/omni_check
+```
+
+```{note}
+Still unverified here: training and generation end to end, and the index-space
+agreement between Mimi's codes and Qwen's vocoder. Both need the full Qwen3-Omni
+checkpoint, not only the encoder half.
+```
+
