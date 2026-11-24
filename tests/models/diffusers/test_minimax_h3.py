@@ -524,10 +524,10 @@ def test_minimax_h3_fp32_linear_stays_fp32_after_bfloat16_conversion():
 @pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
 def test_minimax_h3_fp32_linear_accelerator_autocast():
     from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3FP32Linear
-    from veomni.utils.device import get_device_type, get_torch_device
+    from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
 
     device_api = get_torch_device()
-    if get_device_type() not in ("cuda", "npu") or not device_api.is_available():
+    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or not device_api.is_available():
         pytest.skip("An accessible CUDA GPU or NPU is required")
     device_api.set_device(0)
     device = torch.device(get_device_type())
