@@ -82,12 +82,22 @@ Do not set `extra_parallel_fsdp_no_shard_module` by hand.
 
 ### Inference without the FSDP wrap
 
-ExtraParallel normally composes with FSDP2: the plan slices along its own
-dimension and FSDP shards what is left along `<para>_fsdp`. At inference the
-second half often has nothing to do, and for a quantized checkpoint it cannot
-run at all — an FSDP parameter group requires a single original dtype, while
-one quantized decoder layer holds several (packed int8 weights, fp8 values,
-fp8 or fp32 scales, fp32 numerics buffers).
+ExtraParallel normally composes with FSDP2, and the two shard **different
+dimensions**. For an expert stack `[E, H, I]` the plan takes dim0
+(`Shard(0)` over experts) and the wrap takes dim1 by default — see the
+`shard_placement_fn` that hands FSDP `Shard(1)`, or dim0 again when
+`expert_fsdp_shard_dim: 0` asks for whole-expert shards. `<para>_fsdp` names
+that second axis: with `ep_size=64` on 256 cards it is 4.
+
+At inference the second axis often has nothing to do, and for a checkpoint kept
+quantized it cannot run at all — an FSDP parameter group requires a single
+original dtype, while a decoder layer holding quantized storage as released has
+several (packed int8 weights, fp8 values, fp8 or fp32 scales, fp32 numerics
+buffers). That is the *inference* reason. A training run dequantizes at load —
+`weight_quantization: null` allocates bf16 (or fp32, with the wrap) parameters
+and spends the scales in the converter — so its layer holds one dtype and FSDP2
+accepts it. Training reaches for this mode for memory, not for dtype: an fp32
+master copy of a 196.6 B table would be another 786 GB.
 
 ```yaml
 accelerator:
@@ -105,9 +115,12 @@ the second is load-bearing when there are no gradients and no optimizer state.
 
 It is required rather than merely helpful when `<para>` already spans the whole
 shard axis: FSDP then shards nothing but still allocates an all-gather buffer
-the size of the local shard. The mode refuses a topology where `<para>_fsdp` is
-wider than one rank, since the plan leaves that axis to FSDP and without the
-wrap it would not be sharded at all.
+the size of the local shard. Because the plan leaves the `<para>_fsdp` axis to
+FSDP, the mode refuses a topology where that axis is wider than one rank —
+without the wrap it would not be sharded at all, and every expert would be
+replicated `<para>_fsdp` times in silence. In practice that means `ep_size` must
+equal the shard width (or an `emb` width must equal the card count) for the
+dimension to qualify.
 
 Note that inference defaults `mixed_precision.enable` to `false`. Mixed
 precision keeps fp32 master weights for an optimizer; left on it builds the

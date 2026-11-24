@@ -765,10 +765,12 @@ class FSDPConfig:
         metadata={
             "help": (
                 "Apply the model's ExtraParallel plan (ep / emb) but skip the FSDP2 wrap. "
-                "Inference only. For a quantized checkpoint whose bulk is already sharded "
-                "by the plan, FSDP2 has nothing left to do -- and cannot run anyway, since "
-                "one decoder layer mixes several storage dtypes and an FSDP parameter group "
-                "requires a single original dtype."
+                "The plan shards the dimension it names (e.g. experts on dim0) and the wrap "
+                "shards the rest (dim1 for experts); without the wrap that second axis must "
+                "be size 1, so this only fits a dimension already as wide as the shard axis. "
+                "For inference on a checkpoint kept quantized (fp8/fp4 storage), whose layer "
+                "mixes several floating-point dtypes that an FSDP parameter group refuses; "
+                "a training run dequantizes at load and does not need it for that reason."
             )
         },
     )

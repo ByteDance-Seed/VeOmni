@@ -455,11 +455,25 @@ def _finish_without_fsdp_wrap(
     activations. Only the second kind is load-bearing at inference, where there
     are no gradients and no optimizer state for the first kind to shard.
 
-    Dropping the wrap is what makes a quantized checkpoint loadable at all: an
-    FSDP parameter group requires one original dtype, while one quantized decoder
-    layer holds several (packed int8 weights, fp8 values, fp8 or fp32 scales, and
-    fp32 numerics buffers). That is a property of quantized storage, not a
-    configuration to get right.
+    The two also shard *different dimensions*, and that is what bounds where
+    this mode applies. For an expert stack ``[E, H, I]`` the plan takes dim0
+    (``Shard(0)`` over experts) while the wrap takes dim1 by default
+    (``shard_placement_fn`` -> ``Shard(1)`` over the hidden dim, or dim0 again
+    for whole-expert FSDP). Dropping the wrap leaves dim1 unsharded, so a
+    dimension whose ``<para>_fsdp`` axis is wider than one rank would replicate
+    every expert that many times; the guard below refuses that topology. The
+    mode therefore only fits a dimension that already spans the whole shard axis
+    (``ep_size`` == ``dp_shard`` for EP, or an ``emb`` width equal to the card
+    count).
+
+    At inference it is also what makes a quantized checkpoint loadable: an FSDP
+    parameter group requires one original dtype, and a decoder layer holding
+    quantized storage as released (packed int8 weights, fp8 values, fp8 or fp32
+    scales, fp32 numerics buffers) has several. That is a property of *storing*
+    the checkpoint quantized, not of training: a training run dequantizes at
+    load (``weight_quantization: null`` allocates bf16 or fp32 parameters and
+    spends the scales), so its layer holds one dtype and FSDP2 accepts it. The
+    dtype conflict is therefore the inference reason, not a training one.
 
     What it costs is the parameters the plan does not name: they stay whole on
     every rank instead of being sharded for storage. That is logged rather than
