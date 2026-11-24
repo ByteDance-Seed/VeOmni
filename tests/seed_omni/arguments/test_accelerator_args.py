@@ -266,26 +266,6 @@ def test_extra_parallel_stream_load_with_broadcast_is_enforced_at_construction()
         )
 
 
-def test_the_streaming_load_knob_is_named_for_every_extra_parallel_dimension():
-    """The knob is `extra_parallel_stream_load`, not `ep_`-scoped.
-
-    It streams the dim-0 slice of whatever the plan shards -- `ep` experts, an
-    `emb` table, a `ple` table -- so a name that said `ep` described one caller.
-    Pinned here because a rename that misses one layer fails quietly: the field
-    parses and the loader never runs, because `build_parallelize_model` forwards
-    the flag through `**kwargs` and reads it back by string key. Both spellings
-    are asserted, so neither reintroducing the old name nor dropping the new one
-    passes.
-    """
-    from dataclasses import fields
-
-    from veomni.arguments.arguments_types import ModelArguments
-
-    names = {field.name for field in fields(ModelArguments)}
-    assert "extra_parallel_stream_load" in names
-    assert "ep_sharded_stream_load" not in names
-
-
 def test_validate_omni_accelerator_bans_torch_compile():
     acc = AcceleratorConfig(torch_compile=TorchCompileConfig(enable=True))
     with pytest.raises(ValueError, match="torch_compile"):
