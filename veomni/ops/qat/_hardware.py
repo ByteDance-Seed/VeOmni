@@ -25,7 +25,8 @@ import torch
 from torch import nn
 
 from ...utils.device import get_gpu_compute_capability, get_rocm_gcn_arch, normalize_cuda_device
-from ..platform import ROCM_GFX942_GFX950
+from ...utils.import_utils import is_package_available
+from ..platform import NVIDIA_SM90_PLUS, ROCM_GFX942_GFX950, GpuKernelRequirement
 
 
 TRITON_FP8_ARCHS = ROCM_GFX942_GFX950.architectures
@@ -194,3 +195,25 @@ def fp8_quantizer_backend(device: torch.types.Device | int | None = None) -> str
     if backend is None:
         raise RuntimeError(f"QAT FP8 quantizers require {FP8_QUANTIZER_GPUS}")
     return backend
+
+
+class Fp8QuantizerRequirement(GpuKernelRequirement):
+    """GPU and package requirement for the device-selected FP8 quantizer."""
+
+    def matches(self) -> bool:
+        """Return whether both the GPU and its selected quantizer package are available."""
+        if not super().matches():
+            return False
+        backend = quantizer_backend()
+        return backend is not None and is_package_available("tilelang" if backend == "tilelang" else "triton")
+
+    def check(self) -> None:
+        """Raise when the GPU or its selected quantizer package is unavailable."""
+        super().check()
+        backend = fp8_quantizer_backend()
+        package = "tilelang" if backend == "tilelang" else "triton"
+        if not is_package_available(package):
+            raise RuntimeError(f"QAT FP8 quantization on backend {backend!r} requires package {package!r}")
+
+
+FP8_QUANTIZER_REQUIREMENT = Fp8QuantizerRequirement(platforms=(NVIDIA_SM90_PLUS, ROCM_GFX942_GFX950))

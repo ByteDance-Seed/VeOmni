@@ -35,7 +35,7 @@ The precision is a row *argument* (``dtype``), not part of the name: ``qat`` is
 FP8-only (``dtype="fp8"``), and ``torchao`` serves FP8, NVFP4, and MXFP4.
 """
 
-from ...platform import NVIDIA_SM90_PLUS, ROCM_GFX942_GFX950, GpuKernelRequirement
+from ...qat._hardware import FP8_QUANTIZER_REQUIREMENT
 from ...registry import register_op
 from .grouped import eager as grouped_eager
 from .grouped import qat as grouped_qat
@@ -44,7 +44,7 @@ from .standard import qat as standard_qat
 from .standard import torchao as standard_torchao
 
 
-_QAT_GPU = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS, ROCM_GFX942_GFX950))
+_QAT_GPU = FP8_QUANTIZER_REQUIREMENT
 
 
 register_op(
@@ -62,7 +62,6 @@ register_op(
     description="Blockwise FP8 fake-quantized dense linear projection",
     wrapper=standard_qat.wrapper,
     requirement=_QAT_GPU,
-    requires=("triton",),
 )
 
 register_op(
@@ -89,5 +88,4 @@ register_op(
     description="Blockwise FP8 fake-quantized grouped linear projection",
     wrapper=grouped_qat.module_wrapper,
     requirement=_QAT_GPU,
-    requires=("triton",),
 )

@@ -109,6 +109,14 @@ def test_qat_recipe_rejects_export_block_geometry_drift():
         config.validate_build_prerequisites()
 
 
+def test_qat_recipe_rejects_explicit_empty_metadata():
+    with pytest.raises(ValueError, match="weight_block_size"):
+        _qat_config(quantization_config={"weight_block_size": []}).validate_build_prerequisites()
+
+    with pytest.raises(ValueError, match="expert_dtype"):
+        _qat_config(expert_dtype="").validate_build_prerequisites()
+
+
 def test_qat_recipe_validates_site_override():
     config = _qat_config(quantization_config={"weight_block_size": [32, 32]}, moe_qat=False)
     config.ops_config.linear_implementation = OpsSelection(

@@ -15,6 +15,7 @@
 # Following codes are inspired from https://github.com/volcengine/verl/blob/main/verl/utils/device.py
 
 import os
+from functools import cache
 from typing import Any
 
 import torch
@@ -230,11 +231,19 @@ def is_sm90_or_above() -> bool:
     return get_gpu_compute_capability() >= 90
 
 
+@cache
+def _get_rocm_gcn_arch(device_index: int) -> str:
+    return torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
+
+
 def get_rocm_gcn_arch(device: torch.types.Device | int | None = None) -> str | None:
-    """Return the AMD GPU architecture (e.g. ``"gfx950"``), or ``None`` off ROCm."""
-    if torch.version.hip is None or not IS_CUDA_AVAILABLE:
+    """Return the cached AMD GPU architecture (e.g. ``"gfx950"``), or ``None`` off ROCm."""
+    if torch.version.hip is None:
         return None
-    return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+    resolved = normalize_cuda_device(device)
+    if resolved is None:
+        return None
+    return _get_rocm_gcn_arch(resolved.index if resolved.index is not None else get_device_id())
 
 
 def create_stream(device=None, priority: int = 0) -> Any:

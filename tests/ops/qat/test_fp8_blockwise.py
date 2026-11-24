@@ -19,7 +19,7 @@ from types import ModuleType
 
 import pytest
 import torch
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Partial, Shard
 
 import veomni.ops.qat as qat
 from tests.ops.qat.reference import reference_act_quant, reference_fp4_act_quant, reference_fp8_weight_quant
@@ -183,6 +183,60 @@ def test_fp8_weight_quant_rejects_sharded_dtensor_before_reading_local_weight(mo
     for quantize in (qat.fp8_weight_quant, fp8_fake_quant_weight):
         with pytest.raises(ValueError, match="FSDP unshard hook"):
             quantize(weight)
+
+
+def test_activation_dtensor_rejects_partial_and_last_dimension_shards(monkeypatch):
+    class ShardedActivation:
+        ndim = 3
+
+        def __init__(self, placement):
+            self.placements = (placement,)
+
+        def to_local(self):
+            raise AssertionError("an invalid activation shard must not be read")
+
+    monkeypatch.setattr(fp8_blockwise, "DTensor", ShardedActivation)
+
+    for placement in (Partial(), Shard(2), Shard(-1)):
+        with pytest.raises(ValueError, match="last dimension"):
+            fp8_blockwise._local_activation_operand(ShardedActivation(placement))
+
+
+def test_activation_dtensor_allows_non_quantized_dimension_shards(monkeypatch):
+    local = torch.randn(2, 3, 128, dtype=torch.bfloat16)
+
+    class ShardedActivation:
+        ndim = 3
+        placements = (Shard(0),)
+
+        def to_local(self):
+            return local
+
+    monkeypatch.setattr(fp8_blockwise, "DTensor", ShardedActivation)
+
+    assert fp8_blockwise._local_activation_operand(ShardedActivation()) is local
+
+
+def test_stacked_weight_dtensor_allows_only_expert_dimension_shards(monkeypatch, reference_quantizers):
+    local = torch.randn(2, 128, 128, dtype=torch.bfloat16)
+
+    class ShardedExperts:
+        ndim = 3
+
+        def __init__(self, placement):
+            self.placements = (placement,)
+
+        def to_local(self):
+            return local
+
+    monkeypatch.setattr(fp8_blockwise, "DTensor", ShardedExperts)
+
+    for placement in (Partial(), Shard(1), Shard(2)):
+        with pytest.raises(ValueError, match=r"Replicate or Shard\(0\)"):
+            fp8_fake_quant_stacked_weight(ShardedExperts(placement))
+
+    actual = fp8_fake_quant_stacked_weight(ShardedExperts(Shard(0)))
+    assert actual.shape == local.shape
 
 
 def _fake_quant(kind, tensor):

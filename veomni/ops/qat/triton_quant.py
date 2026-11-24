@@ -26,7 +26,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ...utils.device import get_rocm_gcn_arch
+from ...utils.device import get_rocm_gcn_arch, get_torch_device
 from ._hardware import TRITON_FP8_ARCHS
 from .scale import validate_fp8_scale_pairing
 
@@ -66,8 +66,8 @@ def _clamped_ratio(x, amax, ROUND_SCALE: tl.constexpr):
 def _e4m3fn_value(v, FNUZ_CAST: tl.constexpr):
     if FNUZ_CAST:
         q = (v * 0.5).to(tl.float8e4b8).to(tl.float32) * 2.0
-        sign = v.to(tl.int32, bitcast=True) & -2147483648
-        q = (q.to(tl.int32, bitcast=True) | sign).to(tl.float32, bitcast=True)
+        sign = v.to(tl.uint32, bitcast=True) & 0x80000000
+        q = (q.to(tl.uint32, bitcast=True) | sign).to(tl.float32, bitcast=True)
         return tl.where(_is_nan(v), v, q)
     return v.to(tl.float8e4nv).to(tl.float32)
 
@@ -155,15 +155,13 @@ def _storage(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.uint8) if t.dtype in (torch.float8_e4m3fn, torch.float8_e8m0fnu) else t
 
 
-def _fnuz_cast(x: torch.Tensor) -> bool:
-    return get_rocm_gcn_arch(x.device) == "gfx942"
-
-
-def _validate_operand(x: torch.Tensor, what: str) -> None:
-    if not x.is_cuda or get_rocm_gcn_arch(x.device) not in TRITON_FP8_ARCHS:
+def _validate_operand(x: torch.Tensor, what: str) -> bool:
+    arch = get_rocm_gcn_arch(x.device)
+    if not x.is_cuda or arch not in TRITON_FP8_ARCHS:
         raise ValueError(f"Triton FP8 {what} quantization requires a tensor on AMD gfx942/gfx950")
     if x.dtype != torch.bfloat16:
         raise TypeError(f"{what} quantization expects bfloat16, got {x.dtype}")
+    return arch == "gfx942"
 
 
 def _validate_block_size(block_size: int) -> None:
@@ -182,7 +180,7 @@ def act_quant(
 
     When scale_fmt is set, scales are rounded up to a power of two.
     """
-    _validate_operand(x, "activation")
+    fnuz_cast = _validate_operand(x, "activation")
     _validate_block_size(block_size)
     if x.dim() == 0 or x.size(-1) == 0:
         raise ValueError(f"activation must have a nonzero last dimension, got shape {tuple(x.shape)}")
@@ -195,19 +193,20 @@ def act_quant(
     y = torch.empty_like(z) if dequant else torch.empty_like(z, dtype=torch.float8_e4m3fn)
     s = z if dequant else z.new_empty(*z.size()[:-1], N // block_size, dtype=scale_dtype)
     if M:
-        _act_quant_kernel[(triton.cdiv(M, _ACT_BLOCK_M), N // block_size)](
-            z,
-            _storage(y),
-            _storage(s),
-            M,
-            N,
-            BLOCK_M=_ACT_BLOCK_M,
-            BLOCK_SIZE=block_size,
-            ROUND_SCALE=scale_fmt is not None,
-            DEQUANT=dequant,
-            E8M0_SCALE=scale_dtype == torch.float8_e8m0fnu,
-            FNUZ_CAST=_fnuz_cast(z),
-        )
+        with get_torch_device().device(z.device):
+            _act_quant_kernel[(triton.cdiv(M, _ACT_BLOCK_M), N // block_size)](
+                z,
+                _storage(y),
+                _storage(s),
+                M,
+                N,
+                BLOCK_M=_ACT_BLOCK_M,
+                BLOCK_SIZE=block_size,
+                ROUND_SCALE=scale_fmt is not None,
+                DEQUANT=dequant,
+                E8M0_SCALE=scale_dtype == torch.float8_e8m0fnu,
+                FNUZ_CAST=fnuz_cast,
+            )
     if dequant:
         return y
     return y, s
@@ -226,7 +225,7 @@ def fp8_weight_quant(
     ``dequant`` the BF16 round trip alone, otherwise the E4M3FN weight and one
     ``scale_dtype`` scale per tile. ``x`` is only read.
     """
-    _validate_operand(x, "weight")
+    fnuz_cast = _validate_operand(x, "weight")
     _validate_block_size(block_size)
     if x.dim() != 2:
         raise ValueError(f"fp8_weight_quant expects a 2D weight, got shape {tuple(x.shape)}")
@@ -238,18 +237,19 @@ def fp8_weight_quant(
     y = torch.empty_like(z) if dequant else torch.empty_like(z, dtype=torch.float8_e4m3fn)
     s = z if dequant else z.new_empty((M // block_size, N // block_size), dtype=scale_dtype)
     if M and N:
-        _weight_quant_kernel[(M // block_size, N // block_size)](
-            z,
-            _storage(y),
-            _storage(s),
-            N,
-            BLOCK_SIZE=block_size,
-            ROUND_SCALE=scale_fmt is not None,
-            DEQUANT=dequant,
-            E8M0_SCALE=scale_dtype == torch.float8_e8m0fnu,
-            FNUZ_CAST=_fnuz_cast(z),
-            num_warps=8,
-        )
+        with get_torch_device().device(z.device):
+            _weight_quant_kernel[(M // block_size, N // block_size)](
+                z,
+                _storage(y),
+                _storage(s),
+                N,
+                BLOCK_SIZE=block_size,
+                ROUND_SCALE=scale_fmt is not None,
+                DEQUANT=dequant,
+                E8M0_SCALE=scale_dtype == torch.float8_e8m0fnu,
+                FNUZ_CAST=fnuz_cast,
+                num_warps=8,
+            )
     if dequant:
         return y
     return y, s

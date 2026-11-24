@@ -22,13 +22,13 @@ the HF expert loop (regular autograd). Fused rows wrap the local Functions.
 from ...platform import (
     NVIDIA_SM70_PLUS,
     NVIDIA_SM90_PLUS,
-    ROCM_GFX942_GFX950,
     ROCM_GPU,
     GpuKernelRequirement,
     MluKernelRequirement,
     NpuKernelRequirement,
     NvidiaGpuPlatform,
 )
+from ...qat._hardware import FP8_QUANTIZER_REQUIREMENT
 from ...registry import register_op
 from .gpt_oss import eager as gpt_oss_eager
 from .gpt_oss import quack as gpt_oss_quack
@@ -46,7 +46,7 @@ from .standard import triton as standard_triton
 
 _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
-_QAT_GPU = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS, ROCM_GFX942_GFX950))
+_QAT_GPU = FP8_QUANTIZER_REQUIREMENT
 
 #: ``moe_experts`` rows that fake-quantize the operands they are handed. Adapters
 #: need the real weights, and ``moe_experts_lora`` has no matching row, so an

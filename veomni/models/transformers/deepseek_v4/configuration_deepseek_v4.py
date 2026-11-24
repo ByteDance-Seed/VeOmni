@@ -190,7 +190,9 @@ class DeepseekV4Config(VeOmniPretrainedConfig, _DeepseekV4Config):
         quant_config = getattr(self, "quantization_config", None) or {}
         if not isinstance(quant_config, dict):
             quant_config = quant_config.to_dict() if hasattr(quant_config, "to_dict") else vars(quant_config)
-        raw_weight_block_size = quant_config.get("weight_block_size") or (128, 128)
+        raw_weight_block_size = quant_config.get("weight_block_size")
+        if raw_weight_block_size is None:
+            raw_weight_block_size = (128, 128)
         if not isinstance(raw_weight_block_size, (list, tuple)) or len(raw_weight_block_size) != 2:
             raise ValueError(
                 "DeepSeek-V4 quantization_config.weight_block_size must contain two dimensions, "
@@ -215,7 +217,12 @@ class DeepseekV4Config(VeOmniPretrainedConfig, _DeepseekV4Config):
                 "DeepSeek-V4 QAT requires expert_dtype to agree between the top-level config and "
                 f"quantization_config, got {top_level_expert_dtype!r} and {metadata_expert_dtype!r}."
             )
-        expert_dtype = top_level_expert_dtype or metadata_expert_dtype or "fp8"
+        if top_level_expert_dtype is not None:
+            expert_dtype = top_level_expert_dtype
+        elif metadata_expert_dtype is not None:
+            expert_dtype = metadata_expert_dtype
+        else:
+            expert_dtype = "fp8"
         if expert_dtype not in ("fp8", "fp4"):
             raise ValueError(f"DeepSeek-V4 QAT supports expert_dtype 'fp8' or 'fp4', got {expert_dtype!r}.")
         self.expert_dtype = expert_dtype

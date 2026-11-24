@@ -35,7 +35,7 @@ gfx942/gfx950 GPU.
 """
 
 import torch
-from torch.distributed.tensor import DTensor, Replicate
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 
 from ._hardware import fp8_quantizer_backend
 
@@ -78,7 +78,8 @@ def act_quant(
     scale_dtype: torch.dtype = torch.float32,
     dequant: bool = False,
 ):
-    x = _local_operand(x)
+    """Quantize an activation with the backend selected for its device."""
+    x = _local_activation_operand(x)
     backend = _check_operand(x, scale_fmt, "activation")
     return _act_quant_impl(x, block_size, scale_fmt, scale_dtype, dequant=dequant, backend=backend)
 
@@ -90,13 +91,25 @@ def fp8_weight_quant(
     scale_dtype: torch.dtype = torch.float32,
     dequant: bool = False,
 ):
+    """Quantize a 2D weight with the backend selected for its device."""
     x = _local_weight_operand(x)
     backend = _check_operand(x, scale_fmt, "weight")
     return _weight_quant_impl(x, block_size, scale_fmt, scale_dtype, dequant=dequant, backend=backend)
 
 
-def _local_operand(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+def _local_activation_operand(x: torch.Tensor) -> torch.Tensor:
+    if isinstance(x, DTensor):
+        last_dim = x.ndim - 1
+        if any(
+            isinstance(placement, Partial) or (isinstance(placement, Shard) and placement.dim % x.ndim == last_dim)
+            for placement in x.placements
+        ):
+            raise ValueError(
+                "FP8 activation quantization requires the last dimension to be locally complete; "
+                "Partial or last-dimension-sharded DTensors are unsupported."
+            )
+        return x.to_local()
+    return x
 
 
 def _local_weight_operand(weight: torch.Tensor) -> torch.Tensor:
@@ -174,7 +187,7 @@ def fp8_fake_quant_act(
         A BF16 tensor holding the dequantized values, differentiable into ``x``
         through a straight-through estimator.
     """
-    x = _local_operand(x)
+    x = _local_activation_operand(x)
     _validate_block_size(block_size)
     if x.dim() == 0 or x.shape[-1] == 0:
         raise ValueError(f"activation must have a nonzero last dimension, got shape {tuple(x.shape)}")
@@ -208,7 +221,7 @@ def fp8_fake_quant_act_prefix(
         A BF16 tensor of the same shape as ``x``, quantized below
         ``quant_features`` and untouched above it.
     """
-    x = _local_operand(x)
+    x = _local_activation_operand(x)
     _validate_block_size(block_size)
     if x.dim() == 0:
         raise ValueError("activation must have at least one dimension")
@@ -275,7 +288,13 @@ def fp8_fake_quant_stacked_weight(
         A BF16 tensor of the input shape holding the dequantized weight,
         differentiable into ``weight`` through a straight-through estimator.
     """
-    weight = _local_operand(weight)
+    if isinstance(weight, DTensor):
+        if any(
+            isinstance(placement, Partial) or (isinstance(placement, Shard) and placement.dim % weight.ndim != 0)
+            for placement in weight.placements
+        ):
+            raise ValueError("FP8 stacked-weight quantization supports only Replicate or Shard(0) DTensor placements.")
+        weight = weight.to_local()
     if weight.dim() != 3:
         raise ValueError(f"FP8 stacked weight fake quantization expects a 3D weight, got {tuple(weight.shape)}")
     _validate_block_size(block_size)

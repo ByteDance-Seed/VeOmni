@@ -69,13 +69,13 @@ def test_linear_eager_handles_empty_input():
     assert op(torch.nn.Linear(16, 8), x).shape == (0, 8)
 
 
-def test_linear_qat_rows_require_triton_on_supported_gpus():
-    """The QAT rows declare the runtime shared by their GPU backends."""
-    entries = {(entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", "standard")}
-    assert ("qat", ("triton",)) in entries
-    assert ("qat", ("triton",)) in {
-        (entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", "grouped")
-    }
+def test_linear_qat_rows_use_backend_aware_quantizer_requirement():
+    from veomni.ops.qat._hardware import FP8_QUANTIZER_REQUIREMENT
+
+    for variant in ("standard", "grouped"):
+        entry = next(row for row in OP_REGISTRY.list_entries("linear", variant) if row.impl == "qat")
+        assert entry.requirement is FP8_QUANTIZER_REQUIREMENT
+        assert entry.requires == ()
 
 
 def test_linear_qat_rows_reject_unsupported_rocm_architecture(monkeypatch):
