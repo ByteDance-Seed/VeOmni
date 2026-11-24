@@ -82,7 +82,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
     @property
     def dtype(self) -> torch.dtype:
         """Report the backbone dtype to HF, independently of the FP32 projections."""
-        return self.dit.condition_proj.weight.dtype
+        return next(self.dit.condition_proj.parameters()).dtype
 
     def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
         # Attention validates and binds its backend on the first forward.

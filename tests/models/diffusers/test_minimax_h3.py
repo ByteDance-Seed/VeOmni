@@ -572,6 +572,19 @@ def test_minimax_h3_save_auto_dtype_preserves_mixed_precision(tmp_path, audio_en
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_backbone_dtype_with_lora():
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+
+    model = VeOmniLoraModel(
+        _build_model().bfloat16(), VeOmniLoraConfig(r=4, lora_alpha=8, target_modules=["condition_proj"])
+    )
+    assert model.dtype == torch.bfloat16
+    assert model.get_base_model().dit.video_patch_proj.weight.dtype == torch.float32
+    model.float()
+    assert model.dtype == torch.float32
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_minimax_h3_fp32_linear_supports_meta_forward():
     from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3FP32Linear
 
