@@ -71,7 +71,7 @@ def _triton_fp4_roundtrip_kernel(
         # Clamped to 254 as in the eager row and DeepGEMM's ``ceil_to_ue8m0``: only
         # an ``inf`` / ``NaN`` block reaches 255, where ``255 << 23`` is ``inf`` and
         # the block's zeros would dequantize to ``NaN``.
-        exp_byte = (((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32)).minimum(254)
+        exp_byte = tl.minimum(((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(tl.int32), 254)
         scale = (exp_byte << 23).to(tl.float32, bitcast=True)
     # Same reason as the scale above: ``div_rn`` keeps ``x / scale`` identical to
     # the eager row's ``div.rn.f32`` for a non-power-of-two scale.
