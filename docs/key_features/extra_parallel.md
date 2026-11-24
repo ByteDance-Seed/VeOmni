@@ -96,8 +96,27 @@ several (packed int8 weights, fp8 values, fp8 or fp32 scales, fp32 numerics
 buffers). That is the *inference* reason. A training run dequantizes at load —
 `weight_quantization: null` allocates bf16 (or fp32, with the wrap) parameters
 and spends the scales in the converter — so its layer holds one dtype and FSDP2
-accepts it. Training reaches for this mode for memory, not for dtype: an fp32
-master copy of a 196.6 B table would be another 786 GB.
+accepts it.
+
+Skipping the wrap and skipping fp32 master weights are **two separate
+decisions**. `extra_parallel_only` only drops the wrap;
+`build_parallelize_model` still runs `model = model.float()` whenever
+`mixed_precision.enable` is true, which is the training default, so the fp32
+master copy is allocated exactly as before. A training run that wants the master
+copy gone has to ask for it:
+
+```yaml
+accelerator:
+  ep_size: 32                 # == the shard axis, so <para>_fsdp is 1
+  fsdp_config:
+    fsdp_mode: fsdp2
+    extra_parallel_only: true
+    mixed_precision:
+      enable: false           # this, not extra_parallel_only, removes the fp32 copy
+```
+
+`dsv41`'s `ngram` module does exactly that, with the arithmetic in a comment: an
+fp32 master copy of the 196.6 B tables would be another 786 GB.
 
 ```yaml
 accelerator:

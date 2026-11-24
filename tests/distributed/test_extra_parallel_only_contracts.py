@@ -188,3 +188,48 @@ def test_cpu_offload_is_refused_even_when_every_parameter_is_plan_sharded():
             should_skip_hf_weight_load=True,
             kwargs={"enable_fsdp_offload": True, "init_device": "meta"},
         )
+
+
+def test_shared_expert_lora_is_refused_before_the_optimizer_can_assert_on_it():
+    """No wrap means the shared adapters never become DTensors.
+
+    `build_extra_parallel_fsdp2_optimizer` snapshots them through
+    `_collect_ep_replicated_lora_param_ids`, which asserts every hit is a
+    DTensor (they are pulled into the inner `ep_fsdp` shard by the wrapped
+    build). Unwrapped they stay plain `nn.Parameter`, so the failure surfaces at
+    optimizer construction with an assertion pointing at call order rather than
+    at this config choice. Refused here instead, by class name so the check
+    needs no import of the LoRA layer.
+    """
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+    from torch.distributed.tensor import Shard
+
+    from veomni.distributed.torch_parallelize import _finish_without_fsdp_wrap
+
+    class LoraSharedExperts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = nn.Parameter(torch.zeros(2, 2))
+
+    model = nn.Sequential(LoraSharedExperts())
+    spec_info = {
+        fqn: SimpleNamespace(para_name="ep", placement=Shard(0), persistent_fsdp_shard_dim=None)
+        for fqn, _ in model.named_parameters()
+    }
+    parallel_state = SimpleNamespace(
+        extra_parallel_names=("ep",),
+        extra_parallel_enabled=lambda name: True,
+        extra_parallel_fsdp_size=lambda name: 1,
+    )
+
+    with pytest.raises(ValueError, match="shared-expert LoRA"):
+        _finish_without_fsdp_wrap(
+            model,
+            weights_path=None,
+            parallel_state=parallel_state,
+            fqn2spec_info=spec_info,
+            should_skip_hf_weight_load=True,
+            kwargs={"init_device": "meta"},
+        )

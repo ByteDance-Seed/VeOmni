@@ -477,6 +477,12 @@ def _finish_without_fsdp_wrap(
     spends the scales), so its layer holds one dtype and FSDP2 accepts it. The
     dtype conflict is therefore the inference reason, not a training one.
 
+    It does not remove fp32 master weights. ``build_parallelize_model`` still
+    calls ``model.float()`` when ``mixed_precision.enable`` is true, which is
+    the training default, so a caller that wants the master copy gone must set
+    that flag too -- skipping the wrap and skipping the upcast are separate
+    decisions.
+
     What it costs is the parameters the plan does not name: they stay whole on
     every rank instead of being sharded for storage. That is logged rather than
     assumed, since it is the number that decides whether the model fits.
@@ -553,6 +559,25 @@ def _finish_without_fsdp_wrap(
         module_is_peft_model=kwargs.pop("module_is_peft_model", None),
         module_adapter_path=kwargs.pop("module_adapter_path", None),
     )
+
+    # Shared-expert LoRA (``share_expert_lora: true``) is built as plain
+    # parameters here, but the optimizer path asserts they are DTensors: the
+    # wrapped build pulls them into the inner ``ep_fsdp`` shard so
+    # ``build_extra_parallel_fsdp2_optimizer`` can snapshot their ids. With no
+    # wrap they never become DTensors, and
+    # ``_collect_ep_replicated_lora_param_ids`` raises during construction. Refuse
+    # the combination here, where the user can still act on the message.
+    shared_expert_lora = [
+        name for name, module in model.named_modules() if type(module).__name__ == "LoraSharedExperts"
+    ]
+    if shared_expert_lora:
+        raise ValueError(
+            "fsdp_config.extra_parallel_only cannot be used with shared-expert LoRA "
+            f"(found LoraSharedExperts at {shared_expert_lora[:3]}). Those adapters are pulled into the "
+            "FSDP2 ep_fsdp shard so the optimizer can step them as replicated parameters; without the "
+            "wrap they stay plain tensors and optimizer construction asserts on them. Keep the wrap, or "
+            "use independent (non-shared) expert LoRA."
+        )
 
     _divide_extra_parallel_grads_like_fsdp(model, parallel_state, fqn2spec_info)
     # Read by the grad clipper, which averages the replicated parameters' grads.
