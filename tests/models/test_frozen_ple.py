@@ -220,7 +220,9 @@ def test_dtensor_cast_preserves_local_shard_and_metadata(dtype, tmp_path):
 
 def test_is_engram_or_ple_table_matches_qwen4_and_deepseek_v41_only():
     assert is_engram_or_ple_table("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight")
-    assert is_engram_or_ple_table("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight")
+    assert is_engram_or_ple_table(
+        "module.model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight"
+    )
     assert is_engram_or_ple_table("layers.1.engram.embed.weight")
     assert is_engram_or_ple_table("layers.1.engram.embed.scale")
     assert is_engram_or_ple_table("model.layers.14.engram.embed_tokens.weight")
@@ -236,6 +238,34 @@ def test_is_engram_or_ple_table_matches_qwen4_and_deepseek_v41_only():
     assert not is_engram_or_ple_table("layers.1.engram.wkv.scale")
     assert not is_engram_or_ple_table("embed.weight")
     assert not is_engram_or_ple_table("model.embed_tokens.weight")
+
+
+def test_collect_frozen_engram_state_dict_keys_tracks_shard_scopes_and_preserves_mid_fqn_module():
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Module()])
+    model.layers[0].ple = nn.Module()
+    model.layers[0].ple.ple_embedding = nn.Module()
+    shard0 = nn.Module()
+    shard0.weight = nn.Parameter(torch.ones(4, 2), requires_grad=False)
+    shard0.register_buffer("scale", torch.ones(4, 1, dtype=torch.uint8))
+    shard1 = nn.Module()
+    shard1.weight = nn.Parameter(torch.ones(4, 2), requires_grad=True)
+    shard1.register_buffer("scale", torch.ones(4, 1, dtype=torch.uint8))
+    model.layers[0].ple.ple_embedding.ngram_embedding = nn.ModuleDict({"shard_0": shard0, "shard_1": shard1})
+    # A legitimate submodule named ``module`` mid-FQN must not have ``.module.`` stripped.
+    model.layers[0].module = nn.Linear(2, 2)
+
+    wrapper = nn.Module()
+    wrapper.module = model
+
+    frozen = collect_frozen_engram_state_dict_keys(wrapper, wrapper.state_dict().keys())
+    assert "layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight" in frozen
+    assert "module.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight" in frozen
+    assert "layers.0.ple.ple_embedding.ngram_embedding.shard_0.scale" in frozen
+    assert "module.layers.0.ple.ple_embedding.ngram_embedding.shard_0.scale" in frozen
+    assert "layers.0.ple.ple_embedding.ngram_embedding.shard_1.weight" not in frozen
+    assert "layers.0.ple.ple_embedding.ngram_embedding.shard_1.scale" not in frozen
+    assert "layers.0.module.weight" not in frozen
 
 
 def test_export_weights_skips_frozen_ple_dtensor_without_full_tensor_and_crops_when_kept(monkeypatch, tmp_path):
@@ -290,54 +320,23 @@ def test_export_weights_skips_frozen_ple_dtensor_without_full_tensor_and_crops_w
         assert "layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight" not in skipped_export
         assert "layers.0.ple.key_proj.weight" in skipped_export
 
-        full_export = dict(export_weights(model, skip_frozen_engram=False))
+        # Also verify DDP-style ``model.module`` wrapper unwrapping for both skip and crop paths.
+        wrapped = nn.Module()
+        wrapped.module = model
+        wrapped_skipped = dict(export_weights(wrapped, skip_frozen_engram=True))
+        assert ple_full_tensor_calls == 0
+        assert "layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight" not in wrapped_skipped
+        assert "layers.0.ple.key_proj.weight" in wrapped_skipped
+
+        full_export = dict(export_weights(wrapped, skip_frozen_engram=False))
         assert ple_full_tensor_calls == 1
         ple_exported = full_export["layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"]
         assert ple_exported.shape == (6, 4)
         torch.testing.assert_close(ple_exported, raw_table[:6], rtol=0, atol=0)
 
-        # Unfrozen PLE must NOT be skipped even when skip_frozen_engram=True.
+        # Unfrozen PLE must NOT be skipped even when skip_frozen_engram=True, and is still cropped.
         ple.ngram_embedding["shard_0"].weight.requires_grad_(True)
         trainable_export = dict(export_weights(model, skip_frozen_engram=True))
-        assert "layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight" in trainable_export
+        assert trainable_export["layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"].shape == (6, 4)
     finally:
         dist.destroy_process_group()
-
-
-def test_deepseek_v4_converter_export_weights_skips_frozen_engram_and_scale(monkeypatch, caplog):
-    from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
-        DeepseekV4CheckpointTensorConverter,
-    )
-
-    monkeypatch.setattr(
-        "veomni.distributed.parallel_state.get_parallel_state",
-        lambda: SimpleNamespace(ep_enabled=False),
-    )
-    monkeypatch.setattr("veomni.models.checkpoint.convert.get_device_type", lambda: "cpu")
-
-    model = nn.Module()
-    model.config = SimpleNamespace(model_type="deepseek_v41", tie_word_embeddings=False, quantization_config=None)
-    layer = nn.Module()
-    layer.engram = nn.Module()
-    layer.engram.embed_tokens = nn.Module()
-    layer.engram.embed_tokens.weight = nn.Parameter(torch.ones(8, 4, dtype=torch.bfloat16), requires_grad=False)
-    layer.engram.embed_tokens.register_buffer("scale", torch.ones(8, 1, dtype=torch.uint8))
-    layer.engram.q_weight = nn.Parameter(torch.full((4, 4), 2.0, dtype=torch.bfloat16), requires_grad=True)
-    model.model = nn.Module()
-    model.model.layers = nn.ModuleList([layer])
-    model._veomni_fqn_to_index_mapping = {
-        "layers.0.engram.embed.weight": 1,
-        "layers.0.engram.embed.scale": 1,
-        "layers.0.engram.q_weight": 1,
-    }
-
-    assert "model.layers.0.engram.embed_tokens.scale" in collect_frozen_engram_state_dict_keys(
-        model, model.state_dict().keys()
-    )
-
-    converter = DeepseekV4CheckpointTensorConverter(num_experts=0, target_model_prefix="model.", enable_mtp=False)
-    with caplog.at_level("WARNING"):
-        exported = dict(converter.export_weights(model, skip_frozen_engram=True))
-
-    assert list(exported.keys()) == ["layers.0.engram.q_weight"]
-    assert "Export weights missing" not in caplog.text

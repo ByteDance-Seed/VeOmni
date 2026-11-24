@@ -184,6 +184,15 @@ class CheckpointTensorConverter(Protocol):
         """
         ...
 
+    def crop_hf_export_tensor(self, name: str, tensor: "torch.Tensor") -> "torch.Tensor":
+        """Optional export hook: crop runtime dim-0 padding from a full unsharded tensor.
+
+        ``name`` is the unprefixed weight FQN on the underlying model and ``tensor``
+        is the full unsharded matrix. Implementing this method is optional; a missing
+        method leaves exported tensors unchanged.
+        """
+        ...
+
 
 def checkpoint_converter_is_dim0_zero_pad(
     converter: Optional["CheckpointTensorConverter"],
@@ -441,6 +450,8 @@ def export_weights(
         A generator of tuples of the form (name, tensor).
     """
     ps = parallel_state.get_parallel_state()
+    while isinstance(getattr(model, "module", None), torch.nn.Module):
+        model = model.module
     params = model.state_dict()
     frozen_engram_keys: set[str] = set()
     if skip_frozen_engram:

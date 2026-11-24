@@ -1,8 +1,11 @@
-"""Frozen Qwen4-Exp PLE tables: optimizer exclusion and dtype conversion.
+"""Frozen PLE and Engram lookup tables: optimizer exclusion, dtype conversion, and export filtering.
 
-Same rule as verl's ``verl.utils.veomni.frozen_ple``: only parameters named
-``ple.ple_embedding.ngram_embedding.shard_<n>.weight`` are frozen. The forward
-lookup still reads them.
+``is_ple_table``, ``freeze_ple_embeddings``, and ``prepare_ple_storage`` manage
+Qwen4-Exp ``ple.ple_embedding.ngram_embedding.shard_<n>.weight`` parameters
+during training. ``is_engram_or_ple_table`` and
+``collect_frozen_engram_state_dict_keys`` identify frozen PLE and Engram lookup
+tables (and companion scale tensors) so callers can omit them during partial
+weight export without unsharding ``DTensor`` shards.
 """
 
 import re
@@ -15,7 +18,7 @@ _PLE_TABLE = re.compile(r"(?:^|\.)ple\.ple_embedding\.ngram_embedding\.shard_\d+
 
 _ENGRAM_OR_PLE_TABLE_SCOPES = (
     re.compile(
-        r"^(?P<scope>(?:.+\.)?ngram_embedding)(?:\.shard_\d+)?\.(?:weight|weight_scale|scale|weight_scale_inv)$"
+        r"^(?P<scope>(?:.+\.)?ngram_embedding(?:\.shard_\d+)?)\.(?:weight|weight_scale|scale|weight_scale_inv)$"
     ),
     re.compile(
         r"^(?P<scope>(?:.+\.)?engram(?:\.\d+)?\.(?:embed|embed_tokens))\.(?:weight|scale|weight_scale|weight_scale_inv)$"
@@ -25,20 +28,10 @@ _ENGRAM_OR_PLE_TABLE_SCOPES = (
     ),
 )
 
-_WRAPPER_SEGMENTS = ("_orig_mod.", "_fsdp_wrapped_module.", "module.")
 
-
-def _strip_wrapper_prefixes(name: str) -> str:
-    changed = True
-    while changed:
-        changed = False
-        for seg in _WRAPPER_SEGMENTS:
-            if name.startswith(seg):
-                name = name[len(seg) :]
-                changed = True
-            elif f".{seg}" in name:
-                name = name.replace(f".{seg}", ".")
-                changed = True
+def _strip_ddp_prefix(name: str) -> str:
+    while name.startswith("module."):
+        name = name.removeprefix("module.")
     return name
 
 
@@ -57,7 +50,7 @@ def is_ple_table(name: str) -> bool:
 
 def is_engram_or_ple_table(name: str) -> bool:
     """Return whether ``name`` identifies an Engram or PLE n-gram lookup table tensor/scale."""
-    return _engram_table_scope(_strip_wrapper_prefixes(name)) is not None
+    return _engram_table_scope(_strip_ddp_prefix(name)) is not None
 
 
 def collect_frozen_engram_state_dict_keys(
@@ -77,7 +70,7 @@ def collect_frozen_engram_state_dict_keys(
     trainable_scopes: set[str] = set()
 
     for raw_name, param in model.named_parameters():
-        clean_name = _strip_wrapper_prefixes(raw_name)
+        clean_name = _strip_ddp_prefix(raw_name)
         scope = _engram_table_scope(clean_name)
         if scope is None:
             continue
@@ -91,7 +84,7 @@ def collect_frozen_engram_state_dict_keys(
     pure_frozen_scopes = frozen_scopes - trainable_scopes
     if state_dict_keys is not None and pure_frozen_scopes:
         for key in state_dict_keys:
-            clean_key = _strip_wrapper_prefixes(key)
+            clean_key = _strip_ddp_prefix(key)
             if clean_key in frozen_keys:
                 frozen_keys.add(key)
                 continue
