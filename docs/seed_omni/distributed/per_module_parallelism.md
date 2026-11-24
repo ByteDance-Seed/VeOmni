@@ -23,21 +23,25 @@ A module's choices live in its block of the `modules` YAML, under
 | FSDP2 (default) | `fsdp_config.fsdp_mode: fsdp2` | Backbones and every module large enough that sharding pays for its communication |
 | DDP | `fsdp_config.fsdp_mode: ddp`, usually with `init_device: cuda` and `broadcast_model_weights_from_rank0: false` (module level, outside `accelerator:`) | Small encoders, where a full replica per rank is cheaper than FSDP2 all-gathers |
 | Eager (inference only) | `fsdp_config.fsdp_mode: eager` | A single-process replica with no mesh; rejected for training |
-| Embedding parallel | `extra_parallel_names: ["emb"]`, `extra_parallel_sizes: [N]`, `extra_parallel_placement_innermost: [false]` | A vocabulary-sharded text encoder; see [Sharded Embedding](../../key_features/sharded_embedding.md) |
-| Expert parallel | `extra_parallel_names: ["ep"]`, `extra_parallel_sizes: [N]`, `extra_parallel_placement_innermost: [false]` | A MoE backbone. Write all three lists: they are paired by position, and a module entry inherits the global accelerator's, so overriding only `sizes` desynchronises the lengths when the launcher adds another dim (e.g. `emb`). Do **not** use `ep_size: N` here: it is only appended when `"ep"` is absent from `extra_parallel_names`, and a module entry already inherits `["ep"]`, so the field is inert and the run has no EP |
-
-A module that holds nothing a dimension shards — a vision tower under a
-backbone's `ep`, say — has to **remove** that dimension from its own block,
-not shrink it. A module entry inherits all three global lists, and a module
-with no parallel plan cannot be built under an enabled mesh, so the build
-raises. `ep_size: 1` is not the opt-out (`ep_size` is inert for the reason in
-the table row above, and leaving `"ep"` in `extra_parallel_sizes` with a size of
-1 still builds the dimension): drop `"ep"` from `extra_parallel_names`, its
-entry from `extra_parallel_sizes` and its entry from
-`extra_parallel_placement_innermost`, keeping the three lists the same length.
-The build's error message lists the dimensions it saw enabled.
+| Embedding parallel | `extra_parallel_names: ["emb"]`, `extra_parallel_sizes: [N]`, `extra_parallel_placement_innermost: [false]` | A vocabulary-sharded text encoder; see [Sharded Embedding](../../key_features/sharded_embedding.md). A dimension with no scalar of its own is set through these three lists, which are paired by position — write all three |
+| Expert parallel | `accelerator.ep_size: N` | A MoE backbone. For `ep`, **write `ep_size`, not the lists**. A module entry inherits the global `ep` width, and `_module_base` folds an inherited `ep` entry back into `ep_size` before the overlay merges, then `AcceleratorConfig.__post_init__` re-appends it — so `ep_size` is the field that actually decides the width, and `ep_size: 1` is the per-module opt-out. Writing only `extra_parallel_sizes: [N]` desynchronises the three position-paired lists and leaves the inherited width in `ep_size` (observed: `ep_size=4, sizes=[2, 4]`) |
 | Sequence / Context parallel | `ulysses_size: U`, `cp_size: C` (one axis `> 1` per module, with `U * C = W / dp_size` and `pp_size = tp_size = 1` across all modules) | Ulysses SP on encoders/ViT, CP on long-context backbones |
 | Gradient checkpointing | `gradient_checkpointing.enable: false` | Off for cheap modules (text encoders, VAE, flow connector) |
+
+A module that holds nothing a dimension shards — a vision tower under a
+backbone's `ep`, say — has to switch that dimension off in its own block. A
+module with no parallel plan cannot be built under an enabled mesh, so the build
+raises.
+
+For `ep` the switch is `ep_size: 1`; for any other dimension, remove its name
+from `extra_parallel_names` together with its entries in `extra_parallel_sizes`
+and `extra_parallel_placement_innermost`, keeping the three lists the same
+length. The two are different mechanisms because `ep` has a scalar of its own
+that the other dimensions do not: `_module_base` folds an inherited `ep` entry
+into `ep_size` and `AcceleratorConfig.__post_init__` re-appends it, so clearing
+the lists alone leaves the inherited width in place and the dimension comes
+straight back. The build's error message names the dimensions it saw enabled.
+
 
 Children can inherit `expert_weight_fp8_all_gather: true` from the global accelerator.
 It enables FP8 transport only for experts whose actual `veomni_moe.impl` is

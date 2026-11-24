@@ -110,10 +110,14 @@ def test_a_plan_less_module_under_an_enabled_extra_parallel_dim_says_how_to_fix_
     A plan-less module is normally a per-module overlay that inherited the global
     mesh (a vision tower under a backbone's `ep`). The bare message only pointed at
     example plans, which does not tell that user the cheaper fix is to turn the
-    dimension off for this module -- and the first attempt at saying so named
-    `ep_size: 1`, which is inert in a module overlay, so following the message
-    reproduced the failure. What is asserted here is that the message names the
-    field that does nothing as a non-fix and points at the lists that do.
+    dimension off for this module.
+
+    Getting the fix right took two attempts. `ep_size: 1` *is* the answer for
+    `ep`, because `_module_base` folds an inherited `ep` entry into `ep_size`
+    before the overlay merges; clearing the three lists is what fails, since the
+    folded width comes back through `AcceleratorConfig.__post_init__`. The
+    message must therefore point at `ep_size` and must not send users to the
+    lists.
     """
     from types import SimpleNamespace
 
@@ -142,14 +146,8 @@ def test_a_plan_less_module_under_an_enabled_extra_parallel_dim_says_how_to_fix_
     message = str(excinfo.value)
     assert "parallel plan" in message
     assert "qwen3_moe/parallel_plan.py" in message, "must still point at a worked example"
-    # The message must not send the user to a field that does nothing. `ep_size`
-    # is appended to `extra_parallel_*` only when `"ep"` is absent from the
-    # inherited names, so an overlay setting `ep_size: 1` keeps EP on and the same
-    # assertion fires again -- which is what made the earlier wording useless.
-    assert "does NOT do this" in message and "inert" in message
-    assert "ep_size: 1" in message, "must name the non-fix explicitly, or users will try it"
-    # And it must say what to actually edit: the inherited lists, by dimension.
-    assert "ep" in message and "extra_parallel_names" in message
+    assert "ep_size: 1" in message, "must name the actual opt-out for `ep`"
+    assert "does NOT work" in message, "must warn that clearing the lists is not the fix"
     assert "Enabled dimensions" in message
 
 

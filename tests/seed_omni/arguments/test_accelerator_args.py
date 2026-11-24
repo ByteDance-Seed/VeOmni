@@ -201,6 +201,43 @@ def test_module_runtime_arguments_inherit_weight_load_knobs():
     assert args.ep_sharded_stream_load is False
 
 
+@pytest.mark.parametrize(
+    "override, expected_ep_size",
+    [
+        ({}, 4),
+        ({"accelerator": {"ep_size": 1}}, 1),
+        (
+            {
+                "accelerator": {
+                    "extra_parallel_names": [],
+                    "extra_parallel_sizes": [],
+                    "extra_parallel_placement_innermost": [],
+                }
+            },
+            4,
+        ),
+    ],
+    ids=["inherited", "ep_size_1", "lists_cleared"],
+)
+def test_only_ep_size_turns_off_an_inherited_expert_parallel_dimension(monkeypatch, override, expected_ep_size):
+    """`ep_size: 1` is the per-module opt-out; clearing the three lists is not.
+
+    `_module_base` folds an inherited `ep` entry into `ep_size` before the overlay
+    merges, so the lists are re-derived from that scalar and
+    `AcceleratorConfig.__post_init__` appends the dimension back. Asserting the
+    resolved width, not the field the user wrote, is what distinguishes the two:
+    a module that believed it had opted out would otherwise still build a mesh
+    over four ranks. This is the contract the plan-less-module assertion's
+    message points at.
+    """
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    global_args = OmniModuleRuntimeArguments(model_path="/tmp/model", accelerator=AcceleratorConfig(ep_size=4))
+    modules = build_omni_module_runtime_args(global_args, "/tmp/model", {"mod": override})
+    resolved = modules["mod"].accelerator
+    assert resolved.ep_size == expected_ep_size
+    assert dict(zip(resolved.extra_parallel_names, resolved.extra_parallel_sizes))["ep"] == expected_ep_size
+
+
 def test_validate_omni_accelerator_accepts_defaults():
     _validate_omni_accelerator(AcceleratorConfig())
 
