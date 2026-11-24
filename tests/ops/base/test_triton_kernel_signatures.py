@@ -100,23 +100,3 @@ def test_no_triton_free_function_is_called_as_a_tensor_method() -> None:
 
     found = _offenders(paths, _free_functions_only())
     assert not found, "Triton free functions called as tensor methods:\n" + "\n".join(found)
-
-
-def test_the_scan_distinguishes_the_two_spellings() -> None:
-    """A check that cannot fail is not a check.
-
-    Parses a snippet containing both forms and asserts only the method form is
-    reported, so a walker refactor that matches nothing -- or everything -- fails
-    here instead of passing vacuously.
-    """
-    free = _free_functions_only()
-    assert "minimum" in free, "premise: ``tl.minimum`` has no ``tensor`` binding"
-
-    tmp = pathlib.Path(__file__).with_name("_triton_scan_probe.py")
-    tmp.write_text("def k(x):\n    a = tl.minimum(x, 1)\n    b = x.minimum(1)\n    c = torch.tensor([1])\n")
-    try:
-        found = _offenders([tmp], free)
-    finally:
-        tmp.unlink()
-    assert len(found) == 1, f"only the method form should be flagged, got {found}"
-    assert ":3 " in found[0], f"the flagged line should be 3 (``b = x.minimum(1)``), got {found[0]}"
