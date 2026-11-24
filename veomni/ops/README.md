@@ -57,7 +57,8 @@ when the selected implementation runs.
 | `dsa_indexer`, `dsa_attention` | `deepseek_v4`, `glm` | `eager`, `tilelang`, `triton`, `cann`, `cudnn`, or `flashmla_cudnn` by variant |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
-| `minimax_sparse_attention` | `indexer`, `attention` | `eager` (Ascend NPU tensors run the masked softmax through `torch_npu.npu_fusion_attention`) |
+| `minimax_sparse_indexer` | `standard` | `eager` |
+| `minimax_sparse_attention` | `standard` | `eager`, `npu` (Ascend default) |
 
 The MLU `liger_kernel` rows reuse the CUDA adapters and use
 `MluKernelRequirement` with `requires=("liger_kernel",)`: the Cambricon
@@ -89,14 +90,14 @@ aligned), builds a local boolean mask via `int8` scatter, and calls
 `torch_npu.npu_fusion_attention` / `npu_fusion_attention_grad` without forward
 replay.
 
-MiniMax M3 `minimax_sparse_attention` takes packed TND tensors with the
-standard varlen `cu_seqlens` / `max_seqlen` metadata. `indexer` selects
-`[T, G, topk]` key blocks per query and KV group (`-1` marks an unused slot);
-`attention` applies them with token-level causality inside each block. Only
-sparse layers call it; dense MiniMax layers use the standard `attention` family
-selected by `attn_implementation`. It has no config field yet:
-the model resolves the default row, and a kernel backend adds its rows (and a
-`minimax_sparse_attention_implementation` field once there is a choice). MoE
+MiniMax M3 uses two packed TND ops with `cu_seqlens` and `max_seqlen`.
+`minimax_sparse_indexer` returns sequence-local int32 block indices
+`[T, G, topk]` per query and KV group, with unused slots set to -1.
+`minimax_sparse_attention` consumes these indices and enforces token-level
+causality. Set `minimax_sparse_attention_implementation` to `eager` for the
+PyTorch reference or `npu` for Ascend fusion with matching FP16/BF16 Q/K/V.
+An omitted selection uses `npu` on Ascend and `eager` elsewhere. Dense
+MiniMax layers select standard attention through `attn_implementation`. MoE
 `swiglu_oai` keeps the merged gate/up layout and replaces SiLU with the clamped
 `(up + 1) * gate * sigmoid(alpha * gate)` activation on the standard fused
 Triton and NPU paths, including EP.

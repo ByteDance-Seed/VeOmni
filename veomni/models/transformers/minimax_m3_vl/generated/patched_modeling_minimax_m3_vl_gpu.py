@@ -679,8 +679,10 @@ class MiniMaxM3VLAttention(nn.Module):
         if self.indexer is None:
             self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
         else:
-            self.veomni_msa_indexer = VeomniOp("minimax_sparse_attention", "indexer")
-            self.veomni_msa_attention = VeomniOp("minimax_sparse_attention", "attention")
+            self.veomni_msa_indexer = VeomniOp("minimax_sparse_indexer", "standard")
+            self.veomni_msa_attention = VeomniOp(
+                "minimax_sparse_attention", "standard", self.config.ops_config.minimax_sparse_attention_implementation
+            )
 
     # ================================================================
     # Patch: MiniMaxM3VLAttention.forward

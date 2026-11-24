@@ -156,8 +156,9 @@ _BUILTIN_ENTRIES = (
     ("qsa_attention", "standard", "eager", "any", _ANY, ()),
     ("qsa_attention", "standard", "tilelang", "cuda", _GPU_NVIDIA, ("tilelang",)),
     ("qsa_attention", "standard", "torch_npu", "npu", _NPU, ()),
-    ("minimax_sparse_attention", "indexer", "eager", "any", _ANY, ()),
-    ("minimax_sparse_attention", "attention", "eager", "any", _ANY, ()),
+    ("minimax_sparse_indexer", "standard", "eager", "any", _ANY, ()),
+    ("minimax_sparse_attention", "standard", "eager", "any", _ANY, ()),
+    ("minimax_sparse_attention", "standard", "npu", "npu", _NPU, ()),
     ("moe_experts", "standard", "eager", "any", _ANY, ()),
     ("moe_experts", "standard", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts", "standard", "fused_triton", "mlu", _MLU, ("triton",)),
@@ -260,6 +261,7 @@ def test_builtin_entry_catalog_is_exact():
 
 
 _BUILTIN_DEFAULT_ENTRIES = {
+    ("minimax_sparse_attention", "standard", "npu", "npu"),
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda"),
     ("cross_entropy_loss", "standard", "liger_kernel", "mlu"),
     ("cross_entropy_loss", "standard", "chunk_loss", "npu"),

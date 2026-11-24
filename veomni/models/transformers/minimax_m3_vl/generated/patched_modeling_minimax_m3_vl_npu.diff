@@ -454,7 +454,7 @@
      def __init__(self, config: MiniMaxM3VLTextConfig, layer_idx: int):
          super().__init__()
          self.config = config
-@@ -428,15 +673,32 @@
+@@ -428,15 +673,34 @@
          self.indexer = (
              MiniMaxM3VLIndexer(config, layer_idx) if config.layer_types[layer_idx] == "minimax_m3_sparse" else None
          )
@@ -465,8 +465,10 @@
 +        if self.indexer is None:
 +            self.veomni_attn = VeomniOp("attention", "standard", self.config.ops_config.attn_implementation)
 +        else:
-+            self.veomni_msa_indexer = VeomniOp("minimax_sparse_attention", "indexer")
-+            self.veomni_msa_attention = VeomniOp("minimax_sparse_attention", "attention")
++            self.veomni_msa_indexer = VeomniOp("minimax_sparse_indexer", "standard")
++            self.veomni_msa_attention = VeomniOp(
++                "minimax_sparse_attention", "standard", self.config.ops_config.minimax_sparse_attention_implementation
++            )
 +
 +    # ================================================================
 +    # Patch: MiniMaxM3VLAttention.forward
@@ -494,7 +496,7 @@
          input_shape = hidden_states.shape[:-1]
          hidden_shape = (*input_shape, -1, self.head_dim)
 
-@@ -447,46 +709,40 @@
+@@ -447,46 +711,40 @@
          cos, sin = position_embeddings
          query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
@@ -573,7 +575,7 @@
 
 
  class MiniMaxM3VLIndexer(nn.Module):
-@@ -536,7 +792,7 @@
+@@ -536,7 +794,7 @@
      """
 
      def __init__(self, config: MiniMaxM3VLTextConfig, layer_idx: int):
@@ -582,7 +584,7 @@
          self.config = config
          self.layer_idx = layer_idx
          self.head_dim = config.index_head_dim
-@@ -546,8 +802,18 @@
+@@ -546,8 +804,18 @@
          self.local_blocks = config.index_local_blocks
          self.q_proj = nn.Linear(config.hidden_size, config.index_n_heads * config.index_head_dim, bias=False)
          self.k_proj = nn.Linear(config.hidden_size, config.index_head_dim, bias=False)
@@ -603,7 +605,7 @@
 
      def forward(
          self,
-@@ -635,6 +901,12 @@
+@@ -635,6 +903,12 @@
          return torch.zeros(keep.shape, dtype=dtype, device=device).masked_fill(~keep, min_dtype)
 
 
@@ -616,7 +618,7 @@
  class MiniMaxM3VLDecoderLayer(GradientCheckpointingLayer):
      """M3 decoder layer: per-layer dense/MoE MLP and dense/sparse attention."""
 
-@@ -647,8 +919,8 @@
+@@ -647,8 +921,8 @@
              if config.mlp_layer_types[layer_idx] == "sparse"
              else MiniMaxM3VLDenseMLP(config, intermediate_size=config.dense_intermediate_size)
          )
@@ -627,7 +629,7 @@
 
      def forward(
          self,
-@@ -677,26 +949,41 @@
+@@ -677,26 +951,41 @@
          return hidden_states
 
 
@@ -674,7 +676,7 @@
 
      @torch.no_grad()
      def _init_weights(self, module):
-@@ -712,6 +999,12 @@
+@@ -712,6 +1001,12 @@
              init.zeros_(module.weight)
 
 
@@ -687,7 +689,7 @@
  @auto_docstring
  class MiniMaxM3VLTextModel(MiniMaxM3VLPreTrainedModel):
      config: MiniMaxM3VLTextConfig
-@@ -723,13 +1016,26 @@
+@@ -723,13 +1018,26 @@
 
          self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
          self.layers = nn.ModuleList([MiniMaxM3VLDecoderLayer(config, i) for i in range(config.num_hidden_layers)])
@@ -715,7 +717,7 @@
      @merge_with_config_defaults
      @capture_outputs
      @auto_docstring
-@@ -738,48 +1044,92 @@
+@@ -738,48 +1046,92 @@
          input_ids: torch.LongTensor | None = None,
          attention_mask: torch.Tensor | None = None,
          position_ids: torch.LongTensor | None = None,
@@ -835,7 +837,7 @@
                  position_embeddings=position_embeddings,
                  **kwargs,
              )
-@@ -789,180 +1139,6 @@
+@@ -789,180 +1141,6 @@
          return MoeModelOutputWithPast(
              last_hidden_state=hidden_states,
              past_key_values=past_key_values,
@@ -1016,7 +1018,7 @@
          )
 
 
-@@ -990,6 +1166,12 @@
+@@ -990,6 +1168,12 @@
          )
          hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
          return hidden_states
@@ -1029,7 +1031,7 @@
 
 
  class MiniMaxM3VL3DRotaryEmbedding(nn.Module):
-@@ -1019,14 +1201,34 @@
+@@ -1019,14 +1203,34 @@
          self.spatial_merge_size = spatial_merge_size
          self.theta = theta
 
@@ -1072,7 +1074,7 @@
          coords = coords.to(device=device, dtype=torch.float32)
          inv_freq = 1.0 / (
              self.theta ** (torch.arange(0, self.axis_dim, 2, dtype=torch.float32, device=device) / self.axis_dim)
-@@ -1049,11 +1251,18 @@
+@@ -1049,11 +1253,18 @@
      return torch.cat([q_rot, q_pass], dim=-1), torch.cat([k_rot, k_pass], dim=-1)
 
 
@@ -1091,7 +1093,7 @@
      def __init__(self, config: MiniMaxM3VLVisionConfig):
          super().__init__()
          self.config = config
-@@ -1071,15 +1280,10 @@
+@@ -1071,15 +1282,10 @@
          # The vision tower has no grouped-query attention; the shared eager kernel
          # still expects this attribute to drive its (no-op) `repeat_kv`.
          self.num_key_value_groups = 1
@@ -1111,7 +1113,7 @@
          input_shape = hidden_states.shape[:-1]
          hidden_shape = (*input_shape, -1, self.head_dim)
 
-@@ -1091,10 +1295,7 @@
+@@ -1091,10 +1297,7 @@
          queries, keys = apply_rotary_pos_emb_vision(queries, keys, cos, sin)
          queries, keys = queries.transpose(1, 2), keys.transpose(1, 2)
 
@@ -1123,7 +1125,7 @@
              self,
              queries,
              keys,
-@@ -1156,6 +1357,12 @@
+@@ -1156,6 +1359,12 @@
          return hidden_states
 
 
@@ -1136,7 +1138,7 @@
  @auto_docstring
  class MiniMaxM3VLVisionModel(MiniMaxM3VLPreTrainedModel):
      """CLIP-like vision tower with Conv3d patch embed + 3D RoPE."""
-@@ -1178,23 +1385,134 @@
+@@ -1178,23 +1387,134 @@
          )
          self.post_init()
 
@@ -1277,7 +1279,7 @@
 
 
  class MiniMaxM3VLMultiModalProjector(nn.Module):
-@@ -1278,6 +1596,26 @@
+@@ -1278,6 +1598,26 @@
      image_hidden_states: torch.FloatTensor | None = None
 
      video_hidden_states: torch.FloatTensor | None = None
@@ -1304,7 +1306,7 @@
 
 
  @auto_docstring(custom_intro="MiniMax M3 VL backbone (vision + projector + text), without LM head.")
-@@ -1350,46 +1688,141 @@
+@@ -1350,46 +1690,141 @@
              )
          return special_image_mask, special_video_mask
 
@@ -1463,7 +1465,7 @@
 
          outputs = self.language_model(
              attention_mask=attention_mask,
-@@ -1426,15 +1859,25 @@
+@@ -1426,15 +1861,25 @@
          return vision_outputs
 
 
@@ -1490,7 +1492,7 @@
          self.post_init()
 
      def get_output_embeddings(self) -> nn.Module:
-@@ -1448,48 +1891,25 @@
+@@ -1448,48 +1893,25 @@
      @auto_docstring
      def forward(
          self,
@@ -1557,7 +1559,7 @@
          outputs = self.model(
              input_ids=input_ids,
              pixel_values=pixel_values,
-@@ -1504,15 +1924,29 @@
+@@ -1504,15 +1926,29 @@
          )
          hidden_states = outputs.last_hidden_state
          slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -1592,7 +1594,7 @@
              past_key_values=outputs.past_key_values,
              hidden_states=outputs.hidden_states,
              attentions=outputs.attentions,
-@@ -1524,9 +1958,19 @@
+@@ -1524,9 +1960,19 @@
      def get_video_features(self, pixel_values_videos, video_grid_thw, **kwargs):
          return self.model.get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
 

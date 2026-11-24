@@ -36,35 +36,42 @@ Only sparse layers use these operators. Dense MiniMax layers call the standard
 all-to-all, and ``cu_seqlens`` describes every packed sequence, including the
 synthetic SP tail-padding sequence appended by the collator.
 
-MiniMax generated modeling constructs ``VeomniOp("minimax_sparse_attention",
-"indexer")`` and ``VeomniOp("minimax_sparse_attention", "attention")``, which
-resolve to the ``eager`` rows below (the only implementation today). On Ascend
-NPU tensors the eager attention runs its masked softmax through
-``torch_npu.npu_fusion_attention``; the indexer stays eager. A kernel backend
-registers rows for both variants (and, once there is a choice to make, a
-``minimax_sparse_attention_implementation`` config field); the model code does
-not change.
+Sparse layers bind separate standard indexer and attention ops. The indexer
+uses PyTorch. Attention defaults to the fused NPU implementation on Ascend and
+to PyTorch elsewhere. Explicit eager selection uses PyTorch on every device.
 """
 
+from ...platform import NpuKernelRequirement
 from ...registry import register_op
 from .eager import minimax_sparse_attention_eager, minimax_sparse_indexer_eager
+from .npu import minimax_sparse_attention_npu
 
 
 register_op(
-    "minimax_sparse_attention",
-    "indexer",
+    "minimax_sparse_indexer",
+    "standard",
     "eager",
-    description="PyTorch MiniMax M3 sparse-attention indexer on packed TND input",
+    description="Select MiniMax key blocks per KV group using PyTorch",
     wrapper=minimax_sparse_indexer_eager,
 )
 
 register_op(
     "minimax_sparse_attention",
-    "attention",
+    "standard",
     "eager",
-    description="MiniMax M3 block-sparse attention on packed TND input (npu_fusion_attention on Ascend)",
+    description="PyTorch MiniMax block-sparse attention on packed TND input",
     wrapper=minimax_sparse_attention_eager,
 )
 
+register_op(
+    "minimax_sparse_attention",
+    "standard",
+    "npu",
+    description="MiniMax block-sparse attention using torch_npu.npu_fusion_attention",
+    wrapper=minimax_sparse_attention_npu,
+    requirement=NpuKernelRequirement(),
+    default=True,
+)
 
-__all__ = ["minimax_sparse_attention_eager", "minimax_sparse_indexer_eager"]
+
+__all__ = ["minimax_sparse_attention_eager", "minimax_sparse_attention_npu", "minimax_sparse_indexer_eager"]

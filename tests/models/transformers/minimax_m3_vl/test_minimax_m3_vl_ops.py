@@ -173,7 +173,11 @@ def test_minimax_m3_vl_sparse_layers_never_bind_the_standard_attention(module_na
         )
     )
     sparse, dense = (layer.self_attn for layer in model.layers)
-    assert (sparse.veomni_msa_indexer.op, sparse.veomni_msa_attention.op) == ("minimax_sparse_attention",) * 2
+    assert (sparse.veomni_msa_indexer.op, sparse.veomni_msa_attention.op) == (
+        "minimax_sparse_indexer",
+        "minimax_sparse_attention",
+    )
+    assert sparse.veomni_msa_attention.impl == "eager"
     assert not hasattr(sparse, "veomni_attn")
     assert dense.veomni_attn.op == "attention"
     assert not hasattr(dense, "veomni_msa_attention")

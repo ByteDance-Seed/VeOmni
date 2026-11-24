@@ -354,7 +354,7 @@ _MODEL_CASES = (
         eager_ops=(
             ("veomni_ce", "cross_entropy_loss"),
             ("model.language_model.layers.0.input_layernorm.veomni_rms_norm", "rms_norm"),
-            ("model.language_model.layers.0.self_attn.veomni_msa_indexer", "minimax_sparse_attention"),
+            ("model.language_model.layers.0.self_attn.veomni_msa_indexer", "minimax_sparse_indexer"),
             ("model.language_model.layers.0.self_attn.veomni_msa_attention", "minimax_sparse_attention"),
             ("model.language_model.layers.0.mlp.experts.veomni_moe", "moe_experts"),
             ("model.vision_tower.layers.0.self_attn.veomni_attn", "attention"),

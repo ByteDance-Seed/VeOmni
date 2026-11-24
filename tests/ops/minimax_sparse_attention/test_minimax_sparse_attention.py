@@ -22,11 +22,12 @@ import torch
 import torch.nn.functional as F
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.ops import VeomniOp
 from veomni.ops.kernels.minimax_sparse_attention import (
     minimax_sparse_attention_eager,
     minimax_sparse_indexer_eager,
 )
-from veomni.ops.kernels.minimax_sparse_attention.eager import (
+from veomni.ops.kernels.minimax_sparse_attention._common import (
     _expand_selected_blocks,
     _pack,
     _packed_to_padded_indices,
@@ -290,7 +291,7 @@ def test_bfloat16_block_expansion_matches_boolean_expansion(seq_len, block_size)
 
 @pytest.mark.skipif(not is_torch_npu_available(), reason="Requires Ascend NPU")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-def test_npu_fused_attention_matches_cpu_reference_forward_and_backward(dtype):
+def test_npu_fused_attention_matches_eager_forward_and_backward(dtype):
     torch.manual_seed(42)
     lengths = _SEQUENCE_LENGTHS
     total_length, head_dim = sum(lengths), 64
@@ -300,27 +301,27 @@ def test_npu_fused_attention_matches_cpu_reference_forward_and_backward(dtype):
         for heads in (_NUM_QUERY_HEADS, _NUM_GROUPS, _NUM_GROUPS)
     ]
     npu_inputs = [tensor.detach().to(device="npu", dtype=dtype).requires_grad_() for tensor in cpu_inputs]
-    block_indices = minimax_sparse_indexer_eager(
-        cpu_inputs[1].detach(),
-        cpu_inputs[1][:, :1].detach(),
-        cu_seqlens,
-        max(lengths),
-        block_size=_BLOCK_SIZE,
-        topk_blocks=_TOPK_BLOCKS,
-        local_blocks=_LOCAL_BLOCKS,
-    )
+    # Group 0 attends to the first block, group 1 to the current block of each sequence.
+    positions = torch.cat([torch.arange(length) for length in lengths])
+    blocks = (positions // _BLOCK_SIZE).to(torch.int32)
+    block_indices = torch.stack((torch.zeros_like(blocks), blocks), dim=1).unsqueeze(-1)
     kwargs = dict(block_size=_BLOCK_SIZE, scale=head_dim**-0.5)
-    expected = minimax_sparse_attention_eager(*cpu_inputs, block_indices, cu_seqlens, max(lengths), **kwargs)
-    actual = minimax_sparse_attention_eager(
-        *npu_inputs,
-        block_indices.to("npu"),
-        cu_seqlens,
-        max(lengths),
-        **kwargs,
-    )
-    grad_output = torch.randn_like(expected).to(dtype).float()
-    expected_grads = torch.autograd.grad(expected, cpu_inputs, grad_output)
-    actual_grads = torch.autograd.grad(actual, npu_inputs, grad_output.to(device="npu", dtype=dtype))
+    eager = VeomniOp("minimax_sparse_attention", "standard", "eager")
+    fused = VeomniOp("minimax_sparse_attention", "standard")
+    assert fused.impl == "npu"
+    indices = block_indices.to("npu")
+    reference = eager(*cpu_inputs, block_indices, cu_seqlens, max(lengths), **kwargs)
+    expected = eager(*npu_inputs, indices, cu_seqlens, max(lengths), **kwargs)
+    actual = fused(*npu_inputs, indices, cu_seqlens, max(lengths), **kwargs)
+
+    grad_output = torch.randn_like(reference).to(dtype)
+    reference_grads = torch.autograd.grad(reference, cpu_inputs, grad_output.float())
+    grad_output = grad_output.to("npu")
+    expected_grads = torch.autograd.grad(expected, npu_inputs, grad_output)
+    actual_grads = torch.autograd.grad(actual, npu_inputs, grad_output)
     tolerance = 2e-2 if dtype == torch.bfloat16 else 3e-3
-    for result, reference in zip((actual, *actual_grads), (expected, *expected_grads)):
-        torch.testing.assert_close(result.float().cpu(), reference, atol=tolerance, rtol=tolerance)
+    for result, same_device, cpu in zip(
+        (actual, *actual_grads), (expected, *expected_grads), (reference, *reference_grads)
+    ):
+        torch.testing.assert_close(result.float(), same_device.float(), atol=tolerance, rtol=tolerance)
+        torch.testing.assert_close(result.float().cpu(), cpu, atol=tolerance, rtol=tolerance)

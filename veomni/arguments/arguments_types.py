@@ -1602,6 +1602,12 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },
     )
+    minimax_sparse_attention_implementation: Optional[Literal["eager", "npu"]] = field(
+        default=None,
+        metadata={
+            "help": "MiniMax sparse language attention. Defaults to NPU fusion on Ascend and PyTorch elsewhere."
+        },
+    )
     qsa_attention_implementation: Literal["eager", "tilelang", "torch_npu"] = field(
         default="eager",
         metadata={
