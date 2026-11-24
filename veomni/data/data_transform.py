@@ -664,3 +664,91 @@ def process_sample_qwen_omni(
         labels[assis_i + 2 : user_start_index[user_i] - 1] = input_ids[assis_i + 2 : user_start_index[user_i] - 1]
     model_inputs["labels"] = labels
     return [model_inputs]
+
+
+@DATA_TRANSFORM_REGISTRY.register("kimi_k3")
+def process_sample_kimi_k3(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    chat_template: "ChatTemplate",
+    position_id_func: "Callable",
+    max_seq_len: int = 8192,
+    **kwargs,
+):
+    """Kimi K3 multimodal processing (single image + caption).
+
+    One ``<|media_pad|>`` per merged vision token (the pre-expanded form):
+    the image is preprocessed first so ``grid_thws`` fixes the merged patch
+    count, and that many ``<|media_pad|>`` tokens are materialized inline in
+    the text. ``tpool_patch_merger`` in the modeling pools (averages) the
+    temporal axis instead of concatenating it, so an image contributes
+    ``(h // mh) * (w // mw)`` merged tokens regardless of ``t``.
+    The merge inside the modeling is then length-preserving
+    (masked_scatter of the projected features onto the pad slots), which
+    keeps the collator's packed position_ids / cu_seq_lens and the SP label
+    pre-shift valid. Labels supervise only the caption tail (everything up
+    to and including ``<|media_end|>`` is masked, which also covers the
+    expanded media span). Position ids come from the collator (per-sample
+    arange; the modeling itself is NoPE / divided-fixed), so
+    ``position_id_func`` is accepted but unused.
+    """
+    from .multimodal.image_utils import load_image_from_path
+
+    caption = str(sample.get("caption", "")).strip()
+    if not caption:
+        return []
+
+    image = load_image_from_path(str(sample["image"])).convert("RGB")
+    image_processor = getattr(processor, "image_processor", processor)
+    out = image_processor.preprocess([{"type": "image", "image": image}], return_tensors="pt")
+    grid_thws = out["grid_thws"]
+
+    merge_size = getattr(image_processor, "merge_size", None) or (2, 2)
+    mh, mw = int(merge_size[0]), int(merge_size[1])
+    # The vision tower's tpool_patch_merger AVERAGES over the temporal axis
+    # (t is pooled, not concatenated), so an image contributes
+    # (h // mh) * (w // mw) merged tokens regardless of t -- the prod-based
+    # count would multiply in t and overshoot the pad slots for multi-frame
+    # grids. (h % mh != 0 already raises inside tpool_patch_merger, so no
+    # extra guard is needed here.)
+    num_pads = int(((grid_thws[:, 1] // mh) * (grid_thws[:, 2] // mw)).sum().item())
+
+    width = int(sample["width"])
+    height = int(sample["height"])
+    text = f"<|media_begin|>image {width}x{height}<|media_content|>{'<|media_pad|>' * num_pads}<|media_end|> {caption}"
+
+    tokenizer = getattr(processor, "tokenizer", None) or getattr(chat_template, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError(
+            "kimi_k3 transform needs a tokenizer (processor.tokenizer or chat_template.tokenizer); "
+            "check model.tokenizer_path points at the kimi_k3_hf repository."
+        )
+    media_end_id = tokenizer.encode("<|media_end|>")[0]
+    input_ids = tokenizer.encode(text) + [tokenizer.eos_token_id]
+    media_end_pos = input_ids.index(media_end_id)
+    labels = [-100] * (media_end_pos + 1) + input_ids[media_end_pos + 1 :]
+
+    if len(input_ids) > max_seq_len:
+        # Truncate the caption tail only: a cut into the media span would
+        # desynchronize input_ids from the published grid_thws (the merge
+        # scatters exactly (h // mh) * (w // mw) features per image onto the
+        # pad slots).
+        if media_end_pos + 1 >= max_seq_len:
+            raise ValueError(
+                f"Kimi K3 max_seq_len ({max_seq_len}) truncated the media span "
+                f"(the {num_pads} media_pad tokens end at position {media_end_pos}); "
+                "the sample needs a larger max_seq_len."
+            )
+        input_ids = input_ids[:max_seq_len]
+        labels = labels[:max_seq_len]
+
+    model_inputs = {
+        # 1-D per-sample tensors: MainCollator packs along dim=-1 then unsqueezes
+        # dim 0, so 2-D per-sample tensors would produce a 3-D packed batch.
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
+        "labels": torch.tensor(labels, dtype=torch.long),
+        "pixel_values": out["pixel_values"],
+        "grid_thws": grid_thws,
+    }
+    return [model_inputs]

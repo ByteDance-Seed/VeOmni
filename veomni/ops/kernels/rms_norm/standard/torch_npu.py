@@ -43,13 +43,23 @@ def _eager_fallback(x: Tensor, weight: Tensor, eps: float) -> tuple[Tensor, Save
 
 
 def forward(x: Tensor, weight: Tensor, *, eps: float) -> tuple[Tensor, SavedState]:
-    """NPU fused affine RMSNorm (offset 0).
+    """NPU fused affine RMSNorm (offset 0) under a same-dtype contract.
 
-    Empty ``x``, and tensors that are not on NPU, fall back to the eager
-    pair. The row is chosen from the host, so a CPU activation on an NPU
-    machine must not enter ``npu_rms_norm``. Otherwise saves ``(x, weight, rstd)``.
+    Non-empty ``x`` and ``weight`` must share one dtype: ``aclnnRmsNorm`` has
+    no mixed-dtype overload, so misaligned inputs are rejected instead of
+    being silently cast (callers align on their side). Empty ``x``, and
+    tensors that are not on NPU, fall back to the eager pair. The row is
+    chosen from the host, so a CPU activation on an NPU machine must not
+    enter ``npu_rms_norm``. Otherwise saves ``(x, weight, rstd)``.
     """
-    if x.numel() == 0 or x.device.type != "npu":
+    if x.numel() == 0:
+        return _eager_fallback(x, weight, eps)
+    if x.dtype != weight.dtype:
+        raise TypeError(
+            "rms_norm/torch_npu requires x and weight to share one dtype "
+            f"(got x={x.dtype}, weight={weight.dtype}); cast on the caller side."
+        )
+    if x.device.type != "npu":
         return _eager_fallback(x, weight, eps)
 
     import torch_npu
