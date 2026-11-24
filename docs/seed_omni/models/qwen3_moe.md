@@ -52,18 +52,19 @@ The upstream file stores experts **per expert**
 holds them fused (`experts.gate_up_proj` / `experts.down_proj`). The backbone's
 per-expert converter bridges that on load.
 
-One thing does **not** work against an upstream root:
+Streaming load **does** work against an upstream root. The streaming loader
+applies the layout's rename before slicing (``HFSourceKeyConverter.module_key``
+in ``load_model_weights_ep_sharded``), so each rank reads its own experts' raw
+keys through the same key map the whole-tensor loader uses. Earlier versions
+rejected the combination at startup, because streaming read raw checkpoint
+slices without going through the layout; that restriction is gone, and the
+shipped `train/modules_train.yaml` streams directly from an upstream root.
 
-- **`extra_parallel_stream_load: false` is required.** The shipped
-  `train/modules_train.yaml` enables streaming, and the HF-view validator rejects
-  it (`...does not apply the qwen3_moe HF layout's key renames`) because streaming
-  reads raw checkpoint slices and so cannot go through the layout's renaming. Point
-  `--model.model_config.modules` at an overlay that sets
-  `extra_parallel_stream_load: false` and `broadcast_model_weights_from_rank0: true`.
-
-That combination is rejected at startup rather than mid-run — the argument parser
-fails before a 30B checkpoint is loaded, so a misconfigured job does not waste the
-setup.
+What a sharded key still cannot do is declare a whole-tensor transformation: a
+converter that reshapes or fuses a key it also streams raises, because only a
+slice exists. Per-expert converters avoid that by stacking through
+`fused_expert_target` / `for_expert_range`, and a row-sharded table avoids it by
+declaring `dim0_rowwise_companion`.
 
 **HF export does work against an upstream root.** The layout splits the fused
 expert tensors back into per-expert keys on the way out

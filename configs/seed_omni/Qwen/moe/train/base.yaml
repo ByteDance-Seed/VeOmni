@@ -20,13 +20,11 @@
 #     --model_path Qwen3-MoE \
 #     --output_dir Qwen3-MoE-split
 #
-# The upstream root does work as `model_path` — `qwen3_moe/hf_layout.py` registers
-# a `qwen3_moe` layout, so no offline split is needed — but then you must also pass
-# `--model.model_config.modules` pointing at an overlay with
-# `extra_parallel_stream_load: false` (and `broadcast_model_weights_from_rank0: true`).
-# Streaming cannot apply the layout's key renames, so the parser refuses that
-# combination at startup. HF export works either way: the layout splits the fused
-# expert tensors back to per-expert keys on the way out.
+# The upstream root also works as `model_path` — `qwen3_moe/hf_layout.py` registers
+# a `qwen3_moe` layout, so no offline split is needed. Streaming load works there
+# too: the loader applies the layout's key renames before slicing, so each rank
+# reads its own experts' raw keys. HF export works either way: the layout splits
+# the fused expert tensors back to per-expert keys on the way out.
 #
 # `model_path` and `data.yaml`'s `sources` are placeholders: replace them with
 # absolute paths this job can read before training.

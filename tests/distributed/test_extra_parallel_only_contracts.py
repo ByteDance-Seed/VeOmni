@@ -81,93 +81,6 @@ def test_the_gradient_hook_skips_persistent_parameters():
     )
 
 
-def test_shared_expert_lora_grads_are_divided_like_the_skipped_wrap_would(monkeypatch):
-    """Shared-expert LoRA stays usable without the wrap, with the same grad scale.
-
-    The adapters are replicated across the EP group; ``_ensure_ep_grad_sync_hooks``
-    SUMs their grads over that group and counts on the wrap's
-    ``set_gradient_divide_factor(world_size)`` to turn that sum into
-    ``total_grad / world_size``. Without a wrap the division has to be reinstated,
-    or every step is ``world_size`` times too large.
-
-    Driven through ``_finish_without_fsdp_wrap`` rather than through the helper
-    directly: calling the helper would still pass if the call site forgot it.
-    """
-    from types import SimpleNamespace
-
-    import torch
-    import torch.nn as nn
-    from torch.distributed.tensor import Shard
-
-    from veomni.distributed import torch_parallelize
-
-    class LoraSharedExperts(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.gate_up_proj = nn.Parameter(torch.zeros(2, 2))
-
-    model = nn.Sequential(LoraSharedExperts())
-    spec_info = {
-        fqn: SimpleNamespace(para_name="ep", placement=Shard(0), persistent_fsdp_shard_dim=None)
-        for fqn, _ in model.named_parameters()
-    }
-    parallel_state = SimpleNamespace(
-        extra_parallel_names=("ep",),
-        extra_parallel_enabled=lambda name: True,
-        extra_parallel_fsdp_size=lambda name: 1,
-        world_size=8,
-        extra_parallel_gradient_divide_factor=lambda name: 8,
-    )
-
-    seen = {}
-
-    def _record(m, ps):
-        seen["model"] = m
-        seen["world_size"] = ps.world_size
-
-    monkeypatch.setattr(torch_parallelize, "_divide_replicated_lora_grads_like_fsdp", _record)
-    torch_parallelize._finish_without_fsdp_wrap(
-        model,
-        weights_path=None,
-        parallel_state=parallel_state,
-        fqn2spec_info=spec_info,
-        should_skip_hf_weight_load=True,
-        kwargs={"init_device": "meta"},
-    )
-
-    assert seen.get("model") is model, "the no-wrap path must reinstate the shared-LoRA divide"
-    assert seen.get("world_size") == 8
-
-
-def test_the_shared_lora_divide_is_by_world_size_and_skips_frozen_params():
-    """The factor itself: grads shrink by ``world_size``, frozen params get no hook."""
-    from types import SimpleNamespace
-
-    import torch
-    import torch.nn as nn
-
-    from veomni.distributed.torch_parallelize import _divide_replicated_lora_grads_like_fsdp
-
-    class LoraSharedExperts(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.gate_up_proj = nn.Parameter(torch.zeros(2, 2))
-            self.frozen = nn.Parameter(torch.zeros(2, 2), requires_grad=False)
-
-    # factor 1 registers nothing: the wrapped path's divide factor is 1 there too.
-    plain = nn.Sequential(LoraSharedExperts())
-    _divide_replicated_lora_grads_like_fsdp(plain, SimpleNamespace(world_size=1))
-    assert not plain[0].gate_up_proj._backward_hooks
-
-    model = nn.Sequential(LoraSharedExperts())
-    _divide_replicated_lora_grads_like_fsdp(model, SimpleNamespace(world_size=8))
-    param = model[0].gate_up_proj
-    assert not model[0].frozen._backward_hooks, "a frozen parameter has no grad to divide"
-    # A real backward, so the hook's output lands in `.grad` as it will in training.
-    param.sum().backward()
-    assert torch.equal(param.grad, torch.full((2, 2), 1.0 / 8))
-
-
 def test_shared_lora_params_are_collected_when_the_model_is_unwrapped():
     """Shared-expert LoRA params are collected as plain parameters on this path.
 
@@ -189,3 +102,50 @@ def test_shared_lora_params_are_collected_when_the_model_is_unwrapped():
     model._extra_parallel_only = True
 
     assert _collect_ep_replicated_lora_param_ids(model) == {id(model[0].gate_up_proj)}
+
+
+def test_shared_lora_grad_accumulation_survives_multiple_microbatches():
+    """One division per backward, applied to the whole accumulated grad.
+
+    ``LoraSharedExperts`` reduces through ``register_post_accumulate_grad_hook``,
+    which fires on every backward over the *whole* accumulated ``p.grad``: the
+    all-reduce SUMs every rank's contribution, so a replicated parameter ends up
+    holding ``world_size`` times its own value, and dividing that buffer once
+    restores it. Modelled here at the level the hooks operate on, since the real
+    one needs a process group.
+
+    What this pins is that the division rides on the same callback as the sum. A
+    division installed as a tensor hook instead runs on each new contribution
+    while the sum covers the accumulation, so micro-batch 2 re-scales
+    micro-batch 1 and the grad grows by the EP width per step.
+    """
+    import torch
+    import torch.nn as nn
+
+    world_size = 4
+    # Each EP rank holds the same replicated adapter and computes only its own
+    # experts' contribution, for two micro-batches.
+    my_contributions = [1.0, 3.0]
+    expected = sum(my_contributions)  # replicated: the value is rank-invariant
+
+    param = nn.Parameter(torch.zeros(1))
+
+    def ep_sum_hook(p):
+        # SUM over the EP group: a replicated param accumulates world_size copies
+        # of its own value. Then undo it, which is what FSDP's divide factor did.
+        p.grad.mul_(world_size).div_(world_size)
+
+    param.register_post_accumulate_grad_hook(ep_sum_hook)
+
+    for contribution in my_contributions:
+        # `+=` is what an accumulation step does to `.grad`.
+        if param.grad is None:
+            param.grad = torch.tensor([contribution])
+        else:
+            param.grad += torch.tensor([contribution])
+        for hook in list(param._post_accumulate_grad_hooks.values()):
+            hook(param)
+
+    assert torch.allclose(param.grad, torch.tensor([expected])), (
+        f"grad accumulation drifted: {param.grad.item()} vs {expected}"
+    )

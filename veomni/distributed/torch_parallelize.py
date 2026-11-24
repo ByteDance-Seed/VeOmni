@@ -560,21 +560,22 @@ def _finish_without_fsdp_wrap(
         module_adapter_path=kwargs.pop("module_adapter_path", None),
     )
 
-    # Shared-expert LoRA (``share_expert_lora: true``) is built as plain
-    # parameters here, but the optimizer path asserts they are DTensors: the
-    # wrapped build pulls them into the inner ``ep_fsdp`` shard so
-    # ``build_extra_parallel_fsdp2_optimizer`` can snapshot their ids. With no
-    # wrap they never become DTensors, and
-    # Shared-expert LoRA (``share_expert_lora: true``) needs no wraparound here.
-    # Its adapters are logically replicated across the EP group and
-    # ``LoraSharedExperts._ensure_ep_grad_sync_hooks`` all-reduces their grads
-    # over that group itself; without a wrap nothing divides them by the world
-    # size the way the skipped ``set_gradient_divide_factor`` would have, so the
-    # hook below adds that division. ``_collect_ep_replicated_lora_param_ids``
-    # accepts them as plain parameters once the model is marked unwrapped.
+    # Shared-expert LoRA (``share_expert_lora: true``) needs its grad division
+    # moved into ``LoraSharedExperts``' own EP sum, because only that callback
+    # sees the accumulated grad. Mark the wrappers so its hook knows the wrap's
+    # ``set_gradient_divide_factor`` will not supply the factor.
+    marked = 0
+    for module in model.modules():
+        if any(base.__name__ == "LoraSharedExperts" for base in type(module).__mro__):
+            module._extra_parallel_only_unwrapped = True
+            marked += 1
+    if marked:
+        logger.info_rank0(
+            f"ExtraParallel only: {marked} LoraSharedExperts wrapper(s) divide their EP-summed shared "
+            "adapter grads by the world size, in place of the skipped FSDP divide factor."
+        )
 
     _divide_extra_parallel_grads_like_fsdp(model, parallel_state, fqn2spec_info)
-    _divide_replicated_lora_grads_like_fsdp(model, parallel_state)
     # Read by the grad clipper, which averages the replicated parameters' grads.
     model._extra_parallel_only = True
     for module in model.modules():
@@ -610,35 +611,6 @@ def _divide_extra_parallel_grads_like_fsdp(model: "nn.Module", parallel_state, f
             continue
         factor = parallel_state.extra_parallel_gradient_divide_factor(para)
         if factor > 1:
-            param.register_hook(lambda grad, factor=factor: grad / factor)
-
-
-def _divide_replicated_lora_grads_like_fsdp(model: "nn.Module", parallel_state) -> None:
-    """Divide shared-expert LoRA grads the way the skipped wrap would have.
-
-    Under the wrap these adapters sit in the inner ``fully_shard`` whose
-    ``set_gradient_divide_factor(world_size)`` scales every parameter it owns.
-    ``LoraSharedExperts._ensure_ep_grad_sync_hooks`` sums their grads across the
-    EP group and relies on that division to land on ``total_grad / world_size``
-    -- the same value an EP=1 run with data-parallel size ``world_size`` would
-    produce. Without a wrap nothing divides them, so the sum the hook produces
-    is ``world_size`` times too large and every step overshoots by that factor.
-
-    Only applies to the unwrapped path; the wrapped one already has the factor on
-    the FSDP module, and dividing twice would be just as wrong in the other
-    direction.
-    """
-    factor = parallel_state.world_size
-    if factor <= 1:
-        return
-    for module in model.modules():
-        # MRO walk for the same reason the optimizer does it: ``fully_shard``
-        # rebases the class, and this must keep matching if that ever changes.
-        if not any(base.__name__ == "LoraSharedExperts" for base in type(module).__mro__):
-            continue
-        for param in module.parameters(recurse=True):
-            if not param.requires_grad:
-                continue
             param.register_hook(lambda grad, factor=factor: grad / factor)
 
 
