@@ -765,6 +765,7 @@ class FSDPConfig:
         metadata={
             "help": (
                 "Apply the model's ExtraParallel plan (ep / emb) but skip the FSDP2 wrap. "
+                "Only applies when fsdp_mode='fsdp2'; ignored under 'ddp' or 'eager'. "
                 "The plan shards the dimension it names (e.g. experts on dim0) and the wrap "
                 "shards the rest (dim1 for experts); without the wrap that second axis must "
                 "be size 1, so this only fits a dimension already as wide as the shard axis. "
@@ -776,11 +777,6 @@ class FSDPConfig:
     )
 
     def __post_init__(self):
-        if self.extra_parallel_only and self.fsdp_mode != "fsdp2":
-            raise ValueError(
-                f"fsdp_config.extra_parallel_only requires fsdp_mode='fsdp2', got {self.fsdp_mode!r}. "
-                "It removes the wrap from the fsdp2 path; it is not a mode of its own."
-            )
         if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
             raise ValueError(
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
@@ -967,6 +963,11 @@ class AcceleratorConfig:
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
         self._resolve_topology()
         self._validate_init_device()
+        if self.fsdp_config.fsdp_mode == "eager" and any(s > 1 for s in self.extra_parallel_sizes):
+            raise ValueError(
+                "ExtraParallel (ep_size / extra_parallel_sizes > 1) requires fsdp_mode='fsdp2', "
+                "got fsdp_mode='eager'. Set fsdp_config.fsdp_mode='fsdp2' explicitly."
+            )
 
     def _resolve_topology(self):
         # Ahead of the topology arithmetic below, which cannot defend itself: a

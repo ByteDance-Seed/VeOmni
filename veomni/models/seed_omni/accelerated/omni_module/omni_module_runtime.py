@@ -185,8 +185,7 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Whether this module is loaded unwrapped in one process (``fsdp_mode='eager'``).
 
         Inference only: it skips :meth:`setup`, so it has no mesh, no
-        :class:`ParallelState` and no wrap. Modules requesting ``ep`` or ``emb``
-        always take the distributed path (see :func:`accelerator_needs_distributed_build`).
+        :class:`ParallelState` and no wrap.
         """
         return not accelerator_needs_distributed_build(getattr(self.args, "accelerator", None))
 

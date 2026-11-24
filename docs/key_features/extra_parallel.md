@@ -99,7 +99,8 @@ and spends the scales in the converter — so its layer holds one dtype and FSDP
 accepts it.
 
 Because FSDP2's `MixedPrecisionPolicy` is part of the skipped wrap,
-`extra_parallel_only: true` requires `mixed_precision.enable: false` (otherwise
+`extra_parallel_only: true` only applies when `fsdp_mode: fsdp2` (ignored under
+`ddp` or `eager`) and requires `mixed_precision.enable: false` (otherwise
 `build_parallelize_model` would upcast weights to FP32 with no policy to cast
 them back to the compute dtype, breaking BF16-only kernels such as Triton MoE
 GEMMs). Inference defaults `mixed_precision.enable` to `false`; a training run

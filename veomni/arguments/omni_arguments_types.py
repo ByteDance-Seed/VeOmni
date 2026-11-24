@@ -360,18 +360,6 @@ def build_omni_module_runtime_args(
         merged_acc = merged.setdefault("accelerator", {})
         if isinstance(merged_acc, dict):
             merged_acc["skip_sp_gather_between_modules"] = global_skip_sp_gather
-            # Reconcile inherited `extra_parallel_only` with the module's own `fsdp_mode`:
-            # promote an unnamed mode (e.g. inference `eager` default) to `fsdp2`, or drop
-            # the flag when the module explicitly chose `ddp` / `eager`.
-            fsdp_config = merged_acc.get("fsdp_config")
-            if isinstance(fsdp_config, dict) and fsdp_config.get("extra_parallel_only", False):
-                override_acc = override.get("accelerator") if isinstance(override, dict) else None
-                override_fsdp = override_acc.get("fsdp_config") if isinstance(override_acc, dict) else None
-                module_mode = override_fsdp.get("fsdp_mode") if isinstance(override_fsdp, dict) else None
-                if module_mode is None:
-                    fsdp_config["fsdp_mode"] = "fsdp2"
-                elif str(module_mode).lower() != "fsdp2":
-                    fsdp_config["extra_parallel_only"] = False
         runtime_modules[name] = _instantiate_recursive(OmniModuleRuntimeArguments, merged)
     return runtime_modules
 
@@ -902,7 +890,10 @@ def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, O
             "give them fsdp2 / ddp."
         )
     no_wrap = sorted(
-        name for name, module_args in modules.items() if module_args.accelerator.fsdp_config.extra_parallel_only
+        name
+        for name, module_args in modules.items()
+        if module_args.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+        and module_args.accelerator.fsdp_config.extra_parallel_only
     )
     if no_wrap:
         raise ValueError(

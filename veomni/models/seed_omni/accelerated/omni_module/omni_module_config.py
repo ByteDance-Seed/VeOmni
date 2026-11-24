@@ -47,14 +47,10 @@ def hf_module_model_config(model_config: dict | None) -> dict:
 
 
 def accelerator_needs_distributed_build(accelerator) -> bool:
-    """True when ``accelerator`` requires a distributed build (non-eager ``fsdp_mode`` or ``ep``/``emb`` > 1)."""
+    """True when ``accelerator`` requires a distributed build (``fsdp_mode != 'eager'``)."""
     fsdp_config = getattr(accelerator, "fsdp_config", None)
     fsdp_mode = getattr(fsdp_config, "fsdp_mode", None)
-    if fsdp_mode and str(fsdp_mode).lower() != "eager":
-        return True
-    if getattr(accelerator, "ep_size", 1) > 1:
-        return True
-    return any(size > 1 for size in getattr(accelerator, "extra_parallel_sizes", None) or ())
+    return bool(fsdp_mode and str(fsdp_mode).lower() != "eager")
 
 
 @dataclass
@@ -68,20 +64,9 @@ class OmniModuleRuntimeArguments(ModelArguments):
     is the projection onto an HF module descriptor.
     """
 
-    def __post_init__(self):
-        super().__post_init__()
-        if self.accelerator.fsdp_config.fsdp_mode == "eager" and self.needs_distributed_build:
-            self.accelerator.fsdp_config.fsdp_mode = "fsdp2"
-            self.accelerator.fsdp_config.extra_parallel_only = True
-            self.accelerator._validate_init_device()
-
     @property
     def needs_distributed_build(self) -> bool:
-        """True when this module must be built under a process group, not loaded whole.
-
-        Delegates to :func:`accelerator_needs_distributed_build`; see there for
-        why ``ep`` / ``emb`` count even when ``fsdp_mode`` stays ``eager``.
-        """
+        """True when this module must be built under a process group, not loaded whole."""
         return accelerator_needs_distributed_build(getattr(self, "accelerator", None))
 
     def to_hf_config(self) -> dict:

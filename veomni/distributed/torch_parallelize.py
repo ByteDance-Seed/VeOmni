@@ -1269,7 +1269,7 @@ def build_parallelize_model(
         if kwargs.get("init_device") not in ["cuda", "npu", "mlu"]:
             raise ValueError("Only FSDP training supports `init_device=meta`.")
 
-    if extra_parallel_only and mixed_precision.enable:
+    if parallel_state.dp_mode == "fsdp2" and extra_parallel_only and mixed_precision.enable:
         raise ValueError(
             "fsdp_config.mixed_precision.enable cannot be combined with fsdp_config.extra_parallel_only: "
             "MixedPrecisionPolicy requires the FSDP2 wrap, so without it weights would stay in FP32. "
