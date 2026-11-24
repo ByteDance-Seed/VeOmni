@@ -6,9 +6,15 @@ import torch
 import torch.nn as nn
 
 from veomni.distributed.parallel_state import get_parallel_state
+from veomni.models.loss_utils import load_balancing_loss
+from veomni.models.transformers.qwen3_omni_moe.checkpoint_tensor_converter import (
+    Qwen3OmniMoeCheckpointTensorConverter,
+    convert_qwen3_omni_moe_fqn_to_index_mapping,
+)
 from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextModel,
 )
+from veomni.ops import VeomniOp
 from veomni.utils.tensor_utils import naflatten
 
 from ....utils.conversation import ConversationItem, is_backbone_input
@@ -114,6 +120,10 @@ def pack_qwen3omni_conversations_for_forward(
     visual_pos_masks_list: list[torch.Tensor] = []
     sample_lengths: list[int] = []
     deepstack_chunks: list[list[torch.Tensor]] = []
+    # Hidden width of the packed sequence, learnt from the first non-empty
+    # segment. An empty row cannot infer it: ``reshape(0, -1)`` is ambiguous when
+    # there are no elements, so the zero-row entries are given this width.
+    embeddings_width: Optional[int] = None
 
     for sample in conversations:
         sample_len = 0
@@ -124,6 +134,8 @@ def pack_qwen3omni_conversations_for_forward(
                 continue
             embeds = item.value.to(device)
             length = embeds.size(0)
+            if length > 0 and embeddings_width is None:
+                embeddings_width = int(embeds.shape[-1])
             if length == 0:
                 # An empty segment carries no position and would break the
                 # ``seg_pos.max()`` cursor below. It is kept in the packed
@@ -133,7 +145,15 @@ def pack_qwen3omni_conversations_for_forward(
                 # backbone-input item would hand this row's slice to the empty
                 # item and raise ``StopIteration`` on the next — after the
                 # carrier had already been partly overwritten.
-                inputs_embeds_list.append(embeds.reshape(0, -1) if embeds.dim() == 1 else embeds)
+                #
+                # ``reshape(0, -1)`` is not usable for this: on a 1-D empty tensor
+                # there is no row count to infer, so torch raises. Take the width
+                # from the first non-empty segment when there is one, and fall
+                # back to the item's own declared width otherwise.
+                width = embeddings_width
+                if width is None:
+                    width = embeds.shape[-1] if embeds.dim() != 1 else 0
+                inputs_embeds_list.append(embeds.reshape(0, width))
                 position_ids_list.append(torch.zeros(3, 0, dtype=torch.float, device=device))
                 visual_pos_masks_list.append(torch.zeros(0, dtype=torch.bool, device=device))
                 if item.type in ("image", "video") and "deepstack" in item.meta:
@@ -357,6 +377,15 @@ class Qwen3OmniLlm(InferenceMixin, PretrainedOmniModule):
         self.config = config
         self.language_model = Qwen3OmniMoeThinkerTextModel._from_config(self.config.text_config)
         self.language_model.set_input_embeddings(nn.Identity())
+        # Instance-local handle for the router-balancing objective (see
+        # ``router_balancing_loss``). Built from ``ops_config``, so changing the
+        # config after construction does not replace it — the same rule every
+        # other op handle follows.
+        self.veomni_load_balancing_loss = VeomniOp(
+            "load_balancing_loss",
+            "standard",
+            self.config.ops_config.load_balancing_loss_implementation,
+        )
         self._past_key_values: Any = None
         self._next_position: float = 0.0
         self._thinker_embed_cache: List[torch.Tensor] = []
@@ -375,6 +404,22 @@ class Qwen3OmniLlm(InferenceMixin, PretrainedOmniModule):
         the common path collects nothing.
         """
         return bool(getattr(self.config.text_config, "output_router_logits", False))
+
+    def router_balancing_loss(self, gate_logits: Any, attention_mask: Any = None) -> Any:
+        """The router-balancing term, through this module's bound ``VeomniOp``.
+
+        Bind it here rather than calling the raw function: the row is what
+        ``ops_config.load_balancing_loss_implementation`` selects, so a fused
+        backend configured for the run actually reaches this objective — the same
+        handle the standalone thinker builds in its own ``__init__``.
+        """
+        return load_balancing_loss(
+            gate_logits,
+            self.config.text_config.num_experts,
+            self.config.text_config.num_experts_per_tok,
+            attention_mask,
+            op=self.veomni_load_balancing_loss,
+        )
 
     def freeze_model(self) -> None:
         """Freeze the whole backbone when ``config.freeze`` (talker training)."""
@@ -435,7 +480,12 @@ class Qwen3OmniLlm(InferenceMixin, PretrainedOmniModule):
             # ``None`` unless the objective is on, and popped by the graph hook
             # rather than carried through the DAG.
             "router_logits": outputs.router_logits if output_router_logits else None,
-            "router_attention_mask": attention_mask if output_router_logits else None,
+            # Deliberately *not* ``attention_mask``. That one describes the rows
+            # this call's backend consumed, which under Ulysses is this rank's
+            # shard — while the router logits the hook passes to the balancing
+            # loss are laid out the same way. The hook builds its own mask from
+            # the logits' own row count, so the two can never disagree.
+            "router_attention_mask": None,
         }
         if kwargs.get("output_hidden_states"):
             # Named apart from ``hidden_states`` (the last layer, what the lm_head
@@ -443,6 +493,27 @@ class Qwen3OmniLlm(InferenceMixin, PretrainedOmniModule):
             # embedding; index i>0 is decoder layer i's output.
             result["all_hidden_states"] = outputs.hidden_states
         return result
+
+
+def _create_qwen3omni_llm_checkpoint_tensor_converter(model: "Qwen3OmniLlm"):
+    """Per-expert -> fused experts converter for the omni backbone.
+
+    An upstream checkpoint stores experts per expert
+    (``thinker.model.layers.N.mlp.experts.{j}.{gate,up,down}_proj.weight``); the
+    v5 modeling holds one stacked ``experts.gate_up_proj`` / ``experts.down_proj``.
+    HF ``from_pretrained`` fuses natively, but the VeOmni meta-init / FSDP loader
+    needs the converter explicitly — without it those keys match no parameter and
+    the experts keep their fused-shape *initialisation*, so a direct upstream-root
+    load silently trains on random experts while the offline split works fine.
+    """
+    return Qwen3OmniMoeCheckpointTensorConverter(num_experts=model.config.text_config.num_experts)
+
+
+# Wire the conversion onto this wrapper, the way the qwen3_moe sibling does: the
+# loader resolves the class through ``OMNI_MODEL_REGISTRY``, so the hook has to
+# be registered here rather than on the transformers-side model.
+Qwen3OmniLlm._create_checkpoint_tensor_converter = staticmethod(_create_qwen3omni_llm_checkpoint_tensor_converter)
+Qwen3OmniLlm._convert_fqn_to_index_mapping = staticmethod(convert_qwen3_omni_moe_fqn_to_index_mapping)
 
 
 __all__ = [

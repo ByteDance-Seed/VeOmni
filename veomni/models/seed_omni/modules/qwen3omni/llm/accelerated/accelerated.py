@@ -12,7 +12,6 @@ from torch.distributed.tensor.placement_types import Shard
 
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import gather_outputs, slice_input_tensor, sp_pad
-from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import load_balancing_loss_func
 from veomni.utils.tensor_utils import unflatten
 
 from .......distributed.parallel_plan import ParallelPlan
@@ -49,6 +48,9 @@ class TrainingMixin(TrainingModuleMixin):
         # Active sample's pre-pad packed length. Under SP the output-gather hook
         # narrows the all-gathered (padded) output back to it.
         self._sp_own_len: Optional[int] = None
+        # Pre-slice row count for the router-logits gather (see
+        # ``_full_sequence_router_logits``).
+        self._sp_router_own_len: Optional[int] = None
 
     @pre_forward("forward")
     def forward_pre(
@@ -91,6 +93,10 @@ class TrainingMixin(TrainingModuleMixin):
             group, sp_size, sp_rank = ps.sp_group, ps.sp_size, ps.sp_rank
 
             self._sp_own_len = inputs_embeds.size(1)
+            # Same length, but tracked apart from ``_sp_own_len``: the router loss
+            # gathers its own tensor set and is consumed before the hidden-state
+            # gather, so sharing one field would have them clobber each other.
+            self._sp_router_own_len = inputs_embeds.size(1)
             cu = packed["cu_seq_lens"]
             max_length = int((cu[1:] - cu[:-1]).max().item()) if cu.numel() > 1 else 0
 
@@ -176,7 +182,11 @@ class TrainingMixin(TrainingModuleMixin):
     def forward_post(self, **outputs: Any) -> Dict[str, Any]:
         hidden_states = outputs.pop("hidden_states")
         router_logits = outputs.pop("router_logits", None)
-        router_mask = outputs.pop("router_attention_mask", None)
+        # Dropped rather than used: the balancing loss is computed over the full
+        # gathered sequence, where every row is real, so no mask applies. Keeping
+        # the key would only invite passing a local-width mask to a full-width
+        # tensor — the shape mismatch this replaced.
+        outputs.pop("router_attention_mask", None)
         traces = self._thinker_traces(outputs)
 
         if get_parallel_state().sp_size > 1:
@@ -194,6 +204,7 @@ class TrainingMixin(TrainingModuleMixin):
         pack_shape = self._pack_inputs_embeds_shape
         self._conversation_carrier = None
         self._pack_inputs_embeds_shape = None
+        self._sp_router_own_len = None
 
         if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
             hidden_states = hidden_states.squeeze(0)
@@ -208,12 +219,7 @@ class TrainingMixin(TrainingModuleMixin):
             # configured and the logits were collected, then dropped: the run
             # silently trained on the decode head's CE alone.
             cfg = self.config.text_config
-            aux_loss = load_balancing_loss_func(
-                router_logits,
-                cfg.num_experts,
-                cfg.num_experts_per_tok,
-                router_mask,
-            )
+            aux_loss = self.router_balancing_loss(self._full_sequence_router_logits(router_logits))
             if isinstance(aux_loss, torch.Tensor):
                 # ``router_aux_loss_coef`` is applied here rather than inside the
                 # loss so a zero coefficient still reports the raw term.
@@ -221,6 +227,29 @@ class TrainingMixin(TrainingModuleMixin):
                 device = conversation[0][0].value.device
                 result["_loss"] = aux_loss.to(device=device) * coefficient
         return result
+
+    def _full_sequence_router_logits(self, router_logits: Any) -> Any:
+        """Router logits over the whole packed sequence, not this rank's window.
+
+        The balancing term is a *product* of two batch-level means (per-expert
+        token share times mean router probability), so it is not linear in the
+        rows: averaging per-rank values does not reproduce the value over the
+        combined rows. Under Ulysses each rank therefore has to see every row
+        before the product forms, so the per-layer logits are gathered back and
+        the SP pad tail stripped — the same concatenation the hidden-state
+        gather below produces.
+
+        With ``sp_size == 1`` this is the identity, and there is no pad, so the
+        single-device result is unchanged.
+        """
+        if router_logits is None or get_parallel_state().sp_size == 1:
+            return router_logits
+        group = get_parallel_state().sp_group
+        own_len = self._sp_router_own_len
+        gathered = tuple(
+            gather_outputs(layer, gather_dim=0, group=group).narrow(0, 0, own_len) for layer in router_logits
+        )
+        return gathered
 
     def _thinker_traces(self, outputs: Dict[str, Any]) -> tuple:
         """The talker's two inputs, pulled out of the layer stack this forward kept.

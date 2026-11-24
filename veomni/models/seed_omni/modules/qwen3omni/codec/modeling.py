@@ -7,8 +7,9 @@ Qwen3-Omni released a decoder but not its audio tokenizer:
 * ``decode_codes`` (codes -> waveform) runs Qwen's own ``code2wav`` vocoder.
   This is the inference path, and it is the right decoder because it is the one
   the talker was trained against — it produces the model's actual voice.
-* ``encode_wav`` (waveform -> codes) runs ``kyutai/mimi``, whose index space the
-  talker's codes turn out to share. This is what makes talker training possible
+* ``encode_wav`` (waveform -> codes) runs ``kyutai/mimi``
+  (https://huggingface.co/kyutai/mimi), whose index space the talker's codes turn
+  out to share. This is what makes talker training possible
   without Qwen's unreleased tokenizer: targets can be built from raw audio.
 
 **How far that sharing was verified**, because the naive check is misleading.
@@ -181,8 +182,12 @@ class Qwen3OmniCodec(InferenceMixin, PretrainedOmniModule):
             # an encoder whose weights were never loaded.
             raise NotImplementedError(
                 "qwen3omni_codec: this checkpoint was loaded from the upstream root, which ships only the "
-                "decoder half of the audio codec. The encoder comes from kyutai/mimi, so split the checkpoint "
-                "offline first: `python scripts/seed_omni/convert_model.py --extra mimi_path=kyutai/mimi`."
+                "decoder half of the audio codec. The encoder comes from kyutai/mimi "
+                "(https://huggingface.co/kyutai/mimi), so split the checkpoint offline first:\n"
+                "  python scripts/seed_omni/convert_model.py \\\n"
+                "    --model_path /path/to/Qwen3-Omni-30B-A3B-Instruct \\\n"
+                "    --output_dir /path/to/qwen3omni-split \\\n"
+                "    --extra mimi_path=kyutai/mimi"
             )
         self.config = config
         self.code2wav = Qwen3OmniMoeCode2Wav._from_config(self.config.code2wav_config)

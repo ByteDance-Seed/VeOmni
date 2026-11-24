@@ -20,7 +20,7 @@ qwen3omni_text_encoder.encode ─┘        │
 | `qwen3omni_text_encoder` | `embed_tokens` + untied `lm_head` + tokenizer | token ↔ embedding, CE loss head, ChatML (text + image + video + audio) template |
 | `qwen3omni_llm` | thinker backbone (no embed / no head) | `inputs_embeds → hidden_states`, TMRoPE, exposes the intermediate layer the talker consumes |
 | `qwen3omni_talker` | talker + residual code predictor | thinker states → RVQ codes |
-| `qwen3omni_codec` | Qwen `code2wav` **+** `kyutai/mimi` encoder | codes ↔ waveform |
+| `qwen3omni_codec` | Qwen `code2wav` **+** [`kyutai/mimi`](https://huggingface.co/kyutai/mimi) encoder | codes ↔ waveform |
 
 Three Qwen3-Omni specifics worth knowing before you touch the configs:
 
@@ -66,7 +66,9 @@ Three Qwen3-Omni specifics worth knowing before you touch the configs:
   slice on the carrier in `meta["thinker_embed"]` / `meta["thinker_hidden"]` —
   the same per-item split that returns hidden states to `item.value`.
 - **The codec is two checkpoints.** Qwen ships a vocoder but no audio
-  tokenizer, so the encoder half comes from `kyutai/mimi`. See §1.
+  tokenizer, so the encoder half comes from
+  [`kyutai/mimi`](https://huggingface.co/kyutai/mimi) (CC-BY-4.0, on the Hub —
+  the converter downloads it if you pass the id). See §1.
 
 Config dir: `configs/seed_omni/Qwen/qwen3omni_30b_a3b/`
 
@@ -97,10 +99,12 @@ needs both:
   root uses it directly.
 * `modules/qwen3omni/convert_model.py` — the offline converter, which must run
   for this family because the codec needs a **second** checkpoint: the
-  `kyutai/mimi` encoder that pairs with Qwen's decoder. Its converter takes that
+  [`kyutai/mimi`](https://huggingface.co/kyutai/mimi) encoder that pairs with
+  Qwen's decoder. Its converter takes that
   as a `mimi_path` kwarg, which the shared entry point forwards through
   `--extra` rather than carrying a flag no other family uses. It accepts a local
-  directory or a hub id, and defaults to `kyutai/mimi`.
+  directory or a hub id, and defaults to the Hub id `kyutai/mimi`
+  (`hf download kyutai/mimi --local-dir <dir>` to fetch it explicitly).
 
 ```bash
 python scripts/seed_omni/convert_model.py \

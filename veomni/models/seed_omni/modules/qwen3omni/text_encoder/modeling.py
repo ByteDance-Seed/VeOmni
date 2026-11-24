@@ -222,10 +222,13 @@ class Qwen3OmniTextEncoder(TextEncoder):
             dtype=torch.long,
             device=self.device,
         )
-        # ``_embed_tokens``, not ``embed_tokens``: under the ``emb`` extra-parallel
-        # group the table is sharded and a direct lookup with global ids is wrong.
+        # ``self.embed_tokens``, not a raw table read: it is a
+        # :class:`~veomni.distributed.emb_parallel.sharded_embedding.ShardedEmbedding`,
+        # whose ``forward`` takes *global* ids and handles the ``emb`` extra-parallel
+        # all-to-all itself (falling through to ``nn.Embedding`` when the table is
+        # not split). There is no ``_embed_tokens`` on this class or its bases.
         with torch.no_grad():
-            return self._embed_tokens(tts_ids)
+            return self.embed_tokens(tts_ids)
 
     def generate(
         self,

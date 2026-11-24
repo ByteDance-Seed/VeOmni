@@ -447,6 +447,67 @@ def test_a_single_sample_batch_gets_an_explicit_causal_mask():
     assert mask.all()
 
 
+def test_the_router_balancing_loss_goes_through_the_bound_op():
+    """`load_balancing_loss_implementation` has to reach this objective.
+
+    Calling the standalone function directly ignores the row, so a fused backend
+    configured for the run would silently not be used for the auxiliary loss.
+    """
+    module = _accelerated_llm(text_config={"output_router_logits": True, "router_aux_loss_coef": 0.01})
+
+    # The handle exists and is what `router_balancing_loss` uses.
+    from veomni.ops import VeomniOp
+
+    assert isinstance(module.veomni_load_balancing_loss, VeomniOp)
+
+    cfg = module.config.text_config
+    gate_logits = (torch.randn(6, cfg.num_experts),)
+    with torch.no_grad():
+        loss = module.router_balancing_loss(gate_logits)
+    assert loss.numel() == 1 and torch.isfinite(loss)
+
+
+def test_the_router_loss_is_computed_over_the_whole_sequence_under_sp():
+    """The balancing term is a *product* of batch means, so per-rank values do not
+    average to the full-batch value; the logits are gathered instead."""
+    module = _accelerated_llm(text_config={"output_router_logits": True})
+    # With sp_size == 1 the helper is the identity, which is the baseline the
+    # gathered path has to match.
+    logits = (torch.randn(4, module.config.text_config.num_experts),)
+    assert module._full_sequence_router_logits(logits) is logits
+
+
+def test_an_empty_segment_keeps_its_slot_without_inferring_a_width():
+    """`reshape(0, -1)` is ambiguous on an empty tensor, so the width is carried.
+
+    A 1-D empty segment has no row to infer the hidden width from — torch raises
+    rather than producing `(0, H)` — so the packer takes the width from the
+    sequence it is building.
+    """
+    packed = _pack([_text(2), _text(0), _text(3)])
+
+    assert packed["inputs_embeds_shape"].tolist() == [[2], [0], [3]]
+    assert packed["inputs_embeds"].shape == (1, 5, HIDDEN)
+    # A 1-D empty row goes through the same path rather than raising.
+    sample = [
+        _text(2),
+        ConversationItem(type="text", value=torch.zeros(0), role="user"),
+        _text(3),
+    ]
+    packed_1d = _pack(sample)
+    assert packed_1d["inputs_embeds"].shape == (1, 5, HIDDEN)
+
+
+def test_the_backbone_registers_the_expert_fusion_converter():
+    """Without it an upstream-root load leaves the experts at their fused-shape
+    *initialisation*: the per-expert keys match no parameter, and nothing raises.
+    """
+    from veomni.models.seed_omni.modules.qwen3omni.llm.modeling import Qwen3OmniLlm
+
+    assert hasattr(Qwen3OmniLlm, "_create_checkpoint_tensor_converter")
+    assert hasattr(Qwen3OmniLlm, "_convert_fqn_to_index_mapping")
+
+
 def test_generate_refuses_sequence_parallelism():
     """`forward_pre` slices the sample per rank; `generate` has no such hook.
 
@@ -488,8 +549,11 @@ def test_dummy_items_are_excluded_but_donate_deepstack():
 
 def _accelerated_llm(**config_overrides) -> "Qwen3OmniLlmAccelerated":
     torch.manual_seed(0)
+    # The MoE objective's flags live on the *text* config, which is where the
+    # upstream thinker reads them; they are not fields of the wrapper config.
+    text_config = {**TINY_TEXT_CONFIG, **config_overrides.pop("text_config", {})}
     config = Qwen3OmniLlmConfig(
-        ops_implementation=make_eager_ops_config(), text_config=TINY_TEXT_CONFIG, **config_overrides
+        ops_implementation=make_eager_ops_config(), text_config=text_config, **config_overrides
     )
     return Qwen3OmniLlmAccelerated(config).eval()
 

@@ -258,6 +258,25 @@ def apply_scores(script_args: argparse.Namespace) -> None:
             f"by row position, which that pass invalidated. Re-score, or start from the unfiltered copy."
         )
 
+    # A *partial* pass is the same hazard and the marker above only records a
+    # completed one. An interrupted run has already rewritten (or removed) some
+    # shards, so the remaining scores no longer line up with the files — and a
+    # naive retry would apply them by position and delete valid clips. Recorded
+    # before the first write, cleared only on success, so a crashed run is
+    # reported rather than silently re-applied.
+    in_progress = apply_marker(script_args.corpus) + ".inprogress"
+    if os.path.exists(in_progress):
+        with open(in_progress, encoding="utf-8") as handle:
+            began = json.load(handle)
+        raise SystemExit(
+            f"{script_args.corpus} has a filtered pass in progress from {began.get('when', 'an earlier run')} "
+            f"(marker: {os.path.basename(in_progress)}). It rewrites shards in place, so the scores no longer "
+            f"match every file by row position. Re-score the surviving shards, or restart from the unfiltered "
+            f"copy; delete the marker only if you have done one of those."
+        )
+    with open(in_progress, "w", encoding="utf-8") as handle:
+        json.dump({"when": time.strftime("%Y-%m-%dT%H:%M:%S"), "min_overlap": script_args.min_overlap}, handle)
+
     scores = load_scores(script_args.corpus)
     shards = sorted(glob.glob(os.path.join(script_args.corpus, "*.parquet")))
 
@@ -297,6 +316,9 @@ def apply_scores(script_args: argparse.Namespace) -> None:
             handle,
             indent=2,
         )
+    # The completed marker above and this one travel together: leaving the
+    # in-progress file behind would block every later run.
+    os.remove(in_progress)
 
     values = sorted(scores.values())
     print(

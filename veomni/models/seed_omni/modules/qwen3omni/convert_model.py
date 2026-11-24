@@ -16,10 +16,11 @@ Output layout::
 Two things here are unlike the other model families:
 
 * **The codec needs a second checkpoint.** Qwen3-Omni ships a decoder but no
-  audio tokenizer, so the encoder half comes from ``kyutai/mimi`` (see
-  ``codec/modeling.py`` for how that was verified). The ``mimi_path`` kwarg
-  points at it — ``--extra mimi_path=...`` from the shared convert CLI — and the
-  split fails loudly rather than emitting a codec that can only decode.
+  audio tokenizer, so the encoder half comes from ``kyutai/mimi``
+  (https://huggingface.co/kyutai/mimi — see ``codec/modeling.py`` for how that
+  was verified). The ``mimi_path`` kwarg points at it — ``--extra mimi_path=...``
+  from the shared convert CLI — and the split fails loudly rather than emitting a
+  codec that can only decode.
 * **Weights are streamed, not loaded.** The 30B-A3B checkpoint is 28010 tensors
   over 15 shards, and instantiating the upstream container to re-save it would
   need ~60 GB of host RAM for no benefit. Each shard is opened once and its
@@ -57,8 +58,10 @@ _LLM_PREFIX = "thinker.model."
 _TALKER_PREFIX = "talker."
 _CODE2WAV_PREFIX = "code2wav."
 
-# A hub id, not a cluster path: the encoder half is a public checkpoint, and a
-# default pointing into internal storage would fail for anyone outside it.
+# A hub id, not a cluster path: the encoder half is a public checkpoint
+# (https://huggingface.co/kyutai/mimi), and a default pointing into internal
+# storage would fail for anyone outside it. ``_resolve_mimi_path`` downloads it
+# on demand when a hub id is given.
 DEFAULT_MIMI_PATH = "kyutai/mimi"
 
 
@@ -77,7 +80,8 @@ def _resolve_mimi_path(mimi_path: str) -> str:
     except Exception as exc:
         raise FileNotFoundError(
             f"qwen3omni convert: could not resolve the Mimi checkpoint {mimi_path!r} as a local directory or a hub "
-            f"id ({exc}). Qwen3-Omni ships no audio tokenizer, so the codec's encoder half comes from kyutai/mimi — "
+            f"id ({exc}). Qwen3-Omni ships no audio tokenizer, so the codec's encoder half comes from kyutai/mimi "
+            f"(https://huggingface.co/kyutai/mimi) — "
             f"pass --extra mimi_path=<dir-or-hub-id>. Emitting a decode-only codec would break talker training "
             f"later, far from here."
         ) from exc
