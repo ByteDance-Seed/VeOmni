@@ -711,6 +711,7 @@ class DeepseekV4CheckpointTensorConverter:
         model: torch.nn.Module,
         *,
         should_quantize: Callable[[str], bool] | None = None,
+        skip_frozen_engram: bool = False,
     ) -> Generator[tuple[str, torch.Tensor]]:
         """Export model parameters in DeepSeek-V4 release format with FP8/FP4 quantization when applicable."""
         config = getattr(model, "config", None)
@@ -773,8 +774,29 @@ class DeepseekV4CheckpointTensorConverter:
                     converted = ".".join(fields)
             origin_names[converted] = origin
 
+        skipped_origin_names: set[str] = set()
+        if skip_frozen_engram:
+            from veomni.models.frozen_ple import collect_frozen_engram_state_dict_keys
+
+            for frozen_key in collect_frozen_engram_state_dict_keys(model, fqn_to_index_mapping.keys()):
+                alt_key = frozen_key.replace(".engram.embed_tokens.", ".engram.embed.")
+                origin = origin_names.get(frozen_key) or origin_names.get(alt_key)
+                if origin is None:
+                    for candidate in (frozen_key, alt_key):
+                        if candidate in fqn_to_index_mapping:
+                            origin = candidate
+                            break
+                if origin is None and not fqn_to_index_mapping:
+                    origin = _revert_deepseek_v4_checkpoint_key(
+                        alt_key, target_model_prefix=self.target_model_prefix, enable_mtp=self.enable_mtp
+                    )
+                if origin is not None:
+                    skipped_origin_names.add(origin)
+                    if origin.endswith(".weight"):
+                        skipped_origin_names.add(origin.removesuffix(".weight") + ".scale")
+
         export_weight_names = set()
-        for name, param in export_weights(model):
+        for name, param in export_weights(model, skip_frozen_engram=skip_frozen_engram):
             # 1. replace mlp.experts.0.(gate_proj|up_proj|down_proj).weight to mlp.experts.0.(w1|w2|w3).weight
             if "mlp.experts." in name:
                 fields = name.split(".")
@@ -833,7 +855,7 @@ class DeepseekV4CheckpointTensorConverter:
             yield origin, weight
             yield scale_name, scale
 
-        missing_weight_names = fqn_to_index_mapping.keys() - export_weight_names
+        missing_weight_names = fqn_to_index_mapping.keys() - export_weight_names - skipped_origin_names
         if not self.enable_mtp:
             missing_weight_names = {name for name in missing_weight_names if not _is_mtp_checkpoint_key(name)}
         if missing_weight_names:

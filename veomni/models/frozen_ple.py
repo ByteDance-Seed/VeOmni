@@ -6,16 +6,101 @@ lookup still reads them.
 """
 
 import re
+from collections.abc import Iterable
 
 import torch
 
 
 _PLE_TABLE = re.compile(r"(?:^|\.)ple\.ple_embedding\.ngram_embedding\.shard_\d+\.weight$")
 
+_ENGRAM_OR_PLE_TABLE_SCOPES = (
+    re.compile(
+        r"^(?P<scope>(?:.+\.)?ngram_embedding)(?:\.shard_\d+)?\.(?:weight|weight_scale|scale|weight_scale_inv)$"
+    ),
+    re.compile(
+        r"^(?P<scope>(?:.+\.)?engram(?:\.\d+)?\.(?:embed|embed_tokens))\.(?:weight|scale|weight_scale|weight_scale_inv)$"
+    ),
+    re.compile(
+        r"^(?P<scope>(?:.+\.)?(?:engram|ngram_embedding|ngram_embeddings)\.tables\.\d+)\.(?:weight|scale|weight_scale|weight_scale_inv)$"
+    ),
+)
+
+_WRAPPER_SEGMENTS = ("_orig_mod.", "_fsdp_wrapped_module.", "module.")
+
+
+def _strip_wrapper_prefixes(name: str) -> str:
+    changed = True
+    while changed:
+        changed = False
+        for seg in _WRAPPER_SEGMENTS:
+            if name.startswith(seg):
+                name = name[len(seg) :]
+                changed = True
+            elif f".{seg}" in name:
+                name = name.replace(f".{seg}", ".")
+                changed = True
+    return name
+
+
+def _engram_table_scope(name: str) -> str | None:
+    for pattern in _ENGRAM_OR_PLE_TABLE_SCOPES:
+        match = pattern.match(name)
+        if match is not None:
+            return match.group("scope")
+    return None
+
 
 def is_ple_table(name: str) -> bool:
     """Return whether a parameter name identifies a PLE n-gram shard weight."""
     return _PLE_TABLE.search(name) is not None
+
+
+def is_engram_or_ple_table(name: str) -> bool:
+    """Return whether ``name`` identifies an Engram or PLE n-gram lookup table tensor/scale."""
+    return _engram_table_scope(_strip_wrapper_prefixes(name)) is not None
+
+
+def collect_frozen_engram_state_dict_keys(
+    model: torch.nn.Module,
+    state_dict_keys: Iterable[str] | None = None,
+) -> set[str]:
+    """Return ``state_dict`` keys belonging to frozen Engram / PLE lookup tables.
+
+    Inspects ``model.named_parameters()`` rather than ``model.state_dict()``
+    values because ``state_dict()`` detaches tensors (setting ``requires_grad``
+    to ``False`` unconditionally) and so callers can skip frozen ``DTensor``
+    shards *before* calling ``full_tensor()``. Companion scale buffers in
+    ``state_dict_keys`` under the same frozen table scope are included as well.
+    """
+    frozen_keys: set[str] = set()
+    frozen_scopes: set[str] = set()
+    trainable_scopes: set[str] = set()
+
+    for raw_name, param in model.named_parameters():
+        clean_name = _strip_wrapper_prefixes(raw_name)
+        scope = _engram_table_scope(clean_name)
+        if scope is None:
+            continue
+        if param.requires_grad:
+            trainable_scopes.add(scope)
+        else:
+            frozen_keys.add(raw_name)
+            frozen_keys.add(clean_name)
+            frozen_scopes.add(scope)
+
+    pure_frozen_scopes = frozen_scopes - trainable_scopes
+    if state_dict_keys is not None and pure_frozen_scopes:
+        for key in state_dict_keys:
+            clean_key = _strip_wrapper_prefixes(key)
+            if clean_key in frozen_keys:
+                frozen_keys.add(key)
+                continue
+            scope = _engram_table_scope(clean_key)
+            if scope is not None and scope in pure_frozen_scopes:
+                frozen_keys.add(key)
+                frozen_keys.add(clean_key)
+
+    return frozen_keys
 
 
 def prepare_ple_storage(model: torch.nn.Module, dtype: str | None, expected_device: str | None = None) -> None:

@@ -424,20 +424,37 @@ def split_moe_params(name, tensor, ep_rank=0):
 _process_moe_params = split_moe_params
 
 
-def export_weights(model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor], None, None]:
+def export_weights(
+    model: torch.nn.Module,
+    *,
+    skip_frozen_engram: bool = False,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
     """
     Export master weights from fully_sharded model, fused MoE weights are split into per-expert weights.
 
     Args:
         model: The fully_sharded model to export the master weights from.
+        skip_frozen_engram: If True, skip frozen Engram / PLE n-gram embedding lookup tables
+            (and their companion scales) before unsharding ``DTensor`` parameters.
 
     Returns:
         A generator of tuples of the form (name, tensor).
     """
     ps = parallel_state.get_parallel_state()
     params = model.state_dict()
+    frozen_engram_keys: set[str] = set()
+    if skip_frozen_engram:
+        from veomni.models.frozen_ple import collect_frozen_engram_state_dict_keys
+
+        frozen_engram_keys = collect_frozen_engram_state_dict_keys(model, params.keys())
+
+    converter = get_checkpoint_tensor_converter(model)
+    crop_fn = getattr(converter, "crop_hf_export_tensor", None) if converter is not None else None
+
     device = None
     for name, param in params.items():
+        if name in frozen_engram_keys:
+            continue
         # With ``CPUOffloadPolicy`` the sharded DTensor local shard lives on CPU, so an
         # unstaged ``full_tensor()`` all-gathers over gloo and hands CPU tensors to the
         # consumers (EP broadcast, quantization kernels), which require device tensors.
@@ -464,4 +481,6 @@ def export_weights(model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor]
             if is_expert_layer:
                 yield from split_moe_params(name, unsharded_tensor, ep_rank=0)
             else:
+                if callable(crop_fn):
+                    unsharded_tensor = crop_fn(name, unsharded_tensor)
                 yield name, unsharded_tensor

@@ -9,7 +9,13 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.models.frozen_ple import freeze_ple_embeddings, is_ple_table, prepare_ple_storage
+from veomni.models.frozen_ple import (
+    collect_frozen_engram_state_dict_keys,
+    freeze_ple_embeddings,
+    is_engram_or_ple_table,
+    is_ple_table,
+    prepare_ple_storage,
+)
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -210,3 +216,128 @@ def test_dtensor_cast_preserves_local_shard_and_metadata(dtype, tmp_path):
             torch.testing.assert_close(param.to_local(), values.to(getattr(torch, dtype)), rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
+
+
+def test_is_engram_or_ple_table_matches_qwen4_and_deepseek_v41_only():
+    assert is_engram_or_ple_table("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight")
+    assert is_engram_or_ple_table("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.weight")
+    assert is_engram_or_ple_table("layers.1.engram.embed.weight")
+    assert is_engram_or_ple_table("layers.1.engram.embed.scale")
+    assert is_engram_or_ple_table("model.layers.14.engram.embed_tokens.weight")
+    assert is_engram_or_ple_table("model.ngram_embeddings.tables.0.weight")
+
+    assert not is_engram_or_ple_table("model.language_model.layers.1.ple.key_proj.weight")
+    assert not is_engram_or_ple_table("model.language_model.layers.1.ple.value_proj.weight")
+    assert not is_engram_or_ple_table("model.language_model.layers.1.ple.norm_key.weight")
+    assert not is_engram_or_ple_table("model.language_model.layers.1.ple.conv1d.weight")
+    assert not is_engram_or_ple_table("layers.1.engram.q_weight")
+    assert not is_engram_or_ple_table("layers.1.engram.k_weight")
+    assert not is_engram_or_ple_table("layers.1.engram.wkv.weight")
+    assert not is_engram_or_ple_table("layers.1.engram.wkv.scale")
+    assert not is_engram_or_ple_table("embed.weight")
+    assert not is_engram_or_ple_table("model.embed_tokens.weight")
+
+
+def test_export_weights_skips_frozen_ple_dtensor_without_full_tensor_and_crops_when_kept(monkeypatch, tmp_path):
+    from veomni.models.checkpoint.convert import export_weights
+    from veomni.models.transformers.qwen4_exp.checkpoint_tensor_converter import (
+        create_qwen4_exp_checkpoint_tensor_converter,
+    )
+
+    monkeypatch.setattr(
+        "veomni.distributed.parallel_state.get_parallel_state",
+        lambda: SimpleNamespace(ep_enabled=False),
+    )
+    monkeypatch.setattr("veomni.models.checkpoint.convert.get_device_type", lambda: "cpu")
+
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'rendezvous_export'}", rank=0, world_size=1)
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+        model = nn.Module()
+        model.config = SimpleNamespace(
+            model_type="qwen4_exp",
+            text_config=SimpleNamespace(split_ngram_parts=1, make_ngram_vocab_size_divisible_by=8),
+        )
+        ple = nn.Module()
+        ple.rows_per_checkpoint_shard = 6
+        ple.padded_rows_per_shard = 8
+        ple.ngram_embedding = nn.ModuleDict({"shard_0": nn.Embedding(8, 4)})
+        raw_table = torch.arange(32, dtype=torch.bfloat16).reshape(8, 4)
+        raw_table[6:] = 0
+        ple.ngram_embedding["shard_0"].weight = nn.Parameter(
+            distribute_tensor(raw_table, mesh, [Shard(0)]),
+            requires_grad=False,
+        )
+        model.layers = nn.ModuleList([nn.Module()])
+        model.layers[0].ple = nn.Module()
+        model.layers[0].ple.ple_embedding = ple
+        model.layers[0].ple.key_proj = nn.Linear(4, 4, bias=False)
+        model._create_checkpoint_tensor_converter = create_qwen4_exp_checkpoint_tensor_converter
+
+        orig_full_tensor = torch.distributed.tensor.DTensor.full_tensor
+        ple_full_tensor_calls = 0
+
+        def _guarded_full_tensor(self, *args, **kwargs):
+            nonlocal ple_full_tensor_calls
+            if self.shape == (8, 4):
+                ple_full_tensor_calls += 1
+            return orig_full_tensor(self, *args, **kwargs)
+
+        monkeypatch.setattr(torch.distributed.tensor.DTensor, "full_tensor", _guarded_full_tensor)
+
+        skipped_export = dict(export_weights(model, skip_frozen_engram=True))
+        assert ple_full_tensor_calls == 0
+        assert "layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight" not in skipped_export
+        assert "layers.0.ple.key_proj.weight" in skipped_export
+
+        full_export = dict(export_weights(model, skip_frozen_engram=False))
+        assert ple_full_tensor_calls == 1
+        ple_exported = full_export["layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"]
+        assert ple_exported.shape == (6, 4)
+        torch.testing.assert_close(ple_exported, raw_table[:6], rtol=0, atol=0)
+
+        # Unfrozen PLE must NOT be skipped even when skip_frozen_engram=True.
+        ple.ngram_embedding["shard_0"].weight.requires_grad_(True)
+        trainable_export = dict(export_weights(model, skip_frozen_engram=True))
+        assert "layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight" in trainable_export
+    finally:
+        dist.destroy_process_group()
+
+
+def test_deepseek_v4_converter_export_weights_skips_frozen_engram_and_scale(monkeypatch, caplog):
+    from veomni.models.transformers.deepseek_v4.checkpoint_tensor_converter import (
+        DeepseekV4CheckpointTensorConverter,
+    )
+
+    monkeypatch.setattr(
+        "veomni.distributed.parallel_state.get_parallel_state",
+        lambda: SimpleNamespace(ep_enabled=False),
+    )
+    monkeypatch.setattr("veomni.models.checkpoint.convert.get_device_type", lambda: "cpu")
+
+    model = nn.Module()
+    model.config = SimpleNamespace(model_type="deepseek_v41", tie_word_embeddings=False, quantization_config=None)
+    layer = nn.Module()
+    layer.engram = nn.Module()
+    layer.engram.embed_tokens = nn.Module()
+    layer.engram.embed_tokens.weight = nn.Parameter(torch.ones(8, 4, dtype=torch.bfloat16), requires_grad=False)
+    layer.engram.embed_tokens.register_buffer("scale", torch.ones(8, 1, dtype=torch.uint8))
+    layer.engram.q_weight = nn.Parameter(torch.full((4, 4), 2.0, dtype=torch.bfloat16), requires_grad=True)
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([layer])
+    model._veomni_fqn_to_index_mapping = {
+        "layers.0.engram.embed.weight": 1,
+        "layers.0.engram.embed.scale": 1,
+        "layers.0.engram.q_weight": 1,
+    }
+
+    assert "model.layers.0.engram.embed_tokens.scale" in collect_frozen_engram_state_dict_keys(
+        model, model.state_dict().keys()
+    )
+
+    converter = DeepseekV4CheckpointTensorConverter(num_experts=0, target_model_prefix="model.", enable_mtp=False)
+    with caplog.at_level("WARNING"):
+        exported = dict(converter.export_weights(model, skip_frozen_engram=True))
+
+    assert list(exported.keys()) == ["layers.0.engram.q_weight"]
+    assert "Export weights missing" not in caplog.text

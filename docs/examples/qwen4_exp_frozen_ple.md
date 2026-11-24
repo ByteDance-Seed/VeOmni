@@ -41,3 +41,16 @@ keep the dtype they have after model parallelization.
   was saved, the saved optimizer parameter groups may include them.
   Resuming with `freeze_ple_embeddings: true` excludes them from the current
   optimizer. This mismatch can cause optimizer state loading to fail.
+
+## Weight export
+
+- **Full checkpoint export (`export_weights(model)`).** Frozen PLE / Engram lookup
+  tables remain included by default (`skip_frozen_engram=False`), and padded runtime
+  PLE shards are cropped back to their logical checkpoint row counts when the model
+  converter implements `crop_hf_export_tensor`.
+- **Rollout / partial sync (`export_weights(model, skip_frozen_engram=True)`).**
+  Callers synchronizing only updated parameters (such as RL actor-to-rollout weight
+  sync) can pass `skip_frozen_engram=True` (supported by both
+  `veomni.models.checkpoint.convert.export_weights` and
+  `DeepseekV4CheckpointTensorConverter.export_weights`) to skip frozen PLE / Engram
+  lookup tables and their companion scales before unsharding `DTensor` shards.
