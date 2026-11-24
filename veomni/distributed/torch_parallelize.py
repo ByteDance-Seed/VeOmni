@@ -449,43 +449,21 @@ def _finish_without_fsdp_wrap(
 ) -> "nn.Module":
     """Materialize and load a model whose only parallelism is its ExtraParallel plan.
 
-    FSDP and the plan shard for different reasons. FSDP shards for *storage* and
-    all-gathers the parameter back before the operator runs, so it communicates
-    parameters and computes exactly what one device would. ep / emb shard for
-    *compute*: the parameter is never reassembled, tokens are routed to the rank
-    holding their expert or their table rows, and what crosses the wire is
-    activations. Only the second kind is load-bearing at inference, where there
-    are no gradients and no optimizer state for the first kind to shard.
+    The plan and the wrap shard different things: the plan splits a dimension
+    for *compute* (tokens are routed to the rank holding their expert or table
+    rows), while FSDP splits for *storage* and all-gathers the parameter back.
+    Only the second shards away gradients and optimizer state, which is why it
+    can be dropped when there are none.
 
-    The two also shard *different dimensions*, and that is what bounds where
-    this mode applies. For an expert stack ``[E, H, I]`` the plan takes dim0
-    (``Shard(0)`` over experts) while the wrap takes dim1 by default
-    (``shard_placement_fn`` -> ``Shard(1)`` over the hidden dim, or dim0 again
-    for whole-expert FSDP). Dropping the wrap leaves dim1 unsharded, so a
-    dimension whose ``<para>_fsdp`` axis is wider than one rank would replicate
-    every expert that many times; the guard below refuses that topology. The
-    mode therefore only fits a dimension that already spans the whole shard axis
-    (``ep_size`` == ``dp_shard`` for EP, or an ``emb`` width equal to the card
-    count).
-
-    At inference it is also what makes a quantized checkpoint loadable: an FSDP
-    parameter group requires one original dtype, and a decoder layer holding
-    quantized storage as released (packed int8 weights, fp8 values, fp8 or fp32
-    scales, fp32 numerics buffers) has several. That is a property of *storing*
-    the checkpoint quantized, not of training: a training run dequantizes at
-    load (``weight_quantization: null`` allocates bf16 or fp32 parameters and
-    spends the scales), so its layer holds one dtype and FSDP2 accepts it. The
-    dtype conflict is therefore the inference reason, not a training one.
-
-    It does not remove fp32 master weights. ``build_parallelize_model`` still
-    calls ``model.float()`` when ``mixed_precision.enable`` is true, which is
-    the training default, so a caller that wants the master copy gone must set
-    that flag too -- skipping the wrap and skipping the upcast are separate
-    decisions.
-
-    What it costs is the parameters the plan does not name: they stay whole on
-    every rank instead of being sharded for storage. That is logged rather than
-    assumed, since it is the number that decides whether the model fits.
+    Two consequences bound where this mode applies. Dropping the wrap leaves the
+    ``<para>_fsdp`` axis unsharded, so a dimension whose axis is wider than one
+    rank would replicate every expert that many times -- the guard below refuses
+    it, which means ``<para>_size`` must already span the shard axis. And an
+    FSDP parameter group requires one original dtype, so a checkpoint still
+    holding quantized storage (packed int8, fp8 values, fp8/fp32 scales, fp32
+    buffers) cannot be wrapped at all; a training run dequantizes at load and
+    does not hit this. The mode does *not* remove fp32 master weights --
+    ``model.float()`` still runs when ``mixed_precision.enable`` is true.
     """
     # The plan builds its DTensors over a 2D ``(para_fsdp, para)`` mesh and
     # leaves the first axis to FSDP. With no wrap nothing shards it, so a
@@ -576,11 +554,12 @@ def _finish_without_fsdp_wrap(
         )
 
     _divide_extra_parallel_grads_like_fsdp(model, parallel_state, fqn2spec_info)
-    # Read by the grad clipper, which averages the replicated parameters' grads.
+    # Read by the grad clipper (averages the replicated params' grads) and by
+    # ``ShardedEmbedding`` (no FSDP unit exists to own a split table).
     model._extra_parallel_only = True
     for module in model.modules():
         if isinstance(module, ShardedEmbedding):
-            module.outside_fsdp = True
+            module._extra_parallel_only = True
     return model
 
 

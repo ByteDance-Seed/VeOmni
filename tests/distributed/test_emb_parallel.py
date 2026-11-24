@@ -429,7 +429,7 @@ def test_a_split_table_outside_any_fsdp_wrap_dispatches(emb_state, monkeypatch):
     group = object()
     emb_state(_emb_state(group=group, size=2))
     embedding = _sliced(ShardedEmbedding(8, 4), rows=4)
-    embedding.outside_fsdp = True
+    embedding._extra_parallel_only = True
     groups = []
 
     def fake_all_to_all(dispatch_group, ids, weight):
