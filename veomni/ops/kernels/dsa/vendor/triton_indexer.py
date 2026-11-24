@@ -404,7 +404,7 @@ def triton_lighting_indexer(
         ``(scores, indices)``, both ``[B, S, K]``: FP32 scores (``-inf`` for
         unusable slots) and int32 indices (``-1`` for unusable slots).
     """
-    seq_len, _, heads, dim = index_q.shape
+    seq_len, batch, heads, dim = index_q.shape
     if heads > 64:
         raise ValueError(f"DeepSeek V4 Triton indexer supports at most 64 heads, got {heads}")
     # ``D`` is a Triton constexpr; non-power-of-two dims cannot lower.
@@ -416,12 +416,28 @@ def triton_lighting_indexer(
         raise ValueError(f"DeepSeek V4 Triton indexer requires bfloat16 q/k, got q={index_q.dtype}, k={index_k.dtype}")
     if weights.dtype is not torch.float32:
         raise ValueError(f"DeepSeek V4 Triton indexer requires float32 weights, got {weights.dtype}")
+    if topk_indices is not None:
+        if topk_indices.ndim != 3 or topk_indices.shape[:2] != (batch, seq_len):
+            raise ValueError(
+                f"DeepSeek V4 Triton indexer requires topk_indices [B={batch}, S={seq_len}, K], "
+                f"got {tuple(topk_indices.shape)}"
+            )
+        if topk_indices.device != index_q.device:
+            raise ValueError(
+                "DeepSeek V4 Triton indexer requires topk_indices on the q device, got "
+                f"q={index_q.device}, indices={topk_indices.device}"
+            )
     if (cu_seqlen_ks is None) != (cu_seqlen_ke is None):
         raise ValueError("cu_seqlen_ks and cu_seqlen_ke must be provided together")
     if cu_seqlen_ks is None:
         positions = torch.arange(seq_len, device=index_q.device, dtype=torch.int32)
         cu_seqlen_ks = torch.zeros_like(positions)
         cu_seqlen_ke = (positions + 1) // compress_ratio
+    elif cu_seqlen_ks.shape != (seq_len,) or cu_seqlen_ke.shape != (seq_len,):
+        raise ValueError(
+            f"Packed indexer ranges must have shape ({seq_len},), got "
+            f"{tuple(cu_seqlen_ks.shape)} and {tuple(cu_seqlen_ke.shape)}"
+        )
     return _TritonIndexer.apply(
         index_q.transpose(0, 1).contiguous(),
         index_k.transpose(0, 1).contiguous(),

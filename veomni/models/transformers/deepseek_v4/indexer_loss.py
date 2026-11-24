@@ -102,6 +102,12 @@ def _indexer_loss_enabled(module) -> bool:
             "dsa_indexer_loss requires dsa_attention_implementation='tilelang' or 'triton'; the teacher "
             "distribution requires the fused attention's full base-2 LSE"
         )
+    if indexer_impls and indexer_impls != attention_impls:
+        raise ValueError(
+            "dsa_indexer_loss requires a matched DSA backend pair: indexer and attention must both use "
+            f"'tilelang' or both use 'triton', got indexer={sorted(indexer_impls)!r}, "
+            f"attention={sorted(attention_impls)!r}"
+        )
     state = get_parallel_state()
     if state.ulysses_size > 1:
         raise ValueError(

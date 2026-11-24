@@ -82,6 +82,12 @@ def sparse_mqa_target_fwd_interface(q, kv, topk_idxs, lse, sm_scale=None):
         [B, S, C] fp32. L1-normalise in the caller.
     """
     batch, seq_len, heads, dim = q.shape
+    if kv.shape[0] != batch or kv.shape[-1] != dim:
+        raise RuntimeError(f"kv must be [B={batch}, P, D={dim}], got {tuple(kv.shape)}")
+    if topk_idxs.shape[:2] != (batch, seq_len):
+        raise RuntimeError(f"topk_idxs must be [B={batch}, S={seq_len}, C], got {tuple(topk_idxs.shape)}")
+    if lse.shape != (batch, seq_len, heads):
+        raise RuntimeError(f"lse must be [B={batch}, S={seq_len}, H={heads}], got {tuple(lse.shape)}")
     width = topk_idxs.shape[-1]
     if not (q.is_contiguous() and kv.is_contiguous() and topk_idxs.is_contiguous()):
         raise RuntimeError("target kernel requires q, kv and topk_idxs to be contiguous")

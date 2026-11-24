@@ -240,6 +240,39 @@ def test_triton_indexer_rejects_unsupported_inputs(heads, dim, q_dtype, w_dtype,
 
 
 @requires_rocm
+def test_triton_indexer_rejects_invalid_index_and_range_metadata():
+    from veomni.ops.kernels.dsa.vendor.triton_indexer import triton_lighting_indexer
+
+    seq_len = 4
+    q, k, weights = _inputs(seq_len, 1, 8, 128, 0, seed=16)
+    with pytest.raises(ValueError, match="topk_indices"):
+        triton_lighting_indexer(
+            q,
+            k,
+            weights,
+            compress_ratio=4,
+            topk=1,
+            topk_indices=torch.zeros(2, seq_len, 1, device="cuda", dtype=torch.int32),
+        )
+    with pytest.raises(ValueError, match="topk_indices on the q device"):
+        triton_lighting_indexer(
+            q,
+            k,
+            weights,
+            compress_ratio=4,
+            topk=1,
+            topk_indices=torch.zeros(1, seq_len, 1, dtype=torch.int32),
+        )
+
+    ks = torch.zeros(seq_len, device="cuda", dtype=torch.int32)
+    ke = torch.zeros_like(ks)
+    with pytest.raises(ValueError, match=r"ranges must have shape \(4,\)"):
+        triton_lighting_indexer(q, k, weights, 4, 1, cu_seqlen_ks=ks[:-1], cu_seqlen_ke=ke)
+    with pytest.raises(ValueError, match=r"ranges must have shape \(4,\)"):
+        triton_lighting_indexer(q, k, weights, 4, 1, cu_seqlen_ks=ks, cu_seqlen_ke=ke[:-1])
+
+
+@requires_rocm
 def test_triton_indexer_backward_masks_indices_past_the_pool():
     from veomni.ops.kernels.dsa.vendor.triton_indexer import triton_lighting_indexer
 
