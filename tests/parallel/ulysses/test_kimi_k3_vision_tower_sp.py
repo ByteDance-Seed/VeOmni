@@ -8,9 +8,12 @@ that key: pad_scale=4 keeps every 2x2 merge window whole), the tower computes
 the global attention contract, and the features are gathered back (the
 grad-summing _Gather) before the image-atomic t-pool merger.
 
-This test pins the parity the review asked for: the SP-sharded tower is
-bit-comparable to the single-rank (redundant) one, including token counts not
-divisible by sp_size * pad_scale and video-style T>1 grids.
+This test pins the parity the review asked for: the SP-sharded tower matches
+the single-rank (redundant) one, including token counts not divisible by
+sp_size * pad_scale and video-style T>1 grids. The parity budget is
+per-device: a tight fp32 budget on NPU (the fused row accepts fp32), the
+repo's bf16 budget on CUDA, where the veomni_flash_attention_2 row
+(flash-attn) only accepts fp16/bf16.
 """
 
 import pytest
@@ -40,12 +43,19 @@ CASES = {
 }
 
 
+# CUDA's flash-attn row only accepts fp16/bf16, so the tower and its pixel
+# inputs run bf16 there with the repo's bf16 parity budget (the qwen4_exp
+# vision arrangement); the fused NPU row keeps fp32 and the tight budget.
+_VISION_DTYPE = torch.bfloat16 if get_device_type() == "cuda" else torch.float32
+_PARITY_ATOL = _PARITY_RTOL = 1e-2 if _VISION_DTYPE == torch.bfloat16 else 2e-4
+
+
 def _build_tower(device):
     cfg = tiny_kimi_k3_config()
     cfg._attn_implementation = {"text_config": "eager", "vision_config": "veomni_flash_attention_2"}
     torch.manual_seed(0)
     model = KimiK3ForConditionalGeneration(cfg)
-    return model.vision_tower.to(device).eval()
+    return model.vision_tower.to(device=device, dtype=_VISION_DTYPE).eval()
 
 
 class KimiVisionTowerSPParityTest(SequenceParallelTest):
@@ -65,7 +75,7 @@ class KimiVisionTowerSPParityTest(SequenceParallelTest):
         for name, grids in CASES.items():
             num_rows = sum(t * h * w for t, h, w in grids)
             gen = torch.Generator().manual_seed(1)
-            pixel_values = torch.randn(num_rows, 3, 14, 14, generator=gen).to(device)
+            pixel_values = torch.randn(num_rows, 3, 14, 14, generator=gen).to(device=device, dtype=_VISION_DTYPE)
             grid_thws = torch.tensor(grids, dtype=torch.int64, device=device)
 
             # Baseline: SP off (the DP reference state) -- the full-sequence
@@ -89,7 +99,7 @@ class KimiVisionTowerSPParityTest(SequenceParallelTest):
                 continue
             for a, b in zip(out, expected):
                 try:
-                    torch.testing.assert_close(a, b, atol=2e-4, rtol=2e-4, equal_nan=False)
+                    torch.testing.assert_close(a, b, atol=_PARITY_ATOL, rtol=_PARITY_RTOL, equal_nan=False)
                 except AssertionError as e:
                     failures.append(f"{name}: {' '.join(str(e).split())}")
         assert not failures, "\n".join(failures)
