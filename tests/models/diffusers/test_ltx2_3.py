@@ -124,24 +124,27 @@ def test_ltx2_3_condition_builds_from_registered_class_without_assets(monkeypatc
 
 
 @pytest.mark.parametrize("has_batch_axis", [False, True])
-def test_ltx_offline_audio_latents_have_batch_axis(monkeypatch, has_batch_axis):
+@pytest.mark.parametrize("as_list", [True, False])
+def test_ltx_offline_audio_latents_have_batch_axis(monkeypatch, has_batch_axis, as_list):
     from veomni.models.diffusers.ltx2_3.ltx_condition import modeling_ltx2_3_condition as condition
 
     monkeypatch.setattr(condition.LTXVideoConditionModel, "_load_components", lambda self: None)
     monkeypatch.setattr(condition, "get_device_type", lambda: "cpu")
     model = condition.LTXVideoConditionModel(_tiny_condition_config())
     sample = torch.randn(8, 4, 16)
+    item = sample.unsqueeze(0) if has_batch_axis else sample
     batch = model._unpack_raw_batch(
         {"conditions": [{"video_prompt_embeds": torch.zeros(2, 16)}]},
         latents=None,
         context=None,
         context_mask=None,
         audio_context=None,
-        audio_latents=[sample.unsqueeze(0) if has_batch_axis else sample],
+        audio_latents=[item] if as_list else item,
         reference_latents=None,
         fps=None,
     )
-    torch.testing.assert_close(batch[4][0], sample.unsqueeze(0))
+    actual = batch[4][0] if as_list else batch[4]
+    torch.testing.assert_close(actual, sample.unsqueeze(0))
 
 
 def test_ltx2_3_eager_forward_and_backward_match_vendored_reference():
@@ -384,6 +387,49 @@ def test_ltx_adapter_matches_sdpa():
     torch.testing.assert_close(query.grad, q_ref.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     torch.testing.assert_close(key.grad, k_ref.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
     torch.testing.assert_close(value.grad, v_ref.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+def test_ltx_adapter_matches_sdpa_with_broadcast_padding_mask():
+    from veomni.utils.device import get_device_type
+
+    device = torch.device(get_device_type())
+    dtype = torch.bfloat16 if device.type != "cpu" else torch.float32
+    atol = 1e-2 if dtype == torch.bfloat16 else EAGER_ATOL
+    rtol = 1e-2 if dtype == torch.bfloat16 else EAGER_RTOL
+    grad_atol = 2e-2 if dtype == torch.bfloat16 else EAGER_GRAD_ATOL
+    grad_rtol = 2e-2 if dtype == torch.bfloat16 else EAGER_GRAD_RTOL
+
+    adapter = VeomniLTXAttention("sdpa")
+    torch.manual_seed(0)
+    batch, seq_q, seq_k, heads, dim_head = 2, 5, 7, 2, 8
+    query = torch.randn(batch, seq_q, heads * dim_head, device=device, dtype=dtype, requires_grad=True)
+    key = torch.randn(batch, seq_k, heads * dim_head, device=device, dtype=dtype, requires_grad=True)
+    value = torch.randn(batch, seq_k, heads * dim_head, device=device, dtype=dtype, requires_grad=True)
+    padding_mask = torch.tensor(
+        [[[[0.0, 0.0, 0.0, 0.0, -1e4, -1e4, -1e4]]], [[[0.0, 0.0, 0.0, -1e4, -1e4, -1e4, -1e4]]]],
+        device=device,
+        dtype=dtype,
+    )
+
+    out = adapter(query, key, value, heads, mask=padding_mask)
+
+    q_ref = query.detach().float().clone().requires_grad_(True)
+    k_ref = key.detach().float().clone().requires_grad_(True)
+    v_ref = value.detach().float().clone().requires_grad_(True)
+    q_h = q_ref.view(batch, seq_q, heads, dim_head).transpose(1, 2)
+    k_h = k_ref.view(batch, seq_k, heads, dim_head).transpose(1, 2)
+    v_h = v_ref.view(batch, seq_k, heads, dim_head).transpose(1, 2)
+    scores = torch.matmul(q_h, k_h.transpose(-2, -1)) * (dim_head**-0.5) + padding_mask.float()
+    ref = torch.matmul(torch.softmax(scores, dim=-1), v_h).transpose(1, 2).reshape(batch, seq_q, heads * dim_head)
+
+    torch.testing.assert_close(out.float(), ref, atol=atol, rtol=rtol)
+
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    ref.backward(grad.float())
+    torch.testing.assert_close(query.grad.float(), q_ref.grad, atol=grad_atol, rtol=grad_rtol)
+    torch.testing.assert_close(key.grad.float(), k_ref.grad, atol=grad_atol, rtol=grad_rtol)
+    torch.testing.assert_close(value.grad.float(), v_ref.grad, atol=grad_atol, rtol=grad_rtol)
 
 
 def test_ltx_core_rebinds_away_from_another_copy(tmp_path):
