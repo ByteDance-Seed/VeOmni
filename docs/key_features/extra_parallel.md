@@ -98,12 +98,12 @@ buffers). That is the *inference* reason. A training run dequantizes at load —
 and spends the scales in the converter — so its layer holds one dtype and FSDP2
 accepts it.
 
-Skipping the wrap and skipping fp32 master weights are **two separate
-decisions**. `extra_parallel_only` only drops the wrap;
-`build_parallelize_model` still runs `model = model.float()` whenever
-`mixed_precision.enable` is true, which is the training default, so the fp32
-master copy is allocated exactly as before. A training run that wants the master
-copy gone has to ask for it:
+Because FSDP2's `MixedPrecisionPolicy` is part of the skipped wrap,
+`extra_parallel_only: true` requires `mixed_precision.enable: false` (otherwise
+`build_parallelize_model` would upcast weights to FP32 with no policy to cast
+them back to the compute dtype, breaking BF16-only kernels such as Triton MoE
+GEMMs). Inference defaults `mixed_precision.enable` to `false`; a training run
+must set it explicitly:
 
 ```yaml
 accelerator:
@@ -112,19 +112,11 @@ accelerator:
     fsdp_mode: fsdp2
     extra_parallel_only: true
     mixed_precision:
-      enable: false           # this, not extra_parallel_only, removes the fp32 copy
+      enable: false           # required with extra_parallel_only (also avoids the fp32 master copy)
 ```
 
-`dsv41`'s `ngram` module does exactly that, with the arithmetic in a comment: an
-fp32 master copy of the 196.6 B tables would be another 786 GB.
-
-```yaml
-accelerator:
-  ep_size: 8
-  fsdp_config:
-    fsdp_mode: fsdp2
-    extra_parallel_only: true
-```
+`dsv41`'s `ngram` module uses this setup so its 196.6 B embedding tables avoid
+both FSDP all-gather buffers and an extra 786 GB FP32 master copy.
 
 This applies the plan and skips the wrap. The two shard for different reasons:
 FSDP shards for *storage* and all-gathers the parameter back before the

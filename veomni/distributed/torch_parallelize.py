@@ -446,14 +446,11 @@ def _finish_without_fsdp_wrap(
     can be dropped when there are none.
 
     Two consequences bound where this mode applies. Dropping the wrap leaves the
-    ``<para>_fsdp`` axis unsharded, so a dimension whose axis is wider than one
-    rank would replicate every expert that many times -- the guard below refuses
-    it, which means ``<para>_size`` must already span the shard axis. And an
-    FSDP parameter group requires one original dtype, so a checkpoint still
-    holding quantized storage (packed int8, fp8 values, fp8/fp32 scales, fp32
-    buffers) cannot be wrapped at all; a training run dequantizes at load and
-    does not hit this. The mode does *not* remove fp32 master weights --
-    ``model.float()`` still runs when ``mixed_precision.enable`` is true.
+    ``<para>_fsdp`` axis unsharded, so ``<para>_size`` must already span the shard
+    axis (``<para>_fsdp_size == 1``). And because FSDP2's ``MixedPrecisionPolicy``
+    is skipped along with the wrap, ``mixed_precision.enable`` must be ``False``
+    (otherwise ``model.float()`` would leave parameters in FP32 with no cast back
+    to the compute dtype).
     """
     for para in parallel_state.extra_parallel_names:
         if not parallel_state.extra_parallel_enabled(para):
@@ -593,6 +590,12 @@ def parallelize_model_fsdp2(
     We will use this model for illustration of Expert Parallel + Embed Parallel below.
     """
     parallel_state = get_parallel_state()
+    if extra_parallel_only and mixed_precision.enable:
+        raise ValueError(
+            "fsdp_config.mixed_precision.enable cannot be combined with fsdp_config.extra_parallel_only: "
+            "MixedPrecisionPolicy requires the FSDP2 wrap, so without it weights would stay in FP32. "
+            "Set fsdp_config.mixed_precision.enable=false."
+        )
     if extra_parallel_only and compile_config is not None and compile_config.enable:
         # `validate_compile_runtime` below would reject ExtraParallel + compile,
         # and the unwrapped path returns before reaching it. Fail up front rather
@@ -1265,6 +1268,13 @@ def build_parallelize_model(
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu", "mlu"]:
             raise ValueError("Only FSDP training supports `init_device=meta`.")
+
+    if extra_parallel_only and mixed_precision.enable:
+        raise ValueError(
+            "fsdp_config.mixed_precision.enable cannot be combined with fsdp_config.extra_parallel_only: "
+            "MixedPrecisionPolicy requires the FSDP2 wrap, so without it weights would stay in FP32. "
+            "Set fsdp_config.mixed_precision.enable=false."
+        )
 
     if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
         model = model.float()

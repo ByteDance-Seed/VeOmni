@@ -17,7 +17,7 @@ from packaging.version import Version
 from torch.distributed._tensor import DTensor, Shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.arguments import ModelArguments
+from veomni.arguments import MixedPrecisionConfig, ModelArguments
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
 from veomni.distributed.parallel_plan import ParallelPlan
 from veomni.distributed.parallel_state import (
@@ -205,7 +205,11 @@ def _run_clip_scenario(
             extra_parallel_only=extra_parallel_only,
             init_device="meta",
             weights_path=None,
-            mixed_precision=model_args.accelerator.fsdp_config.mixed_precision,
+            mixed_precision=(
+                MixedPrecisionConfig(enable=False)
+                if extra_parallel_only
+                else model_args.accelerator.fsdp_config.mixed_precision
+            ),
             enable_gradient_checkpointing=False,
             enable_fsdp_offload=cpu_offload,
             basic_modules=[],
