@@ -86,7 +86,57 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--speaker", default="Ethan")
     parser.add_argument("--prompt", default="Hello! Please say this sentence out loud so I can hear your voice.")
     parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument(
+        "--mimi-only",
+        action="store_true",
+        help=(
+            "Check the encoder/decoder *plumbing* without the Qwen checkpoint: load Mimi, verify its config "
+            "against what the codec module expects, and round-trip a tone. This is the part of the verification "
+            "that does not need Qwen weights, so `--model` is not read. It does NOT measure the index-space "
+            "agreement between the two codecs -- that needs both checkpoints."
+        ),
+    )
     return parser.parse_args()
+
+
+def run_mimi_only(args: argparse.Namespace) -> None:
+    """Encoder-side checks that need no Qwen checkpoint.
+
+    Answers the question the converter actually depends on -- is the Mimi
+    checkpoint we fetch the one this module's config was written against -- and
+    nothing more. The two-codec comparison still needs the 30B weights.
+    """
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    from transformers import MimiConfig, MimiModel
+
+    from veomni.models.seed_omni.modules.qwen3omni.codec.configuration import Qwen3OmniCodecConfig
+
+    print(f"[1/3] loading {args.mimi}")
+    mimi = MimiModel.from_pretrained(args.mimi, dtype=torch.float32).eval()
+    print(f"      {sum(p.numel() for p in mimi.parameters()) / 1e6:.1f}M params")
+
+    print("[2/3] does this checkpoint match what the codec module expects?")
+    # The same object the split builds, so the checks below are the ones a real
+    # codec runs at construction rather than a reimplementation of them.
+    config = Qwen3OmniCodecConfig(mimi_config=MimiConfig.from_pretrained(args.mimi).to_dict())
+    print(f"      encoder_from_checkpoint: {config.encoder_from_checkpoint}")
+    print(f"      sampling_rate: {config.sampling_rate} Hz   quantizers: {config.num_quantizers}")
+    print(
+        f"      samples/frame -- decoder {config.decoder_samples_per_frame}, "
+        f"encoder {config.encoder_samples_per_frame}"
+    )
+
+    print("[3/3] encode -> decode round trip on a 1 s tone")
+    rate = config.sampling_rate
+    tone = 0.3 * torch.sin(2 * torch.pi * 220 * torch.arange(rate, dtype=torch.float32) / rate)
+    with torch.no_grad():
+        codes = mimi.encode(tone.view(1, 1, -1), num_quantizers=config.num_quantizers).audio_codes
+        decoded = mimi.decode(codes).audio_values
+    sf.write(out / "mimi_round_trip.wav", decoded.squeeze().float().cpu().numpy(), rate)
+    print(f"      codes {tuple(codes.shape)}  frames/s={codes.shape[-1] / (len(tone) / rate):.1f}")
+    print(f"      decoded {decoded.shape[-1]} samples = {decoded.shape[-1] / rate:.2f}s -> {out}")
 
 
 def spectral_distance(a: np.ndarray, b: np.ndarray) -> float:
@@ -102,6 +152,10 @@ def spectral_distance(a: np.ndarray, b: np.ndarray) -> float:
 
 def main() -> None:
     args = parse_args()
+    if args.mimi_only:
+        run_mimi_only(args)
+        return
+
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
 

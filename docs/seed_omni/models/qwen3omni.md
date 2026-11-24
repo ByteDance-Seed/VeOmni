@@ -405,8 +405,18 @@ is absent, so the CPU suite runs without it.
 pytest tests/seed_omni/modules/qwen3omni/ tests/seed_omni/test_shipped_training_graphs.py
 ```
 
-The codec is the one module that can be exercised against real weights without
-that checkpoint, and was — see §4. To repeat it, point `--mimi` at a local copy:
+The codec is the one module that can be partly exercised against real weights
+without the Qwen checkpoint, and was — see §4. `--mimi-only` reproduces exactly
+those numbers (it never reads `--model`):
+
+```bash
+python scripts/seed_omni/qwen3omni_audio_check.py --mimi-only \
+  --mimi /path/to/kyutai-mimi \
+  --out-dir /tmp/mimi_only_check
+```
+
+The two-codec comparison in §4 needs **both** checkpoints, since it has to run
+the talker to obtain codes:
 
 ```bash
 python scripts/seed_omni/qwen3omni_audio_check.py \
