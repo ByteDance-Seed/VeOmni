@@ -436,11 +436,16 @@ def _configure_fsdp2_manual_prefetch(
 
     In backward, when a block owns an inner ExtraParallel FSDP submodule (such
     as ``mlp.experts``), backward prefetch is attached to the last inner
-    ExtraParallel submodule in forward order (the first reached in backward)
-    rather than the outer decoder block. Under activation checkpointing, the
-    outer block's ``_pre_backward`` runs before recomputation starts; triggering
-    from the inner submodule defers prefetching the previous block until the
-    current block's recomputation finishes and its backward actually begins.
+    ExtraParallel submodule in forward order rather than the outer decoder
+    block. Leaving the outer block's explicit backward prefetch list empty lets
+    FSDP2's default backward prefetch fetch the current block's own inner
+    experts first (avoiding head-of-line blocking behind ``prev_block`` on the
+    all-gather stream), and delays fetching ``prev_block`` until the inner
+    submodule's ``_pre_backward`` hook fires. Under non-reentrant activation
+    checkpointing, that inner hook runs after recomputation when a post-experts
+    op unpacks saved tensors before backward reaches the inner submodule; on a
+    bare residual-add block with no post-experts saved tensor, the inner output
+    hook can fire earlier, before recomputation unpacks its saved tensors.
     """
     groups_by_prefix: dict[str, List[nn.Module]] = {}
     for fqn, (layer_mod, _) in layer_pairs_list:

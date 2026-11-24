@@ -106,7 +106,7 @@ In short words, each decoder layer needs to prefetch the next/prev decoder layer
 
 Otherwise, the attention and expert modules are treated as separate layers. In this case, the time of attention computation often cannot fully overlap the AllGather for expert module.
 
-Manual prefetching groups target blocks by their parent container prefix (for example, `model.layers` vs `model.mtp` or `model.visual.blocks`) so separate or conditionally skipped stacks do not chain prefetch across stack boundaries. During backward, when a block contains an inner ExtraParallel FSDP submodule (such as `mlp.experts`), backward prefetch is registered on that inner submodule instead of the outer decoder block so activation checkpointing recomputation finishes before the previous layer's weights are prefetched.
+Manual prefetching groups target blocks by their parent container prefix (for example, `model.layers` vs `model.mtp` or `model.visual.blocks`) so separate or conditionally skipped stacks do not chain prefetch across stack boundaries. During backward, when a block contains an inner ExtraParallel FSDP submodule (such as `mlp.experts`), backward prefetch for the previous block is registered on that inner submodule instead of the outer decoder block. Leaving the outer block without explicit backward prefetch targets lets FSDP2's default backward prefetch fetch the current block's own inner experts first, and delays prefetching the previous block until the inner submodule enters pre-backward (which under non-reentrant activation checkpointing occurs after recomputation whenever a post-experts op unpacks saved tensors first, though not guaranteed on a bare residual-add graph with no post-experts saved tensor).
 
 ### Consequences of Mixed Sharding Strategy
 

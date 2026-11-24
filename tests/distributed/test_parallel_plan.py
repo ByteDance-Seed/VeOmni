@@ -37,10 +37,11 @@ from veomni.models.transformers.qwen3_5_moe.parallel_plan import get_parallel_pl
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 
 
-pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+_CI_CPU = LaunchSpec(device="cpu")
 _CI_ACCELERATOR_4 = LaunchSpec(nproc=4, device="accelerator")
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_every_planned_parameter_owner_is_a_para_module():
     """An owner left out would be re-sharded over the regular FSDP mesh, mixing ranks' slices."""
     assert qwen3_5_moe_plan().extra_parallel_fsdp_no_shard_module == {
@@ -48,6 +49,7 @@ def test_every_planned_parameter_owner_is_a_para_module():
     }
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_owners_of_one_module_collapse_to_one_entry():
     plan = ParallelPlan(
         extra_parallel_plan={"ep": {"layers.*.experts.gate_up_proj": Shard(0), "layers.*.experts.down_proj": Shard(0)}}
@@ -55,6 +57,7 @@ def test_owners_of_one_module_collapse_to_one_entry():
     assert plan.extra_parallel_fsdp_no_shard_module == {"ep": {"layers.*.experts"}}
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_every_owner_is_found_in_the_model():
     model = nn.Module()
     model.embed_tokens = nn.Embedding(8, 4)
@@ -69,16 +72,19 @@ def test_every_owner_is_found_in_the_model():
     assert found == {"embed_tokens": model.embed_tokens, "decoder.ngram": model.decoder.ngram}
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_nested_owners_are_rejected():
     with pytest.raises(ValueError, match="'decoder' and 'decoder.ngram' are nested"):
         ParallelPlan(extra_parallel_plan={"emb": {"decoder.weight": Shard(0), "decoder.ngram.weight": Shard(0)}})
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_owners_that_only_share_a_name_prefix_are_not_nested():
     plan = ParallelPlan(extra_parallel_plan={"emb": {"ngram.weight": Shard(0), "ngram_extra.weight": Shard(0)}})
     assert plan.extra_parallel_fsdp_no_shard_module == {"emb": {"ngram", "ngram_extra"}}
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_sort_fqn_by_submodule_first_preserves_siblings_and_orders_descendants():
     layers = [f"model.layers.{i}" for i in range(15)]
     assert sort_fqn_by_submodule_first(layers) == layers
@@ -103,6 +109,7 @@ class _RecordingFsdpStub(nn.Module):
         self.backward_prefetch = list(modules)
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_manual_prefetch_groups_by_parent_prefix_and_triggers_from_inner_ep():
     l0 = _RecordingFsdpStub("layers.0")
     l0_ep = _RecordingFsdpStub("layers.0.experts")
@@ -156,6 +163,7 @@ def test_manual_prefetch_groups_by_parent_prefix_and_triggers_from_inner_ep():
     assert singleton.backward_prefetch is None
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU)
 def test_manual_prefetch_backward_trigger_falls_back_for_dense_and_mp_ignored_only():
     dense0 = _RecordingFsdpStub("layers.0")
     dense0._fsdp_modules = [dense0]
