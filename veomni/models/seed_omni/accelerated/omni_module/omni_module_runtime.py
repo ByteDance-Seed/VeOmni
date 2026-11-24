@@ -41,7 +41,6 @@ from ....model_runtime import VeOmniModelRuntime
 from ...mixins.offline_encoding_mixin import OfflineEncodingMixin
 from ...utils.checkpoint import OmniModuleCheckpointManager
 from ..utils.dispatch import unwrap_module_chain
-from .omni_module_config import accelerator_needs_distributed_build
 
 
 if TYPE_CHECKING:
@@ -185,9 +184,10 @@ class ModuleRuntime(VeOmniModelRuntime):
         """Whether this module is loaded unwrapped in one process (``fsdp_mode='eager'``).
 
         Inference only: it skips :meth:`setup`, so it has no mesh, no
-        :class:`ParallelState` and no wrap.
+        :class:`ParallelState` and no wrap. The generic parallelize step rejects
+        ``eager`` for training.
         """
-        return not accelerator_needs_distributed_build(getattr(self.args, "accelerator", None))
+        return self.args.accelerator.fsdp_config.fsdp_mode == "eager"
 
     @property
     def wrap_omni_model(self) -> bool:

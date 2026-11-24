@@ -963,11 +963,6 @@ class AcceleratorConfig:
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
         self._resolve_topology()
         self._validate_init_device()
-        if self.fsdp_config.fsdp_mode == "eager" and any(s > 1 for s in self.extra_parallel_sizes):
-            raise ValueError(
-                "ExtraParallel (ep_size / extra_parallel_sizes > 1) requires fsdp_mode='fsdp2', "
-                "got fsdp_mode='eager'. Set fsdp_config.fsdp_mode='fsdp2' explicitly."
-            )
 
     def _resolve_topology(self):
         # Ahead of the topology arithmetic below, which cannot defend itself: a

@@ -46,13 +46,6 @@ def hf_module_model_config(model_config: dict | None) -> dict:
     return {key: value for key, value in model_config.items() if key not in LAUNCHER_CONFIG_KEYS}
 
 
-def accelerator_needs_distributed_build(accelerator) -> bool:
-    """True when ``accelerator`` requires a distributed build (``fsdp_mode != 'eager'``)."""
-    fsdp_config = getattr(accelerator, "fsdp_config", None)
-    fsdp_mode = getattr(fsdp_config, "fsdp_mode", None)
-    return bool(fsdp_mode and str(fsdp_mode).lower() != "eager")
-
-
 @dataclass
 class OmniModuleRuntimeArguments(ModelArguments):
     """Per-module runtime — one module's slice of a composed Omni model.
@@ -63,11 +56,6 @@ class OmniModuleRuntimeArguments(ModelArguments):
     per index path (several modules routinely share one checkpoint). All this adds
     is the projection onto an HF module descriptor.
     """
-
-    @property
-    def needs_distributed_build(self) -> bool:
-        """True when this module must be built under a process group, not loaded whole."""
-        return accelerator_needs_distributed_build(getattr(self, "accelerator", None))
 
     def to_hf_config(self) -> dict:
         """Project onto this module's ``OmniConfig._module_entries`` entry.
@@ -106,6 +94,5 @@ class OmniModuleRuntimeArguments(ModelArguments):
 
 __all__ = [
     "OmniModuleRuntimeArguments",
-    "accelerator_needs_distributed_build",
     "hf_module_model_config",
 ]

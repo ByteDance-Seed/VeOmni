@@ -140,43 +140,21 @@ def test_the_generic_runtime_forwards_extra_parallel_only_to_the_builder(monkeyp
 
 
 @pytest.mark.parametrize(
-    "global_accelerator, module_override, expected_mode, expected_flag, expected_dist",
+    "global_accelerator, module_override, expected_mode, expected_flag",
     [
-        ({"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)}, {}, "eager", True, False),
+        ({"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)}, {}, "eager", True),
+        ({"ep_size": 4}, {}, "eager", False),
         (
             {"ep_size": 4},
             {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2", "extra_parallel_only": True}}},
             "fsdp2",
             True,
-            True,
         ),
-        (
-            {},
-            {"accelerator": {"ep_size": 4, "fsdp_config": {"fsdp_mode": "fsdp2"}}},
-            "fsdp2",
-            False,
-            True,
-        ),
-        (
-            {},
-            {
-                "accelerator": {
-                    "fsdp_config": {"fsdp_mode": "fsdp2", "extra_parallel_only": True},
-                    "extra_parallel_names": ["emb"],
-                    "extra_parallel_sizes": [8],
-                    "extra_parallel_placement_innermost": [False],
-                }
-            },
-            "fsdp2",
-            True,
-            True,
-        ),
-        ({}, {}, "eager", False, False),
+        ({}, {}, "eager", False),
         (
             {"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)},
             {"accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}}},
             "ddp",
-            True,
             True,
         ),
         (
@@ -184,21 +162,18 @@ def test_the_generic_runtime_forwards_extra_parallel_only_to_the_builder(monkeyp
             {"accelerator": {"fsdp_config": {"fsdp_mode": "eager"}}},
             "eager",
             True,
-            False,
         ),
         (
             {"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)},
             {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}}},
             "fsdp2",
             True,
-            True,
         ),
     ],
     ids=[
         "global_no_wrap_stays_eager",
+        "global_ep_stays_eager_without_override",
         "global_ep_explicit_fsdp2",
-        "module_ep_explicit_fsdp2",
-        "module_emb_explicit_fsdp2",
         "plain_eager",
         "explicit_ddp_ignores_extra_parallel_only",
         "explicit_eager_ignores_extra_parallel_only",
@@ -206,7 +181,7 @@ def test_the_generic_runtime_forwards_extra_parallel_only_to_the_builder(monkeyp
     ],
 )
 def test_inference_fsdp_mode_and_extra_parallel_only(
-    monkeypatch, global_accelerator, module_override, expected_mode, expected_flag, expected_dist
+    monkeypatch, global_accelerator, module_override, expected_mode, expected_flag
 ):
     monkeypatch.setenv("WORLD_SIZE", "8")
     global_args = OmniModuleRuntimeArguments(
@@ -214,38 +189,8 @@ def test_inference_fsdp_mode_and_extra_parallel_only(
     )
     modules = build_omni_module_runtime_args(global_args, "/tmp/model", {"mod": module_override}, for_inference=True)
     mod = modules["mod"]
-    assert mod.needs_distributed_build is expected_dist
     assert mod.accelerator.fsdp_config.fsdp_mode == expected_mode
     assert mod.accelerator.fsdp_config.extra_parallel_only is expected_flag
-
-
-@pytest.mark.parametrize(
-    "global_accelerator, module_override",
-    [
-        ({"ep_size": 4}, {}),
-        ({}, {"accelerator": {"ep_size": 4}}),
-        (
-            {},
-            {
-                "accelerator": {
-                    "extra_parallel_names": ["emb"],
-                    "extra_parallel_sizes": [8],
-                    "extra_parallel_placement_innermost": [False],
-                }
-            },
-        ),
-    ],
-    ids=["global_ep_under_eager", "module_ep_under_eager", "module_emb_under_eager"],
-)
-def test_inference_eager_with_extra_parallel_raises_instead_of_auto_upgrading(
-    monkeypatch, global_accelerator, module_override
-):
-    monkeypatch.setenv("WORLD_SIZE", "8")
-    global_args = OmniModuleRuntimeArguments(
-        model_path="/tmp/model", accelerator=AcceleratorConfig(**global_accelerator)
-    )
-    with pytest.raises(ValueError, match="requires fsdp_mode='fsdp2'"):
-        build_omni_module_runtime_args(global_args, "/tmp/model", {"mod": module_override}, for_inference=True)
 
 
 def test_module_runtime_arguments_inherit_weight_load_knobs():
