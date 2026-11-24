@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import torch
 from torch import Tensor
 
 from ..helper import require_triton_input, require_triton_tensors
@@ -31,7 +32,9 @@ def wrapper(
 
     *post* is ``[B, S, H]`` and *comb* ``[B, S, H, H]``. Like the TileKernels
     row, the mix coefficients stay in FP32 rather than being rounded to the
-    residual dtype first.
+    residual dtype first. The result keeps the residual dtype, so *output* may
+    be narrower than *residual* (BF16 sublayer output into FP32 streams) but
+    not wider.
     """
     hc_mult = residual.shape[-2] if residual.ndim >= 2 else 0
     require_triton_input(residual, hc_mult)
@@ -44,9 +47,9 @@ def wrapper(
     if comb.shape != expected_comb:
         raise ValueError(f"Triton mHC post expects comb shape {expected_comb}, got {tuple(comb.shape)}")
     require_triton_tensors(residual, output=output, post=post, comb=comb)
-    if output.dtype != residual.dtype:
+    if torch.promote_types(output.dtype, residual.dtype) != residual.dtype:
         raise TypeError(
-            f"Triton mHC post requires output and residual to share a dtype, got {output.dtype} and {residual.dtype}"
+            f"Triton mHC post returns the residual dtype {residual.dtype}, which cannot hold output dtype {output.dtype}"
         )
 
     from ..vendor.triton_mhc import hc_post_mix

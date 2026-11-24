@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 
 import pytest
 import torch
@@ -37,7 +38,10 @@ from tests.ops.tol import (
 )
 from tests.ops.utils import assert_gradient_direction_and_scale, is_nvidia_cuda_available, make_grad_leaves
 from veomni.ops import OP_REGISTRY, resolve_op
+from veomni.ops.kernels.mhc.head import triton as head_triton
+from veomni.ops.kernels.mhc.post import triton as post_triton
 from veomni.ops.kernels.mhc.pre import cann as pre_cann
+from veomni.ops.kernels.mhc.pre import triton as pre_triton
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type
 
 
@@ -380,18 +384,28 @@ def test_mhc_triton_head_matches_eager():
     [(1, 33), (2, 33), (4, 7168), (8, 33), (16, 33)],
 )
 def test_mhc_triton_supported_stream_counts(hc_mult: int, hidden: int):
-    x, fn, scale, base = _mhc_pre_inputs(1, 3, hc_mult, hidden, seed=100 + hc_mult)
-    args = (1e-6, hc_mult, 3, 1e-6)
-    x_t, fn_t, scale_t, base_t = make_grad_leaves(x, fn, scale, base)
-    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
-    values_t = resolve_op("mhc", "pre", "triton").wrapper(x_t, fn_t, scale_t, base_t, *args)
-    values_e = resolve_op("mhc", "pre", "eager").wrapper(x_e, fn_e, scale_e, base_e, *args)
+    def run(implementation: str, x: Tensor, fn: Tensor, scale: Tensor, base: Tensor) -> tuple[Tensor, ...]:
+        post, comb, collapsed = resolve_op("mhc", "pre", implementation).wrapper(
+            x, fn, scale, base, 1e-6, hc_mult, 3, 1e-6
+        )
+        mixed = resolve_op("mhc", "post", implementation).wrapper(collapsed * 0.75, x, post, comb)
+        # The head reuses the leading rows of the pre parameters.
+        head = resolve_op("mhc", "head", implementation).wrapper(
+            x, fn[:hc_mult], scale[:1], base[:hc_mult], 1e-6, hc_mult, 1e-6
+        )
+        return post, comb, collapsed, mixed, head
+
+    x, fn, scale, base = _mhc_pre_inputs(1, 9, hc_mult, hidden, seed=100 + hc_mult)
+    leaves_t = make_grad_leaves(x, fn, scale, base)
+    leaves_e = make_grad_leaves(x, fn, scale, base)
+    values_t = run("triton", *leaves_t)
+    values_e = run("eager", *leaves_e)
     for actual, expected in zip(values_t, values_e, strict=True):
         torch.testing.assert_close(actual, expected, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
 
     grad_outputs = tuple(torch.randn_like(value) for value in values_t)
-    grads_t = torch.autograd.grad(values_t, (x_t, fn_t, scale_t, base_t), grad_outputs=grad_outputs)
-    grads_e = torch.autograd.grad(values_e, (x_e, fn_e, scale_e, base_e), grad_outputs=grad_outputs)
+    grads_t = torch.autograd.grad(values_t, leaves_t, grad_outputs=grad_outputs)
+    grads_e = torch.autograd.grad(values_e, leaves_e, grad_outputs=grad_outputs)
     for actual, expected in zip(grads_t, grads_e, strict=True):
         assert_gradient_direction_and_scale(actual, expected, min_cosine=0.999, norm_rtol=0.01)
 
@@ -429,6 +443,30 @@ def test_mhc_triton_post_noncontiguous_direct_gradients():
 
 
 @pytest.mark.skipif(not _TRITON_ROCM_AVAILABLE, reason="Triton mHC requires an AMD ROCm GPU")
+def test_mhc_triton_post_mixes_bf16_output_into_fp32_residual():
+    torch.manual_seed(47)
+    batch, seq_len, hc_mult, hidden = 2, 37, 4, 320
+    output = torch.randn(batch, seq_len, hidden, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(batch, seq_len, hc_mult, hidden, device="cuda")
+    post = torch.rand(batch, seq_len, hc_mult, device="cuda") * 2
+    comb = torch.softmax(torch.randn(batch, seq_len, hc_mult, hc_mult, device="cuda"), dim=-1)
+    inputs_t = make_grad_leaves(output, residual, post, comb)
+    inputs_e = make_grad_leaves(output, residual, post, comb)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        y_t = resolve_op("mhc", "post", "triton").wrapper(*inputs_t)
+        y_e = resolve_op("mhc", "post", "eager").wrapper(*inputs_e)
+    assert y_t.dtype == y_e.dtype == torch.float32
+    torch.testing.assert_close(y_t, y_e, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+
+    grad = torch.randn_like(y_t)
+    grads_t = torch.autograd.grad(y_t, inputs_t, grad_outputs=grad)
+    grads_e = torch.autograd.grad(y_e, inputs_e, grad_outputs=grad)
+    for actual, expected in zip(grads_t, grads_e, strict=True):
+        assert actual.dtype == expected.dtype
+        assert_gradient_direction_and_scale(actual, expected, min_cosine=0.999, norm_rtol=0.01)
+
+
+@pytest.mark.skipif(not _TRITON_ROCM_AVAILABLE, reason="Triton mHC requires an AMD ROCm GPU")
 def test_mhc_triton_rejects_invalid_contracts():
     hc_mult, hidden = 4, 64
     x, fn, scale, base = _mhc_pre_inputs(1, 8, hc_mult, hidden, seed=53)
@@ -444,17 +482,36 @@ def test_mhc_triton_rejects_invalid_contracts():
     output = torch.randn(1, 8, hidden, device="cuda", dtype=torch.float32)
     post = torch.randn(1, 8, hc_mult, device="cuda")
     comb = torch.randn(1, 8, hc_mult, hc_mult, device="cuda")
-    with pytest.raises(TypeError, match="share a dtype"):
+    with pytest.raises(TypeError, match="cannot hold output dtype"):
         post_op(output, x, post, comb)
     with pytest.raises(TypeError, match="float16, bfloat16, or float32"):
         post_op(output.to(torch.int32), x.to(torch.int32), post, comb)
 
 
-@pytest.mark.skipif(not _TRITON_ROCM_AVAILABLE, reason="Triton mHC requires an AMD ROCm GPU")
-def test_mhc_triton_rejects_unsupported_stream_count():
-    x, fn, scale, base = _mhc_pre_inputs(1, 8, 3, 64, seed=31)
-    with pytest.raises(ValueError, match="hc_mult"):
-        resolve_op("mhc", "pre", "triton").wrapper(x, fn, scale, base, 1e-6, 3, 20, 1e-6)
+def test_mhc_triton_validates_inputs_before_importing_the_kernels(monkeypatch: pytest.MonkeyPatch):
+    vendor_module = "veomni.ops.kernels.mhc.vendor.triton_mhc"
+    monkeypatch.delitem(sys.modules, vendor_module, raising=False)
+    hc_mult, hidden = 4, 8
+    mix = (2 + hc_mult) * hc_mult
+    x = torch.randn(1, 3, hc_mult, hidden, dtype=torch.bfloat16)
+    fn = torch.randn(mix, hc_mult * hidden)
+    scale = torch.randn(3)
+    base = torch.randn(mix)
+    pre_args = (fn, scale, base, 1e-6, hc_mult, 20, 1e-6)
+
+    with pytest.raises(TypeError, match="float16, bfloat16, or float32"):
+        pre_triton.wrapper(x.double(), *pre_args)
+    with pytest.raises(ValueError, match="batch, sequence, hc, hidden"):
+        pre_triton.wrapper(x[0], *pre_args)
+    with pytest.raises(ValueError, match="supports hc_mult"):
+        pre_triton.wrapper(x[:, :, :3], fn, scale, base, 1e-6, 3, 20, 1e-6)
+    with pytest.raises(ValueError, match="GPU tensor"):
+        pre_triton.wrapper(x, *pre_args)
+    with pytest.raises(ValueError, match="GPU tensor"):
+        post_triton.wrapper(x[:, :, 0], x, torch.randn(1, 3, hc_mult), torch.randn(1, 3, hc_mult, hc_mult))
+    with pytest.raises(ValueError, match="GPU tensor"):
+        head_triton.wrapper(x, fn[:hc_mult], scale[:1], base[:hc_mult], 1e-6, hc_mult, 1e-6)
+    assert vendor_module not in sys.modules
 
 
 def test_mhc_cann_pre_passes_fp32_parameters_in_kernel_order(monkeypatch: pytest.MonkeyPatch):

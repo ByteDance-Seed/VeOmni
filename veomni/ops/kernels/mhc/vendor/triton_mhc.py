@@ -55,6 +55,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .....utils.device import get_torch_device
+
 
 _STREAM_BLOCK_M = 16
 _STREAM_BLOCK_D = 128
@@ -121,7 +123,8 @@ class _UnweightedRMSNorm(torch.autograd.Function):
         rows = x2.shape[0]
         out = torch.empty((rows, d), dtype=torch.float32, device=x.device)
         rstd = torch.empty((rows,), dtype=torch.float32, device=x.device)
-        _rms_fwd_kernel[(rows,)](x2, out, rstd, d, EPS=float(eps), BLOCK_D=_rms_block_d(d))
+        with get_torch_device().device(x.device):
+            _rms_fwd_kernel[(rows,)](x2, out, rstd, d, EPS=float(eps), BLOCK_D=_rms_block_d(d))
         ctx.save_for_backward(x2, rstd)
         ctx.x_shape = x.shape
         return out.view(x.shape)
@@ -132,7 +135,8 @@ class _UnweightedRMSNorm(torch.autograd.Function):
         d = x2.shape[-1]
         dy = grad.reshape(-1, d).contiguous()
         dx = torch.empty_like(x2)
-        _rms_bwd_kernel[(x2.shape[0],)](x2, rstd, dy, dx, d, BLOCK_D=_rms_block_d(d))
+        with get_torch_device().device(x2.device):
+            _rms_bwd_kernel[(x2.shape[0],)](x2, rstd, dy, dx, d, BLOCK_D=_rms_block_d(d))
         return dx.view(ctx.x_shape), None
 
 
@@ -254,8 +258,9 @@ def _mix_tail_block(rows: int, k: int) -> int:
 
 class _MixTail(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, mixes, scale, base, hc_mult: int, post_mult: float, eps: float, save_states: bool):
+    def forward(ctx, mixes, scale, base, hc_mult: int, post_mult: float, eps: float):
         k = hc_mult
+        save_states = any(ctx.needs_input_grad[:3])
         mixes_c = mixes.contiguous().to(torch.float32)
         scale_c = scale.contiguous().to(torch.float32)
         base_c = base.contiguous().to(torch.float32)
@@ -272,23 +277,24 @@ class _MixTail(torch.autograd.Function):
         else:
             pre_sig = post_sig = comb_sm = torch.empty(1, dtype=torch.float32, device=device)
         block = _mix_tail_block(rows, k)
-        _mix_tail_fwd_kernel[(triton.cdiv(rows, block),)](
-            mixes_c,
-            scale_c,
-            base_c,
-            pre,
-            post,
-            comb,
-            pre_sig,
-            post_sig,
-            comb_sm,
-            rows,
-            EPS=float(eps),
-            POST_MULT=float(post_mult),
-            K=k,
-            SAVE_STATES=save_states,
-            BLOCK_LEADING=block,
-        )
+        with get_torch_device().device(device):
+            _mix_tail_fwd_kernel[(triton.cdiv(rows, block),)](
+                mixes_c,
+                scale_c,
+                base_c,
+                pre,
+                post,
+                comb,
+                pre_sig,
+                post_sig,
+                comb_sm,
+                rows,
+                EPS=float(eps),
+                POST_MULT=float(post_mult),
+                K=k,
+                SAVE_STATES=save_states,
+                BLOCK_LEADING=block,
+            )
         if save_states:
             ctx.save_for_backward(mixes_c, scale_c, pre_sig, post_sig, comb_sm)
             ctx.hc_mult = k
@@ -309,21 +315,22 @@ class _MixTail(torch.autograd.Function):
         d_mixes = torch.empty_like(mixes_c)
         d_logit = torch.empty((rows, (2 + k) * k), dtype=torch.float32, device=device)
         block = _mix_tail_block(rows, k)
-        _mix_tail_bwd_kernel[(triton.cdiv(rows, block),)](
-            d_pre,
-            d_post,
-            d_comb,
-            pre_sig,
-            post_sig,
-            comb_sm,
-            scale_c,
-            d_mixes,
-            d_logit,
-            rows,
-            POST_MULT=ctx.post_mult,
-            K=k,
-            BLOCK_LEADING=block,
-        )
+        with get_torch_device().device(device):
+            _mix_tail_bwd_kernel[(triton.cdiv(rows, block),)](
+                d_pre,
+                d_post,
+                d_comb,
+                pre_sig,
+                post_sig,
+                comb_sm,
+                scale_c,
+                d_mixes,
+                d_logit,
+                rows,
+                POST_MULT=ctx.post_mult,
+                K=k,
+                BLOCK_LEADING=block,
+            )
         mixes_flat = mixes_c.reshape(rows, (2 + k) * k)
         d_scale = torch.stack(
             [
@@ -338,7 +345,6 @@ class _MixTail(torch.autograd.Function):
             d_mixes.view(*ctx.leading, (2 + k) * k).to(mixes_dtype),
             d_scale.to(scale_dtype),
             d_base.to(base_dtype),
-            None,
             None,
             None,
             None,
@@ -358,8 +364,7 @@ def mhc_mix_tail(
     ``mixes`` is ``[..., (2 + hc) * hc]``; ``scale`` holds the pre / post /
     comb scales and ``base`` the matching biases.
     """
-    save_states = torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (mixes, scale, base))
-    return _MixTail.apply(mixes, scale, base, hc_mult, post_mult, eps, save_states)
+    return _MixTail.apply(mixes, scale, base, hc_mult, post_mult, eps)
 
 
 @triton.jit
@@ -422,19 +427,19 @@ def _sinkhorn_bwd_kernel(
     state_base = offs[:, None, None] * STATE_STRIDE + r_offs[None, :, None] * K + c_offs[None, None, :]
 
     # Step s maps state s-1 to state s; odd steps normalize columns (axis 1),
-    # even steps rows (axis 2). Walk them back with dx = (dy - sum(dy * y)) / s.
+    # even steps rows (axis 2). Walk them back with dx = (dy - sum(dy * y)) / s,
+    # reusing each step's input state as the output state of the step before it.
     dm = tl.load(DY_PTR + base, mask=mask, other=0.0).to(tl.float32)
+    after = tl.load(STATES_PTR + state_base + (2 * N_ITERS - 1) * KK, mask=mask, other=0.0)
     for i in range(N_ITERS - 1):
         col_step = 2 * N_ITERS - 1 - 2 * i
         before = tl.load(STATES_PTR + state_base + (col_step - 1) * KK, mask=mask, other=0.0)
-        after = tl.load(STATES_PTR + state_base + col_step * KK, mask=mask, other=0.0)
         dm = (dm - tl.sum(dm * after, axis=1, keep_dims=True)) / (tl.sum(before, axis=1, keep_dims=True) + EPS)
-        row_step = col_step - 1
-        before = tl.load(STATES_PTR + state_base + (row_step - 1) * KK, mask=mask, other=0.0)
-        after = tl.load(STATES_PTR + state_base + row_step * KK, mask=mask, other=0.0)
+        after = before
+        before = tl.load(STATES_PTR + state_base + (col_step - 2) * KK, mask=mask, other=0.0)
         dm = (dm - tl.sum(dm * after, axis=2, keep_dims=True)) / (tl.sum(before, axis=2, keep_dims=True) + EPS)
+        after = before
     before = tl.load(STATES_PTR + state_base, mask=mask, other=0.0)
-    after = tl.load(STATES_PTR + state_base + KK, mask=mask, other=0.0)
     dm = (dm - tl.sum(dm * after, axis=1, keep_dims=True)) / (tl.sum(before, axis=1, keep_dims=True) + EPS)
     tl.store(DX_PTR + base, dm.to(DX_PTR.dtype.element_ty), mask=mask)
 
@@ -458,17 +463,18 @@ class _Sinkhorn(torch.autograd.Function):
             device=x_c.device,
         )
         block = _sinkhorn_block(rows, k)
-        _sinkhorn_fwd_kernel[(triton.cdiv(rows, block),)](
-            x_c,
-            out,
-            states,
-            rows,
-            K=k,
-            N_ITERS=iters,
-            EPS=float(eps),
-            SAVE_STATES=save_states,
-            BLOCK_LEADING=block,
-        )
+        with get_torch_device().device(x_c.device):
+            _sinkhorn_fwd_kernel[(triton.cdiv(rows, block),)](
+                x_c,
+                out,
+                states,
+                rows,
+                K=k,
+                N_ITERS=iters,
+                EPS=float(eps),
+                SAVE_STATES=save_states,
+                BLOCK_LEADING=block,
+            )
         ctx.save_for_backward(states)
         ctx.iters = iters
         ctx.eps = float(eps)
@@ -482,16 +488,17 @@ class _Sinkhorn(torch.autograd.Function):
         dy = grad.contiguous()
         dx = torch.empty_like(dy)
         block = _sinkhorn_block(ctx.rows, k)
-        _sinkhorn_bwd_kernel[(triton.cdiv(ctx.rows, block),)](
-            states,
-            dy,
-            dx,
-            ctx.rows,
-            K=k,
-            N_ITERS=ctx.iters,
-            EPS=ctx.eps,
-            BLOCK_LEADING=block,
-        )
+        with get_torch_device().device(states.device):
+            _sinkhorn_bwd_kernel[(triton.cdiv(ctx.rows, block),)](
+                states,
+                dy,
+                dx,
+                ctx.rows,
+                K=k,
+                N_ITERS=ctx.iters,
+                EPS=ctx.eps,
+                BLOCK_LEADING=block,
+            )
         return dx, None, None
 
 
@@ -577,17 +584,18 @@ class _Collapse(torch.autograd.Function):
         rows = _leading_rows(x_c.shape, 2)
         out = torch.empty((*x_c.shape[:-2], d), dtype=x.dtype, device=x.device)
         grid = (triton.cdiv(rows, _STREAM_BLOCK_M), triton.cdiv(d, _STREAM_BLOCK_D))
-        _collapse_fwd_kernel[grid](
-            x_c,
-            pre_c,
-            out,
-            rows,
-            d,
-            K=k,
-            BLOCK_M=_STREAM_BLOCK_M,
-            BLOCK_D=_STREAM_BLOCK_D,
-            num_warps=_STREAM_NUM_WARPS,
-        )
+        with get_torch_device().device(x.device):
+            _collapse_fwd_kernel[grid](
+                x_c,
+                pre_c,
+                out,
+                rows,
+                d,
+                K=k,
+                BLOCK_M=_STREAM_BLOCK_M,
+                BLOCK_D=_STREAM_BLOCK_D,
+                num_warps=_STREAM_NUM_WARPS,
+            )
         ctx.save_for_backward(x_c, pre_c)
         return out
 
@@ -599,19 +607,20 @@ class _Collapse(torch.autograd.Function):
         num_d = triton.cdiv(d, _STREAM_BLOCK_D)
         dx = torch.empty_like(x_c)
         dpre_partial = torch.empty((num_d, rows, k), dtype=torch.float32, device=x_c.device)
-        _collapse_bwd_kernel[(triton.cdiv(rows, _STREAM_BLOCK_M), num_d)](
-            grad.contiguous(),
-            x_c,
-            pre_c,
-            dx,
-            dpre_partial,
-            rows,
-            d,
-            K=k,
-            BLOCK_M=_STREAM_BLOCK_M,
-            BLOCK_D=_STREAM_BLOCK_D,
-            num_warps=_STREAM_NUM_WARPS,
-        )
+        with get_torch_device().device(x_c.device):
+            _collapse_bwd_kernel[(triton.cdiv(rows, _STREAM_BLOCK_M), num_d)](
+                grad.contiguous(),
+                x_c,
+                pre_c,
+                dx,
+                dpre_partial,
+                rows,
+                d,
+                K=k,
+                BLOCK_M=_STREAM_BLOCK_M,
+                BLOCK_D=_STREAM_BLOCK_D,
+                num_warps=_STREAM_NUM_WARPS,
+            )
         return dx, dpre_partial.sum(dim=0).view(pre_c.shape).to(pre_c.dtype)
 
 
@@ -737,19 +746,20 @@ class _PostMix(torch.autograd.Function):
         rows = _leading_rows(x_c.shape, 2)
         new = torch.empty_like(x_c)
         grid = (triton.cdiv(rows, _STREAM_BLOCK_M), triton.cdiv(d, _STREAM_BLOCK_D))
-        _post_mix_fwd_kernel[grid](
-            x_c,
-            out_c,
-            post_c,
-            comb_c,
-            new,
-            rows,
-            d,
-            K=k,
-            BLOCK_M=_STREAM_BLOCK_M,
-            BLOCK_D=_STREAM_BLOCK_D,
-            num_warps=_STREAM_NUM_WARPS,
-        )
+        with get_torch_device().device(x_c.device):
+            _post_mix_fwd_kernel[grid](
+                x_c,
+                out_c,
+                post_c,
+                comb_c,
+                new,
+                rows,
+                d,
+                K=k,
+                BLOCK_M=_STREAM_BLOCK_M,
+                BLOCK_D=_STREAM_BLOCK_D,
+                num_warps=_STREAM_NUM_WARPS,
+            )
         ctx.save_for_backward(x_c, out_c, post_c, comb_c)
         return new
 
@@ -764,23 +774,27 @@ class _PostMix(torch.autograd.Function):
         dout = torch.empty_like(out_c)
         dpost_partial = torch.empty((num_d, rows, k), dtype=torch.float32, device=device)
         dcomb_partial = torch.empty((num_d, rows, k, k), dtype=torch.float32, device=device)
-        _post_mix_bwd_kernel[(triton.cdiv(rows, _STREAM_BLOCK_M), num_d)](
-            grad.contiguous(),
-            x_c,
-            out_c,
-            post_c,
-            comb_c,
-            dx,
-            dout,
-            dpost_partial,
-            dcomb_partial,
-            rows,
-            d,
-            K=k,
-            BLOCK_M=_STREAM_BLOCK_M,
-            BLOCK_D=_STREAM_BLOCK_D,
-            num_warps=_STREAM_NUM_WARPS,
-        )
+        # The residual and gradient tiles are live together here; at K=16 an
+        # 8-row tile measured faster than 16 rows (MI300X).
+        block_m = _STREAM_BLOCK_M if k <= 8 else _STREAM_BLOCK_M // 2
+        with get_torch_device().device(device):
+            _post_mix_bwd_kernel[(triton.cdiv(rows, block_m), num_d)](
+                grad.contiguous(),
+                x_c,
+                out_c,
+                post_c,
+                comb_c,
+                dx,
+                dout,
+                dpost_partial,
+                dcomb_partial,
+                rows,
+                d,
+                K=k,
+                BLOCK_M=block_m,
+                BLOCK_D=_STREAM_BLOCK_D,
+                num_warps=_STREAM_NUM_WARPS,
+            )
         d_post = dpost_partial.sum(dim=0).view(post_c.shape).to(post_c.dtype)
         d_comb = dcomb_partial.sum(dim=0).view(comb_c.shape).to(comb_c.dtype)
         return dx, dout, d_post, d_comb

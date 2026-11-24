@@ -50,9 +50,7 @@ def require_tilelang_input(x: Tensor, hc_mult: int) -> None:
 
 
 def require_triton_input(x: Tensor, hc_mult: int) -> None:
-    """Validate tensor placement, layout, and stream count for the Triton rows."""
-    if not x.is_cuda:
-        raise ValueError("Triton mHC requires a GPU tensor")
+    """Validate tensor dtype, layout, stream count, and placement for the Triton rows."""
     if x.dtype not in TRITON_FLOAT_DTYPES:
         raise TypeError(f"Triton mHC requires float16, bfloat16, or float32 activations, got {x.dtype}")
     if x.ndim != 4:
@@ -63,6 +61,8 @@ def require_triton_input(x: Tensor, hc_mult: int) -> None:
         raise ValueError(f"Triton mHC got {x.shape[-2]} residual streams for hc_mult={hc_mult}")
     if x.shape[-1] == 0:
         raise ValueError("Triton mHC requires a nonzero hidden dimension")
+    if not x.is_cuda:
+        raise ValueError("Triton mHC requires a GPU tensor")
 
 
 def require_triton_tensors(reference: Tensor, **tensors: Tensor) -> None:
