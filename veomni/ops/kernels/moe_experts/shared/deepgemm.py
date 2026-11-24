@@ -11,6 +11,7 @@ This module is imported lazily by the CUDA-only backend.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
@@ -131,12 +132,15 @@ class GroupedLayout:
         return cls(logical, padded, metadata, rows, unpad, groups, ks, _uses_ue8m0(device), is_identity_unpad)
 
 
-_UNIFORM_LAYOUT_CACHE: dict[tuple[int, int, int, int], GroupedLayout] = {}
-#: Distinct ``(rows, groups, device, stream)`` combinations a run actually meets. A
-#: dense layer is one group and the same row count every step, and a fused MoE
-#: layer's groups all hold the same per-expert token count, so the cache is small;
-#: the cap only bounds a pathological dynamic-batch schedule.
-_UNIFORM_LAYOUT_CACHE_LIMIT = 64
+_UNIFORM_LAYOUT_CACHE: OrderedDict[tuple[int, int, int, int], GroupedLayout] = OrderedDict()
+#: Distinct ``(rows, groups, device, stream)`` combinations a *step* actually meets.
+#: Each entry is ``16 * n_groups * n_rows`` bytes plus the metadata rows, so a
+#: 256K-token dense layer is ~4 MiB -- 64 of those is a quarter of a GiB held for
+#: shapes that will not return. ``dyn_bsz`` defaults on, so ``n_rows`` changes almost
+#: every micro-batch and an unbounded cache would fill with dead shapes. A handful of
+#: entries covers the shapes live within one step (dense + grouped per layer, one
+#: row count each); anything past that is a shape this step will not ask for again.
+_UNIFORM_LAYOUT_CACHE_LIMIT = 8
 
 
 def get_uniform_layout(n_rows: int, n_groups: int, device: torch.device) -> GroupedLayout:
@@ -154,10 +158,18 @@ def get_uniform_layout(n_rows: int, n_groups: int, device: torch.device) -> Grou
     and makes a cross-stream caller build (and synchronize on) its own layout. No
     caller in this repository overlaps these rows across streams today; this is what
     makes that safe rather than accidental.
+
+    It is an LRU rather than a dict with a ``clear()`` cap: clearing on overflow
+    throws away the entries the current step is still using, so the next layer would
+    rebuild -- and resynchronize -- a layout that was hot a moment ago.
     """
     index = device.index if device.index is not None else torch.cuda.current_device()
     stream = torch.cuda.current_stream(index)
-    key = (n_rows, n_groups, index, stream.stream_id)
+    # ``cuda_stream`` is the stream's own handle, which is what ``torch.cuda.Stream``
+    # hashes on. ``stream_id`` is a per-device slot index and two distinct external
+    # streams can share one, which would let a hit return a layout built on another
+    # stream -- exactly the cross-stream hazard the key exists to prevent.
+    key = (n_rows, n_groups, index, stream.cuda_stream)
     cached = _UNIFORM_LAYOUT_CACHE.get(key)
     if cached is not None:
         # ``index`` is already in the key, so the entry is necessarily for this
@@ -165,12 +177,13 @@ def get_uniform_layout(n_rows: int, n_groups: int, device: torch.device) -> Grou
         # ``cached.rows.device == device`` here would be wrong *and* slow: PyTorch
         # says ``torch.device("cuda:0") != torch.device("cuda")``, so a caller
         # passing an unindexed device would miss on every call.
+        _UNIFORM_LAYOUT_CACHE.move_to_end(key)
         return cached
-    if len(_UNIFORM_LAYOUT_CACHE) >= _UNIFORM_LAYOUT_CACHE_LIMIT:
-        _UNIFORM_LAYOUT_CACHE.clear()
     counts = torch.full((n_groups,), n_rows, dtype=torch.int64)
     layout = GroupedLayout.from_counts(counts, device)
     _UNIFORM_LAYOUT_CACHE[key] = layout
+    if len(_UNIFORM_LAYOUT_CACHE) > _UNIFORM_LAYOUT_CACHE_LIMIT:
+        _UNIFORM_LAYOUT_CACHE.popitem(last=False)
     return layout
 
 

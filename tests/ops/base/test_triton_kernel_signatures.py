@@ -76,10 +76,34 @@ def _owned_kernel_files(root: pathlib.Path) -> list[pathlib.Path]:
     return sorted(p for p in kernels.rglob("*.py") if "vendor" not in p.parts and "@triton.jit" in p.read_text())
 
 
+def _is_jit_decorator(node: ast.expr) -> bool:
+    """Whether a decorator is ``@triton.jit`` / ``@jit`` / ``@triton.jit(...)``."""
+    target = node.func if isinstance(node, ast.Call) else node
+    if isinstance(target, ast.Attribute):
+        return target.attr == "jit"
+    return isinstance(target, ast.Name) and target.id == "jit"
+
+
+def _jit_functions(tree: ast.Module):
+    """Yield the body statements of every ``@triton.jit`` function in ``tree``.
+
+    Only these bodies are traced by Triton and therefore only here that a call to a
+    non-existent ``tl.tensor`` method is an error. Scanning the whole module would
+    also read ordinary host code, where several ``triton.language`` free functions
+    share a name with a ``torch.Tensor`` method (``clamp``, ``sqrt``, ``sigmoid``,
+    ``floor``, ``sort``, ``where``), so a normal ``t.clamp(...)`` in a helper beside
+    a kernel would be reported as a kernel bug.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if any(_is_jit_decorator(d) for d in node.decorator_list):
+                yield from ast.walk(node)
+
+
 def _offenders(paths: list[pathlib.Path], free: frozenset[str]) -> list[str]:
     out = []
     for path in paths:
-        for node in ast.walk(ast.parse(path.read_text())):
+        for node in _jit_functions(ast.parse(path.read_text())):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
                 continue
             name = node.func.attr

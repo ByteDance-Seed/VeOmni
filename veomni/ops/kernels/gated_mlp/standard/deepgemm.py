@@ -38,7 +38,7 @@ def wrapper(
     *,
     swiglu_limit: float | None = None,
     dtype: str = "fp8",
-    block_size: int = _BLOCK,
+    block_size: int | None = None,
     activation: str = "silu",
 ) -> Tensor:
     """Run gated-MLP GEMMs on the FP8 tensor cores: forward, dgrad and wgrad.
@@ -58,7 +58,9 @@ def wrapper(
 
     ``dtype`` and ``block_size`` are validated rather than ignored: ``deepgemm``
     has exactly one recipe, and accepting another value would let one field mean
-    two formats depending on which row the config selected.
+    two formats depending on which row the config selected. ``block_size=None``
+    means "the row's own recipe" and is the default, matching the ``linear`` rows
+    and ``torchao``; the ``qat`` row defaults it to 128 and honors the value.
     """
     from .._module import render
 
@@ -67,10 +69,11 @@ def wrapper(
             f"gated_mlp/standard/deepgemm supports dtype={SUPPORTED_DTYPES}, got {dtype!r}. "
             "DeepGEMM ships blockwise FP8 kernels only."
         )
-    if block_size != _BLOCK:
+    if block_size is not None and block_size != _BLOCK:
         raise ValueError(
             f"gated_mlp/standard/deepgemm supports only block_size={_BLOCK}, got {block_size}. "
-            "The block width is part of DeepGEMM's blockwise FP8 recipe, not a per-call choice."
+            "The block width is part of DeepGEMM's blockwise FP8 recipe, not a per-call choice. "
+            "``None`` means the row's own recipe."
         )
     gate_w, gate_b, up_w, up_b, down_w, down_b = render(mlp, impl="deepgemm", activation=activation).weights
 

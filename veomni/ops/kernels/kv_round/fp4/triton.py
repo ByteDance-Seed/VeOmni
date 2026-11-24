@@ -33,12 +33,16 @@ def _pow2_block(block_size: int) -> bool:
 def triton_fp4_roundtrip(x: Tensor, block_size: int = 16, scale_fmt: str = "e4m3") -> Tensor:
     """Run the Triton FP4 storage round-trip, falling back to eager elsewhere.
 
-    A request the kernel cannot serve falls back to the eager row rather than
-    failing, because the eager row is the reference and this one is an
-    optimization of it: a non-power-of-two ``block_size`` (Triton needs a
-    power-of-two ``tl.arange`` extent), a dtype the kernel does not compile for,
-    or a row layout its static strides cannot address. Callers get the same
-    values either way; only the path differs.
+    What falls back is the requests the *kernel* cannot serve at all: a
+    non-power-of-two ``block_size`` (Triton needs a power-of-two ``tl.arange``
+    extent), or a dtype it does not compile for. Callers get the same values either
+    way; only the path differs.
+
+    A layout the kernel's static strides cannot address does **not** fall back --
+    the operand is copied with ``.contiguous()`` and rounded by the kernel. Treating
+    layout as a reason to use the eager row would silently push a whole class of real
+    inputs (a transposed 4D tensor, a strided 3D one with ``batch > 1``) onto the slow
+    path, which is the opposite of what selecting this row asks for.
 
     There is no ``inplace`` / ``out`` form. Both existed in an earlier revision of
     this file with no caller, and a store that writes into the caller's KV slot
@@ -62,19 +66,28 @@ def triton_fp4_roundtrip(x: Tensor, block_size: int = 16, scale_fmt: str = "e4m3
         is_nvidia_cuda_device(x.device)
         and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
         and _pow2_block(block_size)
-        and _row_stride_if_1d_rows(x, last, n_rows) is not None
     ):
         return _eager.fp4_roundtrip(x, block_size=block_size, scale_fmt=scale_fmt)
 
     from .._triton_kernels import _triton_fp4_roundtrip_kernel
 
     n_blocks = last // block_size
+    # A layout ``_row_stride_if_1d_rows`` cannot express -- a transposed 4D tensor
+    # such as ``q.transpose(1, 2)``, or a strided 3D one with ``batch > 1`` -- is
+    # made contiguous and rounded here rather than handed to the eager row. The
+    # eager row is the reference for *numerics*, not a substitute for the kernel:
+    # falling back on layout alone would silently move a whole class of real inputs
+    # onto the slow path. ``kv_round/standard/triton.py`` answers a layout it cannot
+    # address the same way, so the two rows agree.
     x_stride = _row_stride_if_1d_rows(x, last, n_rows)
-    y = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    z = x if x_stride is not None else x.contiguous()
+    if x_stride is None:
+        x_stride = last
+    y = torch.empty(z.shape, dtype=z.dtype, device=z.device)
     if n_rows > 0:
-        with get_torch_device().device(x.device):
+        with get_torch_device().device(z.device):
             _triton_fp4_roundtrip_kernel[(n_rows, n_blocks)](
-                x,
+                z,
                 y,
                 x_stride,
                 last,
