@@ -68,7 +68,10 @@ import torch
 
 
 QWEN_DEFAULT = "/opt/tiger/models/Qwen3-Omni-30B-A3B-Instruct"
-MIMI_DEFAULT = "/mnt/hdfs/veomni/models/kyutai/mimi"
+# A hub id rather than a cluster path, matching `convert_model.py`: the encoder
+# half is public (https://huggingface.co/kyutai/mimi) and `MimiModel.from_pretrained`
+# resolves the id, so anyone outside internal storage can run this check.
+MIMI_DEFAULT = "kyutai/mimi"
 
 
 def parse_args() -> argparse.Namespace:
