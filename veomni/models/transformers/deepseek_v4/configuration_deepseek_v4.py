@@ -176,13 +176,13 @@ class DeepseekV4Config(VeOmniPretrainedConfig, _DeepseekV4Config):
 
     def _validate_qat_prerequisites(self) -> None:
         ops = self.ops_config
+
+        def includes_qat(selection) -> bool:
+            return "qat" in (selection.all_impls() if hasattr(selection, "all_impls") else (selection,))
+
         weight_qat = any(
-            implementation == "qat"
-            for implementation in (
-                ops.linear_implementation,
-                ops.swiglu_mlp_implementation,
-                ops.moe_implementation,
-            )
+            includes_qat(selection)
+            for selection in (ops.linear_implementation, ops.gated_mlp_implementation, ops.moe_implementation)
         )
         if not weight_qat:
             return
@@ -202,7 +202,7 @@ class DeepseekV4Config(VeOmniPretrainedConfig, _DeepseekV4Config):
                 f"but quantization_config.weight_block_size is {tuple(raw_weight_block_size)}."
             )
 
-        if ops.moe_implementation != "qat":
+        if not includes_qat(ops.moe_implementation):
             return
         top_level_expert_dtype = getattr(self, "expert_dtype", None)
         metadata_expert_dtype = quant_config.get("expert_dtype")

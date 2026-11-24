@@ -27,6 +27,7 @@ from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
 from veomni.models.transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+from veomni.ops import OpsSelection, SiteOverride
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -71,7 +72,7 @@ def test_the_defaults_leave_the_objective_off():
 def _qat_config(*, expert_dtype=None, quantization_config=None, moe_qat=True):
     ops = eager_ops_config()
     ops.linear_implementation = "qat"
-    ops.swiglu_mlp_implementation = "qat"
+    ops.gated_mlp_implementation = "qat"
     ops.moe_implementation = "qat" if moe_qat else "eager"
     kwargs = {"ops_implementation": ops}
     if expert_dtype is not None:
@@ -103,6 +104,18 @@ def test_qat_recipe_rejects_conflicting_expert_dtype():
 
 def test_qat_recipe_rejects_export_block_geometry_drift():
     config = _qat_config(quantization_config={"expert_dtype": "fp8", "weight_block_size": [32, 32]})
+
+    with pytest.raises(ValueError, match="128x128"):
+        config.validate_build_prerequisites()
+
+
+def test_qat_recipe_validates_site_override():
+    config = _qat_config(quantization_config={"weight_block_size": [32, 32]}, moe_qat=False)
+    config.ops_config.linear_implementation = OpsSelection(
+        name="eager",
+        overrides=[SiteOverride(site=r"layers\.0\.q_a_proj", name="qat")],
+    )
+    config.ops_config.gated_mlp_implementation = "eager"
 
     with pytest.raises(ValueError, match="128x128"):
         config.validate_build_prerequisites()
