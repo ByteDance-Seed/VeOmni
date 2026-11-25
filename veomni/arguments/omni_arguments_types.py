@@ -870,6 +870,11 @@ def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, O
     fsdp_config = accelerator.fsdp_config
     if fsdp_config.fsdp_scope != "model" or fsdp_config.fsdp_mode == "eager":
         return
+    if fsdp_config.fsdp_mode == "fsdp2" and fsdp_config.extra_parallel_only:
+        raise ValueError(
+            "fsdp_scope='model' wraps the composed OmniModel once, so top-level "
+            "fsdp_config.extra_parallel_only cannot be enabled. Run with fsdp_scope='module'."
+        )
     unwrapped = sorted(
         name for name, module_args in modules.items() if module_args.accelerator.fsdp_config.fsdp_mode == "eager"
     )
