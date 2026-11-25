@@ -632,6 +632,67 @@ def test_large_carried_tensors_are_sliced_across_ranks_and_consolidated_on_every
     assert torch.equal(torch.cat(slices, dim=0), tensors["decoder.proj.weight"])
 
 
+def test_large_carried_tensors_stream_consolidate_without_full_bytearray(hf_root, tmp_path, monkeypatch):
+    """End-to-end: sharded carried tensors consolidate in bounded chunks without allocating a full bytearray."""
+    import torch.distributed as dist
+    import torch.distributed.checkpoint._consolidate_hf_safetensors as consolidate_mod
+    from torch.distributed.checkpoint._hf_utils import CUSTOM_METADATA_KEY, SAVED_OFFSETS_KEY
+    from torch.testing._internal.distributed.fake_pg import FakeStore
+
+    import veomni.models.seed_omni.utils.hf_layout as hf_layout_mod
+    from veomni.checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
+
+    apply_dcp_consolidation_patch()
+    root, tensors = hf_root
+    model = OmniModel.from_pretrained(str(root), torch_dtype=torch.bfloat16, device_map="cpu")
+    source = model.config._hf_source
+    weight_files = source.layout.source_weight_files(source.path)
+    source_specs = hf_layout_mod.source_tensor_specs(source.path, weight_files)
+
+    monkeypatch.setattr(hf_layout_mod, "_SHARDED_CARRY_BYTES", 8)
+
+    sharded_dir = tmp_path / "sharded"
+    sharded_dir.mkdir()
+    # Produce per-rank DCP safetensor shards from the dim-0 sliced carried tensor across 3 ranks.
+    for rank in range(3):
+        dist.init_process_group("fake", store=FakeStore(), rank=rank, world_size=3)
+        try:
+            carried = hf_layout_mod._read_carried_tensors(
+                source.path, weight_files, source_specs, ["decoder.proj.weight"]
+            )
+            local = carried["decoder.proj.weight"]._local_tensor
+        finally:
+            dist.destroy_process_group()
+        chunk = (tensors["decoder.proj.weight"].shape[0] + 2) // 3
+        custom = {"decoder.proj.weight": {SAVED_OFFSETS_KEY: [rank * chunk, 0]}}
+        save_file(
+            {"decoder.proj.weight": local.contiguous()},
+            str(sharded_dir / f"model-00001-of-00001-rank{rank}.safetensors"),
+            metadata={CUSTOM_METADATA_KEY: json.dumps(custom)},
+        )
+
+    out_dir = tmp_path / "consolidated"
+    out_dir.mkdir()
+    allocated = []
+    real_bytearray = bytearray
+
+    def tracking_bytearray(size=0, *args, **kwargs):
+        if isinstance(size, int):
+            allocated.append(size)
+        return real_bytearray(size, *args, **kwargs)
+
+    monkeypatch.setitem(consolidate_mod.__dict__, "bytearray", tracking_bytearray)
+    consolidate_mod.consolidate_safetensors_files(
+        str(sharded_dir), str(out_dir), {"decoder.proj.weight": 1}, num_threads=1
+    )
+
+    assert allocated == []
+    out_files = list(out_dir.glob("*.safetensors"))
+    assert len(out_files) == 1
+    with safe_open(out_files[0], framework="pt") as f:
+        assert torch.equal(f.get_tensor("decoder.proj.weight"), tensors["decoder.proj.weight"])
+
+
 def test_custom_layout_subclass_overrides_hooks_and_per_module_dtypes(tmp_path):
     from veomni.arguments.omni_arguments_types import _check_hf_source_exportable
 

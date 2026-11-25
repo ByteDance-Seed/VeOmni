@@ -606,6 +606,87 @@ class TestSaveHfSafetensorDistributed(unittest.TestCase):
             self.assertEqual(loaded[key].dtype, value.dtype)
             self.assertTrue(torch.equal(loaded[key].view(torch.uint8), value.view(torch.uint8)), key)
 
+    def test_consolidation_streams_dim0_shards_without_full_bytearray_and_keeps_dim1_fallback(self):
+        """Contiguous dim-0 shards stream directly without full-tensor bytearray allocation; dim-1 still falls back."""
+        import json
+        import tempfile
+        from pathlib import Path
+
+        import torch.distributed.checkpoint._consolidate_hf_safetensors as consolidate_mod
+        from safetensors.torch import load_file, save_file
+        from torch.distributed.checkpoint._hf_utils import CUSTOM_METADATA_KEY, SAVED_OFFSETS_KEY
+
+        from veomni.checkpoint.dcp_consolidation import apply_dcp_consolidation_patch
+
+        apply_dcp_consolidation_patch()
+        row_table = torch.arange(7 * 8, dtype=torch.bfloat16).view(7, 8)
+        replicated = torch.arange(4 * 4, dtype=torch.float32).view(4, 4)
+        col_sharded = torch.arange(4 * 8, dtype=torch.bfloat16).view(4, 8)
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            sharded = Path(output_dir) / "sharded"
+            sharded.mkdir()
+
+            def _write_shard(name, tensors, offsets):
+                custom = {k: {SAVED_OFFSETS_KEY: v} for k, v in offsets.items()}
+                save_file(tensors, str(sharded / name), metadata={CUSTOM_METADATA_KEY: json.dumps(custom)})
+
+            # Write shards intentionally out of row order, with unequal row counts, an empty 0-row shard,
+            # and a replicated tensor present on two shards (last shard wins).
+            _write_shard(
+                "shard-02.safetensors",
+                {"row_table": row_table[5:7].contiguous(), "replicated": replicated + 1.0},
+                {"row_table": [5, 0], "replicated": [0, 0]},
+            )
+            _write_shard(
+                "shard-00.safetensors",
+                {
+                    "row_table": row_table[0:3].contiguous(),
+                    "replicated": replicated.contiguous(),
+                    "col_sharded": col_sharded[:, 0:4].contiguous(),
+                },
+                {"row_table": [0, 0], "replicated": [0, 0], "col_sharded": [0, 0]},
+            )
+            _write_shard(
+                "shard-01.safetensors",
+                {
+                    "row_table": row_table[3:5].contiguous(),
+                    "col_sharded": col_sharded[:, 4:8].contiguous(),
+                },
+                {"row_table": [3, 0], "col_sharded": [0, 4]},
+            )
+            _write_shard(
+                "shard-03.safetensors",
+                {"row_table": row_table[7:7].contiguous()},
+                {"row_table": [7, 0]},
+            )
+
+            allocated_sizes = []
+            real_bytearray = bytearray
+
+            def tracking_bytearray(size=0, *args, **kwargs):
+                if isinstance(size, int):
+                    allocated_sizes.append(size)
+                return real_bytearray(size, *args, **kwargs)
+
+            mapping = {"row_table": 1, "replicated": 1, "col_sharded": 2}
+            with patch.dict(consolidate_mod.__dict__, {"bytearray": tracking_bytearray}):
+                consolidate_mod.consolidate_safetensors_files(str(sharded), output_dir, mapping, num_threads=1)
+
+            loaded = {}
+            for file in Path(output_dir).glob("*.safetensors"):
+                loaded.update(load_file(file))
+
+        # Only ``col_sharded`` (dim-1 sharded, 64 bytes) should allocate a bytearray;
+        # ``row_table`` (112 bytes) and ``replicated`` (64 bytes) stream without allocating one.
+        self.assertEqual(allocated_sizes, [col_sharded.numel() * col_sharded.element_size()])
+        self.assertTrue(torch.equal(loaded["row_table"], row_table))
+        self.assertTrue(torch.equal(loaded["col_sharded"], col_sharded))
+        # ``replicated`` matches whichever shard came last in glob order (either original or +1).
+        self.assertTrue(
+            torch.equal(loaded["replicated"], replicated) or torch.equal(loaded["replicated"], replicated + 1.0)
+        )
+
     def test_naflatten_and_unflatten_roundtrip_keeps_shape_on_cpu(self):
         from veomni.utils.tensor_utils import naflatten, unflatten
 

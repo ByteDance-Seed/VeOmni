@@ -951,9 +951,10 @@ def _read_carried_tensors(
     """Read ``keys`` from ``source_path``, splitting large tensors along dim 0 across ranks.
 
     Small tensors go whole to one rank each, round-robin; a tensor at or above
-    ``_SHARDED_CARRY_BYTES`` (e.g. a 91.6 GiB frozen n-gram table) is sliced
+    ``_SHARDED_CARRY_BYTES`` (e.g. a multi-GB frozen embedding table) is sliced
     into a ``Shard(0)`` :class:`DTensor` so no single process reads, holds, or
-    stages it whole during ``dcp.save``.
+    stages it whole during ``dcp.save``, and the patched DCP consolidator
+    streams its dim-0 shards directly to the output file in bounded chunks.
     """
     from safetensors import safe_open
     from torch.distributed.tensor import DeviceMesh, DTensor, Shard
