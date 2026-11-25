@@ -1369,18 +1369,20 @@ class Qwen3OmniMoeVisionEncoder(Qwen3OmniMoePreTrainedModel):
                 cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
         # --- Patch.2 ---
 
-        # ``precomputed_max_seqlen`` is currently unused at the per-block level
-        # in omni_moe ViT (varlen attention reads max from cu_seqlens internally);
-        # accepted as a kwarg for contract symmetry with qwen3_vl and to insulate
-        # callers from per-model differences. Touch to avoid 'unused-var' lints.
-        _ = precomputed_max_seqlen
-
+        # ``precomputed_max_seqlen`` is the collator's host-computed maximum
+        # segment length. Forward it into every block: without it a block falls
+        # back to ``(cu_seqlens[1:] - cu_seqlens[:-1]).max()``, a device tensor
+        # that FlashAttention must ``.item()`` — one device sync per image batch,
+        # and a graph break on torch builds without ``capture_scalar_outputs``.
+        # The value is already a Python int, computed on CPU by
+        # ``collate_multimodal_metadata``.
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
+                max_seqlen=precomputed_max_seqlen,
                 **kwargs,
             )
             if layer_num in self.deepstack_visual_indexes:
