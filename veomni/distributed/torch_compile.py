@@ -14,7 +14,7 @@
 
 import types
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -51,116 +51,35 @@ class CompileConfig:
         return self.backend == "cudagraphs" or self.mode == "reduce-overhead" or self.mode == "max-autotune"
 
 
-def _decoder_block_specs(model: nn.Module) -> list[tuple[str, str | None]]:
-    """``(class name, child scope)`` for every block in ``_no_split_modules``.
+def _block_fqns(model: nn.Module) -> list[str]:
+    """Module paths of the blocks named in ``_no_split_modules``.
 
-    ``_no_split_modules`` is the wrap-unit list FSDP already uses, so compiling it
-    verbatim means the compiled set and the sharded set are the same thing — the
-    whole model is compiled, not a hand-picked subset of it.
+    That list is the wrap-unit list FSDP already uses, so compiling it verbatim
+    keeps the compiled set and the sharded set identical — the whole model, not a
+    subset picked by class name.
 
-    A bare class name has scope ``None`` and matches anywhere; on a SeedOmni
-    composed model each entry is scoped to its child
-    (``janus_llama.LlamaDecoderLayer``, see ``_scoped_no_split_modules``) so it
-    matches only there. The name half is compared against
-    ``type(module).__name__``, which never carries a scope.
+    An entry is a bare class name (``LlamaDecoderLayer``) matching anywhere, or —
+    on a SeedOmni composed model, whose children share one FSDP tree — scoped to
+    a child (``janus_llama.LlamaDecoderLayer``, see ``_scoped_no_split_modules``)
+    matching only under it.
     """
-    no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
-    if no_split_modules is None:
+    entries = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
+    if not entries:
         return []
-    specs: list[tuple[str, str | None]] = []
-    for entry in no_split_modules:
-        if not isinstance(entry, str):
-            continue
-        scope, _, class_name = entry.rpartition(".")
-        specs.append((class_name, scope or None))
-    return specs
-
-
-def _is_composed_model(model: nn.Module) -> bool:
-    """Whether ``model`` is a SeedOmni composed :class:`OmniModel`.
-
-    Recognised by the per-module config map, which no single model carries.
-    """
-    config = getattr(model, "config", None)
-    return bool(getattr(config, "_module_configs", None))
-
-
-def validate_compile_model(
-    model: nn.Module,
-    compile_config: CompileConfig,
-    sequence_parallel_enabled: bool = False,
-    async_enabled: bool = False,
-) -> None:
-    """Validate the contracts a SeedOmni run has on top of the shared ones.
-
-    Every other model is compiled whole and needs no model-specific check: the
-    runtime contracts (CUDA, FSDP2, no ExtraParallel) are validated once in
-    :func:`validate_compile_runtime`, and :func:`_reject_incompatible_ops` covers
-    the op selections Inductor cannot lower.
-
-    A SeedOmni run — a composed ``OmniModel`` or one module built standalone —
-    additionally refuses CUDA Graph replay and sequence parallelism: replay needs
-    one ``cudagraph_mark_step_begin()`` per micro-batch across the composed graph,
-    which ``OmniTrainer`` does not make, and Ulysses slices activations the graph
-    edges reorder. The parse-time twin lives in ``_validate_omni_accelerator``;
-    this is the backstop for a caller that built a config without the launcher.
-    """
-    if not _is_composed_model(model) and not _is_seedomni_module(model):
-        return
-    if compile_config.uses_cuda_graphs():
-        raise RuntimeError(
-            "model.accelerator.torch_compile.enable does not support CUDA Graph replay under SeedOmni; "
-            "use backend='inductor' and mode=None."
+    wanted = []
+    for entry in entries:
+        if isinstance(entry, str):
+            scope, _, class_name = entry.rpartition(".")
+            wanted.append((class_name, scope))
+    return [
+        fqn
+        for fqn, module in model.named_modules()
+        if fqn
+        and any(
+            class_name == type(module).__name__ and (not scope or fqn == scope or fqn.startswith(scope + "."))
+            for class_name, scope in wanted
         )
-    if sequence_parallel_enabled or async_enabled:
-        raise RuntimeError(
-            "model.accelerator.torch_compile.enable does not support sequence parallelism or async Ulysses "
-            "under SeedOmni; set model.accelerator.ulysses_size=1, model.accelerator.cp_size=1, "
-            "and model.accelerator.enable_async=False."
-        )
-
-
-def _is_seedomni_module(model: nn.Module) -> bool:
-    """Whether ``model`` is one SeedOmni module, possibly behind a LoRA/DDP wrapper."""
-    from ..models.seed_omni.accelerated.utils.dispatch import unwrap_module_chain
-    from ..models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
-
-    return isinstance(unwrap_module_chain(model), PretrainedOmniModule)
-
-
-def _is_decoder_block(
-    module: nn.Module,
-    *,
-    fqn: Optional[str] = None,
-    decoder_block_specs: Sequence[tuple[str, str | None]],
-) -> bool:
-    """Whether ``module`` is one of the blocks named in ``_no_split_modules``.
-
-    HuggingFace model classes list the decoder layer class there for
-    FSDP/Accelerate. A scoped entry (``janus_llama.LlamaDecoderLayer``) matches
-    only modules under that child, so a sibling that reuses the same layer class
-    is left alone; a bare entry matches anywhere. The rule mirrors
-    ``_is_fsdp_wrap_target``, so the wrap plan and the compile plan agree on what
-    a block is.
-    """
-
-    class_name = type(module).__name__
-    return any(
-        name == class_name and (scope is None or _under_scope(fqn, scope)) for name, scope in decoder_block_specs
-    )
-
-
-def _under_scope(fqn: Optional[str], scope: str) -> bool:
-    """Whether ``fqn`` is ``scope`` itself or a descendant of it.
-
-    An empty scope means "this whole tree", which is how a standalone module
-    (``fsdp_scope='module'``) says its own root is the scope.
-    """
-    if not scope:
-        return True
-    if fqn is None:
-        return False
-    return fqn == scope or fqn.startswith(scope + ".")
+    ]
 
 
 def validate_compile_config_for_fsdp2(compile_config: CompileConfig, enable_reshard_after_forward: bool) -> None:
@@ -311,12 +230,7 @@ def _uncompilable_at(config, *, prefix: str) -> list[str]:
     return found
 
 
-def compile_decoder_blocks(
-    model: nn.Module,
-    compile_config: CompileConfig,
-    sequence_parallel_enabled: bool = False,
-    async_enabled: bool = False,
-) -> int:
+def compile_decoder_blocks(model: nn.Module, compile_config: CompileConfig) -> int:
     """Compile forward of every block inside ``model`` in place.
 
     Compiling the forward method (rather than wrapping the whole module)
@@ -324,7 +238,9 @@ def compile_decoder_blocks(
     reshard hooks stay outside the compiled region.
 
     The blocks are the ones ``_no_split_modules`` names, so the compiled set and
-    the FSDP wrap set are the same (see :func:`_decoder_block_specs`).
+    the FSDP wrap set are the same (see :func:`_block_fqns`). Nothing here asks
+    what kind of model it is; the runtime contracts are checked once by the
+    caller through :func:`validate_compile_runtime`.
     """
 
     if not hasattr(torch, "compile"):
@@ -332,7 +248,6 @@ def compile_decoder_blocks(
             "model.accelerator.torch_compile.enable requires torch.compile, but this PyTorch build has no torch.compile."
         )
 
-    validate_compile_model(model, compile_config, sequence_parallel_enabled, async_enabled)
     _reject_incompatible_ops(model)
 
     compile_kwargs = {
@@ -349,29 +264,23 @@ def compile_decoder_blocks(
             )
         compile_kwargs["mode"] = compile_config.mode
 
-    decoder_block_specs = _decoder_block_specs(model)
+    blocks = set(_block_fqns(model))
     compiled = 0
     for fqn, module in model.named_modules():
-        if not _is_decoder_block(module, fqn=fqn, decoder_block_specs=decoder_block_specs):
+        if fqn not in blocks or getattr(module, "_veomni_forward_compiled", False):
             continue
-        if getattr(module, "_veomni_forward_compiled", False):
-            continue
-
-        # One config for this call: a SeedOmni module passes its own, so `dynamic`
-        # is already the answer for this module's blocks.
-        block_kwargs = compile_kwargs
 
         original_forward = module.forward
         if hasattr(original_forward, "__func__"):
             module._veomni_original_forward = original_forward.__func__
-            compiled_forward = torch.compile(original_forward.__func__, **block_kwargs)
+            compiled_forward = torch.compile(original_forward.__func__, **compile_kwargs)
             module.forward = types.MethodType(compiled_forward, module)
         else:
             module._veomni_original_forward = original_forward
-            module.forward = torch.compile(original_forward, **block_kwargs)
+            module.forward = torch.compile(original_forward, **compile_kwargs)
         module._veomni_forward_compiled = True
-        module._veomni_compile_config = dict(block_kwargs)
-        logger.info_rank0(f"Compiled decoder block forward for {fqn} with torch.compile({block_kwargs}).")
+        module._veomni_compile_config = dict(compile_kwargs)
+        logger.info_rank0(f"Compiled block forward for {fqn} with torch.compile({compile_kwargs}).")
         compiled += 1
 
     logger.info_rank0(f"Compiled {compiled} decoder blocks with torch.compile.")

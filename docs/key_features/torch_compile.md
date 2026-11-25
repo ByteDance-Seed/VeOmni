@@ -93,9 +93,11 @@ CUDA Graph replay and sequence parallelism, under SeedOmni: replay needs one
 `cudagraph_mark_step_begin()` per micro-batch across the composed graph, which
 `OmniTrainer` does not make, and Ulysses slices activations the graph edges reorder.
 Those are `backend='cudagraphs'`, `mode='reduce-overhead'`, `mode='max-autotune'`,
-`ulysses_size>1`, `cp_size>1`, `enable_async`.
+`ulysses_size>1`, `cp_size>1`, `enable_async`, and they are rejected when the
+launcher config is parsed, before any model is built.
 
-Compiling also requires FSDP2 and CUDA. A selection Inductor cannot lower — the
+Compiling also requires FSDP2 and CUDA; that is checked once per build in
+`validate_compile_runtime`, not per model. A selection Inductor cannot lower — the
 `torchao_mxfp4` rows emit `float8_e8m0fnu` scale tensors, which have no Inductor
 lowering — is rejected up front by config field rather than failing at runtime.
 

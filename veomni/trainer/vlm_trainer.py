@@ -25,7 +25,6 @@ from ..distributed.parallel_state import get_parallel_state, use_parallel_state
 from ..distributed.torch_compile import (
     CompileConfig,
     mark_compile_step_begin,
-    validate_compile_model,
     validate_compile_runtime,
 )
 from ..models import build_foundation_model
@@ -161,12 +160,6 @@ class VLMModelRuntime(VeOmniModelRuntime):
 
         compile_config = CompileConfig(
             **{field.name: getattr(accelerator.torch_compile, field.name) for field in fields(CompileConfig)}
-        )
-        validate_compile_model(
-            self.model,
-            compile_config,
-            sequence_parallel_enabled=accelerator.ulysses_size > 1 or accelerator.cp_size > 1,
-            async_enabled=accelerator.enable_async,
         )
         parallel_state = get_parallel_state()
         validate_compile_runtime(

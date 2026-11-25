@@ -353,29 +353,6 @@ def test_compile_decoder_blocks_allows_a_seedomni_module_tower(monkeypatch):
     assert compile_decoder_blocks(tower, CompileConfig(enable=True, dynamic=True)) == 1
 
 
-def test_compile_decoder_blocks_rejects_cuda_graphs_for_a_seedomni_module(monkeypatch):
-    """The same two refusals as the composed path, with the module named."""
-    from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
-
-    class TowerConfig:
-        model_type = "janus_siglip"
-        vision_config = object()
-        sub_configs = {}
-
-    class Tower(PretrainedOmniModule):
-        _no_split_modules = ["ToyDecoderLayer"]
-        config_class = TowerConfig
-
-        def __init__(self):
-            nn.Module.__init__(self)
-            self.config = TowerConfig()
-
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-
-    with pytest.raises(RuntimeError, match="CUDA Graph replay under SeedOmni"):
-        compile_decoder_blocks(Tower(), CompileConfig(enable=True, backend="cudagraphs"))
-
-
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("use_checkpoint", [False, True])
 def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
