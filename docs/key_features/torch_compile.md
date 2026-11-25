@@ -68,13 +68,22 @@ Compilation happens per module before the FSDP wrap, under `fsdp_scope='module'`
 can compile: a module cannot wrap itself inside a parent that owns the wrap, and the
 parent's `_no_split_modules` are its children. That scope is rejected at parse time.
 
-## `dynamic=True` (the default)
+## `dynamic` — leave it unset
 
-`dynamic` lets one Inductor graph cover a range of shapes, and it defaults to `True`.
-That is not a performance preference — with `fullgraph=True`, a *cache miss* is a hard
-error rather than a silent recompile. A static graph that meets one new shape per step
-walks into `torch._dynamo.config.cache_size_limit` (8) and raises
-`FailOnRecompileLimitHit`:
+`dynamic` defaults to `None`, which is torch's own default and the only setting that
+works on both counts below. It means: the first call compiles a **static** graph, and
+a second distinct shape promotes it to a **symbolic** one that covers the rest of the
+run. Measured on a toy block, `[512, 512, 512, 640, 512, 640, 768, 512, 768]`:
+
+| `dynamic` | graphs after each call | meaning |
+|---|---|---|
+| `False` | 1,1,1,**2**,2,2,**3**,3,3 | one per shape, walks into the cache limit |
+| `True` | 1,1,1,1,1,1,1,1,1 | symbolic from the first call |
+| `None` | 1,1,1,**2**,2,2,2,2,2 | static, then promoted once |
+
+**Why not `False`.** With `fullgraph=True` a cache miss is a hard error, not a silent
+recompile. One new shape per step exhausts `torch._dynamo.config.cache_size_limit`
+(8) and raises `FailOnRecompileLimitHit`:
 
 ```
 dynamic=False, vision block, bf16, fullgraph=True
@@ -82,18 +91,26 @@ dynamic=False, vision block, bf16, fullgraph=True
   token count  352                -> FailOnRecompileLimitHit
 ```
 
-`dynamic=True` costs one compile up front — about 2x the first-call latency — and
-nothing steady state: it emits one symbolic graph and reuses it for the rest of the run.
+`pad_to_length` does not prevent this. It pads only the keys whose `pack_dim` is `-1`
+(`input_ids`, `labels`, `position_ids`, `attention_mask`, `image_mask`,
+`video_mask`), which fixes the *text* token count. `pixel_values` is concatenated
+along dim 0, so a vision tower's patch count follows the images in the batch and moves
+every step. The base trainer forcing `pad_to_length` therefore keeps text stable while
+leaving the towers variable.
 
-`pad_to_length` does not make this unnecessary. It only pads the keys whose
-`pack_dim` is `-1` (`input_ids`, `labels`, `position_ids`, `attention_mask`,
-`image_mask`, `video_mask`), which fixes the *text* token count. `pixel_values` is
-concatenated along dim 0, so a vision tower's patch count follows the images in the
-batch and moves every step. The base trainer forcing `pad_to_length` therefore keeps
-text stable while leaving the towers variable.
+**Why not `True`.** It survives a moving shape, but it pays symbolic tracing on the
+first call even when the shape never moves — about 2x the first-call latency, and
+nothing steady state. More importantly, symbolic tracing is what makes Dynamo try to
+flatten a custom autograd `Function`'s output, and a `Function` it cannot flatten fails
+with `AssertionError` in `overwrite_tensor_vt_proxy`. The fused-Triton MoE experts
+(`moe_implementation='fused_triton'`, the deepseek-v4 default) hit exactly that:
+`deepseek_v4` trains under `dynamic=False` and `dynamic=None`, and raises under
+`dynamic=True`.
 
-Set `dynamic=False` only when every micro-batch really does have the same shape. On a
-shape that moves it will exhaust the cache as above.
+Set `None` and do not spell it. Setting `False` is only safe when every micro-batch
+really does have the same shape, and setting `True` is only safe for a model whose
+compiled blocks contain no custom autograd `Function` whose output structure Dynamo
+cannot flatten.
 
 ## What stays refused
 

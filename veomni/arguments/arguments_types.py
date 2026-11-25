@@ -612,16 +612,17 @@ class TorchCompileConfig:
         default=True,
         metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
     )
-    dynamic: bool = field(
-        default=True,
+    dynamic: Optional[bool] = field(
+        default=None,
         metadata={
             "help": (
-                "Whether to pass dynamic=True to torch.compile. Defaults to True because fullgraph=True "
-                "turns exhausting the recompile cache into a hard failure: a static graph that meets one "
-                "new shape per step raises FailOnRecompileLimitHit at torch._dynamo.config."
-                "cache_size_limit (8). Shapes that pad_to_length pins are unaffected — one symbolic graph "
-                "covers the rest of the run with no steady-state cost. Set False only when every micro-batch "
-                "has exactly the same shape."
+                "Whether to pass dynamic=True to torch.compile. Unset keeps torch's default: the first call "
+                "compiles a static graph and a shape change promotes it to a symbolic one covering the rest of "
+                "the run. Leave it unset. False is not the safe choice: with fullgraph=True a re-cache is a "
+                "hard failure, so one new shape per step raises FailOnRecompileLimitHit once "
+                "torch._dynamo.config.cache_size_limit (8) is exhausted. True survives a moving shape but pays "
+                "for it on the first call and symbolically traces custom autograd Functions whose output "
+                "structure Dynamo cannot flatten."
             )
         },
     )

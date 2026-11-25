@@ -92,7 +92,10 @@ def module_compile_config(accelerator: "AcceleratorConfig", *, global_accelerato
         backend=run_config.backend,
         mode=run_config.mode,
         fullgraph=run_config.fullgraph,
-        dynamic=enabled and bool(run_config.dynamic),
+        # Only a module that compiles gets a shape policy; a disabled module's is
+        # irrelevant, and pinning it to False keeps an eager module's config from
+        # reading as if it had asked for symbolic shapes.
+        dynamic=run_config.dynamic if enabled else False,
     )
 
 

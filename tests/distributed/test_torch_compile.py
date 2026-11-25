@@ -266,7 +266,7 @@ def test_compile_decoder_blocks_uses_no_split_modules(monkeypatch):
     assert compiled == 1
     assert getattr(model.selected, "_veomni_forward_compiled", False)
     assert not getattr(model.unselected, "_veomni_forward_compiled", False)
-    assert calls == [{"fullgraph": True, "dynamic": True, "backend": "inductor"}]
+    assert calls == [{"fullgraph": True, "dynamic": None, "backend": "inductor"}]
 
 
 def test_compile_decoder_blocks_matches_a_scoped_no_split_entry(monkeypatch):
@@ -701,9 +701,10 @@ def test_torch_compile_config_defaults():
     assert cfg.backend == "inductor"
     assert cfg.mode is None
     assert cfg.fullgraph is True
-    # On by default: a static graph that meets a new shape each step exhausts
-    # the recompile cache, which `fullgraph=True` turns into a hard failure.
-    assert cfg.dynamic is True
+    # Unset by default: torch compiles a static first graph and promotes it on a
+    # shape change. `False` would make a shape change a hard failure under
+    # `fullgraph=True`; `True` would pay symbolic tracing on the first call.
+    assert cfg.dynamic is None
 
 
 def test_enable_compile_requires_dynamic_batching():

@@ -749,9 +749,14 @@ def _compile_accelerator(*, enable=True, dynamic=False, fsdp_mode="fsdp2", mode=
     [
         (True, False, "fsdp2", (True, False)),
         (True, True, "fsdp2", (True, True)),
+        # Unset is the default: torch picks, so it must reach `torch.compile` as
+        # None rather than being normalized to a bool.
+        (True, None, "fsdp2", (True, None)),
         (False, True, "fsdp2", (False, False)),
+        (False, None, "fsdp2", (False, False)),
         # ddp cannot compile: `compile_decoder_blocks` only runs under FSDP2
         (True, True, "ddp", (False, False)),
+        (True, None, "ddp", (False, False)),
     ],
 )
 def test_module_compile_config_reads_the_accelerator(run_enable, dynamic, fsdp_mode, expected):

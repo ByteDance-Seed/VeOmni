@@ -33,14 +33,22 @@ class CompileConfig:
     backend: Optional[str] = "inductor"
     mode: Optional[str] = None
     fullgraph: bool = True
-    #: Passed straight to ``torch.compile``. Defaults to ``True`` because
-    #: ``fullgraph=True`` turns a re-cache into a hard failure, not a silent
-    #: recompile: a static graph that meets one new shape per step exhausts
-    #: ``torch._dynamo.config.cache_size_limit`` (8) and raises
-    #: ``FailOnRecompileLimitHit``. ``True`` also subsumes the "promote on the
-    #: second shape" behaviour of ``dynamic=None`` — one graph for the rest of
-    #: the run — for a compile-time cost and no steady-state cost.
-    dynamic: bool = True
+    #: Passed straight to ``torch.compile``. ``None`` is torch's own default:
+    #: the first call compiles a static graph and a shape change promotes it to
+    #: a symbolic one, which then covers the rest of the run.
+    #:
+    #: ``False`` is not the safe choice here. With ``fullgraph=True`` a re-cache
+    #: is a hard failure, not a silent recompile: one new shape per step
+    #: exhausts ``torch._dynamo.config.cache_size_limit`` (8) and raises
+    #: ``FailOnRecompileLimitHit`` — 8 patch counts are fine, the 9th is fatal.
+    #:
+    #: ``True`` also survives a shape that moves, but pays for it on the first
+    #: call even when the shape never changes, and it is what makes Dynamo
+    #: symbolically trace a custom autograd ``Function`` whose output structure
+    #: it cannot flatten (the fused-Triton MoE experts fail that way under
+    #: deepseek-v4). ``None`` keeps the first compile static and identical to
+    #: ``False``; only a real second shape reaches the symbolic path.
+    dynamic: Optional[bool] = None
 
     def uses_cuda_graphs(self) -> bool:
         """Return whether this config asks torch.compile to use graph replay.

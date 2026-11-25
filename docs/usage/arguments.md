@@ -495,7 +495,7 @@ compile, the difference between the two trainers, and the measured payoff.
 | backend | `Optional[str]` | `"inductor"` | Backend passed to `torch.compile`. |
 | mode | `Optional[str]` | `None` | Mode passed to `torch.compile`. `None` uses the `inductor` default. `"reduce-overhead"` enables CUDA Graphs and requires `model.accelerator.fsdp_config.reshard_after_forward=False`; must be `None` when `backend="cudagraphs"`. |
 | fullgraph | `bool` | `True` | Whether to pass `fullgraph=True` to `torch.compile`. |
-| dynamic | `bool` | `True` | Whether to pass `dynamic=True`. Leave it on: with `fullgraph=True`, a static graph that meets a new shape each step raises `FailOnRecompileLimitHit` once `torch._dynamo.config.cache_size_limit` (8) is exhausted. `pad_to_length` pins the text token count but not a vision tower's patch count. Set `False` only when every micro-batch has exactly the same shape. |
+| dynamic | `bool` or unset | unset | Whether to pass `dynamic` to `torch.compile`. Leave it unset: torch compiles a static first graph and promotes it when a shape changes. `False` turns that promotion into a hard `FailOnRecompileLimitHit` once `torch._dynamo.config.cache_size_limit` (8) is exhausted — `pad_to_length` pins the text token count but not a vision tower's patch count. `True` traces symbolically from the first call and fails on custom autograd `Function`s Dynamo cannot flatten (the fused-Triton MoE experts). |
 
 ### OptimizerConfig
 
