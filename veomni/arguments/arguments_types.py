@@ -621,8 +621,8 @@ class TorchCompileConfig:
                 "the run. Leave it unset. False is not the safe choice: with fullgraph=True a re-cache is a "
                 "hard failure, so one new shape per step raises FailOnRecompileLimitHit once "
                 "torch._dynamo.config.cache_size_limit (8) is exhausted. True survives a moving shape but pays "
-                "for it on the first call and symbolically traces custom autograd Functions whose output "
-                "structure Dynamo cannot flatten."
+                "for it on the first call, and it breaks a custom autograd Function that chains two Triton "
+                "kernels (the fused-Triton MoE experts)."
             )
         },
     )

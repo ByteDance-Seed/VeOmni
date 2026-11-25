@@ -100,17 +100,34 @@ leaving the towers variable.
 
 **Why not `True`.** It survives a moving shape, but it pays symbolic tracing on the
 first call even when the shape never moves — about 2x the first-call latency, and
-nothing steady state. More importantly, symbolic tracing is what makes Dynamo try to
-flatten a custom autograd `Function`'s output, and a `Function` it cannot flatten fails
-with `AssertionError` in `overwrite_tensor_vt_proxy`. The fused-Triton MoE experts
-(`moe_implementation='fused_triton'`, the deepseek-v4 default) hit exactly that:
-`deepseek_v4` trains under `dynamic=False` and `dynamic=None`, and raises under
-`dynamic=True`.
+nothing steady state. More importantly, symbolic tracing of a custom autograd
+`Function` fails when the `Function` chains two Triton kernels:
 
-Set `None` and do not spell it. Setting `False` is only safe when every micro-batch
-really does have the same shape, and setting `True` is only safe for a model whose
-compiled blocks contain no custom autograd `Function` whose output structure Dynamo
-cannot flatten.
+```python
+class Fn(torch.autograd.Function):
+    def forward(ctx, x, idx):
+        return moe_gather(moe_scatter(x, idx), idx)   # kernel output -> kernel input
+```
+
+Under `dynamic=True` Dynamo raises `AssertionError` in
+`torch/_dynamo/variables/higher_order_ops.py::overwrite_tensor_vt_proxy`, because the
+first kernel's launch scalars (`N`, `num_elts`, `num_elts - 1`) come back as constants
+where the outer graph still holds symbols for them. What matters is not the shapes but
+the chaining: the same `moe_gather` succeeds under `dynamic=True` when its input is a
+graph input or a fresh `torch.empty`, and fails only when that input came from another
+kernel in the same `Function`. The fused-Triton MoE experts
+(`moe_implementation='fused_triton'`, the deepseek-v4 default) are built exactly that
+way, so `deepseek_v4` compiles under `None` and under `False`, and raises under `True`.
+
+**The same limit applies after a `None` promotion.** `None` only postpones it: the
+first call compiles a static graph, and the promotion to a symbolic one on a new shape
+enters the same path and fails the same way. `deepseek_v4` is unaffected in practice
+only because `pad_to_length` keeps its token count constant, so no promotion ever
+happens. A run whose shapes move needs a model without such a `Function`.
+
+Set `None` and do not spell it. `False` is only safe when every micro-batch really does
+have the same shape; `True` is only safe for a model whose compiled blocks contain no
+custom autograd `Function` that chains kernels.
 
 ## What stays refused
 

@@ -43,11 +43,13 @@ class CompileConfig:
     #: ``FailOnRecompileLimitHit`` — 8 patch counts are fine, the 9th is fatal.
     #:
     #: ``True`` also survives a shape that moves, but pays for it on the first
-    #: call even when the shape never changes, and it is what makes Dynamo
-    #: symbolically trace a custom autograd ``Function`` whose output structure
-    #: it cannot flatten (the fused-Triton MoE experts fail that way under
-    #: deepseek-v4). ``None`` keeps the first compile static and identical to
-    #: ``False``; only a real second shape reaches the symbolic path.
+    #: call even when the shape never changes, and it makes Dynamo symbolically
+    #: trace every custom autograd ``Function``. A ``Function`` that chains two
+    #: Triton kernels then fails in ``overwrite_tensor_vt_proxy``: the first
+    #: kernel's launch scalars come back as constants while the outer graph still
+    #: holds symbols for them. The fused-Triton MoE experts are built that way.
+    #: ``None`` keeps the first compile static and identical to ``False``; only a
+    #: real second shape reaches the symbolic path.
     dynamic: Optional[bool] = None
 
     def uses_cuda_graphs(self) -> bool:
