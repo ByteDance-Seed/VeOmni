@@ -78,6 +78,98 @@ def test_each_tower_claims_only_its_own_prefix():
     assert layout.route("code2wav.decoder.0.weight") == (CODEC, "code2wav.decoder.0.weight")
 
 
+def test_every_bucket_key_matches_the_module_it_is_loaded_into():
+    """A route that renames is only half the contract; the load target must agree.
+
+    ``QWEN3OMNI_HF_LAYOUT.route()`` yields *wrapper-relative* keys
+    (``audio_tower.conv2d1.weight``), so loading the inner module
+    (``audio.audio_tower``) expects ``conv2d1.weight`` and rejects every key. That
+    mismatch fails at the first strict load of an offline conversion — which is
+    why the converter now loads the wrappers, and why this test exists: the
+    routing test alone cannot see it.
+    """
+    import json
+    from pathlib import Path
+
+    import torch
+
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
+    from veomni.models.seed_omni.modules.qwen3omni.convert_model import _BUCKET_FOR_MODULE
+
+    toy = json.loads(
+        (Path(__file__).parents[4] / "tests" / "toy_config" / "qwen3omni_toy" / "config.json").read_text()
+    )
+    thinker, talker = toy["thinker_config"], toy["talker_config"]
+    ops = make_eager_ops_config()
+
+    with torch.device("meta"):
+        audio = OMNI_MODEL_REGISTRY["qwen3omni_audio"]()(
+            OMNI_CONFIG_REGISTRY["qwen3omni_audio"]()(
+                ops_implementation=ops,
+                audio_config=thinker["audio_config"],
+                audio_token_id=thinker["audio_token_id"],
+            )
+        )
+        vision = OMNI_MODEL_REGISTRY["qwen3omni_vision"]()(
+            OMNI_CONFIG_REGISTRY["qwen3omni_vision"]()(ops_implementation=ops, vision_config=thinker["vision_config"])
+        )
+        talker_module = OMNI_MODEL_REGISTRY["qwen3omni_talker"]()(
+            OMNI_CONFIG_REGISTRY["qwen3omni_talker"]()(ops_implementation=ops, talker_config=talker)
+        )
+        llm = OMNI_MODEL_REGISTRY["qwen3omni_llm"]()(
+            OMNI_CONFIG_REGISTRY["qwen3omni_llm"]()(
+                ops_implementation=ops,
+                text_config=thinker["text_config"],
+                spatial_merge_size=2,
+                position_id_per_seconds=13,
+                accept_hidden_layer=0,
+            )
+        )
+
+    cases = [
+        (audio, "thinker.audio_tower.conv2d1.weight"),
+        (vision, "thinker.visual.blocks.0.attn.qkv.weight"),
+        (talker_module, "talker.model.norm.weight"),
+    ]
+    for module, source_key in cases:
+        routed = QWEN3OMNI_HF_LAYOUT.route(source_key)
+        assert routed is not None
+        _, module_key = routed
+        params = set(dict(module.named_parameters()))
+        assert module_key in params, (
+            f"{type(module).__name__} has no parameter {module_key!r}; "
+            f"the converter must load this bucket into the wrapper, not an inner module"
+        )
+
+    # The converters' actual load targets, read from its own source so a change to
+    # the call site is caught. Loading `audio.audio_tower` instead of `audio`
+    # rejects every key (the route keeps `audio_tower.`), which is the regression
+    # this guards and which the routing assertion above cannot see on its own.
+    import inspect
+
+    from veomni.models.seed_omni.modules.qwen3omni import convert_model as converter
+
+    source = inspect.getsource(converter.convert_qwen3omni_checkpoint)
+    for wrapper, inner in (
+        ("audio.load_state_dict", "audio.audio_tower.load_state_dict"),
+        ("vision.load_state_dict", "vision.visual.load_state_dict"),
+        ("talker.load_state_dict", "talker.talker.load_state_dict"),
+    ):
+        assert wrapper in source, f"expected the converter to load the wrapper: {wrapper}"
+        assert inner not in source, (
+            f"the converter loads an inner module, which the route's keys do not match: {inner}"
+        )
+
+    # The backbone is the one module whose bucket keeps a prefix the load target
+    # does not use, so the converter strips it — check that strip is the right one.
+    _, llm_key = QWEN3OMNI_HF_LAYOUT.route("thinker.model.norm.weight")
+    assert llm_key == "language_model.norm.weight"
+    assert llm_key.removeprefix("language_model.") in set(dict(llm.language_model.named_parameters()))
+    assert _BUCKET_FOR_MODULE["qwen3omni_llm"] == "llm"
+    assert 'removeprefix("language_model.")' in source
+
+
 @pytest.mark.parametrize("module_name", [AUDIO, VISION, TEXT_ENCODER, LLM, TALKER, CODEC])
 def test_every_layout_destination_names_a_real_parameter_prefix(module_name):
     """A destination that matches no parameter loads nothing and raises nothing.

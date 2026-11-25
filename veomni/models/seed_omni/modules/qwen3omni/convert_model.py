@@ -213,12 +213,16 @@ def convert_qwen3omni_checkpoint(
         audio_token_id=thinker["audio_token_id"],
     )
     audio = _build(OMNI_MODEL_REGISTRY["qwen3omni_audio"](), audio_cfg)
-    audio.audio_tower.load_state_dict(buckets["audio"], assign=True)
+    # Loaded on the *wrapper*, not `audio.audio_tower`: the layout renames onto
+    # the module's own parameter names (`audio_tower.conv2d1.weight`), which is
+    # where the wrapper holds the tower. Loading the inner module would expect
+    # `conv2d1.weight` and reject every key.
+    audio.load_state_dict(buckets["audio"], assign=True, strict=True)
 
     logger.info_rank0("Extracting qwen3omni_vision ...")
     vision_cfg = OMNI_CONFIG_REGISTRY["qwen3omni_vision"]()(vision_config=thinker["vision_config"])
     vision = _build(OMNI_MODEL_REGISTRY["qwen3omni_vision"](), vision_cfg)
-    vision.visual.load_state_dict(buckets["vision"], assign=True)
+    vision.load_state_dict(buckets["vision"], assign=True, strict=True)
 
     # Qwen3-Omni drives image *and* video off one Qwen2VL-style preprocessor
     # config, and the audio module reads its mel settings from the same file.
@@ -259,16 +263,24 @@ def convert_qwen3omni_checkpoint(
         # trace nothing reads.
     )
     llm = _build(OMNI_MODEL_REGISTRY["qwen3omni_llm"](), llm_cfg)
-    backbone = {k: v for k, v in buckets["llm"].items() if not k.startswith("embed_tokens.")}
-    backbone = _fuse_moe_experts(backbone, text_config["num_experts"])
-    llm.language_model.load_state_dict(backbone, assign=True, strict=True)
+    # The layout renamed `thinker.model.*` onto this module's own names, so the
+    # bucket reads `language_model.layers...`. The backbone's `embed_tokens` was
+    # already claimed by the text encoder (longest prefix), so there is nothing
+    # to drop here — but `nn.Identity()` replaced it, and a leftover key would
+    # only surface as a strict-load failure naming the wrong module.
+    backbone = _fuse_moe_experts(buckets["llm"], text_config["num_experts"])
+    llm.language_model.load_state_dict(
+        {k.removeprefix("language_model."): v for k, v in backbone.items()},
+        assign=True,
+        strict=True,
+    )
 
     logger.info_rank0("Extracting qwen3omni_talker ...")
     talker_cfg = OMNI_CONFIG_REGISTRY["qwen3omni_talker"]()(talker_config=talker_config)
     talker = _build(OMNI_MODEL_REGISTRY["qwen3omni_talker"](), talker_cfg)
     # The talker is its own MoE tower and stores experts the same split way.
     talker_sd = _fuse_moe_experts(buckets["talker"], talker_config["text_config"]["num_experts"])
-    talker.talker.load_state_dict(talker_sd, assign=True, strict=True)
+    talker.load_state_dict(talker_sd, assign=True, strict=True)
 
     logger.info_rank0(f"Extracting qwen3omni_codec (decoder here, encoder from {mimi_path}) ...")
     mimi_path = _resolve_mimi_path(mimi_path)
@@ -279,7 +291,7 @@ def convert_qwen3omni_checkpoint(
         mimi_config=mimi_raw,
     )
     codec = _build(OMNI_MODEL_REGISTRY["qwen3omni_codec"](), codec_cfg)
-    codec.code2wav.load_state_dict(buckets["code2wav"], assign=True, strict=True)
+    codec.code2wav.load_state_dict(buckets["code2wav"], assign=True, strict=True)  # code2wav prefix kept
     mimi_sd = dict(_iter_checkpoint_tensors(mimi_path))
     # Non-strict because the published checkpoint carries decoder-side keys this
     # module does not instantiate, but a *missing* key would leave that
