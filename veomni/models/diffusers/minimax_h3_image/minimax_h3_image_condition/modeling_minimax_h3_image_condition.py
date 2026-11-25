@@ -293,7 +293,7 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
         position_ids, token_tags, image_indices, text_indices, cond_rows = self.build_layout(
             text_token_tags[0], reference_grids, latent_height, latent_width, _IMAGE_PATCH_SIZE
         )
-        image_indices = image_indices.to(device)
+        image_indices = image_indices.to(device, non_blocking=True)
 
         step = torch.randint(_TRAINING_STEPS, (), generator=self.generator, device="cpu").item()
         sigma = self._scheduler.sigmas[step].to(device, non_blocking=True)
@@ -326,10 +326,10 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
             "prompt_embeds": prompt_rows,
             "unique_timesteps": unique_timesteps,
             "inverse_indices": inverse_indices,
-            "token_tags": token_tags.to(device),
+            "token_tags": token_tags.to(device, non_blocking=True),
             "img_position_ids": position_ids.unsqueeze(0).float().to(device, non_blocking=True),
             "img_pos_info": {"position_ids": image_indices},
-            "text_pos_info": {"position_ids": text_indices.to(device)},
+            "text_pos_info": {"position_ids": text_indices.to(device, non_blocking=True)},
             "img_pos_for_infer_output_info": {"position_ids": image_indices},
             "pdd_step_index": int(self._training_pdd_indices[step]),
             "num_pdd_heads": self.config.num_pdd_heads,

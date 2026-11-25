@@ -983,8 +983,9 @@ def test_no_implicit_sync_in_minimax_h3_forward_backward(mode, attention, cfg_mo
     _assert_no_minimax_h3_step_syncs(model, step, mode, attention)
 
 
-def test_no_implicit_sync_in_minimax_h3_image_forward_backward():
-    """Gate the cached image training path, including reference-row conditioning."""
+@pytest.mark.parametrize("condition_source", ["cached_references", "online_t2i"])
+def test_no_implicit_sync_in_minimax_h3_image_forward_backward(condition_source):
+    """Gate cached and online-encoded inputs through H3-Image conditioning and DiT."""
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
 
@@ -998,8 +999,12 @@ def test_no_implicit_sync_in_minimax_h3_image_forward_backward():
     torch.manual_seed(0)
     condition = _condition_model().to(device)
     batch = dict(_cached_batch())
-    batch["reference_latents"] = [batch["clean_latents"]]
-    batch = _to_device_recursive(batch, device)
+    if condition_source == "cached_references":
+        batch["reference_latents"] = [batch["clean_latents"]]
+        batch = _to_device_recursive(batch, device)
+    else:
+        for name in ("prompt_embeds", "clean_latents"):
+            batch[name] = _to_device_recursive(batch[name], device)
     config = tiny_minimax_h3_config(
         audio_enabled=False,
         num_pdd_heads=condition.config.num_pdd_heads,
