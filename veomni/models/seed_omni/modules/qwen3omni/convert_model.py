@@ -291,7 +291,11 @@ def convert_qwen3omni_checkpoint(
         mimi_config=mimi_raw,
     )
     codec = _build(OMNI_MODEL_REGISTRY["qwen3omni_codec"](), codec_cfg)
-    codec.code2wav.load_state_dict(buckets["code2wav"], assign=True, strict=True)  # code2wav prefix kept
+    # Same wrapper-relative naming as the other modules: the route keeps the
+    # `code2wav.` prefix because that is where the codec holds the vocoder, so
+    # the bucket is loaded into `codec` — not `codec.code2wav`, whose parameter
+    # names start at `decoder.0.weight`.
+    codec.load_state_dict(buckets["code2wav"], assign=True, strict=False)
     mimi_sd = dict(_iter_checkpoint_tensors(mimi_path))
     # Non-strict because the published checkpoint carries decoder-side keys this
     # module does not instantiate, but a *missing* key would leave that

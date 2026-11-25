@@ -95,7 +95,6 @@ def test_every_bucket_key_matches_the_module_it_is_loaded_into():
 
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
-    from veomni.models.seed_omni.modules.qwen3omni.convert_model import _BUCKET_FOR_MODULE
 
     toy = json.loads(
         (Path(__file__).parents[4] / "tests" / "toy_config" / "qwen3omni_toy" / "config.json").read_text()
@@ -142,32 +141,73 @@ def test_every_bucket_key_matches_the_module_it_is_loaded_into():
             f"the converter must load this bucket into the wrapper, not an inner module"
         )
 
-    # The converters' actual load targets, read from its own source so a change to
-    # the call site is caught. Loading `audio.audio_tower` instead of `audio`
-    # rejects every key (the route keeps `audio_tower.`), which is the regression
-    # this guards and which the routing assertion above cannot see on its own.
-    import inspect
+    # Every routed key must be loadable into the object the converter loads it
+    # into. Asserted by looking the key up on that object rather than by matching
+    # the call site's text: a source check only proves spelling, and it missed the
+    # codec because that bucket was not in the list above.
+    import torch as _torch
+    from transformers import MimiConfig
 
-    from veomni.models.seed_omni.modules.qwen3omni import convert_model as converter
+    from veomni.models.seed_omni.modules.qwen3omni.codec.modeling import Qwen3OmniCodec
 
-    source = inspect.getsource(converter.convert_qwen3omni_checkpoint)
-    for wrapper, inner in (
-        ("audio.load_state_dict", "audio.audio_tower.load_state_dict"),
-        ("vision.load_state_dict", "vision.visual.load_state_dict"),
-        ("talker.load_state_dict", "talker.talker.load_state_dict"),
-    ):
-        assert wrapper in source, f"expected the converter to load the wrapper: {wrapper}"
-        assert inner not in source, (
-            f"the converter loads an inner module, which the route's keys do not match: {inner}"
+    with _torch.device("meta"):
+        codec = OMNI_MODEL_REGISTRY["qwen3omni_codec"]()(
+            OMNI_CONFIG_REGISTRY["qwen3omni_codec"]()(
+                ops_implementation=ops,
+                code2wav_config=toy["code2wav_config"],
+                mimi_config=MimiConfig().to_dict(),
+            )
+        )
+        text_encoder = OMNI_MODEL_REGISTRY["qwen3omni_text_encoder"]()(
+            OMNI_CONFIG_REGISTRY["qwen3omni_text_encoder"]()(
+                ops_implementation=ops,
+                vocab_size=thinker["text_config"]["vocab_size"],
+                hidden_size=thinker["text_config"]["hidden_size"],
+                tie_word_embeddings=False,
+                lm_head_bias=False,
+            )
         )
 
-    # The backbone is the one module whose bucket keeps a prefix the load target
-    # does not use, so the converter strips it — check that strip is the right one.
-    _, llm_key = QWEN3OMNI_HF_LAYOUT.route("thinker.model.norm.weight")
-    assert llm_key == "language_model.norm.weight"
-    assert llm_key.removeprefix("language_model.") in set(dict(llm.language_model.named_parameters()))
-    assert _BUCKET_FOR_MODULE["qwen3omni_llm"] == "llm"
-    assert 'removeprefix("language_model.")' in source
+    # (load target, a source key that belongs to it). The target is the object the
+    # converter calls `load_state_dict` on — all six modules, codec included.
+    destinations = [
+        (audio, "thinker.audio_tower.conv2d1.weight"),
+        (vision, "thinker.visual.blocks.0.attn.qkv.weight"),
+        (text_encoder, "thinker.model.embed_tokens.weight"),
+        (llm.language_model, "thinker.model.norm.weight"),
+        (talker_module, "talker.model.norm.weight"),
+        (codec, "code2wav.decoder.0.conv.weight"),
+    ]
+    for target, source_key in destinations:
+        routed = QWEN3OMNI_HF_LAYOUT.route(source_key)
+        assert routed is not None, source_key
+        _, module_key = routed
+        # The backbone is the only one whose bucket keeps a prefix its target does
+        # not use; the converter strips it, so mirror that rather than special-case
+        # the assertion.
+        if module_key.startswith("language_model."):
+            module_key = module_key.removeprefix("language_model.")
+        assert module_key in set(dict(target.named_parameters())), (
+            f"{type(target).__name__} has no parameter {module_key!r} — the routed key for "
+            f"{source_key!r} cannot be loaded into this object"
+        )
+
+    # The codec's vocoder half is reachable from the module the converter loads:
+    # `codec.load_state_dict(buckets["code2wav"])` works, while
+    # `codec.code2wav.load_state_dict(...)` would reject every `code2wav.` key.
+    # Asserted by *attempting the load* on both targets, which is what makes this
+    # a behavioural check: with `strict=True` the wrong target raises.
+    assert isinstance(codec, Qwen3OmniCodec)
+    # Real shape, so the *only* variable is which module the key is loaded into.
+    param_name = QWEN3OMNI_HF_LAYOUT.route("code2wav.decoder.0.conv.weight")[1]
+    shape = dict(codec.named_parameters())[param_name].shape
+    routed_codec = {param_name: torch.zeros(shape, device="meta")}
+    # Right target: the wrapper accepts the prefixed key.
+    codec.load_state_dict(routed_codec, assign=True, strict=False)
+    # Wrong target: the inner vocoder has no such key, so a strict load rejects it
+    # — which is exactly how the offline conversion failed.
+    with pytest.raises(RuntimeError):
+        codec.code2wav.load_state_dict(routed_codec, assign=True, strict=True)
 
 
 @pytest.mark.parametrize("module_name", [AUDIO, VISION, TEXT_ENCODER, LLM, TALKER, CODEC])
