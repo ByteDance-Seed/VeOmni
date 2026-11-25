@@ -947,6 +947,14 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
             if remainder != 0:
                 cu_chunk_lens += [remainder]
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
+        # ``cu_chunk_lens`` is a plain Python list of segment lengths, so the
+        # maximum is available here without touching the device. Build it now and
+        # hand it to every layer: the attention otherwise recomputes
+        # ``(cu_seqlens[1:] - cu_seqlens[:-1]).max()`` as a device tensor that
+        # FlashAttention has to ``.item()``, which is one device sync per audio
+        # batch and a graph break on torch builds without
+        # ``capture_scalar_outputs``.
+        max_seqlen = max(cu_chunk_lens[1:]) if len(cu_chunk_lens) > 1 else 0
 
         # --- Patch.3 ---
         if get_parallel_state().sp_enabled:
@@ -955,12 +963,16 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
             pad_seq_len = hidden_states.size(0) * get_parallel_state().sp_size - unpadded_hidden_len
             if pad_seq_len > 0:
                 cu_seqlens = torch.cat([cu_seqlens, (cu_seqlens[-1] + pad_seq_len).unsqueeze(0)], dim=0)
+                # The padded tail becomes its own segment, so the host maximum has
+                # to account for it exactly as the attention's fallback would.
+                max_seqlen = max(max_seqlen, pad_seq_len.item())
         # --- Patch.3 ---
 
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(
                 hidden_states,
                 cu_seqlens,
+                max_seqlen=max_seqlen,
             )
             hidden_states = layer_outputs[0]
 
@@ -1378,6 +1390,11 @@ class Qwen3OmniMoeVisionEncoder(Qwen3OmniMoePreTrainedModel):
         # ``collate_multimodal_metadata``.
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
+            # The blocks forward ``**kwargs`` straight to attention, so a caller
+            # that already put ``max_seqlen`` there would collide with the explicit
+            # argument below.
+            if precomputed_max_seqlen is not None:
+                kwargs.pop("max_seqlen", None)
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,

@@ -1516,16 +1516,20 @@ class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
         # selects from `multimodal_metadata` and passes as the single
         # `vit_metadata` kwarg. qwen2.5-omni's window-attention ViT consumes
         # cu_seqlens / cu_window_seqlens / window_index (the get_window_index
-        # permutation) — all derived host-side by the collator hook. (Unlike
-        # qwen2.5-VL it needs no precomputed max_seqlen: the vision attention
-        # computes `.max()` on-device, no host sync.) All .get() below fall back
-        # to None for callers bypassing MainCollator, in which case the in-forward
-        # derivation runs unchanged. See .agents/knowledge/multimodal_metadata.md.
+        # permutation) — all derived host-side by the collator hook — plus
+        # max_seqlen / win_max_seqlen, which are forwarded into the blocks. Without
+        # those a block recomputes `.max()` on-device, costing a device sync per
+        # batch and a graph break on torch builds without
+        # `capture_scalar_outputs`. All .get() below fall back to None for callers
+        # bypassing MainCollator, in which case the in-forward derivation runs
+        # unchanged. See .agents/knowledge/multimodal_metadata.md.
         vit_metadata = kwargs.pop("vit_metadata", None) or {}
         precomputed_grid_thw_list = vit_metadata.get("grid_thw_list")
         precomputed_cu_seqlens = vit_metadata.get("cu_seqlens")
         precomputed_cu_window_seqlens = vit_metadata.get("cu_window_seqlens")
         precomputed_window_index = vit_metadata.get("window_index")
+        precomputed_max_seqlen = vit_metadata.get("max_seqlen")
+        precomputed_win_max_seqlen = vit_metadata.get("win_max_seqlen")
         use_precompute = precomputed_cu_seqlens is not None
 
         hidden_states = self.patch_embed(hidden_states)
@@ -1634,13 +1638,21 @@ class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
                 cu_seqlens_now = cu_seqlens
+                max_seqlen_now = precomputed_max_seqlen
             else:
                 cu_seqlens_now = cu_window_seqlens
+                max_seqlen_now = precomputed_win_max_seqlen
 
+            # The blocks take ``**kwargs`` straight through to attention, so a
+            # caller that already put ``max_seqlen`` there would collide with the
+            # explicit argument below.
+            if max_seqlen_now is not None:
+                kwargs.pop("max_seqlen", None)
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens_now,
                 position_embeddings=rotary_pos_emb,
+                max_seqlen=max_seqlen_now,
                 **kwargs,
             )
 
