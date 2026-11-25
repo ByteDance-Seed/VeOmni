@@ -44,6 +44,8 @@ def test_build_parallelize_model_forwards_checkpoint_early_stop(monkeypatch, ear
         lambda: types.SimpleNamespace(fsdp_enabled=True, tp_enabled=False, dp_mode="fsdp2"),
     )
     monkeypatch.setattr(torch_parallelize, "parallelize_model_fsdp2", lambda model, **kwargs: model)
+    checkpoint_function = torch.utils.checkpoint.CheckpointFunction
+    monkeypatch.setattr(torch.utils.checkpoint, "CheckpointFunction", checkpoint_function)
     model = _CheckpointingModel()
 
     result = build_parallelize_model(
@@ -61,6 +63,7 @@ def test_build_parallelize_model_forwards_checkpoint_early_stop(monkeypatch, ear
     if not use_reentrant:
         expected["early_stop"] = early_stop
     assert model.gradient_checkpointing_kwargs == expected
+    assert torch.utils.checkpoint.CheckpointFunction is (CheckpointFunction if use_reentrant else checkpoint_function)
 
 
 def test_gradient_checkpointing_config_enables_early_stop_by_default():
@@ -1024,26 +1027,74 @@ class _SkippingRecorder(_Recorder):
 
 
 def test_the_h3_dit_arms_nothing_itself():
-    """H3 owns no recompute strategy: HF's enable is what puts both attributes on its DiT."""
+    """H3 owns no recompute strategy: HF's enable arms each checkpointing block."""
     model = _tiny_h3_model()
     dit = model.dit
 
-    assert hasattr(dit, "gradient_checkpointing")  # the marker HF's enable walks for
-    assert dit.gradient_checkpointing is False
+    assert not hasattr(dit, "gradient_checkpointing")
     assert "_gradient_checkpointing_func" not in vars(dit)
+    assert all(block.gradient_checkpointing is False for block in dit.blocks)
+    assert all("_gradient_checkpointing_func" not in vars(block) for block in dit.blocks)
 
     model.gradient_checkpointing_enable({"use_reentrant": False})  # the run's own entry point
 
-    assert dit.gradient_checkpointing is True
-    assert "_gradient_checkpointing_func" in vars(dit)
+    assert model.gradient_checkpointing is True
+    assert not hasattr(dit, "gradient_checkpointing")
+    assert "_gradient_checkpointing_func" not in vars(dit)
+    assert all(block.gradient_checkpointing is True for block in dit.blocks)
+    assert all("_gradient_checkpointing_func" in vars(block) for block in dit.blocks)
+
+
+@pytest.mark.parametrize("recompute_layers", [-1, 2])
+def test_h3_rejects_reentrant_checkpointing_before_parallel_wrap(monkeypatch, recompute_layers):
+    model = _tiny_h3_model()
+    checkpoint_function = torch.utils.checkpoint.CheckpointFunction
+    try:
+        with pytest.raises(ValueError, match=r"gradient_checkpointing\.enable_reentrant=False"):
+            _parallelize(
+                monkeypatch,
+                model,
+                enable_gradient_checkpointing=True,
+                enable_reentrant=True,
+                recompute_policy=recompute_utils.RecomputePolicy(
+                    recompute_layers=recompute_layers, use_reentrant=True
+                ),
+            )
+        assert torch.utils.checkpoint.CheckpointFunction is checkpoint_function
+    finally:
+        torch.utils.checkpoint.CheckpointFunction = checkpoint_function
+    assert not model.is_gradient_checkpointing
+
+
+@pytest.mark.parametrize("enable_reentrant", [False, True])
+@pytest.mark.parametrize("h3", [False, True])
+def test_parallelize_rejects_conflicting_reentrant_policy(monkeypatch, enable_reentrant, h3):
+    model = _tiny_h3_model() if h3 else _CheckpointingModel()
+    checkpoint_function = torch.utils.checkpoint.CheckpointFunction
+    try:
+        with pytest.raises(ValueError, match=r"recompute_policy.use_reentrant must match enable_reentrant"):
+            _parallelize(
+                monkeypatch,
+                model,
+                enable_reentrant=enable_reentrant,
+                recompute_policy=recompute_utils.RecomputePolicy(
+                    recompute_layers=2, use_reentrant=not enable_reentrant
+                ),
+            )
+        assert torch.utils.checkpoint.CheckpointFunction is checkpoint_function
+        if h3:
+            assert not model.is_gradient_checkpointing
+        else:
+            assert model.gradient_checkpointing_kwargs is None
+    finally:
+        torch.utils.checkpoint.CheckpointFunction = checkpoint_function
 
 
 def test_the_policy_decides_the_h3_blocks_flavour(monkeypatch):
-    """The block loop reads the flag and the bound function; the policy decides per block.
+    """Each H3 block owns the checkpoint entry point that the policy patches.
 
     Called exactly as the runtime does it — HF's enable on the wrapper, then the policy on
-    the wrapper — so the function the loop ends up calling is the framework's container
-    closure, which hands every block it is given that block's own decision.
+    the wrapper — so every block's own function resolves that block's decision.
     """
     recorder = _SkippingRecorder()
     monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recorder)
@@ -1057,14 +1108,13 @@ def test_the_policy_decides_the_h3_blocks_flavour(monkeypatch):
     )
 
     assert report.bound_blocks == 3  # the stack the policy found on the real DiT
-    # No block carries an entry point of its own; the two the enable wrote (wrapper and DiT)
-    # are containers, and the loop's one is what decides per block.
-    assert (report.patched_blocks, report.patched_containers) == (0, 2)
+    # HF arms each block; the wrapper still carries one container entry point.
+    assert (report.patched_blocks, report.patched_containers) == (3, 1)
     assert report.covered
 
     dit = model.dit
-    dit._gradient_checkpointing_func(dit.blocks[1], torch.zeros(1))  # inside the selective range
-    dit._gradient_checkpointing_func(dit.blocks[2], torch.zeros(1))  # recomputed, but not selectively
+    dit.blocks[1]._gradient_checkpointing_func(lambda: None, torch.zeros(1))  # selective range
+    dit.blocks[2]._gradient_checkpointing_func(lambda: None, torch.zeros(1))  # full recompute
 
     assert recorder.calls == [
         {"use_reentrant": False, "context_fn": noop_context_fn, "early_stop": True},

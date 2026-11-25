@@ -77,7 +77,7 @@ _QWEN4_EXP_TRAINING_ARGS = [
     "--model.accelerator.extra_parallel_sizes=2",
     "--model.accelerator.extra_parallel_placement_innermost=false",
     "--model.broadcast_model_weights_from_rank0=false",
-    "--model.ep_sharded_stream_load=true",
+    "--model.extra_parallel_stream_load=true",
     "--train.enable_batch_invariant_mode=False",
 ]
 

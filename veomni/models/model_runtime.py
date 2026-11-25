@@ -475,6 +475,11 @@ class VeOmniModelRuntime:
         self.model = torch_parallelize.build_parallelize_model(
             self.model,
             init_device=args.accelerator.init_device,
+            # The plan can be the module's only parallelism: with
+            # ``extra_parallel_only`` nothing wraps it, so the builder has to be
+            # told or it applies the FSDP2 wrap the module asked to skip (and a
+            # mixed-dtype quantized layer then refuses to load).
+            extra_parallel_only=args.accelerator.fsdp_config.extra_parallel_only,
             weights_path=self.weights_path,
             should_skip_hf_weight_load=skip_hf_weight_load,
             enable_reshard_after_forward=args.accelerator.fsdp_config.reshard_after_forward,
@@ -491,7 +496,7 @@ class VeOmniModelRuntime:
             enable_fsdp_offload=args.accelerator.fsdp_config.offload,
             fsdp_offload_pin_memory=args.accelerator.fsdp_config.offload_pin_memory,
             broadcast_model_weights_from_rank0=args.broadcast_model_weights_from_rank0,
-            ep_sharded_stream_load=args.ep_sharded_stream_load,
+            extra_parallel_stream_load=args.extra_parallel_stream_load,
             max_load_broadcast_size=args.accelerator.fsdp_config.max_load_broadcast_size,
             muon_expert_zero_comm=muon_expert_zero_comm,
             expert_weight_fp8_all_gather=args.accelerator.fsdp_config.expert_weight_fp8_all_gather,
