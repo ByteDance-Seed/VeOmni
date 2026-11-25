@@ -781,7 +781,7 @@ def _run_async_offload_base_trainer_fsdp2_gc():
         basic_modules=[],
         optimizer=OptimizerConfig(),
         broadcast_model_weights_from_rank0=False,
-        ep_sharded_stream_load=False,
+        extra_parallel_stream_load=False,
         accelerator=SimpleNamespace(
             offload_config=OffloadConfig(
                 enable_async_activation=True,

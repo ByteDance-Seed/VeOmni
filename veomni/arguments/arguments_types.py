@@ -86,7 +86,7 @@ class OptimizerConfig:
     norms use AdamW.
     """
 
-    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    type: Literal["adamw", "anyprecision_adamw", "muon", "hyper_muon"] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
@@ -297,6 +297,11 @@ class OptimizerConfig:
     )
 
     def __post_init__(self):
+        if self.type not in ("adamw", "anyprecision_adamw", "muon", "hyper_muon"):
+            raise ValueError(
+                f"Unknown model.optimizer.type: {self.type!r}. "
+                "Supported values: 'adamw', 'anyprecision_adamw', 'muon', 'hyper_muon'."
+            )
         # Annotations are not enforced for YAML values (see constraints), so the
         # literal is validated explicitly; otherwise a typo would silently fall
         # back to the stock path in the builder.
@@ -682,15 +687,36 @@ def validate_low_precision_reduce_scatter_comm(
 
 def validate_expert_fsdp_shard_dim(dim, *, fsdp_mode="fsdp2"):
     """Validate an explicit expert FSDP placement independently of its optimizer."""
-    if dim is not None and (type(dim) is not int or dim not in (0, 1) or fsdp_mode != "fsdp2"):
+    if dim is not None and (type(dim) is not int or dim not in (0, 1) or fsdp_mode not in ("fsdp2", "hyper_fsdp2")):
         raise ValueError("expert_fsdp_shard_dim must be null, 0 or 1 and requires FSDP2.")
+
+
+@dataclass
+class HyperParallelFSDPConfig:
+    """Optional Hyper-specific controls under the shared FSDP configuration."""
+
+    comm_fusion: bool = False
+    comm_fusion_vit: Optional[bool] = None
+    forward_prefetch_depth: int = 1
+    backward_prefetch_depth: int = 1
+    reduce_comm_interval: int = 1
+
+    def __post_init__(self):
+        if type(self.comm_fusion) is not bool:
+            raise ValueError("hyper_parallel.comm_fusion must be bool.")
+        if self.comm_fusion_vit is not None and type(self.comm_fusion_vit) is not bool:
+            raise ValueError("hyper_parallel.comm_fusion_vit must be bool or null.")
+        for name in ("forward_prefetch_depth", "backward_prefetch_depth", "reduce_comm_interval"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"hyper_parallel.{name} must be a positive integer.")
 
 
 @dataclass
 class FSDPConfig:
     """model.accelerator.fsdp_config.* — FSDP sharding configuration."""
 
-    fsdp_mode: Literal["ddp", "fsdp2", "eager"] = field(
+    fsdp_mode: Literal["ddp", "fsdp2", "hyper_fsdp2", "eager"] = field(
         default="fsdp2",
         metadata={
             "help": (
@@ -775,13 +801,29 @@ class FSDPConfig:
         },
     )
     mixed_precision: MixedPrecisionConfig = field(default_factory=MixedPrecisionConfig)
+    extra_parallel_only: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Apply the model's ExtraParallel plan (ep / emb) but skip the FSDP2 wrap. "
+                "Only applies when fsdp_mode='fsdp2'; ignored under 'ddp' or 'eager'. "
+                "The plan shards the dimension it names (e.g. experts on dim0) and the wrap "
+                "shards the rest (dim1 for experts); without the wrap that second axis must "
+                "be size 1, so this only fits a dimension already as wide as the shard axis. "
+                "For inference on a checkpoint kept quantized (fp8/fp4 storage), whose layer "
+                "mixes several floating-point dtypes that an FSDP parameter group refuses; "
+                "a training run dequantizes at load and does not need it for that reason."
+            )
+        },
+    )
+    hyper_parallel: HyperParallelFSDPConfig = field(default_factory=HyperParallelFSDPConfig)
 
     def __post_init__(self):
-        if self.fsdp_mode not in ("ddp", "fsdp2", "eager"):
+        if self.fsdp_mode not in ("ddp", "fsdp2", "hyper_fsdp2", "eager"):
             raise ValueError(
                 f"Unsupported fsdp_mode={self.fsdp_mode!r}. FSDP1 has been removed; "
                 "switch to fsdp_mode='fsdp2' (with model.accelerator.init_device='meta'), "
-                "'ddp', or 'eager'."
+                "'hyper_fsdp2', 'ddp', or 'eager'."
             )
         if self.fsdp_scope not in ("module", "model"):
             raise ValueError(f"Unsupported fsdp_scope={self.fsdp_scope!r}; expected 'module' or 'model'.")
@@ -940,20 +982,28 @@ class AcceleratorConfig:
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
 
+    @property
+    def resolved_extra_parallel(self) -> tuple[list[str], list[int], list[bool]]:
+        """Effective ``(names, sizes, placement_innermost)`` with ``ep`` folded in on demand.
+
+        Keeps the raw dataclass fields untouched so ``asdict()`` and per-module overlay
+        merging never inherit a pre-folded ``"ep"`` entry that shadows ``ep_size``.
+        """
+        names = list(self.extra_parallel_names)
+        sizes = list(self.extra_parallel_sizes)
+        innermost = list(self.extra_parallel_placement_innermost)
+        if "ep" not in names:
+            names.append("ep")
+            sizes.append(self.ep_size)
+            innermost.append(self.ep_outside)
+        return names, sizes, innermost
+
     def __post_init__(self):
         from ..distributed.hccl_options import validate_ep_hccl_options
 
         validate_ep_hccl_options(self.npu_ep_hccl_buffer_mib, self.npu_ep_hccl_expansion_mode)
-        # although expert parallel and extra parallel are both provided in the arguments,
-        # the implementation is configuring extra parallelism to include expert parallelism.
-        # Guarded so re-instantiating from a saved config (asdict round-trip) does not
-        # append a second "ep" dimension.
-        if "ep" not in self.extra_parallel_names:
-            self.extra_parallel_sizes.append(self.ep_size)
-            self.extra_parallel_names.append("ep")
-            self.extra_parallel_placement_innermost.append(self.ep_outside)
-
-        ep_size = dict(zip(self.extra_parallel_names, self.extra_parallel_sizes)).get("ep", 1)
+        extra_parallel_names, extra_parallel_sizes, _ = self.resolved_extra_parallel
+        ep_size = dict(zip(extra_parallel_names, extra_parallel_sizes)).get("ep", 1)
         if (self.npu_ep_hccl_buffer_mib is not None or self.npu_ep_hccl_expansion_mode is not None) and ep_size <= 1:
             raise ValueError("HCCL expert-parallel options require an enabled ep dimension")
 
@@ -1014,7 +1064,7 @@ class AcceleratorConfig:
             self.dp_shard_size = self.dp_size
 
     def _validate_init_device(self):
-        if self.fsdp_config.fsdp_mode == "fsdp2":
+        if self.fsdp_config.fsdp_mode in ("fsdp2", "hyper_fsdp2"):
             assert self.init_device == "meta", "Please use model.accelerator.init_device: meta for FSDP2 training"
         else:
             # DDP wraps with ``device_ids=[local_rank]``, which torch refuses for a
@@ -2089,7 +2139,7 @@ class ModelArguments(BaseModelArguments):
             "help": "When enabled, only rank0 reads model weights from HuggingFace safetensor from disk. Other ranks would receive weights through broadcast. This helps to avoid disk I/O bottleneck."
         },
     )
-    ep_sharded_stream_load: bool = field(
+    extra_parallel_stream_load: bool = field(
         default=False,
         metadata={
             "help": "Opt-in fast/low-memory loader for large ExtraParallel-sharded checkpoint tensors (for example MoE experts or PLE embedding tables): each rank reads only its dim-0 slice straight from the checkpoint. Requires the every-rank-reads path (`broadcast_model_weights_from_rank0=False`) and a model with an ExtraParallel parallel_plan; unsupported model/checkpoint combinations raise `NotImplementedError`."
@@ -2099,6 +2149,11 @@ class ModelArguments(BaseModelArguments):
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
     def __post_init__(self):
+        if self.accelerator.fsdp_config.fsdp_mode == "hyper_fsdp2" and self.optimizer.type == "anyprecision_adamw":
+            raise ValueError(
+                "Hyper FSDP does not support optimizer.type='anyprecision_adamw'. "
+                "Use 'adamw', 'muon', or 'hyper_muon'."
+            )
         super().__post_init__()
         # Both move training state to host; running them together would double
         # the host footprint and fight over the accelerator. Reject at parse time.
@@ -2107,17 +2162,17 @@ class ModelArguments(BaseModelArguments):
                 "model.optimizer.state_offload='cpu' cannot be combined with "
                 "model.accelerator.fsdp_config.offload; both move training state to host."
             )
-        # ep_sharded_stream_load only runs on the every-rank-reads path, so it is
+        # extra_parallel_stream_load only runs on the every-rank-reads path, so it is
         # mutually exclusive with broadcast_model_weights_from_rank0. Fail early
         # instead of silently ignoring the flag.
-        assert not (self.ep_sharded_stream_load and self.broadcast_model_weights_from_rank0), (
-            "model.ep_sharded_stream_load requires "
+        assert not (self.extra_parallel_stream_load and self.broadcast_model_weights_from_rank0), (
+            "model.extra_parallel_stream_load requires "
             "model.broadcast_model_weights_from_rank0=False "
             "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
         )
 
-        extra_parallel_sizes = dict(zip(self.accelerator.extra_parallel_names, self.accelerator.extra_parallel_sizes))
-        ple_size = extra_parallel_sizes.get("ple", 1)
+        extra_parallel_names, extra_parallel_sizes, _ = self.accelerator.resolved_extra_parallel
+        ple_size = dict(zip(extra_parallel_names, extra_parallel_sizes)).get("ple", 1)
         if ple_size > 1:
             effective_fsdp_shard_size = (
                 self.accelerator.dp_shard_size * self.accelerator.ulysses_size * self.accelerator.cp_size
@@ -2126,9 +2181,9 @@ class ModelArguments(BaseModelArguments):
                 raise ValueError(
                     f"PLE size ({ple_size}) must divide the effective FSDP shard size ({effective_fsdp_shard_size})."
                 )
-            if not self.ep_sharded_stream_load:
+            if not self.extra_parallel_stream_load:
                 raise ValueError(
-                    "PLE two-dimensional parallelism requires model.ep_sharded_stream_load=true so each rank "
+                    "PLE two-dimensional parallelism requires model.extra_parallel_stream_load=true so each rank "
                     "reads only its local row-by-column checkpoint rectangle."
                 )
 
