@@ -24,6 +24,7 @@ from torch.distributed.tensor import Shard
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.parallel_plan import ParallelPlan, SpecInfo
 from veomni.distributed.torch_parallelize import _divide_extra_parallel_grads_like_fsdp
+from veomni.distributed.utils import sort_fqn_by_submodule_first
 from veomni.models.transformers.qwen3_5_moe.parallel_plan import get_parallel_plan as qwen3_5_moe_plan
 
 
@@ -66,6 +67,41 @@ def test_nested_owners_are_rejected():
 def test_owners_that_only_share_a_name_prefix_are_not_nested():
     plan = ParallelPlan(extra_parallel_plan={"emb": {"ngram.weight": Shard(0), "ngram_extra.weight": Shard(0)}})
     assert plan.extra_parallel_fsdp_no_shard_module == {"emb": {"ngram", "ngram_extra"}}
+
+
+def test_sort_fqn_by_submodule_first_preserves_siblings_and_orders_descendants():
+    layers = [f"model.layers.{i}" for i in range(15)]
+    assert sort_fqn_by_submodule_first(layers) == layers
+    # Non-adjacent ancestor/descendant pair must still place child before parent while preserving sibling order.
+    assert sort_fqn_by_submodule_first(["decoder", "embed_tokens", "decoder.embed_tokens"]) == [
+        "decoder.embed_tokens",
+        "decoder",
+        "embed_tokens",
+    ]
+    assert sort_fqn_by_submodule_first(["layers.0", "layers.1", "layers.0.experts"]) == [
+        "layers.0.experts",
+        "layers.0",
+        "layers.1",
+    ]
+    # Numeric prefix "model.layers.1" must not be treated as an ancestor of "model.layers.10".
+    assert sort_fqn_by_submodule_first(
+        ["model.layers.0", "model.layers.1", "model.layers.1.sub", "model.layers.10"]
+    ) == [
+        "model.layers.0",
+        "model.layers.1.sub",
+        "model.layers.1",
+        "model.layers.10",
+    ]
+    assert sort_fqn_by_submodule_first(
+        ["", "model", "model.layers.0", "model.layers.1", "model.layers.0.mlp.experts", "model.layers.0.mlp"]
+    ) == [
+        "model.layers.0.mlp.experts",
+        "model.layers.0.mlp",
+        "model.layers.0",
+        "model.layers.1",
+        "model",
+        "",
+    ]
 
 
 def _param_with_spec(*, persistent: int | None) -> nn.Parameter:
