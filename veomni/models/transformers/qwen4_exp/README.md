@@ -49,7 +49,7 @@ Supported in this correctness stage:
 
 The internal example uses `ple_size=8`, `ep_size=4`,
 `broadcast_model_weights_from_rank0=false`, and
-`ep_sharded_stream_load=true`. The world size and every padded PLE shard row
+`extra_parallel_stream_load=true`. The world size and every padded PLE shard row
 count must be divisible by `ple_size`; the number of experts must be divisible
 by `ep_size`. PLE and EP may be enabled together because their parameter sets
 and communication meshes are independent.
