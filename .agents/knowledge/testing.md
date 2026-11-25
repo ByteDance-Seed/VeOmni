@@ -105,6 +105,10 @@ the test. CPU-only launcher regressions must also isolate their subprocess
 environment before importing torch, so ordinary pytest on a GPU/NPU host does
 not choose an accelerator backend for CPU tensors. Architecture-specific
 kernel tests must check hardware eligibility before importing optional kernels.
+CPU-only spawned workers that use checkpoint recomputation must also set
+`torch.utils.checkpoint.DefaultDeviceType` to `"cpu"` inside the child. The
+parent CI plugin's setting does not propagate through `spawn`; an Ascend host's
+default can otherwise initialize hidden NPU devices while querying AMP support.
 
 Distributed rendezvous must own its listener through worker startup. Use
 `tests.tools.launch_utils.spawn_with_rendezvous` for raw spawn workers (the

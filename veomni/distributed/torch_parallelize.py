@@ -992,7 +992,7 @@ def parallelize_model_fsdp2(
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
             for sub_mod in layer_mod.modules():
-                if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
+                if isinstance(sub_mod, mp_ignored_classes) and not isinstance(sub_mod, FSDPModule):
                     fully_shard(sub_mod, **fsdp_kwargs_without_mp)
                     # Keep these modules off transport_reduction_scales: their genuine FP32
                     # gradients need native FP32 communication, not a lossy wire cast.
@@ -1276,11 +1276,16 @@ def build_parallelize_model(
         model = model.float()
 
     checkpoint_early_stop = kwargs.pop("early_stop", True)
+    use_reentrant = False
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         logger.info_rank0("Enable gradient checkpointing.")
         use_reentrant = kwargs.pop("enable_reentrant", False)
-        if use_reentrant:
-            torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
+        if (
+            recompute_policy is not None
+            and recompute_policy.active
+            and recompute_policy.use_reentrant != use_reentrant
+        ):
+            raise ValueError("recompute_policy.use_reentrant must match enable_reentrant.")
 
         # The entry points the policy does not bind keep whatever HF is given here,
         # so the run's own recompute context has to be in it — otherwise a module
@@ -1307,9 +1312,13 @@ def build_parallelize_model(
     # Layer selection and SAC are bound per block, after HF has set its own
     # function on every checkpointing layer and before FSDP shards them. Runs
     # outside the branch above: models whose block loops drive checkpointing
-    # themselves (MiniMax-H3) still need their blocks bound.
+    # themselves still need their blocks bound.
     if recompute_policy is not None:
         recompute_utils.apply_recompute_policy(model, recompute_policy, basic_modules=basic_modules)
+
+    if use_reentrant:
+        # Install only after the model and policy have accepted checkpoint setup.
+        torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
     if parallel_state.tp_enabled:
         logger.info_rank0("Apply tensor parallel to the model.")
