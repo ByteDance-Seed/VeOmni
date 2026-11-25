@@ -206,8 +206,6 @@ class JanusLlama(InferenceMixin, PretrainedOmniModule):
     _supports_sdpa = True
     _supports_flash_attn = True
     _supports_flex_attn = True
-    # Static and dynamic measure the same here (1.00x), so take the one
-    # that absorbs a packed length that moves with the image count.
 
     def __init__(self, config: JanusLlamaConfig):
         super().__init__(config)

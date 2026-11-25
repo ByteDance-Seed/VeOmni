@@ -274,22 +274,6 @@ class JanusVqvae(InferenceMixin, PretrainedOmniModule):
     _supports_sdpa = True
     _supports_flash_attn = True
     _supports_flex_attn = True
-    # Measured ~1.73x: 37 conv/attention blocks, where eager launch overhead
-    # dominates. The largest win of any SeedOmni module.
-    #
-    # ms/step). The mechanism is worked out in the base class docstring.
-    #
-    # Compiling this module does not change the VQ token ids beyond float noise,
-    # and the noise is the codec's own, not the compiler's. Measured on the full
-    # encode path (1152 tokens): eager vs eager with a different batch shape
-    # already flips 0.26% of ids, and flipping float32 TF32 off changes 0.87%.
-    # With TF32 pinned the same way on both sides, compiled vs eager is *exactly*
-    # 0 differences; with the default TF32 on, it is 0.52% -- the same order as
-    # the eager-only perturbations. The quantiser forward on its own (argmin over
-    # 8192 rows, advanced indexing, VQ loss, straight-through) matches eager to
-    # 1.2e-7 with identical ids, because the nearest-neighbour margin is thin
-    # (median gap 2.8e-2, p1 4.7e-4) against TF32's ~1.5e-3 perturbation.
-    # So a run that needs bit-stable targets must pin TF32 off; compile is not
 
     def __init__(self, config: JanusVqvaeConfig):
         super().__init__(config)
