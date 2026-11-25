@@ -135,11 +135,11 @@ def test_deepseek_v4_attention_preserves_q_norm_and_rope_dtype_modes():
 
     captured = {}
 
-    def fake_attention(_module, query, _key, _value, _mask, **_kwargs):
-        captured["query"] = query
-        return torch.zeros_like(query.transpose(1, 2)), None
+    def fake_dsa_attention(query_rows, *_args, **_kwargs):
+        captured["query"] = query_rows.transpose(1, 2)
+        return torch.zeros_like(query_rows)
 
-    attention.veomni_attn = fake_attention
+    attention.veomni_dsa_attention = fake_dsa_attention
     attention(
         hidden_states,
         position_embeddings={"main": (cos, sin), "compress": (cos, sin)},

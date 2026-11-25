@@ -243,7 +243,7 @@ def test_wan_condition_forward_keeps_construction_impls():
 def test_flux_forward_keeps_construction_impls():
     from veomni.models.transformers.flux.modeling_flux import FluxModel
 
-    # This family has no local eager_attention_forward; eager delegates to SDPA.
+    # This family uses VeomniOp("attention", "standard", "eager") -> veomni_eager.
     config = tiny_flux_config()
     inputs = {
         "hidden_states": torch.randn(2, 4, 4, 6),

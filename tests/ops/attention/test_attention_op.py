@@ -50,6 +50,7 @@ _STANDARD_IMPLS = (
     "flash_attention_4",
     "flex_attention",
     "magi_attention",
+    "veomni_eager",
     "veomni_flash_attention_2",
     "veomni_flash_attention_2_hub",
     "veomni_flash_attention_3",
@@ -173,31 +174,44 @@ def eager_attention_forward(module, query, key, value, attention_mask, **kwargs)
 
 
 class _EagerAttentionModule(torch.nn.Module):
-    """Lookup resolves ``eager_attention_forward`` from this test module."""
+    """Module defined alongside a local ``eager_attention_forward``."""
 
 
-def test_lookup_eager_uses_module_local_forward():
+def test_lookup_eager_ignores_module_local_forward(monkeypatch):
+    """VeomniOp attention always dispatches ``eager`` to ``veomni_eager``, ignoring local functions."""
+    captured = {}
+
+    def replacement(module, query, key, value, attention_mask, **kwargs):
+        captured.update(module=module, query=query, kwargs=kwargs)
+        return query.transpose(1, 2) + 2, "veomni-eager"
+
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "veomni_eager", replacement)
     module = _EagerAttentionModule()
     query = torch.randn(2, 4, 3, 8)
     output, metadata = lookup("eager")(module, query, query, query, None, dropout=0.0, scaling=0.5)
-    torch.testing.assert_close(output, query.transpose(1, 2))
-    assert metadata == "eager-local"
+    assert captured["module"] is module
+    assert captured["kwargs"]["skip_ulysses"] is True
+    torch.testing.assert_close(output, query.transpose(1, 2) + 2)
+    assert metadata == "veomni-eager"
 
     op = VeomniOp("attention", "standard", "eager")
     op_output, op_metadata = op(module, query, query, query, None, dropout=0.0, scaling=0.5)
-    torch.testing.assert_close(op_output, query.transpose(1, 2))
-    assert op_metadata == "eager-local"
+    torch.testing.assert_close(op_output, query.transpose(1, 2) + 2)
+    assert op_metadata == "veomni-eager"
 
 
-@pytest.mark.parametrize("impl", ("veomni_sdpa", "eager"))
-def test_lookup_dispatches_through_hf_dict(monkeypatch, impl):
+@pytest.mark.parametrize(
+    ("impl", "target_interface"),
+    (("veomni_sdpa", "veomni_sdpa"), ("veomni_eager", "veomni_eager"), ("eager", "veomni_eager")),
+)
+def test_lookup_dispatches_through_hf_dict(monkeypatch, impl, target_interface):
     captured = {}
 
     def replacement(module, query, key, value, attention_mask, **kwargs):
         captured.update(module=module, query=query, kwargs=kwargs)
         return query.transpose(1, 2) + 1, "attention-metadata"
 
-    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, "veomni_sdpa", replacement)
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, target_interface, replacement)
     module = SimpleNamespace(is_causal=True)
     query = torch.randn(2, 4, 3, 8)
     output, metadata = lookup(impl)(module, query, query, query, None, dropout=0.0, scaling=0.5)
@@ -299,8 +313,8 @@ def test_lookup_raw_attention_rejects_active_ulysses_unless_skipped(monkeypatch,
         captured["kwargs"] = kwargs
         return q.transpose(1, 2), "ok"
 
-    if impl != "eager":
-        monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, impl, fake_forward)
+    target_interface = "veomni_eager" if impl == "eager" else impl
+    monkeypatch.setitem(ALL_ATTENTION_FUNCTIONS._global_mapping, target_interface, fake_forward)
 
     output, metadata = lookup(impl)(
         module,
@@ -313,21 +327,8 @@ def test_lookup_raw_attention_rejects_active_ulysses_unless_skipped(monkeypatch,
         cu_seq_lens_k=cu_seqlens,
     )
     torch.testing.assert_close(output, query.transpose(1, 2))
-    assert metadata in ("eager-local", "ok")
-    if impl != "eager":
-        assert "skip_ulysses" not in captured["kwargs"]
-
-    # DeepSeek-V4's eager -> veomni_dsa_attention bridge already exchanges Q/KV before lookup("eager").
+    assert metadata == "ok"
     if impl == "eager":
-        dsa_out, dsa_meta = lookup("eager")(
-            module,
-            query,
-            query,
-            query,
-            None,
-            dsa_position_ids=torch.arange(6).unsqueeze(0),
-            cu_seq_lens_q=cu_seqlens,
-            cu_seq_lens_k=cu_seqlens,
-        )
-        torch.testing.assert_close(dsa_out, query.transpose(1, 2))
-        assert dsa_meta == "eager-local"
+        assert captured["kwargs"]["skip_ulysses"] is True
+    else:
+        assert "skip_ulysses" not in captured["kwargs"]

@@ -76,6 +76,7 @@ _BUILTIN_ENTRIES = (
         _GPU_NVIDIA_SM100,
         ("magi_attention", "flash_attn_cute", "debugpy"),
     ),
+    ("attention", "standard", "veomni_eager", "any", _ANY, ()),
     ("attention", "standard", "veomni_flash_attention_2", "cuda", _GPU_SM80, ("flash_attn",)),
     ("attention", "standard", "veomni_flash_attention_2", "npu", _NPU, ()),
     ("attention", "standard", "veomni_flash_attention_2", "mlu", _MLU, ("flash_attn",)),

@@ -17,6 +17,7 @@
 from .kernels.attention.mask import (
     MagiAttentionMask,
     causal_mask,
+    eager_attention_mask_builder,
     flash_attention_mask_builder,
     flex_attention_mask_builder,
     magi_attention_mask_builder,
@@ -29,6 +30,7 @@ from .kernels.attention.mask import (
 __all__ = [
     "MagiAttentionMask",
     "causal_mask",
+    "eager_attention_mask_builder",
     "magi_attention_mask_builder",
     "flash_attention_mask_builder",
     "flex_attention_mask_builder",

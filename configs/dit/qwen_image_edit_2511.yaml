@@ -16,7 +16,7 @@ model:
     training_recipe: diffsynth
     image_resize_mode: center_crop
   ops_implementation:
-    attn_implementation: eager
+    attn_implementation: sdpa
     rotary_pos_emb_implementation: eager
     rms_norm_implementation: eager
     gated_mlp_implementation: eager

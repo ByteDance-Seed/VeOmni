@@ -7,7 +7,7 @@ model:
     height: 1024
     width: 1024
   ops_implementation:
-    attn_implementation: eager
+    attn_implementation: sdpa
     rotary_pos_emb_implementation: eager
   lora_config:
     rank: 128

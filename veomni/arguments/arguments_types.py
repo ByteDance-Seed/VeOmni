@@ -1542,6 +1542,7 @@ class OpsImplementationConfig:
             "magi_attention",
             "sage_attention",
             "native-sparse",
+            "veomni_eager",
             "veomni_flash_attention_2",
             "veomni_flash_attention_2_hub",
             "veomni_flash_attention_3",

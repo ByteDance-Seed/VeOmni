@@ -1155,16 +1155,11 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 # ======================================================================
-# [PATCHED FUNCTION] eager_attention_forward
-# Reason: Always call the local dsa_attention deepseek_v4 VeomniOp
-# ======================================================================
-# ================================================================
-# Patch: eager_attention_forward
+# DeepSeek-V4 DSA attention bridge
 # Hand the local dsa_attention deepseek_v4 VeomniOp the structured sparse
-# contract that DeepseekV4Attention.forward assembled, translated out of the
-# Transformers attention-interface call face.
-# ================================================================
-def eager_attention_forward(
+# contract that DeepseekV4Attention.forward assembled.
+# ======================================================================
+def _dsa_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -1315,7 +1310,6 @@ class DeepseekV4Attention(nn.Module):
             "deepseek_v4",
             config.ops_config.dsa_attention_implementation,
         )
-        self.veomni_attn = VeomniOp("attention", "standard", config.ops_config.attn_implementation)
         self.veomni_rope = VeomniOp("rope", "deepseek_v4", config.ops_config.rotary_pos_emb_implementation)
         self.veomni_kv_round = VeomniOp(
             "kv_round", "deepseek_v4", config.ops_config.kv_round_implementation, site=f"layers.{layer_idx}.window_kv"
@@ -1435,7 +1429,7 @@ class DeepseekV4Attention(nn.Module):
                 build_indexer_loss=build_indexer_loss,
             )
 
-        attention_interface = self.veomni_attn
+        attention_interface = _dsa_attention_forward
         kwargs = {key: value for key, value in kwargs.items() if key != "s_aux"}
         # What a query may read, in the terms the kernels are specified in: a sliding
         # window over the full-resolution rows plus the compressor's own selection.

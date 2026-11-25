@@ -241,9 +241,9 @@ RMSNorm supports only `eager`; an explicit `torch_npu` or deprecated `npu`
 selection raises at module construction. Leave the selection unset to use each
 variant's device default.
 
-The registered attention `eager` row calls the modeling file's local
-`eager_attention_forward` when present. Otherwise it forwards to `veomni_sdpa`,
-so modules without local eager math use the same config field without remapping.
+The registered attention `eager` row dispatches to `veomni_eager`, the
+pure-PyTorch eager attention implementation under
+`veomni/ops/kernels/attention/standard/eager.py`.
 
 Full RoPE's eager and Liger implementations store fixed cos/sin tables in the
 query dtype for backward. Forward computation still receives the original
@@ -279,14 +279,14 @@ composes segments into a dense block-diagonal mask for these
 implementations. Their attention calls and the VeOmni SDPA mask builder drop
 cumulative-length and varlen maximum-length metadata when it describes at most
 one segment per batch row, or when the call carries a 3-D/4-D dense mask. When
-an `sdpa`, `veomni_sdpa`, `eager` (with `is_causal=False`), or
-`veomni_sage_attention` attention call has `attention_mask=None` and
-`batch_size == 1` with multiple segments, the wrapper splits `Q/K/V` along
-the sequence dimension by the segment lengths derived from `cu_seqlens` (after
-any Ulysses gather) and concatenates the per-segment outputs. Multi-segment
-metadata with a 2-D mask or `batch_size != 1` raises, as does multi-segment
-metadata passed to `sdpa_attention_mask_builder`. Opaque dense masks are not
-inspected to infer whether they encode sequence boundaries.
+an `sdpa`, `veomni_sdpa`, `eager`, `veomni_eager`, or `veomni_sage_attention`
+attention call has `attention_mask=None` and `batch_size == 1` with multiple
+segments, the wrapper splits `Q/K/V` along the sequence dimension by the segment
+lengths derived from `cu_seqlens` (after any Ulysses gather) and concatenates
+the per-segment outputs. Multi-segment metadata with a 2-D mask or
+`batch_size != 1` raises, as does multi-segment metadata passed to
+`sdpa_attention_mask_builder` or `eager_attention_mask_builder`. Opaque dense
+masks are not inspected to infer whether they encode sequence boundaries.
 
 The VeOmni SDPA mask builder only honors causal mask-elision hints for the
 canonical causal predicate with equal Q/K lengths and offsets. Bidirectional

@@ -26,10 +26,12 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ..utils import logging
 from ..utils.env import get_env
+from .kernels.attention.mask.eager import eager_attention_mask_builder
 from .kernels.attention.mask.flash import flash_attention_mask_builder
 from .kernels.attention.mask.flex import flex_attention_mask_builder
 from .kernels.attention.mask.magi import magi_attention_mask_builder
 from .kernels.attention.mask.sdpa import sdpa_attention_mask_builder
+from .kernels.attention.standard.eager import eager_attention_forward
 from .kernels.attention.standard.flash import bind_flash_attention_forward
 from .kernels.attention.standard.flex import flex_attention_forward
 from .kernels.attention.standard.magi import magi_attention_forward
@@ -42,6 +44,7 @@ logger = logging.get_logger(__name__)
 # Every ``veomni_*`` attention name has a matching mask builder. Flash and
 # Sage preserve 2D padding metadata, while causal stays in ``is_causal``.
 _VEOMNI_HF_PATCHES: tuple[tuple[str, Callable[..., Any], Callable[..., Any]], ...] = (
+    ("veomni_eager", eager_attention_forward, eager_attention_mask_builder),
     (
         "veomni_flash_attention_2",
         bind_flash_attention_forward("veomni_flash_attention_2"),

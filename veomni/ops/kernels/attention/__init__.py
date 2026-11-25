@@ -19,7 +19,6 @@ are registered on that dict by ``apply_ops_patch``.
 Mask builders live under ``mask/`` and are not kernel rows.
 """
 
-import sys
 from collections.abc import Callable
 from typing import Optional
 
@@ -56,20 +55,6 @@ _RAW_NON_SP_IMPLS = frozenset(
 )
 
 
-def _module_eager_forward(module: torch.nn.Module) -> Callable | None:
-    """HF does not register ``eager`` on ``ALL_ATTENTION_FUNCTIONS``.
-
-    Each modeling file keeps a local ``eager_attention_forward`` (Gemma3
-    softcap, GPT-OSS sinks, ...). Resolve that from the Attention class
-    module so ``get_interface("eager", default)`` matches HF consume.
-    """
-    defining = sys.modules.get(type(module).__module__)
-    if defining is None:
-        return None
-    eager = getattr(defining, "eager_attention_forward", None)
-    return eager if callable(eager) else None
-
-
 def lookup(impl: str) -> Callable:
     """Return a wrapper that dispatches ``impl`` through the HF attention dict."""
 
@@ -86,43 +71,31 @@ def lookup(impl: str) -> Callable:
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Dispatch one attention call through the selected Transformers interface."""
-        eager_default = _module_eager_forward(module)
-        interface = "veomni_sdpa" if impl == "eager" and eager_default is None else impl
-        if interface in _RAW_NON_SP_IMPLS:
+        interface = "veomni_eager" if impl == "eager" else impl
+        if impl in _RAW_NON_SP_IMPLS:
             skip_ulysses = bool(kwargs.pop("skip_ulysses", False))
-            if kwargs.get("dsa_position_ids") is None and should_apply_ulysses(skip_ulysses=skip_ulysses):
+            if should_apply_ulysses(skip_ulysses=skip_ulysses):
                 raise ValueError(
-                    f"Attention implementation {interface!r} does not perform Ulysses sequence-parallel exchanges; "
+                    f"Attention implementation {impl!r} does not perform Ulysses sequence-parallel exchanges; "
                     "use a 'veomni_*' attention implementation (such as 'veomni_sdpa') or pass skip_ulysses=True "
                     "when Q/K/V are already gathered."
                 )
+            if interface == "veomni_eager":
+                kwargs["skip_ulysses"] = True
 
         packed_cu_seqlens = None
-        if interface in ("sdpa", "eager"):
+        if interface == "sdpa":
             kwargs, packed_cu_seqlens = extract_packed_varlen_cu_seqlens(
                 kwargs,
                 batch_size=query.shape[0],
                 attention_mask=attention_mask,
             )
 
-        forward = ALL_ATTENTION_FUNCTIONS.get_interface(interface, eager_default)
+        forward = ALL_ATTENTION_FUNCTIONS.get_interface(interface, None)
         if forward is None:
-            raise KeyError(
-                f"attention impl {interface!r} is not registered and "
-                f"{type(module).__module__} has no eager_attention_forward"
-            )
+            raise KeyError(f"attention impl {interface!r} is not registered")
 
         if packed_cu_seqlens is not None:
-            if interface == "eager":
-                is_causal = kwargs.get("is_causal")
-                if is_causal is None:
-                    is_causal = bool(getattr(module, "is_causal", False))
-                if is_causal:
-                    raise ValueError(
-                        "Unmasked packed varlen 'eager' attention does not support is_causal=True because "
-                        "Transformers eager_attention_forward requires an explicit causal attention_mask. "
-                        "Build a 4D mask with packed_causal_mask or pass is_causal=False."
-                    )
             cu_seqlens_q, cu_seqlens_k = packed_cu_seqlens
             return packed_split_attention_forward(
                 forward,
@@ -217,7 +190,10 @@ def _register_attention(
         )
 
 
-_register_attention("eager", "Model-local eager attention, or VeOmni SDPA for modules without a local eager forward")
+_register_attention(
+    "eager",
+    "VeOmni pure-PyTorch eager attention without Ulysses sequence-parallel exchanges",
+)
 _register_attention("sdpa", "PyTorch scaled dot-product attention through Transformers")
 _register_attention("flash_attention_2", "FlashAttention 2 through Transformers", rows=_FA2_ROWS)
 _register_attention(
@@ -246,6 +222,7 @@ _register_attention(
     rows=_MAGI_ROWS,
     interface="veomni_magi_attention",
 )
+_register_attention("veomni_eager", "VeOmni pure-PyTorch eager attention adapter through Transformers")
 _register_attention(
     "veomni_flash_attention_2",
     "VeOmni FlashAttention 2 adapter through Transformers",
