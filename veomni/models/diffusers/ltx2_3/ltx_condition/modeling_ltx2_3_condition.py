@@ -595,7 +595,7 @@ class LTXVideoConditionModel(PreTrainedModel):
 
         elif "conditions" in kwargs:
             conditions_raw = kwargs.pop("conditions")
-            audio_latents_raw = kwargs.pop("audio_latents", None)
+            audio_latents_raw = kwargs.pop("audio_latents", audio_latents)
             if fps is None and "fps" in kwargs:
                 fps = kwargs.pop("fps")
 
@@ -633,6 +633,10 @@ class LTXVideoConditionModel(PreTrainedModel):
                         (t.unsqueeze(0) if isinstance(t, torch.Tensor) and t.dim() == 3 else t).to(device)
                         for t in audio_latents_raw
                     ]
+                elif isinstance(audio_latents_raw, torch.Tensor):
+                    audio_latents = (
+                        audio_latents_raw.unsqueeze(0) if audio_latents_raw.dim() == 3 else audio_latents_raw
+                    ).to(device)
 
         return latents, context, context_mask, audio_context, audio_latents, reference_latents, fps
 

@@ -443,8 +443,6 @@ def load_model_weights(
     _apply_peft_override = make_peft_key_mapper(model, is_peft_model)
 
     converter = get_checkpoint_tensor_converter(model)
-    if converter is None and is_peft_model:
-        converter = get_checkpoint_tensor_converter(model.get_base_model())
     state_dict_iterators = _load_state_dict(weights_path, skip_key=_skip_without_loading_fn(model, converter))
 
     def _dispatch_kv(name: str, tensor: "torch.Tensor") -> None:
@@ -730,11 +728,8 @@ def load_model_weights_ep_sharded(
     # A checkpoint-tensor converter generally needs the whole tensor set, which
     # streaming can't provide. The streamable exceptions (dim-0 zero-pad, per-expert
     # stacking restricted to this rank's experts, and non-ExtraParallel converts for a
-    # converter that stacks experts) are decided per key below. Under PEFT the
-    # converter lives on the *base* model (the wrapper has none).
+    # converter that stacks experts) are decided per key below.
     converter = get_checkpoint_tensor_converter(model)
-    if converter is None and is_peft_model:
-        converter = get_checkpoint_tensor_converter(model.get_base_model())
 
     # Runtime plan: PEFT-prefixes every pattern with ``base_model.model.`` and
     # registers the MoE-LoRA wrapper FQNs -- base experts under ``base_layer.weight``
@@ -1246,8 +1241,6 @@ def rank0_load_and_broadcast_weights(
     _apply_peft_override = make_peft_key_mapper(model, is_peft_model)
 
     converter = get_checkpoint_tensor_converter(model)
-    if converter is None and is_peft_model:
-        converter = get_checkpoint_tensor_converter(model.get_base_model())
     global_rank = get_parallel_state().global_rank
     torch_device = _get_communication_device(init_device)
 

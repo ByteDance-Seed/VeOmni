@@ -70,23 +70,43 @@ Our guiding principles when building VeOmni are:
 
 ## ✏️ Supported Models
 
-| Model                                                    | Model size                    | Example config File                                                   |
-| -------------------------------------------------------- | ----------------------------- | ----------------------------------------------------------------------|
-| [DeepSeek2.5/3/R1](https://huggingface.co/deepseek-ai)   | 236B/671B                     | [deepseek.yaml](configs/text/deepseek.yaml)                           |
-| [DeepSeek-V4](https://huggingface.co/deepseek-ai)        | Checkpoint-dependent          | [deepseek.yaml](configs/text/deepseek.yaml) template; DSA/mHC default to eager, with optional [SM90+ TileLang/TileKernels backends](docs/design/op_selection.md#deepseek-v4-dsa-and-mhc) |
-| [Llama3-3.3](https://huggingface.co/meta-llama)          | 1B/3B/8B/70B                  | [llama3.yaml](configs/text/llama3.yaml)                               |
-| [Qwen2-3](https://huggingface.co/Qwen)                   | 0.5B/1.5B/3B/7B/14B/32B/72B/  | [qwen2_5.yaml](configs/text/qwen2_5.yaml)                             |
-| [Qwen2-3 VL/QVQ](https://huggingface.co/Qwen)            | 2B/3B/7B/32B/72B              | [qwen3_vl_dense.yaml](configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml)|
-| [Qwen3-VL MoE](https://huggingface.co/Qwen)              | 30BA3B/235BA22B               | [qwen3_vl_moe.yaml](configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml)    |
-| [Qwen3-MoE](https://huggingface.co/Qwen)                 | 30BA3B/235BA22B               | [qwen3-moe.yaml](configs/text/qwen3-moe.yaml)                         |
-| [GPT-OSS](https://huggingface.co/openai/gpt-oss-120b)    | 120B                          | [gpt_oss_120b_lora_ep4.yaml](configs/text/gpt_oss_120b_lora_ep4.yaml) |
-| [Qwen2-3 Omni](https://huggingface.co/Qwen)              | 7B/30BA3B                     | [qwen25_omni.yaml](configs/multimodal/qwen25_omni/qwen25_omni.yaml)   |
-| [Kimi K3](docs/examples/kimi_k3.md)                      | Checkpoint-dependent          | [kimi_k3_vl_ascendc.yaml](configs/multimodal/kimi_k3/kimi_k3_vl_ascendc.yaml) |
-| [Wan](https://huggingface.co/Wan-AI)                     | Wan2.1-I2V-14B-480P           | [wan_sft.yaml](configs/dit/wan_sft.yaml)                              |
-| [MiniMax H3](docs/examples/minimax_h3.md)                | Checkpoint-dependent          | [FL2VA](configs/dit/minimax_h3_fl2va_offline.yaml); [Ref2VA](configs/dit/minimax_h3_ref2va_cfg_offline.yaml) |
-| [MiniMax H3-Image](docs/examples/minimax_h3_image.md)    | Checkpoint-dependent          | Inference only (t2i/edit)                                              |
-| [HunyuanVideo 1.5](docs/examples/hunyuanvideo15.md) | 480p T2V (experimental; CPU and NPU backbone checks) | [hunyuanvideo15_t2v.yaml](configs/dit/hunyuanvideo15_t2v.yaml) |
-| [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3)     | Checkpoint-dependent          | [ltx2_av_lora.yaml](configs/dit/ltx2_av_lora.yaml); [training guide](docs/examples/ltx-2.3.md) |
+> ✅ Supported · — Unconfirmed · ❌ Unsupported
+>
+> The default example uses CUDA. Look for `ascend.yaml` in the same [model directory](configs/models) for Ascend. The [validation report](docs/examples/eight_device_validation.md) lists results by checkpoint.
+>
+> **Hardware Guides:** [NVIDIA GPU](docs/get_started/installation/install.md) · [Ascend NPU](docs/hardware_support/get_started_npu.md) · [AMD ROCm](docs/hardware_support/rocm/README.md) · [Cambricon MLU](docs/hardware_support/mlu/README.md)
+
+| Model | NVIDIA GPU | Ascend NPU | AMD GPU | Cambricon MLU | Default example |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| [BAGEL](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | ✅ | — | — | — | [YAML](configs/models/bagel/cuda.yaml) |
+| [Cosmos3-Nano](https://huggingface.co/nvidia/Cosmos3-Nano) | ✅ | ✅ | — | — | [YAML](configs/models/cosmos3/cuda.yaml) |
+| [DeepSeek-V2.5 / V3 / R1](https://huggingface.co/deepseek-ai) | ✅ | ✅ | ✅ | — | [YAML](configs/models/deepseek_v3/cuda.yaml) |
+| [DeepSeek-V4](https://huggingface.co/deepseek-ai) | ✅ | ✅ | ✅ | — | [YAML](configs/models/deepseek_v4/cuda.yaml) |
+| [Gemma 3](https://huggingface.co/google) | ✅ | ✅ | — | — | [YAML](configs/models/gemma3/cuda.yaml) |
+| [GLM-5](https://huggingface.co/zai-org) | ✅ | ✅ | — | — | [YAML](configs/models/glm5/cuda.yaml) |
+| [GPT-OSS](https://huggingface.co/openai/gpt-oss-120b) | ✅ | ✅ | ❌ | ❌ | [YAML](configs/models/gpt_oss/cuda.yaml) |
+| [HunyuanVideo 1.5](https://huggingface.co/tencent/HunyuanVideo-1.5) | ✅ | ✅ | — | — | [YAML](configs/models/hunyuanvideo15/cuda.yaml) |
+| [Janus](https://huggingface.co/deepseek-ai/Janus-1.3B) | ✅ | ✅ | — | — | [YAML](configs/models/janus/cuda.yaml) |
+| [Kimi K3](docs/examples/kimi_k3.md) | ✅ | ✅ | — | — | [YAML](configs/multimodal/kimi_k3/kimi_k3_vl.yaml) |
+| [Llama 3 / 3.1 / 3.3](https://huggingface.co/meta-llama) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/llama3/cuda.yaml) |
+| [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) | ✅ | ✅ | — | — | [YAML](configs/models/ltx2_3/cuda.yaml) |
+| [MiniMax-H3](https://huggingface.co/MiniMaxAI) | ✅ | ✅ | — | — | [YAML](configs/models/minimax_h3_fl2va/cuda.yaml) |
+| [Qwen2 / Qwen2.5](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [YAML](configs/models/qwen2_5/cuda.yaml) |
+| [Qwen2-VL / Qwen2.5-VL](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [YAML](configs/models/qwen2_5_vl/cuda.yaml) |
+| [Qwen2.5-Omni](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [YAML](configs/models/qwen2_5_omni/cuda.yaml) |
+| [Qwen3](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/qwen3/cuda.yaml) |
+| [Qwen3-MoE](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/qwen3_moe/cuda.yaml) |
+| [Qwen3-VL](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/qwen3_vl/cuda.yaml) |
+| [Qwen3-VL-MoE](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/qwen3_vl_moe/cuda.yaml) |
+| [Qwen3-Omni-MoE](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | — | [YAML](configs/models/qwen3_omni_moe/cuda.yaml) |
+| [Qwen3.5](https://huggingface.co/Qwen) | ✅ | — | ✅ | ✅ | [YAML](configs/models/qwen3_5/cuda.yaml) |
+| [Qwen3.5-MoE](https://huggingface.co/Qwen) | ✅ | — | ✅ | ✅ | [YAML](configs/models/qwen3_5_moe/cuda.yaml) |
+| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen) | ✅ | — | — | — | [YAML](configs/models/qwen3_8_flash_next/cuda.yaml) |
+| [Qwen-Image / Qwen-Image-Edit](https://huggingface.co/Qwen) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/qwen_image/cuda.yaml) |
+| [Seed-OSS](https://huggingface.co/ByteDance-Seed) | ✅ | ✅ | — | — | [YAML](configs/models/seed_oss/cuda.yaml) |
+| [Wan2.1 / Wan2.2](https://huggingface.co/Wan-AI) | ✅ | ✅ | ✅ | ✅ | [YAML](configs/models/wan2_1/cuda.yaml) |
+
+For inference-only models, see [MiniMax-H3-Image](docs/examples/minimax_h3_image.md).
 
 Support new models to VeOmni see [Support New Models](https://veomni.readthedocs.io/en/latest/usage/support_new_models/guide_and_checklist.html)
 

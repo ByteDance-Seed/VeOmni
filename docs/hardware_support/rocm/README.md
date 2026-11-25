@@ -80,16 +80,18 @@ docker build \
 Example (8-GPU real-model SFT, from `docs/examples/qwen3.md`):
 
 ```bash
-bash train.sh tasks/train_text.py configs/text/qwen3.yaml \
+bash train.sh tasks/train_text.py configs/models/qwen3/recipes/sft_8b.yaml \
   --model.model_path /path/to/Qwen3-0.6B-Base \
-  --data.train_path  /path/to/train.parquet
+  --data.train_path  /path/to/train.parquet \
+  --train.checkpoint.save_hf_weights false
 ```
 
 Or specify visible devices and process count explicitly:
 
 ```bash
 HIP_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
-  bash train.sh tasks/train_text.py configs/text/qwen3.yaml ...
+  bash train.sh tasks/train_text.py configs/models/qwen3/recipes/sft_8b.yaml \
+  --train.checkpoint.save_hf_weights false ...
 ```
 
 ## ROCm environment variables

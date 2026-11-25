@@ -117,11 +117,11 @@ model:
       kwargs: {dtype: nvfp4}
 ```
 
-Start from [`configs/text/qwen3_nvfp4_qat.yaml`](../../configs/text/qwen3_nvfp4_qat.yaml),
+Start from [`configs/models/qwen3/recipes/nvfp4_qat.yaml`](../../configs/models/qwen3/recipes/nvfp4_qat.yaml),
 set `model.model_path` and `data.train_path`, and run:
 
 ```bash
-bash train.sh tasks/train_text.py configs/text/qwen3_nvfp4_qat.yaml
+bash train.sh tasks/train_text.py configs/models/qwen3/recipes/nvfp4_qat.yaml
 ```
 
 ### FP4 QAT details and constraints

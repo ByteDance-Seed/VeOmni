@@ -1,0 +1,32 @@
+# hf download google/gemma-3-270m --local-dir ./gemma-3-270m
+# bash train.sh tasks/train_text.py configs/models/gemma3/ascend.yaml
+
+model:
+  model_path: ./gemma-3-270m
+  chat_template: chatml
+  ops_implementation:
+    attn_implementation: eager
+  accelerator:
+    init_device: meta
+    fsdp_config:
+      fsdp_mode: fsdp2
+  optimizer:
+    type: adamw
+    lr: 0.0001
+data:
+  train_path: ./data/text.parquet
+  data_type: plaintext
+  text_keys: text
+  max_seq_len: 2048
+  datasets_type: mapping
+train:
+  dyn_bsz: false
+  global_batch_size: 8
+  micro_batch_size: 1
+  num_train_epochs: 1
+  checkpoint:
+    output_dir: outputs/gemma3/ascend
+    manager: dcp
+    save_hf_weights: false
+  wandb:
+    enable: false

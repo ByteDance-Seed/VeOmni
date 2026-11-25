@@ -3,7 +3,7 @@
 DPO training with **Qwen3-0.6B** on the
 [trl-lib/ultrafeedback_binarized](https://huggingface.co/datasets/trl-lib/ultrafeedback_binarized) dataset.
 
-Config: [`configs/text/qwen3_dpo.yaml`](../../configs/text/qwen3_dpo.yaml)
+Config: [`configs/models/qwen3/recipes/dpo.yaml`](../../configs/models/qwen3/recipes/dpo.yaml)
 
 ---
 
@@ -35,7 +35,7 @@ The script appends the model name to `--local_dir`, saving to `./Qwen3-0.6B`.
 ## Step 3 — Start DPO training
 
 ```shell
-bash train.sh tasks/train_text_dpo.py configs/text/qwen3_dpo.yaml
+bash train.sh tasks/train_text_dpo.py configs/models/qwen3/recipes/dpo.yaml
 ```
 
 Key config values (full DPO argument reference: [arguments.md — DPOConfig](../usage/arguments.md#dpoconfig)):

@@ -1,0 +1,38 @@
+# hf download unsloth/DeepSeek-R1-BF16 --local-dir ./DeepSeek-R1-BF16
+# bash train.sh tasks/train_text.py configs/models/deepseek_r1/ascend.yaml
+
+model:
+  model_path: ./DeepSeek-R1-BF16
+  chat_template: chatml
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    moe_implementation: eager
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    gated_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    load_balancing_loss_implementation: eager
+  accelerator:
+    init_device: meta
+    fsdp_config:
+      fsdp_mode: fsdp2
+  optimizer:
+    type: adamw
+    lr: 0.0001
+data:
+  train_path: ./data/text.parquet
+  data_type: plaintext
+  text_keys: text
+  max_seq_len: 2048
+  datasets_type: mapping
+train:
+  dyn_bsz: false
+  global_batch_size: null
+  micro_batch_size: 1
+  num_train_epochs: 1
+  checkpoint:
+    output_dir: outputs/deepseek_r1/ascend
+    manager: dcp
+    save_hf_weights: false
+  wandb:
+    enable: false
