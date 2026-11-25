@@ -443,11 +443,15 @@ def test_mhc_triton_post_noncontiguous_direct_gradients():
 
 
 @pytest.mark.skipif(not _TRITON_ROCM_AVAILABLE, reason="Triton mHC requires an AMD ROCm GPU")
-def test_mhc_triton_post_mixes_bf16_output_into_fp32_residual():
+@pytest.mark.parametrize(
+    ("residual_dtype", "output_dtype"),
+    [(torch.float32, torch.bfloat16), (torch.bfloat16, torch.float32)],
+)
+def test_mhc_triton_post_promotes_mixed_precision_inputs(residual_dtype: torch.dtype, output_dtype: torch.dtype):
     torch.manual_seed(47)
     batch, seq_len, hc_mult, hidden = 2, 37, 4, 320
-    output = torch.randn(batch, seq_len, hidden, device="cuda", dtype=torch.bfloat16)
-    residual = torch.randn(batch, seq_len, hc_mult, hidden, device="cuda")
+    output = torch.randn(batch, seq_len, hidden, device="cuda", dtype=output_dtype)
+    residual = torch.randn(batch, seq_len, hc_mult, hidden, device="cuda", dtype=residual_dtype)
     post = torch.rand(batch, seq_len, hc_mult, device="cuda") * 2
     comb = torch.softmax(torch.randn(batch, seq_len, hc_mult, hc_mult, device="cuda"), dim=-1)
     inputs_t = make_grad_leaves(output, residual, post, comb)
@@ -482,8 +486,6 @@ def test_mhc_triton_rejects_invalid_contracts():
     output = torch.randn(1, 8, hidden, device="cuda", dtype=torch.float32)
     post = torch.randn(1, 8, hc_mult, device="cuda")
     comb = torch.randn(1, 8, hc_mult, hc_mult, device="cuda")
-    with pytest.raises(TypeError, match="cannot hold output dtype"):
-        post_op(output, x, post, comb)
     with pytest.raises(TypeError, match="float16, bfloat16, or float32"):
         post_op(output.to(torch.int32), x.to(torch.int32), post, comb)
 

@@ -364,6 +364,10 @@ def mhc_mix_tail(
     ``mixes`` is ``[..., (2 + hc) * hc]``; ``scale`` holds the pre / post /
     comb scales and ``base`` the matching biases.
     """
+    if not torch.is_grad_enabled():
+        # ``needs_input_grad`` ignores grad mode, so a no-grad call with trainable
+        # parameters would still save the backward states.
+        mixes, scale, base = mixes.detach(), scale.detach(), base.detach()
     return _MixTail.apply(mixes, scale, base, hc_mult, post_mult, eps)
 
 
@@ -744,7 +748,7 @@ class _PostMix(torch.autograd.Function):
         post_c = post.contiguous()
         comb_c = comb.contiguous()
         rows = _leading_rows(x_c.shape, 2)
-        new = torch.empty_like(x_c)
+        new = torch.empty(x_c.shape, dtype=torch.promote_types(x_c.dtype, out_c.dtype), device=x_c.device)
         grid = (triton.cdiv(rows, _STREAM_BLOCK_M), triton.cdiv(d, _STREAM_BLOCK_D))
         with get_torch_device().device(x_c.device):
             _post_mix_fwd_kernel[grid](
@@ -805,6 +809,6 @@ def hc_post_mix(residual: torch.Tensor, output: torch.Tensor, post: torch.Tensor
 
     ``residual`` is ``[..., K, D]``, ``output`` ``[..., D]``, ``post``
     ``[..., K]`` and ``comb`` ``[..., K, K]``. Accumulates in FP32 and returns
-    ``residual.dtype``.
+    the promoted dtype of ``residual`` and ``output``, like the eager expression.
     """
     return _PostMix.apply(residual, output, post, comb)
