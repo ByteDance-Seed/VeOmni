@@ -57,6 +57,15 @@ The sparse-attention indexer (`self_attn.indexer.*`) is frozen and keeps its che
 
 Set `model.ops_implementation.minimax_sparse_attention_implementation` to `eager` for the PyTorch reference on any device or `npu` for Ascend fused attention with FP16 or BF16 inputs. By default, Ascend uses `torch_npu.npu_fusion_attention` and other devices use PyTorch. Both implementations right-pad internally. Eager attention broadcasts one mask per KV group across its query heads. Its per-head scores still grow quadratically with the longest sequence in the pack. The NPU backend expands a multi-group mask only when the fused operator requires one mask per query head.
 
+The table shows peak allocated GPU memory for one eager sparse attention layer on a single NVIDIA H100 80 GB HBM3 with PyTorch `2.11.0+cu130`. Both runs used BF16, one 4096-token sequence, 64 query heads, 4 KV groups, head dimension 128, and 16 selected blocks of 128 tokens each. Block indices were precomputed. The peaks were measured with `torch.cuda.max_memory_allocated()` after warm-up, with gradients enabled for Q, K, and V.
+
+| Mask layout | Forward peak (GiB) | Forward + backward peak (GiB) |
+| --- | ---: | ---: |
+| Per query head (`f63e2909`) | 13.393 | 16.446 |
+| Per KV group | 10.580 | 16.446 |
+
+Broadcasting the mask across query heads saved 2.813 GiB (21.0%) at the forward peak. Both runs peaked at 16.446 GiB over the full forward and backward pass.
+
 The language model accepts only packed input: VeOmni's collator (or verl's remove-padding path) supplies the varlen kwargs, and a caller without them may pass one sequence with batch size 1 and no padding, which is run as a single-segment pack (an `attention_mask`, if given, must be all ones; a padded mask is rejected). Padded `[B, S]` batches (e.g. verl `use_remove_padding=False`), KV cache / `generate`, and context parallelism are rejected with an explicit error.
 
 MiniMax's Gemma-style RMSNorm uses the `rms_norm/offset` op, selecting `liger_kernel` on GPU and `torch_npu` on NPU by default according to `model.ops_implementation.rms_norm_implementation`.
