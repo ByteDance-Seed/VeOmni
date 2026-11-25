@@ -36,7 +36,7 @@ def should_apply_ulysses(*, skip_ulysses: bool = False) -> bool:
     """
     if skip_ulysses:
         return False
-    return get_parallel_state().ulysses_size > 1
+    return getattr(get_parallel_state(), "ulysses_size", 1) > 1
 
 
 def effective_sequence_lengths(
