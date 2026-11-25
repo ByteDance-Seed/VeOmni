@@ -38,9 +38,7 @@ CPU-only parsing, preprocessing, eager references and mocked backend tests need
 an explicit CPU launch plan. Mark entire modules only when all cases are CPU-only;
 use individual case markers in files that also exercise accelerator kernels.
 The lightweight device-API workflow runs architecture, op-documentation and
-generated-call-site-signature tests with `pytest --noconftest`, without Torch.
-The patchgen workflow owns `test_modify_init.py`, using the standalone
-`patchgen` package and `pytest --noconftest` to avoid runtime fixture imports.
+modeling call-site-signature tests with `pytest --noconftest`, without Torch.
 Device-API acceptance also includes the three `check_device_api_usage.py`
 scans over `tasks`, `veomni`, and `tests`; the pytest guards alone do not cover
 that workflow. CPU tests checking device-name forwarding should use a mock
@@ -107,6 +105,10 @@ the test. CPU-only launcher regressions must also isolate their subprocess
 environment before importing torch, so ordinary pytest on a GPU/NPU host does
 not choose an accelerator backend for CPU tensors. Architecture-specific
 kernel tests must check hardware eligibility before importing optional kernels.
+CPU-only spawned workers that use checkpoint recomputation must also set
+`torch.utils.checkpoint.DefaultDeviceType` to `"cpu"` inside the child. The
+parent CI plugin's setting does not propagate through `spawn`; an Ascend host's
+default can otherwise initialize hidden NPU devices while querying AMP support.
 
 Distributed rendezvous must own its listener through worker startup. Use
 `tests.tools.launch_utils.spawn_with_rendezvous` for raw spawn workers (the
@@ -129,7 +131,7 @@ describe selections in `scripts/ci/accelerator/suites/gpu.json` and `npu.json`.
 | `tests/data/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
 | `tests/checkpoints/` | whole directory, in both GPU/NPU manifests (`suite: unit`) |
 | `tests/ops/` | directory in both GPU/NPU unit manifests, excluding `base/test_op_documentation.py` (device-API workflow) |
-| `tests/models/` | unit selection in both manifests, excluding `base/test_modify_init.py` (patchgen workflow) and `transformers/test_generated_call_site_signatures.py` (device-API workflow); GPU additionally excludes `test_omni_fsdp.py` |
+| `tests/models/` | unit selection in both manifests, excluding `transformers/test_generated_call_site_signatures.py` (device-API workflow); GPU additionally excludes `test_omni_fsdp.py` |
 | `tests/parallel/context_parallel/` | whole directory in the GPU manifest (`suite: unit`); on NPU only `test_deepseek_v4_cp.py` is listed |
 | everything else | **one selection per file** in the appropriate GPU/NPU suite manifest |
 | `tests/e2e/test_e2e_parallel.py`, `tests/distributed/test_fsdp_equivalence.py` | GPU/NPU manifests (`suite: e2e`) |
@@ -163,7 +165,7 @@ kernel dependencies land differently, and each decides what a test can reach:
 | `fla_npu` | image venv only; the workspace venv does not inherit it | `chunk_gated_delta_rule_implementation=fla_npu`, so that backend is untestable |
 | `flash-linear-attention` | `gpu` extra only, so absent from both | the `fla` backends. Its `HardwareRequirement` lists `npu`, but the GatedDeltaNet docs say it raises on Ascend even when installed — treat `fla` as GPU-only |
 
-The runners are 910B (A2, non-arch35), so kernels gated behind `is_arch35()`
+The runners are Atlas A2 training products (non-arch35), so kernels gated behind `is_arch35()`
 stay unreachable whatever is installed.
 
 Check whether a file is wired — by name, and by the directory it sits in:
@@ -195,8 +197,7 @@ by a `pytest.param` table, so a new case is a few lines:
 | Ulysses SP behaviour | `tests/parallel/ulysses/test_ulysses.py` and siblings |
 | Checkpoint callback / DCP round-trip | `tests/checkpoints/test_checkpoint_callback.py`, `test_trainer_saveload.py`, `test_dcp_checkpointer.py` |
 | DiT resume / noise-stream equivalence | `tests/checkpoints/test_dit_resume_align.py` |
-| Weight loading / broadcast / EP shard | `tests/utils/test_rank0_load_and_broadcast_weights.py`, `test_moe_ep_sharded_load_matrix.py` |
-| Grad clipping with ExtraParallel | `tests/utils/test_extra_parallel_clip_grad_norm.py` |
+| Weight loading / broadcast / ExtraParallel stream load & grad clipping | `tests/utils/test_rank0_load_and_broadcast_weights.py`, `tests/utils/test_extra_parallel.py` |
 | FLOPs / MFU accounting | `tests/utils/test_count_flops.py` |
 | Optimizer / Muon / swap | `tests/optim/test_muon_*.py`, `test_optimizer_vlm_param_groups.py`, `test_swap_adamw*.py` (CPU parity; the `_device` file runs on one real card; both swap files are enumerated per file in the suite manifests) |
 | LoRA / MoE-LoRA | the enumerated `tests/lora/test_*.py` set |
@@ -222,7 +223,7 @@ is not GPU-specific. Say in the PR what it costs in wall time.
   kernels on the SM89 runners, NPU-only paths with no NPU coverage for that
   area).
 - Changes whose only failure mode is a build/lint error that another gate
-  already catches (`check_patchgen`, `device_api_check`, `check_doc_task_paths`,
+  already catches (`device_api_check`, `check_doc_task_paths`,
   ruff via `check_pr_lint`).
 
 Say so explicitly in the PR's **Test** section, with the reason. "No test

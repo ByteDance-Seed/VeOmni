@@ -125,6 +125,10 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         transformer_config_kwargs: dict | None = None,
         ops_implementation=None,
     ) -> "MiniMaxH3ImagePipeline":
+        transformer_config_kwargs = dict(transformer_config_kwargs or {})
+        transformer_config_kwargs.setdefault("audio_enabled", False)
+        if transformer_config_kwargs["audio_enabled"]:
+            raise ValueError("MiniMax-H3-Image requires audio_enabled=False.")
         model_path = str(Path(model_path))
         pipe = MiniMaxH3ImagePipeline(device=device, torch_dtype=torch_dtype)
         if ops_implementation is None and pipe.device.type == "cpu":
@@ -163,9 +167,7 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
             pipe.vae_spatial_compression_ratio = pipe.vae.spatial_compression_ratio
             pipe.latent_channels = pipe.vae.config.latent_channels
 
-        transformer_config_kwargs = dict(transformer_config_kwargs or {})
         transformer_config_kwargs.setdefault("num_pdd_heads", num_pdd_heads)
-        transformer_config_kwargs.setdefault("audio_enabled", False)
         transformer_config_path = os.path.join(model_path, "transformer", "config.json")
         dit_config = MiniMaxH3DiTModelConfig.from_pretrained(
             transformer_config_path, _validate_ops=False, **transformer_config_kwargs
@@ -173,7 +175,6 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
         dit_config._apply_ops_overrides(ops_implementation=ops_implementation, _validate=False)
         with init_empty_weights():
             pipe.dit = MiniMaxH3DiTModel._from_config(dit_config, torch_dtype=torch_dtype)
-        pipe._keep_dit_fp32_modules()
         load_model_weights(pipe.dit, os.path.join(model_path, "transformer"), init_device="cpu")
         pipe.dit.eval()
         pipe._load_pdd_heads(pdd_state)
@@ -192,20 +193,8 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
                 f"Transformer has {len(final_layer.pdd_out)} PDD heads but the checkpoint has {weight.shape[0]}."
             )
         for index, head in enumerate(final_layer.pdd_out):
-            head.weight.data = weight[index].clone()
-            head.bias.data = bias[index].clone()
-
-    def _keep_dit_fp32_modules(self) -> None:
-        """Preserve the released checkpoint's FP32 projections across loading."""
-        modules = (
-            self.dit.dit.video_patch_proj,
-            self.dit.dit.time_embedder,
-            self.dit.dit.final_layer.video_out,
-            self.dit.dit.final_layer.pdd_out,
-        )
-        for module in modules:
-            if module is not None:
-                module.to(torch.float32)
+            head.weight.data = weight[index].to(head.weight, copy=True)
+            head.bias.data = bias[index].to(head.bias, copy=True)
 
     @staticmethod
     def _parameter_on_device(parameter: torch.Tensor, device: torch.device) -> bool:
@@ -335,7 +324,7 @@ class MiniMaxH3ImagePipeline(torch.nn.Module):
                     unique_timesteps = torch.tensor([timestep], dtype=torch.float32, device=self.device)
                     timestep_indices = torch.zeros(sequence_length, dtype=torch.long, device=self.device)
 
-                noise_pred = self.dit.forward_image(
+                noise_pred = self.dit(
                     x=rows,
                     prompt_embeds=prompt_embeds,
                     unique_timesteps=unique_timesteps,

@@ -463,7 +463,7 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
         ),
         optimizer=None,
         broadcast_model_weights_from_rank0=False,
-        ep_sharded_stream_load=False,
+        extra_parallel_stream_load=False,
     )
 
     captured = {}

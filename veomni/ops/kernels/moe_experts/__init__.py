@@ -19,8 +19,6 @@ interleaved gate/up layout with bias and ``alpha`` / ``limit``. Eager is
 the HF expert loop (regular autograd). Fused rows wrap the local Functions.
 """
 
-from torch import nn
-
 from ...platform import (
     NVIDIA_SM70_PLUS,
     NVIDIA_SM90_PLUS,
@@ -33,6 +31,8 @@ from ...platform import (
 from ...registry import register_op
 from .gpt_oss import eager as gpt_oss_eager
 from .gpt_oss import quack as gpt_oss_quack
+from .kimi_k3 import eager as kimi_k3_eager
+from .kimi_k3 import fused_npu as kimi_k3_fused_npu
 from .shared import unpermute
 from .standard import deepgemm as standard_deepgemm
 from .standard import eager as standard_eager
@@ -51,53 +51,14 @@ _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 #: expert-LoRA request on one of these must be refused rather than silently
 #: falling back to a full-precision ``eager`` base.
 #:
-#: ``deepgemm_fp8`` belongs here for the same reason as ``qat``: its
+#: ``deepgemm`` belongs here for the same reason as ``qat``: its
 #: ``GroupedLinear`` runs the FP8 GEMM in forward, dgrad *and* wgrad. Leaving it
 #: out let a non-SwiGLU activation reach ``merged_experts_act_fn_forward`` -- plain
 #: ``F.linear`` in the model dtype -- and train the routed experts unquantized
-#: while the config said ``deepgemm_fp8``. The remaining rows (``fused_triton``,
+#: while the config said ``deepgemm``. The remaining rows (``fused_triton``,
 #: ``fused_quack``, ``fused_npu``, ``fused_mlu``, ``eager``) do bf16 math and
-#: ignore ``expert_dtype``, so falling back changes nothing for them.
-QUANTIZING_IMPLS = frozenset({"qat", "deepgemm_fp8"})
-
-
-def reject_quantizing_act_fn(owner: nn.Module) -> None:
-    """Raise when a non-SwiGLU activation would bypass a quantizing ``moe_experts`` row.
-
-    Every fused row bakes SiLU into both directions -- ``standard/triton.py`` calls
-    ``aten.silu`` in the forward and ``aten.silu_backward`` in the backward, and the
-    TileLang ``qat`` rows have the same structure -- so an activation outside
-    ``{"silu", "swish"}`` has no fused row and falls back to
-    ``merged_experts_act_fn_forward``, which loops over experts in Python and cannot
-    reach the family row.
-
-    Call this on that fallback. Refusing keeps a quantizing selection from training
-    the routed experts at full precision while the config claims otherwise. Support
-    for other activations is tracked in #1430.
-
-    The activation is read from ``owner.use_swiglu`` rather than a config:
-    ``DeepseekV3Experts`` and its siblings are plain ``nn.Module`` objects that
-    record the answer at construction and hold no config reference.
-
-    Args:
-        owner: The experts module that owns the ``veomni_moe`` handle and carries
-            ``use_swiglu``.
-
-    Raises:
-        ValueError: when the selection quantizes and the activation is not SwiGLU.
-    """
-    if getattr(owner, "use_swiglu", True):
-        return
-    handle = getattr(owner, "veomni_moe", None)
-    impl = getattr(handle, "impl", None)
-    if impl not in QUANTIZING_IMPLS:
-        return
-    raise ValueError(
-        f"moe_implementation={impl!r} cannot run with a non-SwiGLU activation: every `moe_experts` row "
-        "with a fused kernel implements SwiGLU only, in both forward and backward, so these routed "
-        "experts would train through the Python act_fn loop and round nothing. Use hidden_act='silu' "
-        "to quantize them, or moe_implementation='eager' to train them in the model dtype."
-    )
+#: ignore ``dtype``, so falling back changes nothing for them.
+QUANTIZING_IMPLS = frozenset({"qat", "deepgemm"})
 
 
 register_op(
@@ -182,7 +143,7 @@ register_op(
 register_op(
     "moe_experts",
     "standard",
-    "deepgemm_fp8",
+    "deepgemm",
     description="DeepGEMM blockwise FP8 expert forward, input gradients and weight gradients",
     wrapper=standard_deepgemm.wrapper,
     requirement=GpuKernelRequirement(
@@ -217,4 +178,24 @@ register_op(
     wrapper=gpt_oss_quack.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("quack",),
+)
+
+
+register_op(
+    "moe_experts",
+    "kimi_k3",
+    "eager",
+    description="PyTorch routed SituGLU MoE experts (Kimi K3)",
+    wrapper=kimi_k3_eager.wrapper,
+)
+
+register_op(
+    "moe_experts",
+    "kimi_k3",
+    "fused_npu",
+    description="NPU group-GEMM situ fused MoE experts (Kimi K3 SituGLU, EP-aware)",
+    wrapper=kimi_k3_fused_npu.wrapper,
+    requirement=NpuKernelRequirement(),
+    requires=("triton",),
+    default=True,
 )

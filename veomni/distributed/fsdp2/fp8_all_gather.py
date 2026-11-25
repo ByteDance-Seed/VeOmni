@@ -20,7 +20,7 @@ class _ExpertAllGather:
         self.shard_dim = shard_dim
 
     def pre(self, local, mesh, outer_size, outer_stride, module, mp_policy):
-        from ...ops.kernels.moe_experts.shared.deepgemm_fp8 import quantize_weights
+        from ...ops.kernels.moe_experts.shared.deepgemm import quantize_weights
 
         qdata, scale, _, _ = quantize_weights(local, store_transpose=False, round_bf16=True)
         gathered = scale.new_empty((mesh.size(), *scale.shape))
@@ -57,7 +57,7 @@ def _deepgemm_experts(model):
     return (
         (name, module)
         for name, module in model.named_modules()
-        if getattr(getattr(module, "veomni_moe", None), "impl", None) == "deepgemm_fp8"
+        if getattr(getattr(module, "veomni_moe", None), "impl", None) == "deepgemm"
     )
 
 
@@ -90,18 +90,6 @@ def register_deepgemm_fp8_all_gather(model: torch.nn.Module) -> int:
     """
     selected = {}
     for name, module in _deepgemm_experts(model):
-        # ``use_swiglu`` records whether the activation is SwiGLU
-        # (``config.hidden_act in {"silu", "swish"}``). Every ``moe_experts`` fused
-        # row bakes ``aten.silu`` into both its forward and backward, so another
-        # activation makes the experts fall back to ``merged_experts_act_fn_forward``:
-        # a Python loop with no merged 3-D expert layout for this hook to gather.
-        # Hence the check reads the experts module rather than a config -- only the
-        # module records the answer.
-        if not getattr(module, "use_swiglu", True):
-            raise ValueError(
-                f"FP8 all-gather requires SwiGLU experts, but {name} configures an activation "
-                "outside {'silu', 'swish'} and therefore never reaches the DeepGEMM row."
-            )
         params = list(module.named_parameters(recurse=False))
         if len(params) != 2 or any(p.ndim != 3 for _, p in params):
             raise ValueError(f"FP8 all-gather requires two merged expert weights: {name}.")

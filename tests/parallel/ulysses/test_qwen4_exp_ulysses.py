@@ -40,7 +40,7 @@ pytestmark = [pytest.mark.qwen4_exp_ulysses]
 if not IS_CUDA_AVAILABLE:
     pytest.skip("Qwen4-Exp Ulysses tests require CUDA", allow_module_level=True)
 
-_PATCHED_MODULE = "veomni.models.transformers.qwen4_exp.generated.patched_modeling_qwen4_exp_gpu"
+_PATCHED_MODULE = "veomni.models.transformers.qwen4_exp.modeling_qwen4_exp"
 _TOY_CONFIG = "tests/toy_config/qwen4_exp_toy"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 

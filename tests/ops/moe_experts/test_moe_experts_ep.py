@@ -624,7 +624,7 @@ def test_fused_moe_routing_weights_match_ep_projection_order(swiglu_limit: float
     )
 
 
-def _distributed_standard_ep_worker(rank, merged, endpoint):
+def _distributed_standard_ep_worker(rank, merged, activation, impl, endpoint):
     """Compare real token exchange and every gradient with a non-EP replica."""
     import torch.distributed as dist
 
@@ -662,12 +662,38 @@ def _distributed_standard_ep_worker(rank, merged, endpoint):
         reference_routing = routing.detach().clone().requires_grad_()
         actual_routing = routing.detach().clone().requires_grad_()
         empty = torch.empty(0, device=device, dtype=torch.bfloat16)
-        fused = resolve_op("moe_experts", "standard", "fused_triton").wrapper
+        # ``impl`` is the row under test. ``eager`` matters most here: it is what a
+        # fused row hands a non-Swish activation to, and it is where the decision to
+        # take the dispatching path lives.
+        fused = resolve_op("moe_experts", "standard", impl).wrapper
 
         def forward(x, weights, scores):
+            # ``activation`` is what makes this test exercise the EP dispatch at all:
+            # `fused_triton` evaluates the activation itself, and the sharded weights
+            # must reach the EP Functions rather than be indexed by global id.
             if merged:
-                return fused(x, scores, routes, empty, empty, weights[1], weights[0], num_experts=experts)
-            return fused(x, scores, routes, weights[0], weights[1], weights[2], empty, num_experts=experts)
+                return fused(
+                    x,
+                    scores,
+                    routes,
+                    empty,
+                    empty,
+                    weights[1],
+                    weights[0],
+                    num_experts=experts,
+                    activation=activation,
+                )
+            return fused(
+                x,
+                scores,
+                routes,
+                weights[0],
+                weights[1],
+                weights[2],
+                empty,
+                num_experts=experts,
+                activation=activation,
+            )
 
         nonep_state = _init_parallel_state(dp_size=world, device_type=get_device_type(), name="schedule_nonep")
         ep_state = _init_parallel_state(
@@ -705,10 +731,72 @@ def _distributed_standard_ep_worker(rank, merged, endpoint):
 
 
 @pytest.mark.launch_plan(provider=_EP_DISPATCH_PLAN)
+# The rows this CUDA suite can reach. `fused_npu` and `fused_mlu` need their own
+# accelerators, and `deepgemm` needs SM90 plus its own distributed test
+# (`test_deepgemm_distributed.py`), so none of them appear here.
+#
+# `fused_quack` is listed for its SiLU cases only: `quack.wrapper` hands any other
+# activation to the `eager` row, so a `gelu` case labelled `fused_quack` would
+# actually run `eager`'s EP path. The ids say which is which.
+@pytest.mark.parametrize(
+    "impl",
+    ["eager", "fused_triton", "fused_quack"],
+    ids=["eager", "fused_triton", "fused_quack"],
+)
+@pytest.mark.parametrize("activation", ["silu", "gelu"], ids=["silu", "gelu"])
 @pytest.mark.parametrize("merged", [False, True], ids=["split-fc1", "merged-fc1"])
-def test_distributed_standard_ep_dispatch_matches_nonep(merged):
-    """Exercise the compact expert schedule behind real all-to-all dispatch."""
+def test_distributed_standard_ep_dispatch_matches_nonep(request, merged, activation, impl):
+    if impl == "fused_quack":
+        # ``fused_quack`` delegates a non-SiLU activation to the reference row, so only
+        # its SiLU cases exercise quack's own EP path.
+        if activation != "silu":
+            request.node.add_marker(pytest.mark.skip(reason="non-SiLU leaves fused_quack for eager"))
+    """Exercise the compact expert schedule behind real all-to-all dispatch.
+
+    Parametrized over the activation because that is where the dispatch was lost:
+    `gelu` is inside `SUPPORTED_ACTIVATIONS`, so a guard that keyed only on "is this
+    name served?" sent it down the inline expert loop -- which builds its mask from
+    the *global* expert count and then indexes a per-rank shard. A SiLU-only test
+    cannot see that, and ``rtol=0`` against the non-EP replica is what makes the
+    difference visible rather than a plausibility check.
+    """
     _skip_if_unsupported()
+    if impl == "fused_quack" and not is_quack_gemm_available():
+        pytest.skip("the fused_quack row needs the quack package")
     if runner_device_count() < _EP_DISPATCH_PLAN.nproc:
         pytest.skip("Distributed EP dispatch requires its declared accelerator plan")
-    spawn_with_rendezvous(_distributed_standard_ep_worker, args=(merged,), nprocs=_EP_DISPATCH_PLAN.nproc)
+    spawn_with_rendezvous(
+        _distributed_standard_ep_worker, args=(merged, activation, impl), nprocs=_EP_DISPATCH_PLAN.nproc
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_the_spawned_ep_worker_is_called_with_all_of_its_arguments():
+    """The spawn call must supply every worker parameter but `rank` and `endpoint`.
+
+    `spawn_with_rendezvous` binds `rank` first and appends `endpoint`, so the explicit
+    `args` tuple has to cover everything between. Giving the worker a new parameter
+    without widening that tuple produces a `TypeError` inside a spawned process on a
+    GPU box -- two cards burnt to learn what a signature comparison shows on CPU. It
+    happened once already, when the `impl` axis was added.
+    """
+    import ast
+    import inspect
+
+    parameters = list(inspect.signature(_distributed_standard_ep_worker).parameters)
+    assert parameters[0] == "rank"
+    assert parameters[-1] == "endpoint"
+
+    tree = ast.parse(inspect.getsource(test_distributed_standard_ep_dispatch_matches_nonep))
+    call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and "spawn_with_rendezvous" in ast.unparse(node.func)
+    )
+    explicit = next(keyword.value for keyword in call.keywords if keyword.arg == "args")
+    supplied = 1 + len(explicit.elts) + 1
+
+    assert supplied == len(parameters), (
+        f"spawn passes {supplied} arguments to a worker that takes {len(parameters)}: {parameters}. "
+        f"`args` covers everything between `rank` and `endpoint`."
+    )

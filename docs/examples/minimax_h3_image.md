@@ -28,6 +28,9 @@ MiniMax-H3-Image/
 
 ## Text-to-image
 
+The pipeline requires `audio_enabled=False` (the default). An
+`audio_enabled=True` transformer override is rejected before loading weights.
+
 ```python
 import torch
 from veomni.models.diffusers.minimax_h3_image.inference import MiniMaxH3ImagePipeline

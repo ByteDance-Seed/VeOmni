@@ -21,7 +21,15 @@ from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 
 from ..minimax_h3_core.batch_packing import pack_samples
 from ..minimax_h3_core.core import bind_minimax_attention, is_flash_attn_impl
-from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3Attention, MiniMaxH3DiT, unpack_audio, unpatchify_video
+from ..minimax_h3_core.minimax_h3_dit import (
+    MiniMaxH3Attention,
+    MiniMaxH3DiT,
+    MiniMaxH3FP32Linear,
+    MiniMaxH3PDDHeads,
+    MiniMaxH3StandaloneFP32Linear,
+    unpack_audio,
+    unpatchify_video,
+)
 from ..minimax_h3_core.training_objectives import cfg_calibrated_mse
 from .configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 
@@ -60,17 +68,35 @@ class MiniMaxH3DiTModel(PreTrainedModel):
     config_class = MiniMaxH3DiTModelConfig
     supports_gradient_checkpointing = True
     _supports_sdpa = True
-    _no_split_modules = ["MiniMaxH3DiTBlock"]
-
+    # MiniMaxH3DiT is listed so FSDP2 scans its root-level FP32 projections.
+    _no_split_modules = ["MiniMaxH3DiTBlock", "MiniMaxH3DiT"]
+    _activation_offload_target_classes = ["MiniMaxH3DiTBlock"]
     _checkpoint_conversion_mapping = {"^": "dit."}
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Report the backbone dtype to HF, independently of the FP32 projections."""
+        return next(self.dit.condition_proj.parameters()).dtype
 
     def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
         # Attention validates and binds its backend on the first forward.
         return attn_implementation
 
+    def get_ignore_modules_in_mixed_precision(self):
+        """Shard the official FP32 projections without FSDP parameter casting.
+
+        FSDP2 calls this hook, so it also rejects LoRA on those projections.
+        """
+        from .....lora.layers import LoraLinear
+
+        for module in self.dit.modules():
+            if isinstance(module, LoraLinear) and isinstance(module.base_layer, MiniMaxH3FP32Linear):
+                raise NotImplementedError("H3 does not support LoRA on its FP32 projections.")
+        return (MiniMaxH3StandaloneFP32Linear, MiniMaxH3PDDHeads)
+
     def __init__(self, config: MiniMaxH3DiTModelConfig, **kwargs):
         super().__init__(config)
-        # HF's marker. The DiT declares its own, so the enable reaches its block loop too.
+        # HF's marker; each DiT block owns its checkpoint boundary.
         self.gradient_checkpointing = False
         self.dit = MiniMaxH3DiT(
             num_layers=config.num_layers,
@@ -98,6 +124,27 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         )
 
         self._configure_packed_attention(config.ops_config.attn_implementation)
+        # Use the same HF initialization and loading lifecycle for CPU and meta construction.
+        self.post_init()
+
+    @torch.no_grad()
+    def _init_weights(self, module):
+        # Keep the native initialization recipe. HF guards already-loaded tensors when filling missing keys.
+        if isinstance(module, torch.nn.Linear):
+            module.reset_parameters()
+        else:
+            super()._init_weights(module)
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None, every_n_layers: int = 1) -> None:
+        """Enable checkpointing that preserves gradients for keyword block inputs."""
+        checkpoint_kwargs = dict(gradient_checkpointing_kwargs or {})
+        if checkpoint_kwargs.get("use_reentrant"):
+            raise ValueError(
+                "MiniMax-H3 does not support reentrant checkpointing with differentiable keyword inputs. "
+                "Set model.accelerator.gradient_checkpointing.enable_reentrant=False."
+            )
+        checkpoint_kwargs["use_reentrant"] = False
+        super().gradient_checkpointing_enable(checkpoint_kwargs, every_n_layers=every_n_layers)
 
     def freeze_model(self) -> None:
         """Freeze the released output heads in the H3-Image training recipe."""
@@ -155,39 +202,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             loss=losses,
         )
 
-    def forward_image(
-        self,
-        x,
-        prompt_embeds,
-        unique_timesteps,
-        timestep_indices,
-        token_tags,
-        position_ids,
-        image_indices,
-        text_indices,
-        pdd_step_index=None,
-        packed_seq_params=None,
-        refiner_packed_seq_params=None,
-    ):
-        """Adapt the H3-Image inference API to the ordinary forward, preserving the raw velocity sign."""
-        if self.config.audio_enabled:
-            raise ValueError("MiniMax-H3-Image requires a transformer with audio_enabled=False.")
-        output = self(
-            x=x.squeeze(0) if x.dim() == 3 else x,
-            prompt_embeds=prompt_embeds.squeeze(0) if prompt_embeds.dim() == 3 else prompt_embeds,
-            unique_timesteps=unique_timesteps,
-            inverse_indices=timestep_indices,
-            token_tags=token_tags,
-            img_position_ids=position_ids.unsqueeze(0),
-            img_pos_info={"position_ids": image_indices},
-            text_pos_info={"position_ids": text_indices},
-            img_pos_for_infer_output_info={"position_ids": image_indices},
-            pdd_step_index=pdd_step_index,
-            packed_seq_params=packed_seq_params,
-            refiner_packed_seq_params=refiner_packed_seq_params,
-        )
-        return -output.predictions[0]
-
     def forward(
         self,
         x=None,
@@ -208,16 +222,21 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         training_target_audio=None,
         video_latent_shape=None,
         audio_latent_shape=None,
-        *,
+        timestep_indices=None,
+        position_ids=None,
+        image_indices=None,
+        text_indices=None,
         pdd_step_index=None,
+        *,
         num_pdd_heads=None,
         image_loss_weight=None,
         **kwargs,
-    ) -> MiniMaxH3DiTOutput:
-        """Forward pass with unpatchify + negation + internal loss computation.
+    ) -> MiniMaxH3DiTOutput | torch.Tensor:
+        """Run the shared H3 backbone for image and audio/video inputs.
 
-        Accepts all keys from condition_model.process_condition().
-        Pops training_target* internally (not via trainer) and computes MSE loss.
+        Image inference passes ``position_ids`` and returns raw velocity rows.
+        Condition-model inputs pass ``img_position_ids`` and return predictions
+        with the training sign and an optional MSE loss.
 
         video_latent_shape: (T_v, latent_h//2, latent_w//2) for unpatchify_video
         audio_latent_shape: (audio_channel, T_a) for unpack_audio
@@ -261,6 +280,16 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             if len(samples) == 1:
                 return self.forward(**samples[0])
             return self._forward_batch(samples)
+
+        image_inference = not self.config.audio_enabled and position_ids is not None
+        if image_inference:
+            x = x.squeeze(0) if x.dim() == 3 else x
+            prompt_embeds = prompt_embeds.squeeze(0) if prompt_embeds.dim() == 3 else prompt_embeds
+            inverse_indices = timestep_indices
+            img_position_ids = position_ids.unsqueeze(0)
+            img_pos_info = {"position_ids": image_indices}
+            text_pos_info = {"position_ids": text_indices}
+            img_pos_for_infer_output_info = img_pos_info
 
         skip_mask_out_condition = kwargs.pop("skip_mask_out_condition", False)
         cond_rows = kwargs.pop("cond_rows", 0)
@@ -313,6 +342,8 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             pdd_step_index=pdd_step_index,
         )
 
+        if image_inference:
+            return video_tokens
         return self._finish_outputs(
             video_tokens,
             audio_tokens,

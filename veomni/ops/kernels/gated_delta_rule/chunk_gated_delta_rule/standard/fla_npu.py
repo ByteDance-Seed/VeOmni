@@ -14,7 +14,7 @@
 
 """standard chunk_gated_delta_rule AscendC pair.
 
-Uses the stable ``fla_npu.ops.ascendc`` GDN forward/backward pair on A3/A5.
+Uses the stable ``fla_npu.ops.ascendc`` GDN forward/backward pair on Atlas A3 training products/Ascend 950PR&950DT products.
 The library selects arch22/arch35; this adapter uses their common BF16,
 K=V=128, chunk_size=64 contract. Forward can use the Phase6 fused kernel;
 backward is a composite ACLNN executor, not a single fused kernel.
@@ -26,6 +26,7 @@ intermediate arithmetic and reciprocal norms. QKV are materialized in BNSD.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 from torch import Tensor
@@ -129,6 +130,17 @@ def _prepare_chunk_indices_list(cu_seqlens: list[int] | Tensor, chunk_size: int)
     return indices
 
 
+@lru_cache(maxsize=8)
+def _chunk_indices_table(cu_seqlens: tuple[int, ...], chunk_size: int) -> tuple[int, ...]:
+    """Cache the host chunk-index table across the layers of one forward pass.
+
+    Keyed on the integer boundaries, never on the tensor: ``Tensor.__hash__``
+    is id-based, so a tensor key would hit for every layer while pinning device
+    memory and going cold whenever the caller rebuilds the tensor.
+    """
+    return tuple(_prepare_chunk_indices_list(list(cu_seqlens), chunk_size))
+
+
 def _as_int_list(value: list[int] | Tensor | None) -> list[int] | None:
     """Normalize an optional integer tensor or sequence to a Python list."""
     if value is None:
@@ -194,7 +206,7 @@ def _ensure_varlen_metadata(
     list_indices = _as_chunk_list_dict(chunk_indices_list, chunk_size)
     key = str(chunk_size)
     if list_indices.get(key) is None:
-        list_indices[key] = _prepare_chunk_indices_list(cu_seqlens_list, chunk_size)
+        list_indices[key] = list(_chunk_indices_table(tuple(cu_seqlens_list), chunk_size))
     return cu_seqlens, cu_seqlens_list, tensor_indices, list_indices
 
 
@@ -263,7 +275,7 @@ def _get_gdn_ops():
 
 
 def _validate_gdn_contract(q: Tensor, k: Tensor, v: Tensor, chunk_size: int, initial_state: Tensor | None):
-    """Reject inputs outside the common A3/A5 complete forward/backward domain."""
+    """Reject inputs outside the common Atlas A3 training products/Ascend 950PR&950DT products complete forward/backward domain."""
     if any(x.dtype != torch.bfloat16 for x in (q, k, v)):
         raise ValueError("fla_npu GDN on A3/A5 requires bfloat16 q/k/v.")
     if any(x.shape[-1] != 128 for x in (q, k, v)) or chunk_size != 64:
@@ -389,6 +401,11 @@ def forward(
     ``initial_state`` and ``output_final_state=True`` with trainable inputs
     are rejected. Extra NPU varlen tables are accepted; missing
     host chunk tables are filled from ``cu_seqlens`` without device uploads.
+    Grouped value attention is supported natively: ``q``/``k`` may have fewer
+    heads than ``v``, with ``Hv/Hk`` an integer in ``{1, 2, 3, 4}``, and
+    ``g``/``beta`` stay in value-head space. Grouped value heads require a
+    v26.9.1+ build that ships both AscendC GDN entries; the A2/A3 installs in
+    ``docs/examples/qwen3_5.md`` pin the v26.10 line.
     """
     from ...vendor.triton.utils import input_guard
 
@@ -413,13 +430,24 @@ def forward(
         raise ValueError("g and beta must be rank-3 tensors with shape [B, T, H].")
     if query_h.ndim != 4 or key_h.ndim != 4 or value_h.ndim != 4:
         raise ValueError("q, k and v must be rank-4 tensors with shape [B, H, T, D] after layout convert.")
-    if query_h.shape[:3] != key_h.shape[:3] or query_h.shape[:3] != value_h.shape[:3]:
-        raise ValueError(f"q/k/v shape prefixes must match, got {query_h.shape}, {key_h.shape}, {value_h.shape}.")
+    if query_h.shape[:3] != key_h.shape[:3]:
+        raise ValueError(f"q/k shape prefixes must match, got {query_h.shape}, {key_h.shape}.")
+    if value_h.shape[0] != query_h.shape[0] or value_h.shape[2] != query_h.shape[2]:
+        raise ValueError(f"q/k/v batch and sequence dims must match, got {query_h.shape}, {value_h.shape}.")
+    key_heads, value_heads = query_h.shape[1], value_h.shape[1]
+    # The composite backward rejects Hv/Hk outside [1, 4]; refuse it here rather
+    # than surfacing an operator error after the forward has already run.
+    if value_heads % key_heads != 0 or value_heads // key_heads > 4:
+        raise ValueError(
+            "value head count must be 1-4x the q/k head count (grouped value attention), "
+            f"got q/k={key_heads}, v={value_heads}."
+        )
     if g.shape != beta.shape:
         raise ValueError(f"g and beta shapes must match, got {g.shape} and {beta.shape}.")
-    if g.shape[0] != query_h.shape[0] or g.shape[1] != query_h.shape[2] or g.shape[2] != query_h.shape[1]:
+    if g.shape[0] != value_h.shape[0] or g.shape[1] != value_h.shape[2] or g.shape[2] != value_h.shape[1]:
         raise ValueError(
-            f"Expected q/k/v in [B, T, H, D] and g/beta in [B, T, H]; got q={tuple(query.shape)}, g={tuple(g.shape)}."
+            f"Expected q/k in [B, T, Hk, D], v in [B, T, Hv, D] and g/beta in [B, T, Hv]; "
+            f"got q={tuple(query.shape)}, v={tuple(value.shape)}, g={tuple(g.shape)}."
         )
     if chunk_size <= 0 or chunk_size & (chunk_size - 1):
         raise ValueError(f"chunk_size must be a power of 2, got {chunk_size}.")

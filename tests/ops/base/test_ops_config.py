@@ -59,7 +59,7 @@ def test_unweighted_rms_norm_rejects_unregistered_backend(monkeypatch, impl):
 def test_deepgemm_experts_coexist_with_quantizing_gemm_families(monkeypatch, parse_config, field):
     """A DeepGEMM expert GEMM and a quantizing dense family round different operands.
 
-    ``deepgemm_fp8`` and ``qat`` are two values of the same ``moe_implementation``
+    ``deepgemm`` and ``qat`` are two values of the same ``moe_implementation``
     field, so the routed experts can never be quantized twice. The shared expert
     (``gated_mlp``) and the attention projections (``linear``) are separate dense
     GEMMs, so quantizing them alongside is a valid recipe -- and a useful one, since
@@ -75,12 +75,12 @@ def test_deepgemm_experts_coexist_with_quantizing_gemm_families(monkeypatch, par
     monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
     monkeypatch.setattr("torch.version.hip", None)
 
-    values = {"moe_implementation": "deepgemm_fp8", field: "qat"}
+    values = {"moe_implementation": "deepgemm", field: "qat"}
     config = (
         _instantiate_recursive(OpsImplementationConfig, values) if parse_config else OpsImplementationConfig(**values)
     )
 
-    assert config.moe_implementation == "deepgemm_fp8"
+    assert config.moe_implementation == "deepgemm"
     assert getattr(config, field) == "qat"
 
 
@@ -88,9 +88,9 @@ def test_deepgemm_experts_coexist_with_quantizing_gemm_families(monkeypatch, par
 @pytest.mark.parametrize(
     "values",
     [
-        {"moe_implementation": "deepgemm_fp8"},
-        {"moe_implementation": "deepgemm_fp8", "linear_implementation": "eager"},
-        {"moe_implementation": "deepgemm_fp8", "linear_implementation": "torchao_mxfp4"},
+        {"moe_implementation": "deepgemm"},
+        {"moe_implementation": "deepgemm", "linear_implementation": "eager"},
+        {"moe_implementation": "deepgemm", "linear_implementation": "torchao"},
         {"moe_implementation": None, "linear_implementation": "qat"},
         {"moe_implementation": "eager", "linear_implementation": "qat"},
         {"moe_implementation": "fused_triton", "linear_implementation": "qat"},
@@ -110,9 +110,9 @@ def test_deepgemm_qat_guard_preserves_valid_selections(monkeypatch, values):
     monkeypatch.setattr("torch.version.hip", None)
 
     config = OpsImplementationConfig(**values)
+
     assert config.moe_implementation == values["moe_implementation"]
-    expected = values.get("linear_implementation")
-    assert config.linear_implementation == expected
+    assert config.linear_implementation == values.get("linear_implementation")
 
 
 def test_upstream_llama_config_ops_config_save_and_reload(tmp_path):
@@ -967,7 +967,7 @@ def test_direct_model_validates_final_ops_before_hf_initialization(monkeypatch, 
     from tests.tools.training_utils import make_eager_ops_config
     from veomni.models.diffusers.ltx2_3.ltx_transformer.modeling_ltx2_3_transformer import LTXVideoTransformerModel
     from veomni.models.transformers.flux.modeling_flux import FluxModel
-    from veomni.models.transformers.llama.generated.patched_modeling_llama_gpu import LlamaForCausalLM
+    from veomni.models.transformers.llama.modeling_llama import LlamaForCausalLM
 
     monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", True)
     monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
@@ -1102,3 +1102,41 @@ def test_current_selections_are_untouched_by_the_migration():
     selections = {"linear_implementation": "qat", "kv_round_implementation": "triton"}
     assert migrate_retired_selections(selections) == selections
     assert migrate_retired_selections({"gated_mlp_implementation": "qat"}) == {"gated_mlp_implementation": "qat"}
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_ops_config_refreshes_on_nested_kwargs_and_override_mutations(monkeypatch):
+    """Mutating nested ``kwargs`` or ``overrides`` in ``ops_implementation`` invalidates ``ops_config``."""
+    from transformers import Qwen3Config
+
+    from veomni.models.configuration_base import as_veomni_config
+
+    monkeypatch.setattr("veomni.utils.device.IS_NPU_AVAILABLE", False)
+    monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: False)
+
+    config = as_veomni_config(
+        Qwen3Config(
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            intermediate_size=64,
+            ops_implementation={
+                "linear_implementation": {
+                    "name": "torchao",
+                    "kwargs": {"dtype": "nvfp4"},
+                    "overrides": [{"site": r"layers\.0\.q_proj", "name": "eager"}],
+                }
+            },
+        )
+    )
+    assert config.ops_config.linear_implementation.resolve("layers.1.q_proj") == ("torchao", {"dtype": "nvfp4"})
+    assert config.ops_config.linear_implementation.resolve("layers.0.q_proj") == ("eager", {})
+
+    config.ops_implementation["linear_implementation"]["kwargs"]["dtype"] = "mxfp4"
+    assert config.ops_config.linear_implementation.resolve("layers.1.q_proj") == ("torchao", {"dtype": "mxfp4"})
+
+    config.ops_implementation["linear_implementation"]["overrides"][0]["name"] = "torchao"
+    assert config.ops_config.linear_implementation.resolve("layers.0.q_proj") == ("torchao", {"dtype": "mxfp4"})
+    assert "mxfp4" in config.to_json_string()

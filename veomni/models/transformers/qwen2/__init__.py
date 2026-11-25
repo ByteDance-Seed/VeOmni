@@ -19,7 +19,7 @@ from veomni.models.registry import MODELING_REGISTRY
 
 @MODELING_REGISTRY.register("qwen2")
 def register_qwen2_modeling(architecture: str | None):
-    from .generated.patched_modeling_qwen2_gpu import (
+    from .modeling_qwen2 import (
         Qwen2ForCausalLM,
         Qwen2ForQuestionAnswering,
         Qwen2ForSequenceClassification,
