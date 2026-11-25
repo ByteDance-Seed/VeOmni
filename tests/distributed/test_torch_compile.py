@@ -117,7 +117,7 @@ def _run_merged_swiglu_compiled_first_case(entrypoint, dtype_name, swiglu_limit)
 
             # Run the reference only after compiled forward and backward finish.
             original = swiglu.merged_swiglu_forward
-            swiglu.merged_swiglu_forward = lambda gate, up: torch.ops.aten.silu(gate) * up
+            swiglu.merged_swiglu_forward = lambda gate, up, alpha=None: torch.ops.aten.silu(gate) * up
             try:
                 expected = forward(*reference_inputs)
             finally:
