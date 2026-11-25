@@ -303,6 +303,7 @@ def _build_with_indexer_objective(
     indexer_loss: bool = True,
     coef: float = 1.0,
     implementation: str = "tilelang",
+    attention_implementation: str | None = None,
 ) -> int:
     """Run ``build_foundation_model`` with the KL objective on the config and its kernels on the ops config."""
     monkeypatch.setattr(
@@ -311,7 +312,7 @@ def _build_with_indexer_objective(
     monkeypatch.setattr(auto, "get_loader", lambda config: loader)
     ops = eager_ops_config()
     ops.dsa_indexer_implementation = implementation
-    ops.dsa_attention_implementation = implementation
+    ops.dsa_attention_implementation = implementation if attention_implementation is None else attention_implementation
     config = auto.build_config(str(_TOY_CONFIG_DIR / toy), dsa_indexer_loss=indexer_loss, dsa_indexer_loss_coef=coef)
 
     auto.build_foundation_model(config_path=config, init_device="meta", ops_implementation=ops)
@@ -325,8 +326,28 @@ def test_unsupported_indexer_objective_is_refused_before_the_model_is_built(monk
     assert loader.calls == 0, "the refusal must come before the model is constructed"
 
 
-def test_supported_indexer_objective_builds(monkeypatch: pytest.MonkeyPatch):
-    assert _build_with_indexer_objective(monkeypatch, "deepseek_v4_toy", _StubLoader()) == 1
+@pytest.mark.parametrize("implementation", ("tilelang", "triton"))
+def test_supported_indexer_objective_builds(monkeypatch: pytest.MonkeyPatch, implementation: str):
+    assert (
+        _build_with_indexer_objective(monkeypatch, "deepseek_v4_toy", _StubLoader(), implementation=implementation)
+        == 1
+    )
+
+
+@pytest.mark.parametrize(("indexer", "attention"), (("tilelang", "triton"), ("triton", "tilelang")))
+def test_mixed_indexer_objective_backends_are_refused_before_model_build(
+    monkeypatch: pytest.MonkeyPatch, indexer: str, attention: str
+):
+    loader = _StubLoader()
+    with pytest.raises(ValueError, match="matched DSA backend pair"):
+        _build_with_indexer_objective(
+            monkeypatch,
+            "deepseek_v4_toy",
+            loader,
+            implementation=indexer,
+            attention_implementation=attention,
+        )
+    assert loader.calls == 0
 
 
 def test_disabled_indexer_objective_admits_eager_kernels(monkeypatch: pytest.MonkeyPatch):
