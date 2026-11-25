@@ -1075,6 +1075,17 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
                 padded_mask_after_cnn.sum(1).cumsum(0),
             )
         ).to(torch.int32)
+        # ``chunk_lengths`` is already read back as a host list for the split above,
+        # so the varlen segment lengths — and their maximum — are known here without
+        # a device read. Each chunk's after-conv length is ``(L - 1) // 2 + 1``:
+        # ``conv1`` keeps the length and ``conv2`` has stride 2.
+        #
+        # Forwarding this keeps the per-layer attention off
+        # ``(cu_seqlens[1:] - cu_seqlens[:-1]).max()``, a device tensor that
+        # FlashAttention turns into a Python int with ``.item()``. That ``.item()``
+        # is an unconditional sync: the compiled forward measured 1.70ms with it
+        # against 0.30ms without, because it stalls every kernel enqueued before it.
+        max_seqlen = max((length - 1) // 2 + 1 for length in chunk_lengths.tolist())
         # --- Patch.3 ---
         if get_parallel_state().sp_enabled:
             unpadded_dim_len = cu_seqlens[-1]
@@ -1086,6 +1097,9 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
                 # samples on the last rank.
                 new_cumsum = cu_seqlens[-1] + pad_seq_len
                 cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
+                # The padded tail becomes its own segment, so the host maximum has to
+                # account for it exactly as the layer's fallback would.
+                max_seqlen = max(max_seqlen, pad_seq_len.item())
         # --- Patch.3 ---
 
         for encoder_layer in self.layers:
@@ -1099,9 +1113,14 @@ class Qwen2_5OmniAudioEncoder(Qwen2_5OmniPreTrainedModel):
             # ``attention_interface(..., attention_mask=None, ..., **kwargs)``,
             # raising ``TypeError: got multiple values for keyword argument
             # 'attention_mask'``.
+            # The layer forwards ``**kwargs`` straight to attention, so a caller
+            # that already put ``max_seqlen`` there would collide with the explicit
+            # argument below.
+            kwargs.pop("max_seqlen", None)
             layer_outputs = encoder_layer(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
