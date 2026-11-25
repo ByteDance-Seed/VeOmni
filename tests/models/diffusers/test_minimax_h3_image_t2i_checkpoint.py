@@ -19,6 +19,7 @@ from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition.configu
 from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition.modeling_minimax_h3_image_condition import (
     MiniMaxH3ImageConditionModel,
 )
+from veomni.models.diffusers.minimax_h3_image.pdd import DEFAULT_SIGMAS
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -139,6 +140,29 @@ def test_prepare_h3_image_checkpoint_rejects_pdd_schedule_mismatch(tmp_path, nat
     save_file({name: tensor[:-1] for name, tensor in pdd.items()}, model_dir / "pdd_fused_heads.safetensors")
     prepared = tmp_path / "prepared"
     with pytest.raises(ValueError, match="3 transitions but the checkpoint has 2 PDD heads"):
+        prepare_checkpoint(model_dir, prepared)
+    assert not prepared.exists()
+
+
+@pytest.mark.parametrize(
+    ("missing_file", "error_type"),
+    [(True, FileNotFoundError), (False, ValueError)],
+    ids=["missing-file", "missing-key"],
+)
+def test_prepare_h3_image_checkpoint_requires_explicit_pdd_sigmas(tmp_path, native_release, missing_file, error_type):
+    model_dir, _, pdd = native_release
+    num_heads = len(DEFAULT_SIGMAS) - 1
+    save_file(
+        {name: tensor[:1].expand(num_heads, *tensor.shape[1:]).contiguous() for name, tensor in pdd.items()},
+        model_dir / "pdd_fused_heads.safetensors",
+    )
+    pdd_config = model_dir / "pdd_config.json"
+    if missing_file:
+        pdd_config.unlink()
+    else:
+        pdd_config.write_text("{}")
+    prepared = tmp_path / "prepared"
+    with pytest.raises(error_type, match="pdd_config.json"):
         prepare_checkpoint(model_dir, prepared)
     assert not prepared.exists()
 

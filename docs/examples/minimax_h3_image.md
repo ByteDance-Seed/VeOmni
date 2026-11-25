@@ -74,13 +74,15 @@ Both paths sample fresh noise and timesteps. The 1,000-step training schedule us
 
 ### Prepare weights and data
 
-After downloading the release, prepare a training transformer directory. Preparation reads the number of heads from `pdd_fused_heads.safetensors` and the matching sampling schedule from `pdd_config.json`. The example YAMLs use the generated `condition.json` next to the transformer `config.json`. When updating a prepared checkpoint from an older recipe, prepare it again in a new directory and point the YAMLs at both generated configs. The original shards are linked by absolute path, not copied. Keep the release and its shards accessible at those paths on every training node.
+After downloading the release, prepare a training transformer directory. Preparation reads the number of heads from `pdd_fused_heads.safetensors` and requires an explicit, matching `sigmas` schedule in `pdd_config.json`. Only inference can fall back to the legacy schedule if it is missing. The original shards are linked by absolute path, not copied. Keep the release and its shards accessible at those paths on every training node.
 
 ```shell
 uv run python -m scripts.prepare_minimax_h3_image_t2i \
   --model-dir pretrained_models/MiniMax-H3-Image \
   --out-dir pretrained_models/MiniMax-H3-Image-t2i/transformer
 ```
+
+When migrating an older prepared checkpoint, prepare it again in a new directory. In both the online and offline training YAMLs, update `model.model_path` to that directory, `model.config_path` to its `config.json`, and `model.condition_model_path` to its `condition.json` together. The embedding YAML does not load the DiT weights; update only `model.config_path` and `model.condition_model_path` there.
 
 The example expects a CSV with `image,prompt` columns and paths relative to `data.mm_configs.data_dir`. The following pinned DiffSynth sample contains five images:
 

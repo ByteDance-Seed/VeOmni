@@ -26,8 +26,8 @@ def validate_pdd_sigmas(sigmas, num_pdd_heads: int | None = None) -> tuple[float
     return sigmas
 
 
-def load_pdd_release(model_dir: str | Path):
-    """Read the fused output heads and their sigma schedule from one release."""
+def load_pdd_release(model_dir: str | Path, *, require_sigmas: bool = False):
+    """Read fused heads and their schedule, optionally requiring explicit release metadata."""
     model_dir = Path(model_dir)
     state = load_file(model_dir / "pdd_fused_heads.safetensors", device="cpu")
     if state.keys() != {"video_out.weight", "video_out.bias"}:
@@ -37,6 +37,9 @@ def load_pdd_release(model_dir: str | Path):
         raise ValueError("PDD video_out.weight and video_out.bias must have matching head and output dimensions.")
     pdd_config_path = model_dir / "pdd_config.json"
     sigmas = DEFAULT_SIGMAS
-    if pdd_config_path.is_file():
-        sigmas = json.loads(pdd_config_path.read_text()).get("sigmas", DEFAULT_SIGMAS)
+    if require_sigmas or pdd_config_path.is_file():
+        pdd_config = json.loads(pdd_config_path.read_text())
+        if require_sigmas and "sigmas" not in pdd_config:
+            raise ValueError(f"{pdd_config_path} must define 'sigmas' to prepare a training checkpoint.")
+        sigmas = pdd_config.get("sigmas", DEFAULT_SIGMAS)
     return state, validate_pdd_sigmas(sigmas, weight.shape[0])

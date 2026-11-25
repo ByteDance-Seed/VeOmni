@@ -47,6 +47,7 @@ from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_vae.configuration
 from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_vae.modeling_minimax_h3_image_vae import (
     MiniMaxH3ImageVAE,
 )
+from veomni.models.diffusers.minimax_h3_image.pdd import DEFAULT_SIGMAS
 
 
 def _build_model() -> MiniMaxH3DiTModel:
@@ -655,7 +656,8 @@ def test_minimax_h3_image_edit_presentation_tags_picture_blocks():
     assert int((token_tags == 0).sum()) == 12
 
 
-def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch):
+@pytest.mark.parametrize("legacy_schedule", [False, True], ids=["explicit-sigmas", "legacy-fallback"])
+def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch, legacy_schedule):
     transformer_dir = tmp_path / "transformer"
     transformer_dir.mkdir()
     vae_dir = tmp_path / "vae_diffusers"
@@ -678,11 +680,14 @@ def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch):
         vae_dir / "diffusion_pytorch_model.safetensors",
     )
     vae.config.save_pretrained(vae_dir)
+    sigmas = DEFAULT_SIGMAS if legacy_schedule else (1.0, 0.5, 0.0)
+    num_heads = len(sigmas) - 1
     save_file(
-        {"video_out.weight": torch.randn(2, 96, 24), "video_out.bias": torch.randn(2, 96)},
+        {"video_out.weight": torch.randn(num_heads, 96, 24), "video_out.bias": torch.randn(num_heads, 96)},
         tmp_path / "pdd_fused_heads.safetensors",
     )
-    (tmp_path / "pdd_config.json").write_text(json.dumps({"sigmas": [1.0, 0.5, 0.0]}))
+    if not legacy_schedule:
+        (tmp_path / "pdd_config.json").write_text(json.dumps({"sigmas": sigmas}))
 
     class FakeTokenizer:
         def __call__(self, text, add_special_tokens=False):
@@ -723,6 +728,8 @@ def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch):
 
     monkeypatch.setattr(MiniMaxH3ImageConditionModel, "_init_encoders", fake_init)
     pipe = MiniMaxH3ImagePipeline.from_pretrained(str(tmp_path), torch_dtype=torch.bfloat16)
+    torch.testing.assert_close(pipe.scheduler.sigmas, torch.tensor(sigmas), rtol=0, atol=0)
+    assert len(pipe.dit.dit.final_layer.pdd_out) == num_heads
     assert pipe.dit.dit.video_patch_proj.weight.dtype == torch.float32
     assert pipe.dit.dit.time_embedder.proj_in.weight.dtype == torch.float32
     assert pipe.dit.dit.final_layer.video_out.weight.dtype == torch.float32

@@ -100,7 +100,7 @@ def prepare_checkpoint(model_dir: Path, out_dir: Path) -> None:
         or config.get("audio_enabled") is not False
     ):
         raise ValueError("Expected a native MiniMax-H3-Image transformer config (MiniMaxH3DiTModel without audio).")
-    pdd_state, sigmas = load_pdd_release(model_dir)
+    pdd_state, sigmas = load_pdd_release(model_dir, require_sigmas=True)
     num_pdd_heads = pdd_state["video_out.weight"].shape[0]
     condition_model_type = MiniMaxH3ImageConditionModelConfig.model_type
     config.update(
