@@ -332,7 +332,7 @@ def test_graph_matches_the_monolithic_forward(count):
     torch.testing.assert_close(graph, reference, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("attn_implementation", ["eager", "sdpa"])
+@pytest.mark.parametrize("attn_implementation", ["eager", "veomni_eager", "sdpa"])
 def test_packed_forward_matches_per_sample_forward(attn_implementation):
     """Packing must isolate samples: each keeps its own positions, fps and attention range."""
     mot = _modules(attn_implementation, accelerated=False)["cosmos3_mot"]

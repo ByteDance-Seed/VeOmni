@@ -32,7 +32,7 @@ class HunyuanVideo15Model(VeOmniPreTrainedModel):
     def __init__(self, config, attn_implementation=None, **kwargs):
         if attn_implementation is not None:
             config._attn_implementation = attn_implementation
-        if config._attn_implementation not in ("eager", "sdpa", "veomni_sdpa"):
+        if config._attn_implementation not in ("eager", "veomni_eager", "sdpa", "veomni_sdpa"):
             raise ValueError(
                 f"HunyuanVideo 1.5 currently supports dense SDPA only, got {config._attn_implementation!r}"
             )

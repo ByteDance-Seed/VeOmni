@@ -644,37 +644,6 @@ class KimiMLP(nn.Module):
         return down_proj
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Expand the key/value heads from `num_key_value_heads` to `num_attention_heads`."""
-    if n_rep == 1:
-        return hidden_states
-    return torch.repeat_interleave(hidden_states, dim=1, repeats=n_rep)
-
-
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
-):
-    key = repeat_kv(key, module.num_key_value_groups)
-    value = repeat_kv(value, module.num_key_value_groups)
-
-    scores = torch.einsum("bhqd,bhkd->bhqk", query, key) * scaling
-    if attention_mask is not None:
-        scores = scores + attention_mask[:, :, :, : key.shape[-2]]
-
-    probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
-    probs = F.dropout(probs, p=dropout, training=module.training)
-    out = torch.einsum("bhqk,bhkd->bhqd", probs, value).transpose(1, 2).contiguous()
-
-    return out, probs
-
-
 # ======================================================================
 # [MODIFIED CLASS] KimiMLAAttention
 # Methods patched: __init__, forward
@@ -1910,7 +1879,7 @@ class KimiLinearForCausalLM(KimiPreTrainedModel, GenerationMixin):
         _cu_seq_lens_q = fa_kwargs.get("cu_seq_lens_q")
         if _cu_seq_lens_q is not None and os.environ.get("K3_ALLOW_DENSE_PACKED", "0") != "1":
             _attn_impl = _kimi_k3_decoder_attn_implementation(self)
-            if _attn_impl in ("eager", "sdpa", "veomni_sdpa"):
+            if _attn_impl in ("eager", "veomni_eager", "sdpa", "veomni_sdpa"):
                 _cu_t = _cu_seq_lens_q
                 if not isinstance(_cu_t, torch.Tensor):
                     _cu_t = torch.as_tensor(_cu_t, dtype=torch.long)
@@ -2475,11 +2444,9 @@ class MoonViTEncoderLayer(nn.Module):
         self.hidden_dim = hidden_dim
         self.qkv_hidden_size = hidden_dim if qkv_hidden_size is None else qkv_hidden_size
         self.hidden_size_per_attention_head = self.qkv_hidden_size // self.num_heads
-        # The module-resolved eager row (the attention/standard 'eager' row
-        # dispatches through this file's text-side eager_attention_forward,
-        # round-9 review) reads num_key_value_groups for repeat_kv; the vision
-        # tower is MHA (q/k/v share the same head count), so the group size is
-        # 1 -- the same marker the qwen3_vl vision attention module sets.
+        # The vision tower is MHA (q/k/v share the same head count), so the
+        # group size is 1 -- the same marker the qwen3_vl vision attention
+        # module sets.
         self.num_key_value_groups = 1
         self.attn_implementation = attn_implementation
         # The other standard rows read the module's config for kernel
@@ -3487,7 +3454,7 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         _cu_seq_lens_q = fa_kwargs.get("cu_seq_lens_q")
         if _cu_seq_lens_q is not None and os.environ.get("K3_ALLOW_DENSE_PACKED", "0") != "1":
             _attn_impl = _kimi_k3_decoder_attn_implementation(self)
-            if _attn_impl in ("eager", "sdpa", "veomni_sdpa"):
+            if _attn_impl in ("eager", "veomni_eager", "sdpa", "veomni_sdpa"):
                 _cu_t = _cu_seq_lens_q
                 if not isinstance(_cu_t, torch.Tensor):
                     _cu_t = torch.as_tensor(_cu_t, dtype=torch.long)

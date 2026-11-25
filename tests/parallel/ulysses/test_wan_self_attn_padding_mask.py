@@ -9,7 +9,8 @@ CPU with no distributed setup.
 
 import torch
 
-from veomni.models.transformers.wan.modeling_wan import _trim_kv_tail_padding, eager_attention_forward
+from veomni.models.transformers.wan.modeling_wan import _trim_kv_tail_padding
+from veomni.ops.kernels.attention.standard.eager import eager_attention_forward
 
 
 class _Module:

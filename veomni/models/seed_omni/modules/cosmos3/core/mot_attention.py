@@ -17,7 +17,6 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 
 from veomni.ops import VeomniOp
@@ -26,9 +25,11 @@ from .packed_layout import PackedLayout, interleave_und_gen
 
 
 # Attention rows that accept a packed call with independent ``cu_seq_lens_q`` /
-# ``cu_seq_lens_k``. ``eager`` is served by :func:`packed_visibility_mask` instead.
+# ``cu_seq_lens_k``.
 PACKED_VARLEN_IMPLS = frozenset(
     {
+        "eager",
+        "veomni_eager",
         "sdpa",
         "veomni_sdpa",
         "flash_attention_2",
@@ -70,41 +71,6 @@ def bind_mot_attention(module: nn.Module, *, impl: str | None = None, config=Non
     module.config = SimpleNamespace(_attn_implementation=impl)
 
 
-def eager_attention_forward(
-    module: nn.Module,
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    attention_mask: Tensor | None = None,
-    dropout: float = 0.0,
-    scaling: float | None = None,
-    is_causal: bool | None = None,
-    **kwargs,
-) -> tuple[Tensor, None]:
-    """Model-local ``eager`` row: plain SDPA math."""
-    key = _repeat_kv(key, module.num_key_value_groups)
-    value = _repeat_kv(value, module.num_key_value_groups)
-    causal = bool(module.is_causal) if is_causal is None else bool(is_causal)
-    output = F.scaled_dot_product_attention(
-        query,
-        key,
-        value,
-        attn_mask=attention_mask,
-        dropout_p=dropout,
-        scale=scaling,
-        is_causal=causal and attention_mask is None,
-    )
-    return output.transpose(1, 2).contiguous(), None
-
-
-def _repeat_kv(hidden: Tensor, groups: int) -> Tensor:
-    if groups == 1:
-        return hidden
-    batch, heads, length, head_dim = hidden.shape
-    hidden = hidden[:, :, None, :, :].expand(batch, heads, groups, length, head_dim)
-    return hidden.reshape(batch, heads * groups, length, head_dim)
-
-
 def _attend(
     module: nn.Module, query: Tensor, key: Tensor, value: Tensor, *, is_causal: bool, scaling, dropout
 ) -> Tensor:
@@ -121,31 +87,6 @@ def _attend(
         skip_ulysses=True,
     )
     return output.squeeze(0)
-
-
-def packed_visibility_mask(
-    query_lengths: Sequence[int],
-    key_lengths: Sequence[int],
-    *,
-    is_causal: bool,
-    device: torch.device | str | None = None,
-) -> Tensor:
-    """Block-diagonal ``(1, 1, sum(q), sum(k))`` visibility of a packed call."""
-    query_lengths = tuple(int(length) for length in query_lengths)
-    key_lengths = tuple(int(length) for length in key_lengths)
-    if is_causal and query_lengths != key_lengths:
-        raise ValueError(f"a causal packed call needs equal segment lengths, got {query_lengths} and {key_lengths}.")
-    query_total, key_total = sum(query_lengths), sum(key_lengths)
-    mask = torch.zeros((query_total, key_total), dtype=torch.bool, device=device)
-    query_start = key_start = 0
-    for query_length, key_length in zip(query_lengths, key_lengths):
-        block = torch.ones((query_length, key_length), dtype=torch.bool, device=device)
-        if is_causal:
-            block = block.tril()
-        mask[query_start : query_start + query_length, key_start : key_start + key_length] = block
-        query_start += query_length
-        key_start += key_length
-    return mask.view(1, 1, query_total, key_total)
 
 
 def packed_attention_impl(module: nn.Module) -> str:
@@ -169,17 +110,6 @@ def _attend_varlen(
 ) -> Tensor:
     """One packed (TND) attention call on ``(T, heads, head_dim)`` tensors."""
     impl = packed_attention_impl(module)
-    if impl == "eager":
-        mask = packed_visibility_mask(query_lengths, key_lengths, is_causal=is_causal, device=query.device)
-        output = F.scaled_dot_product_attention(
-            query.unsqueeze(0).transpose(1, 2),
-            _repeat_kv(key.unsqueeze(0).transpose(1, 2), module.num_key_value_groups),
-            _repeat_kv(value.unsqueeze(0).transpose(1, 2), module.num_key_value_groups),
-            attn_mask=mask,
-            dropout_p=dropout,
-            scale=scaling,
-        )
-        return output.squeeze(0).transpose(0, 1).contiguous()
     if impl not in PACKED_VARLEN_IMPLS:
         # A dense call over the whole pack would let samples attend to each other.
         raise NotImplementedError(f"Cosmos3 packed attention does not support the {impl!r} attention row.")

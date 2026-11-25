@@ -48,30 +48,6 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
     return x * (1 + scale) + shift
 
 
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    dropout: float = 0.0,
-    **kwargs,
-):
-    head_dim = query.shape[-1]
-    scaling = 1.0 / math.sqrt(head_dim)
-    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.bfloat16).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
-
-
 def _trim_kv_tail_padding(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
@@ -604,7 +580,7 @@ class WanModel(PreTrainedModel):
             # the backend call: the sync path all-to-alls Q/K/V in
             # `SelfAttention.forward`, and the async DiT QKV op does its own
             # internal all-to-all. Every rank therefore uses this mask as-is.
-            # Only `eager_attention_forward` reads it today. Official sageattn
+            # Only `eager`/`veomni_eager` reads it today. Official sageattn
             # has no dense mask, so `veomni_sage_attention` raises if one is
             # passed. Sage is inference-only; training should use FlashAttention.
             # FA3/sage trim the K/V tail this mask marks. SP+sage still cannot

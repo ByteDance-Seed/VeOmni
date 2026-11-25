@@ -61,5 +61,5 @@ def is_flash_attn_impl(impl: str) -> bool:
 
 
 def is_sdpa_attn_impl(impl: str) -> bool:
-    """True when MiniMax attention uses the SDPA path, including its eager row."""
-    return impl in ("eager", "sdpa", "veomni_sdpa")
+    """True when MiniMax attention uses dense eager/SDPA instead of flash varlen."""
+    return impl in ("eager", "veomni_eager", "sdpa", "veomni_sdpa")

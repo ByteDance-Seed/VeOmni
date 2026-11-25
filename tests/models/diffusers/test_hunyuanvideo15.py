@@ -81,6 +81,9 @@ def batch(glyph=False):
         pytest.param("flash_attention_2", {"attn_implementation": "sdpa"}, "sdpa", id="override-sdpa"),
         pytest.param("flash_attention_2", {"attn_implementation": "eager"}, "eager", id="override-eager"),
         pytest.param(
+            "flash_attention_2", {"attn_implementation": "veomni_eager"}, "veomni_eager", id="override-veomni-eager"
+        ),
+        pytest.param(
             "flash_attention_2", {"attn_implementation": "veomni_sdpa"}, "veomni_sdpa", id="override-veomni-sdpa"
         ),
         pytest.param("sdpa", {}, "sdpa", id="preserve-omitted"),
