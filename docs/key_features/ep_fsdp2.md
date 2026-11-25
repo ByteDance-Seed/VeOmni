@@ -102,11 +102,9 @@ Then, we need to find the experts inside the layers if they exist. We cannot rel
 
 Due to the nested sharding of EP+FSDP2, the default prefetching configuration of FSDP2 is no longer efficient, and we need to set the prefetching manually.
 
-In short words, each decoder layer needs to prefetch the next/prev decoder layer's attention and expert module explicitly during forward/backward.
+In short words, each decoder layer need to prefetch the next/prev decoder layer's attention and expert module explicitly during forward/backward.
 
 Otherwise, the attention and expert modules are treated as separate layers. In this case, the time of attention computation often cannot fully overlap the AllGather for expert module.
-
-Manual prefetching groups target blocks by their parent container prefix (for example, `model.layers` vs `model.mtp` or `model.visual.blocks`) so separate or conditionally skipped stacks do not chain prefetch across stack boundaries. During backward, when a block contains an inner ExtraParallel FSDP submodule (such as `mlp.experts`), backward prefetch for the previous block is registered on that inner submodule instead of the outer decoder block. Leaving the outer block without explicit backward prefetch targets lets FSDP2's default backward prefetch fetch the current block's own inner experts first, and delays prefetching the previous block until the inner submodule enters pre-backward (which under non-reentrant activation checkpointing occurs after recomputation whenever a post-experts op unpacks saved tensors first, though not guaranteed on a bare residual-add graph with no post-experts saved tensor).
 
 ### Consequences of Mixed Sharding Strategy
 
