@@ -225,7 +225,8 @@ NPU validation runs at two times:
 - **Config-parse time** (`OpsImplementationConfig.__post_init__`) for the
   nine general-purpose ops (`moe`, `cross_entropy_loss`, `rms_norm`,
   `gated_mlp`, `linear`, `kv_round`, `rotary_pos_emb`, `rotary_pos_emb_vision`,
-  `load_balancing_loss`). Errors fire
+  `load_balancing_loss`) and the Kimi K3 fields
+  (`chunk_kda_implementation`, `situ_and_mul_implementation`). Errors fire
   immediately with a model-agnostic allow-list.
 - **Model-build time** (instance-local `VeomniOp` resolution via the
   registry row's hardware requirement) for Qwen3.5-only ops (`rms_norm_gated`,
@@ -249,6 +250,8 @@ NPU validation runs at two times:
 | rms_norm_gated_implementation | `str` | `"fla"` | Gated RMSNorm (Qwen3.5/Qwen4-Exp GatedDeltaNet `self.norm`). Known values: `eager`, `fla` (FLA `FusedRMSNormGated`; GPU, MLU, NPU), `torch_npu` (`npu_swiglu` for SiLU, eager gate multiply for sigmoid). |
 | causal_conv1d_implementation | `str` | `"fla"` | Varlen depthwise causal conv1d (Qwen3.5 GatedDeltaNet pre-mixer). Known values: `eager`, `fla` (GPU, MLU, NPU), `triton` (vendored Triton-Ascend; requires `triton-ascend`). `eager` does not support the varlen path. |
 | chunk_gated_delta_rule_implementation | `str` | `"fla"` | Chunk gated delta-rule kernel for Qwen3.5 linear attention. Known values: `eager`, `fla` (GPU, MLU, NPU), `flash_qla` (NVIDIA SM90-SM100), `triton` (vendored Triton-Ascend; requires `triton-ascend`), `fla_npu` (AscendC fused, through `fla_npu.ops.ascendc`; requires `fla_npu` + `triton-ascend`). `eager` does not support varlen training. |
+| chunk_kda_implementation | `Optional[str]` | host default | Kimi K3 chunked KDA linear attention. Known values: `eager` (the `chunk_kda_naive` pure-PyTorch reference), `ascendc` (fused AscendC NPU with guarded routing, SHA-pinned chunk indices and version assertions; requires the out-of-tree `fla_npu` + `triton-ascend-kernels` builds), `fla` (CUDA `flash-linear-attention`; version-asserted against the K3 gating contract — refuses builds that carry the gating parameters only through `**kwargs`). Unset resolves to `ascendc` on NPU (falling back to `eager` when the packages are missing) and to `eager` elsewhere. |
+| situ_and_mul_implementation | `Optional[str]` | host default | Kimi K3 SituGLU activation. Known values: `eager` (fp32 core, shared by the MoE expert loops), `triton` (fused Triton-Ascend NPU; requires `triton-ascend`). Unset resolves to `triton` on NPU (falling back to `eager` when the package is missing) and to `eager` elsewhere. |
 | dsa_indexer_implementation | `Literal["eager", "cudnn", "cann", "tilelang"]` | `"eager"` | DeepSeek sparse-attention top-k indexer implementation. `tilelang` selects the DeepSeek-V4 Lightning Indexer kernel and requires an SM90+ CUDA GPU. `cann` selects the DeepSeek-V4 Ascend CANN Lightning Indexer and requires `cann_ops_transformer`; it covers unpacked and packed batches whose `position_ids` restart at 0 in every segment, without context or Ulysses parallelism or decode. |
 | dsa_attention_implementation | `Literal["eager", "flashmla_cudnn", "cann", "tilelang", "triton"]` | `"eager"` | DeepSeek sparse-attention implementation. `tilelang` selects the DeepSeek-V4 sparse MQA kernel and requires an SM90+ CUDA GPU. `triton` selects the same DeepSeek-V4 candidate contract on AMD ROCm; the optional indexer-loss teacher remains TileLang-only. `cann` selects the DeepSeek-V4 Ascend CANN sparse FlashMLA and requires `cann_ops_transformer`; it covers the same unpacked and packed batches as the `cann` indexer, ignores `attention_mask` (so padded batches are unsupported), and runs layers that have no compressed rows in eager. |
 | mhc_implementation | `Literal["eager", "cann", "tilelang"]` | `"eager"` | DeepSeek V4 manifold-constrained Hyper-Connection implementation. `tilelang` enables the forward/backward path provided by the `tile-kernels` package and requires an SM90+ CUDA GPU. `cann` selects the Ascend CANN fused pre/post kernels with a PyTorch final-head collapse and requires BF16 activations and `cann_ops_transformer`. |
@@ -500,7 +503,7 @@ compile, the difference between the two trainers, and the measured payoff.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| type | `Literal["adamw", "anyprecision_adamw", "muon"]` | `"adamw"` | Optimizer type. `muon` builds Muon and AdamW parameter groups. |
+| type | `Literal["adamw", "anyprecision_adamw", "muon", "hyper_muon"]` | `"adamw"` | Optimizer type. `muon` and `hyper_muon` build Muon and AdamW parameter groups using VeOmni and HyperParallel respectively. Hyper FSDP does not support `anyprecision_adamw`. |
 | lr | `float` | `5e-5` | Maximum / default learning rate. |
 | lr_min | `float` | `1e-7` | Minimum learning rate. |
 | lr_start | `float` | `0.0` | Starting learning rate for warmup. |
@@ -523,7 +526,8 @@ compile, the difference between the two trainers, and the measured payoff.
 | muon_adjust_lr_fn | `Literal["original", "match_rms_adamw"]` | `"match_rms_adamw"` | Per-matrix learning-rate adjustment strategy. |
 | muon_head_group_size | `int` | `0` | Attention heads per Newton–Schulz block ("Muon Split"). `0` orthogonalizes each projection as one matrix, `1` is per-head, `g>1` groups `g` heads. Any value `>= 1` requires `muon_head_split_modules`. |
 | muon_head_split_modules | `List[str]` | `[]` | Projections to head-split, each a leaf module name or a dotted path suffix, e.g. `[self_attn.q_b_proj]`. An entry that would split two *nested* projections is rejected with the qualified names to use instead. No default — required when `muon_head_group_size >= 1`. |
-| muon_expert_zero_comm | `bool` | `False` | Use whole-expert `Shard(0)` when the FSDP+ExtraParallel topology permits zero-communication expert Muon updates. |
+| muon_expert_zero_comm | `bool` | `False` | Use whole-expert `Shard(0)` when the FSDP+ExtraParallel topology permits zero-communication expert Muon updates. Falls back to `Shard(1)` when the topology does not permit it. |
+| muon_expert_ns_max_experts | `int` | `-1` | Chunked Newton–Schulz for a local-expert stack on device (the `muon_expert_zero_comm` path). `-1` (default) **disables** chunking: the whole stack is orthogonalized in one call, which is fastest and needs the most NS workspace. A positive value bounds the workspace at `max_experts × min(M, K)²` instead of `local_experts × min(M, K)²`, using balanced slices of at most that many experts. Costs a few percent of step time; enable it only when the unchunked workspace would OOM. This is a constructor-level switch, not resumable state: it is not written to the optimizer checkpoint, so a resume always uses the value the current run configured. |
 | muon_ns_implementation | `Literal["std", "gram", "gram_quack"]` | `"gram_quack"` | Newton–Schulz backend: standard, pure-PyTorch Gram-NS, or Gram-NS with quack kernels (default; falls back to `gram` if unavailable). |
 | muon_gram_ns_reset_iterations | `List[int]` | `[2]` | Restart indices for Gram Newton–Schulz (ignored by `std`). |
 | state_offload | `Literal["none", "cpu"]` | `"none"` | Optimizer-managed state offload. `none` disables it (training state may still be offloaded by `model.accelerator.fsdp_config.offload`); `cpu` keeps the moment states in host buffers and streams them to the device in batches, lowering peak device memory (only with `type="adamw"`). |
@@ -713,7 +717,7 @@ configured and never round-trip through a saved config.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| fsdp_mode | `Literal["ddp", "fsdp2", "eager"]` | `"fsdp2"` | Data parallel mode. `"eager"` skips every wrapper for the single-process Omni inference path (`_init_eager_inference`). |
+| fsdp_mode | `Literal["ddp", "fsdp2", "hyper_fsdp2", "eager"]` | `"fsdp2"` | Data parallel mode. `"hyper_fsdp2"` selects HyperParallel FSDP/HSDP for training, excluding SeedOmni. `"eager"` skips every wrapper for the single-process Omni inference path (`_init_eager_inference`). |
 | fsdp_scope | `Literal["module", "model"]` | `"module"` | SeedOmni: `"module"` wraps each OmniModule independently; `"model"` wraps the composed `OmniModel` once (one FSDP tree). Wrap targets are each child's `_no_split_modules` scoped as `{child}.{ClassName}`; leftover params unshard on `OmniModel.forward()`. Per-module DDP / ExtraParallel / `init_device` / SP-CP-TP-PP overlays are unused under `"model"` (module YAML is not rewritten); the top-level accelerator topology is used. |
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
@@ -725,6 +729,7 @@ configured and never round-trip through a saved config.
 | low_precision_reduce_scatter_comm | `bool` | `False` | Use `mixed_precision.param_dtype` (BF16 or FP16) for node-local FSDP2 ReduceScatter communication while keeping FP32 accumulation. See the precision and topology tables below. |
 | max_load_broadcast_size | `float` | `20.0` | Maximum size (in GB) of parameters broadcasted from rank 0 during loading weights (FSDP2). Parameters exceeding this threshold will be chunked according to the parallel plan before broadcasting. |
 | mixed_precision | `MixedPrecisionConfig` | — | Mixed precision configuration. |
+| hyper_parallel | `HyperParallelFSDPConfig` | — | Hyper FSDP communication and prefetch settings; see below. |
 
 Set `low_precision_reduce_scatter_comm: true` to communicate gradients in `mixed_precision.param_dtype`
 while keeping `mixed_precision.reduce_dtype: float32`. There is no separate communication-dtype setting;
@@ -871,6 +876,19 @@ search of all NCCL tuning or buffer-registration settings.
 Native BF16 was faster (about 2.76 ms at 1024 MiB), but changes reduction precision; its entire
 gap cannot be attributed to conversion alone because the communication and accumulation
 implementations also differ. These timings measure collective latency, not model throughput.
+
+#### HyperParallelFSDPConfig
+
+`model.accelerator.fsdp_config.hyper_parallel.*` — controls for `hyper_fsdp2`.
+See [HyperParallel](../key_features/hyper_parallel.md) for installation and configuration.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| comm_fusion | `bool` | `False` | Fuse parameter and gradient communication buffers. |
+| comm_fusion_vit | `Optional[bool]` | `None` | Override communication fusion for the visual tower; `None` inherits `comm_fusion`. |
+| forward_prefetch_depth | `int` | `1` | Number of following blocks to prefetch when `forward_prefetch` is enabled. |
+| backward_prefetch_depth | `int` | `1` | Number of blocks to prefetch in backward execution order. |
+| reduce_comm_interval | `int` | `1` | Gradient-reduction communication wait interval. |
 
 ### MixedPrecisionConfig
 

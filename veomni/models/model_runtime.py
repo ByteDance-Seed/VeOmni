@@ -25,6 +25,7 @@ share one build sequence instead of maintaining divergent copies of it.
 """
 
 import os
+import sys
 from dataclasses import fields
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -134,6 +135,18 @@ class VeOmniModelRuntime:
         *,
         train: "TrainingArguments",
     ):
+        is_hyper_fsdp = args.accelerator.fsdp_config.fsdp_mode == "hyper_fsdp2"
+        is_hyper_muon = args.optimizer.type == "hyper_muon"
+        hyper_adapter = getattr(sys.modules.get("hyper_parallel.integration.veomni.adapter"), "_ADAPTER", None)
+        if hyper_adapter is None or not hyper_adapter.is_patched:
+            if is_hyper_fsdp or is_hyper_muon:
+                raise ValueError("HyperParallel must be activated by TextTrainer or VLMTrainer.")
+        else:
+            if (is_hyper_fsdp, is_hyper_muon) != (hyper_adapter.fsdp, hyper_adapter.muon):
+                raise RuntimeError("Remove the existing Hyper patch before changing backend selection.")
+            if is_hyper_fsdp and args.accelerator.fsdp_config != hyper_adapter.fsdp_config:
+                raise RuntimeError("Remove the existing Hyper patch before changing FSDP options.")
+
         self.args = args
         self.model_name = model_name
         self.train_args = train
@@ -448,7 +461,7 @@ class VeOmniModelRuntime:
             kwargs["adapter_path"] = args.lora_config.get("lora_adapter", None)
             kwargs["is_peft_model"] = True
 
-        muon_expert_zero_comm = args.optimizer.type == "muon" and args.optimizer.muon_expert_zero_comm
+        muon_expert_zero_comm = args.optimizer.type in ("muon", "hyper_muon") and args.optimizer.muon_expert_zero_comm
 
         if args.fqn_to_index_mapping is not None:
             kwargs["fqn_to_index_mapping"] = args.fqn_to_index_mapping

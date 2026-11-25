@@ -108,9 +108,9 @@ class CheckpointerBase(ABC):
 
 @CHECKPOINTER_REGISTRY.register("dcp")
 def dcp_checkpointer(dist_backend: str):
-    if dist_backend not in ["ddp", "fsdp2"]:
+    if dist_backend not in ["ddp", "fsdp2", "hyper_fsdp2"]:
         raise ValueError(
-            f"Unsupported distributed backend: {dist_backend} for DCP checkpoint manager, supported modes are: ddp, fsdp2"
+            f"Unsupported distributed backend: {dist_backend} for DCP checkpoint manager, supported modes are: ddp, fsdp2, hyper_fsdp2"
         )
     from .dcp_checkpointer import DistributedCheckpointer
 

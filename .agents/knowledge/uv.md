@@ -29,7 +29,7 @@ grep -rnE "torch(-npu)?==" docker/  # same for torch; -npu is the ascend form
 ```
 pyproject.toml
 ├── [project.dependencies]              Core deps (always installed, transformers NOT included here)
-├── [project.optional-dependencies]     Hardware extras + optional Magi / float8 extras + legacy `dev`
+├── [project.optional-dependencies]     Hardware extras + optional Magi / float8 / Hyper extras + legacy `dev`
 │   ├── gpu          NVIDIA x86_64 / aarch64 — full superset (kernel-specific libc requirements):
 │   │                  torch 2.11.0+cu130 + cu130 nvidia stack + cuda-python
 │   │                  + FA2 on x86_64 (cp311/cp312 wheels)
@@ -48,6 +48,7 @@ pyproject.toml
 │   │                  + diffusers / av / audio / video / peft / megatron-energon
 │   ├── npu_aarch64  Ascend NPU aarch64 — full superset except torchcodec:
 │   │                  torch 2.10.0 + torch-npu 2.10.0 + the same data/model deps
+│   ├── hyper        Optional HyperParallel (combine with npu or npu_aarch64; pinned Git source)
 │   └── dev          pre-commit, ruff, pytest (legacy pip-style; modern uv path is the dev group)
 ├── [dependency-groups]                 Dev-only (uv-native)
 │   ├── dev                  includes lint + test
@@ -92,6 +93,10 @@ The `npu` and `npu_aarch64` extras both install the complete Ascend software
 stack and multimodal dependencies. Only `npu_aarch64` omits `torchcodec`
 because no compatible aarch64 wheel is available; build it from source when
 video decoding is required.
+
+HyperParallel is optional: add `--extra hyper` alongside `npu` or `npu_aarch64`.
+Its Git revision is pinned in `tool.uv.sources` and `uv.lock`.
+See `docs/key_features/hyper_parallel.md` for installation instructions.
 
 ## Transformers Version
 

@@ -24,13 +24,17 @@ still needs the multi-rank suites. The seam tests below need no distribution
 at all.
 """
 
+import builtins
+import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.training_utils import make_eager_ops_config, unbuilt_runtime
 from veomni.arguments import (
     AcceleratorConfig,
@@ -62,6 +66,37 @@ def train_args(load_path=None):
             dcp_save_to_lowest_rank=False,
         )
     )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_native_runtime_does_not_require_hyper(monkeypatch):
+    monkeypatch.setitem(sys.modules, "hyper_parallel.integration.veomni", None)
+    setup = Mock(side_effect=RuntimeError("Runtime setup reached."))
+    monkeypatch.setattr(VeOmniModelRuntime, "setup", setup)
+    with pytest.raises(RuntimeError, match="Runtime setup reached"):
+        VeOmniModelRuntime(ModelArguments(model_path="somewhere"), train=train_args())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_missing_hyper_has_install_hint(monkeypatch):
+    from veomni.trainer.text_trainer import TextTrainer
+    from veomni.trainer.vlm_trainer import VLMTrainer
+
+    original_import = builtins.__import__
+
+    def import_without_hyper(name, *args, **kwargs):
+        if name == "hyper_parallel.integration.veomni":
+            raise ModuleNotFoundError("No module named 'hyper_parallel'", name="hyper_parallel")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_hyper)
+    model = ModelArguments(
+        model_path="somewhere",
+        accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="hyper_fsdp2")),
+    )
+    for trainer in (TextTrainer, VLMTrainer):
+        with pytest.raises(ImportError, match="Add `--extra hyper`"):
+            trainer(SimpleNamespace(model=model))
 
 
 @pytest.fixture
