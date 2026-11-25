@@ -56,16 +56,16 @@ type is an error.
   module's weights, an unclaimed key) is *carried*: the export copies it from the
   source instead of gathering it. Carried tensors are spread over the ranks —
   small ones go whole to one rank each, round-robin, and one at or above 64 MiB
-  is read as a `Shard(0)` slice per rank — so reading them is not a rank-0 cost
-  the size of the frozen checkpoint.
-  DCP consolidation is not spread the same way: it rebuilds one tensor at a time
-  into a single process, so a carried tensor is allocated whole on whichever rank
-  consolidates the output file it lands in. Peak host memory is therefore the
-  largest single carried tensor, not the checkpoint's total — but a single
-  carried tensor that large still does not fit, and no shard-file setting changes
-  that, since the allocation is per tensor. Keep such a table out of a
-  layout-based export (split checkpoint, or `save_hf_weights` off) until the
-  consolidation is chunked.
+  is read as a `Shard(0)` slice per rank when `world_size > 1` — so reading them
+  is not a rank-0 cost the size of the frozen checkpoint.
+  During DCP consolidation, the patched consolidator
+  (`veomni/checkpoint/dcp_consolidation.py`) detects contiguous dim-0 whole-row
+  shards — which covers all `Shard(0)` carried tensors as well as whole tensors —
+  and streams each shard directly to the output file in bounded 64 MiB chunks
+  without allocating a full-tensor host buffer. Full per-tensor host allocation
+  is now limited to fallback non-dim-0 shard layouts (such as `Shard(1)` or
+  2D-sharded tensors), and single-process exports (`world_size == 1`) where
+  carried tensors are read whole during `dcp.save`.
 - **Load host memory.** Eager loads take `device_map` as `from_pretrained` does;
   a module spread over several devices (`"auto"`) is loaded on CPU first, so host
   memory must hold it once.

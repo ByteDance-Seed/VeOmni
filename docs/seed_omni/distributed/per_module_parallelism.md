@@ -24,7 +24,7 @@ A module's choices live in its block of the `modules` YAML, under
 | DDP | `fsdp_config.fsdp_mode: ddp`, usually with `init_device: cuda` and `broadcast_model_weights_from_rank0: false` (module level, outside `accelerator:`) | Small encoders, where a full replica per rank is cheaper than FSDP2 all-gathers |
 | Eager (inference only) | `fsdp_config.fsdp_mode: eager` | A single-process replica with no mesh; rejected for training |
 | Embedding parallel | `extra_parallel_names: ["emb"]`, `extra_parallel_sizes: [N]`, `extra_parallel_placement_innermost: [false]` | A vocabulary-sharded text encoder; see [Sharded Embedding](../../key_features/sharded_embedding.md). A dimension with no scalar of its own is set through these three lists, which are paired by position — write all three |
-| Expert parallel | `accelerator.ep_size: N` | A MoE backbone. For `ep`, **write `ep_size`, not the lists**. A module entry inherits the global `ep` width, and `_module_base` folds an inherited `ep` entry back into `ep_size` before the overlay merges, then `AcceleratorConfig.__post_init__` re-appends it — so `ep_size` is the field that actually decides the width, and `ep_size: 1` is the per-module opt-out. Writing only `extra_parallel_sizes: [N]` desynchronises the three position-paired lists and leaves the inherited width in `ep_size` (observed: `ep_size=4, sizes=[2, 4]`) |
+| Expert parallel | `accelerator.ep_size: N` | A MoE backbone. For `ep`, **prefer `ep_size` over the lists**. `AcceleratorConfig.resolved_extra_parallel` leaves the raw fields untouched and folds `("ep", ep_size, ep_outside)` in on demand only when `"ep"` is absent from `extra_parallel_names`. When the global config sets `ep_size`, a module inherits it and opts out with `ep_size: 1`. If the global config instead places `"ep"` explicitly in `extra_parallel_names` / `extra_parallel_sizes` / `extra_parallel_placement_innermost`, that explicit list entry takes precedence over `ep_size`, so a module must also override or remove the matching `"ep"` entry across all three position-paired lists. Writing only `extra_parallel_sizes: [N]` desynchronises the three lists |
 | Sequence / Context parallel | `ulysses_size: U`, `cp_size: C` (one axis `> 1` per module, with `U * C = W / dp_size` and `pp_size = tp_size = 1` across all modules) | Ulysses SP on encoders/ViT, CP on long-context backbones |
 | Gradient checkpointing | `gradient_checkpointing.enable: false` | Off for cheap modules (text encoders, VAE, flow connector) |
 
@@ -33,14 +33,21 @@ backbone's `ep`, say — has to switch that dimension off in its own block. A
 module with no parallel plan cannot be built under an enabled mesh, so the build
 raises.
 
-For `ep` the switch is `ep_size: 1`; for any other dimension, remove its name
-from `extra_parallel_names` together with its entries in `extra_parallel_sizes`
-and `extra_parallel_placement_innermost`, keeping the three lists the same
-length. The two are different mechanisms because `ep` has a scalar of its own
-that the other dimensions do not: `_module_base` folds an inherited `ep` entry
-into `ep_size` and `AcceleratorConfig.__post_init__` re-appends it, so clearing
-the lists alone leaves the inherited width in place and the dimension comes
-straight back. The build's error message names the dimensions it saw enabled.
+For `ep`, set `ep_size: 1` when the global config sets `ep_size`; if the global
+config also (or instead) placed `"ep"` explicitly in `extra_parallel_names`,
+remove or override `"ep"` across `extra_parallel_names`, `extra_parallel_sizes`,
+and `extra_parallel_placement_innermost` as well, keeping all three lists the
+same length. For any other dimension, remove its entries from all three lists.
+`AcceleratorConfig.resolved_extra_parallel` folds `ep_size` in on demand only
+when `"ep"` is absent from `extra_parallel_names`, so:
+
+- if the global config used `ep_size: N`, clearing the lists alone still leaves
+  `ep_size` inherited and `"ep"` is folded back in on demand;
+- if the global config listed `"ep"` explicitly in `extra_parallel_names` /
+  `extra_parallel_sizes`, setting `ep_size: 1` alone still resolves the inherited
+  list width.
+
+The build's error message names the dimensions it saw enabled.
 
 
 Children can inherit `expert_weight_fp8_all_gather: true` from the global accelerator.
