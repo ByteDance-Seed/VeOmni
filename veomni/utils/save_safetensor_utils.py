@@ -509,16 +509,33 @@ def _merge_rows(sharded_path: str, output_path: str, fqn: str, shape: List[int],
     os.replace(partial_path, output_path)
 
 
+def _export_path(save_path: str, relative: str) -> str:
+    """Resolve ``relative`` strictly inside ``save_path``, refusing any escape.
+
+    Both the pending-merge marker and the safetensors index name paths that
+    offline merge deletes or overwrites. Reject empty, absolute, ``.``, ``..``,
+    or symlink-escaped paths so a tampered or corrupted export directory cannot
+    touch files outside ``save_path`` (or remove ``save_path`` itself).
+    """
+    if not isinstance(relative, str) or not relative or os.path.isabs(relative):
+        raise ValueError(f"{relative!r} is not a relative path inside {save_path}.")
+    root = os.path.realpath(save_path)
+    resolved = os.path.realpath(os.path.join(root, relative))
+    if os.path.commonpath([root, resolved]) != root or resolved == root:
+        raise ValueError(f"{relative!r} resolves outside {save_path} ({resolved}).")
+    return resolved
+
+
 def merge_pending_hf_shards(save_path: str, num_threads: Optional[int] = None) -> None:
     """Write out deferred HF export files, then remove the pending marker and shard directory."""
     from concurrent.futures import ThreadPoolExecutor
 
-    marker = os.path.join(save_path, layout.HF_PENDING_MERGE_FILENAME)
+    marker = _export_path(save_path, layout.HF_PENDING_MERGE_FILENAME)
     with open(marker) as f:
         pending = json.load(f)
     tensors = pending["tensors"]
-    sharded_path = os.path.join(save_path, pending["sharded_dir"])
-    index_path = os.path.join(save_path, "model.safetensors.index.json")
+    sharded_path = _export_path(save_path, pending["sharded_dir"])
+    index_path = _export_path(save_path, "model.safetensors.index.json")
     weight_map = {}
     if os.path.exists(index_path):
         with open(index_path) as f:
@@ -528,7 +545,12 @@ def merge_pending_hf_shards(save_path: str, num_threads: Optional[int] = None) -
             f"{index_path} is missing or does not name the files {marker} lists: the save stopped "
             "before writing it. Export this checkpoint again."
         )
-    output_paths = {fqn: os.path.join(save_path, t["file"]) for fqn, t in tensors.items()}
+    output_paths = {fqn: _export_path(save_path, t["file"]) for fqn, t in tensors.items()}
+    if len(set(output_paths.values())) != len(output_paths):
+        raise ValueError(f"{marker} maps multiple deferred tensors to the same output file.")
+    for fqn, out_path in output_paths.items():
+        if out_path in (marker, index_path) or os.path.commonpath([sharded_path, out_path]) == sharded_path:
+            raise ValueError(f"Deferred tensor {fqn!r} targets reserved path {out_path!r} inside {save_path}.")
     start_time = time.time()
     with ThreadPoolExecutor(max_workers=num_threads or len(tensors)) as pool:
         futures = [

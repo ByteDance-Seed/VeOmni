@@ -15,8 +15,8 @@
 """HF export of an oversized row-sharded ``emb`` table: kept split by rank, merged offline.
 
 Consolidating such a table during training is one rank streaming the whole
-tensor into one file -- about an hour for DeepSeek-V4.1's 197 GB n-gram tables
-on an HDFS mount -- while the job waits. The export leaves its per-rank shards
+tensor into one file -- about an hour for a ~200 GB embedding table on an
+HDFS mount -- while the job waits. The export leaves its per-rank shards
 and a marker instead, loaders refuse the directory, and
 ``scripts/merge_hf_export.py`` writes the table out afterwards.
 """
@@ -258,3 +258,76 @@ def test_deferred_emb_table_with_checkpoint_row_counts_crops_padded_tail_on_merg
         loaded = _load_export(save_path)
         assert tuple(loaded["table"].shape) == (logical_rows, COLS)
         torch.testing.assert_close(loaded["table"], table[:logical_rows], atol=0, rtol=0)
+
+
+def test_a_merge_refuses_an_export_whose_save_stopped_before_its_index():
+    table = torch.cat([_local_rows(rank) for rank in range(WORLD_SIZE)])
+    with tempfile.TemporaryDirectory() as save_path:
+        _export(_model(SimpleNamespace(para_name="emb", placement=Shard(0))), {"table": table}, save_path)
+        os.remove(Path(save_path) / "model.safetensors.index.json")
+        with pytest.raises(ValueError, match="Export this checkpoint again"):
+            save_utils.merge_pending_hf_shards(save_path)
+        assert (Path(save_path) / HF_PENDING_MERGE_FILENAME).exists()
+        assert any((Path(save_path) / HF_SHARDED_DIRNAME).iterdir())
+
+
+def test_merge_rejects_paths_escaping_export_directory():
+    table = torch.cat([_local_rows(rank) for rank in range(WORLD_SIZE)])
+    with tempfile.TemporaryDirectory() as tmp:
+        outside_dir = Path(tmp) / "outside_dir"
+        outside_dir.mkdir()
+        outside_marker = outside_dir / "keep.txt"
+        outside_marker.write_text("keep")
+        outside_file = Path(tmp) / "outside.safetensors"
+        outside_file.write_text("do-not-overwrite")
+
+        def _make_export(name: str) -> Path:
+            export_dir = Path(tmp) / name
+            _export(_model(SimpleNamespace(para_name="emb", placement=Shard(0))), {"table": table}, str(export_dir))
+            return export_dir
+
+        # 1. sharded_dir escaping via "..", absolute path, ".", or symlink outside save_path.
+        for idx, bad_sharded in enumerate(("../outside_dir", str(outside_dir), ".", "sharded_link")):
+            export_dir = _make_export(f"bad_sharded_{idx}")
+            if bad_sharded == "sharded_link":
+                os.symlink(outside_dir, export_dir / bad_sharded)
+            marker_path = export_dir / HF_PENDING_MERGE_FILENAME
+            pending = json.loads(marker_path.read_text())
+            pending["sharded_dir"] = bad_sharded
+            marker_path.write_text(json.dumps(pending))
+            with pytest.raises(ValueError, match="outside|relative"):
+                save_utils.merge_pending_hf_shards(str(export_dir))
+            assert outside_marker.exists()
+            assert (export_dir / HF_PENDING_MERGE_FILENAME).exists()
+
+        # 2. output file escaping via "..", absolute path, or symlink outside save_path.
+        for idx, bad_file in enumerate(("../outside.safetensors", str(outside_file), "out_link.safetensors")):
+            export_dir = _make_export(f"bad_file_{idx}")
+            if bad_file == "out_link.safetensors":
+                os.symlink(outside_file, export_dir / bad_file)
+            marker_path = export_dir / HF_PENDING_MERGE_FILENAME
+            pending = json.loads(marker_path.read_text())
+            pending["tensors"]["table"]["file"] = bad_file
+            marker_path.write_text(json.dumps(pending))
+            index_path = export_dir / "model.safetensors.index.json"
+            index = json.loads(index_path.read_text())
+            index["weight_map"]["table"] = bad_file
+            index_path.write_text(json.dumps(index))
+            with pytest.raises(ValueError, match="outside|relative"):
+                save_utils.merge_pending_hf_shards(str(export_dir))
+            assert outside_file.read_text() == "do-not-overwrite"
+            assert (export_dir / HF_PENDING_MERGE_FILENAME).exists()
+
+        # 3. output file targeting a reserved export file (e.g. model.safetensors.index.json).
+        export_dir = _make_export("reserved_target")
+        marker_path = export_dir / HF_PENDING_MERGE_FILENAME
+        pending = json.loads(marker_path.read_text())
+        pending["tensors"]["table"]["file"] = "model.safetensors.index.json"
+        marker_path.write_text(json.dumps(pending))
+        index_path = export_dir / "model.safetensors.index.json"
+        index = json.loads(index_path.read_text())
+        index["weight_map"]["table"] = "model.safetensors.index.json"
+        index_path.write_text(json.dumps(index))
+        with pytest.raises(ValueError, match="reserved path"):
+            save_utils.merge_pending_hf_shards(str(export_dir))
+        assert (export_dir / HF_PENDING_MERGE_FILENAME).exists()
