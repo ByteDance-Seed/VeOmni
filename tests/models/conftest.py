@@ -22,7 +22,7 @@ import pytest
 import torch
 
 from tests.tools.model_fixtures import cpu_model_attention_kernel_guard as cpu_model_attention_kernel_guard
-from veomni.ops import VeomniOp
+from veomni.ops import VeomniOp, apply_ops_patch
 from veomni.ops import registry as op_registry
 from veomni.ops.platform import GpuKernelRequirement, NvidiaGpuPlatform
 from veomni.utils.device import IS_NPU_AVAILABLE
@@ -106,6 +106,14 @@ def selected_rope_impl(monkeypatch, request):
     monkeypatch.setattr("veomni.utils.import_utils.is_torch_mlu_available", lambda: host == "mlu")
     monkeypatch.setattr("veomni.utils.import_utils.is_liger_kernel_mlu_available", lambda: host == "mlu")
     return impl
+
+
+@pytest.fixture
+def veomni_modeling_backend(monkeypatch):
+    """Select VeOmni aliases for config tests and restore the caller's backend."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    # Importing veomni under an external ``hf`` backend skips HF op registration.
+    apply_ops_patch()
 
 
 @pytest.fixture

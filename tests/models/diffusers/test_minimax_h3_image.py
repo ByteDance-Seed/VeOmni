@@ -46,6 +46,9 @@ from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_vae.modeling_mini
 )
 
 
+pytestmark = pytest.mark.usefixtures("veomni_modeling_backend")
+
+
 def _build_model() -> MiniMaxH3DiTModel:
     config = _tiny_config()
     config._set_ops_implementation(eager_ops_config())
@@ -113,6 +116,27 @@ def test_minimax_h3_image_forward_backpropagates_to_image_and_text_rows():
 
     assert inputs["x"].grad is not None
     assert inputs["prompt_embeds"].grad is not None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_image_flash_uses_construction_bound_attention(monkeypatch, available_nvidia_ops):
+    from tests.models.test_minimax_h3_packing import segmented_flash_forward
+    from veomni.ops.kernels.attention.standard import flash as flash_backend
+
+    calls = []
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", segmented_flash_forward(calls))
+    config = _tiny_config(num_layers=2)
+    ops = eager_ops_config()
+    ops.attn_implementation = "flash_attention_2"
+    config._set_ops_implementation(ops)
+    model = MiniMaxH3DiTModel(config)
+    inputs = _image_inputs()
+    output = model.forward_image(**inputs, pdd_step_index=0)
+    output.square().mean().backward()
+
+    assert [call["cu_seqlens"] for call in calls] == [[0, 3], [0, 7], [0, 7]]
+    assert model.dit.blocks[0].attn.veomni_attn.impl == "veomni_flash_attention_2"
+    assert inputs["x"].grad is not None and torch.isfinite(inputs["x"].grad).all()
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

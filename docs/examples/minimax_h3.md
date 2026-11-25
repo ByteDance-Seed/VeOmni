@@ -310,36 +310,101 @@ H3 implementation. Low-precision repeated-index reductions can vary even between
 serial repeats, so packed-gradient comparisons must also measure that baseline
 variability; a separate accumulation-precision fix must not silently change the
 single-sample path. Sample-local refiner execution is restricted to cross-sample
-packing; ordinary single-sample attention dispatch is preserved.
+packing; single-sample and packed forwards use the same configured attention
+backend.
 
 ### Attention and validation
 
-The DiT and VAE attention backend comes from
-`model.ops_implementation.attn_implementation`. The
-`MINIMAX_H3_ATTENTION_IMPLEMENTATION` environment variable and the xformers path
-are removed. Masked attention and packed compatibility mode always use PyTorch
-SDPA, and every other call uses the configured kernel.
+`model.ops_implementation.attn_implementation` is bound to every main-DiT and
+token-refiner attention layer when the model is built, as an instance-local
+`attention/standard` `VeomniOp`. The same handle serves single-sample (`M=1`),
+multi-sample packed and Ulysses forwards; there is no H3-specific kernel loader.
+Each layer reads `config.ops_config.attn_implementation` directly, including the
+framework default when the field is omitted. It does not inspect the sparse
+`config.ops_implementation` dictionary to substitute a model-private default.
+Choose `eager` or `sdpa` explicitly for a portable CPU reference; the example
+recipe selects `sdpa`.
 
-- `eager` / `sdpa`: explicit per-segment PyTorch SDPA reference path; main-DiT
-  projections and MLPs still operate on compact cross-sample rows.
-- `flash_attention_2` / `flash_attention_3` in `model.ops_implementation` resolve
-  to VeOmni's local FA2/FA3 backends, and `flash_attention_2_hub` /
-  `flash_attention_3_hub` to the Hugging Face Hub kernels
-  (`kernels-community/flash-attn2` / `flash-attn3`, version 1). Single-sample
-  attention runs one dense call per segment. With multi-sample packing, each
-  main-DiT layer uses one non-causal varlen call and refiner layers retain one
-  call per sample. The kernel is loaded on the first multi-sample forward and
-  needs BF16/FP16; unavailable kernels are not silently replaced with SDPA.
-- `sage_attention`: inference-only, one call per segment. Multi-sample packing
-  rejects it.
+- `eager` / `sdpa` / `veomni_sdpa`: plain PyTorch SDPA, one dense call per segment.
+  The configured row is preserved: H3 has no module-local eager attention, so
+  the shared op supplies the SDPA reference for `eager`. No `S x S` block-diagonal
+  mask is built.
+- `flash_attention_2` / `flash_attention_3` and `flash_attention_2_hub` /
+  `flash_attention_3_hub`: VeOmni's FlashAttention adapter with the local or
+  Hugging Face Hub kernel (`kernels-community/flash-attn2` / `flash-attn3`,
+  version 1). Each layer makes one non-causal varlen call over all segments;
+  refiner layers keep one call per sample when packing. Kernels need BF16/FP16.
+- Other names (including `flash_attention_4`, flex, sage and magi) raise at model
+  build. Static platform or dependency incompatibilities fail at build; kernel
+  loading and execution failures propagate at the first relevant use without
+  replacing the requested row with SDPA. FA3 and Hub rows are unavailable on Ascend NPU; the FA2 row
+  maps to Transformers' NPU varlen integration, which copies `cu_seqlens` to the
+  host on every call.
+
+Under Ulysses SP the async head-block exchange stays in `MiniMaxH3Attention`;
+after each block's exchange it calls the same handle with `skip_ulysses=True`, so
+the adapter does not exchange again. Segment bounds are built once per forward,
+as host integers and one device `int32` tensor (`_PackedBounds`, in single-sample
+and packed mode alike), and shared by every block and checkpoint recomputation.
+The varlen maximum segment length is taken from the host bounds, so a legacy
+layout's 64-row tail is covered even when it is longer than `max_seqlen_q`.
+
+`MINIMAX_H3_ATTENTION_IMPLEMENTATION` no longer selects the DiT attention; a
+warning is logged when it is set. Use `model.ops_implementation` instead.
 
 `tests/models/test_minimax_h3_packing.py` uses a native tiny model on CPU to
 check packed-versus-serial outputs, losses and gradients (including mixed target
 geometry and checkpoint recomputation), sample isolation, Ref2VA variable
 references, forward-local SP padding and fail-closed inputs. SP collectives are
-mocked there, so it does not establish distributed SP parity. The FA2/FA3 call
-site is checked for all four backends with a kernel stub that asserts the
-varlen layout; kernel correctness itself is covered by
+mocked in the layout-only cases; a separate two-rank CPU/Gloo case checks loss
+and averaged parameter-gradient parity for FL2VA and Ref2VA, including the
+multi-head-block exchange. This does not establish accelerator SP parity. CPU
+FlashAttention contract tests replace the kernel below VeOmni's adapter with a
+segmented SDPA oracle; single-sample, refiner and packed calls are checked
+against that reference.
+
+The same module also includes
+`test_real_flash_bf16_predictions_and_parameter_gradients_match_sdpa`, which
+calls the installed local FlashAttention kernel on CUDA without a numerical
+stand-in. It compares BF16 video/audio predictions, losses and every parameter
+gradient with math SDPA, for both single-sample (`M=1`) and two-sample packed
+forwards. A forwarding spy verifies that the refiner and main blocks use CUDA
+BF16 Q/K/V and the expected varlen segment bounds. Elementwise gradient checks
+are supplemented by direction/norm checks so small gradients cannot pass on
+absolute tolerance alone. Each case declares a one-accelerator launch plan.
+FA2 requires an SM80+ NVIDIA GPU and `flash_attn`; FA3 requires SM90+ and
+`flash_attn_interface`. Unavailable hardware/packages are reported as skips.
+
+```bash
+uv run --no-sync python -m pytest -q -rs \
+  tests/models/test_minimax_h3_packing.py \
+  -k real_flash_bf16_predictions_and_parameter_gradients_match_sdpa
+```
+
+CPU collection or skips do not validate these real-kernel cases. On 2026-11-23,
+the FA2 single-sample and packed cases passed on an OpenI A100-PCIE-40GB
+(SM80, driver 580.65.06), with Python 3.12.15, Torch 2.11.0+cu130,
+Transformers 5.16.1, Diffusers 0.37.0 and local FlashAttention 2.8.4:
+**2 passed, 2 skipped** in 4.13 seconds. The FA3 package was absent; FA3 also
+requires SM90+, so this run provides no FA3 validation.
+
+BF16 predictions use elementwise `rtol=3e-2`, `atol=8e-3` and a relative
+L2 error bound of 1% for every output tensor. Parameter gradients use
+`rtol=8e-2`, `atol=5e-4`; gradients above the signal floor additionally need
+cosine similarity above 0.995 and norm agreement within 5%. An FP32 SDPA
+comparison with the same BF16-rounded weights was used to check the initial
+near-zero tolerance failures: FA2 versus BF16 SDPA output relative L2 errors
+were approximately 0.16%–0.32%, and both BF16 paths differed from FP32 on the
+same scale. The independent whole-output and gradient checks retain sensitivity
+when individual near-zero values need a BF16 rounding allowance.
+
+The source was based on `e68ecb0c`, with the calibrated packing test having
+SHA256 `f8555b76db8931ce1aaf6c19b8e7f7889a320ed39fa3511b3b3a1a30537d5322`.
+The inherited image contained an unrelated top-level `scripts` package;
+the test process explicitly selected the repository's `scripts` namespace.
+No numerical kernel stand-in was used. This single-device test does not
+establish accelerator SP/FSDP parity or Ascend NPU execution.
+The standalone adapter/kernel suite is
 `tests/ops/attention/flash/test_flash_attention.py`.
 No end-to-end speedup or convergence is claimed. Benchmark against an equivalent,
 tuned non-packed baseline before claiming a performance improvement.

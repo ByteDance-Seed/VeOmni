@@ -29,6 +29,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config, qwen_image_inputs, stamp_attn_implementation
 from tests.models.tiny_configs import (
     tiny_deepseek_v3_config,
@@ -300,10 +301,16 @@ def test_ltx_forward_keeps_construction_impls(monkeypatch):
     )
 
 
-def test_minimax_h3_forward_keeps_construction_impls():
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_forward_keeps_construction_impls(monkeypatch, available_nvidia_ops):
+    from tests.models.test_minimax_h3_packing import segmented_flash_forward
     from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
         MiniMaxH3DiTModel,
     )
+    from veomni.ops.kernels.attention.standard import flash as flash_backend
+
+    # Exercise the flash path too; only its kernel is replaced by the segmented reference.
+    monkeypatch.setattr(flash_backend, "_flash_attention_forward", segmented_flash_forward([]))
 
     config = tiny_minimax_h3_config(latents_dim=24, audio_latents_dim=32, patch_size=(1, 2, 2))
     video_rows = 4
@@ -335,8 +342,8 @@ def test_minimax_h3_forward_keeps_construction_impls():
         ).predictions[0],
         attn_paths=("dit.blocks.0.attn.veomni_attn",),
         sticky_paths=("dit.blocks.0.attn.veomni_rope",),
-        eager_cfg=_attn_cfg("eager"),
-        alt_cfg=_attn_cfg("veomni_sdpa"),
+        eager_cfg=_attn_cfg("veomni_sdpa"),
+        alt_cfg=_attn_cfg("veomni_flash_attention_2"),
         poison_cfg=_poison_cfg(),
         hf_config=config,
     )
