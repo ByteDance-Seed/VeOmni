@@ -117,7 +117,7 @@ def run_mimi_only(args: argparse.Namespace) -> None:
     mimi = MimiModel.from_pretrained(args.mimi, dtype=torch.float32).eval()
     print(f"      {sum(p.numel() for p in mimi.parameters()) / 1e6:.1f}M params")
 
-    print("[2/3] does this checkpoint match what the codec module expects?")
+    print("[2/4] does this checkpoint match what the codec module expects?")
     # The same object the split builds, so the checks below are the ones a real
     # codec runs at construction rather than a reimplementation of them.
     config = Qwen3OmniCodecConfig(mimi_config=MimiConfig.from_pretrained(args.mimi).to_dict())
@@ -128,7 +128,7 @@ def run_mimi_only(args: argparse.Namespace) -> None:
         f"encoder {config.encoder_samples_per_frame}"
     )
 
-    print("[3/3] encode -> decode round trip on a 1 s tone")
+    print("[3/4] encode -> decode round trip on a 1 s tone")
     rate = config.sampling_rate
     tone = 0.3 * torch.sin(2 * torch.pi * 220 * torch.arange(rate, dtype=torch.float32) / rate)
     with torch.no_grad():
@@ -137,6 +137,31 @@ def run_mimi_only(args: argparse.Namespace) -> None:
     sf.write(out / "mimi_round_trip.wav", decoded.squeeze().float().cpu().numpy(), rate)
     print(f"      codes {tuple(codes.shape)}  frames/s={codes.shape[-1] / (len(tone) / rate):.1f}")
     print(f"      decoded {decoded.shape[-1]} samples = {decoded.shape[-1] / rate:.2f}s -> {out}")
+
+    # ...and through *this module*, which is the contract the talker is written
+    # against: `(num_quantizers, T)`. Built from the real Mimi config with the
+    # encoder weights loaded, so this exercises `encode_wav` rather than
+    # reimplementing it — without the Qwen decoder half, which `--mimi-only`
+    # deliberately does not have.
+    print("[4/4] this module's encode_wav on the same tone")
+    from veomni.models.seed_omni.modules import OMNI_CONFIG_REGISTRY, OMNI_MODEL_REGISTRY
+    from veomni.models.seed_omni.modules.qwen3omni.codec.modeling import Qwen3OmniCodec
+
+    codec_cfg = OMNI_CONFIG_REGISTRY["qwen3omni_codec"]()(
+        code2wav_config=None,
+        mimi_config=MimiConfig.from_pretrained(args.mimi).to_dict(),
+    )
+    codec = OMNI_MODEL_REGISTRY["qwen3omni_codec"]()(codec_cfg)
+    # The decoder half is absent under `--mimi-only`; nothing in `encode_wav`
+    # touches it, but the module builds it, so keep this honest by reporting.
+    if not isinstance(codec, Qwen3OmniCodec):
+        raise AssertionError(f"unexpected codec class {type(codec).__name__}")
+    codec.mimi.load_state_dict(mimi.state_dict(), strict=False)
+    codec.eval()
+    with torch.no_grad():
+        module_codes = codec.encode_wav(tone, sampling_rate=rate)
+    print(f"      encode_wav -> {tuple(module_codes.shape)}  (expected ({config.num_quantizers}, T))")
+    assert module_codes.shape[0] == config.num_quantizers, module_codes.shape
 
 
 def spectral_distance(a: np.ndarray, b: np.ndarray) -> float:

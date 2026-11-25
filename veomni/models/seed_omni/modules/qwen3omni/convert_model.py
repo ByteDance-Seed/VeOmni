@@ -43,20 +43,22 @@ from veomni.models.checkpoint.weights import init_empty_weights
 from veomni.utils import logging
 
 from ...utils.convert_registry import OMNI_CONVERT_REGISTRY, attach_module_assets, load_family_graphs
+from .hf_layout import QWEN3OMNI_HF_LAYOUT
 
 
 logger = logging.get_logger(__name__)
 
 
-# Upstream tensor prefixes, in the order they are tested. `thinker.model.` is a
-# prefix of nothing else, but embed_tokens must be claimed by the text encoder
-# before the backbone claims the rest, so order matters.
-_TEXT_ENCODER_KEYS = ("thinker.model.embed_tokens.", "thinker.lm_head.")
-_AUDIO_PREFIX = "thinker.audio_tower."
-_VISION_PREFIX = "thinker.visual."
-_LLM_PREFIX = "thinker.model."
-_TALKER_PREFIX = "talker."
-_CODE2WAV_PREFIX = "code2wav."
+# The layout names modules ``qwen3omni_<part>``; this converter's build steps
+# read them as the short names below.
+_BUCKET_FOR_MODULE = {
+    "qwen3omni_audio": "audio",
+    "qwen3omni_vision": "vision",
+    "qwen3omni_text_encoder": "text_encoder",
+    "qwen3omni_llm": "llm",
+    "qwen3omni_talker": "talker",
+    "qwen3omni_codec": "code2wav",
+}
 
 # A hub id, not a cluster path: the encoder half is a public checkpoint
 # (https://huggingface.co/kyutai/mimi), and a default pointing into internal
@@ -112,29 +114,30 @@ def _iter_checkpoint_tensors(model_path: str) -> Iterator[Tuple[str, torch.Tenso
 
 
 def _route_thinker_and_talker(model_path: str) -> Dict[str, Dict[str, torch.Tensor]]:
-    """Stream the checkpoint once, bucketing tensors by destination module."""
+    """Stream the checkpoint once, bucketing tensors by destination module.
+
+    Routed through the family's :data:`QWEN3OMNI_HF_LAYOUT` rather than a second
+    prefix table: the layout is already the single statement of "which upstream
+    tensor belongs to which module", and it is what a direct ``model.model_path``
+    load uses. A private copy here could drift from it — the two would then split
+    the same checkpoint differently depending on whether you converted offline or
+    loaded in place, which is invisible until weights silently land in the wrong
+    module.
+
+    The layout names modules the way the omni checkpoint does
+    (``qwen3omni_audio``); the buckets below key them the way this converter's
+    build steps read them (``audio``).
+    """
     buckets: Dict[str, Dict[str, torch.Tensor]] = defaultdict(dict)
     for key, tensor in _iter_checkpoint_tensors(model_path):
-        if key.startswith(_TEXT_ENCODER_KEYS):
-            # embed_tokens.weight / lm_head.weight, flattened onto the module's
-            # own attribute names.
-            name = "embed_tokens.weight" if "embed_tokens" in key else "lm_head.weight"
-            buckets["text_encoder"][name] = tensor
-        elif key.startswith(_AUDIO_PREFIX):
-            buckets["audio"][key[len(_AUDIO_PREFIX) :]] = tensor
-        elif key.startswith(_VISION_PREFIX):
-            buckets["vision"][key[len(_VISION_PREFIX) :]] = tensor
-        elif key.startswith(_LLM_PREFIX):
-            buckets["llm"][key[len(_LLM_PREFIX) :]] = tensor
-        elif key.startswith(_TALKER_PREFIX):
-            buckets["talker"][key[len(_TALKER_PREFIX) :]] = tensor
-        elif key.startswith(_CODE2WAV_PREFIX):
-            buckets["code2wav"][key[len(_CODE2WAV_PREFIX) :]] = tensor
-        else:
+        routed = QWEN3OMNI_HF_LAYOUT.route(key)
+        if routed is None:
             raise ValueError(
-                f"qwen3omni convert: tensor '{key}' matches no module prefix. The checkpoint layout changed; "
-                f"routing it to the wrong module would silently produce a broken split."
+                f"qwen3omni convert: tensor '{key}' matches no module prefix in the family layout. The "
+                f"checkpoint layout changed; routing it to the wrong module would silently produce a broken split."
             )
+        module, module_key = routed
+        buckets[_BUCKET_FOR_MODULE[module]][module_key] = tensor
     return buckets
 
 

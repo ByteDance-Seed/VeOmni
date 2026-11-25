@@ -204,7 +204,6 @@ class TrainingMixin(TrainingModuleMixin):
         pack_shape = self._pack_inputs_embeds_shape
         self._conversation_carrier = None
         self._pack_inputs_embeds_shape = None
-        self._sp_router_own_len = None
 
         if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
             hidden_states = hidden_states.squeeze(0)
@@ -226,6 +225,10 @@ class TrainingMixin(TrainingModuleMixin):
                 coefficient = getattr(cfg, "router_aux_loss_coef", 0.0)
                 device = conversation[0][0].value.device
                 result["_loss"] = aux_loss.to(device=device) * coefficient
+        # Cleared only after every consumer has run: ``_full_sequence_router_logits``
+        # needs it, and it is read *after* the block above cleared the others.
+        # Clearing it up there left `None` reaching `.narrow(..., None)`.
+        self._sp_router_own_len = None
         return result
 
     def _full_sequence_router_logits(self, router_logits: Any) -> Any:

@@ -477,6 +477,57 @@ def test_the_router_loss_is_computed_over_the_whole_sequence_under_sp():
     assert module._full_sequence_router_logits(logits) is logits
 
 
+def test_the_router_gather_still_has_its_length_when_the_loss_runs():
+    """`_sp_router_own_len` must survive until the router loss has consumed it.
+
+    `forward_post` clears its per-forward state after scattering, and the router
+    block sits *after* that clear. Clearing the router length with the rest left
+    `None` reaching `.narrow(..., None)` — a `TypeError` deep inside the gather,
+    on every SP step with the router objective on. The single-device test above
+    cannot see it, which is what let it through.
+
+    Drives `forward_post` itself rather than the helper: the bug is an ordering
+    one inside that method, so calling the consumer directly would pass either
+    way.
+    """
+    from unittest import mock
+
+    module = _accelerated_llm(text_config={"output_router_logits": True})
+    sample = _text_sample(module, [4])
+    module.pre_forward(method="forward", conversation_list=[sample])
+
+    n_experts = module.config.text_config.num_experts
+    hidden = module.config.text_config.hidden_size
+    outputs = {
+        "hidden_states": torch.randn(1, 4, hidden),
+        "router_logits": (torch.randn(4, n_experts),),
+        "router_attention_mask": None,
+        "all_hidden_states": None,
+    }
+    module._pack_inputs_embeds_shape = torch.tensor([[4]])
+
+    def fake_gather(t, **kw):
+        return t
+
+    with mock.patch(
+        "veomni.models.seed_omni.modules.qwen3omni.llm.accelerated.accelerated.gather_outputs",
+        side_effect=fake_gather,
+    ):
+        with mock.patch(
+            "veomni.models.seed_omni.modules.qwen3omni.llm.accelerated.accelerated.get_parallel_state"
+        ) as ps:
+            ps.return_value.sp_size = 2
+            ps.return_value.sp_group = object()
+            # `forward_pre` would have stored both of these; the ordering bug is
+            # what clears the router one before the loss runs.
+            module._sp_own_len = 4
+            module._sp_router_own_len = 4
+            result = module.forward_post(**outputs)
+
+    assert "_loss" in result, "the router objective contributed nothing"
+    assert module._sp_router_own_len is None, "per-forward state must still be cleared"
+
+
 def test_an_empty_segment_keeps_its_slot_without_inferring_a_width():
     """An empty row is kept so packing and the hidden-state scatter agree.
 

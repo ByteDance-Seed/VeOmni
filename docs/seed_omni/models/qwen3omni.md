@@ -385,12 +385,13 @@ was checked without it, on a 1 s 220 Hz tone against the real Mimi weights:
 | Mimi loads, fp32 | 79.3 M params, 350 tensors |
 | config halves agree | 24 kHz, 16 quantizers, 1920 samples/frame on **both** sides |
 | `encode` → `decode` round trip | `(1, 16, 13)` codes → 1.04 s audio; 13 frames/s = 12.5 Hz ✓ |
-| our codec module, real Mimi config | builds (213.5 M params) and `encode_wav` returns `(16, 13)` — the talker's target contract |
+| `Qwen3OmniCodec.encode_wav` on the same tone | `(16, 13)` — the talker's target contract |
 
 That pins the *plumbing*: the encoder half the converter fetches is the one this
 module's config was written against, the per-frame timing matches on both sides,
-and the target-tensor contract holds. It does not measure the index-space
-agreement above, which still needs both checkpoints.
+and the target-tensor contract holds through this module's own code rather than a
+reimplementation. It does not measure the index-space agreement above, which
+still needs both checkpoints.
 
 ---
 

@@ -29,9 +29,23 @@ class Qwen3OmniTalkerConfig(OmniModuleConfig):
         max_new_tokens: int = 4096,
         semantic_loss_weight: float = 1.0,
         residual_loss_weight: float = 1.0,
+        audio_n_window: int = 50,
         **kwargs,
     ):
         self.talker_config = Qwen3OmniMoeTalkerConfig(**talker_config) if talker_config else Qwen3OmniMoeTalkerConfig()
+        # The *thinker's* mel window, which the talker's 3D RoPE needs and its own
+        # config does not carry.
+        #
+        # `talker.get_rope_index` delegates to
+        # `Qwen3OmniMoePreTrainedModelForConditionalGeneration.get_rope_index`
+        # passing ``self``, and that method reads
+        # ``self.config.audio_config.n_window`` to expand an audio placeholder run
+        # into TMRoPE coordinates. ``Qwen3OmniMoeTalkerConfig`` has no
+        # ``audio_config``, so the call raised ``AttributeError`` as soon as a
+        # prompt carried both a vision span and standalone audio. Declared here
+        # (rather than grafted onto the HF config at call time) so the value is
+        # part of this module's own schema and can be overridden per scenario.
+        self.audio_n_window = audio_n_window
         self.default_speaker = default_speaker
         # Cap on codec frames per utterance (upstream's talker_max_new_tokens).
         # At 12.5 Hz, 4096 frames is ~5.5 minutes of speech.

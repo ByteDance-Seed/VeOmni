@@ -604,7 +604,8 @@ class Qwen3OmniTalker(InferenceMixin, PretrainedOmniModule):
         prompt_length = prompt["inputs_embeds"].shape[1]
         attention_mask = torch.ones((1, prompt_length), dtype=torch.long, device=self.device)
         media = dict(media_metadata or {})
-        prompt_positions, rope_deltas = self.talker.get_rope_index(
+        get_rope_index = self._rope_index_fn()
+        prompt_positions, rope_deltas = get_rope_index(
             prompt["talker_input_ids"],
             media.get("image_grid_thw"),
             media.get("video_grid_thw"),
@@ -617,6 +618,62 @@ class Qwen3OmniTalker(InferenceMixin, PretrainedOmniModule):
         offsets = prompt_length + torch.arange(num_frames, device=self.device) + rope_deltas
         frame_positions = offsets.view(1, 1, num_frames).expand(3, 1, num_frames)
         return torch.cat((prompt_positions, frame_positions), dim=2)
+
+    def _rope_index_fn(self) -> Any:
+        """``get_rope_index`` bound so the thinker's audio window is visible.
+
+        ``Qwen3OmniMoeTalkerForConditionalGeneration.get_rope_index`` is a thin
+        wrapper that calls the thinker's base implementation **with the talker as
+        ``self``**. That implementation reads ``self.config.audio_config.n_window``
+        to size an audio placeholder run, and the talker config has no
+        ``audio_config`` — so a prompt carrying a vision span *and* standalone
+        audio raised ``AttributeError`` before the talker could decode.
+
+        The window belongs to the thinker's tower, which this module does not
+        own, so it is carried on this module's config (``audio_n_window``) and
+        exposed through a view that fills in only the attributes the callee
+        reads. Nothing is written back onto the HF config: this is a call-site
+        adapter, so a stock config stays stock and the value travels with this
+        module rather than mutating shared state mid-forward.
+        """
+        talker = self.talker
+        n_window = self.config.audio_n_window
+        # Imported here rather than at module scope so this file stays importable
+        # without the transformers modeling module being loaded.
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+            Qwen3OmniMoePreTrainedModelForConditionalGeneration,
+        )
+
+        class _AudioWindow:
+            def __init__(self, value: int) -> None:
+                self.n_window = value
+
+        class _ConfigWithWindow:
+            """The talker config plus the one field the callee expects."""
+
+            def __init__(self, inner: Any, value: int) -> None:
+                self._inner = inner
+                self.audio_config = _AudioWindow(value)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+        class _TalkerWithWindow:
+            """The talker itself, with ``config`` swapped for the view above."""
+
+            def __init__(self, inner: Any, value: int) -> None:
+                self._inner = inner
+                self.config = _ConfigWithWindow(inner.config, value)
+                # Read straight off the model by the callee, not from the config.
+                self.spatial_merge_size = getattr(inner, "spatial_merge_size", None)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+        view = _TalkerWithWindow(talker, n_window)
+        return lambda *args, **kwargs: Qwen3OmniMoePreTrainedModelForConditionalGeneration.get_rope_index(
+            view, *args, **kwargs
+        )
 
     def forward(  # type: ignore[override]
         self,

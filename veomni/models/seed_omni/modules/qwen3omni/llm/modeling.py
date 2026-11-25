@@ -363,6 +363,13 @@ class Qwen3OmniLlm(InferenceMixin, PretrainedOmniModule):
     main_input_name = "inputs_embeds"
     _no_split_modules = ["Qwen3OmniMoeThinkerTextDecoderLayer"]
     supports_gradient_checkpointing = True
+    # This wrapper owns no attention — ``self.language_model`` does, and the
+    # patched thinker accepts both eager and SDPA. Without this the base
+    # ``_supports_sdpa = False`` rejects ``sdpa`` / ``veomni_sdpa`` at
+    # construction, and Ulysses refuses a plain ``eager`` (it performs no
+    # exchange of its own) — so sequence-parallel training had no backend it
+    # could be configured with.
+    _supports_sdpa = True
 
     def __init__(self, config: Qwen3OmniLlmConfig):
         super().__init__(config)
