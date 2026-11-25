@@ -722,10 +722,16 @@ class BaseTrainer(Stateful, ABC):
         """Reshard model after backward pass."""
         args: VeOmniArguments = self.args
         model = self.model if model is None else model
+        # `fsdp_mode == "fsdp2"` does not imply this model was actually wrapped:
+        # `fsdp_config.extra_parallel_only` returns through
+        # `_finish_without_fsdp_wrap`, and the method below lives on the wrap. Ask
+        # the model, not the config, or generic text/VLM training raises
+        # `AttributeError` before the first forward.
         if (
             args.model.accelerator.fsdp_config.fsdp_mode in ("fsdp2", "hyper_fsdp2")
             and not args.model.accelerator.fsdp_config.reshard_after_backward
             and num_micro_steps > 1
+            and hasattr(model, "set_reshard_after_backward")
         ):
             if micro_step == 0:
                 model.set_reshard_after_backward(False)
@@ -739,6 +745,7 @@ class BaseTrainer(Stateful, ABC):
             args.model.accelerator.fsdp_config.fsdp_mode in ("fsdp2", "hyper_fsdp2")
             and args.model.accelerator.dp_replicate_size > 1
             and num_micro_steps > 1
+            and hasattr(model, "set_requires_all_reduce")
         ):
             if micro_step == 0:
                 model.set_requires_all_reduce(False)
