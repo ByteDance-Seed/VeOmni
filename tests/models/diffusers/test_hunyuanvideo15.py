@@ -121,7 +121,7 @@ def test_dense_attention_ops_config_roundtrip(monkeypatch, tmp_path, attention):
     if attention is not None:
         config._set_ops_implementation({"attn_implementation": attention})
     model = HunyuanVideo15Model(config)
-    expected = attention or "veomni_sdpa"
+    expected = "veomni_eager" if attention == "eager" else (attention or "veomni_sdpa")
     assert config._attn_implementation == config.ops_config.attn_implementation == expected
     config.save_pretrained(tmp_path)
     restored = HunyuanVideo15Config.from_pretrained(tmp_path)
@@ -161,7 +161,7 @@ def test_condition_construction_preserves_component_dtypes(
             condition_dtype="float32", ops_implementation={"attn_implementation": "eager"}
         ).save_pretrained(tmp_path)
         config = HunyuanVideo15ConditionConfig.from_pretrained(tmp_path, **overrides)
-        assert config.ops_config.attn_implementation == "eager"
+        assert config.ops_config.attn_implementation == "veomni_eager"
     elif config_source == "from_pretrained":
         (tmp_path / "config.json").write_text("{}")
         config = HunyuanVideo15ConditionConfig.from_pretrained(tmp_path, **overrides)

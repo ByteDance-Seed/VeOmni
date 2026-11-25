@@ -427,7 +427,7 @@ def test_minimax_h3_text_encoder_inherits_condition_ops(monkeypatch):
     config._set_ops_implementation(eager_ops_config())
     text_encoder_module.MiniMaxH3TextEncoder(num_retained_layers=1, config=config)
 
-    assert captured["config"].ops_config.attn_implementation == "eager"
+    assert captured["config"].ops_config.attn_implementation == "veomni_eager"
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

@@ -187,5 +187,10 @@ def test_make_eager_ops_config_covers_every_kernel_field():
     for field in fields(OpsImplementationConfig):
         # `eager` is not "off" for kv_round: it is a real row that rounds stored
         # tensors, so the eager config names the `none` row instead.
-        expected = "none" if field.name == "kv_round_implementation" else "eager"
+        if field.name == "kv_round_implementation":
+            expected = "none"
+        elif field.name == "attn_implementation":
+            expected = OpsImplementationConfig.normalize_attention_backend("eager")
+        else:
+            expected = "eager"
         assert getattr(selection, field.name) == expected, field.name

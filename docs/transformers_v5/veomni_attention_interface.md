@@ -69,13 +69,13 @@ model-local VeomniOp("attention", "standard", implementation)
 `apply_veomni_attention_patch()` registers the concrete `veomni_*` forward
 functions and matching mask builders in the Transformers registries. Each ops
 row then uses the same Transformers interface lookup as the model-facing path.
-The `eager` row uses the modeling module's local `eager_attention_forward` when
-present, preserving model-specific math. Modules without that function forward
-through `veomni_sdpa`, including its packed-sequence and Ulysses handling.
-Transformers' global eager interface is unchanged. The short `flex_attention`
-and `magi_attention` rows resolve
-their `veomni_*` interfaces so they share the adapters' device and backend
-behavior when selected directly through the ops registry.
+The `veomni_eager` row runs the pure-PyTorch eager attention implementation in
+`veomni/ops/kernels/attention/standard/eager.py` with full mask, packed-sequence,
+and Ulysses SP support, and the `eager` row runs that same kernel locally with
+`skip_ulysses=True`. Transformers' global eager interface is unchanged. The short
+`flex_attention` and `magi_attention` rows resolve their `veomni_*` interfaces so
+they share the adapters' device and backend behavior when selected directly
+through the ops registry.
 
 The AITER row resolves `veomni_flash_attention_aiter` only on AMD ROCm. It
 reuses the flash/Ulysses adapter, while the patched local-kernel loader supplies
@@ -88,15 +88,15 @@ All registered adapters use the Transformers attention-forward convention.
 Q/K/V inputs use `[batch, heads, sequence, head_dim]`; the returned attention
 output uses `[batch, sequence, heads, head_dim]`.
 
-For `sdpa`, `veomni_sdpa`, `eager` (with `is_causal=False`), and
+For `sdpa`, `veomni_sdpa`, `eager`, `veomni_eager`, and
 `veomni_sage_attention`, unmasked (`attention_mask=None`) batch-size-1 calls
 carrying multi-segment `cu_seqlens` (`cu_seq_lens_q`/`k` or `cu_seqlens_q`/`k`)
 are automatically split per segment inside the wrapper and concatenated back
-along the sequence dimension. In `veomni_sdpa` and `veomni_sage_attention`,
-this split happens after the Ulysses sequence-gather/head-scatter exchange so
-global `cu_seqlens` match the gathered sequence length. Single-segment metadata
-or calls already isolated by a 3D/4D dense `attention_mask` strip the packed
-metadata without splitting.
+along the sequence dimension. In `veomni_sdpa`, `veomni_eager`, and
+`veomni_sage_attention`, this split happens after the Ulysses
+sequence-gather/head-scatter exchange so global `cu_seqlens` match the gathered
+sequence length. Single-segment metadata or calls already isolated by a 3D/4D
+dense `attention_mask` strip the packed metadata without splitting.
 
 ## FlexAttention mask contract
 

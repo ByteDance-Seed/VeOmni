@@ -29,6 +29,7 @@ from tests.models.compare import (
     assert_eager_matches_hf,
     assert_outputs_and_grads_match,
     eager_ops_config,
+    pin_eager_attn_implementation,
 )
 from tests.models.tiny_configs import tiny_glm_moe_dsa_config as _tiny_config
 from tests.ops.tol import EAGER_ATOL, EAGER_RTOL
@@ -42,6 +43,16 @@ def _glm_cls(architecture: str):
     from veomni.models.transformers.glm_moe_dsa import modeling_glm_moe_dsa as gen
 
     return getattr(gen, architecture)
+
+
+def _build_hf(config: GlmMoeDsaConfig, architecture: str = "GlmMoeDsaForCausalLM"):
+    """Construct an isolated upstream HF reference model pinned to ``eager``."""
+    import copy
+
+    hf_cls = HFGlmMoeDsaForCausalLM if architecture == "GlmMoeDsaForCausalLM" else HFGlmMoeDsaModel
+    model = hf_cls(copy.deepcopy(config))
+    pin_eager_attn_implementation(model)
+    return model
 
 
 def _build_ours(
@@ -81,7 +92,7 @@ def test_glm_moe_dsa_eager_matches_hf():
 def test_glm_moe_dsa_base_model_eager_matches_hf():
     torch.manual_seed(0)
     config = _tiny_config("GlmMoeDsaModel")
-    hf = HFGlmMoeDsaModel(config)
+    hf = _build_hf(config, architecture="GlmMoeDsaModel")
     ours = _build_ours(config, architecture="GlmMoeDsaModel")
     _assert_dsa_wiring(ours.layers[0].self_attn)
     ours.load_state_dict(hf.state_dict())
@@ -104,7 +115,7 @@ def test_glm_moe_dsa_chunked_prefill_and_independent_decode_matches_hf():
     """Compressed DSA KV lives on past_key_values, not module buffers."""
     torch.manual_seed(0)
     config = _tiny_config()
-    hf = HFGlmMoeDsaForCausalLM(config).eval()
+    hf = _build_hf(config).eval()
     ours = _build_ours(config).eval()
     _assert_dsa_wiring(ours.model.layers[0].self_attn)
     ours.load_state_dict(hf.state_dict())
@@ -135,7 +146,7 @@ def test_glm_moe_dsa_chunked_prefill_and_independent_decode_matches_hf():
 def test_glm_moe_dsa_cache_reorder_matches_hf():
     torch.manual_seed(1)
     config = _tiny_config()
-    hf = HFGlmMoeDsaForCausalLM(config).eval()
+    hf = _build_hf(config).eval()
     ours = _build_ours(config).eval()
     ours.load_state_dict(hf.state_dict())
 
@@ -305,7 +316,7 @@ def test_glm_moe_dsa_eager_dropout_train_eval_seed_and_grads():
 def test_glm_moe_dsa_eager_output_attentions_matches_hf():
     torch.manual_seed(0)
     config = _tiny_config()
-    hf = HFGlmMoeDsaForCausalLM(config)
+    hf = _build_hf(config)
     ours = _build_ours(config)
     ours.load_state_dict(hf.state_dict())
     input_ids = torch.randint(3, config.vocab_size, (2, 8))

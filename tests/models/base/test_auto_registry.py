@@ -803,7 +803,7 @@ def test_build_foundation_model_constructs_registered_model(model_case: _ModelCa
         op = attrgetter(path)(model)
         assert isinstance(op, VeomniOp), path
         assert op.op == expected_op, path
-        assert op.impl == "eager", path
+        assert op.impl == ("veomni_eager" if expected_op == "attention" else "eager"), path
     if IS_NPU_AVAILABLE and model_case.model_type == "glm_moe_dsa":
         assert not hasattr(model.model.layers[0].self_attn.indexer, "veomni_dsa_indexer")
 
@@ -859,7 +859,7 @@ def test_model_instances_keep_distinct_impls(model_case: _ModelCase, available_n
 
     eager = construct(eager_config)
     selected_op = attrgetter(selected_path)
-    assert selected_op(eager).impl == "eager"
+    assert selected_op(eager).impl == ("veomni_eager" if selected_op_name == "attention" else "eager")
     eager_bindings = _op_bindings(eager, selected_path)
     field, alternate_impl = _ALTERNATE_OP_IMPLS[selected_op(eager).op]
     alternate_config = eager_ops_config()
@@ -992,14 +992,14 @@ def test_build_foundation_model_preserves_subconfig_independent_attention():
     config._set_ops_implementation(eager_ops_config())
     config.vision_config._set_ops_implementation({"attn_implementation": "sdpa"})
 
-    assert config._attn_implementation == "eager"
-    assert config.text_config._attn_implementation == "eager"
+    assert config._attn_implementation == "veomni_eager"
+    assert config.text_config._attn_implementation == "veomni_eager"
     assert config.vision_config._attn_implementation == "veomni_sdpa"
 
     model = build_foundation_model(config_path=config, init_device="meta")
-    assert model.config.text_config._attn_implementation == "eager"
+    assert model.config.text_config._attn_implementation == "veomni_eager"
     assert model.config.vision_config._attn_implementation == "veomni_sdpa"
-    assert model.model.language_model.layers[0].self_attn.veomni_attn.impl == "eager"
+    assert model.model.language_model.layers[0].self_attn.veomni_attn.impl == "veomni_eager"
     assert model.model.visual.blocks[0].attn.veomni_attn.impl == "veomni_sdpa"
 
     # Explicit attn_implementation kwarg overrides all sub-configs.
@@ -1166,4 +1166,4 @@ def test_cpu_hf_reference_constructs_without_optional_attention_kernels(monkeypa
     for module in reference.modules():
         module_config = getattr(module, "config", None)
         if isinstance(module_config, PretrainedConfig):
-            assert module_config._attn_implementation in ("eager", "sdpa", "veomni_sdpa")
+            assert module_config._attn_implementation in ("eager", "veomni_eager", "sdpa", "veomni_sdpa")

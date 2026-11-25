@@ -275,4 +275,4 @@ def test_offline_convert_honours_the_attention_backend_override(hf_root, tmp_pat
     from veomni.models.seed_omni.modules.qwen3_moe.llm.configuration import Qwen3MoeLlmConfig
 
     reloaded = OMNI_MODEL_REGISTRY[MOE_LLM]()(Qwen3MoeLlmConfig.from_pretrained(out / MOE_LLM))
-    assert reloaded.config.text_config._attn_implementation == "eager"
+    assert reloaded.config.text_config._attn_implementation == "veomni_eager"

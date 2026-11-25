@@ -57,7 +57,6 @@ def eager_attention_mask_builder(
     disabled so eager receives an explicit additive mask, while bidirectional
     elision remains available when explicitly requested.
     """
-    del skip_ulysses
     kwargs = strip_sdpa_packed_metadata(kwargs, batch_size=batch_size, dense_mask=None)
     kwargs.pop("allow_is_causal_skip", None)
     mask = _dense_attention_mask_builder(
@@ -68,7 +67,7 @@ def eager_attention_mask_builder(
         kv_offset,
         mask_function,
         attention_mask,
-        skip_ulysses=True,
+        skip_ulysses=skip_ulysses,
         allow_is_causal_skip=False,
         **kwargs,
     )

@@ -194,8 +194,8 @@ def test_pretrained_config_attn_implementation_bidirectional_sync():
         num_attention_heads=4,
         attn_implementation="eager",
     )
-    assert cfg_hf_attn._attn_implementation == "eager"
-    assert cfg_hf_attn.ops_config.attn_implementation == "eager"
+    assert cfg_hf_attn._attn_implementation == "veomni_eager"
+    assert cfg_hf_attn.ops_config.attn_implementation == "veomni_eager"
 
     # 2. When both attn_implementation and ops_implementation["attn_implementation"] are passed at init,
     # ops_implementation wins and updates _attn_implementation.
@@ -228,8 +228,8 @@ def test_pretrained_config_attn_implementation_bidirectional_sync():
         attn_implementation="eager",
     )
     HFLlamaForCausalLM(cfg_bare)
-    assert cfg_bare._attn_implementation == "eager"
-    assert cfg_bare.ops_config.attn_implementation == "eager"
+    assert cfg_bare._attn_implementation == "veomni_eager"
+    assert cfg_bare.ops_config.attn_implementation == "veomni_eager"
 
 
 @pytest.mark.parametrize("base_kind", ["model", "omni_module"])
@@ -260,11 +260,11 @@ def test_custom_config_adapts_declared_subconfig_schema(tmp_path, base_kind):
     )
     assert isinstance(config.backbone, PretrainedConfig)
     assert config.backbone.text_config.ops_config.attn_implementation == "veomni_sdpa"
-    assert config.backbone.vision_config.ops_config.attn_implementation == "eager"
+    assert config.backbone.vision_config.ops_config.attn_implementation == "veomni_eager"
     config.save_pretrained(tmp_path)
     restored = CustomConfig.from_pretrained(tmp_path)
     assert restored.backbone.text_config.ops_config.attn_implementation == "veomni_sdpa"
-    assert restored.backbone.vision_config.ops_config.attn_implementation == "eager"
+    assert restored.backbone.vision_config.ops_config.attn_implementation == "veomni_eager"
 
 
 @pytest.mark.parametrize("family", ["deepseek_v4", "qwen2_5_omni", "qwen3_omni_moe"])
@@ -282,7 +282,7 @@ def test_handwritten_hf_config_subtrees_roundtrip(tmp_path, family):
 
     def check(node):
         assert isinstance(node, VeOmniPretrainedConfig)
-        assert node.ops_config.attn_implementation == "eager"
+        assert node.ops_config.attn_implementation == "veomni_eager"
         for key, child_class in node.sub_configs.items():
             if isinstance(child_class, type) and issubclass(child_class, PretrainedConfig):
                 assert issubclass(child_class, VeOmniPretrainedConfig)
@@ -323,12 +323,12 @@ def test_composite_qwen3_vl_config_subconfig_merge_isolation_and_save(tmp_path):
     }
     assert cfg.vision_config.ops_implementation == {
         "rms_norm_implementation": "eager",
-        "attn_implementation": "eager",
+        "attn_implementation": "veomni_eager",
     }
     assert cfg.text_config._attn_implementation == "veomni_sdpa"
-    assert cfg.vision_config._attn_implementation == "eager"
+    assert cfg.vision_config._attn_implementation == "veomni_eager"
     assert cfg.text_config.ops_config.attn_implementation == "veomni_sdpa"
-    assert cfg.vision_config.ops_config.attn_implementation == "eager"
+    assert cfg.vision_config.ops_config.attn_implementation == "veomni_eager"
 
     # Sub-configs must own distinct dicts so mutating one does not leak to siblings or root.
     assert cfg.text_config.ops_implementation is not cfg.ops_implementation
@@ -343,13 +343,13 @@ def test_composite_qwen3_vl_config_subconfig_merge_isolation_and_save(tmp_path):
         "attn_implementation": "veomni_sdpa",
     }
     assert "ops_implementation" not in raw["text_config"]
-    assert raw["vision_config"]["ops_implementation"] == {"attn_implementation": "eager"}
+    assert raw["vision_config"]["ops_implementation"] == {"attn_implementation": "veomni_eager"}
 
     reloaded = Qwen3VLConfig.from_pretrained(tmp_path)
     assert reloaded.text_config.ops_config.rms_norm_implementation == "eager"
     assert reloaded.text_config.ops_config.attn_implementation == "veomni_sdpa"
     assert reloaded.vision_config.ops_config.rms_norm_implementation == "eager"
-    assert reloaded.vision_config.ops_config.attn_implementation == "eager"
+    assert reloaded.vision_config.ops_config.attn_implementation == "veomni_eager"
 
 
 def test_three_level_nested_config_preserves_grandchild_overrides(tmp_path, monkeypatch):
@@ -385,8 +385,8 @@ def test_three_level_nested_config_preserves_grandchild_overrides(tmp_path, monk
     assert cfg.thinker_config.vision_config.ops_config.rms_norm_implementation == "eager"
     assert cfg.thinker_config.vision_config.ops_config.attn_implementation == "veomni_sdpa"
     assert cfg.thinker_config.text_config.ops_config.rms_norm_implementation == "liger_kernel"
-    assert cfg.thinker_config.text_config.ops_config.attn_implementation == "eager"
-    assert cfg.thinker_config.text_config._attn_implementation == "eager"
+    assert cfg.thinker_config.text_config.ops_config.attn_implementation == "veomni_eager"
+    assert cfg.thinker_config.text_config._attn_implementation == "veomni_eager"
 
     cfg.save_pretrained(tmp_path)
     raw = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
@@ -394,15 +394,15 @@ def test_three_level_nested_config_preserves_grandchild_overrides(tmp_path, monk
     assert "ops_implementation" not in raw["thinker_config"]["vision_config"]
     assert raw["thinker_config"]["text_config"]["ops_implementation"] == {
         "rms_norm_implementation": "liger_kernel",
-        "attn_implementation": "eager",
+        "attn_implementation": "veomni_eager",
     }
 
     reloaded = Qwen3OmniMoeConfig.from_pretrained(tmp_path)
     assert reloaded.thinker_config.vision_config.ops_config.rms_norm_implementation == "eager"
     assert reloaded.thinker_config.vision_config.ops_config.attn_implementation == "veomni_sdpa"
     assert reloaded.thinker_config.text_config.ops_config.rms_norm_implementation == "liger_kernel"
-    assert reloaded.thinker_config.text_config.ops_config.attn_implementation == "eager"
-    assert reloaded.thinker_config.text_config._attn_implementation == "eager"
+    assert reloaded.thinker_config.text_config.ops_config.attn_implementation == "veomni_eager"
+    assert reloaded.thinker_config.text_config._attn_implementation == "veomni_eager"
 
 
 @pytest.mark.parametrize("sub_as_instance", [False, True], ids=["dict", "config_instance"])
@@ -428,17 +428,17 @@ def test_subconfig_hf_attn_implementation_merges_and_roundtrips(tmp_path, sub_as
 
     assert cfg.text_config._attn_implementation == "veomni_sdpa"
     assert cfg.text_config.ops_config.attn_implementation == "veomni_sdpa"
-    assert cfg.vision_config._attn_implementation == "eager"
-    assert cfg.vision_config.ops_config.attn_implementation == "eager"
-    assert cfg.vision_config.ops_implementation["attn_implementation"] == "eager"
+    assert cfg.vision_config._attn_implementation == "veomni_eager"
+    assert cfg.vision_config.ops_config.attn_implementation == "veomni_eager"
+    assert cfg.vision_config.ops_implementation["attn_implementation"] == "veomni_eager"
 
     save_dir = tmp_path / f"{sub_as_instance}_{parent_via_hf_attn}"
     cfg.save_pretrained(save_dir)
     reloaded = Qwen3VLConfig.from_pretrained(save_dir)
     assert reloaded.text_config._attn_implementation == "veomni_sdpa"
     assert reloaded.text_config.ops_config.attn_implementation == "veomni_sdpa"
-    assert reloaded.vision_config._attn_implementation == "eager"
-    assert reloaded.vision_config.ops_config.attn_implementation == "eager"
+    assert reloaded.vision_config._attn_implementation == "veomni_eager"
+    assert reloaded.vision_config.ops_config.attn_implementation == "veomni_eager"
 
 
 def test_nested_attn_implementation_mapping_overrides_grandchild():
@@ -504,8 +504,8 @@ def test_sparse_load_override_preserves_subconfig_choices(tmp_path, monkeypatch)
     reloaded_empty = Qwen3VLConfig.from_pretrained(vl_dir, ops_implementation={})
     assert reloaded_empty.text_config._attn_implementation == "veomni_sdpa"
     assert reloaded_empty.text_config.ops_config.attn_implementation == "veomni_sdpa"
-    assert reloaded_empty.vision_config._attn_implementation == "eager"
-    assert reloaded_empty.vision_config.ops_config.attn_implementation == "eager"
+    assert reloaded_empty.vision_config._attn_implementation == "veomni_eager"
+    assert reloaded_empty.vision_config.ops_config.attn_implementation == "veomni_eager"
 
     # Overriding only rms_norm_implementation must propagate RMSNorm without clobbering vision's attention.
     reloaded_rms = Qwen3VLConfig.from_pretrained(
@@ -517,8 +517,8 @@ def test_sparse_load_override_preserves_subconfig_choices(tmp_path, monkeypatch)
     assert reloaded_rms.vision_config.ops_config.rms_norm_implementation == "liger_kernel"
     assert reloaded_rms.text_config._attn_implementation == "veomni_sdpa"
     assert reloaded_rms.text_config.ops_config.attn_implementation == "veomni_sdpa"
-    assert reloaded_rms.vision_config._attn_implementation == "eager"
-    assert reloaded_rms.vision_config.ops_config.attn_implementation == "eager"
+    assert reloaded_rms.vision_config._attn_implementation == "veomni_eager"
+    assert reloaded_rms.vision_config.ops_config.attn_implementation == "veomni_eager"
 
     # Three-level config (root -> thinker_config -> text_config) preserves grandchild attention under sparse override.
     omni_dir = tmp_path / "qwen3_omni"
@@ -534,8 +534,8 @@ def test_sparse_load_override_preserves_subconfig_choices(tmp_path, monkeypatch)
     )
     assert omni_reloaded.thinker_config.vision_config.ops_config.attn_implementation == "veomni_sdpa"
     assert omni_reloaded.thinker_config.vision_config.ops_config.rms_norm_implementation == "liger_kernel"
-    assert omni_reloaded.thinker_config.text_config._attn_implementation == "eager"
-    assert omni_reloaded.thinker_config.text_config.ops_config.attn_implementation == "eager"
+    assert omni_reloaded.thinker_config.text_config._attn_implementation == "veomni_eager"
+    assert omni_reloaded.thinker_config.text_config.ops_config.attn_implementation == "veomni_eager"
     assert omni_reloaded.thinker_config.text_config.ops_config.rms_norm_implementation == "liger_kernel"
 
 
@@ -690,7 +690,7 @@ def test_cross_device_load_applies_overrides_before_hardware_validation(tmp_path
     assert vl_npu.text_config.ops_config.rms_norm_implementation == "torch_npu"
     assert vl_npu.vision_config.ops_config.rms_norm_implementation == "torch_npu"
     assert vl_npu.text_config.ops_config.attn_implementation == "veomni_sdpa"
-    assert vl_npu.vision_config.ops_config.attn_implementation == "eager"
+    assert vl_npu.vision_config.ops_config.attn_implementation == "veomni_eager"
 
     mod_npu = FakeModuleAConfig.from_pretrained(
         module_dir,
@@ -770,7 +770,7 @@ config = pickle.loads(sys.stdin.buffer.read())
 assert type(config) is get_veomni_config_class(Qwen3VLConfig)
 assert isinstance(config.text_config, VeOmniPretrainedConfig)
 assert config.text_config._attn_implementation == 'veomni_sdpa'
-assert config.vision_config._attn_implementation == 'eager'
+assert config.vision_config._attn_implementation == 'veomni_eager'
 assert '_attn_implementation_internal' not in vars(config)
 """
     subprocess.run([sys.executable, "-c", script], input=pickle.dumps(config), check=True, capture_output=True)
@@ -793,9 +793,9 @@ def test_config_loader_preserves_nested_hf_attention_keywords(tmp_path):
     loaded = build_config(tmp_path)
     assert type(loaded) is get_veomni_config_class(Qwen3VLConfig)
     assert isinstance(loaded.text_config, VeOmniPretrainedConfig)
-    assert loaded._attn_implementation == "eager"
+    assert loaded._attn_implementation == "veomni_eager"
     assert loaded.text_config._attn_implementation == "veomni_sdpa"
-    assert loaded.vision_config._attn_implementation == "eager"
+    assert loaded.vision_config._attn_implementation == "veomni_eager"
 
 
 def test_attention_has_one_storage_and_private_hf_write_is_local():
@@ -808,7 +808,7 @@ def test_attention_has_one_storage_and_private_hf_write_is_local():
     config._attn_implementation_internal = "sdpa"
     assert config.ops_implementation["attn_implementation"] == "sdpa"
     assert config.ops_config.attn_implementation == config._attn_implementation == "sdpa"
-    assert config.vision_config._attn_implementation == "eager"
+    assert config.vision_config._attn_implementation == "veomni_eager"
     assert "_attn_implementation_internal" not in vars(config)
     config.ops_implementation["attn_implementation"] = "eager"
     assert config._attn_implementation_internal == "eager"
@@ -830,7 +830,7 @@ def test_omni_config_uses_module_config_base_and_preserves_root_ops():
         ops_implementation={"attn_implementation": "eager"},
     )
     assert isinstance(config, VeOmniPretrainedConfig)
-    assert config.ops_implementation == {"attn_implementation": "eager"}
+    assert config.ops_implementation == {"attn_implementation": "veomni_eager"}
     # Stable handwritten subclasses of an adapter must retain their exact type.
     custom = DeepseekV4Config(attn_implementation="eager")
     assert type(pickle.loads(pickle.dumps(custom))) is DeepseekV4Config
@@ -886,7 +886,7 @@ def test_remote_config_export_preserves_native_source_and_reload_target(tmp_path
     restored = build_config(exported, trust_remote_code=True, local_files_only=True, **overrides)
     assert isinstance(restored, VeOmniPretrainedConfig)
     assert restored.hidden_size == 8
-    assert restored.ops_config.attn_implementation == "eager"
+    assert restored.ops_config.attn_implementation == "veomni_eager"
 
 
 @pytest.mark.parametrize("child_as_instance", [False, True])
@@ -903,7 +903,7 @@ def test_typed_parent_preserves_explicit_child_ops(child_as_instance):
     )
     assert config.ops_config.attn_implementation == "veomni_sdpa"
     assert config.text_config.ops_config.attn_implementation == "veomni_sdpa"
-    assert config.vision_config.ops_config.attn_implementation == "eager"
+    assert config.vision_config.ops_config.attn_implementation == "veomni_eager"
 
 
 def test_child_default_reset_survives_save_and_reload(tmp_path):
@@ -916,8 +916,8 @@ def test_child_default_reset_survives_save_and_reload(tmp_path):
     assert expected != config.ops_config.attn_implementation
     config.save_pretrained(tmp_path)
     restored = Config.from_pretrained(tmp_path)
-    assert restored.ops_config.attn_implementation == "eager"
-    assert restored.text_config.ops_config.attn_implementation == "eager"
+    assert restored.ops_config.attn_implementation == "veomni_eager"
+    assert restored.text_config.ops_config.attn_implementation == "veomni_eager"
     assert restored.vision_config.ops_config.attn_implementation == expected
 
 
@@ -937,7 +937,7 @@ def test_native_child_load_override_receives_ops(tmp_path, entrypoint, saved_roo
     config = load(tmp_path, vision_config=child, ops_implementation=make_eager_ops_config())
     assert isinstance(config.vision_config, VeOmniPretrainedConfig)
     assert config.vision_config.depth == 1
-    assert config.vision_config.ops_config.attn_implementation == "eager"
+    assert config.vision_config.ops_config.attn_implementation == "veomni_eager"
     assert config.vision_config.ops_config.rotary_pos_emb_vision_implementation == "eager"
 
 

@@ -12,18 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pure-PyTorch eager attention reference implementation."""
+"""Pure-PyTorch eager attention implementation with optional Ulysses SP support."""
 
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
+from .....distributed.parallel_state import get_parallel_state
 from ..helper import (
     extract_packed_varlen_cu_seqlens,
     packed_split_attention_forward,
 )
-from ..ulysses import should_apply_ulysses
+from ..ulysses import (
+    prepare_ulysses_qkv,
+    restore_ulysses_output,
+    should_apply_ulysses,
+    slice_ulysses_head_auxiliary,
+)
 
 
 def _repeat_kv(hidden_states: torch.Tensor, num_key_value_groups: int) -> torch.Tensor:
@@ -35,6 +42,32 @@ def _repeat_kv(hidden_states: torch.Tensor, num_key_value_groups: int) -> torch.
         batch, num_key_value_heads, num_key_value_groups, seq_len, head_dim
     )
     return hidden_states.reshape(batch, num_key_value_heads * num_key_value_groups, seq_len, head_dim)
+
+
+def _slice_ulysses_head_tensor(
+    tensor: torch.Tensor | None,
+    *,
+    query_head_count: int,
+    local_query_head_count: int,
+    group: dist.ProcessGroup,
+    name: str,
+) -> torch.Tensor | None:
+    """Select this rank's query-head slice of a 3-D/4-D mask or bias after head scattering."""
+    if tensor is None or tensor.ndim < 3:
+        return tensor
+
+    head_count = tensor.shape[-3]
+    if head_count in (1, local_query_head_count):
+        return tensor
+    if head_count != query_head_count:
+        raise ValueError(
+            f"Eager attention with Ulysses requires the {name} head dimension to be 1, "
+            f"the local query-head count ({local_query_head_count}), or the global query-head count "
+            f"({query_head_count}); got {head_count}."
+        )
+
+    head_start = dist.get_rank(group) * local_query_head_count
+    return tensor.narrow(-3, head_start, local_query_head_count)
 
 
 def _build_unmasked_eager_mask(
@@ -162,22 +195,19 @@ def eager_attention_forward(
     skip_ulysses: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run pure-PyTorch eager attention with optional packed-segment splitting.
+    """Run pure-PyTorch eager attention with optional Ulysses exchange and packed-segment splitting.
 
     Supports GQA expansion derived from Q/K head counts, explicit float
     additive or boolean masks, unmasked ``is_causal`` / ``sliding_window``
     visibility, ``softcap``, ``position_bias``, and attention sinks
-    (``s_aux``). Unmasked batch-1 multi-segment ``cu_seqlens`` calls split
-    Q/K/V per segment and return ``(output, None)``; unpacked or masked calls
-    return ``(output, attn_weights)``.
+    (``s_aux``). When Ulysses sequence parallelism is active and
+    ``skip_ulysses`` is ``False``, Q/K/V are gathered along sequence and
+    scattered across heads before attention (slicing global head-indexed
+    masks, ``position_bias``, and ``s_aux`` to the local head shard), and the
+    output is restored to sequence-sharded layout with ``(output, None)``.
+    Unmasked batch-1 multi-segment ``cu_seqlens`` calls split Q/K/V per
+    segment after any Ulysses gather and return ``(output, None)``.
     """
-    if should_apply_ulysses(skip_ulysses=skip_ulysses):
-        raise ValueError(
-            "Attention implementation 'veomni_eager' does not perform Ulysses sequence-parallel exchanges yet; "
-            "use a Ulysses-enabled 'veomni_*' attention implementation (such as 'veomni_sdpa') or pass "
-            "skip_ulysses=True when Q/K/V are already gathered."
-        )
-
     kwargs, packed_cu_seqlens = extract_packed_varlen_cu_seqlens(
         kwargs,
         batch_size=query.shape[0],
@@ -187,9 +217,54 @@ def eager_attention_forward(
     if any(dim == 0 for tensor in (query, key, value) for dim in tensor.shape):
         raise ValueError("Eager attention does not support query/key/value tensors with zero dimensions.")
 
+    parallel_state = get_parallel_state()
+    ulysses_enabled = should_apply_ulysses(skip_ulysses=skip_ulysses)
+    if ulysses_enabled:
+        query, key, value, query_head_count = prepare_ulysses_qkv(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            group=parallel_state.ulysses_group,
+            ulysses_size=parallel_state.ulysses_size,
+        )
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        local_query_head_count = query.shape[1]
+        attention_mask = _slice_ulysses_head_tensor(
+            attention_mask,
+            query_head_count=query_head_count,
+            local_query_head_count=local_query_head_count,
+            group=parallel_state.ulysses_group,
+            name="attention_mask",
+        )
+        position_bias = kwargs.get("position_bias")
+        if position_bias is not None:
+            kwargs = {
+                **kwargs,
+                "position_bias": _slice_ulysses_head_tensor(
+                    position_bias,
+                    query_head_count=query_head_count,
+                    local_query_head_count=local_query_head_count,
+                    group=parallel_state.ulysses_group,
+                    name="position_bias",
+                ),
+            }
+        s_aux = kwargs.get("s_aux")
+        if s_aux is not None:
+            kwargs = {
+                **kwargs,
+                "s_aux": slice_ulysses_head_auxiliary(
+                    s_aux,
+                    query_head_count=query_head_count,
+                    local_query_head_count=local_query_head_count,
+                    group=parallel_state.ulysses_group,
+                ),
+            }
+
     if packed_cu_seqlens is not None:
         cu_seqlens_q, cu_seqlens_k = packed_cu_seqlens
-        return packed_split_attention_forward(
+        attn_output, attn_weights = packed_split_attention_forward(
             _eager_attention_core,
             module,
             query,
@@ -203,16 +278,22 @@ def eager_attention_forward(
             softcap=softcap,
             **kwargs,
         )
+    else:
+        attn_output, attn_weights = _eager_attention_core(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=dropout,
+            scaling=scaling,
+            sliding_window=sliding_window,
+            softcap=softcap,
+            **kwargs,
+        )
 
-    return _eager_attention_core(
-        module,
-        query,
-        key,
-        value,
-        attention_mask,
-        dropout=dropout,
-        scaling=scaling,
-        sliding_window=sliding_window,
-        softcap=softcap,
-        **kwargs,
-    )
+    if ulysses_enabled:
+        attn_output = restore_ulysses_output(attn_output, group=parallel_state.ulysses_group)
+        attn_weights = None
+
+    return attn_output, attn_weights

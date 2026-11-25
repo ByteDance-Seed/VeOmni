@@ -241,7 +241,7 @@ def test_qwen3_5_moe_npu_generated_attention_binds_ops_and_runs_eager_forward(mo
     model = npu_modeling.Qwen3_5MoeForCausalLM(config).eval()
     attn = model.model.layers[0].self_attn
     assert attn.veomni_rope.impl == "eager"
-    assert attn.veomni_attn.impl == "eager"
+    assert attn.veomni_attn.impl == "veomni_eager"
     assert attn.q_norm.veomni_rms_norm.impl == "eager"
     assert attn.k_norm.veomni_rms_norm.impl == "eager"
 

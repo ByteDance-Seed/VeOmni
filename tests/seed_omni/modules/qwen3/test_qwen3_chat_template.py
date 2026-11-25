@@ -144,7 +144,7 @@ def test_qwen3_llm_and_text_encoder_save_reload_via_registry(tmp_path: Path):
             ops_implementation={"attn_implementation": "eager", "rms_norm_implementation": "eager"},
         )
     )
-    assert llm.config.text_config._attn_implementation == "eager"
+    assert llm.config.text_config._attn_implementation == "veomni_eager"
     assert llm.config.text_config.ops_config.rms_norm_implementation == "eager"
     save_as_omni(tmp_path / "llm", "qwen3_llm", llm)
     cfg, llm2 = load_from_omni(tmp_path / "llm", "qwen3_llm")

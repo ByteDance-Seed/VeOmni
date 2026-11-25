@@ -31,7 +31,10 @@ from transformers.masking_utils import (
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.attention.attention_cases import clone_qkv, dense_mask, math_sdpa_reference
+from tests.ops.attention.utils import UlyssesHelperRecorder
 from tests.ops.tol import EAGER_ATOL, EAGER_GRAD_ATOL, EAGER_GRAD_RTOL, EAGER_RTOL
+from veomni.arguments import OpsImplementationConfig
+from veomni.models.utils.mask_utils import _resolve_skip_ulysses
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.attention import ulysses as ulysses_backend
 from veomni.ops.kernels.attention.mask import eager as eager_mask_backend
@@ -374,9 +377,8 @@ def test_eager_attention_rejects_invalid_inputs():
         eager_backend.eager_attention_forward(module, query, query, query, None, s_aux=torch.zeros(3))
 
 
-@pytest.mark.parametrize("entrypoint", ("adapter", "veomni_eager", "eager"))
-def test_eager_attention_rejects_active_ulysses_unless_skipped(monkeypatch, entrypoint: str):
-    """Batch 1 eager/veomni_eager fail closed under active Ulysses unless skip_ulysses=True."""
+def test_raw_eager_rejects_active_ulysses_unless_skipped(monkeypatch):
+    """Raw ``eager`` rejects active Ulysses unless ``skip_ulysses=True``."""
     monkeypatch.setattr(
         ulysses_backend,
         "get_parallel_state",
@@ -386,11 +388,97 @@ def test_eager_attention_rejects_active_ulysses_unless_skipped(monkeypatch, entr
     query = torch.randn(1, 4, 4, 8)
 
     with pytest.raises(ValueError, match="does not perform Ulysses sequence-parallel exchanges"):
-        _eager_forward(entrypoint)(module, query, query, query, None)
+        _eager_forward("eager")(module, query, query, query, None)
 
-    out, weights = _eager_forward(entrypoint)(module, query, query, query, None, skip_ulysses=True)
+    out, weights = _eager_forward("eager")(module, query, query, query, None, skip_ulysses=True)
     assert out.shape == (1, 4, 4, 8)
     assert weights is not None
+
+
+@pytest.mark.parametrize("entrypoint", ("adapter", "veomni_eager"))
+def test_veomni_eager_delegates_active_ulysses_and_slices_head_tensors(monkeypatch, entrypoint: str):
+    """``veomni_eager`` delegates active Ulysses exchanges and slices global head-indexed tensors."""
+    group = object()
+    recorder = UlyssesHelperRecorder()
+    captured = {}
+
+    def fake_core(module, query, key, value, attention_mask, **kwargs):
+        recorder.calls.append(("backend", query, key, value))
+        captured["query"] = query
+        captured["mask"] = attention_mask
+        captured["position_bias"] = kwargs.get("position_bias")
+        captured["s_aux"] = kwargs.get("s_aux")
+        return query.transpose(1, 2), torch.zeros(query.shape[0], query.shape[1], query.shape[2], key.shape[2])
+
+    monkeypatch.setattr(
+        eager_backend,
+        "get_parallel_state",
+        lambda: SimpleNamespace(ulysses_group=group, ulysses_size=2, async_enabled=False),
+    )
+    monkeypatch.setattr(eager_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
+    monkeypatch.setattr(eager_backend, "prepare_ulysses_qkv", recorder.prepare)
+    monkeypatch.setattr(eager_backend, "_eager_attention_core", fake_core)
+    monkeypatch.setattr(eager_backend, "restore_ulysses_output", recorder.restore)
+    monkeypatch.setattr(eager_backend.dist, "get_rank", lambda _group: 1)
+    monkeypatch.setattr(ulysses_backend.dist, "get_rank", lambda _group: 1)
+
+    query = torch.randn(1, 4, 8, 8)
+    mask = torch.arange(4, dtype=torch.float32).view(1, 4, 1, 1).expand(1, 4, 8, 8)
+    bias = torch.arange(10, 14, dtype=torch.float32).view(1, 4, 1, 1).expand(1, 4, 8, 8)
+    sinks = torch.tensor([0.1, 0.2, 0.3, 0.4])
+
+    output, weights = _eager_forward(entrypoint)(
+        SimpleNamespace(is_causal=True, training=False),
+        query,
+        query[:, :2],
+        query[:, :2],
+        attention_mask=mask,
+        position_bias=bias,
+        s_aux=sinks,
+    )
+
+    assert [call[0] for call in recorder.calls] == ["prepare", "backend", "restore"]
+    assert recorder.calls[0][1].shape == (1, 8, 4, 8)
+    assert recorder.calls[0][4:] == (group, 2)
+    assert output.shape == (1, 8, 2, 8)
+    assert weights is None
+    torch.testing.assert_close(captured["mask"], mask[:, 2:4])
+    torch.testing.assert_close(captured["position_bias"], bias[:, 2:4])
+    torch.testing.assert_close(captured["s_aux"], sinks[2:4])
+
+
+def test_veomni_eager_skip_ulysses_skips_exchange(monkeypatch):
+    """``skip_ulysses=True`` keeps ``veomni_eager`` local and returns attention weights."""
+    monkeypatch.setattr(eager_backend, "should_apply_ulysses", lambda *, skip_ulysses=False: not skip_ulysses)
+    monkeypatch.setattr(
+        eager_backend,
+        "prepare_ulysses_qkv",
+        lambda *args, **kwargs: pytest.fail("skip_ulysses must not exchange QKV"),
+    )
+    query = torch.randn(1, 4, 6, 8)
+    out, weights = _eager_forward("veomni_eager")(
+        SimpleNamespace(is_causal=True, training=False),
+        query,
+        query[:, :2],
+        query[:, :2],
+        attention_mask=None,
+        skip_ulysses=True,
+    )
+    assert out.shape == (1, 6, 4, 8)
+    assert weights is not None
+
+
+def test_eager_normalization_and_mask_utils_ulysses_routing(monkeypatch):
+    """``eager`` normalizes to ``veomni_eager`` only under ``MODELING_BACKEND=veomni``."""
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    assert OpsImplementationConfig(attn_implementation="eager").attn_implementation == "veomni_eager"
+
+    monkeypatch.setenv("MODELING_BACKEND", "hf")
+    assert OpsImplementationConfig(attn_implementation="eager").attn_implementation == "eager"
+
+    assert _resolve_skip_ulysses("eager", {}) is True
+    assert _resolve_skip_ulysses("veomni_eager", {}) is False
+    assert _resolve_skip_ulysses("veomni_eager", {"skip_ulysses": True}) is True
 
 
 def test_eager_attention_mask_builder_aligns_with_hf_eager_mask():

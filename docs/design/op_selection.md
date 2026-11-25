@@ -453,7 +453,7 @@ model:
 
 | Public value | Implementation | Sequence Parallel | Requirements |
 |-------|--------|:-:|---|
-| `eager` | Model-local PyTorch eager; otherwise `veomni_sdpa` | Yes for the SDPA path | — |
+| `eager` | Pure-PyTorch `veomni_eager` (`standard/eager.py`) | Yes after rewrite to `veomni_eager` | — |
 | `sdpa` | `F.scaled_dot_product_attention` | Yes after rewrite to `veomni_sdpa` | — |
 | `flash_attention_2` | Flash Attention v2 | Yes after rewrite | `flash-attn` |
 | `flash_attention_3` | Flash Attention v3 | Yes after rewrite | `flash-attn-interface` |
@@ -477,6 +477,7 @@ public values to VeOmni adapters:
 | `magi_attention` | `veomni_magi_attention` |
 | `sage_attention` | `veomni_sage_attention` |
 | `sdpa` | `veomni_sdpa` |
+| `eager` | `veomni_eager` |
 
 `apply_veomni_attention_patch()` registers those names and matching mask
 builders on Transformers' `ALL_ATTENTION_FUNCTIONS` /
@@ -491,12 +492,15 @@ ROCm-only GPU requirement and does not resolve on NVIDIA, Ascend, or MLU. Both
 `veomni_flash_attention_aiter` name are rejected on Ascend before Transformers
 can select its NPU attention path.
 
-The registered `eager` row uses the modeling file's `eager_attention_forward`
-when present, preserving model-specific math such as softcap and attention
-sinks. For modules without one (Flux, Qwen-Image, LTX-2.3, MiniMax-H3), that row
-forwards to `veomni_sdpa`, including its mask, packed-sequence, and Ulysses
-handling. Modeling reads `config.ops_config.attn_implementation` directly.
-Masked calls with a mask-less backend still use a separate `veomni_sdpa` handle.
+The `veomni_eager` row implements pure-PyTorch scaled dot-product attention
+(including GQA, softcap, sliding window, attention sinks `s_aux`, additive
+`position_bias`, packed-sequence splitting, and Ulysses SP exchanges) in
+`veomni/ops/kernels/attention/standard/eager.py`. Under
+`MODELING_BACKEND=veomni`, `eager` normalizes to `veomni_eager` on
+`OpsImplementationConfig`, while direct `eager` lookup runs the same
+pure-PyTorch kernel locally with `skip_ulysses=True`. Modeling reads
+`config.ops_config.attn_implementation` directly. Masked calls with a mask-less
+backend use a separate `veomni_sdpa` handle.
 
 FlexAttention requires a model-provided native `BlockMask`; VeOmni does not
 construct model-specific visibility. With Ulysses enabled, the mask must be

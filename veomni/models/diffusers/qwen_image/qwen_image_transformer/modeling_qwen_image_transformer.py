@@ -70,7 +70,7 @@ def _pad_seq(x: torch.Tensor, dim: int, pad_size: int, value: float = 0) -> torc
     return torch.cat([x, pad], dim=dim)
 
 
-_SDPA_ATTN_IMPLS = frozenset({"eager", "sdpa", "veomni_sdpa"})
+_SDPA_ATTN_IMPLS = frozenset({"eager", "veomni_eager", "sdpa", "veomni_sdpa"})
 
 
 class QwenImageAttentionKernelModule:

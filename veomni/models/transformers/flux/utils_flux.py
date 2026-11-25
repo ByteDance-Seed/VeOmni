@@ -266,7 +266,7 @@ def init_weights_on_device(device=None, include_buffers: bool = False):
             setattr(torch, torch_function_name, old_torch_function)
 
 
-_SDPA_ATTN_IMPLS = frozenset({"eager", "sdpa", "veomni_sdpa"})
+_SDPA_ATTN_IMPLS = frozenset({"eager", "veomni_eager", "sdpa", "veomni_sdpa"})
 
 
 def bind_flux_attention(module: torch.nn.Module, impl: str | None = None, config=None) -> None:

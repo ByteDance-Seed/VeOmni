@@ -42,7 +42,7 @@ when the selected implementation runs.
 
 | Op | Variants | Implementations |
 |---|---|---|
-| `attention` | `standard` | `eager`, `sdpa`, and FlashAttention/AITER/FlexAttention/MagiAttention/SageAttention names |
+| `attention` | `standard` | `eager`, `veomni_eager`, `sdpa`, `veomni_sdpa`, and FlashAttention/AITER/FlexAttention/MagiAttention/SageAttention names |
 | `async_ulysses_qkv`, `async_ulysses_o` | `standard`, `dit`, `bagel` | `eager` orchestration |
 | `rms_norm` | `standard`, `deepseek_v4`, `unweighted`, `offset` | `eager`, `liger_kernel`, `torch_npu`, and `triton` where supported; all accept optional `group_size` (fused weighted rows delegate grouped calls to eager) |
 | `layer_norm` | `standard` | `eager`, `apex` (`fused_layer_norm_cuda`); nested by async Ulysses QKV when `norm_type="layernorm"` |
@@ -241,9 +241,11 @@ RMSNorm supports only `eager`; an explicit `torch_npu` or deprecated `npu`
 selection raises at module construction. Leave the selection unset to use each
 variant's device default.
 
-The registered attention `eager` row dispatches to `veomni_eager`, the
-pure-PyTorch eager attention implementation under
-`veomni/ops/kernels/attention/standard/eager.py`.
+The `veomni_eager` row implements pure-PyTorch eager attention with Ulysses SP
+support under `veomni/ops/kernels/attention/standard/eager.py`. Under
+`MODELING_BACKEND=veomni`, `OpsImplementationConfig` normalizes `eager` to
+`veomni_eager`, while direct `eager` lookup runs the same pure-PyTorch kernel
+locally with `skip_ulysses=True`.
 
 Full RoPE's eager and Liger implementations store fixed cos/sin tables in the
 query dtype for backward. Forward computation still receives the original

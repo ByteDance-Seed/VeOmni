@@ -150,10 +150,15 @@ def _assert_isolated(
         for path in sticky_paths:
             assert _handle(model, path).impl == "eager", path
 
+    from veomni.arguments import OpsImplementationConfig
+
+    expected_eager_attn = OpsImplementationConfig.normalize_attention_backend(eager_cfg.attn_implementation)
+    expected_alt_attn = OpsImplementationConfig.normalize_attention_backend(alt_cfg.attn_implementation)
+
     eager = construct(eager_cfg)
     alternate = construct(alt_cfg)
-    check(eager, eager_cfg.attn_implementation)
-    check(alternate, alt_cfg.attn_implementation)
+    check(eager, expected_eager_attn)
+    check(alternate, expected_alt_attn)
 
     with torch.no_grad():
         eager_ref = _output_tensor(run(eager))
@@ -164,15 +169,15 @@ def _assert_isolated(
             for sub_cfg in _iter_configs(hf_config):
                 attention = sub_cfg._attn_implementation
                 sub_cfg.ops_implementation = dict(vars(poison_cfg))
-                check(eager, eager_cfg.attn_implementation)
-                check(alternate, alt_cfg.attn_implementation)
+                check(eager, expected_eager_attn)
+                check(alternate, expected_alt_attn)
                 # HF builds masks from the canonical selection on every forward.
                 # Restore that selection after verifying bound handles are stable.
                 sub_cfg.ops_implementation["attn_implementation"] = attention
         eager_out = _output_tensor(run(eager))
         alt_out = _output_tensor(run(alternate))
-        check(eager, eager_cfg.attn_implementation)
-        check(alternate, alt_cfg.attn_implementation)
+        check(eager, expected_eager_attn)
+        check(alternate, expected_alt_attn)
 
     torch.testing.assert_close(eager_out, eager_ref)
     torch.testing.assert_close(alt_out, alt_ref)
@@ -437,7 +442,7 @@ def test_gemma3_eager_instance_keeps_first_token_causal_after_another_sdpa_model
     other_config = tiny_gemma3_text_config()
     other_config._set_ops_implementation(sdpa_cfg)
     other_model = Gemma3ForCausalLM(other_config).eval()
-    assert model.model.layers[0].self_attn.veomni_attn.impl == "eager"
+    assert model.model.layers[0].self_attn.veomni_attn.impl == "veomni_eager"
     assert other_model.model.layers[0].self_attn.veomni_attn.impl == "veomni_sdpa"
     with torch.no_grad():
         logits = model(input_ids=input_ids, use_cache=False).logits

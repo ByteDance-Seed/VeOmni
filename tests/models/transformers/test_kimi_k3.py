@@ -707,8 +707,8 @@ def test_vlm_attention_override_preserves_child_selections():
     # root selection written without the setter's tree-wide recursion
     cfg.ops_implementation["attn_implementation"] = "veomni_sage_attention"
     model = build_foundation_model(cfg, torch_dtype="float32", init_device="cpu")
-    assert model.config.text_config._attn_implementation == "eager"
-    assert model.config.vision_config._attn_implementation == "eager"
+    assert model.config.text_config._attn_implementation == "veomni_eager"
+    assert model.config.vision_config._attn_implementation == "veomni_eager"
 
     # an sdpa-flavored selection on the vision child itself (raw dict
     # spelling -- both the normalizing setter and HF's own 'sdpa'
@@ -1294,7 +1294,7 @@ def test_vision_attention_family_removed_tower_binds_standard_row():
     model = _build_model()
     for blk in model.vision_tower.encoder.blocks:
         assert isinstance(blk.veomni_attn, VeomniOp)
-        assert blk.veomni_attn.impl == "eager"
+        assert blk.veomni_attn.impl == "veomni_eager"
 
 
 def test_vision_tower_dispatches_through_bound_op_handle():
@@ -1311,7 +1311,7 @@ def test_vision_tower_dispatches_through_bound_op_handle():
     model.eval()
     for blk in model.vision_tower.encoder.blocks:
         assert isinstance(blk.veomni_attn, VeomniOp)
-        assert blk.veomni_attn.impl == "eager"
+        assert blk.veomni_attn.impl == "veomni_eager"
 
     from veomni.models.transformers.kimi_k3 import modeling_kimi_k3 as k3_modeling
 

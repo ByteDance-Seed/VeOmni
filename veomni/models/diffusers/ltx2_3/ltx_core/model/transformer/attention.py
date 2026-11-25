@@ -15,7 +15,7 @@ from ltx_core.model.transformer.rope import LTXRopeType
 from veomni.ops import VeomniOp
 
 
-_SDPA_ATTN_IMPLS = frozenset({"eager", "sdpa", "veomni_sdpa"})
+_SDPA_ATTN_IMPLS = frozenset({"eager", "veomni_eager", "sdpa", "veomni_sdpa"})
 
 
 class AttentionCallable(Protocol):
@@ -126,7 +126,7 @@ class AttentionFunction(Enum):
         """Resolve to a VeOmni attention adapter at module construction time.
 
         ``AUTOMATIC`` reads ``config.ops_config.attn_implementation`` directly.
-        The registered ``eager`` row forwards to ``veomni_sdpa``. SDPA pin names and xformers collapse to
+        The registered ``eager`` row forwards to ``veomni_eager``. SDPA pin names and xformers collapse to
         ``veomni_sdpa``. Flash-3/4 keep those impl names.
         """
         return VeomniLTXAttention(_impl_from_attention_function(self, config=config))
