@@ -1,15 +1,24 @@
 import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+import torch
+import torch.distributed as dist
 
 import veomni.trainer.base as base_module
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.distributed.parallel_state import clear_parallel_state
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.dit_trainer import DiTTrainer
 from veomni.trainer.text_dpo_trainer import TextDPOTrainer
 from veomni.trainer.text_trainer import TextTrainer
 from veomni.trainer.vlm_trainer import VLMTrainer
+from veomni.utils import dist_utils
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _trainer(sync_each_train_step: bool):
@@ -118,3 +127,115 @@ def test_train_step_uses_hsdp_allreduce_helper():
         source = inspect.getsource(wrapper_cls.train_step)
 
         assert "_configure_hsdp_allreduce(" in source
+
+
+def test_train_step_only_counts_step_after_batch_fetch_succeeds():
+    """global_step must not advance for a step whose batch fetch raised StopIteration.
+
+    `BaseTrainer.train()` catches `StopIteration` from `train_step()` and ends the
+    epoch, so a loader that runs dry before `train_steps` is reached must not leave
+    `global_step` counting a step that never ran (no optimizer step, no resume
+    cursor movement for it).
+    """
+    for wrapper_cls in (BaseTrainer, TextTrainer, VLMTrainer, TextDPOTrainer, DiTTrainer):
+        source = inspect.getsource(wrapper_cls.train_step)
+        global_step_line = next(line for line in source.splitlines() if "state.global_step += 1" in line)
+        next_batch_line = next(
+            line for line in source.splitlines() if "next(data_iterator)" in line and "else" not in line
+        )
+        global_step_idx = source.index(global_step_line)
+        next_batch_idx = source.index(next_batch_line)
+
+        assert global_step_idx > next_batch_idx, (
+            f"{wrapper_cls.__name__}.train_step increments global_step before the batch "
+            "fetch that can raise StopIteration"
+        )
+
+
+@pytest.fixture
+def single_rank_group(tmp_path, monkeypatch):
+    # Real `BaseTrainer.train_step` all-reduces the loss-token count, which
+    # needs a live process group. File-store rendezvous under tmp_path keeps
+    # this isolated from any other single-rank gloo group in the suite.
+    # Gloo cannot reduce accelerator (e.g. NPU) tensors, so keep the scalar on CPU.
+    monkeypatch.setattr(dist_utils, "get_device_type", lambda: "cpu")
+    dist.init_process_group(backend="gloo", init_method=f"file://{tmp_path / 'rendezvous'}", world_size=1, rank=0)
+    try:
+        yield
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        clear_parallel_state()
+
+
+def test_base_trainer_global_step_not_overcounted_on_stop_iteration(single_rank_group):
+    """End-to-end: the real `train_step` must not overcount global_step when the loader runs dry.
+
+    Exercises production `BaseTrainer.train_step` (not a stand-in), stubbing out
+    only the model-bound work (reshard, grad clip, optimizer/scheduler step,
+    allreduce config) and callbacks, so a regression in the real counter logic
+    would fail this test.
+    """
+
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.args = SimpleNamespace(
+        train_steps=10,
+        train=SimpleNamespace(local_rank=0, num_train_epochs=1, sync_each_train_step=False),
+        data=SimpleNamespace(dataloader=SimpleNamespace(use_background_prefetcher=False, drop_last=False)),
+    )
+    trainer.state = base_module.TrainerState()
+    trainer.start_epoch = 0
+    trainer.start_step = 0
+
+    n_batches = 3
+    fake_micro_batch = [{"labels": torch.tensor([1, 2, 3])}]
+    trainer.train_dataloader = [fake_micro_batch] * n_batches
+
+    trainer.on_train_begin = lambda: None
+    trainer.on_train_end = lambda: None
+    trainer.on_epoch_begin = lambda: None
+    trainer.on_epoch_end = lambda: None
+    trainer.on_step_begin = lambda **kwargs: None
+
+    trainer.on_step_end = lambda **kwargs: None
+
+    # Model-bound work only -- never the counter/control-flow under test.
+    optimizer_steps = []
+    trainer._reset_async_activation_offload_if_enabled = lambda model: None
+    trainer.model_reshard = lambda micro_step, num_micro_steps: None
+    trainer._configure_hsdp_allreduce = lambda micro_step, num_micro_steps: None
+    trainer.forward_backward_step = lambda micro_batch: (MagicMock(item=lambda: 0.0), {}, {})
+    trainer.model = MagicMock()
+    trainer.model.clip_grad_norm.return_value = 0.0
+    trainer.model.optimizer.step.side_effect = lambda: optimizer_steps.append(1)
+
+    trainer.train()
+
+    assert trainer.state.global_step == n_batches == len(optimizer_steps)
+
+
+@pytest.mark.parametrize("sp_rank", [0, 1])
+def test_dit_sp_exhaustion_is_collective(monkeypatch, sp_rank):
+    """Under SP only sp_rank 0 reads data; exhaustion must still reach the broadcast so peers don't hang."""
+    import veomni.trainer.dit_trainer as dit_module
+
+    broadcasts = []
+
+    def fake_broadcast(obj_list, src, group):
+        broadcasts.append(obj_list[0])
+        obj_list[0] = None  # rank 0's view of an exhausted loader
+
+    ps = SimpleNamespace(sp_enabled=True, sp_rank=sp_rank, sp_group=None)
+    monkeypatch.setattr(dit_module, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(dit_module, "use_parallel_state", lambda _: nullcontext())
+    monkeypatch.setattr(dit_module.dist, "broadcast_object_list", fake_broadcast)
+    monkeypatch.setattr(dit_module.dist, "get_global_rank", lambda group, rank: rank)
+
+    trainer = DiTTrainer.__new__(DiTTrainer)
+    trainer.base = SimpleNamespace(model=SimpleNamespace(parallel_state=None), state=base_module.TrainerState())
+
+    with pytest.raises(StopIteration):
+        trainer.train_step(iter([]) if sp_rank == 0 else None)
+
+    assert broadcasts == [None]
+    assert trainer.base.state.global_step == 0
