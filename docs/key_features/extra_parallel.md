@@ -72,7 +72,7 @@ parallelizer wraps each matched owner as its own FSDP2 unit on that dimension's
 `<name>_fsdp` mesh. For the plan above, `model.layers.*.mlp.experts` is the `ep` owner.
 Do not set `extra_parallel_fsdp_no_shard_module` by hand.
 
-* Owners must not nest. A plan with both `decoder.weight` and `decoder.ngram.weight`
+* Owners must not nest. A plan with both `decoder.weight` and `decoder.embed.weight`
   raises `ValueError`, because each owner would become its own unit.
 * Every owner must sit under a module whose class is listed in the model's
   `_no_split_modules`. The parallelizer pairs owners only under those wrap targets.
@@ -94,9 +94,8 @@ quantized it cannot run at all — an FSDP parameter group requires a single
 original dtype, while a decoder layer holding quantized storage as released has
 several (packed int8 weights, fp8 values, fp8 or fp32 scales, fp32 numerics
 buffers). That is the *inference* reason. A training run dequantizes at load —
-`weight_quantization: null` allocates bf16 (or fp32, with the wrap) parameters
-and spends the scales in the converter — so its layer holds one dtype and FSDP2
-accepts it.
+allocating bf16 (or fp32, with the wrap) parameters and consuming the scales in
+the checkpoint converter — so its layer holds one dtype and FSDP2 accepts it.
 
 Because FSDP2's `MixedPrecisionPolicy` is part of the skipped wrap,
 `extra_parallel_only: true` only applies when `fsdp_mode: fsdp2` (ignored under
@@ -116,8 +115,9 @@ accelerator:
       enable: false           # required with extra_parallel_only (also avoids the fp32 master copy)
 ```
 
-`dsv41`'s `ngram` module uses this setup so its 196.6 B embedding tables avoid
-both FSDP all-gather buffers and an extra 786 GB FP32 master copy.
+Large row-sharded embedding tables (such as `emb`-parallel `ShardedEmbedding`
+modules) can use this setup to avoid both FSDP all-gather buffers and an extra
+FP32 master copy.
 
 This applies the plan and skips the wrap. The two shard for different reasons:
 FSDP shards for *storage* and all-gathers the parameter back before the
