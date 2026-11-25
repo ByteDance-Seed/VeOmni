@@ -19,10 +19,10 @@ from types import ModuleType
 
 import pytest
 import torch
+from torch.distributed.tensor import Partial, Shard
 
 import veomni.ops.qat as qat
 from tests.ops.qat.reference import reference_act_quant, reference_fp4_act_quant, reference_fp8_weight_quant
-from veomni.ops.qat import _hardware as qat_hardware
 from veomni.ops.qat import (
     fp4_blockwise,
     fp4_fake_quant_weight,
@@ -36,14 +36,6 @@ from veomni.utils.device import get_device_type
 
 
 DEVICE = get_device_type()
-
-
-@pytest.fixture(autouse=True)
-def clear_qat_hardware_gate_cache():
-    """Keep process-level hardware caching isolated between QAT tests."""
-    qat_hardware.require_tilelang_sm90.cache_clear()
-    yield
-    qat_hardware.require_tilelang_sm90.cache_clear()
 
 
 def _qat_entry_calls():
@@ -63,8 +55,8 @@ def _qat_entry_calls():
     )
 
 
-def _install_fake_quant_backend(monkeypatch, calls: list[str]) -> None:
-    backend = ModuleType("veomni.ops.qat.quant")
+def _install_fake_quant_backend(monkeypatch, calls: list[str], module: str = "veomni.ops.qat.quant") -> None:
+    backend = ModuleType(module)
 
     def record(name):
         def fake_quant(tensor, *args, **kwargs):
@@ -76,17 +68,21 @@ def _install_fake_quant_backend(monkeypatch, calls: list[str]) -> None:
     backend.act_quant = record("act_quant")
     backend.fp4_act_quant = record("fp4_act_quant")
     backend.fp8_weight_quant = record("fp8_weight_quant")
-    monkeypatch.setitem(sys.modules, "veomni.ops.qat.quant", backend)
+    monkeypatch.setitem(sys.modules, module, backend)
 
 
 def test_qat_entry_points_reject_pre_sm90_before_vendor_import(monkeypatch):
-    """Every quantizing QAT path checks hardware before entering TileLang."""
+    """Every quantizing QAT path checks hardware before entering a vendor backend."""
     vendor_calls = []
     _install_fake_quant_backend(monkeypatch, vendor_calls)
-    monkeypatch.setattr(type(qat_hardware.NVIDIA_SM90_PLUS), "matches", lambda self: False)
+    _install_fake_quant_backend(monkeypatch, vendor_calls, "veomni.ops.qat.triton_quant")
+    error = RuntimeError("QAT quantizers require a supported GPU")
+    monkeypatch.setattr(fp8_blockwise, "fp8_quantizer_backend", lambda device=None: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(qat, "require_tilelang_sm90", lambda device=None: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(fp4_blockwise, "require_tilelang_sm90", lambda device=None: (_ for _ in ()).throw(error))
 
     for name, call in _qat_entry_calls():
-        with pytest.raises(RuntimeError, match="SM90 or later NVIDIA CUDA GPU"):
+        with pytest.raises(RuntimeError, match="supported GPU"):
             call()
         assert vendor_calls == [], f"{name} entered the vendor backend before the hardware check"
 
@@ -94,20 +90,36 @@ def test_qat_entry_points_reject_pre_sm90_before_vendor_import(monkeypatch):
 def test_qat_entry_points_reach_vendor_backend_after_sm90_check(monkeypatch):
     """The hardware gate does not intercept supported QAT calls."""
     vendor_calls = []
-    hardware_checks = []
     _install_fake_quant_backend(monkeypatch, vendor_calls)
-
-    def supports_sm90(self):
-        hardware_checks.append(True)
-        return True
-
-    monkeypatch.setattr(type(qat_hardware.NVIDIA_SM90_PLUS), "matches", supports_sm90)
+    monkeypatch.setattr(fp8_blockwise, "fp8_quantizer_backend", lambda device=None: "tilelang")
+    monkeypatch.setattr(qat, "require_tilelang_sm90", lambda device=None: None)
+    monkeypatch.setattr(fp4_blockwise, "require_tilelang_sm90", lambda device=None: None)
 
     for name, call in _qat_entry_calls():
         vendor_calls.clear()
         call()
         assert vendor_calls, f"{name} did not reach the vendor backend after the hardware check"
-    assert hardware_checks == [True]
+
+
+def test_qat_fp8_entry_points_run_triton_on_amd_and_fp4_stays_nvidia_only(monkeypatch):
+    tilelang_calls, triton_calls = [], []
+    _install_fake_quant_backend(monkeypatch, tilelang_calls)
+    _install_fake_quant_backend(monkeypatch, triton_calls, "veomni.ops.qat.triton_quant")
+    monkeypatch.setattr(fp8_blockwise, "fp8_quantizer_backend", lambda device=None: "triton")
+    error = RuntimeError("QAT TileLang quantizers require an SM90 or later NVIDIA CUDA GPU")
+    monkeypatch.setattr(qat, "require_tilelang_sm90", lambda device=None: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(fp4_blockwise, "require_tilelang_sm90", lambda device=None: (_ for _ in ()).throw(error))
+
+    for name, call in _qat_entry_calls():
+        triton_calls.clear()
+        if "fp4" in name:
+            with pytest.raises(RuntimeError, match="NVIDIA CUDA GPU"):
+                call()
+            assert triton_calls == []
+        else:
+            call()
+            assert triton_calls, f"{name} did not reach the Triton backend"
+    assert tilelang_calls == []
 
 
 @pytest.fixture
@@ -118,8 +130,16 @@ def reference_quantizers(monkeypatch):
     quantize-dequantize numerics for layout, prefix, straight-through gradients,
     and temporary parameter substitution assertions.
     """
-    monkeypatch.setattr(fp8_blockwise, "act_quant", reference_act_quant)
-    monkeypatch.setattr(fp8_blockwise, "fp8_weight_quant", reference_fp8_weight_quant)
+
+    def act_quant_impl(x, block_size, scale_fmt, scale_dtype=torch.float32, dequant=False, backend=None):
+        return reference_act_quant(x, block_size, scale_fmt, scale_dtype, dequant)
+
+    def weight_quant_impl(x, block_size, scale_fmt, scale_dtype=torch.float32, dequant=False, backend=None):
+        return reference_fp8_weight_quant(x, block_size, scale_fmt, scale_dtype, dequant)
+
+    monkeypatch.setattr(fp8_blockwise, "_act_quant_impl", act_quant_impl)
+    monkeypatch.setattr(fp8_blockwise, "_weight_quant_impl", weight_quant_impl)
+    monkeypatch.setattr(fp8_blockwise, "fp8_quantizer_backend", lambda device=None: "reference")
 
 
 @pytest.fixture
@@ -140,6 +160,83 @@ def _weight_qdq(weight, block_size=128, round_scale=True):
     rows, cols = weight.shape
     tiles = quantized.float().view(rows // block_size, block_size, cols // block_size, block_size)
     return (tiles * scales[:, None, :, None]).view(rows, cols).to(weight.dtype)
+
+
+def test_fp8_weight_quant_preserves_x_keyword(reference_quantizers):
+    weight = torch.randn(128, 128, dtype=torch.bfloat16)
+
+    actual = qat.fp8_weight_quant(x=weight, dequant=True)
+
+    torch.testing.assert_close(actual, reference_fp8_weight_quant(weight, dequant=True))
+
+
+def test_fp8_weight_quant_rejects_sharded_dtensor_before_reading_local_weight(monkeypatch):
+    class ShardedWeight:
+        placements = (Shard(0),)
+
+        def to_local(self):
+            raise AssertionError("the sharded local weight must not be read")
+
+    monkeypatch.setattr(fp8_blockwise, "DTensor", ShardedWeight)
+    weight = ShardedWeight()
+
+    for quantize in (qat.fp8_weight_quant, fp8_fake_quant_weight):
+        with pytest.raises(ValueError, match="FSDP unshard hook"):
+            quantize(weight)
+
+
+def test_activation_dtensor_rejects_partial_and_last_dimension_shards(monkeypatch):
+    class ShardedActivation:
+        ndim = 3
+
+        def __init__(self, placement):
+            self.placements = (placement,)
+
+        def to_local(self):
+            raise AssertionError("an invalid activation shard must not be read")
+
+    monkeypatch.setattr(fp8_blockwise, "DTensor", ShardedActivation)
+
+    for placement in (Partial(), Shard(2), Shard(-1)):
+        with pytest.raises(ValueError, match="last dimension"):
+            fp8_blockwise._local_activation_operand(ShardedActivation(placement))
+
+
+def test_activation_dtensor_allows_non_quantized_dimension_shards(monkeypatch):
+    local = torch.randn(2, 3, 128, dtype=torch.bfloat16)
+
+    class ShardedActivation:
+        ndim = 3
+        placements = (Shard(0),)
+
+        def to_local(self):
+            return local
+
+    monkeypatch.setattr(fp8_blockwise, "DTensor", ShardedActivation)
+
+    assert fp8_blockwise._local_activation_operand(ShardedActivation()) is local
+
+
+def test_stacked_weight_dtensor_allows_only_expert_dimension_shards(monkeypatch, reference_quantizers):
+    local = torch.randn(2, 128, 128, dtype=torch.bfloat16)
+
+    class ShardedExperts:
+        ndim = 3
+
+        def __init__(self, placement):
+            self.placements = (placement,)
+
+        def to_local(self):
+            return local
+
+    monkeypatch.setattr(fp8_blockwise, "DTensor", ShardedExperts)
+
+    for placement in (Partial(), Shard(1), Shard(2)):
+        with pytest.raises(ValueError, match=r"Replicate or Shard\(0\)"):
+            fp8_fake_quant_stacked_weight(ShardedExperts(placement))
+
+    actual = fp8_fake_quant_stacked_weight(ShardedExperts(Shard(0)))
+    assert actual.shape == local.shape
 
 
 def _fake_quant(kind, tensor):

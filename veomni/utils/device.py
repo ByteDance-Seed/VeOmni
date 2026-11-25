@@ -15,6 +15,7 @@
 # Following codes are inspired from https://github.com/volcengine/verl/blob/main/verl/utils/device.py
 
 import os
+from functools import cache
 from typing import Any
 
 import torch
@@ -101,6 +102,20 @@ def is_caching_allocator_active() -> bool:
         return get_torch_device().memory.get_allocator_backend() == "native"
     except Exception:
         return False
+
+
+def normalize_cuda_device(device: torch.types.Device | int | None = None) -> torch.device | None:
+    """Resolve a PyTorch CUDA/ROCm device, or return ``None`` off that device namespace."""
+    if not IS_CUDA_AVAILABLE:
+        return None
+    device_type = get_device_type()
+    if device is None:
+        resolved = torch.device(device_type, get_device_id())
+    elif isinstance(device, int):
+        resolved = torch.device(device_type, device)
+    else:
+        resolved = torch.device(device)
+    return resolved if resolved.type == device_type else None
 
 
 def is_moe_kernel_supported(device: torch.device | str) -> bool:
@@ -214,6 +229,21 @@ def get_gpu_compute_capability(device: torch.types.Device | int | None = None) -
 def is_sm90_or_above() -> bool:
     """Check if the current CUDA device has SM90+ capability."""
     return get_gpu_compute_capability() >= 90
+
+
+@cache
+def _get_rocm_gcn_arch(device_index: int) -> str:
+    return torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
+
+
+def get_rocm_gcn_arch(device: torch.types.Device | int | None = None) -> str | None:
+    """Return the cached AMD GPU architecture (e.g. ``"gfx950"``), or ``None`` off ROCm."""
+    if torch.version.hip is None:
+        return None
+    resolved = normalize_cuda_device(device)
+    if resolved is None:
+        return None
+    return _get_rocm_gcn_arch(resolved.index if resolved.index is not None else get_device_id())
 
 
 def create_stream(device=None, priority: int = 0) -> Any:

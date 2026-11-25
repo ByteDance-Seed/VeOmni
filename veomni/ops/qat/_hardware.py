@@ -12,16 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Hardware checks shared by the low-precision rows and their quantizers."""
+"""Hardware checks shared by the low-precision rows and quantizer facades.
+
+FP8 quantizers run the TileLang kernels on SM90+ NVIDIA GPUs and the Triton
+kernels on AMD gfx942/gfx950; both are bit-exact with the same reference. The
+FP4 quantizer exists only in TileLang and stays NVIDIA-only.
+"""
 
 from __future__ import annotations
-
-from functools import cache
 
 import torch
 from torch import nn
 
-from ..platform import NVIDIA_SM90_PLUS
+from ...utils.device import get_gpu_compute_capability, get_rocm_gcn_arch, normalize_cuda_device
+from ...utils.import_utils import is_package_available
+from ..platform import NVIDIA_SM90_PLUS, ROCM_GFX942_GFX950, GpuKernelRequirement
+
+
+TRITON_FP8_ARCHS = ROCM_GFX942_GFX950.architectures
+FP8_QUANTIZER_GPUS = "an SM90 or later NVIDIA CUDA GPU or an AMD ROCm gfx942/gfx950 GPU"
 
 
 _TORCHAO_ROW = "torchao"
@@ -162,8 +171,49 @@ def reject_qat_without_native_bf16(model: nn.Module) -> None:
         )
 
 
-@cache
-def require_tilelang_sm90() -> None:
+def quantizer_backend(device: torch.types.Device | int | None = None) -> str | None:
+    """Return the FP8 backend for ``device``, or ``None`` when that device is unsupported."""
+    device = normalize_cuda_device(device)
+    if device is None:
+        return None
+    if torch.version.hip is not None:
+        return "triton" if get_rocm_gcn_arch(device) in TRITON_FP8_ARCHS else None
+    if get_gpu_compute_capability(device) >= 90:
+        return "tilelang"
+    return None
+
+
+def require_tilelang_sm90(device: torch.types.Device | int | None = None) -> None:
     """Reject unsupported hardware before importing the TileLang quantizers."""
-    if not NVIDIA_SM90_PLUS.matches():
+    if quantizer_backend(device) != "tilelang":
         raise RuntimeError("QAT TileLang quantizers require an SM90 or later NVIDIA CUDA GPU")
+
+
+def fp8_quantizer_backend(device: torch.types.Device | int | None = None) -> str:
+    """Return the FP8 quantizer backend for this GPU, rejecting unsupported hardware first."""
+    backend = quantizer_backend(device)
+    if backend is None:
+        raise RuntimeError(f"QAT FP8 quantizers require {FP8_QUANTIZER_GPUS}")
+    return backend
+
+
+class Fp8QuantizerRequirement(GpuKernelRequirement):
+    """GPU and package requirement for the device-selected FP8 quantizer."""
+
+    def matches(self) -> bool:
+        """Return whether both the GPU and its selected quantizer package are available."""
+        if not super().matches():
+            return False
+        backend = quantizer_backend()
+        return backend is not None and is_package_available("tilelang" if backend == "tilelang" else "triton")
+
+    def check(self) -> None:
+        """Raise when the GPU or its selected quantizer package is unavailable."""
+        super().check()
+        backend = fp8_quantizer_backend()
+        package = "tilelang" if backend == "tilelang" else "triton"
+        if not is_package_available(package):
+            raise RuntimeError(f"QAT FP8 quantization on backend {backend!r} requires package {package!r}")
+
+
+FP8_QUANTIZER_REQUIREMENT = Fp8QuantizerRequirement(platforms=(NVIDIA_SM90_PLUS, ROCM_GFX942_GFX950))

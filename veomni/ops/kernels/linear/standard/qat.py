@@ -14,10 +14,10 @@
 
 """Standard dense linear blockwise QAT implementation.
 
-Both GEMM operands are fake-quantized with the DeepSeek-V4 TileLang quantizers
-and the multiply itself runs in the model dtype, which is what an emulated
-low-precision deployment GEMM computes: the rounded values are read back and
-accumulated in high precision.
+Both GEMM operands are fake-quantized with the DeepSeek-V4 quantizers and the
+multiply itself runs in the model dtype, which is what an emulated low-precision
+deployment GEMM computes: the rounded values are read back and accumulated in
+high precision.
 
 ``dtype`` is FP8-only (``"fp8"``), using ``1 x block_size`` activation blocks
 and square ``block_size x block_size`` weight tiles with optional power-of-two

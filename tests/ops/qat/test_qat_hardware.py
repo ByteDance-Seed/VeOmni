@@ -26,6 +26,8 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops import OpsSelection, SiteOverride
+from veomni.ops.platform import GpuKernelRequirement
+from veomni.ops.qat import _hardware
 from veomni.ops.qat._hardware import reject_qat_without_native_bf16
 
 
@@ -141,3 +143,20 @@ def test_bound_handles_are_authoritative_for_unused_families(monkeypatch):
     model.veomni_q_proj = VeomniOp("linear", "standard", fp8, site="layers.0.q_proj")
     with pytest.raises(RuntimeError, match="SM89"):
         reject_qat_without_native_bf16(model)
+
+
+@pytest.mark.parametrize(("backend", "package"), (("tilelang", "tilelang"), ("triton", "triton")))
+def test_fp8_requirement_checks_the_selected_backend_package(monkeypatch, backend, package):
+    monkeypatch.setattr(GpuKernelRequirement, "matches", lambda self: True)
+    monkeypatch.setattr(GpuKernelRequirement, "check", lambda self: None)
+    monkeypatch.setattr(_hardware, "quantizer_backend", lambda device=None: backend)
+    monkeypatch.setattr(_hardware, "fp8_quantizer_backend", lambda device=None: backend)
+    monkeypatch.setattr(_hardware, "is_package_available", lambda name: name != package)
+
+    assert not _hardware.FP8_QUANTIZER_REQUIREMENT.matches()
+    with pytest.raises(RuntimeError, match=package):
+        _hardware.FP8_QUANTIZER_REQUIREMENT.check()
+
+    monkeypatch.setattr(_hardware, "is_package_available", lambda name: name == package)
+    assert _hardware.FP8_QUANTIZER_REQUIREMENT.matches()
+    _hardware.FP8_QUANTIZER_REQUIREMENT.check()

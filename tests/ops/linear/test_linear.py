@@ -69,13 +69,25 @@ def test_linear_eager_handles_empty_input():
     assert op(torch.nn.Linear(16, 8), x).shape == (0, 8)
 
 
-def test_linear_qat_rows_require_tilelang_on_sm90():
-    """The TileLang rows are declared with the hardware and package they need."""
-    entries = {(entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", "standard")}
-    assert ("qat", ("tilelang",)) in entries
-    assert ("qat", ("tilelang",)) in {
-        (entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", "grouped")
-    }
+def test_linear_qat_rows_use_backend_aware_quantizer_requirement():
+    from veomni.ops.qat._hardware import FP8_QUANTIZER_REQUIREMENT
+
+    for variant in ("standard", "grouped"):
+        entry = next(row for row in OP_REGISTRY.list_entries("linear", variant) if row.impl == "qat")
+        assert entry.requirement is FP8_QUANTIZER_REQUIREMENT
+        assert entry.requires == ()
+
+
+def test_linear_qat_rows_reject_unsupported_rocm_architecture(monkeypatch):
+    monkeypatch.setattr("veomni.ops.platform.gpu.IS_CUDA_AVAILABLE", True)
+    monkeypatch.setattr("veomni.ops.platform.gpu.torch.version.hip", "6.0", raising=False)
+    monkeypatch.setattr("veomni.ops.platform.gpu.get_rocm_gcn_arch", lambda: "gfx90a")
+    entry = next(row for row in OP_REGISTRY.list_entries("linear", "standard") if row.impl == "qat")
+
+    assert not entry.requirement.matches()
+
+    monkeypatch.setattr("veomni.ops.platform.gpu.get_rocm_gcn_arch", lambda: "gfx942")
+    assert entry.requirement.matches()
 
 
 def test_a_wrapped_projection_falls_back_to_its_own_forward():

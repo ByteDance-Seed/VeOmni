@@ -19,21 +19,21 @@ tensor gets quantized at which granularity is a property of the model's
 quantization recipe rather than a selectable op implementation.
 
 The recipes implemented here are DeepSeek-V4's: block-wise FP8 everywhere except
-the routed experts of a V4-Flash checkpoint, whose weights are FP4. Both reuse
-the V4 TileLang quantizers in :mod:`veomni.ops.qat.quant`, so training stays
-bit-aligned with inference by construction.
+the routed experts of a V4-Flash checkpoint, whose weights are FP4. NVIDIA uses
+the TileLang quantizers and AMD gfx942/gfx950 uses their Triton FP8 port.
 
 These are *primitives*, not a selection mechanism. Which tensor is rounded, at
 what block width, is chosen by the op row that calls them -- ``linear`` /
 ``gated_mlp`` / ``moe_experts`` / ``kv_round`` each have their own
-implementation name for it. Quantizing calls require an NVIDIA SM90 or later GPU
-and load the backend lazily, so importing this package on CPU or NPU stays free.
+implementation name for it. Quantizing calls load the backend lazily, so
+importing this package on CPU or NPU stays free.
 
 :mod:`veomni.ops.torchao` is separate: it holds the torchao FP8/FP4 primitives
 used by the ``torchao`` rows, has no SM90 TileLang requirement, and lives at the
 top level of :mod:`veomni.ops`.
 """
 
+from . import fp8_blockwise
 from ._hardware import require_tilelang_sm90
 from .fp4_blockwise import (
     FP4_BLOCK_SIZE,
@@ -49,11 +49,8 @@ from .fp8_blockwise import (
 
 
 def act_quant(*args, **kwargs):
-    """Run the optional TileLang FP8 activation quantizer lazily."""
-    require_tilelang_sm90()
-    from .quant import act_quant as impl
-
-    return impl(*args, **kwargs)
+    """Run this GPU's FP8 activation quantizer lazily."""
+    return fp8_blockwise.act_quant(*args, **kwargs)
 
 
 def fp4_act_quant(*args, **kwargs):
@@ -65,11 +62,8 @@ def fp4_act_quant(*args, **kwargs):
 
 
 def fp8_weight_quant(*args, **kwargs):
-    """Run the optional TileLang FP8 weight quantizer lazily."""
-    require_tilelang_sm90()
-    from .quant import fp8_weight_quant as impl
-
-    return impl(*args, **kwargs)
+    """Run this GPU's FP8 weight quantizer lazily."""
+    return fp8_blockwise.fp8_weight_quant(*args, **kwargs)
 
 
 __all__ = [

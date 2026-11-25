@@ -174,9 +174,71 @@ class DeepseekV4Config(VeOmniPretrainedConfig, _DeepseekV4Config):
                         f"dspark_target_layer_ids contains {layer_idx!r}, outside [0, {self.num_hidden_layers})."
                     )
 
+    def _validate_qat_prerequisites(self) -> None:
+        ops = self.ops_config
+
+        def includes_qat(selection) -> bool:
+            return "qat" in (selection.all_impls() if hasattr(selection, "all_impls") else (selection,))
+
+        weight_qat = any(
+            includes_qat(selection)
+            for selection in (ops.linear_implementation, ops.gated_mlp_implementation, ops.moe_implementation)
+        )
+        if not weight_qat:
+            return
+
+        quant_config = getattr(self, "quantization_config", None) or {}
+        if not isinstance(quant_config, dict):
+            quant_config = quant_config.to_dict() if hasattr(quant_config, "to_dict") else vars(quant_config)
+        raw_weight_block_size = quant_config.get("weight_block_size")
+        if raw_weight_block_size is None:
+            raw_weight_block_size = (128, 128)
+        if not isinstance(raw_weight_block_size, (list, tuple)) or len(raw_weight_block_size) != 2:
+            raise ValueError(
+                "DeepSeek-V4 quantization_config.weight_block_size must contain two dimensions, "
+                f"got {raw_weight_block_size!r}."
+            )
+        if tuple(raw_weight_block_size) != (128, 128):
+            raise ValueError(
+                "DeepSeek-V4 QAT rows train with 128x128 weight tiles, "
+                f"but quantization_config.weight_block_size is {tuple(raw_weight_block_size)}."
+            )
+
+        if not includes_qat(ops.moe_implementation):
+            return
+        top_level_expert_dtype = getattr(self, "expert_dtype", None)
+        metadata_expert_dtype = quant_config.get("expert_dtype")
+        if (
+            top_level_expert_dtype is not None
+            and metadata_expert_dtype is not None
+            and top_level_expert_dtype != metadata_expert_dtype
+        ):
+            raise ValueError(
+                "DeepSeek-V4 QAT requires expert_dtype to agree between the top-level config and "
+                f"quantization_config, got {top_level_expert_dtype!r} and {metadata_expert_dtype!r}."
+            )
+        if top_level_expert_dtype is not None:
+            expert_dtype = top_level_expert_dtype
+        elif metadata_expert_dtype is not None:
+            expert_dtype = metadata_expert_dtype
+        else:
+            expert_dtype = "fp8"
+        if expert_dtype not in ("fp8", "fp4"):
+            raise ValueError(f"DeepSeek-V4 QAT supports expert_dtype 'fp8' or 'fp4', got {expert_dtype!r}.")
+        self.expert_dtype = expert_dtype
+
+        if expert_dtype == "fp4":
+            import torch
+
+            if torch.version.hip is not None:
+                raise ValueError(
+                    "DeepSeek-V4 FP4 expert QAT requires NVIDIA TileLang; AMD ROCm supports FP8 experts only."
+                )
+
     def validate_build_prerequisites(self) -> None:
         """Refuse an invalid DSpark MTP or Lightning Indexer KL configuration before weight loading."""
         self._validate_mtp_prerequisites()
+        self._validate_qat_prerequisites()
 
         enabled = self.dsa_indexer_loss
         if not isinstance(enabled, bool):
