@@ -70,9 +70,9 @@ def build_image_packed_sequence(
         packed = build_packed_fl2va(**geometry, keyframe_indices=[])
 
     device = text_token_tags.device
-    text_indices = packed["text_pos"].to(device)
-    image_indices = packed["img_pos"].to(device)
-    token_tags = packed["token_tags"].to(device)
+    text_indices = packed["text_pos"].to(device, non_blocking=True)
+    image_indices = packed["img_pos"].to(device, non_blocking=True)
+    token_tags = packed["token_tags"].to(device, non_blocking=True)
     token_tags[:num_text_tokens] = text_token_tags
     if image_tag != MINIMAX_H3_IMAGE_TAG:
         token_tags[image_indices] = image_tag

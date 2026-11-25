@@ -886,6 +886,7 @@ _H3_ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
             "which varlen kernels read on device; the DiT itself slices with the host copies."
         ),
     },
+    "image": {},
 }
 
 
@@ -900,7 +901,33 @@ def _to_device_recursive(value, device):
 
 
 def _is_minimax_h3_path(filename: str) -> bool:
-    return "veomni/models/diffusers/minimax_h3/" in filename.replace(os.sep, "/")
+    relpath = _veomni_relpath(filename)
+    return relpath is not None and relpath.startswith(
+        ("veomni/models/diffusers/minimax_h3/", "veomni/models/diffusers/minimax_h3_image/")
+    )
+
+
+def _assert_no_minimax_h3_step_syncs(model, step, mode, attention):
+    step()
+    model.zero_grad(set_to_none=True)
+    synchronize()
+
+    prev_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("warn")
+        with warnings.catch_warnings(record=True) as wlist:
+            warnings.simplefilter("always")
+            step()
+        captured = [(w.filename, w.lineno) for w in wlist if _SYNC_RE.search(str(w.message))]
+    finally:
+        torch.cuda.set_sync_debug_mode(prev_mode)
+
+    observed = {(os.path.basename(f), _enclosing_qualname(f, ln)): ln for f, ln in captured if _is_minimax_h3_path(f)}
+    allowed = _H3_ALLOWED_SYNCS[mode]
+    offending = sorted(k for k in observed if k not in allowed)
+    dead = sorted(k for k in allowed if k not in observed)
+    assert not offending, f"New implicit CUDA sync(s) in MiniMax H3 {mode} ({attention}): {offending}"
+    assert not dead, f"Dead MiniMax H3 sync allowlist entries for {mode}: {dead}"
 
 
 @pytest.mark.parametrize("attention", ["sdpa", "veomni_flash_attention_2"])
@@ -937,24 +964,40 @@ def test_no_implicit_sync_in_minimax_h3_forward_backward(mode, attention, cfg_mo
     def step():
         sum(model(**condition.process_condition(**collated)).loss.values()).backward()
 
-    step()  # warm up lazy kernel loading
-    model.zero_grad(set_to_none=True)
-    synchronize()
+    _assert_no_minimax_h3_step_syncs(model, step, mode, attention)
 
-    prev_mode = torch.cuda.get_sync_debug_mode()
-    captured: list[tuple[str, int]] = []
-    try:
-        torch.cuda.set_sync_debug_mode("warn")
-        with warnings.catch_warnings(record=True) as wlist:
-            warnings.simplefilter("always")
-            step()
-        captured = [(w.filename, w.lineno) for w in wlist if _SYNC_RE.search(str(w.message))]
-    finally:
-        torch.cuda.set_sync_debug_mode(prev_mode)
 
-    observed = {(os.path.basename(f), _enclosing_qualname(f, ln)): ln for f, ln in captured if _is_minimax_h3_path(f)}
-    allowed = _H3_ALLOWED_SYNCS.get(mode, {})
-    offending = sorted(k for k in observed if k not in allowed)
-    dead = sorted(k for k in allowed if k not in observed)
-    assert not offending, f"New implicit CUDA sync(s) in MiniMax H3 {mode} ({attention}): {offending}"
-    assert not dead, f"Dead MiniMax H3 sync allowlist entries for {mode}: {dead}"
+def test_no_implicit_sync_in_minimax_h3_image_forward_backward():
+    """Gate the cached image training path, including reference-row conditioning."""
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("CUDA required.")
+
+    from tests.models.diffusers.test_minimax_h3_image_condition_training import _cached_batch, _condition_model
+    from tests.models.tiny_configs import tiny_minimax_h3_config
+    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
+        MiniMaxH3DiTModel,
+    )
+
+    device = get_device_type()
+    torch.manual_seed(0)
+    condition = _condition_model().to(device)
+    batch = dict(_cached_batch())
+    batch["reference_latents"] = [batch["clean_latents"]]
+    batch = _to_device_recursive(batch, device)
+    config = tiny_minimax_h3_config(
+        audio_enabled=False,
+        num_pdd_heads=condition.config.num_pdd_heads,
+        condition_model_type=condition.config.model_type,
+        patch_size=(1, 2, 2),
+        text_dim=batch["prompt_embeds"][0].shape[-1],
+    )
+    config._set_ops_implementation(make_eager_ops_config(attn_implementation="sdpa"))
+    model = MiniMaxH3DiTModel(config).to(device)
+    model.freeze_model()
+    model.gradient_checkpointing_enable({"use_reentrant": False})
+
+    def step():
+        loss = model(**condition.process_condition(**batch)).loss["mse_image"]
+        loss.backward()
+
+    _assert_no_minimax_h3_step_syncs(model, step, "image", "sdpa")

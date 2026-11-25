@@ -296,14 +296,16 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
         image_indices = image_indices.to(device)
 
         step = torch.randint(_TRAINING_STEPS, (), generator=self.generator, device="cpu").item()
-        sigma = self._scheduler.sigmas[step].to(device)
-        noise = torch.randn(latents.shape, generator=self.generator, device="cpu", dtype=torch.float32).to(device)
+        sigma = self._scheduler.sigmas[step].to(device, non_blocking=True)
+        noise = torch.randn(latents.shape, generator=self.generator, device="cpu", dtype=torch.float32).to(
+            device, non_blocking=True
+        )
         noised_latents = (1.0 - sigma) * latents + sigma * noise
         image_rows = patchify_image_latents(noised_latents.unsqueeze(2), _IMAGE_PATCH_SIZE)
         prompt_rows = prompt_embeds[0]
         if prompt_rows.ndim == 3:
             prompt_rows = prompt_rows.squeeze(0)
-        unique_timesteps = self._training_model_times[step : step + 1].to(device)
+        unique_timesteps = self._training_model_times[step : step + 1].to(device, non_blocking=True)
         inverse_indices = torch.zeros(position_ids.shape[0], dtype=torch.long, device=device)
         if references:
             reference_rows = []
@@ -311,7 +313,7 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
                 reference = reference.to(device=device, dtype=torch.float32)
                 reference_noise = torch.randn(
                     reference.shape, generator=self.generator, device="cpu", dtype=torch.float32
-                ).to(device)
+                ).to(device, non_blocking=True)
                 noised_reference = REFERENCE_MODEL_TIME * reference + (1.0 - REFERENCE_MODEL_TIME) * reference_noise
                 reference_rows.append(patchify_image_latents(noised_reference.unsqueeze(2), _IMAGE_PATCH_SIZE))
             image_rows = torch.cat([*reference_rows, image_rows])
@@ -325,14 +327,14 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
             "unique_timesteps": unique_timesteps,
             "inverse_indices": inverse_indices,
             "token_tags": token_tags.to(device),
-            "img_position_ids": position_ids.unsqueeze(0).to(device, torch.float32),
+            "img_position_ids": position_ids.unsqueeze(0).float().to(device, non_blocking=True),
             "img_pos_info": {"position_ids": image_indices},
             "text_pos_info": {"position_ids": text_indices.to(device)},
             "img_pos_for_infer_output_info": {"position_ids": image_indices},
             "pdd_step_index": int(self._training_pdd_indices[step]),
             "num_pdd_heads": self.config.num_pdd_heads,
             "training_target": patchify_image_latents((noise - latents).unsqueeze(2), _IMAGE_PATCH_SIZE),
-            "image_loss_weight": self._scheduler.linear_timesteps_weights[step].to(device),
+            "image_loss_weight": self._scheduler.linear_timesteps_weights[step].to(device, non_blocking=True),
             "cond_rows": cond_rows,
         }
 
