@@ -33,7 +33,14 @@ class CompileConfig:
     backend: Optional[str] = "inductor"
     mode: Optional[str] = None
     fullgraph: bool = True
-    dynamic: bool = False
+    #: Passed straight to ``torch.compile``. Defaults to ``True`` because
+    #: ``fullgraph=True`` turns a re-cache into a hard failure, not a silent
+    #: recompile: a static graph that meets one new shape per step exhausts
+    #: ``torch._dynamo.config.cache_size_limit`` (8) and raises
+    #: ``FailOnRecompileLimitHit``. ``True`` also subsumes the "promote on the
+    #: second shape" behaviour of ``dynamic=None`` — one graph for the rest of
+    #: the run — for a compile-time cost and no steady-state cost.
+    dynamic: bool = True
 
     def uses_cuda_graphs(self) -> bool:
         """Return whether this config asks torch.compile to use graph replay.

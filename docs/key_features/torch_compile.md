@@ -63,29 +63,37 @@ Two conditions decide per module:
 
 A module failing either trains eagerly while its siblings compile.
 
-Compilation happens per module before the FSDP wrap, under either `fsdp_scope`. With
-`fsdp_scope='model'` the wrap belongs to the composed `OmniModel`, so the launcher's
-`fsdp_mode` is consulted as well — a `fsdp2` overlay cannot make a `ddp` wrap able to
-compile. Under `fsdp_scope='module'` the module's own overlay *is* its wrap.
+Compilation happens per module before the FSDP wrap, under `fsdp_scope='module'`. With
+`fsdp_scope='model'` the wrap belongs to the composed `OmniModel` instead, so no module
+can compile: a module cannot wrap itself inside a parent that owns the wrap, and the
+parent's `_no_split_modules` are its children. That scope is rejected at parse time.
 
-## `dynamic=True`
+## `dynamic=True` (the default)
 
-`dynamic` lets one Inductor graph cover a range of shapes. Whether it is needed
-depends on whether the packed length is stable — not on which trainer you use:
+`dynamic` lets one Inductor graph cover a range of shapes, and it defaults to `True`.
+That is not a performance preference — with `fullgraph=True`, a *cache miss* is a hard
+error rather than a silent recompile. A static graph that meets one new shape per step
+walks into `torch._dynamo.config.cache_size_limit` (8) and raises
+`FailOnRecompileLimitHit`:
 
-- **The base trainer forces `pad_to_length`**, so every micro-batch is padded to
-  the same length and `dynamic` gains nothing. Leave it off.
-- **SeedOmni's collator does not pad** (`SeedOmniCollator`: "no stacking, no
-  padding"), so a text backbone's packed length changes every step and a static
-  compile would recompile per new length. Both trainers expose `dyn_bsz`, but in
-  SeedOmni it only groups samples by token count — it does not pad.
+```
+dynamic=False, vision block, bf16, fullgraph=True
+  token counts 96, 128, ..., 320  -> 8 graphs, OK
+  token count  352                -> FailOnRecompileLimitHit
+```
 
-Turn it on for the modules whose input shape actually moves, and leave it off where
-the shape is fixed by a processor (an image tower, a codec): Inductor emits
-shape-polymorphic kernels — a runtime stride instead of a constant, a predicate on
-every load, some fusions broken, one autotune choice for the whole symbolic range —
-which costs a fixed amount per call and can exceed the compile win on a kernel-heavy
-module.
+`dynamic=True` costs one compile up front — about 2x the first-call latency — and
+nothing steady state: it emits one symbolic graph and reuses it for the rest of the run.
+
+`pad_to_length` does not make this unnecessary. It only pads the keys whose
+`pack_dim` is `-1` (`input_ids`, `labels`, `position_ids`, `attention_mask`,
+`image_mask`, `video_mask`), which fixes the *text* token count. `pixel_values` is
+concatenated along dim 0, so a vision tower's patch count follows the images in the
+batch and moves every step. The base trainer forcing `pad_to_length` therefore keeps
+text stable while leaving the towers variable.
+
+Set `dynamic=False` only when every micro-batch really does have the same shape. On a
+shape that moves it will exhaust the cache as above.
 
 ## What stays refused
 

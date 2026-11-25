@@ -75,6 +75,11 @@ def module_compile_config(accelerator: "AcceleratorConfig", *, global_accelerato
     ``fsdp_scope='model'``), an ``fsdp2`` launcher too, because that wrap is the
     top-level one. Which blocks compile, and whether ``dynamic`` is used, come
     from the config alone; there is no per-model capability flag.
+
+    ``fsdp_scope='model'`` is already refused for ``torch_compile`` at parse time
+    (:func:`veomni.arguments.omni_arguments_types._validate_composed_wrap`), so
+    the launcher leg below is a guard for runtimes built directly rather than
+    through the launcher.
     """
     from .....distributed.torch_compile import CompileConfig
 

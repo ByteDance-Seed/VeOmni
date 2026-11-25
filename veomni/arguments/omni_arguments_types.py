@@ -887,9 +887,21 @@ def _validate_training_task_data(train: OmniTrainingArguments, data: OmniDataArg
 
 
 def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
-    """Reject an eager module under a top-level ``fsdp_scope='model'`` before any weights load."""
+    """Reject the combinations a top-level ``fsdp_scope='model'`` wrap cannot support."""
     fsdp_config = accelerator.fsdp_config
-    if fsdp_config.fsdp_scope != "model" or fsdp_config.fsdp_mode == "eager":
+    if fsdp_config.fsdp_scope != "model":
+        return
+    compiled = sorted(name for name, module_args in modules.items() if module_args.accelerator.torch_compile.enable)
+    if accelerator.torch_compile.enable or compiled:
+        enabled = ["model.accelerator"] + compiled
+        raise ValueError(
+            "accelerator.torch_compile.enable is not supported with fsdp_scope='model'. "
+            f"It is enabled for: {', '.join(enabled)}. That scope wraps the composed OmniModel once, "
+            "so every module shares one wrap: a module cannot compile inside a parent that decides its "
+            "own wrap, and the parent cannot compile blocks that are the children. Run with "
+            "fsdp_scope='module', or disable torch_compile for these modules."
+        )
+    if fsdp_config.fsdp_mode == "eager":
         return
     eager = sorted(
         name for name, module_args in modules.items() if module_args.accelerator.fsdp_config.fsdp_mode == "eager"

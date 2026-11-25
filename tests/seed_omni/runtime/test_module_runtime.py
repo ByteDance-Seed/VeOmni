@@ -793,6 +793,9 @@ def test_a_composed_wrap_module_compiles_once_then_stops_before_the_wrap(monkeyp
     The base build is what compiles and wraps in one go, so this path has to
     compile first (before the composed `fully_shard`) and return instead of
     calling the base — otherwise the module would be wrapped twice.
+
+    The launcher now refuses `torch_compile` under that scope at parse time, so
+    this builds the runtime directly to keep the runtime-level contract pinned.
     """
     import torch.nn as nn
 

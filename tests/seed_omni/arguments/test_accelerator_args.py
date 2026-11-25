@@ -331,6 +331,28 @@ def test_build_omni_model_runtime_args_rejects_an_eager_module_under_the_compose
         build_omni_model_runtime_args(args)
 
 
+def test_build_omni_model_runtime_args_rejects_a_module_compile_under_the_composed_wrap():
+    """``fsdp_scope='model'`` leaves no module able to compile.
+
+    The composed ``OmniModel`` owns the one wrap, so a module cannot wrap itself
+    inside it, and the parent cannot compile its children's blocks. Refusing at
+    resolve time keeps a per-module overlay from silently compiling nothing.
+    """
+    args = _fake_args(modules_override={MODULE_B: {"accelerator": {"torch_compile": {"enable": True}}}})
+    args.model.accelerator.fsdp_config.fsdp_scope = "model"
+    with pytest.raises(ValueError, match=rf"fsdp_scope='model'.*{MODULE_B}"):
+        build_omni_model_runtime_args(args)
+
+
+def test_build_omni_model_runtime_args_rejects_a_launcher_compile_under_the_composed_wrap():
+    """The launcher-level switch is refused under ``fsdp_scope='model'`` too."""
+    args = _fake_args()
+    args.model.accelerator.fsdp_config.fsdp_scope = "model"
+    args.model.accelerator.torch_compile.enable = True
+    with pytest.raises(ValueError, match=r"fsdp_scope='model'.*model\.accelerator"):
+        build_omni_model_runtime_args(args)
+
+
 def test_deep_update_merges_sp_and_cp_from_base_and_override(monkeypatch):
     """``build_omni_module_runtime_args`` merges module overrides onto ``global_args``
     directly via ``_deep_update``, allowing a module to inherit ``ulysses_size`` from
