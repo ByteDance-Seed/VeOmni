@@ -319,7 +319,7 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
             image_rows = torch.cat([*reference_rows, image_rows])
             unique_timesteps = torch.cat([unique_timesteps.new_full((1,), REFERENCE_MODEL_TIME), unique_timesteps])
             inverse_indices.fill_(1)
-            inverse_indices[image_indices[:cond_rows]] = 0
+            inverse_indices.index_fill_(0, image_indices[:cond_rows], 0)
 
         return {
             "x": image_rows,
