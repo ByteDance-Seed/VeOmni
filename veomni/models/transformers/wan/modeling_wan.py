@@ -126,10 +126,10 @@ class RMSNorm(nn.Module):
 class AttentionModule(nn.Module):
     """``attention`` / ``standard``. Impl from ``config.ops_config``.
 
-    ``WanModel`` is not on the HuggingFace attention-interface path, so
-    ``config._attn_implementation`` must stay ``eager``. ``sageattention``
-    maps to ``veomni_sage_attention``. FA3 self-attn with a finite
-    ``last_loss`` uses the local fp8 helper.
+    ``WanModel`` binds ``VeomniOp("attention", "standard", impl)`` directly from
+    ``config.ops_config.attn_implementation``. ``sageattention`` maps to
+    ``veomni_sage_attention``. FA3 self-attn with a finite ``last_loss`` uses
+    the local fp8 helper.
     """
 
     def __init__(self, config, num_heads, head_dim):
@@ -580,11 +580,12 @@ class WanModel(PreTrainedModel):
             # the backend call: the sync path all-to-alls Q/K/V in
             # `SelfAttention.forward`, and the async DiT QKV op does its own
             # internal all-to-all. Every rank therefore uses this mask as-is.
-            # Only `eager`/`veomni_eager` reads it today. Official sageattn
-            # has no dense mask, so `veomni_sage_attention` raises if one is
-            # passed. Sage is inference-only; training should use FlashAttention.
-            # FA3/sage trim the K/V tail this mask marks. SP+sage still cannot
-            # honor an additional padding mask beyond that trim.
+            # Dense backends (`eager`/`veomni_eager`/`sdpa`/`veomni_sdpa`) read
+            # this additive mask directly. Official sageattn has no dense mask,
+            # so `veomni_sage_attention` raises if one is passed. Sage is
+            # inference-only; training should use FlashAttention. FA3/sage trim
+            # the K/V tail this mask marks. SP+sage still cannot honor an
+            # additional padding mask beyond that trim.
             if pad_size > 0:
                 self_attn_mask = torch.zeros(1, 1, 1, padded_seq_len, dtype=x.dtype, device=x.device)
                 self_attn_mask[..., padded_seq_len - pad_size :] = torch.finfo(x.dtype).min

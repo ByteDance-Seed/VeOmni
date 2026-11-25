@@ -329,10 +329,9 @@ logger = logging.get_logger(__name__)
 
 # Flash attention (vision reference path): no guarded import lives at the
 # module top level, so `flash_attn_varlen_func` is unconditionally None here.
-# Since the round-9 review the tower dispatches through the attention/standard
-# family rows; the module-local packed-varlen functions further down
-# (eager_attention / multihead_attention / npu_fusion_vision_attention) stay
-# as the parity reference for tests -- no kernel is lost.
+# The tower dispatches through the attention/standard family rows; the
+# module-local flash/NPU packed-varlen helpers (`multihead_attention` /
+# `npu_fusion_vision_attention`) stay available as reference helpers.
 flash_attn_varlen_func = None
 
 
@@ -1998,36 +1997,6 @@ def multihead_attention(
     return attn_out.flatten(start_dim=-2)
 
 
-def eager_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q_cu_seqlens: Optional[torch.Tensor] = None,
-    k_cu_seqlens: Optional[torch.Tensor] = None,
-    **kwargs,
-) -> torch.Tensor:
-    seq_length = q.shape[0]
-    attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
-    for i in range(1, len(q_cu_seqlens)):
-        attention_mask[
-            ...,
-            q_cu_seqlens[i - 1] : q_cu_seqlens[i],
-            q_cu_seqlens[i - 1] : q_cu_seqlens[i],
-        ] = True
-    q = q.transpose(0, 1)
-    k = k.transpose(0, 1)
-    v = v.transpose(0, 1)
-
-    attn_weight = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
-    attn_weight = attn_weight.masked_fill(~attention_mask, torch.finfo(attn_weight.dtype).min)
-    attn_weight = torch.softmax(attn_weight, dim=-1, dtype=torch.float32).to(q.dtype)
-
-    attn_output = attn_weight @ v
-    attn_output = attn_output.transpose(0, 1)
-    attn_output = attn_output.reshape(seq_length, -1)
-    return attn_output
-
-
 def npu_fusion_vision_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2041,8 +2010,8 @@ def npu_fusion_vision_attention(
 ) -> torch.Tensor:
     """Vision attention via ``torch_npu.npu_fusion_attention`` (TND varlen).
 
-    NPU backend sharing the packed vision contract with ``eager_attention``
-    and ``multihead_attention``: q/k/v of shape (tot_seqlens, num_heads,
+    NPU backend sharing the packed vision contract with
+    ``multihead_attention``: q/k/v of shape (tot_seqlens, num_heads,
     head_dim), non-causal within each image segment, no padding inside
     segments; returns (tot_seqlens, num_heads * head_dim). CANN's varlen
     score takes cumulative-END positions (no leading zero), hence

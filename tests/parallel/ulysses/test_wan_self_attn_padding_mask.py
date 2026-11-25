@@ -7,9 +7,11 @@ produce EXACTLY the same result as never having padded at all? This runs on
 CPU with no distributed setup.
 """
 
+from types import SimpleNamespace
+
 import torch
 
-from veomni.models.transformers.wan.modeling_wan import _trim_kv_tail_padding
+from veomni.models.transformers.wan.modeling_wan import AttentionModule, _trim_kv_tail_padding
 from veomni.ops.kernels.attention.standard.eager import eager_attention_forward
 
 
@@ -108,9 +110,39 @@ def test_trim_kv_tail_padding_is_noop_without_mask():
     assert trimmed_v is value
 
 
+def test_attention_module_veomni_eager_padding_mask_matches_unpadded_reference():
+    """``AttentionModule`` bound to ``veomni_eager`` honors Wan's additive tail-padding mask."""
+    torch.manual_seed(0)
+    batch, num_heads, real_len, head_dim = 2, 4, 37, 16
+    pad_size = 3
+    hidden = num_heads * head_dim
+
+    config = SimpleNamespace(ops_config=SimpleNamespace(attn_implementation="veomni_eager"))
+    attn = AttentionModule(config, num_heads=num_heads, head_dim=head_dim).eval()
+    assert attn.veomni_attn.impl == "veomni_eager"
+
+    query = torch.randn(batch, real_len, hidden)
+    key_real = torch.randn(batch, real_len, hidden)
+    value_real = torch.randn(batch, real_len, hidden)
+
+    ref_output = attn(query, key_real, value_real, attention_mask=None, skip_ulysses=True)
+
+    zeros = torch.zeros(batch, pad_size, hidden)
+    key_padded = torch.cat([key_real, zeros], dim=1)
+    value_padded = torch.cat([value_real, zeros], dim=1)
+
+    local_len = real_len + pad_size
+    mask = torch.zeros(1, 1, 1, local_len)
+    mask[..., local_len - pad_size :] = torch.finfo(torch.float32).min
+
+    padded_output = attn(query, key_padded, value_padded, attention_mask=mask, skip_ulysses=True)
+    torch.testing.assert_close(padded_output, ref_output, atol=1e-6, rtol=1e-5)
+
+
 if __name__ == "__main__":
     test_padding_mask_matches_unpadded_reference()
     test_unmasked_padding_would_have_diverged()
     test_trim_kv_tail_padding_matches_unpadded_reference()
     test_trim_kv_tail_padding_is_noop_without_mask()
+    test_attention_module_veomni_eager_padding_mask_matches_unpadded_reference()
     print("OK")

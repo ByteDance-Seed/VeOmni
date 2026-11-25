@@ -355,6 +355,42 @@ def test_packed_forward_matches_per_sample_forward(attn_implementation):
             torch.testing.assert_close(packed[index], alone, rtol=1e-5, atol=1e-5)
 
 
+def test_packed_veomni_eager_matches_veomni_sdpa():
+    """Packed two-pass Cosmos3 MoT attention matches between ``veomni_eager`` and ``veomni_sdpa``."""
+    from veomni.models.seed_omni.modules.cosmos3.core.mot_attention import joint_attention
+
+    eager_mot = _modules("veomni_eager", accelerated=False)["cosmos3_mot"]
+    sdpa_mot = _modules("veomni_sdpa", accelerated=False)["cosmos3_mot"]
+    sdpa_mot.load_state_dict(eager_mot.state_dict())
+
+    generator = torch.Generator().manual_seed(11)
+    und_lengths, grids, fps = [7, 3], [(3, 2, 3), (2, 1, 2)], [5.0, 24.0]
+    gen_lengths = [t * h * w for t, h, w in grids]
+    und = torch.cat([torch.randn(length, 64, generator=generator) for length in und_lengths])
+    gen = torch.cat([torch.randn(length, 64, generator=generator) for length in gen_lengths])
+    with torch.no_grad():
+        eager_out = eager_mot(und, gen, und_lengths=und_lengths, latent_grids=grids, fps=fps)
+        sdpa_out = sdpa_mot(und, gen, und_lengths=und_lengths, latent_grids=grids, fps=fps)
+
+        layout = build_packed_layout(und_lengths, gen_lengths)
+        q_und = torch.randn(sum(und_lengths), 4, 16, generator=generator)
+        k_und = torch.randn(sum(und_lengths), 2, 16, generator=generator)
+        v_und = torch.randn(sum(und_lengths), 2, 16, generator=generator)
+        q_gen = torch.randn(sum(gen_lengths), 4, 16, generator=generator)
+        k_gen = torch.randn(sum(gen_lengths), 2, 16, generator=generator)
+        v_gen = torch.randn(sum(gen_lengths), 2, 16, generator=generator)
+        eager_und, eager_gen = joint_attention(
+            eager_mot.layers[0].self_attn, q_und, k_und, v_und, q_gen, k_gen, v_gen, layout=layout
+        )
+        sdpa_und, sdpa_gen = joint_attention(
+            sdpa_mot.layers[0].self_attn, q_und, k_und, v_und, q_gen, k_gen, v_gen, layout=layout
+        )
+
+    torch.testing.assert_close(eager_out["hidden_gen"], sdpa_out["hidden_gen"], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(eager_und, sdpa_und, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(eager_gen, sdpa_gen, rtol=1e-5, atol=1e-5)
+
+
 def test_loss_is_a_per_sample_mean():
     """The trainer divides by the micro-batch count, so a micro-batch must not sum its samples."""
     connector = _modules(accelerated=False)["cosmos3_flow_connector"]
