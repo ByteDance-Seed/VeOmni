@@ -66,7 +66,7 @@ register_op(
 register_op(
     "minimax_sparse_attention",
     "standard",
-    "npu",
+    "torch_npu",
     description="MiniMax block-sparse attention using torch_npu.npu_fusion_attention",
     wrapper=minimax_sparse_attention_npu,
     requirement=NpuKernelRequirement(),

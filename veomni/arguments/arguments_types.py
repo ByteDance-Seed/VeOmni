@@ -1429,7 +1429,7 @@ _NPU_ALLOWED: Dict[str, frozenset] = {
     "load_balancing_loss_implementation": frozenset(),
     "cross_entropy_loss_implementation": frozenset({"chunk_loss"}),
     "moe_implementation": frozenset({"fused_npu"}),
-    "minimax_sparse_attention_implementation": frozenset({"npu"}),
+    "minimax_sparse_attention_implementation": frozenset({"torch_npu"}),
     "situ_and_mul_implementation": frozenset({"triton"}),
     "chunk_kda_implementation": frozenset({"ascendc"}),
 }
@@ -1439,7 +1439,7 @@ _NPU_REQUIRED: Dict[str, frozenset] = {
     "rotary_pos_emb_implementation": frozenset({"torch_npu"}),
     "rotary_pos_emb_vision_implementation": frozenset({"torch_npu"}),
     "moe_implementation": frozenset({"fused_npu"}),
-    "minimax_sparse_attention_implementation": frozenset({"npu"}),
+    "minimax_sparse_attention_implementation": frozenset({"torch_npu"}),
 }
 
 _AITER_ATTENTION_IMPLEMENTATIONS = frozenset(
@@ -1694,7 +1694,7 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises when the model resolves its kernel."
         },
     )
-    minimax_sparse_attention_implementation: Optional[Literal["eager", "npu"]] = field(
+    minimax_sparse_attention_implementation: Optional[Literal["eager", "torch_npu"]] = field(
         default=None,
         metadata={
             "help": "MiniMax sparse language attention. Defaults to NPU fusion on Ascend and PyTorch elsewhere."

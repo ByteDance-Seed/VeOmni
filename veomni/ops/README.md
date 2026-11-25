@@ -62,7 +62,7 @@ when the selected implementation runs.
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
 | `minimax_sparse_indexer` | `standard` | `eager` |
-| `minimax_sparse_attention` | `standard` | `eager`, `npu` (Ascend default) |
+| `minimax_sparse_attention` | `standard` | `eager`, `torch_npu` (Ascend default) |
 
 The MLU `liger_kernel` rows reuse the CUDA adapters and use
 `MluKernelRequirement` with `requires=("liger_kernel",)`: the Cambricon
@@ -99,8 +99,8 @@ MiniMax M3 uses two packed TND ops with `cu_seqlens` and `max_seqlen`.
 `[T, G, topk]` per query and KV group, with unused slots set to -1.
 `minimax_sparse_attention` consumes these indices and enforces token-level
 causality. Set `minimax_sparse_attention_implementation` to `eager` for the
-PyTorch reference or `npu` for Ascend fusion with matching FP16/BF16 Q/K/V.
-An omitted selection uses `npu` on Ascend and `eager` elsewhere. Dense
+PyTorch reference or `torch_npu` for Ascend fusion with matching FP16/BF16 Q/K/V.
+An omitted selection uses `torch_npu` on Ascend and `eager` elsewhere. Dense
 MiniMax layers select standard attention through `attn_implementation`. MoE
 `swiglu_oai` keeps the merged gate/up layout and replaces SiLU with the clamped
 `(up + 1) * gate * sigmoid(alpha * gate)` activation on the standard fused

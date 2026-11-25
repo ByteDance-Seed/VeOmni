@@ -309,7 +309,7 @@ def test_npu_fused_attention_matches_eager_forward_and_backward(dtype, num_group
     kwargs = dict(block_size=_BLOCK_SIZE, scale=head_dim**-0.5)
     eager = VeomniOp("minimax_sparse_attention", "standard", "eager")
     fused = VeomniOp("minimax_sparse_attention", "standard")
-    assert fused.impl == "npu"
+    assert fused.impl == "torch_npu"
     indices = block_indices.to("npu")
     reference = eager(*cpu_inputs, block_indices, cu_seqlens, max(lengths), **kwargs)
     expected = eager(*npu_inputs, indices, cu_seqlens, max(lengths), **kwargs)

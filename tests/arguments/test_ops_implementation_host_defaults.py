@@ -77,7 +77,7 @@ _EXPECTED_DEFAULTS: dict[str, dict[str, str]] = {
         "rotary_pos_emb_implementation": "torch_npu",
         "rotary_pos_emb_vision_implementation": "torch_npu",
         "load_balancing_loss_implementation": "eager",
-        "minimax_sparse_attention_implementation": "npu",
+        "minimax_sparse_attention_implementation": "torch_npu",
     },
     "mlu": {
         "moe_implementation": "fused_triton",
@@ -150,7 +150,7 @@ def test_explicit_eager_is_kept_on_npu(field_name: str, monkeypatch: pytest.Monk
         ("rotary_pos_emb_vision_implementation", "torch_npu"),
         ("moe_implementation", "fused_npu"),
         ("cross_entropy_loss_implementation", "chunk_loss"),
-        ("minimax_sparse_attention_implementation", "npu"),
+        ("minimax_sparse_attention_implementation", "torch_npu"),
     ],
 )
 def test_explicit_npu_value_is_kept_on_npu(field_name: str, value: str, monkeypatch: pytest.MonkeyPatch):
@@ -183,7 +183,7 @@ def test_explicit_gpu_default_raises_on_npu(field_name: str, value: str, monkeyp
         ("rms_norm_implementation", "torch_npu"),
         ("rotary_pos_emb_implementation", "torch_npu"),
         ("rotary_pos_emb_vision_implementation", "torch_npu"),
-        ("minimax_sparse_attention_implementation", "npu"),
+        ("minimax_sparse_attention_implementation", "torch_npu"),
     ],
 )
 def test_explicit_npu_value_raises_off_npu(field_name: str, value: str, monkeypatch: pytest.MonkeyPatch):
