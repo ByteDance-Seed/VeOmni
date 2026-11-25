@@ -150,6 +150,48 @@ def test_minimax_h3_meter_excludes_legacy_tail_padding(monkeypatch, mock_device_
     assert meter.consume_tokens == 2 * compact["seq_len"]
 
 
+@pytest.mark.parametrize("with_references", [False, True], ids=["t2i", "with-references"])
+def test_minimax_h3_image_meter_counts_offline_cache(monkeypatch, mock_device_flops, with_references):
+    import torch
+
+    from veomni.trainer.dit_trainer import DiTDataCollator
+    from veomni.utils import helper
+
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
+    monkeypatch.setattr(helper, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(helper, "compute_device_memory_metrics", lambda: {})
+    config = _minimax_h3_config()
+    config.condition_model_type = "MiniMaxH3ImageConditionModel"
+    config.audio_enabled = False
+    meter = helper.EnvironMeter(
+        config=config,
+        global_batch_size=1,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    row = {
+        "prompt_embeds": torch.zeros(1, 3, 8),
+        "text_token_tags": torch.ones(3, dtype=torch.long),
+        "clean_latents": torch.zeros(1, 24, 4, 6),
+    }
+    if with_references:
+        row["reference_latents"] = [torch.zeros(1, 24, 2, 4), torch.zeros(1, 24, 6, 4)]
+    expected_tokens = 17 if with_references else 9
+
+    meter.add(DiTDataCollator()([row]))
+    assert meter.batch_seqlens == [expected_tokens]
+    assert meter._model_metadata["h3_text_seqlens"] == [3]
+    metrics = meter.step(delta_time=2.0, global_step=1)
+    expected_flops, promised = VeomniFlopsCounter(config).estimate_flops(
+        [expected_tokens], 2.0, model_metadata={"h3_text_seqlens": [3]}
+    )
+    assert expected_flops > 0
+    assert metrics["mfu"] == pytest.approx(expected_flops / promised, rel=1e-6, abs=0)
+    assert metrics["tokens_per_second(M)"] == pytest.approx(expected_tokens / 2e6)
+    assert metrics["consumed_chunk_num"] == 1
+
+
 def test_minimax_h3_meter_accumulates_and_clears_packed_lengths(monkeypatch, mock_device_flops):
     from veomni.utils import helper
 
