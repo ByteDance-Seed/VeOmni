@@ -726,6 +726,8 @@ class MiniMaxH3DiT(nn.Module):
         sp_rank = dist.get_rank(sp_group) if sp_group is not None else 0
         if packed_batch and (sp_world != 1 or self._block_offload_enabled):
             raise ValueError("H3 multi-sample packing does not support sequence parallelism or block offload.")
+        if packed_batch and (packed_seq_params is None or refiner_packed_seq_params is None):
+            raise ValueError("H3 multi-sample packing requires packed_seq_params and refiner_packed_seq_params.")
 
         if img_position_ids.dim() != 3 or img_position_ids.shape[0] != 1 or img_position_ids.shape[-1] != 3:
             raise ValueError(f"img_position_ids must be [1, S, 3], got {list(img_position_ids.shape)}")
