@@ -38,26 +38,34 @@ def _validate_prompt(prompt):
 
 
 def _validate_layout(pk):
-    """CFG remapping supports upstream compact [text | cond | audio | video] only."""
+    """Validate compact text, ordered mixed references, and target audio/video."""
     if any(isinstance(value, torch.Tensor) and value.device.type != "cpu" for value in pk.values()):
         raise ValueError("Validate CFG packed layouts on CPU when creating the cache.")
     length, text_len, cond = int(pk["seq_len"]), int(pk["text_len"]), int(pk["cond_rows"])
     audio_len, image_len = pk["audio_pos"].numel(), pk["img_pos"].numel()
     if text_len < 1 or cond < 0 or cond > image_len or length != text_len + audio_len + image_len:
         raise ValueError("CFG requires a compact unconditional packed layout with nonempty text.")
+    audio_cond = int(pk.get("audio_cond_rows", 0))
+    if audio_cond < 0 or audio_cond > audio_len:
+        raise ValueError("CFG audio condition rows must fit the packed audio positions.")
     device = pk["text_pos"].device
+    ref_end = text_len + cond + audio_cond
+    refs = torch.cat((pk["img_pos"][:cond], pk["audio_pos"][:audio_cond]))
     expected = {
         "text_pos": torch.arange(text_len, device=device),
-        "audio_pos": torch.arange(text_len + cond, text_len + cond + audio_len, device=device),
-        "img_pos": torch.cat(
-            (
-                torch.arange(text_len, text_len + cond, device=device),
-                torch.arange(text_len + cond + audio_len, length, device=device),
-            )
-        ),
+        "audio_pos": torch.arange(ref_end, ref_end + audio_len - audio_cond, device=device),
+        "img_pos": torch.arange(ref_end + audio_len - audio_cond, length, device=device),
     }
-    if any(not torch.equal(pk[key], value) for key, value in expected.items()):
-        raise ValueError("CFG packed positions must follow [text | cond | audio | video].")
+    if (
+        not torch.equal(pk["text_pos"], expected["text_pos"])
+        or not torch.equal(pk["audio_pos"][audio_cond:], expected["audio_pos"])
+        or not torch.equal(pk["img_pos"][cond:], expected["img_pos"])
+        or not torch.equal(refs.sort().values, torch.arange(text_len, ref_end, device=device))
+        or any(not torch.equal(pk[key], pk[key].sort().values) for key in ("img_pos", "audio_pos"))
+    ):
+        raise ValueError(
+            "CFG packed positions must follow [text | cond | audio | video] with ordered mixed references."
+        )
     if pk["img_position_ids"].shape != (1, length, 3) or pk["token_tags"].shape != (length,):
         raise ValueError("CFG packed coordinates and token tags must match seq_len.")
     tags = pk["token_tags"]
@@ -106,6 +114,9 @@ def validate_unconditional_metadata(positive_pk, negative_pk, prompt, positive_p
     for pk in (positive_pk, negative_pk):
         length, text_len, cond = pk["seq_len"], pk["text_len"], pk["cond_rows"]
         image_len, audio_len = pk["img_pos"].numel(), pk["audio_pos"].numel()
+        audio_cond = pk.get("audio_cond_rows", 0)
+        if audio_cond < 0 or audio_cond > audio_len:
+            raise ValueError("CFG audio reference rows must fit the packed layout.")
         if text_len < 1 or cond < 0 or cond > image_len or length != text_len + image_len + audio_len:
             raise ValueError("CFG requires a compact packed layout with nonempty text.")
         if pk["text_pos"].shape != (text_len,) or pk["img_pos"].ndim != 1 or pk["audio_pos"].ndim != 1:
@@ -113,8 +124,10 @@ def validate_unconditional_metadata(positive_pk, negative_pk, prompt, positive_p
         if pk["img_position_ids"].shape != (1, length, 3) or pk["token_tags"].shape != (length,):
             raise ValueError("CFG packed coordinates and token tags must match seq_len.")
     geometry = ("latent_t", "latent_h_patched", "latent_w_patched", "audio_t", "audio_channel", "cond_rows")
-    if any(positive_pk[key] != negative_pk[key] for key in geometry) or any(
-        positive_pk[key].numel() != negative_pk[key].numel() for key in ("img_pos", "audio_pos")
+    if (
+        (positive_pk.get("audio_cond_rows", 0) != negative_pk.get("audio_cond_rows", 0))
+        or any(positive_pk[key] != negative_pk[key] for key in geometry)
+        or any(positive_pk[key].numel() != negative_pk[key].numel() for key in ("img_pos", "audio_pos"))
     ):
         raise ValueError("Conditional and unconditional target/reference geometry must match.")
     if (
@@ -132,6 +145,8 @@ def validate_unconditional(positive_pk, negative_pk, prompt, positive_prompt):
     for pk in (positive_pk, negative_pk):
         _validate_layout(pk)
     for key in ("img_pos", "audio_pos"):
+        if not torch.equal(positive_pk[key] - positive_pk["text_len"], negative_pk[key] - negative_pk["text_len"]):
+            raise ValueError("Conditional and unconditional reference ordering differs.")
         p = positive_pk["img_position_ids"][0, positive_pk[key]].clone()
         n = negative_pk["img_position_ids"][0, negative_pk[key]].clone()
         p[:, 0] -= positive_pk["text_len"]
@@ -147,6 +162,7 @@ def prepare_unconditional(sample, positive_pk, negative_pk, prompt):
         key: sample[key]
         for key in ("video_latent_shape", "audio_latent_shape", "cond_rows", "skip_mask_out_condition")
     }
+    result["audio_cond_rows"] = sample.get("audio_cond_rows", 0)
     result.update(use_gradient_checkpointing=False, use_gradient_checkpointing_offload=False, update_mask=None)
     length = negative_pk["seq_len"]
     # Text tokens use the video timestep. Reuse the positive branch's unique
