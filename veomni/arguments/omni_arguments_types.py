@@ -846,11 +846,8 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
     validated too, not just the global default.
 
     ``torch_compile`` is no longer refused outright. ``accelerator.torch_compile.enable``
-    is the run-wide switch, and each module decides for itself whether it may be
-    compiled, through :attr:`~veomni.models.seed_omni.modules.module_modeling_base.
-    PretrainedOmniModule.supports_torch_compile`. A module that leaves the flag
-    ``False`` is never compiled even when the run enables compile, so the two
-    settings cannot disagree.
+    is the switch, resolved per module so a per-module ``accelerator:`` overlay can
+    turn it on or off for one module.
 
     What is still refused here is the combination the composed path cannot run:
     CUDA Graph replay needs one mark per micro-batch across the whole graph, and

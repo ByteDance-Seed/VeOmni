@@ -22,16 +22,6 @@ from .configuration_base import as_veomni_config, get_veomni_config_class
 class VeOmniPreTrainedModel(PreTrainedModel):
     """Adapt model-owned configs, retaining HF's model initialization behavior."""
 
-    #: Whether ``torch.compile`` may wrap this model's blocks.
-    #:
-    #: Off by default. Read per block, from the nearest enclosing
-    #: ``VeOmniPreTrainedModel`` in the block's module path — so a multimodal model
-    #: sets it on the submodels that qualify: a ``Qwen3VLTextModel`` that opts in
-    #: compiles ``model.language_model.layers.*`` while a sibling tower stays
-    #: eager. The block classes are untouched, so ``_no_split_modules`` keeps
-    #: meaning what it meant to FSDP.
-    supports_torch_compile: bool = False
-
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if cls.config_class is not None:

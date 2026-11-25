@@ -67,29 +67,27 @@ def composed_model_owns_wrap(accelerator: "AcceleratorConfig") -> bool:
     return fsdp_config.fsdp_scope == "model" and fsdp_config.fsdp_mode != "eager"
 
 
-def module_compile_config(accelerator: "AcceleratorConfig", module: nn.Module, *, global_accelerator=None):
-    """This module's compile settings, or everything off unless it opts in.
+def module_compile_config(accelerator: "AcceleratorConfig", *, global_accelerator=None):
+    """This module's compile settings, or everything off unless the run asked for it.
 
-    ``enable`` needs all of: the module's resolved ``torch_compile.enable``, its
-    ``supports_torch_compile`` class flag, an ``fsdp2`` wrap, and — when
-    ``global_accelerator`` is given, i.e. under ``fsdp_scope='model'`` — an
-    ``fsdp2`` launcher, because that wrap is the top-level one. ``dynamic`` adds
-    the module's ``supports_torch_compile_dynamic``.
+    ``enable`` needs the module's resolved ``torch_compile.enable`` and an
+    ``fsdp2`` wrap — and, when ``global_accelerator`` is given (i.e. under
+    ``fsdp_scope='model'``), an ``fsdp2`` launcher too, because that wrap is the
+    top-level one. Which blocks compile, and whether ``dynamic`` is used, come
+    from the config alone; there is no per-model capability flag.
     """
     from .....distributed.torch_compile import CompileConfig
 
     run_config = accelerator.torch_compile
-    supported = bool(getattr(module, "supports_torch_compile", False))
-    dynamic_ok = bool(getattr(module, "supports_torch_compile_dynamic", False))
     fsdp2 = accelerator.fsdp_config.fsdp_mode == "fsdp2"
     wrap_fsdp2 = global_accelerator is None or global_accelerator.fsdp_config.fsdp_mode == "fsdp2"
-    enabled = bool(run_config.enable) and supported and fsdp2 and wrap_fsdp2
+    enabled = bool(run_config.enable) and fsdp2 and wrap_fsdp2
     return CompileConfig(
         enable=enabled,
         backend=run_config.backend,
         mode=run_config.mode,
         fullgraph=run_config.fullgraph,
-        dynamic=enabled and bool(run_config.dynamic) and dynamic_ok,
+        dynamic=enabled and bool(run_config.dynamic),
     )
 
 
@@ -498,7 +496,6 @@ class ModuleRuntime(VeOmniModelRuntime):
         """
         return module_compile_config(
             self.args.accelerator,
-            self.model,
             global_accelerator=self._global_accelerator if self.wrap_omni_model else None,
         )
 

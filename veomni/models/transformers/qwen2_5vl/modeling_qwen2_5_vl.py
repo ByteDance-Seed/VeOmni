@@ -1132,9 +1132,6 @@ class Qwen2_5_VLDecoderLayer(GradientCheckpointingLayer):
 
 @auto_docstring
 class Qwen2_5_VLTextModel(Qwen2_5_VLPreTrainedModel):
-    # The text decoder is the measured compile target; the tower keeps the
-    # ``False`` default and stays eager.
-    supports_torch_compile = True
     config: Qwen2_5_VLTextConfig
     input_modalities = ("text",)
     _can_record_outputs = {

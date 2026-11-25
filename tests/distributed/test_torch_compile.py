@@ -2,7 +2,6 @@ import copy
 import os
 import subprocess
 import sys
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -292,96 +291,12 @@ def test_compile_decoder_blocks_matches_a_scoped_no_split_entry(monkeypatch):
     assert compile_decoder_blocks(model, CompileConfig()) == 2
 
 
-def test_compile_decoder_blocks_scopes_accept_non_decoder_block_names(monkeypatch):
-    """A SeedOmni module names its own blocks; its declaration, not the spelling, gates them.
+def test_compile_decoder_blocks_compiles_every_no_split_module(monkeypatch):
+    """Every entry in ``_no_split_modules`` compiles, whatever its class is called.
 
-    ``JanusVqvae`` lists ``JanusVQVAEAttnBlock`` in ``_no_split_modules``. That
-    entry is compilable because the module declared ``supports_torch_compile`` —
-    the class name never mattered.
+    That list is what FSDP wraps, so compiling it verbatim keeps the compiled set
+    and the sharded set identical — the whole model, not a name-selected subset.
     """
-    from veomni.models.modeling_base import VeOmniPreTrainedModel
-
-    class JanusVQVAEAttnBlock(nn.Module):
-        def forward(self, x):
-            return x
-
-    class CodecModel(VeOmniPreTrainedModel):
-        supports_torch_compile = True
-        _no_split_modules = ["JanusVQVAEAttnBlock"]
-
-        def __init__(self):
-            nn.Module.__init__(self)
-            self.vqvae = nn.Module()
-            self.vqvae.blocks = nn.ModuleList([JanusVQVAEAttnBlock()])
-
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-    assert compile_decoder_blocks(CodecModel(), CompileConfig(enable=True)) == 1
-
-
-def test_a_veomni_model_that_does_not_declare_support_never_compiles(monkeypatch):
-    """The declaration decides, and its absence is decisive.
-
-    This is what keeps a vision tower eager without any naming convention: the
-    tower's class simply does not set ``supports_torch_compile``.
-    """
-    from veomni.models.modeling_base import VeOmniPreTrainedModel
-
-    class SomeDecoderLayer(nn.Module):
-        def forward(self, x):
-            return x
-
-    class Undeclared(VeOmniPreTrainedModel):
-        _no_split_modules = ["SomeDecoderLayer"]
-
-        def __init__(self):
-            nn.Module.__init__(self)
-            self.layers = nn.ModuleList([SomeDecoderLayer()])
-
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-    # `*DecoderLayer` in the name would have been enough under the old rule.
-    assert compile_decoder_blocks(Undeclared(), CompileConfig(enable=True)) == 0
-
-
-def test_a_multimodal_model_compiles_its_declared_submodel_only(monkeypatch):
-    """The nearest declaring ancestor decides, so one model can qualify one tower of two."""
-    from veomni.models.modeling_base import VeOmniPreTrainedModel
-
-    class TextBlock(nn.Module):
-        def forward(self, x):
-            return x
-
-    class VisionBlock(nn.Module):
-        def forward(self, x):
-            return x
-
-    class TextModel(VeOmniPreTrainedModel):
-        supports_torch_compile = True
-        _no_split_modules = ["TextBlock"]
-
-    class VisionModel(VeOmniPreTrainedModel):
-        _no_split_modules = ["VisionBlock"]
-
-    class Composed(VeOmniPreTrainedModel):
-        _no_split_modules = ["TextBlock", "VisionBlock"]
-
-        def __init__(self):
-            nn.Module.__init__(self)
-            self.language_model = TextModel.__new__(TextModel)
-            nn.Module.__init__(self.language_model)
-            self.language_model.layers = nn.ModuleList([TextBlock(), TextBlock()])
-            self.visual = VisionModel.__new__(VisionModel)
-            nn.Module.__init__(self.visual)
-            self.visual.blocks = nn.ModuleList([VisionBlock()])
-
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-    model = Composed()
-    assert compile_decoder_blocks(model, CompileConfig(enable=True)) == 2
-    assert all(getattr(b, "_veomni_forward_compiled", False) for b in model.language_model.layers)
-    assert not getattr(model.visual.blocks[0], "_veomni_forward_compiled", False)
-
-
-def test_compile_decoder_blocks_without_scopes_keeps_decoder_layers_only(monkeypatch):
-    """The unscoped path keeps the HF convention: only ``*DecoderLayer`` is compiled."""
 
     class SomeVisionBlock(nn.Module):
         def forward(self, x):
@@ -396,29 +311,11 @@ def test_compile_decoder_blocks_without_scopes_keeps_decoder_layers_only(monkeyp
             self.vision = SomeVisionBlock()
 
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-    compiled = compile_decoder_blocks(MixedModel(), CompileConfig(enable=True))
-    assert compiled == 1
+    model = MixedModel()
 
-
-def test_compile_decoder_blocks_rejects_unvalidated_multimodal_model(monkeypatch):
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-
-    model = ToyModel()
-    model.config = SimpleNamespace(model_type="qwen2_vl", vision_config=SimpleNamespace())
-    model.input_modalities = ("image", "text")
-
-    with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
-        compile_decoder_blocks(model, CompileConfig())
-
-
-def test_compile_decoder_blocks_rejects_qwen3_vl_dynamic_shapes(monkeypatch):
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-
-    with pytest.raises(RuntimeError, match="model.accelerator.torch_compile.dynamic=False"):
-        compile_decoder_blocks(
-            ToyQwen3VLModel(ToyDecoderLayer()),
-            CompileConfig(dynamic=True),
-        )
+    assert compile_decoder_blocks(model, CompileConfig(enable=True)) == 2
+    assert model.decoder._veomni_forward_compiled
+    assert model.vision._veomni_forward_compiled
 
 
 def test_compile_decoder_blocks_allows_a_seedomni_module_tower(monkeypatch):
@@ -466,7 +363,6 @@ def test_compile_decoder_blocks_rejects_cuda_graphs_for_a_seedomni_module(monkey
         sub_configs = {}
 
     class Tower(PretrainedOmniModule):
-        supports_torch_compile = True
         _no_split_modules = ["ToyDecoderLayer"]
         config_class = TowerConfig
 
@@ -476,79 +372,8 @@ def test_compile_decoder_blocks_rejects_cuda_graphs_for_a_seedomni_module(monkey
 
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
 
-    with pytest.raises(RuntimeError, match="CUDA Graph replay for a SeedOmni module"):
+    with pytest.raises(RuntimeError, match="CUDA Graph replay under SeedOmni"):
         compile_decoder_blocks(Tower(), CompileConfig(enable=True, backend="cudagraphs"))
-
-
-def test_compile_decoder_blocks_still_rejects_an_unsupported_hf_multimodal_model(monkeypatch):
-    """A single HF multimodal model keeps the fail-closed rule: it holds the
-    towers *and* the cross-modal injection, unlike a SeedOmni module."""
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-
-    model = ToyModel()
-    model.config = SimpleNamespace(model_type="qwen2_vl", vision_config=SimpleNamespace())
-    model.input_modalities = ("image", "text")
-
-    with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
-        compile_decoder_blocks(model, CompileConfig())
-
-
-@pytest.mark.parametrize(
-    "compile_config",
-    [
-        CompileConfig(backend="inductor", mode="reduce-overhead"),
-        CompileConfig(backend="inductor", mode="max-autotune"),
-        CompileConfig(backend="cudagraphs"),
-    ],
-    ids=["reduce-overhead", "max-autotune", "cudagraphs-backend"],
-)
-def test_compile_decoder_blocks_rejects_qwen3_vl_cuda_graphs(monkeypatch, compile_config):
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-
-    with pytest.raises(RuntimeError, match="does not support CUDA Graph replay"):
-        compile_decoder_blocks(ToyQwen3VLModel(ToyDecoderLayer()), compile_config)
-
-
-@pytest.mark.parametrize(
-    ("sequence_parallel_enabled", "async_enabled"),
-    [(True, False), (False, True)],
-    ids=["sequence-or-context-parallel", "async-ulysses"],
-)
-def test_compile_decoder_blocks_rejects_qwen3_vl_parallel_attention_paths(
-    monkeypatch,
-    sequence_parallel_enabled,
-    async_enabled,
-):
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-
-    with pytest.raises(RuntimeError, match="ulysses_size=1.*cp_size=1.*enable_async=False"):
-        compile_decoder_blocks(
-            ToyQwen3VLModel(ToyDecoderLayer()),
-            CompileConfig(),
-            sequence_parallel_enabled=sequence_parallel_enabled,
-            async_enabled=async_enabled,
-        )
-
-
-def test_compile_decoder_blocks_targets_qwen3_vl_text_layers_only(monkeypatch):
-    from veomni.models import build_foundation_model
-
-    from ..tools.training_utils import make_eager_ops_config
-
-    monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
-    model = build_foundation_model(
-        config_path="tests/toy_config/qwen3vl_toy/config.json",
-        weights_path=None,
-        torch_dtype="float32",
-        init_device="meta",
-        ops_implementation=make_eager_ops_config(),
-    )
-
-    compiled = compile_decoder_blocks(model, CompileConfig())
-
-    assert compiled == len(model.model.language_model.layers) == 2
-    assert all(layer._veomni_forward_compiled for layer in model.model.language_model.layers)
-    assert all(not getattr(block, "_veomni_forward_compiled", False) for block in model.model.visual.blocks)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -596,12 +421,14 @@ def test_qwen3_vl_decoder_traces_under_fullgraph(use_checkpoint):
 
     # An explicit state avoids the logging fallback in get_parallel_state(), which Dynamo cannot trace fullgraph.
     with use_parallel_state(_non_sp_parallel_state()):
+        # Both entries in `_no_split_modules` compile — the text decoder and the toy
+        # vision block. The assertions below only concern the decoder's numerics.
         assert (
             compile_decoder_blocks(
                 compiled_model,
                 CompileConfig(enable=True, backend="eager", fullgraph=True, dynamic=False),
             )
-            == 1
+            == 2
         )
         eager_output = eager_layer(hidden_states_eager, position_embeddings=position_embeddings)
         compiled_output = compiled_layer(hidden_states_compiled, position_embeddings=position_embeddings)
@@ -665,12 +492,14 @@ def test_qwen3_vl_compiled_decoder_matches_eager_packed_flash_attention():
 
     # An explicit state avoids the logging fallback in get_parallel_state(), which Dynamo cannot trace fullgraph.
     with use_parallel_state(_non_sp_parallel_state()):
+        # Both `_no_split_modules` entries compile (decoder + toy vision block); the
+        # assertions below only compare the decoder's numerics.
         assert (
             compile_decoder_blocks(
                 compiled_model,
                 CompileConfig(enable=True, backend="inductor", fullgraph=True, dynamic=False),
             )
-            == 1
+            == 2
         )
         eager_output = eager_layer(
             hidden_states_eager,
@@ -805,43 +634,6 @@ def test_vlm_train_step_marks_each_compile_micro_batch(monkeypatch):
     trainer.train_step(iter([[{}, {}]]))
 
     assert marks == [True, True]
-
-
-def test_vlm_runtime_rejects_unsupported_compile_model_while_building(monkeypatch):
-    # The rejection has to land during the model build, which the runtime does on
-    # construction — i.e. before the trainer touches data.
-    from veomni.trainer.vlm_trainer import VLMModelRuntime
-
-    calls = []
-
-    def build_unsupported_model(runtime):
-        calls.append("_build_model")
-        runtime.model = ToyModel()
-        runtime.model.config = SimpleNamespace(model_type="qwen2_5_vl", vision_config=SimpleNamespace())
-        runtime.model.input_modalities = ("image", "text")
-        runtime.model_config = runtime.model.config
-        runtime._validate_torch_compile()
-
-    # No mesh is registered here, and none is needed: the rejection happens
-    # before anything reads one. Stubbing ``setup`` alone would leave the
-    # build's own scope looking for a state that was never registered.
-    monkeypatch.setattr(VLMModelRuntime, "setup", lambda _: None)
-    monkeypatch.setattr("veomni.models.model_runtime.use_parallel_state", lambda _name: nullcontext())
-    monkeypatch.setattr(VLMModelRuntime, "_build_model", build_unsupported_model)
-    monkeypatch.setattr(VLMModelRuntime, "_freeze_model_module", lambda _: calls.append("_freeze_model_module"))
-
-    args = SimpleNamespace(
-        accelerator=SimpleNamespace(
-            torch_compile=ArgumentsTorchCompileConfig(enable=True),
-            ulysses_size=1,
-            cp_size=1,
-            enable_async=False,
-        ),
-    )
-    with pytest.raises(RuntimeError, match="only for dense Qwen3-VL"):
-        VLMModelRuntime(args, train=SimpleNamespace())
-
-    assert calls == ["_build_model"]
 
 
 def test_compile_config_detects_cuda_graphs():

@@ -1346,9 +1346,6 @@ class Qwen3VLMoeTextRotaryEmbedding(nn.Module):
     )
 )
 class Qwen3VLMoeTextModel(Qwen3VLMoePreTrainedModel):
-    # The text decoder is the measured compile target; the tower keeps the
-    # ``False`` default and stays eager.
-    supports_torch_compile = True
     config: Qwen3VLMoeTextConfig
     input_modalities = ("text",)
 

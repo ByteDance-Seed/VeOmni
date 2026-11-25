@@ -58,8 +58,6 @@ class JanusSiglip(InferenceMixin, PretrainedOmniModule):
     _supports_flash_attn = True
     _supports_flex_attn = True
     # Measured ~1.12x over a 4-block tower — small but positive, and the
-    # cost is a one-off compile.
-    supports_torch_compile = True
 
     def __init__(self, config: JanusSiglipConfig):
         super().__init__(config)

@@ -480,104 +480,19 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 
 ### TorchCompileConfig
 
-`model.accelerator.torch_compile.*` — Per-block `torch.compile` options for text training and dense Qwen3-VL training. Both paths require FSDP2 on CUDA, `train.dyn_bsz=True`, and `train.pad_to_length=True`, so packed token tensors have stable shapes. For Qwen3-VL, only `Qwen3VLTextDecoderLayer` forwards are compiled; the vision tower, DeepStack injection, and language-model head remain eager. Different packed FlashAttention boundaries can produce separate Inductor specializations, so Qwen3-VL currently requires the default `backend="inductor"` and `mode=None` without CUDA Graph replay, `model.accelerator.torch_compile.dynamic=False`, `model.accelerator.ulysses_size=1`, `model.accelerator.cp_size=1`, and `model.accelerator.enable_async=False`. Qwen3-VL-MoE, ExtraParallel, DDP, non-FSDP, NPU, and other multimodal models remain unsupported and fail explicitly.
-
-#### What gets compiled
-
-A model declares which of its `_no_split_modules` entries `torch.compile` may
-wrap, through `supports_torch_compile` on the nearest enclosing
-`VeOmniPreTrainedModel` in the block's module path. The flag defaults to `False`,
-so a block is compiled only where something opted in — and one model can qualify
-one submodel and not another:
-
-```python
-class Qwen3VLTextModel(...):    supports_torch_compile = True    # layers.*
-class Qwen3VLVisionModel(...):  # inherits False                  # blocks.*
-```
-
-`_no_split_modules` itself is unchanged, so FSDP keeps wrapping exactly what it
-wrapped before. The shipped declarations: the pure decoder stacks
-(`llama`, `qwen2`, `qwen3`, `qwen3_moe`, `deepseek_v3`/`v4`, `gemma3`, `gpt_oss`,
-`glm_moe_dsa`, `qwen3_5`, `qwen3_5_moe`, `qwen4_exp`, `seed_oss`) opt in on their
-`PreTrainedModel` base; the multimodal families (`qwen2_vl`, `qwen2_5vl`,
-`qwen3_vl`, `qwen3_vl_moe`, `qwen3_5`, `qwen3_5_moe`, `qwen2_5_omni`,
-`qwen3_omni_moe`) opt in on their text submodel only; the DiT families (`flux`,
-`movqgan`, `wan`) opt in nowhere.
-
-A single HF multimodal model other than dense Qwen3-VL still fails closed — it
-holds its towers *and* the cross-modal injection in one `forward`, so its block
-boundaries are not the plain decoder-block contract.
-
-#### SeedOmni: per-module opt-in
-
-A SeedOmni module adds three conditions of its own, because compile pays off by
-module rather than by model:
-
-1. its own resolved `accelerator.torch_compile.enable` — the launcher default,
-   which a per-module `accelerator:` YAML overlay can flip either way;
-2. `supports_torch_compile = True` on the module class;
-3. `fsdp_mode: fsdp2` for that module — `compile_decoder_blocks` does not run
-   under DDP.
-
-A module failing any of them trains eagerly while its siblings compile. The
-run-level `enable` is the default each module's resolution starts from, not a
-second veto, so an overlay that turns it on is honoured. Under
-`fsdp_scope='model'` the wrap is the top-level one, so the launcher's
-`fsdp_mode` is consulted as well; under `fsdp_scope='module'` the module's own
-overlay *is* its wrap and the launcher is not.
-
-Measured per module on A100-80GB (forward+backward, `backend="inductor"`):
-
-| module | static vs eager | dynamic vs static |
-| --- | --- | --- |
-| `qwen3_llm` | 1.58x | 1.000x |
-| `qwen3vl_llm` | 1.58x | 0.997x |
-| `janus_llama` | 1.32x | 1.000x |
-| `janus_vqvae` | 1.73x | **0.696x** |
-| `janus_siglip` | 1.12x | 0.992x |
-| `bagel_siglip_navit` | 1.02x (stays off) | — |
-
-**`dynamic=True` is a second opt-in, and a text backbone needs it.**
-`SeedOmniCollator` pads nothing, so a text backbone's packed length changes every
-step and a static compile recompiles per new length. Over 40 drawn lengths
-spanning 280–2900 tokens:
-
-| | first pass | second pass | graphs |
-| --- | --- | --- | --- |
-| eager | 1.43 s | 1.03 s | — |
-| `dynamic=False` | **362 s** | 0.70 s | 156 |
-| `dynamic=True` | 13.5 s | 0.70 s | 160 |
-
-`dynamic` is not free: Inductor emits shape-polymorphic kernels — a runtime
-stride instead of a constant, a predicate on every load, some fusions broken —
-which costs a fixed amount per call. That is invisible on a matmul-heavy
-backbone (cuBLAS takes any shape) and dominant on a codec of many small blocks:
-`janus_vqvae` loses 30% (30.7 → 44.2 ms/step, reproduced three times). So a
-module declares `supports_torch_compile_dynamic` separately, and only the ones
-whose input shape really varies set it.
-
-On a text stack, `dynamic=True` over six lengths spanning 300–2816 tokens kept
-four graphs, ran a variable-shape step in `21.6 → 15.3 ms/step` (1.41x), and
-matched eager to the same tolerance as a static compile (2.4e-2 relative on a
-bf16 stack from Inductor reordering reductions; `dynamic-vs-static` differed by
-6e-3).
-
-CUDA Graph replay and sequence parallelism stay refused under SeedOmni
-(`backend='cudagraphs'` / `mode='reduce-overhead'` / `mode='max-autotune'` /
-`ulysses_size>1` / `cp_size>1` / `enable_async`): replay needs one
-`cudagraph_mark_step_begin()` per micro-batch across the composed graph, which
-`OmniTrainer` does not make, and Ulysses slices activations the graph edges
-reorder.
-
-The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `model.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
+`model.accelerator.torch_compile.*` — per-block `torch.compile` options. A model
+wraps the blocks it declares eligible, so `enable: true` is all a supported model
+needs; SeedOmni adds a per-module gate on top. See
+[Per-Block torch.compile](../key_features/torch_compile.md) for which blocks
+compile, the difference between the two trainers, and the measured payoff.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| enable | `bool` | `False` | Enable per-block `torch.compile` on supported FSDP2 decoder blocks. |
+| enable | `bool` | `False` | Compile the blocks this model declares. |
 | backend | `Optional[str]` | `"inductor"` | Backend passed to `torch.compile`. |
-| mode | `Optional[str]` | `None` | Mode passed to `torch.compile`. `None` uses the `inductor` backend default. `"reduce-overhead"` enables CUDA Graphs on the `inductor` backend, requires `model.accelerator.fsdp_config.reshard_after_forward=False`, and must be `None` when `backend="cudagraphs"`. |
+| mode | `Optional[str]` | `None` | Mode passed to `torch.compile`. `None` uses the `inductor` default. `"reduce-overhead"` enables CUDA Graphs and requires `model.accelerator.fsdp_config.reshard_after_forward=False`; must be `None` when `backend="cudagraphs"`. |
 | fullgraph | `bool` | `True` | Whether to pass `fullgraph=True` to `torch.compile`. |
-| dynamic | `bool` | `False` | Whether to pass `dynamic=True` to `torch.compile`. |
+| dynamic | `bool` | `False` | Whether to pass `dynamic=True`. Needed where the packed length changes every step, which under SeedOmni is most text backbones; there it is additionally gated per module. |
 
 ### OptimizerConfig
 

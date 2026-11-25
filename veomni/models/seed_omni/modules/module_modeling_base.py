@@ -54,22 +54,6 @@ class PretrainedOmniModule(PreTrainedModel):
     #: leaves this ``False``, so the two sides of a handoff can never disagree.
     supports_sp_sharded_handoff: bool = False
 
-    #: Whether this module's blocks may be wrapped by ``torch.compile``.
-    #:
-    #: Off by default; set it once the module's compile path has been measured to
-    #: pay off. The run-wide ``accelerator.torch_compile.enable`` still gates the
-    #: whole run, so this is a permission, not a switch.
-    supports_torch_compile: bool = False
-
-    #: Whether the module also tolerates ``dynamic=True``.
-    #:
-    #: Required for a text backbone — the collator pads nothing, so its packed
-    #: length changes every step and a static compile recompiles each time. Left
-    #: off where the input shape is fixed (a tower, a codec), because Inductor's
-    #: shape-polymorphic kernels cost more per call and can lose outright.
-    #: Measurements for both flags: ``docs/usage/arguments.md``.
-    supports_torch_compile_dynamic: bool = False
-
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Any, *args: Any, **kwargs: Any):
         """Load weights, then bind module-owned processor / tokenizer sidecars."""

@@ -399,11 +399,10 @@ class VeOmniModelRuntime:
         )
 
     def _compile_config(self):
-        """``CompileConfig`` for this model's wrap.
+        """``CompileConfig`` for this model's wrap, taken from its ``accelerator``.
 
-        A single model has one compile decision, taken from its ``accelerator``.
-        SeedOmni's :class:`ModuleRuntime` overrides this to intersect it with the
-        module's own :attr:`supports_torch_compile` opt-in.
+        SeedOmni's :class:`ModuleRuntime` overrides this to read its own module's
+        ``accelerator`` and to honour the composed-wrap split.
         """
         from ..distributed.torch_compile import CompileConfig
 

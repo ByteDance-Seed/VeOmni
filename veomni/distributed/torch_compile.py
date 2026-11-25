@@ -25,20 +25,6 @@ from ..utils import device, logging
 logger = logging.get_logger(__name__)
 
 
-#: Multimodal models whose compile path has been validated, and the block each
-#: compiles.
-#:
-#: A single HF multimodal model holds its towers *and* the cross-modal injection
-#: between them in one ``forward``, so its blocks are not the plain decoder-block
-#: contract — hence an allowlist rather than an opt-in. SeedOmni modules and
-#: composed models do not appear here: their parts declare
-#: :attr:`~...modules.module_modeling_base.PretrainedOmniModule.supports_torch_compile`
-#: and get the composed guards instead.
-_SUPPORTED_MULTIMODAL_DECODER_BLOCKS = {
-    "qwen3_vl": "Qwen3VLTextDecoderLayer",
-}
-
-
 @dataclass
 class CompileConfig:
     """Runtime options for compiling FSDP2 decoder blocks."""
@@ -65,131 +51,38 @@ class CompileConfig:
         return self.backend == "cudagraphs" or self.mode == "reduce-overhead" or self.mode == "max-autotune"
 
 
-def _compile_decision(model: nn.Module, fqn: str) -> bool | None:
-    """What the nearest ``VeOmniPreTrainedModel`` owning ``fqn`` says, or ``None`` if there is none.
-
-    Walking outwards from the block and taking the nearest declarer is what lets a
-    multimodal model qualify one submodel and not another
-    (``language_model.layers.0`` finds ``Qwen3VLTextModel``;
-    ``visual.blocks.0`` finds the tower, which inherits ``False``). ``None`` means
-    no ``VeOmniPreTrainedModel`` in the path at all, so the caller keeps its old
-    rule.
-    """
-    from ..models.modeling_base import VeOmniPreTrainedModel
-
-    parts = fqn.split(".")
-    for end in range(len(parts) - 1, -1, -1):
-        path = ".".join(parts[:end])
-        try:
-            candidate = model if not path else model.get_submodule(path)
-        except AttributeError:
-            continue
-        if isinstance(candidate, VeOmniPreTrainedModel):
-            return bool(getattr(candidate, "supports_torch_compile", False))
-    return None
-
-
-def _block_compiles(model: nn.Module, fqn: str, class_name: str) -> bool:
-    """Whether the block at ``fqn`` should be compiled.
-
-    A declaration wins. Only a model that declares nothing falls back to the
-    ``*DecoderLayer`` suffix, which keeps bare-``nn.Module`` callers working.
-    """
-    declared = _compile_decision(model, fqn)
-    if declared is not None:
-        return declared
-    return class_name.endswith("DecoderLayer")
-
-
 def _decoder_block_specs(model: nn.Module) -> list[tuple[str, str | None]]:
-    """``(class name, child scope)`` for each compilable block in ``_no_split_modules``.
+    """``(class name, child scope)`` for every block in ``_no_split_modules``.
+
+    ``_no_split_modules`` is the wrap-unit list FSDP already uses, so compiling it
+    verbatim means the compiled set and the sharded set are the same thing — the
+    whole model is compiled, not a hand-picked subset of it.
 
     A bare class name has scope ``None`` and matches anywhere; on a SeedOmni
-    composed model each entry is scoped to its child (``janus_llama.LlamaDecoderLayer``,
-    see ``_scoped_no_split_modules``) so it matches only there. The name half is
-    compared against ``type(module).__name__``, which never carries a scope.
-
-    Whether an entry compiles is the model's answer, not its class name's — see
-    :func:`_block_compiles`.
+    composed model each entry is scoped to its child
+    (``janus_llama.LlamaDecoderLayer``, see ``_scoped_no_split_modules``) so it
+    matches only there. The name half is compared against
+    ``type(module).__name__``, which never carries a scope.
     """
     no_split_modules = getattr(model, "_no_split_modules", None) or getattr(type(model), "_no_split_modules", None)
     if no_split_modules is None:
         return []
-    by_class: dict[str, list[str]] = {}
-    for name, submodule in model.named_modules():
-        if name:
-            by_class.setdefault(type(submodule).__name__, []).append(name)
-
     specs: list[tuple[str, str | None]] = []
     for entry in no_split_modules:
         if not isinstance(entry, str):
             continue
         scope, _, class_name = entry.rpartition(".")
-        matches = by_class.get(class_name, [])
-        if not matches:
-            continue
-        if any(_block_compiles(model, fqn, class_name) for fqn in matches):
-            specs.append((class_name, scope or None))
+        specs.append((class_name, scope or None))
     return specs
-
-
-def _decoder_block_class_names(model: nn.Module) -> set[str]:
-    """Decoder-layer class names in ``_no_split_modules``, scopes stripped.
-
-    Kept for :func:`validate_compile_model`, which only asks whether a class is
-    declared at all.
-    """
-    return {class_name for class_name, _ in _decoder_block_specs(model)}
 
 
 def _is_composed_model(model: nn.Module) -> bool:
     """Whether ``model`` is a SeedOmni composed :class:`OmniModel`.
 
-    Recognised by the per-module config map, which no single model carries. A
-    composed model presents as text-only to :func:`_is_multimodal_model`: it
-    inherits ``input_modalities = "text"`` from ``PreTrainedModel`` and its
-    ``OmniConfig`` has no ``vision_config`` / ``audio_config`` — the media
-    modalities live in ``_module_configs``.
+    Recognised by the per-module config map, which no single model carries.
     """
     config = getattr(model, "config", None)
     return bool(getattr(config, "_module_configs", None))
-
-
-def _is_multimodal_model(model: nn.Module) -> bool:
-    config = getattr(model, "config", None)
-    if config is not None and any(
-        getattr(config, config_name, None) is not None for config_name in ("vision_config", "audio_config")
-    ):
-        return True
-
-    input_modalities = getattr(model, "input_modalities", None) or getattr(type(model), "input_modalities", ())
-    if isinstance(input_modalities, str):
-        input_modalities = (input_modalities,)
-    return any(modality != "text" for modality in input_modalities)
-
-
-def _is_omni_module(model: nn.Module) -> bool:
-    """Whether ``model`` is one SeedOmni module, possibly behind a wrapper.
-
-    Under ``fsdp_scope='module'`` each module is wrapped on its own, so the wrap
-    sees a single component rather than a whole multimodal model. That matters
-    for the guards below: a SeedOmni tower carries a ``vision_config`` because
-    that is how its own config is shaped, not because it also holds an LLM and
-    the cross-modal injection between them. A single HF multimodal model
-    (Qwen2.5-Omni, Qwen3-VL-MoE, ...) does hold all of that and stays
-    fail-closed.
-
-    The wrapper is looked through. A LoRA module is a
-    :class:`~veomni.lora.VeOmniLoraModel` (a plain ``nn.Module``) holding the
-    SeedOmni module on ``get_base_model()`` / ``.model``, so an ``isinstance``
-    against the outer object would miss it and send the tower through the
-    single-model multimodal rule instead — which rejects every SeedOmni family
-    except dense Qwen3-VL.
-    """
-    from ..models.seed_omni.accelerated.utils.dispatch import unwrap_module_chain
-    from ..models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
-
-    return isinstance(unwrap_module_chain(model), PretrainedOmniModule)
 
 
 def validate_compile_model(
@@ -198,76 +91,41 @@ def validate_compile_model(
     sequence_parallel_enabled: bool = False,
     async_enabled: bool = False,
 ) -> None:
-    """Validate model-specific contracts for per-block compilation.
+    """Validate the contracts a SeedOmni run has on top of the shared ones.
 
-    Four callers, four branches — see the module docstring for the table and for
-    why the single-model multimodal rule is narrower than the SeedOmni ones.
-    Text models keep the generic decoder-layer path. A single multimodal model is
-    fail-closed because its towers and cross-modal injection points have
-    different shape and lifecycle contracts. A SeedOmni module or composed
-    ``OmniModel`` is compiled block by block and gets the composed guards.
+    Every other model is compiled whole and needs no model-specific check: the
+    runtime contracts (CUDA, FSDP2, no ExtraParallel) are validated once in
+    :func:`validate_compile_runtime`, and :func:`_reject_incompatible_ops` covers
+    the op selections Inductor cannot lower.
+
+    A SeedOmni run — a composed ``OmniModel`` or one module built standalone —
+    additionally refuses CUDA Graph replay and sequence parallelism: replay needs
+    one ``cudagraph_mark_step_begin()`` per micro-batch across the composed graph,
+    which ``OmniTrainer`` does not make, and Ulysses slices activations the graph
+    edges reorder. The parse-time twin lives in ``_validate_omni_accelerator``;
+    this is the backstop for a caller that built a config without the launcher.
     """
-
-    # A composed ``OmniModel`` and a single SeedOmni module share these guards:
-    # both compile block by block, and the two paths that stay refused are
-    # refused for reasons that do not depend on which of the two it is. The
-    # parse-time twin lives in ``_validate_omni_accelerator`` — it runs for the
-    # top-level accelerator and every resolved module, so this is the backstop
-    # for a caller that built a config without going through the launcher.
-    #
-    # ``dynamic`` is allowed and is what a run wants when the packed length moves
-    # between steps. Measured over six lengths spanning 300-2816 tokens: every
-    # shape matched eager to the same tolerance a static compile gives (2.4e-2
-    # relative on a bf16 stack, saturating at four layers and identical for
-    # forward and gradients), six lengths kept four graphs, and the variable-shape
-    # step was 1.41x faster than eager.
-    if _is_composed_model(model) or _is_omni_module(model):
-        kind = "a composed SeedOmni OmniModel" if _is_composed_model(model) else "a SeedOmni module"
-        if compile_config.uses_cuda_graphs():
-            raise RuntimeError(
-                f"model.accelerator.torch_compile.enable does not support CUDA Graph replay for {kind}; "
-                "use backend='inductor' and mode=None."
-            )
-        if sequence_parallel_enabled or async_enabled:
-            raise RuntimeError(
-                f"model.accelerator.torch_compile.enable does not support sequence parallelism or async Ulysses "
-                f"for {kind}; set model.accelerator.ulysses_size=1, model.accelerator.cp_size=1, "
-                "and model.accelerator.enable_async=False."
-            )
+    if not _is_composed_model(model) and not _is_seedomni_module(model):
         return
-
-    if not _is_multimodal_model(model):
-        return
-
-    config = getattr(model, "config", None)
-    model_type = getattr(config, "model_type", None)
-    expected_decoder_block = _SUPPORTED_MULTIMODAL_DECODER_BLOCKS.get(model_type)
-    if expected_decoder_block is None:
-        raise RuntimeError(
-            "model.accelerator.torch_compile.enable currently supports multimodal training only for dense Qwen3-VL "
-            f"(model_type='qwen3_vl'); got model_type={model_type!r}."
-        )
-    if compile_config.dynamic:
-        raise RuntimeError(
-            "model.accelerator.torch_compile.enable for Qwen3-VL requires model.accelerator.torch_compile.dynamic=False."
-        )
     if compile_config.uses_cuda_graphs():
         raise RuntimeError(
-            "model.accelerator.torch_compile.enable for Qwen3-VL does not support CUDA Graph replay yet because packed "
-            "FlashAttention metadata can vary between micro-batches; use backend='inductor' and mode=None."
+            "model.accelerator.torch_compile.enable does not support CUDA Graph replay under SeedOmni; "
+            "use backend='inductor' and mode=None."
         )
     if sequence_parallel_enabled or async_enabled:
         raise RuntimeError(
-            "model.accelerator.torch_compile.enable for Qwen3-VL does not support Ulysses sequence parallelism, "
-            "Ring Attention context parallelism, or async Ulysses yet; set model.accelerator.ulysses_size=1, "
-            "model.accelerator.cp_size=1, and model.accelerator.enable_async=False."
+            "model.accelerator.torch_compile.enable does not support sequence parallelism or async Ulysses "
+            "under SeedOmni; set model.accelerator.ulysses_size=1, model.accelerator.cp_size=1, "
+            "and model.accelerator.enable_async=False."
         )
 
-    decoder_block_class_names = _decoder_block_class_names(model)
-    if expected_decoder_block not in decoder_block_class_names:
-        raise RuntimeError(
-            f"model.accelerator.torch_compile.enable for Qwen3-VL requires {expected_decoder_block!r} in model._no_split_modules."
-        )
+
+def _is_seedomni_module(model: nn.Module) -> bool:
+    """Whether ``model`` is one SeedOmni module, possibly behind a LoRA/DDP wrapper."""
+    from ..models.seed_omni.accelerated.utils.dispatch import unwrap_module_chain
+    from ..models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+    return isinstance(unwrap_module_chain(model), PretrainedOmniModule)
 
 
 def _is_decoder_block(
@@ -465,10 +323,8 @@ def compile_decoder_blocks(
     preserves module identity for FSDP2 — pre/post-forward all-gather and
     reshard hooks stay outside the compiled region.
 
-    Which entries qualify is the model's own answer: the nearest enclosing
-    ``VeOmniPreTrainedModel`` opts in per submodel (see
-    :func:`_decoder_block_specs`). A tower that did not opt in stays eager, so a
-    multimodal model can qualify its decoder stack and not its vision tower.
+    The blocks are the ones ``_no_split_modules`` names, so the compiled set and
+    the FSDP wrap set are the same (see :func:`_decoder_block_specs`).
     """
 
     if not hasattr(torch, "compile"):
