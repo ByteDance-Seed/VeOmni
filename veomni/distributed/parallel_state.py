@@ -771,7 +771,9 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
     should not be restating the mapping. Both a job's own mesh and a single
     model's come through here.
     """
-    ep_names, ep_sizes, ep_innermost = accelerator.resolved_extra_parallel
+    extra_parallel_names, extra_parallel_sizes, extra_parallel_placement_innermost = (
+        accelerator.resolved_extra_parallel
+    )
     return _init_parallel_state(
         dp_size=accelerator.dp_size,
         dp_replicate_size=accelerator.dp_replicate_size,
@@ -780,9 +782,9 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
         pp_size=accelerator.pp_size,
         cp_size=accelerator.cp_size,
         ulysses_size=accelerator.ulysses_size,
-        extra_parallel_sizes=ep_sizes,
-        extra_parallel_placement_innermost=ep_innermost,
-        extra_parallel_names=ep_names,
+        extra_parallel_sizes=extra_parallel_sizes,
+        extra_parallel_placement_innermost=extra_parallel_placement_innermost,
+        extra_parallel_names=extra_parallel_names,
         dp_mode=accelerator.fsdp_config.fsdp_mode,
         async_enabled=accelerator.enable_async,
         skip_sp_gather_between_modules=accelerator.skip_sp_gather_between_modules,

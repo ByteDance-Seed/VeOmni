@@ -437,7 +437,9 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
     weights_path = Path(args.test.weights_path)
     get_torch_device().set_device(args.train.local_rank)
     dist.init_process_group(backend=args.test.backend)
-    ep_names, ep_sizes, ep_innermost = args.model.accelerator.resolved_extra_parallel
+    extra_parallel_names, extra_parallel_sizes, extra_parallel_placement_innermost = (
+        args.model.accelerator.resolved_extra_parallel
+    )
     ps = _init_parallel_state(
         dp_size=args.model.accelerator.dp_size,
         dp_replicate_size=args.model.accelerator.dp_replicate_size,
@@ -446,9 +448,9 @@ def run_rank0_broadcast_test(args: Arguments) -> None:
         pp_size=args.model.accelerator.pp_size,
         cp_size=args.model.accelerator.cp_size,
         ulysses_size=args.model.accelerator.ulysses_size,
-        extra_parallel_sizes=ep_sizes,
-        extra_parallel_placement_innermost=ep_innermost,
-        extra_parallel_names=ep_names,
+        extra_parallel_sizes=extra_parallel_sizes,
+        extra_parallel_placement_innermost=extra_parallel_placement_innermost,
+        extra_parallel_names=extra_parallel_names,
         dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
         name="broadcast",
     )
@@ -467,7 +469,9 @@ def run_load_weights_test(args: Arguments) -> None:
     weights_path = Path(args.test.weights_path)
     get_torch_device().set_device(args.train.local_rank)
     dist.init_process_group(backend=args.test.backend)
-    ep_names, ep_sizes, ep_innermost = args.model.accelerator.resolved_extra_parallel
+    extra_parallel_names, extra_parallel_sizes, extra_parallel_placement_innermost = (
+        args.model.accelerator.resolved_extra_parallel
+    )
     ps = _init_parallel_state(
         dp_size=args.model.accelerator.dp_size,
         dp_replicate_size=args.model.accelerator.dp_replicate_size,
@@ -476,9 +480,9 @@ def run_load_weights_test(args: Arguments) -> None:
         pp_size=args.model.accelerator.pp_size,
         cp_size=args.model.accelerator.cp_size,
         ulysses_size=args.model.accelerator.ulysses_size,
-        extra_parallel_sizes=ep_sizes,
-        extra_parallel_placement_innermost=ep_innermost,
-        extra_parallel_names=ep_names,
+        extra_parallel_sizes=extra_parallel_sizes,
+        extra_parallel_placement_innermost=extra_parallel_placement_innermost,
+        extra_parallel_names=extra_parallel_names,
         dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
         name="load_weights",
     )

@@ -225,8 +225,8 @@ def test_module_override_ep_size_replaces_or_disables_inherited_ep(monkeypatch, 
     modules = build_omni_module_runtime_args(global_args, "/tmp/model", {"mod": override})
     resolved = modules["mod"].accelerator
     assert resolved.ep_size == expected_ep_size
-    ep_names, ep_sizes, _ = resolved.resolved_extra_parallel
-    assert dict(zip(ep_names, ep_sizes))["ep"] == expected_ep_size
+    extra_parallel_names, extra_parallel_sizes, _ = resolved.resolved_extra_parallel
+    assert dict(zip(extra_parallel_names, extra_parallel_sizes))["ep"] == expected_ep_size
 
 
 def test_validate_omni_accelerator_accepts_defaults():

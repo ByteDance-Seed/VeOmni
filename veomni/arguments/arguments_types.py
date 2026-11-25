@@ -1002,8 +1002,8 @@ class AcceleratorConfig:
         from ..distributed.hccl_options import validate_ep_hccl_options
 
         validate_ep_hccl_options(self.npu_ep_hccl_buffer_mib, self.npu_ep_hccl_expansion_mode)
-        ep_names, ep_sizes, _ = self.resolved_extra_parallel
-        ep_size = dict(zip(ep_names, ep_sizes)).get("ep", 1)
+        extra_parallel_names, extra_parallel_sizes, _ = self.resolved_extra_parallel
+        ep_size = dict(zip(extra_parallel_names, extra_parallel_sizes)).get("ep", 1)
         if (self.npu_ep_hccl_buffer_mib is not None or self.npu_ep_hccl_expansion_mode is not None) and ep_size <= 1:
             raise ValueError("HCCL expert-parallel options require an enabled ep dimension")
 
@@ -2171,9 +2171,8 @@ class ModelArguments(BaseModelArguments):
             "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
         )
 
-        ep_names, ep_sizes, _ = self.accelerator.resolved_extra_parallel
-        extra_parallel_sizes = dict(zip(ep_names, ep_sizes))
-        ple_size = extra_parallel_sizes.get("ple", 1)
+        extra_parallel_names, extra_parallel_sizes, _ = self.accelerator.resolved_extra_parallel
+        ple_size = dict(zip(extra_parallel_names, extra_parallel_sizes)).get("ple", 1)
         if ple_size > 1:
             effective_fsdp_shard_size = (
                 self.accelerator.dp_shard_size * self.accelerator.ulysses_size * self.accelerator.cp_size

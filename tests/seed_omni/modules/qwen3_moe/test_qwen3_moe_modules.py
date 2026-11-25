@@ -241,8 +241,8 @@ def test_qwen3_moe_extra_parallel_stream_load_applies_to_the_backbone_only():
     encoder = modules["qwen3_text_encoder"]
 
     def effective_ep_dim(args) -> int:
-        names, sizes, _ = args.accelerator.resolved_extra_parallel
-        return dict(zip(names, sizes)).get("ep", 1)
+        extra_parallel_names, extra_parallel_sizes, _ = args.accelerator.resolved_extra_parallel
+        return dict(zip(extra_parallel_names, extra_parallel_sizes)).get("ep", 1)
 
     assert effective_ep_dim(backbone) == 4
     assert effective_ep_dim(encoder) == 1
@@ -303,8 +303,8 @@ def test_qwen3_moe_inference_configs_resolve_the_intended_ep_dim():
             modules=f"{_QWEN3_MOE_TRAIN_CONFIG_DIR.rsplit('/', 1)[0]}/infer/{filename}",
         )
         backbone = modules["qwen3_moe_llm"]
-        names, sizes, _ = backbone.accelerator.resolved_extra_parallel
-        effective = dict(zip(names, sizes)).get("ep", 1)
+        extra_parallel_names, extra_parallel_sizes, _ = backbone.accelerator.resolved_extra_parallel
+        effective = dict(zip(extra_parallel_names, extra_parallel_sizes)).get("ep", 1)
         expected = 1 if "eager" in filename else 4
         assert effective == expected, (filename, effective)
 
