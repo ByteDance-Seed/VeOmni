@@ -88,10 +88,25 @@ def test_owners_that_only_share_a_name_prefix_are_not_nested():
 def test_sort_fqn_by_submodule_first_preserves_siblings_and_orders_descendants():
     layers = [f"model.layers.{i}" for i in range(15)]
     assert sort_fqn_by_submodule_first(layers) == layers
+    assert sort_fqn_by_submodule_first(["layers.0", "layers.1", "layers.0.experts"]) == [
+        "layers.0.experts",
+        "layers.0",
+        "layers.1",
+    ]
     assert sort_fqn_by_submodule_first(["decoder", "embed_tokens", "decoder.embed_tokens"]) == [
-        "embed_tokens",
         "decoder.embed_tokens",
         "decoder",
+        "embed_tokens",
+    ]
+    assert sort_fqn_by_submodule_first(
+        ["", "model", "model.layers.0", "model.layers.1", "model.layers.0.mlp.experts", "model.layers.0.mlp"]
+    ) == [
+        "model.layers.0.mlp.experts",
+        "model.layers.0.mlp",
+        "model.layers.0",
+        "model.layers.1",
+        "model",
+        "",
     ]
 
 

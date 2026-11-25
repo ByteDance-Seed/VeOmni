@@ -124,15 +124,32 @@ def check_fqn_match(fqn_pattern: str, fqn: str, prefix: str = None):
 
 def sort_fqn_by_submodule_first(fqn_list: list[str]) -> list[str]:
     """Sort FQNs so every descendant precedes its ancestors while preserving sibling order."""
+    first_index: dict[str, int] = {}
+    for idx, fqn in enumerate(fqn_list):
+        first_index.setdefault(fqn, idx)
+
+    def _nearest_ancestor_index(fqn: str) -> int | None:
+        if not fqn:
+            return None
+        pos = fqn.rfind(".")
+        while pos != -1:
+            candidate = fqn[:pos]
+            if candidate in first_index:
+                return first_index[candidate]
+            pos = fqn.rfind(".", 0, pos)
+        return first_index.get("")
+
+    children: dict[int | None, list[int]] = {}
+    for idx, fqn in enumerate(fqn_list):
+        parent_idx = _nearest_ancestor_index(fqn)
+        children.setdefault(parent_idx, []).append(idx)
+
     result: list[str] = []
-    remaining = list(fqn_list)
-    while remaining:
-        for i, fqn in enumerate(remaining):
-            prefix = f"{fqn}." if fqn else ""
-            has_descendant = any(
-                (other.startswith(prefix) if prefix else bool(other)) for other in remaining if other != fqn
-            )
-            if not has_descendant:
-                result.append(remaining.pop(i))
-                break
+
+    def _visit(parent_idx: int | None) -> None:
+        for child_idx in children.get(parent_idx, ()):
+            _visit(child_idx)
+            result.append(fqn_list[child_idx])
+
+    _visit(None)
     return result
