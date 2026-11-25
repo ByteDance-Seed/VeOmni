@@ -62,12 +62,12 @@ def _load_dsv4_toy_config(**ops_overrides):
 def _accelerator_device_count() -> int:
     """Devices this suite can run on: the runner's own accelerator cards.
 
-    Context parallelism is admitted on CUDA and, with the eager DSA operators,
-    on Ascend, and these workers build the backend's patched module directly, so
-    a plain device count is the right eligibility test. A CPU-only host reports
-    0 and skips, as does a backend the scheduler does not model -- asking for
-    its capabilities would raise, and this helper feeds a skip decorator, so it
-    runs during collection.
+    Context parallelism is admitted on CUDA and on Ascend for `deepseek_v4`,
+    whose DSA operators may be `eager` or `cann`, and these workers build the
+    backend's patched module directly, so a plain device count is the right
+    eligibility test. A CPU-only host reports 0 and skips, as does a backend the
+    scheduler does not model -- asking for its capabilities would raise, and this
+    helper feeds a skip decorator, so it runs during collection.
     """
     if get_device_type() not in SCHEDULED_BACKENDS:
         return 0

@@ -97,10 +97,14 @@ _NPU_CP_DSA_IMPLEMENTATIONS = {
 
 def _check_deepseek_v4_npu_dsa_ops(config: PretrainedConfig) -> None:
     """Refuse an Ascend CP run whose DSA operators cannot serve CP's geometry."""
-    ops_config = getattr(config, "ops_config", None)
+    # Read both levels directly: this gate runs on the builder's adapted config, which
+    # always has ``ops_config``, and every selection resolves to a dataclass default.
+    # A gate on an allow-list must fail closed, so a missing tree or field raises here
+    # instead of admitting a config whose ops selections could not be judged.
+    ops_config = config.ops_config
     for field, implementations in _NPU_CP_DSA_IMPLEMENTATIONS.items():
-        implementation = getattr(ops_config, field, None)
-        if implementation is not None and implementation not in implementations:
+        implementation = getattr(ops_config, field)
+        if implementation not in implementations:
             allowed = " or ".join(sorted(implementations))
             raise NotImplementedError(
                 f"Context parallelism on Ascend/NPU requires {field} to be {allowed}; got {implementation!r}. "

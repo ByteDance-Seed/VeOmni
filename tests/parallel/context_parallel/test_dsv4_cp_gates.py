@@ -61,8 +61,9 @@ def _enable_npu_cp(monkeypatch):
 
 
 def _npu_ops_for_cp() -> dict:
-    # The selections the shipped NPU config carries. The tests below swap a field
-    # to ``cann`` -- the other admitted value -- and to a rejected one.
+    # The DSA selections ``eager`` and ``cann`` are both admitted under CP. The
+    # tests below start from ``eager`` and swap a field to ``cann`` (the shipped
+    # value) or to a rejected one.
     return {"dsa_indexer_implementation": "eager", "dsa_attention_implementation": "eager"}
 
 

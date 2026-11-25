@@ -44,6 +44,7 @@ from itertools import accumulate
 import torch
 from torch import Tensor
 
+from ......distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
 from ...sparse_indices import CompressedCandidates
 from ...vendor.npu_sparse_flash_mla import npu_sparse_flash_mla
 from . import eager
@@ -59,15 +60,36 @@ _CMP_SEGMENT_CAUSAL_MASK_MODE = 3
 _SFMLA_TOPK_WIDTHS = (512, 1024)
 
 
+def _queries_are_a_context_parallel_shard() -> bool:
+    """Whether this call's queries are a CP shard of the replicated KV buffer.
+
+    Shapes alone do not say: a CP rank and a decode call both pass a buffer longer
+    than their queries. Only the parallel state does, and Ulysses counts as non-CP
+    here because it gathers the sequence back into the queries.
+    """
+    if not is_parallel_state_initialized():
+        return False
+    parallel_state = get_parallel_state()
+    return parallel_state.cp_enabled and not parallel_state.ulysses_enabled
+
+
 def _selection_for_local_table(topk_indices: Tensor, compressed_len: int) -> Tensor:
     """Return the selection columns this call serves, dropping producer padding.
 
     A selection is served when it spans the whole compressed table or matches one of
-    the kernel widths: the vendor wrapper pads anything at most 512 wide up to 512,
+    the kernel widths. The vendor wrapper pads anything at most 512 wide up to 512,
     so the short-table case (every row selected, ``-1`` after them) reaches the
-    kernel in the shape it was built for. A narrower selection is not: on CANN 9.2.1
-    it returns nonfinite rows and a nonfinite ``q`` gradient once the table is wider
-    than the selection, which the parity case used to hit.
+    kernel in the shape it was built for, and a 512/1024-wide selection is served
+    even over a wider table -- exactly what a CP rank receives under the shipped
+    config (``index_topk: 512`` over 1024/2048 local rows), which the ``cp_size=2``
+    CANN comparison in ``docs/design/deepseek_v4_context_parallel.md`` covers.
+
+    A selection below 512 that does not span its table is not served: on CANN 9.2.1
+    such a call (16 indices over a 75-row table) kept the eager direction in the
+    forward but scaled some rows down and produced a nonfinite ``q`` gradient, so
+    the adapter refuses a kernel call with no defined output rather than call it.
+    The model only produces this below-512 shape when ``index_topk`` is neither 512
+    nor 1024 and the table is wider; ``docs/usage/arguments.md`` states that limit.
 
     Context parallelism narrows the compressed table to the local prefix while the
     indexer pads its selection to the global width, so a rank can receive more
@@ -247,17 +269,20 @@ def wrapper(
     ``attention_mask`` cannot be expressed: any call that carries one runs the
     eager row, packed context-parallel shards included, rather than attending to
     keys the caller excluded. The kernel needs the query
-    rows to end at the last KV row: a non-zero ``query_offset`` (context
-    parallelism) is served by narrowing ``ori_kv`` to that prefix, and packed
+    rows to end at the last KV row: a non-zero ``query_offset`` on a context-parallel
+    shard is served by narrowing ``ori_kv`` to that prefix, and packed
     slices then need one call per sample because the TND path segments queries
     and KV alike. A prefix that ends inside the first compression window holds no
     compressed row at all; those queries run the eager row, since the kernel has
-    no mask mode for an empty compressed table. It validates its own dtype,
+    no mask mode for an empty compressed table. A shorter query block that also
+    ends at the last KV row is a decode layout, which the kernel does not
+    implement and outside context parallelism the adapter refuses. It validates
+    its own dtype,
     window, ratio and head-size limits, and this adapter trims the padding a
     context-parallel call inherits from the producer's global selection width,
-    rejecting a selection that is narrower than the table or names a row past
-    it. Packed calls without CP take the TND path, which needs batch size 1 and
-    reads the slice boundaries on the host.
+    rejecting a selection that neither spans the table nor is one of the kernel
+    widths, and one that names a row past it. Packed calls without CP take the TND
+    path, which needs batch size 1 and reads the slice boundaries on the host.
     """
     if attention_mask is not None or cmp_kv is None or cmp_kv.shape[1] == 0:
         return eager.wrapper(
@@ -306,6 +331,18 @@ def wrapper(
             "cann DeepSeek-V4 sparse attention needs the local queries to end inside the KV buffer: "
             f"got {q.shape[1]} queries at query_offset={query_offset} over {ori_kv.shape[1]} rows."
         )
+    if not _queries_are_a_context_parallel_shard() and (query_offset != 0 or ori_kv.shape[1] != q.shape[1]):
+        # Queries that end at the last KV row while covering fewer rows than the
+        # buffer are decode. The kernel numbers queries from ``kv_len - q_len`` and
+        # has no cache layout, so the output is undefined; the indexer refuses this
+        # one op earlier, and the adapter refuses it too instead of widening its
+        # domain silently.
+        raise ValueError(
+            "cann DeepSeek-V4 sparse attention implements the prefill/training layout only: outside context "
+            f"parallelism the queries must be the whole KV buffer (got {q.shape[1]} queries at "
+            f"query_offset={query_offset} over {ori_kv.shape[1]} rows). Decode-shaped calls need the eager "
+            "implementation."
+        )
     # Packed slices describe the global buffer while a CP rank owns a window of it, so
     # they end past the local queries even on the rank whose window starts at row 0.
     if slices is not None and len(slices) > 1 and (query_offset != 0 or slices[-1][1] != q.shape[1]):
@@ -349,7 +386,14 @@ def wrapper(
         segment_starts = _segment_compressed_starts(slices, compress_ratio, q.device)
         topk_indices = torch.where(topk_indices >= 0, topk_indices - segment_starts, -1)
     if topk_indices is not None:
-        topk_indices = _selection_for_local_table(topk_indices, cmp_kv.shape[1])
+        # A TND call indexes each segment's own table, while the producer sizes the
+        # selection from the widest segment. The packed total the rows add up to is
+        # not a table any query addresses, so validating against it would refuse a
+        # selection the indexer built correctly.
+        table_len = cmp_kv.shape[1]
+        if slices is not None and len(slices) > 1:
+            table_len = max((end - start) // compress_ratio for start, end in slices)
+        topk_indices = _selection_for_local_table(topk_indices, table_len)
 
     return npu_sparse_flash_mla(
         _standard_layout(q),

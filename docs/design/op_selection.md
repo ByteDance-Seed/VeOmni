@@ -590,7 +590,9 @@ model:
 
 The `cann` indexer and sparse attention cover unpacked batches and packed
 batches whose `position_ids` restart at 0 in every segment, without Ulysses
-parallelism, decode, or a padding mask. Both also serve context parallelism:
+parallelism or decode. Sparse attention does not implement a padding mask: a call
+that carries an `attention_mask` runs in eager, so padded batches work but take
+that row. Both also serve context parallelism:
 each narrows the replicated compressed/KV buffers to the prefix its local
 queries can see and lets the kernel's `kv_len - q_len` row inference number the
 shard's queries from their global rows. A packed batch under context

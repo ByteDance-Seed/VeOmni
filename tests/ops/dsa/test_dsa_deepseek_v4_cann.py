@@ -15,10 +15,11 @@
 """``deepseek_v4`` ``cann`` indexer and sparse attention.
 
 CANN call layout is checked on any host, so those cases ask for no accelerator.
-The indexer and Sparse FlashMLA are compared with eager on Ascend. The parity case
-uses a selection the kernel serves -- the whole compressed table, which is the only
-shape the model emits for a sequence this short. Narrower selections return
-nonfinite rows on CANN 9.2.1, so the adapter rejects them instead.
+The indexer and Sparse FlashMLA are compared with eager on Ascend. The parity cases
+use selections the kernel serves -- the whole compressed table and the kernel's
+512/1024 widths, the latter over a table both smaller and larger than the
+selection. A selection below 512 that does not span its table returned nonfinite
+rows on CANN 9.2.1, so the adapter rejects it instead.
 """
 
 from __future__ import annotations
@@ -575,6 +576,17 @@ def flash_mla(monkeypatch: pytest.MonkeyPatch) -> _FlashMlaRecorder:
     cann_attention._segment_compressed_starts.cache_clear()
 
 
+@pytest.fixture
+def cp_shard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mark the process as a CP rank: only then may the queries be a local shard."""
+    monkeypatch.setattr(cann_attention, "is_parallel_state_initialized", lambda: True)
+    monkeypatch.setattr(
+        cann_attention,
+        "get_parallel_state",
+        lambda: SimpleNamespace(cp_enabled=True, ulysses_enabled=False),
+    )
+
+
 def _attention_inputs(
     seq_len: int, compressed_len: int, dtype: torch.dtype = torch.bfloat16, device: str = "cpu"
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -659,6 +671,87 @@ def test_attention_packed_call_rebases_the_selection_per_segment(flash_mla: _Fla
     assert (kwargs["ori_mask_mode"], kwargs["cmp_mask_mode"]) == (4, 3)
     assert (kwargs["ori_win_left"], kwargs["ori_win_right"]) == (_WINDOW - 1, 0)
     assert kwargs["sinks"].dtype == torch.float32
+
+
+def test_attention_packed_validation_uses_the_widest_segment_table(flash_mla: _FlashMlaRecorder):
+    # The producer sizes a TND selection from the widest segment, not from the packed
+    # total, and each segment's indices are rebased onto its own table first. Judging
+    # the selection against the packed total (4 rows here) would refuse a correct
+    # 3-wide selection over two 2-row tables.
+    slices = ((0, 8), (8, 16))
+    q, ori_kv, cmp_kv, sink = _attention_inputs(seq_len=16, compressed_len=4)
+    topk = torch.full((1, 16, 3), -1, dtype=torch.int32)
+    topk[0, :8, :2] = torch.tensor([0, 1], dtype=torch.int32)
+    topk[0, 8:, :2] = torch.tensor([2, 3], dtype=torch.int32)
+
+    cann_attention.wrapper(
+        q,
+        ori_kv,
+        cmp_kv,
+        sink,
+        _segment_positions((8, 8)),
+        sliding_window=_WINDOW,
+        compress_ratio=_RATE,
+        candidates=CompressedCandidates(topk_indices=topk),
+        packed_sequence_slices=slices,
+    )
+
+    ((_, _, _, indices), _) = flash_mla.calls[0]
+    # Both samples select their own rows 0 and 1; the third column is padding.
+    assert indices.shape == (1, 16, 2)
+    assert indices[0, :8].tolist() == [[0, 1]] * 8
+    assert indices[0, 8:].tolist() == [[0, 1]] * 8
+
+
+def test_attention_serves_a_kernel_width_over_a_wider_table(flash_mla: _FlashMlaRecorder):
+    # The shipped config selects 512 rows per query while a CP rank holds 1024 or
+    # 2048 compressed rows, so the selection is narrower than the table but exactly
+    # one of the kernel's widths. That shape is served as-is, not trimmed.
+    seq_len, compressed_len = 2052, 513
+    q, ori_kv, cmp_kv, sink = _attention_inputs(seq_len=seq_len, compressed_len=compressed_len)
+    topk = torch.full((1, seq_len, 512), -1, dtype=torch.int32)
+    topk[..., 0] = 0
+
+    cann_attention.wrapper(
+        q,
+        ori_kv,
+        cmp_kv,
+        sink,
+        torch.arange(seq_len).unsqueeze(0),
+        sliding_window=_WINDOW,
+        compress_ratio=_RATE,
+        candidates=CompressedCandidates(topk_indices=topk),
+    )
+
+    ((cann_q, cann_ori_kv, cann_cmp_kv, indices), _) = flash_mla.calls[0]
+    assert cann_q.shape == (1, seq_len, _ATTN_HEADS, _ATTN_DIM)
+    assert cann_ori_kv.shape == (1, seq_len, 1, _ATTN_DIM)
+    assert cann_cmp_kv.shape == (1, compressed_len, 1, _ATTN_DIM)
+    assert indices.shape == (1, seq_len, 512)
+    assert (indices[..., 0] == 0).all() and (indices[..., 1:] == -1).all()
+
+
+def test_attention_refuses_a_decode_call_outside_context_parallel(flash_mla: _FlashMlaRecorder):
+    # One query ending at the last KV row is the decode layout, which the kernel has
+    # no cache input for. Only a CP shard may pass a shorter query block, so outside
+    # CP the call must be refused instead of reaching the kernel.
+    q, ori_kv, cmp_kv, sink = _attention_inputs(seq_len=8, compressed_len=2)
+    topk = torch.zeros(1, 1, 2, dtype=torch.int32)
+    topk[..., 1] = -1
+
+    with pytest.raises(ValueError, match="Decode-shaped calls need the eager implementation"):
+        cann_attention.wrapper(
+            q[:, :1],
+            ori_kv,
+            cmp_kv,
+            sink,
+            torch.full((1, 1), 7, dtype=torch.long),
+            sliding_window=_WINDOW,
+            compress_ratio=_RATE,
+            candidates=CompressedCandidates(topk_indices=topk),
+            query_offset=7,
+        )
+    assert flash_mla.calls == []
 
 
 @pytest.mark.parametrize("slices", [None, ((0, 8),)], ids=["unpacked", "single_segment"])
@@ -747,7 +840,7 @@ def test_attention_rejects_what_the_kernel_cannot_express(flash_mla: _FlashMlaRe
     ("query_offset", "cmp_rows", "residual"), [(0, 1, 2), (6, 3, 0)], ids=["first_rank", "last_rank"]
 )
 def test_attention_context_parallel_narrows_to_the_query_tail(
-    flash_mla: _FlashMlaRecorder, query_offset: int, cmp_rows: int, residual: int
+    flash_mla: _FlashMlaRecorder, cp_shard: None, query_offset: int, cmp_rows: int, residual: int
 ):
     # cp_size=2 over 12 rows: rank 0 owns rows [0, 6), rank 1 owns [6, 12), and both
     # receive the all-gathered 12-row KV. The kernel assumes the queries end at the
@@ -786,7 +879,7 @@ def test_attention_context_parallel_narrows_to_the_query_tail(
     assert kwargs["cmp_residual_kv"].tolist() == [residual]
 
 
-def test_attention_packed_context_parallel_calls_each_intersected_sample(flash_mla: _FlashMlaRecorder):
+def test_attention_packed_context_parallel_calls_each_intersected_sample(flash_mla: _FlashMlaRecorder, cp_shard: None):
     # Global packed sequence of 24 rows over cp_size=2, so this rank owns rows [0, 12).
     # The second sample starts inside the shard, and every local query still needs the
     # rows its own sample contributes before it.
@@ -834,7 +927,7 @@ def test_attention_packed_context_parallel_calls_each_intersected_sample(flash_m
     assert second_idx.shape[-1] == 1
 
 
-def test_attention_packed_context_parallel_leaves_short_samples_to_eager(flash_mla: _FlashMlaRecorder):
+def test_attention_packed_context_parallel_leaves_short_samples_to_eager(flash_mla: _FlashMlaRecorder, cp_shard: None):
     # A padding tail is encoded as 1-token slices; no compressed row is visible there,
     # so those rows run the eager path while the rest of the shard keeps the kernel.
     slices = ((0, 6), (6, 7), (7, 8))
@@ -862,7 +955,7 @@ def test_attention_packed_context_parallel_leaves_short_samples_to_eager(flash_m
     assert cann_cmp.shape == (1, 1, 1, _ATTN_DIM)
 
 
-def test_attention_packed_context_parallel_rebases_the_eager_fallback(flash_mla: _FlashMlaRecorder):
+def test_attention_packed_context_parallel_rebases_the_eager_fallback(flash_mla: _FlashMlaRecorder, cp_shard: None):
     # A sample can start before the shard and end inside its first compression
     # window, so the truncated prefix holds no compressed row and the sample runs
     # eagerly. Its local queries still start at a non-zero row of that buffer, which
@@ -907,6 +1000,7 @@ def test_attention_packed_context_parallel_rebases_the_eager_fallback(flash_mla:
 
 def test_attention_packed_context_parallel_keeps_the_gather_in_the_backward_graph(
     flash_mla: _FlashMlaRecorder,
+    cp_shard: None,
 ):
     # The compressed rows reach every rank through a collective all-gather, so a
     # rank that takes the eager fallback must still produce a gradient for
@@ -939,17 +1033,19 @@ def test_attention_packed_context_parallel_keeps_the_gather_in_the_backward_grap
     not IS_NPU_AVAILABLE or importlib.util.find_spec("cann_ops_transformer") is None,
     reason="CANN Sparse FlashMLA requires Ascend NPU and cann_ops_transformer",
 )
-def test_sparse_flash_mla_matches_eager_on_ascend():
+@pytest.mark.parametrize("seq_len", [300, 2052], ids=["table_below_width", "table_above_width"])
+def test_sparse_flash_mla_matches_eager_on_ascend(seq_len: int):
     """Compare the real kernel's forward and every input gradient with eager.
 
     Most queries are past their first window here, so the compressed table has
     visible rows and the call takes the index path rather than a fallback. The
-    selection is 512 wide, the narrowest width the kernel is built for, over a
-    75-row table; the slots past the table hold ``-1`` and the adapter accepts it.
+    selection is 512 wide, one of the two widths the kernel is built for, and the
+    table is narrower in one case and wider in the other, which is the shipped CP
+    shape; slots past the table hold ``-1`` and the adapter accepts it.
     """
     torch.manual_seed(5)
     device = get_device_type()
-    seq_len, topk = 300, 512
+    topk = 512
     compressed_len = seq_len // _RATE
     q = torch.randn(1, seq_len, _ATTN_HEADS, _ATTN_DIM, device=device).to(torch.bfloat16).requires_grad_()
     ori_kv = torch.randn(1, seq_len, _ATTN_DIM, device=device).to(torch.bfloat16).requires_grad_()

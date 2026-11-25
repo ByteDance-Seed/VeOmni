@@ -140,9 +140,14 @@ buffer itself:
   call per sample the shard intersects. A prefix — or a truncated packed sample —
   that ends inside its first compression window holds no visible compressed row,
   so it runs the eager row with a zero-row compressed table. The compressed
-  selection must either span the table it indexes or be 512/1024 wide, which is
-  the shape `min(index_topk, compressed_len)` produces; a narrower selection
-  returns nonfinite rows on CANN 9.2.1, so the adapter refuses it.
+  selection must either span the table it indexes or be 512/1024 wide. Those are
+  the kernel's own widths — the vendor wrapper pads anything at most 512 wide up
+  to 512 — so a 512/1024-wide selection is served even over a wider table, which
+  is the shape `min(index_topk, compressed_len)` produces on every CP rank at the
+  shipped `index_topk: 512`. A selection below 512 that does not span its table
+  returned nonfinite rows on CANN 9.2.1, so the adapter refuses it; the shipped
+  model only makes that call for an `index_topk` other than 512/1024 over a wider
+  table (see [`docs/usage/arguments.md`](../usage/arguments.md)).
 - `dsa_indexer_implementation: cann` derives causal visibility from the query
   row and accepts only the ranges the shard's global rows imply. CP supplies
   explicit `cu_seqlen_ks` / `cu_seqlen_ke` rebased onto the global sequence, so
@@ -164,13 +169,17 @@ The gate validates that selection pair and nothing else: it cannot check that
 either kernel is numerically correct on Ascend, and
 `cp_size <= S / max(config.compress_rates)` applies unchanged.
 
-Validation beyond configuration is one non-CI training comparison, not tensor
-parity: starting from `configs/text/deepseek_v4_npu.yaml` and overriding the run
-to GSM8K, `max_seq_len=512`, `global_batch_size=32`, lr `3e-4`, seed 42,
+Validation beyond configuration is training comparison, not tensor parity: starting
+from `configs/text/deepseek_v4_npu.yaml` and overriding the run to GSM8K,
+`max_seq_len=512`, `global_batch_size=32`, lr `3e-4`, seed 42,
 `enable_full_determinism: true`, `dp_size=4`, `ep_size=4`, `cp_size=1` and
 `cp_size=2` trained on Ascend over the same 71 steps and the loss relative error
-stayed within ±4%. That is evidence the eager path trains, not a per-tensor
-bound, and it says nothing about `cp_size=8`, which has never been run.
+stayed within ±4%. Two further comparisons, each 71 steps, set one DSA selection
+to `cann` — attention in one, indexer in the other — and compared `cp_size=1`
+against `cp_size=2` with everything else unchanged; both stayed within ±1%. Together
+those cover the shipped CP geometry on both ranks, including the 512-wide selection
+over a wider local table; like the eager run, they are loss comparisons, not
+per-tensor bounds, and they say nothing about `cp_size=8`, which has never been run.
 
 `tests/parallel/context_parallel/` runs its two-rank eager case on the NPU
 suite, so the eager path's rank and local-query/global-KV geometry is checked on
@@ -181,8 +190,11 @@ eager fallbacks — is checked on any host by
 adapters hand their kernels. On Ascend the same file compares the real CANN
 indexer against eager selection, causally and on both packed CP shards. The same
 file compares the real CANN attention kernel with eager — forward and every input
-gradient — on a 512-wide selection over a 75-row table, the narrowest width the
-kernel serves. No CP training run uses the CANN pair.
+gradient — on 512-wide selections, one of the two widths the kernel is built for,
+over a 75-row table and a 513-row table: the width is exercised both wider and
+narrower than the table. The full shipped CP shape, a 512-wide selection over
+1024/2048 local rows, is covered by the `cp_size=2` loss comparisons above rather
+than by a tensor parity case.
 
 ## Decisions that took more than one attempt
 
