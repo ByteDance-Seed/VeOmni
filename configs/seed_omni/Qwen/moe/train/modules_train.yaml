@@ -11,16 +11,14 @@ qwen3_moe_llm:
   broadcast_model_weights_from_rank0: false
   extra_parallel_stream_load: true
   accelerator:
-    # Size the `ep` dim by list, not `ep_size`. A per-module entry starts from
-    # `asdict(ModelArguments)`, which already carries
-    # `extra_parallel_names: ["ep"]`, and `AcceleratorConfig.__post_init__`
-    # only appends `ep_size` when `"ep"` is absent — so `ep_size: 4` here would
-    # leave the effective dim at 1 and silently run without Expert Parallel.
-    #
-    # All three lists are written out together: they are paired by position, and
-    # a launcher whose global accelerator adds another dim (e.g. a text encoder's
-    # `emb`) would leave an inherited placeholder behind, so replacing only
-    # `sizes` would desynchronise the lengths and mis-size `emb`.
+    # Scalar `ep_size: 4` works when the raw `extra_parallel_*` lists are empty
+    # (`AcceleratorConfig.resolved_extra_parallel` folds `ep_size` in on demand).
+    # We still spell out all three position-paired lists explicitly here so that:
+    # 1. if a launcher's global accelerator lists `"ep"` explicitly (which takes
+    #    precedence over scalar `ep_size`), this module's width still wins; and
+    # 2. if the global accelerator adds another dim (e.g. a text encoder's `emb`),
+    #    replacing all three lists together keeps their lengths aligned and keeps
+    #    only `ep` on the backbone.
     extra_parallel_names: ["ep"]
     extra_parallel_sizes: [4]
     extra_parallel_placement_innermost: [false]

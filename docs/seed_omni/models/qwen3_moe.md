@@ -159,14 +159,15 @@ accelerator:
   extra_parallel_placement_innermost: [false]
 ```
 
-Spell the dimension out with the `extra_parallel_*` lists rather than `ep_size`.
-A per-module entry is merged onto `asdict(ModelArguments)`, which already carries
-`extra_parallel_names: ["ep"]`, and `AcceleratorConfig.__post_init__` only
-appends `ep_size` when `"ep"` is absent — so `ep_size: 4` here is inert and the
-run silently has no Expert Parallel. Write all three lists together: they are
-paired by position, so overriding only `sizes` desynchronises them whenever the
-launcher's global accelerator contributes another dim (e.g. a text encoder's
-`emb`). See §6.
+Scalar `ep_size: 4` works on a per-module entry whenever the raw
+`extra_parallel_*` lists do not already contain `"ep"`, because
+`AcceleratorConfig.resolved_extra_parallel` folds `ep_size` in on demand without
+mutating the raw lists. However, any explicit `"ep"` entry inherited from the
+global `extra_parallel_names` / `extra_parallel_sizes` lists takes precedence
+over scalar `ep_size`. Writing all three position-paired lists together here
+guarantees the backbone's EP width overrides an explicit global `"ep"` list
+entry and stays aligned even if the launcher's global accelerator adds another
+dim (e.g. a text encoder's `emb`). See §6.
 
 The backbone builds its **own** `ParallelState` (fsdp2 + ep) while the text
 encoder reuses the global fsdp2 mesh; the per-module grad-clip
@@ -298,21 +299,18 @@ surfaced (and fixed) a few omni-specific interactions:
   through `MODELING_REGISTRY`, so `Qwen3MoeLlm` carries its own copy with
   `language_model.`-prefixed patterns. Without it those names would resolve to
   nothing and the experts would silently get no adapters while attention did.
-- **Express EP via the explicit `extra_parallel_*` lists, not `ep_size`.**
-  `AcceleratorConfig.__post_init__` appends `ep_size` as the `ep` dimension only
-  when `"ep"` is not already in `extra_parallel_names` — a guard that exists so
-  re-instantiating a saved config (an `asdict` round-trip) does not add a second
-  `ep` dim. A per-module entry is built from `asdict(ModelArguments)`, which
-  already carries `["ep"]` / `[1]`, so that guard always fires and `ep_size` in a
-  module YAML is inert: the effective dimension stays 1 and the run has no Expert
-  Parallel while still looking configured. Write all three lists instead —
+- **Scalar `ep_size` vs explicit `extra_parallel_*` list precedence.**
+  `AcceleratorConfig.resolved_extra_parallel` leaves the raw `extra_parallel_*`
+  fields untouched and folds `("ep", ep_size, ep_outside)` in on demand only
+  when `"ep"` is absent from `extra_parallel_names`. As a result, a per-module
+  `ep_size: 4` works whenever the inherited lists are empty (or do not mention
+  `"ep"`), while an explicit `"ep"` entry in the global `extra_parallel_*` lists
+  takes precedence over scalar `ep_size`. The shipped Qwen3-MoE module YAMLs
+  write all three position-paired lists together —
   `extra_parallel_names: ["ep"]`, `extra_parallel_sizes: [4]`,
-  `extra_parallel_placement_innermost: [false]` — because they are paired by
-  position: a module entry inherits the launcher accelerator's list, so replacing
-  only `sizes` leaves a stale entry behind when the launcher adds another dim
-  (e.g. a text encoder's `emb`) and the lengths stop matching. The top-level
-  `model.accelerator` is built from the YAML directly, so `ep_size` does work
-  there.
+  `extra_parallel_placement_innermost: [false]` — so they cleanly override any
+  explicit global `"ep"` list entry and avoid length mismatches if the launcher
+  contributes another dim (e.g. a text encoder's `emb`).
 - **Fused MoE kernel** is bound as an instance-local `VeomniOp("moe_experts", ...)`
   on each `Qwen3MoeExperts` (one class below `Qwen3MoeSparseMoeBlock`, in the
   generated modeling) from that layer's `config.ops_config.moe_implementation`,
