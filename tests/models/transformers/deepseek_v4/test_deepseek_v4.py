@@ -1055,3 +1055,69 @@ def test_deepseek_v4_dspark_mtp_loss_coef_zero_ddp_two_iterations(monkeypatch):
     finally:
         if not already_init and dist.is_initialized():
             dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("with_2d_mask", [False, True])
+def test_deepseek_v4_model_ulysses_sliding_window_mask_does_not_double_scale(monkeypatch, with_2d_mask):
+    """DeepseekV4Model builds full-sequence mask_embeds under SP; veomni_eager must not scale it a second time."""
+    from types import SimpleNamespace
+
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as ds4_mod
+    from veomni.ops.kernels.attention import ulysses as attn_ulysses
+
+    config = _tiny_config()
+    config.layer_types = ["sliding_attention"] * config.num_hidden_layers
+    config.sliding_window = 3
+    model = _build_ours(config).eval()
+    assert model.config._attn_implementation == "veomni_eager"
+
+    captured_masks: list[torch.Tensor | None] = []
+
+    def _capture_layer(hidden_states, attention_mask=None, **kwargs):
+        captured_masks.append(attention_mask)
+        return hidden_states
+
+    monkeypatch.setattr(model.model.layers[0], "forward", _capture_layer)
+    for layer in model.model.layers[1:]:
+        monkeypatch.setattr(layer, "forward", lambda hidden_states, **kwargs: hidden_states)
+
+    sp_state = SimpleNamespace(
+        sp_enabled=True,
+        cp_enabled=False,
+        ulysses_enabled=True,
+        sp_size=2,
+        ulysses_size=2,
+        sp_group=None,
+        ulysses_group=None,
+    )
+    monkeypatch.setattr(ds4_mod, "get_parallel_state", lambda: sp_state)
+    monkeypatch.setattr(attn_ulysses, "get_parallel_state", lambda: sp_state)
+    monkeypatch.setattr(
+        ds4_mod,
+        "gather_outputs",
+        lambda tensor, gather_dim=-1, group=None: torch.cat(
+            [tensor, tensor + tensor.shape[gather_dim]], dim=gather_dim
+        ),
+    )
+
+    local_input_ids = torch.randint(0, config.vocab_size, (1, 4))
+    local_position_ids = torch.arange(4).unsqueeze(0)
+    full_2d_mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 0]], dtype=torch.long) if with_2d_mask else None
+
+    model.model(
+        input_ids=local_input_ids,
+        attention_mask=full_2d_mask,
+        position_ids=local_position_ids,
+        use_cache=False,
+    )
+
+    assert len(captured_masks) == 1
+    mask = captured_masks[0]
+    assert mask is not None
+    assert tuple(mask.shape) == (1, 1, 8, 8)
+    positions = torch.arange(8)
+    distance = positions[:, None] - positions[None, :]
+    expected = (distance >= 0) & (distance < 3)
+    if with_2d_mask:
+        expected = expected & full_2d_mask.bool()
+    torch.testing.assert_close(mask[0, 0] == 0, expected)

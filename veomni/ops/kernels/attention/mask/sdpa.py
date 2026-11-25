@@ -69,6 +69,32 @@ def sdpa_attention_mask_builder(
     )
 
 
+_SLIDING_WINDOW_OVERLAY_QUALNAMES = frozenset(
+    {
+        "sliding_window_overlay.<locals>.inner_mask",
+        "sliding_window_bidirectional_overlay.<locals>.inner_mask",
+    }
+)
+
+
+def _is_canonical_mask_function(mask_function: Callable) -> bool:
+    """Return whether ``mask_function`` is a length-independent canonical pattern."""
+    if mask_function in (causal_mask_function, bidirectional_mask_function):
+        return True
+    if getattr(mask_function, "__qualname__", None) != "and_masks.<locals>.and_mask":
+        return False
+    closure = getattr(mask_function, "__closure__", None)
+    if not closure or len(closure) != 1:
+        return False
+    inner = closure[0].cell_contents
+    return (
+        isinstance(inner, tuple)
+        and len(inner) == 2
+        and getattr(inner[0], "__qualname__", None) in _SLIDING_WINDOW_OVERLAY_QUALNAMES
+        and inner[1] in (causal_mask_function, bidirectional_mask_function)
+    )
+
+
 def _dense_attention_mask_builder(
     batch_size: int,
     q_length: int,
@@ -105,22 +131,22 @@ def _dense_attention_mask_builder(
 
     if should_apply_ulysses(skip_ulysses=skip_ulysses):
         if q_offset != 0 or kv_offset != 0:
-            raise ValueError("SDPA with Ulysses does not support cached mask offsets.")
+            raise ValueError("Dense attention mask with Ulysses does not support cached mask offsets.")
         if (
             attention_mask is None
             and cu_seqlens is None
             and (
-                mask_function not in (causal_mask_function, bidirectional_mask_function)
+                not _is_canonical_mask_function(mask_function)
                 or or_mask_function is not None
                 or and_mask_function is not None
             )
         ):
             raise ValueError(
-                "SDPA with Ulysses requires full-sequence metadata for a custom mask function; "
+                "Dense attention mask with Ulysses requires full-sequence metadata for a custom mask function; "
                 "pass a full-sequence 2D attention mask."
             )
         if attention_mask is not None and attention_mask.ndim != 2:
-            raise ValueError("SDPA with Ulysses requires a full-sequence 2D attention mask.")
+            raise ValueError("Dense attention mask with Ulysses requires a full-sequence 2D attention mask.")
         full_q_length, full_kv_length = ulysses_mask_lengths(
             q_length,
             kv_length,
@@ -128,7 +154,7 @@ def _dense_attention_mask_builder(
         )
         if attention_mask is not None and attention_mask.shape[-1] != full_kv_length:
             raise ValueError(
-                "SDPA with Ulysses requires the full attention-mask sequence length to equal "
+                "Dense attention mask with Ulysses requires the full attention-mask sequence length to equal "
                 f"the post-Ulysses key length, got attention_mask.shape[-1]={attention_mask.shape[-1]} "
                 f"and expected {full_kv_length}."
             )

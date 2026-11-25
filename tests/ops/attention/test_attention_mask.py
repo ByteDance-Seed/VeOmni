@@ -23,7 +23,11 @@ import pytest
 import torch
 from torch.nn.attention.flex_attention import BlockMask
 from transformers import PreTrainedConfig
-from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, create_causal_mask
+from transformers.masking_utils import (
+    ALL_MASK_ATTENTION_FUNCTIONS,
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+)
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.ops.attention.attention_cases import (
@@ -287,6 +291,24 @@ def test_flex_and_sdpa_ulysses_allow_sliding_window_without_metadata(monkeypatch
     positions = torch.arange(8)
     distance = positions[:, None] - positions[None, :]
     torch.testing.assert_close(visible, (distance >= 0) & (distance < 2))
+
+
+@pytest.mark.parametrize("impl", ("veomni_sdpa", "veomni_eager"))
+def test_hf_create_sliding_window_causal_mask_with_ulysses_without_metadata(monkeypatch, impl):
+    """Transformers' sliding-window helper composes a canonical pattern that expands under Ulysses without a 2D mask."""
+    _patch_mask_ulysses(monkeypatch, sdpa_mask, apply=True)
+    config = PreTrainedConfig(sliding_window=3)
+    config._attn_implementation = impl
+    local_embeds = torch.randn(1, 4, 16)
+
+    mask = create_sliding_window_causal_mask(config, local_embeds, None, None)
+
+    assert mask is not None
+    assert tuple(mask.shape) == (1, 1, 8, 8)
+    visible = mask[0, 0] == 0 if impl == "veomni_eager" else mask[0, 0]
+    positions = torch.arange(8)
+    distance = positions[:, None] - positions[None, :]
+    torch.testing.assert_close(visible, (distance >= 0) & (distance < 3))
 
 
 def test_magi_hf_builder_expands_ulysses_local_lengths(monkeypatch):

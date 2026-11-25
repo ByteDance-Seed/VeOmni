@@ -1,7 +1,7 @@
 # VeOmni Attention Interface
 
-VeOmni registers sequence-parallel FlashAttention, AITER, FlexAttention, SDPA,
-SageAttention, and MagiAttention FFA adapters in Transformers'
+VeOmni registers sequence-parallel Eager, FlashAttention, AITER, FlexAttention,
+SDPA, SageAttention, and MagiAttention FFA adapters in Transformers'
 `ALL_ATTENTION_FUNCTIONS`. There is no `fused_attention_forward` facade and
 no replaceable module-level `_flash_attention_forward` slots. Patched models
 bind `VeomniOp("attention", "standard", config.ops_config.attn_implementation)` once in `__init__` / `modify_init` and call
@@ -39,6 +39,8 @@ same way:
 
 | Public value | VeOmni registry name |
 |---|---|
+| `eager` | `veomni_eager` |
+| `sdpa` | `veomni_sdpa` |
 | `flash_attention_2` | `veomni_flash_attention_2` |
 | `flash_attention_2_hub` | `veomni_flash_attention_2_hub` |
 | `flash_attention_3` | `veomni_flash_attention_3` |
@@ -47,6 +49,7 @@ same way:
 | `flex_attention` | `veomni_flex_attention` |
 | `aiter` | `veomni_flash_attention_aiter` |
 | `magi_attention` | `veomni_magi_attention` |
+| `sage_attention` | `veomni_sage_attention` |
 
 The native Transformers `flex_attention` registry entry is left unchanged.
 Only the VeOmni-specific name routes through VeOmni's SP-aware facade.
@@ -58,8 +61,9 @@ The model-facing call path is:
 ```text
 model-local VeomniOp("attention", "standard", implementation)
   -> registered attention row created by attention.lookup(implementation)
-       -> ALL_ATTENTION_FUNCTIONS.get_interface(implementation, eager_default)
-            -> flash_attention_forward(...)
+       -> ALL_ATTENTION_FUNCTIONS[implementation]
+            -> eager_attention_forward(...)
+             | flash_attention_forward(...)
              | flex_attention_forward(...)
              | magi_attention_forward(...)
              | sage_attention_forward(...)

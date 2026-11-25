@@ -52,7 +52,7 @@ def strip_sdpa_packed_metadata(
     ]
     if multi_segment and not has_isolating_attention_mask(dense_mask):
         raise ValueError(
-            "SDPA received packed metadata with several segments per row ("
+            "Dense attention received packed metadata with several segments per row ("
             + ", ".join(multi_segment)
             + ") but no dense attention mask that isolates them. Build one with "
             "packed_causal_mask or use a packed-capable attention implementation."

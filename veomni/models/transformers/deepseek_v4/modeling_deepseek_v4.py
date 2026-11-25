@@ -16,6 +16,7 @@
 # Base-Transformers-Version: 5.16.1
 
 from functools import partial
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
@@ -2128,8 +2129,17 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 # the wrong rows.
                 mask_embeds = inputs_embeds.new_empty(inputs_embeds.shape[0], full_seq_len, inputs_embeds.shape[-1])
                 mask_position_ids = full_position_ids
+            # ``DeepseekV4Model`` already constructs full-sequence ``mask_embeds`` when
+            # SP is enabled because ``veomni_dsa_attention`` consumes the full-width 4D
+            # additive mask directly; pin the mask builder to ``"eager"`` so Ulysses SP
+            # does not scale ``q_length``/``kv_length`` a second time.
+            mask_config = SimpleNamespace(
+                _attn_implementation="eager",
+                sliding_window=self.config.sliding_window,
+                is_causal=getattr(self.config, "is_causal", True),
+            )
             causal_mask = create_sliding_window_causal_mask(
-                config=self.config,
+                config=mask_config,
                 inputs_embeds=mask_embeds,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
