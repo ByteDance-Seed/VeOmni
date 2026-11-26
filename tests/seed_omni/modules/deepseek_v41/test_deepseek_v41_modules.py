@@ -532,20 +532,41 @@ class TestReviewRegressions:
             build_compression_plans,
         )
 
-        # Mapping-form OpsSelection normalizes to its string name.
-        cfg = tiny_llm_config(
+        # Mapping-form OpsSelection and per-site overrides resolve cleanly in both directions.
+        base_ops = {
+            "mhc_implementation": "eager",
+            "moe_implementation": "eager",
+            "rms_norm_implementation": "eager",
+            "gated_mlp_implementation": "eager",
+            "linear_implementation": "eager",
+            "kv_round_implementation": "eager",
+        }
+        cfg = tiny_llm_config(ops_implementation={**base_ops, "dsa_indexer_implementation": {"name": "tilelang"}})
+        assert DeepseekV41Indexer(cfg, layer_idx=1).dsa_indexer_implementation == "tilelang"
+
+        cfg_override_tl = tiny_llm_config(
             ops_implementation={
-                "mhc_implementation": "eager",
-                "moe_implementation": "eager",
-                "rms_norm_implementation": "eager",
-                "gated_mlp_implementation": "eager",
-                "linear_implementation": "eager",
-                "kv_round_implementation": "eager",
-                "dsa_indexer_implementation": {"name": "tilelang"},
+                **base_ops,
+                "dsa_indexer_implementation": {
+                    "name": "eager",
+                    "overrides": [{"site": r"layers\.1\.indexer", "name": "tilelang"}],
+                },
             }
         )
-        idx = DeepseekV41Indexer(cfg, layer_idx=1)
-        assert idx.dsa_indexer_implementation == "tilelang"
+        assert DeepseekV41Indexer(cfg_override_tl, layer_idx=0).dsa_indexer_implementation == "eager"
+        assert DeepseekV41Indexer(cfg_override_tl, layer_idx=1).dsa_indexer_implementation == "tilelang"
+
+        cfg_override_eager = tiny_llm_config(
+            ops_implementation={
+                **base_ops,
+                "dsa_indexer_implementation": {
+                    "name": "tilelang",
+                    "overrides": [{"site": r"layers\.1\.indexer", "name": "eager"}],
+                },
+            }
+        )
+        assert DeepseekV41Indexer(cfg_override_eager, layer_idx=0).dsa_indexer_implementation == "tilelang"
+        assert DeepseekV41Indexer(cfg_override_eager, layer_idx=1).dsa_indexer_implementation == "eager"
 
         # Rejected non-candidate slots become -1 / -inf when fewer than topk candidates survive.
         cfg_cand = tiny_llm_config(

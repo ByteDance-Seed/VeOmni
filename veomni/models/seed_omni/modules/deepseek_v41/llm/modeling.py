@@ -1413,7 +1413,11 @@ class DeepseekV41Indexer(nn.Module):
             site=f"layers.{layer_idx}.indexer",
         )
         indexer_impl = resolve_module_op_impl(config, "dsa_indexer_implementation")
-        self.dsa_indexer_implementation = indexer_impl.name if isinstance(indexer_impl, OpsSelection) else indexer_impl
+        self.dsa_indexer_implementation = (
+            indexer_impl.resolve(site=f"layers.{layer_idx}.indexer")[0]
+            if isinstance(indexer_impl, OpsSelection)
+            else indexer_impl
+        )
 
     def build_keys(
         self,
