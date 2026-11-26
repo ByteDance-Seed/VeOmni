@@ -82,6 +82,36 @@ def check_model_build_prerequisites(config: PretrainedConfig) -> None:
         validate()
 
 
+#: DSA implementations that can serve CP's geometry on Ascend. Both CANN adapters
+#: take CP's local-query/global-KV layout without recomputation: sparse attention
+#: narrows the replicated KV buffer to the prefix the kernel assumes, and the
+#: indexer narrows the compressed table to the local prefix and lets the kernel's
+#: ``kv_len - q_len`` row inference number the shard's queries from their global
+#: rows. A packed indexer batch runs one BSND call per packed sample that
+#: intersects the shard, because the global slices cannot feed the TND path a
+#: local query shard; the sparse attention adapter makes the same per-sample split.
+_NPU_CP_DSA_IMPLEMENTATIONS = {
+    "dsa_indexer_implementation": frozenset({"eager", "cann"}),
+    "dsa_attention_implementation": frozenset({"eager", "cann"}),
+}
+
+
+def _check_deepseek_v4_npu_dsa_ops(config: PretrainedConfig) -> None:
+    """Refuse an Ascend CP run whose DSA operators cannot serve CP's geometry."""
+    # The builder resolves every selection. Reject incomplete configs as well
+    # as explicit implementations that cannot serve CP's geometry.
+    ops_config = getattr(config, "ops_config", None)
+    for field, implementations in _NPU_CP_DSA_IMPLEMENTATIONS.items():
+        implementation = getattr(ops_config, field, None)
+        if implementation not in implementations:
+            allowed = " or ".join(sorted(implementations))
+            raise NotImplementedError(
+                f"Context parallelism on Ascend/NPU requires {field} to be {allowed}; got {implementation!r}. "
+                "The CANN implementations serve CP's local-query/global-KV layout; set it in "
+                "configs/text/deepseek_v4_npu.yaml, or set cp_size=1."
+            )
+
+
 def check_context_parallel_supported(config: PretrainedConfig) -> None:
     """Raise unless this model type implements context parallelism.
 
@@ -122,25 +152,8 @@ def check_context_parallel_supported(config: PretrainedConfig) -> None:
                 "set cp_size=1 on Ascend/NPU runs."
             )
 
-        # The CANN adapters are written against one KV row per query row: sparse
-        # attention keeps the query local and the KV global and passes a nonzero
-        # ``query_offset``, and the indexer derives visibility from the query row
-        # where CP supplies explicit ``cu_seqlen`` ranges over the global
-        # sequence. Both reject the first compressed layer, so only the eager
-        # operators are admitted.
         if model_type == "deepseek_v4":
-            ops_config = getattr(config, "ops_config", None)
-            for field in ("dsa_indexer_implementation", "dsa_attention_implementation"):
-                # Resolved dataclass defaults supply unset fields.
-                implementation = getattr(ops_config, field, None)
-                if implementation != "eager":
-                    raise NotImplementedError(
-                        f"Context parallelism on Ascend/NPU requires {field}='eager'; got {implementation!r}. "
-                        "The CANN DeepSeek-V4 sparse attention rejects CP's local-query/global-KV geometry and "
-                        "the CANN indexer rejects CP's explicit cu_seqlen ranges, so training fails in the first "
-                        "compressed layer. Set both DSA operators to 'eager' in configs/text/deepseek_v4_npu.yaml, "
-                        "or set cp_size=1."
-                    )
+            _check_deepseek_v4_npu_dsa_ops(config)
 
     from .seed_omni.modules.module_configuration_base import OmniModuleConfig
 
