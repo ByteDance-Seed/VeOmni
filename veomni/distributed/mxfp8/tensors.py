@@ -295,8 +295,14 @@ class _MXFP8LinearFunction(torch.autograd.Function):
     def forward(ctx, input_tensor, weight, emulate):
         original_shape = input_tensor.shape
         input_2d = input_tensor.reshape(-1, original_shape[-1]).contiguous()
+        # Save the compute parameter rather than its payloads so FSDP2 can
+        # reshard it after forward and restore it for backward through its hooks.
+        ctx.save_for_backward(input_tensor, weight)
+        ctx.emulate = emulate
         if input_2d.shape[0] == 0:
-            raise ValueError("MXFP8 Linear requires at least one input token.")
+            if original_shape[-1] != weight.shape[1]:
+                raise ValueError(f"Expected {weight.shape[1]} input features, got {original_shape[-1]}.")
+            return input_tensor.new_empty((*original_shape[:-1], weight.shape[0]), dtype=torch.bfloat16)
         input_padded = _pad_rows(input_2d)
         if isinstance(weight, MXFP8GatheredWeight):
             row_weight = weight.rowwise()
@@ -304,15 +310,13 @@ class _MXFP8LinearFunction(torch.autograd.Function):
             master = weight._master if isinstance(weight, MXFP8Weight) else weight
             row_weight = _quantize(master, emulate)
         output = torch.mm(_quantize(input_padded, emulate), row_weight.t())
-        # Save the compute parameter rather than its payloads so FSDP2 can
-        # reshard it after forward and restore it for backward through its hooks.
-        ctx.save_for_backward(input_tensor, weight)
-        ctx.emulate = emulate
         return output[: input_2d.shape[0]].reshape(*original_shape[:-1], weight.shape[0])
 
     @staticmethod
     def backward(ctx, grad_output):
         input_tensor, weight = ctx.saved_tensors
+        if input_tensor.numel() == 0:
+            return torch.empty_like(input_tensor), grad_output.new_zeros(weight.shape, dtype=weight.dtype), None
         input_2d = input_tensor.reshape(-1, input_tensor.shape[-1]).contiguous()
         grad_2d = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()
         input_padded, grad_padded = _pad_rows(input_2d), _pad_rows(grad_2d)

@@ -183,6 +183,22 @@ def test_gathered_linear_forward_and_gradients_match_independent_quantized_oracl
     torch.testing.assert_close(layer.bias.grad, dy.sum((0, 1)), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("gathered", [False, True])
+def test_linear_handles_zero_tokens(gathered):
+    layer = MXFP8Linear.from_float(nn.Linear(64, 128), all_gather=False, emulate=True)
+    if gathered:
+        weight, _ = _gather(layer.weight.detach())
+        layer.weight = nn.Parameter(weight)
+    x = torch.empty(2, 0, 64, requires_grad=True)
+    output = layer(x)
+    assert output.shape == (2, 0, 128)
+    assert output.dtype == torch.bfloat16
+    output.sum().backward()
+    torch.testing.assert_close(x.grad, torch.zeros_like(x))
+    torch.testing.assert_close(layer.weight.grad, torch.zeros(128, 64, dtype=layer.weight.dtype))
+    torch.testing.assert_close(layer.bias.grad, torch.zeros_like(layer.bias))
+
+
 def test_post_all_gather_reuses_parameter_and_payload_after_master_update():
     torch.manual_seed(7)
     master = torch.randn(128, 64)
