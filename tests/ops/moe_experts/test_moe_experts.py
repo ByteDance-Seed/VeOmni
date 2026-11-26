@@ -2203,6 +2203,29 @@ def test_dispatch_to_ep_class_calls_the_expert_math_in_cumsum_order():
         tokens, cumsum, *rest = seen["args"]
         assert rest[0] is weight
         assert torch.equal(cumsum, torch.cumsum(counts, dim=0)), "the helper hands over a cumsum"
+        assert cumsum._cpu_tolist == torch.cumsum(counts, dim=0).tolist()
+
+        # DeepGEMM's EP math rebuilds CPU counts from ``cumsum._cpu_tolist`` without
+        # triggering a device-to-host sync through ``cumsum_to_counts``.
+        from veomni.ops.kernels.moe_experts.standard import deepgemm as deepgemm_moe
+
+        captured_counts = {}
+
+        def fake_experts(x, local_counts, *args):
+            captured_counts["counts"] = local_counts
+            return x
+
+        with (
+            mock.patch.object(deepgemm_moe, "_experts", fake_experts),
+            mock.patch.object(
+                deepgemm_moe,
+                "cumsum_to_counts",
+                side_effect=AssertionError("expected _cpu_tolist fast path"),
+            ),
+        ):
+            deepgemm_moe._deepgemm_expert_math(tokens, cumsum, weight, weight, None)
+        assert captured_counts["counts"].device.type == "cpu"
+        assert torch.equal(captured_counts["counts"], counts)
 
         # and an autograd.Function class, as the Triton and LoRA rows pass
         class _Math(torch.autograd.Function):
@@ -2217,6 +2240,46 @@ def test_dispatch_to_ep_class_calls_the_expert_math_in_cumsum_order():
 
         moe_layer.dispatch_to_ep_class(_Math, 2, torch.rand(6, 1), torch.zeros(6, 1, dtype=torch.long), hidden, weight)
         assert seen["class_args"][2] is weight
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_moe_layer_preprocess_single_host_transfer():
+    """``preprocess`` computes splits and per-expert counts from one host transfer."""
+    from unittest import mock
+
+    from veomni.distributed.moe import moe_layer
+
+    ep_size, num_experts = 2, 4
+    # Rank 0 routes 3 tokens (token 0 repeats expert 1 in both slots); rank 1 routes 2 tokens.
+    selected_by_rank = [
+        torch.tensor([[1, 1], [0, 3], [2, 3]], dtype=torch.long),
+        torch.tensor([[0, 2], [2, 3]], dtype=torch.long),
+    ]
+    masks = [torch.nn.functional.one_hot(sel, num_classes=num_experts).permute(2, 1, 0) for sel in selected_by_rank]
+    per_rank_local = torch.stack([m.any(dim=1).sum(dim=1) for m in masks], dim=0)
+
+    def fake_all_gather(dst, src, group=None):
+        dst.copy_(per_rank_local)
+
+    ep_group = mock.MagicMock()
+    ep_group.size.return_value = ep_size
+    for rank in range(ep_size):
+        with (
+            mock.patch.object(moe_layer.dist, "get_rank", return_value=rank),
+            mock.patch.object(moe_layer.dist, "all_gather_into_tensor", side_effect=fake_all_gather),
+        ):
+            in_splits, out_splits, per_rank_local_exp, sum_local_exp = moe_layer.preprocess(
+                masks[rank], num_experts, ep_group
+            )
+        start, end = rank * 2, (rank + 1) * 2
+        expected_in = per_rank_local[rank].reshape(ep_size, 2).sum(dim=1).tolist()
+        expected_per_rank = per_rank_local[:, start:end]
+        assert in_splits == expected_in
+        assert out_splits == expected_per_rank.sum(dim=1).tolist()
+        assert per_rank_local_exp.device.type == "cpu"
+        assert sum_local_exp.device.type == "cpu"
+        assert torch.equal(per_rank_local_exp, expected_per_rank)
+        assert torch.equal(sum_local_exp, expected_per_rank.sum(dim=0))
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

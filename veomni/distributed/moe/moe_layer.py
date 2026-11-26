@@ -37,9 +37,6 @@ def preprocess(
     # tokens per expert so duplicate top-k/hash slots do not overstate split sizes.
     num_local_tokens_per_expert = expert_mask.any(dim=1).sum(dim=1)
 
-    # [ep_size] represent the number of sum tokens in each rank
-    input_splits = num_local_tokens_per_expert.reshape(ep_size, num_local_experts).sum(dim=1).tolist()
-
     # gather all the number of tokens per expert from all ep ranks
     # [ep_size, num_experts]
     num_global_tokens_per_expert = torch.zeros(
@@ -50,21 +47,18 @@ def preprocess(
     )
     dist.all_gather_into_tensor(num_global_tokens_per_expert, num_local_tokens_per_expert, group=ep_group)
 
-    # [ep_size, num_local_experts]
     start_idx, end_idx = rank * num_local_experts, (rank + 1) * num_local_experts
-    num_global_tokens_per_local_expert = num_global_tokens_per_expert[:, start_idx:end_idx].contiguous()
+    local_splits_gpu = num_local_tokens_per_expert.reshape(ep_size, num_local_experts).sum(dim=1)
+    num_global_tokens_per_local_expert_gpu = num_global_tokens_per_expert[:, start_idx:end_idx].reshape(
+        ep_size, num_local_experts
+    )
 
-    # [ep_size]
+    # Single host transfer for both input_splits and per-rank local expert counts
+    meta_cpu = torch.cat([local_splits_gpu, num_global_tokens_per_local_expert_gpu.reshape(-1)], dim=0).cpu()
+    input_splits = meta_cpu[:ep_size].tolist()
+    num_global_tokens_per_local_expert = meta_cpu[ep_size:].view(ep_size, num_local_experts)
     output_splits = num_global_tokens_per_local_expert.sum(dim=1).tolist()
-
-    # [num_local_expert]
-    num_global_sum_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0).to(
-        torch.device("cpu"), non_blocking=True
-    )
-
-    num_global_tokens_per_local_expert = num_global_tokens_per_local_expert.view(-1, num_local_experts).to(
-        torch.device("cpu"), non_blocking=True
-    )
+    num_global_sum_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=0)
 
     return input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert
 
@@ -191,7 +185,9 @@ def dispatch_to_ep_class(
         ep_group=ep_state.ep_group,
     )
     del expert_mask
-    cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
+    cpu_cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0)
+    cumsum = cpu_cumsum.to(permute_tokens.device, non_blocking=True)
+    cumsum._cpu_tolist = cpu_cumsum.tolist()
 
     # An `autograd.Function` class exposes the entry point as `apply`; anything else is
     # called directly. Keyed on the attribute rather than `isinstance(..., type)`, so a
