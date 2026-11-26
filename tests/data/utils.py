@@ -51,6 +51,9 @@ def setup_test_distributed(args):
             rank=int(os.environ["RANK"]),
         )
 
+    extra_parallel_names, extra_parallel_sizes, extra_parallel_placement_innermost = (
+        args.model.accelerator.resolved_extra_parallel
+    )
     parallel_state = _init_parallel_state(
         dp_size=args.model.accelerator.dp_size,
         dp_replicate_size=args.model.accelerator.dp_replicate_size,
@@ -59,9 +62,9 @@ def setup_test_distributed(args):
         pp_size=args.model.accelerator.pp_size,
         cp_size=args.model.accelerator.cp_size,
         ulysses_size=args.model.accelerator.ulysses_size,
-        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=args.model.accelerator.extra_parallel_names,
+        extra_parallel_sizes=extra_parallel_sizes,
+        extra_parallel_placement_innermost=extra_parallel_placement_innermost,
+        extra_parallel_names=extra_parallel_names,
         dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
         name="base",
     )

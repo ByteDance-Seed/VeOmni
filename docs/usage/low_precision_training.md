@@ -8,8 +8,10 @@ module-swapping patch:
 | --- | --- | --- | --- | --- |
 | `linear_implementation` | `torchao` (`standard` only) | `fp8` (`emulated: false`), `nvfp4` / `mxfp4` (`emulated: true`) | Native FP8 (`aten::_scaled_mm`) or FP4 fake-quant | `--extra float8` (`torchao==0.18.0`); SM89+ for native FP8, CPU / SM80+ for emulated |
 | `linear_implementation` | `qat` (`standard`, `grouped`) | `fp8` | Blockwise FP8 fake-quant | SM90+, `tilelang` |
+| `linear_implementation` | `deepgemm` (`standard`, `grouped`) | `fp8` only | Native FP8 GEMM (forward, dgrad, wgrad) | Hopper SM90 / Blackwell SM100, `deep_gemm` + `triton` |
 | `gated_mlp_implementation` | `torchao` | `fp8` (`emulated: false`), `nvfp4` / `mxfp4` (`emulated: true`) | Native FP8 (`aten::_scaled_mm`) or FP4 fake-quant | `--extra float8` (`torchao==0.18.0`); SM89+ for native FP8, CPU / SM80+ for emulated |
 | `gated_mlp_implementation` | `qat` | `fp8` | Blockwise FP8 fake-quant | SM90+, `tilelang` |
+| `gated_mlp_implementation` | `deepgemm` (`standard`) | `fp8` only | Native FP8 GEMM (forward, dgrad, wgrad); SiLU / `swish` only | Hopper SM90 / Blackwell SM100, `deep_gemm` + `triton` |
 | `moe_implementation` | `deepgemm` | `fp8` only (today) | Native FP8 grouped GEMM (forward, dgrad, wgrad) | Hopper SM90 / Blackwell SM100, `deep_gemm` + `triton` |
 | `moe_implementation` | `qat` | `fp8`, `fp4` | Blockwise FP8/FP4 fake-quant + Triton grouped GEMM | SM90+, `tilelang` + `triton` |
 | `kv_round_implementation` | `triton`, `eager` | — | Stored KV / indexer activation rounding | `triton`: SM89+; `eager`: device-agnostic |
@@ -129,7 +131,7 @@ bash train.sh tasks/train_text.py configs/text/qwen3_nvfp4_qat.yaml
 - **Operand dtypes**: Nonempty operands must be BF16 or FP32 (FP16 is rejected at runtime).
 - **Group alignment**: Projections whose last dimension is not a multiple of the group width raise instead of padding.
 - **Model coverage**: `torchao` is registered for `linear/standard` only. Models that also bind `linear/grouped` (such as DeepSeek-V4 `o_a_proj`) cannot select `linear_implementation: torchao` globally.
-- **Activations**: Quantizing `gated_mlp` rows support `silu`, `swish`, `gelu`, and `gelu_pytorch_tanh` (with optional `swiglu_limit` clamping in model dtype); unsupported activations raise instead of silently training unquantized.
+- **Activations**: Quantizing `gated_mlp` rows support `silu`, `swish`, `gelu`, and `gelu_pytorch_tanh` (with optional `swiglu_limit` clamping in model dtype) on the `qat` and `torchao` rows; `deepgemm` is narrower and serves only `silu` / `swish`, because it fuses the activation into its FP8 kernel. Unsupported activations raise instead of silently training unquantized.
 - **Per-tensor `amax` (`nvfp4`)**: Computed over the rank-local activation tensor, so token packing, batch size, or sequence-parallel sharding can slightly shift the per-tensor scale.
 - **Hardware**: CPU and CUDA SM80+ (native BF16 required for distributed CUDA training, enforced by `ops/qat/_hardware.reject_qat_without_native_bf16`). NPU and MLU reject `torchao` at config-parse time.
 - **`torch.compile`**: `mxfp4` uses `float8_e8m0fnu` scales and is refused by `torch_compile`. `nvfp4` uses `float8_e4m3fn` scales (Inductor fails on pre-SM89 GPUs; on SM89 compiled vs eager can differ by ~0.5% of elements / ~1.2% relative L2, while SM120 is bit-identical).
@@ -149,7 +151,11 @@ For models with MoE experts and stored KV/indexer caches (such as DeepSeek-V4):
   (forward, dgrad, wgrad) on Hopper SM90 / Blackwell SM100. Today `deepgemm`
   supports `dtype: fp8` only; requesting another `dtype` raises `ValueError`.
   It composes cleanly with `qat` or `torchao` on `linear_implementation` and
-  `gated_mlp_implementation` (which cover attention and shared experts).
+  `gated_mlp_implementation`, because those are separate GEMMs on separate
+  fields. The same `deepgemm` row is also available on `linear_implementation`
+  (`standard` and `grouped`) and `gated_mlp_implementation` (`standard`), so the
+  attention projections and the shared expert can run native FP8 too rather than
+  being limited to fake quantization.
 
 See [`configs/text/deepseek_v4_qat.yaml`](../../configs/text/deepseek_v4_qat.yaml)
 for an all-QAT configuration and [FP8 MoE training](../design/deepgemm_moe.md)

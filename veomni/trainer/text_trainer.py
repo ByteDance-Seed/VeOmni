@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 from collections import defaultdict
 from typing import Any, Dict, List
 
@@ -36,6 +37,20 @@ class TextTrainer:
     base: BaseTrainer
 
     def __init__(self, args: VeOmniArguments):
+        if (
+            args.model.accelerator.fsdp_config.fsdp_mode == "hyper_fsdp2"
+            or args.model.optimizer.type == "hyper_muon"
+            or sys.modules.get("hyper_parallel.integration.veomni") is not None
+        ):
+            try:
+                from hyper_parallel.integration.veomni import apply_hyper_parallel_patch
+            except ModuleNotFoundError as exc:
+                if exc.name != "hyper_parallel":
+                    raise
+                raise ImportError(
+                    "HyperParallel is required for the selected backend. Add `--extra hyper` to your uv sync command."
+                ) from exc
+            apply_hyper_parallel_patch(args.model)
         # BaseTrainer.__init__ is NOT called here; we call its private
         # helpers one-by-one so the sequence is explicit.
         self.base = BaseTrainer.__new__(BaseTrainer)
