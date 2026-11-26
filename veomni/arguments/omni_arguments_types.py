@@ -148,17 +148,8 @@ def _check_hf_source_exportable(model_path: str) -> None:
         raise ValueError(f"`train.checkpoint.save_hf_weights` cannot write this source back: {e}") from e
 
 
-def _validate_hf_view_modules(
-    model_path: str,
-    modules: dict[str, OmniModuleRuntimeArguments],
-    *,
-    ep_sharded_stream_load: bool = False,
-) -> None:
-    """Under an HF ``model_path`` every module is one the family layout cuts from that checkpoint.
-
-    ``ep_sharded_stream_load`` is the top-level flag, which the composed wrap
-    (``fsdp_scope: model``) reads instead of the per-module ones.
-    """
+def _validate_hf_view_modules(model_path: str, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
+    """Under an HF ``model_path`` every module is one the family layout cuts from that checkpoint."""
     from ..models.seed_omni.utils.hf_layout import read_hf_source
 
     source = read_hf_source(model_path)
@@ -178,12 +169,6 @@ def _validate_hf_view_modules(
                 f"HuggingFace `{source.model_type}` checkpoint every module loads from. Drop the per-module "
                 "model_path, or convert the checkpoint to compose modules from several sources."
             )
-    streaming = sorted(name for name, args in modules.items() if args.ep_sharded_stream_load)
-    if ep_sharded_stream_load or streaming:
-        raise ValueError(
-            f"ep_sharded_stream_load (model: {ep_sharded_stream_load}, modules: {streaming}) does not apply the "
-            f"`{source.model_type}` HF layout's key renames. Disable it, or convert the checkpoint to a split one."
-        )
     overrides = {
         name: sorted(keys) for name, args in modules.items() if (keys := hf_module_model_config(args.model_config))
     }
@@ -284,9 +269,7 @@ def build_omni_model_runtime_args(args: "OmniArguments", *, for_inference: bool 
         for_inference=for_inference,
         checkpoint_modules=ckpt_modules,
     )
-    _validate_hf_view_modules(
-        seed_omni_model_path, modules, ep_sharded_stream_load=model_runtime.ep_sharded_stream_load
-    )
+    _validate_hf_view_modules(seed_omni_model_path, modules)
     for module_args in modules.values():
         _validate_omni_accelerator(module_args.accelerator)
     _validate_composed_wrap(model_runtime.accelerator, modules)
@@ -352,10 +335,12 @@ def build_omni_module_runtime_args(
     # it off alongside `fsdp_mode: eager` keeps the single-process eager-inference
     # default from inheriting a rank0-broadcast load policy that cannot run
     # without a wrap.
+    # Inference defaults to eager with mixed precision off (no fp32 master weights
+    # are needed, and `model.float()` would upcast quantized fp8 weights/scales).
     inference_default = (
         {
             "broadcast_model_weights_from_rank0": False,
-            "accelerator": {"fsdp_config": {"fsdp_mode": "eager"}},
+            "accelerator": {"fsdp_config": {"fsdp_mode": "eager", "mixed_precision": {"enable": False}}},
         }
         if for_inference
         else {}
@@ -552,6 +537,19 @@ class OmniInferArguments:
     )
     output_dir: str = field(default="output", metadata={"help": "Root output directory."})
     seed: int = field(default=42, metadata={"help": "Random seed."})
+    enable_full_determinism: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Opt into bitwise-reproducible generation (NCCL_DETERMINISTIC, "
+                "torch.use_deterministic_algorithms, cuDNN off). Off by default, "
+                "same as training and as vLLM serving: the rank-0 token broadcast "
+                "already keeps a multi-rank FSM from deadlocking on a last-bit "
+                "MoE scatter_add race. Turn this on only when a seeded prompt "
+                "must give the same answer twice; it is a large latency tax."
+            )
+        },
+    )
 
 
 @dataclass
@@ -853,19 +851,44 @@ def _validate_omni_accelerator(accelerator: AcceleratorConfig) -> None:
     """Checks an ``AcceleratorConfig`` cannot make for itself, for the Omni launcher.
 
     Mesh self-checks (``init_device`` vs ``fsdp_mode`` / ``ep_size``) run in
-    ``AcceleratorConfig.__post_init__``; the ``ep_sharded_stream_load`` /
+    ``AcceleratorConfig.__post_init__``; the ``extra_parallel_stream_load`` /
     ``broadcast_model_weights_from_rank0`` exclusion runs in
-    ``ModelArguments.__post_init__``. Neither is repeated here. What is left is the
-    SeedOmni-only ``torch_compile`` ban (single-model trainers support it, with
-    their own validation in ``VeOmniArguments``).
+    ``ModelArguments.__post_init__``. Neither is repeated here.
 
     Called once for the top-level default (``model.accelerator``, at ``OmniArguments.__post_init__``
     time, before modules are resolved) and once per module (in :func:`build_omni_model_runtime_args`, after
     ``modules`` merges each module's own ``accelerator:`` YAML override) so a per-module override is
     validated too, not just the global default.
+
+    ``torch_compile`` is no longer refused outright. ``accelerator.torch_compile.enable``
+    is the switch, resolved per module so a per-module ``accelerator:`` overlay can
+    turn it on or off for one module.
+
+    What is still refused here is the combination the composed path cannot run:
+    CUDA Graph replay needs one mark per micro-batch across the whole graph, and
+    Ulysses slices activations the graph edges reorder.
     """
-    if accelerator.torch_compile.enable:
-        raise ValueError("accelerator.torch_compile.enable is not supported by SeedOmni yet.")
+    if not accelerator.torch_compile.enable:
+        return
+    # Reuse the runtime predicate rather than restating the spellings: a second
+    # copy is how ``max-autotune`` came to be missing from one of the two guards.
+    from ..distributed.torch_compile import CompileConfig as _RuntimeCompileConfig
+
+    as_compile_config = _RuntimeCompileConfig(
+        enable=True,
+        backend=accelerator.torch_compile.backend,
+        mode=accelerator.torch_compile.mode,
+    )
+    if as_compile_config.uses_cuda_graphs():
+        raise ValueError(
+            "accelerator.torch_compile does not support CUDA Graph replay under SeedOmni; "
+            "use backend='inductor' and mode=None."
+        )
+    if accelerator.ulysses_size > 1 or accelerator.cp_size > 1 or accelerator.enable_async:
+        raise ValueError(
+            "accelerator.torch_compile does not support sequence parallelism under SeedOmni; "
+            "set accelerator.ulysses_size=1, accelerator.cp_size=1, and accelerator.enable_async=False."
+        )
 
 
 def _validate_training_task_data(train: OmniTrainingArguments, data: OmniDataArguments) -> None:
@@ -879,18 +902,56 @@ def _validate_training_task_data(train: OmniTrainingArguments, data: OmniDataArg
 
 
 def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, OmniModuleRuntimeArguments]) -> None:
-    """Reject an eager module under a top-level ``fsdp_scope='model'`` before any weights load."""
+    """Reject settings that a top-level ``fsdp_scope='model'`` wrap cannot honour.
+
+    Three of them: ``torch_compile`` (a module cannot wrap itself inside the
+    parent that owns the wrap, and the parent cannot compile blocks that are its
+    children), an ``eager`` module (nothing would build it sharded), and
+    ``extra_parallel_only`` (it removes the wrap the composed parent owns, so the
+    per-module plan would be left applying to a parent that is also sharded for
+    storage).
+    """
     fsdp_config = accelerator.fsdp_config
-    if fsdp_config.fsdp_scope != "model" or fsdp_config.fsdp_mode == "eager":
+    if fsdp_config.fsdp_scope != "model":
         return
-    eager = sorted(
+    compiled = sorted(name for name, module_args in modules.items() if module_args.accelerator.torch_compile.enable)
+    if accelerator.torch_compile.enable or compiled:
+        # Only name the switches that are actually on: listing ``model.accelerator``
+        # when it is off reads as if the launcher enabled it.
+        enabled = (["model.accelerator"] if accelerator.torch_compile.enable else []) + compiled
+        raise ValueError(
+            "accelerator.torch_compile.enable is not supported with fsdp_scope='model'. "
+            f"It is enabled for: {', '.join(enabled)}. That scope wraps the composed OmniModel once, "
+            "so every module shares one wrap: a module cannot compile inside a parent that decides its "
+            "own wrap, and the parent cannot compile blocks that are the children. Run with "
+            "fsdp_scope='module', or disable torch_compile for these modules."
+        )
+    if fsdp_config.fsdp_mode == "eager":
+        return
+    if fsdp_config.fsdp_mode == "fsdp2" and fsdp_config.extra_parallel_only:
+        raise ValueError(
+            "fsdp_scope='model' wraps the composed OmniModel once, so top-level "
+            "fsdp_config.extra_parallel_only cannot be enabled. Run with fsdp_scope='module'."
+        )
+    unwrapped = sorted(
         name for name, module_args in modules.items() if module_args.accelerator.fsdp_config.fsdp_mode == "eager"
     )
-    if eager:
+    if unwrapped:
         raise ValueError(
             "fsdp_scope='model' wraps the composed OmniModel once, so no module can be loaded "
-            f"unwrapped; these use fsdp_mode='eager': {eager}. Run with fsdp_scope='module', or "
+            f"unwrapped; these use fsdp_mode='eager': {unwrapped}. Run with fsdp_scope='module', or "
             "give them fsdp2 / ddp."
+        )
+    no_wrap = sorted(
+        name
+        for name, module_args in modules.items()
+        if module_args.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+        and module_args.accelerator.fsdp_config.extra_parallel_only
+    )
+    if no_wrap:
+        raise ValueError(
+            "fsdp_scope='model' wraps the composed OmniModel once, so no module can skip that wrap; "
+            f"these set fsdp_config.extra_parallel_only: {no_wrap}. Run with fsdp_scope='module'."
         )
 
 

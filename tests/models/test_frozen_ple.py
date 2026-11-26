@@ -9,7 +9,12 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.models.frozen_ple import freeze_ple_embeddings, is_ple_table, prepare_ple_storage
+from veomni.models.frozen_ple import (
+    freeze_ple_embeddings,
+    has_frozen_ple_embeddings,
+    is_ple_table,
+    prepare_ple_storage,
+)
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -68,7 +73,9 @@ def _build_runtime(dtype):
     from veomni.arguments.arguments_types import OptimizerConfig
 
     runtime.args = SimpleNamespace(
-        optimizer=OptimizerConfig(lr=1e-3, weight_decay=0.0), lora_config=None, accelerator=SimpleNamespace()
+        optimizer=OptimizerConfig(lr=1e-3, weight_decay=0.0),
+        lora_config=None,
+        accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(offload=False, fsdp_mode="fsdp2")),
     )
     runtime.model_name = "base"
     runtime._freeze_model_module()
@@ -148,6 +155,29 @@ def test_runtime_leaves_ple_trainable_when_freeze_is_disabled():
     assert model.ple.ple_embedding.ngram_embedding["shard_0"].weight.requires_grad
 
 
+def test_runtime_rejects_frozen_ple_with_fsdp_offload():
+    """Reject unsupported frozen PLE storage before model parallelization."""
+    from veomni.trainer.vlm_trainer import VLMModelRuntime
+
+    model = _qwen4_model()
+    runtime = VLMModelRuntime.__new__(VLMModelRuntime)
+    runtime.model = model
+    runtime.model_config = model.config
+    runtime.args = SimpleNamespace(
+        lora_config=None,
+        accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(offload=True)),
+    )
+    runtime.train_args = SimpleNamespace(
+        freeze_ple_embeddings=True,
+        frozen_ple_dtype="bfloat16",
+        freeze_vit=False,
+        freeze_audio_tower=False,
+    )
+
+    with pytest.raises(ValueError, match="CPU offload"):
+        runtime._freeze_model_module()
+
+
 def test_freeze_ple_on_meta_preserves_dtype():
     """Freeze meta-initialized tables without materializing or casting them."""
     model = _qwen4_model().to("meta")
@@ -215,5 +245,163 @@ def test_dtensor_cast_preserves_local_shard_and_metadata(dtype, tmp_path):
             assert param.device_mesh == mesh
             assert param.spec_info is metadata
             torch.testing.assert_close(param.to_local(), values.to(getattr(torch, dtype)), rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_has_frozen_ple_embeddings_tracks_parameter_state_through_wrapper():
+    """Derive frozen PLE state from parameters, including through module wrappers."""
+    model = _qwen4_model()
+    assert not has_frozen_ple_embeddings(model)
+
+    table = model.ple.ple_embedding.ngram_embedding["shard_0"].weight
+    table.requires_grad_(False)
+    assert has_frozen_ple_embeddings(model)
+    table.requires_grad_(True)
+    assert not has_frozen_ple_embeddings(model)
+
+    assert freeze_ple_embeddings(model) == 1
+    assert has_frozen_ple_embeddings(model)
+
+    ddp_like = nn.Module()
+    ddp_like.module = model
+    assert has_frozen_ple_embeddings(ddp_like)
+
+
+def test_build_parallelize_model_freezes_and_sets_ple_dtype(monkeypatch):
+    """Apply PLE freezing before upcast/parallelization and storage dtype afterwards."""
+    from veomni.arguments.arguments_types import MixedPrecisionConfig
+    from veomni.distributed import torch_parallelize
+
+    monkeypatch.setattr(
+        torch_parallelize,
+        "get_parallel_state",
+        lambda: SimpleNamespace(dp_mode="fsdp2", tp_enabled=False, fsdp_enabled=True),
+    )
+    monkeypatch.setattr("veomni.utils.device.get_device_type", lambda: "cpu")
+
+    seen_frozen_in_parallelize = False
+
+    def _fake_parallelize_fsdp2(model, **kwargs):
+        nonlocal seen_frozen_in_parallelize
+        table = model.ple.ple_embedding.ngram_embedding["shard_0"].weight
+        seen_frozen_in_parallelize = (not table.requires_grad) and table.dtype == torch.float32
+        return model
+
+    monkeypatch.setattr(torch_parallelize, "parallelize_model_fsdp2", _fake_parallelize_fsdp2)
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        torch_parallelize.build_parallelize_model(_qwen4_model(), freeze_ple_embeddings="true")
+
+    with pytest.raises(ValueError, match="frozen_ple_dtype"):
+        torch_parallelize.build_parallelize_model(
+            _qwen4_model(), freeze_ple_embeddings=False, frozen_ple_dtype="bfloat16"
+        )
+
+    with pytest.raises(ValueError, match="CPU offload"):
+        torch_parallelize.build_parallelize_model(
+            _qwen4_model(),
+            freeze_ple_embeddings=True,
+            enable_fsdp_offload=True,
+        )
+
+    model = _qwen4_model().to(torch.bfloat16)
+    parallelized = torch_parallelize.build_parallelize_model(
+        model,
+        mixed_precision=MixedPrecisionConfig(enable=True),
+        enable_gradient_checkpointing=False,
+        freeze_ple_embeddings=True,
+        frozen_ple_dtype="bfloat16",
+    )
+    assert seen_frozen_in_parallelize
+    assert has_frozen_ple_embeddings(parallelized)
+    table = parallelized.ple.ple_embedding.ngram_embedding["shard_0"].weight
+    assert not table.requires_grad
+    assert table.dtype == torch.bfloat16
+    assert parallelized.other.weight.dtype == torch.float32
+
+
+def test_export_weights_skips_frozen_ple_only_when_requested_and_crops_by_default(monkeypatch, tmp_path):
+    from veomni.models.checkpoint.convert import export_weights
+    from veomni.models.transformers.qwen4_exp.checkpoint_tensor_converter import (
+        create_qwen4_exp_checkpoint_tensor_converter,
+    )
+
+    monkeypatch.setattr(
+        "veomni.distributed.parallel_state.get_parallel_state",
+        lambda: SimpleNamespace(ep_enabled=False),
+    )
+    monkeypatch.setattr("veomni.models.checkpoint.convert.get_device_type", lambda: "cpu")
+
+    dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'rendezvous_export'}", rank=0, world_size=1)
+    try:
+        mesh = init_device_mesh("cpu", (1,))
+
+        def _make_export_model():
+            model = nn.Module()
+            model.config = SimpleNamespace(
+                model_type="qwen4_exp",
+                text_config=SimpleNamespace(split_ngram_parts=1, make_ngram_vocab_size_divisible_by=8),
+            )
+            ple = nn.Module()
+            ple.rows_per_checkpoint_shard = 6
+            ple.padded_rows_per_shard = 8
+            ple.ngram_embedding = nn.ModuleDict({"shard_0": nn.Embedding(8, 4)})
+            raw_table = torch.arange(32, dtype=torch.bfloat16).reshape(8, 4)
+            raw_table[6:] = 0
+            ple.ngram_embedding["shard_0"].weight = nn.Parameter(
+                distribute_tensor(raw_table, mesh, [Shard(0)]),
+                requires_grad=True,
+            )
+            model.layers = nn.ModuleList([nn.Module()])
+            model.layers[0].ple = nn.Module()
+            model.layers[0].ple.ple_embedding = ple
+            model.layers[0].ple.key_proj = nn.Linear(4, 4, bias=False)
+            model._create_checkpoint_tensor_converter = create_qwen4_exp_checkpoint_tensor_converter
+            return model, raw_table
+
+        orig_full_tensor = torch.distributed.tensor.DTensor.full_tensor
+        ple_full_tensor_calls = 0
+
+        def _guarded_full_tensor(self, *args, **kwargs):
+            nonlocal ple_full_tensor_calls
+            if self.shape == (8, 4):
+                ple_full_tensor_calls += 1
+            return orig_full_tensor(self, *args, **kwargs)
+
+        monkeypatch.setattr(torch.distributed.tensor.DTensor, "full_tensor", _guarded_full_tensor)
+
+        frozen_model, raw_table = _make_export_model()
+        assert freeze_ple_embeddings(frozen_model) == 1
+
+        # Complete export remains the default and crops the frozen table to logical rows.
+        full_export = dict(export_weights(frozen_model))
+        assert ple_full_tensor_calls == 1
+        ple_exported = full_export["layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"]
+        assert ple_exported.shape == (6, 4)
+        torch.testing.assert_close(ple_exported, raw_table[:6], rtol=0, atol=0)
+
+        # Rollout sync can explicitly skip frozen PLE before DTensor materialization.
+        skipped_export = dict(export_weights(frozen_model, skip_frozen_ple=True))
+        assert ple_full_tensor_calls == 1
+        assert "layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight" not in skipped_export
+        assert "layers.0.ple.key_proj.weight" in skipped_export
+
+        wrapped = nn.Module()
+        wrapped.module = frozen_model
+        wrapped_skipped = dict(export_weights(wrapped, skip_frozen_ple=True))
+        assert ple_full_tensor_calls == 1
+        assert "layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight" not in wrapped_skipped
+        assert "layers.0.ple.key_proj.weight" in wrapped_skipped
+
+        # The opt-in skips only actually frozen tables.
+        trainable_model, raw_table = _make_export_model()
+        trainable_wrapped = nn.Module()
+        trainable_wrapped.module = trainable_model
+        trainable_export = dict(export_weights(trainable_wrapped, skip_frozen_ple=True))
+        assert ple_full_tensor_calls == 2
+        ple_exported = trainable_export["layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"]
+        assert ple_exported.shape == (6, 4)
+        torch.testing.assert_close(ple_exported, raw_table[:6], rtol=0, atol=0)
     finally:
         dist.destroy_process_group()

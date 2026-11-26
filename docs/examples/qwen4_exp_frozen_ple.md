@@ -41,3 +41,16 @@ keep the dtype they have after model parallelization.
   was saved, the saved optimizer parameter groups may include them.
   Resuming with `freeze_ple_embeddings: true` excludes them from the current
   optimizer. This mismatch can cause optimizer state loading to fail.
+
+## Weight export
+
+- **In-memory weight iteration ([`export_weights`](../../veomni/models/checkpoint/convert.py#L436)).**
+  The default export includes frozen PLE tables and crops padded runtime rows
+  back to their logical checkpoint row counts via
+  [`crop_hf_export_tensor`](../../veomni/models/transformers/qwen4_exp/checkpoint_tensor_converter.py#L107).
+  Rollout synchronization can call `export_weights(model, skip_frozen_ple=True)`
+  to omit only PLE tables whose parameters have `requires_grad=False`, before
+  unsharding their `DTensor` shards. Trainable PLE tables remain included.
+- **Distributed Hugging Face checkpoint save (`save_hf_safetensor`).**
+  Saves all model parameters (including frozen PLE tables) directly from `DTensor`
+  shards at their logical row counts via `RowCropSavePlanner`.

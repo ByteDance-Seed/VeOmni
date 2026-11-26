@@ -105,6 +105,18 @@ def test_state_offload_rejects_selective_extra_parallel_cpu_offload():
         )
 
 
+def test_optimizer_selection_is_validated_before_model_loading():
+    with pytest.raises(ValueError, match="Unknown model.optimizer.type"):
+        OptimizerConfig(type="admaw")
+    with pytest.raises(ValueError, match="Hyper FSDP does not support"):
+        ModelArguments(
+            model_path="weights",
+            optimizer=OptimizerConfig(type="anyprecision_adamw"),
+            accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="hyper_fsdp2")),
+        )
+    assert ModelArguments(model_path="weights", optimizer=OptimizerConfig(type="anyprecision_adamw"))
+
+
 @pytest.mark.parametrize(
     "kwargs,compile_enabled",
     [

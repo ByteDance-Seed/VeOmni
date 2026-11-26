@@ -39,6 +39,7 @@ _GPU_SM80 = ("gpu", (("nvidia", 80, None), ("rocm", None, None)))
 _GPU_NVIDIA = ("gpu", (("nvidia", None, None),))
 _GPU_NVIDIA_SM70 = ("gpu", (("nvidia", 70, None),))
 _GPU_NVIDIA_SM80 = ("gpu", (("nvidia", 80, None),))
+_GPU_NVIDIA_SM89 = ("gpu", (("nvidia", 89, None),))
 _GPU_NVIDIA_SM89_ROCM = ("gpu", (("nvidia", 89, None), ("rocm", None, None)))
 _GPU_NVIDIA_SM90 = ("gpu", (("nvidia", 90, None),))
 _GPU_NVIDIA_SM90_OR_SM100 = ("gpu", (("nvidia", 90, 90), ("nvidia", 100, 100)))
@@ -139,6 +140,9 @@ _BUILTIN_ENTRIES = (
     ("chunk_gated_delta_rule", "standard", "fla_npu", "npu", _NPU, ("fla_npu", "triton")),
     ("load_balancing_loss", "standard", "eager", "any", _ANY, ()),
     ("load_balancing_loss", "standard", "triton", "cuda", _GPU, ("triton",)),
+    ("chunk_kda", "kimi_k3", "eager", "any", _ANY, ()),
+    ("chunk_kda", "kimi_k3", "fla", "cuda", _GPU, ("fla",)),
+    ("chunk_kda", "kimi_k3", "ascendc", "npu", _NPU, ("fla_npu", "triton_ascend_kernels")),
     ("cross_entropy_loss", "standard", "eager", "any", _ANY, ()),
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("cross_entropy_loss", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
@@ -169,6 +173,8 @@ _BUILTIN_ENTRIES = (
     ("moe_experts", "standard", "fused_mlu", "mlu", _MLU, ("apex",)),
     ("moe_experts", "gpt_oss", "eager", "any", _ANY, ()),
     ("moe_experts", "gpt_oss", "fused_quack", "cuda", _GPU_NVIDIA_SM90, ("quack",)),
+    ("moe_experts", "kimi_k3", "eager", "any", _ANY, ()),
+    ("moe_experts", "kimi_k3", "fused_npu", "npu", _NPU, ("triton",)),
     ("moe_experts_lora", "shared", "eager", "any", _ANY, ()),
     ("moe_experts_lora", "shared", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts_lora", "shared", "fused_npu", "npu", _NPU, ()),
@@ -181,13 +187,20 @@ _BUILTIN_ENTRIES = (
     ("kv_round", "deepseek_v4", "none", "any", _ANY, ()),
     ("kv_round", "deepseek_v4", "eager", "any", _ANY, ()),
     ("kv_round", "deepseek_v4", "triton", "cuda", _GPU_NVIDIA_SM89_ROCM, ("triton",)),
+    ("kv_round", "fp4", "none", "any", _ANY, ()),
+    ("kv_round", "fp4", "eager", "any", _ANY, ()),
+    # NVIDIA-only: ``triton_fp4_roundtrip`` hands every ROCm input to the eager row,
+    # so advertising ROCm would select a backend that never runs.
+    ("kv_round", "fp4", "triton", "cuda", _GPU_NVIDIA_SM89, ("triton",)),
     ("layer_norm", "standard", "eager", "any", _ANY, ()),
     ("layer_norm", "standard", "apex", "cuda", _GPU, ("fused_layer_norm_cuda",)),
     ("linear", "standard", "eager", "any", _ANY, ()),
     ("linear", "standard", "qat", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
     ("linear", "standard", "torchao", "any", _ANY, ("torchao",)),
+    ("linear", "standard", "deepgemm", "cuda", _GPU_NVIDIA_SM90_OR_SM100, ("deep_gemm", "triton")),
     ("linear", "grouped", "eager", "any", _ANY, ()),
     ("linear", "grouped", "qat", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
+    ("linear", "grouped", "deepgemm", "cuda", _GPU_NVIDIA_SM90_OR_SM100, ("deep_gemm", "triton")),
     ("rms_norm", "standard", "eager", "any", _ANY, ()),
     ("rms_norm", "standard", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("rms_norm", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
@@ -214,6 +227,8 @@ _BUILTIN_ENTRIES = (
     ("rope", "partial", "torch_npu", "npu", _NPU, ()),
     ("rope", "interleave", "eager", "any", _ANY, ()),
     ("rope", "mrope", "eager", "any", _ANY, ()),
+    ("situ_and_mul", "kimi_k3", "eager", "any", _ANY, ()),
+    ("situ_and_mul", "kimi_k3", "triton", "npu", _NPU, ("triton",)),
     ("rope", "deepseek_v4", "eager", "any", _ANY, ()),
     ("rope", "deepseek_v4", "triton", "cuda", _GPU, ("triton",)),
     ("rope", "wan", "eager", "any", _ANY, ()),
@@ -224,6 +239,7 @@ _BUILTIN_ENTRIES = (
     ("gated_mlp", "standard", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
     ("gated_mlp", "standard", "qat", "cuda", _GPU_NVIDIA_SM90, ("tilelang",)),
     ("gated_mlp", "standard", "torchao", "any", _ANY, ("torchao",)),
+    ("gated_mlp", "standard", "deepgemm", "cuda", _GPU_NVIDIA_SM90_OR_SM100, ("deep_gemm", "triton")),
     ("gated_mlp", "geglu", "eager", "any", _ANY, ()),
     ("gated_mlp", "geglu", "liger_kernel", "cuda", _GPU, ("liger_kernel",)),
     ("gated_mlp", "geglu", "liger_kernel", "mlu", _MLU, ("liger_kernel",)),
@@ -272,12 +288,14 @@ def test_builtin_entry_catalog_is_exact():
 
 
 _BUILTIN_DEFAULT_ENTRIES = {
+    ("chunk_kda", "kimi_k3", "ascendc", "npu"),
     ("cross_entropy_loss", "standard", "liger_kernel", "cuda"),
     ("cross_entropy_loss", "standard", "liger_kernel", "mlu"),
     ("cross_entropy_loss", "standard", "chunk_loss", "npu"),
     ("token_logprobs", "standard", "flash_attn", "cuda"),
     ("token_logprobs", "standard", "torch_npu", "npu"),
     ("load_balancing_loss", "standard", "triton", "cuda"),
+    ("moe_experts", "kimi_k3", "fused_npu", "npu"),
     ("moe_experts", "standard", "fused_triton", "cuda"),
     ("moe_experts", "standard", "fused_mlu", "mlu"),
     ("moe_experts", "standard", "fused_triton", "mlu"),
@@ -299,12 +317,14 @@ _BUILTIN_DEFAULT_ENTRIES = {
     ("rope", "partial", "liger_kernel", "cuda"),
     ("rope", "partial", "liger_kernel", "mlu"),
     ("rope", "partial", "torch_npu", "npu"),
+    ("situ_and_mul", "kimi_k3", "triton", "npu"),
     ("gated_mlp", "standard", "liger_kernel", "cuda"),
     ("gated_mlp", "standard", "liger_kernel", "mlu"),
     ("gated_mlp", "geglu", "liger_kernel", "cuda"),
     ("gated_mlp", "geglu", "liger_kernel", "mlu"),
     ("kv_round", "standard", "triton", "cuda"),
     ("kv_round", "deepseek_v4", "triton", "cuda"),
+    ("kv_round", "fp4", "triton", "cuda"),
 }
 
 
