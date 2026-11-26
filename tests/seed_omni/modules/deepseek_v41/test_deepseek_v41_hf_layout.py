@@ -934,3 +934,55 @@ def test_ngram_stream_load_rejects_truncated_table_below_logical_rows(tmp_path, 
 
     with pytest.raises(RuntimeError, match="below required logical dim0=1000"):
         _stream_ngram_as_rank(path, monkeypatch, rank=0)
+
+
+def test_convert_llm_allows_ratio1_kv_source_without_wgate(tmp_path):
+    """A ratio-1 KV source (e.g. default layer 20) has no ``compressor.wgate.weight``, while ratio > 1 requires it."""
+    from veomni.models.seed_omni.modules.deepseek_v41.convert_model import (
+        TensorSource,
+        _build_configs,
+        convert_llm,
+    )
+
+    path = str(tmp_path / "release_ratio1")
+    _release(path, quantized=False)
+    index_path = os.path.join(path, "model.safetensors.index.json")
+    with open(index_path) as f:
+        index = json.load(f)
+    # Layer 0 is the KV source in the miniature release; remove its compressor.wgate.weight.
+    index["weight_map"].pop("layers.0.attn.compressor.wgate.weight")
+    with open(index_path, "w") as f:
+        json.dump(index, f)
+    with open(os.path.join(path, "config.json")) as f:
+        hf_cfg = json.load(f)
+    # With compress_ratio=2, missing wgate must fail conversion.
+    _, _, _, llm_cfg_r2, _ = _build_configs(hf_cfg)
+    assert 0 in llm_cfg_r2.kv_source_layer_ids and llm_cfg_r2.compress_ratios[0] == 2
+    with pytest.raises(KeyError, match=r"layers\.0\.attn\.compressor\.wgate\.weight"):
+        convert_llm(TensorSource(path), str(tmp_path / "out_r2"), llm_cfg_r2, list(llm_cfg_r2.engram_layer_ids))
+
+    # With compress_ratio=1, DeepseekV41Compressor has no wgate so conversion must succeed.
+    hf_cfg["text_config"]["compress_ratios"] = [1, 1, 0, 0, 0]
+    _, _, _, llm_cfg_r1, _ = _build_configs(hf_cfg)
+    assert 0 in llm_cfg_r1.kv_source_layer_ids and llm_cfg_r1.compress_ratios[0] == 1
+    n_written = convert_llm(
+        TensorSource(path), str(tmp_path / "out_r1"), llm_cfg_r1, list(llm_cfg_r1.engram_layer_ids)
+    )
+    assert n_written > 0
+
+
+def test_quant_fp4_blockwise_matches_nearest_even_reference_on_midpoints():
+    """Midpoint ties must round to nearest-even code, matching ``veomni.ops.kernels.kv_round.fp4.eager``."""
+    from veomni.ops.kernels.kv_round.fp4.eager import _round_to_fp4
+
+    # Include all 7 positive & negative midpoints plus 6.0 so block scale is exactly 1.0 (amax=6.0).
+    midpoints = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
+    row = midpoints + [-m for m in midpoints] + [6.0, -6.0] + [0.0] * 16
+    weight = torch.tensor([row], dtype=torch.float32)
+    packed, scale = quant_fp4_blockwise(weight, block=32)
+    deq = dequant_fp4_blockwise(packed, scale, out_dtype=torch.float32)
+    ref = _round_to_fp4(weight)
+    torch.testing.assert_close(deq, ref, rtol=0, atol=0)
+    # Explicitly verify 0.75 -> 1.0, 1.75 -> 2.0, 2.5 -> 2.0, 3.5 -> 4.0, 5.0 -> 4.0.
+    assert deq[0, :7].tolist() == [0.0, 1.0, 1.0, 2.0, 2.0, 4.0, 4.0]
+    assert deq[0, 7:14].tolist() == [0.0, -1.0, -1.0, -2.0, -2.0, -4.0, -4.0]

@@ -460,7 +460,10 @@ def convert_llm(source: TensorSource, output_dir: str, config, engram_layer_ids:
     for layer in range(config.num_hidden_layers):
         for released, target in llm_layer_names(layer).items():
             if released not in source:
-                is_optional_compressor = ".attn.compressor." in released and layer not in kv_sources
+                is_optional_compressor = ".attn.compressor." in released and (
+                    layer not in kv_sources
+                    or (released.endswith(".compressor.wgate.weight") and config.compress_ratios[layer] <= 1)
+                )
                 is_optional_indexer_kv = released.endswith(
                     (".attn.indexer.wk.weight", ".attn.indexer.k_norm.weight")
                 ) and (layer not in kv_sources or layer not in index_sources)

@@ -172,8 +172,13 @@ def quant_fp4_blockwise(weight: torch.Tensor, block: int = 32) -> tuple[torch.Te
     blocked = weight.float().unflatten(-1, (-1, block))
     scale = _ue8m0_scale(blocked.abs().amax(dim=-1), FP4_E2M1_MAX)
     values = (blocked / scale[..., None]).flatten(1)
+    abs_vals = values.abs()
     midpoints = torch.tensor(_FP4_MIDPOINTS, dtype=torch.float32, device=weight.device)
-    codes = torch.bucketize(values.abs(), midpoints).to(torch.uint8)
+    codes = torch.bucketize(abs_vals, midpoints).to(torch.uint8)
+    # Match IEEE/FP4 QAT nearest-even tie breaking: bucketize(right=False) maps
+    # every midpoint to the lower code, so round exact ties at odd codes up.
+    odd_ties = (abs_vals == 0.75) | (abs_vals == 1.75) | (abs_vals == 3.5)
+    codes = codes + odd_ties.to(torch.uint8)
     codes = codes | torch.signbit(values).to(torch.uint8) << 3
     packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
     return packed.view(torch.int8), scale.to(torch.float8_e8m0fnu)
