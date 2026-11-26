@@ -27,6 +27,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments.arguments_types import AcceleratorConfig
 from veomni.arguments.omni_arguments_types import (
     OmniModuleRuntimeArguments,
@@ -285,7 +286,12 @@ def _vision_sp_worker(rank: int, world_size: int, init_file: str) -> None:
         dist.destroy_process_group()
 
 
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+_CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
+
+
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo required")
 def test_vision_ulysses_sp_forward_and_gradients_match_unsharded() -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        mp.spawn(_vision_sp_worker, args=(2, os.path.join(tmp, "init")), nprocs=2, join=True)
+        mp.spawn(_vision_sp_worker, args=(2, os.path.join(tmp, "init")), nprocs=_CI_CPU_2.nproc, join=True)

@@ -22,6 +22,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 import veomni.models.checkpoint.weights as module_utils
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights, load_model_weights_ep_sharded
 from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import (
     DeepseekV41DequantConverter,
@@ -51,6 +52,8 @@ from veomni.models.seed_omni.utils.hf_layout import (
     save_hf_source_checkpoint,
 )
 
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 HIDDEN = 64
 N_LAYERS = 2

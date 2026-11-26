@@ -23,6 +23,7 @@ import pytest
 import torch
 import yaml
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.loss_utils import ForCausalLMLoss
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modeling_omni import OmniModel
@@ -53,6 +54,8 @@ from veomni.models.seed_omni.modules.deepseek_v41.vision.processing import image
 from veomni.models.seed_omni.utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
 from veomni.ops import VeomniOp
 
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 CONFIG_ROOT = Path("configs/seed_omni/DeepSeek/deepseek_v41_flash")
 TRAIN_GRAPH_PATH = CONFIG_ROOT / "graph_train.yaml"
