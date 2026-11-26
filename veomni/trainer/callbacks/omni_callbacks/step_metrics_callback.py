@@ -101,6 +101,17 @@ class OmniStepMetricsCallback(Callback):
         if lr_scheduler is not None:
             step_train_metrics["training/lr"] = max(lr_scheduler.get_last_lr())
 
+        if "mfu" in step_env_metrics:
+            world_size = max(int(getattr(self.trainer.environ_meter, "world_size", 1)), 1)
+            step_env_metrics["mfu(%)"] = step_env_metrics["mfu"] * 100.0
+            step_env_metrics["tflops_per_gpu"] = step_env_metrics["flops_achieved(T)"] / world_size
+            step_env_metrics["step_time(s)"] = delta_time
+            step_env_metrics["training/mfu"] = step_env_metrics["mfu"]
+            step_env_metrics["training/mfu(%)"] = step_env_metrics["mfu(%)"]
+            step_env_metrics["training/flops_achieved(T)"] = step_env_metrics["flops_achieved(T)"]
+            step_env_metrics["training/tflops_per_gpu"] = step_env_metrics["tflops_per_gpu"]
+            step_env_metrics["training/step_time(s)"] = delta_time
+
         step_env_metrics.update(step_train_metrics)
 
         self.trainer.step_train_metrics = step_train_metrics

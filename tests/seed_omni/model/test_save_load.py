@@ -1083,3 +1083,21 @@ def test_standalone_module_attention_applies_after_composed_ops(
     loaded.save_pretrained(tmp_path / "resaved")
     saved = json.loads((tmp_path / "resaved" / "config.json").read_text())
     assert saved["ops_implementation"]["attn_implementation"] == expected_attention
+
+
+def test_from_pretrained_unwraps_legacy_graph_sidecar_wrappers(tmp_path):
+    """Pre-scenario-map sidecars that nest under ``training_graph`` / ``generation_graphs`` still load."""
+    _build_omni_model().save_pretrained(tmp_path)
+    (tmp_path / DEFAULT_TRAINING_GRAPH_FILE).write_text(
+        "training_graph:\n  default:\n    - {from: fake_module_a, to: fake_module_b}\n    - {from: fake_module_b, to: end}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / DEFAULT_GENERATION_GRAPH_FILE).write_text(
+        "generation_graphs:\n  infer_gen:\n    initial: run\n    states:\n      run:\n        endpoint: fake_module_a\n        transitions:\n          - {to: end}\n",
+        encoding="utf-8",
+    )
+
+    loaded = OmniConfig.from_pretrained(tmp_path)
+    assert list(loaded.training_graphs) == ["default"]
+    assert list(loaded.generation_graphs) == ["infer_gen"]
+    assert loaded.generation_graphs["infer_gen"]["initial"] == "run"

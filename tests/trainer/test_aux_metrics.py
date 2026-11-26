@@ -403,3 +403,60 @@ def test_environ_meter_tolerates_a_step_without_aux_metrics(monkeypatch, aux_met
 
     assert callback.trainer.step_train_metrics["training/foundation_loss"] == pytest.approx(2.0)
     assert callback.trainer.step_train_metrics["training/grad_norm"] == pytest.approx(0.5)
+
+
+def test_trim_wandb_config_keys_caps_nested_dot_flattened_length():
+    """Deeply nested config keys exceeding 64 dot-flattened chars are trimmed with at least an 8-char leaf budget."""
+    trim = trace_callback_module._trim_wandb_config_keys
+    long_leaf = "very_long_configuration_field_name_exceeding_wandb_key_limit"
+    cfg = {
+        "short": 1,
+        "level_one_segment": {
+            "level_two_segment_name": {
+                long_leaf: "value",
+                "ok": True,
+            }
+        },
+        "empty": {},
+    }
+    trimmed = trim(cfg, max_len=64)
+    assert trimmed["short"] == 1
+    assert trimmed["empty"] == {}
+    inner = trimmed["level_one_segment"]["level_two_segment_name"]
+    assert inner["ok"] is True
+    prefix = "level_one_segment.level_two_segment_name."
+    trimmed_keys = [k for k in inner if k != "ok"]
+    assert len(trimmed_keys) == 1
+    assert len(prefix) + len(trimmed_keys[0]) == 64
+    assert inner[trimmed_keys[0]] == "value"
+
+    # When prefix alone already exceeds max_len, keep at least 8 chars of the leaf key.
+    deep_prefix = "a" * 70
+    deep = trim({deep_prefix: {"long_leaf_name": 42}}, max_len=64)
+    assert deep[deep_prefix] == {"long_lea": 42}
+
+
+def test_tqdm_callback_includes_efficiency_metrics_from_step_env_metrics():
+    """``TqdmCallback`` appends MFU / TFLOPs / step_time from ``step_env_metrics`` when present."""
+    from unittest.mock import MagicMock
+
+    trainer = SimpleNamespace(
+        step_train_metrics={"training/total_loss": 1.25},
+        step_env_metrics={
+            "mfu(%)": 42.5,
+            "tflops_per_gpu": 310.2,
+            "flops_achieved(T)": 2481.6,
+            "step_time(s)": 1.5,
+            "ignored_metric": 99.0,
+        },
+    )
+    cb = trace_callback_module.TqdmCallback(trainer)
+    cb.data_loader_tqdm = MagicMock()
+
+    cb.on_step_end(TrainerState(global_step=1))
+
+    cb.data_loader_tqdm.set_postfix_str.assert_called_once_with(
+        "total_loss: 1.25, mfu(%): 42.50, tflops_per_gpu: 310.20, flops_achieved(T): 2481.60, step_time(s): 1.50",
+        refresh=False,
+    )
+    cb.data_loader_tqdm.update.assert_called_once()

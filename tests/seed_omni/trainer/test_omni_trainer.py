@@ -66,14 +66,16 @@ def _accumulate_grads(num_micro_steps: int) -> torch.Tensor:
 
     trainer = OmniTrainer.__new__(OmniTrainer)
     trainer.model = SimpleNamespace(forward=forward, module_runtimes={})
-    trainer.args = SimpleNamespace(train=SimpleNamespace(enable_batch_invariant_mode=False))
+    trainer.args = SimpleNamespace(train=SimpleNamespace(enable_batch_invariant_mode=False, log_memory_steps=0))
     trainer.model_fwd_context = nullcontext()
     trainer.model_bwd_context = nullcontext()
     trainer.preforward = lambda micro_batch: micro_batch
 
-    micro_batch = {"x": torch.tensor([3.0, -1.0])}
+    # A fresh batch per micro-step: ``forward_backward_step`` clears the dict it is
+    # handed once the backward has consumed it, so reusing one would feed the
+    # second step an empty dict and raise KeyError('x').
     for _ in range(num_micro_steps):
-        trainer.forward_backward_step(micro_batch, num_micro_steps=num_micro_steps)
+        trainer.forward_backward_step({"x": torch.tensor([3.0, -1.0])}, num_micro_steps=num_micro_steps)
     return weight.grad
 
 

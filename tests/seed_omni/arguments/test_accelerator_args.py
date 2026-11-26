@@ -143,7 +143,12 @@ def test_the_generic_runtime_forwards_extra_parallel_only_to_the_builder(monkeyp
     "global_accelerator, module_override, expected_mode, expected_flag",
     [
         ({"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)}, {}, "eager", True),
-        ({"ep_size": 4}, {}, "eager", False),
+        # Inference defaults to `eager`, but an `ep` plan is compute parallelism
+        # that has to be built under a process group, and FSDP2 cannot wrap a
+        # layer that mixes storage dtypes -- so `OmniModuleRuntimeArguments`
+        # promotes it to `fsdp2` with the wrap dropped. See
+        # `test_inference_ep_or_emb_with_default_eager_normalizes_to_extra_parallel_only`.
+        ({"ep_size": 4}, {}, "fsdp2", True),
         (
             {"ep_size": 4},
             {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2", "extra_parallel_only": True}}},
@@ -172,7 +177,7 @@ def test_the_generic_runtime_forwards_extra_parallel_only_to_the_builder(monkeyp
     ],
     ids=[
         "global_no_wrap_stays_eager",
-        "global_ep_stays_eager_without_override",
+        "global_ep_normalizes_to_extra_parallel_only",
         "global_ep_explicit_fsdp2",
         "plain_eager",
         "explicit_ddp_ignores_extra_parallel_only",
@@ -494,6 +499,35 @@ def test_build_omni_model_runtime_args_rejects_top_level_dp_size_mismatch(monkey
     )
     with pytest.raises(ValueError, match="Top-level `model.accelerator` resolved to dp_size=4"):
         build_omni_model_runtime_args(args_sp2)
+
+
+def test_inference_ep_or_emb_with_default_eager_normalizes_to_extra_parallel_only(monkeypatch):
+    """An inference module that sets ``ep_size`` or ``emb`` without overriding
+    ``fsdp_mode='eager'`` is normalized to ``fsdp_mode='fsdp2', extra_parallel_only=True``."""
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    global_args = OmniModuleRuntimeArguments(model_path="/tmp/model")
+    modules = build_omni_module_runtime_args(
+        global_args,
+        "/tmp/model",
+        {
+            "ep_mod": {"accelerator": {"ep_size": 4}},
+            "emb_mod": {
+                "accelerator": {
+                    "extra_parallel_names": ["emb"],
+                    "extra_parallel_sizes": [8],
+                    "extra_parallel_placement_innermost": [False],
+                }
+            },
+            "eager_mod": {"model_path": "eager_mod"},
+        },
+        for_inference=True,
+    )
+    for name in ("ep_mod", "emb_mod"):
+        assert modules[name].needs_distributed_build is True
+        assert modules[name].accelerator.fsdp_config.fsdp_mode == "fsdp2"
+        assert modules[name].accelerator.fsdp_config.extra_parallel_only is True
+    assert modules["eager_mod"].needs_distributed_build is False
+    assert modules["eager_mod"].accelerator.fsdp_config.fsdp_mode == "eager"
 
 
 def test_skip_sp_gather_between_modules_is_global_and_propagates_to_modules(monkeypatch):

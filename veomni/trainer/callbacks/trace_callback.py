@@ -134,6 +134,24 @@ class MoERouterMonitorCallback(Callback):
             logger.info_rank0("MoE router monitor disabled.")
 
 
+def _trim_wandb_config_keys(obj: Any, prefix: str = "", max_len: int = 64) -> Any:
+    """Trim long leaf config keys (keeping at least 8 chars) so dot-flattened keys stay within ``max_len``."""
+    if not isinstance(obj, dict):
+        return obj
+    out: Dict[str, Any] = {}
+    for k, v in obj.items():
+        key_str = str(k)
+        full = f"{prefix}.{key_str}" if prefix else key_str
+        if isinstance(v, dict) and v:
+            out[key_str] = _trim_wandb_config_keys(v, full, max_len=max_len)
+        else:
+            if len(full) > max_len:
+                budget = max(max_len - (len(prefix) + 1 if prefix else 0), 8)
+                key_str = key_str[:budget]
+            out[key_str] = v
+    return out
+
+
 class WandbTraceCallback(Callback):
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         args: "VeOmniArguments" = self.trainer.args
@@ -142,12 +160,13 @@ class WandbTraceCallback(Callback):
 
             import wandb
 
+            raw_config = {**asdict(args.model), **asdict(args.data), **asdict(args.train)}
             wandb.init(
                 project=args.train.wandb.project,
                 name=args.train.wandb.name,
                 id=args.train.wandb.id,
                 resume="allow" if args.train.wandb.id else None,
-                config={**asdict(args.model), **asdict(args.data), **asdict(args.train)},
+                config=_trim_wandb_config_keys(raw_config),
             )
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
@@ -293,6 +312,11 @@ class TqdmCallback(Callback):
         self.data_loader_tqdm.close()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
-        postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in self.trainer.step_train_metrics.items())
+        display_metrics = dict(self.trainer.step_train_metrics)
+        env_metrics = getattr(self.trainer, "step_env_metrics", None) or {}
+        for key in ("mfu(%)", "tflops_per_gpu", "flops_achieved(T)", "step_time(s)"):
+            if key in env_metrics:
+                display_metrics[key] = env_metrics[key]
+        postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in display_metrics.items())
         self.data_loader_tqdm.set_postfix_str(postfix, refresh=False)
         self.data_loader_tqdm.update()

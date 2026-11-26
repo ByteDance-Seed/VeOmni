@@ -462,6 +462,7 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | dyn_bsz_physical_overflow_ratio | `float` | `1.5` | Physical-token cap multiplier used with `dyn_bsz_count_mode="effective"`: `ceil(micro_batch_size * max_seq_len * ratio)`. Values above `1.0` allow controlled physical overflow so effective-token batching does not degenerate into total-token batching. |
 | micro_batch_size | `int` | `1` | Number of samples per iteration on each device. |
 | global_batch_size | `Optional[int]` | `None` | Global batch size. If `None`, uses `micro_batch_size × dp_size`. |
+| loss_reduction | `Literal["sample_mean", "token_mean"]` | `"sample_mean"` | *SeedOmni (`OmniTrainingArguments`) only.* How a gradient-accumulation window is averaged: `"sample_mean"` weights every micro-batch equally; `"token_mean"` weights each micro-batch by its share of the window's shifted supervised tokens. |
 | num_train_epochs | `int` | `1` | Number of training epochs. |
 | pad_to_length | `bool` | `False` | Pad packed sequences to a fixed length (requires `dyn_bsz`). |
 | bsz_warmup_ratio | `float` | `0` | Ratio of batch size warmup steps. |
@@ -470,6 +471,7 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 | enable_batch_invariant_mode | `bool` | `False` | Enable batch invariant mode. |
 | sync_each_train_step | `bool` | `True` | Synchronize the accelerator before each training step's forward/backward work. Disable to allow async dataloader and H2D work to overlap with the next step. |
 | empty_cache_steps | `int` | `500` | Steps between device-cache cleanup calls. A non-positive value disables scheduled cleanup. |
+| log_memory_steps | `int` | `0` | *SeedOmni (`OmniTrainingArguments`) only.* Log allocated / peak / reserved device memory every N steps (`0` disables it). |
 | gc_steps | `int` | `500` | When positive, disable automatic Python GC and run `gc.collect()` every N steps. A non-positive value leaves automatic GC enabled and disables scheduled collection. |
 | eval_steps | `int` | `0` | Steps between evaluations. `0` to disable. |
 | eval_epochs | `int` | `1` | Epochs between evaluations. `0` to disable. |

@@ -644,6 +644,21 @@ class OmniTrainingArguments:
         default=None,
         metadata={"help": "Global batch size. If None, use `micro_batch_size` * `data_parallel_size`."},
     )
+    loss_reduction: Literal["sample_mean", "token_mean"] = field(
+        default="sample_mean",
+        metadata={
+            "help": (
+                "How a gradient-accumulation window is averaged. 'sample_mean' divides each "
+                "micro-batch by its own supervised-token count and then weights every micro-batch "
+                "equally, so a short sample and a long one contribute the same gradient; "
+                "'token_mean' divides once by the window's total supervised tokens, so every "
+                "token contributes equally and a sample's weight follows its length. Use "
+                "'token_mean' when sources differ wildly in length (a 86k-token trace next to a "
+                "9k-token answer): under 'sample_mean' the short source gets "
+                "len(long)/len(short) times the per-token gradient."
+            )
+        },
+    )
     num_train_epochs: int = field(
         default=1,
         metadata={"help": "Epochs to train."},
@@ -703,6 +718,16 @@ class OmniTrainingArguments:
     empty_cache_steps: int = field(
         default=500,
         metadata={"help": "Number of steps between two empty cache operations."},
+    )
+    log_memory_steps: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Log allocated / peak / reserved device memory every N steps, at the point where "
+                "every gradient is live. 0 disables it. Used by memory-budget runs, where the "
+                "question is how much headroom a configuration leaves rather than how fast it runs."
+            )
+        },
     )
     gc_steps: int = field(
         default=500,
@@ -764,6 +789,12 @@ class OmniTrainingArguments:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
+        if self.loss_reduction not in ("sample_mean", "token_mean"):
+            raise ValueError(
+                f"Unknown train.loss_reduction {self.loss_reduction!r}; expected 'sample_mean' or 'token_mean'."
+            )
+        if self.log_memory_steps < 0:
+            raise ValueError(f"train.log_memory_steps must be >= 0, got {self.log_memory_steps}.")
 
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))

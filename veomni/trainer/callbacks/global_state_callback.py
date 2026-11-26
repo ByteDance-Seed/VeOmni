@@ -36,6 +36,7 @@ export and the tokenizer/config sidecars are scheduled by
 On-disk contract: ``docs/usage/checkpoint.md``.
 """
 
+import faulthandler
 import os
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -54,6 +55,34 @@ if TYPE_CHECKING:
 
 
 logger = helper.create_logger(__name__)
+
+#: Seconds of forward progress at which the watchdog dumps every thread's stack.
+#: Armed from ``VEOMNI_RESUME_STALL_SECONDS``; 0 disables it.
+_STALL_WATCHDOG_SECONDS = 0
+
+
+def _arm_stall_watchdog(seconds: int) -> None:
+    """Restart the stall timer.
+
+    Any step that completes re-arms it, so the deadline always means "no progress
+    for this long" rather than "the run has taken this long". ``faulthandler``'s
+    dump goes to stderr and names every thread's frame, which is the only way to
+    tell a stalled collective from a slow one when the trainer prints nothing in
+    between.
+    """
+    global _STALL_WATCHDOG_SECONDS
+    prev = _STALL_WATCHDOG_SECONDS
+    _STALL_WATCHDOG_SECONDS = int(seconds)
+    if _STALL_WATCHDOG_SECONDS > 0:
+        _rearm_stall_watchdog()
+    elif prev > 0:
+        faulthandler.cancel_dump_traceback_later()
+
+
+def _rearm_stall_watchdog() -> None:
+    if _STALL_WATCHDOG_SECONDS > 0:
+        faulthandler.dump_traceback_later(_STALL_WATCHDOG_SECONDS, repeat=False)
+
 
 # Keys of ``state_dict`` that belong to ``loader/`` rather than ``extra_state/``.
 _LOADER_KEYS = ("train_dataloader",)
@@ -92,8 +121,14 @@ class GlobalStateCallback(Callback):
 
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self.load_global_state()
+        # Resume can stall before the first step, so arm the watchdog here as well
+        # and let every completed step push the deadline out.
+        _arm_stall_watchdog(int(os.getenv("VEOMNI_RESUME_STALL_SECONDS", "0")))
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
+        # A step finishing is progress: push the watchdog deadline out so a slow
+        # but moving run never trips it.
+        _rearm_stall_watchdog()
         dcp_due = self.dcp_every_n_steps and state.global_step % self.dcp_every_n_steps == 0
         hf_due = self.save_hf_weights and self.hf_every_n_steps and state.global_step % self.hf_every_n_steps == 0
         if dcp_due or hf_due:
@@ -112,6 +147,7 @@ class GlobalStateCallback(Callback):
                 )
 
     def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        _arm_stall_watchdog(0)
         if self.save_hf_weights:
             if state.global_step != self._last_saved_step:
                 self.save_global_state(state)
@@ -247,6 +283,22 @@ class GlobalStateCallback(Callback):
         if load_path is None:
             return None
 
+        # A resume that stalls leaves no trace: every step below can block on a
+        # collective, and the trainer prints nothing between the state-dict merge
+        # and `Start training`. A 128-card run once sat for six hours that way with
+        # all ranks parked on the same line. Dump every thread's stack after a
+        # bounded delay so a stall names the frame it is stuck in, and log each
+        # step so the last line printed bounds where it can be.
+        stall_seconds = int(os.getenv("VEOMNI_RESUME_STALL_SECONDS", "0"))
+        if stall_seconds > 0:
+            _arm_stall_watchdog(stall_seconds)
+        try:
+            return self._load_global_state(load_path)
+        finally:
+            if stall_seconds > 0:
+                _arm_stall_watchdog(0)
+
+    def _load_global_state(self, load_path: str) -> Optional[Dict[str, Any]]:
         state_path = layout.extra_state_path(load_path, self.rank)
         # A file that is present but unreadable is not the same as an absent one:
         # the reduction below treats absence as "resume weights only", which would
@@ -288,7 +340,9 @@ class GlobalStateCallback(Callback):
             offline_cache_writer.load_state_dict(offline_cache_writer_state)
 
         if self.trainer.train_dataloader is not None and global_state.get("train_dataloader") is not None:
+            logger.info_rank0("[resume] restoring the dataloader cursor")
             self.trainer.train_dataloader.load_state_dict(global_state["train_dataloader"])
+            logger.info_rank0("[resume] dataloader cursor restored")
 
         # OmniTrainer checkpoints written before it had a meter store None here.
         if global_state.get("environ_meter") is not None:

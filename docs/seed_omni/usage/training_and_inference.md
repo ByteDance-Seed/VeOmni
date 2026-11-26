@@ -134,6 +134,12 @@ Common overrides:
 
 - `--train.global_batch_size` / `--train.micro_batch_size`: global vs per-step
   micro batch.
+- `--train.loss_reduction`: how a gradient-accumulation window is averaged
+  (`sample_mean`, default, averages micro-batches equally; `token_mean` weights
+  each micro-batch by its share of the window's supervised tokens across the
+  loss-reduction group so long samples are not diluted by short ones).
+- `--train.log_memory_steps`: log rank-0 allocated / peak / reserved device
+  memory every N steps (`0` disables it).
 - `--data.max_seq_len`: packed sequence length.
 - `--train.checkpoint.output_dir`: run root; DCP checkpoints land in
   `<output_dir>/checkpoints/`.
@@ -141,6 +147,11 @@ Common overrides:
   save cadence.
 - `--train.wandb.enable false`: disable wandb for quick runs.
 - `--model.accelerator.fsdp_config.fsdp_mode`: the global FSDP mode.
+
+When `clip_grad_norm()` produces a non-finite norm (`NaN` or `Inf`),
+`OmniTrainer` logs a rank-0 warning and skips `optimizer.step()` for that step
+to protect model weights while still advancing the LR scheduler and zeroing
+gradients.
 
 ### Parallelism
 
@@ -178,6 +189,10 @@ bash train.sh tasks/omni/train_omni.py \
 ```
 
 The checkpoint layout is described in [Checkpointing](../../usage/checkpoint.md).
+Set `VEOMNI_RESUME_STALL_SECONDS=<N>` (default `0`, disabled) to enable a
+`faulthandler` stall watchdog in `GlobalStateCallback` that dumps every
+thread's stack trace to `stderr` if checkpoint resume or a training step makes
+no forward progress for `<N>` seconds.
 
 ## 5. Inference
 
