@@ -62,7 +62,7 @@ __all__ = [
 #: ``weight``; every other row is arithmetic that also works on projection modules.
 #: ``torchao`` serves FP8, NVFP4, and MXFP4; the format is its ``dtype`` argument
 #: and does not change whether it quantizes.
-QUANTIZING_IMPLS = frozenset({"qat", "torchao"})
+QUANTIZING_IMPLS = frozenset({"qat", "torchao", "deepgemm"})
 
 #: Activations each row implements, beyond the module shape check. A row absent
 #: here is held to ``eager``'s behaviour -- an unknown backend's activation support
@@ -72,6 +72,9 @@ ROW_ACTIVATIONS: dict[str, frozenset[str] | None] = {
     "eager": None,
     "qat": None,
     "torchao": None,
+    # Its Triton kernel fuses ``aten.silu`` into the grouped GEMM in both
+    # directions, so it cannot evaluate another activation.
+    "deepgemm": frozenset({"silu", "swish"}),
     "liger_kernel": frozenset({"silu"}),
 }
 

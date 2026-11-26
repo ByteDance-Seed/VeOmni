@@ -102,7 +102,7 @@ All fields below are under `model.accelerator.offload_config`.
 | `enable_activation` | `false` | Enable synchronous offload. |
 | `activation_gpu_limit` | `0.0` | Synchronous retained-activation threshold, in units of 1,024³ bytes. Use a non-negative value; this field is not validated. A negative value bypasses retention for eligible tensors (the small-tensor and weight-view exclusions still apply). Does not tune async mode. |
 | `enable_async_activation` | `false` | Enable asynchronous offload for CUDA/NPU tensors only; MLU tensors are not offloaded. Cannot be combined with `enable_activation`. |
-| `activation_offload_modules` | `[]` | Async module paths. Empty means discover module classes from `model._no_split_modules`. Missing metadata or no matches raises an error. |
+| `activation_offload_modules` | `[]` | Async module paths. Empty means discover classes from `model._activation_offload_target_classes` if defined, otherwise from `model._no_split_modules`. Missing metadata or no matches raises an error. |
 | `activation_offload_host_cache_limit_gb` | `4.0` | Async idle host-buffer cache cap per pool, in units of 1,024³ bytes. Must be finite and non-negative and fit the implementation's byte conversion bound. Zero disables reuse. |
 
 Module patterns are segment-aware: `model.layers.*` matches direct children only,
@@ -202,12 +202,25 @@ integration around the outer checkpoint call is needed before combining them.
 
 ### Automatic Module Discovery
 
-Offload targets are automatically derived from `model._no_split_modules` — the same
-class names used for FSDP sharding boundaries. This mirrors the FSDP enablement pattern
-where `_no_split_modules` determines sharding units automatically.
-For example, with Qwen3-MoE where `_no_split_modules = ["Qwen3MoeDecoderLayer"]`,
-all `Qwen3MoeDecoderLayer` instances are automatically identified as offload targets.
+Explicit `activation_offload_modules` patterns take precedence. When the list is
+empty, the framework reads the model class's optional
+`_activation_offload_target_classes` list in
+`apply_async_activation_offload` before FSDP2 wrapping. The list contains exact
+module class names. If the attribute is absent or `None`, discovery falls back to
+`_no_split_modules`. An empty list of target classes or no matching modules
+raises an error.
 
+Qwen3-MoE uses the fallback to select every `Qwen3MoeDecoderLayer` instance.
+MiniMax H3 sets the following targets because FSDP2 also wraps the parent DiT.
+
+```python
+_no_split_modules = ["MiniMaxH3DiTBlock", "MiniMaxH3DiT"]
+_activation_offload_target_classes = ["MiniMaxH3DiTBlock"]
+```
+
+For H3, automatic offload wraps only the blocks that own the checkpoint
+boundary. This keeps backward recomputation active and avoids overlapping
+offload hooks on the parent DiT and its children.
 
 ### Core API
 
@@ -226,7 +239,8 @@ apply_async_activation_offload(model, activation_offload_modules=[])
 Args:
 - `model`: The model to apply offloading to.
 - `activation_offload_modules`: Explicit module-name patterns, or `[]` to discover
-  targets from `model._no_split_modules`. Missing or unmatched targets raise an error.
+  targets from `model._activation_offload_target_classes` if defined, otherwise
+  from `model._no_split_modules`. Missing or unmatched targets raise an error.
 - `host_cache_limit_bytes`: Optional idle pinned-buffer cache budget for this call.
 - `host_buffer_pool`: Optional shared `PinnedBufferPool` for multiple model roots;
   mutually exclusive with `host_cache_limit_bytes`.
@@ -267,15 +281,29 @@ lifecycle across GPU and CPU:
 1. **Creation:** A pinned CPU buffer (`tensor_cpu`) is allocated matching the tensor's
    shape and dtype.
 2. **D2H (launch_d2h):** On the swap stream, copy GPU tensor to pinned CPU buffer
-   (non-blocking). Record a `d2h_event` for synchronization.
-3. **Wait D2H (wait_d2h_finished):** After the D2H transfer completes, bind the tensor
-   to fresh empty storage. Aliases may keep its original allocation alive.
+   (non-blocking). `record_stream` is called only when `_deferred_free_supported()`
+   confirms the native caching allocator owns the storage, so other backends never
+   see it for external pointers. Record a `d2h_event` and store it on the host
+   buffer as `_last_swap_event`.
+3. **Wait D2H (wait_d2h_finished):** Detach the GPU storage by binding the tensor to
+   fresh empty storage. With CUDA's **native** caching allocator this does **not**
+   host-synchronize: `record_stream` already keeps the source storage alive, so the
+   copy is ordered by the stream. Every other case keeps the event synchronize,
+   because `record_stream` cannot defer a free there: NPU and MLU allocators, CUDA's
+   async allocator, `PYTORCH_NO_CUDA_MEMORY_CACHING`, foreign storage
+   (`from_numpy` / `from_dlpack` / `frombuffer`) and copy-on-write tensors
+   (`torch._lazy_clone`).
 4. **H2D (launch_h2d):** On the swap stream, allocate new device storage with the
    saved size/stride, copy from the pinned CPU buffer (non-blocking), and bind
-   the tensor to that restored storage. Record an `h2d_event`.
+   the tensor to that restored storage. Record an `h2d_event`, also stored on the
+   host buffer as `_last_swap_event`.
 5. **Wait H2D:** The default stream waits on `h2d_event` before accessing the tensor.
 
 State transitions: `device` → (D2H) → `host` → (H2D) → `device`
+
+The `_last_swap_event` tag is what lets the host pool stay asynchronous: a buffer is
+waited on only when handed to a new owner or when dropped or evicted. Both waits run
+outside the pool lock, and the tag is popped so a completed event is not retained.
 
 #### OffloadManager Ownership
 

@@ -906,12 +906,12 @@ class TestMaterializeAndLoadDispatch:
         [
             ({}, False, "plain"),
             ({"broadcast_from_rank0": True}, False, "broadcast"),
-            ({"ep_sharded_stream_load": True}, True, "ep_sharded"),
-            # ``ep_sharded_stream_load`` is set once per run but this helper runs
+            ({"extra_parallel_stream_load": True}, True, "ep_sharded"),
+            # ``extra_parallel_stream_load`` is set once per run but this helper runs
             # once per model, so a model with no ExtraParallel plan -- every
             # SeedOmni V2 sub-module that owns no experts -- must fall through to
             # the loader it would have used anyway, not raise.
-            ({"ep_sharded_stream_load": True}, False, "plain"),
+            ({"extra_parallel_stream_load": True}, False, "plain"),
         ],
     )
     def test_dispatches_to_one_loader(self, loaders, monkeypatch, flags, has_plan, expected):
@@ -3140,3 +3140,36 @@ class TestMarkerValidationAcrossRanks:
         # reduction's verdict. Neither succeeds.
         assert "FileNotFoundError" in outcomes[1], outcomes
         assert all(o != "completed" for o in outcomes), outcomes
+
+
+def _extra_parallel_only_dcp_worker(rank: int, world_size: int, ckpt_dir: str, endpoint) -> None:
+    dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=world_size)
+    try:
+        from torch.distributed.device_mesh import init_device_mesh
+
+        from veomni.checkpoint.dcp_checkpointer import drop_extra_parallel_dim, restore_extra_parallel_dim
+
+        rows, cols = 3, 5
+        mesh = init_device_mesh("cpu", (1, world_size), mesh_dim_names=("emb_fsdp", "emb"))
+        fsdp_submesh = mesh["emb_fsdp"]
+        local = torch.arange(rows * cols, dtype=torch.float32).view(rows, cols) + 100 * rank
+
+        saved = restore_extra_parallel_dim(local.clone(), mesh, fsdp_submesh, ep_shard_dim=0, extra_parallel_only=True)
+        assert saved.shape == (world_size * rows, cols)
+        dcp.save({"table": saved}, checkpoint_id=ckpt_dir)
+
+        target = restore_extra_parallel_dim(
+            torch.zeros_like(local), mesh, fsdp_submesh, ep_shard_dim=0, extra_parallel_only=True
+        )
+        state = {"table": target}
+        dcp.load(state, checkpoint_id=ckpt_dir)
+        torch.testing.assert_close(drop_extra_parallel_dim(state["table"], fsdp_submesh), local)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="gloo required")
+@pytest.mark.launch_plan(provider=_CI_CPU_PROMOTION)
+def test_unwrapped_extra_parallel_slices_survive_save_and_load(tmp_path):
+    """Under ``extra_parallel_only``, plain per-rank slices round-trip via DCP on the ExtraParallel dim."""
+    spawn_with_rendezvous(_extra_parallel_only_dcp_worker, args=(4, str(tmp_path / "ckpt")), nprocs=4)

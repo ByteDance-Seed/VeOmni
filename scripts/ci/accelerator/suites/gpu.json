@@ -2,7 +2,12 @@
   {
     "name": "distributed-default-gloo-group",
     "suite": "unit",
-    "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_dist_utils_group.py"
+    ]
   },
   {
     "name": "01-unit",
@@ -68,7 +73,8 @@
       "-v",
       "-s",
       "-x",
-      "tests/utils/test_fsdp2_clip_grad_norm.py"
+      "tests/utils/test_fsdp2_clip_grad_norm.py",
+      "tests/utils/test_selective_expert_cpu_offload.py"
     ]
   },
   {
@@ -139,6 +145,16 @@
       "-s",
       "-x",
       "tests/parallel/ulysses/test_qwen4_exp_ulysses.py"
+    ]
+  },
+  {
+    "name": "08b-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_kimi_k3_vision_tower_sp.py"
     ]
   },
   {
@@ -291,7 +307,7 @@
     "args": [
       "-s",
       "-x",
-      "tests/utils/test_extra_parallel_clip_grad_norm.py"
+      "tests/utils/test_extra_parallel.py"
     ]
   },
   {
@@ -302,26 +318,6 @@
       "-s",
       "-x",
       "tests/utils/test_rank0_load_and_broadcast_weights.py"
-    ]
-  },
-  {
-    "name": "25-unit",
-    "suite": "unit",
-    "conditional": false,
-    "args": [
-      "-s",
-      "-x",
-      "tests/utils/test_moe_ep_sharded_load_matrix.py"
-    ]
-  },
-  {
-    "name": "26-unit",
-    "suite": "unit",
-    "conditional": false,
-    "args": [
-      "-s",
-      "-x",
-      "tests/utils/test_ep_sharded_expert_stream_load.py"
     ]
   },
   {
@@ -605,16 +601,6 @@
       "-s",
       "-x",
       "tests/lora/test_moe_lora_ep2.py"
-    ]
-  },
-  {
-    "name": "54-unit",
-    "suite": "unit",
-    "conditional": false,
-    "args": [
-      "-s",
-      "-x",
-      "tests/lora/test_moe_lora_ep_sharded_stream_load.py"
     ]
   },
   {

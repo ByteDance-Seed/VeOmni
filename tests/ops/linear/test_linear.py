@@ -30,8 +30,8 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_linear_registry_entries():
-    assert OP_REGISTRY.list_registered("linear", "standard") == ["eager", "qat", "torchao"]
-    assert OP_REGISTRY.list_registered("linear", "grouped") == ["eager", "qat"]
+    assert OP_REGISTRY.list_registered("linear", "standard") == ["eager", "qat", "torchao", "deepgemm"]
+    assert OP_REGISTRY.list_registered("linear", "grouped") == ["eager", "qat", "deepgemm"]
     assert OP_REGISTRY.default_impl("linear", "standard", device="cpu") == "eager"
     assert OP_REGISTRY.default_impl("linear", "grouped", device="cpu") == "eager"
 
@@ -349,3 +349,53 @@ def test_linear_torchao_mxfp4_forward_and_backward_round_trip():
         assert x.grad is not None and torch.isfinite(x.grad).all()
         assert linear.weight.grad is not None and torch.isfinite(linear.weight.grad).all()
         torch.testing.assert_close(linear.bias.grad, torch.full_like(linear.bias.grad, 10.0))
+
+
+def test_the_deepgemm_rows_declare_deep_gemm_on_sm90_or_sm100():
+    """Read the registered metadata rather than resolving the handle.
+
+    Whether resolution *fails* depends on the host this runs on, and this file also
+    runs on GPU CI workers where the row legitimately resolves.
+    """
+    for variant in ("standard", "grouped"):
+        entries = {entry.impl: entry for entry in OP_REGISTRY.list_entries("linear", variant)}
+        assert "deepgemm" in entries, variant
+        entry = entries["deepgemm"]
+        assert entry.requires == ("deep_gemm", "triton"), variant
+        # SM90 and SM100 named explicitly: SM89 has an E4M3 type but no DeepGEMM
+        # kernel, so it must not satisfy this requirement.
+        platforms = entry.requirement.platforms
+        assert {(p.min_cc, p.max_cc) for p in platforms} == {(90, 90), (100, 100)}, variant
+
+
+def test_the_deepgemm_row_refuses_a_linear_subclass_projection():
+    """``resolve_projection`` refuses a subclass for a quantizing row, unchanged by this row.
+
+    ``FSDPLinear`` from ``basic_modules`` unshards its weight inside ``forward``; a
+    row that reads ``module.weight`` would get one rank's shard. The check lives in
+    the shared resolver, so this asserts the new row inherits it rather than
+    reimplementing it.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.linear._module import resolve_projection
+
+    class _Subclass(nn.Linear):
+        pass
+
+    with pytest.raises(ValueError, match="nn.Linear subclass"):
+        resolve_projection("deepgemm", _Subclass(8, 4, bias=False), torch.randn(2, 8))
+
+
+@pytest.mark.parametrize("block_size", [32, 64])
+def test_the_deepgemm_rows_refuse_a_block_size_they_cannot_honor(block_size: int):
+    """``qat`` honors ``block_size``; ``deepgemm``'s recipe is fixed at 128.
+
+    Accepting and ignoring the keyword would make one field mean two different
+    recipes depending on which row the config selected.
+    """
+    from veomni.ops.kernels.linear import standard as linear_standard
+
+    linear = torch.nn.Linear(256, 256, bias=False, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="only block_size=128"):
+        linear_standard.deepgemm.wrapper(linear, torch.randn(2, 256, dtype=torch.bfloat16), block_size=block_size)
