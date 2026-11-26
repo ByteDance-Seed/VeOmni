@@ -798,6 +798,7 @@ def _runtime_plan_mismatch_worker(rank, endpoint):
 
     import veomni.distributed.torch_parallelize as parallelize_module
     import veomni.models.model_runtime as runtime_module
+    from veomni.arguments.arguments_types import AcceleratorConfig
     from veomni.distributed.parallel_plan import ParallelPlan
 
     dist.init_process_group("gloo", store=endpoint.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=30))
@@ -826,7 +827,7 @@ def _runtime_plan_mismatch_worker(rank, endpoint):
         runtime_module.get_parallel_state_by_name = lambda _name: state
         parallelize_module.get_parallel_state = lambda: state
         checkpoint = SimpleNamespace(extra_parallel_canonical_layout=True)
-        args = SimpleNamespace(optimizer=SimpleNamespace(type="adamw"))
+        args = SimpleNamespace(optimizer=SimpleNamespace(type="adamw"), accelerator=AcceleratorConfig())
         with pytest.raises(RuntimeError, match="requires an ExtraParallel model plan"):
             TestRuntime(args, train=SimpleNamespace(checkpoint=checkpoint))
         completed = torch.tensor(1)
