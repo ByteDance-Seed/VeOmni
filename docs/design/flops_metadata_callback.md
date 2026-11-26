@@ -7,14 +7,14 @@ callback. HF models retain their existing metadata handling without a callback.
 ## Callback contract
 
 Register a function under the config's `model_type` in
-[`FLOPS_METADATA_CALLBACKS`](../../veomni/utils/flops_meter.py#L94). The meter
+[`FLOPS_METADATA_CALLBACKS`](../../veomni/utils/flops_meter.py#L96). The meter
 selects it during [`EnvironMeter.__init__`](../../veomni/utils/helper.py#L211)
 and calls it from [`add`](../../veomni/utils/helper.py#L276), once per input
 micro-batch. Callbacks receive the same input supplied to `add`: a batch
 dictionary or a list of batch dictionaries, depending on the training path.
 The default DiT callback preserves the existing dictionary-based latent path.
 
-[`get_flops_metadata_callback`](../../veomni/utils/flops_meter.py#L100) returns
+[`get_flops_metadata_callback`](../../veomni/utils/flops_meter.py#L102) returns
 `None` for configs without `condition_model_type`. For DiT configs it looks up
 the model type, falling back to the registered `__default_dit__` callback,
 which uses the existing [`_compute_wan_seqlens`](../../veomni/utils/flops_meter.py#L23)
@@ -65,13 +65,13 @@ Its signature accepts `(tokens_sum, batch_seqlens, delta_time, model_metadata=No
 when metadata is available it reads `model_metadata["text_lengths"]` and returns
 estimated TFLOPS. It also handles `None` for a step with no metadata. The counter
 supplies device peak FLOPS separately. See the
-[callback registration test](../../tests/utils/test_count_flops.py#L305) for a
+[callback registration test](../../tests/utils/test_count_flops.py#L320) for a
 complete callback and estimator example.
 
 For MiniMax-H3, [`_extract_minimax_h3_metadata`](../../veomni/utils/flops_meter.py#L48)
 extracts main and text-refiner lengths from offline video `packed` data. For
-offline H3-Image, it counts text rows and target/reference image patches from the
-cached tensor shapes. The existing
+offline H3-Image, it counts text rows and target/reference image patches from
+cached latents shaped `[1, C, H, W]`. It skips rows with other latent shapes. The existing
 [`VeomniFlopsCounter`](../../veomni/utils/count_flops.py#L73) calculates the
 formula. H3 online training can produce these tensors or packed metadata only
 after the meter runs; if no rank has usable lengths, the reported MFU is zero.

@@ -15,6 +15,7 @@ from transformers import AutoProcessor
 from veomni.distributed.parallel_state import get_parallel_state, is_parallel_state_initialized
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.utils import logging
+from veomni.utils.device import is_nvidia_cuda_device
 
 from ...minimax_h3.minimax_h3_core.flow_match_scheduler import FlowMatchScheduler
 from ..layout import (
@@ -42,6 +43,10 @@ def _init_empty_weights():
     from ...minimax_h3.minimax_h3_condition._module_utils import init_empty_weights
 
     return init_empty_weights()
+
+
+def _copy_host_values(values, device, dtype):
+    return torch.tensor(values, device="cpu", dtype=dtype).to(device, non_blocking=is_nvidia_cuda_device(device))
 
 
 def _state_dict_iterator(filepath: str):
@@ -223,7 +228,7 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
         token_ids += prompt_ids
         token_tags += [MINIMAX_H3_TEXT_TAG] * len(prompt_ids)
 
-        input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
+        input_ids = _copy_host_values([token_ids], device, torch.long)
         kwargs = {
             "input_ids": input_ids,
             "attention_mask": torch.ones_like(input_ids),
@@ -256,13 +261,16 @@ class MiniMaxH3ImageConditionModel(PreTrainedModel):
         image = image.crop((left, top, left + target_width, top + target_height))
 
         device = self._vae.device
-        pixels = torch.from_numpy(np.array(image)).to(device, torch.float32).permute(2, 0, 1)[None].div(255.0)
-        pixel_mean = pixels.new_tensor(PIXEL_MEAN).view(1, -1, 1, 1)
-        pixel_std = pixels.new_tensor(PIXEL_STD).view(1, -1, 1, 1)
+        pixels = torch.from_numpy(np.array(image)).to(
+            device, torch.float32, non_blocking=is_nvidia_cuda_device(device)
+        )
+        pixels = pixels.permute(2, 0, 1)[None].div(255.0)
+        pixel_mean = _copy_host_values(PIXEL_MEAN, device, pixels.dtype).view(1, -1, 1, 1)
+        pixel_std = _copy_host_values(PIXEL_STD, device, pixels.dtype).view(1, -1, 1, 1)
         posterior = self._vae.encode((pixels - pixel_mean) / pixel_std, return_dict=False)[0]
         latents = posterior.mode().float()
-        latents_mean = latents.new_tensor(self._vae.config.latents_mean).view(1, -1, 1, 1)
-        latents_std = latents.new_tensor(self._vae.config.latents_std).view(1, -1, 1, 1)
+        latents_mean = _copy_host_values(self._vae.config.latents_mean, device, latents.dtype).view(1, -1, 1, 1)
+        latents_std = _copy_host_values(self._vae.config.latents_std, device, latents.dtype).view(1, -1, 1, 1)
         return {
             "prompt_embeds": [prompt_embeds],
             "text_token_tags": [text_token_tags],

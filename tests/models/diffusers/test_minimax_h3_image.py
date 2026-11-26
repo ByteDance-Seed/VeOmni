@@ -125,7 +125,7 @@ def test_minimax_h3_image_forward_backpropagates_to_image_and_text_rows(checkpoi
     assert len(forward_calls) == (2 if checkpointing else 1)
 
 
-def _run_minimax_h3_image_fsdp_forward(rank, weights_path, checkpointing, rendezvous):
+def _run_minimax_h3_image_fsdp_forward(rank, weights_path, checkpointing, param_dtype, rendezvous):
     from datetime import timedelta
 
     import torch.distributed as dist
@@ -175,25 +175,43 @@ def _run_minimax_h3_image_fsdp_forward(rank, weights_path, checkpointing, rendez
             weights_path=str(weights_path),
             init_device="meta",
             mixed_precision=MixedPrecisionConfig(
-                enable=True, param_dtype="float32", reduce_dtype="float32", cast_forward_inputs=False
+                enable=True, param_dtype=param_dtype, reduce_dtype="float32", cast_forward_inputs=False
             ),
             enable_gradient_checkpointing=checkpointing,
         ).train()
-        block_calls = []
-        production.dit.blocks[0].register_forward_pre_hook(lambda *_: block_calls.append(1))
+        block_dtypes, head_calls = [], []
+        production.dit.blocks[0].attn.qkv_proj.register_forward_pre_hook(
+            lambda module, args: block_dtypes.append(module.weight.dtype)
+        )
+
+        def check_pdd_head(module, index):
+            head_calls.append(index)
+            expected_head = reference.dit.final_layer.pdd_out[index]
+            torch.testing.assert_close(module.weight, expected_head.weight, rtol=0, atol=0)
+            torch.testing.assert_close(module.bias, expected_head.bias, rtol=0, atol=0)
+
+        for index, head in enumerate(production.dit.final_layer.pdd_out):
+            head.register_forward_pre_hook(lambda module, args, index=index: check_pdd_head(module, index))
+
         for step in range(2):
             production.zero_grad(set_to_none=True)
             inputs["x"].grad = None
             inputs["prompt_embeds"].grad = None
+            block_dtypes.clear()
+            head_calls.clear()
             pdd_step_index = (rank + step) % 2
             actual = production(**inputs, pdd_step_index=pdd_step_index)
-            with torch.no_grad():
-                expected = reference(**inputs, pdd_step_index=pdd_step_index)
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            forward_calls = len(block_calls)
+            assert actual.dtype == torch.float32 and torch.isfinite(actual).all()
+            if param_dtype == "float32":
+                with torch.no_grad():
+                    expected = reference(**inputs, pdd_step_index=pdd_step_index)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            forward_calls = len(block_dtypes)
             actual.square().mean().backward()
             if checkpointing:
-                assert len(block_calls) > forward_calls
+                assert len(block_dtypes) > forward_calls
+            assert set(block_dtypes) == {getattr(torch, param_dtype)}
+            assert head_calls == [pdd_step_index]
             assert inputs["x"].grad is not None and torch.isfinite(inputs["x"].grad).all()
             gradients = [parameter.grad for parameter in production.parameters() if parameter.grad is not None]
             assert gradients and all(torch.isfinite(gradient.to_local()).all() for gradient in gradients)
@@ -208,11 +226,11 @@ def _run_minimax_h3_image_fsdp_forward(rank, weights_path, checkpointing, rendez
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
-@pytest.mark.parametrize("checkpointing", [False, True])
-def test_minimax_h3_image_forward_through_fsdp2(tmp_path, checkpointing):
+@pytest.mark.parametrize("checkpointing,param_dtype", [(False, "float32"), (True, "float32"), (True, "bfloat16")])
+def test_minimax_h3_image_forward_through_fsdp2(tmp_path, checkpointing, param_dtype):
     from tests.tools.launch_utils import spawn_with_rendezvous
 
-    spawn_with_rendezvous(_run_minimax_h3_image_fsdp_forward, args=(tmp_path, checkpointing), nprocs=2)
+    spawn_with_rendezvous(_run_minimax_h3_image_fsdp_forward, args=(tmp_path, checkpointing, param_dtype), nprocs=2)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

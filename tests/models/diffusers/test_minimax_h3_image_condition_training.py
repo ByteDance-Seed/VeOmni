@@ -214,6 +214,38 @@ def test_t2i_rejects_invalid_training_geometry_and_microbatch():
         model.get_condition(["A rectangle"], [[]])
 
 
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"height": 0}, "positive multiples of 32"),
+        ({"width": 48}, "positive multiples of 32"),
+        ({"pdd_sigmas": [1.0, 0.2, 0.5, 0.0]}, "must strictly decrease"),
+        ({"pdd_sigmas": [1.0, 0.5, 0.0], "num_pdd_heads": 6}, "2 transitions.*6 PDD heads"),
+        ({"num_pdd_heads": 2}, "6 transitions.*2 PDD heads"),
+    ],
+)
+def test_t2i_condition_config_rejects_invalid_load_overrides(tmp_path, overrides, error):
+    path = tmp_path / "condition.json"
+    _condition_model().config.to_json_file(path, use_diff=False)
+    with pytest.raises(ValueError, match=error):
+        MiniMaxH3ImageConditionModelConfig.from_pretrained(path, **overrides)
+
+
+def test_t2i_condition_config_uses_effective_load_overrides(tmp_path):
+    path = tmp_path / "condition.json"
+    saved = _condition_model().config
+    saved.to_json_file(path, use_diff=False)
+    restored = MiniMaxH3ImageConditionModelConfig.from_pretrained(path)
+    assert restored.pdd_sigmas == DEFAULT_SIGMAS and restored.num_pdd_heads == 6
+
+    overridden = MiniMaxH3ImageConditionModelConfig.from_pretrained(
+        path, height=512, width=256, pdd_sigmas=[1.0, 0.5, 0.0]
+    )
+    assert (overridden.height, overridden.width) == (512, 256)
+    assert overridden.pdd_sigmas == (1.0, 0.5, 0.0)
+    assert overridden.num_pdd_heads == 2
+
+
 @pytest.mark.parametrize("sigmas", [(1.0, 0.4, 0.6, 0.0), (1.0, 0.9, 0.1), (0.9, 0.4, 0.0)])
 def test_t2i_rejects_invalid_pdd_schedule(sigmas):
     with pytest.raises(ValueError, match="PDD sigmas must strictly decrease from 1 to 0"):

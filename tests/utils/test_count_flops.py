@@ -192,6 +192,21 @@ def test_minimax_h3_image_meter_counts_offline_cache(monkeypatch, mock_device_fl
     assert metrics["consumed_chunk_num"] == 1
 
 
+@pytest.mark.parametrize("video_field", ["clean_latents", "reference_latents"])
+def test_minimax_h3_image_meter_skips_video_latents(video_field):
+    import torch
+
+    from veomni.utils.flops_meter import get_flops_metadata_callback
+
+    config = _minimax_h3_config()
+    config.condition_model_type = "MiniMaxH3ImageConditionModel"
+    image = torch.zeros(1, 24, 8, 12)
+    video = torch.zeros(1, 24, 3, 8, 12)
+    sample = {"prompt_embeds": [torch.zeros(1, 5, 16)], "clean_latents": [image], "reference_latents": [[image]]}
+    invalid = dict(sample, **{video_field: [video] if video_field == "clean_latents" else [[video]]})
+    assert get_flops_metadata_callback(config)([invalid, sample]) == ([53], {"h3_text_seqlens": [5]})
+
+
 def test_minimax_h3_meter_accumulates_and_clears_packed_lengths(monkeypatch, mock_device_flops):
     from veomni.utils import helper
 

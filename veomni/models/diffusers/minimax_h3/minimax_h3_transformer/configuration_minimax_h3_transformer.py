@@ -56,3 +56,11 @@ class MiniMaxH3DiTModelConfig(VeOmniPretrainedConfig):
         self.final_norm_eps = final_norm_eps
         self.audio_enabled = audio_enabled
         self.num_pdd_heads = num_pdd_heads
+
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        config_dict = dict(config_dict)
+        for name in ("condition_model_type", "audio_enabled", "num_pdd_heads"):
+            if name in kwargs:
+                config_dict[name] = kwargs.pop(name)
+        return super().from_dict(config_dict, **kwargs)

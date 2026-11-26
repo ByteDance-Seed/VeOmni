@@ -11,7 +11,7 @@ from scripts.ci.accelerator.launch_plan import LaunchSpec
 from scripts.prepare_minimax_h3_image_t2i import prepare_checkpoint
 from tests.models.tiny_configs import tiny_minimax_h3_config
 from tests.tools.training_utils import make_eager_ops_config
-from veomni.models import build_foundation_model, load_model_weights
+from veomni.models import build_config, build_foundation_model, load_model_weights
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import MiniMaxH3DiTModel
 from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_condition.configuration_minimax_h3_image_condition import (
     MiniMaxH3ImageConditionModelConfig,
@@ -23,6 +23,25 @@ from veomni.models.diffusers.minimax_h3_image.pdd import DEFAULT_SIGMAS
 
 
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def test_h3_image_dit_config_validates_effective_condition_type(tmp_path, monkeypatch):
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
+    saved = tiny_minimax_h3_config()
+    saved.save_pretrained(tmp_path)
+    ops = make_eager_ops_config()
+    legacy = build_config(str(tmp_path), ops_implementation=ops)
+    assert legacy.condition_model_type == "MiniMaxH3ConditionModel"
+    assert legacy.audio_enabled and legacy.num_pdd_heads == 0
+
+    overrides = {"condition_model_type": "MiniMaxH3ImageConditionModel", "audio_enabled": False, "num_pdd_heads": 2}
+    for invalid_override in ({"audio_enabled": True}, {"num_pdd_heads": 0}):
+        with pytest.raises(ValueError, match="audio-free DiT with PDD heads"):
+            build_config(str(tmp_path), ops_implementation=ops, **(overrides | invalid_override))
+
+    image = build_config(str(tmp_path), ops_implementation=ops, **overrides)
+    assert image.condition_model_type == "MiniMaxH3ImageConditionModel"
+    assert not image.audio_enabled and image.num_pdd_heads == 2
 
 
 @pytest.fixture

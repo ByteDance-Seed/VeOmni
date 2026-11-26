@@ -41,3 +41,13 @@ class MiniMaxH3ImageConditionModelConfig(VeOmniPretrainedConfig):
         self.seed = seed
         self.pdd_sigmas = validate_pdd_sigmas(pdd_sigmas, num_pdd_heads)
         self.num_pdd_heads = len(self.pdd_sigmas) - 1
+
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        config_dict = dict(config_dict)
+        if "pdd_sigmas" in kwargs and "num_pdd_heads" not in kwargs:
+            config_dict.pop("num_pdd_heads", None)
+        for name in ("height", "width", "pdd_sigmas", "num_pdd_heads"):
+            if name in kwargs:
+                config_dict[name] = kwargs.pop(name)
+        return super().from_dict(config_dict, **kwargs)

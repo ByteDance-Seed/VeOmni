@@ -103,11 +103,13 @@ Cache first on a device with enough room to hold the truncated BF16 text encoder
 
 For a training target, bilinear cover resizing preserves the source aspect ratio before center-cropping to the configured `height` and `width`. The crop fixes the canvas and can cut content near the edges. Training uses the VAE posterior mode so cache creation is deterministic and does not consume training noise RNG. Inference references serve a different purpose: they are resized by short-edge bounds with bicubic interpolation to preserve their composition, and use posterior samples as in the release.
 
+The eight-rank recipe below needs at least eight cached rows to form a complete data-parallel batch. Before running the embedding command, duplicate the five *data rows* in the CSV once, keeping a single header. If you already cached five rows, editing the CSV is not enough: rerun the embedding stage with the expanded CSV into a fresh `data.offline_embedding_save_dir` and point the offline training YAML's `data.train_path` there.
+
 ```shell
 NPROC_PER_NODE=1 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_t2i_embedding.yaml
 ```
 
-The second stage loads the DiT without the text encoder or VAE. The reference config uses FP32 throughout to preserve the release projections. With about 33B parameters, weights, gradients, and the two AdamW moments alone account for about 62 GiB per rank across eight ranks, before activations and FSDP2 all-gathers. This is a memory estimate, not a measured peak. The meta-initialized FSDP2 config needs at least two ranks. Set the global batch size to the number of data-parallel ranks for this smoke run. The iterable loader requires at least one cached row per data-parallel rank to form a complete batch. If using eight ranks with the five-image sample, duplicate the five *data rows* in the CSV before caching (keep one header).
+The second stage loads the DiT without the text encoder or VAE. The reference config uses FP32 throughout to preserve the release projections. With about 33B parameters, weights, gradients, and the two AdamW moments alone account for about 62 GiB per rank across eight ranks, before activations and FSDP2 all-gathers. This is a memory estimate, not a measured peak. The meta-initialized FSDP2 config needs at least two ranks. Set the global batch size to the number of data-parallel ranks for this smoke run.
 
 ```shell
 NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_t2i_offline.yaml \
@@ -120,9 +122,13 @@ The smoke config does not save weights. For longer runs, set a positive `train.c
 
 Use the prepared transformer and the same `image,prompt` CSV directly. The online path calls the frozen text encoder and VAE on every sample, then uses the same condition processing and loss as offline training. No embedding-cache stage is needed.
 
+The meter sees the raw prompts and images before encoding, so it reports zero MFU, token throughput, and `consumed_chunk_num` for this online recipe. This does not indicate a failed training step.
+
+The CUDA sync test checks for implicit synchronization calls. Copies of CPU noise, schedules, and input data can still stall during staging from pageable memory; passing this test does not establish copy/compute overlap.
+
 The online reference keeps the same FP32 DiT training policy as the offline config and additionally holds about 50.2 GiB of frozen encoder/VAE parameters on each rank. For eight ranks, the weights, gradients, and AdamW moments estimated above plus those encoders exceed 112 GiB per rank before activations and communication buffers. Use hardware with sufficient memory or increase the shard count; this full-parameter recipe does not fit an eight-rank 64 GiB node. Tiny-DiT online validation on a single 64 GiB Ascend NPU does not establish released-33B training capacity.
 
-As with offline training, the CSV must contain at least one row per data-parallel rank. For the eight-rank command below, duplicate the five sample rows once, keeping one header.
+As with offline training, the CSV must contain at least one row per data-parallel rank. If it still contains only the original five sample rows, duplicate them once and keep one header before running the eight-rank command.
 
 ```shell
 NPROC_PER_NODE=8 uv run bash train.sh tasks/train_dit.py configs/dit/minimax_h3_image_t2i_online.yaml \

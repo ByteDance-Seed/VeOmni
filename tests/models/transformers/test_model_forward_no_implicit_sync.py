@@ -983,9 +983,9 @@ def test_no_implicit_sync_in_minimax_h3_forward_backward(mode, attention, cfg_mo
     _assert_no_minimax_h3_step_syncs(model, step, mode, attention)
 
 
-@pytest.mark.parametrize("condition_source", ["cached_references", "online_t2i"])
+@pytest.mark.parametrize("condition_source", ["cached_references", "post_encode_t2i", "online_raw_t2i"])
 def test_no_implicit_sync_in_minimax_h3_image_forward_backward(condition_source):
-    """Gate cached and online-encoded inputs through H3-Image conditioning and DiT."""
+    """Gate cached, post-encode and raw-input H3-Image training steps."""
     if not IS_CUDA_AVAILABLE:
         pytest.skip("CUDA required.")
 
@@ -999,18 +999,36 @@ def test_no_implicit_sync_in_minimax_h3_image_forward_backward(condition_source)
     torch.manual_seed(0)
     condition = _condition_model().to(device)
     batch = dict(_cached_batch())
+    raw_inputs = None
+    latents_dim = batch["clean_latents"][0].shape[1]
+    text_dim = batch["prompt_embeds"][0].shape[-1]
     if condition_source == "cached_references":
         batch["reference_latents"] = [batch["clean_latents"]]
         batch = _to_device_recursive(batch, device)
-    else:
+    elif condition_source == "post_encode_t2i":
         for name in ("prompt_embeds", "clean_latents"):
             batch[name] = _to_device_recursive(batch[name], device)
+    else:
+        from PIL import Image
+
+        from tests.models.diffusers.test_minimax_h3_image import _tiny_vae
+
+        class TinyTextEncoder(torch.nn.Embedding):
+            def forward(self, input_ids, attention_mask):
+                return super().forward(input_ids[0])
+
+        condition._tokenizer = lambda *args, **kwargs: {"input_ids": [0, 1, 2]}
+        condition._text_encoder = TinyTextEncoder(3, text_dim, device=device, dtype=torch.bfloat16).eval()
+        condition._vae = _tiny_vae().to(device).eval()
+        latents_dim = condition.vae.config.latent_channels
+        raw_inputs = {"inputs": ["A rectangle"], "images": [[Image.new("RGB", (70, 20), (96, 128, 192))]]}
     config = tiny_minimax_h3_config(
         audio_enabled=False,
         num_pdd_heads=condition.config.num_pdd_heads,
         condition_model_type=condition.config.model_type,
+        latents_dim=latents_dim,
         patch_size=(1, 2, 2),
-        text_dim=batch["prompt_embeds"][0].shape[-1],
+        text_dim=text_dim,
     )
     config._set_ops_implementation(make_eager_ops_config(attn_implementation="sdpa"))
     model = MiniMaxH3DiTModel(config).to(device)
@@ -1018,7 +1036,8 @@ def test_no_implicit_sync_in_minimax_h3_image_forward_backward(condition_source)
     model.gradient_checkpointing_enable({"use_reentrant": False})
 
     def step():
-        loss = model(**condition.process_condition(**batch)).loss["mse_image"]
+        conditions = condition.get_condition(**raw_inputs) if raw_inputs is not None else batch
+        loss = model(**condition.process_condition(**conditions)).loss["mse_image"]
         loss.backward()
 
     _assert_no_minimax_h3_step_syncs(model, step, "image", "sdpa")
