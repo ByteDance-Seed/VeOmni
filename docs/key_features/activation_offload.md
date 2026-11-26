@@ -112,6 +112,12 @@ may use a different prefix. Inspect `model.named_modules()` before overriding
 auto-discovery. Matching modules alone does not prove that their saved inputs
 will be eligible for offload.
 
+### Environment Variables
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `VEOMNI_ACTIVATION_OFFLOAD_PINNED_GB` | `0` (uncapped) | Optional page-locked (pinned) host memory ceiling per `PinnedBufferPool` instance, in GiB (`1024³` bytes). Separate pools in the same process enforce independent caps (matching `activation_offload_host_cache_limit_gb`); share a `host_buffer_pool` for a single combined ceiling. When an allocation would exceed the ceiling, idle cached pinned buffers are evicted first; if live pinned allocations still exceed it, the allocation falls back to an uncached pageable host buffer with a one-time rank-0 warning. Leave unset or `0` unless host page-locked memory is scarce, because copying into pageable buffers blocks instead of overlapping asynchronously. |
+
 ## Usage examples
 
 Start with synchronous offload to establish correctness:
@@ -353,6 +359,9 @@ activations to be available on GPU.
   reducing the memory savings.
 - **Pinned CPU memory:** Requires sufficient CPU pinned memory to hold all offloaded
   activations. For very large models with many layers, this can be substantial.
+  On nodes with tight page-locked memory limits, set `VEOMNI_ACTIVATION_OFFLOAD_PINNED_GB`
+  to cap pinned allocations per pool and fall back to pageable host memory instead
+  of stalling in pinned allocation.
 - **Single-stream architecture:** Currently uses a single swap stream for both D2H and
   H2D. Bi-directional overlap (simultaneous D2H and H2D) is not yet supported.
 - **VLM multiple forward passes:** VLM models may invoke the same visual-block

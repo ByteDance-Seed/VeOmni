@@ -21,6 +21,8 @@
 #   - Supports wildcard pattern ``{*}`` for sequential module groups (e.g. model.layers.{*})
 
 import fnmatch
+import math
+import os
 from collections import OrderedDict, deque
 from threading import Lock
 from typing import List, Optional
@@ -45,6 +47,41 @@ from ..utils.device import (
 logger = logging.get_logger(__name__)
 
 _DEFAULT_HOST_CACHE_LIMIT_BYTES = 4 * 1024**3
+
+#: Default ceiling on page-locked host memory per :class:`PinnedBufferPool`.
+#: ``0`` means no cap, which preserves existing non-blocking overlap behavior --
+#: a budget below what the shape actually needs downgrades allocations to pageable
+#: buffers, and `launch_d2h`'s `copy_(non_blocking=True)` into pageable memory
+#: then waits instead of overlapping. Set it only when the node's locked pages
+#: are known to be scarce.
+_DEFAULT_PINNED_BUDGET_BYTES = 0
+
+
+def _pinned_budget_bytes() -> int:
+    """Per-pool ceiling on page-locked host buffers in bytes; 0 means no cap.
+
+    ``VEOMNI_ACTIVATION_OFFLOAD_PINNED_GB`` overrides it, so a node whose locked
+    memory is already held by something else can ask each pool to stop pinning
+    past a ceiling. Separate pools in the same process enforce independent caps
+    (matching ``activation_offload_host_cache_limit_gb``); pass a shared
+    ``host_buffer_pool`` to enforce one combined ceiling. Leaving it unset keeps
+    the pre-existing uncapped behavior.
+    """
+    raw = os.getenv("VEOMNI_ACTIVATION_OFFLOAD_PINNED_GB")
+    if raw:
+        try:
+            gb = float(raw)
+        except ValueError:
+            gb = math.nan
+        if math.isfinite(gb) and gb >= 0:
+            try:
+                return int(gb * 1024**3)
+            except OverflowError:
+                pass
+        logger.warning_once(
+            f"Ignoring VEOMNI_ACTIVATION_OFFLOAD_PINNED_GB={raw!r}: expected a non-negative finite number of gigabytes."
+        )
+    return _DEFAULT_PINNED_BUDGET_BYTES
 
 
 def _module_name_match(pattern: str, name: str) -> bool:
@@ -97,6 +134,16 @@ class PinnedBufferPool:
         self.reuses = 0
         self.evictions = 0
         self.drops = 0
+        # Page-locked host memory is a machine-wide, non-reclaimable resource. A
+        # rank that keeps calling `cudaMallocHost` after the pool is exhausted does
+        # not always get an error: the allocation can block indefinitely, which is
+        # how a large multi-node run can hang inside `acquire` on its first forward
+        # with no message and no stack until a watchdog fires. Track what this pool
+        # has pinned and stop asking past a budget, falling back to pageable memory --
+        # slower to copy, but the D2H still completes.
+        self._pinned_bytes = 0
+        self._pinned_refused = False
+        self.pinned_budget_bytes = _pinned_budget_bytes()
 
     @property
     def cached_bytes(self):
@@ -132,7 +179,56 @@ class PinnedBufferPool:
             self._wait_for_last_swap(buffer)
             return buffer, key
 
-        pin_memory = _is_active_accelerator_tensor(tensor)
+        wanted_pinned = _is_active_accelerator_tensor(tensor)
+        pin_memory = wanted_pinned
+        want_bytes = tensor.numel() * tensor.element_size()
+        charged_pinned = False
+        if pin_memory and self.pinned_budget_bytes > 0:
+            evicted = []
+            with self._lock:
+                # Stop asking for page-locked pages past an explicitly configured
+                # budget. Evict idle cached buffers first so dynamic shapes can
+                # reclaim unused pinned budget before falling back to pageable.
+                if self._pinned_bytes + want_bytes <= self.pinned_budget_bytes:
+                    self._pinned_bytes += want_bytes
+                    charged_pinned = True
+                elif want_bytes <= self.pinned_budget_bytes:
+                    freed_pinned = 0
+                    while self._free_buffers and (
+                        self._pinned_bytes - freed_pinned + want_bytes > self.pinned_budget_bytes
+                    ):
+                        oldest_key, oldest_buffers = next(iter(self._free_buffers.items()))
+                        oldest = oldest_buffers.popleft()
+                        oldest_nbytes = oldest.numel() * oldest.element_size()
+                        self._cached_bytes -= oldest_nbytes
+                        self.evictions += 1
+                        evicted.append(oldest)
+                        if getattr(oldest, "is_pinned", None) and oldest.is_pinned():
+                            freed_pinned += oldest_nbytes
+                        if not oldest_buffers:
+                            del self._free_buffers[oldest_key]
+            if evicted:
+                for oldest in evicted:
+                    self._wait_for_last_swap(oldest)
+                    self._forget_pinned(oldest.numel() * oldest.element_size(), oldest)
+                del oldest
+                evicted.clear()
+            if not charged_pinned:
+                with self._lock:
+                    if self._pinned_bytes + want_bytes > self.pinned_budget_bytes:
+                        pin_memory = False
+                        if not self._pinned_refused:
+                            self._pinned_refused = True
+                            logger.warning_rank0(
+                                f"Async activation offload reached its page-locked host budget "
+                                f"({self.pinned_budget_bytes / 1024**3:.1f} GiB, "
+                                f"{self._pinned_bytes / 1024**3:.1f} GiB held); falling back to pageable host "
+                                "buffers when allocations exceed the budget. Unset "
+                                "VEOMNI_ACTIVATION_OFFLOAD_PINNED_GB to let the pool pin what the shape needs."
+                            )
+                    else:
+                        self._pinned_bytes += want_bytes
+                        charged_pinned = True
         try:
             buffer = torch.empty_strided(
                 tensor.shape,
@@ -141,9 +237,14 @@ class PinnedBufferPool:
                 device="cpu",
                 pin_memory=pin_memory,
             )
+            if wanted_pinned and not pin_memory:
+                buffer._pageable_fallback = True
         except RuntimeError:
             if not pin_memory:
                 raise
+            if charged_pinned:
+                with self._lock:
+                    self._pinned_bytes = max(self._pinned_bytes - want_bytes, 0)
             logger.warning_rank0(
                 "Pinned host allocation for async activation offload failed; falling back to pageable host memory."
             )
@@ -154,6 +255,12 @@ class PinnedBufferPool:
                 device="cpu",
                 pin_memory=False,
             )
+            buffer._pageable_fallback = True
+        except BaseException:
+            if charged_pinned:
+                with self._lock:
+                    self._pinned_bytes = max(self._pinned_bytes - want_bytes, 0)
+            raise
         with self._lock:
             self.allocations += 1
         return buffer, key
@@ -164,6 +271,7 @@ class PinnedBufferPool:
         Reuse is covered by :meth:`acquire`. A dropped or evicted buffer leaves the
         pool for good, so its wait happens here. Both waits run outside the lock;
         the counters stay inside it, since ``release`` can run on any thread.
+        Page-locked pages a dropped/evicted buffer held are returned to the budget.
         """
         if buffer is None:
             return
@@ -171,7 +279,11 @@ class PinnedBufferPool:
         buffer_nbytes = buffer.numel() * buffer.element_size()
         evicted = []
         with self._lock:
-            if self.max_cached_bytes == 0 or buffer_nbytes > self.max_cached_bytes:
+            if (
+                self.max_cached_bytes == 0
+                or buffer_nbytes > self.max_cached_bytes
+                or getattr(buffer, "_pageable_fallback", False)
+            ):
                 self.drops += 1
                 dropped = True
             else:
@@ -191,14 +303,30 @@ class PinnedBufferPool:
                 self._cached_bytes += buffer_nbytes
         if dropped:
             self._wait_for_last_swap(buffer)
+            self._forget_pinned(buffer_nbytes, buffer)
         for oldest in evicted:
             self._wait_for_last_swap(oldest)
+            self._forget_pinned(oldest.numel() * oldest.element_size(), oldest)
+
+    def _forget_pinned(self, nbytes: int, buffer) -> None:
+        """Return a dropped or evicted buffer's share of the page-locked budget.
+
+        Only buffers that leave the pool for good count: a buffer sitting in the
+        cache is still pinned, and re-counting it on return would let the pool pin
+        past its budget.
+        """
+        if not getattr(buffer, "is_pinned", None) or not buffer.is_pinned():
+            return
+        with self._lock:
+            self._pinned_bytes = max(self._pinned_bytes - int(nbytes), 0)
 
     @staticmethod
     def _wait_for_last_swap(buffer) -> None:
         """Wait for the transfer that last touched ``buffer``, then forget its event.
 
-        Popped rather than kept so an idle buffer does not pin a completed event.
+        The tag is attached by :class:`SwapTensor` on every D2H and H2D copy.
+        Popped rather than kept so an idle buffer does not pin a completed event,
+        and released outside the pool lock by every caller.
         """
         event = buffer.__dict__.pop("_last_swap_event", None)
         if event is not None:

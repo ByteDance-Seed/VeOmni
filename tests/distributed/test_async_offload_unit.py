@@ -828,3 +828,225 @@ def test_async_offload_base_trainer_fsdp2_gc_integration():
     from ..tools.launch_utils import torchrun
 
     torchrun(_run_async_offload_base_trainer_fsdp2_gc, world_size=_CI_ACCELERATOR_2.nproc)
+
+
+class _FakeHostTensor(torch.Tensor):
+    """CPU tensor stand-in whose ``is_pinned()`` reflects the requested flag."""
+
+    @staticmethod
+    def __new__(cls, data, *, pinned: bool):
+        obj = torch.Tensor._make_subclass(cls, data)
+        obj._fake_pinned = pinned
+        return obj
+
+    def is_pinned(self, device=None):
+        return self._fake_pinned
+
+
+class TestPinnedBudget:
+    """The pool must stop asking for page-locked memory past its budget.
+
+    `cudaMallocHost` can block instead of failing once a node's locked pages are
+    gone, so the guard has to be a budget the pool can check before calling --
+    catching `RuntimeError` afterwards is not enough, because nothing is raised.
+    """
+
+    def test_budget_is_uncapped_by_default_and_settable_by_env(self, monkeypatch):
+        """No budget unless asked for.
+
+        A cap below what the shape pins does not save memory, it downgrades the
+        pool to pageable buffers, and `launch_d2h`'s `copy_(non_blocking=True)`
+        then waits instead of overlapping -- the run stalls with no error. So the
+        default has to leave the pool alone.
+        """
+        from veomni.distributed.async_offload import _DEFAULT_PINNED_BUDGET_BYTES, _pinned_budget_bytes
+
+        monkeypatch.delenv("VEOMNI_ACTIVATION_OFFLOAD_PINNED_GB", raising=False)
+        assert _DEFAULT_PINNED_BUDGET_BYTES == 0
+        assert _pinned_budget_bytes() == 0
+
+        monkeypatch.setenv("VEOMNI_ACTIVATION_OFFLOAD_PINNED_GB", "2")
+        assert _pinned_budget_bytes() == 2 * 1024**3
+
+        monkeypatch.setenv("VEOMNI_ACTIVATION_OFFLOAD_PINNED_GB", "0")
+        assert _pinned_budget_bytes() == 0
+
+        for invalid in ("not-a-number", "-1", "inf", "nan"):
+            monkeypatch.setenv("VEOMNI_ACTIVATION_OFFLOAD_PINNED_GB", invalid)
+            assert _pinned_budget_bytes() == 0
+
+    def test_past_budget_falls_back_to_pageable_and_warns_once(self, monkeypatch):
+        from veomni.distributed import async_offload
+
+        pin_requests = []
+        warnings = []
+        real_empty_strided = torch.empty_strided
+
+        def fake_empty_strided(size, stride, *, dtype=None, device=None, pin_memory=False):
+            pin_requests.append(pin_memory)
+            return _FakeHostTensor(
+                real_empty_strided(size, stride, dtype=dtype, device="cpu", pin_memory=False),
+                pinned=pin_memory,
+            )
+
+        monkeypatch.setattr(async_offload, "_is_active_accelerator_tensor", lambda _t: True)
+        monkeypatch.setattr(torch, "empty_strided", fake_empty_strided)
+        monkeypatch.setattr(async_offload.logger, "warning_rank0", warnings.append)
+
+        # Each float32 (4, 8) tensor is 128 bytes; budget fits exactly one.
+        pool = PinnedBufferPool(max_cached_bytes=1 << 20)
+        pool.pinned_budget_bytes = 128
+        source = torch.empty(4, 8, dtype=torch.float32)
+
+        first, key1 = pool.acquire(source)
+        second, key2 = pool.acquire(source)
+        third, key3 = pool.acquire(source)
+
+        assert pin_requests == [True, False, False]
+        assert first.is_pinned() is True
+        assert second.is_pinned() is False
+        assert third.is_pinned() is False
+        assert tuple(second.shape) == (4, 8)
+        assert key1 == key2 == key3 == (tuple(source.shape), tuple(source.stride()), source.dtype)
+        assert pool._pinned_bytes == 128
+        assert len(warnings) == 1
+
+    def test_released_buffer_returns_its_pinned_share_on_drop_and_eviction(self, monkeypatch):
+        from veomni.distributed import async_offload
+
+        real_empty_strided = torch.empty_strided
+
+        def fake_empty_strided(size, stride, *, dtype=None, device=None, pin_memory=False):
+            return _FakeHostTensor(
+                real_empty_strided(size, stride, dtype=dtype, device="cpu", pin_memory=False),
+                pinned=pin_memory,
+            )
+
+        monkeypatch.setattr(async_offload, "_is_active_accelerator_tensor", lambda _t: True)
+        monkeypatch.setattr(torch, "empty_strided", fake_empty_strided)
+
+        pool = PinnedBufferPool(max_cached_bytes=128)
+        pool.pinned_budget_bytes = 256
+        small = torch.empty(4, 8, dtype=torch.float32)  # 128 bytes
+        other = torch.empty(8, 4, dtype=torch.float32)  # 128 bytes, distinct layout key
+
+        buf1, key1 = pool.acquire(small)
+        buf2, key2 = pool.acquire(other)
+        pageable, key3 = pool.acquire(small)  # over 256B budget -> pageable
+        assert pool._pinned_bytes == 256
+        assert pageable.is_pinned() is False
+
+        # Caching buf1 keeps its pinned bytes reserved.
+        pool.release(buf1, key1)
+        assert pool._pinned_bytes == 256
+
+        # Releasing buf2 evicts buf1 (128B cache limit) and returns buf1's 128B.
+        pool.release(buf2, key2)
+        assert pool.evictions == 1
+        assert pool._pinned_bytes == 128
+
+        # Dropping a pageable buffer must not subtract from pinned bytes.
+        pool.max_cached_bytes = 0
+        pool.release(pageable, key3)
+        assert pool._pinned_bytes == 128
+
+        # Dropping a pinned buffer returns its 128B share.
+        buf4, key4 = pool.acquire(small)
+        assert buf4.is_pinned() is True
+        assert pool._pinned_bytes == 256
+        pool.release(buf4, key4)
+        assert pool._pinned_bytes == 128
+
+    def test_dynamic_shapes_evict_idle_pinned_and_do_not_cache_pageable_fallback(self, monkeypatch):
+        from veomni.distributed import async_offload
+
+        real_empty_strided = torch.empty_strided
+
+        def fake_empty_strided(size, stride, *, dtype=None, device=None, pin_memory=False):
+            return _FakeHostTensor(
+                real_empty_strided(size, stride, dtype=dtype, device="cpu", pin_memory=False),
+                pinned=pin_memory,
+            )
+
+        monkeypatch.setattr(async_offload, "_is_active_accelerator_tensor", lambda _t: True)
+        monkeypatch.setattr(torch, "empty_strided", fake_empty_strided)
+
+        pool = PinnedBufferPool(max_cached_bytes=256)
+        pool.pinned_budget_bytes = 256
+        shape_a = torch.empty(4, 8, dtype=torch.float32)  # 128 bytes
+        shape_b = torch.empty(8, 4, dtype=torch.float32)  # 128 bytes
+
+        # Step 1: fill the pinned budget with shape_a and cache both buffers.
+        a1, key_a = pool.acquire(shape_a)
+        a2, _ = pool.acquire(shape_a)
+        assert a1.is_pinned() and a2.is_pinned()
+        pool.release(a1, key_a)
+        pool.release(a2, key_a)
+        assert pool._pinned_bytes == 256
+        assert pool.cached_bytes == 256
+
+        # Step 2: a new shape must evict idle cached pinned buffers rather than
+        # falling back to pageable memory while the budget is idle.
+        b1, key_b = pool.acquire(shape_b)
+        b2, _ = pool.acquire(shape_b)
+        assert b1.is_pinned() and b2.is_pinned()
+        assert pool._pinned_bytes == 256
+        assert pool.cached_bytes == 0
+
+        # While b1 and b2 are both live, a third allocation falls back to pageable,
+        # and releasing it must drop rather than cache it (no cache poisoning).
+        pageable, key_p = pool.acquire(shape_a)
+        assert pageable.is_pinned() is False
+        pool.release(pageable, key_p)
+        assert pool.cached_bytes == 0
+        assert pool._pinned_bytes == 256
+
+        # After b1 and b2 are released to the cache, shape_a evicts them and gets
+        # a pinned buffer again instead of reusing a stale pageable buffer.
+        pool.release(b1, key_b)
+        pool.release(b2, key_b)
+        a3, _ = pool.acquire(shape_a)
+        assert a3.is_pinned() is True
+        assert pool._pinned_bytes == 256
+
+    @pytest.mark.parametrize("budget_bytes", [0, 1 << 20])
+    def test_pinned_allocation_runtime_error_rolls_back_budget(self, monkeypatch, budget_bytes):
+        from veomni.distributed import async_offload
+
+        real_empty_strided = torch.empty_strided
+
+        def fake_empty_strided(size, stride, *, dtype=None, device=None, pin_memory=False):
+            if pin_memory:
+                raise RuntimeError("simulated pinned allocation failure")
+            return _FakeHostTensor(
+                real_empty_strided(size, stride, dtype=dtype, device="cpu", pin_memory=False),
+                pinned=False,
+            )
+
+        monkeypatch.setattr(async_offload, "_is_active_accelerator_tensor", lambda _t: True)
+        monkeypatch.setattr(torch, "empty_strided", fake_empty_strided)
+
+        pool = PinnedBufferPool(max_cached_bytes=1 << 20)
+        pool.pinned_budget_bytes = budget_bytes
+        source = torch.empty(4, 8, dtype=torch.float32)
+
+        buf, key = pool.acquire(source)
+        assert buf.is_pinned() is False
+        assert pool._pinned_bytes == 0
+        pool.release(buf, key)
+        assert pool.cached_bytes == 0
+
+    def test_pinned_allocation_non_runtime_error_rolls_back_budget(self, monkeypatch):
+        from veomni.distributed import async_offload
+
+        def fake_empty_strided(size, stride, *, dtype=None, device=None, pin_memory=False):
+            raise MemoryError("simulated OOM")
+
+        monkeypatch.setattr(async_offload, "_is_active_accelerator_tensor", lambda _t: True)
+        monkeypatch.setattr(torch, "empty_strided", fake_empty_strided)
+
+        pool = PinnedBufferPool(max_cached_bytes=1 << 20)
+        pool.pinned_budget_bytes = 1 << 20
+        with pytest.raises(MemoryError, match="simulated OOM"):
+            pool.acquire(torch.empty(4, 8, dtype=torch.float32))
+        assert pool._pinned_bytes == 0

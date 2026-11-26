@@ -92,7 +92,7 @@ class VeOmniMixin(BaseMixin, TrainingMixin, InferenceModuleMixin, MetricMeter):
 | [`MetricMeterMixin.metric_meter_collect() -> (flops, seqlens)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L139) | [`OmniModelRuntime.metric_meter_collect`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L596) | Returns `(estimate_flops(buffer), buffer)` and empties the buffer for the next step. |
 | [`OmniModelRuntime.metric_meter_collect() -> {name: (flops, seqlens)}`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L596) | [`OmniStepMetricsCallback.on_step_end`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L76) | Drains every module with `isinstance(omni_module, MetricMeterMixin)`. Keys are module names, so they are identical on every rank even when a rank's batch did not use a module (it reports `(0.0, [])`). |
 | [`OmniEnvironMeter.add(micro_batch)`](../../../veomni/utils/omni_helper.py#L123) | [`OmniStepMetricsCallback.on_step_begin`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L66), once per micro-batch | Counts samples — `len(conversation_list)`, or a packed batch's `packed_cu_seqlens` boundaries — and, for multi-source, gathers `ds_idx`. Never looks at tokens. |
-| [`OmniEnvironMeter.step(delta_time, global_step, module_metrics)`](../../../veomni/utils/omni_helper.py#L145) | [`OmniStepMetricsCallback.on_step_end`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L73) | [One DP all-reduce](../../../veomni/utils/omni_helper.py#L177) of FLOPs, sample count and per-module token sums, then the metrics listed below. |
+| [`OmniEnvironMeter.step(delta_time, global_step, module_metrics)`](../../../veomni/utils/omni_helper.py#L145) | [`OmniStepMetricsCallback.on_step_end`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L73) | [One DP all-reduce](../../../veomni/utils/omni_helper.py#L181) of FLOPs, sample count and per-module token sums, then the metrics listed below. |
 
 The `OmniEnvironMeter` itself is built in
 [`OmniStepMetricsCallback.__init__`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L51)
@@ -137,19 +137,19 @@ same dict and `WandbTraceCallback` logs it.
 
 | Key | Meaning |
 |-----|---------|
-| [`flops_achieved(T)`](../../../veomni/utils/omni_helper.py#L185) | Sum over modules and DP ranks of `estimate_flops`, divided by `delta_time`. |
-| [`flops_promised(T)`](../../../veomni/utils/omni_helper.py#L186) | Device peak TFLOPs ([`get_device_flops`](../../../veomni/utils/count_flops.py#L26)) × world size. |
-| [`mfu`](../../../veomni/utils/omni_helper.py#L187) | `flops_achieved / flops_promised`. |
-| [`consumed_chunk_num`](../../../veomni/utils/omni_helper.py#L191) | Cumulative real training samples (conversations) across DP ranks. |
-| [`trace/<module>/tokens_per_second(M)`](../../../veomni/utils/omni_helper.py#L201) | This module's global tokens this step / `delta_time`. |
-| [`trace/<module>/consume_tokens(M)`, `(B)`](../../../veomni/utils/omni_helper.py#L202) | This module's cumulative global tokens. |
-| [`trace/<module>/avg_seq_len`](../../../veomni/utils/omni_helper.py#L205) | This module's global tokens this step / `global_batch_size`. |
+| [`flops_achieved(T)`](../../../veomni/utils/omni_helper.py#L189) | Sum over modules and DP ranks of `estimate_flops`, divided by `delta_time`. |
+| [`flops_promised(T)`](../../../veomni/utils/omni_helper.py#L190) | Device peak TFLOPs ([`get_device_flops`](../../../veomni/utils/count_flops.py#L26)) × world size. |
+| [`mfu`](../../../veomni/utils/omni_helper.py#L191) | `flops_achieved / flops_promised`. |
+| [`consumed_chunk_num`](../../../veomni/utils/omni_helper.py#L195) | Cumulative real training samples (conversations) across DP ranks. |
+| [`trace/<module>/tokens_per_second(M)`](../../../veomni/utils/omni_helper.py#L205) | This module's global tokens this step / `delta_time`. |
+| [`trace/<module>/consume_tokens(M)`, `(B)`](../../../veomni/utils/omni_helper.py#L206) | This module's cumulative global tokens. |
+| [`trace/<module>/avg_seq_len`](../../../veomni/utils/omni_helper.py#L209) | This module's global tokens this step / `global_batch_size`. |
 | `max_memory_allocated(GB)`, `cpu_used_memory(GB)`, ... | Device and host memory, reduced to the worst rank by [`compute_device_memory_metrics`](../../../veomni/utils/helper.py#L178) (shared with `EnvironMeter`). |
 | `multi_source/...` | Only with `data.enable_multisource`; see [Multi-source accounting](#multi-source-accounting). |
 
 `<module>` is the module's name in the `OmniModel` (the key of
 `OmniModelRuntime.module_runtimes`). While no module is metered, the three FLOPs
-keys are [omitted](../../../veomni/utils/omni_helper.py#L193) rather than logged
+keys are [omitted](../../../veomni/utils/omni_helper.py#L197) rather than logged
 as zero; token and memory metrics still appear.
 
 FLOPs are summed across modules because each module's compute is distinct
@@ -206,13 +206,13 @@ the cumulative counters survive a resume.
 
 With `data.enable_multisource`, the multi-source tracker needs one sequence
 length per sample to attribute tokens to each dataset.
-[`OmniEnvironMeter._multisource_module`](../../../veomni/utils/omni_helper.py#L237)
+[`OmniEnvironMeter._multisource_module`](../../../veomni/utils/omni_helper.py#L241)
 picks the source module collectively: among the modules whose step buffer has
 exactly one entry per sample (`len(seqlens) == len(ds_idx)`) on **every** DP
 rank, it takes the one with the most global tokens, normally the backbone, whose
 sequence is the union of all modalities. Ties resolve by name. If no module
 qualifies, multi-source token counts are
-[logged as zero](../../../veomni/utils/omni_helper.py#L220) with a one-time
+[logged as zero](../../../veomni/utils/omni_helper.py#L224) with a one-time
 warning. To make a backbone eligible, stash exactly one length per conversation.
 
 ## Tests

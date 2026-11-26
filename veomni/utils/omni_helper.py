@@ -168,6 +168,10 @@ class OmniEnvironMeter:
         names = sorted(module_metrics)
         num_samples = len(self.batch_ds_idx)
 
+        # Do not call `empty_cache()` ahead of this DP all-reduce: freeing cached
+        # allocator blocks while an async activation offload D2H transfer is still
+        # in flight can deadlock `empty_cache()` at step-metrics reporting.
+        #
         # Pack one DP all-reduce:
         # [total_flops, real_samples, num_ranks, tokens_m..., ranks_aligned_m...].
         total_flops_local = sum(flops for flops, _ in module_metrics.values())
