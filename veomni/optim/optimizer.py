@@ -447,8 +447,10 @@ def _build_state_offload_optimizer(
 
     ``model.optimizer.state_offload='cpu'`` is a placement choice, not an algorithm: the
     algorithm dispatch lives here, so a new offloadable algorithm is one branch
-    rather than one helper per algorithm. Muon will add its own ``elif`` (its
-    AdamW leaf is what carries host state today).
+    rather than one helper per algorithm. Muon is handled in
+    ``_build_muon_with_adamw`` instead, because its momentum is a single buffer
+    per parameter and therefore streams one parameter at a time rather than in
+    the batched pipeline ``SwapAdamW`` uses.
     """
     if optimizer_type == "adamw":
         from .swap_adamw import SwapAdamW
@@ -466,7 +468,8 @@ def _build_state_offload_optimizer(
         )
     else:
         raise ValueError(
-            f"model.optimizer.state_offload='cpu' is only supported for type='adamw'; got type={optimizer_type!r}."
+            "model.optimizer.state_offload='cpu' is only supported for type='adamw' or 'muon'; "
+            f"got type={optimizer_type!r}."
         )
 
 
@@ -519,6 +522,7 @@ def build_optimizer(
             no_decay_modules=no_decay_modules,
             no_decay_params=no_decay_params,
             muon_kwargs=muon_kwargs,
+            optimizer_config=optimizer_config,
         )
 
     if param_groups is not None:
@@ -648,6 +652,7 @@ def _build_muon_with_adamw(
     no_decay_modules: Optional[List[str]],
     no_decay_params: Optional[List[str]],
     muon_kwargs: Optional[Dict[str, Any]],
+    optimizer_config: Optional["OptimizerConfig"] = None,
 ) -> "MultiOptimizer":
     """Build a Muon (2D/3D hidden weights) + AdamW (everything else) MultiOptimizer.
 
@@ -655,6 +660,11 @@ def _build_muon_with_adamw(
     dict keys and grad-clipping metadata stay keyed by mesh.
     """
     muon_kwargs = dict(muon_kwargs or {})
+    # Placement for Muon's momentum buffer. The AdamW half of this multi-optimizer
+    # has its own state-offload branch below; Muon needs its own because its
+    # momentum is one tensor per parameter, not two, and is read every step.
+    state_offload = optimizer_config is not None and optimizer_config.state_offload == "cpu"
+    state_offload_pin_memory = True if optimizer_config is None else optimizer_config.state_offload_pin_memory
     # Summary-only keys; not DistributedMuon ctor args.
     expert_zero_comm = bool(muon_kwargs.pop("expert_zero_comm", False))
     adamw_lr = float(lr)
@@ -789,10 +799,28 @@ def _build_muon_with_adamw(
             ns_implementation=muon_kwargs.get("ns_implementation", "gram_quack"),
             gram_ns_reset_iterations=muon_kwargs.get("gram_ns_reset_iterations", (2,)),
             expert_ns_max_experts=muon_kwargs.get("expert_ns_max_experts", -1),
+            state_offload=state_offload,
+            state_offload_pin_memory=state_offload_pin_memory,
         )
 
-    def _make_adamw(params: List[torch.nn.Parameter]) -> AdamW:
+    def _make_adamw(params: List[torch.nn.Parameter]) -> Optimizer:
         groups = _make_param_groups_for_subset(model, params, weight_decay, no_decay_modules, no_decay_params)
+        if state_offload:
+            # Same placement choice as the Muon half: the AdamW leaf (embeddings,
+            # lm_head, norms) keeps its two moments on the host too.
+            from .swap_adamw import SwapAdamW
+
+            return SwapAdamW(
+                groups,
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=weight_decay,
+                device_memory_fraction=(
+                    0.8 if optimizer_config is None else optimizer_config.state_offload_device_memory_fraction
+                ),
+                pin_memory=state_offload_pin_memory,
+            )
         foreach = not fused
         return AdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, fused=fused, foreach=foreach)
 
@@ -814,6 +842,23 @@ def _build_muon_with_adamw(
             optimizer_dict["non_extra_parallel"] = _make_adamw(adamw_non_para)
     elif adamw_params:
         optimizer_dict["adamw"] = _make_adamw(adamw_non_para)
+
+    # Say where the state actually landed. A run configured for host momentum
+    # looks identical in the logs whether the offload took or silently did nothing.
+    if state_offload:
+        for name, sub in optimizer_dict.items():
+            if not hasattr(sub, "state_offload"):
+                continue
+            resident = sum(
+                local.numel() * local.element_size()
+                for group in sub.param_groups
+                for p in group["params"]
+                for local in (p.to_local() if hasattr(p, "to_local") else p,)
+            )
+            logger.info_rank0(
+                f"[state_offload] {name}: {type(sub).__name__} keeps momentum on host "
+                f"({resident / 1024**3:.2f} GiB of local shard momentum streamed one parameter at a time)"
+            )
 
     # Grad clipping groups by mesh, not by optimizer type.
     if extra_parallel_aware:

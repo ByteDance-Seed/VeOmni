@@ -385,10 +385,18 @@ model = build_parallelize_model(
 | `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
 | `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases, norms, and 2D matrices that route, mix or gate rather than transform features (MoE router gates, mHC stream mixing, the DSA indexer's `weights_proj`, compressor `gate_proj`) — see `_DEFAULT_ADAMW_NAME_PATTERNS` in `veomni/optim/muon.py`. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
 
-`model.optimizer.state_offload: cpu` (with `type: adamw`) keeps the AdamW moment
-states in host buffers — pinned by default, pageable when `state_offload_pin_memory`
-is `false` or a pinned allocation fails — and streams them to the device in
-batches, lowering peak device memory.
+`model.optimizer.state_offload: cpu` (supported for `type: adamw` and `type: muon`)
+keeps the moment states in host buffers — pinned by default, pageable when
+`state_offload_pin_memory` is `false` or a pinned allocation fails — lowering
+peak device memory, with a different shape per algorithm:
+
+* `adamw` streams its two moments to the device in batches sized from the
+  currently free device memory.
+* `muon` holds one `momentum_buffer` per parameter, which no other tensor reads,
+  so it streams that buffer in immediately before each parameter's update and
+  releases it straight after. Peak device cost becomes one parameter's momentum
+  instead of the whole Muon group's. Under `type: muon` the AdamW sibling group
+  (embeddings, `lm_head`, norms) offloads in batches too.
 
 Muon-specific hyperparameters live under `model.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` continue to drive the AdamW sibling group.
 

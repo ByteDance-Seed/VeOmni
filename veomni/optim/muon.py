@@ -40,6 +40,17 @@ from ..utils.device import IS_CUDA_AVAILABLE, get_device_type, get_gpu_compute_c
 logger = logging.get_logger(__name__)
 
 
+def _to_local(tensor: Tensor) -> Tensor:
+    """Return the local shard of a DTensor, or the tensor itself otherwise.
+
+    The host momentum buffer holds a plain CPU tensor, so copying to and from it
+    has to go through the local shard rather than the DTensor wrapper.
+    """
+    if isinstance(tensor, DTensor):
+        return tensor.to_local()
+    return tensor
+
+
 try:
     # Reuse upstream's private NS constants and the LR-adjust helper so we
     # match its math without copying it.
@@ -902,6 +913,8 @@ class DistributedMuon(Optimizer):
         gram_ns_reset_iterations: Sequence[int] = (2,),
         head_blocks: int = 1,
         expert_ns_max_experts: int = _DEFAULT_MOE_LOCAL_3D_NS_MAX_EXPERTS,
+        state_offload: bool = False,
+        state_offload_pin_memory: bool = True,
     ) -> None:
         if not _MUON_AVAILABLE:
             raise RuntimeError(
@@ -925,6 +938,17 @@ class DistributedMuon(Optimizer):
             raise ValueError(
                 f"expert_ns_max_experts must be >= -1 (-1 disables chunking) but is: {expert_ns_max_experts}"
             )
+
+        # Muon keeps exactly one state tensor per parameter (``momentum_buffer``),
+        # and nothing else reads it, so host residency is a plain swap rather than
+        # a batched pipeline: each parameter's buffer is streamed in immediately
+        # before its update and released straight after. That bounds the device
+        # cost of the state to one parameter instead of the whole Muon group.
+        self.state_offload = bool(state_offload)
+        self.state_offload_pin_memory = (
+            bool(state_offload_pin_memory) and self.state_offload and get_device_type() != "cpu"
+        )
+        self._host_momentum: Dict[Tensor, Tensor] = {}
 
         defaults: Dict[str, Any] = {
             "lr": lr,
@@ -951,6 +975,8 @@ class DistributedMuon(Optimizer):
 
         for group in self.param_groups:
             self._validate_group(group)
+        if self.state_offload:
+            self._init_host_states()
 
     @staticmethod
     def _validate_group(group: Dict[str, Any]) -> None:
@@ -981,6 +1007,86 @@ class DistributedMuon(Optimizer):
     def add_param_group(self, param_group: Dict[str, Any]) -> None:  # type: ignore[override]
         super().add_param_group(param_group)
         self._validate_group(self.param_groups[-1])
+        if self.state_offload:
+            self._init_host_states()
+
+    @staticmethod
+    def _rewrap_like(local: Tensor, reference: Tensor) -> Tensor:
+        """Relabel a plain tensor as the same DTensor layout as ``reference``.
+
+        ``lerp_`` refuses to mix a plain tensor with a DTensor, and the Muon step
+        reads placements off the update (``_fsdp_all2all_submesh``). When the
+        parameter is not sharded the local tensor is already what is needed.
+        """
+        if not isinstance(reference, DTensor):
+            return local
+        from ..utils.dtensor_utils import rewrap_dtensor_local
+
+        return rewrap_dtensor_local(
+            local,
+            mesh=reference.device_mesh,
+            placements=reference.placements,
+            shape=reference.shape,
+            stride=reference.stride(),
+        )
+
+    def _host_buffer(self, p: Tensor) -> Tensor:
+        """Allocate the host-resident momentum for ``p`` on first use.
+
+        Pinned memory is a finite machine resource; on exhaustion the buffer
+        falls back to pageable host memory once, matching ``SwapAdamW`` and
+        ``async_offload`` rather than failing the run at build time.
+        """
+        buf = self._host_momentum.get(p)
+        if buf is None:
+            local = _to_local(p)
+            shape = tuple(local.shape)
+            try:
+                buf = torch.zeros(shape, dtype=local.dtype, device="cpu", pin_memory=self.state_offload_pin_memory)
+            except (RuntimeError, NotImplementedError, TypeError):
+                if not self.state_offload_pin_memory:
+                    raise
+                logger.warning_rank0(
+                    "Pinned host allocation for Muon momentum failed (page-locked memory "
+                    "exhausted?); continuing with pageable host buffers."
+                )
+                self.state_offload_pin_memory = False
+                buf = torch.zeros(shape, dtype=local.dtype, device="cpu", pin_memory=False)
+            self._host_momentum[p] = buf
+        return buf
+
+    def _ensure_host_state(self, p: Tensor) -> Tensor:
+        """Allocate ``p``'s host momentum buffer and bind it in ``self.state``.
+
+        Binding the CPU tensor (or CPU-backed DTensor via ``rewrap_dtensor_local``)
+        directly into ``self.state[p]["momentum_buffer"]`` matches ``SwapAdamW``:
+        zero bytes reside on the accelerator, ``_init_optim_state`` sees
+        populated state and never triggers a dummy ``step()``, and DCP's
+        ``_unflatten_optim_state_dict`` finds ``"momentum_buffer"`` in
+        ``optim.state[p]`` during resume.
+        """
+        buf = self._host_buffer(p)
+        if "momentum_buffer" not in self.state[p]:
+            self.state[p]["momentum_buffer"] = self._rewrap_like(buf, p)
+        return buf
+
+    def _init_host_states(self) -> None:
+        """Pre-bind host momentum buffers for trainable parameters, matching ``SwapAdamW``."""
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.requires_grad and not p.is_meta:
+                    self._ensure_host_state(p)
+
+    def _bind_host_states(self) -> None:
+        """Ensure every host momentum buffer is bound in ``self.state`` for DCP."""
+        for p, host in self._host_momentum.items():
+            self.state[p]["momentum_buffer"] = self._rewrap_like(host, p)
+
+    def state_dict(self) -> Dict[str, Any]:  # type: ignore[override]
+        """Export optimizer state with host-resident momentum bound directly on CPU."""
+        if self.state_offload:
+            self._bind_host_states()
+        return super().state_dict()
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:  # type: ignore[override]
         """Restore optimizer state while keeping this run's head-split scope.
@@ -994,7 +1100,26 @@ class DistributedMuon(Optimizer):
         # ``None`` where the group carries no ``head_blocks`` at all, so an unsplit
         # run does not gain the key (and its state dict keys) on resume.
         configured = [group.get("head_blocks") for group in self.param_groups]
-        super().load_state_dict(state_dict)
+        extracted_momentum: Dict[Any, Any] = {}
+        if self.state_offload:
+            # Strip ``momentum_buffer`` before delegating to ``Optimizer.load_state_dict``
+            # so torch does not move every host buffer onto the accelerator at once.
+            raw_state = state_dict.get("state", {})
+            stripped_state: Dict[Any, Any] = {}
+            for key, entry in raw_state.items():
+                if isinstance(entry, dict):
+                    copied = {k: v for k, v in entry.items() if k not in ("momentum_buffer", "compensation")}
+                    if "momentum_buffer" in entry:
+                        extracted_momentum[key] = entry["momentum_buffer"]
+                    if copied:
+                        stripped_state[key] = copied
+                else:
+                    stripped_state[key] = entry
+            sd_to_load = {**state_dict, "state": stripped_state}
+        else:
+            sd_to_load = state_dict
+
+        super().load_state_dict(sd_to_load)
         restored = [group.get("head_blocks") for group in self.param_groups]
         for group, blocks in zip(self.param_groups, configured):
             if blocks is None:
@@ -1007,6 +1132,65 @@ class DistributedMuon(Optimizer):
                 f"with the configured {[1 if b is None else b for b in configured]}; "
                 "keeping the configured value."
             )
+        for group in self.param_groups:
+            for p in group["params"]:
+                state = self.state.get(p)
+                if not state:
+                    self.state.pop(p, None)
+                    continue
+                # Legacy checkpoints written while Muon carried a BF16 cast
+                # compensation buffer: drop the key so the optimizer state
+                # matches the current parameter set.
+                state.pop("compensation", None)
+                if not state:
+                    self.state.pop(p, None)
+
+        if self.state_offload:
+            self._adopt_host_momentum_from_state(state_dict.get("param_groups", ()), extracted_momentum)
+
+    def _adopt_host_momentum_from_state(
+        self,
+        saved_groups: Sequence[Dict[str, Any]],
+        extracted_momentum: Dict[Any, Any],
+    ) -> None:
+        """Copy checkpoint-restored momentum directly into the host buffers.
+
+        Under ``state_offload`` the momentum lives in ``_host_momentum`` and is
+        bound as a CPU tensor (or CPU-backed DTensor) in ``self.state``. Copying
+        straight from the stripped state dict keeps the buffers on CPU throughout
+        resume instead of staging them on the accelerator via ``super().load_state_dict``.
+        """
+        id_map: Dict[Any, Tensor] = {}
+        for group, saved_group in zip(self.param_groups, saved_groups):
+            for saved_id, p in zip(saved_group["params"], group["params"]):
+                id_map[saved_id] = p
+
+        loaded_params: set = set()
+        for saved_id, buf in extracted_momentum.items():
+            p = id_map.get(saved_id)
+            if p is None or not isinstance(buf, Tensor):
+                continue
+            host = self._host_buffer(p)
+            local = _to_local(buf)
+            if local.shape != host.shape:
+                raise ValueError(
+                    f"optimizer state 'momentum_buffer' has shape {tuple(local.shape)} in the checkpoint "
+                    f"but {tuple(host.shape)} here; DCP should reshard before this point."
+                )
+            host.copy_(local.detach().to(host.device, host.dtype))
+            self.state[p]["momentum_buffer"] = self._rewrap_like(host, p)
+            loaded_params.add(p)
+
+        for p in list(self._host_momentum):
+            if p in loaded_params:
+                continue
+            if p.requires_grad and not p.is_meta:
+                host = self._host_momentum[p]
+                host.zero_()
+                self.state[p]["momentum_buffer"] = self._rewrap_like(host, p)
+            else:
+                self._host_momentum.pop(p, None)
+                self.state.pop(p, None)
 
     @torch.no_grad()
     def step(self, closure=None):  # type: ignore[override]
@@ -1053,14 +1237,34 @@ class DistributedMuon(Optimizer):
                 if p.grad.is_sparse:
                     raise RuntimeError("DistributedMuon does not support sparse gradients")
 
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                buf: Tensor = state["momentum_buffer"]
-
                 grad = p.grad
-                buf.lerp_(grad, 1 - momentum)
-                update = grad.lerp(buf, momentum) if nesterov else buf
+
+                if self.state_offload:
+                    # Host-resident momentum: stream this parameter's buffer in,
+                    # merge the gradient into it, copy the updated momentum back
+                    # to host synchronously, and release the staging reference
+                    # once ``update`` is formed.
+                    #
+                    # The buffers must be rewrapped as DTensors when the parameter
+                    # is sharded: `lerp_` refuses a mix of plain and distributed
+                    # tensors, and `_compute_ortho` / `_fsdp_all2all_submesh` read
+                    # the placements off ``update``. Rewrapping rather than
+                    # allocating keeps the storage on the device copy it was
+                    # streamed into.
+                    host_buf = self._ensure_host_state(p)
+                    local_buf = host_buf.to(p.device, non_blocking=False)
+                    buf = self._rewrap_like(local_buf, p)
+                    buf.lerp_(grad, 1 - momentum)
+                    host_buf.copy_(_to_local(buf), non_blocking=False)
+                    update = grad.lerp(buf, momentum) if nesterov else buf
+                    del local_buf, buf
+                else:
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    buf: Tensor = state["momentum_buffer"]
+                    buf.lerp_(grad, 1 - momentum)
+                    update = grad.lerp(buf, momentum) if nesterov else buf
 
                 kind = _classify_param(p)
                 submesh = (
@@ -1179,6 +1383,8 @@ class DistributedMuon(Optimizer):
         updates: List["DTensor"],
         mesh: Any,
         ns_kwargs: Dict[str, Any],
+        *,
+        overlap_fn: Optional[Any] = None,
     ) -> List[Tensor]:
         """Orthogonalize evenly-sharded 2D ``Shard(0)`` updates via all-to-all.
 
@@ -1243,7 +1449,11 @@ class DistributedMuon(Optimizer):
                     send_list.append(torch.empty(0, 0, device=device, dtype=pad_dtype))
                 recv_list.append(torch.empty(owned_rows[j], owned_k, device=device, dtype=owned_dtype))
 
-            dist.all_to_all(recv_list, send_list, group=group)
+            work1 = dist.all_to_all(recv_list, send_list, group=group, async_op=overlap_fn is not None)
+            if overlap_fn is not None:
+                overlap_fn()
+            if work1 is not None:
+                work1.wait()
 
             if owned_update is not None:
                 full_grad = torch.cat(recv_list, dim=0)
@@ -1266,7 +1476,11 @@ class DistributedMuon(Optimizer):
                 else:
                     back_recv.append(torch.empty(0, 0, device=device, dtype=pad_dtype))
 
-            dist.all_to_all(back_recv, scatter_send, group=group)
+            work2 = dist.all_to_all(back_recv, scatter_send, group=group, async_op=overlap_fn is not None)
+            if overlap_fn is not None:
+                overlap_fn()
+            if work2 is not None:
+                work2.wait()
 
             for j in range(world):
                 pos = base + j

@@ -474,6 +474,16 @@
     ]
   },
   {
+    "name": "muon-offload-parallel-unit",
+    "suite": "unit",
+    "conditional": false,
+    "args": [
+      "-s",
+      "-x",
+      "tests/optim/test_muon_offload_parallel.py"
+    ]
+  },
+  {
     "name": "45-unit",
     "suite": "unit",
     "conditional": false,

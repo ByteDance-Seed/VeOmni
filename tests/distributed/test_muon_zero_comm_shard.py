@@ -22,7 +22,10 @@ import torch.nn as nn
 from torch.distributed._tensor import Shard
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
-from veomni.distributed.parallel_plan import ParallelPlan
+from veomni.distributed.parallel_plan import (
+    ParallelPlan,
+    _local_extra_parallel_parameter,
+)
 from veomni.distributed.torch_parallelize import _can_shard_extra_parallel_dim0
 
 
@@ -120,6 +123,31 @@ def test_rejects_plan_that_slices_a_non_zero_dim():
 def test_rejects_plan_whose_patterns_match_nothing():
     plan = ParallelPlan(extra_parallel_plan={"ep": {"decoder.*.experts.w1": Shard(0)}})
     assert _can_shard_extra_parallel_dim0(_ToyMoe(), plan, "ep", 2) is False
+
+
+def test_meta_local_parameter_shrinks_fp8_table_rows():
+    # Large fp8 meta table Parameters must be sized locally on ExtraParallel apply
+    # so `to_empty` only allocates this rank's shard instead of the full table.
+    param = nn.Parameter(torch.empty(64, 32, dtype=torch.float8_e4m3fn, device="meta"))
+    local = _local_extra_parallel_parameter(param, Shard(0), para_size=8, para_rank=0)
+    assert tuple(local.shape) == (8, 32)
+    assert local.is_meta
+    assert local.dtype == torch.float8_e4m3fn
+    assert local.requires_grad is True
+
+
+def test_meta_local_parameter_rejects_indivisible_rows():
+    param = nn.Parameter(torch.empty(10, 4, device="meta"))
+    with pytest.raises(ValueError, match="not divisible by 8"):
+        _local_extra_parallel_parameter(param, Shard(0), para_size=8, para_rank=0)
+
+
+def test_local_extra_parallel_parameter_slices_cpu_rows():
+    param = nn.Parameter(torch.arange(32, dtype=torch.float32).reshape(8, 4))
+    local = _local_extra_parallel_parameter(param, Shard(0), para_size=4, para_rank=1)
+    assert tuple(local.shape) == (2, 4)
+    torch.testing.assert_close(local, param[2:4])
+    assert local.device.type == "cpu"
 
 
 def test_rejects_para_absent_from_the_plan():

@@ -96,8 +96,9 @@ class OptimizerConfig:
             "help": (
                 "Optimizer-managed state offload. 'none' disables it (training state may still be "
                 "offloaded by model.accelerator.fsdp_config.offload); 'cpu' keeps the moment states "
-                "in host buffers and streams them to the device in batches, lowering peak device "
-                "memory (type='adamw' only)."
+                "in host buffers, lowering peak device memory (supported for type='adamw' and "
+                "type='muon': AdamW swaps its two moments in batches, and Muon streams its single "
+                "momentum buffer one parameter at a time while its AdamW leaf swaps in batches)."
             )
         },
     )
@@ -308,10 +309,13 @@ class OptimizerConfig:
         if self.state_offload not in ("none", "cpu"):
             raise ValueError(f"model.optimizer.state_offload must be 'none' or 'cpu', got {self.state_offload!r}")
         if self.state_offload == "cpu":
-            if self.type == "adamw":
+            if self.type in ("adamw", "muon"):
                 # YAML resolves an exponent literal without a decimal point
                 # (``8e-1``) to a string, so coerce before the range check (same
                 # reason as ``_collect_muon_kwargs`` does for ``muon_lr``).
+                # ``muon`` reads the fraction for its AdamW leaf (embeddings,
+                # lm_head, norms); its own momentum streams one parameter at a
+                # time and needs no budget.
                 self.state_offload_device_memory_fraction = float(self.state_offload_device_memory_fraction)
                 if not 0.0 < self.state_offload_device_memory_fraction <= 1.0:
                     raise ValueError(
@@ -320,7 +324,8 @@ class OptimizerConfig:
                     )
             else:
                 raise ValueError(
-                    f"model.optimizer.state_offload='cpu' is only supported for type='adamw'; got type={self.type!r}."
+                    "model.optimizer.state_offload='cpu' is only supported for type='adamw' or "
+                    f"'muon'; got type={self.type!r}."
                 )
 
 
