@@ -780,8 +780,92 @@ def test_multisource_workers_keep_hf_epoch_private_without_copying_transform():
     samples = list(loader)
     assert len(samples) >= 24
     # Parent HF streams must keep epoch == 0 even after worker exhaustion resets.
-    assert hf_short.epoch == 0
-    assert hf_long.epoch == 0
+    assert int(hf_short._epoch) == 0
+    assert int(hf_long._epoch) == 0
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_persistent_workers_receive_set_epoch_updates():
+    from datasets import Dataset as HFDataset
+
+    from veomni.data.dataset import IterativeDataset
+
+    hf_a = HFDataset.from_dict({"x": list(range(32))}).to_iterable_dataset(num_shards=2).shuffle(seed=7, buffer_size=8)
+    hf_b = (
+        HFDataset.from_dict({"x": list(range(100, 132))})
+        .to_iterable_dataset(num_shards=2)
+        .shuffle(seed=11, buffer_size=8)
+    )
+    dataset = _make_simple_dataset(
+        datasets=[
+            IterativeDataset(hf_a, transform=lambda row: {"input_ids": [int(row["x"])]}),
+            IterativeDataset(hf_b, transform=lambda row: {"input_ids": [int(row["x"])]}),
+        ],
+        weights=[0.5, 0.5],
+        source_ids=["a", "b"],
+        stopping_strategy="first_exhausted",
+    )
+
+    loader = torch.utils.data.DataLoader(dataset, batch_size=None, num_workers=2, persistent_workers=True)
+    dataset.set_epoch(0)
+    epoch0 = [item["input_ids"][0] for item in loader]
+    dataset.set_epoch(1)
+    epoch1 = [item["input_ids"][0] for item in loader]
+    assert epoch0 != epoch1
+    assert [x for x in epoch0 if x < 100] != [x for x in epoch1 if x < 100]
+    assert int(hf_a._epoch) == 1
+    assert int(hf_b._epoch) == 1
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_build_weighted_multisource_dataset_preserves_cursor_on_resume(tmp_path):
+    import json
+
+    import yaml
+
+    from veomni.data import dataset as dataset_mod
+
+    data_file = tmp_path / "src.jsonl"
+    data_file.write_text("\n".join(json.dumps({"x": i}) for i in range(4)) + "\n", encoding="utf-8")
+    config_path = tmp_path / "multisource.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "sources": [str(data_file)],
+                "names": ["src"],
+                "schedule": [{"schedule_type": "const", "weights": [1.0]}],
+                "stopping_strategy": "never_exhausted",
+                "upstream_sharded": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _transform(row, source_name=None):
+        return {"input_ids": [int(row["x"])]}
+
+    ds = dataset_mod.build_weighted_multisource_dataset(
+        train_path=str(config_path),
+        transform=_transform,
+        shuffle=False,
+        dataset_repeat=True,
+    )
+    it = iter(ds)
+    assert next(it)["input_ids"] == [0]
+    assert next(it)["input_ids"] == [1]
+    saved = ds.state_dict()
+
+    ds_resumed = dataset_mod.build_weighted_multisource_dataset(
+        train_path=str(config_path),
+        transform=_transform,
+        shuffle=False,
+        dataset_repeat=True,
+    )
+    ds_resumed.load_state_dict(saved)
+    it_resumed = iter(ds_resumed)
+    assert next(it_resumed)["input_ids"] == [2]
+    assert next(it_resumed)["input_ids"] == [3]
+    assert next(it_resumed)["input_ids"] == [0]
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

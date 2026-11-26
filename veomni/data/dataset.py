@@ -662,6 +662,7 @@ class WeightedMultiSourceDataset(IterableDataset):
         self._random_state = np.random.RandomState(seed=self._seed)
         self._iters: List[Any] = []
         self._epoch = 0
+        self._shared_epoch = torch.tensor(0, dtype=torch.int64).share_memory_()
         self._reset_counts = [0 for _ in range(self._ds_num)]
         self._exhausted = [False for _ in range(self._ds_num)]
         if self._weights.shape[0] != self._ds_num:
@@ -749,6 +750,7 @@ class WeightedMultiSourceDataset(IterableDataset):
             epoch: Current epoch number.
         """
         self._epoch = epoch
+        self._shared_epoch.fill_(epoch)
         for dataset in self._datasets:
             set_epoch_fn = getattr(dataset, "set_epoch", None)
             if callable(set_epoch_fn):
@@ -765,6 +767,7 @@ class WeightedMultiSourceDataset(IterableDataset):
         worker_info = get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         if worker_info is not None:
+            self._epoch = int(self._shared_epoch.item())
             for ds in self._datasets:
                 _detach_hf_epoch_for_worker(ds)
         if not self._just_resumed:
@@ -773,7 +776,7 @@ class WeightedMultiSourceDataset(IterableDataset):
             self._random_state = np.random.RandomState(current_seed)
             for idx, ds in enumerate(self._datasets):
                 _clear_hf_starting_state_dict(ds)
-                if self._reset_counts[idx] > 0:
+                if worker_info is not None or self._reset_counts[idx] > 0:
                     set_epoch_fn = getattr(ds, "set_epoch", None)
                     if callable(set_epoch_fn):
                         set_epoch_fn(self._epoch)
@@ -785,7 +788,7 @@ class WeightedMultiSourceDataset(IterableDataset):
         else:
             self._just_resumed = False
             for idx, ds in enumerate(self._datasets):
-                if self._reset_counts[idx] > 0:
+                if worker_info is not None or self._reset_counts[idx] > 0:
                     set_epoch_fn = getattr(ds, "set_epoch", None)
                     if callable(set_epoch_fn):
                         set_epoch_fn(self._epoch + self._reset_counts[idx])
