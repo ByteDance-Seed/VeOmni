@@ -20,6 +20,9 @@ without importing the exchange helpers.
 
 from __future__ import annotations
 
+# Imported by value. Tests that simulate an NPU host patch this module's name,
+# not ``veomni.utils.device.IS_NPU_AVAILABLE``. The NPU allow-list below is
+# deepseek_v4 only; ``CONTEXT_PARALLEL_MODEL_TYPES`` also admits qwen4_exp on GPU.
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 

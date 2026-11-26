@@ -235,6 +235,7 @@ def flash_attention_forward(
     if value_head_dim < head_dim:
         value = torch.nn.functional.pad(value, (0, head_dim - value_head_dim))
 
+    # The bare ``flash_attention_2`` name in attention/__init__.py calls this too.
     kwargs = ensure_npu_host_cu_seqlens(kwargs, query.device.type)
 
     attn_output = _flash_attention_forward(

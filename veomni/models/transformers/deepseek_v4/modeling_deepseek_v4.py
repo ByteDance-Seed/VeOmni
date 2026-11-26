@@ -439,10 +439,12 @@ class DeepseekV4HCACompressor(nn.Module):
         # Accepted and ignored. ``DeepseekV4Attention.forward`` holds one compressor whose
         # class is chosen by layer type and calls it through a single call site, so the two
         # compressors have to take the same arguments; only the CSA one owns a Lightning
-        # Indexer and so only it has anything to do with this. Defaulted, so an HCA
+        # Indexer and so only it has anything to do with these. Defaulted, so an HCA
         # compressor called directly is unaffected.
         build_indexer_loss: bool = False,
+        positions_are_canonical: bool | None = None,
     ) -> tuple[torch.Tensor, CompressedCandidates]:
+        del build_indexer_loss, positions_are_canonical
         if (packed_sequence_slices is None) != (packed_compression_metadata is None):
             raise ValueError("Packed sequence slices and compression metadata must be provided together")
         batch, _, _ = hidden_states.shape
@@ -671,6 +673,7 @@ class DeepseekV4Indexer(nn.Module):
         packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
         packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
         build_indexer_loss: bool = False,
+        positions_are_canonical: bool | None = None,
     ) -> torch.LongTensor | tuple[torch.LongTensor, torch.Tensor]:
         if (packed_sequence_slices is None) != (packed_compression_metadata is None):
             raise ValueError("Packed sequence slices and compression metadata must be provided together")
@@ -871,6 +874,10 @@ class DeepseekV4Indexer(nn.Module):
                 query_range_starts = query_range_starts[query_start:query_end]
                 query_range_ends = query_range_ends[query_start:query_end]
 
+        # Packed, CP, and Ulysses already pass ranges. The attention module sets
+        # this flag when the query rows own the whole KV buffer, which is the
+        # 0..S-1 layout, including a prefill whose cache is still empty. Decode
+        # leaves it false so CANN refuses that layout instead of reading the ids.
         index_score, top_k_indices = self.veomni_dsa_indexer(
             query,
             compressed_kv.transpose(0, 1),
@@ -881,6 +888,7 @@ class DeepseekV4Indexer(nn.Module):
             cu_seqlen_ke=query_range_ends,
             packed_sequence_slices=packed_sequence_slices,
             position_ids=position_ids if query_range_starts is None else None,
+            positions_are_canonical=positions_are_canonical if query_range_starts is None else None,
             require_score_grad=build_indexer_loss,
         )
         if ulysses_query_partition:
@@ -955,6 +963,7 @@ class DeepseekV4CSACompressor(nn.Module):
         packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
         packed_compression_metadata: dict[int, dict[str, torch.Tensor]] | None = None,
         build_indexer_loss: bool = False,
+        positions_are_canonical: bool | None = None,
     ) -> tuple[torch.Tensor, CompressedCandidates]:
         if (packed_sequence_slices is None) != (packed_compression_metadata is None):
             raise ValueError("Packed sequence slices and compression metadata must be provided together")
@@ -1030,6 +1039,7 @@ class DeepseekV4CSACompressor(nn.Module):
                 packed_sequence_slices=packed_sequence_slices,
                 packed_compression_metadata=packed_compression_metadata,
                 build_indexer_loss=build_indexer_loss,
+                positions_are_canonical=positions_are_canonical,
             )
             top_k_indices, indexer_scores = _split_indexer_output(indexer_output, build_indexer_loss)
             return compressed_kv, CompressedCandidates(topk_indices=top_k_indices, indexer_scores=indexer_scores)
@@ -1107,6 +1117,7 @@ class DeepseekV4CSACompressor(nn.Module):
             past_key_values,
             layer_idx,
             build_indexer_loss=build_indexer_loss,
+            positions_are_canonical=positions_are_canonical,
         )
         top_k_indices, indexer_scores = _split_indexer_output(indexer_output, build_indexer_loss)
         return compressed_kv, CompressedCandidates(topk_indices=top_k_indices, indexer_scores=indexer_scores)
@@ -1403,6 +1414,7 @@ class DeepseekV4Attention(nn.Module):
                 packed_sequence_slices=kwargs.get("packed_sequence_slices"),
                 packed_compression_metadata=kwargs.get("packed_compression_metadata"),
                 build_indexer_loss=build_indexer_loss,
+                positions_are_canonical=query_offset == 0,
             )
 
         attention_interface = self.veomni_attn

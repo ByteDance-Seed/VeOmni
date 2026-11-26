@@ -62,6 +62,7 @@ when the selected implementation runs.
 | `kv_round` | `standard`, `deepseek_v4` | `none` (leave stored tensors alone), `eager`, `triton` (NVIDIA SM89+/ROCm, FP8 E4M3); `standard` takes block width and quantized prefix as call arguments, `deepseek_v4` fixes the model's two geometries and takes `rope_features` |
 | `mhc` | `pre`, `post`, `head` | `eager`, `tilelang`, `cann` (`head` / `cann` is the eager math) |
 | `qsa_attention` | `standard` | `eager`, `tilelang` (NVIDIA CUDA), `torch_npu` (Ascend NPU) |
+| `qsa_indexer` | `standard` | `eager` |
 
 The MLU `liger_kernel` rows reuse the CUDA adapters and use
 `MluKernelRequirement` with `requires=("liger_kernel",)`: the Cambricon
@@ -92,6 +93,12 @@ atomic scatter, at the cost of sorting and a partial-gradient workspace.
 aligned), builds a local boolean mask via `int8` scatter, and calls
 `torch_npu.npu_fusion_attention` / `npu_fusion_attention_grad` without forward
 replay.
+
+`qsa_indexer` is the block top-k in front of that selection. It receives
+ReLU block scores and a visibility mask. Projections, RoPE, packed metadata,
+and the compressed-row gather stay in the model. `eager` fills invisible
+blocks with `-1.0`, which stays below ReLU scores (`>= 0`) and avoids the
+`-inf` rows that fault Ascend `TopKV2`. The NPU validity gather uses `int8`.
 
 The registry is the source of truth for the exact rows available in a given
 revision:

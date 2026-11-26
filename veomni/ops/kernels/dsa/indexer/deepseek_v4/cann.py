@@ -247,6 +247,7 @@ def wrapper(
     cu_seqlen_ke: Tensor | None = None,
     packed_sequence_slices: tuple[tuple[int, int], ...] | None = None,
     position_ids: Tensor | None = None,
+    positions_are_canonical: bool | None = None,
     require_score_grad: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """Select compressed-KV entries with the CANN Lightning Indexer.
@@ -255,6 +256,8 @@ def wrapper(
     ``weights`` is ``[S, B, H]``, in any strides. Returns scores and indices
     with shape ``[B, S, min(topk, S_kv)]``. Unselectable slots hold index -1
     and score ``-inf``. The kernel is forward-only, so scores carry no gradient.
+    Without cu_seqlen ranges it selects by query row. Pass
+    ``positions_are_canonical=True`` only when ``position_ids`` is ``0..S-1``.
     """
     if require_score_grad:
         raise NotImplementedError(
@@ -271,11 +274,14 @@ def wrapper(
         raise ValueError("cu_seqlen_ks and cu_seqlen_ke must be provided together")
 
     seq_len, batch = index_q.shape[:2]
-    if cu_seqlen_ks is None and position_ids is not None:
-        canonical_positions = torch.arange(seq_len, device=position_ids.device).unsqueeze(0).expand_as(position_ids)
-        if not torch.equal(position_ids, canonical_positions):
-            cu_seqlen_ks = torch.zeros(seq_len, device=index_q.device, dtype=torch.int32)
-            cu_seqlen_ke = ((position_ids[0].to(device=index_q.device) + 1) // compress_ratio).to(torch.int32)
+    # Row-causal selection assumes positions 0..S-1. Comparing ``position_ids``
+    # here would sync every CSA layer. The caller declares that layout instead.
+    if cu_seqlen_ks is None and position_ids is not None and positions_are_canonical is not True:
+        raise ValueError(
+            "dsa_indexer deepseek_v4 cann selects by query row when no cu_seqlen ranges are given, "
+            "so non-canonical position_ids need the eager or tilelang implementation. "
+            "Pass positions_are_canonical=True only when position_ids is 0..S-1."
+        )
     compressed_len = index_k.shape[0]
     q = index_q.transpose(0, 1)
     k = index_k.transpose(0, 1)

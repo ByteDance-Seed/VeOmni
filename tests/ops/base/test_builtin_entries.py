@@ -162,6 +162,7 @@ _BUILTIN_ENTRIES = (
     ("qsa_attention", "standard", "eager", "any", _ANY, ()),
     ("qsa_attention", "standard", "tilelang", "cuda", _GPU_NVIDIA, ("tilelang",)),
     ("qsa_attention", "standard", "torch_npu", "npu", _NPU, ()),
+    ("qsa_indexer", "standard", "eager", "any", _ANY, ()),
     ("moe_experts", "standard", "eager", "any", _ANY, ()),
     ("moe_experts", "standard", "fused_triton", "cuda", _GPU_SM70, ("triton",)),
     ("moe_experts", "standard", "fused_triton", "mlu", _MLU, ("triton",)),

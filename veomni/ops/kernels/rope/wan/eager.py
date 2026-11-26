@@ -43,7 +43,10 @@ def _as_complex_freqs(freqs: Tensor | tuple[Tensor, Tensor]) -> Tensor:
     """Return complex freqs. An existing complex tensor is unchanged.
 
     A real pair is packed as ``[S, 1, D/2]``. CPU uses float64 so the multiply
-    matches the complex-tensor path. NPU storage uses float32.
+    matches the complex-tensor path. NPU has no float64 complex storage, so
+    the same pair is packed in float32 there. Triton keeps the caller's dtype.
+    The result is cast back to the activation dtype, so the gap is below a
+    bf16 or fp16 output step.
     """
     if isinstance(freqs, Tensor):
         return freqs

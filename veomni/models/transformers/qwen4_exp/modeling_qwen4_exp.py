@@ -83,7 +83,6 @@ from veomni.models.transformers.qwen4_exp.packed_ple import (
 from veomni.models.transformers.qwen4_exp.qsa_metadata import PreparedQSAMetadata, prepare_qsa_metadata
 from veomni.ops import VeomniOp
 from veomni.ops.kernels.gated_delta_rule import GROUPED_VALUE_HEAD_IMPLS
-from veomni.ops.kernels.qsa_attention import select_visible_topk_blocks
 from veomni.utils import logging
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.model_outputs import FusedLinearAuxOutputMixin
@@ -977,6 +976,7 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
         self.q_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps, config=config)
         self.k_layernorm = Qwen4ExpTextRMSNorm(self.index_head_dim, eps=config.rms_norm_eps, config=config)
         self.veomni_rope = VeomniOp("rope", "partial", config.ops_config.rotary_pos_emb_implementation)
+        self.veomni_qsa_indexer = VeomniOp("qsa_indexer", "standard", config.ops_config.qsa_indexer_implementation)
 
     def forward(
         self,
@@ -1107,7 +1107,7 @@ class Qwen4ExpTextQSAIndexer(nn.Module):
                     block_starts[None, None] + self.compress_ratio - 1
                     <= query_positions[None, query_start:query_end, None]
                 )
-                top_blocks, top_valid = select_visible_topk_blocks(scores, visible, top_count)
+                top_blocks, top_valid = self.veomni_qsa_indexer(scores, visible, top_count)
                 selected_starts = block_starts[top_blocks].to(torch.int32)
                 selected_chunk = selected_starts[..., None] + block_offsets
                 selected_chunks.append(selected_chunk.masked_fill(~top_valid[..., None], -1).flatten(-2))

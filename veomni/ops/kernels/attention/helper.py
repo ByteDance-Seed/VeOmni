@@ -23,9 +23,14 @@ import torch
 _SDPA_CU_SEQLENS_KEYS = ("cu_seqlens", "cu_seqlens_q", "cu_seqlens_k", "cu_seq_lens_q", "cu_seq_lens_k")
 _SDPA_PACKED_METADATA_KEYS = (*_SDPA_CU_SEQLENS_KEYS, "max_length_q", "max_length_k", "max_seqlen_q", "max_seqlen_k")
 _FA_CU_SEQLENS_KEYS = ("cu_seq_lens_q", "cu_seq_lens_k", "cu_seqlens_q", "cu_seqlens_k")
+# One forward usually carries one or two distinct cu_seqlens tensors, shared by
+# Q and K and reused across layers. 16 is that budget, not a prefix-cache size.
+# The list is unlocked and process-global: interleaved forwards still return
+# the right copy or miss and copy again. They do not corrupt each other.
 _NPU_HOST_CU_SEQLENS_CACHE_MAX = 16
 # Trainable tensors key on ``_version``. Inference tensors have no version
 # counter, so they key on storage identity and are not rewritten in place.
+# Shape and dtype stay in that key so two views of one storage do not collide.
 _HostCacheKey = int | tuple[int, tuple[int, ...], torch.dtype]
 _NPU_HOST_CU_SEQLENS_CACHE: list[tuple[weakref.ref[torch.Tensor], _HostCacheKey, torch.Tensor]] = []
 

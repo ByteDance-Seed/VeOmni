@@ -1677,6 +1677,15 @@ class OpsImplementationConfig:
             "attention mask. Nonzero attention dropout falls back to eager with a warning."
         },
     )
+    qsa_indexer_implementation: Literal["eager"] = field(
+        default="eager",
+        metadata={
+            "help": "Qwen4-Exp QSA block top-k. 'eager' masks invisible blocks with finite -1.0 "
+            "and runs PyTorch topk. Visible scores are ReLU outputs (>= 0), so -1.0 stays below "
+            "them without an -inf sentinel that faults Ascend TopKV2. On NPU the validity gather "
+            "uses int8. Projections, RoPE, and the compressed-row gather stay in the model."
+        },
+    )
     dsa_indexer_implementation: Literal["eager", "cudnn", "cann", "tilelang"] = field(
         default="eager",
         metadata={

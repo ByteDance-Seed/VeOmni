@@ -484,6 +484,7 @@ def test_indexer_canonical_position_ids_uses_causal_plan(fake_ops: _FakeOps):
         _RATE,
         2,
         position_ids=position_ids,
+        positions_are_canonical=True,
     )
 
     assert len(fake_ops.indexer_calls) == 1

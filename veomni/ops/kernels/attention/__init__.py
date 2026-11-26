@@ -141,6 +141,8 @@ def lookup(impl: str) -> Callable:
             )
 
         if interface == "flash_attention_2":
+            # standard/flash.py calls the same helper for the bound veomni_* rows.
+            # A later NPU flash entry has to call it too; skipping it only drops the cache.
             kwargs = ensure_npu_host_cu_seqlens(kwargs, query.device.type)
 
         return forward(

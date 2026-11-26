@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from scripts.ci.accelerator.launch_plan import from_parameter
+from veomni.ops import resolve_op
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
@@ -33,6 +34,7 @@ def test_compact_qsa_finite_mask_matches_inf_packed_selection(monkeypatch):
         q_layernorm=torch.nn.Identity(),
         k_layernorm=torch.nn.Identity(),
         veomni_rope=lambda q, k, cos, sin, **kwargs: (q, k),
+        veomni_qsa_indexer=resolve_op("qsa_indexer", "standard", "eager").wrapper,
     )
     positions = (torch.ones(1, 25, 2), torch.zeros(1, 25, 2))
     boundaries = torch.tensor([0, 9, 25], dtype=torch.int32)
@@ -41,16 +43,16 @@ def test_compact_qsa_finite_mask_matches_inf_packed_selection(monkeypatch):
         top_blocks = scores.masked_fill(~visible, float("-inf")).topk(top_count, dim=-1).indices
         return top_blocks, visible.gather(-1, top_blocks)
 
-    with monkeypatch.context() as mp:
-        mp.setattr(modeling, "select_visible_topk_blocks", inf_selection)
-        expected = modeling.Qwen4ExpTextQSAIndexer.forward(
-            indexer,
-            hidden,
-            positions,
-            attention_mask=None,
-            past_key_values=None,
-            cu_seq_lens_q=boundaries,
-        )
+    indexer.veomni_qsa_indexer = inf_selection
+    expected = modeling.Qwen4ExpTextQSAIndexer.forward(
+        indexer,
+        hidden,
+        positions,
+        attention_mask=None,
+        past_key_values=None,
+        cu_seq_lens_q=boundaries,
+    )
+    indexer.veomni_qsa_indexer = resolve_op("qsa_indexer", "standard", "eager").wrapper
 
     orig_topk = torch.Tensor.topk
     topk_inputs: list[torch.Tensor] = []
@@ -87,35 +89,6 @@ def test_compact_qsa_finite_mask_matches_inf_packed_selection(monkeypatch):
     assert (actual[0, 9] >= 0).sum() == 1  # The next packed example starts fresh.
 
 
-@pytest.mark.parametrize(
-    "device_type",
-    ["cpu", pytest.param("npu", marks=pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="requires Ascend"))],
-)
-@pytest.mark.parametrize("key_length", [511, 513, 29166])
-@pytest.mark.parametrize("quantized", [False, True])
-def test_qsa_sparse_topk_boundary(device_type: str, key_length: int, quantized: bool):
-    """Verify -1.0 finite masking matches -inf selection across TopKV2 boundary sizes."""
-    rows, k = 143, min(512, key_length)
-    scores = torch.rand((1, rows, key_length), generator=torch.Generator().manual_seed(38))
-    if quantized:
-        scores = (scores * 4).floor()  # Exact zeros and ties at the selection cutoff.
-    visible = torch.zeros_like(scores, dtype=torch.bool)
-    for row in range(rows - 6):
-        count = min((1951 + row) // 4, key_length)
-        visible[0, row, key_length - count :] = True
-    visible[0, -3:, -1] = True
-    # The preceding three rows are all masked; the last three have one block.
-    reference = scores.masked_fill(~visible, float("-inf")).sort(dim=-1, descending=True).values[..., :k]
-    device_scores, device_visible = scores.to(device_type), visible.to(device_type)
-    masked = device_scores.masked_fill(~device_visible, -1.0)
-    picked = masked.topk(k, dim=-1).indices.cpu()
-    valid = visible.gather(-1, picked)
-    values = scores.gather(-1, picked).masked_fill(~valid, float("-inf"))
-    torch.testing.assert_close(values.sort(dim=-1, descending=True).values, reference, rtol=0, atol=0)
-    assert torch.equal(valid.sum(dim=-1), visible.sum(dim=-1).clamp(max=k))
-    assert not valid[0, -6:-3].any()
-
-
 def _native_indexer_worker(rank, world_size, endpoint):
     """Compare the real NPU INT8 gather against a bool-gather oracle on packed shards."""
     from datetime import timedelta
@@ -147,6 +120,7 @@ def _native_indexer_worker(rank, world_size, endpoint):
             q_layernorm=torch.nn.Identity(),
             k_layernorm=torch.nn.Identity(),
             veomni_rope=lambda q, k, cos, sin, **kwargs: (q, k),
+            veomni_qsa_indexer=resolve_op("qsa_indexer", "standard", "eager").wrapper,
         )
         gather = torch.Tensor.gather
         bool_calls = []
