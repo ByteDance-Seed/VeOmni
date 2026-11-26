@@ -30,8 +30,7 @@ usage/basic_modules.md
 usage/multimodal_data_processing.md
 usage/data_packing_and_dyn_bsz.md
 usage/dit_microbatching.md
-usage/float8_training.md
-usage/mxfp4_qat.md
+usage/low_precision_training.md
 usage/support_new_models/guide_and_checklist.md
 usage/support_new_models/qwen3_vl_example.md
 usage/support_new_models/qwen3_omni_moe_example.md
@@ -84,6 +83,7 @@ examples/wan2.1_I2V_1.3B.md
 examples/ltx-2.3.md
 examples/qwen3_dpo.md
 examples/seed_oss.md
+examples/kimi_k3.md
 ```
 
 ```{toctree}
@@ -93,11 +93,13 @@ examples/seed_oss.md
 key_features/model_loader.md
 key_features/preprocessor_registry.md
 key_features/ep_fsdp2.md
+key_features/hyper_parallel.md
 key_features/extra_parallel.md
 key_features/sharded_embedding.md
 key_features/ulysses.md
 key_features/lora.md
 key_features/activation_offload.md
+key_features/torch_compile.md
 key_features/moe_router_monitor.md
 key_features/channel_loss.md
 key_features/dcp_async_save.md
@@ -144,7 +146,7 @@ design/ci_case_scheduling.md
 design/op_selection.md
 design/module_config.md
 design/fused_moe_ops.md
-design/deepgemm_fp8_moe.md
+design/deepgemm_moe.md
 design/local_parallel_state.md
 design/qwen4_exp_ple_2d_parallelism.md
 design/verl_topk_distill_integration.md

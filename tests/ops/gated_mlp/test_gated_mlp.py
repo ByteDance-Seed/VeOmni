@@ -646,10 +646,8 @@ def test_the_eager_row_evaluates_every_activation_it_claims(activation, dtype):
     """The row takes the activation as an argument, so a non-SiLU model can quantize.
 
     The oracle is ``ACT2FN[activation]``, not a formula restated here. That is the
-    point: ``gelu_new`` (``NewGELUActivation``) stages ``torch.pow(x, 3.0)`` while
-    ``gelu_pytorch_tanh`` (``PytorchGELUTanh``) writes ``x * x * x``, and the two
-    round differently in bf16. A hand-written tanh formula would have accepted the
-    wrong function for one of them.
+    point: ``gelu`` is the exact-erf form and ``gelu_pytorch_tanh`` the tanh
+    approximation, so a single restated formula would silently accept the wrong one.
 
     Parametrized over ``supported_activations()`` rather than a list here, so the
     test and the implementation cannot disagree about what is supported.
@@ -810,7 +808,7 @@ def test_the_supported_set_is_the_bounded_whitelist():
     """
     from veomni.ops.activation import SUPPORTED_ACTIVATIONS, normalize_activation, supports
 
-    assert set(SUPPORTED_ACTIVATIONS) == {"silu", "swish", "gelu", "gelu_new", "gelu_pytorch_tanh"}
+    assert set(SUPPORTED_ACTIVATIONS) == {"silu", "swish", "gelu", "gelu_pytorch_tanh"}
 
     for name in SUPPORTED_ACTIVATIONS:
         assert supports(name)
@@ -827,10 +825,10 @@ def test_the_supported_set_is_the_bounded_whitelist():
 def test_a_linear_subclass_projection_runs_its_own_forward():
     """Only an exact ``nn.Linear`` may be read by weight; a subclass runs its own forward.
 
-    torchao's ``Float8Linear`` subclasses ``nn.Linear`` and does its float8 GEMM in
-    ``forward``. An ``isinstance`` check would let the fused row read its weight and
-    silently skip float8, so the check must be on the exact type. A quantizing row
-    on such a projection is refused instead of falling back.
+    An ``nn.Linear`` subclass (such as ``FSDPLinear`` from ``basic_modules``) does
+    extra work in ``forward``. An ``isinstance`` check would let the fused row read
+    its weight and bypass that work, so the check must be on the exact type. A
+    quantizing row on such a projection is refused instead of falling back.
     """
     from veomni.ops.kernels.gated_mlp._module import render
 
@@ -857,7 +855,7 @@ def test_a_linear_subclass_projection_runs_its_own_forward():
     with pytest.raises(ValueError, match="nn.Linear subclass"):
         render(mlp, impl="qat", activation="silu")
     with pytest.raises(ValueError, match="nn.Linear subclass"):
-        render(mlp, impl="torchao_nvfp4", activation="silu")
+        render(mlp, impl="torchao", activation="silu")
 
 
 @_cpu
@@ -874,7 +872,7 @@ def test_render_routes_each_row_by_shape_and_activation():
 
     mlp = _tiny_qwen3_mlp()
 
-    for impl in ("eager", "qat", "torchao_nvfp4", "liger_kernel"):
+    for impl in ("eager", "qat", "torchao", "liger_kernel"):
         for activation in ("silu", "swish"):
             assert render(mlp, impl=impl, activation=activation).projections is None, (impl, activation)
 
@@ -882,12 +880,37 @@ def test_render_routes_each_row_by_shape_and_activation():
     # knows it: a ``gelu`` model never enters the row, so there is no second guard
     # inside ``liger_kernel.forward`` to keep in sync (or to test separately).
     assert render(mlp, impl="liger_kernel", activation="gelu").projections is not None
-    for impl in ("eager", "qat", "torchao_nvfp4"):
+    for impl in ("eager", "qat", "torchao"):
         assert render(mlp, impl=impl, activation="gelu").projections is None
 
     # An activation outside the set is never served by a row.
     for impl in ("eager", "liger_kernel"):
         assert render(mlp, impl=impl, activation="mish").projections is not None
+
+
+@_cpu
+def test_every_supported_activation_has_a_backward_and_nothing_else_does():
+    """The derivative covers exactly the served names, and refuses the rest.
+
+    ``apply_activation_backward`` is called from ``moe_experts``' hand-written
+    ``autograd.Function``s, where the derivative must be supplied explicitly. It is
+    a chain of explicit branches with no fallback, so a name it does not know raises
+    rather than differentiating as whichever branch came last -- and a name added to
+    :data:`SUPPORTED_ACTIVATIONS` without a branch here fails this test rather than
+    reaching a training run.
+    """
+    import torch
+
+    from veomni.ops.activation import SUPPORTED_ACTIVATIONS, apply_activation_backward
+
+    grad = torch.randn(8)
+    hidden = torch.randn(8)
+    for name in SUPPORTED_ACTIVATIONS:
+        assert apply_activation_backward(grad, hidden, name).shape == hidden.shape
+
+    for name in ("relu", "mish", "quick_gelu", "gelu_10"):
+        with pytest.raises(ValueError, match="No activation backward"):
+            apply_activation_backward(grad, hidden, name)
 
 
 @_cpu
@@ -946,13 +969,13 @@ def test_render_refuses_a_quantizing_row_it_cannot_serve():
         render(mlp, impl="qat", activation="silu")
 
     # Both messages name `eager` as the way to keep the projection path.
-    for impl, activation in (("qat", "mish"), ("torchao_nvfp4", "mish")):
+    for impl, activation in (("qat", "mish"), ("torchao", "mish")):
         with pytest.raises(ValueError, match="gated_mlp_implementation='eager'"):
             render(mlp, impl=impl, activation=activation)
 
 
 @_cpu
-@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh", "gelu_new"])
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh"])
 def test_the_eager_row_compiles_fullgraph(activation):
     """A compiled forward must not regress against the plain projection path.
 
@@ -986,7 +1009,7 @@ def test_the_eager_row_compiles_fullgraph(activation):
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_new"])
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh"])
 def test_the_eager_row_backward_survives_activation_offload(activation):
     """The row must run inside ``saved_tensors_hooks``, which is how offload works.
 
@@ -1031,7 +1054,7 @@ def test_the_eager_row_backward_survives_activation_offload(activation):
     torch.testing.assert_close(offloaded, plain, rtol=0, atol=0)
 
 
-_requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reason="torchao_nvfp4 row needs torchao")
+_requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reason="torchao row needs torchao")
 
 
 @_cpu
@@ -1039,9 +1062,9 @@ _requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reas
 @pytest.mark.parametrize("swiglu_limit", [None, 1.0])
 def test_torchao_nvfp4_matches_manual_round_trip(swiglu_limit: float | None):
     """The fused row equals the same math with operands quantized by hand, clamp in the model dtype."""
-    from veomni.ops.qat.torchao_nvfp4 import nvfp4_fake_quant
+    from veomni.ops.torchao import nvfp4_fake_quant
 
-    impl = resolve_op("gated_mlp", "standard", "torchao_nvfp4").wrapper
+    impl = resolve_op("gated_mlp", "standard", "torchao").wrapper
     torch.manual_seed(0)
     mlp = _tiny_qwen3_mlp(64, 128).to(dtype=torch.bfloat16)
     x = torch.randn(2, 16, 64, dtype=torch.bfloat16)
@@ -1065,7 +1088,7 @@ def test_torchao_nvfp4_matches_manual_round_trip(swiglu_limit: float | None):
 @_requires_torchao
 def test_torchao_nvfp4_backward_produces_finite_gradients():
     """Straight-through gradients reach the input and every projection weight."""
-    impl = resolve_op("gated_mlp", "standard", "torchao_nvfp4").wrapper
+    impl = resolve_op("gated_mlp", "standard", "torchao").wrapper
     torch.manual_seed(0)
     mlp = _tiny_qwen3_mlp().to(dtype=torch.bfloat16)
     x = torch.randn(2, 16, mlp.hidden_size, dtype=torch.bfloat16, requires_grad=True)
@@ -1082,7 +1105,7 @@ def test_torchao_nvfp4_backward_produces_finite_gradients():
 @_requires_torchao
 def test_torchao_nvfp4_handles_empty_input():
     """Zero-token inputs keep their shape and propagate zero gradients to the MLP weights."""
-    impl = resolve_op("gated_mlp", "standard", "torchao_nvfp4").wrapper
+    impl = resolve_op("gated_mlp", "standard", "torchao").wrapper
     mlp = _tiny_qwen3_mlp().to(dtype=torch.bfloat16)
     x = torch.randn(0, 8, mlp.hidden_size, dtype=torch.bfloat16, requires_grad=True)
 
@@ -1091,3 +1114,197 @@ def test_torchao_nvfp4_handles_empty_input():
     out.sum().backward()
     for parameter in mlp.parameters():
         torch.testing.assert_close(parameter.grad, torch.zeros_like(parameter))
+
+
+@_cpu
+def test_torchao_fp8_validates_and_dispatches_three_projections(monkeypatch):
+    """``gated_mlp`` ``torchao`` with ``dtype='fp8'`` runs gate, up, and down via ``torchao_fp8_linear``."""
+    from veomni.ops.kernels.gated_mlp.standard import torchao as gated_torchao
+
+    mlp = _tiny_qwen3_mlp()
+    x = torch.randn(2, 4, mlp.hidden_size)
+
+    with pytest.raises(ValueError, match="does not accept block_size"):
+        gated_torchao.wrapper(mlp, x, dtype="fp8", block_size=16)
+    with pytest.raises(ValueError, match="float8 recipe"):
+        gated_torchao.wrapper(mlp, x, dtype="fp8", recipe="invalid")
+    with pytest.raises(ValueError, match="recipe is only valid for dtype='fp8'"):
+        gated_torchao.wrapper(mlp, x, dtype="nvfp4", recipe="rowwise")
+    with pytest.raises(NotImplementedError, match="native FP4"):
+        gated_torchao.wrapper(mlp, x, dtype="nvfp4", emulated=False)
+
+    seen = []
+
+    def fake_fp8(inp, weight, bias=None, *, recipe, emulated):
+        seen.append((weight.shape, recipe, emulated))
+        return F.linear(inp, weight, bias)
+
+    monkeypatch.setattr(gated_torchao, "torchao_fp8_linear", fake_fp8)
+    out = gated_torchao.wrapper(mlp, x, dtype="fp8", recipe="rowwise_with_gw_hp")
+    expected = mlp.down_proj(F.silu(mlp.gate_proj(x)) * mlp.up_proj(x))
+    torch.testing.assert_close(out, expected)
+    assert seen == [
+        (mlp.gate_proj.weight.shape, "rowwise_with_gw_hp", False),
+        (mlp.up_proj.weight.shape, "rowwise_with_gw_hp", False),
+        (mlp.down_proj.weight.shape, "rowwise_with_gw_hp", False),
+    ]
+
+
+def test_the_deepgemm_row_is_registered_on_sm90_or_sm100():
+    from veomni.ops import OP_REGISTRY
+
+    assert "deepgemm" in OP_REGISTRY.list_registered("gated_mlp", "standard")
+    entry = {e.impl: e for e in OP_REGISTRY.list_entries("gated_mlp", "standard")}["deepgemm"]
+    assert entry.requires == ("deep_gemm", "triton")
+    assert {(p.min_cc, p.max_cc) for p in entry.requirement.platforms} == {(90, 90), (100, 100)}
+
+
+def test_the_deepgemm_row_declares_the_activations_its_kernel_fuses():
+    """``RecomputedSwiGLU`` fuses ``aten.silu``, so the row cannot serve another activation.
+
+    ``render`` consults ``ROW_ACTIVATIONS`` before the call, so a ``gelu`` model is
+    routed to its projection fallback. Declaring the set here is what makes that
+    routing right rather than accidental -- an entry missing from the map falls back
+    to ``eager``'s behaviour, which would claim the row can compute anything.
+    """
+    from veomni.ops.kernels.gated_mlp._module import ROW_ACTIVATIONS
+
+    assert ROW_ACTIVATIONS["deepgemm"] == frozenset({"silu", "swish"})
+
+
+def test_the_deepgemm_row_refuses_a_block_size_it_cannot_honor():
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+
+    mlp = torch.nn.Module()
+    mlp.gate_proj = torch.nn.Linear(256, 384, bias=False, dtype=torch.bfloat16)
+    mlp.up_proj = torch.nn.Linear(256, 384, bias=False, dtype=torch.bfloat16)
+    mlp.down_proj = torch.nn.Linear(384, 256, bias=False, dtype=torch.bfloat16)
+    x = torch.randn(2, 256, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="only block_size=128"):
+        deepgemm.wrapper(mlp, x, block_size=64)
+
+
+def test_the_deepgemm_row_refuses_a_wrapped_projection():
+    """It quantizes the weight it multiplies, so a LoRA wrapper has to be refused.
+
+    ``render`` raises instead of falling back to the projection modules, because a
+    fallback would train at full precision under a config that said otherwise.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+
+    class _Wrapped(nn.Module):
+        """Stand-in for ``LoraLinear``: no ``weight``, keeps the base at ``base_layer``."""
+
+        def __init__(self):
+            super().__init__()
+            self.base_layer = nn.Linear(256, 384, bias=False)
+
+        def forward(self, x):
+            return self.base_layer(x)
+
+    mlp = nn.Module()
+    mlp.gate_proj = _Wrapped()
+    mlp.up_proj = nn.Linear(256, 384, bias=False)
+    mlp.down_proj = nn.Linear(384, 256, bias=False)
+    with pytest.raises(ValueError, match="quantizes the projection weights"):
+        deepgemm.wrapper(mlp, torch.randn(2, 256), activation="silu")
+
+
+def test_the_deepgemm_row_refuses_an_activation_its_kernel_cannot_fuse():
+    """``render`` keeps a non-SiLU model off this row; a direct call must also refuse.
+
+    ``render`` raises first here, before the row's own check runs -- which is the
+    right order, because it has the wider message (it names the config field to
+    change). The row's ``_FUSED_ACTIVATIONS`` check is the second line of defence
+    for a caller that reaches the kernel some other way.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+
+    mlp = nn.Module()
+    mlp.gate_proj = nn.Linear(256, 384, bias=False)
+    mlp.up_proj = nn.Linear(256, 384, bias=False)
+    mlp.down_proj = nn.Linear(384, 256, bias=False)
+    with pytest.raises(ValueError, match="no quantizing row evaluates that activation"):
+        deepgemm.wrapper(mlp, torch.randn(2, 256), activation="gelu")
+
+
+def test_the_row_states_which_activations_it_serves():
+    """The served set is declared once and is what both the router and the row use.
+
+    This replaces a test that asserted substrings of `deepgemm_moe.md`. That test
+    passed while the prose was wrong — it required "SiLU-only" and an `eager`
+    mention, and the wrong sentence contained both, since it said every non-SiLU
+    activation was rejected and `swish` is SiLU under its other name. So it pinned
+    wording rather than behaviour, and would fail on any equivalent rephrasing.
+
+    What is worth pinning is the set: `render` routes on `ROW_ACTIVATIONS` and the
+    row re-checks the same names, so a row that serves a name it does not declare (or
+    declares one it cannot compute) is the bug this catches.
+    """
+    from veomni.ops.kernels.gated_mlp._module import ROW_ACTIVATIONS
+    from veomni.ops.kernels.gated_mlp.standard.deepgemm import _FUSED_ACTIVATIONS
+
+    declared = ROW_ACTIVATIONS["deepgemm"]
+    assert declared == _FUSED_ACTIVATIONS
+    # ``swish`` is ``ACT2FN``'s alias for SiLU, so a SiLU kernel serves it; a set
+    # without it would send those models down the unquantized path for nothing.
+    assert declared == frozenset({"silu", "swish"})
+
+
+def test_the_deepgemm_row_accepts_a_str_enum_activation():
+    """The row's membership check accepts ``ActivationType`` without unwrapping it.
+
+    ``render`` canonicalizes through ``normalize_activation``, which unwraps
+    ``Enum.value``; a raw ``activation in _FUSED_ACTIVATIONS`` then still has to
+    agree with it. It does, and only because ``ActivationType`` is a ``str`` enum:
+    ``__hash__`` is ``str.__hash__``, so the set lookup matches ``"silu"``. Pinning
+    that keeps a future non-``str`` enum (which *would* need ``is_silu``'s ``.value``
+    unwrapping) from silently diverging from ``render``.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.gated_mlp.standard import deepgemm
+    from veomni.ops.kernels.moe_experts.shared.group_gemm import ActivationType
+
+    assert issubclass(ActivationType, str), "premise: a str enum hashes like its value"
+    assert ActivationType.SILU in deepgemm._FUSED_ACTIVATIONS
+    assert ActivationType.GELU not in deepgemm._FUSED_ACTIVATIONS
+
+    mlp = nn.Module()
+    mlp.gate_proj = nn.Linear(128, 128, bias=False)
+    mlp.up_proj = nn.Linear(128, 128, bias=False)
+    mlp.down_proj = nn.Linear(128, 128, bias=False)
+
+    # ``SILU`` gets past the activation check and stops at the hardware guard: on a
+    # host without SM90/SM100 that is a ``RuntimeError``, which is how this proves
+    # the activation check let it through. ``GELU`` is refused by ``render`` first.
+    with pytest.raises(RuntimeError, match="deepgemm requires NVIDIA"):
+        deepgemm.wrapper(mlp, torch.randn(2, 128), activation=ActivationType.SILU)
+    with pytest.raises(ValueError, match="no quantizing row evaluates that activation"):
+        deepgemm.wrapper(mlp, torch.randn(2, 128), activation=ActivationType.GELU)
+
+
+def test_the_routed_expert_row_has_the_same_activation_restriction():
+    """`moe_experts` rows take `activation=` too, so `linear` is the only row without one.
+
+    The doc claimed the routed experts "take no activation", which would imply no
+    restriction on them. They do take it, and `deepgemm` refuses anything outside
+    `{silu, swish}` because its grouped GEMM fuses the activation as well.
+    """
+    import inspect
+
+    from veomni.ops.kernels.moe_experts.shared.activation import is_silu
+    from veomni.ops.kernels.moe_experts.standard import deepgemm as moe_deepgemm
+
+    assert "activation" in inspect.signature(moe_deepgemm.wrapper).parameters
+    assert is_silu("silu") and is_silu("swish")
+    assert not is_silu("gelu")
+
+    # `linear` is the one row with no activation argument.
+    from veomni.ops.kernels.linear.standard import deepgemm as linear_deepgemm
+
+    assert "activation" not in inspect.signature(linear_deepgemm.wrapper).parameters

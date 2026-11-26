@@ -85,7 +85,7 @@ The `output_dir` becomes `model.model_path` in `base.yaml`.
 ### 2.1 Load an upstream checkpoint directly
 
 A family that registers an HF layout (`OMNI_HF_LAYOUT_REGISTRY` — for example
-`qwen3`, `qwen3_vl`, and `bagel`) skips the convert: `model.model_path` (or
+`qwen3` and `qwen3_vl`) skips the convert: `model.model_path` (or
 `OmniModel.from_pretrained` / `OmniProcessor.from_pretrained`) can name the
 upstream HF checkpoint. Detection is by the root `config.json`'s `model_type`:
 `omni` is a split checkpoint, a type with a registered layout loads through it,
@@ -108,10 +108,10 @@ and any other type is an error.
   module. DCP checkpoints and resume stay per module.
 - **Requirements.** Direct HF loading applies when all active modules come from
   that single upstream checkpoint with their default `model_path` (the module
-  name) and standard weight loading (`ep_sharded_stream_load: false`). Direct HF
+  name); both standard loading and `extra_parallel_stream_load` are supported. Direct HF
   export (`save_hf_weights`) is supported when module tensor converters preserve
-  upstream parameter names and shapes; if a model composes multiple source
-  checkpoints or adds new parameters, convert to a split checkpoint first.
+  upstream parameter names and shapes (or declare `export_state`); if a model composes
+  multiple source checkpoints or adds new parameters, convert to a split checkpoint first.
 
 The offline convert of such a family goes through the same layout, so a split
 checkpoint and the direct load hold identical module weights. To add a layout

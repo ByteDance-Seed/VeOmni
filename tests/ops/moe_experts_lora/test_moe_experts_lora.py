@@ -440,7 +440,25 @@ def test_npu_ep_matches_nonep_single_rank(variant, _single_rank_dist):
             **_SCALES,
         )
         if ep:
-            out = _npu_ep_fused_lora_moe_forward(ep_group=None, **kwargs)
+            # The EP path reads the group from the parallel state, so `ep_group=None` no
+            # longer selects "single rank, no EP" -- it never reaches the group at all.
+            # Point the state at the one-rank gloo group this fixture created instead of
+            # building a mesh: `_init_parallel_state` sizes the mesh from WORLD_SIZE,
+            # which under the NPU CI job is the job's device count, not 1.
+            from types import SimpleNamespace
+            from unittest import mock
+
+            state = SimpleNamespace(
+                ep_group=dist.group.WORLD,
+                extra_parallel_sizes={"ep": 1},
+                ep_size=1,
+                ep_enabled=True,
+            )
+            with mock.patch(
+                "veomni.distributed.moe.moe_layer.get_parallel_state",
+                lambda: state,
+            ):
+                out = _npu_ep_fused_lora_moe_forward(**kwargs)
         else:
             out = _npu_fused_lora_moe_forward(**kwargs)
         return out, (h, routing, fc1, fc2, *(lora[key] for key in _LORA_KEYS))
@@ -548,8 +566,13 @@ def test_zero_b_preserves_fused_base_output_and_vjp(variant):
         assert torch.isfinite(lora[key].grad).all() and torch.count_nonzero(lora[key].grad) > 0
 
 
-def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
-    """Compare the full EP dispatch against non-EP with identical inputs and upstream gradients."""
+def _distributed_ep_parity_worker(rank: int, variant: str, impl: str, endpoint) -> None:
+    """Compare the full EP dispatch against non-EP with identical inputs and upstream gradients.
+
+    ``impl`` selects which registered row does the dispatch. ``eager`` was refused under
+    EP until it gained its own expert math, so its EP gradients had no coverage at all;
+    running the same parity check through it is the only thing that pins them.
+    """
     from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 
     torch.cuda.set_device(rank)
@@ -597,7 +620,7 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
 
         with use_parallel_state(non_ep_state):
             reference = _call(
-                "fused_triton",
+                impl,
                 variant,
                 hidden_reference,
                 routing_reference,
@@ -620,7 +643,7 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
         routing_ep = routing.detach().clone().requires_grad_(True)
         with use_parallel_state(ep_state):
             actual = _call(
-                "fused_triton",
+                impl,
                 variant,
                 hidden_ep,
                 routing_ep,
@@ -677,12 +700,220 @@ def _distributed_ep_parity_worker(rank: int, variant: str, endpoint) -> None:
     reason="distributed triton moe_experts_lora needs GPUs + triton",
 )
 @pytest.mark.parametrize("variant", ["shared", "independent"])
-def test_distributed_ep_dispatch_matches_nonep_forward_and_gradients(variant):
+@pytest.mark.parametrize("impl", ["fused_triton", "eager"])
+def test_distributed_ep_dispatch_matches_nonep_forward_and_gradients(variant, impl):
     """Two GPUs exercise real all-to-all dispatch and both LoRA gradient layouts."""
     if runner_device_count() < _CI_ACCELERATOR_2.nproc:
         pytest.skip("Distributed EP parity requires two CUDA devices.")
     spawn_with_rendezvous(
         _distributed_ep_parity_worker,
-        args=(variant,),
+        args=(variant, impl),
         nprocs=_CI_ACCELERATOR_2.nproc,
     )
+
+
+def _lora_ep_split_reference(impl_module, wrapper_kwargs, num_experts, ep_size, routed, cumsum, weights):
+    """Run the row's EP expert math by hand over ``ep_size`` shards, in one process.
+
+    The EP collective needs a real group, so the math is exercised directly: shard the
+    expert dim, feed each rank the rows ``cumsum`` assigns to its local experts, and
+    concatenate in rank order — which is what ``token_pre_all2all`` would deliver.
+    """
+
+    per_rank = num_experts // ep_size
+    outputs = []
+    for rank in range(ep_size):
+        lo, hi = rank * per_rank, (rank + 1) * per_rank
+        local_cumsum = cumsum[lo:hi] - (cumsum[lo - 1] if lo > 0 else 0)
+        start = cumsum[lo - 1] if lo > 0 else 0
+        local_tokens = routed[start : cumsum[hi - 1]]
+        local_weights = {
+            k: (v[lo:hi] if v.dim() >= 3 and v.shape[0] == num_experts else v) for k, v in weights.items()
+        }
+        outputs.append(
+            impl_module.apply(local_tokens, local_cumsum, **local_weights, **wrapper_kwargs),
+        )
+    return torch.cat(outputs, dim=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("mode", ["shared", "independent"])
+@pytest.mark.parametrize("ep_size", [2, 4])
+def test_lora_eager_ep_math_matches_the_non_ep_loop(mode, ep_size):
+    """The new EP expert math must reproduce the non-EP loop on the scattered tokens.
+
+    Both LoRA families gained an EP branch; before this they raised, so no numeric
+    check existed. Routing weights are applied by ``token_post_all2all`` in the real
+    pipeline, so this compares the unweighted permuted output.
+    """
+    import torch
+
+    from veomni.ops.kernels.moe_experts_lora import independent, shared
+
+    if mode == "shared":
+        impl_module = shared.eager._SharedLoRAExpertMathEP
+    else:
+        impl_module = independent.eager._IndependentLoRAExpertMathEP
+
+    torch.manual_seed(0)
+    num_experts, hidden, inter, rank, tokens, top_k = 4, 8, 16, 2, 6, 2
+    routed = torch.randn(tokens * top_k, hidden)
+    cumsum = torch.tensor([tokens * top_k // num_experts * (i + 1) for i in range(num_experts)], dtype=torch.long)
+    cumsum[-1] = tokens * top_k
+    fc1 = torch.randn(num_experts, 2 * inter, hidden)
+    fc2 = torch.randn(num_experts, hidden, inter)
+    scales = {"lora_scale_gate": 0.5, "lora_scale_up": 0.5, "lora_scale_down": 0.5}
+
+    if mode == "shared":
+        lora = {
+            "lora_a_gate": torch.randn(rank, hidden),
+            "lora_b_gate": torch.randn(inter, rank),
+            "lora_a_up": torch.randn(rank, hidden),
+            "lora_b_up": torch.randn(inter, rank),
+            "lora_a_down": torch.randn(rank, inter),
+            "lora_b_down": torch.randn(hidden, rank),
+        }
+    else:
+        lora = {
+            "lora_a_gate": torch.randn(num_experts, rank, hidden),
+            "lora_b_gate": torch.randn(num_experts, inter, rank),
+            "lora_a_up": torch.randn(num_experts, rank, hidden),
+            "lora_b_up": torch.randn(num_experts, inter, rank),
+            "lora_a_down": torch.randn(num_experts, rank, inter),
+            "lora_b_down": torch.randn(num_experts, hidden, rank),
+        }
+
+    weights = {"fc1_1_2_weight": fc1, "fc2_weight": fc2, **lora}
+    got = _lora_ep_split_reference(impl_module, scales, num_experts, ep_size, routed, cumsum, weights)
+
+    # Expected: the non-EP per-expert loop over the same permuted rows, unweighted.
+    import torch.nn.functional as F
+
+    expected = torch.empty_like(routed)
+    starts = torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
+    for e in range(num_experts):
+        s, t = int(starts[e]), int(cumsum[e])
+        state = routed[s:t]
+        if mode == "shared":
+            gate_up = F.linear(state, fc1[e]) + torch.cat(
+                [
+                    F.linear(F.linear(state, lora["lora_a_gate"]), lora["lora_b_gate"]) * scales["lora_scale_gate"],
+                    F.linear(F.linear(state, lora["lora_a_up"]), lora["lora_b_up"]) * scales["lora_scale_up"],
+                ],
+                dim=-1,
+            )
+            gate, up = gate_up.chunk(2, dim=-1)
+            mid = F.silu(gate) * up
+            lora_down = F.linear(F.linear(mid, lora["lora_a_down"]), lora["lora_b_down"]) * scales["lora_scale_down"]
+        else:
+            gate, up = F.linear(state, fc1[e]).chunk(2, dim=-1)
+            gate = torch.addmm(
+                gate,
+                F.linear(state, lora["lora_a_gate"][e]),
+                lora["lora_b_gate"][e].T,
+                alpha=scales["lora_scale_gate"],
+            )
+            up = torch.addmm(
+                up, F.linear(state, lora["lora_a_up"][e]), lora["lora_b_up"][e].T, alpha=scales["lora_scale_up"]
+            )
+            mid = F.silu(gate) * up
+            lora_down = (
+                F.linear(F.linear(mid, lora["lora_a_down"][e]), lora["lora_b_down"][e]) * scales["lora_scale_down"]
+            )
+        expected[s:t] = F.linear(mid, fc2[e]) + lora_down
+
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_npu_lora_ep_math_applies_both_deltas_between_the_gemms(monkeypatch):
+    """The Ascend LoRA expert math must add each delta at the right seam.
+
+    `_NpuLoRADeltasEP` is the only place the LoRA adapters meet the Ascend grouped
+    GEMMs, and it cannot run without torch_npu, so it had no test at all. Stub the two
+    kernels and assert the order: `gate_up + gate_up_delta` -> `swiglu` ->
+    `down + down_delta`. A delta added on the wrong side of `swiglu` would train a
+    different function while every shape still lined up.
+    """
+    import sys
+    import types
+
+    import torch
+
+    from veomni.ops.kernels.moe_experts.standard import npu as std_npu
+    from veomni.ops.kernels.moe_experts_lora import helper
+
+    calls: list[str] = []
+
+    npu_mod = types.ModuleType("torch_npu")
+
+    def swiglu(x, dim=-1):
+        """Record the activation and halve the last dim."""
+        calls.append("swiglu")
+        return x[..., : x.shape[-1] // 2]
+
+    npu_mod.npu_swiglu = swiglu
+    monkeypatch.setitem(sys.modules, "torch_npu", npu_mod)
+
+    def group_gemm(a, b, counts):
+        """Record the GEMM and return the width ``b`` implies, so the deltas line up."""
+        calls.append("gemm")
+        return torch.zeros(a.shape[0], b.shape[-1])
+
+    monkeypatch.setattr(std_npu, "npu_group_gemm", group_gemm)
+
+    hidden, intermediate, experts = 4, 8, 2
+    tokens = torch.randn(6, hidden)
+    fc1 = torch.randn(experts, 2 * intermediate, hidden)
+    fc2 = torch.randn(experts, hidden, intermediate)
+    cumsum = torch.tensor([3, 6], dtype=torch.long)
+
+    def gate_up_delta(x, counts):
+        """Record the gate/up delta seam."""
+        calls.append("gate_up_delta")
+        return torch.ones(x.shape[0], 2 * intermediate)
+
+    def down_delta(mid, counts):
+        """Record the down delta seam."""
+        calls.append("down_delta")
+        return torch.ones(mid.shape[0], hidden)
+
+    out = helper._NpuLoRADeltasEP.apply(tokens, cumsum, fc1, fc2, gate_up_delta, down_delta)
+
+    assert calls == ["gemm", "gate_up_delta", "swiglu", "gemm", "down_delta"], (
+        f"delta seams are in the wrong order: {calls}"
+    )
+    assert out.shape == tokens.shape
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_npu_lora_ep_math_keeps_an_empty_rank_on_the_graph(monkeypatch):
+    """A rank with no dispatched tokens must still produce a grad-carrying output.
+
+    Both stubs go through ``monkeypatch`` so the fake ``torch_npu`` is torn down with the
+    test: leaving it in ``sys.modules`` would make every later Ascend test import a
+    module that lacks the vendor functions (RMSNorm reaches for them on the next import).
+    """
+    import sys
+    import types
+
+    import torch
+
+    from veomni.ops.kernels.moe_experts.standard import npu as std_npu
+    from veomni.ops.kernels.moe_experts_lora import helper
+
+    npu_mod = types.ModuleType("torch_npu")
+    npu_mod.npu_swiglu = lambda x, dim=-1: x[..., : x.shape[-1] // 2]
+    monkeypatch.setitem(sys.modules, "torch_npu", npu_mod)
+    monkeypatch.setattr(std_npu, "npu_group_gemm", lambda a, b, counts: torch.zeros(a.shape[0], b.shape[-1]))
+
+    tokens = torch.zeros(0, 4, requires_grad=True)
+    out = helper._NpuLoRADeltasEP.apply(
+        tokens,
+        torch.tensor([0], dtype=torch.long),
+        torch.randn(1, 16, 4),
+        torch.randn(1, 4, 8),
+        lambda x, c: torch.zeros(x.shape[0], 16),
+        lambda x, c: torch.zeros(x.shape[0], 4),
+    )
+    assert out.requires_grad, "an empty rank detached from the graph"

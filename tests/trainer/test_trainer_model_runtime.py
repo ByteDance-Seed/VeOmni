@@ -14,14 +14,17 @@
 
 """The trainer composes a runtime; it does not inherit one."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.tools.training_utils import unbuilt_runtime
 from veomni.arguments import ModelArguments
+from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.models.model_runtime import VeOmniModelRuntime
+from veomni.trainer import base
 from veomni.trainer.base import BaseTrainer
 
 
@@ -122,3 +125,37 @@ class TestHowATrainerHoldsItsModel:
         )
 
         assert runtime.skip_hf_weight_load is False
+
+
+@pytest.fixture
+def hyper_cleanup(monkeypatch):
+    events = []
+    adapter = ModuleType("hyper_parallel.integration.veomni")
+    adapter.remove_hyper_parallel_patch = lambda: events.append("unpatch")
+    monkeypatch.setitem(sys.modules, adapter.__name__, adapter)
+    monkeypatch.setattr(DistributedCheckpointer, "wait_for_pending_save", lambda: events.append("save_done"))
+    monkeypatch.setattr(base.dist, "is_initialized", lambda: False)
+    trainer = BaseTrainer.__new__(BaseTrainer)
+    trainer.args = SimpleNamespace(model=ModelArguments(model_path="somewhere"))
+    trainer.args.model.accelerator.fsdp_config.fsdp_mode = "hyper_fsdp2"
+    return trainer, events
+
+
+def test_hyper_teardown_drains_saves_and_unpatches_without_a_process_group(hyper_cleanup):
+    trainer, events = hyper_cleanup
+    # DPO's base has no .model: job cleanup must not assume a single-model handle.
+    trainer.destroy_distributed()
+    assert events == ["save_done", "unpatch"]
+
+
+def test_hyper_teardown_unpatches_and_propagates_a_failed_save(hyper_cleanup, monkeypatch):
+    trainer, events = hyper_cleanup
+
+    def failed_save():
+        events.append("save_failed")
+        raise RuntimeError("Async checkpoint failed.")
+
+    monkeypatch.setattr(DistributedCheckpointer, "wait_for_pending_save", failed_save)
+    with pytest.raises(RuntimeError, match="Async checkpoint failed"):
+        trainer.destroy_distributed()
+    assert events == ["save_failed", "unpatch"]

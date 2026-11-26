@@ -26,8 +26,11 @@ from safetensors.torch import save_file
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.models.compare import eager_ops_config
+from tests.models.tiny_configs import tiny_minimax_h3_config
 from tests.models.tiny_configs import tiny_minimax_h3_image_condition_config as _tiny_condition_config
 from tests.models.tiny_configs import tiny_minimax_h3_image_config as _tiny_config
+from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import patchify_video, unpatchify_video
+from veomni.models.diffusers.minimax_h3.minimax_h3_core.packed_sequence import build_packed_fl2va, build_packed_ref2va
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
     MiniMaxH3DiTModel,
 )
@@ -44,6 +47,7 @@ from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_vae.configuration
 from veomni.models.diffusers.minimax_h3_image.minimax_h3_image_vae.modeling_minimax_h3_image_vae import (
     MiniMaxH3ImageVAE,
 )
+from veomni.models.diffusers.minimax_h3_image.pdd import DEFAULT_SIGMAS
 
 
 def _build_model() -> MiniMaxH3DiTModel:
@@ -96,8 +100,8 @@ def test_minimax_h3_image_forward_uses_pdd_heads_and_has_no_audio_modules():
 
     inputs = _image_inputs()
     with torch.no_grad():
-        first = model.forward_image(**inputs, pdd_step_index=0)
-        second = model.forward_image(**inputs, pdd_step_index=1)
+        first = model(**inputs, pdd_step_index=0)
+        second = model(**inputs, pdd_step_index=1)
 
     assert first.shape == (4, 2)
     assert second.shape == (4, 2)
@@ -105,14 +109,184 @@ def test_minimax_h3_image_forward_uses_pdd_heads_and_has_no_audio_modules():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_minimax_h3_image_forward_backpropagates_to_image_and_text_rows():
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_minimax_h3_image_forward_backpropagates_to_image_and_text_rows(checkpointing):
     model = _build_model()
+    if checkpointing:
+        model.gradient_checkpointing_enable({})
+    forward_calls = []
+    model.dit.blocks[0].register_forward_pre_hook(lambda *_: forward_calls.append(1))
     inputs = _image_inputs()
-    output = model.forward_image(**inputs, pdd_step_index=0)
+    output = model(**inputs, pdd_step_index=0)
     output.sum().backward()
 
     assert inputs["x"].grad is not None
     assert inputs["prompt_embeds"].grad is not None
+    assert len(forward_calls) == (2 if checkpointing else 1)
+
+
+def _run_minimax_h3_image_fsdp_forward(rank, weights_path, checkpointing, param_dtype, rendezvous):
+    from datetime import timedelta
+
+    import torch.distributed as dist
+    from torch.distributed._composable.fsdp import fully_shard
+    from torch.utils.checkpoint import DefaultDeviceType
+
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.arguments import MixedPrecisionConfig
+    from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
+    from veomni.distributed.torch_parallelize import build_parallelize_model
+    from veomni.models.auto import build_foundation_model
+
+    torch.set_num_threads(1)
+    # Spawned ranks do not inherit the CPU checkpoint default set by the CI plugin.
+    DefaultDeviceType.set_device_type("cpu")
+    dist.init_process_group("gloo", store=rendezvous.connect(), rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    try:
+        state = _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu")
+        torch.manual_seed(42)
+        model = _build_model().eval()
+        reference = _build_model().eval()
+        reference.load_state_dict(model.state_dict())
+        inputs = _image_inputs()
+        with torch.no_grad():
+            expected = reference(**inputs, pdd_step_index=0)
+
+        for block in model.dit.blocks:
+            fully_shard(block, mesh=state.fsdp_mesh)
+        fully_shard(model.dit, mesh=state.fsdp_mesh)
+        with torch.no_grad():
+            actual = model(**inputs, pdd_step_index=0)
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        if rank == 0:
+            save_file(reference.dit.state_dict(), str(weights_path / "model.safetensors"))
+        dist.barrier()
+        production = build_foundation_model(
+            _tiny_config(condition_model_type="MiniMaxH3ImageConditionModel"),
+            init_device="meta",
+            torch_dtype="float32",
+            ops_implementation=make_eager_ops_config(),
+        )
+        production.freeze_model()
+        production = build_parallelize_model(
+            production,
+            weights_path=str(weights_path),
+            init_device="meta",
+            mixed_precision=MixedPrecisionConfig(
+                enable=True, param_dtype=param_dtype, reduce_dtype="float32", cast_forward_inputs=False
+            ),
+            enable_gradient_checkpointing=checkpointing,
+        ).train()
+        block_dtypes, head_calls = [], []
+        production.dit.blocks[0].attn.qkv_proj.register_forward_pre_hook(
+            lambda module, args: block_dtypes.append(module.weight.dtype)
+        )
+
+        def check_pdd_head(module, index):
+            head_calls.append(index)
+            expected_head = reference.dit.final_layer.pdd_out[index]
+            torch.testing.assert_close(module.weight, expected_head.weight, rtol=0, atol=0)
+            torch.testing.assert_close(module.bias, expected_head.bias, rtol=0, atol=0)
+
+        for index, head in enumerate(production.dit.final_layer.pdd_out):
+            head.register_forward_pre_hook(lambda module, args, index=index: check_pdd_head(module, index))
+
+        for step in range(2):
+            production.zero_grad(set_to_none=True)
+            inputs["x"].grad = None
+            inputs["prompt_embeds"].grad = None
+            block_dtypes.clear()
+            head_calls.clear()
+            pdd_step_index = (rank + step) % 2
+            actual = production(**inputs, pdd_step_index=pdd_step_index)
+            assert actual.dtype == torch.float32 and torch.isfinite(actual).all()
+            if param_dtype == "float32":
+                with torch.no_grad():
+                    expected = reference(**inputs, pdd_step_index=pdd_step_index)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            forward_calls = len(block_dtypes)
+            actual.square().mean().backward()
+            if checkpointing:
+                assert len(block_dtypes) > forward_calls
+            assert set(block_dtypes) == {getattr(torch, param_dtype)}
+            assert head_calls == [pdd_step_index]
+            assert inputs["x"].grad is not None and torch.isfinite(inputs["x"].grad).all()
+            gradients = [parameter.grad for parameter in production.parameters() if parameter.grad is not None]
+            assert gradients and all(torch.isfinite(gradient.to_local()).all() for gradient in gradients)
+            assert all(
+                not parameter.requires_grad and parameter.grad is None
+                for parameter in production.dit.final_layer.pdd_out.parameters()
+            )
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+        clear_parallel_state()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(nproc=2, device="cpu"))
+@pytest.mark.parametrize("checkpointing,param_dtype", [(False, "float32"), (True, "float32"), (True, "bfloat16")])
+def test_minimax_h3_image_forward_through_fsdp2(tmp_path, checkpointing, param_dtype):
+    from tests.tools.launch_utils import spawn_with_rendezvous
+
+    spawn_with_rendezvous(_run_minimax_h3_image_fsdp_forward, args=(tmp_path, checkpointing, param_dtype), nprocs=2)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_image_training_updates_backbone_through_frozen_head():
+    torch.manual_seed(0)
+    config = tiny_minimax_h3_config(
+        audio_enabled=False, num_pdd_heads=6, condition_model_type="MiniMaxH3ImageConditionModel"
+    )
+    config._set_ops_implementation(eager_ops_config())
+    model = MiniMaxH3DiTModel(config)
+    assert all(param.requires_grad for param in model.dit.final_layer.pdd_out.parameters())
+    model.freeze_model()
+    inputs = {**_image_inputs(), "pdd_step_index": 2}
+    target = torch.randn_like(inputs["x"])
+    weight = torch.tensor(0.7)
+    backbone_before = model.dit.video_patch_proj.weight.detach().clone()
+    frozen_before = {
+        name: param.detach().clone() for name, param in model.named_parameters() if not param.requires_grad
+    }
+
+    with torch.no_grad():
+        raw_prediction = model(**inputs)
+        expected = (raw_prediction + target).square().mean() * weight
+    optimizer = torch.optim.AdamW((param for param in model.parameters() if param.requires_grad), lr=1e-3)
+    training_inputs = {
+        "x": inputs["x"],
+        "prompt_embeds": inputs["prompt_embeds"],
+        "img_position_ids": inputs["position_ids"].unsqueeze(0),
+        "unique_timesteps": inputs["unique_timesteps"],
+        "inverse_indices": inputs["timestep_indices"],
+        "token_tags": inputs["token_tags"],
+        "img_pos_info": {"position_ids": inputs["image_indices"]},
+        "img_pos_for_infer_output_info": {"position_ids": inputs["image_indices"]},
+        "text_pos_info": {"position_ids": inputs["text_indices"]},
+        "pdd_step_index": inputs["pdd_step_index"],
+        "training_target": target,
+        "image_loss_weight": weight,
+    }
+    with pytest.raises(ValueError, match="without audio/video training metadata"):
+        model(**training_inputs, training_cfg_scales=(2.0, 2.0))
+    dit_calls = []
+    with model.dit.register_forward_pre_hook(lambda module, args: dit_calls.append(module)):
+        output = model(**training_inputs)
+    assert dit_calls == [model.dit]
+    torch.testing.assert_close(output.predictions[0], -raw_prediction)
+    torch.testing.assert_close(output.loss["mse_image"], expected)
+    output.loss["mse_image"].backward()
+    assert torch.count_nonzero(model.dit.video_patch_proj.weight.grad) > 0
+    optimizer.step()
+
+    assert not torch.equal(model.dit.video_patch_proj.weight, backbone_before)
+    assert len(frozen_before) == 14
+    for name, param in model.named_parameters():
+        if name in frozen_before:
+            assert param.grad is None
+            torch.testing.assert_close(param, frozen_before[name], rtol=0, atol=0)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -122,23 +296,41 @@ def test_minimax_h3_image_forward_rejects_sequence_parallel(monkeypatch):
     model = _build_model()
     monkeypatch.setattr(minimax_h3_dit, "get_ulysses_sequence_parallel_group", lambda: object())
     with pytest.raises(NotImplementedError, match="sequence parallelism"):
-        model.forward_image(**_image_inputs(), pdd_step_index=0)
+        model(**_image_inputs(), pdd_step_index=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("input_name", ["unique_timesteps", "position_ids"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_minimax_h3_image_forward_rejects_rounded_inputs(input_name, dtype):
+    model = _build_model()
+    inputs = _image_inputs()
+    inputs[input_name] = inputs[input_name].to(dtype)
+    with pytest.raises(ValueError, match="cast_forward_inputs"):
+        model(**inputs, pdd_step_index=0)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_minimax_h3_image_forward_keeps_fp32_projection_modules():
-    model = _build_model().to(torch.bfloat16)
-    model.dit.video_patch_proj.to(torch.float32)
-    model.dit.time_embedder.to(torch.float32)
-    model.dit.final_layer.video_out.to(torch.float32)
-    for head in model.dit.final_layer.pdd_out:
-        head.to(torch.float32)
+    model = _build_model()
+    projections = (
+        model.dit.video_patch_proj,
+        model.dit.time_embedder,
+        model.dit.final_layer.video_out,
+        model.dit.final_layer.pdd_out,
+    )
+    original_params = [[param.detach().clone() for param in module.parameters()] for module in projections]
+    model.to(torch.bfloat16)
+    assert model.dit.condition_proj.weight.dtype == torch.bfloat16
+    for module, originals in zip(projections, original_params, strict=True):
+        for param, original in zip(module.parameters(), originals, strict=True):
+            torch.testing.assert_close(param, original, rtol=0, atol=0)
 
     inputs = _image_inputs()
     inputs["x"] = inputs["x"].to(torch.bfloat16)
     inputs["prompt_embeds"] = inputs["prompt_embeds"].to(torch.bfloat16)
-    with torch.no_grad():
-        output = model.forward_image(**inputs, pdd_step_index=0)
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        output = model(**inputs, pdd_step_index=0)
 
     assert output.shape == (4, 2)
     assert output.dtype == torch.float32
@@ -390,12 +582,60 @@ def test_minimax_h3_image_layout_places_text_references_and_target():
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
-def test_minimax_h3_image_patchify_matches_unpatchify():
-    latents = torch.randn(1, 24, 1, 8, 8)
-    rows = patchify_image_latents(latents, (1, 2, 2))
-    restored = unpatchify_image_rows(rows, 8, 8, 24, (1, 2, 2))
-    assert rows.shape == (16, 96)
-    assert torch.equal(restored, latents[:, :, 0])
+@pytest.mark.parametrize("reference_grids", [[], [(16, 16), (20, 40)]], ids=["t2i", "with-references"])
+def test_minimax_h3_image_layout_matches_single_frame_video(reference_grids):
+    tags = torch.tensor([1, 0, 1])
+    latent_height, latent_width = 16, 24
+    positions, token_tags, image_indices, text_indices, num_reference_rows = build_image_packed_sequence(
+        tags, reference_grids, latent_height, latent_width, (1, 2, 2)
+    )
+
+    layout_args = (tags.numel(), 1, latent_height, latent_width, 0)
+    if reference_grids:
+        ref_blocks = [
+            {"kind": "image", "latent_t": 1, "latent_h": height, "latent_w": width}
+            for height, width in reference_grids
+        ]
+        video = build_packed_ref2va(*layout_args, ref_blocks, text_token_tags=tags)
+    else:
+        video = build_packed_fl2va(*layout_args, [], text_token_tags=tags)
+
+    torch.testing.assert_close(positions, video["img_position_ids"][0], rtol=0, atol=0)
+    torch.testing.assert_close(token_tags, video["token_tags"], rtol=0, atol=0)
+    torch.testing.assert_close(image_indices, video["img_pos"], rtol=0, atol=0)
+    torch.testing.assert_close(text_indices, video["text_pos"], rtol=0, atol=0)
+    assert num_reference_rows == video["cond_rows"]
+    assert video["audio_pos"].numel() == 0
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_minimax_h3_image_layout_keeps_token_metadata_on_input_device(device):
+    tags = torch.tensor([1, 0, 1], device=device)
+    _, token_tags, image_indices, text_indices, references = build_image_packed_sequence(
+        tags, [(4, 4)], 8, 8, (1, 2, 2)
+    )
+    assert token_tags.device == tags.device
+    assert image_indices.device == tags.device
+    assert text_indices.device == tags.device
+    assert token_tags.shape == (23,)
+    assert references == 4
+    if device == "cpu":
+        torch.testing.assert_close(token_tags[:3], tags)
+        torch.testing.assert_close(token_tags[3:], torch.zeros(20, dtype=torch.long))
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("autocast_enabled", [False, True], ids=["fp32", "autocast"])
+def test_minimax_h3_image_patchify_matches_unpatchify(autocast_enabled):
+    latents = torch.randn(1, 24, 1, 8, 12)
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast_enabled):
+        rows = patchify_image_latents(latents, (1, 2, 2))
+        restored = unpatchify_image_rows(rows, 8, 12, 24, (1, 2, 2))
+    assert rows.shape == (24, 96)
+    torch.testing.assert_close(rows, patchify_video(latents), rtol=0, atol=0)
+    torch.testing.assert_close(restored, unpatchify_video(rows, 1, 8, 12).squeeze(2), rtol=0, atol=0)
+    torch.testing.assert_close(restored, latents[:, :, 0], rtol=0, atol=0)
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -548,7 +788,8 @@ def test_minimax_h3_image_edit_presentation_tags_picture_blocks():
     assert int((token_tags == 0).sum()) == 12
 
 
-def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch):
+@pytest.mark.parametrize("legacy_schedule", [False, True], ids=["explicit-sigmas", "legacy-fallback"])
+def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch, legacy_schedule):
     transformer_dir = tmp_path / "transformer"
     transformer_dir.mkdir()
     vae_dir = tmp_path / "vae_diffusers"
@@ -571,11 +812,14 @@ def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch):
         vae_dir / "diffusion_pytorch_model.safetensors",
     )
     vae.config.save_pretrained(vae_dir)
+    sigmas = DEFAULT_SIGMAS if legacy_schedule else (1.0, 0.5, 0.0)
+    num_heads = len(sigmas) - 1
     save_file(
-        {"video_out.weight": torch.randn(2, 96, 24), "video_out.bias": torch.randn(2, 96)},
+        {"video_out.weight": torch.randn(num_heads, 96, 24), "video_out.bias": torch.randn(num_heads, 96)},
         tmp_path / "pdd_fused_heads.safetensors",
     )
-    (tmp_path / "pdd_config.json").write_text(json.dumps({"sigmas": [1.0, 0.5, 0.0]}))
+    if not legacy_schedule:
+        (tmp_path / "pdd_config.json").write_text(json.dumps({"sigmas": sigmas}))
 
     class FakeTokenizer:
         def __call__(self, text, add_special_tokens=False):
@@ -616,6 +860,8 @@ def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch):
 
     monkeypatch.setattr(MiniMaxH3ImageConditionModel, "_init_encoders", fake_init)
     pipe = MiniMaxH3ImagePipeline.from_pretrained(str(tmp_path), torch_dtype=torch.bfloat16)
+    torch.testing.assert_close(pipe.scheduler.sigmas, torch.tensor(sigmas), rtol=0, atol=0)
+    assert len(pipe.dit.dit.final_layer.pdd_out) == num_heads
     assert pipe.dit.dit.video_patch_proj.weight.dtype == torch.float32
     assert pipe.dit.dit.time_embedder.proj_in.weight.dtype == torch.float32
     assert pipe.dit.dit.final_layer.video_out.weight.dtype == torch.float32
@@ -645,6 +891,15 @@ def test_minimax_h3_image_pipeline_loads_tiny_checkpoint(tmp_path, monkeypatch):
         seed=0,
     )
     assert edit.size == (64, 64)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_image_pipeline_rejects_audio_before_loading(tmp_path):
+    # No checkpoint files exist: the invalid override must fail before any weight I/O.
+    with pytest.raises(ValueError, match="audio_enabled=False"):
+        MiniMaxH3ImagePipeline.from_pretrained(
+            str(tmp_path), device="cpu", transformer_config_kwargs={"audio_enabled": True}
+        )
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
@@ -717,7 +972,7 @@ def test_minimax_h3_image_pipeline_offloads_dit_on_failure(monkeypatch, failure_
     failure = RuntimeError("boom")
 
     class FailingDiT(FakeModule):
-        def forward_image(self, **kwargs):
+        def forward(self, **kwargs):
             raise failure
 
     pipe = MiniMaxH3ImagePipeline(device="cpu")
@@ -844,7 +1099,7 @@ def test_minimax_h3_image_pipeline_accelerator_offload_and_retry(failure_phase):
                 raise failure
             return super().to(device)
 
-        def forward_image(self, x, **kwargs):
+        def forward(self, x, **kwargs):
             assert all(tensor.device == pipe.device for tensor in [*self.parameters(), *self.buffers()])
             self.forward_calls += 1
             if self.fail:
