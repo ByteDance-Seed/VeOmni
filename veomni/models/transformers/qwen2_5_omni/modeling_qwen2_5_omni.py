@@ -217,14 +217,17 @@ def collate_multimodal_metadata(batch, sp_pad, window_size, spatial_merge_size, 
             spatial_merge_size,
             patch_size,
         )
-        # The omni ViT consumes cu_seqlens / cu_window_seqlens / window_index;
-        # `sub` also carries max_seqlen / win_max_seqlen (the shared helper is
-        # identical to qwen2.5-VL's) but the omni vision attention computes its
-        # varlen `.max()` on-device, so those are not written into the batch.
         md[f"{modality}_grid_thw_list"] = sub["grid_thw_list"]
         md[f"vit_{modality}_cu_seqlens"] = sub["cu_seqlens"]
         md[f"vit_{modality}_cu_window_seqlens"] = sub["cu_window_seqlens"]
         md[f"vit_{modality}_window_index"] = sub["window_index"]
+        # The full-attention and window-attention blocks read a different
+        # ``cu_seqlens``, so each needs its own host maximum. Emitting both here is
+        # what keeps the ViT off the per-block
+        # ``(cu_seqlens[1:] - cu_seqlens[:-1]).max()``, a device tensor that
+        # FlashAttention turns into a Python int with ``.item()``.
+        md[f"vit_{modality}_max_seqlen"] = sub["max_seqlen"]
+        md[f"vit_{modality}_win_max_seqlen"] = sub["win_max_seqlen"]
 
     if md:
         batch["multimodal_metadata"] = md
@@ -2405,6 +2408,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 "cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
                 "cu_window_seqlens": multimodal_metadata.get("vit_image_cu_window_seqlens"),
                 "window_index": multimodal_metadata.get("vit_image_window_index"),
+                "max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+                "win_max_seqlen": multimodal_metadata.get("vit_image_win_max_seqlen"),
             }
         }
         video_vit_kwargs = {
@@ -2413,6 +2418,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
                 "cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
                 "cu_window_seqlens": multimodal_metadata.get("vit_video_cu_window_seqlens"),
                 "window_index": multimodal_metadata.get("vit_video_window_index"),
+                "max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+                "win_max_seqlen": multimodal_metadata.get("vit_video_win_max_seqlen"),
             }
         }
         # --- Patch.7 ---

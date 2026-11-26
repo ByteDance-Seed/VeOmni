@@ -939,14 +939,22 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
         )
         padded_embed = padded_embed + positional_embedding
         hidden_states = padded_embed[padded_mask_after_cnn]
+        # ``aftercnn_lens`` is a tensor, so iterating it yields 0-dim tensors: the
+        # ``[window_aftercnn] * (cnn_len // window_aftercnn)`` repeat already
+        # forces an implicit sync there, and the ``remainder`` it appends would
+        # stay a tensor. Read the lengths out once as Python ints instead, which
+        # both avoids the per-element sync and keeps ``cu_chunk_lens`` a list of
+        # ints — otherwise ``max()`` below returns a tensor for any short clip
+        # (and for ``dummy_forward``, whose single chunk is always a remainder).
+        aftercnn_lens = aftercnn_lens.tolist()
         cu_chunk_lens = [0]
-        window_aftercnn = padded_mask_after_cnn.shape[-1] * (self.n_window_infer // (self.n_window * 2))
+        window_aftercnn = int(padded_mask_after_cnn.shape[-1] * (self.n_window_infer // (self.n_window * 2)))
         for cnn_len in aftercnn_lens:
             cu_chunk_lens += [window_aftercnn] * (cnn_len // window_aftercnn)
             remainder = cnn_len % window_aftercnn
             if remainder != 0:
                 cu_chunk_lens += [remainder]
-        cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
+        cu_seqlens = torch.tensor(cu_chunk_lens, device=padded_mask_after_cnn.device).cumsum(-1, dtype=torch.int32)
         # ``cu_chunk_lens`` is a plain Python list of segment lengths, so the
         # maximum is available here without touching the device. Build it now and
         # hand it to every layer: the attention otherwise recomputes
