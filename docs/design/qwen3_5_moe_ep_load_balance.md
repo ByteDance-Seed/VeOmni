@@ -17,6 +17,7 @@ train:
 Use full-SFT Qwen3.5-MoE with FSDP2, EP>1, ep_outside=false and
 resolved dp_replicate_size=1. Select fused_triton on CUDA or fused_npu on
 Ascend. CPU/activation offload, LoRA and checkpoint resume are rejected.
+Use YAML booleans for `enabled` and `optimize_memory`.
 Gradient checkpointing and checkpoint saving remain allowed. Replica slots
 must not exceed the original expert rows per EP rank. See the
 [configuration reference](../usage/arguments.md#moeepbalanceconfig).
@@ -25,6 +26,9 @@ must not exceed the original expert rows per EP rank. See the
 
 - The planner gathers actual token histograms, chooses deterministic temporary
   replicas and assigns concrete occurrences without changing router weights.
+- Qwen3.5 expert modules declare replica support. The model runtime attaches
+  the controller after EP and FSDP2 wrapping. The expert module passes its
+  controller as a call argument to its selected fused implementation.
 - Dispatch restores logical order before combine and gradient reduction.
   Temporary weights return contributions to their original owners.
 - CUDA keeps ordered FP32 prefixes and the original grouped-GEMM reduction
@@ -46,7 +50,7 @@ must not exceed the original expert rows per EP rank. See the
   Physical counts accumulate on the host and transfer to the collective
   device when an interval snapshot is collected.
 
-## Validation results and limits
+## Historical validation results
 
 | Cohort | Scope | Memory throughput vs matched OFF | Precision / balancing |
 | --- | --- | ---: | --- |
@@ -73,10 +77,9 @@ Memory C04 allocated peak is 50.283 GiB, near OFF 50.624–50.626 GiB and below
 Legacy 54.772 GiB; memory savings do not establish a throughput benefit.
 
 [Immutable published measurements and raw evidence](https://github.com/ZhentaoFan/VeOmni/tree/fc459f6c92bcbcfe4e2178a81f7ce1f1755bf158/docs/performance)
-retain their own source and runtime identities. EP planning, transport, native
-math and GPU/NPU kernel files in this scope reduction are unchanged. Removal
-of fixture-only model guards and optional display code is packaging cleanup;
-no new full-tree hardware run is claimed for this cleanup.
+identify the source and runtime of each experiment. When validating a new
+revision, record paired OFF, Legacy and Memory throughput on the same hardware
+with the same loss implementation and allocator settings.
 
 ## Regression coverage
 
@@ -84,7 +87,6 @@ Retained tests cover deterministic/conservative planning, actual multi-rank
 routing and owner gradients, BF16 partial migrations, empty segments, frozen
 weights, retained graphs, stream/event lifetimes, unsupported configurations,
 physical scalar aggregation and CUDA two-storage kernels. The hardware E2E
-keeps the native hybrid fixture and fails closed when required by accelerator
-CI. Its modified fixture still needs a fresh hardware CI run; CPU skips are
-not accelerator validation. CP, HSDP, multi-node, offload, resume and LoRA are
-not claimed as supported combinations.
+uses the native hybrid fixture and fails if the devices or kernel packages
+required by the selected accelerator CI job are missing. The validated training
+scope is EP with FSDP2 as described above.

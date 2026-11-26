@@ -2,32 +2,24 @@
 
 import hashlib
 import json
-import math
 
 import torch
 import torch.distributed as dist
 
 
-def weight_grad_token_granularity() -> int:
-    """Use boundaries compatible with every configured weight-gradient tile."""
-    from ...ops.kernels.moe._kernels.kernel.group_gemm import group_gemm_same_mn_kernel
-
-    return math.lcm(*(int(config["BLOCK_K"]) for config in group_gemm_same_mn_kernel.configs.values()))
-
-
 def weight_grad_config_metadata() -> tuple[int, int]:
     """Identify the exact tile configuration shared by an ordered EP group."""
-    from ...ops.kernels.moe._kernels.kernel.group_gemm import group_gemm_same_mn_kernel
+    from ...ops.kernels.moe_experts.shared.group_gemm import _GROUP_GEMM_BLOCK
 
-    serialized = json.dumps(group_gemm_same_mn_kernel.configs, sort_keys=True).encode()
+    serialized = json.dumps(_GROUP_GEMM_BLOCK, sort_keys=True).encode()
     signature = int.from_bytes(hashlib.sha256(serialized).digest()[:8], "little") & ((1 << 63) - 1)
-    return weight_grad_token_granularity(), signature
+    return _GROUP_GEMM_BLOCK["BLOCK_K"], signature
 
 
 def _launch_weight_grad(a, b, c, cumsum, original_total, accumulate, *, group_indices=None):
     import triton
 
-    from ...ops.kernels.moe._kernels.kernel.group_gemm import group_gemm_same_mn_kernel
+    from ...ops.kernels.moe_experts.shared.group_gemm import _GROUP_GEMM_BLOCK, group_gemm_same_mn_kernel
 
     groups, m, n = c.shape
     launch_groups = groups if group_indices is None else group_indices.numel()
@@ -49,6 +41,7 @@ def _launch_weight_grad(a, b, c, cumsum, original_total, accumulate, *, group_in
         ACCUMULATE_TO_C=accumulate,
         group_indices_ptr=group_indices,
         HAS_GROUP_INDICES=group_indices is not None,
+        **_GROUP_GEMM_BLOCK,
     )
 
 

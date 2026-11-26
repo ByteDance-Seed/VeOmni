@@ -1,0 +1,72 @@
+"""Qwen3 AR backbone (no wte / lm_head)."""
+
+from typing import Any, Dict, Optional
+
+import torch
+import torch.nn as nn
+
+from veomni.models.transformers.qwen3.modeling_qwen3 import Qwen3Model
+
+from ...base.llm_packing import SimpleArGenerationMixin
+from ...module_modeling_base import PretrainedOmniModule
+from .configuration import Qwen3LlmConfig
+
+
+class Qwen3Llm(SimpleArGenerationMixin, PretrainedOmniModule):
+    """Qwen3 backbone (no wte, no lm_head).
+
+    Multi-modal inputs are already embedded by the sibling text encoder and live
+    on the ``conversation_list`` items.  :meth:`pre_forward` concatenates every
+    non-dummy item's ``value`` in order into one packed bs=1 sequence.
+
+    ``generate()`` / inference-state reset come from :class:`SimpleArGenerationMixin`
+    — shared verbatim with the Qwen3-MoE backbone (:class:`~...qwen3_moe.llm.modeling.Qwen3MoeLlm`).
+    """
+
+    config_class = Qwen3LlmConfig
+    # Hidden states are a plain per-item concatenation of the carrier, so
+    # ``forward_post`` can write this rank's slice back item by item.
+    supports_sp_sharded_handoff = True
+    base_model_prefix = "qwen3_llm"
+    main_input_name = "inputs_embeds"
+    _no_split_modules = Qwen3Model._no_split_modules
+    supports_gradient_checkpointing = Qwen3Model.supports_gradient_checkpointing
+    _supports_flash_attn = Qwen3Model._supports_flash_attn
+    _supports_sdpa = Qwen3Model._supports_sdpa
+    _supports_flex_attn = Qwen3Model._supports_flex_attn
+    _supports_attention_backend = Qwen3Model._supports_attention_backend
+
+    def __init__(self, config: Qwen3LlmConfig):
+        super().__init__(config)
+        self.config = config
+        self.language_model = Qwen3Model._from_config(self.config.text_config)
+        self.language_model.set_input_embeddings(nn.Identity())
+        self._past_key_values: Any = None
+        self.post_init()
+
+    def freeze_model(self) -> None:
+        """Freeze the whole backbone when ``config.freeze`` (bootstrap setups)."""
+        if getattr(self.config, "freeze", False):
+            self.language_model.requires_grad_(False)
+
+    def forward(  # type: ignore[override]
+        self,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values=None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        outputs = self.language_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **kwargs,
+        )
+        return {
+            "hidden_states": outputs.last_hidden_state,
+            "past_key_values": outputs.past_key_values,
+        }

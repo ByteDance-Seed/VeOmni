@@ -18,17 +18,12 @@ from typing import Any, Callable, Optional
 import torch
 import torch.distributed as dist
 
-from ...utils.import_utils import is_torch_npu_available
+from ...utils.device import is_nvidia_cuda_device
 from ..parallel_state import get_parallel_state
 from .chunk_permutation import ChunkPermutation
 from .comm import all_to_all
 from .ep_dispatch import _record_ep_balance, _validate_ep_balance_dispatch
-from .ep_load_balance import (
-    ExpertReplicaTransfer,
-    _merge_replica_weight_gradients,
-    _validate_replica_weight,
-    cat_local_and_replica_weights,
-)
+from .ep_load_balance import ExpertReplicaTransfer
 from .moe_utils import (
     alias_permute,
     compact_permute,
@@ -38,27 +33,7 @@ from .moe_utils import (
     sort_chunks_by_idxs,
     unpermute,
 )
-
-
-if not is_torch_npu_available():
-    from ...ops.kernels.moe._kernels.kernel.group_gemm import group_gemm_same_mn, group_gemm_same_nk
-
-
-def _apply_swiglu_clamp(fc1_1_output, fc1_2_output, swiglu_limit):
-    """gpt-oss / DeepSeek-V4 style clamped SwiGLU pre-activation.
-
-    Returns ``(fc1_1_clamped, fc1_2_clamped, mask_fc1_1, mask_fc1_2)``.
-    No-op (and returns ``None`` masks) when ``swiglu_limit is None``.
-    Mirrors the helper in ``ops/kernels/moe/group_gemm.py`` to keep this
-    module free of circular imports.
-    """
-    if swiglu_limit is None:
-        return fc1_1_output, fc1_2_output, None, None
-    mask_fc1_1 = fc1_1_output <= swiglu_limit
-    mask_fc1_2 = (fc1_2_output >= -swiglu_limit) & (fc1_2_output <= swiglu_limit)
-    fc1_1_output = fc1_1_output.clamp(max=swiglu_limit)
-    fc1_2_output = fc1_2_output.clamp(min=-swiglu_limit, max=swiglu_limit)
-    return fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2
+from .weighted_combine import weighted_combine
 
 
 def preprocess(
@@ -69,7 +44,11 @@ def preprocess(
     ep_size = ep_group.size()
     num_local_experts = num_experts // ep_size
     rank = dist.get_rank(ep_group)
-    num_local_tokens_per_expert = expert_mask.sum(dim=(1, 2))
+    # ``token_pre_all2all`` folds top-k slots with ``expert_mask.sum(dim=1)`` and
+    # ``permute`` dispatches one row per non-zero ``(expert, token)`` entry while
+    # ``unpermute`` sums repeated slot weights via ``weights_idx``. Count unique
+    # tokens per expert so duplicate top-k/hash slots do not overstate split sizes.
+    num_local_tokens_per_expert = expert_mask.any(dim=1).sum(dim=1)
 
     # [ep_size] represent the number of sum tokens in each rank
     input_splits = num_local_tokens_per_expert.reshape(ep_size, num_local_experts).sum(dim=1).tolist()
@@ -111,153 +90,59 @@ def token_pre_all2all(
     output_splits: torch.Tensor,
     num_global_tokens_per_local_expert: torch.Tensor,
     ep_group: Optional[dist.ProcessGroup] = None,
-    selected_experts: Optional[torch.Tensor] = None,
-    logical_selected_experts: Optional[torch.Tensor] = None,
-    chunk_permutation: Optional[ChunkPermutation] = None,
 ) -> torch.Tensor:
     hidden_dim = hidden_states.size(-1)
     hidden_states = hidden_states.reshape(-1, hidden_dim)
     org_hidden_states_shape = hidden_states.shape
-    if selected_experts is None:
-        routing_map = expert_mask.sum(dim=1)
-        local_permuted_hidden_states, local_input_permutation_mapping = permute(hidden_states, routing_map)
-    else:
-        routing_map = None
-        if logical_selected_experts is None:
-            local_permuted_hidden_states, local_input_permutation_mapping = compact_permute(
-                hidden_states, selected_experts
-            )
-        else:
-            local_permuted_hidden_states, local_input_permutation_mapping = alias_permute(
-                hidden_states, selected_experts, logical_selected_experts
-            )
+    routing_map = expert_mask.sum(dim=1)
+
+    local_permuted_hidden_states, local_input_permutation_mapping = permute(hidden_states, routing_map)
 
     global_permuted_hidden_states = all_to_all(ep_group, local_permuted_hidden_states, output_splits, input_splits)
 
     # group tokens together by expert
-    if chunk_permutation is None:
-        num_local_experts = num_experts // ep_group.size()
-        permute_order = torch.arange(num_experts).reshape(-1, num_local_experts).T.ravel().tolist()
-        global_permuted_hidden_states = sort_chunks_by_idxs(
-            global_permuted_hidden_states,
-            num_global_tokens_per_local_expert.ravel(),
-            permute_order,
-        )
-    else:
-        global_permuted_hidden_states = chunk_permutation.apply(global_permuted_hidden_states)
+    #
+    # No explicit device sync is needed before this line, and it must not be added: the
+    # ``.tolist()`` calls above (``input_splits``, and ``num_global_tokens_per_local_expert``
+    # below) already force a host round-trip that drains the queued collectives. The
+    # Ascend path this replaced had a ``stream_synchronize()`` because it computed its
+    # per-expert counts from device tensors without leaving the device.
+    num_local_experts = num_experts // ep_group.size()
+    permute_order = torch.arange(num_experts).reshape(-1, num_local_experts).T.ravel().tolist()
+    global_permuted_hidden_states = sort_chunks_by_idxs(
+        global_permuted_hidden_states,
+        num_global_tokens_per_local_expert.ravel(),
+        permute_order,
+    )
 
     return global_permuted_hidden_states, routing_map, local_input_permutation_mapping, org_hidden_states_shape
 
 
-def _dispatch_to_balanced_ep(
-    ep_class: Callable[..., torch.Tensor],
-    num_experts: int,
-    routing_weights: torch.Tensor,
-    selected_experts: torch.Tensor,
-    hidden_states: torch.Tensor,
-    ep_class_args: tuple[Any, ...],
-    load_balancer: Any,
-) -> torch.Tensor:
-    if ep_class is not EPMergedFc1GroupGemm:
-        raise ValueError("EP load balancing supports only the merged-fc1 EPMergedFc1GroupGemm path.")
-    if len(ep_class_args) != 3:
-        raise ValueError("Balanced merged EP dispatch expects exactly (gate_up_proj, down_proj, swiglu_limit).")
-    gate_up_proj, down_proj, swiglu_limit = ep_class_args
-    plan = _validate_ep_balance_dispatch(
-        num_experts,
-        selected_experts,
-        gate_up_proj,
-        down_proj,
-        load_balancer,
-    )
-    _record_ep_balance(load_balancer, plan)
+def expert_parallel_size() -> int:
+    """The ``ep`` axis size, read without assuming the axis is named ``ep``.
 
-    ep_group = load_balancer.ep_group
-    # The library GEMM requires dense contiguous original weights. Preserve
-    # previously valid strided inputs through the legacy concatenation path,
-    # without borrowing pool storage or claiming a no-copy execution for them.
-    optimize_memory = (
-        getattr(load_balancer, "optimize_memory", False) and gate_up_proj.is_contiguous() and down_proj.is_contiguous()
-    )
-    gate_up_transfer = None
-    down_transfer = None
-    if plan.replicas:
-        transfer_kwargs = {"pool": getattr(load_balancer, "buffer_pool", None)} if optimize_memory else {}
-        gate_up_transfer = ExpertReplicaTransfer.start(gate_up_proj, plan, ep_group, **transfer_kwargs)
-        down_transfer = ExpertReplicaTransfer.start(down_proj, plan, ep_group, **transfer_kwargs)
+    ``ParallelState.ep_enabled`` indexes ``extra_parallel_sizes["ep"]``
+    unconditionally, and ``_init_parallel_state`` builds that dict from
+    ``extra_parallel_names``. A state initialized with, say, ``("ple",)`` has no
+    ``"ep"`` key, so asking whether expert weights are sharded raised
+    ``KeyError: 'ep'`` -- which took out tests that never touch experts, because this
+    check runs on every call. The question here is only "is expert parallelism on?",
+    and a missing axis means no.
+    """
+    sizes = getattr(get_parallel_state(), "extra_parallel_sizes", None) or {}
+    return sizes.get("ep", 1)
 
-    physical_slots_per_rank = plan.tokens_per_local_physical_expert.shape[1]
-    physical_num_experts = plan.ep_size * physical_slots_per_rank if plan.replicas else num_experts
-    selected_physical_experts = plan.selected_physical_experts
-    chunk_permutation = None
-    if hidden_states.is_cuda:
-        order = torch.arange(physical_num_experts).reshape(plan.ep_size, physical_slots_per_rank).T.ravel().tolist()
-        chunk_permutation = ChunkPermutation(
-            plan.tokens_per_local_physical_expert.ravel(), order, hidden_states.device
-        )
-    permute_tokens, routing_map, local_input_permutation_mapping, org_hidden_states_shape = token_pre_all2all(
-        hidden_states=hidden_states,
-        expert_mask=None,
-        num_experts=physical_num_experts,
-        input_splits=plan.input_splits,
-        output_splits=plan.output_splits,
-        num_global_tokens_per_local_expert=plan.tokens_per_local_physical_expert,
-        ep_group=ep_group,
-        selected_experts=selected_physical_experts,
-        logical_selected_experts=selected_experts if plan.replicas else None,
-        chunk_permutation=chunk_permutation,
-    )
 
-    fused_replica_backward = (permute_tokens.is_cuda or optimize_memory) and plan.replicas
-    replica_gate_up_proj = None
-    replica_down_proj = None
-    if gate_up_transfer is not None and down_transfer is not None:
-        replica_gate_up_proj = gate_up_transfer.wait()
-        replica_down_proj = down_transfer.wait()
-        if not fused_replica_backward:
-            gate_up_proj = cat_local_and_replica_weights(gate_up_proj, replica_gate_up_proj, plan, ep_group)
-            down_proj = cat_local_and_replica_weights(down_proj, replica_down_proj, plan, ep_group)
+def cumsum_to_counts(cumsum: torch.Tensor) -> torch.Tensor:
+    """Turn the cumulative expert bounds into per-expert row counts.
 
-    physical_counts = plan.tokens_per_local_physical_expert.sum(dim=0)
-    cumsum = torch.cumsum(physical_counts, dim=0).to(permute_tokens.device)
-    if fused_replica_backward:
-        expert_fn = _MemoryBalancedEPMergedFc1GroupGemm if optimize_memory else _BalancedEPMergedFc1GroupGemm
-        transfer_args = ((gate_up_transfer, down_transfer),) if optimize_memory else ()
-        final_permute_tokens = expert_fn.apply(
-            permute_tokens,
-            cumsum,
-            gate_up_proj,
-            down_proj,
-            replica_gate_up_proj,
-            replica_down_proj,
-            plan,
-            ep_group,
-            swiglu_limit,
-            *transfer_args,
-        )
-    else:
-        final_permute_tokens = EPMergedFc1GroupGemm.apply(
-            permute_tokens,
-            cumsum,
-            gate_up_proj,
-            down_proj,
-            swiglu_limit,
-        )
-
-    return tokens_post_all2all(
-        expert_outputs=final_permute_tokens,
-        routing_weights=routing_weights,
-        selected_experts=selected_physical_experts,
-        num_experts=physical_num_experts,
-        input_splits=plan.input_splits,
-        output_splits=plan.output_splits,
-        num_global_tokens_per_local_expert=plan.tokens_per_local_physical_expert,
-        routing_map=routing_map,
-        local_input_permutation_mapping=local_input_permutation_mapping,
-        org_hidden_states_shape=org_hidden_states_shape,
-        ep_group=ep_group,
-        chunk_permutation=chunk_permutation,
-    )
+    ``dispatch_to_ep_class`` hands its ``ep_class`` a **cumsum**, but several grouped
+    kernels want per-group sizes instead -- ``npu_group_gemm`` pins
+    ``group_list_type=1``, and ``GroupedLayout.from_counts`` says so in its name. This is
+    that conversion, kept in one place so the contract has a single encoding rather than
+    one per kernel.
+    """
+    return cumsum - torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
 
 
 def dispatch_to_ep_class(
@@ -267,7 +152,6 @@ def dispatch_to_ep_class(
     selected_experts: torch.Tensor,
     hidden_states: torch.Tensor,
     *ep_class_args: Any,
-    load_balancer: Any = None,
 ) -> torch.Tensor:
     """Shared EP MoE plumbing: ``preprocess`` + ``token_pre_all2all`` + ``ep_class.apply`` + ``tokens_post_all2all``.
 
@@ -279,11 +163,19 @@ def dispatch_to_ep_class(
     the EP plumbing evolve in lock-step across LoRA / non-LoRA paths.
 
     Args:
-        ep_class: The EP autograd ``Function`` class to apply (one of
-            :class:`EPGroupGemm`, :class:`EPMergedFc1GroupGemm`, or one of the
-            LoRA variants in ``veomni.lora.ops.moe_group_gemm``).
-            ``ep_class.apply`` must accept ``(permute_tokens, cumsum, *ep_class_args)``
-            in that order and return a ``[T_local, H]`` permuted-output tensor.
+        ep_class: The per-rank expert math, either a caller-owned EP autograd
+            ``Function`` or a plain callable. Typical Functions live in
+            ``veomni.ops.kernels.moe_experts`` or ``moe_experts_lora``; a plain
+            callable is for rows whose grouped matmul is already a ``Function`` of
+            its own, so there is no derivative left to write (the Ascend and DeepGEMM
+            rows). Either way it must accept ``(permute_tokens, cumsum,
+            *ep_class_args)`` in that order and return a ``[T_local, H]``
+            permuted-output tensor.
+
+            Note that ``cumsum`` is a *cumulative* token count. A kernel wanting
+            per-expert counts -- Ascend's ``group_list_type=1``, DeepGEMM's
+            ``GroupedLayout.from_counts`` -- subtracts the running total back out
+            itself; ``MLUGroupGemm`` does it inside its own forward.
         num_experts: total expert count ``E`` for this MoE layer (global on EP).
         routing_weights: ``[B*S, topk]`` per-(token, slot) routing weights —
             applied later by ``tokens_post_all2all`` → ``unpermute``.
@@ -293,24 +185,10 @@ def dispatch_to_ep_class(
             after ``permute_tokens`` and ``cumsum`` — typically the per-rank
             slice of base weights (and, for LoRA variants, LoRA tensors and
             scales).
-        load_balancer: optional private Qwen3.5 EP controller. When present,
-            dispatch uses its immutable physical-alias plan and accepts only
-            the merged gate/up and down projection argument layout.
 
     Returns:
         ``[B, S, H]`` (or ``[N, H]``) — same shape as ``hidden_states``.
     """
-    if load_balancer is not None:
-        return _dispatch_to_balanced_ep(
-            ep_class,
-            num_experts,
-            routing_weights,
-            selected_experts,
-            hidden_states,
-            ep_class_args,
-            load_balancer,
-        )
-
     ep_state = get_parallel_state()
     expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
     input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
@@ -325,9 +203,17 @@ def dispatch_to_ep_class(
         num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
         ep_group=ep_state.ep_group,
     )
+    del expert_mask
     cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
 
-    final_permute_tokens = ep_class.apply(permute_tokens, cumsum, *ep_class_args)
+    # An `autograd.Function` class exposes the entry point as `apply`; anything else is
+    # called directly. Keyed on the attribute rather than `isinstance(..., type)`, so a
+    # class without `apply` reports that instead of being called as a constructor.
+    entry = getattr(ep_class, "apply", None)
+    final_permute_tokens = (
+        entry(permute_tokens, cumsum, *ep_class_args) if entry else ep_class(permute_tokens, cumsum, *ep_class_args)
+    )
+    del permute_tokens
 
     return tokens_post_all2all(
         expert_outputs=final_permute_tokens,
@@ -344,6 +230,62 @@ def dispatch_to_ep_class(
     )
 
 
+def dispatch_to_ep_with_replicas(
+    local_experts: Callable[..., torch.Tensor],
+    num_experts: int,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    hidden_states: torch.Tensor,
+    gate: torch.Tensor | None,
+    down: torch.Tensor,
+    load_balancer: Any,
+    swiglu_limit: float | None,
+    activation: str,
+) -> torch.Tensor:
+    """Run a physical alias plan with a backend-owned expert computation."""
+    plan = _validate_ep_balance_dispatch(num_experts, selected_experts, gate, down, load_balancer)
+    _record_ep_balance(load_balancer, plan)
+    group = load_balancer.ep_group
+    memory = load_balancer.optimize_memory and gate.is_contiguous() and down.is_contiguous() and bool(plan.replicas)
+    gate_transfer = down_transfer = None
+    if plan.replicas:
+        pool = load_balancer.buffer_pool if memory else None
+        gate_transfer = ExpertReplicaTransfer.start(gate, plan, group, pool=pool)
+        down_transfer = ExpertReplicaTransfer.start(down, plan, group, pool=pool)
+
+    physical_ids = plan.selected_physical_experts
+    counts = plan.tokens_per_local_physical_expert
+    tokens = hidden_states.reshape(-1, hidden_states.shape[-1])
+    output_shape = tokens.shape
+    if plan.replicas:
+        tokens, mapping = alias_permute(tokens, physical_ids, selected_experts)
+    else:
+        tokens, mapping = compact_permute(tokens, physical_ids)
+    exchanged = all_to_all(group, tokens, plan.output_splits, plan.input_splits)
+    order = torch.arange(counts.numel()).reshape(counts.shape).T.ravel().tolist()
+    chunk = None
+    if is_nvidia_cuda_device(exchanged.device):
+        chunk = ChunkPermutation(counts.ravel(), order, exchanged.device)
+        permuted = chunk.apply(exchanged)
+    else:
+        permuted = sort_chunks_by_idxs(exchanged, counts.ravel(), order)
+    del tokens, exchanged
+
+    expert_output = local_experts(
+        permuted, gate, down, plan, group, gate_transfer, down_transfer, memory, swiglu_limit, activation
+    )
+    del permuted
+    if chunk is None:
+        reverse_order = torch.arange(counts.numel()).reshape(counts.shape[1], counts.shape[0]).T.ravel().tolist()
+        expert_output = sort_chunks_by_idxs(expert_output, counts.T.ravel(), reverse_order)
+    else:
+        expert_output = chunk.apply(expert_output, inverse=True)
+    returned = all_to_all(group, expert_output, plan.input_splits, plan.output_splits)
+    if plan.replicas:
+        return weighted_combine(returned, routing_weights, output_shape, *mapping)
+    return compact_unpermute(returned, routing_weights, output_shape, mapping)
+
+
 def tokens_post_all2all(
     expert_outputs: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -353,39 +295,20 @@ def tokens_post_all2all(
     output_splits: torch.Tensor,
     num_global_tokens_per_local_expert: torch.Tensor,
     routing_map: torch.Tensor,
-    local_input_permutation_mapping: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    local_input_permutation_mapping: torch.Tensor,
     org_hidden_states_shape: torch.Size,
     ep_group: Optional[dist.ProcessGroup] = None,
-    chunk_permutation: Optional[ChunkPermutation] = None,
 ) -> torch.Tensor:
     # group tokens together by expert
-    if chunk_permutation is None:
-        num_local_experts = num_experts // ep_group.size()
-        unpermute_order = torch.arange(num_experts).reshape(num_local_experts, -1).T.ravel().tolist()
-        expert_outputs = sort_chunks_by_idxs(
-            expert_outputs,
-            num_global_tokens_per_local_expert.T.ravel(),
-            unpermute_order,
-        )
-    else:
-        expert_outputs = chunk_permutation.apply(expert_outputs, inverse=True)
+    num_local_experts = num_experts // ep_group.size()
+    unpermute_order = torch.arange(num_experts).reshape(num_local_experts, -1).T.ravel().tolist()
+    expert_outputs = sort_chunks_by_idxs(
+        expert_outputs,
+        num_global_tokens_per_local_expert.T.ravel(),
+        unpermute_order,
+    )
 
     unpermute_outputs = all_to_all(ep_group, expert_outputs, input_splits, output_splits)
-
-    if routing_map is None:
-        if isinstance(local_input_permutation_mapping, tuple):
-            logical_order, logical_to_physical = local_input_permutation_mapping
-            if unpermute_outputs.is_cuda:
-                from .weighted_combine import weighted_combine
-
-                return weighted_combine(
-                    unpermute_outputs, routing_weights, org_hidden_states_shape, logical_order, logical_to_physical
-                )
-            unpermute_outputs = unpermute_outputs.index_select(0, logical_to_physical)
-            local_input_permutation_mapping = logical_order
-        return compact_unpermute(
-            unpermute_outputs, routing_weights, org_hidden_states_shape, local_input_permutation_mapping
-        )
 
     # [tokens, experts]
     weights_idx = generate_weights_idx(routing_weights, selected_experts, num_experts)
@@ -399,478 +322,3 @@ def tokens_post_all2all(
     )
 
     return unpermute_outputs
-
-
-class EPGroupGemm(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        permute_tokens,
-        cumsum,
-        fc1_1_weight,
-        fc1_2_weight,
-        fc2_weight,
-        swiglu_limit=None,
-    ):
-        # permute_tokens: [tokens, hidden_dim]
-        # cumsum: [local_experts]
-
-        # compute linear layer fc1-1
-        fc1_1_output = group_gemm_same_nk(
-            a=permute_tokens,
-            b=fc1_1_weight,
-            cumsum_M=cumsum,
-            max_M=permute_tokens.shape[0],
-            transpose_a=False,
-            transpose_b=True,
-        )
-
-        # compute linear layer fc1-2
-        fc1_2_output = group_gemm_same_nk(
-            a=permute_tokens,
-            b=fc1_2_weight,
-            cumsum_M=cumsum,
-            max_M=permute_tokens.shape[0],
-            transpose_a=False,
-            transpose_b=True,
-        )
-
-        # gpt-oss / DeepSeek-V4 style clamped SwiGLU pre-activation. No-op when
-        # swiglu_limit is None (legacy MoE models) — masks are None and the
-        # ``if swiglu_limit is not None`` guards in backward are skipped.
-        fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = _apply_swiglu_clamp(
-            fc1_1_output, fc1_2_output, swiglu_limit
-        )
-
-        # compute the actication of linear layer fc1-1
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-
-        # compute final result of linear layer fc1
-        fc1_output = fc1_1_activation * fc1_2_output
-
-        # weighted projection is outside this function
-        # compute linear layer fc2
-        fc2_output = group_gemm_same_nk(
-            a=fc1_output,
-            b=fc2_weight,
-            cumsum_M=cumsum,
-            max_M=permute_tokens.shape[0],
-            transpose_a=False,
-            transpose_b=True,
-        )
-
-        ctx.swiglu_limit = swiglu_limit
-        ctx.save_for_backward(
-            permute_tokens,
-            cumsum,
-            fc1_1_weight,
-            fc1_2_weight,
-            fc2_weight,
-            fc1_1_output,
-            fc1_2_output,
-            mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=permute_tokens.device),
-            mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=permute_tokens.device),
-        )
-
-        return fc2_output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        # grad_output: [tokens, hidden_dim]
-        (
-            permute_tokens,
-            cumsum,
-            fc1_1_weight,
-            fc1_2_weight,
-            fc2_weight,
-            fc1_1_output,
-            fc1_2_output,
-            mask_fc1_1,
-            mask_fc1_2,
-        ) = ctx.saved_tensors
-        swiglu_limit = ctx.swiglu_limit
-        # permute_tokens: [tokens, hidden_dim]
-        # cumsum: [local_experts]
-
-        # dgrad fc1
-        grad_fc1_output = group_gemm_same_nk(
-            a=grad_output,
-            b=fc2_weight,
-            cumsum_M=cumsum,
-            max_M=grad_output.shape[0],
-            transpose_b=False,
-        )
-
-        # recompute
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        fc1_output = fc1_1_activation * fc1_2_output
-
-        # wgrad fc2
-        grad_fc2_weight = None
-        if fc2_weight.requires_grad:
-            grad_fc2_weight = torch.empty_like(fc2_weight)
-            group_gemm_same_mn(
-                a=grad_output,
-                b=fc1_output,
-                c=grad_fc2_weight,
-                cumsum_K=cumsum,
-                max_K=grad_output.shape[0],
-                transpose_a=True,
-                transpose_b=False,
-            )
-
-        grad_fc1_2_output = fc1_1_activation * grad_fc1_output
-        grad_fc1_1_activation = grad_fc1_output * fc1_2_output
-
-        if swiglu_limit is not None:
-            grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
-
-        # dgrad output 2
-        grad_scatter_output_2 = group_gemm_same_nk(
-            a=grad_fc1_2_output,
-            b=fc1_2_weight,
-            cumsum_M=cumsum,
-            max_M=grad_output.shape[0],
-            transpose_b=False,
-        )
-
-        # wgrad fc1-2
-        grad_fc1_2_weight = None
-        if fc1_2_weight.requires_grad:
-            grad_fc1_2_weight = torch.empty_like(fc1_2_weight)
-            group_gemm_same_mn(
-                a=grad_fc1_2_output,
-                b=permute_tokens,
-                c=grad_fc1_2_weight,
-                cumsum_K=cumsum,
-                max_K=grad_output.shape[0],
-                transpose_a=True,
-                transpose_b=False,
-            )
-
-        grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
-        if swiglu_limit is not None:
-            grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
-
-        # dgrad output 1
-        grad_scatter_output_1 = group_gemm_same_nk(
-            a=grad_fc1_1_output,
-            b=fc1_1_weight,
-            cumsum_M=cumsum,
-            max_M=grad_output.shape[0],
-            transpose_b=False,
-        )
-
-        # wgrad fc1-1
-        grad_fc1_1_weight = None
-        if fc1_1_weight.requires_grad:
-            grad_fc1_1_weight = torch.empty_like(fc1_1_weight)
-            group_gemm_same_mn(
-                a=grad_fc1_1_output,
-                b=permute_tokens,
-                c=grad_fc1_1_weight,
-                cumsum_K=cumsum,
-                max_K=grad_output.shape[0],
-                transpose_a=True,
-                transpose_b=False,
-            )
-
-        # grad input
-        grad_permute_tokens = grad_scatter_output_1 + grad_scatter_output_2
-
-        return (
-            grad_permute_tokens,  # permute_tokens
-            None,  # cumsum
-            grad_fc1_1_weight,  # fc1_1_weight
-            grad_fc1_2_weight,  # fc1_2_weight
-            grad_fc2_weight,  # fc2_weight
-            None,  # swiglu_limit
-        )
-
-
-class EPMergedFc1GroupGemm(torch.autograd.Function):
-    """EP autograd function that accepts a merged fc1_1_2 weight [E, 2I, H].
-
-    Uses a single group_gemm_same_nk call for fc1 instead of two separate calls.
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        permute_tokens,
-        cumsum,
-        fc1_1_2_weight,
-        fc2_weight,
-        swiglu_limit=None,
-        *,
-        replica_fc1_weight=None,
-        replica_fc2_weight=None,
-    ):
-        # permute_tokens: [tokens, hidden_dim]
-        # cumsum: [local_experts]
-        assert fc1_1_2_weight.shape[1] % 2 == 0, (
-            f"Merged fc1_1_2_weight dim 1 must be even, got {fc1_1_2_weight.shape[1]}"
-        )
-        max_expert_tokens = getattr(ctx, "max_tokens_per_expert", permute_tokens.shape[0])
-
-        # Single fc1 gemm: output shape [T, 2I]
-        fc1_output = group_gemm_same_nk(
-            a=permute_tokens,
-            b=fc1_1_2_weight,
-            cumsum_M=cumsum,
-            max_M=max_expert_tokens,
-            transpose_a=False,
-            transpose_b=True,
-            **({"b_extra": replica_fc1_weight} if replica_fc1_weight is not None else {}),
-        )
-
-        # chunk is a view, no copy
-        fc1_1_output, fc1_2_output = fc1_output.chunk(2, dim=-1)
-
-        # gpt-oss / DeepSeek-V4 style clamped SwiGLU pre-activation. ``_apply_swiglu_clamp``
-        # creates new tensors when ``swiglu_limit is not None`` so the saved halves are
-        # independent of ``fc1_output`` storage; otherwise it is a no-op.
-        fc1_1_output, fc1_2_output, mask_fc1_1, mask_fc1_2 = _apply_swiglu_clamp(
-            fc1_1_output, fc1_2_output, swiglu_limit
-        )
-
-        # compute the activation of linear layer fc1-1
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-
-        # compute final result of linear layer fc1
-        fc1_result = fc1_1_activation * fc1_2_output
-
-        # compute linear layer fc2
-        fc2_output = group_gemm_same_nk(
-            a=fc1_result,
-            b=fc2_weight,
-            cumsum_M=cumsum,
-            max_M=max_expert_tokens,
-            transpose_a=False,
-            transpose_b=True,
-            **({"b_extra": replica_fc2_weight} if replica_fc2_weight is not None else {}),
-        )
-
-        ctx.swiglu_limit = swiglu_limit
-        ctx.save_for_backward(
-            permute_tokens,
-            cumsum,
-            fc1_1_2_weight,
-            fc2_weight,
-            fc1_1_output,
-            fc1_2_output,
-            mask_fc1_1 if mask_fc1_1 is not None else torch.empty(0, device=permute_tokens.device),
-            mask_fc1_2 if mask_fc1_2 is not None else torch.empty(0, device=permute_tokens.device),
-            *(
-                (replica_fc1_weight, replica_fc2_weight)
-                if replica_fc1_weight is not None or replica_fc2_weight is not None
-                else ()
-            ),
-        )
-
-        return fc2_output
-
-    @staticmethod
-    def backward(ctx, grad_output, *, weight_gradient_dtype=None, weight_needs_grad=None, weight_grad_fn=None):
-        weight_grad_fn = group_gemm_same_mn if weight_grad_fn is None else weight_grad_fn
-        (
-            permute_tokens,
-            cumsum,
-            fc1_1_2_weight,
-            fc2_weight,
-            fc1_1_output,
-            fc1_2_output,
-            mask_fc1_1,
-            mask_fc1_2,
-            *replica_weights,
-        ) = ctx.saved_tensors
-        replica_fc1_weight, replica_fc2_weight = replica_weights or (None, None)
-        swiglu_limit = ctx.swiglu_limit
-        max_expert_tokens = getattr(ctx, "max_tokens_per_expert", grad_output.shape[0])
-
-        # recompute
-        fc1_1_activation = torch.ops.aten.silu(fc1_1_output)
-        fc1_result = fc1_1_activation * fc1_2_output
-
-        # dgrad fc2
-        grad_fc1_result = group_gemm_same_nk(
-            a=grad_output,
-            b=fc2_weight,
-            cumsum_M=cumsum,
-            max_M=max_expert_tokens,
-            transpose_b=False,
-            **({"b_extra": replica_fc2_weight} if replica_fc2_weight is not None else {}),
-        )
-
-        # wgrad fc2
-        grad_fc2_weight = None
-        pending_fc2_weight = None
-        if fc2_weight.requires_grad if weight_needs_grad is None else weight_needs_grad[1]:
-            grad_fc2_weight = torch.empty(
-                (len(cumsum), *fc2_weight.shape[1:]),
-                dtype=weight_gradient_dtype or fc2_weight.dtype,
-                device=fc2_weight.device,
-            )
-            start_weight_grad = getattr(weight_grad_fn, "start", None)
-            launch_weight_grad = start_weight_grad if start_weight_grad is not None else weight_grad_fn
-            result = launch_weight_grad(
-                a=grad_output,
-                b=fc1_result,
-                c=grad_fc2_weight,
-                cumsum_K=cumsum,
-                max_K=grad_output.shape[0],
-                transpose_a=True,
-                transpose_b=False,
-            )
-            if start_weight_grad is not None:
-                pending_fc2_weight = result
-
-        try:
-            # These derivatives do not consume fc2's weight gradient. Submit
-            # them while its first ordered P2P stage is in flight.
-            grad_fc1_2_output = fc1_1_activation * grad_fc1_result
-            grad_fc1_1_activation = grad_fc1_result * fc1_2_output
-            grad_fc1_1_output = torch.ops.aten.silu_backward(grad_fc1_1_activation, fc1_1_output)
-
-            if swiglu_limit is not None:
-                grad_fc1_1_output.masked_fill_(~mask_fc1_1, 0)
-                grad_fc1_2_output.masked_fill_(~mask_fc1_2, 0)
-
-            # Merge grads back to [T, 2I]
-            grad_fc1_output = torch.cat([grad_fc1_1_output, grad_fc1_2_output], dim=-1)
-
-            # single dgrad for merged fc1
-            grad_permute_tokens = group_gemm_same_nk(
-                a=grad_fc1_output,
-                b=fc1_1_2_weight,
-                cumsum_M=cumsum,
-                max_M=max_expert_tokens,
-                transpose_b=False,
-                **({"b_extra": replica_fc1_weight} if replica_fc1_weight is not None else {}),
-            )
-        finally:
-            # Drain communication even when independent work raises, retaining
-            # the handle's operand lifetime. Finish the down-projection chain
-            # before starting gate/up communication to preserve message order.
-            if pending_fc2_weight is not None:
-                pending_fc2_weight.wait()
-
-        # single wgrad for merged fc1
-        grad_fc1_1_2_weight = None
-        if fc1_1_2_weight.requires_grad if weight_needs_grad is None else weight_needs_grad[0]:
-            grad_fc1_1_2_weight = torch.empty(
-                (len(cumsum), *fc1_1_2_weight.shape[1:]),
-                dtype=weight_gradient_dtype or fc1_1_2_weight.dtype,
-                device=fc1_1_2_weight.device,
-            )
-            weight_grad_fn(
-                a=grad_fc1_output,
-                b=permute_tokens,
-                c=grad_fc1_1_2_weight,
-                cumsum_K=cumsum,
-                max_K=grad_output.shape[0],
-                transpose_a=True,
-                transpose_b=False,
-            )
-
-        return (
-            grad_permute_tokens,  # permute_tokens
-            None,  # cumsum
-            grad_fc1_1_2_weight,  # fc1_1_2_weight
-            grad_fc2_weight,  # fc2_weight
-            None,  # swiglu_limit
-        )
-
-
-class _BalancedEPMergedFc1GroupGemm(torch.autograd.Function):
-    """Keep partial wgrad and replica reduction inside one FP32 autograd boundary.
-
-    A separate BF16 concatenation edge would cast partial gradients to BF16
-    before the owner can combine them. Forward weights and activations remain
-    in their original dtype; only weight-gradient buffers and P2P use FP32.
-    """
-
-    @staticmethod
-    def forward(ctx, tokens, cumsum, gate, down, replica_gate, replica_down, plan, group, swiglu_limit):
-        _validate_replica_weight(gate, replica_gate, plan, group)
-        _validate_replica_weight(down, replica_down, plan, group)
-        ctx.replica_plan, ctx.replica_group = plan, group
-        ctx.original_weight_dtype = gate.dtype
-        # Counts are already on the host. Tighten only the independent M/N
-        # launch grid; the total_M tuning key and K reduction remain unchanged.
-        ctx.max_tokens_per_expert = int(plan.tokens_per_local_physical_expert.sum(dim=0).max())
-        return EPMergedFc1GroupGemm.forward(
-            ctx, tokens, cumsum, torch.cat((gate, replica_gate)), torch.cat((down, replica_down)), swiglu_limit
-        )
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        kwargs = dict(
-            weight_gradient_dtype=torch.float32, weight_needs_grad=(ctx.needs_input_grad[2], ctx.needs_input_grad[3])
-        )
-        ordered = grad_output.is_cuda
-        if ordered and any(kwargs["weight_needs_grad"]):
-            from .ep_grad import make_ordered_weight_grad
-
-            kwargs["weight_grad_fn"] = make_ordered_weight_grad(
-                ctx.replica_plan, ctx.replica_group, grad_output.device
-            )
-        dx, _, dgate, ddown, _ = EPMergedFc1GroupGemm.backward(ctx, grad_output, **kwargs)
-        if dgate is not None:
-            dgate = (
-                dgate[: ctx.replica_plan.num_local_experts]
-                if ordered
-                else _merge_replica_weight_gradients(dgate, ctx.replica_plan, ctx.replica_group)
-            ).to(ctx.original_weight_dtype)
-        if ddown is not None:
-            ddown = (
-                ddown[: ctx.replica_plan.num_local_experts]
-                if ordered
-                else _merge_replica_weight_gradients(ddown, ctx.replica_plan, ctx.replica_group)
-            ).to(ctx.original_weight_dtype)
-        return dx, None, dgate, ddown, None, None, None, None, None
-
-
-class _MemoryBalancedEPMergedFc1GroupGemm(_BalancedEPMergedFc1GroupGemm):
-    """Two-storage reads with transfer ownership lasting for the entire graph.
-
-    Keeping owners on ctx (not releasing at backward) also covers retained
-    graphs and frozen expert weights whose tokens still require gradients.
-    """
-
-    @staticmethod
-    def forward(ctx, tokens, cumsum, gate, down, replica_gate, replica_down, plan, group, swiglu_limit, transfers):
-        ctx.replica_transfers = transfers
-        try:
-            _validate_replica_weight(gate, replica_gate, plan, group)
-            _validate_replica_weight(down, replica_down, plan, group)
-            ctx.replica_plan, ctx.replica_group = plan, group
-            ctx.original_weight_dtype = gate.dtype
-            ctx.max_tokens_per_expert = int(plan.tokens_per_local_physical_expert.sum(dim=0).max())
-            return EPMergedFc1GroupGemm.forward(
-                ctx,
-                tokens,
-                cumsum,
-                gate,
-                down,
-                swiglu_limit,
-                replica_fc1_weight=replica_gate,
-                replica_fc2_weight=replica_down,
-            )
-        finally:
-            # Dispatch has successfully waited both transfers before applying
-            # this Function; record even when a later kernel submission fails.
-            try:
-                transfers[0].record_stream_use()
-            finally:
-                transfers[1].record_stream_use()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        try:
-            return (*_BalancedEPMergedFc1GroupGemm.backward(ctx, grad_output), None)
-        finally:
-            try:
-                ctx.replica_transfers[0].record_stream_use()
-            finally:
-                ctx.replica_transfers[1].record_stream_use()

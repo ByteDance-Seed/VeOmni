@@ -13,17 +13,23 @@ import torch
 def _cpu_launcher():
     # Load only the real Python launcher when Triton itself cannot import on CPU.
     # This seam proves pointer/geometry validation, never Triton arithmetic.
-    path = Path(__file__).parents[2] / "veomni/ops/kernels/moe/_kernels/kernel/group_gemm.py"
+    path = Path(__file__).parents[2] / "veomni/ops/kernels/moe_experts/shared/group_gemm.py"
     tree = ast.parse(path.read_text())
     function = next(
         node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "group_gemm_same_nk"
     )
     calls = []
+    block = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "_GROUP_GEMM_BLOCK" for target in node.targets)
+    )
 
     class Launch:
         def __getitem__(self, grid):
             def launch(**kwargs):
-                calls.append((grid(dict(kwargs, BLOCK_M=128, BLOCK_N=128)), kwargs))
+                calls.append((grid(kwargs), kwargs))
 
             return launch
 
@@ -34,22 +40,35 @@ def _cpu_launcher():
         triton=SimpleNamespace(cdiv=lambda a, b: (a + b - 1) // b),
         get_torch_device=lambda: SimpleNamespace(device=lambda _: nullcontext()),
         group_gemm_same_nk_kernel=Launch(),
+        _GROUP_GEMM_BLOCK=block,
     )
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
     return namespace["group_gemm_same_nk"], calls
 
 
 @pytest.mark.parametrize("transpose", [False, True])
-def test_two_storage_launcher_preserves_total_geometry_and_original_pointers(transpose):
+@pytest.mark.parametrize("compact", [False, True])
+def test_two_storage_launcher_preserves_total_geometry_and_original_pointers(transpose, compact):
     launch, calls = _cpu_launcher()
     a = torch.zeros(137, 33, dtype=torch.bfloat16)
     shape = (65, 33) if transpose else (33, 65)
     b, extra = torch.zeros(2, *shape, dtype=a.dtype), torch.zeros(3, *shape, dtype=a.dtype)
-    out = launch(a, b, torch.tensor([0, 5, 5, 8, 137]), 137, transpose_b=transpose, b_extra=extra)
+    prefix = torch.tensor([0, 1, 1, 2, 4]) if compact else None
+    out = launch(
+        a,
+        b,
+        torch.tensor([0, 5, 5, 8, 137]),
+        137,
+        transpose_b=transpose,
+        b_extra=extra,
+        tile_cumsum=prefix,
+        tile_total_M=137 if compact else None,
+    )
     assert out.shape == (137, 65)
     assert len(calls) == 1
     grid, kwargs = calls[0]
-    assert grid == (2, 5)
+    assert grid == ((6,) if compact else (2, 5))
+    assert kwargs["COMPACT_SCHEDULE"] is compact and kwargs["tile_cumsum"] is prefix
     assert kwargs["b_ptr"] is b and kwargs["b_extra_ptr"] is extra
     assert (kwargs["G"], kwargs["LOCAL_G"], kwargs["total_M"], kwargs["max_M"], kwargs["N"], kwargs["K"]) == (
         5,
@@ -87,7 +106,7 @@ def test_two_storage_launcher_rejects_incompatible_extra_before_launch(bad):
 @pytest.mark.parametrize("transpose", [False, True])
 @pytest.mark.parametrize("counts", [(0, 5, 0, 131, 1), (3, 0, 1, 0, 0), (0, 0, 0, 0, 0)])
 def test_cuda_two_storage_group_gemm_matches_concat(dtype, transpose, counts):
-    from veomni.ops.kernels.moe._kernels.kernel.group_gemm import group_gemm_same_nk
+    from veomni.ops.kernels.moe_experts.shared.group_gemm import group_gemm_same_nk
 
     torch.manual_seed(71)
     shape = (65, 33) if transpose else (33, 65)
@@ -111,7 +130,7 @@ def test_cuda_two_storage_group_gemm_matches_concat(dtype, transpose, counts):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("transpose", [False, True])
 def test_cuda_tight_group_bound_preserves_partial_tile_groups(dtype, transpose):
-    from veomni.ops.kernels.moe._kernels.kernel.group_gemm import group_gemm_same_nk
+    from veomni.ops.kernels.moe_experts.shared.group_gemm import group_gemm_same_nk
 
     torch.manual_seed(73)
     counts = (1031, 5, 129, 0, 257)

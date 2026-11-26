@@ -1,19 +1,23 @@
 """Native H3 model-owned packing, without pretrained weights or encoders."""
 
 import copy
-from types import SimpleNamespace
+import importlib.util
+from datetime import timedelta
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.diffusers.minimax_h3.minimax_h3_condition.configuration_minimax_h3_condition import (
     MiniMaxH3ConditionModelConfig,
 )
 from veomni.models.diffusers.minimax_h3.minimax_h3_condition.modeling_minimax_h3_condition import (
     MiniMaxH3ConditionModel,
 )
-from veomni.models.diffusers.minimax_h3.minimax_h3_core import core, minimax_h3_dit, packed_sequence
+from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_dit, packed_sequence
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import (
     MiniMaxH3DiTModelConfig,
 )
@@ -25,13 +29,20 @@ from veomni.trainer.dit_trainer import DiTDataCollator
 from veomni.utils.import_utils import is_torch_npu_available
 
 
-def tiny_model():
+_CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
+
+
+def tiny_model(num_attention_heads=2, *, attn_implementation="eager"):
+    from tests.models.compare import eager_ops_config
+
+    ops = eager_ops_config()
+    ops.attn_implementation = attn_implementation
     return MiniMaxH3DiTModel(
         MiniMaxH3DiTModelConfig(
             hidden_size=32,
             num_layers=2,
             token_refiner_num_layers=1,
-            num_attention_heads=2,
+            num_attention_heads=num_attention_heads,
             attention_head_dim=16,
             ffn_hidden_size=64,
             text_dim=32,
@@ -41,12 +52,84 @@ def tiny_model():
             adaln_out_features=576,
             final_adaln_out_features=64,
             rope_inv_freq_len=2,
+            ops_implementation=ops,
         )
     )
 
 
 def condition_model():
     return MiniMaxH3ConditionModel(MiniMaxH3ConditionModelConfig(skip_encoder_load=True, num_train_timesteps=16))
+
+
+@pytest.mark.parametrize("power,expected_loss,expected_grad", [(2.0, 4.0, 1.0), (1.0, 16.0, 4.0), (0.0, 64.0, 16.0)])
+def test_cfg_objective_curvature_and_detached_unconditional(power, expected_loss, expected_grad):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.training_objectives import cfg_calibrated_mse
+
+    pred = torch.tensor([6.0], requires_grad=True)
+    uncond = torch.tensor([2.0], requires_grad=True)
+    loss = cfg_calibrated_mse(pred, torch.ones(1), unconditional=uncond, scale=4.0, curvature_power=power)
+    loss.backward()
+    torch.testing.assert_close(loss, torch.tensor(expected_loss))
+    torch.testing.assert_close(pred.grad, torch.tensor([expected_grad]))
+    assert uncond.grad is None
+
+
+def test_cfg_scales_use_each_modality_sigma():
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.training_objectives import resolve_cfg_scales
+
+    assert resolve_cfg_scales(4, "constant", t_video=0.25, t_audio=0.8) == (4, 4)
+    assert resolve_cfg_scales(4, "sigma", t_video=0.25, t_audio=0.8) == pytest.approx((3.25, 1.6))
+
+
+def test_cfg_hessian_and_shape_contract():
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.training_objectives import cfg_calibrated_mse
+
+    for power, expected in ((2.0, 2 / 16), (1.0, 2 / 4), (0.0, 2.0), (0.5, 1.0)):
+        p = torch.tensor([6.0], requires_grad=True)
+        loss = cfg_calibrated_mse(p, torch.ones(1), unconditional=torch.ones(1), scale=4, curvature_power=power)
+        gradient = torch.autograd.grad(loss, p, create_graph=True)[0]
+        hessian = torch.autograd.grad(gradient, p)[0]
+        torch.testing.assert_close(hessian, torch.tensor([expected]))
+    with pytest.raises(ValueError, match="shapes"):
+        cfg_calibrated_mse(torch.ones(2), torch.ones(1))
+    with pytest.raises(ValueError, match="unconditional"):
+        cfg_calibrated_mse(torch.ones(2), torch.ones(2), scale=4)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"training_cfg_scale": 0.5},
+        {"training_cfg_scale": float("nan")},
+        {"training_cfg_schedule": "unknown"},
+        {"training_cfg_curvature_power": -1},
+        {"training_cfg_curvature_power": 3},
+        {"training_cfg_curvature_power": float("nan")},
+        {"training_cfg_curvature_power": float("inf")},
+    ],
+)
+def test_cfg_configuration_rejects_invalid_options(options):
+    with pytest.raises(ValueError):
+        MiniMaxH3ConditionModelConfig(**options)
+
+
+def test_default_noise_sampling_preserves_rng():
+    row = raw_sample()
+    cond = condition_model()
+    torch.manual_seed(17)
+    index = torch.randint(0, cond.config.num_train_timesteps, (1,)).item()
+    video_noise = torch.randn_like(row["input_latents"])
+    audio_noise = torch.randn_like(row["audio_input_latents"])
+    state = torch.get_rng_state()
+    torch.manual_seed(17)
+    sample = prepare(cond, [row])[0]
+    assert torch.equal(torch.get_rng_state(), state)
+    torch.testing.assert_close(sample["training_target"], video_noise - row["input_latents"])
+    torch.testing.assert_close(sample["training_target_audio"], audio_noise - row["audio_input_latents"])
+    for modality in ("video", "audio"):
+        scheduler = getattr(cond, f"_scheduler_{modality}")
+        timestep = scheduler.timesteps[index].to(row["input_latents"].dtype)
+        assert sample[f"t_{modality}"] == 1 - timestep.float().item() / scheduler.num_train_timesteps
 
 
 def raw_sample(text_len=3, task="fl2va", refs=None, latent_t=2, latent_h=4, latent_w=6, audio_t=3, keyframes=(0,)):
@@ -65,7 +148,6 @@ def raw_sample(text_len=3, task="fl2va", refs=None, latent_t=2, latent_h=4, late
         audio_input_latents=torch.randn(2, 32, audio_t),
         prompt_embeds=torch.randn(text_len, 32),
         packed=pk,
-        use_gradient_checkpointing=False,
     )
     if pk["cond_rows"]:
         row[anchor_key] = torch.randn(pk["cond_rows"], 96)
@@ -98,15 +180,411 @@ def batch(samples):
     return {key: [sample[key] for sample in samples] for key in samples[0]}
 
 
+def cfg_condition(**options):
+    return MiniMaxH3ConditionModel(
+        MiniMaxH3ConditionModelConfig(skip_encoder_load=True, num_train_timesteps=16, training_cfg_scale=4, **options)
+    )
+
+
+def cfg_raw(text_len=3, task="ref2va"):
+    row = raw_sample(text_len, task)
+    negative = raw_sample(2, task)
+    row["unconditional_prompt_embeds"] = negative["prompt_embeds"]
+    row["unconditional_packed"] = negative["packed"]
+    return row
+
+
+@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
+def test_cfg_branches_share_noise_references_and_rng(task):
+    row = cfg_raw(task=task)
+    torch.manual_seed(12)
+    ordinary = prepare(condition_model(), [row])[0]
+    state = torch.get_rng_state()
+    torch.manual_seed(12)
+    sample = prepare(cfg_condition(), [row])[0]
+    assert torch.equal(torch.get_rng_state(), state)
+    negative = sample["unconditional_inputs"]
+    for key, positions in (("x", "img_pos_info"), ("audio_x", "audio_pos_info")):
+        torch.testing.assert_close(sample[key], ordinary[key])
+        torch.testing.assert_close(
+            sample[key][0, sample[positions]["position_ids"]],
+            negative[key][0, negative[positions]["position_ids"]],
+        )
+    assert "training_target" not in negative
+    assert not negative["use_gradient_checkpointing"]
+    torch.testing.assert_close(negative["unique_timesteps"], sample["unique_timesteps"])
+    for name in ("img_pos_info", "audio_pos_info"):
+        torch.testing.assert_close(
+            negative["inverse_indices"][negative[name]["position_ids"]],
+            sample["inverse_indices"][sample[name]["position_ids"]],
+        )
+
+
+def test_cfg_training_does_not_repeat_cache_value_validation(monkeypatch):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import cfg_conditioning
+
+    row = cfg_raw()
+    cfg_conditioning.validate_unconditional(
+        row["packed"], row["unconditional_packed"], row["unconditional_prompt_embeds"], row["prompt_embeds"]
+    )
+
+    def unexpected_validation(*args):
+        raise AssertionError("Cache values must not be revalidated during training.")
+
+    monkeypatch.setattr(cfg_conditioning, "_validate_layout", unexpected_validation)
+    sample = prepare(cfg_condition(), [row])[0]
+    assert "unconditional_inputs" in sample
+
+
+@pytest.mark.parametrize(
+    "malformation", [None, "width", "geometry", "image_rows", "audio_rows", "coordinates", "tags"]
+)
+def test_cfg_metadata_validation_needs_no_tensor_values(malformation):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.cfg_conditioning import validate_unconditional_metadata
+
+    row = cfg_raw()
+    positive, negative = (
+        {key: value.to("meta") if isinstance(value, torch.Tensor) else value for key, value in row[name].items()}
+        for name in ("packed", "unconditional_packed")
+    )
+    prompt = row["unconditional_prompt_embeds"].to("meta")
+    if malformation == "width":
+        prompt = prompt[:, :16]
+    elif malformation == "geometry":
+        negative["latent_t"] += 1
+    elif malformation in ("image_rows", "audio_rows"):
+        key = "img_pos" if malformation == "image_rows" else "audio_pos"
+        negative[key] = negative[key][:-1]
+    elif malformation == "coordinates":
+        negative["img_position_ids"] = negative["img_position_ids"][:, :-1]
+    elif malformation == "tags":
+        negative["token_tags"] = negative["token_tags"][:-1]
+    if malformation:
+        with pytest.raises(ValueError):
+            validate_unconditional_metadata(positive, negative, prompt, row["prompt_embeds"].to("meta"))
+    else:
+        validate_unconditional_metadata(positive, negative, prompt, row["prompt_embeds"].to("meta"))
+
+
+def test_cfg_remapping_does_not_recompute_unique(monkeypatch):
+    original = torch.unique
+    calls = []
+
+    def unique(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "unique", unique)
+    prepare(cfg_condition(), [cfg_raw()])
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("mode", ["fl2va", "ref2va"])
+@pytest.mark.parametrize("finite", [True, False])
+@pytest.mark.parametrize("drop_visual", [False, True])
+def test_unconditional_cache_producer_matches_native_presentation(monkeypatch, mode, finite, drop_visual):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_text_encoder as text
+
+    class Tokenizer:
+        def __call__(self, value, **kwargs):
+            return {"input_ids": [ord(char) for char in value]}
+
+        def convert_tokens_to_ids(self, token):
+            return {text.VISION_START: 1000, text.VISION_END: 1001, text.IMAGE_PAD: 1002, text.VIDEO_PAD: 1003}[token]
+
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.calls = []
+
+        def forward(self, **kwargs):
+            assert not torch.is_grad_enabled()
+            self.calls.append(kwargs)
+            return kwargs["input_ids"][0, :, None].float().expand(-1, 32) * (self.weight if finite else float("nan"))
+
+    monkeypatch.setattr(
+        text, "image_token_counts", lambda processor, images: (torch.ones(1, 3), torch.ones(1, 3), [2])
+    )
+    cond = condition_model()
+    cond._text_encoder = Encoder()
+    cond._tokenizer = Tokenizer()
+    image = object()
+    row = raw_sample(task=mode)
+    kwargs = (
+        {"keyframe_images": [image]}
+        if mode == "fl2va"
+        else {"ref_blocks": [{"kind": "image", "prepared_image": image}]}
+    )
+    if drop_visual:
+        kwargs["drop_visual"] = True
+    if not finite:
+        with pytest.raises(ValueError, match="finite"):
+            cond.add_unconditional_cache(row, **kwargs)
+        return
+    paired = cond.add_unconditional_cache(row, **kwargs)
+    encoded = {
+        "prompt_embeds": paired["unconditional_prompt_embeds"],
+        "text_token_tags": paired["unconditional_packed"]["token_tags"][: paired["unconditional_packed"]["text_len"]],
+    }
+    if drop_visual:
+        expected_ids, expected_tags = text.presentation_t2va(cond._tokenizer, " ")
+        assert "pixel_values" not in cond._text_encoder.calls[0]
+    elif mode == "fl2va":
+        expected_ids, expected_tags = text.presentation_fl2va(cond._tokenizer, " ", [2])
+    else:
+        expected_ids, expected_tags = text.presentation_ref2va(cond._tokenizer, " ", [("image", 1)], [2], [], [])
+    assert paired["input_latents"] is row["input_latents"]
+    anchor = "keyframe_cond_anchor" if mode == "fl2va" else "ref_visual_anchor"
+    assert paired[anchor] is row[anchor]
+    prepared = prepare(cfg_condition(), [paired])[0]
+    negative = prepared["unconditional_inputs"]
+    torch.testing.assert_close(
+        negative["x"][0, negative["img_pos_info"]["position_ids"]],
+        prepared["x"][0, prepared["img_pos_info"]["position_ids"]],
+    )
+    torch.testing.assert_close(cond._text_encoder.calls[0]["input_ids"][0], expected_ids)
+    torch.testing.assert_close(encoded["text_token_tags"], expected_tags)
+    assert encoded["prompt_embeds"].shape == (len(expected_ids), 32)
+    assert not encoded["prompt_embeds"].requires_grad
+
+
+@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
+def test_text_only_negative_does_not_require_visual_sources(monkeypatch, task):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_text_encoder as text
+
+    def encode(encoder, processor, tokenizer, prompt, **kwargs):
+        assert prompt == " "
+        assert kwargs["keyframes"] is None
+        assert kwargs["ref_blocks"] is None
+        return {"prompt_embeds": torch.ones(1, 32), "text_token_tags": torch.ones(1, dtype=torch.long)}
+
+    monkeypatch.setattr(text, "encode_prompt", encode)
+    cond = condition_model()
+    cond._text_encoder = torch.nn.Linear(1, 1)
+    cond._tokenizer = object()
+    row = raw_sample(task=task)
+    paired = cond.add_unconditional_cache(row, drop_visual=True)
+    assert "unconditional_prompt_embeds" not in row
+    assert paired["unconditional_packed"]["cond_rows"] == row["packed"]["cond_rows"]
+    output = tiny_model()(**prepare(cfg_condition(), [paired])[0])
+    assert all(torch.isfinite(loss) for loss in output.loss.values())
+    sum(output.loss.values()).backward()
+
+
+@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
+def test_paired_cache_rejects_missing_visual_sources(task):
+    with pytest.raises(ValueError, match="original"):
+        condition_model().add_unconditional_cache(raw_sample(task=task))
+
+
+def test_ref_prompt_preserves_reference_order_and_video_timestamps(monkeypatch):
+    import numpy as np
+
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_text_encoder as text
+
+    observed = {}
+
+    def presentation(tokenizer, prompt, labels, images, videos, timestamps):
+        observed.update(prompt=prompt, labels=labels, images=images, videos=videos, timestamps=timestamps)
+        return torch.tensor([1]), torch.tensor([1])
+
+    def process_videos(processor, videos, timestamps):
+        assert videos[0].shape[0] == 2  # native 24 FPS -> Qwen 2 FPS sampling
+        assert timestamps == [[0.25]]
+        return torch.ones(1, 3), torch.ones(1, 3), [[2]], timestamps
+
+    monkeypatch.setattr(text, "presentation_ref2va", presentation)
+    monkeypatch.setattr(
+        text, "image_token_counts", lambda processor, images: (torch.ones(1, 3), torch.ones(1, 3), [3])
+    )
+    monkeypatch.setattr(text, "video_token_counts", process_videos)
+    refs = [
+        {"kind": "video", "prepared_frames": [np.zeros((2, 2, 3)) for _ in range(24)], "ref_audio_t": 0},
+        {"kind": "image", "prepared_image": object()},
+    ]
+    text.prepare_ref_prompt(None, None, " ", refs)
+    assert observed == {
+        "prompt": " ",
+        "labels": [("video", 1), ("image", 1)],
+        "images": [3],
+        "videos": [[2]],
+        "timestamps": [[0.25]],
+    }
+
+
+def test_cfg_missing_or_incompatible_negative_fails():
+    with pytest.raises(ValueError, match="unconditional"):
+        prepare(cfg_condition(), [raw_sample()])
+    row = cfg_raw()
+    row["unconditional_packed"]["latent_t"] += 1
+    with pytest.raises(ValueError, match="geometry"):
+        prepare(cfg_condition(), [row])
+
+
+@pytest.mark.parametrize("power", [0.0, 0.5, 1.0, 2.0])
+def test_cfg_model_loss_raw_predictions_and_gradient_boundary(power):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.training_objectives import cfg_calibrated_mse
+
+    model = tiny_model()
+    row = cfg_raw()
+    row["prompt_embeds"].requires_grad_()
+    row["unconditional_prompt_embeds"].requires_grad_()
+    sample = prepare(cfg_condition(training_cfg_curvature_power=power, training_cfg_schedule="sigma"), [row])[0]
+    branch_modes = []
+    hook = model.dit.register_forward_pre_hook(lambda *args: branch_modes.append(torch.is_grad_enabled()))
+    out = model(**sample)
+    hook.remove()
+    assert branch_modes == [False, True]
+    ordinary = {k: v for k, v in sample.items() if k != "unconditional_inputs"}
+    ordinary["training_cfg_scales"] = (1, 1)
+    with torch.no_grad():
+        negative = model(**sample["unconditional_inputs"])
+        raw = model(**ordinary)
+    for i, modality in enumerate(("video", "audio")):
+        torch.testing.assert_close(out.predictions[i], raw.predictions[i])
+        target = sample["training_target" if i == 0 else "training_target_audio"]
+        expected = cfg_calibrated_mse(
+            out.predictions[i],
+            target,
+            unconditional=negative.predictions[i],
+            scale=sample["training_cfg_scales"][i],
+            curvature_power=power,
+        )
+        scheduler = sample[f"scheduler_{modality}"]
+        weight = scheduler.training_weight(torch.tensor((1 - sample[f"t_{modality}"]) * scheduler.num_train_timesteps))
+        torch.testing.assert_close(out.loss[f"mse_{modality}"], expected * weight)
+    sum(out.loss.values()).backward()
+    assert row["prompt_embeds"].grad is not None
+    assert row["unconditional_prompt_embeds"].grad is None
+
+
+def test_cfg_packed_matches_serial_loss_and_gradients():
+    torch.manual_seed(11)
+    samples = prepare(cfg_condition(), [cfg_raw(3, "fl2va"), cfg_raw(7, "ref2va")])
+    one = tiny_model()
+    many = copy.deepcopy(one)
+    outputs = serial(one, samples)
+    expected = sum(sum(out.loss.values()) for out in outputs) / 2
+    actual = many(**batch(samples))
+    torch.testing.assert_close(sum(actual.loss.values()), expected, rtol=2e-5, atol=2e-5)
+    expected.backward()
+    sum(actual.loss.values()).backward()
+    for a, b in zip(one.parameters(), many.parameters()):
+        if a.grad is not None:
+            torch.testing.assert_close(a.grad, b.grad, rtol=3e-4, atol=3e-5)
+
+
+def test_scale_one_requires_no_negative_and_preserves_output():
+    row = raw_sample()
+    torch.manual_seed(8)
+    expected = prepare(condition_model(), [row])[0]
+    state = torch.get_rng_state()
+    torch.manual_seed(8)
+    cond = MiniMaxH3ConditionModel(
+        MiniMaxH3ConditionModelConfig(
+            skip_encoder_load=True,
+            num_train_timesteps=16,
+            training_cfg_scale=1,
+        )
+    )
+    actual = prepare(cond, [row])[0]
+    assert torch.equal(torch.get_rng_state(), state)
+    assert expected.keys() == actual.keys()
+    model = tiny_model()
+    modes = []
+    hook = model.dit.register_forward_pre_hook(lambda *args: modes.append(torch.is_grad_enabled()))
+    a = model(**actual)
+    hook.remove()
+    assert modes == [True]
+    b = model(**expected)
+    torch.testing.assert_close(a.loss, b.loss, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("malformation", ["width", "nan", "reference", "tags", "layout"])
+def test_cfg_offline_negative_validation(malformation):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.cfg_conditioning import validate_unconditional
+
+    row = cfg_raw()
+    if malformation == "width":
+        row["unconditional_prompt_embeds"] = torch.randn(2, 16)
+    elif malformation == "nan":
+        row["unconditional_prompt_embeds"][0, 0] = float("nan")
+    elif malformation == "reference":
+        pk = row["unconditional_packed"]
+        pk["img_position_ids"][0, pk["img_pos"][0], 1] += 1
+    elif malformation == "tags":
+        row["unconditional_packed"]["token_tags"].fill_(2)
+    else:
+        row["unconditional_packed"]["text_pos"] += 1
+    with pytest.raises(ValueError):
+        validate_unconditional(
+            row["packed"], row["unconditional_packed"], row["unconditional_prompt_embeds"], row["prompt_embeds"]
+        )
+
+
+def test_cfg_checkpointing_and_silent_audio_match():
+    torch.manual_seed(16)
+    row = cfg_raw()
+    row["has_audio"] = False
+    sample = prepare(cfg_condition(), [row])[0]
+    one = tiny_model()
+    checkpointed = copy.deepcopy(one)
+    out = one(**sample)
+    sample["use_gradient_checkpointing"] = True
+    other = checkpointed(**sample)
+    assert out.loss["mse_audio"].item() == 0
+    torch.testing.assert_close(out.loss, other.loss)
+    sum(out.loss.values()).backward()
+    sum(other.loss.values()).backward()
+    for a, b in zip(one.parameters(), checkpointed.parameters()):
+        if a.grad is not None:
+            torch.testing.assert_close(a.grad, b.grad)
+
+
+def test_cfg_offline_cache_roundtrip():
+    import pickle
+
+    from veomni.data.multimodal.dit.data_transform import process_dit_offline_example
+
+    row = cfg_raw()
+    cached = {key: pickle.dumps(value) for key, value in row.items()}
+    restored = process_dit_offline_example(cached)[0]
+    out = tiny_model()(**prepare(cfg_condition(), [restored])[0])
+    assert all(torch.isfinite(loss) for loss in out.loss.values())
+
+
+def test_cfg_recipe_native_lora_and_condition_config_roundtrip():
+    from pathlib import Path
+
+    import yaml
+
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+
+    path = Path(__file__).resolve().parents[2] / "configs/dit/minimax_h3_ref2va_cfg_offline.yaml"
+    recipe = yaml.safe_load(path.read_text())
+    config = MiniMaxH3ConditionModelConfig(**recipe["model"]["condition_model_cfg"])
+    restored = MiniMaxH3ConditionModelConfig.from_dict(config.to_dict())
+    assert restored.to_dict() == config.to_dict()
+    model = VeOmniLoraModel(tiny_model(), VeOmniLoraConfig.from_yaml(recipe["model"]["lora_config"]))
+    trainable = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
+    assert len(trainable) == 2 * 4 * 2  # two blocks, four linears, A/B
+    assert all("dit.blocks." in name and ".lora_" in name for name, _ in trainable)
+    sample = prepare(MiniMaxH3ConditionModel(config), [cfg_raw()])[0]
+    out = model(**sample)
+    sum(out.loss.values()).backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for _, p in trainable)
+    assert any(p.grad.abs().sum() > 0 for _, p in trainable)
+
+
 def serial(model, samples):
     return [model(**sample) for sample in samples]
 
 
 @pytest.fixture(autouse=True)
 def cpu_attention(monkeypatch):
-    monkeypatch.setattr(minimax_h3_dit, "IS_NPU_AVAILABLE", False)
-    monkeypatch.setattr(core, "ATTENTION_IMPLEMENTATION", "torch")
     monkeypatch.setattr(minimax_h3_dit, "get_ulysses_sequence_parallel_group", lambda: None)
+    yield
 
 
 @pytest.mark.parametrize("backend", ["eager", "sdpa"])
@@ -118,7 +596,7 @@ def test_native_foundation_loader_uses_ordinary_batch_contract(backend):
         attn_implementation=backend,
         rms_norm_implementation="eager",
         rotary_pos_emb_implementation="eager",
-        swiglu_mlp_implementation="eager",
+        gated_mlp_implementation="eager",
         cross_entropy_loss_implementation="eager",
         moe_implementation="eager",
         load_balancing_loss_implementation="eager",
@@ -161,8 +639,8 @@ def test_packed_outputs_losses_and_gradients_match_serial(task, checkpointing):
     base = tiny_model()
     packed = copy.deepcopy(base)
     raws = [raw_sample(3, task), raw_sample(7, task)]
-    for row in raws:
-        row["use_gradient_checkpointing"] = checkpointing
+    if checkpointing:
+        packed.gradient_checkpointing_enable({"use_reentrant": False})  # the run's setting, through HF
     samples = prepare(condition_model(), raws)
     expected = serial(base, samples)
     entries = {id(block): 0 for block in packed.dit.blocks}
@@ -292,13 +770,21 @@ def test_accumulated_microbatches_weight_each_sample_like_single_sample():
     torch.testing.assert_close(accumulated, reference)
 
 
-def test_unsupported_backend_fails_only_on_packed_forward():
-    model = tiny_model()
-    model._configure_packed_attention("veomni_flash_attention_4_with_sp")  # what __init__ runs; must not raise
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("attention", ["flash_attention_4", "veomni_flash_attention_4"])
+@pytest.mark.parametrize("layout", ["scalar", "singleton", "packed"])
+def test_unsupported_flash_backend_fails_before_dit_forward(monkeypatch, attention, layout):
+    model = tiny_model(attn_implementation=attention)
+    assert model.config.ops_config.attn_implementation == "veomni_flash_attention_4"
     samples = prepare(condition_model(), [raw_sample(3), raw_sample(5)])
-    serial(model, samples)
+
+    def forbid_execution(*args, **kwargs):
+        raise AssertionError("Unsupported attention must fail before executing the DiT")
+
+    monkeypatch.setattr(model.dit, "forward", forbid_execution)
+    inputs = samples[0] if layout == "scalar" else batch(samples[:1] if layout == "singleton" else samples)
     with pytest.raises(ValueError, match="Unsupported H3 packing backend"):
-        model(**batch(samples))
+        model(**inputs)
 
 
 def test_sample_isolation_boundaries_and_zero_valid_rows():
@@ -444,46 +930,95 @@ def test_sequence_parallel_padding_remains_forward_local(monkeypatch, task):
         model(**batch([sample, sample]))
 
 
-_NPU_REJECTS_HUB = pytest.mark.skipif(is_torch_npu_available(), reason="Hub attention is rejected on Ascend NPU.")
+def _check_sequence_parallel_gradients(rank, init_method, cases):
+    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    try:
+        minimax_h3_dit.get_ulysses_sequence_parallel_group = lambda: dist.group.WORLD
+        for case, heads, state, sample, expected_loss, expected_grads in cases:
+            model = tiny_model(heads)
+            model.load_state_dict(state)
+            loss = sum(model(**sample).loss.values())
+            torch.testing.assert_close(loss, expected_loss, rtol=2e-5, atol=2e-5, msg=case)
+            loss.backward()
+            for name, param in model.named_parameters():
+                # FSDP2 shards over dp_shard_sp, so its reduce-scatter averages over the SP ranks too.
+                grad = param.grad.clone()
+                dist.all_reduce(grad)
+                torch.testing.assert_close(grad / 2, expected_grads[name], rtol=2e-4, atol=2e-5, msg=f"{case} {name}")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo required")
+def test_sequence_parallel_gradients_match_single_rank_after_sp_average(tmp_path):
+    cases = []
+    # Two heads leave one head block per SP rank; four heads exercise the pipelined multi-block exchange.
+    for task, heads in (("fl2va", 2), ("ref2va", 2), ("fl2va", 4)):
+        torch.manual_seed(5)
+        model = tiny_model(heads)
+        sample = prepare(condition_model(), [raw_sample(3, task)])[0]
+        loss = sum(model(**sample).loss.values())
+        loss.backward()
+        grads = {name: param.grad.clone() for name, param in model.named_parameters()}
+        cases.append((f"{task} heads={heads}", heads, model.state_dict(), sample, loss.detach(), grads))
+    mp.spawn(
+        _check_sequence_parallel_gradients, args=((tmp_path / "rendezvous").as_uri(), cases), nprocs=_CI_CPU_2.nproc
+    )
+
+
+_HUB_UNAVAILABLE = pytest.mark.skipif(
+    is_torch_npu_available() or importlib.util.find_spec("kernels") is None,
+    reason="Hub FlashAttention needs the kernels package and is rejected on Ascend NPU.",
+)
 
 
 @pytest.mark.parametrize(
     "backend",
     [
         "flash_attention_2",
-        pytest.param("flash_attention_2_hub", marks=_NPU_REJECTS_HUB),
+        pytest.param("flash_attention_2_hub", marks=_HUB_UNAVAILABLE),
         "flash_attention_3",
-        pytest.param("flash_attention_3_hub", marks=_NPU_REJECTS_HUB),
+        pytest.param("flash_attention_3_hub", marks=_HUB_UNAVAILABLE),
     ],
 )
 def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(monkeypatch, backend):
     from veomni.arguments import OpsImplementationConfig
     from veomni.models.auto import build_foundation_model
-    from veomni.ops.kernels.attention import flash
+    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer import (
+        modeling_minimax_h3_transformer as h3_modeling,
+    )
 
-    calls, loads = [], []
+    calls = []
 
-    config = tiny_model().config
+    def wrapped(self, q, k, v, *, cu_seqlens, max_seqlen, valid_seqlen):
+        bounds = cu_seqlens.device if isinstance(cu_seqlens, minimax_h3_dit._PackedBounds) else cu_seqlens
+        if not torch.is_tensor(bounds):
+            bounds = torch.tensor(bounds, dtype=torch.int32)
+        calls.append(bounds.tolist())
+        return minimax_h3_dit._sdpa_varlen_attention(q, k, v, tuple(bounds.tolist()), self.softmax_scale, True)
 
-    def kernel(q, k, v, *, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, causal):
-        assert q.ndim == 3 and q.shape[1:] == (config.num_attention_heads, config.attention_head_dim)
-        assert q.is_contiguous() and k.shape == v.shape == q.shape
-        assert cu_seqlens_q.dtype == torch.int32 and cu_seqlens_k is cu_seqlens_q
-        assert cu_seqlens_q[-1] == q.shape[0] and max_seqlen_q == max_seqlen_k
-        assert not causal
-        calls.append(cu_seqlens_q.tolist())
-        return minimax_h3_dit._sdpa_varlen_attention(q, k, v, tuple(cu_seqlens_q.tolist()), softmax_scale, True)
+    def bind_packed_name(module, *, is_causal, impl=None):
+        # Only the name is bound, so this case never constructs a real FA backend. FA3 is CUDA SM90-only.
+        module.is_causal = is_causal
+        module.config._attn_implementation = impl
 
-    def loader(name):
-        loads.append(name)
-        return SimpleNamespace(flash_attn_varlen_func=kernel)
+    if backend.endswith("_hub"):
+        from veomni.ops import install
 
-    monkeypatch.setattr(flash, "_load_veomni_flash_kernel", loader)
+        # Model init preloads the kernel. Serve the locally installed build instead of a ~1 GB Hub download.
+        local = "veomni_" + backend.removesuffix("_hub")
+        monkeypatch.setattr(
+            install, "_load_hub_flash_kernel", lambda repo: install._load_veomni_local_flash_kernel(local)
+        )
+
+    monkeypatch.setattr(minimax_h3_dit.MiniMaxH3Attention, "_run_packed_attention", wrapped)
+    monkeypatch.setattr(h3_modeling, "bind_minimax_attention", bind_packed_name)
     ops = OpsImplementationConfig(
         attn_implementation=backend,
         rms_norm_implementation="eager",
         rotary_pos_emb_implementation="eager",
-        swiglu_mlp_implementation="eager",
+        gated_mlp_implementation="eager",
         cross_entropy_loss_implementation="eager",
         moe_implementation="eager",
         load_balancing_loss_implementation="eager",
@@ -499,63 +1034,35 @@ def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(mon
     samples = prepare(condition_model(), raws)
     serial(model, samples)
     assert calls == []
-    loads.clear()  # Transformers may already have resolved the backend at construction.
     out = model(**batch(samples))
     sum(out.loss.values()).backward()
     assert calls[:2] == [[0, 3], [0, 7]]
     assert len(calls) == 4 and calls[2] == calls[3] and len(calls[2]) == 3
-    assert loads == [f"veomni_{backend}_with_sp"]
 
 
-def test_flash_backend_defers_packed_kernel_until_multisample_forward(monkeypatch):
-    import sys
-
-    from transformers import modeling_flash_attention_utils as hf_flash
-
-    from veomni.ops.kernels.attention import flash
+@pytest.mark.parametrize("multisample", [False, True])
+def test_flash_backend_defers_kernel_until_first_forward(monkeypatch, multisample):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer import (
+        modeling_minimax_h3_transformer as h3_modeling,
+    )
 
     loads = []
 
-    def unavailable(name):
-        loads.append(name)
+    def unavailable(module, *, is_causal, impl=None):
+        loads.append(impl)
         raise ImportError("flash_attn unavailable")
 
-    def npu_attention(q, k, v, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None):
-        raise AssertionError("construction must not run NPU attention")
-
-    # Mirror Ascend: Transformers resolves its native NPU FA before VeOmni's loader.
-    monkeypatch.setattr(flash, "_load_veomni_flash_kernel", unavailable)
-    monkeypatch.setattr(hf_flash, "is_flash_attn_2_available", lambda: False)
-    monkeypatch.setattr(hf_flash, "is_torch_npu_available", lambda: True)
-    for name in (
-        "_loaded_implementation",
-        "_flash_fn",
-        "_flash_varlen_fn",
-        "_flash_with_kvcache_fn",
-        "_pad_fn",
-        "_unpad_fn",
-        "_process_flash_kwargs_fn",
-    ):
-        monkeypatch.setattr(hf_flash, name, None if name == "_loaded_implementation" else getattr(hf_flash, name))
-    monkeypatch.setitem(
-        sys.modules,
-        "transformers.integrations.npu_flash_attention",
-        SimpleNamespace(
-            npu_flash_attn_func=npu_attention,
-            npu_flash_attn_varlen_func=npu_attention,
-            npu_flash_attn_with_kvcache=npu_attention,
-        ),
-    )
+    # github/main mocks `_load_veomni_flash_kernel`. Packed load is the bind.
+    monkeypatch.setattr(h3_modeling, "bind_minimax_attention", unavailable)
     config = tiny_model().config
-    config._attn_implementation = "veomni_flash_attention_2_with_sp"
+    config._attn_implementation = "veomni_flash_attention_2"
     model = MiniMaxH3DiTModel(config)
+    assert loads == []
     samples = prepare(condition_model(), [raw_sample(3), raw_sample(7)])
 
-    serial(model, samples[:1])
-    assert loads == []
     with pytest.raises(ImportError, match="flash_attn unavailable"):
-        model(**batch(samples))
-    assert loads == ["veomni_flash_attention_2_with_sp"]
+        model(**batch(samples)) if multisample else serial(model, samples[:1])
+    assert loads == ["veomni_flash_attention_2"]
 
 
 @pytest.mark.parametrize("checkpointing", [False, True])
@@ -569,10 +1076,10 @@ def test_packed_sdpa_slices_with_host_bounds(monkeypatch, checkpointing):
 
     monkeypatch.setattr(minimax_h3_dit, "_sdpa_varlen_attention", record)
     raws = [raw_sample(3), raw_sample(7)]
-    for row in raws:
-        row["use_gradient_checkpointing"] = checkpointing
     samples = prepare(condition_model(), raws)
     model = tiny_model()
+    if checkpointing:
+        model.gradient_checkpointing_enable({"use_reentrant": False})
     reads = []
     tolist = torch.Tensor.tolist
     monkeypatch.setattr(torch.Tensor, "tolist", lambda self: reads.append(self.shape) or tolist(self))
@@ -604,65 +1111,22 @@ def test_refiner_preserves_linear_row_counts_with_main_dit_packed(task):
     assert rows["main"] == [sum(sample["x"].shape[1] for sample in samples)]
 
 
-@pytest.mark.parametrize("offload", [True, [False, True]])
-def test_multisample_wrapper_rejects_checkpoint_offload(offload):
-    inputs = batch(prepare(condition_model(), [raw_sample(), raw_sample()]))
-    inputs["use_gradient_checkpointing_offload"] = offload
-    with pytest.raises(ValueError, match="checkpoint offload"):
-        tiny_model()(**inputs)
-
-
-@pytest.mark.parametrize("offload", [False, True])
-def test_inference_forwards_checkpoint_offload_to_core(offload):
-    from veomni.models.diffusers.minimax_h3.inference import model_fn_minimax_h3
-
-    row = raw_sample()
-    model = tiny_model()
-
-    def capture(module, args, kwargs):
-        assert kwargs["use_gradient_checkpointing_offload"] is offload
-        assert kwargs["packed_seq_params"]["cu_seqlens_host"] == tuple(row["packed"]["cu_seqlens"].tolist())
-        assert kwargs["refiner_packed_seq_params"]["cu_seqlens_host"] == (0, 3)
-        raise RuntimeError("inference offload forwarded")
-
-    handle = model.dit.register_forward_pre_hook(capture, with_kwargs=True)
-    try:
-        with pytest.raises(RuntimeError, match="inference offload forwarded"):
-            model_fn_minimax_h3(
-                model,
-                row["input_latents"],
-                row["audio_input_latents"],
-                row["packed"],
-                row["prompt_embeds"],
-                t_video=0.5,
-                t_audio=0.5,
-                keyframe_cond_anchor=row["keyframe_cond_anchor"],
-                use_gradient_checkpointing_offload=offload,
-            )
-    finally:
-        handle.remove()
-
-
-def test_condition_preserves_checkpoint_offload_for_model_validation():
+def test_a_legacy_sample_column_is_ignored():
+    """Caches written before recompute became configuration-only still load."""
     raws = [raw_sample(), raw_sample()]
     for row in raws:
+        row["use_gradient_checkpointing"] = True
         row["use_gradient_checkpointing_offload"] = True
     samples = prepare(condition_model(), raws)
-    assert all(sample["use_gradient_checkpointing_offload"] is True for sample in samples)
+    assert "use_gradient_checkpointing" not in samples[0]
+
     model = tiny_model()
-    with pytest.raises(ValueError, match="checkpoint offload"):
-        model(**batch(samples))
+    for sample in samples:  # the collated columns ride along from a stale cache
+        sample["use_gradient_checkpointing"] = True
 
-    def capture(module, args, kwargs):
-        assert kwargs["use_gradient_checkpointing_offload"] is True
-        raise RuntimeError("single-sample offload forwarded")
+    out = model(**batch(samples))
 
-    handle = model.dit.register_forward_pre_hook(capture, with_kwargs=True)
-    try:
-        with pytest.raises(RuntimeError, match="single-sample offload forwarded"):
-            model(**samples[0])
-    finally:
-        handle.remove()
+    assert set(out.loss) == {"mse_video", "mse_audio"}
 
 
 def test_invalid_precision_and_legacy_tail_fail_closed():
@@ -680,3 +1144,387 @@ def test_invalid_precision_and_legacy_tail_fail_closed():
         prepare(condition_model(), [row])
     with pytest.raises(ValueError, match="nonempty"):
         model(x=[])
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_h3_foundation_loader_preserves_official_fp32_islands(dtype):
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models.auto import build_foundation_model
+
+    model = build_foundation_model(
+        tiny_model().config, init_device="cpu", torch_dtype=dtype, ops_implementation=make_eager_ops_config()
+    )
+    ordinary_dtype = getattr(torch, dtype)
+    islands = (
+        model.dit.video_patch_proj,
+        model.dit.audio_patch_proj,
+        model.dit.time_embedder.proj_in,
+        model.dit.time_embedder.proj_out,
+        model.dit.final_layer.video_out,
+        model.dit.final_layer.audio_out,
+    )
+    assert all(p.dtype == torch.float32 for module in islands for p in module.parameters())
+    assert model.dit.condition_proj.weight.dtype == ordinary_dtype
+    assert model.dit.blocks[0].adaln_proj.linear.weight.dtype == ordinary_dtype
+    expected = tiny_model()
+    assert {k: v.shape for k, v in model.state_dict().items()} == {
+        k: v.shape for k, v in expected.state_dict().items()
+    }
+    sample = prepare(condition_model(), [raw_sample(text_len=9)])[0]
+    out = model(**sample)
+    assert all(value.dtype == torch.float32 for value in out.predictions)
+    sum(out.loss.values()).backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_h3_adaln_activates_before_casting_fp32_time_embedding():
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3AdalnProj
+
+    torch.manual_seed(39)
+    module = MiniMaxH3AdalnProj(8, 8, 48, expand_ratio=6, modality_num=1).bfloat16()
+    time = torch.randn(5, 8, dtype=torch.float32, requires_grad=True)
+    actual = torch.cat(module(time), dim=-1)
+    expected = module.linear(F.silu(time).bfloat16())
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual.float().sum().backward()
+    assert time.grad.dtype == torch.float32 and torch.isfinite(time.grad).all()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_h3_rejects_rounded_inputs_and_fp32_island_lora():
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+
+    model = tiny_model()
+    sample = prepare(condition_model(), [raw_sample()])[0]
+    for key in ("unique_timesteps", "img_position_ids"):
+        for dtype in (torch.bfloat16, torch.float16):
+            rounded = dict(sample, **{key: sample[key].to(dtype)})
+            with pytest.raises(ValueError, match="cast_forward_inputs"):
+                model(**rounded)
+    float64_timesteps = dict(sample, unique_timesteps=sample["unique_timesteps"].double())
+    for actual, expected in zip(model(**float64_timesteps).predictions, model(**sample).predictions):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    lora = VeOmniLoraModel(tiny_model(), VeOmniLoraConfig(r=4, lora_alpha=8, target_modules=["video_patch_proj"]))
+    with pytest.raises(NotImplementedError, match="FP32 projections"):
+        lora.get_base_model().get_ignore_modules_in_mixed_precision()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("key", ["unique_timesteps", "img_position_ids"])
+def test_h3_packing_accepts_fp64_metadata(key):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.batch_packing import pack_samples
+
+    model = tiny_model().eval()
+    samples = prepare(condition_model(), [raw_sample(text_len=3), raw_sample(text_len=7)])
+    samples[1][key] = samples[1][key].double()
+    packed_inputs, _ = pack_samples(samples)
+    assert packed_inputs[key].dtype == torch.float64
+    expected = [model(**sample).predictions for sample in samples]
+    actual = model(**batch(samples)).predictions
+    for index, predictions in enumerate(expected):
+        for modality in range(2):
+            torch.testing.assert_close(actual[modality][index], predictions[modality], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("key", ["unique_timesteps", "img_position_ids"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_h3_packing_rejects_rounded_sample_before_dtype_promotion(key, dtype):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.batch_packing import pack_samples
+
+    samples = prepare(condition_model(), [raw_sample(), raw_sample()])
+    samples[1][key] = samples[1][key].to(dtype)
+    with pytest.raises(ValueError, match="cast_forward_inputs"):
+        pack_samples(samples)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_h3_async_offload_auto_discovers_blocks_only():
+    from veomni.distributed.async_offload import apply_async_activation_offload
+
+    model = tiny_model()
+    apply_async_activation_offload(model, [])
+
+    assert set(model._no_split_modules) == {"MiniMaxH3DiTBlock", "MiniMaxH3DiT"}
+    assert not hasattr(model.dit, "_veomni_offload_manager")
+    assert [block._veomni_offload_layer_idx for block in model.dit.blocks] == list(range(len(model.dit.blocks)))
+
+
+def _run_h3_precision_fsdp(checkpointing, lora, weights_path, offload=False, basic_modules=None):
+    import os
+
+    import torch.distributed as dist
+    from safetensors.torch import save_file
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.arguments import AcceleratorConfig, MixedPrecisionConfig
+    from veomni.distributed.async_offload import apply_async_activation_offload
+    from veomni.distributed.parallel_state import (
+        clear_parallel_state,
+        init_parallel_state_from_config,
+        use_parallel_state,
+    )
+    from veomni.distributed.torch_parallelize import build_parallelize_model
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.models.auto import build_foundation_model
+    from veomni.utils.device import get_device_type
+
+    os.environ["LOCAL_RANK"] = str(dist.get_rank())
+    os.environ["WORLD_SIZE"] = str(dist.get_world_size())
+    device = torch.device(get_device_type(), dist.get_rank())
+    init_parallel_state_from_config(AcceleratorConfig(), name="h3_precision")
+    try:
+        with use_parallel_state("h3_precision"):
+            config = tiny_model().config
+            model = build_foundation_model(
+                config,
+                init_device="meta",
+                torch_dtype="float32",
+                ops_implementation=make_eager_ops_config(),
+            )
+            reference = build_foundation_model(
+                copy.deepcopy(config),
+                init_device="cpu",
+                torch_dtype="bfloat16",
+                ops_implementation=make_eager_ops_config(),
+            )
+            torch.manual_seed(87)
+            for parameter in reference.parameters():
+                torch.nn.init.normal_(parameter, std=0.1)
+            if dist.get_rank() == 0:
+                save_file(reference.dit.state_dict(), os.path.join(weights_path, "model.safetensors"))
+            dist.barrier()
+            if lora:
+                lora_config = VeOmniLoraConfig(
+                    r=4,
+                    lora_alpha=8,
+                    target_modules=["qkv_proj", "out_proj", "fc1", "fc2"],
+                )
+                model = VeOmniLoraModel(model, lora_config)
+                reference = VeOmniLoraModel(reference, copy.deepcopy(lora_config))
+                for name, parameter in reference.named_parameters():
+                    if "lora_" in name:
+                        torch.nn.init.normal_(parameter, std=0.05)
+            if offload:
+                apply_async_activation_offload(model, [])
+            weights = {name: value.detach().clone().to(device) for name, value in reference.state_dict().items()}
+            model = build_parallelize_model(
+                model,
+                weights_path=weights_path,
+                init_device="meta",
+                basic_modules=basic_modules,
+                mixed_precision=MixedPrecisionConfig(enable=True, cast_forward_inputs=False),
+                is_peft_model=lora,
+                enable_gradient_checkpointing=checkpointing,
+            )
+            from torch.distributed.fsdp import FSDPModule
+
+            dit = (model.get_base_model() if lora else model).dit
+            islands = (
+                dit.video_patch_proj,
+                dit.audio_patch_proj,
+                dit.time_embedder.proj_in,
+                dit.time_embedder.proj_out,
+                dit.final_layer.video_out,
+                dit.final_layer.audio_out,
+            )
+            assert all(isinstance(module, FSDPModule) for module in (dit, *dit.blocks, *islands))
+            assert not isinstance(dit.condition_proj, FSDPModule)
+            if basic_modules:
+                assert isinstance(dit.final_layer, FSDPModule)
+            for name, parameter in model.named_parameters():
+                if "lora_" not in name:
+                    actual_weight = parameter.full_tensor()
+                    torch.testing.assert_close(actual_weight, weights[name].to(actual_weight.dtype), rtol=0, atol=0)
+            if lora:
+                set_model_state_dict(
+                    model,
+                    {name: value for name, value in weights.items() if "lora_" in name},
+                    options=StateDictOptions(full_state_dict=True, strict=False),
+                )
+            reference = reference.to(device)
+            torch.manual_seed(94)
+            samples = prepare(condition_model(), [raw_sample(17, task="ref2va"), raw_sample(9, latent_t=3)])
+            for i, sample in enumerate(samples):
+                sample["img_position_ids"] += 1025.333333333
+                sample["unique_timesteps"] = torch.full_like(sample["unique_timesteps"], 0.094339624 + i * 0.1)
+                sample["use_gradient_checkpointing"] = checkpointing
+
+            def to_device(value):
+                if torch.is_tensor(value):
+                    return value.to(device)
+                if isinstance(value, dict):
+                    return {key: to_device(item) for key, item in value.items()}
+                return value
+
+            samples = [to_device(sample) for sample in samples]
+            inputs = batch(samples)
+            seen, projection_dtypes, time_dtypes = [], [], []
+            from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3FP32Linear
+
+            for module in model.modules():
+                if isinstance(module, MiniMaxH3FP32Linear):
+                    module.register_forward_pre_hook(
+                        lambda module, args: projection_dtypes.append(module.weight.dtype)
+                    )
+            inner = model.get_base_model() if lora else model
+            inner.dit.blocks[0].register_forward_pre_hook(
+                lambda module, args, kwargs: time_dtypes.append(kwargs["t_emb"].dtype), with_kwargs=True
+            )
+            hook = model.register_forward_pre_hook(
+                lambda module, args, kwargs: seen.append((kwargs["img_position_ids"], kwargs["unique_timesteps"])),
+                with_kwargs=True,
+            )
+            single = model(**samples[0])
+            single_reference = reference(**samples[0])
+            with torch.no_grad():
+                one_element = model(**batch([samples[0]]))
+            for output in (single, one_element):
+                for prediction, baseline in zip(output.predictions, single_reference.predictions):
+                    torch.testing.assert_close(prediction, baseline, rtol=0.02, atol=0.002)
+            forward_calls = len(time_dtypes)
+            sum(single.loss.values()).backward()
+            if checkpointing:
+                assert len(time_dtypes) > forward_calls, "checkpointed blocks must recompute during backward"
+            sum(single_reference.loss.values()).backward()
+            grads, ref_grads = [], []
+            ref_params = dict(reference.named_parameters())
+            for name, parameter in model.named_parameters():
+                if parameter.requires_grad:
+                    grads.append(parameter.grad.full_tensor().float().flatten())
+                    ref_grads.append(ref_params[name].grad.float().flatten())
+            grads, ref_grads = torch.cat(grads), torch.cat(ref_grads)
+            assert (grads - ref_grads).norm() / ref_grads.norm() < 0.05
+            model.zero_grad(set_to_none=True)
+            reference.zero_grad(set_to_none=True)
+            actual = model(**inputs)
+            hook.remove()
+            expected = serial(reference, samples)
+            for actual_positions, positions in zip(seen[-1][0], inputs["img_position_ids"]):
+                torch.testing.assert_close(actual_positions, positions, rtol=0, atol=0)
+            for actual_timesteps, timesteps in zip(seen[-1][1], inputs["unique_timesteps"]):
+                torch.testing.assert_close(actual_timesteps, timesteps, rtol=0, atol=0)
+            assert projection_dtypes and set(projection_dtypes) == {torch.float32}
+            assert time_dtypes and set(time_dtypes) == {torch.float32}
+            for i, output in enumerate(expected):
+                for modality, baseline in enumerate(output.predictions):
+                    prediction = actual.predictions[modality][i]
+                    assert prediction.dtype == torch.float32
+                    torch.testing.assert_close(prediction, baseline, rtol=0.02, atol=0.002)
+            sum(actual.loss.values()).backward()
+            torch.stack([sum(output.loss.values()) for output in expected]).mean().backward()
+            actual_grads, expected_grads = [], []
+            reference_params = dict(reference.named_parameters())
+            for name, parameter in model.named_parameters():
+                if not parameter.requires_grad:
+                    continue
+                gradient = parameter.grad.full_tensor().float()
+                assert torch.isfinite(gradient).all()
+                actual_grads.append(gradient.flatten())
+                expected_grads.append(reference_params[name].grad.float().flatten())
+            actual_grads, expected_grads = torch.cat(actual_grads), torch.cat(expected_grads)
+            relative = (actual_grads - expected_grads).norm() / expected_grads.norm()
+            assert relative < 0.05, relative
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+            before = {
+                name: parameter.full_tensor().clone()
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+            }
+            optimizer.step()
+            changed = [
+                not torch.equal(parameter.full_tensor(), before[name])
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+            ]
+            assert any(changed)
+            if not lora and not checkpointing:
+                rounded = build_parallelize_model(
+                    build_foundation_model(
+                        copy.deepcopy(config),
+                        init_device="meta",
+                        torch_dtype="float32",
+                        ops_implementation=make_eager_ops_config(),
+                    ),
+                    weights_path=weights_path,
+                    init_device="meta",
+                    mixed_precision=MixedPrecisionConfig(enable=True, cast_forward_inputs=True),
+                    enable_gradient_checkpointing=False,
+                )
+                with pytest.raises(ValueError, match="cast_forward_inputs"):
+                    rounded(**samples[0])
+            dist.barrier()
+    finally:
+        clear_parallel_state()
+
+
+def _h3_precision_launch(context):
+    """Reserve two CPU ranks locally or two accelerator cards in CI."""
+    device = "cpu" if context.capabilities.backend == "cpu" else "accelerator"
+    return LaunchSpec(nproc=2, device=device)
+
+
+@pytest.mark.launch_plan(provider=_h3_precision_launch)
+@pytest.mark.parametrize(
+    ("checkpointing", "lora", "offload", "basic_modules"),
+    [
+        (False, False, False, None),
+        (True, False, False, None),
+        (False, True, False, None),
+        (True, True, False, None),
+        (True, False, True, None),
+        pytest.param(False, False, False, ["MiniMaxH3FinalLayer"], id="nested-final-layer"),
+    ],
+)
+def test_h3_precision_through_production_fsdp(tmp_path, checkpointing, lora, offload, basic_modules):
+    from tests.tools.launch_utils import torchrun
+
+    torchrun(
+        _run_h3_precision_fsdp,
+        world_size=2,
+        checkpointing=checkpointing,
+        lora=lora,
+        weights_path=str(tmp_path),
+        offload=offload,
+        basic_modules=basic_modules,
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
+def test_h3_fp32_heads_support_multistep_bf16_anchors(task):
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models.auto import build_foundation_model
+    from veomni.models.diffusers.minimax_h3.inference import model_fn_minimax_h3
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.flow_match_scheduler import FlowMatchScheduler
+
+    model = build_foundation_model(
+        tiny_model().config, init_device="cpu", torch_dtype="bfloat16", ops_implementation=make_eager_ops_config()
+    )
+    row = raw_sample(9, task=task)
+    row = {key: value.bfloat16() if torch.is_tensor(value) else value for key, value in row.items()}
+    anchor = row["keyframe_cond_anchor" if task == "fl2va" else "ref_visual_anchor"]
+    video, audio = row["input_latents"], row["audio_input_latents"]
+    scheduler = FlowMatchScheduler()
+    scheduler.set_timesteps(3)
+    for step, timestep in enumerate(scheduler.timesteps[:2]):
+        t = float(1.0 - scheduler.sigmas[step])
+        with torch.no_grad():
+            video_pred, audio_pred = model_fn_minimax_h3(
+                model,
+                video,
+                audio,
+                row["packed"],
+                row["prompt_embeds"],
+                t_video=t,
+                t_audio=t,
+                **{"keyframe_cond_anchor" if task == "fl2va" else "ref_visual_anchor": anchor},
+            )
+        assert video_pred.dtype == audio_pred.dtype == torch.float32
+        video = scheduler.step(video_pred, timestep, video)
+        audio = scheduler.step(audio_pred, timestep, audio)
+        assert torch.isfinite(video).all() and torch.isfinite(audio).all()
+    assert anchor.dtype == torch.bfloat16

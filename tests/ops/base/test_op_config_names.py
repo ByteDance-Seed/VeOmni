@@ -1,0 +1,104 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Check that in-tree YAML op names resolve to registered implementations."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import yaml
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.ops import OP_REGISTRY
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+REPO_ROOT = Path(__file__).parents[3]
+
+_FIELD_TO_OP = {
+    "attn_implementation": "attention",
+    "causal_conv1d_implementation": "causal_conv1d",
+    "chunk_gated_delta_rule_implementation": "chunk_gated_delta_rule",
+    "chunk_kda_implementation": "chunk_kda",
+    "cross_entropy_loss_implementation": "cross_entropy_loss",
+    "dsa_attention_implementation": "dsa_attention",
+    "dsa_indexer_implementation": "dsa_indexer",
+    "load_balancing_loss_implementation": "load_balancing_loss",
+    "linear_implementation": "linear",
+    "kv_round_implementation": "kv_round",
+    "mhc_implementation": "mhc",
+    "moe_implementation": "moe_experts",
+    "qsa_attention_implementation": "qsa_attention",
+    "rms_norm_gated_implementation": "rms_norm_gated",
+    "rms_norm_implementation": "rms_norm",
+    "rotary_pos_emb_implementation": "rope",
+    "rotary_pos_emb_vision_implementation": "rope",
+    "situ_and_mul_implementation": "situ_and_mul",
+    "gated_mlp_implementation": "gated_mlp",
+}
+
+
+def _registered_implementations(op: str) -> set[str]:
+    """Return implementation names registered across every op variant and device."""
+    return {key[2] for key in OP_REGISTRY._entries if key[0] == op}
+
+
+def _selected_names(implementation):
+    """Every row name a YAML selection can produce.
+
+    A bare string is one row for every site. A mapping carries a reference ``name``
+    and one per override, so all of them have to be registered -- a typo in a rule
+    that never runs on this host is still a typo.
+    """
+    if isinstance(implementation, str):
+        return [implementation]
+    if isinstance(implementation, dict):
+        names = [implementation.get("name")]
+        names.extend(rule.get("name") for rule in implementation.get("overrides") or () if isinstance(rule, dict))
+        return [name for name in names if isinstance(name, str)]
+    return []
+
+
+def test_yaml_op_implementation_names_are_registered():
+    """Reject in-tree op selections that do not name a registered implementation."""
+    invalid: list[str] = []
+    for root in (REPO_ROOT / "configs", REPO_ROOT / "tests"):
+        for path in sorted(root.rglob("*.yaml")):
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if not isinstance(document, dict):
+                continue
+            model = document.get("model")
+            if not isinstance(model, dict):
+                continue
+            implementations = model.get("ops_implementation")
+            if not isinstance(implementations, dict):
+                continue
+
+            for field, implementation in implementations.items():
+                # Every op-selection field names a registered family, so an
+                # unmapped key is a stale config rather than a field to skip.
+                op = _FIELD_TO_OP.get(field)
+                if op is None:
+                    invalid.append(f"{path.relative_to(REPO_ROOT)}: unmapped implementation field {field!r}")
+                    continue
+                for name in _selected_names(implementation):
+                    if name in _registered_implementations(op):
+                        continue
+                    invalid.append(f"{path.relative_to(REPO_ROOT)}: {field}={name!r} ({op})")
+
+    assert not invalid, "YAML op implementation names are not registered:\n" + "\n".join(invalid)

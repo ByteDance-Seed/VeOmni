@@ -75,7 +75,7 @@ class GlobalStateCallback(Callback):
         args: "VeOmniArguments" = self.trainer.args
         # The same cadences ``CheckpointCallback`` runs on, read from the same
         # config. An HF export writes the step's DCP whether or not the DCP
-        # cadence reaches that step (``ModelCheckpointManager._prepare_export``),
+        # cadence reaches that step (``ModelCheckpointManager.prepare_export``),
         # so the cursor has to follow both: model state at a step with no cursor
         # beside it is a step nothing can resume from.
         ckpt = args.train.checkpoint
@@ -131,14 +131,17 @@ class GlobalStateCallback(Callback):
 
         channel_loss_callback = getattr(self.trainer, "channel_loss_callback", None)
         channel_loss_state = channel_loss_callback.state_dict() if channel_loss_callback is not None else {}
-        # Optional: ``OmniTrainer`` runs without a meter.
-        environ_meter = getattr(self.trainer, "environ_meter", None)
+
+        # Flushes before it reports, so the rows this cursor covers are on disk.
+        offline_cache_writer = getattr(self.trainer, "offline_cache_writer", None)
+        offline_cache_writer_state = offline_cache_writer.state_dict() if offline_cache_writer is not None else None
 
         return {
             "global_step": state.global_step,
             "train_dataloader": train_dataloader_state,
-            "environ_meter": environ_meter.state_dict() if environ_meter is not None else None,
+            "environ_meter": self.trainer.environ_meter.state_dict(),
             "channel_loss_callback": channel_loss_state,
+            "offline_cache_writer": offline_cache_writer_state,
             "torch_rng_state": torch.get_rng_state(),
             "device_rng_state": get_device_rng_state(),
         }
@@ -199,7 +202,8 @@ class GlobalStateCallback(Callback):
         # Every rank's cursor is down by now, so the trainer-level half of the
         # step can be recorded. Model completeness is DCP's ``.metadata`` under
         # ``model/``, discovered from the filesystem — this file does not list
-        # modules.
+        # modules. A trainer whose ``saves_model_state`` is False writes no
+        # ``model/``, so the manifest says the cursor is the whole step.
         manifest_error: Optional[Exception] = None
         if self.rank == 0:
             try:
@@ -207,6 +211,7 @@ class GlobalStateCallback(Callback):
                     step_root,
                     global_step=state.global_step,
                     world_size=args.train.world_size,
+                    model_state=bool(getattr(self.trainer, "saves_model_state", True)),
                 )
             except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
                 logger.error(f"[RANK {self.rank}] failed to write the manifest under {step_root}", exc_info=True)
@@ -248,21 +253,15 @@ class GlobalStateCallback(Callback):
         # silently drop a corrupt cursor. Reduce the read failure separately, and
         # before that reduction, so a rank that raised cannot strand its peers.
         read_error: Optional[Exception] = None
-        current_state = legacy_state = None
+        current_state = None
         try:
             current_state = self._read_current(load_path)
-            if current_state is None:
-                # Delete this import (and veomni/checkpoint/legacy_v0_1_12.py) to drop
-                # resume from the pre-split layouts.
-                from ...checkpoint.legacy_v0_1_12 import apply_legacy_global_state
-
-                legacy_state = apply_legacy_global_state(load_path, self.rank)
         except Exception as e:  # noqa: BLE001 - re-raised once every rank has agreed
             logger.error(f"[RANK {self.rank}] failed to read trainer state under {load_path}", exc_info=True)
             read_error = e
         raise_if_any_rank_failed(read_error, "reading the trainer state")
 
-        found = current_state is not None or legacy_state is not None
+        found = current_state is not None
         if dist.is_initialized():
             flag = torch.tensor([int(found)], dtype=torch.int32, device=get_device_type())
             dist.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
@@ -274,7 +273,7 @@ class GlobalStateCallback(Callback):
             logger.warning(f"No trainer state at {state_path}; resuming weights only.")
             return None
 
-        global_state = current_state if current_state is not None else legacy_state
+        global_state = current_state
         self.trainer.state.global_step = global_state["global_step"]
         self._restore_position(global_state)
 
@@ -283,12 +282,17 @@ class GlobalStateCallback(Callback):
         if channel_loss_state is not None and channel_loss_callback is not None:
             channel_loss_callback.load_state_dict(channel_loss_state)
 
+        offline_cache_writer_state = global_state.get("offline_cache_writer")
+        offline_cache_writer = getattr(self.trainer, "offline_cache_writer", None)
+        if offline_cache_writer_state is not None and offline_cache_writer is not None:
+            offline_cache_writer.load_state_dict(offline_cache_writer_state)
+
         if self.trainer.train_dataloader is not None and global_state.get("train_dataloader") is not None:
             self.trainer.train_dataloader.load_state_dict(global_state["train_dataloader"])
 
-        environ_meter = getattr(self.trainer, "environ_meter", None)
-        if environ_meter is not None and global_state.get("environ_meter") is not None:
-            environ_meter.load_state_dict(global_state["environ_meter"])
+        # OmniTrainer checkpoints written before it had a meter store None here.
+        if global_state.get("environ_meter") is not None:
+            self.trainer.environ_meter.load_state_dict(global_state["environ_meter"])
         rng_state = global_state.get("torch_rng_state")
         if rng_state is not None:
             torch.set_rng_state(rng_state)

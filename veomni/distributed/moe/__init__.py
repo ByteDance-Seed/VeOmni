@@ -13,10 +13,12 @@
 # limitations under the License.
 
 
+# Temporary: ops and older tests still import these from distributed.moe.
+from ...ops.kernels.moe_experts.shared.ep import EPGroupGemm, EPMergedFc1GroupGemm
 from .moe_layer import (
-    EPGroupGemm,
-    EPMergedFc1GroupGemm,
+    cumsum_to_counts,
     dispatch_to_ep_class,
+    expert_parallel_size,
     preprocess,
     token_pre_all2all,
     tokens_post_all2all,
@@ -28,6 +30,8 @@ __all__ = [
     "token_pre_all2all",
     "tokens_post_all2all",
     "dispatch_to_ep_class",
+    "cumsum_to_counts",
+    "expert_parallel_size",
     "EPGroupGemm",
     "EPMergedFc1GroupGemm",
 ]

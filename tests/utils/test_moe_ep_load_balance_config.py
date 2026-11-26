@@ -19,6 +19,11 @@ from veomni.arguments import (
     parse_args,
 )
 from veomni.arguments.arguments_types import MoEEPBalanceConfig
+from veomni.utils import device
+
+
+def _supported_moe_implementation():
+    return "fused_npu" if device.IS_NPU_AVAILABLE else "fused_triton"
 
 
 def _arguments(
@@ -38,7 +43,7 @@ def _arguments(
     save_steps=0,
     save_hf_weights=True,
     gradient_checkpointing_enable=False,
-    moe_implementation="fused_triton",
+    moe_implementation=None,
     lora_config=None,
 ):
     return VeOmniArguments(
@@ -46,7 +51,9 @@ def _arguments(
             config_path="test-config",
             lora_config={} if lora_config is None else lora_config,
             ops_implementation=OpsImplementationConfig(
-                moe_implementation=moe_implementation,
+                moe_implementation=_supported_moe_implementation()
+                if moe_implementation is None
+                else moe_implementation,
                 load_balancing_loss_implementation="eager",
             ),
             accelerator=AcceleratorConfig(
@@ -99,7 +106,7 @@ def test_moe_ep_load_balance_parses_nested_yaml_and_cli_override(tmp_path, monke
                     "config_path": "test-config",
                     "accelerator": {"ep_size": 2},
                     "ops_implementation": {
-                        "moe_implementation": "fused_triton",
+                        "moe_implementation": _supported_moe_implementation(),
                         "load_balancing_loss_implementation": "eager",
                     },
                 },
@@ -128,6 +135,45 @@ def test_moe_ep_load_balance_parses_nested_yaml_and_cli_override(tmp_path, monke
     )
 
 
+@pytest.mark.parametrize("flag", ["enabled", "optimize_memory"])
+def test_quoted_yaml_booleans_do_not_enable_balancing(tmp_path, monkeypatch, flag):
+    config_path = tmp_path / "config.yaml"
+    balance = {"enabled": True, flag: "false"}
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "config_path": "test-config",
+                    "accelerator": {"ep_size": 2},
+                    "ops_implementation": {
+                        "moe_implementation": _supported_moe_implementation(),
+                        "load_balancing_loss_implementation": "eager",
+                    },
+                },
+                "data": {"train_path": "test-data"},
+                "train": {"moe_ep_load_balance": balance},
+            }
+        )
+    )
+    monkeypatch.setattr(sys, "argv", ["veomni", str(config_path)])
+    with pytest.raises(ValueError, match=rf"{flag} must be a boolean"):
+        parse_args(VeOmniArguments)
+
+
+def test_standalone_runtime_rejects_ep_resume_before_setup(monkeypatch):
+    from veomni.models.model_runtime import VeOmniModelRuntime
+
+    def unexpected_setup(self):
+        pytest.fail("Runtime setup should not start for unsupported EP configuration.")
+
+    monkeypatch.setattr(VeOmniModelRuntime, "setup", unexpected_setup)
+    args = _arguments()
+    args.train.checkpoint.load_path = "resume/global_step_10"
+    args.train.moe_ep_load_balance.enabled = True
+    with pytest.raises(ValueError, match=r"checkpoint\.load_path=None"):
+        VeOmniModelRuntime(args.model, train=args.train)
+
+
 @pytest.mark.parametrize("max_replicas_per_rank", [0, -1, True, False, 1.5, "2"])
 def test_moe_ep_load_balance_requires_positive_integer_replica_count(max_replicas_per_rank):
     with pytest.raises(ValueError, match="max_replicas_per_rank must be a positive integer"):
@@ -149,11 +195,18 @@ def test_moe_ep_load_balance_requires_expert_parallelism():
         _arguments(enabled=True, ep_size=1)
 
 
-@pytest.mark.parametrize("moe_implementation", ["eager", "fused_quack"])
-def test_moe_ep_load_balance_requires_supported_backend(monkeypatch, moe_implementation):
-    # Exercise the EP-specific guard after the generic backend validation.
-    monkeypatch.setattr("veomni.utils.import_utils.is_torch_npu_available", lambda: False)
-    with pytest.raises(ValueError, match="fused_npu.*fused_triton"):
+@pytest.mark.parametrize(
+    ("on_npu", "moe_implementation", "message"),
+    [
+        (False, "eager", "fused_npu.*fused_triton"),
+        (False, "fused_quack", "fused_npu.*fused_triton"),
+        (True, "eager", "fused_npu.*fused_triton"),
+        (True, "fused_quack", "not supported on Ascend NPU"),
+    ],
+)
+def test_moe_ep_load_balance_requires_supported_backend(monkeypatch, on_npu, moe_implementation, message):
+    monkeypatch.setattr(device, "IS_NPU_AVAILABLE", on_npu)
+    with pytest.raises(ValueError, match=message):
         _arguments(enabled=True, moe_implementation=moe_implementation)
 
 

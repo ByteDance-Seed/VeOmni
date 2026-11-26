@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .ops import apply_ops_config, apply_ops_patch, format_kernel_functions
+from .ops import apply_ops_patch
 from .utils.env import format_envs
 from .utils.logging import get_logger
 
@@ -20,11 +20,10 @@ from .utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-def _apply_patches():
-    apply_ops_patch()
+def _log_environment():
     logger.info_rank0(format_envs())
 
 
-_apply_patches()
+_log_environment()
 
 from ._version import __version__

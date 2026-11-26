@@ -1,643 +1,94 @@
-import importlib
-import sys
-import types
-from pathlib import Path
-from types import SimpleNamespace
+"""Real Gloo dispatch, replica exchange and validation behind both fused rows."""
+
+from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import torch.nn as nn
+from torch.nn import functional as F
 
-from veomni.models import model_runtime
-from veomni.ops.kernels import moe as moe_kernels
-from veomni.ops.kernels.moe._scatter import compute_expert_scatter_index, compute_max_expert_tokens
-
-
-def _unexpected_triton_kernel(*args, **kwargs):
-    raise AssertionError("The CPU dispatch tests must not execute a Triton kernel.")
+from veomni.distributed.moe.ep_buffer import ReplicaBufferPool
+from veomni.distributed.moe.ep_load_balance import _Qwen3_5MoEEPLoadBalancer, cat_local_and_replica_weights
+from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
+from veomni.ops.kernels.moe_experts.standard import npu, triton
 
 
-# Load the common dispatch and public Triton boundary with narrow CPU substitutes
-# for unavailable Triton kernel modules. The production dispatch, planner,
-# executor, token permutation, and collectives remain unchanged.
-_MOE_PACKAGE_NAME = "veomni.distributed.moe"
-_MOE_LAYER_NAME = f"{_MOE_PACKAGE_NAME}.moe_layer"
-_EP_DISPATCH_NAME = f"{_MOE_PACKAGE_NAME}.ep_dispatch"
-_EP_LOAD_BALANCE_NAME = f"{_MOE_PACKAGE_NAME}.ep_load_balance"
-_GROUP_GEMM_KERNEL_NAME = "veomni.ops.kernels.moe._kernels.kernel.group_gemm"
-_MOE_KERNEL_NAME = "veomni.ops.kernels.moe._kernels.kernel.moe"
-_SCATTER_NAME = "veomni.ops.kernels.moe._scatter"
-_GROUP_GEMM_NAME = "veomni.ops.kernels.moe.group_gemm"
-_MISSING_PARENT_ATTRIBUTE = object()
-_saved_group_gemm_parent_attribute = getattr(moe_kernels, "group_gemm", _MISSING_PARENT_ATTRIBUTE)
-_saved_modules = {
-    name: sys.modules.get(name)
-    for name in (
-        _MOE_PACKAGE_NAME,
-        _MOE_LAYER_NAME,
-        _EP_DISPATCH_NAME,
-        _EP_LOAD_BALANCE_NAME,
-        _GROUP_GEMM_KERNEL_NAME,
-        _MOE_KERNEL_NAME,
-        _SCATTER_NAME,
-        _GROUP_GEMM_NAME,
-    )
-}
-_moe_package = types.ModuleType(_MOE_PACKAGE_NAME)
-_moe_package.__path__ = [str(Path(__file__).parents[2] / "veomni" / "distributed" / "moe")]
-sys.modules[_MOE_PACKAGE_NAME] = _moe_package
-
-_group_gemm_kernel = types.ModuleType(_GROUP_GEMM_KERNEL_NAME)
-_group_gemm_kernel.group_gemm_same_mn = _unexpected_triton_kernel
-_group_gemm_kernel.group_gemm_same_nk = _unexpected_triton_kernel
-sys.modules[_GROUP_GEMM_KERNEL_NAME] = _group_gemm_kernel
-_moe_kernel = types.ModuleType(_MOE_KERNEL_NAME)
-_moe_kernel.expert_histogram = _unexpected_triton_kernel
-_moe_kernel.moe_gather = _unexpected_triton_kernel
-_moe_kernel.moe_scatter = _unexpected_triton_kernel
-sys.modules[_MOE_KERNEL_NAME] = _moe_kernel
-_scatter = types.ModuleType(_SCATTER_NAME)
-_scatter.compute_expert_scatter_index = compute_expert_scatter_index
-_scatter.compute_max_expert_tokens = compute_max_expert_tokens
-sys.modules[_SCATTER_NAME] = _scatter
-
-moe_layer = importlib.import_module(_MOE_LAYER_NAME)
-ep_dispatch = importlib.import_module(_EP_DISPATCH_NAME)
-ep_load_balance = importlib.import_module(f"{_MOE_PACKAGE_NAME}.ep_load_balance")
-for _name in (
-    "EPGroupGemm",
-    "EPMergedFc1GroupGemm",
-    "dispatch_to_ep_class",
-):
-    setattr(_moe_package, _name, getattr(moe_layer, _name))
-group_gemm = importlib.import_module(_GROUP_GEMM_NAME)
-
-for _name, _saved in _saved_modules.items():
-    if _saved is None:
-        sys.modules.pop(_name, None)
-    else:
-        sys.modules[_name] = _saved
-if _saved_group_gemm_parent_attribute is _MISSING_PARENT_ATTRIBUTE:
-    delattr(moe_kernels, "group_gemm")
-else:
-    moe_kernels.group_gemm = _saved_group_gemm_parent_attribute
-
-_import_seam_restored_without_stub_leaks = all(
-    (name not in sys.modules if saved is None else sys.modules.get(name) is saved)
-    for name, saved in _saved_modules.items()
-)
-_import_seam_parent_attribute_restored = (
-    not hasattr(moe_kernels, "group_gemm")
-    if _saved_group_gemm_parent_attribute is _MISSING_PARENT_ATTRIBUTE
-    else getattr(moe_kernels, "group_gemm", _MISSING_PARENT_ATTRIBUTE) is _saved_group_gemm_parent_attribute
-)
+def _reference_mlp(tokens, gates, downs):
+    projected = torch.bmm(gates, tokens.unsqueeze(-1)).squeeze(-1)
+    gate, up = projected.chunk(2, dim=-1)
+    return torch.bmm(downs, (F.silu(gate) * up).unsqueeze(-1)).squeeze(-1)
 
 
-def test_cpu_import_seam_restores_loaded_moe_submodules():
-    assert _import_seam_restored_without_stub_leaks
-    assert _import_seam_parent_attribute_restored
-    assert getattr(moe_kernels, "group_gemm", None) is not group_gemm
+def _cpu_experts(tokens, gate, down, plan, group, gate_transfer, down_transfer, memory, limit, activation):
+    # Keep Gloo exchange and the actual replica ownership path. Only substitute
+    # the accelerator-specific GEMM for a reference tensor implementation.
+    assert plan.rank_loads_before == (16, 0) and plan.rank_loads_after == (8, 8)
+    assert limit is None and activation == "silu"
+    assert gate_transfer is not None and down_transfer is not None
+    gates = cat_local_and_replica_weights(gate, gate_transfer.wait(), plan, group)
+    downs = cat_local_and_replica_weights(down, down_transfer.wait(), plan, group)
+    counts = plan.tokens_per_local_physical_expert.sum(dim=0)
+    result = _reference_mlp(tokens, gates.repeat_interleave(counts, dim=0), downs.repeat_interleave(counts, dim=0))
+    if memory:
+        gate_transfer.record_stream_use()
+        down_transfer.record_stream_use()
+    return result
 
 
-def test_disabled_dispatch_preserves_the_existing_preprocess_path(monkeypatch):
-    ep_group = object()
-    selected_experts = torch.tensor([[0], [1]])
-    routing_weights = torch.tensor([[0.25], [0.75]])
-    hidden_states = torch.tensor([[2.0], [3.0]])
-    calls = []
-
-    monkeypatch.setattr(moe_layer, "get_parallel_state", lambda: SimpleNamespace(ep_group=ep_group))
-
-    def fake_preprocess(*, expert_mask, num_experts, ep_group):
-        calls.append(("preprocess", expert_mask.clone(), num_experts, ep_group))
-        return (1, 1), (1, 1), torch.tensor([[1], [1]]), torch.tensor([2])
-
-    def fake_pre_all2all(**kwargs):
-        calls.append(("pre", kwargs.copy()))
-        return hidden_states.clone(), torch.ones((2, 2)), torch.tensor([0, 1]), hidden_states.shape
-
-    def fake_post_all2all(**kwargs):
-        calls.append(("post", kwargs.copy()))
-        return kwargs["expert_outputs"] + 1
-
-    class FakeEPClass:
-        @staticmethod
-        def apply(tokens, cumsum, *args):
-            calls.append(("apply", tokens.clone(), cumsum.clone(), args))
-            return tokens * 2
-
-    monkeypatch.setattr(moe_layer, "preprocess", fake_preprocess)
-    monkeypatch.setattr(moe_layer, "token_pre_all2all", fake_pre_all2all)
-    monkeypatch.setattr(moe_layer, "tokens_post_all2all", fake_post_all2all)
-
-    output = moe_layer.dispatch_to_ep_class(
-        FakeEPClass,
-        2,
-        routing_weights,
-        selected_experts,
-        hidden_states,
-        "weight",
-    )
-
-    assert torch.equal(output, hidden_states * 2 + 1)
-    assert [call[0] for call in calls] == ["preprocess", "pre", "apply", "post"]
-    expected_mask = torch.nn.functional.one_hot(selected_experts, num_classes=2).permute(2, 1, 0)
-    assert torch.equal(calls[0][1], expected_mask)
-    assert calls[0][2:] == (2, ep_group)
-    assert calls[2][3] == ("weight",)
-    assert calls[3][1]["selected_experts"] is selected_experts
-    assert calls[3][1]["routing_weights"] is routing_weights
-    assert calls[3][1]["num_experts"] == 2
-
-
-def test_opslot_adapter_adds_balancer_only_when_private_attribute_exists():
-    received = []
-
-    def raw_forward(**kwargs):
-        received.append(kwargs)
-        return kwargs
-
-    adapter = moe_kernels._make_moe_experts_adapter(raw_forward)
-    experts = SimpleNamespace(
-        num_experts=2,
-        gate_up_proj=torch.ones((1, 2, 1)),
-        down_proj=torch.ones((1, 1, 1)),
-    )
-    hidden_states = torch.ones((1, 1))
-    selected_experts = torch.zeros((1, 1), dtype=torch.long)
-    routing_weights = torch.ones((1, 1))
-
-    adapter(experts, hidden_states, selected_experts, routing_weights)
-    assert "load_balancer" not in received[-1]
-    assert set(received[-1]) == {
-        "num_experts",
-        "routing_weights",
-        "selected_experts",
-        "hidden_states",
-        "fc1_1_weight",
-        "fc1_2_weight",
-        "fc2_weight",
-        "fc1_1_2_weight",
-        "swiglu_limit",
-        "assume_distinct_experts",
-    }
-    assert received[-1]["assume_distinct_experts"] is False
-    experts.assume_distinct_experts = True
-    adapter(experts, hidden_states, selected_experts, routing_weights)
-    assert received[-1]["assume_distinct_experts"] is True
-
-    load_balancer = object()
-    experts._veomni_ep_load_balancer = load_balancer
-    adapter(experts, hidden_states, selected_experts, routing_weights)
-    assert received[-1]["load_balancer"] is load_balancer
-    assert received[-1]["assume_distinct_experts"] is True
-
-
-@pytest.mark.parametrize("ep_enabled", [False, True])
-def test_public_group_gemm_rejects_balancing_outside_merged_ep_before_collectives(monkeypatch, ep_enabled):
-    class UnexpectedBalancer:
-        def build_plan(self, selected_experts):
-            raise AssertionError("Invalid load-balancing calls must fail before planning or collectives.")
-
-    monkeypatch.setattr(group_gemm, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=ep_enabled))
-    merged_weight = None if ep_enabled else torch.ones((1, 2, 1))
-    split_weight = torch.ones((1, 1, 1)) if ep_enabled else None
-
-    with pytest.raises(ValueError, match="load balancing.*merged.*expert parallel"):
-        group_gemm.group_gemm_fused_moe_forward(
-            num_experts=2,
-            routing_weights=torch.ones((1, 1)),
-            selected_experts=torch.zeros((1, 1), dtype=torch.long),
-            hidden_states=torch.ones((1, 1)),
-            fc1_1_weight=split_weight,
-            fc1_2_weight=split_weight,
-            fc2_weight=torch.ones((1, 1, 1)),
-            fc1_1_2_weight=merged_weight,
-            load_balancer=UnexpectedBalancer(),
-        )
-
-
-def _merged_weights_case(case: str) -> tuple[torch.Tensor, torch.Tensor]:
-    gate_up_proj = torch.ones((1, 4, 3), dtype=torch.float32)
-    down_proj = torch.ones((1, 3, 2), dtype=torch.float32)
-    if case == "gate_rank":
-        gate_up_proj = torch.ones((4, 3))
-    elif case == "down_rank":
-        down_proj = torch.ones((3, 2))
-    elif case == "gate_width_odd":
-        gate_up_proj = torch.ones((1, 3, 3))
-    elif case == "intermediate_mismatch":
-        down_proj = torch.ones((1, 3, 1))
-    elif case == "hidden_mismatch":
-        down_proj = torch.ones((1, 4, 2))
-    elif case == "expert_rows_mismatch":
-        down_proj = torch.ones((2, 3, 2))
-    elif case == "dtype_mismatch":
-        down_proj = down_proj.double()
-    elif case == "device_mismatch":
-        gate_up_proj = torch.ones((1, 4, 3), device="meta")
-    elif case == "layout_mismatch":
-        gate_up_proj = torch.sparse_coo_tensor(
-            torch.tensor([[0], [0], [0]]),
-            torch.ones(1),
-            size=(1, 4, 3),
-            check_invariants=True,
-        )
-    else:
-        raise AssertionError(f"Unknown merged-weight case: {case}")
-    return gate_up_proj, down_proj
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "gate_rank",
-        "down_rank",
-        "gate_width_odd",
-        "intermediate_mismatch",
-        "hidden_mismatch",
-        "expert_rows_mismatch",
-        "dtype_mismatch",
-        "device_mismatch",
-        "layout_mismatch",
-    ],
-)
-def test_public_group_gemm_validates_merged_weight_relationships_before_planning(monkeypatch, case):
-    class UnexpectedBalancer:
-        def build_plan(self, selected_experts):
-            raise AssertionError("Invalid merged weights must fail before planner collectives.")
-
-    def unexpected_dispatch(*args, load_balancer=None, **kwargs):
-        return load_balancer.build_plan(args[3])
-
-    gate_up_proj, down_proj = _merged_weights_case(case)
-    monkeypatch.setattr(group_gemm, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=True))
-    monkeypatch.setattr(group_gemm, "dispatch_to_ep_class", unexpected_dispatch)
-
-    with pytest.raises(ValueError, match="merged expert weights"):
-        group_gemm.group_gemm_fused_moe_forward(
-            num_experts=2,
-            routing_weights=torch.ones((1, 1)),
-            selected_experts=torch.zeros((1, 1), dtype=torch.long),
-            hidden_states=torch.ones((1, 3)),
-            fc1_1_weight=None,
-            fc1_2_weight=None,
-            fc2_weight=down_proj,
-            fc1_1_2_weight=gate_up_proj,
-            load_balancer=UnexpectedBalancer(),
-        )
-
-
-def test_common_dispatch_validates_merged_weights_before_controller_plan(monkeypatch):
-    ep_group = object()
-
-    class UnexpectedBalancer:
-        def __init__(self):
-            self.ep_group = ep_group
-
-        def build_plan(self, selected_experts):
-            raise AssertionError("Invalid merged weights must fail before controller planning.")
-
-    monkeypatch.setattr(ep_dispatch, "get_parallel_state", lambda: SimpleNamespace(ep_group=ep_group))
-
-    with pytest.raises(ValueError, match="merged expert weights"):
-        moe_layer.dispatch_to_ep_class(
-            moe_layer.EPMergedFc1GroupGemm,
-            2,
-            torch.ones((1, 1)),
-            torch.zeros((1, 1), dtype=torch.long),
-            torch.ones((1, 3)),
-            torch.ones((1, 4, 3), dtype=torch.float32),
-            torch.ones((1, 3, 2), dtype=torch.float64),
-            None,
-            load_balancer=UnexpectedBalancer(),
-        )
-
-
-class _RecordingBalancer:
-    def __init__(self, ep_group):
-        self.ep_group = ep_group
-        self.layer_index = 7
-        self.plan = None
-
-    def build_plan(self, selected_experts):
-        self.plan = ep_load_balance.build_ep_balance_plan(
-            selected_experts,
-            num_experts=2,
-            ep_group=self.ep_group,
-            max_replicas_per_rank=1,
-        )
-        return self.plan
-
-
-class _BalanceMonitor:
-    def __init__(self):
-        self.records = []
-
-    def record_ep_balance(self, *record):
-        self.records.append(record)
-
-
-def _plan_telemetry_worker(rank: int, world_size: int, rendezvous: str, ep_size: int) -> None:
-    from veomni.utils import moe_monitor
-
-    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size)
+def _worker(rank, rendezvous, backend_name, memory):
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=30))
     try:
-        if ep_size == world_size:
-            ep_group = dist.group.WORLD
-        else:
-            even = dist.new_group((0, 2), backend="gloo")
-            odd = dist.new_group((1, 3), backend="gloo")
-            ep_group = even if rank % 2 == 0 else odd
-        ep_rank = dist.get_rank(ep_group)
-        selected = torch.zeros((2 + ep_rank, 1), dtype=torch.long)
-        plan = ep_load_balance.build_ep_balance_plan(selected, 4, ep_group, max_replicas_per_rank=1)
-        monitor = moe_monitor.MoERouterMonitor(num_experts=4, dp_group=dist.group.WORLD)
-        monitor.record(nn.Identity(), selected)
-        moe_monitor.set_active_monitor(monitor)
-        ep_dispatch._record_ep_balance(SimpleNamespace(ep_group=ep_group, layer_index=0), plan)
-        metrics = monitor.compute_metrics(current_step=1, format_only_on=rank == 0)
-        if rank == 0:
-            groups = world_size // ep_size
-            assert metrics["moe/ep_active_replicas/sum"] == len(plan.replicas) * groups
-            assert metrics["moe/ep_moved_tokens/sum"] == sum(r.moved_tokens for r in plan.replicas) * groups
-            assert metrics["moe/ep_total_routed_tokens/sum"] == sum(2 + r for r in range(ep_size)) * groups
-        else:
-            assert metrics == {}
-    finally:
-        moe_monitor.set_active_monitor(None)
-        dist.destroy_process_group()
+        state = _init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cpu", extra_parallel_sizes=(2,))
+        backend = {"npu": npu, "triton": triton}[backend_name]
+        with use_parallel_state(state), patch.object(backend, "_balanced_experts", _cpu_experts):
+            controller = _Qwen3_5MoEEPLoadBalancer(
+                ep_group=state.ep_group,
+                num_experts=4,
+                max_replicas_per_rank=1,
+                layer_index=0,
+                buffer_pool=ReplicaBufferPool() if memory else None,
+            )
+            all_tokens = torch.arange(32, dtype=torch.float32).reshape(16, 2).mul_(0.01).requires_grad_()
+            all_gate = torch.arange(32, dtype=torch.float32).reshape(4, 4, 2).mul_(0.01).requires_grad_()
+            all_down = torch.arange(16, dtype=torch.float32).reshape(4, 2, 2).mul_(0.01).requires_grad_()
+            all_routing = torch.full((16, 1), 0.75, requires_grad=True)
+            token_slice = slice(8 * rank, 8 * (rank + 1))
+            expert_slice = slice(2 * rank, 2 * (rank + 1))
+            tokens, routing = [t[token_slice].detach().clone().requires_grad_() for t in (all_tokens, all_routing)]
+            gate, down = [t[expert_slice].detach().clone().requires_grad_() for t in (all_gate, all_down)]
+            ids = torch.zeros((8, 1), dtype=torch.long)
+            empty = torch.empty(0)
 
+            def actual(down_weight):
+                return backend.wrapper(
+                    tokens, routing, ids, empty, empty, down_weight, gate, num_experts=4, load_balancer=controller
+                )
 
-@pytest.mark.parametrize("ep_size", [2, 4])
-def test_global_ep_plan_telemetry_is_not_counted_once_per_ep_sibling(tmp_path, ep_size):
-    rendezvous = f"file://{tmp_path / f'plan-telemetry-ep{ep_size}'}"
-    mp.spawn(_plan_telemetry_worker, args=(4, rendezvous, ep_size), nprocs=4, join=True)
+            # Invalid local weights propagate through the same histogram gather
+            # on both public rows, before either rank can start replica sends.
+            with pytest.raises(ValueError, match="same expert-row count|counts must be non-negative"):
+                actual(down[:1] if rank else down)
 
-
-def _cpu_merged_expert(tokens, cumsum, gate_up_proj, down_proj, swiglu_limit):
-    assert swiglu_limit is None
-    outputs = []
-    start = 0
-    for expert, end in enumerate(cumsum.tolist()):
-        expert_tokens = tokens[start:end]
-        outputs.append(expert_tokens * gate_up_proj[expert, 0, 0] * down_proj[expert, 0, 0])
-        start = end
-    return torch.cat(outputs, dim=0) if outputs else tokens.new_empty(tokens.shape)
-
-
-def _exercise_two_rank_dispatch(rank: int, group: dist.ProcessGroup) -> None:
-    from veomni.utils import moe_monitor
-
-    selected_experts = torch.zeros((6 if rank == 0 else 4, 1), dtype=torch.long)
-    routing_weights = torch.linspace(0.25, 1.0, selected_experts.shape[0]).reshape(-1, 1)
-    routing_weights_before = routing_weights.clone()
-    hidden_states = torch.arange(
-        1 if rank == 0 else 7,
-        7 if rank == 0 else 11,
-        dtype=torch.float32,
-    ).reshape(-1, 1)
-    gate_up_proj = nn.Parameter(torch.tensor([[[2.0], [11.0]]] if rank == 0 else [[[5.0], [13.0]]]))
-    down_proj = nn.Parameter(torch.tensor([[[3.0]]] if rank == 0 else [[[7.0]]]))
-    balancer = _RecordingBalancer(group)
-    monitor = _BalanceMonitor()
-    events = []
-    observed_cumsums = []
-
-    original_start = ep_load_balance.ExpertReplicaTransfer.start
-    original_all_to_all = moe_layer.all_to_all
-    original_apply = moe_layer.EPMergedFc1GroupGemm.apply
-    original_get_parallel_state = ep_dispatch.get_parallel_state
-    original_group_gemm_get_parallel_state = group_gemm.get_parallel_state
-    original_cat_weights = moe_layer.cat_local_and_replica_weights
-
-    class TrackingTransfer:
-        @staticmethod
-        def start(local_weight, plan, ep_group):
-            weight_name = "gate" if local_weight is gate_up_proj else "down"
-            events.append(f"start_{weight_name}")
-            transfer = original_start(local_weight, plan, ep_group)
-
-            class TrackingWait:
-                def wait(self):
-                    events.append(f"wait_{weight_name}")
-                    return transfer.wait()
-
-            return TrackingWait()
-
-    def tracking_all_to_all(*args, **kwargs):
-        events.append("all_to_all")
-        return original_all_to_all(*args, **kwargs)
-
-    def cpu_apply(tokens, cumsum, *args):
-        observed_cumsums.append(cumsum.detach().cpu().clone())
-        return _cpu_merged_expert(tokens, cumsum, *args)
-
-    def tracking_cat(local_weight, replica_weight, plan, ep_group):
-        weight_name = "gate" if local_weight is gate_up_proj else "down"
-        events.append(f"cat_{weight_name}")
-        return original_cat_weights(local_weight, replica_weight, plan, ep_group)
-
-    moe_layer.ExpertReplicaTransfer = TrackingTransfer
-    moe_layer.all_to_all = tracking_all_to_all
-    moe_layer.cat_local_and_replica_weights = tracking_cat
-    moe_layer.EPMergedFc1GroupGemm.apply = staticmethod(cpu_apply)
-    ep_dispatch.get_parallel_state = lambda: SimpleNamespace(ep_group=group)
-    group_gemm.get_parallel_state = lambda: SimpleNamespace(ep_enabled=True)
-    moe_monitor.set_active_monitor(monitor)
-    try:
-        output = group_gemm.group_gemm_fused_moe_forward(
-            num_experts=2,
-            routing_weights=routing_weights,
-            selected_experts=selected_experts,
-            hidden_states=hidden_states,
-            fc1_1_weight=None,
-            fc1_2_weight=None,
-            fc2_weight=down_proj,
-            fc1_1_2_weight=gate_up_proj,
-            load_balancer=balancer,
-        )
-        expected = hidden_states * 6.0 * routing_weights
-        assert torch.allclose(output, expected)
-        assert torch.equal(routing_weights, routing_weights_before)
-        assert balancer.plan.replicas == (
-            ep_load_balance.ExpertReplica(
-                source_expert=0,
-                source_rank=0,
-                source_local_expert=0,
-                target_rank=1,
-                target_slot=0,
-                alias_expert=3,
-                moved_tokens=5,
-            ),
-        )
-        first_token_all_to_all = events.index("all_to_all")
-        assert events[:first_token_all_to_all] == ["start_gate", "start_down"]
-        assert events[first_token_all_to_all + 1 : first_token_all_to_all + 5] == [
-            "wait_gate",
-            "wait_down",
-            "cat_gate",
-            "cat_down",
-        ]
-        assert observed_cumsums[0].tolist() == ([5, 5] if rank == 0 else [0, 5])
-        assert monitor.records == ([(7, (10, 0), (5, 5), 1, 5)] if rank == 0 else [])
-
-        output.sum().backward()
-        weighted_input_sum = hidden_states.mul(routing_weights).sum()
-        dist.all_reduce(weighted_input_sum, group=group)
-        if rank == 0:
-            assert torch.allclose(gate_up_proj.grad[0, 0, 0], weighted_input_sum * 3.0)
-            assert torch.allclose(down_proj.grad[0, 0, 0], weighted_input_sum * 2.0)
-        else:
-            assert torch.count_nonzero(gate_up_proj.grad).item() == 0
-            assert torch.count_nonzero(down_proj.grad).item() == 0
-    finally:
-        moe_monitor.set_active_monitor(None)
-        moe_layer.ExpertReplicaTransfer = ep_load_balance.ExpertReplicaTransfer
-        moe_layer.all_to_all = original_all_to_all
-        moe_layer.cat_local_and_replica_weights = original_cat_weights
-        moe_layer.EPMergedFc1GroupGemm.apply = original_apply
-        ep_dispatch.get_parallel_state = original_get_parallel_state
-        group_gemm.get_parallel_state = original_group_gemm_get_parallel_state
-
-    dist.barrier(group=group)
-    balanced_selected = torch.full((2, 1), rank, dtype=torch.long)
-    balanced_hidden = torch.tensor([[2.0], [4.0]], requires_grad=True)
-    balanced_routing = torch.tensor([[0.5], [0.75]])
-    balanced_balancer = _RecordingBalancer(group)
-    balanced_gate = nn.Parameter(torch.tensor([[[2.0], [0.0]]] if rank == 0 else [[[5.0], [0.0]]]))
-    balanced_down = nn.Parameter(torch.tensor([[[3.0]]] if rank == 0 else [[[7.0]]]))
-
-    class UnexpectedTransfer:
-        @staticmethod
-        def start(*args, **kwargs):
-            raise AssertionError("A no-replica plan must not start weight P2P.")
-
-    def unexpected_cat(*args, **kwargs):
-        raise AssertionError("A no-replica plan must not concatenate temporary weights.")
-
-    moe_layer.ExpertReplicaTransfer = UnexpectedTransfer
-    moe_layer.cat_local_and_replica_weights = unexpected_cat
-    moe_layer.EPMergedFc1GroupGemm.apply = staticmethod(_cpu_merged_expert)
-    ep_dispatch.get_parallel_state = lambda: SimpleNamespace(ep_group=group)
-    group_gemm.get_parallel_state = lambda: SimpleNamespace(ep_enabled=True)
-    try:
-        balanced_output = group_gemm.group_gemm_fused_moe_forward(
-            num_experts=2,
-            routing_weights=balanced_routing,
-            selected_experts=balanced_selected,
-            hidden_states=balanced_hidden,
-            fc1_1_weight=None,
-            fc1_2_weight=None,
-            fc2_weight=balanced_down,
-            fc1_1_2_weight=balanced_gate,
-            load_balancer=balanced_balancer,
-        )
-        expected_scale = 6.0 if rank == 0 else 35.0
-        assert torch.allclose(balanced_output, balanced_hidden * balanced_routing * expected_scale)
-        assert balanced_balancer.plan.replicas == ()
-    finally:
-        moe_layer.ExpertReplicaTransfer = ep_load_balance.ExpertReplicaTransfer
-        moe_layer.cat_local_and_replica_weights = original_cat_weights
-        moe_layer.EPMergedFc1GroupGemm.apply = original_apply
-        ep_dispatch.get_parallel_state = original_get_parallel_state
-        group_gemm.get_parallel_state = original_group_gemm_get_parallel_state
-
-
-def _two_rank_dispatch_worker(rank: int, world_size: int, rendezvous: str) -> None:
-    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world_size)
-    try:
-        _exercise_two_rank_dispatch(rank, dist.group.WORLD)
+            result = actual(down)
+            result.sum().backward()
+            expected = (
+                _reference_mlp(all_tokens, all_gate[0].expand(16, -1, -1), all_down[0].expand(16, -1, -1))
+                * all_routing
+            )
+            expected.sum().backward()
+            torch.testing.assert_close(result, expected[token_slice])
+            torch.testing.assert_close(tokens.grad, all_tokens.grad[token_slice])
+            torch.testing.assert_close(routing.grad, all_routing.grad[token_slice])
+            torch.testing.assert_close(gate.grad, all_gate.grad[expert_slice])
+            torch.testing.assert_close(down.grad, all_down.grad[expert_slice])
     finally:
         dist.destroy_process_group()
+        clear_parallel_state()
 
 
-def test_two_rank_balanced_dispatch_output_routing_and_owner_gradient(tmp_path: Path):
-    rendezvous = f"file://{tmp_path / 'dispatch-two-rank'}"
-    mp.spawn(_two_rank_dispatch_worker, args=(2, rendezvous), nprocs=2, join=True)
-
-
-def _runtime_args(*, enabled: bool) -> SimpleNamespace:
-    from veomni.arguments import ModelArguments
-
-    from ..tools.training_utils import make_eager_ops_config
-
-    return SimpleNamespace(
-        model=ModelArguments(model_path="unused", ops_implementation=make_eager_ops_config()),
-        train=SimpleNamespace(
-            checkpoint=SimpleNamespace(load_path=None),
-            moe_ep_load_balance=SimpleNamespace(enabled=enabled, max_replicas_per_rank=1),
-        ),
-    )
-
-
-class _OrderModel(nn.Module):
-    def __init__(self, events):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(()))
-        self.events = events
-
-    def train(self, mode: bool = True):
-        self.events.append("train")
-        return super().train(mode)
-
-
-def _install_ep_load_balance_test_module(monkeypatch):
-    monkeypatch.setitem(sys.modules, _MOE_PACKAGE_NAME, _moe_package)
-    monkeypatch.setitem(sys.modules, _EP_LOAD_BALANCE_NAME, ep_load_balance)
-
-
-def test_runtime_attaches_after_parallelization_and_training(monkeypatch):
-    from veomni.distributed import torch_parallelize
-
-    events = []
-    model = _OrderModel(events)
-    args = _runtime_args(enabled=True)
-    runtime = model_runtime.VeOmniModelRuntime.__new__(model_runtime.VeOmniModelRuntime)
-    runtime.args = args.model
-    runtime.train_args = args.train
-    runtime.model = model
-
-    def fake_build(model_arg, **kwargs):
-        assert model_arg is model
-        events.append("build")
-        return model_arg
-
-    def fake_attach(model_arg, max_replicas_per_rank):
-        assert model_arg is model
-        assert model_arg.training
-        assert max_replicas_per_rank == 1
-        events.append("attach")
-        return 1
-
-    monkeypatch.setattr(torch_parallelize, "build_parallelize_model", fake_build)
-    monkeypatch.setattr(ep_load_balance, "attach_qwen3_5_moe_ep_load_balancers", fake_attach)
-    _install_ep_load_balance_test_module(monkeypatch)
-
-    runtime._build_parallelized_model()
-    runtime._attach_moe_ep_load_balancers()
-
-    assert runtime.model is model
-    assert events == ["build", "train", "attach"]
-
-
-def test_runtime_disabled_is_noop_and_enabled_requires_a_real_expert(monkeypatch):
-    _install_ep_load_balance_test_module(monkeypatch)
-
-    def unexpected_attach(*args, **kwargs):
-        raise AssertionError("Disabled configuration must not attach controllers.")
-
-    monkeypatch.setattr(ep_load_balance, "attach_qwen3_5_moe_ep_load_balancers", unexpected_attach)
-    disabled = model_runtime.VeOmniModelRuntime.__new__(model_runtime.VeOmniModelRuntime)
-    disabled.train_args = _runtime_args(enabled=False).train
-    disabled.model = _OrderModel([])
-    disabled._attach_moe_ep_load_balancers()
-
-    monkeypatch.setattr(ep_load_balance, "attach_qwen3_5_moe_ep_load_balancers", lambda *args, **kwargs: 0)
-    enabled = model_runtime.VeOmniModelRuntime.__new__(model_runtime.VeOmniModelRuntime)
-    enabled.train_args = _runtime_args(enabled=True).train
-    enabled.model = _OrderModel([])
-    with pytest.raises(RuntimeError, match="no compatible Qwen3.5 MoE expert modules"):
-        enabled._attach_moe_ep_load_balancers()
+@pytest.mark.parametrize("backend", ["npu", "triton"])
+@pytest.mark.parametrize("memory", [False, True])
+def test_fused_row_dispatches_replicas_and_recovers_from_rank_local_validation(tmp_path, backend, memory):
+    mp.spawn(_worker, args=((tmp_path / "balanced-dispatch").as_uri(), backend, memory), nprocs=2, join=True)

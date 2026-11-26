@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni import EdgeDef, NodeDef
 from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.graphs.base import END
@@ -19,6 +20,9 @@ from veomni.models.seed_omni.mixins.training_module_mixin import TrainingModuleM
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.module_configuration_base import OmniModuleConfig
 from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_from_endpoint_default_method():
@@ -119,23 +123,31 @@ def test_training_graph_rejects_missing_method():
         TrainingGraph([{"from": "a.encode", "to": "end"}], modules={"a": Mod()})
 
 
+_ONE_NODE_FSM = {
+    "initial": "run",
+    "states": {
+        "run": {
+            "body": [{"from": "a", "to": "end"}],
+            "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
+        }
+    },
+}
+
+
 def test_generation_graph_rejects_missing_method():
     class Mod:
         pass
 
     with pytest.raises(ValueError, match=r"Mod\.generate"):
-        GenerationGraph(
-            {
-                "initial": "run",
-                "states": {
-                    "run": {
-                        "body": [{"from": "a", "to": "end"}],
-                        "transitions": [{"condition": {"type": "default"}, "next_state": "done"}],
-                    }
-                },
-            },
-            modules={"a": Mod()},
-        )
+        GenerationGraph(_ONE_NODE_FSM).validate_modules({"a": Mod()})
+
+
+def test_generation_graph_builds_without_the_modules_it_names():
+    """A training job may load only a subset (an ``offline_embedding`` run loads just the encoder)."""
+    graph = GenerationGraph(_ONE_NODE_FSM)
+
+    with pytest.raises(ValueError, match="not loaded: \\['a'\\]"):
+        graph.validate_modules({"vae": object()})
 
 
 def test_single_node_with_only_end_edge():
@@ -203,6 +215,10 @@ class _StubConfig(OmniModuleConfig):
     """Config for the weightless stand-ins below."""
 
     model_type = "stub_omni_module"
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("ops_implementation", {"attn_implementation": "eager"})
+        super().__init__(**kwargs)
 
 
 class _FakeOmniModule(PretrainedOmniModule, TrainingModuleMixin, BaseMixin, InferenceModuleMixin):
@@ -307,7 +323,51 @@ def test_omni_model_forward_runs_fake_module_chain():
 
     # Each Linear is ones-initialized, so a row of ones becomes 8, then 64.
     assert torch.allclose(batch["hidden"], torch.full((2, hidden_size), 64.0))
-    assert out == {"loss": None, "losses": {}}
+    assert out == {"loss": None, "losses": {}, "conversation_list": None}
+
+
+class _ItemEncodingModule(PretrainedOmniModule):
+    """Training stand-in that encodes each ``ConversationItem`` in place, as the offline-cache contract asks."""
+
+    config_class = _StubConfig
+
+    def __init__(self):
+        super().__init__(_StubConfig())
+
+    def forward(self, conversation_list=None, **kwargs):
+        del kwargs
+        for sample in conversation_list:
+            for item in sample:
+                item.value = item.value * 2
+        return {}
+
+
+def test_omni_model_forward_returns_the_items_the_graph_encoded_under_an_input_cast():
+    """FSDP2 mixed precision casts the root's inputs with ``dataclasses.replace``, so the graph encodes copies."""
+    from torch.distributed.utils import _apply_to_tensors
+
+    from veomni.models.seed_omni.utils.conversation import ConversationItem
+
+    config = OmniConfig(
+        _module_entries={"module_A": {"model_path": "module_A"}},
+        training_graphs={"default": [{"from": "module_A", "to": "end"}]},
+        generation_graphs=_minimal_generation_graphs(module="module_A"),
+    )
+    model = OmniModel(config, {"module_A": _ItemEncodingModule()})
+
+    def cast_inputs(module, args, kwargs):
+        to_bf16 = lambda t: t.to(torch.bfloat16)  # noqa: E731
+        return _apply_to_tensors(to_bf16, args), _apply_to_tensors(to_bf16, kwargs)
+
+    model.register_forward_pre_hook(cast_inputs, with_kwargs=True)
+    original = ConversationItem(type="image", value=torch.ones(2), role="user", meta={})
+
+    out = model({"conversation_list": [[original]]})
+
+    assert torch.equal(original.value, torch.ones(2))
+    encoded = out["conversation_list"][0][0]
+    assert encoded is not original
+    assert torch.equal(encoded.value, torch.full((2,), 2.0, dtype=torch.bfloat16))
 
 
 class _ArtefactModule(PretrainedOmniModule):
@@ -404,6 +464,65 @@ def test_generate_keeps_every_artefact_a_body_pass_emits():
     generated = model.generate({})
 
     assert [item["value"] for item in generated] == ["module_A", "module_B"]
+
+
+def _nonterminating_generation_graphs() -> dict:
+    """One state that never transitions, so the driver runs to the token cap."""
+    return {
+        "infer_gen": {
+            "initial": "run",
+            "states": {
+                "run": {
+                    "body": [{"from": "module_A", "to": "end"}],
+                    "transitions": [{"condition": {"type": "module_signal", "key": "unused"}, "next_state": "done"}],
+                }
+            },
+        }
+    }
+
+
+def test_max_new_tokens_does_not_count_the_prefill_pass():
+    """Pass 1 only prefills the prompt; the budget is measured in emitted tokens.
+
+    The graph never signals ``done``, so it runs to the cap: exactly
+    ``max_new_tokens`` artefacts, not ``max_new_tokens - 1``.
+    """
+
+    class _PrefillThenToken(_ArtefactModule):
+        def __init__(self):
+            super().__init__("token")
+            self.calls = 0
+
+        def generate(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {}
+            return {"generated": {"type": "text", "value": str(self.calls)}}
+
+    config = OmniConfig(
+        _module_entries={"module_A": {"model_path": "module_A"}},
+        training_graphs={},
+        generation_graphs=_nonterminating_generation_graphs(),
+    )
+    model = OmniModel(config, {"module_A": _PrefillThenToken()})
+
+    model.reset()
+    generated = model.generate({}, generation_kwargs={"max_new_tokens": 2})
+    assert [item["value"] for item in generated] == ["2", "3"]
+
+
+def test_max_new_tokens_counts_an_immediately_generating_graph():
+    """A first pass that already emits is generation, not prefill: no free extra pass."""
+    config = OmniConfig(
+        _module_entries={"module_A": {"model_path": "module_A"}},
+        training_graphs={},
+        generation_graphs=_nonterminating_generation_graphs(),
+    )
+    model = OmniModel(config, {"module_A": _ArtefactModule("module_A")})
+
+    model.reset()
+    generated = model.generate({}, generation_kwargs={"max_new_tokens": 2})
+    assert len(generated) == 2
 
 
 def test_omni_model_without_a_training_graph_generates_but_refuses_to_train():

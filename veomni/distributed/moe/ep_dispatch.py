@@ -21,7 +21,7 @@ import torch
 import torch.distributed as dist
 
 from ..parallel_state import get_parallel_state
-from .ep_load_balance import EPBalancePlan, _validate_executor_plan
+from .ep_load_balance import EPBalancePlan, _Qwen3_5MoEEPLoadBalancer, _validate_executor_plan
 
 
 def _validate_merged_expert_weights(gate_up_proj: Any, down_proj: Any) -> None:
@@ -54,7 +54,14 @@ def _validate_ep_balance_dispatch(
     load_balancer: Any,
 ) -> EPBalancePlan:
     """Validate shared balanced-EP metadata before any replica transfer."""
-    _validate_merged_expert_weights(gate_up_proj, down_proj)
+    runtime_balancer = isinstance(load_balancer, _Qwen3_5MoEEPLoadBalancer)
+    input_error = None
+    try:
+        _validate_merged_expert_weights(gate_up_proj, down_proj)
+    except ValueError as exc:
+        if not runtime_balancer:
+            raise
+        input_error = exc
     if not callable(getattr(load_balancer, "build_plan", None)):
         raise TypeError("load_balancer must expose build_plan(selected_experts).")
 
@@ -63,7 +70,14 @@ def _validate_ep_balance_dispatch(
     if ep_group is None or ep_group is not ep_state.ep_group:
         raise ValueError("load_balancer.ep_group must be the active expert-parallel process group.")
 
-    plan = load_balancer.build_plan(selected_experts)
+    if runtime_balancer:
+        if input_error is None:
+            expected_rows = load_balancer.num_experts // ep_group.size()
+            if gate_up_proj.shape[0] != expected_rows:
+                input_error = ValueError(f"EP load balancing requires {expected_rows} EP-local expert rows.")
+        plan = load_balancer.build_plan(selected_experts, _input_error=input_error)
+    else:
+        plan = load_balancer.build_plan(selected_experts)
     if not isinstance(plan, EPBalancePlan):
         raise TypeError("load_balancer.build_plan must return an EPBalancePlan.")
     if plan.ep_size <= 1 or num_experts <= 0 or num_experts % plan.ep_size != 0:

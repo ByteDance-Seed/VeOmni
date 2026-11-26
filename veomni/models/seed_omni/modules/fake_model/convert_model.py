@@ -26,49 +26,25 @@ from typing import Any
 
 from transformers import PretrainedConfig
 
-from ...configuration_omni import OmniConfig
-from ...utils.convert_registry import OMNI_CONVERT_REGISTRY
+from ...utils.convert_registry import OMNI_CONVERT_REGISTRY, load_family_graphs
 
 
 FAKE_A = "fake_module_a"
 FAKE_B = "fake_module_b"
 
-_CONFIG_RELATIVE = Path("configs") / "seed_omni" / "fake_model"
-_TRAIN_GRAPH_NAME = "graph_train.yaml"
-_INFER_GRAPH_NAME = "graph_infer.yaml"
 
-
-def _default_config_dir() -> Path:
-    """Walk up from this file to the repo's ``configs/seed_omni/fake_model``."""
-    for parent in Path(__file__).resolve().parents:
-        candidate = parent / _CONFIG_RELATIVE
-        if (candidate / _TRAIN_GRAPH_NAME).is_file():
-            return candidate
-    raise FileNotFoundError(
-        f"Could not find {_CONFIG_RELATIVE / _TRAIN_GRAPH_NAME} above {__file__}. "
-        "Pass training_graph= / generation_graph= explicitly, or run convert from a VeOmni checkout."
-    )
-
-
-def load_family_graphs(
+def load_fake_omni_graphs(
     *,
     training_graph: str | Path | None = None,
     generation_graph: str | Path | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
-    """Read the training DAGs and generation FSMs from YAML under ``configs/``."""
-    config_dir: Path | None = None
-
-    def configs() -> Path:
-        nonlocal config_dir
-        if config_dir is None:
-            config_dir = _default_config_dir()
-        return config_dir
-
-    train_path = Path(training_graph) if training_graph is not None else configs() / _TRAIN_GRAPH_NAME
-    generation_path = Path(generation_graph) if generation_graph is not None else configs() / _INFER_GRAPH_NAME
-    return (
-        OmniConfig._read_graph_file(str(train_path), list),
-        OmniConfig._read_graph_file(str(generation_path), dict),
+    """Read the training DAGs and generation FSMs from YAML under ``configs/seed_omni/fake_model``."""
+    return load_family_graphs(
+        "configs/seed_omni/fake_model",
+        training="graph_train.yaml",
+        generation="graph_infer.yaml",
+        training_graph=training_graph,
+        generation_graph=generation_graph,
     )
 
 
@@ -89,7 +65,7 @@ def convert_fake_omni(model_path: str, **kwargs: Any) -> dict[str, Any]:
 
     cfg_dict, _ = PretrainedConfig.get_config_dict(model_path)
     hidden_size = int(cfg_dict.get("hidden_size", 8))
-    training_graphs, generation_graphs = load_family_graphs(
+    training_graphs, generation_graphs = load_fake_omni_graphs(
         training_graph=training_graph,
         generation_graph=generation_graph,
     )

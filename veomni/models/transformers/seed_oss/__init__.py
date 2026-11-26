@@ -11,28 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ....utils.device import IS_NPU_AVAILABLE
-from ...loader import MODELING_REGISTRY
+
+"""SeedOss modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models.registry import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("seed_oss")
 def register_seed_oss_modeling(architecture: str):
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_seed_oss_npu import (
-            SeedOssForCausalLM,
-            SeedOssForQuestionAnswering,
-            SeedOssForSequenceClassification,
-            SeedOssForTokenClassification,
-            SeedOssModel,
-        )
-    else:
-        from .generated.patched_modeling_seed_oss_gpu import (
-            SeedOssForCausalLM,
-            SeedOssForQuestionAnswering,
-            SeedOssForSequenceClassification,
-            SeedOssForTokenClassification,
-            SeedOssModel,
-        )
+    from .modeling_seed_oss import (
+        SeedOssForCausalLM,
+        SeedOssForQuestionAnswering,
+        SeedOssForSequenceClassification,
+        SeedOssForTokenClassification,
+        SeedOssModel,
+    )
 
     if "ForCausalLM" in architecture:
         return SeedOssForCausalLM

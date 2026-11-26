@@ -1,11 +1,16 @@
+import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.data_collator import add_flash_attention_kwargs_from_position_ids
 from veomni.utils.seqlen_pos_transform_utils import (
     coalesce_tail_padding_cu_seqlens,
     prepare_fa_kwargs_from_position_ids,
     valid_seqlens_from_cu_seqlens,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def make_pos_ids_concat(lengths):

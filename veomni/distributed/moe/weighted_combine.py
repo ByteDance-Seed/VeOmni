@@ -3,14 +3,14 @@
 import torch
 from torch.autograd.function import once_differentiable
 
-from ...utils.device import get_torch_device
+from ...utils.device import get_torch_device, is_nvidia_cuda_device
 from .moe_utils import compact_unpermute
 
 
 class _WeightedCombine(torch.autograd.Function):
     @staticmethod
     def forward(ctx, value, weights, logical_order, logical_to_physical):
-        from ...ops.kernels.moe.ep_combine import build_alias_maps, weighted_combine_forward
+        from ...ops.kernels.moe_experts.shared.ep_combine import build_alias_maps, weighted_combine_forward
 
         direct = torch.empty_like(logical_order)
         inverse = torch.empty_like(logical_order)
@@ -27,7 +27,7 @@ class _WeightedCombine(torch.autograd.Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, gradient):
-        from ...ops.kernels.moe.ep_combine import weighted_combine_backward
+        from ...ops.kernels.moe_experts.shared.ep_combine import weighted_combine_backward
 
         value, weights, inverse = ctx.saved_tensors
         dx = torch.empty_like(value) if ctx.needs_input_grad[0] else None
@@ -69,7 +69,7 @@ def weighted_combine(value, weights, shape, logical_order, logical_to_physical):
         ):
             raise ValueError("Alias maps must be matching one-dimensional int64 tensors on the value device.")
     compatible = (
-        value.is_cuda
+        is_nvidia_cuda_device(value.device)
         and value.dtype == weights.dtype == torch.bfloat16
         # ATen's vectorized sum handles a misaligned row head separately.
         # Reordering rows is bit-preserving only when every row starts at the

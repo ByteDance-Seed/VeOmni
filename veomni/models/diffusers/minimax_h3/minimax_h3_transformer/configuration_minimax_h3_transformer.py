@@ -1,7 +1,7 @@
-from transformers import PretrainedConfig
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
-class MiniMaxH3DiTModelConfig(PretrainedConfig):
+class MiniMaxH3DiTModelConfig(VeOmniPretrainedConfig):
     model_type = "MiniMaxH3DiTModel"
     condition_model_type = "MiniMaxH3ConditionModel"
 
@@ -26,6 +26,8 @@ class MiniMaxH3DiTModelConfig(PretrainedConfig):
         norm_eps: float = 1e-5,
         qk_norm_eps: float = 1e-5,
         final_norm_eps: float = 1e-5,
+        audio_enabled: bool = True,
+        num_pdd_heads: int = 0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -48,3 +50,5 @@ class MiniMaxH3DiTModelConfig(PretrainedConfig):
         self.norm_eps = norm_eps
         self.qk_norm_eps = qk_norm_eps
         self.final_norm_eps = final_norm_eps
+        self.audio_enabled = audio_enabled
+        self.num_pdd_heads = num_pdd_heads

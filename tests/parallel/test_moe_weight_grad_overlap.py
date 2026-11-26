@@ -1,16 +1,16 @@
 """Submit independent dX before ordered communication waits, including errors."""
 
 import gc
-import importlib.util
+import sys
 import weakref
-from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
-from tests.parallel.test_moe_ep_load_balance_dispatch import ep_load_balance as ep
-from tests.parallel.test_moe_ep_load_balance_dispatch import moe_layer as moe
+from veomni.distributed.moe import ep_grad
+from veomni.ops.kernels.moe_experts import shared
+from veomni.ops.kernels.moe_experts.shared import ep
 
 
 @pytest.mark.parametrize("needs", [(True, True), (True, False), (False, True), (False, False)])
@@ -24,8 +24,10 @@ def test_down_wait_follows_dx_and_precedes_gate_weight_grad(monkeypatch, needs, 
     pre_gate = torch.randn(4, 2, dtype=torch.bfloat16)
     pre_up = torch.randn(4, 2, dtype=torch.bfloat16)
     ctx = SimpleNamespace(
-        saved_tensors=(tokens, torch.tensor([4]), gate, down, pre_gate, pre_up, torch.empty(0), torch.empty(0)),
+        saved_tensors=(tokens, torch.tensor([4]), gate, down, pre_gate, pre_up, torch.empty(0), torch.empty(0), None),
         swiglu_limit=None,
+        activation="silu",
+        tile_prefix_total=None,
     )
     calls = 0
 
@@ -56,10 +58,14 @@ def test_down_wait_follows_dx_and_precedes_gate_weight_grad(monkeypatch, needs, 
 
         sync.start = start
 
-    monkeypatch.setattr(moe, "group_gemm_same_nk", nk, raising=False)
+    kernels = ModuleType(f"{shared.__name__}.group_gemm")
+    kernels.group_gemm_same_nk = nk
+    kernels.group_gemm_same_mn = sync
+    monkeypatch.setitem(sys.modules, kernels.__name__, kernels)
+    monkeypatch.setattr(shared, "group_gemm", kernels, raising=False)
 
     def backward():
-        return moe.EPMergedFc1GroupGemm.backward(
+        return ep.EPMergedFc1GroupGemm.backward(
             ctx,
             torch.ones_like(tokens),
             weight_gradient_dtype=torch.float32,
@@ -86,9 +92,6 @@ def test_down_wait_follows_dx_and_precedes_gate_weight_grad(monkeypatch, needs, 
 
 
 def test_pending_handle_retains_operands_and_waits_once():
-    spec = importlib.util.spec_from_file_location("pending_ep_grad_test", Path(ep.__file__).with_name("ep_grad.py"))
-    grad = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(grad)
     events = []
 
     class Operand:
@@ -109,7 +112,7 @@ def test_pending_handle_retains_operands_and_waits_once():
         assert value.value == 7
         events.append("suffix")
 
-    pending = grad._PendingOrderedWeightGrad(stages(operand))
+    pending = ep_grad._PendingOrderedWeightGrad(stages(operand))
     del operand
     gc.collect()
     assert reference() is not None

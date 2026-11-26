@@ -18,10 +18,57 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from ....distributed.sequence_parallel import (
+from ....distributed.parallel_state import get_parallel_state
+from ....distributed.sequence_parallel.ulysses import (
     gather_heads_scatter_seq,
     gather_seq_scatter_heads,
 )
+
+
+def should_apply_ulysses(*, skip_ulysses: bool = False) -> bool:
+    """Return whether this call should gather/scatter Ulysses itself.
+
+    Attention gathers when the Ulysses axis is greater than 1. Callers
+    that already gathered, or whose tokens are not on the SP mesh, pass
+    ``skip_ulysses=True``. The global async flag is not consulted: mixed
+    models keep vision on the sync path while text async gathers outside
+    attention.
+    """
+    if skip_ulysses:
+        return False
+    return get_parallel_state().ulysses_size > 1
+
+
+def effective_sequence_lengths(
+    q_length: int,
+    kv_length: int,
+    *,
+    skip_ulysses: bool = False,
+) -> tuple[int, int]:
+    """Return the Q/K lengths seen by the attention kernel.
+
+    When attention gathers, mask metadata must describe the global
+    sequence. ``skip_ulysses`` keeps the caller's lengths: either they
+    are already global after an outside gather, or the tokens stay local.
+    """
+    if not should_apply_ulysses(skip_ulysses=skip_ulysses):
+        return q_length, kv_length
+    scale = get_parallel_state().ulysses_size
+    return q_length * scale, kv_length * scale
+
+
+def ulysses_mask_lengths(q_length: int, kv_length: int, mask_length: int | None) -> tuple[int, int]:
+    """Return the gathered Q/K lengths for a mask built before Ulysses gathers.
+
+    Q is always the local shard. HF ``create_*_mask`` without a cache takes
+    ``kv_length`` from the 2D mask, which the collator does not SP-slice, so a
+    ``kv_length`` that equals both the mask length and the gathered Q length is
+    already global. Any other ``kv_length`` is local.
+    """
+    full_q_length, full_kv_length = effective_sequence_lengths(q_length, kv_length)
+    if kv_length == mask_length == full_q_length:
+        return full_q_length, kv_length
+    return full_q_length, full_kv_length
 
 
 def prepare_ulysses_qkv(

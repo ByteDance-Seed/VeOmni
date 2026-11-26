@@ -22,6 +22,8 @@ differentiable point-to-point.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 import torch.distributed as dist
 
@@ -35,7 +37,7 @@ def all_gather_kv(kv: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
 
 def all_gather_compressed_rows(
     local_rows: torch.Tensor,
-    counts: torch.Tensor,
+    counts: torch.Tensor | Sequence[int],
     group: dist.ProcessGroup,
 ) -> torch.Tensor:
     """Assemble per-rank compressed rows into global window order.
@@ -55,11 +57,9 @@ def all_gather_compressed_rows(
     Concatenating each rank's valid rows in rank order is already global window
     order, because windows sort by start token and shards sort by rank.
     """
-    # One device-to-host sync for every count at once. Reading ``counts.max()``
-    # and then ``counts[rank]`` inside the loop below drains the device queue
-    # ``cp_size + 1`` times per call, and there is one call per compressor and
-    # per indexer per layer.
-    per_rank = counts.tolist()
+    # Host metadata needs no device synchronization. Legacy tensor callers
+    # retain a single transfer instead of synchronizing once per rank.
+    per_rank = counts.tolist() if isinstance(counts, torch.Tensor) else counts
     n_max = max(per_rank, default=0)
     if n_max == 0:
         return local_rows.new_zeros(local_rows.shape[0], 0, local_rows.shape[-1])

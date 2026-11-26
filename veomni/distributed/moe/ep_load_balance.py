@@ -27,7 +27,7 @@ __all__ = [
     "EPBalancePlan",
     "ExpertReplica",
     "ExpertReplicaTransfer",
-    "attach_qwen3_5_moe_ep_load_balancers",
+    "attach_ep_load_balancers",
     "build_ep_balance_plan",
     "cat_local_and_replica_weights",
 ]
@@ -342,6 +342,7 @@ def _validate_planner_inputs(
     num_experts: int,
     ep_rank: int,
     max_replicas_per_rank: int,
+    local_histogram: torch.Tensor | None = None,
 ) -> tuple[int, int, torch.Tensor]:
     if not isinstance(selected_experts, torch.Tensor):
         raise TypeError("selected_experts must be a torch.Tensor.")
@@ -379,13 +380,14 @@ def _validate_planner_inputs(
     if bool((counts < 0).any()):
         raise ValueError("Gathered expert token counts must be non-negative.")
 
-    flat_selected = selected_experts.reshape(-1)
-    if flat_selected.numel() and (
-        int(flat_selected.min().item()) < 0 or int(flat_selected.max().item()) >= num_experts
-    ):
-        raise ValueError(f"selected_experts IDs must be in [0, {num_experts}).")
-    local_counts = torch.bincount(flat_selected.to(device="cpu", dtype=torch.long), minlength=num_experts)
-    if not torch.equal(local_counts, counts[ep_rank]):
+    if local_histogram is None:
+        flat_selected = selected_experts.reshape(-1)
+        if flat_selected.numel() and (
+            int(flat_selected.min().item()) < 0 or int(flat_selected.max().item()) >= num_experts
+        ):
+            raise ValueError(f"selected_experts IDs must be in [0, {num_experts}).")
+        local_histogram = torch.bincount(flat_selected.to(device="cpu", dtype=torch.long), minlength=num_experts)
+    if not torch.equal(local_histogram, counts[ep_rank]):
         raise ValueError("The local selected_experts histogram does not match the gathered EP-rank row.")
 
     return ep_size, num_local_experts, counts
@@ -518,6 +520,26 @@ def _plan_replicas(
     return replica_states, rank_loads_before, rank_loads, expert_allocations
 
 
+def _whole_tile_replica(
+    counts: torch.Tensor, rank_loads: list[int], num_local_experts: int, tile: int
+) -> _ReplicaState | None:
+    """Recover one improving move when rounding discarded the entire plan."""
+    ranks = range(len(rank_loads))
+    target = min(ranks, key=rank_loads.__getitem__)
+    if max(rank_loads) - rank_loads[target] <= tile:
+        return None
+    totals = counts.sum(dim=0).tolist()
+    for owner in sorted(ranks, key=lambda rank: -rank_loads[rank]):
+        # A gap equal to one tile would only swap the two loads.
+        if rank_loads[owner] - rank_loads[target] <= tile:
+            break
+        start = owner * num_local_experts
+        expert = max(range(start, start + num_local_experts), key=totals.__getitem__)
+        if totals[expert] >= tile:
+            return _ReplicaState(expert, owner, target, 0, tile)
+    return None
+
+
 def _allocate_replica_rows(
     counts: torch.Tensor,
     replica_states: list[_ReplicaState],
@@ -550,6 +572,7 @@ def _build_ep_balance_plan_from_counts(
     max_replicas_per_rank: int,
     *,
     token_granularity: int = 1,
+    _local_histogram: torch.Tensor | None = None,
 ) -> EPBalancePlan:
     """Pure count-driven planning helper used by the public collective entry point."""
     ep_size, num_local_experts, counts = _validate_planner_inputs(
@@ -558,6 +581,7 @@ def _build_ep_balance_plan_from_counts(
         num_experts,
         ep_rank,
         max_replicas_per_rank,
+        _local_histogram,
     )
     replica_states, rank_loads_before, rank_loads_after, _ = _plan_replicas(
         counts,
@@ -569,7 +593,7 @@ def _build_ep_balance_plan_from_counts(
 
     if type(token_granularity) is not int or token_granularity <= 0:
         raise ValueError("token_granularity must be a positive integer.")
-    if token_granularity > 1:
+    if token_granularity > 1 and replica_states:
         replica_states = [
             replace(state, moved_tokens=state.moved_tokens // token_granularity * token_granularity)
             for state in replica_states
@@ -582,8 +606,13 @@ def _build_ep_balance_plan_from_counts(
         # Quantization can remove useful outgoing moves from a rank that is
         # also a target. Never retain a rounded plan that worsens the objective.
         if _rank_load_profile(rank_loads_after) >= _rank_load_profile(rank_loads_before):
-            replica_states = []
+            replica = _whole_tile_replica(counts, rank_loads_before, num_local_experts, token_granularity)
             rank_loads_after = rank_loads_before.copy()
+            replica_states = []
+            if replica is not None:
+                replica_states.append(replica)
+                rank_loads_after[replica.source_rank] -= replica.moved_tokens
+                rank_loads_after[replica.target_rank] += replica.moved_tokens
 
     if not replica_states:
         start = ep_rank * num_local_experts
@@ -700,18 +729,21 @@ def build_ep_balance_plan(
     num_experts: int,
     ep_group: dist.ProcessGroup,
     max_replicas_per_rank: int,
+    *,
+    _input_error: TypeError | ValueError | None = None,
 ) -> EPBalancePlan:
     """Gather the current EP histogram and build this rank's physical alias plan."""
     if not isinstance(selected_experts, torch.Tensor):
         raise TypeError("selected_experts must be a torch.Tensor.")
-    if selected_experts.dtype not in {
+    malformed_dtype = selected_experts.dtype not in {
         torch.int8,
         torch.int16,
         torch.int32,
         torch.int64,
         torch.uint8,
-    }:
-        raise TypeError("selected_experts must contain integer expert IDs.")
+    }
+    if malformed_dtype and _input_error is None:
+        _input_error = TypeError("selected_experts must contain integer expert IDs.")
     if ep_group is None:
         raise ValueError("build_ep_balance_plan requires a real expert-parallel process group.")
     ep_size = dist.get_world_size(group=ep_group)
@@ -732,15 +764,25 @@ def build_ep_balance_plan(
     # on accelerators so validation and each concrete replica rewrite do not introduce
     # separate device synchronizations. Preserve the public result device.
     host_planning = selected_experts.is_cuda or selected_experts.device.type == "npu"
-    planning_selected = selected_experts.cpu() if host_planning else selected_experts
+    if malformed_dtype:
+        planning_selected = torch.empty(0, dtype=torch.long)
+    else:
+        planning_selected = selected_experts.cpu() if host_planning else selected_experts
     flat_selected = planning_selected.reshape(-1)
-    if flat_selected.numel() and (
-        int(flat_selected.min().item()) < 0 or int(flat_selected.max().item()) >= num_experts
+    if (
+        _input_error is None
+        and flat_selected.numel()
+        and (int(flat_selected.min().item()) < 0 or int(flat_selected.max().item()) >= num_experts)
     ):
-        raise ValueError(f"selected_experts IDs must be in [0, {num_experts}).")
-    local_counts = torch.bincount(flat_selected.to(dtype=torch.long), minlength=num_experts)
-    if host_planning:
-        local_counts = local_counts.to(selected_experts.device)
+        _input_error = ValueError(f"selected_experts IDs must be in [0, {num_experts}).")
+    local_histogram = None
+    if _input_error is None:
+        local_histogram = torch.bincount(flat_selected.to(dtype=torch.long), minlength=num_experts)
+        local_counts = local_histogram.to(selected_experts.device) if host_planning else local_histogram
+    else:
+        # Negative counts make every rank reject the existing histogram gather
+        # before any rank can enter the replica or token exchanges.
+        local_counts = selected_experts.new_full((num_experts,), -1, dtype=torch.long)
     granularity = 1
     if selected_experts.is_cuda:
         from .ep_grad import weight_grad_config_metadata
@@ -752,14 +794,20 @@ def build_ep_balance_plan(
         gathered_counts_flat = local_counts.new_empty(ep_size * num_experts)
         dist.all_gather_into_tensor(gathered_counts_flat, local_counts, group=ep_group)
         gathered_counts = gathered_counts_flat.reshape(ep_size, num_experts)
-    plan = _build_ep_balance_plan_from_counts(
-        selected_experts=planning_selected,
-        tokens_per_expert_by_rank=gathered_counts,
-        num_experts=num_experts,
-        ep_rank=ep_rank,
-        max_replicas_per_rank=max_replicas_per_rank,
-        token_granularity=granularity,
-    )
+    try:
+        plan = _build_ep_balance_plan_from_counts(
+            selected_experts=planning_selected,
+            tokens_per_expert_by_rank=gathered_counts,
+            num_experts=num_experts,
+            ep_rank=ep_rank,
+            max_replicas_per_rank=max_replicas_per_rank,
+            token_granularity=granularity,
+            _local_histogram=local_histogram,
+        )
+    except ValueError:
+        if _input_error is not None:
+            raise _input_error from None
+        raise
     if host_planning:
         plan = replace(plan, selected_physical_experts=plan.selected_physical_experts.to(selected_experts.device))
     return plan
@@ -777,30 +825,20 @@ class _Qwen3_5MoEEPLoadBalancer:
     def optimize_memory(self) -> bool:
         return self.buffer_pool is not None
 
-    def build_plan(self, selected_experts: torch.Tensor) -> EPBalancePlan:
+    def build_plan(self, selected_experts: torch.Tensor, *, _input_error: ValueError | None = None) -> EPBalancePlan:
         return build_ep_balance_plan(
             selected_experts=selected_experts,
             num_experts=self.num_experts,
             ep_group=self.ep_group,
             max_replicas_per_rank=self.max_replicas_per_rank,
+            _input_error=_input_error,
         )
 
 
-def _is_runtime_qwen3_5_merged_experts(module: nn.Module) -> bool:
-    class_name = module.__class__.__name__
-    if class_name != "Qwen3_5MoeExperts" and not (
-        class_name.startswith("FSDP") and class_name.endswith("Qwen3_5MoeExperts")
-    ):
-        return False
-    gate_up_proj = getattr(module, "gate_up_proj", None)
-    down_proj = getattr(module, "down_proj", None)
-    return getattr(gate_up_proj, "ndim", None) == 3 and getattr(down_proj, "ndim", None) == 3
+def attach_ep_load_balancers(model: nn.Module, max_replicas_per_rank: int, *, optimize_memory: bool = False) -> int:
+    """Attach a private planner to each expert module that declares replica support."""
+    from ...ops.kernels.moe_experts.shared.activation import is_silu
 
-
-def attach_qwen3_5_moe_ep_load_balancers(
-    model: nn.Module, max_replicas_per_rank: int, *, optimize_memory: bool = False
-) -> int:
-    """Attach a private planner controller to each compatible Qwen3.5 MoE layer."""
     parallel_state = get_parallel_state()
     ep_group = parallel_state.ep_group
     if ep_group is None:
@@ -811,9 +849,16 @@ def attach_qwen3_5_moe_ep_load_balancers(
     if max_replicas_per_rank <= 0:
         raise ValueError("max_replicas_per_rank must be positive.")
 
-    expert_modules = [module for _, module in model.named_modules() if _is_runtime_qwen3_5_merged_experts(module)]
+    expert_modules = [module for module in model.modules() if getattr(module, "_veomni_supports_ep_replicas", False)]
     validated_num_experts = []
     for module in expert_modules:
+        op = module.veomni_moe
+        if op.impl not in ("fused_npu", "fused_triton") or "load_balancer" in op.kwargs:
+            raise ValueError("EP load balancing requires a resolved fused_npu or fused_triton routed expert row.")
+        if not is_silu(op.kwargs.get("activation", module.activation)):
+            raise ValueError("EP load balancing requires merged SiLU routed experts.")
+        if module.gate_up_proj.ndim != 3 or module.down_proj.ndim != 3:
+            raise ValueError("EP load balancing requires merged 3-D expert weights.")
         num_experts = getattr(module, "num_experts", None)
         if not isinstance(num_experts, int) or num_experts <= 0:
             raise ValueError("Qwen3_5MoeExperts.num_experts must be a positive integer.")

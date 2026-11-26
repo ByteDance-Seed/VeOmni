@@ -1,4 +1,4 @@
-.PHONY: build commit quality style test patchgen check-patchgen check-agent-docs
+.PHONY: build commit quality style test check-agent-docs
 
 check_dirs := tasks tests veomni docs
 
@@ -20,11 +20,5 @@ style:
 test:
 	pytest tests/
 
-patchgen:
-	patchgen --all --diff
-
-check-patchgen:
-	patchgen --check
-
 check-agent-docs:
-	python3 scripts/ci/check_agent_doc_paths.py
+	python3 scripts/ci/docs/check_agent_doc_paths.py

@@ -1,8 +1,5 @@
 """Ordered replica boundaries and seeded GEMM tail regressions."""
 
-import importlib.util
-from pathlib import Path
-
 import pytest
 import torch
 import torch.distributed as dist
@@ -15,6 +12,8 @@ from tests.parallel.test_moe_ep_load_balance_planner import (
 from tests.parallel.test_moe_ep_load_balance_planner import (
     ep_load_balance as ep,
 )
+from veomni.distributed.moe import ep_grad
+from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
 
 
 @pytest.mark.parametrize("total", [0, 1, 31, 32, 33, 127, 128, 129, 251, 8193])
@@ -31,6 +30,51 @@ def test_quantized_plan_conserves_occurrences_and_improves_load(total, granulari
     assert all(replica.moved_tokens % granularity == 0 for replica in plans[0].replicas)
     if plans[0].replicas:
         assert sorted(plans[0].rank_loads_after, reverse=True) < sorted(plans[0].rank_loads_before, reverse=True)
+
+
+def test_quantized_top8_plan_keeps_a_feasible_whole_tile_transfer():
+    totals = [64] + [16] * 7 + [14] * 24
+    rows = [[] for _ in range(64)]
+    cursor = 0
+    for expert, occurrences in enumerate(totals):
+        for offset in range(occurrences):
+            rows[(cursor + offset) % len(rows)].append(expert)
+        cursor += occurrences
+    assert all(len(row) == len(set(row)) == 8 for row in rows)
+    selections = torch.tensor(rows).chunk(4)
+    counts = torch.stack([torch.bincount(ids.flatten(), minlength=len(totals)) for ids in selections])
+    plans = [
+        ep._build_ep_balance_plan_from_counts(ids, counts, len(totals), rank, 1, token_granularity=32)
+        for rank, ids in enumerate(selections)
+    ]
+    _assert_global_invariants(counts.tolist(), plans)
+    assert plans[0].rank_loads_before == (176, 112, 112, 112)
+    assert plans[0].rank_loads_after == (144, 144, 112, 112)
+    assert [(r.source_expert, r.target_rank, r.moved_tokens) for r in plans[0].replicas] == [(0, 1, 32)]
+
+
+def test_quantized_plan_recovers_a_tile_with_only_one_possible_recipient():
+    counts = [[80, 0, 56, 0]] * 2
+    plans = [
+        ep._build_ep_balance_plan_from_counts(ids, torch.tensor(counts), 4, rank, 1, token_granularity=32)
+        for rank, ids in enumerate(_selected_rows(counts))
+    ]
+    _assert_global_invariants(counts, plans)
+    assert plans[0].rank_loads_before == (160, 112)
+    assert plans[0].rank_loads_after == (128, 144)
+    assert [replica.moved_tokens for replica in plans[0].replicas] == [32]
+
+
+@pytest.mark.parametrize(
+    ("counts", "loads"),
+    [([[16, 8, 8, 8]] * 4, (64, 32, 32, 32)), ([[15, 15, 0, 0]] * 2, (60, 0))],
+)
+def test_quantized_plan_keeps_identity_without_an_improving_whole_tile(counts, loads):
+    plan = ep._build_ep_balance_plan_from_counts(
+        _selected_rows(counts)[0], torch.tensor(counts), 4, 0, 1, token_granularity=32
+    )
+    assert not plan.replicas
+    assert plan.rank_loads_after == plan.rank_loads_before == loads
 
 
 @pytest.mark.parametrize("granularity", [0, -1, 1.5, True])
@@ -63,10 +107,6 @@ def test_kernel_metadata_collectively_rejects_different_tiles_and_signatures(tmp
 
 
 def _prefix_worker(rank, rendezvous):
-    # The CPU reference does not need to import accelerator kernel packages.
-    spec = importlib.util.spec_from_file_location("ordered_ep_grad_test", Path(ep.__file__).with_name("ep_grad.py"))
-    grad = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(grad)
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=4)
     try:
         for total in (0, 63, 128, 131):
@@ -119,7 +159,7 @@ def _prefix_worker(rank, rendezvous):
                         cc[group].copy_(reference(aa[start:end], bb[start:end], cc[group] if accumulate else None))
                     start = end
 
-            run = grad.make_ordered_weight_grad(plan, dist.group.WORLD, torch.device("cpu"), launcher=launcher)
+            run = ep_grad.make_ordered_weight_grad(plan, dist.group.WORLD, torch.device("cpu"), launcher=launcher)
             run(a, b, c, sizes.cumsum(0), len(a), transpose_a=True)
             expected = reference(full_a, full_b) if rank == 0 else torch.zeros(3, 5)
             torch.testing.assert_close(c[0], expected, rtol=0, atol=0)
@@ -136,7 +176,7 @@ def test_ordered_fp32_prefix_chain_matches_original_with_cancellation_and_tails(
     mp.spawn(_prefix_worker, args=(f"file://{tmp_path / 'prefix'}",), nprocs=4, join=True)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA metadata synchronization regression")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="CUDA metadata synchronization regression")
 @pytest.mark.parametrize("side_stream", [False, True])
 def test_cuda_ordered_metadata_does_not_synchronize_the_current_stream(monkeypatch, side_stream):
     from veomni.distributed.moe.ep_grad import make_ordered_weight_grad
@@ -147,17 +187,19 @@ def test_cuda_ordered_metadata_does_not_synchronize_the_current_stream(monkeypat
     )
     assert plan.replicas
     monkeypatch.setattr(dist, "get_rank", lambda group: 0)
-    stream = torch.cuda.Stream() if side_stream else torch.cuda.current_stream()
-    with torch.cuda.stream(stream):
+    api = get_torch_device()
+    device = torch.device(get_device_type())
+    stream = api.Stream() if side_stream else api.current_stream()
+    with api.stream(stream):
         # Initialize CUDA and profiler state outside the measured constructor.
-        make_ordered_weight_grad(plan, None, torch.device("cuda"))
-        torch.cuda.synchronize()
+        make_ordered_weight_grad(plan, None, device)
+        api.synchronize()
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
         ) as profile:
             with torch.profiler.record_function("ordered_ep_metadata"):
-                make_ordered_weight_grad(plan, None, torch.device("cuda"))
-            torch.cuda.synchronize()
+                make_ordered_weight_grad(plan, None, device)
+            api.synchronize()
     events = profile.events()
     scope = next(event for event in events if event.name == "ordered_ep_metadata")
     synchronizations = [
@@ -170,18 +212,19 @@ def test_cuda_ordered_metadata_does_not_synchronize_the_current_stream(monkeypat
     assert not synchronizations, "Ordered metadata upload must not fence preceding GPU work on the host"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Triton kernel test")
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="CUDA Triton kernel test")
 @pytest.mark.parametrize("m,n", [(3, 5), (33, 65), (64, 64), (129, 63)])
 @pytest.mark.parametrize("suffix", [0, 1, 31, 33])
 def test_cuda_seeded_weight_gradient_preserves_original_order_and_masks_tails(m, n, suffix):
     from veomni.distributed.moe.ep_grad import _launch_weight_grad
 
     torch.manual_seed(41)
+    device = get_device_type()
     count = 32 + suffix
-    a = torch.randint(-2, 3, (count, m), device="cuda").to(torch.bfloat16)
-    b = torch.randint(-2, 3, (count, n), device="cuda").to(torch.bfloat16)
+    a = torch.randint(-2, 3, (count, m), device=device).to(torch.bfloat16)
+    b = torch.randint(-2, 3, (count, n), device=device).to(torch.bfloat16)
     expected = a.float().T @ b.float()
-    c = torch.empty((1, m, n), device="cuda", dtype=torch.float32)
-    _launch_weight_grad(a[:32], b[:32], c, torch.tensor([32], device="cuda"), count, False)
-    _launch_weight_grad(a[32:], b[32:], c, torch.tensor([suffix], device="cuda"), count, True)
+    c = torch.empty((1, m, n), device=device, dtype=torch.float32)
+    _launch_weight_grad(a[:32], b[:32], c, torch.tensor([32], device=device), count, False)
+    _launch_weight_grad(a[32:], b[32:], c, torch.tensor([suffix], device=device), count, True)
     torch.testing.assert_close(c[0], expected, rtol=0, atol=0)

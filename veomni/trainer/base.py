@@ -29,6 +29,7 @@ Features:
 import json
 import os
 import queue
+import sys
 import threading
 from abc import ABC
 from collections import defaultdict
@@ -60,7 +61,7 @@ from ..distributed.parallel_state import (
 )
 from ..distributed.torch_compile import mark_compile_step_begin
 from ..models.model_runtime import VeOmniModelRuntime
-from ..ops.batch_invariant_ops import set_batch_invariant_mode
+from ..ops.batch_invariant import set_batch_invariant_mode
 from ..utils import helper, logging
 from ..utils.device import (
     get_device_type,
@@ -377,6 +378,19 @@ class BaseTrainer(Stateful, ABC):
         return device
 
     def destroy_distributed(self):
+        adapter = sys.modules.get("hyper_parallel.integration.veomni")
+        if adapter is not None and (
+            self.args.model.accelerator.fsdp_config.fsdp_mode == "hyper_fsdp2"
+            or self.args.model.optimizer.type == "hyper_muon"
+        ):
+            from ..checkpoint.dcp_checkpointer import DistributedCheckpointer
+
+            # Checkpoint conversion still needs the bindings until all saves finish.
+            try:
+                DistributedCheckpointer.wait_for_pending_save()
+            finally:
+                adapter.remove_hyper_parallel_patch()
+
         if not dist.is_available() or not dist.is_initialized():
             return
 
@@ -437,6 +451,7 @@ class BaseTrainer(Stateful, ABC):
             dataset_name=args.data.dataset_name,
             transform=self.data_transform,
             seed=args.train.seed,
+            shuffle=args.data.dataloader.shuffle,
             **asdict(args.data),
         )
         dataset_length = None if not hasattr(self.train_dataset, "__len__") else len(self.train_dataset)
@@ -520,10 +535,8 @@ class BaseTrainer(Stateful, ABC):
         # (EnvironMeter, DCP checkpointer) are handed the state directly, so
         # no ambient ``use_parallel_state`` scope is needed around hook dispatch.
         #
-        # Metric producers run after the meter (which resets
-        # ``step_*_metrics`` in ``on_step_end``) and before ``wandb`` (which
-        # logs them), so channel-loss and MoE monitor scalars survive in the
-        # shared payload. The MoE callback's collective still runs on all ranks.
+        # Compute channel-loss and MoE metrics after the meter resets the step
+        # metrics and before Wandb reads them.
         self._callbacks = [
             self.environ_meter_callback,
             self.tqdm_callback,
@@ -708,10 +721,16 @@ class BaseTrainer(Stateful, ABC):
         """Reshard model after backward pass."""
         args: VeOmniArguments = self.args
         model = self.model if model is None else model
+        # `fsdp_mode == "fsdp2"` does not imply this model was actually wrapped:
+        # `fsdp_config.extra_parallel_only` returns through
+        # `_finish_without_fsdp_wrap`, and the method below lives on the wrap. Ask
+        # the model, not the config, or generic text/VLM training raises
+        # `AttributeError` before the first forward.
         if (
-            args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+            args.model.accelerator.fsdp_config.fsdp_mode in ("fsdp2", "hyper_fsdp2")
             and not args.model.accelerator.fsdp_config.reshard_after_backward
             and num_micro_steps > 1
+            and hasattr(model, "set_reshard_after_backward")
         ):
             if micro_step == 0:
                 model.set_reshard_after_backward(False)
@@ -722,9 +741,10 @@ class BaseTrainer(Stateful, ABC):
         args: VeOmniArguments = self.args
         model = self.model if model is None else model
         if (
-            args.model.accelerator.fsdp_config.fsdp_mode == "fsdp2"
+            args.model.accelerator.fsdp_config.fsdp_mode in ("fsdp2", "hyper_fsdp2")
             and args.model.accelerator.dp_replicate_size > 1
             and num_micro_steps > 1
+            and hasattr(model, "set_requires_all_reduce")
         ):
             if micro_step == 0:
                 model.set_requires_all_reduce(False)

@@ -1,4 +1,6 @@
-from ....loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+"""Register the local LTX 2.3 transformer config and model."""
+
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
 @MODEL_CONFIG_REGISTRY.register("LTXVideoTransformerModel")
@@ -9,10 +11,8 @@ def register_ltx_transformer_config():
 
 
 @MODELING_REGISTRY.register("LTXVideoTransformerModel")
-def register_ltx_transformer_modeling(architecture: str):
-    from .modeling_ltx2_3_transformer import LTXVideoTransformerModel as VeOmniLTXVideoTransformerModel
-    from .modeling_ltx2_3_transformer import apply_veomni_ltx_transformer_patch
+def register_ltx_transformer_modeling(_architecture: str | None = None):
+    from .modeling_ltx2_3_transformer import LTXVideoTransformerModel, apply_veomni_ltx_transformer_patch
 
     apply_veomni_ltx_transformer_patch()
-
-    return VeOmniLTXVideoTransformerModel
+    return LTXVideoTransformerModel

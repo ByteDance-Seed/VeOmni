@@ -2,7 +2,7 @@
 
 import torch
 
-from ...utils.device import get_torch_device
+from ...utils.device import get_torch_device, is_nvidia_cuda_device
 
 
 def _integers(value, name):
@@ -45,7 +45,8 @@ class ChunkPermutation:
             raise ValueError("sorted_idxs must be a permutation of every chunk.")
         self.rows = sum(sizes)
         self.device = torch.device(device)
-        if self.device.type not in ("cpu", "cuda"):
+        accelerated = is_nvidia_cuda_device(self.device)
+        if self.device.type != "cpu" and not accelerated:
             raise ValueError("ChunkPermutation supports CUDA and its CPU reference only.")
 
         starts = []
@@ -64,8 +65,8 @@ class ChunkPermutation:
         self.device = self._direct.device
         if not self.rows:
             return
-        if self.device.type == "cuda":
-            from ...ops.kernels.moe.ep_permutation import fill_chunk_row_maps
+        if accelerated:
+            from ...ops.kernels.moe_experts.shared.ep_permutation import fill_chunk_row_maps
 
             with get_torch_device().device(self.device):
                 metadata = torch.tensor(

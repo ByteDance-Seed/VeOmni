@@ -1,4 +1,6 @@
-from ....loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+"""Register the local Wan T2V transformer config and model."""
+
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
 @MODEL_CONFIG_REGISTRY.register("WanTransformer3DModel")
@@ -9,10 +11,8 @@ def register_wan_diffusers_transformer_config():
 
 
 @MODELING_REGISTRY.register("WanTransformer3DModel")
-def register_wan_diffusers_transformer_modeling(architecture: str):
-    from .modeling_wan_transformer import WanTransformer3DModel as VeOmniWanTransformer3DModel
-    from .modeling_wan_transformer import apply_veomni_wan_transformer_patch
+def register_wan_diffusers_transformer_modeling(_architecture: str):
+    from .modeling_wan_transformer import WanTransformer3DModel, apply_veomni_wan_transformer_patch
 
     apply_veomni_wan_transformer_patch()
-
-    return VeOmniWanTransformer3DModel
+    return WanTransformer3DModel

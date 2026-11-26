@@ -1,0 +1,20 @@
+qwen3_text_encoder:
+  model_path: qwen3_text_encoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+qwen3_moe_llm:
+  model_path: qwen3_moe_llm
+  accelerator:
+    fsdp_config:
+      fsdp_mode: fsdp2
+    # Write all three position-paired `extra_parallel_*` lists together so this
+    # module cleanly overrides any global `extra_parallel_*` entries (explicit
+    # `"ep"` list entries take precedence over scalar `ep_size`, and a partial
+    # override would desynchronise list lengths if the global accelerator adds
+    # another dim). See `train/modules_train.yaml`.
+    extra_parallel_names: ["ep"]
+    extra_parallel_sizes: [4]
+    extra_parallel_placement_innermost: [false]

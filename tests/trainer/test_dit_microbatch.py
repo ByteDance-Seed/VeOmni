@@ -14,8 +14,11 @@ from transformers.modeling_outputs import ModelOutput
 
 import veomni.data.data_loader as loader_module
 import veomni.models.model_runtime as runtime_module
+import veomni.trainer.base as base_module
 import veomni.trainer.dit_trainer as dit_module
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.dataset import MappingDataset
+from veomni.trainer.base import BaseTrainer
 from veomni.trainer.dit_trainer import (
     DiTDataArguments,
     DiTDataCollator,
@@ -28,7 +31,10 @@ from veomni.trainer.dit_trainer import (
 )
 
 
-def _trainer(monkeypatch, task, micro_batch_size, dp_size=1, dp_rank=0):
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def _trainer(monkeypatch, task, micro_batch_size, dp_size=1, dp_rank=0, shuffle=True):
     monkeypatch.setenv("WORLD_SIZE", str(dp_size))
     state = SimpleNamespace(dp_size=dp_size, dp_rank=dp_rank, sp_size=1, sp_enabled=False)
     monkeypatch.setattr("veomni.distributed.parallel_state.get_parallel_state", lambda: state)
@@ -48,6 +54,7 @@ def _trainer(monkeypatch, task, micro_batch_size, dp_size=1, dp_rank=0):
     args.data.dataloader.num_workers = 0
     args.data.dataloader.prefetch_factor = None
     args.data.dataloader.pin_memory = False
+    args.data.dataloader.shuffle = shuffle
     args._train_steps = 1
     trainer = DiTTrainer.__new__(DiTTrainer)
     trainer.base = SimpleNamespace(args=args, _setup=Mock(return_value=torch.device("cpu")), LOG_SAMPLE=False)
@@ -77,6 +84,46 @@ def test_setup_and_loader_honor_fixed_microbatches(monkeypatch, task, micro_batc
     assert len(batches) == 4 // micro_batch_size
     assert all(len(batch["value"]) == micro_batch_size for batch in batches)
     assert all(isinstance(batch["value"], list) for batch in batches)
+
+
+@pytest.mark.parametrize("task", ["offline_training", "online_training", "offline_embedding"])
+@pytest.mark.parametrize("shuffle", [True, False])
+def test_dataloader_shuffle_reaches_sampler(monkeypatch, task, shuffle):
+    trainer = _trainer(monkeypatch, task, micro_batch_size=1, shuffle=shuffle)
+    expected = shuffle and task != "offline_embedding"
+    assert trainer.base.args.data.dataloader.shuffle is expected
+    _load(trainer, [{"value": torch.ones(1)} for _ in range(4)])
+    assert trainer.base.train_dataloader.sampler.shuffle is expected
+
+
+@pytest.mark.parametrize("task", ["offline_training", "online_training", "offline_embedding"])
+def test_offline_embedding_keeps_the_last_batch(monkeypatch, task):
+    trainer = _trainer(monkeypatch, task, micro_batch_size=1)
+    expected = task != "offline_embedding"
+    assert trainer.base.args.data.dataloader.drop_last is expected
+    assert not hasattr(trainer.base.args.data, "drop_last")
+    _load(trainer, [{"value": torch.ones(1)} for _ in range(4)])
+    assert trainer.base.train_dataloader.drop_last is expected
+
+
+@pytest.mark.parametrize("shuffle", [True, False])
+def test_dataloader_shuffle_reaches_base_trainer_builders(monkeypatch, shuffle):
+    trainer = _trainer(monkeypatch, "offline_training", micro_batch_size=1, shuffle=shuffle)
+    built = {}
+
+    def build_dataset(**kwargs):
+        built.update(kwargs)
+        return list(range(4))
+
+    monkeypatch.setattr(base_module, "build_dataset", build_dataset)
+    base = SimpleNamespace(args=trainer.base.args, data_transform=None)
+    BaseTrainer._build_dataset(base)
+    assert built["shuffle"] is shuffle
+
+    base.train_dataset = [({"value": torch.ones(1)},) for _ in range(4)]
+    base.collate_fn = DiTDataCollator()
+    BaseTrainer._build_dataloader(base)
+    assert base.train_dataloader.sampler.shuffle is shuffle
 
 
 class _Condition:
@@ -216,3 +263,105 @@ def test_collator_aligns_missing_keys_with_none():
     assert dict(single) == {"a": [1], "b": [2]}
     mixed = DiTDataCollator()([{"a": 1, "x": "fl2va"}, {"a": 2, "y": "ref2va"}, {"a": 3}])
     assert dict(mixed) == {"a": [1, 2, 3], "x": ["fl2va", None, None], "y": [None, "ref2va", None]}
+
+
+@pytest.mark.parametrize("offload", [False, True])
+def test_fused_dit_branch_reloads_weights_and_optimizer_under_its_model_state(monkeypatch, offload):
+    from contextlib import contextmanager
+
+    import veomni.models.checkpoint.weights as weights_module
+    from tests.train_scripts import train_dit_test
+
+    runtime = train_dit_test.TestDiTModelRuntime.__new__(train_dit_test.TestDiTModelRuntime)
+    runtime.args = SimpleNamespace(
+        accelerator=SimpleNamespace(fsdp_config=SimpleNamespace(offload=offload)), model_path="initial"
+    )
+    runtime.train_args = SimpleNamespace(seed=42, enable_full_determinism=False)
+    runtime.model_name = "second-model"
+    runtime.model = nn.Linear(2, 2)
+    state = object()
+    active_state = []
+    monkeypatch.setattr(
+        runtime_module, "get_parallel_state_by_name", lambda name: state if name == runtime.model_name else None
+    )
+
+    @contextmanager
+    def model_scope(current):
+        assert current is state
+        active_state.append(current)
+        try:
+            yield
+        finally:
+            active_state.pop()
+
+    loaded = []
+
+    def load(model, path, **kwargs):
+        assert active_state == [state]
+        assert model is runtime.model and path == "initial"
+        loaded.append(kwargs)
+
+    def optimizer():
+        assert active_state == [state]
+        assert len(loaded) == 1
+
+    monkeypatch.setattr(train_dit_test, "use_parallel_state", model_scope)
+    monkeypatch.setattr(weights_module, "load_model_weights", load)
+    monkeypatch.setattr(runtime, "_build_optimizer", optimizer)
+    monkeypatch.setattr("veomni.utils.helper.set_seed", lambda *args: None)
+    model_device = "test_accelerator"
+    monkeypatch.setattr("veomni.utils.device.get_device_type", lambda: model_device)
+    runtime.reset_for_dataset_branch()
+    assert not active_state
+    assert loaded[0]["init_device"] == ("cpu" if offload else model_device)
+    assert loaded[0]["dtensor_to_cpu"] is offload
+
+
+def test_fused_dit_branch_resizes_schedule_and_runs_full_training_lifecycle(monkeypatch):
+    from tests.train_scripts import train_dit_test
+    from veomni.trainer.callbacks import TrainerState
+
+    trainer = train_dit_test.TestDiTTrainer.__new__(train_dit_test.TestDiTTrainer)
+    train_args = SimpleNamespace(
+        checkpoint=SimpleNamespace(output_dir="first"),
+        num_train_epochs=1,
+        local_rank=0,
+    )
+    data_args = SimpleNamespace(train_path="first", dataloader=SimpleNamespace(use_background_prefetcher=False))
+    args = SimpleNamespace(train=train_args, data=data_args, train_steps=1)
+    model = SimpleNamespace(parallel_state=object(), reset_for_dataset_branch=Mock())
+    events = []
+    trainer.base = SimpleNamespace(
+        args=args,
+        model=model,
+        state=TrainerState(global_step=9),
+        start_epoch=1,
+        start_step=1,
+        _log_callback=SimpleNamespace(log_dict={"loss": [1.0]}),
+        train_dataloader=None,
+        destroy_distributed=lambda: events.append("destroy"),
+    )
+    trainer.training_task = "offline_training"
+    monkeypatch.setattr(train_dit_test, "use_parallel_state", lambda state: nullcontext())
+
+    def dataset():
+        assert args.data.train_path == "second"
+        args.train_steps = 3
+
+    schedule = []
+    trainer._build_dataset = dataset
+    trainer._build_dataloader = lambda: None
+    trainer.base._build_lr_scheduler = lambda: schedule.append(args.train_steps)
+    trainer.on_train_begin = lambda: events.append("begin")
+    trainer.on_epoch_begin = lambda: None
+    trainer.train_step = lambda batch: events.append("step")
+    trainer.on_epoch_end = lambda: None
+    trainer.on_train_end = lambda: events.append("end")
+    monkeypatch.setattr(dit_module, "synchronize", lambda: events.append("sync"))
+    monkeypatch.setattr(dit_module.helper, "print_device_mem_info", lambda *args: None)
+    trainer._run_extra_train_path("second")
+    assert schedule == [3]
+    assert events == ["begin", "step", "step", "step", "end", "sync", "destroy"]
+    assert trainer.base.state.global_step == 0
+    assert trainer.base._log_callback.log_dict == {}
+    assert args.train.checkpoint.output_dir == "first_padding"

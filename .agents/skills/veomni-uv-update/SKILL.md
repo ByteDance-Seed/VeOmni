@@ -13,7 +13,8 @@ Read `.agents/knowledge/uv.md` for the full dependency architecture. The key thi
   matrix, so a version bump has to be applied file by file
 - torch uses **direct wheel URLs** (not just version bumps)
 - three mutually exclusive hardware extras (`gpu` / `npu` / `npu_aarch64`),
-  each a complete superset, plus optional `--extra magi` (combine with `gpu`)
+  each a complete superset, plus optional `--extra magi` and `--extra float8`
+  (combine with `gpu`)
 
 `pyproject.toml` is the source of truth for every version claim below. Read the
 relevant block before editing — this file describes *where* things live, not
@@ -36,10 +37,7 @@ which versions are current.
 
    Update every hit, and keep them on the same version — a per-image drift is
    a debugging trap, not a feature.
-2. `.github/workflows/check_patchgen.yml` -> `astral-sh/setup-uv` `version:`.
-   This job runs outside the container image, so an unpinned uv would float
-   above the range ceiling.
-3. `pyproject.toml` -> `required-version` — only widen/move the range when the
+2. `pyproject.toml` -> `required-version` — only widen/move the range when the
    new pin falls outside it.
 
 Then regenerate the lockfile:
@@ -101,7 +99,7 @@ This is the most complex update. torch versions are pinned in **multiple places*
      `extra-build-variables` entry where the build needs `MAX_JOBS` /
      compute-capability flags (all but `flash-attn-cute` today).
      A torch ABI bump may require bumping the git revs. These belong to the
-     optional `magi` extra and require SM90+; use `uv sync --extra gpu --extra magi`
+     optional `magi` extra and require SM100+; use `uv sync --extra gpu --extra magi`
      to install them. GPU CI runs `uv sync --extra gpu` without `magi`, so
      the SM89 L20 runners omit these source builds.
 4. Update `torchcodec` version if needed (compatibility note in pyproject.toml)
@@ -139,12 +137,11 @@ uv lock
 uv sync --extra gpu --dev
 ```
 
-3. Check for API breakage and adjust `veomni/` accordingly. Forward-looking
-   guards may be expressed with
+3. Check the local model implementations against the new Transformers APIs.
+   Forward-looking guards may be expressed with
    `is_transformers_version_greater_or_equal_to()` from
    `veomni/utils/import_utils.py`.
 4. Run tests: `pytest tests/models/ tests/e2e/`
-5. Regenerate model patches: `make patchgen` (with the target transformers installed)
 
 ## Scenario 5: Regenerate Lockfile Only
 
@@ -168,4 +165,3 @@ If `uv lock` fails due to version conflicts, check:
 - **Committing only pyproject.toml**: always commit `uv.lock` together. Docker builds use `--locked` which requires the lockfile to match.
 - **override-dependencies markers**: the `extra == 'gpu'` markers in overrides are critical. Removing them causes uv to download wrong torch variants from PyPI.
 - **Assuming build isolation is disabled**: there is no `no-build-isolation-package` block any more. Source builds instead get their toolchain from `[tool.uv.extra-build-dependencies]` (uv venvs are not seeded), and `torch` is passed with `match-runtime = true` where the extension links against it. If a source build fails on a missing `setuptools`/`torch`, add it there rather than reaching for `--no-build-isolation`.
-- **Overlay reinstall**: an exact `uv sync` removes the MagiAttention SM90 CUTLASS overlay installed by `scripts/kernel/install_magi_sm90.sh`. Reinstall it afterwards (see constraints, "Environment Reproducibility").

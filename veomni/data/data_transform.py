@@ -30,6 +30,22 @@ if TYPE_CHECKING:
 DATA_TRANSFORM_REGISTRY = Registry("DataTransform")
 
 
+def _replace_gemma3_image_tokens(text: str, processor: "ProcessorMixin", num_crops: torch.Tensor, image_count: int):
+    """Expand each original Gemma 3 image placeholder exactly once."""
+    text_parts = text.split(processor.boi_token)
+    if len(text_parts) != image_count + 1:
+        raise ValueError(
+            f"Gemma 3 chat template produced {len(text_parts) - 1} image placeholders for {image_count} images."
+        )
+
+    replacements = [
+        processor.replace_image_token({"num_crops": num_crops}, image_idx) for image_idx in range(image_count)
+    ]
+    return text_parts[0] + "".join(
+        replacement + suffix for replacement, suffix in zip(replacements, text_parts[1:], strict=True)
+    )
+
+
 def _get_exact_token_id(tokenizer: "PreTrainedTokenizer", token: str, fallback_token: str | None = None) -> int:
     candidates = (token,) if fallback_token is None else (token, fallback_token)
     unk_token_id = getattr(tokenizer, "unk_token_id", None)
@@ -412,6 +428,93 @@ def process_sample_qwen_vl(
     )
 
 
+@DATA_TRANSFORM_REGISTRY.register("gemma3")
+def process_sample_gemma3(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    position_id_func: "Callable",
+    max_seq_len: int = 8192,
+    **kwargs,
+):
+    """Build a Gemma 3 multimodal SFT sample with assistant-only labels."""
+    from .multimodal import conv_preprocess
+    from .multimodal.image_utils import fetch_images
+
+    source = kwargs.get("source_name") or sample.get("source") or sample.get("source_name")
+    conversations = sample.get("conversations")
+    if conversations is None:
+        conversations = sample
+    conversations = conv_preprocess(source, conversations, **kwargs)
+
+    images = sample.get("images")
+    if images is None:
+        images = []
+    images = fetch_images(images, **kwargs)
+    if images:
+        image_inputs = processor.image_processor(images=images, return_tensors="pt", do_pan_and_scan=False)
+        num_crops = image_inputs.pop("num_crops", torch.zeros(len(images), dtype=torch.long))
+    else:
+        image_inputs = {}
+        num_crops = torch.empty(0, dtype=torch.long)
+
+    messages = []
+    for conversation in conversations:
+        role = conversation[0]
+        content = []
+        for value_type, value in conversation[1:]:
+            if value_type == "image":
+                content.append({"type": "image"})
+            elif value_type == "text":
+                content.append({"type": "text", "text": value})
+            else:
+                raise ValueError(f"Unsupported Gemma 3 content type: {value_type}")
+        messages.append({"role": role, "content": content})
+
+    def tokenize_prefix(end: int) -> torch.Tensor:
+        prefix_messages = messages[:end]
+        text = processor.apply_chat_template(prefix_messages, tokenize=False, add_generation_prompt=False)
+        image_count = sum(item["type"] == "image" for msg in prefix_messages for item in msg["content"])
+        text = _replace_gemma3_image_tokens(text, processor, num_crops, image_count)
+        return processor.tokenizer(text, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
+
+    input_ids = tokenize_prefix(len(messages))
+    labels = torch.full_like(input_ids, IGNORE_INDEX)
+    previous_length = 0
+    for end, message in enumerate(messages, start=1):
+        current_length = tokenize_prefix(end).numel()
+        if message["role"] == "assistant":
+            labels[previous_length:current_length] = input_ids[previous_length:current_length]
+        previous_length = current_length
+
+    if input_ids.numel() > max_seq_len:
+        input_ids = input_ids[:max_seq_len]
+        labels = labels[:max_seq_len]
+
+    image_token_id = processor.tokenizer.image_token_id
+    expected_image_tokens = len(images) * processor.image_seq_length
+    actual_image_tokens = int((input_ids == image_token_id).sum())
+    if actual_image_tokens != expected_image_tokens:
+        raise ValueError(
+            "Gemma 3 max_seq_len truncated an image placeholder: "
+            f"expected {expected_image_tokens} image tokens, found {actual_image_tokens}."
+        )
+
+    attention_mask = torch.ones_like(input_ids)
+    position_ids = position_id_func(input_ids=input_ids.unsqueeze(0), attention_mask=attention_mask.unsqueeze(0))[
+        "position_ids"
+    ].squeeze(0)
+
+    model_inputs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "token_type_ids": (input_ids == image_token_id).long(),
+        "labels": labels,
+    }
+    model_inputs.update(image_inputs)
+    return [model_inputs]
+
+
 @DATA_TRANSFORM_REGISTRY.register("qwen2_5_omni")
 @DATA_TRANSFORM_REGISTRY.register("qwen3_omni_moe")
 def process_sample_qwen_omni(
@@ -560,4 +663,92 @@ def process_sample_qwen_omni(
             user_i += 1
         labels[assis_i + 2 : user_start_index[user_i] - 1] = input_ids[assis_i + 2 : user_start_index[user_i] - 1]
     model_inputs["labels"] = labels
+    return [model_inputs]
+
+
+@DATA_TRANSFORM_REGISTRY.register("kimi_k3")
+def process_sample_kimi_k3(
+    sample: Dict[str, Any],
+    processor: "ProcessorMixin",
+    chat_template: "ChatTemplate",
+    position_id_func: "Callable",
+    max_seq_len: int = 8192,
+    **kwargs,
+):
+    """Kimi K3 multimodal processing (single image + caption).
+
+    One ``<|media_pad|>`` per merged vision token (the pre-expanded form):
+    the image is preprocessed first so ``grid_thws`` fixes the merged patch
+    count, and that many ``<|media_pad|>`` tokens are materialized inline in
+    the text. ``tpool_patch_merger`` in the modeling pools (averages) the
+    temporal axis instead of concatenating it, so an image contributes
+    ``(h // mh) * (w // mw)`` merged tokens regardless of ``t``.
+    The merge inside the modeling is then length-preserving
+    (masked_scatter of the projected features onto the pad slots), which
+    keeps the collator's packed position_ids / cu_seq_lens and the SP label
+    pre-shift valid. Labels supervise only the caption tail (everything up
+    to and including ``<|media_end|>`` is masked, which also covers the
+    expanded media span). Position ids come from the collator (per-sample
+    arange; the modeling itself is NoPE / divided-fixed), so
+    ``position_id_func`` is accepted but unused.
+    """
+    from .multimodal.image_utils import load_image_from_path
+
+    caption = str(sample.get("caption", "")).strip()
+    if not caption:
+        return []
+
+    image = load_image_from_path(str(sample["image"])).convert("RGB")
+    image_processor = getattr(processor, "image_processor", processor)
+    out = image_processor.preprocess([{"type": "image", "image": image}], return_tensors="pt")
+    grid_thws = out["grid_thws"]
+
+    merge_size = getattr(image_processor, "merge_size", None) or (2, 2)
+    mh, mw = int(merge_size[0]), int(merge_size[1])
+    # The vision tower's tpool_patch_merger AVERAGES over the temporal axis
+    # (t is pooled, not concatenated), so an image contributes
+    # (h // mh) * (w // mw) merged tokens regardless of t -- the prod-based
+    # count would multiply in t and overshoot the pad slots for multi-frame
+    # grids. (h % mh != 0 already raises inside tpool_patch_merger, so no
+    # extra guard is needed here.)
+    num_pads = int(((grid_thws[:, 1] // mh) * (grid_thws[:, 2] // mw)).sum().item())
+
+    width = int(sample["width"])
+    height = int(sample["height"])
+    text = f"<|media_begin|>image {width}x{height}<|media_content|>{'<|media_pad|>' * num_pads}<|media_end|> {caption}"
+
+    tokenizer = getattr(processor, "tokenizer", None) or getattr(chat_template, "tokenizer", None)
+    if tokenizer is None:
+        raise ValueError(
+            "kimi_k3 transform needs a tokenizer (processor.tokenizer or chat_template.tokenizer); "
+            "check model.tokenizer_path points at the kimi_k3_hf repository."
+        )
+    media_end_id = tokenizer.encode("<|media_end|>")[0]
+    input_ids = tokenizer.encode(text) + [tokenizer.eos_token_id]
+    media_end_pos = input_ids.index(media_end_id)
+    labels = [-100] * (media_end_pos + 1) + input_ids[media_end_pos + 1 :]
+
+    if len(input_ids) > max_seq_len:
+        # Truncate the caption tail only: a cut into the media span would
+        # desynchronize input_ids from the published grid_thws (the merge
+        # scatters exactly (h // mh) * (w // mw) features per image onto the
+        # pad slots).
+        if media_end_pos + 1 >= max_seq_len:
+            raise ValueError(
+                f"Kimi K3 max_seq_len ({max_seq_len}) truncated the media span "
+                f"(the {num_pads} media_pad tokens end at position {media_end_pos}); "
+                "the sample needs a larger max_seq_len."
+            )
+        input_ids = input_ids[:max_seq_len]
+        labels = labels[:max_seq_len]
+
+    model_inputs = {
+        # 1-D per-sample tensors: MainCollator packs along dim=-1 then unsqueezes
+        # dim 0, so 2-D per-sample tensors would produce a 3-D packed batch.
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
+        "labels": torch.tensor(labels, dtype=torch.long),
+        "pixel_values": out["pixel_values"],
+        "grid_thws": grid_thws,
+    }
     return [model_inputs]

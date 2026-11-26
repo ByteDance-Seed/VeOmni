@@ -1,16 +1,23 @@
 """Registry for monolithic HF checkpoint → SeedOmni split checkpoints.
 
 Each family registers a converter under its upstream HuggingFace
-``model_type``. The converter **returns** split modules and, when it has them,
+``model_type`` (or only an
+:class:`~veomni.models.seed_omni.utils.hf_layout.OmniHFLayout`, which then
+does the split). The converter **returns** split modules and, when it has them,
 graphs; :func:`convert_checkpoint` writes the split directory (CLI:
-``scripts/seed_omni/convert_model.py``). Graphs are optional at convert time —
+``scripts/seed_omni/convert_model.py``). A converter whose signature takes
+``output_dir`` streams its module subfolders there itself and returns
+``module_names`` instead of ``modules``, for checkpoints too large to build a
+model from. Graphs are optional at convert time —
 train / generate load sidecars from the checkpoint (or accept an override) and
 error only if they still have nothing to run.
 """
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from ....utils.registry import Registry  # VeOmni shared name→factory registry; not seed_omni-local.
@@ -25,11 +32,103 @@ OMNI_CONVERT_REGISTRY = Registry("OmniConvert")
 
 ConvertFn = Callable[..., dict[str, Any]]
 
+GraphFiles = str | Mapping[str, str]
+
+
+def attach_module_assets(
+    module: PretrainedOmniModule,
+    *,
+    tokenizer: Any = None,
+    processor: Any = None,
+    image_processor: Any = None,
+    video_processor: Any = None,
+) -> PretrainedOmniModule:
+    """Hang HF assets on ``module`` so its ``save_pretrained`` writes them into the module subfolder.
+
+    These are the attributes a module's preprocessor binds at load time, so a
+    converted module saves exactly what the loaded one reads back.
+    """
+    for attr, asset in (
+        ("_tokenizer", tokenizer),
+        ("_processor", processor),
+        ("_image_processor", image_processor),
+        ("_video_processor", video_processor),
+    ):
+        if asset is not None:
+            setattr(module, attr, asset)
+    return module
+
+
+def _repo_config_dir(relative: str | Path) -> Path:
+    """Walk up from this file to ``<repo>/<relative>``."""
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / relative
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(
+        f"Could not find {relative} above {__file__}. "
+        "Pass training_graph= / generation_graph= explicitly, or run convert from a VeOmni checkout."
+    )
+
+
+def _read_graph_files(config_dir: Path, files: GraphFiles, value_type: type) -> dict[str, Any]:
+    """Read one scenario-map file, or ``{scenario: file}`` where each file holds a single graph."""
+    from ..configuration_omni import OmniConfig
+
+    if isinstance(files, str):
+        return OmniConfig._read_graph_file(str(config_dir / files), value_type)
+    graphs: dict[str, Any] = {}
+    for scenario, file in files.items():
+        payload = OmniConfig._read_graph_file(str(config_dir / file), value_type)
+        if len(payload) != 1:
+            raise ValueError(f"{config_dir / file} holds {len(payload)} scenarios; expected one for {scenario!r}.")
+        graphs[scenario] = next(iter(payload.values()))
+    return graphs
+
+
+def load_family_graphs(
+    config_dir: str | Path,
+    *,
+    training: GraphFiles,
+    generation: GraphFiles,
+    training_graph: str | Path | None = None,
+    generation_graph: str | Path | None = None,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
+    """Read a family's default training DAGs and generation FSMs from ``configs/``.
+
+    ``config_dir`` is repo-relative (e.g. ``configs/seed_omni/Janus/janus``);
+    ``training`` / ``generation`` name files under it. ``training_graph`` /
+    ``generation_graph`` are caller-supplied YAML paths that replace the
+    defaults, so a converter still runs outside a checkout when both are given.
+    """
+    from ..configuration_omni import OmniConfig
+
+    root: Path | None = None
+
+    def configs() -> Path:
+        nonlocal root
+        if root is None:
+            root = _repo_config_dir(config_dir)
+        return root
+
+    training_graphs = (
+        OmniConfig._read_graph_file(str(training_graph), list)
+        if training_graph is not None
+        else _read_graph_files(configs(), training, list)
+    )
+    generation_graphs = (
+        OmniConfig._read_graph_file(str(generation_graph), dict)
+        if generation_graph is not None
+        else _read_graph_files(configs(), generation, dict)
+    )
+    return training_graphs, generation_graphs
+
 
 def _save_converted_omni(
     output_dir: str,
     *,
-    modules: Mapping[str, PretrainedOmniModule],
+    modules: Mapping[str, PretrainedOmniModule] | None = None,
+    module_names: list[str] | None = None,
     training_graphs: dict[str, list[dict[str, Any]]] | None = None,
     generation_graphs: dict[str, dict[str, Any]] | None = None,
     train_type: str | None = None,
@@ -39,19 +138,27 @@ def _save_converted_omni(
     """Write a split omni checkpoint: module subfolders, plus graph sidecars when given.
 
     A family can split modules before its DAGs/FSMs exist. Graph endpoints are
-    checked when the checkpoint is loaded, not here.
+    checked when the checkpoint is loaded, not here. ``module_names`` instead of
+    ``modules`` means a streaming converter already wrote those subfolders, so
+    only the root config and graph sidecars are written here.
     """
     from ..configuration_omni import OmniConfig
     from ..modeling_omni import OmniModel
 
+    if (modules is None) == (module_names is None):
+        raise ValueError("A converter returns exactly one of `modules` and `module_names`.")
     config = OmniConfig(
-        _module_entries={name: {"model_path": name} for name in modules},
+        _module_entries={name: {"model_path": name} for name in (modules if modules is not None else module_names)},
         training_graphs=dict(training_graphs or {}),
         generation_graphs=dict(generation_graphs or {}),
         train_type=train_type,
         infer_type=infer_type,
         generation_kwargs=generation_kwargs,
     )
+    if modules is None:
+        config.load_checkpoint_sidecars(output_dir)
+        config.save_pretrained(output_dir)
+        return
     OmniModel(config, modules).save_pretrained(output_dir)
 
 
@@ -74,7 +181,7 @@ def convert_checkpoint(
         kwargs.setdefault("training_graph", training_graph)
     if generation_graph is not None:
         kwargs.setdefault("generation_graph", generation_graph)
-    converted = _run_converter(model_path, **kwargs)
+    converted = _run_converter(model_path, output_dir, **kwargs)
     _apply_graph_files(converted, training_graph=training_graph, generation_graph=generation_graph)
     _save_converted_omni(output_dir, **converted)
 
@@ -103,21 +210,32 @@ def _apply_graph_files(
             converted["infer_type"] = next(iter(graphs)) if graphs else None
 
 
-def _run_converter(model_path: str, **kwargs) -> dict[str, Any]:
+def _run_converter(model_path: str, output_dir: str, **kwargs) -> dict[str, Any]:
     """Dispatch to the registered converter; returns kwargs for :func:`_save_converted_omni`.
+
+    A family with no converter of its own but a registered
+    :class:`~veomni.models.seed_omni.utils.hf_layout.OmniHFLayout` splits
+    through that layout, the same key map an HF ``model_path`` loads with.
 
     Lazy-imports ``modules`` to break the convert_registry ↔ family cycle:
     every family's ``convert_model`` (imported by ``modules/__init__``) imports
     this module.
     """
     from ..modules import read_hf_model_type
+    from .hf_layout import convert_with_hf_layout, has_hf_layout
 
     model_type = read_hf_model_type(model_path)
+    if model_type not in OMNI_CONVERT_REGISTRY.valid_keys() and has_hf_layout(model_type):
+        return convert_with_hf_layout(model_path, **kwargs)
     converter: ConvertFn = OMNI_CONVERT_REGISTRY[model_type]()
+    if "output_dir" in inspect.signature(converter).parameters:
+        return converter(model_path, output_dir=output_dir, **kwargs)
     return converter(model_path, **kwargs)
 
 
 __all__ = [
     "OMNI_CONVERT_REGISTRY",
+    "attach_module_assets",
     "convert_checkpoint",
+    "load_family_graphs",
 ]

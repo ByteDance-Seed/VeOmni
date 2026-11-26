@@ -11,22 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ....utils.device import IS_NPU_AVAILABLE
-from ...loader import MODELING_REGISTRY
+
+"""Qwen3-VL modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models.registry import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("qwen3_vl")
 def register_qwen3_vl_modeling(architecture: str):
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_qwen3_vl_npu import (
-            Qwen3VLForConditionalGeneration,
-            Qwen3VLModel,
-        )
-    else:
-        from .generated.patched_modeling_qwen3_vl_gpu import (
-            Qwen3VLForConditionalGeneration,
-            Qwen3VLModel,
-        )
+    from .modeling_qwen3_vl import (
+        Qwen3VLForConditionalGeneration,
+        Qwen3VLModel,
+    )
 
     if "ForConditionalGeneration" in architecture:
         return Qwen3VLForConditionalGeneration

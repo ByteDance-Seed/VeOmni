@@ -15,12 +15,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
-from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
+from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
+
 from ..minimax_h3_core.batch_packing import pack_samples
-from ..minimax_h3_core.minimax_h3_dit import MiniMaxH3Attention, MiniMaxH3DiT, unpack_audio, unpatchify_video
+from ..minimax_h3_core.core import bind_minimax_attention, is_flash_attn_impl
+from ..minimax_h3_core.minimax_h3_dit import (
+    MiniMaxH3Attention,
+    MiniMaxH3DiT,
+    MiniMaxH3FP32Linear,
+    unpack_audio,
+    unpatchify_video,
+)
+from ..minimax_h3_core.training_objectives import cfg_calibrated_mse
 from .configuration_minimax_h3_transformer import MiniMaxH3DiTModelConfig
 
 
@@ -33,24 +41,61 @@ class MiniMaxH3DiTOutput(ModelOutput):
 
 
 _PACKED_FLASH_BACKENDS = (
-    "veomni_flash_attention_2_with_sp",
-    "veomni_flash_attention_2_hub_with_sp",
-    "veomni_flash_attention_3_with_sp",
-    "veomni_flash_attention_3_hub_with_sp",
+    "veomni_flash_attention_2",
+    "veomni_flash_attention_2_hub",
+    "veomni_flash_attention_3",
+    "veomni_flash_attention_3_hub",
+    "flash_attention_2",
+    "flash_attention_2_hub",
+    "flash_attention_3",
+    "flash_attention_3_hub",
 )
+
+
+def _veomni_attn_impl(attn_implementation: str | None) -> str | None:
+    if attn_implementation in (None, "eager", "sdpa", "veomni_sdpa"):
+        return None
+    if attn_implementation.startswith("flash_attention_"):
+        return f"veomni_{attn_implementation}"
+    if attn_implementation.startswith("veomni_flash_attention_"):
+        return attn_implementation
+    return None
 
 
 class MiniMaxH3DiTModel(PreTrainedModel):
     config_class = MiniMaxH3DiTModelConfig
     supports_gradient_checkpointing = True
     _supports_sdpa = True
-    _no_split_modules = ["MiniMaxH3DiTBlock"]
-
+    # MiniMaxH3DiT is listed so FSDP2 scans its root-level FP32 projections.
+    _no_split_modules = ["MiniMaxH3DiTBlock", "MiniMaxH3DiT"]
+    _activation_offload_target_classes = ["MiniMaxH3DiTBlock"]
     _checkpoint_conversion_mapping = {"^": "dit."}
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Report the backbone dtype to HF, independently of the FP32 projections."""
+        return next(self.dit.condition_proj.parameters()).dtype
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, **kwargs):
+        # Attention validates and binds its backend on the first forward.
+        return attn_implementation
+
+    def get_ignore_modules_in_mixed_precision(self):
+        """Shard the official FP32 projections without FSDP parameter casting.
+
+        FSDP2 calls this hook, so it also rejects LoRA on those projections.
+        """
+        from .....lora.layers import LoraLinear
+
+        for module in self.dit.modules():
+            if isinstance(module, LoraLinear) and isinstance(module.base_layer, MiniMaxH3FP32Linear):
+                raise NotImplementedError("H3 does not support LoRA on its FP32 projections.")
+        return (MiniMaxH3FP32Linear,)
 
     def __init__(self, config: MiniMaxH3DiTModelConfig, **kwargs):
         super().__init__(config)
-        self.gradient_checkpointing = False  # enable HF-compatible GC attr
+        # HF's marker; each DiT block owns its checkpoint boundary.
+        self.gradient_checkpointing = False
         self.dit = MiniMaxH3DiT(
             num_layers=config.num_layers,
             token_refiner_num_layers=config.token_refiner_num_layers,
@@ -71,42 +116,71 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             norm_eps=config.norm_eps,
             qk_norm_eps=config.qk_norm_eps,
             final_norm_eps=config.final_norm_eps,
+            audio_enabled=config.audio_enabled,
+            num_pdd_heads=config.num_pdd_heads,
+            config=config,
         )
 
-        self._configure_packed_attention(config._attn_implementation)
+        self._configure_packed_attention(config.ops_config.attn_implementation)
+        # Use the same HF initialization and loading lifecycle for CPU and meta construction.
+        self.post_init()
+
+    @torch.no_grad()
+    def _init_weights(self, module):
+        # Keep the native initialization recipe. HF guards already-loaded tensors when filling missing keys.
+        if isinstance(module, torch.nn.Linear):
+            module.reset_parameters()
+        else:
+            super()._init_weights(module)
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None, every_n_layers: int = 1) -> None:
+        """Enable checkpointing that preserves gradients for keyword block inputs."""
+        checkpoint_kwargs = dict(gradient_checkpointing_kwargs or {})
+        if checkpoint_kwargs.get("use_reentrant"):
+            raise ValueError(
+                "MiniMax-H3 does not support reentrant checkpointing with differentiable keyword inputs. "
+                "Set model.accelerator.gradient_checkpointing.enable_reentrant=False."
+            )
+        checkpoint_kwargs["use_reentrant"] = False
+        super().gradient_checkpointing_enable(checkpoint_kwargs, every_n_layers=every_n_layers)
 
     def _configure_packed_attention(self, attn_implementation):
-        """Record the packed backend; it is validated and loaded on the first packed forward."""
+        """Record the attention backend. Do not bind it yet: FA4/NPU/pre-SM90
+        cannot construct ``veomni_flash_attention_4``, so a flash name is
+        validated and bound on the first forward.
+        """
         self._packed_attn_implementation = attn_implementation
-        for module in self.dit.modules():
-            if isinstance(module, MiniMaxH3Attention):
-                module.packed_sdpa = attn_implementation in (None, "eager", "sdpa")
-                module.varlen_kernel = None
 
     def _load_packed_attention_kernel(self):
         implementation = self._packed_attn_implementation
-        if implementation in (None, "eager", "sdpa"):
+        if implementation in (None, "eager", "sdpa", "veomni_sdpa"):
             return
-        if implementation not in _PACKED_FLASH_BACKENDS:
+        impl = _veomni_attn_impl(implementation)
+        if impl is None or implementation not in _PACKED_FLASH_BACKENDS:
             raise ValueError(f"Unsupported H3 packing backend: {implementation}")
-        attention_modules = [module for module in self.dit.modules() if isinstance(module, MiniMaxH3Attention)]
-        if all(module.varlen_kernel is not None for module in attention_modules):
-            return
-        from .....ops.kernels.attention.flash import _load_veomni_flash_kernel
-
-        kernel = _load_veomni_flash_kernel(implementation).flash_attn_varlen_func
-        for module in attention_modules:
-            module.varlen_kernel = kernel
+        for module in self.dit.modules():
+            if isinstance(module, MiniMaxH3Attention):
+                bind_minimax_attention(module, is_causal=False, impl=impl)
 
     def _forward_batch(self, samples):
-        if any(sample.get("use_gradient_checkpointing_offload", False) for sample in samples):
-            raise ValueError("H3 multi-sample packing does not support checkpoint offload.")
         self._load_packed_attention_kernel()
+        negatives = [sample.get("unconditional_inputs") for sample in samples]
+        negative_predictions = [None] * len(samples)
+        if any(negative is not None for negative in negatives):
+            if any(negative is None for negative in negatives):
+                raise ValueError("Packed H3 samples must consistently enable or disable CFG.")
+            # Negative first: no graph, same current model, never a frozen/EMA teacher.
+            with torch.no_grad():
+                negative_output = self._forward_batch(negatives)
+            negative_predictions = list(zip(*negative_output.predictions))
         packed_inputs, row_counts = pack_samples(samples)
         video, audio = self.dit(**packed_inputs, packed_batch=True)
         video_parts = video.split([v for v, _ in row_counts])
         audio_parts = audio.split([a for _, a in row_counts])
-        outputs = [self._finish_outputs(v, a, **sample) for sample, v, a in zip(samples, video_parts, audio_parts)]
+        outputs = [
+            self._finish_outputs(v, a, unconditional_predictions=negative, **sample)
+            for sample, v, a, negative in zip(samples, video_parts, audio_parts, negative_predictions)
+        ]
         if any((out.loss is None) != (outputs[0].loss is None) for out in outputs):
             raise ValueError("All H3 samples must consistently supply or omit training targets.")
         losses = None
@@ -136,15 +210,21 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         img_pos_for_infer_output_info=None,
         packed_seq_params=None,
         refiner_packed_seq_params=None,
-        use_gradient_checkpointing=False,
-        use_gradient_checkpointing_offload=False,
         training_target=None,
         training_target_audio=None,
         video_latent_shape=None,
         audio_latent_shape=None,
+        timestep_indices=None,
+        position_ids=None,
+        image_indices=None,
+        text_indices=None,
+        pdd_step_index=None,
         **kwargs,
-    ) -> MiniMaxH3DiTOutput:
-        """Forward pass with unpatchify + negation + internal loss computation.
+    ) -> MiniMaxH3DiTOutput | torch.Tensor:
+        """Run the image or audio/video variant selected by ``config.audio_enabled``.
+
+        The image variant returns image rows. The audio/video variant applies
+        unpatchify, negation and internal loss computation.
 
         Accepts all keys from condition_model.process_condition().
         Pops training_target* internally (not via trainer) and computes MSE loss.
@@ -152,6 +232,22 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         video_latent_shape: (T_v, latent_h//2, latent_w//2) for unpatchify_video
         audio_latent_shape: (audio_channel, T_a) for unpack_audio
         """
+        if not self.config.audio_enabled:
+            self._load_packed_attention_kernel()
+            return self.dit(
+                x=x,
+                prompt_embeds=prompt_embeds,
+                unique_timesteps=unique_timesteps,
+                timestep_indices=timestep_indices,
+                token_tags=token_tags,
+                position_ids=position_ids,
+                image_indices=image_indices,
+                text_indices=text_indices,
+                pdd_step_index=pdd_step_index,
+                packed_seq_params=packed_seq_params,
+                refiner_packed_seq_params=refiner_packed_seq_params,
+            )
+
         if isinstance(x, list):
             if not x:
                 raise ValueError("H3 requires a nonempty microbatch.")
@@ -170,8 +266,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
                 img_pos_for_infer_output_info=img_pos_for_infer_output_info,
                 packed_seq_params=packed_seq_params,
                 refiner_packed_seq_params=refiner_packed_seq_params,
-                use_gradient_checkpointing=use_gradient_checkpointing,
-                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                 training_target=training_target,
                 training_target_audio=training_target_audio,
                 video_latent_shape=video_latent_shape,
@@ -194,7 +288,14 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         cond_rows = kwargs.pop("cond_rows", 0)
         scheduler_video = kwargs.pop("scheduler_video", None)
         scheduler_audio = kwargs.pop("scheduler_audio", None)
+        negative_inputs = kwargs.pop("unconditional_inputs", None)
+        negative_predictions = None
+        if negative_inputs is not None:
+            with torch.no_grad():
+                negative_predictions = self.forward(**negative_inputs).predictions
 
+        if is_flash_attn_impl(self._packed_attn_implementation or ""):
+            self._load_packed_attention_kernel()
         # Run DiT — skip_mask_out_condition=True, update_mask=None
         video_tokens, audio_tokens = self.dit(
             x=x,
@@ -211,8 +312,6 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             img_pos_for_infer_output_info=img_pos_for_infer_output_info,
             packed_seq_params=packed_seq_params,
             refiner_packed_seq_params=refiner_packed_seq_params,
-            use_gradient_checkpointing=use_gradient_checkpointing,
-            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             skip_mask_out_condition=skip_mask_out_condition,
         )
 
@@ -226,6 +325,7 @@ class MiniMaxH3DiTModel(PreTrainedModel):
             training_target_audio=training_target_audio,
             scheduler_video=scheduler_video,
             scheduler_audio=scheduler_audio,
+            unconditional_predictions=negative_predictions,
             **kwargs,
         )
 
@@ -242,6 +342,9 @@ class MiniMaxH3DiTModel(PreTrainedModel):
         scheduler_video=None,
         scheduler_audio=None,
         has_audio=True,
+        unconditional_predictions=None,
+        training_cfg_scales=(1.0, 1.0),
+        training_cfg_curvature_power=2.0,
         **kwargs,
     ):
         # Slice off condition rows (v_video_rows[cond_rows_count:])
@@ -265,8 +368,21 @@ class MiniMaxH3DiTModel(PreTrainedModel):
 
         loss = None
         if training_target is not None and training_target_audio is not None:
-            loss_video = F.mse_loss(video_pred.float(), training_target.float())
-            loss_audio = F.mse_loss(audio_pred.float(), training_target_audio.float())
+            negatives = unconditional_predictions if unconditional_predictions is not None else (None, None)
+            loss_video = cfg_calibrated_mse(
+                video_pred,
+                training_target,
+                unconditional=negatives[0],
+                scale=training_cfg_scales[0],
+                curvature_power=training_cfg_curvature_power,
+            )
+            loss_audio = cfg_calibrated_mse(
+                audio_pred,
+                training_target_audio,
+                unconditional=negatives[1],
+                scale=training_cfg_scales[1],
+                curvature_power=training_cfg_curvature_power,
+            )
 
             # Apply timestep-dependent training weights
             # t_video / t_audio passed directly from process_condition (t = 1 - sigma)

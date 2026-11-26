@@ -1,7 +1,4 @@
-import importlib
 import random
-import sys
-import types
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,20 +9,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 
+from veomni.distributed.moe import ep_load_balance
 
-# The existing MoE package initializer imports Triton kernels eagerly. Load this
-# pure CPU planner submodule without that unrelated optional dependency.
-_MOE_PACKAGE_NAME = "veomni.distributed.moe"
-_previous_moe_package = sys.modules.get(_MOE_PACKAGE_NAME)
-_moe_package = types.ModuleType(_MOE_PACKAGE_NAME)
-_moe_package.__path__ = [str(Path(__file__).parents[2] / "veomni" / "distributed" / "moe")]
-sys.modules[_MOE_PACKAGE_NAME] = _moe_package
-ep_load_balance = importlib.import_module(f"{_MOE_PACKAGE_NAME}.ep_load_balance")
-if _previous_moe_package is None:
-    del sys.modules[_MOE_PACKAGE_NAME]
-else:
-    sys.modules[_MOE_PACKAGE_NAME] = _previous_moe_package
-attach_qwen3_5_moe_ep_load_balancers = ep_load_balance.attach_qwen3_5_moe_ep_load_balancers
+
+attach_ep_load_balancers = ep_load_balance.attach_ep_load_balancers
 build_ep_balance_plan = ep_load_balance.build_ep_balance_plan
 
 
@@ -364,12 +351,14 @@ def _qwen_experts(
     def init(self):
         nn.Module.__init__(self)
         self.num_experts = num_experts
+        self.veomni_moe = SimpleNamespace(impl="fused_triton", kwargs={})
+        self.activation = "silu"
         rows = num_experts if expert_rows is None else expert_rows
         ndim_shape = (rows, 8, 4) if merged else (8, 4)
         self.gate_up_proj = nn.Parameter(torch.empty(ndim_shape))
         self.down_proj = nn.Parameter(torch.empty(ndim_shape))
 
-    runtime_type = type(runtime_name, (nn.Module,), {"__init__": init})
+    runtime_type = type(runtime_name, (nn.Module,), {"__init__": init, "_veomni_supports_ep_replicas": merged})
     return runtime_type()
 
 
@@ -379,7 +368,7 @@ def test_attachment_accepts_post_fsdp2_ep_local_expert_rows(monkeypatch):
     monkeypatch.setattr(ep_load_balance.dist, "get_world_size", lambda group=None: 2)
     experts = _qwen_experts(num_experts=4, expert_rows=2)
 
-    attached = attach_qwen3_5_moe_ep_load_balancers(nn.ModuleList([experts]), max_replicas_per_rank=2)
+    attached = attach_ep_load_balancers(nn.ModuleList([experts]), max_replicas_per_rank=2)
 
     assert attached == 1
     assert experts._veomni_ep_load_balancer.num_experts == 4
@@ -392,7 +381,7 @@ def test_attachment_accepts_fsdp2_dynamic_runtime_class(monkeypatch):
     monkeypatch.setattr(ep_load_balance.dist, "get_world_size", lambda group=None: 2)
     experts = _qwen_experts(expert_rows=2, runtime_name="FSDPQwen3_5MoeExperts")
 
-    attached = attach_qwen3_5_moe_ep_load_balancers(nn.ModuleList([experts]), max_replicas_per_rank=2)
+    attached = attach_ep_load_balancers(nn.ModuleList([experts]), max_replicas_per_rank=2)
 
     assert attached == 1
     assert experts._veomni_ep_load_balancer.ep_group is group
@@ -406,7 +395,7 @@ def test_attachment_memory_pools_are_private_per_layer(monkeypatch, optimize_mem
     parameters = tuple(model.parameters())
     state_keys = tuple(model.state_dict())
 
-    attach_qwen3_5_moe_ep_load_balancers(model, 1, optimize_memory=optimize_memory)
+    attach_ep_load_balancers(model, 1, optimize_memory=optimize_memory)
 
     controllers = [layer._veomni_ep_load_balancer for layer in model]
     assert all(controller.optimize_memory is optimize_memory for controller in controllers)
@@ -429,7 +418,7 @@ def test_attachment_targets_only_runtime_merged_qwen_experts(monkeypatch):
     second = _qwen_experts(expert_rows=2)
     model = nn.ModuleList([first, incompatible, ordinary, second])
 
-    attached = attach_qwen3_5_moe_ep_load_balancers(model, max_replicas_per_rank=2)
+    attached = attach_ep_load_balancers(model, max_replicas_per_rank=2)
 
     assert attached == 2
     assert not hasattr(incompatible, "_veomni_ep_load_balancer")
@@ -459,7 +448,7 @@ def test_attachment_validates_before_install(monkeypatch, num_experts, max_repli
     experts = _qwen_experts(num_experts=num_experts)
 
     with pytest.raises(ValueError, match=message):
-        attach_qwen3_5_moe_ep_load_balancers(nn.ModuleList([experts]), max_replicas)
+        attach_ep_load_balancers(nn.ModuleList([experts]), max_replicas)
 
     assert not hasattr(experts, "_veomni_ep_load_balancer")
 
@@ -472,7 +461,7 @@ def test_attachment_rejects_global_pre_fsdp_rows_before_installing_any_controlle
     global_rows = _qwen_experts(num_experts=4, expert_rows=4)
 
     with pytest.raises(ValueError, match=r"global/pre-FSDP.*after.*EP sharding.*FSDP2"):
-        attach_qwen3_5_moe_ep_load_balancers(nn.ModuleList([valid, global_rows]), max_replicas_per_rank=2)
+        attach_ep_load_balancers(nn.ModuleList([valid, global_rows]), max_replicas_per_rank=2)
 
     assert not hasattr(valid, "_veomni_ep_load_balancer")
     assert not hasattr(global_rows, "_veomni_ep_load_balancer")
@@ -489,6 +478,6 @@ def test_attachment_rejects_either_wrong_ep_local_weight_row_count(monkeypatch):
         ValueError,
         match=r"exactly 2 EP-local expert rows.*gate_up_proj=1.*down_proj=2",
     ):
-        attach_qwen3_5_moe_ep_load_balancers(nn.ModuleList([experts]), max_replicas_per_rank=2)
+        attach_ep_load_balancers(nn.ModuleList([experts]), max_replicas_per_rank=2)
 
     assert not hasattr(experts, "_veomni_ep_load_balancer")

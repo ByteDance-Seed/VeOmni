@@ -167,6 +167,102 @@ def validate_compile_runtime(
     validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
 
 
+#: Op rows whose kernels emit dtypes Inductor cannot lower, keyed by
+#: ``(config field, row name)`` and giving the format that triggers it.
+#:
+#: ``mxfp4`` materializes ``float8_e8m0fnu`` scale tensors, and Inductor's codegen
+#: has no lowering for that dtype. A runtime check cannot catch it, so the selection
+#: is refused here, from the config. It is keyed on the *format* rather than the row
+#: because the row is ``torchao`` for both FP4 layouts: a config may compile with
+#: ``dtype: nvfp4`` (float8_e4m3fn scales plus an FP32 per-tensor scale, both of
+#: which Inductor knows) and must not with ``dtype: mxfp4``.
+_UNCOMPILABLE_FORMATS: dict[str, tuple[str, str, str]] = {
+    "linear_implementation": ("linear", "torchao", "mxfp4"),
+    "gated_mlp_implementation": ("gated_mlp", "torchao", "mxfp4"),
+}
+
+
+def _bound_uncompilable_ops(model: nn.Module) -> tuple[bool, list[str]]:
+    """Inspect concrete ``VeomniOp`` handles bound on ``model`` for uncompilable formats."""
+    from ..ops.registry import VeomniOp
+
+    op_to_rule = {op: (field, impl, dtype) for field, (op, impl, dtype) in _UNCOMPILABLE_FORMATS.items()}
+    has_bound_ops = False
+    offending: list[str] = []
+    for module in model.modules():
+        for attr in vars(module).values():
+            if isinstance(attr, VeomniOp):
+                has_bound_ops = True
+                if attr.op in op_to_rule:
+                    field, impl, dtype = op_to_rule[attr.op]
+                    if attr.impl == impl and attr.kwargs.get("dtype") == dtype:
+                        entry = f"{field}={impl}(dtype={dtype!r})"
+                        if entry not in offending:
+                            offending.append(entry)
+    return has_bound_ops, offending
+
+
+def _selection_reaches(value, target_impl: str, target_dtype: str) -> bool:
+    """Return whether any ordered subset of overrides on ``value`` reaches ``(target_impl, target_dtype)``."""
+    base_name = getattr(value, "name", value)
+    base_kwargs = getattr(value, "kwargs", {}) or {}
+    states: set[tuple[str | None, str | None]] = {(base_name, base_kwargs.get("dtype"))}
+    for rule in getattr(value, "overrides", ()) or ():
+        rule_kwargs = rule.kwargs or {}
+        next_states = set(states)
+        for name, dtype in states:
+            if rule.name is not None and name is not None and rule.name != name:
+                next_states.add((rule.name, rule_kwargs.get("dtype")))
+            else:
+                next_states.add((rule.name if rule.name is not None else name, rule_kwargs.get("dtype", dtype)))
+        states = next_states
+    return (target_impl, target_dtype) in states
+
+
+def _uncompilable_selections(ops) -> list[str]:
+    """Return the offending ``field=row(dtype=...)`` strings on one ops config, if any."""
+    if ops is None:
+        return []
+    offending: list[str] = []
+    for field, (_op, impl, dtype) in _UNCOMPILABLE_FORMATS.items():
+        if _selection_reaches(getattr(ops, field, None), impl, dtype):
+            offending.append(f"{field}={impl}(dtype={dtype!r})")
+    return offending
+
+
+def _reject_incompatible_ops(model: nn.Module) -> None:
+    """Reject op selections ``torch.compile`` cannot lower, at any config depth.
+
+    On a concrete model that binds ``VeomniOp`` handles, inspect only those
+    resolved handles so unmatched overrides or op families the model never
+    binds (such as ``linear_implementation`` on Gemma3) do not falsely block
+    compilation. Fall back to walking ``config`` / ``sub_configs`` when no
+    handles are bound on ``model``.
+    """
+    has_bound_ops, offending = _bound_uncompilable_ops(model)
+    if not has_bound_ops:
+        config = getattr(model, "config", None)
+        offending = _uncompilable_at(config, prefix="")
+    if offending:
+        raise RuntimeError(
+            "model.accelerator.torch_compile cannot be combined with "
+            f"{', '.join(offending)}: those selections emit tensors of a dtype Inductor cannot lower "
+            "(float8_e8m0fnu for the mxfp4 layout). Disable compilation or select a different dtype."
+        )
+
+
+def _uncompilable_at(config, *, prefix: str) -> list[str]:
+    """Collect offending selections on ``config`` and every sub-config below it."""
+    if config is None:
+        return []
+    found = [f"{prefix}{item}" for item in _uncompilable_selections(getattr(config, "ops_config", None))]
+    for name in getattr(config, "sub_configs", {}) or {}:
+        child = getattr(config, name, None)
+        if child is not None:
+            found.extend(_uncompilable_at(child, prefix=f"{prefix}{name}."))
+    return found
+
+
 def compile_decoder_blocks(
     model: nn.Module,
     compile_config: CompileConfig,
@@ -186,6 +282,7 @@ def compile_decoder_blocks(
         )
 
     validate_compile_model(model, compile_config, sequence_parallel_enabled, async_enabled)
+    _reject_incompatible_ops(model)
 
     compile_kwargs = {
         "fullgraph": compile_config.fullgraph,

@@ -1,0 +1,509 @@
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""mHC eager vs HuggingFace DeepSeek-V4, and TileLang / CANN vs eager."""
+
+from __future__ import annotations
+
+import importlib.util
+
+import pytest
+import torch
+from torch import Tensor
+from transformers import DeepseekV4Config
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4HyperConnection, DeepseekV4HyperHead
+
+from tests.ops.tol import (
+    EAGER_ATOL,
+    EAGER_GRAD_ATOL,
+    EAGER_GRAD_RTOL,
+    EAGER_RTOL,
+    MHC_CANN_ATOL,
+    MHC_CANN_RTOL,
+    MHC_FUSED_ATOL,
+    MHC_FUSED_GRAD_COSINE,
+    MHC_FUSED_RTOL,
+)
+from tests.ops.utils import assert_gradient_direction_and_scale, is_nvidia_cuda_available, make_grad_leaves
+from veomni.ops import OP_REGISTRY, resolve_op
+from veomni.ops.kernels.mhc.pre import cann as pre_cann
+from veomni.utils.device import IS_NPU_AVAILABLE, get_device_type
+
+
+# Installed Transformers classes used as the mHC eager reference.
+
+_TILELANG_AVAILABLE = is_nvidia_cuda_available(min_cc=90) and importlib.util.find_spec("tile_kernels") is not None
+_CANN_AVAILABLE = IS_NPU_AVAILABLE and importlib.util.find_spec("cann_ops_transformer") is not None
+
+
+def _tiny_dsv4_config(
+    *,
+    hidden_size: int,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    hc_eps: float,
+    rms_eps: float,
+) -> DeepseekV4Config:
+    return DeepseekV4Config(
+        hidden_size=hidden_size,
+        hc_mult=hc_mult,
+        hc_sinkhorn_iters=sinkhorn_iters,
+        hc_eps=hc_eps,
+        rms_norm_eps=rms_eps,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+    )
+
+
+def _hf_decoder_layer_post(output: Tensor, residual: Tensor, post: Tensor, comb: Tensor) -> Tensor:
+    """HuggingFace decoder-layer residual mix. There is no standalone post module.
+
+    This is the residual-mixing expression used by the installed
+    ``DeepseekV4DecoderLayer.forward`` implementation.
+    """
+    dtype = residual.dtype
+    return post.to(dtype).unsqueeze(-1) * output.unsqueeze(-2) + torch.matmul(
+        comb.to(dtype).transpose(-1, -2), residual
+    )
+
+
+def test_mhc_pre_eager_matches_hf():
+    torch.manual_seed(0)
+    batch, seq_len, hc_mult, hidden = 2, 8, 4, 32
+    norm_eps, hc_eps, sinkhorn_iters = 1e-6, 1e-6, 4
+    mix = (2 + hc_mult) * hc_mult
+    x = torch.randn(batch, seq_len, hc_mult, hidden)
+    fn = torch.randn(mix, hc_mult * hidden) * 0.01
+    scale = torch.randn(3) * 0.01
+    base = torch.randn(mix) * 0.01
+
+    hc = DeepseekV4HyperConnection(
+        _tiny_dsv4_config(
+            hidden_size=hidden,
+            hc_mult=hc_mult,
+            sinkhorn_iters=sinkhorn_iters,
+            hc_eps=hc_eps,
+            rms_eps=norm_eps,
+        )
+    )
+    with torch.no_grad():
+        hc.fn.copy_(fn)
+        hc.base.copy_(base)
+        hc.scale.copy_(scale)
+
+    x_h = x.detach().requires_grad_(True)
+    post_h, comb_h, collapsed_h = hc(x_h)
+
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
+    post_e, comb_e, collapsed_e = resolve_op("mhc", "pre", "eager").wrapper(
+        x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, sinkhorn_iters, hc_eps
+    )
+    assert torch.allclose(post_e, post_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    assert torch.allclose(comb_e, comb_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+    assert torch.allclose(collapsed_e, collapsed_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    grad_outputs = tuple(torch.randn_like(output) for output in (post_e, comb_e, collapsed_e))
+    hf_grads = torch.autograd.grad(
+        (post_h, comb_h, collapsed_h),
+        (x_h, hc.fn, hc.scale, hc.base),
+        grad_outputs=grad_outputs,
+    )
+    eager_grads = torch.autograd.grad(
+        (post_e, comb_e, collapsed_e),
+        (x_e, fn_e, scale_e, base_e),
+        grad_outputs=grad_outputs,
+    )
+    for actual, expected in zip(eager_grads, hf_grads, strict=True):
+        torch.testing.assert_close(actual, expected, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+def test_mhc_post_eager_matches_hf():
+    torch.manual_seed(1)
+    batch, seq_len, hc_mult, hidden = 2, 8, 4, 32
+    residual = torch.randn(batch, seq_len, hc_mult, hidden)
+    output = torch.randn(batch, seq_len, hidden)
+    post = torch.randn(batch, seq_len, hc_mult)
+    comb = torch.randn(batch, seq_len, hc_mult, hc_mult)
+
+    out_h, res_h, post_h, comb_h = make_grad_leaves(output, residual, post, comb)
+    y_h = _hf_decoder_layer_post(out_h, res_h, post_h, comb_h)
+    out_e, res_e, post_e, comb_e = make_grad_leaves(output, residual, post, comb)
+    y_e = resolve_op("mhc", "post", "eager").wrapper(out_e, res_e, post_e, comb_e)
+    assert torch.allclose(y_e, y_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    go = torch.randn_like(y_e)
+    y_h.backward(go)
+    y_e.backward(go)
+    assert torch.allclose(out_e.grad, out_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(res_e.grad, res_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(post_e.grad, post_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(comb_e.grad, comb_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+def test_mhc_head_eager_matches_hf():
+    torch.manual_seed(2)
+    batch, seq_len, hc_mult, hidden = 2, 8, 4, 32
+    norm_eps, hc_eps = 1e-6, 1e-6
+    x = torch.randn(batch, seq_len, hc_mult, hidden)
+    fn = torch.randn(hc_mult, hc_mult * hidden) * 0.01
+    scale = torch.randn(1) * 0.01
+    base = torch.randn(hc_mult) * 0.01
+
+    head = DeepseekV4HyperHead(
+        _tiny_dsv4_config(
+            hidden_size=hidden,
+            hc_mult=hc_mult,
+            sinkhorn_iters=1,
+            hc_eps=hc_eps,
+            rms_eps=norm_eps,
+        )
+    )
+    with torch.no_grad():
+        head.hc_fn.copy_(fn)
+        head.hc_base.copy_(base)
+        head.hc_scale.copy_(scale)
+
+    x_h = x.detach().requires_grad_(True)
+    y_h = head(x_h)
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
+    y_e = resolve_op("mhc", "head", "eager").wrapper(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, hc_eps)
+    assert torch.allclose(y_e, y_h, atol=EAGER_ATOL, rtol=EAGER_RTOL)
+
+    go = torch.randn_like(y_e)
+    y_h.backward(go)
+    y_e.backward(go)
+    assert torch.allclose(x_e.grad, x_h.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(fn_e.grad, head.hc_fn.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(scale_e.grad, head.hc_scale.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+    assert torch.allclose(base_e.grad, head.hc_base.grad, atol=EAGER_GRAD_ATOL, rtol=EAGER_GRAD_RTOL)
+
+
+@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU")
+def test_mhc_tilelang_pre_post_matches_eager():
+    torch.manual_seed(17)
+    device = torch.device("cuda")
+    batch, seq_len, hc_mult, hidden = 1, 32, 4, 256
+    norm_eps, hc_eps, sinkhorn_iters = 1e-6, 1e-6, 20
+    mix = (2 + hc_mult) * hc_mult
+    x = torch.randn(batch, seq_len, hc_mult, hidden, device=device, dtype=torch.bfloat16)
+    fn = torch.randn(mix, hc_mult * hidden, device=device, dtype=torch.float32) * 0.01
+    scale = torch.randn(3, device=device, dtype=torch.float32) * 0.01
+    base = torch.randn(mix, device=device, dtype=torch.float32) * 0.01
+    eager_pre = resolve_op("mhc", "pre", "eager").wrapper
+    other_pre = resolve_op("mhc", "pre", "tilelang").wrapper
+    eager_post = resolve_op("mhc", "post", "eager").wrapper
+    other_post = resolve_op("mhc", "post", "tilelang").wrapper
+
+    with torch.no_grad():
+        inference = other_pre(x, fn, scale, base, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+        eager_inference = eager_pre(x, fn, scale, base, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    for actual, expected in zip(inference, eager_inference, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+
+    x_o, fn_o, scale_o, base_o = make_grad_leaves(x, fn, scale, base)
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
+    post_o, comb_o, collapsed_o = other_pre(x_o, fn_o, scale_o, base_o, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    post_e, comb_e, collapsed_e = eager_pre(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    y_o = other_post(collapsed_o * 0.75, x_o, post_o, comb_o)
+    y_e = eager_post(collapsed_e * 0.75, x_e, post_e, comb_e)
+
+    torch.testing.assert_close(post_o, post_e, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+    torch.testing.assert_close(comb_o, comb_e, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+    torch.testing.assert_close(collapsed_o, collapsed_e, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+    torch.testing.assert_close(y_o, y_e, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+
+    grad = torch.randn_like(y_o)
+    other_grads = torch.autograd.grad((y_o * grad).sum(), (x_o, fn_o, scale_o, base_o))
+    eager_grads = torch.autograd.grad((y_e * grad).sum(), (x_e, fn_e, scale_e, base_e))
+    for actual, expected in zip(other_grads, eager_grads, strict=True):
+        assert_gradient_direction_and_scale(
+            actual,
+            expected,
+            min_cosine=MHC_FUSED_GRAD_COSINE,
+            norm_rtol=0.25,
+        )
+
+
+@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU")
+def test_mhc_tilelang_head_matches_eager():
+    torch.manual_seed(23)
+    device = torch.device("cuda")
+    batch, seq_len, hc_mult, hidden = 1, 32, 4, 256
+    norm_eps, hc_eps = 1e-6, 1e-6
+    x = torch.randn(batch, seq_len, hc_mult, hidden, device=device, dtype=torch.bfloat16)
+    fn = torch.randn(hc_mult, hc_mult * hidden, device=device, dtype=torch.float32) * 0.01
+    scale = torch.randn(1, device=device, dtype=torch.float32) * 0.01
+    base = torch.randn(hc_mult, device=device, dtype=torch.float32) * 0.01
+    eager = resolve_op("mhc", "head", "eager").wrapper
+    other = resolve_op("mhc", "head", "tilelang").wrapper
+
+    x_o, fn_o, scale_o, base_o = make_grad_leaves(x, fn, scale, base)
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
+    y_o = other(x_o, fn_o, scale_o, base_o, norm_eps, hc_mult, hc_eps)
+    y_e = eager(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, hc_eps)
+    torch.testing.assert_close(y_o, y_e, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+
+    grad = torch.randn_like(y_o)
+    other_grads = torch.autograd.grad((y_o * grad).sum(), (x_o, fn_o, scale_o, base_o))
+    eager_grads = torch.autograd.grad((y_e * grad).sum(), (x_e, fn_e, scale_e, base_e))
+    for actual, expected in zip(other_grads, eager_grads, strict=True):
+        assert_gradient_direction_and_scale(
+            actual,
+            expected,
+            min_cosine=MHC_FUSED_GRAD_COSINE,
+            norm_rtol=0.25,
+        )
+
+
+def test_mhc_cann_pre_passes_fp32_parameters_in_kernel_order(monkeypatch: pytest.MonkeyPatch):
+    calls = []
+    monkeypatch.setattr(pre_cann, "npu_mhc_pre_sinkhorn", lambda *args: calls.append(args) or args[:3])
+    hc_mult, hidden = 4, 8
+    mix = (2 + hc_mult) * hc_mult
+    x = torch.randn(1, 3, hc_mult, hidden, dtype=torch.bfloat16)
+    fn = torch.randn(hc_mult * hidden, mix, dtype=torch.bfloat16).t()
+    scale = torch.randn(3, dtype=torch.bfloat16)
+    base = torch.randn(mix, dtype=torch.bfloat16)
+
+    pre_cann.wrapper(x, fn, scale, base, 1e-6, hc_mult, 20, 2e-3)
+
+    ((kernel_x, kernel_fn, kernel_scale, kernel_base, *scalars),) = calls
+    assert kernel_x is x
+    assert all(tensor.dtype == torch.float32 for tensor in (kernel_fn, kernel_scale, kernel_base))
+    assert kernel_fn.is_contiguous()
+    # The kernel takes hc_eps before norm_eps, the reverse of the op contract.
+    assert scalars == [hc_mult, 20, 2e-3, 1e-6]
+
+
+@pytest.mark.skipif(not _CANN_AVAILABLE, reason="CANN mHC requires Ascend NPU and cann_ops_transformer")
+def test_mhc_cann_pre_post_matches_eager():
+    torch.manual_seed(29)
+    device = get_device_type()
+    batch, seq_len, hc_mult, hidden = 1, 8, 4, 128
+    norm_eps, hc_eps, sinkhorn_iters = 1e-6, 1e-6, 20
+    mix = (2 + hc_mult) * hc_mult
+    x = torch.randn(batch, seq_len, hc_mult, hidden, device=device, dtype=torch.bfloat16)
+    fn = torch.randn(mix, hc_mult * hidden, device=device, dtype=torch.float32) * 0.01
+    scale = torch.randn(3, device=device, dtype=torch.float32) * 0.01
+    base = torch.randn(mix, device=device, dtype=torch.float32) * 0.01
+    eager_pre = resolve_op("mhc", "pre", "eager").wrapper
+    other_pre = resolve_op("mhc", "pre", "cann").wrapper
+    eager_post = resolve_op("mhc", "post", "eager").wrapper
+    other_post = resolve_op("mhc", "post", "cann").wrapper
+
+    x_o, fn_o, scale_o, base_o = make_grad_leaves(x, fn, scale, base)
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
+    post_o, comb_o, collapsed_o = other_pre(x_o, fn_o, scale_o, base_o, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    post_e, comb_e, collapsed_e = eager_pre(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    y_o = other_post(collapsed_o * 0.75, x_o, post_o, comb_o)
+    y_e = eager_post(collapsed_e * 0.75, x_e, post_e, comb_e)
+
+    for actual, expected in ((post_o, post_e), (comb_o, comb_e), (collapsed_o, collapsed_e), (y_o, y_e)):
+        torch.testing.assert_close(actual, expected, rtol=MHC_CANN_RTOL, atol=MHC_CANN_ATOL)
+
+    grad = torch.randn_like(y_o)
+    other_grads = torch.autograd.grad((y_o * grad).sum(), (x_o, fn_o, scale_o, base_o))
+    eager_grads = torch.autograd.grad((y_e * grad).sum(), (x_e, fn_e, scale_e, base_e))
+    for actual, expected in zip(other_grads, eager_grads, strict=True):
+        assert_gradient_direction_and_scale(
+            actual,
+            expected,
+            min_cosine=MHC_FUSED_GRAD_COSINE,
+            norm_rtol=0.25,
+        )
+
+
+def test_mhc_cann_head_is_the_eager_math():
+    cann_head = OP_REGISTRY._entries["mhc", "head", "cann", "npu"]
+    assert cann_head.wrapper is resolve_op("mhc", "head", "eager").wrapper
+
+
+@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU")
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("seq_len", [33, 95, 160])
+def test_mhc_tilelang_matches_eager_at_unaligned_sequence_lengths(batch: int, seq_len: int):
+    """The kernels tile the query axis without a length guard, so the row pads.
+
+    A packed dynamic-batch step puts each sample's span wherever it lands, and
+    ``cp_size > 1`` slices that span further, so ``seq_len % 128 != 0`` is the
+    normal case rather than an edge. Before the row padded, the tail tile read
+    and wrote past the tensor: on a 256k run that turned one step's gradient into
+    NaN and the next step's ``optimizer.step()`` into NaN weights.
+
+    Both directions are checked because they pad differently -- the fused
+    inference collapse on 32, ``mhc_pre_norm_fn`` and its backward on 128.
+    """
+    torch.manual_seed(seq_len * 10 + batch)
+    device = torch.device("cuda")
+    hc_mult, hidden = 4, 256
+    norm_eps, hc_eps, sinkhorn_iters = 1e-6, 1e-6, 20
+    mix = (2 + hc_mult) * hc_mult
+    x = torch.randn(batch, seq_len, hc_mult, hidden, device=device, dtype=torch.bfloat16)
+    fn = torch.randn(mix, hc_mult * hidden, device=device, dtype=torch.float32) * 0.01
+    scale = torch.randn(3, device=device, dtype=torch.float32) * 0.01
+    base = torch.randn(mix, device=device, dtype=torch.float32) * 0.01
+    eager_pre = resolve_op("mhc", "pre", "eager").wrapper
+    other_pre = resolve_op("mhc", "pre", "tilelang").wrapper
+
+    with torch.no_grad():
+        inference = other_pre(x, fn, scale, base, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+        eager_inference = eager_pre(x, fn, scale, base, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    for actual, expected in zip(inference, eager_inference, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+        assert actual.shape[1] == seq_len
+        # ``batch=2`` is where a plain slice is not enough: the padded buffer leaves
+        # a gap between the samples, so ``[:, :seq_len]`` of it is non-contiguous and
+        # keeps the whole padded allocation alive. Each returned tensor has to be
+        # contiguous in its own right.
+        assert actual.is_contiguous(), f"batch={batch}: padded output must be trimmed to a contiguous tensor"
+
+    x_o, fn_o, scale_o, base_o = make_grad_leaves(x, fn, scale, base)
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
+    post_o, comb_o, collapsed_o = other_pre(x_o, fn_o, scale_o, base_o, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    post_e, comb_e, collapsed_e = eager_pre(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, sinkhorn_iters, hc_eps)
+    for actual, expected, name in (
+        (post_o, post_e, "post"),
+        (comb_o, comb_e, "comb"),
+        (collapsed_o, collapsed_e, "collapsed"),
+    ):
+        assert actual.shape == expected.shape, (name, actual.shape, expected.shape)
+        torch.testing.assert_close(actual, expected, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+        assert actual.is_contiguous(), f"batch={batch} {name}: gradient-carrying output must be contiguous"
+
+    # All three outputs get a non-zero upstream gradient. Differentiating only
+    # ``collapsed`` would leave ``post`` and ``comb`` at zero and never exercise
+    # ``_mhc_sinkhorn_bwd`` or the ``post`` / ``comb`` branches of
+    # ``_mhc_pre_split_mixes_bwd`` -- which tile at ``token_block_size=32`` with no
+    # length guard, the same class of bug the forward padding fixes. The seed is
+    # fixed so both rows see identical gradients.
+    gen = torch.Generator(device=device).manual_seed(seq_len * 10 + batch)
+    weights = {
+        name: torch.randn(out.shape, device=device, dtype=out.dtype, generator=gen)
+        for name, out in (("post", post_o), ("comb", comb_o), ("collapsed", collapsed_o))
+    }
+
+    def weighted_sum(post, comb, collapsed):
+        return (
+            (post * weights["post"]).sum() + (comb * weights["comb"]).sum() + (collapsed * weights["collapsed"]).sum()
+        )
+
+    other_grads = torch.autograd.grad(weighted_sum(post_o, comb_o, collapsed_o), (x_o, fn_o, scale_o, base_o))
+    eager_grads = torch.autograd.grad(weighted_sum(post_e, comb_e, collapsed_e), (x_e, fn_e, scale_e, base_e))
+    for actual, expected in zip(other_grads, eager_grads, strict=True):
+        assert torch.isfinite(actual).all(), "padded backward must not read uninitialized memory"
+        assert_gradient_direction_and_scale(actual, expected, min_cosine=MHC_FUSED_GRAD_COSINE, norm_rtol=0.25)
+
+
+@pytest.mark.skipif(not _TILELANG_AVAILABLE, reason="TileKernels mHC requires an SM90+ NVIDIA CUDA GPU")
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("seq_len", [33, 95])
+def test_mhc_tilelang_head_matches_eager_at_unaligned_sequence_lengths(batch: int, seq_len: int):
+    """The final collapse runs the same unguarded tiling as ``pre``.
+
+    ``batch=2`` is the case a single sample cannot check: padding leaves a gap
+    between the samples, so the trim has to restore each one's own rows rather than
+    a prefix of the flattened buffer.
+    """
+    torch.manual_seed(seq_len * 10 + batch + 1)
+    device = torch.device("cuda")
+    hc_mult, hidden = 4, 256
+    norm_eps, hc_eps = 1e-6, 1e-6
+    x = torch.randn(batch, seq_len, hc_mult, hidden, device=device, dtype=torch.bfloat16)
+    fn = torch.randn(hc_mult, hc_mult * hidden, device=device, dtype=torch.float32) * 0.01
+    scale = torch.randn(1, device=device, dtype=torch.float32) * 0.01
+    base = torch.randn(hc_mult, device=device, dtype=torch.float32) * 0.01
+    eager = resolve_op("mhc", "head", "eager").wrapper
+    other = resolve_op("mhc", "head", "tilelang").wrapper
+
+    x_o, fn_o, scale_o, base_o = make_grad_leaves(x, fn, scale, base)
+    x_e, fn_e, scale_e, base_e = make_grad_leaves(x, fn, scale, base)
+    y_o = other(x_o, fn_o, scale_o, base_o, norm_eps, hc_mult, hc_eps)
+    y_e = eager(x_e, fn_e, scale_e, base_e, norm_eps, hc_mult, hc_eps)
+    assert y_o.shape == y_e.shape
+    torch.testing.assert_close(y_o, y_e, rtol=MHC_FUSED_RTOL, atol=MHC_FUSED_ATOL)
+    assert y_o.is_contiguous(), f"batch={batch}: padded collapse output must be trimmed to a contiguous tensor"
+
+    # ``make_grad_leaves`` above is only meaningful if a backward actually runs: the
+    # head path goes through ``_mhc_pre_norm_fn_bwd_mul``, whose 128-token tiling has
+    # the same missing length guard as the forward's 32-token one. Comparing against
+    # eager is what pins the padded rows' gradients, and the finiteness check is what
+    # catches a tail block reading uninitialized memory.
+    gen = torch.Generator(device=device).manual_seed(seq_len * 10 + batch + 1)
+    grad = torch.randn(y_o.shape, device=device, dtype=y_o.dtype, generator=gen)
+    other_grads = torch.autograd.grad((y_o * grad).sum(), (x_o, fn_o, scale_o, base_o))
+    eager_grads = torch.autograd.grad((y_e * grad).sum(), (x_e, fn_e, scale_e, base_e))
+    for actual, expected in zip(other_grads, eager_grads, strict=True):
+        assert torch.isfinite(actual).all(), "padded backward must not read uninitialized memory"
+        assert_gradient_direction_and_scale(actual, expected, min_cosine=MHC_FUSED_GRAD_COSINE, norm_rtol=0.25)
+
+
+def test_pad_token_axis_returns_row_major_contiguous():
+    """``F.pad`` preserves ``channels_last``; the kernels ``view`` the result."""
+    from veomni.ops.kernels.mhc.helper import TOKEN_ALIGN, pad_token_axis
+
+    for seq_len in (33, TOKEN_ALIGN):
+        x = torch.randn(2, seq_len, 4, 256).to(memory_format=torch.channels_last)
+        padded, reported = pad_token_axis(x, TOKEN_ALIGN)
+        assert reported == seq_len
+        assert padded.is_contiguous(), seq_len
+        assert padded.shape[1] % TOKEN_ALIGN == 0
+
+
+def test_pad_token_axis_returns_a_new_tensor_for_aligned_but_strided_input():
+    """An aligned input still comes back contiguous, so identity is not the trim test.
+
+    This is the case that made ``hs is not hidden_streams`` wrong: a non-contiguous
+    input of an already-aligned length is copied by ``.contiguous()``, so the
+    identity check sees "changed" even though nothing was padded. Callers must
+    compare shapes instead -- and then the trim is a no-op.
+    """
+    from veomni.ops.kernels.mhc.helper import TOKEN_ALIGN, pad_token_axis, trim_token_axis
+
+    base = torch.randn(2, TOKEN_ALIGN, 4, 512)
+    strided = base[..., ::2]  # aligned length, non-contiguous
+    assert not strided.is_contiguous()
+    padded, reported = pad_token_axis(strided, TOKEN_ALIGN)
+    assert reported == TOKEN_ALIGN
+    assert padded.shape[1] == TOKEN_ALIGN
+    assert padded.is_contiguous()
+    assert padded is not strided, "a copy here is expected; the trim must not rely on identity"
+
+    trimmed = trim_token_axis(padded, reported)
+    assert trimmed.shape[1] == reported
+    assert trimmed.is_contiguous()
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+def test_trim_token_axis_drops_padding_and_stays_contiguous(batch: int):
+    """A slice of a padded ``[batch, aligned, ...]`` buffer is not contiguous for ``batch > 1``.
+
+    The gap between samples is what a plain slice keeps: it both strides over the
+    padding and pins the whole padded allocation. ``trim_token_axis`` has to return
+    a fresh contiguous tensor, and a no-op when nothing was padded.
+    """
+    from veomni.ops.kernels.mhc.helper import trim_token_axis
+
+    aligned, seq_len = 128, 33
+    padded = torch.randn(batch, aligned, 4, 8)
+    trimmed = trim_token_axis(padded, seq_len)
+    assert trimmed.shape == (batch, seq_len, 4, 8)
+    assert trimmed.is_contiguous()
+    torch.testing.assert_close(trimmed, padded[:, :seq_len])
+    if batch > 1:
+        assert not padded[:, :seq_len].is_contiguous(), "the premise: a batch-2 slice is strided"
+
+    # Nothing padded: same tensor back when it is already contiguous.
+    whole = trim_token_axis(padded, aligned)
+    assert whole.shape[1] == aligned
+    assert whole.is_contiguous()

@@ -1,5 +1,4 @@
 import gc
-import importlib
 import sys
 import threading
 import time
@@ -14,19 +13,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 
-
-# The existing MoE package initializer imports Triton kernels eagerly. Load this
-# pure CPU executor submodule without that unrelated optional dependency.
-_MOE_PACKAGE_NAME = "veomni.distributed.moe"
-_previous_moe_package = sys.modules.get(_MOE_PACKAGE_NAME)
-_moe_package = types.ModuleType(_MOE_PACKAGE_NAME)
-_moe_package.__path__ = [str(Path(__file__).parents[2] / "veomni" / "distributed" / "moe")]
-sys.modules[_MOE_PACKAGE_NAME] = _moe_package
-ep_load_balance = importlib.import_module(f"{_MOE_PACKAGE_NAME}.ep_load_balance")
-if _previous_moe_package is None:
-    del sys.modules[_MOE_PACKAGE_NAME]
-else:
-    sys.modules[_MOE_PACKAGE_NAME] = _previous_moe_package
+from veomni.distributed.moe import ep_load_balance
 
 
 def test_executor_symbols_are_publicly_exported():

@@ -25,29 +25,40 @@ source .venv/bin/activate
 ```
 
 `gpu` is a single full superset: cu130 torch, FA2 (cp311/cp312 prebuilt
-wheels) / FA3 (sm90 abi3 prebuilt wheel) / FA4 / FlashQLA, diffusion / audio /
+wheels) / FA3 (sm90 abi3 prebuilt wheel) / FA4 / FlashQLA, DeepGEMM, diffusion / audio /
 video / LoRA deps, and `megatron-energon` for the
 optional energon dataset format. See
 [pyproject.toml](https://github.com/ByteDance-Seed/VeOmni/blob/main/pyproject.toml)
 for the full list.
 
+DeepGEMM wheels cover Python 3.11/3.12 on Linux x86_64/aarch64 and require
+glibc >=2.38 plus a compatible libstdc++ (Ubuntu 24.04 / NGC 25.11).
+FP8 MoE remains opt-in with `moe_implementation: deepgemm` and requires
+Hopper SM90 or Blackwell SM100. Runtime GEMM JIT still needs NVCC and a C++20
+compiler; see [FP8 MoE training](../../design/deepgemm_moe.md).
+
 ### Optional MagiAttention extra
 
-MagiAttention is an optional NVIDIA SM90+ extra. It source-builds CUDA
-extensions, so omit it on Ampere/Ada (A100/L20) and CPU environments.
+MagiAttention is an optional NVIDIA SM100+ extra. It source-builds CUDA
+extensions, so omit it on older GPUs and CPU environments.
 Install it together with the `gpu` extra:
 
 ```bash
 uv sync --locked --extra gpu --extra magi
 ```
 
-MagiAttention uses CUTE DSL/JIT on SM100 and newer GPUs. SM90 GPUs require an additional CUTLASS overlay after the Magi extra is synced:
+MagiAttention uses CUTE DSL/JIT on SM100 and newer GPUs. On SM90, select
+FlexAttention instead; its FA4 backend is included in the `gpu` extra.
+
+### Optional float8 extra
+
+`torchao`, the backend for opt-in [low-precision training](../../usage/low_precision_training.md)
+(Float8 on NVIDIA SM89+ and emulated FP4 QAT), is an optional extra rather than part of `gpu`. Install it
+together with the `gpu` extra:
 
 ```bash
-bash scripts/kernel/install_magi_sm90.sh
+uv sync --locked --extra gpu --extra float8
 ```
-
-The verified default enables BF16/FP16 inputs, the hdim128 bucket, and nfunc 1/3/5. Use `--help` to inspect optional build overrides. A later exact `uv sync` without `--extra magi` can remove the overlay, so rerun the installer before using MagiAttention on SM90.
 
 > **Note**: video/audio processing also needs ffmpeg installed at the OS level:
 > ```bash
@@ -64,7 +75,10 @@ The verified default enables BF16/FP16 inputs, the hdim128 bucket, and nfunc 1/3
 git clone https://github.com/ByteDance-Seed/VeOmni.git
 cd VeOmni
 
-pip3 install -e .[gpu]
+pip3 install -e .[gpu] \
+  --find-links https://verl-project.github.io/verl-wheelhouse/cu130/torch2.11/simple/deep-gemm/
 ```
 
-Add MagiAttention with `pip3 install -e ".[gpu,magi]"`.
+Pip does not read `[tool.uv.sources]`; the wheelhouse link supplies the pinned
+DeepGEMM wheel for the matching torch 2.11 / CUDA 13 environment.
+To include MagiAttention, use `.[gpu,magi]` in the same command.

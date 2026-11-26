@@ -33,11 +33,10 @@ def compact_permute(tokens: torch.Tensor, selected_experts: torch.Tensor):
 def compact_unpermute(tokens, routing_weights, hidden_states_shape, occurrence_order):
     """Preserve expert-major multiplication and the existing FP32 scatter sum."""
     weights = routing_weights.reshape(-1).index_select(0, occurrence_order)
-    weighted_tokens = tokens * weights.unsqueeze(-1)
     token_indices = torch.div(occurrence_order, routing_weights.shape[-1], rounding_mode="floor")
-    output = torch.zeros(hidden_states_shape, dtype=torch.float32, device=tokens.device)
-    output.scatter_add_(0, token_indices.unsqueeze(1).expand(-1, hidden_states_shape[-1]), weighted_tokens.float())
-    return output.to(weighted_tokens.dtype)
+    from ...ops.kernels.moe_experts.shared.unpermute import eager
+
+    return eager(tokens, weights, token_indices, num_tokens=hidden_states_shape[0])
 
 
 def alias_permute(tokens: torch.Tensor, physical_experts: torch.Tensor, logical_experts: torch.Tensor):
@@ -108,16 +107,23 @@ def unpermute(
     Returns:
         torch.Tensor: The unpermuted token tensor, [num_tokens, hidden_dim].
     """
+    out_dtype = tokens.dtype
     tokens_weight = routing_weights.T.contiguous().masked_select(routing_map.bool())
 
-    tokens = tokens * tokens_weight.unsqueeze(-1)
-    hidden_dim = hidden_states_shape[-1]
+    from ...ops import VeomniOp
+    from ...utils.device import IS_CUDA_AVAILABLE, get_device_type
 
-    # Accumulate in FP32 to match the non-EP moe_gather kernel which also uses FP32
-    # accumulation internally, reducing top-k rounding error from BF16 scatter_add_.
-    unpermuted_tokens = torch.zeros(hidden_states_shape, device=tokens.device, dtype=torch.float32)
-    unpermuted_tokens.scatter_add_(0, permutation_mapping.unsqueeze(1).expand(-1, hidden_dim), tokens.float())
-    return unpermuted_tokens.to(tokens.dtype)
+    impl = (
+        "triton"
+        if IS_CUDA_AVAILABLE
+        and torch.version.hip is None
+        and tokens.device.type == get_device_type()
+        and not torch.are_deterministic_algorithms_enabled()
+        else "eager"
+    )
+    return VeomniOp("moe_unpermute", "standard", impl)(
+        tokens, tokens_weight, permutation_mapping, num_tokens=hidden_states_shape[0]
+    ).to(out_dtype)
 
 
 def generate_weights_idx(routing_weights: torch.Tensor, selected_experts: torch.Tensor, num_experts) -> torch.Tensor:

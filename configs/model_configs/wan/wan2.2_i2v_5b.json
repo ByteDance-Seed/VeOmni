@@ -1,0 +1,24 @@
+{
+  "_class_name": "WanTransformer3DModel",
+  "_diffusers_version": "0.35.0.dev0",
+  "added_kv_proj_dim": null,
+  "attention_head_dim": 128,
+  "cross_attn_norm": true,
+  "eps": 1e-06,
+  "ffn_dim": 14336,
+  "freq_dim": 256,
+  "image_dim": null,
+  "in_channels": 48,
+  "num_attention_heads": 24,
+  "num_layers": 30,
+  "out_channels": 48,
+  "patch_size": [
+    1,
+    2,
+    2
+  ],
+  "pos_embed_seq_len": null,
+  "qk_norm": "rms_norm_across_heads",
+  "rope_max_seq_len": 1024,
+  "text_dim": 4096
+}

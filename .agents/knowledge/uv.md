@@ -12,7 +12,6 @@ CI install a concrete pin and use `--locked` / `--frozen` for reproducibility.
 |----------|--------|
 | `pyproject.toml` -> `[tool.uv]` -> `required-version` | range |
 | `docker/**/Dockerfile.*` | concrete pin, per file: `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` |
-| `.github/workflows/check_patchgen.yml` | `setup-uv` `version: "X.Y.Z"` |
 
 Every Dockerfile is standalone and hand-maintained — the Jinja template
 generator and its matrix were dropped in #1133, so nothing fans a pin out for
@@ -30,29 +29,31 @@ grep -rnE "torch(-npu)?==" docker/  # same for torch; -npu is the ascend form
 ```
 pyproject.toml
 ├── [project.dependencies]              Core deps (always installed, transformers NOT included here)
-├── [project.optional-dependencies]     Hardware extras + optional Magi extra + legacy `dev`
-│   ├── gpu          NVIDIA x86_64 / aarch64 (glibc 2.34+) — full superset:
+├── [project.optional-dependencies]     Hardware extras + optional Magi / float8 / Hyper extras + legacy `dev`
+│   ├── gpu          NVIDIA x86_64 / aarch64 — full superset (kernel-specific libc requirements):
 │   │                  torch 2.11.0+cu130 + cu130 nvidia stack + cuda-python
 │   │                  + FA2 on x86_64 (cp311/cp312 wheels)
-│   │                  + FA3 / FlashMLA wheels on both architectures
+│   │                  + FA3 / FlashMLA / DeepGEMM wheels on both architectures
 │   │                  + FA4 / FlashQLA (pure-Python PyPI wheels)
 │   │                  + liger-kernel + FLA + quack + TileLang/TileKernels + DLPack ext
 │   │                  + diffusers / av / librosa / soundfile / ftfy / peft
 │   │                  + megatron-energon (optional dataset format)
-│   ├── magi         Optional NVIDIA SM90+ MagiAttention FFA (combine with gpu):
+│   ├── magi         Optional NVIDIA SM100+ MagiAttention FFA (combine with gpu):
 │   │                  magi-attention + create-block-mask-cuda + flash-attn-cute
 │   │                  + magi-to-hstu-cuda + debugpy; source-built CUDA extensions
+│   ├── float8       Optional torchao==0.18.0 for float8 training and the torchao FP4 QAT rows (combine with gpu);
+│   │                  kept out of gpu so jobs that use neither skip the wheel (and keep PEFT interop)
 │   ├── npu          Ascend NPU x86_64 — full superset, minus CUDA-only kernels:
 │   │                  torch 2.10.0+cpu + torch-npu 2.10.0
 │   │                  + diffusers / av / audio / video / peft / megatron-energon
 │   ├── npu_aarch64  Ascend NPU aarch64 — full superset except torchcodec:
 │   │                  torch 2.10.0 + torch-npu 2.10.0 + the same data/model deps
+│   ├── hyper        Optional HyperParallel (combine with npu or npu_aarch64; pinned Git source)
 │   └── dev          pre-commit, ruff, pytest (legacy pip-style; modern uv path is the dev group)
 ├── [dependency-groups]                 Dev-only (uv-native)
-│   ├── dev                  includes lint + test + patchgen
+│   ├── dev                  includes lint + test
 │   ├── lint                 pre-commit, ruff
 │   ├── test                 pytest, expecttest, rich
-│   ├── patchgen             patchgen (path source under patchgen-pkg/)
 │   └── transformers-stable  transformers==5.16.1 (default, in default-groups)
 ├── [tool.uv]
 │   ├── required-version     Allowed uv version range
@@ -60,7 +61,7 @@ pyproject.toml
 │   ├── conflicts            gpu/npu/npu_aarch64 mutual exclusion;
 │   │                        magi also conflicts with npu / npu_aarch64
 │   └── sources              Custom indexes, direct wheel URLs (av, torch,
-│                            FA2 cp311/cp312, FA3 sm90 abi3, FlashMLA);
+│                            FA2 cp311/cp312, FA3 sm90 abi3, FlashMLA, DeepGEMM);
 │                            git sources (MagiAttention and its three companions)
 └── uv.lock                  Lockfile (committed, used by Docker --locked)
 ```
@@ -73,23 +74,29 @@ conflicts with the NPU extras.
 
 ```bash
 uv sync --extra gpu --dev                      # NVIDIA GPU
-uv sync --extra gpu --extra magi --dev         # NVIDIA GPU + MagiAttention (SM90+)
+uv sync --extra gpu --extra magi --dev         # NVIDIA GPU + MagiAttention (SM100+)
+uv sync --extra gpu --extra float8 --dev       # NVIDIA GPU + torchao (float8 training SM89+, FP4 QAT rows)
 uv sync --extra npu --dev                      # Ascend NPU x86
 uv sync --extra npu_aarch64 --dev              # Ascend NPU ARM
 ```
 
 A fresh `--extra gpu` installs architecture-specific torch, torchcodec, AV,
-FA3, and FlashMLA wheels. FA2 is installed from prebuilt wheels on x86_64 and
+FA3, FlashMLA, and DeepGEMM wheels. FA2 is installed from prebuilt wheels on x86_64 and
 omitted on aarch64. FA4 and FlashQLA are pure-Python PyPI wheels.
-The aarch64 FA3 wheel requires glibc 2.34 or newer. uv caches built wheels
+The aarch64 FA3 wheel requires glibc 2.34 or newer. DeepGEMM has stricter
+host requirements listed below. uv caches built wheels
 under `~/.cache/uv`. MagiAttention is not part of that default GPU set:
-`--extra magi` also pulls `gpu` and source-builds SM90/SM100 CUDA extensions.
-Omit it on Ampere/Ada (SM80/SM89) and CPU environments.
+`--extra magi` also pulls `gpu` and source-builds SM100 CUDA extensions.
+Omit it on older GPUs and CPU environments.
 
 The `npu` and `npu_aarch64` extras both install the complete Ascend software
 stack and multimodal dependencies. Only `npu_aarch64` omits `torchcodec`
 because no compatible aarch64 wheel is available; build it from source when
 video decoding is required.
+
+HyperParallel is optional: add `--extra hyper` alongside `npu` or `npu_aarch64`.
+Its Git revision is pinned in `tool.uv.sources` and `uv.lock`.
+See `docs/key_features/hyper_parallel.md` for installation instructions.
 
 ## Transformers Version
 
@@ -103,6 +110,22 @@ forced into a specific 5.x patch.
   pytorch index) — avoids uv resolving cu128_full wheels that drop nvidia-* deps.
 - **NPU**: pytorch index (`https://download.pytorch.org/whl/`).
 
+## DeepGEMM FP8 MoE
+
+The `gpu` extra pins `deep-gemm==2.8.2+5081f85` to four verl-wheelhouse
+release URLs in `[tool.uv.sources]`: Python 3.11/3.12 × x86_64/aarch64, built
+for torch 2.11.0 and CUDA 13.0.2. Update all four URLs and regenerate `uv.lock`
+when changing the source revision or torch/CUDA ABI. CPU-only and NPU extras
+must not acquire this dependency.
+
+These native Ubuntu 24.04 wheels require glibc >=2.38 and libstdc++ symbols
+through GLIBCXX_3.4.31 (x86_64) or GLIBCXX_3.4.29 (aarch64). They package the
+host extension and DeepJIT/CUTLASS headers; runtime kernel JIT still needs
+NVCC and a C++20 compiler (validated with GCC 13). The backend is lazy-imported
+and selected explicitly with `moe_implementation: deepgemm`; installing
+the GPU extra does not enable FP8 or import DeepGEMM on unsupported GPUs.
+See `docs/design/deepgemm_moe.md` for supported shapes and precision.
+
 ## Attention Kernels
 
 | Package | Source | Notes |
@@ -112,9 +135,15 @@ forced into a specific 5.x patch.
 | `kernels` | PyPI `0.16.0` | Optional `flash_attention_{2,3}_hub` runtimes load pinned version 1 of `kernels-community/flash-attn{2,3}`; local FA2/FA3 remain the defaults. Its Sigstore verification stack adds crypto/TUF dependencies and resolves Pydantic 2.13.x in the Linux GPU environment. |
 | `flash-mla` | cp311/cp312 Luosuu cu130/torch2.11/sm90a+sm100f wheels | architecture-specific x86_64/aarch64 wheels |
 | `flash-attn-4` (cute) | PyPI `4.0.0b16` | pure-Python wheel |
-| `flash-qla` | PyPI `0.1.2` | pure-Python wheel that publishes usable metadata (it declares only `apache-tvm-ffi`), so no source build and no `dependency-metadata` override |
+| `flash-qla` | PyPI `0.1.2` | pure-Python wheel with usable metadata; requires TileLang 0.1.9; full forward/backward support on SM90 and SM100 |
 | `tile-kernels` | PyPI `1.0.0` | DeepSeek V4 mHC forward/backward; requires TileLang 0.1.9 and SM90+ |
-| `magi-attention` + `create-block-mask-cuda`, `flash-attn-cute`, `magi-to-hstu-cuda` | git revs | optional `--extra magi`; SM90/SM100 source builds, omitted by the default GPU CI install |
+| `magi-attention` + `create-block-mask-cuda`, `flash-attn-cute`, `magi-to-hstu-cuda` | git revs | optional `--extra magi`; SM100 source builds, omitted by the default GPU CI install |
+| `torchao` | PyPI `0.18.0` | optional `--extra float8`, backend of the `torchao` low-precision op rows (`fp8`, `nvfp4`, `mxfp4`); exact pin checked at runtime by `veomni/ops/torchao.py`, omitted by the default GPU CI install, so the float8 GPU tests and the torchao QAT tests skip there. Incompatible with the `gpu` extra's `peft==0.18.1` torchao integration (`LinearActivationQuantizedTensor` removed), so PEFT interop fails with the extra installed |
+
+FlashQLA 0.1.2 supports full forward/backward execution on NVIDIA SM90 and
+SM100. Its SM120 path is forward-only, so VeOmni's full op registration is
+limited to the SM90-SM100 range. The GPU extra also installs
+`tile-kernels==1.0.0`, which requires `tilelang>=0.1.9`.
 
 `flash-qla` and `tile-kernels` must agree on one TileLang version, so
 `[tool.uv].override-dependencies` pins the shared GPU environment to
@@ -149,7 +178,7 @@ pinned `demonatic/flash-attention` fork, and it takes its toolchain from
 
 ```bash
 uv sync --extra gpu --dev                          # local dev (cp311 or cp312)
-uv sync --extra gpu --extra magi --dev             # + MagiAttention (SM90+)
+uv sync --extra gpu --extra magi --dev             # + MagiAttention (SM100+)
 uv lock                                             # after pyproject edits
 uv sync --locked --all-packages --extra gpu --dev  # docker / CI (no magi)
 ```
@@ -163,4 +192,4 @@ uv sync --locked --all-packages --extra gpu --dev  # docker / CI (no magi)
 4. **uv bumps require Docker rebuilds**; concrete pins must stay in range.
 5. **`override-dependencies` `extra == '...'` markers are load-bearing.**
 6. **`transformers==5.16.1` is the only supported version.** New code targets
-   v5 + FSDP2 + patchgen-generated modeling.
+   v5 + FSDP2 + standalone `modeling_<m>.py` modules.

@@ -16,6 +16,11 @@
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
 
 def test_preprocessor_registration():
     """Test that custom preprocessors can be registered"""

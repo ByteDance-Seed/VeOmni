@@ -3,6 +3,16 @@
 
 model:
   model_path: DeepSeek-V4-Flash-Base
+  # Optional DeepSeek-V4 model_config overrides (DSpark MTP & DSA indexer loss):
+  # model_config:
+  #   dspark_block_size: 0
+  #   dspark_noise_token_id: 128799
+  #   dspark_target_layer_ids: null
+  #   dspark_markov_rank: 256
+  #   dspark_n_routed_experts: null
+  #   dspark_num_experts_per_tok: null
+  #   mtp_loss_coef: 1.0
+  #   freeze_mtp: false
   ops_implementation:
     attn_implementation: eager
     moe_implementation: fused_triton
@@ -11,17 +21,11 @@ model:
     dsa_indexer_implementation: tilelang
     mhc_implementation: tilelang
     rms_norm_implementation: liger_kernel
-    swiglu_mlp_implementation: liger_kernel
+    gated_mlp_implementation: liger_kernel
     rotary_pos_emb_implementation: triton
-    # FP8 quantization-aware training. `fp8_blockwise` fake-quantizes the
-    # operands of every attention/indexer projection FP8 inference runs as a true
-    # FP8 GEMM, plus the KV entries and index logits it rounds, so training sees
-    # deployment's rounding. Routed experts are covered on the fused-MoE path
-    # only, and follow the checkpoint's `expert_dtype` (FP4 on V4-Flash).
-    # Needs SM90+.
-    qat_implementation: none
   optimizer:
-    # Muon + AdamW: 2D hidden / 3D expert stacks use Muon; embed/lm_head/norms/bias use AdamW.
+    # Muon + AdamW: 2D hidden / 3D expert stacks use Muon; embed/lm_head/norms/bias and
+    # routing/gating matrices (mHC, `gate`, `weights_proj`, compressor gates) use AdamW.
     # Switch back with `type: adamw` if needed.
     type: muon
     lr: 3.0e-4
