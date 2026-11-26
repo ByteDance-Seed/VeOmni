@@ -159,13 +159,13 @@ def test_explicit_npu_value_is_kept_on_npu(field_name: str, value: str, monkeypa
         ("cross_entropy_loss_implementation", "liger_kernel"),
         ("rms_norm_implementation", "liger_kernel"),
         ("gated_mlp_implementation", "liger_kernel"),
-        ("linear_implementation", "torchao_mxfp4"),
+        ("linear_implementation", "torchao"),
         ("kv_round_implementation", "triton"),
         ("rotary_pos_emb_implementation", "liger_kernel"),
         ("load_balancing_loss_implementation", "triton"),
     ],
 )
-def test_explicit_gpu_default_raises_on_npu(field_name: str, value: str, monkeypatch: pytest.MonkeyPatch):
+def test_explicit_gpu_default_raises_on_npu(field_name: str, value: str, monkeypatch):
     _set_host(monkeypatch, "npu")
     with pytest.raises(ValueError, match=f"{field_name}='{value}' is not supported on Ascend NPU"):
         OpsImplementationConfig(**{field_name: value})

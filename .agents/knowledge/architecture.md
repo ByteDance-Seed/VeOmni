@@ -106,6 +106,23 @@ veomni/
 
 Flex is a package under `veomni/ops/kernels/attention/standard/flex/`: `__init__.py` owns dispatch/Ulysses, `_inputs.py` owns input handling, `_fa4.py` owns compiled execution, and `_fa4_sm90_compat.py` owns the pinned bounds shim. The mask builder remains in `attention/mask/flex.py`.
 
+## Optional HyperParallel Integration
+
+FSDP/HSDP and Muon are selected independently:
+
+```yaml
+model:
+  accelerator:
+    fsdp_config:
+      fsdp_mode: hyper_fsdp2
+  optimizer:
+    type: hyper_muon
+```
+
+Text and VLM trainers load the adapter before model construction; native jobs
+do not require HyperParallel. Normal trainer teardown removes the patch.
+The supported training entry points are the Text and VLM trainers.
+
 ## Trainer Hierarchy
 
 A training job splits in two. `VeOmniModelRuntime` (`veomni/models/model_runtime.py`) owns everything bound to *one* model; `BaseTrainer` *holds* one as `trainer.model` and adds everything bound to the *job*, of which there is exactly one. A single-model job is one runtime inside one trainer; a composed omni model is many runtimes under one orchestrator, which is why the trainer composes the runtime rather than inheriting it — `OmniTrainer` holds several and could not inherit them all.
@@ -269,10 +286,10 @@ VeOmni uses FSDP2 exclusively.
    - `fully_shard()` on root model
 4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
-   - `moe_experts/standard/deepgemm_fp8` uses the same dispatch with
+   - `moe_experts/standard/deepgemm` uses the same dispatch with
      Hopper/Blackwell FP8 grouped forward/dgrad/wgrad in `ops/kernels/moe_experts/`.
      FSDP2 and EP communication retain their configured precision. Quantized
-     weights are invocation-local; see `docs/design/deepgemm_fp8_moe.md`.
+     weights are invocation-local; see `docs/design/deepgemm_moe.md`.
 6. Qwen4-Exp PLE is a model-specific exception: its embedding tables remain
    persistent DTensors on the full `(ple_fsdp, ple)` mesh with placements
    `[Shard(1), Shard(0)]`. FSDP2 ignores those parameters, and PLE routes sparse

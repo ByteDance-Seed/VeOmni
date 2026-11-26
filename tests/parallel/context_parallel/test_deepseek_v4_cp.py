@@ -28,6 +28,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from scripts.ci.accelerator.launch_plan import (
+    SCHEDULED_BACKENDS,
     LaunchSpec,
     from_parameter,
     runner_device_count,
@@ -35,7 +36,6 @@ from scripts.ci.accelerator.launch_plan import (
 from veomni.models.configuration_base import as_veomni_config
 from veomni.utils.device import (
     IS_CUDA_AVAILABLE,
-    IS_NPU_AVAILABLE,
     get_device_type,
     get_dist_comm_backend,
     get_gpu_compute_capability,
@@ -62,14 +62,14 @@ def _load_dsv4_toy_config(**ops_overrides):
 def _accelerator_device_count() -> int:
     """Devices this suite can run on: the runner's own accelerator cards.
 
-    Context parallelism is admitted on CUDA and, with the eager DSA operators,
-    on Ascend, and these workers build the backend's patched module directly, so
-    a plain device count is the right eligibility test. A host on any other
-    backend reports 0 and skips -- asking the scheduler for its capabilities
-    would raise, and this helper feeds a skip decorator, so it runs during
-    collection.
+    Context parallelism is admitted on CUDA and on Ascend for `deepseek_v4`,
+    whose DSA operators may be `eager` or `cann`, and these workers build the
+    backend's patched module directly, so a plain device count is the right
+    eligibility test. A CPU-only host reports 0 and skips, as does a backend the
+    scheduler does not model -- asking for its capabilities would raise, and this
+    helper feeds a skip decorator, so it runs during collection.
     """
-    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE):
+    if get_device_type() not in SCHEDULED_BACKENDS:
         return 0
     return runner_device_count()
 
