@@ -17,8 +17,8 @@ from veomni.utils.tensor_utils import unflatten
 from .......distributed.parallel_plan import ParallelPlan
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from .....utils.conversation import ConversationItem, is_backbone_input
-from ....base.llm_packing import scatter_llm_hidden_states
+from .....utils.conversation import ConversationItem
+from ...carrier import is_thinker_input, scatter_hidden_states
 from ..configuration import Qwen3OmniLlmConfig
 from ..modeling import (
     THINKER_EMBED,
@@ -207,7 +207,7 @@ class TrainingMixin(TrainingModuleMixin):
 
         if hidden_states.dim() == 3 and hidden_states.size(0) == 1:
             hidden_states = hidden_states.squeeze(0)
-        scatter_llm_hidden_states(conversation, unflatten(hidden_states, pack_shape))
+        scatter_hidden_states(conversation, unflatten(hidden_states, pack_shape))
         if traces:
             _scatter_thinker_traces(conversation, *(unflatten(_unbatch(t), pack_shape) for t in traces))
 
@@ -319,7 +319,7 @@ def _scatter_thinker_traces(
 ) -> None:
     """Leave each item's slice of the two traces on the item itself.
 
-    ``item.value`` is already spoken for — ``scatter_llm_hidden_states`` puts
+    ``item.value`` is already spoken for — ``scatter_hidden_states`` puts
     the final hidden state there for the text head — so these go to ``meta``.
     Same walk, same order, so an item's traces line up with the value beside
     them, and the talker can read a prompt straight off the carrier instead of
@@ -329,7 +329,7 @@ def _scatter_thinker_traces(
     for sample in conversation:
         for part in sample:
             # Same skip as the packer: these are paired by position.
-            if not is_backbone_input(part):
+            if not is_thinker_input(part):
                 continue
             part.meta[THINKER_EMBED] = next(embeds_iter)
             part.meta[THINKER_HIDDEN] = next(hiddens_iter)

@@ -26,7 +26,7 @@ from veomni.utils.tensor_utils import naflatten, unflatten
 from ....mixins.base_mixin import BaseMixin
 from ....mixins.metric_meter_mixin import MetricMeterMixin
 from ....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from ....utils.conversation import ConversationItem, is_backbone_input
+from ....utils.conversation import ConversationItem
 from ...base.llm_packing import item_token_len
 from ...base.sp_shard import sp_local_len, sp_valid_in_window, split_sp_sharded_tensor
 from ..chat_template import TextEncoderChatTemplate
@@ -172,11 +172,7 @@ class TrainingMixin(TrainingModuleMixin):
         for sample in conversation_list or []:
             sample_start = decode_len
             for part in sample:
-                # Skips dummy anchors AND rows marked ``_NOT_BACKBONE_INPUT`` — a
-                # target for a downstream head (Qwen3-Omni's assistant speech) that
-                # never entered the backbone and holds a raw waveform here, not the
-                # hidden states this walk expects.
-                if not is_backbone_input(part):
+                if part.is_dummy:
                     continue
                 hidden_states = part.value
                 if hidden_states.dim() == 3:

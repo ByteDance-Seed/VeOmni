@@ -1,0 +1,44 @@
+# Qwen3-Omni joint training DAG — thinker and talker in one backward.
+#
+# The two single-round graphs train one half each, with the other frozen:
+#
+#   train/graph_train.yaml         thinker only, text CE, talker absent
+#   train_talker/graph_train.yaml  talker only, thinker frozen, no text CE
+#
+# This graph runs both losses over the same batch. That is what the upstream
+# model does in a single fine-tuning pass, and it is the only arrangement where
+# the talker learns to speak what *this* thinker says rather than what a frozen
+# snapshot said before training started.
+#
+# Both ends of the graph terminate at `end`, so `OmniModel.forward` sums their
+# `_loss` terms: the text encoder's CE and the talker's semantic+residual CE.
+# Everything the talker reads travels on the carrier, so the edges below are
+# ordering constraints as much as data plumbing:
+#
+#   qwen3omni_codec.encode        -> meta[TALKER_CODE_LABELS]   (the target)
+#   qwen3omni_llm                 -> meta[THINKER_EMBED] / [THINKER_HIDDEN]
+#   qwen3omni_text_encoder.encode -> meta[TALKER_PROMPT]
+#
+# Three things have to be true in the module list for this to work, and the
+# talker names whichever one is missing rather than failing on a shape:
+#
+#   * `qwen3omni_llm.collect_thinker_states: true` — the talker reads an interior
+#     layer, so the backbone must retain the stack.
+#   * `qwen3omni_text_encoder.publish_talker_prompt: true` — the token-level
+#     prompt view, which the segmented carrier does not otherwise hold.
+#   * `qwen3omni_text_encoder.decode` present — without it there is no text loss
+#     and the thinker half is not trained at all, which is what makes this graph
+#     distinct from the talker round rather than a copy of it.
+#
+# The traces stay detached (`_thinker_traces` detaches them), so the talker's
+# gradient does not flow back through the thinker. The thinker learns from its
+# own CE. Letting the talker's loss reach it would keep every thinker activation
+# alive for a parameter update that the CE already performs.
+- { from: qwen3omni_audio,                to: qwen3omni_llm }                  # speech/sound embeds
+- { from: qwen3omni_vision,               to: qwen3omni_llm }                  # image/video embeds
+- { from: qwen3omni_text_encoder.encode,  to: qwen3omni_llm }                  # tokenise + wte
+- { from: qwen3omni_llm,                  to: qwen3omni_text_encoder.decode }  # text CE head
+- { from: qwen3omni_text_encoder.decode,  to: end }                            # thinker loss
+- { from: qwen3omni_llm,                  to: qwen3omni_talker }               # thinker traces
+- { from: qwen3omni_codec.encode,         to: qwen3omni_talker }               # waveform -> RVQ targets
+- { from: qwen3omni_talker,               to: end }                            # talker loss

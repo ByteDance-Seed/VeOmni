@@ -17,8 +17,9 @@ from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 from veomni.ops import VeomniOp
 from veomni.utils.tensor_utils import naflatten
 
-from ....utils.conversation import ConversationItem, is_backbone_input
+from ....utils.conversation import ConversationItem
 from ...module_modeling_base import PretrainedOmniModule
+from ..carrier import is_thinker_input
 from .configuration import Qwen3OmniLlmConfig
 
 
@@ -125,7 +126,7 @@ def pack_qwen3omni_conversations_for_forward(
         current_pos = 0.0
         for item in sample:
             # Assistant audio is the talker's label; the thinker never reads it.
-            if not is_backbone_input(item):
+            if not is_thinker_input(item):
                 continue
             embeds = item.value.to(device)
             length = embeds.size(0)

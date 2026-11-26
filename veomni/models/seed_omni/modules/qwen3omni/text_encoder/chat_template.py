@@ -24,8 +24,9 @@ from typing import Any
 
 import torch
 
-from ....utils.conversation import _NOT_BACKBONE_INPUT, ConversationItem, is_backbone_input
+from ....utils.conversation import ConversationItem
 from ...text_encoder.chat_template import TextEncoderChatTemplate
+from ..carrier import is_thinker_input
 
 
 # The placeholder token each modality expands to at the token level. V2 never
@@ -127,7 +128,7 @@ class Qwen3OmniChatTemplate(TextEncoderChatTemplate):
         """
         ids: list[torch.Tensor] = []
         for item in parts:
-            if not is_backbone_input(item):
+            if not is_thinker_input(item):
                 continue
             if item.type == "text":
                 ids.append(item.value.reshape(-1).cpu())
@@ -207,12 +208,10 @@ class Qwen3OmniChatTemplate(TextEncoderChatTemplate):
                 continue
             if role == "assistant" and item.type == "audio":
                 # The talker's label, not a turn. Held back like the dummies so
-                # it stays on the carrier for the codec without taking a
-                # position in the ChatML the thinker reads — and *marked* as
-                # such, because every packer and hidden-state scatter downstream
-                # has to skip it by the same rule and cannot re-derive it from
-                # ``type`` alone (the user's audio is the same type).
-                item.meta[_NOT_BACKBONE_INPUT] = True
+                # it stays on the carrier for the codec without taking a position
+                # in the ChatML the thinker reads. Downstream walks recognise it
+                # by role/type through ``carrier.is_thinker_input``, so it needs
+                # no marker of its own.
                 deferred_parts.append(item)
                 continue
 

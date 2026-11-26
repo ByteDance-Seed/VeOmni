@@ -194,7 +194,11 @@ QWEN3OMNI_HF_LAYOUT = OmniHFLayout(
         ),
     },
     graph_dir="configs/seed_omni/Qwen/qwen3omni_30b_a3b",
-    training_graphs={"thinker": "train/graph_train.yaml", "talker": "train_talker/graph_train.yaml"},
+    training_graphs={
+        "thinker": "train/graph_train.yaml",
+        "talker": "train_talker/graph_train.yaml",
+        "joint": "train_joint/graph_train.yaml",
+    },
     generation_graphs={
         "audio_output": "infer/graph_infer_audio.yaml",
         "thinker_only": "infer/graph_infer_thinker_only.yaml",

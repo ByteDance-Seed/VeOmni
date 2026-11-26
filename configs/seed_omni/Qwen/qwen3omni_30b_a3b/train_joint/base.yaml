@@ -1,0 +1,135 @@
+# VeOmni joint training config for OmniModel V2 — Qwen3-Omni-30B-A3B-Instruct.
+#
+# Trains the thinker and the talker together: one backward carries the text CE
+# and the talker's semantic+residual CE. The single-round launchers next door
+# train one half with the other frozen; this one is what upstream does in a
+# single fine-tuning pass.
+#
+# Choose this over the two separate rounds when the talker has to learn to speak
+# what *this* thinker says. In the talker-only round the thinker is frozen, so
+# its traces come from a snapshot that stops improving while the talker trains.
+#
+# Prerequisite — the same split checkpoint the two rounds use, including the
+# Mimi encoder half:
+#   python scripts/seed_omni/convert_model.py \
+#     --model_path /path/to/Qwen3-Omni-30B-A3B-Instruct \
+#     --output_dir /path/to/qwen3omni-split \
+#     --extra mimi_path=kyutai/mimi
+#
+# Launch:
+#   bash train.sh tasks/omni/train_omni.py \
+#     configs/seed_omni/Qwen/qwen3omni_30b_a3b/train_joint/base.yaml
+#
+# The data mix has to carry both halves of a sample: supervised assistant *text*
+# (the thinker's target) and the assistant *audio* the talker learns to speak.
+# `train/data.yaml` has the text but no assistant speech; `train_talker/data.yaml`
+# has the speech but its text is the transcript of the same turn, which is what
+# the thinker is scored on here. See this directory's `data.yaml`.
+
+model:
+  model_path: /path/to/qwen3omni-split
+  model_config:
+    modules: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train_joint/modules_train.yaml
+    train_graph: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train_joint/graph_train.yaml
+    infer_graph:
+      audio_output: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/graph_infer_audio.yaml
+      thinker_only: configs/seed_omni/Qwen/qwen3omni_30b_a3b/infer/graph_infer_thinker_only.yaml
+    infer_type: audio_output
+
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+  accelerator:
+    init_device: meta
+    gradient_checkpointing:
+      # Both halves are trained here, so both recompute. The frozen rounds turn
+      # this off for whichever half has no gradient to produce; nothing is frozen
+      # in this one. The codec overrides it back off in `modules_train.yaml`,
+      # because it is never trained and its module cannot honour the flag.
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: true
+      reshard_after_backward: true
+      forward_prefetch: true
+      offload: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        # Off for the same reason as the other two launchers: a module-level cast
+        # rounds the backbone's float TMRoPE coordinates to bf16 (769 distinct
+        # values at 4096, up to 8 token positions of error). Every module casts
+        # inside its own forward off the real weight dtype instead.
+        cast_forward_inputs: false
+    offload_config:
+      enable_activation: false
+      activation_gpu_limit: 0.0
+
+  optimizer:
+    # Over the thinker and the talker. The codec has no trainable parameter, so
+    # `ModuleRuntime` gives it no optimizer at all.
+    type: adamw
+    lr: 1.0e-5
+    lr_min: 1.0e-6
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    no_decay_params: []
+    no_decay_modules: []
+
+data:
+  data_type: seedomni
+  max_seq_len: 4096
+  train_path: configs/seed_omni/Qwen/qwen3omni_30b_a3b/train_joint/data.yaml
+  datasets_type: iterable
+  multisource_datasets_type: veomni_weighted_multisource
+  train_sample: 1000000
+  dataloader:
+    type: native
+    num_workers: 4
+    # Required, like the talker round: the talker all-gathers its sharded layers
+    # once per utterance, so a short final batch would give the ranks different
+    # call counts. It raises rather than hangs, but the run still stops.
+    drop_last: true
+    pin_memory: true
+    prefetch_factor: 2
+  mm_configs:
+    use_audio_in_video: false
+    fps: 2.0
+    min_frames: 4
+    max_frames: 8
+
+train:
+  seed: 42
+  num_train_epochs: 1
+  global_batch_size: 32
+  micro_batch_size: 1
+  # Same reason as `drop_last`, and stricter here than in either single round: a
+  # data-dependent micro-batch would also make the thinker's CE and the talker's
+  # CE cover different sample counts within one backward.
+  dyn_bsz: false
+
+  checkpoint:
+    output_dir: outputs/qwen3omni_30b_a3b_joint_sft
+    save_steps: 500
+    save_epochs: 0
+    save_hf_weights: true
+    hf_save_steps: 500
+    hf_save_epochs: 0
+  wandb:
+    enable: true
+    project: VeOmni_omni
+    name: qwen3omni_30b_a3b_joint_sft
+
+infer:
+  generation_kwargs:
+    max_new_tokens: 2048
+    temperature: 0.0
+    top_p: 1.0
+    do_sample: false

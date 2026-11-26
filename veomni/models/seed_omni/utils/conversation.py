@@ -76,24 +76,6 @@ _IMG_TAG_KEY = "_img_tag"
 # can measure each sample's backbone token length before collation.
 _OMNI_TOKEN_LEN = "_omni_token_len"
 
-# Per-item marker: this row is a training target for a downstream head, not
-# input to the AR backbone. It stays on the carrier — the head that consumes it
-# finds it by ``type`` / ``role`` — but every packer and scatter that turns the
-# carrier into one backbone sequence must skip it, or that sequence gains rows
-# the backbone never computed for and every projection after the row shifts.
-#
-# Set by the module that owns the target (Qwen3-Omni's chat template marks the
-# assistant's reference speech, which is a label for the talker), never inferred
-# from ``type``: the same ``type="audio"`` row is backbone input on the user's
-# side and a target on the assistant's, so ``role`` alone is a family
-# convention, while this is a statement the row itself makes.
-#
-# Only Qwen3-Omni sets it today. A future family that keeps a non-embedding row
-# on the carrier for a downstream head must set it too, or the shared packers
-# will read that row as backbone input; a family whose sequence diverges further
-# than that (Qwen3-VL's M-RoPE, BAGEL's MoT mask) keeps its own packer instead.
-_NOT_BACKBONE_INPUT = "_not_backbone_input"
-
 
 @dataclass
 class ConversationItem:
@@ -167,21 +149,6 @@ def _format_value(value: Any) -> str:
     if isinstance(value, Mapping):
         return "{" + ", ".join(f"{k}: {_format_value(v)}" for k, v in value.items()) + "}"
     return f"[UnknownType]{type(value).__name__}"
-
-
-def is_backbone_input(item: ConversationItem) -> bool:
-    """Whether ``item`` takes a position in the AR backbone's packed sequence.
-
-    False for a dummy anchor (``is_dummy``), which exists only to keep an FSDP
-    unit's collectives in step, and for a row marked
-    :data:`_NOT_BACKBONE_INPUT` — a training target for a downstream head that
-    travels on the carrier without entering the sequence.
-
-    Every packer and every hidden-state scatter must agree on this predicate:
-    they pair rows to tensors by position, so one that keeps a row the other
-    skipped shifts every projection after it without raising.
-    """
-    return not item.is_dummy and not item.meta.get(_NOT_BACKBONE_INPUT, False)
 
 
 def maybe_merge_outputs(parts: list[ConversationItem]) -> bool:
@@ -327,8 +294,6 @@ __all__ = [
     "get_tail_output_item",
     "iter_desired_items",
     "collect_desired_values",
-    "is_backbone_input",
     "_IMG_TAG_KEY",
-    "_NOT_BACKBONE_INPUT",
     "_OMNI_TOKEN_LEN",
 ]

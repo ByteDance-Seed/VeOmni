@@ -6,9 +6,10 @@ import torch
 
 from ......utils.constants import IGNORE_INDEX
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
-from ....utils.conversation import ConversationItem, is_backbone_input, maybe_merge_outputs
+from ....utils.conversation import ConversationItem, maybe_merge_outputs
 from ...text_encoder.modeling import TextEncoder
 from ..carrier import PromptSegment as PromptSegment
+from ..carrier import is_thinker_input
 from .configuration import Qwen3OmniTextEncoderConfig
 from .processing import Qwen3OmniTextEncoderPreprocessor
 
@@ -36,9 +37,7 @@ def talker_prompt_segments(conversation: List[ConversationItem]) -> List[PromptS
     ``i`` is the same row as trace slice ``i``.
     """
     return [
-        PromptSegment(item.role, item.type, int(item.value.size(0)))
-        for item in conversation
-        if is_backbone_input(item)
+        PromptSegment(item.role, item.type, int(item.value.size(0))) for item in conversation if is_thinker_input(item)
     ]
 
 
@@ -64,7 +63,7 @@ def talker_supervised_mask(conversation: List[ConversationItem]) -> torch.Tensor
     """
     spans: List[torch.Tensor] = []
     for item in conversation:
-        if not is_backbone_input(item):
+        if not is_thinker_input(item):
             continue
         rows = int(item.value.size(0))
         labels = item.meta.get("labels")

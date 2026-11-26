@@ -35,10 +35,10 @@ from ......distributed.parallel_state import get_parallel_state
 from ......distributed.sequence_parallel import reduce_sequence_parallel_loss
 from ......utils.constants import IGNORE_INDEX
 from ....graphs.generation_graph import FSM_SIGNAL_KEY
-from ....utils.conversation import ConversationItem, is_backbone_input
+from ....utils.conversation import ConversationItem
 from ...module_modeling_base import PretrainedOmniModule
 from ..audio.processing import _OMNI_MEL_LEN as _MEL_LEN_KEY
-from ..carrier import TALKER_CODES_KEY
+from ..carrier import TALKER_CODES_KEY, is_thinker_input
 from .configuration import Qwen3OmniTalkerConfig
 
 
@@ -106,7 +106,7 @@ def collect_media_metadata(conversation_list: Sequence[ConversationItem]) -> Dic
     # placeholder run to expand -- it never entered the sequence. It also carries
     # no mel length, since the audio tower only ever looked at the user's side.
     for item in conversation_list:
-        if not is_backbone_input(item):
+        if not is_thinker_input(item):
             continue
         if item.type == "audio":
             audio_lengths.append(int(item.meta[_MEL_LEN_KEY]))

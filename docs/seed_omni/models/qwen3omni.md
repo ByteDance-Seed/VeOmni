@@ -82,6 +82,10 @@ Config dir: `configs/seed_omni/Qwen/qwen3omni_30b_a3b/`
 | `train_talker/modules_train.yaml` | All six modules — thinker frozen, talker the only trainee. |
 | `train_talker/graph_train.yaml` | Training DAG for the talker. |
 | `train_talker/data.yaml` | Points at the generated assistant-speech corpus (see §4). |
+| `train_joint/base.yaml` | Launcher for the joint round — thinker and talker in one backward. |
+| `train_joint/modules_train.yaml` | All six modules, nothing frozen. |
+| `train_joint/graph_train.yaml` | Training DAG carrying both the text CE and the talker CE. |
+| `train_joint/data.yaml` | The talker corpus — the one shape carrying both targets. |
 | `infer/modules_infer_eager.yaml` | Single-process eager module list (no FSDP wrap). |
 | `infer/modules_infer_eager_audio.yaml` | The same list plus the checkpoint's speech system turn. |
 | `infer/graph_infer_audio.yaml` | Generation FSM: thinker text → talker codes → waveform. |
@@ -341,27 +345,27 @@ waveform that says it. The shipped `voice_assistant` source is the opposite shap
 — a spoken question with a text answer — so its clip is a tower input, and
 nothing else shipped here has assistant speech at all.
 
-`scripts/seed_omni/qwen3omni_build_talker_corpus.py` produces one by running the
-speech graph over real prompts and recording both halves of each reply. The
-`voice_assistant_talker` preprocessor (`veomni/data/seed_omni/preprocess.py`)
-requires both parts of the assistant turn and pairs clips to turns by position.
+Producing that corpus means running the speech graph over real prompts and
+recording both halves of each reply. The `voice_assistant_talker` preprocessor
+(`veomni/data/seed_omni/preprocess.py`) consumes that shape: it requires both
+parts of the assistant turn and pairs clips to turns by position, refusing a
+count mismatch in either direction.
 
 Being the model's own speech makes this self-distillation: enough to make the
 round runnable and to overfit a sample end to end, not enough to teach the talker
 anything it does not already say. A TTS corpus of the same row shape is the
 substitute for a run whose output is meant to be a better talker.
 
-The generator's own filters read metadata and cannot hear that a clip is fluent
-noise, so
-`scripts/seed_omni/qwen3omni_filter_talker_corpus.py` transcribes every clip back
-through the thinker-only graph and drops the rows whose speech does not say their
-text (`--score`, then `--apply --min-overlap 0.6`). That pass is not optional.
+A generator's own metadata filters cannot hear that a clip is fluent noise, so a
+generated corpus needs a listening pass: transcribe each clip back through the
+`thinker_only` graph (see §2) and drop the rows whose speech does not say their
+text. Skipping it trains the talker on clips that are not utterances.
 
 ### What the codec sharing was verified to mean
 
-`scripts/seed_omni/qwen3omni_audio_check.py` measures both directions on real
-checkpoints. Audio-level agreement is good; code-level agreement is **not**
-identity and must not be expected to be. One run, for orientation:
+Measuring both directions on real checkpoints is the only way to settle this.
+Audio-level agreement is good; code-level agreement is **not** identity and must
+not be expected to be. One run on the released checkpoint, for orientation:
 
 ```
 log-STFT L1 vs the talker's own audio (lower is better)
@@ -407,24 +411,12 @@ pytest tests/seed_omni/modules/qwen3omni/ tests/seed_omni/test_shipped_training_
 ```
 
 The codec is the one module that can be partly exercised against real weights
-without the Qwen checkpoint, and was — see §4. `--mimi-only` reproduces exactly
-those numbers (it never reads `--model`):
-
-```bash
-python scripts/seed_omni/qwen3omni_audio_check.py --mimi-only \
-  --mimi /path/to/kyutai-mimi \
-  --out-dir /tmp/mimi_only_check
-```
-
-The two-codec comparison in §4 needs **both** checkpoints, since it has to run
-the talker to obtain codes:
-
-```bash
-python scripts/seed_omni/qwen3omni_audio_check.py \
-  --model /path/to/Qwen3-Omni-30B-A3B-Instruct \
-  --mimi /path/to/kyutai-mimi \
-  --out-dir /tmp/omni_check
-```
+without the Qwen checkpoint, and was — see §4. Loading `kyutai/mimi`, checking its
+config against what `Qwen3OmniCodecConfig` expects (rate, quantizers,
+samples/frame on both sides) and round-tripping a tone reproduces those numbers;
+`Qwen3OmniCodec.encode_wav` returning `(num_quantizers, T)` is the contract the
+talker is written against. The two-codec comparison in §4 needs **both**
+checkpoints, because it has to run the talker to obtain codes at all.
 
 ```{note}
 Still unverified here: training and generation end to end, and the index-space

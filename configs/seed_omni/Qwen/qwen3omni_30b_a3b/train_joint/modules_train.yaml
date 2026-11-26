@@ -1,0 +1,63 @@
+# Joint round: every module is declared, and nothing is frozen.
+#
+# The two single-round lists each freeze one half — `train/modules_train.yaml`
+# omits the talker and codec entirely, `train_talker/modules_train.yaml` freezes
+# the four thinker modules. Here all six are declared and trainable, because the
+# graph in `graph_train.yaml` carries both losses.
+#
+# The two `model_config` flags are what the talker reads and cannot produce for
+# itself; leaving either off does not fail silently, the talker names the missing
+# flag.
+qwen3omni_audio:
+  model_path: qwen3omni_audio
+
+qwen3omni_vision:
+  model_path: qwen3omni_vision
+
+qwen3omni_text_encoder:
+  model_path: qwen3omni_text_encoder
+  accelerator:
+    # The text encoder is an embedding table plus an lm_head — no layers to
+    # recompute — and its accelerated class does not declare
+    # `supports_gradient_checkpointing`, so inheriting the launcher's `enable: true`
+    # would abort during the build.
+    gradient_checkpointing:
+      enable: false
+  model_config:
+    # The talker's 3D RoPE is built by scanning a token sequence. The segmented
+    # carrier holds embeddings here, so this is the only place the ids still
+    # exist — captured before the backbone's scatter overwrites them.
+    publish_talker_prompt: true
+
+qwen3omni_llm:
+  model_path: qwen3omni_llm
+  model_config:
+    # The talker reads an interior layer of the thinker, so the backbone has to
+    # retain the whole stack. Trained in this round, unlike the talker-only one.
+    collect_thinker_states: true
+
+qwen3omni_talker:
+  model_path: qwen3omni_talker
+  model_config:
+    # The two heads score different element counts (T+1 semantic rows against
+    # T*(G-1) residual codes at G=16), so at 1.0 each the residual term dwarfs
+    # the semantic one. Start balanced and rebalance if the semantic head stalls.
+    semantic_loss_weight: 1.0
+    residual_loss_weight: 1.0
+
+qwen3omni_codec:
+  model_path: qwen3omni_codec
+  accelerator:
+    # `Qwen3OmniCodec.supports_gradient_checkpointing` is False and
+    # `gradient_checkpointing_enable` raises on a module that does not support it,
+    # so inheriting the launcher's `enable: true` would abort during the build.
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      # fp32 against the launcher's bf16: this module produces the talker's
+      # labels, and a bf16 Mimi encoder changes ~32% of the code indices it
+      # emits — free label noise on the only supervised signal for the talker.
+      mixed_precision:
+        enable: true
+        param_dtype: float32
+        reduce_dtype: float32

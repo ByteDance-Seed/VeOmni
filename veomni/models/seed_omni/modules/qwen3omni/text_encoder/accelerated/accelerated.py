@@ -8,15 +8,21 @@ chat-template binding.
 from typing import Any, Dict, Optional
 
 import torch
+import torch.nn.functional as F
+
+from veomni.utils.constants import IGNORE_INDEX
 
 from .....mixins.training_module_mixin import post_forward, pre_forward
-from .....utils.conversation import ConversationItem, is_backbone_input
+from .....utils.conversation import ConversationItem
+from ....base.llm_packing import item_token_len
+from ....base.sp_shard import sp_local_len, sp_valid_in_window
 from ....text_encoder.accelerated import (
     TrainingMixin as BaseTrainingMixin,
 )
 from ....text_encoder.accelerated import (
     VeOmniMixin as BaseVeOmniMixin,
 )
+from ...carrier import is_thinker_input
 from ..chat_template import Qwen3OmniChatTemplate
 from ..configuration import Qwen3OmniTextEncoderConfig
 from ..modeling import (
@@ -93,7 +99,7 @@ def _stash_talker_prompts(
     """
     for sample, payload in zip(conversation_list, payloads, strict=True):
         host = next(
-            (item for item in sample if is_backbone_input(item)),
+            (item for item in sample if is_thinker_input(item)),
             None,
         )
         if host is None:
@@ -102,6 +108,73 @@ def _stash_talker_prompts(
                 "leave the talker's prompt view."
             )
         host.meta[TALKER_PROMPT] = payload
+
+    def _prepare_decode_inputs(
+        self,
+        conversation_list: Optional[list[ConversationItem]],
+        ps: Any = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decode ``(hidden_states, shift_labels)``, skipping this family's labels.
+
+        Overridden rather than inherited: the base walk skips only dummy rows, and
+        this carrier also holds the assistant's speech — a talker label that never
+        entered the thinker's forward and still carries a raw waveform, not hidden
+        states. Walking into it would append that waveform to the scored sequence.
+
+        Otherwise identical to the base implementation, including the SP window
+        handling; see
+        :meth:`~...text_encoder.accelerated.accelerated.TrainingMixin._prepare_decode_inputs`.
+        """
+        sharded = ps is not None
+        hidden_states_chunks: list[torch.Tensor] = []
+        label_chunks: list[torch.Tensor] = []
+        sample_starts: list[int] = []
+        decode_len = 0
+
+        for sample in conversation_list or []:
+            sample_start = decode_len
+            for part in sample:
+                if not is_thinker_input(part):
+                    continue
+                hidden_states = part.value
+                if hidden_states.dim() == 3:
+                    hidden_states = hidden_states.squeeze(0)
+                if part.type == "text":
+                    labels = part.meta["labels"]
+                    if not sharded:
+                        assert labels.shape[0] == hidden_states.shape[0]
+                    hidden_states_chunks.append(hidden_states)
+                    label_chunks.append(labels)
+                    decode_len += int(labels.shape[0])
+                elif sharded:
+                    seg_len = item_token_len(part)
+                    hidden_states_chunks.append(hidden_states)
+                    label_chunks.append(torch.full((seg_len,), IGNORE_INDEX, dtype=torch.long))
+                    decode_len += seg_len
+                else:
+                    hidden_states_chunks.append(hidden_states[-1:])
+                    label_chunks.append(torch.full((1,), IGNORE_INDEX, dtype=torch.long))
+                    decode_len += 1
+            if decode_len > sample_start:
+                sample_starts.append(sample_start)
+
+        hidden_states = torch.cat(hidden_states_chunks, dim=0)
+        labels = torch.cat(label_chunks, dim=0)  # CPU
+
+        for start in sample_starts[1:]:
+            labels[start] = IGNORE_INDEX
+
+        labels = labels[..., 1:].contiguous()
+        if not sharded:
+            shift_labels = F.pad(labels, (0, 1), "constant", IGNORE_INDEX)
+        else:
+            rows = sp_valid_in_window(decode_len, ps.sp_rank, ps.sp_size)
+            local_len = sp_local_len(decode_len, ps.sp_size)
+            shift_labels = F.pad(labels, (0, 1 + (local_len * ps.sp_size - decode_len)), "constant", IGNORE_INDEX)
+            shard_start = ps.sp_rank * local_len
+            shift_labels = shift_labels[shard_start : shard_start + rows].contiguous()
+        shift_labels = shift_labels.to(device=hidden_states.device, non_blocking=True)
+        return hidden_states, shift_labels
 
 
 class VeOmniMixin(TrainingMixin, BaseVeOmniMixin):

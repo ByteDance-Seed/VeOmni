@@ -24,7 +24,8 @@ import torch.distributed as dist
 from .......distributed.parallel_state import get_parallel_state
 from .....mixins.base_mixin import BaseMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
-from .....utils.conversation import ConversationItem, is_backbone_input
+from .....utils.conversation import ConversationItem
+from ...carrier import is_thinker_input
 from ...codec.modeling import TALKER_CODE_LABELS
 from ...llm.modeling import THINKER_EMBED, THINKER_HIDDEN
 from ...text_encoder.modeling import TALKER_PROMPT
@@ -199,7 +200,7 @@ def _thinker_traces(sample: Sequence[ConversationItem]) -> Tuple[torch.Tensor, t
     embeds: List[torch.Tensor] = []
     hiddens: List[torch.Tensor] = []
     for item in sample:
-        if not is_backbone_input(item):
+        if not is_thinker_input(item):
             continue
         if THINKER_EMBED not in item.meta or THINKER_HIDDEN not in item.meta:
             raise ValueError(

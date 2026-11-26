@@ -9,6 +9,7 @@ here. That evidence needs both real checkpoints and lives in
 that separates intrinsic RVQ residual drift from a genuine codec mismatch.
 """
 
+import numpy as np
 import pytest
 import torch
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeCode2WavConfig
@@ -26,6 +27,7 @@ from veomni.models.seed_omni.modules.qwen3omni.codec.modeling import (
     TALKER_CODE_LABELS,
     Qwen3OmniCodec,
 )
+from veomni.models.seed_omni.modules.qwen3omni.codec.processing import Qwen3OmniCodecPreprocessor
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
@@ -519,3 +521,108 @@ def test_encode_works_with_the_quantizer_sharded(single_rank_group):
     codes = out["conversation_list"][0][0].meta[TALKER_CODE_LABELS]
     assert codes.shape[0] == NUM_QUANTIZERS
     assert not isinstance(codes, DTensor)
+
+
+def test_the_codec_retunes_assistant_speech_and_moves_the_timeline_with_it():
+    """``encode_wav`` refuses any other rate, and this is what satisfies it.
+
+    Payload and metadata move together: a row left claiming 22.05 kHz x 22050
+    samples would read as 0.92 s once the payload became 24 kHz.
+    """
+    preprocessor = Qwen3OmniCodecPreprocessor(sampling_rate=24000)
+    item = _assistant_audio(1.0, 22050)
+
+    preprocessor.preprocess_conversations([[item]])
+
+    metadata = item.meta[AUDIO_METADATA_KEY]
+    assert metadata.sampling_rate == 24000
+    assert metadata.num_samples == item.value.numel()
+    assert metadata.duration_seconds == pytest.approx(1.0, rel=1e-3)
+
+
+def test_what_the_codec_leaves_on_the_row_is_what_encode_wav_can_read():
+    """A tensor, not the numpy array the data layer loaded.
+
+    ``encode_pre`` hands ``item.value`` to ``encode_wav`` verbatim and its shape
+    normaliser calls ``.dim()``.
+    """
+    from veomni.models.seed_omni.modules.qwen3omni.codec.modeling import _as_mono_batch
+
+    preprocessor = Qwen3OmniCodecPreprocessor(sampling_rate=24000)
+    items = [_assistant_audio(1.0, 22050), _assistant_audio(1.0, 24000)]
+
+    preprocessor.preprocess_conversations([items])
+
+    for item in items:
+        assert isinstance(item.value, torch.Tensor), f"{item.value.__class__.__name__} would break encode_wav"
+        assert _as_mono_batch(item.value).shape[:2] == (1, 1)
+
+
+def test_a_clip_already_at_the_codec_rate_is_not_resampled():
+    """Not merely "same length" — resampling 24k to 24k would still filter it."""
+    preprocessor = Qwen3OmniCodecPreprocessor(sampling_rate=24000)
+    item = _assistant_audio(1.0, 24000)
+    item.value = np.linspace(-1, 1, 24000, dtype=np.float32)
+    original = item.value.copy()
+
+    preprocessor.preprocess_conversations([[item]])
+
+    assert torch.equal(item.value, torch.from_numpy(original))
+
+
+def test_the_codec_never_touches_the_user_side():
+    """Same row type, opposite meaning — the audio tower owns the user's side."""
+    preprocessor = Qwen3OmniCodecPreprocessor(sampling_rate=24000)
+    item = ConversationItem(
+        type="audio",
+        value=np.zeros(22050, dtype=np.float32),
+        role="user",
+        meta={AUDIO_METADATA_KEY: AudioMetadata(sampling_rate=22050, num_samples=22050)},
+    )
+
+    preprocessor.preprocess_conversations([[item]])
+
+    assert item.meta[AUDIO_METADATA_KEY].sampling_rate == 22050
+    assert item.value.size == 22050
+
+
+def test_the_codec_refuses_assistant_audio_that_declares_no_rate():
+    preprocessor = Qwen3OmniCodecPreprocessor(sampling_rate=24000)
+    item = ConversationItem(type="audio", value=np.zeros(1000, dtype=np.float32), role="assistant", meta={})
+
+    with pytest.raises(ValueError, match="states no meta"):
+        preprocessor.preprocess_conversations([[item]])
+
+
+def test_resampled_to_refuses_a_conversion_that_retimed_the_clip():
+    """Retuning must not retime it: the codes are scored against text, so a clip
+    that silently got longer trains the talker against shifted targets.
+
+    Both fields move together, and the duration is checked across them — the one
+    caller (the codec preprocessor) resamples with librosa, whose length is
+    rounded, so the tolerance is a single sample at the coarser rate.
+    """
+    original = AudioMetadata(sampling_rate=22050, num_samples=22050)  # 1.0 s
+
+    # 24 kHz for the same second, rounded to a whole sample: accepted.
+    assert original.resampled_to(24000, 24000).duration_seconds == pytest.approx(1.0)
+    assert original.resampled_to(24000, 24001).duration_seconds == pytest.approx(1.0, abs=1e-3)
+    # A count that only makes sense as a *different* clip: refused.
+    with pytest.raises(ValueError, match="would retime it"):
+        original.resampled_to(24000, 48000)
+
+    for sampling_rate in (0, -1):
+        with pytest.raises(ValueError, match="sampling_rate must be positive"):
+            original.resampled_to(sampling_rate, 24000)
+    with pytest.raises(ValueError, match="num_samples must be non-negative"):
+        original.resampled_to(24000, -1)
+
+
+def test_the_codec_does_nothing_at_inference():
+    """The assistant's speech is generation's output there, not its input."""
+    preprocessor = Qwen3OmniCodecPreprocessor(sampling_rate=24000)
+    item = _assistant_audio(1.0, 22050)
+
+    preprocessor.preprocess_conversations([[item]], inference=True)
+
+    assert item.meta[AUDIO_METADATA_KEY].sampling_rate == 22050
