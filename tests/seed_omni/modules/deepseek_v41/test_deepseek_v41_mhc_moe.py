@@ -32,17 +32,15 @@ import pytest
 import torch
 
 from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
-from veomni.models.seed_omni.modules.deepseek_v41.llm.decoder_layer import DeepseekV41DecoderLayer
-from veomni.models.seed_omni.modules.deepseek_v41.llm.mhc import (
+from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import (
+    DeepseekV41DecoderLayer,
     DeepseekV41HyperConnection,
+    DeepseekV41SparseMoeBlock,
+    DeepseekV41TopKRouter,
     expand_to_streams,
     identity_pre_mix,
     mhc_collapse,
     mhc_expand,
-)
-from veomni.models.seed_omni.modules.deepseek_v41.llm.moe import (
-    DeepseekV41SparseMoeBlock,
-    DeepseekV41TopKRouter,
 )
 
 

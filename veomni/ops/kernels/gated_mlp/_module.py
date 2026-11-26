@@ -79,28 +79,14 @@ ROW_ACTIVATIONS: dict[str, frozenset[str] | None] = {
 }
 
 
-def _is_plain_linear(proj: nn.Module) -> bool:
-    """Whether *proj* is a plain ``nn.Linear`` or an opt-in BF16 delegating subclass."""
-    if type(proj) is nn.Linear:
-        return type(proj.weight).__name__ != "DTensor"
-    return (
-        isinstance(proj, nn.Linear)
-        and bool(type(proj).__dict__.get("_veomni_plain_linear", False))
-        and not getattr(proj, "is_quantized", False)
-        and type(proj.weight).__name__ != "DTensor"
-    )
-
-
 def plain_projections(mlp: nn.Module) -> bool:
-    """Whether all three projections are exact ``nn.Linear`` layers (or opt-in plain subclasses).
+    """Whether all three projections are exact ``nn.Linear`` layers.
 
     The exact type matters, not ``isinstance``: an ``nn.Linear`` subclass (such
     as ``FSDPLinear`` from ``basic_modules``) does extra work inside ``forward``,
-    so reading its ``weight`` directly would bypass it. Delegating subclasses
-    like ``DeepseekV41Linear`` opt in via ``_veomni_plain_linear = True`` on
-    their own class dict so dynamic FSDP2 wrapper subclasses do not inherit it.
+    so reading its ``weight`` directly would bypass it.
     """
-    return all(_is_plain_linear(getattr(mlp, name)) for name in ("gate_proj", "up_proj", "down_proj"))
+    return all(type(getattr(mlp, name)) is nn.Linear for name in ("gate_proj", "up_proj", "down_proj"))
 
 
 class Rendered:
@@ -136,16 +122,6 @@ def render(mlp: nn.Module, *, impl: str | None, activation: str) -> Rendered:
         for an unused bias) or the projection modules.
     """
     from ...activation import normalize_activation
-
-    if any(
-        getattr(proj, "is_quantized", False) or getattr(proj, "weight_scale", None) is not None
-        for proj in (getattr(mlp, "gate_proj", None), getattr(mlp, "up_proj", None), getattr(mlp, "down_proj", None))
-        if proj is not None
-    ):
-        raise ValueError(
-            f"gated_mlp_implementation={impl!r} cannot run on pre-quantized MLP projections "
-            "(they hold `weight_scale`). Clear `weight_quantization` to dequantize weights at load for training."
-        )
 
     try:
         # Canonical spelling first: ``swish`` is ``ACT2FN``'s alias for SiLU, so a

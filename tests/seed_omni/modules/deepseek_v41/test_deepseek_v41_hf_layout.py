@@ -539,7 +539,7 @@ def test_deepgemm_streams_and_dequantizes_quantized_release(tmp_path, monkeypatc
     parameters even when ``config.weight_quantization`` is left on disk."""
     from unittest.mock import Mock
 
-    import veomni.models.seed_omni.modules.deepseek_v41.llm.quantized as quant_mod
+    import veomni.models.seed_omni.modules.deepseek_v41.llm.modeling as quant_mod
     from veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated import DeepseekV41LlmAccelerated
 
     path = str(tmp_path / "release_quant")

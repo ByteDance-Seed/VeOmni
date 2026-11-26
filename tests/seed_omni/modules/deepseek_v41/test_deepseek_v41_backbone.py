@@ -35,10 +35,13 @@ nothing while producing a falling loss.
 import pytest
 import torch
 
-from veomni.models.seed_omni.modules.deepseek_v41.llm.attention import sequence_slices_from_positions
 from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig, shrink_layer_schedule
-from veomni.models.seed_omni.modules.deepseek_v41.llm.mhc import mhc_collapse
-from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import DeepseekV41Backbone, DeepseekV41Llm
+from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import (
+    DeepseekV41Backbone,
+    DeepseekV41Llm,
+    mhc_collapse,
+    sequence_slices_from_positions,
+)
 
 
 HIDDEN = 64
@@ -99,7 +102,7 @@ def stub_backbone(config, indexer_layers=()):
     can be checked against a known value rather than against whatever the last
     layer happened to be handed.
     """
-    from veomni.models.seed_omni.modules.deepseek_v41.llm.attention import IndexerLossTerms
+    from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import IndexerLossTerms
 
     backbone = DeepseekV41Backbone(config).float()
     with torch.no_grad():
@@ -224,8 +227,11 @@ class TestLoopOrdering:
         """When a layer is both an Engram layer and a DSpark target (as in 2-layer
         shrunk stacks), the real ``DeepseekV41DecoderLayer.forward`` must apply
         ``self.engram`` before capturing ``draft_input`` and before attention."""
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.decoder_layer import DeepseekV41DecoderLayer
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.mhc import expand_to_streams, identity_pre_mix
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import (
+            DeepseekV41DecoderLayer,
+            expand_to_streams,
+            identity_pre_mix,
+        )
 
         torch.manual_seed(0)
         config = make_config(engram_layer_ids=[1], dspark_target_layer_ids=[1, 1, 1])

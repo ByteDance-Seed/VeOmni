@@ -32,7 +32,7 @@ from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward, pre_forward
 from .....utils.conversation import ConversationItem
 from ....base.sp_shard import split_sp_sharded_tensor
-from ...ngram.packing import pack_ngram_inputs
+from ...ngram.modeling import pack_ngram_inputs
 from ...quant_scheme import quantized_storage_dtype
 from ..configuration import DeepseekV41MtpConfig
 from ..modeling import DeepseekV41Mtp

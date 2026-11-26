@@ -31,7 +31,7 @@ import torch
 
 from veomni.models.seed_omni.modules.base.llm_packing import pack_llm_conversations_for_forward
 from veomni.models.seed_omni.modules.deepseek_v41.ngram.accelerated.accelerated import pack_ngram_inputs
-from veomni.models.seed_omni.modules.deepseek_v41.ngram.hashing import DEAD
+from veomni.models.seed_omni.modules.deepseek_v41.ngram.modeling import DEAD
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 
 
@@ -395,3 +395,27 @@ class TestShardedCarrier:
         # 2 text + 8 span + 1 text, i.e. the full span, not the 3-row window.
         assert ids.shape[1] == 11
         assert mask.shape == positions.shape == ids.shape
+
+    def test_cp_tail_rank_beyond_valid_len_returns_exact_local_len_zeros(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.ngram.configuration import DeepseekV41NgramConfig
+        from veomni.models.seed_omni.modules.deepseek_v41.ngram.modeling import DeepseekV41Ngram
+
+        config = DeepseekV41NgramConfig(
+            layer_ids=[0],
+            num_embeddings=[1024],
+            max_ngram_size=3,
+            n_heads=2,
+            head_dim=4,
+            vocab_size=64,
+            hash_vocab_size=64,
+            compressed_vocab_size=32,
+            pad_token_id=PAD,
+        )
+        model = DeepseekV41Ngram(config)
+        # cp_size=4, valid_len=2 -> full_len=4, local_len=1; rank 3 covers [3, 4) > valid_len=2.
+        input_ids = torch.tensor([[5, 6]], dtype=torch.long)
+        token_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        out = model(input_ids=input_ids, token_mask=token_mask, cp_size=4, cp_rank=3)
+        assert len(out["ngram_embeds"]) == 1
+        assert out["ngram_embeds"][0].shape == (1, 1, 2 * (3 - 1), 4)
+        assert torch.count_nonzero(out["ngram_embeds"][0]) == 0

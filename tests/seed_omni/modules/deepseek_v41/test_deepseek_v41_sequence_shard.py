@@ -154,10 +154,9 @@ def _loss(outputs, hidden, dspark, markov, weights):
 def _worker(rank: int, world_size: int, init_file: str) -> None:
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     try:
-        from veomni.models.seed_omni.modules.deepseek_v41.llm import attention
+        from veomni.models.seed_omni.modules.deepseek_v41.llm import modeling as attention
         from veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated import shard_packed_row
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import DeepseekV41Llm
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import dense_sparse_attn
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import DeepseekV41Llm, dense_sparse_attn
         from veomni.models.seed_omni.modules.deepseek_v41.mtp.configuration import DeepseekV41MtpConfig
         from veomni.models.seed_omni.modules.deepseek_v41.mtp.modeling import DeepseekV41Mtp
 
@@ -272,9 +271,9 @@ def _skip_sp_gather_worker(rank: int, world_size: int, init_file: str) -> None:
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     try:
         from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state
-        from veomni.models.seed_omni.modules.deepseek_v41.llm import attention
+        from veomni.models.seed_omni.modules.deepseek_v41.llm import modeling as attention
         from veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated import DeepseekV41LlmAccelerated
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import dense_sparse_attn
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import dense_sparse_attn
         from veomni.models.seed_omni.modules.deepseek_v41.text_encoder.accelerated.accelerated import (
             DeepseekV41TextEncoderAccelerated,
         )
@@ -326,6 +325,7 @@ def _skip_sp_gather_worker(rank: int, world_size: int, init_file: str) -> None:
             )
             from veomni.models.seed_omni.modules.deepseek_v41.mtp.accelerated import DeepseekV41MtpAccelerated
             from veomni.models.seed_omni.modules.deepseek_v41.mtp.configuration import DeepseekV41MtpConfig
+            from veomni.models.seed_omni.modules.deepseek_v41.text_encoder.chat_template import DeepseekV41ChatTemplate
 
             config = tiny_config()
             config.emit_draft_hiddens = True
@@ -338,6 +338,7 @@ def _skip_sp_gather_worker(rank: int, world_size: int, init_file: str) -> None:
             )
             torch.manual_seed(0)
             te = DeepseekV41TextEncoderAccelerated(te_cfg).float().train()
+            te._chat_template = DeepseekV41ChatTemplate
             llm = DeepseekV41LlmAccelerated(config).float().train()
             mtp = DeepseekV41MtpAccelerated(mtp_config).float().train()
 

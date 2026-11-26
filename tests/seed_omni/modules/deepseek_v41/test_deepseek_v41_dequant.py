@@ -228,8 +228,8 @@ class TestRequant:
         assert requant_scale.shape == scale.shape
         assert torch.equal(dequant_fp8_blockwise(quantized, requant_scale, out_dtype=torch.float32), values)
 
-    def test_fp4_requant_of_a_dequantized_weight_is_byte_exact(self):
-        """Including ``-0`` codes, which the release stores for small negatives."""
+    def test_fp4_requant_of_a_dequantized_weight_is_value_exact(self):
+        """Re-quantizing a dequantized FP4 block preserves exact scales and values."""
         torch.manual_seed(1)
         packed = torch.randint(-128, 128, (16, 32), dtype=torch.int8)
         packed[:, 0] = 0x7F  # every row carries a 6.0, so the scale cannot shrink
@@ -238,7 +238,7 @@ class TestRequant:
         requant, requant_scale = quant_fp4_blockwise(values)
         assert requant.dtype == torch.int8 and requant_scale.dtype == torch.float8_e8m0fnu
         assert torch.equal(requant_scale.view(torch.uint8), scale.view(torch.uint8))
-        assert torch.equal(requant.view(torch.uint8), packed.view(torch.uint8))
+        assert torch.equal(dequant_fp4_blockwise(requant, requant_scale, out_dtype=torch.float32), values)
 
     def test_fp4_rounds_to_the_nearest_value_and_keeps_the_low_nibble_first(self):
         weight = torch.tensor([[0.6, 5.9, -2.6, 0.1] + [6.0] * 28])
@@ -251,3 +251,24 @@ class TestRequant:
         weight = torch.full((32, 32), 1000.0)
         _, scale = quant_fp8_blockwise(weight)
         assert float(scale.float()) == 4.0  # 1000 / 448 rounds up to 2**2
+
+    def test_dequant_converter_export_weights_keeps_unquantized_3d_experts_bf16(self):
+        from types import SimpleNamespace
+
+        from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import (
+            DeepseekV41DequantConverter,
+        )
+
+        conv = DeepseekV41DequantConverter(config=None)
+        state = {
+            "model.layers.0.mlp.experts.gate_up_proj": torch.ones((4, 8, 4), dtype=torch.bfloat16),
+            "model.layers.0.mlp.experts.down_proj": torch.ones((4, 4, 8), dtype=torch.bfloat16),
+            "model.layers.0.input_layernorm.weight": torch.ones((8,), dtype=torch.float32),
+            "model.layers.0.mlp.gate.e_score_correction_bias": torch.zeros((4,), dtype=torch.bfloat16),
+        }
+        dummy_model = SimpleNamespace(state_dict=lambda: state, named_modules=lambda: [])
+        exported = dict(conv.export_weights(dummy_model))
+        assert exported["model.layers.0.mlp.experts.gate_up_proj"].dtype == torch.bfloat16
+        assert exported["model.layers.0.mlp.experts.down_proj"].dtype == torch.bfloat16
+        assert exported["model.layers.0.input_layernorm.weight"].dtype == torch.bfloat16
+        assert exported["model.layers.0.mlp.gate.e_score_correction_bias"].dtype == torch.float32

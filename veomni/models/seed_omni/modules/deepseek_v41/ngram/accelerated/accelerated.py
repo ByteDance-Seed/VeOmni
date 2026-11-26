@@ -47,8 +47,7 @@ from .....mixins.training_module_mixin import TrainingModuleMixin, post_forward,
 from .....utils.conversation import ConversationItem
 from ...quant_scheme import quantized_storage_dtype
 from ..configuration import DeepseekV41NgramConfig
-from ..modeling import DeepseekV41Ngram
-from ..packing import pack_ngram_inputs
+from ..modeling import DeepseekV41Ngram, pack_ngram_inputs
 
 
 class TrainingMixin(TrainingModuleMixin):

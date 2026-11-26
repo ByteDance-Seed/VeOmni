@@ -143,12 +143,7 @@ class TrainingMixin(TrainingModuleMixin):
         input_ids: list[torch.Tensor] = []
         self._encode_batch_shape = None
         for sample in conversation_list or []:
-            pack_fn = (
-                self._chat_template.pack_input_ids
-                if self._chat_template is not None
-                else TextEncoderChatTemplate.pack_input_ids
-            )
-            input_ids.extend(pack_fn(sample))
+            input_ids.extend(self._chat_template.pack_input_ids(sample))
         # ``naflatten`` keeps the shape on CPU (avoids the post-forward D2H sync);
         # the flat ids may be CPU (worker path) or device (fallback) — move once.
         input_ids, self._encode_batch_shape = naflatten(input_ids)

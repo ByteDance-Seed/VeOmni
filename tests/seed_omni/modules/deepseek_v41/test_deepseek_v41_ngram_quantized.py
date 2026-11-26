@@ -26,13 +26,13 @@ import pytest
 import torch
 
 from veomni.models.seed_omni.modules.deepseek_v41.dequant import dequant_fp8_blockwise
-from veomni.models.seed_omni.modules.deepseek_v41.ngram.checkpoint import (
+from veomni.models.seed_omni.modules.deepseek_v41.ngram.configuration import DeepseekV41NgramConfig
+from veomni.models.seed_omni.modules.deepseek_v41.ngram.modeling import (
+    DeepseekV41NgramTable,
     NgramTableDequant,
     NgramTablePadding,
     create_ngram_table_converter,
 )
-from veomni.models.seed_omni.modules.deepseek_v41.ngram.configuration import DeepseekV41NgramConfig
-from veomni.models.seed_omni.modules.deepseek_v41.ngram.quantized import DeepseekV41NgramTable
 from veomni.models.seed_omni.modules.deepseek_v41.quant_scheme import (
     QUANT_BLOCK_SIZE,
     SCALE_DTYPE,
@@ -424,7 +424,7 @@ class TestCpuOffloadLookup:
         assert model.device == model.token_map.device
 
     def test_fused_quantized_all_to_all_lookup_matches_dense_lookup(self):
-        from veomni.models.seed_omni.modules.deepseek_v41.ngram.quantized import (
+        from veomni.models.seed_omni.modules.deepseek_v41.ngram.modeling import (
             _quantized_all_to_all_lookup,
             dequantize_rows,
         )

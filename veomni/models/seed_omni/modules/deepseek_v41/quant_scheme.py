@@ -57,7 +57,7 @@ def _llm_uses_quantizing_ops(config) -> bool:
     if getattr(config, "model_type", None) not in ("deepseek_v41_llm", "deepseek_v41_mtp"):
         return False
     from .....ops import OpsSelection
-    from .llm.reuse import resolve_module_op_impl
+    from .llm.modeling import resolve_module_op_impl
 
     for field in _GEMM_FIELDS:
         selection = resolve_module_op_impl(config, field)

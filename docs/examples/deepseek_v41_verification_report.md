@@ -77,9 +77,9 @@ Measured directly from `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash` (`
 
 #### Why Previous 256-GPU Muon Runs Had Flat Loss & How It Was Fixed
 1. **Warmup Horizon Mismatch (`train_sample: 1,000,000`)**:
-   - In `full.yaml` / `full128.yaml`, `data.train_sample` defaulted to `1,000,000` (`7,812` steps at `gbs=128`) with `lr_warmup_ratio: 0.03` (`234` warmup steps). Because `OmniTrainer._build_lr_scheduler()` uses `args.train_steps = train_sample // global_batch_size`, a 100-step run spent its entire duration in the bottom fraction of linear warmup unless `data.train_sample` was scaled to `max_steps * global_batch_size` (`12,800`).
+   - In the earlier verification config (`full.yaml` / `full128.yaml`, since consolidated into `configs/seed_omni/DeepSeek/deepseek_v41_flash/train/{bf16,qat,deepgemm_fp8}.yaml`), `data.train_sample` defaulted to `1,000,000` (`7,812` steps at `gbs=128`) with `lr_warmup_ratio: 0.03` (`234` warmup steps). Because `OmniTrainer._build_lr_scheduler()` uses `args.train_steps = train_sample // global_batch_size`, a 100-step run spent its entire duration in the bottom fraction of linear warmup unless `data.train_sample` was scaled to `max_steps * global_batch_size` (`12,800`).
 2. **Muon Effective LR Under `match_rms_adamw` (Historical)**:
-   - In earlier revisions of `modules_train_full128.yaml`, `muon_lr` defaulted to `None` (falling back to `adamw_lr = 1.0e-5`). Under `adjust_lr_fn="match_rms_adamw"`, Muon scales updates by `0.2 * sqrt(max(A, B))`, which requires `muon_lr` in the `3e-4 – 5e-4` range for fast SFT convergence; `modules_train_full128.yaml` now sets `muon_lr: 5.0e-4` by default.
+   - In earlier 128-GPU verification configs, `muon_lr` defaulted to `None` (falling back to `adamw_lr = 1.0e-5`). Under `adjust_lr_fn="match_rms_adamw"`, Muon scales updates by `0.2 * sqrt(max(A, B))`, which requires `muon_lr` in the `3e-4 – 5e-4` range for fast SFT convergence on short 100-step runs (whereas the shipped 256k-context `bf16.yaml` / `qat.yaml` / `deepgemm_fp8.yaml` recipes use a conservative `4.0e-5` learning rate).
 3. **Tuned Hyperparameters Used in `0abc0b09f0eeb205` (`run_20261017_e040c085`)**:
    - `--data.train_sample 12800 --train.max_steps 100`
    - `--model.optimizer.lr 1.0e-4 --model.optimizer.lr_min 1.0e-5 --model.optimizer.lr_warmup_ratio 0.05` (5 warmup steps)
@@ -172,7 +172,7 @@ Measured directly from `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash` (`
   - WandB Run: `run_20261017_5f3d8e3d` (`dsv41_128gpu_sp8_long_4k32k`)
 - **Configuration**:
   - `cp_size: 8` (16 independent SP8 context-parallel groups across 128 GPUs), `ep_size: 128` (`dp_shard_sp_size = 128`, `ep_fsdp_size = 1`)
-  - Dataset: `configs/seed_omni/DeepSeek/deepseek_v41_flash/train/data_long.yaml` (`4k–32k` token sequences, `max_seq_len: 32768`)
+  - Dataset: `configs/seed_omni/DeepSeek/deepseek_v41_flash/train/data.yaml` (`4k–32k` token sequences, `max_seq_len: 32768`)
   - Batch Size: `micro_batch_size: 1, global_batch_size: 16` (`1` long-context sequence per SP8 group per step)
 - **10-Step Results (`10/10` Completed, `rc=0`)**:
 
@@ -210,9 +210,8 @@ Comparing `BaseTrainer` (`veomni/distributed/fsdp2/clip_grad_norm.py`) and `Omni
    - Updated `_average_extra_parallel_only_replicated_grads(model)` so that whenever `getattr(model, "_extra_parallel_only", False)` is `True`, all replicated parameters (`not isinstance(p, DTensor)` and not in any `extra_parallel_param_groups`) have their gradients averaged (`all_reduce(..., AVG)`) across `ps.fsdp_group`.
    - Called `_average_extra_parallel_only_replicated_grads(model)` at the start of `veomni_omni_module_clip_grad_norm`, and set `non_ep` `reduce_groups = [] if getattr(model, "_extra_parallel_only", False) else [("fsdp", ps.fsdp_group)]`.
    - Added unit test `test_omni_module_clip_grad_norm_extra_parallel_only_averages_replicated_grads_and_skips_fsdp_sum` (consolidated into `tests/utils/test_fsdp2_clip_grad_norm.py`, `9/9` passed).
-2. **`configs/seed_omni/DeepSeek/deepseek_v41_flash/train/modules_train_full128.yaml` & `full128.yaml`**:
-   - Aligned `deepseek_v41_text_encoder` directly with `BaseTrainer`: `fsdp_mode: fsdp2, reshard_after_forward: false` (no `emb` / `extra_parallel_only: true`), so both `wte` and `lm_head` are standard FSDP2-sharded `DTensor`s with native reduce-scatter gradient synchronization.
-   - Enabled `deepseek_v41_vision` training (`freeze: false`), set `deepseek_v41_llm` `ep_size: 128`, `lr: 1.0e-4, muon_lr: 5.0e-4`, and increased dataloader throughput (`num_workers: 8, prefetch_factor: 4`).
+2. **Verification Config Update (Historical 128-GPU Short-Context Run)**:
+   - Tested `BaseTrainer`-aligned FSDP2 (`fsdp_mode: fsdp2, reshard_after_forward: false`, no `emb` / `extra_parallel_only`) alongside the fixed `emb` + `extra_parallel_only` path; enabled `deepseek_v41_vision` (`freeze: false`), `ep_size: 128`, `lr: 1.0e-4, muon_lr: 5.0e-4`, and `num_workers: 8, prefetch_factor: 4`. (The final shipped 128-GPU 256k-context recipes under `configs/seed_omni/DeepSeek/deepseek_v41_flash/train/{bf16,qat,deepgemm_fp8}.yaml` use `cp_size: 16`, `ep_size: 32`, `emb: 128` on `text_encoder` and `ngram`, `lr: 4.0e-5`, and `num_workers: 4`.)
 
 ---
 
@@ -275,7 +274,7 @@ To verify that Context Parallelism (`cp_size > 1`) produces the exact same loss 
 
 1. **Hybrid Sequence Parallelism (`ViT Ulysses SP + LLM CP`, `commit 2ee61e9cf`)**:
    - `deepseek_v41_vision` now supports Ulysses Sequence Parallelism (`ulysses_size: S, cp_size: 1`) over the image token sequence (`slice_input_tensor` before the transformer blocks, `gather_seq_scatter_heads` / `gather_heads_scatter_seq` inside `DeepseekV41VisionAttention`, and `gather_outputs` after the downsample mixer).
-   - All `modules_train*.yaml` configs set `deepseek_v41_vision.accelerator: {ulysses_size: 1, cp_size: 1}` by default. When running with top-level `cp_size: S` (`S > 1`), setting `deepseek_v41_vision.accelerator.ulysses_size: S` ensures uniform `dp_size` across `vision`, `text_encoder`, `ngram`, and `llm`.
+   - The training module configs (`modules_{bf16,qat,deepgemm_fp8}.yaml`) set `deepseek_v41_vision.accelerator.ulysses_size` to match `deepseek_v41_llm.accelerator.cp_size` (`16` in the 256k CP16 recipes, `1` when `cp_size: 1`) so that `dp_size` stays uniform across `vision`, `text_encoder`, `ngram`, and `llm`.
 2. **Module-Level `VeomniOp` Migration (`commits 5f09fc231 & f92839dc2`)**:
    - Replaced legacy module-level global `OpSlot` / `OpsConfigSlot` singletons in `deepseek_v41` (`llm`, `vision`, `text_encoder`) with `nn.Module`-attached `VeomniOp` descriptors (`veomni_rms_norm`, `veomni_mhc_post`, `veomni_unweighted_rms_norm`, `veomni_swiglu_mlp`, `veomni_moe`, `veomni_attn`, `veomni_dspark_ce`) resolved from each submodule's `config.ops_implementation` via `apply_veomni_ops`.
    - `DeepSeekV41MoE` reads `config.ops_implementation.qat_implementation` (`"fp8_blockwise"`) directly on the module instance.
@@ -303,8 +302,8 @@ Executed the full `tests/seed_omni/modules/deepseek_v41/` test suite (22 test fi
    - `config.json`, `model.safetensors.index.json`, `tokenizer.json`, and all 48 safetensors shard tensor shapes/dtypes (`475.3 GB` total) are structurally identical to `DeepSeek-V4.1-Flash`, with updated post-trained weights.
 2. **Code Refactoring & Fixes on the verification branch (`3e5ac5936 .. 69f577234`)**:
    - **`17bde2f5c` & `3e5ac5936`**: Reused `deepseek_v4` DSpark (`DSparkMarkovHead`, `DSparkConfidenceHead`, `dense_sparse_attn`, `main_window_indices`) and FP8/FP4 dequant/export primitives (`_dequantize_scaled_weight`, `split_moe_params`, `validate_deepseek_v4_export_quant_support`), and fixed rank-partitioned `save_state` size gathering in `_size_balanced_index_mapping`.
-   - **`6ba73caa6` (`veomni/models/seed_omni/modules/deepseek_v41/llm/quantized.py`)**: Restored `_apply_gate` (`swiglu_limit` clamp + `act_fn(gate) * up`) on `DeepseekV41QuantizedExperts` after `PatchedDeepseekV4Experts` migrated to `self.veomni_moe`.
-   - **`69f577234` (`veomni/ops/kernels/gated_mlp/_module.py`, formerly `swiglu_mlp`)**: Updated `has_plain_linear_projections(mlp)` to guard pre-quantized projections (`is_quantized` / `weight_scale`), refusing to pass raw `float8_e4m3fn` weights into `F.linear` under training ops.
+   - **`6ba73caa6` (`DeepseekV41QuantizedExperts`, now consolidated into `veomni/models/seed_omni/modules/deepseek_v41/llm/modeling.py`)**: Restored `_apply_gate` (`swiglu_limit` clamp + `act_fn(gate) * up`) on `DeepseekV41QuantizedExperts` after `PatchedDeepseekV4Experts` migrated to `self.veomni_moe`.
+   - **Plain-linear training projections (`llm/modeling.py`)**: `make_linear` / `make_grouped_linear` construct standard `nn.Linear` / `DeepseekV4GroupedLinear` modules for bf16 training (so training ops and `gated_mlp` operate directly on plain weights without touching shared `veomni/ops/kernels/gated_mlp/` or `linear/`).
    - **Unit Test Suite**: `pytest tests/seed_omni/modules/deepseek_v41/` passed **`413 passed, 17 skipped`**, and GPU binding verification (`veomniop_binding_check.log`) passed **`41/41` GPU tests** on 8×H100.
 
 ---
@@ -384,7 +383,7 @@ Executed the full `tests/seed_omni/modules/deepseek_v41/` test suite (22 test fi
 
 - **Job ID**: `d1648f5d525261ba`
 - **WandB Run**: `run_20261026_29b134ca` (`dsv41_1017_8gpu_sp8_vitsp8_long_4k32k`)
-- **Configuration**: `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, `cp_size: 8` + `deepseek_v41_vision.accelerator.ulysses_size: 8, cp_size: 1`, `data_long_4k32k.yaml` (`max_seq_len: 32768`, avg sequence length `10,090.3` tokens/step), 10 steps.
+- **Configuration**: `/mnt/hdfs/veomni/models/DeepSeek/DeepSeek-V4.1-Flash-1017`, `cp_size: 8` + `deepseek_v41_vision.accelerator.ulysses_size: 8, cp_size: 1`, long-context dataset (`max_seq_len: 32768`, avg sequence length `10,090.3` tokens/step), 10 steps.
 - **Result**: Completed all **10/10 steps (`rc=0`)** with peak allocated memory **`76.07 GB`**:
   - Step 1: `total_loss: 15.51` (`ce_loss: 15.45, indexer_kl_loss: 0.06, grad_norm: 21.72`)
   - Step 5: `total_loss: 14.23` (`ce_loss: 14.18, indexer_kl_loss: 0.06, grad_norm: 27.91`)

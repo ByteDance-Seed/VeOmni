@@ -59,12 +59,4 @@ def module_wrapper(linear: nn.Module, x: Tensor, *, block_size: int = 128) -> Te
     :func:`wrapper` remains the tensor-level form the quantizing row builds on.
     """
     del block_size
-    if getattr(linear, "is_quantized", False) or getattr(linear, "weight_scale", None) is not None:
-        raise ValueError(
-            f"linear_implementation='eager' cannot run on pre-quantized grouped projection "
-            f"{type(linear).__name__!r} (holds `weight_scale`). Clear `weight_quantization` "
-            "to dequantize weights at load for training."
-        )
-    if getattr(linear, "_veomni_self_dispatched", False):
-        return linear._eager_forward(x)
     return linear(x)

@@ -30,16 +30,14 @@ import math
 import pytest
 import torch
 
-from veomni.models.seed_omni.modules.deepseek_v41.llm.attention import (
-    DeepseekV41Attention,
-    DeepseekV41Indexer,
-)
 from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
-from veomni.models.seed_omni.modules.deepseek_v41.llm.engram_connection import DeepseekV41EngramConnection
-from veomni.models.seed_omni.modules.deepseek_v41.llm.quantized import (
+from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import (
     QUANT_BLOCK_SIZE,
     SCALE_DTYPE,
+    DeepseekV41Attention,
+    DeepseekV41EngramConnection,
     DeepseekV41GroupedLinear,
+    DeepseekV41Indexer,
     DeepseekV41QuantizedExperts,
     DeepseekV41SharedExpert,
     expert_quant_dtype,
@@ -296,7 +294,7 @@ class TestRoutedExperts:
     def test_deepgemm_rejects_quantized_storage_and_coexists_with_qat_shared_expert(self, monkeypatch):
         from unittest.mock import Mock
 
-        import veomni.models.seed_omni.modules.deepseek_v41.llm.quantized as quant_mod
+        import veomni.models.seed_omni.modules.deepseek_v41.llm.modeling as quant_mod
         from veomni.ops.kernels.moe_experts.standard import deepgemm as moe_deepgemm
 
         monkeypatch.setattr(
@@ -312,8 +310,8 @@ class TestRoutedExperts:
         x = torch.randn(2, config_deepgemm.hidden_size, dtype=torch.bfloat16)
         top_k_idx = torch.zeros(2, config_deepgemm.num_experts_per_tok, dtype=torch.long)
         top_k_w = torch.ones(2, config_deepgemm.num_experts_per_tok, dtype=torch.bfloat16)
-        # Training MoE op rows fail fast at runtime when handed pre-quantized scale kwargs.
-        with pytest.raises(TypeError, match="fc1_1_2_scale"):
+        # Pre-quantized FP4 experts fail fast when invoked under training MoE ops.
+        with pytest.raises(ValueError, match="holds pre-quantized weights"):
             experts_quant(x, top_k_idx, top_k_w)
 
         # A ``qat`` shared expert beside ``deepgemm`` experts is legal -- they are
@@ -346,7 +344,7 @@ class TestKvStorageRecipes:
     """Window / compressed / indexer use the released V4.1 recipes, not V4's FP8/64 NoPE helper."""
 
     def test_training_without_qat_is_a_no_op(self):
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.quantization import (
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import (
             round_compress_kv,
             round_index_act,
             round_window_kv,
@@ -358,7 +356,7 @@ class TestKvStorageRecipes:
         torch.testing.assert_close(round_index_act(kv, training=True), kv)
 
     def test_eval_rounds_window_kv_as_fp8_over_the_whole_head(self):
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.quantization import WINDOW_KV_FP8_BLOCK, round_window_kv
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import WINDOW_KV_FP8_BLOCK, round_window_kv
 
         assert WINDOW_KV_FP8_BLOCK == 32
         # 32 is the official group and is *not* divisible by V4 QAT's 64-wide NoPE block.
@@ -369,7 +367,7 @@ class TestKvStorageRecipes:
         assert not torch.equal(rounded, kv)
 
     def test_eval_rounds_compressed_kv_as_fp4_groups_of_16(self):
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.quantization import (
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import (
             COMPRESS_KV_FP4_GROUP,
             round_compress_kv,
         )
@@ -382,7 +380,7 @@ class TestKvStorageRecipes:
         assert not torch.equal(rounded, kv)
 
     def test_eval_rounds_compressed_kv_as_fp8_when_compress_kv_dtype_is_fp8(self):
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.quantization import (
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import (
             WINDOW_KV_FP8_BLOCK,
             round_compress_kv,
             round_window_kv,
@@ -399,7 +397,7 @@ class TestKvStorageRecipes:
         torch.testing.assert_close(kv.grad, torch.ones_like(kv))
 
     def test_attention_wires_compress_kv_dtype_from_config(self):
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.attention import DeepseekV41Attention
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import DeepseekV41Attention
 
         cfg_fp4 = make_config(compress_kv_dtype="fp4")
         cfg_fp8 = make_config(compress_kv_dtype="fp8")
@@ -407,7 +405,7 @@ class TestKvStorageRecipes:
         assert DeepseekV41Attention(cfg_fp8, layer_idx=2).compress_kv_dtype == "fp8"
 
     def test_eval_rounds_indexer_as_fp4_groups_of_32(self):
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.quantization import INDEX_FP4_GROUP, round_index_act
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import INDEX_FP4_GROUP, round_index_act
 
         assert INDEX_FP4_GROUP == 32
         keys = torch.full((1, 4, 32), 50.0, dtype=torch.bfloat16)
@@ -440,7 +438,7 @@ class TestV41QatAlignment:
         """
         from unittest.mock import Mock
 
-        import veomni.models.seed_omni.modules.deepseek_v41.llm.quantized as quant_mod
+        import veomni.models.seed_omni.modules.deepseek_v41.llm.modeling as quant_mod
 
         gated_calls = []
         moe_calls = []
@@ -498,10 +496,8 @@ class TestV41QatAlignment:
         ]
 
         # And a dense projection, so all three quantizing families are covered.
-        linear = quant_mod.DeepseekV41Linear(
-            config.hidden_size, config.hidden_size, config=config, site="layers.3.q_a_proj"
-        ).to(torch.bfloat16)
-        linear(x)
+        attn = DeepseekV41Attention(config, layer_idx=3).to(torch.bfloat16)
+        quant_mod.dispatch_linear(attn.veomni_wq_a, attn.wq_a, x)
         assert linear_calls == [("layers.3.q_a_proj", {})]
 
     def test_deepgemm_wires_linear_gated_mlp_and_kv_round_ops(self):
@@ -511,9 +507,11 @@ class TestV41QatAlignment:
         Every family is named explicitly. A ``deepgemm`` MoE does not turn the dense
         projections into FP8 GEMMs, and it does not turn KV rounding on either.
         """
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.attention import DeepseekV41Attention
         from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import resolve_module_op_impl
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import (
+            DeepseekV41Attention,
+            resolve_module_op_impl,
+        )
 
         full_cfg = DeepseekV41LlmConfig(
             weight_quantization=None,
@@ -540,14 +538,14 @@ class TestV41QatAlignment:
         assert attn.veomni_kv_round_compress_fp8.op == "kv_round" and attn.veomni_kv_round_compress_fp8.impl == "eager"
         assert attn.veomni_kv_round_fp4.op == "kv_round" and attn.veomni_kv_round_fp4.variant == "fp4"
         assert attn.veomni_kv_round_fp4.impl == "eager"
-        assert attn.wq_a.veomni_linear.op == "linear" and attn.wq_a.veomni_linear.variant == "standard"
-        assert attn.wo_a.veomni_linear.op == "linear" and attn.wo_a.veomni_linear.variant == "grouped"
+        assert attn.veomni_wq_a.op == "linear" and attn.veomni_wq_a.variant == "standard"
+        assert attn.veomni_wo_a.op == "linear" and attn.veomni_wo_a.variant == "grouped"
         assert attn.indexer.veomni_kv_round_fp4.op == "kv_round" and attn.indexer.veomni_kv_round_fp4.variant == "fp4"
         assert attn.indexer.veomni_kv_round_fp4.impl == "eager"
 
     def test_a_deepgemm_moe_alone_does_not_select_the_dense_families(self):
         """Selecting only the MoE family leaves ``linear``/``gated_mlp`` alone."""
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import resolve_module_op_impl
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import resolve_module_op_impl
 
         cfg = make_config(
             compress_kv_dtype="fp4",
@@ -558,7 +556,7 @@ class TestV41QatAlignment:
 
     def test_an_all_qat_selection_resolves_every_gemm_family(self):
         """Each GEMM family selects ``qat`` independently."""
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import resolve_module_op_impl
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import resolve_module_op_impl
 
         cfg = make_config(
             expert_dtype="fp8",
@@ -577,7 +575,7 @@ class TestV41QatAlignment:
         import veomni.ops.kernels.gated_mlp.standard.qat as gated_mlp_qat
         import veomni.ops.kernels.moe_experts.standard.qat as moe_qat
         from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import resolve_module_op_impl
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import resolve_module_op_impl
 
         qat_cfg = DeepseekV41LlmConfig(
             weight_quantization=None,
@@ -654,13 +652,13 @@ class TestV41QatAlignment:
     def test_explicit_kv_round_implementation_controls_storage_rounding_in_training(self):
         """``kv_round_implementation`` controls FP8/FP4 KV & indexer storage rounding
         in training directly via bound ``VeomniOp`` handles (including per-site rules)."""
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.attention import DeepseekV41Attention
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.quantization import (
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import (
+            DeepseekV41Attention,
+            resolve_module_op_impl,
             round_compress_kv,
             round_index_act,
             round_window_kv,
         )
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import resolve_module_op_impl
 
         bf16_cfg = make_config(
             compress_kv_dtype="fp4",
@@ -701,10 +699,12 @@ class TestV41QatAlignment:
     def test_per_site_ops_selection_controls_every_v41_site(self):
         """Per-site ``OpsSelection`` rules bind independent rows/kwargs across
         attention projections, indexer, engram, DSpark, shared MLP, experts, and kv_round."""
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.decoder_layer import DeepseekV41DecoderLayer
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.dspark import DeepseekV41DSparkBlock
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.engram_connection import DeepseekV41EngramConnection
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.quantized import quantized_linear_pair
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import (
+            DeepseekV41DecoderLayer,
+            DeepseekV41EngramConnection,
+            dispatch_linear,
+        )
+        from veomni.models.seed_omni.modules.deepseek_v41.mtp.modeling import DeepseekV41DSparkBlock
         from veomni.utils.import_utils import is_package_available
 
         if not is_package_available("torchao"):
@@ -761,15 +761,15 @@ class TestV41QatAlignment:
         engram1 = DeepseekV41EngramConnection(cfg, layer_idx=1)
         dspark0 = DeepseekV41DSparkBlock(cfg, layer_idx=2)
 
-        assert layer0.self_attn.wq_a.veomni_linear.impl == "torchao"
-        assert layer0.self_attn.wq_a.veomni_linear.kwargs == {"dtype": "mxfp4"}
-        assert layer0.self_attn.wkv.veomni_linear.impl == "eager"
-        assert layer0.self_attn.wo_a.veomni_linear.impl == "eager"
-        assert layer1.self_attn.wq_a.veomni_linear.impl == "eager"
-        assert engram0.wkv.veomni_linear.impl == "torchao"
-        assert engram1.wkv.veomni_linear.impl == "eager"
-        assert dspark0.main_proj.veomni_linear.impl == "torchao"
-        assert dspark0.main_proj.veomni_linear.kwargs == {"dtype": "nvfp4"}
+        assert layer0.self_attn.veomni_wq_a.impl == "torchao"
+        assert layer0.self_attn.veomni_wq_a.kwargs == {"dtype": "mxfp4"}
+        assert layer0.self_attn.veomni_wkv.impl == "eager"
+        assert layer0.self_attn.veomni_wo_a.impl == "eager"
+        assert layer1.self_attn.veomni_wq_a.impl == "eager"
+        assert engram0.veomni_wkv.impl == "torchao"
+        assert engram1.veomni_wkv.impl == "eager"
+        assert dspark0.veomni_main_proj.impl == "torchao"
+        assert dspark0.veomni_main_proj.kwargs == {"dtype": "nvfp4"}
 
         assert layer0.mlp.shared_experts.veomni_gated_mlp.impl == "eager"
         assert layer1.mlp.shared_experts.veomni_gated_mlp.impl == "torchao"
@@ -781,13 +781,13 @@ class TestV41QatAlignment:
         assert layer1.self_attn.veomni_kv_round_fp8.impl == "none"
         assert layer1.self_attn.indexer.veomni_kv_round_fp4.impl == "eager"
 
-        # Verify forward + backward through DeepseekV41Linear (torchao mxfp4),
-        # quantized_linear_pair with mismatched sites (torchao + eager), and
+        # Verify forward + backward through per-site dispatched projections and
         # DeepseekV41SharedExpert (torchao mxfp4) on BF16.
         layer0 = layer0.to(torch.bfloat16)
         layer1 = layer1.to(torch.bfloat16)
         x = torch.randn(2, 4, 64, dtype=torch.bfloat16, requires_grad=True)
-        q_a, kv_out = quantized_linear_pair(x, layer0.self_attn.wq_a, layer0.self_attn.wkv)
+        q_a = dispatch_linear(layer0.self_attn.veomni_wq_a, layer0.self_attn.wq_a, x)
+        kv_out = dispatch_linear(layer0.self_attn.veomni_wkv, layer0.self_attn.wkv, x)
         mlp_out = layer1.mlp.shared_experts(x)
         assert q_a.shape == (2, 4, 32) and kv_out.shape == (2, 4, 32) and mlp_out.shape == (2, 4, 64)
         (q_a.sum() + kv_out.sum() + mlp_out.sum()).backward()
@@ -810,15 +810,15 @@ def test_quantized_storage_fails_fast_under_training_ops():
     )
     x = torch.randn(2, eager_quant_cfg.hidden_size, dtype=torch.bfloat16)
     shared = DeepseekV41SharedExpert(eager_quant_cfg, quant_dtype=linear_quant_dtype(eager_quant_cfg))
-    with pytest.raises(ValueError, match="cannot run on pre-quantized"):
+    with pytest.raises(ValueError, match="holds pre-quantized weights"):
         shared(x)
 
-    grouped = DeepseekV41GroupedLinear(64, 128, n_groups=2, quant_dtype=torch.float8_e4m3fn, config=eager_quant_cfg)
-    with pytest.raises(ValueError, match="cannot run on pre-quantized"):
+    grouped = DeepseekV41GroupedLinear(64, 128, n_groups=2, quant_dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="holds pre-quantized weights"):
         grouped(torch.randn(2, 2, 64, dtype=torch.bfloat16))
 
     experts = DeepseekV41QuantizedExperts(eager_quant_cfg, quant_dtype=expert_quant_dtype(eager_quant_cfg))
     top_k_idx = torch.zeros(2, eager_quant_cfg.num_experts_per_tok, dtype=torch.long)
     top_k_w = torch.ones(2, eager_quant_cfg.num_experts_per_tok, dtype=torch.bfloat16)
-    with pytest.raises(TypeError, match="fc1_1_2_scale"):
+    with pytest.raises(ValueError, match="holds pre-quantized weights"):
         experts(x, top_k_idx, top_k_w)

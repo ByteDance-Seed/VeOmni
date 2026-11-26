@@ -32,7 +32,8 @@ All of it runs on CPU in fp32 and never calls the sparse attention kernel.
 import pytest
 import torch
 
-from veomni.models.seed_omni.modules.deepseek_v41.llm.attention import (
+from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
+from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import (
     DeepseekV41Attention,
     DeepseekV41Compressor,
     DeepseekV41Indexer,
@@ -42,7 +43,6 @@ from veomni.models.seed_omni.modules.deepseek_v41.llm.attention import (
     build_compression_plans,
     indexer_kl_terms,
 )
-from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
 
 
 HIDDEN = 64
@@ -403,8 +403,8 @@ class TestIndexerKL:
         projections, and trunk activations untouched (DeepSeek-V3.2 §2.1)."""
         import math
 
-        from veomni.models.seed_omni.modules.deepseek_v41.llm import attention
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import dense_sparse_attn
+        from veomni.models.seed_omni.modules.deepseek_v41.llm import modeling as attention
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import dense_sparse_attn
 
         @torch.no_grad()
         def eager_target(q, kv, topk_idxs, lse, sm_scale=None):

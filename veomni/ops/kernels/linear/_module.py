@@ -43,14 +43,6 @@ __all__ = [
 QUANTIZING_IMPLS = frozenset({"qat", "torchao", "deepgemm"})
 
 
-def _is_sharded(weight: Tensor) -> bool:
-    """Whether ``weight`` is a ``DTensor`` with any ``Shard`` placement."""
-    placements = getattr(weight, "placements", None)
-    if placements is None:
-        return False
-    return any(getattr(p, "is_shard", lambda: False)() for p in placements)
-
-
 def resolve_projection(
     op_impl: str,
     module: nn.Module,
@@ -79,35 +71,8 @@ def resolve_projection(
             Reading ``module.weight`` would bypass the module's ``forward``,
             and calling the fallback would train at full precision under a
             low-precision config.
-        RuntimeError: when the row quantizes and the projection is currently
-            sharded as a ``DTensor``.
     """
-    if getattr(module, "is_quantized", False) or getattr(module, "weight_scale", None) is not None:
-        raise ValueError(
-            f"linear_implementation={op_impl!r} cannot run on pre-quantized projection "
-            f"{type(module).__name__!r} (holds `weight_scale`). Clear `weight_quantization` "
-            "to dequantize weights at load for training."
-        )
-    weight = getattr(module, "weight", None)
-    if isinstance(weight, Tensor) and op_impl in QUANTIZING_IMPLS and _is_sharded(weight):
-        raise RuntimeError(
-            f"linear_implementation={op_impl!r} read a sharded weight from {type(module).__name__!r}: "
-            "the row quantizes the projection without calling its `forward`, so the unshard hook "
-            "`fully_shard` installs there never runs, and the GEMM would multiply one rank's slice. "
-            "Either drop this projection from `basic_modules` (so it is unsharded by its parent "
-            "block's forward) or set linear_implementation='eager'."
-        )
     if type(module) is nn.Linear:
-        return module.weight, None
-    # Delegating ``nn.Linear`` subclasses (such as ``DeepseekV41Linear`` when
-    # holding plain BF16 weights) explicitly opt in on their own class dict so
-    # dynamic FSDP2 wrapper subclasses (``FSDPDeepseekV41Linear``) and LoRA
-    # wrappers do not inherit it.
-    if (
-        isinstance(module, nn.Linear)
-        and bool(type(module).__dict__.get("_veomni_plain_linear", False))
-        and not getattr(module, "is_quantized", False)
-    ):
         return module.weight, None
     if allow_linear_subclass and isinstance(module, nn.Linear):
         return module.weight, None

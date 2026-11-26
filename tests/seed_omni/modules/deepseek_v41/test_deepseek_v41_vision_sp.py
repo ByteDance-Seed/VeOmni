@@ -233,8 +233,8 @@ def _omni_vit_sp_llm_cp_worker(rank: int, world_size: int, init_file: str) -> No
     try:
         from veomni.distributed.parallel_state import use_parallel_state
         from veomni.models.seed_omni.accelerated.utils.executor import TrainNodeRunner
-        from veomni.models.seed_omni.modules.deepseek_v41.llm import attention
-        from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import dense_sparse_attn
+        from veomni.models.seed_omni.modules.deepseek_v41.llm import modeling as attention
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import dense_sparse_attn
         from veomni.models.seed_omni.modules.deepseek_v41.vision import modeling as vision_modeling
 
         from .test_deepseek_v41_sequence_shard import eager_sparse_mqa_target_fwd

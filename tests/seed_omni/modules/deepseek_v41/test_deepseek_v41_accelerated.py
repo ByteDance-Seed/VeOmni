@@ -450,31 +450,29 @@ class TestContextParallelSlice:
             build_omni_module_runtime_args,
         )
 
-        monkeypatch.setenv("WORLD_SIZE", "8")
+        monkeypatch.setenv("WORLD_SIZE", "128")
         modules_yaml = (
             Path(__file__).resolve().parents[4]
-            / "configs/seed_omni/DeepSeek/deepseek_v41_flash/train/modules_train.yaml"
+            / "configs/seed_omni/DeepSeek/deepseek_v41_flash/train/modules_bf16.yaml"
         )
         with open(modules_yaml) as f:
             raw_modules = yaml.safe_load(f)
-        raw_modules["deepseek_v41_vision"]["accelerator"]["ulysses_size"] = 4
-        raw_modules["deepseek_v41_vision"]["accelerator"]["cp_size"] = 1
 
         global_args = OmniModuleRuntimeArguments(
             model_path="/tmp/deepseek_v41",
-            accelerator=AcceleratorConfig(cp_size=4),
+            accelerator=AcceleratorConfig(cp_size=16),
         )
         resolved = build_omni_module_runtime_args(global_args, "/tmp/deepseek_v41", raw_modules)
         _validate_omni_dp_size(global_args.accelerator, resolved)
 
-        assert global_args.accelerator.dp_size == 2
+        assert global_args.accelerator.dp_size == 8
         vision_acc = resolved["deepseek_v41_vision"].accelerator
-        assert (vision_acc.ulysses_size, vision_acc.cp_size, vision_acc.dp_size) == (4, 1, 2)
-        for name in ("deepseek_v41_ngram", "deepseek_v41_text_encoder", "deepseek_v41_llm"):
+        assert (vision_acc.ulysses_size, vision_acc.cp_size, vision_acc.dp_size) == (16, 1, 8)
+        for name in ("deepseek_v41_ngram", "deepseek_v41_text_encoder", "deepseek_v41_llm", "deepseek_v41_mtp"):
             acc = resolved[name].accelerator
-            assert (acc.ulysses_size, acc.cp_size, acc.dp_size) == (1, 4, 2)
+            assert (acc.ulysses_size, acc.cp_size, acc.dp_size) == (1, 16, 8)
 
-        raw_modules["deepseek_v41_vision"]["accelerator"]["ulysses_size"] = 2
+        raw_modules["deepseek_v41_vision"]["accelerator"]["ulysses_size"] = 8
         mismatched = build_omni_module_runtime_args(global_args, "/tmp/deepseek_v41", raw_modules)
         with pytest.raises(ValueError, match="All distributed SeedOmni modules must resolve to the same `dp_size`"):
             _validate_omni_dp_size(global_args.accelerator, mismatched)

@@ -477,37 +477,10 @@ def _resolve_model_path(
 
 
 def _module_base(global_dict: dict[str, Any]) -> dict[str, Any]:
-    """The module base a per-module overlay is merged onto.
-
-    The folded ``ep`` entry is removed because ``AcceleratorConfig`` re-folds it
-    from ``ep_size``; leaving it would make a module that overrides ``ep_size``
-    see the inherited size instead. The inherited *effective* width is carried
-    into ``ep_size`` first: a restored config can hold ``ep_size=1`` beside
-    ``extra_parallel_sizes=[2]``, where the list is what the mesh was built from,
-    and dropping that would silently shrink expert parallelism to 1.
-    """
     acc = global_dict.get("accelerator")
     if isinstance(acc, dict):
         acc["dp_replicate_size"] = -1
         acc["dp_shard_size"] = -1
-        names = acc.get("extra_parallel_names") or []
-        if "ep" in names:
-            i = names.index("ep")
-            sizes = acc.get("extra_parallel_sizes") or ()
-            placement = acc.get("extra_parallel_placement_innermost") or ()
-            inherited_size = sizes[i] if i < len(sizes) else acc.get("ep_size", 1)
-            if inherited_size != acc.get("ep_size", 1):
-                if acc.get("ep_size", 1) != 1:
-                    raise ValueError(
-                        f"accelerator.ep_size={acc.get('ep_size')} and extra_parallel_sizes['ep']="
-                        f"{inherited_size} disagree; 'ep' in extra_parallel_names is the same dimension "
-                        "as ep_size. Set one of them."
-                    )
-                acc["ep_size"] = inherited_size
-                if i < len(placement):
-                    acc["ep_outside"] = placement[i]
-            for key in ("extra_parallel_names", "extra_parallel_sizes", "extra_parallel_placement_innermost"):
-                acc[key] = [v for j, v in enumerate(acc.get(key) or ()) if j != i]
     return global_dict
 
 

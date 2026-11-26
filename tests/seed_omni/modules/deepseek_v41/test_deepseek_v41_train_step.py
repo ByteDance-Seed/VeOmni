@@ -35,7 +35,7 @@ from veomni.models.seed_omni.configuration_omni import OmniConfig
 from veomni.models.seed_omni.modeling_omni import OmniModel
 from veomni.models.seed_omni.modules.deepseek_v41.llm.accelerated.accelerated import DeepseekV41LlmAccelerated
 from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig, shrink_layer_schedule
-from veomni.models.seed_omni.modules.deepseek_v41.llm.reuse import dense_sparse_attn
+from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import dense_sparse_attn
 from veomni.models.seed_omni.modules.deepseek_v41.ngram.accelerated.accelerated import DeepseekV41NgramAccelerated
 from veomni.models.seed_omni.modules.deepseek_v41.ngram.configuration import DeepseekV41NgramConfig
 from veomni.models.seed_omni.modules.deepseek_v41.text_encoder.accelerated.accelerated import (
@@ -54,7 +54,7 @@ from veomni.utils.constants import IGNORE_INDEX
 
 CONFIG_ROOT = Path("configs/seed_omni/DeepSeek/deepseek_v41_flash")
 TRAIN_GRAPH_PATH = CONFIG_ROOT / "train/graph_train.yaml"
-TRAIN_GRAPH_MTP_PATH = CONFIG_ROOT / "train/graph_train_mtp.yaml"
+TRAIN_GRAPH_NO_NGRAM_MTP_PATH = CONFIG_ROOT / "train/graph_train_no_ngram_mtp.yaml"
 
 HIDDEN = 64
 VOCAB = 64
@@ -108,11 +108,11 @@ def _patch_cpu_attention(monkeypatch) -> None:
     backward through the same graph, not a kernel check.
     """
     monkeypatch.setattr(
-        "veomni.models.seed_omni.modules.deepseek_v41.llm.attention.sparse_attn_tilelang",
+        "veomni.models.seed_omni.modules.deepseek_v41.llm.modeling.sparse_attn_tilelang",
         dense_sparse_attn,
     )
     monkeypatch.setattr(
-        "veomni.models.seed_omni.modules.deepseek_v41.llm.attention.sparse_mqa_target_fwd",
+        "veomni.models.seed_omni.modules.deepseek_v41.llm.modeling.sparse_mqa_target_fwd",
         eager_sparse_mqa_target_fwd,
     )
     # flash_attn is importable on this box even when the tensors stay on CPU.
@@ -271,8 +271,13 @@ def build_toy_modules(
 
 
 def build_toy_omni(modules) -> OmniModel:
-    graph_path = TRAIN_GRAPH_MTP_PATH if MTP in modules else TRAIN_GRAPH_PATH
-    edges = yaml.safe_load(graph_path.read_text())
+    if MTP in modules:
+        edges = yaml.safe_load(TRAIN_GRAPH_PATH.read_text())
+    elif NGRAM not in modules:
+        edges = yaml.safe_load(TRAIN_GRAPH_NO_NGRAM_MTP_PATH.read_text())
+    else:
+        edges = [e for e in yaml.safe_load(TRAIN_GRAPH_PATH.read_text()) if e["from"] != MTP and e["to"] != MTP]
+        edges.insert(-1, {"from": LLM, "to": f"{TEXT}.decode"})
     if isinstance(edges, dict):
         edges = edges["training_graph"]
     config = OmniConfig(
@@ -811,8 +816,8 @@ class TestQatOpsSlotBinding:
         assert layer0.mlp.experts.veomni_moe.impl == "eager"
         assert isinstance(layer0.mlp.shared_experts.veomni_gated_mlp, VeomniOp)
         assert layer0.mlp.shared_experts.veomni_gated_mlp.impl == "eager"
-        assert isinstance(layer0.self_attn.wq_a.veomni_linear, VeomniOp)
-        assert layer0.self_attn.wq_a.veomni_linear.impl == "eager"
+        assert isinstance(layer0.self_attn.veomni_wq_a, VeomniOp)
+        assert layer0.self_attn.veomni_wq_a.impl == "eager"
         assert isinstance(layer0.self_attn.veomni_kv_round_fp8, VeomniOp)
         assert layer0.self_attn.veomni_kv_round_fp8.impl == "eager"
         assert isinstance(layer0.input_layernorm.veomni_rms_norm, VeomniOp)

@@ -63,8 +63,7 @@ from ....base.sp_shard import (
 )
 from ...quant_scheme import quantized_storage_dtype
 from ..configuration import DeepseekV41LlmConfig
-from ..modeling import DeepseekV41Llm
-from ..sequence_shard import SequenceShard
+from ..modeling import DeepseekV41Llm, SequenceShard
 
 
 def _seq_slices_from_lengths(sample_seqlens: Sequence[int]) -> Tuple[Tuple[int, int], ...]:

@@ -162,6 +162,7 @@ class DeepseekV41DequantConverter:
     """Pair ``P`` with ``P_scale`` and emit the bf16 weight training expects."""
 
     def __init__(self, config=None) -> None:
+        self.config = config
         self._parts: dict[str, dict[str, torch.Tensor]] = {}
         self._only_mtp = _is_mtp_config(config)
         maps = _shrink_maps(config) if config is not None else None
@@ -575,10 +576,24 @@ def _export_split_llm_weights(
     # the module originated from a quantized split checkpoint, populate scale
     # companions in fqn_to_index_mapping so save_hf_safetensor keeps them in the
     # same shard as their parent weight.
+    quantized_linear_suffixes = (
+        ".self_attn.wq_a",
+        ".self_attn.wq_b",
+        ".self_attn.wkv",
+        ".self_attn.wo_a",
+        ".self_attn.wo_b",
+        ".indexer.wq_b",
+        ".engram.wkv",
+        ".shared_experts.gate_proj",
+        ".shared_experts.up_proj",
+        ".shared_experts.down_proj",
+        ".main_proj",
+    )
     quant_Linear_prefixes = {
         f"{name}.weight"
         for name, mod in model.named_modules()
         if type(mod).__name__ in ("DeepseekV41Linear", "DeepseekV41GroupedLinear")
+        or (isinstance(mod, torch.nn.Linear) and name.endswith(quantized_linear_suffixes))
     }
     any_quantized = False
     for key in sorted(state):
@@ -632,9 +647,10 @@ def _export_split_llm_weights(
         )
         if should_quantize is not None and not should_quantize(key):
             continue
-        if key.endswith("weight") and full.dtype == torch.float32:
+        is_bf16_weight = key.endswith(("weight", ".gate_up_proj", ".down_proj")) or full.ndim == 3
+        if is_bf16_weight and full.dtype == torch.float32:
             full = full.to(torch.bfloat16)
-        elif not key.endswith("weight") and full.dtype == torch.bfloat16:
+        elif not is_bf16_weight and full.dtype == torch.bfloat16:
             full = full.to(torch.float32)
         yield key, full
 
