@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +33,8 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import (
     MiniMaxH3Attention,
     VeomniRMSNorm,
     _PackedBounds,
+    patchify_video,
+    unpatchify_video,
 )
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
     MiniMaxH3DiTModel,
@@ -86,6 +89,15 @@ def _minimax_h3_inputs(cond_rows: int) -> dict:
         "packed_seq_params": {"cu_seqlens_q": torch.tensor([0, seq_len]), "max_seqlen_q": seq_len},
         "refiner_packed_seq_params": {"cu_seqlens_q": torch.tensor([0, 1]), "max_seqlen_q": 1},
     }
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_patchify_matches_legacy_multiframe_layout():
+    latents = torch.arange(2 * 24 * 3 * 16 * 12, dtype=torch.float32).reshape(2, 24, 3, 16, 12)
+    legacy_rows = torch.einsum("nctrhpwq->nthwcrpq", latents.reshape(2, 24, 3, 1, 8, 2, 6, 2)).reshape(-1, 96)
+    rows = patchify_video(latents)
+    assert torch.equal(rows, legacy_rows)
+    assert torch.equal(unpatchify_video(rows, 3, 16, 12), latents)
 
 
 def test_minimax_h3_condition_builds_from_registered_class_without_assets():
@@ -491,3 +503,127 @@ def test_minimax_native_text_encoder_adapts_qwen_config(monkeypatch):
     assert encoder.config.vision_config.ops_config.attn_implementation == "veomni_sdpa"
     output = encoder.model(input_ids=torch.tensor([[1, 2, 3]]), use_cache=False)
     assert output.last_hidden_state.shape == (1, 3, 16)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_fp32_linear_stays_fp32_after_bfloat16_conversion():
+    """A dtype conversion preserves the original FP32 parameters and gradients."""
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3FP32Linear
+
+    linear = MiniMaxH3FP32Linear(4, 4)
+    with torch.no_grad():
+        linear.weight.fill_(1.0 + 2**-12)
+        linear.bias.fill_(-1.0 - 2**-12)
+    weight, bias = linear.weight.detach().clone(), linear.bias.detach().clone()
+    assert not torch.equal(weight.to(torch.bfloat16).float(), weight)
+    linear(torch.full((2, 4), 1.0 + 2**-12)).sum().backward()
+    weight_grad = linear.weight.grad.clone()
+
+    linear.to(dtype=torch.bfloat16)
+    linear.bfloat16()
+    assert linear.weight.dtype == torch.float32 and linear.bias.dtype == torch.float32
+    torch.testing.assert_close(linear.weight, weight, rtol=0, atol=0)
+    torch.testing.assert_close(linear.bias, bias, rtol=0, atol=0)
+    torch.testing.assert_close(linear.weight.grad, weight_grad, rtol=0, atol=0)
+
+    inputs = torch.randn(2, 4, dtype=torch.bfloat16)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = linear(inputs)
+    assert out.dtype == torch.float32
+    torch.testing.assert_close(out, torch.nn.functional.linear(inputs.float(), weight, bias), rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="accelerator"))
+def test_minimax_h3_fp32_linear_accelerator_autocast():
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3FP32Linear
+    from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
+
+    device_api = get_torch_device()
+    if not (IS_CUDA_AVAILABLE or IS_NPU_AVAILABLE) or not device_api.is_available():
+        pytest.skip("An accessible CUDA GPU or NPU is required")
+    device_api.set_device(0)
+    device = torch.device(get_device_type())
+    linear = MiniMaxH3FP32Linear(4, 3).to(device)
+    with torch.no_grad():
+        linear.weight.fill_(1.0 + 2**-12)
+        linear.bias.fill_(-1.0 - 2**-12)
+    weight = linear.weight.detach().clone()
+    bias = linear.bias.detach().clone()
+    inputs = torch.randn(2, 4, dtype=torch.bfloat16, device=device, requires_grad=True)
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+        output = linear(inputs)
+    assert output.dtype == torch.float32
+    torch.testing.assert_close(output, torch.nn.functional.linear(inputs.float(), weight, bias), rtol=0, atol=0)
+    torch.testing.assert_close(linear.weight, weight, rtol=0, atol=0)
+    torch.testing.assert_close(linear.bias, bias, rtol=0, atol=0)
+    output.square().mean().backward()
+    assert linear.weight.grad is not None and torch.isfinite(linear.weight.grad).all()
+    assert linear.bias.grad is not None and torch.isfinite(linear.bias.grad).all()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("audio_enabled", [True, False])
+def test_minimax_h3_save_auto_dtype_preserves_mixed_precision(tmp_path, audio_enabled):
+    config = _tiny_config(audio_enabled=audio_enabled, num_pdd_heads=0 if audio_enabled else 2)
+    config._set_ops_implementation(eager_ops_config())
+    model = MiniMaxH3DiTModel(config).bfloat16()
+    with torch.no_grad():
+        model.dit.video_patch_proj.weight.fill_(1.0 + 2**-12)
+    original = model.state_dict()
+    model.save_pretrained(tmp_path)
+
+    assert model.dtype == torch.bfloat16
+    assert json.loads((tmp_path / "config.json").read_text())["dtype"] == "bfloat16"
+    restored = MiniMaxH3DiTModel.from_pretrained(tmp_path, dtype="auto")
+    assert restored.dtype == torch.bfloat16
+    assert restored.dit.condition_proj.weight.dtype == torch.bfloat16
+    assert restored.dit.video_patch_proj.weight.dtype == torch.float32
+    for name, actual in restored.state_dict().items():
+        torch.testing.assert_close(actual, original[name], rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("audio_enabled", [True, False])
+def test_minimax_h3_checkpoint_matches_cpu_and_meta_init(tmp_path, audio_enabled):
+    from safetensors.torch import save_file
+
+    from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights
+
+    config = _tiny_config(audio_enabled=audio_enabled, num_pdd_heads=0 if audio_enabled else 2)
+    config._set_ops_implementation(eager_ops_config())
+    # Match the released checkpoints, which store keys without the HF wrapper prefix.
+    state = MiniMaxH3DiTModel._from_config(config, dtype=torch.bfloat16).dit.state_dict()
+    for tensor in state.values():
+        if tensor.dtype == torch.float32:
+            tensor.fill_(1.0 + 2**-12)
+    save_file(state, tmp_path / "model.safetensors")
+
+    regular = MiniMaxH3DiTModel._from_config(config, dtype=torch.bfloat16)
+    with init_empty_weights():
+        empty = MiniMaxH3DiTModel._from_config(config, dtype=torch.bfloat16)
+    assert all(parameter.is_meta for parameter in empty.parameters())
+    for model in (regular, empty):
+        load_model_weights(model, str(tmp_path), init_device="cpu")
+        torch.testing.assert_close(model.dit.state_dict(), state, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_backbone_dtype_with_lora():
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+
+    model = VeOmniLoraModel(
+        _build_model().bfloat16(), VeOmniLoraConfig(r=4, lora_alpha=8, target_modules=["condition_proj"])
+    )
+    assert model.dtype == torch.bfloat16
+    assert model.get_base_model().dit.video_patch_proj.weight.dtype == torch.float32
+    model.float()
+    assert model.dtype == torch.float32
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_fp32_linear_supports_meta_forward():
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3FP32Linear
+
+    linear = MiniMaxH3FP32Linear(4, 3, device="meta")
+    output = linear(torch.empty(2, 4, dtype=torch.bfloat16, device="meta"))
+    assert output.is_meta and output.shape == (2, 3) and output.dtype == torch.float32

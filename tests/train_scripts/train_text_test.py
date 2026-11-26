@@ -26,6 +26,14 @@ def process_dummy_example(
 class TestTextTrainer(TextTrainer):
     def __init__(self, args: VeOmniArguments):
         super().__init__(args)
+        if args.model.accelerator.fsdp_config.fsdp_mode == "hyper_fsdp2":
+            from hyper_parallel import HSDPModule
+
+            assert isinstance(self.base.model.model, HSDPModule)
+        if args.model.optimizer.type == "hyper_muon":
+            from hyper_parallel.core.optimizer.muon import Muon
+
+            assert isinstance(self.base.model.optimizer.optimizers_dict["muon"], Muon)
         self.base.logdictsave_callback = LogDictSaveCallback(self.base)
 
     def _build_data_transform(self):
