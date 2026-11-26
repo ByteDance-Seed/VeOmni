@@ -416,6 +416,15 @@ One case decodes the prompt back to text to read the speech-span boundaries, so
 it does need the real tokenizer; it resolves through `CI_HF_MODELS_DIR` and skips
 when no mirror is staged.
 
+`test_qwen3omni_accel_align.py` composes the thinker graph under FSDP2 and
+compares it against the monolithic `Qwen3OmniMoeThinkerForConditionalGeneration`
+on loss, every parameter gradient and the AdamW update. At SP=2 both ranks hold
+the same packed batch, so all three agree exactly. At SP=1 each rank takes one
+conversation, and the graph's router-balancing term is a product of two
+per-batch means — a one-sample batch has a different denominator than the packed
+reference — so gradients and updates are compared there but the loss value is
+not, by construction rather than by tolerance.
+
 The codec is the one module that can be partly exercised against real weights
 without the Qwen checkpoint, and was — see §4. Loading `kyutai/mimi`, checking its
 config against what `Qwen3OmniCodecConfig` expects (rate, quantizers,
