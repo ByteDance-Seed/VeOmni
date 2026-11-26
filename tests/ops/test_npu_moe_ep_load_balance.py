@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -43,6 +44,7 @@ class _RecordingBalancer:
             num_experts=2,
             ep_group=self.ep_group,
             max_replicas_per_rank=1,
+            _retain_host_routing=self.optimize_memory,
         )
         return self.plan
 
@@ -126,7 +128,7 @@ def test_real_npu_singleton_fsdp_gradient_accumulation(real_npu_ep_group, reduce
 @pytest.mark.parametrize("optimize_memory", [False, True])
 @pytest.mark.parametrize("mixed_routing", [False, True])
 def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(
-    optimize_memory, mixed_routing, real_npu_ep_group
+    optimize_memory, mixed_routing, real_npu_ep_group, monkeypatch
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
@@ -158,6 +160,14 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(
     reference_routing = routing_weights.detach().clone().requires_grad_(True)
     parameter_names_before = tuple(dict(weights.named_parameters()))
     balancer = _RecordingBalancer(group, ep_load_balance, optimize_memory=optimize_memory)
+    replica_batches = []
+    native_batch = dist.batch_isend_irecv
+
+    def record_batch(operations):
+        replica_batches.append([op.group for op in operations])
+        return native_batch(operations)
+
+    monkeypatch.setattr(dist, "batch_isend_irecv", record_batch)
     with use_parallel_state(parallel):
         reference = npu.npu_fused_moe_forward(
             2,
@@ -181,6 +191,7 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(
             weights.gate_up,
             load_balancer=balancer,
         )
+        assert replica_batches == ([[group], [group]] if optimize_memory else [])
         assert torch.isfinite(output.float()).all().item()
         assert torch.equal(routing_weights, routing_before)
         assert balancer.build_calls == 1
@@ -196,6 +207,12 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(
             assert getattr(balancer.plan, name) == getattr(expected_plan, name)
         assert balancer.plan.selected_physical_experts.device == device
         assert torch.equal(balancer.plan.selected_physical_experts.cpu(), expected_plan.selected_physical_experts)
+        if optimize_memory:
+            physical_host, logical_host = balancer.plan._host_routing
+            assert torch.equal(physical_host, expected_plan.selected_physical_experts)
+            assert torch.equal(logical_host, selected_experts.cpu())
+        else:
+            assert balancer.plan._host_routing is None
         assert torch.equal(
             balancer.plan.tokens_per_local_physical_expert.cpu(), expected_plan.tokens_per_local_physical_expert
         )
@@ -212,6 +229,39 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(
         ):
             torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-4)
         assert tuple(dict(weights.named_parameters())) == parameter_names_before
+
+
+@pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Real split owner return requires Ascend hardware")
+def test_real_npu_direct_owner_return_matches_packed_prefixes(real_npu_ep_group):
+    from veomni.ops.kernels.moe_experts.standard.npu_ep_memory import (
+        _owner_token_counts,
+        restore_owner_wgrad_inputs,
+    )
+
+    rank = dist.get_rank(real_npu_ep_group)
+    device = torch.device("npu", int(os.environ.get("LOCAL_RANK", "0")))
+    replicas = (
+        ep_load_balance.ExpertReplica(0, 0, 0, 1, 0, 6, 2048),
+        ep_load_balance.ExpertReplica(0, 0, 0, 1, 1, 7, 512),
+        ep_load_balance.ExpertReplica(3, 1, 1, 0, 0, 2, 1024),
+    )
+    counts = torch.zeros(2, 4, dtype=torch.long)
+    counts[rank, :2] = torch.tensor((512, 128) if rank == 0 else (768, 512))
+    for replica in replicas:
+        if replica.target_rank == rank:
+            counts[rank, 2 + replica.target_slot] = replica.moved_tokens
+    plan = SimpleNamespace(replicas=replicas, num_local_experts=2, tokens_per_local_physical_expert=counts)
+    device_counts = _owner_token_counts(counts.sum(0), plan, rank).to(device)
+    generator = torch.Generator().manual_seed(951 + rank)
+    rows = int(counts.sum())
+    tokens = torch.randn(rows, 2048, dtype=torch.bfloat16, generator=generator).to(device)
+    grad = torch.randn(rows, 1024, dtype=torch.bfloat16, generator=generator).to(device)
+    with torch.no_grad():
+        reference = restore_owner_wgrad_inputs(tokens, grad, plan, real_npu_ep_group, device_counts)
+        direct = restore_owner_wgrad_inputs(tokens, grad, plan, real_npu_ep_group, device_counts, reuse_views=True)
+        get_torch_device().synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(reference, direct, strict=True))
+    assert all(item.is_contiguous() for item in direct)
 
 
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Real NPU grouped matmul requires Ascend hardware")

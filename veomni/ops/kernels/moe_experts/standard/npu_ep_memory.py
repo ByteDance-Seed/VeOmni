@@ -14,6 +14,8 @@
 
 """NPU balanced GMM storage and canonical owner weight gradients."""
 
+from itertools import accumulate
+
 import torch
 import torch.distributed as dist
 import torch_npu
@@ -28,6 +30,63 @@ def _owner_token_counts(host_counts, plan, rank):
     return counts
 
 
+def _restore_owner_wgrad_inputs_direct(tokens, grad_output, plan, group, offsets, device_counts):
+    """Receive each replica prefix into the final logical owner inputs."""
+    rank = dist.get_rank(group)
+    local_experts = plan.num_local_experts
+    local_rows = offsets[local_experts]
+    incoming = [0] * local_experts
+    for replica in plan.replicas:
+        if replica.source_rank == rank:
+            incoming[replica.source_local_expert] += replica.moved_tokens
+
+    inputs = (tokens, grad_output)
+    if any(incoming):
+        counts = [offsets[i + 1] - offsets[i] + extra for i, extra in enumerate(incoming)]
+        owner_offsets = list(accumulate(counts, initial=0))
+        receive_offsets = owner_offsets[:-1]
+        owner_inputs = tuple(tensor.new_empty((owner_offsets[-1], tensor.shape[1])) for tensor in inputs)
+        if local_rows:
+            positions = torch.tensor(
+                [
+                    row
+                    for i, extra in enumerate(incoming)
+                    for row in range(owner_offsets[i] + extra, owner_offsets[i + 1])
+                ],
+                dtype=torch.long,
+            )
+            if tokens.device.type == "npu":
+                positions = positions.pin_memory()
+            positions = positions.to(tokens.device, non_blocking=True)
+            for output, tensor in zip(owner_inputs, inputs, strict=True):
+                output.index_copy_(0, positions, tensor[:local_rows])
+    else:
+        owner_inputs = tuple(tensor[:local_rows].contiguous() for tensor in inputs)
+
+    operations = []
+    for replica in plan.replicas:
+        if rank == replica.target_rank:
+            slot = local_experts + replica.target_slot
+            start, end = offsets[slot : slot + 2]
+            rows = tuple(tensor[start:end].contiguous() for tensor in inputs)
+            transfer, peer = dist.isend, replica.source_rank
+        elif rank == replica.source_rank:
+            expert = replica.source_local_expert
+            start = receive_offsets[expert]
+            end = start + replica.moved_tokens
+            receive_offsets[expert] = end
+            rows = tuple(tensor[start:end] for tensor in owner_inputs)
+            transfer, peer = dist.irecv, replica.target_rank
+        else:
+            continue
+        global_peer = dist.get_global_rank(group, peer)
+        operations.extend(dist.P2POp(transfer, row, global_peer, group=group) for row in rows)
+    pending = dist.batch_isend_irecv(operations) if operations else []
+    for work in pending:
+        work.wait()
+    return (*owner_inputs, device_counts)
+
+
 def restore_owner_wgrad_inputs(tokens, grad_output, plan, group, device_counts=None, *, reuse_views=False):
     """Return replica prefixes to owners in the original logical token order.
 
@@ -39,6 +98,13 @@ def restore_owner_wgrad_inputs(tokens, grad_output, plan, group, device_counts=N
     offsets = [0]
     for count in counts:
         offsets.append(offsets[-1] + count)
+    if (
+        reuse_views
+        and device_counts is not None
+        and not torch.is_grad_enabled()
+        and tokens.dtype == grad_output.dtype == torch.bfloat16
+    ):
+        return _restore_owner_wgrad_inputs_direct(tokens, grad_output, plan, group, offsets, device_counts)
     rank = dist.get_rank(group)
     received = {}
     retained = []

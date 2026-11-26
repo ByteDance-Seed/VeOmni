@@ -97,7 +97,9 @@ def _validate_ep_balance_dispatch(
     physical_num_experts = plan.ep_size * physical_slots_per_rank if plan.replicas else num_experts
     physical_ids = plan.selected_physical_experts.reshape(-1)
     npu_memory = physical_ids.device.type == "npu" and getattr(load_balancer, "optimize_memory", False)
-    if physical_ids.is_cuda or npu_memory:
+    if plan._host_routing is not None:
+        physical_ids = plan._host_routing[0].reshape(-1)
+    elif physical_ids.is_cuda or npu_memory:
         # Validate the same routing metadata on the host after a single transfer.
         physical_ids = physical_ids.cpu()
     if physical_ids.numel() and (

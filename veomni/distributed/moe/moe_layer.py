@@ -258,7 +258,8 @@ def dispatch_to_ep_with_replicas(
     tokens = hidden_states.reshape(-1, hidden_states.shape[-1])
     output_shape = tokens.shape
     if plan.replicas:
-        tokens, mapping = alias_permute(tokens, physical_ids, selected_experts)
+        routing = plan._host_routing if memory and plan._host_routing is not None else (physical_ids, selected_experts)
+        tokens, mapping = alias_permute(tokens, *routing)
     else:
         tokens, mapping = compact_permute(tokens, physical_ids)
     exchanged = all_to_all(group, tokens, plan.output_splits, plan.input_splits)

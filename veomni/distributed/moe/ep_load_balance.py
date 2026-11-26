@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import heapq
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import torch
 import torch.distributed as dist
@@ -61,6 +61,8 @@ class EPBalancePlan:
     replicas: tuple[ExpertReplica, ...]
     rank_loads_before: tuple[int, ...]
     rank_loads_after: tuple[int, ...]
+    # Original CPU physical and logical IDs for the NPU Memory alias path.
+    _host_routing: tuple[torch.Tensor, torch.Tensor] | None = field(default=None, repr=False, compare=False)
 
 
 def _validate_executor_plan(
@@ -152,20 +154,29 @@ class ExpertReplicaTransfer:
         replica_weight = lease.tensor if lease is not None else local_weight.new_zeros(shape)
         work_handles: list[dist.Work] = []
         communication_tensors: list[torch.Tensor] = []
+        # Host-routed Memory plans initialize the EP group with the histogram
+        # all-gather. Use the initialized EP communicator for replica transfers.
+        batch_on_ep = plan._host_routing is not None and dist.get_backend(ep_group) == "hccl"
+        operations: list[dist.P2POp] = []
 
         for replica in plan.replicas:
             if ep_rank == replica.source_rank:
-                send_tensor = local_weight[replica.source_local_expert].detach().contiguous()
-                target_global_rank = dist.get_global_rank(ep_group, replica.target_rank)
-                work = dist.isend(send_tensor, dst=target_global_rank, group=ep_group)
-                communication_tensors.append(send_tensor)
-                work_handles.append(work)
+                tensor = local_weight[replica.source_local_expert].detach().contiguous()
+                transfer, peer = dist.isend, replica.target_rank
             elif ep_rank == replica.target_rank:
-                recv_tensor = replica_weight[replica.target_slot]
-                source_global_rank = dist.get_global_rank(ep_group, replica.source_rank)
-                work = dist.irecv(recv_tensor, src=source_global_rank, group=ep_group)
-                communication_tensors.append(recv_tensor)
-                work_handles.append(work)
+                tensor = replica_weight[replica.target_slot]
+                transfer, peer = dist.irecv, replica.source_rank
+            else:
+                continue
+            global_peer = dist.get_global_rank(ep_group, peer)
+            communication_tensors.append(tensor)
+            if batch_on_ep:
+                operations.append(dist.P2POp(transfer, tensor, global_peer, group=ep_group))
+            else:
+                work_handles.append(transfer(tensor, global_peer, group=ep_group))
+
+        if operations:
+            work_handles = dist.batch_isend_irecv(operations)
 
         return cls(replica_weight, tuple(work_handles), tuple(communication_tensors), lease=lease)
 
@@ -731,6 +742,7 @@ def build_ep_balance_plan(
     max_replicas_per_rank: int,
     *,
     _input_error: TypeError | ValueError | None = None,
+    _retain_host_routing: bool = False,
 ) -> EPBalancePlan:
     """Gather the current EP histogram and build this rank's physical alias plan."""
     if not isinstance(selected_experts, torch.Tensor):
@@ -809,7 +821,15 @@ def build_ep_balance_plan(
             raise _input_error from None
         raise
     if host_planning:
-        plan = replace(plan, selected_physical_experts=plan.selected_physical_experts.to(selected_experts.device))
+        physical = plan.selected_physical_experts
+        host_routing = (
+            (physical, planning_selected)
+            if _retain_host_routing and selected_experts.device.type == "npu" and plan.replicas
+            else None
+        )
+        plan = replace(
+            plan, selected_physical_experts=physical.to(selected_experts.device), _host_routing=host_routing
+        )
     return plan
 
 
@@ -832,6 +852,7 @@ class _Qwen3_5MoEEPLoadBalancer:
             ep_group=self.ep_group,
             max_replicas_per_rank=self.max_replicas_per_rank,
             _input_error=_input_error,
+            _retain_host_routing=self.optimize_memory,
         )
 
 

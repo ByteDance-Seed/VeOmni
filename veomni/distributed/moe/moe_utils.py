@@ -39,6 +39,21 @@ def compact_unpermute(tokens, routing_weights, hidden_states_shape, occurrence_o
     return eager(tokens, weights, token_indices, num_tokens=hidden_states_shape[0])
 
 
+class _OrderedAliasGather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tokens, logical_indices, physical_indices, logical_to_physical):
+        ctx.input_shape = tokens.shape
+        ctx.save_for_backward(logical_indices, logical_to_physical)
+        return tokens.index_select(0, physical_indices)
+
+    @staticmethod
+    def backward(ctx, gradient):
+        logical_indices, logical_to_physical = ctx.saved_tensors
+        logical_gradient = gradient.index_select(0, logical_to_physical)
+        token_gradient = torch.ops.aten.index_select_backward(logical_gradient, ctx.input_shape, 0, logical_indices)
+        return token_gradient, None, None, None
+
+
 def alias_permute(tokens: torch.Tensor, physical_experts: torch.Tensor, logical_experts: torch.Tensor):
     """Dispatch physical rows while accumulating input gradients in logical order.
 
@@ -59,7 +74,19 @@ def alias_permute(tokens: torch.Tensor, physical_experts: torch.Tensor, logical_
     physical_to_logical = inverse_logical.index_select(0, physical_order)
     logical_to_physical = torch.empty_like(physical_to_logical)
     logical_to_physical.scatter_(0, physical_to_logical, positions)
-    logical_tokens = tokens.index_select(0, torch.div(logical_order, topk, rounding_mode="floor"))
+    logical_token_indices = torch.div(logical_order, topk, rounding_mode="floor")
+    if logical_order.device != tokens.device:
+        physical_token_indices = torch.div(physical_order, topk, rounding_mode="floor")
+        indices = torch.stack((logical_order, logical_token_indices, physical_token_indices, logical_to_physical))
+        logical_order, logical_token_indices, physical_token_indices, logical_to_physical = (
+            indices.pin_memory().to(tokens.device, non_blocking=True).unbind()
+        )
+        # Gather physical rows directly; accumulate duplicate input gradients in logical order.
+        physical_tokens = _OrderedAliasGather.apply(
+            tokens, logical_token_indices, physical_token_indices, logical_to_physical
+        )
+        return physical_tokens, (logical_order, logical_to_physical)
+    logical_tokens = tokens.index_select(0, logical_token_indices)
     return logical_tokens.index_select(0, physical_to_logical), (logical_order, logical_to_physical)
 
 

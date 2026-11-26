@@ -11,8 +11,25 @@ from torch.nn import functional as F
 
 from veomni.distributed.moe.ep_buffer import ReplicaBufferPool
 from veomni.distributed.moe.ep_load_balance import _Qwen3_5MoEEPLoadBalancer, cat_local_and_replica_weights
+from veomni.distributed.moe.moe_utils import _OrderedAliasGather, alias_permute
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 from veomni.ops.kernels.moe_experts.standard import npu, triton
+
+
+def test_ordered_alias_gather_preserves_duplicate_token_gradient_order():
+    generator = torch.Generator().manual_seed(372)
+    tokens = torch.randn(64, 12, generator=generator, dtype=torch.bfloat16).T.requires_grad_()
+    reference_tokens = tokens.detach().clone().requires_grad_()
+    logical = torch.randint(12, (12, 8), generator=generator)
+    physical = torch.randint(16, logical.shape, generator=generator)
+    reference, (logical_order, logical_to_physical) = alias_permute(reference_tokens, physical, logical)
+    physical_order = torch.argsort(physical.flatten(), stable=True)
+    actual = _OrderedAliasGather.apply(tokens, logical_order // 8, physical_order // 8, logical_to_physical)
+    gradient = torch.randn(actual.shape, generator=generator, dtype=torch.bfloat16)
+    actual.backward(gradient)
+    reference.backward(gradient)
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    torch.testing.assert_close(tokens.grad, reference_tokens.grad, rtol=0, atol=0)
 
 
 def _reference_mlp(tokens, gates, downs):
