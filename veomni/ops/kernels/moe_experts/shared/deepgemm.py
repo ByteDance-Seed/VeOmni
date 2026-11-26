@@ -11,6 +11,7 @@ This module is imported lazily by the CUDA-only backend.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
@@ -88,6 +89,12 @@ class GroupedLayout:
     groups: torch.Tensor
     ks: torch.Tensor
     use_ue8m0: bool
+    #: Whether ``unpad`` is the identity for a single group or a no-op gather.
+    #: Fused MoE always pads to ``alignment`` rows per expert, so a rank whose
+    #: tokens already divide that way skips a full-size gather in forward and in
+    #: backward; the caller only has to slice the padded head off. It is also what
+    #: lets a dense projection (one group) reuse this Function at all.
+    is_identity_unpad: bool = False
 
     @classmethod
     def from_counts(cls, counts: torch.Tensor, device: torch.device) -> GroupedLayout:
@@ -118,7 +125,75 @@ class GroupedLayout:
         if target:
             with torch.cuda.device(device):
                 _layout_kernel[(len(blocks),)](metadata, rows, unpad, groups, BLOCK=128)
-        return cls(logical, padded, metadata, rows, unpad, groups, ks, _uses_ue8m0(device))
+        # ``unpad`` gathers padded rows back to the source order. It is a slice
+        # rather than a gather when there is one group, or when every group was
+        # already a multiple of the alignment.
+        is_identity_unpad = len(logical) == 1 or list(logical) == padded
+        return cls(logical, padded, metadata, rows, unpad, groups, ks, _uses_ue8m0(device), is_identity_unpad)
+
+
+_UNIFORM_LAYOUT_CACHE: OrderedDict[tuple[int, int, int, int], GroupedLayout] = OrderedDict()
+#: Distinct ``(rows, groups, device, stream)`` combinations a *step* actually meets.
+#: ``dyn_bsz`` defaults on, so ``n_rows`` changes almost every micro-batch and an
+#: unbounded cache would fill with shapes that never return. A handful of entries
+#: covers what is live within one step (dense + grouped per layer, one row count
+#: each); anything past that is a shape this step will not ask for again.
+#:
+#: The per-entry size is ``16 * n_groups * n_rows`` bytes (``unpad`` is int64) plus
+#: ``8 * n_groups * n_rows`` for ``rows``/``groups`` and the metadata blocks. It
+#: depends on what ``n_rows`` means per family:
+#:   - a dense projection is one group over the full packed sequence, so a 256K
+#:     layer is ~4 MiB;
+#:   - ``linear/grouped`` gives *every* head group the full token count, so the
+#:     same 256K sequence costs ``o_groups`` times that -- ~32 MiB at 8 groups;
+#:   - a fused MoE splits the tokens among the experts, so the total stays ~4 MiB.
+#: The bound is therefore "8 x the largest live entry", i.e. tens of MiB for a dense
+#: layer and a few hundred MiB for a wide grouped one at 256K -- not a flat 32 MiB.
+_UNIFORM_LAYOUT_CACHE_LIMIT = 8
+
+
+def get_uniform_layout(n_rows: int, n_groups: int, device: torch.device) -> GroupedLayout:
+    """Return a cached :class:`GroupedLayout` for ``n_groups`` groups of ``n_rows`` rows.
+
+    ``from_counts`` reads its counts on the host and JIT-compiles a layout kernel per
+    distinct shape, so a dense projection paying that every step was a visible
+    per-layer cost. The layout depends only on the shape, so caching it is exact.
+
+    The cache key includes the current CUDA stream, because ``_layout_kernel`` writes
+    ``rows`` / ``unpad`` / ``groups`` asynchronously on whatever stream is current
+    when a layout is built. A cache hit hands those tensors back without ordering
+    them against the caller's stream, so a second stream could read them before the
+    first finished writing. Keying by stream keeps same-stream calls on the fast path
+    and makes a cross-stream caller build (and synchronize on) its own layout. No
+    caller in this repository overlaps these rows across streams today; this is what
+    makes that safe rather than accidental.
+
+    It is an LRU rather than a dict with a ``clear()`` cap: clearing on overflow
+    throws away the entries the current step is still using, so the next layer would
+    rebuild -- and resynchronize -- a layout that was hot a moment ago.
+    """
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    stream = torch.cuda.current_stream(index)
+    # ``cuda_stream`` is the stream's own handle, which is what ``torch.cuda.Stream``
+    # hashes on. ``stream_id`` is a per-device slot index and two distinct external
+    # streams can share one, which would let a hit return a layout built on another
+    # stream -- exactly the cross-stream hazard the key exists to prevent.
+    key = (n_rows, n_groups, index, stream.cuda_stream)
+    cached = _UNIFORM_LAYOUT_CACHE.get(key)
+    if cached is not None:
+        # ``index`` is already in the key, so the entry is necessarily for this
+        # device -- there is nothing left to check. Comparing
+        # ``cached.rows.device == device`` here would be wrong *and* slow: PyTorch
+        # says ``torch.device("cuda:0") != torch.device("cuda")``, so a caller
+        # passing an unindexed device would miss on every call.
+        _UNIFORM_LAYOUT_CACHE.move_to_end(key)
+        return cached
+    counts = torch.full((n_groups,), n_rows, dtype=torch.int64)
+    layout = GroupedLayout.from_counts(counts, device)
+    _UNIFORM_LAYOUT_CACHE[key] = layout
+    if len(_UNIFORM_LAYOUT_CACHE) > _UNIFORM_LAYOUT_CACHE_LIMIT:
+        _UNIFORM_LAYOUT_CACHE.popitem(last=False)
+    return layout
 
 
 @triton.jit
@@ -521,8 +596,6 @@ class GroupedLinear(torch.autograd.Function):
                     disable_ue8m0_cast=not layout.use_ue8m0,
                 )
             del qw, sw
-            unpadded = output.index_select(0, layout.unpad)
-            del output
             # Wgrad needs token-axis quantization, not a transpose of the forward
             # row quantization. Produce it from BF16 now so autograd need not
             # retain that larger source activation until backward.
@@ -538,6 +611,22 @@ class GroupedLinear(torch.autograd.Function):
             # Callers retain FP8 instead for temporary BF16 weight copies.
             source_weight = weight if ctx.needs_input_grad[0] and recompute_weight else None
             ctx.save_for_backward(qx, sx, qwt, swt, source_weight)
+            if layout.is_identity_unpad:
+                # Already in source order: a single group, or every group padded
+                # exactly to its own count. Only the padding tail is dropped, which
+                # is what lets a dense projection (one group) reuse this Function
+                # without paying a full-size gather per layer.
+                #
+                # ``narrow`` would return a *view* of a tensor this Function
+                # allocated, and an in-place consumer such as ``relu(inplace=True)``
+                # after a dense linear row is refused for an autograd output's view.
+                # ``clone`` only runs when there is a tail to drop, so the aligned
+                # case keeps the buffer.
+                if len(layout.counts) != 1 or output.shape[0] == layout.counts[0]:
+                    return output
+                return output.narrow(0, 0, layout.counts[0]).clone()
+            unpadded = output.index_select(0, layout.unpad)
+            del output
             return unpadded
 
     @staticmethod
@@ -574,7 +663,15 @@ class GroupedLinear(torch.autograd.Function):
                         recipe=(1, 128, 128),
                         disable_ue8m0_cast=not layout.use_ue8m0,
                     )
-                dx = padded_dx.index_select(0, layout.unpad)
+                if layout.is_identity_unpad:
+                    if len(layout.counts) != 1 or padded_dx.shape[0] == layout.counts[0]:
+                        dx = padded_dx
+                    else:
+                        # Same view-vs-copy reasoning as the forward: the graph
+                        # consumes this gradient and may write into it.
+                        dx = padded_dx.narrow(0, 0, layout.counts[0]).clone()
+                else:
+                    dx = padded_dx.index_select(0, layout.unpad)
                 del padded_dx
             # Dgrad is the last consumer of the weight transpose. Do not overlap
             # it with wgrad's output, column operands and FP32 workspace.
