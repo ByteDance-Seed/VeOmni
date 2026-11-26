@@ -588,6 +588,7 @@ def _read_ep_dim0_slice(
     para_rank: int,
     expected_full0: int,
     zero_pad: bool = False,
+    min_dim0: Optional[int] = None,
     strict_mismatch_message: Optional[str] = None,
     row_transform: Optional[Callable[["torch.Tensor", int, int], "torch.Tensor"]] = None,
 ) -> "torch.Tensor":
@@ -606,6 +607,8 @@ def _read_ep_dim0_slice(
     real0 = sl.get_shape()[0]
     if real0 > expected_full0:
         raise RuntimeError(f"{name}: checkpoint dim0={real0} exceeds model dim0={expected_full0}.")
+    if min_dim0 is not None and real0 < min_dim0:
+        raise RuntimeError(f"{name}: checkpoint dim0={real0} is below required logical dim0={min_dim0}.")
     if not zero_pad and real0 != expected_full0:
         if strict_mismatch_message is not None:
             raise RuntimeError(strict_mismatch_message)
@@ -639,6 +642,7 @@ def _read_persistent_extra_parallel_slice(
     name: str,
     parameter: DTensor,
     zero_pad_dim0: bool,
+    min_dim0: Optional[int] = None,
 ) -> "torch.Tensor":
     """Read one persistent ExtraParallel DTensor rectangle from safetensors.
 
@@ -670,6 +674,8 @@ def _read_persistent_extra_parallel_slice(
         if dim == 0 and zero_pad_dim0:
             if real_dim > global_dim:
                 raise RuntimeError(f"{name}: checkpoint dim0={real_dim} exceeds model dim0={global_dim}.")
+            if min_dim0 is not None and real_dim < min_dim0:
+                raise RuntimeError(f"{name}: checkpoint dim0={real_dim} is below required logical dim0={min_dim0}.")
         elif real_dim != global_dim:
             raise RuntimeError(
                 f"{name}: checkpoint dimension {dim}={real_dim} does not match model dimension {global_dim}."
@@ -1063,6 +1069,8 @@ def load_model_weights_ep_sharded(
                     # overlap and zero-fill the tail. Otherwise the checkpoint must
                     # match the model exactly.
                     zero_pad = checkpoint_converter_is_dim0_zero_pad(converter, bare_name)
+                    min_dim0_fn = getattr(converter, "dim0_min_rows", None)
+                    min_dim0 = min_dim0_fn(bare_name) if callable(min_dim0_fn) else None
                     companion = _rowwise_companion(bare_name)
                     if _converter_transforms(bare_name):
                         # A converter that fuses/reshapes this key can't be streamed.
@@ -1100,6 +1108,7 @@ def load_model_weights_ep_sharded(
                             name=name,
                             parameter=parameter,
                             zero_pad_dim0=zero_pad,
+                            min_dim0=min_dim0,
                         )
                         # `row_transform` is refused above, so the slice is raw
                         # checkpoint storage: a converter that claims this key by
@@ -1127,6 +1136,7 @@ def load_model_weights_ep_sharded(
                         para_rank=para_rank,
                         expected_full0=expected_full0,
                         zero_pad=zero_pad,
+                        min_dim0=min_dim0,
                         row_transform=row_transform,
                     )
                     if row_transform is None:

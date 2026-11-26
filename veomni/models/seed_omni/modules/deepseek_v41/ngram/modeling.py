@@ -455,6 +455,15 @@ class NgramTablePadding:
             tensor = torch.cat((tensor, padding), dim=0)
         return ConvertedCheckpointTensor(name=name, tensor=tensor)
 
+    def dim0_min_rows(self, name: str) -> int | None:
+        match = _TABLE_TENSOR.match(name)
+        if match is None:
+            return None
+        index = int(match.group("index"))
+        if index >= len(self.num_embeddings):
+            return None
+        return self.num_embeddings[index]
+
     def is_dim0_zero_pad(self, name: str) -> bool:
         return self.can_handle(name)
 

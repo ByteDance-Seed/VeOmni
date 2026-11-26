@@ -903,3 +903,31 @@ def test_convert_llm_rejects_missing_required_weight(tmp_path):
     _, _, _, llm_cfg, _ = _build_configs(hf_cfg)
     with pytest.raises(KeyError, match=r"layers\.0\.attn_norm\.weight"):
         convert_llm(TensorSource(path), str(tmp_path / "out"), llm_cfg, list(llm_cfg.engram_layer_ids))
+
+
+@pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "fp8"])
+def test_ngram_stream_load_rejects_truncated_table_below_logical_rows(tmp_path, monkeypatch, quantized):
+    """Streaming EP load must reject checkpoint tables with fewer than logical ``num_embeddings`` rows."""
+    import copy
+
+    from veomni.models.seed_omni.modules.deepseek_v41 import hf_layout as v41_hf_layout
+
+    path = str(tmp_path / f"release_trunc_{quantized}")
+    _release(path, quantized=quantized)
+    with open(os.path.join(path, "config.json")) as f:
+        released = json.load(f)
+    released["text_config"].update(
+        engram_vocab_size=64, engram_num_embeddings=[1000] * len(ENGRAM_LAYERS), engram_compressed_vocab_size=40
+    )
+    with open(os.path.join(path, "config.json"), "w") as f:
+        json.dump(released, f)
+    config = build_deepseek_v41_hf_layout(path).build_module_configs(path)[NGRAM]
+    # Write truncated tables (512 rows < logical 1000 rows, while model pads to 1024).
+    trunc_cfg = copy.deepcopy(config)
+    trunc_cfg.num_embeddings = [512] * len(ENGRAM_LAYERS)
+    _add_ngram_tables(path, trunc_cfg)
+    token_map = torch.arange(config.vocab_size, dtype=torch.int64) % config.compressed_vocab_size
+    monkeypatch.setattr(v41_hf_layout, "build_ngram_token_map", lambda _path, _config: token_map.clone())
+
+    with pytest.raises(RuntimeError, match="below required logical dim0=1000"):
+        _stream_ngram_as_rank(path, monkeypatch, rank=0)

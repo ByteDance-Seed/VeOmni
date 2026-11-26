@@ -573,8 +573,10 @@ class TestReviewRegressions:
         cos = torch.ones(1, seq_len, cfg_cand.qk_rope_head_dim)
         sin = torch.zeros(1, seq_len, cfg_cand.qk_rope_head_dim)
         topk_idxs, student = idx_cand(hidden, q_res, index_k, plan, shared, cos, sin, return_scores=True)
-        # Only slot 0 is a valid candidate; all other slots in topk must be -1 / -inf.
+        # Only slot 0 is a valid candidate; candidate 0 must survive for every query and all other slots must be -1 / -inf.
         assert ((topk_idxs == -1) | (topk_idxs == 0)).all()
+        assert ((topk_idxs == 0).sum(dim=-1) == 1).all()
+        assert torch.isfinite(student[topk_idxs == 0]).all()
         assert torch.isneginf(student[topk_idxs == -1]).all()
 
         # _indexer_loss handles width == 0 without negative-zero slicing.
