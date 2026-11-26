@@ -198,7 +198,9 @@ class TestSplit:
         expert gates, hyper-connection stream mixing, the DSA indexer's per-head
         scores, and the compressors' softmax gates. The sibling feature projections
         in each of those modules must stay on Muon, which is what the scoped
-        `compressor.gate_proj` / `indexer.gate_proj` entries are for.
+        `compressor.gate_proj` / `indexer.gate_proj` entries are for. Lookup
+        matrices (`.q_weight` / `.k_weight`) are the same case for a different
+        reason: a row is a memory, not a feature direction.
         """
         model = nn.Module()
         layer = nn.Module()
@@ -209,12 +211,18 @@ class TestSplit:
         layer.mlp.router = nn.Linear(16, 8, bias=False)
         layer.mlp.shared_expert_gate = nn.Linear(16, 1, bias=False)
         layer.mlp.experts = nn.ParameterDict({"gate_up_proj": nn.Parameter(torch.randn(4, 16, 16))})
-        layer.mlp.shared_experts = nn.ModuleDict({"gate_proj": nn.Linear(16, 8, bias=False)})
+        layer.mlp.shared_experts = nn.ModuleDict(
+            {
+                "gate_proj": nn.Linear(16, 8, bias=False),
+                "custom_adamw_only": nn.Linear(16, 8, bias=False),
+            }
+        )
         layer.self_attn = nn.Module()
         layer.self_attn.compressor = nn.ModuleDict(
             {
                 "kv_proj": nn.Linear(16, 8, bias=False),
                 "gate_proj": nn.Linear(16, 8, bias=False),
+                "wgate": nn.Linear(16, 8, bias=False),
             }
         )
         layer.self_attn.compressor.indexer = nn.ModuleDict(
@@ -227,8 +235,22 @@ class TestSplit:
         )
         model.layers = nn.ModuleList([layer])
         model.hc_head = nn.ParameterDict({"hc_fn": nn.Parameter(torch.randn(4, 64))})
+        model.engram = nn.ModuleDict(
+            {
+                "1": nn.ParameterDict(
+                    {
+                        "q_weight": nn.Parameter(torch.randn(4, 16)),
+                        "k_weight": nn.Parameter(torch.randn(4, 16)),
+                        "wkv": nn.Parameter(torch.randn(32, 16)),
+                    }
+                )
+            }
+        )
 
-        _, _, muon_names, adamw_names = split_muon_adamw_params(model)
+        _, _, muon_names, adamw_names = split_muon_adamw_params(
+            model,
+            extra_adamw_name_patterns=["custom_adamw_only"],
+        )
 
         assert set(adamw_names) == {
             "layers.0.attn_hc.fn",
@@ -236,10 +258,14 @@ class TestSplit:
             "layers.0.mlp.gate.weight",
             "layers.0.mlp.router.weight",
             "layers.0.mlp.shared_expert_gate.weight",
+            "layers.0.mlp.shared_experts.custom_adamw_only.weight",
             "layers.0.self_attn.compressor.gate_proj.weight",
+            "layers.0.self_attn.compressor.wgate.weight",
             "layers.0.self_attn.compressor.indexer.gate_proj.weight",
             "layers.0.self_attn.compressor.indexer.weights_proj.weight",
             "hc_head.hc_fn",
+            "engram.1.q_weight",
+            "engram.1.k_weight",
         }
         assert set(muon_names) == {
             "layers.0.mlp.experts.gate_up_proj",
@@ -247,7 +273,36 @@ class TestSplit:
             "layers.0.self_attn.compressor.kv_proj.weight",
             "layers.0.self_attn.compressor.indexer.q_b_proj.weight",
             "layers.0.self_attn.compressor.indexer.kv_proj.weight",
+            "engram.1.wkv",
         }
+
+        from veomni.arguments.arguments_types import OptimizerConfig
+        from veomni.optim import build_optimizer
+
+        with pytest.raises(ValueError, match="muon_extra_adamw_names"):
+            OptimizerConfig(type="muon", muon_extra_adamw_names="bare_string")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="extra_adamw_name_patterns"):
+            split_muon_adamw_params(model, extra_adamw_name_patterns="bare_string")
+
+        opt_cfg = OptimizerConfig(type="muon", muon_extra_adamw_names=["custom_adamw_only"])
+        built = build_optimizer(model, lr=1e-4, weight_decay=0.1, optimizer_type="muon", optimizer_config=opt_cfg)
+        adamw_param_ids = {id(p) for g in built.optimizers_dict["adamw"].param_groups for p in g["params"]}
+        assert id(layer.mlp.shared_experts["custom_adamw_only"].weight) in adamw_param_ids
+
+    def test_compressor_wgate_spelling_routes_like_gate_proj(self):
+        """Scoped ``compressor.wgate`` routes to AdamW while sibling ``wkv`` stays on Muon."""
+        model = nn.Module()
+        model.compressor = nn.ModuleDict(
+            {
+                "wkv": nn.Linear(16, 8, bias=False),
+                "wgate": nn.Linear(16, 8, bias=False),
+            }
+        )
+
+        _, _, muon_names, adamw_names = split_muon_adamw_params(model)
+
+        assert set(adamw_names) == {"compressor.wgate.weight"}
+        assert set(muon_names) == {"compressor.wkv.weight"}
 
 
 class TestParamShapeEligibility:
@@ -445,6 +500,30 @@ class TestNumerics:
             v_after = sd_after[k]
             if isinstance(v_before, torch.Tensor):
                 torch.testing.assert_close(v_before, v_after, atol=0.0, rtol=0.0, msg=f"state_dict mismatch at {k}")
+
+    @pytest.mark.parametrize("state_offload", [False, True])
+    def test_legacy_compensation_state_is_dropped_on_load(self, state_offload):
+        """A checkpoint written while Muon carried a BF16 cast buffer still loads cleanly."""
+        torch.manual_seed(23)
+        p = nn.Parameter(torch.randn(8, 8, dtype=torch.bfloat16))
+        opt = DistributedMuon([p], lr=4e-5, weight_decay=0.1, ns_implementation="std", state_offload=state_offload)
+        p.grad = torch.randn_like(p)
+        opt.step()
+
+        # Inject a legacy `compensation` entry directly into the leaf optimizer
+        # state dict to emulate a checkpoint written before the buffer was removed.
+        stale_sd = opt.state_dict()
+        stale_sd["state"][0] = {**stale_sd["state"][0], "compensation": torch.zeros_like(p)}
+
+        p_fresh = nn.Parameter(p.detach().clone())
+        fresh_opt = DistributedMuon(
+            [p_fresh], lr=4e-5, weight_decay=0.1, ns_implementation="std", state_offload=state_offload
+        )
+        fresh_opt.load_state_dict(stale_sd)
+        assert "compensation" not in fresh_opt.state.get(p_fresh, {})
+        p_fresh.grad = torch.randn_like(p_fresh)
+        fresh_opt.step()
+        assert "compensation" not in fresh_opt.state[p_fresh]
 
 
 class TestBuildOptimizer:
@@ -1343,6 +1422,100 @@ class TestGramQuackFallback:
         assert muon_mod._gram_quack_unavailable_reason(grad) is None
 
 
+class TestMuonStateOffload:
+    """Host-resident momentum must be numerically identical to device-resident.
+
+    Offload is a placement choice, so the only acceptable difference is *where*
+    the buffer lives: a step taken with ``state_offload=True`` has to match the
+    same step with it off exactly, and a checkpoint round trip has to preserve
+    the host values across a fresh optimizer.
+    """
+
+    @pytest.mark.parametrize("nesterov", [True, False])
+    def test_step_matches_device_resident(self, nesterov):
+        torch.manual_seed(11)
+        w = torch.randn(16, 32, dtype=torch.float32)
+        on_device = nn.Parameter(w.clone())
+        on_host = nn.Parameter(w.clone())
+
+        kw = dict(
+            lr=1e-2,
+            weight_decay=0.05,
+            momentum=0.9,
+            nesterov=nesterov,
+            adjust_lr_fn="match_rms_adamw",
+            ns_implementation="std",
+        )
+        opt_device = DistributedMuon([on_device], **kw)
+        opt_host = DistributedMuon([on_host], state_offload=True, **kw)
+
+        for step in range(3):
+            torch.manual_seed(100 + step)
+            grad = torch.randn_like(on_device)
+            on_device.grad = grad.clone()
+            on_host.grad = grad.clone()
+            opt_device.step()
+            opt_host.step()
+            torch.testing.assert_close(on_device.detach(), on_host.detach(), atol=0.0, rtol=0.0)
+
+    def test_momentum_never_resides_in_device_state(self):
+        torch.manual_seed(5)
+        p = nn.Parameter(torch.randn(8, 16, dtype=torch.float32))
+        opt = DistributedMuon([p], lr=1e-2, state_offload=True, ns_implementation="std")
+        p.grad = torch.randn_like(p)
+        opt.step()
+
+        assert p in opt._host_momentum
+        host_buf = opt._host_momentum[p]
+        assert host_buf.device.type == "cpu"
+        # ``self.state[p]["momentum_buffer"]`` aliases the CPU host buffer directly
+        # (zero accelerator storage), matching ``SwapAdamW``.
+        bound = opt.state[p]["momentum_buffer"]
+        assert bound.device.type == "cpu"
+        assert bound.data_ptr() == host_buf.data_ptr()
+
+    def test_state_dict_roundtrip_preserves_host_momentum(self):
+        torch.manual_seed(9)
+        w = torch.randn(8, 16, dtype=torch.float32)
+        p = nn.Parameter(w.clone())
+        opt = DistributedMuon([p], lr=1e-2, momentum=0.9, state_offload=True, ns_implementation="std")
+        for _ in range(2):
+            p.grad = torch.randn_like(p)
+            opt.step()
+
+        saved = opt.state_dict()
+        # The exported dict has to look like a non-offloaded Muon's, so a
+        # checkpoint written here loads into either flavor.
+        exported = list(saved["state"].values())[0]
+        assert "momentum_buffer" in exported
+
+        p2 = nn.Parameter(w.clone())
+        resumed = DistributedMuon([p2], lr=1e-2, momentum=0.9, state_offload=True, ns_implementation="std")
+        resumed.load_state_dict(saved)
+
+        assert p2 in resumed._host_momentum
+        torch.testing.assert_close(resumed._host_momentum[p2], opt._host_momentum[p], atol=0.0, rtol=0.0)
+        # Bound state aliases the restored CPU buffer (not an extra copy).
+        assert resumed.state[p2]["momentum_buffer"].device.type == "cpu"
+        assert resumed.state[p2]["momentum_buffer"].data_ptr() == resumed._host_momentum[p2].data_ptr()
+
+        # Shape mismatch must fail fast instead of silently broadcasting via copy_.
+        bad_sd = opt.state_dict()
+        bad_sd["state"][0] = {"momentum_buffer": torch.zeros(1, 16)}
+        with pytest.raises(ValueError, match="has shape"):
+            resumed.load_state_dict(bad_sd)
+
+        # And the resumed optimizer continues along the same trajectory, from the
+        # same parameter and momentum values.
+        p2.data.copy_(p.detach())
+        grad = torch.randn_like(p)
+        p.grad = grad.clone()
+        p2.grad = grad.clone()
+        opt.step()
+        resumed.step()
+        torch.testing.assert_close(p.detach(), p2.detach(), atol=0.0, rtol=0.0)
+
+
 def test_moe_expert_ns_chunk_sizes_schedule():
     """The slicer must produce a valid, balanced, minimal-call schedule for any budget.
 
@@ -1560,3 +1733,64 @@ def test_moe_expert_ns_chunking_matches_whole_stack_on_accelerator(monkeypatch):
         torch.testing.assert_close(chunked.float(), whole.float(), atol=5e-3, rtol=5e-3)
         if backend == "gram_quack":
             assert muon_mod._GRAM_QUACK_FALLBACK_WARNED is (get_gpu_compute_capability(local.device) < 90)
+
+
+def test_state_offload_does_not_make_a_save_run_a_step(monkeypatch):
+    """A checkpoint read must not turn into a full Muon update or decay momentum.
+
+    ``distributed.checkpoint`` opens every optimizer state read with
+    ``_init_optim_state``. That helper returns early only when ``optim.state`` is
+    non-empty or a parameter still carries a gradient. Because
+    ``DistributedMuon(state_offload=True)`` binds its CPU momentum buffers
+    directly in ``self.state`` (matching ``SwapAdamW``), ``_init_optim_state``
+    must skip ``step()`` on a fresh optimizer, after ``step() + zero_grad()``,
+    across repeated saves, and right after ``load_state_dict()``.
+    """
+    from torch.distributed.checkpoint.state_dict import _init_optim_state
+
+    torch.manual_seed(13)
+    p = nn.Parameter(torch.randn(8, 16, dtype=torch.float32))
+    opt = DistributedMuon([p], lr=1e-2, momentum=0.9, state_offload=True, ns_implementation="std")
+
+    calls = []
+    real_step = opt.step
+    monkeypatch.setattr(opt, "step", lambda *a, **k: (calls.append(1), real_step(*a, **k))[1])
+
+    # Fresh optimizer before first step (resume template path).
+    _init_optim_state(opt)
+    assert not calls, "fresh state_offload optimizer ran a step during _init_optim_state"
+
+    # Real step + zero_grad (save path).
+    p.grad = torch.randn_like(p)
+    real_step()
+    opt.zero_grad(set_to_none=True)
+
+    before = p.detach().clone()
+    mom_before = opt._host_momentum[p].clone()
+    _init_optim_state(opt)
+    assert not calls, "the checkpoint path ran a full optimizer step"
+    torch.testing.assert_close(p.detach(), before, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(opt._host_momentum[p], mom_before, atol=0.0, rtol=0.0)
+
+    # Several saves in a row: the guard must hold every time, not just once.
+    for _ in range(2):
+        opt.state_dict()
+        _init_optim_state(opt)
+        assert not calls, "a later save ran a full optimizer step"
+        torch.testing.assert_close(p.detach(), before, atol=0.0, rtol=0.0)
+
+    # Right after load_state_dict(): _init_optim_state must still not run or decay momentum.
+    saved = opt.state_dict()
+    p2 = nn.Parameter(before.clone())
+    resumed = DistributedMuon([p2], lr=1e-2, momentum=0.9, state_offload=True, ns_implementation="std")
+    resumed.load_state_dict(saved)
+    resumed_calls = []
+    real_resumed_step = resumed.step
+    monkeypatch.setattr(resumed, "step", lambda *a, **k: (resumed_calls.append(1), real_resumed_step(*a, **k))[1])
+    _init_optim_state(resumed)
+    assert not resumed_calls, "post-resume _init_optim_state ran a step"
+    torch.testing.assert_close(resumed._host_momentum[p2], mom_before, atol=0.0, rtol=0.0)
+
+    # Exported checkpoint carries only standard Muon keys.
+    for state in opt.state_dict()["state"].values():
+        assert set(state.keys()) == {"momentum_buffer"}

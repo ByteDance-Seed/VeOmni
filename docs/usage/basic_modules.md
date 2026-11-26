@@ -383,12 +383,20 @@ model = build_parallelize_model(
 |------|-------------|
 | `adamw` (default) | Standard `torch.optim.AdamW`. |
 | `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
-| `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases, norms, and 2D matrices that route, mix or gate rather than transform features (MoE router gates, mHC stream mixing, the DSA indexer's `weights_proj`, compressor `gate_proj`) — see `_DEFAULT_ADAMW_NAME_PATTERNS` in `veomni/optim/muon.py`. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
+| `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases, norms, and 2D matrices that route, mix, gate, or index lookup tables rather than transform features (MoE router gates, mHC stream mixing, `.q_weight` / `.k_weight` lookup matrices, the DSA indexer's `weights_proj`, compressor `gate_proj` / `wgate`) — see `_DEFAULT_ADAMW_NAME_PATTERNS` in `veomni/optim/muon.py`. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
 
-`model.optimizer.state_offload: cpu` (with `type: adamw`) keeps the AdamW moment
-states in host buffers — pinned by default, pageable when `state_offload_pin_memory`
-is `false` or a pinned allocation fails — and streams them to the device in
-batches, lowering peak device memory.
+`model.optimizer.state_offload: cpu` (supported for `type: adamw` and `type: muon`)
+keeps the moment states in host buffers — pinned by default, pageable when
+`state_offload_pin_memory` is `false` or a pinned allocation fails — lowering
+peak device memory, with a different shape per algorithm:
+
+* `adamw` streams its two moments to the device in batches sized from the
+  currently free device memory.
+* `muon` holds one `momentum_buffer` per parameter, which no other tensor reads,
+  so it streams that buffer in immediately before each parameter's update and
+  releases it straight after. Peak device cost becomes one parameter's momentum
+  instead of the whole Muon group's. Under `type: muon` the AdamW sibling group
+  (embeddings, `lm_head`, norms) offloads in batches too.
 
 Muon-specific hyperparameters live under `model.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` continue to drive the AdamW sibling group.
 
@@ -407,6 +415,7 @@ Muon-specific knobs (only consulted when `optimizer.type == "muon"`):
 | `muon_expert_zero_comm` | `false` | **MoE / FSDP+EP only.** When `true`, expert FSDP shards along dim-0 (whole experts per rank) instead of the default dim-1 (hidden split), letting Muon's batched Newton-Schulz run with **zero communication**. Requires the model's ExtraParallel plan to declare a 3D expert stack sliced on dim 0, and every parameter it covers (2D per-expert biases included) to satisfy `(num_experts / ep_size) % ep_fsdp_size == 0`; otherwise the trainer logs a warning and falls back to the dim-1 + all-to-all-gather path. Non-expert ExtraParallels such as `emb` keep their default layout. |
 | `muon_ns_implementation` | `gram_quack` | Newton–Schulz backend: `std`, `gram` (pure PyTorch Gram-NS), or `gram_quack` (default; Dao-AILab + quack CuTeDSL GEMM; falls back to `gram` with a warning if unavailable). |
 | `muon_gram_ns_reset_iterations` | `[2]` | Restart indices for Gram-NS (`gram` / `gram_quack` only). |
+| `muon_extra_adamw_names` | `[]` | Additional case-insensitive parameter name substrings routed to AdamW (preserving `weight_decay`) instead of Muon orthogonalization. |
 | `muon_head_group_size` | `0` | Attention heads per orthogonalization block ("Muon Split", see below). `0` keeps one polar factor per projection, `1` is fully per-head, `g>1` groups `g` heads per block. Any value `>= 1` also requires `muon_head_split_modules`. |
 | `muon_head_split_modules` | `[]` | Projections to head-split, each matched as a leaf module name or a dotted path suffix (`self_attn.q_b_proj`). **Required** when `muon_head_group_size >= 1`; there is no default list. See below for the nested-name rule. |
 
