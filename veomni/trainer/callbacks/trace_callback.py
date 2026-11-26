@@ -315,7 +315,12 @@ class TqdmCallback(Callback):
         display_metrics = dict(self.trainer.step_train_metrics)
         env_metrics = getattr(self.trainer, "step_env_metrics", None) or {}
         for key in ("mfu(%)", "tflops_per_gpu", "flops_achieved(T)", "step_time(s)"):
-            if key in env_metrics:
+            prefixed_key = f"training/{key}"
+            if key in display_metrics or prefixed_key in display_metrics:
+                continue
+            if prefixed_key in env_metrics:
+                display_metrics[key] = env_metrics[prefixed_key]
+            elif key in env_metrics:
                 display_metrics[key] = env_metrics[key]
         postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in display_metrics.items())
         self.data_loader_tqdm.set_postfix_str(postfix, refresh=False)

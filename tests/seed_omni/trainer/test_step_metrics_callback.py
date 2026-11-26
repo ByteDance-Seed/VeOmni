@@ -82,14 +82,14 @@ def test_ranks_reduce_the_same_step_metrics(tmp_path):
     assert env["trace/text/avg_seq_len"] == 10 / 4
     assert abs(env["flops_achieved(T)"] - 40.0 / 2.0) < 1.0
     assert env["flops_promised(T)"] == 200.0
-    assert env["mfu(%)"] == pytest.approx(env["mfu"] * 100.0)
-    assert env["tflops_per_gpu"] == pytest.approx(env["flops_achieved(T)"] / 2.0)
-    assert env["step_time(s)"] >= 2.0
+    assert "mfu(%)" not in env
+    assert "tflops_per_gpu" not in env
+    assert "step_time(s)" not in env
     assert env["training/mfu"] == pytest.approx(env["mfu"])
-    assert env["training/mfu(%)"] == pytest.approx(env["mfu(%)"])
+    assert env["training/mfu(%)"] == pytest.approx(env["mfu"] * 100.0)
     assert env["training/flops_achieved(T)"] == pytest.approx(env["flops_achieved(T)"])
-    assert env["training/tflops_per_gpu"] == pytest.approx(env["tflops_per_gpu"])
-    assert env["training/step_time(s)"] == pytest.approx(env["step_time(s)"])
+    assert env["training/tflops_per_gpu"] == pytest.approx(env["flops_achieved(T)"] / 2.0)
+    assert env["training/step_time(s)"] >= 2.0
     assert train["training/lr"] == 1e-4
 
 

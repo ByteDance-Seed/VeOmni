@@ -443,10 +443,10 @@ def test_tqdm_callback_includes_efficiency_metrics_from_step_env_metrics():
     trainer = SimpleNamespace(
         step_train_metrics={"training/total_loss": 1.25},
         step_env_metrics={
-            "mfu(%)": 42.5,
-            "tflops_per_gpu": 310.2,
+            "training/mfu(%)": 42.5,
+            "training/tflops_per_gpu": 310.2,
             "flops_achieved(T)": 2481.6,
-            "step_time(s)": 1.5,
+            "training/step_time(s)": 1.5,
             "ignored_metric": 99.0,
         },
     )

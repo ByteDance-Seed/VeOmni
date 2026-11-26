@@ -120,7 +120,7 @@ and stored as `trainer.environ_meter`.
     - [`OmniModelRuntime.metric_meter_collect()`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L596) →
       per metered module [`(estimate_flops(buffer), buffer)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L150); buffer reset.
     - [`OmniEnvironMeter.step(delta_time, global_step, module_metrics)`](../../../veomni/utils/omni_helper.py#L145)
-    - [`trainer.step_env_metrics = ...`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L118),
+    - [`trainer.step_env_metrics = ...`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L115),
       logged by [`WandbTraceCallback`](../../../veomni/trainer/callbacks/trace_callback.py#L178).
 
 `delta_time` covers every micro-batch's forward and backward plus the optimizer
@@ -140,7 +140,7 @@ same dict and `WandbTraceCallback` logs it.
 | [`flops_achieved(T)`](../../../veomni/utils/omni_helper.py#L185) | Sum over modules and DP ranks of `estimate_flops`, divided by `delta_time`. |
 | [`flops_promised(T)`](../../../veomni/utils/omni_helper.py#L186) | Device peak TFLOPs ([`get_device_flops`](../../../veomni/utils/count_flops.py#L26)) × world size. |
 | [`mfu`](../../../veomni/utils/omni_helper.py#L187) | `flops_achieved / flops_promised`. |
-| [`mfu(%)`, `tflops_per_gpu`, `step_time(s)`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L104) | Derived by `OmniStepMetricsCallback` when `mfu` is present (and mirrored under `training/mfu`, `training/mfu(%)`, `training/flops_achieved(T)`, `training/tflops_per_gpu`, `training/step_time(s)`). |
+| [`training/mfu`, `training/mfu(%)`, `training/flops_achieved(T)`, `training/tflops_per_gpu`, `training/step_time(s)`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L104) | Added under `training/` by `OmniStepMetricsCallback` when `mfu` is present. |
 | [`consumed_chunk_num`](../../../veomni/utils/omni_helper.py#L191) | Cumulative real training samples (conversations) across DP ranks. |
 | [`trace/<module>/tokens_per_second(M)`](../../../veomni/utils/omni_helper.py#L201) | This module's global tokens this step / `delta_time`. |
 | [`trace/<module>/consume_tokens(M)`, `(B)`](../../../veomni/utils/omni_helper.py#L202) | This module's cumulative global tokens. |
