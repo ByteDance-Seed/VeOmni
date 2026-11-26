@@ -9,11 +9,13 @@ inputs, and require identical tensors.
 
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tests.tools.hf_paths import hf_local_or_remote
 from tests.tools.training_utils import make_eager_ops_config
 from veomni.data.seed_omni.utils.media_metadata import AUDIO_METADATA_KEY, AudioMetadata
 from veomni.models.seed_omni.modules.qwen3omni.carrier import TALKER_CODES_KEY
@@ -42,9 +44,17 @@ from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 
-CHECKPOINT = "/opt/tiger/models/Qwen3-Omni-30B-A3B-Instruct"
-requires_checkpoint = pytest.mark.skipif(
-    not os.path.isdir(CHECKPOINT), reason=f"needs the Qwen3-Omni checkpoint at {CHECKPOINT}"
+# These cases read the *identity* of the shipped model — token ids, the speaker
+# table, codec special ids, patch/merge sizes — then shrink everything to a size
+# that runs on CPU. The toy config carries the same values, so no weights are
+# needed and the whole file runs in CI.
+CONFIG_DIR = Path(__file__).parents[4] / "tests" / "toy_config" / "qwen3omni_toy"
+# One case decodes the prompt back to text to read the speech-span boundaries
+# instead of only token ids, so it needs the real tokenizer. Resolves through
+# CI_HF_MODELS_DIR when the checkpoint is staged, and skips otherwise.
+TOKENIZER = hf_local_or_remote("Qwen/Qwen3-Omni-30B-A3B-Instruct")
+requires_tokenizer = pytest.mark.skipif(
+    not os.path.isdir(TOKENIZER), reason=f"needs a Qwen3-Omni tokenizer at {TOKENIZER}"
 )
 
 THINKER_HIDDEN_SIZE = 24
@@ -71,13 +81,13 @@ def _shrink(raw, layers=2):
 
 
 def _tiny_talker():
-    """A structurally faithful talker: real config, tiny dimensions, random weights.
+    """A structurally faithful talker: shipped config, tiny dimensions, random weights.
 
-    Derived from the real ``config.json`` rather than hand-written so that the
+    Derived from the shipped ``config.json`` rather than hand-written so that the
     codec special-token ids, the speaker table and the projection wiring are the
     ones the checkpoint actually uses.
     """
-    with open(os.path.join(CHECKPOINT, "config.json")) as handle:
+    with open(os.path.join(CONFIG_DIR, "config.json")) as handle:
         raw = json.load(handle)["talker_config"]
     tiny = dict(raw)
     tiny["text_config"] = {
@@ -89,7 +99,9 @@ def _tiny_talker():
     tiny["code_predictor_config"] = _shrink(raw["code_predictor_config"])
     tiny["thinker_hidden_size"] = THINKER_HIDDEN_SIZE
     torch.manual_seed(0)
-    module = Qwen3OmniTalker(Qwen3OmniTalkerConfig(talker_config=tiny)).eval()
+    module = Qwen3OmniTalker(
+        Qwen3OmniTalkerConfig(talker_config=tiny, ops_implementation=make_eager_ops_config())
+    ).eval()
     _initialize_moe_experts(module)
     return module
 
@@ -244,7 +256,6 @@ def _module_prompt(module, case, speaker="ethan", segments=None, thinker_embed=N
     )
 
 
-@requires_checkpoint
 @pytest.mark.parametrize("history", [False, True], ids=["single_turn", "multi_turn_with_history"])
 def test_prompt_assembly_matches_upstream(history):
     """The carrier-driven assembly must equal upstream's token-scanning one.
@@ -275,7 +286,6 @@ def test_prompt_assembly_matches_upstream(history):
     assert (actual["talker_input_ids"] != SYSTEM).all()
 
 
-@requires_checkpoint
 def test_speech_span_prefix_is_not_merged_with_assistant_history():
     """Splitting turns by ``item.role`` would silently corrupt this case.
 
@@ -298,7 +308,6 @@ def test_speech_span_prefix_is_not_merged_with_assistant_history():
     assert (actual["talker_input_ids"][0, :-9] != TTS_PAD).all()
 
 
-@requires_checkpoint
 def test_trailing_text_carries_generated_tail_plus_eos():
     """``trailing_text_hidden`` is fed one row per decode step, so its length is load-bearing.
 
@@ -315,7 +324,6 @@ def test_trailing_text_carries_generated_tail_plus_eos():
     assert actual["trailing_text_hidden"].size(1) == case.num_generated - 1 + 1
 
 
-@requires_checkpoint
 def test_speaker_and_wiring_errors_are_explicit():
     module = _tiny_talker()
     case = _build_case(history=False)
@@ -336,7 +344,6 @@ def test_speaker_and_wiring_errors_are_explicit():
         )
 
 
-@requires_checkpoint
 def test_generate_appends_a_codes_item_and_signals_done(monkeypatch):
     """Carrier plumbing: codes land as an ``output`` row the codec finds by source."""
     from veomni.models.seed_omni.graphs.generation_graph import FSM_SIGNAL_KEY
@@ -389,7 +396,6 @@ def test_generate_appends_a_codes_item_and_signals_done(monkeypatch):
     assert metadata["use_audio_in_video"] is False
 
 
-@requires_checkpoint
 def test_media_metadata_is_absent_for_a_text_only_prompt():
     """A text-only turn must pass no media shapes, not empty tensors.
 
@@ -406,14 +412,12 @@ def test_media_metadata_is_absent_for_a_text_only_prompt():
     assert metadata["video_second_per_grid"] is None
 
 
-@requires_checkpoint
 def test_missing_graph_inputs_name_the_offending_node():
     module = _tiny_talker()
     with pytest.raises(ValueError, match="flush_thinker_states"):
         module.generate(conversation_list=[], thinker_embed=None, thinker_hidden=None, talker_prompt=None)
 
 
-@requires_checkpoint
 def test_the_code_predictor_is_not_an_fsdp_unit_of_its_own():
     """``post_init`` unions the wrapped talker's wrap list; this module must undo it.
 
@@ -434,7 +438,6 @@ def test_the_code_predictor_is_not_an_fsdp_unit_of_its_own():
     assert type(module.talker.code_predictor).__name__ not in module._no_split_modules
 
 
-@requires_checkpoint
 def test_the_traces_are_cast_to_what_the_projection_computes_in():
     """FSDP2 mixed precision makes ``talker.dtype`` disagree with the matmul.
 
@@ -463,7 +466,7 @@ def test_the_traces_are_cast_to_what_the_projection_computes_in():
     assert prompt["inputs_embeds"].dtype == torch.bfloat16
 
 
-@requires_checkpoint
+@requires_tokenizer
 def test_a_training_shaped_prompt_leaves_the_response_to_be_spoken():
     """The one property the boundary rule exists for, held against the real pipeline.
 
@@ -488,7 +491,7 @@ def test_a_training_shaped_prompt_leaves_the_response_to_be_spoken():
     )
     from veomni.models.seed_omni.utils.conversation import ConversationItem
 
-    template = Qwen3OmniChatTemplate(AutoTokenizer.from_pretrained(CHECKPOINT))
+    template = Qwen3OmniChatTemplate(AutoTokenizer.from_pretrained(TOKENIZER))
     conversation = template.tokenize_conversation(
         [
             ConversationItem(type="text", value="Please say hello out loud.", role="user"),
@@ -607,7 +610,6 @@ def _teacher_forced_hidden(module: Qwen3OmniTalker, prompt: dict, codes: torch.T
         ).last_hidden_state
 
 
-@requires_checkpoint
 def test_teacher_forcing_reproduces_the_decode_loops_semantic_logits():
     """The whole training path rests on this: same codes in, same logits out."""
     module = _tiny_talker()
@@ -622,7 +624,6 @@ def test_teacher_forcing_reproduces_the_decode_loops_semantic_logits():
     torch.testing.assert_close(logits[0], reference[:, 0], rtol=1e-4, atol=1e-4)
 
 
-@requires_checkpoint
 def test_teacher_forcing_reproduces_the_code_predictors_logits():
     """The residual head is indexed per group; an off-by-one would still train."""
     module = _tiny_talker()
@@ -657,7 +658,6 @@ def test_teacher_forcing_reproduces_the_code_predictors_logits():
     torch.testing.assert_close(logits, expected, rtol=1e-4, atol=1e-4)
 
 
-@requires_checkpoint
 def test_scoring_one_utterance_returns_the_summed_loss_and_both_parts():
     module = _tiny_talker()
     prompt = _prompt(module)
@@ -674,7 +674,6 @@ def test_scoring_one_utterance_returns_the_summed_loss_and_both_parts():
     assert not out["residual_loss"].requires_grad
 
 
-@requires_checkpoint
 def test_loss_weights_scale_the_two_heads_independently():
     module = _tiny_talker()
     prompt = _prompt(module)
@@ -686,7 +685,6 @@ def test_loss_weights_scale_the_two_heads_independently():
     torch.testing.assert_close(semantic_only["loss"], base["semantic_loss"])
 
 
-@requires_checkpoint
 def test_the_stop_token_is_scored_after_the_last_frame():
     """Without an eos row the talker would train to speak forever."""
     module = _tiny_talker()
@@ -702,7 +700,6 @@ def test_the_stop_token_is_scored_after_the_last_frame():
     assert scored.shape[1] == frames + 1
 
 
-@requires_checkpoint
 def test_gradients_reach_both_heads_and_the_backbone():
     module = _tiny_talker()
     prompt = _prompt(module)
@@ -721,7 +718,6 @@ def test_gradients_reach_both_heads_and_the_backbone():
     assert grad_of(module.talker.code_predictor.get_input_embeddings()[0].weight)
 
 
-@requires_checkpoint
 def test_target_codes_must_have_one_row_per_code_group():
     module = _tiny_talker()
     prompt = _prompt(module)
@@ -731,7 +727,6 @@ def test_target_codes_must_have_one_row_per_code_group():
         module.score_utterance(prompt=prompt, target_codes=wrong)
 
 
-@requires_checkpoint
 def test_frames_past_the_text_fall_back_to_tts_pad():
     """Speech usually outlasts the text; those frames ride on tts_pad."""
     module = _tiny_talker()
@@ -766,7 +761,6 @@ def _batched_loss(module: Qwen3OmniTalker, pairs: list[tuple[dict, torch.Tensor]
         module.build_prompt = original
 
 
-@requires_checkpoint
 def test_the_batch_loss_is_summed_ce_over_summed_count_not_a_mean_of_means():
     """Independently recomputed from raw CE sums, so a wrong weight cannot hide."""
     module = _tiny_talker()
@@ -790,7 +784,6 @@ def test_the_batch_loss_is_summed_ce_over_summed_count_not_a_mean_of_means():
     torch.testing.assert_close(batched, torch.tensor(expected, dtype=batched.dtype), rtol=1e-5, atol=1e-5)
 
 
-@requires_checkpoint
 def test_the_semantic_count_includes_the_stop_row_and_the_residual_count_does_not():
     module = _tiny_talker()
     prompt = _prompt(module)
@@ -804,7 +797,6 @@ def test_the_semantic_count_includes_the_stop_row_and_the_residual_count_does_no
     assert parts.residual_count == frames * (groups - 1)
 
 
-@requires_checkpoint
 def test_a_batched_loss_still_reaches_the_heads():
     module = _tiny_talker()
     prompt = _prompt(module)
@@ -816,7 +808,6 @@ def test_a_batched_loss_still_reaches_the_heads():
     assert module.talker.code_predictor.lm_head[0].weight.grad.abs().sum() > 0
 
 
-@requires_checkpoint
 def test_a_micro_batch_with_no_utterance_says_so_rather_than_producing_no_gradient():
     module = _tiny_talker()
 
@@ -824,7 +815,6 @@ def test_a_micro_batch_with_no_utterance_says_so_rather_than_producing_no_gradie
         module.forward(thinker_embeds=[], thinker_hiddens=[], talker_prompts=[], target_codes=[])
 
 
-@requires_checkpoint
 def test_a_zero_frame_clip_is_refused_rather_than_averaged_into_a_nan():
     module = _tiny_talker()
     prompt = _prompt(module)
@@ -839,7 +829,7 @@ def _traced_text(rows: int, hidden: int, role: str = "user") -> ConversationItem
         type="text",
         value=torch.zeros(rows, dtype=torch.long),
         role=role,
-        meta={THINKER_EMBED: torch.randn(rows, hidden), THINKER_HIDDEN_SIZE: torch.randn(rows, hidden)},
+        meta={THINKER_EMBED: torch.randn(rows, hidden), THINKER_HIDDEN: torch.randn(rows, hidden)},
     )
 
 
@@ -852,7 +842,6 @@ def _coded_audio(groups: int, frames: int) -> ConversationItem:
     )
 
 
-@requires_checkpoint
 def test_the_thinker_traces_are_rejoined_in_carrier_order():
     sample = [_traced_text(3, 8), _traced_text(2, 8, role="assistant")]
 
@@ -864,7 +853,6 @@ def test_the_thinker_traces_are_rejoined_in_carrier_order():
     torch.testing.assert_close(embed[0, 3:], sample[1].meta[THINKER_EMBED])
 
 
-@requires_checkpoint
 def test_dummy_rows_hold_no_trace_and_are_not_looked_for():
     sample = [
         _traced_text(3, 8),
@@ -876,13 +864,11 @@ def test_dummy_rows_hold_no_trace_and_are_not_looked_for():
     assert embed.shape == (1, 3, 8)
 
 
-@requires_checkpoint
 def test_a_conversation_without_traces_names_the_flag_that_produces_them():
     with pytest.raises(ValueError, match="collect_thinker_states"):
         _thinker_traces([ConversationItem(type="text", value=torch.zeros(3, dtype=torch.long), role="user")])
 
 
-@requires_checkpoint
 def test_the_code_targets_come_off_the_assistant_audio_turn():
     codes = _coded_audio(4, 9)
     sample = [_traced_text(3, 8), codes]
@@ -890,12 +876,10 @@ def test_the_code_targets_come_off_the_assistant_audio_turn():
     assert _target_codes(sample) is codes.meta[TALKER_CODE_LABELS]
 
 
-@requires_checkpoint
 def test_a_sample_with_no_assistant_audio_has_no_target():
     assert _target_codes([_traced_text(3, 8)]) is None
 
 
-@requires_checkpoint
 def test_user_side_audio_is_not_mistaken_for_a_target():
     heard = ConversationItem(
         type="audio", value=torch.zeros(1), role="user", meta={TALKER_CODE_LABELS: torch.zeros(4, 2)}
@@ -904,7 +888,6 @@ def test_user_side_audio_is_not_mistaken_for_a_target():
     assert _target_codes([heard]) is None
 
 
-@requires_checkpoint
 def test_two_assistant_utterances_in_one_sample_say_to_split_it():
     sample = [_coded_audio(4, 3), _coded_audio(4, 5)]
 
@@ -912,13 +895,11 @@ def test_two_assistant_utterances_in_one_sample_say_to_split_it():
         _target_codes(sample)
 
 
-@requires_checkpoint
 def test_the_talker_names_the_text_encoder_flag_when_the_prompt_view_is_missing():
     with pytest.raises(ValueError, match="publish_talker_prompt"):
         _talker_prompt([_traced_text(3, 8)])
 
 
-@requires_checkpoint
 def test_the_prompt_view_is_found_wherever_on_the_sample_it_was_left():
     """The talker scans, so which row hosts it stays the writer's business."""
     payload = {"segments": [], "supervised": torch.zeros(0, dtype=torch.bool)}
@@ -928,7 +909,6 @@ def test_the_prompt_view_is_found_wherever_on_the_sample_it_was_left():
     assert _talker_prompt(sample) is payload
 
 
-@requires_checkpoint
 def test_the_text_encoder_leaves_one_view_per_sample_on_the_carrier():
     """Round-trip: what the encode hook stashes is what the talker reads back."""
     samples = [[_traced_text(3, 8)], [_traced_text(2, 8), _traced_text(4, 8, role="assistant")]]
@@ -939,13 +919,11 @@ def test_the_text_encoder_leaves_one_view_per_sample_on_the_carrier():
     assert [_talker_prompt(sample) for sample in samples] == payloads
 
 
-@requires_checkpoint
 def test_a_sample_with_nothing_in_the_thinker_sequence_has_nowhere_to_leave_it():
     with pytest.raises(ValueError, match="nowhere to leave"):
         _stash_talker_prompts([[_coded_audio(4, 3)]], [{"which": 0}])
 
 
-@requires_checkpoint
 def test_the_prefix_is_the_generation_marker_when_the_response_is_teacher_forced():
     """Training shape: rows 9..11 are `<|im_start|>assistant\\n`, 12.. the response."""
     supervised = torch.zeros(20, dtype=torch.bool)
@@ -954,7 +932,6 @@ def test_the_prefix_is_the_generation_marker_when_the_response_is_teacher_forced
     assert _speech_prefix_length(supervised, start=9, sequence_length=20) == 3
 
 
-@requires_checkpoint
 def test_a_supervised_earlier_turn_does_not_push_the_prefix_negative():
     """Ordinary multi-turn SFT supervises every assistant turn, including history."""
     supervised = torch.zeros(30, dtype=torch.bool)
@@ -965,7 +942,6 @@ def test_a_supervised_earlier_turn_does_not_push_the_prefix_negative():
     assert _speech_prefix_length(supervised, start=22, sequence_length=30) == 3
 
 
-@requires_checkpoint
 def test_nothing_supervised_makes_the_whole_given_sequence_the_prompt():
     """The inference shape: rows past `sequence_length` are text just generated."""
     supervised = torch.zeros(12, dtype=torch.bool)

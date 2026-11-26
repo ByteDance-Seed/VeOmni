@@ -52,7 +52,7 @@ from veomni.models.seed_omni.modules.qwen3omni.vision.processing import (
 )
 from veomni.models.seed_omni.utils.conversation import ConversationItem
 
-from .test_qwen3omni_talker import CHECKPOINT, requires_checkpoint
+from .test_qwen3omni_talker import CONFIG_DIR
 
 
 NUM_MEL_BINS = 128
@@ -432,7 +432,7 @@ def test_tts_embeds_reads_the_sharded_table_it_actually_has():
 
 def _tiny_vision():
     """Structurally faithful tower from the real config, shrunk, random weights."""
-    with open(os.path.join(CHECKPOINT, "config.json")) as handle:
+    with open(os.path.join(CONFIG_DIR, "config.json")) as handle:
         raw = json.load(handle)["thinker_config"]["vision_config"]
     tiny = dict(raw)
     tiny.update(
@@ -445,7 +445,9 @@ def _tiny_vision():
         dtype="float32",
     )
     torch.manual_seed(0)
-    return Qwen3OmniVisionEncoder(Qwen3OmniVisionEncoderConfig(vision_config=tiny)).eval()
+    return Qwen3OmniVisionEncoder(
+        Qwen3OmniVisionEncoderConfig(vision_config=tiny, ops_implementation=make_eager_ops_config())
+    ).eval()
 
 
 def _patch_item(item_type, grid, cfg, role="user", meta=None):
@@ -461,7 +463,6 @@ def _patch_item(item_type, grid, cfg, role="user", meta=None):
     )
 
 
-@requires_checkpoint
 def test_generate_scatters_merged_tokens_and_deepstack_per_item():
     """Each item must receive exactly its own slice of the flat ViT output.
 
@@ -498,7 +499,6 @@ def test_generate_scatters_merged_tokens_and_deepstack_per_item():
     assert items[2].meta["second_per_grid"] == 1.0
 
 
-@requires_checkpoint
 def test_generate_is_a_noop_without_visual_items():
     module = _tiny_vision()
     conversation_list = [ConversationItem(type="text", value=torch.zeros(3), role="user")]
@@ -506,7 +506,6 @@ def test_generate_is_a_noop_without_visual_items():
     assert outputs["conversation_list"] is conversation_list
 
 
-@requires_checkpoint
 def test_images_and_videos_share_one_vit_forward():
     """Mixing modalities must not change any item's result.
 
@@ -587,14 +586,13 @@ def test_a_video_item_with_no_metadata_at_all_is_refused():
         _second_per_grid(item, 2)
 
 
-@requires_checkpoint
 def test_preprocessor_sets_second_per_grid_for_videos_only():
     """Video items get a timeline; still images keep the backbone's 1.0 default.
 
     This is the hand-off the backbone's packer depends on: it raises for a video
     item without ``second_per_grid``, so this preprocessor is the only supplier.
     """
-    preprocessor = Qwen3OmniVisionPreprocessor.from_pretrained(CHECKPOINT)
+    preprocessor = Qwen3OmniVisionPreprocessor.from_pretrained(CONFIG_DIR)
     temporal_patch_size = preprocessor._video_processor.temporal_patch_size
 
     # Real payload and real metadata rather than stand-ins: the payload goes
@@ -620,16 +618,15 @@ def test_preprocessor_sets_second_per_grid_for_videos_only():
         assert len(item.meta[_OMNI_GRID]) == 3
 
 
-@requires_checkpoint
-def test_processors_come_from_the_checkpoint_not_class_defaults():
+def test_processors_come_from_the_dir_not_class_defaults():
     """Qwen3-Omni ships no video_preprocessor_config.json, so this could regress silently.
 
     ``Qwen2VLVideoProcessor``'s class default ``patch_size`` is 14 while
-    Qwen3-Omni uses 16; loading from the checkpoint dir is what makes it fall
-    back to the shared ``preprocessor_config.json``.
+    Qwen3-Omni uses 16; loading from a directory is what makes it fall back to
+    the shared ``preprocessor_config.json``.
     """
-    preprocessor = Qwen3OmniVisionPreprocessor.from_pretrained(CHECKPOINT)
-    with open(os.path.join(CHECKPOINT, "preprocessor_config.json")) as handle:
+    preprocessor = Qwen3OmniVisionPreprocessor.from_pretrained(CONFIG_DIR)
+    with open(os.path.join(CONFIG_DIR, "preprocessor_config.json")) as handle:
         expected = json.load(handle)
     for processor in (preprocessor._image_processor, preprocessor._video_processor):
         assert processor.patch_size == expected["patch_size"]
@@ -639,7 +636,6 @@ def test_processors_come_from_the_checkpoint_not_class_defaults():
     assert preprocessor._video_processor.do_sample_frames is False
 
 
-@requires_checkpoint
 def test_encode_is_bit_identical_to_upstream():
     """The patchgen ViT must match upstream exactly when SP is off.
 

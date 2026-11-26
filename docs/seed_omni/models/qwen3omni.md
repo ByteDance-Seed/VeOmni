@@ -402,13 +402,19 @@ still needs both checkpoints.
 ## 5. Tests
 
 `tests/seed_omni/modules/qwen3omni/` covers each module on random weights plus
-the carrier contracts the graph depends on. Cases that need the real 30B
-checkpoint skip themselves when `/opt/tiger/models/Qwen3-Omni-30B-A3B-Instruct`
-is absent, so the CPU suite runs without it.
+the carrier contracts the graph depends on. Cases that need the shapes and
+special-token ids of the shipped model read them from
+`tests/toy_config/qwen3omni_toy/`, which carries the real identity (token ids,
+speaker table, codec ids, patch/merge sizes) in a CPU-sized configuration, so
+the suite runs whole without weights.
 
 ```bash
 pytest tests/seed_omni/modules/qwen3omni/ tests/seed_omni/test_shipped_training_graphs.py
 ```
+
+One case decodes the prompt back to text to read the speech-span boundaries, so
+it does need the real tokenizer; it resolves through `CI_HF_MODELS_DIR` and skips
+when no mirror is staged.
 
 The codec is the one module that can be partly exercised against real weights
 without the Qwen checkpoint, and was — see §4. Loading `kyutai/mimi`, checking its
