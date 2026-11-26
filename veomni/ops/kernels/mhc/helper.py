@@ -65,6 +65,46 @@ def require_tilelang_input(x: Tensor, hc_mult: int) -> None:
         raise ValueError(f"TileKernels mHC backward currently requires hc_mult=4, got {hc_mult}")
 
 
+def pad_token_axis(x: Tensor, align: int) -> tuple[Tensor, int]:
+    """Pad the query axis of a ``[batch, sequence, hc, hidden]`` tensor to ``align``.
+
+    Returns ``(padded_or_original, seq_len)``. The caller slices every output of
+    the kernel back to ``seq_len`` with :func:`trim_token_axis`; a zero row carries
+    no information the kernel could leak into a kept row, because each query
+    position's mix depends only on its own row plus the shared ``fn`` /
+    ``scale`` / ``base``.
+
+    The returned tensor is always contiguous, and may be the input itself even when
+    nothing was padded -- every call runs ``.contiguous()``. That is why a caller
+    must decide whether to trim from the *shape* (``padded.shape[1] != seq_len``)
+    and not from an identity check against ``x``: an already-aligned but
+    non-contiguous input comes back as a different tensor with the same length.
+    """
+    seq_len = x.shape[1]
+    pad = -seq_len % align
+    if not pad:
+        return x.contiguous(), seq_len
+    # ``contiguous()`` after the pad, not before: ``F.pad`` preserves a
+    # ``channels_last`` memory format, and the kernels ``view(...)`` the result to
+    # flatten batch and sequence, which a preserved stride layout breaks.
+    return F.pad(x, (0, 0, 0, 0, 0, pad)).contiguous(), seq_len
+
+
+def trim_token_axis(t: Tensor, seq_len: int) -> Tensor:
+    """Drop the padding :func:`pad_token_axis` added, returning a contiguous tensor.
+
+    Slicing alone is not enough for ``batch > 1``: the padded buffer is
+    ``[batch, aligned, ...]``, so ``t[:, :seq_len]`` of it strides over the gap
+    between samples and is not contiguous. A non-contiguous view also keeps the
+    whole padded allocation alive, which is a per-layer cost in a training loop.
+    When nothing was padded the slice is already the whole tensor and contiguous,
+    so the clone is skipped.
+    """
+    if t.shape[1] == seq_len:
+        return t if t.is_contiguous() else t.contiguous()
+    return t[:, :seq_len].contiguous()
+
+
 def require_triton_input(x: Tensor, hc_mult: int) -> None:
     """Validate tensor dtype, layout, stream count, and placement for the Triton rows."""
     if x.dtype not in TRITON_FLOAT_DTYPES:
