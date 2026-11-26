@@ -430,10 +430,20 @@ def test_trim_wandb_config_keys_caps_nested_dot_flattened_length():
     assert len(prefix) + len(trimmed_keys[0]) == 64
     assert inner[trimmed_keys[0]] == "value"
 
-    # When prefix alone already exceeds max_len, keep at least 8 chars of the leaf key.
+    # When prefix alone already exceeds max_len, keep an 8-char collision-safe leaf key.
     deep_prefix = "a" * 70
-    deep = trim({deep_prefix: {"long_leaf_name": 42}}, max_len=64)
-    assert deep[deep_prefix] == {"long_lea": 42}
+    deep = trim({deep_prefix: {"learning_rate": 1e-4, "learning_rate_schedule": "cosine"}}, max_len=64)
+    deep_inner = deep[deep_prefix]
+    assert len(deep_inner) == 2
+    assert all(len(k) == 8 for k in deep_inner)
+    assert set(deep_inner.values()) == {1e-4, "cosine"}
+
+    # Distinct long keys sharing a prefix under a long parent must not overwrite each other.
+    parent = "p" * 55
+    colliding = trim({parent: {"learning_rate": 1e-4, "learning_rate_schedule": "cosine", "lr": 1e-3}}, max_len=64)
+    assert colliding[parent]["lr"] == 1e-3
+    assert len(colliding[parent]) == 3
+    assert set(colliding[parent].values()) == {1e-4, "cosine", 1e-3}
 
 
 def test_tqdm_callback_includes_efficiency_metrics_from_step_env_metrics():

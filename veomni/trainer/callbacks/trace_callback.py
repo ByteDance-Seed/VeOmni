@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Union
 
@@ -135,7 +136,7 @@ class MoERouterMonitorCallback(Callback):
 
 
 def _trim_wandb_config_keys(obj: Any, prefix: str = "", max_len: int = 64) -> Any:
-    """Trim long leaf config keys (keeping at least 8 chars) so dot-flattened keys stay within ``max_len``."""
+    """Trim long leaf config keys (keeping at least 8 chars) with a collision-safe hash suffix."""
     if not isinstance(obj, dict):
         return obj
     out: Dict[str, Any] = {}
@@ -147,7 +148,15 @@ def _trim_wandb_config_keys(obj: Any, prefix: str = "", max_len: int = 64) -> An
         else:
             if len(full) > max_len:
                 budget = max(max_len - (len(prefix) + 1 if prefix else 0), 8)
-                key_str = key_str[:budget]
+                digest = hashlib.sha1(key_str.encode("utf-8")).hexdigest()[:6]
+                head_len = max(budget - len(digest) - 1, 0)
+                candidate = f"{key_str[:head_len]}_{digest}" if head_len > 0 else digest[:budget]
+                suffix = 1
+                while candidate in out:
+                    tag = f"_{digest[:4]}{suffix}"
+                    candidate = f"{key_str[: max(budget - len(tag), 0)]}{tag}"[:budget]
+                    suffix += 1
+                key_str = candidate
             out[key_str] = v
     return out
 

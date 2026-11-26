@@ -781,5 +781,37 @@ class TestGlobalStateCallbackJobState:
         cb.on_train_end(TrainerState(global_step=1))
 
         # load_global_state: arm -> cancel; on_train_begin: arm; on_step_end: rearm; on_train_end: cancel
-        assert events == [("arm", 30), ("cancel", None), ("arm", 30), ("arm", 30), ("cancel", None)]
-        assert gsc._STALL_WATCHDOG_SECONDS == 0
+        assert events == [("arm", 30.0), ("cancel", None), ("arm", 30.0), ("arm", 30.0), ("cancel", None)]
+        assert gsc._STALL_WATCHDOG_SECONDS == 0.0
+
+    def test_stall_watchdog_accepts_fractional_float_seconds(self, mock_dist, monkeypatch, tmp_path):
+        """Fractional ``VEOMNI_RESUME_STALL_SECONDS`` (e.g. ``0.5``) is preserved as float, not truncated."""
+        import veomni.trainer.callbacks.global_state_callback as gsc
+
+        mock_dist.is_initialized.return_value = False
+        monkeypatch.setenv("VEOMNI_RESUME_STALL_SECONDS", "0.5")
+        monkeypatch.setattr(gsc, "_STALL_WATCHDOG_SECONDS", 0.0)
+        events: list[tuple[str, float | None]] = []
+        monkeypatch.setattr(
+            gsc.faulthandler,
+            "dump_traceback_later",
+            lambda sec, repeat=False: events.append(("arm", sec)),
+        )
+        monkeypatch.setattr(
+            gsc.faulthandler,
+            "cancel_dump_traceback_later",
+            lambda: events.append(("cancel", None)),
+        )
+
+        trainer = _make_mock_trainer()
+        trainer.args.train.checkpoint.save_hf_weights = False
+        trainer.args.train.checkpoint.load_path = str(tmp_path)
+        trainer.train_dataloader = None
+        cb = GlobalStateCallback(trainer)
+
+        cb.on_train_begin(TrainerState(global_step=0))
+        cb.on_step_end(TrainerState(global_step=1))
+        cb.on_train_end(TrainerState(global_step=1))
+
+        assert events == [("arm", 0.5), ("cancel", None), ("arm", 0.5), ("arm", 0.5), ("cancel", None)]
+        assert gsc._STALL_WATCHDOG_SECONDS == 0.0

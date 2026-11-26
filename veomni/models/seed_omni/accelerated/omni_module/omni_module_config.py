@@ -71,9 +71,43 @@ def accelerator_needs_distributed_build(accelerator) -> bool:
     fsdp_mode = getattr(fsdp_config, "fsdp_mode", None)
     if fsdp_mode and str(fsdp_mode).lower() not in ("eager",):
         return True
+    resolved = getattr(accelerator, "resolved_extra_parallel", None)
+    if resolved is not None:
+        _, sizes, _ = resolved
+        return any(size > 1 for size in sizes)
     if getattr(accelerator, "ep_size", 1) > 1:
         return True
     return any(size > 1 for size in getattr(accelerator, "extra_parallel_sizes", None) or ())
+
+
+def _can_use_extra_parallel_only(accelerator) -> bool:
+    """Whether ``_finish_without_fsdp_wrap`` accepts ``accelerator``'s topology and config.
+
+    Dropping the FSDP2 wrap leaves the ``<para>_fsdp`` axis unsharded, so every
+    enabled extra-parallel dimension must already span ``dp_shard_sp``
+    (``para_fsdp_size == 1``), and FSDP2-wrapped features (mixed precision,
+    CPU offload, ``torch.compile``) must be disabled.
+    """
+    fsdp_config = getattr(accelerator, "fsdp_config", None)
+    if getattr(getattr(fsdp_config, "mixed_precision", None), "enable", False):
+        return False
+    if getattr(fsdp_config, "offload", False):
+        return False
+    if getattr(getattr(accelerator, "torch_compile", None), "enable", False):
+        return False
+    resolved = getattr(accelerator, "resolved_extra_parallel", None)
+    if resolved is None:
+        return False
+    _, sizes, _ = resolved
+    enabled_sizes = [size for size in sizes if size > 1]
+    if not enabled_sizes:
+        return False
+    dp_shard_sp_size = (
+        getattr(accelerator, "dp_shard_size", 1)
+        * getattr(accelerator, "cp_size", 1)
+        * getattr(accelerator, "ulysses_size", 1)
+    )
+    return all(size == dp_shard_sp_size for size in enabled_sizes)
 
 
 @dataclass
@@ -85,13 +119,24 @@ class OmniModuleRuntimeArguments(ModelArguments):
     ``model_path`` localized and ``fqn_to_index_mapping`` parsed lazily and cached
     per index path (several modules routinely share one checkpoint). All this adds
     is the projection onto an HF module descriptor.
+
+    When ``fsdp_mode == "eager"`` is combined with an active extra-parallel
+    dimension (``ep`` / ``emb``), ``__post_init__`` promotes ``fsdp_mode`` to
+    ``"fsdp2"`` so the module enters the distributed sharded build rather than
+    silently loading whole on every rank. It additionally enables
+    ``extra_parallel_only`` only when the topology and config satisfy
+    ``_finish_without_fsdp_wrap`` (every enabled extra-parallel axis spans
+    ``dp_shard_sp`` so ``<para>_fsdp_size == 1``, with mixed precision, offload,
+    and ``torch.compile`` disabled); otherwise FSDP2 wraps the remaining shard
+    axis.
     """
 
     def __post_init__(self):
         super().__post_init__()
         if self.accelerator.fsdp_config.fsdp_mode == "eager" and self.needs_distributed_build:
             self.accelerator.fsdp_config.fsdp_mode = "fsdp2"
-            self.accelerator.fsdp_config.extra_parallel_only = True
+            if _can_use_extra_parallel_only(self.accelerator):
+                self.accelerator.fsdp_config.extra_parallel_only = True
             self.accelerator._validate_init_device()
 
     @property

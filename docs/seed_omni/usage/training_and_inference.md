@@ -137,7 +137,8 @@ Common overrides:
 - `--train.loss_reduction`: how a gradient-accumulation window is averaged
   (`sample_mean`, default, averages micro-batches equally; `token_mean` weights
   each micro-batch by its share of the window's supervised tokens across the
-  loss-reduction group so long samples are not diluted by short ones).
+  loss-reduction group so long samples are not diluted by short ones; supported
+  for training graphs with a single `TextEncoder.decode` objective).
 - `--train.log_memory_steps`: log rank-0 allocated / peak / reserved device
   memory every N steps (`0` disables it).
 - `--data.max_seq_len`: packed sequence length.
@@ -189,10 +190,13 @@ bash train.sh tasks/omni/train_omni.py \
 ```
 
 The checkpoint layout is described in [Checkpointing](../../usage/checkpoint.md).
-Set `VEOMNI_RESUME_STALL_SECONDS=<N>` (default `0`, disabled) to enable a
-`faulthandler` stall watchdog in `GlobalStateCallback` that dumps every
-thread's stack trace to `stderr` if checkpoint resume or a training step makes
-no forward progress for `<N>` seconds.
+Set `VEOMNI_RESUME_STALL_SECONDS=<N>` (positive float in seconds; default `0`,
+disabled) to enable a `faulthandler` stall watchdog in `GlobalStateCallback`
+that dumps every thread's stack trace to `stderr` if trainer global-state
+restoration (dataloader cursor, RNG, meters) or subsequent training steps make
+no forward progress for `<N>` seconds. Note that `CheckpointCallback` runs
+`trainer.load()` before `GlobalStateCallback`, so model and optimizer
+restoration are not covered by this watchdog.
 
 ## 5. Inference
 

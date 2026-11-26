@@ -144,11 +144,21 @@ def test_the_generic_runtime_forwards_extra_parallel_only_to_the_builder(monkeyp
     [
         ({"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)}, {}, "eager", True),
         # Inference defaults to `eager`, but an `ep` plan is compute parallelism
-        # that has to be built under a process group, and FSDP2 cannot wrap a
-        # layer that mixes storage dtypes -- so `OmniModuleRuntimeArguments`
-        # promotes it to `fsdp2` with the wrap dropped. See
-        # `test_inference_ep_or_emb_with_default_eager_normalizes_to_extra_parallel_only`.
-        ({"ep_size": 4}, {}, "fsdp2", True),
+        # that has to be built under a process group. With WORLD_SIZE=8 and
+        # ep_size=4 (ep_fsdp_size=2), `_finish_without_fsdp_wrap` cannot drop
+        # the FSDP2 wrap, so `OmniModuleRuntimeArguments` promotes it to
+        # wrapped `fsdp2` (`extra_parallel_only=False`). When `ep_size` spans
+        # `dp_shard_sp` (`ep_fsdp_size=1`), it promotes with
+        # `extra_parallel_only=True`.
+        ({"ep_size": 4}, {}, "fsdp2", False),
+        ({"ep_size": 8}, {}, "fsdp2", True),
+        ({"ep_size": 4}, {"accelerator": {"dp_replicate_size": 2}}, "fsdp2", True),
+        (
+            {"ep_size": 4},
+            {"accelerator": {"extra_parallel_names": ["ep"], "extra_parallel_sizes": [1]}},
+            "eager",
+            False,
+        ),
         (
             {"ep_size": 4},
             {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2", "extra_parallel_only": True}}},
@@ -177,7 +187,10 @@ def test_the_generic_runtime_forwards_extra_parallel_only_to_the_builder(monkeyp
     ],
     ids=[
         "global_no_wrap_stays_eager",
-        "global_ep_normalizes_to_extra_parallel_only",
+        "global_ep_with_remaining_fsdp_normalizes_to_fsdp2",
+        "global_ep_full_shard_normalizes_to_extra_parallel_only",
+        "global_ep_hsdp_full_shard_normalizes_to_extra_parallel_only",
+        "explicit_ep_override_to_1_stays_eager",
         "global_ep_explicit_fsdp2",
         "plain_eager",
         "explicit_ddp_ignores_extra_parallel_only",
@@ -502,15 +515,16 @@ def test_build_omni_model_runtime_args_rejects_top_level_dp_size_mismatch(monkey
 
 
 def test_inference_ep_or_emb_with_default_eager_normalizes_to_extra_parallel_only(monkeypatch):
-    """An inference module that sets ``ep_size`` or ``emb`` without overriding
-    ``fsdp_mode='eager'`` is normalized to ``fsdp_mode='fsdp2', extra_parallel_only=True``."""
+    """An inference module with ``ep``/``emb`` promotes out of ``eager`` to ``fsdp2``,
+    and sets ``extra_parallel_only=True`` only when every enabled axis spans ``dp_shard_sp``."""
     monkeypatch.setenv("WORLD_SIZE", "8")
     global_args = OmniModuleRuntimeArguments(model_path="/tmp/model")
     modules = build_omni_module_runtime_args(
         global_args,
         "/tmp/model",
         {
-            "ep_mod": {"accelerator": {"ep_size": 4}},
+            "ep_partial_mod": {"accelerator": {"ep_size": 4}},
+            "ep_full_mod": {"accelerator": {"ep_size": 8}},
             "emb_mod": {
                 "accelerator": {
                     "extra_parallel_names": ["emb"],
@@ -522,7 +536,10 @@ def test_inference_ep_or_emb_with_default_eager_normalizes_to_extra_parallel_onl
         },
         for_inference=True,
     )
-    for name in ("ep_mod", "emb_mod"):
+    assert modules["ep_partial_mod"].needs_distributed_build is True
+    assert modules["ep_partial_mod"].accelerator.fsdp_config.fsdp_mode == "fsdp2"
+    assert modules["ep_partial_mod"].accelerator.fsdp_config.extra_parallel_only is False
+    for name in ("ep_full_mod", "emb_mod"):
         assert modules[name].needs_distributed_build is True
         assert modules[name].accelerator.fsdp_config.fsdp_mode == "fsdp2"
         assert modules[name].accelerator.fsdp_config.extra_parallel_only is True

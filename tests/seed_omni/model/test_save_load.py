@@ -1101,3 +1101,30 @@ def test_from_pretrained_unwraps_legacy_graph_sidecar_wrappers(tmp_path):
     assert list(loaded.training_graphs) == ["default"]
     assert list(loaded.generation_graphs) == ["infer_gen"]
     assert loaded.generation_graphs["infer_gen"]["initial"] == "run"
+
+
+def test_save_and_load_preserves_single_scenarios_named_like_legacy_wrappers(tmp_path):
+    """Single scenarios legitimately named ``training_graph`` / ``generation_graphs`` keep their names."""
+    config = OmniConfig(
+        _module_entries=_chain_modules(),
+        training_graphs={"training_graph": _chain_edges()},
+        generation_graphs={"generation_graphs": _minimal_generation_graph(module=FAKE_A)},
+        train_type="training_graph",
+        infer_type="generation_graphs",
+    )
+    model = OmniModel(
+        config,
+        {
+            FAKE_A: FakeModuleA(FakeModuleAConfig(hidden_size=HIDDEN_SIZE)),
+            FAKE_B: FakeModuleB(FakeModuleBConfig(hidden_size=HIDDEN_SIZE)),
+        },
+    )
+    model.save_pretrained(tmp_path, save_module_weights=False)
+
+    reloaded = OmniConfig.from_pretrained(tmp_path)
+    assert list(reloaded.training_graphs) == ["training_graph"]
+    assert reloaded.train_type == "training_graph"
+    assert reloaded.training_graph == _chain_edges()
+    assert list(reloaded.generation_graphs) == ["generation_graphs"]
+    assert reloaded.infer_type == "generation_graphs"
+    assert reloaded.generation_graph["initial"] == "run"

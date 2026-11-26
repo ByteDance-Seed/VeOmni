@@ -825,11 +825,14 @@ class ProfilerWithMem:
         self._p = inner
         self._recording = False
 
+    def __getattr__(self, name):
+        return getattr(self._p, name)
+
     # delegate ctx-manager behaviour
     def __enter__(self):
-        out = self._p.__enter__()
+        self._p.__enter__()
         self._follow_schedule()
-        return out
+        return self
 
     def __exit__(self, *a):
         out = self._p.__exit__(*a)

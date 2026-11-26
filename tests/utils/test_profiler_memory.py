@@ -37,12 +37,22 @@ class _ScheduledProfiler:
     def start(self):
         self.current_action = self._schedule(self.step_num)
 
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stop()
+
     def step(self):
         self.step_num += 1
         self.current_action = self._schedule(self.step_num)
 
     def stop(self):
         pass
+
+    def export_chrome_trace(self, path: str) -> str:
+        return f"exported:{path}"
 
 
 def _recorded_steps(monkeypatch, start_step: int, end_step: int, train_steps: int, *, warmup: int = 0) -> list[int]:
@@ -75,6 +85,28 @@ def test_memory_history_covers_only_the_profiled_window(monkeypatch):
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_memory_history_from_the_first_step_when_the_window_starts_there(monkeypatch):
     assert _recorded_steps(monkeypatch, start_step=1, end_step=3, train_steps=5) == [1, 2]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_profiler_with_mem_context_manager_returns_wrapper_and_forwards_attrs(monkeypatch):
+    """``with ProfilerWithMem(...) as p:`` returns the wrapper so ``p.step()`` follows the schedule."""
+    calls = []
+    memory = SimpleNamespace(_record_memory_history=lambda enabled="all": calls.append(enabled))
+    monkeypatch.setattr(helper, "get_torch_device", lambda: SimpleNamespace(memory=memory))
+
+    wrapper = helper.ProfilerWithMem(_ScheduledProfiler(wait=1, warmup=0, active=1))
+    recorded = []
+    with wrapper as p:
+        assert p is wrapper
+        assert p.export_chrome_trace("trace.json") == "exported:trace.json"
+        for step in range(1, 5):
+            if p._recording:
+                recorded.append(step)
+            p.step()
+
+    assert recorded == [2]
+    assert wrapper._recording is False
+    assert calls[-1] is None
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))

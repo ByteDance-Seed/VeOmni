@@ -277,7 +277,52 @@ class OmniTrainer:
         model = build_omni_model_runtime(build_omni_model_runtime_args(self.args), train_args=self.args.train)
         if model.optimizer is None and self.args.train.training_task != "offline_embedding":
             raise ValueError("OmniTrainer has nothing to train: every module is frozen.")
+        self._validate_loss_reduction(model)
         return model
+
+    def _validate_loss_reduction(self, model: OmniModelRuntime) -> None:
+        """Validate ``train.loss_reduction='token_mean'`` against the active training graph.
+
+        ``token_mean`` scales the summed DAG loss by each micro-batch's share of
+        shifted supervised text tokens, which is only valid when the training
+        graph's terminal objective is a single ``TextEncoder.decode`` node.
+        Multi-objective graphs (e.g. Janus with image VQ loss, BAGEL with
+        flow-matching loss) and non-text graphs (e.g. Cosmos3) must use
+        ``sample_mean``.
+
+        Also detects decoders that shift each text item independently
+        (``BagelTextEncoder``) rather than once per sample (``TextEncoder``) so
+        :meth:`_count_supervised_tokens` uses the decoder's exact target count.
+        """
+        self._text_label_shift_mode = "per_sample"
+        if getattr(self.args.train, "loss_reduction", "sample_mean") != "token_mean":
+            return
+        training_graph = getattr(getattr(model, "model", None), "training_graph", None)
+        if training_graph is None:
+            return
+
+        from ...models.seed_omni.accelerated.utils.dispatch import unwrap_module_chain
+        from ...models.seed_omni.modules.bagel.text_encoder.modeling import BagelTextEncoder
+        from ...models.seed_omni.modules.text_encoder.modeling import TextEncoder
+
+        sinks = list(training_graph.sinks)
+        if len(sinks) != 1:
+            raise ValueError(
+                f"train.loss_reduction='token_mean' only supports training graphs with a single "
+                f"TextEncoder.decode objective; got sinks {sinks}. Use train.loss_reduction='sample_mean' "
+                "for multi-objective graphs."
+            )
+        sink = sinks[0]
+        module_name = training_graph.module_of(sink)
+        method = training_graph.method_of(sink)
+        raw_module = unwrap_module_chain(model.get_module(module_name))
+        if method != "decode" or not isinstance(raw_module, TextEncoder):
+            raise ValueError(
+                f"train.loss_reduction='token_mean' requires a TextEncoder.decode sink; "
+                f"got {sink!r} ({type(raw_module).__name__}). Use train.loss_reduction='sample_mean' instead."
+            )
+        if isinstance(raw_module, BagelTextEncoder):
+            self._text_label_shift_mode = "per_item"
 
     def _build_offline_cache_writer(self) -> None:
         if self.args.train.training_task == "offline_embedding":
@@ -542,19 +587,44 @@ class OmniTrainer:
         conversation_list = micro_batch.get("conversation_list")
         if conversation_list is None:
             return 0
+        per_item = getattr(self, "_text_label_shift_mode", "per_sample") == "per_item"
         total = 0
+        if per_item:
+            # Match BagelTextEncoder._prepare_decode_inputs: each non-dummy text
+            # item is shifted independently.
+            for sample in conversation_list:
+                for part in sample:
+                    if getattr(part, "is_dummy", False) or getattr(part, "type", "text") != "text":
+                        continue
+                    meta = getattr(part, "meta", None)
+                    part_labels = meta.get("labels") if isinstance(meta, Mapping) else None
+                    if part_labels is not None:
+                        total += int((part_labels.reshape(-1)[1:] != IGNORE_INDEX).sum().item())
+            return total
+
         for sample in conversation_list:
-            sample_labels = [
-                part.meta["labels"]
-                for part in sample
-                if not getattr(part, "is_dummy", False)
-                and isinstance(getattr(part, "meta", None), Mapping)
-                and part.meta.get("labels") is not None
-            ]
+            sample_labels: List[torch.Tensor] = []
+            has_non_text_prefix = False
+            for part in sample:
+                if getattr(part, "is_dummy", False):
+                    continue
+                if getattr(part, "type", "text") == "text":
+                    meta = getattr(part, "meta", None)
+                    part_labels = meta.get("labels") if isinstance(meta, Mapping) else None
+                    if part_labels is not None and part_labels.numel() > 0:
+                        sample_labels.append(part_labels.reshape(-1))
+                else:
+                    # Match TextEncoder._prepare_decode_inputs: each non-text
+                    # segment contributes a masked placeholder row before the
+                    # causal shift so a following supervised text token is kept.
+                    if not sample_labels:
+                        has_non_text_prefix = True
             if not sample_labels:
                 continue
-            cat = torch.cat(sample_labels, dim=0) if len(sample_labels) > 1 else sample_labels[0]
-            total += int((cat[..., 1:] != IGNORE_INDEX).sum().item())
+            first_start = 0 if has_non_text_prefix else 1
+            total += int((sample_labels[0][first_start:] != IGNORE_INDEX).sum().item())
+            for part_labels in sample_labels[1:]:
+                total += int((part_labels != IGNORE_INDEX).sum().item())
         return total
 
     def forward_backward_step(

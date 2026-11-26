@@ -557,8 +557,10 @@ class OmniConfig(VeOmniPretrainedConfig):
         with open(path, encoding="utf-8") as f:
             payload = yaml.safe_load(f)
         wrapper = _LEGACY_GRAPH_WRAPPER.get(value_type)
-        if isinstance(payload, dict) and len(payload) == 1 and wrapper in payload:
-            payload = payload[wrapper]
+        wrapped = payload.get(wrapper) if isinstance(payload, dict) and len(payload) == 1 else None
+        is_bare_fsm = value_type is dict and isinstance(wrapped, dict) and {"initial", "states"} <= set(wrapped)
+        if isinstance(wrapped, dict) and not is_bare_fsm:
+            payload = wrapped
         if isinstance(payload, list) and value_type is list:
             payload = {DEFAULT_GRAPH_SCENARIO: payload}
         elif isinstance(payload, dict) and value_type is dict and {"initial", "states"} <= set(payload):

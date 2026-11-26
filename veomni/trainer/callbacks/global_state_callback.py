@@ -58,10 +58,14 @@ logger = helper.create_logger(__name__)
 
 #: Seconds of forward progress at which the watchdog dumps every thread's stack.
 #: Armed from ``VEOMNI_RESUME_STALL_SECONDS``; 0 disables it.
-_STALL_WATCHDOG_SECONDS = 0
+_STALL_WATCHDOG_SECONDS: float = 0.0
 
 
-def _arm_stall_watchdog(seconds: int) -> None:
+def _get_stall_watchdog_seconds() -> float:
+    return float(os.getenv("VEOMNI_RESUME_STALL_SECONDS", "0"))
+
+
+def _arm_stall_watchdog(seconds: float) -> None:
     """Restart the stall timer.
 
     Any step that completes re-arms it, so the deadline always means "no progress
@@ -72,7 +76,7 @@ def _arm_stall_watchdog(seconds: int) -> None:
     """
     global _STALL_WATCHDOG_SECONDS
     prev = _STALL_WATCHDOG_SECONDS
-    _STALL_WATCHDOG_SECONDS = int(seconds)
+    _STALL_WATCHDOG_SECONDS = float(seconds)
     if _STALL_WATCHDOG_SECONDS > 0:
         _rearm_stall_watchdog()
     elif prev > 0:
@@ -123,7 +127,7 @@ class GlobalStateCallback(Callback):
         self.load_global_state()
         # Resume can stall before the first step, so arm the watchdog here as well
         # and let every completed step push the deadline out.
-        _arm_stall_watchdog(int(os.getenv("VEOMNI_RESUME_STALL_SECONDS", "0")))
+        _arm_stall_watchdog(_get_stall_watchdog_seconds())
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
         # A step finishing is progress: push the watchdog deadline out so a slow
@@ -289,7 +293,7 @@ class GlobalStateCallback(Callback):
         # all ranks parked on the same line. Dump every thread's stack after a
         # bounded delay so a stall names the frame it is stuck in, and log each
         # step so the last line printed bounds where it can be.
-        stall_seconds = int(os.getenv("VEOMNI_RESUME_STALL_SECONDS", "0"))
+        stall_seconds = _get_stall_watchdog_seconds()
         if stall_seconds > 0:
             _arm_stall_watchdog(stall_seconds)
         try:
