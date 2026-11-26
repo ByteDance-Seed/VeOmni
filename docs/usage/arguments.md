@@ -909,15 +909,20 @@ See [HyperParallel](../key_features/hyper_parallel.md) for installation and conf
 
 > **ExtraParallel BF16 reduction guard (CUDA / NCCL FSDP2):** When `mixed_precision.enable: true`
 > and the effective reduction dtype is `bfloat16` (either `reduce_dtype: bfloat16` or
-> `reduce_dtype: null` with `param_dtype: bfloat16`), `AcceleratorConfig` rejects FSDP2
-> (`fsdp_mode: fsdp2` / `hyper_fsdp2`) topologies where any ExtraParallel reduce-scatter group
-> spans more than one rank (`para_size > 1` and `dp_shard_sp_size // para_size > 1`, with
-> `dp_shard_sp_size = world_size // dp_replicate_size`). On NCCL, PyTorch's default `PreMulSum`
-> path for `gradient_divide_factor != reduce_scatter_size` truncates power-of-two `1 / 2^k`
-> scalars to `bfloat16(0.0)` and silently zeroes ExtraParallel gradients. Ascend NPU (HCCL,
-> which patches `PREMUL_SUM` to `SUM` + local scaling via `apply_hccl_premul_sum_patch()`),
-> Cambricon MLU (CNCL), non-FSDP2 modes (`ddp`, `eager`), and `mixed_precision.enable: false`
-> are unaffected and exempt. To migrate an affected configuration, choose one of:
+> `reduce_dtype: null` with `param_dtype: bfloat16`), FSDP2 parallelization
+> (`parallelize_model_fsdp2`) rejects wrapping any non-persistent ExtraParallel module whose
+> FSDP reduce-scatter group spans more than one rank (`para_size > 1` and
+> `dp_shard_sp_size // para_size > 1`, with `dp_shard_sp_size = world_size // dp_replicate_size`).
+> On NCCL, PyTorch's default `PreMulSum` path for `gradient_divide_factor != reduce_scatter_size`
+> truncates power-of-two `1 / 2^k` scalars to `bfloat16(0.0)` and silently zeroes ExtraParallel
+> gradients. Persistent ExtraParallel dimensions (such as Qwen4-Exp `ple`, which skip FSDP
+> wrapping and scale gradients in their own backward), modules without an ExtraParallel plan
+> (such as SeedOmni sub-modules inheriting a global `ep_size`), `extra_parallel_only` runs,
+> Ascend NPU (HCCL, which patches `PREMUL_SUM` to `SUM` + local scaling via
+> `apply_hccl_premul_sum_patch()`), Cambricon MLU (CNCL), and non-FSDP2 modes (`ddp`, `eager`)
+> are exempt. When `mixed_precision.enable: false`, this guard is skipped and multi-rank
+> ExtraParallel reductions still use `ReduceOp.SUM` plus local division at runtime. To migrate
+> an affected configuration, choose one of:
 > - Set `reduce_dtype: float32` (default; optionally enable
 >   `fsdp_config.low_precision_reduce_scatter_comm: true` for BF16 wire transport with FP32
 >   accumulation).

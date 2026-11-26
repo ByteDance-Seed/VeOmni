@@ -541,6 +541,78 @@ def _fsdp_reduce_scatter_size(mesh) -> int:
     return int(mesh.size(ndim - 1) if ndim > 1 else mesh.size())
 
 
+def _validate_extra_parallel_bf16_reduce_scatter(
+    para: str,
+    *,
+    mixed_precision: MixedPrecisionConfig,
+    reduce_scatter_size: int,
+    para_size: Optional[int] = None,
+) -> None:
+    """Refuse BF16 gradient reduction over a multi-rank FSDP2 ExtraParallel collective.
+
+    When a non-persistent ExtraParallel FSDP2 unit's reduce-scatter group is wider
+    than one rank and its divide factor differs from that group's size -- which is
+    always the case here, because the factor is the world size -- PyTorch's
+    ``_get_gradient_divide_factors`` picks
+    ``torch.distributed._make_nccl_premul_sum(1 / factor)``. ``ProcessGroupNCCL``
+    then hands the host ``float32*`` scalar to
+    ``ncclRedOpCreatePreMulSum(..., ncclBfloat16, ncclScalarHostImmediate, ...)``,
+    and ``libnccl`` copies the **low two bytes** of the IEEE-754 value as a
+    ``bfloat16``: every power-of-two ``1 / 2^k`` has those bytes zero, so the
+    reduction multiplies the whole gradient by ``0.0``.
+
+    Nothing raises, and the loss curve stays normal -- only the reduced
+    parameters stop moving. While ``_configure_extra_parallel_reduce_scatter``
+    forces ``ReduceOp.SUM`` plus a local divide on PyTorch builds that expose
+    ``set_force_sum_reduction_for_comms``, this wrapping-boundary guard acts as
+    defense-in-depth so no FSDP2 ExtraParallel collective runs with effective BF16
+    reduction (whether set via ``reduce_dtype='bfloat16'`` or inherited via
+    ``reduce_dtype=None`` with ``param_dtype='bfloat16'``).
+
+    Enforcing this at the FSDP2 wrapping boundary ensures only ExtraParallel
+    dimensions actually wrapped with ``fully_shard`` are checked: persistent
+    dimensions (such as Qwen4-Exp ``ple``, which skip FSDP wrapping and scale
+    gradients in their own backward), plan-less sub-modules (such as SeedOmni
+    towers inheriting a global ``ep_size``), ``extra_parallel_only`` runs, and
+    non-FSDP2 modes (``ddp``, ``eager``) are naturally exempt.
+
+    Only ``bfloat16`` is refused, not ``float16``: PyTorch computes
+    ``overflow_risk = reduce_dtype not in (float32, bfloat16)``, so FP16 already
+    takes plain ``ReduceOp.SUM`` with pre/post factors. Ascend NPU (HCCL, patched
+    via ``apply_hccl_premul_sum_patch()``) and Cambricon MLU (CNCL) are exempt
+    because they do not hit ``ProcessGroupNCCL``. Singleton reduce-scatter groups
+    (``reduce_scatter_size <= 1``, including 2D HSDP where
+    ``dp_shard_sp_size // para_size == 1``) are exempt because ``foreach_reduce``
+    skips the collective and divides in its singleton copy branch.
+    """
+    if not mixed_precision.enable:
+        return
+    effective_reduce_dtype = mixed_precision.reduce_dtype or mixed_precision.param_dtype
+    if effective_reduce_dtype != "bfloat16":
+        return
+    if reduce_scatter_size <= 1:
+        return
+
+    from ..utils.device import IS_MLU_AVAILABLE, IS_NPU_AVAILABLE
+
+    if IS_NPU_AVAILABLE or IS_MLU_AVAILABLE:
+        return
+
+    size_detail = f"{para}_size={para_size}" if para_size is not None else f"{para} parallelism"
+    singleton_hint = (
+        f"{para}_size={para_size * reduce_scatter_size}, i.e. equal to dp_shard x cp x ulysses"
+        if para_size is not None
+        else f"{para}_size equal to dp_shard x cp x ulysses"
+    )
+    raise ValueError(
+        f"fsdp_config.mixed_precision.reduce_dtype={mixed_precision.reduce_dtype!r} "
+        f"(effective 'bfloat16') cannot be used with {size_detail}: the {para} "
+        f"reduce-scatter group is {reduce_scatter_size} wide, where PyTorch's default NCCL "
+        "PreMulSum bf16 scalar path truncates 1/2^k to 0.0 and zeroes every gradient in it. "
+        f"Set reduce_dtype='float32', or make the group a singleton ({singleton_hint})."
+    )
+
+
 def _configure_extra_parallel_reduce_scatter(
     module: FSDPModule,
     gradient_divide_factor: float,
@@ -1006,6 +1078,28 @@ def parallelize_model_fsdp2(
         fsdp_reduction_scale = 1.0 / parallel_state.fsdp_mesh.size()
     else:
         transport_reduction_scales = None
+
+    # Validate BF16 ExtraParallel reduce-scatter groups before wrapping any layer so
+    # an incompatible topology fails cleanly without partially mutating the model.
+    # Persistent ExtraParallel modules (e.g. Qwen4-Exp PLE) skip FSDP wrapping and
+    # are skipped here by the exact same predicate.
+    para_sizes = getattr(parallel_state, "extra_parallel_sizes", None) or {}
+    for _layer_fqn, (_layer_mod, extra_parallel_mod) in layer_pairs_list:
+        for para in parallel_state.extra_parallel_names:
+            if not parallel_state.extra_parallel_enabled(para):
+                continue
+            para_rs_size = _fsdp_reduce_scatter_size(extra_parallel_fsdp_kwargs[para]["mesh"])
+            for _para_mod in extra_parallel_mod[para]:
+                if isinstance(_para_mod, FSDPModule):
+                    continue
+                if any(param in persistent_extra_parallel_params for param in _para_mod.parameters()):
+                    continue
+                _validate_extra_parallel_bf16_reduce_scatter(
+                    para,
+                    mixed_precision=mixed_precision,
+                    reduce_scatter_size=para_rs_size,
+                    para_size=para_sizes.get(para),
+                )
 
     for layer_fqn, (layer_mod, extra_parallel_mod) in layer_pairs_list:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
