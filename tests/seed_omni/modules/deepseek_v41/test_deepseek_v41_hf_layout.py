@@ -19,18 +19,31 @@ import types
 import pytest
 import torch
 from safetensors import safe_open
+from safetensors.torch import save_file
 
 import veomni.models.checkpoint.weights as module_utils
 from veomni.models.checkpoint.weights import init_empty_weights, load_model_weights, load_model_weights_ep_sharded
 from veomni.models.seed_omni.modules.deepseek_v41.checkpoint_tensor_converter import (
+    DeepseekV41DequantConverter,
     DeepseekV41LlmConverter,
     dequant_converted_weight,
 )
 from veomni.models.seed_omni.modules.deepseek_v41.convert_model import convert_deepseek_v41_checkpoint
-from veomni.models.seed_omni.modules.deepseek_v41.dequant import dequant_fp4_blockwise, dequant_fp8_blockwise
+from veomni.models.seed_omni.modules.deepseek_v41.dequant import (
+    dequant_fp4_blockwise,
+    dequant_fp8_blockwise,
+    quant_fp4_blockwise,
+    quant_fp8_blockwise,
+)
 from veomni.models.seed_omni.modules.deepseek_v41.hf_layout import build_deepseek_v41_hf_layout
 from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import DeepseekV41Llm
-from veomni.models.seed_omni.modules.deepseek_v41.released_names import LLM, MODULES, NGRAM
+from veomni.models.seed_omni.modules.deepseek_v41.released_names import (
+    LLM,
+    MODULES,
+    NGRAM,
+    llm_layer_names,
+    mtp_layer_names,
+)
 from veomni.models.seed_omni.utils.hf_layout import (
     HFSource,
     attach_hf_source_converter,
@@ -38,14 +51,204 @@ from veomni.models.seed_omni.utils.hf_layout import (
     save_hf_source_checkpoint,
 )
 
-from .test_deepseek_v41_convert import (
-    ENGRAM_LAYERS,
-    N_EXPERTS,
-    N_LAYERS,
-    _write_released_config,
-    build_released_checkpoint,
-    llm_config,
+
+HIDDEN = 64
+N_LAYERS = 2
+N_EXPERTS = 4
+MOE_INTER = 32
+HC = 4
+ENGRAM_LAYERS = [1]
+
+QUANTIZED_SUFFIXES = (
+    "wq_a",
+    "wq_b",
+    "attn.wkv",
+    "wo_a",
+    "wo_b",
+    "indexer.wq_b",
+    "shared_experts.w1",
+    "shared_experts.w2",
+    "shared_experts.w3",
 )
+
+
+def llm_config():
+    from veomni.models.seed_omni.modules.deepseek_v41.llm.configuration import DeepseekV41LlmConfig
+
+    return DeepseekV41LlmConfig(
+        hidden_size=HIDDEN,
+        num_hidden_layers=N_LAYERS,
+        num_attention_heads=4,
+        head_dim=32,
+        qk_rope_head_dim=8,
+        q_lora_rank=64,
+        o_lora_rank=32,
+        o_groups=2,
+        sliding_window=6,
+        index_n_heads=8,
+        index_head_dim=32,
+        index_topk=4,
+        rms_norm_eps=1e-20,
+        hc_mult=HC,
+        compress_ratios=[2] * N_LAYERS + [0, 0, 0],
+        kv_source_layer_ids=[0],
+        index_source_layer_ids=[0],
+        candidate_source_layer_id=0,
+        candidate_topk_blocks=2,
+        candidate_block_size=2,
+        engram_layer_ids=list(ENGRAM_LAYERS),
+        dspark_target_layer_ids=[1],
+        dspark_n_routed_experts=N_EXPERTS,
+        max_position_embeddings=256,
+        n_routed_experts=N_EXPERTS,
+        num_experts_per_tok=2,
+        moe_intermediate_size=MOE_INTER,
+        n_shared_experts=1,
+        engram_max_ngram_size=4,
+        engram_n_heads=2,
+        engram_head_dim=32,
+    )
+
+
+def _e8m0_scale(*shape):
+    return torch.randint(123, 132, shape, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+
+
+def _fp8_pair(out_dim, in_dim, block=32):
+    weight = torch.randn(out_dim, in_dim).to(torch.float8_e4m3fn)
+    return weight, _e8m0_scale(out_dim // block, in_dim // block)
+
+
+def _fp4_pair(out_dim, in_dim, block=32):
+    packed = torch.randint(0, 256, (out_dim, in_dim // 2), dtype=torch.uint8).view(torch.int8)
+    return packed, _e8m0_scale(out_dim, in_dim // block)
+
+
+def build_released_checkpoint(path, config):
+    """Build a two-shard synthetic checkpoint in the released DeepSeek-V4.1 layout."""
+    from veomni.models.seed_omni.modules.deepseek_v41.mtp.configuration import DeepseekV41MtpConfig
+    from veomni.models.seed_omni.modules.deepseek_v41.mtp.modeling import DeepseekV41Mtp
+
+    torch.manual_seed(0)
+    llm = DeepseekV41Llm(config)
+    mtp_cfg = DeepseekV41MtpConfig(**{k: v for k, v in config.to_dict().items() if k != "model_type"})
+    mtp = DeepseekV41Mtp(mtp_cfg)
+    module_shapes = {name: tuple(p.shape) for name, p in llm.named_parameters()}
+    module_shapes.update({name: tuple(b.shape) for name, b in llm.named_buffers()})
+    module_shapes.update({name: tuple(p.shape) for name, p in mtp.named_parameters()})
+    module_shapes.update({name: tuple(b.shape) for name, b in mtp.named_buffers()})
+    tensors = {}
+
+    for layer in range(config.num_hidden_layers):
+        for released, target in llm_layer_names(layer).items():
+            shape = module_shapes.get(target)
+            if shape is None:
+                continue
+            if any(released.endswith(f"{suffix}.weight") for suffix in QUANTIZED_SUFFIXES):
+                weight, scale = _fp8_pair(*shape)
+                tensors[released] = weight
+                tensors[f"{released[: -len('.weight')]}.scale"] = scale
+            else:
+                tensors[released] = torch.randn(*shape) if len(shape) > 1 else torch.ones(*shape)
+
+        fused_shape = module_shapes[f"model.layers.{layer}.mlp.experts.gate_up_proj"]
+        down_shape = module_shapes[f"model.layers.{layer}.mlp.experts.down_proj"]
+        inter, hidden = fused_shape[1] // 2, fused_shape[2]
+        for expert in range(config.n_routed_experts):
+            prefix = f"layers.{layer}.ffn.experts.{expert}"
+            for part, (out_dim, in_dim) in (
+                ("w1", (inter, hidden)),
+                ("w3", (inter, hidden)),
+                ("w2", (down_shape[1], down_shape[2])),
+            ):
+                packed, scale = _fp4_pair(out_dim, in_dim)
+                tensors[f"{prefix}.{part}.weight"] = packed
+                tensors[f"{prefix}.{part}.scale"] = scale
+
+        if layer in ENGRAM_LAYERS:
+            engram = f"layers.{layer}.engram"
+            for part in ("q_weight", "k_weight"):
+                tensors[f"{engram}.{part}"] = torch.randn(*module_shapes[f"model.layers.{layer}.engram.{part}"])
+            weight, scale = _fp8_pair(*module_shapes[f"model.layers.{layer}.engram.wkv.weight"])
+            tensors[f"{engram}.wkv.weight"] = weight
+            tensors[f"{engram}.wkv.scale"] = scale
+
+    n_mtp = config.num_nextn_predict_layers
+    n_mtp_experts = config.dspark_n_routed_experts or config.n_routed_experts
+    for stage in range(n_mtp):
+        for released, target in mtp_layer_names(stage).items():
+            shape = module_shapes.get(target)
+            if shape is None:
+                continue
+            if any(released.endswith(f"{suffix}.weight") for suffix in QUANTIZED_SUFFIXES):
+                weight, scale = _fp8_pair(*shape)
+                tensors[released] = weight
+                tensors[f"{released[: -len('.weight')]}.scale"] = scale
+            else:
+                tensors[released] = torch.randn(*shape) if len(shape) > 1 else torch.ones(*shape)
+        fused_shape = module_shapes[f"model.mtp.{stage}.mlp.experts.gate_up_proj"]
+        down_shape = module_shapes[f"model.mtp.{stage}.mlp.experts.down_proj"]
+        inter, hidden = fused_shape[1] // 2, fused_shape[2]
+        for expert in range(n_mtp_experts):
+            prefix = f"mtp.{stage}.ffn.experts.{expert}"
+            for part, (out_dim, in_dim) in (
+                ("w1", (inter, hidden)),
+                ("w3", (inter, hidden)),
+                ("w2", (down_shape[1], down_shape[2])),
+            ):
+                packed, scale = _fp4_pair(out_dim, in_dim)
+                tensors[f"{prefix}.{part}.weight"] = packed
+                tensors[f"{prefix}.{part}.scale"] = scale
+
+    last = n_mtp - 1
+    weight, scale = _fp8_pair(*module_shapes["model.mtp.0.main_proj.weight"])
+    tensors["mtp.0.main_proj.weight"] = weight
+    tensors["mtp.0.main_proj.scale"] = scale
+    tensors["mtp.0.main_norm.weight"] = torch.ones(*module_shapes["model.mtp.0.main_norm.weight"])
+    tensors[f"mtp.{last}.norm.weight"] = torch.ones(*module_shapes[f"model.mtp.{last}.norm.weight"])
+    tensors[f"mtp.{last}.markov_head.embed.weight"] = torch.randn(
+        *module_shapes[f"model.mtp.{last}.markov_head.embed.weight"]
+    )
+    tensors[f"mtp.{last}.markov_head.head.weight"] = torch.randn(
+        *module_shapes[f"model.mtp.{last}.markov_head.head.weight"]
+    )
+    tensors[f"mtp.{last}.confidence_head.proj.weight"] = torch.randn(
+        *module_shapes[f"model.mtp.{last}.confidence_head.proj.weight"]
+    )
+
+    tensors["norm.weight"] = torch.ones(*module_shapes["model.norm.weight"])
+    tensors["vision.norm.weight"] = torch.ones(HIDDEN)
+    tensors["aligner.w1.bias"] = torch.zeros(HIDDEN)
+    tensors["image_start"] = torch.randn(HIDDEN)
+
+    os.makedirs(path, exist_ok=True)
+    names = sorted(tensors)
+    half = len(names) // 2
+    weight_map = {}
+    for shard_index, chunk in enumerate((names[:half], names[half:])):
+        file_name = f"model-{shard_index + 1:05d}-of-00002.safetensors"
+        save_file({n: tensors[n].contiguous() for n in chunk}, os.path.join(path, file_name))
+        weight_map.update(dict.fromkeys(chunk, file_name))
+    with open(os.path.join(path, "model.safetensors.index.json"), "w") as handle:
+        json.dump({"metadata": {"total_size": 0}, "weight_map": weight_map}, handle)
+    return tensors
+
+
+def _write_released_config(path):
+    text = {k: v for k, v in llm_config().to_dict().items() if not k.startswith("_")}
+    text.update(
+        engram_layer_ids=ENGRAM_LAYERS,
+        engram_num_embeddings=[1024],
+        engram_max_ngram_size=3,
+        engram_n_heads=2,
+        engram_head_dim=16,
+        engram_vocab_size=4096,
+        engram_compressed_vocab_size=100,
+        engram_pad_token_id=2,
+    )
+    vision = {"num_hidden_layers": 1, "hidden_size": HIDDEN, "num_attention_heads": 4, "intermediate_size": 128}
+    with open(os.path.join(path, "config.json"), "w") as handle:
+        json.dump({"model_type": "deepseek_v41", "text_config": text, "vision_config": vision}, handle)
 
 
 QUANTIZATION = {
@@ -344,13 +547,19 @@ class TestStreamLoad:
                 assert experts == set(range(rank * local, (rank + 1) * local)), (module_name, rank, kind)
 
 
+def _quantize_rows(values: torch.Tensor):
+    blocks = values.float().unflatten(-1, (values.shape[-1] // 32, 32))
+    amax = blocks.abs().amax(dim=-1, keepdim=True).clamp(min=1e-30)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    packed = (blocks / scale).to(torch.float8_e4m3fn)
+    return packed.flatten(-2), scale.squeeze(-1).to(torch.float8_e8m0fnu)
+
+
 def _add_ngram_tables(path: str, ngram_config) -> dict[str, torch.Tensor]:
     """The release's fp8 tables and row scales, in a shard of their own; the llm miniature has none."""
-    from safetensors.torch import save_file
-
     from veomni.models.seed_omni.modules.deepseek_v41.ngram.modeling import DeepseekV41Ngram
 
-    from .test_deepseek_v41_ngram_quantized import quantize_rows
+    quantize_rows = _quantize_rows
 
     with init_empty_weights():
         width = DeepseekV41Ngram._from_config(ngram_config).tables[0].weight.shape[1]
@@ -584,3 +793,36 @@ def test_deepgemm_streams_and_dequantizes_quantized_release(tmp_path, monkeypatc
     torch.testing.assert_close(streamed_experts, want_experts, rtol=0, atol=0)
     want_dense = _dequant_release(tensors, "layers.0.attn.wq_a.weight").bfloat16()
     torch.testing.assert_close(ranks[0][dense_key], want_dense, rtol=0, atol=0)
+
+
+def test_fp8_and_fp4_requant_round_trip_is_value_exact():
+    torch.manual_seed(0)
+    fp8_w = (torch.randn(64, 96) * 100).to(torch.float8_e4m3fn)
+    fp8_s = _e8m0_scale(2, 3)
+    fp8_vals = dequant_fp8_blockwise(fp8_w, fp8_s, out_dtype=torch.float32)
+    q_w, q_s = quant_fp8_blockwise(fp8_vals, (32, 32))
+    assert torch.equal(dequant_fp8_blockwise(q_w, q_s, out_dtype=torch.float32), fp8_vals)
+
+    packed = torch.randint(-128, 128, (16, 32), dtype=torch.int8)
+    packed[:, 0] = 0x7F
+    fp4_s = _e8m0_scale(16, 2)
+    fp4_vals = dequant_fp4_blockwise(packed, fp4_s, out_dtype=torch.float32)
+    rq_w, rq_s = quant_fp4_blockwise(fp4_vals)
+    assert torch.equal(rq_s.view(torch.uint8), fp4_s.view(torch.uint8))
+    assert torch.equal(dequant_fp4_blockwise(rq_w, rq_s, out_dtype=torch.float32), fp4_vals)
+
+
+def test_dequant_converter_export_weights_keeps_unquantized_3d_experts_bf16():
+    conv = DeepseekV41DequantConverter(config=None)
+    state = {
+        "model.layers.0.mlp.experts.gate_up_proj": torch.ones((4, 8, 4), dtype=torch.bfloat16),
+        "model.layers.0.mlp.experts.down_proj": torch.ones((4, 4, 8), dtype=torch.bfloat16),
+        "model.layers.0.input_layernorm.weight": torch.ones((8,), dtype=torch.float32),
+        "model.layers.0.mlp.gate.e_score_correction_bias": torch.zeros((4,), dtype=torch.bfloat16),
+    }
+    dummy_model = types.SimpleNamespace(state_dict=lambda: state, named_modules=lambda: [])
+    exported = dict(conv.export_weights(dummy_model))
+    assert exported["model.layers.0.mlp.experts.gate_up_proj"].dtype == torch.bfloat16
+    assert exported["model.layers.0.mlp.experts.down_proj"].dtype == torch.bfloat16
+    assert exported["model.layers.0.input_layernorm.weight"].dtype == torch.bfloat16
+    assert exported["model.layers.0.mlp.gate.e_score_correction_bias"].dtype == torch.float32

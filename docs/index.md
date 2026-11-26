@@ -84,7 +84,6 @@ examples/ltx-2.3.md
 examples/qwen3_dpo.md
 examples/seed_oss.md
 examples/kimi_k3.md
-examples/deepseek_v41_verification_report.md
 ```
 
 ```{toctree}
@@ -136,6 +135,7 @@ seed_omni/models/qwen3.md
 seed_omni/models/qwen3_moe.md
 seed_omni/models/qwen3vl.md
 seed_omni/models/bagel.md
+seed_omni/models/deepseek_v41_flash.md
 ```
 
 ```{toctree}

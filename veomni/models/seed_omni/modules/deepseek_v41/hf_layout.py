@@ -165,7 +165,7 @@ def build_deepseek_v41_hf_layout(source_path: str) -> OmniHFLayout:
         },
         tied_source_keys=tied_mtp_names(num_stages),
         graph_dir=_GRAPH_DIR,
-        training_graphs="train/graph_train.yaml",
+        training_graphs="graph_train.yaml",
         load_hf_config=_read_release_config,
     )
     return layout

@@ -639,7 +639,7 @@ def convert_deepseek_v41_checkpoint(
 
     training_graphs, generation_graphs = load_family_graphs(
         "configs/seed_omni/DeepSeek/deepseek_v41_flash",
-        training="train/graph_train.yaml",
+        training="graph_train.yaml",
         generation={},
         training_graph=training_graph,
         generation_graph=generation_graph,

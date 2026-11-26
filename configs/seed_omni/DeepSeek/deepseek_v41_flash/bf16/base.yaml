@@ -1,16 +1,16 @@
-# DeepSeek-V4.1-Flash full QAT training on 128 GPUs (16 nodes x 8), 256k context, CP=16.
+# DeepSeek-V4.1-Flash BF16 training on 128 GPUs (16 nodes x 8), 256k context, CP=16.
 #
 # `model.model_path` and `data.yaml`'s `sources` are placeholders: replace them
 # with paths this job can read before launching.
 #
 #   NNODES=16 NODE_RANK=<rank> MASTER_ADDR=<host> bash train.sh \
-#     tasks/omni/train_omni.py configs/seed_omni/DeepSeek/deepseek_v41_flash/train/qat.yaml
+#     tasks/omni/train_omni.py configs/seed_omni/DeepSeek/deepseek_v41_flash/bf16/base.yaml
 
 model:
   model_path: DeepSeek-V4.1-Flash
   model_config:
-    modules: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/modules_qat.yaml
-    train_graph: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/graph_train.yaml
+    modules: configs/seed_omni/DeepSeek/deepseek_v41_flash/bf16/modules_train.yaml
+    train_graph: configs/seed_omni/DeepSeek/deepseek_v41_flash/graph_train.yaml
   ops_implementation:
     attn_implementation: flash_attention_2
 
@@ -55,7 +55,7 @@ model:
 data:
   data_type: seedomni
   max_seq_len: 262144
-  train_path: configs/seed_omni/DeepSeek/deepseek_v41_flash/train/data.yaml
+  train_path: configs/seed_omni/DeepSeek/deepseek_v41_flash/data.yaml
   datasets_type: iterable
   multisource_datasets_type: veomni_weighted_multisource
   train_sample: 1000000
@@ -84,11 +84,11 @@ train:
   empty_cache_steps: 0
 
   checkpoint:
-    output_dir: outputs/deepseek_v41_flash_qat_256k_cp16
+    output_dir: outputs/deepseek_v41_flash_bf16_256k_cp16
     save_steps: 500
     save_epochs: 0
     save_hf_weights: false
   wandb:
     enable: true
     project: VeOmni_omni
-    name: deepseek_v41_flash_qat_256k_cp16
+    name: deepseek_v41_flash_bf16_256k_cp16
