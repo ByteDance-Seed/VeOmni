@@ -321,6 +321,33 @@ def test_dpo_resume_binds_reference_low_precision_ops(selection_kind):
         trainer.validate_dpo_provenance_checkpoint(current)
 
 
+@pytest.mark.parametrize(("before", "after"), [("none", "eager"), ("eager", "none"), ("eager", "triton")])
+def test_dpo_resume_requires_same_scalar_kv_rounding(before, after):
+    trainer = _trainer(True)
+    trainer.base.train_dataloader = _native_map_loader(list(range(8)))
+    args = trainer.base.args
+    args.model.ops_implementation = SimpleNamespace(kv_round_implementation=before)
+    trainer._dpo_recovery_geometry = _dpo_recovery_geometry(args)
+    saved = trainer.dpo_provenance_checkpoint_state()
+    assert saved["recovery_geometry"]["reference_model"]["site_ops"]["kv_round_implementation"] == before
+    trainer.validate_dpo_provenance_checkpoint(saved)
+
+    args.model.ops_implementation.kv_round_implementation = after
+    trainer._dpo_recovery_geometry = _dpo_recovery_geometry(args)
+    with pytest.raises(ValueError, match="provenance mode"):
+        trainer.validate_dpo_provenance_checkpoint(saved)
+
+
+def test_dpo_resume_rejects_v9_checkpoint_without_scalar_kv_proof():
+    trainer = _trainer(True)
+    trainer.base.train_dataloader = _native_map_loader(list(range(8)))
+    saved = copy.deepcopy(trainer.dpo_provenance_checkpoint_state())
+    saved["version"] = 9
+    saved["recovery_geometry"]["reference_model"].pop("site_ops")
+    with pytest.raises(ValueError, match="v9 does not attest KV rounding"):
+        trainer.validate_dpo_provenance_checkpoint(saved)
+
+
 def test_dpo_resume_rejects_changed_dataset_fingerprint():
     trainer = _trainer(True)
     saved = trainer.dpo_provenance_checkpoint_state()
