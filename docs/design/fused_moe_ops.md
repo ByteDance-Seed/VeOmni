@@ -211,3 +211,11 @@ routing_weights = full([tokens, topk], weight)
 
 Then compare split-fc1 fused, merged-fc1 fused, and eager MoE backward results,
 and assert all produced gradients are finite.
+
+## Opt-in MXFP8 training
+
+`fused_triton_fp8` is an independent composable backend and quantizes both projections
+in forward, input gradients and weight gradients with E4M3/E8M0 K32 scales.
+It requires NVIDIA Blackwell SM10x, BF16 operands, SiLU/SwiGLU and EP1.
+See [Triton MXFP8 MoE training](triton_mxfp8_moe.md) for the recipe,
+synchronization limits and validation command.

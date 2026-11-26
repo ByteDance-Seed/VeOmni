@@ -41,6 +41,7 @@ from .standard import npu as standard_npu
 from .standard import qat as standard_qat
 from .standard import quack as standard_quack
 from .standard import triton as standard_triton
+from .standard import triton_fp8 as standard_triton_fp8
 
 
 _GPU_SM70_OR_ROCM = GpuKernelRequirement(platforms=(NVIDIA_SM70_PLUS, ROCM_GPU))
@@ -58,7 +59,7 @@ _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
 #: while the config said ``deepgemm``. The remaining rows (``fused_triton``,
 #: ``fused_quack``, ``fused_npu``, ``fused_mlu``, ``eager``) do bf16 math and
 #: ignore ``dtype``, so falling back changes nothing for them.
-QUANTIZING_IMPLS = frozenset({"qat", "deepgemm"})
+QUANTIZING_IMPLS = frozenset({"qat", "deepgemm", "fused_triton_fp8"})
 
 
 register_op(
@@ -96,6 +97,16 @@ register_op(
     requirement=_GPU_SM70_OR_ROCM,
     requires=("triton",),
     default=True,
+)
+
+register_op(
+    "moe_experts",
+    "standard",
+    "fused_triton_fp8",
+    description="Blackwell K32 MXFP8 merged MoE forward, input and weight gradients",
+    wrapper=standard_triton_fp8.wrapper,
+    requirement=GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=100, max_cc=109),)),
+    requires=("triton",),
 )
 
 register_op(
