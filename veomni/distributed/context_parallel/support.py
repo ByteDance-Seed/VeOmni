@@ -26,38 +26,42 @@ from __future__ import annotations
 from veomni.utils.device import IS_NPU_AVAILABLE
 
 
-_CP_DSA_FIELDS = ("dsa_indexer_implementation", "dsa_attention_implementation")
+# ``eager`` and ``cann`` both serve CP's local-query/global-KV layout. The CANN
+# adapters narrow the replicated buffers to the prefix the kernels assume.
+_NPU_CP_DSA_IMPLEMENTATIONS = {
+    "dsa_indexer_implementation": frozenset({"eager", "cann"}),
+    "dsa_attention_implementation": frozenset({"eager", "cann"}),
+}
 
 
 def check_cp_platform_support(config: object) -> None:
     """Refuse context-parallel setups this release cannot run.
 
-    Ascend implements context parallelism for DeepSeek-V4 only. The CANN
-    DeepSeek-V4 indexer and sparse attention reject CP's local-query/global-KV
-    layout, so a ``cann`` selection is refused on every device. Other DSA
-    implementations are admitted.
+    Ascend implements context parallelism for DeepSeek-V4 only, and there only
+    ``eager`` and ``cann`` DSA selections. GPU runs are not filtered here.
     """
+    if not IS_NPU_AVAILABLE:
+        return
+
     model_type = getattr(config, "model_type", None)
-    if IS_NPU_AVAILABLE and model_type != "deepseek_v4":
+    if model_type != "deepseek_v4":
         raise NotImplementedError(
             "Context parallelism is GPU-only in this release except for deepseek_v4; set cp_size=1 on Ascend/NPU runs."
         )
 
-    if model_type != "deepseek_v4":
-        return
-
+    # Fail closed: a missing tree cannot be judged, so it is not admitted.
     ops_config = getattr(config, "ops_config", None)
     if ops_config is None:
-        return
+        raise NotImplementedError(
+            "Context parallelism on Ascend/NPU requires DeepSeek-V4 DSA operator selections, but ops_config is missing."
+        )
 
-    for field in _CP_DSA_FIELDS:
-        # ``ops_config`` resolves dataclass defaults, so an unset field reads
-        # back as its default rather than ``None``.
-        implementation = getattr(ops_config, field, None)
-        if implementation == "cann":
+    for field, implementations in _NPU_CP_DSA_IMPLEMENTATIONS.items():
+        implementation = getattr(ops_config, field)
+        if implementation not in implementations:
+            allowed = " or ".join(sorted(implementations))
             raise NotImplementedError(
-                f"Context parallelism does not support {field}='cann'. "
-                "The CANN DeepSeek-V4 sparse attention rejects CP's local-query/global-KV geometry and "
-                "the CANN indexer rejects CP's explicit cu_seqlen ranges, so training fails in the first "
-                "compressed layer. Select another implementation for both DSA operators, or set cp_size=1."
+                f"Context parallelism on Ascend/NPU requires {field} to be {allowed}; got {implementation!r}. "
+                "The CANN implementations serve CP's local-query/global-KV layout; set it in "
+                "configs/text/deepseek_v4_npu.yaml, or set cp_size=1."
             )
