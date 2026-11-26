@@ -386,15 +386,10 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         swiglu_limit=None,
         assume_distinct_experts=False,
         activation="silu",
-        use_mxfp8=False,
     ):
         """Scatter, merged fc1 GEMM, gated activation, fc2, gather."""
         from ..shared.dispatch import expert_histogram, moe_gather, moe_scatter
         from ..shared.group_gemm import group_gemm_same_nk, same_nk_tile_schedule
-
-        ctx.use_mxfp8 = use_mxfp8
-        if use_mxfp8:
-            from ..shared.mxfp8_group_gemm import mxfp8_group_gemm
 
         splits = expert_histogram(expert_index, num_experts)
         _, scatter_index = compute_expert_scatter_index(expert_index)
@@ -407,22 +402,17 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         max_expert_tokens = compute_max_expert_tokens(expert_index, expert_index.shape[1], assume_distinct_experts)
 
         # Single fc1 gemm: output shape [T, 2I]
-        tile_cumsum, tile_total_M = (
-            (None, None) if use_mxfp8 else same_nk_tile_schedule(cumsum_t, scatter_output.shape[0])
+        tile_cumsum, tile_total_M = same_nk_tile_schedule(cumsum_t, scatter_output.shape[0])
+        fc1_output = group_gemm_same_nk(
+            a=scatter_output,
+            b=fc1_1_2_weight,
+            cumsum_M=cumsum_t,
+            max_M=max_expert_tokens,
+            tile_cumsum=tile_cumsum,
+            transpose_a=False,
+            transpose_b=True,
+            tile_total_M=tile_total_M,
         )
-        if use_mxfp8:
-            fc1_output = mxfp8_group_gemm(scatter_output, fc1_1_2_weight, cumsum_t)
-        else:
-            fc1_output = group_gemm_same_nk(
-                a=scatter_output,
-                b=fc1_1_2_weight,
-                cumsum_M=cumsum_t,
-                max_M=max_expert_tokens,
-                tile_cumsum=tile_cumsum,
-                transpose_a=False,
-                transpose_b=True,
-                tile_total_M=tile_total_M,
-            )
 
         # chunk is a view, no copy
         fc1_1_output, fc1_2_output = fc1_output.chunk(2, dim=-1)
@@ -447,19 +437,16 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
         scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
 
-        if use_mxfp8:
-            fc2_output = mxfp8_group_gemm(fc1_activation, fc2_weight, cumsum_t)
-        else:
-            fc2_output = group_gemm_same_nk(
-                a=fc1_activation,
-                b=fc2_weight,
-                cumsum_M=cumsum_t,
-                max_M=max_expert_tokens,
-                tile_cumsum=tile_cumsum,
-                transpose_a=False,
-                transpose_b=True,
-                tile_total_M=tile_total_M,
-            )
+        fc2_output = group_gemm_same_nk(
+            a=fc1_activation,
+            b=fc2_weight,
+            cumsum_M=cumsum_t,
+            max_M=max_expert_tokens,
+            tile_cumsum=tile_cumsum,
+            transpose_a=False,
+            transpose_b=True,
+            tile_total_M=tile_total_M,
+        )
         fc2_weighted_output = fc2_output * scattered_gate_weight
 
         expert_output = moe_gather(fc2_weighted_output, scatter_index)
@@ -509,9 +496,6 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             mask_fc1_2,
             tile_cumsum,
         ) = ctx.saved_tensors
-        if ctx.use_mxfp8:
-            from ..shared.mxfp8_group_gemm import mxfp8_group_gemm, mxfp8_group_wgrad
-
         tile_total_M = ctx.tile_prefix_total
         swiglu_limit = ctx.swiglu_limit
         max_expert_tokens = ctx.max_expert_tokens
@@ -536,18 +520,15 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         del fc2_output, grad_unweighted_output, grad_scattered_gate_weight, scattered_gate_weight
 
         # MOE Step 9 - dgrad
-        if ctx.use_mxfp8:
-            grad_fc1_activation = mxfp8_group_gemm(grad_fc2_output, fc2_weight.transpose(1, 2).contiguous(), cumsum_t)
-        else:
-            grad_fc1_activation = group_gemm_same_nk(
-                a=grad_fc2_output,
-                b=fc2_weight,
-                cumsum_M=cumsum_t,
-                max_M=max_expert_tokens,
-                tile_cumsum=tile_cumsum,
-                transpose_b=False,
-                tile_total_M=tile_total_M,
-            )
+        grad_fc1_activation = group_gemm_same_nk(
+            a=grad_fc2_output,
+            b=fc2_weight,
+            cumsum_M=cumsum_t,
+            max_M=max_expert_tokens,
+            tile_cumsum=tile_cumsum,
+            transpose_b=False,
+            tile_total_M=tile_total_M,
+        )
 
         if is_silu(ctx.activation):
             fc1_activation, grad_fc1_output = swiglu.merged_swiglu_backward(
@@ -574,55 +555,44 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
         # MOE Step 9 - wgrad
         grad_fc2_weight = None
         if fc2_weight.requires_grad:
-            if ctx.use_mxfp8:
-                grad_fc2_weight = mxfp8_group_wgrad(grad_fc2_output, fc1_activation, cumsum_t)
-            else:
-                grad_fc2_weight = torch.empty_like(fc2_weight)
-                group_gemm_same_mn(
-                    a=grad_fc2_output,
-                    b=fc1_activation,
-                    c=grad_fc2_weight,
-                    cumsum_K=cumsum_t,
-                    max_K=num_scattered_tokens,
-                    transpose_a=True,
-                    transpose_b=False,
-                )
+            grad_fc2_weight = torch.empty_like(fc2_weight)
+            group_gemm_same_mn(
+                a=grad_fc2_output,
+                b=fc1_activation,
+                c=grad_fc2_weight,
+                cumsum_K=cumsum_t,
+                max_K=num_scattered_tokens,
+                transpose_a=True,
+                transpose_b=False,
+            )
         del fc1_activation, grad_fc2_output
 
         # MOE Step 4 - single dgrad for merged fc1
-        if ctx.use_mxfp8:
-            grad_scatter_output = mxfp8_group_gemm(
-                grad_fc1_output, fc1_1_2_weight.transpose(1, 2).contiguous(), cumsum_t
-            )
-        else:
-            grad_scatter_output = group_gemm_same_nk(
-                a=grad_fc1_output,
-                b=fc1_1_2_weight,
-                cumsum_M=cumsum_t,
-                max_M=max_expert_tokens,
-                tile_cumsum=tile_cumsum,
-                transpose_b=False,
-                tile_total_M=tile_total_M,
-            )
+        grad_scatter_output = group_gemm_same_nk(
+            a=grad_fc1_output,
+            b=fc1_1_2_weight,
+            cumsum_M=cumsum_t,
+            max_M=max_expert_tokens,
+            tile_cumsum=tile_cumsum,
+            transpose_b=False,
+            tile_total_M=tile_total_M,
+        )
 
         # MOE Step 4 - single wgrad for merged fc1
         grad_fc1_1_2_weight = None
         if fc1_1_2_weight.requires_grad:
             # Reconstruct the routed input only when FC1 wgrad consumes it.
             scatter_output = moe_scatter(hidden_states, scatter_index)
-            if ctx.use_mxfp8:
-                grad_fc1_1_2_weight = mxfp8_group_wgrad(grad_fc1_output, scatter_output, cumsum_t)
-            else:
-                grad_fc1_1_2_weight = torch.empty_like(fc1_1_2_weight)
-                group_gemm_same_mn(
-                    a=grad_fc1_output,
-                    b=scatter_output,
-                    c=grad_fc1_1_2_weight,
-                    cumsum_K=cumsum_t,
-                    max_K=num_scattered_tokens,
-                    transpose_a=True,
-                    transpose_b=False,
-                )
+            grad_fc1_1_2_weight = torch.empty_like(fc1_1_2_weight)
+            group_gemm_same_mn(
+                a=grad_fc1_output,
+                b=scatter_output,
+                c=grad_fc1_1_2_weight,
+                cumsum_K=cumsum_t,
+                max_K=num_scattered_tokens,
+                transpose_a=True,
+                transpose_b=False,
+            )
             del scatter_output
         del grad_fc1_output
 
@@ -640,7 +610,6 @@ class MergedFc1TritonFusedMoeExpertFunction(torch.autograd.Function):
             None,  # swiglu_limit
             None,  # assume_distinct_experts
             None,  # activation
-            None,  # use_mxfp8
         )
 
 
@@ -656,8 +625,6 @@ def group_gemm_fused_moe_forward(
     swiglu_limit: float | None = None,
     assume_distinct_experts: bool = False,
     activation: str = "silu",
-    *,
-    use_mxfp8: bool = False,
 ):
     """Triton grouped-gemm fused MoE forward pass.
 
@@ -685,12 +652,7 @@ def group_gemm_fused_moe_forward(
     ``False`` uses ``T * top_k``. Eligible eager split/merged execution uses a
     device tile prefix without a host scalar read, including EP-local GEMMs.
     This flag does not change EP's original fallback row bounds.
-
-    ``use_mxfp8`` selects the opt-in merged EP1 path: both projections use
-    K32 E4M3/E8M0 GEMMs in forward, dgrad and wgrad.
     """
-    if use_mxfp8 and (get_parallel_state().ep_enabled or fc1_1_2_weight is None):
-        raise ValueError("Triton MXFP8 requires EP1 and merged gate/up weights")
     routing_weights = routing_weights.to(dtype=hidden_states.dtype)
     # EP comm is outside the Function so all2all is not under no_grad.
     if get_parallel_state().ep_enabled:
@@ -740,7 +702,6 @@ def group_gemm_fused_moe_forward(
                 swiglu_limit,
                 assume_distinct_experts,
                 activation,
-                use_mxfp8,
             )
         else:
             if fc1_1_weight is None or fc1_2_weight is None:

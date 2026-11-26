@@ -10,8 +10,7 @@ import torch
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.ops.kernels import moe_experts
-from veomni.ops.kernels.moe_experts.shared import dispatch
-from veomni.ops.kernels.moe_experts.shared import group_gemm as bf
+from veomni.ops.kernels.moe_experts.shared import mxfp8
 from veomni.ops.kernels.moe_experts.shared import mxfp8_group_gemm as mx
 from veomni.ops.kernels.moe_experts.standard import triton as grouped
 from veomni.ops.kernels.moe_experts.standard import triton_fp8
@@ -25,15 +24,21 @@ cpu = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_registry_and_recipe_constraints(monkeypatch):
     assert "fused_triton_fp8" in OP_REGISTRY.list_registered("moe_experts", "standard")
     assert "fused_triton_fp8" in moe_experts.QUANTIZING_IMPLS
+    monkeypatch.setattr(triton_fp8, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=False))
+    monkeypatch.setattr(mx, "_check_device", lambda *args: None)
     calls = []
-    monkeypatch.setattr(grouped, "group_gemm_fused_moe_forward", lambda *args, **kwargs: calls.append(kwargs))
-    x = torch.empty(1, 128, dtype=torch.bfloat16)
+    monkeypatch.setattr(triton_fp8, "_experts", lambda x, *args: calls.append(x) or x)
+    x = torch.ones(1, 128, dtype=torch.bfloat16)
     empty = x[:0]
-    triton_fp8.wrapper(x, x, x, empty, empty, x, x, num_experts=1)
-    assert calls[0]["use_mxfp8"] is True
+    idx = torch.zeros(1, 1, dtype=torch.int64)
+    gate = torch.ones(1, 1)
+    w1, w2 = x.new_empty(1, 256, 128), x.new_empty(1, 128, 128)
+    y = triton_fp8.wrapper(x, gate, idx, empty, empty, w2, w1, num_experts=1)
+    torch.testing.assert_close(y, x)
+    assert len(calls) == 1
     for kwargs in ({"dtype": "fp4"}, {"activation": "gelu"}):
         with pytest.raises(ValueError, match="FP8 and SiLU"):
-            triton_fp8.wrapper(x, x, x, empty, empty, x, x, num_experts=1, **kwargs)
+            triton_fp8.wrapper(x, gate, idx, empty, empty, w2, w1, num_experts=1, **kwargs)
 
 
 @pytest.mark.parametrize("ends,tokens", [([3, 2], 2), ([-1, 3], 3), ([1, 2], 3)])
@@ -70,13 +75,14 @@ def test_operand_validation():
 
 @cpu
 def test_rejects_ep_and_split_weights(monkeypatch):
-    args = (1, None, None, None, None, None, None)
-    monkeypatch.setattr(grouped, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=False))
+    empty = torch.empty(0)
+    args = (empty, empty, empty, empty, empty, empty, empty)
+    monkeypatch.setattr(triton_fp8, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=False))
     with pytest.raises(ValueError, match="merged"):
-        grouped.group_gemm_fused_moe_forward(*args, use_mxfp8=True)
-    monkeypatch.setattr(grouped, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=True))
+        triton_fp8.wrapper(*args, num_experts=1)
+    monkeypatch.setattr(triton_fp8, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=True))
     with pytest.raises(ValueError, match="EP1"):
-        grouped.group_gemm_fused_moe_forward(*args, torch.empty(1), use_mxfp8=True)
+        triton_fp8.wrapper(*args, num_experts=1)
 
 
 def _dequantize(x):
@@ -125,6 +131,7 @@ def test_grouped_gemm_and_wgrad_reference():
 def test_mxfp8_forward_backward(train_weights, monkeypatch):
     _require_sm10x()
     monkeypatch.setattr(grouped, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=False))
+    monkeypatch.setattr(triton_fp8, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=False))
     torch.manual_seed(42)
     counts = [3, 0, 129, 63]
     device = dict(device="cuda", dtype=torch.bfloat16)
@@ -138,7 +145,11 @@ def test_mxfp8_forward_backward(train_weights, monkeypatch):
     for use_mxfp8 in (False, True):
         inputs = [t.detach().requires_grad_(i < 2 or train_weights) for i, t in enumerate((x, gate, w1, w2))]
         xx, gg, a, b = inputs
-        y = grouped.group_gemm_fused_moe_forward(4, gg, indices, xx, None, None, b, a, use_mxfp8=use_mxfp8)
+        if use_mxfp8:
+            empty = xx.new_empty(0)
+            y = triton_fp8.wrapper(xx, gg, indices, empty, empty, b, a, num_experts=4)
+        else:
+            y = grouped.group_gemm_fused_moe_forward(4, gg, indices, xx, None, None, b, a)
         g = torch.autograd.grad(y, [t for t in inputs if t.requires_grad], dout)
         assert torch.isfinite(y).all() and all(torch.isfinite(t).all() for t in g)
         outputs[use_mxfp8], grads[use_mxfp8] = y, g
@@ -148,51 +159,70 @@ def test_mxfp8_forward_backward(train_weights, monkeypatch):
         assert all(not torch.equal(a, b) for a, b in zip(grads[False][2:], grads[True][2:]))
 
 
-@pytest.mark.parametrize("use_mxfp8", [False, True])
 @pytest.mark.parametrize("train_weights", [True, False])
+@pytest.mark.parametrize("train_inputs", [True, False])
+@pytest.mark.parametrize("limit", [None, 0.1])
 @cpu
-def test_full_mxfp8_dispatch_on_cpu(use_mxfp8, train_weights, monkeypatch):
-    """Exercise the real autograd function with CPU GEMM/scatter stand-ins."""
-    calls = {"mx_gemm": 0, "mx_wgrad": 0, "bf_gemm": 0, "bf_wgrad": 0}
+def test_composed_mxfp8_gradients_on_cpu(train_weights, train_inputs, limit, monkeypatch):
+    """Check actual grouped-linear nodes and routing against an independent BF16 graph.
 
-    def bf_gemm(a, b, transpose_b=True, **kwargs):
-        calls["bf_gemm"] += 1
-        return a @ (b[0].T if transpose_b else b[0])
-
-    def bf_wgrad(a, b, c, **kwargs):
-        calls["bf_wgrad"] += 1
-        c.copy_(a.T @ b)
+    Substitute only the hardware GEMMs with BF16 grouped products. Routing,
+    activation/clamp, gradient selection and composition remain production code.
+    Duplicate routes and an empty expert exercise parameter-gradient accumulation.
+    """
+    calls = {"gemm": 0, "wgrad": 0}
 
     def mx_gemm(a, b, ends):
-        calls["mx_gemm"] += 1
-        return a @ b[0].T
+        calls["gemm"] += 1
+        counts = torch.diff(ends, prepend=ends.new_zeros(1)).tolist()
+        return torch.cat([x @ w.T for x, w in zip(a.split(counts), b)])
 
     def mx_wgrad(a, b, ends):
-        calls["mx_wgrad"] += 1
-        return (a.T @ b).unsqueeze(0)
+        calls["wgrad"] += 1
+        counts = torch.diff(ends, prepend=ends.new_zeros(1)).tolist()
+        return torch.stack([dy.T @ x for dy, x in zip(a.split(counts), b.split(counts))])
 
-    monkeypatch.setattr(bf, "group_gemm_same_nk", bf_gemm)
-    monkeypatch.setattr(bf, "group_gemm_same_mn", bf_wgrad)
-    monkeypatch.setattr(dispatch, "moe_scatter", lambda x, index: x)
-    monkeypatch.setattr(dispatch, "moe_gather", lambda x, index: x)
-    monkeypatch.setattr(dispatch, "expert_histogram", lambda index, n: torch.tensor([index.numel()]))
-    monkeypatch.setattr(bf, "same_nk_tile_schedule", lambda *args: (None, None))
-    monkeypatch.setattr(mx, "mxfp8_group_gemm", mx_gemm)
-    monkeypatch.setattr(mx, "mxfp8_group_wgrad", mx_wgrad)
+    monkeypatch.setattr(mxfp8, "mxfp8_group_gemm", mx_gemm)
+    monkeypatch.setattr(mxfp8, "mxfp8_group_wgrad", mx_wgrad)
+    monkeypatch.setattr(mx, "_check_device", lambda *args: None)
+    monkeypatch.setattr(triton_fp8, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=False))
     torch.manual_seed(42)
-    inputs = [
-        torch.randn(3, 128, dtype=torch.bfloat16).requires_grad_(),
-        torch.ones(3, 1, dtype=torch.bfloat16).requires_grad_(),
-        (torch.randn(1, 256, 128, dtype=torch.bfloat16) / 16).requires_grad_(train_weights),
-        (torch.randn(1, 128, 128, dtype=torch.bfloat16) / 16).requires_grad_(train_weights),
+    sources = [
+        torch.randn(3, 128, dtype=torch.bfloat16),
+        torch.rand(3, 2),
+        torch.randn(3, 256, 128, dtype=torch.bfloat16) / 16,
+        torch.randn(3, 128, 128, dtype=torch.bfloat16) / 16,
     ]
+    indices = torch.tensor([[0, 0], [1, 0], [1, 1]])
+    flags = [train_inputs, True, train_weights, train_weights]
+    inputs = [t.detach().clone().requires_grad_(f) for t, f in zip(sources, flags)]
     x, gate, w1, w2 = inputs
-    args = (1, gate, torch.zeros(3, 1, dtype=torch.int64), x, w1, w2)
-    # The omitted optional argument also verifies the pre-MXFP8 direct-call API.
-    y = grouped.MergedFc1TritonFusedMoeExpertFunction.apply(*args, *([None, False, "silu", True] if use_mxfp8 else []))
-    y.sum().backward()
-    assert all(torch.isfinite(t.grad).all() for t in inputs if t.requires_grad)
-    assert calls["mx_gemm"] == (4 if use_mxfp8 else 0)
-    assert calls["bf_gemm"] == 4 - calls["mx_gemm"]
-    assert calls["mx_wgrad"] == (2 if use_mxfp8 and train_weights else 0)
-    assert calls["bf_wgrad"] == (2 if not use_mxfp8 and train_weights else 0)
+    empty = x.new_empty(0)
+    y = triton_fp8.wrapper(x, gate, indices, empty, empty, w2, w1, num_experts=3, swiglu_limit=limit)
+    grads = torch.autograd.grad(y, [t for t in inputs if t.requires_grad], torch.ones_like(y))
+    assert calls == {
+        "gemm": 2 + int(train_inputs or train_weights) + int(train_inputs),
+        "wgrad": 2 * int(train_weights),
+    }
+
+    refs = [t.detach().clone().requires_grad_(f) for t, f in zip(sources, flags)]
+    xx, gg, a, b = refs
+    rows = []
+    for token in range(3):
+        slots = []
+        for slot in range(2):
+            expert = indices[token, slot]
+            projected = xx[token : token + 1] @ a[expert].T
+            g, u = projected.chunk(2, dim=-1)
+            if limit is not None:
+                g, u = g.clamp(max=limit), u.clamp(min=-limit, max=limit)
+            slots.append(((torch.nn.functional.silu(g) * u) @ b[expert].T) * gg.to(xx.dtype)[token, slot])
+        rows.append(torch.stack(slots).sum(0))
+    expected = torch.cat(rows)
+    expected_grads = torch.autograd.grad(expected, [t for t in refs if t.requires_grad], torch.ones_like(expected))
+    torch.testing.assert_close(y, expected, rtol=0.02, atol=0.003)
+    for actual, reference in zip(grads, expected_grads):
+        torch.testing.assert_close(actual, reference, rtol=0.03, atol=0.003)
+    if train_weights:
+        assert not grads[-1][2].count_nonzero()
+        assert not grads[-2][2].count_nonzero()
