@@ -33,6 +33,8 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import (
     MiniMaxH3Attention,
     VeomniRMSNorm,
     _PackedBounds,
+    patchify_video,
+    unpatchify_video,
 )
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
     MiniMaxH3DiTModel,
@@ -87,6 +89,15 @@ def _minimax_h3_inputs(cond_rows: int) -> dict:
         "packed_seq_params": {"cu_seqlens_q": torch.tensor([0, seq_len]), "max_seqlen_q": seq_len},
         "refiner_packed_seq_params": {"cu_seqlens_q": torch.tensor([0, 1]), "max_seqlen_q": 1},
     }
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_minimax_h3_patchify_matches_legacy_multiframe_layout():
+    latents = torch.arange(2 * 24 * 3 * 16 * 12, dtype=torch.float32).reshape(2, 24, 3, 16, 12)
+    legacy_rows = torch.einsum("nctrhpwq->nthwcrpq", latents.reshape(2, 24, 3, 1, 8, 2, 6, 2)).reshape(-1, 96)
+    rows = patchify_video(latents)
+    assert torch.equal(rows, legacy_rows)
+    assert torch.equal(unpatchify_video(rows, 3, 16, 12), latents)
 
 
 def test_minimax_h3_condition_builds_from_registered_class_without_assets():

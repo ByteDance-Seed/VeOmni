@@ -780,14 +780,11 @@ def parallelize_model_fsdp2(
             fsdp_mode=parallel_state.dp_mode,
             any_extra_parallel_enabled=parallel_state.any_extra_parallel_enabled,
             enable_reshard_after_forward=enable_reshard_after_forward,
+            sequence_parallel_enabled=parallel_state.sp_enabled,
+            async_parallel_enabled=bool(parallel_state.async_enabled),
         )
 
-        compiled_count = compile_decoder_blocks(
-            model,
-            compile_config,
-            sequence_parallel_enabled=parallel_state.sp_enabled,
-            async_enabled=parallel_state.async_enabled,
-        )
+        compiled_count = compile_decoder_blocks(model, compile_config)
         if compiled_count == 0:
             raise RuntimeError("model.accelerator.torch_compile.enable found no decoder blocks to compile.")
         model._veomni_compile_enabled = True
@@ -1222,6 +1219,8 @@ def build_parallelize_model(
     expert_fsdp_shard_dim: Optional[int] = None,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
+    freeze_ple_embeddings: bool = False,
+    frozen_ple_dtype: Optional[str] = None,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -1238,7 +1237,18 @@ def build_parallelize_model(
             enabled gradient checkpointing and before FSDP2 shards the blocks.
         expert_weight_fp8_all_gather: Gather weights of actual DeepGEMM experts in FP8.
             Ignored when the model contains no matching experts.
+        freeze_ple_embeddings: Freeze Qwen4-Exp PLE n-gram tables before parallelization.
+        frozen_ple_dtype: Optional storage dtype (``"float32"`` or ``"bfloat16"``) applied
+            to frozen PLE tables after parallelization and weight loading.
     """
+    from ..models.frozen_ple import validate_frozen_ple_config
+
+    validate_frozen_ple_config(
+        freeze_ple_embeddings,
+        frozen_ple_dtype,
+        enable_fsdp_offload=bool(kwargs.get("enable_fsdp_offload", False)),
+    )
+
     parallel_state = get_parallel_state()
     reject_qat_without_native_bf16(model)
     validate_expert_fsdp_shard_dim(expert_fsdp_shard_dim, fsdp_mode=parallel_state.dp_mode)
@@ -1271,6 +1281,14 @@ def build_parallelize_model(
             "MixedPrecisionPolicy requires the FSDP2 wrap, so without it weights would stay in FP32. "
             "Set fsdp_config.mixed_precision.enable=false."
         )
+
+    if freeze_ple_embeddings:
+        from ..models.frozen_ple import freeze_ple_embeddings as _freeze_ple_embeddings
+        from ..models.frozen_ple import has_frozen_ple_embeddings
+
+        if not has_frozen_ple_embeddings(model):
+            count = _freeze_ple_embeddings(model)
+            logger.info_rank0("Frozen PLE: %d tables", count)
 
     if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
         model = model.float()
@@ -1360,5 +1378,11 @@ def build_parallelize_model(
         raise RuntimeError(
             "model.accelerator.torch_compile.enable requires FSDP2; compile without FSDP is not supported."
         )
+
+    if freeze_ple_embeddings:
+        from ..models.frozen_ple import prepare_ple_storage
+        from ..utils.device import get_device_type
+
+        prepare_ple_storage(model, frozen_ple_dtype, expected_device=get_device_type())
 
     return model

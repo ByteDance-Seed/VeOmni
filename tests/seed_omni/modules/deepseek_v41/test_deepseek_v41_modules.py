@@ -150,6 +150,15 @@ def tiny_llm_config(**overrides) -> DeepseekV41LlmConfig:
         dsa_indexer_loss=True,
         weight_quantization=None,
         image_token_id=4,
+        ops_implementation={
+            "mhc_implementation": "eager",
+            "moe_implementation": "eager",
+            "rms_norm_implementation": "eager",
+            "gated_mlp_implementation": "eager",
+            "linear_implementation": "eager",
+            "kv_round_implementation": "eager",
+            "dsa_indexer_implementation": "eager",
+        },
         rope_scaling={
             "rope_type": "yarn",
             "factor": 1.0,
@@ -202,6 +211,7 @@ def tiny_text_config() -> DeepseekV41TextEncoderConfig:
         dspark_noise_token_id=31,
         pad_token_id=PAD,
         image_token_id=4,
+        ops_implementation={"cross_entropy_loss_implementation": "chunk_loss"},
     )
 
 

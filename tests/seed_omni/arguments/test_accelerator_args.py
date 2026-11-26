@@ -248,22 +248,78 @@ def test_ddp_cpu_init_is_enforced_at_construction():
         AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="ddp"), init_device="cpu")
 
 
-def test_validate_omni_accelerator_bans_torch_compile():
-    acc = AcceleratorConfig(torch_compile=TorchCompileConfig(enable=True))
+def test_validate_omni_accelerator_allows_torch_compile():
+    """``torch_compile`` is the switch; what compiles is decided by the config."""
+    _validate_omni_accelerator(AcceleratorConfig(torch_compile=TorchCompileConfig(enable=True)))
+
+
+@pytest.mark.parametrize(
+    ("compile_overrides", "accelerator_overrides"),
+    [
+        ({"backend": "cudagraphs"}, {}),
+        ({"mode": "reduce-overhead"}, {}),
+        # torch turns on Triton graph capture for this mode too, while
+        # ``max-autotune-no-cudagraphs`` deliberately does not.
+        ({"mode": "max-autotune"}, {}),
+        ({}, {"ulysses_size": 2}),
+        ({}, {"cp_size": 2}),
+        ({}, {"enable_async": True}),
+    ],
+)
+def test_validate_omni_accelerator_refuses_the_combinations_the_composed_path_cannot_run(
+    compile_overrides, accelerator_overrides
+):
+    """CUDA Graph replay needs a per-step mark the composed trainer does not make,
+    and Ulysses slices activations the graph edges reorder.
+
+    ``SimpleNamespace`` rather than an ``AcceleratorConfig``: the dataclass checks
+    the mesh in ``__post_init__``, which would reject a 2-way SP size at world
+    size 1 before the check under test runs.
+    """
+    acc = SimpleNamespace(
+        torch_compile=TorchCompileConfig(enable=True, **compile_overrides),
+        ulysses_size=accelerator_overrides.get("ulysses_size", 1),
+        cp_size=accelerator_overrides.get("cp_size", 1),
+        enable_async=accelerator_overrides.get("enable_async", False),
+    )
+
     with pytest.raises(ValueError, match="torch_compile"):
         _validate_omni_accelerator(acc)
 
 
-def test_omni_arguments_post_init_validates_the_top_level_default():
-    with pytest.raises(ValueError, match="torch_compile"):
-        OmniArguments(
-            model=OmniModelRuntimeArguments(
-                model_path="/tmp/fake_omni",
-                accelerator=AcceleratorConfig(torch_compile=TorchCompileConfig(enable=True)),
-            ),
-            data=OmniDataArguments(train_path=""),
-            infer=OmniInferArguments(),
-        )
+def test_validate_omni_accelerator_allows_max_autotune_without_cudagraphs():
+    """The no-cudagraphs spelling of max-autotune stays available."""
+    acc = SimpleNamespace(
+        torch_compile=TorchCompileConfig(enable=True, backend="inductor", mode="max-autotune-no-cudagraphs"),
+        ulysses_size=1,
+        cp_size=1,
+        enable_async=False,
+    )
+    _validate_omni_accelerator(acc)
+
+
+def test_validate_omni_accelerator_leaves_a_disabled_compile_alone():
+    """The SP / CUDA-graph checks only apply when compile is on."""
+    acc = SimpleNamespace(
+        torch_compile=TorchCompileConfig(enable=False),
+        ulysses_size=2,
+        cp_size=2,
+        enable_async=True,
+    )
+
+    _validate_omni_accelerator(acc)
+
+
+def test_omni_arguments_post_init_accepts_the_top_level_compile_switch():
+    """Enabling compile is a valid launcher setting; the per-module flag gates it."""
+    OmniArguments(
+        model=OmniModelRuntimeArguments(
+            model_path="/tmp/fake_omni",
+            accelerator=AcceleratorConfig(torch_compile=TorchCompileConfig(enable=True)),
+        ),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(),
+    )
 
 
 def test_omni_arguments_post_init_refuses_the_moe_router_monitor():
@@ -359,14 +415,24 @@ def test_build_omni_model_runtime_args_for_inference_forces_eager_without_broadc
 def test_build_omni_model_runtime_args_validates_each_module_accelerator():
     """A per-module override that fails `_validate_omni_accelerator` must raise at resolve time.
 
-    The top-level `model.accelerator` default passes validation on its own (no
-    `torch_compile.enable`); only the module override sets it, so this only
-    fails because `build_omni_model_runtime_args` validates every resolved module's own
-    `accelerator`, not just the top-level default.
+    The top-level `model.accelerator` default passes validation on its own; only
+    the module override sets an unsupported combination (compile + CUDA Graph
+    replay), so this only fails because `build_omni_model_runtime_args` validates
+    every resolved module's own `accelerator`, not just the top-level default.
     """
-    args = _fake_args(modules_override={MODULE_B: {"accelerator": {"torch_compile": {"enable": True}}}})
+    args = _fake_args(
+        modules_override={MODULE_B: {"accelerator": {"torch_compile": {"enable": True, "backend": "cudagraphs"}}}}
+    )
     with pytest.raises(ValueError, match="torch_compile"):
         build_omni_model_runtime_args(args)
+
+
+def test_build_omni_model_runtime_args_allows_a_per_module_compile_switch():
+    """Turning compile on for one module is valid; `module_compile_config` decides
+    at build time whether that module's resolved wrap can actually run it."""
+    args = _fake_args(modules_override={MODULE_B: {"accelerator": {"torch_compile": {"enable": True}}}})
+    resolved = build_omni_model_runtime_args(args)
+    assert resolved.modules[MODULE_B].accelerator.torch_compile.enable is True
 
 
 def test_build_omni_model_runtime_args_rejects_an_eager_module_under_the_composed_wrap():
@@ -375,6 +441,28 @@ def test_build_omni_model_runtime_args_rejects_an_eager_module_under_the_compose
     args = _fake_args(modules_override={MODULE_B: {"accelerator": {"fsdp_config": {"fsdp_mode": "eager"}}}})
     args.model.accelerator.fsdp_config.fsdp_scope = "model"
     with pytest.raises(ValueError, match=rf"fsdp_mode='eager': \['{MODULE_B}'\]"):
+        build_omni_model_runtime_args(args)
+
+
+def test_build_omni_model_runtime_args_rejects_a_module_compile_under_the_composed_wrap():
+    """``fsdp_scope='model'`` leaves no module able to compile.
+
+    The composed ``OmniModel`` owns the one wrap, so a module cannot wrap itself
+    inside it, and the parent cannot compile its children's blocks. Refusing at
+    resolve time keeps a per-module overlay from silently compiling nothing.
+    """
+    args = _fake_args(modules_override={MODULE_B: {"accelerator": {"torch_compile": {"enable": True}}}})
+    args.model.accelerator.fsdp_config.fsdp_scope = "model"
+    with pytest.raises(ValueError, match=rf"fsdp_scope='model'.*{MODULE_B}"):
+        build_omni_model_runtime_args(args)
+
+
+def test_build_omni_model_runtime_args_rejects_a_launcher_compile_under_the_composed_wrap():
+    """The launcher-level switch is refused under ``fsdp_scope='model'`` too."""
+    args = _fake_args()
+    args.model.accelerator.fsdp_config.fsdp_scope = "model"
+    args.model.accelerator.torch_compile.enable = True
+    with pytest.raises(ValueError, match=r"fsdp_scope='model'.*model\.accelerator"):
         build_omni_model_runtime_args(args)
 
 

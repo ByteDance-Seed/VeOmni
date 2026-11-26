@@ -90,6 +90,15 @@ def make_llm_config(**overrides) -> DeepseekV41LlmConfig:
         engram_max_ngram_size=4,
         engram_n_heads=2,
         engram_head_dim=8,
+        ops_implementation={
+            "mhc_implementation": "eager",
+            "moe_implementation": "eager",
+            "rms_norm_implementation": "eager",
+            "gated_mlp_implementation": "eager",
+            "linear_implementation": "eager",
+            "kv_round_implementation": "eager",
+            "dsa_indexer_implementation": "eager",
+        },
     )
     kwargs.update(overrides)
     return DeepseekV41LlmConfig(**kwargs)
@@ -149,6 +158,7 @@ class TestAcceleratedHooks:
         assert "deepseek_v41_vision" not in CONTEXT_PARALLEL_MODEL_TYPES
 
         state = type("PS", (), {"cp_enabled": False, "cp_size": 1, "ulysses_enabled": True, "ulysses_size": 4})()
+        monkeypatch.setattr(auto_module, "IS_NPU_AVAILABLE", False)
         monkeypatch.setattr(auto_module, "is_parallel_state_initialized", lambda: True)
         monkeypatch.setattr(auto_module, "get_parallel_state", lambda: state)
         check_context_parallel_supported(DeepseekV41VisionEncoderConfig())
@@ -215,7 +225,7 @@ def _tiny_vision_sp_config() -> DeepseekV41VisionEncoderConfig:
         max_image_tokens=64,
         min_pixels=16,
         out_hidden_size=_OUT_HIDDEN,
-        ops_implementation={"attn_implementation": "sdpa"},
+        ops_implementation={"attn_implementation": "sdpa", "rms_norm_implementation": "eager"},
     )
 
 

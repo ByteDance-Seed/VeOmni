@@ -610,9 +610,19 @@ class TorchCompileConfig:
         default=True,
         metadata={"help": "Whether to pass fullgraph=True to torch.compile."},
     )
-    dynamic: bool = field(
-        default=False,
-        metadata={"help": "Whether to pass dynamic=True to torch.compile."},
+    dynamic: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Whether to pass dynamic=True to torch.compile. Unset keeps torch's default: the first call "
+                "compiles a static graph and a shape change promotes it to a symbolic one covering the rest of "
+                "the run. Leave it unset. False is not the safe choice: with fullgraph=True a re-cache is a "
+                "hard failure, so one new shape per step raises FailOnRecompileLimitHit once "
+                "torch._dynamo.config.cache_size_limit (8) is exhausted. True survives a moving shape but pays "
+                "for it on the first call, and it breaks a custom autograd Function that chains two Triton "
+                "kernels (the fused-Triton MoE experts)."
+            )
+        },
     )
 
 

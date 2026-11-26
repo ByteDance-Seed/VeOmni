@@ -107,6 +107,15 @@ def llm_config():
         engram_max_ngram_size=4,
         engram_n_heads=2,
         engram_head_dim=32,
+        ops_implementation={
+            "mhc_implementation": "eager",
+            "moe_implementation": "eager",
+            "rms_norm_implementation": "eager",
+            "gated_mlp_implementation": "eager",
+            "linear_implementation": "eager",
+            "kv_round_implementation": "eager",
+            "dsa_indexer_implementation": "eager",
+        },
     )
 
 
