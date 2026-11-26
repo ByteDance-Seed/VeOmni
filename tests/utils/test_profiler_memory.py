@@ -110,6 +110,34 @@ def test_profiler_with_mem_context_manager_returns_wrapper_and_forwards_attrs(mo
 
 
 @pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_profiler_with_mem_disables_history_when_exit_or_stop_raises(monkeypatch):
+    """Allocator history is disabled via ``finally`` even when inner ``__exit__`` or ``stop`` raises."""
+    calls = []
+    memory = SimpleNamespace(_record_memory_history=lambda enabled="all": calls.append(enabled))
+    monkeypatch.setattr(helper, "get_torch_device", lambda: SimpleNamespace(memory=memory))
+
+    class _FailingProfiler(_ScheduledProfiler):
+        def stop(self):
+            raise RuntimeError("trace export failed")
+
+    wrapper_ctx = helper.ProfilerWithMem(_FailingProfiler(wait=0, warmup=0, active=1))
+    with pytest.raises(RuntimeError, match="trace export failed"):
+        with wrapper_ctx:
+            assert wrapper_ctx._recording is True
+    assert wrapper_ctx._recording is False
+    assert calls[-1] is None
+
+    calls.clear()
+    wrapper_stop = helper.ProfilerWithMem(_FailingProfiler(wait=0, warmup=0, active=1))
+    wrapper_stop.start()
+    assert wrapper_stop._recording is True
+    with pytest.raises(RuntimeError, match="trace export failed"):
+        wrapper_stop.stop()
+    assert wrapper_stop._recording is False
+    assert calls[-1] is None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_create_profiler_skips_memory_dump_when_profile_memory_false(monkeypatch, tmp_path):
     captured = {}
     dump_calls = []

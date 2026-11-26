@@ -285,16 +285,17 @@ class OmniTrainer:
 
         ``token_mean`` scales the summed DAG loss by each micro-batch's share of
         shifted supervised text tokens, which is only valid when the training
-        graph's terminal objective is a single ``TextEncoder.decode`` node.
-        Multi-objective graphs (e.g. Janus with image VQ loss, BAGEL with
-        flow-matching loss) and non-text graphs (e.g. Cosmos3) must use
-        ``sample_mean``.
+        graph's sole loss-producing objective is a single ``TextEncoder.decode``
+        node. Multi-objective graphs (e.g. Janus with image VQ loss, BAGEL with
+        flow-matching loss, Qwen3-MoE with router auxiliary loss) and non-text
+        graphs (e.g. Cosmos3) must use ``sample_mean``.
 
         Also detects decoders that shift each text item independently
         (``BagelTextEncoder``) rather than once per sample (``TextEncoder``) so
         :meth:`_count_supervised_tokens` uses the decoder's exact target count.
         """
         self._text_label_shift_mode = "per_sample"
+        self._token_mean_loss_node: str | None = None
         if getattr(self.args.train, "loss_reduction", "sample_mean") != "token_mean":
             return
         training_graph = getattr(getattr(model, "model", None), "training_graph", None)
@@ -321,6 +322,19 @@ class OmniTrainer:
                 f"train.loss_reduction='token_mean' requires a TextEncoder.decode sink; "
                 f"got {sink!r} ({type(raw_module).__name__}). Use train.loss_reduction='sample_mean' instead."
             )
+        for node in training_graph.execution_order:
+            if node == sink:
+                continue
+            node_method = training_graph.method_of(node)
+            node_module = unwrap_module_chain(model.get_module(training_graph.module_of(node)))
+            router_aux = getattr(node_module, "_router_aux_loss_enabled", None)
+            if node_method in ("decode", "decode_velocity") or (callable(router_aux) and router_aux()):
+                raise ValueError(
+                    f"train.loss_reduction='token_mean' only supports a single {sink!r} objective, "
+                    f"but node {node!r} ({type(node_module).__name__}) also produces a loss. "
+                    "Use train.loss_reduction='sample_mean' instead."
+                )
+        self._token_mean_loss_node = sink
         if isinstance(raw_module, BagelTextEncoder):
             self._text_label_shift_mode = "per_item"
 
@@ -659,6 +673,16 @@ class OmniTrainer:
         loss_dict: Dict[str, torch.Tensor] = result.get("losses", {})
         del result
         micro_batch.clear()
+
+        token_mean_node = getattr(self, "_token_mean_loss_node", None)
+        if token_mean_node is not None and loss_dict:
+            extra_loss_nodes = [name for name in loss_dict if name != token_mean_node]
+            if extra_loss_nodes:
+                raise ValueError(
+                    f"train.loss_reduction='token_mean' only supports a single {token_mean_node!r} objective, "
+                    f"but forward produced additional loss(es) from {extra_loss_nodes}. "
+                    "Use train.loss_reduction='sample_mean' instead."
+                )
 
         scale = 1.0 / num_micro_steps if backward_scale is None else backward_scale
 

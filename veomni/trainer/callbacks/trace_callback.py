@@ -199,12 +199,25 @@ def _trim_wandb_config_keys(obj: Any, prefix: str = "", max_len: int = 64) -> An
                 hoisted.append((full, v))
         return out
 
+    def _collect_paths(node: Dict[str, Any], cur_prefix: str, acc: set[str]) -> None:
+        for key_str, v in node.items():
+            full = f"{cur_prefix}.{key_str}" if cur_prefix else key_str
+            acc.add(full)
+            if isinstance(v, dict) and v:
+                _collect_paths(v, full, acc)
+
     result = _walk(obj, prefix)
     if hoisted:
-        root_reserved = set(result.keys())
+        # Reserve every root key AND nested dot-flattened path in ``result`` so a
+        # hoisted root key can never collide with a surviving nested path once W&B
+        # dot-flattens the config dict.
+        root_reserved: set[str] = set()
+        _collect_paths(result, "", root_reserved)
         root_budget = max(max_len - (len(prefix) + 1 if prefix else 0), 8)
+        prefix_head = f"{prefix}." if prefix else ""
         for full, v in hoisted:
-            result[_unique_trimmed_key(full, root_budget, root_reserved)] = v
+            rel_full = full[len(prefix_head) :] if prefix_head and full.startswith(prefix_head) else full
+            result[_unique_trimmed_key(rel_full, root_budget, root_reserved)] = v
     return result
 
 

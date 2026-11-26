@@ -835,9 +835,10 @@ class ProfilerWithMem:
         return self
 
     def __exit__(self, *a):
-        out = self._p.__exit__(*a)
-        self._set_recording(False)
-        return out
+        try:
+            return self._p.__exit__(*a)
+        finally:
+            self._set_recording(False)
 
     def _set_recording(self, enabled: bool) -> None:
         if enabled == self._recording:
@@ -866,9 +867,10 @@ class ProfilerWithMem:
         return out
 
     def stop(self):
-        out = self._p.stop()
-        self._set_recording(False)
-        return out
+        try:
+            return self._p.stop()
+        finally:
+            self._set_recording(False)
 
     def step(self, *a, **kw):
         out = self._p.step(*a, **kw)

@@ -93,7 +93,7 @@ step is therefore only the cursor, and its manifest
 `train.checkpoint.load_path: auto` finds it like any other step. Give the
 encoding run and the training run separate `train.checkpoint.output_dir`s:
 `auto` resumes the newest complete step in the directory, and
-[`OmniTrainer.load`](../../../veomni/trainer/omni/omni_trainer.py#L445) refuses a
+[`OmniTrainer.load`](../../../veomni/trainer/omni/omni_trainer.py#L459) refuses a
 step whose manifest disagrees with the run on carrying model state. A resume of that
 task restores the dataloader cursor and the cache writer's position together,
 both through `GlobalStateCallback`:
@@ -289,7 +289,7 @@ The result:
   because `online_process` still runs every step.
 
 The pieces that complete this workflow are in place:
-[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L797)
+[`OmniTrainer.offline_cache_step`](../../../veomni/trainer/omni/omni_trainer.py#L821)
 runs the encoding run, and
 [`SeedOmniOfflineCacheWriter.save_conversation_list`](../../../veomni/models/seed_omni/utils/offline_cache.py#L181)
 persists each conversation of the `conversation_list` that

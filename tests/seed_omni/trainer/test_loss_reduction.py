@@ -110,31 +110,64 @@ def test_validate_loss_reduction_accepts_single_text_decoder_and_rejects_multi_o
     class _FakeImageHead:
         pass
 
+    class _FakeBackbone:
+        def __init__(self, *, router_aux: bool = False):
+            self._router_aux = router_aux
+
+        def _router_aux_loss_enabled(self) -> bool:
+            return self._router_aux
+
     def _runtime(edges, modules):
         return SimpleNamespace(
             model=SimpleNamespace(training_graph=TrainingGraph(edges)),
             get_module=lambda name: modules[name],
         )
 
-    # Single TextEncoder.decode sink -> accepted with per_sample shift.
+    # Single TextEncoder.decode sink with non-loss-producing backbone -> accepted with per_sample shift.
     trainer = _trainer_with(loss_reduction="token_mean")
     trainer._validate_loss_reduction(
         _runtime(
             [{"from": "llm", "to": "text_enc.decode"}, {"from": "text_enc.decode", "to": "end"}],
-            {"text_enc": _FakeTextEncoder()},
+            {"llm": _FakeBackbone(router_aux=False), "text_enc": _FakeTextEncoder()},
         )
     )
     assert trainer._text_label_shift_mode == "per_sample"
+    assert trainer._token_mean_loss_node == "text_enc.decode"
 
     # Single BagelTextEncoder.decode sink -> accepted with per_item shift.
     trainer_bagel = _trainer_with(loss_reduction="token_mean")
     trainer_bagel._validate_loss_reduction(
         _runtime(
             [{"from": "mot", "to": "bagel_text.decode"}, {"from": "bagel_text.decode", "to": "end"}],
-            {"bagel_text": _FakeBagelTextEncoder()},
+            {"mot": _FakeBackbone(), "bagel_text": _FakeBagelTextEncoder()},
         )
     )
     assert trainer_bagel._text_label_shift_mode == "per_item"
+    assert trainer_bagel._token_mean_loss_node == "bagel_text.decode"
+
+    # Mid-graph MoE LLM with router auxiliary loss enabled -> rejected.
+    trainer_moe = _trainer_with(loss_reduction="token_mean")
+    with pytest.raises(ValueError, match="also produces a loss"):
+        trainer_moe._validate_loss_reduction(
+            _runtime(
+                [{"from": "llm", "to": "text_enc.decode"}, {"from": "text_enc.decode", "to": "end"}],
+                {"llm": _FakeBackbone(router_aux=True), "text_enc": _FakeTextEncoder()},
+            )
+        )
+
+    # Mid-graph decode node feeding into the text sink -> rejected.
+    trainer_mid_decode = _trainer_with(loss_reduction="token_mean")
+    with pytest.raises(ValueError, match="also produces a loss"):
+        trainer_mid_decode._validate_loss_reduction(
+            _runtime(
+                [
+                    {"from": "llm", "to": "vqvae.decode"},
+                    {"from": "vqvae.decode", "to": "text_enc.decode"},
+                    {"from": "text_enc.decode", "to": "end"},
+                ],
+                {"llm": _FakeBackbone(), "vqvae": _FakeImageHead(), "text_enc": _FakeTextEncoder()},
+            )
+        )
 
     # Multi-objective graph (e.g. Janus text + VQ image head) -> rejected.
     trainer_multi = _trainer_with(loss_reduction="token_mean")
@@ -147,7 +180,7 @@ def test_validate_loss_reduction_accepts_single_text_decoder_and_rejects_multi_o
                     {"from": "text_enc.decode", "to": "end"},
                     {"from": "vqvae.decode", "to": "end"},
                 ],
-                {"text_enc": _FakeTextEncoder(), "vqvae": _FakeImageHead()},
+                {"llm": _FakeBackbone(), "text_enc": _FakeTextEncoder(), "vqvae": _FakeImageHead()},
             )
         )
 
@@ -157,9 +190,33 @@ def test_validate_loss_reduction_accepts_single_text_decoder_and_rejects_multi_o
         trainer_nontext._validate_loss_reduction(
             _runtime(
                 [{"from": "mot", "to": "flow.decode_velocity"}, {"from": "flow.decode_velocity", "to": "end"}],
-                {"flow": _FakeImageHead()},
+                {"mot": _FakeBackbone(), "flow": _FakeImageHead()},
             )
         )
+
+
+def test_forward_backward_step_rejects_unexpected_extra_loss_under_token_mean():
+    """Defense-in-depth: runtime forward emitting a second loss under ``token_mean`` fails before backward."""
+    from contextlib import nullcontext
+
+    trainer = _trainer_with(loss_reduction="token_mean")
+    trainer._token_mean_loss_node = "text_enc.decode"
+    trainer.args.train.enable_batch_invariant_mode = False
+    trainer.model_fwd_context = nullcontext()
+    trainer.model_bwd_context = nullcontext()
+    trainer.preforward = lambda mb: mb
+
+    param = torch.nn.Parameter(torch.tensor(1.0))
+    trainer.model = SimpleNamespace(
+        forward=lambda mb: {
+            "loss": param * 2.0,
+            "losses": {"text_enc.decode": param * 1.5, "llm.forward": param * 0.5},
+        }
+    )
+
+    with pytest.raises(ValueError, match="additional loss"):
+        trainer.forward_backward_step({}, num_micro_steps=1, backward_scale=1.0)
+    assert param.grad is None
 
 
 def test_count_supervised_tokens_matches_the_models_causal_shift():

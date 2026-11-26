@@ -467,6 +467,17 @@ def test_trim_wandb_config_keys_caps_nested_dot_flattened_length():
     assert set(flat_inline.values()) == {"kept", True, "bf16"}
     assert all(len(k) <= 64 for k in flat_inline)
 
+    # Hoisted deep-path keys must not collide with surviving nested dot-flattened paths.
+    hoisted_full = f"a.{'p' * 64}.x"
+    alias = f"{'p' * 55}_{hashlib.sha1(hoisted_full.encode()).hexdigest()[:6]}"
+    hoist_collision = trim({"a": {"p" * 64: {"x": 1}, alias: 2}}, max_len=64)
+    assert hoist_collision["a"][alias] == 2
+    flat_hoist_collision = _flatten(hoist_collision)
+    assert len(flat_hoist_collision) == 2
+    assert flat_hoist_collision[f"a.{alias}"] == 2
+    assert set(flat_hoist_collision.values()) == {1, 2}
+    assert all(len(k) <= 64 for k in flat_hoist_collision)
+
     # Distinct long keys sharing a prefix AND a later short sibling whose name equals
     # the first key's deterministic hash candidate must all survive without overwriting.
     parent = "p" * 55

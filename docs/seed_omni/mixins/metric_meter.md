@@ -100,12 +100,12 @@ and stored as `trainer.environ_meter`.
 
 ## Lifecycle of one training step
 
-- [`OmniTrainer.train_step`](../../../veomni/trainer/omni/omni_trainer.py#L716)
-  - [`on_step_begin`](../../../veomni/trainer/omni/omni_trainer.py#L723) →
+- [`OmniTrainer.train_step`](../../../veomni/trainer/omni/omni_trainer.py#L740)
+  - [`on_step_begin`](../../../veomni/trainer/omni/omni_trainer.py#L747) →
     [`OmniStepMetricsCallback.on_step_begin`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L64)
     - [`OmniEnvironMeter.add(micro_batch)`](../../../veomni/utils/omni_helper.py#L123) for each micro-batch: sample count, `ds_idx`.
     - [`start_time = time.time()`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L67)
-  - For each micro-batch: [`forward_backward_step`](../../../veomni/trainer/omni/omni_trainer.py#L630) →
+  - For each micro-batch: [`forward_backward_step`](../../../veomni/trainer/omni/omni_trainer.py#L644) →
     [`OmniModel.forward`](../../../veomni/models/seed_omni/modeling_omni.py#L516) →
     [`TrainNodeRunner`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L78) →
     [`execute_train_node`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L27), for each node:
@@ -113,15 +113,15 @@ and stored as `trainer.environ_meter`.
       - Module code: `self.metric_meter_set_seqlens(method, full_lengths)`, before the SP slice.
     - [`raw.metric_meter_add(method)`](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L66): moves the stash for this `method` into the step buffer and clears the rest.
     - [Endpoint](../../../veomni/models/seed_omni/accelerated/utils/executor.py#L68), then `post_forward`.
-  - [`clip_grad_norm` / `optimizer.step` / `lr_scheduler.step`](../../../veomni/trainer/omni/omni_trainer.py#L778)
-  - [`on_step_end`](../../../veomni/trainer/omni/omni_trainer.py#L795) →
+  - [`clip_grad_norm` / `optimizer.step` / `lr_scheduler.step`](../../../veomni/trainer/omni/omni_trainer.py#L802)
+  - [`on_step_end`](../../../veomni/trainer/omni/omni_trainer.py#L819) →
     [`OmniStepMetricsCallback.on_step_end`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L69)
     - [`delta_time = time.time() - start_time`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L72)
     - [`OmniModelRuntime.metric_meter_collect()`](../../../veomni/models/seed_omni/accelerated/omni_model/omni_model_runtime.py#L596) →
       per metered module [`(estimate_flops(buffer), buffer)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L150); buffer reset.
     - [`OmniEnvironMeter.step(delta_time, global_step, module_metrics)`](../../../veomni/utils/omni_helper.py#L145)
     - [`trainer.step_env_metrics = ...`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L115),
-      logged by [`WandbTraceCallback`](../../../veomni/trainer/callbacks/trace_callback.py#L234).
+      logged by [`WandbTraceCallback`](../../../veomni/trainer/callbacks/trace_callback.py#L247).
 
 `delta_time` covers every micro-batch's forward and backward plus the optimizer
 step. Metering only happens through `TrainNodeRunner`: calling
