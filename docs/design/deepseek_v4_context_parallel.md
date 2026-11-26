@@ -239,10 +239,8 @@ over a 75-row table and a 513-row table: the width is exercised both wider and
 narrower than the table. In the validation run (`max_seq_len: 4096`,
 `cp_size: 2`) the two ranks hold 2048 query rows each, but their narrowed
 compressed tables are 512 and 1024 rows: rank 0's 512-wide selection spans its
-table while rank 1's does not. The loss comparisons above run that pair, and also
-the shipped `max_seq_len: 8192`, where both ranks are wide-table (1024 and 2048
-rows); the tensor parity case on a 513-row table covers the wide-table branch on
-its own.
+table while rank 1's does not, so the same step covers both branches; the
+513-row parity case covers the wide-table branch on its own.
 
 ## Decisions that took more than one attempt
 
