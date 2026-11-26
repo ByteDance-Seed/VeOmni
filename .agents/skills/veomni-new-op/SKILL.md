@@ -5,166 +5,60 @@ description: "Add or optimize a tensor-level kernel in veomni/ops, register its 
 
 ## Before You Start
 
-1. Read `.agents/knowledge/constraints.md`, especially device guards and multi-backend `modeling_<m>.py` rules.
-2. Read `veomni/ops/README.md` and `docs/design/op_selection.md`.
+1. Read `.agents/knowledge/constraints.md` (and `.agents/knowledge/topics/qat_and_ops.md` if touching QAT / low-precision / activations).
+2. Read `veomni/ops/README.md` and `docs/design/op_selection.md` (and `docs/design/module_config.md` for config ownership).
 3. Inspect the closest family under `veomni/ops/kernels/` and its tests under `tests/ops/`.
 
 ## Ops Architecture
 
-`veomni.ops.OP_REGISTRY` is the tensor-kernel source of truth. Each
-row has the identity `(op, variant, implementation, device)`. Callers
-select the public `(op, variant, implementation)` triple; the registry
-derives the device from the row's `KernelRequirement` and resolves the current
-device before a device-agnostic row.
+- `veomni.ops.OP_REGISTRY` keys rows by `(op, variant, implementation, device)`. Callers select `(op, variant, implementation)`; the registry derives device from `KernelRequirement` and resolves the current device before device-agnostic rows.
+- Each row provides **exactly one** form:
+  - Raw `forward` + `backward` (`forward` returns `(output, SavedState)`; `backward` returns one grad per positional tensor input; tensors positional, non-tensor attrs by keyword) → registry builds `torch.autograd.Function`.
+  - Opaque `wrapper` (eager PyTorch or library API owning its own autograd).
+- **Variant** = tensor contract / model geometry; **implementation** = backend (`eager` is an implementation under every variant, never a variant).
+- Modeling constructs instance-local `VeomniOp` handles from `self.config.ops_config.<field>` (public CLI/YAML field: `model.ops_implementation`). Keep input normalization, HF signatures, and loss policy in `veomni/models/`, never in the tensor registry.
+- Separate mechanisms only when required: `veomni/ops/batch_invariant/` (opt-in deterministic ATen patch), `veomni/ops/install.py` (idempotent process-wide third-party registration), `veomni/distributed/hccl_premul_sum.py` (NPU collective compat).
 
-A row provides exactly one of these forms:
+## Workflow
 
-- raw `forward` and `backward` functions, from which the registry generates a
-  `torch.autograd.Function` wrapper; or
-- an opaque `wrapper` for eager PyTorch or a library API that already owns its
-  autograd behavior.
-
-For a raw pair, `forward` returns `(output, SavedState)` and `backward` returns
-one gradient entry per positional tensor input. Pass tensors positionally and
-non-tensor attributes by keyword.
-
-Model classes construct an instance-local `VeomniOp` handle and call it
-directly. Input normalization, HuggingFace-compatible signatures, and loss
-policy belong in `veomni/models/`; do not add consumer-specific adapters
-to the registry. The public CLI/YAML field remains
-`model.ops_implementation`, while model builders receive it through the
-`ops_implementation` keyword.
-
-Use these separate mechanisms only when their semantics require them:
-
-- `veomni/ops/batch_invariant/` for the opt-in ATen patch controlled by
-  `set_batch_invariant_mode(...)`;
-- `veomni/ops/install.py` for idempotent process-wide integrations such as
-  registration with a third-party framework;
-- `veomni/distributed/hccl_premul_sum.py` for the NPU collective compatibility
-  patch used by distributed ExtraParallel code.
-
-## Phase 1: Design
-
-1. Define the stable tensor contract and decide whether consumer-specific
-   preprocessing belongs in `models`.
-2. Choose the op name, semantic variant, implementation name, and device
-   requirement. A variant changes the tensor contract; an implementation keeps
-   that contract and changes how it is computed.
-3. Decide whether the implementation is a raw pair or an opaque wrapper. Never
-   provide both forms for one row.
-4. If users must select it, add or extend the appropriate field in
-   `OpsImplementationConfig`. Preserve existing CLI/YAML field names.
-
-## Phase 2: Implement
-
-1. Create or extend a family under
-   `veomni/ops/kernels/<kernel_name>/`.
-2. Keep implementations in variant/device-oriented modules consistent with the
-   neighboring families.
-3. Register every row through `register_op`:
-
+### 1. Design & Implement
+1. Define the tensor contract, `(op, variant, implementation)`, device requirement, and form (raw pair vs wrapper). Extend `OpsImplementationConfig` only if users must select a new field.
+2. Add modules under `veomni/ops/kernels/<kernel_name>/` matching neighboring layout and register rows via `register_op`:
    ```python
    from veomni.ops import register_op
    from veomni.ops.platform import GpuKernelRequirement, NvidiaGpuPlatform
 
    register_op("example", "standard", "eager", wrapper=eager_example)
    register_op(
-       "example",
-       "standard",
-       "triton",
-       forward=triton_forward,
-       backward=triton_backward,
+       "example", "standard", "triton",
+       forward=triton_forward, backward=triton_backward,
        requirement=GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=80),)),
    )
    ```
+3. Import the family from `veomni/ops/kernels/__init__.py` so registration runs when `veomni.ops` is imported.
+4. For compound raw kernels, call nested raw `forward`/`backward` + `veomni/ops/compound.py` saved-state helpers (never the nested autograd wrapper).
+5. Lazy-import optional device packages and attach explicit `KernelRequirement`; unavailable explicit selections must **raise**, never silently fall back to `eager`.
+6. Bind instance-local `VeomniOp` handles in consuming models (`self.config.ops_config.<field>`). Never import a specific kernel module directly from `modeling_<m>.py`.
+7. Add English docstrings on module, module-level classes, public functions, and `forward`/`backward`/`wrapper`/`__call__` (gated by `tests/ops/base/test_op_documentation.py`).
 
-4. Import the family from `veomni/ops/kernels/__init__.py` so registration
-   happens when `veomni.ops` is imported.
-5. In each consuming model, construct a `VeomniOp` from
-   `config.ops_config.<field>` and store it on the model/module instance.
-6. For a compound raw kernel, call the nested row's raw `forward`/`backward`
-   and use the saved-state helpers in `veomni/ops/compound.py`; do not call
-   the nested autograd wrapper.
-7. Guard optional device packages and attach an explicit requirement. A
-   registered implementation must fail clearly when its requirement is not
-   satisfied; it must not silently fall back to eager.
-8. Add English module, module-level class, and public function docstrings.
-   Nested closures and ordinary `_private` helpers are not gated; `forward` /
-   `backward` / `wrapper` / `__call__` still are. Checked by
-   `tests/ops/base/test_op_documentation.py`.
-
-## Phase 3: Test
-
-1. Add tests under `tests/ops/<kernel_name>/` for:
-   - forward parity against an independent eager reference;
-   - backward parity for every differentiable input;
-   - dtype/shape/edge contracts;
-   - registration and device requirements;
-   - explicit failure for unknown or unavailable implementations.
-2. Put consumer-specific normalization and model wiring tests under
-   `tests/models/` instead of duplicating them in the raw-kernel suite.
-   Cover distinct variants and custom backward implementations separately,
-   including EP/non-EP and split/merged layouts when implemented. Standard
-   Quack and GPT-OSS Quack share GEMM but not the expert computation. An
-   EP-local compute test does not qualify token all-to-all; add a model/backend
-   E2E representative when that integrated path is new. Follow the
-   [new-model coverage policy](../../../docs/transformers_v5/testing_new_model.md)
-   for representative selection and capability exceptions.
-3. Run the family tests plus the registry and documentation guards:
-
-   GPU and NPU unit manifests select `tests/ops/`, with hardware prerequisites
-   and selection filters controlling individual cases. Check both manifests
-   before adding an entry; an already-collected case needs no workflow edit.
-
+### 2. Test
+1. Add tests under `tests/ops/<kernel_name>/` (auto-collected by GPU and NPU unit manifests) covering:
+   - Forward & backward parity against an independent eager reference for every differentiable input
+   - Dtype/shape/edge contracts, distinct variants, and EP/non-EP or split/merged layouts when applicable
+   - Registration, `KernelRequirement`, explicit failure on unknown/unavailable impls, and `torch.compile` inference mode (especially for 1-tensor ops)
+2. Put model wiring / normalization tests under `tests/models/` (and E2E representative in `tests/e2e/test_e2e_parallel.py` when introducing a new integrated distributed path; see `docs/transformers_v5/testing_new_model.md`).
+3. Run:
    ```bash
    pytest -q tests/ops/<kernel_name>/ tests/ops/base/
    ```
 
-4. Add a benchmark only when performance is part of the acceptance criteria;
-   compare it with the canonical eager contract.
-
-## Phase 4: Document
-
-1. Update `veomni/ops/README.md` with the family, variants, and supported
-   implementations.
-2. Update `docs/design/op_selection.md` when selection behavior changes.
-3. Update `.agents/knowledge/architecture.md` when the layout or call chain
-   changes.
-
-## Phase 5: Finalize
-
-1. Run `/veomni-review`.
-2. Run `make quality` and the relevant kernel/model integration tests.
-3. Verify `OP_REGISTRY.list_registered(...)` and
-   `list_available(...)` report the expected rows.
+### 3. Document & Finalize
+1. Update `veomni/ops/README.md` (and `docs/design/op_selection.md` if selection semantics changed).
+2. Verify `OP_REGISTRY.list_registered(...)` and `list_available(...)`, run `make quality`, and run `/veomni-review` before opening the PR.
 
 ## Common Pitfalls
 
-- Confusing a semantic variant with an implementation backend.
-- Adding model-specific reshaping or reduction policy to the tensor registry.
-- Calling a nested autograd wrapper from a compound custom-autograd function.
-- Importing NPU/CUDA-only libraries without guards or requirements.
-- Registering a row without importing its family from `kernels/__init__.py`.
-- Letting an unavailable optimized implementation fall back silently.
-- Importing a specific kernel implementation module directly inside `modeling_<m>.py` instead of dispatching via `VeomniOp`.
-- Renaming `ops_implementation` while changing the internal kernel plumbing.
-
-## Configuration ownership
-
-Model ops selections belong to `VeOmniPretrainedConfig.ops_implementation`.
-Read `config.ops_config.<field>` when binding a handle. HF config methods are
-never patched globally; standalone module tests must construct an adapted config
-with `get_veomni_config_class` or opt in with `as_veomni_config`.
-Attention's HF accessors alias the same dictionary; do not add synchronization
-fields or repair attention state in builders. See `docs/design/module_config.md`.
-
-Merge all load-time ops layers as dictionaries before validation. The owning
-config caches a standard `OpsImplementationConfig` instance after the final
-selection is known; do not bypass its dataclass constructor or introduce an
-ambient validation context. Caches stay out of saved config dictionaries.
-
-Pass selections directly to the owning variant. On NPU, unweighted RMSNorm
-supports only `eager`; explicit `torch_npu`/`npu` must raise. The attention
-`eager` row preserves model-local eager math when present and otherwise
-forwards to `veomni_sdpa`; consumers do not remap eager themselves.
+- Confusing semantic variant with implementation backend, or leaking model policy into the op registry.
+- Calling a nested autograd wrapper inside a compound custom autograd function.
+- Forgetting to import the new family in `veomni/ops/kernels/__init__.py` or letting unavailable selections silently fall back to `eager`.
+- On NPU, unweighted RMSNorm supports only `eager` (explicit `torch_npu`/`npu` must raise); attention `eager` preserves model-local eager math or forwards to `veomni_sdpa`.

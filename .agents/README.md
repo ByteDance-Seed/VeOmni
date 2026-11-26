@@ -1,77 +1,44 @@
 # .agents/ — Shared Agent Configuration
 
-Reusable skills and knowledge for AI coding agents working on VeOmni. Follows the [Agent Skills](https://agentskills.io) open standard, so any agent that implements it can use these as-is.
+Reusable skills and layered knowledge for AI coding agents working on VeOmni, following the [Agent Skills](https://agentskills.io) open standard.
 
 ## Structure
 
-```
+```text
 .agents/
-├── skills/              # Workflow definitions (each skill = folder with SKILL.md)
-│   ├── veomni-develop/
-│   ├── veomni-debug/
-│   ├── veomni-review/
-│   ├── veomni-new-model/
-│   ├── veomni-gpu-to-npu/
-│   ├── veomni-gpu-ci-migrate/
-│   ├── veomni-npu-ci-generate/
-│   ├── veomni-seed-omni/
-│   ├── veomni-new-op/
-│   ├── veomni-uv-update/
-│   ├── veomni-profile/
-│   └── create-pr/
-├── knowledge/           # Shared knowledge base
-│   ├── architecture.md
-│   ├── constraints.md
-│   ├── cpu_only_env.md
-│   ├── multimodal_metadata.md
-│   ├── testing.md
-│   ├── uv.md
-│   └── veomni-seed-omni.md
-├── setup_agent.sh       # Bootstrap script (see below)
+├── skills/                     # Focused workflows (folder + SKILL.md)
+│   ├── veomni-review/          # Pre-PR code review gate
+│   ├── veomni-new-model/       # Model integration, modeling_<m>.py, weight conversion, GPU→NPU
+│   ├── veomni-seed-omni/       # SeedOmni modules, graphs, per-module parallelism
+│   ├── veomni-new-op/          # Tensor-level ops/kernels under veomni/ops/
+│   ├── veomni-uv-update/       # uv / torch / transformers / lockfile updates
+│   └── create-pr/              # Pull request drafting and submission
+├── knowledge/                  # Layered domain knowledge
+│   ├── constraints.md          # Session start: cross-cutting hard constraints
+│   ├── architecture.md         # Session start: module map, hierarchy, core flows
+│   ├── testing.md              # On demand: CI selection, launch plans, test decision rule
+│   ├── multimodal_metadata.md  # On demand: VLM/Omni metadata precompute contract
+│   ├── veomni-seed-omni.md     # On demand: SeedOmni architecture & constraints
+│   └── topics/                 # On demand: subsystem traps not covered in docs/design/
+│       ├── qat_and_ops.md
+│       ├── distributed.md
+│       └── flex_attention.md
+├── setup_agent.sh              # Symlink bootstrap for dotfile-specific agents
 └── README.md
 ```
 
 ## Quick Start
 
-Some agents read the `.agents/` directory natively and will auto-discover skills and knowledge — no extra setup needed.
-
-For an agent that insists on its own dotfile directory, run the bootstrap script with that agent's name:
+Agents supporting `.agents/` auto-discover it natively. For agents expecting `.<agent_name>/`:
 
 ```bash
 bash .agents/setup_agent.sh <agent-name>
 ```
 
-This will:
+Creates `.<agent_name>/`, symlinks `skills/`, `knowledge/`, and `README.md`, and adds it to `.git/info/exclude`.
 
-1. Create a `.<agent_name>/` directory in the project root
-2. Symlink `skills/`, `knowledge/`, and `README.md` from `.agents/` into it
-3. Add `.<agent_name>/` to `.git/info/exclude` (local-only, not committed)
+## Authoring & Hygiene Rules
 
-## Skills
-
-See [skills/README.md](skills/README.md) for the full skill index and how to add new ones.
-
-## Knowledge
-
-The `knowledge/` directory contains domain-specific context loaded by agents on session start:
-
-- **architecture.md** — module map, trainer hierarchy, data flow
-- **constraints.md** — hard constraints checked before any code change
-- **cpu_only_env.md** — what can be verified without a GPU/NPU
-- **multimodal_metadata.md** — canonical multimodal metadata keys and ownership
-- **testing.md** — how CI selects tests; whether a change needs one and where it goes
-- **uv.md** — dependency management architecture
-- **veomni-seed-omni.md** — SeedOmni runtime architecture, config resolution, and SP/FSDP/DDP/resume constraints
-
-## Keeping these docs honest
-
-`make check-agent-docs` (run in CI by the **Check doc task paths** workflow)
-resolves, in `AGENTS.md`, `.agents/**/*.md` and `.cursor/rules/*`: every
-repo-root-relative path, every bare `*.yml` workflow name, and every skill
-reference. Skill references are checked across the whole tracked tree, since a
-renamed skill also leaves dangling mentions in code comments. Use
-`<angle brackets>` for placeholders so they are skipped, and note that a bare
-`.py` name is deliberately not resolved — docs name upstream transformers
-modules and illustrative filenames that do not exist here. It cannot check
-prose claims about behaviour: when you edit a skill, re-read the file it
-describes.
+- **Keep startup docs lean**: `AGENTS.md`, `constraints.md`, and `architecture.md` hold only cross-cutting rules and pointers. Keep internal single-PR details in code docstrings or PR descriptions (and `.agents/knowledge/topics/` only for recurring traps), rather than adding per-PR docs to `docs/`.
+- **Keep skills concise**: each skill is `.agents/skills/<skill-name>/SKILL.md` with YAML frontmatter (`name` matching folder, `description` for auto-discovery). Aim for ~50–100 lines; move conditional topics into `references/` and link to `constraints.md` / `docs/design/` rather than duplicating them. Update the dispatch table in [`AGENTS.md`](../AGENTS.md) when adding or renaming a skill.
+- **Automated path & skill gate**: run `make check-agent-docs` (`scripts/ci/docs/check_agent_doc_paths.py`, enforced in CI) after editing agent docs. Use `<angle brackets>` for placeholders.

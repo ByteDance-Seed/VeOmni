@@ -1,167 +1,57 @@
 ---
 name: veomni-uv-update
-description: "Use this skill when updating dependencies managed by uv: bumping a package version, upgrading the uv tool itself, updating torch/CUDA stack, switching transformers version, or regenerating the lockfile. Trigger: 'update dependency', 'bump version', 'upgrade uv', 'update torch', 'update lockfile', 'uv sync fails'."
+description: "Update VeOmni dependencies managed by uv: bump packages, upgrade uv itself, update torch/CUDA/NPU stacks, bump transformers, or regenerate uv.lock. Trigger: 'update dependency', 'bump version', 'upgrade uv', 'update torch', 'update lockfile', 'uv sync fails'."
 ---
 
-## Before You Start
+# uv Dependency Architecture & Update Playbook
 
-Read `.agents/knowledge/uv.md` for the full dependency architecture. The key things that make VeOmni's uv setup non-trivial:
+Always inspect `pyproject.toml` as the source of truth for current exact versions before editing.
 
-- `[tool.uv].required-version` is a **range**; the concrete uv pins live
-  elsewhere and must stay inside it
-- every Dockerfile is standalone and hand-maintained; there is no generator or
-  matrix, so a version bump has to be applied file by file
-- torch uses **direct wheel URLs** (not just version bumps)
-- three mutually exclusive hardware extras (`gpu` / `npu` / `npu_aarch64`),
-  each a complete superset, plus optional `--extra magi` and `--extra float8`
-  (combine with `gpu`)
+## Architecture & Hardware Extras
 
-`pyproject.toml` is the source of truth for every version claim below. Read the
-relevant block before editing — this file describes *where* things live, not
-which versions are current.
+- **`[project.dependencies]`**: core deps (`transformers` excluded so pip users aren't pinned to one patch; pinned instead in `[dependency-groups].transformers-stable` via `default-groups`).
+- **Mutually exclusive hardware extras** (`[tool.uv].conflicts`):
+  - `gpu`: NVIDIA x86_64/aarch64 superset (`torch` + cu130 stack, FA2 on x86_64, FA3/FlashMLA/DeepGEMM wheels, FA4/FlashQLA/TileKernels, `liger-kernel`, FLA, `quack`, diffusers/av/audio/peft/energon).
+  - `npu` / `npu_aarch64`: Ascend NPU supersets (`torch` + `torch-npu` + multimodal deps; `npu_aarch64` omits `torchcodec`).
+- **Optional GPU add-on extras** (combine with `--extra gpu`):
+  - `magi`: SM100+ source-built MagiAttention + 3 companion CUDA extensions (conflicts with NPU extras; omitted from default GPU CI). Uses `[[tool.uv.dependency-metadata]]` (`requires-dist = []`), `[tool.uv.extra-build-dependencies]` (`setuptools`/`wheel`/`packaging`/`ninja` + `torch` with `match-runtime = true`), and `[tool.uv.extra-build-variables]` rather than `--no-build-isolation`.
+  - `float8`: `torchao==0.18.0` (exact pin checked at runtime by `veomni/ops/torchao.py`; incompatible with `peft==0.18.1` torchao interop, omitted from default GPU CI).
+- **Optional NPU add-on extra** (combine with `--extra npu` or `--extra npu_aarch64`):
+  - `hyper`: HyperParallel Ascend backend (pinned Git source in `[tool.uv.sources]`; see `docs/key_features/hyper_parallel.md`).
+- **Direct wheel URLs (`[tool.uv.sources]`)**: GPU `torch` uses direct cp311/cp312 wheel URLs (not the PyTorch index) to avoid `cu128_full` wheels dropping `nvidia-*` deps; `deep-gemm` pins 4 arch/Python wheel URLs (requires glibc >=2.38, NVCC + C++20 JIT; never add to CPU/NPU).
+- **Load-bearing overrides**: `[tool.uv].override-dependencies` requires `extra == '...'` markers (removing them pulls wrong PyTorch wheels) and pins `tilelang` shared by `flash-qla` and `tile-kernels` (bump as a set).
 
-## Scenario 1: Update uv Version
+## Common Commands
 
-`pyproject.toml` -> `[tool.uv]` -> `required-version` is a **range**
-(e.g. `">=0.9.8,<0.13"`). Docker and CI install a **concrete** pin and run with
-`--locked` / `--frozen`. Every concrete pin must stay inside the range.
+```bash
+uv sync --extra gpu --dev                          # local dev (cp311/cp312)
+uv sync --extra gpu --extra magi --dev             # + MagiAttention (SM100+)
+uv sync --extra gpu --extra float8 --dev           # + torchao (float8 / FP4 QAT)
+uv sync --extra npu --dev                          # Ascend NPU x86_64 (or npu_aarch64)
+uv sync --extra npu --extra hyper --dev            # + HyperParallel (Ascend NPU)
+uv lock && uv sync --extra gpu --dev               # after pyproject.toml edits
+uv sync --locked --all-packages --extra gpu --dev  # Docker / CI
+```
 
-1. **Every Dockerfile that pins uv, one by one.** There is no generator; the
-   pin lives in a `COPY --from=ghcr.io/astral-sh/uv:X.Y.Z` line, and only the
-   uv-based images have one (the pip-based ascend `*.arm` / `*_a3` variants do
-   not). Enumerate rather than assume:
+## Update Procedures
 
+1. **Update `uv` version**: Dockerfiles are standalone and hand-maintained (`*.arm`/`*_a3` pip-based ascend images have no uv pin). Enumerate and update every hit to the same `X.Y.Z` pin, widening `[tool.uv].required-version` only if outside range:
    ```bash
    grep -rn "astral-sh/uv" docker/
    ```
+   Then run `uv lock && uv sync --extra gpu --dev` and inspect `git diff uv.lock`.
 
-   Update every hit, and keep them on the same version — a per-image drift is
-   a debugging trap, not a feature.
-2. `pyproject.toml` -> `required-version` — only widen/move the range when the
-   new pin falls outside it.
+2. **Update a regular package**: edit `pyproject.toml`, run `uv lock && uv sync --extra gpu --dev`, run relevant tests, and commit `pyproject.toml` + `uv.lock` together.
 
-Then regenerate the lockfile:
+3. **Update `torch` / CUDA / NPU stack**:
+   - Update all pinned sites in `pyproject.toml`: `[project.optional-dependencies]` (incl. `torchvision`/`torchaudio`/`torchcodec`/`nvidia-*`), `[tool.uv].override-dependencies` (preserve `extra == '...'` markers), and `[tool.uv.sources]` direct wheel URLs.
+   - Verify ABI-pinned wheels (`flash-attn`, `flash-attn-3`, `flash-mla`, `deep-gemm`), PyPI set (`flash-qla` + `tile-kernels` + `tilelang`), and `--extra magi` git revs.
+   - Enumerate and update every Dockerfile pinning torch directly:
+     ```bash
+     grep -rnE "torch(-npu)?==" docker/
+     ```
+   - Run `uv lock && uv sync --extra gpu --dev` and test.
 
-```bash
-uv lock
-uv sync --extra gpu --dev
-```
+4. **Update `transformers`**: edit `[dependency-groups].transformers-stable`, run `uv lock && uv sync --extra gpu --dev`, audit `veomni/models/transformers/*/modeling_*.py` (updating `# Base-Transformers-Version:` headers when rebased), and run `pytest tests/models/ tests/e2e/`.
 
-Verify the lockfile diff is reasonable (`git diff uv.lock` — should only show version changes, not wholesale rewrites).
-
-## Scenario 2: Update a Regular Dependency
-
-1. Edit version constraint in `pyproject.toml` under `[project.dependencies]` or the relevant `[project.optional-dependencies]` extra.
-2. Regenerate lockfile and sync:
-
-```bash
-uv lock
-uv sync --extra gpu --dev
-```
-
-3. Run tests: `pytest tests/`
-4. Commit both `pyproject.toml` and `uv.lock` together.
-
-## Scenario 3: Update torch / CUDA Stack
-
-This is the most complex update. torch versions are pinned in **multiple places**:
-
-**For GPU (`gpu` extra):**
-- `pyproject.toml` -> `[project.optional-dependencies]` -> `gpu` list
-- `pyproject.toml` -> `[tool.uv]` -> `override-dependencies` (the `extra == 'gpu'` entries)
-- `pyproject.toml` -> `[tool.uv.sources]` -> `torch` (direct wheel URL — must update to matching wheel)
-- Related packages that must move together: `torchvision`, `torchaudio`,
-  `torchcodec`, plus the `nvidia-*` runtime pins in the `gpu` extra. Grep the
-  `gpu` block rather than trusting this list — it grows.
-
-**For NPU (`npu` / `npu_aarch64` extras):**
-- Same pattern but with `+cpu` suffix or no suffix
-
-**Steps:**
-1. Identify the target torch version and matching wheel URLs from https://download.pytorch.org/whl/
-2. Update all pinned versions in `pyproject.toml` (extras, overrides, sources)
-3. Check attention-kernel compatibility. Three groups behave differently —
-   confirm each against `[tool.uv.sources]` before editing:
-   - **Prebuilt wheel URLs** (`flash-attn` cp311/cp312 x86_64-only,
-     `flash-attn-3` abi3, `flash-mla`): pinned to torch+CUDA+ABI-specific
-     wheels. A torch / Python / CUDA bump requires a matching upstream release
-     — see https://github.com/Luosuu/flash-attention3-wheels/releases.
-   - **PyPI releases** (`flash-attn-4`, `flash-qla`): plain version pins in the
-     `gpu` extra. `flash-qla` is a pure-Python wheel whose static metadata
-     declares only `apache-tvm-ffi`, so it needs no
-     source build and no `dependency-metadata` override. `tilelang` is pinned
-     in `override-dependencies` because `tile-kernels` and `flash-qla` must
-     agree on one version — bump them as a set.
-   - **Source-built git pins** (`magi-attention`, `create-block-mask-cuda`,
-     `flash-attn-cute`, `magi-to-hstu-cuda`): each needs a
-     `[[tool.uv.dependency-metadata]]` block (upstream declares no usable
-     metadata) plus an `extra-build-dependencies` entry, and an
-     `extra-build-variables` entry where the build needs `MAX_JOBS` /
-     compute-capability flags (all but `flash-attn-cute` today).
-     A torch ABI bump may require bumping the git revs. These belong to the
-     optional `magi` extra and require SM100+; use `uv sync --extra gpu --extra magi`
-     to install them. GPU CI runs `uv sync --extra gpu` without `magi`, so
-     the SM89 L20 runners omit these source builds.
-4. Update `torchcodec` version if needed (compatibility note in pyproject.toml)
-5. Regenerate lockfile:
-
-```bash
-uv lock
-uv sync --extra gpu --dev
-```
-
-6. Run tests: `pytest tests/`
-7. If the torch version changed, walk the Dockerfiles. Seven of them pin torch
-   directly — `docker/rocm/Dockerfile.ROCm7.14` a ROCm build, and the ascend
-   `*_torch_npu*` images a `torch-npu==X` matched to it by `fla_npu`'s
-   `check_npu_env`. The rest inherit torch from their base image
-   (`docker/cuda/Dockerfile.cu130` from the NGC PyTorch base), so there is no
-   single knob. Match `-npu` too, or you will find one pin out of seven:
-
-   ```bash
-   grep -rnE "torch(-npu)?==" docker/
-   ```
-
-## Scenario 4: Update transformers Version
-
-transformers is pinned by the `transformers-stable` dependency group
-(`pyproject.toml` -> `[dependency-groups] transformers-stable`), which is
-listed in `[tool.uv] default-groups` so `uv sync` installs it automatically.
-
-**Bump within v5** (e.g. 5.2.0 → 5.3.0):
-1. Edit the pinned version in `[dependency-groups] transformers-stable`.
-2. Regenerate lockfile and sync:
-
-```bash
-uv lock
-uv sync --extra gpu --dev
-```
-
-3. Check the local model implementations against the new Transformers APIs.
-   Forward-looking guards may be expressed with
-   `is_transformers_version_greater_or_equal_to()` from
-   `veomni/utils/import_utils.py`.
-4. Run tests: `pytest tests/models/ tests/e2e/`
-
-## Scenario 5: Regenerate Lockfile Only
-
-When `uv.lock` is out of sync or corrupt:
-
-```bash
-uv lock
-uv sync --extra gpu --dev
-```
-
-If `uv lock` fails due to version conflicts, check:
-- `[tool.uv]` -> `conflicts` declarations
-- `override-dependencies` markers
-- Direct wheel URL availability
-
-## Common Pitfalls
-
-- **Bumping one Dockerfile and calling it done**: there are a dozen-plus standalone Dockerfiles under `docker/` and no generator to fan a change out. `grep -rn` for the pin you are moving and update every hit.
-- **Partial torch updates**: updating `torch` but not `torchvision`/`torchaudio`/`torchcodec` to matching versions causes import errors.
-- **flash-attn wheel mismatch**: flash-attn wheels are built for specific torch+CUDA combinations. A torch version bump requires finding or building new wheels.
-- **Committing only pyproject.toml**: always commit `uv.lock` together. Docker builds use `--locked` which requires the lockfile to match.
-- **override-dependencies markers**: the `extra == 'gpu'` markers in overrides are critical. Removing them causes uv to download wrong torch variants from PyPI.
-- **Assuming build isolation is disabled**: there is no `no-build-isolation-package` block any more. Source builds instead get their toolchain from `[tool.uv.extra-build-dependencies]` (uv venvs are not seeded), and `torch` is passed with `match-runtime = true` where the extension links against it. If a source build fails on a missing `setuptools`/`torch`, add it there rather than reaching for `--no-build-isolation`.
+5. **Regenerate lockfile only**: run `uv lock && uv sync --extra gpu --dev`; on conflict, inspect `[tool.uv].conflicts`, `override-dependencies` markers, and wheel URL availability.

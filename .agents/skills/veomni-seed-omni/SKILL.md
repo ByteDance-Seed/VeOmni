@@ -63,4 +63,3 @@ to start a new config file, then compare against the live configs listed in
   `veomni/models/transformers/`.
 - Use this skill after that model exists, when wrapping it as SeedOmni
   modules or wiring it into Omni graphs.
-- Use `veomni-develop` for unrelated framework work outside SeedOmni.

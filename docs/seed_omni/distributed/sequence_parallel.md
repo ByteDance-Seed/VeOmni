@@ -215,8 +215,9 @@ tokens, FLOPs and MFU are identical across SP sizes. See
 peers whose loss shares already account for the replication.
 
 The hard rules agents must follow are kept in
-`.agents/knowledge/veomni-seed-omni.md` (§3) and
-`.agents/knowledge/constraints.md` (§7).
+`.agents/knowledge/veomni-seed-omni.md` (§3),
+`.agents/knowledge/constraints.md` (§7–9), and
+`.agents/knowledge/topics/distributed.md`.
 
 ## 5. Choosing between slicing and item balancing
 
