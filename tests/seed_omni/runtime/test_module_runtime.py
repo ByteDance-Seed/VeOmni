@@ -41,8 +41,21 @@ from veomni.utils import recompute_utils
 pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
-def _fsdp(scope: str, mode: str = "fsdp2") -> SimpleNamespace:
-    return SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope=scope, fsdp_mode=mode))
+def _fsdp(
+    scope: str, mode: str = "fsdp2", *, compile_enable: bool = False, compile_dynamic: bool = False
+) -> SimpleNamespace:
+    """A minimal ``AcceleratorConfig`` stand-in.
+
+    ``torch_compile`` defaults to disabled: these tests are about the wrap and
+    the per-module steps, and leaving compile off keeps
+    ``_build_parallelized_model`` from reaching for the compiler.
+    """
+    return SimpleNamespace(
+        fsdp_config=SimpleNamespace(fsdp_scope=scope, fsdp_mode=mode, reshard_after_forward=True),
+        torch_compile=SimpleNamespace(
+            enable=compile_enable, backend="inductor", mode=None, fullgraph=True, dynamic=compile_dynamic
+        ),
+    )
 
 
 def _unbuilt(model: nn.Module | None = None, **args_fields) -> ModuleRuntime:
@@ -68,6 +81,33 @@ def test_omni_runtime_arguments_are_model_arguments():
 
     assert issubclass(OmniModuleRuntimeArguments, ModelArguments)
     assert issubclass(OmniModelRuntimeArguments, ModelArguments)
+
+
+def test_generic_module_extra_state_hooks_are_saved_and_loaded(monkeypatch):
+    class ModuleWithExtraState(nn.Linear):
+        def __init__(self):
+            super().__init__(2, 2)
+            self.saved = None
+
+        def extra_state_dict(self):
+            return {"value": 7}
+
+        def load_extra_state_dict(self, state):
+            self.saved = state
+
+    module = ModuleWithExtraState()
+    runtime = _unbuilt(module)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    assert runtime.extra_state() == {"module_extra_state": {"value": 7}}
+    runtime.load_extra_state({"module_extra_state": {"value": 9}})
+    assert module.saved == {"value": 9}
+
+
+def test_missing_rng_load_hook_does_not_raise(monkeypatch):
+    module = nn.Linear(2, 2)
+    runtime = _unbuilt(module)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    runtime.load_extra_state({"module_rng_state": {"generator": "state"}})
 
 
 def test_module_checkpoint_manager_is_a_model_checkpoint_manager():
@@ -468,7 +508,10 @@ def _recompute_accelerator(**gc_fields):
     return SimpleNamespace(
         gradient_checkpointing=GradientCheckpointingConfig(**gc_fields),
         offload_config=SimpleNamespace(enable_activation=False, enable_async_activation=False),
-        torch_compile=SimpleNamespace(enable=False),
+        # `_build_recompute_policy` asks the resolved compile config, not the raw
+        # switch, so the fixture carries the fields that resolution reads.
+        torch_compile=SimpleNamespace(enable=False, backend="inductor", mode=None, fullgraph=True, dynamic=None),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
     )
 
 
@@ -529,6 +572,55 @@ def test_the_enable_keeps_torchs_default_without_a_parallel_state(monkeypatch):
     _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
 
     assert model.log[0][1]["context_fn"] is noop_context_fn
+
+
+def test_a_module_that_resolves_to_eager_does_not_claim_compile_to_the_policy(monkeypatch):
+    """The policy reads the resolved config, not the launcher switch.
+
+    A module whose own wrap is DDP resolves to ``enable=False`` even when the
+    launcher asked for compile, because ``module_compile_config`` falls back to
+    eager. Its recompute policy has to see that — otherwise it warns about SAC
+    with torch.compile for a module that never compiles.
+    """
+    seen = {}
+    model = _CheckpointableLinear()
+    accelerator = _recompute_accelerator(enable=True)
+    accelerator.torch_compile.enable = True
+    accelerator.fsdp_config = SimpleNamespace(fsdp_mode="ddp")
+
+    real_build = recompute_utils.build_policy
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(recompute_utils, "build_policy", spy)
+    monkeypatch.setattr(ModuleRuntime, "_recompute_context", lambda self: None)
+
+    _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    assert seen["compile_enabled"] is False
+
+
+def test_a_module_that_resolves_to_compile_tells_the_policy_so(monkeypatch):
+    """The same read, in the direction that keeps the warning working."""
+    seen = {}
+    model = _CheckpointableLinear()
+    accelerator = _recompute_accelerator(enable=True)
+    accelerator.torch_compile.enable = True
+
+    real_build = recompute_utils.build_policy
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(recompute_utils, "build_policy", spy)
+    monkeypatch.setattr(ModuleRuntime, "_recompute_context", lambda self: None)
+
+    _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    assert seen["compile_enabled"] is True
 
 
 def test_the_recompute_apply_ranks_the_stacks_by_the_modules_basic_modules(monkeypatch):
@@ -688,3 +780,108 @@ def test_a_frozen_module_has_no_async_save_to_drain():
     runtime.checkpoint = None
 
     runtime.wait_for_pending_save()
+
+
+# ---------------------------------------------------------------- compile gate
+#
+# `module_compile_config` reads the accelerator only: the run switch, the wrap
+# mode, and (under `fsdp_scope='model'`) the launcher's mode. There is no
+# per-model capability flag — what compiles is decided by the config.
+
+
+def _compile_accelerator(*, enable=True, dynamic=False, fsdp_mode="fsdp2", mode=None):
+    return SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=enable, backend="inductor", mode=mode, fullgraph=True, dynamic=dynamic),
+        fsdp_config=SimpleNamespace(fsdp_mode=fsdp_mode),
+    )
+
+
+@pytest.mark.parametrize(
+    ("run_enable", "dynamic", "fsdp_mode", "expected"),
+    [
+        (True, False, "fsdp2", (True, False)),
+        (True, True, "fsdp2", (True, True)),
+        # Unset is the default: torch picks, so it must reach `torch.compile` as
+        # None rather than being normalized to a bool.
+        (True, None, "fsdp2", (True, None)),
+        (False, True, "fsdp2", (False, False)),
+        (False, None, "fsdp2", (False, False)),
+        # ddp cannot compile: `compile_decoder_blocks` only runs under FSDP2
+        (True, True, "ddp", (False, False)),
+        (True, None, "ddp", (False, False)),
+    ],
+)
+def test_module_compile_config_reads_the_accelerator(run_enable, dynamic, fsdp_mode, expected):
+    """The module's config comes from its resolved accelerator, nothing else."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    config = module_compile_config(_compile_accelerator(enable=run_enable, dynamic=dynamic, fsdp_mode=fsdp_mode))
+
+    assert (config.enable, config.dynamic) == expected
+
+
+def test_a_module_under_ddp_stays_eager_rather_than_failing_its_wrap():
+    """The shipped Janus launcher puts ``janus_siglip`` on DDP."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    config = module_compile_config(_compile_accelerator(enable=True, dynamic=True, fsdp_mode="ddp"))
+    assert config.enable is False
+
+
+def test_the_launcher_gate_applies_only_when_the_composed_model_owns_the_wrap():
+    """A `fsdp2` module under a `ddp` launcher compiles when it owns its own wrap.
+
+    Under `fsdp_scope='module'` the module's own overlay *is* its wrap, so the
+    launcher's `fsdp_mode` is irrelevant. Under `fsdp_scope='model'` the composed
+    `OmniModel` wraps and validates the top-level accelerator, so it decides.
+    """
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    module_acc = _compile_accelerator(enable=True)
+    ddp_launcher = SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope="module", fsdp_mode="ddp"))
+
+    assert module_compile_config(module_acc).enable is True
+    assert module_compile_config(module_acc, global_accelerator=ddp_launcher).enable is False
+
+
+def test_a_composed_wrap_module_leaves_the_wrap_to_the_composed_model(monkeypatch):
+    """Under `fsdp_scope='model'` the module applies what precedes the wrap and returns.
+
+    The base build both compiles and wraps in one go, so calling it here would
+    wrap the module twice. Nothing is compiled on this path: the launcher rejects
+    `torch_compile` under this scope at parse time (`_validate_composed_wrap`), so
+    the module must not reach for the compiler either.
+    """
+    import torch.nn as nn
+
+    from veomni.distributed import torch_compile as tc_mod
+
+    calls = []
+    monkeypatch.setattr(tc_mod, "validate_compile_runtime", lambda *a, **k: None)
+    monkeypatch.setattr(tc_mod, "compile_decoder_blocks", lambda model, config, **k: (calls.append("compiled"), 1)[1])
+
+    class Block(nn.Module):
+        def forward(self, x):
+            return x
+
+    class Mod(nn.Module):
+        _no_split_modules = ["Block"]
+
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([Block()])
+
+    runtime = _unbuilt(Mod())
+    runtime._global_accelerator = _fsdp("model", compile_enable=True)
+    runtime.args.accelerator = _fsdp("model", compile_enable=True)
+    runtime._apply_async_activation_offload = lambda: calls.append("offload")
+
+    def base(*a, **k):
+        calls.append("base-build")
+        raise AssertionError("the composed path must not call the base build")
+
+    monkeypatch.setattr(type(runtime).__mro__[1], "_build_parallelized_model", base)
+
+    runtime._build_parallelized_model()
+
+    assert calls == ["offload"], calls

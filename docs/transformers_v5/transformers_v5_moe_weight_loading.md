@@ -8,7 +8,7 @@ This note documents VeOmni MoE weight-loading expectations under
 Transformers v5 introduced expert-dispatch integration points (`use_experts_implementation` and `ALL_EXPERTS_FUNCTIONS`).
 
 For VeOmni's qwen3_moe path, we use a simpler approach:
-- patch experts behavior in `models` patchgen-generated modeling;
+- implement expert dispatch in the standalone modeling file;
 - construct an instance-local `VeomniOp("moe_experts", "standard", impl)`;
 - always call that handle from the patched expert forward. The eager reference
   is itself a registry row, so no separate module-global gate is needed.
@@ -37,7 +37,7 @@ self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, sel
 ```
 
 Handling summary:
-- safetensor keys are per expert, while VeOmni's patchgen modeling holds
+- safetensor keys are per expert, while VeOmni's standalone modeling holds
   merged expert tensors;
 - a runtime `CheckpointTensorConverter` performs the per-expert -> fused
   conversion on load — no offline preprocessing required.
@@ -90,16 +90,15 @@ Handling summary:
 
 ## Qwen3Moe Handling in VeOmni
 
-VeOmni's patchgen-generated modeling uses the native v5 fused expert layout:
+VeOmni's standalone modeling uses the native v5 fused expert layout:
 - `gate_up_proj` `[E, 2*I, H]`
 - `down_proj` `[E, H, I]`
 
-See `veomni/models/transformers/qwen3_moe/qwen3_moe_gpu_patch_gen_config.py` for the patchgen config.
+See `veomni/models/transformers/qwen3_moe/modeling_qwen3_moe.py` for the implementation.
 
 ### Loading (HF safetensors -> VeOmni modeling)
 
-A runtime `CheckpointTensorConverter` is registered on every patchgen-generated
-model class. For per-expert HF checkpoints, Qwen3-MoE, Qwen3.5-MoE (its MTP
+For per-expert HF checkpoints, Qwen3-MoE, Qwen3.5-MoE (its MTP
 experts), Qwen3-Omni-MoE, DeepSeek-V3 and GLM-MoE-DSA (GLM-5) all use thin
 subclasses of `PerExpertFusedCheckpointTensorConverter`
 (`veomni/models/_moe_per_expert_converter.py`). It converts per-expert HF keys
@@ -116,7 +115,7 @@ This eliminates the need for offline `moe_merge.py` preprocessing. The converter
 does not dequantize: an FP8 per-expert checkpoint, such as the official
 DeepSeek-V3 release, raises `ValueError` and must be converted to BF16 first.
 
-With `model.ep_sharded_stream_load=true`, the converter also streams per rank.
+With `model.extra_parallel_stream_load=true`, the converter also streams per rank.
 It reports each per-expert key's fused target and expert index
 (`fused_expert_target`), and builds a converter restricted to this rank's
 `Shard(0)` expert range (`for_expert_range`). Each EP rank then reads only its
@@ -135,6 +134,61 @@ attention weight + scale pairs. Every rank reads those whole and runs them
 through the converter before dispatch, as the whole-tensor loader does. A
 converter that emits an ExtraParallel parameter from such a key, rather than
 through `fused_expert_target`, raises `NotImplementedError`.
+
+#### Row-wise companions
+
+A converter whose conversion of a row-sharded key needs a second key, row by row,
+declares it with two more methods:
+
+```python
+class MyTableConverter:
+    def dim0_rowwise_companion(self, name: str) -> Optional[str]:
+        """The key row `i` of the converted `name` also needs, or None."""
+        return f"{name}_scale" if name.endswith(".weight") else None
+
+    def convert_rows(self, name, rows, companion_rows):
+        """Convert matching row slices; `rows` covers `[a, b)` of the checkpoint's rows."""
+        return dequant(rows, companion_rows)
+```
+
+Row `i` of the output may depend only on row `i` of the key and of its companion,
+so the transform commutes with the `Shard(0)` split the ExtraParallel plan makes.
+The streaming loader then reads the same `[start, end)` row range of both keys
+(and never reads the companion on its own), zero-fills rows past the checkpoint,
+and hands the pair to `convert_rows`.
+
+Which keys may declare one:
+
+- **Dense, not sharded**: read whole, together with its whole companion, and
+  both handed to `convert_rows`.
+- **ExtraParallel, row-sharded**: streamed with its companion, as above.
+- **Persistent ExtraParallel** (`persistent_fsdp_shard_dim` set, e.g. Qwen4-Exp
+  PLE): **refused** with `NotImplementedError`. A persistent parameter stays a 2D
+  DTensor over the whole `(para_fsdp, para)` mesh for its entire lifetime, so the
+  loader has no per-rank row slice to pair with a companion's row slice.
+
+`can_handle_tensor` still receives the **raw** tensor, because claiming a key by
+content is how a quantized dense weight is recognised at all. What happens next
+depends on the path, and there are four:
+
+- **Dense, not sharded, no companion**: read whole and handed to
+  `maybe_convert_checkpoint_tensor`, so its content-claimed conversion runs
+  normally.
+- **Dense, not sharded, with a row-wise companion**: read whole together with
+  its whole companion and handed straight to `convert_rows`, which replaces the
+  `maybe_convert_checkpoint_tensor` call rather than feeding it — the companion
+  *is* the conversion, and passing the result on would convert it twice.
+- **Sharded, with a row-wise companion**: the loader reads the matching row range
+  of the key and its companion and calls `convert_rows`, which *is* the
+  conversion — so the `can_handle_tensor` refusal is skipped, because the tensor
+  is already converted.
+- **Sharded, without a companion**: the loader has only a slice and cannot run a
+  whole-tensor conversion, so a content-claimed key raises instead of reaching
+  the parameter raw.
+
+So a supported dense conversion does not need `extra_parallel_stream_load` disabled,
+and neither does a row-sharded table that declares a companion. Only a sharded key
+with no companion and a content-claimed conversion is refused.
 
 ### Saving (VeOmni modeling -> checkpoint)
 

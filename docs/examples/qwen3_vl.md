@@ -69,7 +69,7 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_moe.yaml \
 
 ## Optional per-block torch.compile on CUDA
 
-Dense Qwen3-VL can compile each text decoder block before FSDP2 sharding while keeping the vision tower, DeepStack injection, and language-model head eager. Enable fixed-length packed inputs together with compile:
+Dense Qwen3-VL can compile its blocks before FSDP2 sharding. Enable fixed-length packed inputs together with compile:
 
 ```shell
 bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml \
@@ -80,4 +80,4 @@ bash train.sh tasks/train_vlm.py configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml
     --model.accelerator.torch_compile.enable true
 ```
 
-This path currently requires CUDA, FSDP2, the default `model.accelerator.torch_compile.backend=inductor` and `model.accelerator.torch_compile.mode=None`, `model.accelerator.torch_compile.dynamic=false`, `model.accelerator.ulysses_size=1`, `model.accelerator.cp_size=1`, and `model.accelerator.enable_async=false`. Padding fixes the token-tensor shapes, while different packed sequence boundaries can still produce separate Inductor specializations. CUDA Graph replay, Qwen3-VL-MoE, ExtraParallel, and NPU execution are not yet supported.
+Every entry in `_no_split_modules` is compiled, which for this model is both the text decoder layers and the vision blocks. This path currently requires CUDA, FSDP2, the default `model.accelerator.torch_compile.backend=inductor` and `model.accelerator.torch_compile.mode=None`, `model.accelerator.ulysses_size=1`, `model.accelerator.cp_size=1`, and `model.accelerator.enable_async=false` — the last three are refused for every trainer, text included, not just here. Leave `model.accelerator.torch_compile.dynamic` unset: padding fixes the text token count, but a vision tower's patch count follows the images in the batch, and a static graph exhausts the recompile cache on it. CUDA Graph replay, ExtraParallel, and NPU execution are not yet supported.

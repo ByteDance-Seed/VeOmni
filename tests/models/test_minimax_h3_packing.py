@@ -18,6 +18,7 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_condition.modeling_minimax_h3
     MiniMaxH3ConditionModel,
 )
 from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_dit, packed_sequence
+from veomni.models.diffusers.minimax_h3.minimax_h3_core.batch_packing import pack_samples
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import (
     MiniMaxH3DiTModelConfig,
 )
@@ -596,7 +597,7 @@ def test_native_foundation_loader_uses_ordinary_batch_contract(backend):
         attn_implementation=backend,
         rms_norm_implementation="eager",
         rotary_pos_emb_implementation="eager",
-        swiglu_mlp_implementation="eager",
+        gated_mlp_implementation="eager",
         cross_entropy_loss_implementation="eager",
         moe_implementation="eager",
         load_balancing_loss_implementation="eager",
@@ -1018,7 +1019,7 @@ def test_fused_dispatch_keeps_refiners_sample_local_and_single_sample_legacy(mon
         attn_implementation=backend,
         rms_norm_implementation="eager",
         rotary_pos_emb_implementation="eager",
-        swiglu_mlp_implementation="eager",
+        gated_mlp_implementation="eager",
         cross_entropy_loss_implementation="eager",
         moe_implementation="eager",
         load_balancing_loss_implementation="eager",
@@ -1063,6 +1064,15 @@ def test_flash_backend_defers_kernel_until_first_forward(monkeypatch, multisampl
     with pytest.raises(ImportError, match="flash_attn unavailable"):
         model(**batch(samples)) if multisample else serial(model, samples[:1])
     assert loads == ["veomni_flash_attention_2"]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("missing", ["packed_seq_params", "refiner_packed_seq_params"])
+def test_packed_forward_requires_both_sequence_bounds(missing):
+    inputs, _ = pack_samples(prepare(condition_model(), [raw_sample(3), raw_sample(7)]))
+    inputs[missing] = None
+    with pytest.raises(ValueError, match=missing):
+        tiny_model().dit(**inputs, packed_batch=True)
 
 
 @pytest.mark.parametrize("checkpointing", [False, True])
@@ -1144,3 +1154,387 @@ def test_invalid_precision_and_legacy_tail_fail_closed():
         prepare(condition_model(), [row])
     with pytest.raises(ValueError, match="nonempty"):
         model(x=[])
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_h3_foundation_loader_preserves_official_fp32_islands(dtype):
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models.auto import build_foundation_model
+
+    model = build_foundation_model(
+        tiny_model().config, init_device="cpu", torch_dtype=dtype, ops_implementation=make_eager_ops_config()
+    )
+    ordinary_dtype = getattr(torch, dtype)
+    islands = (
+        model.dit.video_patch_proj,
+        model.dit.audio_patch_proj,
+        model.dit.time_embedder.proj_in,
+        model.dit.time_embedder.proj_out,
+        model.dit.final_layer.video_out,
+        model.dit.final_layer.audio_out,
+    )
+    assert all(p.dtype == torch.float32 for module in islands for p in module.parameters())
+    assert model.dit.condition_proj.weight.dtype == ordinary_dtype
+    assert model.dit.blocks[0].adaln_proj.linear.weight.dtype == ordinary_dtype
+    expected = tiny_model()
+    assert {k: v.shape for k, v in model.state_dict().items()} == {
+        k: v.shape for k, v in expected.state_dict().items()
+    }
+    sample = prepare(condition_model(), [raw_sample(text_len=9)])[0]
+    out = model(**sample)
+    assert all(value.dtype == torch.float32 for value in out.predictions)
+    sum(out.loss.values()).backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_h3_adaln_activates_before_casting_fp32_time_embedding():
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3AdalnProj
+
+    torch.manual_seed(39)
+    module = MiniMaxH3AdalnProj(8, 8, 48, expand_ratio=6, modality_num=1).bfloat16()
+    time = torch.randn(5, 8, dtype=torch.float32, requires_grad=True)
+    actual = torch.cat(module(time), dim=-1)
+    expected = module.linear(F.silu(time).bfloat16())
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    actual.float().sum().backward()
+    assert time.grad.dtype == torch.float32 and torch.isfinite(time.grad).all()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_h3_rejects_rounded_inputs_and_fp32_island_lora():
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+
+    model = tiny_model()
+    sample = prepare(condition_model(), [raw_sample()])[0]
+    for key in ("unique_timesteps", "img_position_ids"):
+        for dtype in (torch.bfloat16, torch.float16):
+            rounded = dict(sample, **{key: sample[key].to(dtype)})
+            with pytest.raises(ValueError, match="cast_forward_inputs"):
+                model(**rounded)
+    float64_timesteps = dict(sample, unique_timesteps=sample["unique_timesteps"].double())
+    for actual, expected in zip(model(**float64_timesteps).predictions, model(**sample).predictions):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    lora = VeOmniLoraModel(tiny_model(), VeOmniLoraConfig(r=4, lora_alpha=8, target_modules=["video_patch_proj"]))
+    with pytest.raises(NotImplementedError, match="FP32 projections"):
+        lora.get_base_model().get_ignore_modules_in_mixed_precision()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("key", ["unique_timesteps", "img_position_ids"])
+def test_h3_packing_accepts_fp64_metadata(key):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.batch_packing import pack_samples
+
+    model = tiny_model().eval()
+    samples = prepare(condition_model(), [raw_sample(text_len=3), raw_sample(text_len=7)])
+    samples[1][key] = samples[1][key].double()
+    packed_inputs, _ = pack_samples(samples)
+    assert packed_inputs[key].dtype == torch.float64
+    expected = [model(**sample).predictions for sample in samples]
+    actual = model(**batch(samples)).predictions
+    for index, predictions in enumerate(expected):
+        for modality in range(2):
+            torch.testing.assert_close(actual[modality][index], predictions[modality], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("key", ["unique_timesteps", "img_position_ids"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_h3_packing_rejects_rounded_sample_before_dtype_promotion(key, dtype):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.batch_packing import pack_samples
+
+    samples = prepare(condition_model(), [raw_sample(), raw_sample()])
+    samples[1][key] = samples[1][key].to(dtype)
+    with pytest.raises(ValueError, match="cast_forward_inputs"):
+        pack_samples(samples)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_h3_async_offload_auto_discovers_blocks_only():
+    from veomni.distributed.async_offload import apply_async_activation_offload
+
+    model = tiny_model()
+    apply_async_activation_offload(model, [])
+
+    assert set(model._no_split_modules) == {"MiniMaxH3DiTBlock", "MiniMaxH3DiT"}
+    assert not hasattr(model.dit, "_veomni_offload_manager")
+    assert [block._veomni_offload_layer_idx for block in model.dit.blocks] == list(range(len(model.dit.blocks)))
+
+
+def _run_h3_precision_fsdp(checkpointing, lora, weights_path, offload=False, basic_modules=None):
+    import os
+
+    import torch.distributed as dist
+    from safetensors.torch import save_file
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.arguments import AcceleratorConfig, MixedPrecisionConfig
+    from veomni.distributed.async_offload import apply_async_activation_offload
+    from veomni.distributed.parallel_state import (
+        clear_parallel_state,
+        init_parallel_state_from_config,
+        use_parallel_state,
+    )
+    from veomni.distributed.torch_parallelize import build_parallelize_model
+    from veomni.lora import VeOmniLoraConfig, VeOmniLoraModel
+    from veomni.models.auto import build_foundation_model
+    from veomni.utils.device import get_device_type
+
+    os.environ["LOCAL_RANK"] = str(dist.get_rank())
+    os.environ["WORLD_SIZE"] = str(dist.get_world_size())
+    device = torch.device(get_device_type(), dist.get_rank())
+    init_parallel_state_from_config(AcceleratorConfig(), name="h3_precision")
+    try:
+        with use_parallel_state("h3_precision"):
+            config = tiny_model().config
+            model = build_foundation_model(
+                config,
+                init_device="meta",
+                torch_dtype="float32",
+                ops_implementation=make_eager_ops_config(),
+            )
+            reference = build_foundation_model(
+                copy.deepcopy(config),
+                init_device="cpu",
+                torch_dtype="bfloat16",
+                ops_implementation=make_eager_ops_config(),
+            )
+            torch.manual_seed(87)
+            for parameter in reference.parameters():
+                torch.nn.init.normal_(parameter, std=0.1)
+            if dist.get_rank() == 0:
+                save_file(reference.dit.state_dict(), os.path.join(weights_path, "model.safetensors"))
+            dist.barrier()
+            if lora:
+                lora_config = VeOmniLoraConfig(
+                    r=4,
+                    lora_alpha=8,
+                    target_modules=["qkv_proj", "out_proj", "fc1", "fc2"],
+                )
+                model = VeOmniLoraModel(model, lora_config)
+                reference = VeOmniLoraModel(reference, copy.deepcopy(lora_config))
+                for name, parameter in reference.named_parameters():
+                    if "lora_" in name:
+                        torch.nn.init.normal_(parameter, std=0.05)
+            if offload:
+                apply_async_activation_offload(model, [])
+            weights = {name: value.detach().clone().to(device) for name, value in reference.state_dict().items()}
+            model = build_parallelize_model(
+                model,
+                weights_path=weights_path,
+                init_device="meta",
+                basic_modules=basic_modules,
+                mixed_precision=MixedPrecisionConfig(enable=True, cast_forward_inputs=False),
+                is_peft_model=lora,
+                enable_gradient_checkpointing=checkpointing,
+            )
+            from torch.distributed.fsdp import FSDPModule
+
+            dit = (model.get_base_model() if lora else model).dit
+            islands = (
+                dit.video_patch_proj,
+                dit.audio_patch_proj,
+                dit.time_embedder.proj_in,
+                dit.time_embedder.proj_out,
+                dit.final_layer.video_out,
+                dit.final_layer.audio_out,
+            )
+            assert all(isinstance(module, FSDPModule) for module in (dit, *dit.blocks, *islands))
+            assert not isinstance(dit.condition_proj, FSDPModule)
+            if basic_modules:
+                assert isinstance(dit.final_layer, FSDPModule)
+            for name, parameter in model.named_parameters():
+                if "lora_" not in name:
+                    actual_weight = parameter.full_tensor()
+                    torch.testing.assert_close(actual_weight, weights[name].to(actual_weight.dtype), rtol=0, atol=0)
+            if lora:
+                set_model_state_dict(
+                    model,
+                    {name: value for name, value in weights.items() if "lora_" in name},
+                    options=StateDictOptions(full_state_dict=True, strict=False),
+                )
+            reference = reference.to(device)
+            torch.manual_seed(94)
+            samples = prepare(condition_model(), [raw_sample(17, task="ref2va"), raw_sample(9, latent_t=3)])
+            for i, sample in enumerate(samples):
+                sample["img_position_ids"] += 1025.333333333
+                sample["unique_timesteps"] = torch.full_like(sample["unique_timesteps"], 0.094339624 + i * 0.1)
+                sample["use_gradient_checkpointing"] = checkpointing
+
+            def to_device(value):
+                if torch.is_tensor(value):
+                    return value.to(device)
+                if isinstance(value, dict):
+                    return {key: to_device(item) for key, item in value.items()}
+                return value
+
+            samples = [to_device(sample) for sample in samples]
+            inputs = batch(samples)
+            seen, projection_dtypes, time_dtypes = [], [], []
+            from veomni.models.diffusers.minimax_h3.minimax_h3_core.minimax_h3_dit import MiniMaxH3FP32Linear
+
+            for module in model.modules():
+                if isinstance(module, MiniMaxH3FP32Linear):
+                    module.register_forward_pre_hook(
+                        lambda module, args: projection_dtypes.append(module.weight.dtype)
+                    )
+            inner = model.get_base_model() if lora else model
+            inner.dit.blocks[0].register_forward_pre_hook(
+                lambda module, args, kwargs: time_dtypes.append(kwargs["t_emb"].dtype), with_kwargs=True
+            )
+            hook = model.register_forward_pre_hook(
+                lambda module, args, kwargs: seen.append((kwargs["img_position_ids"], kwargs["unique_timesteps"])),
+                with_kwargs=True,
+            )
+            single = model(**samples[0])
+            single_reference = reference(**samples[0])
+            with torch.no_grad():
+                one_element = model(**batch([samples[0]]))
+            for output in (single, one_element):
+                for prediction, baseline in zip(output.predictions, single_reference.predictions):
+                    torch.testing.assert_close(prediction, baseline, rtol=0.02, atol=0.002)
+            forward_calls = len(time_dtypes)
+            sum(single.loss.values()).backward()
+            if checkpointing:
+                assert len(time_dtypes) > forward_calls, "checkpointed blocks must recompute during backward"
+            sum(single_reference.loss.values()).backward()
+            grads, ref_grads = [], []
+            ref_params = dict(reference.named_parameters())
+            for name, parameter in model.named_parameters():
+                if parameter.requires_grad:
+                    grads.append(parameter.grad.full_tensor().float().flatten())
+                    ref_grads.append(ref_params[name].grad.float().flatten())
+            grads, ref_grads = torch.cat(grads), torch.cat(ref_grads)
+            assert (grads - ref_grads).norm() / ref_grads.norm() < 0.05
+            model.zero_grad(set_to_none=True)
+            reference.zero_grad(set_to_none=True)
+            actual = model(**inputs)
+            hook.remove()
+            expected = serial(reference, samples)
+            for actual_positions, positions in zip(seen[-1][0], inputs["img_position_ids"]):
+                torch.testing.assert_close(actual_positions, positions, rtol=0, atol=0)
+            for actual_timesteps, timesteps in zip(seen[-1][1], inputs["unique_timesteps"]):
+                torch.testing.assert_close(actual_timesteps, timesteps, rtol=0, atol=0)
+            assert projection_dtypes and set(projection_dtypes) == {torch.float32}
+            assert time_dtypes and set(time_dtypes) == {torch.float32}
+            for i, output in enumerate(expected):
+                for modality, baseline in enumerate(output.predictions):
+                    prediction = actual.predictions[modality][i]
+                    assert prediction.dtype == torch.float32
+                    torch.testing.assert_close(prediction, baseline, rtol=0.02, atol=0.002)
+            sum(actual.loss.values()).backward()
+            torch.stack([sum(output.loss.values()) for output in expected]).mean().backward()
+            actual_grads, expected_grads = [], []
+            reference_params = dict(reference.named_parameters())
+            for name, parameter in model.named_parameters():
+                if not parameter.requires_grad:
+                    continue
+                gradient = parameter.grad.full_tensor().float()
+                assert torch.isfinite(gradient).all()
+                actual_grads.append(gradient.flatten())
+                expected_grads.append(reference_params[name].grad.float().flatten())
+            actual_grads, expected_grads = torch.cat(actual_grads), torch.cat(expected_grads)
+            relative = (actual_grads - expected_grads).norm() / expected_grads.norm()
+            assert relative < 0.05, relative
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+            before = {
+                name: parameter.full_tensor().clone()
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+            }
+            optimizer.step()
+            changed = [
+                not torch.equal(parameter.full_tensor(), before[name])
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+            ]
+            assert any(changed)
+            if not lora and not checkpointing:
+                rounded = build_parallelize_model(
+                    build_foundation_model(
+                        copy.deepcopy(config),
+                        init_device="meta",
+                        torch_dtype="float32",
+                        ops_implementation=make_eager_ops_config(),
+                    ),
+                    weights_path=weights_path,
+                    init_device="meta",
+                    mixed_precision=MixedPrecisionConfig(enable=True, cast_forward_inputs=True),
+                    enable_gradient_checkpointing=False,
+                )
+                with pytest.raises(ValueError, match="cast_forward_inputs"):
+                    rounded(**samples[0])
+            dist.barrier()
+    finally:
+        clear_parallel_state()
+
+
+def _h3_precision_launch(context):
+    """Reserve two CPU ranks locally or two accelerator cards in CI."""
+    device = "cpu" if context.capabilities.backend == "cpu" else "accelerator"
+    return LaunchSpec(nproc=2, device=device)
+
+
+@pytest.mark.launch_plan(provider=_h3_precision_launch)
+@pytest.mark.parametrize(
+    ("checkpointing", "lora", "offload", "basic_modules"),
+    [
+        (False, False, False, None),
+        (True, False, False, None),
+        (False, True, False, None),
+        (True, True, False, None),
+        (True, False, True, None),
+        pytest.param(False, False, False, ["MiniMaxH3FinalLayer"], id="nested-final-layer"),
+    ],
+)
+def test_h3_precision_through_production_fsdp(tmp_path, checkpointing, lora, offload, basic_modules):
+    from tests.tools.launch_utils import torchrun
+
+    torchrun(
+        _run_h3_precision_fsdp,
+        world_size=2,
+        checkpointing=checkpointing,
+        lora=lora,
+        weights_path=str(tmp_path),
+        offload=offload,
+        basic_modules=basic_modules,
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("task", ["fl2va", "ref2va"])
+def test_h3_fp32_heads_support_multistep_bf16_anchors(task):
+    from tests.tools.training_utils import make_eager_ops_config
+    from veomni.models.auto import build_foundation_model
+    from veomni.models.diffusers.minimax_h3.inference import model_fn_minimax_h3
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.flow_match_scheduler import FlowMatchScheduler
+
+    model = build_foundation_model(
+        tiny_model().config, init_device="cpu", torch_dtype="bfloat16", ops_implementation=make_eager_ops_config()
+    )
+    row = raw_sample(9, task=task)
+    row = {key: value.bfloat16() if torch.is_tensor(value) else value for key, value in row.items()}
+    anchor = row["keyframe_cond_anchor" if task == "fl2va" else "ref_visual_anchor"]
+    video, audio = row["input_latents"], row["audio_input_latents"]
+    scheduler = FlowMatchScheduler()
+    scheduler.set_timesteps(3)
+    for step, timestep in enumerate(scheduler.timesteps[:2]):
+        t = float(1.0 - scheduler.sigmas[step])
+        with torch.no_grad():
+            video_pred, audio_pred = model_fn_minimax_h3(
+                model,
+                video,
+                audio,
+                row["packed"],
+                row["prompt_embeds"],
+                t_video=t,
+                t_audio=t,
+                **{"keyframe_cond_anchor" if task == "fl2va" else "ref_visual_anchor": anchor},
+            )
+        assert video_pred.dtype == audio_pred.dtype == torch.float32
+        video = scheduler.step(video_pred, timestep, video)
+        audio = scheduler.step(audio_pred, timestep, audio)
+        assert torch.isfinite(video).all() and torch.isfinite(audio).all()
+    assert anchor.dtype == torch.bfloat16

@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MLP hidden_act routing: silu/swish use swiglu_mlp, anything else uses act_fn."""
+"""MLP hidden_act routing: both families take the activation as a call argument.
+
+The dense MLP evaluates it between three GEMMs; the routed experts either do the
+same or delegate to their ``eager`` row. Nothing leaves the family for a Python
+loop, so every activation is asserted to reach exactly one handle call.
+"""
 
 from __future__ import annotations
 
@@ -32,7 +37,6 @@ from tests.models.tiny_configs import (
     tiny_qwen2_config,
     tiny_qwen3_moe_config,
 )
-from veomni.utils.device import IS_NPU_AVAILABLE
 
 
 HIDDEN_ACTS = ("silu", "swish", "gelu")
@@ -52,20 +56,13 @@ class _CallCounter:
         return self.inner(*args, **kwargs)
 
 
-def _raise_if_called(*_args, **_kwargs):
-    raise AssertionError("non-silu hidden_act must not call the fused SwiGLU / silu MoE kernel")
-
-
 def _init_parameters(module: nn.Module) -> None:
     for param in module.parameters():
         nn.init.normal_(param, std=0.02)
 
 
 def _generated_cls(family: str, class_name: str):
-    suffix = "npu" if IS_NPU_AVAILABLE and family != "qwen2" else "gpu"
-    module = importlib.import_module(
-        f"veomni.models.transformers.{family}.generated.patched_modeling_{family}_{suffix}"
-    )
+    module = importlib.import_module(f"veomni.models.transformers.{family}.modeling_{family}")
     return getattr(module, class_name)
 
 
@@ -75,16 +72,19 @@ def _pair(ours_cls, hf_cls, config):
     config._set_ops_implementation(eager_ops_config())
     ours = ours_cls(config)
     ours.load_state_dict(hf.state_dict())
+    # Both families take the activation as a call argument, so every activation
+    # reaches its row: ``gated_mlp`` evaluates it between the GEMMs, and
+    # ``moe_experts`` either does the same (``fused_triton`` / ``qat``) or delegates
+    # to its ``eager`` row for the rows whose kernel fuses SiLU internally. Nothing
+    # falls back to a Python loop outside the family any more, which is why this
+    # asserts the handle is called exactly once for every activation.
     counter = None
-    if config.hidden_act in {"silu", "swish"}:
-        handle_name = "veomni_swiglu_mlp" if hasattr(ours, "veomni_swiglu_mlp") else "veomni_moe"
-        counter = _CallCounter(getattr(ours, handle_name))
-        setattr(ours, handle_name, counter)
-    else:
-        if hasattr(ours, "veomni_swiglu_mlp"):
-            ours.veomni_swiglu_mlp = _raise_if_called
-        if hasattr(ours, "veomni_moe"):
-            ours.veomni_moe = _raise_if_called
+    if hasattr(ours, "veomni_gated_mlp"):
+        counter = _CallCounter(ours.veomni_gated_mlp)
+        ours.veomni_gated_mlp = counter
+    elif hasattr(ours, "veomni_moe"):
+        counter = _CallCounter(ours.veomni_moe)
+        ours.veomni_moe = counter
     return hf, ours, counter
 
 
@@ -145,7 +145,7 @@ def test_hidden_act_routes_silu_to_fused_kernel(family, class_name, hf_cls, conf
 def test_merged_experts_act_fn_forward_rejects_ep_sharded_weights_without_ep():
     from transformers.activations import ACT2FN
 
-    from veomni.models.utils.moe_utils import merged_experts_act_fn_forward
+    from veomni.ops.kernels.moe_experts.shared.act_fn_experts import merged_experts_act_fn_forward
 
     hidden = torch.randn(3, 4)
     top_k_index = torch.tensor([[3], [3], [3]], dtype=torch.long)

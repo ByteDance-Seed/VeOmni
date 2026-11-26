@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
-from dataclasses import fields
 from typing import TYPE_CHECKING, Any, Mapping
 
 import torch
@@ -150,6 +149,32 @@ def _reject_lora_that_matched_nothing(
         f"LoRA was configured for module(s) {requested} but produced no trainable "
         "adapters, and no other module has trainable parameters. "
         "Select at least one Linear or MoE target that a module actually declares."
+    )
+
+
+def _reject_sp_handoff_unsupported_modules(module_runtimes: Mapping[str, ModuleRuntime]) -> None:
+    """Fail a ``skip_sp_gather_between_modules`` run that includes a module which cannot take part.
+
+    The switch is run-wide: it says *every* module's ``post_forward`` hands its
+    sequence-parallel shard to the next module instead of all-gathering. A module
+    that keeps gathering (``PretrainedOmniModule.supports_sp_sharded_handoff`` is
+    ``False``) would then feed a full-sequence tensor to a consumer that expects a
+    shard, or itself receive a shard it cannot parse. Refuse at build time rather
+    than let one boundary silently disagree with the switch.
+    """
+    unsupported = sorted(
+        name for name, runtime in module_runtimes.items() if not runtime.omni_module.supports_sp_sharded_handoff
+    )
+    if not unsupported:
+        return
+    raise ValueError(
+        "`model.accelerator.skip_sp_gather_between_modules=True` hands every module's sequence-parallel "
+        f"shard straight to the next module, but these modules do not implement that handoff: {unsupported}. "
+        "They gather unconditionally (or scatter through a packed layout instead of the carrier), so a "
+        "boundary involving one of them would pass a full-sequence tensor where a shard is expected. "
+        "Disable `skip_sp_gather_between_modules`, or set "
+        "`supports_sp_sharded_handoff = True` on those modules once their "
+        "post_forward hands its shard on."
     )
 
 
@@ -288,9 +313,10 @@ class OmniModelRuntime:
         from .....distributed.torch_compile import CompileConfig
         from .....distributed.torch_parallelize import build_parallelize_model
 
-        compile_config = CompileConfig(
-            **{field.name: getattr(acc.torch_compile, field.name) for field in fields(CompileConfig)}
-        )
+        # Compilation is refused for this scope at parse time
+        # (``_validate_composed_wrap``), so nothing here compiles: this wrap only
+        # wraps and loads, and it is handed a disabled config to say so.
+        compile_config = CompileConfig(enable=False)
         opt = args.optimizer
         muon_expert_zero_comm = bool(opt) and opt.type == "muon" and opt.muon_expert_zero_comm
         weights_path = {name: runtime.weights_path for name, runtime in modules_to_wrap.items()}
@@ -306,6 +332,10 @@ class OmniModelRuntime:
             self.model = build_parallelize_model(
                 self.model,
                 init_device=acc.init_device,
+                # A composed wrap always applies FSDP2 to the parent; the
+                # per-module plan is inside it, so `extra_parallel_only` cannot be
+                # used here (`_validate_composed_wrap` refuses that pairing).
+                extra_parallel_only=False,
                 weights_path=weights_path,
                 should_skip_hf_weight_load=False,
                 enable_reshard_after_forward=acc.fsdp_config.reshard_after_forward,
@@ -318,7 +348,7 @@ class OmniModelRuntime:
                 enable_fsdp_offload=acc.fsdp_config.offload,
                 fsdp_offload_pin_memory=acc.fsdp_config.offload_pin_memory,
                 broadcast_model_weights_from_rank0=args.broadcast_model_weights_from_rank0,
-                ep_sharded_stream_load=args.ep_sharded_stream_load,
+                extra_parallel_stream_load=args.extra_parallel_stream_load,
                 max_load_broadcast_size=acc.fsdp_config.max_load_broadcast_size,
                 muon_expert_zero_comm=muon_expert_zero_comm,
                 expert_weight_fp8_all_gather=acc.fsdp_config.expert_weight_fp8_all_gather,
@@ -703,6 +733,8 @@ def build_omni_model_runtime(
     )
     if not for_inference:
         _reject_lora_that_matched_nothing(module_runtimes, train_args)
+        if bool(omni_model_runtime_args.accelerator.skip_sp_gather_between_modules):
+            _reject_sp_handoff_unsupported_modules(module_runtimes)
     runtime = OmniModelRuntime(
         OmniModel(omni_config, {name: rt.omni_module for name, rt in module_runtimes.items()}),
         module_runtimes=module_runtimes,

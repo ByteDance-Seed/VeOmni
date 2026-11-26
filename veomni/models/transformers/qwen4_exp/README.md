@@ -49,7 +49,7 @@ Supported in this correctness stage:
 
 The internal example uses `ple_size=8`, `ep_size=4`,
 `broadcast_model_weights_from_rank0=false`, and
-`ep_sharded_stream_load=true`. The world size and every padded PLE shard row
+`extra_parallel_stream_load=true`. The world size and every padded PLE shard row
 count must be divisible by `ple_size`; the number of experts must be divisible
 by `ep_size`. PLE and EP may be enabled together because their parameter sets
 and communication meshes are independent.
@@ -73,9 +73,11 @@ Known limitations:
   chunk gated-delta-rule kernels. GatedDeltaNet head counts must be divisible by
   the active `ulysses_size`/`cp_size`; QSA attention has no head-divisibility
   constraint because it keeps all query heads local and all-gathers only KV.
-  When `chunk_gated_delta_rule_implementation=flash_qla`, GatedDeltaNet
+  With `chunk_gated_delta_rule_implementation=flash_qla`, GatedDeltaNet
   preserves grouped Q/K heads (`num_k_heads < num_v_heads`) directly into the
   FlashQLA chunk kernel instead of expanding Q/K with `repeat_interleave`.
+  Qwen4-Exp does the same for `fla_npu`, whose AscendC chunk kernel supports
+  grouped value attention.
 - PLE n-gram history and its dilated convolution reset at explicit
   `cu_seq_lens_q` packed-sample boundaries. The halo-only fallback remains for
   direct component calls that do not provide packing metadata.

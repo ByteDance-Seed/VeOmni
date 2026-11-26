@@ -41,22 +41,13 @@ from veomni.utils.import_utils import is_package_available
 
 
 def _qwen3_classes():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.qwen3.modeling_qwen3 import (
+        Qwen3ForCausalLM,
+        Qwen3ForSequenceClassification,
+        Qwen3ForTokenClassification,
+        Qwen3Model,
+    )
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_npu import (
-            Qwen3ForCausalLM,
-            Qwen3ForSequenceClassification,
-            Qwen3ForTokenClassification,
-            Qwen3Model,
-        )
-    else:
-        from veomni.models.transformers.qwen3.generated.patched_modeling_qwen3_gpu import (
-            Qwen3ForCausalLM,
-            Qwen3ForSequenceClassification,
-            Qwen3ForTokenClassification,
-            Qwen3Model,
-        )
     return Qwen3ForCausalLM, Qwen3ForSequenceClassification, Qwen3ForTokenClassification, Qwen3Model
 
 
@@ -620,7 +611,7 @@ def test_qwen3_packed_sage_attention_matches_independent_samples(monkeypatch, av
 
 _requires_torchao = pytest.mark.skipif(
     not is_package_available("torchao"),
-    reason="the torchao_nvfp4 linear/swiglu_mlp rows need the optional 'torchao' package",
+    reason="the torchao linear/gated_mlp rows need the optional 'torchao' package",
 )
 
 
@@ -636,13 +627,15 @@ def _qwen3_with_ops(config: Qwen3Config, **ops):
 @_cpu
 def test_qwen3_attention_binds_the_configured_linear_row():
     """The attention projections read ``linear_implementation``; the MLP keeps its own field."""
-    model = _qwen3_with_ops(_tiny_config(), linear_implementation="eager", swiglu_mlp_implementation="eager")
+    model = _qwen3_with_ops(_tiny_config(), linear_implementation="eager", gated_mlp_implementation="eager")
 
     attention = model.model.layers[0].self_attn
-    assert isinstance(attention.veomni_linear, VeomniOp)
-    assert (attention.veomni_linear.op, attention.veomni_linear.variant) == ("linear", "standard")
-    assert attention.veomni_linear.impl == "eager"
-    assert model.model.layers[0].mlp.veomni_swiglu_mlp.impl == "eager"
+    for attr in ("veomni_q_proj", "veomni_k_proj", "veomni_v_proj", "veomni_o_proj"):
+        handle = getattr(attention, attr)
+        assert isinstance(handle, VeomniOp)
+        assert (handle.op, handle.variant) == ("linear", "standard")
+        assert handle.impl == "eager"
+    assert model.model.layers[0].mlp.veomni_gated_mlp.impl == "eager"
 
 
 @_cpu
@@ -682,9 +675,7 @@ def test_qwen3_nvfp4_qat_trains_and_rounds(device: str):
     torch.manual_seed(0)
     config = _tiny_config()
     eager = _qwen3_with_ops(config).to(device)
-    quantized = _qwen3_with_ops(
-        config, linear_implementation="torchao_nvfp4", swiglu_mlp_implementation="torchao_nvfp4"
-    ).to(device)
+    quantized = _qwen3_with_ops(config, linear_implementation="torchao", gated_mlp_implementation="torchao").to(device)
     quantized.load_state_dict(eager.state_dict())
 
     input_ids = torch.randint(3, config.vocab_size, (2, 8), device=device)
@@ -712,24 +703,29 @@ def test_qwen3_nvfp4_qat_rounds_exactly_the_projection_weights(monkeypatch):
     A forward-output test cannot tell a recipe that quantizes one tensor too few
     from the right one, so this records which parameters reach the quantizer.
     """
-    import veomni.ops.kernels.linear.standard.torchao_nvfp4 as linear_row
-    import veomni.ops.kernels.swiglu_mlp.standard.torchao_nvfp4 as mlp_row
+    import veomni.ops.kernels.gated_mlp.standard.torchao as mlp_row
+    import veomni.ops.kernels.linear.standard.torchao as linear_row
 
     config = _tiny_config()
-    model = _qwen3_with_ops(config, linear_implementation="torchao_nvfp4", swiglu_mlp_implementation="torchao_nvfp4")
+    model = _qwen3_with_ops(config, linear_implementation="torchao", gated_mlp_implementation="torchao")
     names_by_ptr = {param.data_ptr(): name for name, param in model.named_parameters()}
     rounded = set()
 
     for row in (linear_row, mlp_row):
-        original = row.nvfp4_fake_quant
+        original_factory = row.torchao_fake_quant
 
-        def record(tensor, *args, _original=original, **kwargs):
-            name = names_by_ptr.get(tensor.data_ptr())
-            if name is not None:
-                rounded.add(name)
-            return _original(tensor, *args, **kwargs)
+        def make_recorder(dtype, _original_factory=original_factory):
+            quantize = _original_factory(dtype)
 
-        monkeypatch.setattr(row, "nvfp4_fake_quant", record)
+            def record(tensor, *args, **kwargs):
+                name = names_by_ptr.get(tensor.data_ptr())
+                if name is not None:
+                    rounded.add(name)
+                return quantize(tensor, *args, **kwargs)
+
+            return record
+
+        monkeypatch.setattr(row, "torchao_fake_quant", make_recorder)
 
     model(input_ids=torch.randint(3, config.vocab_size, (1, 8)), use_cache=False)
 
@@ -755,10 +751,8 @@ def test_qwen3_nvfp4_qat_rounds_exactly_the_projection_weights(monkeypatch):
 @pytest.mark.parametrize(
     ("ops", "targets"),
     [
-        pytest.param(
-            {"linear_implementation": "torchao_nvfp4"}, ["q_proj", "k_proj", "v_proj", "o_proj"], id="attention"
-        ),
-        pytest.param({"swiglu_mlp_implementation": "torchao_nvfp4"}, ["gate_proj", "up_proj", "down_proj"], id="mlp"),
+        pytest.param({"linear_implementation": "torchao"}, ["q_proj", "k_proj", "v_proj", "o_proj"], id="attention"),
+        pytest.param({"gated_mlp_implementation": "torchao"}, ["gate_proj", "up_proj", "down_proj"], id="mlp"),
     ],
 )
 @_cpu
@@ -772,7 +766,7 @@ def test_qwen3_nvfp4_qat_refuses_a_wrapped_projection(ops, targets):
     model = _qwen3_with_ops(config, **ops)
     inject_dense_lora(model.model, VeOmniLoraConfig(r=8, lora_alpha=16, target_modules=targets), "default")
 
-    with pytest.raises(ValueError, match="torchao_nvfp4.* cannot run on"):
+    with pytest.raises(ValueError, match="torchao.* cannot run on"):
         model(input_ids=torch.randint(3, config.vocab_size, (1, 4)), use_cache=False)
 
 
