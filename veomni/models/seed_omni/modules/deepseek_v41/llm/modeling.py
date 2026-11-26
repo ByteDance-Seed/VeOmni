@@ -1606,7 +1606,7 @@ class DeepseekV41Indexer(nn.Module):
                         f"Layer {self.layer_idx} indexes inside the candidate blocks but none were published; "
                         "candidate_source_layer_id must name a layer in index_source_layer_ids"
                     )
-                ranked = scores.masked_fill(~shared.candidates, -torch.inf)
+                ranked = _mask_scores_by_candidates(scores, shared.candidates, self.candidate_block_size, inplace=True)
 
             topk_res = ranked.topk(topk, dim=-1, sorted=False)
             selected, order = topk_res.indices.sort(dim=-1)

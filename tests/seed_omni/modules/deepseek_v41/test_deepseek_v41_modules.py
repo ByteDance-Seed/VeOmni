@@ -603,6 +603,29 @@ class TestReviewRegressions:
         assert torch.isfinite(student[topk_idxs == 0]).all()
         assert torch.isneginf(student[topk_idxs == -1]).all()
 
+        # Eager indexer also accepts a compact block mask published by a TileLang candidate source.
+        cfg_block = tiny_llm_config(
+            num_hidden_layers=3,
+            compress_ratios=[2, 1, 1],
+            kv_source_layer_ids=[0, 1],
+            index_source_layer_ids=[0, 1, 2],
+            candidate_source_layer_id=1,
+            engram_layer_ids=[0],
+            dspark_target_layer_ids=[0, 1, 2],
+            index_topk=4,
+            candidate_block_size=2,
+            candidate_topk_blocks=1,
+        )
+        idx_block = DeepseekV41Indexer(cfg_block, layer_idx=2)
+        num_blocks = (plan.compressed_len + cfg_block.candidate_block_size - 1) // cfg_block.candidate_block_size
+        block_mask = torch.zeros(1, seq_len, num_blocks, dtype=torch.bool)
+        block_mask[:, :, 0] = True  # covers slots 0 and 1
+        topk_blk, _ = idx_block(
+            hidden, q_res, index_k, plan, SharedAttentionState(candidates=block_mask), cos, sin, return_scores=False
+        )
+        assert ((topk_blk == -1) | (topk_blk == 0) | (topk_blk == 1)).all()
+        assert (topk_blk[:, 1:] == 1).any()
+
         # _indexer_loss handles width == 0 without negative-zero slicing.
         attn = DeepseekV41Attention(cfg_cand, layer_idx=0)
         q = torch.randn(1, 2, cfg_cand.num_attention_heads, cfg_cand.head_dim)
