@@ -684,10 +684,16 @@ class LoraSharedExperts(nn.Module):
                 # underlying storage.
                 if local_storage.is_contiguous():
                     dist.all_reduce(local_storage, op=dist.ReduceOp.SUM, group=ep_group)
+                    buffer_to_scale = local_storage
                 else:
                     buf = local_storage.contiguous()
                     dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=ep_group)
                     local_storage.copy_(buf)
+                    buffer_to_scale = local_storage
+                # Without an FSDP wrap (`extra_parallel_only`), divide the EP-summed
+                # accumulated grad by world_size here so multi-microbatch scaling stays exact.
+                if getattr(ps, "extra_parallel_only", False):
+                    buffer_to_scale.div_(ps.world_size)
 
             return _hook
 

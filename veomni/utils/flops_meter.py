@@ -50,6 +50,20 @@ def _extract_minimax_h3_metadata(micro_batch):
     seq_lens, text_lens = [], []
     for sample in micro_batch if isinstance(micro_batch, list) else [micro_batch]:
         packed = sample.get("packed")
+        if packed is None:
+            prompts, latents = sample.get("prompt_embeds"), sample.get("clean_latents")
+            if prompts is None or latents is None:
+                continue
+            references = sample.get("reference_latents")
+            for index, (prompt, latent) in enumerate(zip(prompts, latents, strict=True)):
+                image_latents = (latent, *(references[index] or ())) if references is not None else (latent,)
+                if any(image.ndim != 4 or image.shape[0] != 1 for image in image_latents):
+                    continue
+                text_len = prompt.shape[-2]
+                image_len = sum((image.shape[-2] // 2) * (image.shape[-1] // 2) for image in image_latents)
+                seq_lens.append(text_len + image_len)
+                text_lens.append(text_len)
+            continue
         if isinstance(packed, dict):
             packed = [packed]
         if not isinstance(packed, (list, tuple)) or not packed:

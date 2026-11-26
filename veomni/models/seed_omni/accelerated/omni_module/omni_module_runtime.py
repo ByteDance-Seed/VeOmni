@@ -67,6 +67,38 @@ def composed_model_owns_wrap(accelerator: "AcceleratorConfig") -> bool:
     return fsdp_config.fsdp_scope == "model" and fsdp_config.fsdp_mode != "eager"
 
 
+def module_compile_config(accelerator: "AcceleratorConfig", *, global_accelerator=None):
+    """This module's compile settings, or everything off unless the run asked for it.
+
+    ``enable`` needs the module's resolved ``torch_compile.enable`` and an
+    ``fsdp2`` wrap — and, when ``global_accelerator`` is given (i.e. under
+    ``fsdp_scope='model'``), an ``fsdp2`` launcher too, because that wrap is the
+    top-level one. Which blocks compile, and whether ``dynamic`` is used, come
+    from the config alone; there is no per-model capability flag.
+
+    ``fsdp_scope='model'`` is already refused for ``torch_compile`` at parse time
+    (:func:`veomni.arguments.omni_arguments_types._validate_composed_wrap`), so
+    the launcher leg below is a guard for runtimes built directly rather than
+    through the launcher.
+    """
+    from .....distributed.torch_compile import CompileConfig
+
+    run_config = accelerator.torch_compile
+    fsdp2 = accelerator.fsdp_config.fsdp_mode == "fsdp2"
+    wrap_fsdp2 = global_accelerator is None or global_accelerator.fsdp_config.fsdp_mode == "fsdp2"
+    enabled = bool(run_config.enable) and fsdp2 and wrap_fsdp2
+    return CompileConfig(
+        enable=enabled,
+        backend=run_config.backend,
+        mode=run_config.mode,
+        fullgraph=run_config.fullgraph,
+        # Only a module that compiles gets a shape policy; a disabled module's is
+        # irrelevant, and pinning it to False keeps an eager module's config from
+        # reading as if it had asked for symbolic shapes.
+        dynamic=run_config.dynamic if enabled else False,
+    )
+
+
 class ModuleRuntime(VeOmniModelRuntime):
     """One OmniModule's training unit (model + optimizer + lr_scheduler + FSDP2).
 
@@ -433,13 +465,13 @@ class ModuleRuntime(VeOmniModelRuntime):
         )
 
     def _build_parallelized_model(self) -> None:
-        """FSDP2/DDP-wrap this module and load its weights.
+        """Let the base build compile and wrap — except when the composed model owns the wrap.
 
-        When ``fsdp_scope='model'``, only async activation offload is applied
-        here, since it must precede the wrap: the module stays on meta (freeze
-        already applied) so :class:`OmniModelRuntime` can wrap the composed
-        parent once, then :meth:`build_after_omni_model_wrap` builds the
-        optimizer on the now-DTensor parameters.
+        Under ``fsdp_scope='model'`` the composed ``OmniModel`` wraps once, so this
+        module applies what must precede that wrap and returns instead of calling
+        the base build. Compilation is not part of that: the launcher rejects
+        ``torch_compile`` under this scope in ``_validate_composed_wrap``, so there
+        is nothing here to compile and no per-module compile log to emit.
         """
         if self.wrap_omni_model:
             self._apply_async_activation_offload()
@@ -449,6 +481,21 @@ class ModuleRuntime(VeOmniModelRuntime):
             )
             return
         super()._build_parallelized_model()
+
+    def _compile_config(self):
+        """This module's compile settings, or everything off if it did not opt in.
+
+        Under ``fsdp_scope='model'`` the composed ``OmniModel`` does the wrapping,
+        so the launcher's ``fsdp_mode`` has to be consulted as well: that wrap
+        refuses DDP, and a module overlay saying ``fsdp2`` cannot change it.
+        Under ``fsdp_scope='module'`` the module's own overlay *is* its wrap, so
+        the launcher is not consulted — otherwise a ``fsdp2`` child would be
+        disabled by a ``ddp`` launcher default it never uses.
+        """
+        return module_compile_config(
+            self.args.accelerator,
+            global_accelerator=self._global_accelerator if self.wrap_omni_model else None,
+        )
 
     def build_after_omni_model_wrap(self) -> None:
         """Training steps that need the wrapped parameters, once the composed OmniModel is wrapped.

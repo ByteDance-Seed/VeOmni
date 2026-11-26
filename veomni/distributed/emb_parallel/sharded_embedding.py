@@ -114,7 +114,7 @@ class ShardedEmbedding(nn.Embedding):
         return True
 
     def _check_own_fsdp_unit(self) -> None:
-        if not isinstance(self, FSDPModule):
+        if not isinstance(self, FSDPModule) and not getattr(get_parallel_state(), "extra_parallel_only", False):
             # Inside a parent unit the rows are plain and correctly shaped, but that unit sharded and
             # gathered them over the whole FSDP mesh, mixing different ranks' vocab slices.
             raise RuntimeError(
@@ -124,6 +124,13 @@ class ShardedEmbedding(nn.Embedding):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if not self._is_split():
+            if self.weight.device != input.device:
+                # A host-resident table (CPU offload): `super().forward` would index
+                # it with an accelerator tensor and raise. Read where the table
+                # lives, then hand the rows back on the input's device.
+                out_device = input.device
+                out = super().forward(input.to(self.weight.device))
+                return out.to(out_device, non_blocking=True)
             return super().forward(input)
         if self.max_norm is not None or self.scale_grad_by_freq or self.sparse:
             raise NotImplementedError(
