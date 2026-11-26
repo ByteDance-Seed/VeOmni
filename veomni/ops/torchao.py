@@ -52,6 +52,7 @@ __all__ = [
     "NVFP4_BLOCK_SIZE",
     "TORCHAO_REQUIRED_VERSION",
     "nvfp4_fake_quant",
+    "require_torchao_version",
     "torchao_fake_quant",
     "torchao_fp8_linear",
     "validate_float8_recipe",
@@ -76,17 +77,17 @@ def validate_float8_recipe(recipe: str) -> str:
     return recipe
 
 
-def _require_torchao_version() -> None:
-    """Verify the pinned torchao extra is installed before importing ``torchao.float8``."""
+def require_torchao_version() -> None:
+    """Verify the installed torchao version matches the low-precision training APIs."""
+    requirement = f"TorchAO-backed low-precision training requires torchao=={TORCHAO_REQUIRED_VERSION}"
     try:
         installed_version = version("torchao")
     except PackageNotFoundError as exc:
         raise ImportError(
-            f"float8 training requires torchao=={TORCHAO_REQUIRED_VERSION}, which is an optional extra: "
-            "uv sync --extra gpu --extra float8 --dev"
+            f"{requirement}, which is an optional extra: uv sync --extra gpu --extra float8 --dev"
         ) from exc
     if Version(installed_version).public != TORCHAO_REQUIRED_VERSION:
-        raise ImportError(f"float8 training requires torchao=={TORCHAO_REQUIRED_VERSION}; found {installed_version}.")
+        raise ImportError(f"{requirement}; found {installed_version}.")
 
 
 _FLOAT8_CONFIG_CACHE: dict[tuple[str, bool], tuple] = {}
@@ -105,7 +106,7 @@ def _float8_linear_configs(recipe: str, emulated: bool):
     if cached is not None:
         return cached
 
-    _require_torchao_version()
+    require_torchao_version()
 
     from torchao.float8.config import Float8LinearConfig
     from torchao.float8.float8_training_tensor import LinearMMConfig, ScaledMMConfig

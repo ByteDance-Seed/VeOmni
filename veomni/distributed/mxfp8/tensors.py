@@ -24,8 +24,6 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 from torch.utils import _pytree as pytree
 
-from ...ops.platform import NVIDIA_SM100_PLUS
-from ...ops.torchao import _require_torchao_version
 from ...utils import device
 
 
@@ -55,7 +53,10 @@ def _require_mxfp8_runtime(native_device: torch.device | None) -> None:
     """Check the pinned prototype API once per execution device, outside the compiled graph."""
     if native_device in _CHECKED_MXFP8_DEVICES:
         return
-    _require_torchao_version()
+    from ...ops.platform import NVIDIA_SM100_PLUS
+    from ...ops.torchao import require_torchao_version
+
+    require_torchao_version()
     if native_device is not None and (
         not device.is_nvidia_cuda_device(native_device)
         or device.get_gpu_compute_capability(native_device) < NVIDIA_SM100_PLUS.min_cc

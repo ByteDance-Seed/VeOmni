@@ -129,7 +129,9 @@ def test_conversion_rejects_incompatible_torchao(monkeypatch, emulate):
 
     monkeypatch.setattr(tensors, "_CHECKED_MXFP8_DEVICES", set())
     monkeypatch.setattr(torchao, "version", lambda package: "0.19.0")
-    with pytest.raises(ImportError, match=r"torchao==0\.18\.0; found 0\.19\.0"):
+    with pytest.raises(
+        ImportError, match=r"TorchAO-backed low-precision training requires torchao==0\.18\.0; found 0\.19\.0"
+    ):
         MXFP8Linear.from_float(nn.Linear(64, 64), all_gather=False, emulate=emulate)
 
 
