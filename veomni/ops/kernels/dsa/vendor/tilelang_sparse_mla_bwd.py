@@ -26,8 +26,38 @@ import torch
 from tilelang import language as T
 
 
-# KV length granularity these kernels are specialized on; see sparse_mqa_bwd_interface.
-KV_BLOCK = 1024
+# KV length granularity these kernels are specialized on; see _bucket_s_kv.
+KV_BLOCK = 32768
+
+
+def _bucket_s_kv(unpadded_S_kv: int) -> int:
+    """Round a KV length up to the bucket these kernels compile for.
+
+    The compressor shifts ``S_kv`` by a few tokens every step and the backward
+    kernel specializes on it, so rounding to a coarse bucket is what keeps the
+    JIT from recompiling mid-training. Returning the raw length (or rounding to
+    a fine block) costs roughly 50 s of a 170 s step in compiles.
+    """
+    if unpadded_S_kv <= KV_BLOCK:
+        return KV_BLOCK
+    if unpadded_S_kv <= 65536:
+        return 65536
+    if unpadded_S_kv <= 163840:
+        return 163840
+    return (unpadded_S_kv + 65535) // 65536 * 65536
+
+
+def _bucket_topk(topk: int, block_size: int = 32) -> int:
+    """Round ``topk`` to a bucket the backward kernel can be compiled for.
+
+    Packed dynamic-batch sequences leave ``compressed_len`` a few tokens below
+    ``index_topk`` (e.g. 460..511 out of 512), so the caller asks for slightly
+    different ``topk`` values across samples and steps. Collapsing that range to
+    one bucket keeps every step on the same compiled kernel.
+    """
+    if 192 < topk <= 640:
+        return 640
+    return (topk + block_size - 1) // block_size * block_size
 
 
 def cta_threads(block_H, block_size):
@@ -357,9 +387,8 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     assert unpadded_S_kv > 0, "kv must have at least one row"
     topk = topk_idxs.shape[-1]
 
-    # Pad topk to next multiple of block_size (kernel requires divisibility)
-    block_size = 32
-    padded_topk = (topk + block_size - 1) // block_size * block_size
+    # Pad topk to a bucket the kernel can be compiled for; see _bucket_topk.
+    padded_topk = _bucket_topk(topk)
     if padded_topk != topk:
         pad = torch.full((B, S, padded_topk - topk), -1, device=topk_idxs.device, dtype=topk_idxs.dtype)
         topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
@@ -374,26 +403,17 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
         lse = torch.cat([lse, lse.new_zeros(B, S, head_pad)], dim=2).contiguous()
         attn_sink = torch.cat([attn_sink, attn_sink.new_zeros(head_pad)])
 
-    # Pad KV to a whole number of blocks. The compressor makes S_kv drift by a few
-    # tokens per step, and these kernels specialize on it, so the raw length would
-    # recompile them mid-training (seconds of stall per new length). Rounding up
-    # bounds the variant count while keeping S_kv a compile-time constant, which the
-    # indirect KV gather needs for static strides -- feeding the length in as a
-    # runtime value instead costs ~15% on the backward kernel.
+    # Pad KV to a bucket; see _bucket_s_kv. Keeping S_kv a compile-time constant is
+    # what the indirect KV gather needs for static strides -- feeding the length in
+    # as a runtime value instead costs ~15% on the backward kernel.
     #
     # Widening S_kv also widens the kernel's in-range check, so indices at or past
     # the real length are dropped here to keep them out of the pad rows.
-    #
-    # topk is the other key these kernels specialize on. It stays pinned only while
-    # the compressor emits at least index_topk tokens, since the caller asks for
-    # sliding_window + min(compressed_len, index_topk) candidates. It is left
-    # unrounded on purpose: the main loop iterates over topk, so padding it would buy
-    # fewer recompiles at the price of proportionally more kernel time.
-    kv_pad = -unpadded_S_kv % KV_BLOCK
+    S_kv = _bucket_s_kv(unpadded_S_kv)
+    kv_pad = S_kv - unpadded_S_kv
     if kv_pad:
         topk_idxs = torch.where(topk_idxs < unpadded_S_kv, topk_idxs, -1)
         kv = torch.cat([kv, kv.new_zeros(B, kv_pad, D)], dim=1).contiguous()
-    S_kv = unpadded_S_kv + kv_pad
 
     preprocess_kernel = preprocess(B, padded_H, D)
     bwd_kernel = bwd(B, S_kv, padded_H, D, topk, sm_scale)

@@ -249,8 +249,13 @@ def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I
     assert seq_len_kv > 0, "kv must have at least one row"
     _, _, topk = topk_idxs.shape
 
-    # Pad topk to next multiple of block_I (kernel requires divisibility)
-    padded_topk = (topk + block_I - 1) // block_I * block_I
+    # Pad topk to next multiple of block_I (kernel requires divisibility).
+    # Leave <= 192 unbucketed so fixed-width sliding_window + 1 (129) callers
+    # such as DSpark MTP do not pay for 640-wide padding.
+    if 192 < topk <= 640 and block_I == 64:
+        padded_topk = 640
+    else:
+        padded_topk = (topk + block_I - 1) // block_I * block_I
     if padded_topk != topk:
         pad = torch.full((batch, seq_len, padded_topk - topk), -1, device=topk_idxs.device, dtype=topk_idxs.dtype)
         topk_idxs = torch.cat([topk_idxs, pad], dim=-1).contiguous()
@@ -272,3 +277,27 @@ def sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=None, block_I
     )
     out, lse = kernel(q, kv, attn_sink, topk_idxs)
     return out[:, :, :heads].contiguous(), lse[:, :, :heads].contiguous()
+
+
+@torch.library.custom_op("DSA::sparse_mqa_fwd", mutates_args=())
+def _sparse_mqa_fwd_custom_op(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    sm_scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out, lse = sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale)
+    return out, lse
+
+
+@_sparse_mqa_fwd_custom_op.register_fake
+def _(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    sm_scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, seq_len, heads, dim = q.shape
+    return torch.empty_like(q), q.new_empty((batch, seq_len, heads), dtype=torch.float32)

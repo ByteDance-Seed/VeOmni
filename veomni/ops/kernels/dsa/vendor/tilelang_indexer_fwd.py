@@ -167,7 +167,11 @@ def indexer_fwd_interface(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logi
     block_q = 128 // heads
     block_n = 256
     padded_seq_len = (seq_len + block_q - 1) // block_q * block_q
-    padded_seq_len_kv = (seq_len_kv + block_n - 1) // block_n * block_n
+    # Packed sequences can start at a non-zero ``cu_k_s_min`` that is not a
+    # multiple of ``block_n``, so ``cu_k_s_min + ceildiv(span, block_n) * block_n``
+    # can reach up to ``seq_len_kv + block_n - 1``. Pad by one extra block so the
+    # kernel's tiled loads/stores stay in-bounds for any packed offset.
+    padded_seq_len_kv = ((seq_len_kv + block_n - 1) // block_n + 1) * block_n
     if padded_seq_len != seq_len:
         q = torch.cat([q, q.new_zeros(padded_seq_len - seq_len, heads, index_dim)], dim=0)
         weights = torch.cat([weights, weights.new_zeros(padded_seq_len - seq_len, heads)], dim=0)
@@ -208,6 +212,14 @@ def batched_indexer_fwd(q, k, weights, cu_seqlen_ks, cu_seqlen_ke):
     """
     seqlen, batch, heads, dim = q.shape
     seq_len_kv = k.shape[0]
+    if batch == 1:
+        return indexer_fwd_interface(
+            q[:, 0, :, :].contiguous(),
+            k[:, 0, :].contiguous(),
+            weights[:, 0, :].contiguous(),
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+        ).unsqueeze(0)
 
     all_logits = torch.empty([batch, seqlen, seq_len_kv], device=q.device, dtype=torch.float32)
     for b in range(batch):
@@ -219,3 +231,27 @@ def batched_indexer_fwd(q, k, weights, cu_seqlen_ks, cu_seqlen_ke):
             cu_seqlen_ke,
         )
     return all_logits
+
+
+@torch.library.custom_op("DSA::lighting_indexer_fwd", mutates_args=())
+def _lighting_indexer_fwd_custom_op(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    return batched_indexer_fwd(q, k, weights, cu_seqlen_ks, cu_seqlen_ke)
+
+
+@_lighting_indexer_fwd_custom_op.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    seqlen, batch, _, _ = q.shape
+    seq_len_kv = k.shape[0]
+    return q.new_empty((batch, seqlen, seq_len_kv), dtype=torch.float32)
