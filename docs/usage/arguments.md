@@ -916,7 +916,8 @@ See [HyperParallel](../key_features/hyper_parallel.md) for installation and conf
 > On NCCL, PyTorch's default `PreMulSum` path for `gradient_divide_factor != reduce_scatter_size`
 > truncates power-of-two `1 / 2^k` scalars to `bfloat16(0.0)` and silently zeroes ExtraParallel
 > gradients. Persistent ExtraParallel dimensions (such as Qwen4-Exp `ple`, which skip FSDP
-> wrapping and scale gradients in their own backward), modules without an ExtraParallel plan
+> wrapping and scale gradients in their own backward), fully frozen ExtraParallel units
+> (which have no trainable parameters and run no gradient reduction), modules without an ExtraParallel plan
 > (such as SeedOmni sub-modules inheriting a global `ep_size`), `extra_parallel_only` runs,
 > Ascend NPU (HCCL, which patches `PREMUL_SUM` to `SUM` + local scaling via
 > `apply_hccl_premul_sum_patch()`), Cambricon MLU (CNCL), and non-FSDP2 modes (`ddp`, `eager`)

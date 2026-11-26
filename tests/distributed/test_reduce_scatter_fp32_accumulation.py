@@ -820,6 +820,7 @@ class TestBf16ReduceOverAnExtraParallelCollective:
         enable_mp=True,
         persistent=False,
         declared_in_plan=True,
+        freeze_experts=False,
         npu=False,
         mlu=False,
     ):
@@ -899,6 +900,8 @@ class TestBf16ReduceOverAnExtraParallelCollective:
         # A dense layer precedes the EP layer so refusal verifies zero partial wrapping.
         model.dense = ToyDense()
         model.decoder = ToyDecoder()
+        if freeze_experts:
+            model.decoder.experts.requires_grad_(False)
         model._no_split_modules = ["ToyDense", "ToyDecoder"]
         model.decoder.experts.set_gradient_divide_factor = lambda factor: None
         model.decoder.experts.set_reduce_scatter_divide_factor = lambda factor: None
@@ -973,6 +976,21 @@ class TestBf16ReduceOverAnExtraParallelCollective:
                 mesh_shape=(4,),
                 reduce_dtype=reduce_dtype,
             )
+
+    @pytest.mark.parametrize("reduce_dtype", ["bfloat16", None])
+    def test_frozen_ep_unit_is_exempt_from_bf16_guard(self, monkeypatch, mock_fsdp_builder, reduce_dtype):
+        # 4 ranks, ep_size=2 -> ep_fsdp=2, but experts are frozen so no EP gradient reduction runs.
+        result, wrap_calls = self._run_parallelize(
+            monkeypatch,
+            mock_fsdp_builder,
+            para_name="ep",
+            para_size=2,
+            mesh_shape=(2,),
+            reduce_dtype=reduce_dtype,
+            freeze_experts=True,
+        )
+        assert result is not None
+        assert result.decoder.experts in wrap_calls
 
     def test_singleton_ep_group_accepts_bfloat16(self, monkeypatch, mock_fsdp_builder):
         result, wrap_calls = self._run_parallelize(

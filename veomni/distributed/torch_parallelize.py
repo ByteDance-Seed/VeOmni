@@ -1082,7 +1082,8 @@ def parallelize_model_fsdp2(
     # Validate BF16 ExtraParallel reduce-scatter groups before wrapping any layer so
     # an incompatible topology fails cleanly without partially mutating the model.
     # Persistent ExtraParallel modules (e.g. Qwen4-Exp PLE) skip FSDP wrapping and
-    # are skipped here by the exact same predicate.
+    # are skipped here by the exact same predicate; fully frozen units never run
+    # gradient reduction and are also skipped.
     para_sizes = getattr(parallel_state, "extra_parallel_sizes", None) or {}
     for _layer_fqn, (_layer_mod, extra_parallel_mod) in layer_pairs_list:
         for para in parallel_state.extra_parallel_names:
@@ -1093,6 +1094,8 @@ def parallelize_model_fsdp2(
                 if isinstance(_para_mod, FSDPModule):
                     continue
                 if any(param in persistent_extra_parallel_params for param in _para_mod.parameters()):
+                    continue
+                if not any(param.requires_grad for param in _para_mod.parameters()):
                     continue
                 _validate_extra_parallel_bf16_reduce_scatter(
                     para,
