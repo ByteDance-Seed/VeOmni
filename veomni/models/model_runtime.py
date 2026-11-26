@@ -408,7 +408,22 @@ class VeOmniModelRuntime:
             recompute_context=self._recompute_context(),
             offload_active=self.args.accelerator.offload_config.enable_activation
             or self.args.accelerator.offload_config.enable_async_activation,
-            compile_enabled=self.args.accelerator.torch_compile.enable,
+            # The resolved config, not the raw switch: a SeedOmni module under DDP
+            # has ``torch_compile.enable`` set on the launcher but resolves to a
+            # disabled config, and its policy has to follow what actually compiles.
+            compile_enabled=self._compile_config().enable,
+        )
+
+    def _compile_config(self):
+        """``CompileConfig`` for this model's wrap, taken from its ``accelerator``.
+
+        SeedOmni's :class:`ModuleRuntime` overrides this to read its own module's
+        ``accelerator`` and to honour the composed-wrap split.
+        """
+        from ..distributed.torch_compile import CompileConfig
+
+        return CompileConfig(
+            **{field.name: getattr(self.args.accelerator.torch_compile, field.name) for field in fields(CompileConfig)}
         )
 
     def _build_parallelized_model(self) -> None:
@@ -467,11 +482,8 @@ class VeOmniModelRuntime:
         recompute_policy = self._build_recompute_policy()
 
         from ..distributed import torch_parallelize
-        from ..distributed.torch_compile import CompileConfig
 
-        compile_config = CompileConfig(
-            **{field.name: getattr(args.accelerator.torch_compile, field.name) for field in fields(CompileConfig)}
-        )
+        compile_config = self._compile_config()
         self.model = torch_parallelize.build_parallelize_model(
             self.model,
             init_device=args.accelerator.init_device,

@@ -483,17 +483,19 @@ group or learning rate is therefore a recipe choice beyond the reference, not a 
 
 ### TorchCompileConfig
 
-`model.accelerator.torch_compile.*` — Per-block `torch.compile` options for text training and dense Qwen3-VL training. Both paths require FSDP2 on CUDA, `train.dyn_bsz=True`, and `train.pad_to_length=True`, so packed token tensors have stable shapes. For Qwen3-VL, only `Qwen3VLTextDecoderLayer` forwards are compiled; the vision tower, DeepStack injection, and language-model head remain eager. Different packed FlashAttention boundaries can produce separate Inductor specializations, so Qwen3-VL currently requires the default `backend="inductor"` and `mode=None` without CUDA Graph replay, `model.accelerator.torch_compile.dynamic=False`, `model.accelerator.ulysses_size=1`, `model.accelerator.cp_size=1`, and `model.accelerator.enable_async=False`. Qwen3-VL-MoE, ExtraParallel, DDP, non-FSDP, NPU, and other multimodal models remain unsupported and fail explicitly.
-
-The default `mode=None` follows TorchTitan's main path by using the `inductor` backend without CUDA Graph replay. Setting `mode="reduce-overhead"` explicitly enables CUDA Graphs on the `inductor` backend and requires `model.accelerator.fsdp_config.reshard_after_forward=False`. When CUDA Graphs are enabled, each micro-batch calls `torch.compiler.cudagraph_mark_step_begin()` when available so CUDA Graph Trees can separate iterations.
+`model.accelerator.torch_compile.*` — per-block `torch.compile` options. A model
+wraps the blocks it declares eligible, so `enable: true` is all a supported model
+needs; SeedOmni adds a per-module gate on top. See
+[Per-Block torch.compile](../key_features/torch_compile.md) for which blocks
+compile, the difference between the two trainers, and the measured payoff.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| enable | `bool` | `False` | Enable per-block `torch.compile` on supported FSDP2 decoder blocks. |
+| enable | `bool` | `False` | Compile the blocks this model declares. |
 | backend | `Optional[str]` | `"inductor"` | Backend passed to `torch.compile`. |
-| mode | `Optional[str]` | `None` | Mode passed to `torch.compile`. `None` uses the `inductor` backend default. `"reduce-overhead"` enables CUDA Graphs on the `inductor` backend, requires `model.accelerator.fsdp_config.reshard_after_forward=False`, and must be `None` when `backend="cudagraphs"`. |
+| mode | `Optional[str]` | `None` | Mode passed to `torch.compile`. `None` uses the `inductor` default. `"reduce-overhead"` enables CUDA Graphs and requires `model.accelerator.fsdp_config.reshard_after_forward=False`; must be `None` when `backend="cudagraphs"`. |
 | fullgraph | `bool` | `True` | Whether to pass `fullgraph=True` to `torch.compile`. |
-| dynamic | `bool` | `False` | Whether to pass `dynamic=True` to `torch.compile`. |
+| dynamic | `bool` or unset | unset | Whether to pass `dynamic` to `torch.compile`. Leave it unset: torch compiles a static first graph and promotes it when a shape changes. `False` turns that promotion into a hard `FailOnRecompileLimitHit` once `torch._dynamo.config.cache_size_limit` (8) is exhausted — `pad_to_length` pins the text token count but not a vision tower's patch count. `True` traces symbolically from the first call and breaks custom autograd `Function`s that chain two Triton kernels (the fused-Triton MoE experts). |
 
 ### OptimizerConfig
 

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 from contextlib import nullcontext
-from dataclasses import fields
 from typing import TYPE_CHECKING, Any, Mapping
 
 import torch
@@ -314,9 +313,10 @@ class OmniModelRuntime:
         from .....distributed.torch_compile import CompileConfig
         from .....distributed.torch_parallelize import build_parallelize_model
 
-        compile_config = CompileConfig(
-            **{field.name: getattr(acc.torch_compile, field.name) for field in fields(CompileConfig)}
-        )
+        # Compilation is refused for this scope at parse time
+        # (``_validate_composed_wrap``), so nothing here compiles: this wrap only
+        # wraps and loads, and it is handed a disabled config to say so.
+        compile_config = CompileConfig(enable=False)
         opt = args.optimizer
         muon_expert_zero_comm = bool(opt) and opt.type == "muon" and opt.muon_expert_zero_comm
         weights_path = {name: runtime.weights_path for name, runtime in modules_to_wrap.items()}
