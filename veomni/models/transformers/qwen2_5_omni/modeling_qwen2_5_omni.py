@@ -1668,8 +1668,7 @@ class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
             # The blocks take ``**kwargs`` straight through to attention, so a
             # caller that already put ``max_seqlen`` there would collide with the
             # explicit argument below.
-            if max_seqlen_now is not None:
-                kwargs.pop("max_seqlen", None)
+            kwargs.pop("max_seqlen", None)
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens_now,

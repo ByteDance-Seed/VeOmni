@@ -319,24 +319,21 @@ def test_compile_decoder_blocks_compiles_every_no_split_module(monkeypatch):
 
 
 def test_compile_decoder_blocks_allows_a_seedomni_module_tower(monkeypatch):
-    """A SeedOmni module with a ``vision_config`` is not a whole multimodal model.
+    """A SeedOmni module that carries a ``vision_config`` is compiled like any other.
 
-    ``janus_siglip`` / ``qwen3vl_vision`` carry ``vision_config`` because that is
-    how their own config is shaped, so ``_is_multimodal_model`` sees them as
-    multimodal and the Qwen3-VL-only rule used to reject them — even though a
-    module holds one component and no cross-modal injection. Its own guards
-    apply instead.
+    ``janus_siglip`` / ``qwen3vl_vision`` carry ``vision_config`` because that is how
+    their own config is shaped. ``compile_decoder_blocks`` asks nothing about the
+    model, so a module contributes exactly the blocks its own
+    ``_no_split_modules`` names.
     """
     from veomni.models.seed_omni.modules.module_modeling_base import PretrainedOmniModule
 
     class TowerConfig:
-        model_type = "qwen3_vl"  # even claiming the one supported type, the module branch wins
+        model_type = "qwen3_vl"
         vision_config = object()
         sub_configs = {}
 
     class Tower(PretrainedOmniModule):
-        # A module opts in on its class; the block names then no longer matter.
-        supports_torch_compile = True
         _no_split_modules = ["ToyDecoderLayer"]
         config_class = TowerConfig
 
@@ -348,8 +345,6 @@ def test_compile_decoder_blocks_allows_a_seedomni_module_tower(monkeypatch):
     monkeypatch.setattr(torch, "compile", lambda fn, **_: fn)
 
     tower = Tower()
-    # The Qwen3-VL rule would demand ``qwen3_vl`` in _no_split_modules; a module
-    # must not be held to it, so the tower's own declared block is compiled.
     assert compile_decoder_blocks(tower, CompileConfig(enable=True, dynamic=True)) == 1
 
 
@@ -648,6 +643,11 @@ def test_validate_compile_config_accepts_cuda_graphs_without_forward_reshard():
         ({"fsdp_enabled": False}, "requires FSDP2"),
         ({"fsdp_mode": "ddp"}, "fsdp_mode='fsdp2'"),
         ({"any_extra_parallel_enabled": True}, "does not support ExtraParallel"),
+        # The single-model path has to refuse these too: `validate_compile_model`
+        # used to hold them and it is gone, so SeedOmni's parse-time check is no
+        # longer the only guard a run passes through.
+        ({"sequence_parallel_enabled": True}, "does not support sequence parallelism"),
+        ({"async_parallel_enabled": True}, "does not support async activation offload"),
     ],
 )
 def test_validate_compile_runtime_rejects_unsupported_contracts(monkeypatch, overrides, error):

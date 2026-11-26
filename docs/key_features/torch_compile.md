@@ -39,9 +39,10 @@ model:
 ```
 
 Every decoder block in the model is compiled. Requirements: FSDP2 on CUDA,
-`train.dyn_bsz=true`, and `train.pad_to_length=true`, so packed token tensors have
-stable shapes — which is also why `dynamic` is not offered here: with every batch
-padded to the same length there is no shape variation to absorb.
+`train.dyn_bsz=true`, and `train.pad_to_length=true`, so the packed token tensors
+have stable shapes. `dynamic` is still offered and still defaults to unset — see
+[below](#dynamic--leave-it-unset), because a vision tower's patch count is not
+padded even when the text side is.
 
 ### SeedOmni trainer (composed model)
 

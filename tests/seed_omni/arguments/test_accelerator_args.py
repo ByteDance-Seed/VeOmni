@@ -428,8 +428,8 @@ def test_build_omni_model_runtime_args_validates_each_module_accelerator():
 
 
 def test_build_omni_model_runtime_args_allows_a_per_module_compile_switch():
-    """Turning compile on for one module is valid; which blocks get compiled is
-    decided per module by ``supports_torch_compile`` at build time."""
+    """Turning compile on for one module is valid; `module_compile_config` decides
+    at build time whether that module's resolved wrap can actually run it."""
     args = _fake_args(modules_override={MODULE_B: {"accelerator": {"torch_compile": {"enable": True}}}})
     resolved = build_omni_model_runtime_args(args)
     assert resolved.modules[MODULE_B].accelerator.torch_compile.enable is True

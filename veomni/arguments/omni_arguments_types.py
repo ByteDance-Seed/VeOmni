@@ -899,7 +899,9 @@ def _validate_composed_wrap(accelerator: AcceleratorConfig, modules: dict[str, O
         return
     compiled = sorted(name for name, module_args in modules.items() if module_args.accelerator.torch_compile.enable)
     if accelerator.torch_compile.enable or compiled:
-        enabled = ["model.accelerator"] + compiled
+        # Only name the switches that are actually on: listing ``model.accelerator``
+        # when it is off reads as if the launcher enabled it.
+        enabled = (["model.accelerator"] if accelerator.torch_compile.enable else []) + compiled
         raise ValueError(
             "accelerator.torch_compile.enable is not supported with fsdp_scope='model'. "
             f"It is enabled for: {', '.join(enabled)}. That scope wraps the composed OmniModel once, "

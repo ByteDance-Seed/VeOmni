@@ -408,7 +408,10 @@ class VeOmniModelRuntime:
             recompute_context=self._recompute_context(),
             offload_active=self.args.accelerator.offload_config.enable_activation
             or self.args.accelerator.offload_config.enable_async_activation,
-            compile_enabled=self.args.accelerator.torch_compile.enable,
+            # The resolved config, not the raw switch: a SeedOmni module under DDP
+            # has ``torch_compile.enable`` set on the launcher but resolves to a
+            # disabled config, and its policy has to follow what actually compiles.
+            compile_enabled=self._compile_config().enable,
         )
 
     def _compile_config(self):

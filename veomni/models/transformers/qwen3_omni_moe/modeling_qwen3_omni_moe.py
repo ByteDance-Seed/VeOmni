@@ -1401,8 +1401,7 @@ class Qwen3OmniMoeVisionEncoder(Qwen3OmniMoePreTrainedModel):
             # The blocks forward ``**kwargs`` straight to attention, so a caller
             # that already put ``max_seqlen`` there would collide with the explicit
             # argument below.
-            if precomputed_max_seqlen is not None:
-                kwargs.pop("max_seqlen", None)
+            kwargs.pop("max_seqlen", None)
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,

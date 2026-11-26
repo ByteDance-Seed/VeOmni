@@ -424,7 +424,7 @@ def test_composed_wrap_leaves_cache_reader_modules_on_meta(monkeypatch):
     vae = MagicMock()
     vae.reads_offline_cache = True
     vae.model = meta_module
-    # `_compilable_scope` reads each module's own resolved accelerator.
+    # `module_compile_config` reads each module's own resolved accelerator.
     module_accelerator = SimpleNamespace(
         torch_compile=SimpleNamespace(enable=False),
         fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),

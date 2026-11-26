@@ -464,33 +464,20 @@ class ModuleRuntime(VeOmniModelRuntime):
     def _build_parallelized_model(self) -> None:
         """Let the base build compile and wrap — except when the composed model owns the wrap.
 
-        The base sequence already compiles this module's blocks (it reads
-        :meth:`_compile_config`, which this class narrows to the module's own
-        opt-in) and then wraps. The only thing to do differently is stop before
-        the wrap under ``fsdp_scope='model'``: there the composed ``OmniModel``
-        wraps once, so the module applies what must precede that wrap and returns.
+        Under ``fsdp_scope='model'`` the composed ``OmniModel`` wraps once, so this
+        module applies what must precede that wrap and returns instead of calling
+        the base build. Compilation is not part of that: the launcher rejects
+        ``torch_compile`` under this scope in ``_validate_composed_wrap``, so there
+        is nothing here to compile and no per-module compile log to emit.
         """
         if self.wrap_omni_model:
-            # Compilation must happen before the composed wrap, and the base build
-            # is the only place that does both, so compile here and stop.
-            self._compile_blocks()
             self._apply_async_activation_offload()
             logger.info_rank0(
-                f"ModuleRuntime '{self.module_name}': compiled, leaving the FSDP wrap to the composed "
+                f"ModuleRuntime '{self.module_name}': leaving the FSDP wrap to the composed "
                 "OmniModel (accelerator.fsdp_config.fsdp_scope='model')."
             )
             return
         super()._build_parallelized_model()
-
-    def _compile_blocks(self) -> None:
-        """Compile this module's blocks when its config says to, and log which."""
-        compile_config = self._compile_config()
-        if not compile_config.enable:
-            return
-        compiled = self._compile_own_blocks(compile_config)
-        logger.info_rank0(
-            f"ModuleRuntime '{self.module_name}': compiled {compiled} blocks (dynamic={compile_config.dynamic})."
-        )
 
     def _compile_config(self):
         """This module's compile settings, or everything off if it did not opt in.
@@ -506,29 +493,6 @@ class ModuleRuntime(VeOmniModelRuntime):
             self.args.accelerator,
             global_accelerator=self._global_accelerator if self.wrap_omni_model else None,
         )
-
-    def _compile_own_blocks(self, compile_config) -> int:
-        """Compile this module's blocks for the composed-wrap path, where the base build never runs.
-
-        ``validate_compile_runtime`` is called first: it normally lives inside
-        ``build_parallelize_model``, and that is the path not taken here, so
-        without this call the CUDA-only, DDP and ExtraParallel refusals would be
-        skipped.
-        """
-        from .....distributed.parallel_state import get_parallel_state
-        from .....distributed.torch_compile import compile_decoder_blocks, validate_compile_runtime
-        from .....utils.device import get_device_type
-
-        parallel_state = get_parallel_state()
-        validate_compile_runtime(
-            compile_config,
-            device_type=get_device_type(),
-            fsdp_enabled=parallel_state.fsdp_enabled,
-            fsdp_mode=parallel_state.dp_mode,
-            any_extra_parallel_enabled=parallel_state.any_extra_parallel_enabled,
-            enable_reshard_after_forward=self.args.accelerator.fsdp_config.reshard_after_forward,
-        )
-        return compile_decoder_blocks(self.model, compile_config)
 
     def build_after_omni_model_wrap(self) -> None:
         """Training steps that need the wrapped parameters, once the composed OmniModel is wrapped.

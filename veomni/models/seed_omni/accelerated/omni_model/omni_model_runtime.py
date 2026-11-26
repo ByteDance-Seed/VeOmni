@@ -313,15 +313,9 @@ class OmniModelRuntime:
         from .....distributed.torch_compile import CompileConfig
         from .....distributed.torch_parallelize import build_parallelize_model
 
-        # Compilation already happened, per module: each ``ModuleRuntime`` compiled
-        # its own blocks in ``_build_parallelized_model`` before returning to let
-        # this wrap run. That ordering is not a choice — ``compile_decoder_blocks``
-        # runs before ``fully_shard`` under either ``fsdp_scope`` — so the module is
-        # still an ordinary tree when it is compiled, and the composed wrap only
-        # wraps and loads. It is handed a disabled config to say so.
-        #
-        # This is also why there is no scope list here: the unit of compilation is
-        # the module, not a subtree of the composed model.
+        # Compilation is refused for this scope at parse time
+        # (``_validate_composed_wrap``), so nothing here compiles: this wrap only
+        # wraps and loads, and it is handed a disabled config to say so.
         compile_config = CompileConfig(enable=False)
         opt = args.optimizer
         muon_expert_zero_comm = bool(opt) and opt.type == "muon" and opt.muon_expert_zero_comm

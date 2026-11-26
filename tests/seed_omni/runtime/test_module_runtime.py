@@ -508,7 +508,10 @@ def _recompute_accelerator(**gc_fields):
     return SimpleNamespace(
         gradient_checkpointing=GradientCheckpointingConfig(**gc_fields),
         offload_config=SimpleNamespace(enable_activation=False, enable_async_activation=False),
-        torch_compile=SimpleNamespace(enable=False),
+        # `_build_recompute_policy` asks the resolved compile config, not the raw
+        # switch, so the fixture carries the fields that resolution reads.
+        torch_compile=SimpleNamespace(enable=False, backend="inductor", mode=None, fullgraph=True, dynamic=None),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
     )
 
 
@@ -569,6 +572,55 @@ def test_the_enable_keeps_torchs_default_without_a_parallel_state(monkeypatch):
     _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
 
     assert model.log[0][1]["context_fn"] is noop_context_fn
+
+
+def test_a_module_that_resolves_to_eager_does_not_claim_compile_to_the_policy(monkeypatch):
+    """The policy reads the resolved config, not the launcher switch.
+
+    A module whose own wrap is DDP resolves to ``enable=False`` even when the
+    launcher asked for compile, because ``module_compile_config`` falls back to
+    eager. Its recompute policy has to see that — otherwise it warns about SAC
+    with torch.compile for a module that never compiles.
+    """
+    seen = {}
+    model = _CheckpointableLinear()
+    accelerator = _recompute_accelerator(enable=True)
+    accelerator.torch_compile.enable = True
+    accelerator.fsdp_config = SimpleNamespace(fsdp_mode="ddp")
+
+    real_build = recompute_utils.build_policy
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(recompute_utils, "build_policy", spy)
+    monkeypatch.setattr(ModuleRuntime, "_recompute_context", lambda self: None)
+
+    _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    assert seen["compile_enabled"] is False
+
+
+def test_a_module_that_resolves_to_compile_tells_the_policy_so(monkeypatch):
+    """The same read, in the direction that keeps the warning working."""
+    seen = {}
+    model = _CheckpointableLinear()
+    accelerator = _recompute_accelerator(enable=True)
+    accelerator.torch_compile.enable = True
+
+    real_build = recompute_utils.build_policy
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(recompute_utils, "build_policy", spy)
+    monkeypatch.setattr(ModuleRuntime, "_recompute_context", lambda self: None)
+
+    _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    assert seen["compile_enabled"] is True
 
 
 def test_the_recompute_apply_ranks_the_stacks_by_the_modules_basic_modules(monkeypatch):
@@ -792,15 +844,13 @@ def test_the_launcher_gate_applies_only_when_the_composed_model_owns_the_wrap():
     assert module_compile_config(module_acc, global_accelerator=ddp_launcher).enable is False
 
 
-def test_a_composed_wrap_module_compiles_once_then_stops_before_the_wrap(monkeypatch):
-    """Under `fsdp_scope='model'` the module compiles, then leaves the wrap to the composed model.
+def test_a_composed_wrap_module_leaves_the_wrap_to_the_composed_model(monkeypatch):
+    """Under `fsdp_scope='model'` the module applies what precedes the wrap and returns.
 
-    The base build is what compiles and wraps in one go, so this path has to
-    compile first (before the composed `fully_shard`) and return instead of
-    calling the base — otherwise the module would be wrapped twice.
-
-    The launcher now refuses `torch_compile` under that scope at parse time, so
-    this builds the runtime directly to keep the runtime-level contract pinned.
+    The base build both compiles and wraps in one go, so calling it here would
+    wrap the module twice. Nothing is compiled on this path: the launcher rejects
+    `torch_compile` under this scope at parse time (`_validate_composed_wrap`), so
+    the module must not reach for the compiler either.
     """
     import torch.nn as nn
 
@@ -808,9 +858,7 @@ def test_a_composed_wrap_module_compiles_once_then_stops_before_the_wrap(monkeyp
 
     calls = []
     monkeypatch.setattr(tc_mod, "validate_compile_runtime", lambda *a, **k: None)
-    monkeypatch.setattr(
-        tc_mod, "compile_decoder_blocks", lambda model, config, **k: (calls.append(config.enable), 1)[1]
-    )
+    monkeypatch.setattr(tc_mod, "compile_decoder_blocks", lambda model, config, **k: (calls.append("compiled"), 1)[1])
 
     class Block(nn.Module):
         def forward(self, x):
@@ -836,4 +884,4 @@ def test_a_composed_wrap_module_compiles_once_then_stops_before_the_wrap(monkeyp
 
     runtime._build_parallelized_model()
 
-    assert calls == [True, "offload"], calls
+    assert calls == ["offload"], calls

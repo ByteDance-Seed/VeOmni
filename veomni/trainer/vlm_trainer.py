@@ -169,6 +169,8 @@ class VLMModelRuntime(VeOmniModelRuntime):
             fsdp_mode=parallel_state.dp_mode,
             any_extra_parallel_enabled=parallel_state.any_extra_parallel_enabled,
             enable_reshard_after_forward=accelerator.fsdp_config.reshard_after_forward,
+            sequence_parallel_enabled=parallel_state.sp_enabled,
+            async_parallel_enabled=bool(accelerator.enable_async),
         )
 
     def _freeze_model_module(self):

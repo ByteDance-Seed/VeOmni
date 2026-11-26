@@ -118,6 +118,8 @@ def validate_compile_runtime(
     fsdp_mode: str,
     any_extra_parallel_enabled: bool,
     enable_reshard_after_forward: bool,
+    sequence_parallel_enabled: bool = False,
+    async_parallel_enabled: bool = False,
 ) -> None:
     """Validate runtime contracts before compile-specific setup begins."""
 
@@ -135,6 +137,21 @@ def validate_compile_runtime(
         raise RuntimeError(
             "model.accelerator.torch_compile.enable currently does not support ExtraParallel models because EP all-to-all "
             "communication may be captured inside compiled blocks."
+        )
+    # Ulysses/CP slice activations along the sequence dimension, which the graph
+    # edges of a compiled block reorder; async activation offload moves them out
+    # from under the compiled region. Both are refused for the same reason under
+    # SeedOmni (``_validate_omni_accelerator``), so the single-model path has to
+    # refuse them too rather than silently compiling a block that cannot run.
+    if sequence_parallel_enabled:
+        raise RuntimeError(
+            "model.accelerator.torch_compile.enable does not support sequence parallelism: "
+            "set accelerator.ulysses_size=1 and accelerator.cp_size=1."
+        )
+    if async_parallel_enabled:
+        raise RuntimeError(
+            "model.accelerator.torch_compile.enable does not support async activation offload: "
+            "set accelerator.enable_async=False."
         )
     validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)
 
