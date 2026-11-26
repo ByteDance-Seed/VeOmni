@@ -483,12 +483,27 @@ def test_liger_adapter_detaches_vendor_inputs_when_grad_disabled(monkeypatch: py
     assert loss.requires_grad is False
 
 
+def _install_fake_liger_ce_forward(monkeypatch: pytest.MonkeyPatch, forward_fn) -> None:
+    """Stub ``liger_kernel.ops.fused_linear_cross_entropy.fused_linear_cross_entropy_forward``."""
+    liger_pkg = types.ModuleType("liger_kernel")
+    liger_ops_pkg = types.ModuleType("liger_kernel.ops")
+    liger_ce_mod = types.ModuleType("liger_kernel.ops.fused_linear_cross_entropy")
+    liger_ce_mod.fused_linear_cross_entropy_forward = forward_fn
+    liger_ops_pkg.fused_linear_cross_entropy = liger_ce_mod
+    liger_pkg.ops = liger_ops_pkg
+
+    monkeypatch.setitem(sys.modules, "liger_kernel", liger_pkg)
+    monkeypatch.setitem(sys.modules, "liger_kernel.ops", liger_ops_pkg)
+    monkeypatch.setitem(sys.modules, "liger_kernel.ops.fused_linear_cross_entropy", liger_ce_mod)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("return_len", [6, 7])
 def test_liger_adapter_unpacks_6_and_7_tuple_forward_outputs(
     monkeypatch: pytest.MonkeyPatch,
     return_len: int,
 ):
-    """Adapter handles both liger <0.8.5 (6-tuple) and >=0.8.5 (7-tuple with predicted_tokens)."""
+    """Adapter handles both liger <0.8.0 (6-tuple) and >=0.8.0 (7-tuple with predicted_tokens)."""
     from veomni.ops.kernels.loss.cross_entropy_loss.standard import liger_kernel as liger_row
 
     expected_loss = torch.tensor(2.4)
@@ -509,16 +524,7 @@ def test_liger_adapter_unpacks_6_and_7_tuple_forward_outputs(
             None,
         )
 
-    liger_pkg = types.ModuleType("liger_kernel")
-    liger_ops_pkg = types.ModuleType("liger_kernel.ops")
-    liger_ce_mod = types.ModuleType("liger_kernel.ops.fused_linear_cross_entropy")
-    liger_ce_mod.fused_linear_cross_entropy_forward = spy
-    liger_ops_pkg.fused_linear_cross_entropy = liger_ce_mod
-    liger_pkg.ops = liger_ops_pkg
-
-    monkeypatch.setitem(sys.modules, "liger_kernel", liger_pkg)
-    monkeypatch.setitem(sys.modules, "liger_kernel.ops", liger_ops_pkg)
-    monkeypatch.setitem(sys.modules, "liger_kernel.ops.fused_linear_cross_entropy", liger_ce_mod)
+    _install_fake_liger_ce_forward(monkeypatch, spy)
 
     hidden = torch.randn(2, 4, 8, requires_grad=True)
     weight = torch.randn(6, 8, requires_grad=True)
@@ -529,11 +535,25 @@ def test_liger_adapter_unpacks_6_and_7_tuple_forward_outputs(
     torch.testing.assert_close(saved.tensors[1], expected_grad_hidden / 4.0)
     torch.testing.assert_close(saved.tensors[2], expected_grad_weight / 4.0)
 
-    def bad_spy(_input, weight, target, **kwargs):
-        return expected_loss, None, None, expected_grad_hidden, expected_grad_weight
 
-    monkeypatch.setattr(liger_ce_mod, "fused_linear_cross_entropy_forward", bad_spy)
-    with pytest.raises(RuntimeError, match="Unexpected return tuple length 5"):
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("return_len", [5, 8])
+def test_liger_adapter_rejects_unexpected_forward_tuple_length(
+    monkeypatch: pytest.MonkeyPatch,
+    return_len: int,
+):
+    """Adapter raises a clear RuntimeError on unsupported Liger return tuple lengths."""
+    from veomni.ops.kernels.loss.cross_entropy_loss.standard import liger_kernel as liger_row
+
+    def bad_spy(_input, weight, target, **kwargs):
+        return (torch.tensor(2.4),) + (None,) * (return_len - 1)
+
+    _install_fake_liger_ce_forward(monkeypatch, bad_spy)
+
+    hidden = torch.randn(2, 4, 8, requires_grad=True)
+    weight = torch.randn(6, 8, requires_grad=True)
+    labels = torch.randint(0, 6, (2, 4))
+    with pytest.raises(RuntimeError, match=f"Unexpected return tuple length {return_len}"):
         liger_row.forward(hidden, labels, weight, grad_enabled=True)
 
 

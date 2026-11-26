@@ -37,9 +37,9 @@ class _Meta:
 def _unpack_liger_ce_forward_output(result: tuple) -> tuple[Tensor, Tensor | None, Tensor | None]:
     """Extract ``(loss, grad_hidden, grad_weight)`` across Liger 6- and 7-tuple returns.
 
-    ``liger-kernel < 0.8.5`` returns
+    ``liger-kernel < 0.8.0`` returns
     ``(loss, z_loss, token_accuracy, grad_input, grad_weight, grad_bias)``.
-    ``liger-kernel >= 0.8.5`` inserts ``predicted_tokens`` at index 3, returning
+    ``liger-kernel >= 0.8.0`` inserts ``predicted_tokens`` at index 3, returning
     ``(loss, z_loss, token_accuracy, predicted_tokens, grad_input, grad_weight, grad_bias)``.
     """
     if len(result) == 6:
