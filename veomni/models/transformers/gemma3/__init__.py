@@ -21,10 +21,7 @@ from ....utils.device import IS_NPU_AVAILABLE
 
 @MODELING_REGISTRY.register("gemma3_text")
 def register_gemma3_text_modeling(architecture: str | None):
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_gemma3_npu import Gemma3ForCausalLM, Gemma3TextModel
-    else:
-        from .generated.patched_modeling_gemma3_gpu import Gemma3ForCausalLM, Gemma3TextModel
+    from .modeling_gemma3 import Gemma3ForCausalLM, Gemma3TextModel
 
     architecture = architecture or "Gemma3ForCausalLM"
     if "ForCausalLM" in architecture:
@@ -39,7 +36,7 @@ def register_gemma3_modeling(architecture: str | None):
     if not IS_NPU_AVAILABLE:
         raise RuntimeError("Gemma 3 VLM training is currently supported only on NPU.")
 
-    from .generated.patched_modeling_gemma3_npu import Gemma3ForConditionalGeneration, Gemma3Model
+    from .modeling_gemma3 import Gemma3ForConditionalGeneration, Gemma3Model
 
     architecture = architecture or "Gemma3ForConditionalGeneration"
     if "ForConditionalGeneration" in architecture:

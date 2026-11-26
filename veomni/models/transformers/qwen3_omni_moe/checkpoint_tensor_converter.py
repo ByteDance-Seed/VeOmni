@@ -38,7 +38,7 @@ dispatch copies them into place.
 The talker tower (`talker.model.layers.{i}.mlp.experts.*`) uses the same
 per-expert convention and the regex matches it too, but VeOmni builds the
 model with `has_talker=False` and sizes this converter from the thinker
-config. Talker keys therefore end up unexpected: `ep_sharded_stream_load`
+config. Talker keys therefore end up unexpected: `extra_parallel_stream_load`
 skips them unread, while the whole-tensor loaders stack and then drop them.
 """
 

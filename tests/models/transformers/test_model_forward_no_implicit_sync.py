@@ -4,17 +4,16 @@ Runs each model's forward under ``torch.cuda.set_sync_debug_mode("warn")``
 and fails if any new implicit host<->device sync site shows up in
 first-party ``veomni/models/`` or ``veomni/ops/`` reached by that forward.
 
-``vendor/`` is ignored. ``generated/`` is still allowlisted by
-``(basename, qualname)``. Other first-party files use
+``vendor/`` is ignored. First-party files use
 ``(veomni-relative path, qualname)``.
 
 The principle — two axes
 ------------------------
 For each surfaced sync site, decide along two independent axes:
 
-  1. **Owner** — VeOmni-patched (the line appears in the patchgen ``.diff``)
-     vs HF-verbatim (the line is unchanged from upstream HF, even though it
-     lives inside generated/).
+  1. **Owner** — VeOmni-patched (the line differs from the upstream model)
+     vs HF-verbatim (the line is unchanged from upstream HF, in the
+     standalone modeling file).
   2. **Path** — production (code runs every real training/inference step,
      no override above it) vs eager-only fallback (code only runs under a
      specific dev/fallback setting; production bypasses it via a ``VeomniOp``
@@ -24,8 +23,7 @@ The rule:
 
   - Production-path + VeOmni-patched  →  fix the patch (derive host-side,
     precompute in the collator, etc.).
-  - Production-path + HF-verbatim     →  add an ``override_method`` patch
-    and fix there (now becomes ours). **Don't leave a production sync in
+  - Production-path + HF-verbatim     →  fix the local modeling method. **Don't leave a production sync in
     just because the line originated upstream** — that's an unreasonable
     cost in our hot path.
   - Eager-only fallback + HF-verbatim (production bypasses via ``VeomniOp``/
@@ -73,9 +71,9 @@ backend for MoE cases.
 When a new model's first run surfaces sync sites, classify each per the
 two-axis rule above:
 
-- VeOmni-patched line (appears in the patchgen ``.diff``) → fix the patch.
+- VeOmni-specific line → fix the local implementation.
 - HF-verbatim line on a production path (code runs unconditionally, no
-  VeOmni override above) → add an ``override_method`` patch to fix it;
+  VeOmni override above) → fix the local modeling method;
   in the meantime allowlist with ``"HF-prod-pending-fix: ..."`` and
   reference the follow-up.
 - HF-verbatim line on an eager-only fallback path that production
@@ -83,9 +81,9 @@ two-axis rule above:
   dispatches to the fused MoE op) → allowlist with
   ``"HF-eager-only: ..."``.
 
-The allowlist is keyed by ``(generated-file, function qualname)``: each
+The allowlist is keyed by ``(veomni-relative path, function qualname)``: each
 sync warning's line number is resolved to its enclosing function via AST,
-so a ``make patchgen`` that shifts lines does **not** rot the gate. Dead
+so edits that shift lines preserve the key. Dead
 allowlist entries (a function that no longer issues a sync) still fail
 the test, so a landed fix can't silently leave a stale entry behind.
 """
@@ -151,8 +149,8 @@ def _scope_deterministic_backend_flags():
 # ``_forward_cases.py``. Eager-MoE cases stay absent because production uses
 # the fused expert op; the three fused cases above cover that path.
 
-# Acknowledged sync sites in generated/. Keyed by ``ForwardCase.case_id``;
-# value maps ``(basename, lineno)`` -> one-line reason.
+# Acknowledged sync sites in first-party code. Keyed by ``ForwardCase.case_id``;
+# value maps ``(veomni-relative path, qualname)`` -> one-line reason.
 #
 # Reasons MUST start with one of the category tags below — see the
 # module docstring's "principle" section for the two-axis triage. The
@@ -203,9 +201,9 @@ _ALG_ESSENTIAL_VL_GET_ROPE_INDEX = (
     "variable-shape mrope algorithm. Clean fix is to precompute position_ids in the data "
     "transform and skip the call; out-of-scope for this PR."
 )
-# Keyed by ``(generated-file basename, enclosing-function qualname)`` — NOT a
+# Keyed by ``(veomni-relative path, enclosing-function qualname)`` — NOT a
 # raw line number. The qualname is resolved from the sync warning's line via
-# AST (`_enclosing_qualname`), so patchgen line shifts no longer rot the
+# AST (`_enclosing_qualname`), so line shifts no longer rot the
 # allowlist, and each entry reads as the function it accepts. One entry
 # therefore covers *all* the sync sites inside that function.
 _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
@@ -216,8 +214,14 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # splitting or `.tolist()`-syncing. What remains:
     #  - get_rope_index / get_vision_position_ids: the HF-verbatim mrope algorithm.
     "qwen3_5_vl-sdpa": {
-        ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5Model.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5Model.get_vision_position_ids"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        (
+            "veomni/models/transformers/qwen3_5/modeling_qwen3_5.py",
+            "Qwen3_5Model.get_rope_index",
+        ): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        (
+            "veomni/models/transformers/qwen3_5/modeling_qwen3_5.py",
+            "Qwen3_5Model.get_vision_position_ids",
+        ): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
     # qwen3_vl-fa2: the ViT forward consumes the precomputed multimodal
     # metadata — Model.forward selects the per-modality `vit_metadata` sub-dict
@@ -233,23 +237,30 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     #    above _ALG_ESSENTIAL_VL_GET_ROPE_INDEX for why the in-place override
     #    was reverted and the collator-side fix tracked as follow-up.
     "qwen3_vl-fa2": {
-        ("patched_modeling_qwen3_vl_gpu.py", "Qwen3VLVisionModel.rot_pos_emb"): (
+        ("veomni/models/transformers/qwen3_vl/modeling_qwen3_vl.py", "Qwen3VLVisionModel.rot_pos_emb"): (
             "algorithm-essential: `rot_pos_ids(...).to(device)` H2D copy of a CPU tensor "
             "returned by the lru_cached helper; over-reported by torch sync-debug mode."
         ),
-        ("patched_modeling_qwen3_vl_gpu.py", "Qwen3VLModel.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen3_vl_gpu.py", "Qwen3VLModel.get_vision_position_ids"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        (
+            "veomni/models/transformers/qwen3_vl/modeling_qwen3_vl.py",
+            "Qwen3VLModel.get_rope_index",
+        ): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        (
+            "veomni/models/transformers/qwen3_vl/modeling_qwen3_vl.py",
+            "Qwen3VLModel.get_vision_position_ids",
+        ): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
-    # qwen3_vl_moe-fa2-fused: mirrors qwen3_vl (the moe config imports the
-    # vision forward / rot_pos_emb / fast_pos_embed_interpolate helpers from
-    # qwen3_vl and registers its own Model.forward + get_rope_index).
+    # qwen3_vl_moe-fa2-fused: mirrors qwen3_vl.
     "qwen3_vl_moe-fa2-fused": {
-        ("patched_modeling_qwen3_vl_moe_gpu.py", "Qwen3VLMoeVisionModel.rot_pos_emb"): (
+        ("veomni/models/transformers/qwen3_vl_moe/modeling_qwen3_vl_moe.py", "Qwen3VLMoeVisionModel.rot_pos_emb"): (
             "algorithm-essential: see qwen3_vl-fa2 (rot_pos_ids H2D copy)."
         ),
-        ("patched_modeling_qwen3_vl_moe_gpu.py", "Qwen3VLMoeModel.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
         (
-            "patched_modeling_qwen3_vl_moe_gpu.py",
+            "veomni/models/transformers/qwen3_vl_moe/modeling_qwen3_vl_moe.py",
+            "Qwen3VLMoeModel.get_rope_index",
+        ): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        (
+            "veomni/models/transformers/qwen3_vl_moe/modeling_qwen3_vl_moe.py",
             "Qwen3VLMoeModel.get_vision_position_ids",
         ): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
@@ -271,8 +282,14 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # no rotary-path syncs remain. Residual sync: the HF-verbatim mrope
     # algorithm in `get_rope_index` (same as qwen3_vl).
     "qwen2_vl-fa2": {
-        ("patched_modeling_qwen2_vl_gpu.py", "Qwen2VLModel.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
-        ("patched_modeling_qwen2_vl_gpu.py", "Qwen2VLModel.get_vision_position_ids"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        (
+            "veomni/models/transformers/qwen2_vl/modeling_qwen2_vl.py",
+            "Qwen2VLModel.get_rope_index",
+        ): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        (
+            "veomni/models/transformers/qwen2_vl/modeling_qwen2_vl.py",
+            "Qwen2VLModel.get_vision_position_ids",
+        ): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
     # qwen2_5_vl-fa2: the window-attention ViT forward consumes the
     # precomputed metadata (cu_seqlens + cu_window_seqlens + the
@@ -288,9 +305,12 @@ _ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
     # algorithm in `get_rope_index` / `get_vision_position_ids`, same as
     # qwen2_vl.
     "qwen2_5_vl-fa2": {
-        ("patched_modeling_qwen2_5_vl_gpu.py", "Qwen2_5_VLModel.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
         (
-            "patched_modeling_qwen2_5_vl_gpu.py",
+            "veomni/models/transformers/qwen2_5vl/modeling_qwen2_5_vl.py",
+            "Qwen2_5_VLModel.get_rope_index",
+        ): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+        (
+            "veomni/models/transformers/qwen2_5vl/modeling_qwen2_5_vl.py",
             "Qwen2_5_VLModel.get_vision_position_ids",
         ): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
@@ -380,15 +400,12 @@ def _sync_site_key(filename: str, lineno: int) -> tuple[str, str] | None:
     """Allowlist key for a sync warning, or ``None`` to ignore the site.
 
     Watches first-party ``veomni/models/`` and ``veomni/ops/``. Skips
-    ``vendor/``. ``generated/`` keeps the historical ``(basename, qualname)``
-    key so existing allowlist entries stay stable.
+    ``vendor/``.
     """
     rel = _veomni_relpath(filename)
     if rel is None or "/vendor/" in rel:
         return None
     qualname = _enclosing_qualname(filename, lineno)
-    if "/generated/" in rel:
-        return (os.path.basename(rel), qualname)
     if rel.startswith("veomni/models/") or rel.startswith("veomni/ops/"):
         return (rel, qualname)
     return None
@@ -400,7 +417,7 @@ def _def_spans(path: str) -> tuple[tuple[int, int, str], ...]:
 
     AST-parsed once per file (lru_cached). Used to map a sync warning's raw
     line number onto the *qualified name* of the function/method that
-    contains it — a key that survives patchgen line shifts, unlike the line
+    contains it — a key that survives line shifts, unlike the line
     number itself.
     """
     with open(path, encoding="utf-8") as f:
@@ -476,11 +493,11 @@ def test_enclosing_qualname_resolution(tmp_path):
 
 
 def test_sync_site_key_watches_first_party_models_and_ops(tmp_path):
-    """Vendor is ignored; generated keeps a basename key; models/ops are watched."""
-    generated = tmp_path / "veomni" / "models" / "transformers" / "toy" / "generated"
-    generated.mkdir(parents=True)
-    gen_file = generated / "patched_modeling_toy_gpu.py"
-    gen_file.write_text("def forward():\n    return 0\n", encoding="utf-8")
+    """Vendor is ignored; models/ops are watched by relative path + qualname."""
+    model_dir = tmp_path / "veomni" / "models" / "transformers" / "toy"
+    model_dir.mkdir(parents=True)
+    model_file = model_dir / "modeling_toy.py"
+    model_file.write_text("def forward():\n    return 0\n", encoding="utf-8")
     ops_file = tmp_path / "veomni" / "ops" / "kernels" / "dsa" / "attention.py"
     ops_file.parent.mkdir(parents=True)
     ops_file.write_text("def wrapper():\n    return 0\n", encoding="utf-8")
@@ -488,7 +505,7 @@ def test_sync_site_key_watches_first_party_models_and_ops(tmp_path):
     vendor_file.parent.mkdir(parents=True)
     vendor_file.write_text("def kernel():\n    return 0\n", encoding="utf-8")
 
-    assert _sync_site_key(str(gen_file), 2) == ("patched_modeling_toy_gpu.py", "forward")
+    assert _sync_site_key(str(model_file), 2) == ("veomni/models/transformers/toy/modeling_toy.py", "forward")
     assert _sync_site_key(str(ops_file), 2) == ("veomni/ops/kernels/dsa/attention.py", "wrapper")
     assert _sync_site_key(str(vendor_file), 2) is None
     assert _sync_site_key("/usr/lib/python/torch/cuda.py", 1) is None
@@ -618,8 +635,7 @@ def test_no_implicit_sync_in_generated_forward(case):
     allowed = _ALLOWED_SYNCS.get(case.case_id, {})
 
     # Resolve each watched sync warning to the *qualified name* of the
-    # function it fired in. generated/ keys stay ``(basename, qualname)``;
-    # other first-party files use the veomni-relative path.
+    # function it fired in and its veomni-relative path.
     observed: dict[tuple[str, str], tuple[int, str]] = {}
     for f, ln, msg in captured:
         key = _sync_site_key(f, ln)
@@ -643,22 +659,22 @@ def test_no_implicit_sync_in_generated_forward(case):
                 f"{len(offending)} new implicit CUDA sync site(s) in first-party veomni/models or veomni/ops:\n"
                 f"{formatted}\n"
                 f"Each entry is the function the sync fires in. Triage along two axes (owner + path):\n"
-                f"  1. Check the patchgen .diff next to the generated file, or the first-party module.\n"
-                f"     Code is *in the .diff* (added/modified by VeOmni) -> ours.\n"
+                f"  1. Compare the flagged call site with the corresponding upstream HF module.\n"
+                f"     Code is *added/modified by VeOmni* -> ours.\n"
                 f"     Code is *unchanged from HF* -> HF-verbatim.\n"
                 f"  2. Check whether the code is on the production path or only on an\n"
                 f"     eager/fallback path that production bypasses (e.g. via a VeomniOp).\n"
                 f"Then act:\n"
                 f"  - Production + VeOmni-patched -> fix the patch (derive host-side,\n"
                 f"    precompute in the collator).\n"
-                f"  - Production + HF-verbatim -> add an override_method patch and fix\n"
-                f"    there. Don't leave a production sync in because it came from upstream.\n"
+                f"  - Production + HF-verbatim -> fix the local modeling method\n"
+                f"    to avoid the production sync.\n"
                 f"    In the meantime, allowlist with reason 'HF-prod-pending-fix: ...'.\n"
                 f"  - Eager-only fallback + HF-verbatim -> allowlist with reason\n"
                 f"    'HF-eager-only: ...'.\n"
                 f"  - Public entry that must read GPU metadata when the collator did not\n"
                 f"    precompute it -> allowlist with reason 'public-entry-fallback: ...'.\n"
-                f"Add the (basename-or-relpath, qualname) to _ALLOWED_SYNCS[{case.case_id!r}] with the\n"
+                f"Add the (veomni-relative path, qualname) to _ALLOWED_SYNCS[{case.case_id!r}] with the\n"
                 f"appropriate tag prefix."
             )
         if dead:
@@ -762,10 +778,10 @@ _ALLOWED_SYNCS[_PACKED_DSV4_FAST_PATH_ID] = {
         "or attention_mask reduction."
     ),
     (
-        "veomni/ops/kernels/moe_experts/standard/eager.py",
-        "wrapper",
+        "veomni/ops/kernels/moe_experts/shared/act_fn_experts.py",
+        "merged_experts_act_fn_forward",
     ): (
-        "HF-eager-only: eager expert loop uses nonzero()/item() to iterate hit "
+        "HF-eager-only: the reference expert loop uses nonzero()/item() to iterate hit "
         "experts. This packed case forces eager_ops_config; production fused MoE "
         "bypasses the loop."
     ),
@@ -788,7 +804,7 @@ def test_no_implicit_sync_in_packed_deepseek_v4_fast_path():
 
     from tests.models.compare import eager_ops_config
     from tests.models.tiny_configs import tiny_deepseek_v4_config
-    from veomni.models.transformers.deepseek_v4.generated import patched_modeling_deepseek_v4_gpu as dsv4
+    from veomni.models.transformers.deepseek_v4 import modeling_deepseek_v4 as dsv4
 
     device = get_device_type()
     dtype = torch.bfloat16
@@ -868,7 +884,7 @@ def test_no_implicit_sync_in_packed_deepseek_v4_fast_path():
         raise AssertionError("\n\n".join(problems))
 
 
-# MiniMax H3 (native diffusion model, not generated/): gate a training step through the
+# MiniMax H3 (native diffusion model): gate a training step through the
 # ordinary condition/model interface, single-sample and packed, with inputs already on
 # device as ``DiTTrainer.preforward`` leaves them. Keyed by ``(basename, qualname)``.
 _H3_CONDITION_SYNC = (
@@ -886,6 +902,7 @@ _H3_ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
             "which varlen kernels read on device; the DiT itself slices with the host copies."
         ),
     },
+    "image": {},
 }
 
 
@@ -900,7 +917,33 @@ def _to_device_recursive(value, device):
 
 
 def _is_minimax_h3_path(filename: str) -> bool:
-    return "veomni/models/diffusers/minimax_h3/" in filename.replace(os.sep, "/")
+    relpath = _veomni_relpath(filename)
+    return relpath is not None and relpath.startswith(
+        ("veomni/models/diffusers/minimax_h3/", "veomni/models/diffusers/minimax_h3_image/")
+    )
+
+
+def _assert_no_minimax_h3_step_syncs(model, step, mode, attention):
+    step()
+    model.zero_grad(set_to_none=True)
+    synchronize()
+
+    prev_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("warn")
+        with warnings.catch_warnings(record=True) as wlist:
+            warnings.simplefilter("always")
+            step()
+        captured = [(w.filename, w.lineno) for w in wlist if _SYNC_RE.search(str(w.message))]
+    finally:
+        torch.cuda.set_sync_debug_mode(prev_mode)
+
+    observed = {(os.path.basename(f), _enclosing_qualname(f, ln)): ln for f, ln in captured if _is_minimax_h3_path(f)}
+    allowed = _H3_ALLOWED_SYNCS[mode]
+    offending = sorted(k for k in observed if k not in allowed)
+    dead = sorted(k for k in allowed if k not in observed)
+    assert not offending, f"New implicit CUDA sync(s) in MiniMax H3 {mode} ({attention}): {offending}"
+    assert not dead, f"Dead MiniMax H3 sync allowlist entries for {mode}: {dead}"
 
 
 @pytest.mark.parametrize("attention", ["sdpa", "veomni_flash_attention_2"])
@@ -937,24 +980,64 @@ def test_no_implicit_sync_in_minimax_h3_forward_backward(mode, attention, cfg_mo
     def step():
         sum(model(**condition.process_condition(**collated)).loss.values()).backward()
 
-    step()  # warm up lazy kernel loading
-    model.zero_grad(set_to_none=True)
-    synchronize()
+    _assert_no_minimax_h3_step_syncs(model, step, mode, attention)
 
-    prev_mode = torch.cuda.get_sync_debug_mode()
-    captured: list[tuple[str, int]] = []
-    try:
-        torch.cuda.set_sync_debug_mode("warn")
-        with warnings.catch_warnings(record=True) as wlist:
-            warnings.simplefilter("always")
-            step()
-        captured = [(w.filename, w.lineno) for w in wlist if _SYNC_RE.search(str(w.message))]
-    finally:
-        torch.cuda.set_sync_debug_mode(prev_mode)
 
-    observed = {(os.path.basename(f), _enclosing_qualname(f, ln)): ln for f, ln in captured if _is_minimax_h3_path(f)}
-    allowed = _H3_ALLOWED_SYNCS.get(mode, {})
-    offending = sorted(k for k in observed if k not in allowed)
-    dead = sorted(k for k in allowed if k not in observed)
-    assert not offending, f"New implicit CUDA sync(s) in MiniMax H3 {mode} ({attention}): {offending}"
-    assert not dead, f"Dead MiniMax H3 sync allowlist entries for {mode}: {dead}"
+@pytest.mark.parametrize("condition_source", ["cached_references", "post_encode_t2i", "online_raw_t2i"])
+def test_no_implicit_sync_in_minimax_h3_image_forward_backward(condition_source):
+    """Gate cached, post-encode and raw-input H3-Image training steps."""
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("CUDA required.")
+
+    from tests.models.diffusers.test_minimax_h3_image_condition_training import _cached_batch, _condition_model
+    from tests.models.tiny_configs import tiny_minimax_h3_config
+    from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.modeling_minimax_h3_transformer import (
+        MiniMaxH3DiTModel,
+    )
+
+    device = get_device_type()
+    torch.manual_seed(0)
+    condition = _condition_model().to(device)
+    batch = dict(_cached_batch())
+    raw_inputs = None
+    latents_dim = batch["clean_latents"][0].shape[1]
+    text_dim = batch["prompt_embeds"][0].shape[-1]
+    if condition_source == "cached_references":
+        batch["reference_latents"] = [batch["clean_latents"]]
+        batch = _to_device_recursive(batch, device)
+    elif condition_source == "post_encode_t2i":
+        for name in ("prompt_embeds", "clean_latents"):
+            batch[name] = _to_device_recursive(batch[name], device)
+    else:
+        from PIL import Image
+
+        from tests.models.diffusers.test_minimax_h3_image import _tiny_vae
+
+        class TinyTextEncoder(torch.nn.Embedding):
+            def forward(self, input_ids, attention_mask):
+                return super().forward(input_ids[0])
+
+        condition._tokenizer = lambda *args, **kwargs: {"input_ids": [0, 1, 2]}
+        condition._text_encoder = TinyTextEncoder(3, text_dim, device=device, dtype=torch.bfloat16).eval()
+        condition._vae = _tiny_vae().to(device).eval()
+        latents_dim = condition.vae.config.latent_channels
+        raw_inputs = {"inputs": ["A rectangle"], "images": [[Image.new("RGB", (70, 20), (96, 128, 192))]]}
+    config = tiny_minimax_h3_config(
+        audio_enabled=False,
+        num_pdd_heads=condition.config.num_pdd_heads,
+        condition_model_type=condition.config.model_type,
+        latents_dim=latents_dim,
+        patch_size=(1, 2, 2),
+        text_dim=text_dim,
+    )
+    config._set_ops_implementation(make_eager_ops_config(attn_implementation="sdpa"))
+    model = MiniMaxH3DiTModel(config).to(device)
+    model.freeze_model()
+    model.gradient_checkpointing_enable({"use_reentrant": False})
+
+    def step():
+        conditions = condition.get_condition(**raw_inputs) if raw_inputs is not None else batch
+        loss = model(**condition.process_condition(**conditions)).loss["mse_image"]
+        loss.backward()
+
+    _assert_no_minimax_h3_step_syncs(model, step, "image", "sdpa")

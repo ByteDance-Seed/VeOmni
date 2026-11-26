@@ -12,23 +12,16 @@ from typing import Any, Dict, List
 import torch
 from torch.distributed._tensor import Shard
 
+from veomni.models.transformers.qwen3_moe.modeling_qwen3_moe import (
+    load_balancing_loss_func,
+)
+
 from .......distributed.parallel_plan import ParallelPlan
-from .......utils.device import IS_NPU_AVAILABLE
 from .....mixins.metric_meter_mixin import MetricMeterMixin
 from .....mixins.training_module_mixin import post_forward
 from ....qwen3.llm.accelerated import VeOmniMixin as Qwen3LlmVeOmniMixin
 from ..configuration import Qwen3MoeLlmConfig
 from ..modeling import Qwen3MoeLlm
-
-
-if IS_NPU_AVAILABLE:
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_npu import (
-        load_balancing_loss_func,
-    )
-else:
-    from veomni.models.transformers.qwen3_moe.generated.patched_modeling_qwen3_moe_gpu import (
-        load_balancing_loss_func,
-    )
 
 
 class MeterMixin(MetricMeterMixin):
@@ -51,7 +44,7 @@ class MeterMixin(MetricMeterMixin):
 
         # Not every layer is sparse: `Qwen3MoeDecoderLayer` builds a dense MLP when
         # the layer is in `mlp_only_layers`, or when `decoder_sparse_step` skips it
-        # (`patched_modeling_qwen3_moe_gpu.py`, `Qwen3MoeDecoderLayer.__init__`).
+        # (`modeling_qwen3_moe.py`, `Qwen3MoeDecoderLayer.__init__`).
         # Charging those layers the router + top-k cost would over-report FLOPs and
         # under-report MFU for any config that uses those two knobs.
         moe_inter = cfg.moe_intermediate_size

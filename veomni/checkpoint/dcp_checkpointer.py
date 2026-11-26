@@ -1393,7 +1393,12 @@ def _apply_extra_parallel_dim(
             tensor = drop_extra_parallel_dim(tensor, fsdp_submesh, fsdp_shard_dim)
         elif action == "restore" and not versioned:
             tensor = restore_extra_parallel_dim(
-                tensor, spec_info.para_fsdp_mesh, fsdp_submesh, ep_shard_dim, fsdp_shard_dim
+                tensor,
+                spec_info.para_fsdp_mesh,
+                fsdp_submesh,
+                ep_shard_dim,
+                fsdp_shard_dim,
+                extra_parallel_only=getattr(parallel_state, "extra_parallel_only", False),
             )
         elif action == "drop":
             tensor = drop_extra_parallel_dim_v2(
@@ -1709,6 +1714,8 @@ def restore_extra_parallel_dim(
     extra_parallel_fsdp_mesh: DeviceMesh,
     ep_shard_dim: int = 0,
     fsdp_shard_dim: int = 1,
+    *,
+    extra_parallel_only: bool = False,
 ):
     """
     Restore ExtraParallel dim so that DCP can be aware about ExtraParallel ranks
@@ -1724,7 +1731,8 @@ def restore_extra_parallel_dim(
             ``(ep_fsdp, ep)`` for plain FSDP or 3D
             ``(ep_replicate, ep_fsdp, ep)`` for HSDP.
         extra_parallel_fsdp_mesh (DeviceMesh): The FSDP sub-mesh (ExtraParallel
-            dim excluded), used for the pure-ExtraParallel (no FSDP) path.
+            dim excluded). Unused: a plain (unwrapped) tensor shards on the
+            ExtraParallel dim of ``fsdp_mesh`` alone.
         ep_shard_dim (int): Tensor dim the ExtraParallel dim shards along.
         fsdp_shard_dim (int): Tensor dim FSDP shards along.
 
@@ -1765,8 +1773,12 @@ def restore_extra_parallel_dim(
             raise RuntimeError("ExtraParallel shard dimension is outside the tensor rank")
         if fsdp_mesh.mesh_dim_names is None:
             raise RuntimeError("A plain ExtraParallel tensor requires named mesh dimensions")
-        placements = [Replicate()] * (fsdp_mesh.ndim - 1) + [Shard(ep_shard_dim % ndim)]
-        dtensor = _from_local_preserve_device(orgin_tensor, device_mesh=fsdp_mesh, placements=placements)
+        if extra_parallel_only:
+            para_mesh = fsdp_mesh[fsdp_mesh.mesh_dim_names[-1]]
+            dtensor = rewrap_dtensor_local(orgin_tensor, mesh=para_mesh, placements=[Shard(ep_shard_dim % ndim)])
+        else:
+            placements = [Replicate()] * (fsdp_mesh.ndim - 1) + [Shard(ep_shard_dim % ndim)]
+            dtensor = _from_local_preserve_device(orgin_tensor, device_mesh=fsdp_mesh, placements=placements)
     else:
         raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 

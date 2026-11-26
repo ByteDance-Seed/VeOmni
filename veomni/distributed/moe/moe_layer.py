@@ -88,6 +88,12 @@ def token_pre_all2all(
     global_permuted_hidden_states = all_to_all(ep_group, local_permuted_hidden_states, output_splits, input_splits)
 
     # group tokens together by expert
+    #
+    # No explicit device sync is needed before this line, and it must not be added: the
+    # ``.tolist()`` calls above (``input_splits``, and ``num_global_tokens_per_local_expert``
+    # below) already force a host round-trip that drains the queued collectives. The
+    # Ascend path this replaced had a ``stream_synchronize()`` because it computed its
+    # per-expert counts from device tensors without leaving the device.
     num_local_experts = num_experts // ep_group.size()
     permute_order = torch.arange(num_experts).reshape(-1, num_local_experts).T.ravel().tolist()
     global_permuted_hidden_states = sort_chunks_by_idxs(
@@ -97,6 +103,33 @@ def token_pre_all2all(
     )
 
     return global_permuted_hidden_states, routing_map, local_input_permutation_mapping, org_hidden_states_shape
+
+
+def expert_parallel_size() -> int:
+    """The ``ep`` axis size, read without assuming the axis is named ``ep``.
+
+    ``ParallelState.ep_enabled`` indexes ``extra_parallel_sizes["ep"]``
+    unconditionally, and ``_init_parallel_state`` builds that dict from
+    ``extra_parallel_names``. A state initialized with, say, ``("ple",)`` has no
+    ``"ep"`` key, so asking whether expert weights are sharded raised
+    ``KeyError: 'ep'`` -- which took out tests that never touch experts, because this
+    check runs on every call. The question here is only "is expert parallelism on?",
+    and a missing axis means no.
+    """
+    sizes = getattr(get_parallel_state(), "extra_parallel_sizes", None) or {}
+    return sizes.get("ep", 1)
+
+
+def cumsum_to_counts(cumsum: torch.Tensor) -> torch.Tensor:
+    """Turn the cumulative expert bounds into per-expert row counts.
+
+    ``dispatch_to_ep_class`` hands its ``ep_class`` a **cumsum**, but several grouped
+    kernels want per-group sizes instead -- ``npu_group_gemm`` pins
+    ``group_list_type=1``, and ``GroupedLayout.from_counts`` says so in its name. This is
+    that conversion, kept in one place so the contract has a single encoding rather than
+    one per kernel.
+    """
+    return cumsum - torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
 
 
 def dispatch_to_ep_class(
@@ -117,10 +150,19 @@ def dispatch_to_ep_class(
     the EP plumbing evolve in lock-step across LoRA / non-LoRA paths.
 
     Args:
-        ep_class: Caller-owned EP autograd ``Function``. Typical classes live
-            in ``veomni.ops.kernels.moe_experts`` or ``moe_experts_lora``.
-            ``ep_class.apply`` must accept ``(permute_tokens, cumsum, *ep_class_args)``
-            in that order and return a ``[T_local, H]`` permuted-output tensor.
+        ep_class: The per-rank expert math, either a caller-owned EP autograd
+            ``Function`` or a plain callable. Typical Functions live in
+            ``veomni.ops.kernels.moe_experts`` or ``moe_experts_lora``; a plain
+            callable is for rows whose grouped matmul is already a ``Function`` of
+            its own, so there is no derivative left to write (the Ascend and DeepGEMM
+            rows). Either way it must accept ``(permute_tokens, cumsum,
+            *ep_class_args)`` in that order and return a ``[T_local, H]``
+            permuted-output tensor.
+
+            Note that ``cumsum`` is a *cumulative* token count. A kernel wanting
+            per-expert counts -- Ascend's ``group_list_type=1``, DeepGEMM's
+            ``GroupedLayout.from_counts`` -- subtracts the running total back out
+            itself; ``MLUGroupGemm`` does it inside its own forward.
         num_experts: total expert count ``E`` for this MoE layer (global on EP).
         routing_weights: ``[B*S, topk]`` per-(token, slot) routing weights —
             applied later by ``tokens_post_all2all`` → ``unpermute``.
@@ -151,7 +193,13 @@ def dispatch_to_ep_class(
     del expert_mask
     cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
 
-    final_permute_tokens = ep_class.apply(permute_tokens, cumsum, *ep_class_args)
+    # An `autograd.Function` class exposes the entry point as `apply`; anything else is
+    # called directly. Keyed on the attribute rather than `isinstance(..., type)`, so a
+    # class without `apply` reports that instead of being called as a constructor.
+    entry = getattr(ep_class, "apply", None)
+    final_permute_tokens = (
+        entry(permute_tokens, cumsum, *ep_class_args) if entry else ep_class(permute_tokens, cumsum, *ep_class_args)
+    )
     del permute_tokens
 
     return tokens_post_all2all(

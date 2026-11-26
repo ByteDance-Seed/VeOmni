@@ -2,7 +2,12 @@
   {
     "name": "distributed-default-gloo-group",
     "suite": "unit",
-    "args": ["-v", "-s", "-x", "tests/utils/test_dist_utils_group.py"]
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/utils/test_dist_utils_group.py"
+    ]
   },
   {
     "name": "npu-unit-01",
@@ -51,6 +56,16 @@
       "-s",
       "-x",
       "tests/parallel/ulysses/test_wan_t2v_ulysses.py"
+    ]
+  },
+  {
+    "name": "npu-unit-03c",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/parallel/ulysses/test_kimi_k3_vision_tower_sp.py"
     ]
   },
   {
@@ -110,9 +125,18 @@
       "-v",
       "-s",
       "-x",
-      "--ignore=tests/models/base/test_modify_init.py",
       "--ignore=tests/models/transformers/test_generated_call_site_signatures.py",
       "tests/models"
+    ]
+  },
+  {
+    "name": "hyper-parallel-training",
+    "suite": "unit",
+    "args": [
+      "-v",
+      "-s",
+      "-x",
+      "tests/distributed/test_hyper_parallel.py"
     ]
   },
   {
@@ -192,27 +216,7 @@
       "-v",
       "-s",
       "-x",
-      "tests/utils/test_extra_parallel_clip_grad_norm.py"
-    ]
-  },
-  {
-    "name": "npu-unit-17",
-    "suite": "unit",
-    "args": [
-      "-v",
-      "-s",
-      "-x",
-      "tests/utils/test_moe_ep_sharded_load_matrix.py"
-    ]
-  },
-  {
-    "name": "npu-unit-18",
-    "suite": "unit",
-    "args": [
-      "-v",
-      "-s",
-      "-x",
-      "tests/utils/test_ep_sharded_expert_stream_load.py"
+      "tests/utils/test_extra_parallel.py"
     ]
   },
   {
@@ -379,16 +383,6 @@
       "-s",
       "-x",
       "tests/lora/test_qwen3_5_moe_lora.py"
-    ]
-  },
-  {
-    "name": "npu-unit-35",
-    "suite": "unit",
-    "args": [
-      "-v",
-      "-s",
-      "-x",
-      "tests/lora/test_moe_lora_ep_sharded_stream_load.py"
     ]
   },
   {
