@@ -433,32 +433,42 @@ def split_moe_params(name, tensor, ep_rank=0):
 _process_moe_params = split_moe_params
 
 
-def export_weights(model: torch.nn.Module) -> Generator[tuple[str, torch.Tensor], None, None]:
+def export_weights(
+    model: torch.nn.Module,
+    *,
+    skip_frozen_ple: bool = False,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
     """
     Export master weights from fully_sharded model, fused MoE weights are split into per-expert weights.
 
-    When ``freeze_ple_embeddings`` was applied to ``model``, frozen Qwen4-Exp PLE n-gram
-    tables are omitted before unsharding ``DTensor`` shards.
-
     Args:
         model: The fully_sharded model to export the master weights from.
+        skip_frozen_ple: Omit frozen Qwen4-Exp PLE n-gram tables before unsharding
+            ``DTensor`` shards. Disabled by default so checkpoint exports remain complete.
 
     Returns:
         A generator of tuples of the form (name, tensor).
     """
-    from veomni.models.frozen_ple import has_frozen_ple_embeddings, is_ple_table
+    from veomni.models.frozen_ple import is_ple_table
 
     ps = parallel_state.get_parallel_state()
     while isinstance(getattr(model, "module", None), torch.nn.Module):
-        model = model.module
+        next_model = model.module
+        if next_model is model:
+            break
+        model = next_model
     params = model.state_dict()
-    skip_frozen_ple = has_frozen_ple_embeddings(model)
+    frozen_ple_names = (
+        {name for name, param in model.named_parameters() if is_ple_table(name) and not param.requires_grad}
+        if skip_frozen_ple
+        else set()
+    )
     converter = get_checkpoint_tensor_converter(model)
     crop_fn = getattr(converter, "crop_hf_export_tensor", None) if converter is not None else None
 
     device = None
     for name, param in params.items():
-        if skip_frozen_ple and is_ple_table(name):
+        if name in frozen_ple_names:
             continue
         # With ``CPUOffloadPolicy`` the sharded DTensor local shard lives on CPU, so an
         # unstaged ``full_tensor()`` all-gathers over gloo and hands CPU tensors to the

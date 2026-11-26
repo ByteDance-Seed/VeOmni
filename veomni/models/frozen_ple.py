@@ -1,7 +1,6 @@
 """Frozen PLE lookup tables: optimizer exclusion, dtype conversion, and export filtering.
 
-``is_ple_table``, ``freeze_ple_embeddings``, ``has_frozen_ple_embeddings``, and
-``prepare_ple_storage`` manage Qwen4-Exp
+``is_ple_table``, ``freeze_ple_embeddings``, and ``prepare_ple_storage`` manage Qwen4-Exp
 ``ple.ple_embedding.ngram_embedding.shard_<n>.weight`` parameters during
 training and in-memory weight export.
 """
@@ -20,14 +19,30 @@ def is_ple_table(name: str) -> bool:
 
 
 def has_frozen_ple_embeddings(model: torch.nn.Module) -> bool:
-    """Return whether ``freeze_ple_embeddings`` was applied to ``model``."""
-    cur: torch.nn.Module | None = model
-    while isinstance(cur, torch.nn.Module):
-        if getattr(cur, "_veomni_freeze_ple_embeddings", False):
-            return True
-        nxt = getattr(cur, "module", None)
-        cur = nxt if nxt is not cur else None
-    return False
+    """Return whether the model has PLE tables and all of them are frozen."""
+    found = False
+    for name, param in model.named_parameters():
+        if not is_ple_table(name):
+            continue
+        found = True
+        if param.requires_grad:
+            return False
+    return found
+
+
+def validate_frozen_ple_config(
+    freeze: bool,
+    dtype: str | None,
+    *,
+    enable_fsdp_offload: bool = False,
+) -> None:
+    """Validate frozen PLE options shared by trainer and parallelization entry points."""
+    if not isinstance(freeze, bool):
+        raise ValueError("freeze_ple_embeddings must be a boolean (true or false).")
+    if dtype is not None and (not freeze or dtype not in ("float32", "bfloat16")):
+        raise ValueError("frozen_ple_dtype requires freeze_ple_embeddings and must be float32 or bfloat16")
+    if freeze and enable_fsdp_offload:
+        raise ValueError("freeze_ple_embeddings does not support FSDP CPU offload")
 
 
 def prepare_ple_storage(model: torch.nn.Module, dtype: str | None, expected_device: str | None = None) -> None:
@@ -64,5 +79,4 @@ def freeze_ple_embeddings(model: torch.nn.Module) -> int:
         count += 1
     if not count:
         raise ValueError("freeze_ple_embeddings requested but no PLE table parameters were found")
-    model._veomni_freeze_ple_embeddings = True
     return count

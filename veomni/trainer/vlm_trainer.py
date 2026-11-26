@@ -96,12 +96,9 @@ class VLMTrainingArguments(TrainingArguments):
 
     def __post_init__(self):
         """Validate VLM freeze settings and initialize inherited training options."""
-        if not isinstance(self.freeze_ple_embeddings, bool):
-            raise ValueError("freeze_ple_embeddings must be a boolean (true or false).")
-        if self.frozen_ple_dtype is not None and (
-            not self.freeze_ple_embeddings or self.frozen_ple_dtype not in ("float32", "bfloat16")
-        ):
-            raise ValueError("frozen_ple_dtype requires freeze_ple_embeddings and must be float32 or bfloat16")
+        from ..models.frozen_ple import validate_frozen_ple_config
+
+        validate_frozen_ple_config(self.freeze_ple_embeddings, self.frozen_ple_dtype)
         super().__post_init__()
 
 
@@ -217,7 +214,13 @@ class VLMModelRuntime(VeOmniModelRuntime):
                 audio_proj.requires_grad_(True)
 
         if getattr(train_args, "freeze_ple_embeddings", False):
-            from ..models.frozen_ple import freeze_ple_embeddings
+            from ..models.frozen_ple import freeze_ple_embeddings, validate_frozen_ple_config
+
+            validate_frozen_ple_config(
+                train_args.freeze_ple_embeddings,
+                train_args.frozen_ple_dtype,
+                enable_fsdp_offload=self.args.accelerator.fsdp_config.offload,
+            )
 
             count = freeze_ple_embeddings(self.model)
             logger.info_rank0("Frozen PLE: %d tables", count)

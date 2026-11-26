@@ -44,15 +44,13 @@ keep the dtype they have after model parallelization.
 
 ## Weight export
 
-- **In-memory weight iteration ([`export_weights`](../../veomni/models/checkpoint/convert.py#L403)).**
-  When `freeze_ple_embeddings` is enabled (via `VLMTrainer` or
-  [`build_parallelize_model`](../../veomni/distributed/torch_parallelize.py#L1032)),
-  [`freeze_ple_embeddings`](../../veomni/models/frozen_ple.py#L53) marks the model so
-  [`export_weights`](../../veomni/models/checkpoint/convert.py#L403) omits frozen PLE
-  tables before unsharding `DTensor` shards. When `freeze_ple_embeddings` is disabled,
-  [`export_weights`](../../veomni/models/checkpoint/convert.py#L403) unshards PLE tables
-  and crops padded runtime rows back to their logical checkpoint row counts via
+- **In-memory weight iteration ([`export_weights`](../../veomni/models/checkpoint/convert.py#L436)).**
+  The default export includes frozen PLE tables and crops padded runtime rows
+  back to their logical checkpoint row counts via
   [`crop_hf_export_tensor`](../../veomni/models/transformers/qwen4_exp/checkpoint_tensor_converter.py#L107).
+  Rollout synchronization can call `export_weights(model, skip_frozen_ple=True)`
+  to omit only PLE tables whose parameters have `requires_grad=False`, before
+  unsharding their `DTensor` shards. Trainable PLE tables remain included.
 - **Distributed Hugging Face checkpoint save (`save_hf_safetensor`).**
   Saves all model parameters (including frozen PLE tables) directly from `DTensor`
   shards at their logical row counts via `RowCropSavePlanner`.

@@ -1240,15 +1240,17 @@ def build_parallelize_model(
             enabled gradient checkpointing and before FSDP2 shards the blocks.
         expert_weight_fp8_all_gather: Gather weights of actual DeepGEMM experts in FP8.
             Ignored when the model contains no matching experts.
-        freeze_ple_embeddings: Freeze Qwen4-Exp PLE n-gram tables before parallelization
-            and omit them during in-memory ``export_weights`` calls.
+        freeze_ple_embeddings: Freeze Qwen4-Exp PLE n-gram tables before parallelization.
         frozen_ple_dtype: Optional storage dtype (``"float32"`` or ``"bfloat16"``) applied
             to frozen PLE tables after parallelization and weight loading.
     """
-    if not isinstance(freeze_ple_embeddings, bool):
-        raise ValueError("freeze_ple_embeddings must be a boolean (true or false).")
-    if frozen_ple_dtype is not None and (not freeze_ple_embeddings or frozen_ple_dtype not in ("float32", "bfloat16")):
-        raise ValueError("frozen_ple_dtype requires freeze_ple_embeddings and must be float32 or bfloat16")
+    from ..models.frozen_ple import validate_frozen_ple_config
+
+    validate_frozen_ple_config(
+        freeze_ple_embeddings,
+        frozen_ple_dtype,
+        enable_fsdp_offload=bool(kwargs.get("enable_fsdp_offload", False)),
+    )
 
     parallel_state = get_parallel_state()
     reject_qat_without_native_bf16(model)
