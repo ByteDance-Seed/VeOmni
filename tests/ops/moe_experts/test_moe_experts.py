@@ -56,6 +56,7 @@ from tests.ops.utils import assert_close_with_error, assert_reference_signal, ma
 from veomni.ops import resolve_op
 from veomni.ops.kernels.moe_experts.shared import scheduling as same_nk_scheduling
 from veomni.ops.kernels.moe_experts.shared.indices import build_moe_indices
+from veomni.ops.kernels.moe_experts.standard import triton as triton_module
 from veomni.ops.kernels.moe_experts.standard.npu import _fc1_weight
 from veomni.utils.device import (
     IS_CUDA_AVAILABLE,
@@ -634,20 +635,40 @@ def test_triton_split_and_merged_match_eager(swiglu_limit: float | None):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", [(0, 257), (5, 257), (17, 768)])
 @pytest.mark.parametrize("swiglu_limit", [None, 1.0])
-def test_triton_merged_swiglu_preserves_staged_rounding(dtype, shape, swiglu_limit):
-    """Match materialized ATen SiLU for merged views and clamped inputs."""
+@pytest.mark.parametrize("grad_layout", ["contiguous", "transposed"])
+def test_triton_merged_swiglu_preserves_staged_rounding(dtype, shape, swiglu_limit, grad_layout):
+    """Match staged ATen values for merged views and strided upstream gradients."""
     require_nvidia_cuda("triton")
-    from veomni.ops.kernels.moe_experts.shared.swiglu import apply_swiglu_clamp, merged_swiglu_forward
+    from veomni.ops.kernels.moe_experts.shared.swiglu import (
+        apply_swiglu_clamp,
+        merged_swiglu_backward,
+        merged_swiglu_forward,
+    )
 
     torch.manual_seed(919)
     rows, columns = shape
     merged = torch.randn(rows, 2 * columns, device="cuda", dtype=dtype)
-    gate, up = apply_swiglu_clamp(*merged.chunk(2, dim=-1), swiglu_limit)[:2]
+    gate, up, gate_mask, up_mask = apply_swiglu_clamp(*merged.chunk(2, dim=-1), swiglu_limit)
     gate_before, up_before = gate.clone(), up.clone()
     expected = torch.ops.aten.silu(gate) * up
     actual = merged_swiglu_forward(gate, up)
+    if grad_layout == "transposed":
+        grad = torch.randn(columns, rows, device="cuda", dtype=dtype).T
+        if rows:
+            assert not grad.is_contiguous()
+            assert grad.stride(1) > 1
+    else:
+        grad = torch.randn_like(gate)
+    activation, packed_grad = merged_swiglu_backward(gate, up, grad, gate_mask, up_mask)
+    expected_gate_grad = torch.ops.aten.silu_backward(grad * up, gate)
+    expected_up_grad = torch.ops.aten.silu(gate) * grad
+    if gate_mask is not None:
+        expected_gate_grad.masked_fill_(~gate_mask, 0)
+        expected_up_grad.masked_fill_(~up_mask, 0)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(activation, expected, rtol=0, atol=0)
+    torch.testing.assert_close(packed_grad, torch.cat([expected_gate_grad, expected_up_grad], dim=-1), rtol=0, atol=0)
     torch.testing.assert_close(gate, gate_before, rtol=0, atol=0)
     torch.testing.assert_close(up, up_before, rtol=0, atol=0)
     assert actual.shape == shape and actual.dtype == dtype and actual.is_contiguous()
@@ -706,6 +727,17 @@ def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, 
     assert calls == [(tokens * top_k, intermediate), (tokens, intermediate)]
 
     monkeypatch.setattr(swiglu, "merged_swiglu_forward", lambda gate_input, up: torch.ops.aten.silu(gate_input) * up)
+
+    def staged_backward(gate_input, up, grad, gate_mask=None, up_mask=None):
+        silu = torch.ops.aten.silu(gate_input)
+        grad_gate = torch.ops.aten.silu_backward(grad * up, gate_input)
+        grad_up = silu * grad
+        if gate_mask is not None:
+            grad_gate.masked_fill_(~gate_mask, 0)
+            grad_up.masked_fill_(~up_mask, 0)
+        return silu * up, torch.cat([grad_gate, grad_up], dim=-1)
+
+    monkeypatch.setattr(swiglu, "merged_swiglu_backward", staged_backward)
     expected, expected_grads = run()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
@@ -719,6 +751,23 @@ def test_triton_merged_swiglu_matches_unfused_forward_and_backward(monkeypatch, 
     for actual_grad, expected_grad in zip(ep_grads, ep_ref_grads):
         assert torch.isfinite(actual_grad).all()
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_merged_swiglu_backward_cpu_preserves_clamp_gradients():
+    """The non-NVIDIA fallback matches autograd through the original clamped inputs."""
+    from veomni.ops.kernels.moe_experts.shared.swiglu import apply_swiglu_clamp, merged_swiglu_backward
+
+    torch.manual_seed(3)
+    gate = torch.randn(5, 33, requires_grad=True)
+    up = torch.randn_like(gate, requires_grad=True)
+    grad = torch.randn_like(gate)
+    clamped_gate, clamped_up, gate_mask, up_mask = apply_swiglu_clamp(gate, up, 0.5)
+    expected = torch.ops.aten.silu(clamped_gate) * clamped_up
+    expected_grads = torch.autograd.grad(expected, (gate, up), grad)
+    activation, packed_grad = merged_swiglu_backward(clamped_gate, clamped_up, grad, gate_mask, up_mask)
+    torch.testing.assert_close(activation, expected, rtol=0, atol=0)
+    torch.testing.assert_close(packed_grad, torch.cat(expected_grads, dim=-1), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -1416,28 +1465,1034 @@ def test_triton_merged_stream_capture_uses_shape_bound(monkeypatch: pytest.Monke
         assert torch.isfinite(tensor.grad).all()
 
 
-def test_reject_quantizing_act_fn_refuses_only_quantizing_rows():
-    """A non-SwiGLU activation cannot use a fused expert row, so QAT must be refused.
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("activation", ["silu", "swish", "gelu", "gelu_pytorch_tanh"])
+def test_the_eager_row_runs_the_configured_activation(activation):
+    """The routed experts compute ``act(gate) * up`` for the model's activation.
 
-    The fused kernels call ``aten.silu`` / ``aten.silu_backward`` directly, so the
-    Python ``act_fn`` loop is the only path for another activation -- and that loop
-    cannot reach the family row. Support is tracked in #1430.
+    Before this, the fused rows hard-coded ``aten.silu`` and every model whose
+    ``hidden_act`` was anything else fell back to a Python loop outside the family --
+    which is why a quantizing selection had to be refused there. The activation is a
+    call argument now, so the same row serves any of them.
 
-    The activation is read from ``use_swiglu_mlp`` because these experts modules are
-    plain ``nn.Module`` objects with no config reference.
+    The oracle is ``ACT2FN[activation]``, not a restated formula: the exact-erf GELU
+    and the tanh approximation are different functions.
+    """
+    from transformers.activations import ACT2FN
+
+    from veomni.ops.kernels.moe_experts.standard import eager
+
+    torch.manual_seed(0)
+    experts, hidden, intermediate, tokens, top_k = 3, 8, 16, 5, 2
+    x = torch.randn(tokens, hidden, dtype=torch.float32, requires_grad=True)
+    gate_w = torch.randn(experts, intermediate, hidden, dtype=torch.float32, requires_grad=True)
+    up_w = torch.randn(experts, intermediate, hidden, dtype=torch.float32, requires_grad=True)
+    down_w = torch.randn(experts, hidden, intermediate, dtype=torch.float32, requires_grad=True)
+    routes = torch.randint(0, experts, (tokens, top_k))
+    routing = torch.softmax(torch.randn(tokens, top_k), dim=-1)
+
+    out = eager.wrapper(
+        x,
+        routing,
+        routes,
+        gate_w,
+        up_w,
+        down_w,
+        gate_w.new_empty(0),
+        num_experts=experts,
+        activation=activation,
+    )
+
+    # Reference: the same loop with the transformers implementation.
+    act = ACT2FN[activation]
+    expected = torch.zeros(tokens, hidden)
+    for token in range(tokens):
+        for slot in range(top_k):
+            expert = int(routes[token, slot])
+            gate = x[token] @ gate_w[expert].T
+            up = x[token] @ up_w[expert].T
+            expected[token] += ((act(gate) * up) @ down_w[expert].T) * routing[token, slot]
+
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
+
+    out.sum().backward()
+    for tensor in (x, gate_w, up_w, down_w):
+        assert tensor.grad is not None
+        assert torch.isfinite(tensor.grad).all()
+        assert torch.any(tensor.grad != 0)
+
+    # The activation must actually change the result, or this proves nothing.
+    # ``swish`` is HF's alias for SiLU, so it is expected to match rather than differ.
+    if activation not in {"silu", "swish"}:
+        other = eager.wrapper(
+            x.detach(),
+            routing,
+            routes,
+            gate_w.detach(),
+            up_w.detach(),
+            down_w.detach(),
+            gate_w.new_empty(0),
+            num_experts=experts,
+            activation="silu",
+        )
+        assert not torch.equal(out.detach(), other)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    "impl",
+    ["eager", "fused_quack", "fused_npu", "fused_mlu"],
+)
+def test_a_fused_row_delegates_a_non_silu_activation_to_eager(impl):
+    """Rows whose kernel fuses SiLU agree with ``eager`` for every other activation.
+
+    ``fused_quack``, ``fused_npu`` and ``fused_mlu`` compute ``act(gate) * up``
+    inside their grouped GEMM, so another activation has no seam to reach. They hand
+    that call to the ``eager`` row, which is the reference implementation and the same
+    math models used before the activation became a call argument -- hence
+    ``rtol=0, atol=0`` here rather than a loose tolerance. They lose nothing by it:
+    those rows do bf16 math and ignore ``expert_dtype``.
+
+    ``deepgemm`` is deliberately absent. Its GEMM is FP8, so handing the call
+    away would skip the quantization and train the experts in bf16 under a config
+    that said otherwise -- it refuses instead, covered below.
+
+    This also pins the delegation's *placement*: it has to precede each row's
+    hardware guard, or a non-SiLU model on the wrong device fails with a hardware
+    error instead of running on the reference row.
+    """
+    from veomni.ops.kernels.moe_experts.standard import eager, mlu, npu, quack
+
+    rows = {
+        "eager": eager,
+        "fused_quack": quack,
+        "fused_npu": npu,
+        "fused_mlu": mlu,
+    }
+    row = rows[impl]
+
+    torch.manual_seed(0)
+    experts, hidden, intermediate, tokens, top_k = 3, 8, 16, 5, 2
+    x = torch.randn(tokens, hidden)
+    gate_up = torch.randn(experts, 2 * intermediate, hidden)
+    down = torch.randn(experts, hidden, intermediate)
+    routes = torch.randint(0, experts, (tokens, top_k))
+    routing = torch.softmax(torch.randn(tokens, top_k), dim=-1)
+    empty = gate_up.new_empty(0)
+
+    for activation in ("gelu", "gelu_pytorch_tanh"):
+        got = row.wrapper(
+            x,
+            routing,
+            routes,
+            empty,
+            empty,
+            down,
+            gate_up,
+            num_experts=experts,
+            activation=activation,
+        )
+        want = eager.wrapper(
+            x,
+            routing,
+            routes,
+            empty,
+            empty,
+            down,
+            gate_up,
+            num_experts=experts,
+            activation=activation,
+        )
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_every_ctx_attribute_a_backward_reads_is_assigned_in_forward():
+    """A custom ``autograd.Function``'s ``ctx`` only carries what ``forward`` set.
+
+    ``activation`` reaches the backward this way, and the two Triton Functions have
+    separate ``ctx`` assignments -- so adding the argument to one and forgetting the
+    other raises ``AttributeError`` only on the path that uses it. That happened
+    here: the merged-fc1 backward read ``ctx.activation`` while only the split-fc1
+    forward assigned it, and no CPU test reached the merged path.
+
+    Static rather than runtime, so it covers both Functions without a GPU.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(triton_module.__file__).read_text()
+    missing = []
+    checked = 0
+    for cls in (n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)):
+        forward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward"), None)
+        backward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "backward"), None)
+        if forward is None or backward is None:
+            continue
+        checked += 1
+        assigned = {
+            node.attr
+            for node in ast.walk(forward)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "ctx"
+            and isinstance(node.ctx, ast.Store)
+        }
+        read = {
+            node.attr
+            for node in ast.walk(backward)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "ctx"
+            and isinstance(node.ctx, ast.Load)
+        }
+        missing.extend((cls.name, name) for name in read - assigned - {"saved_tensors", "needs_input_grad"})
+
+    assert checked == 2, f"expected both Triton Functions, checked {checked}"
+    assert not missing, f"backward reads an attribute its forward never sets: {missing}"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_every_triton_function_backward_returns_one_gradient_per_argument():
+    """A custom ``autograd.Function``'s backward must return one entry per argument.
+
+    Adding ``activation`` to ``forward`` widened the argument list, and the backward
+    tuples have to grow with it -- PyTorch reports the mismatch only at the first
+    training step ("returned an incorrect number of gradients (expected 9, got 8)"),
+    which on CPU never runs because these rows need a GPU. Two consecutive CI runs
+    failed this way, so it is checked here statically instead.
+    """
+    import ast
+    import pathlib
+
+    from veomni.ops.kernels.moe_experts.shared import ep as ep_module
+
+    mismatches = []
+    checked = 0
+    modules = (triton_module, ep_module)
+    for cls in (
+        node
+        for module in modules
+        for node in ast.parse(pathlib.Path(module.__file__).read_text()).body
+        if isinstance(node, ast.ClassDef)
+    ):
+        forward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward"), None)
+        backward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "backward"), None)
+        if forward is None or backward is None:
+            continue
+        checked += 1
+        # ``ctx`` is not part of the tuple PyTorch compares against.
+        arguments = len([argument for argument in forward.args.args if argument.arg != "ctx"])
+        returned = next((node for node in ast.walk(backward) if isinstance(node, ast.Return)), None)
+        entries = len(returned.value.elts) if isinstance(returned.value, ast.Tuple) else 1
+        if arguments != entries:
+            mismatches.append((cls.name, arguments, entries))
+
+    assert checked == 4, f"expected both Triton and both EP Functions, checked {checked}"
+    assert not mismatches, f"backward tuple does not match forward's arguments: {mismatches}"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("activation", ["relu", "mish", "quick_gelu"])
+def test_the_eager_row_evaluates_an_activation_outside_the_whitelist(activation):
+    """A config outside the four served names still runs on the reference row.
+
+    ``veomni.ops.activation`` serves a closed set, and the fused rows refuse anything
+    else -- but before the activation became a call argument, every model evaluated
+    its own ``act_fn`` through ``merged_experts_act_fn_forward``. Dropping that made
+    ``hidden_act: relu`` construct and then fail at the first forward, which is a
+    regression for models that trained fine. ``act_fn`` restores the escape, the same
+    way ``gated_mlp``'s ``eager`` row uses ``mlp.act_fn``.
+    """
+    from transformers.activations import ACT2FN
+
+    from veomni.ops.kernels.moe_experts.standard import eager
+
+    torch.manual_seed(0)
+    experts, hidden, intermediate, tokens, top_k = 3, 8, 16, 5, 2
+    x = torch.randn(tokens, hidden)
+    gate_up = torch.randn(experts, 2 * intermediate, hidden)
+    down = torch.randn(experts, hidden, intermediate)
+    routes = torch.randint(0, experts, (tokens, top_k))
+    routing = torch.softmax(torch.randn(tokens, top_k), dim=-1)
+
+    act_fn = ACT2FN[activation]
+    got = eager.wrapper(
+        x,
+        routing,
+        routes,
+        gate_up.new_empty(0),
+        gate_up.new_empty(0),
+        down,
+        gate_up,
+        num_experts=experts,
+        activation=activation,
+    )
+
+    expected = torch.zeros(tokens, hidden)
+    for token in range(tokens):
+        for slot in range(top_k):
+            expert = int(routes[token, slot])
+            gate = x[token] @ gate_up[expert][:intermediate].T
+            up = x[token] @ gate_up[expert][intermediate:].T
+            expected[token] += ((act_fn(gate) * up) @ down[expert].T) * routing[token, slot]
+
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
+
+    # A name transformers does not know is the only case with no answer at all.
+    with pytest.raises(ValueError, match="no implementation for activation"):
+        eager.wrapper(
+            x,
+            routing,
+            routes,
+            gate_up.new_empty(0),
+            gate_up.new_empty(0),
+            down,
+            gate_up,
+            num_experts=experts,
+            activation="not_an_activation",
+        )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_absent_clamp_masks_are_never_inverted():
+    """The merged backward must not apply ``~`` to the empty placeholder tensor.
+
+    ``forward`` saves ``torch.empty(0)`` where a clamp mask would go, so checking
+    ``mask is not None`` is always true and ``~`` on a float tensor raises. The guard
+    has to be ``swiglu_limit is not None``, as the split backward already does. This
+    is a static check because the merged path needs a GPU.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(triton_module.__file__).read_text()
+    offenders = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.If):
+            continue
+        comparisons = ast.unparse(node.test)
+        body = ast.unparse(node)
+        if "mask_fc1_" in comparisons and "is not None" in comparisons and "~mask_fc1_" in body:
+            offenders.append(comparisons)
+    assert not offenders, f"a clamp mask is tested with `is not None`, but forward saves an empty tensor: {offenders}"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_a_quantizing_row_refuses_an_activation_it_cannot_evaluate():
+    """Neither quantizing row may quietly fall back to the model dtype.
+
+    ``qat`` and ``deepgemm`` round the expert GEMMs, so an activation they cannot
+    evaluate has no correct answer: handing it to a reference row, or to the model's
+    own ``act_fn``, would train the experts at full precision while the config claimed
+    quantization. Both refuse, and both say which selection to use instead.
+
+    ``moe_experts``' bf16 fused rows are the contrast: they delegate, because they
+    round nothing and the reference path is exactly as precise.
+    """
+
+    from veomni.ops.kernels.moe_experts.standard import deepgemm, qat
+
+    torch.manual_seed(0)
+    experts, hidden, intermediate, tokens, top_k = 3, 128, 256, 4, 2
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
+    gate_up = torch.randn(experts, 2 * intermediate, hidden, dtype=torch.bfloat16)
+    down = torch.randn(experts, hidden, intermediate, dtype=torch.bfloat16)
+    routes = torch.randint(0, experts, (tokens, top_k))
+    routing = torch.softmax(torch.randn(tokens, top_k), dim=-1).to(torch.bfloat16)
+    empty = gate_up.new_empty(0)
+
+    for row, name in ((qat, "qat"), (deepgemm, "deepgemm")):
+        with pytest.raises(ValueError, match=f"moe_implementation='{name}'"):
+            row.wrapper(
+                x,
+                routing,
+                routes,
+                empty,
+                empty,
+                down,
+                gate_up,
+                num_experts=experts,
+                activation="relu",
+            )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_no_triton_function_forward_reads_the_activation_without_its_ctx_copy():
+    """Every activation site in the Triton Functions goes through one helper.
+
+    A row that evaluates the activation in `forward` with one expression and in
+    `backward` with another produces a forward that computes SiLU and a backward that
+    differentiates GELU -- a silently wrong training run, not a crash. The merged-fc1
+    forward had exactly that shape. Routing every site through `_expert_activation`
+    and the `ctx` copy of the same arguments makes the two halves agree by
+    construction, so this pins the shape rather than re-testing the arithmetic.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(triton_module.__file__).read_text()
+    offenders = []
+    for cls in (n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)):
+        for method in ("forward", "backward"):
+            function = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == method), None)
+            if function is None:
+                continue
+            # A direct call is fine inside an explicit ``== "silu"`` branch, which is
+            # how the fused kernel is chosen; what is not fine is one side of the
+            # function picking it and the other side not.
+            guarded = set()
+            for node in ast.walk(function):
+                if not isinstance(node, ast.If) or "silu" not in ast.unparse(node.test):
+                    continue
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Call):
+                        guarded.add(id(inner))
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call) or id(node) in guarded:
+                    continue
+                callee = ast.unparse(node.func)
+                if callee in {"apply_activation", "swiglu.merged_swiglu_forward", "swiglu.merged_swiglu_backward"}:
+                    offenders.append(f"{cls.name}.{method} calls {callee} directly")
+
+    assert not offenders, (
+        "an activation is evaluated outside _expert_activation, so forward and backward "
+        f"can pick different functions: {offenders}"
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_the_expert_parallel_functions_receive_the_activation():
+    """The EP path is selected before any of the non-EP code, so it needs its own pass.
+
+    `fused_triton` dispatches to `EPGroupGemm` / `EPMergedFc1GroupGemm` when expert
+    parallelism is on, and those Functions are separate implementations with their own
+    `forward` and `backward`. They were left on `aten.silu` while the non-EP path took
+    the configured activation, which meant an EP run silently trained a different
+    function than the same config without EP.
+    """
+    import ast
+    import pathlib
+
+    from veomni.ops.kernels.moe_experts.shared import ep as ep_module
+
+    source = pathlib.Path(ep_module.__file__).read_text()
+    checked = 0
+    for cls in (n for n in ast.parse(source).body if isinstance(n, ast.ClassDef)):
+        forward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward"), None)
+        backward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "backward"), None)
+        if forward is None or backward is None:
+            continue
+        checked += 1
+        arguments = [argument.arg for argument in forward.args.args]
+        assert "activation" in arguments, f"{cls.name}.forward does not take the activation"
+        body = ast.unparse(forward) + ast.unparse(backward)
+        assert "_expert_activation" in body, f"{cls.name} evaluates the activation directly"
+        assert "ctx.activation" in body, f"{cls.name}.backward does not read the saved act_fn"
+
+    assert checked == 2, f"expected both EP Functions, checked {checked}"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_every_backward_keeps_its_weight_gradient_inside_the_requires_grad_guard():
+    """A ``requires_grad``-guarded wgrad must stay inside that guard.
+
+    Adding a branch around the activation is easy to get wrong in a way that reads
+    fine: the ``group_gemm_same_mn`` that produces ``grad_fc2_weight`` was left inside
+    the *non*-SiLU branch, so the SiLU path -- every real training run -- skipped that
+    weight's gradient entirely. Nothing raised; the loss simply diverged from the
+    configuration that computes it correctly, which is what the expert-parallel
+    alignment test caught.
+
+    Static because these paths need a GPU and an EP group.
+    """
+    import ast
+    import pathlib
+
+    from veomni.ops.kernels.moe_experts.shared import ep as ep_module
+
+    problems = []
+    for module in (triton_module, ep_module):
+        for cls in (
+            n for n in ast.parse(pathlib.Path(module.__file__).read_text()).body if isinstance(n, ast.ClassDef)
+        ):
+            backward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "backward"), None)
+            if backward is None:
+                continue
+            # every `if <weight>.requires_grad:` must contain the GEMM writing that weight
+            for node in ast.walk(backward):
+                if not isinstance(node, ast.If):
+                    continue
+                test = ast.unparse(node.test)
+                if "requires_grad" not in test:
+                    continue
+                body = ast.unparse(node)
+                if "group_gemm" not in body:
+                    problems.append(f"{cls.name}: `if {test}` computes no weight gradient")
+
+    assert not problems, f"a weight gradient moved out of its guard: {problems}"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("activation", ["relu", "mish", "quick_gelu", "gelu", "silu"])
+def test_the_shared_activation_backward_matches_autograd(activation):
+    """A name outside the four served ones differentiates through the model's `act_fn`.
+
+    `fused_triton` is the GPU default, so a `relu` config reaches it first. Forward
+    worked through the `act_fn` fallback, but backward called
+    `apply_activation_backward`, which raises for anything outside its four branches --
+    so the run failed at the first training step instead of the first forward. This
+    covers both routes through one helper.
+    """
+    from transformers.activations import ACT2FN
+
+    from veomni.ops.kernels.moe_experts.shared.activation import activation_backward
+
+    torch.manual_seed(0)
+    act_fn = ACT2FN[activation]
+    hidden = torch.randn(256, dtype=torch.bfloat16)
+    grad = torch.randn(256, dtype=torch.bfloat16)
+
+    got = activation_backward(grad, hidden, activation)
+
+    leaf = hidden.detach().clone().requires_grad_(True)
+    (expected,) = torch.autograd.grad(act_fn(leaf), leaf, grad)
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_the_reference_row_owns_the_expert_parallel_dispatch():
+    """A non-Swish activation under EP must be dispatched, not indexed by global id.
+
+    `eager` is what every SiLU-fused row hands a non-Swish activation to, so it has to
+    carry the expert-parallel path: under EP each rank holds a shard of the expert
+    weights, and the per-expert loop indexes by global id -- reading past the shard or
+    picking the wrong expert, silently. An earlier revision of this branch delegated
+    EP traffic to `triton` instead, which made one row call another; the dispatch
+    belongs to the row that runs the loop.
+    """
+    from transformers.activations import ACT2FN
+
+    from veomni.ops.kernels.moe_experts.shared.act_fn_experts import merged_experts_act_fn_forward
+
+    # Sharded expert weights with EP off: refuse rather than read the wrong expert.
+    with pytest.raises(ValueError, match="expert-parallel sharded weights"):
+        merged_experts_act_fn_forward(
+            torch.randn(3, 4),
+            torch.tensor([[3], [3], [3]]),
+            torch.ones(3, 1),
+            torch.randn(2, 8, 4),
+            torch.randn(2, 4, 4),
+            ACT2FN["gelu"],
+            num_experts=4,
+        )
+
+    # And the fused rows delegate to a single row, which owns that dispatch.
+    import pathlib
+
+    for module in ("quack", "npu", "mlu"):
+        source = (pathlib.Path(triton_module.__file__).parent / f"{module}.py").read_text()
+        assert "_eager.wrapper(" in source, f"{module} does not delegate to the reference row"
+        assert "_triton.wrapper(" not in source, f"{module} calls another row instead"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_every_backward_attribute_exists_on_the_ctx_its_forward_built():
+    """A `ctx.<name>` a backward reads must be one the forward set, across modules.
+
+    `ep.py` kept passing `ctx.act_fn` after that attribute was removed, so both EP
+    Functions raised `AttributeError` on the first backward -- including the default
+    SiLU path. The existing check only looked inside `triton.py`, which is how the
+    copy in `ep.py` survived.
+
+    Static because the EP path needs a distributed group and a GPU, and because the
+    failure is a name, not a number.
+    """
+    import ast
+    import pathlib
+
+    from veomni.ops.kernels.moe_experts.shared import ep as ep_module
+
+    missing = []
+    checked = 0
+    for module in (triton_module, ep_module):
+        for cls in (
+            n for n in ast.parse(pathlib.Path(module.__file__).read_text()).body if isinstance(n, ast.ClassDef)
+        ):
+            forward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward"), None)
+            backward = next((n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "backward"), None)
+            if forward is None or backward is None:
+                continue
+            checked += 1
+            assigned = {
+                node.attr
+                for node in ast.walk(forward)
+                if isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "ctx"
+                and isinstance(node.ctx, ast.Store)
+            }
+            read = {
+                node.attr
+                for node in ast.walk(backward)
+                if isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "ctx"
+                and isinstance(node.ctx, ast.Load)
+            }
+            missing.extend(f"{cls.name}.{name}" for name in read - assigned - {"saved_tensors", "needs_input_grad"})
+
+    assert checked == 4, f"expected four Functions across both modules, checked {checked}"
+    assert not missing, f"backward reads a ctx attribute its forward never sets: {missing}"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_expert_sharding_is_read_without_assuming_the_axis_is_named_ep():
+    """A parallel state built with another extra axis must not raise here.
+
+    ``ParallelState.ep_enabled`` indexes ``extra_parallel_sizes["ep"]`` unconditionally,
+    and ``_init_parallel_state`` builds that dict from ``extra_parallel_names``. A state
+    initialized with, say, ``("ple",)`` therefore has no ``"ep"`` key, and asking
+    whether expert weights are sharded raised ``KeyError: 'ep'`` -- which took out an
+    Ulysses test that never touches experts, because the guard runs on every call.
+
+    The question this row needs answered is only "are experts sharded?", and a missing
+    axis means no.
     """
     from types import SimpleNamespace
+    from unittest import mock
 
-    from veomni.ops.kernels.moe_experts import reject_quantizing_act_fn
+    from veomni.ops.kernels.moe_experts.shared import act_fn_experts
 
-    def experts(impl, swiglu):
-        return SimpleNamespace(veomni_moe=SimpleNamespace(impl=impl), use_swiglu_mlp=swiglu)
+    def with_sizes(sizes):
+        return mock.patch(
+            "veomni.distributed.moe.moe_layer.get_parallel_state",
+            lambda: SimpleNamespace(extra_parallel_sizes=sizes),
+        )
 
-    # SwiGLU is what every fused row implements.
-    reject_quantizing_act_fn(experts("qat", swiglu=True))
+    with with_sizes({"ep": 4}):
+        assert act_fn_experts.expert_parallel_size() == 4
+    with with_sizes({"ep": 1}):
+        assert act_fn_experts.expert_parallel_size() == 1
+    with with_sizes({"ple": 2}):
+        assert act_fn_experts.expert_parallel_size() == 1
+    with with_sizes({}):
+        assert act_fn_experts.expert_parallel_size() == 1
 
-    with pytest.raises(ValueError, match="moe_implementation='qat' cannot run with a non-SwiGLU activation"):
-        reject_quantizing_act_fn(experts("qat", swiglu=False))
 
-    # A reference row may use the fallback; that is a deliberate precision choice.
-    reject_quantizing_act_fn(experts("eager", swiglu=False))
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh"])
+def test_a_served_activation_differentiates_under_fullgraph_compile(activation):
+    """The four served names compile; that is part of why they are the served set.
+
+    `activation_backward` routes them through ATen backward ops, and a row built on it
+    stays traceable under `torch.compile(fullgraph=True)`. A name outside the set has
+    to differentiate an arbitrary transformers callable through a fresh
+    `requires_grad_(True)` leaf, which Dynamo rejects -- a limit recorded in
+    `veomni/ops/activation.py` and `constraints.md` rather than worked around,
+    because no model here configures such a name.
+    """
+    import torch
+
+    from veomni.ops.kernels.moe_experts.shared.activation import activation_backward
+
+    class _Row(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, hidden, name):
+            from veomni.ops.activation import resolve
+
+            ctx.name = name
+            ctx.save_for_backward(hidden)
+            return resolve(name)(hidden)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            (hidden,) = ctx.saved_tensors
+            return activation_backward(grad_output, hidden, ctx.name), None
+
+    hidden = torch.randn(64, dtype=torch.bfloat16, requires_grad=True)
+    compiled = torch.compile(_Row.apply, fullgraph=True, backend="eager")
+    compiled(hidden, activation).sum().backward()
+    assert hidden.grad is not None
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_an_unserved_activation_is_the_documented_compile_limit():
+    """The limit is real and pinned, so it is not mistaken for a regression later.
+
+    If a future change makes these compile too, this test fails and the documentation
+    in `activation.py` / `constraints.md` should be updated to match -- which is a
+    better outcome than silently having prose that no longer describes the code.
+    """
+    import torch
+
+    from veomni.ops.kernels.moe_experts.shared.activation import activation_backward
+
+    class _Row(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, hidden, name):
+            from veomni.ops.activation import resolve
+
+            ctx.name = name
+            ctx.save_for_backward(hidden)
+            return resolve(name)(hidden)
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            (hidden,) = ctx.saved_tensors
+            return activation_backward(grad_output, hidden, ctx.name), None
+
+    hidden = torch.randn(64, dtype=torch.bfloat16, requires_grad=True)
+    compiled = torch.compile(_Row.apply, fullgraph=True, backend="eager")
+    with pytest.raises(Exception, match="requires_grad_|Unsupported"):
+        compiled(hidden, "relu").sum().backward()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_dispatch_to_ep_class_calls_the_expert_math_in_cumsum_order():
+    """Pin the ``(permute_tokens, cumsum, *weights)`` contract the rows rely on.
+
+    Every fused row hands its per-rank math to `dispatch_to_ep_class`, and the shared
+    helper decides what that argument order is. A swap there is invisible to the GPU
+    parity test when both sides call the same helper -- both would be wrong
+    identically. This stubs out the collectives and records what arrives.
+
+    Also covers the two accepted shapes: an `autograd.Function` class (`.apply`) and a
+    plain callable, which the Ascend and DeepGEMM rows pass because their grouped
+    matmul is already a `Function`.
+    """
+    from unittest import mock
+
+    import torch
+
+    from veomni.distributed.moe import moe_layer
+
+    seen = {}
+
+    def record(tokens, cumsum, *rest):
+        seen["args"] = (tokens, cumsum, *rest)
+        return tokens
+
+    counts = torch.tensor([3, 0, 5])
+    stubs = {
+        "preprocess": lambda **_: (
+            [3],
+            [3],
+            counts,
+            counts,
+        ),
+        "token_pre_all2all": lambda hidden_states, **_: (
+            hidden_states.reshape(-1, hidden_states.shape[-1]),
+            None,
+            None,
+            tuple(hidden_states.shape),
+        ),
+        "tokens_post_all2all": lambda expert_outputs, **_: expert_outputs,
+    }
+    with (
+        mock.patch.multiple(moe_layer, **stubs),
+        mock.patch.object(moe_layer, "get_parallel_state", lambda: mock.MagicMock(ep_group=mock.MagicMock())),
+    ):
+        hidden = torch.randn(6, 4)
+        weight = torch.randn(8, 4)
+
+        # a plain callable, as the Ascend and DeepGEMM rows pass
+        moe_layer.dispatch_to_ep_class(
+            record, 2, torch.rand(6, 1), torch.zeros(6, 1, dtype=torch.long), hidden, weight
+        )
+        tokens, cumsum, *rest = seen["args"]
+        assert rest[0] is weight
+        assert torch.equal(cumsum, torch.cumsum(counts, dim=0)), "the helper hands over a cumsum"
+
+        # and an autograd.Function class, as the Triton and LoRA rows pass
+        class _Math(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, tokens, cumsum, *rest):
+                seen["class_args"] = (tokens, cumsum, *rest)
+                return tokens
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                return (grad_output, None, None)
+
+        moe_layer.dispatch_to_ep_class(_Math, 2, torch.rand(6, 1), torch.zeros(6, 1, dtype=torch.long), hidden, weight)
+        assert seen["class_args"][2] is weight
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_the_eager_row_has_one_reference_loop_not_two():
+    """`eager` must delegate, not carry a second copy of the expert loop.
+
+    It used to hold an inline non-EP loop beside the shared one, chosen by
+    ``if not supports(activation) or _experts_are_sharded()``. The inline copy indexed
+    expert weights with *global* ids, so it was wrong under EP and could not serve an
+    activation outside the whitelist -- two behaviours that the branch condition hid
+    rather than expressed. Keeping only the delegated path means one implementation of
+    "the reference row", and EP correctness is a property of the row rather than of
+    which branch a caller happened to take.
+
+    Static because the defect is structural: a second `for` loop over experts compiled
+    and passed the numeric tests on the non-EP path.
+    """
+    import ast
+    import pathlib
+
+    from veomni.ops.kernels.moe_experts.standard import eager as eager_module
+
+    source = pathlib.Path(eager_module.__file__).read_text()
+
+    tree = ast.parse(source)
+    wrapper = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "wrapper")
+    loops = [node for node in ast.walk(wrapper) if isinstance(node, (ast.For, ast.AsyncFor))]
+    assert not loops, "eager.wrapper runs the expert loop inline again; it must delegate to the shared one"
+
+    def _callee_tail(node: ast.AST) -> str | None:
+        """Last name of a call target, so an aliased import still counts as a call."""
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return None
+
+    calls = [n for n in ast.walk(wrapper) if isinstance(n, ast.Call)]
+    assert any(_callee_tail(c.func) == "merged_experts_act_fn_forward" for c in calls), (
+        "eager.wrapper must call merged_experts_act_fn_forward"
+    )
+
+    # The property the name claims is "one reference loop in the repository", so check
+    # the module that actually owns it: exactly one loop over experts. A second copy
+    # reintroduced there would not show up in eager.py at all.
+    from veomni.ops.kernels.moe_experts.shared import act_fn_experts as shared_module
+
+    shared_tree = ast.parse(pathlib.Path(shared_module.__file__).read_text())
+    shared_loops = [
+        node
+        for node in ast.walk(shared_tree)
+        if isinstance(node, (ast.For, ast.AsyncFor))
+        and any(isinstance(n, ast.Name) and n.id == "expert_idx" for n in ast.walk(node))
+    ]
+    assert len(shared_loops) == 2, (
+        "act_fn_experts should hold exactly two per-expert loops (the EP math and the "
+        f"non-EP loop), found {len(shared_loops)}"
+    )
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_pytorch_tanh", "relu"])
+def test_split_and_merged_fc1_agree_on_every_activation(activation):
+    """Both weight layouts take the same path, so they must agree bit for bit.
+
+    `eager` accepts a fused `gate_up_proj` or a `fc1_1`/`fc1_2` pair. Merging the two
+    loops made the split layout a concatenation inside the shared loop; a mismatch
+    there would silently train a different function depending on which layout a model
+    happened to build.
+    """
+    from veomni.ops.kernels.moe_experts.standard import eager
+
+    torch.manual_seed(0)
+    experts, hidden, intermediate, tokens, top_k = 3, 8, 16, 5, 2
+    routed = torch.randn(tokens, hidden)
+    routes = torch.randint(0, experts, (tokens, top_k))
+    routing = torch.softmax(torch.randn(tokens, top_k), dim=-1)
+    down = torch.randn(experts, hidden, intermediate)
+    gate_w = torch.randn(experts, intermediate, hidden)
+    up_w = torch.randn(experts, intermediate, hidden)
+    empty = gate_w.new_empty(0)
+
+    merged = eager.wrapper(
+        routed,
+        routing,
+        routes,
+        empty,
+        empty,
+        down,
+        torch.cat([gate_w, up_w], dim=1),
+        num_experts=experts,
+        activation=activation,
+    )
+    split = eager.wrapper(
+        routed,
+        routing,
+        routes,
+        gate_w,
+        up_w,
+        down,
+        empty,
+        num_experts=experts,
+        activation=activation,
+    )
+    assert torch.equal(merged, split), f"{activation}: a layout change altered the result"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_the_reference_loop_keeps_an_empty_microbatch_on_the_graph():
+    """Zero routed tokens must still produce a tensor with a `grad_fn`.
+
+    The loop builds its accumulator with `new_zeros` + `index_add_`, so when the loop
+    body never executes the result is detached and autograd skips the block. Under EP
+    that skips a rank's all-to-all backward while the other ranks block. The EP variants
+    guard with `+ tokens * 0`; the non-EP loop lost that guard when the two loops were
+    merged, so this pins it.
+    """
+    from veomni.ops.kernels.moe_experts.standard import eager
+
+    experts, hidden, intermediate, tokens = 3, 8, 16, 4
+    routed = torch.randn(tokens, hidden, requires_grad=True)
+    down = torch.randn(experts, hidden, intermediate, requires_grad=True)
+    gate_up = torch.randn(experts, 2 * intermediate, hidden, requires_grad=True)
+    empty = gate_up.new_empty(0)
+
+    # An empty microbatch: no token reaches any expert, so the loop body never runs.
+    out = eager.wrapper(
+        routed[:0],
+        torch.ones(0, 1),
+        torch.zeros(0, 1, dtype=torch.long),
+        empty,
+        empty,
+        down,
+        gate_up,
+        num_experts=experts,
+    )
+    assert out.requires_grad, "an empty microbatch detached from the graph"
+    assert out.grad_fn is not None
+
+    out.sum().backward()
+    assert routed.grad is not None, "the input got no gradient, so the block was skipped"
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("ep_size", [2, 4])
+def test_gpt_oss_eager_ep_math_matches_the_hf_loop(ep_size):
+    """GPT-OSS's eager row dispatches under EP instead of indexing a shard.
+
+    It had no EP branch at all: the loop read `gate_up_proj[idx]` with a global expert
+    id against per-rank shards, so `gpt_oss + eager + ep_size>1` raised. The interleaved
+    gate/up layout and the clamped activation are GPT-OSS's own, so the per-rank math
+    stays in `gpt_oss/eager.py` and only the plumbing is shared.
+
+    The oracle is HF's `GptOssExperts` itself, run once per local expert over the rows
+    that expert owns. That pins the interleaved `[..., ::2]` slicing, which side of the
+    clamp each half takes, and `alpha` -- a restated formula in the test would not.
+    """
+    from veomni.ops.kernels.moe_experts.gpt_oss import eager as gpt_oss_eager
+
+    torch.manual_seed(0)
+    experts, hidden, intermediate, rows = 4, 16, 32, 16
+    routed = torch.randn(rows, hidden)
+    # Right-multiplied layout, as the model builds it: [E, H, 2I] and [E, I, H].
+    gate_up = torch.randn(experts, hidden, 2 * intermediate)
+    gate_up_bias = torch.randn(experts, 2 * intermediate)
+    down = torch.randn(experts, intermediate, hidden)
+    down_bias = torch.randn(experts, hidden)
+
+    # Expert 1 owns no rows, so its slice is zero-length and contributes nothing.
+    cumsum = torch.tensor([5, 5, 11, 16], dtype=torch.long)
+
+    expected = torch.empty_like(routed)
+    row_starts = torch.cat([cumsum.new_zeros(1), cumsum[:-1]])
+    units = torch.ones(1, 1)
+    for e in range(experts):
+        s, t = int(row_starts[e]), int(cumsum[e])
+        if t == s:
+            continue  # an empty expert: HF would be called with zero rows
+        # One expert, routing weight 1.0, so HF returns that expert's contribution.
+        oracle, _ = _gpt_oss_hf_loop(
+            routed[s:t],
+            units.expand(t - s, 1),
+            torch.zeros((t - s, 1), dtype=torch.long),  # local id 0 in the 1-expert slice
+            gate_up[e : e + 1],
+            gate_up_bias[e : e + 1],
+            down[e : e + 1],
+            down_bias[e : e + 1],
+            num_experts=1,
+        )
+        expected[s:t] = oracle
+
+    per_rank = experts // ep_size
+    pieces = [
+        gpt_oss_eager._GptOssExpertMathEP.apply(
+            routed[int(row_starts[rank * per_rank]) : int(cumsum[(rank + 1) * per_rank - 1])],
+            cumsum[rank * per_rank : (rank + 1) * per_rank] - (cumsum[rank * per_rank - 1] if rank > 0 else 0),
+            gate_up[rank * per_rank : (rank + 1) * per_rank],
+            gate_up_bias[rank * per_rank : (rank + 1) * per_rank],
+            down[rank * per_rank : (rank + 1) * per_rank],
+            down_bias[rank * per_rank : (rank + 1) * per_rank],
+            1.702,
+            7.0,
+        )
+        for rank in range(ep_size)
+    ]
+    got = torch.cat(pieces, dim=0)
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-6)
+    # The empty expert contributed exactly nothing, and its rows stayed put.
+    assert int(cumsum[1] - cumsum[0]) == 0
+    torch.testing.assert_close(got[5:5], expected[5:5])
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_gpt_oss_eager_wrapper_reaches_the_ep_branch():
+    """The EP branch of `wrapper` must actually be taken, not just reachable in theory.
+
+    The numeric test above calls the math class directly, so it cannot catch a wrapper
+    that forgets to dispatch -- which is the exact shape of the bug this fixed. Here the
+    collectives are stubbed and the branch is asserted through its output.
+    """
+    from unittest import mock
+
+    from veomni.distributed.moe import moe_layer
+    from veomni.ops.kernels.moe_experts.gpt_oss import eager as gpt_oss_eager
+
+    torch.manual_seed(0)
+    experts, hidden, intermediate, rows = 4, 8, 16, 6
+    called: dict[str, int] = {}
+
+    def fake_dispatch(ep_class, num_experts, routing_weights, *args, **kwargs):
+        """Record the dispatch and run the math on the local shard."""
+        called["dispatch"] = num_experts
+        called["routing_dtype"] = routing_weights.dtype
+        return torch.zeros(rows, hidden)
+
+    with mock.patch.object(gpt_oss_eager, "expert_parallel_size", lambda: 2):
+        with mock.patch.object(moe_layer, "dispatch_to_ep_class", fake_dispatch):
+            import veomni.distributed.moe as moe_pkg
+
+            with mock.patch.object(moe_pkg, "dispatch_to_ep_class", fake_dispatch):
+                out = gpt_oss_eager.wrapper(
+                    torch.randn(rows, hidden, dtype=torch.bfloat16),
+                    torch.ones(rows, 1, dtype=torch.float32),
+                    torch.zeros(rows, 1, dtype=torch.long),
+                    torch.randn(experts // 2, hidden, 2 * intermediate, dtype=torch.bfloat16),
+                    torch.randn(experts // 2, 2 * intermediate, dtype=torch.bfloat16),
+                    torch.randn(experts // 2, intermediate, hidden, dtype=torch.bfloat16),
+                    torch.randn(experts // 2, hidden, dtype=torch.bfloat16),
+                    num_experts=experts,
+                )
+
+    assert called.get("dispatch") == experts, "the EP branch was not taken"
+    assert called["routing_dtype"] == torch.bfloat16, "routing weights were not cast before dispatch"
+    assert out.shape == (rows, hidden)
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_gpt_oss_eager_refuses_weights_sharded_by_the_wrong_factor():
+    """An EP state whose weights are not actually sharded must name the problem."""
+    from unittest import mock
+
+    from veomni.ops.kernels.moe_experts.gpt_oss import eager as gpt_oss_eager
+
+    hidden, intermediate, experts = 8, 16, 4
+    with mock.patch(
+        "veomni.ops.kernels.moe_experts.gpt_oss.eager.expert_parallel_size",
+        lambda: 2,
+    ):
+        with pytest.raises(ValueError, match="not sharded as expected"):
+            gpt_oss_eager.wrapper(
+                torch.randn(4, hidden),
+                torch.ones(4, 1),
+                torch.zeros(4, 1, dtype=torch.long),
+                torch.randn(experts, hidden, 2 * intermediate),
+                torch.randn(experts, 2 * intermediate),
+                torch.randn(experts, intermediate, hidden),
+                torch.randn(experts, hidden),
+                num_experts=experts,
+            )

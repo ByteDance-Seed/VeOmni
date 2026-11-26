@@ -77,7 +77,7 @@ _QWEN4_EXP_TRAINING_ARGS = [
     "--model.accelerator.extra_parallel_sizes=2",
     "--model.accelerator.extra_parallel_placement_innermost=false",
     "--model.broadcast_model_weights_from_rank0=false",
-    "--model.ep_sharded_stream_load=true",
+    "--model.extra_parallel_stream_load=true",
     "--train.enable_batch_invariant_mode=False",
 ]
 
@@ -582,7 +582,7 @@ def test_deepseek_v4_compiled_fsdp2_training_alignment(dummy_deepseek_v4_dense_p
                 f"--model.accelerator.torch_compile.enable={enabled}",
                 "--model.accelerator.torch_compile.fullgraph=True",
                 "--model.ops_implementation.rms_norm_implementation=eager",
-                "--model.ops_implementation.swiglu_mlp_implementation=eager",
+                "--model.ops_implementation.gated_mlp_implementation=eager",
                 "--model.ops_implementation.cross_entropy_loss_implementation=eager",
                 "--model.ops_implementation.rotary_pos_emb_implementation=eager",
                 "--model.ops_implementation.dsa_indexer_implementation=eager",

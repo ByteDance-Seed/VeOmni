@@ -289,52 +289,23 @@ def quack_gemm_gpt_oss_fused_moe_forward(
 ):
     """GPT-OSS quack MoE forward with native interleaved gate/up layout."""
     routing_weights = routing_weights.to(dtype=hidden_states.dtype)
-    # EP comm is outside the Function so all2all is not under no_grad.
+    # EP comm is outside the Function so all2all is not under no_grad. The shared
+    # helper owns that sequencing, so this row keeps only its per-rank math.
     if get_parallel_state().ep_enabled:
-        from .....distributed.moe import preprocess, token_pre_all2all, tokens_post_all2all
+        from .....distributed.moe import dispatch_to_ep_class
 
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=num_experts).permute(2, 1, 0)
-        input_splits, output_splits, num_global_tokens_per_local_expert, num_global_sum_tokens_per_local_expert = (
-            preprocess(
-                expert_mask=expert_mask,
-                num_experts=num_experts,
-                ep_group=get_parallel_state().ep_group,
-            )
-        )
-        permute_tokens, routing_map, local_input_permutation_mapping, org_hidden_states_shape = token_pre_all2all(
-            hidden_states=hidden_states,
-            expert_mask=expert_mask,
-            num_experts=num_experts,
-            input_splits=input_splits,
-            output_splits=output_splits,
-            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
-            ep_group=get_parallel_state().ep_group,
-        )
-
-        cumsum = torch.cumsum(num_global_sum_tokens_per_local_expert, dim=0).to(permute_tokens.device)
-        final_permute_tokens = EPGptOssQuackGroupGemm.apply(
-            permute_tokens,
-            cumsum,
+        return dispatch_to_ep_class(
+            EPGptOssQuackGroupGemm,
+            num_experts,
+            routing_weights,
+            selected_experts,
+            hidden_states,
             gate_up_proj,
             gate_up_proj_bias,
             down_proj,
             down_proj_bias,
             alpha,
             limit,
-        )
-
-        return tokens_post_all2all(
-            expert_outputs=final_permute_tokens,
-            routing_weights=routing_weights,
-            selected_experts=selected_experts,
-            num_experts=num_experts,
-            input_splits=input_splits,
-            output_splits=output_splits,
-            num_global_tokens_per_local_expert=num_global_tokens_per_local_expert,
-            routing_map=routing_map,
-            local_input_permutation_mapping=local_input_permutation_mapping,
-            org_hidden_states_shape=org_hidden_states_shape,
-            ep_group=get_parallel_state().ep_group,
         )
 
     return GptOssQuackFusedMoeExpertFunction.apply(

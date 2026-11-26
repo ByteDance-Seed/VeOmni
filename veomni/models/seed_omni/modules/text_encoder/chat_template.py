@@ -51,12 +51,19 @@ class TextEncoderChatTemplate:
         raise NotImplementedError
 
     @abstractmethod
-    def apply_generation_prompt(self, sample: list[ConversationItem]) -> list[ConversationItem]:
+    def apply_generation_prompt(
+        self,
+        sample: list[ConversationItem],
+        *,
+        generation_kwargs: dict[str, Any] | None = None,
+    ) -> list[ConversationItem]:
         """Append the assistant generation prefix to a templated prompt (inference).
 
         Used by a ChatML-style module ``generate``; each per-model template
         implements it (Janus, whose inference is not ChatML, builds its assistant
-        prefix inline in ``generate`` instead).
+        prefix inline in ``generate`` instead). ``generation_kwargs`` carries the
+        scenario (``infer_type``) so a template can shape the prefix per response
+        modality, as Bagel already does.
         """
         raise NotImplementedError
 
@@ -65,6 +72,7 @@ class TextEncoderChatTemplate:
         sample: list[ConversationItem],
         *,
         add_generation_prompt: bool = False,
+        generation_kwargs: dict[str, Any] | None = None,
     ) -> list[ConversationItem]:
         """Full text pipeline: apply chat template → tokenize → merge tokenized text.
 
@@ -72,10 +80,11 @@ class TextEncoderChatTemplate:
         prefix (:meth:`apply_generation_prompt`) between templating and tokenizing,
         so the request is left ready for the model to start decoding; training
         leaves it off (the assistant turn is already in the data).
+        ``generation_kwargs`` is forwarded to that call.
         """
         parts = self.apply_chat_template(sample)
         if add_generation_prompt:
-            parts = self.apply_generation_prompt(parts)
+            parts = self.apply_generation_prompt(parts, generation_kwargs=generation_kwargs)
         self.tokenize(parts)
         return self.merge_text_embeds(parts)
 

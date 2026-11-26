@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch.nn as nn
 import yaml
 
 from scripts.ci.accelerator.launch_plan import LaunchSpec
@@ -78,10 +79,11 @@ def _fake_args(*, modules_override: dict | None = None, accelerator: Accelerator
 def test_accelerator_config_has_seed_omni_fields_with_expected_defaults():
     acc = AcceleratorConfig()
     assert acc.init_device == "meta"
+    assert acc.skip_sp_gather_between_modules is False
     assert isinstance(acc.gradient_checkpointing, GradientCheckpointingConfig)
     assert isinstance(acc.torch_compile, TorchCompileConfig)
     assert not hasattr(acc, "broadcast_model_weights_from_rank0")
-    assert not hasattr(acc, "ep_sharded_stream_load")
+    assert not hasattr(acc, "extra_parallel_stream_load")
 
 
 def test_fsdp_scope_defaults_to_module_and_rejects_unknown_values():
@@ -100,10 +102,131 @@ def test_the_generic_runtime_refuses_eager_rather_than_falling_back_to_ddp():
         runtime._build_parallelized_model()
 
 
+def test_the_generic_runtime_forwards_extra_parallel_only_to_the_builder(monkeypatch):
+    """The no-wrap mode is a builder argument, not something the plan can imply.
+
+    Left unforwarded, an `extra_parallel_only` module would still be FSDP2-wrapped
+    -- and a mixed-dtype quantized layer cannot be, so it would fail to load.
+    """
+    from veomni.distributed import torch_parallelize
+
+    seen = {}
+
+    def fake_build(model, **kwargs):
+        seen.update(kwargs)
+        return model
+
+    monkeypatch.setattr(torch_parallelize, "build_parallelize_model", fake_build)
+    runtime = VeOmniModelRuntime.__new__(VeOmniModelRuntime)
+    runtime.model = nn.Module()
+    runtime.train_args = None
+    runtime.args = SimpleNamespace(
+        accelerator=AcceleratorConfig(
+            fsdp_config=FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True),
+        ),
+        basic_modules=[],
+        lora_config=None,
+        fqn_to_index_mapping=None,
+        broadcast_model_weights_from_rank0=False,
+        extra_parallel_stream_load=False,
+        model_path=None,
+        optimizer=SimpleNamespace(type="adamw", muon_expert_zero_comm=False),
+    )
+    monkeypatch.setattr(VeOmniModelRuntime, "skip_hf_weight_load", False, raising=False)
+
+    runtime._build_parallelized_model()
+
+    assert seen["extra_parallel_only"] is True
+
+
+@pytest.mark.parametrize(
+    "global_accelerator, module_override, expected_mode, expected_flag",
+    [
+        ({"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)}, {}, "eager", True),
+        ({"ep_size": 4}, {}, "eager", False),
+        (
+            {"ep_size": 4},
+            {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2", "extra_parallel_only": True}}},
+            "fsdp2",
+            True,
+        ),
+        ({}, {}, "eager", False),
+        (
+            {"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)},
+            {"accelerator": {"fsdp_config": {"fsdp_mode": "ddp"}}},
+            "ddp",
+            True,
+        ),
+        (
+            {"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)},
+            {"accelerator": {"fsdp_config": {"fsdp_mode": "eager"}}},
+            "eager",
+            True,
+        ),
+        (
+            {"fsdp_config": FSDPConfig(fsdp_mode="fsdp2", extra_parallel_only=True)},
+            {"accelerator": {"fsdp_config": {"fsdp_mode": "fsdp2"}}},
+            "fsdp2",
+            True,
+        ),
+    ],
+    ids=[
+        "global_no_wrap_stays_eager",
+        "global_ep_stays_eager_without_override",
+        "global_ep_explicit_fsdp2",
+        "plain_eager",
+        "explicit_ddp_ignores_extra_parallel_only",
+        "explicit_eager_ignores_extra_parallel_only",
+        "explicit_fsdp2",
+    ],
+)
+def test_inference_fsdp_mode_and_extra_parallel_only(
+    monkeypatch, global_accelerator, module_override, expected_mode, expected_flag
+):
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    global_args = OmniModuleRuntimeArguments(
+        model_path="/tmp/model", accelerator=AcceleratorConfig(**global_accelerator)
+    )
+    modules = build_omni_module_runtime_args(global_args, "/tmp/model", {"mod": module_override}, for_inference=True)
+    mod = modules["mod"]
+    assert mod.accelerator.fsdp_config.fsdp_mode == expected_mode
+    assert mod.accelerator.fsdp_config.extra_parallel_only is expected_flag
+
+
 def test_module_runtime_arguments_inherit_weight_load_knobs():
     args = OmniModuleRuntimeArguments(model_path="/tmp/model")
     assert args.broadcast_model_weights_from_rank0 is True
-    assert args.ep_sharded_stream_load is False
+    assert args.extra_parallel_stream_load is False
+
+
+@pytest.mark.parametrize(
+    "override, expected_ep_size",
+    [
+        ({}, 8),
+        ({"accelerator": {"ep_size": 4}}, 4),
+        ({"accelerator": {"ep_size": 1}}, 1),
+        (
+            {
+                "accelerator": {
+                    "extra_parallel_names": [],
+                    "extra_parallel_sizes": [],
+                    "extra_parallel_placement_innermost": [],
+                }
+            },
+            8,
+        ),
+    ],
+    ids=["inherited", "shrink_ep4", "disable_ep1", "lists_cleared_keeps_ep"],
+)
+def test_module_override_ep_size_replaces_or_disables_inherited_ep(monkeypatch, override, expected_ep_size):
+    """Per-module ``ep_size`` overrides or disables an inherited global ``ep_size``."""
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    global_args = OmniModuleRuntimeArguments(model_path="/tmp/model", accelerator=AcceleratorConfig(ep_size=8))
+    modules = build_omni_module_runtime_args(global_args, "/tmp/model", {"mod": override})
+    resolved = modules["mod"].accelerator
+    assert resolved.ep_size == expected_ep_size
+    extra_parallel_names, extra_parallel_sizes, _ = resolved.resolved_extra_parallel
+    assert dict(zip(extra_parallel_names, extra_parallel_sizes))["ep"] == expected_ep_size
 
 
 def test_validate_omni_accelerator_accepts_defaults():
@@ -125,31 +248,78 @@ def test_ddp_cpu_init_is_enforced_at_construction():
         AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="ddp"), init_device="cpu")
 
 
-def test_ep_sharded_stream_load_with_broadcast_is_enforced_at_construction():
-    with pytest.raises(AssertionError, match="ep_sharded_stream_load"):
-        OmniModuleRuntimeArguments(
-            model_path="/tmp/model",
-            ep_sharded_stream_load=True,
-            broadcast_model_weights_from_rank0=True,
-        )
+def test_validate_omni_accelerator_allows_torch_compile():
+    """``torch_compile`` is the switch; what compiles is decided by the config."""
+    _validate_omni_accelerator(AcceleratorConfig(torch_compile=TorchCompileConfig(enable=True)))
 
 
-def test_validate_omni_accelerator_bans_torch_compile():
-    acc = AcceleratorConfig(torch_compile=TorchCompileConfig(enable=True))
+@pytest.mark.parametrize(
+    ("compile_overrides", "accelerator_overrides"),
+    [
+        ({"backend": "cudagraphs"}, {}),
+        ({"mode": "reduce-overhead"}, {}),
+        # torch turns on Triton graph capture for this mode too, while
+        # ``max-autotune-no-cudagraphs`` deliberately does not.
+        ({"mode": "max-autotune"}, {}),
+        ({}, {"ulysses_size": 2}),
+        ({}, {"cp_size": 2}),
+        ({}, {"enable_async": True}),
+    ],
+)
+def test_validate_omni_accelerator_refuses_the_combinations_the_composed_path_cannot_run(
+    compile_overrides, accelerator_overrides
+):
+    """CUDA Graph replay needs a per-step mark the composed trainer does not make,
+    and Ulysses slices activations the graph edges reorder.
+
+    ``SimpleNamespace`` rather than an ``AcceleratorConfig``: the dataclass checks
+    the mesh in ``__post_init__``, which would reject a 2-way SP size at world
+    size 1 before the check under test runs.
+    """
+    acc = SimpleNamespace(
+        torch_compile=TorchCompileConfig(enable=True, **compile_overrides),
+        ulysses_size=accelerator_overrides.get("ulysses_size", 1),
+        cp_size=accelerator_overrides.get("cp_size", 1),
+        enable_async=accelerator_overrides.get("enable_async", False),
+    )
+
     with pytest.raises(ValueError, match="torch_compile"):
         _validate_omni_accelerator(acc)
 
 
-def test_omni_arguments_post_init_validates_the_top_level_default():
-    with pytest.raises(ValueError, match="torch_compile"):
-        OmniArguments(
-            model=OmniModelRuntimeArguments(
-                model_path="/tmp/fake_omni",
-                accelerator=AcceleratorConfig(torch_compile=TorchCompileConfig(enable=True)),
-            ),
-            data=OmniDataArguments(train_path=""),
-            infer=OmniInferArguments(),
-        )
+def test_validate_omni_accelerator_allows_max_autotune_without_cudagraphs():
+    """The no-cudagraphs spelling of max-autotune stays available."""
+    acc = SimpleNamespace(
+        torch_compile=TorchCompileConfig(enable=True, backend="inductor", mode="max-autotune-no-cudagraphs"),
+        ulysses_size=1,
+        cp_size=1,
+        enable_async=False,
+    )
+    _validate_omni_accelerator(acc)
+
+
+def test_validate_omni_accelerator_leaves_a_disabled_compile_alone():
+    """The SP / CUDA-graph checks only apply when compile is on."""
+    acc = SimpleNamespace(
+        torch_compile=TorchCompileConfig(enable=False),
+        ulysses_size=2,
+        cp_size=2,
+        enable_async=True,
+    )
+
+    _validate_omni_accelerator(acc)
+
+
+def test_omni_arguments_post_init_accepts_the_top_level_compile_switch():
+    """Enabling compile is a valid launcher setting; the per-module flag gates it."""
+    OmniArguments(
+        model=OmniModelRuntimeArguments(
+            model_path="/tmp/fake_omni",
+            accelerator=AcceleratorConfig(torch_compile=TorchCompileConfig(enable=True)),
+        ),
+        data=OmniDataArguments(train_path=""),
+        infer=OmniInferArguments(),
+    )
 
 
 def test_omni_arguments_post_init_refuses_the_moe_router_monitor():
@@ -245,14 +415,24 @@ def test_build_omni_model_runtime_args_for_inference_forces_eager_without_broadc
 def test_build_omni_model_runtime_args_validates_each_module_accelerator():
     """A per-module override that fails `_validate_omni_accelerator` must raise at resolve time.
 
-    The top-level `model.accelerator` default passes validation on its own (no
-    `torch_compile.enable`); only the module override sets it, so this only
-    fails because `build_omni_model_runtime_args` validates every resolved module's own
-    `accelerator`, not just the top-level default.
+    The top-level `model.accelerator` default passes validation on its own; only
+    the module override sets an unsupported combination (compile + CUDA Graph
+    replay), so this only fails because `build_omni_model_runtime_args` validates
+    every resolved module's own `accelerator`, not just the top-level default.
     """
-    args = _fake_args(modules_override={MODULE_B: {"accelerator": {"torch_compile": {"enable": True}}}})
+    args = _fake_args(
+        modules_override={MODULE_B: {"accelerator": {"torch_compile": {"enable": True, "backend": "cudagraphs"}}}}
+    )
     with pytest.raises(ValueError, match="torch_compile"):
         build_omni_model_runtime_args(args)
+
+
+def test_build_omni_model_runtime_args_allows_a_per_module_compile_switch():
+    """Turning compile on for one module is valid; `module_compile_config` decides
+    at build time whether that module's resolved wrap can actually run it."""
+    args = _fake_args(modules_override={MODULE_B: {"accelerator": {"torch_compile": {"enable": True}}}})
+    resolved = build_omni_model_runtime_args(args)
+    assert resolved.modules[MODULE_B].accelerator.torch_compile.enable is True
 
 
 def test_build_omni_model_runtime_args_rejects_an_eager_module_under_the_composed_wrap():
@@ -262,6 +442,52 @@ def test_build_omni_model_runtime_args_rejects_an_eager_module_under_the_compose
     args.model.accelerator.fsdp_config.fsdp_scope = "model"
     with pytest.raises(ValueError, match=rf"fsdp_mode='eager': \['{MODULE_B}'\]"):
         build_omni_model_runtime_args(args)
+
+
+def test_build_omni_model_runtime_args_rejects_a_module_compile_under_the_composed_wrap():
+    """``fsdp_scope='model'`` leaves no module able to compile.
+
+    The composed ``OmniModel`` owns the one wrap, so a module cannot wrap itself
+    inside it, and the parent cannot compile its children's blocks. Refusing at
+    resolve time keeps a per-module overlay from silently compiling nothing.
+    """
+    args = _fake_args(modules_override={MODULE_B: {"accelerator": {"torch_compile": {"enable": True}}}})
+    args.model.accelerator.fsdp_config.fsdp_scope = "model"
+    with pytest.raises(ValueError, match=rf"fsdp_scope='model'.*{MODULE_B}"):
+        build_omni_model_runtime_args(args)
+
+
+def test_build_omni_model_runtime_args_rejects_a_launcher_compile_under_the_composed_wrap():
+    """The launcher-level switch is refused under ``fsdp_scope='model'`` too."""
+    args = _fake_args()
+    args.model.accelerator.fsdp_config.fsdp_scope = "model"
+    args.model.accelerator.torch_compile.enable = True
+    with pytest.raises(ValueError, match=r"fsdp_scope='model'.*model\.accelerator"):
+        build_omni_model_runtime_args(args)
+
+
+def test_build_omni_model_runtime_args_rejects_extra_parallel_only_under_composed_wrap():
+    """``fsdp_scope='model'`` rejects both top-level and per-module ``extra_parallel_only=True``."""
+    # Root extra_parallel_only=True must be rejected even when every child overrides it to False,
+    # because child ParallelStates under fsdp_scope='model' are built from the top-level accelerator.
+    args = _fake_args(
+        modules_override={
+            MODULE_A: {"accelerator": {"fsdp_config": {"extra_parallel_only": False}}},
+            MODULE_B: {"accelerator": {"fsdp_config": {"extra_parallel_only": False}}},
+        }
+    )
+    args.model.accelerator.fsdp_config.fsdp_scope = "model"
+    args.model.accelerator.fsdp_config.extra_parallel_only = True
+    with pytest.raises(ValueError, match="top-level fsdp_config.extra_parallel_only"):
+        build_omni_model_runtime_args(args)
+
+    # Per-module extra_parallel_only=True under root fsdp_scope='model' is also rejected.
+    child_args = _fake_args(
+        modules_override={MODULE_B: {"accelerator": {"fsdp_config": {"extra_parallel_only": True}}}}
+    )
+    child_args.model.accelerator.fsdp_config.fsdp_scope = "model"
+    with pytest.raises(ValueError, match=rf"fsdp_config.extra_parallel_only: \['{MODULE_B}'\]"):
+        build_omni_model_runtime_args(child_args)
 
 
 def test_deep_update_merges_sp_and_cp_from_base_and_override(monkeypatch):
@@ -356,3 +582,40 @@ def test_build_omni_model_runtime_args_rejects_top_level_dp_size_mismatch(monkey
     )
     with pytest.raises(ValueError, match="Top-level `model.accelerator` resolved to dp_size=4"):
         build_omni_model_runtime_args(args_sp2)
+
+
+def test_skip_sp_gather_between_modules_is_global_and_propagates_to_modules(monkeypatch):
+    """``skip_sp_gather_between_modules`` is a run-wide switch propagated to every module.
+
+    It describes the whole graph -- every ``post_forward`` either gathers or hands
+    its SP shard on -- so a per-module YAML entry cannot desynchronise the two
+    sides of a handoff; the top-level value wins.
+    """
+    from veomni.distributed import parallel_state
+    from veomni.distributed.parallel_state import clear_parallel_state, init_parallel_state_from_config
+
+    class _DummyMesh:
+        def __getitem__(self, _key):
+            return self
+
+        def _flatten(self, **_kwargs):
+            return self
+
+    monkeypatch.setattr(parallel_state, "init_device_mesh", lambda *a, **kw: _DummyMesh())
+    args = _fake_args(
+        accelerator=AcceleratorConfig(skip_sp_gather_between_modules=True),
+        modules_override={
+            MODULE_A: {"accelerator": {"skip_sp_gather_between_modules": False}},
+        },
+    )
+    resolved = build_omni_model_runtime_args(args)
+    assert resolved.accelerator.skip_sp_gather_between_modules is True
+    for mod_args in resolved.modules.values():
+        assert mod_args.accelerator.skip_sp_gather_between_modules is True
+
+    clear_parallel_state()
+    try:
+        ps = init_parallel_state_from_config(resolved.accelerator, name="test_skip_sp_gather")
+        assert ps.skip_sp_gather_between_modules is True
+    finally:
+        clear_parallel_state()

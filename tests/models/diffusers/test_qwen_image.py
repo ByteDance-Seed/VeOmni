@@ -314,9 +314,11 @@ def test_qwen_image_from_pretrained_binds_config_ops_to_processor(tmp_path, monk
 
     # 4. Explicit ops_implementation / attn_implementation overrides bind to both config and processor.
     # Ensure VeomniOp can resolve veomni_flash_attention_2 even on CPU-only test runners.
+    # The intern key is ``(op, variant, impl, kwargs)``; the trailing empty tuple is a
+    # row with no arguments, which is what the model builds for attention.
     fa2_handle = SimpleNamespace(op="attention", variant="standard", impl="veomni_flash_attention_2")
     sdpa_handle = VeomniOp("attention", "standard", "veomni_sdpa")
-    monkeypatch.setitem(VeomniOp._intern, ("attention", "standard", "veomni_flash_attention_2"), fa2_handle)
+    monkeypatch.setitem(VeomniOp._intern, ("attention", "standard", "veomni_flash_attention_2", ()), fa2_handle)
 
     loaded_fa2 = QwenImageTransformer2DModel.from_pretrained(
         ckpt_dir,

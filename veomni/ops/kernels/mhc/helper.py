@@ -24,12 +24,28 @@ with the ``tile_kernels`` package, and the Triton rows to AMD ROCm.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 
 POST_MULTIPLIER = 2.0
 TRITON_FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 TRITON_HC_MULTS = (1, 2, 4, 8, 16)
+
+#: Query-axis tile the TileKernels mHC backward indexes without a length guard.
+#: ``_mhc_pre_norm_fn_bwd_mul`` walks the token axis in steps of this size, so a
+#: packed sequence whose per-sample query span is not a multiple of it reads and
+#: writes past the tensor -- which is what turned a dynamic-batch step's
+#: ``grad_norm`` into NaN on a 256k run. Callers pad to it and slice the result.
+#: The forward halves of ``mhc_pre_norm_fn`` tile at ``TOKEN_BLOCK`` instead.
+TOKEN_ALIGN = 128
+#: The tile the forward half of these kernels uses. It is *finer* than
+#: ``TOKEN_ALIGN``, not coarser: both ``mhc_pre_norm_fn``'s forward
+#: (``_mhc_pre_norm_fn_fwd_mul``) and the fused inference collapse
+#: (``mhc_pre_big_fuse``, which launches per token and calls that same forward)
+#: walk the token axis in blocks of this size without a length guard. Padding a
+#: forward-only call to 32 rather than 128 skips up to 96 wasted rows per sample.
+FUSED_TOKEN_ALIGN = 32
 
 
 def unweighted_rms(x: Tensor, eps: float) -> Tensor:

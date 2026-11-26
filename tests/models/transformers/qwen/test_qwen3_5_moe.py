@@ -57,18 +57,11 @@ VIDEO_TOKEN_ID = 121
 
 
 def _qwen3_5_moe_classes():
-    from veomni.utils.device import IS_NPU_AVAILABLE
+    from veomni.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeForCausalLM,
+        Qwen3_5MoeForConditionalGeneration,
+    )
 
-    if IS_NPU_AVAILABLE:
-        from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_npu import (
-            Qwen3_5MoeForCausalLM,
-            Qwen3_5MoeForConditionalGeneration,
-        )
-    else:
-        from veomni.models.transformers.qwen3_5_moe.generated.patched_modeling_qwen3_5_moe_gpu import (
-            Qwen3_5MoeForCausalLM,
-            Qwen3_5MoeForConditionalGeneration,
-        )
     return Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration
 
 
@@ -231,10 +224,17 @@ def test_qwen3_5_moe_eager_matches_hf_aux_loss():
 
 
 def test_qwen3_5_moe_npu_generated_attention_binds_ops_and_runs_eager_forward(monkeypatch):
-    from veomni.models.transformers.qwen3_5_moe.generated import patched_modeling_qwen3_5_moe_npu as npu_modeling
+    from veomni.models.transformers.qwen3_5_moe import modeling_qwen3_5_moe as npu_modeling
     from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu
 
-    monkeypatch.setattr(fla_npu, "precompute_varlen_metadata", lambda **kwargs: ([0, 6], None, None))
+    recorded: list[dict[str, object]] = []
+
+    def fake_precompute(**kwargs):
+        recorded.append(kwargs)
+        return ([0, 6], None, None)
+
+    monkeypatch.setattr(npu_modeling, "IS_NPU_AVAILABLE", True)
+    monkeypatch.setattr(fla_npu, "precompute_varlen_metadata", fake_precompute)
     torch.manual_seed(0)
     config = _tiny_text_config(layer_types=["full_attention", "full_attention"])
     config._set_ops_implementation(eager_ops_config())
@@ -246,10 +246,16 @@ def test_qwen3_5_moe_npu_generated_attention_binds_ops_and_runs_eager_forward(mo
     assert attn.k_norm.veomni_rms_norm.impl == "eager"
 
     input_ids = torch.randint(3, config.vocab_size, (1, 6))
+    cu_seq_lens_q = torch.tensor([0, 3, 6], dtype=torch.int32)
+    linear_cu_seq_lens_q = torch.tensor([0, 6], dtype=torch.int32)
     with torch.no_grad():
         out = model(
             input_ids=input_ids,
-            cu_seq_lens_q=torch.tensor([0, 6], dtype=torch.int32),
+            cu_seq_lens_q=cu_seq_lens_q,
+            linear_attn_cu_seq_lens_q=linear_cu_seq_lens_q,
             use_cache=False,
         )
     assert torch.isfinite(out.logits).all()
+    assert len(recorded) == 1
+    assert torch.equal(recorded[0]["cu_seqlens"], linear_cu_seq_lens_q)
+    assert recorded[0].get("device") is None

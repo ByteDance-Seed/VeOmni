@@ -30,8 +30,8 @@ pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def test_linear_registry_entries():
-    assert OP_REGISTRY.list_registered("linear", "standard") == ["eager", "qat", "torchao_nvfp4"]
-    assert OP_REGISTRY.list_registered("linear", "grouped") == ["eager", "qat"]
+    assert OP_REGISTRY.list_registered("linear", "standard") == ["eager", "qat", "torchao", "deepgemm"]
+    assert OP_REGISTRY.list_registered("linear", "grouped") == ["eager", "qat", "deepgemm"]
     assert OP_REGISTRY.default_impl("linear", "standard", device="cpu") == "eager"
     assert OP_REGISTRY.default_impl("linear", "grouped", device="cpu") == "eager"
 
@@ -126,7 +126,7 @@ def test_a_quantizing_row_refuses_a_wrapped_projection(quantizing_impl):
 
 @pytest.mark.parametrize("quantizing_impl", sorted(QUANTIZING_IMPLS))
 def test_a_quantizing_row_refuses_a_linear_subclass_projection(quantizing_impl):
-    """A converted ``nn.Linear`` subclass such as ``Float8Linear`` owns a weight but runs its own GEMM."""
+    """An ``nn.Linear`` subclass (e.g. ``FSDPLinear`` from ``basic_modules``) runs extra work in forward."""
     from torch import nn
 
     from veomni.ops.kernels.linear._module import resolve_projection
@@ -147,14 +147,6 @@ def test_a_quantizing_row_refuses_a_linear_subclass_projection(quantizing_impl):
     weight, shortcut = resolve_projection("eager", sub, x)
     assert weight is None
     assert shortcut is not None
-
-    if is_package_available("torchao"):
-        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-
-        fp8_parent = nn.Sequential(nn.Linear(16, 16, bias=False))
-        convert_to_float8_training(fp8_parent, config=Float8LinearConfig())
-        with pytest.raises(ValueError, match="nn.Linear subclass"):
-            resolve_projection(quantizing_impl, fp8_parent[0], torch.randn(2, 16))
 
 
 class _GroupedProjection(torch.nn.Linear):
@@ -220,7 +212,7 @@ def test_the_standard_eager_row_calls_the_projection_module():
     torch.testing.assert_close(out, F.linear(x, linear.weight, linear.bias))
 
 
-_requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reason="torchao_nvfp4 row needs torchao")
+_requires_torchao = pytest.mark.skipif(not is_package_available("torchao"), reason="torchao row needs torchao")
 
 
 def _nvfp4_reference(x: torch.Tensor) -> torch.Tensor:
@@ -238,23 +230,22 @@ def _nvfp4_reference(x: torch.Tensor) -> torch.Tensor:
     return quantized.dequantize(x.dtype).reshape_as(x)
 
 
-def test_linear_torchao_nvfp4_row_is_declared_with_torchao():
+def test_linear_torchao_row_is_declared_with_torchao():
     """The row needs no specific hardware, only the optional package."""
     entries = {(entry.impl, entry.requires) for entry in OP_REGISTRY.list_entries("linear", "standard")}
-    assert ("torchao_nvfp4", ("torchao",)) in entries
-    assert "torchao_nvfp4" in QUANTIZING_IMPLS
+    assert ("torchao", ("torchao",)) in entries
+    assert "torchao" in QUANTIZING_IMPLS
     # ``standard`` only: a model that also binds ``grouped`` cannot select it.
-    assert "torchao_nvfp4" not in OP_REGISTRY.list_registered("linear", "grouped")
+    assert "torchao" not in OP_REGISTRY.list_registered("linear", "grouped")
 
 
 @_requires_torchao
 def test_linear_torchao_nvfp4_forward_and_backward_round_trip():
     """The row equals F.linear over torchao's NVFP4 round trip, with straight-through gradients."""
-    from veomni.ops.kernels.linear.standard import torchao_nvfp4 as impl
-    from veomni.ops.qat.torchao_nvfp4 import nvfp4_fake_quant
+    from veomni.ops.torchao import NVFP4_BLOCK_SIZE, nvfp4_fake_quant
 
-    assert impl.NVFP4_BLOCK_SIZE == 16
-    op = VeomniOp("linear", "standard", "torchao_nvfp4")
+    assert NVFP4_BLOCK_SIZE == 16
+    op = VeomniOp("linear", "standard", "torchao")
     torch.manual_seed(0)
     # 48 is a whole number of 16-wide groups: NVFP4 needs nothing wider.
     linear = torch.nn.Linear(48, 32).to(torch.bfloat16)
@@ -277,9 +268,9 @@ def test_linear_torchao_nvfp4_forward_and_backward_round_trip():
 @_requires_torchao
 def test_linear_torchao_nvfp4_validates_its_operands():
     """16-wide groups only, BF16/FP32 only, and no partial group."""
-    from veomni.ops.qat.torchao_nvfp4 import nvfp4_fake_quant
+    from veomni.ops.torchao import nvfp4_fake_quant
 
-    op = VeomniOp("linear", "standard", "torchao_nvfp4")
+    op = VeomniOp("linear", "standard", "torchao")
     with pytest.raises(ValueError, match="divisible by block_size 16"):
         op(torch.nn.Linear(24, 16, bias=False).to(torch.bfloat16), torch.randn(2, 24, dtype=torch.bfloat16))
     with pytest.raises(ValueError, match="requires block_size=16"):
@@ -294,7 +285,7 @@ def test_linear_torchao_nvfp4_validates_its_operands():
 @_requires_torchao
 def test_linear_torchao_nvfp4_handles_empty_input():
     """A zero-token micro-batch keeps its shape and yields zero weight gradients."""
-    op = VeomniOp("linear", "standard", "torchao_nvfp4")
+    op = VeomniOp("linear", "standard", "torchao")
     linear = torch.nn.Linear(16, 8).to(torch.bfloat16)
     x = torch.randn(0, 16, dtype=torch.bfloat16, requires_grad=True)
 
@@ -302,3 +293,109 @@ def test_linear_torchao_nvfp4_handles_empty_input():
     assert out.shape == (0, 8)
     out.sum().backward()
     torch.testing.assert_close(linear.weight.grad, torch.zeros_like(linear.weight))
+
+
+def test_linear_torchao_fp8_validates_arguments_and_dispatches(monkeypatch):
+    """``torchao`` with ``dtype='fp8'`` validates recipe/block_size and forwards to ``torchao_fp8_linear``."""
+    from veomni.ops.kernels.linear.standard import torchao as linear_torchao
+
+    linear = torch.nn.Linear(32, 16)
+    x = torch.randn(2, 32)
+
+    with pytest.raises(ValueError, match="does not accept block_size"):
+        linear_torchao.wrapper(linear, x, dtype="fp8", block_size=16)
+    with pytest.raises(ValueError, match="float8 recipe"):
+        linear_torchao.wrapper(linear, x, dtype="fp8", recipe="invalid")
+    with pytest.raises(ValueError, match="recipe is only valid for dtype='fp8'"):
+        linear_torchao.wrapper(linear, x, dtype="nvfp4", recipe="rowwise")
+    with pytest.raises(NotImplementedError, match="native FP4"):
+        linear_torchao.wrapper(linear, x, dtype="nvfp4", emulated=False)
+
+    seen = []
+
+    def fake_fp8(inp, weight, bias=None, *, recipe, emulated):
+        seen.append((inp.shape, weight.shape, bias is not None, recipe, emulated))
+        return F.linear(inp, weight, bias)
+
+    monkeypatch.setattr(linear_torchao, "torchao_fp8_linear", fake_fp8)
+    out = linear_torchao.wrapper(linear, x, dtype="fp8", recipe="rowwise")
+    torch.testing.assert_close(out, linear(x))
+    assert seen == [((2, 32), (16, 32), True, "rowwise", False)]
+
+    out_emulated = linear_torchao.wrapper(linear, x, dtype="fp8", emulated=True)
+    torch.testing.assert_close(out_emulated, linear(x))
+    assert seen[-1] == ((2, 32), (16, 32), True, "tensorwise", True)
+
+
+@_requires_torchao
+def test_linear_torchao_mxfp4_forward_and_backward_round_trip():
+    """The ``torchao`` row with ``dtype='mxfp4'`` runs MXFP4 forward and STE backward on BF16 and FP32."""
+    from veomni.ops import OpsSelection
+
+    op = VeomniOp("linear", "standard", OpsSelection(name="torchao", kwargs={"dtype": "mxfp4"}))
+    torch.manual_seed(0)
+    for tensor_dtype in (torch.bfloat16, torch.float32):
+        # 64 is a whole number of 32-wide MXFP4 groups.
+        linear = torch.nn.Linear(64, 32).to(tensor_dtype)
+        x = torch.randn(2, 5, 64, dtype=tensor_dtype, requires_grad=True)
+
+        out = op(linear, x)
+        assert out.shape == (2, 5, 32)
+        assert out.dtype == tensor_dtype
+        assert torch.isfinite(out).all()
+        assert not torch.equal(out, linear(x))
+
+        out.sum().backward()
+        assert x.grad is not None and torch.isfinite(x.grad).all()
+        assert linear.weight.grad is not None and torch.isfinite(linear.weight.grad).all()
+        torch.testing.assert_close(linear.bias.grad, torch.full_like(linear.bias.grad, 10.0))
+
+
+def test_the_deepgemm_rows_declare_deep_gemm_on_sm90_or_sm100():
+    """Read the registered metadata rather than resolving the handle.
+
+    Whether resolution *fails* depends on the host this runs on, and this file also
+    runs on GPU CI workers where the row legitimately resolves.
+    """
+    for variant in ("standard", "grouped"):
+        entries = {entry.impl: entry for entry in OP_REGISTRY.list_entries("linear", variant)}
+        assert "deepgemm" in entries, variant
+        entry = entries["deepgemm"]
+        assert entry.requires == ("deep_gemm", "triton"), variant
+        # SM90 and SM100 named explicitly: SM89 has an E4M3 type but no DeepGEMM
+        # kernel, so it must not satisfy this requirement.
+        platforms = entry.requirement.platforms
+        assert {(p.min_cc, p.max_cc) for p in platforms} == {(90, 90), (100, 100)}, variant
+
+
+def test_the_deepgemm_row_refuses_a_linear_subclass_projection():
+    """``resolve_projection`` refuses a subclass for a quantizing row, unchanged by this row.
+
+    ``FSDPLinear`` from ``basic_modules`` unshards its weight inside ``forward``; a
+    row that reads ``module.weight`` would get one rank's shard. The check lives in
+    the shared resolver, so this asserts the new row inherits it rather than
+    reimplementing it.
+    """
+    from torch import nn
+
+    from veomni.ops.kernels.linear._module import resolve_projection
+
+    class _Subclass(nn.Linear):
+        pass
+
+    with pytest.raises(ValueError, match="nn.Linear subclass"):
+        resolve_projection("deepgemm", _Subclass(8, 4, bias=False), torch.randn(2, 8))
+
+
+@pytest.mark.parametrize("block_size", [32, 64])
+def test_the_deepgemm_rows_refuse_a_block_size_they_cannot_honor(block_size: int):
+    """``qat`` honors ``block_size``; ``deepgemm``'s recipe is fixed at 128.
+
+    Accepting and ignoring the keyword would make one field mean two different
+    recipes depending on which row the config selected.
+    """
+    from veomni.ops.kernels.linear import standard as linear_standard
+
+    linear = torch.nn.Linear(256, 256, bias=False, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="only block_size=128"):
+        linear_standard.deepgemm.wrapper(linear, torch.randn(2, 256, dtype=torch.bfloat16), block_size=block_size)

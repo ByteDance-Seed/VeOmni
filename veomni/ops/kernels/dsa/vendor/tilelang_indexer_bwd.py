@@ -146,6 +146,14 @@ def tl_indexer_bwd_impl(
                     if indices_shared[i] > -1 and indices_shared[i] < seq_len:
                         T.atomic_add(dIndexK[indices_shared[i], j], d_index_k_frag[i, j])
 
+                # Shared-memory WAR barrier: the next ``bi_i`` iteration overwrites
+                # ``indices_shared`` / ``grad`` (and then ``index_k_shared`` and
+                # ``_logits``), while a slower warp may still be reading
+                # ``indices_shared[i]`` here to pick its ``dIndexK`` row. Without it
+                # a fast warp's store can land first and the slow warp updates the
+                # wrong row -- ``dIndexK`` silently loses entries.
+                T.sync_threads()
+
             T.copy(d_index_q_frag[:heads, :], dIndexQ[bx, :, :])
             T.copy(d_weights_frag[:heads], dWeights[bx, :])
 

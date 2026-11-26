@@ -74,8 +74,14 @@ class Qwen3ChatTemplate(TextEncoderChatTemplate):
         out.extend(dummy_parts)
         return out
 
-    def apply_generation_prompt(self, sample: list[ConversationItem]) -> list[ConversationItem]:
+    def apply_generation_prompt(
+        self,
+        sample: list[ConversationItem],
+        *,
+        generation_kwargs: dict[str, Any] | None = None,
+    ) -> list[ConversationItem]:
         """Append the assistant generation prefix after a templated (turn-closed) prompt."""
+        del generation_kwargs
         out = list(sample)
         out.append(self._build_conversation_item("text", self.chat_markers.assistant_prefix, "assistant", loss_mask=0))
         return out

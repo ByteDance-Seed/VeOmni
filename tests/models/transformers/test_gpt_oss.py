@@ -37,7 +37,7 @@ from veomni.utils.import_utils import is_quack_gemm_available
 
 
 def _build_ours(config: GptOssConfig, ops: SimpleNamespace | None = None):
-    from veomni.models.transformers.gpt_oss.generated.patched_modeling_gpt_oss_gpu import (
+    from veomni.models.transformers.gpt_oss.modeling_gpt_oss import (
         GptOssForCausalLM,
     )
 
