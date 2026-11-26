@@ -13,7 +13,75 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 
-from veomni.distributed.moe import ep_load_balance
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.distributed.moe import comm, ep_load_balance
+
+
+_CPU_2_RANKS = LaunchSpec(nproc=2, device="cpu")
+_CPU_4_RANKS = LaunchSpec(nproc=4, device="cpu")
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    ("cann_flag", "version", "name", "expected"),
+    [
+        (True, "9.2.0", "Ascend910B3", True),
+        (False, "9.2.0", "Ascend910B3", False),
+        (None, "8.3.RC2", "Ascend910B3", False),
+        (None, "9.0.0", "Ascend910_9381", True),
+        (True, "9.2.0", "Ascend950DT", False),
+    ],
+)
+def test_npu_batch_capability_matches_torchnpu(monkeypatch, cann_flag, version, name, expected):
+    c10d = types.SimpleNamespace()
+    if cann_flag is not None:
+        c10d._CANN_VERSION = cann_flag
+    monkeypatch.setitem(
+        sys.modules, "torch_npu", types.SimpleNamespace(npu=types.SimpleNamespace(get_device_name=lambda device: name))
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu.distributed", types.SimpleNamespace(distributed_c10d=c10d))
+    monkeypatch.setitem(sys.modules, "torch_npu.utils", types.SimpleNamespace(get_cann_version=lambda module: version))
+    comm._npu_p2p_coalesces.cache_clear()
+    try:
+        assert comm._npu_p2p_coalesces("npu:0") is expected
+    finally:
+        comm._npu_p2p_coalesces.cache_clear()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize(
+    ("device_type", "coalesces", "repeated", "rounds"),
+    [
+        ("npu", False, True, [[0, 1, 3], [2, 4], [5]]),
+        ("npu", True, True, [[0, 1, 2, 3, 4, 5]]),
+        ("npu", False, False, [[0, 1]]),
+        ("cpu", False, True, [[0, 1, 2, 3, 4, 5]]),
+    ],
+)
+def test_ep_p2p_batches_preserve_directed_message_order(monkeypatch, device_type, coalesces, repeated, rounds):
+    out, incoming = dist.isend, dist.irecv
+    pairs = [(out, 1), (incoming, 1)]
+    if repeated:
+        pairs += [(out, 1), (out, 2), (incoming, 1), (out, 1)]
+    tensor = types.SimpleNamespace(device=types.SimpleNamespace(type=device_type))
+    operations = [
+        types.SimpleNamespace(op=op, peer=peer, tensor=tensor, index=index) for index, (op, peer) in enumerate(pairs)
+    ]
+    calls = []
+    works = []
+
+    def record_batch(batch):
+        calls.append(batch)
+        work = object()
+        works.append(work)
+        return [work]
+
+    monkeypatch.setattr(comm, "_npu_p2p_coalesces", lambda device: coalesces)
+    monkeypatch.setattr(dist, "batch_isend_irecv", record_batch)
+    assert comm.batch_ep_p2p(operations) == works
+    assert [[op.index for op in batch] for batch in calls] == rounds
+    if len(rounds) == 1:
+        assert calls[0] is operations
 
 
 def test_executor_symbols_are_publicly_exported():
@@ -125,9 +193,10 @@ def _two_rank_worker(rank: int, world_size: int, rendezvous: str) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CPU_2_RANKS)
 def test_two_rank_copy_alias_computation_and_replica_gradient_return(tmp_path: Path):
     rendezvous = f"file://{tmp_path / 'executor-two-rank'}"
-    mp.spawn(_two_rank_worker, args=(2, rendezvous), nprocs=2, join=True)
+    mp.spawn(_two_rank_worker, args=(_CPU_2_RANKS.nproc, rendezvous), nprocs=_CPU_2_RANKS.nproc, join=True)
 
 
 def _transposed_gradient_worker(rank: int, world_size: int, rendezvous: str) -> None:
@@ -152,9 +221,10 @@ def _transposed_gradient_worker(rank: int, world_size: int, rendezvous: str) -> 
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CPU_2_RANKS)
 def test_transposed_replica_gradients_use_contiguous_receive_buffers(tmp_path: Path):
     rendezvous = f"file://{tmp_path / 'executor-transposed-gradient'}"
-    mp.spawn(_transposed_gradient_worker, args=(2, rendezvous), nprocs=2, join=True)
+    mp.spawn(_transposed_gradient_worker, args=(_CPU_2_RANKS.nproc, rendezvous), nprocs=_CPU_2_RANKS.nproc, join=True)
 
 
 def _empty_plan_worker(rank: int, world_size: int, rendezvous: str) -> None:
@@ -202,9 +272,10 @@ def _empty_plan_worker(rank: int, world_size: int, rendezvous: str) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CPU_2_RANKS)
 def test_empty_plan_is_an_identity_without_p2p(tmp_path: Path):
     rendezvous = f"file://{tmp_path / 'executor-empty'}"
-    mp.spawn(_empty_plan_worker, args=(2, rendezvous), nprocs=2, join=True)
+    mp.spawn(_empty_plan_worker, args=(_CPU_2_RANKS.nproc, rendezvous), nprocs=_CPU_2_RANKS.nproc, join=True)
 
 
 def _multiple_copy_worker(rank: int, world_size: int, rendezvous: str) -> None:
@@ -227,9 +298,10 @@ def _multiple_copy_worker(rank: int, world_size: int, rendezvous: str) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CPU_4_RANKS)
 def test_multiple_copies_of_one_source_sum_all_replica_gradients(tmp_path: Path):
     rendezvous = f"file://{tmp_path / 'executor-multiple-copy'}"
-    mp.spawn(_multiple_copy_worker, args=(4, rendezvous), nprocs=4, join=True)
+    mp.spawn(_multiple_copy_worker, args=(_CPU_4_RANKS.nproc, rendezvous), nprocs=_CPU_4_RANKS.nproc, join=True)
 
 
 def _noncontiguous_group_worker(rank: int, world_size: int, rendezvous: str) -> None:
@@ -256,9 +328,10 @@ def _noncontiguous_group_worker(rank: int, world_size: int, rendezvous: str) -> 
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CPU_4_RANKS)
 def test_real_noncontiguous_process_groups_map_ep_ranks_to_global_peers(tmp_path: Path):
     rendezvous = f"file://{tmp_path / 'executor-noncontiguous'}"
-    mp.spawn(_noncontiguous_group_worker, args=(4, rendezvous), nprocs=4, join=True)
+    mp.spawn(_noncontiguous_group_worker, args=(_CPU_4_RANKS.nproc, rendezvous), nprocs=_CPU_4_RANKS.nproc, join=True)
 
 
 def _buffer_pool(max_cached=2):
@@ -449,8 +522,14 @@ def _pooled_gradient_parts_worker(rank, world_size, rendezvous):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CPU_2_RANKS)
 def test_pooled_two_rank_refresh_and_noncontiguous_gradient_parts(tmp_path):
-    mp.spawn(_pooled_gradient_parts_worker, args=(2, f"file://{tmp_path / 'pooled'}"), nprocs=2, join=True)
+    mp.spawn(
+        _pooled_gradient_parts_worker,
+        args=(_CPU_2_RANKS.nproc, f"file://{tmp_path / 'pooled'}"),
+        nprocs=_CPU_2_RANKS.nproc,
+        join=True,
+    )
 
 
 @pytest.mark.parametrize("failure_stage", ["record_stream", "event"])

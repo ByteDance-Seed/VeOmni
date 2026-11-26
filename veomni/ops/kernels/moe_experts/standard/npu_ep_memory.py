@@ -20,6 +20,8 @@ import torch
 import torch.distributed as dist
 import torch_npu
 
+from .....distributed.moe.comm import batch_ep_p2p
+
 
 def _owner_token_counts(host_counts, plan, rank):
     """Recover original owner demand without modifying physical execution counts."""
@@ -81,7 +83,7 @@ def _restore_owner_wgrad_inputs_direct(tokens, grad_output, plan, group, offsets
             continue
         global_peer = dist.get_global_rank(group, peer)
         operations.extend(dist.P2POp(transfer, row, global_peer, group=group) for row in rows)
-    pending = dist.batch_isend_irecv(operations) if operations else []
+    pending = batch_ep_p2p(operations) if operations else []
     for work in pending:
         work.wait()
     return (*owner_inputs, device_counts)
@@ -124,7 +126,7 @@ def restore_owner_wgrad_inputs(tokens, grad_output, plan, group, device_counts=N
             operations.append(
                 dist.P2POp(dist.irecv, rows, dist.get_global_rank(group, replica.target_rank), group=group)
             )
-    pending = dist.batch_isend_irecv(operations) if operations else []
+    pending = batch_ep_p2p(operations) if operations else []
     for work in pending:
         work.wait()
 
@@ -163,6 +165,7 @@ class _BalancedGroupGemm(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, tokens, local_weight, replica_weight, counts, host_counts, plan, group, transfer, memory, gemm):
+        """Run native grouped GEMM and retain the required expert inputs."""
         ctx.plan, ctx.group = plan, group
         # Legacy backward consumes the saved combined copy. Only Memory needs
         # the borrowed replica storage and its owner for the graph lifetime.
@@ -194,6 +197,7 @@ class _BalancedGroupGemm(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Restore ordered owner rows for the native weight gradient."""
         tokens, local_weight, replica_weight, counts, combined, _host_owner_counts, device_owner_counts = (
             ctx.saved_tensors
         )
@@ -238,6 +242,7 @@ class _BalancedGroupGemm(torch.autograd.Function):
 def balanced_group_gemm(
     tokens, local_weight, replica_weight, counts, host_counts, plan, group, transfer, memory, gemm
 ):
+    """Apply native balanced grouped GEMM to the local and replica rows."""
     return _BalancedGroupGemm.apply(
         tokens, local_weight, replica_weight, counts, host_counts, plan, group, transfer, memory, gemm
     )
@@ -248,11 +253,13 @@ class _EmptyGroupGemm(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, tokens, weight):
+        """Create an empty expert output with the weight output width."""
         ctx.layouts = [(tensor.shape, tensor.dtype, tensor.device) for tensor in (tokens, weight)]
         return tokens.new_empty((0, weight.shape[-1]))
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Return zero gradients for the inputs that require them."""
         return tuple(
             torch.zeros(shape, dtype=dtype, device=device) if needed else None
             for (shape, dtype, device), needed in zip(ctx.layouts, ctx.needs_input_grad, strict=True)

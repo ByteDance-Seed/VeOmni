@@ -77,11 +77,13 @@ def _weighted_combine_backward(
 
 
 def build_alias_maps(logical_order, logical_to_physical, direct, inverse, ranks):
+    """Build the maps for weighting physical replica rows in logical order."""
     count = logical_order.numel()
     _alias_maps[(triton.cdiv(count, 256),)](logical_order, logical_to_physical, direct, inverse, ranks, count, 256)
 
 
 def weighted_combine_forward(value, weights, ranks, direct, output):
+    """Combine weighted replica rows into the caller-provided output."""
     rows, hidden = output.shape
     _weighted_combine_forward[(rows * triton.cdiv(hidden, 256),)](
         value,
@@ -98,6 +100,7 @@ def weighted_combine_forward(value, weights, ranks, direct, output):
 
 
 def weighted_combine_backward(value, weights, gradient, inverse, dx, product):
+    """Write the requested value gradients and routing-weight products."""
     rows, hidden = value.shape
     _weighted_combine_backward[(rows * triton.cdiv(hidden, 256),)](
         value,

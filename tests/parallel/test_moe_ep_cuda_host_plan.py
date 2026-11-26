@@ -5,7 +5,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_dist_comm_backend, get_torch_device
+
+
+_ACCELERATOR_2_RANKS = LaunchSpec(nproc=2, device="accelerator")
 
 
 def _worker(rank, rendezvous):
@@ -50,5 +54,6 @@ def _worker(rank, rendezvous):
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE or get_torch_device().device_count() < 2, reason="Requires two CUDA devices")
+@pytest.mark.launch_plan(provider=_ACCELERATOR_2_RANKS)
 def test_cuda_host_planning_matches_reference(tmp_path):
-    mp.spawn(_worker, args=(f"file://{tmp_path / 'cuda_host_plan'}",), nprocs=2, join=True)
+    mp.spawn(_worker, args=(f"file://{tmp_path / 'cuda_host_plan'}",), nprocs=_ACCELERATOR_2_RANKS.nproc, join=True)

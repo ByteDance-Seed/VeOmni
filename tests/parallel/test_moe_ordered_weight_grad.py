@@ -5,6 +5,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.parallel.test_moe_ep_load_balance_planner import (
     _assert_global_invariants,
     _selected_rows,
@@ -14,6 +15,10 @@ from tests.parallel.test_moe_ep_load_balance_planner import (
 )
 from veomni.distributed.moe import ep_grad
 from veomni.utils.device import IS_CUDA_AVAILABLE, get_device_type, get_torch_device
+
+
+_CPU_2_RANKS = LaunchSpec(nproc=2, device="cpu")
+_CPU_4_RANKS = LaunchSpec(nproc=4, device="cpu")
 
 
 @pytest.mark.parametrize("total", [0, 1, 31, 32, 33, 127, 128, 129, 251, 8193])
@@ -102,8 +107,9 @@ def _metadata_worker(rank, rendezvous):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CPU_2_RANKS)
 def test_kernel_metadata_collectively_rejects_different_tiles_and_signatures(tmp_path):
-    mp.spawn(_metadata_worker, args=(f"file://{tmp_path / 'metadata'}",), nprocs=2, join=True)
+    mp.spawn(_metadata_worker, args=(f"file://{tmp_path / 'metadata'}",), nprocs=_CPU_2_RANKS.nproc, join=True)
 
 
 def _prefix_worker(rank, rendezvous):
@@ -172,8 +178,9 @@ def _prefix_worker(rank, rendezvous):
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CPU_4_RANKS)
 def test_ordered_fp32_prefix_chain_matches_original_with_cancellation_and_tails(tmp_path):
-    mp.spawn(_prefix_worker, args=(f"file://{tmp_path / 'prefix'}",), nprocs=4, join=True)
+    mp.spawn(_prefix_worker, args=(f"file://{tmp_path / 'prefix'}",), nprocs=_CPU_4_RANKS.nproc, join=True)
 
 
 @pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="CUDA metadata synchronization regression")

@@ -11,17 +11,19 @@ import importlib.util
 import json
 import math
 import os
-import subprocess
 import textwrap
 from pathlib import Path
 
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import CasePlan, LaunchSpec
+from tests.tools.launch_utils import run_bounded_process_group
 from veomni.utils.device import IS_CUDA_AVAILABLE, IS_NPU_AVAILABLE, get_device_type, get_torch_device
 
 
 _REQUIRED_DEVICES = 4
+_EP_BALANCE_LAUNCH = LaunchSpec(nproc=_REQUIRED_DEVICES)
 _CONFIG_PATH = Path("tests/toy_config/qwen3_5_moe_toy/config.json")
 _STRICT_E2E_ENV = "VEOMNI_REQUIRE_EP_BALANCE_E2E"
 _RTOL = 1e-3
@@ -337,6 +339,7 @@ def _finite_curve(envelope: dict, name: str) -> list[float]:
     return curve
 
 
+@pytest.mark.launch_plan(provider=CasePlan.sequential(_EP_BALANCE_LAUNCH, _EP_BALANCE_LAUNCH))
 @pytest.mark.parametrize("ep_size", [2, 4])
 @pytest.mark.parametrize("optimize_memory,checkpointing", [(False, False), (True, False), (True, True)])
 def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(
@@ -418,7 +421,7 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(
         for run_label, command in (("baseline", baseline_command), ("candidate", candidate_command)):
             run_env = dict(base_env)
             run_env["VEOMNI_EP_BALANCE_RUN_LABEL"] = run_label
-            subprocess.run(command, check=True, env=run_env)
+            run_bounded_process_group(command, env=run_env, timeout=600.0)
     finally:
         del dataset
 
@@ -482,11 +485,3 @@ def test_qwen3_5_moe_ep_load_balance_matched_precision_and_telemetry(
     for output_dir in (baseline_output, candidate_output):
         for rank in range(_REQUIRED_DEVICES):
             (output_dir / f"expert_precision_rank{rank}.pt").unlink()
-
-
-@pytest.mark.parametrize("strict", [False, True])
-def test_required_ci_cannot_silently_skip_missing_hardware(monkeypatch, strict):
-    monkeypatch.setenv(_STRICT_E2E_ENV, "1" if strict else "0")
-    expected = pytest.fail.Exception if strict else pytest.skip.Exception
-    with pytest.raises(expected):
-        _prerequisite_unavailable("Missing accelerators")

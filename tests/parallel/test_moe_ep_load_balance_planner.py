@@ -9,7 +9,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.moe import ep_load_balance
+
+
+_CPU_2_RANKS = LaunchSpec(nproc=2, device="cpu")
 
 
 attach_ep_load_balancers = ep_load_balance.attach_ep_load_balancers
@@ -329,9 +333,10 @@ def _gloo_plan_worker(rank: int, world_size: int, rendezvous: str) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CPU_2_RANKS)
 def test_public_builder_gathers_real_ep_histograms_and_rewrites_locally(tmp_path: Path):
     rendezvous = f"file://{tmp_path / 'ep-plan-rendezvous'}"
-    mp.spawn(_gloo_plan_worker, args=(2, rendezvous), nprocs=2, join=True)
+    mp.spawn(_gloo_plan_worker, args=(_CPU_2_RANKS.nproc, rendezvous), nprocs=_CPU_2_RANKS.nproc, join=True)
 
 
 class _OrdinaryExperts(nn.Module):

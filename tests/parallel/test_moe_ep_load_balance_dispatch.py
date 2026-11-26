@@ -9,11 +9,15 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn import functional as F
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.moe.ep_buffer import ReplicaBufferPool
 from veomni.distributed.moe.ep_load_balance import _Qwen3_5MoEEPLoadBalancer, cat_local_and_replica_weights
 from veomni.distributed.moe.moe_utils import _OrderedAliasGather, alias_permute
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 from veomni.ops.kernels.moe_experts.standard import npu, triton
+
+
+_CPU_2_RANKS = LaunchSpec(nproc=2, device="cpu")
 
 
 def test_ordered_alias_gather_preserves_duplicate_token_gradient_order():
@@ -107,5 +111,11 @@ def _worker(rank, rendezvous, backend_name, memory):
 
 @pytest.mark.parametrize("backend", ["npu", "triton"])
 @pytest.mark.parametrize("memory", [False, True])
+@pytest.mark.launch_plan(provider=_CPU_2_RANKS)
 def test_fused_row_dispatches_replicas_and_recovers_from_rank_local_validation(tmp_path, backend, memory):
-    mp.spawn(_worker, args=((tmp_path / "balanced-dispatch").as_uri(), backend, memory), nprocs=2, join=True)
+    mp.spawn(
+        _worker,
+        args=((tmp_path / "balanced-dispatch").as_uri(), backend, memory),
+        nprocs=_CPU_2_RANKS.nproc,
+        join=True,
+    )

@@ -424,6 +424,7 @@ class BalancedEPMergedFc1GroupGemm(torch.autograd.Function):
     def forward(
         ctx, tokens, cumsum, gate, down, replica_gate, replica_down, plan, group, limit, activation, transfers
     ):
+        """Execute local and replica expert rows with the merged EP kernel."""
         from .....distributed.moe.ep_load_balance import _validate_replica_weight
 
         ctx.replica_plan, ctx.replica_group = plan, group
@@ -461,6 +462,7 @@ class BalancedEPMergedFc1GroupGemm(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Compute input gradients and return weight gradients to their owners."""
         from .....distributed.moe.ep_grad import make_ordered_weight_grad
         from .....distributed.moe.ep_load_balance import _merge_replica_weight_gradients
 

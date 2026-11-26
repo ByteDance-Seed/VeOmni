@@ -21,10 +21,15 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from tests.tools import torchrun
 from veomni.distributed.moe import ep_load_balance
 from veomni.distributed.parallel_state import _init_parallel_state, clear_parallel_state, use_parallel_state
 from veomni.ops.kernels.moe_experts.standard import npu
 from veomni.utils.device import IS_NPU_AVAILABLE, get_torch_device
+
+
+_EP_LAUNCH = LaunchSpec(nproc=2)
 
 
 class _RecordingBalancer:
@@ -61,8 +66,11 @@ class _ExpertWeights(nn.Module):
 @pytest.fixture(scope="module")
 def real_npu_ep_group():
     world_size = dist.get_world_size() if dist.is_initialized() else int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size != 2:
-        pytest.skip("Run with torchrun --standalone --nproc-per-node=2 on an Ascend host.")
+    if world_size == 1:
+        yield None
+        return
+    if world_size != _EP_LAUNCH.nproc:
+        pytest.skip("The native EP cases require two Ascend ranks.")
     get_torch_device().set_device(int(os.environ.get("LOCAL_RANK", "0")))
     owns_group = not dist.is_initialized()
     if owns_group:
@@ -77,18 +85,28 @@ def real_npu_ep_group():
             clear_parallel_state()
 
 
+def _run_npu_ep_case(group, worker, *args):
+    if group is None:
+        torchrun(worker, _EP_LAUNCH.nproc, *args)
+    else:
+        worker(*args)
+
+
+@pytest.mark.launch_plan(provider=_EP_LAUNCH)
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Real singleton FSDP2 requires Ascend hardware")
 @pytest.mark.parametrize("reduce_dtype", [torch.float32, torch.bfloat16])
 def test_real_npu_singleton_fsdp_gradient_accumulation(real_npu_ep_group, reduce_dtype):
+    _run_npu_ep_case(real_npu_ep_group, _singleton_fsdp_gradient_worker, reduce_dtype)
+
+
+def _singleton_fsdp_gradient_worker(reduce_dtype):
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 
     from veomni.distributed.fsdp2.grad_scaling import configure_singleton_gradient_scaling
 
     device = torch.device("npu", int(os.environ.get("LOCAL_RANK", "0")))
-    mesh = init_device_mesh("npu", (dist.get_world_size(real_npu_ep_group), 1), mesh_dim_names=("ep", "efsdp"))[
-        "efsdp"
-    ]
+    mesh = init_device_mesh("npu", (dist.get_world_size(), 1), mesh_dim_names=("ep", "efsdp"))["efsdp"]
     policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=reduce_dtype)
     reference = nn.Sequential(*(nn.Linear(32, 32, device=device, dtype=torch.float32) for _ in range(2)))
     candidate = nn.Sequential(*(nn.Linear(32, 32, device=device, dtype=torch.float32) for _ in range(2)))
@@ -106,7 +124,7 @@ def test_real_npu_singleton_fsdp_gradient_accumulation(real_npu_ep_group, reduce
     fully_shard(reference, mesh=mesh, mp_policy=policy)
     fully_shard(candidate, mesh=mesh, mp_policy=policy)
 
-    generator = torch.Generator().manual_seed(17 + dist.get_rank(real_npu_ep_group))
+    generator = torch.Generator().manual_seed(17 + dist.get_rank())
     for _ in range(2):
         inputs = torch.randn(4, 32, generator=generator).to(device=device, dtype=torch.bfloat16)
         reference_inputs = inputs.clone().requires_grad_()
@@ -124,12 +142,17 @@ def test_real_npu_singleton_fsdp_gradient_accumulation(real_npu_ep_group, reduce
         torch.testing.assert_close(upstream, saved, rtol=0, atol=0)
 
 
+@pytest.mark.launch_plan(provider=_EP_LAUNCH)
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Real NPU fused MoE balance requires torch_npu and Ascend hardware")
 @pytest.mark.parametrize("optimize_memory", [False, True])
 @pytest.mark.parametrize("mixed_routing", [False, True])
 def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(
-    optimize_memory, mixed_routing, real_npu_ep_group, monkeypatch
+    optimize_memory, mixed_routing, real_npu_ep_group
 ):
+    _run_npu_ep_case(real_npu_ep_group, _alias_forward_backward_worker, optimize_memory, mixed_routing)
+
+
+def _alias_forward_backward_worker(optimize_memory, mixed_routing):
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
     parallel = _init_parallel_state(
@@ -167,8 +190,7 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(
         replica_batches.append([op.group for op in operations])
         return native_batch(operations)
 
-    monkeypatch.setattr(dist, "batch_isend_irecv", record_batch)
-    with use_parallel_state(parallel):
+    with patch.object(dist, "batch_isend_irecv", record_batch), use_parallel_state(parallel):
         reference = npu.npu_fused_moe_forward(
             2,
             reference_routing,
@@ -231,8 +253,14 @@ def test_real_npu_two_rank_alias_forward_backward_and_owner_gradient(
         assert tuple(dict(weights.named_parameters())) == parameter_names_before
 
 
+@pytest.mark.launch_plan(provider=_EP_LAUNCH)
 @pytest.mark.skipif(not IS_NPU_AVAILABLE, reason="Real split owner return requires Ascend hardware")
 def test_real_npu_direct_owner_return_matches_packed_prefixes(real_npu_ep_group):
+    _run_npu_ep_case(real_npu_ep_group, _direct_owner_return_worker)
+
+
+def _direct_owner_return_worker():
+    real_npu_ep_group = dist.group.WORLD
     from veomni.ops.kernels.moe_experts.standard.npu_ep_memory import (
         _owner_token_counts,
         restore_owner_wgrad_inputs,

@@ -37,6 +37,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.utils import moe_monitor
 from veomni.utils.device import get_device_type, get_torch_device
 from veomni.utils.moe_monitor import (
@@ -50,6 +51,9 @@ from veomni.utils.moe_monitor import (
     register_router_extractor,
     set_active_monitor,
 )
+
+
+_CPU_2_RANKS = LaunchSpec(nproc=2, device="cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -685,9 +689,10 @@ def _two_rank_ep_monitor_worker(rank: int, world_size: int, rendezvous: str) -> 
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CPU_2_RANKS)
 def test_ep_balance_real_world2_gloo_dp_reduction_and_reset(tmp_path):
     rendezvous = f"file://{tmp_path / 'moe-monitor-world2'}"
-    mp.spawn(_two_rank_ep_monitor_worker, args=(2, rendezvous), nprocs=2, join=True)
+    mp.spawn(_two_rank_ep_monitor_worker, args=(_CPU_2_RANKS.nproc, rendezvous), nprocs=_CPU_2_RANKS.nproc, join=True)
 
 
 def _asymmetric_ep_monitor_worker(rank: int, world_size: int, rendezvous: str) -> None:
@@ -715,12 +720,13 @@ def _asymmetric_ep_monitor_worker(rank: int, world_size: int, rendezvous: str) -
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CPU_2_RANKS)
 def test_ep_balance_real_world2_asymmetric_record_uses_matching_collectives(tmp_path):
     rendezvous = f"file://{tmp_path / 'moe-monitor-asymmetric-world2'}"
     process_context = mp.spawn(
         _asymmetric_ep_monitor_worker,
-        args=(2, rendezvous),
-        nprocs=2,
+        args=(_CPU_2_RANKS.nproc, rendezvous),
+        nprocs=_CPU_2_RANKS.nproc,
         join=False,
     )
     deadline = time.monotonic() + 30
@@ -830,12 +836,13 @@ def _coordinated_host_transfer_failure_worker(rank: int, world_size: int, rendez
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CPU_2_RANKS)
 def test_real_world2_formatter_host_transfer_failure_is_coordinated_and_retryable(tmp_path):
     rendezvous = f"file://{tmp_path / 'moe-monitor-host-failure-world2'}"
     process_context = mp.spawn(
         _coordinated_host_transfer_failure_worker,
-        args=(2, rendezvous),
-        nprocs=2,
+        args=(_CPU_2_RANKS.nproc, rendezvous),
+        nprocs=_CPU_2_RANKS.nproc,
         join=False,
     )
     deadline = time.monotonic() + 30

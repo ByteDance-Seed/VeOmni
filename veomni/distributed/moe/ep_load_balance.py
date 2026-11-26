@@ -20,6 +20,7 @@ import torch.distributed as dist
 from torch import nn
 
 from ..parallel_state import get_parallel_state
+from .comm import batch_ep_p2p
 from .ep_buffer import ReplicaBufferLease, ReplicaBufferPool
 
 
@@ -176,7 +177,7 @@ class ExpertReplicaTransfer:
                 work_handles.append(transfer(tensor, global_peer, group=ep_group))
 
         if operations:
-            work_handles = dist.batch_isend_irecv(operations)
+            work_handles = batch_ep_p2p(operations)
 
         return cls(replica_weight, tuple(work_handles), tuple(communication_tensors), lease=lease)
 

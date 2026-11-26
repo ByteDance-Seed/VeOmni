@@ -13,8 +13,49 @@
 # limitations under the License.
 
 
+from functools import lru_cache
+
 import torch
 import torch.distributed as dist
+
+
+@lru_cache(maxsize=None)
+def _npu_p2p_coalesces(device):
+    from torch_npu import npu
+    from torch_npu.distributed import distributed_c10d
+    from torch_npu.utils import get_cann_version
+
+    # Match TorchNPU's CANN gate. The base wheel compares version strings.
+    cann_supported = getattr(distributed_c10d, "_CANN_VERSION", None)
+    if cann_supported is None:
+        cann_supported = (get_cann_version("CANN") or "") >= "9.0.0"
+    if not cann_supported:
+        return False
+
+    name = npu.get_device_name(device)
+    return "Ascend910B1" <= name <= "Ascend910B4_1" or "Ascend910_9362" <= name <= "Ascend910_9392"
+
+
+def batch_ep_p2p(operations):
+    """Submit EP P2P operations in the backend's supported batch layout."""
+    device = operations[0].tensor.device
+    if len(operations) == 1 or device.type != "npu" or _npu_p2p_coalesces(device):
+        return dist.batch_isend_irecv(operations)
+
+    # Native HCCL accepts one message per directed rank pair in a batch.
+    # Both endpoints assign the nth message on a pair to the same round.
+    batches = []
+    next_round = {}
+    for operation in operations:
+        key = (operation.op, operation.peer)
+        round_index = next_round.get(key, 0)
+        if round_index == len(batches):
+            batches.append([])
+        batches[round_index].append(operation)
+        next_round[key] = round_index + 1
+    if len(batches) == 1:
+        return dist.batch_isend_irecv(operations)
+    return [work for batch in batches for work in dist.batch_isend_irecv(batch)]
 
 
 class _AllToAll(torch.autograd.Function):

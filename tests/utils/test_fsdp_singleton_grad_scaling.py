@@ -3,7 +3,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.fsdp2.grad_scaling import configure_singleton_gradient_scaling
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class HookModule:

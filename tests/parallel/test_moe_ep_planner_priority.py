@@ -5,7 +5,11 @@ import itertools
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from tests.parallel.test_moe_ep_load_balance_planner import ep_load_balance as ep
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _reference_plan_replicas(
