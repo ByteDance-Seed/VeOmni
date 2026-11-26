@@ -72,28 +72,20 @@ def test_legacy_cpu_shards_keep_stride_and_negative_axis(requires_grad, nonconti
 
 
 @pytest.mark.parametrize("grad_enabled", [False, True])
-def test_matching_cpu_mesh_matches_native_dtensor_grad_state(grad_enabled):
-    class FakeMesh:
-        device_type = "cpu"
-        ndim = 1
-        mesh = torch.zeros(2, dtype=torch.int64)
-        mesh_dim_names = ("d0",)
-
-        def size(self, dim=None):
-            return 2
-
-        def get_coordinate(self):
-            return [0]
-
-    local = torch.arange(24, dtype=torch.float32).reshape(3, 8)[:, ::2].detach().requires_grad_(True)
-    mesh = FakeMesh()
-    with torch.set_grad_enabled(grad_enabled):
-        reference = DTensor.from_local(local, device_mesh=mesh, placements=[Shard(0)], run_check=False)
-        actual = _from_local_preserve_device(local, mesh, [Shard(0)])
-    assert actual.requires_grad == reference.requires_grad
-    assert actual._local_tensor.requires_grad == reference._local_tensor.requires_grad
-    assert actual._local_tensor.data_ptr() == local.data_ptr()
-    assert actual.stride() == reference.stride()
+def test_matching_cpu_mesh_matches_native_dtensor_grad_state(grad_enabled, tmp_path):
+    dist.init_process_group("gloo", init_method=(tmp_path / "mesh-init").as_uri(), rank=0, world_size=1)
+    try:
+        local = torch.arange(24, dtype=torch.float32).reshape(3, 8)[:, ::2].detach().requires_grad_(True)
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("test",))
+        with torch.set_grad_enabled(grad_enabled):
+            reference = DTensor.from_local(local, device_mesh=mesh, placements=[Shard(0)], run_check=False)
+            actual = _from_local_preserve_device(local, mesh, [Shard(0)])
+        assert actual.requires_grad == reference.requires_grad
+        assert actual._local_tensor.requires_grad == reference._local_tensor.requires_grad
+        assert actual._local_tensor.data_ptr() == local.data_ptr()
+        assert actual.stride() == reference.stride()
+    finally:
+        dist.destroy_process_group()
 
 
 def _roundtrip(rank, root, ep_shard_dim, fsdp_shard_dim, rows=5):
