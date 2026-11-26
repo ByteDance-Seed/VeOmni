@@ -779,7 +779,7 @@ class _PostMix(torch.autograd.Function):
         dpost_partial = torch.empty((num_d, rows, k), dtype=torch.float32, device=device)
         dcomb_partial = torch.empty((num_d, rows, k, k), dtype=torch.float32, device=device)
         # The residual and gradient tiles are live together here; at K=16 an
-        # 8-row tile measured faster than 16 rows (MI300X).
+        # 8-row tile measured faster than 16 rows on gfx942.
         block_m = _STREAM_BLOCK_M if k <= 8 else _STREAM_BLOCK_M // 2
         with get_torch_device().device(device):
             _post_mix_bwd_kernel[(triton.cdiv(rows, block_m), num_d)](
