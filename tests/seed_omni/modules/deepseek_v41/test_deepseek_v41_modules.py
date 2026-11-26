@@ -454,3 +454,209 @@ class TestNgramPackingAndCP:
         assert len(out["ngram_embeds"]) == 1
         assert out["ngram_embeds"][0].shape == (1, 1, ENGRAM_HEADS * (MAX_NGRAM - 1), ENGRAM_HEAD_DIM)
         assert torch.count_nonzero(out["ngram_embeds"][0]) == 0
+
+
+class TestReviewRegressions:
+    def test_vision_freeze_aligner_independent_and_forward_pre_kwargs_and_dummy_filter(self):
+        cfg = tiny_vision_config()
+        cfg.freeze = False
+        cfg.freeze_aligner = True
+        cfg.enable_vision = True
+        vis = DeepseekV41VisionEncoderAccelerated(cfg)
+        vis.freeze_model()
+        assert all(p.requires_grad for p in vis.vision.parameters())
+        assert not any(p.requires_grad for p in vis.aligner.parameters())
+        assert (
+            not vis.image_start.requires_grad
+            and not vis.image_end.requires_grad
+            and not vis.image_newline.requires_grad
+        )
+
+        from veomni.models.seed_omni.modules.deepseek_v41.vision.processing import _OMNI_TOKEN_TYPES, _OMNI_VIT_GRID
+
+        grid = [2, 2]
+        patches = torch.zeros(4, 3, cfg.patch_size, cfg.patch_size)
+        types = image_token_types(1, 1)
+        real_item = ConversationItem(
+            type="image",
+            value=patches,
+            role="user",
+            is_dummy=False,
+            meta={_OMNI_VIT_GRID: grid, _OMNI_TOKEN_TYPES: types},
+        )
+        dummy_item = ConversationItem(
+            type="image",
+            value=patches,
+            role="user",
+            is_dummy=True,
+            meta={_OMNI_VIT_GRID: grid, _OMNI_TOKEN_TYPES: types},
+        )
+        # Accepts extra multisource keys (ds_idx/source_name) and skips dummy items when real images exist.
+        out = vis.forward_pre(
+            conversation_list=[[real_item], [dummy_item]],
+            ds_idx=torch.tensor([0, 1]),
+            source_name="mix",
+        )
+        assert out["grids"] == [grid]
+        assert len(vis._visual_output_slots) == 1 and vis._visual_output_slots[0].item is real_item
+
+    def test_reentrant_gradient_checkpointing_rejected_on_llm_and_mtp(self):
+        llm = DeepseekV41LlmAccelerated(tiny_llm_config())
+        with pytest.raises(ValueError, match="reentrant"):
+            llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+        llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+        mtp_schedule = shrink_layer_schedule(N_LAYERS, n_draft=1)
+        mtp_schedule.pop("kept_layer_ids", None)
+        mtp_cfg = DeepseekV41MtpConfig(
+            **(
+                tiny_llm_config(
+                    dspark_block_size=2,
+                    dspark_markov_rank=16,
+                    dspark_n_routed_experts=4,
+                    dspark_num_experts_per_tok=2,
+                    **mtp_schedule,
+                ).to_dict()
+            )
+        )
+        mtp = DeepseekV41MtpAccelerated(mtp_cfg)
+        with pytest.raises(ValueError, match="reentrant"):
+            mtp.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+        mtp.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+    def test_indexer_ops_selection_candidate_mask_zero_width_and_ratio_validation(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import (
+            DeepseekV41Attention,
+            DeepseekV41Indexer,
+            SharedAttentionState,
+            build_compression_plans,
+        )
+
+        # Mapping-form OpsSelection normalizes to its string name.
+        cfg = tiny_llm_config(
+            ops_implementation={
+                "mhc_implementation": "eager",
+                "moe_implementation": "eager",
+                "rms_norm_implementation": "eager",
+                "gated_mlp_implementation": "eager",
+                "linear_implementation": "eager",
+                "kv_round_implementation": "eager",
+                "dsa_indexer_implementation": {"name": "tilelang"},
+            }
+        )
+        idx = DeepseekV41Indexer(cfg, layer_idx=1)
+        assert idx.dsa_indexer_implementation == "tilelang"
+
+        # Rejected non-candidate slots become -1 / -inf when fewer than topk candidates survive.
+        cfg_cand = tiny_llm_config(
+            num_hidden_layers=3,
+            compress_ratios=[2, 1, 1],
+            kv_source_layer_ids=[0, 1],
+            index_source_layer_ids=[0, 1, 2],
+            candidate_source_layer_id=1,
+            engram_layer_ids=[0],
+            dspark_target_layer_ids=[0, 1, 2],
+            index_topk=4,
+            candidate_block_size=1,
+            candidate_topk_blocks=1,
+        )
+        idx_cand = DeepseekV41Indexer(cfg_cand, layer_idx=2)
+        assert idx_cand.uses_candidates is True
+        seq_len = 8
+        pos = torch.arange(seq_len).unsqueeze(0)
+        plan = build_compression_plans(cfg_cand, pos, [(0, seq_len)])[cfg_cand.compress_ratios[2]]
+        shared = SharedAttentionState(candidates=torch.zeros(1, seq_len, plan.compressed_len, dtype=torch.bool))
+        shared.candidates[:, :, 0] = True
+        hidden = torch.randn(1, seq_len, cfg_cand.hidden_size)
+        q_res = torch.randn(1, seq_len, cfg_cand.q_lora_rank)
+        index_k = torch.randn(1, plan.compressed_len, cfg_cand.index_head_dim)
+        cos = torch.ones(1, seq_len, cfg_cand.qk_rope_head_dim)
+        sin = torch.zeros(1, seq_len, cfg_cand.qk_rope_head_dim)
+        topk_idxs, student = idx_cand(hidden, q_res, index_k, plan, shared, cos, sin, return_scores=True)
+        # Only slot 0 is a valid candidate; all other slots in topk must be -1 / -inf.
+        assert ((topk_idxs == -1) | (topk_idxs == 0)).all()
+        assert torch.isneginf(student[topk_idxs == -1]).all()
+
+        # _indexer_loss handles width == 0 without negative-zero slicing.
+        attn = DeepseekV41Attention(cfg_cand, layer_idx=0)
+        q = torch.randn(1, 2, cfg_cand.num_attention_heads, cfg_cand.head_dim)
+        kv = torch.randn(1, 2, cfg_cand.head_dim)
+        lse = torch.zeros(1, 2, cfg_cand.num_attention_heads)
+        terms = attn._indexer_loss(q, kv, torch.zeros(1, 2, 2, dtype=torch.int32), lse, torch.empty(1, 2, 0))
+        assert terms.kl.item() == 0.0 and terms.uniform.item() == 0.0
+
+        # Mismatched compress_ratio between consumer and KV source fails fast.
+        with pytest.raises(ValueError, match="compress_ratio"):
+            tiny_llm_config(
+                num_hidden_layers=3,
+                compress_ratios=[2, 4, 4],
+                kv_source_layer_ids=[0],
+                index_source_layer_ids=[0],
+                candidate_source_layer_id=0,
+                engram_layer_ids=[0],
+                dspark_target_layer_ids=[0, 1, 2],
+            )
+
+    def test_ngram_prime_overflow_empty_dequant_fused_lookup_and_converter_guards(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.ngram.modeling import (
+            _DEFAULT_ALL_TO_ALL_APPLY,
+            AllToAllEmbedding,
+            NgramTableDequant,
+            NgramTablePadding,
+            dequantize_rows,
+        )
+
+        # Bound method equality keeps fused lookup active when not monkeypatched.
+        assert not (AllToAllEmbedding.apply != _DEFAULT_ALL_TO_ALL_APPLY)
+
+        # Empty FP8 rows dequantize to empty BF16 without dividing by zero.
+        empty_rows = torch.empty((0, 128), dtype=torch.float8_e4m3fn)
+        empty_scales = torch.empty((0, 1), dtype=torch.float32)
+        out = dequantize_rows(empty_rows, empty_scales)
+        assert out.shape == (0, 128) and out.dtype == torch.bfloat16
+
+        # Prime bucket sum exceeding logical num_embeddings fails fast even if floor & padded rows pass.
+        small_cfg = DeepseekV41NgramConfig(
+            layer_ids=[0],
+            num_embeddings=[384],
+            make_table_rows_divisible_by=1024,
+            max_ngram_size=MAX_NGRAM,
+            n_heads=ENGRAM_HEADS,
+            head_dim=ENGRAM_HEAD_DIM,
+            vocab_size=VOCAB,
+            hash_vocab_size=HASH_VOCAB,
+            compressed_vocab_size=VOCAB,
+            pad_token_id=PAD,
+        )
+        assert small_cfg.padded_num_embeddings == [1024]
+        with pytest.raises(ValueError, match="prime buckets"):
+            DeepseekV41Ngram(small_cfg)
+
+        # Truncated checkpoint (< logical_rows) is rejected.
+        pad_conv = NgramTablePadding(padded_num_embeddings=[64], num_embeddings=[40])
+        with pytest.raises(ValueError, match="outside the expected"):
+            pad_conv.convert("tables.0.weight", torch.zeros(32, 16, dtype=torch.bfloat16))
+
+        # Unpaired FP8 table weights are flagged by can_handle_tensor; BF16 weights are not.
+        deq_conv = NgramTableDequant(padded_num_embeddings=[64], num_embeddings=[40])
+        assert deq_conv.can_handle_tensor("tables.0.weight", torch.zeros(40, 128, dtype=torch.float8_e4m3fn))
+        assert not deq_conv.can_handle_tensor("tables.0.weight", torch.zeros(40, 128, dtype=torch.bfloat16))
+
+    def test_build_configs_enables_emit_draft_hiddens_when_mtp_present(self):
+        from veomni.models.seed_omni.modules.deepseek_v41.convert_model import _build_configs
+
+        mtp_schedule = shrink_layer_schedule(N_LAYERS, n_draft=1)
+        mtp_schedule.pop("kept_layer_ids", None)
+        hf_cfg = {
+            "text_config": tiny_llm_config(dspark_block_size=2, **mtp_schedule).to_dict()
+            | {
+                "engram_num_embeddings": [256],
+                "engram_vocab_size": 32,
+                "engram_compressed_vocab_size": 32,
+                "engram_pad_token_id": 0,
+            },
+            "vision_config": tiny_vision_config().to_dict(),
+        }
+        hf_cfg["text_config"].pop("emit_draft_hiddens", None)
+        _, _, _, llm_cfg, _ = _build_configs(hf_cfg)
+        assert llm_cfg.emit_draft_hiddens is True

@@ -595,6 +595,12 @@ def _build_configs(hf_config: dict[str, Any]):
     # this on the in-memory config so the modules allocate bf16 and the load
     # converter spends the scales.
     llm_fields["weight_quantization"] = dict(quant) if quant else None
+    # Default training graphs wire ``deepseek_v41_mtp`` downstream of the LLM, so
+    # enable draft hidden emission whenever the checkpoint declares draft stages.
+    llm_fields.setdefault(
+        "emit_draft_hiddens",
+        bool(llm_fields.get("num_nextn_predict_layers", 3) and llm_fields.get("dspark_block_size", 5)),
+    )
     llm_config = LlmConfig(**llm_fields)
     mtp_config = MtpConfig(**llm_fields)
     return vision_config, text_encoder_config, ngram_config, llm_config, mtp_config

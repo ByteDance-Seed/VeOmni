@@ -886,6 +886,7 @@ class SharedAttentionState:
     """What a source layer publishes for the layers that follow it."""
 
     compress_kv: torch.Tensor | None = None
+    compress_ratio: int | None = None
     index_k: torch.Tensor | None = None
     topk_idxs: torch.Tensor | None = None
     candidates: torch.Tensor | None = None
@@ -1008,8 +1009,10 @@ def build_compression_plans(
         compressed_offsets = torch.cumsum(group_counts, dim=0) - group_counts
         total_groups = int(sum((end - begin) // ratio for begin, end in sequence_slices))
         if total_groups > 0:
-            group_slice_begins = torch.repeat_interleave(slice_begins, group_counts)
-            group_compressed_offsets = torch.repeat_interleave(compressed_offsets, group_counts)
+            group_slice_begins = torch.repeat_interleave(slice_begins, group_counts, output_size=total_groups)
+            group_compressed_offsets = torch.repeat_interleave(
+                compressed_offsets, group_counts, output_size=total_groups
+            )
             group_idx_in_slice = torch.arange(total_groups, device=device, dtype=torch.long) - group_compressed_offsets
             window_starts = group_slice_begins + group_idx_in_slice * ratio
         else:
@@ -1018,8 +1021,10 @@ def build_compression_plans(
         window_indices = window_starts[:, None] + offsets[None, :]
 
         if seq_len > 0:
-            range_starts = torch.repeat_interleave(compressed_offsets.to(torch.int32), slice_lengths)
-            max_groups = torch.repeat_interleave(group_counts.to(torch.int32), slice_lengths)
+            range_starts = torch.repeat_interleave(
+                compressed_offsets.to(torch.int32), slice_lengths, output_size=seq_len
+            )
+            max_groups = torch.repeat_interleave(group_counts.to(torch.int32), slice_lengths, output_size=seq_len)
             visible = torch.minimum(((positions + 1) // ratio).to(torch.int32), max_groups)
             range_ends = range_starts + visible
         else:
@@ -1407,7 +1412,8 @@ class DeepseekV41Indexer(nn.Module):
             _resolve_kv_round_impl(config),
             site=f"layers.{layer_idx}.indexer",
         )
-        self.dsa_indexer_implementation = resolve_module_op_impl(config, "dsa_indexer_implementation")
+        indexer_impl = resolve_module_op_impl(config, "dsa_indexer_implementation")
+        self.dsa_indexer_implementation = indexer_impl.name if isinstance(indexer_impl, OpsSelection) else indexer_impl
 
     def build_keys(
         self,
@@ -1500,15 +1506,18 @@ class DeepseekV41Indexer(nn.Module):
                             inplace=not return_scores,
                         )
 
-                    selected = ranked.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+                    topk_res = ranked.topk(topk, dim=-1, sorted=False)
+                    selected, order = topk_res.indices.sort(dim=-1)
                     reachable = (selected >= plan.range_starts.view(1, -1, 1)) & (
                         selected < plan.range_ends.view(1, -1, 1)
                     )
+                    if self.uses_candidates:
+                        reachable = reachable & torch.isfinite(topk_res.values.gather(-1, order))
                     topk_idxs = selected.to(torch.int32).masked_fill(~reachable, -1)
                     student_scores = (
                         scores.gather(-1, selected).masked_fill(~reachable, -torch.inf) if return_scores else None
                     )
-                    del scores, ranked
+                    del scores, ranked, topk_res, order
                 else:
                     topk_idxs = torch.empty((batch, seq_len, topk), dtype=torch.int32, device=device)
                     student_scores = (
@@ -1547,14 +1556,17 @@ class DeepseekV41Indexer(nn.Module):
                                 self.candidate_block_size,
                                 inplace=not return_scores,
                             )
-                        sel_chunk = ranked_chunk.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+                        topk_chunk = ranked_chunk.topk(topk, dim=-1, sorted=False)
+                        sel_chunk, order_chunk = topk_chunk.indices.sort(dim=-1)
                         reach_chunk = (sel_chunk >= rs_chunk.view(1, -1, 1)) & (sel_chunk < re_chunk.view(1, -1, 1))
+                        if self.uses_candidates:
+                            reach_chunk = reach_chunk & torch.isfinite(topk_chunk.values.gather(-1, order_chunk))
                         topk_idxs[:, begin:end] = sel_chunk.to(torch.int32).masked_fill(~reach_chunk, -1)
                         if student_scores is not None:
                             student_scores[:, begin:end] = scores_chunk.gather(-1, sel_chunk).masked_fill(
                                 ~reach_chunk, -torch.inf
                             )
-                        del scores_chunk, ranked_chunk, sel_chunk, reach_chunk
+                        del scores_chunk, ranked_chunk, topk_chunk, sel_chunk, order_chunk, reach_chunk
                     if self.is_candidate_source:
                         shared.candidates = candidates_buf
             if not return_scores:
@@ -1592,10 +1604,13 @@ class DeepseekV41Indexer(nn.Module):
                     )
                 ranked = scores.masked_fill(~shared.candidates, -torch.inf)
 
-            selected = ranked.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+            topk_res = ranked.topk(topk, dim=-1, sorted=False)
+            selected, order = topk_res.indices.sort(dim=-1)
             reachable = visible.unsqueeze(0).expand(batch, -1, -1).gather(-1, selected)
+            if self.uses_candidates:
+                reachable = reachable & torch.isfinite(topk_res.values.gather(-1, order))
             topk_idxs = selected.to(torch.int32).masked_fill(~reachable, -1)
-            del scores, ranked
+            del scores, ranked, topk_res, order
         if not return_scores:
             return topk_idxs, None
         student_chunks = []
@@ -1771,6 +1786,9 @@ class DeepseekV41Attention(nn.Module):
         valid_rows: torch.Tensor | None = None,
     ) -> IndexerLossTerms:
         width = student.shape[-1]
+        if width == 0:
+            zero = query.new_zeros((), dtype=torch.float32)
+            return IndexerLossTerms(kl=zero, uniform=zero.clone())
         if width > topk_idxs.shape[-1]:
             raise RuntimeError(
                 f"the indexer scored {width} slots but the attention selected {topk_idxs.shape[-1]} in total; "
@@ -1830,11 +1848,17 @@ class DeepseekV41Attention(nn.Module):
                 op_fp4=self.veomni_kv_round_fp4,
                 op_fp8=self.veomni_kv_round_compress_fp8,
             )
+            shared.compress_ratio = self.compress_ratio
 
         if shared.compress_kv is None:
             raise RuntimeError(
                 f"Layer {self.layer_idx} attends over compressed KV but no source layer has published any; "
                 "kv_source_layer_ids must contain a layer at or before it"
+            )
+        if shared.compress_ratio is not None and shared.compress_ratio != self.compress_ratio:
+            raise RuntimeError(
+                f"Layer {self.layer_idx} expects compress_ratio={self.compress_ratio} but the active KV source "
+                f"published compress_ratio={shared.compress_ratio}."
             )
 
         student: torch.Tensor | None = None
@@ -2182,6 +2206,17 @@ class DeepseekV41Llm(PretrainedOmniModule):
         self.config = config
         self.model = DeepseekV41Backbone(config)
         self.post_init()
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None, **kwargs) -> None:
+        checkpoint_kwargs = dict(gradient_checkpointing_kwargs or {})
+        if checkpoint_kwargs.get("use_reentrant"):
+            raise ValueError(
+                "deepseek_v41_llm does not support reentrant gradient checkpointing because layers return "
+                "IndexerLossTerms and publish shared compressed KV state across layers. "
+                "Set model.accelerator.gradient_checkpointing.enable_reentrant=False."
+            )
+        checkpoint_kwargs["use_reentrant"] = False
+        super().gradient_checkpointing_enable(gradient_checkpointing_kwargs=checkpoint_kwargs, **kwargs)
 
     def _init_weights(self, module: nn.Module) -> None:
         if getattr(module, "is_quantized", False):

@@ -243,7 +243,9 @@ def _quantized_all_to_all_lookup(
     weight_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dispatch ``ids`` once over ``group`` and return both ``(rows, scales)`` on ``ids.device``."""
-    if AllToAllEmbedding.apply is not _DEFAULT_ALL_TO_ALL_APPLY:
+    # Bound classmethods return a fresh wrapper on every access, so use ``!=``
+    # (which compares ``__func__`` and ``__self__``) rather than ``is not``.
+    if AllToAllEmbedding.apply != _DEFAULT_ALL_TO_ALL_APPLY:
         rows = AllToAllEmbedding.apply(group, ids, weight.view(torch.int8)).view(torch.float8_e4m3fn)
         scales = AllToAllEmbedding.apply(group, ids, weight_scale.view(torch.int8)).view(SCALE_DTYPE)
         return rows, scales
@@ -328,6 +330,8 @@ def _quantized_all_to_all_lookup(
 def dequantize_rows(rows: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     """Gathered fp8 rows plus their block scales -> bf16, for any leading shape."""
     columns = rows.shape[-1]
+    if rows.numel() == 0:
+        return torch.empty(rows.shape, dtype=torch.bfloat16, device=rows.device)
     dequantized = dequant_fp8_blockwise(rows.reshape(-1, columns), scales.reshape(-1, scales.shape[-1]))
     return dequantized.view(*rows.shape[:-1], columns)
 
@@ -438,13 +442,13 @@ class NgramTablePadding:
                 f"{name} is table {index}, but this config declares only {len(self.padded_num_embeddings)} tables."
             )
 
+        logical_rows = self.num_embeddings[index]
         padded_rows = self.padded_num_embeddings[index]
         rows = tensor.shape[0]
-        if rows > padded_rows:
+        if rows < logical_rows or rows > padded_rows:
             raise ValueError(
-                f"{name} has {rows} rows, more than the {padded_rows} the module allocated. The config's "
-                "`num_embeddings` describes a different table than this checkpoint holds, and every lookup "
-                "would read a row belonging to another bucket."
+                f"{name} has {rows} rows, outside the expected [{logical_rows}, {padded_rows}] range "
+                "for this config's `num_embeddings` / `padded_num_embeddings`."
             )
         if rows < padded_rows:
             padding = tensor.new_zeros((padded_rows - rows, *tensor.shape[1:]))
@@ -479,6 +483,9 @@ class NgramTableDequant(NgramTablePadding):
         if rows.shape[0] == 0:
             return torch.empty(rows.shape, dtype=torch.bfloat16)
         return dequantize_rows(rows, companion_rows)
+
+    def can_handle_tensor(self, name: str, tensor: torch.Tensor) -> bool:
+        return self.can_handle(name) and name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
 
     def is_dim0_zero_pad(self, name: str) -> bool:
         return self.can_handle(name) and name.endswith(".weight")
@@ -551,6 +558,17 @@ class DeepseekV41Ngram(PretrainedOmniModule):
         config.validate_bucket_layout()
         self.config = config
 
+        primes = build_bucket_primes(
+            len(config.layer_ids), config.max_ngram_size, config.n_heads, config.hash_vocab_size
+        )
+        for index, (layer_primes, logical_rows) in enumerate(zip(primes, config.num_embeddings, strict=True)):
+            required_rows = sum(p for per_ngram in layer_primes for p in per_ngram)
+            if required_rows > logical_rows:
+                raise ValueError(
+                    f"n-gram table {index} needs {required_rows} rows for its prime buckets, "
+                    f"which exceeds logical num_embeddings[{index}]={logical_rows}."
+                )
+
         quant_dtype = quantized_storage_dtype(config)
         self.tables = nn.ModuleList(
             [
@@ -559,9 +577,6 @@ class DeepseekV41Ngram(PretrainedOmniModule):
             ]
         )
 
-        primes = build_bucket_primes(
-            len(config.layer_ids), config.max_ngram_size, config.n_heads, config.hash_vocab_size
-        )
         self.register_buffer("primes", torch.tensor(primes), persistent=False)
         self.register_buffer("offsets", build_bucket_offsets(primes), persistent=False)
         self.register_buffer(

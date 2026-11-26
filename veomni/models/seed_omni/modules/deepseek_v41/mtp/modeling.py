@@ -345,6 +345,17 @@ class DeepseekV41Mtp(PretrainedOmniModule):
             nn.init.normal_(module.gate_up_proj, mean=0.0, std=std)
             nn.init.normal_(module.down_proj, mean=0.0, std=std)
 
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None, **kwargs) -> None:
+        checkpoint_kwargs = dict(gradient_checkpointing_kwargs or {})
+        if checkpoint_kwargs.get("use_reentrant"):
+            raise ValueError(
+                "deepseek_v41_mtp does not support reentrant gradient checkpointing because draft stages "
+                "capture side outputs (factored Markov head weights) inside forward. "
+                "Set model.accelerator.gradient_checkpointing.enable_reentrant=False."
+            )
+        checkpoint_kwargs["use_reentrant"] = False
+        super().gradient_checkpointing_enable(gradient_checkpointing_kwargs=checkpoint_kwargs, **kwargs)
+
     def freeze_model(self) -> None:
         if self.config.freeze:
             self.model.mtp.requires_grad_(False)

@@ -640,11 +640,7 @@ def _export_split_llm_weights(
             yield s_key, scale
             continue
 
-        full = (
-            _unpermute_ep_fsdp_dim0(tensor.full_tensor(), tensor.device_mesh, tensor.placements)
-            if isinstance(tensor, DTensor)
-            else tensor
-        )
+        full = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
         if should_quantize is not None and not should_quantize(key):
             continue
         is_bf16_weight = key.endswith(("weight", ".gate_up_proj", ".down_proj")) or full.ndim == 3

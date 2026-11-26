@@ -61,12 +61,18 @@ class TrainingMixin(TrainingModuleMixin):
     def forward_pre(
         self,
         conversation_list: Optional[list[list[ConversationItem]]] = None,
+        **_kwargs: Any,
     ) -> Dict[str, Any]:
         self._conversation_carrier = conversation_list
         if not getattr(self.config, "enable_vision", True):
             self._visual_output_slots = []
             return {"pixel_values": None}
-        items = list(iter_desired_items(conversation_list, types=["image"], roles=["user"]))
+        image_items = list(iter_desired_items(conversation_list, types=["image"], roles=["user"]))
+        real_items = [item for item in image_items if not item.is_dummy]
+        # Mirror ``modality_groups``: run real images when any exist; fall back to
+        # the dummy placeholder(s) only on an all-dummy micro-batch so SP scatter
+        # and gather partition the exact same item list.
+        items = real_items if real_items else image_items
         if not items:
             self._visual_output_slots = []
             return {"pixel_values": None}

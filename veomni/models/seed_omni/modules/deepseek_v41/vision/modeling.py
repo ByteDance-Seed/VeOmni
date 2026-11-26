@@ -423,13 +423,13 @@ class DeepseekV41VisionEncoder(PretrainedOmniModule):
         vision_disabled = not getattr(self.config, "enable_vision", True)
         if self.config.freeze or vision_disabled:
             self.vision.requires_grad_(False)
-            if getattr(self.config, "freeze_aligner", False) or vision_disabled:
-                self.aligner.requires_grad_(False)
-                self.image_start.requires_grad_(False)
-                self.image_end.requires_grad_(False)
-                self.image_newline.requires_grad_(False)
-            else:
-                self.aligner.requires_grad_(True)
+        if getattr(self.config, "freeze_aligner", False) or vision_disabled:
+            self.aligner.requires_grad_(False)
+            self.image_start.requires_grad_(False)
+            self.image_end.requires_grad_(False)
+            self.image_newline.requires_grad_(False)
+        elif self.config.freeze:
+            self.aligner.requires_grad_(True)
 
     def _assemble_span(
         self,

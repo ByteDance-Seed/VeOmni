@@ -337,6 +337,31 @@ class DeepseekV41LlmConfig(OmniModuleConfig):
         for layer_idx in self.index_source_layer_ids:
             if not 0 <= layer_idx < self.num_hidden_layers:
                 raise ValueError(f"index_source_layer_ids contains out-of-range layer {layer_idx}.")
+            if self.compress_ratios[layer_idx] == 0:
+                raise ValueError(
+                    f"layer {layer_idx} is an index source but its compress_ratio is 0 (sliding window only), "
+                    "so it has no compressed groups to index."
+                )
+        kv_sources = set(self.kv_source_layer_ids)
+        index_sources = set(self.index_source_layer_ids)
+        active_kv_source: int | None = None
+        active_index_source: int | None = None
+        for layer_idx in range(self.num_hidden_layers):
+            ratio = self.compress_ratios[layer_idx]
+            if layer_idx in kv_sources:
+                active_kv_source = layer_idx
+            if ratio > 0 and active_kv_source is not None and self.compress_ratios[active_kv_source] != ratio:
+                raise ValueError(
+                    f"layer {layer_idx} has compress_ratio={ratio}, which does not match its active KV source "
+                    f"layer {active_kv_source} (compress_ratio={self.compress_ratios[active_kv_source]})."
+                )
+            if layer_idx in index_sources:
+                active_index_source = layer_idx
+            elif ratio > 0 and active_index_source is not None and self.compress_ratios[active_index_source] != ratio:
+                raise ValueError(
+                    f"layer {layer_idx} has compress_ratio={ratio}, which does not match its active index source "
+                    f"layer {active_index_source} (compress_ratio={self.compress_ratios[active_index_source]})."
+                )
         for layer_idx in self.engram_layer_ids:
             if not 0 <= layer_idx < self.num_hidden_layers:
                 raise ValueError(f"engram_layer_ids contains out-of-range layer {layer_idx}.")
