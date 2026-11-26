@@ -1,0 +1,65 @@
+model:
+  model_path: pretrained_models/MiniMax-H3-Image-t2i/transformer
+  config_path: pretrained_models/MiniMax-H3-Image-t2i/transformer/config.json
+  condition_model_path: pretrained_models/MiniMax-H3-Image-t2i/transformer/condition.json
+  condition_model_cfg:
+    base_model_path: pretrained_models/MiniMax-H3-Image
+    height: 1024
+    width: 1024
+  ops_implementation:
+    attn_implementation: eager
+    rotary_pos_emb_implementation: eager
+    rms_norm_implementation: eager
+    gated_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    moe_implementation: eager
+    load_balancing_loss_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 1.0e-5
+    lr_decay_style: constant
+    weight_decay: 0.01
+  accelerator:
+    init_device: meta
+    ulysses_size: 1
+    gradient_checkpointing:
+      enable: true
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: float32
+        reduce_dtype: float32
+        cast_forward_inputs: false
+
+data:
+  train_path: dataset/minimax_h3_image/metadata.csv
+  data_type: diffusion
+  text_keys: prompt
+  source_name: minimax_h3_image
+  data_transform: minimax_h3_image_t2i
+  datasets_type: iterable
+  dataset_repeat: true
+  log_sample: false
+  dataloader:
+    type: native
+    num_workers: 0
+    drop_last: true
+  mm_configs:
+    data_dir: dataset/minimax_h3_image
+
+train:
+  training_task: online_training
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+  seed: 42
+  num_train_epochs: 1
+  max_steps: 1
+  checkpoint:
+    output_dir: output/minimax_h3_image_t2i_online_sft
+    save_steps: 0
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
