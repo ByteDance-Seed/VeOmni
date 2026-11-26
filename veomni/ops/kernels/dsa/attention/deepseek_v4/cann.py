@@ -80,14 +80,16 @@ def _selection_for_local_table(topk_indices: Tensor, compressed_len: int) -> Ten
     the kernel widths. The vendor wrapper pads anything at most 512 wide up to 512,
     so the short-table case (every row selected, ``-1`` after them) reaches the
     kernel in the shape it was built for, and a 512/1024-wide selection is served
-    even over a wider table. At the shipped ``index_topk: 512`` with
-    ``max_seq_len: 4096`` and ``cp_size: 2`` each rank's prefix holds 512 compressed
-    rows, so the selection spans its table and equals the kernel width at once; a
-    rank only sees a table wider than its selection for longer sequences. The
-    ``cp_size=2`` training comparison in
-    ``docs/design/deepseek_v4_context_parallel.md`` runs the shipped shape, and the
-    513-row parity case in ``tests/ops/dsa/test_dsa_deepseek_v4_cann.py`` covers a
-    table wider than the selection.
+    even over a wider table, which is what the shipped ``index_topk: 512`` always
+    produces. The narrowed prefix grows with the rank, ``(cp_rank + 1) * L / rate``,
+    so rank 0 spans its table exactly when ``L == rate * index_topk`` and later ranks
+    exceed it: in the ``cp_size=2`` comparison in
+    ``docs/design/deepseek_v4_context_parallel.md`` (``max_seq_len: 4096``, rate 4)
+    the two ranks narrow to 512 and 1024 rows, exercising the spanning and the
+    wide-table case in the same step, and at the shipped ``max_seq_len: 8192`` both
+    ranks are wide-table (1024 and 2048 rows). The 513-row parity case in
+    ``tests/ops/dsa/test_dsa_deepseek_v4_cann.py`` covers the width over a table
+    wider than the selection on its own.
 
     A selection below 512 that does not span its table is not served: on CANN 9.2.1
     such a call (16 indices over a 75-row table) kept the eager direction in the

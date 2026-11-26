@@ -142,11 +142,15 @@ buffer itself:
   so it runs the eager row with a zero-row compressed table. The compressed
   selection must either span the table it indexes or be 512/1024 wide. Those are
   the kernel's own widths — the vendor wrapper pads anything at most 512 wide up
-  to 512 — so a 512/1024-wide selection is served even over a wider table. At the
-  shipped `index_topk: 512` with `max_seq_len: 4096` and `cp_size: 2`, each rank's
-  prefix holds 512 compressed rows, so the selection spans its table and matches
-  the kernel width at once; a rank only sees a table wider than its selection for
-  longer sequences. A selection below 512 that does not span its table returned
+  to 512 — so a 512/1024-wide selection is served even over a wider table, and the
+  shipped `index_topk: 512` always produces one of those widths. The prefix grows
+  with the rank, `(cp_rank + 1) * L / rate`, so rank 0 spans its table exactly when
+  `L == rate * index_topk` and every later rank exceeds it. In the validation run
+  (`max_seq_len: 4096`, `cp_size: 2`, rate 4) that is a 512-row table on rank 0 and
+  1024 rows on rank 1, so the two ranks exercise the spanning and the wide-table
+  case in the same step; at the shipped `max_seq_len: 8192` the tables are 1024 and
+  2048 rows, both wider than the selection, and only the kernel width keeps them
+  served. A selection below 512 that does not span its table returned
   nonfinite rows on CANN 9.2.1, so the adapter refuses it; the shipped model only
   makes that call for an `index_topk` other than 512/1024 over a wider table (see
   [`docs/usage/arguments.md`](../usage/arguments.md)).
@@ -232,10 +236,13 @@ indexer against eager selection, causally and on both packed CP shards. The same
 file compares the real CANN attention kernel with eager — forward and every input
 gradient — on 512-wide selections, one of the two widths the kernel is built for,
 over a 75-row table and a 513-row table: the width is exercised both wider and
-narrower than the table. At the shipped `max_seq_len: 4096` and `cp_size: 2` each
-rank holds 2048 query rows over a 512-row compressed table, so the shipped CP
-selection spans its table and equals the 512 width; that shape is covered by the
-loss comparisons above rather than by a tensor parity case.
+narrower than the table. In the validation run (`max_seq_len: 4096`,
+`cp_size: 2`) the two ranks hold 2048 query rows each, but their narrowed
+compressed tables are 512 and 1024 rows: rank 0's 512-wide selection spans its
+table while rank 1's does not. The loss comparisons above run that pair, and also
+the shipped `max_seq_len: 8192`, where both ranks are wide-table (1024 and 2048
+rows); the tensor parity case on a 513-row table covers the wide-table branch on
+its own.
 
 ## Decisions that took more than one attempt
 
