@@ -566,8 +566,15 @@ class GroupedLinear(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight, layout, recompute_weight=True):
-        """Return BF16 output and save independently quantized token-axis inputs."""
+    def forward(ctx, x, weight, layout, recompute_weight=True, free_input=False):
+        """Return BF16 output and save independently quantized token-axis inputs.
+
+        When ``free_input=True``, ``x`` must be a private, single-consumer
+        temporary whose storage is no longer needed by the caller or any
+        upstream autograd node; its underlying storage is released once the
+        FP8 operands are materialized (unless BF16 ``x`` itself is retained for
+        wgrad).
+        """
         with torch.cuda.device(x.device):
             import deep_gemm
 
@@ -585,27 +592,32 @@ class GroupedLinear(torch.autograd.Function):
             ctx.weight_dtype = weight.dtype
             ctx.input_shape = x.shape
             ctx.input_dtype = x.dtype
-            output = x.new_empty((layout.rows.numel(), weight.shape[1]))
-            if output.shape[0]:
+            n_padded = layout.rows.numel()
+            rq = quantize_rows(x, layout) if n_padded else None
+            # Wgrad needs token-axis quantization, not a transpose of the forward
+            # row quantization. Produce it from BF16 now so autograd need not
+            # retain that larger source activation until backward.
+            # Sparse expert groups can expand substantially when padded. Keep
+            # BF16 instead when it is smaller than the FP8 payload plus scales.
+            column_bytes = n_padded * (x.shape[1] + 4 * (x.shape[1] // 128))
+            ctx.quantized_input = column_bytes < x.numel() * x.element_size()
+            qx, sx = None, None
+            if ctx.needs_input_grad[1]:
+                qx, sx = quantize_columns(x, layout) if ctx.quantized_input else (x, None)
+            if free_input and (ctx.quantized_input or not ctx.needs_input_grad[1]):
+                x.untyped_storage().resize_(0)
+            del x
+            output = weight.new_empty((n_padded, weight.shape[1]))
+            if n_padded:
                 deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-                    quantize_rows(x, layout),
+                    rq,
                     (qw, sw),
                     output,
                     layout.groups,
                     recipe=(1, 128, 128),
                     disable_ue8m0_cast=not layout.use_ue8m0,
                 )
-            del qw, sw
-            # Wgrad needs token-axis quantization, not a transpose of the forward
-            # row quantization. Produce it from BF16 now so autograd need not
-            # retain that larger source activation until backward.
-            # Sparse expert groups can expand substantially when padded. Keep
-            # BF16 instead when it is smaller than the FP8 payload plus scales.
-            column_bytes = layout.rows.numel() * (x.shape[1] + 4 * (x.shape[1] // 128))
-            ctx.quantized_input = column_bytes < x.numel() * x.element_size()
-            qx, sx = None, None
-            if ctx.needs_input_grad[1]:
-                qx, sx = quantize_columns(x, layout) if ctx.quantized_input else (x, None)
+            del rq, qw, sw
             # Existing BF16 parameters already occupy storage. Requantize them
             # at dgrad rather than retaining an extra FP8 copy across forward.
             # Callers retain FP8 instead for temporary BF16 weight copies.
@@ -683,4 +695,112 @@ class GroupedLinear(torch.autograd.Function):
                     )
                 else:
                     dw = _weight_gradient(qx, grad_output, layout, ctx.weight_shape, ctx.weight_dtype)
-            return dx, dw, None, None
+            return dx, dw, None, None, None
+
+
+@triton.jit
+def _moe_weighted_combine_fwd_kernel(
+    Returned_ptr,
+    Weights_ptr,
+    InvOrder_ptr,
+    Out_ptr,
+    H: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    t = tl.program_id(0).to(tl.int64)
+    hb = tl.program_id(1).to(tl.int64)
+    offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs_h < H
+    acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    for k in tl.static_range(0, TOP_K):
+        r = tl.load(InvOrder_ptr + t * TOP_K + k).to(tl.int64)
+        w = tl.load(Weights_ptr + t * TOP_K + k).to(tl.float32)
+        v = tl.load(Returned_ptr + r * H + offs_h, mask=mask, other=0.0).to(tl.float32)
+        acc += w * v
+    tl.store(Out_ptr + t * H + offs_h, acc.to(Out_ptr.dtype.element_ty), mask=mask)
+
+
+@triton.jit
+def _moe_weighted_combine_bwd_kernel(
+    GradOut_ptr,
+    Returned_ptr,
+    Weights_ptr,
+    InvOrder_ptr,
+    GradReturned_ptr,
+    GradWeights_ptr,
+    H: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    t = tl.program_id(0).to(tl.int64)
+    hb = tl.program_id(1).to(tl.int64)
+    offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs_h < H
+    g = tl.load(GradOut_ptr + t * H + offs_h, mask=mask, other=0.0).to(tl.float32)
+    for k in tl.static_range(0, TOP_K):
+        r = tl.load(InvOrder_ptr + t * TOP_K + k).to(tl.int64)
+        w = tl.load(Weights_ptr + t * TOP_K + k).to(tl.float32)
+        v = tl.load(Returned_ptr + r * H + offs_h, mask=mask, other=0.0).to(tl.float32)
+        tl.store(GradReturned_ptr + r * H + offs_h, (g * w).to(GradReturned_ptr.dtype.element_ty), mask=mask)
+        dw = tl.sum(g * v, axis=0)
+        tl.atomic_add(GradWeights_ptr + t * TOP_K + k, dw)
+
+
+class MoEWeightedCombine(torch.autograd.Function):
+    """Fused weighted combine over ``top_k`` returned expert rows in BF16."""
+
+    @staticmethod
+    def forward(ctx, returned: torch.Tensor, routing_weights: torch.Tensor, inv_order: torch.Tensor) -> torch.Tensor:
+        """Combine each token's ``top_k`` expert rows under their routing weights."""
+        returned = returned.contiguous()
+        routing_weights = routing_weights.contiguous()
+        inv_order = inv_order.contiguous()
+        num_tokens, top_k = routing_weights.shape
+        hidden_dim = returned.shape[1]
+        out = torch.empty((num_tokens, hidden_dim), dtype=returned.dtype, device=returned.device)
+        if num_tokens > 0 and hidden_dim > 0:
+            block_h = 1024
+            with torch.cuda.device(returned.device):
+                _moe_weighted_combine_fwd_kernel[(num_tokens, triton.cdiv(hidden_dim, block_h))](
+                    returned,
+                    routing_weights,
+                    inv_order,
+                    out,
+                    H=hidden_dim,
+                    TOP_K=top_k,
+                    BLOCK_H=block_h,
+                )
+        ctx.save_for_backward(returned, routing_weights, inv_order)
+        return out
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_out: torch.Tensor):
+        """Return gradients for returned rows and routing weights."""
+        returned, routing_weights, inv_order = ctx.saved_tensors
+        ctx.maybe_clear_saved_tensors()
+        num_tokens, top_k = routing_weights.shape
+        hidden_dim = returned.shape[1]
+        grad_out_c = grad_out.contiguous()
+        grad_returned = torch.empty_like(returned)
+        grad_weights_fp32 = torch.zeros((num_tokens, top_k), dtype=torch.float32, device=returned.device)
+        if num_tokens > 0 and hidden_dim > 0:
+            block_h = 1024
+            with torch.cuda.device(returned.device):
+                _moe_weighted_combine_bwd_kernel[(num_tokens, triton.cdiv(hidden_dim, block_h))](
+                    grad_out_c,
+                    returned,
+                    routing_weights,
+                    inv_order,
+                    grad_returned,
+                    grad_weights_fp32,
+                    H=hidden_dim,
+                    TOP_K=top_k,
+                    BLOCK_H=block_h,
+                )
+        return (
+            grad_returned if ctx.needs_input_grad[0] else None,
+            grad_weights_fp32.to(routing_weights.dtype) if ctx.needs_input_grad[1] else None,
+            None,
+        )
