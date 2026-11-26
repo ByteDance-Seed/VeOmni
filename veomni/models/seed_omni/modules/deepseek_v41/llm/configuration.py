@@ -350,18 +350,32 @@ class DeepseekV41LlmConfig(OmniModuleConfig):
             ratio = self.compress_ratios[layer_idx]
             if layer_idx in kv_sources:
                 active_kv_source = layer_idx
-            if ratio > 0 and active_kv_source is not None and self.compress_ratios[active_kv_source] != ratio:
-                raise ValueError(
-                    f"layer {layer_idx} has compress_ratio={ratio}, which does not match its active KV source "
-                    f"layer {active_kv_source} (compress_ratio={self.compress_ratios[active_kv_source]})."
-                )
+            if ratio > 0:
+                if active_kv_source is None:
+                    raise ValueError(
+                        f"layer {layer_idx} attends over compressed KV (compress_ratio={ratio}) before any KV source; "
+                        f"kv_source_layer_ids={list(self.kv_source_layer_ids)} must contain a layer at or before "
+                        f"{layer_idx}."
+                    )
+                if self.compress_ratios[active_kv_source] != ratio:
+                    raise ValueError(
+                        f"layer {layer_idx} has compress_ratio={ratio}, which does not match its active KV source "
+                        f"layer {active_kv_source} (compress_ratio={self.compress_ratios[active_kv_source]})."
+                    )
             if layer_idx in index_sources:
                 active_index_source = layer_idx
-            elif ratio > 0 and active_index_source is not None and self.compress_ratios[active_index_source] != ratio:
-                raise ValueError(
-                    f"layer {layer_idx} has compress_ratio={ratio}, which does not match its active index source "
-                    f"layer {active_index_source} (compress_ratio={self.compress_ratios[active_index_source]})."
-                )
+            elif ratio > 0:
+                if active_index_source is None:
+                    raise ValueError(
+                        f"layer {layer_idx} reuses compressed top-k indices before any index source; "
+                        f"index_source_layer_ids={list(self.index_source_layer_ids)} must contain a layer at or before "
+                        f"{layer_idx}."
+                    )
+                if self.compress_ratios[active_index_source] != ratio:
+                    raise ValueError(
+                        f"layer {layer_idx} has compress_ratio={ratio}, which does not match its active index source "
+                        f"layer {active_index_source} (compress_ratio={self.compress_ratios[active_index_source]})."
+                    )
         for layer_idx in self.engram_layer_ids:
             if not 0 <= layer_idx < self.num_hidden_layers:
                 raise ValueError(f"engram_layer_ids contains out-of-range layer {layer_idx}.")
@@ -529,12 +543,17 @@ def shrink_layer_schedule(n_layers: int, n_draft: int = 3) -> Dict[str, Any]:
         enc_keep = [encoder_kv[0]]
     else:
         enc_keep = _even_pick(encoder_pool, n_enc)
-        if not any(idx in encoder_kv for idx in enc_keep):
-            enc_keep[-1] = encoder_kv[-1]
-            enc_keep = sorted(set(enc_keep))
-            drop_from = [idx for idx in enc_keep if idx not in encoder_kv]
-            while len(enc_keep) > n_enc and drop_from:
-                enc_keep.remove(drop_from.pop(0))
+        # Ensure a kept KV source precedes (or is) the first compressed encoder
+        # layer so no compressed consumer runs before shared.compress_kv exists.
+        first_compressed_pos = next((i for i, idx in enumerate(enc_keep) if released_ratios[idx] > 0), None)
+        if first_compressed_pos is None:
+            enc_keep[-1] = encoder_kv[0]
+        else:
+            first_compressed = enc_keep[first_compressed_pos]
+            if not any(kv in encoder_kv and kv <= first_compressed for kv in enc_keep):
+                preceding_kvs = [kv for kv in encoder_kv if kv <= first_compressed]
+                enc_keep[first_compressed_pos] = preceding_kvs[-1] if preceding_kvs else encoder_kv[0]
+        enc_keep = sorted(set(enc_keep))
 
     decoder_rest = [
         idx

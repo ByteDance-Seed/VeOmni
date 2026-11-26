@@ -527,10 +527,11 @@ class TestReviewRegressions:
             mtp.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
         mtp.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-    def test_indexer_ops_selection_candidate_mask_zero_width_and_ratio_validation(self):
+    def test_indexer_ops_selection_candidate_mask_zero_width_and_ratio_validation(self, monkeypatch):
         from veomni.models.seed_omni.modules.deepseek_v41.llm.modeling import (
             DeepseekV41Attention,
             DeepseekV41Indexer,
+            DeepseekV41Llm,
             SharedAttentionState,
             build_compression_plans,
         )
@@ -645,6 +646,52 @@ class TestReviewRegressions:
                 engram_layer_ids=[0],
                 dspark_target_layer_ids=[0, 1, 2],
             )
+
+        # Compressed consumer before the first KV or index source fails fast at config validation.
+        with pytest.raises(ValueError, match="before any KV source"):
+            tiny_llm_config(
+                num_hidden_layers=3,
+                compress_ratios=[0, 2, 2],
+                kv_source_layer_ids=[2],
+                index_source_layer_ids=[2],
+                candidate_source_layer_id=2,
+                engram_layer_ids=[0],
+                dspark_target_layer_ids=[0, 1, 2],
+            )
+        with pytest.raises(ValueError, match="before any index source"):
+            tiny_llm_config(
+                num_hidden_layers=3,
+                compress_ratios=[2, 2, 2],
+                kv_source_layer_ids=[0],
+                index_source_layer_ids=[2],
+                candidate_source_layer_id=2,
+                engram_layer_ids=[0],
+                dspark_target_layer_ids=[0, 1, 2],
+            )
+
+        # shrink_layer_schedule produces a valid KV/index-ordered schedule for every n_layers in [2, 40]
+        # and the n_layers=6, n_draft=0 schedule executes a full forward pass without missing shared.compress_kv.
+        for n_layers in range(2, 41):
+            sched = shrink_layer_schedule(n_layers, n_draft=0)
+            sched.pop("kept_layer_ids", None)
+            cfg_shrunk = tiny_llm_config(**sched)
+            assert cfg_shrunk.num_hidden_layers == n_layers
+
+        _patch_cpu_attention(monkeypatch)
+        sched6 = shrink_layer_schedule(6, n_draft=0)
+        sched6.pop("kept_layer_ids", None)
+        cfg6 = tiny_llm_config(**sched6)
+        llm6 = DeepseekV41Llm(cfg6)
+        ngram6 = [
+            torch.randn(1, 16, cfg6.engram_n_heads * (MAX_NGRAM - 1), cfg6.engram_head_dim)
+            for _ in cfg6.engram_layer_ids
+        ]
+        out6 = llm6(
+            inputs_embeds=torch.randn(1, 16, cfg6.hidden_size),
+            position_ids=torch.arange(16).unsqueeze(0),
+            ngram_embeds=ngram6,
+        )
+        assert torch.isfinite(out6["hidden_states"]).all()
 
     def test_ngram_prime_overflow_empty_dequant_fused_lookup_and_converter_guards(self):
         from veomni.models.seed_omni.modules.deepseek_v41.ngram.modeling import (
