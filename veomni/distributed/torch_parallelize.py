@@ -533,10 +533,64 @@ def _divide_extra_parallel_grads_like_fsdp(model: "nn.Module", parallel_state, f
             param.register_hook(lambda grad, factor=factor: grad / factor)
 
 
+def _fsdp_reduce_scatter_size(mesh) -> int:
+    """Size of the FSDP reduce-scatter axis (innermost dim on 2D HSDP, sole dim on 1D)."""
+    if mesh is None:
+        return 1
+    ndim = getattr(mesh, "ndim", 1)
+    return int(mesh.size(ndim - 1) if ndim > 1 else mesh.size())
+
+
+def _configure_extra_parallel_reduce_scatter(
+    module: FSDPModule,
+    gradient_divide_factor: float,
+    *,
+    reduce_scatter_size: int,
+) -> None:
+    """Scale ExtraParallel gradients with a plain SUM reduce-scatter plus an exact local divide.
+
+    ExtraParallel asks for ``gradient_divide_factor == world_size`` while the
+    reduce-scatter group is only ``ep_fsdp``, so the two differ whenever
+    ``ep_size > 1``. PyTorch's ``_get_gradient_divide_factors`` then picks
+    ``torch.distributed._make_nccl_premul_sum(1 / factor)`` instead of
+    ``ReduceOp.AVG``. That default is wrong for this repository on three
+    independent counts:
+
+    1. A BF16 reduction is silently zeroed. ``ProcessGroupNCCL``
+       hands the host ``float32*`` scalar to
+       ``ncclRedOpCreatePreMulSum(..., ncclBfloat16, ncclScalarHostImmediate, ...)``;
+       ``libnccl`` then ``memcpy``s the low 2 bytes of the IEEE-754 value as a
+       ``bfloat16``. Every power-of-two ``1 / 2^k`` has ``0x0000`` there, so a
+       BF16 reduction multiplies the whole gradient by ``0.0``. Nothing
+       raises and the loss curve stays normal — only the reduced parameters
+       stop moving. (FP16 avoids this because PyTorch's
+       ``overflow_risk = reduce_dtype not in (float32, bfloat16)`` already
+       routes FP16 to plain ``ReduceOp.SUM`` with pre/post factors.)
+    2. It costs NVLS eligibility. Floating-point ``AVG`` maps to ``PreMulSum``,
+       which NCCL cannot run on NVLS; a SUM followed by a local divide can.
+    3. Gloo rejects it outright (``Cannot use ReduceOp.PREMUL_SUM with Gloo``),
+       so the CPU distributed tests could not exercise this path at all.
+
+    ``ReduceOp.SUM`` plus one ATen post-division is arithmetically the same
+    average and works on every backend.
+
+    The ``reduce_scatter_size > 1`` guard is load-bearing. When the group holds
+    a single rank (``ep_size == world_size``, so ``ep_fsdp == 1``)
+    ``foreach_reduce`` never issues the collective and already divides by
+    ``gradient_divide_factor`` in its singleton copy branch. Forcing SUM there
+    would also populate ``postdivide_factor`` and divide a second time, by
+    ``factor ** 2``.
+    """
+    module.set_gradient_divide_factor(gradient_divide_factor)
+    if reduce_scatter_size > 1 and hasattr(module, "set_force_sum_reduction_for_comms"):
+        module.set_force_sum_reduction_for_comms(True)
+
+
 def _configure_fsdp_gradient_reduction(
     module: FSDPModule,
     *,
     gradient_divide_factor: float,
+    reduce_scatter_size: int,
     use_low_precision_transport: bool,
     transport_reduction_scales: dict[nn.Module, float],
 ) -> None:
@@ -544,7 +598,11 @@ def _configure_fsdp_gradient_reduction(
         transport_reduction_scales[module] = 1.0 / gradient_divide_factor
     else:
         # Singleton, cross-node and unknown-placement groups keep native scaling.
-        module.set_gradient_divide_factor(gradient_divide_factor)
+        _configure_extra_parallel_reduce_scatter(
+            module,
+            gradient_divide_factor,
+            reduce_scatter_size=reduce_scatter_size,
+        )
 
 
 def parallelize_model_fsdp2(
@@ -974,16 +1032,22 @@ def parallelize_model_fsdp2(
                 # experts_mod.set_gradient_divide_factor(parallel_state.ep_size)
                 # but for torch 2.7 we still use set_reduce_scatter_divide_factor(parallel_state.ep_size)
                 gradient_divide_factor = parallel_state.extra_parallel_gradient_divide_factor(para)
+                para_rs_size = _fsdp_reduce_scatter_size(extra_parallel_fsdp_kwargs[para]["mesh"])
                 logger.info(f"setting grad divide factor for {para} module to {gradient_divide_factor}")
                 if IS_NPU_AVAILABLE:
                     # NPU is using torch 2.7
                     _para_mod.set_reduce_scatter_divide_factor(gradient_divide_factor)
                 elif transport_reduction_scales is None:
-                    _para_mod.set_gradient_divide_factor(gradient_divide_factor)
+                    _configure_extra_parallel_reduce_scatter(
+                        _para_mod,
+                        gradient_divide_factor,
+                        reduce_scatter_size=para_rs_size,
+                    )
                 else:
                     _configure_fsdp_gradient_reduction(
                         _para_mod,
                         gradient_divide_factor=gradient_divide_factor,
+                        reduce_scatter_size=para_rs_size,
                         use_low_precision_transport=extra_parallel_transport_enabled[para],
                         transport_reduction_scales=transport_reduction_scales,
                     )

@@ -1011,6 +1011,82 @@ class AcceleratorConfig:
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
         self._resolve_topology()
         self._validate_init_device()
+        self._reject_bf16_reduce_over_the_extra_parallel_collective()
+
+    def _reject_bf16_reduce_over_the_extra_parallel_collective(self) -> None:
+        """Refuse BF16 gradient reduction over an ExtraParallel collective that would zero it.
+
+        When an ExtraParallel unit's reduce-scatter group is wider than one rank and
+        its divide factor differs from that group's size -- which is always the case
+        here, because the factor is the world size -- PyTorch's
+        ``_get_gradient_divide_factors`` picks
+        ``torch.distributed._make_nccl_premul_sum(1 / factor)``. ``ProcessGroupNCCL``
+        then hands the host ``float32*`` scalar to
+        ``ncclRedOpCreatePreMulSum(..., ncclBfloat16, ncclScalarHostImmediate, ...)``,
+        and ``libnccl`` copies the **low two bytes** of the IEEE-754 value as a
+        ``bfloat16``: every power-of-two ``1 / 2^k`` has those bytes zero, so the
+        reduction multiplies the whole gradient by ``0.0``.
+
+        Nothing raises, and the loss curve stays normal -- only the reduced
+        parameters stop moving. While ``_configure_extra_parallel_reduce_scatter``
+        forces ``ReduceOp.SUM`` plus a local divide on PyTorch builds that expose
+        ``set_force_sum_reduction_for_comms``, this config-time guard acts as
+        defense-in-depth so no FSDP2 config reaches a wide ExtraParallel collective
+        with BF16 reduction (whether set explicitly via ``reduce_dtype='bfloat16'``
+        or inherited via ``reduce_dtype=None`` with ``param_dtype='bfloat16'``).
+
+        Only ``bfloat16`` is refused, not ``float16``: PyTorch computes
+        ``overflow_risk = reduce_dtype not in (float32, bfloat16)``, so an FP16
+        reduction never takes the PreMulSum path -- it gets pre/post factors with
+        plain ``ReduceOp.SUM``. Non-FSDP2 modes (``ddp``, ``eager``) skip this
+        check because they never run FSDP2 ExtraParallel reduce-scatter (for
+        example, a SeedOmni sub-module may inherit a global ``ep_size``).
+
+        A singleton group is fine and is what smaller shapes use: the reduce-scatter
+        never issues a collective there, and ``foreach_reduce`` already divides in
+        its singleton copy branch.
+
+        The group width is ``dp_shard_sp_size // para_size`` -- the same expression
+        ``ParallelState`` builds the ``(para_replicate, para_fsdp, para)`` mesh from.
+        Using the world size instead would over-reject HSDP, where ``dp_replicate``
+        is a separate axis: ``world // para_size`` is then wider than the group that
+        actually runs the collective.
+        """
+        if self.fsdp_config.fsdp_mode not in ("fsdp2", "hyper_fsdp2"):
+            return
+        mixed_precision = self.fsdp_config.mixed_precision
+        effective_reduce_dtype = mixed_precision.reduce_dtype or mixed_precision.param_dtype
+        if not mixed_precision.enable or effective_reduce_dtype != "bfloat16":
+            return
+
+        # `ep` is folded in on demand rather than written back to the raw fields,
+        # so the effective list -- not `extra_parallel_names` -- is what the mesh
+        # is built from.
+        names, sizes, _ = self.resolved_extra_parallel
+        if len(names) != len(sizes):
+            raise ValueError(
+                f"extra_parallel_names={names!r} and extra_parallel_sizes={sizes!r} must have the same length."
+            )
+
+        # `dp_shard_sp` is the axis ExtraParallel shards over; `dp_replicate` is a
+        # separate axis above it. `_resolve_topology()` has already derived both.
+        dp_shard_sp_size = self.world_size // self.dp_replicate_size
+        for para, para_size in zip(names, sizes):
+            if para_size <= 1:
+                continue
+            if dp_shard_sp_size % para_size != 0:
+                # ParallelState reports this itself, with the mesh it was building.
+                continue
+            para_fsdp_size = dp_shard_sp_size // para_size
+            if para_fsdp_size > 1:
+                raise ValueError(
+                    f"fsdp_config.mixed_precision.reduce_dtype={mixed_precision.reduce_dtype!r} "
+                    f"(effective 'bfloat16') cannot be used with {para}_size={para_size}: the {para} "
+                    f"reduce-scatter group is {para_fsdp_size} wide, where PyTorch's default NCCL "
+                    "PreMulSum bf16 scalar path truncates 1/2^k to 0.0 and zeroes every gradient in it. "
+                    "Set reduce_dtype='float32', or make the group a singleton "
+                    f"({para}_size={dp_shard_sp_size}, i.e. equal to dp_shard x cp x ulysses)."
+                )
 
     def _resolve_topology(self):
         # Ahead of the topology arithmetic below, which cannot defend itself: a

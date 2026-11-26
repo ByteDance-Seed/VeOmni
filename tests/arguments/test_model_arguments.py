@@ -206,3 +206,91 @@ def test_expert_fsdp_shard_dim_rejects_ddp():
 
     with pytest.raises(ValueError, match="expert_fsdp_shard_dim"):
         FSDPConfig(expert_fsdp_shard_dim=0, fsdp_mode="ddp")
+
+
+class TestBf16ReduceOverAnExtraParallelCollective:
+    """BF16 reduction is refused only where the NCCL PreMulSum path would zero it.
+
+    When an ExtraParallel unit's reduce-scatter group is wider than one rank,
+    PyTorch scales it with `_make_nccl_premul_sum(1 / factor)`, and
+    `ProcessGroupNCCL` hands libnccl a `float32*` for a `ncclBfloat16` op -- it
+    copies the low two bytes, so `1/2^k` becomes bf16 0.0 and the whole gradient
+    is multiplied by zero. Nothing raises, so a config must not be able to reach
+    it. The group width is `dp_shard_sp_size // para_size`, the same expression
+    `ParallelState` builds the `(para_replicate, para_fsdp, para)` mesh from.
+    """
+
+    @staticmethod
+    def _build(monkeypatch, *, world_size, reduce_dtype, ep_size=1, dp_replicate_size=-1):
+        from veomni.arguments import MixedPrecisionConfig
+
+        monkeypatch.setenv("WORLD_SIZE", str(world_size))
+        return AcceleratorConfig(
+            ep_size=ep_size,
+            dp_replicate_size=dp_replicate_size,
+            fsdp_config=FSDPConfig(
+                fsdp_mode="fsdp2",
+                mixed_precision=MixedPrecisionConfig(enable=True, param_dtype="bfloat16", reduce_dtype=reduce_dtype),
+            ),
+        )
+
+    def test_a_wide_group_refuses_bfloat16(self, monkeypatch):
+        with pytest.raises(ValueError, match="zeroes every gradient"):
+            self._build(monkeypatch, world_size=128, ep_size=32, reduce_dtype="bfloat16")
+
+    def test_a_singleton_group_accepts_bfloat16(self, monkeypatch):
+        # 128 experts over 128 ranks: the reduce-scatter never issues a collective,
+        # and `foreach_reduce` already divides in its singleton copy branch.
+        args = self._build(monkeypatch, world_size=128, ep_size=128, reduce_dtype="bfloat16")
+        assert args.ep_size == 128
+
+    def test_float32_is_always_accepted(self, monkeypatch):
+        self._build(monkeypatch, world_size=128, ep_size=32, reduce_dtype="float32")
+
+    def test_float16_is_accepted_because_it_never_takes_the_premulsum_path(self, monkeypatch):
+        # PyTorch computes `overflow_risk = reduce_dtype not in (float32, bfloat16)`,
+        # so FP16 gets pre/post factors with plain SUM instead.
+        self._build(monkeypatch, world_size=128, ep_size=32, reduce_dtype="float16")
+
+    def test_disabled_mixed_precision_is_not_checked(self, monkeypatch):
+        monkeypatch.setenv("WORLD_SIZE", "128")
+        from veomni.arguments import MixedPrecisionConfig
+
+        AcceleratorConfig(
+            ep_size=32,
+            fsdp_config=FSDPConfig(
+                fsdp_mode="fsdp2",
+                mixed_precision=MixedPrecisionConfig(enable=False, reduce_dtype="bfloat16"),
+            ),
+        )
+
+    def test_hsdp_measures_the_shard_axis_not_the_world_size(self, monkeypatch):
+        # world=8, dp_replicate=2 -> dp_shard_sp=4. ep_size=4 makes the group a
+        # singleton even though world // ep_size would be 2. Refusing here would
+        # break a topology whose collective never issues.
+        self._build(monkeypatch, world_size=8, ep_size=4, dp_replicate_size=2, reduce_dtype="bfloat16")
+
+    def test_hsdp_still_refuses_a_group_wider_than_one(self, monkeypatch):
+        # Same mesh, but ep_size=2 leaves a 2-wide group.
+        with pytest.raises(ValueError, match="zeroes every gradient"):
+            self._build(monkeypatch, world_size=8, ep_size=2, dp_replicate_size=2, reduce_dtype="bfloat16")
+
+    def test_reduce_dtype_none_with_bf16_param_dtype_is_refused(self, monkeypatch):
+        # FSDP2 inherits param_dtype when reduce_dtype is None, so BF16 param_dtype
+        # reaches the same BF16 reduce-scatter path.
+        with pytest.raises(ValueError, match="zeroes every gradient"):
+            self._build(monkeypatch, world_size=128, ep_size=32, reduce_dtype=None)
+
+    @pytest.mark.parametrize("fsdp_mode", ["ddp", "eager"])
+    def test_non_fsdp2_modes_skip_the_check(self, monkeypatch, fsdp_mode):
+        # SeedOmni sub-modules can inherit global ep_size while running under DDP or eager.
+        from veomni.arguments import MixedPrecisionConfig
+
+        monkeypatch.setenv("WORLD_SIZE", "128")
+        AcceleratorConfig(
+            ep_size=32,
+            fsdp_config=FSDPConfig(
+                fsdp_mode=fsdp_mode,
+                mixed_precision=MixedPrecisionConfig(enable=True, param_dtype="bfloat16", reduce_dtype="bfloat16"),
+            ),
+        )
