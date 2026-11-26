@@ -459,10 +459,12 @@ def _dpo_recovery_geometry(args: Any) -> dict[str, Any]:
         selection = getattr(ops, field_name, None)
         if isinstance(selection, OpsSelection):
             selected[field_name] = asdict(selection)
+        elif field_name == "kv_round_implementation":
+            # Even scalar rows can change the frozen reference's KV values.
+            selected[field_name] = selection
         elif isinstance(selection, str) and selection in {"torchao", "qat", "deepgemm"}:
             selected[field_name] = selection
-    if selected:
-        result["reference_model"]["site_ops"] = selected
+    result["reference_model"]["site_ops"] = selected
     return result
 
 
@@ -878,7 +880,7 @@ class TextDPOTrainer:
                 },
             }
         return {
-            "version": 9,
+            "version": 10,
             "enabled": self.base.args.dpo_config.explicit_segment_provenance,
             "plaintext_transform_version": 1,
             "conversation_transform_version": 1,
@@ -930,6 +932,11 @@ class TextDPOTrainer:
                 "legacy DPO trainer state has no data-semantics version; start from weights only "
                 "or perform an independently verified migration to required provenance"
             )
+        if type(saved) is dict and saved.get("version") == 9:
+            raise ValueError(
+                "DPO checkpoint protocol v9 does not attest KV rounding; "
+                "use the original runtime or an independently verified migration"
+            )
         if (
             type(saved) is not dict
             or set(saved)
@@ -950,7 +957,7 @@ class TextDPOTrainer:
                 "steps_per_epoch",
             }
             or type(saved["version"]) is not int
-            or saved["version"] != 9
+            or saved["version"] != 10
             or type(saved["enabled"]) is not bool
             or type(saved["plaintext_transform_version"]) is not int
             or saved["plaintext_transform_version"] != 1

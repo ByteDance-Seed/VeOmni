@@ -370,9 +370,9 @@ A missing module or method still fails before the first request runs.
   [the `seedomni_cached` transform](../../../tests/seed_omni/test_offline_cache_writer.py#L41), the
   [writer round trip](../../../tests/seed_omni/test_offline_cache_writer.py#L59),
   [one writer per `dp_rank`](../../../tests/seed_omni/test_offline_cache_writer.py#L112),
-  [a resumed writer keeps every row its cursor covers and drops the replayed ones](../../../tests/seed_omni/test_offline_cache_writer.py#L140),
-  [a finalized cache](../../../tests/seed_omni/test_offline_cache_writer.py#L168) or [another dp size](../../../tests/seed_omni/test_offline_cache_writer.py#L181) cannot be resumed into, and
-  [a shard only one rank sees fails every rank](../../../tests/seed_omni/test_offline_cache_writer.py#L324).
+  [a resumed writer keeps every row its cursor covers and drops the replayed ones](../../../tests/seed_omni/test_offline_cache_writer.py#L143),
+  [a finalized cache](../../../tests/seed_omni/test_offline_cache_writer.py#L171) or [another dp size](../../../tests/seed_omni/test_offline_cache_writer.py#L184) cannot be resumed into, and
+  [a shard only one rank sees fails every rank](../../../tests/seed_omni/test_offline_cache_writer.py#L327).
 - [`tests/seed_omni/trainer/test_omni_trainer.py`](../../../tests/seed_omni/trainer/test_omni_trainer.py):
   [an `offline_embedding` run may build no optimizer](../../../tests/seed_omni/trainer/test_omni_trainer.py#L161),
   [it saves no model state](../../../tests/seed_omni/trainer/test_omni_trainer.py#L173),
