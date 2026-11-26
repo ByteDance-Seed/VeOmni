@@ -368,7 +368,7 @@ model = build_parallelize_model(
     early_stop=args.model.accelerator.gradient_checkpointing.early_stop,
     enable_forward_prefetch=args.model.accelerator.fsdp_config.forward_prefetch,
     broadcast_model_weights_from_rank0=args.model.broadcast_model_weights_from_rank0, # load model weights
-    ep_sharded_stream_load=args.model.ep_sharded_stream_load,
+    extra_parallel_stream_load=args.model.extra_parallel_stream_load,
     max_load_broadcast_size=args.model.accelerator.fsdp_config.max_load_broadcast_size, # max load broadcast size
     # Muon's zero-comm expert layout is decided here, not by build_optimizer.
     muon_expert_zero_comm=args.model.optimizer.type == "muon" and args.model.optimizer.muon_expert_zero_comm,

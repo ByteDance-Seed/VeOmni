@@ -42,7 +42,7 @@ model:
     lr_decay_style: cosine
     max_grad_norm: 1.0
   broadcast_model_weights_from_rank0: false
-  ep_sharded_stream_load: true
+  extra_parallel_stream_load: true
   accelerator:
     init_device: meta
     ulysses_size: 1

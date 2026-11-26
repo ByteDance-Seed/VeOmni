@@ -291,6 +291,172 @@ def test_async_offload_rejects_cpu_tensors():
     assert not base_check_fn(torch.ones(4))
 
 
+class _FakeEvent:
+    """Minimal stand-in for the device events the swap path records and waits on."""
+
+    def __init__(self):
+        self.recorded = 0
+        self.synced = 0
+
+    def record(self):
+        self.recorded += 1
+
+    def synchronize(self):
+        self.synced += 1
+
+
+class _FakeStream:
+    """Stand-in for a swap stream: only ``wait_event`` is touched."""
+
+    def wait_event(self, _event):
+        pass
+
+
+def _patch_swap_stream(monkeypatch):
+    """Route event creation and stream switching to the stand-ins above."""
+    from contextlib import nullcontext
+
+    from veomni.distributed import async_offload
+
+    monkeypatch.setattr(async_offload, "create_event", _FakeEvent)
+    monkeypatch.setattr(async_offload, "switch_to_specified_stream", lambda _stream: nullcontext())
+
+
+def test_deferred_free_requires_an_allocator_owned_storage(monkeypatch):
+    """``_deferred_free_supported`` accepts only storage the native allocator owns.
+
+    Foreign storage (``from_numpy`` / ``frombuffer`` / ``from_dlpack``) and COW
+    storage (``torch._lazy_clone``) must be rejected: ``record_stream`` is a no-op
+    for them, so detaching would free memory an in-flight copy is reading.
+    """
+    from veomni.distributed import async_offload
+
+    monkeypatch.setattr(async_offload, "is_caching_allocator_active", lambda: True)
+
+    owned = torch.empty(4)
+    assert async_offload._deferred_free_supported(owned)
+
+    import numpy as np
+
+    foreign = torch.from_numpy(np.zeros(4, dtype=np.float32))
+    assert not foreign.untyped_storage().resizable()
+    assert not async_offload._deferred_free_supported(foreign)
+
+    if hasattr(torch, "_lazy_clone") and hasattr(torch._C, "_is_cow_tensor"):
+        cow_source = torch.empty(4)
+        cow_clone = torch._lazy_clone(cow_source)
+        assert cow_clone.untyped_storage().resizable()
+        assert not async_offload._deferred_free_supported(cow_clone)
+        assert not async_offload._deferred_free_supported(cow_source)
+
+
+@pytest.mark.skipif(not IS_CUDA_AVAILABLE, reason="NVIDIA CUDA required for the allocator-backend probe")
+def test_is_caching_allocator_active_accepts_only_the_native_backend(monkeypatch):
+    """Only the native caching allocator may take the deferred-free path.
+
+    ``backend:cudaMallocAsync`` has its own ``recordStream`` that asserts the
+    pointer is in its allocation map, so an external DLPack tensor aborts there.
+    """
+    from veomni.utils import device
+
+    monkeypatch.delenv("PYTORCH_NO_CUDA_MEMORY_CACHING", raising=False)
+    for backend, expected in (("native", True), ("cudaMallocAsync", False)):
+        fake = SimpleNamespace(memory=SimpleNamespace(get_allocator_backend=lambda b=backend: b))
+        monkeypatch.setattr(device, "get_torch_device", lambda f=fake: f)
+        assert device.is_caching_allocator_active() is expected
+
+
+def test_launch_d2h_gates_record_stream_on_deferred_free(monkeypatch):
+    """``record_stream`` and the host wait in ``wait_d2h_finished`` must be paired.
+
+    Skipping ``record_stream`` without the synchronize frees memory mid-copy;
+    calling it where the allocator ignores it is a no-op hiding the same bug.
+    """
+    import numpy as np
+
+    from veomni.distributed import async_offload
+
+    _patch_swap_stream(monkeypatch)
+
+    recorded_streams = []
+    monkeypatch.setattr(
+        torch.Tensor,
+        "record_stream",
+        lambda self, s: recorded_streams.append((self, s)),
+    )
+
+    pool = PinnedBufferPool(max_cached_bytes=1 << 20)
+    stream = _FakeStream()
+
+    # Unsupported allocator -> no record_stream call, host synchronize in wait_d2h_finished.
+    monkeypatch.setattr(async_offload, "is_caching_allocator_active", lambda: False)
+    t_no_alloc = torch.arange(4.0)
+    swap_no_alloc = SwapTensor(t_no_alloc, "0_0", pool)
+    swap_no_alloc.launch_d2h(stream)
+    assert recorded_streams == []
+    assert swap_no_alloc._deferred_free is False
+    swap_no_alloc.wait_d2h_finished()
+    assert swap_no_alloc.d2h_event.synced == 1
+
+    # Native allocator with foreign storage -> no record_stream call, host synchronize.
+    monkeypatch.setattr(async_offload, "is_caching_allocator_active", lambda: True)
+    t_foreign = torch.from_numpy(np.arange(4, dtype=np.float32))
+    swap_foreign = SwapTensor(t_foreign, "0_1", pool)
+    swap_foreign.launch_d2h(stream)
+    assert recorded_streams == []
+    assert swap_foreign._deferred_free is False
+    swap_foreign.wait_d2h_finished()
+    assert swap_foreign.d2h_event.synced == 1
+
+    # Native allocator with owned storage -> record_stream called, host synchronize skipped.
+    t_owned = torch.arange(4.0)
+    swap_owned = SwapTensor(t_owned, "0_2", pool)
+    swap_owned.launch_d2h(stream)
+    assert recorded_streams == [(t_owned, stream)]
+    assert swap_owned._deferred_free is True
+    swap_owned.wait_d2h_finished()
+    assert swap_owned.d2h_event.synced == 0
+
+
+def test_release_host_buffer_syncs_abandoned_d2h_without_deferred_free(monkeypatch):
+    """A wrapper torn down mid-D2H must not leave a copy reading freed device memory.
+
+    Without ``record_stream``, dropping the last device reference before the copy
+    finishes is unsafe, so teardown synchronizes. The deferred path must not: the
+    pool's buffer tag covers reuse.
+    """
+    from veomni.distributed import async_offload
+
+    _patch_swap_stream(monkeypatch)
+    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, _s: None)
+
+    stream = _FakeStream()
+
+    # Non-deferred path: abandoned forward graph (stat == "d2h") must sync d2h_event.
+    monkeypatch.setattr(async_offload, "is_caching_allocator_active", lambda: False)
+    pool_sync = PinnedBufferPool(max_cached_bytes=1 << 20)
+    swap_sync = SwapTensor(torch.arange(4.0), "0_0", pool_sync)
+    host_buf_sync = swap_sync.tensor_cpu
+    swap_sync.launch_d2h(stream)
+    assert swap_sync.stat == "d2h"
+    assert swap_sync._deferred_free is False
+    swap_sync.release_host_buffer()
+    assert swap_sync.d2h_event.synced == 1
+    assert "_last_swap_event" not in host_buf_sync.__dict__
+
+    # Native deferred path: abandoned forward graph skips host sync and keeps the tag for pool reuse.
+    monkeypatch.setattr(async_offload, "is_caching_allocator_active", lambda: True)
+    pool_async = PinnedBufferPool(max_cached_bytes=1 << 20)
+    swap_async = SwapTensor(torch.arange(4.0), "0_1", pool_async)
+    host_buf_async = swap_async.tensor_cpu
+    swap_async.launch_d2h(stream)
+    assert swap_async.stat == "d2h"
+    assert swap_async._deferred_free is True
+    swap_async.release_host_buffer()
+    assert swap_async.d2h_event.synced == 0
+    assert host_buf_async.__dict__.get("_last_swap_event") is swap_async.d2h_event
+
+
 def test_shared_host_buffer_pool_survives_repeated_application():
     """The per-module application path must not multiply the configured limit.
 
@@ -387,6 +553,77 @@ def test_pinned_buffer_pool_refreshes_layout_recency_on_reuse():
     pool.acquire(layouts[1])
 
     assert pool.allocations == allocations_before + 1
+
+
+def test_pinned_buffer_pool_waits_for_pending_event_on_eviction():
+    """An evicted buffer must be synchronized even though it never returns via ``acquire``.
+
+    Eviction frees the buffer for good, so ``release`` itself must wait, and do it
+    outside the pool lock since the pool is shared across managers and threads.
+    """
+    pool = PinnedBufferPool(max_cached_bytes=32)
+
+    class _FakeEvent:
+        def __init__(self):
+            self.sync_count = 0
+            self.lock_free_during_sync = None
+
+        def synchronize(self):
+            self.sync_count += 1
+            acquired = pool._lock.acquire(blocking=False)
+            self.lock_free_during_sync = acquired
+            if acquired:
+                pool._lock.release()
+
+    first, first_key = pool.acquire(torch.empty((4,), dtype=torch.float32))  # 16 bytes
+    second, second_key = pool.acquire(torch.empty((8,), dtype=torch.float32))  # 32 bytes
+    pending = _FakeEvent()
+    first._last_swap_event = pending
+
+    # Release fits in the cache: wait is deferred and the tag stays attached.
+    pool.release(first, first_key)
+    assert pending.sync_count == 0
+    assert "_last_swap_event" in first.__dict__
+
+    # Releasing a 32-byte buffer forces eviction of ``first`` without ever returning via ``acquire()``.
+    pool.release(second, second_key)
+    assert pool.evictions == 1
+    assert pending.sync_count == 1
+    assert pending.lock_free_during_sync is True
+    assert "_last_swap_event" not in first.__dict__
+
+
+def test_pinned_buffer_pool_waits_for_pending_event_on_drop():
+    """An oversized buffer that bypasses the cache must be synchronized on ``release``.
+
+    A drop is chosen by size, not cache pressure, so it exercises a different
+    branch than eviction.
+    """
+    pool = PinnedBufferPool(max_cached_bytes=16)
+
+    class _FakeEvent:
+        def __init__(self, target_pool):
+            self._pool = target_pool
+            self.sync_count = 0
+            self.lock_free_during_sync = None
+
+        def synchronize(self):
+            self.sync_count += 1
+            acquired = self._pool._lock.acquire(blocking=False)
+            self.lock_free_during_sync = acquired
+            if acquired:
+                self._pool._lock.release()
+
+    # Drop path: oversized buffer bypasses cache and synchronizes on release outside the lock.
+    big_src = torch.empty((8,), dtype=torch.float32)  # 32 bytes > max_cached_bytes=16
+    big_buf, big_key = pool.acquire(big_src)
+    drop_event = _FakeEvent(pool)
+    big_buf._last_swap_event = drop_event
+    pool.release(big_buf, big_key)
+    assert pool.drops == 1
+    assert drop_event.sync_count == 1
+    assert drop_event.lock_free_during_sync is True
+    assert "_last_swap_event" not in big_buf.__dict__
 
 
 def test_async_offload_manager_resets_at_step_boundary():
@@ -544,7 +781,7 @@ def _run_async_offload_base_trainer_fsdp2_gc():
         basic_modules=[],
         optimizer=OptimizerConfig(),
         broadcast_model_weights_from_rank0=False,
-        ep_sharded_stream_load=False,
+        extra_parallel_stream_load=False,
         accelerator=SimpleNamespace(
             offload_config=OffloadConfig(
                 enable_async_activation=True,
