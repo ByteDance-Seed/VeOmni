@@ -18,6 +18,7 @@ from veomni.models.diffusers.minimax_h3.minimax_h3_condition.modeling_minimax_h3
     MiniMaxH3ConditionModel,
 )
 from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_dit, packed_sequence
+from veomni.models.diffusers.minimax_h3.minimax_h3_core.batch_packing import pack_samples
 from veomni.models.diffusers.minimax_h3.minimax_h3_transformer.configuration_minimax_h3_transformer import (
     MiniMaxH3DiTModelConfig,
 )
@@ -1063,6 +1064,15 @@ def test_flash_backend_defers_kernel_until_first_forward(monkeypatch, multisampl
     with pytest.raises(ImportError, match="flash_attn unavailable"):
         model(**batch(samples)) if multisample else serial(model, samples[:1])
     assert loads == ["veomni_flash_attention_2"]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+@pytest.mark.parametrize("missing", ["packed_seq_params", "refiner_packed_seq_params"])
+def test_packed_forward_requires_both_sequence_bounds(missing):
+    inputs, _ = pack_samples(prepare(condition_model(), [raw_sample(3), raw_sample(7)]))
+    inputs[missing] = None
+    with pytest.raises(ValueError, match=missing):
+        tiny_model().dit(**inputs, packed_batch=True)
 
 
 @pytest.mark.parametrize("checkpointing", [False, True])

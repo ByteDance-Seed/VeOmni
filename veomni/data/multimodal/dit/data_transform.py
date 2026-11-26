@@ -1,7 +1,9 @@
+import os
+
 import PIL
 
 from ...data_transform import DATA_TRANSFORM_REGISTRY
-from ..image_utils import fetch_images
+from ..image_utils import fetch_images, load_image
 from ..preprocess import conv_preprocess
 from ..video_utils import fetch_videos
 
@@ -20,6 +22,19 @@ def process_dit_online_example(example, source_name, **kwargs):
         "videos": videos,
     }
     return [processed_example]
+
+
+@DATA_TRANSFORM_REGISTRY.register("minimax_h3_image_t2i")
+def process_minimax_h3_image_t2i_example(example, data_dir="", **kwargs):
+    """Load one prompt and target image for MiniMax-H3-Image T2I training or caching."""
+    prompt, image = example.get("prompt"), example.get("image")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("MiniMax-H3-Image training requires a non-empty 'prompt' column.")
+    if not isinstance(image, (str, bytes)) or not image:
+        raise ValueError("MiniMax-H3-Image training requires an image path or bytes in the 'image' column.")
+    if data_dir and isinstance(image, str) and not os.path.isabs(image) and "://" not in image:
+        image = os.path.join(data_dir, image)
+    return [{"inputs": prompt, "images": [load_image(image)]}]
 
 
 @DATA_TRANSFORM_REGISTRY.register("minimax_h3_online")

@@ -780,14 +780,11 @@ def parallelize_model_fsdp2(
             fsdp_mode=parallel_state.dp_mode,
             any_extra_parallel_enabled=parallel_state.any_extra_parallel_enabled,
             enable_reshard_after_forward=enable_reshard_after_forward,
+            sequence_parallel_enabled=parallel_state.sp_enabled,
+            async_parallel_enabled=bool(parallel_state.async_enabled),
         )
 
-        compiled_count = compile_decoder_blocks(
-            model,
-            compile_config,
-            sequence_parallel_enabled=parallel_state.sp_enabled,
-            async_enabled=parallel_state.async_enabled,
-        )
+        compiled_count = compile_decoder_blocks(model, compile_config)
         if compiled_count == 0:
             raise RuntimeError("model.accelerator.torch_compile.enable found no decoder blocks to compile.")
         model._veomni_compile_enabled = True
