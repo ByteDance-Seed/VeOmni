@@ -118,3 +118,32 @@ def test_train_step_uses_hsdp_allreduce_helper():
         source = inspect.getsource(wrapper_cls.train_step)
 
         assert "_configure_hsdp_allreduce(" in source
+
+
+def test_model_reshard_is_a_no_op_for_an_unwrapped_model():
+    """`fsdp_mode == "fsdp2"` does not imply the model was wrapped.
+
+    `fsdp_config.extra_parallel_only` returns through `_finish_without_fsdp_wrap`,
+    so the model has no `set_reshard_after_backward`. The guard used to read the
+    config alone and raised `AttributeError` on the first micro-step of a
+    gradient-accumulation run.
+    """
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+
+    from veomni.trainer.base import BaseTrainer
+
+    trainer = object.__new__(BaseTrainer)
+    trainer.args = SimpleNamespace(
+        model=SimpleNamespace(
+            accelerator=SimpleNamespace(
+                dp_replicate_size=2,
+                fsdp_config=SimpleNamespace(fsdp_mode="fsdp2", reshard_after_backward=False),
+            )
+        )
+    )
+    trainer.model = nn.Linear(2, 2)  # no `set_reshard_after_backward` or `set_requires_all_reduce`
+
+    trainer.model_reshard(micro_step=0, num_micro_steps=4)  # must not raise
+    trainer._configure_hsdp_allreduce(micro_step=0, num_micro_steps=4)  # must not raise

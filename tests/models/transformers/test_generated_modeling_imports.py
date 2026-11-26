@@ -20,7 +20,7 @@ patched signatures and return dataclass docstrings while the class body is
 executed, and it raises rather than warns for some shapes.
 
 The bitwise logits suite does not cover every family (some have no toy config on
-the current accelerator), so importing all 19 HF-derived modeling modules
+the current accelerator), so importing every HF-derived modeling module
 directly catches import-time regressions across the board.
 """
 
@@ -35,7 +35,7 @@ import veomni  # noqa: F401  installs the ops/attention patches the modeling fil
 
 _VEOMNI_ROOT = pathlib.Path(veomni.__file__).parent
 _NON_HF_DIRS = {"flux", "movqgan", "wan"}
-_EXPECTED_HF_MODEL_COUNT = 19
+_EXPECTED_HF_MODEL_COUNT = 20
 
 
 def _hf_modeling_modules() -> list[str]:

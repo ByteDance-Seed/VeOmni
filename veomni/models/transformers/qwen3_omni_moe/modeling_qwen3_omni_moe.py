@@ -939,14 +939,30 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
         )
         padded_embed = padded_embed + positional_embedding
         hidden_states = padded_embed[padded_mask_after_cnn]
+        # ``aftercnn_lens`` is a tensor, so iterating it yields 0-dim tensors: the
+        # ``[window_aftercnn] * (cnn_len // window_aftercnn)`` repeat already
+        # forces an implicit sync there, and the ``remainder`` it appends would
+        # stay a tensor. Read the lengths out once as Python ints instead, which
+        # both avoids the per-element sync and keeps ``cu_chunk_lens`` a list of
+        # ints — otherwise ``max()`` below returns a tensor for any short clip
+        # (and for ``dummy_forward``, whose single chunk is always a remainder).
+        aftercnn_lens = aftercnn_lens.tolist()
         cu_chunk_lens = [0]
-        window_aftercnn = padded_mask_after_cnn.shape[-1] * (self.n_window_infer // (self.n_window * 2))
+        window_aftercnn = int(padded_mask_after_cnn.shape[-1] * (self.n_window_infer // (self.n_window * 2)))
         for cnn_len in aftercnn_lens:
             cu_chunk_lens += [window_aftercnn] * (cnn_len // window_aftercnn)
             remainder = cnn_len % window_aftercnn
             if remainder != 0:
                 cu_chunk_lens += [remainder]
-        cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
+        cu_seqlens = torch.tensor(cu_chunk_lens, device=padded_mask_after_cnn.device).cumsum(-1, dtype=torch.int32)
+        # ``cu_chunk_lens`` is a plain Python list of segment lengths, so the
+        # maximum is available here without touching the device. Build it now and
+        # hand it to every layer: the attention otherwise recomputes
+        # ``(cu_seqlens[1:] - cu_seqlens[:-1]).max()`` as a device tensor that
+        # FlashAttention has to ``.item()``, which is one device sync per audio
+        # batch and a graph break on torch builds without
+        # ``capture_scalar_outputs``.
+        max_seqlen = max(cu_chunk_lens[1:]) if len(cu_chunk_lens) > 1 else 0
 
         # --- Patch.3 ---
         if get_parallel_state().sp_enabled:
@@ -955,12 +971,16 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
             pad_seq_len = hidden_states.size(0) * get_parallel_state().sp_size - unpadded_hidden_len
             if pad_seq_len > 0:
                 cu_seqlens = torch.cat([cu_seqlens, (cu_seqlens[-1] + pad_seq_len).unsqueeze(0)], dim=0)
+                # The padded tail becomes its own segment, so the host maximum has
+                # to account for it exactly as the attention's fallback would.
+                max_seqlen = max(max_seqlen, pad_seq_len.item())
         # --- Patch.3 ---
 
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(
                 hidden_states,
                 cu_seqlens,
+                max_seqlen=max_seqlen,
             )
             hidden_states = layer_outputs[0]
 
@@ -1369,18 +1389,24 @@ class Qwen3OmniMoeVisionEncoder(Qwen3OmniMoePreTrainedModel):
                 cu_seqlens = torch.cat([cu_seqlens, new_cumsum.unsqueeze(0)], dim=0)
         # --- Patch.2 ---
 
-        # ``precomputed_max_seqlen`` is currently unused at the per-block level
-        # in omni_moe ViT (varlen attention reads max from cu_seqlens internally);
-        # accepted as a kwarg for contract symmetry with qwen3_vl and to insulate
-        # callers from per-model differences. Touch to avoid 'unused-var' lints.
-        _ = precomputed_max_seqlen
-
+        # ``precomputed_max_seqlen`` is the collator's host-computed maximum
+        # segment length. Forward it into every block: without it a block falls
+        # back to ``(cu_seqlens[1:] - cu_seqlens[:-1]).max()``, a device tensor
+        # that FlashAttention must ``.item()`` — one device sync per image batch,
+        # and a graph break on torch builds without ``capture_scalar_outputs``.
+        # The value is already a Python int, computed on CPU by
+        # ``collate_multimodal_metadata``.
         deepstack_feature_lists = []
         for layer_num, blk in enumerate(self.blocks):
+            # The blocks forward ``**kwargs`` straight to attention, so a caller
+            # that already put ``max_seqlen`` there would collide with the explicit
+            # argument below.
+            kwargs.pop("max_seqlen", None)
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
+                max_seqlen=precomputed_max_seqlen,
                 **kwargs,
             )
             if layer_num in self.deepstack_visual_indexes:
@@ -2106,8 +2132,8 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
     base_model_prefix = "thinker"
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _no_split_modules = [
-        "Qwen3OmniMoeAudioEncoder",
-        "Qwen3OmniMoeVisionEncoder",
+        "Qwen3OmniMoeAudioEncoderLayer",
+        "Qwen3OmniMoeVisionBlock",
         "Qwen3OmniMoeThinkerTextDecoderLayer",
     ]
     _can_compile_fullgraph = True

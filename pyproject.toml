@@ -118,6 +118,11 @@ magi = [
   "magi-attention==1.1.1; sys_platform == 'linux'",
 ]
 
+# Optional HyperParallel backend; combine with npu or npu_aarch64.
+hyper = [
+  "hyper-parallel==1.2.0.dev0",
+]
+
 # Ascend NPU x86_64 — superset minus CUDA-only kernels (FA2/3/4, FlashQLA).
 npu = [
   "torch==2.10.0+cpu",
@@ -224,6 +229,7 @@ conflicts = [
 ]
 
 [tool.uv.sources]
+hyper-parallel = { git = "https://github.com/mindspore-ai/hyper-parallel.git", rev = "f570046629fa7f43428861cba0e54996e1ce6a3d" }
 magi-attention = { git = "https://github.com/SandAI-org/MagiAttention.git", rev = "d7ea8afd44c790b65fab68a04a6a0fdd5adbf182" }
 # MagiAttention upstream designates this contributor-maintained support branch
 # for its arbitrary-mask FA4 packages. Dao-AILab does
