@@ -292,6 +292,16 @@ def test_from_float_rejects_invalid_master_weights(all_gather, in_features, out_
 
 
 @pytest.mark.parametrize("all_gather", [False, True])
+def test_from_float_rejects_subclass_with_custom_forward(all_gather):
+    class ScaledLinear(nn.Linear):
+        def forward(self, x):
+            return 2 * super().forward(x)
+
+    with pytest.raises(ValueError, match=r"plain nn\.Linear.*ScaledLinear"):
+        MXFP8Linear.from_float(ScaledLinear(32, 32), all_gather=all_gather, emulate=True)
+
+
+@pytest.mark.parametrize("all_gather", [False, True])
 def test_from_float_rejects_hooked_projection(all_gather):
     layer = nn.Linear(32, 32)
     layer.register_forward_hook(lambda module, args, kwargs, output: 2 * output, with_kwargs=True)

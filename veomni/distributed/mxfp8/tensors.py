@@ -365,6 +365,11 @@ class MXFP8Linear(nn.Linear):
 
     @classmethod
     def from_float(cls, module: nn.Linear, *, all_gather: bool, emulate: bool = False):
+        if type(module) is not nn.Linear:
+            raise ValueError(
+                f"MXFP8Linear conversion requires a plain nn.Linear, got {type(module).__name__}. "
+                "Conversion replaces the source module's forward."
+            )
         if module.weight.dtype != torch.float32:
             raise ValueError(f"MXFP8Linear conversion requires an FP32 master weight, got {module.weight.dtype}.")
         shape = module.weight.shape
