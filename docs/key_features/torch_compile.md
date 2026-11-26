@@ -132,20 +132,26 @@ custom autograd `Function` that chains kernels.
 
 ## What stays refused
 
-CUDA Graph replay, sequence parallelism, and async Ulysses. Replay needs one
-`cudagraph_mark_step_begin()` per micro-batch across the composed graph, which
-`OmniTrainer` does not make; Ulysses and context parallelism slice activations the
-graph edges of a compiled block reorder; async Ulysses pipelines the same exchanges
-across steps. Those are `backend='cudagraphs'`, `mode='reduce-overhead'`,
-`mode='max-autotune'`, `ulysses_size>1`, `cp_size>1`, and `enable_async`.
+Two groups, refused in two different ways.
 
-They are refused in two places, at two different times:
+**CUDA Graph replay** — `backend='cudagraphs'`, `mode='reduce-overhead'`,
+`mode='max-autotune'`. Banned outright **only under SeedOmni**: replay needs one
+`cudagraph_mark_step_begin()` per micro-batch across the composed graph, which
+`OmniTrainer` does not make. The single-model trainers allow replay, subject to the
+requirement every path has — `fsdp_config.reshard_after_forward` must be `False`,
+since replay records the all-gather/reshard sequence. That is
+`validate_compile_config_for_fsdp2`; see [the default `mode=None`](#the-default-modenone)
+for how to enable it.
+
+**Sequence parallelism** — `ulysses_size>1`, `cp_size>1`, `enable_async`. Ulysses and
+context parallelism slice activations the graph edges of a compiled block reorder, and
+async Ulysses pipelines the same exchanges across steps. Refused for every trainer:
 
 - **Under SeedOmni** the launcher config is checked when it is parsed, before any
   model is built (`_validate_omni_accelerator`), so a per-module overlay cannot slip
   past it either.
-- **Single-model trainers** (text and VLM) check the same combinations at build time
-  in `validate_compile_runtime`, before the first `fully_shard`. This applies to text
+- **Single-model trainers** (text and VLM) check it at build time in
+  `validate_compile_runtime`, before the first `fully_shard`. This applies to text
   models as well as VLM ones — no `torch_compile` + sequence-parallel path exists in
   this repo yet, for either, and refusing it uniformly is deliberate rather than a
   claim that one of them works.

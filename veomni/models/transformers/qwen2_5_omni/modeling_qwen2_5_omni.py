@@ -2122,7 +2122,11 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
     config: Qwen2_5OmniThinkerConfig
     base_model_prefix = "thinker"
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-    _no_split_modules = ["Qwen2_5OmniAudioEncoder", "Qwen2_5OmniVisionEncoder"]
+    _no_split_modules = [
+        "Qwen2_5OmniAudioEncoderLayer",
+        "Qwen2_5OmniVisionBlock",
+        "Qwen2_5OmniDecoderLayer",
+    ]
     _can_compile_fullgraph = True
 
     # ================================================================
