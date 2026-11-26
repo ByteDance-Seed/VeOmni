@@ -16,6 +16,7 @@
 # Adapted from https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/parallel_dims.py
 
 import os
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
@@ -78,6 +79,7 @@ class ParallelState:
     extra_parallel_flat_device_mesh: Dict[str, Optional["DeviceMesh"]] = field(default_factory=lambda: {"ep": None})
     async_enabled: Optional[bool] = False
     skip_sp_gather_between_modules: bool = False
+    extra_parallel_only: bool = False
 
     def __post_init__(self):
         if not isinstance(self.allow_hybrid_cp, bool):
@@ -504,7 +506,7 @@ def _init_parallel_state(
     cp_size: int = 1,
     ulysses_size: int = 1,
     allow_hybrid_cp: bool = False,
-    dp_mode: Literal["ddp", "fsdp2"] = "fsdp2",
+    dp_mode: Literal["ddp", "fsdp2", "hyper_fsdp2"] = "fsdp2",
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
     extra_parallel_sizes: Tuple[int] = (1,),
@@ -512,6 +514,7 @@ def _init_parallel_state(
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
     skip_sp_gather_between_modules: bool = False,
+    extra_parallel_only: bool = False,
     name: Optional[str] = "base",
     npu_ep_hccl_buffer_mib: Optional[int] = None,
     npu_ep_hccl_expansion_mode: Optional[str] = None,
@@ -545,6 +548,11 @@ def _init_parallel_state(
     if not isinstance(allow_hybrid_cp, bool):
         raise ValueError(f"allow_hybrid_cp must be a boolean; got {allow_hybrid_cp!r}.")
 
+    if dp_mode == "hyper_fsdp2":
+        hyper_adapter = getattr(sys.modules.get("hyper_parallel.integration.veomni.adapter"), "_ADAPTER", None)
+        if hyper_adapter is None or not hyper_adapter.is_patched or not hyper_adapter.fsdp:
+            raise ValueError("HyperParallel must be activated by TextTrainer or VLMTrainer.")
+
     if name is not None and name in _PARALLEL_STATE_REGISTRY:
         logger.debug(
             f"Parallel state {name!r} is already registered; returning the existing state without rebuilding."
@@ -576,6 +584,9 @@ def _init_parallel_state(
         "each extra parallel should correspond to a size, a placement and a name"
     )
 
+    if dp_mode == "hyper_fsdp2":
+        dp_mode = "fsdp2"
+
     # Reuse an already-built state for an identical topology (e.g. the omni
     # orchestrator builds one ParallelState per module, many of which share the
     # global topology). Building the device mesh / extra-parallel meshes creates
@@ -583,6 +594,7 @@ def _init_parallel_state(
     # the same order, so cache hits/misses are rank-consistent and no duplicate
     # groups are created. The key spans every field that shapes the mesh or the
     # state's behaviour (e.g. ``dp_mode`` is read by grad-clip).
+    extra_parallel_only = bool(extra_parallel_only and dp_mode == "fsdp2")
     cache_key = (
         dp_size,
         dp_replicate_size,
@@ -600,6 +612,7 @@ def _init_parallel_state(
         extra_parallel_names,
         async_enabled,
         skip_sp_gather_between_modules,
+        extra_parallel_only,
         npu_ep_hccl_buffer_mib,
         npu_ep_hccl_expansion_mode,
     )
@@ -748,6 +761,7 @@ def _init_parallel_state(
         extra_parallel_flat_device_mesh=extra_parallel_flat_device_mesh,
         async_enabled=async_enabled,
         skip_sp_gather_between_modules=skip_sp_gather_between_modules,
+        extra_parallel_only=extra_parallel_only,
     )
 
     if _PARALLEL_STATE is None:
@@ -766,6 +780,9 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
     should not be restating the mapping. Both a job's own mesh and a single
     model's come through here.
     """
+    extra_parallel_names, extra_parallel_sizes, extra_parallel_placement_innermost = (
+        accelerator.resolved_extra_parallel
+    )
     return _init_parallel_state(
         dp_size=accelerator.dp_size,
         dp_replicate_size=accelerator.dp_replicate_size,
@@ -775,12 +792,13 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
         cp_size=accelerator.cp_size,
         ulysses_size=accelerator.ulysses_size,
         allow_hybrid_cp=getattr(accelerator, "allow_hybrid_cp", False),
-        extra_parallel_sizes=accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=accelerator.extra_parallel_names,
+        extra_parallel_sizes=extra_parallel_sizes,
+        extra_parallel_placement_innermost=extra_parallel_placement_innermost,
+        extra_parallel_names=extra_parallel_names,
         dp_mode=accelerator.fsdp_config.fsdp_mode,
         async_enabled=accelerator.enable_async,
         skip_sp_gather_between_modules=accelerator.skip_sp_gather_between_modules,
+        extra_parallel_only=accelerator.fsdp_config.extra_parallel_only,
         npu_ep_hccl_buffer_mib=accelerator.npu_ep_hccl_buffer_mib,
         npu_ep_hccl_expansion_mode=accelerator.npu_ep_hccl_expansion_mode,
         name=name,

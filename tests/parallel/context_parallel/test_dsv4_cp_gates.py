@@ -61,8 +61,9 @@ def _enable_npu_cp(monkeypatch):
 
 
 def _npu_ops_for_cp() -> dict:
-    # Only the pair the gate admits matters here; a real CP run is the shipped NPU
-    # config with these two fields switched to ``eager``.
+    # The DSA selections ``eager`` and ``cann`` are both admitted under CP. The
+    # tests below start from ``eager`` and swap a field to ``cann`` (the shipped
+    # value) or to a rejected one.
     return {"dsa_indexer_implementation": "eager", "dsa_attention_implementation": "eager"}
 
 
@@ -164,7 +165,7 @@ def test_gate_allows_npu_dsv4_cp_with_eager_dsa_ops(monkeypatch):
 
 def test_gate_rejects_npu_dsv4_cp_without_resolved_ops(monkeypatch):
     _enable_npu_cp(monkeypatch)
-    with pytest.raises(NotImplementedError, match="dsa_indexer_implementation='eager'"):
+    with pytest.raises(NotImplementedError, match="dsa_indexer_implementation.*cann or eager"):
         check_context_parallel_supported(SimpleNamespace(model_type="deepseek_v4"))
 
 
@@ -176,10 +177,27 @@ def test_gate_rejects_dsv4_hybrid_ulysses_cp(monkeypatch):
 
 
 @pytest.mark.parametrize("field", ["dsa_indexer_implementation", "dsa_attention_implementation"])
-def test_gate_rejects_npu_dsv4_cp_with_a_non_cp_aware_dsa_operator(monkeypatch, field):
+def test_gate_allows_npu_dsv4_cp_with_cann_dsa_ops(monkeypatch, field):
+    """The CANN adapters take the query offset, so they serve CP's geometry too."""
     _enable_npu_cp(monkeypatch)
     ops = _npu_ops_for_cp()
     ops[field] = "cann"
+
+    check_context_parallel_supported(_dsv4_with_ops(ops))
+
+
+def test_gate_allows_npu_dsv4_cp_with_both_cann_dsa_ops(monkeypatch):
+    _enable_npu_cp(monkeypatch)
+    ops = dict.fromkeys(_npu_ops_for_cp(), "cann")
+
+    check_context_parallel_supported(_dsv4_with_ops(ops))
+
+
+@pytest.mark.parametrize("field", ["dsa_indexer_implementation", "dsa_attention_implementation"])
+def test_gate_rejects_npu_dsv4_cp_with_a_non_cp_aware_dsa_operator(monkeypatch, field):
+    _enable_npu_cp(monkeypatch)
+    ops = _npu_ops_for_cp()
+    ops[field] = "tilelang"
 
     with pytest.raises(NotImplementedError, match=field):
         check_context_parallel_supported(_dsv4_with_ops(ops))
@@ -191,7 +209,7 @@ def test_gate_rejects_a_native_config_adapted_by_the_builder(monkeypatch):
     load_model = Mock(return_value=torch.nn.Identity())
     monkeypatch.setattr(auto_module, "get_loader", lambda config: SimpleNamespace(load_model=load_model))
     ops = _npu_ops_for_cp()
-    ops["dsa_attention_implementation"] = "cann"
+    ops["dsa_attention_implementation"] = "tilelang"
 
     with pytest.raises(NotImplementedError, match="dsa_attention_implementation"):
         auto_module.build_foundation_model(

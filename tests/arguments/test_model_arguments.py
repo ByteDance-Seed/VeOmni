@@ -74,6 +74,18 @@ def test_state_offload_rejects_fsdp_cpu_offload():
         )
 
 
+def test_optimizer_selection_is_validated_before_model_loading():
+    with pytest.raises(ValueError, match="Unknown model.optimizer.type"):
+        OptimizerConfig(type="admaw")
+    with pytest.raises(ValueError, match="Hyper FSDP does not support"):
+        ModelArguments(
+            model_path="weights",
+            optimizer=OptimizerConfig(type="anyprecision_adamw"),
+            accelerator=AcceleratorConfig(fsdp_config=FSDPConfig(fsdp_mode="hyper_fsdp2")),
+        )
+    assert ModelArguments(model_path="weights", optimizer=OptimizerConfig(type="anyprecision_adamw"))
+
+
 @pytest.mark.parametrize(
     "kwargs,compile_enabled",
     [
@@ -102,7 +114,7 @@ def test_fp8_all_gather_validates_policies_only_for_matching_experts(
     assert config.expert_weight_fp8_all_gather is True
     model = nn.Sequential(nn.Linear(2, 2))
     if has_experts:
-        model[0].veomni_moe = SimpleNamespace(impl="deepgemm_fp8")
+        model[0].veomni_moe = SimpleNamespace(impl="deepgemm")
     calls = []
     monkeypatch.setattr(
         torch_parallelize,
@@ -169,7 +181,7 @@ def test_fp8_all_gather_still_validates_selected_experts():
     from veomni.distributed.fsdp2.fp8_all_gather import register_deepgemm_fp8_all_gather
 
     module = nn.Linear(2, 2)
-    module.veomni_moe = SimpleNamespace(impl="deepgemm_fp8")
+    module.veomni_moe = SimpleNamespace(impl="deepgemm")
     with pytest.raises(ValueError, match="two merged expert weights"):
         register_deepgemm_fp8_all_gather(module)
 
