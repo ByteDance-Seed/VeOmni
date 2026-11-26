@@ -132,14 +132,25 @@ custom autograd `Function` that chains kernels.
 
 ## What stays refused
 
-CUDA Graph replay and sequence parallelism, under SeedOmni: replay needs one
+CUDA Graph replay, sequence parallelism, and async Ulysses. Replay needs one
 `cudagraph_mark_step_begin()` per micro-batch across the composed graph, which
-`OmniTrainer` does not make, and Ulysses slices activations the graph edges reorder.
-Those are `backend='cudagraphs'`, `mode='reduce-overhead'`, `mode='max-autotune'`,
-`ulysses_size>1`, `cp_size>1`, `enable_async`, and they are rejected when the
-launcher config is parsed, before any model is built.
+`OmniTrainer` does not make; Ulysses and context parallelism slice activations the
+graph edges of a compiled block reorder; async Ulysses pipelines the same exchanges
+across steps. Those are `backend='cudagraphs'`, `mode='reduce-overhead'`,
+`mode='max-autotune'`, `ulysses_size>1`, `cp_size>1`, and `enable_async`.
 
-Compiling also requires FSDP2 and CUDA; that is checked once per build in
+They are refused in two places, at two different times:
+
+- **Under SeedOmni** the launcher config is checked when it is parsed, before any
+  model is built (`_validate_omni_accelerator`), so a per-module overlay cannot slip
+  past it either.
+- **Single-model trainers** (text and VLM) check the same combinations at build time
+  in `validate_compile_runtime`, before the first `fully_shard`. This applies to text
+  models as well as VLM ones — no `torch_compile` + sequence-parallel path exists in
+  this repo yet, for either, and refusing it uniformly is deliberate rather than a
+  claim that one of them works.
+
+Compiling also requires FSDP2 and CUDA; that is checked in the same
 `validate_compile_runtime`, not per model. A selection Inductor cannot lower — the
 `torchao_mxfp4` rows emit `float8_e8m0fnu` scale tensors, which have no Inductor
 lowering — is rejected up front by config field rather than failing at runtime.

@@ -139,10 +139,10 @@ def validate_compile_runtime(
             "communication may be captured inside compiled blocks."
         )
     # Ulysses/CP slice activations along the sequence dimension, which the graph
-    # edges of a compiled block reorder; async activation offload moves them out
-    # from under the compiled region. Both are refused for the same reason under
-    # SeedOmni (``_validate_omni_accelerator``), so the single-model path has to
-    # refuse them too rather than silently compiling a block that cannot run.
+    # edges of a compiled block reorder; async Ulysses pipelines the same
+    # exchanges across steps. Both are refused for the same reason under SeedOmni
+    # (``_validate_omni_accelerator``), so the single-model path refuses them too
+    # rather than silently compiling a block that cannot run.
     if sequence_parallel_enabled:
         raise RuntimeError(
             "model.accelerator.torch_compile.enable does not support sequence parallelism: "
@@ -150,7 +150,7 @@ def validate_compile_runtime(
         )
     if async_parallel_enabled:
         raise RuntimeError(
-            "model.accelerator.torch_compile.enable does not support async activation offload: "
+            "model.accelerator.torch_compile.enable does not support async Ulysses: "
             "set accelerator.enable_async=False."
         )
     validate_compile_config_for_fsdp2(compile_config, enable_reshard_after_forward)

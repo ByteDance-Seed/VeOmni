@@ -781,7 +781,7 @@ def parallelize_model_fsdp2(
             any_extra_parallel_enabled=parallel_state.any_extra_parallel_enabled,
             enable_reshard_after_forward=enable_reshard_after_forward,
             sequence_parallel_enabled=parallel_state.sp_enabled,
-            async_parallel_enabled=parallel_state.async_enabled is not False,
+            async_parallel_enabled=bool(parallel_state.async_enabled),
         )
 
         compiled_count = compile_decoder_blocks(model, compile_config)

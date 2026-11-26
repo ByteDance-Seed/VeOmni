@@ -647,7 +647,7 @@ def test_validate_compile_config_accepts_cuda_graphs_without_forward_reshard():
         # used to hold them and it is gone, so SeedOmni's parse-time check is no
         # longer the only guard a run passes through.
         ({"sequence_parallel_enabled": True}, "does not support sequence parallelism"),
-        ({"async_parallel_enabled": True}, "does not support async activation offload"),
+        ({"async_parallel_enabled": True}, "does not support async Ulysses"),
     ],
 )
 def test_validate_compile_runtime_rejects_unsupported_contracts(monkeypatch, overrides, error):
