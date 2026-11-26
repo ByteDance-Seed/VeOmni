@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.distributed.context_parallel.sharding import (
     empty_compressed_rows,
     local_window_range,
@@ -27,6 +28,9 @@ from veomni.distributed.context_parallel.sharding import (
     rebase_window_indices,
     window_owner_counts,
 )
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 # Canonical fixture: cp_size=4, seq_len=64, L=16, R=4, samples [(0,38),(38,64)].

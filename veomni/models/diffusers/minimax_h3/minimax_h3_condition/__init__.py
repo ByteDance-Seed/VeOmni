@@ -1,4 +1,6 @@
-from ....loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+"""Register the local MiniMax H3 condition config and model."""
+
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
 @MODEL_CONFIG_REGISTRY.register("MiniMaxH3ConditionModel")
@@ -9,7 +11,7 @@ def register_minimax_h3_condition_config():
 
 
 @MODELING_REGISTRY.register("MiniMaxH3ConditionModel")
-def register_minimax_h3_condition_modeling(architecture: str = None):
+def register_minimax_h3_condition_modeling(_architecture: str | None = None):
     from .modeling_minimax_h3_condition import MiniMaxH3ConditionModel
 
     return MiniMaxH3ConditionModel

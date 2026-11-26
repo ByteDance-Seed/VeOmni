@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ....lora.target_mapping import convert_fused_moe_lora_targets
-from ....utils.device import IS_NPU_AVAILABLE
-from ...loader import MODELING_REGISTRY
+
+"""Qwen3-MoE modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.lora.target_mapping import convert_fused_moe_lora_targets
+from veomni.models.registry import MODELING_REGISTRY
 
 
 def _convert_qwen3_moe_wrapped_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
@@ -34,31 +36,33 @@ def _convert_qwen3_moe_model_lora_targets_to_parameters(_model, lora_modules, ta
     )
 
 
+def _convert_qwen3_moe_qa_lora_targets_to_parameters(_model, lora_modules, target_parameter_patterns):
+    return convert_fused_moe_lora_targets(
+        lora_modules,
+        target_parameter_patterns,
+        "transformer.layers.*.mlp.experts.gate_up_proj",
+        "transformer.layers.*.mlp.experts.down_proj",
+    )
+
+
 @MODELING_REGISTRY.register("qwen3_moe")
 def register_qwen3_moe_modeling(architecture: str):
     from .checkpoint_tensor_converter import (
         convert_qwen3_moe_fqn_to_index_mapping,
         create_qwen3_moe_checkpoint_tensor_converter,
     )
-
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_qwen3_moe_npu import (
-            Qwen3MoeForCausalLM,
-            Qwen3MoeForQuestionAnswering,
-            Qwen3MoeForTokenClassification,
-            Qwen3MoeModel,
-        )
-    else:
-        from .generated.patched_modeling_qwen3_moe_gpu import (
-            Qwen3MoeForCausalLM,
-            Qwen3MoeForQuestionAnswering,
-            Qwen3MoeForTokenClassification,
-            Qwen3MoeModel,
-        )
+    from .modeling_qwen3_moe import (
+        Qwen3MoeForCausalLM,
+        Qwen3MoeForQuestionAnswering,
+        Qwen3MoeForSequenceClassification,
+        Qwen3MoeForTokenClassification,
+        Qwen3MoeModel,
+    )
 
     for model_cls in (
         Qwen3MoeForCausalLM,
         Qwen3MoeForQuestionAnswering,
+        Qwen3MoeForSequenceClassification,
         Qwen3MoeForTokenClassification,
         Qwen3MoeModel,
     ):
@@ -70,11 +74,16 @@ def register_qwen3_moe_modeling(architecture: str):
     Qwen3MoeModel._convert_lora_targets_to_parameters = staticmethod(
         _convert_qwen3_moe_model_lora_targets_to_parameters
     )
+    Qwen3MoeForQuestionAnswering._convert_lora_targets_to_parameters = staticmethod(
+        _convert_qwen3_moe_qa_lora_targets_to_parameters
+    )
 
     if "ForCausalLM" in architecture:
         return Qwen3MoeForCausalLM
     elif "ForTokenClassification" in architecture:
         return Qwen3MoeForTokenClassification
+    elif "ForSequenceClassification" in architecture:
+        return Qwen3MoeForSequenceClassification
     elif "ForQuestionAnswering" in architecture:
         return Qwen3MoeForQuestionAnswering
     elif "Model" in architecture:

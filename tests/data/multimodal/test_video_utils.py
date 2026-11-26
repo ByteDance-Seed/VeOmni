@@ -10,6 +10,7 @@ import PIL.Image
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.data.multimodal import video_utils
 from veomni.data.multimodal.video_utils import (
     _apply_dynamic_video_max_pixels,
@@ -22,6 +23,9 @@ from veomni.data.multimodal.video_utils import (
     smart_video_nframes,
 )
 from veomni.utils.import_utils import is_ffmpeg_available
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 # Make sure to place a sample.mp4 file in tests/data/assets

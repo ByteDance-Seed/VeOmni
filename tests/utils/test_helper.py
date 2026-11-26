@@ -19,6 +19,23 @@ from veomni.utils.device import get_device_type, get_dist_comm_backend, get_torc
 logger = helper.create_logger(__name__)
 
 
+def test_compute_gemma3_image_seqlens_from_pixel_values():
+    config = SimpleNamespace(model_type="gemma3", vision_config=SimpleNamespace(patch_size=14))
+    micro_batch = {"pixel_values": torch.empty(2, 3, 896, 896)}
+
+    assert helper._compute_image_seqlens(micro_batch, config) == [4096, 4096]
+
+
+def test_compute_image_seqlens_prefers_grid_metadata():
+    config = SimpleNamespace(model_type="gemma3", vision_config=SimpleNamespace(patch_size=14))
+    micro_batch = {
+        "image_grid_thw": torch.tensor([[1, 12, 10], [2, 8, 8]]),
+        "pixel_values": torch.empty(2, 3, 896, 896),
+    }
+
+    assert helper._compute_image_seqlens(micro_batch, config) == [120, 64, 64]
+
+
 def test_environ_meter_passes_supported_lora_config(monkeypatch):
     calls = []
 
@@ -102,6 +119,9 @@ def run_environ_meter(args):
     dist.init_process_group(backend=get_dist_comm_backend(), world_size=world_size, rank=rank)
 
     config = Qwen2Config()
+    extra_parallel_names, extra_parallel_sizes, extra_parallel_placement_innermost = (
+        args.model.accelerator.resolved_extra_parallel
+    )
     _init_parallel_state(
         dp_size=args.model.accelerator.dp_size,
         dp_replicate_size=args.model.accelerator.dp_replicate_size,
@@ -110,9 +130,9 @@ def run_environ_meter(args):
         pp_size=args.model.accelerator.pp_size,
         cp_size=args.model.accelerator.cp_size,
         ulysses_size=args.model.accelerator.ulysses_size,
-        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=args.model.accelerator.extra_parallel_names,
+        extra_parallel_sizes=extra_parallel_sizes,
+        extra_parallel_placement_innermost=extra_parallel_placement_innermost,
+        extra_parallel_names=extra_parallel_names,
         dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
         async_enabled=args.model.accelerator.enable_async,
     )

@@ -31,6 +31,7 @@ Our guiding principles when building VeOmni are:
 </div>
 
 ## 🔥 Latest News
+- [2026/11] VeOmni now supports [HyperParallel](https://github.com/mindspore-ai/hyper-parallel) as an optional acceleration backend for training on Ascend SuperPoD.
 - [2025/11] Our Paper [OmniScale: Scaling Any Modality Model Training with Model-Centric Distributed Recipe Zoo](https://arxiv.org/abs/2508.02317) was accepted by AAAI 2026
 - [2025/09] We released VeOmni's first official version, [v0.1.0](https://github.com/ByteDance-Seed/VeOmni/pull/75).
 - [2025/08] We release [VeOmni Tech report](https://arxiv.org/abs/2508.02317) and open the [WeChat group](./docs/assets/wechat.png). Feel free to join us!
@@ -45,11 +46,13 @@ Our guiding principles when building VeOmni are:
 - Compatible with HuggingFace Transformers models. [Qwen3](https://veomni.readthedocs.io/en/latest/examples/qwen3.html), [Qwen3-VL](https://veomni.readthedocs.io/en/latest/examples/qwen3_vl.html), Qwen3-Moe, etc
 - Dynamic batching strategy, Omnidata processing
 - [**Torch Distributed Checkpoint**](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html) for checkpoint.
-- Support for NVIDIA GPU, AMD ROCm, and Ascend NPU training.
+- Support for NVIDIA GPU, AMD ROCm, Ascend NPU, and Cambricon MLU training.
+- Optional [**HyperParallel**](docs/key_features/hyper_parallel.md) acceleration backend for Ascend SuperPoD training, providing FSDP/HSDP and distributed Muon.
 - Experiment tracking with wandb
 
 ## 📝 Upcoming Features and Changes
 
+- Proposed HyperParallel optimizations for Ascend NPU training, including high-performance modules and MegaMoE ([RFC #1413](https://github.com/ByteDance-Seed/VeOmni/issues/1413)).
 - VeOmni v0.2 Roadmap https://github.com/ByteDance-Seed/VeOmni/issues/268, https://github.com/ByteDance-Seed/VeOmni/issues/271
 - Vit balance tool https://github.com/ByteDance-Seed/VeOmni/issues/280
 - Validation dataset during training https://github.com/ByteDance-Seed/VeOmni/issues/247
@@ -70,7 +73,7 @@ Our guiding principles when building VeOmni are:
 | Model                                                    | Model size                    | Example config File                                                   |
 | -------------------------------------------------------- | ----------------------------- | ----------------------------------------------------------------------|
 | [DeepSeek2.5/3/R1](https://huggingface.co/deepseek-ai)   | 236B/671B                     | [deepseek.yaml](configs/text/deepseek.yaml)                           |
-| [DeepSeek-V4](https://huggingface.co/deepseek-ai)        | Checkpoint-dependent          | [deepseek.yaml](configs/text/deepseek.yaml) template; DSA/mHC default to eager, with optional [SM90+ TileLang/TileKernels backends](docs/design/kernel_selection.md#deepseek-v4-dsa-and-mhc) |
+| [DeepSeek-V4](https://huggingface.co/deepseek-ai)        | Checkpoint-dependent          | [deepseek.yaml](configs/text/deepseek.yaml) template; DSA/mHC default to eager, with optional [SM90+ TileLang/TileKernels backends](docs/design/op_selection.md#deepseek-v4-dsa-and-mhc) |
 | [Llama3-3.3](https://huggingface.co/meta-llama)          | 1B/3B/8B/70B                  | [llama3.yaml](configs/text/llama3.yaml)                               |
 | [Qwen2-3](https://huggingface.co/Qwen)                   | 0.5B/1.5B/3B/7B/14B/32B/72B/  | [qwen2_5.yaml](configs/text/qwen2_5.yaml)                             |
 | [Qwen2-3 VL/QVQ](https://huggingface.co/Qwen)            | 2B/3B/7B/32B/72B              | [qwen3_vl_dense.yaml](configs/multimodal/qwen3_vl/qwen3_vl_dense.yaml)|
@@ -78,7 +81,11 @@ Our guiding principles when building VeOmni are:
 | [Qwen3-MoE](https://huggingface.co/Qwen)                 | 30BA3B/235BA22B               | [qwen3-moe.yaml](configs/text/qwen3-moe.yaml)                         |
 | [GPT-OSS](https://huggingface.co/openai/gpt-oss-120b)    | 120B                          | [gpt_oss_120b_lora_ep4.yaml](configs/text/gpt_oss_120b_lora_ep4.yaml) |
 | [Qwen2-3 Omni](https://huggingface.co/Qwen)              | 7B/30BA3B                     | [qwen25_omni.yaml](configs/multimodal/qwen25_omni/qwen25_omni.yaml)   |
+| [Kimi K3](docs/examples/kimi_k3.md)                      | Checkpoint-dependent          | [kimi_k3_vl_ascendc.yaml](configs/multimodal/kimi_k3/kimi_k3_vl_ascendc.yaml) |
 | [Wan](https://huggingface.co/Wan-AI)                     | Wan2.1-I2V-14B-480P           | [wan_sft.yaml](configs/dit/wan_sft.yaml)                              |
+| [MiniMax H3](docs/examples/minimax_h3.md)                | Checkpoint-dependent          | [FL2VA](configs/dit/minimax_h3_fl2va_offline.yaml); [Ref2VA](configs/dit/minimax_h3_ref2va_cfg_offline.yaml) |
+| [MiniMax H3-Image](docs/examples/minimax_h3_image.md)    | Checkpoint-dependent          | T2I/edit inference; experimental online/offline T2I fine-tuning       |
+| [HunyuanVideo 1.5](docs/examples/hunyuanvideo15.md) | 480p T2V (experimental; CPU and NPU backbone checks) | [hunyuanvideo15_t2v.yaml](configs/dit/hunyuanvideo15_t2v.yaml) |
 | [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3)     | Checkpoint-dependent          | [ltx2_av_lora.yaml](configs/dit/ltx2_av_lora.yaml); [training guide](docs/examples/ltx-2.3.md) |
 
 Support new models to VeOmni see [Support New Models](https://veomni.readthedocs.io/en/latest/usage/support_new_models/guide_and_checklist.html)

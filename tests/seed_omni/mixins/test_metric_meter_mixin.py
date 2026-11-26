@@ -17,9 +17,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.models.seed_omni import MetricMeterMixin
 from veomni.utils import helper, omni_helper
 from veomni.utils.omni_helper import OmniEnvironMeter
+
+
+_CI_CPU_2 = LaunchSpec(nproc=2, device="cpu")
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 class MeteredModule(MetricMeterMixin):
@@ -159,6 +165,26 @@ def test_consumed_tokens_accumulate_per_module_across_steps(single_process_meter
 
     assert meter.consume_tokens == {"backbone": 200}
     assert meter.consume_chunks == 2
+
+
+def test_add_counts_a_packed_batch_by_its_packed_sequences(single_process_meter):
+    """A packed batch carries no conversation carrier, so counting `conversation_list`
+    alone reports zero samples for a whole packed run. `packed_cu_seqlens` has one
+    boundary per sample and does not depend on multi-source metadata being attached."""
+    meter = single_process_meter
+    meter.add({"packed_input_ids": torch.zeros(1, 8, dtype=torch.long), "packed_cu_seqlens": torch.tensor([0, 8, 16])})
+    assert meter.batch_count == 2
+
+    meter.add({"packed_input_ids": torch.zeros(1, 8, dtype=torch.long), "packed_cu_seqlens": torch.tensor([0, 8])})
+    assert meter.batch_count == 3
+
+
+def test_add_counts_a_packed_batch_with_no_boundaries_as_one_sample(single_process_meter):
+    """A hand-built batch without `packed_cu_seqlens` is still one micro-batch of
+    samples, not zero."""
+    meter = single_process_meter
+    meter.add({"packed_input_ids": torch.zeros(1, 8, dtype=torch.long)})
+    assert meter.batch_count == 1
 
 
 def test_step_resets_the_per_step_sample_accumulator(single_process_meter):
@@ -308,8 +334,11 @@ def _two_rank_step_main(rank: int, rendezvous: str, out_dir: str) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.launch_plan(provider=_CI_CPU_2)
 def test_step_reduces_by_module_name_and_agrees_on_the_multisource_module(tmp_path):
-    mp.spawn(_two_rank_step_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=2, join=True)
+    mp.spawn(
+        _two_rank_step_main, args=(str(tmp_path / "rendezvous"), str(tmp_path)), nprocs=_CI_CPU_2.nproc, join=True
+    )
 
     results = [json.loads((tmp_path / f"rank{rank}.json").read_text()) for rank in range(2)]
     for rank, result in enumerate(results):

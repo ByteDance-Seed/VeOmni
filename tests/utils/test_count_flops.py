@@ -20,8 +20,12 @@ from unittest.mock import patch
 
 import pytest
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.lora.config import LORA_MODULES_BY_MODEL_TYPE, VeOmniLoraConfig
 from veomni.utils.count_flops import VeomniFlopsCounter, get_device_flops
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _to_namespace(value):
@@ -69,6 +73,351 @@ def test_b200_device_flops():
         assert get_device_flops() == 2382.0
 
 
+def _minimax_h3_config():
+    return SimpleNamespace(
+        model_type="MiniMaxH3DiTModel",
+        condition_model_type="MiniMaxH3ConditionModel",
+        hidden_size=8,
+        num_attention_heads=2,
+        attention_head_dim=4,
+        ffn_hidden_size=16,
+        num_layers=2,
+        token_refiner_num_layers=1,
+    )
+
+
+def _h3_packed(seq_len, text_len):
+    import torch
+
+    return {
+        "seq_len": seq_len,
+        "text_len": text_len,
+        "text_pos": torch.arange(text_len),
+        "img_pos": torch.arange(seq_len - text_len),
+        "audio_pos": torch.empty(0, dtype=torch.long),
+    }
+
+
+def test_minimax_h3_flops_counts_each_packed_sequence(mock_device_flops):
+    counter = VeomniFlopsCounter(_minimax_h3_config())
+    flops, promised = counter.estimate_flops([4, 2], 2.0, model_metadata={"h3_text_seqlens": [2, 1]})
+    # Main projections 46080, attention 3840, refiner 11520 + 480 FLOPs.
+    assert flops == pytest.approx(30960 / 1e12)
+    assert promised == 1000.0
+    with_optional_arg, _ = counter.estimate_flops(
+        [4, 2], 2.0, model_metadata={"h3_text_seqlens": [2, 1]}, freeze_vit=False
+    )
+    assert with_optional_arg == flops
+    empty, _ = counter.estimate_flops([], 2.0, model_metadata={"h3_text_seqlens": []})
+    assert empty == 0
+    empty_without_metadata, _ = counter.estimate_flops([], 2.0)
+    assert empty_without_metadata == 0
+    with pytest.raises(ValueError, match="one text length"):
+        counter.estimate_flops([4], 2.0)
+    with pytest.raises(ValueError, match="one text length"):
+        counter.estimate_flops([4, 2], 2.0, model_metadata={"h3_text_seqlens": [2]})
+    with pytest.raises(ValueError, match="within packed"):
+        counter.estimate_flops([4], 2.0, model_metadata={"h3_text_seqlens": [5]})
+    with pytest.raises(ValueError, match="positive"):
+        counter.estimate_flops([4], 0, model_metadata={"h3_text_seqlens": [2]})
+    with patch("veomni.utils.count_flops.logger.warning_rank0"):
+        unsupported, _ = counter.estimate_flops([4], 2.0, lora_config=_lora_config(8, ["q_proj"]))
+    assert unsupported == 0
+
+
+def test_minimax_h3_meter_excludes_legacy_tail_padding(monkeypatch, mock_device_flops):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.packed_sequence import build_packed_fl2va
+    from veomni.utils import helper
+
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
+    monkeypatch.setattr(helper, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(helper, "compute_device_memory_metrics", lambda: {})
+    meter = helper.EnvironMeter(
+        config=_minimax_h3_config(),
+        global_batch_size=1,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    compact = build_packed_fl2va(text_len=3, latent_t=2, latent_h=4, latent_w=4, audio_t=2, keyframe_indices=[])
+    legacy = dict(compact, seq_len=compact["seq_len"] + 28)
+    meter.add({"packed": [compact]})
+    compact_metrics = meter.step(delta_time=2.0, global_step=1)
+    meter.add({"packed": [legacy]})
+    legacy_metrics = meter.step(delta_time=2.0, global_step=2)
+    assert legacy_metrics["mfu"] == pytest.approx(compact_metrics["mfu"])
+    assert legacy_metrics["training/avg_sample_seq_len"] == compact["seq_len"]
+    assert meter.consume_tokens == 2 * compact["seq_len"]
+
+
+@pytest.mark.parametrize("with_references", [False, True], ids=["t2i", "with-references"])
+def test_minimax_h3_image_meter_counts_offline_cache(monkeypatch, mock_device_flops, with_references):
+    import torch
+
+    from veomni.trainer.dit_trainer import DiTDataCollator
+    from veomni.utils import helper
+
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
+    monkeypatch.setattr(helper, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(helper, "compute_device_memory_metrics", lambda: {})
+    config = _minimax_h3_config()
+    config.condition_model_type = "MiniMaxH3ImageConditionModel"
+    config.audio_enabled = False
+    meter = helper.EnvironMeter(
+        config=config,
+        global_batch_size=1,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    row = {
+        "prompt_embeds": torch.zeros(1, 3, 8),
+        "text_token_tags": torch.ones(3, dtype=torch.long),
+        "clean_latents": torch.zeros(1, 24, 4, 6),
+    }
+    if with_references:
+        row["reference_latents"] = [torch.zeros(1, 24, 2, 4), torch.zeros(1, 24, 6, 4)]
+    expected_tokens = 17 if with_references else 9
+
+    meter.add(DiTDataCollator()([row]))
+    assert meter.batch_seqlens == [expected_tokens]
+    assert meter._model_metadata["h3_text_seqlens"] == [3]
+    metrics = meter.step(delta_time=2.0, global_step=1)
+    expected_flops, promised = VeomniFlopsCounter(config).estimate_flops(
+        [expected_tokens], 2.0, model_metadata={"h3_text_seqlens": [3]}
+    )
+    assert expected_flops > 0
+    assert metrics["mfu"] == pytest.approx(expected_flops / promised, rel=1e-6, abs=0)
+    assert metrics["tokens_per_second(M)"] == pytest.approx(expected_tokens / 2e6)
+    assert metrics["consumed_chunk_num"] == 1
+
+
+@pytest.mark.parametrize("video_field", ["clean_latents", "reference_latents"])
+def test_minimax_h3_image_meter_skips_video_latents(video_field):
+    import torch
+
+    from veomni.utils.flops_meter import get_flops_metadata_callback
+
+    config = _minimax_h3_config()
+    config.condition_model_type = "MiniMaxH3ImageConditionModel"
+    image = torch.zeros(1, 24, 8, 12)
+    video = torch.zeros(1, 24, 3, 8, 12)
+    sample = {"prompt_embeds": [torch.zeros(1, 5, 16)], "clean_latents": [image], "reference_latents": [[image]]}
+    invalid = dict(sample, **{video_field: [video] if video_field == "clean_latents" else [[video]]})
+    assert get_flops_metadata_callback(config)([invalid, sample]) == ([53], {"h3_text_seqlens": [5]})
+
+
+def test_minimax_h3_meter_accumulates_and_clears_packed_lengths(monkeypatch, mock_device_flops):
+    from veomni.utils import helper
+
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
+    monkeypatch.setattr(helper, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(helper, "compute_device_memory_metrics", lambda: {})
+    meter = helper.EnvironMeter(
+        config=_minimax_h3_config(),
+        global_batch_size=3,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    meter.add({"packed": [_h3_packed(4, 2)]})
+    meter.add([{"packed": _h3_packed(2, 1)}, {"packed": _h3_packed(3, 1)}])
+    assert meter.batch_seqlens == [4, 2, 3]
+    assert meter._model_metadata["h3_text_seqlens"] == [2, 1, 1]
+    metrics = meter.step(delta_time=2.0, global_step=1)
+    assert metrics["mfu"] > 0
+    assert meter.batch_seqlens == [] and meter._model_metadata == {}
+    meter.add({"packed": _h3_packed(5, 2)})
+    assert meter.batch_seqlens == [5] and meter._model_metadata["h3_text_seqlens"] == [2]
+    meter.add({})
+    metrics = meter.step(delta_time=2.0, global_step=2)
+    assert metrics["mfu"] > 0
+    meter.add([{}, {"packed": _h3_packed(4, 2)}])
+    assert meter.step(delta_time=2.0, global_step=3)["mfu"] > 0
+    meter.add({})
+    assert meter.step(delta_time=2.0, global_step=4)["mfu"] == 0
+
+
+def test_minimax_h3_missing_remote_metadata_keeps_available_flops(monkeypatch, mock_device_flops):
+    from veomni.utils import helper
+
+    def fake_all_reduce(values, **kwargs):
+        if isinstance(values, tuple):
+            assert len(values) == 3
+            return values  # The other rank contributes no lengths or FLOPs.
+        return values
+
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 2)
+    monkeypatch.setattr(helper, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(helper, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(helper, "compute_device_memory_metrics", lambda: {})
+    meter = helper.EnvironMeter(
+        config=_minimax_h3_config(),
+        global_batch_size=2,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    meter.add({"packed": _h3_packed(4, 2)})
+    metrics = meter.step(delta_time=1.0, global_step=1)
+    assert metrics["mfu"] > 0
+    assert metrics["training/avg_sample_seq_len"] == 4
+
+
+@pytest.mark.parametrize("missing_field", ["text_len", "seq_len"])
+def test_minimax_h3_missing_length_defers_to_model(monkeypatch, mock_device_flops, missing_field):
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core.cfg_conditioning import packed_seq_params
+    from veomni.utils import helper
+
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
+    monkeypatch.setattr(helper, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(helper, "compute_device_memory_metrics", lambda: {})
+    meter = helper.EnvironMeter(
+        config=_minimax_h3_config(),
+        global_batch_size=2,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    malformed = _h3_packed(4, 2)
+    del malformed[missing_field]
+    meter.add({"packed": [_h3_packed(4, 2), malformed]})
+    assert meter.step(delta_time=1.0, global_step=1)["mfu"] == 0
+    with pytest.raises(KeyError, match=missing_field):
+        packed_seq_params(malformed, "cpu")
+    meter.add({"packed": [_h3_packed(4, 2)]})
+    assert meter.step(delta_time=1.0, global_step=2)["mfu"] > 0
+
+
+@pytest.mark.parametrize("defect", ["missing_position", "none_position", "invalid_length", "invalid_item"])
+def test_minimax_h3_invalid_packed_skips_mfu(monkeypatch, mock_device_flops, defect):
+    from veomni.utils import helper
+
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
+    monkeypatch.setattr(helper, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(helper, "compute_device_memory_metrics", lambda: {})
+    meter = helper.EnvironMeter(
+        config=_minimax_h3_config(),
+        global_batch_size=2,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    malformed = _h3_packed(4, 2)
+    if defect == "missing_position":
+        del malformed["img_pos"]
+    elif defect == "none_position":
+        malformed["img_pos"] = None
+    elif defect == "invalid_length":
+        malformed["text_len"] = 5
+    else:
+        malformed = None
+    meter.add({"packed": [_h3_packed(4, 2), malformed]})
+    assert meter.step(delta_time=1.0, global_step=1)["mfu"] == 0
+    meter.add({"packed": [_h3_packed(4, 2)]})
+    assert meter.step(delta_time=1.0, global_step=2)["mfu"] > 0
+
+
+def test_registered_flops_metadata_callback_handles_step(monkeypatch, mock_device_flops):
+    from veomni.utils import flops_meter, helper
+
+    def extract_metadata(batch):
+        if "text_lengths" not in batch:
+            return batch["lengths"], {}
+        return batch["lengths"], {"text_lengths": batch["text_lengths"]}
+
+    monkeypatch.setitem(flops_meter.FLOPS_METADATA_CALLBACKS, "ExampleDiT", extract_metadata)
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(helper, "all_reduce", lambda values, **kwargs: values)
+    monkeypatch.setattr(helper, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(helper, "compute_device_memory_metrics", lambda: {})
+    meter = helper.EnvironMeter(
+        config=SimpleNamespace(model_type="ExampleDiT", condition_model_type="ExampleCondition"),
+        global_batch_size=1,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    calls = []
+
+    def estimate(tokens_sum, lengths, delta_time, model_metadata=None):
+        text_lengths = None if model_metadata is None else list(model_metadata["text_lengths"])
+        calls.append((tokens_sum, list(lengths), delta_time, text_lengths))
+        return 0 if text_lengths is None else 100
+
+    meter.estimate_flops.__self__.estimate_func["ExampleDiT"] = estimate
+    meter.add({"lengths": [4], "text_lengths": [2]})
+    meter.add({"lengths": [6], "text_lengths": [3]})
+    assert meter.step(delta_time=1.0, global_step=1)["mfu"] == pytest.approx(0.1)
+    assert calls == [(10, [4, 6], 1.0, [2, 3])]
+    assert meter._model_metadata == {}
+    meter.add({"lengths": [5], "text_lengths": [1]})
+    assert meter.step(delta_time=2.0, global_step=2)["mfu"] == pytest.approx(0.1)
+    assert calls[-1] == (5, [5], 2.0, [1])
+    assert meter._model_metadata == {}
+    meter.add({"lengths": []})
+    assert meter.step(delta_time=1.0, global_step=3)["mfu"] == 0
+    assert calls[-1] == (0, [], 1.0, None)
+    assert meter._model_metadata == {}
+    meter.add({"lengths": [7], "text_lengths": [4]})
+    assert meter.step(delta_time=1.0, global_step=4)["mfu"] == pytest.approx(0.1)
+    assert calls[-1] == (7, [7], 1.0, [4])
+
+
+def test_hf_model_keeps_original_metadata_path(monkeypatch, mock_device_flops):
+    import torch
+
+    from veomni.utils import flops_meter, helper
+
+    def extract_metadata(batch):
+        pytest.fail("HF models should not use the DiT metadata callback")
+
+    monkeypatch.setitem(flops_meter.FLOPS_METADATA_CALLBACKS, "ExampleHF", extract_metadata)
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 1)
+    meter = helper.EnvironMeter(
+        config=SimpleNamespace(model_type="ExampleHF"),
+        global_batch_size=1,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    meter.enable_multisource = True
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+        "labels": torch.tensor([[1, 2, 3, 4]]),
+        "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+        "image_grid_thw": torch.tensor([[1, 2, 2]]),
+        "ds_idx": 1,
+        "source_name": "example",
+    }
+    meter.add(batch)
+    assert meter.batch_seqlens == [3]
+    assert meter._model_metadata == {}
+    assert meter._flops_metadata_callback is None
+    assert meter.images_seqlens == [4]
+    assert len(meter._batch_token_stats) == 1
+    assert meter.batch_ds_idx == [1]
+    assert "ds_idx" not in batch and "source_name" not in batch
+
+
+@pytest.mark.parametrize(
+    "model_type", ["WanTransformer3DModel", "QwenImageTransformer2DModel", "LTXVideoTransformerModel", "OtherDiT"]
+)
+def test_unregistered_dit_uses_default_metadata_callback(monkeypatch, mock_device_flops, model_type):
+    import torch
+
+    from veomni.utils import flops_meter, helper
+
+    monkeypatch.setattr(helper.dist, "get_world_size", lambda *args, **kwargs: 1)
+    meter = helper.EnvironMeter(
+        config=SimpleNamespace(model_type=model_type, condition_model_type="DiTCondition"),
+        global_batch_size=1,
+        empty_cache_steps=0,
+        parallel_state=SimpleNamespace(dp_group=None, sp_enabled=False),
+    )
+    meter.add({"latents": [torch.zeros(1, 4, 8), torch.zeros(2, 4, 3, 8, 8)]})
+    meter.add({})
+    assert meter.batch_seqlens == [4, 96]
+    assert meter._flops_metadata_callback is flops_meter._extract_default_dit_metadata
+
+
 def test_gb200_device_flops():
     with patch("veomni.utils.count_flops.get_device_name", return_value="NVIDIA GB200"):
         assert get_device_flops() == 2565.0
@@ -98,6 +447,11 @@ def qwen3_config():
 @pytest.fixture
 def qwen3_counter(qwen3_config):
     return VeomniFlopsCounter(qwen3_config)
+
+
+@pytest.fixture
+def gemma3_config():
+    return _load_toy_config("tests/toy_config/gemma3_toy")
 
 
 @pytest.fixture
@@ -140,6 +494,9 @@ def deepseek_v4_counter(deepseek_v4_config):
     return VeomniFlopsCounter(deepseek_v4_config)
 
 
+# Numerical snapshots use the canonical compact fixtures: H=256, four layers
+# (three linear + one full attention), explicit head_dim=256 and vocab=248320.
+# The two-layer ViT contributes 5_536_481_280 FLOPs for image lengths [256, 512].
 class TestQwen35Flops:
     pytestmark = pytest.mark.usefixtures("mock_device_flops")
 
@@ -147,13 +504,13 @@ class TestQwen35Flops:
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0)
         # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
-        assert flops == pytest.approx(106.965220982784, rel=1e-9)
+        assert flops == pytest.approx(1.729445756928, rel=1e-9)
 
     def test_numerical_with_vit(self, qwen3_5_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
         flops, _ = qwen3_5_counter.estimate_flops(batch_seqlens, delta_time=1.0, images_seqlens=[256, 512])
         # Embedding lookup is not a matmul; only lm_head contributes vocab_size * hidden_size.
-        assert flops == pytest.approx(109.196454395904, rel=1e-9)
+        assert flops == pytest.approx(1.734982238208, rel=1e-9)
 
 
 class TestQwen35LoraFlops:
@@ -334,7 +691,7 @@ class TestQwen35MoeFlops:
         )
         # The embedding lookup is excluded. The shared-expert scalar gate is
         # an ordinary trainable linear and follows the FFT factor-six convention.
-        assert flops == pytest.approx(16.888079843328 + shared_expert_gate_flops, rel=1e-9)
+        assert flops == pytest.approx(1.749175762944 + shared_expert_gate_flops, rel=1e-9)
 
     def test_numerical_with_vit(self, qwen3_5_moe_counter):
         batch_seqlens = [1024, 1024, 1024, 1024]
@@ -343,7 +700,7 @@ class TestQwen35MoeFlops:
         shared_expert_gate_flops = (
             6 * text_config.hidden_size * text_config.num_hidden_layers * sum(batch_seqlens) / 1e12
         )
-        assert flops == pytest.approx(19.05408344064 + shared_expert_gate_flops, rel=1e-9)
+        assert flops == pytest.approx(1.754712244224 + shared_expert_gate_flops, rel=1e-9)
 
 
 class TestQwen4ExpFlops:
@@ -418,6 +775,60 @@ class TestQwen3Flops:
 
         flops, _ = qwen3_counter.estimate_flops(batch_seqlens, delta_time=1.0)
         assert flops == pytest.approx(expected_flops / 1e12, rel=1e-9)
+
+
+class TestGemma3Flops:
+    pytestmark = pytest.mark.usefixtures("mock_device_flops")
+
+    def test_text_flops_include_full_and_sliding_attention(self, gemma3_config):
+        batch_seqlens = [12, 5]
+        tokens_sum = sum(batch_seqlens)
+        q_size = gemma3_config.num_attention_heads * gemma3_config.head_dim
+        kv_size = gemma3_config.num_key_value_heads * gemma3_config.head_dim
+        linear_params = (
+            gemma3_config.hidden_size * gemma3_config.intermediate_size * 3
+            + gemma3_config.hidden_size * (2 * q_size + 2 * kv_size)
+        ) * gemma3_config.num_hidden_layers + gemma3_config.hidden_size * gemma3_config.vocab_size
+        full_scores = sum(seqlen * seqlen for seqlen in batch_seqlens)
+        sliding_scores = VeomniFlopsCounter._compute_sliding_attention_score_sum(
+            batch_seqlens, gemma3_config.sliding_window
+        )
+        expected_flops = 6 * linear_params * tokens_sum
+        expected_flops += (
+            12 * (full_scores + sliding_scores) * gemma3_config.head_dim * gemma3_config.num_attention_heads
+        )
+
+        flops, _ = VeomniFlopsCounter(gemma3_config).estimate_flops(batch_seqlens, delta_time=1.0)
+
+        assert flops == pytest.approx(expected_flops / 1e12, rel=1e-9)
+
+    def test_vlm_dispatch_adds_vision_work_and_scales_with_time(self, gemma3_config):
+        config = SimpleNamespace(
+            model_type="gemma3",
+            text_config=gemma3_config,
+            vision_config=SimpleNamespace(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+            ),
+            mm_tokens_per_image=4,
+        )
+        counter = VeomniFlopsCounter(config)
+
+        text_flops, _ = VeomniFlopsCounter(gemma3_config).estimate_flops([12, 5], delta_time=1.0)
+        wrapped_text_flops, _ = counter.estimate_flops([12, 5], delta_time=1.0)
+        vlm_flops, _ = counter.estimate_flops([12, 5], delta_time=1.0, images_seqlens=[16, 16])
+        slower_vlm_flops, _ = counter.estimate_flops([12, 5], delta_time=2.0, images_seqlens=[16, 16])
+
+        vision_linear_params = 2 * (2 * 32 * 64 + 4 * 32**2)
+        expected_vision_flops = 6 * vision_linear_params * 32
+        expected_vision_flops += 12 * (16**2 + 16**2) * 8 * 4 * 2
+        expected_vision_flops += 6 * (2 * 4) * 32 * gemma3_config.hidden_size
+
+        assert wrapped_text_flops == pytest.approx(text_flops)
+        assert vlm_flops - text_flops == pytest.approx(expected_vision_flops / 1e12)
+        assert slower_vlm_flops == pytest.approx(vlm_flops / 2)
 
 
 class TestQwen25VLFlops:
@@ -599,7 +1010,7 @@ class TestGptOssFlops:
     def test_numerical(self, gpt_oss_counter):
         batch_seqlens = [12, 5]
         flops, promised_flops = gpt_oss_counter.estimate_flops(batch_seqlens, delta_time=1.0)
-        assert flops == pytest.approx(0.000326931456, rel=1e-9)
+        assert flops == pytest.approx(0.000328366848, rel=1e-9)
         assert promised_flops == 1000.0
 
     def test_sliding_attention_reduces_quadratic_flops(self, gpt_oss_config):

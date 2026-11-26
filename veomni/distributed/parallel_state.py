@@ -16,6 +16,7 @@
 # Adapted from https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/parallel_dims.py
 
 import os
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import cached_property, wraps
@@ -76,6 +77,8 @@ class ParallelState:
     extra_parallel_fsdp_device_mesh: Dict[str, Optional["DeviceMesh"]] = field(default_factory=lambda: {"ep": None})
     extra_parallel_flat_device_mesh: Dict[str, Optional["DeviceMesh"]] = field(default_factory=lambda: {"ep": None})
     async_enabled: Optional[bool] = False
+    skip_sp_gather_between_modules: bool = False
+    extra_parallel_only: bool = False
 
     def __post_init__(self):
         if not self.include_sp_in_fsdp:
@@ -88,6 +91,8 @@ class ParallelState:
         # directly, which is how a per-module state under use_parallel_state is made.
         if self.cp_size < 1:
             raise ValueError(f"cp_size must be a positive integer; got {self.cp_size}.")
+        if self.ulysses_size < 1:
+            raise ValueError(f"ulysses_size must be a positive integer; got {self.ulysses_size}.")
 
         if self.cp_size > 1 and self.ulysses_size > 1:
             raise NotImplementedError(
@@ -497,14 +502,18 @@ def _init_parallel_state(
     pp_size: int = 1,
     cp_size: int = 1,
     ulysses_size: int = 1,
-    dp_mode: Literal["ddp", "fsdp2"] = "fsdp2",
+    dp_mode: Literal["ddp", "fsdp2", "hyper_fsdp2"] = "fsdp2",
     device_type: str = None,
     include_sp_in_fsdp: bool = True,
     extra_parallel_sizes: Tuple[int] = (1,),
     extra_parallel_placement_innermost: Tuple[bool] = (False,),
     extra_parallel_names: Tuple[str] = ("ep",),
     async_enabled: Optional[bool] = False,
+    skip_sp_gather_between_modules: bool = False,
+    extra_parallel_only: bool = False,
     name: Optional[str] = "base",
+    npu_ep_hccl_buffer_mib: Optional[int] = None,
+    npu_ep_hccl_expansion_mode: Optional[str] = None,
 ) -> "ParallelState":
     """
     Initialize a parallel state, register it under ``name``, and set it as the
@@ -532,6 +541,11 @@ def _init_parallel_state(
     """
     global _PARALLEL_STATE
 
+    if dp_mode == "hyper_fsdp2":
+        hyper_adapter = getattr(sys.modules.get("hyper_parallel.integration.veomni.adapter"), "_ADAPTER", None)
+        if hyper_adapter is None or not hyper_adapter.is_patched or not hyper_adapter.fsdp:
+            raise ValueError("HyperParallel must be activated by TextTrainer or VLMTrainer.")
+
     if name is not None and name in _PARALLEL_STATE_REGISTRY:
         logger.debug(
             f"Parallel state {name!r} is already registered; returning the existing state without rebuilding."
@@ -539,10 +553,16 @@ def _init_parallel_state(
         return _PARALLEL_STATE_REGISTRY[name]
 
     if _PARALLEL_STATE is not None:
-        logger.warning("Parallel state has already been initialized.")
+        logger.debug("Parallel state has already been initialized.")
 
     if device_type is None:
         device_type = get_device_type()
+
+    from .hccl_options import ep_backend_override
+
+    ep_override = ep_backend_override(device_type, npu_ep_hccl_buffer_mib, npu_ep_hccl_expansion_mode)
+    if ep_override and dict(zip(extra_parallel_names, extra_parallel_sizes)).get("ep", 1) <= 1:
+        raise ValueError("HCCL expert-parallel options require an enabled ep dimension")
 
     # Set dp_shard_size to dp_size if dp_shard_size and dp_replicate_size are not set when dp enabled
     if dp_size > 1 and dp_shard_size == 1 and dp_replicate_size == 1:
@@ -557,6 +577,9 @@ def _init_parallel_state(
         "each extra parallel should correspond to a size, a placement and a name"
     )
 
+    if dp_mode == "hyper_fsdp2":
+        dp_mode = "fsdp2"
+
     # Reuse an already-built state for an identical topology (e.g. the omni
     # orchestrator builds one ParallelState per module, many of which share the
     # global topology). Building the device mesh / extra-parallel meshes creates
@@ -564,6 +587,7 @@ def _init_parallel_state(
     # the same order, so cache hits/misses are rank-consistent and no duplicate
     # groups are created. The key spans every field that shapes the mesh or the
     # state's behaviour (e.g. ``dp_mode`` is read by grad-clip).
+    extra_parallel_only = bool(extra_parallel_only and dp_mode == "fsdp2")
     cache_key = (
         dp_size,
         dp_replicate_size,
@@ -579,10 +603,14 @@ def _init_parallel_state(
         extra_parallel_placement_innermost,
         extra_parallel_names,
         async_enabled,
+        skip_sp_gather_between_modules,
+        extra_parallel_only,
+        npu_ep_hccl_buffer_mib,
+        npu_ep_hccl_expansion_mode,
     )
     cached_state = _PARALLEL_STATE_CACHE.get(cache_key)
     if cached_state is not None:
-        logger.info_rank0("Reusing cached parallel state for identical topology.")
+        logger.debug("Reusing cached parallel state for identical topology.")
         # Mirror the build path below: only (re)establish the default global if it
         # has not been set yet. The cache is a module-level global that outlives the
         # global state (e.g. tests reset ``_PARALLEL_STATE = None`` at teardown but
@@ -693,6 +721,7 @@ def _init_parallel_state(
                 device_type=device_type,
                 mesh_shape=param_mesh_shape,
                 mesh_dim_names=para_mesh_dim_names,
+                **({"backend_override": ep_override} if para_name == "ep" and ep_override else {}),
             )
             extra_parallel_fsdp_device_mesh[f"{para_name}"] = para_mesh
             # Qwen4-Exp PLE routes sparse lookup requests across the complete
@@ -722,6 +751,8 @@ def _init_parallel_state(
         extra_parallel_fsdp_device_mesh=extra_parallel_fsdp_device_mesh,
         extra_parallel_flat_device_mesh=extra_parallel_flat_device_mesh,
         async_enabled=async_enabled,
+        skip_sp_gather_between_modules=skip_sp_gather_between_modules,
+        extra_parallel_only=extra_parallel_only,
     )
 
     if _PARALLEL_STATE is None:
@@ -740,6 +771,9 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
     should not be restating the mapping. Both a job's own mesh and a single
     model's come through here.
     """
+    extra_parallel_names, extra_parallel_sizes, extra_parallel_placement_innermost = (
+        accelerator.resolved_extra_parallel
+    )
     return _init_parallel_state(
         dp_size=accelerator.dp_size,
         dp_replicate_size=accelerator.dp_replicate_size,
@@ -748,11 +782,15 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
         pp_size=accelerator.pp_size,
         cp_size=accelerator.cp_size,
         ulysses_size=accelerator.ulysses_size,
-        extra_parallel_sizes=accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=accelerator.extra_parallel_names,
+        extra_parallel_sizes=extra_parallel_sizes,
+        extra_parallel_placement_innermost=extra_parallel_placement_innermost,
+        extra_parallel_names=extra_parallel_names,
         dp_mode=accelerator.fsdp_config.fsdp_mode,
         async_enabled=accelerator.enable_async,
+        skip_sp_gather_between_modules=accelerator.skip_sp_gather_between_modules,
+        extra_parallel_only=accelerator.fsdp_config.extra_parallel_only,
+        npu_ep_hccl_buffer_mib=accelerator.npu_ep_hccl_buffer_mib,
+        npu_ep_hccl_expansion_mode=accelerator.npu_ep_hccl_expansion_mode,
         name=name,
     )
 

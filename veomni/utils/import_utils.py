@@ -15,9 +15,10 @@
 
 """Import utils"""
 
+import importlib.machinery
 import importlib.metadata
-import importlib.util
 import subprocess
+import sys
 from functools import lru_cache
 from typing import TYPE_CHECKING, Dict
 
@@ -28,8 +29,43 @@ if TYPE_CHECKING:
     from packaging.version import Version
 
 
+def _find_spec_without_import(fullname: str, path) -> object | None:
+    """Ask active meta-path finders for a spec without executing a parent loader."""
+    for finder in tuple(sys.meta_path):
+        find_spec = getattr(finder, "find_spec", None)
+        if find_spec is None:
+            continue
+        lookup_name = fullname
+        if path is not None and finder is importlib.machinery.PathFinder:
+            lookup_name = fullname.rpartition(".")[2]
+        spec = find_spec(lookup_name, path, None)
+        if spec is not None:
+            return spec
+    return None
+
+
 def _is_package_available(name: str) -> bool:
-    return importlib.util.find_spec(name) is not None
+    """Return whether a module path is discoverable without importing its parents."""
+    try:
+        search_path = None
+        parts = name.split(".")
+        for index in range(len(parts)):
+            fullname = ".".join(parts[: index + 1])
+            if fullname in sys.modules:
+                loaded = sys.modules[fullname]
+                if index == len(parts) - 1:
+                    return loaded is not None
+                search_path = getattr(loaded, "__path__", None)
+            else:
+                spec = _find_spec_without_import(fullname, search_path)
+                if spec is None:
+                    return False
+                search_path = spec.submodule_search_locations
+            if index != len(parts) - 1 and search_path is None:
+                return False
+        return True
+    except (ImportError, AttributeError, KeyError, ValueError):
+        return False
 
 
 def _get_package_version(name: str) -> "Version":
@@ -90,6 +126,17 @@ def is_apex_mlu_available() -> bool:
         return _is_package_available("apex.contrib.grouped_gemm")
     except importlib.metadata.PackageNotFoundError:
         return False
+
+
+@lru_cache
+def is_liger_kernel_mlu_available() -> bool:
+    if not _PACKAGE_FLAGS["liger_kernel"]:
+        return False
+    try:
+        import liger_kernel
+    except ImportError:
+        return False
+    return hasattr(liger_kernel, "__mlu_version__")
 
 
 def is_diffusers_available() -> bool:

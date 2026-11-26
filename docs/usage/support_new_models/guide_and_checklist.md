@@ -4,17 +4,14 @@
 - [qwen3_vl_example.md](./qwen3_vl_example.md) — VLM + MoE (image/video, deepstack, EP)
 - [qwen3_omni_moe_example.md](./qwen3_omni_moe_example.md) — Omni-modal MoE (image/video/audio, talker)
 
-> **Scope note:** VeOmni now pins `transformers==5.16.1` and ships
-> patchgen-generated modeling files under
-> `veomni/models/transformers/<model>/generated/`. The runtime monkey-patch
-> flow this document was originally written for has been retired. The high-level
+> **Scope note:** VeOmni pins `transformers==5.16.1` and ships standalone,
+> multi-backend modeling files at
+> `veomni/models/transformers/<model>/modeling_<model>.py`. The runtime monkey-patch flow this
+> document was originally written for has been retired. The high-level
 > checklists (registration, parallel plan, multimodal data transform, trainer
-> wiring, tests) still apply, but the modeling-patch steps below should be
-> read as describing what the *generated* file does, with the actual edits
-> happening in `<model>_gpu_patch_gen_config.py`. For step-by-step
-> instructions on the patchgen flow, see
-> [the patchgen design guide](../../design/patchgen.md) and
-> the `veomni-patchgen-model` agent skill.
+> wiring, tests) still apply, with the modeling adaptations living directly in
+> `modeling_<model>.py` using instance-local `VeomniOp` handles. See the
+> `/veomni-new-model` agent skill for the step-by-step workflow.
 
 ---
 
@@ -22,9 +19,9 @@
 
 | Model Type | Files Required | Key Additions |
 |---|---|---|
-| Dense text-only LLM | `__init__.py` | SP position embedding slicing |
-| VLM (image/video) | `__init__.py` + `modeling_*.py` | FSDP dummy forward, SP in ViT + LM, position ID func |
-| Omni-modal MoE | `__init__.py` + 4 more files | All of the above + audio encoder, fused MoE, EP plan, processor patch |
+| Dense text-only LLM | `__init__.py` + `modeling_<model>.py` | `VeomniOp` handles, SP position embedding slicing |
+| VLM (image/video) | `__init__.py` + `modeling_<model>.py` | FSDP dummy forward, SP in ViT + LM, position ID + metadata hooks |
+| Omni-modal MoE | `__init__.py` + `modeling_<model>.py` + helpers | All of the above + audio encoder, fused MoE, EP plan, processor patch |
 
 ---
 
@@ -46,8 +43,8 @@ Before writing any VeOmni code, answer:
 ```bash
 mkdir veomni/models/transformers/your_model_name/
 touch veomni/models/transformers/your_model_name/__init__.py
-# For complex models, also add:
 touch veomni/models/transformers/your_model_name/modeling_your_model_name.py
+# For complex models, also add:
 touch veomni/models/transformers/your_model_name/configuration_your_model_name.py  # if config fix needed
 touch veomni/models/transformers/your_model_name/processing_your_model_name.py    # if multimodal
 touch veomni/models/transformers/your_model_name/parallel_plan.py                 # if MoE
@@ -57,34 +54,31 @@ touch veomni/models/transformers/your_model_name/parallel_plan.py               
 
 **Minimal (text-only):**
 ```python
-from ...loader import MODELING_REGISTRY
+from veomni.models.registry import MODELING_REGISTRY
 
 @MODELING_REGISTRY.register("your_model_type")
 def register_modeling(architecture: str):
-    from transformers.models.your_model import YourModelForCausalLM
+    from .modeling_your_model_name import YourModelForCausalLM
     return YourModelForCausalLM
 ```
 
 **Full (multimodal MoE):**
 ```python
-from ...loader import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODEL_PROCESSOR_REGISTRY, MODELING_REGISTRY
 
 @MODEL_CONFIG_REGISTRY.register("your_model_type")
 def register_config():
-    from .configuration_your_model import YourModelConfig, apply_veomni_patch
-    apply_veomni_patch()
+    from .configuration_your_model import YourModelConfig
     return YourModelConfig
 
 @MODELING_REGISTRY.register("your_model_type")
 def register_modeling(architecture: str):
-    from .modeling_your_model import YourModelForCausalLM, apply_veomni_patch
-    apply_veomni_patch()
+    from .modeling_your_model_name import YourModelForCausalLM
     return YourModelForCausalLM
 
 @MODEL_PROCESSOR_REGISTRY.register("YourModelProcessor")  # exact class name from processor_config.json
 def register_processor():
-    from .processing_your_model import YourModelProcessor, apply_veomni_patch
-    apply_veomni_patch()
+    from .processing_your_model import YourModelProcessor
     return YourModelProcessor
 ```
 
@@ -103,20 +97,13 @@ from . import (
 )
 ```
 
-### Step 4: Patch the Model (`modeling_*.py`)
+### Step 4: Author `modeling_<model>.py`
 
-Standard pattern — import HF module as alias, define patches, apply at end:
-
-```python
-import transformers.models.your_model.modeling_your_model as hf_your_model
-
-# ... define patches ...
-
-def apply_veomni_patch():
-    hf_your_model.YourClass.method = patched_method
-```
-
-Which patches to apply depends on model type (see checklist below). For implementation details of each patch, see the example docs.
+Adapt `veomni/models/transformers/<model>/modeling_<model>.py` directly:
+replace `PreTrainedModel` with `VeOmniPreTrainedModel`, wire instance-local
+`VeomniOp` handles (`self.config.ops_config`), and keep `# Upstream-Module:` /
+`# Base-Transformers-Version:` headers intact. See the `/veomni-new-model` skill for the
+complete workflow.
 
 ### Step 5: Define Expert Parallelism Plan (`parallel_plan.py`, MoE only)
 
@@ -155,7 +142,10 @@ Create `configs/multimodal/your_model/your_model.yaml` with `model.config_path`,
 
 ### Step 10: Test
 
-See the testing checklist below for what to add.
+Follow [Testing a New Model](../../transformers_v5/testing_new_model.md), the
+source of truth for model parity, SP/EP mode selection, representative models,
+and capability exceptions. Use the testing checklist below to track the
+integration-specific additions.
 
 ---
 
@@ -163,7 +153,7 @@ See the testing checklist below for what to add.
 
 | Patch | Text LLM | VLM | Omni MoE |
 |---|:---:|:---:|:---:|
-| `tie_word_embeddings` config fix | sometimes | sometimes | ✓ |
+| `tie_word_embeddings` config fix | — (not needed) | — (not needed) | — (not needed) |
 | FSDP dummy forward | — | ✓ | ✓ (ViT + Audio) |
 | SP: LM position embedding slicing | ✓ | ✓ | ✓ |
 | SP: ViT pad+slice | — | ✓ | ✓ |
@@ -201,8 +191,7 @@ For implementation details of each patch, refer to the example docs.
 
 - [ ] `parallel_plan.py` with correct expert weight paths
 - [ ] `get_parallel_plan` wired on the pretrained model base class
-- [ ] Stacked-weight `YourModelExperts` module + `fused_moe_forward`
-- [ ] `_moe_implementation` propagated from top-level config to text sub-config
+- [ ] Stacked-weight `YourModelExperts` module + a local `moe_experts` `VeomniOp` from `config.ops_config.moe_implementation`
 - [ ] `_init_weights` patched for stacked expert params
 
 ### Omni-modal (audio)
@@ -214,12 +203,16 @@ For implementation details of each patch, refer to the example docs.
 
 ### Testing (all models)
 
-- [ ] Toy config in `tests/toy_config/your_model_toy/`
+- [ ] Canonical tiny-config factory in `tests/models/tiny_configs.py`
 - [ ] `DummyYourModelDataset` in `veomni/data/dummy_dataset.py` (multimodal)
-- [ ] `MODEL_TO_DATASET` entry in `tests/models/utils.py`
-- [ ] `pytest.param` in `TEST_CASES` in `tests/models/test_models_patch.py` (Level 1)
-- [ ] Test case + fixture + test function in `tests/e2e/test_e2e_parallel.py` (Level 2)
-- [ ] For VLM models, add the toy config to the `freeze_vit` smoke test list in `tests/models/test_vlm_trainer.py`
+- [ ] Registry case in `tests/models/base/test_auto_registry.py`
+- [ ] Family parity and contract tests under `tests/models/transformers/`
+- [ ] One supported accelerator configuration has reference loss/backward coverage
+- [ ] E2E case extends an existing family table/fixture in `tests/e2e/test_e2e_parallel.py`
+- [ ] Dense uses `(SP1, EP1)` / `(SP2, EP1)`; ordinary MoE uses `(SP1, EP1)` / `(SP2, EP2)`
+- [ ] Extra modes, capability limits, and smoke-only gaps are justified in the case
+- [ ] GPU/NPU eligibility and CI selection checked; launch plan matches worker process count
+- [ ] For VLM models, add the toy config to the `freeze_vit` smoke test list in `tests/trainer/test_vlm_trainer.py`
 
 ---
 
@@ -230,7 +223,7 @@ For implementation details of each patch, refer to the example docs.
 | NCCL hang during backward | Missing `dummy_forward` on ViT/AudioEncoder | Add and call on `fsdp_enabled` ranks when input is `None` |
 | Shape mismatch in ViT attention | `cu_seqlens` missing padding entry for SP | Append `cu_seqlens[-1] + pad_seq_len` when SP is active |
 | `masked_scatter` size error | Fill-back attempted in SP-sliced layout | Call `gather_seq_scatter_heads` before fill-back |
-| Crash: `tie_word_embeddings` | Config default `True` but no `get_output_embeddings` | Patch config to `tie_word_embeddings=False` |
+| Crash: `tie_word_embeddings` | Config default `True` but no `get_output_embeddings` | Nothing to do — a module with no output head is skipped by `tie_word_embeddings_if_requested`. Do **not** patch the config to `False`; that was the old workaround and it faked a field the module does not have |
 | Wrong position IDs in multi-sample batch | `(bs, 3, L)` not transposed to `(3, bs, L)` | Add transpose check in model forward |
 | Audio inputs silently skipped | `if audio is not None:` passes for empty list `[]` | Change to `if audio:` in processor |
 | EP has no effect | Expert weight paths in `parallel_plan` don't match | Run `named_parameters()` on model to verify exact paths |
@@ -253,8 +246,8 @@ from veomni.distributed.sequence_parallel import (
 )
 from veomni.distributed.sequence_parallel.ulysses import _Gather  # all-gather with autograd
 
-from veomni.ops import fused_moe_forward
-from veomni.ops.kernels.cross_entropy import ForCausalLMLoss
+from veomni.ops import VeomniOp
+from veomni.models.loss_utils import ForCausalLMLoss
 
 from veomni.utils.constants import (
     AUDIO_INPUT_INDEX,   # placeholder token ID for audio in input_ids

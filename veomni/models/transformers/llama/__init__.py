@@ -11,12 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...loader import MODELING_REGISTRY
+
+"""Llama modeling that calls local ``VeomniOp`` handles."""
+
+from veomni.models.registry import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("llama")
 def register_llama_modeling(architecture: str):
-    from .generated.patched_modeling_llama_gpu import (
+    from .modeling_llama import (
         LlamaForCausalLM,
         LlamaForSequenceClassification,
         LlamaForTokenClassification,

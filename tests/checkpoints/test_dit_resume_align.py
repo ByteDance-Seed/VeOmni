@@ -73,7 +73,11 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from tools.data_generators import DummyDataset  # noqa: E402
-from tools.launch_utils import find_free_port  # noqa: E402
+
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+
+
+_CI_LAUNCH = LaunchSpec(nproc=2)
 
 
 TOTAL_STEPS = 6
@@ -271,20 +275,17 @@ def _materialize_toy_dit_weights(target_dir: str) -> None:
     entirely: the weights are loaded instead of randomly initialized. Building
     the same model directly (no meta device, no FSDP) does not hit the issue.
     """
-    from veomni.arguments.arguments_types import OpsImplementationConfig
+    from tests.tools.training_utils import make_eager_ops_config
     from veomni.models.auto import build_foundation_model
-    from veomni.ops import apply_ops_config
 
-    # Wan's ``rope_apply`` has a non-standard signature, so its device patch
-    # explicitly disables the liger RoPE backend. The framework default for
-    # ``rotary_pos_emb_implementation`` is ``liger_kernel``, which would raise
-    # here; every Wan YAML pins ``eager`` for the same reason.
-    apply_ops_config(OpsImplementationConfig(rotary_pos_emb_implementation="eager"))
+    # This asset is materialized in FP32 on CPU before the accelerator trainer starts.
+    ops = make_eager_ops_config(attn_implementation="sdpa")
     model = build_foundation_model(
         config_path="tests/toy_config/wan_t2v_toy/config.json",
         weights_path=None,
         torch_dtype="float32",
         init_device="cpu",
+        ops_implementation=ops,
     )
     model.save_pretrained(target_dir)
 
@@ -319,8 +320,8 @@ def _run_trainer(run: str, train_path: str, weights_dir: str, load_path: str | N
         "-m",
         "torch.distributed.run",
         "--nnodes=1",
-        "--nproc_per_node=2",
-        f"--master-port={find_free_port()}",
+        f"--nproc_per_node={_CI_LAUNCH.nproc}",
+        "--standalone",
         os.path.abspath(__file__),
         "--model.config_path=tests/toy_config/wan_t2v_toy/config.json",
         f"--model.model_path={weights_dir}",
@@ -371,6 +372,7 @@ def _read_signatures(run: str) -> Dict[str, Dict[str, float]]:
         return json.load(handle)
 
 
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
 def test_dit_resume_continues_noise_and_timestep_stream():
     """A resumed DiT run draws the same noise/timestep as the uninterrupted one."""
     from veomni.utils.device import get_device_type
@@ -421,3 +423,25 @@ def test_dit_resume_continues_noise_and_timestep_stream():
 
 if __name__ == "__main__":
     main()
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_materialize_toy_dit_weights_uses_portable_ops(tmp_path, monkeypatch):
+    from safetensors.torch import load_file
+
+    from veomni.models import build_config
+
+    def forbid_loading(*args, **kwargs):
+        raise AssertionError("CPU checkpoint preparation must not preload FlashAttention")
+
+    monkeypatch.setattr("transformers.modeling_utils.lazy_import_flash_attention", forbid_loading)
+    monkeypatch.setattr("veomni.ops.install._load_veomni_local_flash_kernel", forbid_loading)
+    _materialize_toy_dit_weights(str(tmp_path))
+    config = build_config(str(tmp_path))
+    assert config.ops_config.attn_implementation == "veomni_sdpa"
+    shards = list(tmp_path.glob("*.safetensors"))
+    assert shards
+    for shard in shards:
+        weights = load_file(shard)
+        assert weights
+        assert all(tensor.device.type == "cpu" and torch.isfinite(tensor).all() for tensor in weights.values())

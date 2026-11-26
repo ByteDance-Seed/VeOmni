@@ -1,7 +1,7 @@
-from transformers import PretrainedConfig
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
-class MoVQGANConfig(PretrainedConfig):
+class MoVQGANConfig(VeOmniPretrainedConfig):
     model_type = "movqgan"
 
     def __init__(

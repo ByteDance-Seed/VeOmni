@@ -20,24 +20,48 @@ differs from a standalone model are the places that override it.
 """
 
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch.nn as nn
+from torch.utils.checkpoint import noop_context_fn
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
+from veomni.arguments import GradientCheckpointingConfig
 from veomni.distributed import parallel_state
-from veomni.distributed.parallel_state import ParallelState
+from veomni.distributed.parallel_state import ParallelState, use_parallel_state
 from veomni.models.model_runtime import VeOmniModelRuntime
+from veomni.models.seed_omni.accelerated.omni_module import omni_module_runtime
 from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import ModuleRuntime
+from veomni.models.seed_omni.mixins.offline_encoding_mixin import OfflineEncodingMixin
+from veomni.utils import recompute_utils
 
 
-def _fsdp(scope: str, mode: str = "fsdp2") -> SimpleNamespace:
-    return SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope=scope, fsdp_mode=mode))
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+
+
+def _fsdp(
+    scope: str, mode: str = "fsdp2", *, compile_enable: bool = False, compile_dynamic: bool = False
+) -> SimpleNamespace:
+    """A minimal ``AcceleratorConfig`` stand-in.
+
+    ``torch_compile`` defaults to disabled: these tests are about the wrap and
+    the per-module steps, and leaving compile off keeps
+    ``_build_parallelized_model`` from reaching for the compiler.
+    """
+    return SimpleNamespace(
+        fsdp_config=SimpleNamespace(fsdp_scope=scope, fsdp_mode=mode, reshard_after_forward=True),
+        torch_compile=SimpleNamespace(
+            enable=compile_enable, backend="inductor", mode=None, fullgraph=True, dynamic=compile_dynamic
+        ),
+    )
 
 
 def _unbuilt(model: nn.Module | None = None, **args_fields) -> ModuleRuntime:
     """A ModuleRuntime with its fields set but no build run."""
     args_fields.setdefault("accelerator", _fsdp("module"))
+    args_fields.setdefault("basic_modules", [])
     runtime = ModuleRuntime.__new__(ModuleRuntime)
     runtime._global_accelerator = _fsdp("module")
     runtime.model = model
@@ -59,8 +83,35 @@ def test_omni_runtime_arguments_are_model_arguments():
     assert issubclass(OmniModelRuntimeArguments, ModelArguments)
 
 
+def test_generic_module_extra_state_hooks_are_saved_and_loaded(monkeypatch):
+    class ModuleWithExtraState(nn.Linear):
+        def __init__(self):
+            super().__init__(2, 2)
+            self.saved = None
+
+        def extra_state_dict(self):
+            return {"value": 7}
+
+        def load_extra_state_dict(self, state):
+            self.saved = state
+
+    module = ModuleWithExtraState()
+    runtime = _unbuilt(module)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    assert runtime.extra_state() == {"module_extra_state": {"value": 7}}
+    runtime.load_extra_state({"module_extra_state": {"value": 9}})
+    assert module.saved == {"value": 9}
+
+
+def test_missing_rng_load_hook_does_not_raise(monkeypatch):
+    module = nn.Linear(2, 2)
+    runtime = _unbuilt(module)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    runtime.load_extra_state({"module_rng_state": {"generator": "state"}})
+
+
 def test_module_checkpoint_manager_is_a_model_checkpoint_manager():
-    from veomni.models.checkpoint_manager import ModelCheckpointManager
+    from veomni.models.checkpoint import ModelCheckpointManager
     from veomni.models.seed_omni.utils.checkpoint import OmniModuleCheckpointManager
 
     assert issubclass(OmniModuleCheckpointManager, ModelCheckpointManager)
@@ -134,11 +185,146 @@ def test_build_model_uses_the_config_the_omni_config_loaded(monkeypatch):
             ),
         ),
     )
-    runtime.module_config = SimpleNamespace(model_type="fake")
+    runtime.module_config = SimpleNamespace(model_type="fake", ops_config=None)
     runtime._build_model()
 
     assert captured["config_path"] is runtime.module_config
     assert captured["weights_path"] == "/tmp/hf-model"
+
+
+class _CacheableModule(OfflineEncodingMixin, nn.Linear):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("training_task", "model_cls", "on_meta"),
+    [
+        ("offline_training", _CacheableModule, True),
+        ("offline_training", nn.Linear, False),
+        ("offline_embedding", _CacheableModule, False),
+        ("online_training", _CacheableModule, False),
+        (None, _CacheableModule, False),
+    ],
+)
+def test_only_a_cacheable_module_is_built_on_meta_for_offline_training(monkeypatch, training_task, model_cls, on_meta):
+    """``offline_training`` reads every module that mixes in ``OfflineEncodingMixin`` from the cache,
+    whichever of its methods the graph names; no other module and no other task does.
+
+    ``None`` stands for an inference build, which has no train args.
+    """
+    captured = {}
+
+    def fake_build_foundation_model(**kwargs):
+        captured.update(kwargs)
+        model = nn.Linear(2, 2)
+        model.config = SimpleNamespace()
+        return model
+
+    monkeypatch.setattr("veomni.models.build_foundation_model", fake_build_foundation_model)
+    monkeypatch.setattr("veomni.models.loader.get_model_class", lambda config: model_cls)
+    runtime = _offline_cache_runtime(training_task)
+
+    assert runtime.reads_offline_cache is on_meta
+    runtime._build_model()
+
+    assert captured["init_device"] == ("meta" if on_meta else "cpu")
+
+
+@pytest.mark.parametrize(("accelerated_cls", "on_meta"), [(_CacheableModule, True), (None, False)])
+def test_the_class_the_omni_registries_build_decides_the_meta_build(monkeypatch, accelerated_cls, on_meta):
+    """The real lookup prefers the accelerated class, so a marker there (as on BAGEL's VAE) is what counts."""
+    from veomni.models.seed_omni import OMNI_ACCELERATED_MODEL_REGISTRY, OMNI_MODEL_REGISTRY
+
+    monkeypatch.delenv("MODELING_BACKEND", raising=False)
+    model_type = "offline_cache_marker_test"
+    OMNI_MODEL_REGISTRY[model_type] = lambda: nn.Linear
+    if accelerated_cls is not None:
+        OMNI_ACCELERATED_MODEL_REGISTRY[model_type] = lambda: accelerated_cls
+    try:
+        runtime = _offline_cache_runtime("offline_training")
+        runtime.module_config = SimpleNamespace(model_type=model_type, architectures=None)
+        assert runtime.reads_offline_cache is on_meta
+    finally:
+        del OMNI_MODEL_REGISTRY[model_type]
+        if accelerated_cls is not None:
+            del OMNI_ACCELERATED_MODEL_REGISTRY[model_type]
+
+
+def test_a_cache_reading_module_is_frozen_and_never_wrapped_trained_or_saved(monkeypatch):
+    calls = []
+    for step in (
+        "setup",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+        "_build_optimizer",
+        "build_checkpoint",
+    ):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, _step=step, **k: calls.append(_step))
+    monkeypatch.setattr(ModuleRuntime, "_build_model_assets", lambda self: None)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+
+    def fake_build_model(self):
+        self.model = nn.Linear(2, 2)
+
+    monkeypatch.setattr(ModuleRuntime, "_build_model", fake_build_model)
+    monkeypatch.setattr("veomni.models.loader.get_model_class", lambda config: _CacheableModule)
+    train = SimpleNamespace(training_task="offline_training", checkpoint=SimpleNamespace(load_path=None))
+
+    runtime = ModuleRuntime(
+        SimpleNamespace(accelerator=_fsdp("module")),
+        "vae",
+        module_config=SimpleNamespace(),
+        global_accelerator=_fsdp("module"),
+        train_args=train,
+    )
+
+    assert calls == ["setup"]
+    assert not any(p.requires_grad for p in runtime.model.parameters())
+
+
+def test_an_offline_embedding_run_loads_and_wraps_every_module_but_freezes_it(monkeypatch):
+    """It trains nothing, so the frozen module gets no optimizer and no checkpoint manager."""
+    calls = []
+    for step in ("setup", "_freeze_model_module", "_build_parallelized_model"):
+        monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, _step=step, **k: calls.append(_step))
+    monkeypatch.setattr(ModuleRuntime, "_build_model_assets", lambda self: None)
+    monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
+    monkeypatch.setattr(ModuleRuntime, "_build_model", lambda self: setattr(self, "model", nn.Linear(2, 2)))
+    train = SimpleNamespace(training_task="offline_embedding", checkpoint=SimpleNamespace(load_path=None))
+
+    runtime = ModuleRuntime(
+        SimpleNamespace(accelerator=_fsdp("module")),
+        "llm",
+        module_config=SimpleNamespace(),
+        global_accelerator=_fsdp("module"),
+        train_args=train,
+    )
+
+    assert calls == [
+        "setup",
+        "_freeze_model_module",
+        "_build_parallelized_model",
+    ]
+    assert not runtime.has_trainable_parameters
+    assert runtime.optimizer is None
+    assert getattr(runtime, "checkpoint", None) is None
+
+
+def _offline_cache_runtime(training_task):
+    runtime = _unbuilt(
+        model_config=None,
+        ops_implementation=None,
+        accelerator=SimpleNamespace(
+            init_device="cpu",
+            fsdp_config=SimpleNamespace(
+                fsdp_mode="fsdp2", fsdp_scope="module", mixed_precision=SimpleNamespace(enable=False)
+            ),
+        ),
+    )
+    runtime.module_config = SimpleNamespace(model_type="fake", ops_config=None)
+    if training_task is not None:
+        runtime.train_args = SimpleNamespace(training_task=training_task)
+    return runtime
 
 
 # The base declares these as class attributes defaulting to ``None``, so a test
@@ -238,17 +424,16 @@ def test_the_constructor_stores_training_args_where_the_base_reads_them(monkeypa
         "_build_model_assets",
         "_freeze_model_module",
         "_build_parallelized_model",
-        "_scope_recompute_to_parallel_state",
         "_build_optimizer",
         "build_checkpoint",
     ):
         monkeypatch.setattr(ModuleRuntime, step, lambda self, *a, **k: None)
     monkeypatch.setattr(ModuleRuntime, "_scoped", lambda self: nullcontext())
-    train = SimpleNamespace(checkpoint=SimpleNamespace(load_path=None))
+    train = SimpleNamespace(training_task="online_training", checkpoint=SimpleNamespace(load_path=None))
     args = SimpleNamespace(accelerator=_fsdp("module"))
 
     runtime = ModuleRuntime(
-        args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp("module"), train=train
+        args, "vision_encoder", module_config=SimpleNamespace(), global_accelerator=_fsdp("module"), train_args=train
     )
 
     assert vars(runtime)["train_args"] is train
@@ -266,7 +451,6 @@ def test_only_the_top_level_scope_decides_wrap_omni_model(monkeypatch, top_level
         "_build_model_assets",
         "_freeze_model_module",
         "_build_parallelized_model",
-        "_scope_recompute_to_parallel_state",
         "_build_optimizer",
         "build_checkpoint",
     ):
@@ -292,6 +476,203 @@ def test_a_module_under_the_omni_model_wrap_applies_async_activation_offload_fir
     runtime._build_parallelized_model()
 
     assert applied == [runtime]
+
+
+class _CheckpointableLinear(nn.Linear):
+    """An HF-style model: it owns the ``gradient_checkpointing_enable`` entry point."""
+
+    def __init__(self, log=None):
+        super().__init__(2, 2)
+        self.log = [] if log is None else log
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        self.log.append(("enable", gradient_checkpointing_kwargs))
+
+
+class _RecordingParallelState:
+    """Stands in for ``use_parallel_state(name)``, recording where it was entered."""
+
+    def __init__(self, name, log):
+        self.name = name
+        self.log = log
+
+    def __enter__(self):
+        self.log.append(self.name)
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def _recompute_accelerator(**gc_fields):
+    return SimpleNamespace(
+        gradient_checkpointing=GradientCheckpointingConfig(**gc_fields),
+        offload_config=SimpleNamespace(enable_activation=False, enable_async_activation=False),
+        # `_build_recompute_policy` asks the resolved compile config, not the raw
+        # switch, so the fixture carries the fields that resolution reads.
+        torch_compile=SimpleNamespace(enable=False, backend="inductor", mode=None, fullgraph=True, dynamic=None),
+        fsdp_config=SimpleNamespace(fsdp_mode="fsdp2"),
+    )
+
+
+def test_the_recompute_apply_enables_first_then_applies_the_policy(monkeypatch):
+    """The module's ParallelState is folded into the policy, never armed as a second enable.
+
+    Enabling again *after* the apply rewrites every block's entry point, which is
+    how the composed path used to lose both the layer filter and SAC.
+    """
+    calls = []
+    model = _CheckpointableLinear(calls)
+    monkeypatch.setattr(
+        recompute_utils,
+        "apply_recompute_policy",
+        lambda wrapped, policy, **kwargs: calls.append(("apply", wrapped, policy)),
+    )
+    accelerator = _recompute_accelerator(enable=True, recompute_layers=1, selective_recompute_layers=1)
+
+    _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    assert [call[0] for call in calls] == ["enable", "apply"]
+    enable_kwargs = calls[0][1]
+    assert enable_kwargs["use_reentrant"] is False and enable_kwargs["early_stop"] is True
+
+    _, wrapped, policy = calls[1]
+    assert wrapped is model
+    assert (policy.recompute_layers, policy.selective_recompute_layers) == (1, 1)
+    assert isinstance(policy.recompute_context, partial)
+    assert policy.recompute_context.func is use_parallel_state
+    assert policy.recompute_context.args == ("vision_encoder",)
+
+
+def test_the_enable_scopes_recompute_to_the_modules_parallel_state(monkeypatch):
+    """Blocks the policy does not bind keep HF's function, so the enable must carry
+    the module's ParallelState itself — the default config binds nothing."""
+    entered = []
+    model = _CheckpointableLinear()
+    monkeypatch.setattr(omni_module_runtime, "use_parallel_state", lambda name: _RecordingParallelState(name, entered))
+    accelerator = _recompute_accelerator(enable=True)  # the defaults: nothing is bound selectively
+
+    _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    context_fn = model.log[0][1]["context_fn"]
+    assert context_fn is not noop_context_fn
+    forward_ctx, recompute_ctx = context_fn()
+    with forward_ctx:
+        assert entered == []
+    with recompute_ctx:
+        assert entered == ["vision_encoder"]
+
+
+def test_the_enable_keeps_torchs_default_without_a_parallel_state(monkeypatch):
+    """A module with no state of its own has nothing to fold in."""
+    model = _CheckpointableLinear()
+    monkeypatch.setattr(ModuleRuntime, "_recompute_context", lambda self: None)
+    accelerator = _recompute_accelerator(enable=True)
+
+    _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    assert model.log[0][1]["context_fn"] is noop_context_fn
+
+
+def test_a_module_that_resolves_to_eager_does_not_claim_compile_to_the_policy(monkeypatch):
+    """The policy reads the resolved config, not the launcher switch.
+
+    A module whose own wrap is DDP resolves to ``enable=False`` even when the
+    launcher asked for compile, because ``module_compile_config`` falls back to
+    eager. Its recompute policy has to see that — otherwise it warns about SAC
+    with torch.compile for a module that never compiles.
+    """
+    seen = {}
+    model = _CheckpointableLinear()
+    accelerator = _recompute_accelerator(enable=True)
+    accelerator.torch_compile.enable = True
+    accelerator.fsdp_config = SimpleNamespace(fsdp_mode="ddp")
+
+    real_build = recompute_utils.build_policy
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(recompute_utils, "build_policy", spy)
+    monkeypatch.setattr(ModuleRuntime, "_recompute_context", lambda self: None)
+
+    _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    assert seen["compile_enabled"] is False
+
+
+def test_a_module_that_resolves_to_compile_tells_the_policy_so(monkeypatch):
+    """The same read, in the direction that keeps the warning working."""
+    seen = {}
+    model = _CheckpointableLinear()
+    accelerator = _recompute_accelerator(enable=True)
+    accelerator.torch_compile.enable = True
+
+    real_build = recompute_utils.build_policy
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(recompute_utils, "build_policy", spy)
+    monkeypatch.setattr(ModuleRuntime, "_recompute_context", lambda self: None)
+
+    _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    assert seen["compile_enabled"] is True
+
+
+def test_the_recompute_apply_ranks_the_stacks_by_the_modules_basic_modules(monkeypatch):
+    """Ranking the block stacks is what ``basic_modules`` is for, and the composed scope
+    has to rank them like the ``fsdp_scope='module'`` wrap does, or one configuration
+    would bind different stacks in the two scopes."""
+    seen = []
+    model = _CheckpointableLinear()
+    monkeypatch.setattr(
+        recompute_utils,
+        "apply_recompute_policy",
+        lambda wrapped, policy, **kwargs: seen.append(kwargs),
+    )
+    accelerator = _recompute_accelerator(enable=True)
+
+    _unbuilt(model, accelerator=accelerator, basic_modules=["BlockA"])._apply_recompute_policy()
+
+    assert seen == [{"basic_modules": ["BlockA"]}]
+
+
+def test_reentrant_checkpointing_is_rejected_for_a_scoped_module(monkeypatch):
+    """Reentrant checkpointing takes no ``context_fn``, so a module that must recompute
+    inside its ParallelState cannot use it: the run would recompute with the wrong state
+    current. Rejected, not silently scoped out."""
+    model = _CheckpointableLinear()
+    accelerator = _recompute_accelerator(enable=True, enable_reentrant=True)
+
+    with pytest.raises(ValueError, match="enable_reentrant"):
+        _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    assert model.log == []
+
+
+def test_reentrant_checkpointing_is_only_rejected_while_checkpointing_is_on():
+    """``enable_reentrant`` says nothing with checkpointing off: no reentrant
+    checkpoint call happens, so the policy is built instead of failing the run."""
+    accelerator = _recompute_accelerator(enable=False, enable_reentrant=True)
+
+    policy = _unbuilt(accelerator=accelerator)._build_recompute_policy()
+
+    assert policy.use_reentrant is True
+
+
+def test_the_recompute_apply_is_a_no_op_when_checkpointing_is_off(monkeypatch):
+    calls = []
+    model = _CheckpointableLinear(calls)
+    monkeypatch.setattr(recompute_utils, "apply_recompute_policy", lambda *args, **kwargs: calls.append(("apply",)))
+    accelerator = SimpleNamespace(gradient_checkpointing=GradientCheckpointingConfig(enable=False))
+
+    _unbuilt(model, accelerator=accelerator)._apply_recompute_policy()
+
+    assert calls == []
 
 
 def test_distributed_inference_wraps_lora_before_loading_weights(monkeypatch):
@@ -399,3 +780,108 @@ def test_a_frozen_module_has_no_async_save_to_drain():
     runtime.checkpoint = None
 
     runtime.wait_for_pending_save()
+
+
+# ---------------------------------------------------------------- compile gate
+#
+# `module_compile_config` reads the accelerator only: the run switch, the wrap
+# mode, and (under `fsdp_scope='model'`) the launcher's mode. There is no
+# per-model capability flag — what compiles is decided by the config.
+
+
+def _compile_accelerator(*, enable=True, dynamic=False, fsdp_mode="fsdp2", mode=None):
+    return SimpleNamespace(
+        torch_compile=SimpleNamespace(enable=enable, backend="inductor", mode=mode, fullgraph=True, dynamic=dynamic),
+        fsdp_config=SimpleNamespace(fsdp_mode=fsdp_mode),
+    )
+
+
+@pytest.mark.parametrize(
+    ("run_enable", "dynamic", "fsdp_mode", "expected"),
+    [
+        (True, False, "fsdp2", (True, False)),
+        (True, True, "fsdp2", (True, True)),
+        # Unset is the default: torch picks, so it must reach `torch.compile` as
+        # None rather than being normalized to a bool.
+        (True, None, "fsdp2", (True, None)),
+        (False, True, "fsdp2", (False, False)),
+        (False, None, "fsdp2", (False, False)),
+        # ddp cannot compile: `compile_decoder_blocks` only runs under FSDP2
+        (True, True, "ddp", (False, False)),
+        (True, None, "ddp", (False, False)),
+    ],
+)
+def test_module_compile_config_reads_the_accelerator(run_enable, dynamic, fsdp_mode, expected):
+    """The module's config comes from its resolved accelerator, nothing else."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    config = module_compile_config(_compile_accelerator(enable=run_enable, dynamic=dynamic, fsdp_mode=fsdp_mode))
+
+    assert (config.enable, config.dynamic) == expected
+
+
+def test_a_module_under_ddp_stays_eager_rather_than_failing_its_wrap():
+    """The shipped Janus launcher puts ``janus_siglip`` on DDP."""
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    config = module_compile_config(_compile_accelerator(enable=True, dynamic=True, fsdp_mode="ddp"))
+    assert config.enable is False
+
+
+def test_the_launcher_gate_applies_only_when_the_composed_model_owns_the_wrap():
+    """A `fsdp2` module under a `ddp` launcher compiles when it owns its own wrap.
+
+    Under `fsdp_scope='module'` the module's own overlay *is* its wrap, so the
+    launcher's `fsdp_mode` is irrelevant. Under `fsdp_scope='model'` the composed
+    `OmniModel` wraps and validates the top-level accelerator, so it decides.
+    """
+    from veomni.models.seed_omni.accelerated.omni_module.omni_module_runtime import module_compile_config
+
+    module_acc = _compile_accelerator(enable=True)
+    ddp_launcher = SimpleNamespace(fsdp_config=SimpleNamespace(fsdp_scope="module", fsdp_mode="ddp"))
+
+    assert module_compile_config(module_acc).enable is True
+    assert module_compile_config(module_acc, global_accelerator=ddp_launcher).enable is False
+
+
+def test_a_composed_wrap_module_leaves_the_wrap_to_the_composed_model(monkeypatch):
+    """Under `fsdp_scope='model'` the module applies what precedes the wrap and returns.
+
+    The base build both compiles and wraps in one go, so calling it here would
+    wrap the module twice. Nothing is compiled on this path: the launcher rejects
+    `torch_compile` under this scope at parse time (`_validate_composed_wrap`), so
+    the module must not reach for the compiler either.
+    """
+    import torch.nn as nn
+
+    from veomni.distributed import torch_compile as tc_mod
+
+    calls = []
+    monkeypatch.setattr(tc_mod, "validate_compile_runtime", lambda *a, **k: None)
+    monkeypatch.setattr(tc_mod, "compile_decoder_blocks", lambda model, config, **k: (calls.append("compiled"), 1)[1])
+
+    class Block(nn.Module):
+        def forward(self, x):
+            return x
+
+    class Mod(nn.Module):
+        _no_split_modules = ["Block"]
+
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([Block()])
+
+    runtime = _unbuilt(Mod())
+    runtime._global_accelerator = _fsdp("model", compile_enable=True)
+    runtime.args.accelerator = _fsdp("model", compile_enable=True)
+    runtime._apply_async_activation_offload = lambda: calls.append("offload")
+
+    def base(*a, **k):
+        calls.append("base-build")
+        raise AssertionError("the composed path must not call the base build")
+
+    monkeypatch.setattr(type(runtime).__mro__[1], "_build_parallelized_model", base)
+
+    runtime._build_parallelized_model()
+
+    assert calls == ["offload"], calls

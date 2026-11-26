@@ -57,12 +57,12 @@ data:
   data_transform: minimax_h3_online
   datasets_type: mapping
   log_sample: false
-  shuffle: false
   text_keys: text
   dataloader:
     type: native
     num_workers: 0
     drop_last: false
+    shuffle: false
   mm_configs:
     data_dir: dataset/minimax-h3-demo/minimax_h3/MiniMax-H3-FL2VA/
     fps: 24

@@ -12,4 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+
+"""Register the local Wan config and model."""
+
+from veomni.models.registry import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
+
+
+@MODEL_CONFIG_REGISTRY.register("wan")
+def register_wan_config():
+    from .config_wan import WanConfig
+
+    return WanConfig
+
+
+@MODELING_REGISTRY.register("wan")
+def register_wan_modeling(_architecture: str):
+    from .modeling_wan import WanModel
+
+    return WanModel

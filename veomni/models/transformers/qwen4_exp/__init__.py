@@ -12,26 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ....utils.device import IS_NPU_AVAILABLE
-from ...loader import MODELING_REGISTRY
-from .checkpoint_tensor_converter import (
-    convert_qwen4_exp_fqn_to_index_mapping,
-    create_qwen4_exp_checkpoint_tensor_converter,
-)
+from veomni.models.registry import MODELING_REGISTRY
 
 
 @MODELING_REGISTRY.register("qwen4_exp")
 def register_qwen4_exp_modeling(architecture: str):
-    """Register the Qwen4-Exp VLM SFT implementation for the active device."""
+    """Register the Qwen4-Exp VLM SFT implementation."""
+    from .checkpoint_tensor_converter import (
+        convert_qwen4_exp_fqn_to_index_mapping,
+        create_qwen4_exp_checkpoint_tensor_converter,
+    )
+
     if architecture != "Qwen4ExpForConditionalGeneration":
         raise NotImplementedError(
             "The initial Qwen4-Exp integration supports only Qwen4ExpForConditionalGeneration for VLM SFT."
         )
 
-    if IS_NPU_AVAILABLE:
-        from .generated.patched_modeling_qwen4_exp_npu import Qwen4ExpForConditionalGeneration
-    else:
-        from .generated.patched_modeling_qwen4_exp_gpu import Qwen4ExpForConditionalGeneration
+    from .modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
 
     Qwen4ExpForConditionalGeneration._create_checkpoint_tensor_converter = staticmethod(
         create_qwen4_exp_checkpoint_tensor_converter

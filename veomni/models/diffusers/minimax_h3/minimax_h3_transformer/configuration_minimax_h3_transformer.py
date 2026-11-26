@@ -1,7 +1,7 @@
-from transformers import PretrainedConfig
+from veomni.models.configuration_base import VeOmniPretrainedConfig
 
 
-class MiniMaxH3DiTModelConfig(PretrainedConfig):
+class MiniMaxH3DiTModelConfig(VeOmniPretrainedConfig):
     model_type = "MiniMaxH3DiTModel"
     condition_model_type = "MiniMaxH3ConditionModel"
 
@@ -26,9 +26,15 @@ class MiniMaxH3DiTModelConfig(PretrainedConfig):
         norm_eps: float = 1e-5,
         qk_norm_eps: float = 1e-5,
         final_norm_eps: float = 1e-5,
+        audio_enabled: bool = True,
+        num_pdd_heads: int = 0,
+        condition_model_type: str = "MiniMaxH3ConditionModel",
         **kwargs,
     ):
         super().__init__(**kwargs)
+        if condition_model_type == "MiniMaxH3ImageConditionModel" and (audio_enabled or num_pdd_heads < 1):
+            raise ValueError("H3-Image conditioning requires the audio-free DiT with PDD heads.")
+        self.condition_model_type = condition_model_type
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.token_refiner_num_layers = token_refiner_num_layers
@@ -48,3 +54,13 @@ class MiniMaxH3DiTModelConfig(PretrainedConfig):
         self.norm_eps = norm_eps
         self.qk_norm_eps = qk_norm_eps
         self.final_norm_eps = final_norm_eps
+        self.audio_enabled = audio_enabled
+        self.num_pdd_heads = num_pdd_heads
+
+    @classmethod
+    def from_dict(cls, config_dict, **kwargs):
+        config_dict = dict(config_dict)
+        for name in ("condition_model_type", "audio_enabled", "num_pdd_heads"):
+            if name in kwargs:
+                config_dict[name] = kwargs.pop(name)
+        return super().from_dict(config_dict, **kwargs)

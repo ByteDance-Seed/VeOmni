@@ -30,7 +30,7 @@ NODE_RANK=${NODE_RANK:=0}
 MASTER_ADDR=${MASTER_ADDR:=192.168.1.100}
 # Master node port (default works for most cases)
 MASTER_PORT=${MASTER_PORT:=12345}
-# Number of NPUs per node (A2: max 8, A3: max 16)
+# Number of NPUs per node (Atlas A2 training products: max 8, Atlas A3 training products: max 16)
 NPROC_PER_NODE=${NPROC_PER_NODE:=8}
 ```
 
@@ -41,7 +41,7 @@ NPROC_PER_NODE=${NPROC_PER_NODE:=8}
 - `NODE_RANK`: Unique identifier for each node (0 to NNODES-1)
 - `MASTER_ADDR`: IP address of the master node (same for all machines)
 - `MASTER_PORT`: Communication port (default: 12345)
-- `NPROC_PER_NODE`: NPUs per node (A2: max 8, A3: max 16)
+- `NPROC_PER_NODE`: NPUs per node (Atlas A2 training products: max 8, Atlas A3 training products: max 16)
 
 **Important Notes**:
 - All nodes must communicate via `MASTER_ADDR:MASTER_PORT`
@@ -58,26 +58,27 @@ Configure the operators in your YAML configuration file:
 model:
   ops_implementation:
     # Use these only when replacing explicit GPU-only overrides.
-    rms_norm_implementation: "npu"
-    rotary_pos_emb_implementation: "npu"
-    swiglu_mlp_implementation: "eager"
+    rms_norm_implementation: "torch_npu"
+    rotary_pos_emb_implementation: "torch_npu"
+    gated_mlp_implementation: "eager"
     moe_implementation: "fused_npu"
 ```
 
 > **Configuration Location**: See the [operator implementation arguments](../usage/arguments.md#opsimplementationconfig).
 
 **NPU Optimized Operators**:
-VeOmni automatically maps default-valued general operator settings to NPU-compatible
-implementations:
+General operator settings left unset resolve to NPU-compatible implementations on NPU:
 
-- `npu_group_gemm`: [MoE GroupGEMM operator](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/moe/npu_group_gemm.py)
-- `npu_rms_norm`: [RMS normalization operator](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/rms_norm/npu.py)
-- `npu_rotary_mul`: [RoPE positional encoding operator](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/rotary/npu.py)
+- `npu_group_gemm`: [MoE GroupGEMM kernel](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/moe_experts/standard/npu.py)
+- `npu_rms_norm`: [RMS normalization kernel](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/rms_norm/standard/torch_npu.py)
+- `npu_rotary_mul`: [RoPE positional encoding kernel](https://github.com/ByteDance-Seed/VeOmni/blob/main/veomni/ops/kernels/rope/full/torch_npu.py)
 
-**Note**: Only fields that still equal their dataclass defaults are auto-mapped. Explicit
-non-default overrides are preserved and rejected if unsupported. Attention continues to use
+**Note**: Only unset fields take the NPU default. Explicit values are preserved and rejected
+if unsupported, so remove or replace GPU-only values such as `liger_kernel` and `fused_triton`
+when reusing a GPU YAML. Attention continues to use
 the configured HuggingFace attention backend. Qwen3.5's `rms_norm_gated`, `causal_conv1d`,
-and `chunk_gated_delta_rule` fields are model-specific and must be set to `npu` explicitly.
+and `chunk_gated_delta_rule` fields are model-specific and must be set to their Ascend values
+(`torch_npu`, `triton`, or `fla_npu`) explicitly.
 
 ## Q: How to resolve "'global batch size' should be a multiple of 8/16/32" error?
 

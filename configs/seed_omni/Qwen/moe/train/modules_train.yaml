@@ -1,0 +1,24 @@
+qwen3_text_encoder:
+  model_path: qwen3_text_encoder
+  accelerator:
+    gradient_checkpointing:
+      enable: false
+qwen3_moe_llm:
+  model_path: qwen3_moe_llm
+  # Per-rank EP-slice streaming: each rank reads only its own experts' rows
+  # straight from the checkpoint instead of every rank reading all of them.
+  # Needs the every-rank-reads path, so the rank0 broadcast is off here.
+  broadcast_model_weights_from_rank0: false
+  extra_parallel_stream_load: true
+  accelerator:
+    # Scalar `ep_size: 4` works when the raw `extra_parallel_*` lists are empty
+    # (`AcceleratorConfig.resolved_extra_parallel` folds `ep_size` in on demand).
+    # We still spell out all three position-paired lists explicitly here so that:
+    # 1. if a launcher's global accelerator lists `"ep"` explicitly (which takes
+    #    precedence over scalar `ep_size`), this module's width still wins; and
+    # 2. if the global accelerator adds another dim (e.g. a text encoder's `emb`),
+    #    replacing all three lists together keeps their lengths aligned and keeps
+    #    only `ep` on the backbone.
+    extra_parallel_names: ["ep"]
+    extra_parallel_sizes: [4]
+    extra_parallel_placement_innermost: [false]

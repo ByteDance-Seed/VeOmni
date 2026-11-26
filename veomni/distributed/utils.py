@@ -123,19 +123,33 @@ def check_fqn_match(fqn_pattern: str, fqn: str, prefix: str = None):
 
 
 def sort_fqn_by_submodule_first(fqn_list: list[str]) -> list[str]:
-    """
-    Sort FQN list purely by string nesting relationship (ignore depth calculation)
-    """
+    """Sort FQNs so every descendant precedes its ancestors while preserving sibling order."""
+    first_index: dict[str, int] = {}
+    for idx, fqn in enumerate(fqn_list):
+        first_index.setdefault(fqn, idx)
 
-    def _fqn_nesting_compare(a: str, b: str) -> int:
-        if a in b and a != b:
-            return 1
-        elif b in a and b != a:
-            return -1
-        else:
-            return 0
+    def _nearest_ancestor_index(fqn: str) -> int | None:
+        if not fqn:
+            return None
+        pos = fqn.rfind(".")
+        while pos != -1:
+            candidate = fqn[:pos]
+            if candidate in first_index:
+                return first_index[candidate]
+            pos = fqn.rfind(".", 0, pos)
+        return first_index.get("")
 
-    from functools import cmp_to_key
+    children: dict[int | None, list[int]] = {}
+    for idx, fqn in enumerate(fqn_list):
+        parent_idx = _nearest_ancestor_index(fqn)
+        children.setdefault(parent_idx, []).append(idx)
 
-    sorted_list = sorted(fqn_list, key=cmp_to_key(_fqn_nesting_compare))
-    return sorted_list
+    result: list[str] = []
+
+    def _visit(parent_idx: int | None) -> None:
+        for child_idx in children.get(parent_idx, ()):
+            _visit(child_idx)
+            result.append(fqn_list[child_idx])
+
+    _visit(None)
+    return result

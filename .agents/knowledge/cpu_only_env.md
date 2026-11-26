@@ -16,13 +16,11 @@ Some hosted environments pre-run that sync in a startup script, in which case
 `PATH`, check `~/.local/bin`.
 
 Do not add `--extra magi` on a CPU-only host: MagiAttention source-builds CUDA
-extensions and is NVIDIA SM90+ only.
+extensions and is NVIDIA SM100+ only.
 
 ## What works CPU-only (use these to validate changes without hardware)
 
 - Lint gate: `make quality` (and `make style` to auto-fix) — see `Makefile`.
-- Patchgen drift: `make check-patchgen` (i.e. `patchgen --check`; CI equivalent
-  of the check_patchgen job).
 - Device API check — the `-d` flag takes a single directory, so run it once per dir:
   `for d in veomni tasks tests; do python tests/special_sanity/check_device_api_usage.py -d "$d"; done`.
 - The CPU subset of `pytest` (registry/ops-gate/eager/data/lora-unit/converter/

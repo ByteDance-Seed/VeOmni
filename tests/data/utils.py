@@ -31,6 +31,9 @@ def setup_test_distributed(args):
     """Initialize a minimal distributed runtime for data tests.
 
     Returns the device and the ``ParallelState``.
+
+    Registers under ``"base"`` because callers stand in for ``BaseTrainer._setup``,
+    and ``BaseTrainer`` scopes its build under ``use_parallel_state("base")``.
     """
     device_type = get_device_type()
     if device_type != "cpu":
@@ -48,6 +51,9 @@ def setup_test_distributed(args):
             rank=int(os.environ["RANK"]),
         )
 
+    extra_parallel_names, extra_parallel_sizes, extra_parallel_placement_innermost = (
+        args.model.accelerator.resolved_extra_parallel
+    )
     parallel_state = _init_parallel_state(
         dp_size=args.model.accelerator.dp_size,
         dp_replicate_size=args.model.accelerator.dp_replicate_size,
@@ -56,10 +62,11 @@ def setup_test_distributed(args):
         pp_size=args.model.accelerator.pp_size,
         cp_size=args.model.accelerator.cp_size,
         ulysses_size=args.model.accelerator.ulysses_size,
-        extra_parallel_sizes=args.model.accelerator.extra_parallel_sizes,
-        extra_parallel_placement_innermost=args.model.accelerator.extra_parallel_placement_innermost,
-        extra_parallel_names=args.model.accelerator.extra_parallel_names,
+        extra_parallel_sizes=extra_parallel_sizes,
+        extra_parallel_placement_innermost=extra_parallel_placement_innermost,
+        extra_parallel_names=extra_parallel_names,
         dp_mode=args.model.accelerator.fsdp_config.fsdp_mode,
+        name="base",
     )
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
     return device, parallel_state

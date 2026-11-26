@@ -14,6 +14,7 @@
 
 # Following codes are inspired from https://github.com/volcengine/verl/blob/main/verl/utils/device.py
 
+import os
 from typing import Any
 
 import torch
@@ -26,13 +27,21 @@ logger = logging.get_logger(__name__)
 
 
 IS_CUDA_AVAILABLE = torch.cuda.is_available()
-IS_NPU_AVAILABLE = is_torch_npu_available()
+# ``is_torch_npu_available`` is a package-install check. Tests that disable
+# ``TORCH_DEVICE_BACKEND_AUTOLOAD`` still have the package, but ``torch.npu`` is
+# not registered, so treat that as NPU-unavailable rather than crashing on import.
+IS_NPU_AVAILABLE = is_torch_npu_available() and hasattr(torch, "npu")
 IS_MLU_AVAILABLE = is_torch_mlu_available()
 
 if IS_NPU_AVAILABLE:
     torch.npu.config.allow_internal_format = False
 
 MOE_TRITON_DEVICE_TYPES = ("cuda", "mlu")
+# Backends whose torch build registers a ``torch._fused_adamw_`` kernel.
+FUSED_ADAMW_DEVICE_TYPES = ("cuda", "npu")
+# Backends the swap optimizer's async copy streams are validated on; other
+# accelerators (e.g. MLU) copy synchronously.
+STREAM_DEVICE_TYPES = ("cuda", "npu")
 
 
 def get_device_type() -> str:
@@ -47,6 +56,11 @@ def get_device_type() -> str:
         device = "cpu"
 
     return device
+
+
+def is_nvidia_cuda_device(device: torch.types.Device | int | None) -> bool:
+    """Return whether an explicit device uses NVIDIA CUDA rather than ROCm."""
+    return device is not None and torch.device(device).type == "cuda" and torch.version.hip is None
 
 
 def get_device_name() -> str:
@@ -68,6 +82,25 @@ def get_torch_device() -> Any:
 def get_device_id() -> int:
     """Get current device id based on device type."""
     return get_torch_device().current_device()
+
+
+def is_caching_allocator_active() -> bool:
+    """Whether ``record_stream`` can defer the free of an accelerator allocation.
+
+    Only the native CUDA caching allocator keeps a block alive until the recording
+    stream reaches it. Every other backend returns False so the caller keeps its
+    host synchronize: NPU / MLU allocators, the async backend (its
+    ``record_stream`` keeps no per-block stream-use list), and
+    ``PYTORCH_NO_CUDA_MEMORY_CACHING`` (which makes ``record_stream`` a no-op).
+    """
+    if get_device_type() != "cuda":
+        return False
+    if os.environ.get("PYTORCH_NO_CUDA_MEMORY_CACHING", "0") not in ("0", ""):
+        return False
+    try:
+        return get_torch_device().memory.get_allocator_backend() == "native"
+    except Exception:
+        return False
 
 
 def is_moe_kernel_supported(device: torch.device | str) -> bool:
@@ -106,8 +139,10 @@ def stream_synchronize() -> None:
 
 
 def empty_cache() -> None:
-    """Execute torch empty cache operation."""
-    get_torch_device().empty_cache()
+    """Release unused accelerator cache when the active device supports it."""
+    device = get_torch_device()
+    if hasattr(device, "empty_cache"):
+        device.empty_cache()
 
 
 def set_device(device: torch.types.Device) -> None:
@@ -181,18 +216,12 @@ def is_sm90_or_above() -> bool:
     return get_gpu_compute_capability() >= 90
 
 
-def create_stream(device: torch.device | None = None, priority: int = 0) -> Any:
+def create_stream(device=None, priority: int = 0) -> Any:
     """Create a device stream (CUDA/NPU-agnostic)."""
     device_type = get_device_type()
     device_api = get_torch_device()
-
-    # ``torch.cpu.Stream`` intentionally has a smaller constructor than the
-    # CUDA/NPU stream implementations.  Passing ``device`` or ``priority``
-    # through unconditionally makes CPU-only unit tests fail before they can
-    # exercise the device-agnostic caller.
     if device_type == "cpu":
         return device_api.Stream()
-
     kwargs = {}
     if device is not None:
         kwargs["device"] = device
@@ -205,14 +234,20 @@ def create_event(enable_timing: bool = False, blocking: bool = False) -> Any:
     """Create a device event (CUDA/NPU-agnostic)."""
     device_api = get_torch_device()
     if get_device_type() == "cpu":
-        # ``torch.cpu.Event`` is a no-argument synchronization marker.
         return device_api.Event()
     return device_api.Event(enable_timing=enable_timing, blocking=blocking)
 
 
-def get_current_stream() -> Any:
+def get_current_stream(device=None) -> Any:
     """Get the current device stream."""
-    return get_torch_device().current_stream()
+    if device is None:
+        return get_torch_device().current_stream()
+    return get_torch_device().current_stream(device=device)
+
+
+def switch_to_stream(stream: Any) -> Any:
+    """Set the given stream as the current compute stream; returns the previous stream."""
+    return get_torch_device().set_stream(stream)
 
 
 def switch_to_specified_stream(stream: Any) -> Any:
@@ -230,8 +265,9 @@ def get_compute_units():
 
     # Use match/case for device-specific logic (Python 3.10+)
     match device_type:
-        case "cuda":
-            device_properties = torch.cuda.get_device_properties(0)
+        case "cuda" | "npu":
+            # An NPU publishes the same counter as CUDA: one entry per AI core.
+            device_properties = getattr(torch, device_type).get_device_properties(0)
             NUM_SMS = device_properties.multi_processor_count
         case "xpu":
             device_properties = torch.xpu.get_device_properties(0)
@@ -240,7 +276,7 @@ def get_compute_units():
             device_properties = torch.mlu.get_device_properties(0)
             NUM_SMS = device_properties.multi_processor_count
         case _:
-            print("No CUDA, XPU, or MLU device available. Using CPU.")
+            print("No CUDA, NPU, XPU, or MLU device available. Using CPU.")
             # For CPU, you might want to use the number of CPU cores
             NUM_SMS = torch.get_num_threads()
 

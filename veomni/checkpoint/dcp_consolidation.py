@@ -22,6 +22,8 @@
 This module provides monkey patches for:
 - Distributed file systems (e.g., HDFS via FUSE) that do not support r+b
   (read-write binary) file mode for random write access.
+- Bounded-memory chunked streaming when consolidating contiguous dim-0
+  whole-row shards, avoiding full-tensor host ``bytearray`` allocations.
 - Integer and boolean tensors, whose byte sizes PyTorch's consolidator computes
   with ``torch.finfo`` even though it only accepts floating-point dtypes.
 """
@@ -147,49 +149,151 @@ def apply_dcp_consolidation_patch():
     # This is a modified version of torch.distributed.checkpoint._consolidate_hf_safetensors._process_output_file
     # Original: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/distributed/checkpoint/_consolidate_hf_safetensors.py
     # Key change: Use append mode ("ab") instead of read-write mode ("r+b") for HDFS FUSE compatibility
+    # Second change: every input shard is opened once per output file. Upstream opens
+    # and maps each shard again for every tensor it holds; with FSDP every tensor is
+    # in every rank's shard, and on HDFS FUSE those opens dominate (~1 MB/s observed).
+    # Third change: stream contiguous dim-0 whole-row shards directly to the output file
+    # in bounded chunks instead of allocating a full-tensor bytearray in host RAM, so
+    # large carried or row-sharded tensors do not OOM the consolidating rank.
     def _process_output_file_impl(output_file, output_data, input_files_data):
+        """Consolidate sharded safetensor slices into ``output_file`` with up to 32 pinned input streams."""
+        copy_chunk_bytes = 64 << 20
         sorted_tensors = sorted(output_data.fqn_data.items(), key=lambda x: x[1].offset_in_file)
+        input_streams = {}
 
-        with open(output_file, "ab") as output_stream:  # Changed from "r+b"
-            for tensor_fqn, tensor_fqn_data in sorted_tensors:
-                full_tensor_mv = memoryview(
-                    bytearray(math.prod(tensor_fqn_data.shape_in_file) * tensor_fqn_data.dtype_size)
-                )
+        def _get_input_stream(safetensors_file):
+            stream = input_streams.get(safetensors_file)
+            if stream is not None:
+                return stream, False
+            if len(input_streams) < 32:
+                stream = input_streams[safetensors_file] = open(safetensors_file, "rb")
+                return stream, False
+            return open(safetensors_file, "rb"), True
 
-                for safetensors_file in input_files_data:
-                    file_metadata = input_files_data[safetensors_file].metadata
-                    input_metadata_size = input_files_data[safetensors_file].metadata_size
+        def _stream_slice(safetensors_file, read_offset, read_length, output_stream, tensor_fqn):
+            stream, should_close = _get_input_stream(safetensors_file)
+            try:
+                stream.seek(read_offset)
+                remaining = read_length
+                while remaining > 0:
+                    chunk = stream.read(min(copy_chunk_bytes, remaining))
+                    if not chunk:
+                        raise EOFError(
+                            f"Unexpected EOF while reading {tensor_fqn!r} from {safetensors_file} "
+                            f"({remaining} bytes remaining)."
+                        )
+                    output_stream.write(chunk)
+                    remaining -= len(chunk)
+            finally:
+                if should_close:
+                    stream.close()
 
-                    if tensor_fqn not in file_metadata:
+        def _ordered_contiguous_dim0_shards(shard_entries, target_shape, dtype_size, expected_total_bytes):
+            if not target_shape or not shard_entries:
+                return None
+            ndim = len(target_shape)
+            tail_shape = target_shape[1:]
+            # Keep the last shard for any duplicate (offset, shape) to match upstream overwrite semantics.
+            dedup = {}
+            for entry in shard_entries:
+                _, _, read_length, saved_offsets, shard_shape = entry
+                if (
+                    len(saved_offsets) != ndim
+                    or len(shard_shape) != ndim
+                    or any(offset != 0 for offset in saved_offsets[1:])
+                    or list(shard_shape[1:]) != tail_shape
+                    or read_length != math.prod(shard_shape) * dtype_size
+                ):
+                    return None
+                if shard_shape[0] == 0:
+                    continue
+                dedup[(tuple(saved_offsets), tuple(shard_shape))] = entry
+
+            ordered = sorted(dedup.values(), key=lambda item: item[3][0])
+            next_row = 0
+            streamed_bytes = 0
+            for _, _, read_length, saved_offsets, shard_shape in ordered:
+                if saved_offsets[0] != next_row:
+                    return None
+                next_row += shard_shape[0]
+                streamed_bytes += read_length
+            if next_row != target_shape[0] or streamed_bytes != expected_total_bytes:
+                return None
+            return ordered
+
+        try:
+            with open(output_file, "ab") as output_stream:  # Changed from "r+b"
+                for tensor_fqn, tensor_fqn_data in sorted_tensors:
+                    target_shape = list(tensor_fqn_data.shape_in_file)
+                    dtype_size = tensor_fqn_data.dtype_size
+                    expected_total_bytes = math.prod(target_shape) * dtype_size
+                    if expected_total_bytes == 0:
                         continue
 
-                    metadata = file_metadata[tensor_fqn]
-                    data_offsets = metadata[DATA_OFFSETS_KEY]
+                    shard_entries = []
+                    for safetensors_file in input_files_data:
+                        file_metadata = input_files_data[safetensors_file].metadata
+                        if tensor_fqn not in file_metadata:
+                            continue
+                        input_metadata_size = input_files_data[safetensors_file].metadata_size
+                        metadata = file_metadata[tensor_fqn]
+                        data_offsets = metadata[DATA_OFFSETS_KEY]
+                        read_offset = input_metadata_size + data_offsets[0]
+                        read_length = data_offsets[1] - data_offsets[0]
+                        fqn_custom_metadata = _get_dcp_custom_metadata(file_metadata)[tensor_fqn]
+                        shard_entries.append(
+                            (
+                                safetensors_file,
+                                read_offset,
+                                read_length,
+                                fqn_custom_metadata[SAVED_OFFSETS_KEY],
+                                metadata[SHAPE_KEY],
+                            )
+                        )
 
-                    # These functions are resolved from hf_module's globals at runtime
-                    data_to_write = _read_tensor_data_mmap(
-                        safetensors_file,
-                        data_offsets[0],
-                        data_offsets[1],
-                        input_metadata_size,
+                    ordered_shards = _ordered_contiguous_dim0_shards(
+                        shard_entries, target_shape, dtype_size, expected_total_bytes
                     )
+                    if ordered_shards is not None:
+                        for safetensors_file, read_offset, read_length, _, _ in ordered_shards:
+                            _stream_slice(safetensors_file, read_offset, read_length, output_stream, tensor_fqn)
+                        continue
 
-                    fqn_custom_metadata = _get_dcp_custom_metadata(file_metadata)[tensor_fqn]
-                    offsets_of_tensor_being_read = fqn_custom_metadata[SAVED_OFFSETS_KEY]
+                    full_tensor_mv = memoryview(bytearray(expected_total_bytes))
+                    for safetensors_file, read_offset, read_length, saved_offsets, shard_shape in shard_entries:
+                        stream, should_close = _get_input_stream(safetensors_file)
+                        try:
+                            stream.seek(read_offset)
+                            data_to_write = stream.read(read_length)
+                        finally:
+                            if should_close:
+                                stream.close()
 
-                    _write_sub_tensor_to_file_optimized(
-                        full_tensor_mv,
-                        data_to_write,
-                        tensor_fqn_data.dtype_size,
-                        tensor_fqn_data.shape_in_file,
-                        offsets_of_tensor_being_read,
-                        metadata[SHAPE_KEY],
-                    )
+                        # Resolved from hf_module's globals at runtime
+                        _write_sub_tensor_to_file_optimized(
+                            full_tensor_mv,
+                            data_to_write,
+                            dtype_size,
+                            target_shape,
+                            saved_offsets,
+                            shard_shape,
+                        )
 
-                output_stream.write(full_tensor_mv)
+                    output_stream.write(full_tensor_mv)
+        finally:
+            for input_stream in input_streams.values():
+                input_stream.close()
 
     def _parse_input_metadata_impl(input_files_data, output_files_data):
-        from safetensors.torch import _getdtype
+        """Parse input safetensor shard metadata using element_size() and F8_E8M0 fallback."""
+        from safetensors.torch import _getdtype as _safetensors_getdtype
+
+        def _getdtype(dtype_str: str) -> torch.dtype:
+            """Resolve safetensors dtype string to torch.dtype with F8_E8M0 support."""
+            # Older safetensors releases cannot name e8m0, which block-scaled checkpoints store.
+            if dtype_str == "F8_E8M0" and hasattr(torch, "float8_e8m0fnu"):
+                return torch.float8_e8m0fnu
+            return _safetensors_getdtype(dtype_str)
 
         fqn_to_size_mapping = {}
 

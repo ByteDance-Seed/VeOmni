@@ -51,6 +51,10 @@ class OmniModelRuntimeArguments(ModelArguments):
     train_type: Optional[str] = None
     infer_type: Optional[str] = None
     generation_kwargs: dict[str, Any] = field(default_factory=dict)
+    # Filled by ``build_omni_model_runtime_args``: the weight-free split view when
+    # ``model_path`` is an upstream HF checkpoint, otherwise equal to ``model_path``.
+    # A launcher value is overwritten; ``model_path`` itself is never rewritten.
+    seed_omni_model_path: Optional[str] = None
 
     def launcher_config(self, key: str, default: Any = None) -> Any:
         """Read a launcher layout key from ``model_config`` (``modules``, graphs, …)."""
@@ -63,7 +67,13 @@ class OmniModelRuntimeArguments(ModelArguments):
 
     @property
     def resolved_model_path(self) -> str:
-        path = self.model_path
+        """Root every SeedOmni consumer reads for configs / assets / graphs.
+
+        Prefer :attr:`seed_omni_model_path` (set during args resolution). Fall
+        back to :attr:`model_path` only when the runtime was built without going
+        through :func:`~veomni.arguments.omni_arguments_types.build_omni_model_runtime_args`.
+        """
+        path = self.seed_omni_model_path or self.model_path
         if not path:
             raise ValueError("`model.model_path` (split-checkpoint root) is required for OmniModel.")
         return path

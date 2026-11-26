@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence,
 
 import torch
 import torch.nn as nn
-from torch.distributed._tensor import DTensor
+from torch.distributed._tensor import DTensor, Shard
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_optimizer_state_dict,
@@ -92,11 +92,16 @@ def _collect_ep_replicated_lora_param_ids(model: "nn.Module") -> set[int]:
             for n, p in mod.named_parameters(recurse=True):
                 if not p.requires_grad:
                     continue
-                # Catches wrong call-order misuse: if any matched LoRA param
-                # is still a plain ``nn.Parameter`` (not a DTensor) at this
-                # point, FSDP2 hasn't wrapped yet -- ``build_optimizer`` was
-                # invoked before ``build_parallelize_model``. The snapshot
-                # we are about to take would be stale immediately.
+                # A plain ``nn.Parameter`` here used to mean "build_optimizer ran
+                # before build_parallelize_model" -- a real misuse, because the
+                # snapshot would be stale the moment FSDP2 rewrapped the module.
+                # Under ``extra_parallel_only`` there is no wrap to wait for, so
+                # these stay plain tensors by design and the snapshot is already
+                # final. Distinguish the two by asking whether the model was
+                # wrapped at all, rather than by the parameter's type.
+                if not isinstance(p, DTensor) and getattr(get_parallel_state(), "extra_parallel_only", False):
+                    out.add(id(p))
+                    continue
                 assert isinstance(p, DTensor), (
                     f"_collect_ep_replicated_lora_param_ids: LoRA param {n!r} on a "
                     f"LoraSharedExperts wrapper is not a DTensor -- call "
@@ -148,36 +153,6 @@ def filter_empty_param_groups(
             total - len(non_empty),
         )
     return non_empty
-
-
-def restore_optimizer_param_group_defaults(optimizer: Any) -> None:
-    """Re-apply optimizer defaults to param groups after DCP load.
-
-    Recurses into containers of optimizers so the safety net reaches every real
-    optimizer regardless of how it was passed:
-
-    * a plain ``dict`` of optimizers (the form PyTorch DCP APIs natively accept),
-    * a ``MultiOptimizer`` (ExtraParallel+FSDP2 / Muon), which has no top-level
-      ``defaults``/``param_groups`` and wraps sub-optimizers in ``optimizers_dict``.
-    """
-    if isinstance(optimizer, dict):
-        for sub_optimizer in optimizer.values():
-            restore_optimizer_param_group_defaults(sub_optimizer)
-        return
-
-    sub_optimizers = getattr(optimizer, "optimizers_dict", None)
-    if sub_optimizers is not None:
-        for sub_optimizer in sub_optimizers.values():
-            restore_optimizer_param_group_defaults(sub_optimizer)
-        return
-
-    defaults = getattr(optimizer, "defaults", None)
-    param_groups = getattr(optimizer, "param_groups", None)
-    if not defaults or not param_groups:
-        return
-    for group in param_groups:
-        for key, value in defaults.items():
-            group.setdefault(key, value)
 
 
 # https://github.com/meta-llama/llama-recipes/blob/v0.0.4/src/llama_recipes/policies/anyprecision_optimizer.py
@@ -451,9 +426,48 @@ def _collect_muon_kwargs(optimizer_cfg: "OptimizerConfig") -> Dict[str, Any]:
         # Resolved against the model in _build_muon_with_adamw, not ctor kwargs.
         "head_group_size": int(optimizer_cfg.muon_head_group_size),
         "head_split_modules": tuple(optimizer_cfg.muon_head_split_modules),
+        # NS workspace bound; only meaningful on the muon_expert_zero_comm path.
+        "expert_ns_max_experts": int(optimizer_cfg.muon_expert_ns_max_experts),
         # Surface for startup summary only; not a DistributedMuon ctor kwarg.
         "expert_zero_comm": bool(optimizer_cfg.muon_expert_zero_comm),
     }
+
+
+def _build_state_offload_optimizer(
+    optimizer_type: str,
+    param_groups: Sequence[Dict[str, Any]],
+    *,
+    lr: float,
+    betas: Tuple[float, float],
+    eps: float,
+    weight_decay: float,
+    optimizer_config: Optional["OptimizerConfig"],
+) -> "Optimizer":
+    """Build the optimizer whose moment states live in host buffers.
+
+    ``model.optimizer.state_offload='cpu'`` is a placement choice, not an algorithm: the
+    algorithm dispatch lives here, so a new offloadable algorithm is one branch
+    rather than one helper per algorithm. Muon will add its own ``elif`` (its
+    AdamW leaf is what carries host state today).
+    """
+    if optimizer_type == "adamw":
+        from .swap_adamw import SwapAdamW
+
+        return SwapAdamW(
+            param_groups,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            device_memory_fraction=(
+                0.8 if optimizer_config is None else optimizer_config.state_offload_device_memory_fraction
+            ),
+            pin_memory=True if optimizer_config is None else optimizer_config.state_offload_pin_memory,
+        )
+    else:
+        raise ValueError(
+            f"model.optimizer.state_offload='cpu' is only supported for type='adamw'; got type={optimizer_type!r}."
+        )
 
 
 def build_optimizer(
@@ -473,12 +487,17 @@ def build_optimizer(
     """Build the optimizer.
 
     ``optimizer_config`` lets callers hand over the whole ``OptimizerConfig`` so
-    that optimizer-specific knobs (currently Muon's ``muon_*`` fields) are read
-    here rather than unpacked by every trainer. It does *not* supply ``lr``,
-    ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit arguments,
-    because callers such as the VLM trainer drive the AdamW side from their own
-    param groups. ``muon_kwargs`` overrides the config key by key, for callers
-    that build Muon without an ``OptimizerConfig`` at all.
+    that optimizer-specific knobs (currently Muon's ``muon_*`` fields and
+    ``state_offload='cpu'``'s ``state_offload_device_memory_fraction``/``state_offload_pin_memory``)
+    are read here rather than unpacked by every trainer. It does *not* supply
+    ``lr``, ``weight_decay`` or the ``no_decay_*`` lists — those stay explicit
+    arguments, because callers such as the VLM trainer drive the AdamW side from
+    their own param groups. ``muon_kwargs`` overrides the config key by key, for
+    callers that build Muon without an ``OptimizerConfig`` at all.
+
+    ``fused`` drives the stock ``AdamW`` path only: the state-offload optimizer
+    selects the fused kernel from the backend (``FUSED_ADAMW_DEVICE_TYPES``) and
+    takes the elementwise path elsewhere.
     """
     if optimizer_type == "muon":
         if optimizer_config is not None:
@@ -509,7 +528,17 @@ def build_optimizer(
 
     if _should_build_extra_parallel_aware(model):
         return build_extra_parallel_fsdp2_optimizer(
-            model, lr, betas, eps, weight_decay, fused, optimizer_type, param_groups, no_decay_modules, no_decay_params
+            model,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            fused,
+            optimizer_type,
+            param_groups,
+            no_decay_modules,
+            no_decay_params,
+            optimizer_config=optimizer_config,
         )
     if param_groups is None:
         decay_param_names = get_parameter_names(model, no_decay_modules, no_decay_params)
@@ -536,6 +565,19 @@ def build_optimizer(
     if not param_groups:
         raise ValueError("All optimizer param groups are empty; no trainable parameters to optimize.")
 
+    if optimizer_config is not None and optimizer_config.state_offload == "cpu":
+        # State offload is a placement choice, not a new algorithm: dispatch on it
+        # first; the algorithm branch lives in the helper.
+        return _build_state_offload_optimizer(
+            optimizer_type,
+            param_groups,
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            optimizer_config=optimizer_config,
+        )
+
     if optimizer_type == "adamw":
         foreach = not fused
         fused = fused
@@ -552,8 +594,17 @@ def build_optimizer(
 
 
 def _is_extra_parallel_param(p: torch.nn.Parameter, extra_parallel_names: Sequence[str]) -> Optional[str]:
-    """Return the ExtraParallel name for a DTensor param, or ``None``."""
+    """Return the ExtraParallel name for a plan-sharded param, or ``None``.
+
+    Under FSDP2 a plan shard is a DTensor on the ``{para}_fsdp`` mesh. Without the
+    wrap (``extra_parallel_only``) it stays a plain local tensor, and only the
+    ``spec_info`` the plan attached says it holds distinct rows on every rank.
+    """
     if DTensor is None or not isinstance(p, DTensor):
+        spec_info = getattr(p, "spec_info", None)
+        if spec_info is not None and isinstance(spec_info.placement, Shard):
+            if spec_info.para_name in extra_parallel_names:
+                return spec_info.para_name
         return None
     mesh = getattr(p, "device_mesh", None)
     names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
@@ -703,7 +754,9 @@ def _build_muon_with_adamw(
         f"momentum={float(muon_kwargs.get('momentum', 0.95)):g}, "
         f"nesterov={bool(muon_kwargs.get('nesterov', True))}, "
         f"expert_zero_comm={expert_zero_comm} "
-        "(applied at FSDP parallelize; see [muon_expert_zero_comm] logs)."
+        "(applied at FSDP parallelize; see [muon_expert_zero_comm] logs), "
+        f"expert_ns_max_experts={int(muon_kwargs.get('expert_ns_max_experts', -1))} "
+        "(-1 = NS chunking disabled)."
     )
     if head_split_names:
         blocks_hist: Dict[int, int] = {}
@@ -735,6 +788,7 @@ def _build_muon_with_adamw(
             adjust_lr_fn=muon_kwargs.get("adjust_lr_fn", "match_rms_adamw"),
             ns_implementation=muon_kwargs.get("ns_implementation", "gram_quack"),
             gram_ns_reset_iterations=muon_kwargs.get("gram_ns_reset_iterations", (2,)),
+            expert_ns_max_experts=muon_kwargs.get("expert_ns_max_experts", -1),
         )
 
     def _make_adamw(params: List[torch.nn.Parameter]) -> AdamW:
@@ -782,6 +836,7 @@ def build_extra_parallel_fsdp2_optimizer(
     param_groups: Optional[List[Dict[str, Any]]] = None,
     no_decay_modules: Optional[List[str]] = None,
     no_decay_params: Optional[List[str]] = None,
+    optimizer_config: Optional["OptimizerConfig"] = None,
 ):
     """
     Build a MultiOptimizer instance when model is parallelized with ExtraParallel+FSDP2
@@ -828,18 +883,10 @@ def build_extra_parallel_fsdp2_optimizer(
                 if not p.requires_grad:
                     continue
 
-                # Check if this parameter is part of ExtraParallel
-                is_extra_parallel_params = False
-                if DTensor is not None and isinstance(p, DTensor):
-                    mesh = getattr(p, "device_mesh", None)
-                    names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
-                    for para in parallel_state.extra_parallel_names:
-                        if f"{para}_fsdp" in names:
-                            group_extra_parallel_params[para].append(p)
-                            is_extra_parallel_params = True
-                            break
-
-                if not is_extra_parallel_params:
+                para = _is_extra_parallel_param(p, parallel_state.extra_parallel_names)
+                if para is not None:
+                    group_extra_parallel_params[para].append(p)
+                else:
                     group_non_extra_parallel_params.append(p)
 
             # Create subgroups with weight decay handling
@@ -879,21 +926,11 @@ def build_extra_parallel_fsdp2_optimizer(
             if not p.requires_grad:
                 continue
 
-            # Check if this parameter is part of ExtraParallel
-            is_extra_parallel_params = False
-            if DTensor is not None and isinstance(p, DTensor):
-                mesh = getattr(p, "device_mesh", None)
-                names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
-                logger.debug_rank0(f"param {name} has device_mesh {mesh} with mesh dim names {names}")
-
-                for para in parallel_state.extra_parallel_names:
-                    if f"{para}_fsdp" in names:
-                        logger.debug_rank0(f"Adding {name} to {para}_params in extra_parallel+fsdp2 optimizer")
-                        extra_parallel_params[para].append(p)
-                        is_extra_parallel_params = True
-                        break
-
-            if not is_extra_parallel_params:
+            para = _is_extra_parallel_param(p, parallel_state.extra_parallel_names)
+            if para is not None:
+                logger.debug_rank0(f"Adding {name} to {para}_params in extra_parallel+fsdp2 optimizer")
+                extra_parallel_params[para].append(p)
+            else:
                 logger.debug_rank0(f"Adding {name} to non_extra_parallel_params in extra_parallel+fsdp2 optimizer")
                 non_extra_parallel_params.append(p)
 
@@ -908,7 +945,23 @@ def build_extra_parallel_fsdp2_optimizer(
             model, non_extra_parallel_params, weight_decay, no_decay_modules, no_decay_params
         )
 
+    # Each SwapAdamW leaf owns its own swap stream: the MultiOptimizer steps its
+    # leaves serially and every leaf drains its stream at the end of its own
+    # ``step``, so there is no cross-leaf copy to serialize.
+
     def _build(groups: Sequence[Dict[str, Any]]) -> Optimizer:
+        if optimizer_config is not None and optimizer_config.state_offload == "cpu":
+            # Same outer dispatch as the dense path: offload decides placement,
+            # the helper decides the algorithm.
+            return _build_state_offload_optimizer(
+                optimizer_type,
+                groups,
+                lr=lr,
+                betas=betas,
+                eps=eps,
+                weight_decay=weight_decay,
+                optimizer_config=optimizer_config,
+            )
         if optimizer_type == "adamw":
             nonlocal fused
             foreach = not fused

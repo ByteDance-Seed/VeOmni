@@ -128,7 +128,7 @@ def _extract_qwen3_topk(output: Any) -> Optional[torch.Tensor]:
 
 # ---------------------------------------------------------------------------
 # External-record routers. Families whose router forward doesn't surface
-# indices (DeepSeek-V3) record by calling :func:`record_router_indices`
+# indices (DeepSeek-V3, GLM-MoE-DSA) record by calling :func:`record_router_indices`
 # explicitly from the patched MoE block. We still want
 # :func:`attach_moe_router_monitor` to count and pre-register these modules
 # so the heatmap layer order is stable across resumes.
@@ -143,6 +143,7 @@ def register_external_record_router(class_name: str) -> None:
 
 
 register_external_record_router("DeepseekV3TopkRouter")
+register_external_record_router("GlmMoeDsaTopkRouter")
 
 
 def record_router_indices(router_module: nn.Module, indices: torch.Tensor) -> None:

@@ -14,13 +14,19 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.checkpoint import layout
-from veomni.models.checkpoint_manager import ModelCheckpointManager
+from veomni.models.checkpoint import ModelCheckpointManager
+from veomni.models.seed_omni.utils.conversation import ConversationItem
+from veomni.models.seed_omni.utils.offline_cache import SeedOmniOfflineCacheWriter
 from veomni.trainer.callbacks.base import TrainerState
 from veomni.trainer.callbacks.checkpoint_callback import (
     CheckpointCallback,
 )
 from veomni.trainer.callbacks.global_state_callback import GlobalStateCallback
+
+
+pytestmark = pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 
 
 def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
@@ -61,6 +67,7 @@ def _make_mock_trainer(save_path="/tmp/test_ckpt", save_async=False):
     trainer.environ_meter = MagicMock()
     trainer.channel_loss_callback = MagicMock()
     trainer.channel_loss_callback.state_dict.return_value = {}
+    trainer.offline_cache_writer = None
     trainer.model_assets = []
     trainer.state = TrainerState()
     trainer.start_epoch = 0
@@ -273,9 +280,9 @@ class TestCheckpointCallbackTrainEndWait:
         trainer.wait_for_pending_save.assert_called_once_with()
 
 
-@patch("veomni.models.checkpoint_manager.build_checkpointer")
-@patch("veomni.models.checkpoint_manager.dist")
-@patch("veomni.models.checkpoint_manager.helper")
+@patch("veomni.models.checkpoint.manager.build_checkpointer")
+@patch("veomni.models.checkpoint.manager.dist")
+@patch("veomni.models.checkpoint.manager.helper")
 class TestModelCheckpointManagerSaveContract:
     """``stage_dir`` keys its staging directory on the ``path`` given to ``save``.
 
@@ -479,7 +486,7 @@ class TestGlobalStateCallbackJobState:
 
     def test_train_end_writes_the_cursor_for_the_export_that_follows(self, mock_dist, tmp_path):
         """A run ending off the cadence still exports, and that export writes the
-        step's DCP (``ModelCheckpointManager._prepare_export``). Model state at a
+        step's DCP (``ModelCheckpointManager.prepare_export``). Model state at a
         step with no cursor beside it is a step nothing can resume from, so the
         cursor follows the export."""
         mock_dist.is_initialized.return_value = False
@@ -618,13 +625,49 @@ class TestGlobalStateCallbackJobState:
             "channel_loss_callback": callback_state,
             "torch_rng_state": torch.get_rng_state(),
         }
-        torch.save(payload, tmp_path / "trainer_state_rank_0.pt")
+        extra_path = Path(layout.extra_state_path(str(tmp_path), 0))
+        extra_path.parent.mkdir(parents=True)
+        torch.save(payload, extra_path)
 
         cb = GlobalStateCallback(trainer)
         cb.load_global_state()
 
         trainer.channel_loss_callback.load_state_dict.assert_called_once_with(callback_state)
         assert trainer.state.global_step == 7
+
+    def test_the_offline_cache_writer_resumes_with_the_cursor(self, mock_dist, tmp_path):
+        """The cursor is saved only after the writer flushed, and the position comes back with it.
+
+        The run saves no model state, so the cursor alone makes the step complete for ``load_path: auto``.
+        """
+        mock_dist.is_initialized.return_value = False
+        trainer = _make_mock_trainer(save_path=str(tmp_path / "ckpt"))
+        trainer.train_dataloader = None
+        trainer.data_iterator = None
+        trainer.environ_meter.state_dict.return_value = {}
+        trainer.saves_model_state = False
+        writer = SeedOmniOfflineCacheWriter(str(tmp_path / "cache"), max_rows_per_shard=10)
+        writer.open()
+        writer.save_conversation_list([[ConversationItem(type="text", value="s0", role="user")]])
+        trainer.offline_cache_writer = writer
+
+        GlobalStateCallback(trainer).save_global_state(TrainerState(global_step=10))
+
+        assert writer.buffer == []
+        assert (tmp_path / "cache" / "shard_000000.parquet").exists()
+        step_root = str(tmp_path / "ckpt" / "global_step_10")
+        assert not os.path.exists(os.path.join(step_root, layout.MODEL_DIRNAME))
+        assert layout.checkpoint_is_complete(step_root)
+
+        resumed = _make_mock_trainer()
+        resumed.args.train.checkpoint.load_path = str(tmp_path / "ckpt" / "global_step_10")
+        resumed.train_dataloader = None
+        resumed.offline_cache_writer = MagicMock()
+        GlobalStateCallback(resumed).load_global_state()
+
+        resumed.offline_cache_writer.load_state_dict.assert_called_once_with(
+            {"shard_index": 1, "rows_written": 1, "world_size": 1}
+        )
 
     @patch("veomni.trainer.callbacks.global_state_callback.get_device_type", return_value="cpu")
     def test_load_skips_when_any_rank_is_missing_state(self, mock_device, mock_dist, tmp_path):
@@ -639,6 +682,8 @@ class TestGlobalStateCallbackJobState:
         trainer.args.train.checkpoint.load_path = str(tmp_path)
         trainer.args.train.global_rank = 0
         trainer.train_dataloader = None
+        extra_path = Path(layout.extra_state_path(str(tmp_path), 0))
+        extra_path.parent.mkdir(parents=True)
         torch.save(
             {
                 "global_step": 7,
@@ -647,7 +692,7 @@ class TestGlobalStateCallbackJobState:
                 "channel_loss_callback": {},
                 "torch_rng_state": torch.get_rng_state(),
             },
-            tmp_path / "trainer_state_rank_0.pt",
+            extra_path,
         )
 
         cb = GlobalStateCallback(trainer)
@@ -657,72 +702,27 @@ class TestGlobalStateCallbackJobState:
         mock_dist.all_reduce.assert_called_once()
         assert mock_dist.all_reduce.call_args.kwargs["op"] is torch.distributed.ReduceOp.MIN
 
-    def test_load_restores_0_1_12_extra_state_job_cursor(self, mock_dist, tmp_path):
-        mock_dist.is_initialized.return_value = False
-        trainer = _make_mock_trainer()
-        trainer.args.train.checkpoint.load_path = str(tmp_path)
-        trainer.args.train.global_rank = 0
-        trainer.args.train_steps = 100
-        rng = torch.get_rng_state()
-        extra = tmp_path / "extra_state"
-        extra.mkdir()
-        torch.save(
-            {
-                "global_step": 7,
-                "lr_scheduler": {"last_epoch": 7},
-                "train_dataloader": {"cursor": 3},
-                "environ_meter": {"tokens": 1},
-                "channel_loss_callback": {"source_registry": [(1, "train/a")]},
-                "torch_rng_state": rng,
-            },
-            extra / "extra_state_rank_0.pt",
-        )
+    def test_a_pre_split_job_cursor_is_not_read(self, mock_dist, tmp_path):
+        """Only ``extra_state/rank_{R}.pt`` carries the cursor now.
 
-        cb = GlobalStateCallback(trainer)
-        cb.load_global_state()
-
-        assert trainer.state.global_step == 7
-        assert trainer.start_epoch == 0
-        assert trainer.start_step == 7
-        trainer.train_dataloader.load_state_dict.assert_called_once_with({"cursor": 3})
-        trainer.environ_meter.load_state_dict.assert_called_once_with({"tokens": 1})
-        trainer.channel_loss_callback.load_state_dict.assert_called_once_with({"source_registry": [(1, "train/a")]})
-
-    def test_trainer_state_wins_over_extra_state_job_cursor(self, mock_dist, tmp_path):
+        The pre-split layouts kept it in ``extra_state_rank_{R}.pt`` and
+        ``trainer_state_rank_{R}.pt``. Both are gone with
+        ``veomni/checkpoint/legacy_v0_1_12.py``: the step has no current-layout
+        cursor, so a resume falls back to weights only rather than restoring a
+        step counter from a shape nothing writes any more.
+        """
         mock_dist.is_initialized.return_value = False
         trainer = _make_mock_trainer()
         trainer.args.train.checkpoint.load_path = str(tmp_path)
         trainer.args.train.global_rank = 0
         trainer.train_dataloader = None
-        torch.save(
-            {
-                "global_step": 7,
-                "train_dataloader": None,
-                "environ_meter": {},
-                "channel_loss_callback": {},
-                "torch_rng_state": torch.get_rng_state(),
-            },
-            tmp_path / "trainer_state_rank_0.pt",
-        )
         extra = tmp_path / "extra_state"
         extra.mkdir()
         torch.save(
-            {"global_step": 99, "lr_scheduler": {}, "torch_rng_state": torch.get_rng_state()},
+            {"global_step": 7, "lr_scheduler": {}, "torch_rng_state": torch.get_rng_state()},
             extra / "extra_state_rank_0.pt",
         )
-
-        cb = GlobalStateCallback(trainer)
-        cb.load_global_state()
-        assert trainer.state.global_step == 7
-
-    def test_scheduler_only_extra_state_does_not_restore_job_cursor(self, mock_dist, tmp_path):
-        mock_dist.is_initialized.return_value = False
-        trainer = _make_mock_trainer()
-        trainer.args.train.checkpoint.load_path = str(tmp_path)
-        trainer.args.train.global_rank = 0
-        extra = tmp_path / "extra_state"
-        extra.mkdir()
-        torch.save({"lr_scheduler": {"last_epoch": 3}}, extra / "extra_state_rank_0.pt")
+        torch.save({"global_step": 9, "torch_rng_state": torch.get_rng_state()}, tmp_path / "trainer_state_rank_0.pt")
 
         cb = GlobalStateCallback(trainer)
         assert cb.load_global_state() is None

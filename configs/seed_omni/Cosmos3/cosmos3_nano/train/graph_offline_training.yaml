@@ -1,0 +1,7 @@
+# Cosmos3-Nano stage 2 of 2: the latents come from the cache. The VAE is built on
+# meta and never loaded; online_process only checks that every clip is a latent.
+- { from: cosmos3_text_encoder.encode,              to: cosmos3_mot }
+- { from: cosmos3_vae.online_process,               to: cosmos3_flow_connector.embed_latent }
+- { from: cosmos3_flow_connector.embed_latent,      to: cosmos3_mot }
+- { from: cosmos3_mot,                              to: cosmos3_flow_connector.decode_velocity }
+- { from: cosmos3_flow_connector.decode_velocity,   to: end }

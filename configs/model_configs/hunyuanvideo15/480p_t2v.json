@@ -1,0 +1,45 @@
+{
+  "attn_mode": "torch",
+  "attn_param": null,
+  "concat_condition": true,
+  "glyph_byT5_v2": true,
+  "guidance_embed": false,
+  "heads_num": 16,
+  "hidden_size": 2048,
+  "ideal_resolution": "480p",
+  "ideal_task": "t2v",
+  "in_channels": 32,
+  "is_reshape_temporal_channels": false,
+  "mlp_act_type": "gelu_tanh",
+  "mlp_width_ratio": 4,
+  "mm_double_blocks_depth": 54,
+  "mm_single_blocks_depth": 0,
+  "out_channels": 32,
+  "patch_size": [
+    1,
+    1,
+    1
+  ],
+  "qk_norm": true,
+  "qk_norm_type": "rms",
+  "qkv_bias": true,
+  "rope_dim_list": [
+    16,
+    56,
+    56
+  ],
+  "rope_theta": 256,
+  "text_pool_type": null,
+  "text_projection": "single_refiner",
+  "text_states_dim": 3584,
+  "text_states_dim_2": null,
+  "use_attention_mask": true,
+  "use_cond_type_embedding": true,
+  "use_meanflow": false,
+  "vision_projection": "linear",
+  "vision_states_dim": 1152,
+  "model_type": "HunyuanVideo15Model",
+  "architectures": [
+    "HunyuanVideo15Model"
+  ]
+}

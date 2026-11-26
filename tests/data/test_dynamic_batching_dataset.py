@@ -29,6 +29,7 @@ The test suite includes:
 
 import argparse
 import copy
+import gc
 import os
 import subprocess
 import sys
@@ -43,8 +44,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
 from tools import resolve_ops_overrides
-from tools.launch_utils import find_free_port
 from torch.utils.data import IterableDataset
 from utils import (
     FakeModelRuntime,
@@ -58,22 +59,25 @@ from utils import (
     setup_test_distributed,
 )
 
+from scripts.ci.accelerator.launch_plan import LaunchSpec
 from veomni.arguments import VeOmniArguments, parse_args
 from veomni.data import build_dataloader
 from veomni.data.data_collator import MainCollator
 from veomni.data.dataset import (
     DynamicBatchingSizeDataset,
-    get_length_by_attention_mask_fn,
-    get_length_by_input_ids_fn,
     get_length_by_labels_fn,
+    get_length_fn,
     get_length_fn_by_count_mode,
 )
 from veomni.data.dynamic_batching import TextBatchingStrategy
-from veomni.distributed.parallel_state import get_parallel_state
+from veomni.distributed.parallel_state import clear_parallel_state, get_parallel_state
 from veomni.trainer.base import BaseTrainer
 from veomni.trainer.callbacks import Callback, EnvironMeterCallback, TrainerState
 from veomni.utils import helper
 from veomni.utils.constants import IGNORE_INDEX
+
+
+_CI_LAUNCH = LaunchSpec(nproc=2)
 
 
 logger = helper.create_logger(__name__)
@@ -82,10 +86,6 @@ logger = helper.create_logger(__name__)
 MICRO_BATCH_SEQ_LENGTH = 32  # Max tokens per batch
 READY_FOR_MICRO_BATCH_THRESHOLD = 10  # Minimum samples in buffer before batching
 DATASET_SIZE = 50
-
-
-def get_length_fn(item):
-    return item["attention_mask"].sum()
 
 
 def _make_sample(token_id: int, total_tokens: int = 4, effective_tokens: int = 2) -> Dict[str, torch.Tensor]:
@@ -131,6 +131,7 @@ def setup_dynamic_batching_dataset():
 
 
 # Unit tests (can run without distributed setup)
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize(
     "shuffle,seed",
     [
@@ -229,6 +230,7 @@ def test_dynamic_batching_basic(shuffle, seed):
     logger.info(f"test_dynamic_batching_basic (shuffle={shuffle}) passed! Produced {batch_count} batches")
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_last_batch_on_dataset_end(setup_dynamic_batching_dataset):
     """Test that remaining buffer items are yielded when dataset ends.
 
@@ -277,6 +279,7 @@ def test_last_batch_on_dataset_end(setup_dynamic_batching_dataset):
     )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_dynamic_batching_without_get_item():
     """Test DynamicBatchingSizeDataset initialization without get_item provided.
 
@@ -303,12 +306,13 @@ def test_dynamic_batching_without_get_item():
         )
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_get_length_fn_by_count_mode():
     sample = _make_sample(token_id=7, total_tokens=5, effective_tokens=3)
 
-    assert get_length_by_attention_mask_fn(sample) == 5
+    assert get_length_fn(sample) == 5
     assert get_length_by_labels_fn(sample) == 3
-    assert get_length_by_input_ids_fn(sample) == 5
+    assert get_length_fn({"input_ids": sample["input_ids"]}) == 5
     assert get_length_fn_by_count_mode("total")(sample) == 5
     assert get_length_fn_by_count_mode("effective")(sample) == 3
     assert get_length_by_labels_fn({"attention_mask": sample["attention_mask"]}) == 5
@@ -318,18 +322,18 @@ def test_get_length_fn_by_count_mode():
         "attention_mask": [1, 1, 1, 1, 0],
         "labels": [IGNORE_INDEX, 2, IGNORE_INDEX, 4, 5],
     }
-    assert get_length_by_attention_mask_fn(list_sample) == 4
+    assert get_length_fn(list_sample) == 4
     assert get_length_by_labels_fn(list_sample) == 3
-    assert get_length_by_input_ids_fn(list_sample) == 5
+    assert get_length_fn({"input_ids": list_sample["input_ids"]}) == 5
 
     np_sample = {
         "input_ids": np.arange(5),
         "attention_mask": np.array([1, 1, 1, 0, 0]),
         "labels": np.array([IGNORE_INDEX, 1, 2, IGNORE_INDEX, IGNORE_INDEX]),
     }
-    assert get_length_by_attention_mask_fn(np_sample) == 3
+    assert get_length_fn(np_sample) == 3
     assert get_length_by_labels_fn(np_sample) == 2
-    assert get_length_by_input_ids_fn(np_sample) == 5
+    assert get_length_fn({"input_ids": np_sample["input_ids"]}) == 5
 
     unsupported_labels_sample = {
         "input_ids": [1, 2, 3],
@@ -339,6 +343,7 @@ def test_get_length_fn_by_count_mode():
     assert get_length_by_labels_fn(unsupported_labels_sample) == 2
 
     input_ids_only_sample = {"input_ids": np.arange(4)}
+    assert get_length_fn(input_ids_only_sample) == 4
     assert get_length_by_labels_fn(input_ids_only_sample) == 4
     assert get_length_by_labels_fn([list_sample, np_sample]) == 5
     assert get_length_by_labels_fn(None) == 0
@@ -349,6 +354,76 @@ def test_get_length_fn_by_count_mode():
         get_length_fn_by_count_mode("bad-mode")
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_seedomni_conversation_list_dyn_bsz_lengths_and_strategy():
+    from veomni.data.seed_omni.collator import SeedOmniCollator
+    from veomni.models.seed_omni.utils.conversation import _OMNI_TOKEN_LEN, ConversationItem
+
+    conv_sample = {
+        "conversation_list": [
+            ConversationItem(
+                type="text",
+                value=torch.tensor([1, 2, 3]),
+                role="user",
+                meta={
+                    "attention_mask": torch.ones(3, dtype=torch.long),
+                    "labels": torch.full((3,), IGNORE_INDEX, dtype=torch.long),
+                    _OMNI_TOKEN_LEN: 3,
+                },
+            ),
+            ConversationItem(
+                type="image",
+                value=torch.zeros(4, 8),
+                role="user",
+                meta={_OMNI_TOKEN_LEN: 4},
+            ),
+            ConversationItem(
+                type="text",
+                value=torch.tensor([10, 11, 12, 13, 14]),
+                role="assistant",
+                meta={
+                    "attention_mask": torch.ones(5, dtype=torch.long),
+                    "labels": torch.tensor([IGNORE_INDEX, 11, 12, 13, 14], dtype=torch.long),
+                    _OMNI_TOKEN_LEN: 5,
+                },
+            ),
+            ConversationItem(
+                type="image",
+                value=torch.zeros(3, 8, 8),
+                role="assistant",
+                meta={_OMNI_TOKEN_LEN: 8},
+            ),
+            ConversationItem(
+                type="image",
+                value=torch.zeros(2, 8),
+                role="user",
+                is_dummy=True,
+                meta={_OMNI_TOKEN_LEN: 2},
+            ),
+        ]
+    }
+
+    # Total length includes all items (including is_dummy=True): 3 + 4 + 5 + 8 + 2 = 22.
+    assert get_length_fn(conv_sample) == 22
+    # Effective length excludes is_dummy=True and user items: 4 (assistant text) + 8 (assistant image) = 12.
+    assert get_length_by_labels_fn(conv_sample) == 12
+
+    strategy = TextBatchingStrategy(
+        token_micro_bsz=24,
+        buffer_size=1,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=44,
+        get_physical_length_fn=get_length_fn,
+    )
+    strategy.put_item(conv_sample)
+    strategy.put_item(conv_sample)
+    micro_batch = strategy.get_micro_batch(step=0)
+    assert len(micro_batch) == 2
+    collated = SeedOmniCollator()(micro_batch)
+    assert len(collated["conversation_list"]) == 2
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_text_batching_strategy_effective_count_mode():
     total_strategy = TextBatchingStrategy(token_micro_bsz=4, buffer_size=1)
     effective_strategy = TextBatchingStrategy(
@@ -370,13 +445,14 @@ def test_text_batching_strategy_effective_count_mode():
     assert sum(batch_sample["attention_mask"].sum().item() for batch_sample in effective_batch) == 8
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_text_batching_strategy_effective_mode_can_overflow_total_budget_with_larger_physical_cap():
     strategy = TextBatchingStrategy(
         token_micro_bsz=4,
         buffer_size=1,
         get_length_fn=get_length_by_labels_fn,
         physical_token_cap=6,
-        get_physical_length_fn=get_length_by_attention_mask_fn,
+        get_physical_length_fn=get_length_fn,
     )
     samples = [
         _make_sample(token_id=1, total_tokens=3, effective_tokens=2),
@@ -394,13 +470,14 @@ def test_text_batching_strategy_effective_mode_can_overflow_total_budget_with_la
     assert sum(sample["attention_mask"].sum().item() for sample in micro_batch) == 6
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_text_batching_strategy_effective_mode_honors_physical_cap():
     strategy = TextBatchingStrategy(
         token_micro_bsz=4,
         buffer_size=1,
         get_length_fn=get_length_by_labels_fn,
         physical_token_cap=8,
-        get_physical_length_fn=get_length_by_attention_mask_fn,
+        get_physical_length_fn=get_length_fn,
     )
     samples = [
         _make_sample(token_id=1, total_tokens=6, effective_tokens=2),
@@ -419,6 +496,7 @@ def test_text_batching_strategy_effective_mode_honors_physical_cap():
     assert strategy.buffer.all_physical_token_cnt == 6
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_dynamic_batching_size_dataset_effective_mode_can_overflow_total_budget_with_larger_physical_cap():
     class PromptHeavyDataset(IterableDataset):
         def __iter__(self):
@@ -435,7 +513,7 @@ def test_dynamic_batching_size_dataset_effective_mode_can_overflow_total_budget_
         dynamic_batching_collate_fn=lambda samples: samples,
         get_length_fn=get_length_by_labels_fn,
         physical_token_cap=6,
-        get_physical_length_fn=get_length_by_attention_mask_fn,
+        get_physical_length_fn=get_length_fn,
         save_by_idx=False,
     )
 
@@ -445,6 +523,7 @@ def test_dynamic_batching_size_dataset_effective_mode_can_overflow_total_budget_
     assert [sum(sample["attention_mask"].sum().item() for sample in batch) for batch in micro_batches] == [6, 3]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 def test_dynamic_batching_size_dataset_effective_mode_honors_physical_cap():
     class PromptHeavyDataset(IterableDataset):
         def __iter__(self):
@@ -461,7 +540,7 @@ def test_dynamic_batching_size_dataset_effective_mode_honors_physical_cap():
         dynamic_batching_collate_fn=lambda samples: samples,
         get_length_fn=get_length_by_labels_fn,
         physical_token_cap=8,
-        get_physical_length_fn=get_length_by_attention_mask_fn,
+        get_physical_length_fn=get_length_fn,
         save_by_idx=False,
     )
 
@@ -471,6 +550,47 @@ def test_dynamic_batching_size_dataset_effective_mode_honors_physical_cap():
     assert [sum(sample["attention_mask"].sum().item() for sample in batch) for batch in micro_batches] == [6, 8]
 
 
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
+def test_zero_effective_length_first_sample_still_enforces_physical_cap():
+    samples = [
+        _make_sample(token_id=1, total_tokens=6, effective_tokens=0),
+        _make_sample(token_id=2, total_tokens=6, effective_tokens=2),
+        _make_sample(token_id=3, total_tokens=2, effective_tokens=2),
+    ]
+
+    strategy = TextBatchingStrategy(
+        token_micro_bsz=4,
+        buffer_size=1,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=8,
+        get_physical_length_fn=get_length_fn,
+    )
+    for sample in samples:
+        strategy.put_item(sample)
+    micro_batch = strategy.get_micro_batch(step=0)
+    assert [sample["input_ids"][0].item() for sample in micro_batch] == [1, 3]
+    assert sum(sample["attention_mask"].sum().item() for sample in micro_batch) == 8
+
+    class ZeroEffectiveFirstDataset(IterableDataset):
+        def __iter__(self):
+            yield from samples
+
+    dynamic_ds = DynamicBatchingSizeDataset(
+        dataset=ZeroEffectiveFirstDataset(),
+        micro_batch_seq_length=4,
+        ready_for_micro_batch_threshold=1,
+        dynamic_batching_collate_fn=lambda batch_samples: batch_samples,
+        get_length_fn=get_length_by_labels_fn,
+        physical_token_cap=8,
+        get_physical_length_fn=get_length_fn,
+        save_by_idx=False,
+    )
+    micro_batches = list(dynamic_ds)
+    assert [[sample["input_ids"][0].item() for sample in batch] for batch in micro_batches] == [[1], [2, 3]]
+    assert [sum(sample["attention_mask"].sum().item() for sample in batch) for batch in micro_batches] == [6, 8]
+
+
+@pytest.mark.launch_plan(provider=LaunchSpec(device="cpu"))
 @pytest.mark.parametrize("save_by_idx", [False, True])
 def test_save_load_state_dict(save_by_idx):
     """Unit test for DynamicBatchingSizeDataset state_dict and load_state_dict.
@@ -530,67 +650,40 @@ def test_save_load_state_dict(save_by_idx):
     logger.info(f"test_save_load_state_dict (save_by_idx={save_by_idx}) passed!")
 
 
-@pytest.mark.parametrize(
-    "dataset_type,shuffle,save_by_idx,multi_sample_per_iteration",
-    [
-        ("iterable", False, False, False),
-        ("iterable", False, True, False),
-        ("iterable", True, False, False),
-        ("iterable", True, True, False),
-        ("iterable", True, True, True),
-        ("mapping", True, True, False),
-        ("mapping", True, True, True),
-        ("mapping", True, False, False),
-    ],
+# (dataset_type, shuffle, save_by_idx, multi_sample_per_iteration)
+_DISTRIBUTED_SCENARIOS: tuple[tuple[str, bool, bool, bool], ...] = (
+    ("iterable", False, False, False),
+    ("iterable", False, True, False),
+    ("iterable", True, False, False),
+    ("iterable", True, True, False),
+    ("iterable", True, True, True),
+    ("mapping", True, True, False),
+    ("mapping", True, True, True),
+    ("mapping", True, False, False),
 )
-def test_dynamic_batching_dataset_distributed(dataset_type, shuffle, save_by_idx, multi_sample_per_iteration):
-    """Test DynamicBatchingSizeDataset in distributed setting.
 
-    Runs _main_distributed_test() by torchrun with or without data shuffling
-    and with or without save_by_idx for checkpoint buffer saving.
 
-    Args:
-        dataset_type: Whether the upstream is iterable or map-style.
-        shuffle: Whether to enable data shuffling.
-        save_by_idx: Whether to save buffer by index for checkpointing.
-        multi_sample_per_iteration: Whether one dataset iteration emits two samples.
-
-    Raises:
-        subprocess.CalledProcessError: If the distributed test fails.
-    """
-    command = build_command(
-        dataset_type=dataset_type,
-        shuffle=shuffle,
-        save_by_idx=save_by_idx,
-        multi_sample_per_iteration=multi_sample_per_iteration,
-    )
-    # Pass current environment to subprocess to inherit virtual environment
+@pytest.mark.launch_plan(provider=_CI_LAUNCH)
+def test_dynamic_batching_dataset_distributed():
+    """Fused 2-rank worker covering all 8 iterable/mapping x shuffle x save_by_idx x multi_sample combinations."""
+    command = build_suite_command()
     result = subprocess.run(command, check=True, env=os.environ.copy())
     assert result.returncode == 0
 
 
-def build_command(dataset_type="iterable", shuffle=True, save_by_idx=True, multi_sample_per_iteration=False):
-    """Build torchrun command for distributed testing.
-
-    Constructs a command to launch the test script with torchrun for
-    distributed execution with 2 processes.
-
-    Args:
-        dataset_type: Whether to build an iterable or map-style upstream dataset.
-        shuffle: Whether to enable data shuffling.
-        save_by_idx: Whether to save buffer by index for checkpointing.
-        multi_sample_per_iteration: Whether one dataset iteration emits two samples.
-
-    Returns:
-        list: Command arguments for subprocess.run().
-    """
-    port = find_free_port()
-
-    command = [
+def build_suite_command() -> list[str]:
+    return [
         "torchrun",
         "--nnodes=1",
-        "--nproc_per_node=2",
-        f"--master_port={port}",
+        f"--nproc_per_node={_CI_LAUNCH.nproc}",
+        "--standalone",
+        "tests/data/test_dynamic_batching_dataset.py",
+        "--run-all-scenarios",
+    ]
+
+
+def _scenario_argv(output_dir: str) -> list[str]:
+    return [
         "tests/data/test_dynamic_batching_dataset.py",
         "--model.config_path=test",
         "--data.train_path=None",
@@ -600,27 +693,21 @@ def build_command(dataset_type="iterable", shuffle=True, save_by_idx=True, multi
         "--data.dataloader.num_workers=2",
         "--data.dataloader.drop_last=false",
         "--train.micro_batch_size=2",
-        f"--shuffle={str(shuffle).lower()}",
         "--train.global_batch_size=16",
         "--model.accelerator.fsdp_config.fsdp_mode=ddp",
         "--train.checkpoint.manager=dcp",
-        "--train.checkpoint.output_dir=.tests/cache",
+        f"--train.checkpoint.output_dir={output_dir}",
         "--train.dyn_bsz=true",
         "--train.dyn_bsz_runtime=worker",
-        f"--dataset_type={dataset_type}",
-        f"--save_by_idx={str(save_by_idx).lower()}",
-        f"--multi_sample_per_iteration={str(multi_sample_per_iteration).lower()}",
         "--train.seed=42",
-        # Hardware-aware ops_implementation overrides; see test_datasets.py.
         *resolve_ops_overrides(None),
     ]
-    return command
 
 
 class TrainerTest(BaseTrainer):
-    gt_data_list: List[List[Dict[str, Any]]] = []
-    pred_data_list: List[List[Dict[str, Any]]] = []
-    golden_env_metrics: Dict[str, Any] = {}
+    gt_data_list: List[List[Dict[str, Any]]]
+    pred_data_list: List[List[Dict[str, Any]]]
+    golden_env_metrics: Dict[str, Any]
     resume_dcp_path: str
 
     save_epoch, save_step = 1, 0
@@ -634,6 +721,11 @@ class TrainerTest(BaseTrainer):
         save_by_idx: bool,
         multi_sample_per_iteration: bool,
     ):
+        self.gt_data_list = []
+        self.pred_data_list = []
+        self.golden_env_metrics = {}
+        self.resume_dcp_path = ""
+        self.is_resume_train = False
         self.dataset_type = dataset_type
         self.shuffle = shuffle
         self.save_by_idx = save_by_idx
@@ -757,8 +849,9 @@ class TrainerTest(BaseTrainer):
         super().train()
 
     def destroy_distributed(self):
-        if self.is_resume_train:
-            super().destroy_distributed()
+        # Fused worker manages process-group teardown after all sub-scenarios complete.
+        if dist.is_initialized():
+            dist.barrier()
 
 
 class CheckCallback(Callback):
@@ -805,35 +898,84 @@ class CheckCallback(Callback):
             self.trainer.golden_env_metrics = copy.deepcopy(self.trainer.step_env_metrics)
 
 
-def _main_distributed_test():
-    """Entry point for the distributed test launched by ``torchrun``.
+def _run_single_distributed_scenario(
+    *,
+    args: VeOmniArguments,
+    dataset_type: str,
+    shuffle: bool,
+    save_by_idx: bool,
+    multi_sample_per_iteration: bool,
+) -> None:
+    trainer = TrainerTest(
+        args,
+        dataset_type=dataset_type,
+        shuffle=shuffle,
+        save_by_idx=save_by_idx,
+        multi_sample_per_iteration=multi_sample_per_iteration,
+    )
+    trainer.train()
+    assert trainer.args.train.checkpoint.load_path is not None
+    trainer.resume_train()
+    del trainer
+    gc.collect()
+    if dist.is_initialized():
+        dist.barrier()
 
-    It wraps ``_run_distributed_test()` and in the testing it is supposed to be
-    triggered by test_dynamic_batching_dataset_distributed().
-    """
+
+def _main_distributed_test():
+    """Entry point for the distributed test launched by ``torchrun``."""
     # Patch both the source function and DCP's imported alias to avoid CPU AttributeError.
     with (
         patch("veomni.utils.device.empty_cache", mock_empty_cache),
     ):
         _parser = argparse.ArgumentParser()
+        _parser.add_argument("--run-all-scenarios", action="store_true")
+        _parser.add_argument("--reverse-scenarios", action="store_true")
         _parser.add_argument("--dataset_type", choices=["iterable", "mapping"], default="iterable")
         _parser.add_argument("--shuffle", type=lambda x: x.lower() == "true", default=True)
         _parser.add_argument("--save_by_idx", type=lambda x: x.lower() == "true", default=True)
         _parser.add_argument("--multi_sample_per_iteration", type=lambda x: x.lower() == "true", default=False)
         test_args, remaining_argv = _parser.parse_known_args()
-        sys.argv = [sys.argv[0]] + remaining_argv
 
-        args = parse_args(VeOmniArguments)
-        trainer = TrainerTest(
-            args,
-            dataset_type=test_args.dataset_type,
-            shuffle=test_args.shuffle,
-            save_by_idx=test_args.save_by_idx,
-            multi_sample_per_iteration=test_args.multi_sample_per_iteration,
-        )
-        trainer.train()
-        assert trainer.args.train.checkpoint.load_path is not None
-        trainer.resume_train()
+        try:
+            if test_args.run_all_scenarios:
+                scenarios = list(_DISTRIBUTED_SCENARIOS)
+                reverse = test_args.reverse_scenarios or os.environ.get("VEOMNI_REVERSE_SCENARIOS") == "1"
+                if reverse:
+                    scenarios = list(reversed(scenarios))
+                for idx, (dataset_type, shuffle, save_by_idx, multi_sample_per_iteration) in enumerate(scenarios):
+                    label = (
+                        f"dyn_bsz_{idx}_{dataset_type}_shuf{int(shuffle)}"
+                        f"_idx{int(save_by_idx)}_multi{int(multi_sample_per_iteration)}"
+                    )
+                    output_dir = os.path.join(".tests/cache", label)
+                    sys.argv = _scenario_argv(output_dir=output_dir)
+                    args = parse_args(VeOmniArguments)
+                    _run_single_distributed_scenario(
+                        args=args,
+                        dataset_type=dataset_type,
+                        shuffle=shuffle,
+                        save_by_idx=save_by_idx,
+                        multi_sample_per_iteration=multi_sample_per_iteration,
+                    )
+            else:
+                sys.argv = [sys.argv[0]] + remaining_argv
+                args = parse_args(VeOmniArguments)
+                _run_single_distributed_scenario(
+                    args=args,
+                    dataset_type=test_args.dataset_type,
+                    shuffle=test_args.shuffle,
+                    save_by_idx=test_args.save_by_idx,
+                    multi_sample_per_iteration=test_args.multi_sample_per_iteration,
+                )
+            if dist.is_initialized():
+                dist.barrier()
+        finally:
+            try:
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+            finally:
+                clear_parallel_state()
 
 
 if __name__ == "__main__":

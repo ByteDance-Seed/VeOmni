@@ -1,0 +1,176 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""KV cache and indexer activation storage-rounding kernel family.
+
+A row here answers "round this stored tensor the way inference would". The
+variant is the *recipe* -- which geometry a model stores -- and the
+implementation is the backend that performs it.
+
+* ``standard`` is model-agnostic: the caller passes ``block_size`` and, if it
+  wants to stop partway through the last dimension, ``quant_features``.
+* ``deepseek_v4`` fixes DeepSeek-V4's two geometries in one place: 64-wide FP8
+  groups over the NoPE channels of a KV entry, and 128-wide groups over a whole
+  indexer head. A caller selects which by passing ``rope_features``.
+
+The *implementation* is the backend: ``eager`` is a PyTorch round trip, ``triton``
+the same arithmetic on a fused kernel. Every variant also registers ``none``, which
+returns the tensor unchanged. Every other family spells "off" as ``eager``; here
+``eager`` is a real rounding row, so "off" needs its own name. That keeps the field
+shaped like the others -- the model always builds a handle and never branches on a
+missing one. Each variant owns its own ``none`` because the call arguments differ:
+``standard``'s takes ``quant_features``, ``fp4``'s takes ``scale_fmt``, and a
+caller passes its variant's arguments to whichever row the config selected --
+including the off row, which is this family's default.
+
+The *element format* is not part of either name. ``fp4`` below is a separate
+variant rather than an ``impl`` because it changes what the stored tensor means --
+E2M1 values in ``[-6, 6]`` with a 16-wide group, not E4M3 with a 64- or 128-wide
+one -- and a model that stores FP4 has no FP8 geometry to fall back to. A caller
+therefore selects the variant its checkpoint uses, exactly as it selects
+``deepseek_v4`` for that model's FP8 geometries.
+
+These are *storage* round trips, not GEMM operand quantization: the point is to
+show training the values an inference cache would hold. Backward is a
+straight-through estimator, which is sound for FP8 because every scale derives
+from its own group's amax and rounds up, so no element saturates. FP4 saturates by
+construction (E2M1 tops out at 6 and an E4M3 scale is not always a power of two),
+so its backward is the same approximation a deployment kernel makes when it reads
+back the rounded values.
+"""
+
+from ...platform import NVIDIA_SM89_PLUS, ROCM_GPU, GpuKernelRequirement
+from ...registry import register_op
+from .deepseek_v4 import eager as dsv4_eager
+from .deepseek_v4 import none as dsv4_none
+from .deepseek_v4 import triton as dsv4_triton
+from .fp4 import eager as fp4_eager
+from .fp4 import none as fp4_none
+from .fp4 import triton as fp4_triton
+from .standard import eager as standard_eager
+from .standard import none as standard_none
+from .standard import triton as standard_triton
+
+
+#: The Triton row casts to ``tl.float8e4nv``, which Triton enables on NVIDIA only
+#: from SM89 -- Ampere has no E4M3 type, so an SM80/SM86 host would resolve this
+#: row and then fail in compilation. ROCm is left as it was; nothing about the
+#: narrowing above says anything about it.
+_GPU_FP8 = GpuKernelRequirement(platforms=(NVIDIA_SM89_PLUS, ROCM_GPU))
+#: The FP4 Triton kernel has no ROCm path: ``triton_fp4_roundtrip`` gates on
+#: ``is_nvidia_cuda_device`` and hands every ROCm input to the eager row, so
+#: advertising ROCm here would let a config select a backend that never runs --
+#: the silent fallback a ``requirement`` exists to prevent. NVIDIA-only until
+#: there is a ROCm kernel. The eager row stays available everywhere.
+_GPU_FP4_TRITON = GpuKernelRequirement(platforms=(NVIDIA_SM89_PLUS,))
+
+register_op(
+    "kv_round",
+    "standard",
+    "none",
+    standard_none.forward,
+    standard_none.backward,
+    description="Leave stored tensors unchanged; the off state for this family",
+)
+
+register_op(
+    "kv_round",
+    "standard",
+    "eager",
+    standard_eager.forward,
+    standard_eager.backward,
+    description="PyTorch blockwise FP8 (E4M3 + UE8M0 scale) storage round-trip with straight-through backward",
+)
+
+register_op(
+    "kv_round",
+    "standard",
+    "triton",
+    standard_triton.forward,
+    standard_triton.backward,
+    description="Triton blockwise FP8 (E4M3 + UE8M0 scale) storage round-trip with straight-through backward",
+    requirement=_GPU_FP8,
+    requires=("triton",),
+    default=True,
+)
+
+register_op(
+    "kv_round",
+    "deepseek_v4",
+    "none",
+    dsv4_none.forward,
+    dsv4_none.backward,
+    description="Leave stored tensors unchanged; the off state for this family",
+)
+
+register_op(
+    "kv_round",
+    "deepseek_v4",
+    "eager",
+    dsv4_eager.forward,
+    dsv4_eager.backward,
+    description=(
+        "PyTorch DeepSeek-V4 storage rounding: 64-wide FP8 groups over the NoPE channels of a KV "
+        "entry, 128-wide over a whole indexer head, straight-through backward"
+    ),
+)
+
+register_op(
+    "kv_round",
+    "deepseek_v4",
+    "triton",
+    dsv4_triton.forward,
+    dsv4_triton.backward,
+    description=(
+        "Triton DeepSeek-V4 storage rounding: the same two geometries as the eager row on the "
+        "Triton round trip, straight-through backward"
+    ),
+    requirement=_GPU_FP8,
+    requires=("triton",),
+    default=True,
+)
+
+register_op(
+    "kv_round",
+    "fp4",
+    "none",
+    fp4_none.forward,
+    fp4_none.backward,
+    description="Leave stored tensors unchanged; the off state for this family",
+)
+
+register_op(
+    "kv_round",
+    "fp4",
+    "eager",
+    fp4_eager.forward,
+    fp4_eager.backward,
+    description=(
+        "PyTorch blockwise FP4 (E2M1 + E4M3 or UE8M0 scale) storage round-trip with straight-through backward"
+    ),
+)
+
+register_op(
+    "kv_round",
+    "fp4",
+    "triton",
+    fp4_triton.forward,
+    fp4_triton.backward,
+    description=(
+        "Triton blockwise FP4 (E2M1 + E4M3 or UE8M0 scale) storage round-trip with straight-through backward"
+    ),
+    requirement=_GPU_FP4_TRITON,
+    requires=("triton",),
+    default=True,
+)
