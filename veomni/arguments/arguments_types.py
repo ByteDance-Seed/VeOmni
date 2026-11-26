@@ -164,8 +164,10 @@ class OptimizerConfig:
         metadata={
             "help": (
                 "With model.optimizer.state_offload='cpu', the fraction of currently free device memory "
-                "used to size one streamed batch of optimizer states. It is recomputed every step; "
-                "a parameter whose states exceed it cannot be swapped in and step() raises."
+                "used to size one streamed batch of SwapAdamW optimizer states (for type='adamw', and for "
+                "the AdamW sibling leaf under type='muon'). It is recomputed every step; an AdamW parameter "
+                "whose states exceed it cannot be swapped in and step() raises. Muon's own momentum "
+                "streaming is not capped by this setting."
             )
         },
     )

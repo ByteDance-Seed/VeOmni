@@ -242,15 +242,22 @@ def test_ortho_fsdp_group_all2all_overlap_fn_matches_sync(cpu_mesh, monkeypatch)
     events: list[str] = []
 
     class _FakeWork:
+        def __init__(self, pairs) -> None:
+            self._pairs = pairs
+
         def wait(self) -> None:
             events.append("wait")
+            for out_t, in_t in self._pairs:
+                out_t.copy_(in_t)
 
     def _fake_all_to_all(output_list, input_list, group=None, async_op=False):
-        for out_t, in_t in zip(output_list, input_list):
-            out_t.copy_(in_t)
         if async_op:
             events.append("async_launch")
-            return _FakeWork()
+            for out_t in output_list:
+                out_t.fill_(float("nan"))
+            return _FakeWork([(out_t, in_t.clone()) for out_t, in_t in zip(output_list, input_list)])
+        for out_t, in_t in zip(output_list, input_list):
+            out_t.copy_(in_t)
         return None
 
     monkeypatch.setattr(dist, "all_to_all", _fake_all_to_all)

@@ -1444,11 +1444,25 @@ class TestMuonStateOffload:
         assert resumed.state[p2]["momentum_buffer"].device.type == "cpu"
         assert resumed.state[p2]["momentum_buffer"].data_ptr() == resumed._host_momentum[p2].data_ptr()
 
-        # Shape mismatch must fail fast instead of silently broadcasting via copy_.
-        bad_sd = opt.state_dict()
-        bad_sd["state"][0] = {"momentum_buffer": torch.zeros(1, 16)}
+        # Shape mismatch on a later parameter must fail before mutating any
+        # earlier host buffer or installing the checkpoint's hyperparameters.
+        w_a = nn.Parameter(torch.randn(8, 16, dtype=torch.float32))
+        w_b = nn.Parameter(torch.randn(8, 16, dtype=torch.float32))
+        live = DistributedMuon([w_a, w_b], lr=1e-2, momentum=0.9, state_offload=True, ns_implementation="std")
+        w_a.grad = torch.randn_like(w_a)
+        w_b.grad = torch.randn_like(w_b)
+        live.step()
+        mom_a_before = live._host_momentum[w_a].clone()
+        mom_b_before = live._host_momentum[w_b].clone()
+        bad_sd = live.state_dict()
+        bad_sd["param_groups"][0]["lr"] = 5e-1
+        bad_sd["state"][0] = {"momentum_buffer": torch.full((8, 16), 7.0)}
+        bad_sd["state"][1] = {"momentum_buffer": torch.zeros(1, 16)}
         with pytest.raises(ValueError, match="has shape"):
-            resumed.load_state_dict(bad_sd)
+            live.load_state_dict(bad_sd)
+        assert live.param_groups[0]["lr"] == 1e-2
+        torch.testing.assert_close(live._host_momentum[w_a], mom_a_before, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(live._host_momentum[w_b], mom_b_before, atol=0.0, rtol=0.0)
 
         # And the resumed optimizer continues along the same trajectory, from the
         # same parameter and momentum values.

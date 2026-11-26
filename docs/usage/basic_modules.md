@@ -394,9 +394,13 @@ peak device memory, with a different shape per algorithm:
   currently free device memory.
 * `muon` holds one `momentum_buffer` per parameter, which no other tensor reads,
   so it streams that buffer in immediately before each parameter's update and
-  releases it straight after. Peak device cost becomes one parameter's momentum
-  instead of the whole Muon group's. Under `type: muon` the AdamW sibling group
-  (embeddings, `lm_head`, norms) offloads in batches too.
+  writes it back straight after. Non-all-to-all parameters (single-device and
+  3D local expert stacks under `muon_expert_zero_comm`) stage one local shard at
+  a time; FSDP2-sharded 2D parameters entering the owner-assigned all-to-all
+  path keep up to one chunk of `shard_world_size` local update shards live until
+  the chunk flushes (still bounded by roughly one full parameter instead of the
+  entire Muon group). Under `type: muon` the AdamW sibling group (embeddings,
+  `lm_head`, norms) offloads in batches too via `SwapAdamW`.
 
 Muon-specific hyperparameters live under `model.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` continue to drive the AdamW sibling group.
 

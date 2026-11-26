@@ -940,10 +940,13 @@ class DistributedMuon(Optimizer):
             )
 
         # Muon keeps exactly one state tensor per parameter (``momentum_buffer``),
-        # and nothing else reads it, so host residency is a plain swap rather than
-        # a batched pipeline: each parameter's buffer is streamed in immediately
-        # before its update and released straight after. That bounds the device
-        # cost of the state to one parameter instead of the whole Muon group.
+        # and nothing else reads it, so host residency streams each parameter's
+        # buffer in immediately before its update and copies it back right after.
+        # Non-all-to-all parameters (single-device and 3D local experts under
+        # ``muon_expert_zero_comm``) stage one local shard at a time; FSDP2-sharded
+        # 2D parameters entering ``a2a_buckets`` keep up to ``submesh.size(0)``
+        # local update shards live until the bucket flushes (roughly one full
+        # parameter rather than the entire Muon group).
         self.state_offload = bool(state_offload)
         self.state_offload_pin_memory = (
             bool(state_offload_pin_memory) and self.state_offload and get_device_type() != "cpu"
@@ -1116,6 +1119,29 @@ class DistributedMuon(Optimizer):
                 else:
                     stripped_state[key] = entry
             sd_to_load = {**state_dict, "state": stripped_state}
+            # Validate all mapped momentum shapes before mutating param_groups or
+            # copying any host buffers so a shape mismatch leaves the live
+            # optimizer completely untouched.
+            saved_groups = state_dict.get("param_groups", ())
+            if len(saved_groups) == len(self.param_groups) and all(
+                len(sg.get("params", ())) == len(g["params"]) for g, sg in zip(self.param_groups, saved_groups)
+            ):
+                id_map = {
+                    saved_id: p
+                    for group, saved_group in zip(self.param_groups, saved_groups)
+                    for saved_id, p in zip(saved_group["params"], group["params"])
+                }
+                for saved_id, buf in extracted_momentum.items():
+                    p = id_map.get(saved_id)
+                    if p is None or not isinstance(buf, Tensor):
+                        continue
+                    expected_shape = self._host_momentum[p].shape if p in self._host_momentum else _to_local(p).shape
+                    local_shape = _to_local(buf).shape
+                    if local_shape != expected_shape:
+                        raise ValueError(
+                            f"optimizer state 'momentum_buffer' has shape {tuple(local_shape)} in the checkpoint "
+                            f"but {tuple(expected_shape)} here; DCP should reshard before this point."
+                        )
         else:
             sd_to_load = state_dict
 
@@ -1242,8 +1268,11 @@ class DistributedMuon(Optimizer):
                 if self.state_offload:
                     # Host-resident momentum: stream this parameter's buffer in,
                     # merge the gradient into it, copy the updated momentum back
-                    # to host synchronously, and release the staging reference
-                    # once ``update`` is formed.
+                    # to host synchronously, and drop our local staging refs once
+                    # ``update`` is formed. Non-all-to-all parameters release
+                    # ``update`` immediately after ``_compute_ortho``; FSDP2 2D
+                    # parameters keep ``update`` in ``a2a_buckets`` until the
+                    # ``submesh.size(0)`` chunk flushes.
                     #
                     # The buffers must be rewrapped as DTensors when the parameter
                     # is sharded: `lerp_` refuses a mix of plain and distributed
