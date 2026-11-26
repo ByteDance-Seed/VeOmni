@@ -53,12 +53,14 @@ def eager_attention_mask_builder(
     """HF-signature additive mask builder for ``veomni_eager``.
 
     Single-segment packed/varlen metadata is dropped. Several segments per row
-    raise; build them with ``packed_causal_mask``. Causal skip is always
-    disabled so eager receives an explicit additive mask, while bidirectional
-    elision remains available when explicitly requested.
+    raise; build them with ``packed_causal_mask``. Causal and bidirectional
+    skips are disabled so eager receives an explicit additive mask. ``None``
+    would otherwise be reread as ``module.is_causal``. Direct unmasked causal
+    calls do not use this builder.
     """
     kwargs = strip_sdpa_packed_metadata(kwargs, batch_size=batch_size, dense_mask=None)
     kwargs.pop("allow_is_causal_skip", None)
+    kwargs.pop("allow_is_bidirectional_skip", None)
     mask = _dense_attention_mask_builder(
         batch_size,
         q_length,
@@ -69,6 +71,7 @@ def eager_attention_mask_builder(
         attention_mask,
         skip_ulysses=skip_ulysses,
         allow_is_causal_skip=False,
+        allow_is_bidirectional_skip=False,
         **kwargs,
     )
     return _to_eager_additive(mask, dtype)

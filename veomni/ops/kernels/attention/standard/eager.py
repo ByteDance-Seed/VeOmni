@@ -92,8 +92,30 @@ def _build_unmasked_eager_mask(
             visible = visible & ((q_positions - k_positions) < sliding_window)
     else:
         assert sliding_window is not None
-        visible = (q_positions - k_positions).abs() < sliding_window
+        # Match ``sliding_window_bidirectional_overlay``: the boundary distance is visible.
+        visible = (q_positions - k_positions).abs() <= sliding_window
     return visible[None, None]
+
+
+def _fully_blocked_rows(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Return rows whose keys are all invisible.
+
+    Boolean masks use ``False`` for blocked keys. Additive masks use non-finite
+    values, including ``-inf``. A row of finite minima is not fully blocked.
+    """
+    visible = attention_mask if attention_mask.dtype == torch.bool else torch.isfinite(attention_mask)
+    return ~visible.any(dim=-1, keepdim=True)
+
+
+def _softmax_without_fully_blocked_rows(
+    attn_weights: torch.Tensor, fully_blocked: torch.Tensor | None
+) -> torch.Tensor:
+    """Softmax over keys, giving fully blocked rows probability 0 instead of NaN or a uniform distribution."""
+    if fully_blocked is None:
+        return F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(attn_weights.dtype)
+    finite_logits = attn_weights.masked_fill(fully_blocked, 0)
+    probabilities = F.softmax(finite_logits, dim=-1, dtype=torch.float32).to(attn_weights.dtype)
+    return probabilities.masked_fill(fully_blocked, 0)
 
 
 def _eager_attention_core(
@@ -108,7 +130,12 @@ def _eager_attention_core(
     softcap: float | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute pure-PyTorch scaled dot-product attention for one unpacked batch."""
+    """Compute pure-PyTorch scaled dot-product attention for one unpacked batch.
+
+    Fully blocked rows receive zero probability. A boolean row with no ``True``
+    would otherwise softmax to a uniform distribution, and an additive row of
+    ``-inf`` would softmax to NaN.
+    """
     if key.shape[1] != value.shape[1] or query.shape[1] % key.shape[1] != 0:
         raise ValueError(
             "Eager attention requires query heads to be divisible by matching key/value heads; "
@@ -138,9 +165,11 @@ def _eager_attention_core(
             position_bias = position_bias[..., : key_states.shape[-2]]
         attn_weights = attn_weights + position_bias
 
+    fully_blocked = None
     if attention_mask is not None:
         if attention_mask.ndim >= 2 and attention_mask.shape[-1] > key_states.shape[-2]:
             attention_mask = attention_mask[..., : key_states.shape[-2]]
+        fully_blocked = _fully_blocked_rows(attention_mask)
         if attention_mask.dtype == torch.bool:
             attn_weights = attn_weights.masked_fill(~attention_mask, torch.finfo(attn_weights.dtype).min)
         else:
@@ -157,6 +186,7 @@ def _eager_attention_core(
             device=query.device,
         )
         if visible is not None:
+            fully_blocked = _fully_blocked_rows(visible)
             attn_weights = attn_weights.masked_fill(~visible, torch.finfo(attn_weights.dtype).min)
 
     training = bool(getattr(module, "training", False))
@@ -174,7 +204,7 @@ def _eager_attention_core(
         scores = probs[..., :-1]
         attn_weights = F.dropout(scores, p=dropout, training=training).to(value_states.dtype)
     else:
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+        attn_weights = _softmax_without_fully_blocked_rows(attn_weights, fully_blocked).to(query.dtype)
         attn_weights = F.dropout(attn_weights, p=dropout, training=training)
 
     attn_output = torch.matmul(attn_weights, value_states)

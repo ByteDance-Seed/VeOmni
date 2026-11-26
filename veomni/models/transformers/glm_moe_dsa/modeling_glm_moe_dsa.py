@@ -42,6 +42,7 @@ from veomni.models.loss_utils import ForCausalLMLoss
 # Additional imports for patches
 from veomni.models.modeling_base import VeOmniPreTrainedModel as PreTrainedModel
 from veomni.ops import VeomniOp
+from veomni.ops.kernels.attention.ulysses import should_apply_ulysses
 from veomni.ops.kernels.dsa.mask import copy_dsa_mask_provenance, create_standard_causal_mask, translate_fused_dsa_mask
 from veomni.utils.device import IS_NPU_AVAILABLE
 from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
@@ -393,6 +394,14 @@ class GlmMoeDsaAttention(nn.Module):
 
         eager_attention = self.veomni_dsa_attention.impl == "eager"
         if eager_attention:
+            if should_apply_ulysses(skip_ulysses=False):
+                # Top-k indices address the local sequence. Gathering Q/K/V inside
+                # attention leaves this mask too small, and skip_ulysses would only
+                # attend inside each rank.
+                raise ValueError(
+                    "GLM-MoE-DSA eager top-k attention does not support Ulysses sequence parallelism; "
+                    "the top-k mask uses local sequence coordinates and cannot be applied to gathered Q/K/V."
+                )
             # Eager keeps Hugging Face's expanded MLA: kv_b_proj K/V on the cache and
             # standard attention over the top-k mask, so it matches HF bitwise.
             query_states = torch.cat((q_nope, q_pe), dim=-1)

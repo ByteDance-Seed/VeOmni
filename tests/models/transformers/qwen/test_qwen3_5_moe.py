@@ -227,6 +227,7 @@ def test_qwen3_5_moe_npu_generated_attention_binds_ops_and_runs_eager_forward(mo
     from veomni.models.transformers.qwen3_5_moe import modeling_qwen3_5_moe as npu_modeling
     from veomni.ops.kernels.gated_delta_rule.chunk_gated_delta_rule.standard import fla_npu
 
+    monkeypatch.setenv("MODELING_BACKEND", "veomni")
     recorded: list[dict[str, object]] = []
 
     def fake_precompute(**kwargs):

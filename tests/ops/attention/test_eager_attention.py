@@ -128,7 +128,7 @@ def test_eager_attention_unmasked_visibility_patterns(
         expected_visible = (
             torch.ones(q_len, kv_len, dtype=torch.bool)
             if sliding_window is None
-            else (q_pos - k_pos).abs() < sliding_window
+            else (q_pos - k_pos).abs() <= sliding_window
         )
 
     ref_qkv = clone_qkv(query, key, value)
@@ -151,6 +151,70 @@ def test_eager_attention_unmasked_visibility_patterns(
     torch.testing.assert_close(actual_out, ref_out, rtol=EAGER_RTOL, atol=EAGER_ATOL)
     for actual_grad, ref_grad in zip(actual_grads, ref_grads, strict=True):
         torch.testing.assert_close(actual_grad, ref_grad, rtol=EAGER_GRAD_RTOL, atol=EAGER_GRAD_ATOL)
+
+
+def test_eager_attention_zeroes_fully_blocked_rows():
+    """Boolean and ``-inf`` rows with no visible key get zero probability and stay finite."""
+    query = torch.zeros(1, 1, 2, 4)
+    key = torch.zeros(1, 1, 2, 4)
+    value = torch.tensor([1.0, 3.0]).view(1, 1, 2, 1)
+    module = SimpleNamespace(is_causal=False, training=False)
+    bool_mask = torch.tensor([[[[False, False], [True, False]]]])
+    additive = torch.zeros(1, 1, 2, 2)
+    additive[..., 0, :] = float("-inf")
+    additive[..., 1, 1] = float("-inf")
+
+    for mask in (bool_mask, additive):
+        out, weights = eager_backend.eager_attention_forward(module, query, key, value, mask, dropout=0.0)
+        assert weights is not None
+        assert torch.isfinite(out).all()
+        assert torch.isfinite(weights).all()
+        torch.testing.assert_close(out[0, 0, 0], torch.zeros(1))
+        torch.testing.assert_close(out[0, 1, 0], torch.ones(1))
+        torch.testing.assert_close(weights[0, 0, 0], torch.zeros(2))
+        torch.testing.assert_close(weights[0, 0, 1], torch.tensor([1.0, 0.0]))
+
+    value_grad = value.detach().requires_grad_(True)
+    grad_out, _ = eager_backend.eager_attention_forward(module, query, key, value_grad, additive, dropout=0.0)
+    grad_out.sum().backward()
+    assert value_grad.grad is not None
+    assert torch.isfinite(value_grad.grad).all()
+
+
+def test_unmasked_bidirectional_sliding_window_matches_explicit_mask():
+    """Unmasked bidirectional windows include the boundary token, matching the mask builder."""
+    generator = torch.Generator().manual_seed(7)
+    query = torch.randn(1, 2, 5, 8, generator=generator)
+    key = torch.randn(1, 2, 5, 8, generator=generator)
+    value = torch.randn(1, 2, 5, 8, generator=generator)
+    module = SimpleNamespace(is_causal=False, training=False)
+    sliding_window = 1
+
+    unmasked, _ = eager_backend.eager_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask=None,
+        sliding_window=sliding_window,
+    )
+    explicit = eager_attention_mask_builder(
+        1,
+        5,
+        5,
+        device=query.device,
+        dtype=query.dtype,
+        mask_function=bidirectional_mask_function,
+        sliding_window=sliding_window,
+    )
+    assert explicit is not None
+    masked, _ = eager_backend.eager_attention_forward(module, query, key, value, explicit)
+    torch.testing.assert_close(unmasked, masked, rtol=EAGER_RTOL, atol=EAGER_ATOL)
+
+    positions = torch.arange(5)
+    distance = (positions[:, None] - positions[None, :]).abs()
+    assert torch.all(explicit[0, 0][distance == sliding_window] == 0)
+    assert torch.all(explicit[0, 0][distance > sliding_window] == torch.finfo(explicit.dtype).min)
 
 
 def test_eager_attention_slices_wider_mask_and_supports_position_bias():
@@ -499,17 +563,25 @@ def test_eager_attention_mask_builder_aligns_with_hf_eager_mask():
     assert ours_sliding is not None
     torch.testing.assert_close(ours_sliding, hf_sliding, rtol=0, atol=0)
 
-    assert (
-        eager_attention_mask_builder(
-            1,
-            4,
-            4,
-            device="cpu",
-            mask_function=bidirectional_mask_function,
-            allow_is_bidirectional_skip=True,
-        )
-        is None
+    hf_bidirectional = ALL_MASK_ATTENTION_FUNCTIONS["eager"](
+        batch_size=1,
+        q_length=4,
+        kv_length=4,
+        device="cpu",
+        mask_function=bidirectional_mask_function,
     )
+    ours_bidirectional = eager_attention_mask_builder(
+        1,
+        4,
+        4,
+        device="cpu",
+        mask_function=bidirectional_mask_function,
+        allow_is_bidirectional_skip=True,
+    )
+    assert ours_bidirectional is not None
+    assert hf_bidirectional is not None
+    torch.testing.assert_close(ours_bidirectional, hf_bidirectional, rtol=0, atol=0)
+    assert torch.count_nonzero(ours_bidirectional) == 0
 
     # Single-segment metadata is dropped; multi-segment metadata raises.
     single = eager_attention_mask_builder(1, 4, 4, device="cpu", cu_seq_lens_q=torch.tensor([0, 4]))

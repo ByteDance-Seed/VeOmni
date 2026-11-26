@@ -77,6 +77,19 @@ def _assert_dsa_wiring(attn) -> None:
     assert attn.indexer.veomni_dsa_indexer.variant == "glm"
 
 
+def test_glm_moe_dsa_eager_topk_rejects_ulysses(monkeypatch):
+    """Local top-k masks cannot be applied after Ulysses gathers Q/K/V."""
+    from veomni.models.transformers.glm_moe_dsa import modeling_glm_moe_dsa as gen
+
+    monkeypatch.setattr(gen, "should_apply_ulysses", lambda *, skip_ulysses=False: True)
+    torch.manual_seed(0)
+    config = _tiny_config()
+    model = _build_ours(config).eval()
+    input_ids = torch.randint(3, config.vocab_size, (1, 4))
+    with pytest.raises(ValueError, match="does not support Ulysses"):
+        model(input_ids=input_ids, use_cache=False)
+
+
 def test_glm_moe_dsa_eager_matches_hf():
     torch.manual_seed(0)
     config = _tiny_config()
