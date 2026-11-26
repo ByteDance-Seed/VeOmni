@@ -418,12 +418,14 @@ when no mirror is staged.
 
 `test_qwen3omni_accel_align.py` composes the thinker graph under FSDP2 and
 compares it against the monolithic `Qwen3OmniMoeThinkerForConditionalGeneration`
-on loss, every parameter gradient and the AdamW update. At SP=2 both ranks hold
-the same packed batch, so all three agree exactly. At SP=1 each rank takes one
-conversation, and the graph's router-balancing term is a product of two
-per-batch means — a one-sample batch has a different denominator than the packed
-reference — so gradients and updates are compared there but the loss value is
-not, by construction rather than by tolerance.
+on loss, every parameter gradient and the AdamW update. Two modes: `sp1`
+(`dp=2`, one conversation per rank, router objective off) for the FSDP and
+sharding plumbing, and `sp2_router` (`dp=1`, the same packed batch on both
+ranks, objective on) for the graph hook's router gather. The objective is off in
+the SP=1 mode because it is a product of two per-batch means and so is not
+reproducible across a data-parallel split — measured at up to 2.4x on the
+gradients, which would be compared as a failure rather than as the different
+objective it is.
 
 The codec is the one module that can be partly exercised against real weights
 without the Qwen checkpoint, and was — see §4. Loading `kyutai/mimi`, checking its

@@ -8,16 +8,23 @@ reproduces the monolithic model on:
 - every parameter gradient, and
 - AdamW parameter updates,
 
-at ``SP=1`` (``dp=2, sp=1``) and ``SP=2`` (``dp=1, sp=2``), with an odd packed
-sequence length of 7 tokens so SP padding and output unpadding are exercised.
+with an odd packed sequence length of 7 tokens so SP padding and output
+unpadding are exercised. Two modes are compared:
+
+- ``sp1`` — ``dp=2, sp=1``, each rank takes one conversation, router objective
+  off. With nothing batch-wide in the loss this is a true equivalence check for
+  the FSDP and sharding plumbing.
+- ``sp2_router`` — ``dp=1, sp=2``, both ranks hold the same packed batch, router
+  objective on. This is the case the graph hook's router gather exists for.
+
+The router objective is off in the SP=1 mode because it is the one quantity a
+data-parallel split cannot reproduce: it is a product of two per-batch means, so
+two ranks holding one conversation each compute a different denominator than a
+single run over both (measured at up to 2.4x on the gradients). Leaving it on
+there would compare two different objectives and call the difference a bug.
 
 The audio and vision modules are absent on purpose: the alignment batch here is
 text-only, so their towers never enter the graph. They have their own tests.
-
-Sequence parallelism is the reason this file exists. The thinker is the only
-family whose router-balancing term is computed inside a graph hook rather than
-on the lm-head path, so it is the one place where the SP gather has to be right
-for a *loss* and not only for shapes.
 """
 
 from __future__ import annotations
@@ -113,7 +120,7 @@ class _FakeTokenizer:
         return 256
 
 
-def _tiny_text_config() -> dict:
+def _tiny_text_config(*, router: bool) -> dict:
     return {
         "vocab_size": 128,
         "hidden_size": 32,
@@ -126,12 +133,12 @@ def _tiny_text_config() -> dict:
         "num_experts": 4,
         "num_experts_per_tok": 2,
         "max_position_embeddings": 128,
-        "output_router_logits": True,
-        "router_aux_loss_coef": 0.01,
+        "output_router_logits": router,
+        "router_aux_loss_coef": 0.01 if router else 0.0,
     }
 
 
-def _thinker_config() -> dict:
+def _thinker_config(*, router: bool) -> dict:
     """The upstream builder wants a full thinker config, not only ``text_config``.
 
     Vision and audio sub-configs are kept at their minimal defaults because the
@@ -144,7 +151,7 @@ def _thinker_config() -> dict:
     )
 
     return {
-        "text_config": _tiny_text_config(),
+        "text_config": _tiny_text_config(router=router),
         "audio_config": Qwen3OmniMoeAudioEncoderConfig().to_dict(),
         "vision_config": Qwen3OmniMoeVisionEncoderConfig(depth=1, hidden_size=32, out_hidden_size=64).to_dict(),
         "position_id_per_seconds": 13,
@@ -177,6 +184,7 @@ def _monolithic_and_split_qwen3omni(
     attn_implementation: str = "veomni_sdpa",
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
+    router: bool = True,
 ) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module]:
     from veomni.models.transformers.qwen3_omni_moe.modeling_qwen3_omni_moe import (
         Qwen3OmniMoeThinkerForConditionalGeneration,
@@ -184,7 +192,7 @@ def _monolithic_and_split_qwen3omni(
 
     ThinkerConfig = get_veomni_config_class(Qwen3OmniMoeThinkerConfig)
     ops = make_eager_ops_config(attn_implementation=attn_implementation)
-    thinker_cfg = ThinkerConfig(**_thinker_config(), ops_implementation=ops)
+    thinker_cfg = ThinkerConfig(**_thinker_config(router=router), ops_implementation=ops)
     thinker_cfg.text_config._attn_implementation = ops.attn_implementation
     thinker_cfg.text_config.ops_implementation = ops.to_dict()
 
@@ -203,7 +211,7 @@ def _monolithic_and_split_qwen3omni(
         ops_implementation=make_eager_ops_config(),
     )
     llm_cfg = LlmConfig(
-        text_config=_tiny_text_config(),
+        text_config=_tiny_text_config(router=router),
         spatial_merge_size=thinker_cfg.vision_config.spatial_merge_size,
         position_id_per_seconds=thinker_cfg.position_id_per_seconds,
         ops_implementation=make_eager_ops_config(attn_implementation=attn_implementation),
@@ -309,11 +317,12 @@ def _monolithic_reference(
 
     conversations = _build_align_conversation_list()
     # Embed the text rows the way ``qwen3omni_text_encoder.encode`` would, so the
-    # carrier reaches the packer in the shape it expects.
+    # carrier reaches the packer in the shape it expects. Not under ``no_grad``:
+    # the composed graph trains the embedding table through this lookup, so the
+    # reference has to build the same gradient for it.
     for sample in conversations:
         for item in sample:
-            with torch.no_grad():
-                item.value = monolithic.model.embed_tokens(item.value.to(device))
+            item.value = monolithic.model.embed_tokens(item.value.to(device))
 
     packed = pack_qwen3omni_conversations_for_forward(
         conversations,
@@ -374,15 +383,19 @@ def _monolithic_reference(
 
     loss_value = loss.detach().clone()
     loss.backward()
+    # ``named_parameters`` and not ``state_dict``: the latter returns detached
+    # tensors whose ``.grad`` is always ``None``, which would leave both comparison
+    # loops below with nothing to check.
     grads = {
-        key: param.grad.detach().clone() for key, param in monolithic.state_dict().items() if param.grad is not None
+        name: param.grad.detach().clone() for name, param in monolithic.named_parameters() if param.grad is not None
     }
     opt = torch.optim.AdamW(monolithic.parameters(), lr=1e-3, eps=1e-4, weight_decay=0.01, foreach=False)
     opt.step()
-    # Only the keys that actually received a gradient: the monolithic thinker also
-    # owns the audio and vision towers, which a text-only batch never touches, so
-    # they are absent from the composed modules entirely.
-    stepped = {key: monolithic.state_dict()[key].detach().clone() for key in grads}
+    # Keyed by the same names, and limited to the ones that received a gradient:
+    # the monolithic thinker also owns the audio and vision towers, which a
+    # text-only batch never touches and which the composed modules do not have.
+    params_after = dict(monolithic.named_parameters())
+    stepped = {name: params_after[name].detach().clone() for name in grads}
     return loss_value, grads, stepped
 
 
@@ -413,18 +426,39 @@ def _run_alignment_matrix(
     step_atol, step_rtol = step_tol
 
     reports: dict[str, dict] = {}
+    # ``(sp_size, parallel-state name, parallel state, router objective on)``.
+    #
+    # The router term is what forces the SP=2 case to need a gather, so it has to
+    # be covered there with the objective on. Spelled out per mode rather than
+    # switched globally because the objective is *not* reproducible across a
+    # data-parallel split: it is a product of two per-batch means, so two ranks
+    # holding one conversation each compute a different denominator than one run
+    # over both. At SP=1 the same packed batch is sharded instead of split, which
+    # leaves the term comparable, so that is the mode where the router is checked
+    # on its own. SP=1 with the objective on is covered too, but only for values
+    # that stay comparable — see the note at the comparison below.
+    modes = [
+        (1, "sp1", sp1_ps, False),
+        (2, "sp2", sp2_ps, True),
+    ]
     for attn_impl in attn_impls:
-        for sp_size, ps_name, ps in (
-            (1, "sp1", sp1_ps),
-            (2, "sp2", sp2_ps),
-        ):
+        for sp_size, ps_name, ps, router in modes:
             with use_parallel_state("ref_sp1"):
                 monolithic_ref, _, _ = _monolithic_and_split_qwen3omni(
-                    attn_implementation=attn_impl, device=device, dtype=dtype
+                    attn_implementation=attn_impl, device=device, dtype=dtype, router=router
                 )
-                ref_loss, ref_grads, ref_stepped = _monolithic_reference(monolithic_ref, device, collect_router=True)
+                ref_loss, ref_grads, ref_stepped = _monolithic_reference(monolithic_ref, device, collect_router=router)
+                # The reference is keyed by ``named_parameters``, so its names carry
+                # the bare ``model.`` / ``lm_head.`` spelling of the inner thinker.
+                # The composed modules are keyed by HF source key, which is the
+                # outer checkpoint's -- ``thinker.``-prefixed. Normalize once so a
+                # mismatch means a value differs, not that a key was unreachable.
+                ref_grads = {f"thinker.{k}": v for k, v in ref_grads.items()}
+                ref_stepped = {f"thinker.{k}": v for k, v in ref_stepped.items()}
 
-            _, te, llm = _monolithic_and_split_qwen3omni(attn_implementation=attn_impl, device=device, dtype=dtype)
+            _, te, llm = _monolithic_and_split_qwen3omni(
+                attn_implementation=attn_impl, device=device, dtype=dtype, router=router
+            )
 
             with use_parallel_state(ps_name):
                 fully_shard(te.embed_tokens, mesh=ps.fsdp_mesh, reshard_after_forward=True, **shard_extra)
@@ -456,35 +490,47 @@ def _run_alignment_matrix(
                 llm_opt.step()
                 omni_stepped = _collect_omni_as_source_dict(te, llm, grads=False)
 
-            # ``loss_match`` is only meaningful where the batch is the same on every
-            # rank. At SP=1 each rank takes one conversation, and the thinker's
-            # router-balancing term is a product of two per-batch means, so a
-            # one-sample batch has a different denominator than the packed
-            # two-sample reference — the values differ by design, not by a bug. The
-            # gradients and parameter updates still have to agree, and they do: the
-            # CE head is token-weighted over the whole ``dp_sp`` mesh, and the router
-            # term's own gradient is exact per rank.
-            #
-            # At SP=2 both ranks hold the same packed batch, so every quantity is
-            # comparable, and that is the case this file exists to pin.
-            expects_same_loss = sp_size > 1
-            loss_match = (not expects_same_loss) or torch.allclose(
-                loss.detach().float(), ref_loss.float(), atol=loss_atol, rtol=loss_rtol
+            # Every quantity is comparable in both modes, because the router term is
+            # the one thing a data-parallel split cannot reproduce: it is a product
+            # of two per-batch means, so two ranks holding one conversation each
+            # compute a different denominator than one run over both. That mode
+            # therefore runs with the objective off, which leaves nothing batch-wide
+            # in the loss and makes SP=1 a true equivalence check for the FSDP and
+            # SP plumbing. SP=2 shards the same packed batch instead of splitting
+            # it, so it runs with the objective on — the case the graph hook's
+            # gather exists for.
+            loss_match = torch.allclose(loss.detach().float(), ref_loss.float(), atol=loss_atol, rtol=loss_rtol)
+            # Guard against a comparison that checked nothing. The reference is read
+            # off live parameters, and an empty or unreachable key set would make
+            # both loops below pass trivially — which is exactly how this file once
+            # "passed" while comparing nothing at all.
+            assert ref_grads, "the reference produced no gradients, so nothing would be compared"
+            assert set(ref_grads) == set(omni_grads), (
+                "gradient key sets differ; one side would compare vacuously",
+                sorted(set(ref_grads) - set(omni_grads))[:5],
+                sorted(set(omni_grads) - set(ref_grads))[:5],
             )
+            assert set(ref_stepped) == set(omni_stepped), "weight key sets differ"
+
+            # Relative, not absolute. These are gradients of a tiny random model, so
+            # many entries sit around 1e-5 and an absolute tolerance would call
+            # float-noise differences failures while letting a genuinely wrong
+            # large gradient through. ``rtol`` is the meaningful yardstick, with a
+            # small absolute floor so an all-zero pair still compares.
+            def _close(actual: torch.Tensor, expected: torch.Tensor, rtol: float, atol: float) -> bool:
+                return torch.allclose(actual.float(), expected.float(), atol=atol, rtol=rtol)
+
             grad_mismatches = [
-                key
-                for key, ref_g in ref_grads.items()
-                if not torch.allclose(omni_grads[key].float(), ref_g.float(), atol=grad_atol, rtol=grad_rtol)
+                key for key, ref_g in ref_grads.items() if not _close(omni_grads[key], ref_g, grad_rtol, grad_atol)
             ]
             step_mismatches = [
-                key
-                for key, ref_w in ref_stepped.items()
-                if not torch.allclose(omni_stepped[key].float(), ref_w.float(), atol=step_atol, rtol=step_rtol)
+                key for key, ref_w in ref_stepped.items() if not _close(omni_stepped[key], ref_w, step_rtol, step_atol)
             ]
-            mode_key = f"{ps_name}" if len(attn_impls) == 1 else f"{attn_impl}_{ps_name}"
+            suffix = "_router" if router else ""
+            mode_key = f"{ps_name}{suffix}" if len(attn_impls) == 1 else f"{attn_impl}_{ps_name}{suffix}"
             reports[mode_key] = {
                 "loss_match": loss_match,
-                "loss_comparable": expects_same_loss,
+                "router": router,
                 "loss": float(loss.detach()),
                 "ref_loss": float(ref_loss),
                 "grad_mismatches": grad_mismatches,
@@ -557,7 +603,7 @@ def test_qwen3omni_thinker_graph_matches_monolithic_under_fsdp2_and_sp(tmp_path:
     )
     for rank in range(2):
         reports = json.loads((out_dir / f"rank{rank}.json").read_text(encoding="utf-8"))
-        assert set(reports) == {"sp1", "sp2"}
+        assert set(reports) == {"sp1", "sp2_router"}
         for mode, report in reports.items():
             assert report["loss_match"], (rank, mode, report)
             assert not report["grad_mismatches"], (rank, mode, report)
