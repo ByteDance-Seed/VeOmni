@@ -121,7 +121,7 @@ and stored as `trainer.environ_meter`.
       per metered module [`(estimate_flops(buffer), buffer)`](../../../veomni/models/seed_omni/mixins/metric_meter_mixin.py#L150); buffer reset.
     - [`OmniEnvironMeter.step(delta_time, global_step, module_metrics)`](../../../veomni/utils/omni_helper.py#L145)
     - [`trainer.step_env_metrics = ...`](../../../veomni/trainer/callbacks/omni_callbacks/step_metrics_callback.py#L115),
-      logged by [`WandbTraceCallback`](../../../veomni/trainer/callbacks/trace_callback.py#L187).
+      logged by [`WandbTraceCallback`](../../../veomni/trainer/callbacks/trace_callback.py#L234).
 
 `delta_time` covers every micro-batch's forward and backward plus the optimizer
 step. Metering only happens through `TrainNodeRunner`: calling

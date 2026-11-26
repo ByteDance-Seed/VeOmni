@@ -135,30 +135,77 @@ class MoERouterMonitorCallback(Callback):
             logger.info_rank0("MoE router monitor disabled.")
 
 
+def _unique_trimmed_key(raw: str, budget: int, reserved: set[str]) -> str:
+    """Shorten ``raw`` to at most ``budget`` chars with a deterministic hash suffix avoiding ``reserved``."""
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:6]
+    head_len = max(budget - len(digest) - 1, 0)
+    candidate = f"{raw[:head_len]}_{digest}" if head_len > 0 else digest[:budget]
+    suffix = 1
+    while candidate in reserved:
+        tag = f"_{digest[:4]}{suffix}"
+        head_len = max(budget - len(tag), 0)
+        candidate = f"{raw[:head_len]}{tag}" if head_len > 0 else tag[-budget:]
+        suffix += 1
+    reserved.add(candidate)
+    return candidate
+
+
 def _trim_wandb_config_keys(obj: Any, prefix: str = "", max_len: int = 64) -> Any:
-    """Trim long leaf config keys (keeping at least 8 chars) with a collision-safe hash suffix."""
+    """Shorten overflowing config keys so every dot-flattened key stays within ``max_len`` without collisions.
+
+    Short keys keep their original nested paths unchanged. When a parent prefix leaves
+    at least 8 characters of budget, overflowing sibling leaf keys are shortened in place
+    with a deterministic hash suffix after reserving all non-overflowing sibling keys.
+    When the parent path leaves fewer than 8 characters (such as deeply nested inline
+    ``model_config.modules.<name>.accelerator...`` entries), those leaves are hoisted to
+    the root dict under a deterministic ``<= max_len`` flattened key so every flattened
+    W&B key strictly satisfies ``len(key) <= max_len``.
+    """
     if not isinstance(obj, dict):
         return obj
-    out: Dict[str, Any] = {}
-    for k, v in obj.items():
-        key_str = str(k)
-        full = f"{prefix}.{key_str}" if prefix else key_str
-        if isinstance(v, dict) and v:
-            out[key_str] = _trim_wandb_config_keys(v, full, max_len=max_len)
-        else:
-            if len(full) > max_len:
-                budget = max(max_len - (len(prefix) + 1 if prefix else 0), 8)
-                digest = hashlib.sha1(key_str.encode("utf-8")).hexdigest()[:6]
-                head_len = max(budget - len(digest) - 1, 0)
-                candidate = f"{key_str[:head_len]}_{digest}" if head_len > 0 else digest[:budget]
-                suffix = 1
-                while candidate in out:
-                    tag = f"_{digest[:4]}{suffix}"
-                    candidate = f"{key_str[: max(budget - len(tag), 0)]}{tag}"[:budget]
-                    suffix += 1
-                key_str = candidate
-            out[key_str] = v
-    return out
+
+    hoisted: list[tuple[str, Any]] = []
+
+    def _walk(node: Dict[str, Any], cur_prefix: str) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        reserved: set[str] = set()
+        nested_items: list[tuple[str, Dict[str, Any]]] = []
+        leaf_items: list[tuple[str, Any]] = []
+        for k, v in node.items():
+            key_str = str(k)
+            full = f"{cur_prefix}.{key_str}" if cur_prefix else key_str
+            if isinstance(v, dict) and v:
+                nested_items.append((key_str, v))
+            else:
+                leaf_items.append((key_str, v))
+                if len(full) <= max_len:
+                    reserved.add(key_str)
+
+        for key_str, v in nested_items:
+            full = f"{cur_prefix}.{key_str}" if cur_prefix else key_str
+            sub = _walk(v, full)
+            if sub:
+                out[key_str] = sub
+                reserved.add(key_str)
+
+        budget = max_len - (len(cur_prefix) + 1 if cur_prefix else 0)
+        for key_str, v in leaf_items:
+            full = f"{cur_prefix}.{key_str}" if cur_prefix else key_str
+            if len(full) <= max_len:
+                out[key_str] = v
+            elif budget >= 8:
+                out[_unique_trimmed_key(key_str, budget, reserved)] = v
+            else:
+                hoisted.append((full, v))
+        return out
+
+    result = _walk(obj, prefix)
+    if hoisted:
+        root_reserved = set(result.keys())
+        root_budget = max(max_len - (len(prefix) + 1 if prefix else 0), 8)
+        for full, v in hoisted:
+            result[_unique_trimmed_key(full, root_budget, root_reserved)] = v
+    return result
 
 
 class WandbTraceCallback(Callback):

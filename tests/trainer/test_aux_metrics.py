@@ -406,7 +406,19 @@ def test_environ_meter_tolerates_a_step_without_aux_metrics(monkeypatch, aux_met
 
 
 def test_trim_wandb_config_keys_caps_nested_dot_flattened_length():
-    """Deeply nested config keys exceeding 64 dot-flattened chars are trimmed with at least an 8-char leaf budget."""
+    """Every dot-flattened key stays <= ``max_len``, with no overwrites from sibling or deep-parent collisions."""
+    import hashlib
+
+    def _flatten(d, prefix=""):
+        items = {}
+        for k, v in d.items():
+            full = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict) and v:
+                items.update(_flatten(v, full))
+            else:
+                items[full] = v
+        return items
+
     trim = trace_callback_module._trim_wandb_config_keys
     long_leaf = "very_long_configuration_field_name_exceeding_wandb_key_limit"
     cfg = {
@@ -430,20 +442,53 @@ def test_trim_wandb_config_keys_caps_nested_dot_flattened_length():
     assert len(prefix) + len(trimmed_keys[0]) == 64
     assert inner[trimmed_keys[0]] == "value"
 
-    # When prefix alone already exceeds max_len, keep an 8-char collision-safe leaf key.
-    deep_prefix = "a" * 70
-    deep = trim({deep_prefix: {"learning_rate": 1e-4, "learning_rate_schedule": "cosine"}}, max_len=64)
-    deep_inner = deep[deep_prefix]
-    assert len(deep_inner) == 2
-    assert all(len(k) == 8 for k in deep_inner)
-    assert set(deep_inner.values()) == {1e-4, "cosine"}
+    # Deeply nested inline module configs whose parent path alone exceeds max_len
+    # are hoisted so EVERY dot-flattened key strictly satisfies len <= max_len.
+    inline_cfg = {
+        "short": "kept",
+        "model_config": {
+            "modules": {
+                "qwen3_text_encoder": {
+                    "accelerator": {
+                        "fsdp_config": {
+                            "mixed_precision": {
+                                "enable": True,
+                                "param_dtype": "bf16",
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    }
+    flat_inline = _flatten(trim(inline_cfg, max_len=64))
+    assert flat_inline["short"] == "kept"
+    assert len(flat_inline) == 3
+    assert set(flat_inline.values()) == {"kept", True, "bf16"}
+    assert all(len(k) <= 64 for k in flat_inline)
 
-    # Distinct long keys sharing a prefix under a long parent must not overwrite each other.
+    # Distinct long keys sharing a prefix AND a later short sibling whose name equals
+    # the first key's deterministic hash candidate must all survive without overwriting.
     parent = "p" * 55
-    colliding = trim({parent: {"learning_rate": 1e-4, "learning_rate_schedule": "cosine", "lr": 1e-3}}, max_len=64)
+    digest = hashlib.sha1(b"learning_rate").hexdigest()[:6]
+    adversarial_sibling = f"l_{digest}"
+    colliding = trim(
+        {
+            parent: {
+                "learning_rate": 1e-4,
+                adversarial_sibling: "preexisting_short_key",
+                "learning_rate_schedule": "cosine",
+                "lr": 1e-3,
+            }
+        },
+        max_len=64,
+    )
+    flat_colliding = _flatten(colliding)
     assert colliding[parent]["lr"] == 1e-3
-    assert len(colliding[parent]) == 3
-    assert set(colliding[parent].values()) == {1e-4, "cosine", 1e-3}
+    assert colliding[parent][adversarial_sibling] == "preexisting_short_key"
+    assert len(flat_colliding) == 4
+    assert set(flat_colliding.values()) == {1e-4, "preexisting_short_key", "cosine", 1e-3}
+    assert all(len(k) <= 64 for k in flat_colliding)
 
 
 def test_tqdm_callback_includes_efficiency_metrics_from_step_env_metrics():

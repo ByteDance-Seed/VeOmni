@@ -83,10 +83,10 @@ def accelerator_needs_distributed_build(accelerator) -> bool:
 def _can_use_extra_parallel_only(accelerator) -> bool:
     """Whether ``_finish_without_fsdp_wrap`` accepts ``accelerator``'s topology and config.
 
-    Dropping the FSDP2 wrap leaves the ``<para>_fsdp`` axis unsharded, so every
-    enabled extra-parallel dimension must already span ``dp_shard_sp``
-    (``para_fsdp_size == 1``), and FSDP2-wrapped features (mixed precision,
-    CPU offload, ``torch.compile``) must be disabled.
+    ``_finish_without_fsdp_wrap`` requires ``ParallelState.extra_parallel_fsdp_size(para) == 1``
+    for every enabled extra-parallel axis (where ``extra_parallel_fsdp_size = fsdp_size // para_size``
+    and ``fsdp_size = world_size // (pp_size * tp_size)``), and FSDP2-wrapped features
+    (mixed precision, CPU offload, ``torch.compile``) must be disabled.
     """
     fsdp_config = getattr(accelerator, "fsdp_config", None)
     if getattr(getattr(fsdp_config, "mixed_precision", None), "enable", False):
@@ -102,12 +102,11 @@ def _can_use_extra_parallel_only(accelerator) -> bool:
     enabled_sizes = [size for size in sizes if size > 1]
     if not enabled_sizes:
         return False
-    dp_shard_sp_size = (
-        getattr(accelerator, "dp_shard_size", 1)
-        * getattr(accelerator, "cp_size", 1)
-        * getattr(accelerator, "ulysses_size", 1)
-    )
-    return all(size == dp_shard_sp_size for size in enabled_sizes)
+    world_size = getattr(accelerator, "world_size", 1)
+    pp_size = getattr(accelerator, "pp_size", 1)
+    tp_size = getattr(accelerator, "tp_size", 1)
+    fsdp_size = world_size // (pp_size * tp_size)
+    return all(fsdp_size % size == 0 and fsdp_size // size == 1 for size in enabled_sizes)
 
 
 @dataclass
@@ -123,20 +122,19 @@ class OmniModuleRuntimeArguments(ModelArguments):
     When ``fsdp_mode == "eager"`` is combined with an active extra-parallel
     dimension (``ep`` / ``emb``), ``__post_init__`` promotes ``fsdp_mode`` to
     ``"fsdp2"`` so the module enters the distributed sharded build rather than
-    silently loading whole on every rank. It additionally enables
-    ``extra_parallel_only`` only when the topology and config satisfy
-    ``_finish_without_fsdp_wrap`` (every enabled extra-parallel axis spans
-    ``dp_shard_sp`` so ``<para>_fsdp_size == 1``, with mixed precision, offload,
-    and ``torch.compile`` disabled); otherwise FSDP2 wraps the remaining shard
-    axis.
+    silently loading whole on every rank. It sets ``extra_parallel_only`` to
+    ``True`` if and only if the topology and config satisfy
+    ``_finish_without_fsdp_wrap`` (every enabled extra-parallel axis has
+    ``extra_parallel_fsdp_size == 1`` with mixed precision, offload, and
+    ``torch.compile`` disabled); otherwise it clears ``extra_parallel_only`` to
+    ``False`` so FSDP2 wraps the remaining shard axis.
     """
 
     def __post_init__(self):
         super().__post_init__()
         if self.accelerator.fsdp_config.fsdp_mode == "eager" and self.needs_distributed_build:
             self.accelerator.fsdp_config.fsdp_mode = "fsdp2"
-            if _can_use_extra_parallel_only(self.accelerator):
-                self.accelerator.fsdp_config.extra_parallel_only = True
+            self.accelerator.fsdp_config.extra_parallel_only = _can_use_extra_parallel_only(self.accelerator)
             self.accelerator._validate_init_device()
 
     @property
