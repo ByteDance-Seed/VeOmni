@@ -6,7 +6,7 @@ Pass `from_float()` a plain `nn.Linear` with a 2-D FP32 master weight. Both inpu
 
 An input with zero tokens keeps its leading dimensions and produces an empty output of width `out_features`. Its contribution to the weight and bias gradients is zero.
 
-Given a dense `model.proj` and an initialized FSDP2 mesh, convert before sharding and create the optimizer last. With MXFP8 all-gather, conversion replaces the weight parameter.
+Given a dense `model.proj` and an initialized FSDP2 mesh, convert before sharding and create the optimizer last. Use `all_gather=True` only for untied weights. It replaces the weight parameter, which breaks ties such as an output projection sharing an embedding weight. Use `all_gather=False` to preserve the original parameter.
 
 ```python
 import torch
@@ -22,6 +22,8 @@ optimizer = torch.optim.AdamW(model.parameters())
 
 - `all_gather=True` quantizes each shard in both orientations before a multi-rank gather. Use BF16 compute parameters and FP32 gradient reduction. The weight must be nonempty, contiguous and evenly sharded along dimension 0, with both the local row count and input width divisible by 32.
 - `all_gather=False` keeps the original parameter and uses the standard FSDP2 gather. The layer quantizes the gathered weight for computation.
+
+Keep synchronous activation offload disabled with `all_gather=True`. Its saved-tensor hook can try to copy the gathered weight to CPU, while FSDP2 owns that weight's payload buffers through backward.
 
 The MXFP8 weight subclass owns the gather hooks for a dense 2-D projection. It exposes the FP32 master for export and reconstructs both compute views after the gather. VeOmni’s [DeepGEMM FP8 AllGather installer](../../veomni/distributed/fsdp2/fp8_all_gather.py#L81) attaches hooks to 3-D expert weights after sharding.
 
