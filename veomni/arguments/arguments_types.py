@@ -1596,6 +1596,7 @@ class OpsImplementationConfig:
         default=None,
         metadata={
             "help": "MoE experts forward. 'fused_triton' (GPU SM70+ or MLU) | "
+            "'fused_triton_fp8' (Blackwell SM10x, merged gate/up, EP1, full MXFP8) | "
             "'fused_quack' (GPU SM90+) | 'deepgemm' (SM90/SM100, dtype='fp8') | 'fused_npu' (NPU) | "
             "'fused_mlu' (MLU Apex grouped-GEMM) | 'qat' (dtype='fp8' or 'fp4') | 'eager'. "
             "Unset: 'fused_triton' on GPU, 'fused_npu' on NPU, 'fused_mlu' on MLU with Apex "
