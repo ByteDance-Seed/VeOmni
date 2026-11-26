@@ -85,30 +85,6 @@ class TrainingMixin(BaseTrainingMixin):
             )
         return result
 
-
-def _stash_talker_prompts(
-    conversation_list: list[list[ConversationItem]],
-    payloads: list[Dict[str, Any]],
-) -> None:
-    """Leave one payload per sample on the carrier, for the talker to find.
-
-    On the sample's first packed row: the payload describes the whole sample, and
-    the carrier has no sample-level slot, so a designated row stands in for one.
-    The talker scans for the key rather than assuming which row, so this choice
-    stays an implementation detail.
-    """
-    for sample, payload in zip(conversation_list, payloads, strict=True):
-        host = next(
-            (item for item in sample if is_thinker_input(item)),
-            None,
-        )
-        if host is None:
-            raise ValueError(
-                "qwen3omni_text_encoder: a sample has no row in the thinker's sequence, so there is nowhere to "
-                "leave the talker's prompt view."
-            )
-        host.meta[TALKER_PROMPT] = payload
-
     def _prepare_decode_inputs(
         self,
         conversation_list: Optional[list[ConversationItem]],
@@ -175,6 +151,30 @@ def _stash_talker_prompts(
             shift_labels = shift_labels[shard_start : shard_start + rows].contiguous()
         shift_labels = shift_labels.to(device=hidden_states.device, non_blocking=True)
         return hidden_states, shift_labels
+
+
+def _stash_talker_prompts(
+    conversation_list: list[list[ConversationItem]],
+    payloads: list[Dict[str, Any]],
+) -> None:
+    """Leave one payload per sample on the carrier, for the talker to find.
+
+    On the sample's first packed row: the payload describes the whole sample, and
+    the carrier has no sample-level slot, so a designated row stands in for one.
+    The talker scans for the key rather than assuming which row, so this choice
+    stays an implementation detail.
+    """
+    for sample, payload in zip(conversation_list, payloads, strict=True):
+        host = next(
+            (item for item in sample if is_thinker_input(item)),
+            None,
+        )
+        if host is None:
+            raise ValueError(
+                "qwen3omni_text_encoder: a sample has no row in the thinker's sequence, so there is nowhere to "
+                "leave the talker's prompt view."
+            )
+        host.meta[TALKER_PROMPT] = payload
 
 
 class VeOmniMixin(TrainingMixin, BaseVeOmniMixin):

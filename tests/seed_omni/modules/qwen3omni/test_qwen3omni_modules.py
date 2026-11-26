@@ -34,6 +34,9 @@ from veomni.models.seed_omni.modules.qwen3omni.audio.processing import (
     _OMNI_MEL_LEN,
     Qwen3OmniAudioPreprocessor,
 )
+from veomni.models.seed_omni.modules.qwen3omni.text_encoder.accelerated.accelerated import (
+    Qwen3OmniTextEncoderAccelerated,
+)
 from veomni.models.seed_omni.modules.qwen3omni.text_encoder.configuration import Qwen3OmniTextEncoderConfig
 from veomni.models.seed_omni.modules.qwen3omni.text_encoder.modeling import Qwen3OmniTextEncoder
 from veomni.models.seed_omni.modules.qwen3omni.text_encoder.processing import Qwen3OmniTextEncoderPreprocessor
@@ -693,3 +696,55 @@ def _accelerated_tower():
         }
     )
     return Qwen3OmniVisionEncoderAccelerated(config).eval()
+
+
+def test_the_decode_walk_skips_the_assistant_speech_target():
+    """The one override that makes the joint graph work.
+
+    The base decode walk skips only dummy rows. This carrier also holds the
+    assistant's speech, which never entered the thinker's forward and still holds a
+    raw waveform — concatenating it with the thinker's hidden states fails. The
+    override must therefore be *this* class's method, not the inherited one: a
+    nested or misplaced definition silently keeps the base behaviour and the joint
+    graph breaks only when a real audio target reaches it.
+    """
+    from veomni.models.seed_omni.modules.qwen3omni.text_encoder.accelerated.accelerated import (
+        TrainingMixin as Qwen3OmniTrainingMixin,
+    )
+    from veomni.models.seed_omni.modules.text_encoder.accelerated.accelerated import (
+        TrainingMixin as BaseTrainingMixin,
+    )
+
+    assert "_prepare_decode_inputs" in Qwen3OmniTrainingMixin.__dict__, (
+        "the override must be a member of this mixin; nested inside a function it overrides nothing"
+    )
+    assert Qwen3OmniTrainingMixin._prepare_decode_inputs is not BaseTrainingMixin._prepare_decode_inputs, (
+        "the override must differ from the base walk"
+    )
+
+    # And it must actually drop the waveform row: two text rows with a spoken
+    # assistant turn between them walk as two text segments, not three.
+    module = Qwen3OmniTextEncoderAccelerated(
+        Qwen3OmniTextEncoderConfig(vocab_size=64, hidden_size=8, tie_word_embeddings=False)
+    )
+    import torch as _torch
+
+    sample = [
+        ConversationItem(
+            type="text",
+            value=_torch.zeros(2, 8),
+            role="user",
+            meta={"labels": _torch.zeros(2, dtype=_torch.long)},
+        ),
+        ConversationItem(type="audio", value=_torch.zeros(2400), role="assistant"),
+        ConversationItem(
+            type="text",
+            value=_torch.zeros(3, 8),
+            role="assistant",
+            meta={"labels": _torch.zeros(3, dtype=_torch.long)},
+        ),
+    ]
+    hidden, shift_labels = module._prepare_decode_inputs([sample])
+
+    assert hidden.shape[0] == 5, f"expected the two text rows only, got {tuple(hidden.shape)}"
+    assert shift_labels.shape[0] == 5
