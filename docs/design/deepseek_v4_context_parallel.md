@@ -197,20 +197,29 @@ differ in world size: `cp_size=1` ran `world 4 / dp 4 / ep 4` and `cp_size=2` ra
 together.
 
 The early steps agree closely: step 1 loss differs by at most 0.002% across all
-five runs, and every step in 1–40 stays within 0.11%. From about step 44 the run
-enters a gradient-spike and loss-plateau regime, and single steps diverge: over
-steps 1–99 the per-step relative difference is p50 0.13–0.20%, p90 1.6–2.2% and
-max 3.7% across the three `cp_size` comparisons, with 10-step means alternating in sign
-around +0.2% rather than drifting. Repeating the same `cp_size=2` configuration
-gives the noise floor for that regime: p50 0.15%, p90 1.1%, max 2.0%. Swapping
-which DSA selection runs `cann` at a fixed topology — both implementations are
-separately validated, so this isolates numerics rather than correctness — moves
-the loss by sd 0.6–0.9%, the same scale. The `cp_size=2` spread is therefore
-run-to-run reproducibility amplified through the spike region rather than a
-systematic bias: it is absent in the early steps and shows no accumulating offset.
-None of this is a per-tensor bound. `cp_size=8` has never been run, and an `lr=0`
-comparison and a `cp_size=1` run at `world 8 / ep 8` are still outstanding
-controls.
+five runs, and every step in 1–40 stays within 0.11% — 0.11% in the indexer
+family, 0.05% in the attention family. Both families enter a gradient-spike and
+loss-plateau regime at steps 44–51, the first step whose loss moves by more than
+0.5% being 44 and 45 in the two indexer runs and 49 in the attention run, and from
+there single steps diverge. Over steps 1–99:
+
+| comparison | p50 | p90 | max |
+|----|----|----|----|
+| indexer, `cp_size=2` run A vs `cp_size=1` | 0.19% | 2.2% | 3.7% |
+| indexer, `cp_size=2` run B vs `cp_size=1` | 0.20% | 1.8% | 2.9% |
+| attention, `cp_size=2` vs `cp_size=1` | 0.13% | 1.6% | 2.6% |
+| noise floor: indexer run B vs run A | 0.15% | 1.1% | 2.0% |
+
+The 10-step means alternate in sign around +0.2% rather than drifting. Repeating
+the same `cp_size=2` configuration already reaches 2.0% on a single step, and
+swapping which DSA selection runs `cann` at a fixed topology — both
+implementations are separately validated, so this isolates numerics rather than
+correctness — moves the loss by sd 0.6–0.9%, the same scale. The `cp_size=2`
+spread is therefore run-to-run reproducibility amplified through the spike region
+rather than a systematic bias: it is absent in the early steps and shows no
+accumulating offset. None of this is a per-tensor bound. `cp_size=8` has never
+been run, and an `lr=0` comparison and a `cp_size=1` run at `world 8 / ep 8` are
+still outstanding controls.
 
 `tests/parallel/context_parallel/` runs its two-rank eager case on the NPU
 suite, so the eager path's rank and local-query/global-KV geometry is checked on
