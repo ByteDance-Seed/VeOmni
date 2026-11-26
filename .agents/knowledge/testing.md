@@ -105,6 +105,10 @@ the test. CPU-only launcher regressions must also isolate their subprocess
 environment before importing torch, so ordinary pytest on a GPU/NPU host does
 not choose an accelerator backend for CPU tensors. Architecture-specific
 kernel tests must check hardware eligibility before importing optional kernels.
+CPU-only spawned workers that use checkpoint recomputation must also set
+`torch.utils.checkpoint.DefaultDeviceType` to `"cpu"` inside the child. The
+parent CI plugin's setting does not propagate through `spawn`; an Ascend host's
+default can otherwise initialize hidden NPU devices while querying AMP support.
 
 Distributed rendezvous must own its listener through worker startup. Use
 `tests.tools.launch_utils.spawn_with_rendezvous` for raw spawn workers (the
@@ -193,8 +197,7 @@ by a `pytest.param` table, so a new case is a few lines:
 | Ulysses SP behaviour | `tests/parallel/ulysses/test_ulysses.py` and siblings |
 | Checkpoint callback / DCP round-trip | `tests/checkpoints/test_checkpoint_callback.py`, `test_trainer_saveload.py`, `test_dcp_checkpointer.py` |
 | DiT resume / noise-stream equivalence | `tests/checkpoints/test_dit_resume_align.py` |
-| Weight loading / broadcast / EP shard | `tests/utils/test_rank0_load_and_broadcast_weights.py`, `test_moe_ep_sharded_load_matrix.py` |
-| Grad clipping with ExtraParallel | `tests/utils/test_extra_parallel_clip_grad_norm.py` |
+| Weight loading / broadcast / ExtraParallel stream load & grad clipping | `tests/utils/test_rank0_load_and_broadcast_weights.py`, `tests/utils/test_extra_parallel.py` |
 | FLOPs / MFU accounting | `tests/utils/test_count_flops.py` |
 | Optimizer / Muon / swap | `tests/optim/test_muon_*.py`, `test_optimizer_vlm_param_groups.py`, `test_swap_adamw*.py` (CPU parity; the `_device` file runs on one real card; both swap files are enumerated per file in the suite manifests) |
 | LoRA / MoE-LoRA | the enumerated `tests/lora/test_*.py` set |

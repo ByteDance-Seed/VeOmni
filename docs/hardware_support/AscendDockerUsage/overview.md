@@ -29,10 +29,10 @@ All image tags follow this pattern:
 
 | Field | Example Values | Description |
 |---|---|---|
-| `veomni-version` | `v0.1.11` | VeOmni release tag |
-| `cann` | `9.1.0` | CANN version |
-| `torch_npu` | `2.10.0.post2` | torch-npu version |
-| `chip-series` | `910b`, `a3` | Target Ascend chip series |
+| `veomni-version` | `v0.1.12` | VeOmni release tag |
+| `cann` | `9.2.1` | CANN version |
+| `torch_npu` | `2.10.0.post7` | torch-npu version |
+| `chip-series` | `910b`, `a3`, `a5` | Target Ascend chip series |
 | `os` | `ubuntu22.04` | Base operating system |
 | `python` | `py3.12` | Python version |
 | `veomni` | `-veomni` | Marks the image as built by VeOmni |
@@ -43,11 +43,11 @@ All image tags follow this pattern:
 
 | Chip Series | Architecture | Tag Example | Dockerfile |
 |---|---|---|---|
-| Atlas A2 training products | amd64 + arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni` | [x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.x86) / [arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_910b.arm) |
-| Atlas A3 training products | arm64 | `v0.1.11-cann9.1.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.12-veomni` | [Atlas A3 training products](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.1.0_torch_npu2.10.0.post2_a3) |
+| Atlas A2 training products | amd64 + arm64 | `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-910b-ubuntu22.04-py3.12-veomni` | [x86](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.x86) / [arm](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_910b.arm) |
+| Atlas A3 training products | arm64 | `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-a3-ubuntu22.04-py3.12-veomni` | [Atlas A3 training products](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_a3) |
 | Ascend 950PR&950DT products | arm64 | `v0.1.12-cann9.2.1-torch_npu2.10.0.post7-a5-ubuntu22.04-py3.12-veomni` | [Ascend 950PR&950DT products](https://github.com/ByteDance-Seed/VeOmni/blob/main/docker/ascend/Dockerfile.ascend_9.2.1_torch_npu2.10.0.post7_a5) |
 
-For the complete list of published image tags, see [Ascend Docker Supported Tags](supported_tags.md).
+For the complete list of published image tags, see [Ascend Docker Supported Tags](https://github.com/ByteDance-Seed/VeOmni/blob/main/docs/hardware_support/AscendDockerUsage/supported_tags.md).
 
 Notes:
 
@@ -70,19 +70,24 @@ Pull the image from quay.io and run it:
 
 ```bash
 # Atlas A2 training products, multi-arch
-docker pull quay.io/ascend/veomni:v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni
+docker pull quay.io/ascend/veomni:v0.1.12-cann9.2.1-torch_npu2.10.0.post7-910b-ubuntu22.04-py3.12-veomni
 
 # Atlas A3 training products
-docker pull quay.io/ascend/veomni:v0.1.11-cann9.1.0-torch_npu2.10.0.post2-a3-ubuntu22.04-py3.12-veomni
+docker pull quay.io/ascend/veomni:v0.1.12-cann9.2.1-torch_npu2.10.0.post7-a3-ubuntu22.04-py3.12-veomni
+
+# Ascend 950PR&950DT products (A5)
+docker pull quay.io/ascend/veomni:v0.1.12-cann9.2.1-torch_npu2.10.0.post7-a5-ubuntu22.04-py3.12-veomni
 ```
 
-To run the container, mount the Ascend device files and the host driver directories:
+The following command starts the A2 image with one NPU device. For A3, replace the image tag with the A3 tag you pulled above. For A5, use the launch command in the [A5 build guide](https://github.com/ByteDance-Seed/VeOmni/blob/main/docs/hardware_support/AscendDockerUsage/build_a5_docker.md), keeping its device mappings and replacing `ascend-a5-env:v1` with the full image reference from the A5 `docker pull` command above.
+
+To expose more NPUs, add a separate device argument for each one, for example `--device=/dev/davinci1` for a second device.
 
 ```bash
 docker run --runtime=runc -it \
   --ulimit nproc=65535 \
   --ulimit nofile=65535 \
-  --device=/dev/davinci* \
+  --device=/dev/davinci0 \
   --device=/dev/davinci_manager \
   --device=/dev/devmm_svm \
   --device=/dev/hisi_hdc \
@@ -90,15 +95,15 @@ docker run --runtime=runc -it \
   -v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64:ro \
   -v /usr/local/Ascend/driver/tools:/usr/local/Ascend/driver/tools:ro \
   -v /usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons:ro \
-  quay.io/ascend/veomni:v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni \
+  quay.io/ascend/veomni:v0.1.12-cann9.2.1-torch_npu2.10.0.post7-910b-ubuntu22.04-py3.12-veomni \
   /bin/bash
 ```
 
 For complete, advanced mount and training configuration (checkpoint / dataset mounts, training command examples) per platform, see:
 
-- [build_a2_docker.md](build_a2_docker.md) — Atlas A2 training products build and usage
-- [build_a3_docker.md](build_a3_docker.md) — Atlas A3 training products build and usage
-- [build_a5_docker.md](build_a5_docker.md) — Ascend 950PR&950DT products build and usage
+- [build_a2_docker.md](https://github.com/ByteDance-Seed/VeOmni/blob/main/docs/hardware_support/AscendDockerUsage/build_a2_docker.md) — Atlas A2 training products build and usage
+- [build_a3_docker.md](https://github.com/ByteDance-Seed/VeOmni/blob/main/docs/hardware_support/AscendDockerUsage/build_a3_docker.md) — Atlas A3 training products build and usage
+- [build_a5_docker.md](https://github.com/ByteDance-Seed/VeOmni/blob/main/docs/hardware_support/AscendDockerUsage/build_a5_docker.md) — Ascend 950PR&950DT products build and usage
 
 ---
 
@@ -106,9 +111,9 @@ For complete, advanced mount and training configuration (checkpoint / dataset mo
 
 Starting from a CANN base image, build locally with the in-repo Dockerfiles. For build commands, proxy configuration, and per-platform details, see:
 
-- [build_a2_docker.md](build_a2_docker.md) (x86 uses uv, arm uses pip — two environments)
-- [build_a3_docker.md](build_a3_docker.md)
-- [build_a5_docker.md](build_a5_docker.md)
+- [build_a2_docker.md](https://github.com/ByteDance-Seed/VeOmni/blob/main/docs/hardware_support/AscendDockerUsage/build_a2_docker.md) (x86 uses uv, arm uses pip — two environments)
+- [build_a3_docker.md](https://github.com/ByteDance-Seed/VeOmni/blob/main/docs/hardware_support/AscendDockerUsage/build_a3_docker.md)
+- [build_a5_docker.md](https://github.com/ByteDance-Seed/VeOmni/blob/main/docs/hardware_support/AscendDockerUsage/build_a5_docker.md)
 
 ---
 
@@ -117,7 +122,7 @@ Starting from a CANN base image, build locally with the in-repo Dockerfiles. For
 Use the VeOmni image as the base image and add your own software:
 
 ```dockerfile
-FROM quay.io/ascend/veomni:v0.1.11-cann9.1.0-torch_npu2.10.0.post2-910b-ubuntu22.04-py3.12-veomni
+FROM quay.io/ascend/veomni:v0.1.12-cann9.2.1-torch_npu2.10.0.post7-910b-ubuntu22.04-py3.12-veomni
 
 RUN apt update -y && \
     apt install gcc ...

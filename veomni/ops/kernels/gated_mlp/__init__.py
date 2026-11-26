@@ -24,19 +24,24 @@ can read the projection weights or has to run the projection modules. See
 ``._module`` for that decision and why it belongs to the row.
 """
 
-from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, MluKernelRequirement
+from ...platform import NVIDIA_SM90_PLUS, GpuKernelRequirement, MluKernelRequirement, NvidiaGpuPlatform
 from ...registry import register_op
 from .geglu import eager as geglu_eager
 from .geglu import liger_kernel as geglu_liger
+from .standard import deepgemm as standard_deepgemm
 from .standard import eager as standard_eager
 from .standard import liger_kernel as standard_liger
 from .standard import qat as standard_qat
-from .standard import torchao_nvfp4 as standard_torchao_nvfp4
+from .standard import torchao as standard_torchao
 
 
 _GPU = GpuKernelRequirement()
 _MLU = MluKernelRequirement()
 _NVIDIA_SM90_PLUS = GpuKernelRequirement(platforms=(NVIDIA_SM90_PLUS,))
+#: DeepGEMM ships Hopper and Blackwell kernels only; see the ``linear`` family.
+_NVIDIA_SM90_OR_SM100 = GpuKernelRequirement(
+    platforms=(NvidiaGpuPlatform(min_cc=90, max_cc=90), NvidiaGpuPlatform(min_cc=100, max_cc=100)),
+)
 
 register_op(
     "gated_mlp",
@@ -72,7 +77,7 @@ register_op(
     "gated_mlp",
     "standard",
     "qat",
-    description="TileLang blockwise FP8 fake-quantized SwiGLU MLP with optional activation clamping",
+    description="TileLang blockwise FP8 fake-quantized gated MLP with optional activation clamping",
     wrapper=standard_qat.wrapper,
     requirement=_NVIDIA_SM90_PLUS,
     requires=("tilelang",),
@@ -81,10 +86,20 @@ register_op(
 register_op(
     "gated_mlp",
     "standard",
-    "torchao_nvfp4",
-    description="TorchAO NVFP4 fake-quantized SwiGLU MLP with optional activation clamping",
-    wrapper=standard_torchao_nvfp4.wrapper,
+    "torchao",
+    description="TorchAO low-precision (FP8 / NVFP4 / MXFP4) gated MLP with optional activation clamping",
+    wrapper=standard_torchao.wrapper,
     requires=("torchao",),
+)
+
+register_op(
+    "gated_mlp",
+    "standard",
+    "deepgemm",
+    description="DeepGEMM blockwise FP8 gated MLP forward, input gradients and weight gradients",
+    wrapper=standard_deepgemm.wrapper,
+    requirement=_NVIDIA_SM90_OR_SM100,
+    requires=("deep_gemm", "triton"),
 )
 
 
