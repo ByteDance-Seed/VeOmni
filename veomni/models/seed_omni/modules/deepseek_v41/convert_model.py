@@ -455,10 +455,26 @@ def convert_llm(source: TensorSource, output_dir: str, config, engram_layer_ids:
     writer = ShardWriter(os.path.join(output_dir, "deepseek_v41_llm"))
     emitter = Emitter(source, writer)
 
+    kv_sources = set(config.kv_source_layer_ids)
+    index_sources = set(config.index_source_layer_ids)
     for layer in range(config.num_hidden_layers):
         for released, target in llm_layer_names(layer).items():
             if released not in source:
-                continue
+                is_optional_compressor = ".attn.compressor." in released and layer not in kv_sources
+                is_optional_indexer_kv = released.endswith(
+                    (".attn.indexer.wk.weight", ".attn.indexer.k_norm.weight")
+                ) and (layer not in kv_sources or layer not in index_sources)
+                is_optional_indexer_q = (
+                    released.endswith((".attn.indexer.wq_b.weight", ".attn.indexer.weights_proj.weight"))
+                    and layer not in index_sources
+                )
+                is_optional_bias_vl = released.endswith(".ffn.gate.bias_vl") and not config.enable_vision_routing_bias
+                if is_optional_compressor or is_optional_indexer_kv or is_optional_indexer_q or is_optional_bias_vl:
+                    continue
+                raise KeyError(
+                    f"Required LLM weight {released!r} is missing from the release checkpoint "
+                    f"(layer={layer}, target={target!r})."
+                )
             emitter.emit(target, released)
 
         _convert_layer_experts(emitter, layer, config.n_routed_experts)

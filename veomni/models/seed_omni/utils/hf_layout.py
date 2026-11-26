@@ -451,7 +451,7 @@ class HFSource:
 
     @classmethod
     def from_path(cls, path: str, model_type: str) -> HFSource:
-        layout = get_hf_layout(model_type)
+        layout = get_hf_layout(model_type, os.path.realpath(path))
         return cls(path=os.path.realpath(layout.resolve_source_path(path)), model_type=model_type)
 
     @property

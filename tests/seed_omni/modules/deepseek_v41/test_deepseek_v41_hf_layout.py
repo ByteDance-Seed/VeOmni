@@ -607,7 +607,22 @@ def _stream_ngram_as_rank(path: str, monkeypatch, rank: int) -> tuple[dict[str, 
         module_utils, "_ep_dim0_slice_meta", lambda _state, _group, target0: (EP_SIZE, rank, target0 * EP_SIZE)
     )
     read = []
+    sliced: dict[str, list[slice]] = {}
     real_safe_open = module_utils.safe_open
+
+    class _SliceProxy:
+        def __init__(self, key: str, inner):
+            self._key = key
+            self._inner = inner
+
+        def __getitem__(self, item):
+            row_sel = item[0] if isinstance(item, tuple) else item
+            if isinstance(row_sel, slice):
+                sliced.setdefault(self._key, []).append(row_sel)
+            return self._inner[item]
+
+        def __getattr__(self, attr):
+            return getattr(self._inner, attr)
 
     class _Recording:
         def __init__(self, *args, **kwargs):
@@ -621,6 +636,9 @@ def _stream_ngram_as_rank(path: str, monkeypatch, rank: int) -> tuple[dict[str, 
                     read.append(key)
                     return handle.get_tensor(key)
 
+                def get_slice(self, key):
+                    return _SliceProxy(key, handle.get_slice(key))
+
                 def __getattr__(self, attr):
                     return getattr(handle, attr)
 
@@ -632,7 +650,7 @@ def _stream_ngram_as_rank(path: str, monkeypatch, rank: int) -> tuple[dict[str, 
     monkeypatch.setattr(module_utils, "safe_open", _Recording)
     load_model_weights_ep_sharded(model, path, "cpu")
     monkeypatch.setattr(module_utils, "safe_open", real_safe_open)
-    return {name: tensor.detach() for name, tensor in model.state_dict().items()}, read
+    return {name: tensor.detach() for name, tensor in model.state_dict().items()}, read, sliced
 
 
 class TestNgramStreamLoad:
@@ -662,13 +680,17 @@ class TestNgramStreamLoad:
         assert torch.equal(whole["token_map"], token_map)
         for key, value in whole.items():
             if key.startswith("tables."):
-                streamed = torch.cat([state[key] for state, _ in ranks])
+                streamed = torch.cat([state[key] for state, _, _ in ranks])
             else:
                 streamed = ranks[1][0][key]
             assert streamed.dtype == value.dtype, key
             assert torch.equal(streamed.view(torch.uint8), value.view(torch.uint8)), key
-        for _, read in ranks:
+        for rank_idx, (_, read, sliced) in enumerate(ranks):
             assert not set(read) & set(tables), read
+            for table_key, tensor in tables.items():
+                local_rows = tensor.shape[0] // EP_SIZE
+                expected = slice(rank_idx * local_rows, (rank_idx + 1) * local_rows)
+                assert sliced.get(table_key) == [expected], (rank_idx, table_key, sliced.get(table_key))
 
 
 def _dequant_release(tensors: dict[str, torch.Tensor], key: str) -> torch.Tensor:
@@ -765,7 +787,7 @@ def test_deepgemm_streams_and_dequantizes_quantized_release(tmp_path, monkeypatc
     monkeypatch.setattr(
         quant_mod,
         "VeomniOp",
-        lambda _domain, _variant, impl, **_kw: Mock(impl=impl or "deepgemm"),
+        lambda _domain, _variant, impl, **_kw: Mock(impl=impl),
     )
 
     layout = build_deepseek_v41_hf_layout(path)
@@ -776,6 +798,7 @@ def test_deepgemm_streams_and_dequantizes_quantized_release(tmp_path, monkeypatc
         config._set_ops_implementation({"moe_implementation": "deepgemm"})
         with init_empty_weights():
             model = DeepseekV41Llm._from_config(config, dtype=torch.bfloat16)
+        assert model.model.layers[0].mlp.experts.veomni_moe.impl == "deepgemm"
         assert not model.model.layers[0].mlp.experts.experts_are_quantized
         for name, param in list(model.named_parameters()):
             if _EXPERT_PARAM.search(name):
@@ -835,3 +858,48 @@ def test_dequant_converter_export_weights_keeps_unquantized_3d_experts_bf16():
     assert exported["model.layers.0.mlp.experts.down_proj"].dtype == torch.bfloat16
     assert exported["model.layers.0.input_layernorm.weight"].dtype == torch.bfloat16
     assert exported["model.layers.0.mlp.gate.e_score_correction_bias"].dtype == torch.float32
+
+
+def test_resolve_omni_checkpoint_root_passes_path_to_deepseek_v41_layout(tmp_path, monkeypatch):
+    """Public ``resolve_omni_checkpoint_root`` must work on a DeepSeek-V4.1 release via ``model.model_path``."""
+    from transformers import AutoTokenizer
+
+    from veomni.models.seed_omni.utils.hf_layout import resolve_omni_checkpoint_root
+
+    class _DummyTokenizer:
+        def save_pretrained(self, out_dir: str) -> None:
+            os.makedirs(out_dir, exist_ok=True)
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", staticmethod(lambda *_a, **_kw: _DummyTokenizer()))
+    path = str(tmp_path / "release_root")
+    _release(path, quantized=False)
+    assert HFSource.from_path(path, "deepseek_v41").path == os.path.realpath(path)
+    resolved = resolve_omni_checkpoint_root(path)
+    assert os.path.isfile(os.path.join(resolved, "config.json"))
+    assert os.path.isfile(os.path.join(resolved, LLM, "config.json"))
+    with open(os.path.join(resolved, "config.json")) as f:
+        cfg = json.load(f)
+    assert cfg["model_type"] == "omni"
+
+
+def test_convert_llm_rejects_missing_required_weight(tmp_path):
+    """Missing required LLM weights (e.g. ``layers.0.attn_norm.weight``) fail conversion instead of being skipped."""
+    from veomni.models.seed_omni.modules.deepseek_v41.convert_model import (
+        TensorSource,
+        _build_configs,
+        convert_llm,
+    )
+
+    path = str(tmp_path / "release_missing")
+    _release(path, quantized=False)
+    index_path = os.path.join(path, "model.safetensors.index.json")
+    with open(index_path) as f:
+        index = json.load(f)
+    index["weight_map"].pop("layers.0.attn_norm.weight")
+    with open(index_path, "w") as f:
+        json.dump(index, f)
+    with open(os.path.join(path, "config.json")) as f:
+        hf_cfg = json.load(f)
+    _, _, _, llm_cfg, _ = _build_configs(hf_cfg)
+    with pytest.raises(KeyError, match=r"layers\.0\.attn_norm\.weight"):
+        convert_llm(TensorSource(path), str(tmp_path / "out"), llm_cfg, list(llm_cfg.engram_layer_ids))
