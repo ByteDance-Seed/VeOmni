@@ -65,7 +65,7 @@ def _require_mxfp8_runtime(native_device: torch.device | None) -> None:
 
 
 def _quantize(tensor: torch.Tensor, emulate: bool) -> MXTensor:
-    """Quantize each MXFP8 block to E4M3 using torchao's RCEIL scaling."""
+    """Use RCEIL so the E4M3 block scale accommodates the largest magnitude, including in gradients."""
     from torchao.prototype.mx_formats.config import ScaleCalculationMode
     from torchao.prototype.mx_formats.mx_tensor import MXTensor
     from torchao.quantization.quantize_.common import KernelPreference
@@ -415,4 +415,5 @@ class MXFP8Linear(nn.Linear):
         return output
 
 
+# torch.load(weights_only=True) needs these types to reconstruct serialized tensor subclasses.
 torch.serialization.add_safe_globals([MXFP8Weight, MXFP8GatheredWeight])

@@ -2,7 +2,9 @@
 
 Install the `float8` extra (`uv sync --extra gpu --extra float8 --dev`) for the pinned `torchao==0.18.0`. Native MXFP8 execution requires an NVIDIA GPU with compute capability 10.0 or newer (SM100+).
 
-Pass `from_float()` a dense `nn.Linear` with a 2-D FP32 master weight. Both input and output widths must be positive multiples of 32. Register module hooks on the converted projection. Conversion creates a new module and rejects projections with existing hooks.
+Pass `from_float()` a plain `nn.Linear` with a 2-D FP32 master weight. Both input and output widths must be positive multiples of 32. Conversion rejects subclasses and wrapped projections because replacing them can discard their forward logic. It also rejects modules with existing hooks. Register hooks after conversion.
+
+An input with zero tokens keeps its leading dimensions and produces an empty output of width `out_features`. Its contribution to the weight and bias gradients is zero.
 
 Given a dense `model.proj` and an initialized FSDP2 mesh, convert before sharding and create the optimizer last. With MXFP8 all-gather, conversion replaces the weight parameter.
 

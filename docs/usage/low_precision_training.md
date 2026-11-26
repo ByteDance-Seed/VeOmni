@@ -39,10 +39,10 @@ uv sync --locked --extra gpu --extra float8 --dev
 source .venv/bin/activate      # train.sh resolves torchrun from PATH
 ```
 
-Selecting `torchao` without `torchao` installed raises an explicit error at
-model construction; running `dtype: fp8` with a mismatched version raises
-`ImportError: float8 training requires torchao==0.18.0, ...` because torchao's
-float8 training internals are not stable across minor versions.
+Selecting the `torchao` backend without the extra raises an error at model
+construction. With `dtype: fp8`, a version mismatch raises an `ImportError`
+that reports the required and installed versions. VeOmni pins the version
+because torchao's training APIs can change between minor releases.
 
 > **PEFT interop note**: `peft==0.18.1` (from the `gpu` extra) imports
 > `LinearActivationQuantizedTensor` from torchao when torchao is installed,
