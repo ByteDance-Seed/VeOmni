@@ -1,0 +1,150 @@
+# Pure-text 40-layer LLM 256k long-context training on 128 x H20 (16 nodes)
+# with Context Parallelism (`cp_size: 16`, 16k local tokens/GPU) and full-stack
+# DeepGEMM FP8 + TileLang (`moe_implementation: deepgemm`,
+# `linear_implementation: deepgemm`, `gated_mlp_implementation: deepgemm`,
+# `kv_round_implementation: triton`, `mhc_implementation: tilelang`,
+# `dsa_indexer_implementation: tilelang`).
+#
+# - `deepseek_v41_vision` stays in the composed model/graph for checkpoint layout
+#   compatibility, with `enable_vision: false`, `freeze: true`, `freeze_aligner: true`,
+#   and `ulysses_size: 16, cp_size: 1` to match `dp_size = 128 // 16 = 8`.
+# - `deepseek_v41_text_encoder` and `deepseek_v41_ngram` (196.6 B) stay frozen with
+#   `extra_parallel_only: true` over all 128 ranks (`dp_shard x cp_size = 128`).
+# - `deepseek_v41_llm` (550.6 B) trains all 40 backbone layers with `cp_size: 16`
+#   (`local_len = 262144 / 16 = 16384` tokens/GPU) and `ep_size: 32`
+#   (`ep_fsdp_size = 4`, 12 unsharded experts/rank in forward, 3 persistent
+#   experts/rank for zero-comm Muon orthogonalization).
+
+deepseek_v41_vision:
+  model_path: deepseek_v41_vision
+  model_config:
+    enable_vision: false
+    freeze: true
+    freeze_aligner: true
+  ops_implementation:
+    attn_implementation: flash_attention_2
+  accelerator:
+    ulysses_size: 16
+    cp_size: 1
+    gradient_checkpointing:
+      enable: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      reshard_after_forward: false
+      mixed_precision:
+        enable: false
+
+deepseek_v41_text_encoder:
+  model_path: deepseek_v41_text_encoder
+  model_config:
+    freeze: true
+    dspark_block_size: 0
+  ops_implementation:
+    cross_entropy_loss_implementation: liger_kernel
+  accelerator:
+    cp_size: 16
+    ulysses_size: 1
+    skip_sp_gather_between_modules: true
+    extra_parallel_sizes: [128]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      reshard_after_forward: false
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_ngram:
+  model_path: deepseek_v41_ngram
+  model_config:
+    freeze: true
+  broadcast_model_weights_from_rank0: false
+  extra_parallel_stream_load: true
+  accelerator:
+    cp_size: 16
+    ulysses_size: 1
+    extra_parallel_sizes: [128]
+    extra_parallel_names: ["emb"]
+    extra_parallel_placement_innermost: [false]
+    fsdp_config:
+      fsdp_mode: fsdp2
+      extra_parallel_only: true
+      reshard_after_forward: false
+      mixed_precision:
+        enable: false
+    gradient_checkpointing:
+      enable: false
+
+deepseek_v41_llm:
+  model_path: deepseek_v41_llm
+  broadcast_model_weights_from_rank0: false
+  extra_parallel_stream_load: true
+  model_config:
+    weight_quantization: null
+    compress_kv_dtype: fp4
+    dsa_indexer_loss: true
+    dspark_block_size: 0
+    enable_vision_routing_bias: false
+  ops_implementation:
+    moe_implementation: deepgemm
+    linear_implementation: deepgemm
+    gated_mlp_implementation: deepgemm
+    kv_round_implementation: triton
+    mhc_implementation: tilelang
+    dsa_indexer_implementation: tilelang
+  optimizer:
+    type: muon
+    lr: 4.0e-5
+    lr_start: 4.0e-7
+    lr_min: 4.0e-6
+    lr_warmup_ratio: 0.10
+    lr_decay_style: cosine
+    lr_decay_ratio: 1.0
+    weight_decay: 0.1
+    # FP32 master weights for the routed experts cost +23.7 GiB a rank over the
+    # BF16 layout: the 3-D expert stack goes from four BF16 copies to three FP32
+    # ones, and `reduce_dtype: float32` widens the reduce-scatter buffer. The
+    # measured peaks are 68.1-71.0 GB with BF16 experts against ~95 GB of card,
+    # so the FP32 run has no headroom left and dies in `step_end` on a 13 MB NCCL
+    # allocation. Muon's momentum is 15.8 GiB of that per rank and no other tensor
+    # reads it, so keep it in host memory and stream one parameter at a time.
+    # Note: Muon CPU state offload (`state_offload: cpu`) is tracked in a
+    # follow-up optimizer PR; uncomment once `type: muon` supports `state_offload: cpu`.
+    # state_offload: cpu
+    muon_lr: 4.0e-5
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_weight_decay: 0.1
+    muon_expert_zero_comm: true
+    muon_ns_implementation: std
+    # Official DeepSeek-V4.1 §2.5: split Query weights by head before the Muon
+    # update. Vanilla Muon applies one preconditioner to every head, while
+    # head-wise Muon gives each head its own; the report observes it wins.
+    # `match_rms_adamw` also scales by 0.2 * sqrt(rows), so the whole [32768, 1280]
+    # stack would take a 5.06x larger step than one head's [512, 1280] block.
+    muon_head_group_size: 1
+    muon_head_split_modules:
+      - self_attn.wq_b
+      - indexer.wq_b
+  accelerator:
+    cp_size: 16
+    ulysses_size: 1
+    skip_sp_gather_between_modules: true
+    ep_size: 32
+    ep_outside: false
+    gradient_checkpointing:
+      enable: true
+      enable_reentrant: false
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        # FP32 gradient reduction. BF16 reduction halves the ReduceScatter wire
+        # size but rounds every gradient on the way out; the throughput it buys
+        # is not worth the precision.
+        reduce_dtype: float32
+        cast_forward_inputs: false

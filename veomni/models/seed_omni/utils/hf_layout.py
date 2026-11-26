@@ -391,7 +391,7 @@ class OmniHFLayout:
             return {}, {}
 
     def source_weight_files(self, source_path: str) -> dict[str, str]:
-        """``{weight key: shard filename}`` of a safetensors HF checkpoint."""
+        """``{weight key: shard filename}`` of the source checkpoint."""
         return read_source_weight_files(source_path)
 
     def validate_module_state(self, source_path: str, name: str, model: torch.nn.Module) -> None:
@@ -1205,5 +1205,6 @@ __all__ = [
     "read_hf_source",
     "resolve_omni_checkpoint_root",
     "save_hf_source_checkpoint",
+    "read_source_weight_files",
     "source_tensor_specs",
 ]

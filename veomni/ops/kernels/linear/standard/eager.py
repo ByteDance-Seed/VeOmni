@@ -33,4 +33,12 @@ def wrapper(linear: nn.Module, x: Tensor, *, block_size: int = 128) -> Tensor:
     without a special case, which is why this row needs no ``resolve_projection``.
     """
     del block_size
+    if getattr(linear, "is_quantized", False) or getattr(linear, "weight_scale", None) is not None:
+        raise ValueError(
+            f"linear_implementation='eager' cannot run on pre-quantized projection "
+            f"{type(linear).__name__!r} (holds `weight_scale`). Clear `weight_quantization` "
+            "to dequantize weights at load for training."
+        )
+    if getattr(linear, "_veomni_self_dispatched", False):
+        return linear._eager_forward(x)
     return linear(x)

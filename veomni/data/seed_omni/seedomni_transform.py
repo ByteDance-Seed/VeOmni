@@ -132,7 +132,7 @@ def _build_conversation_list(
         if not turn:
             continue
         role = turn[0]
-        assert role in ["user", "assistant"], f"role must be user or assistant, got {role}"
+        assert role in ["system", "user", "assistant"], f"role must be system, user, or assistant, got {role}"
         for entry in turn[1:]:
             assert len(entry) in (2, 3), (
                 f"turn entry must be a (type, value) or (type, value, meta) tuple, got {entry}"

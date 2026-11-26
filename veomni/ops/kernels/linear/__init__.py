@@ -123,3 +123,48 @@ register_op(
     requirement=_NVIDIA_SM90_OR_SM100,
     requires=("deep_gemm", "triton"),
 )
+
+
+def paired_linear(x, linear_a, linear_b):
+    """Run two projections sharing input ``x``, fusing work when both handles match.
+
+    Dispatches purely on the bound ``veomni_linear`` handles on ``linear_a`` and
+    ``linear_b``: fuses paired ``deepgemm`` (BF16 FP8-training) projections when
+    eligible, and otherwise invokes each projection module directly.
+    """
+    import torch
+
+    op_a = getattr(linear_a, "veomni_linear", None)
+    op_b = getattr(linear_b, "veomni_linear", None)
+    if (
+        op_a is not None
+        and op_b is not None
+        and op_a.impl == op_b.impl
+        and op_a.kwargs == op_b.kwargs
+        and op_a.impl == "deepgemm"
+        and op_a.kwargs.get("dtype", "fp8") == "fp8"
+        and op_a.kwargs.get("block_size", 128) == 128
+        and linear_a.bias is None
+        and linear_b.bias is None
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and linear_a.weight.dtype == torch.bfloat16
+        and linear_b.weight.dtype == torch.bfloat16
+        and linear_a.weight.shape[0] % 128 == 0
+        and linear_b.weight.shape[0] % 128 == 0
+        and linear_a.weight.shape[1] % 128 == 0
+    ):
+        from ..moe_experts.shared.deepgemm import GroupedLinear, get_uniform_layout
+
+        in_shape = x.shape
+        hidden = in_shape[-1]
+        out_a = linear_a.weight.shape[0]
+        out_b = linear_b.weight.shape[0]
+        x_2d = x.reshape(-1, hidden)
+        layout = get_uniform_layout(x_2d.shape[0], 1, x.device)
+        w_cat = torch.cat((linear_a.weight, linear_b.weight), dim=0).unsqueeze(0).contiguous()
+        out_cat = GroupedLinear.apply(x_2d, w_cat, layout, False)
+        res_a, res_b = out_cat.split([out_a, out_b], dim=-1)
+        return res_a.reshape(*in_shape[:-1], out_a), res_b.reshape(*in_shape[:-1], out_b)
+
+    return linear_a(x), linear_b(x)

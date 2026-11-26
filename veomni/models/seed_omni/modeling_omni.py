@@ -58,7 +58,9 @@ if TYPE_CHECKING:
 
 logger = helper.create_logger(__name__)
 
-# Must match the ``_loss`` key every OmniModule's ``post_forward`` emits.
+# Must match the ``_loss`` key every OmniModule's ``post_forward`` emits. Its value is
+# either a bare scalar (logged as ``{module}.{method}``) or a ``{loss_name: scalar}``
+# dict (logged as ``{module}.{method}.{loss_name}``). The training loss is the sum of all.
 LOSS_KEY = "_loss"
 
 # HF hub kwargs forwarded to :meth:`OmniConfig.from_pretrained`.
@@ -555,7 +557,13 @@ class OmniModel(PreTrainedModel):
         for node in self.training_graph.iter_nodes():
             run_node(self.get_module(node.module), node, batch)
             loss = batch.pop(LOSS_KEY, None)
-            if loss is not None:
+            if loss is None:
+                continue
+            if isinstance(loss, Mapping):
+                for loss_name, value in loss.items():
+                    if value is not None:
+                        self._losses[f"{node.name}.{loss_name}"] = value
+            else:
                 self._losses[node.name] = loss
         return {
             "loss": _sum_losses(self._losses),

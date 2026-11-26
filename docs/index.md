@@ -84,6 +84,7 @@ examples/ltx-2.3.md
 examples/qwen3_dpo.md
 examples/seed_oss.md
 examples/kimi_k3.md
+examples/deepseek_v41_verification_report.md
 ```
 
 ```{toctree}

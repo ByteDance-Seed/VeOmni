@@ -110,6 +110,7 @@ def act_quant_kernel(
             y_shared = T.alloc_shared((blk_m, group_size), out_dtype)
 
             for _ in T.Pipelined(1, num_stages=num_stages):
+                T.clear(amax_local)
                 T.copy(X[pid_m * blk_m, pid_n * group_size], x_shared)
                 T.copy(x_shared, x_local)
                 T.reduce_absmax(x_local, amax_local, dim=1)
@@ -202,6 +203,8 @@ def fp8_weight_quant_kernel(
             scale_local = T.alloc_fragment((1,), FP32)
             scale_shared = T.alloc_shared((1,), FP32)
 
+            T.clear(amax_row_local)
+            T.clear(scale_local)
             T.copy(X[by * block_size, bx * block_size], x_shared)
             T.reduce_absmax(x_shared, amax_row_local, dim=1)
             T.reduce_absmax(amax_row_local, scale_local, dim=0)
@@ -317,6 +320,7 @@ def fp4_quant_kernel(N, block_size=32, in_dtype=BF16, scale_dtype=FE8M0, dequant
             y_shared = T.alloc_shared((blk_m, group_size), out_dtype)
 
             for _ in T.Pipelined(1, num_stages=2):
+                T.clear(amax_local)
                 T.copy(X[pid_m * blk_m, pid_n * group_size], x_shared)
                 T.copy(x_shared, x_local)
                 T.reduce_absmax(x_local, amax_local, dim=1)
@@ -334,7 +338,8 @@ def fp4_quant_kernel(N, block_size=32, in_dtype=BF16, scale_dtype=FE8M0, dequant
                     for i, j in T.Parallel(blk_m, group_size):
                         y_local[i, j] = T.clamp(x_local[i, j] / s_local[i], -fp4_max, fp4_max)
                 for i in T.Parallel(blk_m):
-                    S[pid_m * blk_m + i, pid_n] = T.Cast(scale_dtype, s_local[i])
+                    if pid_m * blk_m + i < M:
+                        S[pid_m * blk_m + i, pid_n] = T.Cast(scale_dtype, s_local[i])
                 T.copy(y_local, y_shared)
                 T.copy(y_shared, Y[pid_m * blk_m, pid_n * group_size])
 

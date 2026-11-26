@@ -1,0 +1,21 @@
+# Default multimodal SFT mix (image + video + text understanding), aligned with
+# Qwen3-VL / SeedOmni recipes.
+# The tulu shards upstream are sorted by subset and each dataloader worker
+# streams its own shards on every rank, so a global step would be one subset;
+# the -shuffled copy permutes rows across shards.
+sources:
+  - /mnt/hdfs/veomni/datasets/sharegpt4v_cap_100k
+  - /mnt/hdfs/veomni/datasets/llava_video
+  - /mnt/hdfs/veomni/datasets/tulu-3-sft-mixture-le1024-shuffled/data
+names:
+  - sharegpt4v_cap_100k
+  - llava_video
+  - tulu-3-sft-mixture
+schedule:
+  - schedule_type: const
+    weights: [0.4, 0.4, 0.2]
+# Heterogeneous schemas across the three sources -- VeOmni weighted multisource
+# rather than an HF interleave, which would try to merge them.
+level: token
+stopping_strategy: all_exhausted
+upstream_sharded: true
