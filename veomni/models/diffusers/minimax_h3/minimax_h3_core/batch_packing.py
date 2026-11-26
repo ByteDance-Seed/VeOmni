@@ -3,6 +3,14 @@
 import torch
 
 
+def _validate_fp32_metadata(timesteps: torch.Tensor, position_ids: torch.Tensor) -> None:
+    """Reject timestep and position inputs that have already lost FP32 precision."""
+    if any(tensor.is_floating_point() and tensor.element_size() < 4 for tensor in (timesteps, position_ids)):
+        raise ValueError(
+            "H3 floating-point timesteps and positions need FP32 or higher. Set cast_forward_inputs=False."
+        )
+
+
 def pack_samples(samples):
     if not samples:
         raise ValueError("H3 requires a nonempty microbatch.")
@@ -24,11 +32,8 @@ def pack_samples(samples):
     cu, refiner_cu, row_counts = [0], [0], []
     time_offset = 0
     for inp in samples:
-        if inp["unique_timesteps"].dtype != torch.float32 or inp["img_position_ids"].dtype not in (
-            torch.float32,
-            torch.float64,
-        ):
-            raise ValueError("H3 packing must retain timestep/position precision; use cast_forward_inputs=false.")
+        # Check each sample before concatenation can promote a rounded input.
+        _validate_fp32_metadata(inp["unique_timesteps"], inp["img_position_ids"])
         if not inp["skip_mask_out_condition"]:
             raise ValueError("H3 packing requires explicit condition-row output cropping.")
         length = inp["x"].shape[1]
